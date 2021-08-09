@@ -1,0 +1,29 @@
+{
+  "epoch_time": 1626697480,
+  "period": 259200,
+  "interval": 60,
+  "granularity": 10,
+  "datasources": [
+    {
+      "connector": { "type": "stateful" },
+      "actions": {
+        "buy": "local_portfolio_usd_balance -= coinbase_btcusd_price\nlocal_portfolio_btc_balance += 1",
+        "sell": "local_portfolio_usd_balance += coinbase_btcusd_price\nlocal_portfolio_btc_balance -= 1"
+      }
+    }
+  ],
+  "fields": {
+    "coinbase_btcusd_price": 0,
+    "local_portfolio_btc_balance": 0,
+    "local_portfolio_usd_balance": 100000
+  },
+  "actions": {
+    "buy": "reward = new_state.coinbase_btcusd_price - prev_state.coinbase_btcusd_price",
+    "hold": "reward = -(new_state.coinbase_btcusd_price - prev_state.coinbase_btcusd_price)",
+    "sell": "reward = -1"
+  },
+  "laws": [
+    "local_portfolio_usd_balance \u003e= 0",
+    "local_portfolio_btc_balance \u003e= 0"
+  ]
+}

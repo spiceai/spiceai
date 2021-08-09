@@ -1,0 +1,18 @@
+datasources:
+  - datasource:
+    from: gym
+    name: CartPole-v1
+    connector:
+      type: openai-gym
+    fields:
+      - name: position
+      - name: velocity
+      - name: pole_angle
+      - name: pole_angular_velocity
+    actions:
+      left: passthru
+      right: passthru
+
+training:
+  goal: score > 200
+  rewards: uniform
