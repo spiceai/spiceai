@@ -59,7 +59,7 @@ You may want to add to your terminal configuration, E.g. `.bashrc` or `.zshrc`.
 Install the Spice CLI by running the following `curl` command in your terminal.
 
 ```bash
-curl https://raw.githubusercontent.com/spiceai/spiceai/trunk/install/install.sh\?token\=AAKTKO3WFSKCDXVQOJM6P63BC2PM4 | /bin/bash
+curl https://raw.githubusercontent.com/spiceai/spiceai/trunk/install/install.sh\?token\=AAATSLXNSHFZJML3F53V6MLBDIX4Q | /bin/bash
 ```
 
 The installation path is not currently added to your PATH, so we recommend to add it manually with the following command which you may want to add to your terminal configuration, E.g. `.bashrc` or `.zshrc`.
