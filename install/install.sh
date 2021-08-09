@@ -185,7 +185,7 @@ cleanup() {
 }
 
 installCompleted() {
-    echo -e "\nTo get started with Spice, visit https://docs.spiceai.io/getting-started/"
+    echo -e "\nTo get started with Spice AI, visit https://spiceai.github.io/docs/"
 }
 
 # -----------------------------------------------------------------------------
@@ -206,7 +206,7 @@ checkHttpRequestCLI
 checkJqInstalled
 
 if [ -z "$1" ]; then
-    echo "Getting the latest Spice CLI..."
+    echo "Getting the latest Spice AI CLI..."
     getLatestRelease
 else
     ret_val=v$1
