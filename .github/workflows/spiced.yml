@@ -1,0 +1,143 @@
+name: spiced
+
+on:
+  push:
+    branches:
+      - trunk
+      - release-*
+    tags:
+      - v*
+  pull_request:
+    branches:
+      - trunk
+      - release-*
+
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build ${{ matrix.target_os }}_${{ matrix.target_arch }} binaries
+    runs-on: ${{ matrix.os }}
+    env:
+      GOVER: 1.16
+
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macOS-latest]
+        target_arch: [arm, arm64, amd64]
+        include:
+          - os: ubuntu-latest
+            target_os: linux
+          - os: windows-latest
+            target_os: windows
+          - os: macOS-latest
+            target_os: darwin
+        exclude:
+          - os: windows-latest
+            target_arch: arm
+          - os: windows-latest
+            target_arch: arm64
+          - os: macOS-latest
+            target_arch: arm
+          - os: macOS-latest
+            target_arch: arm64
+
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Set REL_VERSION from version.txt
+        run: python ./.github/scripts/get_release_version.py
+
+      - name: Set up Go
+        uses: actions/setup-go@v2
+        with:
+          go-version: ${{ env.GOVER }}
+
+      - name: Build spiced
+        run: make
+        working-directory: cmd/spiced
+
+      - name: Test spiced
+        run: go test -v
+        working-directory: cmd/spiced
+        
+      - name: tar binary
+        if: matrix.target_os != 'windows'
+        run: |
+          mv cmd/spiced/spiced spiced
+          chmod +x spiced
+          tar cf spiced_${{ matrix.target_os }}_${{ matrix.target_arch }}.tar.gz spiced
+
+      - name: Print version
+        if: matrix.target_os != 'windows'
+        run: ./spiced version
+
+      - uses: actions/upload-artifact@v2
+        if: matrix.target_os != 'windows'
+        with:
+          name: spiced_${{ matrix.target_os }}_${{ matrix.target_arch }}
+          path: spiced_${{ matrix.target_os }}_${{ matrix.target_arch }}.tar.gz
+
+      - uses: actions/upload-artifact@v2
+        if: matrix.target_os == 'windows'
+        with:
+          name: spiced_${{ matrix.target_os }}_${{ matrix.target_arch }}
+          path: cmd/spiced/spiced.exe
+
+  publish:
+    name: Publish ${{ matrix.target_os }}-${{ matrix.target_arch }} binaries
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name != 'pull_request'
+    env:
+      ARTIFACT_DIR: ./release
+
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macOS-latest]
+        target_arch: [amd64]
+        include:
+          - os: ubuntu-latest
+            target_os: linux
+          - os: macOS-latest
+            target_os: darwin
+    
+    steps:
+      - name: Check out code into the Go module directory
+        uses: actions/checkout@v2
+
+      - name: Set REL_VERSION from version.txt
+        run: python ./.github/scripts/get_release_version.py
+
+      - name: download artifacts - spiced_${{ matrix.target_os }}_${{ matrix.target_arch }}
+        uses: actions/download-artifact@master
+        with:
+          name: spiced_${{ matrix.target_os }}_${{ matrix.target_arch }}
+          path: ${{ env.ARTIFACT_DIR }}
+
+      - name: lists artifacts
+        run: ls -l ${{ env.ARTIFACT_DIR }}
+
+      - name: publish binaries to github
+        run: |
+          echo "installing github-release-cli..."
+          sudo npm install --silent --no-progress -g github-release-cli@1.3.1
+          # Parse repository to get owner and repo names
+          OWNER_NAME="${GITHUB_REPOSITORY%%/*}"
+          REPO_NAME="${GITHUB_REPOSITORY#*/}"
+          export GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }}
+          if [ "$LATEST_RELEASE" = "true" ]; then
+            export RELEASE_BODY=`cat ./docs/release_notes/v${{ env.REL_VERSION }}.md`
+          else
+            export RELEASE_BODY="This is the release candidate ${{ env.REL_VERSION }}"
+          fi
+          # Get the list of files
+          RELEASE_ARTIFACT=(${ARTIFACT_DIR}/*)
+          echo "Uploading Spice Runtime Binaries to GitHub Release"
+          github-release upload \
+            --owner $OWNER_NAME --repo $REPO_NAME \
+            --tag "v${{ env.REL_VERSION }}-spiced" \
+            --name "Spice Runtime v${{ env.REL_VERSION }}" \
+            --body "${RELEASE_BODY}" \
+            --prerelease true \
+            ${RELEASE_ARTIFACT[*]}

@@ -1,0 +1,61 @@
+name: spiced_docker
+
+on:
+  push:
+    branches:
+      - trunk
+      - release-*
+    tags:
+      - v*
+  pull_request:
+    branches:
+      - trunk
+      - release-*
+
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build Spice ${{ matrix.target_os }}_${{ matrix.target_arch }} Docker image
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+        target_arch: [amd64]
+        include:
+          - os: ubuntu-latest
+            target_os: linux
+
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Set REL_VERSION from version.txt
+        run: python ./.github/scripts/get_release_version.py
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v1
+
+      - name: Login to GitHub Package Registry
+        uses: docker/login-action@v1
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker images
+        id: docker_build
+        uses: docker/build-push-action@v2.5.0
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: ${{ matrix.target_os }}/${{ matrix.target_arch }}
+          push: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/trunk' }}
+          build-args: REL_VERSION=${{ env.REL_VERSION }}
+          tags: |
+            ghcr.io/spiceai/spiced:latest
+            ghcr.io/spiceai/spiced:v${{ env.REL_VERSION }}
+            ghcr.io/spiceai/spiced:v${{ env.REL_VERSION }}-${{ matrix.target_arch }}
+
+      - name: Image digest
+        run: echo ${{ steps.docker_build.outputs.digest }}

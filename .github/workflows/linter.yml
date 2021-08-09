@@ -1,0 +1,38 @@
+---
+name: lint code base
+
+on:
+  pull_request:
+    branches:
+      - trunk
+      - release-*
+
+jobs:
+  golangci:
+    name: lint golang code
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v2
+
+  black:
+    name: lint python code
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v2
+      - name: Set up Python 3.8.11
+        uses: actions/setup-python@v1
+        with:
+          python-version: 3.8.11
+      - name: Install black
+        working-directory: ai/src
+        run: |
+          pip install black
+      - name: Analysing the AI code with black
+        working-directory: ai/src
+        run: |
+          black --check .
