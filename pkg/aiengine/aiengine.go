@@ -17,15 +17,18 @@ import (
 
 	"github.com/hashicorp/go-retryablehttp"
 	"github.com/logrusorgru/aurora"
+	zmq "github.com/pebbe/zmq4"
 	"github.com/spiceai/spice/pkg/config"
 	"github.com/spiceai/spice/pkg/context"
 	"github.com/spiceai/spice/pkg/flights"
+	"github.com/spiceai/spice/pkg/initpb"
 	spice_log "github.com/spiceai/spice/pkg/log"
 	"github.com/spiceai/spice/pkg/observations"
 	"github.com/spiceai/spice/pkg/pods"
 	"github.com/spiceai/spice/pkg/spec"
 	"github.com/spiceai/spice/pkg/state"
 	"github.com/spiceai/spice/pkg/util"
+	"google.golang.org/protobuf/proto"
 )
 
 type AIEngineResponse struct {
@@ -46,6 +49,7 @@ var (
 	aiServerPath  string = filepath.Join(config.AiEnginePath(), "main.py")
 	aiServerCmd   *exec.Cmd
 	aiServerReady bool = false
+	sender *zmq.Socket
 )
 
 func getPythonCmd() string {
@@ -149,6 +153,19 @@ func StartServer(ready chan bool) {
 		go func() {
 			waitForServerHealthy(30)
 			aiServerReady = true
+
+			var senderErr error
+			sender, senderErr = zmq.NewSocket(zmq.PUSH)
+			if senderErr != nil {
+				log.Println(fmt.Errorf("failed to create ZMQ socket: %w", senderErr))
+			}
+
+			defer sender.Close()
+			senderErr = sender.Connect("tcp://127.0.0.1:5558")
+			if senderErr != nil {
+				log.Println(fmt.Errorf("failed to connect to ZMQ socket: %w", senderErr))
+			}
+			
 			ready <- true
 			appErr := aiServerCmd.Wait()
 
@@ -159,6 +176,10 @@ func StartServer(ready chan bool) {
 				fileLogger.Close()
 			}
 			sigCh <- os.Interrupt
+		}()
+
+		go func() {
+
 		}()
 
 		appRunning <- true
@@ -253,6 +274,17 @@ func InitializePod(pod *pods.Pod) error {
 	}
 
 	log.Println(aurora.Yellow(string(data)))
+
+	init := &initpb.Init{Msg: "init message"}
+	initBytes, err := proto.Marshal(init)
+	if err != nil {
+        return err
+	}
+
+	_, err = sender.SendBytes(initBytes, 0)
+	if err != nil {
+		return err
+	}
 
 	initUrl := fmt.Sprintf("%s/pods/%s/init", aiServerUrl, pod.Name)
 

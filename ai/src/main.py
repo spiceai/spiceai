@@ -8,6 +8,8 @@ import tensorflow as tf
 import threading
 import requests
 import tempfile
+import zmq
+import init_pb2
 from agent import Spice_Agent
 from flask import Flask, jsonify, make_response, request
 from data import DataManager
@@ -37,6 +39,8 @@ saved_models: "dict[str]" = dict()
 training_lock = threading.Lock()
 training_thread = None
 init_lock = threading.Lock()
+
+socket = None
 
 # Tensors passed to custom loss functions don't work for some reason.
 # Turning off eager execution makes it work
@@ -244,6 +248,11 @@ def dispatch_train_agent(
 @app.route("/pods/<pod>/init", methods=["POST"])
 def init(pod: str):
     with init_lock:
+        init = init_pb2.Init()
+        socket_bytes = socket.recv()
+        init.ParseFromString(socket_bytes)
+        print_event(pod, init.msg)
+
         init_data = request.get_json()
         data_manager = DataManager()
         connector_manager = ConnectorManager()
@@ -439,5 +448,8 @@ def health():
 
 
 if __name__ == "__main__":
+    context = zmq.Context()
+    socket = context.socket(zmq.PULL)
+    socket.bind("tcp://127.0.0.1:5558")
 
     app.run(host="0.0.0.0", port=8004)
