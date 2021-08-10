@@ -1,8 +1,9 @@
+from algorithms.agent_interface import SpiceAIAgent
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras import layers, models
 from tensorflow.keras import backend as K
-from memory import Memory
+from algorithms.vpg.memory import Memory
 import warnings
 import os
 
@@ -45,7 +46,7 @@ def build_networks(state_shape, action_size, learning_rate, hidden_neurons):
     return policy, predict
 
 
-class Spice_Agent:
+class VanillaPolicyGradient_Agent(SpiceAIAgent):
     """Sets up a reinforcement learning agent."""
 
     def __init__(
@@ -58,8 +59,8 @@ class Spice_Agent:
             state_shape: The shape of the observation state
             action_size: How many actions our agent is able to take.
             gamma: The discount factor for rewards that occur earlier on.
-            action_size (int): The number of possible actions to take.
         """
+        super().__init__(state_shape, action_size)
 
         policy, predict = build_networks(
             state_shape, action_size, learning_rate, hidden_neurons
@@ -71,8 +72,8 @@ class Spice_Agent:
 
         warnings.simplefilter(action="ignore", category=Warning)
 
-    def add_experience(self, experience):
-        self.memory.add(experience)
+    def add_experience(self, state, action, reward):
+        self.memory.add((state, action, reward))
 
     def act(self, state):
         """Selects an action for the agent to take given a game state.

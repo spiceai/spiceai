@@ -8,7 +8,8 @@ import tensorflow as tf
 import threading
 import requests
 import tempfile
-from agent import Spice_Agent
+from algorithms.factory import get_agent
+from algorithms.agent_interface import SpiceAIAgent
 from flask import Flask, jsonify, make_response, request
 from data import DataManager
 from connector.manager import ConnectorManager, ConnectorType
@@ -64,13 +65,7 @@ def train_agent(
 
         data_manager.rewind()
         model_data_shape = data_manager.get_shape()
-        agent = Spice_Agent(
-            model_data_shape,
-            ACTION_SIZE,
-            GAMMA,
-            LEARNING_RATE,
-            HIDDEN_NEURONS,
-        )
+        agent: SpiceAIAgent = get_agent("vpg", model_data_shape, ACTION_SIZE)
         model_data_shapes[pod_name] = model_data_shape
 
         print_event(pod_name, f"Training {TRAINING_EPISODES} episodes...")
@@ -128,7 +123,7 @@ def train_agent(
                         return
 
                 episode_reward += reward
-                agent.add_experience((model_state, action, reward))
+                agent.add_experience(model_state, action, reward)
                 episode_actions[action] += 1
                 model_state = model_state_prime
                 raw_state = raw_state_prime
@@ -396,12 +391,8 @@ def inference(pod, tag):
     # multi-threading in python, so we are just loading it from the file system
     data_manager = data_managers[pod]
     model_data_shape = data_manager.get_shape()
-    agent = Spice_Agent(
-        model_data_shape,
-        len(data_manager.action_names),
-        GAMMA,
-        LEARNING_RATE,
-        HIDDEN_NEURONS,
+    agent: SpiceAIAgent = get_agent(
+        "vpg", model_data_shape, len(data_manager.action_names)
     )
     if model_exists:
         agent.load(saved_models[pod])
