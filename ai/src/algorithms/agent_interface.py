@@ -1,7 +1,7 @@
 import abc
 
 """
-The interface that all Spice AI compatible deep-RL agents should comform to.
+The interface that all Spice AI compatible deep-RL agents should conform to.
 """
 
 
