@@ -57,9 +57,9 @@ jobs:
         run: make
         working-directory: cmd/spice
 
-      - name: Test spice
-        run: go test -v
-        working-directory: cmd/spice
+      - name: Run go test
+        if: matrix.target_os != 'windows'
+        run: go test -v ./...
 
       - name: tar binary
         if: matrix.target_os != 'windows'
