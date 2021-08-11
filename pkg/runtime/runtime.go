@@ -122,7 +122,7 @@ func Run() error {
 	fmt.Println("Use Ctrl-C to stop")
 
 	// Setup
-	runtime.scanForPods()
+	err = runtime.scanForPods()
 	if err != nil {
 		log.Printf("error scanning for pods: %s", err.Error())
 		return err

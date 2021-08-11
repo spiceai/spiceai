@@ -129,7 +129,10 @@ func benchProcessCsvFunc(csvData []byte) func(*testing.B) {
 	return func(b *testing.B) {
 		for i := 0; i < 10; i++ {
 			reader := bytes.NewReader(csvData)
-			ProcessCsv(reader)
+			_, err := ProcessCsv(reader)
+			if err != nil {
+				b.Fatal(err.Error())
+			}
 		}
 	}
 }

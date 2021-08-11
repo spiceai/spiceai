@@ -32,7 +32,10 @@ func testParseTimeFunc() func(*testing.T) {
 func benchParseTimeFunc() func(*testing.B) {
 	return func(b *testing.B) {
 		for i := 0; i < 100; i++ {
-			ParseTime("1605312000")
+			_, err := ParseTime("1605312000")
+			if err != nil {
+				b.Fatal(err.Error())
+			}
 		}
 	}
 }
