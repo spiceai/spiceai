@@ -58,6 +58,7 @@ jobs:
         working-directory: cmd/spiced
 
       - name: Run go test
+        if: matrix.target_os != 'windows'
         run: go test -v ./...
         
       - name: tar binary
