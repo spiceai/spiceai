@@ -7,20 +7,28 @@ import (
 	"github.com/spiceai/spice/pkg/observations"
 )
 
+const (
+	CsvConnectorId       = "csv"
+	InfluxDbConnectorId  = "influxdb"
+	OpenAIGymConnectorId = "openai-gym"
+	StatefulConnectorId  = "stateful"
+)
+
 type Connector interface {
+	Type() string
 	Initialize() error
-	FetchData(period time.Duration, interval time.Duration) ([]observations.Observation, error)
+	FetchData(epoch time.Time, period time.Duration, interval time.Duration) ([]observations.Observation, error)
 }
 
 func NewConnector(id string, params map[string]string) (Connector, error) {
 	switch id {
-	case "csv":
+	case CsvConnectorId:
 		return NewCsvConnector(params), nil
-	case "influxdb":
+	case InfluxDbConnectorId:
 		return NewInfluxDbConnector(params), nil
-	case "openai-gym":
+	case OpenAIGymConnectorId:
 		return NewOpenAIGymConnector(params), nil
-	case "stateful":
+	case StatefulConnectorId:
 		return NewStateConnector(params), nil
 	}
 

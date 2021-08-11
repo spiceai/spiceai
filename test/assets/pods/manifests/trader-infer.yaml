@@ -1,4 +1,6 @@
 name: trader-infer
+params:
+  epoch: 1605312000
 datasources:
 # Add a list of datasources here or run 'spice datasource add <datasource_publisher/datasource_id>'
   - datasource:
@@ -32,7 +34,7 @@ datasources:
       params:
         path: ../../test/assets/data/csv/COINBASE_BTCUSD, 30.csv
     fields:
-    - name: price
+    - name: close
     
 
 actions:

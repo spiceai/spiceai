@@ -26,6 +26,7 @@ type Pod struct {
 	hash               string
 	manifestPath       string
 	dataSources        []*datasources.DataSource
+	fields             map[string]float64
 	fieldNames         []string
 	flights            map[string]*flights.Flight
 	viper              *viper.Viper
@@ -109,7 +110,7 @@ func (pod *Pod) Episodes() int {
 	if pod.PodSpec.Params != nil {
 		episodesParam, ok := pod.PodSpec.Params["episodes"]
 		if ok {
-			if episodes, err := strconv.ParseInt(episodesParam, 0, 64); err != nil {
+			if episodes, err := strconv.ParseInt(episodesParam, 0, 64); err == nil {
 				return int(episodes)
 			}
 		}
@@ -117,24 +118,56 @@ func (pod *Pod) Episodes() int {
 	return 10
 }
 
-func (pod *Pod) CachedObservations() []observations.Observation {
-	var observations []observations.Observation
+func (pod *Pod) CachedState() []*state.State {
+	var cachedState []*state.State
 	for _, ds := range pod.DataSources() {
-		for _, state := range ds.CachedState() {
-			observations = append(observations, state.Observations()...)
+		dsState := ds.CachedState()
+		if dsState != nil {
+			cachedState = append(cachedState, dsState...)
 		}
 	}
 
 	if pod.podLocalState != nil {
 		pod.podLocalStateMutex.RLock()
 		defer pod.podLocalStateMutex.RUnlock()
-
-		for _, state := range pod.podLocalState {
-			observations = append(observations, state.Observations()...)
+		if pod.podLocalState != nil && len(pod.podLocalState) > 0 {
+			cachedState = append(cachedState, pod.podLocalState...)
 		}
 	}
 
-	return observations
+	return cachedState
+}
+
+func (pod *Pod) CachedCsv() string {
+	csv := strings.Builder{}
+	fieldNames := pod.FieldNames()
+
+	st := fmt.Sprintf("time,%s\n", strings.Join(fieldNames, ","))
+	csv.WriteString(st)
+
+	cachedState := pod.CachedState()
+	for _, state := range cachedState {
+		var validFieldNames []string
+
+		for _, globalFieldName := range fieldNames {
+			isValid := false
+			for _, fieldName := range state.FieldNames() {
+				field := state.Path() + "." + fieldName
+				if globalFieldName == field {
+					validFieldNames = append(validFieldNames, fieldName)
+					isValid = true
+					break
+				}
+			}
+			if !isValid {
+				validFieldNames = append(validFieldNames, globalFieldName)
+			}
+		}
+
+		stateCsv, _ := observations.GetCsv(validFieldNames, state.Observations(), 0)
+		csv.WriteString(stateCsv)
+	}
+	return csv.String()
 }
 
 func (pod *Pod) DataSources() []*datasources.DataSource {
@@ -240,6 +273,10 @@ func (pod *Pod) Rewards() map[string]string {
 	return rewards
 }
 
+func (pod *Pod) Fields() map[string]float64 {
+	return pod.fields
+}
+
 func (pod *Pod) FieldNames() []string {
 	return pod.fieldNames
 }
@@ -294,51 +331,24 @@ func (pod *Pod) ValidateForTraining() error {
 	return nil
 }
 
-func (pod *Pod) AddLocalObservations(newObservations ...observations.Observation) error {
-	validFieldNames := pod.FieldNames()
-	validFieldNamesNum := len(validFieldNames)
-	fieldNamesMap := make(map[string]bool)
-
-	for _, o := range newObservations {
-		for fieldName := range o.Data {
-			fieldNamesMap[fieldName] = true
-		}
-	}
-
-	fieldNames := make([]string, len(fieldNamesMap))
-
-	// Validate field names in data
-	for fieldName := range fieldNamesMap {
-		if fieldName == "time" {
-			continue
-		}
-		index := sort.SearchStrings(validFieldNames, fieldName)
-		if index >= validFieldNamesNum || validFieldNames[index] != fieldName {
-			return fmt.Errorf("%s is an invalid field for pod %s. Valid fields are: %+v", fieldName, pod.Name, validFieldNames)
-		}
-	}
-
-	newState := state.NewState(fieldNames, newObservations)
-
+func (pod *Pod) AddLocalState(newState ...*state.State) {
 	pod.podLocalStateMutex.Lock()
 	defer pod.podLocalStateMutex.Unlock()
 
-	pod.podLocalState = append(pod.podLocalState, newState)
-
-	return nil
+	pod.podLocalState = append(pod.podLocalState, newState...)
 }
 
 func (pod *Pod) State() ([]*state.State, error) {
 	var allState []*state.State
 	for _, ds := range pod.DataSources() {
-		state, err := ds.FetchNewState(pod.Period(), pod.Interval())
+		state, err := ds.FetchNewState(pod.Epoch(), pod.Period(), pod.Interval())
 		if err != nil {
 			return nil, err
 		}
 		if state == nil {
 			continue
 		}
-		allState = append(allState, state)
+		allState = append(allState, state...)
 	}
 
 	allState = append(allState, pod.podLocalState...)
@@ -349,11 +359,11 @@ func (pod *Pod) State() ([]*state.State, error) {
 func (pod *Pod) FetchNewData() ([]*state.State, error) {
 	var allState []*state.State
 	for _, ds := range pod.DataSources() {
-		state, err := ds.FetchNewState(pod.Period(), pod.Interval())
+		state, err := ds.FetchNewState(pod.Epoch(), pod.Period(), pod.Interval())
 		if err != nil {
 			return nil, err
 		}
-		allState = append(allState, state)
+		allState = append(allState, state...)
 	}
 	return allState, nil
 }
@@ -389,8 +399,9 @@ func unmarshalPod(podPath string) (*Pod, error) {
 	}
 
 	pod := &Pod{
-		PodSpec: *podSpec,
-		viper:   v,
+		PodSpec:            *podSpec,
+		viper:              v,
+		podLocalStateMutex: sync.RWMutex{},
 	}
 
 	return pod, nil
@@ -411,6 +422,7 @@ func loadPod(podPath string, hash string) (*Pod, error) {
 	pod.flights = make(map[string]*flights.Flight)
 
 	var fieldNames []string
+	fields := make(map[string]float64)
 
 	for _, dsSpec := range pod.PodSpec.DataSources {
 		ds, err := datasources.NewDataSource(dsSpec)
@@ -419,13 +431,18 @@ func loadPod(podPath string, hash string) (*Pod, error) {
 		}
 		pod.dataSources = append(pod.dataSources, ds)
 
-		for _, fieldName := range ds.FieldNames() {
+		for _, fieldName := range ds.FieldNameMap() {
 			fieldNames = append(fieldNames, fieldName)
+		}
+
+		for field, intializer := range ds.Fields() {
+			fields[field] = intializer
 		}
 	}
 
 	sort.Strings(fieldNames)
 	pod.fieldNames = fieldNames
+	pod.fields = fields
 
 	return pod, err
 }

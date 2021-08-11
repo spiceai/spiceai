@@ -28,6 +28,11 @@ func NewDataSource(dsSpec spec.DataSourceSpec) (*DataSource, error) {
 		return nil, err
 	}
 
+	err = connector.Initialize()
+	if err != nil {
+		return nil, fmt.Errorf("data connector '%s' failed to initialize: %s", connector.Type(), err)
+	}
+
 	ds := DataSource{
 		DataSourceSpec:   dsSpec,
 		connector:        connector,
@@ -41,13 +46,17 @@ func (ds *DataSource) Name() string {
 	return fmt.Sprintf("%s/%s", ds.DataSourceSpec.From, ds.DataSourceSpec.Name)
 }
 
+func (ds *DataSource) Path() string {
+	return fmt.Sprintf("%s.%s", ds.DataSourceSpec.From, ds.DataSourceSpec.Name)
+}
+
 func (ds *DataSource) CachedState() []*state.State {
 	return ds.cachedState
 }
 
 func (ds *DataSource) Actions() map[string]string {
 	fqActions := make(map[string]string)
-	fqFieldNames := ds.FieldNames()
+	fqFieldNames := ds.FieldNameMap()
 	fqActionNames := ds.ActionNames()
 	for dsActionName, dsActionBody := range ds.DataSourceSpec.Actions {
 		fqDsActionBody := dsActionBody
@@ -59,9 +68,10 @@ func (ds *DataSource) Actions() map[string]string {
 	return fqActions
 }
 
+// Returns a mapping of fully-qualified field names to their intializers
 func (ds *DataSource) Fields() map[string]float64 {
 	fqFieldInitializers := make(map[string]float64)
-	fqFieldNames := ds.FieldNames()
+	fqFieldNames := ds.FieldNameMap()
 	for _, field := range ds.DataSourceSpec.Fields {
 		var initialValue float64 = 0
 		if field.Initializer != nil {
@@ -73,11 +83,19 @@ func (ds *DataSource) Fields() map[string]float64 {
 }
 
 // Returns a mapping of the datasource local field names to their fully-qualified field name
-func (ds *DataSource) FieldNames() map[string]string {
-	fieldNames := make(map[string]string)
+func (ds *DataSource) FieldNameMap() map[string]string {
+	fieldNames := make(map[string]string, len(ds.DataSourceSpec.Fields))
 	for _, v := range ds.DataSourceSpec.Fields {
 		fqname := fmt.Sprintf("%s.%s.%s", ds.From, ds.DataSourceSpec.Name, v.Name)
 		fieldNames[v.Name] = fqname
+	}
+	return fieldNames
+}
+
+func (ds *DataSource) FieldNames() []string {
+	fieldNames := make([]string, len(ds.DataSourceSpec.Fields))
+	for i, v := range ds.DataSourceSpec.Fields {
+		fieldNames[i] = v.Name
 	}
 	return fieldNames
 }
@@ -96,7 +114,7 @@ func (ds *DataSource) ActionNames() map[string]string {
 func (ds *DataSource) Laws() []string {
 	var fqLaws []string
 
-	fqFieldNames := ds.FieldNames()
+	fqFieldNames := ds.FieldNameMap()
 
 	for _, dsLaw := range ds.DataSourceSpec.Laws {
 		law := dsLaw
@@ -116,23 +134,14 @@ func (ds *DataSource) AddNewState(state *state.State) {
 	ds.cachedState = append(ds.cachedState, state)
 }
 
-func (ds *DataSource) FetchNewState(period time.Duration, interval time.Duration) (*state.State, error) {
-	data, err := ds.connector.FetchData(period, interval)
+func (ds *DataSource) FetchNewState(epoch time.Time, period time.Duration, interval time.Duration) ([]*state.State, error) {
+	observations, err := ds.connector.FetchData(epoch, period, interval)
 	if err != nil {
 		return nil, err
 	}
 
-	if len(data) == 0 {
-		return nil, nil
-	}
+	newState := state.NewState(ds.Path(), ds.FieldNames(), observations)
+	ds.AddNewState(newState)
 
-	var fields []string
-	for _, f := range ds.FieldNames() {
-		fields = append(fields, f)
-	}
-
-	state := state.NewState(fields, data)
-	ds.AddNewState(state)
-
-	return state, nil
+	return []*state.State{newState}, nil
 }

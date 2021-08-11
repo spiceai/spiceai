@@ -11,7 +11,11 @@ type OpenAIGymConnector struct {
 }
 
 func NewOpenAIGymConnector(params map[string]string) Connector {
-	return &StateConnector{}
+	return &OpenAIGymConnector{}
+}
+
+func (c *OpenAIGymConnector) Type() string {
+	return OpenAIGymConnectorId
 }
 
 func (c *OpenAIGymConnector) Initialize() error {
@@ -20,6 +24,6 @@ func (c *OpenAIGymConnector) Initialize() error {
 	return nil
 }
 
-func (c *OpenAIGymConnector) FetchData(period time.Duration, interval time.Duration) ([]observations.Observation, error) {
+func (c *OpenAIGymConnector) FetchData(epoch time.Time, period time.Duration, interval time.Duration) ([]observations.Observation, error) {
 	return c.state, nil
 }

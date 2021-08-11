@@ -117,7 +117,7 @@ func testFieldsFunc(dsSpec spec.DataSourceSpec) func(*testing.T) {
 			}
 		case "coinbase/btcusd":
 			expected = map[string]float64{
-				"coinbase.btcusd.price": 0,
+				"coinbase.btcusd.close": 0,
 			}
 
 		case "gym/CartPole-v1":
@@ -143,7 +143,7 @@ func testFieldNamesFunc(dsSpec spec.DataSourceSpec) func(*testing.T) {
 			t.Error(err)
 		}
 
-		actual := ds.FieldNames()
+		actual := ds.FieldNameMap()
 
 		var expected map[string]string
 
@@ -155,7 +155,7 @@ func testFieldNamesFunc(dsSpec spec.DataSourceSpec) func(*testing.T) {
 			}
 		case "coinbase/btcusd":
 			expected = map[string]string{
-				"price": "coinbase.btcusd.price",
+				"close": "coinbase.btcusd.close",
 			}
 
 		case "gym/CartPole-v1":

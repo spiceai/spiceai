@@ -32,21 +32,27 @@ func NewInfluxDbConnector(params map[string]string) Connector {
 	}
 }
 
+func (c *InfluxDbConnector) Type() string {
+	return InfluxDbConnectorId
+}
+
 func (c *InfluxDbConnector) Initialize() error {
 	return nil
 }
 
-func (c *InfluxDbConnector) FetchData(period time.Duration, interval time.Duration) ([]observations.Observation, error) {
-	periodStr := fmt.Sprintf("%ds", int64(period.Seconds()))
+func (c *InfluxDbConnector) FetchData(epoch time.Time, period time.Duration, interval time.Duration) ([]observations.Observation, error) {
+	periodStart := epoch.Format(time.RFC3339)
+	periodEnd := epoch.Add(period).Format(time.RFC3339)
+
 	intervalStr := fmt.Sprintf("%ds", int64(interval.Seconds()))
 
 	query := fmt.Sprintf(`
 		from(bucket:"%s") |>
-		range(start: -%s) |>
+		range(start: %s, stop: %s) |>
 		filter(fn: (r) => r["_measurement"] == "tick") |>
 		filter(fn: (r) => r["_field"] == "%s") |>
 		aggregateWindow(every: %s, fn: mean, createEmpty: false)
-    `, c.bucket, periodStr, c.field, intervalStr)
+    `, c.bucket, periodStart, periodEnd, c.field, intervalStr)
 
 	result, err := c.client.QueryAPI(c.org).Query(context.Background(), query)
 	if err != nil {
@@ -58,15 +64,15 @@ func (c *InfluxDbConnector) FetchData(period time.Duration, interval time.Durati
 	var newObservations []observations.Observation
 
 	for result.Next() {
-		var ts uint64
-		var data = make(map[string]interface{})
+		var ts int64
+		var data = make(map[string]float64)
 
-		ts = uint64(result.Record().Time().Unix())
+		ts = result.Record().Time().Unix()
 		data[c.field] = result.Record().Value().(float64)
 
 		observation := observations.Observation{
-			Timestamp: ts,
-			Data:      data,
+			Time: ts,
+			Data: data,
 		}
 
 		newObservations = append(newObservations, observation)

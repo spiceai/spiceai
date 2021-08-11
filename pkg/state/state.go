@@ -10,18 +10,40 @@ import (
 type State struct {
 	Time               time.Time
 	TimeSentToAIEngine time.Time
-	Fields             []string
+	path               string
+	fieldNames         []string
+	fields             []string
 	observations       []observations.Observation
 	observationsMutex  sync.RWMutex
 }
 
-func NewState(fields []string, observations []observations.Observation) *State {
+func NewState(path string, fieldNames []string, observations []observations.Observation) *State {
+	fields := make([]string, len(fieldNames))
+	for i, name := range fieldNames {
+		fields[i] = path + "." + name
+	}
+
 	return &State{
 		Time:               time.Now(),
 		TimeSentToAIEngine: time.Time{},
-		Fields:             fields,
+		path:               path,
+		fieldNames:         fieldNames,
+		fields:             fields,
 		observations:       observations,
 	}
+}
+
+func (s *State) Path() string {
+	return s.path
+}
+
+func (s *State) FieldNames() []string {
+	return s.fieldNames
+}
+
+func (s *State) Fields() []string {
+
+	return s.fields
 }
 
 func (s *State) Observations() []observations.Observation {

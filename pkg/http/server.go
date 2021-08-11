@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"strings"
 	"time"
 
 	"github.com/fasthttp/router"
@@ -15,7 +14,6 @@ import (
 	"github.com/spiceai/spice/pkg/csv"
 	"github.com/spiceai/spice/pkg/dashboard"
 	"github.com/spiceai/spice/pkg/flights"
-	"github.com/spiceai/spice/pkg/observations"
 	"github.com/spiceai/spice/pkg/pods"
 	"github.com/valyala/fasthttp"
 )
@@ -53,15 +51,9 @@ func apiGetObservationsHandler(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	fieldNames := pod.FieldNames()
-
-	st := fmt.Sprintf("time,%s\n", strings.Join(fieldNames, ","))
-
-	csv, _ := observations.GetCsv(fieldNames, pod.CachedObservations(), 0)
+	csv := pod.CachedCsv()
 
 	ctx.Response.Header.Add("Content-Type", " text/csv")
-
-	_, _ = ctx.Write([]byte(st))
 	_, _ = ctx.Write([]byte(csv))
 }
 
@@ -74,31 +66,16 @@ func apiPostObservationsHandler(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	var observations []observations.Observation
-	var err error
-	if string(ctx.Request.Header.ContentType()) == "application/json" {
-		err = json.Unmarshal(ctx.Request.Body(), &observations)
-		if err != nil {
-			ctx.Response.SetStatusCode(400)
-			fmt.Fprintf(ctx, "error processing json: %s", err.Error())
-			return
-		}
-	} else {
-		reader := bytes.NewReader(ctx.Request.Body())
-		observations, err = csv.ProcessCsv(reader)
-		if err != nil {
-			ctx.Response.SetStatusCode(400)
-			fmt.Fprintf(ctx, "error processing csv: %s", err.Error())
-			return
-		}
-	}
-
-	err = pod.AddLocalObservations(observations...)
+	reader := bytes.NewReader(ctx.Request.Body())
+	validFieldNames := pod.FieldNames()
+	newState, err := csv.ProcessCsvByPath(reader, &validFieldNames)
 	if err != nil {
-		ctx.Response.SetStatusCode(500)
-		fmt.Fprintf(ctx, "error processing data: %s", err.Error())
+		ctx.Response.SetStatusCode(400)
+		fmt.Fprintf(ctx, "error processing csv: %s", err.Error())
 		return
 	}
+
+	pod.AddLocalState(newState...)
 
 	ctx.Response.SetStatusCode(201)
 }
