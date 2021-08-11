@@ -1,5 +1,5 @@
 ---
-name: test
+name: pr_test
 
 on:
   pull_request:
@@ -22,6 +22,9 @@ jobs:
         with:
           go-version: ${{ env.GOVER }}
 
+      - name: go vet
+        run: go vet ./...
+      
       - name: go test
         run: go test ./...
 
