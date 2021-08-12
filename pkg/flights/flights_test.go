@@ -15,12 +15,17 @@ func TestFlight(t *testing.T) {
 func testRecordEpisode() func(*testing.T) {
 	return func(t *testing.T) {
 		flight := flights.NewFlight(1)
-		episode := flights.Episode{EpisodeId: 1}
+		episode := flights.Episode{
+			EpisodeId: 1,
+		}
 
 		ts := time.Now()
 		flight.RecordEpisode(&episode)
+		episodes := flight.Episodes()
 
-		assert.EqualValues(t, 1, flight.Episodes()[0].EpisodeId)
-		assert.True(t, flight.End().After(ts))
+		assert.Equal(t, 1, len(episodes), "unexpected number of episodes")
+		assert.EqualValues(t, 1, episodes[0].EpisodeId)
+
+		assert.True(t, flight.End() == ts || flight.End().After(ts))
 	}
 }
