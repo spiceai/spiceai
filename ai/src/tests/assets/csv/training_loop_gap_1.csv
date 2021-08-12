@@ -1,4 +1,4 @@
-time,local_portfolio_usd_balance,local_portfolio_btc_balance,coinbase_btcusd_price
+time,local_portfolio_usd_balance,local_portfolio_btc_balance,coinbase_btcusd_close
 1626697860,,,31198.839090909096
 1626697870,,,31166.879444444443
 1626697880,,,31106.09007299272
