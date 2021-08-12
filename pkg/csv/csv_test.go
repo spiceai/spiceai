@@ -2,8 +2,8 @@ package csv
 
 import (
 	"bytes"
-	"fmt"
 	"io/ioutil"
+	"sort"
 	"testing"
 
 	"github.com/bradleyjkemp/cupaloy"
@@ -82,14 +82,14 @@ func testProcessCsvByPathFunc(csvData []byte) func(*testing.T) {
 			return
 		}
 
-		fmt.Printf("%v\n\n", actualState)
-
 		assert.Equal(t, 2, len(actualState), "expected two state objects")
-		assert.Equal(t, "local.portfolio", actualState[0].Path(), "expected path incorrect")
-		assert.Equal(t, "coinbase.btcusd", actualState[1].Path(), "expected path incorrect")
 
-		expectedObservations := make([]observations.Observation, 0)
-		assert.Equal(t, expectedObservations, actualState[0].Observations(), "Observations not correct")
+		sort.Slice(actualState, func(i, j int) bool {
+			return actualState[i].Path() < actualState[j].Path()
+		})
+
+		assert.Equal(t, "coinbase.btcusd", actualState[0].Path(), "expected path incorrect")
+		assert.Equal(t, "local.portfolio", actualState[1].Path(), "expected path incorrect")
 
 		expectedFirstObservation := observations.Observation{
 			Time: 1626697480,
@@ -98,9 +98,12 @@ func testProcessCsvByPathFunc(csvData []byte) func(*testing.T) {
 			},
 		}
 
-		actualObservations := actualState[1].Observations()
-		assert.Equal(t, expectedFirstObservation, actualState[1].Observations()[0], "First Observation not correct")
+		actualObservations := actualState[0].Observations()
+		assert.Equal(t, expectedFirstObservation, actualState[0].Observations()[0], "First Observation not correct")
 		assert.Equal(t, 57, len(actualObservations), "number of observations incorrect")
+
+		expectedObservations := make([]observations.Observation, 0)
+		assert.Equal(t, expectedObservations, actualState[1].Observations(), "Observations not correct")
 	}
 }
 
