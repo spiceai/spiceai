@@ -1,18 +1,29 @@
+params:
+  granularity: 10s
+  interval: 10s
+  period: 3000s
+
 datasources:
-  - datasource:
-    from: gym
-    name: CartPole-v1
+  - from: gym
+    name: CartPole
     connector:
       type: openai-gym
+      params:
+        environment: CartPole-v1
     fields:
-      - name: position
-      - name: velocity
+      - name: cart_position
+      - name: cart_velocity
       - name: pole_angle
       - name: pole_angular_velocity
+      - name: is_done
     actions:
       left: passthru
       right: passthru
 
 training:
   goal: score > 200
-  rewards: uniform
+  rewards:
+    - reward: left
+      with: reward = 0 if new_state.gym_CartPole_is_done == 1 else 1
+    - reward: right
+      with: reward = 0 if new_state.gym_CartPole_is_done == 1 else 1
