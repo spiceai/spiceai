@@ -85,10 +85,10 @@ func testActionsFunc(dsSpec spec.DataSourceSpec) func(*testing.T) {
 		case "coinbase/btcusd":
 			expected = make(map[string]string)
 
-		case "gym/CartPole-v1":
+		case "gym/CartPole":
 			expected = map[string]string{
-				"gym.CartPole-v1.left":  "passthru",
-				"gym.CartPole-v1.right": "passthru",
+				"gym.CartPole.left":  "passthru",
+				"gym.CartPole.right": "passthru",
 			}
 		}
 		if !reflect.DeepEqual(expected, actual) {
@@ -120,12 +120,13 @@ func testFieldsFunc(dsSpec spec.DataSourceSpec) func(*testing.T) {
 				"coinbase.btcusd.close": 0,
 			}
 
-		case "gym/CartPole-v1":
+		case "gym/CartPole":
 			expected = map[string]float64{
-				"gym.CartPole-v1.pole_angle":            0,
-				"gym.CartPole-v1.pole_angular_velocity": 0,
-				"gym.CartPole-v1.position":              0,
-				"gym.CartPole-v1.velocity":              0,
+				"gym.CartPole.pole_angle":            0,
+				"gym.CartPole.pole_angular_velocity": 0,
+				"gym.CartPole.cart_position":         0,
+				"gym.CartPole.cart_velocity":         0,
+				"gym.CartPole.is_done":               0,
 			}
 		}
 
@@ -158,12 +159,13 @@ func testFieldNamesFunc(dsSpec spec.DataSourceSpec) func(*testing.T) {
 				"close": "coinbase.btcusd.close",
 			}
 
-		case "gym/CartPole-v1":
+		case "gym/CartPole":
 			expected = map[string]string{
-				"pole_angle":            "gym.CartPole-v1.pole_angle",
-				"pole_angular_velocity": "gym.CartPole-v1.pole_angular_velocity",
-				"position":              "gym.CartPole-v1.position",
-				"velocity":              "gym.CartPole-v1.velocity",
+				"pole_angle":            "gym.CartPole.pole_angle",
+				"pole_angular_velocity": "gym.CartPole.pole_angular_velocity",
+				"cart_position":         "gym.CartPole.cart_position",
+				"cart_velocity":         "gym.CartPole.cart_velocity",
+				"is_done":               "gym.CartPole.is_done",
 			}
 		}
 
@@ -194,10 +196,10 @@ func testActionNamesFunc(dsSpec spec.DataSourceSpec) func(*testing.T) {
 		case "coinbase/btcusd":
 			expected = make(map[string]string)
 
-		case "gym/CartPole-v1":
+		case "gym/CartPole":
 			expected = map[string]string{
-				"left":  "gym.CartPole-v1.left",
-				"right": "gym.CartPole-v1.right",
+				"left":  "gym.CartPole.left",
+				"right": "gym.CartPole.right",
 			}
 		}
 
