@@ -1,6 +1,7 @@
 package flights
 
 import (
+	"sync"
 	"time"
 )
 
@@ -8,6 +9,7 @@ type Flight struct {
 	start    time.Time
 	end      time.Time
 	episodes []*Episode
+	episodesMutex sync.RWMutex
 }
 
 func NewFlight(episodes int) *Flight {
@@ -22,6 +24,9 @@ func (f *Flight) Complete() {
 }
 
 func (f *Flight) RecordEpisode(e *Episode) {
+	f.episodesMutex.Lock()
+	defer f.episodesMutex.Unlock()
+
 	f.episodes = append(f.episodes, e)
 	if len(f.episodes) >= f.ExpectedEpisodes() || e.Error != "" {
 		f.Complete()

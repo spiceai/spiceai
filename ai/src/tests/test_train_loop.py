@@ -206,12 +206,12 @@ class TrainingLoopTests(unittest.TestCase):
         gap_start = pd.to_datetime(1626697640, unit="s")
         gap_end = pd.to_datetime(1626697860, unit="s")
         table = main.data_managers["trader"].massive_table_filled
-        price = list(table[gap_start:gap_start].coinbase_btcusd_price)[-1]
+        price = list(table[gap_start:gap_start].coinbase_btcusd_close)[-1]
 
         # Validate the forward filling is working.
         current_time = gap_start
         while current_time < gap_end:
-            next_price = list(table[current_time:current_time].coinbase_btcusd_price)[
+            next_price = list(table[current_time:current_time].coinbase_btcusd_close)[
                 -1
             ]
             self.assertEqual(price, next_price)
@@ -414,7 +414,7 @@ class TrainingLoopTests(unittest.TestCase):
         trader_init = copy.deepcopy(self.trader_init)
         trader_init["datasources"][0]["actions"][
             "buy"
-        ] = "local_portfolio_usd_balance1 -= coinbase_btcusd_price\nlocal_portfolio_btc_balance += 1"
+        ] = "local_portfolio_usd_balance1 -= coinbase_btcusd_close\nlocal_portfolio_btc_balance += 1"
 
         self.init("trader", trader_init)
 
@@ -449,7 +449,7 @@ class TrainingLoopTests(unittest.TestCase):
             "time",
             "local_portfolio_usd_balance",
             "local_portfolio_btc_balance",
-            "coinbase_btcusd_price",
+            "coinbase_btcusd_close",
         ]
         writer = csv.writer(csv_data)
         writer.writerow(headers)

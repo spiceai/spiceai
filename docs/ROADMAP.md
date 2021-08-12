@@ -8,7 +8,7 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 
 ### Known bugs
 
-- Observations API returns incomplete data
+- Data Connectors do not honor interval
 
 ### v0.1-alpha Developer Preview limitations
 

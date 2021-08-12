@@ -2,7 +2,6 @@ package pods
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 	"io/ioutil"
 	"path/filepath"
@@ -32,9 +31,9 @@ func TestPod(t *testing.T) {
 		t.Run(fmt.Sprintf("FieldNames() - %s", manifestToTest), testFieldNamesFunc(pod))
 		t.Run(fmt.Sprintf("Rewards() - %s", manifestToTest), testRewardsFunc(pod))
 		t.Run(fmt.Sprintf("Actions() - %s", manifestToTest), testActionsFunc(pod))
-		t.Run(fmt.Sprintf("CachedObservations() - %s", manifestToTest), testCachedObservationsFunc(pod))
-		t.Run(fmt.Sprintf("AddLocalObservations() - %s", manifestToTest), testAddLocalObservationsFunc(pod))
-		t.Run(fmt.Sprintf("AddLocalObservations()/CachedObservations() - %s", manifestToTest), testAddLocalObservationsCachedObservationsFunc(pod))
+		t.Run(fmt.Sprintf("CachedCsv() - %s", manifestToTest), testCachedCsvFunc(pod))
+		t.Run(fmt.Sprintf("AddLocalState() - %s", manifestToTest), testAddLocalStateFunc(pod))
+		t.Run(fmt.Sprintf("AddLocalState()/CachedCsv() - %s", manifestToTest), testAddLocalStateCachedCsvFunc(pod))
 	}
 }
 
@@ -48,9 +47,9 @@ func testBasePropertiesFunc(pod *Pod) func(*testing.T) {
 
 		switch pod.Name {
 		case "trader":
-			expected = "9883cd1c9f69a500c58a1b20126f45f0"
+			expected = "d2cc6c526c3f48b630a251fb1b586cf4"
 		case "trader-infer":
-			expected = "e1942845c72c1f16b9a91824fcd392b8"
+			expected = "95c0e9b0b65ae7b50af26b4582126624"
 		case "cartpole-v1":
 			expected = "39bf314b96309caa223d9881ed5674b4"
 		}
@@ -138,7 +137,7 @@ func testFieldNamesFunc(pod *Pod) func(*testing.T) {
 			fallthrough
 		case "trader-infer":
 			expected = []string{
-				"coinbase.btcusd.price",
+				"coinbase.btcusd.close",
 				"local.portfolio.btc_balance",
 				"local.portfolio.usd_balance",
 			}
@@ -195,9 +194,9 @@ func testActionsFunc(pod *Pod) func(*testing.T) {
 		switch pod.Name {
 		case "trader":
 			expected = map[string]string{
-				"buy":  "local.portfolio.usd_balance -= coinbase.btcusd.price\nlocal.portfolio.btc_balance += 1",
+				"buy":  "local.portfolio.usd_balance -= coinbase.btcusd.close\nlocal.portfolio.btc_balance += 1",
 				"hold": "",
-				"sell": "local.portfolio.usd_balance += coinbase.btcusd.price\nlocal.portfolio.btc_balance -= 1",
+				"sell": "local.portfolio.usd_balance += coinbase.btcusd.close\nlocal.portfolio.btc_balance -= 1",
 			}
 		case "trader-infer":
 			expected = map[string]string{
@@ -217,8 +216,8 @@ func testActionsFunc(pod *Pod) func(*testing.T) {
 	}
 }
 
-// Tests CachedObservations() getter
-func testCachedObservationsFunc(pod *Pod) func(*testing.T) {
+// Tests CachedCsv() getter
+func testCachedCsvFunc(pod *Pod) func(*testing.T) {
 	return func(t *testing.T) {
 		_, err := pod.FetchNewData()
 		if err != nil {
@@ -226,14 +225,14 @@ func testCachedObservationsFunc(pod *Pod) func(*testing.T) {
 			return
 		}
 
-		actual := pod.CachedObservations()
+		actual := pod.CachedCsv()
 
 		snapshotter.SnapshotT(t, actual)
 	}
 }
 
-// Tests AddLocalObservations() getter
-func testAddLocalObservationsFunc(pod *Pod) func(*testing.T) {
+// Tests AddLocalState()
+func testAddLocalStateFunc(pod *Pod) func(*testing.T) {
 	return func(t *testing.T) {
 		data, err := ioutil.ReadFile("../../test/assets/data/csv/trader_input.csv")
 		if err != nil {
@@ -241,29 +240,18 @@ func testAddLocalObservationsFunc(pod *Pod) func(*testing.T) {
 			return
 		}
 
-		observations, err := csv.ProcessCsv(bytes.NewReader(data))
+		reader := bytes.NewReader(data)
+		newState, err := csv.ProcessCsvByPath(reader, nil)
 		if err != nil {
 			t.Error(err)
 		}
 
-		err = pod.AddLocalObservations(observations...)
-
-		switch pod.Name {
-		case "trader":
-			fallthrough
-		case "trader-infer":
-			assert.NoError(t, err, "failed to add observations")
-		case "cartpole-v1":
-			if assert.Error(t, err) {
-				expectedError := errors.New("coinbase.btcusd.price is an invalid field for pod cartpole-v1. Valid fields are: [gym.CartPole-v1.pole_angle gym.CartPole-v1.pole_angular_velocity gym.CartPole-v1.position gym.CartPole-v1.velocity]")
-				assert.Equal(t, expectedError, err, "Did not produce expected error")
-			}
-		}
+		pod.AddLocalState(newState...)
 	}
 }
 
-// Tests AddLocalObservationsCachedObservations() getter
-func testAddLocalObservationsCachedObservationsFunc(pod *Pod) func(*testing.T) {
+// Tests AddLocalStateCachedCsv()
+func testAddLocalStateCachedCsvFunc(pod *Pod) func(*testing.T) {
 	return func(t *testing.T) {
 		data, err := ioutil.ReadFile("../../test/assets/data/csv/trader_input.csv")
 		if err != nil {
@@ -271,26 +259,17 @@ func testAddLocalObservationsCachedObservationsFunc(pod *Pod) func(*testing.T) {
 			return
 		}
 
-		observations, err := csv.ProcessCsv(bytes.NewReader(data))
+		reader := bytes.NewReader(data)
+		newState, err := csv.ProcessCsvByPath(reader, nil)
 		if err != nil {
 			t.Error(err)
 		}
 
-		err = pod.AddLocalObservations(observations...)
+		assert.Equal(t, 2, len(newState), "expected two state objects, one for local and one for coinbase")
 
-		switch pod.Name {
-		case "trader":
-			fallthrough
-		case "trader-infer":
-			assert.NoError(t, err, "failed to add observations")
-		case "cartpole-v1":
-			if assert.Error(t, err) {
-				expectedError := errors.New("coinbase.btcusd.price is an invalid field for pod cartpole-v1. Valid fields are: [gym.CartPole-v1.pole_angle gym.CartPole-v1.pole_angular_velocity gym.CartPole-v1.position gym.CartPole-v1.velocity]")
-				assert.Equal(t, expectedError, err, "Did not produce expected error")
-			}
-		}
+		pod.AddLocalState(newState...)
 
-		actual := pod.CachedObservations()
+		actual := pod.CachedCsv()
 
 		snapshotter.SnapshotT(t, actual)
 	}

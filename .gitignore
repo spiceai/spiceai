@@ -20,7 +20,11 @@ dist
 
 # Binaries
 cmd/spice/spice
+cmd/spice/.spice
+cmd/spice/data
 cmd/spiced/spiced
+cmd/spiced/.spice
+cmd/spiced/data
 
 # AI
 __pycache__

@@ -1,0 +1,392 @@
+([]*state.State) (len=2) {
+  (*state.State)({
+    Time: (time.Time) 2021-08-11 15:16:15.015996 +0900 KST m=+0.017609668,
+    TimeSentToAIEngine: (time.Time) 0001-01-01 00:00:00 +0000 UTC,
+    path: (string) (len=15) "local.portfolio",
+    fieldNames: ([]string) (len=2) {
+      (string) (len=11) "usd_balance",
+      (string) (len=11) "btc_balance"
+    },
+    fields: ([]string) (len=2) {
+      (string) (len=27) "local.portfolio.usd_balance",
+      (string) (len=27) "local.portfolio.btc_balance"
+    },
+    observations: ([]observations.Observation) {
+    },
+    observationsMutex: (sync.RWMutex) {
+      w: (sync.Mutex) {
+        state: (int32) 0,
+        sema: (uint32) 0
+      },
+      writerSem: (uint32) 0,
+      readerSem: (uint32) 0,
+      readerCount: (int32) 0,
+      readerWait: (int32) 0
+    }
+  }),
+  (*state.State)({
+    Time: (time.Time) 2021-08-11 15:16:15.015997 +0900 KST m=+0.017610210,
+    TimeSentToAIEngine: (time.Time) 0001-01-01 00:00:00 +0000 UTC,
+    path: (string) (len=15) "coinbase.btcusd",
+    fieldNames: ([]string) (len=1) {
+      (string) (len=5) "price"
+    },
+    fields: ([]string) (len=1) {
+      (string) (len=21) "coinbase.btcusd.price"
+    },
+    observations: ([]observations.Observation) (len=57) {
+      (observations.Observation) {
+        Time: (int64) 1626697480,
+        Data: (map[string]float64) (len=1) {
+          (string) (len=5) "price": (float64) 31232.709090909084
+        }
+      },
+      (observations.Observation) {
+        Time: (int64) 1626697490,
+        Data: (map[string]float64) (len=1) {
+          (string) (len=5) "price": (float64) 31249.58714285714
+        }
+      },
+      (observations.Observation) {
+        Time: (int64) 1626697500,
+        Data: (map[string]float64) (len=1) {
+          (string) (len=5) "price": (float64) 31251.882352941182
+        }
+      },
+      (observations.Observation) {
+        Time: (int64) 1626697510,
+        Data: (map[string]float64) (len=1) {
+          (string) (len=5) "price": (float64) 31232.918181818175
+        }
+      },
+      (observations.Observation) {
+        Time: (int64) 1626697520,
+        Data: (map[string]float64) (len=1) {
+          (string) (len=5) "price": (float64) 31229.15692307692
+        }
+      },
+      (observations.Observation) {
+        Time: (int64) 1626697530,
+        Data: (map[string]float64) (len=1) {
+          (string) (len=5) "price": (float64) 31230.817777777775
+        }
+      },
+      (observations.Observation) {
+        Time: (int64) 1626697540,
+        Data: (map[string]float64) (len=1) {
+          (string) (len=5) "price": (float64) 31229.688000000002
+        }
+      },
+      (observations.Observation) {
+        Time: (int64) 1626697550,
+        Data: (map[string]float64) (len=1) {
+          (string) (len=5) "price": (float64) 31223.926363636358
+        }
+      },
+      (observations.Observation) {
+        Time: (int64) 1626697560,
+        Data: (map[string]float64) (len=1) {
+          (string) (len=5) "price": (float64) 31214.111875
+        }
+      },
+      (observations.Observation) {
+        Time: (int64) 1626697570,
+        Data: (map[string]float64) (len=1) {
+          (string) (len=5) "price": (float64) 31215.271250000005
+        }
+      },
+      (observations.Observation) {
+        Time: (int64) 1626697580,
+        Data: (map[string]float64) (len=1) {
+          (string) (len=5) "price": (float64) 31212.456363636364
+        }
+      },
+      (observations.Observation) {
+        Time: (int64) 1626697590,
+        Data: (map[string]float64) (len=1) {
+          (string) (len=5) "price": (float64) 31212.45625
+        }
+      },
+      (observations.Observation) {
+        Time: (int64) 1626697600,
+        Data: (map[string]float64) (len=1) {
+          (string) (len=5) "price": (float64) 31222.47125
+        }
+      },
+      (observations.Observation) {
+        Time: (int64) 1626697610,
+        Data: (map[string]float64) (len=1) {
+          (string) (len=5) "price": (float64) 31224.57157894736
+        }
+      },
+      (observations.Observation) {
+        Time: (int64) 1626697620,
+        Data: (map[string]float64) (len=1) {
+          (string) (len=5) "price": (float64) 31223.700769230767
+        }
+      },
+      (observations.Observation) {
+        Time: (int64) 1626697630,
+        Data: (map[string]float64) (len=1) {
+          (string) (len=5) "price": (float64) 31216.57388888888
+        }
+      },
+      (observations.Observation) {
+        Time: (int64) 1626697640,
+        Data: (map[string]float64) (len=1) {
+          (string) (len=5) "price": (float64) 31223.65166666667
+        }
+      },
+      (observations.Observation) {
+        Time: (int64) 1626697650,
+        Data: (map[string]float64) (len=1) {
+          (string) (len=5) "price": (float64) 31225.18857142857
+        }
+      },
+      (observations.Observation) {
+        Time: (int64) 1626697660,
+        Data: (map[string]float64) (len=1) {
+          (string) (len=5) "price": (float64) 31222.940000000002
+        }
+      },
+      (observations.Observation) {
+        Time: (int64) 1626697670,
+        Data: (map[string]float64) (len=1) {
+          (string) (len=5) "price": (float64) 31223.278571428567
+        }
+      },
+      (observations.Observation) {
+        Time: (int64) 1626697680,
+        Data: (map[string]float64) (len=1) {
+          (string) (len=5) "price": (float64) 31225.01222222222
+        }
+      },
+      (observations.Observation) {
+        Time: (int64) 1626697690,
+        Data: (map[string]float64) (len=1) {
+          (string) (len=5) "price": (float64) 31224.7925
+        }
+      },
+      (observations.Observation) {
+        Time: (int64) 1626697700,
+        Data: (map[string]float64) (len=1) {
+          (string) (len=5) "price": (float64) 31229.456666666665
+        }
+      },
+      (observations.Observation) {
+        Time: (int64) 1626697710,
+        Data: (map[string]float64) (len=1) {
+          (string) (len=5) "price": (float64) 31237.051111111112
+        }
+      },
+      (observations.Observation) {
+        Time: (int64) 1626697720,
+        Data: (map[string]float64) (len=1) {
+          (string) (len=5) "price": (float64) 31244.267777777775
+        }
+      },
+      (observations.Observation) {
+        Time: (int64) 1626697730,
+        Data: (map[string]float64) (len=1) {
+          (string) (len=5) "price": (float64) 31244.265000000003
+        }
+      },
+      (observations.Observation) {
+        Time: (int64) 1626697740,
+        Data: (map[string]float64) (len=1) {
+          (string) (len=5) "price": (float64) 31240.976000000002
+        }
+      },
+      (observations.Observation) {
+        Time: (int64) 1626697750,
+        Data: (map[string]float64) (len=1) {
+          (string) (len=5) "price": (float64) 31232.241250000003
+        }
+      },
+      (observations.Observation) {
+        Time: (int64) 1626697760,
+        Data: (map[string]float64) (len=1) {
+          (string) (len=5) "price": (float64) 31228.209999999995
+        }
+      },
+      (observations.Observation) {
+        Time: (int64) 1626697770,
+        Data: (map[string]float64) (len=1) {
+          (string) (len=5) "price": (float64) 31231.48545454545
+        }
+      },
+      (observations.Observation) {
+        Time: (int64) 1626697780,
+        Data: (map[string]float64) (len=1) {
+          (string) (len=5) "price": (float64) 31228.78
+        }
+      },
+      (observations.Observation) {
+        Time: (int64) 1626697790,
+        Data: (map[string]float64) (len=1) {
+          (string) (len=5) "price": (float64) 31229.997777777775
+        }
+      },
+      (observations.Observation) {
+        Time: (int64) 1626697800,
+        Data: (map[string]float64) (len=1) {
+          (string) (len=5) "price": (float64) 31229.95428571428
+        }
+      },
+      (observations.Observation) {
+        Time: (int64) 1626697810,
+        Data: (map[string]float64) (len=1) {
+          (string) (len=5) "price": (float64) 31207.76365079364
+        }
+      },
+      (observations.Observation) {
+        Time: (int64) 1626697820,
+        Data: (map[string]float64) (len=1) {
+          (string) (len=5) "price": (float64) 31187.065555555568
+        }
+      },
+      (observations.Observation) {
+        Time: (int64) 1626697830,
+        Data: (map[string]float64) (len=1) {
+          (string) (len=5) "price": (float64) 31202.949565217386
+        }
+      },
+      (observations.Observation) {
+        Time: (int64) 1626697840,
+        Data: (map[string]float64) (len=1) {
+          (string) (len=5) "price": (float64) 31203.676
+        }
+      },
+      (observations.Observation) {
+        Time: (int64) 1626697850,
+        Data: (map[string]float64) (len=1) {
+          (string) (len=5) "price": (float64) 31193.947419354838
+        }
+      },
+      (observations.Observation) {
+        Time: (int64) 1626697860,
+        Data: (map[string]float64) (len=1) {
+          (string) (len=5) "price": (float64) 31198.839090909096
+        }
+      },
+      (observations.Observation) {
+        Time: (int64) 1626697870,
+        Data: (map[string]float64) (len=1) {
+          (string) (len=5) "price": (float64) 31166.879444444443
+        }
+      },
+      (observations.Observation) {
+        Time: (int64) 1626697880,
+        Data: (map[string]float64) (len=1) {
+          (string) (len=5) "price": (float64) 31106.09007299272
+        }
+      },
+      (observations.Observation) {
+        Time: (int64) 1626697890,
+        Data: (map[string]float64) (len=1) {
+          (string) (len=5) "price": (float64) 31120.469285714273
+        }
+      },
+      (observations.Observation) {
+        Time: (int64) 1626697900,
+        Data: (map[string]float64) (len=1) {
+          (string) (len=5) "price": (float64) 31127.45947368421
+        }
+      },
+      (observations.Observation) {
+        Time: (int64) 1626697910,
+        Data: (map[string]float64) (len=1) {
+          (string) (len=5) "price": (float64) 31118.449166666673
+        }
+      },
+      (observations.Observation) {
+        Time: (int64) 1626697920,
+        Data: (map[string]float64) (len=1) {
+          (string) (len=5) "price": (float64) 31123.060370370356
+        }
+      },
+      (observations.Observation) {
+        Time: (int64) 1626697930,
+        Data: (map[string]float64) (len=1) {
+          (string) (len=5) "price": (float64) 31133.14
+        }
+      },
+      (observations.Observation) {
+        Time: (int64) 1626697940,
+        Data: (map[string]float64) (len=1) {
+          (string) (len=5) "price": (float64) 31124.023684210522
+        }
+      },
+      (observations.Observation) {
+        Time: (int64) 1626697950,
+        Data: (map[string]float64) (len=1) {
+          (string) (len=5) "price": (float64) 31123.479761904753
+        }
+      },
+      (observations.Observation) {
+        Time: (int64) 1626697960,
+        Data: (map[string]float64) (len=1) {
+          (string) (len=5) "price": (float64) 31122.878
+        }
+      },
+      (observations.Observation) {
+        Time: (int64) 1626697970,
+        Data: (map[string]float64) (len=1) {
+          (string) (len=5) "price": (float64) 31111.5027536232
+        }
+      },
+      (observations.Observation) {
+        Time: (int64) 1626697980,
+        Data: (map[string]float64) (len=1) {
+          (string) (len=5) "price": (float64) 31103.21105263158
+        }
+      },
+      (observations.Observation) {
+        Time: (int64) 1626697990,
+        Data: (map[string]float64) (len=1) {
+          (string) (len=5) "price": (float64) 31122.5829032258
+        }
+      },
+      (observations.Observation) {
+        Time: (int64) 1626698000,
+        Data: (map[string]float64) (len=1) {
+          (string) (len=5) "price": (float64) 31136.449677419354
+        }
+      },
+      (observations.Observation) {
+        Time: (int64) 1626698010,
+        Data: (map[string]float64) (len=1) {
+          (string) (len=5) "price": (float64) 31142.228333333333
+        }
+      },
+      (observations.Observation) {
+        Time: (int64) 1626698020,
+        Data: (map[string]float64) (len=1) {
+          (string) (len=5) "price": (float64) 31137.710285714296
+        }
+      },
+      (observations.Observation) {
+        Time: (int64) 1626698030,
+        Data: (map[string]float64) (len=1) {
+          (string) (len=5) "price": (float64) 31123.34363636363
+        }
+      },
+      (observations.Observation) {
+        Time: (int64) 1626698040,
+        Data: (map[string]float64) (len=1) {
+          (string) (len=5) "price": (float64) 31110.61892857143
+        }
+      }
+    },
+    observationsMutex: (sync.RWMutex) {
+      w: (sync.Mutex) {
+        state: (int32) 0,
+        sema: (uint32) 0
+      },
+      writerSem: (uint32) 0,
+      readerSem: (uint32) 0,
+      readerCount: (int32) 0,
+      readerWait: (int32) 0
+    }
+  })
+}

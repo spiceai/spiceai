@@ -7,8 +7,8 @@
     {
       "connector": { "type": "stateful" },
       "actions": {
-        "buy": "local_portfolio_usd_balance -= coinbase_btcusd_price\nlocal_portfolio_btc_balance += 1",
-        "sell": "local_portfolio_usd_balance += coinbase_btcusd_price\nlocal_portfolio_btc_balance -= 1"
+        "buy": "local_portfolio_usd_balance -= coinbase_btcusd_close\nlocal_portfolio_btc_balance += 1",
+        "sell": "local_portfolio_usd_balance += coinbase_btcusd_close\nlocal_portfolio_btc_balance -= 1"
       }
     },
     {
@@ -22,7 +22,7 @@
     }
   ],
   "fields": {
-    "coinbase_btcusd_price": 0,
+    "coinbase_btcusd_close": 0,
     "local_portfolio_btc_balance": 0,
     "local_portfolio_usd_balance": 1000000
   },

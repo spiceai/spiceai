@@ -91,7 +91,10 @@ class DataManager:
             return expressions.where(condition, existing_values, newer_values)
 
         with self.table_lock:
-            if (
+            if len(new_data) == 0:
+                return
+
+            elif (
                 len(new_data) == 1
                 and new_data.index[0] in self.massive_table_sparse.index
             ):

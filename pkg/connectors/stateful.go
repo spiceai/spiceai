@@ -20,6 +20,10 @@ func NewStateConnector(params map[string]string) Connector {
 	}
 }
 
+func (c *StateConnector) Type() string {
+	return StatefulConnectorId
+}
+
 func (c *StateConnector) Initialize() error {
 	c.stateMutex.Lock()
 	defer c.stateMutex.Unlock()
@@ -36,6 +40,9 @@ func (c *StateConnector) AppendData(observations []observations.Observation) {
 	c.state = append(c.state, observations...)
 }
 
-func (c *StateConnector) FetchData(period time.Duration, interval time.Duration) ([]observations.Observation, error) {
+func (c *StateConnector) FetchData(epoch time.Time, period time.Duration, interval time.Duration) ([]observations.Observation, error) {
+	c.stateMutex.RLock()
+	defer c.stateMutex.RUnlock()
+
 	return c.state, nil
 }

@@ -351,13 +351,13 @@ func SendData(pod *pods.Pod, podState ...*state.State) error {
 
 		csv := strings.Builder{}
 		csv.WriteString("time")
-		for _, field := range s.Fields {
+		for _, field := range s.Fields() {
 			csv.WriteString(",")
 			csv.WriteString(strings.ReplaceAll(field, ".", "_"))
 		}
 		csv.WriteString("\n")
 
-		csvChunk, csvPreview := observations.GetCsv(s.Fields, s.Observations(), 5)
+		csvChunk, csvPreview := observations.GetCsv(s.Fields(), s.Observations(), 5)
 
 		log.Printf("Posting data to AI engine:\n%s", aurora.BrightYellow(fmt.Sprintf("%s%s...\n%d observations posted", csv.String(), csvPreview, len(s.Observations()))))
 

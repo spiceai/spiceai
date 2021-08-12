@@ -16,8 +16,8 @@ func TestConnectors(t *testing.T) {
 	params := make(map[string]string)
 	openAIGymConnector, err := connectors.NewConnector("openai-gym", params)
 	if assert.NoError(t, err) {
-		t.Run("OpenAI Gym Initialize()", testOpenAIGymInitializeFunc(openAIGymConnector.(*connectors.StateConnector)))
-		t.Run("OpenAI Gym FetchData()", testOpenAIGymFetchDataFunc(openAIGymConnector.(*connectors.StateConnector)))
+		t.Run("OpenAI Gym Initialize()", testOpenAIGymInitializeFunc(openAIGymConnector.(*connectors.OpenAIGymConnector)))
+		t.Run("OpenAI Gym FetchData()", testOpenAIGymFetchDataFunc(openAIGymConnector.(*connectors.OpenAIGymConnector)))
 	}
 
 	// State connector
@@ -43,16 +43,16 @@ func TestConnectors(t *testing.T) {
 	}
 }
 
-func testOpenAIGymInitializeFunc(c *connectors.StateConnector) func(*testing.T) {
+func testOpenAIGymInitializeFunc(c *connectors.OpenAIGymConnector) func(*testing.T) {
 	return func(t *testing.T) {
 		err := c.Initialize()
 		assert.NoError(t, err)
 	}
 }
 
-func testOpenAIGymFetchDataFunc(c *connectors.StateConnector) func(*testing.T) {
+func testOpenAIGymFetchDataFunc(c *connectors.OpenAIGymConnector) func(*testing.T) {
 	return func(t *testing.T) {
-		data, err := c.FetchData(time.Hour*24*365*10, time.Minute*1)
+		data, err := c.FetchData(time.Time{}, time.Hour*24*365*10, time.Minute*1)
 		if assert.NoError(t, err) {
 			assert.EqualValues(t, []observations.Observation{}, data)
 		}
@@ -68,7 +68,7 @@ func testStateInitializeFunc(c *connectors.StateConnector) func(*testing.T) {
 
 func testStateFetchDataFunc(c *connectors.StateConnector) func(*testing.T) {
 	return func(t *testing.T) {
-		data, err := c.FetchData(time.Hour*24*365*10, time.Minute*1)
+		data, err := c.FetchData(time.Time{}, time.Hour*24*365*10, time.Minute*1)
 		if assert.NoError(t, err) {
 			assert.EqualValues(t, []observations.Observation{}, data)
 		}
@@ -86,7 +86,7 @@ func testCsvInitializeFunc(c *connectors.CsvConnector) func(*testing.T) {
 
 func testCsvFetchDataFunc(c *connectors.CsvConnector) func(*testing.T) {
 	return func(t *testing.T) {
-		data, err := c.FetchData(time.Hour*24*365*10, time.Minute*1)
+		data, err := c.FetchData(time.Unix(1605312000, 0), time.Hour*24*365*10, time.Minute*1)
 		if err != nil {
 			t.Error(err)
 		}

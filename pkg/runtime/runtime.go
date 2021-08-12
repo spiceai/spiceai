@@ -122,7 +122,12 @@ func Run() error {
 	fmt.Println("Use Ctrl-C to stop")
 
 	// Setup
-	runtime.scanForPods()
+	err = runtime.scanForPods()
+	if err != nil {
+		log.Printf("error scanning for pods: %s", err.Error())
+		return err
+	}
+
 	err = watchPods()
 	if err != nil {
 		return err
@@ -136,27 +141,27 @@ func Run() error {
 	return nil
 }
 
-func (r *SpiceRuntime) scanForPods() {
+func (r *SpiceRuntime) scanForPods() error {
 	_, err := os.Stat(config.AppSpicePath())
 	if err != nil {
-		return
+		return err
 	}
 
 	podsManifestDir := config.PodsManifestsPath()
 	_, err = os.Stat(podsManifestDir)
 	if err != nil {
-		return
+		return err
 	}
 
 	d, err := os.Open(podsManifestDir)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 
 	files, err := d.Readdir(-1)
 	d.Close()
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 
 	for _, f := range files {
@@ -181,6 +186,8 @@ func (r *SpiceRuntime) scanForPods() {
 			fmt.Printf("Loaded datasource %s\n", aurora.BrightCyan(ds.Name()))
 		}
 	}
+
+	return nil
 }
 
 func Shutdown() {
