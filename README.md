@@ -5,7 +5,7 @@
 [![Discord](https://img.shields.io/discord/803820740868571196)](https://discord.com/channels/803820740868571196/803820740868571199)
 [![Follow on Twitter](https://img.shields.io/twitter/follow/spiceaihq.svg?style=social&logo=twitter)](https://twitter.com/intent/follow?screen_name=spiceaihq)
 
-Spice AI is an open source runtime and distribution system for series AI built for developers.
+Spice AI is an open source runtime and distribution system for time series AI built for developers.
 
 ---
 
