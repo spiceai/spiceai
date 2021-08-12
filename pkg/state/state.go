@@ -42,7 +42,6 @@ func (s *State) FieldNames() []string {
 }
 
 func (s *State) Fields() []string {
-
 	return s.fields
 }
 
