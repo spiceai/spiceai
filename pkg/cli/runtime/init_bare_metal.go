@@ -24,15 +24,22 @@ func getCurrentVersion() (string, error) {
 }
 
 func initBareMetal() error {
-	release, err := getLatestRuntimeRelease()
-	if err != nil {
-		return err
-	}
-
 	binDir := config.SpiceBinPath()
 	var isUpgrade bool = false
+	var release *github.RepoRelease = nil
+
 	if !isBinaryInstallationRequired(runtimeFileName, binDir) {
 		currentVersion, err := getCurrentVersion()
+		if err != nil {
+			return err
+		}
+
+		if currentVersion == "edge" {
+			fmt.Println("Using latest 'edge' runtime version.")
+			return nil
+		}
+
+		release, err := getLatestRuntimeRelease()
 		if err != nil {
 			return err
 		}
@@ -40,9 +47,6 @@ func initBareMetal() error {
 		latestRelease := trimSuffix(release.TagName)
 		if semver.Compare(currentVersion, latestRelease) == 0 {
 			fmt.Println("The Spice runtime is at the latest version.")
-			return nil
-		} else if currentVersion == "edge" {
-			fmt.Println("Using latest 'edge' runtime version.")
 			return nil
 		}
 
@@ -55,7 +59,7 @@ func initBareMetal() error {
 		fmt.Println("The Spice runtime has not yet been installed.")
 	}
 
-	err = prepareInstallDir(binDir)
+	err := prepareInstallDir(binDir)
 	if err != nil {
 		return err
 	}
@@ -66,6 +70,13 @@ func initBareMetal() error {
 	}
 
 	assetName := getAssetName()
+
+	if release == nil {
+		release, err = getLatestRuntimeRelease()
+		if err != nil {
+			return err
+		}
+	}
 
 	runtimeVersion := trimSuffix(release.TagName)
 
