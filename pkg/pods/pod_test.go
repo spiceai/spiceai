@@ -51,7 +51,7 @@ func testBasePropertiesFunc(pod *Pod) func(*testing.T) {
 		case "trader-infer":
 			expected = "95c0e9b0b65ae7b50af26b4582126624"
 		case "cartpole-v1":
-			expected = "39bf314b96309caa223d9881ed5674b4"
+			expected = "f739fd1bf82dc26a864dca4778a43331"
 		}
 
 		assert.Equal(t, expected, actual, "invalid pod.Hash()")
@@ -92,7 +92,7 @@ func testBasePropertiesFunc(pod *Pod) func(*testing.T) {
 		case "trader-infer":
 			expected = "72h0m0s"
 		case "cartpole-v1":
-			expected = "72h0m0s"
+			expected = "50m0s"
 		}
 
 		assert.Equal(t, expected, actual, "invalid pod.Period()")
@@ -105,7 +105,7 @@ func testBasePropertiesFunc(pod *Pod) func(*testing.T) {
 		case "trader-infer":
 			expected = "1m0s"
 		case "cartpole-v1":
-			expected = "1m0s"
+			expected = "10s"
 		}
 
 		assert.Equal(t, expected, actual, "invalid pod.Interval()")
@@ -143,10 +143,11 @@ func testFieldNamesFunc(pod *Pod) func(*testing.T) {
 			}
 		case "cartpole-v1":
 			expected = []string{
-				"gym.CartPole-v1.pole_angle",
-				"gym.CartPole-v1.pole_angular_velocity",
-				"gym.CartPole-v1.position",
-				"gym.CartPole-v1.velocity",
+				"gym.CartPole.cart_position",
+				"gym.CartPole.cart_velocity",
+				"gym.CartPole.is_done",
+				"gym.CartPole.pole_angle",
+				"gym.CartPole.pole_angular_velocity",
 			}
 		}
 
@@ -175,8 +176,8 @@ func testRewardsFunc(pod *Pod) func(*testing.T) {
 			}
 		case "cartpole-v1":
 			expected = map[string]string{
-				"left":  "reward = 1",
-				"right": "reward = 1",
+				"left":  "reward = 0 if new_state.gym_CartPole_is_done == 1 else 1",
+				"right": "reward = 0 if new_state.gym_CartPole_is_done == 1 else 1",
 			}
 		}
 

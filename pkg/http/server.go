@@ -18,6 +18,11 @@ import (
 	"github.com/valyala/fasthttp"
 )
 
+var (
+	shouldSignalTrainingComplete bool
+	trainingComplete chan bool
+)
+
 type ServerConfig struct {
 	Port uint
 }
@@ -246,6 +251,13 @@ func apiPostFlightEpisodeHandler(ctx *fasthttp.RequestCtx) {
 
 	if episode.Error != "" {
 		log.Printf("Training stopped -> %s: %s\n", aurora.Red(episode.Error), aurora.Yellow(episode.ErrorMessage))
+		if shouldSignalTrainingComplete {
+			trainingComplete <- true
+		}
+	}
+
+	if shouldSignalTrainingComplete && flight.IsComplete() {
+		trainingComplete <- true
 	}
 
 	ctx.Response.SetStatusCode(201)
@@ -259,7 +271,7 @@ func NewServer(port uint) *server {
 	}
 }
 
-func (server *server) Start() {
+func (server *server) Start(signalTrainingCompleted bool, trainingCompleted chan bool) {
 	r := router.New()
 	r.GET("/health", healthHandler)
 
@@ -280,6 +292,9 @@ func (server *server) Start() {
 	r.GET("/api/v0.1/pods/{pod}/flights", apiGetFlightsHandler)
 	r.GET("/api/v0.1/pods/{pod}/flights/{flight}", apiGetFlightHandler)
 	r.POST("/api/v0.1/pods/{pod}/flights/{flight}/episodes", apiPostFlightEpisodeHandler)
+
+	shouldSignalTrainingComplete = signalTrainingCompleted
+	trainingComplete = trainingCompleted
 
 	go func() {
 		log.Fatal(fasthttp.ListenAndServe(fmt.Sprintf(":%d", server.config.Port), r.Handler))

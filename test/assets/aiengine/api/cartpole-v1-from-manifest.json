@@ -1,20 +1,32 @@
 {
-  "epoch_time": 1627873431,
-  "period": 259200,
-  "interval": 60,
+  "epoch_time": 123,
+  "period": 3000,
+  "interval": 10,
   "granularity": 10,
   "datasources": [
     {
-      "connector": { "type": "openai-gym" },
-      "actions": { "left": "passthru", "right": "passthru" }
+      "connector": {
+        "type": "openai-gym",
+        "params": {
+          "environment": "CartPole-v1"
+        }
+      },
+      "actions": {
+        "left": "passthru",
+        "right": "passthru"
+      }
     }
   ],
   "fields": {
-    "gym_CartPole-v1_pole_angle": 0,
-    "gym_CartPole-v1_pole_angular_velocity": 0,
-    "gym_CartPole-v1_position": 0,
-    "gym_CartPole-v1_velocity": 0
+    "gym_CartPole_cart_position": 0,
+    "gym_CartPole_cart_velocity": 0,
+    "gym_CartPole_is_done": 0,
+    "gym_CartPole_pole_angle": 0,
+    "gym_CartPole_pole_angular_velocity": 0
   },
-  "actions": { "left": "reward = 1", "right": "reward = 1" },
+  "actions": {
+    "left": "reward = 0 if new_state.gym_CartPole_is_done == 1 else 1",
+    "right": "reward = 0 if new_state.gym_CartPole_is_done == 1 else 1"
+  },
   "laws": null
 }

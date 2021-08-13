@@ -20,30 +20,31 @@ var RunCmd = &cobra.Command{
 # Run Spice, install if necessary
 spice run
 
-# Run Spice in watch mode
-spice run -w
-
 # See more at: https://docs.spiceai.io/getting-started/
 `,
 	Run: func(cmd *cobra.Command, args []string) {
-		var cliContext context.RuntimeContext = context.Docker
-		if baremetal {
-			cliContext = context.BareMetal
-		}
-
-		// Dependencies
-		err := runtime.Init(cliContext)
-		if err != nil {
-			fmt.Println(err.Error())
-			os.Exit(1)
-		}
-
-		err = runtime.Run(cliContext)
-		if err != nil {
-			fmt.Println(err.Error())
-			os.Exit(1)
-		}
+		Run(baremetal, "")
 	},
+}
+
+func Run(baremetal bool, manifestPath string) {
+	var cliContext context.RuntimeContext = context.Docker
+	if baremetal {
+		cliContext = context.BareMetal
+	}
+
+	// Dependencies
+	err := runtime.Init(cliContext)
+	if err != nil {
+		fmt.Println(err.Error())
+		os.Exit(1)
+	}
+
+	err = runtime.Run(cliContext, manifestPath)
+	if err != nil {
+		fmt.Println(err.Error())
+		os.Exit(1)
+	}
 }
 
 func init() {
