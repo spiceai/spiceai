@@ -42,4 +42,4 @@ COPY ai/src/connector/*.py ./ai/connector/
 
 WORKDIR /userapp
 
-CMD ["/app/spiced"]
+ENTRYPOINT ["/app/spiced"]

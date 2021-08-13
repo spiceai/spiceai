@@ -1,0 +1,60 @@
+---
+name: e2e_test
+
+on:
+  push:
+    branches:
+      - trunk
+      - release-*
+    tags:
+      - v*
+  pull_request:
+    branches:
+      - trunk
+      - release-*
+
+jobs:
+  end-to-end:
+    name: end to end test
+    runs-on: ubuntu-latest
+    env:
+      GOVER: 1.16
+
+    steps:
+      - uses: actions/checkout@v2
+      
+      - name: Set up Python 3.8.11
+        uses: actions/setup-python@v1
+        with:
+          python-version: 3.8.11
+      
+      - name: Install requirements
+        working-directory: ai/src
+        run: |
+          python -m venv venv
+          source venv/bin/activate
+          python -m pip install -r requirements.txt
+      
+      - name: Set up Go
+        uses: actions/setup-go@v2
+        with:
+          go-version: ${{ env.GOVER }}
+
+      - name: Build spice
+        run: make
+        working-directory: cmd/spice
+
+      - name: Build spiced
+        run: make
+        working-directory: cmd/spiced
+
+      - name: Ensure correct directory structure
+        run: |
+          mkdir -p $HOME/.spice/bin
+          cp cmd/spiced/spiced $HOME/.spice/bin
+          ln -s ${{ github.workspace }}/ai/src $HOME/.spice/bin/ai
+
+      - name: Execute test
+        run: |
+          ./spice train -b ../../test/assets/pods/manifests/cartpole-v1.yaml
+        working-directory: cmd/spice

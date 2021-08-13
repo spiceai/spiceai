@@ -73,7 +73,6 @@ func StartServer(ready chan bool) {
 
 	aiServerCmd = execCommand(getPythonCmd(), aiServerPath)
 
-	sigCh := make(chan os.Signal, 1)
 	appRunning := make(chan bool, 1)
 
 	go func() {
@@ -158,7 +157,11 @@ func StartServer(ready chan bool) {
 			if fileLogger != nil {
 				fileLogger.Close()
 			}
-			sigCh <- os.Interrupt
+
+			if !isTestEnvironment() {
+				// If the AI engine crashes, pass on its exit status
+				os.Exit(aiServerCmd.ProcessState.ExitCode())
+			}
 		}()
 
 		appRunning <- true
@@ -448,4 +451,14 @@ func waitForServerHealthy(maxAttempts int) int {
 	}
 
 	return attemptCount
+}
+
+func isTestEnvironment() bool {
+	for _, envVar := range aiServerCmd.Env {
+		if envVar == "GO_WANT_HELPER_PROCESS=1" {
+			return true
+		}
+	}
+
+	return false
 }

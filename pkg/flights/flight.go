@@ -49,6 +49,10 @@ func (f *Flight) End() time.Time {
 	return f.end
 }
 
+func (f *Flight) IsComplete() bool {
+	return !f.end.IsZero()
+}
+
 func (f *Flight) Duration() time.Duration {
 	if !f.end.IsZero() {
 		return f.end.Sub(f.start)
