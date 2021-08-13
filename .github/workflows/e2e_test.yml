@@ -54,7 +54,14 @@ jobs:
           cp cmd/spiced/spiced $HOME/.spice/bin
           ln -s ${{ github.workspace }}/ai/src $HOME/.spice/bin/ai
 
-      - name: Execute test
+      - name: "Execute test - cartpole (default algorithm: vpg)"
         run: |
           ./spice train -b ../../test/assets/pods/manifests/cartpole-v1.yaml
         working-directory: cmd/spice
+        
+      - name: "Execute test - cartpole (default algorithm: dql)"
+        run: |
+          export SPICE_DEEPRL_ALGORITHM="dql"
+          ./spice train -b ../../test/assets/pods/manifests/cartpole-v1.yaml
+        working-directory: cmd/spice
+        
