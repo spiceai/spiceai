@@ -6,17 +6,20 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 
 ## Current Limitations
 
+- Data Sources are polled only (every 30 secs) - will change to push/streaming
+- Debug logs are printed to console (sorry! :-()
+
 ### Known bugs
 
 - Data Connectors do not honor interval
+- Deleting a pod manifest file is not handled gracefully by the runtime ([#15](https://github.com/spiceai/spiceai/issues/15))
 
 ### v0.1-alpha Developer Preview limitations
 
 - Docker hosting only
-- Windows host requires WSL 2
+- Windows baremetal host requires WSL 2
 - Coupled DataSource/DataProcessor implementations
 - Single AI backend (Tensorflow)
-- Single AI algorithm (Policy Gradient)
 - Development Registry (github.com/spiceai/registry)
 - Basic local Pod/Flight monitoring through polling
 
@@ -24,8 +27,9 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 
 - Self-host on baremetal or VM
 - Kubernetes-host
+- Push/Streaming Data Sources/Connectors
 - CI/CD on GitHub
-- Multiple AI algorithms (E.g. Q-Learning)
+- Additional AI algorithms (E.g. A3C)
 - Defined DataSource/DataProcessor interface with community implementation repo
 - Spice AI Registry v0.1
 - Local Pod/Flight monitoring (WebSockets)
