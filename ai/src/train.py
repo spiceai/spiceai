@@ -24,7 +24,7 @@ training_lock = threading.Lock()
 saved_models: "dict[str]" = dict()
 
 DEFAULT_ALGORITHM = "vpg"
-ALGORITHM = os.getenv("SPICE_AIALGORITHM", DEFAULT_ALGORITHM)
+ALGORITHM = os.getenv("SPICE_DEEPRL_ALGORITHM", DEFAULT_ALGORITHM)
 
 
 def train_agent(
