@@ -2,15 +2,10 @@ import numpy as np
 
 
 class Memory:
-    """Sets up a memory replay buffer for Policy Gradient methods.
+    """Sets up a memory replay buffer for Policy Gradient methods."""
 
-    Args:
-        gamma (float): The "discount rate" used to assess TD(1) values.
-    """
-
-    def __init__(self, gamma):
+    def __init__(self):
         self.buffer = []
-        self.gamma = gamma
 
     def add(self, experience):
         """Adds an experience into the memory buffer.
