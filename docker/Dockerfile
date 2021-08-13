@@ -38,7 +38,8 @@ COPY ai/src/requirements.txt .
 RUN python3 -m pip install -r requirements.txt
 
 COPY ai/src/*.py ./ai/
-COPY ai/src/connector/*.py ./ai/connector/
+COPY ai/src/connector/ ./ai/connector/
+COPY ai/src/algorithms/ ./ai/algorithms/
 
 WORKDIR /userapp
 
