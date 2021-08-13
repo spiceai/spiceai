@@ -9,12 +9,14 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 ### Known bugs
 
 - Data Connectors do not honor interval
+- 0 observations posted message is printed to console ([#14](https://github.com/spiceai/spiceai/issues/14))
 - Deleting a pod manifest file is not handled gracefully by the runtime ([#15](https://github.com/spiceai/spiceai/issues/15))
 
 ### v0.1-alpha Developer Preview limitations
 
 - Docker hosting only
 - Windows baremetal host requires WSL 2
+- Data Sources are polled only (every 30 secs) - will change to push/streaming
 - Coupled DataSource/DataProcessor implementations
 - Single AI backend (Tensorflow)
 - Development Registry (github.com/spiceai/registry)
@@ -24,6 +26,7 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 
 - Self-host on baremetal or VM
 - Kubernetes-host
+- Push/Streaming Data Sources/Connectors
 - CI/CD on GitHub
 - Additional AI algorithms (E.g. A3C)
 - Defined DataSource/DataProcessor interface with community implementation repo
