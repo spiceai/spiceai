@@ -9,6 +9,7 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 ### Known bugs
 
 - Data Connectors do not honor interval
+- Deleting a pod manifest file is not handled gracefully by the runtime ([#15](https://github.com/spiceai/spiceai/issues/15))
 
 ### v0.1-alpha Developer Preview limitations
 
