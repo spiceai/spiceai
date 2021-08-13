@@ -11,7 +11,7 @@
       "program": "main.py",
       "console": "integratedTerminal",
       "env": {
-        "DEBUG": "1"
+        "SPICE_DEBUG": "1"
       }
     }
   ]

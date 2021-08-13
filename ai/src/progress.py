@@ -15,7 +15,7 @@ class ProgressBar:
         self.total_steps = total_steps
         self.step = 0
         self.timer = datetime.datetime.now()
-        self.show_metrics = os.getenv("DEBUG") == "1"
+        self.show_metrics = os.getenv("SPICE_DEBUG") == "1"
 
     def next(self):
         self.step += 1
