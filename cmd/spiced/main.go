@@ -22,11 +22,19 @@ func main() {
 var RootCmd = &cobra.Command{
 	Use:   "spiced",
 	Short: "Spice Runtime",
+	Args:  cobra.MaximumNArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
-		err := runtime.Run()
+		var err error
+		if len(args) > 0 {
+			err = runtime.Run(args[0])
+		} else {
+			err = runtime.Run("")
+		}
+
 		if err != nil {
 			log.Fatalln(err)
 		}
+
 		defer runtime.Shutdown()
 
 		stop := make(chan os.Signal, 1)

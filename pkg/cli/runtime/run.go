@@ -19,7 +19,7 @@ func getDockerArgs(args string) []string {
 	return strings.Split(args, " ")
 }
 
-func Run(cliContext context.RuntimeContext) error {
+func Run(cliContext context.RuntimeContext, manifestPath string) error {
 	fmt.Println("Spice runtime starting...")
 
 	var cmd *exec.Cmd
@@ -39,6 +39,11 @@ func Run(cliContext context.RuntimeContext) error {
 
 		dockerImg := fmt.Sprintf(spicedDockerImg, dockerVersion)
 		dockerArgs := getDockerArgs(fmt.Sprintf(spicedDockerCmd, userApp, dockerImg))
+
+		if manifestPath != "" {
+			dockerArgs = append(dockerArgs, manifestPath)
+		}
+
 		cmd = exec.Command("docker", dockerArgs...)
 
 	case context.BareMetal:
@@ -47,7 +52,8 @@ func Run(cliContext context.RuntimeContext) error {
 			return fmt.Errorf("AI Engine has not been downloaded")
 		}
 		spiceCMD := binaryFilePath(config.SpiceBinPath(), "spiced")
-		cmd = exec.Command(spiceCMD)
+
+		cmd = exec.Command(spiceCMD, manifestPath)
 
 	default:
 		return fmt.Errorf("unknown runtime context: %v", cliContext)

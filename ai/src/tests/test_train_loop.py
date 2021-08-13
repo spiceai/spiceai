@@ -231,23 +231,28 @@ class TrainingLoopTests(unittest.TestCase):
         NUMBER_EPISODES = 10
         self.start_training("trader", FLIGHT, NUMBER_EPISODES)
 
+        post_data_lock = threading.Lock()
         episode_5_lock = threading.Lock()
         episode_5_lock.acquire()
 
         def release_lock_on_episode_5(episode: int):
             if episode == 5 and episode_5_lock.locked():
                 episode_5_lock.release()
+                post_data_lock.acquire()
 
         main.end_of_episode = release_lock_on_episode_5
 
         # wait for episode 5
+        post_data_lock.acquire()
         episode_5_lock.acquire()
 
         print("Posting gap_data_1")
         self.post_data("trader", gap_data_1)
+        post_data_lock.release()
 
         self.wait_for_training()
         episode_5_lock.release()
+        post_data_lock.release()
 
         self.validate_episode_data(
             "trader",

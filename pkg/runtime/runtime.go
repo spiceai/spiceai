@@ -100,7 +100,7 @@ func (r *SpiceRuntime) configChangeHandler(e fsnotify.Event) {
 	r.processPodsConfig()
 }
 
-func Run() error {
+func Run(manifestPath string) error {
 	runtime = SpiceRuntime{}
 
 	err := runtime.LoadConfig()
@@ -112,7 +112,10 @@ func Run() error {
 
 	aiEngineReady := make(chan bool)
 	aiengine.StartServer(aiEngineReady)
-	spice_http.NewServer(runtime.config.HttpPort).Start()
+
+	singleRun := manifestPath != ""
+	singleRunComplete := make(chan bool)
+	spice_http.NewServer(runtime.config.HttpPort).Start(singleRun, singleRunComplete)
 
 	<-aiEngineReady
 
@@ -121,7 +124,28 @@ func Run() error {
 	fmt.Println()
 	fmt.Println("Use Ctrl-C to stop")
 
-	// Setup
+	// If we are in "single run" mode, wait for a single training run to complete, then exit
+	if singleRun {
+		pod, err := initializePod(manifestPath)
+		if err != nil {
+			return err
+		}
+
+		err = environment.StartDataListeners(15)
+		if err != nil {
+			return err
+		}
+
+		err = aiengine.StartTraining(pod)
+		if err != nil {
+			return err
+		}
+
+		<-singleRunComplete
+		fmt.Println(aurora.Green("Exiting after a single training run."))
+		os.Exit(0)
+	}
+
 	err = runtime.scanForPods()
 	if err != nil {
 		log.Printf("error scanning for pods: %s", err.Error())
@@ -170,24 +194,34 @@ func (r *SpiceRuntime) scanForPods() error {
 		}
 
 		manifestPath := filepath.Join(podsManifestDir, f.Name())
-		newPod, err := pods.LoadPodFromManifest(manifestPath)
+		_, err = initializePod(manifestPath)
 		if err != nil {
 			continue
-		}
-
-		pods.CreateOrUpdatePod(newPod)
-		err = aiengine.InitializePod(newPod)
-		if err != nil {
-			log.Println(fmt.Errorf("error initializing pod %s: %w", newPod.Name, err))
-			continue
-		}
-
-		for _, ds := range newPod.DataSources() {
-			fmt.Printf("Loaded datasource %s\n", aurora.BrightCyan(ds.Name()))
 		}
 	}
 
 	return nil
+}
+
+func initializePod(manifestPath string) (*pods.Pod, error) {
+	newPod, err := pods.LoadPodFromManifest(manifestPath)
+	if err != nil {
+		log.Println(fmt.Errorf("error loading pod manifest %s: %w", manifestPath, err))
+		return nil, err
+	}
+
+	pods.CreateOrUpdatePod(newPod)
+	err = aiengine.InitializePod(newPod)
+	if err != nil {
+		log.Println(fmt.Errorf("error initializing pod %s: %w", newPod.Name, err))
+		return nil, err
+	}
+
+	for _, ds := range newPod.DataSources() {
+		fmt.Printf("Loaded datasource %s\n", aurora.BrightCyan(ds.Name()))
+	}
+
+	return newPod, nil
 }
 
 func Shutdown() {
