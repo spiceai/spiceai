@@ -16,7 +16,6 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 - Windows host requires WSL 2
 - Coupled DataSource/DataProcessor implementations
 - Single AI backend (Tensorflow)
-- Single AI algorithm (Policy Gradient)
 - Development Registry (github.com/spiceai/registry)
 - Basic local Pod/Flight monitoring through polling
 
@@ -25,7 +24,7 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 - Self-host on baremetal or VM
 - Kubernetes-host
 - CI/CD on GitHub
-- Multiple AI algorithms (E.g. Q-Learning)
+- Additional AI algorithms (E.g. A3C)
 - Defined DataSource/DataProcessor interface with community implementation repo
 - Spice AI Registry v0.1
 - Local Pod/Flight monitoring (WebSockets)
