@@ -1,14 +1,12 @@
-if __name__ == "__main__":
-    import main_test_path
-
 import io
 import csv
 import unittest
-import main
 import json
 import pandas as pd
 import threading
 import copy
+import main
+import train
 
 
 class TrainingLoopTests(unittest.TestCase):
@@ -31,17 +29,17 @@ class TrainingLoopTests(unittest.TestCase):
             self.trader_data_csv = trader_data.read()
 
         self.episode_results = list()
-        self.original_post_episode_result = main.post_episode_result
-        main.post_episode_result = (
+        self.original_post_episode_result = train.post_episode_result
+        train.post_episode_result = (
             lambda request_url, episode_data: self.episode_results.append(
                 {"request_url": request_url, "episode_data": episode_data}
             )
         )
-        self.original_end_of_episode = main.end_of_episode
+        self.original_end_of_episode = train.end_of_episode
 
     def tearDown(self):
-        main.post_episode_result = self.original_post_episode_result
-        main.end_of_episode = self.original_end_of_episode
+        train.post_episode_result = self.original_post_episode_result
+        train.end_of_episode = self.original_end_of_episode
 
     def init(
         self,
@@ -238,7 +236,7 @@ class TrainingLoopTests(unittest.TestCase):
             if episode == 5 and episode_5_lock.locked():
                 episode_5_lock.release()
 
-        main.end_of_episode = release_lock_on_episode_5
+        train.end_of_episode = release_lock_on_episode_5
 
         # wait for episode 5
         episode_5_lock.acquire()
@@ -491,6 +489,36 @@ class TrainingLoopTests(unittest.TestCase):
             num_actions=299,
             episode_results=self.episode_results,
         )
+
+    def test_post_data_with_different_fields_fails(self):
+        trader_init = copy.deepcopy(self.trader_init)
+        del trader_init["epoch_time"]
+        trader_init["period"] = 120
+        self.init("trader", self.trader_init)
+
+        now_unix_seconds = (
+            pd.Timestamp.now() - pd.Timestamp("1970-01-01")
+        ) // pd.Timedelta("1s")
+
+        csv_data = io.StringIO()
+        headers = [
+            "time",
+            "local_portfolio_usd_balance",
+            "local_portfolio_btc_balance",
+            "non_exist",
+        ]
+        writer = csv.writer(csv_data)
+        writer.writerow(headers)
+
+        for unix_seconds in range(now_unix_seconds - 70, now_unix_seconds - 10, 10):
+            row = [unix_seconds, None, None, 123]
+            writer.writerow(row)
+
+        resp = self.test_client.post(f"/pods/trader/data", data=csv_data.getvalue())
+        self.assertEqual(resp.status_code, 400)
+        json_resp = resp.get_json()
+        self.assertEqual(json_resp["result"], "unexpected_field")
+        self.assertEqual(json_resp["message"], "Unexpected field: 'non_exist'")
 
 
 if __name__ == "__main__":

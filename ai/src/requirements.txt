@@ -64,6 +64,7 @@ pyglet==1.5.15
 Pygments==2.9.0
 pyparsing==2.4.7
 pytest==6.2.3
+pytest-timeout==1.4.2
 python-dateutil==2.8.1
 pytz==2021.1
 PyYAML==5.4.1
