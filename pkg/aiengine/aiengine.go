@@ -360,9 +360,15 @@ func SendData(pod *pods.Pod, podState ...*state.State) error {
 		}
 		csv.WriteString("\n")
 
-		csvChunk, csvPreview := observations.GetCsv(s.Fields(), s.Observations(), 5)
+		observations := s.Observations()
 
-		log.Printf("Posting data to AI engine:\n%s", aurora.BrightYellow(fmt.Sprintf("%s%s...\n%d observations posted", csv.String(), csvPreview, len(s.Observations()))))
+		if len(observations) == 0 {
+			continue
+		}
+
+		csvChunk, csvPreview := observations.GetCsv(s.Fields(), observations, 5)
+
+		log.Printf("Posting data to AI engine:\n%s", aurora.BrightYellow(fmt.Sprintf("%s%s...\n%d observations posted", csv.String(), csvPreview, len(observations))))
 
 		csv.WriteString(csvChunk)
 
