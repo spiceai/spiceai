@@ -6,6 +6,9 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 
 ## Current Limitations
 
+- Data Sources are polled only (every 30 secs) - will change to push/streaming
+- Debug logs are printed to console (sorry! :-()
+
 ### Known bugs
 
 - Data Connectors do not honor interval
@@ -16,7 +19,6 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 
 - Docker hosting only
 - Windows baremetal host requires WSL 2
-- Data Sources are polled only (every 30 secs) - will change to push/streaming
 - Coupled DataSource/DataProcessor implementations
 - Single AI backend (Tensorflow)
 - Development Registry (github.com/spiceai/registry)
