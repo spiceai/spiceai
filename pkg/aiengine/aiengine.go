@@ -167,7 +167,7 @@ func StartServer(ready chan bool, isSingleRun bool) error {
 				fileLogger.Close()
 			}
 
-			if !isTestEnvironment() {
+			if !aiServerCmd.ProcessState.Success() && !isTestEnvironment() {
 				// If the AI engine crashes, pass on its exit status
 				os.Exit(aiServerCmd.ProcessState.ExitCode())
 			}

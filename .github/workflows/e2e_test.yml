@@ -22,19 +22,19 @@ jobs:
 
     steps:
       - uses: actions/checkout@v2
-      
+
       - name: Set up Python 3.8.11
         uses: actions/setup-python@v1
         with:
           python-version: 3.8.11
-      
+
       - name: Install requirements
         working-directory: ai/src
         run: |
           python -m venv venv
           source venv/bin/activate
           python -m pip install -r requirements.txt
-      
+
       - name: Set up Go
         uses: actions/setup-go@v2
         with:
@@ -58,10 +58,9 @@ jobs:
         run: |
           ./spice train -b ../../test/assets/pods/manifests/cartpole-v1.yaml
         working-directory: cmd/spice
-        
+
       - name: "Execute test - cartpole (default algorithm: dql)"
         run: |
           export SPICE_DEEPRL_ALGORITHM="dql"
           ./spice train -b ../../test/assets/pods/manifests/cartpole-v1.yaml
         working-directory: cmd/spice
-        
