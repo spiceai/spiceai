@@ -362,7 +362,7 @@ func SendData(pod *pods.Pod, podState ...*state.State) error {
 
 		observationData := s.Observations()
 
-		if len(observations) == 0 {
+		if len(observationData) == 0 {
 			continue
 		}
 
