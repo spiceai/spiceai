@@ -13,7 +13,7 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 ### v0.1-alpha Developer Preview limitations
 
 - Docker hosting only
-- Windows host requires WSL 2
+- Windows baremetal host requires WSL 2
 - Coupled DataSource/DataProcessor implementations
 - Single AI backend (Tensorflow)
 - Development Registry (github.com/spiceai/registry)
