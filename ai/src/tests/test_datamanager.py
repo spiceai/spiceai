@@ -1,6 +1,3 @@
-if __name__ == "__main__":
-    import main_test_path
-
 from io import StringIO
 import unittest
 import pandas as pd

@@ -1,6 +1,3 @@
-if __name__ == "__main__":
-    import main_test_path
-
 import unittest
 import main
 import json
