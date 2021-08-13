@@ -168,13 +168,15 @@ func Run(manifestPath string) error {
 func (r *SpiceRuntime) scanForPods() error {
 	_, err := os.Stat(config.AppSpicePath())
 	if err != nil {
-		return err
+		// No .spice means no pods
+		return nil
 	}
 
 	podsManifestDir := config.PodsManifestsPath()
 	_, err = os.Stat(podsManifestDir)
 	if err != nil {
-		return err
+		// No .spice/pods means no pods
+		return nil
 	}
 
 	d, err := os.Open(podsManifestDir)
@@ -196,6 +198,7 @@ func (r *SpiceRuntime) scanForPods() error {
 		manifestPath := filepath.Join(podsManifestDir, f.Name())
 		_, err = initializePod(manifestPath)
 		if err != nil {
+			log.Println(fmt.Errorf("error loading pod manifest %s: %w", manifestPath, err))
 			continue
 		}
 	}

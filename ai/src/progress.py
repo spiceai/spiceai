@@ -29,7 +29,9 @@ class ProgressBar:
             self.pod_name,
             f"\tEpisode {self.episode_num}: Processed {self.step}/{self.total_steps} data points...",
         )
-        print_event(self.pod_name, f"\t\tEstimated time remaining {est_remaining_time}")
+        print_event(
+            self.pod_name, f"\t\tEstimated time remaining: {est_remaining_time}"
+        )
 
         if self.show_metrics:
             print_event(self.pod_name, "")
