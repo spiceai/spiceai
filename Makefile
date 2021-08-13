@@ -14,3 +14,8 @@ test:
 	go vet ./...
 	go test ./...
 	pushd ai/src  && make test && popd
+
+.PHONY: build
+build:
+	pushd cmd/spice && go build . && popd
+	pushd cmd/spiced && go build . && popd

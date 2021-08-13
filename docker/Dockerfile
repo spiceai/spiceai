@@ -29,8 +29,6 @@ RUN chown -R spice:spice /app
 
 USER spice
 
-COPY --from=build /build/cmd/spiced/spiced /app/spiced
-
 ENV HOME=/app/home
 ENV SPICE_ENVIRONMENT=docker
 
@@ -40,6 +38,7 @@ RUN python3 -m pip install -r requirements.txt
 COPY ai/src/*.py ./ai/
 COPY ai/src/connector/ ./ai/connector/
 COPY ai/src/algorithms/ ./ai/algorithms/
+COPY --from=build /build/cmd/spiced/spiced /app/spiced
 
 WORKDIR /userapp
 
