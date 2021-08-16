@@ -30,9 +30,9 @@ func RemovePod(name string) {
 }
 
 func RemovePodByManifestPath(manifestPath string) {
+	relativePath := config.GetSpiceAppRelativePath(manifestPath)
 	for _, pod := range pods {
 		if pod.ManifestPath() == manifestPath {
-			relativePath := config.GetSpiceAppRelativePath(manifestPath)
 			loggers.ZapLogger().Sugar().Infof("Removing pod %s: %s\n", aurora.Bold(pod.Name), aurora.Gray(12, relativePath))
 			RemovePod(pod.Name)
 			return
