@@ -6,18 +6,30 @@ import (
 	"os/exec"
 	"strings"
 
+	"github.com/spf13/viper"
 	"github.com/spiceai/spice/pkg/config"
 	"github.com/spiceai/spice/pkg/context"
 )
 
 var (
 	spicedDockerImg string = "ghcr.io/spiceai/spiced:%s"
-	spicedDockerCmd string = "run -p 8000:8000 -v %s:/userapp --rm %s"
+	spicedDockerCmd string = "run -p %d:%d -v %s:/userapp --rm %s"
 )
 
 func getDockerArgs(args string) []string {
 	return strings.Split(args, " ")
 }
+
+func getHttpPort() (uint, error) {
+	v := viper.New()
+	runtimeConfig, err := config.LoadRuntimeConfiguration(v)
+	if err != nil {
+		fmt.Println("failed to load runtime configuration")
+		return 0, err
+	}
+
+	return runtimeConfig.HttpPort, nil
+} 
 
 func Run(cliContext context.RuntimeContext, manifestPath string) error {
 	fmt.Println("Spice runtime starting...")
@@ -37,8 +49,13 @@ func Run(cliContext context.RuntimeContext, manifestPath string) error {
 		}
 		dockerVersion := strings.TrimSpace(string(dockerVersionTagBytes))
 
+		httpPort, err := getHttpPort()
+		if err != nil {
+			return err
+		}
+
 		dockerImg := fmt.Sprintf(spicedDockerImg, dockerVersion)
-		dockerArgs := getDockerArgs(fmt.Sprintf(spicedDockerCmd, userApp, dockerImg))
+		dockerArgs := getDockerArgs(fmt.Sprintf(spicedDockerCmd, httpPort, httpPort, userApp, dockerImg))
 
 		if manifestPath != "" {
 			dockerArgs = append(dockerArgs, manifestPath)
