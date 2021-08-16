@@ -21,6 +21,11 @@ const (
 )
 
 func (r *GitHubRegistry) GetPod(podPath string) (string, error) {
+	err := privatePreviewTokenCheck()
+	if err != nil {
+		return "", err
+	}
+	
 	podName := strings.ToLower(filepath.Base(podPath))
 	gh := github.NewGitHubClient(gitHubRegistryOwner, gitHubRegistryRepo, "")
 
@@ -59,6 +64,11 @@ func (r *GitHubRegistry) GetPod(podPath string) (string, error) {
 }
 
 func (r *GitHubRegistry) GetDataSource(datasourcePath string) (*spec.DataSourceSpec, error) {
+	err := privatePreviewTokenCheck()
+	if err != nil {
+		return nil, err
+	}
+
 	gh := github.NewGitHubClient(gitHubRegistryOwner, gitHubRegistryRepo, "")
 
 	path := fmt.Sprintf("datasources/%s", datasourcePath)
@@ -98,4 +108,12 @@ func (r *GitHubRegistry) GetDataSource(datasourcePath string) (*spec.DataSourceS
 	}
 
 	return &dataSource, nil
+}
+
+func privatePreviewTokenCheck() error {
+	ghToken := os.Getenv("SPICE_GH_TOKEN") != ""
+	if !ghToken {
+		return errors.New("SPICE_GH_TOKEN is required to be set during Private Preview. See https://github.com/spiceai/spiceai#prerequisites-developer-preview-only")
+	}
+	return nil
 }
