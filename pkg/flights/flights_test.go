@@ -14,7 +14,7 @@ func TestFlight(t *testing.T) {
 
 func testRecordEpisode() func(*testing.T) {
 	return func(t *testing.T) {
-		flight := flights.NewFlight(1)
+		flight := flights.NewFlight("test", 1)
 		episode := flights.Episode{
 			EpisodeId: 1,
 		}
@@ -25,6 +25,8 @@ func testRecordEpisode() func(*testing.T) {
 
 		assert.Equal(t, 1, len(episodes), "unexpected number of episodes")
 		assert.EqualValues(t, 1, episodes[0].EpisodeId)
+
+		<-*flight.WaitForDoneChan()
 
 		assert.True(t, flight.End() == ts || flight.End().After(ts))
 	}

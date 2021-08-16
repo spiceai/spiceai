@@ -26,6 +26,7 @@ import (
 	"github.com/spiceai/spice/pkg/spec"
 	"github.com/spiceai/spice/pkg/state"
 	"github.com/spiceai/spice/pkg/util"
+	"go.uber.org/zap"
 )
 
 type AIEngineResponse struct {
@@ -39,13 +40,16 @@ const (
 )
 
 var (
-	execCommand                = exec.Command
-	HttpClient    *http.Client = http.DefaultClient
-	retryClient   *http.Client
-	pythonPath    string = filepath.Join(config.AiEnginePath(), "venv", "bin", pythonCmd)
-	aiServerPath  string = filepath.Join(config.AiEnginePath(), "main.py")
-	aiServerCmd   *exec.Cmd
-	aiServerReady bool = false
+	execCommand                      = exec.Command
+	HttpClient          *http.Client = http.DefaultClient
+	retryClient         *http.Client
+	pythonPath          string = filepath.Join(config.AiEnginePath(), "venv", "bin", pythonCmd)
+	aiServerPath        string = filepath.Join(config.AiEnginePath(), "main.py")
+	aiServerCmd         *exec.Cmd
+	aiServerRunning     chan bool
+	aiServerReady       bool        = false
+	aiSingleTrainingRun bool        = false
+	zaplog              *zap.Logger = loggers.ZapLogger()
 )
 
 func getPythonCmd() string {
@@ -56,7 +60,13 @@ func getPythonCmd() string {
 	return pythonPath
 }
 
-func StartServer(ready chan bool) {
+func StartServer(ready chan bool, isSingleRun bool) error {
+	if aiServerRunning != nil {
+		return errors.New("ai engine already started")
+	}
+
+	aiSingleTrainingRun = isSingleRun
+
 	outputFormatter := func(line string) {
 		parts := strings.SplitN(line, "->", 2)
 		if len(parts) == 2 {
@@ -72,26 +82,25 @@ func StartServer(ready chan bool) {
 	}
 
 	aiServerCmd = execCommand(getPythonCmd(), aiServerPath)
-
-	appRunning := make(chan bool, 1)
+	aiServerRunning := make(chan bool, 1)
 
 	go func() {
 		if aiServerCmd == nil {
-			appRunning <- true
+			aiServerRunning <- true
 			return
 		}
 
 		stdOutPipe, pipeErr := aiServerCmd.StdoutPipe()
 		if pipeErr != nil {
 			log.Printf("Error creating stdout for App: %s\n", pipeErr.Error())
-			appRunning <- false
+			aiServerRunning <- false
 			return
 		}
 
 		stdErrPipe, pipeErr := aiServerCmd.StderrPipe()
 		if pipeErr != nil {
 			log.Printf("Error creating stderr for App: %s\n", pipeErr.Error())
-			appRunning <- false
+			aiServerRunning <- false
 			return
 		}
 
@@ -141,7 +150,7 @@ func StartServer(ready chan bool) {
 			if fileLogger != nil {
 				fileLogger.Close()
 			}
-			appRunning <- false
+			aiServerRunning <- false
 			return
 		}
 
@@ -164,13 +173,15 @@ func StartServer(ready chan bool) {
 			}
 		}()
 
-		appRunning <- true
+		aiServerRunning <- true
 	}()
 
-	appRunStatus := <-appRunning
+	appRunStatus := <-aiServerRunning
 	if !appRunStatus {
-		log.Println("appRunStatus not running")
+		zaplog.Sugar().Error("AI Engine failed to run")
 	}
+
+	return nil
 }
 
 func StopServer() error {
@@ -180,6 +191,9 @@ func StopServer() error {
 		aiServerCmd = nil
 		if err != nil {
 			return err
+		}
+		if aiServerRunning != nil {
+			<-aiServerRunning
 		}
 	}
 	return nil
@@ -255,7 +269,7 @@ func InitializePod(pod *pods.Pod) error {
 		return err
 	}
 
-	log.Println(aurora.Yellow(string(data)))
+	zaplog.Sugar().Debug(aurora.Yellow(string(data)))
 
 	initUrl := fmt.Sprintf("%s/pods/%s/init", aiServerUrl, pod.Name)
 
@@ -285,7 +299,7 @@ func InitializePod(pod *pods.Pod) error {
 func StartTraining(pod *pods.Pod) error {
 	flightId := fmt.Sprintf("%d", len(*pod.Flights())+1)
 
-	flight := flights.NewFlight(int(pod.Episodes()))
+	flight := flights.NewFlight(flightId, int(pod.Episodes()))
 
 	trainConfig := &spec.TrainSpec{
 		EpochTime: pod.Epoch().Unix(),
@@ -329,10 +343,17 @@ func StartTraining(pod *pods.Pod) error {
 	case "started_training":
 		pod.AddFlight(flightId, flight)
 		log.Println(fmt.Sprintf("%s -> %s", pod.Name, aurora.BrightCyan("Starting training...")))
-		return nil
 	default:
 		return fmt.Errorf("%s -> failed to verify training has started: %s", pod.Name, aiResponse.Result)
 	}
+
+	if !aiSingleTrainingRun {
+		return nil
+	}
+
+	<-*flight.WaitForDoneChan()
+
+	return nil
 }
 
 func SendData(pod *pods.Pod, podState ...*state.State) error {
@@ -368,7 +389,7 @@ func SendData(pod *pods.Pod, podState ...*state.State) error {
 
 		csvChunk, csvPreview := observations.GetCsv(s.FieldNames(), observationData, 5)
 
-		log.Printf("Posting data to AI engine:\n%s", aurora.BrightYellow(fmt.Sprintf("%s%s...\n%d observations posted", csv.String(), csvPreview, len(observationData))))
+		zaplog.Sugar().Debugf("Posting data to AI engine:\n%s", aurora.BrightYellow(fmt.Sprintf("%s%s...\n%d observations posted", csv.String(), csvPreview, len(observationData))))
 
 		csv.WriteString(csvChunk)
 

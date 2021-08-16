@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/fasthttp/router"
-	"github.com/logrusorgru/aurora"
 	"github.com/spiceai/spice/pkg/aiengine"
 	"github.com/spiceai/spice/pkg/api"
 	"github.com/spiceai/spice/pkg/csv"
@@ -16,11 +15,6 @@ import (
 	"github.com/spiceai/spice/pkg/flights"
 	"github.com/spiceai/spice/pkg/pods"
 	"github.com/valyala/fasthttp"
-)
-
-var (
-	shouldSignalTrainingComplete bool
-	trainingComplete chan bool
 )
 
 type ServerConfig struct {
@@ -249,17 +243,6 @@ func apiPostFlightEpisodeHandler(ctx *fasthttp.RequestCtx) {
 
 	flight.RecordEpisode(episode)
 
-	if episode.Error != "" {
-		log.Printf("Training stopped -> %s: %s\n", aurora.Red(episode.Error), aurora.Yellow(episode.ErrorMessage))
-		if shouldSignalTrainingComplete {
-			trainingComplete <- true
-		}
-	}
-
-	if shouldSignalTrainingComplete && flight.IsComplete() {
-		trainingComplete <- true
-	}
-
 	ctx.Response.SetStatusCode(201)
 }
 
@@ -271,7 +254,7 @@ func NewServer(port uint) *server {
 	}
 }
 
-func (server *server) Start(signalTrainingCompleted bool, trainingCompleted chan bool) {
+func (server *server) Start() {
 	r := router.New()
 	r.GET("/health", healthHandler)
 
@@ -292,9 +275,6 @@ func (server *server) Start(signalTrainingCompleted bool, trainingCompleted chan
 	r.GET("/api/v0.1/pods/{pod}/flights", apiGetFlightsHandler)
 	r.GET("/api/v0.1/pods/{pod}/flights/{flight}", apiGetFlightHandler)
 	r.POST("/api/v0.1/pods/{pod}/flights/{flight}/episodes", apiPostFlightEpisodeHandler)
-
-	shouldSignalTrainingComplete = signalTrainingCompleted
-	trainingComplete = trainingCompleted
 
 	go func() {
 		log.Fatal(fasthttp.ListenAndServe(fmt.Sprintf(":%d", server.config.Port), r.Handler))

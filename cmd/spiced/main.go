@@ -24,22 +24,30 @@ var RootCmd = &cobra.Command{
 	Short: "Spice Runtime",
 	Args:  cobra.MaximumNArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
-		var err error
+
+		var manifestPath string
 		if len(args) > 0 {
-			err = runtime.Run(args[0])
-		} else {
-			err = runtime.Run("")
+			manifestPath = args[0]
 		}
 
+		isSingleRun := manifestPath != ""
+
+		var err error
+		if isSingleRun {
+			err = runtime.SingleRun(manifestPath)
+		} else {
+			err = runtime.Run()
+		}
 		if err != nil {
 			log.Fatalln(err)
 		}
-
 		defer runtime.Shutdown()
 
-		stop := make(chan os.Signal, 1)
-		signal.Notify(stop, syscall.SIGTERM, os.Interrupt)
-		<-stop
+		if !isSingleRun {
+			stop := make(chan os.Signal, 1)
+			signal.Notify(stop, syscall.SIGTERM, os.Interrupt)
+			<-stop
+		}
 	},
 }
 

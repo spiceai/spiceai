@@ -100,51 +100,71 @@ func (r *SpiceRuntime) configChangeHandler(e fsnotify.Event) {
 	r.processPodsConfig()
 }
 
-func Run(manifestPath string) error {
-	runtime = SpiceRuntime{}
+func (r *SpiceRuntime) printStartupBanner(mode string) {
+	fmt.Printf("- Runtime version: %s\n", version.Version())
+	if mode != "" {
+		fmt.Printf("- Mode: %s", mode)
+	}
+	fmt.Println(aurora.Green(fmt.Sprintf("- Listening on http://localhost:%d", runtime.config.HttpPort)))
+	fmt.Println()
+	fmt.Println("Use Ctrl-C to stop")
+}
 
-	err := runtime.LoadConfig()
+func SingleRun(manifestPath string) error {
+	err := startRuntime()
 	if err != nil {
 		return err
 	}
 
-	fmt.Println("Loading Spice runtime ...")
+	aiEngineReady := make(chan bool, 1)
+	err = aiengine.StartServer(aiEngineReady, true)
+	if err != nil {
+		return err
+	}
 
-	aiEngineReady := make(chan bool)
-	aiengine.StartServer(aiEngineReady)
-
-	singleRun := manifestPath != ""
-	singleRunComplete := make(chan bool)
-	spice_http.NewServer(runtime.config.HttpPort).Start(singleRun, singleRunComplete)
+	spice_http.NewServer(runtime.config.HttpPort).Start()
 
 	<-aiEngineReady
 
-	fmt.Printf("- Runtime version: %s\n", version.Version())
-	fmt.Println(aurora.Green(fmt.Sprintf("- Listening on http://localhost:%d", runtime.config.HttpPort)))
-	fmt.Println()
-	fmt.Println("Use Ctrl-C to stop")
+	runtime.printStartupBanner("Single training run")
 
-	// If we are in "single run" mode, wait for a single training run to complete, then exit
-	if singleRun {
-		pod, err := initializePod(manifestPath)
-		if err != nil {
-			return err
-		}
-
-		err = environment.StartDataListeners(15)
-		if err != nil {
-			return err
-		}
-
-		err = aiengine.StartTraining(pod)
-		if err != nil {
-			return err
-		}
-
-		<-singleRunComplete
-		fmt.Println(aurora.Green("Exiting after a single training run."))
-		os.Exit(0)
+	pod, err := initializePod(manifestPath)
+	if err != nil {
+		return err
 	}
+
+	err = environment.StartDataListeners(15)
+	if err != nil {
+		return err
+	}
+
+	err = aiengine.StartTraining(pod)
+	if err != nil {
+		return err
+	}
+
+	fmt.Println(aurora.Green("Exiting after single training run."))
+
+	return nil
+}
+
+func Run() error {
+	err := startRuntime()
+	if err != nil {
+		return err
+	}
+
+	aiEngineReady := make(chan bool)
+	err = aiengine.StartServer(aiEngineReady, false)
+	if err != nil {
+		return err
+	}
+
+	spice_http.NewServer(runtime.config.HttpPort).Start()
+
+	<-aiEngineReady
+
+	runtime.printStartupBanner("")
 
 	err = runtime.scanForPods()
 	if err != nil {
@@ -154,6 +174,7 @@ func Run(manifestPath string) error {
 
 	err = watchPods()
 	if err != nil {
+		zaplog.Sugar().Errorf("error watching for pods: %s", err.Error())
 		return err
 	}
 
@@ -202,6 +223,19 @@ func (r *SpiceRuntime) scanForPods() error {
 			continue
 		}
 	}
+
+	return nil
+}
+
+func startRuntime() error {
+	runtime = SpiceRuntime{}
+
+	err := runtime.LoadConfig()
+	if err != nil {
+		return err
+	}
+
+	fmt.Println("Loading Spice runtime ...")
 
 	return nil
 }
