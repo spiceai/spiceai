@@ -13,6 +13,9 @@ require (
 	github.com/spf13/viper v1.8.1
 	github.com/stretchr/testify v1.7.0 // indirect
 	github.com/valyala/fasthttp v1.27.0
+	go.uber.org/atomic v1.9.0 // indirect
+	go.uber.org/multierr v1.7.0 // indirect
+	go.uber.org/zap v1.19.0 // indirect
 	golang.org/x/mod v0.4.2
 	gopkg.in/yaml.v2 v2.4.0
 )

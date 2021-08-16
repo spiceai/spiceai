@@ -9,9 +9,15 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/spiceai/spice/pkg/loggers"
 	"github.com/spiceai/spice/pkg/observations"
 	"github.com/spiceai/spice/pkg/state"
 	"github.com/spiceai/spice/pkg/util"
+	"go.uber.org/zap"
+)
+
+var (
+	zaplog *zap.Logger = loggers.ZapLogger()
 )
 
 // Processes CSV into Observations
@@ -96,8 +102,7 @@ func ProcessCsvByPath(input io.Reader, validFields *[]string) ([]*state.State, e
 		pathToFieldNames[path] = append(pathToFieldNames[path], fieldName)
 	}
 
-	// TODO: Verbose log
-	// log.Printf("Read headers of %v", headers)
+	zaplog.Sugar().Debugf("Read headers of %v", headers)
 
 	numDataFields := len(headers) - 1
 

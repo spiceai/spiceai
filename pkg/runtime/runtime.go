@@ -14,8 +14,10 @@ import (
 	"github.com/spiceai/spice/pkg/config"
 	"github.com/spiceai/spice/pkg/environment"
 	spice_http "github.com/spiceai/spice/pkg/http"
+	"github.com/spiceai/spice/pkg/loggers"
 	"github.com/spiceai/spice/pkg/pods"
 	"github.com/spiceai/spice/pkg/version"
+	"go.uber.org/zap"
 )
 
 type SpiceRuntime struct {
@@ -23,7 +25,10 @@ type SpiceRuntime struct {
 	viper  *viper.Viper
 }
 
-var runtime SpiceRuntime
+var (
+	runtime SpiceRuntime
+	zaplog  *zap.Logger = loggers.ZapLogger()
+)
 
 func (r *SpiceRuntime) LoadConfig() error {
 	if r.viper == nil {
@@ -271,7 +276,7 @@ func Shutdown() {
 		defer wg.Done()
 		err := aiengine.StopServer()
 		if err != nil {
-			// TODO: Log to verbose log
+			zaplog.Sugar().Debug(err.Error())
 			return
 		}
 	}()
