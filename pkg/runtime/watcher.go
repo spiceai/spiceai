@@ -89,8 +89,8 @@ func processNotifyEvent(event fsnotify.Event) error {
 			return err
 		}
 	case fsnotify.Remove:
-		// TODO
-		break
+		pods.RemovePodByManifestPath(manifestPath)
+		return nil
 	}
 
 	return nil
