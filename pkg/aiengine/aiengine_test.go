@@ -273,7 +273,8 @@ func testStartServerFunc() func(*testing.T) {
 
 		assert.Nil(t, aiServerCmd)
 		ready := make(chan bool)
-		StartServer(ready)
+		err := StartServer(ready, false)
+		assert.NoError(t, err)
 		<-ready
 		assert.NotNil(t, aiServerCmd)
 		actualPythonCmd := aiServerCmd.Args[3]
@@ -314,7 +315,8 @@ func testStartServerHealthyLaterFunc() func(*testing.T) {
 		})
 
 		ready := make(chan bool)
-		StartServer(ready)
+		err := StartServer(ready, false)
+		assert.NoError(t, err)
 		<-ready
 	}
 }

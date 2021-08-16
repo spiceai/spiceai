@@ -1,26 +1,35 @@
 package flights
 
 import (
+	"fmt"
 	"sync"
 	"time"
+
+	"github.com/logrusorgru/aurora"
 )
 
 type Flight struct {
-	start    time.Time
-	end      time.Time
-	episodes []*Episode
+	id            string
+	start         time.Time
+	end           time.Time
+	episodes      []*Episode
 	episodesMutex sync.RWMutex
+	isDone        chan bool
+	err           error
 }
 
-func NewFlight(episodes int) *Flight {
+func NewFlight(id string, episodes int) *Flight {
 	return &Flight{
+		id:       id,
 		start:    time.Now(),
 		episodes: make([]*Episode, 0, episodes),
+		isDone:   make(chan bool, 1),
+		err:      nil,
 	}
 }
 
-func (f *Flight) Complete() {
-	f.end = time.Now()
+func (f *Flight) WaitForDoneChan() *chan bool {
+	return &f.isDone
 }
 
 func (f *Flight) RecordEpisode(e *Episode) {
@@ -28,8 +37,15 @@ func (f *Flight) RecordEpisode(e *Episode) {
 	defer f.episodesMutex.Unlock()
 
 	f.episodes = append(f.episodes, e)
+
 	if len(f.episodes) >= f.ExpectedEpisodes() || e.Error != "" {
-		f.Complete()
+		go func() {
+			var err error = nil
+			if e.Error != "" {
+				err = fmt.Errorf("%s: %s", e.Error, e.ErrorMessage)
+			}
+			f.complete(err)
+		}()
 	}
 }
 
@@ -59,4 +75,13 @@ func (f *Flight) Duration() time.Duration {
 	}
 
 	return time.Since(f.start)
+}
+
+func (f *Flight) complete(err error) {
+	f.end = time.Now()
+	f.err = err
+	if err != nil {
+		fmt.Printf("Flight '%s' stopped on episode %d with error: %s\n", f.id, len(f.Episodes())+1, aurora.Red(err))
+	}
+	f.isDone <- true
 }

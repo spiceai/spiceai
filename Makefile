@@ -19,3 +19,8 @@ test:
 build:
 	pushd cmd/spice && go build . && popd
 	pushd cmd/spiced && go build . && popd
+
+.PHONY: lint
+lint:
+	go vet ./...
+	golangci-lint run
