@@ -8,11 +8,18 @@ import (
 	"syscall"
 
 	"github.com/spf13/cobra"
+	"github.com/spiceai/spice/pkg/loggers"
 	"github.com/spiceai/spice/pkg/runtime"
 	"github.com/spiceai/spice/pkg/version"
 )
 
 func main() {
+	logger := loggers.ZapLogger()
+	if logger == nil {
+		os.Exit(-1)
+	}
+	defer loggers.ZapLoggerSync()
+
 	if err := RootCmd.Execute(); err != nil {
 		fmt.Println(err)
 		os.Exit(-1)

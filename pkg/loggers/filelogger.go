@@ -1,4 +1,4 @@
-package log
+package loggers
 
 import (
 	"bufio"

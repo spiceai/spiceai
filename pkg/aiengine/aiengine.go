@@ -20,7 +20,7 @@ import (
 	"github.com/spiceai/spice/pkg/config"
 	"github.com/spiceai/spice/pkg/context"
 	"github.com/spiceai/spice/pkg/flights"
-	spice_log "github.com/spiceai/spice/pkg/log"
+	"github.com/spiceai/spice/pkg/loggers"
 	"github.com/spiceai/spice/pkg/observations"
 	"github.com/spiceai/spice/pkg/pods"
 	"github.com/spiceai/spice/pkg/spec"
@@ -107,10 +107,10 @@ func StartServer(ready chan bool, isSingleRun bool) error {
 		outScanner := bufio.NewScanner(stdOutPipe)
 		errScanner := bufio.NewScanner(stdErrPipe)
 
-		logFileName := spice_log.FormatTimestampedLogFileName("ai-server")
+		logFileName := loggers.FormatTimestampedLogFileName("ai-server")
 		logPath := filepath.Join(config.SpiceLogPath(), logFileName)
 
-		fileLogger := spice_log.NewFileLogger(logPath)
+		fileLogger := loggers.NewFileLogger(logPath)
 		err := fileLogger.Open()
 		if err != nil {
 			log.Println(fmt.Errorf("error opening log file %s: %w", logPath, err))
@@ -470,7 +470,7 @@ func waitForServerHealthy(maxAttempts int) int {
 
 		err := IsServerHealthy()
 		if err != nil {
-			// TODO: Log to debug log
+			zaplog.Debug(err.Error())
 			continue
 		}
 
