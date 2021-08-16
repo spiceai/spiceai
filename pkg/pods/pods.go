@@ -5,7 +5,9 @@ import (
 	"log"
 	"path/filepath"
 
+	"github.com/logrusorgru/aurora"
 	"github.com/spiceai/spice/pkg/config"
+	"github.com/spiceai/spice/pkg/loggers"
 	"github.com/spiceai/spice/pkg/util"
 )
 
@@ -24,7 +26,18 @@ func GetPod(name string) *Pod {
 }
 
 func RemovePod(name string) {
-	pods[name] = nil
+	delete(pods, name)
+}
+
+func RemovePodByManifestPath(manifestPath string) {
+	for _, pod := range pods {
+		if pod.ManifestPath() == manifestPath {
+			relativePath := config.GetSpiceAppRelativePath(manifestPath)
+			loggers.ZapLogger().Sugar().Infof("Removing pod %s: %s\n", aurora.Bold(pod.Name), aurora.Gray(12, relativePath))
+			RemovePod(pod.Name)
+			return
+		}
+	}
 }
 
 func FindFirstManifestPath() string {
