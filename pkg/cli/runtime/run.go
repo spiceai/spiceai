@@ -13,7 +13,7 @@ import (
 
 var (
 	spicedDockerImg string = "ghcr.io/spiceai/spiced:%s"
-	spicedDockerCmd string = "run -p %d:%d -v %s:/userapp --rm %s"
+	spicedDockerCmd string = "run -p %d:%d --add-host=host.docker.internal:host-gateway -v %s:/userapp --rm %s"
 )
 
 func getDockerArgs(args string) []string {
