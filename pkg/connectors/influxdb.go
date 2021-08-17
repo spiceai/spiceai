@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"strings"
 	"time"
 
 	influxdb2 "github.com/influxdata/influxdb-client-go"
@@ -15,19 +14,22 @@ type InfluxDbConnector struct {
 	client influxdb2.Client
 	org    string
 	bucket string
+	measurement string
 	field  string
 }
 
 func NewInfluxDbConnector(params map[string]string) Connector {
 	client := influxdb2.NewClient(params["url"], params["token"])
 	org := params["org"]
-	bucket := strings.ToUpper(params["bucket"])
+	bucket := params["bucket"]
+	measurement := params["measurement"]
 	field := params["field"]
 
 	return &InfluxDbConnector{
 		client: client,
 		org:    org,
 		bucket: bucket,
+		measurement: measurement,
 		field:  field,
 	}
 }
@@ -49,10 +51,10 @@ func (c *InfluxDbConnector) FetchData(epoch time.Time, period time.Duration, int
 	query := fmt.Sprintf(`
 		from(bucket:"%s") |>
 		range(start: %s, stop: %s) |>
-		filter(fn: (r) => r["_measurement"] == "tick") |>
+		filter(fn: (r) => r["_measurement"] == "%s") |>
 		filter(fn: (r) => r["_field"] == "%s") |>
 		aggregateWindow(every: %s, fn: mean, createEmpty: false)
-    `, c.bucket, periodStart, periodEnd, c.field, intervalStr)
+    `, c.bucket, periodStart, periodEnd, c.measurement, c.field, intervalStr)
 
 	result, err := c.client.QueryAPI(c.org).Query(context.Background(), query)
 	if err != nil {

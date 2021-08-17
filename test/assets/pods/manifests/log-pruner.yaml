@@ -1,0 +1,37 @@
+name: log-pruner
+params:
+  period: 24h
+  interval: 10m
+  granularity: 30s
+datasources:
+- from: telegraf
+  name: metrics
+  connector:
+    type: influxdb
+    params:
+      # If running in baremetal mode, use
+      # url: http://localhost:8086
+
+      # If running in docker v20.10 or above on Linux, v18.03 and above for MacOS/Windows
+      url: http://host.docker.internal:8086
+      token: my-super-secret-auth-token
+      org: my-org
+      bucket: my-bucket
+      measurement: cpu
+      field: usage_idle
+  fields:
+      - name: usage_idle
+
+actions:
+  - name: prune_logs
+  - name: do_not_prune_logs
+
+training:
+  rewards:
+    # Reward pruning logs at a time when load is anticipated to be low
+    - reward: prune_logs
+      with: reward = -10 if new_state.telegraf_metrics_usage_idle < 0.90 else 1
+
+    # Bias toward not pruning under load
+    - reward: do_not_prune_logs
+      with: reward = 2 if new_state.telegraf_metrics_usage_idle < 0.90 else -1
