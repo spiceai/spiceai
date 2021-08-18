@@ -1,16 +1,16 @@
 {
-  "epoch_time": 1605312000,
-  "period": 61200,
-  "interval": 1020,
-  "granularity": 17,
+  "epoch_time": 1234,
+  "period": 259200,
+  "interval": 60,
+  "granularity": 10,
   "datasources": [
     {
       "connector": {
         "name": "localstate"
       },
       "actions": {
-        "buy": "local_portfolio_usd_balance -= coinbase_btcusd_close\nlocal_portfolio_btc_balance += 1",
-        "sell": "local_portfolio_usd_balance += coinbase_btcusd_close\nlocal_portfolio_btc_balance -= 1"
+        "buy": "local_portfolio_usd_balance -= args_price\nlocal_portfolio_btc_balance += 1",
+        "sell": "local_portfolio_usd_balance += args_price\nlocal_portfolio_btc_balance -= 1"
       }
     },
     {
@@ -26,11 +26,10 @@
   "fields": {
     "coinbase_btcusd_close": 0,
     "local_portfolio_btc_balance": 0,
-    "local_portfolio_usd_balance": 1000000
+    "local_portfolio_usd_balance": 0
   },
   "actions": {
     "buy": "reward = 1",
-    "hold": "reward = 1",
     "sell": "reward = 1"
   },
   "laws": [

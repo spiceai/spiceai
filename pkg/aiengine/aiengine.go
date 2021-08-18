@@ -214,55 +214,7 @@ func InitializePod(pod *pods.Pod) error {
 		return err
 	}
 
-	fields := make(map[string]float64)
-
-	globalActions := pod.Actions()
-	var laws []string
-
-	var dsInitSpecs []spec.DataSourceInitSpec
-	for _, ds := range pod.DataSources() {
-		for fqField, fqFieldInitializer := range ds.Fields() {
-			fieldName := strings.ReplaceAll(fqField, ".", "_")
-			fields[fieldName] = fqFieldInitializer
-		}
-
-		dsActions := make(map[string]string)
-		for dsAction := range ds.DataSourceSpec.Actions {
-			fqAction, ok := globalActions[dsAction]
-			if ok {
-				dsActions[dsAction] = strings.ReplaceAll(fqAction, ".", "_")
-			}
-		}
-
-		for _, law := range ds.Laws() {
-			laws = append(laws, strings.ReplaceAll(law, ".", "_"))
-		}
-
-		dsInitSpec := spec.DataSourceInitSpec{
-			Actions:   dsActions,
-			Connector: *ds.DataSourceSpec.Connector,
-		}
-		dsInitSpecs = append(dsInitSpecs, dsInitSpec)
-	}
-
-	rewards := pod.Rewards()
-	globalActionRewards := make(map[string]string)
-	for actionName := range globalActions {
-		globalActionRewards[actionName] = rewards[actionName]
-	}
-
-	epoch := pod.Epoch().Unix()
-
-	podInit := spec.PodInitSpec{
-		EpochTime:   &epoch,
-		Period:      int64(pod.Period().Seconds()),
-		Interval:    int(pod.Interval().Seconds()),
-		Granularity: int(pod.Granularity().Seconds()),
-		DataSources: dsInitSpecs,
-		Fields:      fields,
-		Actions:     globalActionRewards,
-		Laws:        laws,
-	}
+	podInit := getPodInitForTraining(pod)
 
 	data, err := json.Marshal(podInit)
 	if err != nil {

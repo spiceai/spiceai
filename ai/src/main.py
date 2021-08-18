@@ -224,6 +224,13 @@ def inference(pod, tag):
         agent.load(saved_models[pod])
 
     data_manager: DataManager = data_managers[pod]
+
+    if data_manager.massive_table_filled.shape[0] < data_manager.get_window_span():
+        return make_response(
+            jsonify({"result": "not_enough_data"}),
+            404,
+        )
+
     latest_window = data_manager.get_latest_window()
     state = data_manager.flatten_and_normalize_window(latest_window)
 
@@ -238,8 +245,8 @@ def inference(pod, tag):
     start_time = end_time - data_manager.interval_secs
 
     response = dict()
-    response["start"] = start_time.strftime("%c")
-    response["end"] = end_time.strftime("%c")
+    response["start"] = start_time.isoformat()
+    response["end"] = end_time.isoformat()
     response["action"] = action_name
     response["confidence"] = float(confidence)
     response["tag"] = tag

@@ -165,8 +165,8 @@ func testRewardsFunc(pod *Pod) func(*testing.T) {
 		switch pod.Name {
 		case "trader":
 			expected = map[string]string{
-				"buy":  "reward = 1",
-				"sell": "reward = 1",
+				"buy":  "new_price = new_state.coinbase.btcusd.close\nchange_in_price = prev_price - new_price\nreward = change_in_price\n",
+				"sell": "new_price = new_state.coinbase.btcusd.close\nchange_in_price = prev_price - new_price\nreward = -change_in_price\n",
 				"hold": "reward = 1",
 			}
 		case "trader-infer":

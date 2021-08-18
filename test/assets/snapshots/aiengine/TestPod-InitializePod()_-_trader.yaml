@@ -1,0 +1,40 @@
+{
+  "epoch_time": 1605312000,
+  "period": 61200,
+  "interval": 1020,
+  "granularity": 17,
+  "datasources": [
+    {
+      "connector": {
+        "name": "localstate"
+      },
+      "actions": {
+        "buy": "local_portfolio_usd_balance -= coinbase_btcusd_close\nlocal_portfolio_btc_balance += 1",
+        "sell": "local_portfolio_usd_balance += coinbase_btcusd_close\nlocal_portfolio_btc_balance -= 1"
+      }
+    },
+    {
+      "connector": {
+        "name": "file",
+        "params": {
+          "path": "../../test/assets/data/csv/COINBASE_BTCUSD, 30.csv"
+        }
+      },
+      "actions": {}
+    }
+  ],
+  "fields": {
+    "coinbase_btcusd_close": 0,
+    "local_portfolio_btc_balance": 0,
+    "local_portfolio_usd_balance": 1000000
+  },
+  "actions": {
+    "buy": "prev_price = prev_state.coinbase_btcusd_close\nnew_price = new_state.coinbase_btcusd_close\nchange_in_price = prev_price - new_price\nreward = change_in_price\n",
+    "hold": "prev_price = prev_state.coinbase_btcusd_close\nreward = 1",
+    "sell": "prev_price = prev_state.coinbase_btcusd_close\nnew_price = new_state.coinbase_btcusd_close\nchange_in_price = prev_price - new_price\nreward = -change_in_price\n"
+  },
+  "laws": [
+    "local_portfolio_usd_balance \u003e= 0",
+    "local_portfolio_btc_balance \u003e= 0"
+  ]
+}

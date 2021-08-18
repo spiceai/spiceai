@@ -5,19 +5,21 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"testing"
 
+	"github.com/bradleyjkemp/cupaloy"
 	"github.com/spiceai/spice/pkg/context"
 	"github.com/spiceai/spice/pkg/pods"
 	"github.com/spiceai/spice/pkg/spec"
 	"github.com/spiceai/spice/pkg/testutils"
 	"github.com/stretchr/testify/assert"
 )
+
+var snapshotter = cupaloy.New(cupaloy.SnapshotSubdirectory("../../test/assets/snapshots/aiengine"))
 
 func TestAIEngineGetPythonCmd(t *testing.T) {
 	origContext := context.CurrentContext()
@@ -55,6 +57,7 @@ func TestPod(t *testing.T) {
 			return
 		}
 
+		t.Run(fmt.Sprintf("testGetPodInitForTrainingFunc() - %s", manifestToTest), testGetPodInitForTrainingFunc(pod))
 		t.Run(fmt.Sprintf("InitializePod() - %s", manifestToTest), testInitializePod(pod))
 		t.Run(fmt.Sprintf("StartTraining() already_training - %s", manifestToTest), testStartTrainingFunc(pod, "already_training"))
 		t.Run(fmt.Sprintf("StartTraining() not_enough_data_for_training - %s", manifestToTest), testStartTrainingFunc(pod, "already_training"))
@@ -65,25 +68,6 @@ func TestPod(t *testing.T) {
 
 func testInitializePod(pod *pods.Pod) func(t *testing.T) {
 	return func(t *testing.T) {
-		var expectedInit spec.PodInitSpec
-		switch pod.Name {
-		case "cartpole-v1":
-			fallthrough
-		case "trader":
-			manifestInit := fmt.Sprintf("%s-from-manifest.json", pod.Name)
-			manifestInitPath := filepath.Join("../../test/assets/aiengine/api", manifestInit)
-			content, err := ioutil.ReadFile(manifestInitPath)
-			if err != nil {
-				t.Error(err)
-				return
-			}
-			err = json.Unmarshal(content, &expectedInit)
-			if err != nil {
-				t.Error(err)
-				return
-			}
-		}
-
 		HttpClient = testutils.NewTestClient(func(req *http.Request) (*http.Response, error) {
 			switch req.URL.String() {
 			case fmt.Sprintf("http://localhost:8004/pods/%s/init", pod.Name):
@@ -101,11 +85,18 @@ func testInitializePod(pod *pods.Pod) func(t *testing.T) {
 
 				if pod.Name == "cartpole-v1" {
 					// Epoch time is not specified for cartpole, so it will be "now"
-					epochTime := actualInit.EpochTime
-					expectedInit.EpochTime = epochTime
+					var testStaticEpochTime int64 = 123
+					actualInit.EpochTime = &testStaticEpochTime
 				}
 
-				assert.Equal(t, expectedInit, actualInit)
+				// marshal to JSON so the snapshot is easy to consume
+				data, err := json.MarshalIndent(actualInit, "", "  ")
+				if err != nil {
+					t.Error(err)
+				}
+
+				snapshotter.SnapshotT(t, data)
+
 				return &http.Response{
 					StatusCode: 200,
 					Body:       io.NopCloser(bytes.NewBufferString("ok")),
@@ -318,5 +309,23 @@ func testStartServerHealthyLaterFunc() func(*testing.T) {
 		err := StartServer(ready, false)
 		assert.NoError(t, err)
 		<-ready
+	}
+}
+
+func testGetPodInitForTrainingFunc(pod *pods.Pod) func(*testing.T) {
+	return func(t *testing.T) {
+		podInitSpec := getPodInitForTraining(pod)
+
+		// set static epoch time for snapshot testing
+		var testEpochTime int64 = 1234
+		podInitSpec.EpochTime = &testEpochTime
+
+		// marshal to JSON so the snapshot is easy to consume
+		data, err := json.MarshalIndent(podInitSpec, "", "  ")
+		if err != nil {
+			t.Error(err)
+		}
+
+		snapshotter.SnapshotT(t, data)
 	}
 }
