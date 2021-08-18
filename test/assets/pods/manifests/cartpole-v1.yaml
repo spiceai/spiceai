@@ -6,10 +6,6 @@ params:
 datasources:
   - from: gym
     name: CartPole
-    connector:
-      type: openai-gym
-      params:
-        environment: CartPole-v1
     fields:
       - name: cart_position
       - name: cart_velocity
@@ -19,6 +15,13 @@ datasources:
     actions:
       left: passthru
       right: passthru
+    data:
+      connector:
+        name: openai-gym
+        params:
+          environment: CartPole-v1
+      processor:
+        name: openai-gym
 
 training:
   goal: score > 200

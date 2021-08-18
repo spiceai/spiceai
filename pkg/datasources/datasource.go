@@ -6,37 +6,49 @@ import (
 	"sync"
 	"time"
 
-	"github.com/spiceai/spice/pkg/connectors"
+	"github.com/spiceai/spice/pkg/dataconnectors"
+	"github.com/spiceai/spice/pkg/dataprocessors"
 	"github.com/spiceai/spice/pkg/spec"
 	"github.com/spiceai/spice/pkg/state"
 )
 
 type DataSource struct {
 	spec.DataSourceSpec
-	connector        connectors.Connector
+	connector        dataconnectors.DataConnector
+	processor        dataprocessors.DataProcessor
 	cachedState      []*state.State
 	cachedStateMutex *sync.RWMutex
 }
 
 func NewDataSource(dsSpec spec.DataSourceSpec) (*DataSource, error) {
-	if dsSpec.Connector == nil {
-		return nil, fmt.Errorf("a connector is required for datasource %s/%s", dsSpec.From, dsSpec.Name)
-	}
-
-	connector, err := connectors.NewConnector(dsSpec.Connector.Type, dsSpec.Connector.Params)
-	if err != nil {
-		return nil, err
-	}
-
-	err = connector.Initialize()
-	if err != nil {
-		return nil, fmt.Errorf("data connector '%s' failed to initialize: %s", connector.Type(), err)
-	}
-
 	ds := DataSource{
 		DataSourceSpec:   dsSpec,
-		connector:        connector,
 		cachedStateMutex: &sync.RWMutex{},
+	}
+
+	if dsSpec.Data != nil {
+		connector, err := dataconnectors.NewDataConnector(dsSpec.Data.Connector.Name)
+		if err != nil {
+			return nil, fmt.Errorf("failed to initialize data connector '%s': %s", dsSpec.Data.Connector.Name, err)
+		}
+
+		err = connector.Init(dsSpec.Data.Connector.Params)
+		if err != nil {
+			return nil, fmt.Errorf("failed to initialize data connector '%s': %s", dsSpec.Data.Connector.Name, err)
+		}
+
+		processor, err := dataprocessors.NewDataProcessor(ds.Data.Processor.Name)
+		if err != nil {
+			return nil, fmt.Errorf("failed to initialize data processor '%s': %s", dsSpec.Data.Connector.Name, err)
+		}
+
+		err = processor.Init(dsSpec.Data.Connector.Params)
+		if err != nil {
+			return nil, fmt.Errorf("failed to initialize data processor '%s': %s", dsSpec.Data.Connector.Name, err)
+		}
+
+		ds.connector = connector
+		ds.processor = processor
 	}
 
 	return &ds, nil
@@ -135,7 +147,25 @@ func (ds *DataSource) AddNewState(state *state.State) {
 }
 
 func (ds *DataSource) FetchNewState(epoch time.Time, period time.Duration, interval time.Duration) ([]*state.State, error) {
-	observations, err := ds.connector.FetchData(epoch, period, interval)
+	if ds.connector == nil || ds.processor == nil {
+		return nil, nil
+	}
+
+	data, err := ds.connector.FetchData(epoch, period, interval)
+	if err != nil {
+		return nil, err
+	}
+
+	if data == nil {
+		return nil, nil
+	}
+
+	_, err = ds.processor.OnData(data)
+	if err != nil {
+		return nil, err
+	}
+
+	observations, err := ds.processor.GetObservations()
 	if err != nil {
 		return nil, err
 	}

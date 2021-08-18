@@ -29,7 +29,7 @@ func getHttpPort() (uint, error) {
 	}
 
 	return runtimeConfig.HttpPort, nil
-} 
+}
 
 func Run(cliContext context.RuntimeContext, manifestPath string) error {
 	fmt.Println("Spice runtime starting...")

@@ -6,7 +6,7 @@
   "datasources": [
     {
       "connector": {
-        "type": "openai-gym",
+        "name": "openai-gym",
         "params": {
           "environment": "CartPole-v1"
         }

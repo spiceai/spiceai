@@ -5,7 +5,7 @@
   "granularity": 10,
   "datasources": [
     {
-      "connector": { "type": "stateful" },
+      "connector": { "name": "localstate" },
       "actions": {
         "buy": "local_portfolio_usd_balance -= coinbase_btcusd_close\nlocal_portfolio_btc_balance += 1",
         "sell": "local_portfolio_usd_balance += coinbase_btcusd_close\nlocal_portfolio_btc_balance -= 1"

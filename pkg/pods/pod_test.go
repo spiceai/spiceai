@@ -1,15 +1,15 @@
 package pods
 
 import (
-	"bytes"
 	"fmt"
-	"io/ioutil"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/bradleyjkemp/cupaloy"
-	"github.com/spiceai/spice/pkg/csv"
+	"github.com/spiceai/spice/pkg/dataconnectors/file"
+	"github.com/spiceai/spice/pkg/dataprocessors"
+	"github.com/spiceai/spice/pkg/dataprocessors/csv"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -47,11 +47,11 @@ func testBasePropertiesFunc(pod *Pod) func(*testing.T) {
 
 		switch pod.Name {
 		case "trader":
-			expected = "d2cc6c526c3f48b630a251fb1b586cf4"
+			expected = "406b3108ae48fe5fc73aea9171daed6d"
 		case "trader-infer":
-			expected = "95c0e9b0b65ae7b50af26b4582126624"
+			expected = "54dd4e787c975f6149180d5974a091e3"
 		case "cartpole-v1":
-			expected = "f739fd1bf82dc26a864dca4778a43331"
+			expected = "aec667e29a1ab877cad4a541d895426a"
 		}
 
 		assert.Equal(t, expected, actual, "invalid pod.Hash()")
@@ -235,14 +235,31 @@ func testCachedCsvFunc(pod *Pod) func(*testing.T) {
 // Tests AddLocalState()
 func testAddLocalStateFunc(pod *Pod) func(*testing.T) {
 	return func(t *testing.T) {
-		data, err := ioutil.ReadFile("../../test/assets/data/csv/trader_input.csv")
+		fileConnector := file.NewFileConnector()
+		err := fileConnector.Init(map[string]string{
+			"path":  "../../test/assets/data/csv/trader_input.csv",
+			"watch": "false",
+		})
 		if err != nil {
-			t.Error(err)
-			return
+			t.Fatal(err.Error())
+		}
+		data, err := fileConnector.FetchData(time.Unix(1605312000, 0), 7*24*time.Hour, time.Hour)
+		if err != nil {
+			t.Fatal(err.Error())
 		}
 
-		reader := bytes.NewReader(data)
-		newState, err := csv.ProcessCsvByPath(reader, nil)
+		dp, err := dataprocessors.NewDataProcessor(csv.CsvProcessorName)
+		if err != nil {
+			t.Error(err)
+		}
+
+		err = dp.Init(nil)
+		assert.NoError(t, err)
+
+		_, err = dp.OnData(data)
+		assert.NoError(t, err)
+
+		newState, err := dp.GetState(nil)
 		if err != nil {
 			t.Error(err)
 		}
@@ -251,17 +268,34 @@ func testAddLocalStateFunc(pod *Pod) func(*testing.T) {
 	}
 }
 
-// Tests AddLocalStateCachedCsv()
+// Tests CachedCsv() called after AddLocalState()
 func testAddLocalStateCachedCsvFunc(pod *Pod) func(*testing.T) {
 	return func(t *testing.T) {
-		data, err := ioutil.ReadFile("../../test/assets/data/csv/trader_input.csv")
+		fileConnector := file.NewFileConnector()
+		err := fileConnector.Init(map[string]string{
+			"path":  "../../test/assets/data/csv/trader_input.csv",
+			"watch": "false",
+		})
 		if err != nil {
-			t.Error(err)
-			return
+			t.Fatal(err.Error())
+		}
+		data, err := fileConnector.FetchData(time.Unix(1605312000, 0), 7*24*time.Hour, time.Hour)
+		if err != nil {
+			t.Fatal(err.Error())
 		}
 
-		reader := bytes.NewReader(data)
-		newState, err := csv.ProcessCsvByPath(reader, nil)
+		dp, err := dataprocessors.NewDataProcessor(csv.CsvProcessorName)
+		if err != nil {
+			t.Error(err)
+		}
+
+		err = dp.Init(nil)
+		assert.NoError(t, err)
+
+		_, err = dp.OnData(data)
+		assert.NoError(t, err)
+
+		newState, err := dp.GetState(nil)
 		if err != nil {
 			t.Error(err)
 		}

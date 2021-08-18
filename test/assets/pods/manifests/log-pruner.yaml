@@ -6,19 +6,22 @@ params:
 datasources:
 - from: telegraf
   name: metrics
-  connector:
-    type: influxdb
-    params:
-      # If running in baremetal mode, use
-      # url: http://localhost:8086
+  data:
+    connector:
+      name: influxdb
+      params:
+        # If running in baremetal mode, use
+        # url: http://localhost:8086
 
-      # If running in docker v20.10 or above on Linux, v18.03 and above for MacOS/Windows
-      url: http://host.docker.internal:8086
-      token: my-super-secret-auth-token
-      org: my-org
-      bucket: my-bucket
-      measurement: cpu
-      field: usage_idle
+        # If running in docker v20.10 or above on Linux, v18.03 and above for MacOS/Windows
+        url: http://host.docker.internal:8086
+        token: my-super-secret-auth-token
+        org: my-org
+        bucket: my-bucket
+        measurement: cpu
+        field: usage_idle
+    processor:
+      name: flux-csv
   fields:
       - name: usage_idle
 

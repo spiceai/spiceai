@@ -1,17 +1,22 @@
 package spec
 
 type DataSourceInitSpec struct {
-	Connector ConnectorSpec     `json:"connector"`
+	Connector DataConnectorSpec `json:"connector"`
 	Actions   map[string]string `json:"actions"`
 }
 
 type DataSourceSpec struct {
-	From      string            `json:"from,omitempty" yaml:"from,omitempty" mapstructure:"from,omitempty"`
-	Name      string            `json:"name,omitempty" yaml:"name,omitempty" mapstructure:"name,omitempty"`
-	Connector *ConnectorSpec    `json:"connector,omitempty" yaml:"connector,omitempty" mapstructure:"connector,omitempty"`
-	Fields    []FieldSpec       `json:"fields,omitempty" yaml:"fields,omitempty" mapstructure:"fields,omitempty"`
-	Actions   map[string]string `json:"actions,omitempty" yaml:"actions,omitempty" mapstructure:"actions,omitempty"`
-	Laws      []string          `json:"laws,omitempty" yaml:"laws,omitempty" mapstructure:"laws,omitempty"`
+	From    string            `json:"from,omitempty" yaml:"from,omitempty" mapstructure:"from,omitempty"`
+	Name    string            `json:"name,omitempty" yaml:"name,omitempty" mapstructure:"name,omitempty"`
+	Data    *DataSpec         `json:"data,omitempty" yaml:"data,omitempty" mapstructure:"data,omitempty"`
+	Fields  []FieldSpec       `json:"fields,omitempty" yaml:"fields,omitempty" mapstructure:"fields,omitempty"`
+	Actions map[string]string `json:"actions,omitempty" yaml:"actions,omitempty" mapstructure:"actions,omitempty"`
+	Laws    []string          `json:"laws,omitempty" yaml:"laws,omitempty" mapstructure:"laws,omitempty"`
+}
+
+type DataSpec struct {
+	Connector DataConnectorSpec `json:"connector,omitempty" yaml:"connector,omitempty" mapstructure:"connector,omitempty"`
+	Processor DataProcessorSpec `json:"processor,omitempty" yaml:"processor,omitempty" mapstructure:"processor,omitempty"`
 }
 
 type FieldSpec struct {

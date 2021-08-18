@@ -29,7 +29,8 @@ Follow this guide to get started quickly with Spice AI. For a more comphrehensiv
 
 The developer preview of Spice AI has a few extra requirements that won't be needed for the public release.
 
-Currently, macOS and Linux are natively supported. [WSL 2](https://docs.microsoft.com/en-us/windows/wsl/install-win10) is required for Windows.
+* Currently, only macOS and Linux are natively supported. [WSL 2](https://docs.microsoft.com/en-us/windows/wsl/install-win10) is required for Windows.
+* arm64 is not yet supported (i.e. Apple's M1 Macs). We use M1s ourselves, so we hope to support this very soon :-)
 
 1. Install Docker
 2. Generate and export a GitHub PAT
@@ -127,15 +128,15 @@ This is just the start of your journey with AI. Next try one of the quickstart t
 
 **Quickstarts:**
 
-- [Trader](https://laughing-doodle-19648c61.pages.github.io/#/Samples?id=trader) - a basic Bitcoin trading bot
+* [Trader](https://laughing-doodle-19648c61.pages.github.io/#/Samples?id=trader) - a basic Bitcoin trading bot
 
 ## Community
 
 Spice AI started with the vision to make AI easy for developers. We are building Spice AI in the open and with the community. Reach out on Discord or by email to get involved. We will be starting a community call series soon!
 
-- Discord: [![Discord Banner](https://discord.com/api/guilds/803820740868571196/widget.png?style=shield)](https://discord.com/channels/803820740868571196/803820740868571199)
-- Twitter: [@SpiceAIHQ](https://twitter.com/spiceaihq)
-- Email: [team@spiceai.io](mailto:team@spiceai.io)
+* Discord: [![Discord Banner](https://discord.com/api/guilds/803820740868571196/widget.png?style=shield)](https://discord.com/channels/803820740868571196/803820740868571199)
+* Twitter: [@SpiceAIHQ](https://twitter.com/spiceaihq)
+* Email: [team@spiceai.io](mailto:team@spiceai.io)
 
 ### Contributing to Spice AI
 

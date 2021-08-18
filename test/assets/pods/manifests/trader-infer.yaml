@@ -6,8 +6,6 @@ datasources:
   - datasource:
     from: local
     name: portfolio
-    connector:
-      type: stateful
     fields:
     - name: usd_balance
       type: number
@@ -29,10 +27,13 @@ datasources:
   - datasource:
     from: coinbase
     name: btcusd
-    connector:
-      type: csv
-      params:
-        path: ../../test/assets/data/csv/COINBASE_BTCUSD, 30.csv
+    data:
+      connector:
+        name: file
+        params:
+          path: ../../test/assets/data/csv/COINBASE_BTCUSD, 30.csv
+      processor:
+        name: csv
     fields:
     - name: close
     

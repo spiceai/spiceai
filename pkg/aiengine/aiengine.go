@@ -313,7 +313,7 @@ func StartTraining(pod *pods.Pod) error {
 		return err
 	}
 
-	log.Println(aurora.Yellow(string(data)))
+	zaplog.Sugar().Debug(aurora.Yellow(string(data)))
 
 	trainUrl := fmt.Sprintf("%s/pods/%s/train", aiServerUrl, pod.Name)
 
@@ -478,6 +478,84 @@ func waitForServerHealthy(maxAttempts int) int {
 	}
 
 	return attemptCount
+}
+
+func getPodInitForTraining(pod *pods.Pod) *spec.PodInitSpec {
+	fields := make(map[string]float64)
+
+	globalActions := pod.Actions()
+	var laws []string
+
+	var dsInitSpecs []spec.DataSourceInitSpec
+	for _, ds := range pod.DataSources() {
+		for fqField, fqFieldInitializer := range ds.Fields() {
+			fieldName := strings.ReplaceAll(fqField, ".", "_")
+			fields[fieldName] = fqFieldInitializer
+		}
+
+		dsActions := make(map[string]string)
+		for dsAction := range ds.DataSourceSpec.Actions {
+			fqAction, ok := globalActions[dsAction]
+			if ok {
+				dsActions[dsAction] = strings.ReplaceAll(fqAction, ".", "_")
+			}
+		}
+
+		for _, law := range ds.Laws() {
+			laws = append(laws, strings.ReplaceAll(law, ".", "_"))
+		}
+
+		dsInitSpec := spec.DataSourceInitSpec{
+			Actions: dsActions,
+		}
+		if ds.DataSourceSpec.Data != nil {
+			dsInitSpec.Connector = ds.DataSourceSpec.Data.Connector
+		} else {
+			dsInitSpec.Connector = spec.DataConnectorSpec{
+				Name: "localstate",
+			}
+		}
+
+		dsInitSpecs = append(dsInitSpecs, dsInitSpec)
+	}
+
+	var rewardInit *string
+	if pod.PodSpec.Training != nil {
+		rewardInitTrimmed := strings.TrimSpace(pod.PodSpec.Training.RewardInit)
+		if rewardInitTrimmed != "" {
+			rewardInit = &rewardInitTrimmed
+		}
+	}
+
+	globalFields := pod.FieldNames()
+
+	rewards := pod.Rewards()
+	globalActionRewards := make(map[string]string)
+	for actionName := range globalActions {
+		globalActionRewards[actionName] = rewards[actionName]
+		if rewardInit != nil {
+			reward := *rewardInit + "\n" + rewards[actionName]
+			for _, fieldName := range globalFields {
+				reward = strings.ReplaceAll(reward, fieldName, strings.ReplaceAll(fieldName, ".", "_"))
+			}
+			globalActionRewards[actionName] = reward
+		}
+	}
+
+	epoch := pod.Epoch().Unix()
+
+	podInit := spec.PodInitSpec{
+		EpochTime:   &epoch,
+		Period:      int64(pod.Period().Seconds()),
+		Interval:    int(pod.Interval().Seconds()),
+		Granularity: int(pod.Granularity().Seconds()),
+		DataSources: dsInitSpecs,
+		Fields:      fields,
+		Actions:     globalActionRewards,
+		Laws:        laws,
+	}
+
+	return &podInit
 }
 
 func isTestEnvironment() bool {

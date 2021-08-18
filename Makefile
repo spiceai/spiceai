@@ -23,4 +23,5 @@ build:
 .PHONY: lint
 lint:
 	go vet ./...
+	black --check ai/src
 	golangci-lint run

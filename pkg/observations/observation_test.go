@@ -1,13 +1,13 @@
 package observations_test
 
 import (
-	"bytes"
 	"io/ioutil"
 	"strings"
 	"testing"
 
 	"github.com/bradleyjkemp/cupaloy"
-	"github.com/spiceai/spice/pkg/csv"
+	"github.com/spiceai/spice/pkg/dataprocessors"
+	"github.com/spiceai/spice/pkg/dataprocessors/csv"
 	"github.com/spiceai/spice/pkg/observations"
 	"github.com/stretchr/testify/assert"
 )
@@ -22,16 +22,27 @@ func TestObservations(t *testing.T) {
 // Tests "GetCsv() - All headers with preview
 func testGetCsvAllHeadersWithPreviewFunc() func(*testing.T) {
 	return func(t *testing.T) {
-		csvFilePath := "../../test/assets/data/csv/COINBASE_BTCUSD, 30.csv"
-		csvData, err := ioutil.ReadFile(csvFilePath)
+		data, err := ioutil.ReadFile("../../test/assets/data/csv/COINBASE_BTCUSD, 30.csv")
 		if err != nil {
-			t.Error(err)
-			return
+			t.Fatal(err)
 		}
 
-		reader := bytes.NewReader(csvData)
+		dp, err := dataprocessors.NewDataProcessor(csv.CsvProcessorName)
+		if err != nil {
+			t.Error(err)
+		}
 
-		data, err := csv.ProcessCsv(reader)
+		err = dp.Init(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		_, err = dp.OnData(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		newObservations, err := dp.GetObservations()
 		if err != nil {
 			t.Error(err)
 			return
@@ -40,7 +51,7 @@ func testGetCsvAllHeadersWithPreviewFunc() func(*testing.T) {
 		headerLine := "open,high,low,close,volume"
 		headers := strings.Split(headerLine, ",")
 
-		actualCsvNoHeaders, actualPreviewCsv := observations.GetCsv(headers, data, 5)
+		actualCsvNoHeaders, actualPreviewCsv := observations.GetCsv(headers, newObservations, 5)
 
 		expectedPreviewCsv := `1605312000,16339.56,16339.6,16240,16254.51,274.42607
 1605313800,16256.42,16305,16248.6,16305,110.91971
@@ -55,19 +66,30 @@ func testGetCsvAllHeadersWithPreviewFunc() func(*testing.T) {
 	}
 }
 
-// Tests "GetCsv() - All headers with preview
+// Tests "GetCsv() - Select headers with preview
 func testGetCsvSelectHeadersWithPreviewFunc() func(*testing.T) {
 	return func(t *testing.T) {
-		csvFilePath := "../../test/assets/data/csv/COINBASE_BTCUSD, 30.csv"
-		csvData, err := ioutil.ReadFile(csvFilePath)
+		data, err := ioutil.ReadFile("../../test/assets/data/csv/COINBASE_BTCUSD, 30.csv")
 		if err != nil {
-			t.Error(err)
-			return
+			t.Fatal(err)
 		}
 
-		reader := bytes.NewReader(csvData)
+		dp, err := dataprocessors.NewDataProcessor(csv.CsvProcessorName)
+		if err != nil {
+			t.Error(err)
+		}
 
-		data, err := csv.ProcessCsv(reader)
+		err = dp.Init(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		_, err = dp.OnData(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		newObservations, err := dp.GetObservations()
 		if err != nil {
 			t.Error(err)
 			return
@@ -75,7 +97,7 @@ func testGetCsvSelectHeadersWithPreviewFunc() func(*testing.T) {
 
 		headers := strings.Split("open,high,low,close,volume", ",")
 
-		_, actualPreviewCsv := observations.GetCsv(headers, data, 5)
+		_, actualPreviewCsv := observations.GetCsv(headers, newObservations, 5)
 
 		expectedPreviewCsv := `1605312000,16339.56,16339.6,16240,16254.51,274.42607
 1605313800,16256.42,16305,16248.6,16305,110.91971
