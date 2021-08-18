@@ -25,7 +25,7 @@ func (r *GitHubRegistry) GetPod(podPath string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	
+
 	podName := strings.ToLower(filepath.Base(podPath))
 	gh := github.NewGitHubClient(gitHubRegistryOwner, gitHubRegistryRepo, "")
 

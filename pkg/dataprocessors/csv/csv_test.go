@@ -1,55 +1,91 @@
 package csv
 
 import (
-	"bytes"
-	"io/ioutil"
 	"sort"
 	"testing"
+	"time"
 
 	"github.com/bradleyjkemp/cupaloy"
+	"github.com/spiceai/spice/pkg/dataconnectors/file"
 	"github.com/spiceai/spice/pkg/observations"
 	"github.com/stretchr/testify/assert"
 )
 
-var snapshotter = cupaloy.New(cupaloy.SnapshotSubdirectory("../../test/assets/snapshots/csv"))
+var snapshotter = cupaloy.New(cupaloy.SnapshotSubdirectory("../../../test/assets/snapshots/dataprocessors/csv"))
 
 func TestCsv(t *testing.T) {
-	localCsvFilePath := "../../test/assets/data/csv/COINBASE_BTCUSD, 30.csv"
-	localCsvData, err := ioutil.ReadFile(localCsvFilePath)
+	localFileConnector := file.NewFileConnector()
+	err := localFileConnector.Init(map[string]string{
+		"path":  "../../../test/assets/data/csv/COINBASE_BTCUSD, 30.csv",
+		"watch": "false",
+	})
 	if err != nil {
-		t.Error(err)
-		return
+		t.Fatal(err.Error())
+	}
+	localData, err := localFileConnector.FetchData(time.Unix(1605312000, 0), 7*24*time.Hour, time.Hour)
+	if err != nil {
+		t.Fatal(err.Error())
 	}
 
-	globalCsvFilePath := "../../test/assets/data/csv/trader_input.csv"
-	globalCsvData, err := ioutil.ReadFile(globalCsvFilePath)
+	globalFileConnector := file.NewFileConnector()
+	err = globalFileConnector.Init(map[string]string{
+		"path":  "../../../test/assets/data/csv/trader_input.csv",
+		"watch": "false",
+	})
 	if err != nil {
-		t.Error(err)
-		return
+		t.Fatal(err.Error())
+	}
+	globalData, err := globalFileConnector.FetchData(time.Unix(1605312000, 0), 7*24*time.Hour, time.Hour)
+	if err != nil {
+		t.Fatal(err.Error())
 	}
 
-	t.Run("ProcessCsv()", testProcessCsvFunc(localCsvData))
-	t.Run("ProcessCsvByPath()", testProcessCsvByPathFunc(globalCsvData))
+	t.Run("Init()", testInitFunc())
+	t.Run("GetObservations()", testGetObservationsFunc(localData))
+	t.Run("GetState()", testGetStateFunc(globalData))
 	t.Run("getColumnMappings()", testgetColumnMappingsFunc())
 }
 
-func BenchmarkProcessCsv(b *testing.B) {
-	csvFilePath := "../../test/assets/data/csv/COINBASE_BTCUSD, 30.csv"
-	csvData, err := ioutil.ReadFile(csvFilePath)
+func BenchmarkGetObservations(b *testing.B) {
+	localFileConnector := file.NewFileConnector()
+	err := localFileConnector.Init(map[string]string{
+		"path":  "../../test/assets/data/csv/COINBASE_BTCUSD, 30.csv",
+		"watch": "false",
+	})
 	if err != nil {
 		b.Error(err)
-		return
 	}
 
-	b.Run("ProcessCsv()", benchProcessCsvFunc(csvData))
+	b.Run("GetObservations()", benchGetObservationsFunc(localFileConnector))
 }
 
-// Tests "ProcessCsv()"
-func testProcessCsvFunc(csvData []byte) func(*testing.T) {
-	return func(t *testing.T) {
-		reader := bytes.NewReader(csvData)
+// Tests "Init()"
+func testInitFunc() func(*testing.T) {
+	p := NewCsvProcessor()
 
-		actualObservations, err := ProcessCsv(reader)
+	params := map[string]string{}
+
+	return func(t *testing.T) {
+		err := p.Init(params)
+		assert.NoError(t, err)
+	}
+}
+
+// Tests "GetObservations()"
+func testGetObservationsFunc(data []byte) func(*testing.T) {
+	return func(t *testing.T) {
+		if len(data) == 0 {
+			t.Fatal("no data")
+		}
+
+		dp := NewCsvProcessor()
+		err := dp.Init(nil)
+		assert.NoError(t, err)
+
+		_, err = dp.OnData(data)
+		assert.NoError(t, err)
+
+		actualObservations, err := dp.GetObservations()
 		if err != nil {
 			t.Error(err)
 			return
@@ -71,12 +107,21 @@ func testProcessCsvFunc(csvData []byte) func(*testing.T) {
 	}
 }
 
-// Tests "ProcessCsvByPath()"
-func testProcessCsvByPathFunc(csvData []byte) func(*testing.T) {
+// Tests "GetState()"
+func testGetStateFunc(data []byte) func(*testing.T) {
 	return func(t *testing.T) {
-		reader := bytes.NewReader(csvData)
+		if len(data) == 0 {
+			t.Fatal("no data")
+		}
 
-		actualState, err := ProcessCsvByPath(reader, nil)
+		dp := NewCsvProcessor()
+		err := dp.Init(nil)
+		assert.NoError(t, err)
+
+		_, err = dp.OnData(data)
+		assert.NoError(t, err)
+
+		actualState, err := dp.GetState(nil)
 		if err != nil {
 			t.Error(err)
 			return
@@ -110,7 +155,6 @@ func testProcessCsvByPathFunc(csvData []byte) func(*testing.T) {
 // Tests "getColumnMappings()"
 func testgetColumnMappingsFunc() func(*testing.T) {
 	return func(t *testing.T) {
-
 		headers := []string{"time", "local.portfolio.usd_balance", "local.portfolio.btc_balance", "coinbase.btcusd.price"}
 
 		colToPath, colToFieldName, err := getColumnMappings(headers)
@@ -127,12 +171,17 @@ func testgetColumnMappingsFunc() func(*testing.T) {
 	}
 }
 
-// Benchmark "GetCsv()"
-func benchProcessCsvFunc(csvData []byte) func(*testing.B) {
+// Benchmark "GetObservations()"
+func benchGetObservationsFunc(c *file.FileConnector) func(*testing.B) {
 	return func(b *testing.B) {
+		dp := NewCsvProcessor()
+		err := dp.Init(nil)
+		if err != nil {
+			b.Error(err)
+		}
+
 		for i := 0; i < 10; i++ {
-			reader := bytes.NewReader(csvData)
-			_, err := ProcessCsv(reader)
+			_, err := dp.GetObservations()
 			if err != nil {
 				b.Fatal(err.Error())
 			}

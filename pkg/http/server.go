@@ -1,7 +1,6 @@
 package http
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -10,11 +9,14 @@ import (
 	"github.com/fasthttp/router"
 	"github.com/spiceai/spice/pkg/aiengine"
 	"github.com/spiceai/spice/pkg/api"
-	"github.com/spiceai/spice/pkg/csv"
 	"github.com/spiceai/spice/pkg/dashboard"
+	"github.com/spiceai/spice/pkg/dataprocessors"
+	"github.com/spiceai/spice/pkg/dataprocessors/csv"
 	"github.com/spiceai/spice/pkg/flights"
+	"github.com/spiceai/spice/pkg/loggers"
 	"github.com/spiceai/spice/pkg/pods"
 	"github.com/valyala/fasthttp"
+	"go.uber.org/zap"
 )
 
 type ServerConfig struct {
@@ -24,6 +26,10 @@ type ServerConfig struct {
 type server struct {
 	config ServerConfig
 }
+
+var (
+	zaplog *zap.Logger = loggers.ZapLogger()
+)
 
 func healthHandler(ctx *fasthttp.RequestCtx) {
 	if !aiengine.ServerReady() {
@@ -65,9 +71,21 @@ func apiPostObservationsHandler(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	reader := bytes.NewReader(ctx.Request.Body())
+	dp, err := dataprocessors.NewDataProcessor(csv.CsvProcessorName)
+	if err != nil {
+		zaplog.Sugar().Error(err)
+		ctx.Response.SetStatusCode(500)
+	}
+
+	_, err = dp.OnData(ctx.Request.Body())
+	if err != nil {
+		zaplog.Sugar().Error(err)
+		ctx.Response.SetStatusCode(500)
+	}
+
 	validFieldNames := pod.FieldNames()
-	newState, err := csv.ProcessCsvByPath(reader, &validFieldNames)
+
+	newState, err := dp.GetState(&validFieldNames)
 	if err != nil {
 		ctx.Response.SetStatusCode(400)
 		fmt.Fprintf(ctx, "error processing csv: %s", err.Error())

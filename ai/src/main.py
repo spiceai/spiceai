@@ -6,7 +6,7 @@ from algorithms.factory import get_agent
 from algorithms.agent_interface import SpiceAIAgent
 from flask import Flask, jsonify, make_response, request
 from data import DataManager
-from connector.manager import ConnectorManager, ConnectorType
+from connector.manager import ConnectorManager, ConnectorName
 from connector.openai_gym import OpenAIGymConnector
 from connector.stateful import StatefulConnector
 from validation import validate_rewards
@@ -94,7 +94,7 @@ def init(pod: str):
 
         for datasource_data in datasources_data:
             connector_data = datasource_data["connector"]
-            connector_type: ConnectorType = connector_data["type"]
+            connector_name: ConnectorName = connector_data["name"]
 
             connector_params = dict()
             if "params" in connector_data:
@@ -104,15 +104,15 @@ def init(pod: str):
             if "actions" in datasource_data:
                 datasource_actions = datasource_data["actions"]
 
-            if connector_type == ConnectorType.STATEFUL.value:
+            if connector_name == ConnectorName.STATEFUL.value:
                 new_connector = StatefulConnector(
                     data_manager=data_manager,
                     action_effects=datasource_actions,
                 )
                 connector_manager.add_connector(new_connector)
-            elif connector_type == ConnectorType.OPENAI_GYM.value:
+            elif connector_name == ConnectorName.OPENAI_GYM.value:
                 if not "environment" in connector_params:
-                    message = f"missing the environment parameter for {connector_type}"
+                    message = f"missing the environment parameter for {connector_name}"
                     return make_response(
                         jsonify({"result": "missing_param", "message": message}), 400
                     )

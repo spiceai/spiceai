@@ -1,6 +1,7 @@
 package csv
 
 import (
+	"bytes"
 	"encoding/csv"
 	"errors"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"log"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/spiceai/spice/pkg/loggers"
 	"github.com/spiceai/spice/pkg/observations"
@@ -20,9 +22,46 @@ var (
 	zaplog *zap.Logger = loggers.ZapLogger()
 )
 
-// Processes CSV into Observations
-func ProcessCsv(input io.Reader) ([]observations.Observation, error) {
-	headers, lines, err := getCsvHeaderAndLines(input)
+const (
+	CsvProcessorName string = "csv"
+)
+
+type CsvProcessor struct {
+	data      []byte
+	dataMutex sync.RWMutex
+}
+
+func NewCsvProcessor() *CsvProcessor {
+	return &CsvProcessor{}
+}
+
+func (p *CsvProcessor) Init(params map[string]string) error {
+	return nil
+}
+
+func (p *CsvProcessor) OnData(data []byte) ([]byte, error) {
+	p.dataMutex.Lock()
+	defer p.dataMutex.Unlock()
+
+	p.data = data
+
+	return data, nil
+}
+
+func (p *CsvProcessor) GetObservations() ([]observations.Observation, error) {
+	reader, err := p.getDataReader()
+	if err != nil {
+		return nil, err
+	}
+	if reader == nil {
+		return nil, nil
+	}
+
+	return p.getObservations(reader)
+}
+
+func (p *CsvProcessor) getObservations(reader io.Reader) ([]observations.Observation, error) {
+	headers, lines, err := getCsvHeaderAndLines(reader)
 	if err != nil {
 		return nil, fmt.Errorf("failed to process csv: %s", err)
 	}
@@ -58,10 +97,18 @@ func ProcessCsv(input io.Reader) ([]observations.Observation, error) {
 	return newObservations, nil
 }
 
-// Processes CSV into State by field path
+// Processes into State by field path
 // CSV headers are expected to be fully-qualified field names
-func ProcessCsvByPath(input io.Reader, validFields *[]string) ([]*state.State, error) {
-	headers, lines, err := getCsvHeaderAndLines(input)
+func (p *CsvProcessor) GetState(validFields *[]string) ([]*state.State, error) {
+	reader, err := p.getDataReader()
+	if err != nil {
+		return nil, err
+	}
+	if reader == nil {
+		return nil, nil
+	}
+
+	headers, lines, err := getCsvHeaderAndLines(reader)
 	if err != nil {
 		return nil, fmt.Errorf("failed to process csv: %s", err)
 	}
@@ -165,6 +212,11 @@ func ProcessCsvByPath(input io.Reader, validFields *[]string) ([]*state.State, e
 	}
 
 	return result, nil
+}
+
+func (p *CsvProcessor) getDataReader() (io.Reader, error) {
+	reader := bytes.NewReader(p.data)
+	return reader, nil
 }
 
 func getCsvHeaderAndLines(input io.Reader) ([]string, [][]string, error) {

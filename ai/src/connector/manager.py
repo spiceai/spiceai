@@ -5,8 +5,8 @@ from enum import Enum
 from typing import Union
 
 
-class ConnectorType(Enum):
-    STATEFUL = "stateful"
+class ConnectorName(Enum):
+    STATEFUL = "localstate"
     OPENAI_GYM = "openai-gym"
 
 
