@@ -108,7 +108,7 @@ func (r *SpiceRuntime) configChangeHandler(e fsnotify.Event) {
 func (r *SpiceRuntime) printStartupBanner(mode string) {
 	fmt.Printf("- Runtime version: %s\n", version.Version())
 	if mode != "" {
-		fmt.Printf("- Mode: %s", mode)
+		fmt.Printf("- Mode: %s\n", mode)
 	}
 	fmt.Println(aurora.Green(fmt.Sprintf("- Listening on http://localhost:%d", runtime.config.HttpPort)))
 	fmt.Println()
