@@ -142,11 +142,20 @@ class DataManager:
                 return self.massive_table_filled.iloc[start_index:end_index]
 
     def get_latest_window(self):
+        start_index = None
+        end_index = None
         latest_time = self.massive_table_filled.last_valid_index()
-        start_index = self.massive_table_filled.index.get_loc(
-            latest_time - self.interval_secs, "ffill"
-        )
-        end_index = self.massive_table_filled.index.get_loc(latest_time, "ffill")
+
+        # If we only have a single row, use it
+        if self.massive_table_filled.shape[0] == 1:
+            start_index = self.massive_table_filled.index.get_loc(latest_time)
+            end_index = start_index
+        else:
+            start_index = self.massive_table_filled.index.get_loc(
+                latest_time - self.interval_secs, "ffill"
+            )
+            end_index = self.massive_table_filled.index.get_loc(latest_time, "ffill")
+
         if self.get_window_span() == 1:
             return self.massive_table_filled.iloc[start_index : start_index + 1]
         else:
