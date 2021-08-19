@@ -128,7 +128,11 @@ This is just the start of your journey with AI. Next try one of the quickstart t
 
 **Quickstarts:**
 
-* [Trader](https://laughing-doodle-19648c61.pages.github.io/#/Samples?id=trader) - a basic Bitcoin trading bot
+* [Trader](https://github.com/spiceai/quickstarts/tree/trunk/trader) - a basic Bitcoin trading bot
+
+**Kubernetes:**
+
+Spice AI integrates with your Kubernetes hosted apps!  Try out the [Kubernetes sample](https://github.com/spiceai/samples/tree/trunk/kubernetes) for yourself.   
 
 ## Community
 
