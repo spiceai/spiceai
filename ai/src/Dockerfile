@@ -5,8 +5,8 @@ WORKDIR /app
 ENV HOME=/app/home
 ENV SPICE_ENVIRONMENT=demo
 
-COPY requirements.txt .
-RUN python3 -m pip install -r requirements.txt
+COPY requirements/common.txt requirements/production.txt ./
+RUN python3 -m pip install -r production.txt
 
 COPY *.py ./
 COPY connectors/*.py ./connectors/

@@ -1,3 +1,4 @@
+# Contains requirements common to all environments
 absl-py==0.12.0
 appdirs==1.4.4
 appnope==0.1.2
@@ -23,7 +24,6 @@ gym==0.18.3
 h5py==3.1.0
 humanize==3.11.0
 idna==2.10
-influxdb-client==1.18.0
 iniconfig==1.1.1
 ipykernel==5.5.5
 ipython==7.24.1

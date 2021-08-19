@@ -5,4 +5,11 @@ test: venv
 
 venv:
 	python3 -m venv venv
-	venv/bin/pip3 install -r requirements.txt
+	venv/bin/pip3 install --upgrade pip
+	venv/bin/pip3 install -r requirements/production.txt
+
+.PHONY: venv-dev
+venv-dev:
+	python3 -m venv venv
+	venv/bin/pip3 install --upgrade pip
+	venv/bin/pip3 install -r requirements/development.txt
