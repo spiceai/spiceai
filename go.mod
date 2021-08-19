@@ -33,6 +33,7 @@ require (
 	golang.org/x/net v0.0.0-20210813160813-60bc85c4be6d // indirect
 	golang.org/x/sys v0.0.0-20210816074244-15123e1e1f71 // indirect
 	golang.org/x/text v0.3.7 // indirect
+	gopkg.in/natefinch/lumberjack.v2 v2.0.0 // indirect
 	gopkg.in/src-d/go-git.v4 v4.8.1 // indirect
 	gopkg.in/yaml.v2 v2.4.0
 )

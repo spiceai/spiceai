@@ -107,13 +107,9 @@ func StartServer(ready chan bool, isSingleRun bool) error {
 		outScanner := bufio.NewScanner(stdOutPipe)
 		errScanner := bufio.NewScanner(stdErrPipe)
 
-		logFileName := loggers.FormatTimestampedLogFileName("ai-server")
-		logPath := filepath.Join(config.SpiceLogPath(), logFileName)
-
-		fileLogger := loggers.NewFileLogger(logPath)
-		err := fileLogger.Open()
+		fileLogger, err := loggers.NewFileLogger("aiengine")
 		if err != nil {
-			log.Println(fmt.Errorf("error opening log file %s: %w", logPath, err))
+			zaplog.Sugar().Errorf("error creating file logger: %w", err)
 			fileLogger = nil
 		}
 
@@ -129,7 +125,7 @@ func StartServer(ready chan bool, isSingleRun bool) error {
 				}
 
 				if fileLogger != nil {
-					_ = fileLogger.Writeln(line)
+					fileLogger.Info(line)
 				}
 			}
 		}()
@@ -139,7 +135,7 @@ func StartServer(ready chan bool, isSingleRun bool) error {
 				line := errScanner.Text()
 
 				if fileLogger != nil {
-					_ = fileLogger.Writeln(line)
+					fileLogger.Info(line)
 				}
 			}
 		}()
@@ -148,7 +144,7 @@ func StartServer(ready chan bool, isSingleRun bool) error {
 		if err != nil {
 			log.Println(fmt.Errorf("error starting %s: %w", aiServerCmd.Path, err))
 			if fileLogger != nil {
-				fileLogger.Close()
+				_ = fileLogger.Sync()
 			}
 			aiServerRunning <- false
 			return
@@ -164,7 +160,7 @@ func StartServer(ready chan bool, isSingleRun bool) error {
 				log.Println(fmt.Errorf("process %s exited with error: %w", aiServerCmd.Path, appErr))
 			}
 			if fileLogger != nil {
-				fileLogger.Close()
+				_ = fileLogger.Sync()
 			}
 
 			if !aiServerCmd.ProcessState.Success() && !isTestEnvironment() {

@@ -1,54 +1,50 @@
 package loggers
 
 import (
-	"bufio"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
+
+	"github.com/spiceai/spice/pkg/config"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	lumberjack "gopkg.in/natefinch/lumberjack.v2"
 )
 
-type FileLogger struct {
-	path   string
-	file   *os.File
-	writer *bufio.Writer
-}
+func NewFileLogger(name string) (*zap.Logger, error) {
+	path := config.SpiceLogPath()
+	if _, err := os.Stat(path); err != nil {
+		runtimePath := config.SpiceRuntimePath()
+		rootStat, err := os.Stat(config.SpiceRuntimePath())
+		if err != nil {
+			return nil, fmt.Errorf("failed to find runtime path '%s': %w", runtimePath, err)
+		}
 
-func NewFileLogger(path string) *FileLogger {
-	return &FileLogger{
-		path: path,
+		if err = os.MkdirAll(path, rootStat.Mode().Perm()); err != nil {
+			return nil, fmt.Errorf("failed to create log path '%s'", path)
+		}
 	}
-}
 
-func FormatTimestampedLogFileName(basename string) string {
-	return fmt.Sprintf("%s-%s.log", basename, time.Now().UTC().Format("20060102T150405Z"))
-}
+	fileName := fmt.Sprintf("%s-%s.log", name, time.Now().UTC().Format("20060102T150405Z"))
+	logPath := filepath.Join(path, fileName)
 
-func (logger *FileLogger) Open() error {
-	file, err := os.OpenFile(logger.path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0666)
+	_, err := os.Create(logPath)
 	if err != nil {
-		return err
+		return nil, fmt.Errorf("failed to create log file '%s': %w", logPath, err)
 	}
-	logger.file = file
-	logger.writer = bufio.NewWriter(file)
 
-	return nil
-}
+	w := zapcore.AddSync(&lumberjack.Logger{
+		Filename:   logPath,
+		MaxSize:    100, // megabytes
+		MaxBackups: 3,
+		MaxAge:     60, // days
+	})
+	core := zapcore.NewCore(
+		zapcore.NewJSONEncoder(zap.NewProductionEncoderConfig()),
+		w,
+		zap.DebugLevel,
+	)
 
-func (logger *FileLogger) Close() {
-	if logger.writer != nil {
-		logger.writer.Flush()
-		logger.writer = nil
-	}
-	if logger.file != nil {
-		logger.file.Close()
-		logger.file = nil
-	}
-}
-
-func (logger *FileLogger) Writeln(text string) error {
-	_, err := logger.writer.WriteString(fmt.Sprintln(text))
-	if err != nil {
-		return err
-	}
-	return nil
+	return zap.New(core), nil
 }
