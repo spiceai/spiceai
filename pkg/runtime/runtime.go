@@ -127,7 +127,10 @@ func SingleRun(manifestPath string) error {
 		return err
 	}
 
-	spice_http.NewServer(runtime.config.HttpPort).Start()
+	err = spice_http.NewServer(runtime.config.HttpPort, runtime.config.CustomDashboardPath).Start()
+	if err != nil {
+		return err
+	}
 
 	<-aiEngineReady
 
@@ -165,7 +168,10 @@ func Run() error {
 		return err
 	}
 
-	spice_http.NewServer(runtime.config.HttpPort).Start()
+	err = spice_http.NewServer(runtime.config.HttpPort, runtime.config.CustomDashboardPath).Start()
+	if err != nil {
+		return err
+	}
 
 	<-aiEngineReady
 

@@ -20,7 +20,8 @@ import (
 )
 
 type ServerConfig struct {
-	Port uint
+	Port          uint
+	DashboardPath *string
 }
 
 type server struct {
@@ -264,21 +265,33 @@ func apiPostFlightEpisodeHandler(ctx *fasthttp.RequestCtx) {
 	ctx.Response.SetStatusCode(201)
 }
 
-func NewServer(port uint) *server {
+func NewServer(port uint, dashboardPath *string) *server {
 	return &server{
 		config: ServerConfig{
-			Port: port,
+			Port:          port,
+			DashboardPath: dashboardPath,
 		},
 	}
 }
 
-func (server *server) Start() {
+func (server *server) Start() error {
 	r := router.New()
 	r.GET("/health", healthHandler)
 
 	// Static Dashboard
-	r.GET("/", dashboard.DashboardIndexHandler)
-	r.GET("/js/{jsFile}", dashboard.DashboardAppHandler)
+	var dashboardServer dashboard.Dashboard
+	var err error
+	if server.config.DashboardPath != nil {
+		dashboardServer, err = dashboard.NewDashboardLocalFs(*server.config.DashboardPath)
+		if err != nil {
+			return fmt.Errorf("failed to initialize dashboard: %w", err)
+		}
+	} else {
+		dashboardServer = dashboard.NewDashboardEmbedded()
+	}
+
+	r.GET("/", dashboardServer.IndexHandler)
+	r.GET("/js/{jsFile}", dashboardServer.JsHandler)
 
 	// Pods
 	r.GET("/api/v0.1/pods", apiPodsHandler)
@@ -297,4 +310,6 @@ func (server *server) Start() {
 	go func() {
 		log.Fatal(fasthttp.ListenAndServe(fmt.Sprintf(":%d", server.config.Port), r.Handler))
 	}()
+
+	return nil
 }

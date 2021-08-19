@@ -25,7 +25,9 @@ func testDashboardIndexHandler() func(*testing.T) {
 		r, err := http.NewRequest("GET", "http://test/", nil)
 		assert.NoError(t, err)
 
-		res, err := serve("/", dashboard.DashboardIndexHandler, r)
+		server := dashboard.NewDashboardEmbedded()
+
+		res, err := serve("/", server.IndexHandler, r)
 		assert.NoError(t, err)
 
 		body, err := ioutil.ReadAll(res.Body)
@@ -40,7 +42,9 @@ func testDashboardAppHandler() func(*testing.T) {
 		r, err := http.NewRequest("GET", "http://test/js/app.js", nil)
 		assert.NoError(t, err)
 
-		res, err := serve("/js/{jsFile}", dashboard.DashboardAppHandler, r)
+		server := dashboard.NewDashboardEmbedded()
+
+		res, err := serve("/js/{jsFile}", server.JsHandler, r)
 		assert.NoError(t, err)
 
 		body, err := ioutil.ReadAll(res.Body)
