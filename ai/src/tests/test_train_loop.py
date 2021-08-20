@@ -374,6 +374,29 @@ class TrainingLoopTests(unittest.TestCase):
             error_data["error_message"], """NameError("name 'foo' is not defined")"""
         )
 
+    def test_unsafe_reward_error(self):
+        trader_init = copy.deepcopy(self.trader_init_req)
+        trader_init.actions[
+            "buy"
+        ] = "open('/tmp/FILE','w').write('this is unsafe!'); reward = 1"
+
+        self.init(trader_init)
+
+        self.add_data("trader", self.trader_data_csv)
+
+        FLIGHT = "1"
+        NUMBER_EPISODES = 10
+        self.start_training("trader", FLIGHT, NUMBER_EPISODES, 1626697490)
+
+        self.wait_for_training()
+
+        self.assertEqual(len(self.episode_results), 1)
+        error_data = self.episode_results[0]["episode_data"]
+        self.assertEqual(error_data["error"], "invalid_reward_function")
+        self.assertEqual(
+            error_data["error_message"], """NameError("name 'open' is not defined")"""
+        )
+
     def test_invalid_law_post_error(self):
         trader_init = copy.deepcopy(self.trader_init_req)
         trader_init.laws[0] = "can I do this?"

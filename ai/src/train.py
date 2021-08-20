@@ -18,6 +18,7 @@ from connector.manager import ConnectorManager
 from data import DataManager
 from metrics import metrics
 import threading
+from exec import somewhat_safe_eval
 
 training_lock = threading.Lock()
 
@@ -115,7 +116,7 @@ def train_agent(
             if training_goal != "":
                 loc = dict()
                 loc["score"] = episode_reward
-                custom_training_goal_met = eval(training_goal, dict(), loc)
+                custom_training_goal_met = somewhat_safe_eval(training_goal, loc)
 
             agent.learn()
             print_event(

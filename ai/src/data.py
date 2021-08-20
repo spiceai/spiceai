@@ -6,6 +6,7 @@ import math
 import threading
 from exception import RewardInvalidException
 from metrics import metrics
+from exec import somewhat_safe_exec
 
 
 class DataManager:
@@ -191,7 +192,7 @@ class DataManager:
         reward_func = self.action_rewards[action_name]
 
         try:
-            exec(reward_func, globals(), loc)
+            loc = somewhat_safe_exec(reward_func, loc)
         except Exception as ex:
             raise RewardInvalidException(repr(ex))
 

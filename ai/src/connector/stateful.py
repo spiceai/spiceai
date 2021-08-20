@@ -3,6 +3,7 @@ import numpy as np
 import pandas as pd
 import copy
 from exception import LawInvalidException, DataSourceActionInvalidException
+from exec import somewhat_safe_exec, somewhat_safe_eval
 
 
 class StatefulConnector:
@@ -35,13 +36,13 @@ class StatefulConnector:
         original_local = copy.deepcopy(locals)
 
         try:
-            exec(self.action_effects[action_name], globals(), locals)
+            locals = somewhat_safe_exec(self.action_effects[action_name], locals)
         except Exception as ex:
             raise DataSourceActionInvalidException(repr(ex))
 
         try:
             for law in self.data_manager.laws:
-                if not eval(law, globals(), locals):
+                if not somewhat_safe_eval(law, locals):
                     return False
         except Exception as ex:
             raise LawInvalidException(repr(ex))
