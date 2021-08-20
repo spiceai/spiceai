@@ -62,18 +62,18 @@ func LoadRuntimeConfiguration(v *viper.Viper) (*SpiceConfiguration, error) {
 		configPath = ".spice/config.yaml"
 	} else if _, err := os.Stat(".spice/config.yml"); err == nil {
 		configPath = ".spice/config.yml"
-	} 
-	
+	}
+
 	if configPath != "" {
 		configBytes, err := util.ReplaceEnvVariablesFromPath(configPath, SpiceEnvVarPrefix)
 		if err != nil {
 			return nil, err
 		}
-	
+
 		err = v.ReadConfig(bytes.NewBuffer(configBytes))
 		if err != nil {
 			return nil, err
-		}	
+		}
 	} else {
 		// No config file found, use defaults
 		config = LoadDefaultConfiguration()

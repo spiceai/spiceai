@@ -80,11 +80,6 @@ func (r *SpiceRuntime) processPodsConfig() {
 				continue
 			}
 
-			err = aiengine.LoadInferencing(pod, tag)
-			if err != nil {
-				log.Println("Error:", "Failed to reload inferencing with tag", tag)
-			}
-
 			log.Printf("Updated pod '%s' model to '%s'\n", pod.Name, tag)
 		}
 	}

@@ -7,7 +7,6 @@ import (
 
 	"github.com/logrusorgru/aurora"
 	"github.com/spiceai/spice/pkg/config"
-	"github.com/spiceai/spice/pkg/loggers"
 	"github.com/spiceai/spice/pkg/util"
 )
 
@@ -33,7 +32,7 @@ func RemovePodByManifestPath(manifestPath string) {
 	relativePath := config.GetSpiceAppRelativePath(manifestPath)
 	for _, pod := range pods {
 		if pod.ManifestPath() == manifestPath {
-			loggers.ZapLogger().Sugar().Infof("Removing pod %s: %s\n", aurora.Bold(pod.Name), aurora.Gray(12, relativePath))
+			log.Printf("Removing pod %s: %s\n", aurora.Bold(pod.Name), aurora.Gray(12, relativePath))
 			RemovePod(pod.Name)
 			return
 		}

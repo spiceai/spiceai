@@ -1,18 +1,19 @@
+import grpc
 import pandas as pd
 from io import StringIO
 import tensorflow as tf
 import threading
 from algorithms.factory import get_agent
 from algorithms.agent_interface import SpiceAIAgent
-from flask import Flask, jsonify, make_response, request
 from data import DataManager
 from connector.manager import ConnectorManager, ConnectorName
 from connector.openai_gym import OpenAIGymConnector
 from connector.stateful import StatefulConnector
 from validation import validate_rewards
 from train import train_agent, training_lock, saved_models, ALGORITHM
+from concurrent import futures
+from proto.aiengine.v1 import aiengine_pb2, aiengine_pb2_grpc
 
-app = Flask(__name__)
 data_managers: "dict[DataManager]" = dict()
 connector_managers: "dict[ConnectorManager]" = dict()
 
@@ -50,218 +51,202 @@ def dispatch_train_agent(
     return True
 
 
-@app.route("/pods/<pod>/init", methods=["POST"])
-def init(pod: str):
-    with init_lock:
-        init_data = request.get_json()
-        data_manager = DataManager()
-        connector_manager = ConnectorManager()
+class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
+    def GetHealth(self, request, context):
+        return aiengine_pb2.Response(result="ok")
 
-        period_secs = pd.to_timedelta(int(init_data["period"]), unit="s")
-        interval_secs = pd.to_timedelta(int(init_data["interval"]), unit="s")
-        granularity_secs = pd.to_timedelta(int(init_data["granularity"]), unit="s")
+    def AddData(self, request: aiengine_pb2.AddDataRequest, context):
+        with init_lock:
+            new_data: pd.DataFrame = pd.read_csv(StringIO(request.csv_data))
+            new_data["time"] = pd.to_datetime(new_data["time"], unit="s")
+            new_data = new_data.set_index("time")
 
-        epoch_time = pd.Timestamp.now() - period_secs
-        if "epoch_time" in init_data:
-            epoch_time = pd.to_datetime(int(init_data["epoch_time"]), unit="s")
-
-        if not "actions" in init_data:
-            return make_response(jsonify({"result": "missing_actions"}), 400)
-        action_rewards = init_data["actions"]
-        if not validate_rewards(action_rewards):
-            return make_response(jsonify({"result": "invalid_reward_function"}), 400)
-
-        if not "fields" in init_data:
-            return make_response(jsonify({"result": "missing_fields"}), 400)
-        if not "laws" in init_data:
-            return make_response(jsonify({"result": "missing_laws"}), 400)
-
-        data_manager.init(
-            epoch_time=epoch_time,
-            period_secs=period_secs,
-            interval_secs=interval_secs,
-            granularity_secs=granularity_secs,
-            fields=init_data["fields"],
-            action_rewards=action_rewards,
-            laws=init_data["laws"],
-        )
-        data_managers[pod] = data_manager
-        connector_managers[pod] = connector_manager
-
-        datasources_data = list()
-        if "datasources" in init_data:
-            datasources_data = init_data["datasources"]
-
-        for datasource_data in datasources_data:
-            connector_data = datasource_data["connector"]
-            connector_name: ConnectorName = connector_data["name"]
-
-            connector_params = dict()
-            if "params" in connector_data:
-                connector_params = connector_data["params"]
-
-            datasource_actions = dict()
-            if "actions" in datasource_data:
-                datasource_actions = datasource_data["actions"]
-
-            if connector_name == ConnectorName.STATEFUL.value:
-                new_connector = StatefulConnector(
-                    data_manager=data_manager,
-                    action_effects=datasource_actions,
-                )
-                connector_manager.add_connector(new_connector)
-            elif connector_name == ConnectorName.OPENAI_GYM.value:
-                if not "environment" in connector_params:
-                    message = f"missing the environment parameter for {connector_name}"
-                    return make_response(
-                        jsonify({"result": "missing_param", "message": message}), 400
+            data_manager: DataManager = data_managers[request.pod]
+            for field in new_data.columns:
+                if not field in data_manager.fields.keys():
+                    return aiengine_pb2.Response(
+                        result="unexpected_field",
+                        message=f"Unexpected field: '{field}'",
+                        error=True,
                     )
 
-                new_connector = OpenAIGymConnector(
-                    connector_params["environment"],
-                    data_manager,
-                    data_manager.fields,
+            data_manager.merge_data(new_data)
+            return aiengine_pb2.Response(result="ok")
+
+    def StartTraining(self, request: aiengine_pb2.StartTrainingRequest, context):
+        data_manager: DataManager = data_managers[request.pod]
+        connector_manager: ConnectorManager = connector_managers[request.pod]
+
+        if request.epoch_time != 0:
+            new_epoch_time = pd.to_datetime(request.epoch_time, unit="s")
+            if new_epoch_time < data_manager.epoch_time:
+                return aiengine_pb2.Response(
+                    result="epoch_time_invalid",
+                    message=f"epoch time should be after {data_manager.epoch_time.timestamp()}",
+                    error=True,
                 )
-                connector_manager.add_connector(new_connector)
-        return make_response(jsonify({"result": "ok"}), 200)
+            data_manager.epoch_time = new_epoch_time
+            data_manager.end_time = data_manager.epoch_time + data_manager.period_secs
 
+        number_episodes = 30
+        if request.number_episodes != 0:
+            number_episodes = request.number_episodes
 
-@app.route("/pods/<pod>/data", methods=["POST"])
-def data(pod: str):
-    with init_lock:
-        csv_data = request.get_data().decode("utf-8")
-        new_data: pd.DataFrame = pd.read_csv(StringIO(csv_data))
-        new_data["time"] = pd.to_datetime(new_data["time"], unit="s")
-        new_data = new_data.set_index("time")
+        flight = request.flight
 
-        data_manager: DataManager = data_managers[pod]
-        for field in new_data.columns:
-            if not field in data_manager.fields.keys():
-                return make_response(
-                    jsonify(
-                        {
-                            "result": "unexpected_field",
-                            "message": f"Unexpected field: '{field}'",
-                        }
-                    ),
-                    400,
-                )
+        training_goal = request.training_goal
 
-        data_manager.merge_data(new_data)
-        return make_response(data_manager.massive_table_filled.to_json(), 200)
-
-
-@app.route("/pods/<pod>/data", methods=["GET"])
-def get_data(pod: str):
-    data_manager: DataManager = data_managers[pod]
-    return make_response(data_manager.massive_table_filled.to_json(), 200)
-
-
-@app.route("/pods/<pod>/train", methods=["POST"])
-def start_training(pod: str):
-    train_data = request.get_json()
-    data_manager: DataManager = data_managers[pod]
-    connector_manager: ConnectorManager = connector_managers[pod]
-
-    if "epoch_time" in train_data:
-        new_epoch_time = pd.to_datetime(int(train_data["epoch_time"]), unit="s")
-        if new_epoch_time < data_manager.epoch_time:
-            invalid_result = {
-                "result": "epoch_time_invalid",
-                "message": f"epoch time should be after {data_manager.epoch_time.timestamp()}",
-            }
-            return make_response(jsonify(invalid_result), 400)
-        data_manager.epoch_time = new_epoch_time
-        data_manager.end_time = data_manager.epoch_time + data_manager.period_secs
-
-    number_episodes = 30
-    if "number_episodes" in train_data:
-        number_episodes = int(train_data["number_episodes"])
-
-    flight = str(train_data["flight"])
-
-    training_goal = ""
-    if "training_goal" in train_data:
-        training_goal = str(train_data["training_goal"])
-
-    index_of_epoch = data_manager.massive_table_filled.index.get_loc(
-        data_manager.epoch_time, "ffill"
-    )
-
-    if (
-        len(data_manager.massive_table_filled.iloc[index_of_epoch:])
-        < data_manager.get_window_span()
-    ):
-        return make_response(jsonify({"result": "not_enough_data_for_training"}), 400)
-
-    started = dispatch_train_agent(
-        pod, data_manager, connector_manager, number_episodes, flight, training_goal
-    )
-    message = "started_training" if started else "already_training"
-    return make_response(jsonify({"result": message}), 200)
-
-
-@app.route("/pods/<pod>/models/<tag>/inference", methods=["GET"])
-def inference(pod, tag):
-    model_exists = False
-    if pod in saved_models:
-        model_exists = True
-
-    if not pod in data_managers:
-        return make_response(
-            jsonify({"result": "pod_not_initialized"}),
-            404,
+        index_of_epoch = data_manager.massive_table_filled.index.get_loc(
+            data_manager.epoch_time, "ffill"
         )
 
-    # Ideally we could just re-use the in-memory agent we created during training, but tensorflow has issues with
-    # multi-threading in python, so we are just loading it from the file system
-    data_manager = data_managers[pod]
-    model_data_shape = data_manager.get_shape()
-    agent: SpiceAIAgent = get_agent(
-        ALGORITHM, model_data_shape, len(data_manager.action_names)
-    )
-    if model_exists:
-        agent.load(saved_models[pod])
+        if (
+            len(data_manager.massive_table_filled.iloc[index_of_epoch:])
+            < data_manager.get_window_span()
+        ):
+            return aiengine_pb2.Response(
+                result="not_enough_data_for_training",
+                error=True,
+            )
 
-    data_manager: DataManager = data_managers[pod]
-
-    if data_manager.massive_table_filled.shape[0] < data_manager.get_window_span():
-        return make_response(
-            jsonify({"result": "not_enough_data"}),
-            404,
+        started = dispatch_train_agent(
+            request.pod,
+            data_manager,
+            connector_manager,
+            number_episodes,
+            flight,
+            training_goal,
         )
+        result = "started_training" if started else "already_training"
+        return aiengine_pb2.Response(result=result)
 
-    latest_window = data_manager.get_latest_window()
-    state = data_manager.flatten_and_normalize_window(latest_window)
+    def GetInference(self, request: aiengine_pb2.InferenceRequest, context):
+        model_exists = False
+        if request.pod in saved_models:
+            model_exists = True
 
-    action_from_model, probabilities = agent.act(state)
-    confidence = f"{probabilities[action_from_model]:.3f}"
-    if not model_exists:
-        confidence = 0.0
+        if not request.pod in data_managers:
+            return aiengine_pb2.InferenceResult(
+                response=aiengine_pb2.Response(result="pod_not_initialized", error=True)
+            )
 
-    action_name = data_manager.action_names[action_from_model]
+        # Ideally we could just re-use the in-memory agent we created during training, but tensorflow has issues with
+        # multi-threading in python, so we are just loading it from the file system
+        data_manager = data_managers[request.pod]
+        model_data_shape = data_manager.get_shape()
+        agent: SpiceAIAgent = get_agent(
+            ALGORITHM, model_data_shape, len(data_manager.action_names)
+        )
+        if model_exists:
+            agent.load(saved_models[request.pod])
 
-    end_time = data_manager.massive_table_filled.last_valid_index()
-    start_time = end_time - data_manager.interval_secs
+        data_manager: DataManager = data_managers[request.pod]
 
-    response = dict()
-    response["start"] = start_time.isoformat()
-    response["end"] = end_time.isoformat()
-    response["action"] = action_name
-    response["confidence"] = float(confidence)
-    response["tag"] = tag
+        if data_manager.massive_table_filled.shape[0] < data_manager.get_window_span():
+            return aiengine_pb2.InferenceResult(
+                response=aiengine_pb2.Response(result="not_enough_data", error=True)
+            )
 
-    return make_response(
-        jsonify(response),
-        200,
-    )
+        latest_window = data_manager.get_latest_window()
+        state = data_manager.flatten_and_normalize_window(latest_window)
+
+        action_from_model, probabilities = agent.act(state)
+        confidence = f"{probabilities[action_from_model]:.3f}"
+        if not model_exists:
+            confidence = 0.0
+
+        action_name = data_manager.action_names[action_from_model]
+
+        end_time = data_manager.massive_table_filled.last_valid_index()
+        start_time = end_time - data_manager.interval_secs
+
+        result = aiengine_pb2.InferenceResult()
+        result.start = int(start_time.timestamp())
+        result.end = int(end_time.timestamp())
+        result.action = action_name
+        result.confidence = float(confidence)
+        result.tag = request.tag
+        result.response.result = "ok"
+
+        return result
+
+    def Init(self, request: aiengine_pb2.InitRequest, context):
+        with init_lock:
+            data_manager = DataManager()
+            connector_manager = ConnectorManager()
+
+            period_secs = pd.to_timedelta(request.period, unit="s")
+            interval_secs = pd.to_timedelta(request.interval, unit="s")
+            granularity_secs = pd.to_timedelta(request.granularity, unit="s")
+
+            epoch_time = pd.Timestamp.now() - period_secs
+            if request.epoch_time != 0:
+                epoch_time = pd.to_datetime(request.epoch_time, unit="s")
+
+            if len(request.actions) == 0:
+                return aiengine_pb2.Response(result="missing_actions", error=True)
+            action_rewards = request.actions
+            if not validate_rewards(action_rewards):
+                return aiengine_pb2.Response(
+                    result="invalid_reward_function", error=True
+                )
+
+            if len(request.fields) == 0:
+                return aiengine_pb2.Response(result="missing_fields", error=True)
+
+            data_manager.init(
+                epoch_time=epoch_time,
+                period_secs=period_secs,
+                interval_secs=interval_secs,
+                granularity_secs=granularity_secs,
+                fields=request.fields,
+                action_rewards=action_rewards,
+                laws=request.laws,
+            )
+            data_managers[request.pod] = data_manager
+            connector_managers[request.pod] = connector_manager
+
+            datasources_data = request.datasources
+
+            for datasource_data in datasources_data:
+                connector_data = datasource_data.connector
+                connector_name: ConnectorName = connector_data.name
+
+                connector_params = connector_data.params
+                datasource_actions = datasource_data.actions
+
+                if connector_name == ConnectorName.STATEFUL.value:
+                    new_connector = StatefulConnector(
+                        data_manager=data_manager,
+                        action_effects=datasource_actions,
+                    )
+                    connector_manager.add_connector(new_connector)
+                elif connector_name == ConnectorName.OPENAI_GYM.value:
+                    if not "environment" in connector_params:
+                        message = (
+                            f"missing the environment parameter for {connector_name}"
+                        )
+                        return aiengine_pb2.Response(
+                            result="missing_param", message=message, error=True
+                        )
+
+                    new_connector = OpenAIGymConnector(
+                        connector_params["environment"],
+                        data_manager,
+                        data_manager.fields,
+                    )
+                    connector_manager.add_connector(new_connector)
+            return aiengine_pb2.Response(result="ok")
 
 
-@app.route("/health", methods=["GET"])
-def health():
-    return make_response("ok", 200)
+def serve():
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
+    aiengine_pb2_grpc.add_AIEngineServicer_to_server(AIEngine(), server)
+    server.add_insecure_port("[::]:8004")
+    server.start()
+    print(f"AIEngine: gRPC server listening on port {8004}")
+    server.wait_for_termination()
 
 
 if __name__ == "__main__":
-
-    app.run(host="0.0.0.0", port=8004)
+    serve()

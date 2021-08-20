@@ -35,4 +35,4 @@ jobs:
       - name: Analysing the AI code with black
         working-directory: ai/src
         run: |
-          black --check .
+          black --check --extend-exclude proto .

@@ -7,23 +7,23 @@ import threading
 import copy
 import main
 import train
+from tests import common
+from proto.aiengine.v1 import aiengine_pb2
 
 
 class TrainingLoopTests(unittest.TestCase):
     def setUp(self):
-        self.test_client = main.app.test_client()
+        self.aiengine = main.AIEngine()
 
-        with open(
-            "../../test/assets/aiengine/api/trader_init.json", "r"
-        ) as trader_init:
-            trader_init_data = trader_init.read()
-        self.trader_init = json.loads(trader_init_data)
+        self.trader_init_req = common.get_init_from_json(
+            init_data_path="../../test/assets/aiengine/api/trader_init.json",
+            pod_name="trader",
+        )
 
-        with open(
-            "../../test/assets/aiengine/api/cartpole_init.json", "r"
-        ) as cartpole_init:
-            cartpole_init_data = cartpole_init.read()
-        self.cartpole_init = json.loads(cartpole_init_data)
+        self.cartpole_init_req = common.get_init_from_json(
+            init_data_path="../../test/assets/aiengine/api/cartpole_init.json",
+            pod_name="cartpole",
+        )
 
         with open("../../test/assets/data/csv/trader.csv", "r") as trader_data:
             self.trader_data_csv = trader_data.read()
@@ -43,19 +43,19 @@ class TrainingLoopTests(unittest.TestCase):
 
     def init(
         self,
-        pod_name: str,
-        init_payload: dict,
-        expected_code: int = 200,
+        init_req: aiengine_pb2.InitRequest,
+        expected_error: bool = False,
         expected_result: str = "ok",
     ):
-        resp = self.test_client.post(f"/pods/{pod_name}/init", json=init_payload)
-        response_json = resp.get_json()
-        self.assertEqual(resp.status_code, expected_code)
-        self.assertEqual(response_json["result"], expected_result)
+        resp = self.aiengine.Init(init_req, None)
+        self.assertEqual(resp.error, expected_error)
+        self.assertEqual(resp.result, expected_result)
 
-    def post_data(self, pod_name: str, data: dict):
-        resp = self.test_client.post(f"/pods/{pod_name}/data", data=data)
-        self.assertEqual(resp.status_code, 200)
+    def add_data(self, pod_name: str, csv_data: str):
+        resp = self.aiengine.AddData(
+            aiengine_pb2.AddDataRequest(pod=pod_name, csv_data=csv_data), None
+        )
+        self.assertFalse(resp.error)
 
     def start_training(
         self,
@@ -63,37 +63,34 @@ class TrainingLoopTests(unittest.TestCase):
         flight: str = None,
         number_episodes: int = None,
         epoch_time: int = None,
-        expected_code: int = 200,
+        expected_error: bool = False,
         expected_result: str = "started_training",
     ):
-        train_params = dict()
-        if flight:
-            train_params["flight"] = flight
-        if number_episodes:
-            train_params["number_episodes"] = number_episodes
-        if epoch_time:
-            train_params["epoch_time"] = epoch_time
-
-        resp = self.test_client.post(
-            f"/pods/{pod_name}/train",
-            json=train_params,
+        train_req = aiengine_pb2.StartTrainingRequest(
+            pod=pod_name,
+            number_episodes=number_episodes,
+            flight=flight,
+            epoch_time=epoch_time,
         )
-        response_json = resp.get_json()
-        self.assertEqual(resp.status_code, expected_code)
-        self.assertEqual(response_json["result"], expected_result)
+
+        resp = self.aiengine.StartTraining(train_req, None)
+
+        self.assertEqual(resp.error, expected_error)
+        self.assertEqual(resp.result, expected_result)
 
     def wait_for_training(self):
         self.assertIsNotNone(main.training_thread)
         main.training_thread.join()
 
     def inference(self, pod_name: str, tag: str, assertion_on_response=None):
-        resp = self.test_client.get(f"/pods/{pod_name}/models/{tag}/inference")
-        response_json = resp.get_json()
-        self.assertEqual(resp.status_code, 200)
-        self.assertEqual(response_json["tag"], tag)
+        resp = self.aiengine.GetInference(
+            aiengine_pb2.InferenceRequest(pod=pod_name, tag=tag), None
+        )
+        self.assertFalse(resp.response.error)
+        self.assertEqual(resp.tag, tag)
 
         if assertion_on_response is not None:
-            assertion_on_response(response_json)
+            assertion_on_response(resp)
 
     def validate_episode_data(
         self, pod_name, flight, number_episodes, num_actions, episode_results
@@ -119,10 +116,10 @@ class TrainingLoopTests(unittest.TestCase):
 
     def test_train_inference_loop(self):
         # Step 1, init the pod
-        self.init("trader", self.trader_init)
+        self.init(self.trader_init_req)
 
         # Step 2, load the csv data
-        self.post_data("trader", self.trader_data_csv)
+        self.add_data("trader", self.trader_data_csv)
 
         FLIGHT = "1"
         NUMBER_EPISODES = 10
@@ -135,7 +132,7 @@ class TrainingLoopTests(unittest.TestCase):
         self.inference(
             "trader",
             "latest",
-            lambda response_json: self.assertNotEqual(response_json["confidence"], 0.0),
+            lambda response: self.assertNotEqual(response.confidence, 0.0),
         )
 
         # Validate the episode data
@@ -149,10 +146,10 @@ class TrainingLoopTests(unittest.TestCase):
 
     def test_train_inference_loop_train_different_epoch(self):
         # Step 1, init the pod
-        self.init("trader", self.trader_init)
+        self.init(self.trader_init_req)
 
         # Step 2, load the csv data
-        self.post_data("trader", self.trader_data_csv)
+        self.add_data("trader", self.trader_data_csv)
 
         FLIGHT = "1"
         NUMBER_EPISODES = 10
@@ -165,7 +162,7 @@ class TrainingLoopTests(unittest.TestCase):
         self.inference(
             "trader",
             "latest",
-            lambda response_json: self.assertNotEqual(response_json["confidence"], 0.0),
+            lambda response: self.assertNotEqual(response.confidence, 0.0),
         )
 
         # Validate the episode data
@@ -183,9 +180,9 @@ class TrainingLoopTests(unittest.TestCase):
         with open("./tests/assets/csv/training_loop_gap_1.csv", "r") as data:
             gap_data_1 = data.read()
 
-        self.init("trader", self.trader_init)
-        self.post_data("trader", gap_data_0)
-        self.post_data("trader", gap_data_1)
+        self.init(self.trader_init_req)
+        self.add_data("trader", gap_data_0)
+        self.add_data("trader", gap_data_1)
 
         FLIGHT = "1"
         NUMBER_EPISODES = 10
@@ -214,7 +211,7 @@ class TrainingLoopTests(unittest.TestCase):
             ]
             self.assertEqual(price, next_price)
             price = next_price
-            current_time += pd.to_timedelta(self.trader_init["granularity"], unit="s")
+            current_time += pd.to_timedelta(self.trader_init_req.granularity, unit="s")
 
     def test_data_added_after_training_starts(self):
         with open("./tests/assets/csv/training_loop_gap_0.csv", "r") as data:
@@ -222,8 +219,8 @@ class TrainingLoopTests(unittest.TestCase):
         with open("./tests/assets/csv/training_loop_gap_1.csv", "r") as data:
             gap_data_1 = data.read()
 
-        self.init("trader", self.trader_init)
-        self.post_data("trader", gap_data_0)
+        self.init(self.trader_init_req)
+        self.add_data("trader", gap_data_0)
 
         FLIGHT = "1"
         NUMBER_EPISODES = 10
@@ -245,7 +242,7 @@ class TrainingLoopTests(unittest.TestCase):
         episode_5_lock.acquire()
 
         print("Posting gap_data_1")
-        self.post_data("trader", gap_data_1)
+        self.add_data("trader", gap_data_1)
         post_data_lock.release()
 
         self.wait_for_training()
@@ -268,115 +265,101 @@ class TrainingLoopTests(unittest.TestCase):
         )
 
     def test_epoch_earlier_than_data(self):
-        self.init("trader", self.trader_init)
-        self.post_data("trader", self.trader_data_csv)
+        self.init(self.trader_init_req)
+        self.add_data("trader", self.trader_data_csv)
         self.start_training(
             "trader",
             "1",
             10,
             1626697400,
-            expected_code=400,
+            expected_error=True,
             expected_result="epoch_time_invalid",
         )
 
     def test_epoch_offset_from_data(self):
-        self.init("trader", self.trader_init)
-        self.post_data("trader", self.trader_data_csv)
+        self.init(self.trader_init_req)
+        self.add_data("trader", self.trader_data_csv)
         self.start_training(
             "trader",
             "1",
             1,
             1626697485,
-            expected_code=200,
+            expected_error=False,
             expected_result="started_training",
         )
         self.wait_for_training()
 
     def test_epoch_after_latest_data(self):
-        self.init("trader", self.trader_init)
-        self.post_data("trader", self.trader_data_csv)
+        self.init(self.trader_init_req)
+        self.add_data("trader", self.trader_data_csv)
         self.start_training(
             "trader",
             "1",
             10,
             1626699240,
-            expected_code=400,
+            expected_error=True,
             expected_result="not_enough_data_for_training",
         )
 
     def test_not_enough_data_for_training_no_data(self):
-        self.init("trader", self.trader_init)
+        self.init(self.trader_init_req)
         self.start_training(
             "trader",
             "1",
             10,
-            expected_code=400,
+            expected_error=True,
             expected_result="not_enough_data_for_training",
         )
 
     def test_not_enough_data_for_training_late_epoch(self):
-        self.init("trader", self.trader_init)
-        self.post_data("trader", self.trader_data_csv)
+        self.init(self.trader_init_req)
+        self.add_data("trader", self.trader_data_csv)
         self.start_training(
             "trader",
             "1",
             10,
             epoch_time=1626698020,
-            expected_code=400,
+            expected_error=True,
             expected_result="not_enough_data_for_training",
         )
 
     def test_invalid_reward_handled_gracefully(self):
-        trader_init = copy.deepcopy(self.trader_init)
-        trader_init["actions"]["buy"] = "foo"
+        trader_init = copy.deepcopy(self.trader_init_req)
+        trader_init.actions["buy"] = "foo"
 
         self.init(
-            "trader",
             trader_init,
-            expected_code=400,
+            expected_error=True,
             expected_result="invalid_reward_function",
         )
 
     def test_no_rewards_handled_gracefully(self):
-        trader_init = copy.deepcopy(self.trader_init)
-        del trader_init["actions"]
+        trader_init = copy.deepcopy(self.trader_init_req)
+        trader_init.actions.clear()
 
         self.init(
-            "trader",
             trader_init,
-            expected_code=400,
+            expected_error=True,
             expected_result="missing_actions",
         )
 
     def test_no_fields_handled_gracefully(self):
-        trader_init = copy.deepcopy(self.trader_init)
-        del trader_init["fields"]
+        trader_init = copy.deepcopy(self.trader_init_req)
+        trader_init.fields.clear()
 
         self.init(
-            "trader",
             trader_init,
-            expected_code=400,
+            expected_error=True,
             expected_result="missing_fields",
         )
 
-    def test_no_laws_handled_gracefully(self):
-        trader_init = copy.deepcopy(self.trader_init)
-        del trader_init["laws"]
-
-        self.init(
-            "trader",
-            trader_init,
-            expected_code=400,
-            expected_result="missing_laws",
-        )
-
     def test_invalid_reward_post_error(self):
-        trader_init = copy.deepcopy(self.trader_init)
-        trader_init["actions"]["buy"] = "reward = foo"
+        trader_init = copy.deepcopy(self.trader_init_req)
+        trader_init.actions["buy"] = "reward = foo"
 
-        self.init("trader", trader_init)
+        self.init(trader_init)
 
-        self.post_data("trader", self.trader_data_csv)
+        self.add_data("trader", self.trader_data_csv)
 
         FLIGHT = "1"
         NUMBER_EPISODES = 10
@@ -392,12 +375,12 @@ class TrainingLoopTests(unittest.TestCase):
         )
 
     def test_invalid_law_post_error(self):
-        trader_init = copy.deepcopy(self.trader_init)
-        trader_init["laws"][0] = "can I do this?"
+        trader_init = copy.deepcopy(self.trader_init_req)
+        trader_init.laws[0] = "can I do this?"
 
-        self.init("trader", trader_init)
+        self.init(trader_init)
 
-        self.post_data("trader", self.trader_data_csv)
+        self.add_data("trader", self.trader_data_csv)
 
         FLIGHT = "1"
         NUMBER_EPISODES = 10
@@ -414,14 +397,14 @@ class TrainingLoopTests(unittest.TestCase):
         )
 
     def test_invalid_datasource_action_post_error(self):
-        trader_init = copy.deepcopy(self.trader_init)
-        trader_init["datasources"][0]["actions"][
+        trader_init = copy.deepcopy(self.trader_init_req)
+        trader_init.datasources[0].actions[
             "buy"
         ] = "local_portfolio_usd_balance1 -= coinbase_btcusd_close\nlocal_portfolio_btc_balance += 1"
 
-        self.init("trader", trader_init)
+        self.init(trader_init)
 
-        self.post_data("trader", self.trader_data_csv)
+        self.add_data("trader", self.trader_data_csv)
 
         FLIGHT = "1"
         NUMBER_EPISODES = 10
@@ -438,10 +421,10 @@ class TrainingLoopTests(unittest.TestCase):
         )
 
     def test_epoch_is_inferred_if_absent(self):
-        trader_init = copy.deepcopy(self.trader_init)
-        del trader_init["epoch_time"]
-        trader_init["period"] = 120
-        self.init("trader", trader_init)
+        trader_init = copy.deepcopy(self.trader_init_req)
+        trader_init.epoch_time = 0
+        trader_init.period = 120
+        self.init(trader_init)
 
         now_unix_seconds = (
             pd.Timestamp.now() - pd.Timestamp("1970-01-01")
@@ -461,7 +444,7 @@ class TrainingLoopTests(unittest.TestCase):
             row = [unix_seconds, None, None, 123]
             writer.writerow(row)
 
-        self.post_data("trader", csv_data.getvalue())
+        self.add_data("trader", csv_data.getvalue())
 
         FLIGHT = "1"
         NUMBER_EPISODES = 10
@@ -469,19 +452,19 @@ class TrainingLoopTests(unittest.TestCase):
             "trader",
             FLIGHT,
             NUMBER_EPISODES,
-            expected_code=200,
+            expected_error=False,
         )
 
         # Counts will be unstable due to timing.  The important thing is that we launch training with enough data.
         self.wait_for_training()
 
     def test_cartpole_training(self):
-        self.init("cartpole", self.cartpole_init)
+        self.init(self.cartpole_init_req)
         self.start_training(
             "cartpole",
             "1",
             1,
-            expected_code=200,
+            expected_error=False,
             expected_result="started_training",
         )
         self.wait_for_training()
@@ -495,11 +478,11 @@ class TrainingLoopTests(unittest.TestCase):
             episode_results=self.episode_results,
         )
 
-    def test_post_data_with_different_fields_fails(self):
-        trader_init = copy.deepcopy(self.trader_init)
-        del trader_init["epoch_time"]
-        trader_init["period"] = 120
-        self.init("trader", self.trader_init)
+    def test_add_data_with_different_fields_fails(self):
+        trader_init = copy.deepcopy(self.trader_init_req)
+        trader_init.epoch_time = 0
+        trader_init.period = 120
+        self.init(self.trader_init_req)
 
         now_unix_seconds = (
             pd.Timestamp.now() - pd.Timestamp("1970-01-01")
@@ -519,11 +502,13 @@ class TrainingLoopTests(unittest.TestCase):
             row = [unix_seconds, None, None, 123]
             writer.writerow(row)
 
-        resp = self.test_client.post(f"/pods/trader/data", data=csv_data.getvalue())
-        self.assertEqual(resp.status_code, 400)
-        json_resp = resp.get_json()
-        self.assertEqual(json_resp["result"], "unexpected_field")
-        self.assertEqual(json_resp["message"], "Unexpected field: 'non_exist'")
+        resp = self.aiengine.AddData(
+            aiengine_pb2.AddDataRequest(pod="trader", csv_data=csv_data.getvalue()),
+            None,
+        )
+        self.assertTrue(resp.error)
+        self.assertEqual(resp.result, "unexpected_field")
+        self.assertEqual(resp.message, "Unexpected field: 'non_exist'")
 
 
 if __name__ == "__main__":

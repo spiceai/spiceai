@@ -38,6 +38,7 @@ RUN python3 -m pip install -r production.txt
 COPY ai/src/*.py ./ai/
 COPY ai/src/connector/ ./ai/connector/
 COPY ai/src/algorithms/ ./ai/algorithms/
+COPY ai/src/proto/ ./ai/proto/
 COPY --from=build /build/cmd/spiced/spiced /app/spiced
 
 WORKDIR /userapp

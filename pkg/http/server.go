@@ -168,7 +168,14 @@ func apiInferHandler(ctx *fasthttp.RequestCtx) {
 		tag = "latest"
 	}
 
-	body, err := aiengine.Infer(pod, tag.(string))
+	inference, err := aiengine.Infer(pod, tag.(string))
+	if err != nil {
+		ctx.Response.SetStatusCode(500)
+		ctx.Response.SetBody([]byte(err.Error()))
+		return
+	}
+
+	body, err := json.Marshal(inference)
 	if err != nil {
 		ctx.Response.SetStatusCode(500)
 		ctx.Response.SetBody([]byte(err.Error()))
