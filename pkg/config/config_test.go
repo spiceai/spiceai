@@ -16,8 +16,11 @@ import (
 
 func TestConfig(t *testing.T) {
 	testConfigPath := "../../test/assets/config/config.yaml"
-	t.Run("LoadRuntimeConfiguration() - Config loads correctly", testRuntimeConfigLoads(testConfigPath))
+	testConfigPathWithEnvVars := "../../test/assets/config/config_with_env_vars.yaml"
 	t.Cleanup(testutils.CleanupTestSpiceDirectory)
+	t.Run("LoadRuntimeConfiguration() - Config loads correctly", testRuntimeConfigLoads(testConfigPath))
+	testutils.CleanupTestSpiceDirectory()
+	t.Run("LoadRuntimeConfiguration() - Environment variables in config are replaced", testRuntimeConfigReplacesEnvironmentVariables(testConfigPathWithEnvVars))
 }
 
 // Tests configuration loads correctly
@@ -50,7 +53,7 @@ func testRuntimeConfigLoads(testConfigPath string) func(*testing.T) {
 		}
 
 		actual = spiceConfiguration.Connections["github"].Token
-		expected = "SPICE_GH_TOKEN"
+		expected = "rawtoken"
 
 		if !reflect.DeepEqual(expected, actual) {
 			t.Errorf("Expected:\n%v\nGot:\n%v", expected, actual)
@@ -76,6 +79,41 @@ func testRuntimeConfigLoads(testConfigPath string) func(*testing.T) {
 		if !reflect.DeepEqual(expected, actual) {
 			t.Errorf("Expected:\n%v\nGot:\n%v", expected, actual)
 		}
+	}
+}
+
+// Tests configuration replaces environment variables correctly
+func testRuntimeConfigReplacesEnvironmentVariables(testConfigPath string) func(*testing.T) {
+	return func(t *testing.T) {
+		testutils.EnsureTestSpiceDirectory(t)
+
+		// Go 1.17 includes a Setenv on the testing pkg, but for now we will just set/unset with the os package
+		testEnvVar := "SPICE_TOKEN_TO_REPLACE"
+		if os.Getenv(testEnvVar) != "" {
+			t.Errorf("%s must not be set during tests", testEnvVar)
+		}
+
+		expected := "replacedvalue"
+		os.Setenv(testEnvVar, expected)
+
+		tempConfigPath := filepath.Join(".spice", "config.yaml")
+		copyFile(testConfigPath, tempConfigPath)
+
+		viper := viper.New()
+		spiceConfiguration, err := config.LoadRuntimeConfiguration(viper)
+		if err != nil {
+			t.Error(err)
+			os.Unsetenv(testEnvVar)
+			return
+		}
+
+		actual := spiceConfiguration.Connections["github"].Token
+		if !reflect.DeepEqual(expected, actual) {
+			t.Errorf("Expected:\n%v\nGot:\n%v", expected, actual)
+			os.Unsetenv(testEnvVar)
+		}
+
+		os.Unsetenv(testEnvVar)
 	}
 }
 

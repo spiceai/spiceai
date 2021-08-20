@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
@@ -8,7 +9,12 @@ import (
 	"time"
 
 	"github.com/spf13/viper"
+	"github.com/spiceai/spice/pkg/util"
 	"gopkg.in/yaml.v2"
+)
+
+var (
+	SpiceEnvVarPrefix string = "SPICE_"
 )
 
 type SpiceConfiguration struct {
@@ -49,12 +55,26 @@ func LoadRuntimeConfiguration(v *viper.Viper) (*SpiceConfiguration, error) {
 	v.SetConfigName("config")
 	v.SetConfigType("yaml")
 
-	v.SetEnvPrefix("SPICE")
-	v.AutomaticEnv()
-
 	var config *SpiceConfiguration
-	err := v.ReadInConfig()
-	if err != nil {
+	configPath := ""
+
+	if _, err := os.Stat(".spice/config.yaml"); err == nil {
+		configPath = ".spice/config.yaml"
+	} else if _, err := os.Stat(".spice/config.yml"); err == nil {
+		configPath = ".spice/config.yml"
+	} 
+	
+	if configPath != "" {
+		configBytes, err := util.ReplaceEnvVariablesFromPath(configPath, SpiceEnvVarPrefix)
+		if err != nil {
+			return nil, err
+		}
+	
+		err = v.ReadConfig(bytes.NewBuffer(configBytes))
+		if err != nil {
+			return nil, err
+		}	
+	} else {
 		// No config file found, use defaults
 		config = LoadDefaultConfiguration()
 		spiceAppPath := AppSpicePath()
@@ -89,7 +109,7 @@ func LoadRuntimeConfiguration(v *viper.Viper) (*SpiceConfiguration, error) {
 
 	v.WatchConfig()
 
-	err = v.Unmarshal(&config)
+	err := v.Unmarshal(&config)
 	return config, err
 }
 
