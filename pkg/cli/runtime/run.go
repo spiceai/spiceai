@@ -19,22 +19,22 @@ var (
 func getSpiceEnvVarsAsDockerArgs() string {
 	var dockerEnvArgs []string
 	for _, envVar := range os.Environ() {
-        if (strings.HasPrefix(envVar, config.SpiceEnvVarPrefix)) {
+		if strings.HasPrefix(envVar, config.SpiceEnvVarPrefix) {
 			dockerEnvArgs = append(dockerEnvArgs, "--env")
 			dockerEnvArgs = append(dockerEnvArgs, envVar)
 		}
-    }
+	}
 
 	return strings.Join(dockerEnvArgs, " ")
-} 
+}
 
 func getDockerArgs(args string) []string {
 	originalArgs := strings.Split(args, " ")
-	
+
 	// strings.Split will add empty strings if more than one space occurs in a row - trim them out
 	var argsTrimmedOfEmptyStrings []string
 	for _, arg := range originalArgs {
-		if (arg != "") {
+		if arg != "" {
 			argsTrimmedOfEmptyStrings = append(argsTrimmedOfEmptyStrings, arg)
 		}
 	}

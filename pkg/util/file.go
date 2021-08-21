@@ -45,14 +45,14 @@ func ReplaceEnvVariablesFromPath(filePath string, envVarPrefix string) ([]byte, 
 	if err != nil {
 		return nil, err
 	}
-	
+
 	contentString := string(content)
 	for _, envVarValPair := range os.Environ() {
-        if (strings.HasPrefix(envVarValPair, envVarPrefix)) {
+		if strings.HasPrefix(envVarValPair, envVarPrefix) {
 			envVar := strings.Split(envVarValPair, "=")[0]
 			contentString = strings.ReplaceAll(contentString, envVar, os.Getenv(envVar))
 		}
-    }
+	}
 
 	return []byte(contentString), nil
 }

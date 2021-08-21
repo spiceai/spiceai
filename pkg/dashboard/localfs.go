@@ -11,7 +11,6 @@ import (
 type DashboardLocalFs struct {
 	rootDir   string
 	indexPath string
-	jsPath    string
 }
 
 func NewDashboardLocalFs(rootDir string) (*DashboardLocalFs, error) {
@@ -35,26 +34,43 @@ func NewDashboardLocalFs(rootDir string) (*DashboardLocalFs, error) {
 		return nil, fmt.Errorf("rootDir '%s' does not exist: %w", rootDir, err)
 	}
 
-	indexPath := filepath.Join(rootDir, "html", "index.html")
-	jsPath := filepath.Join(rootDir, "js")
+	indexPath := filepath.Join(rootDir, "index.html")
 
 	return &DashboardLocalFs{
 		rootDir:   rootDir,
 		indexPath: indexPath,
-		jsPath:    jsPath,
 	}, nil
 }
 
 func (d *DashboardLocalFs) IndexHandler(ctx *fasthttp.RequestCtx) {
-	ctx.Response.Header.SetContentType("text/html")
+	contentType := GetContentType("html")
+	ctx.Response.Header.SetContentType(contentType)
 	fasthttp.ServeFile(ctx, d.indexPath)
 }
 
 func (d *DashboardLocalFs) JsHandler(ctx *fasthttp.RequestCtx) {
-	jsFile := ctx.UserValue("jsFile").(string)
+	d.fileHandler(ctx, "js")
+}
 
-	jsFilePath := filepath.Join(d.jsPath, jsFile)
+func (d *DashboardLocalFs) CssHandler(ctx *fasthttp.RequestCtx) {
+	d.fileHandler(ctx, "css")
+}
 
-	ctx.Response.Header.SetContentType("application/javascript")
-	fasthttp.ServeFile(ctx, jsFilePath)
+func (d *DashboardLocalFs) SvgHandler(ctx *fasthttp.RequestCtx) {
+	d.fileHandler(ctx, "svg")
+}
+
+func (d *DashboardLocalFs) fileHandler(ctx *fasthttp.RequestCtx, filetype string) {
+	filePath := ctx.UserValue("filepath").(string)
+
+	subfolder := filetype
+	if filetype == "svg" {
+		subfolder = "media"
+	}
+
+	fullFilePath := filepath.Join(d.rootDir, "static", subfolder, filePath)
+
+	contentType := GetContentType(filetype)
+	ctx.Response.Header.SetContentType(contentType)
+	fasthttp.ServeFile(ctx, fullFilePath)
 }

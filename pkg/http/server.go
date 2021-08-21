@@ -298,7 +298,9 @@ func (server *server) Start() error {
 	}
 
 	r.GET("/", dashboardServer.IndexHandler)
-	r.GET("/js/{jsFile}", dashboardServer.JsHandler)
+	r.GET("/js/{file}", dashboardServer.JsHandler)
+	r.GET("/css/{file}", dashboardServer.CssHandler)
+	r.GET("/media/{file}", dashboardServer.SvgHandler)
 
 	// Pods
 	r.GET("/api/v0.1/pods", apiPodsHandler)
