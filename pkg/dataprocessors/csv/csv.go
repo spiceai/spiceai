@@ -29,6 +29,7 @@ const (
 type CsvProcessor struct {
 	data      []byte
 	dataMutex sync.RWMutex
+	dataHash  []byte
 }
 
 func NewCsvProcessor() *CsvProcessor {
@@ -43,12 +44,24 @@ func (p *CsvProcessor) OnData(data []byte) ([]byte, error) {
 	p.dataMutex.Lock()
 	defer p.dataMutex.Unlock()
 
-	p.data = data
+	newDataHash, err := util.ComputeNewHash(p.data, p.dataHash, data)
+	if err != nil {
+		return nil, fmt.Errorf("error computing new data hash in csv processor: %w", err)
+	}
+
+	if newDataHash != nil {
+		// Only update data if new
+		p.data = data
+		p.dataHash = newDataHash
+	}
 
 	return data, nil
 }
 
 func (p *CsvProcessor) GetObservations() ([]observations.Observation, error) {
+	p.dataMutex.Lock()
+	defer p.dataMutex.Unlock()
+
 	reader, err := p.getDataReader()
 	if err != nil {
 		return nil, err
@@ -57,7 +70,13 @@ func (p *CsvProcessor) GetObservations() ([]observations.Observation, error) {
 		return nil, nil
 	}
 
-	return p.getObservations(reader)
+	newObservations, err := p.getObservations(reader)
+	if err != nil {
+		return nil, err
+	}
+
+	p.data = nil
+	return newObservations, nil
 }
 
 func (p *CsvProcessor) getObservations(reader io.Reader) ([]observations.Observation, error) {
@@ -100,6 +119,9 @@ func (p *CsvProcessor) getObservations(reader io.Reader) ([]observations.Observa
 // Processes into State by field path
 // CSV headers are expected to be fully-qualified field names
 func (p *CsvProcessor) GetState(validFields *[]string) ([]*state.State, error) {
+	p.dataMutex.Lock()
+	defer p.dataMutex.Unlock()
+
 	reader, err := p.getDataReader()
 	if err != nil {
 		return nil, err
@@ -211,10 +233,15 @@ func (p *CsvProcessor) GetState(validFields *[]string) ([]*state.State, error) {
 		i++
 	}
 
+	p.data = nil
 	return result, nil
 }
 
 func (p *CsvProcessor) getDataReader() (io.Reader, error) {
+	if p.data == nil {
+		return nil, nil
+	}
+
 	reader := bytes.NewReader(p.data)
 	return reader, nil
 }
