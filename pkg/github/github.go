@@ -35,7 +35,7 @@ func NewGitHubClientFromPath(path string, token string) (*GitHubClient, error) {
 
 func NewGitHubClient(owner string, repo string, token string) *GitHubClient {
 	if token == "" {
-		token = os.Getenv("SPICE_GH_TOKEN")
+		token = GetGitHubTokenFromEnv()
 	}
 
 	return &GitHubClient{
@@ -43,6 +43,14 @@ func NewGitHubClient(owner string, repo string, token string) *GitHubClient {
 		Repo:  repo,
 		Token: token,
 	}
+}
+
+func GetGitHubTokenFromEnv() string {
+	token := os.Getenv("SPICE_GH_TOKEN")
+	if token == "" {
+		token = os.Getenv("GITHUB_TOKEN")
+	}
+	return token
 }
 
 func (g *GitHubClient) Get(url string, payload []byte) ([]byte, error) {
