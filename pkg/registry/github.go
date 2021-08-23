@@ -111,8 +111,8 @@ func (r *GitHubRegistry) GetDataSource(datasourcePath string) (*spec.DataSourceS
 }
 
 func privatePreviewTokenCheck() error {
-	ghToken := os.Getenv("SPICE_GH_TOKEN") != ""
-	if !ghToken {
+	ghToken := github.GetGitHubTokenFromEnv()
+	if ghToken == "" {
 		return errors.New("SPICE_GH_TOKEN is required to be set during Private Preview. See https://github.com/spiceai/spiceai#prerequisites-developer-preview-only")
 	}
 	return nil

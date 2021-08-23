@@ -194,8 +194,13 @@ installCompleted() {
 trap "fail_trap" EXIT
 
 if [[ -z "$SPICE_GH_TOKEN" ]]; then
-  echo "ERROR: Please set env var SPICE_GH_TOKEN to your GitHub Token!"
-  exit 1
+    if [[ -z "$GITHUB_TOKEN" ]]; then
+        echo "ERROR: Please set env var SPICE_GH_TOKEN to your GitHub Token!"
+        exit 1
+    else
+        echo "Using $GITHUB_TOKEN as $SPICE_GH_TOKEN"
+        export $SPICE_GH_TOKEN="$GITHUB_TOKEN"
+    fi
 fi
 
 mkdir -p $SPICE_CLI_INSTALL_DIR
