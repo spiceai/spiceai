@@ -80,7 +80,7 @@ The installation path is not currently added to your PATH, so we recommend to ad
 export PATH="$HOME/.spice/bin:$PATH"
 ```
 
-You can may also add to your `.bashrc`
+You can also add to your `.bashrc`
 
 ```bash
 cat "export PATH="$HOME/.spice/bin:$PATH"" >> ~/.bashrc
