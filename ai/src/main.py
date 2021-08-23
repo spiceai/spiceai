@@ -3,6 +3,8 @@ import pandas as pd
 from io import StringIO
 import tensorflow as tf
 import threading
+from psutil import Process
+import os
 from algorithms.factory import get_agent
 from algorithms.agent_interface import SpiceAIAgent
 from data import DataManager
@@ -239,14 +241,18 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
             return aiengine_pb2.Response(result="ok")
 
 
-def serve():
+def wait_parent_process():
+    current_process = Process(os.getpid())
+    parent_process: Process = current_process.parent()
+
+    parent_process.wait()
+
+
+if __name__ == "__main__":
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
     aiengine_pb2_grpc.add_AIEngineServicer_to_server(AIEngine(), server)
     server.add_insecure_port("[::]:8004")
     server.start()
     print(f"AIEngine: gRPC server listening on port {8004}")
-    server.wait_for_termination()
 
-
-if __name__ == "__main__":
-    serve()
+    wait_parent_process()
