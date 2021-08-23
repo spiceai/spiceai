@@ -20,7 +20,7 @@ func ComputeNewHash(a []byte, hashA []byte, b []byte) ([]byte, error) {
 		return nil, err
 	}
 
-	isSame := bytes.Compare(hashA, hashB) == 0
+	isSame := bytes.Equal(hashA, hashB)
 	if isSame {
 		return nil, nil
 	}
