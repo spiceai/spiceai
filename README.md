@@ -98,7 +98,7 @@ Once you open the Codespace, Spice AI and everything you need to get started wil
 
 ### Create your first Spice AI Pod and train it
 
-A [Spice AI Pod](https://laughing-doodle-19648c61.pages.github.io/#/Concepts?id=pod) is simply a collection of configuration and data that you use to train and deploy your own AI.
+A [Spice AI Pod](https://laughing-doodle-19648c61.pages.github.io/#/concepts/README?id=pod) is simply a collection of configuration and data that you use to train and deploy your own AI.
 
 The first Spice AI Pod you will create and train is based off an [Open AI gym](https://gym.openai.com/) example called [CartPole-v1](https://gym.openai.com/envs/CartPole-v1/). Open AI describes CartPole as:
 
