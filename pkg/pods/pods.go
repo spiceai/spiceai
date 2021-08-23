@@ -57,7 +57,7 @@ func FindFirstManifestPath() string {
 }
 
 func LoadPodFromManifest(manifestPath string) (*Pod, error) {
-	manifestHash, err := util.MD5Hash(manifestPath)
+	manifestHash, err := util.ComputeFileHash(manifestPath)
 	if err != nil {
 		log.Printf("Error: Failed to compute hash for manifest '%s: %s\n", manifestPath, err)
 		return nil, err
