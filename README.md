@@ -23,7 +23,7 @@ Thank you for sharing this journey with us! 🙏
 
 ## Getting started with Spice AI
 
-Follow this guide to get started quickly with Spice AI. For a more comphrehensive getting started guide, see the full [online documentation](https://laughing-doodle-19648c61.pages.github.io/).
+Follow this guide to get started quickly with Spice AI. For a more comphrehensive getting started guide, see the full [online documentation](https://crispy-dollop-c329115a.pages.github.io/#/).
 
 ### Current Limitations
 
@@ -98,7 +98,7 @@ Once you open the Codespace, Spice AI and everything you need to get started wil
 
 ### Create your first Spice AI Pod and train it
 
-A [Spice AI Pod](https://laughing-doodle-19648c61.pages.github.io/#/concepts/README?id=pod) is simply a collection of configuration and data that you use to train and deploy your own AI.
+A [Spice AI Pod](https://crispy-dollop-c329115a.pages.github.io/#/concepts/README?id=pod) is simply a collection of configuration and data that you use to train and deploy your own AI.
 
 The first Spice AI Pod you will create and train is based off an [Open AI gym](https://gym.openai.com/) example called [CartPole-v1](https://gym.openai.com/envs/CartPole-v1/). Open AI describes CartPole as:
 
