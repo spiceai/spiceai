@@ -199,7 +199,7 @@ if [[ -z "$SPICE_GH_TOKEN" ]]; then
         exit 1
     else
         echo "Using $GITHUB_TOKEN as $SPICE_GH_TOKEN"
-        export $SPICE_GH_TOKEN="$GITHUB_TOKEN"
+        export SPICE_GH_TOKEN="$GITHUB_TOKEN"
     fi
 fi
 
