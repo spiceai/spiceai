@@ -15,6 +15,10 @@ jobs:
     steps:
       - uses: actions/checkout@v2
 
+      - name: Build and copy dashboard
+        working-directory: dashboard
+        run: make
+
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v2
         with:

@@ -53,6 +53,14 @@ jobs:
         with:
           go-version: ${{ env.GOVER }}
 
+      - name: Build and copy dashboard
+        run: make
+        working-directory: dashboard
+
+      - name: Test dashboard
+        run: yarn test
+        working-directory: dashboard
+
       - name: Build spiced
         run: make
         working-directory: cmd/spiced
@@ -60,7 +68,7 @@ jobs:
       - name: Run go test
         if: matrix.target_os != 'windows'
         run: go test -v ./...
-        
+
       - name: tar binary
         if: matrix.target_os != 'windows'
         run: |
@@ -101,7 +109,7 @@ jobs:
             target_os: linux
           - os: macOS-latest
             target_os: darwin
-    
+
     steps:
       - name: Check out code into the Go module directory
         uses: actions/checkout@v2
