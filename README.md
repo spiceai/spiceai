@@ -105,7 +105,7 @@ The first Spice AI Pod you will create and train is based off an [Open AI gym](h
 >A pole is attached by an un-actuated joint to a cart, which moves along a frictionless track. The system is controlled by applying a force of +1 or -1 to the cart. The pendulum starts upright, and the goal is to prevent it from falling over. A reward of +1 is provided for every timestep that the pole remains upright. The episode ends when the pole is more than 15 degrees from vertical, or the cart moves more than 2.4 units from the center.
 Source: https://gym.openai.com/envs/CartPole-v1/
 
-We will use Spice AI to train a Pod that can play the game.
+We will use Spice AI to train a pod that can play the game.
 
 Create a directory for the CartPole where you would normally put your code. E.g.
 
@@ -136,7 +136,7 @@ The Spice runtime will then automatically detect the manifest and start your fir
 
 ### Observe your pod training
 
-Navigate to [http://localhost:8000](http://localhost:8000) in your favorite browser. You will see an overview of your pods. From here, you can click on the `cartpole-v1` Pod to see a chart of the pod's training progress.
+Navigate to [http://localhost:8000](http://localhost:8000) in your favorite browser. You will see an overview of your pods. From here, you can click on the `cartpole-v1` pod to see a chart of the pod's training progress.
 
 ### Retrain your pod
 
