@@ -242,15 +242,11 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
             return aiengine_pb2.Response(result="ok")
 
 
-def check_parent_process():
-    pid = os.getpid()
-    current_process = Process(pid)
+def wait_parent_process():
+    current_process = Process(os.getpid())
     parent_process: Process = current_process.parent()
 
-    while True:
-        if parent_process.status() == "terminated":
-            return
-        sleep(5)
+    parent_process.wait()
 
 
 if __name__ == "__main__":
@@ -260,4 +256,4 @@ if __name__ == "__main__":
     server.start()
     print(f"AIEngine: gRPC server listening on port {8004}")
 
-    check_parent_process()
+    wait_parent_process()
