@@ -4,6 +4,12 @@
 *.dll
 *.so
 *.dylib
+cmd/spice/spice
+cmd/spice/.spice
+cmd/spice/data
+cmd/spiced/spiced
+cmd/spiced/.spice
+cmd/spiced/data
 
 # Test binary, built with `go test -c`
 *.test
@@ -18,14 +24,10 @@
 
 dist
 
-# Binaries
-cmd/spice/spice
-cmd/spice/.spice
-cmd/spice/data
-cmd/spiced/spiced
-cmd/spiced/.spice
-cmd/spiced/data
-
 # AI
 __pycache__
 venv
+.venv
+
+# Dashboard
+*.fasthttp.br

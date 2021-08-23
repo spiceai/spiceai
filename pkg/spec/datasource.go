@@ -1,10 +1,5 @@
 package spec
 
-type DataSourceInitSpec struct {
-	Connector DataConnectorSpec `json:"connector"`
-	Actions   map[string]string `json:"actions"`
-}
-
 type DataSourceSpec struct {
 	From    string            `json:"from,omitempty" yaml:"from,omitempty" mapstructure:"from,omitempty"`
 	Name    string            `json:"name,omitempty" yaml:"name,omitempty" mapstructure:"name,omitempty"`

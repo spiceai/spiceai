@@ -8,6 +8,37 @@ on:
       - release-*
 
 jobs:
+  proto_unchanged:
+    name: validate protobuf files unchanged
+    runs-on: ubuntu-latest
+    env:
+      GOVER: 1.16
+
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Set up Go
+        uses: actions/setup-go@v2
+        with:
+          go-version: ${{ env.GOVER }}
+
+      - name: Make venv for proto gen
+        working-directory: ai/src
+        run: make venv-gen-proto
+
+      - name: Run gen-proto check diff
+        run: |
+          wget https://github.com/protocolbuffers/protobuf/releases/download/v3.17.3/protoc-3.17.3-linux-x86_64.zip
+          unzip protoc-3.17.3-linux-x86_64.zip -d protoc
+          sudo cp -r protoc/include/google/ /usr/local/include/
+          sudo chmod -R 755 /usr/local/include/google
+          sudo cp protoc/bin/protoc /usr/local/bin/
+          sudo chmod +x /usr/local/bin/protoc
+          rm -r protoc protoc-3.17.3-linux-x86_64.zip
+          make init-proto
+          export PATH="$PATH:$(go env GOPATH)/bin"
+          make gen-proto check-proto-diff
+
   spiced-and-spice:
     name: go test spiced & spice
     runs-on: ubuntu-latest

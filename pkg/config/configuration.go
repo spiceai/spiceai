@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
@@ -8,13 +9,19 @@ import (
 	"time"
 
 	"github.com/spf13/viper"
+	"github.com/spiceai/spice/pkg/util"
 	"gopkg.in/yaml.v2"
 )
 
+var (
+	SpiceEnvVarPrefix string = "SPICE_"
+)
+
 type SpiceConfiguration struct {
-	HttpPort    uint                      `json:"http_port,omitempty" mapstructure:"http_port,omitempty" yaml:"http_port,omitempty"`
-	Connections map[string]ConnectionSpec `json:"connections,omitempty" yaml:"connections,omitempty"`
-	Pods        []PodSpec                 `json:"pods,omitempty" yaml:"pods,omitempty"`
+	HttpPort            uint                      `json:"http_port,omitempty" mapstructure:"http_port,omitempty" yaml:"http_port,omitempty"`
+	CustomDashboardPath *string                   `json:"custom_dashboard_path,omitempty" mapstructure:"custom_dashboard_path,omitempty" yaml:"custom_dashboard_path,omitempty"`
+	Connections         map[string]ConnectionSpec `json:"connections,omitempty" yaml:"connections,omitempty"`
+	Pods                []PodSpec                 `json:"pods,omitempty" yaml:"pods,omitempty"`
 }
 
 type ConnectionSpec struct {
@@ -48,12 +55,26 @@ func LoadRuntimeConfiguration(v *viper.Viper) (*SpiceConfiguration, error) {
 	v.SetConfigName("config")
 	v.SetConfigType("yaml")
 
-	v.SetEnvPrefix("SPICE")
-	v.AutomaticEnv()
-
 	var config *SpiceConfiguration
-	err := v.ReadInConfig()
-	if err != nil {
+	configPath := ""
+
+	if _, err := os.Stat(".spice/config.yaml"); err == nil {
+		configPath = ".spice/config.yaml"
+	} else if _, err := os.Stat(".spice/config.yml"); err == nil {
+		configPath = ".spice/config.yml"
+	}
+
+	if configPath != "" {
+		configBytes, err := util.ReplaceEnvVariablesFromPath(configPath, SpiceEnvVarPrefix)
+		if err != nil {
+			return nil, err
+		}
+
+		err = v.ReadConfig(bytes.NewBuffer(configBytes))
+		if err != nil {
+			return nil, err
+		}
+	} else {
 		// No config file found, use defaults
 		config = LoadDefaultConfiguration()
 		spiceAppPath := AppSpicePath()
@@ -88,7 +109,7 @@ func LoadRuntimeConfiguration(v *viper.Viper) (*SpiceConfiguration, error) {
 
 	v.WatchConfig()
 
-	err = v.Unmarshal(&config)
+	err := v.Unmarshal(&config)
 	return config, err
 }
 

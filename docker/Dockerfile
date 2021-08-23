@@ -32,12 +32,13 @@ USER spice
 ENV HOME=/app/home
 ENV SPICE_ENVIRONMENT=docker
 
-COPY ai/src/requirements.txt .
-RUN python3 -m pip install -r requirements.txt
+COPY ai/src/requirements/common.txt ai/src/requirements/production.txt ./
+RUN python3 -m pip install -r production.txt
 
 COPY ai/src/*.py ./ai/
 COPY ai/src/connector/ ./ai/connector/
 COPY ai/src/algorithms/ ./ai/algorithms/
+COPY ai/src/proto/ ./ai/proto/
 COPY --from=build /build/cmd/spiced/spiced /app/spiced
 
 WORKDIR /userapp

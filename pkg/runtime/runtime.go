@@ -80,11 +80,6 @@ func (r *SpiceRuntime) processPodsConfig() {
 				continue
 			}
 
-			err = aiengine.LoadInferencing(pod, tag)
-			if err != nil {
-				log.Println("Error:", "Failed to reload inferencing with tag", tag)
-			}
-
 			log.Printf("Updated pod '%s' model to '%s'\n", pod.Name, tag)
 		}
 	}
@@ -127,7 +122,10 @@ func SingleRun(manifestPath string) error {
 		return err
 	}
 
-	spice_http.NewServer(runtime.config.HttpPort).Start()
+	err = spice_http.NewServer(runtime.config.HttpPort, runtime.config.CustomDashboardPath).Start()
+	if err != nil {
+		return err
+	}
 
 	<-aiEngineReady
 
@@ -165,7 +163,10 @@ func Run() error {
 		return err
 	}
 
-	spice_http.NewServer(runtime.config.HttpPort).Start()
+	err = spice_http.NewServer(runtime.config.HttpPort, runtime.config.CustomDashboardPath).Start()
+	if err != nil {
+		return err
+	}
 
 	<-aiEngineReady
 

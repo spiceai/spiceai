@@ -164,7 +164,7 @@ var podTrainCmd = &cobra.Command{
 
 		serverBaseUrl := runtimeConfig.ServerBaseUrl()
 
-		err = util.IsServerHealthy(serverBaseUrl, http.DefaultClient)
+		err = util.IsRuntimeServerHealthy(serverBaseUrl, http.DefaultClient)
 		if err != nil {
 			fmt.Printf("failed to reach %s. is the spice runtime running?", serverBaseUrl)
 			return

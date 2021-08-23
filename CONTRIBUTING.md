@@ -55,7 +55,8 @@ All contributions come through pull requests. To submit a proposed change, we re
 A good way to communicate before investing too much time is to create a "Work-in-progress" PR and share it with your reviewers. The standard way of doing this is to add a "[WIP]" prefix in your PR's title and assign the **do-not-merge** label. This will let people looking at your PR know that it is not well baked yet.
 
 ## Security Vulnerability Reporting
-Spice AI takes security and our users' trust very seriously. If you believe you have found a security issue in any of our open source projects, please responsibly disclose it by contacting security@spiceai.io. 
+
+Spice AI takes security and our users' trust very seriously. If you believe you have found a security issue in any of our open source projects, please responsibly disclose it by contacting security@spiceai.io.
 
 ### Use of Third-party code
 
@@ -99,7 +100,7 @@ Activate the venv and install the python dependencies:
 
 ```bash
 $ source venv/bin/activate
-$ pip install -r requirements.txt
+$ pip install -r requirements/development.txt
 ```
 
 ### Building the Spice CLI

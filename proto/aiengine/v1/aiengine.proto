@@ -1,0 +1,70 @@
+syntax = "proto3";
+
+package aiengine;
+
+option go_package = "github.com/spiceai/spice/pkg/proto/aiengine_pb";
+
+service AIEngine {
+  rpc Init(InitRequest) returns (Response);
+  rpc AddData(AddDataRequest) returns (Response);
+  rpc StartTraining(StartTrainingRequest) returns (Response);
+  rpc GetInference(InferenceRequest) returns (InferenceResult);
+  rpc GetHealth(HealthRequest) returns (Response);
+}
+
+message DataConnector {
+  string name = 1;
+  map<string, string> params = 2;
+}
+
+message DataSource {
+  DataConnector connector = 1;
+  map<string, string> actions = 2;
+}
+
+message InitRequest {
+  string pod = 1;
+  int64 period = 2;
+  int64 interval = 3;
+  int64 granularity = 4;
+  int64 epoch_time = 5;
+  map<string, string> actions = 6;
+  map<string, double> fields = 7;
+  repeated string laws = 8;
+  repeated DataSource datasources = 9;
+}
+
+message Response {
+  string result = 1;
+  string message = 2;
+  bool error = 3;
+}
+
+message StartTrainingRequest {
+  string pod = 1;
+  int64 number_episodes = 2;
+  string flight = 3;
+  string training_goal = 4;
+  int64 epoch_time = 5;
+}
+
+message InferenceRequest {
+  string pod = 1;
+  string tag = 2;
+}
+
+message InferenceResult {
+  Response response = 1;
+  int64 start = 2;
+  int64 end = 3;
+  string action = 4;
+  float confidence = 5;
+  string tag = 6;
+}
+
+message AddDataRequest {
+  string pod = 1;
+  string csv_data = 2;
+}
+
+message HealthRequest {}

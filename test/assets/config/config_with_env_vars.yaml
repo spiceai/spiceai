@@ -1,0 +1,12 @@
+http_port: 8000
+connections:
+  github:
+    name: foo/bar
+    token: SPICE_TOKEN_TO_REPLACE
+pods:
+- name: trader
+  models:
+    downloader:
+      uses: github
+    keep: 10
+    

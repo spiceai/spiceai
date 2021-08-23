@@ -2,7 +2,7 @@ http_port: 8000
 connections:
   github:
     name: foo/bar
-    token: SPICE_GH_TOKEN
+    token: rawtoken
 pods:
 - name: trader
   models:

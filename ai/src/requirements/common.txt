@@ -1,3 +1,4 @@
+# Contains requirements common to all environments
 absl-py==0.12.0
 appdirs==1.4.4
 appnope==0.1.2
@@ -12,18 +13,16 @@ click==8.0.1
 cloudpickle==1.6.0
 cycler==0.10.0
 decorator==5.0.9
-Flask==2.0.1
 flatbuffers==1.12
 gast==0.4.0
 google-auth==1.30.2
 google-auth-oauthlib==0.4.4
 google-pasta==0.2.0
-grpcio==1.34.1
+grpcio~=1.34.0
 gym==0.18.3
 h5py==3.1.0
 humanize==3.11.0
 idna==2.10
-influxdb-client==1.18.0
 iniconfig==1.1.1
 ipykernel==5.5.5
 ipython==7.24.1
@@ -31,8 +30,6 @@ ipython-genutils==0.2.0
 itsdangerous==2.0.1
 jedi==0.18.0
 Jinja2==3.0.1
-jupyter-client==6.1.12
-jupyter-core==4.7.1
 keras-nightly==2.5.0.dev2021032900
 Keras-Preprocessing==1.1.2
 kiwisolver==1.3.1

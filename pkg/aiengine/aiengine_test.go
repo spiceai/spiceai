@@ -1,11 +1,9 @@
 package aiengine
 
 import (
-	"bytes"
+	go_context "context"
 	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,9 +12,10 @@ import (
 	"github.com/bradleyjkemp/cupaloy"
 	"github.com/spiceai/spice/pkg/context"
 	"github.com/spiceai/spice/pkg/pods"
-	"github.com/spiceai/spice/pkg/spec"
+	"github.com/spiceai/spice/pkg/proto/aiengine_pb"
 	"github.com/spiceai/spice/pkg/testutils"
 	"github.com/stretchr/testify/assert"
+	"google.golang.org/grpc"
 )
 
 var snapshotter = cupaloy.New(cupaloy.SnapshotSubdirectory("../../test/assets/snapshots/aiengine"))
@@ -33,8 +32,6 @@ func TestAIEngineStartServer(t *testing.T) {
 	origContext := context.CurrentContext()
 	t.Cleanup(func() { context.SetContext(origContext) })
 	t.Cleanup(func() { execCommand = exec.Command })
-	origHttpClient := HttpClient
-	t.Cleanup(func() { HttpClient = origHttpClient })
 
 	t.Run("StartServer() -- Happy Path", testStartServerFunc())
 	t.Run("StartServer() -- Python server takes a few tries to return healthy", testStartServerHealthyLaterFunc())
@@ -68,44 +65,33 @@ func TestPod(t *testing.T) {
 
 func testInitializePod(pod *pods.Pod) func(t *testing.T) {
 	return func(t *testing.T) {
-		HttpClient = testutils.NewTestClient(func(req *http.Request) (*http.Response, error) {
-			switch req.URL.String() {
-			case fmt.Sprintf("http://localhost:8004/pods/%s/init", pod.Name):
-				reqBody, err := io.ReadAll(req.Body)
-				if err != nil {
-					t.Error(err)
-					return nil, err
-				}
-				var actualInit spec.PodInitSpec
-				err = json.Unmarshal(reqBody, &actualInit)
-				if err != nil {
-					t.Error(err)
-					return nil, err
-				}
+		t.Cleanup(func() {
+			aiengineClient = nil
+		})
 
+		mockAIEngineClient := &MockAIEngineClient{
+			InitHandler: func(c go_context.Context, ir *aiengine_pb.InitRequest, co ...grpc.CallOption) (*aiengine_pb.Response, error) {
 				if pod.Name == "cartpole-v1" {
 					// Epoch time is not specified for cartpole, so it will be "now"
 					var testStaticEpochTime int64 = 123
-					actualInit.EpochTime = &testStaticEpochTime
+					ir.EpochTime = testStaticEpochTime
 				}
 
 				// marshal to JSON so the snapshot is easy to consume
-				data, err := json.MarshalIndent(actualInit, "", "  ")
+				data, err := json.MarshalIndent(ir, "", "  ")
 				if err != nil {
 					t.Error(err)
 				}
 
 				snapshotter.SnapshotT(t, data)
 
-				return &http.Response{
-					StatusCode: 200,
-					Body:       io.NopCloser(bytes.NewBufferString("ok")),
-					Header:     make(http.Header),
+				return &aiengine_pb.Response{
+					Result: "ok",
 				}, nil
-			}
+			},
+		}
 
-			return nil, fmt.Errorf("Unexpected request: %s", req.URL.String())
-		})
+		aiengineClient = mockAIEngineClient
 
 		err := InitializePod(pod)
 		if pod.Name == "trader-infer" {
@@ -125,49 +111,30 @@ func testInitializePod(pod *pods.Pod) func(t *testing.T) {
 
 func testStartTrainingFunc(pod *pods.Pod, response string) func(t *testing.T) {
 	return func(t *testing.T) {
-		expectedTrainConfig := spec.TrainSpec{
-			FlightId: "1",
-			Episodes: 10,
-			Goal:     pod.PodSpec.Training.Goal,
+		expectedTrainRequest := &aiengine_pb.StartTrainingRequest{
+			Pod:            pod.Name,
+			Flight:         "1",
+			NumberEpisodes: 10,
+			TrainingGoal:   pod.PodSpec.Training.Goal,
 		}
 
-		HttpClient = testutils.NewTestClient(func(req *http.Request) (*http.Response, error) {
-			switch req.URL.String() {
-			case fmt.Sprintf("http://localhost:8004/pods/%s/train", pod.Name):
-				reqBody, err := io.ReadAll(req.Body)
-				if err != nil {
-					t.Error(err)
-					return nil, err
-				}
-				var actualTrainConfig spec.TrainSpec
-				err = json.Unmarshal(reqBody, &actualTrainConfig)
-				if err != nil {
-					t.Error(err)
-					return nil, err
-				}
-				expectedTrainConfig.EpochTime = actualTrainConfig.EpochTime
-
-				assert.Equal(t, expectedTrainConfig, actualTrainConfig)
-
-				aiResponse := &AIEngineResponse{
-					Result: response,
-				}
-
-				aiResponseBytes, err := json.Marshal(aiResponse)
-				if err != nil {
-					t.Error(err)
-					return nil, err
-				}
-
-				return &http.Response{
-					StatusCode: 200,
-					Body:       io.NopCloser(bytes.NewBuffer(aiResponseBytes)),
-					Header:     make(http.Header),
-				}, nil
-			}
-
-			return nil, fmt.Errorf("Unexpected request: %s", req.URL.String())
+		t.Cleanup(func() {
+			aiengineClient = nil
 		})
+
+		mockAIEngineClient := &MockAIEngineClient{
+			StartTrainingHandler: func(c go_context.Context, actualTrainRequest *aiengine_pb.StartTrainingRequest, co ...grpc.CallOption) (*aiengine_pb.Response, error) {
+				expectedTrainRequest.EpochTime = actualTrainRequest.EpochTime
+
+				assert.Equal(t, expectedTrainRequest, actualTrainRequest)
+
+				return &aiengine_pb.Response{
+					Result: response,
+				}, nil
+			},
+		}
+
+		aiengineClient = mockAIEngineClient
 
 		err := StartTraining(pod)
 		switch response {
@@ -201,28 +168,32 @@ func testInferServerNotReadyFunc() func(*testing.T) {
 func testInferServerFunc() func(*testing.T) {
 	return func(t *testing.T) {
 		aiServerReady = true
-		t.Cleanup(func() { aiServerReady = false })
+		t.Cleanup(func() {
+			aiServerReady = false
+			aiengineClient = nil
+		})
 
 		podName := "pod_foo"
 		tagName := "tag_bar"
-		expectedUrl := fmt.Sprintf("http://localhost:8004/pods/%s/models/%s/inference", podName, tagName)
 
-		retryClient = testutils.NewTestClient(func(req *http.Request) (*http.Response, error) {
-			switch req.URL.String() {
-			case expectedUrl:
-				return &http.Response{
-					StatusCode: 200,
-					Body:       io.NopCloser(bytes.NewBufferString("ok")),
-					Header:     make(http.Header),
+		mockAIEngineClient := &MockAIEngineClient{
+			GetInferenceHandler: func(c go_context.Context, inferenceRequest *aiengine_pb.InferenceRequest, co ...grpc.CallOption) (*aiengine_pb.InferenceResult, error) {
+				assert.Equal(t, inferenceRequest.Pod, podName)
+				assert.Equal(t, inferenceRequest.Tag, tagName)
+
+				return &aiengine_pb.InferenceResult{
+					Response: &aiengine_pb.Response{
+						Result: "ok",
+					},
 				}, nil
-			}
+			},
+		}
 
-			return nil, fmt.Errorf("Unexpected request: %s", req.URL.String())
-		})
+		aiengineClient = mockAIEngineClient
 
 		resp, err := Infer("pod_foo", "tag_bar")
 		if assert.NoError(t, err) {
-			assert.Equal(t, "ok", string(resp))
+			assert.Equal(t, "ok", resp.Response.Result)
 		}
 	}
 }
@@ -249,18 +220,22 @@ func testPythonCmdBareMetalContextFunc() func(*testing.T) {
 func testStartServerFunc() func(*testing.T) {
 	return func(t *testing.T) {
 		execCommand = testutils.GetScenarioExecCommand("HAPPY_PATH")
-		HttpClient = testutils.NewTestClient(func(req *http.Request) (*http.Response, error) {
-			switch req.URL.String() {
-			case "http://localhost:8004/health":
-				return &http.Response{
-					StatusCode: 200,
-					Body:       io.NopCloser(bytes.NewBufferString("ok")),
-					Header:     make(http.Header),
-				}, nil
-			}
-
-			return nil, fmt.Errorf("Unexpected request: %s", req.URL.String())
+		t.Cleanup(func() {
+			getClient = NewAIEngineClient
+			aiengineClient = nil
 		})
+
+		mockAIEngineClient := &MockAIEngineClient{
+			GetHealthHandler: func(c go_context.Context, healthRequest *aiengine_pb.HealthRequest, co ...grpc.CallOption) (*aiengine_pb.Response, error) {
+				return &aiengine_pb.Response{
+					Result: "ok",
+				}, nil
+			},
+		}
+
+		getClient = func(target string) (AIEngineClient, error) {
+			return mockAIEngineClient, nil
+		}
 
 		assert.Nil(t, aiServerCmd)
 		ready := make(chan bool)
@@ -278,32 +253,29 @@ func testStartServerFunc() func(*testing.T) {
 func testStartServerHealthyLaterFunc() func(*testing.T) {
 	return func(t *testing.T) {
 		execCommand = testutils.GetScenarioExecCommand("HAPPY_PATH")
+		t.Cleanup(func() {
+			getClient = NewAIEngineClient
+			aiengineClient = nil
+		})
 
 		healthyRequests := 0
-		HttpClient = testutils.NewTestClient(func(req *http.Request) (*http.Response, error) {
-			switch req.URL.String() {
-			case "http://localhost:8004/health":
+		mockAIEngineClient := &MockAIEngineClient{
+			GetHealthHandler: func(c go_context.Context, healthRequest *aiengine_pb.HealthRequest, co ...grpc.CallOption) (*aiengine_pb.Response, error) {
 				healthyRequests += 1
 
 				if healthyRequests >= 5 {
-					return &http.Response{
-						StatusCode: 200,
-						Body:       io.NopCloser(bytes.NewBufferString("ok")),
-						Header:     make(http.Header),
-					}, nil
-				} else if healthyRequests >= 3 {
-					return &http.Response{
-						StatusCode: 500,
-						Body:       io.NopCloser(bytes.NewBufferString("server not ready yet")),
-						Header:     make(http.Header),
+					return &aiengine_pb.Response{
+						Result: "ok",
 					}, nil
 				} else {
 					return nil, fmt.Errorf("server not ready yet")
 				}
-			}
+			},
+		}
 
-			return nil, fmt.Errorf("Unexpected request: %s", req.URL.String())
-		})
+		getClient = func(target string) (AIEngineClient, error) {
+			return mockAIEngineClient, nil
+		}
 
 		ready := make(chan bool)
 		err := StartServer(ready, false)
@@ -318,7 +290,7 @@ func testGetPodInitForTrainingFunc(pod *pods.Pod) func(*testing.T) {
 
 		// set static epoch time for snapshot testing
 		var testEpochTime int64 = 1234
-		podInitSpec.EpochTime = &testEpochTime
+		podInitSpec.EpochTime = testEpochTime
 
 		// marshal to JSON so the snapshot is easy to consume
 		data, err := json.MarshalIndent(podInitSpec, "", "  ")

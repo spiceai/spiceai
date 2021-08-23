@@ -1,24 +1,20 @@
 package environment_test
 
 import (
-	"bytes"
+	"context"
 	"fmt"
-	"io"
-	"net/http"
 	"testing"
 	"time"
 
 	"github.com/spiceai/spice/pkg/aiengine"
 	"github.com/spiceai/spice/pkg/environment"
 	"github.com/spiceai/spice/pkg/pods"
-	"github.com/spiceai/spice/pkg/testutils"
+	"github.com/spiceai/spice/pkg/proto/aiengine_pb"
 	"github.com/stretchr/testify/assert"
+	"google.golang.org/grpc"
 )
 
 func TestEnvironment(t *testing.T) {
-	origHttpClient := aiengine.HttpClient
-	t.Cleanup(func() { aiengine.HttpClient = origHttpClient })
-
 	t.Run("testStartDataListeners() -- Should start listeners and post data", testStartDataListeners())
 }
 
@@ -29,27 +25,22 @@ func testStartDataListeners() func(*testing.T) {
 		pods.CreateOrUpdatePod(pod)
 		data_received := make(chan bool)
 
-		aiengine.HttpClient = testutils.NewTestClient(func(req *http.Request) (*http.Response, error) {
-			switch req.URL.String() {
-			case "http://localhost:8004/health":
+		t.Cleanup(func() {
+			aiengine.SetAIEngineClient(nil)
+		})
 
-				return &http.Response{
-					StatusCode: 200,
-					Body:       io.NopCloser(bytes.NewBufferString("ok")),
-					Header:     make(http.Header),
+		aiengine.SetAIEngineClient(&aiengine.MockAIEngineClient{
+			GetHealthHandler: func(c context.Context, hr *aiengine_pb.HealthRequest, co ...grpc.CallOption) (*aiengine_pb.Response, error) {
+				return &aiengine_pb.Response{
+					Result: "ok",
 				}, nil
-
-			case "http://localhost:8004/pods/trader/data":
+			},
+			AddDataHandler: func(c context.Context, adr *aiengine_pb.AddDataRequest, co ...grpc.CallOption) (*aiengine_pb.Response, error) {
 				data_received <- true
-				return &http.Response{
-					StatusCode: 200,
-					Body:       io.NopCloser(bytes.NewBufferString("ok")),
-					Header:     make(http.Header),
+				return &aiengine_pb.Response{
+					Result: "ok",
 				}, nil
-
-			}
-
-			return nil, fmt.Errorf("Unexpected request: %s", req.URL.String())
+			},
 		})
 
 		go func() {

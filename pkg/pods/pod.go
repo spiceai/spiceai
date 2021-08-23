@@ -1,6 +1,7 @@
 package pods
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -19,6 +20,7 @@ import (
 	"github.com/spiceai/spice/pkg/observations"
 	"github.com/spiceai/spice/pkg/spec"
 	"github.com/spiceai/spice/pkg/state"
+	"github.com/spiceai/spice/pkg/util"
 )
 
 type Pod struct {
@@ -378,15 +380,15 @@ func (pod *Pod) DownloadModelUpdate(connectionId string, connection config.Conne
 }
 
 func unmarshalPod(podPath string) (*Pod, error) {
-	podDir := filepath.Dir(podPath)
-	podName := strings.TrimSuffix(filepath.Base(podPath), filepath.Ext(podPath))
+	podBytes, err := util.ReplaceEnvVariablesFromPath(podPath, config.SpiceEnvVarPrefix)
+	if err != nil {
+		return nil, err
+	}
 
 	v := viper.New()
-	v.AddConfigPath(podDir)
-	v.SetConfigName(podName)
 	v.SetConfigType("yaml")
 
-	err := v.ReadInConfig()
+	err = v.ReadConfig(bytes.NewBuffer(podBytes))
 	if err != nil {
 		return nil, err
 	}

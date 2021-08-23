@@ -17,7 +17,9 @@ import (
 
 func TestDashboard(t *testing.T) {
 	t.Run("DashboardIndexHandler() - GET returns dashboard content", testDashboardIndexHandler())
-	t.Run("DashboardAppHandler() - GET returns JS content", testDashboardAppHandler())
+	t.Run("DashboardJsHandler() - GET returns JS content", testDashboardJsHandler())
+	t.Run("DashboardCssHandler() - GET returns CSS content", testDashboardCssHandler())
+	t.Run("DashboardSvgHandler() - GET returns SVG content", testDashboardSvgHandler())
 }
 
 func testDashboardIndexHandler() func(*testing.T) {
@@ -25,30 +27,72 @@ func testDashboardIndexHandler() func(*testing.T) {
 		r, err := http.NewRequest("GET", "http://test/", nil)
 		assert.NoError(t, err)
 
-		res, err := serve("/", dashboard.DashboardIndexHandler, r)
+		server := dashboard.NewDashboardEmbedded()
+
+		res, err := serve("/", server.IndexHandler, r)
 		assert.NoError(t, err)
 
 		body, err := ioutil.ReadAll(res.Body)
 		assert.NoError(t, err)
 
-		assert.Contains(t, string(body), "Spice AI")
+		assert.Contains(t, string(body), "dummy")
 	}
 }
 
-func testDashboardAppHandler() func(*testing.T) {
+func testDashboardJsHandler() func(*testing.T) {
 	return func(t *testing.T) {
-		r, err := http.NewRequest("GET", "http://test/js/app.js", nil)
+		r, err := http.NewRequest("GET", "http://test/js/dummy.js", nil)
 		assert.NoError(t, err)
 
-		res, err := serve("/js/{jsFile}", dashboard.DashboardAppHandler, r)
+		server := dashboard.NewDashboardEmbedded()
+
+		res, err := serve("/js/{file}", server.JsHandler, r)
 		assert.NoError(t, err)
 
 		body, err := ioutil.ReadAll(res.Body)
 		assert.NoError(t, err)
 
 		assert.EqualValues(t, 200, res.StatusCode)
-		assert.EqualValues(t, "application/javascript", res.Header.Get("Content-Type"))
-		assert.Contains(t, string(body), "SPICE_VERSION")
+		assert.EqualValues(t, "application/javascript; charset=utf-8", res.Header.Get("Content-Type"))
+		assert.Contains(t, string(body), "dummy - js")
+	}
+}
+
+func testDashboardCssHandler() func(*testing.T) {
+	return func(t *testing.T) {
+		r, err := http.NewRequest("GET", "http://test/css/dummy.css", nil)
+		assert.NoError(t, err)
+
+		server := dashboard.NewDashboardEmbedded()
+
+		res, err := serve("/css/{file}", server.CssHandler, r)
+		assert.NoError(t, err)
+
+		body, err := ioutil.ReadAll(res.Body)
+		assert.NoError(t, err)
+
+		assert.EqualValues(t, 200, res.StatusCode)
+		assert.EqualValues(t, "text/css; charset=utf-8", res.Header.Get("Content-Type"))
+		assert.Contains(t, string(body), "dummy-css")
+	}
+}
+
+func testDashboardSvgHandler() func(*testing.T) {
+	return func(t *testing.T) {
+		r, err := http.NewRequest("GET", "http://test/media/dummy.svg", nil)
+		assert.NoError(t, err)
+
+		server := dashboard.NewDashboardEmbedded()
+
+		res, err := serve("/media/{file}", server.SvgHandler, r)
+		assert.NoError(t, err)
+
+		body, err := ioutil.ReadAll(res.Body)
+		assert.NoError(t, err)
+
+		assert.EqualValues(t, 200, res.StatusCode)
+		assert.EqualValues(t, "image/svg+xml", res.Header.Get("Content-Type"))
+		assert.Contains(t, string(body), "dummy-svg")
 	}
 }
 

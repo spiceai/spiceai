@@ -13,11 +13,33 @@ import (
 
 var (
 	spicedDockerImg string = "ghcr.io/spiceai/spiced:%s"
-	spicedDockerCmd string = "run -p %d:%d --add-host=host.docker.internal:host-gateway -v %s:/userapp --rm %s"
+	spicedDockerCmd string = "run -p %d:%d %s --add-host=host.docker.internal:host-gateway -v %s:/userapp --rm %s"
 )
 
+func getSpiceEnvVarsAsDockerArgs() string {
+	var dockerEnvArgs []string
+	for _, envVar := range os.Environ() {
+		if strings.HasPrefix(envVar, config.SpiceEnvVarPrefix) {
+			dockerEnvArgs = append(dockerEnvArgs, "--env")
+			dockerEnvArgs = append(dockerEnvArgs, envVar)
+		}
+	}
+
+	return strings.Join(dockerEnvArgs, " ")
+}
+
 func getDockerArgs(args string) []string {
-	return strings.Split(args, " ")
+	originalArgs := strings.Split(args, " ")
+
+	// strings.Split will add empty strings if more than one space occurs in a row - trim them out
+	var argsTrimmedOfEmptyStrings []string
+	for _, arg := range originalArgs {
+		if arg != "" {
+			argsTrimmedOfEmptyStrings = append(argsTrimmedOfEmptyStrings, arg)
+		}
+	}
+
+	return argsTrimmedOfEmptyStrings
 }
 
 func getHttpPort() (uint, error) {
@@ -54,8 +76,10 @@ func Run(cliContext context.RuntimeContext, manifestPath string) error {
 			return err
 		}
 
+		spiceEnvArgs := getSpiceEnvVarsAsDockerArgs()
+
 		dockerImg := fmt.Sprintf(spicedDockerImg, dockerVersion)
-		dockerArgs := getDockerArgs(fmt.Sprintf(spicedDockerCmd, httpPort, httpPort, userApp, dockerImg))
+		dockerArgs := getDockerArgs(fmt.Sprintf(spicedDockerCmd, httpPort, httpPort, spiceEnvArgs, userApp, dockerImg))
 
 		if manifestPath != "" {
 			dockerArgs = append(dockerArgs, manifestPath)

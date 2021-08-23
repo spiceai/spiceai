@@ -17,6 +17,8 @@ jobs:
 
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v2
+        with:
+          args: --timeout=2m
 
   black:
     name: lint python code
@@ -35,4 +37,4 @@ jobs:
       - name: Analysing the AI code with black
         working-directory: ai/src
         run: |
-          black --check .
+          black --check --extend-exclude proto .

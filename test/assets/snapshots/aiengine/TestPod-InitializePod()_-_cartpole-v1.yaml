@@ -1,8 +1,20 @@
 {
-  "epoch_time": 123,
+  "pod": "cartpole-v1",
   "period": 3000,
   "interval": 10,
   "granularity": 10,
+  "epoch_time": 123,
+  "actions": {
+    "left": "reward = 0 if new_state.gym_CartPole_is_done == 1 else 1",
+    "right": "reward = 0 if new_state.gym_CartPole_is_done == 1 else 1"
+  },
+  "fields": {
+    "gym_CartPole_cart_position": 0,
+    "gym_CartPole_cart_velocity": 0,
+    "gym_CartPole_is_done": 0,
+    "gym_CartPole_pole_angle": 0,
+    "gym_CartPole_pole_angular_velocity": 0
+  },
   "datasources": [
     {
       "connector": {
@@ -16,17 +28,5 @@
         "right": "passthru"
       }
     }
-  ],
-  "fields": {
-    "gym_CartPole_cart_position": 0,
-    "gym_CartPole_cart_velocity": 0,
-    "gym_CartPole_is_done": 0,
-    "gym_CartPole_pole_angle": 0,
-    "gym_CartPole_pole_angular_velocity": 0
-  },
-  "actions": {
-    "left": "reward = 0 if new_state.gym_CartPole_is_done == 1 else 1",
-    "right": "reward = 0 if new_state.gym_CartPole_is_done == 1 else 1"
-  },
-  "laws": null
+  ]
 }

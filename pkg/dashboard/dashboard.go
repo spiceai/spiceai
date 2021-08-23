@@ -1,37 +1,26 @@
 package dashboard
 
 import (
-	"embed"
-	"path/filepath"
-
 	"github.com/valyala/fasthttp"
 )
 
-// fasthttp doesn't yet support serving embed.FS files, so serve each file manually for now
-// GitHub Isssue: https://github.com/valyala/fasthttp/issues/974
-// More info on go:embed at https://pkg.go.dev/embed@master
-
-//go:embed html/index.html
-var contentIndexHtml []byte
-
-//go:embed js/*
-var jsFiles embed.FS
-
-func DashboardIndexHandler(ctx *fasthttp.RequestCtx) {
-	ctx.Response.Header.SetContentType("text/html")
-	ctx.Response.SetBody(contentIndexHtml)
+type Dashboard interface {
+	IndexHandler(ctx *fasthttp.RequestCtx)
+	JsHandler(ctx *fasthttp.RequestCtx)
+	CssHandler(ctx *fasthttp.RequestCtx)
+	SvgHandler(ctx *fasthttp.RequestCtx)
 }
 
-func DashboardAppHandler(ctx *fasthttp.RequestCtx) {
-	jsFile := ctx.UserValue("jsFile").(string)
-
-	jsFileContent, err := jsFiles.ReadFile(filepath.Join("js", jsFile))
-	if err != nil {
-		ctx.Response.SetStatusCode(500)
-		ctx.Response.SetBody([]byte(err.Error()))
-		return
+func GetContentType(fileType string) string {
+	switch fileType {
+	case "html":
+		return "text/html; charset=utf-8"
+	case "js":
+		return "application/javascript; charset=utf-8"
+	case "css":
+		return "text/css; charset=utf-8"
+	case "svg":
+		return "image/svg+xml"
 	}
-
-	ctx.Response.Header.SetContentType("application/javascript")
-	ctx.Response.SetBody(jsFileContent)
+	return ""
 }

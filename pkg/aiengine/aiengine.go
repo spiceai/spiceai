@@ -2,20 +2,16 @@ package aiengine
 
 import (
 	"bufio"
-	"bytes"
-	"encoding/json"
+	go_context "context"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"log"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
 
-	"github.com/hashicorp/go-retryablehttp"
 	"github.com/logrusorgru/aurora"
 	"github.com/spiceai/spice/pkg/config"
 	"github.com/spiceai/spice/pkg/context"
@@ -23,7 +19,7 @@ import (
 	"github.com/spiceai/spice/pkg/loggers"
 	"github.com/spiceai/spice/pkg/observations"
 	"github.com/spiceai/spice/pkg/pods"
-	"github.com/spiceai/spice/pkg/spec"
+	"github.com/spiceai/spice/pkg/proto/aiengine_pb"
 	"github.com/spiceai/spice/pkg/state"
 	"github.com/spiceai/spice/pkg/util"
 	"go.uber.org/zap"
@@ -36,13 +32,13 @@ type AIEngineResponse struct {
 
 const (
 	pythonCmd   string = "python"
-	aiServerUrl string = "http://localhost:8004"
+	aiServerUrl string = "localhost:8004"
 )
 
 var (
-	execCommand                      = exec.Command
-	HttpClient          *http.Client = http.DefaultClient
-	retryClient         *http.Client
+	execCommand         = exec.Command
+	aiengineClient      AIEngineClient
+	getClient                  = NewAIEngineClient
 	pythonPath          string = filepath.Join(config.AiEnginePath(), "venv", "bin", pythonCmd)
 	aiServerPath        string = filepath.Join(config.AiEnginePath(), "main.py")
 	aiServerCmd         *exec.Cmd
@@ -84,6 +80,12 @@ func StartServer(ready chan bool, isSingleRun bool) error {
 	aiServerCmd = execCommand(getPythonCmd(), aiServerPath)
 	aiServerRunning := make(chan bool, 1)
 
+	var err error
+	aiengineClient, err = getClient(aiServerUrl)
+	if err != nil {
+		return err
+	}
+
 	go func() {
 		if aiServerCmd == nil {
 			aiServerRunning <- true
@@ -107,13 +109,9 @@ func StartServer(ready chan bool, isSingleRun bool) error {
 		outScanner := bufio.NewScanner(stdOutPipe)
 		errScanner := bufio.NewScanner(stdErrPipe)
 
-		logFileName := loggers.FormatTimestampedLogFileName("ai-server")
-		logPath := filepath.Join(config.SpiceLogPath(), logFileName)
-
-		fileLogger := loggers.NewFileLogger(logPath)
-		err := fileLogger.Open()
+		fileLogger, err := loggers.NewFileLogger("aiengine")
 		if err != nil {
-			log.Println(fmt.Errorf("error opening log file %s: %w", logPath, err))
+			zaplog.Sugar().Errorf("error creating file logger: %w", err)
 			fileLogger = nil
 		}
 
@@ -129,7 +127,7 @@ func StartServer(ready chan bool, isSingleRun bool) error {
 				}
 
 				if fileLogger != nil {
-					_ = fileLogger.Writeln(line)
+					fileLogger.Info(line)
 				}
 			}
 		}()
@@ -139,7 +137,7 @@ func StartServer(ready chan bool, isSingleRun bool) error {
 				line := errScanner.Text()
 
 				if fileLogger != nil {
-					_ = fileLogger.Writeln(line)
+					fileLogger.Info(line)
 				}
 			}
 		}()
@@ -148,7 +146,7 @@ func StartServer(ready chan bool, isSingleRun bool) error {
 		if err != nil {
 			log.Println(fmt.Errorf("error starting %s: %w", aiServerCmd.Path, err))
 			if fileLogger != nil {
-				fileLogger.Close()
+				_ = fileLogger.Sync()
 			}
 			aiServerRunning <- false
 			return
@@ -164,10 +162,10 @@ func StartServer(ready chan bool, isSingleRun bool) error {
 				log.Println(fmt.Errorf("process %s exited with error: %w", aiServerCmd.Path, appErr))
 			}
 			if fileLogger != nil {
-				fileLogger.Close()
+				_ = fileLogger.Sync()
 			}
 
-			if !isTestEnvironment() {
+			if !aiServerCmd.ProcessState.Success() && !isTestEnvironment() {
 				// If the AI engine crashes, pass on its exit status
 				os.Exit(aiServerCmd.ProcessState.ExitCode())
 			}
@@ -196,6 +194,13 @@ func StopServer() error {
 			<-aiServerRunning
 		}
 	}
+	if aiengineClient != nil {
+		err := aiengineClient.Close()
+		if err != nil {
+			return err
+		}
+		aiengineClient = nil
+	}
 	return nil
 }
 
@@ -204,7 +209,7 @@ func ServerReady() bool {
 }
 
 func IsServerHealthy() error {
-	return util.IsServerHealthy(aiServerUrl, HttpClient)
+	return util.IsAIEngineServerHealthy(aiengineClient)
 }
 
 func InitializePod(pod *pods.Pod) error {
@@ -216,33 +221,15 @@ func InitializePod(pod *pods.Pod) error {
 
 	podInit := getPodInitForTraining(pod)
 
-	data, err := json.Marshal(podInit)
+	ctx, cancel := go_context.WithTimeout(go_context.Background(), time.Second)
+	defer cancel()
+	response, err := aiengineClient.Init(ctx, podInit)
 	if err != nil {
 		return err
 	}
 
-	zaplog.Sugar().Debug(aurora.Yellow(string(data)))
-
-	initUrl := fmt.Sprintf("%s/pods/%s/init", aiServerUrl, pod.Name)
-
-	response, err := HttpClient.Post(initUrl, "application/json", bytes.NewBuffer(data))
-	if err != nil {
-		return err
-	}
-
-	if response.StatusCode != 200 {
-		responseData, err := ioutil.ReadAll(response.Body)
-		if err != nil {
-			return fmt.Errorf("failed to verify training has started: %w", err)
-		}
-
-		var aiResponse AIEngineResponse
-		err = json.Unmarshal(responseData, &aiResponse)
-		if err != nil {
-			return fmt.Errorf("failed to verify training has started: %w", err)
-		}
-
-		return fmt.Errorf("failed to validate manifest: %s", aiResponse.Result)
+	if response.Error {
+		return fmt.Errorf("failed to validate manifest: %s", response.Result)
 	}
 
 	return nil
@@ -253,50 +240,33 @@ func StartTraining(pod *pods.Pod) error {
 
 	flight := flights.NewFlight(flightId, int(pod.Episodes()))
 
-	trainConfig := &spec.TrainSpec{
-		EpochTime: pod.Epoch().Unix(),
-		FlightId:  flightId,
-		Episodes:  flight.ExpectedEpisodes(),
-		Goal:      pod.PodSpec.Training.Goal,
+	trainRequest := &aiengine_pb.StartTrainingRequest{
+		Pod:            pod.Name,
+		EpochTime:      pod.Epoch().Unix(),
+		Flight:         flightId,
+		NumberEpisodes: int64(flight.ExpectedEpisodes()),
+		TrainingGoal:   pod.PodSpec.Training.Goal,
 	}
 
-	data, err := json.Marshal(trainConfig)
-	if err != nil {
-		return err
-	}
-
-	zaplog.Sugar().Debug(aurora.Yellow(string(data)))
-
-	trainUrl := fmt.Sprintf("%s/pods/%s/train", aiServerUrl, pod.Name)
-
-	response, err := HttpClient.Post(trainUrl, "application/json", bytes.NewBuffer(data))
-	if err != nil {
-		return fmt.Errorf("%s -> failed to start training: %w", pod.Name, err)
-	}
-
-	responseData, err := ioutil.ReadAll(response.Body)
+	ctx, cancel := go_context.WithTimeout(go_context.Background(), time.Second)
+	defer cancel()
+	response, err := aiengineClient.StartTraining(ctx, trainRequest)
 	if err != nil {
 		return fmt.Errorf("%s -> failed to verify training has started: %w", pod.Name, err)
 	}
 
-	var aiResponse AIEngineResponse
-	err = json.Unmarshal(responseData, &aiResponse)
-	if err != nil {
-		return fmt.Errorf("%s -> failed to verify training has started: %w", pod.Name, err)
-	}
-
-	switch aiResponse.Result {
+	switch response.Result {
 	case "already_training":
 		return fmt.Errorf("%s -> training is already in progress", pod.Name)
 	case "not_enough_data_for_training":
 		return fmt.Errorf("%s -> insufficient data for training", pod.Name)
 	case "epoch_time_invalid":
-		return fmt.Errorf("%s -> epoch time %d invalid: %s", pod.Name, pod.Epoch().Unix(), aiResponse.Message)
+		return fmt.Errorf("%s -> epoch time %d invalid: %s", pod.Name, pod.Epoch().Unix(), response.Message)
 	case "started_training":
 		pod.AddFlight(flightId, flight)
 		log.Println(fmt.Sprintf("%s -> %s", pod.Name, aurora.BrightCyan("Starting training...")))
 	default:
-		return fmt.Errorf("%s -> failed to verify training has started: %s", pod.Name, aiResponse.Result)
+		return fmt.Errorf("%s -> failed to verify training has started: %s", pod.Name, response.Result)
 	}
 
 	if !aiSingleTrainingRun {
@@ -345,11 +315,20 @@ func SendData(pod *pods.Pod, podState ...*state.State) error {
 
 		csv.WriteString(csvChunk)
 
-		dataUrl := fmt.Sprintf("%s/pods/%s/data", aiServerUrl, pod.Name)
+		addDataRequest := &aiengine_pb.AddDataRequest{
+			Pod:     pod.Name,
+			CsvData: csv.String(),
+		}
 
-		_, err = HttpClient.Post(dataUrl, "text/plain; charset=utf-8", bytes.NewBufferString(csv.String()))
+		ctx, cancel := go_context.WithTimeout(go_context.Background(), time.Second)
+		defer cancel()
+		response, err := aiengineClient.AddData(ctx, addDataRequest)
 		if err != nil {
 			return fmt.Errorf("failed to post new data to pod %s: %w", pod.Name, err)
+		}
+
+		if response.Error {
+			return fmt.Errorf("failed to post new data to pod %s: %s", pod.Name, response.Result)
 		}
 
 		s.Sent()
@@ -358,52 +337,24 @@ func SendData(pod *pods.Pod, podState ...*state.State) error {
 	return err
 }
 
-func LoadInferencing(pod *pods.Pod, tag string) error {
-	if tag == "" {
-		tag = "latest"
-	}
-
-	url := fmt.Sprintf("%s/pods/%s/models/%s/load", aiServerUrl, pod.Name, tag)
-	response, err := http.Post(url, "application/yaml", nil)
-	if err != nil {
-		return err
-	}
-
-	if response.StatusCode == 404 {
-		return nil
-	} else if response.StatusCode != 200 {
-		log.Printf("Error: Failed to load model %d", response.StatusCode)
-		return errors.New("unable to reload model after training")
-	}
-
-	return nil
-}
-
-func Infer(pod string, tag string) ([]byte, error) {
+func Infer(pod string, tag string) (*aiengine_pb.InferenceResult, error) {
 	if !ServerReady() {
 		return nil, fmt.Errorf("not ready")
 	}
 
-	url := fmt.Sprintf("%s/pods/%s/models/%s/inference", aiServerUrl, pod, tag)
-
-	if retryClient == nil {
-		retryableClient := retryablehttp.NewClient()
-		retryableClient.RetryMax = 3
-
-		retryClient = retryableClient.StandardClient()
+	request := &aiengine_pb.InferenceRequest{
+		Pod: pod,
+		Tag: tag,
 	}
 
-	response, err := retryClient.Get(url)
+	ctx, cancel := go_context.WithTimeout(go_context.Background(), time.Second)
+	defer cancel()
+	response, err := aiengineClient.GetInference(ctx, request)
 	if err != nil {
 		return nil, err
 	}
 
-	body, err := ioutil.ReadAll(response.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	return body, nil
+	return response, nil
 }
 
 func waitForServerHealthy(maxAttempts int) int {
@@ -432,13 +383,13 @@ func waitForServerHealthy(maxAttempts int) int {
 	return attemptCount
 }
 
-func getPodInitForTraining(pod *pods.Pod) *spec.PodInitSpec {
+func getPodInitForTraining(pod *pods.Pod) *aiengine_pb.InitRequest {
 	fields := make(map[string]float64)
 
 	globalActions := pod.Actions()
 	var laws []string
 
-	var dsInitSpecs []spec.DataSourceInitSpec
+	var dsInitSpecs []*aiengine_pb.DataSource
 	for _, ds := range pod.DataSources() {
 		for fqField, fqFieldInitializer := range ds.Fields() {
 			fieldName := strings.ReplaceAll(fqField, ".", "_")
@@ -457,18 +408,21 @@ func getPodInitForTraining(pod *pods.Pod) *spec.PodInitSpec {
 			laws = append(laws, strings.ReplaceAll(law, ".", "_"))
 		}
 
-		dsInitSpec := spec.DataSourceInitSpec{
+		dsInitSpec := aiengine_pb.DataSource{
 			Actions: dsActions,
 		}
 		if ds.DataSourceSpec.Data != nil {
-			dsInitSpec.Connector = ds.DataSourceSpec.Data.Connector
+			dsInitSpec.Connector = &aiengine_pb.DataConnector{
+				Name:   ds.DataSourceSpec.Data.Connector.Name,
+				Params: ds.DataSourceSpec.Data.Connector.Params,
+			}
 		} else {
-			dsInitSpec.Connector = spec.DataConnectorSpec{
+			dsInitSpec.Connector = &aiengine_pb.DataConnector{
 				Name: "localstate",
 			}
 		}
 
-		dsInitSpecs = append(dsInitSpecs, dsInitSpec)
+		dsInitSpecs = append(dsInitSpecs, &dsInitSpec)
 	}
 
 	var rewardInit *string
@@ -496,12 +450,13 @@ func getPodInitForTraining(pod *pods.Pod) *spec.PodInitSpec {
 
 	epoch := pod.Epoch().Unix()
 
-	podInit := spec.PodInitSpec{
-		EpochTime:   &epoch,
+	podInit := aiengine_pb.InitRequest{
+		Pod:         pod.Name,
+		EpochTime:   epoch,
 		Period:      int64(pod.Period().Seconds()),
-		Interval:    int(pod.Interval().Seconds()),
-		Granularity: int(pod.Granularity().Seconds()),
-		DataSources: dsInitSpecs,
+		Interval:    int64(pod.Interval().Seconds()),
+		Granularity: int64(pod.Granularity().Seconds()),
+		Datasources: dsInitSpecs,
 		Fields:      fields,
 		Actions:     globalActionRewards,
 		Laws:        laws,
@@ -518,4 +473,8 @@ func isTestEnvironment() bool {
 	}
 
 	return false
+}
+
+func SetAIEngineClient(newClient AIEngineClient) {
+	aiengineClient = newClient
 }

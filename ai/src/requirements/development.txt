@@ -1,0 +1,5 @@
+# Specifies only dev-specific requirements
+-r common.txt
+jupyter-client==6.1.12
+jupyter-core==4.7.1
+grpcio-tools==1.39.0

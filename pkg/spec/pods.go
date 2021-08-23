@@ -1,16 +1,5 @@
 package spec
 
-type PodInitSpec struct {
-	EpochTime   *int64               `json:"epoch_time,omitempty"`
-	Period      int64                `json:"period"`
-	Interval    int                  `json:"interval"`
-	Granularity int                  `json:"granularity"`
-	DataSources []DataSourceInitSpec `json:"datasources"`
-	Fields      map[string]float64   `json:"fields"`
-	Actions     map[string]string    `json:"actions"`
-	Laws        []string             `json:"laws"`
-}
-
 type PodSpec struct {
 	Name        string            `json:"name,omitempty" yaml:"name,omitempty" mapstructure:"name,omitempty"`
 	Params      map[string]string `json:"params,omitempty" yaml:"params,omitempty" mapstructure:"params,omitempty"`
