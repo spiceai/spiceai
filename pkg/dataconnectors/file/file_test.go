@@ -23,6 +23,7 @@ func TestFileConnector(t *testing.T) {
 
 		t.Run(fmt.Sprintf("Init() - %s", fileToTest), testInitFunc(params))
 		t.Run(fmt.Sprintf("FetchData() - %s", fileToTest), testFetchDataFunc(params))
+		t.Run(fmt.Sprintf("FetchData() twice - %s", fileToTest), testFetchDataTwiceFunc(params))
 	}
 }
 
@@ -46,5 +47,24 @@ func testFetchDataFunc(params map[string]string) func(*testing.T) {
 		assert.NoError(t, err)
 
 		snapshotter.SnapshotT(t, string(data))
+	}
+}
+
+func testFetchDataTwiceFunc(params map[string]string) func(*testing.T) {
+	c := file.NewFileConnector()
+
+	return func(t *testing.T) {
+		err := c.Init(params)
+		assert.NoError(t, err)
+
+		data, err := c.FetchData(time.Unix(1605312000, 0), time.Hour*24*365*10, time.Minute*1)
+		assert.NoError(t, err)
+
+		snapshotter.SnapshotT(t, string(data))
+
+		data2, err := c.FetchData(time.Unix(1605312000, 0), time.Hour*24*365*10, time.Minute*1)
+		assert.NoError(t, err)
+
+		snapshotter.SnapshotT(t, string(data2))
 	}
 }

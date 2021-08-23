@@ -42,9 +42,9 @@ func (c *FileConnector) Init(params map[string]string) error {
 	c.path = path
 	c.noWatch = params["watch"] != "true"
 
-	_, err := os.Stat(c.path)
+	newFileInfo, err := os.Stat(c.path)
 	if err == nil {
-		_, err := c.loadFileData()
+		_, err := c.loadFileData(newFileInfo)
 		if err != nil {
 			return err
 		}
@@ -58,40 +58,40 @@ func (c *FileConnector) Init(params map[string]string) error {
 }
 
 func (c *FileConnector) FetchData(epoch time.Time, period time.Duration, interval time.Duration) ([]byte, error) {
-	return c.loadFileData()
-}
-
-func (c *FileConnector) loadFileData() ([]byte, error) {
-	log.Printf("loading file '%s' ...", c.path)
-
 	c.dataMutex.Lock()
 	defer c.dataMutex.Unlock()
-
-	loadStartTime := time.Now()
 
 	newFileInfo, err := os.Stat(c.path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open file '%s': %w", c.path, err)
 	}
 
+	if c.fileInfo == nil || newFileInfo.ModTime().After(c.fileInfo.ModTime()) {
+		// Only load file if it's changed since last read
+		return c.loadFileData(newFileInfo)
+	}
+
+	return c.data, nil
+}
+
+func (c *FileConnector) loadFileData(newFileInfo fs.FileInfo) ([]byte, error) {
+	log.Printf("loading file '%s' ...", c.path)
+
+	loadStartTime := time.Now()
+
 	fileData, err := ioutil.ReadFile(c.path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open file '%s': %w", c.path, err)
 	}
 
-	if len(fileData) == 0 {
-		// Nothing to read
-		return nil, nil
-	}
-
-	c.fileInfo = newFileInfo
 	c.data = fileData
+	c.fileInfo = newFileInfo
 
 	duration := time.Since(loadStartTime)
 
 	log.Println(aurora.Green(fmt.Sprintf("loaded file '%s' in %.2f seconds ...", filepath.Base(c.path), duration.Seconds())))
 
-	return c.data, nil
+	return fileData, nil
 }
 
 func (c *FileConnector) watchPath() {
@@ -111,7 +111,7 @@ func (c *FileConnector) watchPath() {
 		for {
 			select {
 			case event := <-watcher.Events:
-				err := c.processWatchNotifyEvent(event)
+				err := c.processWatchNotifyEvent(event, c.path)
 				if err != nil {
 					log.Println(fmt.Errorf("error processing '%s' event %s: %w", c.path, event, err))
 				}
@@ -122,18 +122,24 @@ func (c *FileConnector) watchPath() {
 	}()
 }
 
-func (c *FileConnector) processWatchNotifyEvent(event fsnotify.Event) error {
+func (c *FileConnector) processWatchNotifyEvent(event fsnotify.Event, path string) error {
 	switch event.Op {
 	case fsnotify.Create:
 		fallthrough
 	case fsnotify.Write:
-		_, err := c.loadFileData()
+		file := filepath.Join(path, event.Name)
+		newFileInfo, err := os.Stat(file)
+		if err != nil {
+			return fmt.Errorf("failed to open file '%s': %w", file, err)
+		}
+		_, err = c.loadFileData(newFileInfo)
 		if err != nil {
 			return err
 		}
 	case fsnotify.Remove:
 		c.dataMutex.Lock()
 		defer c.dataMutex.Unlock()
+		c.fileInfo = nil
 		c.data = nil
 	}
 

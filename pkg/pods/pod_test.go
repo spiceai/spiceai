@@ -47,11 +47,11 @@ func testBasePropertiesFunc(pod *Pod) func(*testing.T) {
 
 		switch pod.Name {
 		case "trader":
-			expected = "406b3108ae48fe5fc73aea9171daed6d"
+			expected = "abde6a467f8e99e468d1766a47ec3822"
 		case "trader-infer":
-			expected = "54dd4e787c975f6149180d5974a091e3"
+			expected = "6c1841e198a8228448f606667b5405e5"
 		case "cartpole-v1":
-			expected = "aec667e29a1ab877cad4a541d895426a"
+			expected = "12e235c7c3d281bf5c30025dd86a1814"
 		}
 
 		assert.Equal(t, expected, actual, "invalid pod.Hash()")

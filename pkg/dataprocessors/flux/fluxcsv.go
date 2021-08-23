@@ -3,6 +3,7 @@ package flux
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"github.com/spiceai/spice/pkg/loggers"
 	"github.com/spiceai/spice/pkg/observations"
 	"github.com/spiceai/spice/pkg/state"
+	"github.com/spiceai/spice/pkg/util"
 	"go.uber.org/zap"
 )
 
@@ -26,6 +28,7 @@ const (
 type FluxCsvProcessor struct {
 	data      []byte
 	dataMutex sync.RWMutex
+	dataHash  []byte
 }
 
 func NewFluxCsvProcessor() *FluxCsvProcessor {
@@ -40,14 +43,23 @@ func (p *FluxCsvProcessor) OnData(data []byte) ([]byte, error) {
 	p.dataMutex.Lock()
 	defer p.dataMutex.Unlock()
 
-	p.data = data
+	newDataHash, err := util.ComputeNewHash(p.data, p.dataHash, data)
+	if err != nil {
+		return nil, fmt.Errorf("error computing new data hash in %s processor: %w", FluxCsvProcessorName, err)
+	}
+
+	if newDataHash != nil {
+		// Only update data if new
+		p.data = data
+		p.dataHash = newDataHash
+	}
 
 	return data, nil
 }
 
 func (p *FluxCsvProcessor) GetObservations() ([]observations.Observation, error) {
-	p.dataMutex.RLock()
-	defer p.dataMutex.RUnlock()
+	p.dataMutex.Lock()
+	defer p.dataMutex.Unlock()
 
 	if len(p.data) == 0 {
 		return nil, nil
@@ -149,9 +161,12 @@ func (p *FluxCsvProcessor) GetObservations() ([]observations.Observation, error)
 		return nil, err
 	}
 
+	p.data = nil
+
 	return newObservations, nil
 }
 
 func (p *FluxCsvProcessor) GetState(validFields *[]string) ([]*state.State, error) {
+	// TODO
 	return nil, nil
 }
