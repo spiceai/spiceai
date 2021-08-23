@@ -83,7 +83,7 @@ export PATH="$HOME/.spice/bin:$PATH"
 You can also add to your `.bashrc`
 
 ```bash
-cat "export PATH="$HOME/.spice/bin:$PATH"" >> ~/.bashrc
+cat "export PATH="$HOME/.spice/bin:$PATH" >> ~/.bashrc
 ```
 
 ### Getting started with Codespaces
