@@ -13,9 +13,9 @@ Spice AI is an open source runtime and distribution system for time series AI bu
 
 ---
 
-Welcome and thank you for your engagement in Spice AI early development with our Developer Preview.
+Welcome to the Spice AI Developer Preview and thank you for your engagement in early Spice AI development.
 
-Our intention with this preview is to work with developers early to co-define and co-develop the developer experience aligning to the goal of making AI easy for developers. 🚀 Thus, due to the stage of development and as we focus, there are currently several [limitations](https://github.com/spiceai/spiceai/docs/ROADMAP.md#current-limitations) on the general [Roadmap to v1.0-stable](https://github.com/spiceai/spiceai/docs/ROADMAP.md#spice-ai-1.0-stable-roadmap).
+Our intention with this preview is to work with developers early to co-define and co-develop the developer experience, aligning to the goal of making AI easy for developers. 🚀 Thus, due to the stage of development and as we focus, there are currently several [limitations](https://github.com/spiceai/spiceai/blob/trunk/docs/ROADMAP.md#current-limitations) on the general [Roadmap to v1.0-stable](https://github.com/spiceai/spiceai/blob/trunk/docs/ROADMAP.md#spice-ai-v10-stable-roadmap).
 
 We greatly appreciate and value your feedback. Please feel free to [file an issue](https://github.com/spiceai/spiceai/issues/new) and get in touch with the team through [Discord](https://discord.com/channels/803820740868571196/803820740868571199) or by sending us mail at [team@spiceai.io](mailto:team@spiceai.io).
 
@@ -23,15 +23,19 @@ Thank you for sharing this journey with us! 🙏
 
 ## Getting started with Spice AI
 
-Follow this guide to get started quickly with Spice AI. For a more comphrehensive getting started guide, see the full [online documentation](https://laughing-doodle-19648c61.pages.github.io/).
+Follow this guide to get started quickly with Spice AI. For a more comphrehensive getting started guide, see the full [online documentation](https://crispy-dollop-c329115a.pages.github.io/#/).
+
+### Current Limitations
+
+- Running in Docker is required. We will support a baremetal experience at launch.
+- Only macOS and Linux are natively supported. [WSL 2](https://docs.microsoft.com/en-us/windows/wsl/install-win10) is required for Windows.
+- arm64 is not yet supported (i.e. Apple's M1 Macs). We use M1s ourselves, so we hope to support this very soon :-)
 
 ### Prerequisites (Developer Preview only)
 
-- Currently, only macOS and Linux are natively supported. [WSL 2](https://docs.microsoft.com/en-us/windows/wsl/install-win10) is required for Windows.
-- arm64 is not yet supported (i.e. Apple's M1 Macs). We use M1s ourselves, so we hope to support this very soon :-)
+We highly recommend using [GitHub Codespaces](https://github.com/features/codespaces) to get started. Codespaces enables you to run Spice AI in a virtual environment in the cloud. If you use Codespaces, the following prerequisites are not required and you may skip to the [Getting Started with Codespaces](https://github.com/spiceai/spiceai#getting-started-with-codespaces) section.
 
-- Currently, only macOS and Linux are natively supported. [WSL 2](https://docs.microsoft.com/en-us/windows/wsl/install-win10) is required for Windows.
-- arm64 is not yet supported (i.e. Apple's M1 Macs). We use M1s ourselves, so we hope to support this very soon :-)
+To continue with installation on your local machine, follow these steps:
 
 1. Install Docker
 2. Generate and export a GitHub PAT
@@ -54,14 +58,20 @@ Add the token to an environment variable named SPICE_GH_TOKEN:
 export SPICE_GH_TOKEN=<your token>
 ```
 
-You may want to add to your terminal configuration, E.g. `.bashrc` or `.zshrc`.
+You will need to set the SPICE_GH_TOKEN in each terminal you use, so you may want to add to your terminal configuration, E.g. `.bashrc` or `.zshrc`. You can manually edit the file or use a command like:
 
-### Installation
+```bash
+cat "export SPICE_GH_TOKEN=<your token>" >> ~/.bashrc
+```
+
+These steps won't be required after public release.
+
+### Installation (local machine)
 
 Install the Spice CLI by running the following `curl` command in your terminal.
 
 ```bash
-curl https://raw.githubusercontent.com/spiceai/spiceai/trunk/install/install.sh\?token\=AAATSLRBS4STDET7UCNWQFDBFQ7E2 | /bin/bash
+curl https://raw.githubusercontent.com/spiceai/spiceai/trunk/install/install.sh\?token\=AAATSLSSFWUX6ZVJ6LZI4XDBFRYHC | /bin/bash
 ```
 
 The installation path is not currently added to your PATH, so we recommend to add it manually with the following command which you may want to add to your terminal configuration, E.g. `.bashrc` or `.zshrc`. This step won't be required after public release.
@@ -70,11 +80,32 @@ The installation path is not currently added to your PATH, so we recommend to ad
 export PATH="$HOME/.spice/bin:$PATH"
 ```
 
+You can also add to your `.bashrc`
+
+```bash
+cat "export PATH="$HOME/.spice/bin:$PATH" >> ~/.bashrc
+```
+
+### Getting started with Codespaces
+
+The recommended way to get started with Spice AI is to use GitHub Codespaces.
+
+Create a new GitHub Codespace in the `spiceai/quickstarts` repo at [github.com/spiceai/quickstarts/codespaces](https://github.com/spiceai/quickstarts/codespaces).
+
+<img src="https://user-images.githubusercontent.com/80174/130397022-e882fc26-06fd-49da-ae35-03383221c63d.png" width="300">
+
+Once you open the Codespace, Spice AI and everything you need to get started will already be installed. You may continue on below.
+
 ### Create your first Spice AI Pod and train it
 
-A [Spice AI Pod](https://laughing-doodle-19648c61.pages.github.io/#/Concepts?id=pod) is simply a collection of configuration and data that you use to train and deploy your own AI.
+A [Spice AI Pod](https://crispy-dollop-c329115a.pages.github.io/#/concepts/README?id=pod-pod-manifest) is simply a collection of configuration and data that you use to train and deploy your own AI.
 
-The first Spice AI Pod you will create and train is based off an [Open AI gym](https://gym.openai.com/) example called [CartPole-v1](https://gym.openai.com/envs/CartPole-v1/).
+The first Spice AI Pod you will create and train is based off an [Open AI gym](https://gym.openai.com/) example called [CartPole-v1](https://gym.openai.com/envs/CartPole-v1/). Open AI describes CartPole as:
+
+>A pole is attached by an un-actuated joint to a cart, which moves along a frictionless track. The system is controlled by applying a force of +1 or -1 to the cart. The pendulum starts upright, and the goal is to prevent it from falling over. A reward of +1 is provided for every timestep that the pole remains upright. The episode ends when the pole is more than 15 degrees from vertical, or the cart moves more than 2.4 units from the center.
+Source: https://gym.openai.com/envs/CartPole-v1/
+
+We will use Spice AI to train a pod that can play the game.
 
 Create a directory for the CartPole where you would normally put your code. E.g.
 
@@ -87,11 +118,11 @@ cd cartpole
 In a new terminal window or tab, navigate to the directory and start the Spice runtime in development mode with `spice run`.
 
 ```bash
-cd $HOME\cartpole
+cd $HOME/cartpole
 spice run
 ```
 
-In the original terminal instance, add the CartPole-v1 sample:
+In the original terminal instance, add the CartPole-v1 sample pod:
 
 ```bash
 spice pod add samples/CartPole-v1
@@ -99,11 +130,13 @@ spice pod add samples/CartPole-v1
 
 The Spice CLI will download the CartPole-v1 sample pod manifest and add it to your project at `.spice/pods/cartpole-v1.yaml`.
 
-The Spice Runtime will automatically detect the manifest and start your first training run!
+The Spice runtime will then automatically detect the manifest and start your first training run!
+
+> Note, automatic training relies on your system's filewatcher. In some cases, this might be disabled or not work as expected, especially when using containers. If training does not start, follow the command to [retrain your pod](https://github.com/spiceai/spiceai#retrain-your-pod) below.
 
 ### Observe your pod training
 
-Navigate to [http://localhost:8000](http://localhost:8000) in your favorite browser. You will see an overview of your pods. From here, you can click on `cartpole-v1` Pod to see a chart of your training progress.
+Navigate to [http://localhost:8000](http://localhost:8000) in your favorite browser. You will see an overview of your pods. From here, you can click on the `cartpole-v1` pod to see a chart of the pod's training progress.
 
 ### Retrain your pod
 
@@ -125,15 +158,16 @@ curl http://localhost:8000/api/v0.1/pods/cartpole-v1/inference
 
 Congratulations! In just a few minutes you downloaded and installed the Spice AI CLI and runtime, created your first Spice AI Pod, trained it, and got a recommendation from it.
 
-This is just the start of your journey with AI. Next try one of the quickstart tutorials for creating intelligent applications with Spice AI.
+This is just the start of your journey with AI. Next, try one of the quickstart tutorials for creating intelligent applications with Spice AI.
 
 **Quickstarts:**
 
+- [Log Pruner](https://github.com/spiceai/quickstarts/tree/trunk/log-pruner) - a CPU load based log pruner
 - [Trader](https://github.com/spiceai/quickstarts/tree/trunk/trader) - a basic Bitcoin trading bot
 
 **Kubernetes:**
 
-Spice AI integrates with your Kubernetes hosted apps! Try out the [Kubernetes sample](https://github.com/spiceai/samples/tree/trunk/kubernetes) for yourself.
+Spice AI can be deployed to Kubernetes! Try out the [Kubernetes sample](https://github.com/spiceai/samples/tree/trunk/kubernetes).
 
 ## Community
 
