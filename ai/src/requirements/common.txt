@@ -52,7 +52,7 @@ Pillow==8.2.0
 pluggy==0.13.1
 prompt-toolkit==3.0.18
 protobuf==3.17.3
-psutil=5.8.0
+psutil==5.8.0
 ptyprocess==0.7.0
 py==1.10.0
 pyasn1==0.4.8
