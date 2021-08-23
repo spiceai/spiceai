@@ -298,9 +298,9 @@ func (server *server) Start() error {
 	}
 
 	r.GET("/", dashboardServer.IndexHandler)
-	r.GET("/js/{file}", dashboardServer.JsHandler)
-	r.GET("/css/{file}", dashboardServer.CssHandler)
-	r.GET("/media/{file}", dashboardServer.SvgHandler)
+	r.GET("/static/js/{file}", dashboardServer.JsHandler)
+	r.GET("/static/css/{file}", dashboardServer.CssHandler)
+	r.GET("/static/media/{file}", dashboardServer.SvgHandler)
 
 	// Pods
 	r.GET("/api/v0.1/pods", apiPodsHandler)
@@ -316,8 +316,17 @@ func (server *server) Start() error {
 	r.GET("/api/v0.1/pods/{pod}/flights/{flight}", apiGetFlightHandler)
 	r.POST("/api/v0.1/pods/{pod}/flights/{flight}/episodes", apiPostFlightEpisodeHandler)
 
+	serverLogger, err := zap.NewStdLogAt(zaplog, zap.DebugLevel)
+	if err != nil {
+		return fmt.Errorf("failed to initialize logger: %w", err)
+	}
+	fastServer := &fasthttp.Server{
+		Handler: r.Handler,
+		Logger:  serverLogger,
+	}
+
 	go func() {
-		log.Fatal(fasthttp.ListenAndServe(fmt.Sprintf(":%d", server.config.Port), r.Handler))
+		log.Fatal(fastServer.ListenAndServe(fmt.Sprintf(":%d", server.config.Port)))
 	}()
 
 	return nil
