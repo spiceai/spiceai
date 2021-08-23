@@ -5,7 +5,6 @@ import tensorflow as tf
 import threading
 from psutil import Process
 import os
-from time import sleep
 from algorithms.factory import get_agent
 from algorithms.agent_interface import SpiceAIAgent
 from data import DataManager
