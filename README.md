@@ -13,9 +13,9 @@ Spice AI is an open source runtime and distribution system for time series AI bu
 
 ---
 
-Welcome to the Spice AI Developer Preview and thank you for your engagement early Spice AI development.
+Welcome to the Spice AI Developer Preview and thank you for your engagement in early Spice AI development.
 
-Our intention with this preview is to work with developers early to co-define and co-develop the developer experience aligning to the goal of making AI easy for developers. 🚀 Thus, due to the stage of development and as we focus, there are currently several [limitations](https://github.com/spiceai/spiceai/docs/ROADMAP.md#current-limitations) on the general [Roadmap to v1.0-stable](https://github.com/spiceai/spiceai/docs/ROADMAP.md#spice-ai-1.0-stable-roadmap).
+Our intention with this preview is to work with developers early to co-define and co-develop the developer experience, aligning to the goal of making AI easy for developers. 🚀 Thus, due to the stage of development and as we focus, there are currently several [limitations](https://github.com/spiceai/spiceai/blob/trunk/docs/ROADMAP.md#current-limitations) on the general [Roadmap to v1.0-stable](https://github.com/spiceai/spiceai/blob/trunk/docs/ROADMAP.md#spice-ai-v10-stable-roadmap).
 
 We greatly appreciate and value your feedback. Please feel free to [file an issue](https://github.com/spiceai/spiceai/issues/new) and get in touch with the team through [Discord](https://discord.com/channels/803820740868571196/803820740868571199) or by sending us mail at [team@spiceai.io](mailto:team@spiceai.io).
 
@@ -33,7 +33,7 @@ Follow this guide to get started quickly with Spice AI. For a more comphrehensiv
 
 ### Prerequisites (Developer Preview only)
 
-We highly recommend using [GitHub Codespaces](https://github.com/features/codespaces) to get started. Codespaces enables you to run Spice AI in a virtual environment in the cloud. If you use Codespaces, the following prerequistics are not required and you may skip to the [Getting Started with Codespaces](https://github.com/spiceai/spiceai#getting-started-with-codespaces) section.
+We highly recommend using [GitHub Codespaces](https://github.com/features/codespaces) to get started. Codespaces enables you to run Spice AI in a virtual environment in the cloud. If you use Codespaces, the following prerequisites are not required and you may skip to the [Getting Started with Codespaces](https://github.com/spiceai/spiceai#getting-started-with-codespaces) section.
 
 To continue with installation on your local machine, follow these steps:
 
@@ -118,7 +118,7 @@ cd cartpole
 In a new terminal window or tab, navigate to the directory and start the Spice runtime in development mode with `spice run`.
 
 ```bash
-cd $HOME\cartpole
+cd $HOME/cartpole
 spice run
 ```
 
@@ -130,7 +130,7 @@ spice pod add samples/CartPole-v1
 
 The Spice CLI will download the CartPole-v1 sample pod manifest and add it to your project at `.spice/pods/cartpole-v1.yaml`.
 
-The Spice Runtime will then automatically detect the manifest and start your first training run!
+The Spice runtime will then automatically detect the manifest and start your first training run!
 
 > Note, automatic training relies on your system's filewatcher. In some cases, this might be disabled or not work as expected, especially when using containers. If training does not start, follow the command to [retrain your pod](https://github.com/spiceai/spiceai#retrain-your-pod) below.
 
@@ -158,7 +158,7 @@ curl http://localhost:8000/api/v0.1/pods/cartpole-v1/inference
 
 Congratulations! In just a few minutes you downloaded and installed the Spice AI CLI and runtime, created your first Spice AI Pod, trained it, and got a recommendation from it.
 
-This is just the start of your journey with AI. Next try one of the quickstart tutorials for creating intelligent applications with Spice AI.
+This is just the start of your journey with AI. Next, try one of the quickstart tutorials for creating intelligent applications with Spice AI.
 
 **Quickstarts:**
 
