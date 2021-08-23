@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	influxdb2 "github.com/influxdata/influxdb-client-go"
@@ -21,10 +22,15 @@ type InfluxDbConnector struct {
 	bucket      string
 	field       string
 	measurement string
+	lastFetchPeriodEnd time.Time
+	data        []byte
+	dataMutex sync.RWMutex
 }
 
 func NewInfluxDbConnector() *InfluxDbConnector {
-	return &InfluxDbConnector{}
+	return &InfluxDbConnector{
+		dataMutex: sync.RWMutex{},
+	}
 }
 
 func (c *InfluxDbConnector) Init(params map[string]string) error {
@@ -64,8 +70,21 @@ func (c *InfluxDbConnector) Init(params map[string]string) error {
 }
 
 func (c *InfluxDbConnector) FetchData(epoch time.Time, period time.Duration, interval time.Duration) ([]byte, error) {
-	periodStart := epoch.Format(time.RFC3339)
-	periodEnd := epoch.Add(period).Format(time.RFC3339)
+	c.dataMutex.Lock()
+	defer c.dataMutex.Unlock()
+
+	periodStart := epoch
+	periodEnd := epoch.Add(period)
+
+	if !c.lastFetchPeriodEnd.IsZero() && c.lastFetchPeriodEnd.After(epoch) {
+		// If we've already fetched, only fetch the difference with an interval overlap
+		periodStart = c.lastFetchPeriodEnd.Add(-interval)
+	}
+
+	if periodStart == periodEnd || periodStart.After(periodEnd) {
+		// No new data to fetch
+		return c.data, nil
+	}
 
 	intervalStr := fmt.Sprintf("%ds", int64(interval.Seconds()))
 
@@ -75,7 +94,7 @@ func (c *InfluxDbConnector) FetchData(epoch time.Time, period time.Duration, int
 		filter(fn: (r) => r["_measurement"] == "%s") |>
 		filter(fn: (r) => r["_field"] == "%s") |>
 		aggregateWindow(every: %s, fn: mean, createEmpty: false)
-    `, c.bucket, periodStart, periodEnd, c.measurement, c.field, intervalStr)
+    `, c.bucket, periodStart.Format(time.RFC3339), periodEnd.Format(time.RFC3339), c.measurement, c.field, intervalStr)
 
 	header := true
 	annotations := []domain.DialectAnnotations{"group", "datatype", "default"}
@@ -92,5 +111,10 @@ func (c *InfluxDbConnector) FetchData(epoch time.Time, period time.Duration, int
 		return nil, err
 	}
 
-	return []byte(result), nil
+	data := []byte(result)
+
+	c.data = data
+	c.lastFetchPeriodEnd = periodEnd
+
+	return data, nil
 }
