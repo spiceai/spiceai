@@ -4,29 +4,35 @@ PROTOC ?=protoc
 # Target: all                                                                 #
 ################################################################################
 .PHONY: all
-all:
-	docker build -t ghcr.io/spiceai/spiced:dev -f docker/Dockerfile .
-
-.PHONY: push
-push:
-	docker push ghcr.io/spiceai/spiced:dev
-
-.PHONY: test
-test:
-	go vet ./...
-	go test ./...
-	cd ai/src && make test
+all: build docker
 
 .PHONY: build
 build:
+	pushd dashboard && yarn build && cp -rf build ../pkg/dashboard/ && popd
 	pushd cmd/spice && go build . && popd
 	pushd cmd/spiced && go build . && popd
 
 .PHONY: lint
 lint:
-	go vet ./...
+	pushd dashboard && yarn lint && popd
 	black --check --extend-exclude proto ai/src
-	golangci-lint run
+	go vet ./...
+	golangci-lint run	
+
+.PHONY: test
+test:
+	pushd dashboard && yarn test-ci && popd
+	cd ai/src && make test
+	go vet ./...
+	go test ./...
+
+.PHONY: docker
+docker:
+	docker build -t ghcr.io/spiceai/spiced:dev -f docker/Dockerfile .
+
+.PHONY: push
+push:
+	docker push ghcr.io/spiceai/spiced:dev
 
 ################################################################################
 # Target: modtidy                                                              #

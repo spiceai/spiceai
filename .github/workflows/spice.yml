@@ -53,6 +53,10 @@ jobs:
         with:
           go-version: ${{ env.GOVER }}
 
+      - name: Build and copy dashboard
+        run: make
+        working-directory: dashboard
+
       - name: Build spice
         run: make
         working-directory: cmd/spice
@@ -101,7 +105,7 @@ jobs:
             target_os: linux
           - os: macOS-latest
             target_os: darwin
-    
+
     runs-on: ubuntu-latest
     steps:
       - name: Check out code into the Go module directory

@@ -53,6 +53,10 @@ jobs:
         with:
           go-version: ${{ env.GOVER }}
 
+      - name: Build and copy dashboard
+        working-directory: dashboard
+        run: make
+
       - name: go vet
         run: go vet ./...
 

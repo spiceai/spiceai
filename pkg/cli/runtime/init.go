@@ -25,7 +25,8 @@ const (
 
 // Init installs Spice on a local machine using the supplied runtimeVersion.
 func Init(cliContext context.RuntimeContext) error {
-	githubClient = github.NewGitHubClient(runtimeOwner, runtimeRepo, "")
+	githubToken := github.GetGitHubTokenFromEnv()
+	githubClient = github.NewGitHubClient(runtimeOwner, runtimeRepo, githubToken)
 
 	switch cliContext {
 	case context.Docker:

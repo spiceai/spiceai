@@ -1,0 +1,74 @@
+{
+  "name": "spice.ai-dashboard",
+  "version": "0.1.0",
+  "license": "Apache-2.0",
+  "private": true,
+  "dependencies": {
+    "@testing-library/dom": "^8.1.0",
+    "@testing-library/jest-dom": "^5.11.4",
+    "@testing-library/react": "^11.1.0",
+    "@testing-library/user-event": "^12.1.10",
+    "@types/jest": "^26.0.15",
+    "@types/node": "^12.0.0",
+    "@types/react": "^17.0.0",
+    "@types/react-dom": "^17.0.0",
+    "@types/react-router-dom": "^5.1.8",
+    "@types/react-sparklines": "^1.7.1",
+    "autoprefixer": "^10.3.1",
+    "chart.js": "^3.5.1",
+    "chokidar": "^3.5.2",
+    "chokidar-cli": "^3.0.0",
+    "postcss": "^8.3.6",
+    "react": "^17.0.2",
+    "react-dom": "^17.0.2",
+    "react-router-dom": "^5.2.0",
+    "react-scripts": "4.0.3",
+    "react-sparklines": "^1.7.0",
+    "swr": "^0.5.6",
+    "tailwindcss": "^2.2.7",
+    "typescript": "^4.3.5",
+    "web-vitals": "^1.0.1",
+    "yarn-run-all": "^3.1.1"
+  },
+  "devDependencies": {
+    "@typescript-eslint/eslint-plugin": "^4.29.2",
+    "@typescript-eslint/parser": "^4.29.2",
+    "eslint": "^7.32.0",
+    "eslint-config-prettier": "8.3.0",
+    "eslint-plugin-prettier": "3.4.0",
+    "eslint-plugin-react": "^7.24.0",
+    "prettier": "2.3.2"
+  },
+  "scripts": {
+    "build:tailwind": "tailwind build -i src/tailwind.css -o src/tailwind.output.css",
+    "watch:tailwind": "chokidar 'src/**/*.css' 'src/**/*.scss' 'tailwind.config.js' --ignore src/tailwind.output.css -c 'yarn build:tailwind'",
+    "start": "npm-run-all build:tailwind --parallel watch:tailwind start:react",
+    "start:react": "react-scripts start",
+    "prebuild": "run-s build:tailwind",
+    "build": "react-scripts build",
+    "lint": "eslint . --ext .js,.jsx,.ts,.tsx",
+    "lint-fix": "yarn run lint --fix",
+    "test": "react-scripts test",
+    "test-ci": "react-scripts test --watchAll=false",
+    "tsc": "tsc"
+  },
+  "eslintConfig": {
+    "extends": [
+      "react-app",
+      "react-app/jest"
+    ]
+  },
+  "browserslist": {
+    "production": [
+      ">0.2%",
+      "not dead",
+      "not op_mini all"
+    ],
+    "development": [
+      "last 1 chrome version",
+      "last 1 firefox version",
+      "last 1 safari version"
+    ]
+  },
+  "proxy": "http://localhost:8000"
+}
