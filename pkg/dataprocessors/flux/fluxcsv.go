@@ -13,6 +13,7 @@ import (
 	"github.com/spiceai/spice/pkg/loggers"
 	"github.com/spiceai/spice/pkg/observations"
 	"github.com/spiceai/spice/pkg/state"
+	"github.com/spiceai/spice/pkg/util"
 	"go.uber.org/zap"
 )
 
@@ -27,7 +28,7 @@ const (
 type FluxCsvProcessor struct {
 	data      []byte
 	dataMutex sync.RWMutex
-	dataHash	[]byte
+	dataHash  []byte
 }
 
 func NewFluxCsvProcessor() *FluxCsvProcessor {
