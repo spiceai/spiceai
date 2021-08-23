@@ -27,10 +27,12 @@ Follow this guide to get started quickly with Spice AI. For a more comphrehensiv
 
 ### Prerequisites (Developer Preview only)
 
-The developer preview of Spice AI has a few extra requirements that won't be needed for the public release.
+- Currently, only macOS and Linux are natively supported. [WSL 2](https://docs.microsoft.com/en-us/windows/wsl/install-win10) is required for Windows.
+- arm64 is not yet supported (i.e. Apple's M1 Macs). We use M1s ourselves, so we hope to support this very soon :-)
 
-* Currently, only macOS and Linux are natively supported. [WSL 2](https://docs.microsoft.com/en-us/windows/wsl/install-win10) is required for Windows.
-* arm64 is not yet supported (i.e. Apple's M1 Macs). We use M1s ourselves, so we hope to support this very soon :-)
+In addition, the developer preview of Spice AI has a few extra requirements that won't be needed for the public release.
+
+**NOTE**: If you are running in GitHub Codespaces, you can skip these steps and go directly to **Installation**
 
 1. Install Docker
 2. Generate and export a GitHub PAT
@@ -63,7 +65,7 @@ Install the Spice CLI by running the following `curl` command in your terminal.
 curl https://raw.githubusercontent.com/spiceai/spiceai/trunk/install/install.sh\?token\=AAATSLWZERW2BKCY66LS7XLBESSSU | /bin/bash
 ```
 
-The installation path is not currently added to your PATH, so we recommend to add it manually with the following command which you may want to add to your terminal configuration, E.g. `.bashrc` or `.zshrc`.
+The installation path is not currently added to your PATH, so we recommend to add it manually with the following command which you may want to add to your terminal configuration, E.g. `.bashrc` or `.zshrc`. This step won't be required after public release.
 
 ```bash
 export PATH="$HOME/.spice/bin:$PATH"
@@ -102,7 +104,7 @@ The Spice Runtime will automatically detect the manifest and start your first tr
 
 ### Observe your pod training
 
-Navigate to [http://localhost:8000](http://localhost:8000) in your favorite browser.  You will see an overview of your pods. From here, you can click on `cartpole-v1` Pod to see a chart of your training progress.
+Navigate to [http://localhost:8000](http://localhost:8000) in your favorite browser. You will see an overview of your pods. From here, you can click on `cartpole-v1` Pod to see a chart of your training progress.
 
 ### Retrain your pod
 
@@ -128,15 +130,15 @@ This is just the start of your journey with AI. Next try one of the quickstart t
 
 **Quickstarts:**
 
-* [Trader](https://laughing-doodle-19648c61.pages.github.io/#/Samples?id=trader) - a basic Bitcoin trading bot
+- [Trader](https://laughing-doodle-19648c61.pages.github.io/#/Samples?id=trader) - a basic Bitcoin trading bot
 
 ## Community
 
 Spice AI started with the vision to make AI easy for developers. We are building Spice AI in the open and with the community. Reach out on Discord or by email to get involved. We will be starting a community call series soon!
 
-* Discord: [![Discord Banner](https://discord.com/api/guilds/803820740868571196/widget.png?style=shield)](https://discord.com/channels/803820740868571196/803820740868571199)
-* Twitter: [@SpiceAIHQ](https://twitter.com/spiceaihq)
-* Email: [team@spiceai.io](mailto:team@spiceai.io)
+- Discord: [![Discord Banner](https://discord.com/api/guilds/803820740868571196/widget.png?style=shield)](https://discord.com/channels/803820740868571196/803820740868571199)
+- Twitter: [@SpiceAIHQ](https://twitter.com/spiceaihq)
+- Email: [team@spiceai.io](mailto:team@spiceai.io)
 
 ### Contributing to Spice AI
 
