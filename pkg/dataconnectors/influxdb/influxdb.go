@@ -81,8 +81,8 @@ func (c *InfluxDbConnector) FetchData(epoch time.Time, period time.Duration, int
 	annotations := []domain.DialectAnnotations{"group", "datatype", "default"}
 	dateTimeFormat := domain.DialectDateTimeFormatRFC3339
 	dialect := &domain.Dialect{
-		Header: &header,
-		Annotations: &annotations,
+		Header:         &header,
+		Annotations:    &annotations,
 		DateTimeFormat: &dateTimeFormat,
 	}
 

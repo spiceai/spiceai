@@ -1,9 +1,22 @@
+FROM node as dashboard
+
+WORKDIR /build-dashboard
+
+COPY dashboard dashboard/
+
+WORKDIR /build-dashboard/dashboard
+
+RUN yarn install
+RUN yarn build
+
 FROM golang AS build
 
 ARG REL_VERSION
 ENV REL_VERSION=${REL_VERSION:-edge}
 
 WORKDIR /build
+
+COPY --from=dashboard /build-dashboard/dashboard/build /build/pkg/dashboard/build
 
 COPY go.mod go.mod
 COPY go.sum go.sum

@@ -4,6 +4,7 @@
 *.dll
 *.so
 *.dylib
+pkg/dashboard/build
 cmd/spice/spice
 cmd/spice/.spice
 cmd/spice/data

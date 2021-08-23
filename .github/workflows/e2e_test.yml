@@ -40,6 +40,10 @@ jobs:
         with:
           go-version: ${{ env.GOVER }}
 
+      - name: Build and copy dashboard
+        working-directory: dashboard
+        run: make
+
       - name: Build spice
         run: make
         working-directory: cmd/spice
