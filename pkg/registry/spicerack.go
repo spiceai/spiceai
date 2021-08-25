@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	spiceRackBaseUrl string = "http://prod.spicerack.org/api/v0.1" // Will update to https://api.spicerack.org/api/v0.1
+	spiceRackBaseUrl string = "http://api.spicerack.org/api/v0.1"
 )
 
 var (
