@@ -1,9 +1,13 @@
 package util
 
 import (
+	"archive/zip"
+	"bytes"
+	"errors"
 	"io"
 	"io/ioutil"
 	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -35,6 +39,85 @@ func WriteToExistingFile(filePath string, contentToWrite []byte) error {
 	}
 
 	return nil
+}
+
+func ExtractZip(body []byte, downloadDir string) error {
+	zipBytesReader := bytes.NewReader(body)
+
+	zipReader, err := zip.NewReader(zipBytesReader, int64(len(body)))
+	if err != nil {
+		return err
+	}
+
+	for _, file := range zipReader.File {
+		reader, err := file.Open()
+		if err != nil {
+			return err
+		}
+
+		defer reader.Close()
+
+		fileName := file.FileInfo().Name()
+
+		fileToWrite := filepath.Join(downloadDir, fileName)
+
+		newFile, err := os.Create(fileToWrite)
+		if err != nil {
+			return err
+		}
+
+		defer newFile.Close()
+
+		_, err = io.Copy(newFile, reader)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func ExtractTarGzInsideZip(body []byte, downloadDir string) error {
+	zipBytesReader := bytes.NewReader(body)
+	zipReader, err := zip.NewReader(zipBytesReader, int64(len(body)))
+	if err != nil {
+		return err
+	}
+
+	for _, file := range zipReader.File {
+		reader, err := file.Open()
+		if err != nil {
+			return err
+		}
+
+		defer reader.Close()
+
+		tarFileName := file.FileInfo().Name()
+
+		if !strings.HasSuffix(tarFileName, ".tar.gz") {
+			return errors.New("Unexpected file: " + tarFileName)
+		}
+
+		err = Untar(reader, downloadDir, true)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func ExtractTarGz(body []byte, downloadDir string) error {
+	bodyReader := bytes.NewReader(body)
+	err := Untar(bodyReader, downloadDir, true)
+	if err.Error() == "requires gzip-compressed body: gzip: invalid header" {
+		_, err = bodyReader.Seek(0, io.SeekStart)
+		if err != nil {
+			return err
+		}
+		return Untar(bodyReader, downloadDir, false)
+	}
+	return err
 }
 
 // We have to manually swap out environment variables,

@@ -1,14 +1,11 @@
 package github
 
 import (
-	"archive/zip"
 	"bytes"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/spiceai/spice/pkg/util"
@@ -72,86 +69,7 @@ func (g *GitHubClient) DownloadTarGzip(url string, downloadDir string) error {
 		return err
 	}
 
-	return g.ExtractTarGz(body, downloadDir)
-}
-
-func (g *GitHubClient) ExtractZip(body []byte, downloadDir string) error {
-	zipBytesReader := bytes.NewReader(body)
-
-	zipReader, err := zip.NewReader(zipBytesReader, int64(len(body)))
-	if err != nil {
-		return err
-	}
-
-	for _, file := range zipReader.File {
-		reader, err := file.Open()
-		if err != nil {
-			return err
-		}
-
-		defer reader.Close()
-
-		fileName := file.FileInfo().Name()
-
-		fileToWrite := filepath.Join(downloadDir, fileName)
-
-		newFile, err := os.Create(fileToWrite)
-		if err != nil {
-			return err
-		}
-
-		defer newFile.Close()
-
-		_, err = io.Copy(newFile, reader)
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func (g *GitHubClient) ExtractTarGzInsideZip(body []byte, downloadDir string) error {
-	zipBytesReader := bytes.NewReader(body)
-	zipReader, err := zip.NewReader(zipBytesReader, int64(len(body)))
-	if err != nil {
-		return err
-	}
-
-	for _, file := range zipReader.File {
-		reader, err := file.Open()
-		if err != nil {
-			return err
-		}
-
-		defer reader.Close()
-
-		tarFileName := file.FileInfo().Name()
-
-		if !strings.HasSuffix(tarFileName, ".tar.gz") {
-			return errors.New("Unexpected file: " + tarFileName)
-		}
-
-		err = util.Untar(reader, downloadDir, true)
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func (g *GitHubClient) ExtractTarGz(body []byte, downloadDir string) error {
-	bodyReader := bytes.NewReader(body)
-	err := util.Untar(bodyReader, downloadDir, true)
-	if err.Error() == "requires gzip-compressed body: gzip: invalid header" {
-		_, err = bodyReader.Seek(0, io.SeekStart)
-		if err != nil {
-			return err
-		}
-		return util.Untar(bodyReader, downloadDir, false)
-	}
-	return err
+	return util.ExtractTarGz(body, downloadDir)
 }
 
 func (g *GitHubClient) call(method string, url string, payload []byte, accept string) ([]byte, error) {

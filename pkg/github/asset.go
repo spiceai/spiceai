@@ -6,6 +6,8 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+
+	"github.com/spiceai/spice/pkg/util"
 )
 
 type ReleaseAsset struct {
@@ -52,9 +54,9 @@ func DownloadPrivateReleaseAsset(gh *GitHubClient, release RepoRelease, assetNam
 
 	switch ext {
 	case ".zip":
-		return gh.ExtractZip(body, downloadDir)
+		return util.ExtractZip(body, downloadDir)
 	case ".gz":
-		return gh.ExtractTarGz(body, downloadDir)
+		return util.ExtractTarGz(body, downloadDir)
 	default:
 		filePath := filepath.Join(downloadDir, assetName)
 		return os.WriteFile(filePath, body, 0766)

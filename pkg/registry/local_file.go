@@ -6,8 +6,6 @@ import (
 	"path/filepath"
 
 	"github.com/spiceai/spice/pkg/config"
-	"github.com/spiceai/spice/pkg/spec"
-	"gopkg.in/yaml.v2"
 )
 
 type LocalFileRegistry struct{}
@@ -28,19 +26,4 @@ func (r *LocalFileRegistry) GetPod(podPath string) (string, error) {
 	}
 
 	return podManifestPath, nil
-}
-
-func (r *LocalFileRegistry) GetDataSource(datasourcePath string) (*spec.DataSourceSpec, error) {
-	data, err := ioutil.ReadFile(datasourcePath)
-	if err != nil {
-		return nil, fmt.Errorf("datasource not found at %s: %w", datasourcePath, err)
-	}
-
-	var dataSource spec.DataSourceSpec
-	err = yaml.Unmarshal(data, &dataSource)
-	if err != nil {
-		return nil, fmt.Errorf("Invalid datasource %w", err)
-	}
-
-	return &dataSource, nil
 }
