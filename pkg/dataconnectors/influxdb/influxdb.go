@@ -17,14 +17,14 @@ const (
 )
 
 type InfluxDbConnector struct {
-	client      influxdb2.Client
-	org         string
-	bucket      string
-	field       string
-	measurement string
+	client             influxdb2.Client
+	org                string
+	bucket             string
+	field              string
+	measurement        string
 	lastFetchPeriodEnd time.Time
-	data        []byte
-	dataMutex sync.RWMutex
+	data               []byte
+	dataMutex          sync.RWMutex
 }
 
 func NewInfluxDbConnector() *InfluxDbConnector {

@@ -2,13 +2,10 @@ package registry
 
 import (
 	"strings"
-
-	"github.com/spiceai/spice/pkg/spec"
 )
 
 type SpiceRegistry interface {
 	GetPod(podPath string) (string, error)
-	GetDataSource(datasourcePath string) (*spec.DataSourceSpec, error)
 }
 
 func GetRegistry(path string) SpiceRegistry {
@@ -16,5 +13,5 @@ func GetRegistry(path string) SpiceRegistry {
 		return &LocalFileRegistry{}
 	}
 
-	return &GitHubRegistry{}
+	return &SpiceRackRegistry{}
 }

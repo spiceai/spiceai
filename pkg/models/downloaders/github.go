@@ -9,6 +9,7 @@ import (
 	"github.com/logrusorgru/aurora"
 	"github.com/spiceai/spice/pkg/config"
 	"github.com/spiceai/spice/pkg/github"
+	"github.com/spiceai/spice/pkg/util"
 )
 
 type GitHubDownloader struct {
@@ -49,7 +50,7 @@ func (g *GitHubDownloader) Fetch() (string, error) {
 		return "", err
 	}
 
-	err = g.GitHub.ExtractTarGzInsideZip(zipArtifact, g.ModelSavePath)
+	err = util.ExtractTarGzInsideZip(zipArtifact, g.ModelSavePath)
 	if err != nil {
 		return "", err
 	}
