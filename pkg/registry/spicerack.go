@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	spiceRackBaseUrl string = "http://prod.spicerack.org/api/v0.1" // Will update to https://api.spicerack.org
+	spiceRackBaseUrl string = "http://prod.spicerack.org/api/v0.1" // Will update to https://api.spicerack.org/api/v0.1
 )
 
 var (
@@ -49,7 +49,7 @@ func (r *SpiceRackRegistry) GetPod(podPath string) (string, error) {
 	}
 
 	if response.StatusCode != 200 {
-		return "", fmt.Errorf("an error occurred fetching pod %s", podPath)
+		return "", fmt.Errorf("an error occurred fetching pod '%s'", podPath)
 	}
 
 	downloadPath := filepath.Join(config.PodsManifestsPath(), podManifestFileName)
