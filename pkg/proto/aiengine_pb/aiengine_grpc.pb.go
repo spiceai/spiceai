@@ -23,6 +23,8 @@ type AIEngineClient interface {
 	StartTraining(ctx context.Context, in *StartTrainingRequest, opts ...grpc.CallOption) (*Response, error)
 	GetInference(ctx context.Context, in *InferenceRequest, opts ...grpc.CallOption) (*InferenceResult, error)
 	GetHealth(ctx context.Context, in *HealthRequest, opts ...grpc.CallOption) (*Response, error)
+	ExportModel(ctx context.Context, in *ExportModelRequest, opts ...grpc.CallOption) (*ExportModelResult, error)
+	ImportModel(ctx context.Context, in *ImportModelRequest, opts ...grpc.CallOption) (*Response, error)
 }
 
 type aIEngineClient struct {
@@ -78,6 +80,24 @@ func (c *aIEngineClient) GetHealth(ctx context.Context, in *HealthRequest, opts 
 	return out, nil
 }
 
+func (c *aIEngineClient) ExportModel(ctx context.Context, in *ExportModelRequest, opts ...grpc.CallOption) (*ExportModelResult, error) {
+	out := new(ExportModelResult)
+	err := c.cc.Invoke(ctx, "/aiengine.AIEngine/ExportModel", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *aIEngineClient) ImportModel(ctx context.Context, in *ImportModelRequest, opts ...grpc.CallOption) (*Response, error) {
+	out := new(Response)
+	err := c.cc.Invoke(ctx, "/aiengine.AIEngine/ImportModel", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // AIEngineServer is the server API for AIEngine service.
 // All implementations should embed UnimplementedAIEngineServer
 // for forward compatibility
@@ -87,6 +107,8 @@ type AIEngineServer interface {
 	StartTraining(context.Context, *StartTrainingRequest) (*Response, error)
 	GetInference(context.Context, *InferenceRequest) (*InferenceResult, error)
 	GetHealth(context.Context, *HealthRequest) (*Response, error)
+	ExportModel(context.Context, *ExportModelRequest) (*ExportModelResult, error)
+	ImportModel(context.Context, *ImportModelRequest) (*Response, error)
 }
 
 // UnimplementedAIEngineServer should be embedded to have forward compatible implementations.
@@ -107,6 +129,12 @@ func (UnimplementedAIEngineServer) GetInference(context.Context, *InferenceReque
 }
 func (UnimplementedAIEngineServer) GetHealth(context.Context, *HealthRequest) (*Response, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetHealth not implemented")
+}
+func (UnimplementedAIEngineServer) ExportModel(context.Context, *ExportModelRequest) (*ExportModelResult, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ExportModel not implemented")
+}
+func (UnimplementedAIEngineServer) ImportModel(context.Context, *ImportModelRequest) (*Response, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ImportModel not implemented")
 }
 
 // UnsafeAIEngineServer may be embedded to opt out of forward compatibility for this service.
@@ -210,6 +238,42 @@ func _AIEngine_GetHealth_Handler(srv interface{}, ctx context.Context, dec func(
 	return interceptor(ctx, in, info, handler)
 }
 
+func _AIEngine_ExportModel_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ExportModelRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AIEngineServer).ExportModel(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/aiengine.AIEngine/ExportModel",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AIEngineServer).ExportModel(ctx, req.(*ExportModelRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _AIEngine_ImportModel_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ImportModelRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AIEngineServer).ImportModel(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/aiengine.AIEngine/ImportModel",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AIEngineServer).ImportModel(ctx, req.(*ImportModelRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // AIEngine_ServiceDesc is the grpc.ServiceDesc for AIEngine service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -236,6 +300,14 @@ var AIEngine_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetHealth",
 			Handler:    _AIEngine_GetHealth_Handler,
+		},
+		{
+			MethodName: "ExportModel",
+			Handler:    _AIEngine_ExportModel_Handler,
+		},
+		{
+			MethodName: "ImportModel",
+			Handler:    _AIEngine_ImportModel_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

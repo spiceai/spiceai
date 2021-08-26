@@ -22,6 +22,11 @@
     "hold": "reward = -(new_state.coinbase_btcusd_close - prev_state.coinbase_btcusd_close)",
     "sell": "reward = -1"
   },
+  "actions_order": {
+    "buy": 0,
+    "hold": 1,
+    "sell": 2
+  },
   "laws": [
     "local_portfolio_usd_balance \u003e= 0",
     "local_portfolio_btc_balance \u003e= 0"

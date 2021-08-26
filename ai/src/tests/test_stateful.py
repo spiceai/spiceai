@@ -30,6 +30,10 @@ class StatefulConnectorTests(unittest.TestCase):
                 "foo_action": "reward = 1",
                 "bar_action": "reward = 1",
             },
+            actions_order={
+                "foo_action": 0,
+                "bar_action": 1,
+            },
             laws=["bar >= 0"],
         )
 

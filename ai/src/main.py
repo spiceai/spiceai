@@ -132,6 +132,15 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
                 response=aiengine_pb2.Response(result="pod_not_initialized", error=True)
             )
 
+        if request.tag != "latest":
+            return aiengine_pb2.InferenceResult(
+                response=aiengine_pb2.Response(
+                    result="tag_not_yet_supported",
+                    message="Support for multiple tags coming soon!",
+                    error=True,
+                )
+            )
+
         # Ideally we could just re-use the in-memory agent we created during training, but tensorflow has issues with
         # multi-threading in python, so we are just loading it from the file system
         data_manager = data_managers[request.pod]
@@ -203,6 +212,7 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
                 granularity_secs=granularity_secs,
                 fields=request.fields,
                 action_rewards=action_rewards,
+                actions_order=request.actions_order,
                 laws=request.laws,
             )
             data_managers[request.pod] = data_manager
@@ -239,6 +249,56 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
                     )
                     connector_manager.add_connector(new_connector)
             return aiengine_pb2.Response(result="ok")
+
+    def ExportModel(self, request: aiengine_pb2.ExportModelRequest, context):
+        if not request.pod in saved_models:
+            return aiengine_pb2.ExportModelResult(
+                response=aiengine_pb2.Response(
+                    result="pod_not_trained",
+                    message="Unable to export a model that hasn't finished at least one training run",
+                    error=True,
+                )
+            )
+
+        if not request.pod in data_managers:
+            return aiengine_pb2.ExportModelResult(
+                resopnse=aiengine_pb2.Response(result="pod_not_initialized", error=True)
+            )
+
+        if request.tag != "latest":
+            return aiengine_pb2.ExportModelResult(
+                response=aiengine_pb2.Response(
+                    result="tag_not_yet_supported",
+                    message="Support for multiple tags coming soon!",
+                    error=True,
+                )
+            )
+
+        return aiengine_pb2.ExportModelResult(
+            response=aiengine_pb2.Response(result="ok"),
+            model_path=saved_models[request.pod],
+        )
+
+    def ImportModel(self, request: aiengine_pb2.ImportModelRequest, context):
+        if not request.pod in data_managers:
+            return aiengine_pb2.Response(result="pod_not_initialized", error=True)
+
+        data_manager = data_managers[request.pod]
+        model_data_shape = data_manager.get_shape()
+        agent: SpiceAIAgent = get_agent(
+            ALGORITHM, model_data_shape, len(data_manager.action_names)
+        )
+        ok = agent.load(request.import_path)
+        if not ok:
+            return aiengine_pb2.Response(
+                result="unable_to_load_model",
+                message=f"Unable to find a model at {request.import_path}",
+                error=True,
+            )
+
+        saved_models[request.pod] = request.import_path
+
+        return aiengine_pb2.Response(result="ok")
 
 
 def wait_parent_process():

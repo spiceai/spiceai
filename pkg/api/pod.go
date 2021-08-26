@@ -1,14 +1,12 @@
 package api
 
-import "github.com/spiceai/spice/pkg/pods"
+import (
+	"github.com/spiceai/spice/pkg/pods"
+	"github.com/spiceai/spice/pkg/proto/runtime_pb"
+)
 
-type Pod struct {
-	Name         string `json:"name"`
-	ManifestPath string `json:"manifest_path"`
-}
-
-func NewPod(f *pods.Pod) *Pod {
-	return &Pod{
+func NewPod(f *pods.Pod) *runtime_pb.Pod {
+	return &runtime_pb.Pod{
 		Name:         f.Name,
 		ManifestPath: f.ManifestPath(),
 	}

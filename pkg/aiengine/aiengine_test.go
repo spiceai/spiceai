@@ -69,12 +69,37 @@ func testInitializePod(pod *pods.Pod) func(t *testing.T) {
 			aiengineClient = nil
 		})
 
+		// Go is not deterministic with array ordering, so we account for that by sending a specified order
+		// in the initialize request. However this makes tests unstable since the order will change on each run.
+		// Fix the test by assigning a specific ordering
+		testActionOrdering := map[string]map[string]int32{
+			"cartpole-v1": {
+				"left":  0,
+				"right": 1,
+			},
+			"trader": {
+				"buy":  0,
+				"sell": 1,
+				"hold": 2,
+			},
+		}
+
 		mockAIEngineClient := &MockAIEngineClient{
 			InitHandler: func(c go_context.Context, ir *aiengine_pb.InitRequest, co ...grpc.CallOption) (*aiengine_pb.Response, error) {
 				if pod.Name == "cartpole-v1" {
 					// Epoch time is not specified for cartpole, so it will be "now"
 					var testStaticEpochTime int64 = 123
 					ir.EpochTime = testStaticEpochTime
+				}
+
+				if val, ok := testActionOrdering[pod.Name]; ok {
+					assert.Equal(t, len(ir.ActionsOrder), len(val))
+					for action := range ir.ActionsOrder {
+						_, ok := val[action]
+						assert.True(t, ok)
+					}
+
+					ir.ActionsOrder = val
 				}
 
 				// marshal to JSON so the snapshot is easy to consume

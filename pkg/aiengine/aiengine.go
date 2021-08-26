@@ -2,7 +2,6 @@ package aiengine
 
 import (
 	"bufio"
-	go_context "context"
 	"errors"
 	"fmt"
 	"log"
@@ -15,12 +14,9 @@ import (
 	"github.com/logrusorgru/aurora"
 	"github.com/spiceai/spice/pkg/config"
 	"github.com/spiceai/spice/pkg/context"
-	"github.com/spiceai/spice/pkg/flights"
 	"github.com/spiceai/spice/pkg/loggers"
-	"github.com/spiceai/spice/pkg/observations"
 	"github.com/spiceai/spice/pkg/pods"
 	"github.com/spiceai/spice/pkg/proto/aiengine_pb"
-	"github.com/spiceai/spice/pkg/state"
 	"github.com/spiceai/spice/pkg/util"
 	"go.uber.org/zap"
 )
@@ -210,151 +206,6 @@ func ServerReady() bool {
 
 func IsServerHealthy() error {
 	return util.IsAIEngineServerHealthy(aiengineClient)
-}
-
-func InitializePod(pod *pods.Pod) error {
-
-	err := pod.ValidateForTraining()
-	if err != nil {
-		return err
-	}
-
-	podInit := getPodInitForTraining(pod)
-
-	ctx, cancel := go_context.WithTimeout(go_context.Background(), time.Second)
-	defer cancel()
-	response, err := aiengineClient.Init(ctx, podInit)
-	if err != nil {
-		return err
-	}
-
-	if response.Error {
-		return fmt.Errorf("failed to validate manifest: %s", response.Result)
-	}
-
-	return nil
-}
-
-func StartTraining(pod *pods.Pod) error {
-	flightId := fmt.Sprintf("%d", len(*pod.Flights())+1)
-
-	flight := flights.NewFlight(flightId, int(pod.Episodes()))
-
-	trainRequest := &aiengine_pb.StartTrainingRequest{
-		Pod:            pod.Name,
-		EpochTime:      pod.Epoch().Unix(),
-		Flight:         flightId,
-		NumberEpisodes: int64(flight.ExpectedEpisodes()),
-		TrainingGoal:   pod.PodSpec.Training.Goal,
-	}
-
-	ctx, cancel := go_context.WithTimeout(go_context.Background(), time.Second)
-	defer cancel()
-	response, err := aiengineClient.StartTraining(ctx, trainRequest)
-	if err != nil {
-		return fmt.Errorf("%s -> failed to verify training has started: %w", pod.Name, err)
-	}
-
-	switch response.Result {
-	case "already_training":
-		return fmt.Errorf("%s -> training is already in progress", pod.Name)
-	case "not_enough_data_for_training":
-		return fmt.Errorf("%s -> insufficient data for training", pod.Name)
-	case "epoch_time_invalid":
-		return fmt.Errorf("%s -> epoch time %d invalid: %s", pod.Name, pod.Epoch().Unix(), response.Message)
-	case "started_training":
-		pod.AddFlight(flightId, flight)
-		log.Println(fmt.Sprintf("%s -> %s", pod.Name, aurora.BrightCyan("Starting training...")))
-	default:
-		return fmt.Errorf("%s -> failed to verify training has started: %s", pod.Name, response.Result)
-	}
-
-	if !aiSingleTrainingRun {
-		return nil
-	}
-
-	<-*flight.WaitForDoneChan()
-
-	return nil
-}
-
-func SendData(pod *pods.Pod, podState ...*state.State) error {
-	if len(podState) == 0 {
-		// Nothing to do
-		return nil
-	}
-
-	err := IsServerHealthy()
-	if err != nil {
-		return err
-	}
-
-	for _, s := range podState {
-		if s == nil || !s.TimeSentToAIEngine.IsZero() {
-			// Already sent
-			continue
-		}
-
-		csv := strings.Builder{}
-		csv.WriteString("time")
-		for _, field := range s.Fields() {
-			csv.WriteString(",")
-			csv.WriteString(strings.ReplaceAll(field, ".", "_"))
-		}
-		csv.WriteString("\n")
-
-		observationData := s.Observations()
-
-		if len(observationData) == 0 {
-			continue
-		}
-
-		csvChunk, csvPreview := observations.GetCsv(s.FieldNames(), observationData, 5)
-
-		zaplog.Sugar().Debugf("Posting data to AI engine:\n%s", aurora.BrightYellow(fmt.Sprintf("%s%s...\n%d observations posted", csv.String(), csvPreview, len(observationData))))
-
-		csv.WriteString(csvChunk)
-
-		addDataRequest := &aiengine_pb.AddDataRequest{
-			Pod:     pod.Name,
-			CsvData: csv.String(),
-		}
-
-		ctx, cancel := go_context.WithTimeout(go_context.Background(), time.Second)
-		defer cancel()
-		response, err := aiengineClient.AddData(ctx, addDataRequest)
-		if err != nil {
-			return fmt.Errorf("failed to post new data to pod %s: %w", pod.Name, err)
-		}
-
-		if response.Error {
-			return fmt.Errorf("failed to post new data to pod %s: %s", pod.Name, response.Result)
-		}
-
-		s.Sent()
-	}
-
-	return err
-}
-
-func Infer(pod string, tag string) (*aiengine_pb.InferenceResult, error) {
-	if !ServerReady() {
-		return nil, fmt.Errorf("not ready")
-	}
-
-	request := &aiengine_pb.InferenceRequest{
-		Pod: pod,
-		Tag: tag,
-	}
-
-	ctx, cancel := go_context.WithTimeout(go_context.Background(), time.Second)
-	defer cancel()
-	response, err := aiengineClient.GetInference(ctx, request)
-	if err != nil {
-		return nil, err
-	}
-
-	return response, nil
 }
 
 func waitForServerHealthy(maxAttempts int) int {

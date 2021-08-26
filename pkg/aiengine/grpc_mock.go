@@ -13,6 +13,8 @@ type MockAIEngineClient struct {
 	StartTrainingHandler func(context.Context, *aiengine_pb.StartTrainingRequest, ...grpc.CallOption) (*aiengine_pb.Response, error)
 	GetInferenceHandler  func(context.Context, *aiengine_pb.InferenceRequest, ...grpc.CallOption) (*aiengine_pb.InferenceResult, error)
 	GetHealthHandler     func(context.Context, *aiengine_pb.HealthRequest, ...grpc.CallOption) (*aiengine_pb.Response, error)
+	ExportModelHandler   func(context.Context, *aiengine_pb.ExportModelRequest, ...grpc.CallOption) (*aiengine_pb.ExportModelResult, error)
+	ImportModelHandler   func(context.Context, *aiengine_pb.ImportModelRequest, ...grpc.CallOption) (*aiengine_pb.Response, error)
 	CloseHandler         func() error
 }
 
@@ -55,6 +57,22 @@ func (a *MockAIEngineClient) GetInference(ctx context.Context, in *aiengine_pb.I
 func (a *MockAIEngineClient) GetHealth(ctx context.Context, in *aiengine_pb.HealthRequest, opts ...grpc.CallOption) (*aiengine_pb.Response, error) {
 	if a.GetHealthHandler != nil {
 		return a.GetHealthHandler(ctx, in, opts...)
+	}
+
+	return nil, nil
+}
+
+func (a *MockAIEngineClient) ExportModel(ctx context.Context, in *aiengine_pb.ExportModelRequest, opts ...grpc.CallOption) (*aiengine_pb.ExportModelResult, error) {
+	if a.ExportModelHandler != nil {
+		return a.ExportModelHandler(ctx, in, opts...)
+	}
+
+	return nil, nil
+}
+
+func (a *MockAIEngineClient) ImportModel(ctx context.Context, in *aiengine_pb.ImportModelRequest, opts ...grpc.CallOption) (*aiengine_pb.Response, error) {
+	if a.ImportModelHandler != nil {
+		return a.ImportModelHandler(ctx, in, opts...)
 	}
 
 	return nil, nil

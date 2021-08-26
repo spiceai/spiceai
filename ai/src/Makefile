@@ -20,6 +20,20 @@ venv-gen-proto:
 	venv/bin/pip3 install --upgrade pip
 	venv/bin/pip3 install grpcio-tools
 
+################################################################################
+# Target: gen-proto                                                            #
+################################################################################
+GRPC_PROTOS:=aiengine runtime
+
+define genProtoc
+.PHONY: gen-proto-$(1)
+gen-proto-$(1):
+	venv/bin/python3 -m grpc_tools.protoc --proto_path=../.. --python_out=. --grpc_python_out=. proto/$(1)/v1/$(1).proto
+endef
+
+$(foreach ITEM,$(GRPC_PROTOS),$(eval $(call genProtoc,$(ITEM))))
+
+GEN_PROTOS:=$(foreach ITEM,$(GRPC_PROTOS),gen-proto-$(ITEM))
+
 .PHONY: gen-proto
-gen-proto:
-	venv/bin/python3 -m grpc_tools.protoc --proto_path=../.. --python_out=. --grpc_python_out=. proto/aiengine/v1/aiengine.proto
+gen-proto: $(GEN_PROTOS)

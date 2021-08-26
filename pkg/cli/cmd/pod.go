@@ -3,17 +3,14 @@ package cmd
 import (
 	"errors"
 	"fmt"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/logrusorgru/aurora"
 	"github.com/spf13/cobra"
-	"github.com/spf13/viper"
 	"github.com/spiceai/spice/pkg/config"
 	"github.com/spiceai/spice/pkg/context"
-	"github.com/spiceai/spice/pkg/pods"
 	"github.com/spiceai/spice/pkg/registry"
 	"github.com/spiceai/spice/pkg/spec"
 	"github.com/spiceai/spice/pkg/util"
@@ -138,47 +135,15 @@ var podTrainCmd = &cobra.Command{
 		context.SetContext(context.BareMetal)
 		podName := args[0]
 
-		podPath := pods.FindFirstManifestPath()
-		if podPath == "" {
-			fmt.Println("No pods detected!")
-			return
-		}
-
-		pod, err := pods.LoadPodFromManifest(podPath)
+		runtimeClient, err := NewRuntimeClient(podName)
 		if err != nil {
 			fmt.Println(err.Error())
 			return
 		}
 
-		if pod.Name != podName {
-			fmt.Printf("the pod %s does not exist\n", podName)
-			return
-		}
-
-		v := viper.New()
-		runtimeConfig, err := config.LoadRuntimeConfiguration(v)
+		err = runtimeClient.StartTraining()
 		if err != nil {
-			fmt.Println("failed to load runtime configuration")
-			return
-		}
-
-		serverBaseUrl := runtimeConfig.ServerBaseUrl()
-
-		err = util.IsRuntimeServerHealthy(serverBaseUrl, http.DefaultClient)
-		if err != nil {
-			fmt.Printf("failed to reach %s. is the spice runtime running?", serverBaseUrl)
-			return
-		}
-
-		trainUrl := fmt.Sprintf("%s/api/v0.1/pods/%s/train", serverBaseUrl, pod.Name)
-		response, err := http.DefaultClient.Post(trainUrl, "application/json", nil)
-		if err != nil {
-			fmt.Printf("failed to start training: %s", err.Error())
-			return
-		}
-
-		if response.StatusCode != 200 {
-			fmt.Printf("failed to start training: %s", response.Status)
+			fmt.Println(err.Error())
 			return
 		}
 

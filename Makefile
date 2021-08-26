@@ -52,7 +52,7 @@ init-proto:
 ################################################################################
 # Target: gen-proto                                                            #
 ################################################################################
-GRPC_PROTOS:=aiengine
+GRPC_PROTOS:=aiengine runtime
 PROTO_PREFIX:=github.com/spiceai/spice
 
 define genProtoc
@@ -76,5 +76,8 @@ gen-proto: $(GEN_PROTOS) modtidy
 check-proto-diff:
 	git diff --exit-code ./pkg/proto/aiengine_pb/aiengine.pb.go # check no changes
 	git diff --exit-code ./pkg/proto/aiengine_pb/aiengine_grpc.pb.go # check no changes
+	git diff --exit-code ./pkg/proto/runtime_pb/runtime.pb.go # check no changes
 	git diff --exit-code ./ai/src/proto/aiengine/v1/aiengine_pb2.py # check no changes
 	git diff --exit-code ./ai/src/proto/aiengine/v1/aiengine_pb2_grpc.py # check no changes
+	git diff --exit-code ./ai/src/proto/runtime/v1/runtime_pb2.py # check no changes
+	git diff --exit-code ./ai/src/proto/runtime/v1/runtime_pb2_grpc.py # check no changes
