@@ -16,6 +16,7 @@ import (
 	spice_http "github.com/spiceai/spice/pkg/http"
 	"github.com/spiceai/spice/pkg/loggers"
 	"github.com/spiceai/spice/pkg/pods"
+	"github.com/spiceai/spice/pkg/tempdir"
 	"github.com/spiceai/spice/pkg/version"
 	"go.uber.org/zap"
 )
@@ -276,6 +277,18 @@ func Shutdown() {
 	go func() {
 		defer wg.Done()
 		err := aiengine.StopServer()
+		if err != nil {
+			zaplog.Sugar().Debug(err.Error())
+			return
+		}
+	}()
+
+	wg.Add(1)
+
+	go func() {
+		defer wg.Done()
+
+		err := tempdir.RemoveAllCreatedTempDirectories()
 		if err != nil {
 			zaplog.Sugar().Debug(err.Error())
 			return

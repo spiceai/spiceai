@@ -1,7 +1,6 @@
 import io
 import csv
 import unittest
-import json
 import pandas as pd
 import threading
 import copy
@@ -9,6 +8,7 @@ import main
 import train
 from tests import common
 from proto.aiengine.v1 import aiengine_pb2
+from cleanup import cleanup_on_shutdown
 
 
 class TrainingLoopTests(unittest.TestCase):
@@ -40,6 +40,7 @@ class TrainingLoopTests(unittest.TestCase):
     def tearDown(self):
         train.post_episode_result = self.original_post_episode_result
         train.end_of_episode = self.original_end_of_episode
+        cleanup_on_shutdown()
 
     def init(
         self,

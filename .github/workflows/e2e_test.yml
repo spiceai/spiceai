@@ -68,3 +68,8 @@ jobs:
           export SPICE_DEEPRL_ALGORITHM="dql"
           ./spice train -b ../../test/assets/pods/manifests/cartpole-v1.yaml
         working-directory: cmd/spice
+
+      - name: Execute e2e tests
+        working-directory: test/e2e
+        run: |
+          go test -v . -e2e

@@ -5,6 +5,7 @@ import tensorflow as tf
 import threading
 from psutil import Process
 import os
+import signal
 from algorithms.factory import get_agent
 from algorithms.agent_interface import SpiceAIAgent
 from data import DataManager
@@ -15,6 +16,7 @@ from validation import validate_rewards
 from train import train_agent, training_lock, saved_models, ALGORITHM
 from concurrent import futures
 from proto.aiengine.v1 import aiengine_pb2, aiengine_pb2_grpc
+from cleanup import cleanup_on_shutdown
 
 data_managers: "dict[DataManager]" = dict()
 connector_managers: "dict[ConnectorManager]" = dict()
@@ -309,6 +311,7 @@ def wait_parent_process():
 
 
 if __name__ == "__main__":
+    signal.signal(signal.SIGINT, cleanup_on_shutdown)
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
     aiengine_pb2_grpc.add_AIEngineServicer_to_server(AIEngine(), server)
     server.add_insecure_port("[::]:8004")
@@ -316,3 +319,4 @@ if __name__ == "__main__":
     print(f"AIEngine: gRPC server listening on port {8004}")
 
     wait_parent_process()
+    cleanup_on_shutdown()

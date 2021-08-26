@@ -21,11 +21,12 @@ lint:
 	golangci-lint run	
 
 .PHONY: test
-test:
+test: build
 	pushd dashboard && yarn test-ci && popd
-	cd ai/src && make test
+	pushd ai/src && make test && popd
 	go vet ./...
 	go test ./...
+	pushd test/e2e && go test -v . -e2e && popd
 
 .PHONY: docker
 docker:

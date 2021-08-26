@@ -14,6 +14,7 @@ import (
 	"github.com/spiceai/spice/pkg/pods"
 	"github.com/spiceai/spice/pkg/proto/aiengine_pb"
 	"github.com/spiceai/spice/pkg/proto/runtime_pb"
+	"github.com/spiceai/spice/pkg/tempdir"
 	"github.com/spiceai/spice/pkg/util"
 	"google.golang.org/protobuf/proto"
 )
@@ -106,7 +107,7 @@ func ImportModel(request *runtime_pb.ImportModel) error {
 		return fmt.Errorf("not ready")
 	}
 
-	tempDir, err := createTempImportDir()
+	tempDir, err := tempdir.CreateTempDir("import")
 	if err != nil {
 		return err
 	}
@@ -167,24 +168,6 @@ func ImportModel(request *runtime_pb.ImportModel) error {
 	}
 
 	return nil
-}
-
-func createTempImportDir() (string, error) {
-	tempDir := os.TempDir()
-	stat, err := os.Stat(tempDir)
-	if err != nil {
-		return "", nil
-	}
-
-	spiceDir := fmt.Sprintf("spice_import_%v", time.Now().Unix())
-	tempDir = filepath.Join(tempDir, spiceDir)
-
-	err = os.Mkdir(tempDir, stat.Mode())
-	if err != nil {
-		return "", err
-	}
-
-	return tempDir, nil
 }
 
 func AddBytesAsFileToZip(zipWriter *zip.Writer, fileContent []byte, filename string) error {
