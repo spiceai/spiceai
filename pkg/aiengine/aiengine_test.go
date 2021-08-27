@@ -92,6 +92,16 @@ func testInitializePod(pod *pods.Pod) func(t *testing.T) {
 					ir.ActionsOrder = val
 				}
 
+				if val, ok := testActionOrdering[pod.Name]; ok {
+					assert.Equal(t, len(ir.ActionsOrder), len(val))
+					for action := range ir.ActionsOrder {
+						_, ok := val[action]
+						assert.True(t, ok)
+					}
+
+					ir.ActionsOrder = val
+				}
+
 				// marshal to JSON so the snapshot is easy to consume
 				data, err := json.MarshalIndent(ir, "", "  ")
 				if err != nil {
