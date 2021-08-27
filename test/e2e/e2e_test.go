@@ -24,8 +24,8 @@ var (
 	spicedContext    string
 	testDir          string
 	repoRoot         string
-	spicePodsDir     string
 	workingDirectory string
+	spicePodsDir     string
 	runtimePath      string
 	cliClient        *cli
 	runtime          *runtimeServer
@@ -77,7 +77,14 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
-	_, err = os.Stat(testDir)
+	stat, err := os.Stat(testDir)
+	if err != nil {
+		log.Println(err.Error())
+		os.Exit(1)
+	}
+
+	spicePodsDir = filepath.Join(testDir, ".spice", "pods")
+	err = os.MkdirAll(spicePodsDir, stat.Mode())
 	if err != nil {
 		log.Println(err.Error())
 		os.Exit(1)
@@ -104,12 +111,6 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 	
-	err = cliClient.runCliCmd("add", "test/Trader")
-	if err != nil {
-		log.Println(err.Error())
-		os.Exit(1)
-	}
-
 	err = cliClient.runCliCmd("add", "test/Trader")
 	if err != nil {
 		log.Println(err.Error())
