@@ -12,6 +12,7 @@ on:
     branches:
       - trunk
       - release-*
+  workflow_dispatch:
 
 jobs:
   algorithms:
@@ -56,6 +57,9 @@ jobs:
         run: make
         working-directory: cmd/spiced
 
+      - name: Build Docker image
+        run: make docker
+
       - name: Ensure correct directory structure
         run: |
           mkdir -p $HOME/.spice/bin
@@ -81,7 +85,7 @@ jobs:
       fail-fast: false
       matrix:
         algorithm: [vpg, dql]
-        context: [metal]
+        context: [metal, docker]
     steps:
       - uses: actions/checkout@v2
 
@@ -114,6 +118,9 @@ jobs:
         run: make
         working-directory: cmd/spiced
 
+      - name: Build Docker image
+        run: make docker
+
       - name: Ensure correct directory structure
         run: |
           mkdir -p $HOME/.spice/bin
@@ -124,4 +131,4 @@ jobs:
         working-directory: test/e2e
         run: |
           export SPICE_DEEPRL_ALGORITHM="${{ matrix.algorithm }}"
-          go test -v . -e2e
+          go test -v . -e2e -context '${{ matrix.context }}'
