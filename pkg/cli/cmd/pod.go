@@ -173,12 +173,12 @@ var podTrainCmd = &cobra.Command{
 		trainUrl := fmt.Sprintf("%s/api/v0.1/pods/%s/train", serverBaseUrl, pod.Name)
 		response, err := http.DefaultClient.Post(trainUrl, "application/json", nil)
 		if err != nil {
-			fmt.Printf("failed to start training: %s", err.Error())
+			fmt.Printf("failed to start training: %s\n", err.Error())
 			return
 		}
 
 		if response.StatusCode != 200 {
-			fmt.Printf("failed to start training: %s", response.Status)
+			fmt.Printf("failed to start training: %s\n", response.Status)
 			return
 		}
 
