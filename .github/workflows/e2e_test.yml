@@ -62,12 +62,14 @@ jobs:
           cp cmd/spiced/spiced $HOME/.spice/bin
           ln -s ${{ github.workspace }}/ai/src $HOME/.spice/bin/ai
 
-      - name: "Execute test - cartpole (algorithm: ${{ matrix.algorithm }})"
+      - name: "Execute test - trader (algorithm: ${{ matrix.algorithm }})"
         run: |
+          cp ../../test/assets/data/csv/COINBASE_BTCUSD\,\ 30.csv .
           export SPICE_GH_TOKEN=${{ secrets.GITHUB_TOKEN }}
           export SPICE_DEEPRL_ALGORITHM="${{ matrix.algorithm }}"
           ./spice version --context ${{ matrix.context }}
-          ./spice train ../../test/assets/pods/manifests/cartpole-v1.yaml --context ${{ matrix.context }}
+          ./spice add test/Trader
+          ./spice train .spice/pods/trader.yaml --context ${{ matrix.context }}
         working-directory: cmd/spice
 
   end-to-end:

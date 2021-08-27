@@ -1,2 +1,0 @@
-time,gym.CartPole.cart_position,gym.CartPole.cart_velocity,gym.CartPole.is_done,gym.CartPole.pole_angle,gym.CartPole.pole_angular_velocity
-
