@@ -75,7 +75,7 @@ jobs:
           python-version: 3.8.11
       - name: Install Python dependencies
         working-directory: ai/src
-        run: make venv
+        run: make venv-dev
       - name: Run tests
         working-directory: ai/src
         run: make test

@@ -16,7 +16,7 @@ import (
 var snapshotter = cupaloy.New(cupaloy.SnapshotSubdirectory("../../test/assets/snapshots/pods"))
 
 func TestPod(t *testing.T) {
-	manifestsToTest := []string{"trader.yaml", "trader-infer.yaml", "cartpole-v1.yaml"}
+	manifestsToTest := []string{"trader.yaml", "trader-infer.yaml"}
 
 	for _, manifestToTest := range manifestsToTest {
 		manifestPath := filepath.Join("../../test/assets/pods/manifests", manifestToTest)
@@ -50,8 +50,6 @@ func testBasePropertiesFunc(pod *Pod) func(*testing.T) {
 			expected = "abde6a467f8e99e468d1766a47ec3822"
 		case "trader-infer":
 			expected = "6c1841e198a8228448f606667b5405e5"
-		case "cartpole-v1":
-			expected = "12e235c7c3d281bf5c30025dd86a1814"
 		}
 
 		assert.Equal(t, expected, actual, "invalid pod.Hash()")
@@ -63,8 +61,6 @@ func testBasePropertiesFunc(pod *Pod) func(*testing.T) {
 			expected = "../../test/assets/pods/manifests/trader.yaml"
 		case "trader-infer":
 			expected = "../../test/assets/pods/manifests/trader-infer.yaml"
-		case "cartpole-v1":
-			expected = "../../test/assets/pods/manifests/cartpole-v1.yaml"
 		}
 
 		assert.Equal(t, expected, actual, "invalid pod.ManifestPath()")
@@ -75,9 +71,6 @@ func testBasePropertiesFunc(pod *Pod) func(*testing.T) {
 		case "trader":
 			expected = "1605312000"
 		case "trader-infer":
-			actual = actual[:8] // Reduce precision to test
-			expected = fmt.Sprintf("%d", time.Now().Add(-pod.Period()).Unix())[:8]
-		case "cartpole-v1":
 			actual = actual[:8] // Reduce precision to test
 			expected = fmt.Sprintf("%d", time.Now().Add(-pod.Period()).Unix())[:8]
 		}
@@ -91,8 +84,6 @@ func testBasePropertiesFunc(pod *Pod) func(*testing.T) {
 			expected = "17h0m0s"
 		case "trader-infer":
 			expected = "72h0m0s"
-		case "cartpole-v1":
-			expected = "50m0s"
 		}
 
 		assert.Equal(t, expected, actual, "invalid pod.Period()")
@@ -104,8 +95,6 @@ func testBasePropertiesFunc(pod *Pod) func(*testing.T) {
 			expected = "17m0s"
 		case "trader-infer":
 			expected = "1m0s"
-		case "cartpole-v1":
-			expected = "10s"
 		}
 
 		assert.Equal(t, expected, actual, "invalid pod.Interval()")
@@ -116,8 +105,6 @@ func testBasePropertiesFunc(pod *Pod) func(*testing.T) {
 		case "trader":
 			expected = "17s"
 		case "trader-infer":
-			expected = "10s"
-		case "cartpole-v1":
 			expected = "10s"
 		}
 
@@ -140,14 +127,6 @@ func testFieldNamesFunc(pod *Pod) func(*testing.T) {
 				"coinbase.btcusd.close",
 				"local.portfolio.btc_balance",
 				"local.portfolio.usd_balance",
-			}
-		case "cartpole-v1":
-			expected = []string{
-				"gym.CartPole.cart_position",
-				"gym.CartPole.cart_velocity",
-				"gym.CartPole.is_done",
-				"gym.CartPole.pole_angle",
-				"gym.CartPole.pole_angular_velocity",
 			}
 		}
 
@@ -174,11 +153,6 @@ func testRewardsFunc(pod *Pod) func(*testing.T) {
 				"buy":  "reward = 1",
 				"sell": "reward = 1",
 			}
-		case "cartpole-v1":
-			expected = map[string]string{
-				"left":  "reward = 0 if new_state.gym_CartPole_is_done == 1 else 1",
-				"right": "reward = 0 if new_state.gym_CartPole_is_done == 1 else 1",
-			}
 		}
 
 		assert.Equal(t, expected, actual, "invalid pod.Rewards()")
@@ -203,11 +177,6 @@ func testActionsFunc(pod *Pod) func(*testing.T) {
 			expected = map[string]string{
 				"buy":  "local.portfolio.usd_balance -= args.price\nlocal.portfolio.btc_balance += 1",
 				"sell": "local.portfolio.usd_balance += args.price\nlocal.portfolio.btc_balance -= 1",
-			}
-		case "cartpole-v1":
-			expected = map[string]string{
-				"left":  "passthru",
-				"right": "passthru",
 			}
 		default:
 			t.Errorf("invalid pod %s", pod.Name)

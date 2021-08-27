@@ -10,7 +10,6 @@ from algorithms.factory import get_agent
 from algorithms.agent_interface import SpiceAIAgent
 from data import DataManager
 from connector.manager import ConnectorManager, ConnectorName
-from connector.openai_gym import OpenAIGymConnector
 from connector.stateful import StatefulConnector
 from validation import validate_rewards
 from train import train_agent, training_lock, saved_models, ALGORITHM
@@ -226,28 +225,12 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
                 connector_data = datasource_data.connector
                 connector_name: ConnectorName = connector_data.name
 
-                connector_params = connector_data.params
                 datasource_actions = datasource_data.actions
 
                 if connector_name == ConnectorName.STATEFUL.value:
                     new_connector = StatefulConnector(
                         data_manager=data_manager,
                         action_effects=datasource_actions,
-                    )
-                    connector_manager.add_connector(new_connector)
-                elif connector_name == ConnectorName.OPENAI_GYM.value:
-                    if not "environment" in connector_params:
-                        message = (
-                            f"missing the environment parameter for {connector_name}"
-                        )
-                        return aiengine_pb2.Response(
-                            result="missing_param", message=message, error=True
-                        )
-
-                    new_connector = OpenAIGymConnector(
-                        connector_params["environment"],
-                        data_manager,
-                        data_manager.fields,
                     )
                     connector_manager.add_connector(new_connector)
             return aiengine_pb2.Response(result="ok")

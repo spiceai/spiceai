@@ -24,7 +24,6 @@ var (
 	testDir          string
 	repoRoot         string
 	workingDirectory string
-	spicePodsDir     string
 	runtimePath      string
 	cliClient        *cli
 	runtime          *runtimeServer
@@ -75,14 +74,7 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
-	stat, err := os.Stat(testDir)
-	if err != nil {
-		log.Println(err.Error())
-		os.Exit(1)
-	}
-
-	spicePodsDir = filepath.Join(testDir, ".spice", "pods")
-	err = os.MkdirAll(spicePodsDir, stat.Mode())
+	_, err = os.Stat(testDir)
 	if err != nil {
 		log.Println(err.Error())
 		os.Exit(1)
@@ -103,7 +95,7 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
-	err = copyFile(filepath.Join(workingDirectory, "pods/trader.yaml"), spicePodsDir)
+	err = cliClient.runCliCmd("add", "test/Trader")
 	if err != nil {
 		log.Println(err.Error())
 		os.Exit(1)
