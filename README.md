@@ -125,7 +125,7 @@ spice run
 In the original terminal instance, add the CartPole-v1 sample pod:
 
 ```bash
-spice pod add samples/CartPole-v1
+spice add samples/CartPole-v1
 ```
 
 The Spice CLI will download the CartPole-v1 sample pod manifest and add it to your project at `.spice/pods/cartpole-v1.yaml`.
@@ -143,7 +143,7 @@ Navigate to [http://localhost:8000](http://localhost:8000) in your favorite brow
 The runtime will automatically detect changes to your pod manifest and start training. In addition, you can trigger training by using the Spice CLI from within your app directory.
 
 ```bash
-spice pod train cartpole-v1
+spice train cartpole-v1
 ```
 
 ### Get a recommendation from your pod

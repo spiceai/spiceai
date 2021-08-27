@@ -5,6 +5,7 @@ import (
 
 	"github.com/logrusorgru/aurora"
 	"github.com/spf13/cobra"
+	"github.com/spiceai/spice/pkg/cli/runtime"
 	"github.com/spiceai/spice/pkg/proto/aiengine_pb"
 	"github.com/spiceai/spice/pkg/util"
 	"google.golang.org/protobuf/proto"
@@ -14,9 +15,9 @@ var importTag string
 
 var ImportCmd = &cobra.Command{
 	Use:   "import",
-	Short: "Import Pod - import a Spice AI Pod",
+	Short: "Import Pod - import a pod",
 	Example: `
-spice import [path-to-pod]
+spice import <path-to-pod>
 spice import ./models/trader.spicepod
 
 spice import --tag [tag-name] [path-to-pod]
@@ -57,7 +58,7 @@ spice import --tag latest ./models/trader.spicepod
 			return
 		}
 
-		runtimeClient, err := NewRuntimeClient(init.Pod)
+		runtimeClient, err := runtime.NewRuntimeClient(init.Pod)
 		if err != nil {
 			fmt.Println(err.Error())
 			return

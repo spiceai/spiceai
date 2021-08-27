@@ -13,10 +13,9 @@ import (
 	"time"
 
 	"github.com/spf13/viper"
-	"github.com/spiceai/spice/pkg/config"
+	"github.com/spiceai/spice/pkg/constants"
 	"github.com/spiceai/spice/pkg/datasources"
 	"github.com/spiceai/spice/pkg/flights"
-	"github.com/spiceai/spice/pkg/models"
 	"github.com/spiceai/spice/pkg/observations"
 	"github.com/spiceai/spice/pkg/spec"
 	"github.com/spiceai/spice/pkg/state"
@@ -370,17 +369,8 @@ func (pod *Pod) FetchNewData() ([]*state.State, error) {
 	return allState, nil
 }
 
-func (pod *Pod) DownloadModelUpdate(connectionId string, connection config.ConnectionSpec, branch string) (string, error) {
-	downloader, err := models.GetDownloader(pod.Name, connectionId, connection, branch)
-	if err != nil {
-		return "", err
-	}
-
-	return downloader.Fetch()
-}
-
 func unmarshalPod(podPath string) (*Pod, error) {
-	podBytes, err := util.ReplaceEnvVariablesFromPath(podPath, config.SpiceEnvVarPrefix)
+	podBytes, err := util.ReplaceEnvVariablesFromPath(podPath, constants.SpiceEnvVarPrefix)
 	if err != nil {
 		return nil, err
 	}

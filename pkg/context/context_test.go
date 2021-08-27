@@ -1,28 +1,34 @@
 package context_test
 
 import (
-	"os"
 	"testing"
 
 	"github.com/spiceai/spice/pkg/context"
+	"github.com/spiceai/spice/pkg/context/metal"
 	"github.com/stretchr/testify/assert"
 )
 
 func TestContext(t *testing.T) {
 	t.Run("CurrentContext() - Context is set correctly", testCurrentContext())
+	t.Run("SetDefaultContext() - Context is set correctly", testSetDefaultContext())
 }
 
 // Tests CurrentContext() inferring the correct context from the environment
 func testCurrentContext() func(*testing.T) {
 	return func(t *testing.T) {
-		orig := os.Getenv("SPICE_ENVIRONMENT")
-		t.Cleanup(func() { os.Setenv("SPICE_ENVIRONMENT", orig) })
+		assert.IsType(t, &metal.MetalContext{}, context.CurrentContext())
+	}
+}
 
-		os.Setenv("SPICE_ENVIRONMENT", "docker")
-		assert.EqualValues(t, context.Docker, context.CurrentContext())
-		context.SetContext(context.Undefined)
+// Tests SetDefaultContext()
+func testSetDefaultContext() func(*testing.T) {
+	return func(t *testing.T) {
+		// Ensure no context is set
+		context.SetContext(nil)
 
-		os.Setenv("SPICE_ENVIRONMENT", "")
-		assert.EqualValues(t, context.BareMetal, context.CurrentContext())
+		err := context.SetDefaultContext()
+		assert.NoError(t, err)
+
+		assert.IsType(t, &metal.MetalContext{}, context.CurrentContext())
 	}
 }

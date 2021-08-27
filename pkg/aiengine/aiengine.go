@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/logrusorgru/aurora"
-	"github.com/spiceai/spice/pkg/config"
 	"github.com/spiceai/spice/pkg/context"
 	"github.com/spiceai/spice/pkg/loggers"
 	"github.com/spiceai/spice/pkg/pods"
@@ -27,30 +26,20 @@ type AIEngineResponse struct {
 }
 
 const (
-	pythonCmd   string = "python"
-	aiServerUrl string = "localhost:8004"
+	aiServerUrl          = "localhost:8004"
+	pythonServerFilename = "main.py"
 )
 
 var (
 	execCommand         = exec.Command
 	aiengineClient      AIEngineClient
-	getClient                  = NewAIEngineClient
-	pythonPath          string = filepath.Join(config.AiEnginePath(), "venv", "bin", pythonCmd)
-	aiServerPath        string = filepath.Join(config.AiEnginePath(), "main.py")
+	getClient           = NewAIEngineClient
 	aiServerCmd         *exec.Cmd
 	aiServerRunning     chan bool
 	aiServerReady       bool        = false
 	aiSingleTrainingRun bool        = false
 	zaplog              *zap.Logger = loggers.ZapLogger()
 )
-
-func getPythonCmd() string {
-	if context.CurrentContext() == context.Docker {
-		return pythonCmd
-	}
-
-	return pythonPath
-}
 
 func StartServer(ready chan bool, isSingleRun bool) error {
 	if aiServerRunning != nil {
@@ -73,7 +62,9 @@ func StartServer(ready chan bool, isSingleRun bool) error {
 		log.Println(line)
 	}
 
-	aiServerCmd = execCommand(getPythonCmd(), aiServerPath)
+	context := context.CurrentContext()
+	aiServerPath := filepath.Join(context.AIEngineDir(), pythonServerFilename)
+	aiServerCmd = execCommand(context.AIEnginePythonCmdPath(), aiServerPath)
 	aiServerRunning := make(chan bool, 1)
 
 	var err error
@@ -105,7 +96,7 @@ func StartServer(ready chan bool, isSingleRun bool) error {
 		outScanner := bufio.NewScanner(stdOutPipe)
 		errScanner := bufio.NewScanner(stdErrPipe)
 
-		fileLogger, err := loggers.NewFileLogger("aiengine")
+		fileLogger, err := loggers.NewFileLogger("aiengine", context.SpiceRuntimeDir())
 		if err != nil {
 			zaplog.Sugar().Errorf("error creating file logger: %w", err)
 			fileLogger = nil

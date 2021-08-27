@@ -1,4 +1,4 @@
-package cmd
+package runtime
 
 import (
 	"bytes"
@@ -7,7 +7,9 @@ import (
 	"io"
 	"net/http"
 
+	"github.com/spf13/viper"
 	"github.com/spiceai/spice/pkg/config"
+	"github.com/spiceai/spice/pkg/context"
 	"github.com/spiceai/spice/pkg/pods"
 	"github.com/spiceai/spice/pkg/proto/runtime_pb"
 	"github.com/spiceai/spice/pkg/util"
@@ -20,9 +22,16 @@ type RuntimeClient struct {
 }
 
 func NewRuntimeClient(podName string) (*RuntimeClient, error) {
-	pod, runtimeConfig, err := GetPodAndConfiguration(podName)
+	pod, err := pods.FindPod(podName)
 	if err != nil {
 		return nil, err
+	}
+
+	v := viper.New()
+	appDir := context.CurrentContext().AppDir()
+	runtimeConfig, err := config.LoadRuntimeConfiguration(v, appDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load runtime configuration: %w", err)
 	}
 
 	serverBaseUrl := runtimeConfig.ServerBaseUrl()
@@ -34,15 +43,15 @@ func NewRuntimeClient(podName string) (*RuntimeClient, error) {
 	}, nil
 }
 
-func (r *RuntimeClient) ExportModel(exportModelPath *exportPathResult, tag string) error {
+func (r *RuntimeClient) ExportModel(directory string, filename string, tag string) error {
 	err := util.IsRuntimeServerHealthy(r.serverBaseUrl, http.DefaultClient)
 	if err != nil {
 		return fmt.Errorf("failed to reach %s. is the spice runtime running? %w", r.serverBaseUrl, err)
 	}
 
 	exportRequest := &runtime_pb.ExportModel{
-		Directory: exportModelPath.directory,
-		Filename:  exportModelPath.filename,
+		Directory: directory,
+		Filename:  filename,
 	}
 
 	exportRequestBytes, err := json.Marshal(&exportRequest)

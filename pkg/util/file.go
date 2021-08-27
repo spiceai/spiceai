@@ -138,3 +138,7 @@ func ReplaceEnvVariablesFromPath(filePath string, envVarPrefix string) ([]byte, 
 
 	return []byte(contentString), nil
 }
+
+func MakeFileExecutable(filepath string) error {
+	return os.Chmod(filepath, 0777)
+}

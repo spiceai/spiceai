@@ -194,7 +194,7 @@ func TestTrainingOutput(t *testing.T) {
 		}
 	})
 
-	err = cliClient.runCliCmd("pod", "train", "trader")
+	err = cliClient.runCliCmd("train", "trader", "--context", "metal")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -240,7 +240,7 @@ func TestImportExport(t *testing.T) {
 	}
 	defer runtimeCmd.Process.Kill() //nolint:errcheck
 
-	err = cliClient.runCliCmd("pod", "train", "trader")
+	err = cliClient.runCliCmd("train", "trader", "--context", "metal")
 	if err != nil {
 		t.Fatal(err)
 	}

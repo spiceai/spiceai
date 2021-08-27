@@ -12,7 +12,7 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 	"github.com/logrusorgru/aurora"
-	"github.com/spiceai/spice/pkg/config"
+	"github.com/spiceai/spice/pkg/context"
 )
 
 const (
@@ -36,7 +36,8 @@ func (c *FileConnector) Init(params map[string]string) error {
 
 	path := params["path"]
 	if !filepath.IsAbs(path) {
-		path = filepath.Join(config.AppPath(), path)
+		appDir := context.CurrentContext().AppDir()
+		path = filepath.Join(appDir, path)
 	}
 
 	c.path = path

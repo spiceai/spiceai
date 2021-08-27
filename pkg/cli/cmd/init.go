@@ -1,43 +1,34 @@
 package cmd
 
 import (
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 
-	"github.com/logrusorgru/aurora"
 	"github.com/spf13/cobra"
-	"github.com/spiceai/spice/pkg/config"
 	"github.com/spiceai/spice/pkg/context"
-	"github.com/spiceai/spice/pkg/registry"
 	"github.com/spiceai/spice/pkg/spec"
 	"github.com/spiceai/spice/pkg/util"
 	"gopkg.in/yaml.v2"
 )
 
-var podCmd = &cobra.Command{
-	Use:   "pod",
-	Short: "Pod actions",
-	Example: `
-spice pod install samples/CartPole
-`,
-}
-
-var podInitCmd = &cobra.Command{
+var initCmd = &cobra.Command{
 	Use:   "init",
-	Short: "Initializes a skeleton Spice Pod",
-	Long:  "Initializes a skeleton Spice Pod",
-	Args:  cobra.MinimumNArgs(1),
+	Short: "Initialize Pod - initializes a new pod in the project",
+	Example: `
+spice init <pod name>
+spice init trader
+`,
+	Args: cobra.MinimumNArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
-		context.SetContext(context.BareMetal)
 		podName := args[0]
 		podManifestFileName := fmt.Sprintf("%s.yaml", strings.ToLower(podName))
 
-		podsPath := config.PodsManifestsPath()
+		rtcontext := context.CurrentContext()
+		podsPath := rtcontext.PodsDir()
 		podManifestPath := filepath.Join(podsPath, podManifestFileName)
-		appRelativeManifestPath := config.GetSpiceAppRelativePath(podManifestPath)
+		appRelativeManifestPath := rtcontext.GetSpiceAppRelativePath(podManifestPath)
 
 		if _, err := os.Stat(podManifestPath); !os.IsNotExist(err) {
 			fmt.Printf("Pod manifest already exists at %s. Replace (y/n)? \n", appRelativeManifestPath)
@@ -91,73 +82,9 @@ var podInitCmd = &cobra.Command{
 
 		fmt.Printf("Spice pod manifest initialized at %s!\n", appRelativeManifestPath)
 	},
-	Example: `
-spice pod init trader	
-`,
-}
-
-var podAddCmd = &cobra.Command{
-	Use:   "add",
-	Short: "Adds a Spice Pod into your app",
-	Args:  cobra.MinimumNArgs(1),
-	Run: func(cmd *cobra.Command, args []string) {
-		context.SetContext(context.BareMetal)
-		podPath := args[0]
-
-		fmt.Printf("Getting Pod %s ...\n", podPath)
-
-		r := registry.GetRegistry(podPath)
-		downloadPath, err := r.GetPod(podPath)
-		if err != nil {
-			var itemNotFound *registry.RegistryItemNotFound
-			if errors.As(err, &itemNotFound) {
-				fmt.Printf("No pod found with the name '%s'.\n", podPath)
-			} else {
-				fmt.Println(err)
-			}
-			return
-		}
-
-		relativePath := config.GetSpiceAppRelativePath(downloadPath)
-
-		fmt.Printf("Added %s\n", relativePath)
-	},
-	Example: `
-spice pod add samples/CartPole-V1
-`,
-}
-
-var podTrainCmd = &cobra.Command{
-	Use:   "train",
-	Short: "Starts training run for this pod",
-	Args:  cobra.MinimumNArgs(1),
-	Run: func(cmd *cobra.Command, args []string) {
-		context.SetContext(context.BareMetal)
-		podName := args[0]
-
-		runtimeClient, err := NewRuntimeClient(podName)
-		if err != nil {
-			fmt.Println(err.Error())
-			return
-		}
-
-		err = runtimeClient.StartTraining()
-		if err != nil {
-			fmt.Println(err.Error())
-			return
-		}
-
-		fmt.Println(aurora.Green("training started!"))
-	},
-	Example: `
-spice pod train CartPole-V1
-`,
 }
 
 func init() {
-	podCmd.AddCommand(podInitCmd)
-	podCmd.AddCommand(podAddCmd)
-	podCmd.AddCommand(podTrainCmd)
-	podCmd.Flags().BoolP("help", "h", false, "Print this help message")
-	RootCmd.AddCommand(podCmd)
+	initCmd.Flags().BoolP("help", "h", false, "Print this help message")
+	RootCmd.AddCommand(initCmd)
 }

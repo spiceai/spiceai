@@ -225,19 +225,23 @@ func testInferServerFunc() func(*testing.T) {
 
 func testPythonCmdDockerContextFunc() func(*testing.T) {
 	return func(t *testing.T) {
-		context.SetContext(context.Docker)
-		actual := getPythonCmd()
-		assert.Equal(t, "python", actual)
+		rtcontext, err := context.NewContext("docker")
+		assert.NoError(t, err)
+
+		actual := rtcontext.AIEnginePythonCmdPath()
+		assert.Equal(t, "python3", actual)
 	}
 }
 
 func testPythonCmdBareMetalContextFunc() func(*testing.T) {
 	return func(t *testing.T) {
 		homePath := os.Getenv("HOME")
-		expectedPython := filepath.Join(homePath, ".spice/bin/ai/venv/bin/python")
+		expectedPython := filepath.Join(homePath, ".spice/bin/ai/venv/bin/python3")
 
-		context.SetContext(context.BareMetal)
-		actual := getPythonCmd()
+		rtcontext, err := context.NewContext("metal")
+		assert.NoError(t, err)
+
+		actual := rtcontext.AIEnginePythonCmdPath()
 		assert.Equal(t, expectedPython, actual)
 	}
 }
@@ -269,7 +273,7 @@ func testStartServerFunc() func(*testing.T) {
 		<-ready
 		assert.NotNil(t, aiServerCmd)
 		actualPythonCmd := aiServerCmd.Args[3]
-		assert.Equal(t, filepath.Join(os.Getenv("HOME"), ".spice/bin/ai/venv/bin/python"), actualPythonCmd)
+		assert.Equal(t, filepath.Join(os.Getenv("HOME"), ".spice/bin/ai/venv/bin/python3"), actualPythonCmd)
 		actualArg := aiServerCmd.Args[4]
 		assert.Equal(t, filepath.Join(os.Getenv("HOME"), ".spice/bin/ai/main.py"), actualArg)
 	}
