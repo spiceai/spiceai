@@ -57,6 +57,10 @@ jobs:
         working-directory: dashboard
         run: make
 
+      - name: Test dashboard
+        run: yarn test
+        working-directory: dashboard
+
       - name: go vet
         run: go vet ./...
 
