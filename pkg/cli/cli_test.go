@@ -16,9 +16,9 @@ func TestCLI(t *testing.T) {
 	t.Cleanup(cleanup)
 
 	// These tests simulate a real workflow and should run in sequence
-	t.Run("podInitCmd() - spice pod init foo creates a skeleton pod", testPodInit(cmd.RootCmd))
+	t.Run("initCmd() - spice init foo creates a skeleton pod", testInit(cmd.RootCmd))
 	t.Run("actionAddCmd() - spice action add jump adds an action", testActionAddCmd(cmd.RootCmd))
-	t.Run("rewardsAddCmd() - spice rewards add adds default rewards", testRewardsAddCmd(cmd.RootCmd))
+	t.Run("rewardAddCmd() - spice reward add adds default rewards", testRewardsAddCmd(cmd.RootCmd))
 }
 
 func init() {
@@ -62,9 +62,9 @@ func executeCommand(root *cobra.Command, args ...string) (output string, err err
 }
 
 // Tests pod init creates a loadable skeleton pod
-func testPodInit(root *cobra.Command) func(*testing.T) {
+func testInit(root *cobra.Command) func(*testing.T) {
 	return func(t *testing.T) {
-		_, err := executeCommand(root, "pod", "init", "foo")
+		_, err := executeCommand(root, "init", "foo")
 		assert.NoError(t, err)
 		_, err = os.Stat(".spice/pods/foo.yaml")
 		assert.NoError(t, err)
@@ -90,7 +90,7 @@ func testActionAddCmd(root *cobra.Command) func(*testing.T) {
 // Tests rewards add adds default rewards
 func testRewardsAddCmd(root *cobra.Command) func(*testing.T) {
 	return func(t *testing.T) {
-		_, err := executeCommand(root, "rewards", "add")
+		_, err := executeCommand(root, "reward", "add")
 		assert.NoError(t, err)
 
 		pod, err := pods.LoadPodFromManifest(".spice/pods/foo.yaml")

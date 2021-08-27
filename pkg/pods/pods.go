@@ -1,12 +1,13 @@
 package pods
 
 import (
+	"fmt"
 	"io/ioutil"
 	"log"
 	"path/filepath"
 
 	"github.com/logrusorgru/aurora"
-	"github.com/spiceai/spice/pkg/config"
+	"github.com/spiceai/spice/pkg/context"
 	"github.com/spiceai/spice/pkg/util"
 )
 
@@ -28,8 +29,27 @@ func RemovePod(name string) {
 	delete(pods, name)
 }
 
+func FindPod(podName string) (*Pod, error) {
+	podPath := FindFirstManifestPath()
+	if podPath == "" {
+		return nil, fmt.Errorf("no pods detected")
+	}
+
+	pod, err := LoadPodFromManifest(podPath)
+	if err != nil {
+		return nil, err
+	}
+
+	if pod.Name != podName {
+		fmt.Printf("the pod %s does not exist\n", podName)
+		return nil, fmt.Errorf("the pod %s does not exist", podName)
+	}
+
+	return pod, nil
+}
+
 func RemovePodByManifestPath(manifestPath string) {
-	relativePath := config.GetSpiceAppRelativePath(manifestPath)
+	relativePath := context.CurrentContext().GetSpiceAppRelativePath(manifestPath)
 	for _, pod := range pods {
 		if pod.ManifestPath() == manifestPath {
 			log.Printf("Removing pod %s: %s\n", aurora.Bold(pod.Name), aurora.Gray(12, relativePath))
@@ -40,7 +60,7 @@ func RemovePodByManifestPath(manifestPath string) {
 }
 
 func FindFirstManifestPath() string {
-	podsPath := config.PodsManifestsPath()
+	podsPath := context.CurrentContext().PodsDir()
 	files, err := ioutil.ReadDir(podsPath)
 	if err != nil {
 		log.Fatal(err.Error())

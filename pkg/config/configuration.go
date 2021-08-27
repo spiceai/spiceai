@@ -9,39 +9,14 @@ import (
 	"time"
 
 	"github.com/spf13/viper"
+	"github.com/spiceai/spice/pkg/constants"
 	"github.com/spiceai/spice/pkg/util"
 	"gopkg.in/yaml.v2"
 )
 
-var (
-	SpiceEnvVarPrefix string = "SPICE_"
-)
-
 type SpiceConfiguration struct {
-	HttpPort            uint                      `json:"http_port,omitempty" mapstructure:"http_port,omitempty" yaml:"http_port,omitempty"`
-	CustomDashboardPath *string                   `json:"custom_dashboard_path,omitempty" mapstructure:"custom_dashboard_path,omitempty" yaml:"custom_dashboard_path,omitempty"`
-	Connections         map[string]ConnectionSpec `json:"connections,omitempty" yaml:"connections,omitempty"`
-	Pods                []PodSpec                 `json:"pods,omitempty" yaml:"pods,omitempty"`
-}
-
-type ConnectionSpec struct {
-	Name  string `json:"name,omitempty" yaml:"name,omitempty"`
-	Token string `json:"token,omitempty" yaml:"token,omitempty"`
-}
-
-type PodSpec struct {
-	Name   string      `json:"name,omitempty" yaml:"name,omitempty"`
-	Models *ModelsSpec `json:"models,omitempty" yaml:"models,omitempty"`
-}
-
-type ModelsSpec struct {
-	Downloader *GitHubModelDownloaderSpec `json:"downloader,omitempty" yaml:"downloader,omitempty"`
-	Keep       uint                       `json:"keep,omitempty" yaml:"keep,omitempty"`
-}
-
-type GitHubModelDownloaderSpec struct {
-	Uses   string  `json:"uses,omitempty" yaml:"uses,omitempty"`
-	Branch *string `json:"branch,omitempty" yaml:"branch,omitempty"`
+	HttpPort            uint    `json:"http_port,omitempty" mapstructure:"http_port,omitempty" yaml:"http_port,omitempty"`
+	CustomDashboardPath *string `json:"custom_dashboard_path,omitempty" mapstructure:"custom_dashboard_path,omitempty" yaml:"custom_dashboard_path,omitempty"`
 }
 
 func LoadDefaultConfiguration() *SpiceConfiguration {
@@ -50,8 +25,9 @@ func LoadDefaultConfiguration() *SpiceConfiguration {
 	}
 }
 
-func LoadRuntimeConfiguration(v *viper.Viper) (*SpiceConfiguration, error) {
-	v.AddConfigPath(".spice")
+func LoadRuntimeConfiguration(v *viper.Viper, appDir string) (*SpiceConfiguration, error) {
+	spiceAppPath := filepath.Join(appDir, constants.DotSpice)
+	v.AddConfigPath(spiceAppPath)
 	v.SetConfigName("config")
 	v.SetConfigType("yaml")
 
@@ -65,7 +41,7 @@ func LoadRuntimeConfiguration(v *viper.Viper) (*SpiceConfiguration, error) {
 	}
 
 	if configPath != "" {
-		configBytes, err := util.ReplaceEnvVariablesFromPath(configPath, SpiceEnvVarPrefix)
+		configBytes, err := util.ReplaceEnvVariablesFromPath(configPath, constants.SpiceEnvVarPrefix)
 		if err != nil {
 			return nil, err
 		}
@@ -77,7 +53,6 @@ func LoadRuntimeConfiguration(v *viper.Viper) (*SpiceConfiguration, error) {
 	} else {
 		// No config file found, use defaults
 		config = LoadDefaultConfiguration()
-		spiceAppPath := AppSpicePath()
 		configPath := filepath.Join(spiceAppPath, "config.yaml")
 		marshalledConfig, err := yaml.Marshal(config)
 		if err != nil {

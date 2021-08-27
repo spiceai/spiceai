@@ -13,6 +13,7 @@ def get_init_from_json(init_data_path: str, pod_name: str) -> aiengine_pb2.InitR
         granularity=int(pod_init_json["granularity"]),
         epoch_time=int(pod_init_json["epoch_time"]),
         actions=pod_init_json["actions"],
+        actions_order=pod_init_json["actions_order"],
         fields=pod_init_json["fields"],
         laws=pod_init_json["laws"],
     )

@@ -51,6 +51,14 @@ func (a *aiEngineClient) GetHealth(ctx context.Context, in *aiengine_pb.HealthRe
 	return a.client.GetHealth(ctx, in, opts...)
 }
 
+func (a *aiEngineClient) ExportModel(ctx context.Context, in *aiengine_pb.ExportModelRequest, opts ...grpc.CallOption) (*aiengine_pb.ExportModelResult, error) {
+	return a.client.ExportModel(ctx, in, opts...)
+}
+
+func (a *aiEngineClient) ImportModel(ctx context.Context, in *aiengine_pb.ImportModelRequest, opts ...grpc.CallOption) (*aiengine_pb.Response, error) {
+	return a.client.ImportModel(ctx, in, opts...)
+}
+
 func (a *aiEngineClient) Close() error {
 	err := a.conn.Close()
 	if err != nil {

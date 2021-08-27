@@ -6,49 +6,27 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/spiceai/spice/pkg/cli/runtime"
-	"github.com/spiceai/spice/pkg/context"
 )
 
-var (
-	baremetal bool
-)
-
-var RunCmd = &cobra.Command{
+var runCmd = &cobra.Command{
 	Use:   "run",
-	Short: "Run Spice, install if necessary.",
+	Short: "Run Spice AI - starts the Spice AI runtime, installing if necessary",
 	Example: `
-# Run Spice, install if necessary
 spice run
 
-# See more at: https://docs.spiceai.io/getting-started/
+# See more at: https://spiceai.github.io/docs
 `,
 	Run: func(cmd *cobra.Command, args []string) {
-		Run(baremetal, "")
+		err := runtime.Run(contextFlag, "")
+		if err != nil {
+			fmt.Println(err.Error())
+			os.Exit(1)
+		}
 	},
 }
 
-func Run(baremetal bool, manifestPath string) {
-	var cliContext context.RuntimeContext = context.Docker
-	if baremetal {
-		cliContext = context.BareMetal
-	}
-
-	// Dependencies
-	err := runtime.Init(cliContext)
-	if err != nil {
-		fmt.Println(err.Error())
-		os.Exit(1)
-	}
-
-	err = runtime.Run(cliContext, manifestPath)
-	if err != nil {
-		fmt.Println(err.Error())
-		os.Exit(1)
-	}
-}
-
 func init() {
-	RunCmd.Flags().BoolVarP(&baremetal, "baremetal", "b", false, "Starts the runtime and AI Engine in a local process, not in Docker")
-	RunCmd.Flags().BoolP("help", "h", false, "Print this help message")
-	RootCmd.AddCommand(RunCmd)
+	runCmd.Flags().StringVar(&contextFlag, "context", "docker", "Runs Spice AI in the given context, either 'docker' or 'metal'")
+	runCmd.Flags().BoolP("help", "h", false, "Print this help message")
+	RootCmd.AddCommand(runCmd)
 }

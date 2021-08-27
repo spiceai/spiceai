@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"golang.org/x/mod/semver"
 )
 
 type RepoRelease struct {
@@ -27,7 +29,25 @@ type RepoRelease struct {
 	Assets          []ReleaseAsset `json:"assets"`
 }
 
-func GetReleases(gh *GitHubClient) ([]RepoRelease, error) {
+type RepoReleases []RepoRelease
+
+func (r RepoReleases) Len() int {
+	return len(r)
+}
+
+func (r RepoReleases) Less(i, j int) bool {
+	one := r[i]
+	two := r[j]
+
+	// Compare the releases via a semver comparison in descending order
+	return semver.Compare(one.TagName, two.TagName) == 1
+}
+
+func (r RepoReleases) Swap(i, j int) {
+	r[i], r[j] = r[j], r[i]
+}
+
+func GetReleases(gh *GitHubClient) (RepoReleases, error) {
 	releasesURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/releases", gh.Owner, gh.Repo)
 	body, err := gh.Get(releasesURL, nil)
 	if err != nil {
@@ -41,6 +61,18 @@ func GetReleases(gh *GitHubClient) ([]RepoRelease, error) {
 	}
 
 	return githubRepoReleases, nil
+}
+
+func GetReleaseByAssetName(releases RepoReleases, assetName string) *RepoRelease {
+	for _, release := range releases {
+		for _, asset := range release.Assets {
+			if asset.Name == assetName {
+				return &release
+			}
+		}
+	}
+
+	return nil
 }
 
 func GetLatestReleaseTagName(gh *GitHubClient) (string, error) {

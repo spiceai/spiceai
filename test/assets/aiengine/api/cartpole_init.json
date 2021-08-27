@@ -23,5 +23,9 @@
     "left": "reward = 0 if new_state.gym_CartPole_is_done == 1 else 1",
     "right": "reward = 0 if new_state.gym_CartPole_is_done == 1 else 1"
   },
+  "actions_order": {
+    "left": 0,
+    "right": 1
+  },
   "laws": null
 }

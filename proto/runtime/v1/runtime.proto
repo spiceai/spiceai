@@ -1,0 +1,37 @@
+syntax = "proto3";
+
+package runtime;
+
+option go_package = "github.com/spiceai/spice/pkg/proto/runtime_pb";
+
+message ExportModel {
+  string directory = 1;
+  string filename = 2;
+}
+
+message ImportModel {
+  string pod = 1;
+  string tag = 2;
+  string archive_path = 3;
+}
+
+message Episode {
+  uint64 episode = 1;
+  int64 start = 2;
+  int64 end = 3;
+  double score = 4;
+  map<string, uint64> actions_taken = 5;
+  string error = 6;
+  string error_message = 7;
+}
+
+message Flight {
+  int64 start = 1;
+  int64 end = 2;
+  repeated Episode episodes = 3;
+}
+
+message Pod {
+  string name = 1;
+  string manifest_path = 2;
+}

@@ -17,12 +17,14 @@ func TestRegistry(t *testing.T) {
 
 func testGetPod() func(*testing.T) {
 	return func(t *testing.T) {
-		r := registry.GetRegistry("file://../../test/assets/pods/manifests/trader.yaml")
-		_, err := r.GetPod("../../test/assets/pods/manifests/trader.yaml")
+		manifestPath := "../../test/assets/pods/manifests/trader.yaml"
+		r := registry.GetRegistry(manifestPath)
+		_, err := r.GetPod(manifestPath)
 		assert.NoError(t, err)
 
 		pod, err := pods.LoadPodFromManifest(".spice/pods/trader.yaml")
-		assert.NoError(t, err)
-		assert.Contains(t, pod.Name, "trader")
+		if assert.NoError(t, err) {
+			assert.Contains(t, pod.Name, "trader")
+		}
 	}
 }

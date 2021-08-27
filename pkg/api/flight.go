@@ -1,23 +1,20 @@
 package api
 
-import "github.com/spiceai/spice/pkg/flights"
+import (
+	"github.com/spiceai/spice/pkg/flights"
+	"github.com/spiceai/spice/pkg/proto/runtime_pb"
+)
 
-type Flight struct {
-	Start    int64       `json:"start"`
-	End      int64       `json:"end"`
-	Episodes *[]*Episode `json:"episodes"`
-}
-
-func NewFlight(f *flights.Flight) *Flight {
-	episodes := make([]*Episode, 0)
+func NewFlight(f *flights.Flight) *runtime_pb.Flight {
+	episodes := make([]*runtime_pb.Episode, 0)
 	for _, ep := range f.Episodes() {
 		episode := NewEpisode(ep)
 		episodes = append(episodes, episode)
 	}
 
-	return &Flight{
+	return &runtime_pb.Flight{
 		Start:    f.Start().Unix(),
 		End:      f.End().Unix(),
-		Episodes: &episodes,
+		Episodes: episodes,
 	}
 }

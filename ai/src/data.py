@@ -18,6 +18,7 @@ class DataManager:
         granularity_secs: pd.Timedelta,
         fields: "dict[str]",
         action_rewards: "dict[str]",
+        actions_order: "dict[int]",
         laws: "list[str]",
     ):
         self.fields = fields
@@ -40,8 +41,12 @@ class DataManager:
 
         self.current_time: pd.Timestamp = None
         self.action_rewards = action_rewards
-        self.action_names = list(action_rewards.keys())
         self.table_lock = threading.Lock()
+
+        self.action_names = [None] * len(actions_order)
+
+        for action in actions_order:
+            self.action_names[actions_order[action]] = action
 
     def get_window_span(self):
         return math.floor(self.interval_secs / self.granularity_secs)

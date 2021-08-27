@@ -102,8 +102,8 @@ A [Spice AI Pod](https://crispy-dollop-c329115a.pages.github.io/#/concepts/READM
 
 The first Spice AI Pod you will create and train is based off an [Open AI gym](https://gym.openai.com/) example called [CartPole-v1](https://gym.openai.com/envs/CartPole-v1/). Open AI describes CartPole as:
 
->A pole is attached by an un-actuated joint to a cart, which moves along a frictionless track. The system is controlled by applying a force of +1 or -1 to the cart. The pendulum starts upright, and the goal is to prevent it from falling over. A reward of +1 is provided for every timestep that the pole remains upright. The episode ends when the pole is more than 15 degrees from vertical, or the cart moves more than 2.4 units from the center.
-Source: https://gym.openai.com/envs/CartPole-v1/
+> A pole is attached by an un-actuated joint to a cart, which moves along a frictionless track. The system is controlled by applying a force of +1 or -1 to the cart. The pendulum starts upright, and the goal is to prevent it from falling over. A reward of +1 is provided for every timestep that the pole remains upright. The episode ends when the pole is more than 15 degrees from vertical, or the cart moves more than 2.4 units from the center.
+> Source: [gym.openai.com/envs/CartPole-v1](https://gym.openai.com/envs/CartPole-v1/)
 
 We will use Spice AI to train a pod that can play the game.
 
@@ -125,7 +125,7 @@ spice run
 In the original terminal instance, add the CartPole-v1 sample pod:
 
 ```bash
-spice pod add samples/CartPole-v1
+spice add samples/CartPole-v1
 ```
 
 The Spice CLI will download the CartPole-v1 sample pod manifest and add it to your project at `.spice/pods/cartpole-v1.yaml`.
@@ -143,7 +143,7 @@ Navigate to [http://localhost:8000](http://localhost:8000) in your favorite brow
 The runtime will automatically detect changes to your pod manifest and start training. In addition, you can trigger training by using the Spice CLI from within your app directory.
 
 ```bash
-spice pod train cartpole-v1
+spice train cartpole-v1
 ```
 
 ### Get a recommendation from your pod

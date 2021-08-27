@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"errors"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -33,7 +32,7 @@ func WriteToExistingFile(filePath string, contentToWrite []byte) error {
 		return err
 	}
 
-	err = ioutil.WriteFile(filePath, contentToWrite, fileStats.Mode())
+	err = os.WriteFile(filePath, contentToWrite, fileStats.Mode())
 	if err != nil {
 		return err
 	}
@@ -124,7 +123,7 @@ func ExtractTarGz(body []byte, downloadDir string) error {
 // as Viper's AutomaticEnv() doesn't work with Unmarshal() and the workarounds do not work for nested structures.
 // See https://github.com/spf13/viper/issues/761
 func ReplaceEnvVariablesFromPath(filePath string, envVarPrefix string) ([]byte, error) {
-	content, err := ioutil.ReadFile(filePath)
+	content, err := os.ReadFile(filePath)
 	if err != nil {
 		return nil, err
 	}
@@ -138,4 +137,8 @@ func ReplaceEnvVariablesFromPath(filePath string, envVarPrefix string) ([]byte, 
 	}
 
 	return []byte(contentString), nil
+}
+
+func MakeFileExecutable(filepath string) error {
+	return os.Chmod(filepath, 0777)
 }

@@ -8,13 +8,14 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 	"github.com/spiceai/spice/pkg/aiengine"
-	"github.com/spiceai/spice/pkg/config"
+	"github.com/spiceai/spice/pkg/context"
 	"github.com/spiceai/spice/pkg/pods"
 )
 
 func ensurePodsPathExists() error {
-	if _, err := os.Stat(config.PodsManifestsPath()); os.IsNotExist(err) {
-		err := os.MkdirAll(config.PodsManifestsPath(), 0766)
+	podsDir := context.CurrentContext().PodsDir()
+	if _, err := os.Stat(podsDir); os.IsNotExist(err) {
+		err := os.MkdirAll(podsDir, 0766)
 		if err != nil {
 			return err
 		}
@@ -23,7 +24,7 @@ func ensurePodsPathExists() error {
 }
 
 func watchPods() error {
-	spiceWorkspace := config.PodsManifestsPath()
+	podsDir := context.CurrentContext().PodsDir()
 	if err := ensurePodsPathExists(); err != nil {
 		// Ignore this error, just don't watch
 		return nil
@@ -32,12 +33,12 @@ func watchPods() error {
 	go func() {
 		watcher, err := fsnotify.NewWatcher()
 		if err != nil {
-			log.Println(fmt.Errorf("error starting '%s' watcher: %w", spiceWorkspace, err))
+			log.Println(fmt.Errorf("error starting '%s' watcher: %w", podsDir, err))
 		}
 		defer watcher.Close()
 
-		if err := watcher.Add(spiceWorkspace); err != nil {
-			log.Println(fmt.Errorf("error starting '%s' watcher: %w", spiceWorkspace, err))
+		if err := watcher.Add(podsDir); err != nil {
+			log.Println(fmt.Errorf("error starting '%s' watcher: %w", podsDir, err))
 		}
 		for {
 			select {
@@ -47,7 +48,7 @@ func watchPods() error {
 					log.Println(err)
 				}
 			case err := <-watcher.Errors:
-				log.Println(fmt.Errorf("error from '%s' watcher: %w", spiceWorkspace, err))
+				log.Println(fmt.Errorf("error from '%s' watcher: %w", podsDir, err))
 			}
 		}
 	}()

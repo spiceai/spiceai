@@ -11,7 +11,9 @@ import (
 
 	"github.com/spf13/viper"
 	"github.com/spiceai/spice/pkg/config"
+	"github.com/spiceai/spice/pkg/context"
 	"github.com/spiceai/spice/pkg/testutils"
+	"github.com/stretchr/testify/assert"
 )
 
 func TestConfig(t *testing.T) {
@@ -32,7 +34,8 @@ func testRuntimeConfigLoads(testConfigPath string) func(*testing.T) {
 		copyFile(testConfigPath, tempConfigPath)
 
 		viper := viper.New()
-		spiceConfiguration, err := config.LoadRuntimeConfiguration(viper)
+		rtcontext := context.CurrentContext()
+		spiceConfiguration, err := config.LoadRuntimeConfiguration(viper, rtcontext.AppDir())
 		if err != nil {
 			t.Error(err)
 			return
@@ -40,41 +43,6 @@ func testRuntimeConfigLoads(testConfigPath string) func(*testing.T) {
 
 		actual := strconv.Itoa(int(spiceConfiguration.HttpPort))
 		expected := "8000"
-
-		if !reflect.DeepEqual(expected, actual) {
-			t.Errorf("Expected:\n%v\nGot:\n%v", expected, actual)
-		}
-
-		actual = spiceConfiguration.Connections["github"].Name
-		expected = "foo/bar"
-
-		if !reflect.DeepEqual(expected, actual) {
-			t.Errorf("Expected:\n%v\nGot:\n%v", expected, actual)
-		}
-
-		actual = spiceConfiguration.Connections["github"].Token
-		expected = "rawtoken"
-
-		if !reflect.DeepEqual(expected, actual) {
-			t.Errorf("Expected:\n%v\nGot:\n%v", expected, actual)
-		}
-
-		actual = spiceConfiguration.Pods[0].Name
-		expected = "trader"
-
-		if !reflect.DeepEqual(expected, actual) {
-			t.Errorf("Expected:\n%v\nGot:\n%v", expected, actual)
-		}
-
-		actual = spiceConfiguration.Pods[0].Models.Downloader.Uses
-		expected = "github"
-
-		if !reflect.DeepEqual(expected, actual) {
-			t.Errorf("Expected:\n%v\nGot:\n%v", expected, actual)
-		}
-
-		actual = strconv.Itoa(int(spiceConfiguration.Pods[0].Models.Keep))
-		expected = "10"
 
 		if !reflect.DeepEqual(expected, actual) {
 			t.Errorf("Expected:\n%v\nGot:\n%v", expected, actual)
@@ -88,7 +56,7 @@ func testRuntimeConfigReplacesEnvironmentVariables(testConfigPath string) func(*
 		testutils.EnsureTestSpiceDirectory(t)
 
 		// Go 1.17 includes a Setenv on the testing pkg, but for now we will just set/unset with the os package
-		testEnvVar := "SPICE_TOKEN_TO_REPLACE"
+		testEnvVar := "SPICE_DASHBOARD_TO_REPLACE"
 		if os.Getenv(testEnvVar) != "" {
 			t.Errorf("%s must not be set during tests", testEnvVar)
 		}
@@ -100,15 +68,16 @@ func testRuntimeConfigReplacesEnvironmentVariables(testConfigPath string) func(*
 		copyFile(testConfigPath, tempConfigPath)
 
 		viper := viper.New()
-		spiceConfiguration, err := config.LoadRuntimeConfiguration(viper)
+		rtcontext := context.CurrentContext()
+		spiceConfiguration, err := config.LoadRuntimeConfiguration(viper, rtcontext.AppDir())
 		if err != nil {
 			t.Error(err)
 			os.Unsetenv(testEnvVar)
 			return
 		}
 
-		actual := spiceConfiguration.Connections["github"].Token
-		if !reflect.DeepEqual(expected, actual) {
+		actual := *spiceConfiguration.CustomDashboardPath
+		if !assert.Equal(t, expected, actual) {
 			t.Errorf("Expected:\n%v\nGot:\n%v", expected, actual)
 			os.Unsetenv(testEnvVar)
 		}

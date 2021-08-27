@@ -10,6 +10,8 @@ service AIEngine {
   rpc StartTraining(StartTrainingRequest) returns (Response);
   rpc GetInference(InferenceRequest) returns (InferenceResult);
   rpc GetHealth(HealthRequest) returns (Response);
+  rpc ExportModel(ExportModelRequest) returns (ExportModelResult);
+  rpc ImportModel(ImportModelRequest) returns (Response);
 }
 
 message DataConnector {
@@ -29,15 +31,21 @@ message InitRequest {
   int64 granularity = 4;
   int64 epoch_time = 5;
   map<string, string> actions = 6;
-  map<string, double> fields = 7;
-  repeated string laws = 8;
-  repeated DataSource datasources = 9;
+  map<string, int32> actions_order = 7;
+  map<string, double> fields = 8;
+  repeated string laws = 9;
+  repeated DataSource datasources = 10;
 }
 
 message Response {
   string result = 1;
   string message = 2;
   bool error = 3;
+}
+
+message ExportModelResult {
+  Response response = 1;
+  string model_path = 2;
 }
 
 message StartTrainingRequest {
@@ -68,3 +76,14 @@ message AddDataRequest {
 }
 
 message HealthRequest {}
+
+message ExportModelRequest {
+  string pod = 1;
+  string tag = 2;
+}
+
+message ImportModelRequest {
+  string pod = 1;
+  string tag = 2;
+  string import_path = 3;
+}
