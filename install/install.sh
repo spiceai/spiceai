@@ -212,18 +212,11 @@ checkShell() {
 }
 
 addToProfile() {
-  echo -e "Add the line:\n"
+  echo -e "Adding the line:\n"
   echo -e "  ${white}$1${reset}\n"
-  echo -e "to your shell profile at '${blue}$SHELL_TO_USE${reset}' ?\n"
-  read -p "[y/n] " -n 1 -r
-  echo
-  if [[ $REPLY =~ ^[Yy]$ ]]; then
-    echo "Adding to PATH"
-    echo -e "$1" >> $SHELL_TO_USE
-    echo "Added! You may need to restart your shell to be able to run 'spice'"
-  else
-    echo "Not adding to PATH"
-  fi
+  echo -e "to your shell profile at '${blue}$SHELL_TO_USE${reset}'\n"
+  echo -e "$1" >> $SHELL_TO_USE
+  echo "Added! You may need to restart your shell to be able to run 'spice'"
 }
 
 installCompleted() {
