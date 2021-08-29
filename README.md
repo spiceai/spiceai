@@ -1,7 +1,7 @@
 # Spice.ai
 
-[![spiced](https://github.com/spiceai/spice/actions/workflows/spiced.yml/badge.svg?branch=trunk&event=push)](https://github.com/spiceai/spice/actions/workflows/spiced.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-yellow.svg)](https://opensource.org/licenses/Apache-2.0)
+[![spiced](https://github.com/spiceai/spiceai/actions/workflows/spiced.yml/badge.svg?branch=trunk&event=push)](https://github.com/spiceai/spice/actions/workflows/spiced.yml)
 [![Discord](https://img.shields.io/discord/803820740868571196)](https://discord.com/channels/803820740868571196/803820740868571199)
 ![Subreddit subscribers](https://img.shields.io/reddit/subreddit-subscribers/spiceai?style=social)
 [![Follow on Twitter](https://img.shields.io/twitter/follow/spiceaihq.svg?style=social&logo=twitter)](https://twitter.com/intent/follow?screen_name=spiceaihq)
@@ -36,7 +36,9 @@ Follow this guide to get started quickly with Spice.ai. For a more comphrehensiv
 
 We highly recommend using [GitHub Codespaces](https://github.com/features/codespaces) to get started. Codespaces enables you to run Spice.ai in a virtual environment in the cloud. If you use Codespaces, the following prerequisites are not required and you may skip to the [Getting Started with Codespaces](https://github.com/spiceai/spiceai#getting-started-with-codespaces) section.
 
-To continue with installation on your local machine, follow these steps:
+- Currently, only macOS and Linux are natively supported. [WSL 2](https://docs.microsoft.com/en-us/windows/wsl/install-win10) is required for Windows.
+- ## arm64 is not yet supported (i.e. Apple's M1 Macs). We use M1s ourselves, so we hope to support this very soon :-)
+  To continue with installation on your local machine, follow these steps:
 
 1. Install Docker
 2. Generate and export a GitHub PAT
@@ -101,35 +103,32 @@ Once you open the Codespace, Spice.ai and everything you need to get started wil
 
 A [Spice.ai Pod](https://crispy-dollop-c329115a.pages.github.io/#/concepts/README?id=pod-pod-manifest) is simply a collection of configuration and data that you use to train and deploy your own AI.
 
-The first Spice.ai Pod you will create and train is based off an [Open AI gym](https://gym.openai.com/) example called [CartPole-v1](https://gym.openai.com/envs/CartPole-v1/). Open AI describes CartPole as:
+The first Spice AI Pod you will create and train is based off of a problem that many system administrators are familiar with: **server maintenance**. Application and system logging is critical part of running a production service, but letting those logs build up can cause other issues, especially if those logs end up filling the entire disk! It is simple enough to run a utility at a certain time every day to ensure this doesn't happen, but what if we choose to run the cleanup in the middle of peak traffic to the server?
 
-> A pole is attached by an un-actuated joint to a cart, which moves along a frictionless track. The system is controlled by applying a force of +1 or -1 to the cart. The pendulum starts upright, and the goal is to prevent it from falling over. A reward of +1 is provided for every timestep that the pole remains upright. The episode ends when the pole is more than 15 degrees from vertical, or the cart moves more than 2.4 units from the center.
-> Source: [gym.openai.com/envs/CartPole-v1](https://gym.openai.com/envs/CartPole-v1/)
+We will use Spice AI to train a pod that can intelligently learn when the best times are to run a cleanup job on a server. Let's call this example the `LogPruner`.
 
-We will use Spice.ai to train a pod that can play the game.
-
-Create a directory for the CartPole where you would normally put your code. E.g.
+Clone the Spice AI quickstarts repo in a directory where you would normally put your code. E.g.
 
 ```bash
 cd $HOME
-mkdir cartpole
-cd cartpole
+git clone https://github.com/spiceai/quickstarts
+cd quickstarts/logpruner
 ```
 
 In a new terminal window or tab, navigate to the directory and start the Spice runtime in development mode with `spice run`.
 
 ```bash
-cd $HOME/cartpole
+cd $HOME/quickstarts/logpruner
 spice run
 ```
 
-In the original terminal instance, add the CartPole-v1 sample pod:
+In the original terminal instance, add the LogPruner sample pod:
 
 ```bash
-spice add samples/CartPole-v1
+spice add samples/LogPruner
 ```
 
-The Spice CLI will download the CartPole-v1 sample pod manifest and add it to your project at `.spice/pods/cartpole-v1.yaml`.
+The Spice CLI will download the LogPruner sample pod manifest and add it to your project at `.spice/pods/logpruner.yaml`.
 
 The Spice runtime will then automatically detect the manifest and start your first training run!
 
@@ -137,14 +136,14 @@ The Spice runtime will then automatically detect the manifest and start your fir
 
 ### Observe your pod training
 
-Navigate to [http://localhost:8000](http://localhost:8000) in your favorite browser. You will see an overview of your pods. From here, you can click on the `cartpole-v1` pod to see a chart of the pod's training progress.
+Navigate to [http://localhost:8000](http://localhost:8000) in your favorite browser. You will see an overview of your pods. From here, you can click on the `logpruner` pod to see a chart of the pod's training progress.
 
 ### Retrain your pod
 
 The runtime will automatically detect changes to your pod manifest and start training. In addition, you can trigger training by using the Spice CLI from within your app directory.
 
 ```bash
-spice train cartpole-v1
+spice train logpruner
 ```
 
 ### Get a recommendation from your pod
@@ -152,18 +151,18 @@ spice train cartpole-v1
 After training your pod, you can now get a recommendation for an action from it!
 
 ```bash
-curl http://localhost:8000/api/v0.1/pods/cartpole-v1/inference
+curl http://localhost:8000/api/v0.1/pods/logpruner/inference
 ```
 
 ### Conclusion and next steps
 
 Congratulations! In just a few minutes you downloaded and installed the Spice.ai CLI and runtime, created your first Spice.ai Pod, trained it, and got a recommendation from it.
 
-This is just the start of your journey with AI. Next, try one of the quickstart tutorials for creating intelligent applications with Spice.ai.
+This is just the start of your journey with AI. Next, try one of the quickstart tutorials or in-depth samples for creating intelligent applications with Spice AI.
 
-**Quickstarts:**
+**Try:**
 
-- [Log Pruner](https://github.com/spiceai/quickstarts/tree/trunk/log-pruner) - a CPU load based log pruner
+- [Log Pruner sample](https://github.com/spiceai/samples/tree/trunk/logpruner) - a more in-depth version of the quickstart you just completed, using CPU metrics from your own machine
 - [Trader](https://github.com/spiceai/quickstarts/tree/trunk/trader) - a basic Bitcoin trading bot
 
 **Kubernetes:**

@@ -9,7 +9,7 @@ import (
 )
 
 func Run(contextFlag string, manifestPath string) error {
-	fmt.Println("Spice.ai runtime starting...")
+	fmt.Println("Spice AI runtime starting...")
 
 	rtcontext, err := context.NewContext(contextFlag)
 	if err != nil {
@@ -26,7 +26,7 @@ func Run(contextFlag string, manifestPath string) error {
 	shouldInstall := false
 	var upgradeVersion string
 	if installRequired := rtcontext.IsRuntimeInstallRequired(); installRequired {
-		fmt.Println("The Spice.ai runtime has not yet been installed.")
+		fmt.Println("The Spice AI runtime has not yet been installed.")
 		shouldInstall = true
 	} else {
 		upgradeVersion, err = rtcontext.IsRuntimeUpgradeAvailable()

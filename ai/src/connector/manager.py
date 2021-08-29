@@ -1,4 +1,3 @@
-from connector.openai_gym import OpenAIGymConnector
 from connector.stateful import StatefulConnector
 import pandas as pd
 from enum import Enum
@@ -7,10 +6,9 @@ from typing import Union
 
 class ConnectorName(Enum):
     STATEFUL = "localstate"
-    OPENAI_GYM = "openai-gym"
 
 
-ConnectorSpec = Union[StatefulConnector, OpenAIGymConnector]
+ConnectorSpec = Union[StatefulConnector]
 
 
 class ConnectorManager:

@@ -20,7 +20,8 @@ const (
 )
 
 var (
-	shouldRunTest    *bool
+	shouldRunTest    bool
+	spicedContext    string
 	testDir          string
 	repoRoot         string
 	workingDirectory string
@@ -32,9 +33,10 @@ var (
 )
 
 func TestMain(m *testing.M) {
-	shouldRunTest = flag.Bool("e2e", false, "run e2e tests")
+	flag.BoolVar(&shouldRunTest, "e2e", false, "run e2e tests")
+	flag.StringVar(&spicedContext, "context", "docker", "specify --context <context> to spice CLI for spiced")
 	flag.Parse()
-	if !*shouldRunTest {
+	if !shouldRunTest {
 		os.Exit(m.Run())
 	}
 
@@ -108,6 +110,12 @@ func TestMain(m *testing.M) {
 		log.Println(err.Error())
 		os.Exit(1)
 	}
+	
+	err = cliClient.runCliCmd("add", "test/Trader")
+	if err != nil {
+		log.Println(err.Error())
+		os.Exit(1)
+	}
 
 	testCode := m.Run()
 
@@ -120,7 +128,7 @@ func TestMain(m *testing.M) {
 }
 
 func TestObservations(t *testing.T) {
-	if !*shouldRunTest {
+	if !shouldRunTest {
 		t.Skip("Specify '-e2e' to run e2e tests")
 		return
 	}
@@ -173,7 +181,7 @@ func TestObservations(t *testing.T) {
 }
 
 func TestTrainingOutput(t *testing.T) {
-	if !*shouldRunTest {
+	if !shouldRunTest {
 		t.Skip("Specify '-e2e' to run e2e tests")
 		return
 	}
@@ -194,7 +202,7 @@ func TestTrainingOutput(t *testing.T) {
 		}
 	})
 
-	err = cliClient.runCliCmd("train", "trader", "--context", "metal")
+	err = cliClient.runCliCmd("train", "trader", "--context", spicedContext)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -229,7 +237,7 @@ func TestTrainingOutput(t *testing.T) {
 }
 
 func TestImportExport(t *testing.T) {
-	if !*shouldRunTest {
+	if !shouldRunTest {
 		t.Skip("Specify '-e2e' to run e2e tests")
 		return
 	}
@@ -240,7 +248,7 @@ func TestImportExport(t *testing.T) {
 	}
 	defer runtimeCmd.Process.Kill() //nolint:errcheck
 
-	err = cliClient.runCliCmd("train", "trader", "--context", "metal")
+	err = cliClient.runCliCmd("train", "trader", "--context", spicedContext)
 	if err != nil {
 		t.Fatal(err)
 	}

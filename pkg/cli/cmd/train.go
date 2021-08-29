@@ -89,6 +89,6 @@ spice train logpruner.yaml
 }
 
 func init() {
-	trainCmd.Flags().StringVar(&contextFlag, "context", "docker", "Runs Spice.ai in the given context, either 'docker' or 'metal'")
+	trainCmd.Flags().StringVar(&contextFlag, "context", "docker", "Runs Spice AI in the given context, either 'docker' or 'metal'")
 	RootCmd.AddCommand(trainCmd)
 }

@@ -82,6 +82,6 @@ var VersionCmd = &cobra.Command{
 }
 
 func init() {
-	RootCmd.Flags().StringVar(&contextFlag, "context", "metal", "Runs Spice.ai in the given context, either 'docker' or 'metal'")
+	RootCmd.Flags().StringVar(&contextFlag, "context", "metal", "Runs Spice AI in the given context, either 'docker' or 'metal'")
 	RootCmd.AddCommand(VersionCmd)
 }

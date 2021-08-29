@@ -107,11 +107,11 @@ func (c *MetalContext) InstallOrUpgradeRuntime() error {
 
 	runtimeVersion := github.GetRuntimeVersion(release)
 
-	fmt.Printf("Downloading and installing Spice.ai Runtime %s ...\n", runtimeVersion)
+	fmt.Printf("Downloading and installing Spice AI Runtime %s ...\n", runtimeVersion)
 
 	err = github.DownloadRuntimeAsset(release, c.spiceBinDir)
 	if err != nil {
-		fmt.Println("Error downloading Spice.ai runtime binaries.")
+		fmt.Println("Error downloading Spice AI runtime binaries.")
 		return err
 	}
 

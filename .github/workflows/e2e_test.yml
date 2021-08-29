@@ -12,6 +12,7 @@ on:
     branches:
       - trunk
       - release-*
+  workflow_dispatch:
 
 jobs:
   algorithms:
@@ -56,18 +57,23 @@ jobs:
         run: make
         working-directory: cmd/spiced
 
+      - name: Build Docker image
+        run: make docker
+
       - name: Ensure correct directory structure
         run: |
           mkdir -p $HOME/.spice/bin
           cp cmd/spiced/spiced $HOME/.spice/bin
           ln -s ${{ github.workspace }}/ai/src $HOME/.spice/bin/ai
 
-      - name: "Execute test - cartpole (algorithm: ${{ matrix.algorithm }})"
+      - name: "Execute test - trader (algorithm: ${{ matrix.algorithm }})"
         run: |
+          cp ../../test/assets/data/csv/COINBASE_BTCUSD\,\ 30.csv .
           export SPICE_GH_TOKEN=${{ secrets.GITHUB_TOKEN }}
           export SPICE_DEEPRL_ALGORITHM="${{ matrix.algorithm }}"
           ./spice version --context ${{ matrix.context }}
-          ./spice train ../../test/assets/pods/manifests/cartpole-v1.yaml --context ${{ matrix.context }}
+          ./spice add test/Trader
+          ./spice train .spice/pods/trader.yaml --context ${{ matrix.context }}
         working-directory: cmd/spice
 
   end-to-end:
@@ -79,7 +85,7 @@ jobs:
       fail-fast: false
       matrix:
         algorithm: [vpg, dql]
-        context: [metal]
+        context: [metal, docker]
     steps:
       - uses: actions/checkout@v2
 
@@ -112,6 +118,9 @@ jobs:
         run: make
         working-directory: cmd/spiced
 
+      - name: Build Docker image
+        run: make docker
+
       - name: Ensure correct directory structure
         run: |
           mkdir -p $HOME/.spice/bin
@@ -122,4 +131,4 @@ jobs:
         working-directory: test/e2e
         run: |
           export SPICE_DEEPRL_ALGORITHM="${{ matrix.algorithm }}"
-          go test -v . -e2e
+          go test -v . -e2e -context '${{ matrix.context }}'

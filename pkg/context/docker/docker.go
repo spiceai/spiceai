@@ -22,7 +22,7 @@ type DockerContext struct {
 
 const (
 	spicedDockerImg        = "ghcr.io/spiceai/spiced"
-	spicedDockerCmd        = "run -p %d:%d %s --add-host=host.docker.internal:host-gateway --mount src=%s,target=/userapp,type=bind --rm %s"
+	spicedDockerCmd        = "run -p %d:%d %s --add-host=host.docker.internal:host-gateway -v %s:/userapp --rm %s"
 	dockerAppPath          = "/userapp"
 	dockerSpiceRuntimePath = "/.spice"
 	dockerAiEnginePath     = "/app/ai"
@@ -100,9 +100,18 @@ func (c *DockerContext) IsRuntimeUpgradeAvailable() (string, error) {
 }
 
 func (c *DockerContext) GetRunCmd(manifestPath string) (*exec.Cmd, error) {
-	version, err := c.Version()
+	version, err := getDockerImageVersion()
 	if err != nil {
 		return nil, err
+	}
+
+	if version == "dev" {
+		fmt.Println("found and using local dev image")
+	} else {
+		version, err = c.Version()
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	cwd, err := os.Getwd()
