@@ -2,7 +2,7 @@ import abc
 from typing import Tuple
 
 """
-The interface that all Spice AI compatible deep-RL agents should conform to.
+The interface that all Spice.ai compatible deep-RL agents should conform to.
 """
 
 
