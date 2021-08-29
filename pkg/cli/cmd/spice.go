@@ -16,7 +16,7 @@ var (
 
 var RootCmd = &cobra.Command{
 	Use:   "spice",
-	Short: "Spice AI CLI",
+	Short: "Spice.ai CLI",
 }
 
 // Execute adds all child commands to the root command.

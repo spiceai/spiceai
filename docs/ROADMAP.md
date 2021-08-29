@@ -1,6 +1,6 @@
-# Spice AI Roadmap
+# Spice.ai Roadmap
 
-This describes the current Spice AI Roadmap.
+This describes the current Spice.ai Roadmap.
 
 If you have a feature request or suggestion, please [get in touch](https://github.com/spiceai/spiceai#community)!
 
@@ -24,7 +24,7 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 
 ## v0.1-alpha Public Release Roadmap
 
-- Spice AI Registry v0.1
+- Spice.ai Registry v0.1
 - Basic package manager support (E.g. brew install spiceai)
 - More samples
 - Friendlier concept names
@@ -40,7 +40,7 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 - CI/CD on GitHub
 - Sidecar injection on Kubernetes
 
-## Spice AI v1.0-stable Roadmap
+## Spice.ai v1.0-stable Roadmap
 
 - A/B testing and flighting
 - Distributed learning

@@ -1,6 +1,6 @@
-# Spice AI First Principles
+# Spice.ai First Principles
 
-Spice AI is built upon a foundation of first principles.
+Spice.ai is built upon a foundation of first principles.
 
 ## Summary
 

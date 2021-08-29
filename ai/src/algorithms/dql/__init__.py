@@ -1,4 +1,4 @@
-# Spice AI implementation of Deep Q Learning (DQL)
+# Spice.ai implementation of Deep Q Learning (DQL)
 #
 # Explanation from: https://www.tensorflow.org/agents/tutorials/0_intro_rl
 #

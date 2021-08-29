@@ -1,12 +1,12 @@
 # Contribution Guidelines
 
-Thank you for your interest in Spice AI!
+Thank you for your interest in Spice.ai!
 
 This project welcomes contributions and suggestions.
 
 Contributions come in many forms: submitting issues, writing code, participating in discussions and community calls.
 
-This document provides the guidelines for how to contribute to the Spice AI project.
+This document provides the guidelines for how to contribute to the Spice.ai project.
 
 ## Issues
 
@@ -33,9 +33,9 @@ Before you file an issue, make sure you've checked the following:
 1. For bugs
    - You have as much data as possible. This usually comes in the form of logs and/or stacktraces. Screenshots or screen recordings of the buggy behavior are very helpful.
 
-## Contributing to Spice AI
+## Contributing to Spice.ai
 
-This section describes the guidelines for contributing code / docs to Spice AI.
+This section describes the guidelines for contributing code / docs to Spice.ai.
 
 ### Pull Requests
 
@@ -56,7 +56,7 @@ A good way to communicate before investing too much time is to create a "Work-in
 
 ## Security Vulnerability Reporting
 
-Spice AI takes security and our users' trust very seriously. If you believe you have found a security issue in any of our open source projects, please responsibly disclose it by contacting security@spiceai.io.
+Spice.ai takes security and our users' trust very seriously. If you believe you have found a security issue in any of our open source projects, please responsibly disclose it by contacting security@spiceai.io.
 
 ### Use of Third-party code
 
@@ -66,7 +66,7 @@ Spice AI takes security and our users' trust very seriously. If you believe you 
 
 ### Installing Dependencies
 
-Spice AI requires Go 1.16, Python 3.8+ and Docker.
+Spice.ai requires Go 1.16, Python 3.8+ and Docker.
 
 #### Go 1.16
 

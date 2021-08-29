@@ -10,7 +10,7 @@ import (
 
 var runCmd = &cobra.Command{
 	Use:   "run",
-	Short: "Run Spice AI - starts the Spice AI runtime, installing if necessary",
+	Short: "Run Spice.ai - starts the Spice.ai runtime, installing if necessary",
 	Example: `
 spice run
 
@@ -26,7 +26,7 @@ spice run
 }
 
 func init() {
-	runCmd.Flags().StringVar(&contextFlag, "context", "docker", "Runs Spice AI in the given context, either 'docker' or 'metal'")
+	runCmd.Flags().StringVar(&contextFlag, "context", "docker", "Runs Spice.ai in the given context, either 'docker' or 'metal'")
 	runCmd.Flags().BoolP("help", "h", false, "Print this help message")
 	RootCmd.AddCommand(runCmd)
 }

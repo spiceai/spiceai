@@ -180,7 +180,7 @@ fail_trap() {
     result=$?
     if [ "$result" != "0" ]; then
         echo "Failed to install Spice CLI"
-        echo "For support, go to https://spiceai.io"
+        echo "For support, see https://docs.spiceai.org"
     fi
     cleanup
     exit $result
@@ -220,7 +220,7 @@ addToProfile() {
 }
 
 installCompleted() {
-    echo -e "\nTo get started with Spice AI, visit https://spiceai.github.io/docs/"
+    echo -e "\nTo get started with Spice.ai, visit https://docs.spiceai.org"
 }
 
 # -----------------------------------------------------------------------------
@@ -246,7 +246,7 @@ checkHttpRequestCLI
 checkJqInstalled
 
 if [ -z "$1" ]; then
-    echo "Getting the latest Spice AI CLI..."
+    echo "Getting the latest Spice.ai CLI..."
     getLatestRelease
 else
     ret_val=v$1

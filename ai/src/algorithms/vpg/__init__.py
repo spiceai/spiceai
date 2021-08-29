@@ -1,4 +1,4 @@
-# Spice AI implementation of the Vanilla Policy Gradient (VPG)
+# Spice.ai implementation of the Vanilla Policy Gradient (VPG)
 #
 # Explanation from: https://spinningup.openai.com/en/latest/algorithms/vpg.html
 #
