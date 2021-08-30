@@ -107,14 +107,14 @@ jobs:
         uses: actions/download-artifact@v2
         with:
           name: spice
-          path: "$HOME/.spice/bin"
+          path: "${{ env.HOME }}/.spice/bin"
 
       - name: Download spiced
         if: matrix.context == 'metal'
         uses: actions/download-artifact@v2
         with:
           name: spiced
-          path: "$HOME/.spice/bin"
+          path: "${{ env.HOME }}/.spice/bin"
 
       - name: Build Docker image
         if: matrix.context == 'docker'
@@ -167,14 +167,14 @@ jobs:
         uses: actions/download-artifact@v2
         with:
           name: spice
-          path: "$HOME/.spice/bin"
+          path: "${{ env.HOME }}/.spice/bin"
 
       - name: Download spiced
         if: matrix.context == 'metal'
         uses: actions/download-artifact@v2
         with:
           name: spiced
-          path: "$HOME/.spice/bin"
+          path: "${{ env.HOME }}/.spice/bin"
 
       - name: Build Docker image
         if: matrix.context == 'docker'
