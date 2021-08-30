@@ -73,7 +73,7 @@ jobs:
         uses: actions/upload-artifact@v2
         with:
           name: spiced
-          path: cmd/spice/spiced
+          path: cmd/spiced/spiced
 
   algorithms:
     name: algorithms test
