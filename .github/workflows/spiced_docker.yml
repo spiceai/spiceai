@@ -52,6 +52,8 @@ jobs:
             ghcr.io/spiceai/spiced:latest
             ghcr.io/spiceai/spiced:v${{ env.REL_VERSION }}
             ghcr.io/spiceai/spiced:v${{ env.REL_VERSION }}-${{ matrix.target_arch }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
       - name: Image digest
         run: echo ${{ steps.docker_build.outputs.digest }}
