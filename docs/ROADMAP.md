@@ -8,7 +8,7 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 
 Spice.ai is still under early development, so there are several limitations, including:
 
-- Data Sources are polled/fetched only (every 30 secs) - will change to push/streaming in v0.2
+- Data Sources are polled/fetched only (every 15 secs) - will change to push/streaming in v0.2
 - Basic local Pod/Flight monitoring through polling - will move to streaming websockets in v0.2
 - Data Connectors do not yet fully honor period, interval and granularity in all cases
 - Single AI backend only (Tensorflow) - expect to support others like PyTorch and Scikit-learn in v0.2
