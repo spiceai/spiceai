@@ -4,7 +4,17 @@ Spice.ai is built upon a foundation of first principles.
 
 ## Summary
 
+- API first
+- Composable from community driven-components
 - Data is always in time-based intervals
+
+### API first
+
+- All functionality is available through the HTTP API on `spiced`
+
+### Composable from community driven-components
+
+- A Spice.ai project consists of Pods, Data Connectors, and Data Processors all of which are composable through community built-components available through the spicerack.org registry or the `data-components-contrib` reposistory.
 
 ### Data is always in time-based intervals
 
