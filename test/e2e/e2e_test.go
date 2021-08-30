@@ -275,7 +275,7 @@ func TestImportExport(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	inference, err := runtime.getInference("trader", "latest")
+	inference, err := runtime.getRecommendation("trader", "latest")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -307,13 +307,13 @@ func TestImportExport(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	newInference, err := runtime.getInference("trader", "latest")
+	newInference, err := runtime.getRecommendation("trader", "latest")
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	for i := 0; newInference.Action != inference.Action; i++ {
-		newInference, err = runtime.getInference("trader", "latest")
+		newInference, err = runtime.getRecommendation("trader", "latest")
 		if err != nil {
 			t.Fatal(err)
 		}
