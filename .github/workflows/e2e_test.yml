@@ -84,8 +84,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        algorithm: [vpg]
-        context: [docker]
+        algorithm: [vpg, dql]
+        context: [metal]
     steps:
       - uses: actions/checkout@v2
 
@@ -144,7 +144,6 @@ jobs:
 
   end-to-end:
     name: end-to-end test
-    if: false
     needs: build_binaries
     runs-on: ubuntu-latest
     env:
