@@ -17,6 +17,7 @@ import (
 
 const (
 	BaseUrl = "http://localhost:8000"
+	testPod = "test/Trader@0.2.0"
 )
 
 var (
@@ -111,7 +112,7 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
-	err = cliClient.runCliCmd("add", "test/Trader")
+	err = cliClient.runCliCmd("add", testPod)
 	if err != nil {
 		log.Println(err.Error())
 		os.Exit(1)
