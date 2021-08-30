@@ -24,12 +24,23 @@ var (
 
 type SpiceRackRegistry struct{}
 
-func (r *SpiceRackRegistry) GetPod(podPath string) (string, error) {
+func (r *SpiceRackRegistry) GetPod(podFullPath string) (string, error) {
+	parts := strings.Split(podFullPath, "@")
+	podPath := podFullPath
+	podVersion := ""
+	if len(parts) == 2 {
+		podPath = parts[0]
+		podVersion = parts[1]
+	}
+
 	podName := strings.ToLower(filepath.Base(podPath))
 	podManifestFileName := fmt.Sprintf("%s.yaml", podName)
 
 	url := fmt.Sprintf("%s/pods/%s", spiceRackBaseUrl, podPath)
-	failureMessage := fmt.Sprintf("An error occurred while fetching pod '%s' from spicerack.org", podPath)
+	if podVersion != "" {
+		url = fmt.Sprintf("%s/%s", url, podVersion)
+	}
+	failureMessage := fmt.Sprintf("An error occurred while fetching pod '%s' from spicerack.org", podFullPath)
 
 	response, err := http.Get(url)
 	if err != nil {
