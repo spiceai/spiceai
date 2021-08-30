@@ -7,10 +7,6 @@ on:
       - release-*
     tags:
       - v*
-  pull_request:
-    branches:
-      - trunk
-      - release-*
 
   workflow_dispatch:
 
