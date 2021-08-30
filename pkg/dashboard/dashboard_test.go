@@ -41,7 +41,7 @@ func testDashboardIndexHandler() func(*testing.T) {
 		body, err := ioutil.ReadAll(res.Body)
 		assert.NoError(t, err)
 
-		assert.Contains(t, string(body), "React App")
+		assert.Contains(t, string(body), "Spice.ai")
 	}
 }
 
