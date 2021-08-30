@@ -3,7 +3,7 @@ package github
 import (
 	"encoding/json"
 	"fmt"
-	"strings"
+	"sort"
 
 	"golang.org/x/mod/semver"
 )
@@ -47,6 +47,16 @@ func (r RepoReleases) Swap(i, j int) {
 	r[i], r[j] = r[j], r[i]
 }
 
+func (r *RepoRelease) HasAsset(assetName string) bool {
+	for _, asset := range r.Assets {
+		if asset.Name == assetName {
+			return true
+		}
+	}
+
+	return false
+}
+
 func GetReleases(gh *GitHubClient) (RepoReleases, error) {
 	releasesURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/releases", gh.Owner, gh.Repo)
 	body, err := gh.Get(releasesURL, nil)
@@ -63,35 +73,30 @@ func GetReleases(gh *GitHubClient) (RepoReleases, error) {
 	return githubRepoReleases, nil
 }
 
-func GetReleaseByAssetName(releases RepoReleases, assetName string) *RepoRelease {
-	for _, release := range releases {
-		for _, asset := range release.Assets {
-			if asset.Name == assetName {
-				return &release
-			}
-		}
-	}
-
-	return nil
-}
-
-func GetLatestReleaseTagName(gh *GitHubClient) (string, error) {
-	githubRepoReleases, err := GetReleases(gh)
+func GetLatestRelease(gh *GitHubClient, tagName string, assetName string) (*RepoRelease, error) {
+	releases, err := GetReleases(gh)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
-	if len(githubRepoReleases) == 0 {
-		return "", fmt.Errorf("no releases")
+	if len(releases) == 0 {
+		return nil, fmt.Errorf("no releases")
 	}
 
-	for _, release := range githubRepoReleases {
-		if !strings.Contains(release.TagName, "-rc") {
-			return release.TagName, nil
+	// Sort by semver in descending order
+	sort.Sort(releases)
+
+	for _, release := range releases {
+		if tagName != "" && release.TagName != tagName {
+			continue
 		}
+		if assetName != "" && !release.HasAsset(assetName) {
+			continue
+		}
+		return &release, nil
 	}
 
-	return "", fmt.Errorf("no releases")
+	return nil, fmt.Errorf("no releases")
 }
 
 func DownloadReleaseByTagName(gh *GitHubClient, tagName string, downloadDir string, filename string) error {

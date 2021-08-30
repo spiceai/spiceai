@@ -12,7 +12,8 @@ import (
 	"github.com/spf13/viper"
 	"github.com/spiceai/spice/pkg/config"
 	"github.com/spiceai/spice/pkg/constants"
-	"github.com/spiceai/spice/pkg/github"
+	spice_version "github.com/spiceai/spice/pkg/version"
+	"golang.org/x/mod/semver"
 )
 
 type DockerContext struct {
@@ -45,12 +46,8 @@ func (c *DockerContext) Version() (string, error) {
 	}
 
 	if version == "" {
-		// Image doesn't exist, no local version yet
-		release, err := github.GetLatestRuntimeRelease()
-		if err != nil {
-			return "", err
-		}
-		return github.GetRuntimeVersion(release), nil
+		// Image doesn't exist, no local version yet, use CLI version
+		return spice_version.Version(), nil
 	}
 
 	return version, nil
@@ -90,12 +87,34 @@ func (c *DockerContext) IsRuntimeInstallRequired() bool {
 }
 
 func (c *DockerContext) InstallOrUpgradeRuntime() error {
-	// Docker run will "install" the image automatically
-	return nil
+	dockerImg := getDockerImage(spice_version.Version())
+	cmd := exec.Command("docker", "pull", dockerImg)
+
+	cmd.Stderr = os.Stderr
+	cmd.Stdout = os.Stdout
+
+	err := cmd.Start()
+	if err != nil {
+		return err
+	}
+
+	return cmd.Wait()
 }
 
 func (c *DockerContext) IsRuntimeUpgradeAvailable() (string, error) {
-	// Docker run will "upgrade" the image automatically
+	version, err := c.Version()
+	if err != nil {
+		return "", err
+	}
+
+	if version == "dev" {
+		return "", nil
+	}
+
+	if semver.Compare(spice_version.Version(), version) > 0 {
+		return spice_version.Version(), nil
+	}
+
 	return "", nil
 }
 
@@ -127,7 +146,7 @@ func (c *DockerContext) GetRunCmd(manifestPath string) (*exec.Cmd, error) {
 
 	spiceEnvArgs := getSpiceEnvVarsAsDockerArgs()
 
-	dockerImg := fmt.Sprintf("%s:%s", spicedDockerImg, version)
+	dockerImg := getDockerImage(version)
 	dockerArgs := getDockerArgs(fmt.Sprintf(spicedDockerCmd, config.HttpPort, config.HttpPort, spiceEnvArgs, cwd, dockerImg))
 
 	if manifestPath != "" {
@@ -170,6 +189,10 @@ func getDockerArgs(args string) []string {
 	}
 
 	return argsTrimmedOfEmptyStrings
+}
+
+func getDockerImage(version string) string {
+	return fmt.Sprintf("%s:%s", spicedDockerImg, version)
 }
 
 func getDockerImageVersion() (string, error) {
