@@ -85,7 +85,7 @@ jobs:
       fail-fast: false
       matrix:
         algorithm: [vpg, dql]
-        context: [metal, docker]
+        context: [metal]
     steps:
       - uses: actions/checkout@v2
 
@@ -128,8 +128,6 @@ jobs:
           file: docker/Dockerfile
           push: false
           tags: ghcr.io/spiceai/spiced:dev
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
       
       - name: Ensure correct directory structure
         if: matrix.context == 'metal'
@@ -205,11 +203,10 @@ jobs:
         if: matrix.context == 'docker'
         uses: docker/build-push-action@v2
         with:
-          context: docker
+          context: .
+          file: docker/Dockerfile
           push: false
           tags: ghcr.io/spiceai/spiced:dev
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
 
       - name: Ensure correct directory structure
         if: matrix.context == 'metal'
