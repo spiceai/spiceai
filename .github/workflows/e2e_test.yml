@@ -85,7 +85,7 @@ jobs:
       fail-fast: false
       matrix:
         algorithm: [vpg]
-        context: [metal]
+        context: [metal, docker]
     steps:
       - uses: actions/checkout@v2
 
