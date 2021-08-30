@@ -52,7 +52,7 @@ func createLogDirectory(dotSpicePath string) (string, error) {
 	defer createLogDirectoryMutex.Unlock()
 
 	logPath := filepath.Join(dotSpicePath, "log")
-	if err := util.MkDirAllInheritPerm(logPath); err != nil {
+	if _, err := util.MkDirAllInheritPerm(logPath); err != nil {
 		return "", fmt.Errorf("failed to create log path '%s'", logPath)
 	}
 

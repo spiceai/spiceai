@@ -12,7 +12,7 @@ import (
 	"github.com/spiceai/spice/pkg/constants"
 	"github.com/spiceai/spice/pkg/github"
 	"github.com/spiceai/spice/pkg/util"
-	"golang.org/x/mod/semver"
+	spice_version "github.com/spiceai/spice/pkg/version"
 )
 
 type MetalContext struct {
@@ -100,7 +100,7 @@ func (c *MetalContext) InstallOrUpgradeRuntime() error {
 		return err
 	}
 
-	release, err := github.GetLatestRuntimeRelease()
+	release, err := github.GetLatestRuntimeRelease(spice_version.Version())
 	if err != nil {
 		return err
 	}
@@ -139,17 +139,13 @@ func (c *MetalContext) IsRuntimeUpgradeAvailable() (string, error) {
 		return "", nil
 	}
 
-	release, err := github.GetLatestRuntimeRelease()
+	tagName := "v" + currentVersion
+	release, err := github.GetLatestRuntimeRelease(tagName)
 	if err != nil {
 		return "", err
 	}
 
-	latestRelease := github.GetRuntimeVersion(release)
-	if semver.Compare(currentVersion, latestRelease) == 0 {
-		return "", nil
-	}
-
-	return latestRelease, nil
+	return release.TagName, nil
 }
 
 func (c *MetalContext) GetSpiceAppRelativePath(absolutePath string) string {
