@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/spiceai/spice/pkg/util"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	lumberjack "gopkg.in/natefinch/lumberjack.v2"
@@ -51,18 +52,8 @@ func createLogDirectory(dotSpicePath string) (string, error) {
 	defer createLogDirectoryMutex.Unlock()
 
 	logPath := filepath.Join(dotSpicePath, "log")
-	if _, err := os.Stat(logPath); err != nil {
-		rootStat, err := os.Stat(dotSpicePath)
-		if err != nil {
-			rootStat, err = os.Stat(filepath.Dir(dotSpicePath))
-			if err != nil {
-				return "", fmt.Errorf("failed to find runtime path '%s': %w", dotSpicePath, err)
-			}
-		}
-
-		if err = os.MkdirAll(logPath, rootStat.Mode().Perm()); err != nil {
-			return "", fmt.Errorf("failed to create log path '%s'", logPath)
-		}
+	if err := util.MkDirAllInheritPerm(logPath); err != nil {
+		return "", fmt.Errorf("failed to create log path '%s'", logPath)
 	}
 
 	return logPath, nil
