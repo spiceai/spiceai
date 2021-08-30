@@ -10,7 +10,7 @@ Spice.ai is built upon a foundation of first principles.
 
 ### API first
 
-- All functionality is available through the HTTP API on `spiced`
+- All functionality is available through the HTTP API on the Spice.ai runtime: `spiced`
 
 ### Composable from community driven-components
 
