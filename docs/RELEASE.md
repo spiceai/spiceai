@@ -14,7 +14,8 @@ Create an endgame issue with the following content:
 - [ ] Merge Registry PRs
 - [ ] Merge Samples PRs
 - [ ] Merge Quickstarts PRs
-- [ ] Merge version rev, docs and release notes
+- [ ] Merge release notes
+- [ ] Update version using documented process at [docs/RELEASE.md](https://github.com/spiceai/spiceai/blob/trunk/docs/RELEASE.md#version-update)
 - [ ] Final test pass on released binaries
 - [ ] Discord announcement
 - [ ] Email announcement
