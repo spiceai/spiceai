@@ -1,4 +1,4 @@
-package datasources
+package dataspaces
 
 import (
 	"fmt"
@@ -24,8 +24,8 @@ func TestDataSource(t *testing.T) {
 			t.Error(err)
 		}
 
-		var datasources []spec.DataSourceSpec
-		err = v.UnmarshalKey("datasources", &datasources)
+		var datasources []spec.DataspaceSpec
+		err = v.UnmarshalKey("dataspaces", &datasources)
 		if err != nil {
 			t.Error(err)
 		}
@@ -38,7 +38,7 @@ func TestDataSource(t *testing.T) {
 		for _, dsSpec := range datasources {
 			dsName := fmt.Sprintf("%s/%s", dsSpec.From, dsSpec.Name)
 
-			t.Run(fmt.Sprintf("NewDataSource() - %s", dsName), testNewDataSourceFunc(dsSpec))
+			t.Run(fmt.Sprintf("NewDataspace() - %s", dsName), testNewDataspaceFunc(dsSpec))
 			t.Run(fmt.Sprintf("Actions() - %s", dsName), testActionsFunc(dsSpec))
 			t.Run(fmt.Sprintf("Fields() - %s", dsName), testFieldsFunc(dsSpec))
 			t.Run(fmt.Sprintf("FieldNames() - %s", dsName), testFieldNamesFunc(dsSpec))
@@ -48,10 +48,10 @@ func TestDataSource(t *testing.T) {
 	}
 }
 
-// Tests DataSource creation from DataSourceSpec
-func testNewDataSourceFunc(dsSpec spec.DataSourceSpec) func(*testing.T) {
+// Tests Dataspace creation from DataspaceSpec
+func testNewDataspaceFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 	return func(t *testing.T) {
-		ds, err := NewDataSource(dsSpec)
+		ds, err := NewDataspace(dsSpec)
 		if err != nil {
 			t.Error(err)
 		}
@@ -65,9 +65,9 @@ func testNewDataSourceFunc(dsSpec spec.DataSourceSpec) func(*testing.T) {
 }
 
 // Tests Actions() getter
-func testActionsFunc(dsSpec spec.DataSourceSpec) func(*testing.T) {
+func testActionsFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 	return func(t *testing.T) {
-		ds, err := NewDataSource(dsSpec)
+		ds, err := NewDataspace(dsSpec)
 		if err != nil {
 			t.Error(err)
 		}
@@ -92,9 +92,9 @@ func testActionsFunc(dsSpec spec.DataSourceSpec) func(*testing.T) {
 }
 
 // Tests Fields() getter
-func testFieldsFunc(dsSpec spec.DataSourceSpec) func(*testing.T) {
+func testFieldsFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 	return func(t *testing.T) {
-		ds, err := NewDataSource(dsSpec)
+		ds, err := NewDataspace(dsSpec)
 		if err != nil {
 			t.Error(err)
 		}
@@ -122,9 +122,9 @@ func testFieldsFunc(dsSpec spec.DataSourceSpec) func(*testing.T) {
 }
 
 // Tests FieldNames() getter
-func testFieldNamesFunc(dsSpec spec.DataSourceSpec) func(*testing.T) {
+func testFieldNamesFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 	return func(t *testing.T) {
-		ds, err := NewDataSource(dsSpec)
+		ds, err := NewDataspace(dsSpec)
 		if err != nil {
 			t.Error(err)
 		}
@@ -152,9 +152,9 @@ func testFieldNamesFunc(dsSpec spec.DataSourceSpec) func(*testing.T) {
 }
 
 // Tests ActionNames() getter
-func testActionNamesFunc(dsSpec spec.DataSourceSpec) func(*testing.T) {
+func testActionNamesFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 	return func(t *testing.T) {
-		ds, err := NewDataSource(dsSpec)
+		ds, err := NewDataspace(dsSpec)
 		if err != nil {
 			t.Error(err)
 		}
@@ -180,9 +180,9 @@ func testActionNamesFunc(dsSpec spec.DataSourceSpec) func(*testing.T) {
 }
 
 // Tests Laws() getter
-func testLawsFunc(dsSpec spec.DataSourceSpec) func(*testing.T) {
+func testLawsFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 	return func(t *testing.T) {
-		ds, err := NewDataSource(dsSpec)
+		ds, err := NewDataspace(dsSpec)
 		if err != nil {
 			t.Error(err)
 		}

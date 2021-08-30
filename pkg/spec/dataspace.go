@@ -1,6 +1,6 @@
 package spec
 
-type DataSourceSpec struct {
+type DataspaceSpec struct {
 	From    string            `json:"from,omitempty" yaml:"from,omitempty" mapstructure:"from,omitempty"`
 	Name    string            `json:"name,omitempty" yaml:"name,omitempty" mapstructure:"name,omitempty"`
 	Data    *DataSpec         `json:"data,omitempty" yaml:"data,omitempty" mapstructure:"data,omitempty"`

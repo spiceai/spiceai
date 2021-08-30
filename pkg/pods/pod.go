@@ -14,7 +14,7 @@ import (
 
 	"github.com/spf13/viper"
 	"github.com/spiceai/spice/pkg/constants"
-	"github.com/spiceai/spice/pkg/datasources"
+	"github.com/spiceai/spice/pkg/dataspaces"
 	"github.com/spiceai/spice/pkg/flights"
 	"github.com/spiceai/spice/pkg/observations"
 	"github.com/spiceai/spice/pkg/spec"
@@ -26,7 +26,7 @@ type Pod struct {
 	spec.PodSpec
 	hash               string
 	manifestPath       string
-	dataSources        []*datasources.DataSource
+	dataSources        []*dataspaces.Dataspace
 	fields             map[string]float64
 	fieldNames         []string
 	flights            map[string]*flights.Flight
@@ -171,7 +171,7 @@ func (pod *Pod) CachedCsv() string {
 	return csv.String()
 }
 
-func (pod *Pod) DataSources() []*datasources.DataSource {
+func (pod *Pod) DataSources() []*dataspaces.Dataspace {
 	return pod.dataSources
 }
 
@@ -197,7 +197,7 @@ func (pod *Pod) Actions() map[string]string {
 	for _, ds := range pod.DataSources() {
 		for fqActionName, fqAction := range ds.Actions() {
 			allDataSourceActions[fqActionName] = fqAction
-			dataSourcePrefixes = append(dataSourcePrefixes, fmt.Sprintf("%s.%s", ds.DataSourceSpec.From, ds.DataSourceSpec.Name))
+			dataSourcePrefixes = append(dataSourcePrefixes, fmt.Sprintf("%s.%s", ds.DataspaceSpec.From, ds.DataspaceSpec.Name))
 		}
 	}
 
@@ -224,7 +224,7 @@ func (pod *Pod) Actions() map[string]string {
 		}
 	}
 
-	// Hoist any datasource actions to global scope if they don't exist
+	// Hoist any dataspace actions to global scope if they don't exist
 	for dsActionName, dsAction := range allDataSourceActions {
 		dsActionExistsGlobally := false
 		for globalActionName := range actions {
@@ -291,8 +291,8 @@ func (pod *Pod) ValidateForTraining() error {
 		return errors.New("interval must be less than or equal to period")
 	}
 
-	if pod.PodSpec.DataSources == nil || len(pod.PodSpec.DataSources) < 1 {
-		return errors.New("at least one datasource is required for training")
+	if pod.PodSpec.Dataspaces == nil || len(pod.PodSpec.Dataspaces) < 1 {
+		return errors.New("at least one dataspace is required for training")
 	}
 
 	actions := pod.Actions()
@@ -416,8 +416,8 @@ func loadPod(podPath string, hash string) (*Pod, error) {
 	var fieldNames []string
 	fields := make(map[string]float64)
 
-	for _, dsSpec := range pod.PodSpec.DataSources {
-		ds, err := datasources.NewDataSource(dsSpec)
+	for _, dsSpec := range pod.PodSpec.Dataspaces {
+		ds, err := dataspaces.NewDataspace(dsSpec)
 		if err != nil {
 			return nil, err
 		}
