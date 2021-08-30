@@ -107,14 +107,14 @@ jobs:
         uses: actions/download-artifact@v2
         with:
           name: spice
-          path: .
+          path: $HOME/.spice/bin
 
       - name: Download spiced
         if: matrix.context == 'metal'
         uses: actions/download-artifact@v2
         with:
           name: spiced
-          path: .
+          path: $HOME/.spice/bin
 
       - name: Build Docker image
         if: matrix.context == 'docker'
@@ -124,8 +124,6 @@ jobs:
       - name: Ensure correct directory structure
         if: matrix.context == 'metal'
         run: |
-          mkdir -p $HOME/.spice/bin
-          cp cmd/spiced/spiced $HOME/.spice/bin
           ln -s ${{ github.workspace }}/ai/src $HOME/.spice/bin/ai
 
       - name: "Execute test - trader (algorithm: ${{ matrix.algorithm }})"
@@ -133,10 +131,9 @@ jobs:
           cp ../../test/assets/data/csv/COINBASE_BTCUSD\,\ 30.csv .
           export SPICE_GH_TOKEN=${{ secrets.GITHUB_TOKEN }}
           export SPICE_DEEPRL_ALGORITHM="${{ matrix.algorithm }}"
-          ./spice version --context ${{ matrix.context }}
-          ./spice add test/Trader
-          ./spice train .spice/pods/trader.yaml --context ${{ matrix.context }}
-        working-directory: cmd/spice
+          ~/.spice/bin/spice version --context ${{ matrix.context }}
+          ~/.spice/bin/spice add test/Trader
+          ~/.spice/bin/spice train .spice/pods/trader.yaml --context ${{ matrix.context }}
 
   end-to-end:
     name: end-to-end test
@@ -170,14 +167,14 @@ jobs:
         uses: actions/download-artifact@v2
         with:
           name: spice
-          path: .
+          path: $HOME/.spice/bin
 
       - name: Download spiced
         if: matrix.context == 'metal'
         uses: actions/download-artifact@v2
         with:
           name: spiced
-          path: .
+          path: $HOME/.spice/bin
 
       - name: Build Docker image
         if: matrix.context == 'docker'
@@ -187,8 +184,6 @@ jobs:
       - name: Ensure correct directory structure
         if: matrix.context == 'metal'
         run: |
-          mkdir -p $HOME/.spice/bin
-          cp cmd/spiced/spiced $HOME/.spice/bin
           ln -s ${{ github.workspace }}/ai/src $HOME/.spice/bin/ai
 
       - name: "Execute e2e tests (algorithm: ${{ matrix.algorithm }})"
