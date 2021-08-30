@@ -48,6 +48,8 @@ var RootCmd = &cobra.Command{
 			os.Exit(1)
 		}
 
+		context.SetContext(rtcontext)
+
 		var manifestPath string
 		if len(args) > 0 {
 			manifestPath = args[0]
