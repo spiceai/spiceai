@@ -75,27 +75,9 @@ jobs:
           name: spiced
           path: cmd/spice/spiced
 
-  build_docker:
-    name: build Docker images
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v2
-
-      - name: Build and save Docker image
-        run: |
-          make docker
-          docker save --output docker-spiced.tar ghcr.io/spiceai/spiced:dev
-
-      - name: Upload Docker image
-        uses: actions/upload-artifact@v2
-        with:
-          name: docker_spiced
-          path: docker-spiced.tar
-
   algorithms:
     name: algorithms test
-    needs: [build_binaries, build_docker]
+    needs: build_binaries
     runs-on: ubuntu-latest
     env:
       GOVER: 1.16
@@ -134,17 +116,10 @@ jobs:
           name: spiced
           path: .
 
-      - name: Download Docker image
-        if: matrix.context == 'docker'
-        uses: actions/download-artifact@v2
-        with:
-          name: docker_spiced
-          path: .
-
-      - name: Load Docker image
+      - name: Build Docker image
         if: matrix.context == 'docker'
         run: |
-          docker load --input docker-spiced.tar
+          make docker
 
       - name: Ensure correct directory structure
         if: matrix.context == 'metal'
@@ -165,7 +140,7 @@ jobs:
 
   end-to-end:
     name: end-to-end test
-    needs: [build_binaries, build_docker]
+    needs: build_binaries
     runs-on: ubuntu-latest
     env:
       GOVER: 1.16
@@ -204,17 +179,10 @@ jobs:
           name: spiced
           path: .
 
-      - name: Download Docker image
-        if: matrix.context == 'docker'
-        uses: actions/download-artifact@v2
-        with:
-          name: docker_spiced
-          path: .
-
-      - name: Load Docker image
+      - name: Build Docker image
         if: matrix.context == 'docker'
         run: |
-          docker load --input docker-spiced.tar
+          make docker
 
       - name: Ensure correct directory structure
         if: matrix.context == 'metal'

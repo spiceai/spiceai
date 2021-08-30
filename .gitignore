@@ -12,6 +12,9 @@ cmd/spiced/spiced
 cmd/spiced/.spice
 cmd/spiced/data
 
+# Debug binaries
+__debug_bin
+
 # Test binary, built with `go test -c`
 *.test
 
