@@ -31,7 +31,7 @@ const (
 
 func NewDockerContext() *DockerContext {
 	spiceBinDir := path.Join(dockerSpiceRuntimePath, "bin")
-	podsDir := path.Join(dockerSpiceRuntimePath, "pods")
+	podsDir := path.Join(dockerAppPath, constants.DotSpice, "pods")
 
 	return &DockerContext{
 		spiceBinDir: spiceBinDir,
@@ -152,7 +152,7 @@ func (c *DockerContext) GetRunCmd(manifestPath string) (*exec.Cmd, error) {
 	if manifestPath != "" {
 		dockerArgs = append(dockerArgs, manifestPath)
 	}
-
+	
 	cmd := exec.Command("docker", dockerArgs...)
 
 	return cmd, nil
