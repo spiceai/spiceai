@@ -41,7 +41,7 @@ var RootCmd = &cobra.Command{
 			fmt.Println(err)
 			os.Exit(1)
 		}
-		
+
 		err = rtcontext.Init()
 		if err != nil {
 			fmt.Println(err)

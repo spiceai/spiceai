@@ -152,7 +152,7 @@ func (c *DockerContext) GetRunCmd(manifestPath string) (*exec.Cmd, error) {
 	if manifestPath != "" {
 		dockerArgs = append(dockerArgs, manifestPath)
 	}
-	
+
 	cmd := exec.Command("docker", dockerArgs...)
 
 	return cmd, nil
