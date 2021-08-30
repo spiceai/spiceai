@@ -1,4 +1,4 @@
-package datasources
+package dataspaces
 
 import (
 	"fmt"
@@ -12,17 +12,17 @@ import (
 	"github.com/spiceai/spice/pkg/state"
 )
 
-type DataSource struct {
-	spec.DataSourceSpec
+type Dataspace struct {
+	spec.DataspaceSpec
 	connector        dataconnectors.DataConnector
 	processor        dataprocessors.DataProcessor
 	cachedState      []*state.State
 	cachedStateMutex *sync.RWMutex
 }
 
-func NewDataSource(dsSpec spec.DataSourceSpec) (*DataSource, error) {
-	ds := DataSource{
-		DataSourceSpec:   dsSpec,
+func NewDataspace(dsSpec spec.DataspaceSpec) (*Dataspace, error) {
+	ds := Dataspace{
+		DataspaceSpec:    dsSpec,
 		cachedStateMutex: &sync.RWMutex{},
 	}
 
@@ -54,23 +54,23 @@ func NewDataSource(dsSpec spec.DataSourceSpec) (*DataSource, error) {
 	return &ds, nil
 }
 
-func (ds *DataSource) Name() string {
-	return fmt.Sprintf("%s/%s", ds.DataSourceSpec.From, ds.DataSourceSpec.Name)
+func (ds *Dataspace) Name() string {
+	return fmt.Sprintf("%s/%s", ds.DataspaceSpec.From, ds.DataspaceSpec.Name)
 }
 
-func (ds *DataSource) Path() string {
-	return fmt.Sprintf("%s.%s", ds.DataSourceSpec.From, ds.DataSourceSpec.Name)
+func (ds *Dataspace) Path() string {
+	return fmt.Sprintf("%s.%s", ds.DataspaceSpec.From, ds.DataspaceSpec.Name)
 }
 
-func (ds *DataSource) CachedState() []*state.State {
+func (ds *Dataspace) CachedState() []*state.State {
 	return ds.cachedState
 }
 
-func (ds *DataSource) Actions() map[string]string {
+func (ds *Dataspace) Actions() map[string]string {
 	fqActions := make(map[string]string)
 	fqFieldNames := ds.FieldNameMap()
 	fqActionNames := ds.ActionNames()
-	for dsActionName, dsActionBody := range ds.DataSourceSpec.Actions {
+	for dsActionName, dsActionBody := range ds.DataspaceSpec.Actions {
 		fqDsActionBody := dsActionBody
 		for fieldName, fqFieldName := range fqFieldNames {
 			fqDsActionBody = strings.ReplaceAll(fqDsActionBody, fieldName, fqFieldName)
@@ -81,10 +81,10 @@ func (ds *DataSource) Actions() map[string]string {
 }
 
 // Returns a mapping of fully-qualified field names to their intializers
-func (ds *DataSource) Fields() map[string]float64 {
+func (ds *Dataspace) Fields() map[string]float64 {
 	fqFieldInitializers := make(map[string]float64)
 	fqFieldNames := ds.FieldNameMap()
-	for _, field := range ds.DataSourceSpec.Fields {
+	for _, field := range ds.DataspaceSpec.Fields {
 		var initialValue float64 = 0
 		if field.Initializer != nil {
 			initialValue = *field.Initializer
@@ -95,40 +95,40 @@ func (ds *DataSource) Fields() map[string]float64 {
 }
 
 // Returns a mapping of the datasource local field names to their fully-qualified field name
-func (ds *DataSource) FieldNameMap() map[string]string {
-	fieldNames := make(map[string]string, len(ds.DataSourceSpec.Fields))
-	for _, v := range ds.DataSourceSpec.Fields {
-		fqname := fmt.Sprintf("%s.%s.%s", ds.From, ds.DataSourceSpec.Name, v.Name)
+func (ds *Dataspace) FieldNameMap() map[string]string {
+	fieldNames := make(map[string]string, len(ds.DataspaceSpec.Fields))
+	for _, v := range ds.DataspaceSpec.Fields {
+		fqname := fmt.Sprintf("%s.%s.%s", ds.From, ds.DataspaceSpec.Name, v.Name)
 		fieldNames[v.Name] = fqname
 	}
 	return fieldNames
 }
 
-func (ds *DataSource) FieldNames() []string {
-	fieldNames := make([]string, len(ds.DataSourceSpec.Fields))
-	for i, v := range ds.DataSourceSpec.Fields {
+func (ds *Dataspace) FieldNames() []string {
+	fieldNames := make([]string, len(ds.DataspaceSpec.Fields))
+	for i, v := range ds.DataspaceSpec.Fields {
 		fieldNames[i] = v.Name
 	}
 	return fieldNames
 }
 
-func (ds *DataSource) ActionNames() map[string]string {
+func (ds *Dataspace) ActionNames() map[string]string {
 	fqActionNames := make(map[string]string)
 
-	for dsActionName := range ds.DataSourceSpec.Actions {
-		fqName := fmt.Sprintf("%s.%s.%s", ds.DataSourceSpec.From, ds.DataSourceSpec.Name, dsActionName)
+	for dsActionName := range ds.DataspaceSpec.Actions {
+		fqName := fmt.Sprintf("%s.%s.%s", ds.DataspaceSpec.From, ds.DataspaceSpec.Name, dsActionName)
 		fqActionNames[dsActionName] = fqName
 	}
 
 	return fqActionNames
 }
 
-func (ds *DataSource) Laws() []string {
+func (ds *Dataspace) Laws() []string {
 	var fqLaws []string
 
 	fqFieldNames := ds.FieldNameMap()
 
-	for _, dsLaw := range ds.DataSourceSpec.Laws {
+	for _, dsLaw := range ds.DataspaceSpec.Laws {
 		law := dsLaw
 		for fieldName, fqFieldName := range fqFieldNames {
 			law = strings.ReplaceAll(law, fieldName, fqFieldName)
@@ -139,14 +139,14 @@ func (ds *DataSource) Laws() []string {
 	return fqLaws
 }
 
-func (ds *DataSource) AddNewState(state *state.State) {
+func (ds *Dataspace) AddNewState(state *state.State) {
 	ds.cachedStateMutex.Lock()
 	defer ds.cachedStateMutex.Unlock()
 
 	ds.cachedState = append(ds.cachedState, state)
 }
 
-func (ds *DataSource) FetchNewState(epoch time.Time, period time.Duration, interval time.Duration) ([]*state.State, error) {
+func (ds *Dataspace) FetchNewState(epoch time.Time, period time.Duration, interval time.Duration) ([]*state.State, error) {
 	if ds.connector == nil || ds.processor == nil {
 		return nil, nil
 	}

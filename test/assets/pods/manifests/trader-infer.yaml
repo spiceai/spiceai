@@ -1,18 +1,17 @@
 name: trader-infer
 params:
   epoch: 1605312000
-datasources:
-# Add a list of datasources here or run 'spice datasource add <datasource_publisher/datasource_id>'
-  - datasource:
-    from: local
+dataspaces:
+  # Add a list of dataspaces here
+  - from: local
     name: portfolio
     fields:
-    - name: usd_balance
-      type: number
-      initializer: 0
-    - name: btc_balance
-      type: number
-      initializer: 0
+      - name: usd_balance
+        type: number
+        initializer: 0
+      - name: btc_balance
+        type: number
+        initializer: 0
     actions:
       buy: |
         usd_balance -= args.price
@@ -21,11 +20,10 @@ datasources:
         usd_balance += args.price
         btc_balance -= 1
     laws:
-    - usd_balance >= 0
-    - btc_balance >= 0
-    
-  - datasource:
-    from: coinbase
+      - usd_balance >= 0
+      - btc_balance >= 0
+
+  - from: coinbase
     name: btcusd
     data:
       connector:
@@ -35,8 +33,7 @@ datasources:
       processor:
         name: csv
     fields:
-    - name: close
-    
+      - name: close
 
 actions:
 # Add a list of actions here or run 'spice action add <action_id>

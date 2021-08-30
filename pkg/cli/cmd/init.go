@@ -42,9 +42,9 @@ spice init trader
 		var rewardContent interface{} = "uniform"
 
 		skeletonPod := &spec.PodSpec{
-			Name:        podName,
-			DataSources: make([]spec.DataSourceSpec, 1),
-			Actions:     make([]spec.PodActionSpec, 1),
+			Name:       podName,
+			Dataspaces: make([]spec.DataspaceSpec, 1),
+			Actions:    make([]spec.PodActionSpec, 1),
 			Training: &spec.TrainingSpec{
 				Rewards: rewardContent,
 			},
@@ -58,9 +58,6 @@ spice init trader
 
 		// HACKHACK: In place of properly marshalling comments
 		skeletonPodContent := string(skeletonPodContentBytes)
-
-		dataSourcesComment := "# Add a list of datasources here or run 'spice datasource add <datasource_publisher/datasource_id>'\n"
-		skeletonPodContent, _ = util.AddElementToString(skeletonPodContent, dataSourcesComment, "datasources:", true)
 
 		actionsComment := "# Add a list of actions here or run 'spice action add <action_id>'\n"
 		skeletonPodContent, _ = util.AddElementToString(skeletonPodContent, actionsComment, "actions:", true)

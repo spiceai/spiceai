@@ -1,11 +1,11 @@
 package spec
 
 type PodSpec struct {
-	Name        string            `json:"name,omitempty" yaml:"name,omitempty" mapstructure:"name,omitempty"`
-	Params      map[string]string `json:"params,omitempty" yaml:"params,omitempty" mapstructure:"params,omitempty"`
-	DataSources []DataSourceSpec  `json:"datasources,omitempty" yaml:"datasources,omitempty" mapstructure:"datasources,omitempty"`
-	Actions     []PodActionSpec   `json:"actions,omitempty" yaml:"actions,omitempty" mapstructure:"actions,omitempty"`
-	Training    *TrainingSpec     `json:"training,omitempty" yaml:"training,omitempty" mapstructure:"training,omitempty"`
+	Name       string            `json:"name,omitempty" yaml:"name,omitempty" mapstructure:"name,omitempty"`
+	Params     map[string]string `json:"params,omitempty" yaml:"params,omitempty" mapstructure:"params,omitempty"`
+	Dataspaces []DataspaceSpec   `json:"dataspaces,omitempty" yaml:"dataspaces,omitempty" mapstructure:"dataspaces,omitempty"`
+	Actions    []PodActionSpec   `json:"actions,omitempty" yaml:"actions,omitempty" mapstructure:"actions,omitempty"`
+	Training   *TrainingSpec     `json:"training,omitempty" yaml:"training,omitempty" mapstructure:"training,omitempty"`
 }
 
 type PodActionSpec struct {
