@@ -156,6 +156,11 @@ jobs:
     steps:
       - uses: actions/checkout@v2
 
+      - name: Set up Go
+        uses: actions/setup-go@v2
+        with:
+          go-version: ${{ env.GOVER }}
+
       - name: Set up Python 3.8.11
         if: matrix.context == 'metal'
         uses: actions/setup-python@v1
