@@ -127,8 +127,6 @@ jobs:
           context: docker
           push: false
           tags: ghcr.io/spiceai/spiced:dev
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
       
       - name: Ensure correct directory structure
         if: matrix.context == 'metal'
