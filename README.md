@@ -3,7 +3,7 @@
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-yellow.svg)](https://opensource.org/licenses/Apache-2.0)
 [![spiced](https://github.com/spiceai/spiceai/actions/workflows/spiced.yml/badge.svg?branch=trunk&event=push)](https://github.com/spiceai/spice/actions/workflows/spiced.yml)
 [![Discord](https://img.shields.io/discord/803820740868571196)](https://discord.com/channels/803820740868571196/803820740868571199)
-![Subreddit subscribers](https://img.shields.io/reddit/subreddit-subscribers/spiceai?style=social)
+[![Subreddit subscribers](https://img.shields.io/reddit/subreddit-subscribers/spiceai?style=social)](https://www.reddit.com/r/spiceai)
 [![Follow on Twitter](https://img.shields.io/twitter/follow/spiceaihq.svg?style=social&logo=twitter)](https://twitter.com/intent/follow?screen_name=spiceaihq)
 
 Spice.ai is an open source runtime and distribution system for time series AI built for developers.
@@ -34,11 +34,9 @@ Follow this guide to get started quickly with Spice.ai. For a more comphrehensiv
 
 ### Prerequisites (Developer Preview only)
 
-We highly recommend using [GitHub Codespaces](https://github.com/features/codespaces) to get started. Codespaces enables you to run Spice.ai in a virtual environment in the cloud. If you use Codespaces, the following prerequisites are not required and you may skip to the [Getting Started with Codespaces](https://github.com/spiceai/spiceai#getting-started-with-codespaces) section.
+⭐️ We highly recommend using [GitHub Codespaces](https://github.com/features/codespaces) to get started. Codespaces enables you to run Spice.ai in a virtual environment in the cloud. If you use Codespaces, the following prerequisites are not required and you may skip to the [Getting Started with Codespaces](https://github.com/spiceai/spiceai#getting-started-with-codespaces) section.
 
-- Currently, only macOS and Linux are natively supported. [WSL 2](https://docs.microsoft.com/en-us/windows/wsl/install-win10) is required for Windows.
-- ## arm64 is not yet supported (i.e. Apple's M1 Macs). We use M1s ourselves, so we hope to support this very soon :-)
-  To continue with installation on your local machine, follow these steps:
+To continue with installation on your local machine, follow these steps:
 
 1. Install Docker
 2. Generate and export a GitHub PAT
@@ -74,20 +72,10 @@ These steps won't be required after public release.
 Install the Spice CLI by running the following `curl` command in your terminal.
 
 ```bash
-curl https://raw.githubusercontent.com/spiceai/spiceai/trunk/install/install.sh\?token\=AAATSLSSFWUX6ZVJ6LZI4XDBFRYHC | /bin/bash
+curl https://install.spiceai.org | /bin/bash
 ```
 
-The installation path is not currently added to your PATH, so we recommend to add it manually with the following command which you may want to add to your terminal configuration, E.g. `.bashrc` or `.zshrc`. This step won't be required after public release.
-
-```bash
-export PATH="$HOME/.spice/bin:$PATH"
-```
-
-You can also add to your `.bashrc`
-
-```bash
-cat "export PATH="$HOME/.spice/bin:$PATH" >> ~/.bashrc
-```
+You may need to restart your terminal for the `spice` command to be added to your PATH.
 
 ### Getting started with Codespaces
 
@@ -174,7 +162,7 @@ Spice.ai can be deployed to Kubernetes! Try out the [Kubernetes sample](https://
 Spice.ai started with the vision to make AI easy for developers. We are building Spice.ai in the open and with the community. Reach out on Discord or by email to get involved. We will be starting a community call series soon!
 
 - Discord: [![Discord Banner](https://discord.com/api/guilds/803820740868571196/widget.png?style=shield)](https://discord.com/channels/803820740868571196/803820740868571199)
-- Reddit: ![Subreddit subscribers](https://img.shields.io/reddit/subreddit-subscribers/spiceai?style=social)
+- Reddit: [![Subreddit subscribers](https://img.shields.io/reddit/subreddit-subscribers/spiceai?style=social)](https://www.reddit.com/r/spiceai)
 - Twitter: [@SpiceAIHQ](https://twitter.com/spiceaihq)
 - Email: [team@spiceai.io](mailto:team@spiceai.io)
 

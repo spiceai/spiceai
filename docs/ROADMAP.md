@@ -6,10 +6,13 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 
 ## Current Limitations
 
-- Data Sources are polled/fetched only (every 30 secs) - will change to push/streaming in v0.2
+Spice.ai is still under early development, so there are several limitations, including:
+
+- Data Sources are polled/fetched only (every 15 secs) - will change to push/streaming in v0.2
+- Basic local Pod/Flight monitoring through polling - will move to streaming websockets in v0.2
 - Data Connectors do not yet fully honor period, interval and granularity in all cases
 - Single AI backend only (Tensorflow) - expect to support others like PyTorch and Scikit-learn in v0.2
-- Running in Docker is required - a baremetal experience will be supported before v1.0
+- Running in Docker is required - a pure metal experience will be supported before v1.0
 - Only macOS and Linux are supported natively. [WSL 2](https://docs.microsoft.com/en-us/windows/wsl/install-win10) is required for Windows.
 - darwin/arm64 is not yet supported (i.e. Apple's M1 Macs). We use M1s ourselves, so we hope to support this very soon 👨‍💻
 
@@ -17,22 +20,18 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 
 - See [Bugs](https://github.com/spiceai/spiceai/labels/bug). Feel free to file a new Issue if you see a bug and let us know on Discord.
 
-### v0.1-alpha Developer Preview limitations
-
-- Development Registry (github.com/spiceai/registry) - will move to https://spicerack.org in v0.1-alpha public release
-- Basic local Pod/Flight monitoring through polling - will move to streaming websockets in v0.2
-
 ## v0.1-alpha Public Release Roadmap
 
-- Spice.ai Registry v0.1
 - Basic package manager support (E.g. brew install spiceai)
 - More samples
-- Friendlier concept names
 
 ## v0.2-alpha Roadmap
 
+- First-class simulated data
+- Pluggable environments
 - Additional AI algorithms (E.g. A3C)
 - Multiple AI Engine backends (E.g. PyTorch, Scikit-learn, etc.)
+- Search, index, publish and browse the Spice Rack registry
 - Self-host on baremetal or VM
 - Push/Streaming Data Sources/Connectors
 - Local Pod/Flight monitoring (WebSockets)
