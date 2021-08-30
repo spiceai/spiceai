@@ -126,6 +126,8 @@ jobs:
         run: |
           mkdir -p $HOME/.spice/bin
           cp ./spiced $HOME/.spice/bin/
+          chmod +x $HOME/.spice/bin/spiced
+          chmod +x ./spice
           ln -s ${{ github.workspace }}/ai/src $HOME/.spice/bin/ai
 
       - name: "Execute test - trader (algorithm: ${{ matrix.algorithm }})"
@@ -189,6 +191,8 @@ jobs:
         run: |
           mkdir -p $HOME/.spice/bin
           cp ./spiced $HOME/.spice/bin/
+          chmod +x $HOME/.spice/bin/spiced
+          chmod +x ./spice
           ln -s ${{ github.workspace }}/ai/src $HOME/.spice/bin/ai
 
       - name: "Execute e2e tests (algorithm: ${{ matrix.algorithm }})"
