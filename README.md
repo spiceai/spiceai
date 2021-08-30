@@ -151,7 +151,7 @@ spice train logpruner
 After training your pod, you can now get a recommendation for an action from it!
 
 ```bash
-curl http://localhost:8000/api/v0.1/pods/logpruner/inference
+curl http://localhost:8000/api/v0.1/pods/logpruner/recommendation
 ```
 
 ### Conclusion and next steps

@@ -37,9 +37,9 @@ func (r *runtimeServer) startRuntime(runtimePath string, workingDirectory string
 	return runtimeCmd, nil
 }
 
-func (r *runtimeServer) getInference(podName string, tag string) (*aiengine_pb.InferenceResult, error) {
+func (r *runtimeServer) getRecommendation(podName string, tag string) (*aiengine_pb.InferenceResult, error) {
 	var inference aiengine_pb.InferenceResult
-	url := fmt.Sprintf("%s/api/v0.1/pods/%s/models/%s/inference", r.baseUrl, podName, tag)
+	url := fmt.Sprintf("%s/api/v0.1/pods/%s/models/%s/recommendation", r.baseUrl, podName, tag)
 	err := r.internalGet(url, &inference)
 	if err != nil {
 		return nil, err
