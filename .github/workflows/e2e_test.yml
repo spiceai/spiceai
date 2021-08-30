@@ -183,7 +183,6 @@ jobs:
           path: cmd/spice
 
       - name: Download spiced
-        if: matrix.context == 'metal'
         uses: actions/download-artifact@v2
         with:
           name: spiced
