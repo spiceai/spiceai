@@ -110,7 +110,7 @@ func TestMain(m *testing.M) {
 		log.Println(err.Error())
 		os.Exit(1)
 	}
-	
+
 	err = cliClient.runCliCmd("add", "test/Trader")
 	if err != nil {
 		log.Println(err.Error())
