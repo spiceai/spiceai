@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 )
 
-func MkDirAllInheritPerm(path string) error {
+func MkDirAllInheritPerm(path string) (os.FileMode, error) {
 	var stat os.FileInfo
 	var err error
 	cwpath := path
@@ -18,10 +18,10 @@ func MkDirAllInheritPerm(path string) error {
 				cwpath = parent
 				continue
 			}
-			return err
+			return 0, err
 		}
 		break
 	}
 
-	return os.MkdirAll(path, stat.Mode())
+	return stat.Mode().Perm(), os.MkdirAll(path, stat.Mode().Perm())
 }
