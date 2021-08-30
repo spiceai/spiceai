@@ -1,6 +1,7 @@
 package registry
 
 import (
+	"os"
 	"strings"
 )
 
@@ -10,6 +11,10 @@ type SpiceRegistry interface {
 
 func GetRegistry(path string) SpiceRegistry {
 	if strings.HasPrefix(path, "/") || strings.HasPrefix(path, "file://") {
+		return &LocalFileRegistry{}
+	}
+
+	if _, err := os.Stat(path); err == nil {
 		return &LocalFileRegistry{}
 	}
 

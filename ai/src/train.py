@@ -19,6 +19,7 @@ from data import DataManager
 from metrics import metrics
 import threading
 from exec import somewhat_safe_eval
+from cleanup import directories_to_delete
 
 training_lock = threading.Lock()
 
@@ -170,7 +171,8 @@ def train_agent(
                 pod_name, f"Max training episodes ({TRAINING_EPISODES}) reached!"
             )
 
-        tmpdir = os.getenv("TMPDIR") or tempfile.gettempdir()
+        tmpdir = tempfile.mkdtemp()
+        directories_to_delete.append(tmpdir)
         model_path = os.path.join(tmpdir, f"{pod_name}.model")
         agent.save(model_path)
         saved_models[pod_name] = model_path

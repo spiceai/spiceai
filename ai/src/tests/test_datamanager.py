@@ -15,6 +15,7 @@ class DataManagerTestCase(unittest.TestCase):
             granularity_secs=pd.to_timedelta(10, unit="s"),
             fields={"foo": "bar"},
             action_rewards={"foo": "bar"},
+            actions_order={"foo": 0},
             laws=["law"],
         )
 
@@ -55,6 +56,7 @@ class DataManagerTestCase(unittest.TestCase):
                 granularity_secs=pd.to_timedelta(10, unit="s"),
                 fields=test_case["fields"],
                 action_rewards={"foo": "bar"},
+                actions_order={"foo": 0},
                 laws=["law"],
             )
 
@@ -81,6 +83,7 @@ class DataManagerTestCase(unittest.TestCase):
                 granularity_secs=pd.to_timedelta(test_case["granularity"], unit="s"),
                 fields={"foo": "bar"},
                 action_rewards={"foo": "bar"},
+                actions_order={"foo": 0},
                 laws=["law"],
             )
 
@@ -102,6 +105,7 @@ class DataManagerTestCase(unittest.TestCase):
             granularity_secs=pd.to_timedelta(10, unit="s"),
             fields={"foo": "bar"},
             action_rewards={"foo": "bar"},
+            actions_order={"foo": 0},
             laws=["law"],
         )
 
@@ -124,6 +128,7 @@ class DataManagerTestCase(unittest.TestCase):
             granularity_secs=granularity,
             fields={"foo": "bar"},
             action_rewards={"foo": "bar"},
+            actions_order={"foo": 0},
             laws=["law"],
         )
 

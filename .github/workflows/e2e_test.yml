@@ -12,14 +12,19 @@ on:
     branches:
       - trunk
       - release-*
+  workflow_dispatch:
 
 jobs:
-  end-to-end:
-    name: end to end test
+  algorithms:
+    name: algorithms test
     runs-on: ubuntu-latest
     env:
       GOVER: 1.16
-
+    strategy:
+      fail-fast: false
+      matrix:
+        algorithm: [vpg, dql]
+        context: [metal]
     steps:
       - uses: actions/checkout@v2
 
@@ -52,19 +57,78 @@ jobs:
         run: make
         working-directory: cmd/spiced
 
+      - name: Build Docker image
+        run: make docker
+
       - name: Ensure correct directory structure
         run: |
           mkdir -p $HOME/.spice/bin
           cp cmd/spiced/spiced $HOME/.spice/bin
           ln -s ${{ github.workspace }}/ai/src $HOME/.spice/bin/ai
 
-      - name: "Execute test - cartpole (default algorithm: vpg)"
+      - name: "Execute test - trader (algorithm: ${{ matrix.algorithm }})"
         run: |
-          ./spice train -b ../../test/assets/pods/manifests/cartpole-v1.yaml
+          cp ../../test/assets/data/csv/COINBASE_BTCUSD\,\ 30.csv .
+          export SPICE_GH_TOKEN=${{ secrets.GITHUB_TOKEN }}
+          export SPICE_DEEPRL_ALGORITHM="${{ matrix.algorithm }}"
+          ./spice version --context ${{ matrix.context }}
+          ./spice add test/Trader
+          ./spice train .spice/pods/trader.yaml --context ${{ matrix.context }}
         working-directory: cmd/spice
 
-      - name: "Execute test - cartpole (default algorithm: dql)"
+  end-to-end:
+    name: end-to-end test
+    runs-on: ubuntu-latest
+    env:
+      GOVER: 1.16
+    strategy:
+      fail-fast: false
+      matrix:
+        algorithm: [vpg, dql]
+        context: [metal, docker]
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Set up Python 3.8.11
+        uses: actions/setup-python@v1
+        with:
+          python-version: 3.8.11
+
+      - name: Install requirements
+        working-directory: ai/src
         run: |
-          export SPICE_DEEPRL_ALGORITHM="dql"
-          ./spice train -b ../../test/assets/pods/manifests/cartpole-v1.yaml
+          python -m venv venv
+          source venv/bin/activate
+          python -m pip install -r requirements/production.txt
+
+      - name: Set up Go
+        uses: actions/setup-go@v2
+        with:
+          go-version: ${{ env.GOVER }}
+
+      - name: Build and copy dashboard
+        working-directory: dashboard
+        run: make
+
+      - name: Build spice
+        run: make
         working-directory: cmd/spice
+
+      - name: Build spiced
+        run: make
+        working-directory: cmd/spiced
+
+      - name: Build Docker image
+        run: make docker
+
+      - name: Ensure correct directory structure
+        run: |
+          mkdir -p $HOME/.spice/bin
+          cp cmd/spiced/spiced $HOME/.spice/bin
+          ln -s ${{ github.workspace }}/ai/src $HOME/.spice/bin/ai
+
+      - name: "Execute e2e tests (algorithm: ${{ matrix.algorithm }})"
+        working-directory: test/e2e
+        run: |
+          export SPICE_DEEPRL_ALGORITHM="${{ matrix.algorithm }}"
+          go test -v . -e2e -context '${{ matrix.context }}'

@@ -1,7 +1,6 @@
 import io
 import csv
 import unittest
-import json
 import pandas as pd
 import threading
 import copy
@@ -9,6 +8,7 @@ import main
 import train
 from tests import common
 from proto.aiengine.v1 import aiengine_pb2
+from cleanup import cleanup_on_shutdown
 
 
 class TrainingLoopTests(unittest.TestCase):
@@ -18,11 +18,6 @@ class TrainingLoopTests(unittest.TestCase):
         self.trader_init_req = common.get_init_from_json(
             init_data_path="../../test/assets/aiengine/api/trader_init.json",
             pod_name="trader",
-        )
-
-        self.cartpole_init_req = common.get_init_from_json(
-            init_data_path="../../test/assets/aiengine/api/cartpole_init.json",
-            pod_name="cartpole",
         )
 
         with open("../../test/assets/data/csv/trader.csv", "r") as trader_data:
@@ -40,6 +35,7 @@ class TrainingLoopTests(unittest.TestCase):
     def tearDown(self):
         train.post_episode_result = self.original_post_episode_result
         train.end_of_episode = self.original_end_of_episode
+        cleanup_on_shutdown()
 
     def init(
         self,
@@ -480,26 +476,6 @@ class TrainingLoopTests(unittest.TestCase):
 
         # Counts will be unstable due to timing.  The important thing is that we launch training with enough data.
         self.wait_for_training()
-
-    def test_cartpole_training(self):
-        self.init(self.cartpole_init_req)
-        self.start_training(
-            "cartpole",
-            "1",
-            1,
-            expected_error=False,
-            expected_result="started_training",
-        )
-        self.wait_for_training()
-
-        # Validate the episode data
-        self.validate_episode_data(
-            "cartpole",
-            "1",
-            1,
-            num_actions=299,
-            episode_results=self.episode_results,
-        )
 
     def test_add_data_with_different_fields_fails(self):
         trader_init = copy.deepcopy(self.trader_init_req)

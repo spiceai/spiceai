@@ -5,7 +5,10 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"testing"
+
+	"github.com/spiceai/spice/pkg/constants"
 )
 
 // This test suite is using a neat trick for testing exec.Command that is documented here:
@@ -55,13 +58,14 @@ func TestAIEngineMockCmd(t *testing.T) {
 
 func EnsureTestSpiceDirectory(t *testing.T) {
 	// Ensure test config directory doesn't exist already so we don't hose it on cleanup
-	_, err := os.Stat(".spice")
+	_, err := os.Stat(constants.DotSpice)
 	if err == nil {
 		t.Errorf(".spice directory already exists")
 		return
 	}
 
-	err = os.MkdirAll(".spice/pods", 0766)
+	podsPath := filepath.Join(constants.DotSpice, "pods")
+	err = os.MkdirAll(podsPath, 0766)
 	if err != nil {
 		t.Error(err)
 		return
@@ -69,7 +73,7 @@ func EnsureTestSpiceDirectory(t *testing.T) {
 }
 
 func CleanupTestSpiceDirectory() {
-	err := os.RemoveAll(".spice")
+	err := os.RemoveAll(constants.DotSpice)
 	if err != nil {
 		fmt.Println(err)
 	}

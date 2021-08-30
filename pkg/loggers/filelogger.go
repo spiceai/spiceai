@@ -4,38 +4,35 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
-	"github.com/spiceai/spice/pkg/config"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	lumberjack "gopkg.in/natefinch/lumberjack.v2"
 )
 
-func NewFileLogger(name string) (*zap.Logger, error) {
-	path := config.SpiceLogPath()
-	if _, err := os.Stat(path); err != nil {
-		runtimePath := config.SpiceRuntimePath()
-		rootStat, err := os.Stat(config.SpiceRuntimePath())
-		if err != nil {
-			return nil, fmt.Errorf("failed to find runtime path '%s': %w", runtimePath, err)
-		}
+var (
+	createLogDirectoryMutex sync.RWMutex
+)
 
-		if err = os.MkdirAll(path, rootStat.Mode().Perm()); err != nil {
-			return nil, fmt.Errorf("failed to create log path '%s'", path)
-		}
+func NewFileLogger(name string, dotSpicePath string) (*zap.Logger, error) {
+
+	logPath, err := createLogDirectory(dotSpicePath)
+	if err != nil {
+		return nil, err
 	}
 
 	fileName := fmt.Sprintf("%s-%s.log", name, time.Now().UTC().Format("20060102T150405Z"))
-	logPath := filepath.Join(path, fileName)
+	logFilePath := filepath.Join(logPath, fileName)
 
-	_, err := os.Create(logPath)
+	_, err = os.Create(logFilePath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create log file '%s': %w", logPath, err)
+		return nil, fmt.Errorf("failed to create log file '%s': %w", logFilePath, err)
 	}
 
 	w := zapcore.AddSync(&lumberjack.Logger{
-		Filename:   logPath,
+		Filename:   logFilePath,
 		MaxSize:    100, // megabytes
 		MaxBackups: 3,
 		MaxAge:     60, // days
@@ -47,4 +44,26 @@ func NewFileLogger(name string) (*zap.Logger, error) {
 	)
 
 	return zap.New(core), nil
+}
+
+func createLogDirectory(dotSpicePath string) (string, error) {
+	createLogDirectoryMutex.Lock()
+	defer createLogDirectoryMutex.Unlock()
+
+	logPath := filepath.Join(dotSpicePath, "log")
+	if _, err := os.Stat(logPath); err != nil {
+		rootStat, err := os.Stat(dotSpicePath)
+		if err != nil {
+			rootStat, err = os.Stat(filepath.Dir(dotSpicePath))
+			if err != nil {
+				return "", fmt.Errorf("failed to find runtime path '%s': %w", dotSpicePath, err)
+			}
+		}
+
+		if err = os.MkdirAll(logPath, rootStat.Mode().Perm()); err != nil {
+			return "", fmt.Errorf("failed to create log path '%s'", logPath)
+		}
+	}
+
+	return logPath, nil
 }

@@ -12,10 +12,12 @@ import (
 	"github.com/spf13/viper"
 	"github.com/spiceai/spice/pkg/aiengine"
 	"github.com/spiceai/spice/pkg/config"
+	"github.com/spiceai/spice/pkg/context"
 	"github.com/spiceai/spice/pkg/environment"
 	spice_http "github.com/spiceai/spice/pkg/http"
 	"github.com/spiceai/spice/pkg/loggers"
 	"github.com/spiceai/spice/pkg/pods"
+	"github.com/spiceai/spice/pkg/tempdir"
 	"github.com/spiceai/spice/pkg/version"
 	"go.uber.org/zap"
 )
@@ -38,55 +40,15 @@ func (r *SpiceRuntime) LoadConfig() error {
 
 	var err error
 	if r.config == nil {
-		r.config, err = config.LoadRuntimeConfiguration(r.viper)
+		appDir := context.CurrentContext().AppDir()
+		r.config, err = config.LoadRuntimeConfiguration(r.viper, appDir)
 	}
 
 	return err
 }
 
-func (r *SpiceRuntime) processPodsConfig() {
-	if r.config.Pods == nil {
-		return
-	}
-
-	for _, f := range r.config.Pods {
-		pod := pods.GetPod(f.Name)
-		if pod == nil {
-			continue
-		}
-
-		if f.Models != nil && f.Models.Downloader != nil {
-			connectionId := f.Models.Downloader.Uses
-			connection, ok := r.config.Connections[connectionId]
-			if !ok {
-				log.Println("Warning: Connection", f.Models.Downloader.Uses, "not found.")
-				continue
-			}
-
-			// TODO: Take this from .git
-			branch := "trunk"
-			if f.Models.Downloader.Branch != nil {
-				branch = *f.Models.Downloader.Branch
-			}
-
-			log.Printf("Checking for pod %s model updates ...", pod.Name)
-			tag, err := pod.DownloadModelUpdate(connectionId, connection, branch)
-			if err != nil {
-				log.Println("Warning: Failed to download model update for", pod.Name)
-			}
-
-			if tag == "" {
-				log.Println("No new model updates.")
-				continue
-			}
-
-			log.Printf("Updated pod '%s' model to '%s'\n", pod.Name, tag)
-		}
-	}
-}
-
 func (r *SpiceRuntime) configChangeHandler(e fsnotify.Event) {
-	configPath := config.GetSpiceAppRelativePath(e.Name)
+	configPath := context.CurrentContext().GetSpiceAppRelativePath(e.Name)
 	log.Println("Detected config change to", configPath)
 
 	var newConfig *config.SpiceConfiguration
@@ -96,8 +58,6 @@ func (r *SpiceRuntime) configChangeHandler(e fsnotify.Event) {
 	}
 
 	r.config = newConfig
-
-	r.processPodsConfig()
 }
 
 func (r *SpiceRuntime) printStartupBanner(mode string) {
@@ -193,13 +153,13 @@ func Run() error {
 }
 
 func (r *SpiceRuntime) scanForPods() error {
-	_, err := os.Stat(config.AppSpicePath())
+	_, err := os.Stat(context.CurrentContext().AppDir())
 	if err != nil {
 		// No .spice means no pods
 		return nil
 	}
 
-	podsManifestDir := config.PodsManifestsPath()
+	podsManifestDir := context.CurrentContext().PodsDir()
 	_, err = os.Stat(podsManifestDir)
 	if err != nil {
 		// No .spice/pods means no pods
@@ -276,6 +236,18 @@ func Shutdown() {
 	go func() {
 		defer wg.Done()
 		err := aiengine.StopServer()
+		if err != nil {
+			zaplog.Sugar().Debug(err.Error())
+			return
+		}
+	}()
+
+	wg.Add(1)
+
+	go func() {
+		defer wg.Done()
+
+		err := tempdir.RemoveAllCreatedTempDirectories()
 		if err != nil {
 			zaplog.Sugar().Debug(err.Error())
 			return

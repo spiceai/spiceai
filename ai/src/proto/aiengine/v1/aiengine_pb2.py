@@ -19,7 +19,7 @@ DESCRIPTOR = _descriptor.FileDescriptor(
   syntax='proto3',
   serialized_options=b'Z.github.com/spiceai/spice/pkg/proto/aiengine_pb',
   create_key=_descriptor._internal_create_key,
-  serialized_pb=b'\n proto/aiengine/v1/aiengine.proto\x12\x08\x61iengine\"\x81\x01\n\rDataConnector\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\x33\n\x06params\x18\x02 \x03(\x0b\x32#.aiengine.DataConnector.ParamsEntry\x1a-\n\x0bParamsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\"\x9c\x01\n\nDataSource\x12*\n\tconnector\x18\x01 \x01(\x0b\x32\x17.aiengine.DataConnector\x12\x32\n\x07\x61\x63tions\x18\x02 \x03(\x0b\x32!.aiengine.DataSource.ActionsEntry\x1a.\n\x0c\x41\x63tionsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\"\xe5\x02\n\x0bInitRequest\x12\x0b\n\x03pod\x18\x01 \x01(\t\x12\x0e\n\x06period\x18\x02 \x01(\x03\x12\x10\n\x08interval\x18\x03 \x01(\x03\x12\x13\n\x0bgranularity\x18\x04 \x01(\x03\x12\x12\n\nepoch_time\x18\x05 \x01(\x03\x12\x33\n\x07\x61\x63tions\x18\x06 \x03(\x0b\x32\".aiengine.InitRequest.ActionsEntry\x12\x31\n\x06\x66ields\x18\x07 \x03(\x0b\x32!.aiengine.InitRequest.FieldsEntry\x12\x0c\n\x04laws\x18\x08 \x03(\t\x12)\n\x0b\x64\x61tasources\x18\t \x03(\x0b\x32\x14.aiengine.DataSource\x1a.\n\x0c\x41\x63tionsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\x1a-\n\x0b\x46ieldsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\x01:\x02\x38\x01\":\n\x08Response\x12\x0e\n\x06result\x18\x01 \x01(\t\x12\x0f\n\x07message\x18\x02 \x01(\t\x12\r\n\x05\x65rror\x18\x03 \x01(\x08\"w\n\x14StartTrainingRequest\x12\x0b\n\x03pod\x18\x01 \x01(\t\x12\x17\n\x0fnumber_episodes\x18\x02 \x01(\x03\x12\x0e\n\x06\x66light\x18\x03 \x01(\t\x12\x15\n\rtraining_goal\x18\x04 \x01(\t\x12\x12\n\nepoch_time\x18\x05 \x01(\x03\",\n\x10InferenceRequest\x12\x0b\n\x03pod\x18\x01 \x01(\t\x12\x0b\n\x03tag\x18\x02 \x01(\t\"\x84\x01\n\x0fInferenceResult\x12$\n\x08response\x18\x01 \x01(\x0b\x32\x12.aiengine.Response\x12\r\n\x05start\x18\x02 \x01(\x03\x12\x0b\n\x03\x65nd\x18\x03 \x01(\x03\x12\x0e\n\x06\x61\x63tion\x18\x04 \x01(\t\x12\x12\n\nconfidence\x18\x05 \x01(\x02\x12\x0b\n\x03tag\x18\x06 \x01(\t\"/\n\x0e\x41\x64\x64\x44\x61taRequest\x12\x0b\n\x03pod\x18\x01 \x01(\t\x12\x10\n\x08\x63sv_data\x18\x02 \x01(\t\"\x0f\n\rHealthRequest2\xbc\x02\n\x08\x41IEngine\x12\x31\n\x04Init\x12\x15.aiengine.InitRequest\x1a\x12.aiengine.Response\x12\x37\n\x07\x41\x64\x64\x44\x61ta\x12\x18.aiengine.AddDataRequest\x1a\x12.aiengine.Response\x12\x43\n\rStartTraining\x12\x1e.aiengine.StartTrainingRequest\x1a\x12.aiengine.Response\x12\x45\n\x0cGetInference\x12\x1a.aiengine.InferenceRequest\x1a\x19.aiengine.InferenceResult\x12\x38\n\tGetHealth\x12\x17.aiengine.HealthRequest\x1a\x12.aiengine.ResponseB0Z.github.com/spiceai/spice/pkg/proto/aiengine_pbb\x06proto3'
+  serialized_pb=b'\n proto/aiengine/v1/aiengine.proto\x12\x08\x61iengine\"\x81\x01\n\rDataConnector\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\x33\n\x06params\x18\x02 \x03(\x0b\x32#.aiengine.DataConnector.ParamsEntry\x1a-\n\x0bParamsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\"\x9c\x01\n\nDataSource\x12*\n\tconnector\x18\x01 \x01(\x0b\x32\x17.aiengine.DataConnector\x12\x32\n\x07\x61\x63tions\x18\x02 \x03(\x0b\x32!.aiengine.DataSource.ActionsEntry\x1a.\n\x0c\x41\x63tionsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\"\xda\x03\n\x0bInitRequest\x12\x0b\n\x03pod\x18\x01 \x01(\t\x12\x0e\n\x06period\x18\x02 \x01(\x03\x12\x10\n\x08interval\x18\x03 \x01(\x03\x12\x13\n\x0bgranularity\x18\x04 \x01(\x03\x12\x12\n\nepoch_time\x18\x05 \x01(\x03\x12\x33\n\x07\x61\x63tions\x18\x06 \x03(\x0b\x32\".aiengine.InitRequest.ActionsEntry\x12>\n\ractions_order\x18\x07 \x03(\x0b\x32\'.aiengine.InitRequest.ActionsOrderEntry\x12\x31\n\x06\x66ields\x18\x08 \x03(\x0b\x32!.aiengine.InitRequest.FieldsEntry\x12\x0c\n\x04laws\x18\t \x03(\t\x12)\n\x0b\x64\x61tasources\x18\n \x03(\x0b\x32\x14.aiengine.DataSource\x1a.\n\x0c\x41\x63tionsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\x1a\x33\n\x11\x41\x63tionsOrderEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\x05:\x02\x38\x01\x1a-\n\x0b\x46ieldsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\x01:\x02\x38\x01\":\n\x08Response\x12\x0e\n\x06result\x18\x01 \x01(\t\x12\x0f\n\x07message\x18\x02 \x01(\t\x12\r\n\x05\x65rror\x18\x03 \x01(\x08\"M\n\x11\x45xportModelResult\x12$\n\x08response\x18\x01 \x01(\x0b\x32\x12.aiengine.Response\x12\x12\n\nmodel_path\x18\x02 \x01(\t\"w\n\x14StartTrainingRequest\x12\x0b\n\x03pod\x18\x01 \x01(\t\x12\x17\n\x0fnumber_episodes\x18\x02 \x01(\x03\x12\x0e\n\x06\x66light\x18\x03 \x01(\t\x12\x15\n\rtraining_goal\x18\x04 \x01(\t\x12\x12\n\nepoch_time\x18\x05 \x01(\x03\",\n\x10InferenceRequest\x12\x0b\n\x03pod\x18\x01 \x01(\t\x12\x0b\n\x03tag\x18\x02 \x01(\t\"\x84\x01\n\x0fInferenceResult\x12$\n\x08response\x18\x01 \x01(\x0b\x32\x12.aiengine.Response\x12\r\n\x05start\x18\x02 \x01(\x03\x12\x0b\n\x03\x65nd\x18\x03 \x01(\x03\x12\x0e\n\x06\x61\x63tion\x18\x04 \x01(\t\x12\x12\n\nconfidence\x18\x05 \x01(\x02\x12\x0b\n\x03tag\x18\x06 \x01(\t\"/\n\x0e\x41\x64\x64\x44\x61taRequest\x12\x0b\n\x03pod\x18\x01 \x01(\t\x12\x10\n\x08\x63sv_data\x18\x02 \x01(\t\"\x0f\n\rHealthRequest\".\n\x12\x45xportModelRequest\x12\x0b\n\x03pod\x18\x01 \x01(\t\x12\x0b\n\x03tag\x18\x02 \x01(\t\"C\n\x12ImportModelRequest\x12\x0b\n\x03pod\x18\x01 \x01(\t\x12\x0b\n\x03tag\x18\x02 \x01(\t\x12\x13\n\x0bimport_path\x18\x03 \x01(\t2\xc7\x03\n\x08\x41IEngine\x12\x31\n\x04Init\x12\x15.aiengine.InitRequest\x1a\x12.aiengine.Response\x12\x37\n\x07\x41\x64\x64\x44\x61ta\x12\x18.aiengine.AddDataRequest\x1a\x12.aiengine.Response\x12\x43\n\rStartTraining\x12\x1e.aiengine.StartTrainingRequest\x1a\x12.aiengine.Response\x12\x45\n\x0cGetInference\x12\x1a.aiengine.InferenceRequest\x1a\x19.aiengine.InferenceResult\x12\x38\n\tGetHealth\x12\x17.aiengine.HealthRequest\x1a\x12.aiengine.Response\x12H\n\x0b\x45xportModel\x12\x1c.aiengine.ExportModelRequest\x1a\x1b.aiengine.ExportModelResult\x12?\n\x0bImportModel\x12\x1c.aiengine.ImportModelRequest\x1a\x12.aiengine.ResponseB0Z.github.com/spiceai/spice/pkg/proto/aiengine_pbb\x06proto3'
 )
 
 
@@ -217,6 +217,44 @@ _INITREQUEST_ACTIONSENTRY = _descriptor.Descriptor(
   serialized_end=335,
 )
 
+_INITREQUEST_ACTIONSORDERENTRY = _descriptor.Descriptor(
+  name='ActionsOrderEntry',
+  full_name='aiengine.InitRequest.ActionsOrderEntry',
+  filename=None,
+  file=DESCRIPTOR,
+  containing_type=None,
+  create_key=_descriptor._internal_create_key,
+  fields=[
+    _descriptor.FieldDescriptor(
+      name='key', full_name='aiengine.InitRequest.ActionsOrderEntry.key', index=0,
+      number=1, type=9, cpp_type=9, label=1,
+      has_default_value=False, default_value=b"".decode('utf-8'),
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      serialized_options=None, file=DESCRIPTOR,  create_key=_descriptor._internal_create_key),
+    _descriptor.FieldDescriptor(
+      name='value', full_name='aiengine.InitRequest.ActionsOrderEntry.value', index=1,
+      number=2, type=5, cpp_type=1, label=1,
+      has_default_value=False, default_value=0,
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      serialized_options=None, file=DESCRIPTOR,  create_key=_descriptor._internal_create_key),
+  ],
+  extensions=[
+  ],
+  nested_types=[],
+  enum_types=[
+  ],
+  serialized_options=b'8\001',
+  is_extendable=False,
+  syntax='proto3',
+  extension_ranges=[],
+  oneofs=[
+  ],
+  serialized_start=714,
+  serialized_end=765,
+)
+
 _INITREQUEST_FIELDSENTRY = _descriptor.Descriptor(
   name='FieldsEntry',
   full_name='aiengine.InitRequest.FieldsEntry',
@@ -251,8 +289,8 @@ _INITREQUEST_FIELDSENTRY = _descriptor.Descriptor(
   extension_ranges=[],
   oneofs=[
   ],
-  serialized_start=650,
-  serialized_end=695,
+  serialized_start=767,
+  serialized_end=812,
 )
 
 _INITREQUEST = _descriptor.Descriptor(
@@ -306,22 +344,29 @@ _INITREQUEST = _descriptor.Descriptor(
       is_extension=False, extension_scope=None,
       serialized_options=None, file=DESCRIPTOR,  create_key=_descriptor._internal_create_key),
     _descriptor.FieldDescriptor(
-      name='fields', full_name='aiengine.InitRequest.fields', index=6,
+      name='actions_order', full_name='aiengine.InitRequest.actions_order', index=6,
       number=7, type=11, cpp_type=10, label=3,
       has_default_value=False, default_value=[],
       message_type=None, enum_type=None, containing_type=None,
       is_extension=False, extension_scope=None,
       serialized_options=None, file=DESCRIPTOR,  create_key=_descriptor._internal_create_key),
     _descriptor.FieldDescriptor(
-      name='laws', full_name='aiengine.InitRequest.laws', index=7,
-      number=8, type=9, cpp_type=9, label=3,
+      name='fields', full_name='aiengine.InitRequest.fields', index=7,
+      number=8, type=11, cpp_type=10, label=3,
       has_default_value=False, default_value=[],
       message_type=None, enum_type=None, containing_type=None,
       is_extension=False, extension_scope=None,
       serialized_options=None, file=DESCRIPTOR,  create_key=_descriptor._internal_create_key),
     _descriptor.FieldDescriptor(
-      name='datasources', full_name='aiengine.InitRequest.datasources', index=8,
-      number=9, type=11, cpp_type=10, label=3,
+      name='laws', full_name='aiengine.InitRequest.laws', index=8,
+      number=9, type=9, cpp_type=9, label=3,
+      has_default_value=False, default_value=[],
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      serialized_options=None, file=DESCRIPTOR,  create_key=_descriptor._internal_create_key),
+    _descriptor.FieldDescriptor(
+      name='datasources', full_name='aiengine.InitRequest.datasources', index=9,
+      number=10, type=11, cpp_type=10, label=3,
       has_default_value=False, default_value=[],
       message_type=None, enum_type=None, containing_type=None,
       is_extension=False, extension_scope=None,
@@ -329,7 +374,7 @@ _INITREQUEST = _descriptor.Descriptor(
   ],
   extensions=[
   ],
-  nested_types=[_INITREQUEST_ACTIONSENTRY, _INITREQUEST_FIELDSENTRY, ],
+  nested_types=[_INITREQUEST_ACTIONSENTRY, _INITREQUEST_ACTIONSORDERENTRY, _INITREQUEST_FIELDSENTRY, ],
   enum_types=[
   ],
   serialized_options=None,
@@ -339,7 +384,7 @@ _INITREQUEST = _descriptor.Descriptor(
   oneofs=[
   ],
   serialized_start=338,
-  serialized_end=695,
+  serialized_end=812,
 )
 
 
@@ -384,8 +429,47 @@ _RESPONSE = _descriptor.Descriptor(
   extension_ranges=[],
   oneofs=[
   ],
-  serialized_start=697,
-  serialized_end=755,
+  serialized_start=814,
+  serialized_end=872,
+)
+
+
+_EXPORTMODELRESULT = _descriptor.Descriptor(
+  name='ExportModelResult',
+  full_name='aiengine.ExportModelResult',
+  filename=None,
+  file=DESCRIPTOR,
+  containing_type=None,
+  create_key=_descriptor._internal_create_key,
+  fields=[
+    _descriptor.FieldDescriptor(
+      name='response', full_name='aiengine.ExportModelResult.response', index=0,
+      number=1, type=11, cpp_type=10, label=1,
+      has_default_value=False, default_value=None,
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      serialized_options=None, file=DESCRIPTOR,  create_key=_descriptor._internal_create_key),
+    _descriptor.FieldDescriptor(
+      name='model_path', full_name='aiengine.ExportModelResult.model_path', index=1,
+      number=2, type=9, cpp_type=9, label=1,
+      has_default_value=False, default_value=b"".decode('utf-8'),
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      serialized_options=None, file=DESCRIPTOR,  create_key=_descriptor._internal_create_key),
+  ],
+  extensions=[
+  ],
+  nested_types=[],
+  enum_types=[
+  ],
+  serialized_options=None,
+  is_extendable=False,
+  syntax='proto3',
+  extension_ranges=[],
+  oneofs=[
+  ],
+  serialized_start=874,
+  serialized_end=951,
 )
 
 
@@ -444,8 +528,8 @@ _STARTTRAININGREQUEST = _descriptor.Descriptor(
   extension_ranges=[],
   oneofs=[
   ],
-  serialized_start=757,
-  serialized_end=876,
+  serialized_start=953,
+  serialized_end=1072,
 )
 
 
@@ -483,8 +567,8 @@ _INFERENCEREQUEST = _descriptor.Descriptor(
   extension_ranges=[],
   oneofs=[
   ],
-  serialized_start=878,
-  serialized_end=922,
+  serialized_start=1074,
+  serialized_end=1118,
 )
 
 
@@ -550,8 +634,8 @@ _INFERENCERESULT = _descriptor.Descriptor(
   extension_ranges=[],
   oneofs=[
   ],
-  serialized_start=925,
-  serialized_end=1057,
+  serialized_start=1121,
+  serialized_end=1253,
 )
 
 
@@ -589,8 +673,8 @@ _ADDDATAREQUEST = _descriptor.Descriptor(
   extension_ranges=[],
   oneofs=[
   ],
-  serialized_start=1059,
-  serialized_end=1106,
+  serialized_start=1255,
+  serialized_end=1302,
 )
 
 
@@ -614,8 +698,93 @@ _HEALTHREQUEST = _descriptor.Descriptor(
   extension_ranges=[],
   oneofs=[
   ],
-  serialized_start=1108,
-  serialized_end=1123,
+  serialized_start=1304,
+  serialized_end=1319,
+)
+
+
+_EXPORTMODELREQUEST = _descriptor.Descriptor(
+  name='ExportModelRequest',
+  full_name='aiengine.ExportModelRequest',
+  filename=None,
+  file=DESCRIPTOR,
+  containing_type=None,
+  create_key=_descriptor._internal_create_key,
+  fields=[
+    _descriptor.FieldDescriptor(
+      name='pod', full_name='aiengine.ExportModelRequest.pod', index=0,
+      number=1, type=9, cpp_type=9, label=1,
+      has_default_value=False, default_value=b"".decode('utf-8'),
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      serialized_options=None, file=DESCRIPTOR,  create_key=_descriptor._internal_create_key),
+    _descriptor.FieldDescriptor(
+      name='tag', full_name='aiengine.ExportModelRequest.tag', index=1,
+      number=2, type=9, cpp_type=9, label=1,
+      has_default_value=False, default_value=b"".decode('utf-8'),
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      serialized_options=None, file=DESCRIPTOR,  create_key=_descriptor._internal_create_key),
+  ],
+  extensions=[
+  ],
+  nested_types=[],
+  enum_types=[
+  ],
+  serialized_options=None,
+  is_extendable=False,
+  syntax='proto3',
+  extension_ranges=[],
+  oneofs=[
+  ],
+  serialized_start=1321,
+  serialized_end=1367,
+)
+
+
+_IMPORTMODELREQUEST = _descriptor.Descriptor(
+  name='ImportModelRequest',
+  full_name='aiengine.ImportModelRequest',
+  filename=None,
+  file=DESCRIPTOR,
+  containing_type=None,
+  create_key=_descriptor._internal_create_key,
+  fields=[
+    _descriptor.FieldDescriptor(
+      name='pod', full_name='aiengine.ImportModelRequest.pod', index=0,
+      number=1, type=9, cpp_type=9, label=1,
+      has_default_value=False, default_value=b"".decode('utf-8'),
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      serialized_options=None, file=DESCRIPTOR,  create_key=_descriptor._internal_create_key),
+    _descriptor.FieldDescriptor(
+      name='tag', full_name='aiengine.ImportModelRequest.tag', index=1,
+      number=2, type=9, cpp_type=9, label=1,
+      has_default_value=False, default_value=b"".decode('utf-8'),
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      serialized_options=None, file=DESCRIPTOR,  create_key=_descriptor._internal_create_key),
+    _descriptor.FieldDescriptor(
+      name='import_path', full_name='aiengine.ImportModelRequest.import_path', index=2,
+      number=3, type=9, cpp_type=9, label=1,
+      has_default_value=False, default_value=b"".decode('utf-8'),
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      serialized_options=None, file=DESCRIPTOR,  create_key=_descriptor._internal_create_key),
+  ],
+  extensions=[
+  ],
+  nested_types=[],
+  enum_types=[
+  ],
+  serialized_options=None,
+  is_extendable=False,
+  syntax='proto3',
+  extension_ranges=[],
+  oneofs=[
+  ],
+  serialized_start=1369,
+  serialized_end=1436,
 )
 
 _DATACONNECTOR_PARAMSENTRY.containing_type = _DATACONNECTOR
@@ -624,20 +793,26 @@ _DATASOURCE_ACTIONSENTRY.containing_type = _DATASOURCE
 _DATASOURCE.fields_by_name['connector'].message_type = _DATACONNECTOR
 _DATASOURCE.fields_by_name['actions'].message_type = _DATASOURCE_ACTIONSENTRY
 _INITREQUEST_ACTIONSENTRY.containing_type = _INITREQUEST
+_INITREQUEST_ACTIONSORDERENTRY.containing_type = _INITREQUEST
 _INITREQUEST_FIELDSENTRY.containing_type = _INITREQUEST
 _INITREQUEST.fields_by_name['actions'].message_type = _INITREQUEST_ACTIONSENTRY
+_INITREQUEST.fields_by_name['actions_order'].message_type = _INITREQUEST_ACTIONSORDERENTRY
 _INITREQUEST.fields_by_name['fields'].message_type = _INITREQUEST_FIELDSENTRY
 _INITREQUEST.fields_by_name['datasources'].message_type = _DATASOURCE
+_EXPORTMODELRESULT.fields_by_name['response'].message_type = _RESPONSE
 _INFERENCERESULT.fields_by_name['response'].message_type = _RESPONSE
 DESCRIPTOR.message_types_by_name['DataConnector'] = _DATACONNECTOR
 DESCRIPTOR.message_types_by_name['DataSource'] = _DATASOURCE
 DESCRIPTOR.message_types_by_name['InitRequest'] = _INITREQUEST
 DESCRIPTOR.message_types_by_name['Response'] = _RESPONSE
+DESCRIPTOR.message_types_by_name['ExportModelResult'] = _EXPORTMODELRESULT
 DESCRIPTOR.message_types_by_name['StartTrainingRequest'] = _STARTTRAININGREQUEST
 DESCRIPTOR.message_types_by_name['InferenceRequest'] = _INFERENCEREQUEST
 DESCRIPTOR.message_types_by_name['InferenceResult'] = _INFERENCERESULT
 DESCRIPTOR.message_types_by_name['AddDataRequest'] = _ADDDATAREQUEST
 DESCRIPTOR.message_types_by_name['HealthRequest'] = _HEALTHREQUEST
+DESCRIPTOR.message_types_by_name['ExportModelRequest'] = _EXPORTMODELREQUEST
+DESCRIPTOR.message_types_by_name['ImportModelRequest'] = _IMPORTMODELREQUEST
 _sym_db.RegisterFileDescriptor(DESCRIPTOR)
 
 DataConnector = _reflection.GeneratedProtocolMessageType('DataConnector', (_message.Message,), {
@@ -679,6 +854,13 @@ InitRequest = _reflection.GeneratedProtocolMessageType('InitRequest', (_message.
     })
   ,
 
+  'ActionsOrderEntry' : _reflection.GeneratedProtocolMessageType('ActionsOrderEntry', (_message.Message,), {
+    'DESCRIPTOR' : _INITREQUEST_ACTIONSORDERENTRY,
+    '__module__' : 'proto.aiengine.v1.aiengine_pb2'
+    # @@protoc_insertion_point(class_scope:aiengine.InitRequest.ActionsOrderEntry)
+    })
+  ,
+
   'FieldsEntry' : _reflection.GeneratedProtocolMessageType('FieldsEntry', (_message.Message,), {
     'DESCRIPTOR' : _INITREQUEST_FIELDSENTRY,
     '__module__' : 'proto.aiengine.v1.aiengine_pb2'
@@ -691,6 +873,7 @@ InitRequest = _reflection.GeneratedProtocolMessageType('InitRequest', (_message.
   })
 _sym_db.RegisterMessage(InitRequest)
 _sym_db.RegisterMessage(InitRequest.ActionsEntry)
+_sym_db.RegisterMessage(InitRequest.ActionsOrderEntry)
 _sym_db.RegisterMessage(InitRequest.FieldsEntry)
 
 Response = _reflection.GeneratedProtocolMessageType('Response', (_message.Message,), {
@@ -699,6 +882,13 @@ Response = _reflection.GeneratedProtocolMessageType('Response', (_message.Messag
   # @@protoc_insertion_point(class_scope:aiengine.Response)
   })
 _sym_db.RegisterMessage(Response)
+
+ExportModelResult = _reflection.GeneratedProtocolMessageType('ExportModelResult', (_message.Message,), {
+  'DESCRIPTOR' : _EXPORTMODELRESULT,
+  '__module__' : 'proto.aiengine.v1.aiengine_pb2'
+  # @@protoc_insertion_point(class_scope:aiengine.ExportModelResult)
+  })
+_sym_db.RegisterMessage(ExportModelResult)
 
 StartTrainingRequest = _reflection.GeneratedProtocolMessageType('StartTrainingRequest', (_message.Message,), {
   'DESCRIPTOR' : _STARTTRAININGREQUEST,
@@ -735,11 +925,26 @@ HealthRequest = _reflection.GeneratedProtocolMessageType('HealthRequest', (_mess
   })
 _sym_db.RegisterMessage(HealthRequest)
 
+ExportModelRequest = _reflection.GeneratedProtocolMessageType('ExportModelRequest', (_message.Message,), {
+  'DESCRIPTOR' : _EXPORTMODELREQUEST,
+  '__module__' : 'proto.aiengine.v1.aiengine_pb2'
+  # @@protoc_insertion_point(class_scope:aiengine.ExportModelRequest)
+  })
+_sym_db.RegisterMessage(ExportModelRequest)
+
+ImportModelRequest = _reflection.GeneratedProtocolMessageType('ImportModelRequest', (_message.Message,), {
+  'DESCRIPTOR' : _IMPORTMODELREQUEST,
+  '__module__' : 'proto.aiengine.v1.aiengine_pb2'
+  # @@protoc_insertion_point(class_scope:aiengine.ImportModelRequest)
+  })
+_sym_db.RegisterMessage(ImportModelRequest)
+
 
 DESCRIPTOR._options = None
 _DATACONNECTOR_PARAMSENTRY._options = None
 _DATASOURCE_ACTIONSENTRY._options = None
 _INITREQUEST_ACTIONSENTRY._options = None
+_INITREQUEST_ACTIONSORDERENTRY._options = None
 _INITREQUEST_FIELDSENTRY._options = None
 
 _AIENGINE = _descriptor.ServiceDescriptor(
@@ -749,8 +954,8 @@ _AIENGINE = _descriptor.ServiceDescriptor(
   index=0,
   serialized_options=None,
   create_key=_descriptor._internal_create_key,
-  serialized_start=1126,
-  serialized_end=1442,
+  serialized_start=1439,
+  serialized_end=1894,
   methods=[
   _descriptor.MethodDescriptor(
     name='Init',
@@ -798,6 +1003,26 @@ _AIENGINE = _descriptor.ServiceDescriptor(
     index=4,
     containing_service=None,
     input_type=_HEALTHREQUEST,
+    output_type=_RESPONSE,
+    serialized_options=None,
+    create_key=_descriptor._internal_create_key,
+  ),
+  _descriptor.MethodDescriptor(
+    name='ExportModel',
+    full_name='aiengine.AIEngine.ExportModel',
+    index=5,
+    containing_service=None,
+    input_type=_EXPORTMODELREQUEST,
+    output_type=_EXPORTMODELRESULT,
+    serialized_options=None,
+    create_key=_descriptor._internal_create_key,
+  ),
+  _descriptor.MethodDescriptor(
+    name='ImportModel',
+    full_name='aiengine.AIEngine.ImportModel',
+    index=6,
+    containing_service=None,
+    input_type=_IMPORTMODELREQUEST,
     output_type=_RESPONSE,
     serialized_options=None,
     create_key=_descriptor._internal_create_key,

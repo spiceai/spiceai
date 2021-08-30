@@ -5,27 +5,28 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
-	"github.com/spiceai/spice/pkg/context"
 	"github.com/spiceai/spice/pkg/pods"
 	"github.com/spiceai/spice/pkg/spec"
 	"github.com/spiceai/spice/pkg/util"
 	"gopkg.in/yaml.v2"
 )
 
-var rewardsCmd = &cobra.Command{
-	Use:   "rewards",
-	Short: "Modify rewards",
+var rewardCmd = &cobra.Command{
+	Use:     "reward",
+	Aliases: []string{"rewards"},
+	Short:   "Maintains rewards",
 	Example: `
-spice rewards add
+spice reward add
 `,
 }
 
-var rewardsAddCmd = &cobra.Command{
+var rewardAddCmd = &cobra.Command{
 	Use:   "add",
-	Short: "Adds default rewards to your Spice pod",
+	Short: "Add Reward - adds a reward to your Spice pod",
+	Example: `
+spice reward add
+`,
 	Run: func(cmd *cobra.Command, args []string) {
-		context.SetContext(context.BareMetal)
-
 		podPath := pods.FindFirstManifestPath()
 		if podPath == "" {
 			fmt.Println("No pods detected!")
@@ -93,13 +94,10 @@ var rewardsAddCmd = &cobra.Command{
 
 		fmt.Printf("Uniform rewards added to pod %s.\n", pod.Name)
 	},
-	Example: `
-spice rewards add
-`,
 }
 
 func init() {
-	rewardsCmd.AddCommand(rewardsAddCmd)
-	rewardsCmd.Flags().BoolP("help", "h", false, "Print this help message")
-	RootCmd.AddCommand(rewardsCmd)
+	rewardCmd.AddCommand(rewardAddCmd)
+	rewardCmd.Flags().BoolP("help", "h", false, "Print this help message")
+	RootCmd.AddCommand(rewardCmd)
 }

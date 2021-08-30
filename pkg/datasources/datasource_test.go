@@ -11,7 +11,7 @@ import (
 
 func TestDataSource(t *testing.T) {
 
-	manifestsToTest := []string{"trader", "cartpole-v1"}
+	manifestsToTest := []string{"trader"}
 
 	for _, manifestName := range manifestsToTest {
 		v := viper.New()
@@ -84,12 +84,6 @@ func testActionsFunc(dsSpec spec.DataSourceSpec) func(*testing.T) {
 			}
 		case "coinbase/btcusd":
 			expected = make(map[string]string)
-
-		case "gym/CartPole":
-			expected = map[string]string{
-				"gym.CartPole.left":  "passthru",
-				"gym.CartPole.right": "passthru",
-			}
 		}
 		if !reflect.DeepEqual(expected, actual) {
 			t.Errorf("Expected:\n%v\nGot:\n%v", expected, actual)
@@ -118,15 +112,6 @@ func testFieldsFunc(dsSpec spec.DataSourceSpec) func(*testing.T) {
 		case "coinbase/btcusd":
 			expected = map[string]float64{
 				"coinbase.btcusd.close": 0,
-			}
-
-		case "gym/CartPole":
-			expected = map[string]float64{
-				"gym.CartPole.pole_angle":            0,
-				"gym.CartPole.pole_angular_velocity": 0,
-				"gym.CartPole.cart_position":         0,
-				"gym.CartPole.cart_velocity":         0,
-				"gym.CartPole.is_done":               0,
 			}
 		}
 
@@ -158,15 +143,6 @@ func testFieldNamesFunc(dsSpec spec.DataSourceSpec) func(*testing.T) {
 			expected = map[string]string{
 				"close": "coinbase.btcusd.close",
 			}
-
-		case "gym/CartPole":
-			expected = map[string]string{
-				"pole_angle":            "gym.CartPole.pole_angle",
-				"pole_angular_velocity": "gym.CartPole.pole_angular_velocity",
-				"cart_position":         "gym.CartPole.cart_position",
-				"cart_velocity":         "gym.CartPole.cart_velocity",
-				"is_done":               "gym.CartPole.is_done",
-			}
 		}
 
 		if !reflect.DeepEqual(expected, actual) {
@@ -195,12 +171,6 @@ func testActionNamesFunc(dsSpec spec.DataSourceSpec) func(*testing.T) {
 			}
 		case "coinbase/btcusd":
 			expected = make(map[string]string)
-
-		case "gym/CartPole":
-			expected = map[string]string{
-				"left":  "gym.CartPole.left",
-				"right": "gym.CartPole.right",
-			}
 		}
 
 		if !reflect.DeepEqual(expected, actual) {
@@ -228,8 +198,6 @@ func testLawsFunc(dsSpec spec.DataSourceSpec) func(*testing.T) {
 				"local.portfolio.btc_balance >= 0",
 			}
 		case "coinbase/btcusd":
-			// No laws
-		case "gym/CartPole-v1":
 			// No laws
 		}
 

@@ -5,7 +5,7 @@ import (
 	"io/ioutil"
 	"path/filepath"
 
-	"github.com/spiceai/spice/pkg/config"
+	"github.com/spiceai/spice/pkg/context"
 )
 
 type LocalFileRegistry struct{}
@@ -18,7 +18,7 @@ func (r *LocalFileRegistry) GetPod(podPath string) (string, error) {
 
 	podManifestFileName := filepath.Base(podPath)
 
-	podManifestPath := filepath.Join(config.PodsManifestsPath(), podManifestFileName)
+	podManifestPath := filepath.Join(context.CurrentContext().PodsDir(), podManifestFileName)
 
 	err = ioutil.WriteFile(podManifestPath, input, 0644)
 	if err != nil {

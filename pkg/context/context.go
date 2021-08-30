@@ -1,31 +1,76 @@
 package context
 
-import "os"
+import (
+	"fmt"
+	"log"
+	"os/exec"
+	"strings"
 
-type RuntimeContext int
-
-const (
-	Undefined = 0
-	Docker    = 1
-	BareMetal = 2
+	"github.com/spiceai/spice/pkg/context/docker"
+	"github.com/spiceai/spice/pkg/context/metal"
 )
+
+type RuntimeContext interface {
+	Init() error
+	Version() (string, error)
+	IsRuntimeInstallRequired() bool
+	InstallOrUpgradeRuntime() error
+	IsRuntimeUpgradeAvailable() (string, error)
+	SpiceRuntimeDir() string
+	AppDir() string
+	PodsDir() string
+	AIEngineDir() string
+	AIEnginePythonCmdPath() string
+	GetRunCmd(manifestPath string) (*exec.Cmd, error)
+	GetSpiceAppRelativePath(absolutePath string) string
+}
 
 var (
 	currentContext RuntimeContext
 )
+
+func NewContext(context string) (RuntimeContext, error) {
+	context = strings.ToLower(context)
+
+	var contextToSet RuntimeContext
+	switch context {
+	case "docker":
+		contextToSet = docker.NewDockerContext()
+	case "metal":
+		contextToSet = metal.NewMetalContext()
+	default:
+		return nil, fmt.Errorf("invalid context '%s'", context)
+	}
+
+	return contextToSet, nil
+}
+
+func SetDefaultContext() error {
+	rtcontext, err := NewContext("metal")
+	if err != nil {
+		return err
+	}
+
+	err = rtcontext.Init()
+	if err != nil {
+		return err
+	}
+
+	SetContext(rtcontext)
+
+	return nil
+}
 
 func SetContext(context RuntimeContext) {
 	currentContext = context
 }
 
 func CurrentContext() RuntimeContext {
-	if currentContext == Undefined {
-		if os.Getenv("SPICE_ENVIRONMENT") == "docker" {
-			currentContext = Docker
-			return currentContext
+	if currentContext == nil {
+		err := SetDefaultContext()
+		if err != nil {
+			log.Fatal(err)
 		}
-
-		currentContext = BareMetal
 	}
 
 	return currentContext

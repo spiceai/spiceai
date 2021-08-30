@@ -43,7 +43,7 @@ func TestInfer(t *testing.T) {
 }
 
 func TestPod(t *testing.T) {
-	manifestsToTest := []string{"trader.yaml", "trader-infer.yaml", "cartpole-v1.yaml"}
+	manifestsToTest := []string{"trader.yaml", "trader-infer.yaml"}
 
 	for _, manifestToTest := range manifestsToTest {
 		manifestPath := filepath.Join("../../test/assets/pods/manifests", manifestToTest)
@@ -69,12 +69,27 @@ func testInitializePod(pod *pods.Pod) func(t *testing.T) {
 			aiengineClient = nil
 		})
 
+		// Go is not deterministic with array ordering, so we account for that by sending a specified order
+		// in the initialize request. However this makes tests unstable since the order will change on each run.
+		// Fix the test by assigning a specific ordering
+		testActionOrdering := map[string]map[string]int32{
+			"trader": {
+				"buy":  0,
+				"sell": 1,
+				"hold": 2,
+			},
+		}
+
 		mockAIEngineClient := &MockAIEngineClient{
 			InitHandler: func(c go_context.Context, ir *aiengine_pb.InitRequest, co ...grpc.CallOption) (*aiengine_pb.Response, error) {
-				if pod.Name == "cartpole-v1" {
-					// Epoch time is not specified for cartpole, so it will be "now"
-					var testStaticEpochTime int64 = 123
-					ir.EpochTime = testStaticEpochTime
+				if val, ok := testActionOrdering[pod.Name]; ok {
+					assert.Equal(t, len(ir.ActionsOrder), len(val))
+					for action := range ir.ActionsOrder {
+						_, ok := val[action]
+						assert.True(t, ok)
+					}
+
+					ir.ActionsOrder = val
 				}
 
 				// marshal to JSON so the snapshot is easy to consume
@@ -200,19 +215,23 @@ func testInferServerFunc() func(*testing.T) {
 
 func testPythonCmdDockerContextFunc() func(*testing.T) {
 	return func(t *testing.T) {
-		context.SetContext(context.Docker)
-		actual := getPythonCmd()
-		assert.Equal(t, "python", actual)
+		rtcontext, err := context.NewContext("docker")
+		assert.NoError(t, err)
+
+		actual := rtcontext.AIEnginePythonCmdPath()
+		assert.Equal(t, "python3", actual)
 	}
 }
 
 func testPythonCmdBareMetalContextFunc() func(*testing.T) {
 	return func(t *testing.T) {
 		homePath := os.Getenv("HOME")
-		expectedPython := filepath.Join(homePath, ".spice/bin/ai/venv/bin/python")
+		expectedPython := filepath.Join(homePath, ".spice/bin/ai/venv/bin/python3")
 
-		context.SetContext(context.BareMetal)
-		actual := getPythonCmd()
+		rtcontext, err := context.NewContext("metal")
+		assert.NoError(t, err)
+
+		actual := rtcontext.AIEnginePythonCmdPath()
 		assert.Equal(t, expectedPython, actual)
 	}
 }
@@ -244,7 +263,7 @@ func testStartServerFunc() func(*testing.T) {
 		<-ready
 		assert.NotNil(t, aiServerCmd)
 		actualPythonCmd := aiServerCmd.Args[3]
-		assert.Equal(t, filepath.Join(os.Getenv("HOME"), ".spice/bin/ai/venv/bin/python"), actualPythonCmd)
+		assert.Equal(t, filepath.Join(os.Getenv("HOME"), ".spice/bin/ai/venv/bin/python3"), actualPythonCmd)
 		actualArg := aiServerCmd.Args[4]
 		assert.Equal(t, filepath.Join(os.Getenv("HOME"), ".spice/bin/ai/main.py"), actualArg)
 	}

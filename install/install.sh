@@ -1,7 +1,15 @@
 #!/usr/bin/env bash
 
+# colors
+blue="\033[0;94m"
+white="\033[0;97m"
+yellow="\033[0;33m"
+reset="\033[0m"
+
+SPICE_BIN=".spice/bin"
+
 # Spice CLI location
-: ${SPICE_CLI_INSTALL_DIR:="$HOME/.spice/bin/"}
+: ${SPICE_CLI_INSTALL_DIR:="$HOME/$SPICE_BIN"}
 
 # sudo is required to copy binary to SPICE_INSTALL_DIR for linux
 : ${USE_SUDO:="false"}
@@ -172,7 +180,7 @@ fail_trap() {
     result=$?
     if [ "$result" != "0" ]; then
         echo "Failed to install Spice CLI"
-        echo "For support, go to https://spiceai.io"
+        echo "For support, see https://docs.spiceai.org"
     fi
     cleanup
     exit $result
@@ -184,8 +192,35 @@ cleanup() {
     fi
 }
 
+SHELL_TO_USE=null
+MOST_RECENT_MODIFIED=0
+
+checkShell() {
+  SHELL=$HOME/$1
+  if [[ -f "$SHELL" ]]; then
+    if [[ "$OS" == "linux" ]]; then
+      MODIFIED_TIME=`date +%s -r "$SHELL"`
+    elif [[ "$OS" == "darwin" ]]; then
+      MODIFIED_TIME=`stat -f%c "$SHELL"`
+    fi
+
+    if (( $MODIFIED_TIME > $MOST_RECENT_MODIFIED )); then
+      SHELL_TO_USE=$SHELL
+      MOST_RECENT_MODIFIED=$MODIFIED_TIME
+    fi
+  fi
+}
+
+addToProfile() {
+  echo -e "Adding the line:\n"
+  echo -e "  ${white}$1${reset}\n"
+  echo -e "to your shell profile at '${blue}$SHELL_TO_USE${reset}'\n"
+  echo -e "$1" >> $SHELL_TO_USE
+  echo "Added! You may need to restart your shell to be able to run 'spice'"
+}
+
 installCompleted() {
-    echo -e "\nTo get started with Spice AI, visit https://spiceai.github.io/docs/"
+    echo -e "\nTo get started with Spice.ai, visit https://docs.spiceai.org"
 }
 
 # -----------------------------------------------------------------------------
@@ -211,7 +246,7 @@ checkHttpRequestCLI
 checkJqInstalled
 
 if [ -z "$1" ]; then
-    echo "Getting the latest Spice AI CLI..."
+    echo "Getting the latest Spice.ai CLI..."
     getLatestRelease
 else
     ret_val=v$1
@@ -223,5 +258,27 @@ echo "Installing Spice CLI $FRIENDLY_VERSION ..."
 downloadFile $ret_val
 installFile
 cleanup
+
+SHELLS_TO_CHECK=(".bashrc" ".bash_profile" ".zshrc" ".config/fish/config.fish")
+
+for i in "${SHELLS_TO_CHECK[@]}"; do checkShell $i; done
+
+if [[ "$SHELL_TO_USE" == "null" ]]; then
+  echo "Unable to find the shell profile, not adding the Spice CLI to PATH"
+  echo "Manually add 'export PATH=$HOME/$SPICE_BIN:\$PATH' to your shell profile"
+else
+  if grep -Fq $SPICE_BIN $SHELL_TO_USE
+  then
+    echo "The Spice CLI is already in your PATH!"
+  else
+    echo -e "${yellow}The Spice CLI is not in your PATH${reset}\n"
+
+    if [[ "$SHELL_TO_USE" == "$HOME/.config/fish/config.fish" ]]; then
+      addToProfile "fish_add_path \$HOME/.spice/bin"
+    else
+      addToProfile "export PATH=$HOME/$SPICE_BIN:\$PATH"
+    fi
+  fi
+fi
 
 installCompleted

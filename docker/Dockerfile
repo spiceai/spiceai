@@ -43,7 +43,6 @@ RUN chown -R spice:spice /app
 USER spice
 
 ENV HOME=/app/home
-ENV SPICE_ENVIRONMENT=docker
 
 COPY ai/src/requirements/common.txt ai/src/requirements/production.txt ./
 RUN python3 -m pip install -r production.txt
@@ -56,4 +55,4 @@ COPY --from=build /build/cmd/spiced/spiced /app/spiced
 
 WORKDIR /userapp
 
-ENTRYPOINT ["/app/spiced"]
+ENTRYPOINT ["/app/spiced", "--context", "docker"]

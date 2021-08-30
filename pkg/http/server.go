@@ -15,6 +15,7 @@ import (
 	"github.com/spiceai/spice/pkg/flights"
 	"github.com/spiceai/spice/pkg/loggers"
 	"github.com/spiceai/spice/pkg/pods"
+	"github.com/spiceai/spice/pkg/proto/runtime_pb"
 	"github.com/valyala/fasthttp"
 	"go.uber.org/zap"
 )
@@ -101,7 +102,7 @@ func apiPostObservationsHandler(ctx *fasthttp.RequestCtx) {
 func apiPodsHandler(ctx *fasthttp.RequestCtx) {
 	pods := pods.Pods()
 
-	data := make([]*api.Pod, 0)
+	data := make([]*runtime_pb.Pod, 0)
 
 	for _, f := range *pods {
 		if f == nil {
@@ -175,6 +176,10 @@ func apiInferHandler(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
+	if inference.Response.Error {
+		ctx.Response.SetStatusCode(400)
+	}
+
 	body, err := json.Marshal(inference)
 	if err != nil {
 		ctx.Response.SetStatusCode(500)
@@ -193,7 +198,7 @@ func apiGetFlightsHandler(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	data := make([]*api.Flight, 0)
+	data := make([]*runtime_pb.Flight, 0)
 	for _, f := range *pod.Flights() {
 		flight := api.NewFlight(f)
 		data = append(data, flight)
@@ -249,7 +254,7 @@ func apiPostFlightEpisodeHandler(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	var apiEpisode api.Episode
+	var apiEpisode runtime_pb.Episode
 	err := json.Unmarshal(ctx.Request.Body(), &apiEpisode)
 	if err != nil {
 		ctx.Response.SetStatusCode(400)
@@ -258,7 +263,7 @@ func apiPostFlightEpisodeHandler(ctx *fasthttp.RequestCtx) {
 	}
 
 	episode := &flights.Episode{
-		EpisodeId:    apiEpisode.EpisodeId,
+		EpisodeId:    apiEpisode.Episode,
 		Start:        time.Unix(apiEpisode.Start, 0),
 		End:          time.Unix(apiEpisode.End, 0),
 		Score:        apiEpisode.Score,
@@ -270,6 +275,73 @@ func apiPostFlightEpisodeHandler(ctx *fasthttp.RequestCtx) {
 	flight.RecordEpisode(episode)
 
 	ctx.Response.SetStatusCode(201)
+}
+
+func apiPostExportHandler(ctx *fasthttp.RequestCtx) {
+	tag := ctx.UserValue("tag")
+
+	if tag == nil || tag == "" {
+		tag = "latest"
+	}
+
+	podParam := ctx.UserValue("pod").(string)
+	pod := pods.GetPod(podParam)
+	if pod == nil {
+		ctx.Response.SetStatusCode(404)
+		return
+	}
+
+	var exportRequest runtime_pb.ExportModel
+	err := json.Unmarshal(ctx.Request.Body(), &exportRequest)
+	if err != nil {
+		ctx.Response.SetStatusCode(400)
+		ctx.Response.SetBody([]byte(err.Error()))
+		return
+	}
+
+	err = aiengine.ExportModel(pod.Name, tag.(string), &exportRequest)
+	if err != nil {
+		ctx.Response.SetStatusCode(400)
+		ctx.Response.SetBody([]byte(err.Error()))
+		return
+	}
+
+	ctx.Response.SetStatusCode(200)
+}
+
+func apiPostImportHandler(ctx *fasthttp.RequestCtx) {
+	tag := ctx.UserValue("tag")
+
+	if tag == nil || tag == "" {
+		tag = "latest"
+	}
+
+	podParam := ctx.UserValue("pod").(string)
+	pod := pods.GetPod(podParam)
+	if pod == nil {
+		ctx.Response.SetStatusCode(404)
+		return
+	}
+
+	var importRequest runtime_pb.ImportModel
+	err := json.Unmarshal(ctx.Request.Body(), &importRequest)
+	if err != nil {
+		ctx.Response.SetStatusCode(400)
+		ctx.Response.SetBody([]byte(err.Error()))
+		return
+	}
+
+	importRequest.Pod = pod.Name
+	importRequest.Tag = tag.(string)
+
+	err = aiengine.ImportModel(&importRequest)
+	if err != nil {
+		ctx.Response.SetStatusCode(400)
+		ctx.Response.SetBody([]byte(err.Error()))
+		return
+	}
+
+	ctx.Response.SetStatusCode(200)
 }
 
 func NewServer(port uint, dashboardPath *string) *server {
@@ -310,6 +382,10 @@ func (server *server) Start() error {
 	r.POST("/api/v0.1/pods/{pod}/observations", apiPostObservationsHandler)
 	r.GET("/api/v0.1/pods/{pod}/inference", apiInferHandler)
 	r.GET("/api/v0.1/pods/{pod}/models/{tag}/inference", apiInferHandler)
+	r.POST("/api/v0.1/pods/{pod}/export", apiPostExportHandler)
+	r.POST("/api/v0.1/pods/{pod}/models/{tag}/export", apiPostExportHandler)
+	r.POST("/api/v0.1/pods/{pod}/import", apiPostImportHandler)
+	r.POST("/api/v0.1/pods/{pod}/models/{tag}/import", apiPostImportHandler)
 
 	// Flights
 	r.GET("/api/v0.1/pods/{pod}/flights", apiGetFlightsHandler)

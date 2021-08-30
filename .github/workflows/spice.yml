@@ -15,16 +15,39 @@ on:
   workflow_dispatch:
 
 jobs:
+  build_dashboard:
+    name: Build dashboard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Build and copy dashboard
+        run: make
+        working-directory: dashboard
+
+      - name: Test dashboard
+        run: yarn test
+        working-directory: dashboard
+
+      - name: Upload dashboard artifact
+        uses: actions/upload-artifact@v2
+        with:
+          name: dashboard_build
+          path: dashboard/build
+
   build:
     name: Build ${{ matrix.target_os }}_${{ matrix.target_arch }} binaries
+    needs: build_dashboard
     runs-on: ${{ matrix.os }}
     env:
       GOVER: 1.16
+      GOOS: ${{ matrix.target_os }}
+      GOARCH: ${{ matrix.target_arch }}
 
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest, macOS-latest]
-        target_arch: [arm, arm64, amd64]
+        os: [self-hosted, ubuntu-latest, windows-latest, macOS-latest]
+        target_arch: [amd64, arm64]
         include:
           - os: ubuntu-latest
             target_os: linux
@@ -32,15 +55,17 @@ jobs:
             target_os: windows
           - os: macOS-latest
             target_os: darwin
+          - os: self-hosted
+            target_os: darwin
         exclude:
           - os: windows-latest
-            target_arch: arm
-          - os: windows-latest
+            target_arch: arm64
+          - os: ubuntu-latest
             target_arch: arm64
           - os: macOS-latest
-            target_arch: arm
-          - os: macOS-latest
             target_arch: arm64
+          - os: self-hosted
+            target_arch: amd64
 
     steps:
       - uses: actions/checkout@v2
@@ -53,9 +78,11 @@ jobs:
         with:
           go-version: ${{ env.GOVER }}
 
-      - name: Build and copy dashboard
-        run: make
-        working-directory: dashboard
+      - name: Download dashboard
+        uses: actions/download-artifact@v2
+        with:
+          name: dashboard_build
+          path: pkg/dashboard/build
 
       - name: Build spice
         run: make
@@ -99,12 +126,15 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, macOS-latest]
-        target_arch: [amd64]
+        target_arch: [amd64, arm64]
         include:
           - os: ubuntu-latest
             target_os: linux
           - os: macOS-latest
             target_os: darwin
+        exclude:
+          - os: ubuntu-latest
+            target_arch: arm64
 
     runs-on: ubuntu-latest
     steps:
@@ -123,7 +153,7 @@ jobs:
       - name: lists artifacts
         run: ls -l ${{ env.ARTIFACT_DIR }}
 
-      - name: publish binaries to github
+      - name: publish ${{ matrix.target_os }}/${{ matrix.target_arch }} binaries to github
         run: |
           echo "installing github-release-cli..."
           sudo npm install --silent --no-progress -g github-release-cli@1.3.1

@@ -8,9 +8,14 @@ import (
 	"syscall"
 
 	"github.com/spf13/cobra"
+	"github.com/spiceai/spice/pkg/context"
 	"github.com/spiceai/spice/pkg/loggers"
 	"github.com/spiceai/spice/pkg/runtime"
 	"github.com/spiceai/spice/pkg/version"
+)
+
+var (
+	contextFlag string
 )
 
 func main() {
@@ -31,6 +36,17 @@ var RootCmd = &cobra.Command{
 	Short: "Spice Runtime",
 	Args:  cobra.MaximumNArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
+		rtcontext, err := context.NewContext(contextFlag)
+		if err != nil {
+			fmt.Println(err)
+			os.Exit(1)
+		}
+
+		err = rtcontext.Init()
+		if err != nil {
+			fmt.Println(err)
+			os.Exit(1)
+		}
 
 		var manifestPath string
 		if len(args) > 0 {
@@ -39,7 +55,6 @@ var RootCmd = &cobra.Command{
 
 		isSingleRun := manifestPath != ""
 
-		var err error
 		if isSingleRun {
 			err = runtime.SingleRun(manifestPath)
 		} else {
@@ -67,5 +82,6 @@ var VersionCmd = &cobra.Command{
 }
 
 func init() {
+	RootCmd.Flags().StringVar(&contextFlag, "context", "metal", "Runs Spice.ai in the given context, either 'docker' or 'metal'")
 	RootCmd.AddCommand(VersionCmd)
 }

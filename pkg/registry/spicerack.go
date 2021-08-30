@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/spiceai/spice/pkg/config"
+	"github.com/spiceai/spice/pkg/context"
 	"github.com/spiceai/spice/pkg/loggers"
 	"go.uber.org/zap"
 )
@@ -52,9 +52,10 @@ func (r *SpiceRackRegistry) GetPod(podPath string) (string, error) {
 		return "", fmt.Errorf("an error occurred fetching pod '%s'", podPath)
 	}
 
-	downloadPath := filepath.Join(config.PodsManifestsPath(), podManifestFileName)
+	podsPath := context.CurrentContext().PodsDir()
+	downloadPath := filepath.Join(podsPath, podManifestFileName)
 
-	err = os.MkdirAll(config.PodsManifestsPath(), 0766)
+	err = os.MkdirAll(podsPath, 0766)
 	if err != nil {
 		return "", err
 	}

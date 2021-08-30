@@ -26,7 +26,7 @@ type ReleaseAsset struct {
 	Uploader           Author `json:"uploader"`
 }
 
-func DownloadPrivateReleaseAsset(gh *GitHubClient, release RepoRelease, assetName string, downloadDir string) error {
+func DownloadPrivateReleaseAsset(gh *GitHubClient, release *RepoRelease, assetName string, downloadDir string) error {
 	if release.Assets == nil || len(release.Assets) == 0 {
 		return errors.New("no release assets found")
 	}
