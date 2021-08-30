@@ -59,12 +59,12 @@ func LoadRuntimeConfiguration(v *viper.Viper, appDir string) (*SpiceConfiguratio
 			return nil, err
 		}
 
-		err = util.MkDirAllInheritPerm(appDir)
+		perm, err := util.MkDirAllInheritPerm(spiceAppPath)
 		if err != nil {
 			return nil, fmt.Errorf("error initializing .spice/config.yaml: %w", err)
 		}
 
-		err = os.WriteFile(configPath, marshalledConfig, 0766)
+		err = os.WriteFile(configPath, marshalledConfig, perm)
 		if err != nil {
 			return nil, fmt.Errorf("error initializing .spice/config.yaml: %w", err)
 		}
