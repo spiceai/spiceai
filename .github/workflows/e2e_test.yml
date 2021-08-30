@@ -15,8 +15,92 @@ on:
   workflow_dispatch:
 
 jobs:
+  build_dashboard:
+    name: Build dashboard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Build and copy dashboard
+        run: make
+        working-directory: dashboard
+
+      - name: Test dashboard
+        run: yarn test
+        working-directory: dashboard
+
+      - name: Upload dashboard artifact
+        uses: actions/upload-artifact@v2
+        with:
+          name: dashboard_build
+          path: dashboard/build
+
+  build_binaries:
+    name: build spice and spiced
+    needs: build_dashboard
+    runs-on: ubuntu-latest
+    env:
+      GOVER: 1.16
+    strategy:
+      fail-fast: false
+      matrix:
+        algorithm: [vpg, dql]
+        context: [metal, docker]
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Set up Go
+        uses: actions/setup-go@v2
+        with:
+          go-version: ${{ env.GOVER }}
+
+      - name: Download dashboard
+        uses: actions/download-artifact@v2
+        with:
+          name: dashboard_build
+          path: pkg/dashboard/build
+
+      - name: Build spice
+        run: make
+        working-directory: cmd/spice
+
+      - name: Build spiced
+        run: make
+        working-directory: cmd/spiced
+
+      - name: Upload spice
+        uses: actions/upload-artifact@v2
+        with:
+          name: spice
+          path: cmd/spice/spice
+
+      - name: Upload spiced
+        uses: actions/upload-artifact@v2
+        with:
+          name: spiced
+          path: cmd/spice/spiced
+
+  build_docker:
+    name: build Docker images
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Build and save Docker image
+        run: |
+          make docker
+          docker save --output docker-spiced.tar ghcr.io/spiceai/spiced:dev
+
+      - name: Upload Docker image
+        uses: actions/upload-artifact@v2
+        with:
+          name: docker_spiced
+          path: docker-spiced.tar
+
   algorithms:
     name: algorithms test
+    needs: [build_binaries, build_docker]
     runs-on: ubuntu-latest
     env:
       GOVER: 1.16
@@ -29,38 +113,46 @@ jobs:
       - uses: actions/checkout@v2
 
       - name: Set up Python 3.8.11
+        if: matrix.context == 'metal'
         uses: actions/setup-python@v1
         with:
           python-version: 3.8.11
 
       - name: Install requirements
+        if: matrix.context == 'metal'
         working-directory: ai/src
         run: |
           python -m venv venv
           source venv/bin/activate
           python -m pip install -r requirements/production.txt
 
-      - name: Set up Go
-        uses: actions/setup-go@v2
+      - name: Download spice
+        uses: actions/download-artifact@v2
         with:
-          go-version: ${{ env.GOVER }}
+          name: spice
+          path: .
 
-      - name: Build and copy dashboard
-        working-directory: dashboard
-        run: make
+      - name: Download spiced
+        if: matrix.context == 'metal'
+        uses: actions/download-artifact@v2
+        with:
+          name: spiced
+          path: .
 
-      - name: Build spice
-        run: make
-        working-directory: cmd/spice
+      - name: Download Docker image
+        if: matrix.context == 'docker'
+        uses: actions/download-artifact@v2
+        with:
+          name: docker_spiced
+          path: .
 
-      - name: Build spiced
-        run: make
-        working-directory: cmd/spiced
-
-      - name: Build Docker image
-        run: make docker
+      - name: Load Docker image
+        if: matrix.context == 'docker'
+        run: |
+          docker load --input docker-spiced.tar
 
       - name: Ensure correct directory structure
+        if: matrix.context == 'metal'
         run: |
           mkdir -p $HOME/.spice/bin
           cp cmd/spiced/spiced $HOME/.spice/bin
@@ -78,6 +170,7 @@ jobs:
 
   end-to-end:
     name: end-to-end test
+    needs: [build_dashboard, build_docker]
     runs-on: ubuntu-latest
     env:
       GOVER: 1.16
@@ -90,38 +183,46 @@ jobs:
       - uses: actions/checkout@v2
 
       - name: Set up Python 3.8.11
+        if: matrix.context == 'metal'
         uses: actions/setup-python@v1
         with:
           python-version: 3.8.11
 
       - name: Install requirements
+        if: matrix.context == 'metal'
         working-directory: ai/src
         run: |
           python -m venv venv
           source venv/bin/activate
           python -m pip install -r requirements/production.txt
 
-      - name: Set up Go
-        uses: actions/setup-go@v2
+      - name: Download spice
+        uses: actions/download-artifact@v2
         with:
-          go-version: ${{ env.GOVER }}
+          name: spice
+          path: .
 
-      - name: Build and copy dashboard
-        working-directory: dashboard
-        run: make
+      - name: Download spiced
+        if: matrix.context == 'metal'
+        uses: actions/download-artifact@v2
+        with:
+          name: spiced
+          path: .
 
-      - name: Build spice
-        run: make
-        working-directory: cmd/spice
+      - name: Download Docker image
+        if: matrix.context == 'docker'
+        uses: actions/download-artifact@v2
+        with:
+          name: docker_spiced
+          path: .
 
-      - name: Build spiced
-        run: make
-        working-directory: cmd/spiced
-
-      - name: Build Docker image
-        run: make docker
+      - name: Load Docker image
+        if: matrix.context == 'docker'
+        run: |
+          docker load --input docker-spiced.tar
 
       - name: Ensure correct directory structure
+        if: matrix.context == 'metal'
         run: |
           mkdir -p $HOME/.spice/bin
           cp cmd/spiced/spiced $HOME/.spice/bin
