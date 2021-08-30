@@ -161,7 +161,7 @@ func apiPodTrainHandler(ctx *fasthttp.RequestCtx) {
 	fmt.Fprintf(ctx, "ok")
 }
 
-func apiInferHandler(ctx *fasthttp.RequestCtx) {
+func apiRecommendationHandler(ctx *fasthttp.RequestCtx) {
 	pod := ctx.UserValue("pod").(string)
 	tag := ctx.UserValue("tag")
 
@@ -380,8 +380,8 @@ func (server *server) Start() error {
 	r.POST("/api/v0.1/pods/{pod}/train", apiPodTrainHandler)
 	r.GET("/api/v0.1/pods/{pod}/observations", apiGetObservationsHandler)
 	r.POST("/api/v0.1/pods/{pod}/observations", apiPostObservationsHandler)
-	r.GET("/api/v0.1/pods/{pod}/inference", apiInferHandler)
-	r.GET("/api/v0.1/pods/{pod}/models/{tag}/inference", apiInferHandler)
+	r.GET("/api/v0.1/pods/{pod}/recommendation", apiRecommendationHandler)
+	r.GET("/api/v0.1/pods/{pod}/models/{tag}/recommendation", apiRecommendationHandler)
 	r.POST("/api/v0.1/pods/{pod}/export", apiPostExportHandler)
 	r.POST("/api/v0.1/pods/{pod}/models/{tag}/export", apiPostExportHandler)
 	r.POST("/api/v0.1/pods/{pod}/import", apiPostImportHandler)

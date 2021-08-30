@@ -7,10 +7,6 @@ on:
       - release-*
     tags:
       - v*
-  pull_request:
-    branches:
-      - trunk
-      - release-*
 
   workflow_dispatch:
 
@@ -161,13 +157,18 @@ jobs:
           OWNER_NAME="${GITHUB_REPOSITORY%%/*}"
           REPO_NAME="${GITHUB_REPOSITORY#*/}"
           export GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }}
+          # Get the list of files
+          RELEASE_ARTIFACT=(${ARTIFACT_DIR}/*)
+          # Delete existing release artifact
+          github-release delete \
+            --owner $OWNER_NAME --repo $REPO_NAME \
+            --tag "v${{ env.REL_VERSION }}-spice" \
+            ${RELEASE_ARTIFACT[*]}
           if [ "$LATEST_RELEASE" = "true" ]; then
             export RELEASE_BODY=`cat ./docs/release_notes/v${{ env.REL_VERSION }}.md`
           else
             export RELEASE_BODY="This is the release candidate ${{ env.REL_VERSION }}"
           fi
-          # Get the list of files
-          RELEASE_ARTIFACT=(${ARTIFACT_DIR}/*)
           echo "Uploading Spice CLI Binaries to GitHub Release"
           github-release upload \
             --owner $OWNER_NAME --repo $REPO_NAME \
