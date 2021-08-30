@@ -6,7 +6,7 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 
 ## Current Limitations
 
-Spice.ai is still under early development, so there are several limitations including:
+Spice.ai is still under early development, so there are several limitations, including:
 
 - Data Sources are polled/fetched only (every 30 secs) - will change to push/streaming in v0.2
 - Basic local Pod/Flight monitoring through polling - will move to streaming websockets in v0.2
