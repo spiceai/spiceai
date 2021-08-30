@@ -165,7 +165,7 @@ jobs:
 
   end-to-end:
     name: end-to-end test
-    needs: [build_dashboard, build_docker]
+    needs: [build_binaries, build_docker]
     runs-on: ubuntu-latest
     env:
       GOVER: 1.16
