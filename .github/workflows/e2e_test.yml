@@ -99,6 +99,21 @@ jobs:
         with:
           python-version: 3.8.11
 
+      - name: Cache PIP
+        id: cache-pip
+        uses: actions/cache@v2
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-${{ hashFiles('requirements/production.txt') }}
+
+      - name: Generate PIP Cache
+        if: steps.cache-pip.outputs.cache-hit != 'true'
+        working-directory: ai/src
+        run: |
+          python -m venv venv
+          source venv/bin/activate
+          python -m pip install -r requirements/production.txt
+
       - name: Install requirements
         if: matrix.context == 'metal'
         working-directory: ai/src
