@@ -66,11 +66,11 @@ Spice.ai takes security and our users' trust very seriously. If you believe you 
 
 ### Installing Dependencies
 
-Spice.ai requires Go 1.16, Python 3.8+ and Docker.
+Spice.ai requires Go 1.17, Python 3.8+ and Docker.
 
-#### Go 1.16
+#### Go 1.17
 
-Download & install the latest 1.16 release for Go: https://golang.org/dl/
+Download & install the latest 1.17 release for Go: https://golang.org/dl/
 
 To make it easy to manage multiple versions of Go on your machine, see https://github.com/moovweb/gvm
 

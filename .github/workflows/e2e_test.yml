@@ -40,7 +40,7 @@ jobs:
     needs: build_dashboard
     runs-on: ubuntu-latest
     env:
-      GOVER: 1.16
+      GOVER: 1.17
     steps:
       - uses: actions/checkout@v2
 
@@ -80,7 +80,7 @@ jobs:
     needs: build_binaries
     runs-on: ubuntu-latest
     env:
-      GOVER: 1.16
+      GOVER: 1.17
     strategy:
       fail-fast: false
       matrix:
@@ -155,7 +155,7 @@ jobs:
     needs: build_binaries
     runs-on: ubuntu-latest
     env:
-      GOVER: 1.16
+      GOVER: 1.17
     strategy:
       fail-fast: false
       matrix:
