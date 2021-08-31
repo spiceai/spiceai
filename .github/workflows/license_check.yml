@@ -1,13 +1,16 @@
 ---
 name: Check for forbidden licenses
 
-# Checks for any forbidden/copyleft licenses
+# Checks for any forbidden/copyleft licenses using their SPDX identifiers
+# (https://spdx.org/licenses/)
 
 # List of copyleft licenses derived from Blue Oak Council Guide to Copyleft
 # https://blueoakcouncil.org/copyleft
 
 # List of forbidden licenses derived from Google License Classifier
 # https://github.com/google/licenseclassifier
+
+
 
 on:
   pull_request:
@@ -32,27 +35,23 @@ jobs:
       - name: Install go-licences
         run: go get github.com/google/go-licenses
 
-      # Match any copyleft/forbidden licenses Google licenseclassifier can detect
-      # (https://github.com/google/licenseclassifier/blob/main/license_type.go)
       - name: Check spice licenses
         working-directory: cmd/spice
         run: |
-          go-licenses csv . |& grep -i -E "gpl|cc|apsl|cpal|eupl|osl|qpl|sleepycat|cddl|cpl|epl|ipl|mpl|wtfpl|facebook" | grep . && echo "copyleft/forbidden license detected!" || echo "ok"
+          go-licenses csv . |& grep -i -E "GPL|CC|APSL|CPAL|EUPL|NPOSL|OSL|SSPL|Parity|RPL|QPL|Sleepycat|copyleft|CDDL|CPL|EPL|ErlPL|IPL|MPL|MS-RL|SPL|WTFPL|Facebook|Commons-Clause" | grep . && echo "copyleft/forbidden license detected!" || echo "ok"
       
       - name: Check spiced licenses
         working-directory: cmd/spiced
         run: |
-          go-licenses csv . |& grep -i -E "gpl|cc|apsl|cpal|eupl|osl|qpl|sleepycat|cddl|cpl|epl|ipl|mpl|wtfpl|facebook" | grep . && echo "copyleft/forbidden license detected!" || echo "ok"
+          go-licenses csv . |& grep -i -E "GPL|CC|APSL|CPAL|EUPL|NPOSL|OSL|SSPL|Parity|RPL|QPL|Sleepycat|copyleft|CDDL|CPL|EPL|ErlPL|IPL|MPL|MS-RL|SPL|WTFPL|Facebook|Commons-Clause" | grep . && echo "copyleft/forbidden license detected!" || echo "ok"
 
       - name: Install root packages
         run: |
           yarn install
 
-      # Match any copyleft/forbidden licenses license-checker can detect using SPDX identifiers
-      # (https://spdx.org/licenses/)
       - name: Check root package licenses
         run: |
-          npx license-checker |& grep -i -E "gpl|cc|apsl|cpal|eupl|nposl|osl|sspl|cal|parity|rpl|qpl|sleepycat|copyleft|cddl|cpl|epl|erlpl|ipl|mpl|ms-rl|spl|wtfpl|facebook|BSD-Protection" | grep . && echo "copyleft/forbidden license detected!" || echo "ok"          
+          npx license-checker |& grep -E "GPL|CC|APSL|CPAL|EUPL|NPOSL|OSL|SSPL|Parity|RPL|QPL|Sleepycat|copyleft|CDDL|CPL|EPL|ErlPL|IPL|MPL|MS-RL|SPL|WTFPL|Facebook|Commons-Clause" | grep . && echo "copyleft/forbidden license detected!" || echo "ok"          
 
       - name: Install dashboard packages
         working-directory: dashboard
@@ -62,7 +61,7 @@ jobs:
       - name: Check dashboard package licenses
         working-directory: dashboard
         run: |
-          npx license-checker |& grep -i -E "gpl|cc|apsl|cpal|eupl|nposl|osl|sspl|cal|parity|rpl|qpl|sleepycat|copyleft|cddl|cpl|epl|erlpl|ipl|mpl|ms-rl|spl|wtfpl|facebook|BSD-Protection" | grep . && echo "copyleft/forbidden license detected!" || echo "ok"
+          npx license-checker |& grep -E "GPL|CC|APSL|CPAL|EUPL|NPOSL|OSL|SSPL|Parity|RPL|QPL|Sleepycat|copyleft|CDDL|CPL|EPL|ErlPL|IPL|MPL|MS-RL|SPL|WTFPL|Facebook|Commons-Clause" | grep . && echo "copyleft/forbidden license detected!" || echo "ok"
 
       - name: Set up Python 3.8.11
         uses: actions/setup-python@v1
@@ -84,5 +83,5 @@ jobs:
       - name: Check AI package licenses
         working-directory: ai/src
         run: |
-          pip-licenses |& grep -i -E "gpl|cc|apsl|cpal|eupl|nposl|osl|sspl|parity|rpl|qpl|sleepycat|copyleft|cddl|cpl|epl|erlpl|ipl|mpl|ms-rl|spl|wtfpl|facebook" | grep . && echo "copyleft/forbidden license detected!" || echo "ok"
+          pip-licenses |& grep -E "GPL|CC|APSL|CPAL|EUPL|NPOSL|OSL|SSPL|Parity|RPL|QPL|Sleepycat|copyleft|CDDL|CPL|EPL|ErlPL|IPL|MPL|MS-RL|SPL|WTFPL|Facebook|Commons-Clause" | grep . && echo "copyleft/forbidden license detected!" || echo "ok"
 
