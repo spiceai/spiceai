@@ -1,8 +1,8 @@
 package api
 
 import (
-	"github.com/spiceai/spice/pkg/pods"
-	"github.com/spiceai/spice/pkg/proto/runtime_pb"
+	"github.com/spiceai/spiceai/pkg/pods"
+	"github.com/spiceai/spiceai/pkg/proto/runtime_pb"
 )
 
 func NewPod(f *pods.Pod) *runtime_pb.Pod {

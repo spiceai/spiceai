@@ -6,10 +6,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/spiceai/spice/pkg/aiengine"
-	"github.com/spiceai/spice/pkg/environment"
-	"github.com/spiceai/spice/pkg/pods"
-	"github.com/spiceai/spice/pkg/proto/aiengine_pb"
+	"github.com/spiceai/spiceai/pkg/aiengine"
+	"github.com/spiceai/spiceai/pkg/environment"
+	"github.com/spiceai/spiceai/pkg/pods"
+	"github.com/spiceai/spiceai/pkg/proto/aiengine_pb"
 	"github.com/stretchr/testify/assert"
 	"google.golang.org/grpc"
 )

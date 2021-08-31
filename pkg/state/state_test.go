@@ -3,8 +3,8 @@ package state_test
 import (
 	"testing"
 
-	"github.com/spiceai/spice/pkg/observations"
-	"github.com/spiceai/spice/pkg/state"
+	"github.com/spiceai/spiceai/pkg/observations"
+	"github.com/spiceai/spiceai/pkg/state"
 	"github.com/stretchr/testify/assert"
 )
 

@@ -6,7 +6,7 @@ import (
 	"testing"
 
 	"github.com/spf13/viper"
-	"github.com/spiceai/spice/pkg/spec"
+	"github.com/spiceai/spiceai/pkg/spec"
 )
 
 func TestDataSource(t *testing.T) {

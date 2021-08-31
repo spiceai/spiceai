@@ -4,9 +4,9 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/spiceai/spice/pkg/dataconnectors/file"
-	"github.com/spiceai/spice/pkg/dataconnectors/influxdb"
-	"github.com/spiceai/spice/pkg/dataconnectors/openai_gym"
+	"github.com/spiceai/spiceai/pkg/dataconnectors/file"
+	"github.com/spiceai/spiceai/pkg/dataconnectors/influxdb"
+	"github.com/spiceai/spiceai/pkg/dataconnectors/openai_gym"
 )
 
 type DataConnector interface {

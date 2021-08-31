@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/spiceai/spice/pkg/pods"
-	"github.com/spiceai/spice/pkg/proto/aiengine_pb"
+	"github.com/spiceai/spiceai/pkg/pods"
+	"github.com/spiceai/spiceai/pkg/proto/aiengine_pb"
 )
 
 var podInitMap map[string]*aiengine_pb.InitRequest

@@ -8,10 +8,10 @@ import (
 	"syscall"
 
 	"github.com/spf13/cobra"
-	"github.com/spiceai/spice/pkg/context"
-	"github.com/spiceai/spice/pkg/loggers"
-	"github.com/spiceai/spice/pkg/runtime"
-	"github.com/spiceai/spice/pkg/version"
+	"github.com/spiceai/spiceai/pkg/context"
+	"github.com/spiceai/spiceai/pkg/loggers"
+	"github.com/spiceai/spiceai/pkg/runtime"
+	"github.com/spiceai/spiceai/pkg/version"
 )
 
 var (

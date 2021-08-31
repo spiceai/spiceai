@@ -5,9 +5,9 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
-	"github.com/spiceai/spice/pkg/pods"
-	"github.com/spiceai/spice/pkg/spec"
-	"github.com/spiceai/spice/pkg/util"
+	"github.com/spiceai/spiceai/pkg/pods"
+	"github.com/spiceai/spiceai/pkg/spec"
+	"github.com/spiceai/spiceai/pkg/util"
 	"gopkg.in/yaml.v2"
 )
 

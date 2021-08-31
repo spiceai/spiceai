@@ -5,7 +5,7 @@ import (
 	"log"
 	"os"
 
-	"github.com/spiceai/spice/pkg/context"
+	"github.com/spiceai/spiceai/pkg/context"
 )
 
 func Run(contextFlag string, manifestPath string) error {

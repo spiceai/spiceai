@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/spiceai/spice/pkg/proto/aiengine_pb"
+	"github.com/spiceai/spiceai/pkg/proto/aiengine_pb"
 )
 
 func Infer(pod string, tag string) (*aiengine_pb.InferenceResult, error) {

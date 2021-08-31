@@ -7,9 +7,9 @@ import (
 	"time"
 
 	"github.com/bradleyjkemp/cupaloy"
-	"github.com/spiceai/spice/pkg/dataconnectors/file"
-	"github.com/spiceai/spice/pkg/dataprocessors"
-	"github.com/spiceai/spice/pkg/dataprocessors/csv"
+	"github.com/spiceai/spiceai/pkg/dataconnectors/file"
+	"github.com/spiceai/spiceai/pkg/dataprocessors"
+	"github.com/spiceai/spiceai/pkg/dataprocessors/csv"
 	"github.com/stretchr/testify/assert"
 )
 

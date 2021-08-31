@@ -3,9 +3,9 @@ package registry_test
 import (
 	"testing"
 
-	"github.com/spiceai/spice/pkg/pods"
-	"github.com/spiceai/spice/pkg/registry"
-	"github.com/spiceai/spice/pkg/testutils"
+	"github.com/spiceai/spiceai/pkg/pods"
+	"github.com/spiceai/spiceai/pkg/registry"
+	"github.com/spiceai/spiceai/pkg/testutils"
 	"github.com/stretchr/testify/assert"
 )
 

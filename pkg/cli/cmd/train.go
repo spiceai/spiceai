@@ -8,11 +8,11 @@ import (
 	"github.com/logrusorgru/aurora"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
-	"github.com/spiceai/spice/pkg/cli/runtime"
-	"github.com/spiceai/spice/pkg/config"
-	"github.com/spiceai/spice/pkg/context"
-	"github.com/spiceai/spice/pkg/pods"
-	"github.com/spiceai/spice/pkg/util"
+	"github.com/spiceai/spiceai/pkg/cli/runtime"
+	"github.com/spiceai/spiceai/pkg/config"
+	"github.com/spiceai/spiceai/pkg/context"
+	"github.com/spiceai/spiceai/pkg/pods"
+	"github.com/spiceai/spiceai/pkg/util"
 )
 
 var trainCmd = &cobra.Command{

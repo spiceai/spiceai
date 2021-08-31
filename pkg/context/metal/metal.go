@@ -9,10 +9,10 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/spiceai/spice/pkg/constants"
-	"github.com/spiceai/spice/pkg/github"
-	"github.com/spiceai/spice/pkg/util"
-	spice_version "github.com/spiceai/spice/pkg/version"
+	"github.com/spiceai/spiceai/pkg/constants"
+	"github.com/spiceai/spiceai/pkg/github"
+	"github.com/spiceai/spiceai/pkg/util"
+	spice_version "github.com/spiceai/spiceai/pkg/version"
 )
 
 type MetalContext struct {

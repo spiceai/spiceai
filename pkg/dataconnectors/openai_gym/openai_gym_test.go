@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/spiceai/spice/pkg/dataconnectors/openai_gym"
+	"github.com/spiceai/spiceai/pkg/dataconnectors/openai_gym"
 	"github.com/stretchr/testify/assert"
 )
 

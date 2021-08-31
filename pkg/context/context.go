@@ -6,8 +6,8 @@ import (
 	"os/exec"
 	"strings"
 
-	"github.com/spiceai/spice/pkg/context/docker"
-	"github.com/spiceai/spice/pkg/context/metal"
+	"github.com/spiceai/spiceai/pkg/context/docker"
+	"github.com/spiceai/spiceai/pkg/context/metal"
 )
 
 type RuntimeContext interface {

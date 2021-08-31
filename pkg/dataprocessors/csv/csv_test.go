@@ -8,8 +8,8 @@ import (
 	"time"
 
 	"github.com/bradleyjkemp/cupaloy"
-	"github.com/spiceai/spice/pkg/dataconnectors/file"
-	"github.com/spiceai/spice/pkg/observations"
+	"github.com/spiceai/spiceai/pkg/dataconnectors/file"
+	"github.com/spiceai/spiceai/pkg/observations"
 	"github.com/stretchr/testify/assert"
 )
 

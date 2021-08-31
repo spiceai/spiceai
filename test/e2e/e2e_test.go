@@ -11,7 +11,7 @@ import (
 
 	"github.com/bradleyjkemp/cupaloy"
 	"github.com/logrusorgru/aurora"
-	"github.com/spiceai/spice/pkg/tempdir"
+	"github.com/spiceai/spiceai/pkg/tempdir"
 	"github.com/stretchr/testify/assert"
 )
 

@@ -10,9 +10,9 @@ import (
 	"testing"
 
 	"github.com/spf13/viper"
-	"github.com/spiceai/spice/pkg/config"
-	"github.com/spiceai/spice/pkg/context"
-	"github.com/spiceai/spice/pkg/testutils"
+	"github.com/spiceai/spiceai/pkg/config"
+	"github.com/spiceai/spiceai/pkg/context"
+	"github.com/spiceai/spiceai/pkg/testutils"
 	"github.com/stretchr/testify/assert"
 )
 

@@ -6,7 +6,7 @@ import (
 	"testing"
 
 	"github.com/bradleyjkemp/cupaloy"
-	"github.com/spiceai/spice/pkg/observations"
+	"github.com/spiceai/spiceai/pkg/observations"
 	"github.com/stretchr/testify/assert"
 )
 
