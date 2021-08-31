@@ -14,7 +14,7 @@ RUN yarn build
 FROM golang AS build
 
 ARG REL_VERSION
-ENV REL_VERSION=${REL_VERSION:-edge}
+ENV REL_VERSION=${REL_VERSION:-local}
 
 WORKDIR /build
 
