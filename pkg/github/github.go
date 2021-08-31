@@ -8,7 +8,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/spiceai/spice/pkg/util"
+	"github.com/spiceai/spiceai/pkg/util"
 )
 
 type GitHubClient struct {

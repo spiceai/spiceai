@@ -6,10 +6,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/spiceai/spice/pkg/dataconnectors"
-	"github.com/spiceai/spice/pkg/dataprocessors"
-	"github.com/spiceai/spice/pkg/spec"
-	"github.com/spiceai/spice/pkg/state"
+	"github.com/spiceai/spiceai/pkg/dataconnectors"
+	"github.com/spiceai/spiceai/pkg/dataprocessors"
+	"github.com/spiceai/spiceai/pkg/spec"
+	"github.com/spiceai/spiceai/pkg/state"
 )
 
 type Dataspace struct {

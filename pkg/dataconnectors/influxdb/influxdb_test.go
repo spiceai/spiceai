@@ -3,7 +3,7 @@ package influxdb_test
 import (
 	"testing"
 
-	"github.com/spiceai/spice/pkg/dataconnectors/influxdb"
+	"github.com/spiceai/spiceai/pkg/dataconnectors/influxdb"
 	"github.com/stretchr/testify/assert"
 )
 

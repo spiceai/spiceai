@@ -9,8 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/spiceai/spice/pkg/context"
-	"github.com/spiceai/spice/pkg/loggers"
+	"github.com/spiceai/spiceai/pkg/context"
+	"github.com/spiceai/spiceai/pkg/loggers"
 	"go.uber.org/zap"
 )
 

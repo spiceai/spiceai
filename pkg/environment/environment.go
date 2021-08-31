@@ -4,8 +4,8 @@ import (
 	"log"
 	"time"
 
-	"github.com/spiceai/spice/pkg/aiengine"
-	"github.com/spiceai/spice/pkg/pods"
+	"github.com/spiceai/spiceai/pkg/aiengine"
+	"github.com/spiceai/spiceai/pkg/pods"
 )
 
 func StartDataListeners(intervalSecs int) error {

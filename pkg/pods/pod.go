@@ -13,13 +13,13 @@ import (
 	"time"
 
 	"github.com/spf13/viper"
-	"github.com/spiceai/spice/pkg/constants"
-	"github.com/spiceai/spice/pkg/dataspaces"
-	"github.com/spiceai/spice/pkg/flights"
-	"github.com/spiceai/spice/pkg/observations"
-	"github.com/spiceai/spice/pkg/spec"
-	"github.com/spiceai/spice/pkg/state"
-	"github.com/spiceai/spice/pkg/util"
+	"github.com/spiceai/spiceai/pkg/constants"
+	"github.com/spiceai/spiceai/pkg/dataspaces"
+	"github.com/spiceai/spiceai/pkg/flights"
+	"github.com/spiceai/spiceai/pkg/observations"
+	"github.com/spiceai/spiceai/pkg/spec"
+	"github.com/spiceai/spiceai/pkg/state"
+	"github.com/spiceai/spiceai/pkg/util"
 )
 
 type Pod struct {

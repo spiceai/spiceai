@@ -7,7 +7,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
-	"github.com/spiceai/spice/pkg/context"
+	"github.com/spiceai/spiceai/pkg/context"
 )
 
 var (

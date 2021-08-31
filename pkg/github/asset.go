@@ -7,7 +7,7 @@ import (
 	"path"
 	"path/filepath"
 
-	"github.com/spiceai/spice/pkg/util"
+	"github.com/spiceai/spiceai/pkg/util"
 )
 
 type ReleaseAsset struct {

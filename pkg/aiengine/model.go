@@ -11,11 +11,11 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/spiceai/spice/pkg/pods"
-	"github.com/spiceai/spice/pkg/proto/aiengine_pb"
-	"github.com/spiceai/spice/pkg/proto/runtime_pb"
-	"github.com/spiceai/spice/pkg/tempdir"
-	"github.com/spiceai/spice/pkg/util"
+	"github.com/spiceai/spiceai/pkg/pods"
+	"github.com/spiceai/spiceai/pkg/proto/aiengine_pb"
+	"github.com/spiceai/spiceai/pkg/proto/runtime_pb"
+	"github.com/spiceai/spiceai/pkg/tempdir"
+	"github.com/spiceai/spiceai/pkg/util"
 	"google.golang.org/protobuf/proto"
 )
 

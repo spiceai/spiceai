@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/spiceai/spice/pkg/flights"
+	"github.com/spiceai/spiceai/pkg/flights"
 	"github.com/stretchr/testify/assert"
 )
 

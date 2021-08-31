@@ -1,8 +1,8 @@
 package openai_gym
 
 import (
-	"github.com/spiceai/spice/pkg/observations"
-	"github.com/spiceai/spice/pkg/state"
+	"github.com/spiceai/spiceai/pkg/observations"
+	"github.com/spiceai/spiceai/pkg/state"
 )
 
 const (

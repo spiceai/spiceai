@@ -12,11 +12,11 @@ import (
 	"time"
 
 	"github.com/logrusorgru/aurora"
-	"github.com/spiceai/spice/pkg/context"
-	"github.com/spiceai/spice/pkg/loggers"
-	"github.com/spiceai/spice/pkg/pods"
-	"github.com/spiceai/spice/pkg/proto/aiengine_pb"
-	"github.com/spiceai/spice/pkg/util"
+	"github.com/spiceai/spiceai/pkg/context"
+	"github.com/spiceai/spiceai/pkg/loggers"
+	"github.com/spiceai/spiceai/pkg/pods"
+	"github.com/spiceai/spiceai/pkg/proto/aiengine_pb"
+	"github.com/spiceai/spiceai/pkg/util"
 	"go.uber.org/zap"
 )
 

@@ -5,8 +5,8 @@ import (
 	"fmt"
 
 	"github.com/spf13/cobra"
-	"github.com/spiceai/spice/pkg/context"
-	"github.com/spiceai/spice/pkg/registry"
+	"github.com/spiceai/spiceai/pkg/context"
+	"github.com/spiceai/spiceai/pkg/registry"
 )
 
 var addCmd = &cobra.Command{

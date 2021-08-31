@@ -9,8 +9,8 @@ import (
 
 	"github.com/logrusorgru/aurora"
 	"github.com/spf13/cobra"
-	"github.com/spiceai/spice/pkg/cli/runtime"
-	"github.com/spiceai/spice/pkg/constants"
+	"github.com/spiceai/spiceai/pkg/cli/runtime"
+	"github.com/spiceai/spiceai/pkg/constants"
 )
 
 var (

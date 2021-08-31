@@ -4,7 +4,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/spiceai/spice/pkg/observations"
+	"github.com/spiceai/spiceai/pkg/observations"
 )
 
 type State struct {

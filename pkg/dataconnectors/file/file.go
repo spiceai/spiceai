@@ -12,7 +12,7 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 	"github.com/logrusorgru/aurora"
-	"github.com/spiceai/spice/pkg/context"
+	"github.com/spiceai/spiceai/pkg/context"
 )
 
 const (

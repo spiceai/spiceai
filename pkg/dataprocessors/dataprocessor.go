@@ -3,11 +3,11 @@ package dataprocessors
 import (
 	"fmt"
 
-	"github.com/spiceai/spice/pkg/dataprocessors/csv"
-	"github.com/spiceai/spice/pkg/dataprocessors/flux"
-	"github.com/spiceai/spice/pkg/dataprocessors/openai_gym"
-	"github.com/spiceai/spice/pkg/observations"
-	"github.com/spiceai/spice/pkg/state"
+	"github.com/spiceai/spiceai/pkg/dataprocessors/csv"
+	"github.com/spiceai/spiceai/pkg/dataprocessors/flux"
+	"github.com/spiceai/spiceai/pkg/dataprocessors/openai_gym"
+	"github.com/spiceai/spiceai/pkg/observations"
+	"github.com/spiceai/spiceai/pkg/state"
 )
 
 type DataProcessor interface {

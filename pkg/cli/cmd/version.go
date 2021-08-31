@@ -5,8 +5,8 @@ import (
 	"os"
 
 	"github.com/spf13/cobra"
-	"github.com/spiceai/spice/pkg/context"
-	"github.com/spiceai/spice/pkg/version"
+	"github.com/spiceai/spiceai/pkg/context"
+	"github.com/spiceai/spiceai/pkg/version"
 )
 
 var versionCmd = &cobra.Command{
