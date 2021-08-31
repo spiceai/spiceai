@@ -3,7 +3,7 @@ BASE_PACKAGE_NAME := github.com/spiceai/spice
 ifdef REL_VERSION
 	SPICE_VERSION := $(REL_VERSION)
 else
-	SPICE_VERSION := edge
+	SPICE_VERSION := local
 endif
 
 LDFLAGS:="-X $(BASE_PACKAGE_NAME)/pkg/version.version=$(SPICE_VERSION)"
