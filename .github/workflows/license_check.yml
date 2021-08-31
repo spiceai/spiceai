@@ -19,9 +19,15 @@ jobs:
   license-check:
     name: license check
     runs-on: ubuntu-latest
-
+    env:
+      GOVER: 1.17
     steps:
       - uses: actions/checkout@v2
+
+      - name: Set up Go
+        uses: actions/setup-go@v2
+        with:
+          go-version: ${{ env.GOVER }}
 
       - name: Install go-licences
         run: go get github.com/google/go-licenses
