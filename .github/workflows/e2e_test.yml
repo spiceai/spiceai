@@ -75,9 +75,40 @@ jobs:
           name: spiced
           path: cmd/spiced/spiced
 
+  cache_pip:
+    name: cache_pip
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [production]
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Set up Python 3.8.11
+        if: matrix.context == 'metal'
+        uses: actions/setup-python@v1
+        with:
+          python-version: 3.8.11
+
+      - name: Cache PIP
+        id: cache-pip
+        uses: actions/cache@v2
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-${{ hashFiles('requirements/${{ matrix.context }}.txt') }}
+
+      - name: Generate PIP Cache
+        if: steps.cache-pip.outputs.cache-hit != 'true'
+        working-directory: ai/src
+        run: |
+          python -m venv venv
+          source venv/bin/activate
+          python -m pip install -r requirements/production.txt
+
   algorithms:
     name: algorithms test
-    needs: build_binaries
+    needs: [cache_pip, build_binaries]
     runs-on: ubuntu-latest
     env:
       GOVER: 1.17
@@ -100,19 +131,10 @@ jobs:
           python-version: 3.8.11
 
       - name: Cache PIP
-        id: cache-pip
         uses: actions/cache@v2
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-${{ hashFiles('requirements/production.txt') }}
-
-      - name: Generate PIP Cache
-        if: steps.cache-pip.outputs.cache-hit != 'true'
-        working-directory: ai/src
-        run: |
-          python -m venv venv
-          source venv/bin/activate
-          python -m pip install -r requirements/production.txt
 
       - name: Install requirements
         if: matrix.context == 'metal'
@@ -167,7 +189,7 @@ jobs:
 
   end-to-end:
     name: end-to-end test
-    needs: build_binaries
+    needs: [cache_pip, build_binaries]
     runs-on: ubuntu-latest
     env:
       GOVER: 1.17
@@ -193,6 +215,12 @@ jobs:
         uses: actions/setup-python@v1
         with:
           python-version: 3.8.11
+
+      - name: Cache PIP
+        uses: actions/cache@v2
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-${{ hashFiles('requirements/production.txt') }}
 
       - name: Install requirements
         if: matrix.context == 'metal'
