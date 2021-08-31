@@ -83,4 +83,4 @@ jobs:
       - name: Check AI package licenses
         working-directory: ai/src
         run: |
-          pip-licenses |& grep -E ${{ env.FORBIDDEN_LICENSE_CHECK }}
+          pip-licenses |& ${{ env.FORBIDDEN_LICENSE_CHECK }}
