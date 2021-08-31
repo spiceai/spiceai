@@ -1,0 +1,73 @@
+---
+name: Check for forbidden licenses
+
+# Checks for any forbidden/copyleft licenses
+
+# List of copyleft licenses derived from Blue Oak Council Guide to Copyleft
+# https://blueoakcouncil.org/copyleft
+
+# List of forbidden licenses derived from Google License Classifier
+# https://github.com/google/licenseclassifier
+
+on:
+  pull_request:
+    branches:
+      - trunk
+      - release-*
+
+jobs:
+  go-licenses:
+    name: go-licenses check
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Install go-licences
+        run: go get github.com/google/go-licenses
+
+      - name: Check spice licenses
+        working-directory: cmd/spice
+        run: |
+          go-licenses csv . |& grep -i -E "gpl|cc|apsl|cpal|eupl|nposl|osl|sspl|cal|parity|rpl|qpl|sleepycat|copyleft|cddl|cpl|epl|erlpl|ipl|mpl|ms-rl|wtfpl|facebook" | grep . && echo "copyleft/forbidden license detected!" || echo "ok"
+      
+      - name: Check spiced licenses
+        working-directory: cmd/spiced
+        run: |
+          go-licenses csv . |& grep -i -E "gpl|cc|apsl|cpal|eupl|nposl|osl|sspl|cal|parity|rpl|qpl|sleepycat|copyleft|cddl|cpl|epl|erlpl|ipl|mpl|ms-rl|wtfpl|facebook" | grep . && echo "copyleft/forbidden license detected!" || echo "ok"
+
+      - name: Install root packages
+        run: |
+          yarn install
+
+      - name: Check root package licenses
+        run: |
+          npx license-checker |& grep -i -E "gpl|cc|apsl|cpal|eupl|nposl|osl|sspl|cal|parity|rpl|qpl|sleepycat|copyleft|cddl|cpl|epl|erlpl|ipl|mpl|ms-rl|wtfpl|facebook" | grep . && echo "copyleft/forbidden license detected!" || echo "ok"          
+
+      - name: Install dashboard packages
+        working-directory: dashboard
+        run: |
+          yarn install
+
+      - name: Check dashboard package licenses
+        working-directory: dashboard
+        run: |
+          npx license-checker |& grep -i -E "gpl|cc|apsl|cpal|eupl|nposl|osl|sspl|cal|parity|rpl|qpl|sleepycat|copyleft|cddl|cpl|epl|erlpl|ipl|mpl|ms-rl|wtfpl|facebook" | grep . && echo "copyleft/forbidden license detected!" || echo "ok"
+
+      - name: Install AI packages
+        working-directory: ai/src
+        run: |
+          pip install -r requirements/production.txt
+          pip install -r requirements/development.txt
+
+      - name: Install pip-licenses
+        working-directory: ai/src
+        run: |
+          pip install -r requirements/production.txt
+          pip install -r requirements/development.txt
+
+      - name: Check AI package licenses
+        working-directory: ai/src
+        run: |
+          pip-licenses |& grep -i -E "gpl|cc|apsl|cpal|eupl|nposl|osl|sspl|cal|parity|rpl|qpl|sleepycat|copyleft|cddl|cpl|epl|erlpl|ipl|mpl|ms-rl|wtfpl|facebook" | grep . && echo "copyleft/forbidden license detected!" || echo "ok"
+
