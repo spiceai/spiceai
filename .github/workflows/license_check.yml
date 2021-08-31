@@ -16,8 +16,8 @@ on:
       - release-*
 
 jobs:
-  go-licenses:
-    name: go-licenses check
+  license-check:
+    name: license check
     runs-on: ubuntu-latest
 
     steps:
