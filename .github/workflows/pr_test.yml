@@ -73,13 +73,23 @@ jobs:
 
     steps:
       - uses: actions/checkout@v2
+
       - name: Set up Python 3.8.11
         uses: actions/setup-python@v1
         with:
           python-version: 3.8.11
+
+      - name: Cache PIP
+        id: cache-pip
+        uses: actions/cache@v2
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-${{ hashFiles('ai/src/requirements/development.txt') }}
+
       - name: Install Python dependencies
         working-directory: ai/src
         run: make venv-dev
+      
       - name: Run tests
         working-directory: ai/src
         run: make test
