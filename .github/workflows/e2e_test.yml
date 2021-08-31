@@ -21,11 +21,20 @@ jobs:
     steps:
       - uses: actions/checkout@v2
 
+      - name: Cache dashboard
+        id: cache-dashboard
+        uses: actions/cache@v2
+        with:
+          path: pkg/dashboard/build
+          key: ${{ runner.os }}-${{ hashFiles('dashboard/**') }}
+
       - name: Build and copy dashboard
+        if: steps.cache-dashboard.outputs.cache-hit != 'true'
         run: make
         working-directory: dashboard
 
       - name: Test dashboard
+        if: steps.cache-dashboard.outputs.cache-hit != 'true'
         run: yarn test
         working-directory: dashboard
 
@@ -33,7 +42,7 @@ jobs:
         uses: actions/upload-artifact@v2
         with:
           name: dashboard_build
-          path: dashboard/build
+          path: pkg/dashboard/build
 
   build_binaries:
     name: build spice and spiced
