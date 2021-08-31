@@ -86,7 +86,6 @@ jobs:
       - uses: actions/checkout@v2
 
       - name: Set up Python 3.8.11
-        if: matrix.context == 'metal'
         uses: actions/setup-python@v1
         with:
           python-version: 3.8.11
@@ -104,7 +103,7 @@ jobs:
         run: |
           python -m venv venv
           source venv/bin/activate
-          python -m pip install -r requirements/production.txt
+          python -m pip install -r requirements/${{ matrix.context }}.txt
 
   algorithms:
     name: algorithms test
