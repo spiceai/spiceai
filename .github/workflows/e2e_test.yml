@@ -130,6 +130,7 @@ jobs:
           python-version: 3.8.11
 
       - name: Cache PIP
+        if: matrix.context == 'metal'
         uses: actions/cache@v2
         with:
           path: ~/.cache/pip
@@ -216,6 +217,7 @@ jobs:
           python-version: 3.8.11
 
       - name: Cache PIP
+        if: matrix.context == 'metal'
         uses: actions/cache@v2
         with:
           path: ~/.cache/pip
