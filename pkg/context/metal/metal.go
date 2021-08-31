@@ -134,8 +134,8 @@ func (c *MetalContext) IsRuntimeUpgradeAvailable() (string, error) {
 		return "", err
 	}
 
-	if currentVersion == "edge" {
-		fmt.Println("Using latest 'edge' runtime version.")
+	if currentVersion == "local" {
+		fmt.Println("Using latest 'local' runtime version.")
 		return "", nil
 	}
 

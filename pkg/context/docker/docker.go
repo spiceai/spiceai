@@ -87,7 +87,14 @@ func (c *DockerContext) IsRuntimeInstallRequired() bool {
 }
 
 func (c *DockerContext) InstallOrUpgradeRuntime() error {
+	version := spice_version.Version()
+	if version == "local" {
+		// No need to install or upgrade a local image
+		return nil
+	}
+	
 	dockerImg := getDockerImage(spice_version.Version())
+	fmt.Printf("Pulling Docker image %s\n", dockerImg)
 	cmd := exec.Command("docker", "pull", dockerImg)
 
 	cmd.Stderr = os.Stderr
@@ -107,7 +114,8 @@ func (c *DockerContext) IsRuntimeUpgradeAvailable() (string, error) {
 		return "", err
 	}
 
-	if version == "dev" {
+	if version == "local" {
+		// No need to upgrade local image
 		return "", nil
 	}
 
@@ -124,7 +132,7 @@ func (c *DockerContext) GetRunCmd(manifestPath string) (*exec.Cmd, error) {
 		return nil, err
 	}
 
-	if version == "dev" {
+	if version == "local" {
 		fmt.Println("found and using local dev image")
 	} else {
 		version, err = c.Version()

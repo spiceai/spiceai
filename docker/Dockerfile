@@ -6,6 +6,8 @@ COPY dashboard dashboard/
 
 WORKDIR /build-dashboard/dashboard
 
+RUN npm install --global npm
+RUN npm install --global yarn
 RUN yarn install
 RUN yarn build
 
@@ -25,6 +27,7 @@ COPY pkg pkg/
 
 WORKDIR /build/cmd/spiced
 
+RUN go mod tidy
 RUN make
 
 FROM python:3.8

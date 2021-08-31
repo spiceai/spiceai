@@ -84,8 +84,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        algorithm: [vpg, dql]
-        context: [metal]
+        algorithm: [vpg]
+        context: [docker]
     steps:
       - uses: actions/checkout@v2
 
@@ -127,7 +127,7 @@ jobs:
           context: .
           file: docker/Dockerfile
           push: false
-          tags: ghcr.io/spiceai/spiced:dev
+          tags: ghcr.io/spiceai/spiced:local
       
       - name: Ensure correct directory structure
         if: matrix.context == 'metal'
@@ -152,6 +152,7 @@ jobs:
 
   end-to-end:
     name: end-to-end test
+    if: false
     needs: build_binaries
     runs-on: ubuntu-latest
     env:
@@ -206,7 +207,7 @@ jobs:
           context: .
           file: docker/Dockerfile
           push: false
-          tags: ghcr.io/spiceai/spiced:dev
+          tags: ghcr.io/spiceai/spiced:local
 
       - name: Ensure correct directory structure
         if: matrix.context == 'metal'
