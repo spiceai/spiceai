@@ -104,7 +104,7 @@ jobs:
         uses: actions/cache@v2
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-${{ hashFiles('requirements/${{ matrix.target }}.txt') }}
+          key: ${{ runner.os }}-${{ hashFiles('ai/src/requirements/${{ matrix.target }}.txt') }}
 
       - name: Generate PIP Cache
         if: steps.cache-pip.outputs.cache-hit != 'true'
@@ -143,7 +143,7 @@ jobs:
         uses: actions/cache@v2
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-${{ hashFiles('requirements/production.txt') }}
+          key: ${{ runner.os }}-${{ hashFiles('ai/src/requirements/production.txt') }}
 
       - name: Install requirements
         if: matrix.context == 'metal'
@@ -230,7 +230,7 @@ jobs:
         uses: actions/cache@v2
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-${{ hashFiles('requirements/production.txt') }}
+          key: ${{ runner.os }}-${{ hashFiles('ai/src/requirements/production.txt') }}
 
       - name: Install requirements
         if: matrix.context == 'metal'

@@ -84,7 +84,7 @@ jobs:
         uses: actions/cache@v2
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-${{ hashFiles('requirements/development.txt') }}
+          key: ${{ runner.os }}-${{ hashFiles('ai/src/requirements/development.txt') }}
 
       - name: Install Python dependencies
         working-directory: ai/src
