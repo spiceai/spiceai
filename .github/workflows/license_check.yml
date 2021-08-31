@@ -63,8 +63,7 @@ jobs:
       - name: Install pip-licenses
         working-directory: ai/src
         run: |
-          pip install -r requirements/production.txt
-          pip install -r requirements/development.txt
+          pip install pip-licenses
 
       - name: Check AI package licenses
         working-directory: ai/src
