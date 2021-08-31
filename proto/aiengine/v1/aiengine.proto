@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package aiengine;
 
-option go_package = "github.com/spiceai/spice/pkg/proto/aiengine_pb";
+option go_package = "github.com/spiceai/spiceai/pkg/proto/aiengine_pb";
 
 service AIEngine {
   rpc Init(InitRequest) returns (Response);
