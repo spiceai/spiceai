@@ -16,7 +16,6 @@ with open(os.getenv("GITHUB_ENV"), "a") as githubEnv:
         githubEnv.write("LATEST_RELEASE=true\n")
     else:
         print("{} is not found".format(releaseNotePath))
-        sys.exit(1)
     print("Release build from {}...".format(gitRef))
 
     githubEnv.write("REL_VERSION={}\n".format(releaseVersion))
