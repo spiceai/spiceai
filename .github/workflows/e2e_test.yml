@@ -95,7 +95,7 @@ jobs:
         uses: actions/cache@v2
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-${{ hashFiles('requirements/${{ matrix.context }}.txt') }}
+          key: ${{ runner.os }}-${{ hashFiles('requirements/${{ matrix.target }}.txt') }}
 
       - name: Generate PIP Cache
         if: steps.cache-pip.outputs.cache-hit != 'true'
@@ -103,7 +103,7 @@ jobs:
         run: |
           python -m venv venv
           source venv/bin/activate
-          python -m pip install -r requirements/${{ matrix.context }}.txt
+          python -m pip install -r requirements/${{ matrix.target }}.txt
 
   algorithms:
     name: algorithms test
