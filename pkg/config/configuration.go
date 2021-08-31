@@ -61,12 +61,12 @@ func LoadRuntimeConfiguration(v *viper.Viper, appDir string) (*SpiceConfiguratio
 
 		perm, err := util.MkDirAllInheritPerm(spiceAppPath)
 		if err != nil {
-			return nil, fmt.Errorf("error initializing .spice/config.yaml: %w", err)
+			return nil, fmt.Errorf("error creating %s: %w", spiceAppPath, err)
 		}
 
 		err = os.WriteFile(configPath, marshalledConfig, perm)
 		if err != nil {
-			return nil, fmt.Errorf("error initializing .spice/config.yaml: %w", err)
+			return nil, fmt.Errorf("error writing %s: %w", configPath, err)
 		}
 
 		// Wait for file flush to ensure viper.WatchConfig() works
