@@ -7,7 +7,7 @@ COPY dashboard dashboard/
 WORKDIR /build-dashboard/dashboard
 
 RUN npm install --global npm
-RUN npm install --global yarn
+RUN npm install --global yarn --force
 RUN yarn install
 RUN yarn build
 
