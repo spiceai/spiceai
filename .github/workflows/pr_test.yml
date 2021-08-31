@@ -12,7 +12,7 @@ jobs:
     name: validate protobuf files unchanged
     runs-on: ubuntu-latest
     env:
-      GOVER: 1.16
+      GOVER: 1.17
 
     steps:
       - uses: actions/checkout@v2
@@ -43,7 +43,7 @@ jobs:
     name: go test spiced & spice
     runs-on: ubuntu-latest
     env:
-      GOVER: 1.16
+      GOVER: 1.17
 
     steps:
       - uses: actions/checkout@v2

@@ -7,8 +7,8 @@ import (
 	"testing"
 
 	"github.com/spf13/cobra"
-	"github.com/spiceai/spice/pkg/cli/cmd"
-	"github.com/spiceai/spice/pkg/pods"
+	"github.com/spiceai/spiceai/pkg/cli/cmd"
+	"github.com/spiceai/spiceai/pkg/pods"
 	"github.com/stretchr/testify/assert"
 )
 

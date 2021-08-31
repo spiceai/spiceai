@@ -8,7 +8,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/spiceai/spice/pkg/proto/aiengine_pb"
+	"github.com/spiceai/spiceai/pkg/proto/aiengine_pb"
 )
 
 func IsRuntimeServerHealthy(serverBaseUrl string, httpClient *http.Client) error {

@@ -10,9 +10,9 @@ import (
 	"os/exec"
 	"time"
 
-	"github.com/spiceai/spice/pkg/proto/aiengine_pb"
-	"github.com/spiceai/spice/pkg/proto/runtime_pb"
-	"github.com/spiceai/spice/pkg/util"
+	"github.com/spiceai/spiceai/pkg/proto/aiengine_pb"
+	"github.com/spiceai/spiceai/pkg/proto/runtime_pb"
+	"github.com/spiceai/spiceai/pkg/util"
 )
 
 type runtimeServer struct {

@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/spiceai/spice/pkg/constants"
+	"github.com/spiceai/spiceai/pkg/constants"
 )
 
 // This test suite is using a neat trick for testing exec.Command that is documented here:

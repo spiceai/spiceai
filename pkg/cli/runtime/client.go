@@ -8,11 +8,11 @@ import (
 	"net/http"
 
 	"github.com/spf13/viper"
-	"github.com/spiceai/spice/pkg/config"
-	"github.com/spiceai/spice/pkg/context"
-	"github.com/spiceai/spice/pkg/pods"
-	"github.com/spiceai/spice/pkg/proto/runtime_pb"
-	"github.com/spiceai/spice/pkg/util"
+	"github.com/spiceai/spiceai/pkg/config"
+	"github.com/spiceai/spiceai/pkg/context"
+	"github.com/spiceai/spiceai/pkg/pods"
+	"github.com/spiceai/spiceai/pkg/proto/runtime_pb"
+	"github.com/spiceai/spiceai/pkg/util"
 )
 
 type RuntimeClient struct {

@@ -5,7 +5,7 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/spiceai/spice/pkg/constants"
+	"github.com/spiceai/spiceai/pkg/constants"
 )
 
 var (

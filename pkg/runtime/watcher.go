@@ -7,9 +7,9 @@ import (
 	"path/filepath"
 
 	"github.com/fsnotify/fsnotify"
-	"github.com/spiceai/spice/pkg/aiengine"
-	"github.com/spiceai/spice/pkg/context"
-	"github.com/spiceai/spice/pkg/pods"
+	"github.com/spiceai/spiceai/pkg/aiengine"
+	"github.com/spiceai/spiceai/pkg/context"
+	"github.com/spiceai/spiceai/pkg/pods"
 )
 
 func ensurePodsPathExists() error {

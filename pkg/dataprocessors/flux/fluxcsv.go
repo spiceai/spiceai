@@ -10,10 +10,10 @@ import (
 
 	"github.com/influxdata/flux"
 	flux_csv "github.com/influxdata/flux/csv"
-	"github.com/spiceai/spice/pkg/loggers"
-	"github.com/spiceai/spice/pkg/observations"
-	"github.com/spiceai/spice/pkg/state"
-	"github.com/spiceai/spice/pkg/util"
+	"github.com/spiceai/spiceai/pkg/loggers"
+	"github.com/spiceai/spiceai/pkg/observations"
+	"github.com/spiceai/spiceai/pkg/state"
+	"github.com/spiceai/spiceai/pkg/util"
 	"go.uber.org/zap"
 )
 

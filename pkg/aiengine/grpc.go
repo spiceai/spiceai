@@ -3,7 +3,7 @@ package aiengine
 import (
 	"context"
 
-	"github.com/spiceai/spice/pkg/proto/aiengine_pb"
+	"github.com/spiceai/spiceai/pkg/proto/aiengine_pb"
 	"google.golang.org/grpc"
 )
 

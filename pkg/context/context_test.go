@@ -3,8 +3,8 @@ package context_test
 import (
 	"testing"
 
-	"github.com/spiceai/spice/pkg/context"
-	"github.com/spiceai/spice/pkg/context/metal"
+	"github.com/spiceai/spiceai/pkg/context"
+	"github.com/spiceai/spiceai/pkg/context/metal"
 	"github.com/stretchr/testify/assert"
 )
 

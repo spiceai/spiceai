@@ -26,7 +26,7 @@ There are 4 types of issues:
 Before you file an issue, make sure you've checked the following:
 
 1. Check for existing issues
-   - Before you create a new issue, please do a search in [open issues](https://github.com/spiceai/spice/issues) to see if the issue or feature request has already been filed.
+   - Before you create a new issue, please do a search in [open issues](https://github.com/spiceai/spiceai/issues) to see if the issue or feature request has already been filed.
    - If you find your issue already exists, make relevant comments and add your [reaction](https://github.com/blog/2119-add-reaction-to-pull-requests-issues-and-comments). Use a reaction:
      - 👍 up-vote
      - 👎 down-vote
@@ -66,11 +66,11 @@ Spice.ai takes security and our users' trust very seriously. If you believe you 
 
 ### Installing Dependencies
 
-Spice.ai requires Go 1.16, Python 3.8+ and Docker.
+Spice.ai requires Go 1.17, Python 3.8+ and Docker.
 
-#### Go 1.16
+#### Go 1.17
 
-Download & install the latest 1.16 release for Go: https://golang.org/dl/
+Download & install the latest 1.17 release for Go: https://golang.org/dl/
 
 To make it easy to manage multiple versions of Go on your machine, see https://github.com/moovweb/gvm
 

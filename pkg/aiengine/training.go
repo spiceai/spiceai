@@ -7,9 +7,9 @@ import (
 	"time"
 
 	"github.com/logrusorgru/aurora"
-	"github.com/spiceai/spice/pkg/flights"
-	"github.com/spiceai/spice/pkg/pods"
-	"github.com/spiceai/spice/pkg/proto/aiengine_pb"
+	"github.com/spiceai/spiceai/pkg/flights"
+	"github.com/spiceai/spiceai/pkg/pods"
+	"github.com/spiceai/spiceai/pkg/proto/aiengine_pb"
 )
 
 func StartTraining(pod *pods.Pod) error {

@@ -10,9 +10,9 @@ import (
 	"strings"
 
 	"github.com/spf13/viper"
-	"github.com/spiceai/spice/pkg/config"
-	"github.com/spiceai/spice/pkg/constants"
-	spice_version "github.com/spiceai/spice/pkg/version"
+	"github.com/spiceai/spiceai/pkg/config"
+	"github.com/spiceai/spiceai/pkg/constants"
+	spice_version "github.com/spiceai/spiceai/pkg/version"
 	"golang.org/x/mod/semver"
 )
 

@@ -5,7 +5,7 @@ import (
 	"io/ioutil"
 	"path/filepath"
 
-	"github.com/spiceai/spice/pkg/context"
+	"github.com/spiceai/spiceai/pkg/context"
 )
 
 type LocalFileRegistry struct{}

@@ -10,10 +10,10 @@ import (
 	"testing"
 
 	"github.com/bradleyjkemp/cupaloy"
-	"github.com/spiceai/spice/pkg/context"
-	"github.com/spiceai/spice/pkg/pods"
-	"github.com/spiceai/spice/pkg/proto/aiengine_pb"
-	"github.com/spiceai/spice/pkg/testutils"
+	"github.com/spiceai/spiceai/pkg/context"
+	"github.com/spiceai/spiceai/pkg/pods"
+	"github.com/spiceai/spiceai/pkg/proto/aiengine_pb"
+	"github.com/spiceai/spiceai/pkg/testutils"
 	"github.com/stretchr/testify/assert"
 	"google.golang.org/grpc"
 )

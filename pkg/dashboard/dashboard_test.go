@@ -12,7 +12,7 @@ import (
 	"testing"
 
 	"github.com/fasthttp/router"
-	"github.com/spiceai/spice/pkg/dashboard"
+	"github.com/spiceai/spiceai/pkg/dashboard"
 	"github.com/stretchr/testify/assert"
 	"github.com/valyala/fasthttp"
 	"github.com/valyala/fasthttp/fasthttputil"

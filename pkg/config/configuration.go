@@ -9,8 +9,8 @@ import (
 	"time"
 
 	"github.com/spf13/viper"
-	"github.com/spiceai/spice/pkg/constants"
-	"github.com/spiceai/spice/pkg/util"
+	"github.com/spiceai/spiceai/pkg/constants"
+	"github.com/spiceai/spiceai/pkg/util"
 	"gopkg.in/yaml.v2"
 )
 

@@ -5,7 +5,7 @@ import (
 	"os"
 
 	"github.com/spf13/cobra"
-	"github.com/spiceai/spice/pkg/cli/runtime"
+	"github.com/spiceai/spiceai/pkg/cli/runtime"
 )
 
 var runCmd = &cobra.Command{

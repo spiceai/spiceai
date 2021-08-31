@@ -1,8 +1,8 @@
 package api
 
 import (
-	"github.com/spiceai/spice/pkg/flights"
-	"github.com/spiceai/spice/pkg/proto/runtime_pb"
+	"github.com/spiceai/spiceai/pkg/flights"
+	"github.com/spiceai/spiceai/pkg/proto/runtime_pb"
 )
 
 func NewFlight(f *flights.Flight) *runtime_pb.Flight {

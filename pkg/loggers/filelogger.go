@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/spiceai/spice/pkg/util"
+	"github.com/spiceai/spiceai/pkg/util"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	lumberjack "gopkg.in/natefinch/lumberjack.v2"
