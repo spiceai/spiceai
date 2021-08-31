@@ -64,6 +64,11 @@ jobs:
         run: |
           npx license-checker |& grep -i -E "gpl|cc|apsl|cpal|eupl|nposl|osl|sspl|cal|parity|rpl|qpl|sleepycat|copyleft|cddl|cpl|epl|erlpl|ipl|mpl|ms-rl|spl|wtfpl|facebook|BSD-Protection" | grep . && echo "copyleft/forbidden license detected!" || echo "ok"
 
+      - name: Set up Python 3.8.11
+        uses: actions/setup-python@v1
+        with:
+          python-version: 3.8.11
+
       - name: Install AI packages
         working-directory: ai/src
         run: |
