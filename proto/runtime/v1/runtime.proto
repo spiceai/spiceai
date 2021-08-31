@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package runtime;
 
-option go_package = "github.com/spiceai/spice/pkg/proto/runtime_pb";
+option go_package = "github.com/spiceai/spiceai/pkg/proto/runtime_pb";
 
 message ExportModel {
   string directory = 1;
