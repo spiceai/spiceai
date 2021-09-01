@@ -58,6 +58,17 @@ jobs:
         with:
           go-version: ${{ env.GOVER }}
 
+      - name: write .netrc
+        env:
+          PAT: ${{ secrets.PAT_PHILLIP }}
+        run: |
+          echo "machine github.com login phillipleblanc password $PAT" > ~/.netrc
+
+      - name: go get github.com/spiceai/data-components-contrib
+        env:
+          GONOSUMDB: github.com/spiceai/data-components-contrib
+        run: go get github.com/spiceai/data-components-contrib
+
       - name: Download dashboard
         uses: actions/download-artifact@v2
         with:
@@ -124,13 +135,9 @@ jobs:
       fail-fast: false
       matrix:
         algorithm: [vpg, dql]
-        context: [metal]
+        context: [metal, docker]
     steps:
       - uses: actions/checkout@v2
-
-      - name: Set up Docker Buildx
-        if: matrix.context == 'docker'
-        uses: docker/setup-buildx-action@v1
 
       - name: Set up Python 3.8.11
         if: matrix.context == 'metal'
@@ -166,15 +173,24 @@ jobs:
           name: spiced
           path: .
 
-      - name: Build Docker image
+      - name: Build local Docker image
         if: matrix.context == 'docker'
         uses: docker/build-push-action@v2
         with:
           context: .
           file: docker/Dockerfile
           push: false
-          tags: ghcr.io/spiceai/spiced:dev
-      
+          tags: ghcr.io/spiceai/spiced:local
+          build-args: |
+            GH_USERNAME=phillipleblanc
+          secrets: |
+            "gh_pat=${{ secrets.PAT_PHILLIP }}"
+
+      - name: Verify Docker images
+        if: matrix.context == 'docker'
+        run: |
+          docker images
+
       - name: Ensure correct directory structure
         if: matrix.context == 'metal'
         run: |
@@ -215,10 +231,6 @@ jobs:
         with:
           go-version: ${{ env.GOVER }}
 
-      - name: Set up Docker Buildx
-        if: matrix.context == 'docker'
-        uses: docker/setup-buildx-action@v1
-
       - name: Set up Python 3.8.11
         if: matrix.context == 'metal'
         uses: actions/setup-python@v1
@@ -252,14 +264,23 @@ jobs:
           name: spiced
           path: cmd/spiced
 
-      - name: Build and push
+      - name: Build local Docker image
         if: matrix.context == 'docker'
         uses: docker/build-push-action@v2
         with:
           context: .
           file: docker/Dockerfile
           push: false
-          tags: ghcr.io/spiceai/spiced:dev
+          tags: ghcr.io/spiceai/spiced:local
+          build-args: |
+            GH_USERNAME=phillipleblanc
+          secrets: |
+            "gh_pat=${{ secrets.PAT_PHILLIP }}"
+
+      - name: Verify Docker images
+        if: matrix.context == 'docker'
+        run: |
+          docker images
 
       - name: Ensure correct directory structure
         if: matrix.context == 'metal'

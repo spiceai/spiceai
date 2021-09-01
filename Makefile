@@ -30,18 +30,14 @@ test: build
 
 .PHONY: docker
 docker:
-	docker build -t ghcr.io/spiceai/spiced:dev -f docker/Dockerfile .
-
-.PHONY: push
-push:
-	docker push ghcr.io/spiceai/spiced:dev
+	DOCKER_BUILDKIT=1 docker build -t ghcr.io/spiceai/spiced:local -f docker/Dockerfile --build-arg GH_USERNAME=$(GH_USERNAME) --secret id=gh_pat,src=$(GH_PAT_FILE) .
 
 ################################################################################
 # Target: modtidy                                                              #
 ################################################################################
 .PHONY: modtidy
 modtidy:
-	go mod tidy
+	go mod tidy -compat=1.17
 
 ################################################################################
 # Target: init-proto                                                           #

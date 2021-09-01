@@ -2,11 +2,9 @@ package config
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
-	"time"
 
 	"github.com/spf13/viper"
 	"github.com/spiceai/spiceai/pkg/constants"
@@ -51,34 +49,33 @@ func LoadRuntimeConfiguration(v *viper.Viper, appDir string) (*SpiceConfiguratio
 			return nil, err
 		}
 	} else {
+		_, err := util.MkDirAllInheritPerm(spiceAppPath)
+		if err != nil {
+			return nil, fmt.Errorf("error creating %s: %w", spiceAppPath, err)
+		}
+
+		configPath := filepath.Join(spiceAppPath, "config.yaml")
+
+		configFile, err := os.Create(configPath)
+		if err != nil {
+			return nil, fmt.Errorf("error creating %s: %w", configPath, err)
+		}
+
 		// No config file found, use defaults
 		config = LoadDefaultConfiguration()
-		configPath := filepath.Join(spiceAppPath, "config.yaml")
 		marshalledConfig, err := yaml.Marshal(config)
 		if err != nil {
 			return nil, err
 		}
 
-		perm, err := util.MkDirAllInheritPerm(spiceAppPath)
+		_, err = configFile.Write(marshalledConfig)
 		if err != nil {
-			return nil, fmt.Errorf("error initializing .spice/config.yaml: %w", err)
+			return nil, fmt.Errorf("error writing %s: %w", configPath, err)
 		}
 
-		err = os.WriteFile(configPath, marshalledConfig, perm)
+		err = configFile.Sync()
 		if err != nil {
-			return nil, fmt.Errorf("error initializing .spice/config.yaml: %w", err)
-		}
-
-		// Wait for file flush to ensure viper.WatchConfig() works
-		for i := 0; i < 10; i++ {
-			_, err := os.Stat(configPath)
-			if err != nil {
-				break
-			}
-			time.Sleep(100 * time.Millisecond)
-		}
-		if err != nil {
-			return nil, errors.New("error initializing .spice/config.yaml")
+			return nil, fmt.Errorf("error initializing .spice/config.yaml: %s", err)
 		}
 	}
 

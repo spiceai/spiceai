@@ -6,17 +6,25 @@ COPY dashboard dashboard/
 
 WORKDIR /build-dashboard/dashboard
 
+RUN npm install --global npm
+RUN npm install --global yarn --force
 RUN yarn install
 RUN yarn build
 
 FROM golang AS build
 
 ARG REL_VERSION
-ENV REL_VERSION=${REL_VERSION:-edge}
+ENV REL_VERSION=${REL_VERSION:-local}
 
 WORKDIR /build
 
 COPY --from=dashboard /build-dashboard/dashboard/build /build/pkg/dashboard/build
+
+ARG GH_USERNAME
+ARG GH_PAT
+
+RUN --mount=type=secret,id=gh_pat echo "machine github.com login $GH_USERNAME password $(cat /run/secrets/gh_pat)" > ~/.netrc
+RUN GONOSUMDB=github.com/spiceai/data-components-contrib go get github.com/spiceai/data-components-contrib@trunk
 
 COPY go.mod go.mod
 COPY go.sum go.sum
@@ -25,22 +33,15 @@ COPY pkg pkg/
 
 WORKDIR /build/cmd/spiced
 
+RUN go mod tidy -compat=1.17
 RUN make
 
-FROM python:3.8
+RUN rm ~/.netrc
+
+FROM python:3.8.11-slim
 
 ### App code
 WORKDIR /app
-
-RUN groupadd -r spice --gid=1000 && \
-  useradd -r -g spice --uid=1000 --home-dir=/home/spice --shell=/bin/bash spice && \
-  mkdir -p /home/spice && \
-  chown -R spice:spice /home/spice
-
-RUN mkdir -p /.spice/log && chown -R spice:spice /.spice
-RUN chown -R spice:spice /app
-
-USER spice
 
 ENV HOME=/app/home
 

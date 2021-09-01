@@ -6,8 +6,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/spiceai/spiceai/pkg/dataconnectors"
-	"github.com/spiceai/spiceai/pkg/dataprocessors"
+	"github.com/spiceai/data-components-contrib/dataconnectors"
+	"github.com/spiceai/data-components-contrib/dataprocessors"
 	"github.com/spiceai/spiceai/pkg/spec"
 	"github.com/spiceai/spiceai/pkg/state"
 )

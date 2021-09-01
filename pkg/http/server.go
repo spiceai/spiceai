@@ -7,11 +7,11 @@ import (
 	"time"
 
 	"github.com/fasthttp/router"
+	"github.com/spiceai/data-components-contrib/dataprocessors"
+	"github.com/spiceai/data-components-contrib/dataprocessors/csv"
 	"github.com/spiceai/spiceai/pkg/aiengine"
 	"github.com/spiceai/spiceai/pkg/api"
 	"github.com/spiceai/spiceai/pkg/dashboard"
-	"github.com/spiceai/spiceai/pkg/dataprocessors"
-	"github.com/spiceai/spiceai/pkg/dataprocessors/csv"
 	"github.com/spiceai/spiceai/pkg/flights"
 	"github.com/spiceai/spiceai/pkg/loggers"
 	"github.com/spiceai/spiceai/pkg/pods"
