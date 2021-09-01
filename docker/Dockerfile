@@ -27,7 +27,7 @@ WORKDIR /build/cmd/spiced
 
 RUN make
 
-FROM python:3.8
+FROM python:3.8.11-alpine
 
 ### App code
 WORKDIR /app
