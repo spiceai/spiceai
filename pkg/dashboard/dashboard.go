@@ -6,6 +6,7 @@ import (
 
 type Dashboard interface {
 	IndexHandler(ctx *fasthttp.RequestCtx)
+	AcknowledgementsHandler(ctx *fasthttp.RequestCtx)
 	JsHandler(ctx *fasthttp.RequestCtx)
 	CssHandler(ctx *fasthttp.RequestCtx)
 	SvgHandler(ctx *fasthttp.RequestCtx)

@@ -14,6 +14,9 @@ import (
 //go:embed build/index.html
 var contentIndexHtml []byte
 
+//go:embed build/acknowledgements.html
+var contentAcknowledgementsHtml []byte
+
 //go:embed build/static/js/*
 var jsFiles embed.FS
 
@@ -33,6 +36,12 @@ func (d *DashboardEmbedded) IndexHandler(ctx *fasthttp.RequestCtx) {
 	contentType := GetContentType("html")
 	ctx.Response.Header.SetContentType(contentType)
 	ctx.Response.SetBody(contentIndexHtml)
+}
+
+func (d *DashboardEmbedded) AcknowledgementsHandler(ctx *fasthttp.RequestCtx) {
+	contentType := GetContentType("html")
+	ctx.Response.Header.SetContentType(contentType)
+	ctx.Response.SetBody(contentAcknowledgementsHtml)
 }
 
 func (d *DashboardEmbedded) JsHandler(ctx *fasthttp.RequestCtx) {
