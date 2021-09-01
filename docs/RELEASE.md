@@ -15,7 +15,8 @@ Create an endgame issue with the following content:
 - [ ] Merge Samples PRs
 - [ ] Merge Quickstarts PRs
 - [ ] Merge release notes
-- [ ] Update version using documented process at [docs/RELEASE.md](https://github.com/spiceai/spiceai/blob/trunk/docs/RELEASE.md#version-update)
+- [ ] Update data-components-contrib repo with latest tag and reference it in spiceai. See [Components contrib version update](https://github.com/spiceai/spiceai/blob/trunk/docs/RELEASE.md#version-update)
+- [ ] Update version using documented process at [docs/RELEASE.md](https://github.com/spiceai/spiceai/blob/trunk/docs/RELEASE.md#components-contrib-version-update)
 - [ ] Final test pass on released binaries
 - [ ] Discord announcement
 - [ ] Email announcement
@@ -32,3 +33,9 @@ PR reference:
 - Create a new PR updating version.txt to bump to the next version with the `-rc` flag.
   - i.e. `0.1.0-alpha.4` -> `0.1.0-alpha.5-rc`
 - Merge that PR and verify the new RC release is created.
+
+## Components contrib version update
+
+- Tag the latest commit on https://github.com/spiceai/data-components-contrib with the same version as the main `spiceai` repo for this release
+- Create a PR in `spiceai` to update the version of `github.com/spiceai/data-components-contrib` to the latest version tag.
+  - To update, run `go get -u github.com/spiceai/data-components-contrib@<version tag>` and commit the `go.mod` and `go.sum` changes
