@@ -218,7 +218,7 @@ jobs:
       fail-fast: false
       matrix:
         algorithm: [vpg, dql]
-        context: [metal, docker]
+        context: [metal]
     steps:
       - uses: actions/checkout@v2
 
