@@ -92,7 +92,7 @@ func (c *DockerContext) InstallOrUpgradeRuntime() error {
 		// No need to install or upgrade a local image
 		return nil
 	}
-	
+
 	dockerImg := getDockerImage(spice_version.Version())
 	fmt.Printf("Pulling Docker image %s\n", dockerImg)
 	cmd := exec.Command("docker", "pull", dockerImg)
