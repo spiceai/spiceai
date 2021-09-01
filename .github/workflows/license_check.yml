@@ -22,8 +22,13 @@ jobs:
     runs-on: ubuntu-latest
     env:
       GOVER: 1.17
+
+      # Manually exclude packages that have a clause allowing a permissive license *or* a copyleft license to be used
+      EXCLUDE_JS_PACKAGES: node-forge@0.10.0
+      EXCLUDE_PYTHON_PACKAGES: pyzmq
+
       FORBIDDEN_LICENSE_CHECK: |
-        grep -E "GPL|CC-BY-SA|CC-BY-NC|CC-BY-NC-SA|CC-BY-NC-ND|APSL|CPAL|EUPL|NPOSL|OSL|SSPL|Parity|RPL|QPL|Sleepycat|copyleft|CDDL|CPL|EPL|ErlPL|IPL|MPL|MS-RL|SPL|WTFPL|Facebook|Commons-Clause" | grep . && echo "copyleft/forbidden license detected!" || echo "ok" 
+        grep -E "GPL|CC-BY-SA|CC-BY-NC|CC-BY-NC-SA|CC-BY-NC-ND|APSL|CPAL|EUPL|NPOSL|OSL|SSPL|Parity|RPL|QPL|Sleepycat|copyleft|CDDL|CPL|EPL|ErlPL|IPL|MS-RL|SPL|Facebook|Commons-Clause" | grep . && exit 1 || echo "ok" 
     steps:
       - uses: actions/checkout@v2
 
@@ -51,7 +56,7 @@ jobs:
 
       - name: Check root package licenses
         run: |
-          npx license-checker |& ${{ env.FORBIDDEN_LICENSE_CHECK }}
+          npx license-checker --excludePackage ${{ env.EXCLUDE_JS_PACKAGES }} |& ${{ env.FORBIDDEN_LICENSE_CHECK }}
 
       - name: Install dashboard packages
         working-directory: dashboard
@@ -61,7 +66,7 @@ jobs:
       - name: Check dashboard package licenses
         working-directory: dashboard
         run: |
-          npx license-checker |& ${{ env.FORBIDDEN_LICENSE_CHECK }}
+          npx license-checker --excludePackage ${{ env.EXCLUDE_JS_PACKAGES }} |& ${{ env.FORBIDDEN_LICENSE_CHECK }}
 
       - name: Set up Python 3.8.11
         uses: actions/setup-python@v1
@@ -83,4 +88,4 @@ jobs:
       - name: Check AI package licenses
         working-directory: ai/src
         run: |
-          pip-licenses |& ${{ env.FORBIDDEN_LICENSE_CHECK }}
+          pip-licenses --ignore-packages ${{ env.EXCLUDE_PYTHON_PACKAGES}} |& ${{ env.FORBIDDEN_LICENSE_CHECK }}
