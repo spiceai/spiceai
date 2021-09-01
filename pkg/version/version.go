@@ -8,9 +8,9 @@ var (
 )
 
 // Version returns the Spice version. This is either a semantic version
-// number or else, in the case of unreleased code, the string "edge".
+// number or else, in the case of unreleased code, the string "local".
 func Version() string {
-	if version == "local" || version == "edge" {
+	if version == "local" {
 		return version
 	}
 
