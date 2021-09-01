@@ -64,6 +64,28 @@ func LoadRuntimeConfiguration(v *viper.Viper, appDir string) (*SpiceConfiguratio
 			return nil, fmt.Errorf("error initializing .spice/config.yaml: %w", err)
 		}
 
+		fi, err := os.Stat(spiceAppPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to stat %s: %w", spiceAppPath, err)
+		}
+
+		mode := fi.Mode()
+
+		fmt.Print("Owner: ")
+		for i := 1; i < 4; i++ {
+			fmt.Print(string(mode.String()[i]))
+		}
+
+		fmt.Print("\nGroup: ")
+		for i := 4; i < 7; i++ {
+			fmt.Print(string(mode.String()[i]))
+		}
+
+		fmt.Print("\nOther: ")
+		for i := 7; i < 10; i++ {
+			fmt.Print(string(mode.String()[i]))
+		}
+
 		err = os.WriteFile(configPath, marshalledConfig, perm)
 		if err != nil {
 			return nil, fmt.Errorf("error initializing .spice/config.yaml: %w", err)
