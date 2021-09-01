@@ -64,6 +64,12 @@ jobs:
           name: dashboard_build
           path: pkg/dashboard/build
 
+      - name: Cache Go modules
+        uses: actions/cache@v2
+        with:
+          path: ${{ env.GOPATH }}/pkg/mod
+          key: ${{ env.GOOS }}-${{ env.GOARCH }}-${{ hashFiles('go.sum', 'go.mod') }}
+
       - name: Build spice
         run: make
         working-directory: cmd/spice
