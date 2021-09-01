@@ -133,7 +133,7 @@ func (c *DockerContext) GetRunCmd(manifestPath string) (*exec.Cmd, error) {
 	}
 
 	if version == "local" {
-		fmt.Println("found and using local dev image")
+		fmt.Println("Found and using local dev Docker image")
 	} else {
 		version, err = c.Version()
 		if err != nil {
