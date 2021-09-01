@@ -30,7 +30,7 @@ WORKDIR /build/cmd/spiced
 RUN go mod tidy
 RUN make
 
-FROM python:3.8.11-alpine
+FROM python:3.8.11-slim
 
 ### App code
 WORKDIR /app
