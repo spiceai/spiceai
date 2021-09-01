@@ -67,7 +67,7 @@ jobs:
       - name: Cache Go modules
         uses: actions/cache@v2
         with:
-          path: ${{ env.GOPATH }}/pkg/mod
+          path: $GOPATH/pkg/mod
           key: ${{ env.GOOS }}-${{ env.GOARCH }}-${{ hashFiles('go.sum', 'go.mod') }}
 
       - name: Build spice
