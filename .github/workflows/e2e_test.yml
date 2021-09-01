@@ -124,13 +124,9 @@ jobs:
       fail-fast: false
       matrix:
         algorithm: [vpg, dql]
-        context: [metal]
+        context: [metal, docker]
     steps:
       - uses: actions/checkout@v2
-
-      - name: Set up Docker Buildx
-        if: matrix.context == 'docker'
-        uses: docker/setup-buildx-action@v1
 
       - name: Set up Python 3.8.11
         if: matrix.context == 'metal'
@@ -166,14 +162,19 @@ jobs:
           name: spiced
           path: .
 
-      - name: Build Docker image
+      - name: Build local Docker image
         if: matrix.context == 'docker'
         uses: docker/build-push-action@v2
         with:
           context: .
           file: docker/Dockerfile
           push: false
-          tags: ghcr.io/spiceai/spiced:dev
+          tags: ghcr.io/spiceai/spiced:local
+
+      - name: Verify Docker images
+        if: matrix.context == 'docker'
+        run: |
+          docker images
       
       - name: Ensure correct directory structure
         if: matrix.context == 'metal'
@@ -206,7 +207,7 @@ jobs:
       fail-fast: false
       matrix:
         algorithm: [vpg, dql]
-        context: [metal]
+        context: [metal, docker]
     steps:
       - uses: actions/checkout@v2
 
@@ -214,10 +215,6 @@ jobs:
         uses: actions/setup-go@v2
         with:
           go-version: ${{ env.GOVER }}
-
-      - name: Set up Docker Buildx
-        if: matrix.context == 'docker'
-        uses: docker/setup-buildx-action@v1
 
       - name: Set up Python 3.8.11
         if: matrix.context == 'metal'
@@ -252,14 +249,19 @@ jobs:
           name: spiced
           path: cmd/spiced
 
-      - name: Build and push
+      - name: Build local Docker image
         if: matrix.context == 'docker'
         uses: docker/build-push-action@v2
         with:
           context: .
           file: docker/Dockerfile
           push: false
-          tags: ghcr.io/spiceai/spiced:dev
+          tags: ghcr.io/spiceai/spiced:local
+
+      - name: Verify Docker images
+        if: matrix.context == 'docker'
+        run: |
+          docker images
 
       - name: Ensure correct directory structure
         if: matrix.context == 'metal'
