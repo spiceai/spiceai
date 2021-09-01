@@ -3,7 +3,7 @@
 ## Release environments
 
 |                     | Production                    | Development                | Local                        |
-|---------------------|-------------------------------|----------------------------|------------------------------|
+| ------------------- | ----------------------------- | -------------------------- | ---------------------------- |
 | Short name          | prod                          | dev                        | local                        |
 | spiced Docker image | ghcr.io/spiceai/spiced:latest | ghcr.io/spiceai/spiced:dev | ghcr.io/spiceai/spiced:local |
 | Spice Rack URL      | https://api.spicerack.org     | https://dev.spicerack.org  | http://localhost:80          |
@@ -23,9 +23,10 @@ Create an endgame issue with the following content:
 - [ ] Merge Samples PRs
 - [ ] Merge Quickstarts PRs
 - [ ] Merge release notes
-- [ ] Update data-components-contrib repo with latest tag and reference it in spiceai. See [Components contrib version update](https://github.com/spiceai/spiceai/blob/trunk/docs/RELEASE.md#version-update)
-- [ ] Update version using documented process at [docs/RELEASE.md](https://github.com/spiceai/spiceai/blob/trunk/docs/RELEASE.md#components-contrib-version-update)
+- [ ] Update data-components-contrib repo with latest tag and reference it in spiceai. See [Components contrib version update](https://github.com/spiceai/spiceai/blob/trunk/docs/RELEASE.md#components-contrib-version-update)
+- [ ] Update version using documented process at [docs/RELEASE.md](https://github.com/spiceai/spiceai/blob/trunk/docs/RELEASE.md#version-update)
 - [ ] Final test pass on released binaries
+- [ ] Update version to next-highest with `-rc`
 - [ ] Discord announcement
 - [ ] Email announcement
 
