@@ -64,6 +64,9 @@ jobs:
           name: dashboard_build
           path: pkg/dashboard/build
 
+      - name: Get go env
+        run: go env
+      
       - name: Cache Go modules
         uses: actions/cache@v2
         with:
