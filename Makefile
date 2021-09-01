@@ -30,7 +30,7 @@ test: build
 
 .PHONY: docker
 docker:
-	docker build -t ghcr.io/spiceai/spiced:local -f docker/Dockerfile .
+	DOCKER_BUILDKIT=1 docker build -t ghcr.io/spiceai/spiced:local -f docker/Dockerfile --build-arg GH_USERNAME=$(GH_USERNAME) --secret id=gh_pat,src=$(GH_PAT_FILE) .
 
 ################################################################################
 # Target: modtidy                                                              #
