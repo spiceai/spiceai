@@ -58,6 +58,17 @@ jobs:
         with:
           go-version: ${{ env.GOVER }}
 
+      - name: write .netrc
+        env:
+          PAT: ${{ secrets.PAT_PHILLIP }}
+        run: |
+          echo "machine github.com login phillipleblanc password $PAT" > ~/.netrc
+
+      - name: go get github.com/spiceai/data-components-contrib
+        env:
+          GONOSUMDB: github.com/spiceai/data-components-contrib
+        run: go get github.com/spiceai/data-components-contrib
+
       - name: Download dashboard
         uses: actions/download-artifact@v2
         with:
@@ -174,7 +185,7 @@ jobs:
           file: docker/Dockerfile
           push: false
           tags: ghcr.io/spiceai/spiced:dev
-      
+
       - name: Ensure correct directory structure
         if: matrix.context == 'metal'
         run: |
