@@ -11,9 +11,16 @@ jobs:
   golangci:
     name: lint golang code
     runs-on: ubuntu-latest
+    env:
+      GOVER: 1.17
 
     steps:
       - uses: actions/checkout@v2
+
+      - name: Set up Go
+        uses: actions/setup-go@v2
+        with:
+          go-version: ${{ env.GOVER }}
 
       - name: Build and copy dashboard
         working-directory: dashboard
