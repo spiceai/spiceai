@@ -30,11 +30,7 @@ test: build
 
 .PHONY: docker
 docker:
-	docker build -t ghcr.io/spiceai/spiced:dev -f docker/Dockerfile .
-
-.PHONY: push
-push:
-	docker push ghcr.io/spiceai/spiced:dev
+	docker build -t ghcr.io/spiceai/spiced:local -f docker/Dockerfile .
 
 ################################################################################
 # Target: modtidy                                                              #
