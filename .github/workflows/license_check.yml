@@ -1,0 +1,103 @@
+---
+name: Check for forbidden licenses
+
+# Checks for any forbidden/copyleft licenses using their SPDX identifiers
+# (https://spdx.org/licenses/)
+
+# List of copyleft licenses derived from Blue Oak Council Guide to Copyleft
+# https://blueoakcouncil.org/copyleft
+
+# List of forbidden licenses derived from Google License Classifier
+# (https://github.com/google/licenseclassifier)
+
+on:
+  pull_request:
+    branches:
+      - trunk
+      - release-*
+
+jobs:
+  license-check:
+    name: license check
+    runs-on: ubuntu-latest
+    env:
+      GOVER: 1.17
+
+      # Manually exclude packages that have a clause allowing a permissive license *or* a copyleft license to be used
+      EXCLUDE_JS_PACKAGES: node-forge@0.10.0
+      EXCLUDE_PYTHON_PACKAGES: pyzmq
+
+      FORBIDDEN_LICENSE_CHECK: |
+        grep -E "GPL|CC-BY-SA|CC-BY-NC|CC-BY-NC-SA|CC-BY-NC-ND|APSL|CPAL|EUPL|NPOSL|OSL|SSPL|Parity|RPL|QPL|Sleepycat|copyleft|CDDL|CPL|EPL|ErlPL|IPL|MS-RL|SPL|Facebook|Commons-Clause" | grep . && exit 1 || echo "ok" 
+        
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Set up Go
+        uses: actions/setup-go@v2
+        with:
+          go-version: ${{ env.GOVER }}
+
+      - name: write .netrc
+        env:
+          PAT: ${{ secrets.PAT_PHILLIP }}
+        run: |
+          echo "machine github.com login phillipleblanc password $PAT" > ~/.netrc
+
+      - name: go get github.com/spiceai/data-components-contrib
+        env:
+          GONOSUMDB: github.com/spiceai/data-components-contrib
+        run: go get github.com/spiceai/data-components-contrib
+
+      - name: Install go-licences
+        run: go get github.com/google/go-licenses
+
+      - name: Check spice licenses
+        working-directory: cmd/spice
+        run: |
+          go-licenses csv . |& ${{ env.FORBIDDEN_LICENSE_CHECK }}
+      
+      - name: Check spiced licenses
+        working-directory: cmd/spiced
+        run: |
+          go-licenses csv . |& ${{ env.FORBIDDEN_LICENSE_CHECK }}
+
+      - name: Install root packages
+        run: |
+          yarn install
+
+      - name: Check root package licenses
+        run: |
+          npx license-checker --excludePackage ${{ env.EXCLUDE_JS_PACKAGES }} |& ${{ env.FORBIDDEN_LICENSE_CHECK }}
+
+      - name: Install dashboard packages
+        working-directory: dashboard
+        run: |
+          yarn install
+
+      - name: Check dashboard package licenses
+        working-directory: dashboard
+        run: |
+          npx license-checker --excludePackage ${{ env.EXCLUDE_JS_PACKAGES }} |& ${{ env.FORBIDDEN_LICENSE_CHECK }}
+
+      - name: Set up Python 3.8.11
+        uses: actions/setup-python@v1
+        with:
+          python-version: 3.8.11
+
+      - name: Install AI packages
+        working-directory: ai/src
+        run: |
+          pip install -r requirements/production.txt
+          pip install -r requirements/development.txt
+          pip install -r requirements/common.txt
+
+      - name: Install pip-licenses
+        working-directory: ai/src
+        run: |
+          pip install pip-licenses
+
+      - name: Check AI package licenses
+        working-directory: ai/src
+        run: |
+          pip-licenses --ignore-packages ${{ env.EXCLUDE_PYTHON_PACKAGES}} |& ${{ env.FORBIDDEN_LICENSE_CHECK }}
