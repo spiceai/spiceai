@@ -80,16 +80,6 @@ jobs:
           name: dashboard_build
           path: pkg/dashboard/build
 
-      - name: Set GOMODCACHE
-        run: |
-          echo "GOMODCACHE=$(go env GOMODCACHE)" >> $GITHUB_ENV
-      
-      - name: Cache Go modules
-        uses: actions/cache@v2
-        with:
-          path: ${{ env.GOMODCACHE }}
-          key: ${{ hashFiles('go.sum', 'go.mod') }}
-
       - name: Build spice
         run: make
         working-directory: cmd/spice
