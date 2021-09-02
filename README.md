@@ -1,18 +1,18 @@
 # Spice.ai
 
 [![e2e_test](https://github.com/spiceai/spiceai/actions/workflows/e2e_test.yml/badge.svg?branch=trunk&event=push)](https://github.com/spiceai/spiceai/actions/workflows/e2e_test.yml)
-[![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-lightgreen.svg)](https://opensource.org/licenses/Apache-2.0)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Discord](https://img.shields.io/discord/803820740868571196)](https://discord.com/channels/803820740868571196/803820740868571199)
 [![Subreddit subscribers](https://img.shields.io/reddit/subreddit-subscribers/spiceai?style=social)](https://www.reddit.com/r/spiceai)
 [![Follow on Twitter](https://img.shields.io/twitter/follow/spiceaihq.svg?style=social&logo=twitter)](https://twitter.com/intent/follow?screen_name=spiceaihq)
-
-Welcome to the Spice.ai alpha and thank you for your engagement in early Spice.ai development.
 
 Spice.ai is an open source, portable runtime for training and using deep learning on time series data. It's written in Golang and Python and runs as a container or microservice with applications calling a simple HTTP API. It's deployable to any public cloud, on-premises, and edge.
 
 The vision for Spice.ai is to make creating intelligent applications as easy as possible for developers in their development environment of choice. Spice.ai brings AI development to their editor, in any language or framework with a fast, iterative, inner development loop, with continuous-integration (CI) and continuous-deployment (CD) workflows.
 
 The Spice.ai runtime also includes a library of [community-driven components](https://github.com/spiceai/data-components-contrib) for streaming and processing time series data, with the vision of enabling developers to quickly and easily combine data with learning to create intelligent models.
+
+📢 Read the Spice.ai announcement blog post at [blog.spiceai.org](https://blog.spiceai.org)
 
 ---
 
