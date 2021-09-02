@@ -22,6 +22,8 @@ func GetContentType(fileType string) string {
 		return "text/css; charset=utf-8"
 	case "svg":
 		return "image/svg+xml"
+	case "text":
+		return "text/plain; charset=utf-8"
 	}
 	return ""
 }

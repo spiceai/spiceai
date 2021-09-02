@@ -36,7 +36,7 @@ func NewDashboardLocalFs(rootDir string) (*DashboardLocalFs, error) {
 	}
 
 	indexPath := filepath.Join(rootDir, "index.html")
-	acknowledgementsPath := filepath.Join(rootDir, "acknowledgements.html")
+	acknowledgementsPath := filepath.Join(rootDir, "acknowledgements.txt")
 
 	return &DashboardLocalFs{
 		rootDir:   rootDir,
@@ -52,7 +52,7 @@ func (d *DashboardLocalFs) IndexHandler(ctx *fasthttp.RequestCtx) {
 }
 
 func (d *DashboardLocalFs) AcknowledgementsHandler(ctx *fasthttp.RequestCtx) {
-	contentType := GetContentType("html")
+	contentType := GetContentType("text")
 	ctx.Response.Header.SetContentType(contentType)
 	fasthttp.ServeFile(ctx, d.acknowledgementsPath)
 }

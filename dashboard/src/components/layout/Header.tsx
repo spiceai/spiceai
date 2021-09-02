@@ -12,7 +12,7 @@ const Header: React.FunctionComponent = () => {
       </div>
       <div className="justify-self-center"></div>
       <div className=" mr-4 justify-self-end">
-        <span className="uppercase font-bold text-xs text-white">
+        <span className="uppercase font-bold space-x-2 text-xs text-white">
           <a href="https://docs.spiceai.org">Docs</a>
           <a href="/acknowledgements">Acknowledgements</a>
         </span>
