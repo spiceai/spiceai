@@ -46,6 +46,7 @@ WORKDIR /app
 ENV HOME=/app/home
 
 RUN apk add --update-cache gcc
+RUN apk add --update-cache libatomic
 RUN apk add --update-cache musl-dev
 
 COPY ai/src/requirements/common.txt ai/src/requirements/production.txt ./
