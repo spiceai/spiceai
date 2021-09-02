@@ -45,7 +45,7 @@ WORKDIR /app
 
 ENV HOME=/app/home
 
-RUN apk add --update-cache gcc
+RUN apk add --update-cache base-build
 RUN apk add --update-cache linux-headers
 RUN apk add --update-cache libatomic
 RUN apk add --update-cache musl-dev
