@@ -42,20 +42,16 @@ jobs:
 
     strategy:
       matrix:
-        os: [self-hosted, ubuntu-latest, windows-latest, macOS-latest]
+        os: [self-hosted, ubuntu-latest, macOS-latest]
         target_arch: [amd64, arm64]
         include:
           - os: ubuntu-latest
             target_os: linux
-          - os: windows-latest
-            target_os: windows
           - os: macOS-latest
             target_os: darwin
           - os: self-hosted
             target_os: darwin
         exclude:
-          - os: windows-latest
-            target_arch: arm64
           - os: ubuntu-latest
             target_arch: arm64
           - os: macOS-latest
