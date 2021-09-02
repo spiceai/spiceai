@@ -1,3 +1,5 @@
+Spice.ai would like the following open source projects for making this project possible:
+
 Python Packages
 
 "Keras-Preprocessing","1.1.2","MIT License","Keras Team","https://github.com/keras-team/keras-preprocessing"
