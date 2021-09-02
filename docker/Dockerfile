@@ -38,12 +38,15 @@ RUN make
 
 RUN rm ~/.netrc
 
-FROM python:3.8.11-slim
+FROM python:3.8.11-alpine
 
 ### App code
 WORKDIR /app
 
 ENV HOME=/app/home
+
+RUN apk add --update-cache gcc
+RUN apk add --update-cache musl-dev
 
 COPY ai/src/requirements/common.txt ai/src/requirements/production.txt ./
 RUN python3 -m pip install -r production.txt
