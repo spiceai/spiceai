@@ -45,12 +45,10 @@ WORKDIR /app
 
 ENV HOME=/app/home
 
-RUN apk add --update-cache build-base
+RUN apk add --update-cache gcc
 RUN apk add --update-cache linux-headers
-RUN apk add --update-cache gcc-c++
 RUN apk add --update-cache libatomic
 RUN apk add --update-cache musl-dev
-RUN apk add --update-cache python3-devel
 
 COPY ai/src/requirements/common.txt ai/src/requirements/production.txt ./
 RUN python3 -m pip install -r production.txt
