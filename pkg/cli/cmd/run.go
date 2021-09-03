@@ -14,7 +14,7 @@ var runCmd = &cobra.Command{
 	Example: `
 spice run
 
-# See more at: https://spiceai.github.io/docs
+# See more at: https://docs.spiceai.org/
 `,
 	Run: func(cmd *cobra.Command, args []string) {
 		err := runtime.Run(contextFlag, "")
