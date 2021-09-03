@@ -17,7 +17,7 @@ func GetContentType(fileType string) string {
 	case "html":
 		return "text/html; charset=utf-8"
 	case "js":
-		return "application/javascript; charset=utf-8"
+		return "application/javascript"
 	case "css":
 		return "text/css; charset=utf-8"
 	case "svg":
