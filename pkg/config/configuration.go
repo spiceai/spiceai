@@ -13,8 +13,7 @@ import (
 )
 
 type SpiceConfiguration struct {
-	HttpPort            uint    `json:"http_port,omitempty" mapstructure:"http_port,omitempty" yaml:"http_port,omitempty"`
-	CustomDashboardPath *string `json:"custom_dashboard_path,omitempty" mapstructure:"custom_dashboard_path,omitempty" yaml:"custom_dashboard_path,omitempty"`
+	HttpPort uint `json:"http_port,omitempty" mapstructure:"http_port,omitempty" yaml:"http_port,omitempty"`
 }
 
 func LoadDefaultConfiguration() *SpiceConfiguration {

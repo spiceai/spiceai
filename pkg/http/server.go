@@ -21,8 +21,7 @@ import (
 )
 
 type ServerConfig struct {
-	Port          uint
-	DashboardPath *string
+	Port uint
 }
 
 type server struct {
@@ -344,11 +343,10 @@ func apiPostImportHandler(ctx *fasthttp.RequestCtx) {
 	ctx.Response.SetStatusCode(200)
 }
 
-func NewServer(port uint, dashboardPath *string) *server {
+func NewServer(port uint) *server {
 	return &server{
 		config: ServerConfig{
-			Port:          port,
-			DashboardPath: dashboardPath,
+			Port: port,
 		},
 	}
 }
@@ -358,16 +356,8 @@ func (server *server) Start() error {
 	r.GET("/health", healthHandler)
 
 	// Static Dashboard
-	var dashboardServer dashboard.Dashboard
+	dashboardServer := dashboard.NewDashboardEmbedded()
 	var err error
-	if server.config.DashboardPath != nil {
-		dashboardServer, err = dashboard.NewDashboardLocalFs(*server.config.DashboardPath)
-		if err != nil {
-			return fmt.Errorf("failed to initialize dashboard: %w", err)
-		}
-	} else {
-		dashboardServer = dashboard.NewDashboardEmbedded()
-	}
 
 	r.GET("/", dashboardServer.IndexHandler)
 	r.GET("/acknowledgements", dashboardServer.AcknowledgementsHandler)
