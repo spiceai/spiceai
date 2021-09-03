@@ -98,7 +98,7 @@ In the original terminal instance, add the LogPruner sample pod:
 spice add quickstarts/logpruner
 ```
 
-The Spice CLI will download the LogPruner sample pod manifest and add it to your project at `.spice/pods/logpruner.yaml`.
+The Spice CLI will download the LogPruner sample pod manifest and add it to your project at `spicepods/logpruner.yaml`.
 
 The Spice.ai runtime will then automatically detect the manifest and start your first training run!
 

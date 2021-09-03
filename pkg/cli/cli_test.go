@@ -66,10 +66,10 @@ func testInit(root *cobra.Command) func(*testing.T) {
 	return func(t *testing.T) {
 		_, err := executeCommand(root, "init", "foo")
 		assert.NoError(t, err)
-		_, err = os.Stat(".spice/pods/foo.yaml")
+		_, err = os.Stat("spicepods/foo.yaml")
 		assert.NoError(t, err)
 
-		_, err = pods.LoadPodFromManifest(".spice/pods/foo.yaml")
+		_, err = pods.LoadPodFromManifest("spicepods/foo.yaml")
 		assert.NoError(t, err)
 	}
 }
@@ -80,7 +80,7 @@ func testActionAddCmd(root *cobra.Command) func(*testing.T) {
 		_, err := executeCommand(root, "action", "add", "jump")
 		assert.NoError(t, err)
 
-		pod, err := pods.LoadPodFromManifest(".spice/pods/foo.yaml")
+		pod, err := pods.LoadPodFromManifest("spicepods/foo.yaml")
 		assert.NoError(t, err)
 
 		assert.Contains(t, pod.Actions(), "jump")
@@ -93,7 +93,7 @@ func testRewardsAddCmd(root *cobra.Command) func(*testing.T) {
 		_, err := executeCommand(root, "reward", "add")
 		assert.NoError(t, err)
 
-		pod, err := pods.LoadPodFromManifest(".spice/pods/foo.yaml")
+		pod, err := pods.LoadPodFromManifest("spicepods/foo.yaml")
 		assert.NoError(t, err)
 
 		assert.Contains(t, pod.Rewards(), "jump")
