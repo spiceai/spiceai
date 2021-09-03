@@ -31,7 +31,7 @@ const (
 
 func NewDockerContext() *DockerContext {
 	spiceBinDir := path.Join(dockerSpiceRuntimePath, "bin")
-	podsDir := path.Join(dockerAppPath, constants.DotSpice, "pods")
+	podsDir := path.Join(dockerAppPath, constants.SpicePodsDirectoryName)
 
 	return &DockerContext{
 		spiceBinDir: spiceBinDir,

@@ -147,7 +147,7 @@ func (r *SpiceRuntime) scanForPods() error {
 	podsManifestDir := context.CurrentContext().PodsDir()
 	_, err = os.Stat(podsManifestDir)
 	if err != nil {
-		// No .spice/pods means no pods
+		// No spicepods means no pods
 		return nil
 	}
 
