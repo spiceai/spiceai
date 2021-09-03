@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"fmt"
 	"os"
-	"path/filepath"
 
 	"github.com/spf13/viper"
 	"github.com/spiceai/spiceai/pkg/constants"
@@ -23,67 +22,65 @@ func LoadDefaultConfiguration() *SpiceConfiguration {
 }
 
 func LoadRuntimeConfiguration(v *viper.Viper, appDir string) (*SpiceConfiguration, error) {
-	spiceAppPath := filepath.Join(appDir, constants.DotSpice)
-	v.AddConfigPath(spiceAppPath)
-	v.SetConfigName("config")
+	v.AddConfigPath(appDir)
+	v.SetConfigName(constants.SpiceConfigBaseName)
 	v.SetConfigType("yaml")
 
 	var config *SpiceConfiguration
-	configPath := ""
+	configPath := fmt.Sprintf("%s.yaml", constants.SpiceConfigBaseName)
 
-	if _, err := os.Stat(".spice/config.yaml"); err == nil {
-		configPath = ".spice/config.yaml"
-	} else if _, err := os.Stat(".spice/config.yml"); err == nil {
-		configPath = ".spice/config.yml"
-	}
-
-	if configPath != "" {
-		configBytes, err := util.ReplaceEnvVariablesFromPath(configPath, constants.SpiceEnvVarPrefix)
-		if err != nil {
-			return nil, err
-		}
-
-		err = v.ReadConfig(bytes.NewBuffer(configBytes))
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		_, err := util.MkDirAllInheritPerm(spiceAppPath)
-		if err != nil {
-			return nil, fmt.Errorf("error creating %s: %w", spiceAppPath, err)
-		}
-
-		configPath := filepath.Join(spiceAppPath, "config.yaml")
-
-		configFile, err := os.Create(configPath)
-		if err != nil {
-			return nil, fmt.Errorf("error creating %s: %w", configPath, err)
-		}
-
-		// No config file found, use defaults
-		config = LoadDefaultConfiguration()
-		marshalledConfig, err := yaml.Marshal(config)
-		if err != nil {
-			return nil, err
-		}
-
-		_, err = configFile.Write(marshalledConfig)
-		if err != nil {
-			return nil, fmt.Errorf("error writing %s: %w", configPath, err)
-		}
-
-		err = configFile.Sync()
-		if err != nil {
-			return nil, fmt.Errorf("error initializing .spice/config.yaml: %s", err)
+	if _, err := os.Stat(configPath); err != nil {
+		configPath = fmt.Sprintf("%s.yml", constants.SpiceConfigBaseName)
+		if _, err := os.Stat(configPath); err != nil {
+			// No config file found, use defaults
+			config = LoadDefaultConfiguration()
+			return config, nil
 		}
 	}
 
-	v.WatchConfig()
+	configBytes, err := util.ReplaceEnvVariablesFromPath(configPath, constants.SpiceEnvVarPrefix)
+	if err != nil {
+		return nil, err
+	}
 
-	err := v.Unmarshal(&config)
+	err = v.ReadConfig(bytes.NewBuffer(configBytes))
+	if err != nil {
+		return nil, err
+	}
+
+	err = v.Unmarshal(&config)
+	if err != nil {
+		return nil, err
+	}
+
 	return config, err
 }
 
 func (rtConfig *SpiceConfiguration) ServerBaseUrl() string {
 	return fmt.Sprintf("http://localhost:%d", rtConfig.HttpPort)
+}
+
+func (rtConfig *SpiceConfiguration) WriteToFile() error {
+	configPath := fmt.Sprintf("%s.yaml", constants.SpiceConfigBaseName)
+	configFile, err := os.Create(configPath)
+	if err != nil {
+		return fmt.Errorf("error creating %s: %w", configPath, err)
+	}
+
+	marshalledConfig, err := yaml.Marshal(rtConfig)
+	if err != nil {
+		return err
+	}
+
+	_, err = configFile.Write(marshalledConfig)
+	if err != nil {
+		return fmt.Errorf("error writing %s: %w", configPath, err)
+	}
+
+	err = configFile.Sync()
+	if err != nil {
+		return fmt.Errorf("error writing %s: %s", configPath, err)
+	}
+
+	return nil
 }

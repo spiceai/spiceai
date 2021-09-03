@@ -5,7 +5,6 @@ import (
 	"io"
 	"log"
 	"os"
-	"path/filepath"
 	"reflect"
 	"strconv"
 	"testing"
@@ -31,8 +30,9 @@ func testRuntimeConfigLoads(testConfigPath string) func(*testing.T) {
 	return func(t *testing.T) {
 		testutils.EnsureTestSpiceDirectory(t)
 
-		tempConfigPath := filepath.Join(".spice", "config.yaml")
+		tempConfigPath := "spiceai.config.yaml"
 		copyFile(testConfigPath, tempConfigPath)
+		defer os.Remove(tempConfigPath)
 
 		viper := viper.New()
 		rtcontext := context.CurrentContext()
@@ -65,8 +65,9 @@ func testRuntimeConfigReplacesEnvironmentVariables(testConfigPath string) func(*
 		var expected uint = 12345
 		t.Setenv(testEnvVar, fmt.Sprintf("%d", expected))
 
-		tempConfigPath := filepath.Join(".spice", "config.yaml")
+		tempConfigPath := "spiceai.config.yaml"
 		copyFile(testConfigPath, tempConfigPath)
+		defer os.Remove(tempConfigPath)
 
 		viper := viper.New()
 		rtcontext := context.CurrentContext()

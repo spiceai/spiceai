@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"sync"
 
-	"github.com/fsnotify/fsnotify"
 	"github.com/logrusorgru/aurora"
 	"github.com/spf13/viper"
 	"github.com/spiceai/spiceai/pkg/aiengine"
@@ -35,7 +34,6 @@ var (
 func (r *SpiceRuntime) LoadConfig() error {
 	if r.viper == nil {
 		r.viper = viper.New()
-		r.viper.OnConfigChange(r.configChangeHandler)
 	}
 
 	var err error
@@ -45,19 +43,6 @@ func (r *SpiceRuntime) LoadConfig() error {
 	}
 
 	return err
-}
-
-func (r *SpiceRuntime) configChangeHandler(e fsnotify.Event) {
-	configPath := context.CurrentContext().GetSpiceAppRelativePath(e.Name)
-	log.Println("Detected config change to", configPath)
-
-	var newConfig *config.SpiceConfiguration
-	err := r.viper.Unmarshal(&newConfig)
-	if err != nil {
-		log.Printf("Warning: Ignoring invalid change to %s\n", configPath)
-	}
-
-	r.config = newConfig
 }
 
 func (r *SpiceRuntime) printStartupBanner(mode string) {
