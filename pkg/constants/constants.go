@@ -2,7 +2,7 @@ package constants
 
 const (
 	DotSpice              = ".spice"
-	SpiceConfigBaseName   = "spiceai.config"
+	SpiceConfigBaseName   = "spice.config"
 	SpiceRuntimeFilename  = "spiced"
 	SpicePodFileExtension = ".spicepod"
 	PythonCmd             = "python3"

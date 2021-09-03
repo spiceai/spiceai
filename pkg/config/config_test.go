@@ -30,7 +30,7 @@ func testRuntimeConfigLoads(testConfigPath string) func(*testing.T) {
 	return func(t *testing.T) {
 		testutils.EnsureTestSpiceDirectory(t)
 
-		tempConfigPath := "spiceai.config.yaml"
+		tempConfigPath := "spice.config.yaml"
 		copyFile(testConfigPath, tempConfigPath)
 		defer os.Remove(tempConfigPath)
 
@@ -65,7 +65,7 @@ func testRuntimeConfigReplacesEnvironmentVariables(testConfigPath string) func(*
 		var expected uint = 12345
 		t.Setenv(testEnvVar, fmt.Sprintf("%d", expected))
 
-		tempConfigPath := "spiceai.config.yaml"
+		tempConfigPath := "spice.config.yaml"
 		copyFile(testConfigPath, tempConfigPath)
 		defer os.Remove(tempConfigPath)
 
