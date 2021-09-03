@@ -82,7 +82,7 @@ func testDashboardJsHandler() func(*testing.T) {
 		assert.NoError(t, err)
 
 		assert.EqualValues(t, 200, res.StatusCode)
-		assert.EqualValues(t, "application/javascript; charset=utf-8", res.Header.Get("Content-Type"))
+		assert.EqualValues(t, "application/javascript", res.Header.Get("Content-Type"))
 
 		body, err := ioutil.ReadAll(res.Body)
 		assert.NoError(t, err)

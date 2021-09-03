@@ -14,7 +14,6 @@ const Header: React.FunctionComponent = () => {
       <div className=" mr-4 justify-self-end">
         <span className="uppercase font-bold space-x-2 text-xs text-white">
           <a href="https://docs.spiceai.org">Docs</a>
-          <a href="/acknowledgements">Acknowledgements</a>
         </span>
       </div>
     </header>
