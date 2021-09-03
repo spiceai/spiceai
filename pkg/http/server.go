@@ -370,6 +370,7 @@ func (server *server) Start() error {
 	}
 
 	r.GET("/", dashboardServer.IndexHandler)
+	r.GET("/acknowledgements", dashboardServer.AcknowledgementsHandler)
 	r.GET("/static/js/{file}", dashboardServer.JsHandler)
 	r.GET("/static/css/{file}", dashboardServer.CssHandler)
 	r.GET("/static/media/{file}", dashboardServer.SvgHandler)

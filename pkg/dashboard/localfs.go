@@ -11,6 +11,7 @@ import (
 type DashboardLocalFs struct {
 	rootDir   string
 	indexPath string
+	acknowledgementsPath string
 }
 
 func NewDashboardLocalFs(rootDir string) (*DashboardLocalFs, error) {
@@ -35,10 +36,12 @@ func NewDashboardLocalFs(rootDir string) (*DashboardLocalFs, error) {
 	}
 
 	indexPath := filepath.Join(rootDir, "index.html")
+	acknowledgementsPath := filepath.Join(rootDir, "acknowledgements.txt")
 
 	return &DashboardLocalFs{
 		rootDir:   rootDir,
 		indexPath: indexPath,
+		acknowledgementsPath: acknowledgementsPath,
 	}, nil
 }
 
@@ -46,6 +49,12 @@ func (d *DashboardLocalFs) IndexHandler(ctx *fasthttp.RequestCtx) {
 	contentType := GetContentType("html")
 	ctx.Response.Header.SetContentType(contentType)
 	fasthttp.ServeFile(ctx, d.indexPath)
+}
+
+func (d *DashboardLocalFs) AcknowledgementsHandler(ctx *fasthttp.RequestCtx) {
+	contentType := GetContentType("text")
+	ctx.Response.Header.SetContentType(contentType)
+	fasthttp.ServeFile(ctx, d.acknowledgementsPath)
 }
 
 func (d *DashboardLocalFs) JsHandler(ctx *fasthttp.RequestCtx) {

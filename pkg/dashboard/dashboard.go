@@ -6,6 +6,7 @@ import (
 
 type Dashboard interface {
 	IndexHandler(ctx *fasthttp.RequestCtx)
+	AcknowledgementsHandler(ctx *fasthttp.RequestCtx)
 	JsHandler(ctx *fasthttp.RequestCtx)
 	CssHandler(ctx *fasthttp.RequestCtx)
 	SvgHandler(ctx *fasthttp.RequestCtx)
@@ -21,6 +22,8 @@ func GetContentType(fileType string) string {
 		return "text/css; charset=utf-8"
 	case "svg":
 		return "image/svg+xml"
+	case "text":
+		return "text/plain; charset=utf-8"
 	}
 	return ""
 }
