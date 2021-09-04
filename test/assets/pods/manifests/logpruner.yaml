@@ -1,4 +1,4 @@
-name: logpruner
+name: serverops
 params:
   period: 24h
   interval: 10m

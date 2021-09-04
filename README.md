@@ -75,30 +75,30 @@ A [Spice.ai Pod](https://docs.spiceai.org/concepts/#pod--pod-manifest) is simply
 
 The first Spice.ai Pod you will create and train is based off of a problem that many system administrators are familiar with: **server maintenance**. Application and system logging is critical part of running a production service, but letting those logs build up can cause other issues, especially if those logs end up filling the entire disk! It is simple enough to run a utility at a certain time every day to ensure this doesn't happen, but what if we choose to run the cleanup in the middle of peak traffic to the server?
 
-We will use Spice.ai to train a pod that can intelligently learn when the best times are to run a cleanup job on a server. Let's call this example the `LogPruner`.
+We will use Spice.ai to train a pod that can intelligently learn when the best times are to run different jobs on a server. Let's call this example **ServerOps**.
 
 Clone the Spice.ai quickstarts repo in a directory where you would normally put your code. E.g.
 
 ```bash
 cd $HOME
 git clone https://github.com/spiceai/quickstarts
-cd quickstarts/logpruner
+cd quickstarts/serverops
 ```
 
 In a new terminal window or tab, navigate to the directory and start the Spice runtime in development mode with `spice run`.
 
 ```bash
-cd $HOME/quickstarts/logpruner
+cd $HOME/quickstarts/serverops
 spice run
 ```
 
-In the original terminal instance, add the LogPruner sample pod:
+In the original terminal instance, add the ServerOps sample pod:
 
 ```bash
-spice add quickstarts/logpruner
+spice add quickstarts/serverops
 ```
 
-The Spice CLI will download the LogPruner sample pod manifest and add it to your project at `spicepods/logpruner.yaml`.
+The Spice CLI will download the ServerOps sample pod manifest and add it to your project at `spicepods/serverops.yaml`.
 
 The Spice.ai runtime will then automatically detect the manifest and start your first training run!
 
@@ -106,14 +106,14 @@ The Spice.ai runtime will then automatically detect the manifest and start your 
 
 ### Observe your pod training
 
-Navigate to [http://localhost:8000](http://localhost:8000) in your favorite browser. You will see an overview of your pods. From here, you can click on the `logpruner` pod to see a chart of the pod's training progress.
+Navigate to [http://localhost:8000](http://localhost:8000) in your favorite browser. You will see an overview of your pods. From here, you can click on the `serverops` pod to see a chart of the pod's training progress.
 
 ### Retrain your pod
 
 The runtime will automatically detect changes to your pod manifest and start training. In addition, you can trigger training by using the Spice CLI from within your app directory.
 
 ```bash
-spice train logpruner
+spice train serverops
 ```
 
 ### Get a recommendation from your pod
@@ -121,7 +121,7 @@ spice train logpruner
 After training your pod, you can now fetch a recommendation for an action!
 
 ```bash
-curl http://localhost:8000/api/v0.1/pods/logpruner/recommendation
+curl http://localhost:8000/api/v0.1/pods/serverops/recommendation
 ```
 
 ### Conclusion and next steps
@@ -132,7 +132,7 @@ This is just the start of your journey with AI. Next, try one of the quickstart 
 
 **Try:**
 
-- [Log Pruner sample](https://github.com/spiceai/samples/tree/trunk/logpruner/README.md) - a more in-depth version of the quickstart you just completed, using CPU metrics from your own machine
+- [Log Pruner sample](https://github.com/spiceai/samples/tree/trunk/serverops/README.md) - a more in-depth version of the quickstart you just completed, using CPU metrics from your own machine
 - [Gardener](https://github.com/spiceai/samples/tree/trunk/gardener/README.md) - Intelligently water a simulated garden
 - [Trader](https://github.com/spiceai/quickstarts/tree/trunk/trader/README.md) - a basic Bitcoin trading bot
 
