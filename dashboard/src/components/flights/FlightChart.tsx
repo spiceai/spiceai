@@ -16,7 +16,7 @@ const FlightChart: React.FunctionComponent<FlightChartProps> = (props) => {
   useEffect(() => {
     if (chartRef.current) {
       const labels = props.flight.episodes.map(ep => {
-        return `Ep ${ep.episode}`
+        return `Ep ${ep.episode || 0}`
       })
       const chartCanvas = chartRef.current as ChartItem;
       const chartConfig: ChartConfiguration<'line'> = {
