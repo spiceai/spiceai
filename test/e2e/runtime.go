@@ -83,7 +83,7 @@ func (r *runtimeServer) getObservations(podName string) (string, error) {
 
 func (r *runtimeServer) getFlights(podName string) ([]*runtime_pb.Flight, error) {
 	var data []*runtime_pb.Flight
-	err := r.internalGet(fmt.Sprintf("%s/api/v0.1/pods/%s/flights", r.baseUrl, podName), &data)
+	err := r.internalGet(fmt.Sprintf("%s/api/v0.1/pods/%s/training_runs", r.baseUrl, podName), &data)
 	if err != nil {
 		return nil, err
 	}
@@ -102,7 +102,7 @@ func (r *runtimeServer) waitForTrainingToComplete(podName string, flight string,
 		}
 
 		var flightResponse runtime_pb.Flight
-		url := fmt.Sprintf("%s/api/v0.1/pods/%s/flights/%s", r.baseUrl, podName, flight)
+		url := fmt.Sprintf("%s/api/v0.1/pods/%s/training_runs/%s", r.baseUrl, podName, flight)
 		err := r.internalGet(url, &flightResponse)
 		if err != nil {
 			fmt.Println(err.Error())
