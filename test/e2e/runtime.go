@@ -102,7 +102,7 @@ func (r *runtimeServer) waitForTrainingToComplete(podName string, flight string,
 		}
 
 		var flightResponse runtime_pb.Flight
-		url := fmt.Sprintf("%s/api/v0.1/pods/%s/flights/%s", r.baseUrl, podName, flight)
+		url := fmt.Sprintf("%s/api/v0.1/pods/%s/training_runs/%s", r.baseUrl, podName, flight)
 		err := r.internalGet(url, &flightResponse)
 		if err != nil {
 			fmt.Println(err.Error())

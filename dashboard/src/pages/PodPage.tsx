@@ -24,7 +24,7 @@ const PodPage: React.FunctionComponent<PodProps> = () => {
       { !podError && pod &&
         <div className="mb-2">
           <PodHeader pod={pod}></PodHeader>
-          <h2 className="ml-2 mb-2 font-spice tracking-spice text-s uppercase">Flights</h2>
+          <h2 className="ml-2 mb-2 font-spice tracking-spice text-s uppercase">Training Runs</h2>
           <div className="p-2">
             { !flightsError && flights.map((flight, i) => (
                 <div key={i}>
@@ -34,7 +34,7 @@ const PodPage: React.FunctionComponent<PodProps> = () => {
                 </div>
             ))}
             { (!flights || flights.length === 0) &&
-              <span>Pod has no flights</span>
+              <span>Pod has no training runs.</span>
             }
           </div>
         </div>

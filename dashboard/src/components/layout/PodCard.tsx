@@ -52,7 +52,7 @@ const PodCard: React.FunctionComponent<PodCardProps> = (props) => {
       </div>
       <div className="flex-grow"></div>
       <div className="w-60">
-        <span className="text-xs">Average flight rewards (last 5)</span>
+        <span className="text-xs">Average rewards (last 5 training runs)</span>
         <Sparklines data={sparkData} min={0} limit={5}>
           <SparklinesLine color={hasFlightData ? 'blue' : undefined} />
         </Sparklines>

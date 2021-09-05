@@ -379,9 +379,9 @@ func (server *server) Start() error {
 	r.POST("/api/v0.1/pods/{pod}/models/{tag}/import", apiPostImportHandler)
 
 	// Flights
-	r.GET("/api/v0.1/pods/{pod}/flights", apiGetFlightsHandler)
-	r.GET("/api/v0.1/pods/{pod}/flights/{flight}", apiGetFlightHandler)
-	r.POST("/api/v0.1/pods/{pod}/flights/{flight}/episodes", apiPostFlightEpisodeHandler)
+	r.GET("/api/v0.1/pods/{pod}/training_runs", apiGetFlightsHandler)
+	r.GET("/api/v0.1/pods/{pod}/training_runs/{flight}", apiGetFlightHandler)
+	r.POST("/api/v0.1/pods/{pod}/training_runs/{flight}/episodes", apiPostFlightEpisodeHandler)
 
 	serverLogger, err := zap.NewStdLogAt(zaplog, zap.DebugLevel)
 	if err != nil {

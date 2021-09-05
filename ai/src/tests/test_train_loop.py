@@ -97,7 +97,7 @@ class TrainingLoopTests(unittest.TestCase):
             episode_data = episode_result["episode_data"]
             self.assertEqual(
                 episode_result["request_url"],
-                f"http://localhost:8000/api/v0.1/pods/{pod_name}/flights/{flight}/episodes",
+                f"http://localhost:8000/api/v0.1/pods/{pod_name}/training_runs/{flight}/episodes",
             )
             self.assertEqual(episode_data["episode"], index)
             self.assertTrue(episode_data["start"])
