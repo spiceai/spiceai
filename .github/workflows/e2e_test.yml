@@ -206,7 +206,6 @@ jobs:
       - name: "Execute test - trader (algorithm: ${{ matrix.algorithm }})"
         run: |
           cp ./test/assets/data/csv/COINBASE_BTCUSD\,\ 30.csv .
-          export SPICE_GH_TOKEN=${{ secrets.GITHUB_TOKEN }}
           export SPICE_DEEPRL_ALGORITHM="${{ matrix.algorithm }}"
           ./spice version --context ${{ matrix.context }}
           ./spice add test/Trader@0.2.0

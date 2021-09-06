@@ -105,9 +105,9 @@ getLatestRelease() {
     local latest_release=""
 
     if [ "$SPICE_HTTP_REQUEST_CLI" == "curl" ]; then
-        latest_release=$(curl -H "Authorization: token ${SPICE_GH_TOKEN}" -s $spiceReleaseUrl | grep \"tag_name\" | grep -v rc | grep spice\" | awk 'NR==1{print $2}' |  sed -n 's/\"\(.*\)\",/\1/p')
+        latest_release=$(curl -s $spiceReleaseUrl | grep \"tag_name\" | grep -v rc | grep spice\" | awk 'NR==1{print $2}' |  sed -n 's/\"\(.*\)\",/\1/p')
     else
-        latest_release=$(wget -q --header="Accept: application/json" --header="Authorization: token ${SPICE_GH_TOKEN}" -O - $spiceReleaseUrl | grep \"tag_name\" | grep -v rc | grep spice\" | awk 'NR==1{print $2}' |  sed -n 's/\"\(.*\)\",/\1/p')
+        latest_release=$(wget -q --header="Accept: application/json" -O - $spiceReleaseUrl | grep \"tag_name\" | grep -v rc | grep spice\" | awk 'NR==1{print $2}' |  sed -n 's/\"\(.*\)\",/\1/p')
     fi
 
     ret_val=$latest_release
@@ -127,8 +127,7 @@ downloadFile() {
     echo "Downloading $DOWNLOAD_URL ..."
 
     function gh_curl() {
-      curl -H "Authorization: token $SPICE_GH_TOKEN" \
-          -H "Accept: application/vnd.github.v3.raw" \
+      curl -H "Accept: application/vnd.github.v3.raw" \
           $@
     }
 
@@ -142,11 +141,11 @@ downloadFile() {
 
     if [ "$SPICE_HTTP_REQUEST_CLI" == "curl" ]; then
         curl -H "Accept:application/octet-stream" -SsL \
-            https://$SPICE_GH_TOKEN:@api.github.com/repos/$GITHUB_ORG/$GITHUB_REPO/releases/assets/$asset_id \
+            https://api.github.com/repos/$GITHUB_ORG/$GITHUB_REPO/releases/assets/$asset_id \
             -o "$ARTIFACT_TMP_FILE"
     else
         wget -q --auth-no-challenge --header='Accept:application/octet-stream' \
-            https://$SPICE_GH_TOKEN:@api.github.com/repos/$GITHUB_ORG/$GITHUB_REPO/releases/assets/$asset_id \
+            https://api.github.com/repos/$GITHUB_ORG/$GITHUB_REPO/releases/assets/$asset_id \
             -O "$ARTIFACT_TMP_FILE"
     fi
 
@@ -227,16 +226,6 @@ installCompleted() {
 # main
 # -----------------------------------------------------------------------------
 trap "fail_trap" EXIT
-
-if [[ -z "$SPICE_GH_TOKEN" ]]; then
-    if [[ -z "$GITHUB_TOKEN" ]]; then
-        echo "ERROR: Please set env var SPICE_GH_TOKEN to your GitHub Token!"
-        exit 1
-    else
-        echo "Using $GITHUB_TOKEN as $SPICE_GH_TOKEN"
-        export SPICE_GH_TOKEN="$GITHUB_TOKEN"
-    fi
-fi
 
 mkdir -p $SPICE_CLI_INSTALL_DIR
 
