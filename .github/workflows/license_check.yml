@@ -28,8 +28,8 @@ jobs:
       EXCLUDE_PYTHON_PACKAGES: pyzmq
 
       FORBIDDEN_LICENSE_CHECK: |
-        grep -E "GPL|CC-BY-SA|CC-BY-NC|CC-BY-NC-SA|CC-BY-NC-ND|APSL|CPAL|EUPL|NPOSL|OSL|SSPL|Parity|RPL|QPL|Sleepycat|copyleft|CDDL|CPL|EPL|ErlPL|IPL|MS-RL|SPL|Facebook|Commons-Clause" | grep . && exit 1 || echo "ok" 
-        
+        grep -E "GPL|CC-BY-SA|CC-BY-NC|CC-BY-NC-SA|CC-BY-NC-ND|APSL|CPAL|EUPL|NPOSL|OSL|SSPL|Parity|RPL|QPL|Sleepycat|copyleft|CDDL|CPL|EPL|ErlPL|IPL|MS-RL|SPL|Facebook|Commons-Clause" | grep . && exit 1 || echo "ok"
+
     steps:
       - uses: actions/checkout@v2
 
@@ -38,17 +38,6 @@ jobs:
         with:
           go-version: ${{ env.GOVER }}
 
-      - name: write .netrc
-        env:
-          PAT: ${{ secrets.PAT_PHILLIP }}
-        run: |
-          echo "machine github.com login phillipleblanc password $PAT" > ~/.netrc
-
-      - name: go get github.com/spiceai/data-components-contrib
-        env:
-          GONOSUMDB: github.com/spiceai/data-components-contrib
-        run: go get github.com/spiceai/data-components-contrib
-
       - name: Install go-licences
         run: go get github.com/google/go-licenses
 
@@ -56,7 +45,7 @@ jobs:
         working-directory: cmd/spice
         run: |
           go-licenses csv . |& ${{ env.FORBIDDEN_LICENSE_CHECK }}
-      
+
       - name: Check spiced licenses
         working-directory: cmd/spiced
         run: |

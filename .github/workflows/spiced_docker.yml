@@ -49,15 +49,12 @@ jobs:
           push: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/trunk' }}
           build-args: |
             REL_VERSION=${{ env.REL_VERSION }}
-            GH_USERNAME=phillipleblanc
           tags: |
             ghcr.io/spiceai/spiced:latest
             ghcr.io/spiceai/spiced:v${{ env.REL_VERSION }}
             ghcr.io/spiceai/spiced:v${{ env.REL_VERSION }}-${{ matrix.target_arch }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          secrets: |
-            "gh_pat=${{ secrets.PAT_PHILLIP }}"
 
       - name: Image digest
         run: echo ${{ steps.docker_build.outputs.digest }}
