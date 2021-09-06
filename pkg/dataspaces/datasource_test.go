@@ -79,7 +79,7 @@ func testActionsFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 		switch ds.Name() {
 		case "local/portfolio":
 			expected = map[string]string{
-				"local.portfolio.buy":  "local.portfolio.usd_balance -= args.price\nlocal.portfolio.btc_balance += 1",
+				"local.portfolio.buy":  "local.portfolio.usd_balance -= args.price\nlocal.portfolio.btc_balance += 1.1",
 				"local.portfolio.sell": "local.portfolio.usd_balance += args.price\nlocal.portfolio.btc_balance -= 1",
 			}
 		case "coinbase/btcusd":
