@@ -92,7 +92,7 @@ It is a best practice to use a virtual environment (venv) when working with Pyth
 $ cd ai/src
 # Ensure python 3+ is installed
 $ python --version
-Python 3.9.5
+Python 3.8.12
 $ python -m venv venv
 ```
 
