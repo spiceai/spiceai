@@ -353,13 +353,12 @@ func NewServer(port uint) *server {
 
 func (server *server) Start() error {
 	r := router.New()
-	r.GET("/health", healthHandler)
+	r.ANY("/health", healthHandler)
 
 	// Static Dashboard
 	dashboardServer := dashboard.NewDashboardEmbedded()
 	var err error
 
-	r.GET("/", dashboardServer.IndexHandler)
 	r.GET("/manifest.json", dashboardServer.ManifestJsonHandler)
 	r.GET("/acknowledgements", dashboardServer.AcknowledgementsHandler)
 	r.GET("/static/js/{file}", dashboardServer.JsHandler)
@@ -383,6 +382,9 @@ func (server *server) Start() error {
 	r.GET("/api/v0.1/pods/{pod}/training_runs", apiGetFlightsHandler)
 	r.GET("/api/v0.1/pods/{pod}/training_runs/{flight}", apiGetFlightHandler)
 	r.POST("/api/v0.1/pods/{pod}/training_runs/{flight}/episodes", apiPostFlightEpisodeHandler)
+
+	r.GET("/{filepath:*}", dashboardServer.IndexHandler)
+	r.GET("/", dashboardServer.IndexHandler)
 
 	serverLogger, err := zap.NewStdLogAt(zaplog, zap.DebugLevel)
 	if err != nil {
