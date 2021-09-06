@@ -360,8 +360,6 @@ func (server *server) Start() error {
 	var err error
 
 	r.GET("/", dashboardServer.IndexHandler)
-	r.GET("/{filepath:*}", dashboardServer.IndexHandler)
-
 	r.GET("/manifest.json", dashboardServer.ManifestJsonHandler)
 	r.GET("/acknowledgements", dashboardServer.AcknowledgementsHandler)
 	r.GET("/static/js/{file}", dashboardServer.JsHandler)
