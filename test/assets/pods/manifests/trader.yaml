@@ -17,7 +17,7 @@ dataspaces:
     actions:
       buy: |
         usd_balance -= args.price
-        btc_balance += 1
+        btc_balance += 1.1
       sell: |
         usd_balance += args.price
         btc_balance -= 1

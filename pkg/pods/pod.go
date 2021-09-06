@@ -249,6 +249,25 @@ func (pod *Pod) Actions() map[string]string {
 	return actions
 }
 
+func (pod *Pod) ActionsArgs() []string {
+	actionsArgsMap := make(map[string]bool)
+	for _, globalAction := range pod.PodSpec.Actions {
+		if globalAction.Do == nil {
+			continue
+		}
+		for argName := range globalAction.Do.Args {
+			actionsArgsMap[fmt.Sprintf("args.%s", argName)] = true
+		}
+	}
+
+	actionsArgs := make([]string, 0, len(actionsArgsMap))
+	for arg := range actionsArgsMap {
+		actionsArgs = append(actionsArgs, arg)
+	}
+
+	return actionsArgs
+}
+
 func (pod *Pod) Rewards() map[string]string {
 	rewards := make(map[string]string)
 
