@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path"
 	"strings"
+	"syscall"
 
 	"github.com/spf13/viper"
 	"github.com/spiceai/spiceai/pkg/config"
@@ -74,6 +75,9 @@ func (c *DockerContext) PodsDir() string {
 }
 
 func (c *DockerContext) Init() error {
+	// Ensure any perms set by this process are applied as intended
+	syscall.Umask(0)
+
 	return nil
 }
 
