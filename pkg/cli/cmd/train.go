@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+	"io/ioutil"
 	"net/http"
 	"os"
 
@@ -68,19 +69,32 @@ spice train logpruner.yaml
 
 		err = util.IsRuntimeServerHealthy(serverBaseUrl, http.DefaultClient)
 		if err != nil {
-			fmt.Printf("failed to reach %s. is the spice runtime running?", serverBaseUrl)
+			fmt.Printf("failed to reach %s. is the spice runtime running?\n", serverBaseUrl)
 			return
 		}
 
 		trainUrl := fmt.Sprintf("%s/api/v0.1/pods/%s/train", serverBaseUrl, pod.Name)
 		response, err := http.DefaultClient.Post(trainUrl, "application/json", nil)
 		if err != nil {
-			fmt.Printf("failed to start training: %s", err.Error())
+			fmt.Printf("failed to start training: %s\n", err.Error())
 			return
 		}
 
 		if response.StatusCode != 200 {
-			fmt.Printf("failed to start training: %s", response.Status)
+			body, err := ioutil.ReadAll(response.Body)
+			defer response.Body.Close()
+
+			if err != nil {
+				fmt.Printf("failed to start training: %s\n", err.Error())
+				return
+			}
+
+			if len(body) > 0 {
+				fmt.Printf("failed to start training: %s\n", body)
+			} else {
+				fmt.Printf("failed to start training: %s\n", response.Status)
+			}
+
 			return
 		}
 
