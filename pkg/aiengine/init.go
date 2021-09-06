@@ -137,10 +137,6 @@ func getPodInitForTraining(pod *pods.Pod) *aiengine_pb.InitRequest {
 }
 
 func replaceDotNotatedFieldNames(content string, fieldNames []string) string {
-	if strings.Contains(content, "args.price") {
-		fmt.Println(content)
-		fmt.Printf("%v\n", fieldNames)
-	}
 	newContent := content
 	for _, fieldName := range fieldNames {
 		newContent = strings.ReplaceAll(newContent, fieldName, strings.ReplaceAll(fieldName, ".", "_"))
