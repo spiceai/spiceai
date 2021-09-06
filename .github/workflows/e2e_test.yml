@@ -105,10 +105,10 @@ jobs:
     steps:
       - uses: actions/checkout@v2
 
-      - name: Set up Python 3.8.12
+      - name: Set up Python 3.8
         uses: actions/setup-python@v1
         with:
-          python-version: 3.8.12
+          python-version: 3.8
 
       - name: Cache PIP
         id: cache-pip
@@ -139,11 +139,11 @@ jobs:
     steps:
       - uses: actions/checkout@v2
 
-      - name: Set up Python 3.8.12
+      - name: Set up Python 3.8
         if: matrix.context == 'metal'
         uses: actions/setup-python@v1
         with:
-          python-version: 3.8.12
+          python-version: 3.8
 
       - name: Cache PIP
         if: matrix.context == 'metal'
@@ -231,11 +231,11 @@ jobs:
         with:
           go-version: ${{ env.GOVER }}
 
-      - name: Set up Python 3.8.12
+      - name: Set up Python 3.8
         if: matrix.context == 'metal'
         uses: actions/setup-python@v1
         with:
-          python-version: 3.8.12
+          python-version: 3.8
 
       - name: Cache PIP
         if: matrix.context == 'metal'
