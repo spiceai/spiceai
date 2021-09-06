@@ -17,7 +17,7 @@ type GitHubClient struct {
 	Token string
 }
 
-func NewGitHubClientFromPath(path string, token string) (*GitHubClient, error) {
+func NewGitHubClientFromPath(path string) (*GitHubClient, error) {
 	gitHubPathSplit := strings.Split(path, "/")
 
 	if gitHubPathSplit[0] != "github.com" {
@@ -27,14 +27,13 @@ func NewGitHubClientFromPath(path string, token string) (*GitHubClient, error) {
 	owner := gitHubPathSplit[1]
 	repo := gitHubPathSplit[2]
 
-	return NewGitHubClient(owner, repo, token), nil
+	return NewGitHubClient(owner, repo), nil
 }
 
-func NewGitHubClient(owner string, repo string, token string) *GitHubClient {
+func NewGitHubClient(owner string, repo string) *GitHubClient {
 	return &GitHubClient{
 		Owner: owner,
 		Repo:  repo,
-		Token: token,
 	}
 }
 

@@ -10,7 +10,7 @@ import (
 
 var (
 	assetNameMemo string
-	githubClient  = NewGitHubClient(runtimeOwner, runtimeRepo, GetGitHubTokenFromEnv())
+	githubClient  = NewGitHubClient(runtimeOwner, runtimeRepo)
 )
 
 const (
