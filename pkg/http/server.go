@@ -353,36 +353,44 @@ func NewServer(port uint) *server {
 
 func (server *server) Start() error {
 	r := router.New()
-	r.ANY("/health", healthHandler)
+	r.GET("/health", healthHandler)
 
 	// Static Dashboard
 	dashboardServer := dashboard.NewDashboardEmbedded()
 	var err error
 
-	r.GET("/", dashboardServer.IndexHandler)
-	r.GET("/manifest.json", dashboardServer.ManifestJsonHandler)
+	api := r.Group("/api/v0.1")
+	{
+		// Pods
+		api.GET("/pods", apiPodsHandler)
+		api.GET("/pods/{pod}", apiPodHandler)
+		api.POST("/pods/{pod}/train", apiPodTrainHandler)
+		api.GET("/pods/{pod}/observations", apiGetObservationsHandler)
+		api.POST("/pods/{pod}/observations", apiPostObservationsHandler)
+		api.GET("/pods/{pod}/recommendation", apiRecommendationHandler)
+		api.GET("/pods/{pod}/models/{tag}/recommendation", apiRecommendationHandler)
+		api.POST("/pods/{pod}/export", apiPostExportHandler)
+		api.POST("/pods/{pod}/models/{tag}/export", apiPostExportHandler)
+		api.POST("/pods/{pod}/import", apiPostImportHandler)
+		api.POST("/pods/{pod}/models/{tag}/import", apiPostImportHandler)
+
+		// Flights
+		api.GET("/pods/{pod}/training_runs", apiGetFlightsHandler)
+		api.GET("/pods/{pod}/training_runs/{flight}", apiGetFlightHandler)
+		api.POST("/pods/{pod}/training_runs/{flight}/episodes", apiPostFlightEpisodeHandler)
+	}
+
+	static := r.Group("/static")
+	{
+		static.GET("/js/{file}", dashboardServer.JsHandler)
+		static.GET("/css/{file}", dashboardServer.CssHandler)
+		static.GET("/media/{file}", dashboardServer.SvgHandler)
+	}
+
 	r.GET("/acknowledgements", dashboardServer.AcknowledgementsHandler)
-	r.GET("/static/js/{file}", dashboardServer.JsHandler)
-	r.GET("/static/css/{file}", dashboardServer.CssHandler)
-	r.GET("/static/media/{file}", dashboardServer.SvgHandler)
-
-	// Pods
-	r.GET("/api/v0.1/pods", apiPodsHandler)
-	r.GET("/api/v0.1/pods/{pod}", apiPodHandler)
-	r.POST("/api/v0.1/pods/{pod}/train", apiPodTrainHandler)
-	r.GET("/api/v0.1/pods/{pod}/observations", apiGetObservationsHandler)
-	r.POST("/api/v0.1/pods/{pod}/observations", apiPostObservationsHandler)
-	r.GET("/api/v0.1/pods/{pod}/recommendation", apiRecommendationHandler)
-	r.GET("/api/v0.1/pods/{pod}/models/{tag}/recommendation", apiRecommendationHandler)
-	r.POST("/api/v0.1/pods/{pod}/export", apiPostExportHandler)
-	r.POST("/api/v0.1/pods/{pod}/models/{tag}/export", apiPostExportHandler)
-	r.POST("/api/v0.1/pods/{pod}/import", apiPostImportHandler)
-	r.POST("/api/v0.1/pods/{pod}/models/{tag}/import", apiPostImportHandler)
-
-	// Flights
-	r.GET("/api/v0.1/pods/{pod}/training_runs", apiGetFlightsHandler)
-	r.GET("/api/v0.1/pods/{pod}/training_runs/{flight}", apiGetFlightHandler)
-	r.POST("/api/v0.1/pods/{pod}/training_runs/{flight}/episodes", apiPostFlightEpisodeHandler)
+	r.GET("/manifest.json", dashboardServer.ManifestJsonHandler)
+	r.GET("/{filepath:*}", dashboardServer.IndexHandler)
+	r.GET("/", dashboardServer.IndexHandler)
 
 	serverLogger, err := zap.NewStdLogAt(zaplog, zap.DebugLevel)
 	if err != nil {
