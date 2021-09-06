@@ -81,6 +81,11 @@ spice train logpruner.yaml
 		}
 
 		if response.StatusCode != 200 {
+			if response.StatusCode == 404 {
+				fmt.Printf("failed to start training.  the pod '%s' cannot be found.  has it been added?", podNameOrPath)
+				return
+			}
+
 			body, err := ioutil.ReadAll(response.Body)
 			defer response.Body.Close()
 
