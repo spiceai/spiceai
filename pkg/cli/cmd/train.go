@@ -80,7 +80,12 @@ spice train logpruner.yaml
 		}
 
 		if response.StatusCode != 200 {
-			fmt.Printf("failed to start training: %s", response.Status)
+			if response.StatusCode == 404 {
+				fmt.Printf("failed to start training.  the pod '%s' cannot be found.  has it been added?", podNameOrPath)
+			} else {
+				fmt.Printf("failed to start training: %s", response.Status)
+			}
+			
 			return
 		}
 
