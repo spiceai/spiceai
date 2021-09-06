@@ -375,9 +375,9 @@ func (server *server) Start() error {
 		api.POST("/pods/{pod}/models/{tag}/import", apiPostImportHandler)
 
 		// Flights
-		api.GET("/api/v0.1/pods/{pod}/training_runs", apiGetFlightsHandler)
-		api.GET("/api/v0.1/pods/{pod}/training_runs/{flight}", apiGetFlightHandler)
-		api.POST("/api/v0.1/pods/{pod}/training_runs/{flight}/episodes", apiPostFlightEpisodeHandler)
+		api.GET("/pods/{pod}/training_runs", apiGetFlightsHandler)
+		api.GET("/pods/{pod}/training_runs/{flight}", apiGetFlightHandler)
+		api.POST("/pods/{pod}/training_runs/{flight}/episodes", apiPostFlightEpisodeHandler)
 	}
 
 	static := r.Group("/static")
