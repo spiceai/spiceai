@@ -42,20 +42,16 @@ jobs:
 
     strategy:
       matrix:
-        os: [self-hosted, ubuntu-latest, windows-latest, macOS-latest]
+        os: [self-hosted, ubuntu-latest, macOS-latest]
         target_arch: [amd64, arm64]
         include:
           - os: ubuntu-latest
             target_os: linux
-          - os: windows-latest
-            target_os: windows
           - os: macOS-latest
             target_os: darwin
           - os: self-hosted
             target_os: darwin
         exclude:
-          - os: windows-latest
-            target_arch: arm64
           - os: ubuntu-latest
             target_arch: arm64
           - os: macOS-latest
@@ -74,21 +70,23 @@ jobs:
         with:
           go-version: ${{ env.GOVER }}
 
+      - name: write .netrc
+        env:
+          PAT: ${{ secrets.PAT_PHILLIP }}
+        run: |
+          echo "machine github.com login phillipleblanc password $PAT" > ~/.netrc
+          echo "machine github.com login phillipleblanc password $PAT" > ~/_netrc
+
+      - name: go get github.com/spiceai/data-components-contrib
+        env:
+          GONOSUMDB: github.com/spiceai/data-components-contrib
+        run: go get github.com/spiceai/data-components-contrib
+
       - name: Download dashboard
         uses: actions/download-artifact@v2
         with:
           name: dashboard_build
           path: pkg/dashboard/build
-
-      - name: Set GOMODCACHE
-        run: |
-          echo "GOMODCACHE=$(go env GOMODCACHE)" >> $GITHUB_ENV
-      
-      - name: Cache Go modules
-        uses: actions/cache@v2
-        with:
-          path: ${{ env.GOMODCACHE }}
-          key: ${{ hashFiles('go.sum', 'go.mod') }}
 
       - name: Build spiced
         run: make

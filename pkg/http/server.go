@@ -7,11 +7,11 @@ import (
 	"time"
 
 	"github.com/fasthttp/router"
+	"github.com/spiceai/data-components-contrib/dataprocessors"
+	"github.com/spiceai/data-components-contrib/dataprocessors/csv"
 	"github.com/spiceai/spiceai/pkg/aiengine"
 	"github.com/spiceai/spiceai/pkg/api"
 	"github.com/spiceai/spiceai/pkg/dashboard"
-	"github.com/spiceai/spiceai/pkg/dataprocessors"
-	"github.com/spiceai/spiceai/pkg/dataprocessors/csv"
 	"github.com/spiceai/spiceai/pkg/flights"
 	"github.com/spiceai/spiceai/pkg/loggers"
 	"github.com/spiceai/spiceai/pkg/pods"
@@ -21,8 +21,7 @@ import (
 )
 
 type ServerConfig struct {
-	Port          uint
-	DashboardPath *string
+	Port uint
 }
 
 type server struct {
@@ -344,11 +343,10 @@ func apiPostImportHandler(ctx *fasthttp.RequestCtx) {
 	ctx.Response.SetStatusCode(200)
 }
 
-func NewServer(port uint, dashboardPath *string) *server {
+func NewServer(port uint) *server {
 	return &server{
 		config: ServerConfig{
-			Port:          port,
-			DashboardPath: dashboardPath,
+			Port: port,
 		},
 	}
 }
@@ -358,18 +356,11 @@ func (server *server) Start() error {
 	r.GET("/health", healthHandler)
 
 	// Static Dashboard
-	var dashboardServer dashboard.Dashboard
+	dashboardServer := dashboard.NewDashboardEmbedded()
 	var err error
-	if server.config.DashboardPath != nil {
-		dashboardServer, err = dashboard.NewDashboardLocalFs(*server.config.DashboardPath)
-		if err != nil {
-			return fmt.Errorf("failed to initialize dashboard: %w", err)
-		}
-	} else {
-		dashboardServer = dashboard.NewDashboardEmbedded()
-	}
 
 	r.GET("/", dashboardServer.IndexHandler)
+	r.GET("/acknowledgements", dashboardServer.AcknowledgementsHandler)
 	r.GET("/static/js/{file}", dashboardServer.JsHandler)
 	r.GET("/static/css/{file}", dashboardServer.CssHandler)
 	r.GET("/static/media/{file}", dashboardServer.SvgHandler)
@@ -388,9 +379,9 @@ func (server *server) Start() error {
 	r.POST("/api/v0.1/pods/{pod}/models/{tag}/import", apiPostImportHandler)
 
 	// Flights
-	r.GET("/api/v0.1/pods/{pod}/flights", apiGetFlightsHandler)
-	r.GET("/api/v0.1/pods/{pod}/flights/{flight}", apiGetFlightHandler)
-	r.POST("/api/v0.1/pods/{pod}/flights/{flight}/episodes", apiPostFlightEpisodeHandler)
+	r.GET("/api/v0.1/pods/{pod}/training_runs", apiGetFlightsHandler)
+	r.GET("/api/v0.1/pods/{pod}/training_runs/{flight}", apiGetFlightHandler)
+	r.POST("/api/v0.1/pods/{pod}/training_runs/{flight}/episodes", apiPostFlightEpisodeHandler)
 
 	serverLogger, err := zap.NewStdLogAt(zaplog, zap.DebugLevel)
 	if err != nil {

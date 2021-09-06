@@ -20,6 +20,7 @@ import (
 
 func TestDashboard(t *testing.T) {
 	t.Run("DashboardIndexHandler() - GET returns dashboard content", testDashboardIndexHandler())
+	t.Run("DashboardAcknowledgementsHandler() - GET returns acknowledgements content", testDashboardAcknowledgementsHandler())
 	t.Run("DashboardJsHandler() - GET returns JS content", testDashboardJsHandler())
 	t.Run("DashboardCssHandler() - GET returns CSS content", testDashboardCssHandler())
 	t.Run("DashboardSvgHandler() - GET returns SVG content", testDashboardSvgHandler())
@@ -45,6 +46,26 @@ func testDashboardIndexHandler() func(*testing.T) {
 	}
 }
 
+func testDashboardAcknowledgementsHandler() func(*testing.T) {
+	return func(t *testing.T) {
+		r, err := http.NewRequest("GET", "http://test/acknowledgements", nil)
+		assert.NoError(t, err)
+
+		server := dashboard.NewDashboardEmbedded()
+
+		res, err := serve("/acknowledgements", server.AcknowledgementsHandler, r)
+		assert.NoError(t, err)
+
+		assert.EqualValues(t, 200, res.StatusCode)
+		assert.EqualValues(t, "text/plain; charset=utf-8", res.Header.Get("Content-Type"))
+
+		body, err := ioutil.ReadAll(res.Body)
+		assert.NoError(t, err)
+
+		assert.Contains(t, string(body), "MIT")
+	}
+}
+
 func testDashboardJsHandler() func(*testing.T) {
 	return func(t *testing.T) {
 		url, err := getFirstStaticAssetUrl("js")
@@ -61,7 +82,7 @@ func testDashboardJsHandler() func(*testing.T) {
 		assert.NoError(t, err)
 
 		assert.EqualValues(t, 200, res.StatusCode)
-		assert.EqualValues(t, "application/javascript; charset=utf-8", res.Header.Get("Content-Type"))
+		assert.EqualValues(t, "application/javascript", res.Header.Get("Content-Type"))
 
 		body, err := ioutil.ReadAll(res.Body)
 		assert.NoError(t, err)

@@ -10,6 +10,6 @@ test('renders docs header', () => {
 
 test('renders github.com/spiceai/spiceai footer', () => {
   render(<App />);
-  const linkElement = screen.getByText(/github\.com\/spiceai\/spiceai/i);
+  const linkElement = screen.getByText(/spiceai\.org/i);
   expect(linkElement).toBeInTheDocument();
 });

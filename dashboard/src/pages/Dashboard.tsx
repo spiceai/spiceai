@@ -12,6 +12,13 @@ const Dashboard: React.FunctionComponent = () => {
       { podsError &&
         <p>An error occurred while getting pods: { podsError }</p>
       }
+      {
+        !podsError && pods.length == 0 &&
+        <div>
+          <p>No pods exist yet.</p>
+          <p className="mt-2">Initialize one with <span className="bg-gray-300 py-1 px-1.5 rounded">spice pod init</span> or add from <a href="https://spicerack.org">spicerack.org</a> with <span className="bg-gray-300 py-1 px-1.5 rounded">spice add &lt;pod&gt;</span>.</p>
+        </div>
+      }
       { !podsError && pods.map((pod, i) => (
         <div key={i}>
           <PodCard

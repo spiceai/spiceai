@@ -40,9 +40,7 @@ def train_agent(
     with training_lock:
         ACTION_SIZE = len(data_manager.action_names)
 
-        REQUEST_URL = (
-            f"http://localhost:8000/api/v0.1/pods/{pod_name}/flights/{flight}/episodes"
-        )
+        REQUEST_URL = f"http://localhost:8000/api/v0.1/pods/{pod_name}/training_runs/{flight}/episodes"
 
         TRAINING_EPISODES = number_episodes
         NOT_LEARNING_THRESHOLD = 3

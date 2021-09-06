@@ -4,9 +4,14 @@ Spice.ai is built upon a foundation of first principles.
 
 ## Summary
 
+- Developer experience first
 - API first
 - Composable from community driven-components
 - Data is always in time-based intervals
+
+### Developer experience first
+
+- The goal of Spice.ai is to make creating intelligent applications as easy as possible, and so developer experience comes first
 
 ### API first
 

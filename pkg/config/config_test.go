@@ -1,10 +1,10 @@
 package config_test
 
 import (
+	"fmt"
 	"io"
 	"log"
 	"os"
-	"path/filepath"
 	"reflect"
 	"strconv"
 	"testing"
@@ -30,8 +30,9 @@ func testRuntimeConfigLoads(testConfigPath string) func(*testing.T) {
 	return func(t *testing.T) {
 		testutils.EnsureTestSpiceDirectory(t)
 
-		tempConfigPath := filepath.Join(".spice", "config.yaml")
+		tempConfigPath := "spice.config.yaml"
 		copyFile(testConfigPath, tempConfigPath)
+		defer os.Remove(tempConfigPath)
 
 		viper := viper.New()
 		rtcontext := context.CurrentContext()
@@ -55,34 +56,29 @@ func testRuntimeConfigReplacesEnvironmentVariables(testConfigPath string) func(*
 	return func(t *testing.T) {
 		testutils.EnsureTestSpiceDirectory(t)
 
-		// Go 1.17 includes a Setenv on the testing pkg, but for now we will just set/unset with the os package
-		testEnvVar := "SPICE_DASHBOARD_TO_REPLACE"
+		testEnvVar := "SPICE_PORT_TO_REPLACE"
 		if os.Getenv(testEnvVar) != "" {
 			t.Errorf("%s must not be set during tests", testEnvVar)
+			return
 		}
 
-		expected := "replacedvalue"
-		os.Setenv(testEnvVar, expected)
+		var expected uint = 12345
+		t.Setenv(testEnvVar, fmt.Sprintf("%d", expected))
 
-		tempConfigPath := filepath.Join(".spice", "config.yaml")
+		tempConfigPath := "spice.config.yaml"
 		copyFile(testConfigPath, tempConfigPath)
+		defer os.Remove(tempConfigPath)
 
 		viper := viper.New()
 		rtcontext := context.CurrentContext()
 		spiceConfiguration, err := config.LoadRuntimeConfiguration(viper, rtcontext.AppDir())
 		if err != nil {
 			t.Error(err)
-			os.Unsetenv(testEnvVar)
 			return
 		}
 
-		actual := *spiceConfiguration.CustomDashboardPath
-		if !assert.Equal(t, expected, actual) {
-			t.Errorf("Expected:\n%v\nGot:\n%v", expected, actual)
-			os.Unsetenv(testEnvVar)
-		}
-
-		os.Unsetenv(testEnvVar)
+		actual := spiceConfiguration.HttpPort
+		assert.Equal(t, expected, actual, "Expected:\n%d\nGot:\n%d", expected, actual)
 	}
 }
 
