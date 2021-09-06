@@ -51,7 +51,7 @@
     "test": "react-scripts test",
     "test-ci": "react-scripts test --watchAll=false",
     "tsc": "tsc",
-    "set-version": "sed -i s/REACT_APP_SPICE_VERSION=.*$/REACT_APP_SPICE_VERSION=$(cat ../version.txt)/g .env"
+    "set-version": "cat .env | sed s/REACT_APP_SPICE_VERSION=.*$/REACT_APP_SPICE_VERSION=$(cat ../version.txt)/g > .env"
   },
   "eslintConfig": {
     "extends": [
