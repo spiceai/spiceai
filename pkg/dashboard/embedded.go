@@ -14,6 +14,9 @@ import (
 //go:embed build/index.html
 var contentIndexHtml []byte
 
+//go:embed build/manifest.json
+var contentManifestJson []byte
+
 //go:embed build/acknowledgements.txt
 var contentAcknowledgementsText []byte
 
@@ -36,6 +39,12 @@ func (d *DashboardEmbedded) IndexHandler(ctx *fasthttp.RequestCtx) {
 	contentType := GetContentType("html")
 	ctx.Response.Header.SetContentType(contentType)
 	ctx.Response.SetBody(contentIndexHtml)
+}
+
+func (d *DashboardEmbedded) ManifestJsonHandler(ctx *fasthttp.RequestCtx) {
+	contentType := GetContentType("json")
+	ctx.Response.Header.SetContentType(contentType)
+	ctx.Response.SetBody(contentManifestJson)
 }
 
 func (d *DashboardEmbedded) AcknowledgementsHandler(ctx *fasthttp.RequestCtx) {
