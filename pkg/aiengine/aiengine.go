@@ -14,8 +14,6 @@ import (
 	"github.com/logrusorgru/aurora"
 	"github.com/spiceai/spiceai/pkg/context"
 	"github.com/spiceai/spiceai/pkg/loggers"
-	"github.com/spiceai/spiceai/pkg/pods"
-	"github.com/spiceai/spiceai/pkg/proto/aiengine_pb"
 	"github.com/spiceai/spiceai/pkg/util"
 	"go.uber.org/zap"
 )
@@ -223,88 +221,6 @@ func waitForServerHealthy(maxAttempts int) int {
 	}
 
 	return attemptCount
-}
-
-func getPodInitForTraining(pod *pods.Pod) *aiengine_pb.InitRequest {
-	fields := make(map[string]float64)
-
-	globalActions := pod.Actions()
-	var laws []string
-
-	var dsInitSpecs []*aiengine_pb.DataSource
-	for _, ds := range pod.DataSources() {
-		for fqField, fqFieldInitializer := range ds.Fields() {
-			fieldName := strings.ReplaceAll(fqField, ".", "_")
-			fields[fieldName] = fqFieldInitializer
-		}
-
-		dsActions := make(map[string]string)
-		for dsAction := range ds.DataspaceSpec.Actions {
-			fqAction, ok := globalActions[dsAction]
-			if ok {
-				dsActions[dsAction] = strings.ReplaceAll(fqAction, ".", "_")
-			}
-		}
-
-		for _, law := range ds.Laws() {
-			laws = append(laws, strings.ReplaceAll(law, ".", "_"))
-		}
-
-		dsInitSpec := aiengine_pb.DataSource{
-			Actions: dsActions,
-		}
-		if ds.DataspaceSpec.Data != nil {
-			dsInitSpec.Connector = &aiengine_pb.DataConnector{
-				Name:   ds.DataspaceSpec.Data.Connector.Name,
-				Params: ds.DataspaceSpec.Data.Connector.Params,
-			}
-		} else {
-			dsInitSpec.Connector = &aiengine_pb.DataConnector{
-				Name: "localstate",
-			}
-		}
-
-		dsInitSpecs = append(dsInitSpecs, &dsInitSpec)
-	}
-
-	var rewardInit *string
-	if pod.PodSpec.Training != nil {
-		rewardInitTrimmed := strings.TrimSpace(pod.PodSpec.Training.RewardInit)
-		if rewardInitTrimmed != "" {
-			rewardInit = &rewardInitTrimmed
-		}
-	}
-
-	globalFields := pod.FieldNames()
-
-	rewards := pod.Rewards()
-	globalActionRewards := make(map[string]string)
-	for actionName := range globalActions {
-		globalActionRewards[actionName] = rewards[actionName]
-		if rewardInit != nil {
-			reward := *rewardInit + "\n" + rewards[actionName]
-			for _, fieldName := range globalFields {
-				reward = strings.ReplaceAll(reward, fieldName, strings.ReplaceAll(fieldName, ".", "_"))
-			}
-			globalActionRewards[actionName] = reward
-		}
-	}
-
-	epoch := pod.Epoch().Unix()
-
-	podInit := aiengine_pb.InitRequest{
-		Pod:         pod.Name,
-		EpochTime:   epoch,
-		Period:      int64(pod.Period().Seconds()),
-		Interval:    int64(pod.Interval().Seconds()),
-		Granularity: int64(pod.Granularity().Seconds()),
-		Datasources: dsInitSpecs,
-		Fields:      fields,
-		Actions:     globalActionRewards,
-		Laws:        laws,
-	}
-
-	return &podInit
 }
 
 func isTestEnvironment() bool {
