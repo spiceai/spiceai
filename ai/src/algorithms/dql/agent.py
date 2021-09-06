@@ -9,6 +9,7 @@ import tensorflow as tf
 from tensorflow.keras.layers import Dense, Input
 from tensorflow.keras.optimizers import Adam
 from algorithms.dql.memory import ReplayBuffer
+from exception import InvalidDataShapeException
 
 tf.keras.backend.set_floatx("float64")
 
@@ -114,7 +115,13 @@ class DeepQLearning_Agent(SpiceAIAgent):
     def load(self, model_path: str) -> bool:
         if os.path.exists(model_path):
             self.model.model = tf.keras.models.load_model(model_path)
-            self.update_target()
+
+            try:
+                self.update_target()
+            except ValueError as ex:
+                if "not compatible with provided weight shape" in str(ex):
+                    raise InvalidDataShapeException(str(ex))
+                raise ex
 
             # When loading a model, we want to set the epsilon to 0 so that the agent
             # will not explore
