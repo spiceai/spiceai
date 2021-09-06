@@ -10,7 +10,6 @@ import (
 	"github.com/spiceai/spiceai/pkg/aiengine"
 	"github.com/spiceai/spiceai/pkg/context"
 	"github.com/spiceai/spiceai/pkg/pods"
-	"github.com/spiceai/spiceai/pkg/util"
 )
 
 func ensurePodsPathExists() error {
