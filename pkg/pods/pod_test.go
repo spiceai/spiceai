@@ -47,7 +47,7 @@ func testBasePropertiesFunc(pod *Pod) func(*testing.T) {
 
 		switch pod.Name {
 		case "trader":
-			expected = "b8ede2b6ad0f234e83d622a9e561da01"
+			expected = "64a15d213ebe84486fc68e209ca5d160"
 		case "trader-infer":
 			expected = "ae441bfd1c725a0f8dfbce525146d441"
 		}
@@ -169,7 +169,7 @@ func testActionsFunc(pod *Pod) func(*testing.T) {
 		switch pod.Name {
 		case "trader":
 			expected = map[string]string{
-				"buy":  "local.portfolio.usd_balance -= coinbase.btcusd.close\nlocal.portfolio.btc_balance += 1",
+				"buy":  "local.portfolio.usd_balance -= coinbase.btcusd.close\nlocal.portfolio.btc_balance += 1.1",
 				"hold": "",
 				"sell": "local.portfolio.usd_balance += coinbase.btcusd.close\nlocal.portfolio.btc_balance -= 1",
 			}

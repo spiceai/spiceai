@@ -38,3 +38,9 @@ class InvalidFieldsException(AiEngineException):
     def __init__(self, message: str):
         super().__init__(message)
         self.type = "invalid_fields"
+
+
+class InvalidDataShapeException(AiEngineException):
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.type = "invalid_data_shape"

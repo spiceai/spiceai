@@ -2,18 +2,18 @@ import { useState, useEffect } from 'react';
 import useSWR from 'swr';
 
 import { getApiPath } from '../util/api';
-import { Episode, newEpisode } from './episode'
+import { Episode, newEpisode } from './episode';
 
 export interface Flight {
-  start: Date
-  end: Date
-  episodes: Episode[]
+  start: Date;
+  end: Date;
+  episodes: Episode[];
 }
 
 export interface FlightsResponse {
-  data: Flight[]
-  isLoading: boolean
-  error: any
+  data: Flight[];
+  isLoading: boolean;
+  error: any;
 }
 
 const requestInit = {
@@ -28,7 +28,7 @@ const fetcher = async (url: string): Promise<any> => {
 };
 
 export function useFlights(podName: string): FlightsResponse {
-  const path = getApiPath(`/pods/${podName}/flights`)
+  const path = getApiPath(`/pods/${podName}/training_runs`);
   const { data, error } = useSWR(path, fetcher, {
     refreshInterval: 200,
   });
@@ -36,15 +36,19 @@ export function useFlights(podName: string): FlightsResponse {
 
   useEffect(() => {
     if (data) {
-      setFlights((data.map((flight: any) => {
-        return {
-          start: new Date(flight.start * 1000),
-          end: new Date(flight.end * 1000),
-          episodes: flight.episodes.map((ep: any) => newEpisode(ep))
-        } as Flight
-      }) as Flight[]).sort((a, b) => {
-        return b.start.getTime() - a.start.getTime()
-      }));
+      setFlights(
+        (
+          data.map((flight: any) => {
+            return {
+              start: new Date(flight.start * 1000),
+              end: new Date(flight.end * 1000),
+              episodes: flight.episodes.map((ep: any) => newEpisode(ep)),
+            } as Flight;
+          }) as Flight[]
+        ).sort((a, b) => {
+          return b.start.getTime() - a.start.getTime();
+        })
+      );
     }
   }, [data]);
 

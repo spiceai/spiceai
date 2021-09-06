@@ -4,6 +4,7 @@ import tensorflow as tf
 from tensorflow.keras import layers, models
 from tensorflow.keras import backend as K
 from algorithms.vpg.memory import Memory
+from exception import InvalidDataShapeException
 import warnings
 import os
 
@@ -87,7 +88,13 @@ class VanillaPolicyGradient_Agent(SpiceAIAgent):
         """
         # If not acting randomly, take action with highest predicted value.
         state_batch = np.expand_dims(state, axis=0)
-        probabilities = self.predict.predict(state_batch, verbose=0)[0]
+        try:
+            probabilities = self.predict.predict(state_batch, verbose=0)[0]
+        except ValueError as ex:
+            if "expected state to have shape" in str(ex):
+                raise InvalidDataShapeException(str(ex))
+            raise ex
+
         # print(probabilities)
         action = np.random.choice(len(probabilities), p=probabilities)
         return action, probabilities

@@ -353,7 +353,7 @@ func NewServer(port uint) *server {
 
 func (server *server) Start() error {
 	r := router.New()
-	r.GET("/health", healthHandler)
+	r.ANY("/health", healthHandler)
 
 	// Static Dashboard
 	dashboardServer := dashboard.NewDashboardEmbedded()

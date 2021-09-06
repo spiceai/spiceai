@@ -16,6 +16,7 @@ from train import train_agent, training_lock, saved_models, ALGORITHM
 from concurrent import futures
 from proto.aiengine.v1 import aiengine_pb2, aiengine_pb2_grpc
 from cleanup import cleanup_on_shutdown
+from exception import InvalidDataShapeException
 
 data_managers: "dict[DataManager]" = dict()
 connector_managers: "dict[ConnectorManager]" = dict()
@@ -124,45 +125,66 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
         return aiengine_pb2.Response(result=result)
 
     def GetInference(self, request: aiengine_pb2.InferenceRequest, context):
-        model_exists = False
-        if request.pod in saved_models:
-            model_exists = True
+        try:
+            model_exists = False
+            if request.pod in saved_models:
+                model_exists = True
 
-        if not request.pod in data_managers:
-            return aiengine_pb2.InferenceResult(
-                response=aiengine_pb2.Response(result="pod_not_initialized", error=True)
+            if not request.pod in data_managers:
+                return aiengine_pb2.InferenceResult(
+                    response=aiengine_pb2.Response(
+                        result="pod_not_initialized", error=True
+                    )
+                )
+
+            if request.tag != "latest":
+                return aiengine_pb2.InferenceResult(
+                    response=aiengine_pb2.Response(
+                        result="tag_not_yet_supported",
+                        message="Support for multiple tags coming soon!",
+                        error=True,
+                    )
+                )
+
+            # Ideally we could just re-use the in-memory agent we created during training, but tensorflow has issues with
+            # multi-threading in python, so we are just loading it from the file system
+            data_manager = data_managers[request.pod]
+            model_data_shape = data_manager.get_shape()
+            agent: SpiceAIAgent = get_agent(
+                ALGORITHM, model_data_shape, len(data_manager.action_names)
             )
+            if model_exists:
+                agent.load(saved_models[request.pod])
 
-        if request.tag != "latest":
+            data_manager: DataManager = data_managers[request.pod]
+
+            if (
+                data_manager.massive_table_filled.shape[0]
+                < data_manager.get_window_span()
+            ):
+                return aiengine_pb2.InferenceResult(
+                    response=aiengine_pb2.Response(result="not_enough_data", error=True)
+                )
+
+            latest_window = data_manager.get_latest_window()
+            state = data_manager.flatten_and_normalize_window(latest_window)
+
+            action_from_model, probabilities = agent.act(state)
+        except InvalidDataShapeException as ex:
+            result = ex.type
+            message = ex.message
+
+            if training_lock.locked():
+                result = "training_not_complete"
+                message = (
+                    "Please wait to get a recommendation until after training completes"
+                )
+
             return aiengine_pb2.InferenceResult(
                 response=aiengine_pb2.Response(
-                    result="tag_not_yet_supported",
-                    message="Support for multiple tags coming soon!",
-                    error=True,
+                    result=result, message=message, error=True
                 )
             )
-
-        # Ideally we could just re-use the in-memory agent we created during training, but tensorflow has issues with
-        # multi-threading in python, so we are just loading it from the file system
-        data_manager = data_managers[request.pod]
-        model_data_shape = data_manager.get_shape()
-        agent: SpiceAIAgent = get_agent(
-            ALGORITHM, model_data_shape, len(data_manager.action_names)
-        )
-        if model_exists:
-            agent.load(saved_models[request.pod])
-
-        data_manager: DataManager = data_managers[request.pod]
-
-        if data_manager.massive_table_filled.shape[0] < data_manager.get_window_span():
-            return aiengine_pb2.InferenceResult(
-                response=aiengine_pb2.Response(result="not_enough_data", error=True)
-            )
-
-        latest_window = data_manager.get_latest_window()
-        state = data_manager.flatten_and_normalize_window(latest_window)
-
-        action_from_model, probabilities = agent.act(state)
         confidence = f"{probabilities[action_from_model]:.3f}"
         if not model_exists:
             confidence = 0.0
