@@ -12,7 +12,7 @@
 
 Create an endgame issue with the following content:
 
-```
+```markdown
 - [ ] Ensure all outstanding `spiceai` feature PRs are merged
 - [ ] Full test pass and update if necessary over README.md (please get screenshots!)
 - [ ] Full test pass and update if necessary over Docs (please get screenshots!)
@@ -31,6 +31,7 @@ Create an endgame issue with the following content:
 - [ ] Email announcement
 
 PR reference:
+-
 ```
 
 ## Version update
