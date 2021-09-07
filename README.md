@@ -9,7 +9,9 @@
 **Spice.ai** is an open source, portable runtime for training and using deep learning on time series data. It's written in Golang and Python and runs as a container or microservice with applications calling a simple HTTP API. It's deployable to any public cloud, on-premises, and edge.
 
 ---
+
 ⚠️ **DEVELOPER PREVIEW ONLY** Spice.ai is under active **alpha** stage development and is not intended to be used in production until its **1.0-stable** release.
+
 ---
 
 **The vision for Spice.ai is to make creating intelligent applications as easy as building a modern website.** Spice.ai brings AI development to your editor, in any language or framework with a fast, iterative, inner development loop, with continuous-integration (CI) and continuous-deployment (CD) workflows.
