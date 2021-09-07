@@ -82,7 +82,7 @@ Once you open the Codespace, Spice.ai and everything you need to get started wil
 
 ### Create your first Spice.ai Pod and train it
 
-A [Spice.ai Pod](https://docs.spiceai.org/concepts/#pod--pod-manifest) is simply a collection of configuration and data that is used to train and deploy your own AI.
+A [Spice.ai Pod](https://docs.spiceai.org/concepts/#pod) is simply a collection of configuration and data that is used to train and deploy your own AI.
 
 We will add intelligence to a sample application, **ServerOps**, by creating and training a Spice.ai pod that offers recommendations to the application for different server operations, such as performing server maintenance.
 
