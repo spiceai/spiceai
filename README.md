@@ -6,13 +6,19 @@
 [![Subreddit subscribers](https://img.shields.io/reddit/subreddit-subscribers/spiceai?style=social)](https://www.reddit.com/r/spiceai)
 [![Follow on Twitter](https://img.shields.io/twitter/follow/spiceaihq.svg?style=social&logo=twitter)](https://twitter.com/intent/follow?screen_name=spiceaihq)
 
-Spice.ai is an open source, portable runtime for training and using deep learning on time series data. It's written in Golang and Python and runs as a container or microservice with applications calling a simple HTTP API. It's deployable to any public cloud, on-premises, and edge.
+**Spice.ai** is an open source, portable runtime for training and using deep learning on time series data. It's written in Golang and Python and runs as a container or microservice with applications calling a simple HTTP API. It's deployable to any public cloud, on-premises, and edge.
 
-The vision for Spice.ai is to make creating intelligent applications as easy as possible for developers in their development environment of choice. Spice.ai brings AI development to their editor, in any language or framework with a fast, iterative, inner development loop, with continuous-integration (CI) and continuous-deployment (CD) workflows.
+**The vision for Spice.ai is to make creating intelligent applications as easy as building a modern website.** Spice.ai brings AI development to your editor, in any language or framework with a fast, iterative, inner development loop, with continuous-integration (CI) and continuous-deployment (CD) workflows.
 
-The Spice.ai runtime also includes a library of [community-driven components](https://github.com/spiceai/data-components-contrib) for streaming and processing time series data, with the vision of enabling developers to quickly and easily combine data with learning to create intelligent models.
+📢 Read the Spice.ai announcement blog post at [blog.spiceai.org](https://blog.spiceai.org).
 
-📢 Read the Spice.ai announcement blog post at [blog.spiceai.org](https://blog.spiceai.org)
+### Community-driven data components
+
+The Spice.ai runtime also includes a library of [community-driven data components](https://github.com/spiceai/data-components-contrib) for streaming and processing time series data, enabling developers to quickly and easily combine data with learning to create intelligent models.
+
+### Spice.ai pod registry
+
+Modern developers also build with the community by leveraging registries such as npm, NuGet, and pip. The registry for sharing and using Spice.ai packages is [spicerack.org](https://spicerack.org). As the community shares more and more AI building blocks, developers can quickly build intelligence into their applications, initially with definitions of AI projects and eventually by sharing and reusing fully-trained models.
 
 ---
 
@@ -20,13 +26,15 @@ The Spice.ai runtime also includes a library of [community-driven components](ht
 
 ---
 
-The vision to bring intelligent application development to the maturity of modern web development is a vast undertaking. We haven't figured it all out or solved all the problems yet. We're looking for feedback on the direction. It's not finished, in fact, we only just started in June, and we invite you on the journey.
+### Pre-release software
 
-Modern developers also build with the community by leveraging registries such as npm, NuGet, and pip. The registry for sharing and using Spice.ai packages is [spicerack.org](https://spicerack.org). As the community shares more and more AI building blocks, developers can quickly build intelligence into their applications, initially with definitions of AI projects and eventually by sharing and reusing fully-trained models.
+⚠️ The vision to bring intelligent application development to the maturity of modern web development is a vast undertaking. We haven't figured it all out or solved all the problems yet. We're looking for feedback on the direction. Spice.ai is not finished, in fact, we only just started in June, and we invite you on the journey.
 
 Spice.ai and spicerack.org are both pre-release, early, alpha software. Spice.ai v0.1-alpha has many gaps, including limited deep learning algorithms and training scale, streaming data, simulated environments, and offline learning modes. Packages aren't searchable or even listed on spicerack.org yet.
 
 Our intention with this preview is to work with developers early to co-define and co-develop the developer experience, aligning to the goal of making AI easy for developers. 🚀 Thus, due to the stage of development and as we focus, there are currently several [limitations](https://github.com/spiceai/spiceai/blob/trunk/docs/ROADMAP.md#current-limitations) on the general [Roadmap to v1.0-stable](https://github.com/spiceai/spiceai/blob/trunk/docs/ROADMAP.md#spice-ai-v10-stable-roadmap).
+
+### Join us!
 
 We greatly appreciate and value your feedback. Please feel free to [file an issue](https://github.com/spiceai/spiceai/issues/new) and get in touch with the team through [Discord](https://discord.com/channels/803820740868571196) or by sending us mail at [team@spiceai.io](mailto:team@spiceai.io).
 
@@ -38,11 +46,12 @@ Follow this guide to get started quickly with Spice.ai. For a more comprehensive
 
 ### Current hosting limitations
 
-- Running in Docker is required. We are targeting a baremetal experience by v0.3-alpha.
+- Docker is required. We are targeting self-host support in v0.3.0-alpha.
 - Only macOS and Linux are natively supported. [WSL 2](https://docs.microsoft.com/en-us/windows/wsl/install-win10) is required for Windows.
-- arm64 is not yet supported (e.g. Apple's M1 Macs). We use M1s ourselves, so we hope to support this very soon :-)
+- arm64 is not yet supported (i.e. Apple's M1 Macs). We use M1s ourselves, so we hope to support this very soon :-)
 
-⭐️ We highly recommend using [GitHub Codespaces](https://github.com/features/codespaces) to get started. Codespaces enables you to run Spice.ai in a virtual environment in the cloud. If you use Codespaces, the following prerequisites are not required and you may skip to the [Getting Started with Codespaces](https://github.com/spiceai/spiceai#getting-started-with-codespaces) section.
+⭐️ We highly recommend using [GitHub Codespaces](https://github.com/features/codespaces) to get started. Codespaces enables you to run Spice.ai in a virtual environment in the cloud. If you use Codespaces, the install is not required and you may skip to the [Getting Started with Codespaces](#getting-started-with-codespaces) section.
+
 
 ### Installation (local machine)
 
@@ -71,13 +80,13 @@ Once you open the Codespace, Spice.ai and everything you need to get started wil
 
 ### Create your first Spice.ai Pod and train it
 
-A [Spice.ai Pod](https://docs.spiceai.org/concepts/#pod--pod-manifest) is simply a collection of configuration and data that Spice.ai uses to train and deploy AI.
+A [Spice.ai Pod](https://docs.spiceai.org/concepts/#pod--pod-manifest) is simply a collection of configuration and data that is used to train and deploy your own AI.
 
-The first Spice.ai Pod you will create and train is based off of a problem that many system administrators are familiar with: **server maintenance**. Application and system logging is critical part of running a production service, but letting those logs build up can cause other issues, especially if those logs end up filling the entire disk! It is simple enough to run a utility at a certain time every day to ensure this doesn't happen, but what if we choose to run the cleanup in the middle of peak traffic to the server?
+We will add intelligence to a sample application, **ServerOps**, by creating and training a Spice.ai pod that offers recommendations to the application for different server operations, such as performing server maintenance.
 
-We will use Spice.ai to train a pod that can intelligently learn when the best times are to run different jobs on a server. Let's call this example **ServerOps**.
+If you are using GitHub Codespaces, skip Step 1. and continue with Step 2., as the repository will already be cloned.
 
-Clone the Spice.ai quickstarts repo in a directory where you would normally put your code. E.g.
+Step 1. Clone the Spice.ai quickstarts repository:
 
 ```bash
 cd $HOME
@@ -85,60 +94,58 @@ git clone https://github.com/spiceai/quickstarts
 cd quickstarts/serverops
 ```
 
-In a new terminal window or tab, navigate to the directory and start the Spice runtime in development mode with `spice run`.
+Step 2. Start the Spice runtime with `spice run`:
 
 ```bash
 cd $HOME/quickstarts/serverops
 spice run
 ```
 
-In the original terminal instance, add the ServerOps sample pod:
+Step. 3. In a new terminal, add the ServerOps sample pod:
+
+So that we can leave Spice.ai runing, add the sample pod in a new terminal tab or window. If you are running in GitHub Codespaces, you an open a new terminal by clicking the split-terminal button in VS Code.
 
 ```bash
-spice add quickstarts/serverops
+spice add samples/serverops
 ```
 
-The Spice CLI will download the ServerOps sample pod manifest and add it to your project at `spicepods/serverops.yaml`.
+The Spice.ai CLI will download the ServerOps sample pod and add the pod manifest to your project at `spicepods/serverops.yaml`.
 
-The Spice.ai runtime will then automatically detect the manifest and start your first training run!
+The Spice runtime will then automatically detect the pod and start your first training run!
 
-> Note, automatic training relies on your system's filewatcher. In some cases, this might be disabled or not work as expected, especially when using containers. If training does not start, follow the command to [retrain your pod](https://github.com/spiceai/spiceai#retrain-your-pod) below.
+> Note, automatic training relies on your system's filewatcher. In some cases, this might be disabled or not work as expected. If training does not start, follow the command to [retrain the pod](#retrain-the-pod) below.
 
-### Observe your pod training
+### Observe the pod training
 
 Navigate to [http://localhost:8000](http://localhost:8000) in your favorite browser. You will see an overview of your pods. From here, you can click on the `serverops` pod to see a chart of the pod's training progress.
 
-### Retrain your pod
+### Retrain the pod
 
-The runtime will automatically detect changes to your pod manifest and start training. In addition, you can trigger training by using the Spice CLI from within your app directory.
+In addition to automatic training upon manifest changes, training can be started by using the Spice CLI from within your app directory.
 
 ```bash
 spice train serverops
 ```
 
-### Get a recommendation from your pod
+### Get a recommendation
 
-After training your pod, you can now fetch a recommendation for an action!
+After training the pod, you can now get a recommendation for an action from it!
 
 ```bash
 curl http://localhost:8000/api/v0.1/pods/serverops/recommendation
 ```
 
-### Conclusion and next steps
+### Next steps
 
 Congratulations! In just a few minutes you downloaded and installed the Spice.ai CLI and runtime, created your first Spice.ai Pod, trained it, and got a recommendation from it.
 
-This is just the start of your journey with AI. Next, try one of the quickstart tutorials or in-depth samples for creating intelligent applications with Spice.ai.
+This is just the start of the journey with Spice.ai. Next, try one of the quickstart tutorials or in-depth samples for creating intelligent applications.
 
 **Try:**
 
 - [ServerOps sample](https://github.com/spiceai/samples/tree/trunk/serverops/README.md) - a more in-depth version of the quickstart you just completed, using CPU metrics from your own machine
 - [Gardener](https://github.com/spiceai/samples/tree/trunk/gardener/README.md) - Intelligently water a simulated garden
 - [Trader](https://github.com/spiceai/quickstarts/tree/trunk/trader/README.md) - a basic Bitcoin trading bot
-
-**Kubernetes:**
-
-Spice.ai can be deployed to Kubernetes! Try out the [Kubernetes sample](https://github.com/spiceai/samples/tree/trunk/kubernetes).
 
 ## Community
 
