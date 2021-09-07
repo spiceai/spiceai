@@ -43,7 +43,7 @@ getSystemInfo() {
 }
 
 verifySupported() {
-    local supported=(darwin-amd64 linux-amd64 linux-arm linux-arm64)
+    local supported=(darwin-amd64 linux-amd64)
     local current_osarch="${OS}-${ARCH}"
 
     for osarch in "${supported[@]}"; do
@@ -53,9 +53,7 @@ verifySupported() {
     done
 
     if [ "$current_osarch" == "darwin-arm64" ]; then
-        echo "The darwin_arm64 arch has no native binary, however you can use the amd64 version so long as you have rosetta installed"
-        echo "Use 'softwareupdate --install-rosetta' to install rosetta if you don't already have it"
-        ARCH="amd64"
+        echo "darwin_arm64 arch is not yet supported. See the Spice.ai roadmap at https://github.com/spiceai/spiceai/blob/trunk/docs/ROADMAP.md."
         return
     fi
 
