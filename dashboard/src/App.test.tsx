@@ -1,6 +1,7 @@
 import React from 'react';
 import { render, screen } from '@testing-library/react';
 import App from './App';
+import { readFileSync } from 'fs';
 
 test('renders docs header', () => {
   render(<App />);
@@ -9,8 +10,11 @@ test('renders docs header', () => {
 });
 
 test('renders version', () => {
+  const versionFile = readFileSync("../version.txt")
+  const versionString = versionFile.toString().trim()
+  console.log(`renders version test: testing for version '${versionString}'`)
   render(<App />);
-  const linkElement = screen.getByText(/v0.1.0-alpha/i);
+  const linkElement = screen.getByText(new RegExp(versionString, "i"));
   expect(linkElement).toBeInTheDocument();
 });
 
