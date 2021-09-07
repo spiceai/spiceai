@@ -3,6 +3,7 @@ FROM node as dashboard
 WORKDIR /build-dashboard
 
 COPY dashboard dashboard/
+COPY version.txt /build-dashboard/version.txt
 
 WORKDIR /build-dashboard/dashboard
 
