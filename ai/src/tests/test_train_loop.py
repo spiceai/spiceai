@@ -248,16 +248,16 @@ class TrainingLoopTests(unittest.TestCase):
         self.validate_episode_data(
             "trader",
             FLIGHT,
-            6,
+            5,
             num_actions=10,
-            episode_results=self.episode_results[0:6],
+            episode_results=self.episode_results[0:5],
         )
         self.validate_episode_data(
             "trader",
             FLIGHT,
-            4,
+            5,
             num_actions=50,
-            episode_results=self.episode_results[6:],
+            episode_results=self.episode_results[5:],
         )
 
     def test_epoch_earlier_than_data(self):

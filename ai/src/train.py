@@ -56,7 +56,7 @@ def train_agent(
 
         not_learning_episodes = 0
         last_episode_reward = None
-        for episode in range(TRAINING_EPISODES):
+        for episode in range(1, TRAINING_EPISODES + 1):
             episode_start = math.floor(time.time())
             data_manager.rewind()
             raw_state = data_manager.get_current_window()
