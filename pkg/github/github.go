@@ -14,10 +14,9 @@ import (
 type GitHubClient struct {
 	Owner string
 	Repo  string
-	Token string
 }
 
-func NewGitHubClientFromPath(path string, token string) (*GitHubClient, error) {
+func NewGitHubClientFromPath(path string) (*GitHubClient, error) {
 	gitHubPathSplit := strings.Split(path, "/")
 
 	if gitHubPathSplit[0] != "github.com" {
@@ -27,27 +26,14 @@ func NewGitHubClientFromPath(path string, token string) (*GitHubClient, error) {
 	owner := gitHubPathSplit[1]
 	repo := gitHubPathSplit[2]
 
-	return NewGitHubClient(owner, repo, token), nil
+	return NewGitHubClient(owner, repo), nil
 }
 
-func NewGitHubClient(owner string, repo string, token string) *GitHubClient {
-	if token == "" {
-		token = GetGitHubTokenFromEnv()
-	}
-
+func NewGitHubClient(owner string, repo string) *GitHubClient {
 	return &GitHubClient{
 		Owner: owner,
 		Repo:  repo,
-		Token: token,
 	}
-}
-
-func GetGitHubTokenFromEnv() string {
-	token := os.Getenv("SPICE_GH_TOKEN")
-	if token == "" {
-		token = os.Getenv("GITHUB_TOKEN")
-	}
-	return token
 }
 
 func (g *GitHubClient) Get(url string, payload []byte) ([]byte, error) {
@@ -82,10 +68,6 @@ func (g *GitHubClient) call(method string, url string, payload []byte, accept st
 	req, err := http.NewRequest(method, url, payloadReader)
 	if err != nil {
 		return nil, err
-	}
-
-	if g.Token != "" {
-		req.Header.Add("Authorization", fmt.Sprintf("token %s", g.Token))
 	}
 
 	if accept != "" {
