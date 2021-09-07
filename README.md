@@ -42,7 +42,9 @@ Thank you for sharing this journey with us! 🙏
 
 ## Getting started with Spice.ai
 
-Follow this guide to get started quickly with Spice.ai. For a more comprehensive getting started guide, see the full [online documentation](https://docs.spiceai.org/).
+First, ⭐️ star this repo! Thank you for your support! 🙏 
+
+Then, follow this guide to get started quickly with Spice.ai. For a more comprehensive getting started guide, see the full [online documentation](https://docs.spiceai.org/).
 
 ### Current hosting limitations
 
