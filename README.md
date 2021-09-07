@@ -14,6 +14,13 @@
 
 📺 View a 60 second demo of Spice.ai in action [here](https://www.youtube.com/watch?v=FPPGyPq41kQ).
 
+
+---
+
+⚠️ **DEVELOPER PREVIEW ONLY** Spice.ai is under active **alpha** stage development and is not intended to be used in production until its **1.0-stable** release.
+
+---
+
 ### Community-driven data components
 
 The Spice.ai runtime also includes a library of [community-driven data components](https://github.com/spiceai/data-components-contrib) for streaming and processing time series data, enabling developers to quickly and easily combine data with learning to create intelligent models.
@@ -22,13 +29,7 @@ The Spice.ai runtime also includes a library of [community-driven data component
 
 Modern developers also build with the community by leveraging registries such as npm, NuGet, and pip. The registry for sharing and using Spice.ai packages is [spicerack.org](https://spicerack.org). As the community shares more and more AI building blocks, developers can quickly build intelligence into their applications, initially with definitions of AI projects and eventually by sharing and reusing fully-trained models.
 
-<img src="https://user-images.githubusercontent.com/1389883/132372436-23b8bff2-2aab-4928-b608-0da3f2dc7c4c.png" width="500" />
-
----
-
-⚠️ **DEVELOPER PREVIEW ONLY** Spice.ai is under active **alpha** stage development and is not intended to be used in production until its **1.0-stable** release.
-
----
+<img src="https://user-images.githubusercontent.com/1389883/132372436-23b8bff2-2aab-4928-b608-0da3f2dc7c4c.png" width="600" />
 
 ### Pre-release software
 
