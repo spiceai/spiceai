@@ -15,7 +15,7 @@ import (
 func ensurePodsPathExists() error {
 	podsDir := context.CurrentContext().PodsDir()
 	if _, err := os.Stat(podsDir); os.IsNotExist(err) {
-		err := os.MkdirAll(podsDir, 0766)
+		err := os.MkdirAll(podsDir, os.ModePerm)
 		if err != nil {
 			return err
 		}

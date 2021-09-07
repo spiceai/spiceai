@@ -8,6 +8,12 @@ test('renders docs header', () => {
   expect(linkElement).toBeInTheDocument();
 });
 
+test('renders version', () => {
+  render(<App />);
+  const linkElement = screen.getByText(/v0.1.0-alpha/i);
+  expect(linkElement).toBeInTheDocument();
+});
+
 test('renders github.com/spiceai/spiceai footer', () => {
   render(<App />);
   const linkElement = screen.getByText(/spiceai\.org/i);

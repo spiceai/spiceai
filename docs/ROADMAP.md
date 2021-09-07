@@ -9,6 +9,7 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 Spice.ai is still under early development, so there are several gaps and limitations, including:
 
 - Simulated environment support is very limited
+- Splitting of data (training/testing/etc)
 - Custom environments are not yet supported
 - Custom visualizations are not yet support
 - Environment and reward function code must be written in Python 3
