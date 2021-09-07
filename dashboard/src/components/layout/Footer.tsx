@@ -1,5 +1,4 @@
 import React from 'react';
-import { Link } from 'react-router-dom'
 
 const appVersion = process.env.REACT_APP_SPICE_VERSION
 
@@ -9,7 +8,7 @@ const Footer: React.FunctionComponent = () => {
       <div>v{appVersion}</div>
       <div className="flex-grow"></div>
       <div>
-        <Link to="/acknowledgements">Acknowledgements</Link>
+        <a href="/api/v0.1/acknowledgements">Acknowledgements</a>
       </div>
       <div>|</div>
       <div>
