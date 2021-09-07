@@ -22,6 +22,8 @@ The Spice.ai runtime also includes a library of [community-driven data component
 
 Modern developers also build with the community by leveraging registries such as npm, NuGet, and pip. The registry for sharing and using Spice.ai packages is [spicerack.org](https://spicerack.org). As the community shares more and more AI building blocks, developers can quickly build intelligence into their applications, initially with definitions of AI projects and eventually by sharing and reusing fully-trained models.
 
+![Spice.ai Architecture](https://user-images.githubusercontent.com/1389883/132372436-23b8bff2-2aab-4928-b608-0da3f2dc7c4c.png | width=300)
+
 ---
 
 ⚠️ **DEVELOPER PREVIEW ONLY** Spice.ai is under active **alpha** stage development and is not intended to be used in production until its **1.0-stable** release.
@@ -41,14 +43,6 @@ Our intention with this preview is to work with developers early to co-define an
 We greatly appreciate and value your feedback. Please feel free to [file an issue](https://github.com/spiceai/spiceai/issues/new) and get in touch with the team through [Discord](https://discord.com/channels/803820740868571196) or by sending us mail at [team@spiceai.io](mailto:team@spiceai.io).
 
 Thank you for sharing this journey with us! 🙏
-
-## Architecture
-
-Spice.ai is composed of a [runtime](https://docs.spiceai.org/concepts/#spiceai-runtime) and a [command line interface](https://docs.spiceai.org/concepts/#spiceai-cli).  The runtime consumes observations from a set of configurable [data spaces](https://docs.spiceai.org/concepts/#dataspace) and uses those observations to provide recommendations to your application via a simple [API](https://docs.spiceai.org/api/).  Spice.ai also provides [spicerack.org](https://spicerack.org/), a registry of pluggable components to use with your application.
-
-![Spice.ai Architecture](https://user-images.githubusercontent.com/1389883/132372436-23b8bff2-2aab-4928-b608-0da3f2dc7c4c.png)
-
-To learn more about Spice.ai's architecture, see the [online documentation](https://docs.spiceai.org/).
 
 ## Getting started with Spice.ai
 
