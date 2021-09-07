@@ -1,3 +1,4 @@
+![Spice ai Architecture (1)](https://user-images.githubusercontent.com/80174/132381744-af2737ef-4d06-41f3-a210-637ada352c53.png)
 # Spice.ai
 
 [![build](https://github.com/spiceai/spiceai/actions/workflows/e2e_test.yml/badge.svg?branch=trunk&event=push)](https://github.com/spiceai/spiceai/actions/workflows/e2e_test.yml)
@@ -29,7 +30,7 @@ The Spice.ai runtime also includes a library of [community-driven data component
 Modern developers also build with the community by leveraging registries such as npm, NuGet, and pip. The registry for sharing and using Spice.ai packages is [spicerack.org](https://spicerack.org). As the community shares more and more AI building blocks, developers can quickly build intelligence into their applications, initially with definitions of AI projects and eventually by sharing and reusing fully-trained models.
 
 <p align="center">
-  <img src="https://user-images.githubusercontent.com/80174/132381453-8f1b385d-d3bb-4bb2-920a-7ae11534f568.png" width="600" />
+  <img src="https://user-images.githubusercontent.com/80174/132381762-4dee6fab-294b-4d33-894b-94d645e58e0e.png" width="600" />
 </p>
 
 ### Pre-release software
