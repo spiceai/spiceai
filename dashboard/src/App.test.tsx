@@ -11,7 +11,7 @@ test('renders docs header', () => {
 
 test('renders version', () => {
   const versionFile = readFileSync("../version.txt")
-  const versionString = versionFile.toString().trim()
+  const versionString = `v${versionFile.toString().trim()}`
   console.log(`renders version test: testing for version '${versionString}'`)
   render(<App />);
   const linkElement = screen.getByText(new RegExp(versionString, "i"));
