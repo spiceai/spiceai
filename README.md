@@ -6,7 +6,9 @@
 [![Subreddit subscribers](https://img.shields.io/reddit/subreddit-subscribers/spiceai?style=social)](https://www.reddit.com/r/spiceai)
 [![Follow on Twitter](https://img.shields.io/twitter/follow/spiceaihq.svg?style=social&logo=twitter)](https://twitter.com/intent/follow?screen_name=spiceaihq)
 
-**Spice.ai** is an open source, portable runtime for training and using deep learning on time series data. It's written in Golang and Python and runs as a container or microservice with applications calling a simple HTTP API. It's deployable to any public cloud, on-premises, and edge.
+
+**Spice.ai** is an open source, portable runtime for training and using deep learning on time series data.
+
 
 ---
 
@@ -15,6 +17,8 @@
 ---
 
 **The vision for Spice.ai is to make creating intelligent applications as easy as building a modern website.** Spice.ai brings AI development to your editor, in any language or framework with a fast, iterative, inner development loop, with continuous-integration (CI) and continuous-deployment (CD) workflows.
+
+Spice.ai is written in Golang and Python and runs as a container or microservice with applications calling a simple HTTP API. It's deployable to any public cloud, on-premises, and edge.
 
 📢 Read the Spice.ai announcement blog post at [blog.spiceai.org](https://blog.spiceai.org).
 
