@@ -378,6 +378,8 @@ func (server *server) Start() error {
 		api.GET("/pods/{pod}/training_runs", apiGetFlightsHandler)
 		api.GET("/pods/{pod}/training_runs/{flight}", apiGetFlightHandler)
 		api.POST("/pods/{pod}/training_runs/{flight}/episodes", apiPostFlightEpisodeHandler)
+
+		api.GET("/acknowledgements", dashboardServer.AcknowledgementsHandler)
 	}
 
 	static := r.Group("/static")
@@ -387,7 +389,6 @@ func (server *server) Start() error {
 		static.GET("/media/{file}", dashboardServer.SvgHandler)
 	}
 
-	r.GET("/acknowledgements", dashboardServer.AcknowledgementsHandler)
 	r.GET("/manifest.json", dashboardServer.ManifestJsonHandler)
 	r.GET("/{filepath:*}", dashboardServer.IndexHandler)
 	r.GET("/", dashboardServer.IndexHandler)
