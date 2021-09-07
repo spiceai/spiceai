@@ -29,7 +29,7 @@ The Spice.ai runtime also includes a library of [community-driven data component
 Modern developers also build with the community by leveraging registries such as npm, NuGet, and pip. The registry for sharing and using Spice.ai packages is [spicerack.org](https://spicerack.org). As the community shares more and more AI building blocks, developers can quickly build intelligence into their applications, initially with definitions of AI projects and eventually by sharing and reusing fully-trained models.
 
 <p align="center">
-  <img src="https://user-images.githubusercontent.com/80174/132381762-4dee6fab-294b-4d33-894b-94d645e58e0e.png" width="600" />
+  <img src="https://user-images.githubusercontent.com/80174/132382372-c32cc8b7-25f2-4f82-8f9f-e4778fb69254.png" width="600" />
 </p>
 
 ### Pre-release software
