@@ -1,5 +1,4 @@
 import React from 'react';
-import { Link } from 'react-router-dom'
 import { SPICE_VERSION } from '../../constants'
 
 const Footer: React.FunctionComponent = () => {
@@ -8,7 +7,7 @@ const Footer: React.FunctionComponent = () => {
       <div>v{SPICE_VERSION}</div>
       <div className="flex-grow"></div>
       <div>
-        <Link to="/acknowledgements">Acknowledgements</Link>
+        <a href="/api/v0.1/acknowledgements">Acknowledgements</a>
       </div>
       <div>|</div>
       <div>
