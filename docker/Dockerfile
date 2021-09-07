@@ -20,12 +20,6 @@ WORKDIR /build
 
 COPY --from=dashboard /build-dashboard/dashboard/build /build/pkg/dashboard/build
 
-ARG GH_USERNAME
-ARG GH_PAT
-
-RUN --mount=type=secret,id=gh_pat echo "machine github.com login $GH_USERNAME password $(cat /run/secrets/gh_pat)" > ~/.netrc
-RUN GONOSUMDB=github.com/spiceai/data-components-contrib go get github.com/spiceai/data-components-contrib@trunk
-
 COPY go.mod go.mod
 COPY go.sum go.sum
 COPY cmd cmd/
@@ -35,8 +29,6 @@ WORKDIR /build/cmd/spiced
 
 RUN go mod tidy -compat=1.17
 RUN make
-
-RUN rm ~/.netrc
 
 FROM python:3.8.12-slim
 

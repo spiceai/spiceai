@@ -14,7 +14,6 @@ import (
 type GitHubClient struct {
 	Owner string
 	Repo  string
-	Token string
 }
 
 func NewGitHubClientFromPath(path string) (*GitHubClient, error) {
@@ -69,10 +68,6 @@ func (g *GitHubClient) call(method string, url string, payload []byte, accept st
 	req, err := http.NewRequest(method, url, payloadReader)
 	if err != nil {
 		return nil, err
-	}
-
-	if g.Token != "" {
-		req.Header.Add("Authorization", fmt.Sprintf("token %s", g.Token))
 	}
 
 	if accept != "" {
