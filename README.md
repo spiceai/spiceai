@@ -42,6 +42,14 @@ We greatly appreciate and value your feedback. Please feel free to [file an issu
 
 Thank you for sharing this journey with us! 🙏
 
+## Architecture
+
+Spice.ai is composed of a [runtime](https://docs.spiceai.org/concepts/#spiceai-runtime) and a [command line interface](https://docs.spiceai.org/concepts/#spiceai-cli).  The runtime consumes observations from a set of configurable [data spaces](https://docs.spiceai.org/concepts/#dataspace) and uses those observations to provide recommendations to your application via a simple [API](https://docs.spiceai.org/api/).  Spice.ai also provides [Spicerack](https://spicerack.org/), a registry of pluggable components to use with your application.
+
+![Spice ai Architecture](https://user-images.githubusercontent.com/1389883/132372436-23b8bff2-2aab-4928-b608-0da3f2dc7c4c.png)
+
+To learn more about Spice.ai's architecture, see the [online documentation](https://docs.spiceai.org/).
+
 ## Getting started with Spice.ai
 
 First, ⭐️ star this repo! Thank you for your support! 🙏 
