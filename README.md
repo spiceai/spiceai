@@ -101,15 +101,15 @@ cd $HOME/quickstarts/serverops
 spice run
 ```
 
-Step. 3. In a new terminal, add the ServerOps sample pod:
+Step. 3. In a new terminal, add the ServerOps quickstart pod:
 
-So that we can leave Spice.ai runing, add the sample pod in a new terminal tab or window. If you are running in GitHub Codespaces, you an open a new terminal by clicking the split-terminal button in VS Code.
+So that we can leave Spice.ai running, add the quickstart pod in a new terminal tab or window. If you are running in GitHub Codespaces, you can open a new terminal by clicking the split-terminal button in VS Code.
 
 ```bash
-spice add samples/serverops
+spice add quickstarts/serverops
 ```
 
-The Spice.ai CLI will download the ServerOps sample pod and add the pod manifest to your project at `spicepods/serverops.yaml`.
+The Spice.ai CLI will download the ServerOps quickstart pod and add the pod manifest to your project at `spicepods/serverops.yaml`.
 
 The Spice runtime will then automatically detect the pod and start your first training run!
 
@@ -133,6 +133,23 @@ After training the pod, you can now get a recommendation for an action from it!
 
 ```bash
 curl http://localhost:8000/api/v0.1/pods/serverops/recommendation
+```
+
+### Run the ServerOps application
+
+To see how Spice.ai makes creating intelligent applications easy, try running and reviewing the sample ServerOps Node or Powershell apps, `serverops.js` and `serverops.ps1`.
+
+Node:
+
+```bash
+npm install
+node serverops.js
+```
+
+Powershell:
+
+```ps
+./serverops.ps1
 ```
 
 ### Next steps
