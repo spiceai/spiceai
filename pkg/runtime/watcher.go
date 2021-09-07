@@ -10,13 +10,12 @@ import (
 	"github.com/spiceai/spiceai/pkg/aiengine"
 	"github.com/spiceai/spiceai/pkg/context"
 	"github.com/spiceai/spiceai/pkg/pods"
-	"github.com/spiceai/spiceai/pkg/util"
 )
 
 func ensurePodsPathExists() error {
 	podsDir := context.CurrentContext().PodsDir()
 	if _, err := os.Stat(podsDir); os.IsNotExist(err) {
-		_, err := util.MkDirAllInheritPerm(podsDir)
+		err := os.MkdirAll(podsDir, os.ModePerm)
 		if err != nil {
 			return err
 		}
