@@ -10,7 +10,7 @@ import (
 
 var (
 	assetNameMemo string
-	githubClient  = NewGitHubClient(runtimeOwner, runtimeRepo, GetGitHubTokenFromEnv())
+	githubClient  = NewGitHubClient(runtimeOwner, runtimeRepo)
 )
 
 const (
@@ -35,7 +35,7 @@ func GetRuntimeVersion(release *RepoRelease) string {
 
 func DownloadRuntimeAsset(release *RepoRelease, downloadPath string) error {
 	assetName := GetRuntimeAssetName()
-	return DownloadPrivateReleaseAsset(githubClient, release, assetName, downloadPath)
+	return DownloadReleaseAsset(githubClient, release, assetName, downloadPath)
 }
 
 func GetRuntimeAssetName() string {

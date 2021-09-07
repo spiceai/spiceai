@@ -26,7 +26,7 @@ type ReleaseAsset struct {
 	Uploader           Author `json:"uploader"`
 }
 
-func DownloadPrivateReleaseAsset(gh *GitHubClient, release *RepoRelease, assetName string, downloadDir string) error {
+func DownloadReleaseAsset(gh *GitHubClient, release *RepoRelease, assetName string, downloadDir string) error {
 	if release.Assets == nil || len(release.Assets) == 0 {
 		return errors.New("no release assets found")
 	}
@@ -43,9 +43,9 @@ func DownloadPrivateReleaseAsset(gh *GitHubClient, release *RepoRelease, assetNa
 		return errors.New("no matching asset found")
 	}
 
-	assetUrl := fmt.Sprintf("https://%s:@api.github.com/repos/%s/%s/releases/assets/%d", gh.Token, gh.Owner, gh.Repo, asset.ID)
+	assetUrl := fmt.Sprintf("https://api.github.com/repos/%s/%s/releases/assets/%d", gh.Owner, gh.Repo, asset.ID)
 
-	body, err := gh.call("GET", assetUrl, nil, "application/octet-stream") // Do not pass token, authenticated inline
+	body, err := gh.call("GET", assetUrl, nil, "application/octet-stream")
 	if err != nil {
 		return err
 	}
