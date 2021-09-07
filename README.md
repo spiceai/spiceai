@@ -1,4 +1,3 @@
-![Spice ai Architecture (1)](https://user-images.githubusercontent.com/80174/132381744-af2737ef-4d06-41f3-a210-637ada352c53.png)
 # Spice.ai
 
 [![build](https://github.com/spiceai/spiceai/actions/workflows/e2e_test.yml/badge.svg?branch=trunk&event=push)](https://github.com/spiceai/spiceai/actions/workflows/e2e_test.yml)
