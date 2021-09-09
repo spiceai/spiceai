@@ -19,7 +19,7 @@ import (
 )
 
 func TestDashboard(t *testing.T) {
-	t.Run("DashboardIndexHandler() - GET returns dashboard content", testDashboardIndexHandler())test
+	t.Run("DashboardIndexHandler() - GET returns dashboard content", testDashboardIndexHandler())
 	t.Run("DashboardJsHandler() - GET returns JS content", testDashboardJsHandler())
 	t.Run("DashboardCssHandler() - GET returns CSS content", testDashboardCssHandler())
 	t.Run("DashboardMediaHandler() - GET returns SVG content", testDashboardMediaHandler("svg", "image/svg+xhtml"))
