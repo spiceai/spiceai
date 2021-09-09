@@ -378,15 +378,13 @@ func (server *server) Start() error {
 		api.GET("/pods/{pod}/training_runs", apiGetFlightsHandler)
 		api.GET("/pods/{pod}/training_runs/{flight}", apiGetFlightHandler)
 		api.POST("/pods/{pod}/training_runs/{flight}/episodes", apiPostFlightEpisodeHandler)
-
-		api.GET("/acknowledgements", dashboardServer.AcknowledgementsHandler)
 	}
 
 	static := r.Group("/static")
 	{
 		static.GET("/js/{file}", dashboardServer.JsHandler)
 		static.GET("/css/{file}", dashboardServer.CssHandler)
-		static.GET("/media/{file}", dashboardServer.SvgHandler)
+		static.GET("/media/{file}", dashboardServer.MediaHandler)
 	}
 
 	r.GET("/manifest.json", dashboardServer.ManifestJsonHandler)

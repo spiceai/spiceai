@@ -4,7 +4,7 @@ import { ReactComponent as Logo } from '../../assets/svg/spice-ai-logo.svg';
 
 const Header: React.FunctionComponent = () => {
   return (
-    <header className="grid grid-cols-3 h-10 items-center bg-primary-dark">
+    <div className="flex-grow grid grid-cols-3 h-10 items-center bg-primary-dark">
       <div className="justify-self-left">
         <Link to={'/'}>
           <Logo className="h-2.5 w-32 ml-3" />
@@ -16,7 +16,7 @@ const Header: React.FunctionComponent = () => {
           <a href="https://docs.spiceai.org">Docs</a>
         </span>
       </div>
-    </header>
+    </div>
   );
 };
 

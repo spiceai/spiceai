@@ -10,3 +10,17 @@ body {
   -moz-osx-font-smoothing: grayscale;
   background-color: #022132;
 }
+
+h1 {
+  font-weight: 700;
+  font-size: x-large;
+}
+
+.markdown {
+  white-space: pre-wrap;
+}
+
+.markdown a {
+  color: rgb(17, 168, 205);
+  text-decoration: underline;
+}
