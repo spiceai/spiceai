@@ -160,6 +160,8 @@ func TestObservations(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	time.Sleep(1 * time.Second)
+
 	observation, err = runtime.getObservations("trader")
 	if err != nil {
 		t.Fatal(err)
