@@ -34,7 +34,7 @@ func RunCommand(cmd *exec.Cmd) error {
 
 	<-sigCh
 
-	if cmd != nil && (cmd.ProcessState == nil || !cmd.ProcessState.Exited()) {
+	if cmd.ProcessState == nil || !cmd.ProcessState.Exited() {
 		err := cmd.Process.Signal(os.Interrupt)
 		if err != nil {
 			return err
