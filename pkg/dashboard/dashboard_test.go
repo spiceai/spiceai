@@ -19,10 +19,10 @@ import (
 )
 
 func TestDashboard(t *testing.T) {
-	t.Run("DashboardIndexHandler() - GET returns dashboard content", testDashboardIndexHandler())
+	t.Run("DashboardIndexHandler() - GET returns dashboard content", testDashboardIndexHandler())test
 	t.Run("DashboardJsHandler() - GET returns JS content", testDashboardJsHandler())
 	t.Run("DashboardCssHandler() - GET returns CSS content", testDashboardCssHandler())
-	t.Run("DashboardSvgHandler() - GET returns SVG content", testDashboardSvgHandler())
+	t.Run("DashboardMediaHandler() - GET returns SVG content", testDashboardMediaHandler("svg", "image/svg+xhtml"))
 }
 
 func testDashboardIndexHandler() func(*testing.T) {
@@ -95,9 +95,9 @@ func testDashboardCssHandler() func(*testing.T) {
 	}
 }
 
-func testDashboardSvgHandler() func(*testing.T) {
+func testDashboardMediaHandler(mediaType string, contentType string) func(*testing.T) {
 	return func(t *testing.T) {
-		url, err := getFirstStaticAssetUrl("svg")
+		url, err := getFirstStaticAssetUrl(mediaType)
 		if err != nil {
 			t.Error(err)
 		}
@@ -107,16 +107,16 @@ func testDashboardSvgHandler() func(*testing.T) {
 
 		server := dashboard.NewDashboardEmbedded()
 
-		res, err := serve("/media/{file}", server.SvgHandler, r)
+		res, err := serve("/media/{file}", server.MediaHandler, r)
 		assert.NoError(t, err)
 
 		assert.EqualValues(t, 200, res.StatusCode)
-		assert.EqualValues(t, "image/svg+xml", res.Header.Get("Content-Type"))
+		assert.EqualValues(t, contentType, res.Header.Get("Content-Type"))
 
 		body, err := ioutil.ReadAll(res.Body)
 		assert.NoError(t, err)
 
-		assert.Contains(t, string(body), "svg")
+		assert.Contains(t, string(body), mediaType)
 	}
 }
 
@@ -147,7 +147,7 @@ func serve(route string, handler fasthttp.RequestHandler, req *http.Request) (*h
 
 func getFirstStaticAssetUrl(typeName string) (string, error) {
 	directoryName := typeName
-	if typeName == "svg" {
+	if typeName == "svg" || typeName == "md" {
 		directoryName = "media"
 	}
 
@@ -162,7 +162,7 @@ func getFirstStaticAssetUrl(typeName string) (string, error) {
 
 	// Look for first chunk
 	var filename string
-	if typeName == "svg" {
+	if typeName == "svg" || typeName == "md" {
 		filename = assets[0].Name()
 	} else {
 		suffix := fmt.Sprintf(".chunk.%s", typeName)
