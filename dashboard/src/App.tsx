@@ -5,22 +5,28 @@ import ContentPanel from './components/layout/ContentPanel';
 import Footer from './components/layout/Footer';
 import Dashboard from './pages/Dashboard';
 import PodPage from './pages/PodPage';
+import AcknowledgementsPage from './pages/Acknowledgements'
 import './App.css';
 
 function App(): JSX.Element {
   return (
     <BrowserRouter>
-      <div className="flex flex-col flex-grow h-screen">
-        <Header />
-        <main className="flex flex-col flex-grow">
+      <div className="flex flex-col h-screen">
+        <header className="flex">
+          <Header />
+        </header>
+        <main className="flex flex-col flex-1">
           <ContentPanel>
             <Switch>
               <Route exact path={['/', '/pods']} component={Dashboard} />
               <Route exact path="/pods/:podName" component={PodPage} />
+              <Route exact path="/acknowledgements" component={AcknowledgementsPage} />
             </Switch>
           </ContentPanel>
         </main>
-        <Footer />
+        <footer className="flex">
+          <Footer />
+        </footer>
       </div>
     </BrowserRouter>
   );

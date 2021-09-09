@@ -2,7 +2,9 @@ package dashboard
 
 import (
 	"embed"
+	"path"
 	"path/filepath"
+	"strings"
 
 	"github.com/valyala/fasthttp"
 )
@@ -16,9 +18,6 @@ var contentIndexHtml []byte
 
 //go:embed build/manifest.json
 var contentManifestJson []byte
-
-//go:embed build/acknowledgements.txt
-var contentAcknowledgementsText []byte
 
 //go:embed build/static/js/*
 var jsFiles embed.FS
@@ -47,12 +46,6 @@ func (d *DashboardEmbedded) ManifestJsonHandler(ctx *fasthttp.RequestCtx) {
 	ctx.Response.SetBody(contentManifestJson)
 }
 
-func (d *DashboardEmbedded) AcknowledgementsHandler(ctx *fasthttp.RequestCtx) {
-	contentType := GetContentType("text")
-	ctx.Response.Header.SetContentType(contentType)
-	ctx.Response.SetBody(contentAcknowledgementsText)
-}
-
 func (d *DashboardEmbedded) JsHandler(ctx *fasthttp.RequestCtx) {
 	d.fileHandler(ctx, jsFiles, "js")
 }
@@ -61,15 +54,16 @@ func (d *DashboardEmbedded) CssHandler(ctx *fasthttp.RequestCtx) {
 	d.fileHandler(ctx, cssFiles, "css")
 }
 
-func (d *DashboardEmbedded) SvgHandler(ctx *fasthttp.RequestCtx) {
-	d.fileHandler(ctx, mediaFiles, "svg")
+func (d *DashboardEmbedded) MediaHandler(ctx *fasthttp.RequestCtx) {
+	ext := strings.TrimPrefix(path.Ext(ctx.UserValue("file").(string)), ".")
+	d.fileHandler(ctx, mediaFiles, ext)
 }
 
 func (d *DashboardEmbedded) fileHandler(ctx *fasthttp.RequestCtx, fs embed.FS, fileType string) {
 	filePath := ctx.UserValue("file").(string)
 
 	subfolder := fileType
-	if fileType == "svg" {
+	if fileType == "svg" || fileType == ".md" {
 		subfolder = "media"
 	}
 
