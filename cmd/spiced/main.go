@@ -19,6 +19,8 @@ var (
 )
 
 func main() {
+	version.SetComponent("spiced")
+
 	logger := loggers.ZapLogger()
 	if logger == nil {
 		os.Exit(-1)

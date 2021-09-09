@@ -4,12 +4,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/spiceai/spiceai/pkg/context"
+	spice_http "github.com/spiceai/spiceai/pkg/http"
 	"github.com/spiceai/spiceai/pkg/loggers"
 	"go.uber.org/zap"
 )
@@ -42,7 +42,7 @@ func (r *SpiceRackRegistry) GetPod(podFullPath string) (string, error) {
 	}
 	failureMessage := fmt.Sprintf("An error occurred while fetching pod '%s' from spicerack.org", podFullPath)
 
-	response, err := http.Get(url)
+	response, err := spice_http.Get(url)
 	if err != nil {
 		zaplog.Sugar().Debugf("%s: %s", failureMessage, err.Error())
 		return "", errors.New(failureMessage)

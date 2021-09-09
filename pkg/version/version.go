@@ -2,8 +2,9 @@ package version
 
 import "fmt"
 
-// Values for these are injected by the build.
 var (
+	component = ""
+	// Values for these are injected by the build.
 	version = "local"
 )
 
@@ -15,4 +16,12 @@ func Version() string {
 	}
 
 	return fmt.Sprintf("v%s", version)
+}
+
+func Component() string {
+	return component
+}
+
+func SetComponent(newComponent string) {
+	component = newComponent
 }

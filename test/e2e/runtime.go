@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"time"
 
+	spice_http "github.com/spiceai/spiceai/pkg/http"
 	"github.com/spiceai/spiceai/pkg/proto/aiengine_pb"
 	"github.com/spiceai/spiceai/pkg/proto/runtime_pb"
 	"github.com/spiceai/spiceai/pkg/util"
@@ -64,7 +65,7 @@ func (r *runtimeServer) postObservations(podName string, newObservations []byte)
 
 func (r *runtimeServer) getObservations(podName string) (string, error) {
 	url := fmt.Sprintf("%s/api/v0.1/pods/%s/observations", r.baseUrl, podName)
-	resp, err := http.Get(url)
+	resp, err := spice_http.Get(url)
 	if err != nil {
 		return "", err
 	}
@@ -120,7 +121,7 @@ func (r *runtimeServer) waitForTrainingToComplete(podName string, flight string,
 }
 
 func (r *runtimeServer) internalGet(url string, data interface{}) error {
-	resp, err := http.Get(url)
+	resp, err := spice_http.Get(url)
 	if err != nil {
 		return err
 	}
