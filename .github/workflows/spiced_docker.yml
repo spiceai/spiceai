@@ -39,6 +39,12 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Login to DockerHub
+        uses: docker/login-action@v1
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - name: Build and push Docker images
         id: docker_build
         uses: docker/build-push-action@v2.5.0
@@ -46,13 +52,16 @@ jobs:
           context: .
           file: docker/Dockerfile
           platforms: ${{ matrix.target_os }}/${{ matrix.target_arch }}
-          push: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/trunk' }}
+          push: true # ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/trunk' }}
           build-args: |
             REL_VERSION=${{ env.REL_VERSION }}
           tags: |
             ghcr.io/spiceai/spiced:latest
             ghcr.io/spiceai/spiced:v${{ env.REL_VERSION }}
             ghcr.io/spiceai/spiced:v${{ env.REL_VERSION }}-${{ matrix.target_arch }}
+            spiceai/spiced:latest
+            spiceai/spiced:v${{ env.REL_VERSION }}
+            spiceai/spiced:v${{ env.REL_VERSION }}-${{ matrix.target_arch }}
           # cache-from: type=gha
           # cache-to: type=gha,mode=max
 
