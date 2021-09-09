@@ -22,7 +22,7 @@ func TestDashboard(t *testing.T) {
 	t.Run("DashboardIndexHandler() - GET returns dashboard content", testDashboardIndexHandler())
 	t.Run("DashboardJsHandler() - GET returns JS content", testDashboardJsHandler())
 	t.Run("DashboardCssHandler() - GET returns CSS content", testDashboardCssHandler())
-	t.Run("DashboardMediaHandler() - GET returns SVG content", testDashboardMediaHandler("svg", "image/svg+xhtml"))
+	t.Run("DashboardMediaHandler() - GET returns SVG content", testDashboardMediaHandler("svg", "image/svg+xml"))
 }
 
 func testDashboardIndexHandler() func(*testing.T) {
@@ -160,17 +160,19 @@ func getFirstStaticAssetUrl(typeName string) (string, error) {
 		return "", fmt.Errorf("Expected %s assets in static directory. Is dashboard built?", typeName)
 	}
 
-	// Look for first chunk
+	// Look for first matching chunk
 	var filename string
+	var suffix string
 	if typeName == "svg" || typeName == "md" {
-		filename = assets[0].Name()
+		suffix = fmt.Sprintf(".%s", typeName)
 	} else {
-		suffix := fmt.Sprintf(".chunk.%s", typeName)
-		for _, asset := range assets {
-			if strings.HasSuffix(asset.Name(), suffix) {
-				filename = asset.Name()
-				break
-			}
+		suffix = fmt.Sprintf(".chunk.%s", typeName)
+	}
+
+	for _, asset := range assets {
+		if strings.HasSuffix(asset.Name(), suffix) {
+			filename = asset.Name()
+			break
 		}
 	}
 
