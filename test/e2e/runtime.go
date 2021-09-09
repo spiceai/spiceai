@@ -16,20 +16,49 @@ import (
 )
 
 type runtimeServer struct {
-	baseUrl string
+	baseUrl          string
+	runtimePath      string
+	workingDirectory string
+	cli              *cli
+	context          string
 }
 
-func (r *runtimeServer) startRuntime(runtimePath string, workingDirectory string) (*exec.Cmd, error) {
-	runtimeCmd := exec.Command(runtimePath)
-	runtimeCmd.Dir = workingDirectory
-	runtimeCmd.Stdout = os.Stdout
-	runtimeCmd.Stderr = os.Stderr
-	err := runtimeCmd.Start()
+func (r *runtimeServer) startRuntime() (*exec.Cmd, error) {
+	var runtimeCmd *exec.Cmd
+	var err error
+
+	if r.context == "docker" {
+		runtimeCmd, err = r.startDockerRuntime()
+	} else {
+		runtimeCmd, err = r.startMetalRuntime()
+	}
 	if err != nil {
 		return nil, err
 	}
 
 	err = r.waitForServerHealthy()
+	if err != nil {
+		return nil, err
+	}
+
+	return runtimeCmd, nil
+}
+
+func (r *runtimeServer) startDockerRuntime() (*exec.Cmd, error) {
+	runtimeCmd, err := r.cli.startCliCmd("run")
+	if err != nil {
+		return nil, err
+	}
+
+	return runtimeCmd, nil
+}
+
+func (r *runtimeServer) startMetalRuntime() (*exec.Cmd, error) {
+	runtimeCmd := exec.Command(r.runtimePath)
+	runtimeCmd.Dir = r.workingDirectory
+	runtimeCmd.Stdout = os.Stdout
+	runtimeCmd.Stderr = os.Stderr
+	err := runtimeCmd.Start()
 	if err != nil {
 		return nil, err
 	}
