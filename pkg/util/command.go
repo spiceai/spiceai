@@ -1,10 +1,10 @@
 package util
 
 import (
-	"fmt"
-	"log"
 	"os"
 	"os/exec"
+	"os/signal"
+	"syscall"
 )
 
 func RunCommand(cmd *exec.Cmd) error {
@@ -12,31 +12,39 @@ func RunCommand(cmd *exec.Cmd) error {
 		return nil
 	}
 
+	cmdErr := make(chan error, 1)
+	cmdStopped := make(chan bool, 1)
 	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, os.Interrupt)
+
+	err := cmd.Start()
+	if err != nil {
+		return err
+	}
 
 	go func() {
-		err := cmd.Start()
-		if err != nil {
-			return
+		appErr := cmd.Wait()
+
+		if appErr != nil {
+			cmdErr <- appErr
 		}
-
-		go func() {
-			appErr := cmd.Wait()
-
-			if appErr != nil {
-				log.Println(fmt.Errorf("process %s exited with error: %w", cmd.Path, appErr))
-			}
-			sigCh <- os.Interrupt
-		}()
+		cmdStopped <- true
+		sigCh <- os.Interrupt
 	}()
 
 	<-sigCh
 
 	if cmd != nil && (cmd.ProcessState == nil || !cmd.ProcessState.Exited()) {
-		err := cmd.Process.Kill()
+		err := cmd.Process.Signal(os.Interrupt)
 		if err != nil {
 			return err
 		}
+	}
+
+	<-cmdStopped
+
+	if len(cmdErr) > 0 {
+		return <-cmdErr
 	}
 
 	return nil
