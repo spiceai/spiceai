@@ -2,7 +2,7 @@
 
 [![build](https://github.com/spiceai/spiceai/actions/workflows/e2e_test.yml/badge.svg?branch=trunk&event=push)](https://github.com/spiceai/spiceai/actions/workflows/e2e_test.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![Discord](https://img.shields.io/discord/803820740868571196)](https://discord.com/channels/803820740868571196/803820740868571199)
+[![Discord](https://img.shields.io/discord/803820740868571196)](https://discord.gg/mXZdsRjRdN)
 [![Subreddit subscribers](https://img.shields.io/reddit/subreddit-subscribers/spiceai?style=social)](https://www.reddit.com/r/spiceai)
 [![Follow on Twitter](https://img.shields.io/twitter/follow/spiceaihq.svg?style=social&logo=twitter)](https://twitter.com/intent/follow?screen_name=spiceaihq)
 
@@ -46,7 +46,7 @@ Our intention with this preview is to work with developers early to co-define an
 
 ### Join us!
 
-We greatly appreciate and value your feedback. Please feel free to [file an issue](https://github.com/spiceai/spiceai/issues/new) and get in touch with the team through [Discord](https://discord.com/channels/803820740868571196) or by sending us mail at [team@spiceai.io](mailto:team@spiceai.io).
+We greatly appreciate and value your feedback. Please feel free to [file an issue](https://github.com/spiceai/spiceai/issues/new) and get in touch with the team through [Discord](https://discord.gg/mXZdsRjRdN) or by sending us mail at [team@spiceai.io](mailto:team@spiceai.io).
 
 Thank you for sharing this journey with us! 🙏
 
@@ -180,7 +180,7 @@ This is just the start of the journey with Spice.ai. Next, try one of the quicks
 
 Spice.ai started with the vision to make AI easy for developers. We are building Spice.ai in the open and with the community. Reach out on Discord or by email to get involved. We will be starting a community call series soon!
 
-- Discord: [![Discord Banner](https://discord.com/api/guilds/803820740868571196/widget.png?style=shield)](https://discord.com/channels/803820740868571196/803820740868571199)
+- Discord: [![Discord Banner](https://discord.com/api/guilds/803820740868571196/widget.png?style=shield)](https://discord.gg/mXZdsRjRdN)
 - Reddit: [![Subreddit subscribers](https://img.shields.io/reddit/subreddit-subscribers/spiceai?style=social)](https://www.reddit.com/r/spiceai)
 - Twitter: [@SpiceAIHQ](https://twitter.com/spiceaihq)
 - Email: [team@spiceai.io](mailto:team@spiceai.io)
