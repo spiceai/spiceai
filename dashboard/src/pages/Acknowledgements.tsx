@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
-import ReactMarkdown from 'react-markdown';
 import acknowledgements from '../content/acknowledgements.md';
+import marked from 'marked'
 
 const Acknowledgements: React.FunctionComponent = () => {
   const [acknowledgementsMarkdown, setAcknowledgementsMarkdown] = useState('');
@@ -16,7 +16,7 @@ const Acknowledgements: React.FunctionComponent = () => {
 
   return (
     <section className="p-8">
-      <ReactMarkdown className="markdown">{acknowledgementsMarkdown}</ReactMarkdown>
+      <div className="markdown" dangerouslySetInnerHTML={{ __html: marked(acknowledgementsMarkdown) }}></div>
     </section>
   );
 };

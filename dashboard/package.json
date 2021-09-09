@@ -18,10 +18,10 @@
     "chart.js": "^3.5.1",
     "chokidar": "^3.5.2",
     "chokidar-cli": "^3.0.0",
+    "marked": "^3.0.3",
     "postcss": "^8.3.6",
     "react": "^17.0.2",
     "react-dom": "^17.0.2",
-    "react-markdown": "^7.0.1",
     "react-router-dom": "^5.2.0",
     "react-scripts": "4.0.3",
     "react-sparklines": "^1.7.0",
@@ -32,6 +32,7 @@
     "yarn-run-all": "^3.1.1"
   },
   "devDependencies": {
+    "@types/marked": "^3.0.0",
     "@typescript-eslint/eslint-plugin": "^4.29.2",
     "@typescript-eslint/parser": "^4.29.2",
     "eslint": "^7.32.0",
