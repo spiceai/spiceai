@@ -109,12 +109,15 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, macOS-latest]
-        target_arch: [amd64]
+        target_arch: [amd64, arm64]
         include:
           - os: ubuntu-latest
             target_os: linux
           - os: macOS-latest
             target_os: darwin
+        exclude:
+          - os: ubuntu-latest
+            target_arch: arm64
 
     runs-on: ubuntu-latest
     steps:
