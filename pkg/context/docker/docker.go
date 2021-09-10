@@ -204,6 +204,7 @@ func getDockerArgs(args string) []string {
 }
 
 func getDockerImage(version string) string {
+	version = strings.TrimPrefix(version, "v")
 	return fmt.Sprintf("%s:%s", spicedDockerImg, version)
 }
 
