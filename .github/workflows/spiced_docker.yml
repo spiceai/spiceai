@@ -56,12 +56,12 @@ jobs:
           build-args: |
             REL_VERSION=${{ env.REL_VERSION }}
           tags: |
-            ghcr.io/spiceai/spiced:latest
-            ghcr.io/spiceai/spiced:v${{ env.REL_VERSION }}
-            ghcr.io/spiceai/spiced:v${{ env.REL_VERSION }}-${{ matrix.target_arch }}
-            spiceai/spiced:latest
-            spiceai/spiced:v${{ env.REL_VERSION }}
-            spiceai/spiced:v${{ env.REL_VERSION }}-${{ matrix.target_arch }}
+            ghcr.io/spiceai/spiceai:latest
+            ghcr.io/spiceai/spiceai:v${{ env.REL_VERSION }}
+            ghcr.io/spiceai/spiceai:v${{ env.REL_VERSION }}-${{ matrix.target_arch }}
+            spiceai/spiceai:latest
+            spiceai/spiceai:v${{ env.REL_VERSION }}
+            spiceai/spiceai:v${{ env.REL_VERSION }}-${{ matrix.target_arch }}
           # cache-from: type=gha
           # cache-to: type=gha,mode=max
 
