@@ -2,11 +2,11 @@
 
 ## Release environments
 
-|                     | Production                    | Development                | Local                        |
-| ------------------- | ----------------------------- | -------------------------- | ---------------------------- |
-| Short name          | prod                          | dev                        | local                        |
-| spiced Docker image | ghcr.io/spiceai/spiced:latest | ghcr.io/spiceai/spiced:dev | ghcr.io/spiceai/spiced:local |
-| Spice Rack URL      | https://api.spicerack.org     | https://dev.spicerack.org  | http://localhost:80          |
+|                     | Production                     | Development                 | Local                         |
+| ------------------- | ------------------------------ | --------------------------- | ----------------------------- |
+| Short name          | prod                           | dev                         | local                         |
+| spiced Docker image | ghcr.io/spiceai/spiceai:latest | ghcr.io/spiceai/spiceai:dev | ghcr.io/spiceai/spiceai:local |
+| Spice Rack URL      | https://api.spicerack.org      | https://dev.spicerack.org   | http://localhost:80           |
 
 ## Endgame issue
 
