@@ -169,7 +169,7 @@ jobs:
           context: .
           file: docker/Dockerfile
           push: false
-          tags: ghcr.io/spiceai/spiced:local
+          tags: ghcr.io/spiceai/spiceai:local
 
       - name: Verify Docker images
         if: matrix.context == 'docker'
@@ -255,7 +255,7 @@ jobs:
           context: .
           file: docker/Dockerfile
           push: false
-          tags: ghcr.io/spiceai/spiced:local
+          tags: ghcr.io/spiceai/spiceai:local
 
       - name: Verify Docker images
         if: matrix.context == 'docker'
