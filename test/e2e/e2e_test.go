@@ -179,7 +179,7 @@ func TestInterpretations(t *testing.T) {
 		return
 	}
 
-	runtimeCmd, err := runtime.startRuntime(runtimePath, testDir)
+	runtimeCmd, err := runtime.startRuntime()
 	if err != nil {
 		t.Fatal(err)
 	}

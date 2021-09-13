@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/spiceai/spiceai/pkg/api"
 	"github.com/spiceai/spiceai/pkg/interpretations"
 	"github.com/spiceai/spiceai/pkg/pods"
 	"github.com/stretchr/testify/assert"
@@ -20,6 +21,7 @@ func TestServer(t *testing.T) {
 	}
 
 	t.Run("getInterpretations()", testGetInterpretationsHandlerFunc(pod))
+	t.Run("postInterpretations()", testPostInterpretationsHandlerFunc(pod))
 }
 
 func testGetInterpretationsHandlerFunc(pod *pods.Pod) func(t *testing.T) {
@@ -33,7 +35,10 @@ func testGetInterpretationsHandlerFunc(pod *pods.Pod) func(t *testing.T) {
 			t.Error(err)
 		}
 
-		pod.AddInterpretation(interpretation)
+		err = pod.AddInterpretation(interpretation)
+		if err != nil {
+			t.Error(err)
+		}
 
 		ctx := &fasthttp.RequestCtx{
 			Request: fasthttp.Request{},
@@ -64,7 +69,9 @@ func testPostInterpretationsHandlerFunc(pod *pods.Pod) func(t *testing.T) {
 		}
 		ctx.SetUserValue("pod", "trader")
 
-		data, err := json.Marshal(interpretation)
+		apiInterpretation := api.NewInterpretation(interpretation)
+
+		data, err := json.Marshal(apiInterpretation)
 		if err != nil {
 			t.Error(err)
 		}

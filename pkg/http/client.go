@@ -15,7 +15,7 @@ func Get(url string) (*net_http.Response, error) {
 	if err != nil {
 		return nil, err
 	}
-	
+
 	req.Header.Set("User-Agent", userAgent())
 
 	resp, err := net_http.DefaultClient.Do(req)
