@@ -404,7 +404,7 @@ func apiPostExportHandler(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	err = aiengine.ExportModel(pod.Name, tag.(string), &exportRequest)
+	err = aiengine.ExportPod(pod.Name, tag.(string), &exportRequest)
 	if err != nil {
 		ctx.Response.SetStatusCode(400)
 		ctx.Response.SetBodyString(err.Error())
@@ -439,7 +439,7 @@ func apiPostImportHandler(ctx *fasthttp.RequestCtx) {
 	importRequest.Pod = pod.Name
 	importRequest.Tag = tag.(string)
 
-	err = aiengine.ImportModel(&importRequest)
+	err = aiengine.ImportPod(&importRequest)
 	if err != nil {
 		ctx.Response.SetStatusCode(400)
 		ctx.Response.SetBodyString(err.Error())

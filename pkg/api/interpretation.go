@@ -21,3 +21,10 @@ func NewInterpretation(interpretation *interpretations.Interpretation) *Interpre
 		Tags:    interpretation.Tags(),
 	}
 }
+
+func ApiInterpretations(interpretations []*interpretations.Interpretation) []*Interpretation{
+	apiInterpretations := make([]*Interpretation, 0, len(interpretations))
+	for _, i := range interpretations {
+		apiInterpretations = append(apiInterpretations, i)
+	}
+}

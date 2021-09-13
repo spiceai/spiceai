@@ -19,7 +19,7 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-func ExportModel(podName string, tag string, request *runtime_pb.ExportModel) error {
+func ExportPod(podName string, tag string, request *runtime_pb.ExportModel) error {
 	if !ServerReady() {
 		return fmt.Errorf("not ready")
 	}
@@ -68,7 +68,7 @@ func ExportModel(podName string, tag string, request *runtime_pb.ExportModel) er
 	defer zipWriter.Close()
 
 	for _, f := range files {
-		err = AddFileOrDirToZip(zipWriter, filepath.Join(absDir, f), f)
+		err = addFileOrDirToZip(zipWriter, filepath.Join(absDir, f), f)
 		if err != nil {
 			return err
 		}
@@ -90,11 +90,14 @@ func ExportModel(podName string, tag string, request *runtime_pb.ExportModel) er
 		return err
 	}
 
-	err = AddBytesAsFileToZip(zipWriter, initBytes, "init.pb")
+	interpretations := pod.Interpretations()
+	
+
+	err = addBytesAsFileToZip(zipWriter, initBytes, "init.pb")
 	if err != nil {
 		return err
 	}
-	err = AddBytesAsFileToZip(zipWriter, manifestBytes, fmt.Sprintf("%s.yaml", podName))
+	err = addBytesAsFileToZip(zipWriter, manifestBytes, fmt.Sprintf("%s.yaml", podName))
 	if err != nil {
 		return err
 	}
@@ -102,7 +105,7 @@ func ExportModel(podName string, tag string, request *runtime_pb.ExportModel) er
 	return nil
 }
 
-func ImportModel(request *runtime_pb.ImportModel) error {
+func ImportPod(request *runtime_pb.ImportModel) error {
 	if !ServerReady() {
 		return fmt.Errorf("not ready")
 	}
@@ -170,7 +173,7 @@ func ImportModel(request *runtime_pb.ImportModel) error {
 	return nil
 }
 
-func AddBytesAsFileToZip(zipWriter *zip.Writer, fileContent []byte, filename string) error {
+func addBytesAsFileToZip(zipWriter *zip.Writer, fileContent []byte, filename string) error {
 	header := &zip.FileHeader{
 		Name:   filename,
 		Method: zip.Store,
@@ -188,7 +191,7 @@ func AddBytesAsFileToZip(zipWriter *zip.Writer, fileContent []byte, filename str
 	return nil
 }
 
-func AddFileOrDirToZip(zipWriter *zip.Writer, fullPath string, relativePath string) error {
+func addFileOrDirToZip(zipWriter *zip.Writer, fullPath string, relativePath string) error {
 	fileToZip, err := os.Open(fullPath)
 	if err != nil {
 		return err
