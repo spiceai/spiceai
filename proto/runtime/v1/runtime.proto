@@ -35,11 +35,3 @@ message Pod {
   string name = 1;
   string manifest_path = 2;
 }
-
-message Interpretation {
-  int64 start = 1;
-  int64 end = 2;
-  string name = 3;
-  repeated string actions = 4;
-  repeated string tags = 5;
-}

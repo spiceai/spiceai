@@ -18,6 +18,7 @@ import (
 	"github.com/spiceai/spiceai/pkg/interpretations"
 	"github.com/spiceai/spiceai/pkg/loggers"
 	"github.com/spiceai/spiceai/pkg/pods"
+	"github.com/spiceai/spiceai/pkg/proto/common_pb"
 	"github.com/spiceai/spiceai/pkg/proto/runtime_pb"
 	"github.com/spiceai/spiceai/pkg/util"
 	"github.com/valyala/fasthttp"
@@ -355,7 +356,7 @@ func apiPostInterpretationsHandler(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	var apiInterpretations []*runtime_pb.Interpretation
+	var apiInterpretations []*common_pb.Interpretation
 	err := json.Unmarshal(ctx.Request.Body(), &apiInterpretations)
 	if err != nil {
 		ctx.Response.SetStatusCode(http.StatusBadRequest)

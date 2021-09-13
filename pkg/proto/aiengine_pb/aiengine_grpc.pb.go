@@ -20,6 +20,7 @@ const _ = grpc.SupportPackageIsVersion7
 type AIEngineClient interface {
 	Init(ctx context.Context, in *InitRequest, opts ...grpc.CallOption) (*Response, error)
 	AddData(ctx context.Context, in *AddDataRequest, opts ...grpc.CallOption) (*Response, error)
+	AddInterpretations(ctx context.Context, in *AddInterpretationsRequest, opts ...grpc.CallOption) (*Response, error)
 	StartTraining(ctx context.Context, in *StartTrainingRequest, opts ...grpc.CallOption) (*Response, error)
 	GetInference(ctx context.Context, in *InferenceRequest, opts ...grpc.CallOption) (*InferenceResult, error)
 	GetHealth(ctx context.Context, in *HealthRequest, opts ...grpc.CallOption) (*Response, error)
@@ -47,6 +48,15 @@ func (c *aIEngineClient) Init(ctx context.Context, in *InitRequest, opts ...grpc
 func (c *aIEngineClient) AddData(ctx context.Context, in *AddDataRequest, opts ...grpc.CallOption) (*Response, error) {
 	out := new(Response)
 	err := c.cc.Invoke(ctx, "/aiengine.AIEngine/AddData", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *aIEngineClient) AddInterpretations(ctx context.Context, in *AddInterpretationsRequest, opts ...grpc.CallOption) (*Response, error) {
+	out := new(Response)
+	err := c.cc.Invoke(ctx, "/aiengine.AIEngine/AddInterpretations", in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -104,6 +114,7 @@ func (c *aIEngineClient) ImportModel(ctx context.Context, in *ImportModelRequest
 type AIEngineServer interface {
 	Init(context.Context, *InitRequest) (*Response, error)
 	AddData(context.Context, *AddDataRequest) (*Response, error)
+	AddInterpretations(context.Context, *AddInterpretationsRequest) (*Response, error)
 	StartTraining(context.Context, *StartTrainingRequest) (*Response, error)
 	GetInference(context.Context, *InferenceRequest) (*InferenceResult, error)
 	GetHealth(context.Context, *HealthRequest) (*Response, error)
@@ -120,6 +131,9 @@ func (UnimplementedAIEngineServer) Init(context.Context, *InitRequest) (*Respons
 }
 func (UnimplementedAIEngineServer) AddData(context.Context, *AddDataRequest) (*Response, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method AddData not implemented")
+}
+func (UnimplementedAIEngineServer) AddInterpretations(context.Context, *AddInterpretationsRequest) (*Response, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method AddInterpretations not implemented")
 }
 func (UnimplementedAIEngineServer) StartTraining(context.Context, *StartTrainingRequest) (*Response, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method StartTraining not implemented")
@@ -180,6 +194,24 @@ func _AIEngine_AddData_Handler(srv interface{}, ctx context.Context, dec func(in
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(AIEngineServer).AddData(ctx, req.(*AddDataRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _AIEngine_AddInterpretations_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AddInterpretationsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AIEngineServer).AddInterpretations(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/aiengine.AIEngine/AddInterpretations",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AIEngineServer).AddInterpretations(ctx, req.(*AddInterpretationsRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -288,6 +320,10 @@ var AIEngine_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "AddData",
 			Handler:    _AIEngine_AddData_Handler,
+		},
+		{
+			MethodName: "AddInterpretations",
+			Handler:    _AIEngine_AddInterpretations_Handler,
 		},
 		{
 			MethodName: "StartTraining",

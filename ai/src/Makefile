@@ -23,7 +23,7 @@ venv-gen-proto:
 ################################################################################
 # Target: gen-proto                                                            #
 ################################################################################
-GRPC_PROTOS:=aiengine runtime
+GRPC_PROTOS:=common aiengine runtime
 
 define genProtoc
 .PHONY: gen-proto-$(1)

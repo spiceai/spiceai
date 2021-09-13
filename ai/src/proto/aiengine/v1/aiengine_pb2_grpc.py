@@ -24,6 +24,11 @@ class AIEngineStub(object):
                 request_serializer=proto_dot_aiengine_dot_v1_dot_aiengine__pb2.AddDataRequest.SerializeToString,
                 response_deserializer=proto_dot_aiengine_dot_v1_dot_aiengine__pb2.Response.FromString,
                 )
+        self.AddInterpretations = channel.unary_unary(
+                '/aiengine.AIEngine/AddInterpretations',
+                request_serializer=proto_dot_aiengine_dot_v1_dot_aiengine__pb2.AddInterpretationsRequest.SerializeToString,
+                response_deserializer=proto_dot_aiengine_dot_v1_dot_aiengine__pb2.Response.FromString,
+                )
         self.StartTraining = channel.unary_unary(
                 '/aiengine.AIEngine/StartTraining',
                 request_serializer=proto_dot_aiengine_dot_v1_dot_aiengine__pb2.StartTrainingRequest.SerializeToString,
@@ -61,6 +66,12 @@ class AIEngineServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def AddData(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def AddInterpretations(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -107,6 +118,11 @@ def add_AIEngineServicer_to_server(servicer, server):
             'AddData': grpc.unary_unary_rpc_method_handler(
                     servicer.AddData,
                     request_deserializer=proto_dot_aiengine_dot_v1_dot_aiengine__pb2.AddDataRequest.FromString,
+                    response_serializer=proto_dot_aiengine_dot_v1_dot_aiengine__pb2.Response.SerializeToString,
+            ),
+            'AddInterpretations': grpc.unary_unary_rpc_method_handler(
+                    servicer.AddInterpretations,
+                    request_deserializer=proto_dot_aiengine_dot_v1_dot_aiengine__pb2.AddInterpretationsRequest.FromString,
                     response_serializer=proto_dot_aiengine_dot_v1_dot_aiengine__pb2.Response.SerializeToString,
             ),
             'StartTraining': grpc.unary_unary_rpc_method_handler(
@@ -174,6 +190,23 @@ class AIEngine(object):
             metadata=None):
         return grpc.experimental.unary_unary(request, target, '/aiengine.AIEngine/AddData',
             proto_dot_aiengine_dot_v1_dot_aiengine__pb2.AddDataRequest.SerializeToString,
+            proto_dot_aiengine_dot_v1_dot_aiengine__pb2.Response.FromString,
+            options, channel_credentials,
+            insecure, call_credentials, compression, wait_for_ready, timeout, metadata)
+
+    @staticmethod
+    def AddInterpretations(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(request, target, '/aiengine.AIEngine/AddInterpretations',
+            proto_dot_aiengine_dot_v1_dot_aiengine__pb2.AddInterpretationsRequest.SerializeToString,
             proto_dot_aiengine_dot_v1_dot_aiengine__pb2.Response.FromString,
             options, channel_credentials,
             insecure, call_credentials, compression, wait_for_ready, timeout, metadata)

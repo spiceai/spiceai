@@ -49,7 +49,7 @@ init-proto:
 ################################################################################
 # Target: gen-proto                                                            #
 ################################################################################
-GRPC_PROTOS:=aiengine runtime
+GRPC_PROTOS:=common aiengine runtime
 PROTO_PREFIX:=github.com/spiceai/spiceai
 
 define genProtoc

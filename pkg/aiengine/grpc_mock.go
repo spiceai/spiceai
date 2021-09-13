@@ -8,14 +8,15 @@ import (
 )
 
 type MockAIEngineClient struct {
-	InitHandler          func(context.Context, *aiengine_pb.InitRequest, ...grpc.CallOption) (*aiengine_pb.Response, error)
-	AddDataHandler       func(context.Context, *aiengine_pb.AddDataRequest, ...grpc.CallOption) (*aiengine_pb.Response, error)
-	StartTrainingHandler func(context.Context, *aiengine_pb.StartTrainingRequest, ...grpc.CallOption) (*aiengine_pb.Response, error)
-	GetInferenceHandler  func(context.Context, *aiengine_pb.InferenceRequest, ...grpc.CallOption) (*aiengine_pb.InferenceResult, error)
-	GetHealthHandler     func(context.Context, *aiengine_pb.HealthRequest, ...grpc.CallOption) (*aiengine_pb.Response, error)
-	ExportModelHandler   func(context.Context, *aiengine_pb.ExportModelRequest, ...grpc.CallOption) (*aiengine_pb.ExportModelResult, error)
-	ImportModelHandler   func(context.Context, *aiengine_pb.ImportModelRequest, ...grpc.CallOption) (*aiengine_pb.Response, error)
-	CloseHandler         func() error
+	InitHandler               func(context.Context, *aiengine_pb.InitRequest, ...grpc.CallOption) (*aiengine_pb.Response, error)
+	AddDataHandler            func(context.Context, *aiengine_pb.AddDataRequest, ...grpc.CallOption) (*aiengine_pb.Response, error)
+	AddInterpretationsHandler func(context.Context, *aiengine_pb.AddInterpretationsRequest, ...grpc.CallOption) (*aiengine_pb.Response, error)
+	StartTrainingHandler      func(context.Context, *aiengine_pb.StartTrainingRequest, ...grpc.CallOption) (*aiengine_pb.Response, error)
+	GetInferenceHandler       func(context.Context, *aiengine_pb.InferenceRequest, ...grpc.CallOption) (*aiengine_pb.InferenceResult, error)
+	GetHealthHandler          func(context.Context, *aiengine_pb.HealthRequest, ...grpc.CallOption) (*aiengine_pb.Response, error)
+	ExportModelHandler        func(context.Context, *aiengine_pb.ExportModelRequest, ...grpc.CallOption) (*aiengine_pb.ExportModelResult, error)
+	ImportModelHandler        func(context.Context, *aiengine_pb.ImportModelRequest, ...grpc.CallOption) (*aiengine_pb.Response, error)
+	CloseHandler              func() error
 }
 
 func NewMockAIEngineClient(target string) (AIEngineClient, error) {
@@ -33,6 +34,14 @@ func (a *MockAIEngineClient) Init(ctx context.Context, in *aiengine_pb.InitReque
 func (a *MockAIEngineClient) AddData(ctx context.Context, in *aiengine_pb.AddDataRequest, opts ...grpc.CallOption) (*aiengine_pb.Response, error) {
 	if a.AddDataHandler != nil {
 		return a.AddDataHandler(ctx, in, opts...)
+	}
+
+	return nil, nil
+}
+
+func (a *MockAIEngineClient) AddInterpretations(ctx context.Context, in *aiengine_pb.AddInterpretationsRequest, opts ...grpc.CallOption) (*aiengine_pb.Response, error) {
+	if a.AddInterpretationsHandler != nil {
+		return a.AddInterpretationsHandler(ctx, in, opts...)
 	}
 
 	return nil, nil

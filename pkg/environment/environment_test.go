@@ -41,6 +41,12 @@ func testStartDataListeners() func(*testing.T) {
 					Result: "ok",
 				}, nil
 			},
+			AddInterpretationsHandler: func(c context.Context, adr *aiengine_pb.AddInterpretationsRequest, co ...grpc.CallOption) (*aiengine_pb.Response, error) {
+				data_received <- true
+				return &aiengine_pb.Response{
+					Result: "ok",
+				}, nil
+			},
 		})
 
 		go func() {

@@ -2,11 +2,14 @@ syntax = "proto3";
 
 package aiengine;
 
+import "proto/common/v1/common.proto";
+
 option go_package = "github.com/spiceai/spiceai/pkg/proto/aiengine_pb";
 
 service AIEngine {
   rpc Init(InitRequest) returns (Response);
   rpc AddData(AddDataRequest) returns (Response);
+  rpc AddInterpretations(AddInterpretationsRequest) returns (Response);
   rpc StartTraining(StartTrainingRequest) returns (Response);
   rpc GetInference(InferenceRequest) returns (InferenceResult);
   rpc GetHealth(HealthRequest) returns (Response);
@@ -73,6 +76,11 @@ message InferenceResult {
 message AddDataRequest {
   string pod = 1;
   string csv_data = 2;
+}
+
+message AddInterpretationsRequest {
+  string pod = 1;
+  repeated common.Interpretation interpretations = 2;
 }
 
 message HealthRequest {}

@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/spiceai/spiceai/pkg/proto/runtime_pb"
+	"github.com/spiceai/spiceai/pkg/proto/common_pb"
 )
 
 type Interpretation struct {
@@ -15,7 +15,7 @@ type Interpretation struct {
 	tags    []string
 }
 
-func NewInterpretationFromProto(apiInterpretation *runtime_pb.Interpretation) (*Interpretation, error) {
+func NewInterpretationFromProto(apiInterpretation *common_pb.Interpretation) (*Interpretation, error) {
 	i, err := NewInterpretation(
 		time.Unix(apiInterpretation.Start, 0),
 		time.Unix(apiInterpretation.End, 0),

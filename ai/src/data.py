@@ -39,6 +39,8 @@ class DataManager:
         ).mean()
         self.fill_table()
 
+        self.interpretations = []
+
         self.current_time: pd.Timestamp = None
         self.action_rewards = action_rewards
         self.table_lock = threading.Lock()
@@ -116,6 +118,9 @@ class DataManager:
             metrics.end("combine")
 
             self.fill_table()
+
+    def add_interpretations(self, aiengine_pb2):
+
 
     def get_shape(self):
         return np.shape([0] * self.get_window_span() * len(self.fields))
