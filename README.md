@@ -24,6 +24,14 @@ Spice.ai is written in Golang and Python and runs as a container or microservice
 
 📺 View a 60 second demo of Spice.ai in action [here](https://www.youtube.com/watch?v=FPPGyPq41kQ).
 
+### Why Spice.ai?
+
+Spice.ai is for developers interested in using AI to make their applications more intelligent but don't have the time or resources to learn and build all the AI/ML.
+
+Imagine you have timestamped measurements of the room temperature and access to air-conditioning controls. If you had a time-series AI engine, your application could optimize when the A/C activates. You could reduce energy usage by not overcooling the room as the temperature drops.
+
+Now imagine learning Python, neural networks, deep-learning algorithms and building a system that streams and processes time-series data to do that. With a time-series AI engine accessible over HTTP APIs, a library of community-driven components for data streaming and processing, and an eco-system of pre-created ML configuration, you could build upon the experience of the community instead of doing it all yourself. You can then focus on your business logic and building your application instead of the ML.
+
 ### Community-driven data components
 
 The Spice.ai runtime also includes a library of [community-driven data components](https://github.com/spiceai/data-components-contrib) for streaming and processing time series data, enabling developers to quickly and easily combine data with learning to create intelligent models.
