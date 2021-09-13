@@ -15,7 +15,6 @@ import (
 	"github.com/spiceai/spiceai/pkg/api"
 	"github.com/spiceai/spiceai/pkg/dashboard"
 	"github.com/spiceai/spiceai/pkg/flights"
-	"github.com/spiceai/spiceai/pkg/interpretations"
 	"github.com/spiceai/spiceai/pkg/loggers"
 	"github.com/spiceai/spiceai/pkg/pods"
 	"github.com/spiceai/spiceai/pkg/proto/runtime_pb"
@@ -351,7 +350,7 @@ func apiPostInterpretationsHandler(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	var apiInterpretations []*runtime_pb.Interpretation
+	var apiInterpretations []*api.Interpretation
 	err := json.Unmarshal(ctx.Request.Body(), &apiInterpretations)
 	if err != nil {
 		ctx.Response.SetStatusCode(http.StatusBadRequest)
@@ -360,7 +359,7 @@ func apiPostInterpretationsHandler(ctx *fasthttp.RequestCtx) {
 	}
 
 	for _, i := range apiInterpretations {
-		interpretation, err := interpretations.NewInterpretationFromProto(i)
+		interpretation, err := api.NewInterpretationFromApi(i)
 		if err != nil {
 			ctx.Response.SetStatusCode(http.StatusBadRequest)
 			ctx.Response.SetBodyString(err.Error())
