@@ -15,9 +15,11 @@ import (
 	"github.com/spiceai/spiceai/pkg/api"
 	"github.com/spiceai/spiceai/pkg/dashboard"
 	"github.com/spiceai/spiceai/pkg/flights"
+	"github.com/spiceai/spiceai/pkg/interpretations"
 	"github.com/spiceai/spiceai/pkg/loggers"
 	"github.com/spiceai/spiceai/pkg/pods"
 	"github.com/spiceai/spiceai/pkg/proto/runtime_pb"
+	"github.com/spiceai/spiceai/pkg/util"
 	"github.com/valyala/fasthttp"
 	"go.uber.org/zap"
 )
@@ -278,6 +280,108 @@ func apiPostFlightEpisodeHandler(ctx *fasthttp.RequestCtx) {
 	ctx.Response.SetStatusCode(201)
 }
 
+func apiGetInterpretationsHandler(ctx *fasthttp.RequestCtx) {
+	podParam := ctx.UserValue("pod").(string)
+	pod := pods.GetPod(podParam)
+	if pod == nil {
+		ctx.Response.SetStatusCode(http.StatusNotFound)
+		return
+	}
+
+	start := pod.Epoch()
+	startArg := ctx.QueryArgs().Peek("start")
+	if startArg != nil {
+		startTime, err := util.ParseTime(string(startArg))
+		if err != nil {
+			ctx.Response.SetStatusCode(http.StatusBadRequest)
+			ctx.Response.SetBodyString(fmt.Sprintf("invalid start %s", startArg))
+			return
+		}
+		start = time.Unix(startTime, 0)
+
+		if start.Before(pod.Epoch()) {
+			ctx.Response.SetStatusCode(http.StatusBadRequest)
+			ctx.Response.SetBodyString(fmt.Sprintf("start %s cannot be before pod epoch %s", startArg, pod.Epoch().String()))
+			return
+		}
+	}
+
+	podPeriodEnd := pod.Epoch().Add(pod.Period())
+	end := podPeriodEnd
+	endArg := ctx.QueryArgs().Peek("end")
+	if endArg != nil {
+		endTime, err := util.ParseTime(string(endArg))
+		if err != nil {
+			ctx.Response.SetStatusCode(http.StatusBadRequest)
+			ctx.Response.SetBodyString(fmt.Sprintf("invalid end %s", endArg))
+			return
+		}
+		end = time.Unix(endTime, 0)
+
+		if end.After(podPeriodEnd) {
+			ctx.Response.SetStatusCode(http.StatusBadRequest)
+			ctx.Response.SetBodyString(fmt.Sprintf("end %s cannot be after pod period %s", startArg, podPeriodEnd.String()))
+			return
+		}
+	}
+
+	if end.Before(start) {
+		ctx.Response.SetStatusCode(http.StatusBadRequest)
+		ctx.Response.SetBodyString(fmt.Sprintf("end %s cannot be before start %s", endArg, startArg))
+		return
+	}
+
+	interpretations := pod.GetInterpretations(start, end)
+
+	apiInterpretations := make([]*api.Interpretation, 0, len(interpretations))
+	for _, i := range interpretations {
+		apiInterpretations = append(apiInterpretations, api.NewInterpretation(&i))
+	}
+
+	response, err := json.Marshal(apiInterpretations)
+	if err != nil {
+		ctx.Response.Header.SetContentType("application/json")
+		return
+	}
+
+	ctx.Response.SetBody(response)
+}
+
+func apiPostInterpretationsHandler(ctx *fasthttp.RequestCtx) {
+	podParam := ctx.UserValue("pod").(string)
+	pod := pods.GetPod(podParam)
+	if pod == nil {
+		ctx.Response.SetStatusCode(http.StatusNotFound)
+		return
+	}
+
+	var apiInterpretations []*runtime_pb.Interpretation
+	err := json.Unmarshal(ctx.Request.Body(), &apiInterpretations)
+	if err != nil {
+		ctx.Response.SetStatusCode(http.StatusBadRequest)
+		ctx.Response.SetBodyString(err.Error())
+		return
+	}
+
+	for _, i := range apiInterpretations {
+		interpretation, err := interpretations.NewInterpretationFromProto(i)
+		if err != nil {
+			ctx.Response.SetStatusCode(http.StatusBadRequest)
+			ctx.Response.SetBodyString(err.Error())
+			return
+		}
+
+		err = pod.AddInterpretation(interpretation)
+		if err != nil {
+			ctx.Response.SetStatusCode(http.StatusBadRequest)
+			ctx.Response.SetBodyString(err.Error())
+			return
+		}
+	}
+
+	ctx.Response.SetStatusCode(http.StatusCreated)
+}
+
 func apiPostExportHandler(ctx *fasthttp.RequestCtx) {
 	tag := ctx.UserValue("tag")
 
@@ -382,6 +486,10 @@ func (server *server) Start() error {
 		api.POST("/pods/{pod}/training_runs/{flight}/episodes", apiPostFlightEpisodeHandler)
 
 		api.GET("/acknowledgements", dashboardServer.AcknowledgementsHandler)
+		
+		// Interpretations
+		api.GET("/pods/{pod}/interpretations", apiGetInterpretationsHandler)
+		api.POST("/pods/{pod}/interpretations", apiPostInterpretationsHandler)
 	}
 
 	static := r.Group("/static")
