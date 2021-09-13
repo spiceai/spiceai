@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
+	"strings"
 	"time"
 
 	"github.com/fasthttp/router"
@@ -390,7 +392,13 @@ func (server *server) Start() error {
 	}
 
 	r.GET("/manifest.json", dashboardServer.ManifestJsonHandler)
-	r.GET("/{filepath:*}", dashboardServer.IndexHandler)
+	r.GET("/{filepath:*}", func(ctx *fasthttp.RequestCtx) {
+		if strings.Contains(ctx.URI().String(), "/api/") {
+			ctx.Response.SetStatusCode(http.StatusNotFound)
+			return
+		}
+		dashboardServer.IndexHandler(ctx)
+	})
 	r.GET("/", dashboardServer.IndexHandler)
 
 	serverLogger, err := zap.NewStdLogAt(zaplog, zap.DebugLevel)
