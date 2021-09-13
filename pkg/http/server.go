@@ -393,7 +393,7 @@ func (server *server) Start() error {
 
 	r.GET("/manifest.json", dashboardServer.ManifestJsonHandler)
 	r.GET("/{filepath:*}", func(ctx *fasthttp.RequestCtx) {
-		if strings.Index(ctx.URI().String(), "/api/") >= 0 {
+		if strings.Contains(ctx.URI().String(), "/api/") {
 			ctx.Response.SetStatusCode(http.StatusNotFound)
 			return
 		}
