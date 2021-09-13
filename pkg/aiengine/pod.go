@@ -146,6 +146,8 @@ func ImportPod(request *runtime_pb.ImportModel) error {
 		return err
 	}
 
+	pods.CreateOrUpdatePod(pod)
+
 	err = sendInit(&init)
 	if err != nil {
 		return err
