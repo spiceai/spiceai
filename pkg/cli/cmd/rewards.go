@@ -27,11 +27,13 @@ var rewardAddCmd = &cobra.Command{
 spice reward add
 `,
 	Run: func(cmd *cobra.Command, args []string) {
-		podPath := pods.FindFirstManifestPath()
-		if podPath == "" {
+		manifests := pods.FindAllManifestPaths()
+		if len(manifests) == 0 {
 			fmt.Println("No pods detected!")
 			return
 		}
+
+		podPath := manifests[0]
 
 		pod, err := pods.LoadPodFromManifest(podPath)
 		if err != nil {
