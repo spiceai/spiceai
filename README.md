@@ -30,8 +30,6 @@ Spice.ai includes:
 
 Spice.ai is written in Golang and Python and runs as a container or microservice. It's deployable to any public cloud, on-premises, and edge.
 
-Spice.ai is written in Golang and Python and runs as a container or microservice with applications calling a simple HTTP API. It's deployable to any public cloud, on-premises, and edge.
-
 📢 Read the Spice.ai announcement blog post at [blog.spiceai.org](https://blog.spiceai.org).
 
 📺 View a 60 second demo of Spice.ai in action [here](https://www.youtube.com/watch?v=FPPGyPq41kQ).
