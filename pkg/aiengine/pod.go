@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"io/fs"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/spiceai/spiceai/pkg/api"
 	"github.com/spiceai/spiceai/pkg/pods"
 	"github.com/spiceai/spiceai/pkg/proto/aiengine_pb"
 	"github.com/spiceai/spiceai/pkg/proto/runtime_pb"
@@ -91,7 +93,16 @@ func ExportPod(podName string, tag string, request *runtime_pb.ExportModel) erro
 	}
 
 	interpretations := pod.Interpretations()
-	
+	apiInterpretations := api.ApiInterpretations(interpretations)
+	interpretationData, err := json.Marshal(apiInterpretations)
+	if err != nil {
+		return err
+	}
+
+	err = addBytesAsFileToZip(zipWriter, interpretationData, "interpretations.json")
+	if err != nil {
+		return err
+	}
 
 	err = addBytesAsFileToZip(zipWriter, initBytes, "init.pb")
 	if err != nil {
@@ -138,6 +149,22 @@ func ImportPod(request *runtime_pb.ImportModel) error {
 	err = sendInit(&init)
 	if err != nil {
 		return err
+	}
+
+	interpretationsPath := filepath.Join(tempDir, "interpretations.json")
+	if _, err := os.Stat(interpretationsPath); err == nil {
+		interpretationsBytes, err := os.ReadFile(filepath.Join(tempDir, "interpretations.json"))
+		if err != nil {
+			return err
+		}
+		var apiInterpretations []api.Interpretation
+		err = json.Unmarshal(interpretationsBytes, &apiInterpretations)
+		if err != nil {
+			return err
+		}
+		for _, i := range apiInterpretations {
+			interpretation := api.NewInterpretationFromApi(i)
+		}
 	}
 
 	podState, err := pod.FetchNewData()

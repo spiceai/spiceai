@@ -332,11 +332,7 @@ func apiGetInterpretationsHandler(ctx *fasthttp.RequestCtx) {
 	}
 
 	interpretations := pod.GetInterpretations(start, end)
-
-	apiInterpretations := make([]*api.Interpretation, 0, len(interpretations))
-	for _, i := range interpretations {
-		apiInterpretations = append(apiInterpretations, api.NewInterpretation(&i))
-	}
+	apiInterpretations := api.ApiInterpretations(interpretations)
 
 	response, err := json.Marshal(apiInterpretations)
 	if err != nil {
