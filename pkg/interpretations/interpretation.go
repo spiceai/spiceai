@@ -3,8 +3,6 @@ package interpretations
 import (
 	"fmt"
 	"time"
-
-	"github.com/spiceai/spiceai/pkg/proto/runtime_pb"
 )
 
 type Interpretation struct {
@@ -13,23 +11,6 @@ type Interpretation struct {
 	name    string
 	actions []string
 	tags    []string
-}
-
-func NewInterpretationFromProto(apiInterpretation *runtime_pb.Interpretation) (*Interpretation, error) {
-	i, err := NewInterpretation(
-		time.Unix(apiInterpretation.Start, 0),
-		time.Unix(apiInterpretation.End, 0),
-		apiInterpretation.Name,
-	)
-
-	if err != nil {
-		return nil, err
-	}
-
-	i.AddActions(apiInterpretation.Actions...)
-	i.AddTags(apiInterpretation.Tags...)
-
-	return i, nil
 }
 
 func NewInterpretation(start time.Time, end time.Time, name string) (*Interpretation, error) {

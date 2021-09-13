@@ -69,7 +69,7 @@ func testPostInterpretationsHandlerFunc(pod *pods.Pod) func(t *testing.T) {
 		}
 		ctx.SetUserValue("pod", "trader")
 
-		apiInterpretation := api.NewInterpretation(interpretation)
+		apiInterpretation := api.NewApiInterpretation(interpretation)
 
 		data, err := json.Marshal(apiInterpretation)
 		if err != nil {
