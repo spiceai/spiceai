@@ -119,8 +119,13 @@ class DataManager:
 
             self.fill_table()
 
-    def add_interpretations(self, aiengine_pb2):
+    def add_interpretations(self, interpretations):
+        self.interpretations += interpretations
+        pass
 
+    def get_interpretations_for_interval(self):
+        # use.current_time && self.interval_sec
+        pass
 
     def get_shape(self):
         return np.shape([0] * self.get_window_span() * len(self.fields))
@@ -183,7 +188,7 @@ class DataManager:
 
         return True
 
-    def reward(self, prev_state_pd, new_state_pd, action: int):
+    def reward(self, prev_state_pd, new_state_pd, action: int, interpretations):
         prev_state_dict = dict()
         new_state_dict = dict()
 
@@ -197,6 +202,8 @@ class DataManager:
         loc = dict()
         loc["prev_state"] = prev_state
         loc["new_state"] = new_state
+        if interpretations is not None:
+            loc["interpretations"] = interpretations
 
         action_name = self.action_names[action]
         reward_func = self.action_rewards[action_name]

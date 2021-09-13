@@ -93,11 +93,13 @@ def train_agent(
 
                 reward = -5
                 if is_valid:
+                    interpretations = data_manager.get_interpretations_for_interval()
                     try:
                         reward = data_manager.reward(
                             raw_state,
                             raw_state_prime,
                             action,
+                            interpretations,
                         )
                     except RewardInvalidException as ex:
                         post_episode_result(REQUEST_URL, ex.get_error_body())
