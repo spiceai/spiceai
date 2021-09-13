@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
 	"time"
 
 	"github.com/fasthttp/router"
@@ -12,10 +13,12 @@ import (
 	"github.com/spiceai/spiceai/pkg/aiengine"
 	"github.com/spiceai/spiceai/pkg/api"
 	"github.com/spiceai/spiceai/pkg/dashboard"
+	"github.com/spiceai/spiceai/pkg/dataspaces"
 	"github.com/spiceai/spiceai/pkg/flights"
 	"github.com/spiceai/spiceai/pkg/loggers"
 	"github.com/spiceai/spiceai/pkg/pods"
 	"github.com/spiceai/spiceai/pkg/proto/runtime_pb"
+	"github.com/spiceai/spiceai/pkg/state"
 	"github.com/valyala/fasthttp"
 	"go.uber.org/zap"
 )
@@ -94,6 +97,57 @@ func apiPostObservationsHandler(ctx *fasthttp.RequestCtx) {
 	}
 
 	pod.AddLocalState(newState...)
+
+	ctx.Response.SetStatusCode(201)
+}
+
+func apiPostDataspaceHandler(ctx *fasthttp.RequestCtx) {
+	podParam := ctx.UserValue("pod").(string)
+	pod := pods.GetPod(podParam)
+
+	if pod == nil {
+		ctx.Response.SetStatusCode(404)
+		return
+	}
+
+	dataspaceFrom := ctx.UserValue("dataspace_from").(string)
+	dataspaceName := ctx.UserValue("dataspace_name").(string)
+
+	var selectedDataspace *dataspaces.Dataspace
+	for _, dataspace := range pod.DataSources() {
+		if dataspace.DataspaceSpec.From == dataspaceFrom && dataspace.DataspaceSpec.Name == dataspaceName {
+			selectedDataspace = dataspace
+		}
+	}
+
+	if selectedDataspace == nil {
+		ctx.Response.SetStatusCode(http.StatusNotFound)
+		return
+	}
+
+	dp, err := dataprocessors.NewDataProcessor(selectedDataspace.DataspaceSpec.Data.Processor.Name)
+	if err != nil {
+		zaplog.Sugar().Error(err)
+		ctx.Response.SetStatusCode(500)
+		return
+	}
+
+	_, err = dp.OnData(ctx.Request.Body())
+	if err != nil {
+		zaplog.Sugar().Error(err)
+		ctx.Response.SetStatusCode(500)
+		return
+	}
+
+	observations, err := dp.GetObservations()
+	if err != nil {
+		zaplog.Sugar().Error(err)
+		ctx.Response.SetStatusCode(500)
+		return
+	}
+
+	newState := state.NewState(selectedDataspace.Path(), selectedDataspace.FieldNames(), observations)
+	selectedDataspace.AddNewState(newState)
 
 	ctx.Response.SetStatusCode(201)
 }
@@ -373,6 +427,7 @@ func (server *server) Start() error {
 		api.POST("/pods/{pod}/models/{tag}/export", apiPostExportHandler)
 		api.POST("/pods/{pod}/import", apiPostImportHandler)
 		api.POST("/pods/{pod}/models/{tag}/import", apiPostImportHandler)
+		api.POST("/pods/{pod}/dataspaces/{dataspace_from}/{dataspace_name}", apiPostDataspaceHandler)
 
 		// Flights
 		api.GET("/pods/{pod}/training_runs", apiGetFlightsHandler)

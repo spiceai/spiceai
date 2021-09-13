@@ -27,14 +27,19 @@ func NewDataspace(dsSpec spec.DataspaceSpec) (*Dataspace, error) {
 	}
 
 	if dsSpec.Data != nil {
-		connector, err := dataconnectors.NewDataConnector(dsSpec.Data.Connector.Name)
-		if err != nil {
-			return nil, fmt.Errorf("failed to initialize data connector '%s': %s", dsSpec.Data.Connector.Name, err)
-		}
+		var connector dataconnectors.DataConnector = nil
+		var err error
 
-		err = connector.Init(dsSpec.Data.Connector.Params)
-		if err != nil {
-			return nil, fmt.Errorf("failed to initialize data connector '%s': %s", dsSpec.Data.Connector.Name, err)
+		if dsSpec.Data.Connector.Name != "" {
+			connector, err = dataconnectors.NewDataConnector(dsSpec.Data.Connector.Name)
+			if err != nil {
+				return nil, fmt.Errorf("failed to initialize data connector '%s': %s", dsSpec.Data.Connector.Name, err)
+			}
+
+			err = connector.Init(dsSpec.Data.Connector.Params)
+			if err != nil {
+				return nil, fmt.Errorf("failed to initialize data connector '%s': %s", dsSpec.Data.Connector.Name, err)
+			}
 		}
 
 		processor, err := dataprocessors.NewDataProcessor(ds.Data.Processor.Name)
