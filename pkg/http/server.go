@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/fasthttp/router"
@@ -19,6 +20,7 @@ import (
 	"github.com/spiceai/spiceai/pkg/pods"
 	"github.com/spiceai/spiceai/pkg/proto/runtime_pb"
 	"github.com/spiceai/spiceai/pkg/state"
+	"github.com/spiceai/spiceai/pkg/util"
 	"github.com/valyala/fasthttp"
 	"go.uber.org/zap"
 )
@@ -63,7 +65,7 @@ func apiGetObservationsHandler(ctx *fasthttp.RequestCtx) {
 	csv := pod.CachedCsv()
 
 	ctx.Response.Header.Add("Content-Type", " text/csv")
-	_, _ = ctx.Write([]byte(csv))
+	_, _ = ctx.WriteString(csv)
 }
 
 func apiPostObservationsHandler(ctx *fasthttp.RequestCtx) {
@@ -207,7 +209,7 @@ func apiPodTrainHandler(ctx *fasthttp.RequestCtx) {
 	err := aiengine.StartTraining(pod)
 	if err != nil {
 		ctx.Response.SetStatusCode(500)
-		ctx.Response.SetBody([]byte(err.Error()))
+		ctx.Response.SetBodyString(err.Error())
 		return
 	}
 
@@ -225,7 +227,7 @@ func apiRecommendationHandler(ctx *fasthttp.RequestCtx) {
 	inference, err := aiengine.Infer(pod, tag.(string))
 	if err != nil {
 		ctx.Response.SetStatusCode(500)
-		ctx.Response.SetBody([]byte(err.Error()))
+		ctx.Response.SetBodyString(err.Error())
 		return
 	}
 
@@ -236,7 +238,7 @@ func apiRecommendationHandler(ctx *fasthttp.RequestCtx) {
 	body, err := json.Marshal(inference)
 	if err != nil {
 		ctx.Response.SetStatusCode(500)
-		ctx.Response.SetBody([]byte(err.Error()))
+		ctx.Response.SetBodyString(err.Error())
 		return
 	}
 
@@ -311,7 +313,7 @@ func apiPostFlightEpisodeHandler(ctx *fasthttp.RequestCtx) {
 	err := json.Unmarshal(ctx.Request.Body(), &apiEpisode)
 	if err != nil {
 		ctx.Response.SetStatusCode(400)
-		ctx.Response.SetBody([]byte(err.Error()))
+		ctx.Response.SetBodyString(err.Error())
 		return
 	}
 
@@ -328,6 +330,108 @@ func apiPostFlightEpisodeHandler(ctx *fasthttp.RequestCtx) {
 	flight.RecordEpisode(episode)
 
 	ctx.Response.SetStatusCode(201)
+}
+
+func apiGetInterpretationsHandler(ctx *fasthttp.RequestCtx) {
+	podParam := ctx.UserValue("pod").(string)
+	pod := pods.GetPod(podParam)
+	if pod == nil {
+		ctx.Response.SetStatusCode(http.StatusNotFound)
+		return
+	}
+
+	start := pod.Epoch()
+	startArg := ctx.QueryArgs().Peek("start")
+	if startArg != nil {
+		startTime, err := util.ParseTime(string(startArg))
+		if err != nil {
+			ctx.Response.SetStatusCode(http.StatusBadRequest)
+			ctx.Response.SetBodyString(fmt.Sprintf("invalid start %s", startArg))
+			return
+		}
+		start = time.Unix(startTime, 0)
+
+		if start.Before(pod.Epoch()) {
+			ctx.Response.SetStatusCode(http.StatusBadRequest)
+			ctx.Response.SetBodyString(fmt.Sprintf("start %s cannot be before pod epoch %s", startArg, pod.Epoch().String()))
+			return
+		}
+	}
+
+	podPeriodEnd := pod.Epoch().Add(pod.Period())
+	end := podPeriodEnd
+	endArg := ctx.QueryArgs().Peek("end")
+	if endArg != nil {
+		endTime, err := util.ParseTime(string(endArg))
+		if err != nil {
+			ctx.Response.SetStatusCode(http.StatusBadRequest)
+			ctx.Response.SetBodyString(fmt.Sprintf("invalid end %s", endArg))
+			return
+		}
+		end = time.Unix(endTime, 0)
+
+		if end.After(podPeriodEnd) {
+			ctx.Response.SetStatusCode(http.StatusBadRequest)
+			ctx.Response.SetBodyString(fmt.Sprintf("end %s cannot be after pod period %s", startArg, podPeriodEnd.String()))
+			return
+		}
+	}
+
+	if end.Before(start) {
+		ctx.Response.SetStatusCode(http.StatusBadRequest)
+		ctx.Response.SetBodyString(fmt.Sprintf("end %s cannot be before start %s", endArg, startArg))
+		return
+	}
+
+	interpretations := pod.GetInterpretations(start, end)
+
+	apiInterpretations := make([]*api.Interpretation, 0, len(interpretations))
+	for _, i := range interpretations {
+		apiInterpretations = append(apiInterpretations, api.NewApiInterpretation(&i))
+	}
+
+	response, err := json.Marshal(apiInterpretations)
+	if err != nil {
+		ctx.Response.Header.SetContentType("application/json")
+		return
+	}
+
+	ctx.Response.SetBody(response)
+}
+
+func apiPostInterpretationsHandler(ctx *fasthttp.RequestCtx) {
+	podParam := ctx.UserValue("pod").(string)
+	pod := pods.GetPod(podParam)
+	if pod == nil {
+		ctx.Response.SetStatusCode(http.StatusNotFound)
+		return
+	}
+
+	var apiInterpretations []*api.Interpretation
+	err := json.Unmarshal(ctx.Request.Body(), &apiInterpretations)
+	if err != nil {
+		ctx.Response.SetStatusCode(http.StatusBadRequest)
+		ctx.Response.SetBodyString(err.Error())
+		return
+	}
+
+	for _, i := range apiInterpretations {
+		interpretation, err := api.NewInterpretationFromApi(i)
+		if err != nil {
+			ctx.Response.SetStatusCode(http.StatusBadRequest)
+			ctx.Response.SetBodyString(err.Error())
+			return
+		}
+
+		err = pod.AddInterpretation(interpretation)
+		if err != nil {
+			ctx.Response.SetStatusCode(http.StatusBadRequest)
+			ctx.Response.SetBodyString(err.Error())
+			return
+		}
+	}
+
+	ctx.Response.SetStatusCode(http.StatusCreated)
 }
 
 func apiPostExportHandler(ctx *fasthttp.RequestCtx) {
@@ -348,14 +452,14 @@ func apiPostExportHandler(ctx *fasthttp.RequestCtx) {
 	err := json.Unmarshal(ctx.Request.Body(), &exportRequest)
 	if err != nil {
 		ctx.Response.SetStatusCode(400)
-		ctx.Response.SetBody([]byte(err.Error()))
+		ctx.Response.SetBodyString(err.Error())
 		return
 	}
 
 	err = aiengine.ExportModel(pod.Name, tag.(string), &exportRequest)
 	if err != nil {
 		ctx.Response.SetStatusCode(400)
-		ctx.Response.SetBody([]byte(err.Error()))
+		ctx.Response.SetBodyString(err.Error())
 		return
 	}
 
@@ -380,7 +484,7 @@ func apiPostImportHandler(ctx *fasthttp.RequestCtx) {
 	err := json.Unmarshal(ctx.Request.Body(), &importRequest)
 	if err != nil {
 		ctx.Response.SetStatusCode(400)
-		ctx.Response.SetBody([]byte(err.Error()))
+		ctx.Response.SetBodyString(err.Error())
 		return
 	}
 
@@ -390,7 +494,7 @@ func apiPostImportHandler(ctx *fasthttp.RequestCtx) {
 	err = aiengine.ImportModel(&importRequest)
 	if err != nil {
 		ctx.Response.SetStatusCode(400)
-		ctx.Response.SetBody([]byte(err.Error()))
+		ctx.Response.SetBodyString(err.Error())
 		return
 	}
 
@@ -433,6 +537,10 @@ func (server *server) Start() error {
 		api.GET("/pods/{pod}/training_runs", apiGetFlightsHandler)
 		api.GET("/pods/{pod}/training_runs/{flight}", apiGetFlightHandler)
 		api.POST("/pods/{pod}/training_runs/{flight}/episodes", apiPostFlightEpisodeHandler)
+
+		// Interpretations
+		api.GET("/pods/{pod}/interpretations", apiGetInterpretationsHandler)
+		api.POST("/pods/{pod}/interpretations", apiPostInterpretationsHandler)
 	}
 
 	static := r.Group("/static")
@@ -443,7 +551,13 @@ func (server *server) Start() error {
 	}
 
 	r.GET("/manifest.json", dashboardServer.ManifestJsonHandler)
-	r.GET("/{filepath:*}", dashboardServer.IndexHandler)
+	r.GET("/{filepath:*}", func(ctx *fasthttp.RequestCtx) {
+		if strings.Contains(ctx.URI().String(), "/api/") {
+			ctx.Response.SetStatusCode(http.StatusNotFound)
+			return
+		}
+		dashboardServer.IndexHandler(ctx)
+	})
 	r.GET("/", dashboardServer.IndexHandler)
 
 	serverLogger, err := zap.NewStdLogAt(zaplog, zap.DebugLevel)
