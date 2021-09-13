@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"time"
 
+	"github.com/spiceai/spiceai/pkg/api"
 	"github.com/spiceai/spiceai/pkg/proto/aiengine_pb"
 	"github.com/spiceai/spiceai/pkg/proto/runtime_pb"
 	"github.com/spiceai/spiceai/pkg/util"
@@ -113,6 +114,30 @@ func (r *runtimeServer) getObservations(podName string) (string, error) {
 func (r *runtimeServer) getFlights(podName string) ([]*runtime_pb.Flight, error) {
 	var data []*runtime_pb.Flight
 	err := r.internalGet(fmt.Sprintf("%s/api/v0.1/pods/%s/training_runs", r.baseUrl, podName), &data)
+	if err != nil {
+		return nil, err
+	}
+
+	return data, nil
+}
+
+func (r *runtimeServer) postInterpretations(podName string, newInterpretations []byte) error {
+	url := fmt.Sprintf("%s/api/v0.1/pods/%s/interpretations", r.baseUrl, podName)
+	resp, err := http.Post(url, "application/json", bytes.NewReader(newInterpretations))
+	if err != nil {
+		return err
+	}
+
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("error posting new interpretations: %s", resp.Status)
+	}
+
+	return nil
+}
+
+func (r *runtimeServer) getInterpretations(podName string, startTime int64, endTime int64) ([]*api.Interpretation, error) {
+	var data []*api.Interpretation
+	err := r.internalGet(fmt.Sprintf("%s/api/v0.1/pods/%s/interpretations", r.baseUrl, podName), &data)
 	if err != nil {
 		return nil, err
 	}

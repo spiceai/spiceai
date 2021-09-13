@@ -173,6 +173,60 @@ func TestObservations(t *testing.T) {
 	}
 }
 
+func TestInterpretations(t *testing.T) {
+	if !shouldRunTest {
+		t.Skip("Specify '-e2e' to run e2e tests")
+		return
+	}
+
+	runtimeCmd, err := runtime.startRuntime()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() {
+		err = runtimeCmd.Process.Signal(os.Interrupt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = runtimeCmd.Wait()
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	var podEpochTime int64 = 1605312000
+
+	interpretations, err := runtime.getInterpretations("trader", podEpochTime, podEpochTime)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	assert.Equal(t, 0, len(interpretations))
+
+	newInterpretations, err := os.ReadFile(filepath.Join(repoRoot, "test/assets/data/json/e2e_additional_interpretations.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = runtime.postInterpretations("trader", newInterpretations)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	interpretations, err = runtime.getInterpretations("trader", podEpochTime, podEpochTime)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	assert.Equal(t, 1, len(interpretations))
+
+	err = snapshotter.Snapshot("interpretations.json", interpretations)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestTrainingOutput(t *testing.T) {
 	if !shouldRunTest {
 		t.Skip("Specify '-e2e' to run e2e tests")
