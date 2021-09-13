@@ -60,7 +60,7 @@ func apiGetObservationsHandler(ctx *fasthttp.RequestCtx) {
 	csv := pod.CachedCsv()
 
 	ctx.Response.Header.Add("Content-Type", " text/csv")
-	_, _ = ctx.Write([]byte(csv))
+	_, _ = ctx.WriteString(csv)
 }
 
 func apiPostObservationsHandler(ctx *fasthttp.RequestCtx) {
@@ -153,7 +153,7 @@ func apiPodTrainHandler(ctx *fasthttp.RequestCtx) {
 	err := aiengine.StartTraining(pod)
 	if err != nil {
 		ctx.Response.SetStatusCode(500)
-		ctx.Response.SetBody([]byte(err.Error()))
+		ctx.Response.SetBodyString(err.Error())
 		return
 	}
 
@@ -171,7 +171,7 @@ func apiRecommendationHandler(ctx *fasthttp.RequestCtx) {
 	inference, err := aiengine.Infer(pod, tag.(string))
 	if err != nil {
 		ctx.Response.SetStatusCode(500)
-		ctx.Response.SetBody([]byte(err.Error()))
+		ctx.Response.SetBodyString(err.Error())
 		return
 	}
 
@@ -182,7 +182,7 @@ func apiRecommendationHandler(ctx *fasthttp.RequestCtx) {
 	body, err := json.Marshal(inference)
 	if err != nil {
 		ctx.Response.SetStatusCode(500)
-		ctx.Response.SetBody([]byte(err.Error()))
+		ctx.Response.SetBodyString(err.Error())
 		return
 	}
 
@@ -257,7 +257,7 @@ func apiPostFlightEpisodeHandler(ctx *fasthttp.RequestCtx) {
 	err := json.Unmarshal(ctx.Request.Body(), &apiEpisode)
 	if err != nil {
 		ctx.Response.SetStatusCode(400)
-		ctx.Response.SetBody([]byte(err.Error()))
+		ctx.Response.SetBodyString(err.Error())
 		return
 	}
 
@@ -294,14 +294,14 @@ func apiPostExportHandler(ctx *fasthttp.RequestCtx) {
 	err := json.Unmarshal(ctx.Request.Body(), &exportRequest)
 	if err != nil {
 		ctx.Response.SetStatusCode(400)
-		ctx.Response.SetBody([]byte(err.Error()))
+		ctx.Response.SetBodyString(err.Error())
 		return
 	}
 
 	err = aiengine.ExportModel(pod.Name, tag.(string), &exportRequest)
 	if err != nil {
 		ctx.Response.SetStatusCode(400)
-		ctx.Response.SetBody([]byte(err.Error()))
+		ctx.Response.SetBodyString(err.Error())
 		return
 	}
 
@@ -326,7 +326,7 @@ func apiPostImportHandler(ctx *fasthttp.RequestCtx) {
 	err := json.Unmarshal(ctx.Request.Body(), &importRequest)
 	if err != nil {
 		ctx.Response.SetStatusCode(400)
-		ctx.Response.SetBody([]byte(err.Error()))
+		ctx.Response.SetBodyString(err.Error())
 		return
 	}
 
@@ -336,7 +336,7 @@ func apiPostImportHandler(ctx *fasthttp.RequestCtx) {
 	err = aiengine.ImportModel(&importRequest)
 	if err != nil {
 		ctx.Response.SetStatusCode(400)
-		ctx.Response.SetBody([]byte(err.Error()))
+		ctx.Response.SetBodyString(err.Error())
 		return
 	}
 
