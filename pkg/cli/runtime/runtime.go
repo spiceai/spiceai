@@ -6,6 +6,7 @@ import (
 	"os"
 
 	"github.com/spiceai/spiceai/pkg/context"
+	"github.com/spiceai/spiceai/pkg/util"
 )
 
 func Run(contextFlag string, manifestPath string) error {
@@ -52,10 +53,10 @@ func Run(contextFlag string, manifestPath string) error {
 	cmd.Stderr = os.Stderr
 	cmd.Stdout = os.Stdout
 
-	err = cmd.Start()
+	err = util.RunCommand(cmd)
 	if err != nil {
 		return err
 	}
 
-	return cmd.Wait()
+	return nil
 }

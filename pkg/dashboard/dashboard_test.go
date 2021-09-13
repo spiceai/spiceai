@@ -20,10 +20,9 @@ import (
 
 func TestDashboard(t *testing.T) {
 	t.Run("DashboardIndexHandler() - GET returns dashboard content", testDashboardIndexHandler())
-	t.Run("DashboardAcknowledgementsHandler() - GET returns acknowledgements content", testDashboardAcknowledgementsHandler())
 	t.Run("DashboardJsHandler() - GET returns JS content", testDashboardJsHandler())
 	t.Run("DashboardCssHandler() - GET returns CSS content", testDashboardCssHandler())
-	t.Run("DashboardSvgHandler() - GET returns SVG content", testDashboardSvgHandler())
+	t.Run("DashboardMediaHandler() - GET returns SVG content", testDashboardMediaHandler("svg", "image/svg+xml"))
 }
 
 func testDashboardIndexHandler() func(*testing.T) {
@@ -43,26 +42,6 @@ func testDashboardIndexHandler() func(*testing.T) {
 		assert.NoError(t, err)
 
 		assert.Contains(t, string(body), "Spice.ai")
-	}
-}
-
-func testDashboardAcknowledgementsHandler() func(*testing.T) {
-	return func(t *testing.T) {
-		r, err := http.NewRequest("GET", "http://test/acknowledgements", nil)
-		assert.NoError(t, err)
-
-		server := dashboard.NewDashboardEmbedded()
-
-		res, err := serve("/acknowledgements", server.AcknowledgementsHandler, r)
-		assert.NoError(t, err)
-
-		assert.EqualValues(t, 200, res.StatusCode)
-		assert.EqualValues(t, "text/plain; charset=utf-8", res.Header.Get("Content-Type"))
-
-		body, err := ioutil.ReadAll(res.Body)
-		assert.NoError(t, err)
-
-		assert.Contains(t, string(body), "MIT")
 	}
 }
 
@@ -116,9 +95,9 @@ func testDashboardCssHandler() func(*testing.T) {
 	}
 }
 
-func testDashboardSvgHandler() func(*testing.T) {
+func testDashboardMediaHandler(mediaType string, contentType string) func(*testing.T) {
 	return func(t *testing.T) {
-		url, err := getFirstStaticAssetUrl("svg")
+		url, err := getFirstStaticAssetUrl(mediaType)
 		if err != nil {
 			t.Error(err)
 		}
@@ -128,16 +107,16 @@ func testDashboardSvgHandler() func(*testing.T) {
 
 		server := dashboard.NewDashboardEmbedded()
 
-		res, err := serve("/media/{file}", server.SvgHandler, r)
+		res, err := serve("/media/{file}", server.MediaHandler, r)
 		assert.NoError(t, err)
 
 		assert.EqualValues(t, 200, res.StatusCode)
-		assert.EqualValues(t, "image/svg+xml", res.Header.Get("Content-Type"))
+		assert.EqualValues(t, contentType, res.Header.Get("Content-Type"))
 
 		body, err := ioutil.ReadAll(res.Body)
 		assert.NoError(t, err)
 
-		assert.Contains(t, string(body), "svg")
+		assert.Contains(t, string(body), mediaType)
 	}
 }
 
@@ -168,7 +147,7 @@ func serve(route string, handler fasthttp.RequestHandler, req *http.Request) (*h
 
 func getFirstStaticAssetUrl(typeName string) (string, error) {
 	directoryName := typeName
-	if typeName == "svg" {
+	if typeName == "svg" || typeName == "md" {
 		directoryName = "media"
 	}
 
@@ -181,17 +160,19 @@ func getFirstStaticAssetUrl(typeName string) (string, error) {
 		return "", fmt.Errorf("Expected %s assets in static directory. Is dashboard built?", typeName)
 	}
 
-	// Look for first chunk
+	// Look for first matching chunk
 	var filename string
-	if typeName == "svg" {
-		filename = assets[0].Name()
+	var suffix string
+	if typeName == "svg" || typeName == "md" {
+		suffix = fmt.Sprintf(".%s", typeName)
 	} else {
-		suffix := fmt.Sprintf(".chunk.%s", typeName)
-		for _, asset := range assets {
-			if strings.HasSuffix(asset.Name(), suffix) {
-				filename = asset.Name()
-				break
-			}
+		suffix = fmt.Sprintf(".chunk.%s", typeName)
+	}
+
+	for _, asset := range assets {
+		if strings.HasSuffix(asset.Name(), suffix) {
+			filename = asset.Name()
+			break
 		}
 	}
 

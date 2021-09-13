@@ -7,7 +7,7 @@
 [![Follow on Twitter](https://img.shields.io/twitter/follow/spiceaihq.svg?style=social&logo=twitter)](https://twitter.com/intent/follow?screen_name=spiceaihq)
 
 
-**Spice.ai** is an open source, portable runtime for training and using deep learning on time series data.
+**Spice.ai** is an open source, portable runtime and set of tools that helps developers add AI to their applications by leveraging machine-learning on time-series data.
 
 
 ---
@@ -16,13 +16,31 @@
 
 ---
 
-**The vision for Spice.ai is to make creating intelligent applications as easy as building a modern website.** Spice.ai brings AI development to your editor, in any language or framework with a fast, iterative, inner development loop, with continuous-integration (CI) and continuous-deployment (CD) workflows.
+**The vision for Spice.ai is to make creating intelligent applications as easy as building a modern website.**
 
-Spice.ai is written in Golang and Python and runs as a container or microservice with applications calling a simple HTTP API. It's deployable to any public cloud, on-premises, and edge.
+Spice.ai focuses on a fast, iterative, inner development loop through simple configuration, REST-like APIs, and the goal of coding in any language or framework.
+
+Spice.ai includes:
+
+- A lightweight, portable ML runtime accessible by simple HTTP APIs
+- A developer-friendly CLI
+- Simple, git-committable, configuration and code
+- Community-driven re-usable components for streaming and processing time-series data
+- Re-useable building blocks, sharable through spicerack.org to build upon community work and get started quickly
+
+Spice.ai is written in Golang and Python and runs as a container or microservice. It's deployable to any public cloud, on-premises, and edge.
 
 📢 Read the Spice.ai announcement blog post at [blog.spiceai.org](https://blog.spiceai.org).
 
 📺 View a 60 second demo of Spice.ai in action [here](https://www.youtube.com/watch?v=FPPGyPq41kQ).
+
+### Why Spice.ai?
+
+Spice.ai is for developers interested in using AI to make their applications more intelligent but don't have the time or resources to learn and build all the AI/ML.
+
+Imagine you have timestamped measurements of the room temperature and access to air-conditioning controls. If you had a time-series AI engine, your application could optimize when the A/C activates. You could reduce energy usage by not overcooling the room as the temperature drops.
+
+Now imagine learning Python, neural networks, deep-learning algorithms and building a system that streams and processes time-series data to do that. With a time-series AI engine accessible over HTTP APIs, a library of community-driven components for data streaming and processing, and an eco-system of pre-created ML configuration, you could build upon the experience of the community instead of doing it all yourself. You can then focus on your business logic and building your application instead of the ML.
 
 ### Community-driven data components
 
