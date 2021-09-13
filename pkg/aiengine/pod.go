@@ -163,7 +163,14 @@ func ImportPod(request *runtime_pb.ImportModel) error {
 			return err
 		}
 		for _, i := range apiInterpretations {
-			interpretation := api.NewInterpretationFromApi(i)
+			interpretation, err := api.NewInterpretationFromApi(&i)
+			if err != nil {
+				return err
+			}
+			err = pod.AddInterpretation(interpretation)
+			if err != nil {
+				return err
+			}
 		}
 	}
 

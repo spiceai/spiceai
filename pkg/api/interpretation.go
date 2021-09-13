@@ -41,10 +41,12 @@ func NewApiInterpretation(interpretation *interpretations.Interpretation) *Inter
 	}
 }
 
-func ApiInterpretations(interpretations []interpretations.Interpretation) []*Interpretation{
+func ApiInterpretations(interpretations []interpretations.Interpretation) []*Interpretation {
 	apiInterpretations := make([]*Interpretation, 0, len(interpretations))
 	for _, i := range interpretations {
-		apiInterpretations = append(apiInterpretations, NewInterpretation(&i))
+		apiInterpretation := NewApiInterpretation(&i)
+		apiInterpretations = append(apiInterpretations, apiInterpretation)
 	}
+
 	return apiInterpretations
 }
