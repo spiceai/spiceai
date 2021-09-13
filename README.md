@@ -7,7 +7,7 @@
 [![Follow on Twitter](https://img.shields.io/twitter/follow/spiceaihq.svg?style=social&logo=twitter)](https://twitter.com/intent/follow?screen_name=spiceaihq)
 
 
-**Spice.ai** is an open source, portable runtime for training and using deep learning on time series data.
+**Spice.ai** is an open source, portable runtime and set of tools that helps developers add AI to their applications by leveraging machine-learning on time-series data.
 
 
 ---
@@ -16,7 +16,19 @@
 
 ---
 
-**The vision for Spice.ai is to make creating intelligent applications as easy as building a modern website.** Spice.ai brings AI development to your editor, in any language or framework with a fast, iterative, inner development loop, with continuous-integration (CI) and continuous-deployment (CD) workflows.
+**The vision for Spice.ai is to make creating intelligent applications as easy as building a modern website.**
+
+Spice.ai focuses on a fast, iterative, inner development loop through simple configuration, REST-like APIs, and the goal of coding in any language or framework.
+
+Spice.ai includes:
+
+- A lightweight, portable ML runtime accessible by simple HTTP APIs
+- A developer-friendly CLI
+- Simple, git-committable, configuration and code
+- Community-driven re-usable components for streaming and processing time-series data
+- Re-useable building blocks, sharable through spicerack.org to build upon community work and get started quickly
+
+Spice.ai is written in Golang and Python and runs as a container or microservice. It's deployable to any public cloud, on-premises, and edge.
 
 Spice.ai is written in Golang and Python and runs as a container or microservice with applications calling a simple HTTP API. It's deployable to any public cloud, on-premises, and edge.
 
