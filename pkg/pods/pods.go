@@ -5,23 +5,33 @@ import (
 	"io/ioutil"
 	"log"
 	"path/filepath"
+	"sync"
 
 	"github.com/logrusorgru/aurora"
 	"github.com/spiceai/spiceai/pkg/context"
 	"github.com/spiceai/spiceai/pkg/util"
 )
 
-var pods = make(map[string]*Pod)
+var (
+	podsMutex sync.RWMutex
+	pods = make(map[string]*Pod)
+)
 
-func Pods() *map[string]*Pod {
-	return &pods
+func Pods() map[string]*Pod {
+	return pods
 }
 
 func GetPod(name string) *Pod {
+	podsMutex.RLock()
+	defer podsMutex.RUnlock()
+
 	return pods[name]
 }
 
 func RemovePod(name string) {
+	podsMutex.Lock()
+	defer podsMutex.Unlock()
+
 	delete(pods, name)
 }
 
@@ -46,6 +56,10 @@ func FindPod(podName string) (*Pod, error) {
 
 func RemovePodByManifestPath(manifestPath string) {
 	relativePath := context.CurrentContext().GetSpiceAppRelativePath(manifestPath)
+
+	podsMutex.Lock()
+	defer podsMutex.Unlock()
+
 	for _, pod := range pods {
 		if pod.ManifestPath() == manifestPath {
 			log.Printf("Removing pod %s: %s\n", aurora.Bold(pod.Name), aurora.Gray(12, relativePath))
@@ -95,7 +109,9 @@ func LoadPodFromManifest(manifestPath string) (*Pod, error) {
 		pod.copyData(existingPod)
 	}
 
+	podsMutex.Lock()
 	pods[pod.Name] = pod
+	podsMutex.Unlock()
 
 	return pod, nil
 }
