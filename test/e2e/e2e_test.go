@@ -207,7 +207,7 @@ func TestDataspaceData(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	newJsonData, err := os.ReadFile(filepath.Join(repoRoot, "test/assets/data/json/customprocessor.json"))
+	newJsonData, err := os.ReadFile(filepath.Join(repoRoot, "test/assets/data/json/observations.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
