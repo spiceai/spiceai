@@ -1,4 +1,4 @@
-package api
+package observation
 
 import (
 	_ "embed"
