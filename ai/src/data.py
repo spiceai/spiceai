@@ -125,12 +125,13 @@ class DataManager:
         pass
 
     def get_interpretations_for_interval(self):
-        index = self.interpretations.index[self.current_time]
-        interval_interpretations = []
-        if index is not None:
-            for i in index.Indicies:
-                interval_interpretations += self.interpretations.interpretations[i]
-        return interval_interpretations
+        if self.interpretations is not None:
+            index = self.interpretations.index[self.current_time]
+            interval_interpretations = []
+            if index is not None:
+                for i in index.Indicies:
+                    interval_interpretations += self.interpretations.interpretations[i]
+            return interval_interpretations
 
     def get_shape(self):
         return np.shape([0] * self.get_window_span() * len(self.fields))
