@@ -199,6 +199,7 @@ func initializePod(manifestPath string) (*pods.Pod, error) {
 	}
 
 	pods.CreateOrUpdatePod(newPod)
+
 	err = aiengine.InitializePod(newPod)
 	if err != nil {
 		log.Println(fmt.Errorf("error initializing pod %s: %w", newPod.Name, err))
