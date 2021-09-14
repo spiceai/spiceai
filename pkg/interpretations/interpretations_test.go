@@ -152,9 +152,8 @@ func testTimeIndexFunc() func(*testing.T) {
 		all := store.All()
 		assert.Equal(t, 3, len(all))
 
-		timeIndex := store.TimeIndex()
-		assert.Equal(t, store.Intervals(), int64(len(timeIndex)))
+		timeIndex := store.IndexedInterpretations()
 
-		snapshotter.SnapshotT(t, timeIndex)
+		snapshotter.SnapshotT(t, &timeIndex)
 	}
 }

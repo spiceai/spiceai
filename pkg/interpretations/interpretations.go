@@ -5,6 +5,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/spiceai/spiceai/pkg/proto/common_pb"
 	"github.com/spiceai/spiceai/pkg/util"
 )
 
@@ -17,7 +18,7 @@ type InterpretationsStore struct {
 
 	interpretationsMutex sync.RWMutex
 	interpretations      []Interpretation
-	timeIndex            [][]*Interpretation
+	timeIndex            *common_pb.IndexedInterpretations
 }
 
 func NewInterpretationsStore(epoch time.Time, period time.Duration, granularity time.Duration) *InterpretationsStore {
@@ -28,7 +29,9 @@ func NewInterpretationsStore(epoch time.Time, period time.Duration, granularity 
 		period:      period,
 		granularity: granularity,
 		intervals:   intervals,
-		timeIndex:   make([][]*Interpretation, intervals, intervals),
+		timeIndex: &common_pb.IndexedInterpretations{
+			Index: make(map[uint64]*common_pb.InterpretationIndices),
+		},
 	}
 }
 
@@ -40,7 +43,10 @@ func (store *InterpretationsStore) All() []Interpretation {
 	return store.interpretations
 }
 
-func (store *InterpretationsStore) TimeIndex() [][]*Interpretation {
+func (store *InterpretationsStore) IndexedInterpretations() *common_pb.IndexedInterpretations {
+	store.interpretationsMutex.RLock()
+	defer store.interpretationsMutex.RUnlock()
+
 	return store.timeIndex
 }
 
@@ -82,10 +88,29 @@ func (store *InterpretationsStore) Add(interpretation *Interpretation) error {
 }
 
 func (store *InterpretationsStore) addToTimeIndex(interpretation *Interpretation) {
+	timeIndex := store.timeIndex
+	pbInterpretation := newPbInterpretation(interpretation)
+	pbInterpretationIndex := uint32(len(timeIndex.Interpretations))
+	timeIndex.Interpretations = append(timeIndex.Interpretations, pbInterpretation)
+
 	startOffset := interpretation.Start().Sub(store.epoch)
 	startIndex := startOffset / store.granularity
 	intervals := interpretation.End().Sub(interpretation.Start()) / store.granularity
 	for i := startIndex; i < intervals; i++ {
-		store.timeIndex[i] = append(store.timeIndex[i], interpretation)
+		index := uint64(i)
+		if timeIndex.Index[index] == nil {
+			timeIndex.Index[index] = &common_pb.InterpretationIndices{}
+		}
+		timeIndex.Index[index].Indicies = append(timeIndex.Index[index].Indicies, pbInterpretationIndex)
+	}
+}
+
+func newPbInterpretation(interpretation *Interpretation) *common_pb.Interpretation {
+	return &common_pb.Interpretation{
+		Start:   uint64(interpretation.Start().Unix()),
+		End:     uint64(interpretation.End().Unix()),
+		Name:    interpretation.Name(),
+		Actions: interpretation.Actions(),
+		Tags:    interpretation.Tags(),
 	}
 }

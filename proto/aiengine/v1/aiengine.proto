@@ -80,7 +80,7 @@ message AddDataRequest {
 
 message AddInterpretationsRequest {
   string pod = 1;
-  repeated common.Interpretation interpretations = 2;
+  common.IndexedInterpretations indexed_interpretations = 2;
 }
 
 message HealthRequest {}
