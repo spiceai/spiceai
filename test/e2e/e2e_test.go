@@ -308,6 +308,16 @@ func TestImportExport(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	newInterpretations, err := os.ReadFile(filepath.Join(repoRoot, "test/assets/data/json/e2e_additional_interpretations.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = runtime.postInterpretations("trader", newInterpretations)
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	err = runtime.waitForTrainingToComplete("trader", "1" /*flight*/, 10)
 	if err != nil {
 		t.Fatal(err)
@@ -340,6 +350,19 @@ func TestImportExport(t *testing.T) {
 	}
 
 	t.Logf("%v\n", inference)
+
+	var podEpochTime int64 = 1605312000
+	interpretations, err := runtime.getInterpretations("trader", podEpochTime, podEpochTime)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	assert.Equal(t, 1, len(interpretations))
+
+	err = snapshotter.Snapshot("interpretations.json", interpretations)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// Now let's shutdown the runtime and restart it and import our exported pod
 	err = runtimeCmd.Process.Signal(os.Interrupt)
@@ -384,6 +407,18 @@ func TestImportExport(t *testing.T) {
 
 	if newInference.Confidence != inference.Confidence {
 		t.Fatal(fmt.Errorf("%s: the confidence values are different between the exported and imported models", aurora.Red("error")))
+	}
+
+	interpretations, err = runtime.getInterpretations("trader", podEpochTime, podEpochTime)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	assert.Equal(t, 1, len(interpretations))
+
+	err = snapshotter.Snapshot("interpretations.json", interpretations)
+	if err != nil {
+		t.Fatal(err)
 	}
 
 	err = runtimeCmd.Process.Signal(os.Interrupt)
