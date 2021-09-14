@@ -31,11 +31,13 @@ spice action add jump
 	Run: func(cmd *cobra.Command, args []string) {
 		cmdActionName := args[0]
 
-		podPath := pods.FindFirstManifestPath()
-		if podPath == "" {
+		manifests := pods.FindAllManifestPaths()
+		if len(manifests) == 0 {
 			fmt.Println("No pods detected!")
 			return
 		}
+
+		podPath := manifests[0]
 
 		pod, err := pods.LoadPodFromManifest(podPath)
 		if err != nil {
