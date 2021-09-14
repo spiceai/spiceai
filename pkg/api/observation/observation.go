@@ -2,7 +2,8 @@ package observation
 
 import (
 	_ "embed"
-	"time"
+
+	spice_time "github.com/spiceai/spiceai/pkg/time"
 )
 
 var (
@@ -11,7 +12,7 @@ var (
 )
 
 type Observation struct {
-	Time *time.Time         `json:"time"`
+	Time *spice_time.Time   `json:"time"`
 	Data map[string]float64 `json:"data"`
 	Tags []string           `json:"tags,omitempty"`
 }
