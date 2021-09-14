@@ -8,7 +8,7 @@ import (
 
 var (
 	//go:embed observation_schema.json
-	schema []byte
+	jsonSchema []byte
 )
 
 type Time struct {
@@ -22,7 +22,7 @@ type Observation struct {
 	Tags []string           `json:"tags,omitempty"`
 }
 
-func GetSchema() *[]byte {
+func JsonSchema() *[]byte {
 	return &schema
 }
 
