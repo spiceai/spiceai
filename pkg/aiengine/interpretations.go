@@ -5,12 +5,14 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/logrusorgru/aurora"
 	"github.com/spiceai/spiceai/pkg/pods"
 	"github.com/spiceai/spiceai/pkg/proto/aiengine_pb"
 	"github.com/spiceai/spiceai/pkg/proto/common_pb"
 )
 
 func sendInterpretations(pod *pods.Pod, indexedInterpretations *common_pb.IndexedInterpretations) error {
+	zaplog.Sugar().Debugf("Sending %d interpretations to AI engine\n", aurora.BrightYellow(len(indexedInterpretations.Interpretations)))
 	if len(indexedInterpretations.Interpretations) == 0 {
 		// Nothing to do
 		return nil
@@ -36,6 +38,8 @@ func sendInterpretations(pod *pods.Pod, indexedInterpretations *common_pb.Indexe
 	if response.Error {
 		return fmt.Errorf("failed to post new interpretations to pod %s: %s", pod.Name, response.Result)
 	}
+
+	zaplog.Sugar().Debugf("Sent %d interpretations to AI engine\n", aurora.BrightYellow(len(indexedInterpretations.Interpretations)))
 
 	return nil
 }

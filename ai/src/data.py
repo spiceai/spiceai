@@ -122,7 +122,8 @@ class DataManager:
 
     def add_interpretations(self, interpretations):
         self.interpretations = interpretations
-        pass
+        if interpretations is not None:
+            print(interpretations)
 
     def get_interpretations_for_interval(self):
         if self.interpretations is not None:
@@ -208,8 +209,7 @@ class DataManager:
         loc = dict()
         loc["prev_state"] = prev_state
         loc["new_state"] = new_state
-        if interpretations is not None:
-            loc["interpretations"] = interpretations
+        loc["interpretations"] = interpretations
 
         action_name = self.action_names[action]
         reward_func = self.action_rewards[action_name]
