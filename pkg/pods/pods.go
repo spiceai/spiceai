@@ -5,27 +5,40 @@ import (
 	"io/ioutil"
 	"log"
 	"path/filepath"
+	"sync"
 
 	"github.com/logrusorgru/aurora"
 	"github.com/spiceai/spiceai/pkg/context"
 	"github.com/spiceai/spiceai/pkg/util"
 )
 
-var pods = make(map[string]*Pod)
-
-func Pods() *map[string]*Pod {
-	return &pods
-}
+var (
+	podsMutex sync.RWMutex
+	pods      = make(map[string]*Pod)
+)
 
 func CreateOrUpdatePod(pod *Pod) {
+	podsMutex.Lock()
+	defer podsMutex.Unlock()
+
 	pods[pod.Name] = pod
 }
 
+func Pods() map[string]*Pod {
+	return pods
+}
+
 func GetPod(name string) *Pod {
+	podsMutex.RLock()
+	defer podsMutex.RUnlock()
+
 	return pods[name]
 }
 
 func RemovePod(name string) {
+	podsMutex.Lock()
+	defer podsMutex.Unlock()
+
 	delete(pods, name)
 }
 
@@ -50,13 +63,16 @@ func FindPod(podName string) (*Pod, error) {
 
 func RemovePodByManifestPath(manifestPath string) {
 	relativePath := context.CurrentContext().GetSpiceAppRelativePath(manifestPath)
+	var podToDelete *Pod
 	for _, pod := range pods {
 		if pod.ManifestPath() == manifestPath {
-			log.Printf("Removing pod %s: %s\n", aurora.Bold(pod.Name), aurora.Gray(12, relativePath))
-			RemovePod(pod.Name)
-			return
+			podToDelete = pod
+			break
 		}
 	}
+
+	log.Printf("Removing pod %s: %s\n", aurora.Bold(podToDelete.Name), aurora.Gray(12, relativePath))
+	RemovePod(podToDelete.Name)
 }
 
 func FindFirstManifestPath() string {
@@ -87,6 +103,14 @@ func LoadPodFromManifest(manifestPath string) (*Pod, error) {
 	if err != nil {
 		log.Printf("Error: Failed to load manifest '%s': %s\n", manifestPath, err)
 		return nil, err
+	}
+
+	existingPod, ok := pods[pod.Name]
+	if ok {
+		if existingPod.IsSame(pod) {
+			// Pods are the same, ignore new pod
+			return existingPod, nil
+		}
 	}
 
 	return pod, nil

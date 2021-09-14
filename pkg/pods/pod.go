@@ -476,3 +476,7 @@ func (pod *Pod) loadRewardSpecs() ([]spec.RewardSpec, error) {
 	}
 	return rewards, nil
 }
+
+func (pod *Pod) IsSame(otherPod *Pod) bool {
+	return otherPod != nil && pod.manifestPath == otherPod.manifestPath && pod.Hash() == otherPod.Hash()
+}
