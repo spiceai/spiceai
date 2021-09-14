@@ -978,6 +978,8 @@ github.com/spiceai/data-components-contrib v0.0.0-20210901070425-f99a2b678fa4 h1
 github.com/spiceai/data-components-contrib v0.0.0-20210901070425-f99a2b678fa4/go.mod h1:G9HIuE/UNz7g2NT+LFwE9LtXeRe5NPQpTDrybB/qbDQ=
 github.com/spiceai/data-components-contrib v0.0.0-20210913060300-7e34aaec77ce h1:elYsrXaFaqFT2ijQBCMPWPsf2BwQn12EIakILyKHm3g=
 github.com/spiceai/data-components-contrib v0.0.0-20210913060300-7e34aaec77ce/go.mod h1:AYY/1FkpI28uNXdsj5DoVBHUP/1YnHQao7xwGTvVwUY=
+github.com/spiceai/data-components-contrib v0.0.0-20210914061217-be6887a4bd2b h1:PFsYOmBDQPXHkNrYBTkf/FnGB1I82rAMhqY3LDoRie4=
+github.com/spiceai/data-components-contrib v0.0.0-20210914061217-be6887a4bd2b/go.mod h1:g0LQZivregrjtgPgZLzJ746T2A6yJm0iCRet0E1A1ZU=
 github.com/spiceai/spiceai v0.1.0-alpha.5-rc-spiced.0.20210831052121-80234a1fb51a/go.mod h1:pb+hKV5zvpFuKiLlKJmIUF0jkpeb/eTfhHLapttiVPk=
 github.com/src-d/gcfg v1.4.0/go.mod h1:p/UMsR43ujA89BJY9duynAwIpvqEujIH/jFlfL7jWoI=
 github.com/stoewer/go-strcase v1.2.0/go.mod h1:IBiWB2sKIp3wVVQ3Y035++gc+knqhUQag1KpM8ahLw8=
