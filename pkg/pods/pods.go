@@ -14,7 +14,7 @@ import (
 
 var (
 	podsMutex sync.RWMutex
-	pods = make(map[string]*Pod)
+	pods      = make(map[string]*Pod)
 )
 
 func Pods() map[string]*Pod {

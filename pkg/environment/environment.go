@@ -40,7 +40,7 @@ func StartDataListeners(intervalSecs int) error {
 }
 
 func FetchNewData() (bool, error) {
-	for _, pod := range *pods.Pods() {
+	for _, pod := range pods.Pods() {
 		state, err := pod.State()
 		if err != nil {
 			log.Printf("%v", err)
