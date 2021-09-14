@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import pandas.core.computation.expressions as expressions
+from proto.aiengine.v1 import common_pb2
 from types import SimpleNamespace
 import math
 import threading
@@ -39,7 +40,7 @@ class DataManager:
         ).mean()
         self.fill_table()
 
-        self.interpretations = []
+        self.interpretations: common_pb2.IndexedInterpretations = None
 
         self.current_time: pd.Timestamp = None
         self.action_rewards = action_rewards
@@ -120,12 +121,16 @@ class DataManager:
             self.fill_table()
 
     def add_interpretations(self, interpretations):
-        self.interpretations += interpretations
+        self.interpretations = interpretations
         pass
 
     def get_interpretations_for_interval(self):
-        # use.current_time && self.interval_sec
-        pass
+        index = self.interpretations.index[self.current_time]
+        interval_interpretations = []
+        if index is not None:
+            for i in index.Indicies:
+                interval_interpretations += self.interpretations.interpretations[i]
+        return interval_interpretations
 
     def get_shape(self):
         return np.shape([0] * self.get_window_span() * len(self.fields))
