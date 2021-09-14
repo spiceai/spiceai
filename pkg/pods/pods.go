@@ -17,10 +17,6 @@ func Pods() *map[string]*Pod {
 	return &pods
 }
 
-func CreateOrUpdatePod(pod *Pod) {
-	pods[pod.Name] = pod
-}
-
 func GetPod(name string) *Pod {
 	return pods[name]
 }
@@ -88,6 +84,18 @@ func LoadPodFromManifest(manifestPath string) (*Pod, error) {
 		log.Printf("Error: Failed to load manifest '%s': %s\n", manifestPath, err)
 		return nil, err
 	}
+
+	existingPod, ok := pods[pod.Name]
+	if ok {
+		if existingPod.Hash() == pod.Hash() {
+			// Pods are the same, ignore new pod
+			return existingPod, nil
+		}
+		// Copy data from old pod
+		pod.copyData(existingPod)
+	}
+
+	pods[pod.Name] = pod
 
 	return pod, nil
 }

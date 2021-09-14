@@ -506,3 +506,9 @@ func (pod *Pod) loadRewardSpecs() ([]spec.RewardSpec, error) {
 	}
 	return rewards, nil
 }
+
+func (pod *Pod) copyData(oldPod *Pod) {
+	pod.flights = oldPod.flights
+	pod.interpretations = oldPod.interpretations
+	pod.podLocalState = oldPod.podLocalState
+}
