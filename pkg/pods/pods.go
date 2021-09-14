@@ -2,8 +2,8 @@ package pods
 
 import (
 	"fmt"
-	"io/ioutil"
 	"log"
+	"os"
 	"path/filepath"
 	"sync"
 
@@ -43,22 +43,30 @@ func RemovePod(name string) {
 }
 
 func FindPod(podName string) (*Pod, error) {
-	podPath := FindFirstManifestPath()
-	if podPath == "" {
+	manifests := FindAllManifestPaths()
+
+	if len(manifests) == 0 {
 		return nil, fmt.Errorf("no pods detected")
 	}
 
-	pod, err := LoadPodFromManifest(podPath)
-	if err != nil {
-		return nil, err
+	var selectedPod *Pod
+	for _, podPath := range manifests {
+		pod, err := LoadPodFromManifest(podPath)
+		if err != nil {
+			return nil, err
+		}
+
+		if pod.Name == podName {
+			selectedPod = pod
+		}
 	}
 
-	if pod.Name != podName {
+	if selectedPod == nil {
 		fmt.Printf("the pod %s does not exist\n", podName)
 		return nil, fmt.Errorf("the pod %s does not exist", podName)
 	}
 
-	return pod, nil
+	return selectedPod, nil
 }
 
 func RemovePodByManifestPath(manifestPath string) {
@@ -75,21 +83,23 @@ func RemovePodByManifestPath(manifestPath string) {
 	RemovePod(podToDelete.Name)
 }
 
-func FindFirstManifestPath() string {
+func FindAllManifestPaths() []string {
 	podsPath := context.CurrentContext().PodsDir()
-	files, err := ioutil.ReadDir(podsPath)
+	files, err := os.ReadDir(podsPath)
 	if err != nil {
 		log.Fatal(err.Error())
 	}
 
+	manifestPaths := make([]string, 0)
+
 	for _, file := range files {
 		extension := filepath.Ext(file.Name())
 		if extension == ".yml" || extension == ".yaml" {
-			return filepath.Join(podsPath, file.Name())
+			manifestPaths = append(manifestPaths, filepath.Join(podsPath, file.Name()))
 		}
 	}
 
-	return ""
+	return manifestPaths
 }
 
 func LoadPodFromManifest(manifestPath string) (*Pod, error) {
