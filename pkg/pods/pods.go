@@ -17,6 +17,13 @@ var (
 	pods      = make(map[string]*Pod)
 )
 
+func CreateOrUpdatePod(pod *Pod) {
+	podsMutex.Lock()
+	defer podsMutex.Unlock()
+
+	pods[pod.Name] = pod
+}
+
 func Pods() map[string]*Pod {
 	return pods
 }
@@ -105,13 +112,7 @@ func LoadPodFromManifest(manifestPath string) (*Pod, error) {
 			// Pods are the same, ignore new pod
 			return existingPod, nil
 		}
-		// Copy data from old pod
-		pod.copyData(existingPod)
 	}
-
-	podsMutex.Lock()
-	pods[pod.Name] = pod
-	podsMutex.Unlock()
 
 	return pod, nil
 }

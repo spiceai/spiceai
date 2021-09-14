@@ -98,6 +98,7 @@ func processNotifyEvent(event fsnotify.Event) error {
 }
 
 func startNewPodTraining(pod *pods.Pod) error {
+	pods.CreateOrUpdatePod(pod)
 	err := aiengine.InitializePod(pod)
 	if err != nil {
 		return err
