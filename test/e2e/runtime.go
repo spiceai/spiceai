@@ -42,6 +42,8 @@ func (r *runtimeServer) startRuntime() (*exec.Cmd, error) {
 		return nil, err
 	}
 
+	time.Sleep(1 * time.Second)
+
 	return runtimeCmd, nil
 }
 
@@ -87,6 +89,20 @@ func (r *runtimeServer) postObservations(podName string, newObservations []byte)
 
 	if resp.StatusCode >= 400 {
 		return fmt.Errorf("error posting new observations: %s", resp.Status)
+	}
+
+	return nil
+}
+
+func (r *runtimeServer) postDataspace(podName string, dataspaceFrom string, dataspaceName string, data []byte) error {
+	url := fmt.Sprintf("%s/api/v0.1/pods/%s/dataspaces/%s/%s", r.baseUrl, podName, dataspaceFrom, dataspaceName)
+	resp, err := http.Post(url, "application/octet-stream", bytes.NewReader(data))
+	if err != nil {
+		return err
+	}
+
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("error posting new data to dataspace: %s", resp.Status)
 	}
 
 	return nil

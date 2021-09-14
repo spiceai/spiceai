@@ -25,13 +25,14 @@ spice train logpruner.yaml
 `,
 	Args: cobra.ExactArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
+		var manifests []string
 		podNameOrPath := args[0]
 
 		podPath := podNameOrPath
 		podName := podNameOrPath
 		_, err := os.Stat(podNameOrPath)
 		if err != nil {
-			podPath = pods.FindFirstManifestPath()
+			manifests = pods.FindAllManifestPaths()
 		} else {
 			err := runtime.Run(contextFlag, podPath)
 			if err != nil {
@@ -41,18 +42,25 @@ spice train logpruner.yaml
 			return
 		}
 
-		if podPath == "" || podName == "" {
+		if len(manifests) == 0 || podName == "" || podPath == "" {
 			fmt.Println("pod not found")
 			return
 		}
 
-		pod, err := pods.LoadPodFromManifest(podPath)
-		if err != nil {
-			fmt.Println(err.Error())
-			return
+		var selectedPod *pods.Pod
+		for _, podPath := range manifests {
+			pod, err := pods.LoadPodFromManifest(podPath)
+			if err != nil {
+				fmt.Println(err.Error())
+				return
+			}
+
+			if pod.Name == podName {
+				selectedPod = pod
+			}
 		}
 
-		if pod.Name != podName {
+		if selectedPod == nil {
 			fmt.Printf("the pod '%s' does not exist\n", podNameOrPath)
 			return
 		}
@@ -73,7 +81,7 @@ spice train logpruner.yaml
 			return
 		}
 
-		trainUrl := fmt.Sprintf("%s/api/v0.1/pods/%s/train", serverBaseUrl, pod.Name)
+		trainUrl := fmt.Sprintf("%s/api/v0.1/pods/%s/train", serverBaseUrl, selectedPod.Name)
 		response, err := http.DefaultClient.Post(trainUrl, "application/json", nil)
 		if err != nil {
 			fmt.Printf("failed to start training: %s\n", err.Error())
