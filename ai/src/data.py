@@ -122,17 +122,15 @@ class DataManager:
 
     def add_interpretations(self, interpretations):
         self.interpretations = interpretations
-        if interpretations is not None:
-            print(interpretations)
 
     def get_interpretations_for_interval(self):
         if self.interpretations is not None:
-            index = self.interpretations.index[self.current_time]
-            interval_interpretations = []
-            if index is not None:
-                for i in index.Indicies:
+            index = self.interpretations.index.get(self.current_time)
+            if index is not None and index.indicies is not None:
+                interval_interpretations = []
+                for i in index.indicies:
                     interval_interpretations += self.interpretations.interpretations[i]
-            return interval_interpretations
+                return interval_interpretations
 
     def get_shape(self):
         return np.shape([0] * self.get_window_span() * len(self.fields))

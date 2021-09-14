@@ -28,6 +28,7 @@ func sendInterpretations(pod *pods.Pod, indexedInterpretations *common_pb.Indexe
 		IndexedInterpretations: indexedInterpretations,
 	}
 
+	startTime := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	response, err := aiengineClient.AddInterpretations(ctx, addInterpretationsRequest)
@@ -39,7 +40,8 @@ func sendInterpretations(pod *pods.Pod, indexedInterpretations *common_pb.Indexe
 		return fmt.Errorf("failed to post new interpretations to pod %s: %s", pod.Name, response.Result)
 	}
 
-	zaplog.Sugar().Debugf("Sent %d interpretations to AI engine\n", aurora.BrightYellow(len(indexedInterpretations.Interpretations)))
+	duration := time.Now().Sub(startTime)
+	zaplog.Sugar().Debugf("Sent %d interpretations to AI engine in %.2f seconds\n", len(indexedInterpretations.Interpretations), duration.Seconds())
 
 	return nil
 }

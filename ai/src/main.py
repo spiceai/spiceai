@@ -81,7 +81,7 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
         self, request: aiengine_pb2.AddInterpretationsRequest, context
     ):
         data_manager: DataManager = data_managers[request.pod]
-        data_manager.add_interpretations(request.interpretations)
+        data_manager.add_interpretations(request.indexed_interpretations)
         return aiengine_pb2.Response(result="ok")
 
     def StartTraining(self, request: aiengine_pb2.StartTrainingRequest, context):
