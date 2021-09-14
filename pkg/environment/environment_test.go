@@ -20,8 +20,9 @@ func TestEnvironment(t *testing.T) {
 
 func testStartDataListeners() func(*testing.T) {
 	return func(t *testing.T) {
-		_, err := pods.LoadPodFromManifest("../../test/assets/pods/manifests/trader.yaml")
+		pod, err := pods.LoadPodFromManifest("../../test/assets/pods/manifests/trader.yaml")
 		assert.NoError(t, err)
+		pods.CreateOrUpdatePod(pod)
 		data_received := make(chan bool)
 
 		t.Cleanup(func() {
