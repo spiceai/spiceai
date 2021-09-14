@@ -331,11 +331,7 @@ func apiGetInterpretationsHandler(ctx *fasthttp.RequestCtx) {
 	}
 
 	interpretations := pod.GetInterpretations(start, end)
-
-	apiInterpretations := make([]*api.Interpretation, 0, len(interpretations))
-	for _, i := range interpretations {
-		apiInterpretations = append(apiInterpretations, api.NewApiInterpretation(&i))
-	}
+	apiInterpretations := api.ApiInterpretations(interpretations)
 
 	response, err := json.Marshal(apiInterpretations)
 	if err != nil {
@@ -403,7 +399,7 @@ func apiPostExportHandler(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	err = aiengine.ExportModel(pod.Name, tag.(string), &exportRequest)
+	err = aiengine.ExportPod(pod.Name, tag.(string), &exportRequest)
 	if err != nil {
 		ctx.Response.SetStatusCode(400)
 		ctx.Response.SetBodyString(err.Error())
@@ -438,7 +434,7 @@ func apiPostImportHandler(ctx *fasthttp.RequestCtx) {
 	importRequest.Pod = pod.Name
 	importRequest.Tag = tag.(string)
 
-	err = aiengine.ImportModel(&importRequest)
+	err = aiengine.ImportPod(&importRequest)
 	if err != nil {
 		ctx.Response.SetStatusCode(400)
 		ctx.Response.SetBodyString(err.Error())
