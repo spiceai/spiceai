@@ -35,7 +35,7 @@ func testGetInterpretationsHandlerFunc(pod *pods.Pod) func(t *testing.T) {
 			t.Error(err)
 		}
 
-		err = pod.AddInterpretation(interpretation)
+		err = pod.Interpretations().Add(interpretation)
 		if err != nil {
 			t.Error(err)
 		}
@@ -47,7 +47,7 @@ func testGetInterpretationsHandlerFunc(pod *pods.Pod) func(t *testing.T) {
 
 		apiGetInterpretationsHandler(ctx)
 
-		interpretations := pod.Interpretations()
+		interpretations := pod.Interpretations().All()
 		assert.Equal(t, 1, len(interpretations))
 		assert.Equal(t, interpretation, &interpretations[0])
 	}
@@ -80,7 +80,7 @@ func testPostInterpretationsHandlerFunc(pod *pods.Pod) func(t *testing.T) {
 
 		apiPostInterpretationsHandler(ctx)
 
-		interpretations := pod.Interpretations()
+		interpretations := pod.Interpretations().All()
 		assert.Equal(t, 1, len(interpretations))
 		assert.Equal(t, interpretation, &interpretations[0])
 	}

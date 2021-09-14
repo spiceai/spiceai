@@ -330,7 +330,7 @@ func apiGetInterpretationsHandler(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	interpretations := pod.GetInterpretations(start, end)
+	interpretations := pod.Interpretations().Get(start, end)
 
 	apiInterpretations := make([]*api.Interpretation, 0, len(interpretations))
 	for _, i := range interpretations {
@@ -370,7 +370,7 @@ func apiPostInterpretationsHandler(ctx *fasthttp.RequestCtx) {
 			return
 		}
 
-		err = pod.AddInterpretation(interpretation)
+		err = pod.Interpretations().Add(interpretation)
 		if err != nil {
 			ctx.Response.SetStatusCode(http.StatusBadRequest)
 			ctx.Response.SetBodyString(err.Error())
