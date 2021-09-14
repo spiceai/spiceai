@@ -106,7 +106,7 @@ func apiPodsHandler(ctx *fasthttp.RequestCtx) {
 
 	data := make([]*runtime_pb.Pod, 0)
 
-	for _, f := range *pods {
+	for _, f := range pods {
 		if f == nil {
 			continue
 		}
