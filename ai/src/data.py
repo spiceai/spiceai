@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 import pandas.core.computation.expressions as expressions
-from proto.aiengine.v1 import common_pb2
+from proto.common.v1 import common_pb2
 from types import SimpleNamespace
 import math
 import threading
