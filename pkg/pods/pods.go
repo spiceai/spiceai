@@ -17,6 +17,13 @@ var (
 	pods      = make(map[string]*Pod)
 )
 
+func CreateOrUpdatePod(pod *Pod) {
+	podsMutex.Lock()
+	defer podsMutex.Unlock()
+
+	pods[pod.Name] = pod
+}
+
 func Pods() map[string]*Pod {
 	return pods
 }
@@ -56,17 +63,16 @@ func FindPod(podName string) (*Pod, error) {
 
 func RemovePodByManifestPath(manifestPath string) {
 	relativePath := context.CurrentContext().GetSpiceAppRelativePath(manifestPath)
-
-	podsMutex.Lock()
-	defer podsMutex.Unlock()
-
+	var podToDelete *Pod
 	for _, pod := range pods {
 		if pod.ManifestPath() == manifestPath {
-			log.Printf("Removing pod %s: %s\n", aurora.Bold(pod.Name), aurora.Gray(12, relativePath))
-			RemovePod(pod.Name)
-			return
+			podToDelete = pod
+			break
 		}
 	}
+
+	log.Printf("Removing pod %s: %s\n", aurora.Bold(podToDelete.Name), aurora.Gray(12, relativePath))
+	RemovePod(podToDelete.Name)
 }
 
 func FindFirstManifestPath() string {
@@ -101,17 +107,11 @@ func LoadPodFromManifest(manifestPath string) (*Pod, error) {
 
 	existingPod, ok := pods[pod.Name]
 	if ok {
-		if existingPod.Hash() == pod.Hash() {
+		if existingPod.IsSame(pod) {
 			// Pods are the same, ignore new pod
 			return existingPod, nil
 		}
-		// Copy data from old pod
-		pod.copyData(existingPod)
 	}
-
-	podsMutex.Lock()
-	pods[pod.Name] = pod
-	podsMutex.Unlock()
 
 	return pod, nil
 }

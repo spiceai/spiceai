@@ -80,7 +80,7 @@ func processNotifyEvent(event fsnotify.Event) error {
 			return err
 		}
 		existingPod := pods.GetPod(newPod.Name)
-		if existingPod != nil && newPod.Hash() == existingPod.Hash() {
+		if newPod.IsSame(existingPod) {
 			// Nothing changed, ignore
 			break
 		}

@@ -507,8 +507,6 @@ func (pod *Pod) loadRewardSpecs() ([]spec.RewardSpec, error) {
 	return rewards, nil
 }
 
-func (pod *Pod) copyData(oldPod *Pod) {
-	pod.flights = oldPod.flights
-	pod.interpretations = oldPod.interpretations
-	pod.podLocalState = oldPod.podLocalState
+func (pod *Pod) IsSame(otherPod *Pod) bool {
+	return otherPod != nil && pod.manifestPath == otherPod.manifestPath && pod.Hash() == otherPod.Hash()
 }
