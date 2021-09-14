@@ -107,7 +107,7 @@ func LoadPodFromManifest(manifestPath string) (*Pod, error) {
 
 	existingPod, ok := pods[pod.Name]
 	if ok {
-		if existingPod.Hash() == pod.Hash() {
+		if existingPod.IsSame(pod) {
 			// Pods are the same, ignore new pod
 			return existingPod, nil
 		}
