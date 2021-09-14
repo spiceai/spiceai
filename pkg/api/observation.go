@@ -23,7 +23,7 @@ type Observation struct {
 }
 
 func JsonSchema() *[]byte {
-	return &schema
+	return &jsonSchema
 }
 
 func (x *Time) UnmarshalJSON(data []byte) error {
