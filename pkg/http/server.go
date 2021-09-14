@@ -134,6 +134,13 @@ func apiPostDataspaceHandler(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
+	err = dp.Init(nil)
+	if err != nil {
+		zaplog.Sugar().Error(err)
+		ctx.Response.SetStatusCode(500)
+		return
+	}
+
 	_, err = dp.OnData(ctx.Request.Body())
 	if err != nil {
 		zaplog.Sugar().Error(err)
