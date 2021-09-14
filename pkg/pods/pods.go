@@ -63,17 +63,16 @@ func FindPod(podName string) (*Pod, error) {
 
 func RemovePodByManifestPath(manifestPath string) {
 	relativePath := context.CurrentContext().GetSpiceAppRelativePath(manifestPath)
-
-	podsMutex.Lock()
-	defer podsMutex.Unlock()
-
+	var podToDelete *Pod
 	for _, pod := range pods {
 		if pod.ManifestPath() == manifestPath {
-			log.Printf("Removing pod %s: %s\n", aurora.Bold(pod.Name), aurora.Gray(12, relativePath))
-			RemovePod(pod.Name)
-			return
+			podToDelete = pod
+			break
 		}
 	}
+
+	log.Printf("Removing pod %s: %s\n", aurora.Bold(podToDelete.Name), aurora.Gray(12, relativePath))
+	RemovePod(podToDelete.Name)
 }
 
 func FindFirstManifestPath() string {
