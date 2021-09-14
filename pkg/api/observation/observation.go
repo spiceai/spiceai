@@ -17,6 +17,6 @@ type Observation struct {
 	Tags []string           `json:"tags,omitempty"`
 }
 
-func JsonSchema() *[]byte {
-	return &jsonSchema
+func JsonSchema() []byte {
+	return jsonSchema
 }
