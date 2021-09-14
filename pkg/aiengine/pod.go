@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"io/fs"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/spiceai/spiceai/pkg/api"
 	"github.com/spiceai/spiceai/pkg/pods"
 	"github.com/spiceai/spiceai/pkg/proto/aiengine_pb"
 	"github.com/spiceai/spiceai/pkg/proto/runtime_pb"
@@ -19,7 +21,7 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-func ExportModel(podName string, tag string, request *runtime_pb.ExportModel) error {
+func ExportPod(podName string, tag string, request *runtime_pb.ExportModel) error {
 	if !ServerReady() {
 		return fmt.Errorf("not ready")
 	}
@@ -68,7 +70,7 @@ func ExportModel(podName string, tag string, request *runtime_pb.ExportModel) er
 	defer zipWriter.Close()
 
 	for _, f := range files {
-		err = AddFileOrDirToZip(zipWriter, filepath.Join(absDir, f), f)
+		err = addFileOrDirToZip(zipWriter, filepath.Join(absDir, f), f)
 		if err != nil {
 			return err
 		}
@@ -90,11 +92,23 @@ func ExportModel(podName string, tag string, request *runtime_pb.ExportModel) er
 		return err
 	}
 
-	err = AddBytesAsFileToZip(zipWriter, initBytes, "init.pb")
+	interpretations := pod.Interpretations()
+	apiInterpretations := api.ApiInterpretations(interpretations)
+	interpretationData, err := json.Marshal(apiInterpretations)
 	if err != nil {
 		return err
 	}
-	err = AddBytesAsFileToZip(zipWriter, manifestBytes, fmt.Sprintf("%s.yaml", podName))
+
+	err = addBytesAsFileToZip(zipWriter, interpretationData, "interpretations.json")
+	if err != nil {
+		return err
+	}
+
+	err = addBytesAsFileToZip(zipWriter, initBytes, "init.pb")
+	if err != nil {
+		return err
+	}
+	err = addBytesAsFileToZip(zipWriter, manifestBytes, fmt.Sprintf("%s.yaml", podName))
 	if err != nil {
 		return err
 	}
@@ -102,7 +116,7 @@ func ExportModel(podName string, tag string, request *runtime_pb.ExportModel) er
 	return nil
 }
 
-func ImportModel(request *runtime_pb.ImportModel) error {
+func ImportPod(request *runtime_pb.ImportModel) error {
 	if !ServerReady() {
 		return fmt.Errorf("not ready")
 	}
@@ -132,9 +146,34 @@ func ImportModel(request *runtime_pb.ImportModel) error {
 		return err
 	}
 
+	pods.CreateOrUpdatePod(pod)
+
 	err = sendInit(&init)
 	if err != nil {
 		return err
+	}
+
+	interpretationsPath := filepath.Join(tempDir, "interpretations.json")
+	if _, err := os.Stat(interpretationsPath); err == nil {
+		interpretationsBytes, err := os.ReadFile(filepath.Join(tempDir, "interpretations.json"))
+		if err != nil {
+			return err
+		}
+		var apiInterpretations []api.Interpretation
+		err = json.Unmarshal(interpretationsBytes, &apiInterpretations)
+		if err != nil {
+			return err
+		}
+		for _, i := range apiInterpretations {
+			interpretation, err := api.NewInterpretationFromApi(&i)
+			if err != nil {
+				return err
+			}
+			err = pod.AddInterpretation(interpretation)
+			if err != nil {
+				return err
+			}
+		}
 	}
 
 	podState, err := pod.FetchNewData()
@@ -170,7 +209,7 @@ func ImportModel(request *runtime_pb.ImportModel) error {
 	return nil
 }
 
-func AddBytesAsFileToZip(zipWriter *zip.Writer, fileContent []byte, filename string) error {
+func addBytesAsFileToZip(zipWriter *zip.Writer, fileContent []byte, filename string) error {
 	header := &zip.FileHeader{
 		Name:   filename,
 		Method: zip.Store,
@@ -188,7 +227,7 @@ func AddBytesAsFileToZip(zipWriter *zip.Writer, fileContent []byte, filename str
 	return nil
 }
 
-func AddFileOrDirToZip(zipWriter *zip.Writer, fullPath string, relativePath string) error {
+func addFileOrDirToZip(zipWriter *zip.Writer, fullPath string, relativePath string) error {
 	fileToZip, err := os.Open(fullPath)
 	if err != nil {
 		return err
