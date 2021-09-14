@@ -4,13 +4,17 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bradleyjkemp/cupaloy"
 	"github.com/spiceai/spiceai/pkg/interpretations"
 	"github.com/stretchr/testify/assert"
 )
 
+var snapshotter = cupaloy.New(cupaloy.SnapshotSubdirectory("../../test/assets/snapshots/interpretations"))
+
 func TestInterpretations(t *testing.T) {
 	t.Run("Intervals()", testIntervalsFunc())
 	t.Run("Get()", testGetInterpretationsFunc())
+	t.Run("TimeIndex()", testTimeIndexFunc())
 }
 
 // Tests Intervals()
@@ -19,7 +23,7 @@ func testIntervalsFunc() func(*testing.T) {
 		epoch := time.Now()
 		period := 7 * 24 * time.Hour // 7 days
 		granularity := 1 * time.Hour // 1 hour
-		
+
 		store := interpretations.NewInterpretationsStore(epoch, period, granularity)
 
 		var expectedIntervals int64 = 24 * 7
@@ -106,5 +110,51 @@ func testGetInterpretationsFunc() func(*testing.T) {
 
 		assert.Equal(t, 4, len(store.Get(startRange, endRange)))
 		assert.Equal(t, inRangeInterpretations, store.Get(startRange, endRange))
+	}
+}
+
+// Tests TimeIndex()
+func testTimeIndexFunc() func(*testing.T) {
+	return func(t *testing.T) {
+		epoch := time.Unix(1631590387, 0)
+		period := 1000 * time.Second
+		granularity := time.Second
+
+		store := interpretations.NewInterpretationsStore(epoch, period, granularity)
+
+		i, err := interpretations.NewInterpretation(epoch.Add(100*time.Second), epoch.Add(200*time.Second), "from 100-200")
+		if err != nil {
+			t.Error(err)
+		}
+
+		if err := store.Add(i); err != nil {
+			t.Error(err)
+		}
+
+		i, err = interpretations.NewInterpretation(epoch.Add(150*time.Second), epoch.Add(250*time.Second), "from 150-250")
+		if err != nil {
+			t.Error(err)
+		}
+
+		if err := store.Add(i); err != nil {
+			t.Error(err)
+		}
+
+		i, err = interpretations.NewInterpretation(epoch.Add(50*time.Second), epoch.Add(300*time.Second), "from 50-300")
+		if err != nil {
+			t.Error(err)
+		}
+
+		if err := store.Add(i); err != nil {
+			t.Error(err)
+		}
+
+		all := store.All()
+		assert.Equal(t, 3, len(all))
+
+		timeIndex := store.TimeIndex()
+		assert.Equal(t, store.Intervals(), int64(len(timeIndex)))
+
+		snapshotter.SnapshotT(t, timeIndex)
 	}
 }

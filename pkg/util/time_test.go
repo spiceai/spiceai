@@ -2,12 +2,14 @@ package util
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 )
 
 func TestTime(t *testing.T) {
 	t.Run("ParseTime()", testParseTimeFunc())
+	t.Run("NumIntervals()", testNumIntervalsFunc())
 }
 
 func BenchmarkTime(b *testing.B) {
@@ -37,5 +39,26 @@ func benchParseTimeFunc() func(*testing.B) {
 				b.Fatal(err.Error())
 			}
 		}
+	}
+}
+
+// Tests "NumIntervals()"
+func testNumIntervalsFunc() func(*testing.T) {
+	return func(t *testing.T) {
+		// Exact
+		actual := NumIntervals(87*time.Second, time.Second)
+		assert.Equal(t, int64(87), actual)
+
+		// Less than midpoint
+		actual = NumIntervals(30*time.Second, 7*time.Second)
+		assert.Equal(t, int64(5), actual)
+
+		// Midpoint
+		actual = NumIntervals(30*time.Second, 4*time.Second)
+		assert.Equal(t, int64(8), actual)
+
+		// More than Midpoint
+		actual = NumIntervals(30*time.Second, 8*time.Second)
+		assert.Equal(t, int64(4), actual)
 	}
 }
