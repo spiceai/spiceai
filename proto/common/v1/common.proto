@@ -5,9 +5,18 @@ package common;
 option go_package = "github.com/spiceai/spiceai/pkg/proto/common_pb";
 
 message Interpretation {
-    int64 start = 1;
-    int64 end = 2;
+    uint64 start = 1;
+    uint64 end = 2;
     string name = 3;
     repeated string actions = 4;
     repeated string tags = 5;
-  }
+}
+
+message InterpretationIndices {
+  repeated uint32 indicies = 1 [packed=true];
+}
+
+message IndexedInterpretations {
+  repeated Interpretation interpretations = 1;
+  map<uint64, InterpretationIndices> index = 2;
+}

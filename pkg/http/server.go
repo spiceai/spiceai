@@ -15,10 +15,8 @@ import (
 	"github.com/spiceai/spiceai/pkg/api"
 	"github.com/spiceai/spiceai/pkg/dashboard"
 	"github.com/spiceai/spiceai/pkg/flights"
-	"github.com/spiceai/spiceai/pkg/interpretations"
 	"github.com/spiceai/spiceai/pkg/loggers"
 	"github.com/spiceai/spiceai/pkg/pods"
-	"github.com/spiceai/spiceai/pkg/proto/common_pb"
 	"github.com/spiceai/spiceai/pkg/proto/runtime_pb"
 	"github.com/spiceai/spiceai/pkg/util"
 	"github.com/valyala/fasthttp"
@@ -65,7 +63,7 @@ func apiGetObservationsHandler(ctx *fasthttp.RequestCtx) {
 	csv := pod.CachedCsv()
 
 	ctx.Response.Header.Add("Content-Type", " text/csv")
-	_, _ = ctx.Write([]byte(csv))
+	_, _ = ctx.WriteString(csv)
 }
 
 func apiPostObservationsHandler(ctx *fasthttp.RequestCtx) {
@@ -158,7 +156,7 @@ func apiPodTrainHandler(ctx *fasthttp.RequestCtx) {
 	err := aiengine.StartTraining(pod)
 	if err != nil {
 		ctx.Response.SetStatusCode(500)
-		ctx.Response.SetBody([]byte(err.Error()))
+		ctx.Response.SetBodyString(err.Error())
 		return
 	}
 
@@ -176,7 +174,7 @@ func apiRecommendationHandler(ctx *fasthttp.RequestCtx) {
 	inference, err := aiengine.Infer(pod, tag.(string))
 	if err != nil {
 		ctx.Response.SetStatusCode(500)
-		ctx.Response.SetBody([]byte(err.Error()))
+		ctx.Response.SetBodyString(err.Error())
 		return
 	}
 
@@ -187,7 +185,7 @@ func apiRecommendationHandler(ctx *fasthttp.RequestCtx) {
 	body, err := json.Marshal(inference)
 	if err != nil {
 		ctx.Response.SetStatusCode(500)
-		ctx.Response.SetBody([]byte(err.Error()))
+		ctx.Response.SetBodyString(err.Error())
 		return
 	}
 
@@ -262,7 +260,7 @@ func apiPostFlightEpisodeHandler(ctx *fasthttp.RequestCtx) {
 	err := json.Unmarshal(ctx.Request.Body(), &apiEpisode)
 	if err != nil {
 		ctx.Response.SetStatusCode(400)
-		ctx.Response.SetBody([]byte(err.Error()))
+		ctx.Response.SetBodyString(err.Error())
 		return
 	}
 
@@ -332,11 +330,11 @@ func apiGetInterpretationsHandler(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	interpretations := pod.GetInterpretations(start, end)
+	interpretations := pod.Interpretations().Get(start, end)
 
 	apiInterpretations := make([]*api.Interpretation, 0, len(interpretations))
 	for _, i := range interpretations {
-		apiInterpretations = append(apiInterpretations, api.NewInterpretation(&i))
+		apiInterpretations = append(apiInterpretations, api.NewApiInterpretation(&i))
 	}
 
 	response, err := json.Marshal(apiInterpretations)
@@ -356,7 +354,7 @@ func apiPostInterpretationsHandler(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	var apiInterpretations []*common_pb.Interpretation
+	var apiInterpretations []*api.Interpretation
 	err := json.Unmarshal(ctx.Request.Body(), &apiInterpretations)
 	if err != nil {
 		ctx.Response.SetStatusCode(http.StatusBadRequest)
@@ -365,14 +363,14 @@ func apiPostInterpretationsHandler(ctx *fasthttp.RequestCtx) {
 	}
 
 	for _, i := range apiInterpretations {
-		interpretation, err := interpretations.NewInterpretationFromProto(i)
+		interpretation, err := api.NewInterpretationFromApi(i)
 		if err != nil {
 			ctx.Response.SetStatusCode(http.StatusBadRequest)
 			ctx.Response.SetBodyString(err.Error())
 			return
 		}
 
-		err = pod.AddInterpretation(interpretation)
+		err = pod.Interpretations().Add(interpretation)
 		if err != nil {
 			ctx.Response.SetStatusCode(http.StatusBadRequest)
 			ctx.Response.SetBodyString(err.Error())
@@ -401,14 +399,14 @@ func apiPostExportHandler(ctx *fasthttp.RequestCtx) {
 	err := json.Unmarshal(ctx.Request.Body(), &exportRequest)
 	if err != nil {
 		ctx.Response.SetStatusCode(400)
-		ctx.Response.SetBody([]byte(err.Error()))
+		ctx.Response.SetBodyString(err.Error())
 		return
 	}
 
 	err = aiengine.ExportModel(pod.Name, tag.(string), &exportRequest)
 	if err != nil {
 		ctx.Response.SetStatusCode(400)
-		ctx.Response.SetBody([]byte(err.Error()))
+		ctx.Response.SetBodyString(err.Error())
 		return
 	}
 
@@ -433,7 +431,7 @@ func apiPostImportHandler(ctx *fasthttp.RequestCtx) {
 	err := json.Unmarshal(ctx.Request.Body(), &importRequest)
 	if err != nil {
 		ctx.Response.SetStatusCode(400)
-		ctx.Response.SetBody([]byte(err.Error()))
+		ctx.Response.SetBodyString(err.Error())
 		return
 	}
 
@@ -443,7 +441,7 @@ func apiPostImportHandler(ctx *fasthttp.RequestCtx) {
 	err = aiengine.ImportModel(&importRequest)
 	if err != nil {
 		ctx.Response.SetStatusCode(400)
-		ctx.Response.SetBody([]byte(err.Error()))
+		ctx.Response.SetBodyString(err.Error())
 		return
 	}
 

@@ -10,8 +10,8 @@ import (
 	"github.com/spiceai/spiceai/pkg/proto/common_pb"
 )
 
-func SendInterpretations(pod *pods.Pod, interpretations []*common_pb.Interpretation) error {
-	if len(interpretations) == 0 {
+func sendInterpretations(pod *pods.Pod, indexedInterpretations *common_pb.IndexedInterpretations) error {
+	if len(indexedInterpretations.Interpretations) == 0 {
 		// Nothing to do
 		return nil
 	}
@@ -22,8 +22,8 @@ func SendInterpretations(pod *pods.Pod, interpretations []*common_pb.Interpretat
 	}
 
 	addInterpretationsRequest := &aiengine_pb.AddInterpretationsRequest{
-		Pod:             pod.Name,
-		Interpretations: interpretations,
+		Pod:                    pod.Name,
+		IndexedInterpretations: indexedInterpretations,
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)

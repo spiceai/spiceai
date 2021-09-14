@@ -10,7 +10,6 @@ import (
 	"github.com/spiceai/data-components-contrib/dataconnectors/file"
 	"github.com/spiceai/data-components-contrib/dataprocessors"
 	"github.com/spiceai/data-components-contrib/dataprocessors/csv"
-	"github.com/spiceai/spiceai/pkg/interpretations"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -35,7 +34,6 @@ func TestPod(t *testing.T) {
 		t.Run(fmt.Sprintf("CachedCsv() - %s", manifestToTest), testCachedCsvFunc(pod))
 		t.Run(fmt.Sprintf("AddLocalState() - %s", manifestToTest), testAddLocalStateFunc(pod))
 		t.Run(fmt.Sprintf("AddLocalState()/CachedCsv() - %s", manifestToTest), testAddLocalStateCachedCsvFunc(pod))
-		t.Run(fmt.Sprintf("GetInterpretations() - %s", manifestToTest), testGetInterpretationsFunc(pod))
 	}
 }
 
@@ -278,80 +276,5 @@ func testAddLocalStateCachedCsvFunc(pod *Pod) func(*testing.T) {
 		actual := pod.CachedCsv()
 
 		snapshotter.SnapshotT(t, actual)
-	}
-}
-
-// Tests GetIntepretations()
-func testGetInterpretationsFunc(pod *Pod) func(*testing.T) {
-	return func(t *testing.T) {
-		startRange := pod.Epoch().Add(100 * time.Second)
-		endRange := pod.Epoch().Add(200 * time.Second)
-
-		var allInterpretations []interpretations.Interpretation
-		var inRangeInterpretations []interpretations.Interpretation
-
-		beforeRangeInterpretation, err := interpretations.NewInterpretation(startRange.Add(-2*time.Second), startRange.Add(-1*time.Second), "before range")
-		if err != nil {
-			t.Error(err)
-		}
-
-		err = pod.AddInterpretation(beforeRangeInterpretation)
-		assert.NoError(t, err)
-		allInterpretations = append(allInterpretations, *beforeRangeInterpretation)
-
-		endOnRangeInterpretation, err := interpretations.NewInterpretation(startRange.Add(-1*time.Second), startRange, "end on range")
-		if err != nil {
-			t.Error(err)
-		}
-
-		err = pod.AddInterpretation(endOnRangeInterpretation)
-		assert.NoError(t, err)
-		allInterpretations = append(allInterpretations, *endOnRangeInterpretation)
-		inRangeInterpretations = append(inRangeInterpretations, *endOnRangeInterpretation)
-
-		withinRangeInterpretation, err := interpretations.NewInterpretation(startRange.Add(1*time.Second), startRange.Add(2*time.Second), "within range")
-		if err != nil {
-			t.Error(err)
-		}
-
-		err = pod.AddInterpretation(withinRangeInterpretation)
-		assert.NoError(t, err)
-		allInterpretations = append(allInterpretations, *withinRangeInterpretation)
-		inRangeInterpretations = append(inRangeInterpretations, *withinRangeInterpretation)
-
-		aroundRangeInterpretation, err := interpretations.NewInterpretation(startRange.Add(-1*time.Second), endRange.Add(1*time.Second), "around range")
-		if err != nil {
-			t.Error(err)
-		}
-
-		err = pod.AddInterpretation(aroundRangeInterpretation)
-		assert.NoError(t, err)
-		allInterpretations = append(allInterpretations, *aroundRangeInterpretation)
-		inRangeInterpretations = append(inRangeInterpretations, *aroundRangeInterpretation)
-
-		startOnRangeInterpretation, err := interpretations.NewInterpretation(endRange, endRange.Add(1*time.Second), "start on range")
-		if err != nil {
-			t.Error(err)
-		}
-
-		err = pod.AddInterpretation(startOnRangeInterpretation)
-		assert.NoError(t, err)
-		allInterpretations = append(allInterpretations, *startOnRangeInterpretation)
-		inRangeInterpretations = append(inRangeInterpretations, *startOnRangeInterpretation)
-
-		startAfterRangeInterpretation, err := interpretations.NewInterpretation(endRange.Add(1*time.Second), endRange.Add(2*time.Second), "start after range")
-		if err != nil {
-			t.Error(err)
-		}
-
-		err = pod.AddInterpretation(startAfterRangeInterpretation)
-		assert.NoError(t, err)
-		allInterpretations = append(allInterpretations, *startAfterRangeInterpretation)
-
-		assert.Equal(t, 6, len(allInterpretations))
-		assert.Equal(t, allInterpretations, pod.Interpretations())
-
-		assert.Equal(t, 4, len(pod.GetInterpretations(startRange, endRange)))
-		assert.Equal(t, inRangeInterpretations, pod.GetInterpretations(startRange, endRange))
 	}
 }
