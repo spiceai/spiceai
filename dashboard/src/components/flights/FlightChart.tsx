@@ -49,13 +49,13 @@ const FlightChart: React.FunctionComponent<FlightChartProps> = (props) => {
             },
             y1: {
               id: "rewards",
-              display: true,
+              display: false,
               title: {
                 display: true,
                 text: 'Rewards',
               },
               position: "left",
-              type: 'linear',
+              type: 'logarithmic',
               weight: 100,
               grid: {
                 display: false,
@@ -70,7 +70,7 @@ const FlightChart: React.FunctionComponent<FlightChartProps> = (props) => {
                 display: true,
                 text: "Action Count",
               },
-              type: "linear",
+              type: "logarithmic",
               position: "right",
               grid: {
                 display: false,
@@ -87,12 +87,6 @@ const FlightChart: React.FunctionComponent<FlightChartProps> = (props) => {
             },
             legend: {
               display: true,
-            },
-            boxselect: {
-              select: {
-                enabled: true,
-                direction: 'x',
-              },
             },
           },
         } as any,
@@ -117,7 +111,7 @@ const FlightChart: React.FunctionComponent<FlightChartProps> = (props) => {
         },
       };
 
-      if (chartConfig.data.datasets.length == 1 && props.flight.episodes.length) {
+      if (chartConfig.data.datasets.length == 0 && props.flight.episodes.length) {
         const ep = props.flight.episodes[0]
         let numActions = 0
         for (const actionName of Object.keys(ep.actions_taken)) {
@@ -147,7 +141,7 @@ const FlightChart: React.FunctionComponent<FlightChartProps> = (props) => {
       if (chart.current) {
         chart.current.options = chartConfig.options as any;
         chart.current.data = chartConfig.data;
-        chart.current.update("resize");
+        chart.current.update();
       } else {
         chart.current = new Chart(chartCanvas, chartConfig);
       }
