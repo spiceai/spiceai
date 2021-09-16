@@ -93,7 +93,7 @@ func (store *InterpretationsStore) addToTimeIndex(interpretation *Interpretation
 	pbInterpretationIndex := uint32(len(timeIndex.Interpretations))
 	timeIndex.Interpretations = append(timeIndex.Interpretations, pbInterpretation)
 
-	for i := interpretation.Start(); i.Before(interpretation.End()); i.Add(store.granularity) {
+	for i := interpretation.Start(); i.Before(interpretation.End()); i = i.Add(store.granularity) {
 		index := i.Unix()
 		if timeIndex.Index[index] == nil {
 			timeIndex.Index[index] = &common_pb.InterpretationIndices{}
