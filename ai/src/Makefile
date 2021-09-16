@@ -20,6 +20,12 @@ venv-gen-proto:
 	venv/bin/pip3 install --upgrade pip
 	venv/bin/pip3 install grpcio-tools
 
+.PHONY: install-codespaces
+install-codespaces:
+	sudo apt update
+	sudo apt-get install libbz2-dev -y
+	cp /usr/lib/python3.8/lib-dynload/_bz2.cpython-38-x86_64-linux-gnu.so  venv/lib/python3.8/site-packages
+
 ################################################################################
 # Target: gen-proto                                                            #
 ################################################################################
