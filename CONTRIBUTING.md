@@ -66,11 +66,11 @@ Spice.ai takes security and our users' trust very seriously. If you believe you 
 
 ### Installing Dependencies
 
-Spice.ai requires Go 1.17, Python 3.8+ and Docker.
+Spice.ai requires Go 1.17, Python 3.8.x and Docker.
 
 #### Go 1.17
 
-Download & install the latest 1.17 release for Go: https://golang.org/dl/
+Download & install the latest 1.17 release for Go: https://golang.org/dl/ or run `brew install golang`
 
 To make it easy to manage multiple versions of Go on your machine, see https://github.com/moovweb/gvm
 
@@ -78,7 +78,7 @@ To make it easy to manage multiple versions of Go on your machine, see https://g
 
 Download and install Docker from: https://www.docker.com/products/docker-desktop
 
-#### Python 3
+#### Python 3.8
 
 Download & install the latest release for Python: https://www.python.org/downloads/
 
@@ -101,6 +101,12 @@ Activate the venv and install the python dependencies:
 ```bash
 $ source venv/bin/activate
 $ pip install -r requirements/development.txt
+```
+
+If you are running in GitHub Codespaces or other Ubuntu/Debian environment, you may need to install additional libraries. Do this by running:
+
+```bash
+make install-codespaces
 ```
 
 ### Building the Spice CLI
