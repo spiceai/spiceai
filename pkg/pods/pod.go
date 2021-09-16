@@ -115,7 +115,7 @@ func (pod *Pod) Episodes() int {
 	if pod.PodSpec.Params != nil {
 		episodesParam, ok := pod.PodSpec.Params["episodes"]
 		if ok {
-			if episodes, err := strconv.ParseInt(episodesParam, 0, 64); err == nil {
+			if episodes, err := strconv.ParseInt(episodesParam, 0, 0); err == nil {
 				return int(episodes)
 			}
 		}

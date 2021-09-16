@@ -17,7 +17,6 @@ import (
 
 const (
 	BaseUrl = "http://localhost:8000"
-	testPod = "test/Trader@0.2.0"
 )
 
 var (
@@ -30,6 +29,7 @@ var (
 	cliClient        *cli
 	runtime          *runtimeServer
 	snapshotter      *cupaloy.Config
+	testPods         = []string{"test/Trader@0.2.0", "test/customprocessor@0.1.0"}
 )
 
 func TestMain(m *testing.M) {
@@ -102,10 +102,12 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
-	err = cliClient.runCliCmd("add", testPod)
-	if err != nil {
-		log.Println(err.Error())
-		os.Exit(1)
+	for _, testPod := range testPods {
+		err = cliClient.runCliCmd("add", testPod)
+		if err != nil {
+			log.Println(err.Error())
+			os.Exit(1)
+		}
 	}
 
 	testCode := m.Run()
@@ -168,6 +170,83 @@ func TestObservations(t *testing.T) {
 	}
 
 	err = snapshotter.SnapshotMulti("new_observation.csv", observation)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDataspaceData(t *testing.T) {
+	if !shouldRunTest {
+		t.Skip("Specify '-e2e' to run e2e tests")
+		return
+	}
+
+	runtimeCmd, err := runtime.startRuntime()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() {
+		err = runtimeCmd.Process.Signal(os.Interrupt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = runtimeCmd.Wait()
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	observation, err := runtime.getObservations("customprocessor")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = snapshotter.SnapshotMulti("initial_observation.csv", observation)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	newJsonData, err := os.ReadFile(filepath.Join(repoRoot, "test/assets/data/json/customprocessor.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = runtime.postDataspace("customprocessor", "json", "processor", newJsonData)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(1 * time.Second)
+
+	observation, err = runtime.getObservations("customprocessor")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = snapshotter.SnapshotMulti("new_observation.csv", observation)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	newCsvData, err := os.ReadFile(filepath.Join(repoRoot, "test/assets/data/csv/customprocessor.csv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = runtime.postDataspace("customprocessor", "csv", "processor", newCsvData)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(1 * time.Second)
+
+	observation, err = runtime.getObservations("customprocessor")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = snapshotter.SnapshotMulti("new_observation_after_new_csv.csv", observation)
 	if err != nil {
 		t.Fatal(err)
 	}
