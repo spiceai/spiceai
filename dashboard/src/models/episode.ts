@@ -3,7 +3,7 @@ export interface ApiEpisode {
     start: number,
     end: number,
     score: number,
-    actions_taken: Map<string, string>
+    actions_taken: Map<string, number>
     error: string
     error_message: string
 }
@@ -13,7 +13,7 @@ export interface Episode {
     start: Date,
     end: Date,
     reward: number,
-    actions_taken: Map<string, string>
+    actions_taken: Map<string, number>
     error: string
     error_message: string
 }
