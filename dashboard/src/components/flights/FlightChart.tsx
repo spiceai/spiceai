@@ -48,36 +48,29 @@ const FlightChart: React.FunctionComponent<FlightChartProps> = (props) => {
               type: 'category',
             },
             y1: {
-              id: "rewards",
-              display: false,
+              display: true,
               title: {
                 display: true,
                 text: 'Rewards',
               },
               position: "left",
-              type: 'logarithmic',
+              type: 'linear',
               weight: 100,
               grid: {
-                display: false,
+                display: true,
               },
-              ticks: {
-                display: false,
-              }
             },
             y2: {
-              id: "actions",
+              display: true,
               title: {
                 display: true,
                 text: "Action Count",
               },
-              type: "logarithmic",
+              type: "linear",
               position: "right",
               grid: {
                 display: false,
               },
-              ticks: {
-                display: false,
-              }
             }
           },
           plugins: {
@@ -104,14 +97,13 @@ const FlightChart: React.FunctionComponent<FlightChartProps> = (props) => {
                 xAxisKey: 'episode',
                 yAxisKey: 'reward',
               },
-              yAxisID: 'rewards',
-              normalized: true,
+              yAxisID: 'y1',
             }
           ],
         },
       };
 
-      if (chartConfig.data.datasets.length == 0 && props.flight.episodes.length) {
+      if (chartConfig.data.datasets.length == 1 && props.flight.episodes.length) {
         const ep = props.flight.episodes[0]
         let numActions = 0
         for (const actionName of Object.keys(ep.actions_taken)) {
@@ -130,8 +122,7 @@ const FlightChart: React.FunctionComponent<FlightChartProps> = (props) => {
               xAxisKey: 'episode',
               yAxisKey: `actions_taken.${actionName}`,
             },
-            yAxisID: 'actions',
-            normalized: true,
+            yAxisID: 'y2',
           }
           chartConfig.data.datasets.push(dataset)
           numActions++
