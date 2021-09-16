@@ -19,7 +19,7 @@ DESCRIPTOR = _descriptor.FileDescriptor(
   syntax='proto3',
   serialized_options=b'Z.github.com/spiceai/spiceai/pkg/proto/common_pb',
   create_key=_descriptor._internal_create_key,
-  serialized_pb=b'\n\x1cproto/common/v1/common.proto\x12\x06\x63ommon\"Y\n\x0eInterpretation\x12\r\n\x05start\x18\x01 \x01(\x04\x12\x0b\n\x03\x65nd\x18\x02 \x01(\x04\x12\x0c\n\x04name\x18\x03 \x01(\t\x12\x0f\n\x07\x61\x63tions\x18\x04 \x03(\t\x12\x0c\n\x04tags\x18\x05 \x03(\t\"-\n\x15InterpretationIndices\x12\x14\n\x08indicies\x18\x01 \x03(\rB\x02\x10\x01\"\xd0\x01\n\x16IndexedInterpretations\x12/\n\x0finterpretations\x18\x01 \x03(\x0b\x32\x16.common.Interpretation\x12\x38\n\x05index\x18\x02 \x03(\x0b\x32).common.IndexedInterpretations.IndexEntry\x1aK\n\nIndexEntry\x12\x0b\n\x03key\x18\x01 \x01(\x04\x12,\n\x05value\x18\x02 \x01(\x0b\x32\x1d.common.InterpretationIndices:\x02\x38\x01\x42\x30Z.github.com/spiceai/spiceai/pkg/proto/common_pbb\x06proto3'
+  serialized_pb=b'\n\x1cproto/common/v1/common.proto\x12\x06\x63ommon\"Y\n\x0eInterpretation\x12\r\n\x05start\x18\x01 \x01(\x03\x12\x0b\n\x03\x65nd\x18\x02 \x01(\x03\x12\x0c\n\x04name\x18\x03 \x01(\t\x12\x0f\n\x07\x61\x63tions\x18\x04 \x03(\t\x12\x0c\n\x04tags\x18\x05 \x03(\t\"-\n\x15InterpretationIndices\x12\x14\n\x08indicies\x18\x01 \x03(\rB\x02\x10\x01\"\xd0\x01\n\x16IndexedInterpretations\x12/\n\x0finterpretations\x18\x01 \x03(\x0b\x32\x16.common.Interpretation\x12\x38\n\x05index\x18\x02 \x03(\x0b\x32).common.IndexedInterpretations.IndexEntry\x1aK\n\nIndexEntry\x12\x0b\n\x03key\x18\x01 \x01(\x03\x12,\n\x05value\x18\x02 \x01(\x0b\x32\x1d.common.InterpretationIndices:\x02\x38\x01\x42\x30Z.github.com/spiceai/spiceai/pkg/proto/common_pbb\x06proto3'
 )
 
 
@@ -35,14 +35,14 @@ _INTERPRETATION = _descriptor.Descriptor(
   fields=[
     _descriptor.FieldDescriptor(
       name='start', full_name='common.Interpretation.start', index=0,
-      number=1, type=4, cpp_type=4, label=1,
+      number=1, type=3, cpp_type=2, label=1,
       has_default_value=False, default_value=0,
       message_type=None, enum_type=None, containing_type=None,
       is_extension=False, extension_scope=None,
       serialized_options=None, file=DESCRIPTOR,  create_key=_descriptor._internal_create_key),
     _descriptor.FieldDescriptor(
       name='end', full_name='common.Interpretation.end', index=1,
-      number=2, type=4, cpp_type=4, label=1,
+      number=2, type=3, cpp_type=2, label=1,
       has_default_value=False, default_value=0,
       message_type=None, enum_type=None, containing_type=None,
       is_extension=False, extension_scope=None,
@@ -127,7 +127,7 @@ _INDEXEDINTERPRETATIONS_INDEXENTRY = _descriptor.Descriptor(
   fields=[
     _descriptor.FieldDescriptor(
       name='key', full_name='common.IndexedInterpretations.IndexEntry.key', index=0,
-      number=1, type=4, cpp_type=4, label=1,
+      number=1, type=3, cpp_type=2, label=1,
       has_default_value=False, default_value=0,
       message_type=None, enum_type=None, containing_type=None,
       is_extension=False, extension_scope=None,

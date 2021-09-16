@@ -30,7 +30,7 @@ func NewInterpretationsStore(epoch time.Time, period time.Duration, granularity 
 		granularity: granularity,
 		intervals:   intervals,
 		timeIndex: &common_pb.IndexedInterpretations{
-			Index: make(map[uint64]*common_pb.InterpretationIndices),
+			Index: make(map[int64]*common_pb.InterpretationIndices),
 		},
 	}
 }
@@ -93,11 +93,8 @@ func (store *InterpretationsStore) addToTimeIndex(interpretation *Interpretation
 	pbInterpretationIndex := uint32(len(timeIndex.Interpretations))
 	timeIndex.Interpretations = append(timeIndex.Interpretations, pbInterpretation)
 
-	startOffset := interpretation.Start().Sub(store.epoch)
-	startIndex := startOffset / store.granularity
-	intervals := interpretation.End().Sub(interpretation.Start()) / store.granularity
-	for i := startIndex; i < intervals; i++ {
-		index := uint64(i)
+	for i := interpretation.Start(); i.Before(interpretation.End()); i.Add(store.granularity) {
+		index := i.Unix()
 		if timeIndex.Index[index] == nil {
 			timeIndex.Index[index] = &common_pb.InterpretationIndices{}
 		}
@@ -107,8 +104,8 @@ func (store *InterpretationsStore) addToTimeIndex(interpretation *Interpretation
 
 func newPbInterpretation(interpretation *Interpretation) *common_pb.Interpretation {
 	return &common_pb.Interpretation{
-		Start:   uint64(interpretation.Start().Unix()),
-		End:     uint64(interpretation.End().Unix()),
+		Start:   interpretation.Start().Unix(),
+		End:     interpretation.End().Unix(),
 		Name:    interpretation.Name(),
 		Actions: interpretation.Actions(),
 		Tags:    interpretation.Tags(),
