@@ -8,9 +8,15 @@ import (
 
 // Unmarshals from json a union data type that can contain either an int64, string or float64
 func UnmarshalUnion(data []byte, pi **int64, ps **string, pf **float64) error {
-	*pi = nil
-	*ps = nil
-	*pf = nil
+	if pi != nil {
+		*pi = nil
+	}
+	if ps != nil {
+		*ps = nil
+	}
+	if pf != nil {
+		*pf = nil
+	}
 
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.UseNumber()
@@ -21,17 +27,22 @@ func UnmarshalUnion(data []byte, pi **int64, ps **string, pf **float64) error {
 
 	switch v := tok.(type) {
 	case json.Number:
-		i, err := v.Int64()
-		if err == nil {
-			*pi = &i
-			return nil
+		if pi != nil {
+			i, err := v.Int64()
+			if err == nil {
+				*pi = &i
+				return nil
+			}
 		}
-		f, err := v.Float64()
-		if err == nil {
-			*pf = &f
-			return nil
+		if pf != nil {
+			f, err := v.Float64()
+			if err == nil {
+				*pf = &f
+				return nil
+			}
+			return errors.New("unparsable number")
 		}
-		return err
+		return errors.New("union does not contain number")
 	case string:
 		*ps = &v
 		return nil

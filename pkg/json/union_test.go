@@ -45,6 +45,9 @@ func testUnmarshalUnionFunc() func(*testing.T) {
 		assert.Equal(t, float64(24.0), *test.Float)
 		assert.Nil(t, test.String)
 		assert.Nil(t, test.Integer)
+
+		err = UnmarshalUnion([]byte("24.0"), nil, nil, &test.Float)
+		assert.NoError(t, err)
 	}
 }
 
@@ -74,6 +77,10 @@ func testMarshalUnionFunc() func(*testing.T) {
 		test.Float = &floatVal
 
 		jsonBytes, err = MarshalUnion(test.Integer, test.String, test.Float)
+		assert.NoError(t, err)
+		assert.Equal(t, "24.2", string(jsonBytes))
+
+		jsonBytes, err = MarshalUnion(nil, nil, test.Float)
 		assert.NoError(t, err)
 		assert.Equal(t, "24.2", string(jsonBytes))
 	}

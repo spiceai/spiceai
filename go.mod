@@ -1,4 +1,4 @@
-module github.com/phillipleblanc/spiceai
+module github.com/spiceai/spiceai
 
 go 1.17
 
