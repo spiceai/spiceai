@@ -125,11 +125,17 @@ class DataManager:
 
     def get_interpretations_for_interval(self):
         if self.interpretations is not None:
-            index = self.interpretations.index.get(self.current_time)
-            if index is not None and index.indicies is not None:
+            index = self.interpretations.index[int(self.current_time.timestamp())]
+            if (
+                index is not None
+                and index.indicies is not None
+                and len(index.indicies) > 0
+            ):
                 interval_interpretations = []
                 for i in index.indicies:
-                    interval_interpretations += self.interpretations.interpretations[i]
+                    interval_interpretations.append(
+                        self.interpretations.interpretations[i]
+                    )
                 return interval_interpretations
 
     def get_shape(self):
@@ -193,7 +199,14 @@ class DataManager:
 
         return True
 
-    def reward(self, prev_state_pd, new_state_pd, action: int, interpretations):
+    def reward(
+        self,
+        prev_state_pd,
+        prev_state_interpretations,
+        new_state_pd,
+        new_state_intepretations,
+        action: int,
+    ):
         prev_state_dict = dict()
         new_state_dict = dict()
 
@@ -201,13 +214,16 @@ class DataManager:
             prev_state_dict[key] = list(prev_state_pd[key])[-1]
             new_state_dict[key] = list(new_state_pd[key])[-1]
 
+        prev_state_dict["interpretations"] = prev_state_interpretations
+        new_state_dict["interpretations"] = new_state_intepretations
+
         prev_state = SimpleNamespace(**prev_state_dict)
         new_state = SimpleNamespace(**new_state_dict)
 
         loc = dict()
         loc["prev_state"] = prev_state
         loc["new_state"] = new_state
-        loc["interpretations"] = interpretations
+        loc["print"] = print
 
         action_name = self.action_names[action]
         reward_func = self.action_rewards[action_name]

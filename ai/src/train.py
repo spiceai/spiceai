@@ -60,6 +60,9 @@ def train_agent(
             episode_start = math.floor(time.time())
             data_manager.rewind()
             raw_state = data_manager.get_current_window()
+            raw_state_prime_interpretations = (
+                data_manager.get_interpretations_for_interval()
+            )
             model_state = data_manager.flatten_and_normalize_window(raw_state)
             episode_reward = 0
             episode_actions = [0] * len(data_manager.action_names)
@@ -91,15 +94,20 @@ def train_agent(
                 if np.shape(model_state_prime) != model_data_shape:
                     break
 
+                raw_state_interpretations = raw_state_prime_interpretations
+                raw_state_prime_interpretations = (
+                    data_manager.get_interpretations_for_interval()
+                )
+
                 reward = -5
                 if is_valid:
-                    interpretations = data_manager.get_interpretations_for_interval()
                     try:
                         reward = data_manager.reward(
                             raw_state,
+                            raw_state_interpretations,
                             raw_state_prime,
+                            raw_state_prime_interpretations,
                             action,
-                            interpretations,
                         )
                     except RewardInvalidException as ex:
                         post_episode_result(REQUEST_URL, ex.get_error_body())
