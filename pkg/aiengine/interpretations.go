@@ -40,7 +40,7 @@ func sendInterpretations(pod *pods.Pod, indexedInterpretations *common_pb.Indexe
 		return fmt.Errorf("failed to post new interpretations to pod %s: %s", pod.Name, response.Result)
 	}
 
-	duration := time.Now().Sub(startTime)
+	duration := time.Since(startTime)
 	zaplog.Sugar().Debugf("Sent %d interpretations to AI engine in %.2f seconds\n", len(indexedInterpretations.Interpretations), duration.Seconds())
 
 	return nil
