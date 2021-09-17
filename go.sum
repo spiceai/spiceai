@@ -975,10 +975,12 @@ github.com/spf13/viper v1.7.1/go.mod h1:8WkrPz2fc9jxqZNCJI/76HCieCp4Q8HaLFoCha5q
 github.com/spf13/viper v1.8.1 h1:Kq1fyeebqsBfbjZj4EL7gj2IO0mMaiyjYUWcUsl2O44=
 github.com/spf13/viper v1.8.1/go.mod h1:o0Pch8wJ9BVSWGQMbra6iw0oQ5oktSIBaujf1rJH9Ns=
 github.com/spiceai/data-components-contrib v0.0.0-20210901070425-f99a2b678fa4/go.mod h1:G9HIuE/UNz7g2NT+LFwE9LtXeRe5NPQpTDrybB/qbDQ=
-github.com/spiceai/data-components-contrib v0.0.0-20210914102419-cfcf22c1f438 h1:y6DuLaUuJlofGw0evsmaMYUty0lzDFKIh1MpnZOOGjM=
 github.com/spiceai/data-components-contrib v0.0.0-20210914102419-cfcf22c1f438/go.mod h1:v2nEPZGDQ7s5IQd/c3tgO7khDSbKmRJm4ry77zF5bAk=
+github.com/spiceai/data-components-contrib v0.0.0-20210917025245-ab0478df3b90 h1:Ai3wD5J1A5ryZgictbWKYcRNXz+O32wo8bP6LayQtnc=
+github.com/spiceai/data-components-contrib v0.0.0-20210917025245-ab0478df3b90/go.mod h1:5wRs4oYYczprCga+OwqSpEnCohbrNrpAcUykX7KPJDE=
 github.com/spiceai/spiceai v0.1.0-alpha.5-rc-spiced.0.20210831052121-80234a1fb51a/go.mod h1:pb+hKV5zvpFuKiLlKJmIUF0jkpeb/eTfhHLapttiVPk=
 github.com/spiceai/spiceai v0.2.0-alpha-rc-spiced.0.20210914095457-91c82109b461/go.mod h1:SxCAf9FDi5GX8R22QKarckFsj3r1IDXWIqcmNs+B54c=
+github.com/spiceai/spiceai v0.2.0-alpha-rc-spiced.0.20210917015218-a50887cec3e9/go.mod h1:nK2cyAhXDAcwqNvFrczDbsIHJqQAf6Hm+GMx36W6utI=
 github.com/src-d/gcfg v1.4.0/go.mod h1:p/UMsR43ujA89BJY9duynAwIpvqEujIH/jFlfL7jWoI=
 github.com/stoewer/go-strcase v1.2.0/go.mod h1:IBiWB2sKIp3wVVQ3Y035++gc+knqhUQag1KpM8ahLw8=
 github.com/streadway/amqp v0.0.0-20190404075320-75d898a42a94/go.mod h1:AZpEONHx3DKn8O/DFsRAY58/XVQiIPMTMB1SddzLXVw=
