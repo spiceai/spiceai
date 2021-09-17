@@ -10,7 +10,7 @@ type Time struct {
 }
 
 func (x *Time) UnmarshalJSON(data []byte) error {
-	err := spice_json.UnmarshalUnion(data, &x.Integer, &x.String)
+	err := spice_json.UnmarshalUnion(data, &x.Integer, &x.String, nil)
 	if err != nil {
 		return err
 	}
@@ -18,5 +18,5 @@ func (x *Time) UnmarshalJSON(data []byte) error {
 }
 
 func (x *Time) MarshalJSON() ([]byte, error) {
-	return spice_json.MarshalUnion(x.Integer, x.String)
+	return spice_json.MarshalUnion(x.Integer, x.String, nil)
 }

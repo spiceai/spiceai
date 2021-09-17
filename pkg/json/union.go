@@ -6,10 +6,11 @@ import (
 	"errors"
 )
 
-// Unmarshals from json a union data type that can contain either an int64 or a string
-func UnmarshalUnion(data []byte, pi **int64, ps **string) error {
+// Unmarshals from json a union data type that can contain either an int64, string or float64
+func UnmarshalUnion(data []byte, pi **int64, ps **string, pf **float64) error {
 	*pi = nil
 	*ps = nil
+	*pf = nil
 
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.UseNumber()
@@ -25,21 +26,29 @@ func UnmarshalUnion(data []byte, pi **int64, ps **string) error {
 			*pi = &i
 			return nil
 		}
+		f, err := v.Float64()
+		if err == nil {
+			*pf = &f
+			return nil
+		}
 		return err
 	case string:
 		*ps = &v
 		return nil
 	}
-	return errors.New("cannot unmarshal Time")
+	return errors.New("cannot unmarshal union")
 }
 
-// Marshals to json a union data type that can contain either an int64 or a string
-func MarshalUnion(pi *int64, ps *string) ([]byte, error) {
+// Marshals to json a union data type that can contain either an int64, string or float64
+func MarshalUnion(pi *int64, ps *string, pf *float64) ([]byte, error) {
 	if pi != nil {
 		return json.Marshal(*pi)
 	}
 	if ps != nil {
 		return json.Marshal(*ps)
 	}
-	return nil, errors.New("time must not be null")
+	if pf != nil {
+		return json.Marshal(*pf)
+	}
+	return nil, errors.New("union must not be null")
 }
