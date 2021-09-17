@@ -15,7 +15,7 @@ require (
 	github.com/spf13/cast v1.4.1 // indirect
 	github.com/spf13/cobra v1.2.1
 	github.com/spf13/viper v1.8.1
-	github.com/spiceai/data-components-contrib v0.0.0-20210914102419-cfcf22c1f438
+	github.com/spiceai/data-components-contrib v0.0.0-20210917025245-ab0478df3b90
 	github.com/stretchr/testify v1.7.0
 	github.com/valyala/fasthttp v1.28.0
 	go.uber.org/atomic v1.9.0 // indirect
