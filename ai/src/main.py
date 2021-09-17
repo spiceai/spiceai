@@ -77,6 +77,13 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
             data_manager.merge_data(new_data)
             return aiengine_pb2.Response(result="ok")
 
+    def AddInterpretations(
+        self, request: aiengine_pb2.AddInterpretationsRequest, context
+    ):
+        data_manager: DataManager = data_managers[request.pod]
+        data_manager.add_interpretations(request.indexed_interpretations)
+        return aiengine_pb2.Response(result="ok")
+
     def StartTraining(self, request: aiengine_pb2.StartTrainingRequest, context):
         data_manager: DataManager = data_managers[request.pod]
         connector_manager: ConnectorManager = connector_managers[request.pod]

@@ -92,7 +92,7 @@ func ExportPod(podName string, tag string, request *runtime_pb.ExportModel) erro
 		return err
 	}
 
-	interpretations := pod.Interpretations()
+	interpretations := pod.Interpretations().All()
 	apiInterpretations := api.ApiInterpretations(interpretations)
 	interpretationData, err := json.Marshal(apiInterpretations)
 	if err != nil {
@@ -169,7 +169,7 @@ func ImportPod(request *runtime_pb.ImportModel) error {
 			if err != nil {
 				return err
 			}
-			err = pod.AddInterpretation(interpretation)
+			err = pod.Interpretations().Add(interpretation)
 			if err != nil {
 				return err
 			}

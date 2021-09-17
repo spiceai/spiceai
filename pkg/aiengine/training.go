@@ -17,6 +17,12 @@ func StartTraining(pod *pods.Pod) error {
 
 	flight := flights.NewFlight(flightId, int(pod.Episodes()))
 
+	// Once we have an AI engine -> spiced gRPC channel, this should be done on demand
+	err := sendInterpretations(pod, pod.Interpretations().IndexedInterpretations())
+	if err != nil {
+		return err
+	}
+
 	trainRequest := &aiengine_pb.StartTrainingRequest{
 		Pod:            pod.Name,
 		EpochTime:      pod.Epoch().Unix(),

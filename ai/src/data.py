@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import pandas.core.computation.expressions as expressions
+from proto.common.v1 import common_pb2
 from types import SimpleNamespace
 import math
 import threading
@@ -38,6 +39,8 @@ class DataManager:
             self.granularity_secs
         ).mean()
         self.fill_table()
+
+        self.interpretations: common_pb2.IndexedInterpretations = None
 
         self.current_time: pd.Timestamp = None
         self.action_rewards = action_rewards
@@ -117,6 +120,24 @@ class DataManager:
 
             self.fill_table()
 
+    def add_interpretations(self, interpretations):
+        self.interpretations = interpretations
+
+    def get_interpretations_for_interval(self):
+        if self.interpretations is not None:
+            index = self.interpretations.index[int(self.current_time.timestamp())]
+            if (
+                index is not None
+                and index.indicies is not None
+                and len(index.indicies) > 0
+            ):
+                interval_interpretations = []
+                for i in index.indicies:
+                    interval_interpretations.append(
+                        self.interpretations.interpretations[i]
+                    )
+                return interval_interpretations
+
     def get_shape(self):
         return np.shape([0] * self.get_window_span() * len(self.fields))
 
@@ -178,7 +199,14 @@ class DataManager:
 
         return True
 
-    def reward(self, prev_state_pd, new_state_pd, action: int):
+    def reward(
+        self,
+        prev_state_pd,
+        prev_state_interpretations,
+        new_state_pd,
+        new_state_intepretations,
+        action: int,
+    ):
         prev_state_dict = dict()
         new_state_dict = dict()
 
@@ -186,12 +214,16 @@ class DataManager:
             prev_state_dict[key] = list(prev_state_pd[key])[-1]
             new_state_dict[key] = list(new_state_pd[key])[-1]
 
+        prev_state_dict["interpretations"] = prev_state_interpretations
+        new_state_dict["interpretations"] = new_state_intepretations
+
         prev_state = SimpleNamespace(**prev_state_dict)
         new_state = SimpleNamespace(**new_state_dict)
 
         loc = dict()
         loc["prev_state"] = prev_state
         loc["new_state"] = new_state
+        loc["print"] = print
 
         action_name = self.action_names[action]
         reward_func = self.action_rewards[action_name]

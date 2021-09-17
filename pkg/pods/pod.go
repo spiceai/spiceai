@@ -25,17 +25,18 @@ import (
 
 type Pod struct {
 	spec.PodSpec
-	hash                 string
-	manifestPath         string
-	dataSources          []*dataspaces.Dataspace
-	fields               map[string]float64
-	fieldNames           []string
-	flights              map[string]*flights.Flight
-	interpretations      []interpretations.Interpretation
-	interpretationsMutex sync.RWMutex
-	viper                *viper.Viper
-	podLocalState        []*state.State
-	podLocalStateMutex   sync.RWMutex
+	hash         string
+	manifestPath string
+	dataSources  []*dataspaces.Dataspace
+	fields       map[string]float64
+	fieldNames   []string
+	flights      map[string]*flights.Flight
+	viper        *viper.Viper
+
+	podLocalStateMutex sync.RWMutex
+	podLocalState      []*state.State
+
+	interpretations *interpretations.InterpretationsStore
 }
 
 func (pod *Pod) Hash() string {
@@ -182,6 +183,10 @@ func (pod *Pod) Flights() *map[string]*flights.Flight {
 	return &pod.flights
 }
 
+func (pod *Pod) Interpretations() *interpretations.InterpretationsStore {
+	return pod.interpretations
+}
+
 func (pod *Pod) GetFlight(flight string) *flights.Flight {
 	f, ok := pod.flights[flight]
 	if ok {
@@ -192,43 +197,6 @@ func (pod *Pod) GetFlight(flight string) *flights.Flight {
 
 func (pod *Pod) AddFlight(flightId string, flight *flights.Flight) {
 	pod.flights[flightId] = flight
-}
-
-func (pod *Pod) Interpretations() []interpretations.Interpretation {
-	return pod.interpretations
-}
-
-func (pod *Pod) GetInterpretations(start time.Time, end time.Time) []interpretations.Interpretation {
-	// naive linear filter - something smarter later
-	pod.interpretationsMutex.RLock()
-	defer pod.interpretationsMutex.RUnlock()
-
-	var filteredInterpretations []interpretations.Interpretation
-	// At least one end falls within the range
-	for _, i := range pod.interpretations {
-		if i.End().Before(start) {
-			continue
-		}
-		if i.Start().After(end) {
-			continue
-		}
-		filteredInterpretations = append(filteredInterpretations, i)
-	}
-
-	return filteredInterpretations
-}
-
-func (pod *Pod) AddInterpretation(interpretation *interpretations.Interpretation) error {
-	if interpretation.Start().Before(pod.Epoch()) {
-		return fmt.Errorf("interpretation start '%s' must be same or later than pod epoch '%s'", interpretation.Start().String(), pod.Epoch().String())
-	}
-
-	pod.interpretationsMutex.Lock()
-	defer pod.interpretationsMutex.Unlock()
-
-	pod.interpretations = append(pod.interpretations, *interpretation)
-
-	return nil
 }
 
 func (pod *Pod) Actions() map[string]string {
@@ -494,6 +462,8 @@ func loadPod(podPath string, hash string) (*Pod, error) {
 	sort.Strings(fieldNames)
 	pod.fieldNames = fieldNames
 	pod.fields = fields
+
+	pod.interpretations = interpretations.NewInterpretationsStore(pod.Epoch(), pod.Period(), pod.Granularity())
 
 	return pod, err
 }

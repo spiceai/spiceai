@@ -39,6 +39,10 @@ func (a *aiEngineClient) AddData(ctx context.Context, in *aiengine_pb.AddDataReq
 	return a.client.AddData(ctx, in, opts...)
 }
 
+func (a *aiEngineClient) AddInterpretations(ctx context.Context, in *aiengine_pb.AddInterpretationsRequest, opts ...grpc.CallOption) (*aiengine_pb.Response, error) {
+	return a.client.AddInterpretations(ctx, in, opts...)
+}
+
 func (a *aiEngineClient) StartTraining(ctx context.Context, in *aiengine_pb.StartTrainingRequest, opts ...grpc.CallOption) (*aiengine_pb.Response, error) {
 	return a.client.StartTraining(ctx, in, opts...)
 }

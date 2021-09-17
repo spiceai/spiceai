@@ -390,7 +390,7 @@ func apiGetInterpretationsHandler(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	interpretations := pod.GetInterpretations(start, end)
+	interpretations := pod.Interpretations().Get(start, end)
 	apiInterpretations := api.ApiInterpretations(interpretations)
 
 	response, err := json.Marshal(apiInterpretations)
@@ -426,7 +426,7 @@ func apiPostInterpretationsHandler(ctx *fasthttp.RequestCtx) {
 			return
 		}
 
-		err = pod.AddInterpretation(interpretation)
+		err = pod.Interpretations().Add(interpretation)
 		if err != nil {
 			ctx.Response.SetStatusCode(http.StatusBadRequest)
 			ctx.Response.SetBodyString(err.Error())

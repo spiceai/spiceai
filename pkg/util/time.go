@@ -1,7 +1,9 @@
 package util
 
 import (
+	"math"
 	"strconv"
+	"time"
 )
 
 func ParseTime(str string) (int64, error) {
@@ -11,4 +13,8 @@ func ParseTime(str string) (int64, error) {
 	}
 
 	return ts, nil
+}
+
+func NumIntervals(period time.Duration, granularity time.Duration) int64 {
+	return int64(math.Ceil(float64(period) / float64(granularity)))
 }
