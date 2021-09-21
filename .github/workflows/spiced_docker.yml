@@ -52,14 +52,12 @@ jobs:
           context: .
           file: docker/Dockerfile
           platforms: ${{ matrix.target_os }}/${{ matrix.target_arch }}
-          push: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/trunk' }}
+          push: ${{ github.event_name != 'pull_request' && (github.ref == 'refs/heads/trunk' || startsWith(github.ref, 'refs/heads/release-')) }}
           build-args: |
             REL_VERSION=${{ env.REL_VERSION }}
           tags: |
-            ghcr.io/spiceai/spiceai:latest
             ghcr.io/spiceai/spiceai:${{ env.REL_VERSION }}
             ghcr.io/spiceai/spiceai:${{ env.REL_VERSION }}-${{ matrix.target_os }}-${{ matrix.target_arch }}
-            spiceai/spiceai:latest
             spiceai/spiceai:${{ env.REL_VERSION }}
             spiceai/spiceai:${{ env.REL_VERSION }}-${{ matrix.target_os }}-${{ matrix.target_arch }}
           # cache-from: type=gha
