@@ -56,7 +56,6 @@ jobs:
           build-args: |
             REL_VERSION=${{ env.REL_VERSION }}
           tags: |
-            ghcr.io/spiceai/spiceai:latest
             ghcr.io/spiceai/spiceai:${{ env.REL_VERSION }}
             ghcr.io/spiceai/spiceai:${{ env.REL_VERSION }}-${{ matrix.target_os }}-${{ matrix.target_arch }}
             spiceai/spiceai:latest
