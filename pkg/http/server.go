@@ -542,7 +542,7 @@ func (server *server) Start() error {
 		api.POST("/pods/{pod}/training_runs/{flight}/episodes", apiPostFlightEpisodeHandler)
 
 		api.GET("/acknowledgements", dashboardServer.AcknowledgementsHandler)
-		
+
 		// Interpretations
 		api.GET("/pods/{pod}/interpretations", apiGetInterpretationsHandler)
 		api.POST("/pods/{pod}/interpretations", apiPostInterpretationsHandler)
