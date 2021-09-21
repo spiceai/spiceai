@@ -58,7 +58,6 @@ jobs:
           tags: |
             ghcr.io/spiceai/spiceai:${{ env.REL_VERSION }}
             ghcr.io/spiceai/spiceai:${{ env.REL_VERSION }}-${{ matrix.target_os }}-${{ matrix.target_arch }}
-            spiceai/spiceai:latest
             spiceai/spiceai:${{ env.REL_VERSION }}
             spiceai/spiceai:${{ env.REL_VERSION }}-${{ matrix.target_os }}-${{ matrix.target_arch }}
           # cache-from: type=gha
