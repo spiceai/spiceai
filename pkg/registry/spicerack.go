@@ -5,19 +5,20 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
 
+	"github.com/hashicorp/go-retryablehttp"
 	"github.com/spiceai/spiceai/pkg/context"
-	spice_http "github.com/spiceai/spiceai/pkg/http"
 	"github.com/spiceai/spiceai/pkg/loggers"
 	"github.com/spiceai/spiceai/pkg/util"
 	"go.uber.org/zap"
 )
 
 const (
-	spiceRackBaseUrl string = "https://api.spicerack.org/api/v0.1"
+	spiceRackBaseUrl string = "https://dev.spicerack.org/api/v0.1"
 )
 
 var (
@@ -34,9 +35,7 @@ func (r *SpiceRackRegistry) GetPod(podFullPath string) (string, error) {
 		podPath = parts[0]
 		podVersion = parts[1]
 	}
-
-	podName := strings.ToLower(filepath.Base(podPath))
-	podManifestFileName := fmt.Sprintf("%s.yaml", podName)
+	podName := filepath.Base(podPath)
 
 	url := fmt.Sprintf("%s/pods/%s", spiceRackBaseUrl, podPath)
 	if podVersion != "" {
@@ -44,59 +43,14 @@ func (r *SpiceRackRegistry) GetPod(podFullPath string) (string, error) {
 	}
 	failureMessage := fmt.Sprintf("An error occurred while fetching pod '%s' from spicerack.org", podFullPath)
 
-	response, err := spice_http.Get(url)
-	if err != nil {
-		zaplog.Sugar().Debugf("%s: %s", failureMessage, err.Error())
-		return "", errors.New(failureMessage)
-	}
-	defer response.Body.Close()
-
-	body, err := io.ReadAll(response.Body)
-	if err != nil {
-		zaplog.Sugar().Debugf("%s: %s", failureMessage, err.Error())
-		return "", errors.New(failureMessage)
-	}
-
-	if response.StatusCode == 404 {
-		return "", NewRegistryItemNotFound(fmt.Errorf("pod %s not found", podPath))
-	}
-
-	if response.StatusCode != 200 {
-		return "", fmt.Errorf("an error occurred fetching pod '%s'", podPath)
-	}
-
-	podsPath := context.CurrentContext().PodsDir()
-	downloadPath := filepath.Join(podsPath, podManifestFileName)
-
-	err = os.MkdirAll(podsPath, 0766)
+	req, err := retryablehttp.NewRequest("GET", url, nil)
 	if err != nil {
 		return "", err
 	}
 
-	err = os.WriteFile(downloadPath, body, 0666)
-	if err != nil {
-		return "", fmt.Errorf("an error occurred downloading pod %s", podPath)
-	}
+	req.Header.Add("Accept", "application/zip")
 
-	return downloadPath, nil
-}
-
-func (r *SpiceRackRegistry) GetSpicepod(podFullPath string) (string, error) {
-	parts := strings.Split(podFullPath, "@")
-	podPath := podFullPath
-	podVersion := ""
-	if len(parts) == 2 {
-		podPath = parts[0]
-		podVersion = parts[1]
-	}
-
-	url := fmt.Sprintf("%s/pods/%s", spiceRackBaseUrl, podPath)
-	if podVersion != "" {
-		url = fmt.Sprintf("%s/%s", url, podVersion)
-	}
-	failureMessage := fmt.Sprintf("An error occurred while fetching pod '%s' from spicerack.org", podFullPath)
-
-	response, err := spice_http.Get(url, "application/zip")
+	response, err := retryablehttp.NewClient().Do(req)
 	if err != nil {
 		zaplog.Sugar().Debugf("%s: %s", failureMessage, err.Error())
 		return "", errors.New(failureMessage)
@@ -109,6 +63,17 @@ func (r *SpiceRackRegistry) GetSpicepod(podFullPath string) (string, error) {
 
 	if response.StatusCode != 200 {
 		return "", fmt.Errorf("an error occurred fetching pod '%s'", podPath)
+	}
+
+	tmpFile, err := ioutil.TempFile(os.TempDir(), "spice-")
+	if err != nil {
+		return "", err
+	}
+	defer os.Remove(tmpFile.Name())
+
+	_, err = io.Copy(tmpFile, response.Body)
+	if err != nil {
+		return "", err
 	}
 
 	podsPath := context.CurrentContext().PodsDir()
@@ -118,11 +83,12 @@ func (r *SpiceRackRegistry) GetSpicepod(podFullPath string) (string, error) {
 		return "", err
 	}
 
-	
-	zipReader, err := zip.NewReader(reader, response.ContentLength)
+	zipReader, err := zip.OpenReader(tmpFile.Name())
 	if err != nil {
 		return "", err
 	}
+
+	var manifestPath string
 
 	for _, f := range zipReader.File {
 		fpath := filepath.Join(podsPath, f.Name)
@@ -155,7 +121,11 @@ func (r *SpiceRackRegistry) GetSpicepod(podFullPath string) (string, error) {
 		if err != nil {
 			return "", err
 		}
+
+		if strings.EqualFold(filepath.Base(outFile.Name()), fmt.Sprintf("%s.yaml", podName)) {
+			manifestPath = outFile.Name()
+		}
 	}
 
-	return downloadPath, nil
+	return manifestPath, nil
 }
