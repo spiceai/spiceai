@@ -130,7 +130,7 @@ func TestObservations(t *testing.T) {
 		return
 	}
 
-	runtimeCmd, err := runtime.startRuntime(runtimePath, testDir)
+	runtimeCmd, err := runtime.startRuntime()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -314,7 +314,7 @@ func TestTrainingOutput(t *testing.T) {
 		return
 	}
 
-	runtimeCmd, err := runtime.startRuntime(runtimePath, testDir)
+	runtimeCmd, err := runtime.startRuntime()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -370,7 +370,7 @@ func TestImportExport(t *testing.T) {
 		return
 	}
 
-	runtimeCmd, err := runtime.startRuntime(runtimePath, testDir)
+	runtimeCmd, err := runtime.startRuntime()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -447,7 +447,7 @@ func TestImportExport(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	runtimeCmd, err = runtime.startRuntime(runtimePath, testDir)
+	runtimeCmd, err = runtime.startRuntime()
 	if err != nil {
 		t.Fatal(err)
 	}
