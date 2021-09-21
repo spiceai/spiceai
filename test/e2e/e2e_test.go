@@ -25,7 +25,6 @@ var (
 	testDir          string
 	repoRoot         string
 	workingDirectory string
-	spicePodsDir     string
 	runtimePath      string
 	cliClient        *cli
 	runtime          *runtimeServer
