@@ -81,9 +81,6 @@ jobs:
           name: dashboard_build
           path: pkg/dashboard/build
 
-      - name: Clear cache
-        run: go clean -cache
-
       - name: Build spice
         run: make
         working-directory: cmd/spice
