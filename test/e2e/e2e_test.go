@@ -29,7 +29,7 @@ var (
 	cliClient        *cli
 	runtime          *runtimeServer
 	snapshotter      *cupaloy.Config
-	testPods         = []string{"test/Trader@0.2.0", "test/customprocessor@0.1.0"}
+	testPods         = []string{"test/Trader@0.3.0", "test/customprocessor@0.1.0"}
 )
 
 func TestMain(m *testing.M) {
@@ -94,12 +94,6 @@ func TestMain(m *testing.M) {
 		workingDirectory: testDir,
 		cli:              cliClient,
 		context:          spicedContext,
-	}
-
-	err = copyFile(filepath.Join(repoRoot, "test/assets/data/csv/COINBASE_BTCUSD, 30.csv"), testDir)
-	if err != nil {
-		log.Println(err.Error())
-		os.Exit(1)
 	}
 
 	for _, testPod := range testPods {
@@ -500,27 +494,6 @@ func TestImportExport(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-}
-
-func copyFile(sourceFile string, targetPath string) error {
-	fileContent, err := os.ReadFile(sourceFile)
-	if err != nil {
-		return err
-	}
-
-	stat, err := os.Stat(targetPath)
-	if err != nil {
-		return err
-	}
-
-	filename := filepath.Base(sourceFile)
-
-	err = os.WriteFile(filepath.Join(targetPath, filename), fileContent, stat.Mode())
-	if err != nil {
-		return err
-	}
-
-	return nil
 }
 
 func validateRepoRoot(repoRoot string) error {

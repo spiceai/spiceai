@@ -1,16 +1,19 @@
 package registry
 
 import (
+	"archive/zip"
 	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
 
+	"github.com/hashicorp/go-retryablehttp"
 	"github.com/spiceai/spiceai/pkg/context"
-	spice_http "github.com/spiceai/spiceai/pkg/http"
 	"github.com/spiceai/spiceai/pkg/loggers"
+	"github.com/spiceai/spiceai/pkg/util"
 	"go.uber.org/zap"
 )
 
@@ -32,9 +35,7 @@ func (r *SpiceRackRegistry) GetPod(podFullPath string) (string, error) {
 		podPath = parts[0]
 		podVersion = parts[1]
 	}
-
-	podName := strings.ToLower(filepath.Base(podPath))
-	podManifestFileName := fmt.Sprintf("%s.yaml", podName)
+	podName := filepath.Base(podPath)
 
 	url := fmt.Sprintf("%s/pods/%s", spiceRackBaseUrl, podPath)
 	if podVersion != "" {
@@ -42,18 +43,19 @@ func (r *SpiceRackRegistry) GetPod(podFullPath string) (string, error) {
 	}
 	failureMessage := fmt.Sprintf("An error occurred while fetching pod '%s' from spicerack.org", podFullPath)
 
-	response, err := spice_http.Get(url)
+	req, err := retryablehttp.NewRequest("GET", url, nil)
+	if err != nil {
+		return "", err
+	}
+
+	req.Header.Add("Accept", "application/zip")
+
+	response, err := retryablehttp.NewClient().Do(req)
 	if err != nil {
 		zaplog.Sugar().Debugf("%s: %s", failureMessage, err.Error())
 		return "", errors.New(failureMessage)
 	}
 	defer response.Body.Close()
-
-	body, err := io.ReadAll(response.Body)
-	if err != nil {
-		zaplog.Sugar().Debugf("%s: %s", failureMessage, err.Error())
-		return "", errors.New(failureMessage)
-	}
 
 	if response.StatusCode == 404 {
 		return "", NewRegistryItemNotFound(fmt.Errorf("pod %s not found", podPath))
@@ -63,18 +65,67 @@ func (r *SpiceRackRegistry) GetPod(podFullPath string) (string, error) {
 		return "", fmt.Errorf("an error occurred fetching pod '%s'", podPath)
 	}
 
-	podsPath := context.CurrentContext().PodsDir()
-	downloadPath := filepath.Join(podsPath, podManifestFileName)
+	tmpFile, err := ioutil.TempFile(os.TempDir(), "spice-")
+	if err != nil {
+		return "", err
+	}
+	defer os.Remove(tmpFile.Name())
 
-	err = os.MkdirAll(podsPath, 0766)
+	_, err = io.Copy(tmpFile, response.Body)
 	if err != nil {
 		return "", err
 	}
 
-	err = os.WriteFile(downloadPath, body, 0666)
+	podsPath := context.CurrentContext().PodsDir()
+
+	podsPerm, err := util.MkDirAllInheritPerm(podsPath)
 	if err != nil {
-		return "", fmt.Errorf("an error occurred downloading pod %s", podPath)
+		return "", err
 	}
 
-	return downloadPath, nil
+	zipReader, err := zip.OpenReader(tmpFile.Name())
+	if err != nil {
+		return "", err
+	}
+
+	var manifestPath string
+
+	for _, f := range zipReader.File {
+		fpath := filepath.Join(podsPath, f.Name)
+		if f.FileInfo().IsDir() {
+			err := os.MkdirAll(fpath, podsPerm)
+			if err != nil {
+				return "", err
+			}
+			continue
+		}
+
+		err = os.MkdirAll(filepath.Dir(fpath), podsPerm)
+		if err != nil {
+			return "", err
+		}
+
+		outFile, err := os.OpenFile(fpath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, f.Mode())
+		if err != nil {
+			return "", err
+		}
+		defer outFile.Close()
+
+		zipFile, err := f.Open()
+		if err != nil {
+			return "", err
+		}
+		defer zipFile.Close()
+
+		_, err = io.Copy(outFile, zipFile)
+		if err != nil {
+			return "", err
+		}
+
+		if strings.EqualFold(filepath.Base(outFile.Name()), fmt.Sprintf("%s.yaml", podName)) {
+			manifestPath = outFile.Name()
+		}
+	}
+
+	return manifestPath, nil
 }
