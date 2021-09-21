@@ -127,6 +127,8 @@ jobs:
         exclude:
           - os: ubuntu-latest
             target_arch: arm64
+          - os: macOS-latest
+            target_arch: arm64
 
     runs-on: ubuntu-latest
     steps:
@@ -148,7 +150,8 @@ jobs:
       - name: publish ${{ matrix.target_os }}/${{ matrix.target_arch }} binaries to github
         run: |
           echo "installing github-release-cli..."
-          sudo npm install --no-progress --production=false -g github-release-cli@2.0.0
+          sudo npm install --no-progress -g @babel/runtime@7.13.10
+          sudo npm install --no-progress -g github-release-cli@2.0.0
           # Parse repository to get owner and repo names
           OWNER_NAME="${GITHUB_REPOSITORY%%/*}"
           REPO_NAME="${GITHUB_REPOSITORY#*/}"
