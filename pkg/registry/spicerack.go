@@ -18,7 +18,7 @@ import (
 )
 
 const (
-	spiceRackBaseUrl string = "https://dev.spicerack.org/api/v0.1"
+	spiceRackBaseUrl string = "https://api.spicerack.org/api/v0.1"
 )
 
 var (
