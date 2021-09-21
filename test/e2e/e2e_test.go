@@ -96,12 +96,6 @@ func TestMain(m *testing.M) {
 		context:          spicedContext,
 	}
 
-	err = copyFile(filepath.Join(repoRoot, "test/assets/data/csv/COINBASE_BTCUSD, 30.csv"), testDir)
-	if err != nil {
-		log.Println(err.Error())
-		os.Exit(1)
-	}
-
 	for _, testPod := range testPods {
 		err = cliClient.runCliCmd("add", testPod)
 		if err != nil {
