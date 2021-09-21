@@ -8,6 +8,11 @@ on:
     tags:
       - v*
 
+  pull_request:
+    branches:
+      - trunk
+      - release-*
+
   workflow_dispatch:
 
 jobs:
@@ -111,7 +116,6 @@ jobs:
   publish:
     name: Publish ${{ matrix.target_os }}-${{ matrix.target_arch }} binaries
     needs: build
-    if: github.event_name != 'pull_request'
     env:
       ARTIFACT_DIR: ./release
 
@@ -148,7 +152,7 @@ jobs:
       - name: publish ${{ matrix.target_os }}/${{ matrix.target_arch }} binaries to github
         run: |
           echo "installing github-release-cli..."
-          sudo npm install --no-progress -g github-release-cli@2.0.0
+          sudo npm install --no-progress --production=false -g github-release-cli@2.0.0
           # Parse repository to get owner and repo names
           OWNER_NAME="${GITHUB_REPOSITORY%%/*}"
           REPO_NAME="${GITHUB_REPOSITORY#*/}"
