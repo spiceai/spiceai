@@ -1,6 +1,7 @@
 package interpretations_test
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -154,6 +155,11 @@ func testTimeIndexFunc() func(*testing.T) {
 
 		timeIndex := store.IndexedInterpretations()
 
-		snapshotter.SnapshotT(t, &timeIndex)
+		timeIndexJson, err := json.MarshalIndent(timeIndex, "", "  ")
+		if err != nil {
+			t.Error(err)
+		}
+
+		snapshotter.SnapshotT(t, string(timeIndexJson))
 	}
 }
