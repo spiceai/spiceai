@@ -8,6 +8,11 @@ on:
     tags:
       - v*
 
+  pull_request:
+    branches:
+      - trunk
+      - release-*
+
   workflow_dispatch:
 
 jobs:
@@ -75,6 +80,9 @@ jobs:
         with:
           name: dashboard_build
           path: pkg/dashboard/build
+
+      - name: Clear cache
+        run: go clean -cache
 
       - name: Build spice
         run: make
