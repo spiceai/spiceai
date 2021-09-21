@@ -29,7 +29,7 @@ var (
 	cliClient        *cli
 	runtime          *runtimeServer
 	snapshotter      *cupaloy.Config
-	testPods         = []string{"test/Trader@0.2.0", "test/customprocessor@0.1.0"}
+	testPods         = []string{"test/Trader@0.3.0", "test/customprocessor@0.1.0"}
 )
 
 func TestMain(m *testing.M) {
