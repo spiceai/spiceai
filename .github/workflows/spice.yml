@@ -148,6 +148,7 @@ jobs:
       - name: publish ${{ matrix.target_os }}/${{ matrix.target_arch }} binaries to github
         run: |
           echo "installing github-release-cli..."
+          sudo npm install --no-progress -g @babel/runtime@7.13.10
           sudo npm install --no-progress -g github-release-cli@2.0.0
           # Parse repository to get owner and repo names
           OWNER_NAME="${GITHUB_REPOSITORY%%/*}"
