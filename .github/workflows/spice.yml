@@ -8,11 +8,6 @@ on:
     tags:
       - v*
 
-  pull_request:
-    branches:
-      - trunk
-      - release-*
-
   workflow_dispatch:
 
 jobs:
@@ -47,18 +42,22 @@ jobs:
 
     strategy:
       matrix:
-        os: [ubuntu-latest, macOS-latest]
+        os: [self-hosted, ubuntu-latest, macOS-latest]
         target_arch: [amd64, arm64]
         include:
           - os: ubuntu-latest
             target_os: linux
           - os: macOS-latest
             target_os: darwin
+          - os: self-hosted
+            target_os: darwin
         exclude:
           - os: ubuntu-latest
             target_arch: arm64
           - os: macOS-latest
             target_arch: arm64
+          - os: self-hosted
+            target_arch: amd64
 
     steps:
       - uses: actions/checkout@v2
@@ -112,6 +111,7 @@ jobs:
   publish:
     name: Publish ${{ matrix.target_os }}-${{ matrix.target_arch }} binaries
     needs: build
+    if: github.event_name != 'pull_request'
     env:
       ARTIFACT_DIR: ./release
 
@@ -126,8 +126,6 @@ jobs:
             target_os: darwin
         exclude:
           - os: ubuntu-latest
-            target_arch: arm64
-          - os: macOS-latest
             target_arch: arm64
 
     runs-on: ubuntu-latest
