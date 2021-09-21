@@ -496,27 +496,6 @@ func TestImportExport(t *testing.T) {
 	}
 }
 
-func copyFile(sourceFile string, targetPath string) error {
-	fileContent, err := os.ReadFile(sourceFile)
-	if err != nil {
-		return err
-	}
-
-	stat, err := os.Stat(targetPath)
-	if err != nil {
-		return err
-	}
-
-	filename := filepath.Base(sourceFile)
-
-	err = os.WriteFile(filepath.Join(targetPath, filename), fileContent, stat.Mode())
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
 func validateRepoRoot(repoRoot string) error {
 	return validateExists(filepath.Join(repoRoot, "go.mod"))
 }
