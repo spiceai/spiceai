@@ -109,6 +109,18 @@ If you are running in GitHub Codespaces or other Ubuntu/Debian environment, you 
 make install-codespaces
 ```
 
+### Building the Dashboard
+```
+cd dashboard
+make
+```
+
+### Run Makefile in Project Root
+This is necessary before building the CLI or Runtime
+```
+make
+```
+
 ### Building the Spice CLI
 
 ```bash
