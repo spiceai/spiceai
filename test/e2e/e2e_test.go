@@ -352,7 +352,7 @@ func TestTrainingOutput(t *testing.T) {
 		}
 
 		assert.Equal(t, 3, numActions, "expect 3 actions to be taken each episode")
-		assert.Equal(t, uint64(132), actionCount, "expect a total of 132 actions to be taken")
+		assert.Equal(t, uint64(1428), actionCount, "expect a total of 132 actions to be taken")
 	}
 }
 
