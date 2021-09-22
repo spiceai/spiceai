@@ -8,6 +8,7 @@ import (
 type Observation struct {
 	Time int64
 	Data map[string]float64
+	Tags []string
 }
 
 func GetCsv(headers []string, observations []Observation, previewLines int) (string, string) {
