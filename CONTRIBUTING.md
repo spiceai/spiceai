@@ -106,19 +106,19 @@ $ pip install -r requirements/development.txt
 If you are running in GitHub Codespaces or other Ubuntu/Debian environment, you may need to install additional libraries. Do this by running:
 
 ```bash
-make install-codespaces
+$ make install-codespaces
 ```
 
 ### Building the Dashboard
 ```
-cd dashboard
-make
+$ cd dashboard
+$ make
 ```
 
 ### Run Makefile in Project Root
 This is necessary before building the CLI or Runtime
 ```
-make
+$ make
 ```
 
 ### Building the Spice CLI
