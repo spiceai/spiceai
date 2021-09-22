@@ -162,12 +162,12 @@ func (r *runtimeServer) getInterpretations(podName string, startTime int64, endT
 }
 
 func (r *runtimeServer) waitForTrainingToComplete(podName string, flight string, expectedEpisodes int) error {
-	maxAttempts := 20
+	maxAttempts := 120
 	attemptCount := 0
 	for {
-		time.Sleep(time.Millisecond * 250)
+		time.Sleep(time.Second)
 
-		if attemptCount++; attemptCount > 4*maxAttempts {
+		if attemptCount++; attemptCount > maxAttempts {
 			return fmt.Errorf("failed to verify training completed after %d attempts", attemptCount)
 		}
 
