@@ -29,7 +29,7 @@ var (
 	cliClient        *cli
 	runtime          *runtimeServer
 	snapshotter      *cupaloy.Config
-	testPods         = []string{"test/Trader@0.3.0", "test/customprocessor@0.1.0"}
+	testPods         = []string{"test/Trader@0.3.1", "test/customprocessor@0.1.0"}
 )
 
 func TestMain(m *testing.M) {
@@ -352,7 +352,7 @@ func TestTrainingOutput(t *testing.T) {
 		}
 
 		assert.Equal(t, 3, numActions, "expect 3 actions to be taken each episode")
-		assert.Equal(t, uint64(132), actionCount, "expect a total of 132 actions to be taken")
+		assert.Equal(t, uint64(1428), actionCount, "expect a total of 132 actions to be taken")
 	}
 }
 

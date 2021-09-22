@@ -10,6 +10,7 @@ import (
 	"github.com/spiceai/data-components-contrib/dataconnectors/file"
 	"github.com/spiceai/data-components-contrib/dataprocessors"
 	"github.com/spiceai/data-components-contrib/dataprocessors/csv"
+	"github.com/spiceai/spiceai/pkg/spec"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -49,7 +50,7 @@ func testBasePropertiesFunc(pod *Pod) func(*testing.T) {
 		case "trader":
 			expected = "64a15d213ebe84486fc68e209ca5d160"
 		case "trader-infer":
-			expected = "ae441bfd1c725a0f8dfbce525146d441"
+			expected = "d0246ffda395945f070cdf2aa60645a7"
 		}
 
 		assert.Equal(t, expected, actual, "invalid pod.Hash()")
@@ -276,5 +277,48 @@ func testAddLocalStateCachedCsvFunc(pod *Pod) func(*testing.T) {
 		actual := pod.CachedCsv()
 
 		snapshotter.SnapshotT(t, actual)
+	}
+}
+
+// Tests loadParams()
+func TestLoadParams(t *testing.T) {
+	t.Run("loadParams() - defaults", testLoadParamsDefaultsFunc())
+	t.Run("loadParams()", testLoadParamsFunc())
+}
+
+func testLoadParamsDefaultsFunc() func(*testing.T) {
+	return func(t *testing.T) {
+		pod := &Pod{
+			PodSpec: spec.PodSpec{},
+		}
+		err := pod.loadParams()
+		assert.NoError(t, err)
+
+		assert.Equal(t, time.Now().Add(-pod.Period()).Unix()/10, pod.Epoch().Unix()/10)
+		assert.Equal(t, 72*time.Hour, pod.Period())
+		assert.Equal(t, 1*time.Minute, pod.Interval())
+		assert.Equal(t, 10*time.Second, pod.Granularity())
+	}
+}
+
+func testLoadParamsFunc() func(*testing.T) {
+	return func(t *testing.T) {
+		pod := &Pod{
+			PodSpec: spec.PodSpec{
+				Params: map[string]string{
+					"epoch_time":  "123456789",
+					"period":      "152h",
+					"interval":    "355m",
+					"granularity": "124s",
+				},
+			},
+		}
+		err := pod.loadParams()
+		assert.NoError(t, err)
+
+		assert.Equal(t, int64(123456789), pod.Epoch().Unix())
+		assert.Equal(t, 152*time.Hour, pod.Period())
+		assert.Equal(t, 355*time.Minute, pod.Interval())
+		assert.Equal(t, 124*time.Second, pod.Granularity())
 	}
 }
