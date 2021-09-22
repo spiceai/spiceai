@@ -25,6 +25,7 @@ import (
 
 type Pod struct {
 	spec.PodSpec
+	podParams    *PodParams
 	hash         string
 	manifestPath string
 	dataSources  []*dataspaces.Dataspace
@@ -48,59 +49,23 @@ func (f *Pod) ManifestPath() string {
 }
 
 func (pod *Pod) Period() time.Duration {
-	if pod.PodSpec.Params != nil {
-		str, ok := pod.PodSpec.Params["period"]
-		if ok {
-			val, err := time.ParseDuration(str)
-			if err == nil {
-				return val
-			}
-		}
-	}
-
-	return time.Hour * 24 * 3 // Default to 3 days
+	return pod.podParams.Period
 }
 
 func (pod *Pod) Interval() time.Duration {
-	if pod.PodSpec.Params != nil {
-		str, ok := pod.PodSpec.Params["interval"]
-		if ok {
-			val, err := time.ParseDuration(str)
-			if err == nil {
-				return val
-			}
-		}
-	}
-
-	return time.Minute * 1 // Default to 1 min
+	return pod.podParams.Interval
 }
 
 func (pod *Pod) Epoch() time.Time {
-	if pod.PodSpec.Params != nil {
-		str, ok := pod.PodSpec.Params["epoch_time"]
-		if ok {
-			intVal, err := strconv.ParseInt(str, 10, 64)
-			if err == nil {
-				return time.Unix(intVal, 0)
-			}
-		}
+	if pod.podParams.Epoch.IsZero() {
+		return time.Now().Add(-pod.Period())
 	}
 
-	return time.Now().Add(-pod.Period())
+	return pod.podParams.Epoch
 }
 
 func (pod *Pod) Granularity() time.Duration {
-	if pod.PodSpec.Params != nil {
-		str, ok := pod.PodSpec.Params["granularity"]
-		if ok {
-			val, err := time.ParseDuration(str)
-			if err == nil {
-				return val
-			}
-		}
-	}
-
-	return time.Second * 10 // Default to 10 sec
+	return pod.podParams.Granularity
 }
 
 func (pod *Pod) TrainingGoal() *string {
@@ -432,6 +397,11 @@ func loadPod(podPath string, hash string) (*Pod, error) {
 		return nil, err
 	}
 
+	err = pod.loadParams()
+	if err != nil {
+		return nil, fmt.Errorf("error loading pod params: %s", err.Error())
+	}
+
 	pod.manifestPath = podPath
 	pod.hash = hash
 	if pod.Name == "" {
@@ -479,4 +449,50 @@ func (pod *Pod) loadRewardSpecs() ([]spec.RewardSpec, error) {
 
 func (pod *Pod) IsSame(otherPod *Pod) bool {
 	return otherPod != nil && pod.manifestPath == otherPod.manifestPath && pod.Hash() == otherPod.Hash()
+}
+
+func (pod *Pod) loadParams() error {
+	podParams := NewPodParams()
+
+	if pod.PodSpec.Params != nil {
+		str, ok := pod.PodSpec.Params["epoch_time"]
+		if ok {
+			intVal, err := strconv.ParseInt(str, 10, 64)
+			if err != nil {
+				return err
+			}
+			podParams.Epoch = time.Unix(intVal, 0)
+		}
+
+		str, ok = pod.PodSpec.Params["period"]
+		if ok {
+			val, err := time.ParseDuration(str)
+			if err != nil {
+				return err
+			}
+			podParams.Period = val
+		}
+
+		str, ok = pod.PodSpec.Params["interval"]
+		if ok {
+			val, err := time.ParseDuration(str)
+			if err != nil {
+				return err
+			}
+			podParams.Interval = val
+		}
+
+		str, ok = pod.PodSpec.Params["granularity"]
+		if ok {
+			val, err := time.ParseDuration(str)
+			if err != nil {
+				return err
+			}
+			podParams.Granularity = val
+		}
+	}
+
+	pod.podParams = podParams
+
+	return nil
 }

@@ -1,6 +1,4 @@
 name: trader-infer
-params:
-  epoch: 1605312000
 dataspaces:
   # Add a list of dataspaces here
   - from: local
