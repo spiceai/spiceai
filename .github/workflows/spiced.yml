@@ -147,7 +147,8 @@ jobs:
       - name: publish ${{ matrix.target_os }}/${{ matrix.target_arch }} binaries to github
         run: |
           echo "installing github-release-cli..."
-          sudo npm install --silent --no-progress -g github-release-cli@1.3.1
+          sudo npm install --no-progress -g @babel/runtime@7.13.10
+          sudo npm install --no-progress -g github-release-cli@2.0.0
           # Parse repository to get owner and repo names
           OWNER_NAME="${GITHUB_REPOSITORY%%/*}"
           REPO_NAME="${GITHUB_REPOSITORY#*/}"
@@ -168,7 +169,7 @@ jobs:
           github-release upload \
             --owner $OWNER_NAME --repo $REPO_NAME \
             --tag "v${{ env.REL_VERSION }}-spiced" \
-            --name "Spice Runtime v${{ env.REL_VERSION }}" \
+            --release-name "Spice Runtime v${{ env.REL_VERSION }}" \
             --body "${RELEASE_BODY}" \
             --prerelease true \
             ${RELEASE_ARTIFACT[*]}

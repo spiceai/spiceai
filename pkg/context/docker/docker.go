@@ -234,5 +234,9 @@ func getDockerImageVersion() (string, error) {
 	// Most recent image
 	tag := strings.TrimSpace(lines[0])
 
+	if !strings.HasPrefix(tag, "v") {
+		return fmt.Sprintf("v%s", tag), nil
+	}
+
 	return tag, nil
 }

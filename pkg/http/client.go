@@ -10,13 +10,16 @@ import (
 
 var _userAgent string
 
-func Get(url string) (*net_http.Response, error) {
+func Get(url string, accept string) (*net_http.Response, error) {
 	req, err := net_http.NewRequest("GET", url, nil)
 	if err != nil {
 		return nil, err
 	}
 
 	req.Header.Set("User-Agent", userAgent())
+	if accept != "" {
+		req.Header.Set("Accept", accept)
+	}
 
 	resp, err := net_http.DefaultClient.Do(req)
 	if err != nil {
