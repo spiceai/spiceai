@@ -104,11 +104,7 @@ func startNewPodTraining(pod *pods.Pod) error {
 		return err
 	}
 
-	podState, err := pod.FetchNewData()
-	if err != nil {
-		return err
-	}
-
+	podState := pod.CachedState()
 	err = aiengine.SendData(pod, podState...)
 	if err != nil {
 		return err

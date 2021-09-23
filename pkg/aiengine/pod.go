@@ -176,11 +176,7 @@ func ImportPod(request *runtime_pb.ImportModel) error {
 		}
 	}
 
-	podState, err := pod.FetchNewData()
-	if err != nil {
-		return err
-	}
-
+	podState := pod.CachedState()
 	err = SendData(pod, podState...)
 	if err != nil {
 		return err

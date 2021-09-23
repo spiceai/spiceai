@@ -190,12 +190,6 @@ func testActionsFunc(pod *Pod) func(*testing.T) {
 // Tests CachedCsv() getter
 func testCachedCsvFunc(pod *Pod) func(*testing.T) {
 	return func(t *testing.T) {
-		_, err := pod.FetchNewData()
-		if err != nil {
-			t.Error(err)
-			return
-		}
-
 		actual := pod.CachedCsv()
 
 		snapshotter.SnapshotT(t, actual)
@@ -205,18 +199,9 @@ func testCachedCsvFunc(pod *Pod) func(*testing.T) {
 // Tests AddLocalState()
 func testAddLocalStateFunc(pod *Pod) func(*testing.T) {
 	return func(t *testing.T) {
-		fileConnector := file.NewFileConnector()
-		err := fileConnector.Init(map[string]string{
-			"path":  "../../test/assets/data/csv/trader_input.csv",
-			"watch": "false",
-		})
-		if err != nil {
-			t.Fatal(err.Error())
-		}
-		data, err := fileConnector.FetchData(time.Unix(1605312000, 0), 7*24*time.Hour, time.Hour)
-		if err != nil {
-			t.Fatal(err.Error())
-		}
+		epoch := time.Unix(1605312000, 0)
+		period := 7 * 24 * time.Hour
+		interval := time.Hour
 
 		dp, err := dataprocessors.NewDataProcessor(csv.CsvProcessorName)
 		if err != nil {
@@ -226,8 +211,27 @@ func testAddLocalStateFunc(pod *Pod) func(*testing.T) {
 		err = dp.Init(nil)
 		assert.NoError(t, err)
 
-		_, err = dp.OnData(data)
-		assert.NoError(t, err)
+		fileConnector := file.NewFileConnector()
+		err = fileConnector.Init(epoch, period, interval, map[string]string{
+			"path":  "../../test/assets/data/csv/trader_input.csv",
+			"watch": "false",
+		})
+		if err != nil {
+			t.Fatal(err.Error())
+		}
+
+		done := make(chan bool, 1)
+		err = fileConnector.Read(func(data []byte, metadata map[string]string) ([]byte, error) {
+			_, err := dp.OnData(data)
+			assert.NoError(t, err)
+			done <- true
+			return nil, err
+		})
+		if err != nil {
+			t.Fatal(err.Error())
+		}
+
+		<-done
 
 		newState, err := dp.GetState(nil)
 		if err != nil {
@@ -241,18 +245,9 @@ func testAddLocalStateFunc(pod *Pod) func(*testing.T) {
 // Tests CachedCsv() called after AddLocalState()
 func testAddLocalStateCachedCsvFunc(pod *Pod) func(*testing.T) {
 	return func(t *testing.T) {
-		fileConnector := file.NewFileConnector()
-		err := fileConnector.Init(map[string]string{
-			"path":  "../../test/assets/data/csv/trader_input.csv",
-			"watch": "false",
-		})
-		if err != nil {
-			t.Fatal(err.Error())
-		}
-		data, err := fileConnector.FetchData(time.Unix(1605312000, 0), 7*24*time.Hour, time.Hour)
-		if err != nil {
-			t.Fatal(err.Error())
-		}
+		epoch := time.Unix(1605312000, 0)
+		period := 7 * 24 * time.Hour
+		interval := time.Hour
 
 		dp, err := dataprocessors.NewDataProcessor(csv.CsvProcessorName)
 		if err != nil {
@@ -262,8 +257,29 @@ func testAddLocalStateCachedCsvFunc(pod *Pod) func(*testing.T) {
 		err = dp.Init(nil)
 		assert.NoError(t, err)
 
-		_, err = dp.OnData(data)
-		assert.NoError(t, err)
+		fileConnector := file.NewFileConnector()
+
+		done := make(chan bool, 1)
+
+		err = fileConnector.Read(func(data []byte, metadata map[string]string) ([]byte, error) {
+			_, err := dp.OnData(data)
+			assert.NoError(t, err)
+			done <- true
+			return nil, err
+		})
+		if err != nil {
+			t.Fatal(err.Error())
+		}
+
+		err = fileConnector.Init(epoch, period, interval, map[string]string{
+			"path":  "../../test/assets/data/csv/trader_input.csv",
+			"watch": "false",
+		})
+		if err != nil {
+			t.Fatal(err.Error())
+		}
+
+		<-done
 
 		newState, err := dp.GetState(nil)
 		if err != nil {

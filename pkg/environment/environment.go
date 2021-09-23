@@ -1,58 +1,16 @@
 package environment
 
 import (
-	"log"
-	"time"
-
 	"github.com/spiceai/spiceai/pkg/aiengine"
 	"github.com/spiceai/spiceai/pkg/pods"
+	"github.com/spiceai/spiceai/pkg/state"
 )
 
-func StartDataListeners(intervalSecs int) error {
-	_, err := FetchNewData()
-	if err != nil {
-		log.Println(err)
-		return err
-	}
-
-	// HACKHACK: Polled fetch for now (TODO data sources subscribe with push model)
-	ticker := time.NewTicker(time.Duration(intervalSecs) * time.Second)
-	quit := make(chan struct{})
-	go func() {
-		for {
-			select {
-			case <-ticker.C:
-				{
-					_, err := FetchNewData()
-					if err != nil {
-						log.Println(err)
-						return
-					}
-				}
-			case <-quit:
-				ticker.Stop()
-				return
-			}
-		}
-	}()
-
-	return nil
-}
-
-func FetchNewData() (bool, error) {
+func RegisterStateHandlers() {
 	for _, pod := range pods.Pods() {
-		state, err := pod.State()
-		if err != nil {
-			log.Printf("%v", err)
-			continue
+		handler := func(state *state.State, metadata map[string]string) error {
+			return aiengine.SendData(pod, state)
 		}
-
-		err = aiengine.SendData(pod, state...)
-		if err != nil {
-			log.Printf("%v", err)
-			continue
-		}
+		pod.RegisterStateHandler(handler)
 	}
-
-	return true, nil
 }

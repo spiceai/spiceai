@@ -50,7 +50,7 @@ func testStartDataListeners() func(*testing.T) {
 		})
 
 		go func() {
-			err = environment.StartDataListeners(1)
+			environment.RegisterStateHandlers()
 			assert.NoError(t, err)
 		}()
 

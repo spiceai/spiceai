@@ -156,7 +156,7 @@ func apiPostDataspaceHandler(ctx *fasthttp.RequestCtx) {
 	}
 
 	newState := state.NewState(selectedDataspace.Path(), selectedDataspace.FieldNames(), observations)
-	selectedDataspace.AddNewState(newState)
+	selectedDataspace.AddNewState(newState, nil)
 
 	ctx.Response.SetStatusCode(201)
 }

@@ -81,10 +81,7 @@ func SingleRun(manifestPath string) error {
 		return err
 	}
 
-	err = environment.StartDataListeners(15)
-	if err != nil {
-		return err
-	}
+	environment.RegisterStateHandlers()
 
 	err = aiengine.StartTraining(pod)
 	if err != nil {
@@ -129,10 +126,7 @@ func Run() error {
 		return err
 	}
 
-	err = environment.StartDataListeners(15)
-	if err != nil {
-		return err
-	}
+	environment.RegisterStateHandlers()
 
 	return nil
 }

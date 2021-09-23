@@ -14,7 +14,7 @@ import (
 
 	"github.com/spf13/viper"
 	"github.com/spiceai/spiceai/pkg/constants"
-	"github.com/spiceai/spiceai/pkg/dataspaces"
+	"github.com/spiceai/spiceai/pkg/dataspace"
 	"github.com/spiceai/spiceai/pkg/flights"
 	"github.com/spiceai/spiceai/pkg/interpretations"
 	"github.com/spiceai/spiceai/pkg/observations"
@@ -28,14 +28,15 @@ type Pod struct {
 	podParams    *PodParams
 	hash         string
 	manifestPath string
-	dataSources  []*dataspaces.Dataspace
+	dataSources  []*dataspace.Dataspace
 	fields       map[string]float64
 	fieldNames   []string
 	flights      map[string]*flights.Flight
 	viper        *viper.Viper
 
-	podLocalStateMutex sync.RWMutex
-	podLocalState      []*state.State
+	podLocalStateMutex    sync.RWMutex
+	podLocalState         []*state.State
+	podLocalStateHandlers []state.StateHandler
 
 	interpretations *interpretations.InterpretationsStore
 }
@@ -140,7 +141,7 @@ func (pod *Pod) CachedCsv() string {
 	return csv.String()
 }
 
-func (pod *Pod) DataSources() []*dataspaces.Dataspace {
+func (pod *Pod) DataSources() []*dataspace.Dataspace {
 	return pod.dataSources
 }
 
@@ -331,34 +332,18 @@ func (pod *Pod) AddLocalState(newState ...*state.State) {
 	pod.podLocalState = append(pod.podLocalState, newState...)
 }
 
-func (pod *Pod) State() ([]*state.State, error) {
-	var allState []*state.State
-	for _, ds := range pod.DataSources() {
-		state, err := ds.FetchNewState(pod.Epoch(), pod.Period(), pod.Interval())
-		if err != nil {
-			return nil, err
-		}
-		if state == nil {
-			continue
-		}
-		allState = append(allState, state...)
-	}
-
-	allState = append(allState, pod.podLocalState...)
-
-	return allState, nil
+func (pod *Pod) State() []*state.State {
+	return pod.podLocalState
 }
 
-func (pod *Pod) FetchNewData() ([]*state.State, error) {
-	var allState []*state.State
+func (pod *Pod) RegisterStateHandler(handler state.StateHandler) {
+	pod.podLocalStateMutex.Lock()
+	defer pod.podLocalStateMutex.Unlock()
+
+	pod.podLocalStateHandlers = append(pod.podLocalStateHandlers, handler)
 	for _, ds := range pod.DataSources() {
-		state, err := ds.FetchNewState(pod.Epoch(), pod.Period(), pod.Interval())
-		if err != nil {
-			return nil, err
-		}
-		allState = append(allState, state...)
+		ds.RegisterStateHandler(handler)
 	}
-	return allState, nil
 }
 
 func unmarshalPod(podPath string) (*Pod, error) {
@@ -414,7 +399,7 @@ func loadPod(podPath string, hash string) (*Pod, error) {
 	fields := make(map[string]float64)
 
 	for _, dsSpec := range pod.PodSpec.Dataspaces {
-		ds, err := dataspaces.NewDataspace(dsSpec)
+		ds, err := dataspace.NewDataspace(dsSpec, pod.podParams.Epoch, pod.podParams.Period, pod.podParams.Interval)
 		if err != nil {
 			return nil, err
 		}
