@@ -2,6 +2,7 @@ package pods
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -21,6 +22,7 @@ import (
 	"github.com/spiceai/spiceai/pkg/spec"
 	"github.com/spiceai/spiceai/pkg/state"
 	"github.com/spiceai/spiceai/pkg/util"
+	"golang.org/x/sync/errgroup"
 )
 
 type Pod struct {
@@ -336,14 +338,24 @@ func (pod *Pod) State() []*state.State {
 	return pod.podLocalState
 }
 
-func (pod *Pod) RegisterStateHandler(handler state.StateHandler) {
+func (pod *Pod) InitDataConnectors(handler state.StateHandler) error {
 	pod.podLocalStateMutex.Lock()
 	defer pod.podLocalStateMutex.Unlock()
 
 	pod.podLocalStateHandlers = append(pod.podLocalStateHandlers, handler)
+
+	errGroup, _ := errgroup.WithContext(context.Background())
+
 	for _, ds := range pod.DataSources() {
-		ds.RegisterStateHandler(handler)
+		dsp := ds
+		errGroup.Go(func() error {
+			dsp.RegisterStateHandler(handler)
+			fmt.Println("HERHEHR")
+			return dsp.InitDataConnector(pod.podParams.Epoch, pod.podParams.Period, pod.podParams.Interval)
+		})
 	}
+
+	return errGroup.Wait()
 }
 
 func unmarshalPod(podPath string) (*Pod, error) {
@@ -399,7 +411,7 @@ func loadPod(podPath string, hash string) (*Pod, error) {
 	fields := make(map[string]float64)
 
 	for _, dsSpec := range pod.PodSpec.Dataspaces {
-		ds, err := dataspace.NewDataspace(dsSpec, pod.podParams.Epoch, pod.podParams.Period, pod.podParams.Interval)
+		ds, err := dataspace.NewDataspace(dsSpec)
 		if err != nil {
 			return nil, err
 		}

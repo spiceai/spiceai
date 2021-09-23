@@ -14,7 +14,7 @@ import (
 	"github.com/spiceai/spiceai/pkg/aiengine"
 	"github.com/spiceai/spiceai/pkg/api"
 	"github.com/spiceai/spiceai/pkg/dashboard"
-	"github.com/spiceai/spiceai/pkg/dataspaces"
+	"github.com/spiceai/spiceai/pkg/dataspace"
 	"github.com/spiceai/spiceai/pkg/flights"
 	"github.com/spiceai/spiceai/pkg/loggers"
 	"github.com/spiceai/spiceai/pkg/pods"
@@ -115,7 +115,7 @@ func apiPostDataspaceHandler(ctx *fasthttp.RequestCtx) {
 	dataspaceFrom := ctx.UserValue("dataspace_from").(string)
 	dataspaceName := ctx.UserValue("dataspace_name").(string)
 
-	var selectedDataspace *dataspaces.Dataspace
+	var selectedDataspace *dataspace.Dataspace
 	for _, dataspace := range pod.DataSources() {
 		if dataspace.DataspaceSpec.From == dataspaceFrom && dataspace.DataspaceSpec.Name == dataspaceName {
 			selectedDataspace = dataspace
@@ -156,7 +156,12 @@ func apiPostDataspaceHandler(ctx *fasthttp.RequestCtx) {
 	}
 
 	newState := state.NewState(selectedDataspace.Path(), selectedDataspace.FieldNames(), observations)
-	selectedDataspace.AddNewState(newState, nil)
+	err = selectedDataspace.AddNewState(newState, nil)
+	if err != nil {
+		zaplog.Sugar().Error(err)
+		ctx.Response.SetStatusCode(500)
+		return
+	}
 
 	ctx.Response.SetStatusCode(201)
 }

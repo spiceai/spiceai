@@ -81,7 +81,10 @@ func SingleRun(manifestPath string) error {
 		return err
 	}
 
-	environment.RegisterStateHandlers()
+	err = environment.InitDataConnectors()
+	if err != nil {
+		return err
+	}
 
 	err = aiengine.StartTraining(pod)
 	if err != nil {
@@ -126,7 +129,10 @@ func Run() error {
 		return err
 	}
 
-	environment.RegisterStateHandlers()
+	err = environment.InitDataConnectors()
+	if err != nil {
+		return err
+	}
 
 	return nil
 }

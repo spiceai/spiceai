@@ -15,20 +15,12 @@ import (
 )
 
 func TestEnvironment(t *testing.T) {
-	t.Run("testStartDataListeners() -- Should start listeners and post data", testStartDataListeners())
+	t.Run("RegisterStateHandlers() -- Should register handlers and post data", testRegisterStateHandlers())
 }
 
-func testStartDataListeners() func(*testing.T) {
+func testRegisterStateHandlers() func(*testing.T) {
 	return func(t *testing.T) {
-		pod, err := pods.LoadPodFromManifest("../../test/assets/pods/manifests/trader.yaml")
-		assert.NoError(t, err)
-		pods.CreateOrUpdatePod(pod)
 		data_received := make(chan bool)
-
-		t.Cleanup(func() {
-			aiengine.SetAIEngineClient(nil)
-		})
-
 		aiengine.SetAIEngineClient(&aiengine.MockAIEngineClient{
 			GetHealthHandler: func(c context.Context, hr *aiengine_pb.HealthRequest, co ...grpc.CallOption) (*aiengine_pb.Response, error) {
 				return &aiengine_pb.Response{
@@ -49,8 +41,16 @@ func testStartDataListeners() func(*testing.T) {
 			},
 		})
 
+		pod, err := pods.LoadPodFromManifest("../../test/assets/pods/manifests/trader.yaml")
+		assert.NoError(t, err)
+		pods.CreateOrUpdatePod(pod)
+
+		t.Cleanup(func() {
+			aiengine.SetAIEngineClient(nil)
+		})
+
 		go func() {
-			environment.RegisterStateHandlers()
+			err := environment.InitDataConnectors()
 			assert.NoError(t, err)
 		}()
 

@@ -1,6 +1,7 @@
 package dataspace
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"sync"
@@ -10,6 +11,7 @@ import (
 	"github.com/spiceai/data-components-contrib/dataprocessors"
 	"github.com/spiceai/spiceai/pkg/spec"
 	"github.com/spiceai/spiceai/pkg/state"
+	"golang.org/x/sync/errgroup"
 )
 
 type Dataspace struct {
@@ -22,7 +24,7 @@ type Dataspace struct {
 	stateHandlers []state.StateHandler
 }
 
-func NewDataspace(dsSpec spec.DataspaceSpec, epoch time.Time, period time.Duration, interval time.Duration) (*Dataspace, error) {
+func NewDataspace(dsSpec spec.DataspaceSpec) (*Dataspace, error) {
 	ds := Dataspace{
 		DataspaceSpec: dsSpec,
 		stateMutex:    &sync.RWMutex{},
@@ -42,6 +44,8 @@ func NewDataspace(dsSpec spec.DataspaceSpec, epoch time.Time, period time.Durati
 			return nil, fmt.Errorf("failed to initialize data processor '%s': %s", dsSpec.Data.Connector.Name, err)
 		}
 
+		ds.processor = processor
+
 		if dsSpec.Data.Connector.Name != "" {
 			connector, err = dataconnectors.NewDataConnector(dsSpec.Data.Connector.Name)
 			if err != nil {
@@ -52,15 +56,9 @@ func NewDataspace(dsSpec spec.DataspaceSpec, epoch time.Time, period time.Durati
 			if err != nil {
 				return nil, fmt.Errorf("failed to initialize data connector '%s': %s", dsSpec.Data.Connector.Name, err)
 			}
-
-			err = connector.Init(epoch, period, interval, dsSpec.Data.Connector.Params)
-			if err != nil {
-				return nil, fmt.Errorf("failed to initialize data connector '%s': %s", dsSpec.Data.Connector.Name, err)
-			}
 		}
 
 		ds.connector = connector
-		ds.processor = processor
 	}
 
 	return &ds, nil
@@ -151,15 +149,22 @@ func (ds *Dataspace) Laws() []string {
 	return fqLaws
 }
 
-func (ds *Dataspace) AddNewState(state *state.State, metadata map[string]string) {
+func (ds *Dataspace) AddNewState(state *state.State, metadata map[string]string) error {
 	ds.stateMutex.Lock()
 	defer ds.stateMutex.Unlock()
 
 	ds.cachedState = append(ds.cachedState, state)
 
+	errGroup, _ := errgroup.WithContext(context.Background())
+
 	for _, handler := range ds.stateHandlers {
-		handler(state, metadata)
+		h := handler
+		errGroup.Go(func() error {
+			return h(state, metadata)
+		})
 	}
+
+	return errGroup.Wait()
 }
 
 func (ds *Dataspace) RegisterStateHandler(handler func(state *state.State, metadata map[string]string) error) {
@@ -169,8 +174,18 @@ func (ds *Dataspace) RegisterStateHandler(handler func(state *state.State, metad
 	ds.stateHandlers = append(ds.stateHandlers, handler)
 }
 
+func (ds *Dataspace) InitDataConnector(epoch time.Time, period time.Duration, interval time.Duration) error {
+	if ds.connector != nil {
+		err := ds.connector.Init(epoch, period, interval, ds.Data.Connector.Params)
+		if err != nil {
+			return fmt.Errorf("failed to initialize data connector '%s': %s", ds.Data.Connector.Name, err)
+		}
+	}
+	return nil
+}
+
 func (ds *Dataspace) readData(data []byte, metadata map[string]string) ([]byte, error) {
-	if data == nil || ds.processor == nil {
+	if data == nil {
 		return nil, nil
 	}
 
@@ -185,7 +200,10 @@ func (ds *Dataspace) readData(data []byte, metadata map[string]string) ([]byte, 
 	}
 
 	newState := state.NewState(ds.Path(), ds.FieldNames(), observations)
-	ds.AddNewState(newState, metadata)
+	err = ds.AddNewState(newState, metadata)
+	if err != nil {
+		return nil, err
+	}
 
 	return data, nil
 }

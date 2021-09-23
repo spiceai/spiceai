@@ -6,11 +6,15 @@ import (
 	"github.com/spiceai/spiceai/pkg/state"
 )
 
-func RegisterStateHandlers() {
+func InitDataConnectors() error {
 	for _, pod := range pods.Pods() {
 		handler := func(state *state.State, metadata map[string]string) error {
 			return aiengine.SendData(pod, state)
 		}
-		pod.RegisterStateHandler(handler)
+		err := pod.InitDataConnectors(handler)
+		if err != nil {
+			return err
+		}
 	}
+	return nil
 }
