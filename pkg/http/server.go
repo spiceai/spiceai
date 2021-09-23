@@ -19,7 +19,6 @@ import (
 	"github.com/spiceai/spiceai/pkg/loggers"
 	"github.com/spiceai/spiceai/pkg/pods"
 	"github.com/spiceai/spiceai/pkg/proto/runtime_pb"
-	"github.com/spiceai/spiceai/pkg/state"
 	"github.com/spiceai/spiceai/pkg/util"
 	"github.com/valyala/fasthttp"
 	"go.uber.org/zap"
@@ -119,6 +118,7 @@ func apiPostDataspaceHandler(ctx *fasthttp.RequestCtx) {
 	for _, dataspace := range pod.DataSources() {
 		if dataspace.DataspaceSpec.From == dataspaceFrom && dataspace.DataspaceSpec.Name == dataspaceName {
 			selectedDataspace = dataspace
+			break
 		}
 	}
 
@@ -127,36 +127,7 @@ func apiPostDataspaceHandler(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	dp, err := dataprocessors.NewDataProcessor(selectedDataspace.DataspaceSpec.Data.Processor.Name)
-	if err != nil {
-		zaplog.Sugar().Error(err)
-		ctx.Response.SetStatusCode(500)
-		return
-	}
-
-	err = dp.Init(nil)
-	if err != nil {
-		zaplog.Sugar().Error(err)
-		ctx.Response.SetStatusCode(500)
-		return
-	}
-
-	_, err = dp.OnData(ctx.Request.Body())
-	if err != nil {
-		zaplog.Sugar().Error(err)
-		ctx.Response.SetStatusCode(500)
-		return
-	}
-
-	observations, err := dp.GetObservations()
-	if err != nil {
-		zaplog.Sugar().Error(err)
-		ctx.Response.SetStatusCode(500)
-		return
-	}
-
-	newState := state.NewState(selectedDataspace.Path(), selectedDataspace.FieldNames(), observations)
-	err = selectedDataspace.AddNewState(newState, nil)
+	_, err := selectedDataspace.ReadData(ctx.Request.Body(), nil)
 	if err != nil {
 		zaplog.Sugar().Error(err)
 		ctx.Response.SetStatusCode(500)

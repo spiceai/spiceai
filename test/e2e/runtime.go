@@ -17,34 +17,52 @@ import (
 )
 
 type runtimeServer struct {
-	baseUrl          string
-	runtimePath      string
-	workingDirectory string
-	cli              *cli
-	context          string
+	baseUrl            string
+	shouldStartRuntime bool
+	runtimePath        string
+	workingDirectory   string
+	cli                *cli
+	context            string
+	cmd                *exec.Cmd
 }
 
-func (r *runtimeServer) startRuntime() (*exec.Cmd, error) {
-	var runtimeCmd *exec.Cmd
+func (r *runtimeServer) startRuntime() error {
+	if !r.shouldStartRuntime {
+		return nil
+	}
+
 	var err error
 
 	if r.context == "docker" {
-		runtimeCmd, err = r.startDockerRuntime()
+		r.cmd, err = r.startDockerRuntime()
 	} else {
-		runtimeCmd, err = r.startMetalRuntime()
+		r.cmd, err = r.startMetalRuntime()
 	}
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	err = r.waitForServerHealthy()
 	if err != nil {
-		return nil, err
+		return err
 	}
 
-	time.Sleep(1 * time.Second)
+	return nil
+}
 
-	return runtimeCmd, nil
+func (r *runtimeServer) shutdown() error {
+	if r.cmd != nil {
+		err := r.cmd.Process.Signal(os.Interrupt)
+		if err != nil {
+			return err
+		}
+		err = r.cmd.Wait()
+		if err != nil {
+			return err
+		}
+		r.cmd = nil
+	}
+	return nil
 }
 
 func (r *runtimeServer) startDockerRuntime() (*exec.Cmd, error) {

@@ -52,7 +52,7 @@ func NewDataspace(dsSpec spec.DataspaceSpec) (*Dataspace, error) {
 				return nil, fmt.Errorf("failed to initialize data connector '%s': %s", dsSpec.Data.Connector.Name, err)
 			}
 
-			err = connector.Read(ds.readData)
+			err = connector.Read(ds.ReadData)
 			if err != nil {
 				return nil, fmt.Errorf("failed to initialize data connector '%s': %s", dsSpec.Data.Connector.Name, err)
 			}
@@ -184,7 +184,7 @@ func (ds *Dataspace) InitDataConnector(epoch time.Time, period time.Duration, in
 	return nil
 }
 
-func (ds *Dataspace) readData(data []byte, metadata map[string]string) ([]byte, error) {
+func (ds *Dataspace) ReadData(data []byte, metadata map[string]string) ([]byte, error) {
 	if data == nil {
 		return nil, nil
 	}
