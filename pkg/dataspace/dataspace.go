@@ -3,6 +3,7 @@ package dataspace
 import (
 	"context"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"time"
@@ -149,22 +150,27 @@ func (ds *Dataspace) Laws() []string {
 	return fqLaws
 }
 
-func (ds *Dataspace) AddNewState(state *state.State, metadata map[string]string) error {
+func (ds *Dataspace) AddNewState(state *state.State, metadata map[string]string) {
 	ds.stateMutex.Lock()
 	defer ds.stateMutex.Unlock()
 
 	ds.cachedState = append(ds.cachedState, state)
 
-	errGroup, _ := errgroup.WithContext(context.Background())
+	go func() {
+		errGroup, _ := errgroup.WithContext(context.Background())
 
-	for _, handler := range ds.stateHandlers {
-		h := handler
-		errGroup.Go(func() error {
-			return h(state, metadata)
-		})
-	}
+		for _, handler := range ds.stateHandlers {
+			h := handler
+			errGroup.Go(func() error {
+				return h(state, metadata)
+			})
+		}
 
-	return errGroup.Wait()
+		err := errGroup.Wait()
+		if err != nil {
+			log.Println(err.Error())
+		}
+	}()
 }
 
 func (ds *Dataspace) RegisterStateHandler(handler func(state *state.State, metadata map[string]string) error) {
@@ -200,10 +206,7 @@ func (ds *Dataspace) readData(data []byte, metadata map[string]string) ([]byte, 
 	}
 
 	newState := state.NewState(ds.Path(), ds.FieldNames(), observations)
-	err = ds.AddNewState(newState, metadata)
-	if err != nil {
-		return nil, err
-	}
+	ds.AddNewState(newState, metadata)
 
 	return data, nil
 }
