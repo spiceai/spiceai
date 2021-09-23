@@ -156,7 +156,12 @@ func apiPostDataspaceHandler(ctx *fasthttp.RequestCtx) {
 	}
 
 	newState := state.NewState(selectedDataspace.Path(), selectedDataspace.FieldNames(), observations)
-	selectedDataspace.AddNewState(newState, nil)
+	err = selectedDataspace.AddNewState(newState, nil)
+	if err != nil {
+		zaplog.Sugar().Error(err)
+		ctx.Response.SetStatusCode(500)
+		return
+	}
 
 	ctx.Response.SetStatusCode(201)
 }

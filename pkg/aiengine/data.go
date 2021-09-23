@@ -55,7 +55,7 @@ func SendData(pod *pods.Pod, podState ...*state.State) error {
 			CsvData: csv.String(),
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
 		response, err := aiengineClient.AddData(ctx, addDataRequest)
 		if err != nil {
