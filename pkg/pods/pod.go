@@ -350,7 +350,6 @@ func (pod *Pod) InitDataConnectors(handler state.StateHandler) error {
 		dsp := ds
 		errGroup.Go(func() error {
 			dsp.RegisterStateHandler(handler)
-			fmt.Println("HERHEHR")
 			return dsp.InitDataConnector(pod.podParams.Epoch, pod.podParams.Period, pod.podParams.Interval)
 		})
 	}
