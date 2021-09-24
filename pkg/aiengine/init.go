@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/logrusorgru/aurora"
 	"github.com/spiceai/spiceai/pkg/pods"
 	"github.com/spiceai/spiceai/pkg/proto/aiengine_pb"
 )
@@ -66,6 +67,7 @@ func getPodInitForTraining(pod *pods.Pod) *aiengine_pb.InitRequest {
 
 	var dsInitSpecs []*aiengine_pb.DataSource
 	for _, ds := range pod.DataSources() {
+		fmt.Printf("%+v\n", ds.DataspaceSpec)
 		for fqField, fqFieldInitializer := range ds.Fields() {
 			fieldName := strings.ReplaceAll(fqField, ".", "_")
 			fields[fieldName] = fqFieldInitializer
@@ -132,6 +134,8 @@ func getPodInitForTraining(pod *pods.Pod) *aiengine_pb.InitRequest {
 		Actions:     globalActionRewards,
 		Laws:        laws,
 	}
+
+	fmt.Println(aurora.BrightYellow(fmt.Sprintf("%+v", podInit.Fields)))
 
 	return &podInit
 }

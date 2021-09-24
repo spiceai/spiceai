@@ -44,6 +44,8 @@ func SendData(pod *pods.Pod, podState ...*state.State) error {
 			continue
 		}
 
+		fmt.Println(aurora.BrightGreen(csv.String()))
+
 		csvChunk, csvPreview := observations.GetCsv(s.FieldNames(), observationData, 5)
 
 		zaplog.Sugar().Debugf("Posting data to AI engine:\n%s", aurora.BrightYellow(fmt.Sprintf("%s%s...\n%d observations posted", csv.String(), csvPreview, len(observationData))))
@@ -55,7 +57,8 @@ func SendData(pod *pods.Pod, podState ...*state.State) error {
 			CsvData: csv.String(),
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		fmt.Println(aurora.BrightMagenta(fmt.Sprintf("Sending data %d", len(addDataRequest.CsvData))))
+		ctx, cancel := context.WithTimeout(context.Background(), 60 * time.Second)
 		defer cancel()
 		response, err := aiengineClient.AddData(ctx, addDataRequest)
 		if err != nil {

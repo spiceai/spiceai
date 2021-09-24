@@ -126,6 +126,25 @@ func (r *runtimeServer) postDataspace(podName string, dataspaceFrom string, data
 	return nil
 }
 
+func (r *runtimeServer) getPods() (string, error) {
+	url := fmt.Sprintf("%s/api/v0.1/pods", r.baseUrl)
+	resp, err := http.Get(url)
+	if err != nil {
+		return "", err
+	}
+
+	if resp.StatusCode >= 400 {
+		return "", fmt.Errorf("unexpected status: %s", resp.Status)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	return string(body), nil
+}
+
 func (r *runtimeServer) getObservations(podName string) (string, error) {
 	url := fmt.Sprintf("%s/api/v0.1/pods/%s/observations", r.baseUrl, podName)
 	resp, err := http.Get(url)
