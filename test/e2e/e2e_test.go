@@ -7,6 +7,8 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -148,6 +150,10 @@ func TestPods(t *testing.T) {
 	}
 
 	assert.Len(t, pods, 2)
+
+	sort.SliceStable(pods, func(i, j int) bool {
+		return strings.Compare(pods[i]["name"], pods[j]["name"]) == -1
+	})
 
 	snapshotter.SnapshotT(t, pods[0]["name"], pods[1]["name"])
 }
