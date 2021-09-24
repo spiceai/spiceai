@@ -3,6 +3,7 @@ package aiengine
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -46,11 +47,9 @@ func SendData(pod *pods.Pod, podState ...*state.State) error {
 
 		fmt.Println(aurora.BrightGreen(csv.String()))
 
-		csvChunk, csvPreview := observations.GetCsv(s.FieldNames(), observationData, 5)
+		csvPreview := getData(&csv, pod.Epoch(), s.FieldNames(), observationData, 5)
 
 		zaplog.Sugar().Debugf("Posting data to AI engine:\n%s", aurora.BrightYellow(fmt.Sprintf("%s%s...\n%d observations posted", csv.String(), csvPreview, len(observationData))))
-
-		csv.WriteString(csvChunk)
 
 		addDataRequest := &aiengine_pb.AddDataRequest{
 			Pod:     pod.Name,
@@ -73,4 +72,27 @@ func SendData(pod *pods.Pod, podState ...*state.State) error {
 	}
 
 	return err
+}
+
+func getData(csv *strings.Builder, epoch time.Time, headers []string, observations []observations.Observation, previewLines int) string {
+	epochTime := epoch.Unix()
+	var csvPreview string
+	for i, o := range observations {
+		if o.Time < epochTime {
+			continue
+		}
+		csv.WriteString(strconv.FormatInt(o.Time, 10))
+		for _, f := range headers {
+			csv.WriteString(",")
+			val, ok := o.Data[f]
+			if ok {
+				csv.WriteString(strconv.FormatFloat(val, 'f', -1, 64))
+			}
+		}
+		csv.WriteString("\n")
+		if previewLines > 0 && (i+1 == previewLines || (previewLines >= i && i+1 == len(observations))) {
+			csvPreview = csv.String()
+		}
+	}
+	return csvPreview
 }

@@ -11,10 +11,9 @@ type Observation struct {
 	Tags []string
 }
 
-func GetCsv(headers []string, observations []Observation, previewLines int) (string, string) {
+func GetCsv(headers []string, observations []Observation) string {
 	csv := strings.Builder{}
-	var csvPreview string
-	for i, o := range observations {
+	for _, o := range observations {
 		csv.WriteString(strconv.FormatInt(o.Time, 10))
 		for _, f := range headers {
 			csv.WriteString(",")
@@ -24,9 +23,6 @@ func GetCsv(headers []string, observations []Observation, previewLines int) (str
 			}
 		}
 		csv.WriteString("\n")
-		if previewLines > 0 && (i+1 == previewLines || (previewLines >= i && i+1 == len(observations))) {
-			csvPreview = csv.String()
-		}
 	}
-	return csv.String(), csvPreview
+	return csv.String()
 }
