@@ -144,10 +144,11 @@ func TestPods(t *testing.T) {
 	var pods []map[string]string
 	err = json.Unmarshal([]byte(observation), &pods)
 	if err != nil {
+		t.Fatal(err)
 	}
 
 	assert.Len(t, pods, 2)
-	
+
 	snapshotter.SnapshotT(t, pods[0]["name"], pods[1]["name"])
 }
 
