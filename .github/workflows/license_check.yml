@@ -69,10 +69,10 @@ jobs:
         run: |
           npx license-checker --excludePackage ${{ env.EXCLUDE_JS_PACKAGES }} |& ${{ env.FORBIDDEN_LICENSE_CHECK }}
 
-      - name: Set up Python 3.8.11
+      - name: Set up Python 3.8
         uses: actions/setup-python@v1
         with:
-          python-version: 3.8.11
+          python-version: 3.8
 
       - name: Install AI packages
         working-directory: ai/src
