@@ -31,6 +31,7 @@ type Pod struct {
 	dataSources  []*dataspaces.Dataspace
 	fields       map[string]float64
 	fieldNames   []string
+	tagPathMap   map[string][]string
 	flights      map[string]*flights.Flight
 	viper        *viper.Viper
 
@@ -111,30 +112,50 @@ func (pod *Pod) CachedState() []*state.State {
 func (pod *Pod) CachedCsv() string {
 	csv := strings.Builder{}
 	fieldNames := pod.FieldNames()
+	tagPathMap := pod.TagPathMap()
 
-	st := fmt.Sprintf("time,%s\n", strings.Join(fieldNames, ","))
+	headers := make([]string, len(fieldNames)+len(tagPathMap))
+	for _, fieldName := range fieldNames {
+		headers = append(headers, fieldName)
+	}
+	for tagPath := range tagPathMap {
+		headers = append(headers, fmt.Sprintf("%s._tags", tagPath))
+	}
+
+	st := fmt.Sprintf("time,%s\n", strings.Join(headers, ","))
 	csv.WriteString(st)
 
 	cachedState := pod.CachedState()
 	for _, state := range cachedState {
-		var validFieldNames []string
+		var validHeaders []string
 
 		for _, globalFieldName := range fieldNames {
-			isValid := false
+			isLocal := false
 			for _, fieldName := range state.FieldNames() {
 				field := state.Path() + "." + fieldName
 				if globalFieldName == field {
-					validFieldNames = append(validFieldNames, fieldName)
-					isValid = true
+					validHeaders = append(validHeaders, fieldName)
+					isLocal = true
 					break
 				}
 			}
-			if !isValid {
-				validFieldNames = append(validFieldNames, globalFieldName)
+			if !isLocal {
+				validHeaders = append(validHeaders, globalFieldName)
 			}
 		}
 
-		stateCsv := observations.GetCsv(validFieldNames, state.Observations())
+		for tagPath := range tagPathMap {
+			hasTags := false
+			if tagPath == state.Path() {
+				validHeaders = append(validHeaders, "_tags")
+				hasTags = true
+			}
+			if !hasTags {
+				validHeaders = append(validHeaders, "__SKIP__")
+			}
+		}
+
+		stateCsv := observations.GetCsv(validHeaders, tagPathMap[state.Path()], state.Observations())
 		csv.WriteString(stateCsv)
 	}
 	return csv.String()
@@ -274,6 +295,11 @@ func (pod *Pod) FieldNames() []string {
 	return pod.fieldNames
 }
 
+// Returns a map of datasource paths to the tags in those paths
+func (pod *Pod) TagPathMap() map[string][]string {
+	return pod.tagPathMap
+}
+
 func (pod *Pod) ValidateForTraining() error {
 	if pod.Granularity() > pod.Interval() {
 		return errors.New("granularity must be less than or equal to interval")
@@ -411,6 +437,7 @@ func loadPod(podPath string, hash string) (*Pod, error) {
 	pod.flights = make(map[string]*flights.Flight)
 
 	var fieldNames []string
+	tagPathMap := make(map[string][]string)
 	fields := make(map[string]float64)
 
 	for _, dsSpec := range pod.PodSpec.Dataspaces {
@@ -424,6 +451,13 @@ func loadPod(podPath string, hash string) (*Pod, error) {
 			fieldNames = append(fieldNames, fieldName)
 		}
 
+		for _, tag := range ds.Tags() {
+			tagPathMap[ds.Path()] = append(tagPathMap[ds.Path()], tag)
+		}
+		if _, ok := tagPathMap[ds.Path()]; ok {
+			sort.Strings(tagPathMap[ds.Path()])
+		}
+
 		for field, intializer := range ds.Fields() {
 			fields[field] = intializer
 		}
@@ -432,6 +466,7 @@ func loadPod(podPath string, hash string) (*Pod, error) {
 	sort.Strings(fieldNames)
 	pod.fieldNames = fieldNames
 	pod.fields = fields
+	pod.tagPathMap = tagPathMap
 
 	pod.interpretations = interpretations.NewInterpretationsStore(pod.Epoch(), pod.Period(), pod.Granularity())
 

@@ -13,11 +13,12 @@ type State struct {
 	path               string
 	fieldNames         []string
 	fields             []string
+	tags               []string
 	observations       []observations.Observation
 	observationsMutex  sync.RWMutex
 }
 
-func NewState(path string, fieldNames []string, observations []observations.Observation) *State {
+func NewState(path string, fieldNames []string, tags []string, observations []observations.Observation) *State {
 	fields := make([]string, len(fieldNames))
 	for i, name := range fieldNames {
 		fields[i] = path + "." + name
@@ -29,6 +30,7 @@ func NewState(path string, fieldNames []string, observations []observations.Obse
 		path:               path,
 		fieldNames:         fieldNames,
 		fields:             fields,
+		tags:               tags,
 		observations:       observations,
 	}
 }
@@ -47,6 +49,10 @@ func (s *State) Fields() []string {
 
 func (s *State) Observations() []observations.Observation {
 	return s.observations
+}
+
+func (s *State) Tags() []string {
+	return s.tags
 }
 
 func (s *State) Sent() {

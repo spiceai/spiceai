@@ -50,7 +50,7 @@ func testGetCsvAllHeadersFunc() func(*testing.T) {
 		headerLine := "open,high,low,close,volume"
 		headers := strings.Split(headerLine, ",")
 
-		csv := observations.GetCsv(headers, newObservations)
+		csv := observations.GetCsv(headers, nil, newObservations)
 
 		snapshotter.SnapshotT(t, csv)
 	}
@@ -86,7 +86,7 @@ func testGetCsvSelectHeadersFunc() func(*testing.T) {
 		}
 
 		headers := strings.Split("open,high,low,close,volume", ",")
-		csv := observations.GetCsv(headers, newObservations)
+		csv := observations.GetCsv(headers, nil, newObservations)
 
 		snapshotter.SnapshotT(t, csv)
 	}
