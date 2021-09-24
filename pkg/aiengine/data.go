@@ -45,8 +45,6 @@ func SendData(pod *pods.Pod, podState ...*state.State) error {
 			continue
 		}
 
-		fmt.Println(aurora.BrightGreen(csv.String()))
-
 		csvPreview := getData(&csv, pod.Epoch(), s.FieldNames(), observationData, 5)
 
 		zaplog.Sugar().Debugf("Posting data to AI engine:\n%s", aurora.BrightYellow(fmt.Sprintf("%s%s...\n%d observations posted", csv.String(), csvPreview, len(observationData))))
