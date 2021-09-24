@@ -42,7 +42,7 @@ spice export trader -o ./models
 			return
 		}
 
-		err = runtimeClient.ExportModel(directory, filename, exportTag)
+		err = runtimeClient.ExportModel(podName, directory, filename, exportTag)
 		if err != nil {
 			fmt.Println(err.Error())
 			return

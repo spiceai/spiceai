@@ -9,6 +9,7 @@ import (
 	"github.com/fsnotify/fsnotify"
 	"github.com/spiceai/spiceai/pkg/aiengine"
 	"github.com/spiceai/spiceai/pkg/context"
+	"github.com/spiceai/spiceai/pkg/environment"
 	"github.com/spiceai/spiceai/pkg/pods"
 )
 
@@ -99,7 +100,13 @@ func processNotifyEvent(event fsnotify.Event) error {
 
 func startNewPodTraining(pod *pods.Pod) error {
 	pods.CreateOrUpdatePod(pod)
-	err := aiengine.InitializePod(pod)
+
+	err := environment.InitPodDataConnector(pod)
+	if err != nil {
+		return err
+	}
+
+	err = aiengine.InitializePod(pod)
 	if err != nil {
 		return err
 	}

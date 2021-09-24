@@ -419,7 +419,7 @@ func TestImportExport(t *testing.T) {
 
 	_, err = os.Stat(filepath.Join(testDir, "trader.spicepod"))
 	if err != nil {
-		t.Fatal(fmt.Errorf("didn't see expected exported spicedpod: %w", err))
+		t.Fatal(fmt.Errorf("didn't see expected exported spicepod: %w", err))
 	}
 
 	err = cliClient.runCliCmd("import", "trader.spicepod")

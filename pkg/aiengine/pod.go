@@ -16,8 +16,7 @@ import (
 	"github.com/spiceai/spiceai/pkg/pods"
 	"github.com/spiceai/spiceai/pkg/proto/aiengine_pb"
 	"github.com/spiceai/spiceai/pkg/proto/runtime_pb"
-	"github.com/spiceai/spiceai/pkg/tempdir"
-	"github.com/spiceai/spiceai/pkg/util"
+	"golang.org/x/sync/errgroup"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -116,22 +115,15 @@ func ExportPod(podName string, tag string, request *runtime_pb.ExportModel) erro
 	return nil
 }
 
-func ImportPod(request *runtime_pb.ImportModel) error {
+func ImportPod(pod *pods.Pod, request *runtime_pb.ImportModel) error {
 	if !ServerReady() {
 		return fmt.Errorf("not ready")
 	}
 
-	tempDir, err := tempdir.CreateTempDir("import")
-	if err != nil {
-		return err
-	}
-	err = util.ExtractZipFileToDir(request.ArchivePath, tempDir)
-	if err != nil {
-		return err
-	}
+	podDir := filepath.Dir(pod.ManifestPath())
 
 	var init aiengine_pb.InitRequest
-	initBytes, err := os.ReadFile(filepath.Join(tempDir, "init.pb"))
+	initBytes, err := os.ReadFile(filepath.Join(podDir, "init.pb"))
 	if err != nil {
 		return err
 	}
@@ -140,69 +132,28 @@ func ImportPod(request *runtime_pb.ImportModel) error {
 		return err
 	}
 
-	manifestPath := filepath.Join(tempDir, fmt.Sprintf("%s.yaml", request.Pod))
-	pod, err := pods.LoadPodFromManifest(manifestPath)
-	if err != nil {
-		return err
-	}
-
-	pods.CreateOrUpdatePod(pod)
-
 	err = sendInit(&init)
 	if err != nil {
 		return err
 	}
 
-	interpretationsPath := filepath.Join(tempDir, "interpretations.json")
-	if _, err := os.Stat(interpretationsPath); err == nil {
-		interpretationsBytes, err := os.ReadFile(filepath.Join(tempDir, "interpretations.json"))
-		if err != nil {
-			return err
-		}
-		var apiInterpretations []api.Interpretation
-		err = json.Unmarshal(interpretationsBytes, &apiInterpretations)
-		if err != nil {
-			return err
-		}
-		for _, i := range apiInterpretations {
-			interpretation, err := api.NewInterpretationFromApi(&i)
-			if err != nil {
-				return err
-			}
-			err = pod.Interpretations().Add(interpretation)
-			if err != nil {
-				return err
-			}
-		}
-	}
+	errGroup, _ := errgroup.WithContext(context.Background())
 
-	podState := pod.CachedState()
-	err = SendData(pod, podState...)
-	if err != nil {
-		return err
-	}
+	errGroup.Go(func() error {
+		interpretationsPath := filepath.Join(podDir, "interpretations.json")
+		return importInterpretations(pod, interpretationsPath)
+	})
 
-	modelName := fmt.Sprintf("%s.model", init.Pod)
-	modelPath := filepath.Join(tempDir, modelName)
+	errGroup.Go(func() error {
+		podState := pod.CachedState()
+		return SendData(pod, podState...)
+	})
 
-	importRequest := &aiengine_pb.ImportModelRequest{
-		Pod:        request.Pod,
-		Tag:        request.Tag,
-		ImportPath: modelPath,
-	}
+	errGroup.Go(func() error {
+		return importModel(pod, request.Tag)
+	})
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	response, err := aiengineClient.ImportModel(ctx, importRequest)
-	if err != nil {
-		return err
-	}
-
-	if response.Error {
-		return fmt.Errorf("%s: %s", response.Result, response.Message)
-	}
-
-	return nil
+	return errGroup.Wait()
 }
 
 func addBytesAsFileToZip(zipWriter *zip.Writer, fileContent []byte, filename string) error {

@@ -15,6 +15,7 @@ import (
 	"github.com/spiceai/spiceai/pkg/api"
 	"github.com/spiceai/spiceai/pkg/dashboard"
 	"github.com/spiceai/spiceai/pkg/dataspace"
+	"github.com/spiceai/spiceai/pkg/environment"
 	"github.com/spiceai/spiceai/pkg/flights"
 	"github.com/spiceai/spiceai/pkg/loggers"
 	"github.com/spiceai/spiceai/pkg/pods"
@@ -452,12 +453,7 @@ func apiPostImportHandler(ctx *fasthttp.RequestCtx) {
 		tag = "latest"
 	}
 
-	podParam := ctx.UserValue("pod").(string)
-	pod := pods.GetPod(podParam)
-	if pod == nil {
-		ctx.Response.SetStatusCode(404)
-		return
-	}
+	podName := ctx.UserValue("pod").(string)
 
 	var importRequest runtime_pb.ImportModel
 	err := json.Unmarshal(ctx.Request.Body(), &importRequest)
@@ -467,12 +463,26 @@ func apiPostImportHandler(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	importRequest.Pod = pod.Name
+	importRequest.Pod = podName
 	importRequest.Tag = tag.(string)
 
-	err = aiengine.ImportPod(&importRequest)
+	pod, err := pods.ImportPod(importRequest.Pod, importRequest.ArchivePath)
+	if err != nil {
+		ctx.Response.SetStatusCode(500)
+		ctx.Response.SetBodyString(err.Error())
+		return
+	}
+
+	err = aiengine.ImportPod(pod, &importRequest)
 	if err != nil {
 		ctx.Response.SetStatusCode(400)
+		ctx.Response.SetBodyString(err.Error())
+		return
+	}
+
+	err = environment.InitPodDataConnector(pod)
+	if err != nil {
+		ctx.Response.SetStatusCode(500)
 		ctx.Response.SetBodyString(err.Error())
 		return
 	}

@@ -232,13 +232,13 @@ func (r *runtimeServer) internalGet(url string, data interface{}) error {
 		return err
 	}
 
-	if resp.StatusCode >= 400 {
-		return fmt.Errorf("unexpected status: %s", resp.Status)
-	}
-
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return err
+	}
+
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("unexpected status: %s\nbody:%s", resp.Status, body)
 	}
 
 	err = json.Unmarshal(body, &data)
