@@ -134,7 +134,7 @@ func (pod *Pod) CachedCsv() string {
 			}
 		}
 
-		stateCsv, _ := observations.GetCsv(validFieldNames, state.Observations(), 0)
+		stateCsv := observations.GetCsv(validFieldNames, state.Observations())
 		csv.WriteString(stateCsv)
 	}
 	return csv.String()
