@@ -24,10 +24,6 @@ func GetCsv(headers []string, observations []Observation, previewLines int) (str
 			}
 		}
 
-		for _, tag := range o.Tags {
-
-		}
-
 		csv.WriteString("\n")
 		if previewLines > 0 && (i+1 == previewLines || (previewLines >= i && i+1 == len(observations))) {
 			csvPreview = csv.String()
