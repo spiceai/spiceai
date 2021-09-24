@@ -57,7 +57,7 @@ func SendData(pod *pods.Pod, podState ...*state.State) error {
 		}
 
 		fmt.Println(aurora.BrightMagenta(fmt.Sprintf("Sending data %d", len(addDataRequest.CsvData))))
-		ctx, cancel := context.WithTimeout(context.Background(), 60 * time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
 		response, err := aiengineClient.AddData(ctx, addDataRequest)
 		if err != nil {

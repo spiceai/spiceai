@@ -1,6 +1,7 @@
 package e2e
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -30,7 +31,7 @@ var (
 	cliClient          *cli
 	runtime            *runtimeServer
 	snapshotter        *cupaloy.Config
-	testPods           = []string{"test/customprocessor@0.1.0"}
+	testPods           = []string{"test/Trader@0.3.1", "test/customprocessor@0.1.0"}
 )
 
 func TestMain(m *testing.M) {
@@ -115,6 +116,39 @@ func TestMain(m *testing.M) {
 	}
 
 	os.Exit(testCode)
+}
+
+func TestPods(t *testing.T) {
+	if !shouldRunTest {
+		t.Skip("Specify '-e2e' to run e2e tests")
+		return
+	}
+
+	err := runtime.startRuntime()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() {
+		err := runtime.shutdown()
+		if err != nil {
+			log.Fatalln(err.Error())
+		}
+	})
+
+	observation, err := runtime.getPods()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var pods []map[string]string
+	err = json.Unmarshal([]byte(observation), &pods)
+	if err != nil {
+	}
+
+	assert.Len(t, pods, 2)
+	
+	snapshotter.SnapshotT(t, pods[0]["name"], pods[1]["name"])
 }
 
 func TestObservations(t *testing.T) {
