@@ -9,6 +9,7 @@ import (
 
 	"github.com/logrusorgru/aurora"
 	"github.com/spiceai/spiceai/pkg/context"
+	"github.com/spiceai/spiceai/pkg/tempdir"
 	"github.com/spiceai/spiceai/pkg/util"
 )
 
@@ -122,6 +123,27 @@ func LoadPodFromManifest(manifestPath string) (*Pod, error) {
 			return existingPod, nil
 		}
 	}
+
+	return pod, nil
+}
+
+func ImportPod(podName string, archivePath string) (*Pod, error) {
+	tempDir, err := tempdir.CreateTempDir("import")
+	if err != nil {
+		return nil, err
+	}
+
+	if err = util.ExtractZipFileToDir(archivePath, tempDir); err != nil {
+		return nil, err
+	}
+
+	manifestPath := filepath.Join(tempDir, fmt.Sprintf("%s.yaml", podName))
+	pod, err := LoadPodFromManifest(manifestPath)
+	if err != nil {
+		return nil, err
+	}
+
+	CreateOrUpdatePod(pod)
 
 	return pod, nil
 }

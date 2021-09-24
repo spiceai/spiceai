@@ -10,23 +10,16 @@ import (
 	"github.com/spf13/viper"
 	"github.com/spiceai/spiceai/pkg/config"
 	"github.com/spiceai/spiceai/pkg/context"
-	"github.com/spiceai/spiceai/pkg/pods"
 	"github.com/spiceai/spiceai/pkg/proto/runtime_pb"
 	"github.com/spiceai/spiceai/pkg/util"
 )
 
 type RuntimeClient struct {
 	runtimeConfig *config.SpiceConfiguration
-	pod           *pods.Pod
 	serverBaseUrl string
 }
 
 func NewRuntimeClient(podName string) (*RuntimeClient, error) {
-	pod, err := pods.FindPod(podName)
-	if err != nil {
-		return nil, err
-	}
-
 	v := viper.New()
 	appDir := context.CurrentContext().AppDir()
 	runtimeConfig, err := config.LoadRuntimeConfiguration(v, appDir)
@@ -38,12 +31,11 @@ func NewRuntimeClient(podName string) (*RuntimeClient, error) {
 
 	return &RuntimeClient{
 		runtimeConfig: runtimeConfig,
-		pod:           pod,
 		serverBaseUrl: serverBaseUrl,
 	}, nil
 }
 
-func (r *RuntimeClient) ExportModel(directory string, filename string, tag string) error {
+func (r *RuntimeClient) ExportModel(podName string, directory string, filename string, tag string) error {
 	err := util.IsRuntimeServerHealthy(r.serverBaseUrl, http.DefaultClient)
 	if err != nil {
 		return fmt.Errorf("failed to reach %s. is the spice runtime running? %w", r.serverBaseUrl, err)
@@ -59,7 +51,7 @@ func (r *RuntimeClient) ExportModel(directory string, filename string, tag strin
 		return err
 	}
 
-	exportModelUrl := fmt.Sprintf("%s/api/v0.1/pods/%s/models/%s/export", r.serverBaseUrl, r.pod.Name, tag)
+	exportModelUrl := fmt.Sprintf("%s/api/v0.1/pods/%s/models/%s/export", r.serverBaseUrl, podName, tag)
 	response, err := http.DefaultClient.Post(exportModelUrl, "application/json", bytes.NewReader(exportRequestBytes))
 	if err != nil {
 		return nil
@@ -76,7 +68,7 @@ func (r *RuntimeClient) ExportModel(directory string, filename string, tag strin
 	return nil
 }
 
-func (r *RuntimeClient) ImportModel(archivePath string, tag string) error {
+func (r *RuntimeClient) ImportModel(podName string, archivePath string, tag string) error {
 	err := util.IsRuntimeServerHealthy(r.serverBaseUrl, http.DefaultClient)
 	if err != nil {
 		return fmt.Errorf("failed to reach %s. is the spice runtime running? %w", r.serverBaseUrl, err)
@@ -85,7 +77,7 @@ func (r *RuntimeClient) ImportModel(archivePath string, tag string) error {
 	importRequest := &runtime_pb.ImportModel{
 		ArchivePath: archivePath,
 		Tag:         tag,
-		Pod:         r.pod.Name,
+		Pod:         podName,
 	}
 
 	importRequestBytes, err := json.Marshal(&importRequest)
@@ -93,7 +85,7 @@ func (r *RuntimeClient) ImportModel(archivePath string, tag string) error {
 		return err
 	}
 
-	importModelUrl := fmt.Sprintf("%s/api/v0.1/pods/%s/models/%s/import", r.serverBaseUrl, r.pod.Name, tag)
+	importModelUrl := fmt.Sprintf("%s/api/v0.1/pods/%s/models/%s/import", r.serverBaseUrl, podName, tag)
 	response, err := http.DefaultClient.Post(importModelUrl, "application/json", bytes.NewReader(importRequestBytes))
 	if err != nil {
 		return nil
@@ -110,13 +102,13 @@ func (r *RuntimeClient) ImportModel(archivePath string, tag string) error {
 	return nil
 }
 
-func (r *RuntimeClient) StartTraining() error {
+func (r *RuntimeClient) StartTraining(podName string) error {
 	err := util.IsRuntimeServerHealthy(r.serverBaseUrl, http.DefaultClient)
 	if err != nil {
 		return fmt.Errorf("failed to reach %s. is the spice runtime running? %w", r.serverBaseUrl, err)
 	}
 
-	trainUrl := fmt.Sprintf("%s/api/v0.1/pods/%s/train", r.serverBaseUrl, r.pod.Name)
+	trainUrl := fmt.Sprintf("%s/api/v0.1/pods/%s/train", r.serverBaseUrl, podName)
 	response, err := http.DefaultClient.Post(trainUrl, "application/json", nil)
 	if err != nil {
 		return fmt.Errorf("failed to start training: %w", err)

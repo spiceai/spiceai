@@ -54,7 +54,9 @@ func SendData(pod *pods.Pod, podState ...*state.State) error {
 			CsvData: csv.String(),
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		zaplog.Sugar().Debug(aurora.BrightMagenta(fmt.Sprintf("Sending data %d", len(addDataRequest.CsvData))))
+
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
 		response, err := aiengineClient.AddData(ctx, addDataRequest)
 		if err != nil {
@@ -62,7 +64,7 @@ func SendData(pod *pods.Pod, podState ...*state.State) error {
 		}
 
 		if response.Error {
-			return fmt.Errorf("failed to post new data to pod %s: %s", pod.Name, response.Result)
+			return fmt.Errorf("failed to post new data to pod %s: %s", pod.Name, response.Message)
 		}
 
 		s.Sent()

@@ -17,34 +17,52 @@ import (
 )
 
 type runtimeServer struct {
-	baseUrl          string
-	runtimePath      string
-	workingDirectory string
-	cli              *cli
-	context          string
+	baseUrl            string
+	shouldStartRuntime bool
+	runtimePath        string
+	workingDirectory   string
+	cli                *cli
+	context            string
+	cmd                *exec.Cmd
 }
 
-func (r *runtimeServer) startRuntime() (*exec.Cmd, error) {
-	var runtimeCmd *exec.Cmd
+func (r *runtimeServer) startRuntime() error {
+	if !r.shouldStartRuntime {
+		return nil
+	}
+
 	var err error
 
 	if r.context == "docker" {
-		runtimeCmd, err = r.startDockerRuntime()
+		r.cmd, err = r.startDockerRuntime()
 	} else {
-		runtimeCmd, err = r.startMetalRuntime()
+		r.cmd, err = r.startMetalRuntime()
 	}
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	err = r.waitForServerHealthy()
 	if err != nil {
-		return nil, err
+		return err
 	}
 
-	time.Sleep(1 * time.Second)
+	return nil
+}
 
-	return runtimeCmd, nil
+func (r *runtimeServer) shutdown() error {
+	if r.cmd != nil {
+		err := r.cmd.Process.Signal(os.Interrupt)
+		if err != nil {
+			return err
+		}
+		err = r.cmd.Wait()
+		if err != nil {
+			return err
+		}
+		r.cmd = nil
+	}
+	return nil
 }
 
 func (r *runtimeServer) startDockerRuntime() (*exec.Cmd, error) {
@@ -106,6 +124,25 @@ func (r *runtimeServer) postDataspace(podName string, dataspaceFrom string, data
 	}
 
 	return nil
+}
+
+func (r *runtimeServer) getPods() (string, error) {
+	url := fmt.Sprintf("%s/api/v0.1/pods", r.baseUrl)
+	resp, err := http.Get(url)
+	if err != nil {
+		return "", err
+	}
+
+	if resp.StatusCode >= 400 {
+		return "", fmt.Errorf("unexpected status: %s", resp.Status)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	return string(body), nil
 }
 
 func (r *runtimeServer) getObservations(podName string) (string, error) {
@@ -195,13 +232,13 @@ func (r *runtimeServer) internalGet(url string, data interface{}) error {
 		return err
 	}
 
-	if resp.StatusCode >= 400 {
-		return fmt.Errorf("unexpected status: %s", resp.Status)
-	}
-
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return err
+	}
+
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("unexpected status: %s\nbody:%s", resp.Status, body)
 	}
 
 	err = json.Unmarshal(body, &data)
