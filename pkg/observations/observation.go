@@ -17,6 +17,12 @@ func GetCsv(headers []string, observations []Observation) string {
 		csv.WriteString(strconv.FormatInt(o.Time, 10))
 		for _, f := range headers {
 			csv.WriteString(",")
+
+			if f == "_tags" {
+				csv.WriteString(strings.Join(o.Tags, " "))
+				continue
+			}
+
 			val, ok := o.Data[f]
 			if ok {
 				csv.WriteString(strconv.FormatFloat(val, 'f', -1, 64))

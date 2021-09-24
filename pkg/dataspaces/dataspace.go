@@ -111,9 +111,20 @@ func (ds *Dataspace) FieldNameMap() map[string]string {
 
 func (ds *Dataspace) FieldNames() []string {
 	fieldNames := make([]string, len(ds.DataspaceSpec.Fields))
+	hasTags := false
 	for i, v := range ds.DataspaceSpec.Fields {
+		if v.Type == "tag" {
+			hasTags = true
+			continue
+		}
+
 		fieldNames[i] = v.Name
 	}
+
+	if hasTags {
+		fieldNames = append(fieldNames, "_tags")
+	}
+
 	return fieldNames
 }
 
