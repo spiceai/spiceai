@@ -17,6 +17,8 @@ type State struct {
 	observationsMutex  sync.RWMutex
 }
 
+type StateHandler func(state *State, metadata map[string]string) error
+
 func NewState(path string, fieldNames []string, observations []observations.Observation) *State {
 	fields := make([]string, len(fieldNames))
 	for i, name := range fieldNames {

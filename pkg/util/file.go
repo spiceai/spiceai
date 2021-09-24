@@ -142,3 +142,17 @@ func ReplaceEnvVariablesFromPath(filePath string, envVarPrefix string) ([]byte, 
 func MakeFileExecutable(filepath string) error {
 	return os.Chmod(filepath, 0777)
 }
+
+func CopyFile(src string, dst string) error {
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+
+	perm, err := MkDirAllInheritPerm(filepath.Dir(dst))
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(dst, data, perm)
+}

@@ -3,6 +3,7 @@ package aiengine
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -44,18 +45,18 @@ func SendData(pod *pods.Pod, podState ...*state.State) error {
 			continue
 		}
 
-		csvChunk, csvPreview := observations.GetCsv(s.FieldNames(), observationData, 5)
+		csvPreview := getData(&csv, pod.Epoch(), s.FieldNames(), observationData, 5)
 
 		zaplog.Sugar().Debugf("Posting data to AI engine:\n%s", aurora.BrightYellow(fmt.Sprintf("%s%s...\n%d observations posted", csv.String(), csvPreview, len(observationData))))
-
-		csv.WriteString(csvChunk)
 
 		addDataRequest := &aiengine_pb.AddDataRequest{
 			Pod:     pod.Name,
 			CsvData: csv.String(),
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		zaplog.Sugar().Debug(aurora.BrightMagenta(fmt.Sprintf("Sending data %d", len(addDataRequest.CsvData))))
+
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
 		response, err := aiengineClient.AddData(ctx, addDataRequest)
 		if err != nil {
@@ -63,11 +64,34 @@ func SendData(pod *pods.Pod, podState ...*state.State) error {
 		}
 
 		if response.Error {
-			return fmt.Errorf("failed to post new data to pod %s: %s", pod.Name, response.Result)
+			return fmt.Errorf("failed to post new data to pod %s: %s", pod.Name, response.Message)
 		}
 
 		s.Sent()
 	}
 
 	return err
+}
+
+func getData(csv *strings.Builder, epoch time.Time, headers []string, observations []observations.Observation, previewLines int) string {
+	epochTime := epoch.Unix()
+	var csvPreview string
+	for i, o := range observations {
+		if o.Time < epochTime {
+			continue
+		}
+		csv.WriteString(strconv.FormatInt(o.Time, 10))
+		for _, f := range headers {
+			csv.WriteString(",")
+			val, ok := o.Data[f]
+			if ok {
+				csv.WriteString(strconv.FormatFloat(val, 'f', -1, 64))
+			}
+		}
+		csv.WriteString("\n")
+		if previewLines > 0 && (i+1 == previewLines || (previewLines >= i && i+1 == len(observations))) {
+			csvPreview = csv.String()
+		}
+	}
+	return csvPreview
 }
