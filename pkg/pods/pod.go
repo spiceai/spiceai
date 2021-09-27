@@ -117,10 +117,8 @@ func (pod *Pod) CachedCsv() string {
 	fieldNames := pod.FieldNames()
 	tagPathMap := pod.TagPathMap()
 
-	headers := make([]string, len(fieldNames)+len(tagPathMap))
-	for _, fieldName := range fieldNames {
-		headers = append(headers, fieldName)
-	}
+	headers := make([]string, 0, len(fieldNames)+len(tagPathMap))
+	headers = append(headers, fieldNames...)
 	for tagPath := range tagPathMap {
 		headers = append(headers, fmt.Sprintf("%s._tags", tagPath))
 	}
