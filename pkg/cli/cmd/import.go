@@ -64,7 +64,7 @@ spice import --tag latest ./models/trader.spicepod
 			return
 		}
 
-		err = runtimeClient.ImportModel(relativePath, importTag)
+		err = runtimeClient.ImportModel(init.Pod, relativePath, importTag)
 		if err != nil {
 			fmt.Println(err.Error())
 			return

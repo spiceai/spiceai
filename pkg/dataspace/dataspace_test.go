@@ -1,4 +1,4 @@
-package dataspaces
+package dataspace_test
 
 import (
 	"fmt"
@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/spf13/viper"
+	"github.com/spiceai/spiceai/pkg/dataspace"
 	"github.com/spiceai/spiceai/pkg/spec"
 )
 
@@ -51,7 +52,7 @@ func TestDataSource(t *testing.T) {
 // Tests Dataspace creation from DataspaceSpec
 func testNewDataspaceFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 	return func(t *testing.T) {
-		ds, err := NewDataspace(dsSpec)
+		ds, err := dataspace.NewDataspace(dsSpec)
 		if err != nil {
 			t.Error(err)
 		}
@@ -67,7 +68,7 @@ func testNewDataspaceFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 // Tests Actions() getter
 func testActionsFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 	return func(t *testing.T) {
-		ds, err := NewDataspace(dsSpec)
+		ds, err := dataspace.NewDataspace(dsSpec)
 		if err != nil {
 			t.Error(err)
 		}
@@ -94,7 +95,7 @@ func testActionsFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 // Tests Fields() getter
 func testFieldsFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 	return func(t *testing.T) {
-		ds, err := NewDataspace(dsSpec)
+		ds, err := dataspace.NewDataspace(dsSpec)
 		if err != nil {
 			t.Error(err)
 		}
@@ -124,7 +125,7 @@ func testFieldsFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 // Tests FieldNames() getter
 func testFieldNamesFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 	return func(t *testing.T) {
-		ds, err := NewDataspace(dsSpec)
+		ds, err := dataspace.NewDataspace(dsSpec)
 		if err != nil {
 			t.Error(err)
 		}
@@ -154,7 +155,7 @@ func testFieldNamesFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 // Tests ActionNames() getter
 func testActionNamesFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 	return func(t *testing.T) {
-		ds, err := NewDataspace(dsSpec)
+		ds, err := dataspace.NewDataspace(dsSpec)
 		if err != nil {
 			t.Error(err)
 		}
@@ -182,7 +183,7 @@ func testActionNamesFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 // Tests Laws() getter
 func testLawsFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 	return func(t *testing.T) {
-		ds, err := NewDataspace(dsSpec)
+		ds, err := dataspace.NewDataspace(dsSpec)
 		if err != nil {
 			t.Error(err)
 		}

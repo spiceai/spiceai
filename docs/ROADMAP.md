@@ -13,7 +13,6 @@ Spice.ai is still under early development, so there are several gaps and limitat
 - Custom environments are not yet supported
 - Custom visualizations are not yet support
 - Environment and reward function code must be written in Python 3
-- Data Sources are polled/fetched only - will change to push/streaming in v0.2
 - Basic local Pod/Flight monitoring through polling - will move to streaming websockets in v0.2
 - Data Connectors do not yet fully honor period, interval and granularity in all cases
 - Single AI backend only (Tensorflow) - expect to support others like PyTorch and Scikit-learn in v0.3
@@ -31,7 +30,6 @@ Spice.ai is still under early development, so there are several gaps and limitat
 - Pluggable environments
 - Additional AI algorithms (E.g. A3C)
 - Search, index, publish and browse the Spice Rack registry
-- Push/Streaming Data Sources/Connectors
 - Local Pod/Flight monitoring (WebSockets)
 - Custom visualization hooks for DataSources
 

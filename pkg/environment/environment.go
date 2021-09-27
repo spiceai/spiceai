@@ -1,58 +1,33 @@
 package environment
 
 import (
-	"log"
-	"time"
+	"context"
 
 	"github.com/spiceai/spiceai/pkg/aiengine"
 	"github.com/spiceai/spiceai/pkg/pods"
+	"github.com/spiceai/spiceai/pkg/state"
+	"golang.org/x/sync/errgroup"
 )
 
-func StartDataListeners(intervalSecs int) error {
-	_, err := FetchNewData()
+func InitDataConnectors() error {
+	errGroup, _ := errgroup.WithContext(context.Background())
+	for _, pod := range pods.Pods() {
+		p := pod
+		errGroup.Go(func() error {
+			return InitPodDataConnector(p)
+		})
+	}
+	return errGroup.Wait()
+}
+
+func InitPodDataConnector(pod *pods.Pod) error {
+	handler := func(state *state.State, metadata map[string]string) error {
+		return aiengine.SendData(pod, state)
+	}
+	err := pod.InitDataConnectors(handler)
 	if err != nil {
-		log.Println(err)
 		return err
 	}
 
-	// HACKHACK: Polled fetch for now (TODO data sources subscribe with push model)
-	ticker := time.NewTicker(time.Duration(intervalSecs) * time.Second)
-	quit := make(chan struct{})
-	go func() {
-		for {
-			select {
-			case <-ticker.C:
-				{
-					_, err := FetchNewData()
-					if err != nil {
-						log.Println(err)
-						return
-					}
-				}
-			case <-quit:
-				ticker.Stop()
-				return
-			}
-		}
-	}()
-
 	return nil
-}
-
-func FetchNewData() (bool, error) {
-	for _, pod := range pods.Pods() {
-		state, err := pod.State()
-		if err != nil {
-			log.Printf("%v", err)
-			continue
-		}
-
-		err = aiengine.SendData(pod, state...)
-		if err != nil {
-			log.Printf("%v", err)
-			continue
-		}
-	}
-
-	return true, nil
 }

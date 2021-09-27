@@ -9,7 +9,7 @@ all: build docker
 
 .PHONY: build
 build:
-	pushd dashboard && yarn build && cp -rf build ../pkg/dashboard/ && popd
+	pushd dashboard && yarn install && yarn build && cp -rf build ../pkg/dashboard/ && popd
 	pushd cmd/spice && go build . && popd
 	pushd cmd/spiced && go build . && popd
 

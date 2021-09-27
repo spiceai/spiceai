@@ -14,12 +14,12 @@ import (
 	"github.com/spiceai/spiceai/pkg/aiengine"
 	"github.com/spiceai/spiceai/pkg/api"
 	"github.com/spiceai/spiceai/pkg/dashboard"
-	"github.com/spiceai/spiceai/pkg/dataspaces"
+	"github.com/spiceai/spiceai/pkg/dataspace"
+	"github.com/spiceai/spiceai/pkg/environment"
 	"github.com/spiceai/spiceai/pkg/flights"
 	"github.com/spiceai/spiceai/pkg/loggers"
 	"github.com/spiceai/spiceai/pkg/pods"
 	"github.com/spiceai/spiceai/pkg/proto/runtime_pb"
-	"github.com/spiceai/spiceai/pkg/state"
 	"github.com/spiceai/spiceai/pkg/util"
 	"github.com/valyala/fasthttp"
 	"go.uber.org/zap"
@@ -115,10 +115,11 @@ func apiPostDataspaceHandler(ctx *fasthttp.RequestCtx) {
 	dataspaceFrom := ctx.UserValue("dataspace_from").(string)
 	dataspaceName := ctx.UserValue("dataspace_name").(string)
 
-	var selectedDataspace *dataspaces.Dataspace
+	var selectedDataspace *dataspace.Dataspace
 	for _, dataspace := range pod.DataSources() {
 		if dataspace.DataspaceSpec.From == dataspaceFrom && dataspace.DataspaceSpec.Name == dataspaceName {
 			selectedDataspace = dataspace
+			break
 		}
 	}
 
@@ -127,36 +128,12 @@ func apiPostDataspaceHandler(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	dp, err := dataprocessors.NewDataProcessor(selectedDataspace.DataspaceSpec.Data.Processor.Name)
+	_, err := selectedDataspace.ReadData(ctx.Request.Body(), nil)
 	if err != nil {
 		zaplog.Sugar().Error(err)
 		ctx.Response.SetStatusCode(500)
 		return
 	}
-
-	err = dp.Init(nil)
-	if err != nil {
-		zaplog.Sugar().Error(err)
-		ctx.Response.SetStatusCode(500)
-		return
-	}
-
-	_, err = dp.OnData(ctx.Request.Body())
-	if err != nil {
-		zaplog.Sugar().Error(err)
-		ctx.Response.SetStatusCode(500)
-		return
-	}
-
-	observations, err := dp.GetObservations()
-	if err != nil {
-		zaplog.Sugar().Error(err)
-		ctx.Response.SetStatusCode(500)
-		return
-	}
-
-	newState := state.NewState(selectedDataspace.Path(), selectedDataspace.FieldNames(), selectedDataspace.Tags(), observations)
-	selectedDataspace.AddNewState(newState)
 
 	ctx.Response.SetStatusCode(201)
 }
@@ -476,12 +453,7 @@ func apiPostImportHandler(ctx *fasthttp.RequestCtx) {
 		tag = "latest"
 	}
 
-	podParam := ctx.UserValue("pod").(string)
-	pod := pods.GetPod(podParam)
-	if pod == nil {
-		ctx.Response.SetStatusCode(404)
-		return
-	}
+	podName := ctx.UserValue("pod").(string)
 
 	var importRequest runtime_pb.ImportModel
 	err := json.Unmarshal(ctx.Request.Body(), &importRequest)
@@ -491,12 +463,26 @@ func apiPostImportHandler(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	importRequest.Pod = pod.Name
+	importRequest.Pod = podName
 	importRequest.Tag = tag.(string)
 
-	err = aiengine.ImportPod(&importRequest)
+	pod, err := pods.ImportPod(importRequest.Pod, importRequest.ArchivePath)
+	if err != nil {
+		ctx.Response.SetStatusCode(500)
+		ctx.Response.SetBodyString(err.Error())
+		return
+	}
+
+	err = aiengine.ImportPod(pod, &importRequest)
 	if err != nil {
 		ctx.Response.SetStatusCode(400)
+		ctx.Response.SetBodyString(err.Error())
+		return
+	}
+
+	err = environment.InitPodDataConnector(pod)
+	if err != nil {
+		ctx.Response.SetStatusCode(500)
 		ctx.Response.SetBodyString(err.Error())
 		return
 	}

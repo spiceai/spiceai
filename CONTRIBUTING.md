@@ -106,37 +106,49 @@ $ pip install -r requirements/development.txt
 If you are running in GitHub Codespaces or other Ubuntu/Debian environment, you may need to install additional libraries. Do this by running:
 
 ```bash
-make install-codespaces
+ make install-codespaces
+```
+
+### Building the Dashboard
+```bash
+ cd dashboard
+ make
+```
+
+### Run Makefile in Project Root
+This is necessary before building the CLI or Runtime
+```bash
+ make
 ```
 
 ### Building the Spice CLI
 
 ```bash
-$ cd cmd/spice
-$ make
+ cd cmd/spice
+ make
 ```
 
 ### Building the Spice Runtime (spiced)
 
 ```bash
-$ cd cmd/spiced
-$ make
+ cd cmd/spiced
+ make
 ```
 
 ### Running the AI Engine
 
 ```bash
-$ cd ai/src
-$ source venv/bin/activate
-$ python main.py
+ cd ai/src
+ source venv/bin/activate
+ python main.py
 ```
 
 ### Running test suite
 
 ```bash
-$ go test ./...
-$ cd ai/src
-$ python -m unittest discover -s ./tests
+ go test ./...
+ cd ai/src
+ python -m unittest discover -s ./tests
 ```
 
 **Thank You!** - Your contributions to open source, large or small, make projects like this possible. Thank you for taking the time to contribute.

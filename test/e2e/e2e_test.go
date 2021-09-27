@@ -1,11 +1,14 @@
 package e2e
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -20,20 +23,22 @@ const (
 )
 
 var (
-	shouldRunTest    bool
-	spicedContext    string
-	testDir          string
-	repoRoot         string
-	workingDirectory string
-	runtimePath      string
-	cliClient        *cli
-	runtime          *runtimeServer
-	snapshotter      *cupaloy.Config
-	testPods         = []string{"test/Trader@0.3.1", "test/customprocessor@0.1.0"}
+	shouldRunTest      bool
+	shouldStartRuntime bool
+	spicedContext      string
+	testDir            string
+	repoRoot           string
+	workingDirectory   string
+	runtimePath        string
+	cliClient          *cli
+	runtime            *runtimeServer
+	snapshotter        *cupaloy.Config
+	testPods           = []string{"test/Trader@0.3.1", "test/customprocessor@0.1.0"}
 )
 
 func TestMain(m *testing.M) {
 	flag.BoolVar(&shouldRunTest, "e2e", false, "run e2e tests")
+	flag.BoolVar(&shouldStartRuntime, "startruntime", true, "start runtime")
 	flag.StringVar(&spicedContext, "context", "docker", "specify --context <context> to spice CLI for spiced")
 	flag.Parse()
 	if !shouldRunTest {
@@ -89,11 +94,12 @@ func TestMain(m *testing.M) {
 	}
 
 	runtime = &runtimeServer{
-		baseUrl:          BaseUrl,
-		runtimePath:      runtimePath,
-		workingDirectory: testDir,
-		cli:              cliClient,
-		context:          spicedContext,
+		baseUrl:            BaseUrl,
+		shouldStartRuntime: shouldStartRuntime,
+		runtimePath:        runtimePath,
+		workingDirectory:   testDir,
+		cli:                cliClient,
+		context:            spicedContext,
 	}
 
 	for _, testPod := range testPods {
@@ -114,25 +120,59 @@ func TestMain(m *testing.M) {
 	os.Exit(testCode)
 }
 
+func TestPods(t *testing.T) {
+	if !shouldRunTest {
+		t.Skip("Specify '-e2e' to run e2e tests")
+		return
+	}
+
+	err := runtime.startRuntime()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() {
+		err := runtime.shutdown()
+		if err != nil {
+			log.Fatalln(err.Error())
+		}
+	})
+
+	observation, err := runtime.getPods()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var pods []map[string]string
+	err = json.Unmarshal([]byte(observation), &pods)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	assert.Len(t, pods, 2)
+
+	sort.SliceStable(pods, func(i, j int) bool {
+		return strings.Compare(pods[i]["name"], pods[j]["name"]) == -1
+	})
+
+	snapshotter.SnapshotT(t, pods[0]["name"], pods[1]["name"])
+}
+
 func TestObservations(t *testing.T) {
 	if !shouldRunTest {
 		t.Skip("Specify '-e2e' to run e2e tests")
 		return
 	}
 
-	runtimeCmd, err := runtime.startRuntime()
+	err := runtime.startRuntime()
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	t.Cleanup(func() {
-		err = runtimeCmd.Process.Signal(os.Interrupt)
+		err := runtime.shutdown()
 		if err != nil {
-			t.Fatal(err)
-		}
-		err = runtimeCmd.Wait()
-		if err != nil {
-			t.Fatal(err)
+			log.Fatalln(err.Error())
 		}
 	})
 
@@ -175,19 +215,15 @@ func TestDataspaceData(t *testing.T) {
 		return
 	}
 
-	runtimeCmd, err := runtime.startRuntime()
+	err := runtime.startRuntime()
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	t.Cleanup(func() {
-		err = runtimeCmd.Process.Signal(os.Interrupt)
+		err := runtime.shutdown()
 		if err != nil {
-			t.Fatal(err)
-		}
-		err = runtimeCmd.Wait()
-		if err != nil {
-			t.Fatal(err)
+			log.Fatalln(err.Error())
 		}
 	})
 
@@ -252,19 +288,15 @@ func TestInterpretations(t *testing.T) {
 		return
 	}
 
-	runtimeCmd, err := runtime.startRuntime()
+	err := runtime.startRuntime()
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	t.Cleanup(func() {
-		err = runtimeCmd.Process.Signal(os.Interrupt)
+		err := runtime.shutdown()
 		if err != nil {
-			t.Fatal(err)
-		}
-		err = runtimeCmd.Wait()
-		if err != nil {
-			t.Fatal(err)
+			log.Fatalln(err.Error())
 		}
 	})
 
@@ -306,19 +338,15 @@ func TestTrainingOutput(t *testing.T) {
 		return
 	}
 
-	runtimeCmd, err := runtime.startRuntime()
+	err := runtime.startRuntime()
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	t.Cleanup(func() {
-		err = runtimeCmd.Process.Signal(os.Interrupt)
+		err := runtime.shutdown()
 		if err != nil {
-			t.Fatal(err)
-		}
-		err = runtimeCmd.Wait()
-		if err != nil {
-			t.Fatal(err)
+			log.Fatalln(err.Error())
 		}
 	})
 
@@ -362,11 +390,11 @@ func TestImportExport(t *testing.T) {
 		return
 	}
 
-	runtimeCmd, err := runtime.startRuntime()
+	err := runtime.startRuntime()
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer runtimeCmd.Process.Kill() //nolint:errcheck
+	defer runtime.shutdown() //nolint:errcheck
 
 	err = cliClient.runCliCmd("train", "trader", "--context", spicedContext)
 	if err != nil {
@@ -397,7 +425,7 @@ func TestImportExport(t *testing.T) {
 
 	_, err = os.Stat(filepath.Join(testDir, "trader.spicepod"))
 	if err != nil {
-		t.Fatal(fmt.Errorf("didn't see expected exported spicedpod: %w", err))
+		t.Fatal(fmt.Errorf("didn't see expected exported spicepod: %w", err))
 	}
 
 	err = cliClient.runCliCmd("import", "trader.spicepod")
@@ -430,20 +458,16 @@ func TestImportExport(t *testing.T) {
 	}
 
 	// Now let's shutdown the runtime and restart it and import our exported pod
-	err = runtimeCmd.Process.Signal(os.Interrupt)
+	err = runtime.shutdown()
 	if err != nil {
-		t.Fatal(err)
-	}
-	err = runtimeCmd.Wait()
-	if err != nil {
-		t.Fatal(err)
+		log.Fatalln(err.Error())
 	}
 
-	runtimeCmd, err = runtime.startRuntime()
+	err = runtime.startRuntime()
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer runtimeCmd.Process.Kill() //nolint:errcheck
+	defer runtime.shutdown() //nolint:errcheck
 
 	err = cliClient.runCliCmd("import", "trader.spicepod")
 	if err != nil {
@@ -486,11 +510,7 @@ func TestImportExport(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = runtimeCmd.Process.Signal(os.Interrupt)
-	if err != nil {
-		t.Fatal(err)
-	}
-	err = runtimeCmd.Wait()
+	err = runtime.shutdown()
 	if err != nil {
 		t.Fatal(err)
 	}

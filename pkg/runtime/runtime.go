@@ -81,7 +81,7 @@ func SingleRun(manifestPath string) error {
 		return err
 	}
 
-	err = environment.StartDataListeners(15)
+	err = environment.InitDataConnectors()
 	if err != nil {
 		return err
 	}
@@ -129,7 +129,7 @@ func Run() error {
 		return err
 	}
 
-	err = environment.StartDataListeners(15)
+	err = environment.InitDataConnectors()
 	if err != nil {
 		return err
 	}
