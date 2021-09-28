@@ -450,8 +450,8 @@ func loadPod(podPath string, hash string) (*Pod, error) {
 			fieldNames = append(fieldNames, fieldName)
 		}
 
-		tagPathMap[ds.Path()] = append(tagPathMap[ds.Path()], ds.Tags()...)
-		if _, ok := tagPathMap[ds.Path()]; ok {
+		if len(ds.Tags()) > 0 {
+			tagPathMap[ds.Path()] = append(tagPathMap[ds.Path()], ds.Tags()...)
 			sort.Strings(tagPathMap[ds.Path()])
 		}
 
