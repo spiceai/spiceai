@@ -19,9 +19,26 @@ import (
 var snapshotter = cupaloy.New(cupaloy.SnapshotSubdirectory("../../test/assets/snapshots/pods"))
 
 func TestPod(t *testing.T) {
-	manifestsToTest := []string{"trader.yaml", "trader-infer.yaml"}
+	type TestPodParams struct {
+		LocalStateTest bool
+		ExpectedHash   string
+	}
+	manifestsToTest := map[string]*TestPodParams{
+		"trader.yaml": {
+			LocalStateTest: true,
+			ExpectedHash:   "64a15d213ebe84486fc68e209ca5d160",
+		},
+		"trader-infer.yaml": {
+			LocalStateTest: true,
+			ExpectedHash:   "d0246ffda395945f070cdf2aa60645a7",
+		},
+		"event-tags.yaml": {
+			LocalStateTest: false,
+			ExpectedHash:   "9498eef0628a6a128b2a91797e264b6b",
+		},
+	}
 
-	for _, manifestToTest := range manifestsToTest {
+	for manifestToTest, testParams := range manifestsToTest {
 		manifestPath := filepath.Join("../../test/assets/pods/manifests", manifestToTest)
 
 		pod, err := LoadPodFromManifest(manifestPath)
@@ -30,32 +47,29 @@ func TestPod(t *testing.T) {
 			return
 		}
 
-		t.Run(fmt.Sprintf("Base Properties - %s", manifestToTest), testBasePropertiesFunc(pod))
+		t.Run(fmt.Sprintf("Base Properties - %s", manifestToTest), testBasePropertiesFunc(pod, testParams.ExpectedHash))
 		t.Run(fmt.Sprintf("FieldNames() - %s", manifestToTest), testFieldNamesFunc(pod))
 		t.Run(fmt.Sprintf("Rewards() - %s", manifestToTest), testRewardsFunc(pod))
 		t.Run(fmt.Sprintf("Actions() - %s", manifestToTest), testActionsFunc(pod))
 		t.Run(fmt.Sprintf("CachedCsv() - %s", manifestToTest), testCachedCsvFunc(pod))
-		t.Run(fmt.Sprintf("AddLocalState() - %s", manifestToTest), testAddLocalStateFunc(pod))
-		t.Run(fmt.Sprintf("AddLocalState()/CachedCsv() - %s", manifestToTest), testAddLocalStateCachedCsvFunc(pod))
+		t.Run(fmt.Sprintf("TagPathMap() - %s", manifestToTest), testTagPathMap(pod))
+
+		if testParams.LocalStateTest {
+			t.Run(fmt.Sprintf("AddLocalState() - %s", manifestToTest), testAddLocalStateFunc(pod))
+			t.Run(fmt.Sprintf("AddLocalState()/CachedCsv() - %s", manifestToTest), testAddLocalStateCachedCsvFunc(pod))
+		}
 	}
 }
 
 // Tests base properties
-func testBasePropertiesFunc(pod *Pod) func(*testing.T) {
+func testBasePropertiesFunc(pod *Pod, expectedHash string) func(*testing.T) {
 	return func(t *testing.T) {
 
 		actual := pod.Hash()
 
 		var expected string
 
-		switch pod.Name {
-		case "trader":
-			expected = "64a15d213ebe84486fc68e209ca5d160"
-		case "trader-infer":
-			expected = "d0246ffda395945f070cdf2aa60645a7"
-		}
-
-		assert.Equal(t, expected, actual, "invalid pod.Hash()")
+		assert.Equal(t, expectedHash, actual, "invalid pod.Hash()")
 
 		actual = pod.ManifestPath()
 
@@ -64,6 +78,8 @@ func testBasePropertiesFunc(pod *Pod) func(*testing.T) {
 			expected = "../../test/assets/pods/manifests/trader.yaml"
 		case "trader-infer":
 			expected = "../../test/assets/pods/manifests/trader-infer.yaml"
+		case "event-tags":
+			expected = "../../test/assets/pods/manifests/event-tags.yaml"
 		}
 
 		assert.Equal(t, expected, actual, "invalid pod.ManifestPath()")
@@ -76,6 +92,8 @@ func testBasePropertiesFunc(pod *Pod) func(*testing.T) {
 		case "trader-infer":
 			actual = actual[:8] // Reduce precision to test
 			expected = fmt.Sprintf("%d", time.Now().Add(-pod.Period()).Unix())[:8]
+		case "event-tags":
+			expected = "1610057400"
 		}
 
 		assert.Equal(t, expected, actual, "invalid pod.Epoch()")
@@ -87,6 +105,8 @@ func testBasePropertiesFunc(pod *Pod) func(*testing.T) {
 			expected = "17h0m0s"
 		case "trader-infer":
 			expected = "72h0m0s"
+		case "event-tags":
+			expected = "24h0m0s"
 		}
 
 		assert.Equal(t, expected, actual, "invalid pod.Period()")
@@ -98,6 +118,8 @@ func testBasePropertiesFunc(pod *Pod) func(*testing.T) {
 			expected = "17m0s"
 		case "trader-infer":
 			expected = "1m0s"
+		case "event-tags":
+			expected = "10m0s"
 		}
 
 		assert.Equal(t, expected, actual, "invalid pod.Interval()")
@@ -109,6 +131,8 @@ func testBasePropertiesFunc(pod *Pod) func(*testing.T) {
 			expected = "17s"
 		case "trader-infer":
 			expected = "10s"
+		case "event-tags":
+			expected = "30s"
 		}
 
 		assert.Equal(t, expected, actual, "invalid pod.Granularity()")
@@ -130,6 +154,14 @@ func testFieldNamesFunc(pod *Pod) func(*testing.T) {
 				"coinbase.btcusd.close",
 				"local.portfolio.btc_balance",
 				"local.portfolio.usd_balance",
+			}
+		case "event-tags":
+			expected = []string{
+				"event.data.eventId",
+				"event.data.height",
+				"event.data.rating",
+				"event.data.speed",
+				"event.data.target",
 			}
 		}
 
@@ -156,6 +188,11 @@ func testRewardsFunc(pod *Pod) func(*testing.T) {
 				"buy":  "reward = 1",
 				"sell": "reward = 1",
 			}
+		case "event-tags":
+			expected = map[string]string{
+				"action_one": "reward = 1",
+				"action_two": "reward = 1",
+			}
 		}
 
 		assert.Equal(t, expected, actual, "invalid pod.Rewards()")
@@ -181,6 +218,8 @@ func testActionsFunc(pod *Pod) func(*testing.T) {
 				"buy":  "local.portfolio.usd_balance -= args.price\nlocal.portfolio.btc_balance += 1",
 				"sell": "local.portfolio.usd_balance += args.price\nlocal.portfolio.btc_balance -= 1",
 			}
+		case "event-tags":
+			expected = map[string]string{"action_one": "", "action_two": ""}
 		default:
 			t.Errorf("invalid pod %s", pod.Name)
 		}
@@ -207,6 +246,23 @@ func testCachedCsvFunc(pod *Pod) func(*testing.T) {
 		actual := pod.CachedCsv()
 
 		snapshotter.SnapshotT(t, actual)
+	}
+}
+
+// Tests TagPathMap()
+func testTagPathMap(pod *Pod) func(*testing.T) {
+	return func(t *testing.T) {
+		actualMap := pod.TagPathMap()
+
+		var expected map[string][]string
+		switch pod.Name {
+		case "event-tags":
+			expected = map[string][]string{"event.data": {"tagA", "tagB", "tagC"}}
+		default:
+			expected = make(map[string][]string)
+		}
+
+		assert.Equal(t, expected, actualMap)
 	}
 }
 

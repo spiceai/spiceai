@@ -95,6 +95,9 @@ func (ds *Dataspace) Fields() map[string]float64 {
 	fqFieldInitializers := make(map[string]float64)
 	fqFieldNames := ds.FieldNameMap()
 	for _, field := range ds.DataspaceSpec.Fields {
+		if field.Type == "tag" {
+			continue
+		}
 		var initialValue float64 = 0
 		if field.Initializer != nil {
 			initialValue = *field.Initializer
@@ -108,6 +111,9 @@ func (ds *Dataspace) Fields() map[string]float64 {
 func (ds *Dataspace) FieldNameMap() map[string]string {
 	fieldNames := make(map[string]string, len(ds.DataspaceSpec.Fields))
 	for _, v := range ds.DataspaceSpec.Fields {
+		if v.Type == "tag" {
+			continue
+		}
 		fqname := fmt.Sprintf("%s.%s.%s", ds.From, ds.DataspaceSpec.Name, v.Name)
 		fieldNames[v.Name] = fqname
 	}
@@ -117,9 +123,25 @@ func (ds *Dataspace) FieldNameMap() map[string]string {
 func (ds *Dataspace) FieldNames() []string {
 	fieldNames := make([]string, len(ds.DataspaceSpec.Fields))
 	for i, v := range ds.DataspaceSpec.Fields {
+		if v.Type == "tag" {
+			continue
+		}
 		fieldNames[i] = v.Name
 	}
+
 	return fieldNames
+}
+
+// Returns the local tag name (not fully-qualified)
+func (ds *Dataspace) Tags() []string {
+	tags := make([]string, 0)
+	for _, v := range ds.DataspaceSpec.Fields {
+		if v.Type == "tag" {
+			tags = append(tags, v.Name)
+		}
+	}
+
+	return tags
 }
 
 func (ds *Dataspace) ActionNames() map[string]string {
@@ -199,7 +221,7 @@ func (ds *Dataspace) ReadData(data []byte, metadata map[string]string) ([]byte, 
 		return nil, err
 	}
 
-	newState := state.NewState(ds.Path(), ds.FieldNames(), observations)
+	newState := state.NewState(ds.Path(), ds.FieldNames(), ds.Tags(), observations)
 	err = ds.AddNewState(newState, metadata)
 	if err != nil {
 		return nil, err

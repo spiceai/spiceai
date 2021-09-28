@@ -11,17 +11,32 @@ type Observation struct {
 	Tags []string
 }
 
-func GetCsv(headers []string, observations []Observation) string {
+func GetCsv(headers []string, validTags []string, observations []Observation) string {
 	csv := strings.Builder{}
 	for _, o := range observations {
 		csv.WriteString(strconv.FormatInt(o.Time, 10))
 		for _, f := range headers {
 			csv.WriteString(",")
+
+			if f == "_tags" {
+				var observationValidTags []string
+				for _, observationTag := range o.Tags {
+					for _, validTag := range validTags {
+						if validTag == observationTag {
+							observationValidTags = append(observationValidTags, observationTag)
+						}
+					}
+				}
+				csv.WriteString(strings.Join(observationValidTags, " "))
+				continue
+			}
+
 			val, ok := o.Data[f]
 			if ok {
 				csv.WriteString(strconv.FormatFloat(val, 'f', -1, 64))
 			}
 		}
+
 		csv.WriteString("\n")
 	}
 	return csv.String()

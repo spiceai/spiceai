@@ -17,9 +17,10 @@ func testNewState() func(*testing.T) {
 	return func(t *testing.T) {
 		expectedPath := "test.path"
 		expectedFieldNames := []string{"field1", "field2", "field3"}
+		expectedTags := []string{}
 		expectedObservations := []observations.Observation{}
 
-		newState := state.NewState(expectedPath, expectedFieldNames, expectedObservations)
+		newState := state.NewState(expectedPath, expectedFieldNames, expectedTags, expectedObservations)
 
 		assert.Equal(t, expectedPath, newState.Path(), "Path() not equal")
 		assert.Equal(t, expectedFieldNames, newState.FieldNames(), "FieldNames() not equal")
