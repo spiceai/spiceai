@@ -138,6 +138,7 @@ func TestPods(t *testing.T) {
 		}
 	})
 
+	t.Log("*** Get Pods ***")
 	observation, err := runtime.getPods()
 	if err != nil {
 		t.Fatal(err)
@@ -176,6 +177,7 @@ func TestObservations(t *testing.T) {
 		}
 	})
 
+	t.Log("*** Get Observations ***")
 	observation, err := runtime.getObservations("trader")
 	if err != nil {
 		t.Fatal(err)
@@ -191,6 +193,7 @@ func TestObservations(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	t.Log("*** Post Observations ***")
 	err = runtime.postObservations("trader", newObservations)
 	if err != nil {
 		t.Fatal(err)
@@ -198,6 +201,7 @@ func TestObservations(t *testing.T) {
 
 	time.Sleep(1 * time.Second)
 
+	t.Log("*** Get New Observations ***")
 	observation, err = runtime.getObservations("trader")
 	if err != nil {
 		t.Fatal(err)
@@ -227,6 +231,7 @@ func TestDataspaceData(t *testing.T) {
 		}
 	})
 
+	t.Log("*** Get Observations ***")
 	observation, err := runtime.getObservations("customprocessor")
 	if err != nil {
 		t.Fatal(err)
@@ -242,6 +247,7 @@ func TestDataspaceData(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	t.Log("*** Post Dataspace Json Data ***")
 	err = runtime.postDataspace("customprocessor", "json", "processor", newJsonData)
 	if err != nil {
 		t.Fatal(err)
@@ -249,6 +255,7 @@ func TestDataspaceData(t *testing.T) {
 
 	time.Sleep(1 * time.Second)
 
+	t.Log("*** Get New Observations ***")
 	observation, err = runtime.getObservations("customprocessor")
 	if err != nil {
 		t.Fatal(err)
@@ -264,6 +271,7 @@ func TestDataspaceData(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	t.Log("*** Post Dataspace CSV Data ***")
 	err = runtime.postDataspace("customprocessor", "csv", "processor", newCsvData)
 	if err != nil {
 		t.Fatal(err)
@@ -271,6 +279,7 @@ func TestDataspaceData(t *testing.T) {
 
 	time.Sleep(1 * time.Second)
 
+	t.Log("*** Get New Observations with CSV Data ***")
 	observation, err = runtime.getObservations("customprocessor")
 	if err != nil {
 		t.Fatal(err)
@@ -302,6 +311,7 @@ func TestInterpretations(t *testing.T) {
 
 	var podEpochTime int64 = 1605312000
 
+	t.Log("*** Get Interpretation ***")
 	interpretations, err := runtime.getInterpretations("trader", podEpochTime, podEpochTime)
 	if err != nil {
 		t.Fatal(err)
@@ -314,11 +324,13 @@ func TestInterpretations(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	t.Log("*** Post Interpretations ***")
 	err = runtime.postInterpretations("trader", newInterpretations)
 	if err != nil {
 		t.Fatal(err)
 	}
 
+	t.Log("*** Get New Interpretations ***")
 	interpretations, err = runtime.getInterpretations("trader", podEpochTime, podEpochTime)
 	if err != nil {
 		t.Fatal(err)
@@ -350,6 +362,7 @@ func TestTrainingOutput(t *testing.T) {
 		}
 	})
 
+	t.Log("*** Start Training ***")
 	err = cliClient.runCliCmd("train", "trader", "--context", spicedContext)
 	if err != nil {
 		t.Fatal(err)
@@ -360,6 +373,7 @@ func TestTrainingOutput(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	t.Log("*** Get Flights ***")
 	flights, err := runtime.getFlights("trader")
 	if err != nil {
 		t.Fatal(err)
@@ -380,7 +394,7 @@ func TestTrainingOutput(t *testing.T) {
 		}
 
 		assert.Equal(t, 3, numActions, "expect 3 actions to be taken each episode")
-		assert.Equal(t, uint64(1428), actionCount, "expect a total of 132 actions to be taken")
+		assert.Equal(t, uint64(1428), actionCount, "unexpected actions taken")
 	}
 }
 
@@ -406,6 +420,7 @@ func TestImportExport(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	t.Log("*** Post Interpretations ***")
 	err = runtime.postInterpretations("trader", newInterpretations)
 	if err != nil {
 		t.Fatal(err)
@@ -415,9 +430,10 @@ func TestImportExport(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Log("E2E: Training Completed!")
+	t.Log("*** Training Completed ***")
 	time.Sleep(time.Second)
 
+	t.Log("*** Export Pod ***")
 	err = cliClient.runCliCmd("export", "trader")
 	if err != nil {
 		t.Fatal(err)
@@ -428,11 +444,13 @@ func TestImportExport(t *testing.T) {
 		t.Fatal(fmt.Errorf("didn't see expected exported spicepod: %w", err))
 	}
 
+	t.Log("*** Import Pod ***")
 	err = cliClient.runCliCmd("import", "trader.spicepod")
 	if err != nil {
 		t.Fatal(err)
 	}
 
+	t.Log("*** Get Recommendation ***")
 	inference, err := runtime.getRecommendation("trader", "latest")
 	if err != nil {
 		t.Fatal(err)
@@ -444,6 +462,7 @@ func TestImportExport(t *testing.T) {
 
 	t.Logf("%v\n", inference)
 
+	t.Log("*** Get Interpretations ***")
 	var podEpochTime int64 = 1605312000
 	interpretations, err := runtime.getInterpretations("trader", podEpochTime, podEpochTime)
 	if err != nil {
@@ -457,23 +476,27 @@ func TestImportExport(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	t.Log("*** Shutdown Runtime ***")
 	// Now let's shutdown the runtime and restart it and import our exported pod
 	err = runtime.shutdown()
 	if err != nil {
 		log.Fatalln(err.Error())
 	}
 
+	t.Log("*** Start Runtime ***")
 	err = runtime.startRuntime()
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer runtime.shutdown() //nolint:errcheck
 
+	t.Log("*** Import Pod again ***")
 	err = cliClient.runCliCmd("import", "trader.spicepod")
 	if err != nil {
 		t.Fatal(err)
 	}
 
+	t.Log("*** Get Recommendation again ***")
 	newInference, err := runtime.getRecommendation("trader", "latest")
 	if err != nil {
 		t.Fatal(err)
@@ -498,6 +521,7 @@ func TestImportExport(t *testing.T) {
 		t.Fatal(fmt.Errorf("%s: the confidence values are different between the exported and imported models", aurora.Red("error")))
 	}
 
+	t.Log("*** Get Interpretations again ***")
 	interpretations, err = runtime.getInterpretations("trader", podEpochTime, podEpochTime)
 	if err != nil {
 		t.Fatal(err)
