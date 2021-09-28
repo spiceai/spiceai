@@ -119,9 +119,14 @@ func (pod *Pod) CachedCsv() string {
 
 	headers := make([]string, 0, len(fieldNames)+len(tagPathMap))
 	headers = append(headers, fieldNames...)
+
+	var tagPaths []string
 	for tagPath := range tagPathMap {
-		headers = append(headers, fmt.Sprintf("%s._tags", tagPath))
+		tagPaths = append(tagPaths, fmt.Sprintf("%s._tags", tagPath))
 	}
+	sort.Strings(tagPaths)
+
+	headers = append(headers, tagPaths...)
 
 	st := fmt.Sprintf("time,%s\n", strings.Join(headers, ","))
 	csv.WriteString(st)
@@ -445,9 +450,7 @@ func loadPod(podPath string, hash string) (*Pod, error) {
 			fieldNames = append(fieldNames, fieldName)
 		}
 
-		for _, tag := range ds.Tags() {
-			tagPathMap[ds.Path()] = append(tagPathMap[ds.Path()], tag)
-		}
+		tagPathMap[ds.Path()] = append(tagPathMap[ds.Path()], ds.Tags()...)
 		if _, ok := tagPathMap[ds.Path()]; ok {
 			sort.Strings(tagPathMap[ds.Path()])
 		}
