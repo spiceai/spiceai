@@ -9,14 +9,14 @@ interface FlightChartProps {
 }
 
 const colors = [
-  "#022132",
-  "#1c3155",
-  "#4e3d71",
-  "#88417e",
-  "#bf4578",
-  "#ea5562",
-  "#ff7840",
-  "#ffa600",
+  "#e6194B",
+  "#f58231",
+  "#bfef45",
+  "#3cb44b",
+  "#42d4f4",
+  "#9A6324",
+  "#000000",
+  "#ffe119"
 ]
 
 const FlightChart: React.FunctionComponent<FlightChartProps> = (props) => {
@@ -91,8 +91,8 @@ const FlightChart: React.FunctionComponent<FlightChartProps> = (props) => {
               data: props.flight.episodes as any,
               backgroundColor: 'rgba(00, 22, 132, 0.5)',
               borderColor: 'rgba(00, 22, 132, 1)',
-              borderWidth: 2,
-              pointRadius: 4,
+              borderWidth: 3,
+              pointRadius: 5,
               parsing: {
                 xAxisKey: 'episode',
                 yAxisKey: 'reward',
@@ -116,8 +116,8 @@ const FlightChart: React.FunctionComponent<FlightChartProps> = (props) => {
             data: props.flight.episodes as any,
             backgroundColor: colors[numActions] + "22",
             borderColor: colors[numActions] + "DD",
-            borderWidth: 1,
-            pointRadius: 2,
+            borderWidth: 2,
+            pointRadius: 3,
             parsing: {
               xAxisKey: 'episode',
               yAxisKey: `actions_taken.${actionName}`,
