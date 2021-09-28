@@ -52,6 +52,7 @@ func TestPod(t *testing.T) {
 		t.Run(fmt.Sprintf("Rewards() - %s", manifestToTest), testRewardsFunc(pod))
 		t.Run(fmt.Sprintf("Actions() - %s", manifestToTest), testActionsFunc(pod))
 		t.Run(fmt.Sprintf("CachedCsv() - %s", manifestToTest), testCachedCsvFunc(pod))
+		t.Run(fmt.Sprintf("TagPathMap() - %s", manifestToTest), testTagPathMap(pod))
 
 		if testParams.LocalStateTest {
 			t.Run(fmt.Sprintf("AddLocalState() - %s", manifestToTest), testAddLocalStateFunc(pod))
@@ -245,6 +246,23 @@ func testCachedCsvFunc(pod *Pod) func(*testing.T) {
 		actual := pod.CachedCsv()
 
 		snapshotter.SnapshotT(t, actual)
+	}
+}
+
+// Tests TagPathMap()
+func testTagPathMap(pod *Pod) func(*testing.T) {
+	return func(t *testing.T) {
+		actualMap := pod.TagPathMap()
+
+		var expected map[string][]string
+		switch pod.Name {
+		case "event-tags":
+			expected = map[string][]string{"event.data": {"tagA", "tagB", "tagC"}}
+		default:
+			expected = make(map[string][]string)
+		}
+
+		assert.Equal(t, expected, actualMap)
 	}
 }
 
