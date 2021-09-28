@@ -20,7 +20,7 @@ import (
 	"github.com/spiceai/spiceai/pkg/loggers"
 	"github.com/spiceai/spiceai/pkg/pods"
 	"github.com/spiceai/spiceai/pkg/proto/runtime_pb"
-	"github.com/spiceai/spiceai/pkg/util"
+	spice_time "github.com/spiceai/spiceai/pkg/time"
 	"github.com/valyala/fasthttp"
 	"go.uber.org/zap"
 )
@@ -327,13 +327,12 @@ func apiGetInterpretationsHandler(ctx *fasthttp.RequestCtx) {
 	start := pod.Epoch()
 	startArg := ctx.QueryArgs().Peek("start")
 	if startArg != nil {
-		startTime, err := util.ParseTime(string(startArg))
+		start, err := spice_time.ParseTime(string(startArg), "")
 		if err != nil {
 			ctx.Response.SetStatusCode(http.StatusBadRequest)
 			ctx.Response.SetBodyString(fmt.Sprintf("invalid start %s", startArg))
 			return
 		}
-		start = time.Unix(startTime, 0)
 
 		if start.Before(pod.Epoch()) {
 			ctx.Response.SetStatusCode(http.StatusBadRequest)
@@ -346,13 +345,12 @@ func apiGetInterpretationsHandler(ctx *fasthttp.RequestCtx) {
 	end := podPeriodEnd
 	endArg := ctx.QueryArgs().Peek("end")
 	if endArg != nil {
-		endTime, err := util.ParseTime(string(endArg))
+		end, err := spice_time.ParseTime(string(endArg), "")
 		if err != nil {
 			ctx.Response.SetStatusCode(http.StatusBadRequest)
 			ctx.Response.SetBodyString(fmt.Sprintf("invalid end %s", endArg))
 			return
 		}
-		end = time.Unix(endTime, 0)
 
 		if end.After(podPeriodEnd) {
 			ctx.Response.SetStatusCode(http.StatusBadRequest)

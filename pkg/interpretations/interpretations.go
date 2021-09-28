@@ -6,7 +6,7 @@ import (
 	"time"
 
 	"github.com/spiceai/spiceai/pkg/proto/common_pb"
-	"github.com/spiceai/spiceai/pkg/util"
+	spice_time "github.com/spiceai/spiceai/pkg/time"
 )
 
 type InterpretationsStore struct {
@@ -22,7 +22,7 @@ type InterpretationsStore struct {
 }
 
 func NewInterpretationsStore(epoch time.Time, period time.Duration, granularity time.Duration) *InterpretationsStore {
-	intervals := util.NumIntervals(period, granularity)
+	intervals := spice_time.NumIntervals(period, granularity)
 	return &InterpretationsStore{
 		epoch:       epoch,
 		endTime:     epoch.Add(period),
@@ -40,6 +40,9 @@ func (store *InterpretationsStore) Intervals() int64 {
 }
 
 func (store *InterpretationsStore) All() []Interpretation {
+	store.interpretationsMutex.RLock()
+	defer store.interpretationsMutex.RUnlock()
+	
 	return store.interpretations
 }
 
