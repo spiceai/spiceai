@@ -58,7 +58,7 @@ func init() {
 }
 
 func getPodInitForTraining(pod *pods.Pod) *aiengine_pb.InitRequest {
-	fields := make(map[string]float64)
+	fields := make(map[string]*aiengine_pb.FieldData)
 
 	globalActions := pod.Actions()
 	globalFieldsWithArgs := append(pod.FieldNames(), pod.ActionsArgs()...)
@@ -68,7 +68,10 @@ func getPodInitForTraining(pod *pods.Pod) *aiengine_pb.InitRequest {
 	for _, ds := range pod.DataSpaces() {
 		for fqField, fqFieldInitializer := range ds.Fields() {
 			fieldName := strings.ReplaceAll(fqField, ".", "_")
-			fields[fieldName] = fqFieldInitializer
+			fields[fieldName] = &aiengine_pb.FieldData{
+				Initializer: fqFieldInitializer,
+				FillMethod:  aiengine_pb.FillType_FILL_FORWARD,
+			}
 		}
 
 		dsActions := make(map[string]string)
