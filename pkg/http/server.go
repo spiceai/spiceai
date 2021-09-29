@@ -39,7 +39,7 @@ var (
 
 func healthHandler(ctx *fasthttp.RequestCtx) {
 	if !aiengine.ServerReady() {
-		fmt.Fprintf(ctx, "initializing")
+		fmt.Fprintf(ctx, "ai engine initializing")
 		return
 	}
 
