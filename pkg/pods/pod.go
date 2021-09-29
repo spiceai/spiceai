@@ -94,7 +94,7 @@ func (pod *Pod) Episodes() int {
 
 func (pod *Pod) CachedState() []*state.State {
 	var cachedState []*state.State
-	for _, ds := range pod.DataSources() {
+	for _, ds := range pod.DataSpaces() {
 		dsState := ds.CachedState()
 		if dsState != nil {
 			cachedState = append(cachedState, dsState...)
@@ -167,7 +167,7 @@ func (pod *Pod) CachedCsv() string {
 	return csv.String()
 }
 
-func (pod *Pod) DataSources() []*dataspace.Dataspace {
+func (pod *Pod) DataSpaces() []*dataspace.Dataspace {
 	return pod.dataSources
 }
 
@@ -194,7 +194,7 @@ func (pod *Pod) AddFlight(flightId string, flight *flights.Flight) {
 func (pod *Pod) Actions() map[string]string {
 	allDataSourceActions := make(map[string]string)
 	var dataSourcePrefixes []string
-	for _, ds := range pod.DataSources() {
+	for _, ds := range pod.DataSpaces() {
 		for fqActionName, fqAction := range ds.Actions() {
 			allDataSourceActions[fqActionName] = fqAction
 			dataSourcePrefixes = append(dataSourcePrefixes, fmt.Sprintf("%s.%s", ds.DataspaceSpec.From, ds.DataspaceSpec.Name))
@@ -375,7 +375,7 @@ func (pod *Pod) InitDataConnectors(handler state.StateHandler) error {
 
 	errGroup, _ := errgroup.WithContext(context.Background())
 
-	for _, ds := range pod.DataSources() {
+	for _, ds := range pod.DataSpaces() {
 		dsp := ds
 		errGroup.Go(func() error {
 			dsp.RegisterStateHandler(handler)

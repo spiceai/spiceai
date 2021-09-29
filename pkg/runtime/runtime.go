@@ -206,7 +206,7 @@ func initializePod(manifestPath string) (*pods.Pod, error) {
 		return nil, err
 	}
 
-	for _, ds := range newPod.DataSources() {
+	for _, ds := range newPod.DataSpaces() {
 		fmt.Printf("Loaded dataspace %s\n", aurora.BrightCyan(ds.Name()))
 	}
 

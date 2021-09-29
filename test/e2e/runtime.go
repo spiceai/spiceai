@@ -252,15 +252,17 @@ func (r *runtimeServer) internalGet(url string, data interface{}) error {
 func (r *runtimeServer) waitForServerHealthy() error {
 	maxAttempts := 20
 	attemptCount := 0
+	var lastErr error
 	for {
 		time.Sleep(time.Millisecond * 250)
 
 		if attemptCount++; attemptCount > 4*maxAttempts {
-			return fmt.Errorf("failed to verify health of %s after %d attempts", r.baseUrl, attemptCount)
+			return fmt.Errorf("failed to verify health of %s after %d attempts: %w", r.baseUrl, attemptCount, lastErr)
 		}
 
 		err := util.IsRuntimeServerHealthy(r.baseUrl, http.DefaultClient)
 		if err != nil {
+			lastErr = err
 			continue
 		}
 

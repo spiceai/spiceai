@@ -39,7 +39,7 @@ var (
 
 func healthHandler(ctx *fasthttp.RequestCtx) {
 	if !aiengine.ServerReady() {
-		fmt.Fprintf(ctx, "initializing")
+		fmt.Fprintf(ctx, "ai engine initializing")
 		return
 	}
 
@@ -47,6 +47,11 @@ func healthHandler(ctx *fasthttp.RequestCtx) {
 	if err != nil {
 		fmt.Fprintf(ctx, "degraded\n")
 		fmt.Fprintf(ctx, "ai: %s", err.Error())
+		return
+	}
+
+	if !environment.FirstInitializationCompleted() {
+		fmt.Fprintf(ctx, "environment initializing")
 		return
 	}
 
@@ -116,7 +121,7 @@ func apiPostDataspaceHandler(ctx *fasthttp.RequestCtx) {
 	dataspaceName := ctx.UserValue("dataspace_name").(string)
 
 	var selectedDataspace *dataspace.Dataspace
-	for _, dataspace := range pod.DataSources() {
+	for _, dataspace := range pod.DataSpaces() {
 		if dataspace.DataspaceSpec.From == dataspaceFrom && dataspace.DataspaceSpec.Name == dataspaceName {
 			selectedDataspace = dataspace
 			break
