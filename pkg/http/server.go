@@ -15,6 +15,7 @@ import (
 	"github.com/spiceai/spiceai/pkg/api"
 	"github.com/spiceai/spiceai/pkg/dashboard"
 	"github.com/spiceai/spiceai/pkg/dataspace"
+	"github.com/spiceai/spiceai/pkg/diagnostics"
 	"github.com/spiceai/spiceai/pkg/environment"
 	"github.com/spiceai/spiceai/pkg/flights"
 	"github.com/spiceai/spiceai/pkg/loggers"
@@ -493,6 +494,17 @@ func apiPostImportHandler(ctx *fasthttp.RequestCtx) {
 	ctx.Response.SetStatusCode(200)
 }
 
+func (server *server)apiGetDiagnosticsHandler(ctx *fasthttp.RequestCtx) {
+	report, err := diagnostics.GenerateReport()
+	if err != nil {
+		ctx.Response.SetStatusCode(500)
+		ctx.Response.SetBodyString(err.Error())
+		return
+	}
+
+	ctx.SetBodyString(report)
+}
+
 func NewServer(port uint) *server {
 	return &server{
 		config: ServerConfig{
@@ -533,6 +545,8 @@ func (server *server) Start() error {
 		// Interpretations
 		api.GET("/pods/{pod}/interpretations", apiGetInterpretationsHandler)
 		api.POST("/pods/{pod}/interpretations", apiPostInterpretationsHandler)
+
+		api.GET("/diagnostics", server.apiGetDiagnosticsHandler)
 	}
 
 	static := r.Group("/static")

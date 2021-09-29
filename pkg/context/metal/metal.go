@@ -40,6 +40,10 @@ func NewMetalContext() *MetalContext {
 	}
 }
 
+func (c *MetalContext) Name() string {
+	return "metal"
+}
+
 func (c *MetalContext) SpiceRuntimeDir() string {
 	return c.spiceRuntimeDir
 }
