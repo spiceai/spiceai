@@ -9,10 +9,10 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-var initCompleted bool = false
+var firstInitCompleted bool = false
 
-func InitializationCompleted() bool {
-	return initCompleted
+func FirstInitializationCompleted() bool {
+	return firstInitCompleted
 }
 
 func InitDataConnectors() error {
@@ -24,7 +24,9 @@ func InitDataConnectors() error {
 		})
 	}
 	err := errGroup.Wait()
-	initCompleted = true
+	if err != nil {
+		firstInitCompleted = true
+	}
 	return err
 }
 
