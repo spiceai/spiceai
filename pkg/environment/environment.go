@@ -24,7 +24,7 @@ func InitDataConnectors() error {
 		})
 	}
 	err := errGroup.Wait()
-	if err != nil {
+	if err == nil {
 		firstInitCompleted = true
 	}
 	return err
