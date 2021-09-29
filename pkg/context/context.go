@@ -11,6 +11,7 @@ import (
 )
 
 type RuntimeContext interface {
+	Name() string
 	Init() error
 	Version() (string, error)
 	IsRuntimeInstallRequired() bool

@@ -40,6 +40,10 @@ func NewDockerContext() *DockerContext {
 	}
 }
 
+func (c *DockerContext) Name() string {
+	return "docker"
+}
+
 func (c *DockerContext) Version() (string, error) {
 	version, err := getDockerImageVersion()
 	if err != nil {
