@@ -50,6 +50,11 @@ func healthHandler(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
+	if !environment.InitializationCompleted() {
+		fmt.Fprintf(ctx, "environment initializing")
+		return
+	}
+
 	fmt.Fprintf(ctx, "ok")
 }
 

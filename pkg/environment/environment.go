@@ -9,6 +9,12 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+var initCompleted bool = false
+
+func InitializationCompleted() bool {
+	return initCompleted
+}
+
 func InitDataConnectors() error {
 	errGroup, _ := errgroup.WithContext(context.Background())
 	for _, pod := range pods.Pods() {
@@ -17,7 +23,9 @@ func InitDataConnectors() error {
 			return InitPodDataConnector(p)
 		})
 	}
-	return errGroup.Wait()
+	err := errGroup.Wait()
+	initCompleted = true
+	return err
 }
 
 func InitPodDataConnector(pod *pods.Pod) error {
