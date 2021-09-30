@@ -33,7 +33,7 @@ var (
 	cliClient          *cli
 	runtime            *runtimeServer
 	snapshotter        *cupaloy.Config
-	testPods           = []string{"test/Trader@0.3.1", "test/customprocessor@0.1.0"}
+	testPods           = []string{"test/Trader@0.3.1", "test/customprocessor@0.1.0", "test/event-tags@0.1.0"}
 )
 
 func TestMain(m *testing.M) {
@@ -150,13 +150,13 @@ func TestPods(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	assert.Len(t, pods, 2)
+	assert.Len(t, pods, 3)
 
 	sort.SliceStable(pods, func(i, j int) bool {
 		return strings.Compare(pods[i]["name"], pods[j]["name"]) == -1
 	})
 
-	snapshotter.SnapshotT(t, pods[0]["name"], pods[1]["name"])
+	snapshotter.SnapshotT(t, pods[0]["name"], pods[1]["name"], pods[2]["name"])
 }
 
 func TestObservations(t *testing.T) {
@@ -395,6 +395,59 @@ func TestTrainingOutput(t *testing.T) {
 
 		assert.Equal(t, 3, numActions, "expect 3 actions to be taken each episode")
 		assert.Equal(t, uint64(1428), actionCount, "unexpected actions taken")
+	}
+}
+
+func TestPodWithTags(t *testing.T) {
+	if !shouldRunTest {
+		t.Skip("Specify '-e2e' to run e2e tests")
+		return
+	}
+
+	err := runtime.startRuntime()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() {
+		err := runtime.shutdown()
+		if err != nil {
+			log.Fatalln(err.Error())
+		}
+	})
+
+	err = cliClient.runCliCmd("train", "event-tags", "--context", spicedContext)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = runtime.waitForTrainingToComplete("event-tags", "1" /*flight*/, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Log("*** Get Flights ***")
+	flights, err := runtime.getFlights("event-tags")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	assert.Equal(t, 1, len(flights), "expect 1 flight to be returned")
+	flight := flights[0]
+	assert.Equal(t, len(flight.Episodes), 4, "expect 4 episodes to be returned")
+	for _, episode := range flight.Episodes {
+		assert.Empty(t, episode.Error)
+		assert.Empty(t, episode.ErrorMessage)
+
+		var actionCount uint64
+		var numActions int
+		for _, count := range episode.ActionsTaken {
+			actionCount += count
+			numActions++
+		}
+
+		assert.Equal(t, 2, numActions, "expect 2 actions to be taken each episode")
+		assert.Equal(t, uint64(33), actionCount, "unexpected actions taken")
 	}
 }
 
