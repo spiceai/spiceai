@@ -15,9 +15,11 @@
     "sell": 1
   },
   "fields": {
-    "coinbase_btcusd_close": 0,
-    "local_portfolio_btc_balance": 0,
-    "local_portfolio_usd_balance": 1000000
+    "coinbase_btcusd_close": {},
+    "local_portfolio_btc_balance": {},
+    "local_portfolio_usd_balance": {
+      "initializer": 1000000
+    }
   },
   "laws": [
     "local_portfolio_usd_balance \u003e= 0",

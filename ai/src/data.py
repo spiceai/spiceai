@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import pandas.core.computation.expressions as expressions
 from proto.common.v1 import common_pb2
+from proto.aiengine.v1 import aiengine_pb2
 from types import SimpleNamespace
 import math
 import threading
@@ -32,7 +33,7 @@ class DataManager:
 
         new_series = dict()
         for field_name in fields:
-            new_series[field_name] = [fields[field_name]]
+            new_series[field_name] = [fields[field_name].initializer]
 
         self.massive_table_sparse = pd.DataFrame(new_series, index={self.epoch_time})
         self.massive_table_sparse = self.massive_table_sparse.resample(
@@ -67,7 +68,17 @@ class DataManager:
         metrics.end("resample")
 
         metrics.start("ffill")
-        self.massive_table_filled = self.massive_table_sparse.ffill()
+        self.massive_table_filled = self.massive_table_sparse.copy()
+        for col_name in self.massive_table_sparse:
+            fill_method = self.fields[col_name].fill_method
+            if fill_method == aiengine_pb2.FILL_FORWARD:
+                self.massive_table_filled[col_name] = self.massive_table_sparse[
+                    col_name
+                ].ffill()
+            elif fill_method == aiengine_pb2.FILL_ZERO:
+                self.massive_table_filled[col_name] = self.massive_table_sparse[
+                    col_name
+                ].fillna(0)
         metrics.end("ffill")
 
         metrics.start("reindex")

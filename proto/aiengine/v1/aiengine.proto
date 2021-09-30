@@ -27,6 +27,16 @@ message DataSource {
   map<string, string> actions = 2;
 }
 
+enum FillType {
+  FILL_FORWARD = 0;
+  FILL_ZERO = 1;
+}
+
+message FieldData {
+  double initializer = 1;
+  FillType fill_method = 2;
+}
+
 message InitRequest {
   string pod = 1;
   int64 period = 2;
@@ -35,7 +45,7 @@ message InitRequest {
   int64 epoch_time = 5;
   map<string, string> actions = 6;
   map<string, int32> actions_order = 7;
-  map<string, double> fields = 8;
+  map<string, FieldData> fields = 8;
   repeated string laws = 9;
   repeated DataSource datasources = 10;
 }
