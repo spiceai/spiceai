@@ -43,6 +43,7 @@ def train_agent(
         REQUEST_URL = f"http://localhost:8000/api/v0.1/pods/{pod_name}/training_runs/{flight}/episodes"
 
         TRAINING_EPISODES = number_episodes
+        NOT_LEARNING_THRESHOLD = 3
 
         data_manager.rewind()
         model_data_shape = data_manager.get_shape()
@@ -51,6 +52,7 @@ def train_agent(
         print_event(pod_name, f"Training {TRAINING_EPISODES} episodes...")
 
         custom_training_goal_met = False
+        not_learning_episodes_threshold_met = False
 
         not_learning_episodes = 0
         last_episode_reward = None
@@ -155,10 +157,23 @@ def train_agent(
 
             post_episode_result(REQUEST_URL, episode_data)
 
+            if last_episode_reward == episode_reward:
+                not_learning_episodes += 1
+            else:
+                not_learning_episodes = 0
+
+            if not_learning_episodes >= NOT_LEARNING_THRESHOLD:
+                not_learning_episodes_threshold_met = True
+                break
+
+            last_episode_reward = episode_reward
+
             end_of_episode(episode)
 
         if custom_training_goal_met:
             print_event(pod_name, f"Training goal '{training_goal}' reached!")
+        elif not_learning_episodes_threshold_met:
+            print_event(pod_name, f"Training goal 'score_variance < 1' reached!")
         else:
             print_event(
                 pod_name, f"Max training episodes ({TRAINING_EPISODES}) reached!"
