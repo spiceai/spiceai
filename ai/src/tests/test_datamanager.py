@@ -13,7 +13,11 @@ class DataManagerTestCase(unittest.TestCase):
             period_secs=pd.to_timedelta(1, unit="s"),
             interval_secs=pd.to_timedelta(1, unit="s"),
             granularity_secs=pd.to_timedelta(10, unit="s"),
-            fields={"foo": aiengine_pb2.FieldData(initializer=10.0, fill_method=aiengine_pb2.FILL_ZERO)},
+            fields={
+                "foo": aiengine_pb2.FieldData(
+                    initializer=10.0, fill_method=aiengine_pb2.FILL_ZERO
+                )
+            },
             action_rewards={"foo": "bar"},
             actions_order={"foo": 0},
             laws=["law"],
@@ -27,10 +31,15 @@ class DataManagerTestCase(unittest.TestCase):
 
         data_manager.merge_data(original_data)
 
-        expected_data = { 10: 1.0, 20: 2.0, 30: 3.0, 40: 0.0, 50: 4.0 }
+        expected_data = {10: 1.0, 20: 2.0, 30: 3.0, 40: 0.0, 50: 4.0}
 
         for key in expected_data:
-            self.assertEqual(expected_data[key], data_manager.massive_table_filled.loc[pd.to_datetime(key, unit="s")].values[0])
+            self.assertEqual(
+                expected_data[key],
+                data_manager.massive_table_filled.loc[
+                    pd.to_datetime(key, unit="s")
+                ].values[0],
+            )
 
     def test_forward_fill_data(self):
         data_manager = DataManager()
@@ -39,7 +48,11 @@ class DataManagerTestCase(unittest.TestCase):
             period_secs=pd.to_timedelta(1, unit="s"),
             interval_secs=pd.to_timedelta(1, unit="s"),
             granularity_secs=pd.to_timedelta(10, unit="s"),
-            fields={"foo": aiengine_pb2.FieldData(initializer=10.0, fill_method=aiengine_pb2.FILL_FORWARD)},
+            fields={
+                "foo": aiengine_pb2.FieldData(
+                    initializer=10.0, fill_method=aiengine_pb2.FILL_FORWARD
+                )
+            },
             action_rewards={"foo": "bar"},
             actions_order={"foo": 0},
             laws=["law"],
@@ -53,10 +66,15 @@ class DataManagerTestCase(unittest.TestCase):
 
         data_manager.merge_data(original_data)
 
-        expected_data = { 10: 1.0, 20: 2.0, 30: 3.0, 40: 3.0, 50: 4.0 }
+        expected_data = {10: 1.0, 20: 2.0, 30: 3.0, 40: 3.0, 50: 4.0}
 
         for key in expected_data:
-            self.assertEqual(expected_data[key], data_manager.massive_table_filled.loc[pd.to_datetime(key, unit="s")].values[0])
+            self.assertEqual(
+                expected_data[key],
+                data_manager.massive_table_filled.loc[
+                    pd.to_datetime(key, unit="s")
+                ].values[0],
+            )
 
     def test_merge_data_resampling(self):
         data_manager = DataManager()
