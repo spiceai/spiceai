@@ -2,6 +2,7 @@ from io import StringIO
 import unittest
 import pandas as pd
 from data import DataManager
+from proto.aiengine.v1 import aiengine_pb2
 
 
 class DataManagerTestCase(unittest.TestCase):
@@ -13,7 +14,7 @@ class DataManagerTestCase(unittest.TestCase):
             period_secs=pd.to_timedelta(1, unit="s"),
             interval_secs=pd.to_timedelta(1, unit="s"),
             granularity_secs=pd.to_timedelta(10, unit="s"),
-            fields={"foo": "bar"},
+            fields={"foo": aiengine_pb2.FieldData(initializer=0.0)},
             action_rewards={"foo": "bar"},
             actions_order={"foo": 0},
             laws=["law"],
@@ -40,10 +41,23 @@ class DataManagerTestCase(unittest.TestCase):
         data_manager = DataManager()
 
         test_cases = (
-            {"fields": {"foo": "bar"}, "expected_shape": (10,)},
-            {"fields": {"foo": "bar", "foo2": "bar2"}, "expected_shape": (20,)},
             {
-                "fields": {"foo": "bar", "foo2": "bar2", "foo3": "bar3"},
+                "fields": {"foo": aiengine_pb2.FieldData(initializer=0.0)},
+                "expected_shape": (10,),
+            },
+            {
+                "fields": {
+                    "foo": aiengine_pb2.FieldData(initializer=0.0),
+                    "foo2": aiengine_pb2.FieldData(initializer=0.0),
+                },
+                "expected_shape": (20,),
+            },
+            {
+                "fields": {
+                    "foo": aiengine_pb2.FieldData(initializer=0.0),
+                    "foo2": aiengine_pb2.FieldData(initializer=0.0),
+                    "foo3": aiengine_pb2.FieldData(initializer=0.0),
+                },
                 "expected_shape": (30,),
             },
         )
@@ -81,7 +95,7 @@ class DataManagerTestCase(unittest.TestCase):
                 period_secs=pd.to_timedelta(1, unit="s"),
                 interval_secs=pd.to_timedelta(test_case["interval"], unit="s"),
                 granularity_secs=pd.to_timedelta(test_case["granularity"], unit="s"),
-                fields={"foo": "bar"},
+                fields={"foo": aiengine_pb2.FieldData(initializer=0.0)},
                 action_rewards={"foo": "bar"},
                 actions_order={"foo": 0},
                 laws=["law"],
@@ -103,7 +117,7 @@ class DataManagerTestCase(unittest.TestCase):
             period_secs=pd.to_timedelta(1, unit="s"),
             interval_secs=interval,
             granularity_secs=pd.to_timedelta(10, unit="s"),
-            fields={"foo": "bar"},
+            fields={"foo": aiengine_pb2.FieldData(initializer=0.0)},
             action_rewards={"foo": "bar"},
             actions_order={"foo": 0},
             laws=["law"],
@@ -126,7 +140,7 @@ class DataManagerTestCase(unittest.TestCase):
             period_secs=period,
             interval_secs=interval,
             granularity_secs=granularity,
-            fields={"foo": "bar"},
+            fields={"foo": aiengine_pb2.FieldData(initializer=0.0)},
             action_rewards={"foo": "bar"},
             actions_order={"foo": 0},
             laws=["law"],

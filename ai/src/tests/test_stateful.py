@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 from connector.stateful import StatefulConnector
 from data import DataManager
+from proto.aiengine.v1 import aiengine_pb2
 
 original_csv = "time,baz\n10,1.0\n20,2.0\n30,3.0\n40,4.0\n50,5.0"
 original_data = pd.read_csv(StringIO(original_csv))
@@ -25,7 +26,11 @@ class StatefulConnectorTests(unittest.TestCase):
             period_secs=period,
             interval_secs=interval,
             granularity_secs=granularity,
-            fields={"foo": 10.0, "bar": 5.0},
+            fields={
+                "foo": aiengine_pb2.FieldData(initializer=10.0),
+                "bar": aiengine_pb2.FieldData(initializer=5.0),
+                "baz": aiengine_pb2.FieldData(initializer=1.0),
+            },
             action_rewards={
                 "foo_action": "reward = 1",
                 "bar_action": "reward = 1",
