@@ -42,7 +42,8 @@ func SendData(pod *pods.Pod, podState ...*state.State) error {
 		if _, ok := tagPathMap[s.Path()]; ok {
 			for _, tagName := range tagPathMap[s.Path()] {
 				csv.WriteString(",")
-				csv.WriteString(fmt.Sprintf("%s.%s", s.Path(), tagName))
+				fqTagName := fmt.Sprintf("%s.%s", s.Path(), tagName)
+				csv.WriteString(strings.ReplaceAll(fqTagName, ".", "_"))
 			}
 		}
 		csv.WriteString("\n")
