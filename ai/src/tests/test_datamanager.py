@@ -6,6 +6,58 @@ from proto.aiengine.v1 import aiengine_pb2
 
 
 class DataManagerTestCase(unittest.TestCase):
+    def test_zero_fill_data(self):
+        data_manager = DataManager()
+        data_manager.init(
+            epoch_time=pd.to_datetime(10, unit="s"),
+            period_secs=pd.to_timedelta(1, unit="s"),
+            interval_secs=pd.to_timedelta(1, unit="s"),
+            granularity_secs=pd.to_timedelta(10, unit="s"),
+            fields={"foo": aiengine_pb2.FieldData(initializer=10.0, fill_method=aiengine_pb2.FILL_ZERO)},
+            action_rewards={"foo": "bar"},
+            actions_order={"foo": 0},
+            laws=["law"],
+        )
+
+        # Leave a gap at time 40
+        original_csv = "time,foo\n10,1.0\n20,2.0\n30,3.0\n50,4.0"
+        original_data = pd.read_csv(StringIO(original_csv))
+        original_data["time"] = pd.to_datetime(original_data["time"], unit="s")
+        original_data = original_data.set_index("time")
+
+        data_manager.merge_data(original_data)
+
+        expected_data = { 10: 1.0, 20: 2.0, 30: 3.0, 40: 0.0, 50: 4.0 }
+
+        for key in expected_data:
+            self.assertEqual(expected_data[key], data_manager.massive_table_filled.loc[pd.to_datetime(key, unit="s")].values[0])
+
+    def test_forward_fill_data(self):
+        data_manager = DataManager()
+        data_manager.init(
+            epoch_time=pd.to_datetime(10, unit="s"),
+            period_secs=pd.to_timedelta(1, unit="s"),
+            interval_secs=pd.to_timedelta(1, unit="s"),
+            granularity_secs=pd.to_timedelta(10, unit="s"),
+            fields={"foo": aiengine_pb2.FieldData(initializer=10.0, fill_method=aiengine_pb2.FILL_FORWARD)},
+            action_rewards={"foo": "bar"},
+            actions_order={"foo": 0},
+            laws=["law"],
+        )
+
+        # Leave a gap at time 40
+        original_csv = "time,foo\n10,1.0\n20,2.0\n30,3.0\n50,4.0"
+        original_data = pd.read_csv(StringIO(original_csv))
+        original_data["time"] = pd.to_datetime(original_data["time"], unit="s")
+        original_data = original_data.set_index("time")
+
+        data_manager.merge_data(original_data)
+
+        expected_data = { 10: 1.0, 20: 2.0, 30: 3.0, 40: 3.0, 50: 4.0 }
+
+        for key in expected_data:
+            self.assertEqual(expected_data[key], data_manager.massive_table_filled.loc[pd.to_datetime(key, unit="s")].values[0])
+
     def test_merge_data_resampling(self):
         data_manager = DataManager()
 
