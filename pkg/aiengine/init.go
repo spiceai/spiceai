@@ -74,6 +74,14 @@ func getPodInitForTraining(pod *pods.Pod) *aiengine_pb.InitRequest {
 			}
 		}
 
+		for _, localTag := range ds.Tags() {
+			fqTag := fmt.Sprintf("%s_%s_%s", ds.From, ds.DataspaceSpec.Name, localTag)
+			fields[fqTag] = &aiengine_pb.FieldData{
+				Initializer: 0.0,
+				FillMethod:  aiengine_pb.FillType_FILL_ZERO,
+			}
+		}
+
 		dsActions := make(map[string]string)
 		for dsAction := range ds.DataspaceSpec.Actions {
 			fqAction, ok := globalActions[dsAction]
