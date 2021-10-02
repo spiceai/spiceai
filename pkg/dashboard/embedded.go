@@ -63,7 +63,7 @@ func (d *DashboardEmbedded) fileHandler(ctx *fasthttp.RequestCtx, fs embed.FS, f
 	filePath := ctx.UserValue("file").(string)
 
 	subfolder := fileType
-	if fileType == "svg" || fileType == ".md" {
+	if fileType == "svg" || fileType == "md" {
 		subfolder = "media"
 	}
 
