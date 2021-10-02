@@ -5,21 +5,26 @@ Spice.ai is built upon a foundation of first principles.
 ## Summary
 
 - Developer experience first
+- Bring data and ML to your application
 - API first
 - Composable from community driven-components
 - Data is always in time-based intervals
 
 ### Developer experience first
 
-- The goal of Spice.ai is to make creating intelligent applications as easy as possible, and so developer experience comes first
+The goal of Spice.ai is to make creating intelligent applications as easy as possible, and so developer experience comes first
+
+### Bring data and ML to your application
+
+Instead of sending valuable application data into another service, bring data and ML as close to your application as possible. This supports the approach for the application and the ML engine to work together in the same data space, and to provide feedback to each other, for higher performance.
 
 ### API first
 
-- All functionality is available through the HTTP API on the Spice.ai runtime: `spiced`
+All functionality is available through the HTTP API on the Spice.ai runtime: `spiced`
 
 ### Composable from community driven-components
 
-- A Spice.ai project consists of Pods, Data Connectors, and Data Processors, all of which are composable through community built-components available through the spicerack.org registry or the `data-components-contrib` reposistory.
+A Spice.ai project consists of Pods, Data Connectors, and Data Processors, all of which are composable through community built-components available through the spicerack.org registry or the `data-components-contrib` reposistory.
 
 ### Data is always in time-based intervals
 
