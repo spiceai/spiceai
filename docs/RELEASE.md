@@ -23,6 +23,7 @@ Create an endgame issue with the following content:
 - [ ] Merge Samples PRs
 - [ ] Merge Quickstarts PRs
 - [ ] Merge release notes
+- [ ] Update acknowledgements
 - [ ] Update data-components-contrib repo with latest tag and reference it in spiceai. See [Components contrib version update](https://github.com/spiceai/spiceai/blob/trunk/docs/RELEASE.md#components-contrib-version-update)
 - [ ] Update version using documented process at [docs/RELEASE.md](https://github.com/spiceai/spiceai/blob/trunk/docs/RELEASE.md#version-update)
 - [ ] Final test pass on released binaries
@@ -49,3 +50,11 @@ PR reference:
 - Tag the latest commit on https://github.com/spiceai/data-components-contrib with the same version as the main `spiceai` repo for this release
 - Create a PR in `spiceai` to update the version of `github.com/spiceai/data-components-contrib` to the latest version tag.
   - To update, run `go get -u github.com/spiceai/data-components-contrib@<version tag>` and commit the `go.mod` and `go.sum` changes
+
+## Acknowledgements update
+
+- Run the `generate-acknowledgements` target and commit the result for each in:
+  - spiceai
+  - quickstarts
+  - samples
+  - data-components-contrib
