@@ -35,10 +35,10 @@ docker:
 .PHONY: metal-symlinks
 metal-symlinks:
 	mkdir -p ~/.spice/bin
-	if [ [ -f "${HOME}/.spice/bin/ai" ]] then rm -rf "${HOME}/.spice/bin/ai" fi
+	if [[ -f "${HOME}/.spice/bin/ai" ]]; then rm -rf "${HOME}/.spice/bin/ai"; fi
 	ln -s $(shell pwd)/ai/src ${HOME}/.spice/bin/ai
-	if [ [ -f "$(shell pwd)/spice/spice" ]] then ln -s "$(shell pwd)/spice/spice" ${HOME}/.spice/bin/spice fi
-	if [ [ -f "$(shell pwd)/spiced/spiced" ]] then ln -s "$(shell pwd)/spiced/spiced" ${HOME}/.spice/bin/spiced fi
+	if [[ -f "$(shell pwd)/spice/spice" ]]; then ln -s "$(shell pwd)/spice/spice" ${HOME}/.spice/bin/spice; fi
+	if [[ -f "$(shell pwd)/spiced/spiced" ]]; then ln -s "$(shell pwd)/spiced/spiced" ${HOME}/.spice/bin/spiced; fi
 	ls -la ~/.spice/bin
 
 ################################################################################
