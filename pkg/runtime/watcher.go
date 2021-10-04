@@ -101,12 +101,12 @@ func processNotifyEvent(event fsnotify.Event) error {
 func startNewPodTraining(pod *pods.Pod) error {
 	pods.CreateOrUpdatePod(pod)
 
-	err := environment.InitPodDataConnector(pod)
+	err := aiengine.InitializePod(pod)
 	if err != nil {
 		return err
 	}
 
-	err = aiengine.InitializePod(pod)
+	err = environment.InitPodDataConnector(pod)
 	if err != nil {
 		return err
 	}
