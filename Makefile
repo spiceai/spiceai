@@ -32,6 +32,15 @@ test: build
 docker:
 	docker build -t ghcr.io/spiceai/spiceai:local -f docker/Dockerfile .
 
+.PHONY: metal-symlinks
+metal-symlinks:
+	mkdir -p ~/.spice/bin
+	if [[ -f "${HOME}/.spice/bin/ai" ]]; then rm -rf "${HOME}/.spice/bin/ai"; fi
+	ln -s $(shell pwd)/ai/src ${HOME}/.spice/bin/ai
+	if [[ -f "$(shell pwd)/spice/spice" ]]; then ln -s "$(shell pwd)/spice/spice" ${HOME}/.spice/bin/spice; fi
+	if [[ -f "$(shell pwd)/spiced/spiced" ]]; then ln -s "$(shell pwd)/spiced/spiced" ${HOME}/.spice/bin/spiced; fi
+	ls -la ~/.spice/bin
+
 ################################################################################
 # Target: modtidy                                                              #
 ################################################################################
@@ -78,3 +87,37 @@ check-proto-diff:
 	git diff --exit-code ./ai/src/proto/aiengine/v1/aiengine_pb2_grpc.py # check no changes
 	git diff --exit-code ./ai/src/proto/runtime/v1/runtime_pb2.py # check no changes
 	git diff --exit-code ./ai/src/proto/runtime/v1/runtime_pb2_grpc.py # check no changes
+
+################################################################################
+# Target: generate-acknowledgements                                            #
+################################################################################
+ACKNOWLEDGEMENTS_PATH := dashboard/src/content/acknowledgements.md
+
+.PHONY: generate-acknowledgements
+generate-acknowledgements:
+	echo -e "# Open Source Acknowledgements\n\nSpice.ai would like to acknowledge the following open source projects for making this project possible:\n\n## Python Packages\n" > $(ACKNOWLEDGEMENTS_PATH)
+	
+	# Python Packages
+	python -m venv venv-acknowledgments
+	source venv-acknowledgments/bin/activate
+	venv-acknowledgments/bin/pip install -r ai/src/requirements/production.txt
+	venv-acknowledgments/bin/pip install -r ai/src/requirements/development.txt
+	venv-acknowledgments/bin/pip install -r ai/src/requirements/common.txt
+	venv-acknowledgments/bin/pip install pip-licenses
+	venv-acknowledgments/bin/pip-licenses -f csv --with-authors --with-urls 2>/dev/null >> $(ACKNOWLEDGEMENTS_PATH)
+	rm -rf venv-acknowledgments
+
+	# Go Modules
+	echo -e "\n## Go Modules\n" >> $(ACKNOWLEDGEMENTS_PATH)
+	go get github.com/google/go-licenses
+	pushd cmd/spice && go-licenses csv . 2>/dev/null >> ../../$(ACKNOWLEDGEMENTS_PATH) && popd
+	pushd cmd/spiced && go-licenses csv . 2>/dev/null >> ../../$(ACKNOWLEDGEMENTS_PATH) && popd
+
+	# Node Packages
+	echo -e "\n## Node Packages\n" >> $(ACKNOWLEDGEMENTS_PATH)
+	pushd dashboard && yarn install && npx license-checker --csv 2>/dev/null >> ../$(ACKNOWLEDGEMENTS_PATH) && popd
+
+	# Apply Formatting
+	sed -i 's/\"//g' $(ACKNOWLEDGEMENTS_PATH)
+	sed -i 's/,/, /g' $(ACKNOWLEDGEMENTS_PATH)
+	sed -i 's/,  /, /g' $(ACKNOWLEDGEMENTS_PATH)
