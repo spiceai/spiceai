@@ -53,7 +53,7 @@ jobs:
 
       - name: Test step for getting env vars
         run: |
-          echo ${{ env.LATEST_GHCR_TAG }}
+          echo "Tag is ${{ env.LATEST_GHCR_TAG }}."
 
       - name: Build and push Docker images
         id: docker_build
