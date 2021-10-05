@@ -45,6 +45,16 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Sets latest tags for release
+        run: |
+          echo "LATEST_GHCR_TAG=ghcr.io/spiceai/spiceai:latest" >> $GITHUB_ENV
+          echo "LATEST_DOCKERHUB_TAG=spiceai/spiceai:latest" >> $GITHUB_ENV
+        if: startsWith(github.ref, 'refs/heads/release-')
+
+      - name: Test step for getting env vars
+        run: |
+          echo ${{ env.LATEST_GHCR_TAG }}
+
       - name: Build and push Docker images
         id: docker_build
         uses: docker/build-push-action@v2.5.0
@@ -60,6 +70,8 @@ jobs:
             ghcr.io/spiceai/spiceai:${{ env.REL_VERSION }}-${{ matrix.target_os }}-${{ matrix.target_arch }}
             spiceai/spiceai:${{ env.REL_VERSION }}
             spiceai/spiceai:${{ env.REL_VERSION }}-${{ matrix.target_os }}-${{ matrix.target_arch }}
+            ${{ env.LATEST_GHCR_TAG }}
+            ${{ env.LATEST_DOCKERHUB_TAG }}
           # cache-from: type=gha
           # cache-to: type=gha,mode=max
 
