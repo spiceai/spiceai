@@ -1,6 +1,10 @@
 name: spiced_docker
 
 on:
+  pull_request:
+    branches:
+      - trunk
+      - release-*
   push:
     branches:
       - trunk
