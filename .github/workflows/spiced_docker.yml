@@ -36,11 +36,12 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v1
 
+
       - name: Sets latest tags for release
         run: |
           echo "LATEST_GHCR_TAG=ghcr.io/spiceai/spiceai:latest" >> $GITHUB_ENV
           echo "LATEST_DOCKERHUB_TAG=spiceai/spiceai:latest" >> $GITHUB_ENV
-        if: startsWith(github.ref, 'refs/heads/release-')
+     #   if: startsWith(github.ref, 'refs/heads/release-')
 
       - name: Test step for getting env vars
         run: |
