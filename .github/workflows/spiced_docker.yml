@@ -41,7 +41,7 @@ jobs:
         run: |
           echo "LATEST_GHCR_TAG=ghcr.io/spiceai/spiceai:latest" >> $GITHUB_ENV
           echo "LATEST_DOCKERHUB_TAG=spiceai/spiceai:latest" >> $GITHUB_ENV
-        if: endsWith(env.REL_VERSION, '-rc')
+        if: endsWith(env.REL_VERSION, '-rc') == false
 
       - name: Test step for getting env vars
         run: |
