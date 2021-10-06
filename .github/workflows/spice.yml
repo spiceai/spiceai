@@ -172,5 +172,5 @@ jobs:
             --tag "v${{ env.REL_VERSION }}-spice" \
             --release-name "Spice CLI v${{ env.REL_VERSION }}" \
             --body "${RELEASE_BODY}" \
-            --prerelease true \
+            --pre-release \
             ${RELEASE_ARTIFACT[*]}
