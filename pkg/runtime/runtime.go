@@ -174,12 +174,13 @@ func (r *SpiceRuntime) Shutdown() {
 }
 
 func (r *SpiceRuntime) printStartupBanner(runMode string) {
-	if r.config.DevelopmentMode {
-		fmt.Println(aurora.Yellow("** Development Mode **"))
-	}
 	fmt.Printf("- Runtime version: %s\n", version.Version())
 	if runMode != "" {
-		fmt.Printf("- Mode: %s\n", runMode)
+		fmt.Printf("- %s\n", runMode)
+	}
+	if r.config.DevelopmentMode {
+		fmt.Print("- ")
+		fmt.Println(aurora.Yellow("Development mode"))
 	}
 	fmt.Print("- ")
 	fmt.Println(aurora.Green(fmt.Sprintf("Listening on http://localhost:%d", runtime.config.HttpPort)))

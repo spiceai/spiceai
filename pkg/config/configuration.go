@@ -28,6 +28,8 @@ func LoadRuntimeConfiguration(v *viper.Viper, appDir string) (*SpiceConfiguratio
 	v.SetConfigName(constants.SpiceConfigBaseName)
 	v.SetConfigType("yaml")
 
+	fmt.Println(v.GetString("development_mode"))
+
 	var config *SpiceConfiguration
 	configPath := fmt.Sprintf("%s.yaml", constants.SpiceConfigBaseName)
 
@@ -36,21 +38,22 @@ func LoadRuntimeConfiguration(v *viper.Viper, appDir string) (*SpiceConfiguratio
 		if _, err := os.Stat(configPath); err != nil {
 			// No config file found, use defaults
 			config = LoadDefaultConfiguration()
-			return config, nil
 		}
 	}
 
-	configBytes, err := util.ReplaceEnvVariablesFromPath(configPath, constants.SpiceEnvVarPrefix)
-	if err != nil {
-		return nil, err
+	if config == nil {
+		configBytes, err := util.ReplaceEnvVariablesFromPath(configPath, constants.SpiceEnvVarPrefix)
+		if err != nil {
+			return nil, err
+		}
+
+		err = v.ReadConfig(bytes.NewBuffer(configBytes))
+		if err != nil {
+			return nil, err
+		}
 	}
 
-	err = v.ReadConfig(bytes.NewBuffer(configBytes))
-	if err != nil {
-		return nil, err
-	}
-
-	err = v.Unmarshal(&config)
+	err := v.Unmarshal(&config)
 	if err != nil {
 		return nil, err
 	}
