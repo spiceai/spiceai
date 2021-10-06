@@ -28,8 +28,6 @@ func LoadRuntimeConfiguration(v *viper.Viper, appDir string) (*SpiceConfiguratio
 	v.SetConfigName(constants.SpiceConfigBaseName)
 	v.SetConfigType("yaml")
 
-	fmt.Println(v.GetString("development_mode"))
-
 	var config *SpiceConfiguration
 	configPath := fmt.Sprintf("%s.yaml", constants.SpiceConfigBaseName)
 
