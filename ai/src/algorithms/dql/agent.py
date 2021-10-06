@@ -1,13 +1,10 @@
 import os
 
-from tensorflow.python.keras.engine.input_layer import InputLayer
 from algorithms.agent_interface import SpiceAIAgent
 import random
 
 import numpy as np
 import tensorflow as tf
-from tensorflow.keras.layers import Dense, Input
-from tensorflow.keras.optimizers import Adam
 from algorithms.dql.memory import ReplayBuffer
 from exception import InvalidDataShapeException
 
@@ -46,13 +43,13 @@ class Model:
     def nn_model(self):
         model = tf.keras.Sequential(
             [
-                InputLayer(self.state_shape),
-                Dense(32, activation="relu"),
-                Dense(16, activation="relu"),
-                Dense(self.action_size),
+                tf.keras.layers.InputLayer(self.state_shape),
+                tf.keras.layers.Dense(32, activation="relu"),
+                tf.keras.layers.Dense(16, activation="relu"),
+                tf.keras.layers.Dense(self.action_size),
             ]
         )
-        model.compile(loss="mse", optimizer=Adam(LEARNING_RATE))
+        model.compile(loss="mse", optimizer=tf.keras.optimizers.Adam(LEARNING_RATE))
         return model
 
     def predict(self, state: np.ndarray):
