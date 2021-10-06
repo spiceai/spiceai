@@ -1011,6 +1011,8 @@ github.com/spiceai/data-components-contrib v0.0.0-20210929022049-99326a37be88 h1
 github.com/spiceai/data-components-contrib v0.0.0-20210929022049-99326a37be88/go.mod h1:9vPmlXJckpxfqnVM5d/RKSbh1XT7qnwBSS7U4FvuPHQ=
 github.com/spiceai/data-components-contrib v0.0.0-20211005182912-556e7678eb95 h1:uWayA2iMO05lLPHwTw+v6uUfZCvbWh745kyI5g2wkOk=
 github.com/spiceai/data-components-contrib v0.0.0-20211005182912-556e7678eb95/go.mod h1:kuwIrq8Qnkzgz5bjw68rIUzp3vnBSIzgtvzNve+ZO24=
+github.com/spiceai/data-components-contrib v0.0.0-20211006182528-4abb5a9be52a h1:HWdPNuAniR5k2FOD26JRoxIXpFplX5zi4uCMJoBScJo=
+github.com/spiceai/data-components-contrib v0.0.0-20211006182528-4abb5a9be52a/go.mod h1:kuwIrq8Qnkzgz5bjw68rIUzp3vnBSIzgtvzNve+ZO24=
 github.com/src-d/gcfg v1.4.0/go.mod h1:p/UMsR43ujA89BJY9duynAwIpvqEujIH/jFlfL7jWoI=
 github.com/stoewer/go-strcase v1.2.0/go.mod h1:IBiWB2sKIp3wVVQ3Y035++gc+knqhUQag1KpM8ahLw8=
 github.com/streadway/amqp v0.0.0-20190404075320-75d898a42a94/go.mod h1:AZpEONHx3DKn8O/DFsRAY58/XVQiIPMTMB1SddzLXVw=
