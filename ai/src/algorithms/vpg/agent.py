@@ -1,8 +1,6 @@
 from algorithms.agent_interface import SpiceAIAgent
 import numpy as np
 import tensorflow as tf
-from tensorflow.keras import layers, models
-from tensorflow.keras import backend as K
 from algorithms.vpg.memory import Memory
 from exception import InvalidDataShapeException
 import warnings
@@ -23,24 +21,24 @@ def build_networks(state_shape, action_size, learning_rate, hidden_neurons):
         hidden_neurons (int): the number of neurons to use per hidden
             layer.
     """
-    state_input = layers.Input(state_shape, name="state")
-    g = layers.Input((1,), name="g")
+    state_input = tf.keras.layers.Input(state_shape, name="state")
+    g = tf.keras.layers.Input((1,), name="g")
 
-    hidden_1 = layers.Dense(hidden_neurons, activation="relu")(state_input)
-    hidden_2 = layers.Dense(hidden_neurons, activation="relu")(hidden_1)
-    probabilities = layers.Dense(action_size, activation="softmax")(hidden_2)
+    hidden_1 = tf.keras.layers.Dense(hidden_neurons, activation="relu")(state_input)
+    hidden_2 = tf.keras.layers.Dense(hidden_neurons, activation="relu")(hidden_1)
+    probabilities = tf.keras.layers.Dense(action_size, activation="softmax")(hidden_2)
 
     def custom_loss(y_true, y_pred):
         CLIP_EDGE = 1e-8
-        y_pred_clipped = K.clip(y_pred, CLIP_EDGE, 1 - CLIP_EDGE)
-        log_lik = y_true * K.log(y_pred_clipped)
-        return K.sum(-log_lik * g)
+        y_pred_clipped = tf.keras.backend.clip(y_pred, CLIP_EDGE, 1 - CLIP_EDGE)
+        log_lik = y_true * tf.keras.backend.log(y_pred_clipped)
+        return tf.keras.backend.sum(-log_lik * g)
 
-    policy = models.Model(inputs=[state_input, g], outputs=[probabilities])
+    policy = tf.keras.models.Model(inputs=[state_input, g], outputs=[probabilities])
     optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
     policy.compile(loss=custom_loss, optimizer=optimizer)
 
-    predict = models.Model(inputs=[state_input], outputs=[probabilities])
+    predict = tf.keras.models.Model(inputs=[state_input], outputs=[probabilities])
 
     # Useful for visualizing the neural network graph
     # tf.keras.utils.plot_model(predict, "predict_model.png", show_shapes=True)
@@ -126,7 +124,7 @@ class VanillaPolicyGradient_Agent(SpiceAIAgent):
 
     def load(self, model_name):
         if os.path.exists(model_name):
-            self.predict = models.load_model(model_name)
+            self.predict = tf.keras.models.load_model(model_name)
             return True
         else:
             print(f"Model {model_name} doesn't exist")
