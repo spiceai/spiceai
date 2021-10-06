@@ -1,12 +1,11 @@
 import os
 
-from tensorflow.python.keras.engine.input_layer import InputLayer
 from algorithms.agent_interface import SpiceAIAgent
 import random
 
 import numpy as np
 import tensorflow as tf
-from tensorflow.keras.layers import Dense, Input
+from tensorflow.keras.layers import Dense, Input, InputLayer
 from tensorflow.keras.optimizers import Adam
 from algorithms.dql.memory import ReplayBuffer
 from exception import InvalidDataShapeException
