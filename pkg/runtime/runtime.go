@@ -45,12 +45,16 @@ func (r *SpiceRuntime) LoadConfig() error {
 	return err
 }
 
-func (r *SpiceRuntime) printStartupBanner(mode string) {
-	fmt.Printf("- Runtime version: %s\n", version.Version())
-	if mode != "" {
-		fmt.Printf("- Mode: %s\n", mode)
+func (r *SpiceRuntime) printStartupBanner(runMode string) {
+	if r.config.DevelopmentMode {
+		fmt.Println(aurora.Yellow("** Development Mode**"))
 	}
-	fmt.Println(aurora.Green(fmt.Sprintf("- Listening on http://localhost:%d", runtime.config.HttpPort)))
+	fmt.Printf("- Runtime version: %s\n", version.Version())
+	if runMode != "" {
+		fmt.Printf("- Mode: %s\n", runMode)
+	}
+	fmt.Print("- ")
+	fmt.Println(aurora.Green(fmt.Sprintf("Listening on http://localhost:%d", runtime.config.HttpPort)))
 	fmt.Println()
 	fmt.Println("Use Ctrl-C to stop")
 }
@@ -123,10 +127,12 @@ func Run() error {
 		return err
 	}
 
-	err = watchPods()
-	if err != nil {
-		zaplog.Sugar().Errorf("error watching for pods: %s", err.Error())
-		return err
+	if runtime.config.DevelopmentMode {
+		err = watchPods()
+		if err != nil {
+			zaplog.Sugar().Errorf("error watching for pods: %s", err.Error())
+			return err
+		}
 	}
 
 	err = environment.InitDataConnectors()

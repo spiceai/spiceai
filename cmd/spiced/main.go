@@ -8,6 +8,7 @@ import (
 	"syscall"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
 	"github.com/spiceai/spiceai/pkg/context"
 	"github.com/spiceai/spiceai/pkg/loggers"
 	"github.com/spiceai/spiceai/pkg/runtime"
@@ -16,6 +17,7 @@ import (
 
 var (
 	contextFlag string
+	developmentMode bool
 )
 
 func main() {
@@ -87,5 +89,7 @@ var VersionCmd = &cobra.Command{
 
 func init() {
 	RootCmd.Flags().StringVar(&contextFlag, "context", "metal", "Runs Spice.ai in the given context, either 'docker' or 'metal'")
+	RootCmd.Flags().BoolVarP(&developmentMode, "development", "d", false, "Runs Spice.ai in development mode.")
+	viper.BindPFlag("development_mode", RootCmd.Flags().Lookup("development"))
 	RootCmd.AddCommand(VersionCmd)
 }

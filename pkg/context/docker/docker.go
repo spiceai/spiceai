@@ -204,6 +204,9 @@ func getDockerArgs(args string) []string {
 		}
 	}
 
+	argsTrimmedOfEmptyStrings = append(argsTrimmedOfEmptyStrings, "--entrypoint")
+	argsTrimmedOfEmptyStrings = append(argsTrimmedOfEmptyStrings, "/app/spiced --context docker --development")
+
 	return argsTrimmedOfEmptyStrings
 }
 
