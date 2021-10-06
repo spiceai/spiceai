@@ -12,13 +12,13 @@ import (
 )
 
 type SpiceConfiguration struct {
-	HttpPort uint `json:"http_port,omitempty" mapstructure:"http_port,omitempty" yaml:"http_port,omitempty"`
+	HttpPort        uint `json:"http_port,omitempty" mapstructure:"http_port,omitempty" yaml:"http_port,omitempty"`
 	DevelopmentMode bool `json:"development_mode,omitempty" mapstructure:"development_mode,omitempty" yaml:"development_mode,omitempty"`
 }
 
 func LoadDefaultConfiguration() *SpiceConfiguration {
 	return &SpiceConfiguration{
-		HttpPort: 8000,
+		HttpPort:        8000,
 		DevelopmentMode: false,
 	}
 }

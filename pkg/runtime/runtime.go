@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"github.com/logrusorgru/aurora"
+	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
 	"github.com/spiceai/spiceai/pkg/aiengine"
 	"github.com/spiceai/spiceai/pkg/config"
@@ -27,15 +28,20 @@ type SpiceRuntime struct {
 }
 
 var (
-	runtime SpiceRuntime
+	runtime *SpiceRuntime
 	zaplog  *zap.Logger = loggers.ZapLogger()
 )
 
-func (r *SpiceRuntime) LoadConfig() error {
-	if r.viper == nil {
-		r.viper = viper.New()
+func GetSpiceRuntime() *SpiceRuntime {
+	if runtime == nil {
+		runtime = &SpiceRuntime{
+			viper: viper.New(),
+		}
 	}
+	return runtime
+}
 
+func (r *SpiceRuntime) LoadConfig() error {
 	var err error
 	if r.config == nil {
 		appDir := context.CurrentContext().AppDir()
@@ -45,22 +51,8 @@ func (r *SpiceRuntime) LoadConfig() error {
 	return err
 }
 
-func (r *SpiceRuntime) printStartupBanner(runMode string) {
-	if r.config.DevelopmentMode {
-		fmt.Println(aurora.Yellow("** Development Mode**"))
-	}
-	fmt.Printf("- Runtime version: %s\n", version.Version())
-	if runMode != "" {
-		fmt.Printf("- Mode: %s\n", runMode)
-	}
-	fmt.Print("- ")
-	fmt.Println(aurora.Green(fmt.Sprintf("Listening on http://localhost:%d", runtime.config.HttpPort)))
-	fmt.Println()
-	fmt.Println("Use Ctrl-C to stop")
-}
-
-func SingleRun(manifestPath string) error {
-	err := startRuntime()
+func (r *SpiceRuntime) SingleRun(manifestPath string) error {
+	err := r.startRuntime()
 	if err != nil {
 		return err
 	}
@@ -100,8 +92,8 @@ func SingleRun(manifestPath string) error {
 	return nil
 }
 
-func Run() error {
-	err := startRuntime()
+func (r *SpiceRuntime) Run() error {
+	err := r.startRuntime()
 	if err != nil {
 		return err
 	}
@@ -143,17 +135,69 @@ func Run() error {
 	return nil
 }
 
+func (r *SpiceRuntime) BindFlags(developmentFlag *pflag.Flag) error {
+	err := r.viper.BindPFlag("development_mode", developmentFlag)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (r *SpiceRuntime) Shutdown() {
+	log.Println("Shutting down...")
+
+	wg := new(sync.WaitGroup)
+	wg.Add(1)
+
+	go func() {
+		defer wg.Done()
+		err := aiengine.StopServer()
+		if err != nil {
+			zaplog.Sugar().Debug(err.Error())
+			return
+		}
+	}()
+
+	wg.Add(1)
+
+	go func() {
+		defer wg.Done()
+
+		err := tempdir.RemoveAllCreatedTempDirectories()
+		if err != nil {
+			zaplog.Sugar().Debug(err.Error())
+			return
+		}
+	}()
+
+	wg.Wait()
+}
+
+func (r *SpiceRuntime) printStartupBanner(runMode string) {
+	if r.config.DevelopmentMode {
+		fmt.Println(aurora.Yellow("** Development Mode **"))
+	}
+	fmt.Printf("- Runtime version: %s\n", version.Version())
+	if runMode != "" {
+		fmt.Printf("- Mode: %s\n", runMode)
+	}
+	fmt.Print("- ")
+	fmt.Println(aurora.Green(fmt.Sprintf("Listening on http://localhost:%d", runtime.config.HttpPort)))
+	fmt.Println()
+	fmt.Println("Use Ctrl-C to stop")
+}
+
 func (r *SpiceRuntime) scanForPods() error {
 	_, err := os.Stat(context.CurrentContext().AppDir())
 	if err != nil {
-		// No .spice means no pods
+		// No app directory means no pods
 		return nil
 	}
 
 	podsManifestDir := context.CurrentContext().PodsDir()
 	_, err = os.Stat(podsManifestDir)
 	if err != nil {
-		// No spicepods means no pods
+		// No spicepods directory means no pods
 		return nil
 	}
 
@@ -184,9 +228,7 @@ func (r *SpiceRuntime) scanForPods() error {
 	return nil
 }
 
-func startRuntime() error {
-	runtime = SpiceRuntime{}
-
+func (r *SpiceRuntime) startRuntime() error {
 	err := runtime.LoadConfig()
 	if err != nil {
 		return err
@@ -217,34 +259,4 @@ func initializePod(manifestPath string) (*pods.Pod, error) {
 	}
 
 	return newPod, nil
-}
-
-func Shutdown() {
-	log.Println("Shutting down...")
-
-	wg := new(sync.WaitGroup)
-	wg.Add(1)
-
-	go func() {
-		defer wg.Done()
-		err := aiengine.StopServer()
-		if err != nil {
-			zaplog.Sugar().Debug(err.Error())
-			return
-		}
-	}()
-
-	wg.Add(1)
-
-	go func() {
-		defer wg.Done()
-
-		err := tempdir.RemoveAllCreatedTempDirectories()
-		if err != nil {
-			zaplog.Sugar().Debug(err.Error())
-			return
-		}
-	}()
-
-	wg.Wait()
 }

@@ -42,7 +42,7 @@ func (store *InterpretationsStore) Intervals() int64 {
 func (store *InterpretationsStore) All() []Interpretation {
 	store.interpretationsMutex.RLock()
 	defer store.interpretationsMutex.RUnlock()
-	
+
 	return store.interpretations
 }
 
