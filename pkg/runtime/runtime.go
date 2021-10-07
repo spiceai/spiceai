@@ -41,6 +41,10 @@ func GetSpiceRuntime() *SpiceRuntime {
 	return runtime
 }
 
+func (r *SpiceRuntime) IsDevelopmentMode() bool {
+	return r.config.DevelopmentMode
+}
+
 func (r *SpiceRuntime) LoadConfig() error {
 	var err error
 	if r.config == nil {
