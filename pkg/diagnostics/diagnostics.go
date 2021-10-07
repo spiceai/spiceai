@@ -12,7 +12,7 @@ func GenerateReport() (string, error) {
 	body := strings.Builder{}
 
 	body.WriteString("## Diagnostics Report\n\n")
-	
+
 	body.WriteString("Runtime Context\n")
 	body.WriteString("---------------\n")
 	context := context.CurrentContext()

@@ -18,8 +18,9 @@ import (
 )
 
 type DockerContext struct {
-	spiceBinDir string
-	podsDir     string
+	spiceBinDir       string
+	podsDir           string
+	isDevelopmentMode bool
 }
 
 const (
@@ -78,9 +79,11 @@ func (c *DockerContext) PodsDir() string {
 	return c.podsDir
 }
 
-func (c *DockerContext) Init() error {
+func (c *DockerContext) Init(isDevelopmentMode bool) error {
 	// Ensure any perms set by this process are applied as intended
 	syscall.Umask(0)
+
+	c.isDevelopmentMode = isDevelopmentMode
 
 	return nil
 }
@@ -163,7 +166,7 @@ func (c *DockerContext) GetRunCmd(manifestPath string) (*exec.Cmd, error) {
 	spiceEnvArgs := getSpiceEnvVarsAsDockerArgs()
 
 	dockerImg := getDockerImage(version)
-	dockerArgs := getDockerArgs(fmt.Sprintf(spicedDockerCmd, config.HttpPort, config.HttpPort, spiceEnvArgs, cwd, dockerImg))
+	dockerArgs := c.getDockerArgs(fmt.Sprintf(spicedDockerCmd, config.HttpPort, config.HttpPort, spiceEnvArgs, cwd, dockerImg))
 
 	if manifestPath != "" {
 		dockerArgs = append(dockerArgs, manifestPath)
@@ -181,19 +184,7 @@ func (c *DockerContext) GetSpiceAppRelativePath(absolutePath string) string {
 	return absolutePath
 }
 
-func getSpiceEnvVarsAsDockerArgs() string {
-	var dockerEnvArgs []string
-	for _, envVar := range os.Environ() {
-		if strings.HasPrefix(envVar, constants.SpiceEnvVarPrefix) {
-			dockerEnvArgs = append(dockerEnvArgs, "--env")
-			dockerEnvArgs = append(dockerEnvArgs, envVar)
-		}
-	}
-
-	return strings.Join(dockerEnvArgs, " ")
-}
-
-func getDockerArgs(args string) []string {
+func (c *DockerContext) getDockerArgs(args string) []string {
 	originalArgs := strings.Split(args, " ")
 
 	// strings.Split will add empty strings if more than one space occurs in a row - trim them out
@@ -204,7 +195,23 @@ func getDockerArgs(args string) []string {
 		}
 	}
 
+	if c.isDevelopmentMode {
+		argsTrimmedOfEmptyStrings = append(argsTrimmedOfEmptyStrings, "--development")
+	}
+
 	return argsTrimmedOfEmptyStrings
+}
+
+func getSpiceEnvVarsAsDockerArgs() string {
+	var dockerEnvArgs []string
+	for _, envVar := range os.Environ() {
+		if strings.HasPrefix(envVar, constants.SpiceEnvVarPrefix) {
+			dockerEnvArgs = append(dockerEnvArgs, "--env")
+			dockerEnvArgs = append(dockerEnvArgs, envVar)
+		}
+	}
+
+	return strings.Join(dockerEnvArgs, " ")
 }
 
 func getDockerImage(version string) string {

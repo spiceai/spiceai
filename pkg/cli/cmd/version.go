@@ -27,7 +27,7 @@ spice version
 			os.Exit(1)
 		}
 
-		err = rtcontext.Init()
+		err = rtcontext.Init(true)
 		if err != nil {
 			fmt.Println(err.Error())
 			os.Exit(1)

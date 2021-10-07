@@ -494,7 +494,7 @@ func apiPostImportHandler(ctx *fasthttp.RequestCtx) {
 	ctx.Response.SetStatusCode(200)
 }
 
-func (server *server)apiGetDiagnosticsHandler(ctx *fasthttp.RequestCtx) {
+func (server *server) apiGetDiagnosticsHandler(ctx *fasthttp.RequestCtx) {
 	report, err := diagnostics.GenerateReport()
 	if err != nil {
 		ctx.Response.SetStatusCode(500)

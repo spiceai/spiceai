@@ -12,12 +12,14 @@ import (
 )
 
 type SpiceConfiguration struct {
-	HttpPort uint `json:"http_port,omitempty" mapstructure:"http_port,omitempty" yaml:"http_port,omitempty"`
+	HttpPort        uint `json:"http_port,omitempty" mapstructure:"http_port,omitempty" yaml:"http_port,omitempty"`
+	DevelopmentMode bool `json:"development_mode,omitempty" mapstructure:"development_mode,omitempty" yaml:"development_mode,omitempty"`
 }
 
 func LoadDefaultConfiguration() *SpiceConfiguration {
 	return &SpiceConfiguration{
-		HttpPort: 8000,
+		HttpPort:        8000,
+		DevelopmentMode: false,
 	}
 }
 
@@ -34,21 +36,22 @@ func LoadRuntimeConfiguration(v *viper.Viper, appDir string) (*SpiceConfiguratio
 		if _, err := os.Stat(configPath); err != nil {
 			// No config file found, use defaults
 			config = LoadDefaultConfiguration()
-			return config, nil
 		}
 	}
 
-	configBytes, err := util.ReplaceEnvVariablesFromPath(configPath, constants.SpiceEnvVarPrefix)
-	if err != nil {
-		return nil, err
+	if config == nil {
+		configBytes, err := util.ReplaceEnvVariablesFromPath(configPath, constants.SpiceEnvVarPrefix)
+		if err != nil {
+			return nil, err
+		}
+
+		err = v.ReadConfig(bytes.NewBuffer(configBytes))
+		if err != nil {
+			return nil, err
+		}
 	}
 
-	err = v.ReadConfig(bytes.NewBuffer(configBytes))
-	if err != nil {
-		return nil, err
-	}
-
-	err = v.Unmarshal(&config)
+	err := v.Unmarshal(&config)
 	if err != nil {
 		return nil, err
 	}

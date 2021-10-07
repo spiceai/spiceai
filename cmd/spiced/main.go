@@ -15,7 +15,8 @@ import (
 )
 
 var (
-	contextFlag string
+	contextFlag     string
+	developmentMode bool
 )
 
 func main() {
@@ -44,7 +45,7 @@ var RootCmd = &cobra.Command{
 			os.Exit(1)
 		}
 
-		err = rtcontext.Init()
+		err = rtcontext.Init(developmentMode)
 		if err != nil {
 			fmt.Println(err)
 			os.Exit(1)
@@ -59,6 +60,7 @@ var RootCmd = &cobra.Command{
 
 		isSingleRun := manifestPath != ""
 
+		runtime := runtime.GetSpiceRuntime()
 		if isSingleRun {
 			err = runtime.SingleRun(manifestPath)
 		} else {
@@ -86,6 +88,13 @@ var VersionCmd = &cobra.Command{
 }
 
 func init() {
+	runtime := runtime.GetSpiceRuntime()
 	RootCmd.Flags().StringVar(&contextFlag, "context", "metal", "Runs Spice.ai in the given context, either 'docker' or 'metal'")
+	RootCmd.Flags().BoolVarP(&developmentMode, "development", "d", false, "Runs Spice.ai in development mode.")
+	err := runtime.BindFlags(RootCmd.Flags().Lookup("development"))
+	if err != nil {
+		fmt.Printf("error initializing: %s", err)
+		return
+	}
 	RootCmd.AddCommand(VersionCmd)
 }

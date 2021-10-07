@@ -25,7 +25,7 @@ func ParseTime(str string, format string) (time.Time, error) {
 		}
 		return time.Time{}, fmt.Errorf("incorrectly formatted time '%s', expected unix timestamp or rfc3339", str)
 	}
-	
+
 	if strings.EqualFold(format, "rfc3339") {
 		t, err := time.Parse(time.RFC3339, str)
 		if err != nil {

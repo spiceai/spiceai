@@ -12,7 +12,7 @@ import (
 
 type RuntimeContext interface {
 	Name() string
-	Init() error
+	Init(isDevelopmentMode bool) error
 	Version() (string, error)
 	IsRuntimeInstallRequired() bool
 	InstallOrUpgradeRuntime() error
@@ -52,7 +52,7 @@ func SetDefaultContext() error {
 		return err
 	}
 
-	err = rtcontext.Init()
+	err = rtcontext.Init(false)
 	if err != nil {
 		return err
 	}
