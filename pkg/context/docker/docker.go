@@ -166,13 +166,12 @@ func (c *DockerContext) GetRunCmd(manifestPath string) (*exec.Cmd, error) {
 	spiceEnvArgs := getSpiceEnvVarsAsDockerArgs()
 
 	dockerImg := getDockerImage(version)
-	dockerArgs := getDockerArgs(fmt.Sprintf(spicedDockerCmd, config.HttpPort, config.HttpPort, spiceEnvArgs, cwd, dockerImg))
+	dockerArgs := c.getDockerArgs(fmt.Sprintf(spicedDockerCmd, config.HttpPort, config.HttpPort, spiceEnvArgs, cwd, dockerImg))
 
 	if manifestPath != "" {
 		dockerArgs = append(dockerArgs, manifestPath)
 	}
 
-	fmt.Println(strings.Join(dockerArgs, " "))
 	cmd := exec.Command("docker", dockerArgs...)
 
 	return cmd, nil
@@ -185,19 +184,7 @@ func (c *DockerContext) GetSpiceAppRelativePath(absolutePath string) string {
 	return absolutePath
 }
 
-func getSpiceEnvVarsAsDockerArgs() string {
-	var dockerEnvArgs []string
-	for _, envVar := range os.Environ() {
-		if strings.HasPrefix(envVar, constants.SpiceEnvVarPrefix) {
-			dockerEnvArgs = append(dockerEnvArgs, "--env")
-			dockerEnvArgs = append(dockerEnvArgs, envVar)
-		}
-	}
-
-	return strings.Join(dockerEnvArgs, " ")
-}
-
-func getDockerArgs(args string) []string {
+func (c *DockerContext) getDockerArgs(args string) []string {
 	originalArgs := strings.Split(args, " ")
 
 	// strings.Split will add empty strings if more than one space occurs in a row - trim them out
@@ -208,11 +195,23 @@ func getDockerArgs(args string) []string {
 		}
 	}
 
-	argsTrimmedOfEmptyStrings = append(argsTrimmedOfEmptyStrings, "--entrypoint /app/spiced")
-	argsTrimmedOfEmptyStrings = append(argsTrimmedOfEmptyStrings, "--context docker")
-	argsTrimmedOfEmptyStrings = append(argsTrimmedOfEmptyStrings, "--development")
+	if c.isDevelopmentMode {
+		argsTrimmedOfEmptyStrings = append(argsTrimmedOfEmptyStrings, "--development")
+	}
 
 	return argsTrimmedOfEmptyStrings
+}
+
+func getSpiceEnvVarsAsDockerArgs() string {
+	var dockerEnvArgs []string
+	for _, envVar := range os.Environ() {
+		if strings.HasPrefix(envVar, constants.SpiceEnvVarPrefix) {
+			dockerEnvArgs = append(dockerEnvArgs, "--env")
+			dockerEnvArgs = append(dockerEnvArgs, envVar)
+		}
+	}
+
+	return strings.Join(dockerEnvArgs, " ")
 }
 
 func getDockerImage(version string) string {

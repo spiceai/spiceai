@@ -168,11 +168,11 @@ func (c *MetalContext) GetRunCmd(manifestPath string) (*exec.Cmd, error) {
 	}
 	spiceCMD := c.binaryFilePath("spiced")
 
-	args := []string{ manifestPath }
+	args := []string{manifestPath}
 	if c.isDevelopmentMode {
 		args = append(args, "--development")
 	}
-	
+
 	cmd := exec.Command(spiceCMD, args...)
 
 	return cmd, nil
