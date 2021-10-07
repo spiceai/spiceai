@@ -162,10 +162,6 @@ func (c *MetalContext) GetSpiceAppRelativePath(absolutePath string) string {
 }
 
 func (c *MetalContext) GetRunCmd(manifestPath string) (*exec.Cmd, error) {
-	err := c.ensureAIPresent()
-	if err != nil {
-		return nil, fmt.Errorf("AI Engine has not been downloaded")
-	}
 	spiceCMD := c.binaryFilePath("spiced")
 
 	args := []string{manifestPath}
