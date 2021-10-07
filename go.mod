@@ -16,7 +16,7 @@ require (
 	github.com/spf13/cast v1.4.1 // indirect
 	github.com/spf13/cobra v1.2.1
 	github.com/spf13/viper v1.8.1
-	github.com/spiceai/data-components-contrib v0.0.0-20210929022049-99326a37be88
+	github.com/spiceai/data-components-contrib v0.0.0-20211006182528-4abb5a9be52a
 	github.com/stretchr/testify v1.7.0
 	github.com/valyala/fasthttp v1.28.0
 	go.uber.org/atomic v1.9.0 // indirect
@@ -39,12 +39,17 @@ require (
 	github.com/andreyvit/diff v0.0.0-20170406064948-c7f18ee00883 // indirect
 	github.com/apache/arrow/go/arrow v0.0.0-20210922070358-ec7aeb577330 // indirect
 	github.com/benbjohnson/immutable v0.2.1 // indirect
+	github.com/cenkalti/backoff v2.2.1+incompatible // indirect
 	github.com/cespare/xxhash/v2 v2.1.2 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
+	github.com/dghubble/go-twitter v0.0.0-20210609183100-2fdbf421508e // indirect
+	github.com/dghubble/oauth1 v0.7.0 // indirect
+	github.com/dghubble/sling v1.3.0 // indirect
 	github.com/gofrs/uuid v4.0.0+incompatible // indirect
 	github.com/golang/protobuf v1.5.2 // indirect
 	github.com/google/flatbuffers v2.0.0+incompatible // indirect
 	github.com/google/go-cmp v0.5.6 // indirect
+	github.com/google/go-querystring v1.0.0 // indirect
 	github.com/hashicorp/errwrap v1.1.0 // indirect
 	github.com/hashicorp/go-cleanhttp v0.5.1 // indirect
 	github.com/hashicorp/go-multierror v1.1.1 // indirect

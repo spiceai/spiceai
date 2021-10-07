@@ -379,7 +379,7 @@ func (pod *Pod) InitDataConnectors(handler state.StateHandler) error {
 		dsp := ds
 		errGroup.Go(func() error {
 			dsp.RegisterStateHandler(handler)
-			return dsp.InitDataConnector(pod.Epoch(), pod.Period(), pod.Interval())
+			return dsp.InitDataConnector(pod.podParams.Epoch, pod.podParams.Period, pod.podParams.Interval)
 		})
 	}
 
