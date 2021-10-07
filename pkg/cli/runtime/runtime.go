@@ -6,6 +6,7 @@ import (
 	"os"
 
 	"github.com/spiceai/spiceai/pkg/context"
+	"github.com/spiceai/spiceai/pkg/runtime"
 	"github.com/spiceai/spiceai/pkg/util"
 )
 
@@ -18,7 +19,8 @@ func Run(contextFlag string, manifestPath string) error {
 		os.Exit(1)
 	}
 
-	err = rtcontext.Init()
+	runtime := runtime.GetSpiceRuntime()
+	err = rtcontext.Init(runtime.IsDevelopmentMode())
 	if err != nil {
 		fmt.Println(err.Error())
 		os.Exit(1)

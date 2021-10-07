@@ -18,8 +18,9 @@ import (
 )
 
 type DockerContext struct {
-	spiceBinDir string
-	podsDir     string
+	spiceBinDir       string
+	podsDir           string
+	isDevelopmentMode bool
 }
 
 const (
@@ -78,9 +79,11 @@ func (c *DockerContext) PodsDir() string {
 	return c.podsDir
 }
 
-func (c *DockerContext) Init() error {
+func (c *DockerContext) Init(isDevelopmentMode bool) error {
 	// Ensure any perms set by this process are applied as intended
 	syscall.Umask(0)
+
+	c.isDevelopmentMode = isDevelopmentMode
 
 	return nil
 }
@@ -169,6 +172,7 @@ func (c *DockerContext) GetRunCmd(manifestPath string) (*exec.Cmd, error) {
 		dockerArgs = append(dockerArgs, manifestPath)
 	}
 
+	fmt.Println(strings.Join(dockerArgs, " "))
 	cmd := exec.Command("docker", dockerArgs...)
 
 	return cmd, nil
@@ -204,8 +208,9 @@ func getDockerArgs(args string) []string {
 		}
 	}
 
-	argsTrimmedOfEmptyStrings = append(argsTrimmedOfEmptyStrings, "--entrypoint")
-	argsTrimmedOfEmptyStrings = append(argsTrimmedOfEmptyStrings, "/app/spiced --context docker --development")
+	argsTrimmedOfEmptyStrings = append(argsTrimmedOfEmptyStrings, "--entrypoint /app/spiced")
+	argsTrimmedOfEmptyStrings = append(argsTrimmedOfEmptyStrings, "--context docker")
+	argsTrimmedOfEmptyStrings = append(argsTrimmedOfEmptyStrings, "--development")
 
 	return argsTrimmedOfEmptyStrings
 }

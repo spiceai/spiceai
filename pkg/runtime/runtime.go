@@ -42,7 +42,7 @@ func GetSpiceRuntime() *SpiceRuntime {
 }
 
 func (r *SpiceRuntime) IsDevelopmentMode() bool {
-	return r.config.DevelopmentMode
+	return r.viper.GetBool("development_mode")
 }
 
 func (r *SpiceRuntime) LoadConfig() error {

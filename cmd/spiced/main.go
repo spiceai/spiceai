@@ -45,7 +45,7 @@ var RootCmd = &cobra.Command{
 			os.Exit(1)
 		}
 
-		err = rtcontext.Init()
+		err = rtcontext.Init(developmentMode)
 		if err != nil {
 			fmt.Println(err)
 			os.Exit(1)

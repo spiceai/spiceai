@@ -22,6 +22,7 @@ type MetalContext struct {
 	aiEnginePythonCmdPath string
 	appDir                string
 	podsDir               string
+	isDevelopmentMode     bool
 }
 
 func NewMetalContext() *MetalContext {
@@ -64,13 +65,14 @@ func (c *MetalContext) PodsDir() string {
 	return c.podsDir
 }
 
-func (c *MetalContext) Init() error {
+func (c *MetalContext) Init(isDevelopmentMode bool) error {
 	cwd, err := os.Getwd()
 	if err != nil {
 		return err
 	}
 	c.appDir = cwd
 	c.podsDir = filepath.Join(c.appDir, constants.SpicePodsDirectoryName)
+	c.isDevelopmentMode = isDevelopmentMode
 
 	return nil
 }
@@ -166,8 +168,11 @@ func (c *MetalContext) GetRunCmd(manifestPath string) (*exec.Cmd, error) {
 	}
 	spiceCMD := c.binaryFilePath("spiced")
 
-	args := []string{manifestPath}
-	args = append(args, "-development")
+	args := []string{ manifestPath }
+	if c.isDevelopmentMode {
+		args = append(args, "--development")
+	}
+	
 	cmd := exec.Command(spiceCMD, args...)
 
 	return cmd, nil
