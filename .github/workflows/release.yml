@@ -248,5 +248,5 @@ jobs:
             --tag "v${{ env.REL_VERSION }}-spiceai" \
             --release-name "Spice.ai v${{ env.REL_VERSION }}" \
             --body "${RELEASE_BODY}" \
-            --prerelease=true \
+            --prerelease "true" \
             ${RELEASE_ARTIFACT[*]}
