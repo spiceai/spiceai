@@ -6,9 +6,10 @@ import (
 )
 
 type Observation struct {
-	Time int64
-	Data map[string]float64
-	Tags []string
+	Time       int64
+	Data       map[string]float64
+	Categories map[string]string
+	Tags       []string
 }
 
 func GetCsv(headers []string, validTags []string, observations []Observation) string {
@@ -34,6 +35,13 @@ func GetCsv(headers []string, validTags []string, observations []Observation) st
 			val, ok := o.Data[f]
 			if ok {
 				csv.WriteString(strconv.FormatFloat(val, 'f', -1, 64))
+				continue
+			}
+
+			category, ok := o.Categories[f]
+			if ok {
+				csv.WriteString(category)
+				continue
 			}
 		}
 
