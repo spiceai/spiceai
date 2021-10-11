@@ -171,5 +171,5 @@ jobs:
             --tag "v${{ env.REL_VERSION }}-spiced" \
             --release-name "Spice Runtime v${{ env.REL_VERSION }}" \
             --body "${RELEASE_BODY}" \
-            --pre-release \
+            --prerelease \
             ${RELEASE_ARTIFACT[*]}
