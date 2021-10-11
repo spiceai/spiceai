@@ -145,7 +145,7 @@ func (c *MetalContext) IsRuntimeUpgradeAvailable() (string, error) {
 		return "", nil
 	}
 
-	tagName := "v" + currentVersion
+	tagName := currentVersion
 	release, err := github.GetLatestRuntimeRelease(tagName)
 	if err != nil {
 		return "", err
