@@ -16,15 +16,6 @@ on:
   workflow_dispatch:
 
 jobs:
-  setup_environment:
-    name: Set release environment variables
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v2
-
-      - name: Set REL_VERSION from version.txt
-        run: python ./.github/scripts/get_release_version.py
-
   build_dashboard:
     name: Build dashboard
     runs-on: ubuntu-latest
@@ -45,73 +36,9 @@ jobs:
           name: dashboard_build
           path: dashboard/build
 
-  build_spice:
-    name: Build ${{ matrix.target_os }}_${{ matrix.target_arch }} binaries
-    needs: setup_environment
-    runs-on: ${{ matrix.os }}
-    env:
-      GOVER: 1.17
-      GOOS: ${{ matrix.target_os }}
-      GOARCH: ${{ matrix.target_arch }}
-
-    strategy:
-      matrix:
-        os: [self-hosted, ubuntu-latest, macOS-latest]
-        target_arch: [amd64, arm64]
-        include:
-          - os: ubuntu-latest
-            target_os: linux
-          - os: macOS-latest
-            target_os: darwin
-          - os: self-hosted
-            target_os: darwin
-        exclude:
-          - os: ubuntu-latest
-            target_arch: arm64
-          - os: macOS-latest
-            target_arch: arm64
-          - os: self-hosted
-            target_arch: amd64
-
-    steps:
-      - uses: actions/checkout@v2
-
-      - name: Set up Go
-        uses: actions/setup-go@v2
-        with:
-          go-version: ${{ env.GOVER }}
-
-      - name: Build spice
-        run: make
-        working-directory: cmd/spice
-
-      - name: tar binary
-        if: matrix.target_os != 'windows'
-        working-directory: cmd/spice
-        run: |
-          chmod +x spice
-          tar cf spice_${{ matrix.target_os }}_${{ matrix.target_arch }}.tar.gz spice
-
-      - name: Print version
-        if: matrix.target_os != 'windows'
-        working-directory: cmd/spice
-        run: ./spice version
-
-      - uses: actions/upload-artifact@v2
-        if: matrix.target_os != 'windows'
-        with:
-          name: spice_${{ matrix.target_os }}_${{ matrix.target_arch }}
-          path: cmd/spice/spice_${{ matrix.target_os }}_${{ matrix.target_arch }}.tar.gz
-
-      - uses: actions/upload-artifact@v2
-        if: matrix.target_os == 'windows'
-        with:
-          name: spice_${{ matrix.target_os }}_${{ matrix.target_arch }}
-          path: cmd/spice/spice.exe
-
   build_spiced:
     name: Build ${{ matrix.target_os }}_${{ matrix.target_arch }} binaries
-    needs: [setup_environment, build_dashboard]
+    needs: build_dashboard
     runs-on: ${{ matrix.os }}
     env:
       GOVER: 1.17
@@ -184,6 +111,72 @@ jobs:
         with:
           name: spiced_${{ matrix.target_os }}_${{ matrix.target_arch }}
           path: cmd/spiced/spiced.exe
+
+  build_spice:
+    name: Build ${{ matrix.target_os }}_${{ matrix.target_arch }} binaries
+    runs-on: ${{ matrix.os }}
+    env:
+      GOVER: 1.17
+      GOOS: ${{ matrix.target_os }}
+      GOARCH: ${{ matrix.target_arch }}
+
+    strategy:
+      matrix:
+        os: [self-hosted, ubuntu-latest, macOS-latest]
+        target_arch: [amd64, arm64]
+        include:
+          - os: ubuntu-latest
+            target_os: linux
+          - os: macOS-latest
+            target_os: darwin
+          - os: self-hosted
+            target_os: darwin
+        exclude:
+          - os: ubuntu-latest
+            target_arch: arm64
+          - os: macOS-latest
+            target_arch: arm64
+          - os: self-hosted
+            target_arch: amd64
+
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Set REL_VERSION from version.txt
+        run: python ./.github/scripts/get_release_version.py
+
+      - name: Set up Go
+        uses: actions/setup-go@v2
+        with:
+          go-version: ${{ env.GOVER }}
+
+      - name: Build spice
+        run: make
+        working-directory: cmd/spice
+
+      - name: tar binary
+        if: matrix.target_os != 'windows'
+        working-directory: cmd/spice
+        run: |
+          chmod +x spice
+          tar cf spice_${{ matrix.target_os }}_${{ matrix.target_arch }}.tar.gz spice
+
+      - name: Print version
+        if: matrix.target_os != 'windows'
+        working-directory: cmd/spice
+        run: ./spice version
+
+      - uses: actions/upload-artifact@v2
+        if: matrix.target_os != 'windows'
+        with:
+          name: spice_${{ matrix.target_os }}_${{ matrix.target_arch }}
+          path: cmd/spice/spice_${{ matrix.target_os }}_${{ matrix.target_arch }}.tar.gz
+
+      - uses: actions/upload-artifact@v2
+        if: matrix.target_os == 'windows'
+        with:
+          name: spice_${{ matrix.target_os }}_${{ matrix.target_arch }}
+          path: cmd/spice/spice.exe
 
   publish:
     name: Publish ${{ matrix.target_os }}-${{ matrix.target_arch }} binaries
