@@ -25,7 +25,8 @@ func TestGetPodInitForTraining(t *testing.T) {
 
 		initRequest := getPodInitForTraining(pod)
 		initRequest.EpochTime = 123456789
-		err = snapshotter.SnapshotMulti(filepath.Base(pod.ManifestPath()), initRequest)
+
+		err = snapshotter.SnapshotMultiJson(filepath.Base(pod.ManifestPath()), initRequest)
 		if err != nil {
 			t.Fatal(err)
 		}

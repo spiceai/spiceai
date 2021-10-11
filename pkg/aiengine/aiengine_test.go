@@ -2,14 +2,12 @@ package aiengine
 
 import (
 	go_context "context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"testing"
 
-	"github.com/bradleyjkemp/cupaloy"
 	"github.com/spiceai/spiceai/pkg/context"
 	"github.com/spiceai/spiceai/pkg/pods"
 	"github.com/spiceai/spiceai/pkg/proto/aiengine_pb"
@@ -18,7 +16,7 @@ import (
 	"google.golang.org/grpc"
 )
 
-var snapshotter = cupaloy.New(cupaloy.SnapshotSubdirectory("../../test/assets/snapshots/aiengine"))
+var snapshotter = testutils.NewSnapshotter("../../test/assets/snapshots/aiengine")
 
 func TestAIEngineGetPythonCmd(t *testing.T) {
 	origContext := context.CurrentContext()
@@ -96,13 +94,7 @@ func testInitializePod(pod *pods.Pod) func(t *testing.T) {
 					ir.ActionsOrder = val
 				}
 
-				// marshal to JSON so the snapshot is easy to consume
-				data, err := json.MarshalIndent(ir, "", "  ")
-				if err != nil {
-					t.Error(err)
-				}
-
-				snapshotter.SnapshotT(t, data)
+				snapshotter.SnapshotTJson(t, ir)
 
 				return &aiengine_pb.Response{
 					Result: "ok",
@@ -315,12 +307,6 @@ func testGetPodInitForTrainingFunc(pod *pods.Pod) func(*testing.T) {
 		var testEpochTime int64 = 1234
 		podInitSpec.EpochTime = testEpochTime
 
-		// marshal to JSON so the snapshot is easy to consume
-		data, err := json.MarshalIndent(podInitSpec, "", "  ")
-		if err != nil {
-			t.Error(err)
-		}
-
-		snapshotter.SnapshotT(t, data)
+		snapshotter.SnapshotTJson(t, podInitSpec)
 	}
 }
