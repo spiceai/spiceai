@@ -18,6 +18,7 @@ dataspaces:
       - name: eventId
       - name: height
       - name: rating
+        fill: none
       - name: speed
       - name: target
       - name: tagA

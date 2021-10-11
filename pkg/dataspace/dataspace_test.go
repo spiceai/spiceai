@@ -3,12 +3,16 @@ package dataspace_test
 import (
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 
+	"github.com/bradleyjkemp/cupaloy"
 	"github.com/spf13/viper"
 	"github.com/spiceai/spiceai/pkg/dataspace"
 	"github.com/spiceai/spiceai/pkg/spec"
 )
+
+var snapshotter = cupaloy.New(cupaloy.SnapshotSubdirectory("../../test/assets/snapshots/dataspace"))
 
 func TestDataSource(t *testing.T) {
 
@@ -102,22 +106,9 @@ func testFieldsFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 
 		actual := ds.Fields()
 
-		var expected map[string]float64
-
-		switch ds.Name() {
-		case "local/portfolio":
-			expected = map[string]float64{
-				"local.portfolio.usd_balance": 1000000,
-				"local.portfolio.btc_balance": 0,
-			}
-		case "coinbase/btcusd":
-			expected = map[string]float64{
-				"coinbase.btcusd.close": 0,
-			}
-		}
-
-		if !reflect.DeepEqual(expected, actual) {
-			t.Errorf("Expected:\n%v\nGot:\n%v", expected, actual)
+		err = snapshotter.SnapshotMulti(strings.ReplaceAll(ds.Name(), "/", "_"), actual)
+		if err != nil {
+			t.Fatal(err)
 		}
 	}
 }
