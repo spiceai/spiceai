@@ -1,6 +1,11 @@
 name: release
 
 on:
+  pull_request:
+    branches:
+      - trunk
+      - release-*
+
   push:
     branches:
       - trunk
@@ -187,7 +192,7 @@ jobs:
   publish:
     name: Publish ${{ matrix.target_os }}-${{ matrix.target_arch }} binaries
     needs: build_spice, build_spiced
-    if: github.event_name != 'pull_request'
+    # if: github.event_name != 'pull_request'
     env:
       ARTIFACT_DIR: ./release
 
