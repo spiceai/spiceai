@@ -83,6 +83,8 @@ func GetLatestRelease(gh *GitHubClient, tagName string, assetName string) (*Repo
 		return nil, fmt.Errorf("no releases")
 	}
 
+	tagName += "-spiceai"
+
 	// Sort by semver in descending order
 	sort.Sort(releases)
 
