@@ -115,7 +115,7 @@ jobs:
 
   build_spiced:
     name: Build ${{ matrix.target_os }}_${{ matrix.target_arch }} binaries
-    needs: setup_environment, build_dashboard
+    needs: [setup_environment, build_dashboard]
     runs-on: ${{ matrix.os }}
     env:
       GOVER: 1.17
@@ -191,7 +191,7 @@ jobs:
 
   publish:
     name: Publish ${{ matrix.target_os }}-${{ matrix.target_arch }} binaries
-    needs: build_spice, build_spiced
+    needs: [build_spice, build_spiced]
     # if: github.event_name != 'pull_request'
     env:
       ARTIFACT_DIR: ./release
