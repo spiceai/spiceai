@@ -242,11 +242,17 @@ jobs:
           else
             export RELEASE_BODY="This is the release candidate ${{ env.REL_VERSION }}"
           fi
+          echo "Creating Spice.ai Release"
+          github-release upload \
+            --owner $OWNER_NAME --repo $REPO_NAME \
+            --tag "v${{ env.REL_VERSION }}-spiceai" \
+            --release-name "Spice.ai v${{ env.REL_VERSION }}" \
+            --body "${RELEASE_BODY}" \
+            --prerelease
           echo "Uploading Spice.ai Binaries to GitHub Release"
           github-release upload \
             --owner $OWNER_NAME --repo $REPO_NAME \
             --tag "v${{ env.REL_VERSION }}-spiceai" \
             --release-name "Spice.ai v${{ env.REL_VERSION }}" \
             --body "${RELEASE_BODY}" \
-            --prerelease "true" \
             ${RELEASE_ARTIFACT[*]}
