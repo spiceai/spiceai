@@ -9,10 +9,18 @@
     "action_two": "reward = 1"
   },
   "fields": {
-    "event_data_eventId": {},
-    "event_data_height": {},
-    "event_data_rating": {},
-    "event_data_speed": {},
+    "event_data_eventId": {
+      "fill_method": 1
+    },
+    "event_data_height": {
+      "fill_method": 1
+    },
+    "event_data_rating": {
+      "fill_method": 1
+    },
+    "event_data_speed": {
+      "fill_method": 1
+    },
     "event_data_tagA": {
       "fill_method": 1
     },
@@ -22,7 +30,9 @@
     "event_data_tagC": {
       "fill_method": 1
     },
-    "event_data_target": {}
+    "event_data_target": {
+      "fill_method": 1
+    }
   },
   "datasources": [
     {

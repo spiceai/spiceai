@@ -66,12 +66,18 @@ func getPodInitForTraining(pod *pods.Pod) *aiengine_pb.InitRequest {
 
 	var dsInitSpecs []*aiengine_pb.DataSource
 	for _, ds := range pod.DataSpaces() {
-		for fqField, fqFieldInitializer := range ds.Fields() {
+		for fqField, field := range ds.Fields() {
 			fieldName := strings.ReplaceAll(fqField, ".", "_")
-			fields[fieldName] = &aiengine_pb.FieldData{
-				Initializer: fqFieldInitializer,
-				FillMethod:  aiengine_pb.FillType_FILL_FORWARD,
+			fieldData := &aiengine_pb.FieldData{
+				Initializer: field.InitialValue,
+				FillMethod:  aiengine_pb.FillType_FILL_ZERO,
 			}
+
+			if field.Fill == "previous" {
+				fieldData.FillMethod = aiengine_pb.FillType_FILL_FORWARD
+			}
+
+			fields[fieldName] = fieldData
 		}
 
 		for _, localTag := range ds.Tags() {

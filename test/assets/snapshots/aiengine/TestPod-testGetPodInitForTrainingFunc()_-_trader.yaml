@@ -10,10 +10,15 @@
     "sell": "prev_price = prev_state.coinbase_btcusd_close\nnew_price = new_state.coinbase_btcusd_close\nchange_in_price = prev_price - new_price\nreward = -change_in_price\n"
   },
   "fields": {
-    "coinbase_btcusd_close": {},
-    "local_portfolio_btc_balance": {},
+    "coinbase_btcusd_close": {
+      "fill_method": 1
+    },
+    "local_portfolio_btc_balance": {
+      "fill_method": 1
+    },
     "local_portfolio_usd_balance": {
-      "initializer": 1000000
+      "initializer": 1000000,
+      "fill_method": 1
     }
   },
   "laws": [
