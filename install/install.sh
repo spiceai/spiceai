@@ -103,9 +103,9 @@ getLatestRelease() {
     local latest_release=""
 
     if [ "$SPICE_HTTP_REQUEST_CLI" == "curl" ]; then
-        latest_release=$(curl -s $spiceReleaseUrl | grep \"tag_name\" | grep -v rc | grep spice\" | awk 'NR==1{print $2}' |  sed -n 's/\"\(.*\)\",/\1/p')
+        latest_release=$(curl -s $spiceReleaseUrl | grep \"tag_name\" | grep spiceai\" | awk 'NR==1{print $2}' |  sed -n 's/\"\(.*\)\",/\1/p')
     else
-        latest_release=$(wget -q --header="Accept: application/json" -O - $spiceReleaseUrl | grep \"tag_name\" | grep -v rc | grep spice\" | awk 'NR==1{print $2}' |  sed -n 's/\"\(.*\)\",/\1/p')
+        latest_release=$(wget -q --header="Accept: application/json" -O - $spiceReleaseUrl | grep \"tag_name\" | grep spiceai\" | awk 'NR==1{print $2}' |  sed -n 's/\"\(.*\)\",/\1/p')
     fi
 
     ret_val=$latest_release
@@ -239,7 +239,7 @@ else
     ret_val=v$1
 fi
 
-FRIENDLY_VERSION=$(echo $ret_val | sed 's/-spice//')
+FRIENDLY_VERSION=$(echo $ret_val | sed 's/-spiceai//')
 echo "Installing Spice CLI $FRIENDLY_VERSION ..."
 
 downloadFile $ret_val
