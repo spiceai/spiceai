@@ -30,7 +30,7 @@ func GetLatestRuntimeRelease(tagName string) (*RepoRelease, error) {
 }
 
 func GetRuntimeVersion(release *RepoRelease) string {
-	return strings.TrimSuffix(release.TagName, fmt.Sprintf("-%s", constants.SpiceRuntimeFilename))
+	return strings.TrimSuffix(release.TagName, "-spiceai")
 }
 
 func DownloadRuntimeAsset(release *RepoRelease, downloadPath string) error {
