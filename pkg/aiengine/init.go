@@ -70,11 +70,11 @@ func getPodInitForTraining(pod *pods.Pod) *aiengine_pb.InitRequest {
 			fieldName := strings.ReplaceAll(fqField, ".", "_")
 			fieldData := &aiengine_pb.FieldData{
 				Initializer: field.InitialValue,
-				FillMethod:  aiengine_pb.FillType_FILL_ZERO,
+				FillMethod:  aiengine_pb.FillType_FILL_FORWARD,
 			}
 
-			if field.Fill == "previous" {
-				fieldData.FillMethod = aiengine_pb.FillType_FILL_FORWARD
+			if field.Fill == "none" {
+				fieldData.FillMethod = aiengine_pb.FillType_FILL_ZERO
 			}
 
 			fields[fieldName] = fieldData

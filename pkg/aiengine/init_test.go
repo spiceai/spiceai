@@ -8,7 +8,7 @@ import (
 )
 
 func TestGetPodInitForTraining(t *testing.T) {
-	manifestsToTest := []string{"trader.yaml", "trader-infer.yaml", "event-tags.yaml"}
+	manifestsToTest := []string{"event-tags.yaml", "trader.yaml", "trader-infer.yaml", "event-tags.yaml"}
 
 	for _, manifestToTest := range manifestsToTest {
 		manifestPath := filepath.Join("../../test/assets/pods/manifests", manifestToTest)
