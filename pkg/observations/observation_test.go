@@ -13,6 +13,17 @@ import (
 
 var snapshotter = cupaloy.New(cupaloy.SnapshotSubdirectory("../../test/assets/snapshots/observations"))
 
+func TestObservationsCategorical(t *testing.T) {
+	observation := &observations.Observation{
+		Data:       map[string]float64{"foo": 1.0},
+		Categories: map[string]string{"color": "red"},
+	}
+
+	csv := observations.GetCsv([]string{"foo", "color"}, []string{}, []observations.Observation{*observation})
+
+	snapshotter.SnapshotT(t, csv)
+}
+
 func TestObservations(t *testing.T) {
 	t.Run("GetCsv() - All headers", testGetCsvAllHeadersFunc())
 	t.Run("GetCsv() - Select headers", testGetCsvSelectHeadersFunc())
