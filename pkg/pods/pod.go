@@ -319,6 +319,26 @@ func (pod *Pod) ValidateForTraining() error {
 		return errors.New("at least one dataspace is required for training")
 	}
 
+	for _, ds := range pod.PodSpec.Dataspaces {
+		for _, f := range ds.Fields {
+			switch f.Type {
+			case "":
+				fallthrough
+			case "number":
+				continue
+			case "category":
+				if len(f.Values) == 0 {
+					return fmt.Errorf("specify the category values")
+				}
+				continue
+			case "tag":
+				continue
+			default:
+				return fmt.Errorf("invalid type '%s': choose one of ['number', 'tag', 'category']", f.Type)
+			}
+		}
+	}
+
 	actions := pod.Actions()
 
 	if len(actions) == 0 {
