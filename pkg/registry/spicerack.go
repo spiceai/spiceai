@@ -10,7 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/hashicorp/go-retryablehttp"
+	spice_http "github.com/spiceai/spiceai/pkg/http"
+
 	"github.com/spiceai/spiceai/pkg/context"
 	"github.com/spiceai/spiceai/pkg/loggers"
 	"github.com/spiceai/spiceai/pkg/util"
@@ -43,14 +44,7 @@ func (r *SpiceRackRegistry) GetPod(podFullPath string) (string, error) {
 	}
 	failureMessage := fmt.Sprintf("An error occurred while fetching pod '%s' from spicerack.org", podFullPath)
 
-	req, err := retryablehttp.NewRequest("GET", url, nil)
-	if err != nil {
-		return "", err
-	}
-
-	req.Header.Add("Accept", "application/zip")
-
-	response, err := retryablehttp.NewClient().Do(req)
+	response, err := spice_http.Get(url, "application/zip")
 	if err != nil {
 		zaplog.Sugar().Debugf("%s: %s", failureMessage, err.Error())
 		return "", errors.New(failureMessage)
