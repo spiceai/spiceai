@@ -112,7 +112,7 @@ func (c *MetalContext) InstallOrUpgradeRuntime() error {
 		return err
 	}
 
-	runtimeVersion := github.GetRuntimeVersion(release)
+	runtimeVersion := release.TagName
 
 	fmt.Printf("Downloading and installing Spice.ai Runtime %s ...\n", runtimeVersion)
 
@@ -151,7 +151,7 @@ func (c *MetalContext) IsRuntimeUpgradeAvailable() (string, error) {
 		return "", err
 	}
 
-	if semver.Compare(currentVersion, strings.TrimSuffix(release.TagName, "-spiceai")) == 0 {
+	if semver.Compare(currentVersion, release.TagName) == 0 {
 		return "", nil
 	}
 
