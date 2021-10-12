@@ -20,4 +20,5 @@ type FieldSpec struct {
 	// Initializer needs to be a *float64 in order to properly handle zero values - "omitempty" will drop them otherwise
 	Initializer *float64 `json:"initializer,omitempty" yaml:"initializer,omitempty" mapstructure:"initializer,omitempty"`
 	Values      []string `json:"values,omitempty" yaml:"values,omitempty" mapstructure:"values,omitempty"`
+	Fill        string   `json:"fill,omitempty" yaml:"fill,omitempty" mapstructure:"fill,omitempty"`
 }

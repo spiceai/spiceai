@@ -14,6 +14,12 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+type Field struct {
+	Name         string
+	InitialValue float64
+	Fill         string
+}
+
 type Dataspace struct {
 	spec.DataspaceSpec
 	connector dataconnectors.DataConnector
@@ -90,19 +96,23 @@ func (ds *Dataspace) Actions() map[string]string {
 	return fqActions
 }
 
-// Returns a mapping of fully-qualified field names to their intializers
-func (ds *Dataspace) Fields() map[string]float64 {
-	fqFieldInitializers := make(map[string]float64)
+// Returns a mapping of fully-qualified field names to Fields
+func (ds *Dataspace) Fields() map[string]*Field {
+	fqFieldInitializers := make(map[string]*Field)
 	fqFieldNames := ds.FieldNameMap()
-	for _, field := range ds.DataspaceSpec.Fields {
-		if field.Type == "tag" {
+	for _, fieldSpec := range ds.DataspaceSpec.Fields {
+		if fieldSpec.Type == "tag" {
 			continue
 		}
-		var initialValue float64 = 0
-		if field.Initializer != nil {
-			initialValue = *field.Initializer
+		field := &Field{
+			Name:         fieldSpec.Name,
+			InitialValue: 0,
+			Fill:         fieldSpec.Fill,
 		}
-		fqFieldInitializers[fqFieldNames[field.Name]] = initialValue
+		if fieldSpec.Initializer != nil {
+			field.InitialValue = *fieldSpec.Initializer
+		}
+		fqFieldInitializers[fqFieldNames[fieldSpec.Name]] = field
 	}
 	return fqFieldInitializers
 }

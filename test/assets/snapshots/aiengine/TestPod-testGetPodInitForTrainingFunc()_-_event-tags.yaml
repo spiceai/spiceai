@@ -11,7 +11,9 @@
   "fields": {
     "event_data_eventId": {},
     "event_data_height": {},
-    "event_data_rating": {},
+    "event_data_rating": {
+      "fill_method": 1
+    },
     "event_data_speed": {},
     "event_data_tagA": {
       "fill_method": 1

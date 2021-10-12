@@ -34,7 +34,7 @@ func TestPod(t *testing.T) {
 		},
 		"event-tags.yaml": {
 			LocalStateTest: false,
-			ExpectedHash:   "9498eef0628a6a128b2a91797e264b6b",
+			ExpectedHash:   "9c4eb2a29cd338b3593132c2b9036029",
 		},
 	}
 

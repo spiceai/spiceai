@@ -31,7 +31,7 @@ type Pod struct {
 	hash         string
 	manifestPath string
 	dataSources  []*dataspace.Dataspace
-	fields       map[string]float64
+	fields       map[string]*dataspace.Field
 	fieldNames   []string
 	tagPathMap   map[string][]string
 	flights      map[string]*flights.Flight
@@ -293,7 +293,7 @@ func (pod *Pod) Rewards() map[string]string {
 	return rewards
 }
 
-func (pod *Pod) Fields() map[string]float64 {
+func (pod *Pod) Fields() map[string]*dataspace.Field {
 	return pod.fields
 }
 
@@ -335,6 +335,17 @@ func (pod *Pod) ValidateForTraining() error {
 				continue
 			default:
 				return fmt.Errorf("invalid type '%s': choose one of ['number', 'tag', 'category']", f.Type)
+			}
+			// TODO: FIX!
+			switch f.Fill {
+			case "":
+				fallthrough
+			case "previous":
+				fallthrough
+			case "none":
+				continue
+			default:
+				return fmt.Errorf("invalid field fill '%s'", f.Fill)
 			}
 		}
 	}
@@ -457,7 +468,7 @@ func loadPod(podPath string, hash string) (*Pod, error) {
 
 	var fieldNames []string
 	tagPathMap := make(map[string][]string)
-	fields := make(map[string]float64)
+	fields := make(map[string]*dataspace.Field)
 
 	for _, dsSpec := range pod.PodSpec.Dataspaces {
 		ds, err := dataspace.NewDataspace(dsSpec)
@@ -475,8 +486,8 @@ func loadPod(podPath string, hash string) (*Pod, error) {
 			sort.Strings(tagPathMap[ds.Path()])
 		}
 
-		for field, intializer := range ds.Fields() {
-			fields[field] = intializer
+		for fqFieldName, field := range ds.Fields() {
+			fields[fqFieldName] = field
 		}
 	}
 
