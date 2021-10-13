@@ -7,9 +7,9 @@
 [![Subreddit subscribers](https://img.shields.io/reddit/subreddit-subscribers/spiceai?style=social)](https://www.reddit.com/r/spiceai)
 [![Follow on Twitter](https://img.shields.io/twitter/follow/spiceaihq.svg?style=social&logo=twitter)](https://twitter.com/intent/follow?screen_name=spiceaihq)
 
+**Spice.ai** makes it easy for developers to build intelligent apps. It streamlines the use of machine learning (ML) in software. Combined with time-series data, developers can create applications that continuously learn and adapt using ML recommendations.
 
-**Spice.ai** is an open source, portable runtime and set of tools that helps developers add AI to their applications by leveraging machine-learning on time-series data.
-
+Spice.ai takes a developer-first approach, and is focused on a fast, iterative, inner development loop, enabling developers to get started with ML in minutes instead of months.
 
 ---
 
@@ -17,39 +17,38 @@
 
 ---
 
-**The vision for Spice.ai is to make creating intelligent applications as easy as building a modern website.**
-
-Spice.ai focuses on a fast, iterative, inner development loop through simple configuration, REST-like APIs, and the goal of coding in any language or framework.
-
-Spice.ai includes:
-
-- A lightweight, portable ML runtime accessible by simple HTTP APIs
-- A developer-friendly CLI
-- Simple, git-committable, configuration and code
-- Community-driven re-usable components for streaming and processing time-series data
-- Re-useable building blocks, sharable through spicerack.org to build upon community work and get started quickly
-
-Spice.ai is written in Golang and Python and runs as a container or microservice. It's deployable to any public cloud, on-premises, and edge.
-
 📢 Read the Spice.ai announcement blog post at [blog.spiceai.org](https://blog.spiceai.org).
 
 📺 View a 60 second demo of Spice.ai in action [here](https://www.youtube.com/watch?v=FPPGyPq41kQ).
 
-### Why Spice.ai?
+## Features
 
-Spice.ai is for developers interested in using AI to make their applications more intelligent but don't have the time or resources to learn and build all the AI/ML.
+The Spice.ai runtime is written in Golang and Python and runs as a container or microservice. It's deployable to any public cloud, on-premises, and edge. It is configured with a simple manifest and accessed by HTTP APIs.
 
-Imagine you have timestamped measurements of the room temperature and access to air-conditioning controls. If you had a time-series AI engine, your application could optimize when the A/C activates. You could reduce energy usage by not overcooling the room as the temperature drops.
+Spice.ai includes:
 
-Now imagine learning Python, neural networks, deep-learning algorithms and building a system that streams and processes time-series data to do that. With a time-series AI engine accessible over HTTP APIs, a library of community-driven components for data streaming and processing, and an eco-system of pre-created ML configuration, you could build upon the experience of the community instead of doing it all yourself. You can then focus on your business logic and building your application instead of the ML.
+- A lightweight, portable ML runtime accessible by simple HTTP APIs, allowing developers to use their preferred languages and frameworks
+- A dashboard to visualize data and learning
+- A developer-friendly CLI
+- Simple, git-committable, configuration and code
 
-### Community-driven data components
+### Community-Driven Data Components
 
-The Spice.ai runtime also includes a library of [community-driven data components](https://github.com/spiceai/data-components-contrib) for streaming and processing time series data, enabling developers to quickly and easily combine data with learning to create intelligent models.
+Spice.ai also includes a library of community-driven [data components](https://github.com/spiceai/data-components-contrib) for streaming and processing time series data, enabling developers to quickly and easily combine data with learning to create intelligent models.
 
-### Spice.ai pod registry
+### Spicepod registry
 
-Modern developers also build with the community by leveraging registries such as npm, NuGet, and pip. The registry for sharing and using Spice.ai packages is [spicerack.org](https://spicerack.org). As the community shares more and more AI building blocks, developers can quickly build intelligence into their applications, initially with definitions of AI projects and eventually by sharing and reusing fully-trained models.
+Modern developers build with the community by leveraging registries such as npm, NuGet, and pip. The Spice.ai platform includes [spicerack.org](https://spicerack.org), the registry for ML building blocks.
+
+As the community shares their ML building blocks (aka Spicepods, or pods for short), developers can quickly add them to their Spice.ai applications enabling them to stream data and build learning into their applications quickly and easily. Initially, Spicepods contain simple definitions of how the app should learn, and eventually will enable the sharing and use of fully-trained models.
+
+## Why Spice.ai?
+
+Spice.ai is for developers who want to build intelligent applications but don't have the time or resources to learn, build and integrate the required ML to do so.
+
+Imagine you have timestamped measurements of the room temperature and access to air-conditioning controls. If you had a time-series ML engine, your application could optimize when the A/C activates. You could reduce energy usage by not overcooling the room as the temperature drops.
+
+Now imagine learning Python or R, neural networks, deep-learning algorithms and building a system that streams and processes time-series data to do that. With Spice.ai — which includes a time-series ML engine accessible over HTTP APIs, a library of community-driven components for data streaming and processing, and an ecosystem of pre-created ML configurations — you can build upon the experience of the community instead of doing it all yourself. You can focus on business logic and building your application instead of the ML.
 
 <p align="center">
   <img src="https://user-images.githubusercontent.com/80174/132382372-c32cc8b7-25f2-4f82-8f9f-e4778fb69254.png" width="600" />
@@ -57,32 +56,40 @@ Modern developers also build with the community by leveraging registries such as
 
 ### Pre-release software
 
-⚠️ The vision to bring intelligent application development to the maturity of modern web development is a vast undertaking. We haven't figured it all out or solved all the problems yet. We're looking for feedback on the direction. Spice.ai is not finished, in fact, we only just started in June, and we invite you on the journey.
+⚠️ The vision to make it easy to build intelligent applications that learn is a vast undertaking. We haven't figured it all out or solved all the problems yet (we only started in June 2021!), so we’re inviting you on this journey and are looking for feedback the direction.
 
-Spice.ai and spicerack.org are both pre-release, early, alpha software. Spice.ai v0.1-alpha has many gaps, including limited deep learning algorithms and training scale, streaming data, simulated environments, and offline learning modes. Packages aren't searchable or even listed on spicerack.org yet.
+Spice.ai and spicerack.org are both pre-release, early, alpha software. Until v1.0, Spice.ai may have gaps, including limited deep learning algorithms, training-at-scale, and simulated environments. Also, Spicepods aren't searchable or listed on spicerack.org yet.
 
-Our intention with this preview is to work with developers early to co-define and co-develop the developer experience, aligning to the goal of making AI easy for developers. 🚀 Thus, due to the stage of development and as we focus, there are currently several [limitations](https://github.com/spiceai/spiceai/blob/trunk/docs/ROADMAP.md#current-limitations) on the general [Roadmap to v1.0-stable](https://github.com/spiceai/spiceai/blob/trunk/docs/ROADMAP.md#spice-ai-v10-stable-roadmap).
+Our intention with this preview is to work with developers early to define and create the developer experience together. 🚀 See the [Roadmap to v1.0-stable](https://github.com/spiceai/spiceai/blob/trunk/docs/ROADMAP.md#spice-ai-v10-stable-roadmap) for upcoming features.
 
 ### Join us!
 
-We greatly appreciate and value your feedback. Please feel free to [file an issue](https://github.com/spiceai/spiceai/issues/new) and get in touch with the team through [Discord](https://discord.gg/kZnTfneP5u) or by sending us mail at [team@spiceai.io](mailto:team@spiceai.io).
+We greatly appreciate and value your support! You can help Spice.ai in a number of ways:
 
-Thank you for sharing this journey with us! 🙏
+- ⭐️ Star this repo.
+- Build an app with Spice.ai and send us feedback and suggestions at [hey@spiceai.io](mailto:hey@spiceai.io) or on [Discord](https://discord.gg/kZnTfneP5u).
+- [File an issue](https://github.com/spiceai/spiceai/issues/new) if you see something not quite working correctly.
+- Follow us on [Reddit](https://www.reddit.com/r/spiceai), [Twitter](https://twitter.com/SpiceAIHQ), and [LinkedIn](https://www.linkedin.com/company/74148478).
+- Join our team ([We’re hiring!](https://spiceai.io/careers))
+- Contribute code or documentation to the project (see [CONTRIBUTING.md](CONTRIBUTING.md)).
+
+We’re also starting a community call series soon!
+
+Thank you for sharing this journey with us.
 
 ## Getting started with Spice.ai
 
-First, ⭐️ star this repo! Thank you for your support! 🙏 
+First, ⭐️ star this repo! Thank you for your support! 🙏
 
-Then, follow this guide to get started quickly with Spice.ai. For a more comprehensive getting started guide, see the full [online documentation](https://docs.spiceai.org/).
+Then, follow this guide to get started quickly with Spice.ai. For a more comprehensive guide, see the full [online documentation](https://docs.spiceai.org/).
 
 ### Current hosting limitations
 
-- Docker is required. We are targeting self-host support in v0.3.0-alpha.
+- Docker is required. Self-host and metal support is on the roadmap.
 - Only macOS and Linux are natively supported. [WSL 2](https://docs.microsoft.com/en-us/windows/wsl/install-win10) is required for Windows.
-- arm64 is not yet supported (i.e. Apple's M1 Macs). We use M1s ourselves, so we hope to support this very soon :-)
+- darwin/arm64 is not yet supported (i.e. Apple's M1 Macs). We use M1s ourselves, so we hope to support this very soon. :-)
 
 ⭐️ We highly recommend using [GitHub Codespaces](https://github.com/features/codespaces) to get started. Codespaces enables you to run Spice.ai in a virtual environment in the cloud. If you use Codespaces, the install is not required and you may skip to the [Getting Started with Codespaces](#getting-started-with-codespaces) section.
-
 
 ### Installation (local machine)
 
@@ -109,11 +116,11 @@ Create a new GitHub Codespace in the `spiceai/quickstarts` repo at [github.com/s
 
 Once you open the Codespace, Spice.ai and everything you need to get started will already be installed. Continue on to train your first pod.
 
-### Create your first Spice.ai Pod and train it
+### Create your first Spicepod and train it
 
-A [Spice.ai Pod](https://docs.spiceai.org/concepts/#pod) is simply a collection of configuration and data that is used to train and deploy your own AI.
+A [Spicepod](https://docs.spiceai.org/concepts/#pod) is simply a collection of configuration and data that is used to train and deploy your own AI.
 
-We will add intelligence to a sample application, **ServerOps**, by creating and training a Spice.ai pod that offers recommendations to the application for different server operations, such as performing server maintenance.
+We will add intelligence to a sample application, **ServerOps**, by creating and training a Spicepod that offers recommendations to the application for different server operations, such as performing server maintenance.
 
 If you are using GitHub Codespaces, skip Step 1. and continue with Step 2., as the repository will already be cloned.
 
@@ -152,7 +159,7 @@ Navigate to [http://localhost:8000](http://localhost:8000) in your favorite brow
 
 ### Retrain the pod
 
-In addition to automatic training upon manifest changes, training can be started by using the Spice CLI from within your app directory.
+In addition to automatic training on each manifest change, training can be started by using the Spice CLI from within your app directory.
 
 ```bash
 spice train serverops
@@ -185,7 +192,7 @@ Powershell:
 
 ### Next steps
 
-Congratulations! In just a few minutes you downloaded and installed the Spice.ai CLI and runtime, created your first Spice.ai Pod, trained it, and got a recommendation from it.
+Congratulations! In just a few minutes you downloaded and installed the Spice.ai CLI and runtime, created your first Spicepod, trained it, and got a recommendation from it.
 
 This is just the start of the journey with Spice.ai. Next, try one of the quickstart tutorials or in-depth samples for creating intelligent applications.
 
