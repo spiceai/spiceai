@@ -14,19 +14,17 @@ dataspaces:
           path: ../../test/assets/data/csv/csv_data_with_tags.csv
       processor:
         name: csv
-    fields:
+    measurements:
       - name: eventId
       - name: height
       - name: rating
         fill: none
       - name: speed
       - name: target
-      - name: tagA
-        type: tag
-      - name: tagB
-        type: tag
-      - name: tagC
-        type: tag
+    tags:
+      - tagA
+      - tagB
+      - tagC
 
 actions:
   - name: action_one

@@ -61,23 +61,23 @@ func getPodInitForTraining(pod *pods.Pod) *aiengine_pb.InitRequest {
 	fields := make(map[string]*aiengine_pb.FieldData)
 
 	globalActions := pod.Actions()
-	globalFieldsWithArgs := append(pod.FieldNames(), pod.ActionsArgs()...)
+	globalFieldsWithArgs := append(pod.MeasurementNames(), pod.ActionsArgs()...)
 	var laws []string
 
 	var dsInitSpecs []*aiengine_pb.DataSource
 	for _, ds := range pod.DataSpaces() {
-		for fqField, field := range ds.Fields() {
-			fieldName := strings.ReplaceAll(fqField, ".", "_")
-			fieldData := &aiengine_pb.FieldData{
-				Initializer: field.InitialValue,
+		for fqField, measurement := range ds.Measurements() {
+			measurementName := strings.ReplaceAll(fqField, ".", "_")
+			measurementData := &aiengine_pb.FieldData{
+				Initializer: measurement.InitialValue,
 				FillMethod:  aiengine_pb.FillType_FILL_FORWARD,
 			}
 
-			if field.Fill == "none" {
-				fieldData.FillMethod = aiengine_pb.FillType_FILL_ZERO
+			if measurement.Fill == "none" {
+				measurementData.FillMethod = aiengine_pb.FillType_FILL_ZERO
 			}
 
-			fields[fieldName] = fieldData
+			fields[measurementName] = measurementData
 		}
 
 		for _, localTag := range ds.Tags() {
