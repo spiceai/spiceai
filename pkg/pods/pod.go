@@ -307,6 +307,7 @@ func (pod *Pod) TagPathMap() map[string][]string {
 }
 
 func (pod *Pod) ValidateForTraining() error {
+	// Consider using something like https://github.com/go-playground/validator in the future
 	if pod.Granularity() > pod.Interval() {
 		return errors.New("granularity must be less than or equal to interval")
 	}
@@ -321,29 +322,24 @@ func (pod *Pod) ValidateForTraining() error {
 
 	for _, ds := range pod.PodSpec.Dataspaces {
 		for _, f := range ds.Fields {
+			// Validate the "type" field
 			switch f.Type {
 			case "":
-				fallthrough
 			case "number":
-				continue
 			case "category":
 				if len(f.Values) == 0 {
 					return fmt.Errorf("specify the category values")
 				}
-				continue
 			case "tag":
-				continue
 			default:
 				return fmt.Errorf("invalid type '%s': choose one of ['number', 'tag', 'category']", f.Type)
 			}
-			// TODO: FIX!
+
+			// Validate the "fill" field
 			switch f.Fill {
 			case "":
-				fallthrough
 			case "previous":
-				fallthrough
 			case "none":
-				continue
 			default:
 				return fmt.Errorf("invalid field fill '%s'", f.Fill)
 			}
