@@ -3,7 +3,6 @@ package github
 import (
 	"fmt"
 	"runtime"
-	"strings"
 
 	"github.com/spiceai/spiceai/pkg/constants"
 )
@@ -27,10 +26,6 @@ func GetLatestRuntimeRelease(tagName string) (*RepoRelease, error) {
 	}
 
 	return release, nil
-}
-
-func GetRuntimeVersion(release *RepoRelease) string {
-	return strings.TrimSuffix(release.TagName, fmt.Sprintf("-%s", constants.SpiceRuntimeFilename))
 }
 
 func DownloadRuntimeAsset(release *RepoRelease, downloadPath string) error {

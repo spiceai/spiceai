@@ -1,4 +1,4 @@
-name: spice
+name: release
 
 on:
   push:
@@ -76,6 +76,10 @@ jobs:
           name: dashboard_build
           path: pkg/dashboard/build
 
+      - name: Build spiced
+        run: make
+        working-directory: cmd/spiced
+
       - name: Build spice
         run: make
         working-directory: cmd/spice
@@ -83,6 +87,29 @@ jobs:
       - name: Run go test
         if: matrix.target_os != 'windows'
         run: go test -v ./... -shuffle=on
+
+      - name: tar binary
+        if: matrix.target_os != 'windows'
+        run: |
+          mv cmd/spiced/spiced spiced
+          chmod +x spiced
+          tar cf spiced_${{ matrix.target_os }}_${{ matrix.target_arch }}.tar.gz spiced
+
+      - name: Print version
+        if: matrix.target_os != 'windows'
+        run: ./spiced version
+
+      - uses: actions/upload-artifact@v2
+        if: matrix.target_os != 'windows'
+        with:
+          name: spiced_${{ matrix.target_os }}_${{ matrix.target_arch }}
+          path: spiced_${{ matrix.target_os }}_${{ matrix.target_arch }}.tar.gz
+
+      - uses: actions/upload-artifact@v2
+        if: matrix.target_os == 'windows'
+        with:
+          name: spiced_${{ matrix.target_os }}_${{ matrix.target_arch }}
+          path: cmd/spiced/spiced.exe
 
       - name: tar binary
         if: matrix.target_os != 'windows'
@@ -142,6 +169,12 @@ jobs:
           name: spice_${{ matrix.target_os }}_${{ matrix.target_arch }}
           path: ${{ env.ARTIFACT_DIR }}
 
+      - name: download artifacts - spiced_${{ matrix.target_os }}_${{ matrix.target_arch }}
+        uses: actions/download-artifact@master
+        with:
+          name: spiced_${{ matrix.target_os }}_${{ matrix.target_arch }}
+          path: ${{ env.ARTIFACT_DIR }}
+
       - name: lists artifacts
         run: ls -l ${{ env.ARTIFACT_DIR }}
 
@@ -159,18 +192,17 @@ jobs:
           # Delete existing release artifact
           github-release delete \
             --owner $OWNER_NAME --repo $REPO_NAME \
-            --tag "v${{ env.REL_VERSION }}-spice" \
+            --tag "v${{ env.REL_VERSION }}" \
             ${RELEASE_ARTIFACT[*]}
           if [ "$LATEST_RELEASE" = "true" ]; then
             export RELEASE_BODY=`cat ./docs/release_notes/v${{ env.REL_VERSION }}.md`
           else
             export RELEASE_BODY="This is the release candidate ${{ env.REL_VERSION }}"
           fi
-          echo "Uploading Spice CLI Binaries to GitHub Release"
+          echo "Uploading Spice.ai Binaries to GitHub Release"
           github-release upload \
             --owner $OWNER_NAME --repo $REPO_NAME \
-            --tag "v${{ env.REL_VERSION }}-spice" \
-            --release-name "Spice CLI v${{ env.REL_VERSION }}" \
+            --tag "v${{ env.REL_VERSION }}" \
+            --release-name "Spice.ai v${{ env.REL_VERSION }}" \
             --body "${RELEASE_BODY}" \
-            --prerelease \
             ${RELEASE_ARTIFACT[*]}
