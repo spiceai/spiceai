@@ -16,7 +16,9 @@ dataspaces:
         name: csv
     measurements:
       - name: eventId
+        selector: event_id
       - name: height
+        selector: h
       - name: rating
         fill: none
       - name: speed

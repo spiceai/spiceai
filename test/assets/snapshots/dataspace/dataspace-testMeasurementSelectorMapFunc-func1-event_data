@@ -1,0 +1,7 @@
+(map[string]string) (len=5) {
+  (string) (len=7) "eventId": (string) (len=8) "event_id",
+  (string) (len=6) "height": (string) (len=1) "h",
+  (string) (len=6) "rating": (string) (len=6) "rating",
+  (string) (len=5) "speed": (string) (len=5) "speed",
+  (string) (len=6) "target": (string) (len=6) "target"
+}

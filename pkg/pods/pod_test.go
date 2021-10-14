@@ -34,7 +34,7 @@ func TestPod(t *testing.T) {
 		},
 		"event-tags.yaml": {
 			LocalStateTest: false,
-			ExpectedHash:   "31083813b0495927b0d94a8b19b1889e",
+			ExpectedHash:   "16fc4b1dbaacbabb2b88b16e47e2c0de",
 		},
 	}
 
@@ -278,7 +278,7 @@ func testAddLocalStateFunc(pod *Pod) func(*testing.T) {
 			t.Error(err)
 		}
 
-		err = dp.Init(nil)
+		err = dp.Init(nil, nil, nil)
 		assert.NoError(t, err)
 
 		fileConnector := file.NewFileConnector()
@@ -325,7 +325,7 @@ func testAddLocalStateCachedCsvFunc(pod *Pod) func(*testing.T) {
 			t.Error(err)
 		}
 
-		err = dp.Init(nil)
+		err = dp.Init(nil, nil, nil)
 		assert.NoError(t, err)
 
 		var wg sync.WaitGroup
