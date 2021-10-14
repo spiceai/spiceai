@@ -16,7 +16,7 @@ require (
 	github.com/spf13/cast v1.4.1 // indirect
 	github.com/spf13/cobra v1.2.1
 	github.com/spf13/viper v1.8.1
-	github.com/spiceai/data-components-contrib v0.0.0-20211014035630-a5624de9e33a
+	github.com/spiceai/data-components-contrib v0.2.0
 	github.com/stretchr/testify v1.7.0
 	github.com/valyala/fasthttp v1.28.0
 	go.uber.org/atomic v1.9.0 // indirect
@@ -35,6 +35,8 @@ require (
 )
 
 require github.com/spf13/pflag v1.0.5
+
+replace github.com/spiceai/data-components-contrib v0.2.0 => ../data-components-contrib
 
 require (
 	github.com/alecthomas/jsonschema v0.0.0-20210920000243-787cd8204a0d // indirect

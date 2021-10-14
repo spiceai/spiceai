@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/logrusorgru/aurora"
+	"github.com/spiceai/spiceai/pkg/dataspace"
 	"github.com/spiceai/spiceai/pkg/observations"
 	"github.com/spiceai/spiceai/pkg/pods"
 	"github.com/spiceai/spiceai/pkg/proto/aiengine_pb"
@@ -26,6 +27,7 @@ func SendData(pod *pods.Pod, podState ...*state.State) error {
 	}
 
 	tagPathMap := pod.TagPathMap()
+	categoryPathMap := pod.CategoryPathMap()
 
 	for _, s := range podState {
 		if s == nil || !s.TimeSentToAIEngine.IsZero() {
@@ -33,12 +35,25 @@ func SendData(pod *pods.Pod, podState ...*state.State) error {
 			continue
 		}
 
+		var currentDataspace *dataspace.Dataspace
+		for _, ds := range pod.DataSpaces() {
+			if ds.Path() == s.Path() {
+				currentDataspace = ds
+			}
+		}
+
 		csv := strings.Builder{}
 		csv.WriteString("time")
 		for _, field := range s.Fields() {
+			categories := currentDataspace.Categories()
+			if _, ok := categories[field]; ok {
+				// Don't write the comma for a category, we will handle it below
+				continue
+			}
 			csv.WriteString(",")
 			csv.WriteString(strings.ReplaceAll(field, ".", "_"))
 		}
+		//TODO: Handle headers for categories
 		if _, ok := tagPathMap[s.Path()]; ok {
 			for _, tagName := range tagPathMap[s.Path()] {
 				csv.WriteString(",")
@@ -54,7 +69,7 @@ func SendData(pod *pods.Pod, podState ...*state.State) error {
 			continue
 		}
 
-		csvPreview := getData(&csv, pod.Epoch(), s.FieldNames(), tagPathMap[s.Path()], observationData, 5)
+		csvPreview := getData(&csv, pod.Epoch(), s.FieldNames(), tagPathMap[s.Path()], categoryPathMap[s.Path()], observationData, 5)
 
 		zaplog.Sugar().Debugf("Posting data to AI engine:\n%s", aurora.BrightYellow(fmt.Sprintf("%s%s...\n%d observations posted", csv.String(), csvPreview, len(observationData))))
 
@@ -82,7 +97,7 @@ func SendData(pod *pods.Pod, podState ...*state.State) error {
 	return err
 }
 
-func getData(csv *strings.Builder, epoch time.Time, fieldNames []string, tags []string, observations []observations.Observation, previewLines int) string {
+func getData(csv *strings.Builder, epoch time.Time, fieldNames []string, tags []string, categories []*dataspace.Category, observations []observations.Observation, previewLines int) string {
 	epochTime := epoch.Unix()
 	var csvPreview string
 	for i, o := range observations {
@@ -90,14 +105,40 @@ func getData(csv *strings.Builder, epoch time.Time, fieldNames []string, tags []
 			continue
 		}
 		csv.WriteString(strconv.FormatInt(o.Time, 10))
+
+		foundCategories := make(map[string]string)
 		for _, f := range fieldNames {
+			if category, ok := o.Categories[f]; ok {
+				foundCategories[f] = category
+				continue
+			}
+
 			csv.WriteString(",")
 
-			val, ok := o.Data[f]
+			measurement, ok := o.Measurements[f]
 			if ok {
-				csv.WriteString(strconv.FormatFloat(val, 'f', -1, 64))
+				csv.WriteString(strconv.FormatFloat(measurement, 'f', -1, 64))
 			}
 		}
+
+		for _, category := range categories {
+			for _, val := range category.Values {
+				csv.WriteString(",")
+				foundValMatches := false
+				if foundVal, ok := foundCategories[category.Name]; ok {
+					if foundVal == val {
+						foundValMatches = true
+					}
+				}
+
+				if foundValMatches {
+					csv.WriteString("1")
+				} else {
+					csv.WriteString("0")
+				}
+			}
+		}
+
 		for _, t := range tags {
 			csv.WriteString(",")
 
