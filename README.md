@@ -7,7 +7,7 @@
 [![Subreddit subscribers](https://img.shields.io/reddit/subreddit-subscribers/spiceai?style=social)](https://www.reddit.com/r/spiceai)
 [![Follow on Twitter](https://img.shields.io/twitter/follow/spiceaihq.svg?style=social&logo=twitter)](https://twitter.com/intent/follow?screen_name=spiceaihq)
 
-**Spice.ai** makes it easy for developers to build apps that learn and adapt. It streamlines the use of machine learning (ML) in software. Combined with time-series data, developers can create applications that continuously improve using ML recommendations.
+**Spice.ai** makes it easy for developers to build apps that learn and adapt by streamlining the use of machine learning (ML) in software. Combined with time-series data, developers can create applications that continuously improve using ML recommendations.
 
 Spice.ai takes a developer-first approach, and is focused on a fast, iterative, inner development loop, enabling developers to get started with ML in minutes instead of months.
 
