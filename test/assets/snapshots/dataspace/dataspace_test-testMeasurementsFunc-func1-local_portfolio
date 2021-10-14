@@ -1,10 +1,10 @@
-(map[string]*dataspace.Field) (len=2) {
-  (string) (len=27) "local.portfolio.btc_balance": (*dataspace.Field)({
+(map[string]*dataspace.Measurement) (len=2) {
+  (string) (len=27) "local.portfolio.btc_balance": (*dataspace.Measurement)({
     Name: (string) (len=11) "btc_balance",
     InitialValue: (float64) 0,
     Fill: (string) ""
   }),
-  (string) (len=27) "local.portfolio.usd_balance": (*dataspace.Field)({
+  (string) (len=27) "local.portfolio.usd_balance": (*dataspace.Measurement)({
     Name: (string) (len=11) "usd_balance",
     InitialValue: (float64) 1e+06,
     Fill: (string) ""

@@ -45,8 +45,8 @@ func TestDataSource(t *testing.T) {
 
 			t.Run(fmt.Sprintf("NewDataspace() - %s", dsName), testNewDataspaceFunc(dsSpec))
 			t.Run(fmt.Sprintf("Actions() - %s", dsName), testActionsFunc(dsSpec))
-			t.Run(fmt.Sprintf("Fields() - %s", dsName), testFieldsFunc(dsSpec))
-			t.Run(fmt.Sprintf("FieldNames() - %s", dsName), testFieldNamesFunc(dsSpec))
+			t.Run(fmt.Sprintf("Measurements() - %s", dsName), testMeasurementsFunc(dsSpec))
+			t.Run(fmt.Sprintf("MeasurementNames() - %s", dsName), testMeasurementNamesFunc(dsSpec))
 			t.Run(fmt.Sprintf("ActionNames() - %s", dsName), testActionNamesFunc(dsSpec))
 			t.Run(fmt.Sprintf("Laws() - %s", dsName), testLawsFunc(dsSpec))
 		}
@@ -96,15 +96,15 @@ func testActionsFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 	}
 }
 
-// Tests Fields() getter
-func testFieldsFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
+// Tests Measurements() getter
+func testMeasurementsFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 	return func(t *testing.T) {
 		ds, err := dataspace.NewDataspace(dsSpec)
 		if err != nil {
 			t.Error(err)
 		}
 
-		actual := ds.Fields()
+		actual := ds.Measurements()
 
 		err = snapshotter.SnapshotMulti(strings.ReplaceAll(ds.Name(), "/", "_"), actual)
 		if err != nil {
@@ -113,15 +113,15 @@ func testFieldsFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 	}
 }
 
-// Tests FieldNames() getter
-func testFieldNamesFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
+// Tests MeasurementNames() getter
+func testMeasurementNamesFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 	return func(t *testing.T) {
 		ds, err := dataspace.NewDataspace(dsSpec)
 		if err != nil {
 			t.Error(err)
 		}
 
-		actual := ds.FieldNameMap()
+		actual := ds.MeasurementNameMap()
 
 		var expected map[string]string
 

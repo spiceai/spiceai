@@ -27,15 +27,15 @@ import (
 
 type Pod struct {
 	spec.PodSpec
-	podParams    *PodParams
-	hash         string
-	manifestPath string
-	dataSources  []*dataspace.Dataspace
-	fields       map[string]*dataspace.Field
-	fieldNames   []string
-	tagPathMap   map[string][]string
-	flights      map[string]*flights.Flight
-	viper        *viper.Viper
+	podParams        *PodParams
+	hash             string
+	manifestPath     string
+	dataSources      []*dataspace.Dataspace
+	measurements     map[string]*dataspace.Measurement
+	measurementNames []string
+	tagPathMap       map[string][]string
+	flights          map[string]*flights.Flight
+	viper            *viper.Viper
 
 	podLocalStateMutex    sync.RWMutex
 	podLocalState         []*state.State
@@ -114,11 +114,11 @@ func (pod *Pod) CachedState() []*state.State {
 
 func (pod *Pod) CachedCsv() string {
 	csv := strings.Builder{}
-	fieldNames := pod.FieldNames()
+	measurementNames := pod.MeasurementNames()
 	tagPathMap := pod.TagPathMap()
 
-	headers := make([]string, 0, len(fieldNames)+len(tagPathMap))
-	headers = append(headers, fieldNames...)
+	headers := make([]string, 0, len(measurementNames)+len(tagPathMap))
+	headers = append(headers, measurementNames...)
 
 	var tagPaths []string
 	for tagPath := range tagPathMap {
@@ -135,18 +135,18 @@ func (pod *Pod) CachedCsv() string {
 	for _, state := range cachedState {
 		var validHeaders []string
 
-		for _, globalFieldName := range fieldNames {
+		for _, globalMeasurementName := range measurementNames {
 			isLocal := false
-			for _, fieldName := range state.FieldNames() {
-				field := state.Path() + "." + fieldName
-				if globalFieldName == field {
-					validHeaders = append(validHeaders, fieldName)
+			for _, measurementName := range state.FieldNames() {
+				measurement := state.Path() + "." + measurementName
+				if globalMeasurementName == measurement {
+					validHeaders = append(validHeaders, measurementName)
 					isLocal = true
 					break
 				}
 			}
 			if !isLocal {
-				validHeaders = append(validHeaders, globalFieldName)
+				validHeaders = append(validHeaders, globalMeasurementName)
 			}
 		}
 
@@ -293,12 +293,12 @@ func (pod *Pod) Rewards() map[string]string {
 	return rewards
 }
 
-func (pod *Pod) Fields() map[string]*dataspace.Field {
-	return pod.fields
+func (pod *Pod) Measurements() map[string]*dataspace.Measurement {
+	return pod.measurements
 }
 
-func (pod *Pod) FieldNames() []string {
-	return pod.fieldNames
+func (pod *Pod) MeasurementNames() []string {
+	return pod.measurementNames
 }
 
 // Returns a map of datasource paths to the tags in those paths
@@ -307,6 +307,7 @@ func (pod *Pod) TagPathMap() map[string][]string {
 }
 
 func (pod *Pod) ValidateForTraining() error {
+	// Consider using something like https://github.com/go-playground/validator in the future
 	if pod.Granularity() > pod.Interval() {
 		return errors.New("granularity must be less than or equal to interval")
 	}
@@ -320,16 +321,13 @@ func (pod *Pod) ValidateForTraining() error {
 	}
 
 	for _, ds := range pod.PodSpec.Dataspaces {
-		for _, f := range ds.Fields {
+		for _, f := range ds.Measurements {
 			switch f.Fill {
 			case "":
-				fallthrough
 			case "previous":
-				fallthrough
 			case "none":
-				continue
 			default:
-				return fmt.Errorf("invalid field fill '%s'", f.Fill)
+				return fmt.Errorf("invalid measurement fill '%s': choose one of ['previous', 'none']", f.Fill)
 			}
 		}
 	}
@@ -450,9 +448,9 @@ func loadPod(podPath string, hash string) (*Pod, error) {
 
 	pod.flights = make(map[string]*flights.Flight)
 
-	var fieldNames []string
+	var measurementNames []string
 	tagPathMap := make(map[string][]string)
-	fields := make(map[string]*dataspace.Field)
+	measurements := make(map[string]*dataspace.Measurement)
 
 	for _, dsSpec := range pod.PodSpec.Dataspaces {
 		ds, err := dataspace.NewDataspace(dsSpec)
@@ -461,8 +459,8 @@ func loadPod(podPath string, hash string) (*Pod, error) {
 		}
 		pod.dataSources = append(pod.dataSources, ds)
 
-		for _, fieldName := range ds.FieldNameMap() {
-			fieldNames = append(fieldNames, fieldName)
+		for _, measurementName := range ds.MeasurementNameMap() {
+			measurementNames = append(measurementNames, measurementName)
 		}
 
 		if len(ds.Tags()) > 0 {
@@ -470,14 +468,14 @@ func loadPod(podPath string, hash string) (*Pod, error) {
 			sort.Strings(tagPathMap[ds.Path()])
 		}
 
-		for fqFieldName, field := range ds.Fields() {
-			fields[fqFieldName] = field
+		for fqMeasurementName, measurement := range ds.Measurements() {
+			measurements[fqMeasurementName] = measurement
 		}
 	}
 
-	sort.Strings(fieldNames)
-	pod.fieldNames = fieldNames
-	pod.fields = fields
+	sort.Strings(measurementNames)
+	pod.measurementNames = measurementNames
+	pod.measurements = measurements
 	pod.tagPathMap = tagPathMap
 
 	pod.interpretations = interpretations.NewInterpretationsStore(pod.Epoch(), pod.Period(), pod.Granularity())

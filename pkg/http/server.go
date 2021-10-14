@@ -95,9 +95,9 @@ func apiPostObservationsHandler(ctx *fasthttp.RequestCtx) {
 		ctx.Response.SetStatusCode(500)
 	}
 
-	validFieldNames := pod.FieldNames()
+	validMeasurementNames := pod.MeasurementNames()
 
-	newState, err := dp.GetState(validFieldNames)
+	newState, err := dp.GetState(validMeasurementNames)
 	if err != nil {
 		ctx.Response.SetStatusCode(400)
 		fmt.Fprintf(ctx, "error processing csv: %s", err.Error())
