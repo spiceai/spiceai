@@ -43,7 +43,7 @@ func testGetCsvWithTagsFunc() func(*testing.T) {
 			t.Error(err)
 		}
 
-		err = dp.Init(nil)
+		err = dp.Init(nil, nil, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -82,7 +82,7 @@ func testGetCsvAllHeadersFunc() func(*testing.T) {
 			t.Error(err)
 		}
 
-		err = dp.Init(nil)
+		err = dp.Init(nil, nil, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -120,7 +120,7 @@ func testGetCsvSelectHeadersFunc() func(*testing.T) {
 			t.Error(err)
 		}
 
-		err = dp.Init(nil)
+		err = dp.Init(nil, nil, nil)
 		if err != nil {
 			t.Fatal(err)
 		}

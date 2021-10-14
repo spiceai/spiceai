@@ -14,7 +14,7 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-type Field struct {
+type Measurement struct {
 	Name         string
 	InitialValue float64
 	Fill         string
@@ -45,7 +45,10 @@ func NewDataspace(dsSpec spec.DataspaceSpec) (*Dataspace, error) {
 			return nil, fmt.Errorf("failed to initialize data processor '%s': %s", dsSpec.Data.Connector.Name, err)
 		}
 
-		err = processor.Init(dsSpec.Data.Connector.Params)
+		measurements := ds.measurementSelectorMap()
+		categories := ds.categorySelectorMap()
+
+		err = processor.Init(dsSpec.Data.Connector.Params, measurements, categories)
 		if err != nil {
 			return nil, fmt.Errorf("failed to initialize data processor '%s': %s", dsSpec.Data.Connector.Name, err)
 		}
@@ -84,72 +87,85 @@ func (ds *Dataspace) CachedState() []*state.State {
 
 func (ds *Dataspace) Actions() map[string]string {
 	fqActions := make(map[string]string)
-	fqFieldNames := ds.FieldNameMap()
+	fqMeasurementNames := ds.MeasurementNameMap()
 	fqActionNames := ds.ActionNames()
 	for dsActionName, dsActionBody := range ds.DataspaceSpec.Actions {
 		fqDsActionBody := dsActionBody
-		for fieldName, fqFieldName := range fqFieldNames {
-			fqDsActionBody = strings.ReplaceAll(fqDsActionBody, fieldName, fqFieldName)
+		for measurementName, fqMeasurementName := range fqMeasurementNames {
+			fqDsActionBody = strings.ReplaceAll(fqDsActionBody, measurementName, fqMeasurementName)
 			fqActions[fqActionNames[dsActionName]] = strings.TrimSpace(fqDsActionBody)
 		}
 	}
 	return fqActions
 }
 
-// Returns a mapping of fully-qualified field names to Fields
-func (ds *Dataspace) Fields() map[string]*Field {
-	fqFieldInitializers := make(map[string]*Field)
-	fqFieldNames := ds.FieldNameMap()
-	for _, fieldSpec := range ds.DataspaceSpec.Fields {
-		if fieldSpec.Type == "tag" {
-			continue
-		}
-		field := &Field{
-			Name:         fieldSpec.Name,
+// Returns a mapping of fully-qualified measurement names to Measurements
+func (ds *Dataspace) Measurements() map[string]*Measurement {
+	fqMeasurementInitializers := make(map[string]*Measurement)
+	fqMeasurementNames := ds.MeasurementNameMap()
+	for _, measurementSpec := range ds.DataspaceSpec.Measurements {
+		measurement := &Measurement{
+			Name:         measurementSpec.Name,
 			InitialValue: 0,
-			Fill:         fieldSpec.Fill,
+			Fill:         measurementSpec.Fill,
 		}
-		if fieldSpec.Initializer != nil {
-			field.InitialValue = *fieldSpec.Initializer
+		if measurementSpec.Initializer != nil {
+			measurement.InitialValue = *measurementSpec.Initializer
 		}
-		fqFieldInitializers[fqFieldNames[fieldSpec.Name]] = field
+		fqMeasurementInitializers[fqMeasurementNames[measurementSpec.Name]] = measurement
 	}
-	return fqFieldInitializers
+	return fqMeasurementInitializers
 }
 
-// Returns a mapping of the datasource local field names to their fully-qualified field name
-func (ds *Dataspace) FieldNameMap() map[string]string {
-	fieldNames := make(map[string]string, len(ds.DataspaceSpec.Fields))
-	for _, v := range ds.DataspaceSpec.Fields {
-		if v.Type == "tag" {
-			continue
-		}
+// Returns a mapping of the datasource local measurement names to their fully-qualified measurement name
+func (ds *Dataspace) MeasurementNameMap() map[string]string {
+	measurementNames := make(map[string]string, len(ds.DataspaceSpec.Measurements))
+	for _, v := range ds.DataspaceSpec.Measurements {
 		fqname := fmt.Sprintf("%s.%s.%s", ds.From, ds.DataspaceSpec.Name, v.Name)
-		fieldNames[v.Name] = fqname
+		measurementNames[v.Name] = fqname
 	}
-	return fieldNames
+	return measurementNames
 }
 
-func (ds *Dataspace) FieldNames() []string {
-	fieldNames := make([]string, 0, len(ds.DataspaceSpec.Fields))
-	for _, v := range ds.DataspaceSpec.Fields {
-		if v.Type == "tag" {
-			continue
-		}
-		fieldNames = append(fieldNames, v.Name)
+func (ds *Dataspace) MeasurementNames() []string {
+	measurementNames := make([]string, 0, len(ds.DataspaceSpec.Measurements))
+	for _, v := range ds.DataspaceSpec.Measurements {
+		measurementNames = append(measurementNames, v.Name)
 	}
 
-	return fieldNames
+	return measurementNames
+}
+
+func (ds *Dataspace) measurementSelectorMap() map[string]string {
+	measurements := make(map[string]string)
+	for _, m := range ds.DataspaceSpec.Measurements {
+		if m.Selector == "" {
+			measurements[m.Name] = m.Name
+		} else {
+			measurements[m.Name] = m.Selector
+		}
+	}
+
+	return measurements
+}
+
+func (ds *Dataspace) categorySelectorMap() map[string]string {
+	categories := make(map[string]string)
+	for _, c := range ds.DataspaceSpec.Categories {
+		if c.Selector == "" {
+			categories[c.Name] = c.Name
+		} else {
+			categories[c.Name] = c.Selector
+		}
+	}
+
+	return categories
 }
 
 // Returns the local tag name (not fully-qualified)
 func (ds *Dataspace) Tags() []string {
-	tags := make([]string, 0)
-	for _, v := range ds.DataspaceSpec.Fields {
-		if v.Type == "tag" {
-			tags = append(tags, v.Name)
-		}
-	}
+	var tags []string
+	tags = append(tags, ds.DataspaceSpec.Tags...)
 
 	return tags
 }
@@ -168,12 +184,12 @@ func (ds *Dataspace) ActionNames() map[string]string {
 func (ds *Dataspace) Laws() []string {
 	var fqLaws []string
 
-	fqFieldNames := ds.FieldNameMap()
+	fqMeasurementNames := ds.MeasurementNameMap()
 
 	for _, dsLaw := range ds.DataspaceSpec.Laws {
 		law := dsLaw
-		for fieldName, fqFieldName := range fqFieldNames {
-			law = strings.ReplaceAll(law, fieldName, fqFieldName)
+		for measurementName, fqMeasurementName := range fqMeasurementNames {
+			law = strings.ReplaceAll(law, measurementName, fqMeasurementName)
 		}
 		fqLaws = append(fqLaws, law)
 	}
@@ -231,7 +247,7 @@ func (ds *Dataspace) ReadData(data []byte, metadata map[string]string) ([]byte, 
 		return nil, err
 	}
 
-	newState := state.NewState(ds.Path(), ds.FieldNames(), ds.Tags(), observations)
+	newState := state.NewState(ds.Path(), ds.MeasurementNames(), ds.Tags(), observations)
 	err = ds.AddNewState(newState, metadata)
 	if err != nil {
 		return nil, err

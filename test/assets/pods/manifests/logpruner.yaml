@@ -22,7 +22,7 @@ dataspaces:
           field: usage_idle
       processor:
         name: flux-csv
-    fields:
+    measurements:
       - name: usage_idle
 
 actions:

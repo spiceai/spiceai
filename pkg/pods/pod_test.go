@@ -26,15 +26,15 @@ func TestPod(t *testing.T) {
 	manifestsToTest := map[string]*TestPodParams{
 		"trader.yaml": {
 			LocalStateTest: true,
-			ExpectedHash:   "64a15d213ebe84486fc68e209ca5d160",
+			ExpectedHash:   "83ba69e37dd58ba0b607c6ebd88d9f96",
 		},
 		"trader-infer.yaml": {
 			LocalStateTest: true,
-			ExpectedHash:   "d0246ffda395945f070cdf2aa60645a7",
+			ExpectedHash:   "ea70b58d28538842a1cb52fdb7d5b11f",
 		},
 		"event-tags.yaml": {
 			LocalStateTest: false,
-			ExpectedHash:   "9c4eb2a29cd338b3593132c2b9036029",
+			ExpectedHash:   "16fc4b1dbaacbabb2b88b16e47e2c0de",
 		},
 	}
 
@@ -48,7 +48,7 @@ func TestPod(t *testing.T) {
 		}
 
 		t.Run(fmt.Sprintf("Base Properties - %s", manifestToTest), testBasePropertiesFunc(pod, testParams.ExpectedHash))
-		t.Run(fmt.Sprintf("FieldNames() - %s", manifestToTest), testFieldNamesFunc(pod))
+		t.Run(fmt.Sprintf("MeasurementNames() - %s", manifestToTest), testMeasurementNamesFunc(pod))
 		t.Run(fmt.Sprintf("Rewards() - %s", manifestToTest), testRewardsFunc(pod))
 		t.Run(fmt.Sprintf("Actions() - %s", manifestToTest), testActionsFunc(pod))
 		t.Run(fmt.Sprintf("CachedCsv() - %s", manifestToTest), testCachedCsvFunc(pod))
@@ -139,10 +139,10 @@ func testBasePropertiesFunc(pod *Pod, expectedHash string) func(*testing.T) {
 	}
 }
 
-// Tests FieldNames() getter
-func testFieldNamesFunc(pod *Pod) func(*testing.T) {
+// Tests MeasurementNames() getter
+func testMeasurementNamesFunc(pod *Pod) func(*testing.T) {
 	return func(t *testing.T) {
-		actual := pod.FieldNames()
+		actual := pod.MeasurementNames()
 
 		var expected []string
 
@@ -165,7 +165,7 @@ func testFieldNamesFunc(pod *Pod) func(*testing.T) {
 			}
 		}
 
-		assert.Equal(t, expected, actual, "invalid pod.FieldNames()")
+		assert.Equal(t, expected, actual, "invalid pod.MeasurementNames()")
 	}
 }
 
@@ -278,7 +278,7 @@ func testAddLocalStateFunc(pod *Pod) func(*testing.T) {
 			t.Error(err)
 		}
 
-		err = dp.Init(nil)
+		err = dp.Init(nil, nil, nil)
 		assert.NoError(t, err)
 
 		fileConnector := file.NewFileConnector()
@@ -325,7 +325,7 @@ func testAddLocalStateCachedCsvFunc(pod *Pod) func(*testing.T) {
 			t.Error(err)
 		}
 
-		err = dp.Init(nil)
+		err = dp.Init(nil, nil, nil)
 		assert.NoError(t, err)
 
 		var wg sync.WaitGroup
