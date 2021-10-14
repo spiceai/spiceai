@@ -16,7 +16,7 @@ var snapshotter = cupaloy.New(cupaloy.SnapshotSubdirectory("../../test/assets/sn
 
 func TestDataSource(t *testing.T) {
 
-	manifestsToTest := []string{"trader"}
+	manifestsToTest := []string{"trader", "event-tags"}
 
 	for _, manifestName := range manifestsToTest {
 		v := viper.New()
@@ -49,6 +49,41 @@ func TestDataSource(t *testing.T) {
 			t.Run(fmt.Sprintf("MeasurementNames() - %s", dsName), testMeasurementNamesFunc(dsSpec))
 			t.Run(fmt.Sprintf("ActionNames() - %s", dsName), testActionNamesFunc(dsSpec))
 			t.Run(fmt.Sprintf("Laws() - %s", dsName), testLawsFunc(dsSpec))
+			t.Run(fmt.Sprintf("MeasurementSelectorMap() - %s", dsName), testMeasurementSelectorMapFunc(dsSpec))
+			t.Run(fmt.Sprintf("CategorySelectorMap() - %s", dsName), testCategorySelectorMapFunc(dsSpec))
+		}
+	}
+}
+
+func testMeasurementSelectorMapFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
+	return func(t *testing.T) {
+		ds, err := dataspace.NewDataspace(dsSpec)
+		if err != nil {
+			t.Error(err)
+		}
+
+		actual := ds.MeasurementSelectorMap()
+
+		err = snapshotter.SnapshotMulti(strings.ReplaceAll(ds.Name(), "/", "_"), actual)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func testCategorySelectorMapFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
+	return func(t *testing.T) {
+
+		ds, err := dataspace.NewDataspace(dsSpec)
+		if err != nil {
+			t.Error(err)
+		}
+
+		actual := ds.CategorySelectorMap()
+
+		err = snapshotter.SnapshotMulti(strings.ReplaceAll(ds.Name(), "/", "_"), actual)
+		if err != nil {
+			t.Fatal(err)
 		}
 	}
 }
@@ -87,6 +122,8 @@ func testActionsFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 				"local.portfolio.buy":  "local.portfolio.usd_balance -= args.price\nlocal.portfolio.btc_balance += 1.1",
 				"local.portfolio.sell": "local.portfolio.usd_balance += args.price\nlocal.portfolio.btc_balance -= 1",
 			}
+		case "event/data":
+			fallthrough
 		case "coinbase/btcusd":
 			expected = make(map[string]string)
 		}
@@ -131,6 +168,14 @@ func testMeasurementNamesFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 				"usd_balance": "local.portfolio.usd_balance",
 				"btc_balance": "local.portfolio.btc_balance",
 			}
+		case "event/data":
+			expected = map[string]string{
+				"eventId": "event.data.eventId",
+				"height":  "event.data.height",
+				"rating":  "event.data.rating",
+				"speed":   "event.data.speed",
+				"target":  "event.data.target",
+			}
 		case "coinbase/btcusd":
 			expected = map[string]string{
 				"close": "coinbase.btcusd.close",
@@ -161,6 +206,8 @@ func testActionNamesFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 				"buy":  "local.portfolio.buy",
 				"sell": "local.portfolio.sell",
 			}
+		case "event/data":
+			fallthrough
 		case "coinbase/btcusd":
 			expected = make(map[string]string)
 		}

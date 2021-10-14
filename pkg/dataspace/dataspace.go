@@ -45,7 +45,10 @@ func NewDataspace(dsSpec spec.DataspaceSpec) (*Dataspace, error) {
 			return nil, fmt.Errorf("failed to initialize data processor '%s': %s", dsSpec.Data.Connector.Name, err)
 		}
 
-		err = processor.Init(dsSpec.Data.Connector.Params)
+		measurements := ds.MeasurementSelectorMap()
+		categories := ds.CategorySelectorMap()
+
+		err = processor.Init(dsSpec.Data.Connector.Params, measurements, categories)
 		if err != nil {
 			return nil, fmt.Errorf("failed to initialize data processor '%s': %s", dsSpec.Data.Connector.Name, err)
 		}
@@ -131,6 +134,32 @@ func (ds *Dataspace) MeasurementNames() []string {
 	}
 
 	return measurementNames
+}
+
+func (ds *Dataspace) MeasurementSelectorMap() map[string]string {
+	measurements := make(map[string]string)
+	for _, m := range ds.DataspaceSpec.Measurements {
+		if m.Selector == "" {
+			measurements[m.Name] = m.Name
+		} else {
+			measurements[m.Name] = m.Selector
+		}
+	}
+
+	return measurements
+}
+
+func (ds *Dataspace) CategorySelectorMap() map[string]string {
+	categories := make(map[string]string)
+	for _, c := range ds.DataspaceSpec.Categories {
+		if c.Selector == "" {
+			categories[c.Name] = c.Name
+		} else {
+			categories[c.Name] = c.Selector
+		}
+	}
+
+	return categories
 }
 
 // Returns the local tag name (not fully-qualified)

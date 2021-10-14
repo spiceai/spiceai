@@ -16,7 +16,7 @@ require (
 	github.com/spf13/cast v1.4.1 // indirect
 	github.com/spf13/cobra v1.2.1
 	github.com/spf13/viper v1.8.1
-	github.com/spiceai/data-components-contrib v0.0.0-20211006182528-4abb5a9be52a
+	github.com/spiceai/data-components-contrib v0.0.0-20211014035630-a5624de9e33a
 	github.com/stretchr/testify v1.7.0
 	github.com/valyala/fasthttp v1.28.0
 	go.uber.org/atomic v1.9.0 // indirect
@@ -33,6 +33,8 @@ require (
 	gopkg.in/natefinch/lumberjack.v2 v2.0.0
 	gopkg.in/yaml.v2 v2.4.0
 )
+
+require github.com/spf13/pflag v1.0.5
 
 require (
 	github.com/alecthomas/jsonschema v0.0.0-20210920000243-787cd8204a0d // indirect
@@ -70,7 +72,6 @@ require (
 	github.com/sergi/go-diff v1.2.0 // indirect
 	github.com/spf13/afero v1.6.0 // indirect
 	github.com/spf13/jwalterweatherman v1.1.0 // indirect
-	github.com/spf13/pflag v1.0.5 // indirect
 	github.com/subosito/gotenv v1.2.0 // indirect
 	github.com/uber/jaeger-client-go v2.29.1+incompatible // indirect
 	github.com/uber/jaeger-lib v2.4.1+incompatible // indirect
