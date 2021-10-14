@@ -1,4 +1,4 @@
-package dataspace_test
+package dataspace
 
 import (
 	"fmt"
@@ -8,7 +8,6 @@ import (
 
 	"github.com/bradleyjkemp/cupaloy"
 	"github.com/spf13/viper"
-	"github.com/spiceai/spiceai/pkg/dataspace"
 	"github.com/spiceai/spiceai/pkg/spec"
 )
 
@@ -49,20 +48,20 @@ func TestDataSource(t *testing.T) {
 			t.Run(fmt.Sprintf("MeasurementNames() - %s", dsName), testMeasurementNamesFunc(dsSpec))
 			t.Run(fmt.Sprintf("ActionNames() - %s", dsName), testActionNamesFunc(dsSpec))
 			t.Run(fmt.Sprintf("Laws() - %s", dsName), testLawsFunc(dsSpec))
-			t.Run(fmt.Sprintf("MeasurementSelectorMap() - %s", dsName), testMeasurementSelectorMapFunc(dsSpec))
-			t.Run(fmt.Sprintf("CategorySelectorMap() - %s", dsName), testCategorySelectorMapFunc(dsSpec))
+			t.Run(fmt.Sprintf("measurementSelectorMap() - %s", dsName), testMeasurementSelectorMapFunc(dsSpec))
+			t.Run(fmt.Sprintf("categorySelectorMap() - %s", dsName), testCategorySelectorMapFunc(dsSpec))
 		}
 	}
 }
 
 func testMeasurementSelectorMapFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 	return func(t *testing.T) {
-		ds, err := dataspace.NewDataspace(dsSpec)
+		ds, err := NewDataspace(dsSpec)
 		if err != nil {
 			t.Error(err)
 		}
 
-		actual := ds.MeasurementSelectorMap()
+		actual := ds.measurementSelectorMap()
 
 		err = snapshotter.SnapshotMulti(strings.ReplaceAll(ds.Name(), "/", "_"), actual)
 		if err != nil {
@@ -74,12 +73,12 @@ func testMeasurementSelectorMapFunc(dsSpec spec.DataspaceSpec) func(*testing.T) 
 func testCategorySelectorMapFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 	return func(t *testing.T) {
 
-		ds, err := dataspace.NewDataspace(dsSpec)
+		ds, err := NewDataspace(dsSpec)
 		if err != nil {
 			t.Error(err)
 		}
 
-		actual := ds.CategorySelectorMap()
+		actual := ds.categorySelectorMap()
 
 		err = snapshotter.SnapshotMulti(strings.ReplaceAll(ds.Name(), "/", "_"), actual)
 		if err != nil {
@@ -91,7 +90,7 @@ func testCategorySelectorMapFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 // Tests Dataspace creation from DataspaceSpec
 func testNewDataspaceFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 	return func(t *testing.T) {
-		ds, err := dataspace.NewDataspace(dsSpec)
+		ds, err := NewDataspace(dsSpec)
 		if err != nil {
 			t.Error(err)
 		}
@@ -107,7 +106,7 @@ func testNewDataspaceFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 // Tests Actions() getter
 func testActionsFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 	return func(t *testing.T) {
-		ds, err := dataspace.NewDataspace(dsSpec)
+		ds, err := NewDataspace(dsSpec)
 		if err != nil {
 			t.Error(err)
 		}
@@ -136,7 +135,7 @@ func testActionsFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 // Tests Measurements() getter
 func testMeasurementsFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 	return func(t *testing.T) {
-		ds, err := dataspace.NewDataspace(dsSpec)
+		ds, err := NewDataspace(dsSpec)
 		if err != nil {
 			t.Error(err)
 		}
@@ -153,7 +152,7 @@ func testMeasurementsFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 // Tests MeasurementNames() getter
 func testMeasurementNamesFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 	return func(t *testing.T) {
-		ds, err := dataspace.NewDataspace(dsSpec)
+		ds, err := NewDataspace(dsSpec)
 		if err != nil {
 			t.Error(err)
 		}
@@ -191,7 +190,7 @@ func testMeasurementNamesFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 // Tests ActionNames() getter
 func testActionNamesFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 	return func(t *testing.T) {
-		ds, err := dataspace.NewDataspace(dsSpec)
+		ds, err := NewDataspace(dsSpec)
 		if err != nil {
 			t.Error(err)
 		}
@@ -221,7 +220,7 @@ func testActionNamesFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 // Tests Laws() getter
 func testLawsFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 	return func(t *testing.T) {
-		ds, err := dataspace.NewDataspace(dsSpec)
+		ds, err := NewDataspace(dsSpec)
 		if err != nil {
 			t.Error(err)
 		}

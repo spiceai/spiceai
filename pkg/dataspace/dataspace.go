@@ -45,8 +45,8 @@ func NewDataspace(dsSpec spec.DataspaceSpec) (*Dataspace, error) {
 			return nil, fmt.Errorf("failed to initialize data processor '%s': %s", dsSpec.Data.Connector.Name, err)
 		}
 
-		measurements := ds.MeasurementSelectorMap()
-		categories := ds.CategorySelectorMap()
+		measurements := ds.measurementSelectorMap()
+		categories := ds.categorySelectorMap()
 
 		err = processor.Init(dsSpec.Data.Connector.Params, measurements, categories)
 		if err != nil {
@@ -136,7 +136,7 @@ func (ds *Dataspace) MeasurementNames() []string {
 	return measurementNames
 }
 
-func (ds *Dataspace) MeasurementSelectorMap() map[string]string {
+func (ds *Dataspace) measurementSelectorMap() map[string]string {
 	measurements := make(map[string]string)
 	for _, m := range ds.DataspaceSpec.Measurements {
 		if m.Selector == "" {
@@ -149,7 +149,7 @@ func (ds *Dataspace) MeasurementSelectorMap() map[string]string {
 	return measurements
 }
 
-func (ds *Dataspace) CategorySelectorMap() map[string]string {
+func (ds *Dataspace) categorySelectorMap() map[string]string {
 	categories := make(map[string]string)
 	for _, c := range ds.DataspaceSpec.Categories {
 		if c.Selector == "" {
