@@ -9,8 +9,6 @@ import (
 	"time"
 
 	"github.com/fasthttp/router"
-	"github.com/spiceai/data-components-contrib/dataprocessors"
-	"github.com/spiceai/data-components-contrib/dataprocessors/csv"
 	"github.com/spiceai/spiceai/pkg/aiengine"
 	"github.com/spiceai/spiceai/pkg/api"
 	"github.com/spiceai/spiceai/pkg/dashboard"
@@ -21,6 +19,7 @@ import (
 	"github.com/spiceai/spiceai/pkg/loggers"
 	"github.com/spiceai/spiceai/pkg/pods"
 	"github.com/spiceai/spiceai/pkg/proto/runtime_pb"
+	"github.com/spiceai/spiceai/pkg/state"
 	spice_time "github.com/spiceai/spiceai/pkg/time"
 	"github.com/valyala/fasthttp"
 	"go.uber.org/zap"
@@ -83,21 +82,9 @@ func apiPostObservationsHandler(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	dp, err := dataprocessors.NewDataProcessor(csv.CsvProcessorName)
-	if err != nil {
-		zaplog.Sugar().Error(err)
-		ctx.Response.SetStatusCode(500)
-	}
-
-	_, err = dp.OnData(ctx.Request.Body())
-	if err != nil {
-		zaplog.Sugar().Error(err)
-		ctx.Response.SetStatusCode(500)
-	}
-
 	validMeasurementNames := pod.MeasurementNames()
 
-	newState, err := dp.GetState(validMeasurementNames)
+	newState, err := state.GetStateFromCsv(validMeasurementNames, ctx.Request.Body())
 	if err != nil {
 		ctx.Response.SetStatusCode(400)
 		fmt.Fprintf(ctx, "error processing csv: %s", err.Error())

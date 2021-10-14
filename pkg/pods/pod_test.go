@@ -9,8 +9,6 @@ import (
 
 	"github.com/bradleyjkemp/cupaloy"
 	"github.com/spiceai/data-components-contrib/dataconnectors/file"
-	"github.com/spiceai/data-components-contrib/dataprocessors"
-	"github.com/spiceai/data-components-contrib/dataprocessors/csv"
 	"github.com/spiceai/spiceai/pkg/spec"
 	"github.com/spiceai/spiceai/pkg/state"
 	"github.com/stretchr/testify/assert"
@@ -273,22 +271,15 @@ func testAddLocalStateFunc(pod *Pod) func(*testing.T) {
 		period := 7 * 24 * time.Hour
 		interval := time.Hour
 
-		dp, err := dataprocessors.NewDataProcessor(csv.CsvProcessorName)
-		if err != nil {
-			t.Error(err)
-		}
-
-		err = dp.Init(nil, nil, nil)
-		assert.NoError(t, err)
-
 		fileConnector := file.NewFileConnector()
 
+		var fileData []byte
+
 		done := make(chan bool, 1)
-		err = fileConnector.Read(func(data []byte, metadata map[string]string) ([]byte, error) {
-			_, err := dp.OnData(data)
-			assert.NoError(t, err)
+		err := fileConnector.Read(func(data []byte, metadata map[string]string) ([]byte, error) {
+			fileData = data
 			done <- true
-			return nil, err
+			return nil, nil
 		})
 		if err != nil {
 			t.Fatal(err.Error())
@@ -304,7 +295,7 @@ func testAddLocalStateFunc(pod *Pod) func(*testing.T) {
 
 		<-done
 
-		newState, err := dp.GetState(nil)
+		newState, err := state.GetStateFromCsv(nil, fileData)
 		if err != nil {
 			t.Error(err)
 		}
@@ -320,18 +311,10 @@ func testAddLocalStateCachedCsvFunc(pod *Pod) func(*testing.T) {
 		period := 7 * 24 * time.Hour
 		interval := time.Hour
 
-		dp, err := dataprocessors.NewDataProcessor(csv.CsvProcessorName)
-		if err != nil {
-			t.Error(err)
-		}
-
-		err = dp.Init(nil, nil, nil)
-		assert.NoError(t, err)
-
 		var wg sync.WaitGroup
 		wg.Add(2)
 
-		err = pod.InitDataConnectors(func(state *state.State, metadata map[string]string) error {
+		err := pod.InitDataConnectors(func(state *state.State, metadata map[string]string) error {
 			wg.Done()
 			return nil
 		})
@@ -341,11 +324,11 @@ func testAddLocalStateCachedCsvFunc(pod *Pod) func(*testing.T) {
 
 		fileConnector := file.NewFileConnector()
 
+		var fileData []byte
 		err = fileConnector.Read(func(data []byte, metadata map[string]string) ([]byte, error) {
-			_, err := dp.OnData(data)
-			assert.NoError(t, err)
+			fileData = data
 			wg.Done()
-			return nil, err
+			return nil, nil
 		})
 		if err != nil {
 			t.Fatal(err.Error())
@@ -361,7 +344,7 @@ func testAddLocalStateCachedCsvFunc(pod *Pod) func(*testing.T) {
 
 		wg.Wait()
 
-		newState, err := dp.GetState(nil)
+		newState, err := state.GetStateFromCsv(nil, fileData)
 		if err != nil {
 			t.Error(err)
 		}
