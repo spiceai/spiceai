@@ -42,10 +42,11 @@ func SendData(pod *pods.Pod, podState ...*state.State) error {
 			}
 		}
 
+		categories := currentDataspace.Categories()
+
 		csv := strings.Builder{}
 		csv.WriteString("time")
 		for _, field := range s.Fields() {
-			categories := currentDataspace.Categories()
 			if _, ok := categories[field]; ok {
 				// Don't write the comma for a category, we will handle it below
 				continue
@@ -53,7 +54,13 @@ func SendData(pod *pods.Pod, podState ...*state.State) error {
 			csv.WriteString(",")
 			csv.WriteString(strings.ReplaceAll(field, ".", "_"))
 		}
-		//TODO: Handle headers for categories
+		for _, category := range categories {
+			for _, val := range category.Values {
+				csv.WriteString(",")
+				oneHotFieldName := fmt.Sprintf("%s-%s", category.Name, val)
+				csv.WriteString(oneHotFieldName)
+			}
+		}
 		if _, ok := tagPathMap[s.Path()]; ok {
 			for _, tagName := range tagPathMap[s.Path()] {
 				csv.WriteString(",")
