@@ -16,11 +16,11 @@ func NewSnapshotter(subdirectory string) *Snapshotter {
 	}
 }
 
-func (s *Snapshotter) SnapshotT(t cupaloy.TestingT, i ...interface{}) {
+func (s Snapshotter) SnapshotT(t cupaloy.TestingT, i ...interface{}) {
 	s.config.SnapshotT(t, i...)
 }
 
-func (s *Snapshotter) SnapshotTJson(t cupaloy.TestingT, i interface{}) {
+func (s Snapshotter) SnapshotTJson(t cupaloy.TestingT, i interface{}) {
 	json, err := getJson(i)
 	if err != nil {
 		t.Fatal(err)
@@ -28,7 +28,7 @@ func (s *Snapshotter) SnapshotTJson(t cupaloy.TestingT, i interface{}) {
 	s.config.SnapshotT(t, json)
 }
 
-func (s *Snapshotter) SnapshotMultiJson(name string, i interface{}) error {
+func (s Snapshotter) SnapshotMultiJson(name string, i interface{}) error {
 	json, err := getJson(i)
 	if err != nil {
 		return err
