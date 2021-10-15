@@ -54,10 +54,11 @@ func SendData(pod *pods.Pod, podState ...*state.State) error {
 			csv.WriteString(",")
 			csv.WriteString(strings.ReplaceAll(field, ".", "_"))
 		}
-		for _, category := range categories {
+		for fqCategoryName, category := range categories {
 			for _, val := range category.Values {
 				csv.WriteString(",")
-				oneHotFieldName := fmt.Sprintf("%s-%s", category.Name, val)
+				oneHotFieldName := fmt.Sprintf("%s-%s", fqCategoryName, val)
+				oneHotFieldName = strings.ReplaceAll(oneHotFieldName, ".", "_")
 				csv.WriteString(oneHotFieldName)
 			}
 		}
