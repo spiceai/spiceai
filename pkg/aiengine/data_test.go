@@ -10,6 +10,8 @@ import (
 	"github.com/spiceai/data-components-contrib/dataprocessors/csv"
 	"github.com/spiceai/data-components-contrib/dataprocessors/json"
 	"github.com/spiceai/spiceai/pkg/dataspace"
+	"github.com/spiceai/spiceai/pkg/pods"
+	"github.com/spiceai/spiceai/pkg/state"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -18,6 +20,65 @@ func TestObservations(t *testing.T) {
 	t.Run("getData() - Select headers with preview", testGetCsvSelectHeadersWithPreviewFunc())
 	t.Run("getData() - With tags", testGetDataWithTagsFunc())
 	t.Run("getData() - With categories", testGetDataWithCategoriesFunc())
+	t.Run("getAddDataRequest()", testGetAddDataRequestFunc())
+}
+
+func testGetAddDataRequestFunc() func(*testing.T) {
+	return func(t *testing.T) {
+		data, err := os.ReadFile("../../test/assets/data/json/event_stream_categories.json")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		pod, err := pods.LoadPodFromManifest("../../test/assets/pods/manifests/event-categories.yaml")
+		if err != nil {
+			t.Error(err)
+			return
+		}
+
+		dp, err := dataprocessors.NewDataProcessor(json.JsonProcessorName)
+		if err != nil {
+			t.Error(err)
+		}
+
+		measurements := map[string]string{
+			"duration":     "length_of_time",
+			"guest_count":  "num_guests",
+			"ticket_price": "ticket_price",
+		}
+
+		categories := map[string]string{
+			"event_type":      "event_type",
+			"target_audience": "target_audience",
+		}
+
+		err = dp.Init(nil, measurements, categories)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		_, err = dp.OnData(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		newObservations, err := dp.GetObservations()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+
+		fieldNames := []string{"duration", "guest_count", "ticket_price", "event_type", "target_audience"}
+		tags := []string{"tagA", "tagB", "tagC"}
+
+		s := state.NewState("event.stream", fieldNames, tags, newObservations)
+
+		addDataRequest := getAddDataRequest(pod, s)
+
+		assert.Equal(t, "event-categories", addDataRequest.Pod)
+
+		snapshotter.SnapshotT(t, addDataRequest.CsvData)
+	}
 }
 
 // Tests "GetCsv() - All headers with preview
