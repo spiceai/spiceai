@@ -160,9 +160,9 @@ func GetStateFromCsv(validFields []string, data []byte) ([]*State, error) {
 
 		for path, data := range lineData {
 			observation := &observations.Observation{
-				Time: ts.Unix(),
-				Data: data,
-				Tags: tagData[path],
+				Time:         ts.Unix(),
+				Measurements: data,
+				Tags:         tagData[path],
 			}
 			obs := pathToObservations[path]
 			pathToObservations[path] = append(obs, *observation)

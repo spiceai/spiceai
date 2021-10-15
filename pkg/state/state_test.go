@@ -102,7 +102,7 @@ func testGetStateFunc(data []byte) func(*testing.T) {
 
 		expectedFirstObservation := observations.Observation{
 			Time: 1626697480,
-			Data: map[string]float64{
+			Measurements: map[string]float64{
 				"price": 31232.709090909084,
 			},
 		}
@@ -143,7 +143,7 @@ func testGetStateTagsFunc(data []byte) func(*testing.T) {
 
 		expectedFirstObservation := observations.Observation{
 			Time: 1605312000,
-			Data: map[string]float64{
+			Measurements: map[string]float64{
 				"low": 16240,
 			},
 		}
@@ -186,7 +186,7 @@ func testGetStateTwiceFunc(data []byte) func(*testing.T) {
 
 		expectedFirstObservation := observations.Observation{
 			Time: 1626697480,
-			Data: map[string]float64{
+			Measurements: map[string]float64{
 				"price": 31232.709090909084,
 			},
 		}
