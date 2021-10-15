@@ -7,7 +7,6 @@ import (
 
 type Observation struct {
 	Time         int64
-	Data         map[string]float64 // Temporary
 	Measurements map[string]float64
 	Categories   map[string]string
 	Tags         []string
