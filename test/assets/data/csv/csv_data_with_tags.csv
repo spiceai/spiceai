@@ -1,4 +1,4 @@
-time,eventId,height,rating,speed,target,_tags
+time,event_id,h,rating,speed,target,_tags
 1610057400,1,10,10,15,1,tagA tagB tagC
 1610057800,2,20,11,30,2,tagA
 1610058200,4,30,12,45,3,tagA tagC

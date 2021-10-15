@@ -93,7 +93,7 @@ func getData(csv *strings.Builder, epoch time.Time, fieldNames []string, tags []
 		for _, f := range fieldNames {
 			csv.WriteString(",")
 
-			val, ok := o.Data[f]
+			val, ok := o.Measurements[f]
 			if ok {
 				csv.WriteString(strconv.FormatFloat(val, 'f', -1, 64))
 			}

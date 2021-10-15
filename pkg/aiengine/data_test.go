@@ -30,7 +30,15 @@ func testGetCsvAllHeadersWithPreviewFunc() func(*testing.T) {
 			t.Error(err)
 		}
 
-		err = dp.Init(nil, nil, nil)
+		measurements := map[string]string{
+			"open":   "open",
+			"high":   "high",
+			"low":    "low",
+			"close":  "close",
+			"volume": "volume",
+		}
+
+		err = dp.Init(nil, measurements, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -79,7 +87,15 @@ func testGetCsvSelectHeadersWithPreviewFunc() func(*testing.T) {
 			t.Error(err)
 		}
 
-		err = dp.Init(nil, nil, nil)
+		measurements := map[string]string{
+			"open":   "open",
+			"high":   "high",
+			"low":    "low",
+			"close":  "close",
+			"volume": "volume",
+		}
+
+		err = dp.Init(nil, measurements, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -125,7 +141,15 @@ func testGetDataWithTagsFunc() func(*testing.T) {
 			t.Error(err)
 		}
 
-		err = dp.Init(nil, nil, nil)
+		measurements := map[string]string{
+			"eventId": "event_id",
+			"height":  "h",
+			"rating":  "rating",
+			"speed":   "speed",
+			"target":  "target",
+		}
+
+		err = dp.Init(nil, measurements, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
