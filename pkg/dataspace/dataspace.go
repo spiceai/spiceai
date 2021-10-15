@@ -20,6 +20,11 @@ type Measurement struct {
 	Fill         string
 }
 
+type Category struct {
+	Name   string
+	Values []string
+}
+
 type Dataspace struct {
 	spec.DataspaceSpec
 	connector dataconnectors.DataConnector
@@ -97,6 +102,20 @@ func (ds *Dataspace) Actions() map[string]string {
 		}
 	}
 	return fqActions
+}
+
+// Returns a mapping of fully-qualified category names to Category
+func (ds *Dataspace) Categories() map[string]*Category {
+	categories := make(map[string]*Category)
+	for _, categorySpec := range ds.DataspaceSpec.Categories {
+		fqCategoryName := fmt.Sprintf("%s.%s.%s", ds.From, ds.DataspaceSpec.Name, categorySpec.Name)
+		categories[fqCategoryName] = &Category{
+			Name:   categorySpec.Name,
+			Values: categorySpec.Values,
+		}
+	}
+
+	return categories
 }
 
 // Returns a mapping of fully-qualified measurement names to Measurements

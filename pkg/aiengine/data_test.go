@@ -8,6 +8,10 @@ import (
 
 	"github.com/spiceai/data-components-contrib/dataprocessors"
 	"github.com/spiceai/data-components-contrib/dataprocessors/csv"
+	"github.com/spiceai/data-components-contrib/dataprocessors/json"
+	"github.com/spiceai/spiceai/pkg/dataspace"
+	"github.com/spiceai/spiceai/pkg/pods"
+	"github.com/spiceai/spiceai/pkg/state"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -15,6 +19,66 @@ func TestObservations(t *testing.T) {
 	t.Run("getData() - All headers with preview", testGetCsvAllHeadersWithPreviewFunc())
 	t.Run("getData() - Select headers with preview", testGetCsvSelectHeadersWithPreviewFunc())
 	t.Run("getData() - With tags", testGetDataWithTagsFunc())
+	t.Run("getData() - With categories", testGetDataWithCategoriesFunc())
+	t.Run("getAddDataRequest()", testGetAddDataRequestFunc())
+}
+
+func testGetAddDataRequestFunc() func(*testing.T) {
+	return func(t *testing.T) {
+		data, err := os.ReadFile("../../test/assets/data/json/event_stream_categories.json")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		pod, err := pods.LoadPodFromManifest("../../test/assets/pods/manifests/event-categories.yaml")
+		if err != nil {
+			t.Error(err)
+			return
+		}
+
+		dp, err := dataprocessors.NewDataProcessor(json.JsonProcessorName)
+		if err != nil {
+			t.Error(err)
+		}
+
+		measurements := map[string]string{
+			"duration":     "length_of_time",
+			"guest_count":  "num_guests",
+			"ticket_price": "ticket_price",
+		}
+
+		categories := map[string]string{
+			"event_type":      "event_type",
+			"target_audience": "target_audience",
+		}
+
+		err = dp.Init(nil, measurements, categories)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		_, err = dp.OnData(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		newObservations, err := dp.GetObservations()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+
+		fieldNames := []string{"duration", "guest_count", "ticket_price", "event_type", "target_audience"}
+		tags := []string{"tagA", "tagB", "tagC"}
+
+		s := state.NewState("event.stream", fieldNames, tags, newObservations)
+
+		addDataRequest := getAddDataRequest(pod, s)
+
+		assert.Equal(t, "event-categories", addDataRequest.Pod)
+
+		snapshotter.SnapshotT(t, addDataRequest.CsvData)
+	}
 }
 
 // Tests "GetCsv() - All headers with preview
@@ -60,7 +124,7 @@ func testGetCsvAllHeadersWithPreviewFunc() func(*testing.T) {
 		headers := strings.Split(headerLine, ",")
 		tags := make([]string, 0)
 
-		actualPreviewCsv := getData(&csv, epoch, headers, tags, newObservations, 5)
+		actualPreviewCsv := getData(&csv, epoch, headers, tags, nil, newObservations, 5)
 
 		expectedPreviewCsv := `1605313800,16256.42,16305,16248.6,16305,110.91971
 1605315600,16303.88,16303.88,16210.99,16222.16,231.64805
@@ -116,7 +180,7 @@ func testGetCsvSelectHeadersWithPreviewFunc() func(*testing.T) {
 		headers := strings.Split("open,high,low,close,volume", ",")
 		tags := make([]string, 0)
 
-		actualPreviewCsv := getData(&csv, epoch, headers, tags, newObservations, 5)
+		actualPreviewCsv := getData(&csv, epoch, headers, tags, nil, newObservations, 5)
 
 		expectedPreviewCsv := `1605312000,16339.56,16339.6,16240,16254.51,274.42607
 1605313800,16256.42,16305,16248.6,16305,110.91971
@@ -170,7 +234,7 @@ func testGetDataWithTagsFunc() func(*testing.T) {
 		fieldNames := []string{"eventId", "height", "rating", "speed", "target"}
 		tags := []string{"tagA", "tagB", "tagC"}
 
-		actualPreviewCsv := getData(&csv, epoch, fieldNames, tags, newObservations, 5)
+		actualPreviewCsv := getData(&csv, epoch, fieldNames, tags, nil, newObservations, 5)
 
 		expectedPreviewCsv := `1610057400,1,10,10,15,1,1,1,1
 1610057800,2,20,11,30,2,1,0,0
@@ -180,5 +244,61 @@ func testGetDataWithTagsFunc() func(*testing.T) {
 `
 
 		assert.Equal(t, expectedPreviewCsv, actualPreviewCsv, "preview csv did not match")
+	}
+}
+
+func testGetDataWithCategoriesFunc() func(*testing.T) {
+	return func(t *testing.T) {
+		data, err := os.ReadFile("../../test/assets/data/json/event_stream_categories.json")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		dp, err := dataprocessors.NewDataProcessor(json.JsonProcessorName)
+		if err != nil {
+			t.Error(err)
+		}
+
+		measurements := map[string]string{
+			"duration":     "length_of_time",
+			"guest_count":  "num_guests",
+			"ticket_price": "ticket_price",
+		}
+
+		categories := map[string]string{
+			"event_type":      "event_type",
+			"target_audience": "target_audience",
+		}
+
+		err = dp.Init(nil, measurements, categories)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		_, err = dp.OnData(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		newObservations, err := dp.GetObservations()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+
+		categoriesList := []*dataspace.Category{
+			{Name: "event_type", Values: []string{"dinner", "party", "dance", "concert", "football_game"}},
+			{Name: "target_audience", Values: []string{"employees", "investors", "cohort_a"}},
+		}
+
+		csv := strings.Builder{}
+		epoch := time.Unix(1610057400, 0)
+		fieldNames := []string{"duration", "guest_count", "ticket_price", "event_type", "target_audience"}
+		tags := []string{"tagA", "tagB", "tagC"}
+
+		t.Log(fieldNames)
+		getData(&csv, epoch, fieldNames, tags, categoriesList, newObservations, 5)
+
+		snapshotter.SnapshotT(t, csv.String())
 	}
 }

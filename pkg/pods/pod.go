@@ -33,6 +33,7 @@ type Pod struct {
 	dataSources      []*dataspace.Dataspace
 	measurements     map[string]*dataspace.Measurement
 	measurementNames []string
+	categoryPathMap  map[string][]*dataspace.Category
 	tagPathMap       map[string][]string
 	flights          map[string]*flights.Flight
 	viper            *viper.Viper
@@ -301,6 +302,10 @@ func (pod *Pod) MeasurementNames() []string {
 	return pod.measurementNames
 }
 
+func (pod *Pod) CategoryPathMap() map[string][]*dataspace.Category {
+	return pod.categoryPathMap
+}
+
 // Returns a map of datasource paths to the tags in those paths
 func (pod *Pod) TagPathMap() map[string][]string {
 	return pod.tagPathMap
@@ -451,6 +456,7 @@ func loadPod(podPath string, hash string) (*Pod, error) {
 	var measurementNames []string
 	tagPathMap := make(map[string][]string)
 	measurements := make(map[string]*dataspace.Measurement)
+	categoryPathMap := make(map[string][]*dataspace.Category)
 
 	for _, dsSpec := range pod.PodSpec.Dataspaces {
 		ds, err := dataspace.NewDataspace(dsSpec)
@@ -471,11 +477,18 @@ func loadPod(podPath string, hash string) (*Pod, error) {
 		for fqMeasurementName, measurement := range ds.Measurements() {
 			measurements[fqMeasurementName] = measurement
 		}
+
+		dsCategories := make([]*dataspace.Category, 0, len(ds.Categories()))
+		for _, category := range ds.Categories() {
+			dsCategories = append(dsCategories, category)
+		}
+		categoryPathMap[ds.Path()] = dsCategories
 	}
 
 	sort.Strings(measurementNames)
 	pod.measurementNames = measurementNames
 	pod.measurements = measurements
+	pod.categoryPathMap = categoryPathMap
 	pod.tagPathMap = tagPathMap
 
 	pod.interpretations = interpretations.NewInterpretationsStore(pod.Epoch(), pod.Period(), pod.Granularity())
