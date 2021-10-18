@@ -2,6 +2,8 @@ module github.com/spiceai/spiceai
 
 go 1.17
 
+replace github.com/spiceai/data-components-contrib v0.0.1-fake-version => ../data-components-contrib
+
 require (
 	github.com/andybalholm/brotli v1.0.3 // indirect
 	github.com/bradleyjkemp/cupaloy v2.3.0+incompatible
@@ -16,7 +18,7 @@ require (
 	github.com/spf13/cast v1.4.1 // indirect
 	github.com/spf13/cobra v1.2.1
 	github.com/spf13/viper v1.8.1
-	github.com/spiceai/data-components-contrib v0.0.0-20211015130448-79e1d1311909
+	github.com/spiceai/data-components-contrib v0.0.0-20211018075747-fc5a4509d253
 	github.com/stretchr/testify v1.7.0
 	github.com/valyala/fasthttp v1.28.0
 	go.uber.org/atomic v1.9.0 // indirect

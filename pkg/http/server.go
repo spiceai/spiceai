@@ -43,7 +43,7 @@ func healthHandler(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	err := aiengine.IsServerHealthy()
+	err := aiengine.IsAIEngineHealthy()
 	if err != nil {
 		fmt.Fprintf(ctx, "degraded\n")
 		fmt.Fprintf(ctx, "ai: %s", err.Error())
@@ -522,7 +522,7 @@ func (server *server) Start() error {
 		api.POST("/pods/{pod}/models/{tag}/export", apiPostExportHandler)
 		api.POST("/pods/{pod}/import", apiPostImportHandler)
 		api.POST("/pods/{pod}/models/{tag}/import", apiPostImportHandler)
-		api.POST("/pods/{pod}/dataspaces/{dataspace_from}/{dataspace_name}", apiPostDataspaceHandler)
+		api.POST("/pods/{pod}/dataspaces/{dataspace_from}/{dataspace_name}/data", apiPostDataspaceHandler)
 
 		// Flights
 		api.GET("/pods/{pod}/training_runs", apiGetFlightsHandler)

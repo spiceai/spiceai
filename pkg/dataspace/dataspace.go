@@ -68,7 +68,7 @@ func NewDataspace(dsSpec spec.DataspaceSpec) (*Dataspace, error) {
 
 			err = connector.Read(ds.ReadData)
 			if err != nil {
-				return nil, fmt.Errorf("failed to initialize data connector '%s': %s", dsSpec.Data.Connector.Name, err)
+				return nil, fmt.Errorf("'%s' data connector failed to read: %s", dsSpec.Data.Connector.Name, err)
 			}
 		}
 
