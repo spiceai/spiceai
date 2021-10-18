@@ -10,7 +10,7 @@ type SpiceRegistry interface {
 }
 
 func GetRegistry(path string) SpiceRegistry {
-	if strings.HasPrefix(path, "/") || strings.HasPrefix(path, "file://") {
+	if strings.HasPrefix(path, "/") || strings.HasPrefix(path, "../") || strings.HasPrefix(path, "file://") {
 		return &LocalFileRegistry{}
 	}
 
