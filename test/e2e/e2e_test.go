@@ -28,6 +28,7 @@ var (
 	spicedContext      string
 	testDir            string
 	repoRoot           string
+	localRegistryPath  string
 	workingDirectory   string
 	runtimePath        string
 	cliClient          *cli
@@ -40,6 +41,7 @@ func TestMain(m *testing.M) {
 	flag.BoolVar(&shouldRunTest, "e2e", false, "run e2e tests")
 	flag.BoolVar(&shouldStartRuntime, "startruntime", true, "start runtime")
 	flag.StringVar(&spicedContext, "context", "docker", "specify --context <context> to spice CLI for spiced")
+	flag.StringVar(&localRegistryPath, "localregistry", "", "--localregistry <path> uses local Spicepod registry at <path> instead of spicerack.org")
 	flag.Parse()
 	if !shouldRunTest {
 		os.Exit(m.Run())
@@ -102,7 +104,17 @@ func TestMain(m *testing.M) {
 		context:            spicedContext,
 	}
 
-	for _, testPod := range testPods {
+	podsToAdd := testPods
+	if localRegistryPath != "" {
+		fmt.Println(aurora.BgBrightBlue(fmt.Sprintf("Adding pods from local registry '%s'", localRegistryPath)))
+		podsToAdd := make([]string, len(testPods))
+		for _, p := range testPods {
+			pPath := strings.Split(p, "@")[0]
+			podsToAdd = append(podsToAdd, filepath.Join(localRegistryPath, pPath))
+		}
+	}
+
+	for _, testPod := range podsToAdd {
 		err = cliClient.runCliCmd("add", testPod)
 		if err != nil {
 			log.Println(err.Error())
