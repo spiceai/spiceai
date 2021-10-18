@@ -9,11 +9,16 @@ interface DataGridProps {
 }
 
 const DataGrid: React.FunctionComponent<DataGridProps> = (props) => {
-  const { data: observationData, error: observationError } = useObservations(props.pod.name);
+  const {
+    data: observationData,
+    isLoading: observationsLoading,
+    error: observationError,
+  } = useObservations(props.pod.name);
 
-  // TODO: Handle isLoading and error states
-  if (!observationData || observationError) {
-    return <>Error loading observation data: {observationError}</>;
+  if (observationError) {
+    return (
+      <div className="p-2">Error loading observation data: {JSON.stringify(observationError)}</div>
+    );
   }
 
   return (
@@ -24,14 +29,11 @@ const DataGrid: React.FunctionComponent<DataGridProps> = (props) => {
         </span>
       </div>
 
-      <div className="grid grid-cols-7 justify-items-center overflow-scroll">
-        <GridItem heading>Time</GridItem>
-        {observationData.map((od, i) => (
-          <div key={i}>
-            <GridItem>{new Date(od.time).toLocaleString()}</GridItem>
-          </div>
-        ))}
-      </div>
+      {observationData.length === 0 ? (
+        <div>No data</div>
+      ) : (
+        <div className="grid grid-cols-7 justify-items-center overflow-scroll"></div>
+      )}
     </div>
   );
 };

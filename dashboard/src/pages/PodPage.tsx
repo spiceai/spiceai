@@ -6,7 +6,6 @@ import Card from '../components/layout/Card';
 import { usePod } from '../models/pod';
 import { useFlights } from '../models/flight';
 import FlightChart from '../components/flights/FlightChart';
-import { useObservations } from '../models/observation';
 import DataGrid from '../components/datagrid/DataGrid';
 
 interface PodProps {
@@ -19,7 +18,6 @@ const PodPage: React.FunctionComponent<PodProps> = () => {
   const podName = location.pathname.substring(podNamePathIndex);
 
   const { data: pod, error: podError } = usePod(podName);
-  const { data: observations, error: observationsError } = useObservations(podName);
   const { data: flights, error: flightsError } = useFlights(podName);
 
   return (
@@ -28,9 +26,8 @@ const PodPage: React.FunctionComponent<PodProps> = () => {
         <div className="mb-2">
           <PodHeader pod={pod}></PodHeader>
           <h2 className="ml-2 mb-2 font-spice tracking-spice text-s uppercase">Observations</h2>
-          <div className="p-2">
-            <DataGrid pod={pod} />
-          </div>
+          <DataGrid pod={pod} />
+          <div className="p-2"></div>
           <h2 className="ml-2 mb-2 font-spice tracking-spice text-s uppercase">Training Runs</h2>
           <div className="p-2">
             {!flightsError &&
