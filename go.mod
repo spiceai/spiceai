@@ -2,7 +2,7 @@ module github.com/spiceai/spiceai
 
 go 1.17
 
-replace github.com/spiceai/data-components-contrib v0.0.0-20211018055114-f24eb4b6da92 => ../data-components-contrib
+replace github.com/spiceai/data-components-contrib v0.0.1-fake-version => ../data-components-contrib
 
 require (
 	github.com/andybalholm/brotli v1.0.3 // indirect
