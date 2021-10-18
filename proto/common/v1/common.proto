@@ -4,6 +4,13 @@ package common;
 
 option go_package = "github.com/spiceai/spiceai/pkg/proto/common_pb";
 
+message Observation {
+  int64 time = 1;
+  map<string, double> measurements = 2;
+  map<string, string> categories = 3;
+  repeated string tags = 4;
+}
+
 message Interpretation {
     int64 start = 1;
     int64 end = 2;
