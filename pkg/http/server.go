@@ -18,6 +18,7 @@ import (
 	"github.com/spiceai/spiceai/pkg/flights"
 	"github.com/spiceai/spiceai/pkg/loggers"
 	"github.com/spiceai/spiceai/pkg/pods"
+	"github.com/spiceai/spiceai/pkg/proto/common_pb"
 	"github.com/spiceai/spiceai/pkg/proto/runtime_pb"
 	"github.com/spiceai/spiceai/pkg/state"
 	spice_time "github.com/spiceai/spiceai/pkg/time"
@@ -67,9 +68,26 @@ func apiGetObservationsHandler(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	csv := pod.CachedCsv()
+	if string(ctx.Request.Header.Peek("Accept")) == "application/json" {
+		observations := []*common_pb.Observation{}
+		for _, state := range pod.CachedState() {
+			for _, o := range state.Observations() {
+				observations = append(observations, api.NewObservation(&o))
+			}
+		}
+		ctx.Response.Header.Add("Content-Type", "application/json")
+		data, err := json.Marshal(observations)
+		if err != nil {
+			ctx.Response.SetStatusCode(500)
+			fmt.Fprintf(ctx, "error getting observations: %s", err.Error())
+			return
+		}
+		_, _ = ctx.Write(data)
+		return
+	}
 
-	ctx.Response.Header.Add("Content-Type", " text/csv")
+	ctx.Response.Header.Add("Content-Type", "text/csv")
+	csv := pod.CachedCsv()
 	_, _ = ctx.WriteString(csv)
 }
 
