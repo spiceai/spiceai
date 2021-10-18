@@ -265,4 +265,5 @@ func isTestEnvironment() bool {
 
 func SetAIEngineClient(newClient AIEngineClient) {
 	aiengineClient = newClient
+	aiServerReady = true
 }
