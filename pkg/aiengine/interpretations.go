@@ -21,7 +21,7 @@ func sendInterpretations(pod *pods.Pod, indexedInterpretations *common_pb.Indexe
 		return nil
 	}
 
-	err := IsServerHealthy()
+	err := IsAIEngineHealthy()
 	if err != nil {
 		return err
 	}

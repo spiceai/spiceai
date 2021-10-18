@@ -2,6 +2,7 @@ package aiengine
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -12,9 +13,9 @@ import (
 	"time"
 
 	"github.com/logrusorgru/aurora"
-	"github.com/spiceai/spiceai/pkg/context"
+	spice_context "github.com/spiceai/spiceai/pkg/context"
 	"github.com/spiceai/spiceai/pkg/loggers"
-	"github.com/spiceai/spiceai/pkg/util"
+	"github.com/spiceai/spiceai/pkg/proto/aiengine_pb"
 	"go.uber.org/zap"
 )
 
@@ -60,9 +61,9 @@ func StartServer(ready chan bool, isSingleRun bool) error {
 		log.Println(line)
 	}
 
-	context := context.CurrentContext()
-	aiServerPath := filepath.Join(context.AIEngineDir(), pythonServerFilename)
-	aiServerCmd = execCommand(context.AIEnginePythonCmdPath(), aiServerPath)
+	rtcontext := spice_context.CurrentContext()
+	aiServerPath := filepath.Join(rtcontext.AIEngineDir(), pythonServerFilename)
+	aiServerCmd = execCommand(rtcontext.AIEnginePythonCmdPath(), aiServerPath)
 	aiServerRunning := make(chan bool, 1)
 
 	var err error
@@ -94,7 +95,7 @@ func StartServer(ready chan bool, isSingleRun bool) error {
 		outScanner := bufio.NewScanner(stdOutPipe)
 		errScanner := bufio.NewScanner(stdErrPipe)
 
-		fileLogger, err := loggers.NewFileLogger("aiengine", context.SpiceRuntimeDir())
+		fileLogger, err := loggers.NewFileLogger("aiengine", rtcontext.SpiceRuntimeDir())
 		if err != nil {
 			zaplog.Sugar().Errorf("error creating file logger: %w", err)
 			fileLogger = nil
@@ -190,11 +191,21 @@ func StopServer() error {
 }
 
 func ServerReady() bool {
-	return aiServerReady
+	err := IsAIEngineHealthy()
+	if err != nil {
+		zaplog.Sugar().Debugf("aiengine not healthy: %s", err)
+		return false
+	}
+
+	return true
 }
 
-func IsServerHealthy() error {
-	return util.IsAIEngineServerHealthy(aiengineClient)
+func IsAIEngineHealthy() error {
+	if !aiServerReady {
+		return errors.New("aiengine not yet ready")
+	}
+
+	return isAIEngineServerHealthy()
 }
 
 func waitForServerHealthy(maxAttempts int) int {
@@ -211,7 +222,7 @@ func waitForServerHealthy(maxAttempts int) int {
 			break
 		}
 
-		err := IsServerHealthy()
+		err := isAIEngineServerHealthy()
 		if err != nil {
 			zaplog.Debug(err.Error())
 			continue
@@ -221,6 +232,25 @@ func waitForServerHealthy(maxAttempts int) int {
 	}
 
 	return attemptCount
+}
+
+func isAIEngineServerHealthy() error {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	resp, err := aiengineClient.GetHealth(ctx, &aiengine_pb.HealthRequest{})
+	if err != nil {
+		return err
+	}
+
+	if resp.Error {
+		return errors.New(resp.Result)
+	}
+
+	if resp.Result != "ok" {
+		return errors.New(resp.Result)
+	}
+
+	return nil
 }
 
 func isTestEnvironment() bool {

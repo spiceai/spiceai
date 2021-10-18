@@ -35,10 +35,10 @@ func (r *LocalFileRegistry) GetPod(podPath string) (string, error) {
 	}
 
 	// Validate source
-	podManifestFileName := filepath.Base(podPath)
+	podManifestFileName := fmt.Sprintf("%s.yaml", strings.ToLower(filepath.Base(podPath)))
 	podManifestPath := filepath.Join(context.CurrentContext().PodsDir(), podManifestFileName)
 
-	if _, err := os.Stat(filepath.Join(podPath, fmt.Sprintf("%s.yaml", podManifestFileName))); err != nil {
+	if _, err := os.Stat(filepath.Join(podPath, podManifestFileName)); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return "", fmt.Errorf("the directory '%s' does not contain a manifest. Is it a valid pod?", podPath)
 		}
