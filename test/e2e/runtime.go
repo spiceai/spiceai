@@ -113,7 +113,7 @@ func (r *runtimeServer) postObservations(podName string, newObservations []byte)
 }
 
 func (r *runtimeServer) postDataspace(podName string, dataspaceFrom string, dataspaceName string, data []byte) error {
-	url := fmt.Sprintf("%s/api/v0.1/pods/%s/dataspaces/%s/%s", r.baseUrl, podName, dataspaceFrom, dataspaceName)
+	url := fmt.Sprintf("%s/api/v0.1/pods/%s/dataspaces/%s/%s/data", r.baseUrl, podName, dataspaceFrom, dataspaceName)
 	resp, err := http.Post(url, "application/octet-stream", bytes.NewReader(data))
 	if err != nil {
 		return err
