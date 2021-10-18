@@ -58,7 +58,7 @@ func (r *LocalFileRegistry) GetPod(podPath string) (string, error) {
 	}
 
 	// Copy files
-	fileList := make(map[string]fs.DirEntry, 0)
+	fileList := make(map[string]fs.DirEntry)
 	err = filepath.WalkDir(podPath, func(path string, d fs.DirEntry, err error) error {
 		if path != podPath {
 			fileList[path] = d
