@@ -196,12 +196,22 @@ func TestObservations(t *testing.T) {
 	})
 
 	t.Log("*** Get Observations ***")
-	observation, err := runtime.getObservations("trader")
+	initialObservationsCsv, err := runtime.getObservations("trader", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	err = snapshotter.SnapshotMulti("initial_observation.csv", observation)
+	err = snapshotter.SnapshotMulti("initial_observation.csv", initialObservationsCsv)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	initialObservationsJson, err := runtime.getObservations("trader", "application/json")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = snapshotter.SnapshotMulti("initial_observation.json", initialObservationsJson)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -220,12 +230,22 @@ func TestObservations(t *testing.T) {
 	time.Sleep(1 * time.Second)
 
 	t.Log("*** Get New Observations ***")
-	observation, err = runtime.getObservations("trader")
+	newObservationsCsv, err := runtime.getObservations("trader", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	err = snapshotter.SnapshotMulti("new_observation.csv", observation)
+	err = snapshotter.SnapshotMulti("new_observation.csv", newObservationsCsv)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	newObservationsJson, err := runtime.getObservations("trader", "application/json")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = snapshotter.SnapshotMulti("new_observation.json", newObservationsJson)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -250,7 +270,7 @@ func TestDataspaceData(t *testing.T) {
 	})
 
 	t.Log("*** Get Observations ***")
-	observation, err := runtime.getObservations("customprocessor")
+	observation, err := runtime.getObservations("customprocessor", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -274,7 +294,7 @@ func TestDataspaceData(t *testing.T) {
 	time.Sleep(1 * time.Second)
 
 	t.Log("*** Get New Observations ***")
-	observation, err = runtime.getObservations("customprocessor")
+	observation, err = runtime.getObservations("customprocessor", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -298,7 +318,7 @@ func TestDataspaceData(t *testing.T) {
 	time.Sleep(1 * time.Second)
 
 	t.Log("*** Get New Observations with CSV Data ***")
-	observation, err = runtime.getObservations("customprocessor")
+	observation, err = runtime.getObservations("customprocessor", "")
 	if err != nil {
 		t.Fatal(err)
 	}
