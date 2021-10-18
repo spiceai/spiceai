@@ -6,39 +6,45 @@ import Card from '../components/layout/Card';
 import { usePod } from '../models/pod';
 import { useFlights } from '../models/flight';
 import FlightChart from '../components/flights/FlightChart';
+import { useObservations } from '../models/observation';
+import DataGrid from '../components/datagrid/DataGrid';
 
 interface PodProps {
-  podName: string
+  podName: string;
 }
 
 const PodPage: React.FunctionComponent<PodProps> = () => {
-  const location = useLocation()
-  const podNamePathIndex = location.pathname.lastIndexOf('/') + 1
-  const podName = location.pathname.substring(podNamePathIndex)
+  const location = useLocation();
+  const podNamePathIndex = location.pathname.lastIndexOf('/') + 1;
+  const podName = location.pathname.substring(podNamePathIndex);
 
   const { data: pod, error: podError } = usePod(podName);
-  const { data: flights, error: flightsError } = useFlights(podName)
+  const { data: observations, error: observationsError } = useObservations(podName);
+  const { data: flights, error: flightsError } = useFlights(podName);
 
   return (
     <div className="flex flex-col flex-grow">
-      { !podError && pod &&
+      {!podError && pod && (
         <div className="mb-2">
           <PodHeader pod={pod}></PodHeader>
+          <h2 className="ml-2 mb-2 font-spice tracking-spice text-s uppercase">Observations</h2>
+          <div className="p-2">
+            <DataGrid pod={pod} />
+          </div>
           <h2 className="ml-2 mb-2 font-spice tracking-spice text-s uppercase">Training Runs</h2>
           <div className="p-2">
-            { !flightsError && flights.map((flight, i) => (
+            {!flightsError &&
+              flights.map((flight, i) => (
                 <div key={i}>
                   <Card>
                     <FlightChart flight={flight} />
                   </Card>
                 </div>
-            ))}
-            { (!flights || flights.length === 0) &&
-              <span>Pod has no training runs.</span>
-            }
+              ))}
+            {(!flights || flights.length === 0) && <span>Pod has no training runs.</span>}
           </div>
         </div>
-      }
+      )}
     </div>
   );
 };
