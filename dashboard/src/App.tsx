@@ -5,7 +5,7 @@ import ContentPanel from './components/layout/ContentPanel';
 import Footer from './components/layout/Footer';
 import Dashboard from './pages/Dashboard';
 import PodPage from './pages/PodPage';
-import AcknowledgementsPage from './pages/Acknowledgements'
+import AcknowledgementsPage from './pages/Acknowledgements';
 import './App.css';
 
 function App(): JSX.Element {
@@ -27,6 +27,7 @@ function App(): JSX.Element {
         <footer className="flex">
           <Footer />
         </footer>
+        <div id="portal" />
       </div>
     </BrowserRouter>
   );
