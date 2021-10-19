@@ -146,9 +146,17 @@ func (r *runtimeServer) getPods() (string, error) {
 	return string(body), nil
 }
 
-func (r *runtimeServer) getObservations(podName string) (string, error) {
+func (r *runtimeServer) getObservations(podName string, contentType string) (string, error) {
 	url := fmt.Sprintf("%s/api/v0.1/pods/%s/observations", r.baseUrl, podName)
-	resp, err := http.Get(url)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return "", err
+	}
+	if contentType != "" {
+		req.Header.Add("Accept", contentType)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return "", err
 	}
