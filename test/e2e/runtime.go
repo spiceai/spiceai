@@ -21,7 +21,6 @@ type runtimeServer struct {
 	shouldStartRuntime bool
 	runtimePath        string
 	workingDirectory   string
-	localRegistryPath  string
 	cli                *cli
 	context            string
 	cmd                *exec.Cmd
