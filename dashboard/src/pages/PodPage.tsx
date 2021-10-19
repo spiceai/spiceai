@@ -48,7 +48,7 @@ const PodPage: React.FunctionComponent<PodProps> = () => {
       const measurementsKeys = Object.keys(firstObservation.measurements);
       const categoriesKeys = Object.keys(firstObservation.categories);
       const colWidth =
-        (gridWidth - timeCol.width - 15) / (measurementsKeys.length + categoriesKeys.length + 1);
+        (gridWidth - timeCol.width - 17) / (measurementsKeys.length + categoriesKeys.length + 1);
 
       for (const m of measurementsKeys) {
         cols.push({ title: m, width: colWidth });
