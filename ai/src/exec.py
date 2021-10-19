@@ -2,9 +2,9 @@
 
 
 def somewhat_safe_exec(code: str, locals_dict: dict) -> dict:
-    exec(code, {"__builtins__": {}}, locals_dict)
+    exec(code, {"__builtins__": {}}, locals_dict)  # pylint: disable=exec-used
     return locals_dict
 
 
 def somewhat_safe_eval(code: str, locals_dict: dict) -> any:
-    return eval(code, {"__builtins__": {}}, locals_dict)
+    return eval(code, {"__builtins__": {}}, locals_dict)  # pylint: disable=eval-used

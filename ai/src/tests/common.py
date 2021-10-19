@@ -3,11 +3,11 @@ from proto.aiengine.v1 import aiengine_pb2
 
 
 def get_init_from_json(init_data_path: str, pod_name: str) -> aiengine_pb2.InitRequest:
-    with open(init_data_path, "r") as pod_init:
+    with open(init_data_path, "r", encoding="utf-8") as pod_init:
         pod_init_bytes = pod_init.read()
     pod_init_json = json.loads(pod_init_bytes)
 
-    pod_fields = dict()
+    pod_fields = {}
     for field in pod_init_json["fields"]:
         initializer = (
             float(0)

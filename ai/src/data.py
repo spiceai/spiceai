@@ -1,44 +1,43 @@
-import numpy as np
-import pandas as pd
-import pandas.core.computation.expressions as expressions
-from proto.common.v1 import common_pb2
-from proto.aiengine.v1 import aiengine_pb2
-from types import SimpleNamespace
 import math
 import threading
+from types import SimpleNamespace
+from typing import Dict, List
+
+import numpy as np
+import pandas as pd
+from pandas.core.computation import expressions
+
 from exception import RewardInvalidException
 from metrics import metrics
+from proto.common.v1 import common_pb2
+from proto.aiengine.v1 import aiengine_pb2
 from exec import somewhat_safe_exec
 
 
-class DataManager:
-    def init(
-        self,
-        epoch_time: pd.Timestamp,
-        period_secs: pd.Timedelta,
-        interval_secs: pd.Timedelta,
-        granularity_secs: pd.Timedelta,
-        fields: "dict[str]",
-        action_rewards: "dict[str]",
-        actions_order: "dict[int]",
-        laws: "list[str]",
-    ):
-        self.fields = fields
-        self.laws = laws
+class DataParam:
+    def __init__(self, epoch_time: pd.Timestamp, period_secs: pd.Timedelta, interval_secs: pd.Timedelta,
+                 granularity_secs: pd.Timedelta):
         self.interval_secs = interval_secs
         self.granularity_secs = granularity_secs
         self.epoch_time = epoch_time
         self.period_secs = period_secs
         self.end_time = epoch_time + self.period_secs
 
-        new_series = dict()
+
+class DataManager:
+    def __init__(self, param: DataParam, fields: Dict[str, aiengine_pb2.FieldData], action_rewards: Dict[str, str],
+                 actions_order: Dict[str, int], laws: List[str]):
+        self.fields = fields
+        self.laws = laws
+        self.param = param
+
+        new_series = {}
         for field_name in fields:
             new_series[field_name] = [fields[field_name].initializer]
 
-        self.massive_table_sparse = pd.DataFrame(new_series, index={self.epoch_time})
-        self.massive_table_sparse = self.massive_table_sparse.resample(
-            self.granularity_secs
-        ).mean()
+        self.massive_table_sparse = pd.DataFrame(new_series, index={self.param.epoch_time})
+        self.massive_table_sparse = self.massive_table_sparse.resample(self.param.granularity_secs).mean()
+        self.massive_table_filled = None
         self.fill_table()
 
         self.interpretations: common_pb2.IndexedInterpretations = None
@@ -53,7 +52,7 @@ class DataManager:
             self.action_names[actions_order[action]] = action
 
     def get_window_span(self):
-        return math.floor(self.interval_secs / self.granularity_secs)
+        return math.floor(self.param.interval_secs / self.param.granularity_secs)
 
     def overwrite_data(self, new_data):
         self.massive_table_sparse = new_data
@@ -62,9 +61,7 @@ class DataManager:
 
     def fill_table(self):
         metrics.start("resample")
-        self.massive_table_sparse = self.massive_table_sparse.resample(
-            self.granularity_secs
-        ).mean()
+        self.massive_table_sparse = self.massive_table_sparse.resample(self.param.granularity_secs).mean()
         metrics.end("resample")
 
         metrics.start("ffill")
@@ -114,10 +111,7 @@ class DataManager:
             if len(new_data) == 0:
                 return
 
-            elif (
-                len(new_data) == 1
-                and new_data.index[0] in self.massive_table_sparse.index
-            ):
+            if len(new_data) == 1 and new_data.index[0] in self.massive_table_sparse.index:
                 metrics.start("merge_row")
                 self.merge_row(new_data)
                 metrics.end("merge_row")
@@ -137,22 +131,20 @@ class DataManager:
     def get_interpretations_for_interval(self):
         if self.interpretations is not None:
             index = self.interpretations.index[int(self.current_time.timestamp())]
-            if (
-                index is not None
-                and index.indicies is not None
-                and len(index.indicies) > 0
-            ):
+            if index is not None and index.indicies is not None and len(index.indicies) > 0:
                 interval_interpretations = []
                 for i in index.indicies:
                     interval_interpretations.append(
                         self.interpretations.interpretations[i]
                     )
                 return interval_interpretations
+        return None
 
     def get_shape(self):
         return np.shape([0] * self.get_window_span() * len(self.fields))
 
-    def flatten_and_normalize_window(self, current_window):
+    @staticmethod
+    def flatten_and_normalize_window(current_window):
         result_array = []
         for col in current_window:
             denominator = np.linalg.norm(current_window[col])
@@ -166,18 +158,19 @@ class DataManager:
 
     def get_current_window(self):
         with self.table_lock:
-            # This will get the nearest previous index that matches the timestamp, so we don't need to specify the timestamps exactly
+            # This will get the nearest previous index that matches the timestamp,
+            # so we don't need to specify the timestamps exactly
             start_index = self.massive_table_filled.index.get_loc(
-                self.current_time - self.interval_secs, "ffill"
+                self.current_time - self.param.interval_secs, "ffill"
             )
             end_index = self.massive_table_filled.index.get_loc(
                 self.current_time, "ffill"
             )
 
-            if self.get_window_span() == 1:
-                return self.massive_table_filled.iloc[start_index : start_index + 1]
-            else:
-                return self.massive_table_filled.iloc[start_index:end_index]
+            return (
+                self.massive_table_filled.iloc[start_index:start_index + 1]
+                if self.get_window_span() == 1 else
+                self.massive_table_filled.iloc[start_index:end_index])
 
     def get_latest_window(self):
         start_index = None
@@ -190,23 +183,23 @@ class DataManager:
             end_index = start_index
         else:
             start_index = self.massive_table_filled.index.get_loc(
-                latest_time - self.interval_secs, "ffill"
+                latest_time - self.param.interval_secs, "ffill"
             )
             end_index = self.massive_table_filled.index.get_loc(latest_time, "ffill")
 
-        if self.get_window_span() == 1:
-            return self.massive_table_filled.iloc[start_index : start_index + 1]
-        else:
-            return self.massive_table_filled.iloc[start_index:end_index]
+        return (
+            self.massive_table_filled.iloc[start_index:start_index + 1]
+            if self.get_window_span() == 1 else
+            self.massive_table_filled.iloc[start_index:end_index])
 
     def rewind(self):
-        self.current_time = self.epoch_time + self.interval_secs
+        self.current_time = self.param.epoch_time + self.param.interval_secs
 
     def advance(self):
-        if self.current_time >= self.end_time:
+        if self.current_time >= self.param.end_time:
             return False
 
-        self.current_time += self.granularity_secs
+        self.current_time += self.param.granularity_secs
 
         return True
 
@@ -218,8 +211,8 @@ class DataManager:
         new_state_intepretations,
         action: int,
     ):
-        prev_state_dict = dict()
-        new_state_dict = dict()
+        prev_state_dict = {}
+        new_state_dict = {}
 
         for key in prev_state_pd:
             prev_state_dict[key] = list(prev_state_pd[key])[-1]
@@ -231,7 +224,7 @@ class DataManager:
         prev_state = SimpleNamespace(**prev_state_dict)
         new_state = SimpleNamespace(**new_state_dict)
 
-        loc = dict()
+        loc = {}
         loc["prev_state"] = prev_state
         loc["new_state"] = new_state
         loc["print"] = print
@@ -242,6 +235,6 @@ class DataManager:
         try:
             loc = somewhat_safe_exec(reward_func, loc)
         except Exception as ex:
-            raise RewardInvalidException(repr(ex))
+            raise RewardInvalidException(repr(ex)) from ex
 
         return loc["reward"]

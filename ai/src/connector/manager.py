@@ -1,7 +1,9 @@
-from connector.stateful import StatefulConnector
-import pandas as pd
 from enum import Enum
-from typing import Union
+from typing import List, Union
+
+import pandas as pd
+
+from connector.stateful import StatefulConnector
 
 
 class ConnectorName(Enum):
@@ -13,7 +15,7 @@ ConnectorSpec = Union[StatefulConnector]
 
 class ConnectorManager:
     def __init__(self):
-        self.connectors: "list[ConnectorSpec]" = []
+        self.connectors: List[ConnectorSpec] = []
 
     def add_connector(self, connector: ConnectorSpec):
         self.connectors.append(connector)

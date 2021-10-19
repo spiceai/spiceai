@@ -8,8 +8,8 @@ import unittest
 import pandas as pd
 
 from cleanup import cleanup_on_shutdown
-from proto.aiengine.v1 import aiengine_pb2
 import main
+from proto.aiengine.v1 import aiengine_pb2
 from tests import common
 import train
 
@@ -32,10 +32,10 @@ class TrainingLoopTests(unittest.TestCase):
             pod_name="trader",
         )
 
-        with open("../../test/assets/data/csv/trader.csv", "r") as trader_data:
+        with open("../../test/assets/data/csv/trader.csv", "r", encoding="utf8") as trader_data:
             self.trader_data_csv = trader_data.read()
 
-        self.episode_results = list()
+        self.episode_results = []
         self.original_post_episode_result = train.post_episode_result
         train.post_episode_result = (
             lambda request_url, episode_data: self.episode_results.append(
@@ -66,21 +66,14 @@ class TrainingLoopTests(unittest.TestCase):
         self.assertFalse(resp.error)
 
     def start_training(
-        self,
-        pod_name: str,
-        flight: str = None,
-        number_episodes: int = None,
-        epoch_time: int = None,
-        expected_error: bool = False,
-        expected_result: str = "started_training",
-    ):
+            self, pod_name: str, flight: str = None, number_episodes: int = None, epoch_time: int = None,
+            expected_error: bool = False, expected_result: str = "started_training"):
         train_req = aiengine_pb2.StartTrainingRequest(
             pod=pod_name,
             number_episodes=number_episodes,
             flight=flight,
             epoch_time=epoch_time,
-            learning_algorithm=self.ALGORITHM,
-        )
+            learning_algorithm=self.ALGORITHM)
 
         resp = self.aiengine.StartTraining(train_req, None)
 
@@ -88,8 +81,8 @@ class TrainingLoopTests(unittest.TestCase):
         self.assertEqual(resp.result, expected_result)
 
     def wait_for_training(self):
-        self.assertIsNotNone(main.training_thread)
-        main.training_thread.join()
+        self.assertIsNotNone(main.Dispatch.TRAINING_THREAD)
+        main.Dispatch.TRAINING_THREAD.join()
 
     def inference(self, pod_name: str, tag: str, assertion_on_response=None):
         resp = self.aiengine.GetInference(
@@ -117,10 +110,10 @@ class TrainingLoopTests(unittest.TestCase):
             self.assertTrue(episode_data["end"])
             self.assertTrue(episode_data["score"])
 
-            actionsCount = 0
+            actions_count = 0
             for action_name in episode_data["actions_taken"]:
-                actionsCount += episode_data["actions_taken"][action_name]
-            self.assertEqual(actionsCount, num_actions)
+                actions_count += episode_data["actions_taken"][action_name]
+            self.assertEqual(actions_count, num_actions)
             index += 1
 
     def test_train_inference_loop(self):
@@ -130,10 +123,10 @@ class TrainingLoopTests(unittest.TestCase):
         # Step 2, load the csv data
         self.add_data("trader", self.trader_data_csv)
 
-        FLIGHT = "1"
-        NUMBER_EPISODES = 10
+        flight = "1"
+        number_episodes = 10
         # Step 3, train
-        self.start_training("trader", FLIGHT, NUMBER_EPISODES)
+        self.start_training("trader", flight, number_episodes)
 
         self.wait_for_training()
 
@@ -147,8 +140,8 @@ class TrainingLoopTests(unittest.TestCase):
         # Validate the episode data
         self.validate_episode_data(
             "trader",
-            FLIGHT,
-            NUMBER_EPISODES,
+            flight,
+            number_episodes,
             num_actions=50,
             episode_results=self.episode_results,
         )
@@ -160,10 +153,10 @@ class TrainingLoopTests(unittest.TestCase):
         # Step 2, load the csv data
         self.add_data("trader", self.trader_data_csv)
 
-        FLIGHT = "1"
-        NUMBER_EPISODES = 10
+        flight = "1"
+        number_episodes = 10
         # Step 3, train
-        self.start_training("trader", FLIGHT, NUMBER_EPISODES, 1626697490)
+        self.start_training("trader", flight, number_episodes, 1626697490)
 
         self.wait_for_training()
 
@@ -177,32 +170,32 @@ class TrainingLoopTests(unittest.TestCase):
         # Validate the episode data
         self.validate_episode_data(
             "trader",
-            FLIGHT,
-            NUMBER_EPISODES,
+            flight,
+            number_episodes,
             num_actions=49,
             episode_results=self.episode_results,
         )
 
     def test_train_gap_in_data(self):
-        with open("./tests/assets/csv/training_loop_gap_0.csv", "r") as data:
+        with open("./tests/assets/csv/training_loop_gap_0.csv", "r", encoding="utf8") as data:
             gap_data_0 = data.read()
-        with open("./tests/assets/csv/training_loop_gap_1.csv", "r") as data:
+        with open("./tests/assets/csv/training_loop_gap_1.csv", "r", encoding="utf-8") as data:
             gap_data_1 = data.read()
 
         self.init(self.trader_init_req)
         self.add_data("trader", gap_data_0)
         self.add_data("trader", gap_data_1)
 
-        FLIGHT = "1"
-        NUMBER_EPISODES = 10
-        self.start_training("trader", FLIGHT, NUMBER_EPISODES)
+        flight = "1"
+        number_episodes = 10
+        self.start_training("trader", flight, number_episodes)
 
         self.wait_for_training()
 
         self.validate_episode_data(
             "trader",
-            FLIGHT,
-            NUMBER_EPISODES,
+            flight,
+            number_episodes,
             num_actions=50,
             episode_results=self.episode_results,
         )
@@ -223,32 +216,32 @@ class TrainingLoopTests(unittest.TestCase):
             current_time += pd.to_timedelta(self.trader_init_req.granularity, unit="s")
 
     def test_data_added_after_training_starts(self):
-        with open("./tests/assets/csv/training_loop_gap_0.csv", "r") as data:
+        with open("./tests/assets/csv/training_loop_gap_0.csv", "r", encoding="utf-8") as data:
             gap_data_0 = data.read()
-        with open("./tests/assets/csv/training_loop_gap_1.csv", "r") as data:
+        with open("./tests/assets/csv/training_loop_gap_1.csv", "r", encoding="utf-8") as data:
             gap_data_1 = data.read()
 
         self.init(self.trader_init_req)
         self.add_data("trader", gap_data_0)
 
-        FLIGHT = "1"
-        NUMBER_EPISODES = 10
-        self.start_training("trader", FLIGHT, NUMBER_EPISODES)
+        flight = "1"
+        number_episodes = 10
+        self.start_training("trader", flight, number_episodes)
 
         post_data_lock = threading.Lock()
         episode_5_lock = threading.Lock()
-        episode_5_lock.acquire()
+        episode_5_lock.acquire()  # pylint: disable=consider-using-with
 
         def release_lock_on_episode_5(episode: int):
             if episode == 5 and episode_5_lock.locked():
                 episode_5_lock.release()
-                post_data_lock.acquire()
+                post_data_lock.acquire()  # pylint: disable=consider-using-with
 
         train.end_of_episode = release_lock_on_episode_5
 
         # wait for episode 5
-        post_data_lock.acquire()
-        episode_5_lock.acquire()
+        post_data_lock.acquire()  # pylint: disable=consider-using-with
+        episode_5_lock.acquire()  # pylint: disable=consider-using-with
 
         print("Posting gap_data_1")
         self.add_data("trader", gap_data_1)
@@ -260,14 +253,14 @@ class TrainingLoopTests(unittest.TestCase):
 
         self.validate_episode_data(
             "trader",
-            FLIGHT,
+            flight,
             5,
             num_actions=10,
             episode_results=self.episode_results[0:5],
         )
         self.validate_episode_data(
             "trader",
-            FLIGHT,
+            flight,
             5,
             num_actions=50,
             episode_results=self.episode_results[5:],
@@ -276,61 +269,30 @@ class TrainingLoopTests(unittest.TestCase):
     def test_epoch_earlier_than_data(self):
         self.init(self.trader_init_req)
         self.add_data("trader", self.trader_data_csv)
-        self.start_training(
-            "trader",
-            "1",
-            10,
-            1626697400,
-            expected_error=True,
-            expected_result="epoch_time_invalid",
-        )
+        self.start_training("trader", "1", 10, 1626697400, expected_error=True, expected_result="epoch_time_invalid")
 
     def test_epoch_offset_from_data(self):
         self.init(self.trader_init_req)
         self.add_data("trader", self.trader_data_csv)
-        self.start_training(
-            "trader",
-            "1",
-            1,
-            1626697485,
-            expected_error=False,
-            expected_result="started_training",
-        )
+        self.start_training("trader", "1", 1, 1626697485, expected_error=False, expected_result="started_training")
         self.wait_for_training()
 
     def test_epoch_after_latest_data(self):
         self.init(self.trader_init_req)
         self.add_data("trader", self.trader_data_csv)
         self.start_training(
-            "trader",
-            "1",
-            10,
-            1626699240,
-            expected_error=True,
-            expected_result="not_enough_data_for_training",
-        )
+            "trader", "1", 10, 1626699240, expected_error=True, expected_result="not_enough_data_for_training")
 
     def test_not_enough_data_for_training_no_data(self):
         self.init(self.trader_init_req)
-        self.start_training(
-            "trader",
-            "1",
-            10,
-            expected_error=True,
-            expected_result="not_enough_data_for_training",
-        )
+        self.start_training("trader", "1", 10, expected_error=True, expected_result="not_enough_data_for_training")
 
     def test_not_enough_data_for_training_late_epoch(self):
         self.init(self.trader_init_req)
         self.add_data("trader", self.trader_data_csv)
         self.start_training(
-            "trader",
-            "1",
-            10,
-            epoch_time=1626698020,
-            expected_error=True,
-            expected_result="not_enough_data_for_training",
-        )
+            "trader", "1", 10, epoch_time=1626698020,
+            expected_error=True, expected_result="not_enough_data_for_training")
 
     def test_invalid_reward_handled_gracefully(self):
         trader_init = copy.deepcopy(self.trader_init_req)
@@ -370,9 +332,9 @@ class TrainingLoopTests(unittest.TestCase):
 
         self.add_data("trader", self.trader_data_csv)
 
-        FLIGHT = "1"
-        NUMBER_EPISODES = 10
-        self.start_training("trader", FLIGHT, NUMBER_EPISODES, 1626697490)
+        flight = "1"
+        number_episodes = 10
+        self.start_training("trader", flight, number_episodes, 1626697490)
 
         self.wait_for_training()
 
@@ -393,9 +355,9 @@ class TrainingLoopTests(unittest.TestCase):
 
         self.add_data("trader", self.trader_data_csv)
 
-        FLIGHT = "1"
-        NUMBER_EPISODES = 10
-        self.start_training("trader", FLIGHT, NUMBER_EPISODES, 1626697490)
+        flight = "1"
+        number_episodes = 10
+        self.start_training("trader", flight, number_episodes, 1626697490)
 
         self.wait_for_training()
 
@@ -414,9 +376,9 @@ class TrainingLoopTests(unittest.TestCase):
 
         self.add_data("trader", self.trader_data_csv)
 
-        FLIGHT = "1"
-        NUMBER_EPISODES = 10
-        self.start_training("trader", FLIGHT, NUMBER_EPISODES, 1626697490)
+        flight = "1"
+        number_episodes = 10
+        self.start_training("trader", flight, number_episodes, 1626697490)
 
         self.wait_for_training()
 
@@ -438,9 +400,9 @@ class TrainingLoopTests(unittest.TestCase):
 
         self.add_data("trader", self.trader_data_csv)
 
-        FLIGHT = "1"
-        NUMBER_EPISODES = 10
-        self.start_training("trader", FLIGHT, NUMBER_EPISODES, 1626697490)
+        flight = "1"
+        number_episodes = 10
+        self.start_training("trader", flight, number_episodes, 1626697490)
 
         self.wait_for_training()
 
@@ -478,14 +440,9 @@ class TrainingLoopTests(unittest.TestCase):
 
         self.add_data("trader", csv_data.getvalue())
 
-        FLIGHT = "1"
-        NUMBER_EPISODES = 10
-        self.start_training(
-            "trader",
-            FLIGHT,
-            NUMBER_EPISODES,
-            expected_error=False,
-        )
+        flight = "1"
+        number_episodes = 10
+        self.start_training("trader", flight, number_episodes, expected_error=False)
 
         # Counts will be unstable due to timing.  The important thing is that we launch training with enough data.
         self.wait_for_training()
