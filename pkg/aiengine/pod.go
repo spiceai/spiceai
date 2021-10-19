@@ -150,7 +150,7 @@ func ImportPod(pod *pods.Pod, request *runtime_pb.ImportModel) error {
 	})
 
 	errGroup.Go(func() error {
-		return importModel(pod, request.Tag)
+		return importModel(pod, request.Tag, request.Algorithm)
 	})
 
 	return errGroup.Wait()

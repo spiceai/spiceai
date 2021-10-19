@@ -19,7 +19,7 @@ DESCRIPTOR = _descriptor.FileDescriptor(
   syntax='proto3',
   serialized_options=b'Z/github.com/spiceai/spiceai/pkg/proto/runtime_pb',
   create_key=_descriptor._internal_create_key,
-  serialized_pb=b'\n\x1eproto/runtime/v1/runtime.proto\x12\x07runtime\"2\n\x0b\x45xportModel\x12\x11\n\tdirectory\x18\x01 \x01(\t\x12\x10\n\x08\x66ilename\x18\x02 \x01(\t\"=\n\x0bImportModel\x12\x0b\n\x03pod\x18\x01 \x01(\t\x12\x0b\n\x03tag\x18\x02 \x01(\t\x12\x14\n\x0c\x61rchive_path\x18\x03 \x01(\t\"\xdb\x01\n\x07\x45pisode\x12\x0f\n\x07\x65pisode\x18\x01 \x01(\x04\x12\r\n\x05start\x18\x02 \x01(\x03\x12\x0b\n\x03\x65nd\x18\x03 \x01(\x03\x12\r\n\x05score\x18\x04 \x01(\x01\x12\x39\n\ractions_taken\x18\x05 \x03(\x0b\x32\".runtime.Episode.ActionsTakenEntry\x12\r\n\x05\x65rror\x18\x06 \x01(\t\x12\x15\n\rerror_message\x18\x07 \x01(\t\x1a\x33\n\x11\x41\x63tionsTakenEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\x04:\x02\x38\x01\"H\n\x06\x46light\x12\r\n\x05start\x18\x01 \x01(\x03\x12\x0b\n\x03\x65nd\x18\x02 \x01(\x03\x12\"\n\x08\x65pisodes\x18\x03 \x03(\x0b\x32\x10.runtime.Episode\"*\n\x03Pod\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\x15\n\rmanifest_path\x18\x02 \x01(\tB1Z/github.com/spiceai/spiceai/pkg/proto/runtime_pbb\x06proto3'
+  serialized_pb=b'\n\x1eproto/runtime/v1/runtime.proto\x12\x07runtime\"2\n\x0b\x45xportModel\x12\x11\n\tdirectory\x18\x01 \x01(\t\x12\x10\n\x08\x66ilename\x18\x02 \x01(\t\"P\n\x0bImportModel\x12\x0b\n\x03pod\x18\x01 \x01(\t\x12\x0b\n\x03tag\x18\x02 \x01(\t\x12\x14\n\x0c\x61rchive_path\x18\x03 \x01(\t\x12\x11\n\talgorithm\x18\x04 \x01(\t\"\xdb\x01\n\x07\x45pisode\x12\x0f\n\x07\x65pisode\x18\x01 \x01(\x04\x12\r\n\x05start\x18\x02 \x01(\x03\x12\x0b\n\x03\x65nd\x18\x03 \x01(\x03\x12\r\n\x05score\x18\x04 \x01(\x01\x12\x39\n\ractions_taken\x18\x05 \x03(\x0b\x32\".runtime.Episode.ActionsTakenEntry\x12\r\n\x05\x65rror\x18\x06 \x01(\t\x12\x15\n\rerror_message\x18\x07 \x01(\t\x1a\x33\n\x11\x41\x63tionsTakenEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\x04:\x02\x38\x01\"H\n\x06\x46light\x12\r\n\x05start\x18\x01 \x01(\x03\x12\x0b\n\x03\x65nd\x18\x02 \x01(\x03\x12\"\n\x08\x65pisodes\x18\x03 \x03(\x0b\x32\x10.runtime.Episode\"*\n\x03Pod\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\x15\n\rmanifest_path\x18\x02 \x01(\t\"\x1f\n\nTrainModel\x12\x11\n\talgorithm\x18\x01 \x01(\tB1Z/github.com/spiceai/spiceai/pkg/proto/runtime_pbb\x06proto3'
 )
 
 
@@ -93,6 +93,13 @@ _IMPORTMODEL = _descriptor.Descriptor(
       message_type=None, enum_type=None, containing_type=None,
       is_extension=False, extension_scope=None,
       serialized_options=None, file=DESCRIPTOR,  create_key=_descriptor._internal_create_key),
+    _descriptor.FieldDescriptor(
+      name='algorithm', full_name='runtime.ImportModel.algorithm', index=3,
+      number=4, type=9, cpp_type=9, label=1,
+      has_default_value=False, default_value=b"".decode('utf-8'),
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      serialized_options=None, file=DESCRIPTOR,  create_key=_descriptor._internal_create_key),
   ],
   extensions=[
   ],
@@ -106,7 +113,7 @@ _IMPORTMODEL = _descriptor.Descriptor(
   oneofs=[
   ],
   serialized_start=95,
-  serialized_end=156,
+  serialized_end=175,
 )
 
 
@@ -144,8 +151,8 @@ _EPISODE_ACTIONSTAKENENTRY = _descriptor.Descriptor(
   extension_ranges=[],
   oneofs=[
   ],
-  serialized_start=327,
-  serialized_end=378,
+  serialized_start=346,
+  serialized_end=397,
 )
 
 _EPISODE = _descriptor.Descriptor(
@@ -217,8 +224,8 @@ _EPISODE = _descriptor.Descriptor(
   extension_ranges=[],
   oneofs=[
   ],
-  serialized_start=159,
-  serialized_end=378,
+  serialized_start=178,
+  serialized_end=397,
 )
 
 
@@ -263,8 +270,8 @@ _FLIGHT = _descriptor.Descriptor(
   extension_ranges=[],
   oneofs=[
   ],
-  serialized_start=380,
-  serialized_end=452,
+  serialized_start=399,
+  serialized_end=471,
 )
 
 
@@ -302,8 +309,40 @@ _POD = _descriptor.Descriptor(
   extension_ranges=[],
   oneofs=[
   ],
-  serialized_start=454,
-  serialized_end=496,
+  serialized_start=473,
+  serialized_end=515,
+)
+
+
+_TRAINMODEL = _descriptor.Descriptor(
+  name='TrainModel',
+  full_name='runtime.TrainModel',
+  filename=None,
+  file=DESCRIPTOR,
+  containing_type=None,
+  create_key=_descriptor._internal_create_key,
+  fields=[
+    _descriptor.FieldDescriptor(
+      name='algorithm', full_name='runtime.TrainModel.algorithm', index=0,
+      number=1, type=9, cpp_type=9, label=1,
+      has_default_value=False, default_value=b"".decode('utf-8'),
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      serialized_options=None, file=DESCRIPTOR,  create_key=_descriptor._internal_create_key),
+  ],
+  extensions=[
+  ],
+  nested_types=[],
+  enum_types=[
+  ],
+  serialized_options=None,
+  is_extendable=False,
+  syntax='proto3',
+  extension_ranges=[],
+  oneofs=[
+  ],
+  serialized_start=517,
+  serialized_end=548,
 )
 
 _EPISODE_ACTIONSTAKENENTRY.containing_type = _EPISODE
@@ -314,6 +353,7 @@ DESCRIPTOR.message_types_by_name['ImportModel'] = _IMPORTMODEL
 DESCRIPTOR.message_types_by_name['Episode'] = _EPISODE
 DESCRIPTOR.message_types_by_name['Flight'] = _FLIGHT
 DESCRIPTOR.message_types_by_name['Pod'] = _POD
+DESCRIPTOR.message_types_by_name['TrainModel'] = _TRAINMODEL
 _sym_db.RegisterFileDescriptor(DESCRIPTOR)
 
 ExportModel = _reflection.GeneratedProtocolMessageType('ExportModel', (_message.Message,), {
@@ -358,6 +398,13 @@ Pod = _reflection.GeneratedProtocolMessageType('Pod', (_message.Message,), {
   # @@protoc_insertion_point(class_scope:runtime.Pod)
   })
 _sym_db.RegisterMessage(Pod)
+
+TrainModel = _reflection.GeneratedProtocolMessageType('TrainModel', (_message.Message,), {
+  'DESCRIPTOR' : _TRAINMODEL,
+  '__module__' : 'proto.runtime.v1.runtime_pb2'
+  # @@protoc_insertion_point(class_scope:runtime.TrainModel)
+  })
+_sym_db.RegisterMessage(TrainModel)
 
 
 DESCRIPTOR._options = None

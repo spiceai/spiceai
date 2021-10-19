@@ -29,6 +29,7 @@ func StartTraining(pod *pods.Pod) error {
 		Flight:         flightId,
 		NumberEpisodes: int64(flight.ExpectedEpisodes()),
 		TrainingGoal:   pod.PodSpec.Training.Goal,
+		Algorithm:      pod.Algorithm(),
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)

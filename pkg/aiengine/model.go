@@ -10,7 +10,7 @@ import (
 	"github.com/spiceai/spiceai/pkg/proto/aiengine_pb"
 )
 
-func importModel(pod *pods.Pod, tag string) error {
+func importModel(pod *pods.Pod, tag string, algorithm string) error {
 	modelName := fmt.Sprintf("%s.model", pod.Name)
 	podDir := filepath.Dir(pod.ManifestPath())
 	modelPath := filepath.Join(podDir, modelName)
@@ -19,6 +19,7 @@ func importModel(pod *pods.Pod, tag string) error {
 		Pod:        pod.Name,
 		Tag:        tag,
 		ImportPath: modelPath,
+		Algorithm: algorithm,
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)

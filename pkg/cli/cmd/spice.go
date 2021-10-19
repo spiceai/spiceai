@@ -12,6 +12,7 @@ import (
 
 var (
 	contextFlag string
+	algorithmFlag string
 )
 
 var RootCmd = &cobra.Command{

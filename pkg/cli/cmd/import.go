@@ -12,6 +12,7 @@ import (
 )
 
 var importTag string
+var algorithmTag string
 
 var ImportCmd = &cobra.Command{
 	Use:   "import",
@@ -64,7 +65,7 @@ spice import --tag latest ./models/trader.spicepod
 			return
 		}
 
-		err = runtimeClient.ImportModel(init.Pod, relativePath, importTag)
+		err = runtimeClient.ImportModel(init.Pod, relativePath, importTag, algorithmTag)
 		if err != nil {
 			fmt.Println(err.Error())
 			return
@@ -76,5 +77,6 @@ spice import --tag latest ./models/trader.spicepod
 
 func init() {
 	ImportCmd.Flags().StringVar(&importTag, "tag", "latest", "Specify which tag to import the model to")
+	ImportCmd.Flags().StringVar(&algorithmTag, "algorithm", "dql", "Specify algorithm of the pod")
 	RootCmd.AddCommand(ImportCmd)
 }

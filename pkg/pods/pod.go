@@ -554,3 +554,11 @@ func (pod *Pod) loadParams() error {
 
 	return nil
 }
+
+func (pod *Pod) Algorithm() string {
+	return pod.podParams.Algorithm
+}
+
+func (pod *Pod) SetAlgorithm(algorithm string) {
+	pod.podParams.Algorithm = algorithm
+}

@@ -13,6 +13,7 @@ message ImportModel {
   string pod = 1;
   string tag = 2;
   string archive_path = 3;
+  string algorithm = 4;
 }
 
 message Episode {
@@ -34,4 +35,8 @@ message Flight {
 message Pod {
   string name = 1;
   string manifest_path = 2;
+}
+
+message TrainModel {
+  string algorithm = 1;
 }
