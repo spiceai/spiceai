@@ -13,7 +13,7 @@ message ImportModel {
   string pod = 1;
   string tag = 2;
   string archive_path = 3;
-  string algorithm = 4;
+  string learning_algorithm = 4;
 }
 
 message Episode {
@@ -38,5 +38,5 @@ message Pod {
 }
 
 message TrainModel {
-  string algorithm = 1;
+  string learning_algorithm = 1;
 }

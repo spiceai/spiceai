@@ -67,7 +67,7 @@ message StartTrainingRequest {
   string flight = 3;
   string training_goal = 4;
   int64 epoch_time = 5;
-  string algorithm = 6;
+  string learning_algorithm = 6;
 }
 
 message InferenceRequest {
@@ -105,5 +105,5 @@ message ImportModelRequest {
   string pod = 1;
   string tag = 2;
   string import_path = 3;
-  string algorithm = 4;
+  string learning_algorithm = 4;
 }

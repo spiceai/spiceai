@@ -77,6 +77,6 @@ spice import --tag latest ./models/trader.spicepod
 
 func init() {
 	ImportCmd.Flags().StringVar(&importTag, "tag", "latest", "Specify which tag to import the model to")
-	ImportCmd.Flags().StringVar(&algorithmTag, "algorithm", "dql", "Specify algorithm of the pod")
+	ImportCmd.Flags().StringVar(&algorithmTag, "learning-algorithm", "dql", "Specify the learning algorithm of the pod")
 	RootCmd.AddCommand(ImportCmd)
 }

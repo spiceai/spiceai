@@ -192,8 +192,8 @@ func apiPodTrainHandler(ctx *fasthttp.RequestCtx) {
 		ctx.Response.SetBodyString(err.Error())
 		return
 	}
-	if trainRequest.Algorithm != "" {
-		overloaded_pod.SetAlgorithm(trainRequest.Algorithm)
+	if trainRequest.LearningAlgorithm != "" {
+		overloaded_pod.SetLearningAlgorithm(trainRequest.LearningAlgorithm)
 	}
 
 	err = aiengine.StartTraining(overloaded_pod)

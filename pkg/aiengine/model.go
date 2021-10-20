@@ -19,7 +19,7 @@ func importModel(pod *pods.Pod, tag string, algorithm string) error {
 		Pod:        pod.Name,
 		Tag:        tag,
 		ImportPath: modelPath,
-		Algorithm: algorithm,
+		LearningAlgorithm: algorithm,
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)

@@ -102,7 +102,7 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
             data_manager.epoch_time = new_epoch_time
             data_manager.end_time = data_manager.epoch_time + data_manager.period_secs
 
-        algorithm = request.algorithm
+        algorithm = request.learning_algorithm
         number_episodes = (
             request.number_episodes if request.number_episodes != 0 else 30
         )
@@ -311,7 +311,7 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
         data_manager = data_managers[request.pod]
         model_data_shape = data_manager.get_shape()
         agent: SpiceAIAgent = get_agent(
-            request.algorithm, model_data_shape, len(data_manager.action_names)
+            request.learning_algorithm, model_data_shape, len(data_manager.action_names)
         )
         if not agent.load(Path(request.import_path)):
             return aiengine_pb2.Response(

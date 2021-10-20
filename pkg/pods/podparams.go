@@ -7,7 +7,7 @@ type PodParams struct {
 	Period      time.Duration
 	Interval    time.Duration
 	Granularity time.Duration
-	Algorithm   string
+	LearningAlgorithm   string
 }
 
 func NewPodParams() *PodParams {
@@ -15,6 +15,6 @@ func NewPodParams() *PodParams {
 		Period:      time.Hour * 24 * 3,
 		Interval:    time.Minute * 1,
 		Granularity: time.Second * 10,
-		Algorithm: "dql",
+		LearningAlgorithm: "dql",
 	}
 }

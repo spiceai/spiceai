@@ -78,7 +78,7 @@ func (r *RuntimeClient) ImportModel(podName string, archivePath string, tag stri
 		ArchivePath: archivePath,
 		Tag:         tag,
 		Pod:         podName,
-		Algorithm: algorithm,
+		LearningAlgorithm: algorithm,
 	}
 
 	importRequestBytes, err := json.Marshal(&importRequest)

@@ -79,7 +79,7 @@ class TrainingLoopTests(unittest.TestCase):
             number_episodes=number_episodes,
             flight=flight,
             epoch_time=epoch_time,
-            algorithm=self.ALGORITHM,
+            learning_algorithm=self.ALGORITHM,
         )
 
         resp = self.aiengine.StartTraining(train_req, None)
