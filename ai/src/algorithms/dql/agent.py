@@ -111,7 +111,7 @@ class DeepQLearningAgent(SpiceAIAgent):
         model_path = path / "model.pb"
         with open(path / "meta.json", "w", encoding="utf-8") as meta_file:
             meta_file.write(
-                json.dumps({"algorithm": "vpg", "model_path": str(model_path)})
+                json.dumps({"algorithm": "dql", "model_path": str(model_path)})
             )
         self.model.model.save(model_path)
 

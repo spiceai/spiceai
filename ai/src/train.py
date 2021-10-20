@@ -1,5 +1,6 @@
 import math
 import os
+from pathlib import Path
 import tempfile
 import threading
 import time
@@ -179,11 +180,12 @@ def train_agent(
                 pod_name, f"Max training episodes ({TRAINING_EPISODES}) reached!"
             )
 
-        tmpdir = tempfile.mkdtemp()
+        tmpdir = tempfile.mkdtemp(prefix="spiceai_")
+        save_path = Path(tmpdir, f"{pod_name}_train")
+        save_path.mkdir(parents=True)
         directories_to_delete.append(tmpdir)
-        model_path = os.path.join(tmpdir, f"{pod_name}.model")
-        agent.save(model_path)
-        saved_models[pod_name] = model_path
+        agent.save(save_path)
+        saved_models[pod_name] = save_path
 
 
 def end_of_episode(_episode: int):

@@ -172,7 +172,7 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
                 algorithm, model_data_shape, len(data_manager.action_names)
             )
             if model_exists:
-                agent.load(Path(save_info["model_path"]))
+                agent.load(Path(save_path))
 
             data_manager: DataManager = data_managers[request.pod]
 
