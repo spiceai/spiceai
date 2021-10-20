@@ -130,8 +130,6 @@ def actionDelete(args):
         print(f"Unable to find a release with tag: {args.tag}")
         return
 
-    print(releaseInfo["assets"])
-
     # Step 2: For each artifact, see if it already exists as an asset on the release
     for artifact in args.artifact:
         filename = os.path.basename(artifact)

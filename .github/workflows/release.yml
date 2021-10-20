@@ -139,7 +139,7 @@ jobs:
   publish:
     name: Publish ${{ matrix.target_os }}-${{ matrix.target_arch }} binaries
     needs: build
-    if: github.event_name != 'pull_request'
+    if: startswith(github.ref, 'refs/tags/v') && github.event_name != 'pull_request'
     env:
       ARTIFACT_DIR: ./release
 
