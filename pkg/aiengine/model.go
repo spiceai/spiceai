@@ -16,9 +16,9 @@ func importModel(pod *pods.Pod, tag string) error {
 	modelPath := filepath.Join(podDir, modelName)
 
 	importRequest := &aiengine_pb.ImportModelRequest{
-		Pod:               pod.Name,
-		Tag:               tag,
-		ImportPath:        modelPath,
+		Pod:        pod.Name,
+		Tag:        tag,
+		ImportPath: modelPath,
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)

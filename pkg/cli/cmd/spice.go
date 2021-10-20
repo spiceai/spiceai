@@ -11,7 +11,7 @@ import (
 )
 
 var (
-	contextFlag string
+	contextFlag   string
 	algorithmFlag string
 )
 
