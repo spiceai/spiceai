@@ -161,7 +161,7 @@ jobs:
       - name: Check out code into the Go module directory
         uses: actions/checkout@v2
 
-      - name: Set REL_VERSION from version.txt
+      - name: Set REL_VERSION from tag
         run: python ./.github/scripts/get_release_version.py
 
       - name: download artifacts - spice_${{ matrix.target_os }}_${{ matrix.target_arch }}
@@ -203,4 +203,5 @@ jobs:
             --tag "v${{ env.REL_VERSION }}" \
             --release-name "Spice.ai v${{ env.REL_VERSION }}" \
             --body "${RELEASE_BODY}" \
+            --prerelease "$LATEST_RELEASE" \
             ${RELEASE_ARTIFACT[*]}

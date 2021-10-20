@@ -17,7 +17,7 @@ parser.add_argument('--repo')
 parser.add_argument('--tag')
 parser.add_argument('--release-name')
 parser.add_argument('--body')
-parser.add_argument('--prerelease', action='store_true')
+parser.add_argument('--prerelease')
 parser.add_argument('action')
 parser.add_argument('artifact', nargs='+')
 
@@ -95,16 +95,18 @@ def updateRelease(id, owner, repo, release_name, body, prerelease):
 def actionUpload(args):
     # Step 1: Get the release
     releaseInfo = getReleaseByTag(args.owner, args.repo, args.tag)
+
+    is_prerelease = args.prerelease == "true"
     
     # Step 2: Create the release if it doesn't exist
     if releaseInfo == None:
         print("Creating release")
-        releaseInfo = createRelease(args.owner, args.repo, args.tag, args.release_name, args.body, args.prerelease)
+        releaseInfo = createRelease(args.owner, args.repo, args.tag, args.release_name, args.body, is_prerelease)
         print("Release created!")
     else:
         # Step 2.5: Update the release with the latest info
         print("Updating release")
-        updateRelease(releaseInfo["id"], args.owner, args.repo, args.release_name, args.body, args.prerelease)
+        updateRelease(releaseInfo["id"], args.owner, args.repo, args.release_name, args.body, is_prerelease)
         print("Release updated!")
 
     # Step 3: Upload the release asset for each artifact
