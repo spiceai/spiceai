@@ -278,5 +278,4 @@ jobs:
       - name: "Execute e2e tests (algorithm: ${{ matrix.algorithm }})"
         working-directory: test/e2e
         run: |
-          export SPICE_DEEPRL_ALGORITHM="${{ matrix.algorithm }}"
-          go test -v . -e2e -shuffle=on -context '${{ matrix.context }}'
+          go test -v . -e2e -shuffle=on -context '${{ matrix.context }}' -learning-algorithm '${{ matrix.algorithm }}'

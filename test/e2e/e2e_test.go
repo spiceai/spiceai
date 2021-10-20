@@ -26,6 +26,7 @@ var (
 	shouldRunTest      bool
 	shouldStartRuntime bool
 	spicedContext      string
+	learningAlgorithm  string
 	testDir            string
 	repoRoot           string
 	workingDirectory   string
@@ -40,6 +41,7 @@ func TestMain(m *testing.M) {
 	flag.BoolVar(&shouldRunTest, "e2e", false, "run e2e tests")
 	flag.BoolVar(&shouldStartRuntime, "startruntime", true, "start runtime")
 	flag.StringVar(&spicedContext, "context", "docker", "specify --context <context> to spice CLI for spiced")
+	flag.StringVar(&learningAlgorithm, "learning-algorithm", "dql", "specify --learning-alogrithm use for training")
 	flag.Parse()
 	if !shouldRunTest {
 		os.Exit(m.Run())
@@ -363,7 +365,7 @@ func TestTrainingOutput(t *testing.T) {
 	})
 
 	t.Log("*** Start Training ***")
-	err = cliClient.runCliCmd("train", "trader", "--context", spicedContext)
+	err = cliClient.runCliCmd("train", "trader", "--context", spicedContext, "--learning-algorithm", learningAlgorithm)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -416,7 +418,7 @@ func TestPodWithTags(t *testing.T) {
 		}
 	})
 
-	err = cliClient.runCliCmd("train", "event-tags", "--context", spicedContext)
+	err = cliClient.runCliCmd("train", "event-tags", "--context", spicedContext, "--learning-algorithm", learningAlgorithm)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -469,7 +471,7 @@ func TestPodWithCategories(t *testing.T) {
 		}
 	})
 
-	err = cliClient.runCliCmd("train", "event-categories", "--context", spicedContext)
+	err = cliClient.runCliCmd("train", "event-categories", "--context", spicedContext, "--learning-algorithm", learningAlgorithm)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -516,7 +518,7 @@ func TestImportExport(t *testing.T) {
 	}
 	defer runtime.shutdown() //nolint:errcheck
 
-	err = cliClient.runCliCmd("train", "trader", "--context", spicedContext)
+	err = cliClient.runCliCmd("train", "trader", "--context", spicedContext, "--learning-algorithm", learningAlgorithm)
 	if err != nil {
 		t.Fatal(err)
 	}

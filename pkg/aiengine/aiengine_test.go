@@ -127,6 +127,7 @@ func testStartTrainingFunc(pod *pods.Pod, response string) func(t *testing.T) {
 			Flight:         "1",
 			NumberEpisodes: 10,
 			TrainingGoal:   pod.PodSpec.Training.Goal,
+			LearningAlgorithm: "dql",
 		}
 
 		t.Cleanup(func() {
