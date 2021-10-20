@@ -35,3 +35,7 @@ message Pod {
   string name = 1;
   string manifest_path = 2;
 }
+
+message TrainModel {
+  string learning_algorithm = 1;
+}

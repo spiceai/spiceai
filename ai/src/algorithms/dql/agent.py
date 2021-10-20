@@ -1,12 +1,13 @@
-import os
-
-from algorithms.agent_interface import SpiceAIAgent
+import json
+from pathlib import Path
 import random
 
 import numpy as np
 import tensorflow as tf
-from tensorflow.keras.layers import Dense, Input, InputLayer
-from tensorflow.keras.optimizers import Adam
+from tensorflow.keras import layers
+from tensorflow.keras import optimizers
+
+from algorithms.agent_interface import SpiceAIAgent
 from algorithms.dql.memory import ReplayBuffer
 from exception import InvalidDataShapeException
 
@@ -45,23 +46,22 @@ class Model:
     def nn_model(self):
         model = tf.keras.Sequential(
             [
-                InputLayer(self.state_shape),
-                Dense(32, activation="relu"),
-                Dense(16, activation="relu"),
-                Dense(self.action_size),
+                layers.InputLayer(self.state_shape),
+                layers.Dense(32, activation="relu"),
+                layers.Dense(16, activation="relu"),
+                layers.Dense(self.action_size),
             ]
         )
-        model.compile(loss="mse", optimizer=Adam(LEARNING_RATE))
+        model.compile(loss="mse", optimizer=optimizers.Adam(LEARNING_RATE))
         return model
 
     def predict(self, state: np.ndarray):
         if state.shape != self.state_shape:
             if state.shape[0] == BATCH_SIZE and state.shape[1] == self.state_shape[0]:
                 return self.model.predict(state)
-            else:
-                raise ValueError(
-                    f"Wrong state shape: {state.shape}, expected {self.state_shape}"
-                )
+            raise ValueError(
+                f"Wrong state shape: {state.shape}, expected {self.state_shape}"
+            )
 
         state_batch = np.expand_dims(state, axis=0)
 
@@ -87,10 +87,9 @@ class Model:
         self.model.fit(states, targets, epochs=1)
 
 
-class DeepQLearning_Agent(SpiceAIAgent):
+class DeepQLearningAgent(SpiceAIAgent):
     def __init__(self, state_shape, action_size):
-        self.state_shape = state_shape
-        self.action_size = action_size
+        super().__init__(state_shape, action_size)
 
         self.model = Model(self.state_shape, self.action_size)
         self.target_model = Model(self.state_shape, self.action_size)
@@ -108,26 +107,33 @@ class DeepQLearning_Agent(SpiceAIAgent):
     def act(self, state):
         return self.model.get_action(state)
 
-    def save(self, model_path: str):
+    def save(self, path: Path):
+        model_name = "model.pb"
+        model_path = path / model_name
+        with open(path / "meta.json", "w", encoding="utf-8") as meta_file:
+            meta_file.write(json.dumps({"algorithm": "dql", "model_name": model_name}))
         self.model.model.save(model_path)
 
-    def load(self, model_path: str) -> bool:
-        if os.path.exists(model_path):
-            self.model.model = tf.keras.models.load_model(model_path)
+    def load(self, path: Path) -> bool:
+        if (path / "meta.json").exists():
+            with open(path / "meta.json", "r", encoding="utf-8") as meta_file:
+                meta_info = json.loads(meta_file.read())
+            self.model.model = tf.keras.models.load_model(
+                str(path / meta_info["model_name"])
+            )
 
             try:
                 self.update_target()
             except ValueError as ex:
                 if "not compatible with provided weight shape" in str(ex):
-                    raise InvalidDataShapeException(str(ex))
+                    raise InvalidDataShapeException(str(ex)) from ex
                 raise ex
 
             # When loading a model, we want to set the epsilon to 0 so that the agent
             # will not explore
             self.model.epsilon = 0.0
             return True
-        else:
-            return False
+        return False
 
     def learn(self):
         if self.buffer.size() >= BATCH_SIZE:

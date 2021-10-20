@@ -11,7 +11,7 @@ import (
 )
 
 func importModel(pod *pods.Pod, tag string) error {
-	modelName := fmt.Sprintf("%s.model", pod.Name)
+	modelName := fmt.Sprintf("%s_train", pod.Name)
 	podDir := filepath.Dir(pod.ManifestPath())
 	modelPath := filepath.Join(podDir, modelName)
 

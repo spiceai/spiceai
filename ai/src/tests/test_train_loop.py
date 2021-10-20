@@ -1,18 +1,30 @@
-import io
-import csv
-import unittest
-import pandas as pd
-import threading
 import copy
-import main
-import train
-from tests import common
-from proto.aiengine.v1 import aiengine_pb2
+import csv
+import io
+import os
+import threading
+import unittest
+
+import pandas as pd
+
 from cleanup import cleanup_on_shutdown
+from proto.aiengine.v1 import aiengine_pb2
+import main
+from tests import common
+import train
 
 
 class TrainingLoopTests(unittest.TestCase):
+    ALGORITHM = os.environ["ALGORITHM"]
+
     def setUp(self):
+        # Preventing tensorflow verbose initialization
+        os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+        import tensorflow as tf  # pylint: disable=import-outside-toplevel
+
+        # Eager execution is too slow to use, so disabling
+        tf.compat.v1.disable_eager_execution()
+
         self.aiengine = main.AIEngine()
 
         self.trader_init_req = common.get_init_from_json(
@@ -67,6 +79,7 @@ class TrainingLoopTests(unittest.TestCase):
             number_episodes=number_episodes,
             flight=flight,
             epoch_time=epoch_time,
+            learning_algorithm=self.ALGORITHM,
         )
 
         resp = self.aiengine.StartTraining(train_req, None)

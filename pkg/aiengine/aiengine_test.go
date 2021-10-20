@@ -123,10 +123,11 @@ func testInitializePod(pod *pods.Pod) func(t *testing.T) {
 func testStartTrainingFunc(pod *pods.Pod, response string) func(t *testing.T) {
 	return func(t *testing.T) {
 		expectedTrainRequest := &aiengine_pb.StartTrainingRequest{
-			Pod:            pod.Name,
-			Flight:         "1",
-			NumberEpisodes: 10,
-			TrainingGoal:   pod.PodSpec.Training.Goal,
+			Pod:               pod.Name,
+			Flight:            "1",
+			NumberEpisodes:    10,
+			TrainingGoal:      pod.PodSpec.Training.Goal,
+			LearningAlgorithm: "dql",
 		}
 
 		t.Cleanup(func() {

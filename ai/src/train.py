@@ -1,38 +1,39 @@
-import tempfile
-import numpy as np
+import math
 import os
+from pathlib import Path
+import tempfile
+import threading
+import time
 
+import numpy as np
+from progress import ProgressBar
 import requests
+
+from algorithms.factory import get_agent
+from algorithms.agent_interface import SpiceAIAgent
+from cleanup import directories_to_delete
+from connector.manager import ConnectorManager
+from data import DataManager
+from exec import somewhat_safe_eval
 from exception import (
     DataSourceActionInvalidException,
     LawInvalidException,
     RewardInvalidException,
 )
-import math
-from progress import ProgressBar
-import time
-from utils import print_event
-from algorithms.factory import get_agent
-from algorithms.agent_interface import SpiceAIAgent
-from connector.manager import ConnectorManager
-from data import DataManager
 from metrics import metrics
-import threading
-from exec import somewhat_safe_eval
-from cleanup import directories_to_delete
+from utils import print_event
+
 
 training_lock = threading.Lock()
 
-saved_models: "dict[str]" = dict()
-
-DEFAULT_ALGORITHM = "vpg"
-ALGORITHM = os.getenv("SPICE_DEEPRL_ALGORITHM", DEFAULT_ALGORITHM)
+saved_models: "dict[str]" = {}
 
 
 def train_agent(
     pod_name: str,
     data_manager: DataManager,
     connector_manager: ConnectorManager,
+    algorithm: str,
     number_episodes: int,
     flight: str,
     training_goal: str,
@@ -47,7 +48,7 @@ def train_agent(
 
         data_manager.rewind()
         model_data_shape = data_manager.get_shape()
-        agent: SpiceAIAgent = get_agent(ALGORITHM, model_data_shape, ACTION_SIZE)
+        agent: SpiceAIAgent = get_agent(algorithm, model_data_shape, ACTION_SIZE)
 
         print_event(pod_name, f"Training {TRAINING_EPISODES} episodes...")
 
@@ -123,7 +124,7 @@ def train_agent(
             episode_end = math.floor(time.time())
 
             if training_goal != "":
-                loc = dict()
+                loc = {}
                 loc["score"] = episode_reward
                 custom_training_goal_met = somewhat_safe_eval(training_goal, loc)
 
@@ -133,7 +134,7 @@ def train_agent(
                 f"Episode {episode} completed with score of {round(episode_reward, 2)}.",
             )
 
-            episode_actions_name = dict()
+            episode_actions_name = {}
             action_counts = ""
             for i in range(ACTION_SIZE):
                 action_name = data_manager.action_names[i]
@@ -173,20 +174,21 @@ def train_agent(
         if custom_training_goal_met:
             print_event(pod_name, f"Training goal '{training_goal}' reached!")
         elif not_learning_episodes_threshold_met:
-            print_event(pod_name, f"Training goal 'score_variance < 1' reached!")
+            print_event(pod_name, "Training goal 'score_variance < 1' reached!")
         else:
             print_event(
                 pod_name, f"Max training episodes ({TRAINING_EPISODES}) reached!"
             )
 
-        tmpdir = tempfile.mkdtemp()
+        tmpdir = tempfile.mkdtemp(prefix="spiceai_")
+        save_path = Path(tmpdir, f"{pod_name}_train")
+        save_path.mkdir(parents=True)
         directories_to_delete.append(tmpdir)
-        model_path = os.path.join(tmpdir, f"{pod_name}.model")
-        agent.save(model_path)
-        saved_models[pod_name] = model_path
+        agent.save(save_path)
+        saved_models[pod_name] = save_path
 
 
-def end_of_episode(episode: int):
+def end_of_episode(_episode: int):
     return True
 
 
@@ -196,6 +198,5 @@ def post_episode_result(request_url, episode_data):
             request_url,
             json=episode_data,
         )
-    except Exception as e:
-        print(f"Failed to update episode result: {e}")
-        pass
+    except Exception as error:
+        print(f"Failed to update episode result: {error}")

@@ -1,6 +1,8 @@
 package cmd
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"net/http"
@@ -13,6 +15,7 @@ import (
 	"github.com/spiceai/spiceai/pkg/config"
 	"github.com/spiceai/spiceai/pkg/context"
 	"github.com/spiceai/spiceai/pkg/pods"
+	"github.com/spiceai/spiceai/pkg/proto/runtime_pb"
 	"github.com/spiceai/spiceai/pkg/util"
 )
 
@@ -82,7 +85,16 @@ spice train logpruner.yaml
 		}
 
 		trainUrl := fmt.Sprintf("%s/api/v0.1/pods/%s/train", serverBaseUrl, selectedPod.Name)
-		response, err := http.DefaultClient.Post(trainUrl, "application/json", nil)
+
+		trainRequest := &runtime_pb.TrainModel{
+			LearningAlgorithm: algorithmFlag,
+		}
+		trainRequestBytes, err := json.Marshal(&trainRequest)
+		if err != nil {
+			return
+		}
+
+		response, err := http.DefaultClient.Post(trainUrl, "application/json", bytes.NewReader(trainRequestBytes))
 		if err != nil {
 			fmt.Printf("failed to start training: %s\n", err.Error())
 			return
@@ -117,5 +129,6 @@ spice train logpruner.yaml
 
 func init() {
 	trainCmd.Flags().StringVar(&contextFlag, "context", "docker", "Runs Spice.ai in the given context, either 'docker' or 'metal'")
+	trainCmd.Flags().StringVar(&algorithmFlag, "learning-algorithm", "", "Train the pod with specified algorithm")
 	RootCmd.AddCommand(trainCmd)
 }

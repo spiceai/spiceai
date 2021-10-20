@@ -67,6 +67,7 @@ message StartTrainingRequest {
   string flight = 3;
   string training_goal = 4;
   int64 epoch_time = 5;
+  string learning_algorithm = 6;
 }
 
 message InferenceRequest {

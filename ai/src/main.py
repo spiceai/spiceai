@@ -1,37 +1,39 @@
+from concurrent import futures
+from io import StringIO
+import json
+import os
+from pathlib import Path
+import signal
+import threading
+from typing import Dict
+
 import grpc
 import pandas as pd
-from io import StringIO
-import tensorflow as tf
-import threading
 from psutil import Process
-import os
-import signal
+
 from algorithms.factory import get_agent
 from algorithms.agent_interface import SpiceAIAgent
-from data import DataManager
+from cleanup import cleanup_on_shutdown
 from connector.manager import ConnectorManager, ConnectorName
 from connector.stateful import StatefulConnector
-from validation import validate_rewards
-from train import train_agent, training_lock, saved_models, ALGORITHM
-from concurrent import futures
-from proto.aiengine.v1 import aiengine_pb2, aiengine_pb2_grpc
-from cleanup import cleanup_on_shutdown
+from data import DataManager
 from exception import InvalidDataShapeException
+from proto.aiengine.v1 import aiengine_pb2, aiengine_pb2_grpc
+from train import train_agent, training_lock, saved_models
+from validation import validate_rewards
 
-data_managers: "dict[DataManager]" = dict()
-connector_managers: "dict[ConnectorManager]" = dict()
+data_managers: "dict[DataManager]" = {}
+connector_managers: "dict[ConnectorManager]" = {}
 
 training_thread = None
 init_lock = threading.Lock()
-
-# Eager execution is too slow to use, so disabling
-tf.compat.v1.disable_eager_execution()
 
 
 def dispatch_train_agent(
     pod_name: str,
     data_manager: DataManager,
     connector_manager: ConnectorManager,
+    algorithm: str,
     number_episodes: int,
     flight: str,
     training_goal: str,
@@ -46,6 +48,7 @@ def dispatch_train_agent(
             pod_name,
             data_manager,
             connector_manager,
+            algorithm,
             number_episodes,
             flight,
             training_goal,
@@ -67,7 +70,7 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
 
             data_manager: DataManager = data_managers[request.pod]
             for field in new_data.columns:
-                if not field in data_manager.fields.keys():
+                if field not in data_manager.fields.keys():
                     return aiengine_pb2.Response(
                         result="unexpected_field",
                         message=f"Unexpected field: '{field}'",
@@ -99,12 +102,11 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
             data_manager.epoch_time = new_epoch_time
             data_manager.end_time = data_manager.epoch_time + data_manager.period_secs
 
-        number_episodes = 30
-        if request.number_episodes != 0:
-            number_episodes = request.number_episodes
-
+        algorithm = request.learning_algorithm
+        number_episodes = (
+            request.number_episodes if request.number_episodes != 0 else 30
+        )
         flight = request.flight
-
         training_goal = request.training_goal
 
         index_of_epoch = data_manager.massive_table_filled.index.get_loc(
@@ -124,6 +126,7 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
             request.pod,
             data_manager,
             connector_manager,
+            algorithm,
             number_episodes,
             flight,
             training_goal,
@@ -137,7 +140,7 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
             if request.pod in saved_models:
                 model_exists = True
 
-            if not request.pod in data_managers:
+            if request.pod not in data_managers:
                 return aiengine_pb2.InferenceResult(
                     response=aiengine_pb2.Response(
                         result="pod_not_initialized", error=True
@@ -153,15 +156,23 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
                     )
                 )
 
-            # Ideally we could just re-use the in-memory agent we created during training, but tensorflow has issues with
-            # multi-threading in python, so we are just loading it from the file system
+            # Ideally we could just re-use the in-memory agent we created during training,
+            # but tensorflow has issues with multi-threading in python, so we are just loading it from the file system
             data_manager = data_managers[request.pod]
             model_data_shape = data_manager.get_shape()
+            if model_exists:
+                save_path = saved_models[request.pod]
+                with open(save_path / "meta.json", "r", encoding="utf-8") as meta_file:
+                    save_info = json.loads(meta_file.read())
+                algorithm = save_info["algorithm"]
+            else:
+                algorithm = "dql"
+
             agent: SpiceAIAgent = get_agent(
-                ALGORITHM, model_data_shape, len(data_manager.action_names)
+                algorithm, model_data_shape, len(data_manager.action_names)
             )
             if model_exists:
-                agent.load(saved_models[request.pod])
+                agent.load(Path(save_path))
 
             data_manager: DataManager = data_managers[request.pod]
 
@@ -265,7 +276,7 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
             return aiengine_pb2.Response(result="ok")
 
     def ExportModel(self, request: aiengine_pb2.ExportModelRequest, context):
-        if not request.pod in saved_models:
+        if request.pod not in saved_models:
             return aiengine_pb2.ExportModelResult(
                 response=aiengine_pb2.Response(
                     result="pod_not_trained",
@@ -274,7 +285,7 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
                 )
             )
 
-        if not request.pod in data_managers:
+        if request.pod not in data_managers:
             return aiengine_pb2.ExportModelResult(
                 resopnse=aiengine_pb2.Response(result="pod_not_initialized", error=True)
             )
@@ -290,27 +301,37 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
 
         return aiengine_pb2.ExportModelResult(
             response=aiengine_pb2.Response(result="ok"),
-            model_path=saved_models[request.pod],
+            model_path=str(saved_models[request.pod]),
         )
 
     def ImportModel(self, request: aiengine_pb2.ImportModelRequest, context):
-        if not request.pod in data_managers:
+        if request.pod not in data_managers:
             return aiengine_pb2.Response(result="pod_not_initialized", error=True)
 
         data_manager = data_managers[request.pod]
         model_data_shape = data_manager.get_shape()
+        import_path = Path(request.import_path)
+
+        if not (import_path / "meta.json").exists():
+            return aiengine_pb2.Response(
+                result="unable_to_load_model_metadata",
+                message=f"Unable to find meta data at {import_path}",
+                error=True,
+            )
+        with open(import_path / "meta.json", "r", encoding="utf-8") as meta_file:
+            algorithm = json.loads(meta_file.read())["algorithm"]
+
         agent: SpiceAIAgent = get_agent(
-            ALGORITHM, model_data_shape, len(data_manager.action_names)
+            algorithm, model_data_shape, len(data_manager.action_names)
         )
-        ok = agent.load(request.import_path)
-        if not ok:
+        if not agent.load(import_path):
             return aiengine_pb2.Response(
                 result="unable_to_load_model",
-                message=f"Unable to find a model at {request.import_path}",
+                message=f"Unable to find a model at {import_path}",
                 error=True,
             )
 
-        saved_models[request.pod] = request.import_path
+        saved_models[request.pod] = Path(request.import_path)
 
         return aiengine_pb2.Response(result="ok")
 
@@ -322,7 +343,14 @@ def wait_parent_process():
     parent_process.wait()
 
 
-if __name__ == "__main__":
+def main():
+    # Preventing tensorflow verbose initialization
+    os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+    import tensorflow as tf  # pylint: disable=import-outside-toplevel
+
+    # Eager execution is too slow to use, so disabling
+    tf.compat.v1.disable_eager_execution()
+
     signal.signal(signal.SIGINT, cleanup_on_shutdown)
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
     aiengine_pb2_grpc.add_AIEngineServicer_to_server(AIEngine(), server)
@@ -332,3 +360,7 @@ if __name__ == "__main__":
 
     wait_parent_process()
     cleanup_on_shutdown()
+
+
+if __name__ == "__main__":
+    main()

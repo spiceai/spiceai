@@ -1,12 +1,15 @@
-from algorithms.agent_interface import SpiceAIAgent
+import json
+from pathlib import Path
+import warnings
+
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras import layers, models
 from tensorflow.keras import backend as K
+
+from algorithms.agent_interface import SpiceAIAgent
 from algorithms.vpg.memory import Memory
 from exception import InvalidDataShapeException
-import warnings
-import os
 
 
 def build_networks(state_shape, action_size, learning_rate, hidden_neurons):
@@ -14,7 +17,7 @@ def build_networks(state_shape, action_size, learning_rate, hidden_neurons):
 
     Creates a two hidden-layer Policy Gradient Neural Network. The loss
     function is altered to be a log-likelihood function weighted
-    by the discounted reward, g.
+    by the discounted reward, gamma.
 
     Args:
         space_shape: a tuple of ints representing the observation space.
@@ -24,19 +27,19 @@ def build_networks(state_shape, action_size, learning_rate, hidden_neurons):
             layer.
     """
     state_input = layers.Input(state_shape, name="state")
-    g = layers.Input((1,), name="g")
+    gamma = layers.Input((1,), name="gamma")
 
     hidden_1 = layers.Dense(hidden_neurons, activation="relu")(state_input)
     hidden_2 = layers.Dense(hidden_neurons, activation="relu")(hidden_1)
     probabilities = layers.Dense(action_size, activation="softmax")(hidden_2)
 
     def custom_loss(y_true, y_pred):
-        CLIP_EDGE = 1e-8
-        y_pred_clipped = K.clip(y_pred, CLIP_EDGE, 1 - CLIP_EDGE)
+        clip_edge = 1e-8
+        y_pred_clipped = K.clip(y_pred, clip_edge, 1 - clip_edge)
         log_lik = y_true * K.log(y_pred_clipped)
-        return K.sum(-log_lik * g)
+        return K.sum(-log_lik * gamma)
 
-    policy = models.Model(inputs=[state_input, g], outputs=[probabilities])
+    policy = models.Model(inputs=[state_input, gamma], outputs=[probabilities])
     optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
     policy.compile(loss=custom_loss, optimizer=optimizer)
 
@@ -47,7 +50,7 @@ def build_networks(state_shape, action_size, learning_rate, hidden_neurons):
     return policy, predict
 
 
-class VanillaPolicyGradient_Agent(SpiceAIAgent):
+class VanillaPolicyGradientAgent(SpiceAIAgent):
     """Sets up a reinforcement learning agent."""
 
     def __init__(
@@ -92,19 +95,20 @@ class VanillaPolicyGradient_Agent(SpiceAIAgent):
             probabilities = self.predict.predict(state_batch, verbose=0)[0]
         except ValueError as ex:
             if "expected state to have shape" in str(ex):
-                raise InvalidDataShapeException(str(ex))
+                raise InvalidDataShapeException(str(ex)) from ex
             raise ex
 
         # print(probabilities)
         action = np.random.choice(len(probabilities), p=probabilities)
         return action, probabilities
 
-    def discount_episode(self, rewards, gamma):
+    @staticmethod
+    def discount_episode(rewards, gamma):
         discounted_rewards = np.zeros_like(rewards)
         total_rewards = 0
-        for t in reversed(range(len(rewards))):
-            total_rewards = rewards[t] + total_rewards * gamma
-            discounted_rewards[t] = total_rewards
+        for step in reversed(range(len(rewards))):
+            total_rewards = rewards[step] + total_rewards * gamma
+            discounted_rewards[step] = total_rewards
         return discounted_rewards
 
     def learn(self):
@@ -121,13 +125,19 @@ class VanillaPolicyGradient_Agent(SpiceAIAgent):
         discount_mb = (discount_mb - np.mean(discount_mb)) / std_dev
         return self.policy.train_on_batch([state_mb, discount_mb], actions)
 
-    def save(self, model_name):
-        self.predict.save(model_name)
+    def save(self, path: Path):
+        model_name = "model.pb"
+        model_path = path / model_name
+        with open(path / "meta.json", "w", encoding="utf-8") as meta_file:
+            meta_file.write(json.dumps({"algorithm": "vpg", "model_name": model_name}))
+        self.predict.save(model_path)
 
-    def load(self, model_name):
-        if os.path.exists(model_name):
-            self.predict = models.load_model(model_name)
+    def load(self, path: Path) -> bool:
+        if (path / "meta.json").exists():
+            with open(path / "meta.json", "r", encoding="utf-8") as meta_file:
+                meta_info = json.loads(meta_file.read())
+            self.predict = models.load_model(str(path / meta_info["model_name"]))
             return True
-        else:
-            print(f"Model {model_name} doesn't exist")
-            return False
+
+        print(f"Model {path} doesn't exist")
+        return False

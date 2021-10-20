@@ -24,11 +24,12 @@ func StartTraining(pod *pods.Pod) error {
 	}
 
 	trainRequest := &aiengine_pb.StartTrainingRequest{
-		Pod:            pod.Name,
-		EpochTime:      pod.Epoch().Unix(),
-		Flight:         flightId,
-		NumberEpisodes: int64(flight.ExpectedEpisodes()),
-		TrainingGoal:   pod.PodSpec.Training.Goal,
+		Pod:               pod.Name,
+		EpochTime:         pod.Epoch().Unix(),
+		Flight:            flightId,
+		NumberEpisodes:    int64(flight.ExpectedEpisodes()),
+		TrainingGoal:      pod.PodSpec.Training.Goal,
+		LearningAlgorithm: pod.LearningAlgorithm(),
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
