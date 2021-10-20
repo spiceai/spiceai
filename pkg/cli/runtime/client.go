@@ -68,7 +68,7 @@ func (r *RuntimeClient) ExportModel(podName string, directory string, filename s
 	return nil
 }
 
-func (r *RuntimeClient) ImportModel(podName string, archivePath string, tag string, algorithm string) error {
+func (r *RuntimeClient) ImportModel(podName string, archivePath string, tag string) error {
 	err := util.IsRuntimeServerHealthy(r.serverBaseUrl, http.DefaultClient)
 	if err != nil {
 		return fmt.Errorf("failed to reach %s. is the spice runtime running? %w", r.serverBaseUrl, err)
@@ -78,7 +78,6 @@ func (r *RuntimeClient) ImportModel(podName string, archivePath string, tag stri
 		ArchivePath: archivePath,
 		Tag:         tag,
 		Pod:         podName,
-		LearningAlgorithm: algorithm,
 	}
 
 	importRequestBytes, err := json.Marshal(&importRequest)

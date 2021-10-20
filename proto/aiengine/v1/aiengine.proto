@@ -105,5 +105,4 @@ message ImportModelRequest {
   string pod = 1;
   string tag = 2;
   string import_path = 3;
-  string learning_algorithm = 4;
 }

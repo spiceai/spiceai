@@ -301,7 +301,7 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
 
         return aiengine_pb2.ExportModelResult(
             response=aiengine_pb2.Response(result="ok"),
-            model_path=saved_models[request.pod],
+            model_path=str(saved_models[request.pod]),
         )
 
     def ImportModel(self, request: aiengine_pb2.ImportModelRequest, context):
@@ -310,17 +310,28 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
 
         data_manager = data_managers[request.pod]
         model_data_shape = data_manager.get_shape()
+        import_path = Path(request.import_path)
+
+        if not (import_path / "meta.json").exists():
+            return aiengine_pb2.Response(
+                result="unable_to_load_model_metadata",
+                message=f"Unable to find meta data at {import_path}",
+                error=True,
+            )
+        with open(import_path / "meta.json", "r", encoding="utf-8") as meta_file:
+            algorithm = json.loads(meta_file.read())["algorithm"]
+
         agent: SpiceAIAgent = get_agent(
-            request.learning_algorithm, model_data_shape, len(data_manager.action_names)
+            algorithm, model_data_shape, len(data_manager.action_names)
         )
-        if not agent.load(Path(request.import_path)):
+        if not agent.load(import_path):
             return aiengine_pb2.Response(
                 result="unable_to_load_model",
-                message=f"Unable to find a model at {request.import_path}",
+                message=f"Unable to find a model at {import_path}",
                 error=True,
             )
 
-        saved_models[request.pod] = request.import_path
+        saved_models[request.pod] = Path(request.import_path)
 
         return aiengine_pb2.Response(result="ok")
 

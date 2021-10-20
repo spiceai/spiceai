@@ -108,18 +108,19 @@ class DeepQLearningAgent(SpiceAIAgent):
         return self.model.get_action(state)
 
     def save(self, path: Path):
-        model_path = path / "model.pb"
+        model_name = "model.pb"
+        model_path = path / model_name
         with open(path / "meta.json", "w", encoding="utf-8") as meta_file:
-            meta_file.write(
-                json.dumps({"algorithm": "dql", "model_path": str(model_path)})
-            )
+            meta_file.write(json.dumps({"algorithm": "dql", "model_name": model_name}))
         self.model.model.save(model_path)
 
     def load(self, path: Path) -> bool:
         if (path / "meta.json").exists():
             with open(path / "meta.json", "r", encoding="utf-8") as meta_file:
                 meta_info = json.loads(meta_file.read())
-            self.model.model = tf.keras.models.load_model(meta_info["model_path"])
+            self.model.model = tf.keras.models.load_model(
+                str(path / meta_info["model_name"])
+            )
 
             try:
                 self.update_target()

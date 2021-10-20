@@ -10,4 +10,6 @@ def get_agent(name: str, state_shape, action_size: int) -> SpiceAIAgent:
     if name == "dql":
         return DeepQLearningAgent(state_shape, action_size)
 
-    raise NotImplementedError(f"Unable to find agent for the algorithm '{name}'")
+    raise NotImplementedError(
+        f"Unable to find agent for the learning algorithm '{name}'"
+    )

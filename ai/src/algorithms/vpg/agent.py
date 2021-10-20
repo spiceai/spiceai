@@ -126,18 +126,17 @@ class VanillaPolicyGradientAgent(SpiceAIAgent):
         return self.policy.train_on_batch([state_mb, discount_mb], actions)
 
     def save(self, path: Path):
-        model_path = path / "model.pb"
+        model_name = "model.pb"
+        model_path = path / model_name
         with open(path / "meta.json", "w", encoding="utf-8") as meta_file:
-            meta_file.write(
-                json.dumps({"algorithm": "vpg", "model_path": str(model_path)})
-            )
+            meta_file.write(json.dumps({"algorithm": "vpg", "model_name": model_name}))
         self.predict.save(model_path)
 
     def load(self, path: Path) -> bool:
         if (path / "meta.json").exists():
             with open(path / "meta.json", "r", encoding="utf-8") as meta_file:
                 meta_info = json.loads(meta_file.read())
-            self.predict = models.load_model(meta_info["model_path"])
+            self.predict = models.load_model(str(path / meta_info["model_name"]))
             return True
 
         print(f"Model {path} doesn't exist")

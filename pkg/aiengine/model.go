@@ -10,16 +10,15 @@ import (
 	"github.com/spiceai/spiceai/pkg/proto/aiengine_pb"
 )
 
-func importModel(pod *pods.Pod, tag string, algorithm string) error {
-	modelName := fmt.Sprintf("%s.model", pod.Name)
+func importModel(pod *pods.Pod, tag string) error {
+	modelName := fmt.Sprintf("%s_train", pod.Name)
 	podDir := filepath.Dir(pod.ManifestPath())
 	modelPath := filepath.Join(podDir, modelName)
 
 	importRequest := &aiengine_pb.ImportModelRequest{
-		Pod:        pod.Name,
-		Tag:        tag,
-		ImportPath: modelPath,
-		LearningAlgorithm: algorithm,
+		Pod:               pod.Name,
+		Tag:               tag,
+		ImportPath:        modelPath,
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
