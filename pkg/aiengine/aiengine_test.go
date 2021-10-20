@@ -199,9 +199,14 @@ func testInferServerFunc() func(*testing.T) {
 					},
 				}, nil
 			},
+			GetHealthHandler: func(c go_context.Context, healthRequest *aiengine_pb.HealthRequest, co ...grpc.CallOption) (*aiengine_pb.Response, error) {
+				return &aiengine_pb.Response{
+					Result: "ok",
+				}, nil
+			},
 		}
 
-		aiengineClient = mockAIEngineClient
+		SetAIEngineClient(mockAIEngineClient)
 
 		resp, err := Infer("pod_foo", "tag_bar")
 		if assert.NoError(t, err) {

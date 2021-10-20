@@ -21,7 +21,7 @@ func SendData(pod *pods.Pod, podState ...*state.State) error {
 		return nil
 	}
 
-	err := IsServerHealthy()
+	err := IsAIEngineHealthy()
 	if err != nil {
 		return err
 	}

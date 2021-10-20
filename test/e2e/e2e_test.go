@@ -29,6 +29,7 @@ var (
 	learningAlgorithm  string
 	testDir            string
 	repoRoot           string
+	localRegistryPath  string
 	workingDirectory   string
 	runtimePath        string
 	cliClient          *cli
@@ -42,10 +43,13 @@ func TestMain(m *testing.M) {
 	flag.BoolVar(&shouldStartRuntime, "startruntime", true, "start runtime")
 	flag.StringVar(&spicedContext, "context", "docker", "specify --context <context> to spice CLI for spiced")
 	flag.StringVar(&learningAlgorithm, "learning-algorithm", "dql", "specify --learning-alogrithm use for training")
+	flag.StringVar(&localRegistryPath, "localregistry", "", "-localregistry <path> uses local Spicepod registry at <path> instead of spicerack.org")
 	flag.Parse()
 	if !shouldRunTest {
 		os.Exit(m.Run())
 	}
+
+	fmt.Printf("Using %s context\n", aurora.BrightCyan(spicedContext))
 
 	var err error
 	testDir, err = tempdir.CreateTempDir("e2e")
@@ -104,7 +108,21 @@ func TestMain(m *testing.M) {
 		context:            spicedContext,
 	}
 
-	for _, testPod := range testPods {
+	podsToAdd := testPods
+	if localRegistryPath != "" {
+		fmt.Printf("Adding pods from local registry %s", aurora.BrightBlue(localRegistryPath))
+		podsToAdd = make([]string, len(testPods))
+		for _, p := range testPods {
+			pPath := strings.Split(p, "@")
+			podsToAdd = append(podsToAdd, filepath.Join(localRegistryPath, "pods", pPath[0]))
+		}
+	}
+
+	for _, testPod := range podsToAdd {
+		if testPod == "" {
+			continue
+		}
+		fmt.Printf("Running: spice add %s\n", testPod)
 		err = cliClient.runCliCmd("add", testPod)
 		if err != nil {
 			log.Println(err.Error())
@@ -180,12 +198,22 @@ func TestObservations(t *testing.T) {
 	})
 
 	t.Log("*** Get Observations ***")
-	observation, err := runtime.getObservations("trader")
+	initialObservationsCsv, err := runtime.getObservations("trader", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	err = snapshotter.SnapshotMulti("initial_observation.csv", observation)
+	err = snapshotter.SnapshotMulti("initial_observation.csv", initialObservationsCsv)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	initialObservationsJson, err := runtime.getObservations("trader", "application/json")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = snapshotter.SnapshotMulti("initial_observation.json", initialObservationsJson)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -204,12 +232,22 @@ func TestObservations(t *testing.T) {
 	time.Sleep(1 * time.Second)
 
 	t.Log("*** Get New Observations ***")
-	observation, err = runtime.getObservations("trader")
+	newObservationsCsv, err := runtime.getObservations("trader", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	err = snapshotter.SnapshotMulti("new_observation.csv", observation)
+	err = snapshotter.SnapshotMulti("new_observation.csv", newObservationsCsv)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	newObservationsJson, err := runtime.getObservations("trader", "application/json")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = snapshotter.SnapshotMulti("new_observation.json", newObservationsJson)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -234,7 +272,7 @@ func TestDataspaceData(t *testing.T) {
 	})
 
 	t.Log("*** Get Observations ***")
-	observation, err := runtime.getObservations("customprocessor")
+	observation, err := runtime.getObservations("customprocessor", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -258,7 +296,7 @@ func TestDataspaceData(t *testing.T) {
 	time.Sleep(1 * time.Second)
 
 	t.Log("*** Get New Observations ***")
-	observation, err = runtime.getObservations("customprocessor")
+	observation, err = runtime.getObservations("customprocessor", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -282,7 +320,7 @@ func TestDataspaceData(t *testing.T) {
 	time.Sleep(1 * time.Second)
 
 	t.Log("*** Get New Observations with CSV Data ***")
-	observation, err = runtime.getObservations("customprocessor")
+	observation, err = runtime.getObservations("customprocessor", "")
 	if err != nil {
 		t.Fatal(err)
 	}
