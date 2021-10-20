@@ -14,7 +14,7 @@ with open(os.getenv("GITHUB_ENV"), "a") as githubEnv:
     releaseVersion = gitRef[len(tagRefPrefix):]
     releaseNotePath = "docs/release_notes/v{}.md".format(releaseVersion)
 
-    if gitRef.find("-rc.") > 0:
+    if gitRef.find("-rc") > 0:
         print ("Release Candidate build from {}...".format(gitRef))
     else:
         print ("Checking if {} exists".format(releaseNotePath))
