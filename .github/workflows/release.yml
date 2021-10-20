@@ -203,5 +203,5 @@ jobs:
             --tag "v${{ env.REL_VERSION }}" \
             --release-name "Spice.ai v${{ env.REL_VERSION }}" \
             --body "${RELEASE_BODY}" \
-            --prerelease "$LATEST_RELEASE" \
+            --prerelease "$PRE_RELEASE" \
             ${RELEASE_ARTIFACT[*]}
