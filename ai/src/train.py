@@ -29,13 +29,13 @@ saved_models: "dict[str]" = {}
 
 
 def train_agent(
-        pod_name: str,
-        data_manager: DataManager,
-        connector_manager: ConnectorManager,
-        algorithm: str,
-        number_episodes: int,
-        flight: str,
-        training_goal: str,
+    pod_name: str,
+    data_manager: DataManager,
+    connector_manager: ConnectorManager,
+    algorithm: str,
+    number_episodes: int,
+    flight: str,
+    training_goal: str,
 ):
     with training_lock:
         ACTION_SIZE = len(data_manager.action_names)

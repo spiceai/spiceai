@@ -1,9 +1,10 @@
-import abc
-from typing import Tuple
-
 """
 The interface that all Spice.ai compatible deep-RL agents should conform to.
 """
+
+import abc
+from pathlib import Path
+from typing import Tuple
 
 
 class SpiceAIAgent(metaclass=abc.ABCMeta):
@@ -52,7 +53,7 @@ class SpiceAIAgent(metaclass=abc.ABCMeta):
         raise NotImplementedError()
 
     @abc.abstractmethod
-    def save(self, model_path: str):
+    def save(self, path: Path):
         """
         Save the trained model to disk
 
@@ -62,7 +63,7 @@ class SpiceAIAgent(metaclass=abc.ABCMeta):
         raise NotImplementedError()
 
     @abc.abstractmethod
-    def load(self, model_path: str) -> bool:
+    def load(self, path: Path) -> bool:
         """
         Load a previously trained model from disk. Returns whether it was able to load the model.
 

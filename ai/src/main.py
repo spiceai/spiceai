@@ -1,8 +1,11 @@
 from concurrent import futures
 from io import StringIO
-import threading
+import json
 import os
+from pathlib import Path
 import signal
+import threading
+from typing import Dict
 
 import grpc
 import pandas as pd
@@ -27,13 +30,13 @@ init_lock = threading.Lock()
 
 
 def dispatch_train_agent(
-        pod_name: str,
-        data_manager: DataManager,
-        connector_manager: ConnectorManager,
-        algorithm: str,
-        number_episodes: int,
-        flight: str,
-        training_goal: str,
+    pod_name: str,
+    data_manager: DataManager,
+    connector_manager: ConnectorManager,
+    algorithm: str,
+    number_episodes: int,
+    flight: str,
+    training_goal: str,
 ):
     if training_lock.locked():
         return False
@@ -100,7 +103,9 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
             data_manager.end_time = data_manager.epoch_time + data_manager.period_secs
 
         algorithm = request.algorithm
-        number_episodes = request.number_episodes if request.number_episodes != 0 else 30
+        number_episodes = (
+            request.number_episodes if request.number_episodes != 0 else 30
+        )
         flight = request.flight
         training_goal = request.training_goal
 
@@ -108,7 +113,10 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
             data_manager.epoch_time, "ffill"
         )
 
-        if len(data_manager.massive_table_filled.iloc[index_of_epoch:]) < data_manager.get_window_span():
+        if (
+            len(data_manager.massive_table_filled.iloc[index_of_epoch:])
+            < data_manager.get_window_span()
+        ):
             return aiengine_pb2.Response(
                 result="not_enough_data_for_training",
                 error=True,
@@ -152,15 +160,26 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
             # but tensorflow has issues with multi-threading in python, so we are just loading it from the file system
             data_manager = data_managers[request.pod]
             model_data_shape = data_manager.get_shape()
+            if model_exists:
+                save_path = saved_models[request.pod]
+                with open(save_path / "meta.json", "r", encoding="utf-8") as meta_file:
+                    save_info = json.loads(meta_file.read())
+                algorithm = save_info["algorithm"]
+            else:
+                algorithm = "dql"
+
             agent: SpiceAIAgent = get_agent(
-                request.algorithm, model_data_shape, len(data_manager.action_names)
+                algorithm, model_data_shape, len(data_manager.action_names)
             )
             if model_exists:
-                agent.load(saved_models[request.pod])
+                agent.load(Path(save_info["model_path"]))
 
             data_manager: DataManager = data_managers[request.pod]
 
-            if data_manager.massive_table_filled.shape[0] < data_manager.get_window_span():
+            if (
+                data_manager.massive_table_filled.shape[0]
+                < data_manager.get_window_span()
+            ):
                 return aiengine_pb2.InferenceResult(
                     response=aiengine_pb2.Response(result="not_enough_data", error=True)
                 )
@@ -294,7 +313,7 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
         agent: SpiceAIAgent = get_agent(
             request.algorithm, model_data_shape, len(data_manager.action_names)
         )
-        if not agent.load(request.import_path):
+        if not agent.load(Path(request.import_path)):
             return aiengine_pb2.Response(
                 result="unable_to_load_model",
                 message=f"Unable to find a model at {request.import_path}",
@@ -315,7 +334,7 @@ def wait_parent_process():
 
 def main():
     # Preventing tensorflow verbose initialization
-    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+    os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
     import tensorflow as tf  # pylint: disable=import-outside-toplevel
 
     # Eager execution is too slow to use, so disabling
