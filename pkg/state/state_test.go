@@ -70,11 +70,11 @@ func testNewState() func(*testing.T) {
 		newState := NewState(expectedPath, expectedFieldNames, expectedTags, expectedObservations)
 
 		assert.Equal(t, expectedPath, newState.Path(), "Path() not equal")
-		assert.Equal(t, expectedFieldNames, newState.FieldNames(), "FieldNames() not equal")
+		assert.Equal(t, expectedFieldNames, newState.MeasurementsNames(), "FieldNames() not equal")
 
 		expectedFields := []string{"test.path.field1", "test.path.field2", "test.path.field3"}
 
-		assert.Equal(t, expectedFields, newState.Fields(), "Fields() not equal")
+		assert.Equal(t, expectedFields, newState.FqMeasurementsNames(), "Fields() not equal")
 	}
 }
 
@@ -216,5 +216,19 @@ func testgetColumnMappingsFunc() func(*testing.T) {
 
 		expectedColToFieldName := []string{"usd_balance", "btc_balance", "price"}
 		assert.Equal(t, expectedColToFieldName, colToFieldName, "column to path mapping incorrect")
+	}
+}
+
+func TestGetFieldNames(t *testing.T) {
+	names := []string{"a", "b", "c"}
+	fqNames, namesMap := getFieldNames("my.test.path", names)
+
+	expectedFqNames := []string{"my.test.path.a", "my.test.path.b", "my.test.path.c"}
+	assert.Equal(t, expectedFqNames, fqNames)
+
+	assert.Len(t, namesMap, len(names))
+
+	for i, n := range names {
+		assert.Equal(t, namesMap[n], expectedFqNames[i])
 	}
 }

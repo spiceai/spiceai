@@ -38,4 +38,5 @@ message Pod {
 
 message TrainModel {
   string learning_algorithm = 1;
+  int64 number_episodes = 2;
 }

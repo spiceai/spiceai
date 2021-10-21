@@ -71,9 +71,8 @@ func apiGetObservationsHandler(ctx *fasthttp.RequestCtx) {
 	if string(ctx.Request.Header.Peek("Accept")) == "application/json" {
 		observations := []*common_pb.Observation{}
 		for _, state := range pod.CachedState() {
-			for _, o := range state.Observations() {
-				observations = append(observations, api.NewObservation(&o))
-			}
+			obs := api.NewObservationsFromState(state)
+			observations = append(observations, obs...)
 		}
 		ctx.Response.Header.Add("Content-Type", "application/json")
 		data, err := json.Marshal(observations)
@@ -205,8 +204,6 @@ func apiPodTrainHandler(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	// Retrieving body request to overload the pod
-	overloaded_pod := pod
 	var trainRequest runtime_pb.TrainModel
 	err := json.Unmarshal(ctx.Request.Body(), &trainRequest)
 	if err != nil {
@@ -214,11 +211,8 @@ func apiPodTrainHandler(ctx *fasthttp.RequestCtx) {
 		ctx.Response.SetBodyString(err.Error())
 		return
 	}
-	if trainRequest.LearningAlgorithm != "" {
-		overloaded_pod.SetLearningAlgorithm(trainRequest.LearningAlgorithm)
-	}
 
-	err = aiengine.StartTraining(overloaded_pod)
+	err = aiengine.StartTraining(pod, trainRequest.LearningAlgorithm, trainRequest.NumberEpisodes)
 	if err != nil {
 		ctx.Response.SetStatusCode(500)
 		ctx.Response.SetBodyString(err.Error())

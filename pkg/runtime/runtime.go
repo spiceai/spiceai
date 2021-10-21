@@ -82,7 +82,8 @@ func (r *SpiceRuntime) SingleRun(manifestPath string) error {
 		return err
 	}
 
-	err = aiengine.StartTraining(pod)
+	// Pass empty algorithm and negative episode number string to use pod's default
+	err = aiengine.StartTraining(pod, "", -1)
 	if err != nil {
 		return err
 	}

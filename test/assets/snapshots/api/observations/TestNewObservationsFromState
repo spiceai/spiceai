@@ -1,0 +1,24 @@
+[
+  {
+    "time": 1634804788,
+    "measurements": {
+      "my.test.path.m-1": 123.567,
+      "my.test.path.m-2": 567.89
+    },
+    "tags": [
+      "a",
+      "c"
+    ]
+  },
+  {
+    "time": 1634808475,
+    "measurements": {
+      "my.test.path.m-1": 4734.3434,
+      "my.test.path.m-2": 453.23465
+    },
+    "tags": [
+      "b",
+      "c"
+    ]
+  }
+]
