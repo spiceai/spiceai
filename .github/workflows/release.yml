@@ -138,7 +138,7 @@ jobs:
   publish:
     name: Publish ${{ matrix.target_os }}-${{ matrix.target_arch }} binaries
     needs: build
-    if: github.event_name != 'pull_request'
+    if: startswith(github.ref, 'refs/tags/v') && github.event_name != 'pull_request'
     env:
       ARTIFACT_DIR: ./release
 
@@ -180,9 +180,6 @@ jobs:
 
       - name: publish ${{ matrix.target_os }}/${{ matrix.target_arch }} binaries to github
         run: |
-          echo "installing github-release-cli..."
-          sudo npm install --no-progress -g @babel/runtime@7.13.10
-          sudo npm install --no-progress -g github-release-cli@2.0.0
           # Parse repository to get owner and repo names
           OWNER_NAME="${GITHUB_REPOSITORY%%/*}"
           REPO_NAME="${GITHUB_REPOSITORY#*/}"
@@ -190,7 +187,7 @@ jobs:
           # Get the list of files
           RELEASE_ARTIFACT=(${ARTIFACT_DIR}/*)
           # Delete existing release artifact
-          github-release delete \
+          python ./.github/scripts/github_release.py delete \
             --owner $OWNER_NAME --repo $REPO_NAME \
             --tag "v${{ env.REL_VERSION }}" \
             ${RELEASE_ARTIFACT[*]}
@@ -200,9 +197,10 @@ jobs:
             export RELEASE_BODY="This is the release candidate ${{ env.REL_VERSION }}"
           fi
           echo "Uploading Spice.ai Binaries to GitHub Release"
-          github-release upload \
+          python ./.github/scripts/github_release.py upload \
             --owner $OWNER_NAME --repo $REPO_NAME \
             --tag "v${{ env.REL_VERSION }}" \
             --release-name "Spice.ai v${{ env.REL_VERSION }}" \
             --body "${RELEASE_BODY}" \
+            --prerelease "$PRE_RELEASE" \
             ${RELEASE_ARTIFACT[*]}

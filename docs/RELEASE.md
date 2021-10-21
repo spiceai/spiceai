@@ -32,30 +32,17 @@ Create an endgame issue with the following content:
 - [ ] For major releases, [blog.spiceai.org](https://blog.spiceai.org) announcement
 - [ ] For major releases, email announcement
 
-PR reference:
--
+## PR reference:
 ```
-
-## Post release
-
-- [ ] Update version to next-highest version with `-rc`
 
 ## Version update
 
-- Major and minor updates can drop the patch. I.e. `v0.3` not `v0.3.0`
-- Create a PR updating version.txt to remove the `-rc` flag.
-  - i.e. `0.1-alpha.4-rc` -> `0.1-alpha.4`
-- Ensure the release notes at `docs/release_notes/v{version}.md` already exists (or add to the version bump PR)
-- Merge the PR created in step 1. Verify the releases are created appropropriately with the right version tag.
-- Create a new PR updating version.txt to bump to the next version with the `-rc` flag.
-  - i.e. `0.1-alpha.4` -> `0.1-alpha.5-rc`
-- Merge that PR and verify the new RC release is created.
-
-## Components contrib version update
-
-- Tag the latest commit on https://github.com/spiceai/data-components-contrib with the same version as the main `spiceai` repo for this release
-- Create a PR in `spiceai` to update the version of `github.com/spiceai/data-components-contrib` to the latest version tag.
-  - To update, run `go get -u github.com/spiceai/data-components-contrib@<version tag>` and commit the `go.mod` and `go.sum` changes
+- Major and minor updates can drop the patch. i.e. `v0.3` not `v0.3.0`
+- Create a PR updating version.txt to the next planned version number.
+  - i.e. `0.2.1-alpha` -> `0.3-alpha`
+- Ensure the release notes at `docs/release_notes/v{version}.md` exist
+- Create a new pre-release [GitHub release](https://github.com/spiceai/spiceai/releases/new) with placeholder information. Create a tag that matches the version to be released. The details of the release will be filled in by the automation.
+  - Alternatively push a new tag via the git command line to the GitHub repository, and the release automation will be triggered.
 
 ## Acknowledgements update
 

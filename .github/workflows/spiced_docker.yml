@@ -58,7 +58,7 @@ jobs:
           context: .
           file: docker/Dockerfile
           platforms: ${{ matrix.target_os }}/${{ matrix.target_arch }}
-          push: ${{ github.event_name != 'pull_request' && (github.ref == 'refs/heads/trunk' || startsWith(github.ref, 'refs/heads/release-')) }}
+          push: ${{ github.event_name != 'pull_request' && startswith(github.ref, 'refs/tags/v') }}
           build-args: |
             REL_VERSION=${{ env.REL_VERSION }}
           tags: |
