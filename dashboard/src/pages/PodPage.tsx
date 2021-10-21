@@ -45,8 +45,12 @@ const PodPage: React.FunctionComponent<PodProps> = () => {
       cols.push(timeCol);
       const firstObservation = observations[0];
 
-      const measurementsKeys = Object.keys(firstObservation.measurements);
-      const categoriesKeys = Object.keys(firstObservation.categories);
+      const measurementsKeys = firstObservation.measurements
+        ? Object.keys(firstObservation.measurements)
+        : [];
+      const categoriesKeys = firstObservation.categories
+        ? Object.keys(firstObservation.categories)
+        : [];
       const colWidth =
         (gridWidth - timeCol.width - 17) / (measurementsKeys.length + categoriesKeys.length + 1);
 
@@ -79,9 +83,8 @@ const PodPage: React.FunctionComponent<PodProps> = () => {
           };
         }
 
-        const firstObservationMeasurementKeys = Object.keys(firstObservation.measurements);
-        if (col >= 1 && col <= firstObservationMeasurementKeys.length) {
-          const measurement = observation.measurements[firstObservationMeasurementKeys[col - 1]];
+        if (col >= 1 && col <= measurementsKeys.length) {
+          const measurement = observation.measurements[measurementsKeys[col - 1]];
           return {
             kind: GridCellKind.Number,
             data: measurement,
@@ -90,15 +93,12 @@ const PodPage: React.FunctionComponent<PodProps> = () => {
           };
         }
 
-        const firstObservationCategoriesKeys = Object.keys(firstObservation.categories);
         if (
-          col > firstObservationMeasurementKeys.length &&
-          col <= firstObservationMeasurementKeys.length + firstObservationCategoriesKeys.length
+          col > measurementsKeys.length &&
+          col <= measurementsKeys.length + categoriesKeys.length
         ) {
           const category =
-            observation.categories[
-              firstObservationCategoriesKeys[col - firstObservationMeasurementKeys.length - 1]
-            ];
+            observation.categories[categoriesKeys[col - measurementsKeys.length - 1]];
           return {
             kind: GridCellKind.Text,
             data: category,
@@ -107,10 +107,7 @@ const PodPage: React.FunctionComponent<PodProps> = () => {
           };
         }
 
-        if (
-          col ==
-          firstObservationMeasurementKeys.length + firstObservationCategoriesKeys.length + 1
-        ) {
+        if (col == measurementsKeys.length + categoriesKeys.length + 1) {
           const tags = observation.tags ? observation.tags.join(' ') : '';
           return {
             kind: GridCellKind.Text,
