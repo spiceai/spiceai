@@ -2,6 +2,8 @@ package http
 
 import (
 	"fmt"
+	"io/ioutil"
+	"log"
 	net_http "net/http"
 	"runtime"
 
@@ -15,6 +17,7 @@ var client *retryablehttp.Client
 func RetryableClient() *retryablehttp.Client {
 	if client == nil {
 		client = retryablehttp.NewClient()
+		client.Logger = log.New(ioutil.Discard, "", 0)
 	}
 	return client
 }
