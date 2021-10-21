@@ -151,7 +151,7 @@ func apiPostDataspaceHandler(ctx *fasthttp.RequestCtx) {
 func apiGetPodsHandler(ctx *fasthttp.RequestCtx) {
 	pods := pods.Pods()
 
-	data := make([]*runtime_pb.Pod, 0, len(pods))
+	data := make([]*api.Pod, 0, len(pods))
 
 	for _, f := range pods {
 		if f == nil {
