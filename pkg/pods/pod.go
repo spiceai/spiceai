@@ -138,7 +138,7 @@ func (pod *Pod) CachedCsv() string {
 
 		for _, globalMeasurementName := range measurementNames {
 			isLocal := false
-			for _, measurementName := range state.FieldNames() {
+			for _, measurementName := range state.MeasurementsNames() {
 				measurement := state.Path() + "." + measurementName
 				if globalMeasurementName == measurement {
 					validHeaders = append(validHeaders, measurementName)

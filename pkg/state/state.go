@@ -18,32 +18,31 @@ import (
 )
 
 type State struct {
-	Time               time.Time
-	TimeSentToAIEngine time.Time
-	path               string
-	fieldNames         []string
-	fields             []string
-	tags               []string
-	observations       []observations.Observation
-	observationsMutex  sync.RWMutex
+	Time                 time.Time
+	TimeSentToAIEngine   time.Time
+	path                 string
+	measurementsNames    []string
+	fqMeasurementsNames  []string
+	measurementsNamesMap map[string]string
+	tags                 []string
+	observations         []observations.Observation
+	observationsMutex    sync.RWMutex
 }
 
 type StateHandler func(state *State, metadata map[string]string) error
 
-func NewState(path string, fieldNames []string, tags []string, observations []observations.Observation) *State {
-	fields := make([]string, len(fieldNames))
-	for i, name := range fieldNames {
-		fields[i] = path + "." + name
-	}
+func NewState(path string, measurementsNames []string, tags []string, observations []observations.Observation) *State {
+	fqMeasurementsNames, measurementsNamesMap := getFieldNames(path, measurementsNames)
 
 	return &State{
-		Time:               time.Now(),
-		TimeSentToAIEngine: time.Time{},
-		path:               path,
-		fieldNames:         fieldNames,
-		fields:             fields,
-		tags:               tags,
-		observations:       observations,
+		Time:                 time.Now(),
+		TimeSentToAIEngine:   time.Time{},
+		path:                 path,
+		measurementsNames:    measurementsNames,
+		fqMeasurementsNames:  fqMeasurementsNames,
+		measurementsNamesMap: measurementsNamesMap,
+		tags:                 tags,
+		observations:         observations,
 	}
 }
 
@@ -191,12 +190,16 @@ func (s *State) Path() string {
 	return s.path
 }
 
-func (s *State) FieldNames() []string {
-	return s.fieldNames
+func (s *State) MeasurementsNames() []string {
+	return s.measurementsNames
 }
 
-func (s *State) Fields() []string {
-	return s.fields
+func (s *State) FqMeasurementsNames() []string {
+	return s.fqMeasurementsNames
+}
+
+func (s *State) MeasurementsNamesMap() map[string]string {
+	return s.measurementsNamesMap
 }
 
 func (s *State) Observations() []observations.Observation {
@@ -260,4 +263,18 @@ func getColumnMappings(headers []string) ([]string, []string, error) {
 	}
 
 	return columnToPath, columnToFieldName, nil
+}
+
+// Gets the list of fully-qualified field names, and a map of names to fq names
+func getFieldNames(path string, fieldNames []string) ([]string, map[string]string) {
+	fqNames := make([]string, len(fieldNames))
+	namesMap := make(map[string]string, len(fieldNames))
+
+	for i, name := range fieldNames {
+		fqName := path + "." + name
+		fqNames[i] = fqName
+		namesMap[name] = fqName
+	}
+
+	return fqNames, namesMap
 }
