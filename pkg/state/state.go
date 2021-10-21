@@ -198,6 +198,7 @@ func (s *State) FqMeasurementsNames() []string {
 	return s.fqMeasurementsNames
 }
 
+// Returns map of measurement names to fully-qualified meausurement names
 func (s *State) MeasurementsNamesMap() map[string]string {
 	return s.measurementsNamesMap
 }

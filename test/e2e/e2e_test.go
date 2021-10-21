@@ -164,7 +164,7 @@ func TestPods(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var pods []map[string]string
+	var pods []map[string]interface{}
 	err = json.Unmarshal([]byte(observation), &pods)
 	if err != nil {
 		t.Fatal(err)
@@ -173,10 +173,19 @@ func TestPods(t *testing.T) {
 	assert.Len(t, pods, 4)
 
 	sort.SliceStable(pods, func(i, j int) bool {
-		return strings.Compare(pods[i]["name"], pods[j]["name"]) == -1
+		return strings.Compare(pods[i]["name"].(string), pods[j]["name"].(string)) == -1
 	})
 
-	snapshotter.SnapshotT(t, pods[0]["name"], pods[1]["name"], pods[2]["name"], pods[3]["name"])
+	for _, pod := range pods {
+		pod["manifest_path"] = "fixed"
+	}
+
+	podsData, err := json.MarshalIndent(pods, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	snapshotter.SnapshotT(t, podsData)
 }
 
 func TestObservations(t *testing.T) {

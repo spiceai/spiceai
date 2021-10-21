@@ -27,16 +27,17 @@ import (
 
 type Pod struct {
 	spec.PodSpec
-	podParams        *PodParams
-	hash             string
-	manifestPath     string
-	dataSources      []*dataspace.Dataspace
-	measurements     map[string]*dataspace.Measurement
-	measurementNames []string
-	categoryPathMap  map[string][]*dataspace.Category
-	tagPathMap       map[string][]string
-	flights          map[string]*flights.Flight
-	viper            *viper.Viper
+	podParams          *PodParams
+	hash               string
+	manifestPath       string
+	dataSources        []*dataspace.Dataspace
+	measurements       map[string]*dataspace.Measurement
+	fqMeasurementNames []string
+	fqCategoryNames    []string
+	categoryPathMap    map[string][]*dataspace.Category
+	tagPathMap         map[string][]string
+	flights            map[string]*flights.Flight
+	viper              *viper.Viper
 
 	podLocalStateMutex    sync.RWMutex
 	podLocalState         []*state.State
@@ -136,18 +137,17 @@ func (pod *Pod) CachedCsv() string {
 	for _, state := range cachedState {
 		var validHeaders []string
 
-		for _, globalMeasurementName := range measurementNames {
+		for _, podFqMeasurementName := range measurementNames {
 			isLocal := false
-			for _, measurementName := range state.MeasurementsNames() {
-				measurement := state.Path() + "." + measurementName
-				if globalMeasurementName == measurement {
+			for measurementName, fqMeasurementName := range state.MeasurementsNamesMap() {
+				if podFqMeasurementName == fqMeasurementName {
 					validHeaders = append(validHeaders, measurementName)
 					isLocal = true
 					break
 				}
 			}
 			if !isLocal {
-				validHeaders = append(validHeaders, globalMeasurementName)
+				validHeaders = append(validHeaders, podFqMeasurementName)
 			}
 		}
 
@@ -298,8 +298,14 @@ func (pod *Pod) Measurements() map[string]*dataspace.Measurement {
 	return pod.measurements
 }
 
+// Returns the list of fully-qualified measurement names
 func (pod *Pod) MeasurementNames() []string {
-	return pod.measurementNames
+	return pod.fqMeasurementNames
+}
+
+// Returns the list of fully-qualified category names
+func (pod *Pod) CategoryNames() []string {
+	return pod.fqCategoryNames
 }
 
 func (pod *Pod) CategoryPathMap() map[string][]*dataspace.Category {
@@ -453,7 +459,9 @@ func loadPod(podPath string, hash string) (*Pod, error) {
 
 	pod.flights = make(map[string]*flights.Flight)
 
-	var measurementNames []string
+	var fqMeasurementNames []string
+	var fqCategoryNames []string
+
 	tagPathMap := make(map[string][]string)
 	measurements := make(map[string]*dataspace.Measurement)
 	categoryPathMap := make(map[string][]*dataspace.Category)
@@ -465,30 +473,33 @@ func loadPod(podPath string, hash string) (*Pod, error) {
 		}
 		pod.dataSources = append(pod.dataSources, ds)
 
-		for _, measurementName := range ds.MeasurementNameMap() {
-			measurementNames = append(measurementNames, measurementName)
-		}
-
-		if len(ds.Tags()) > 0 {
-			tagPathMap[ds.Path()] = append(tagPathMap[ds.Path()], ds.Tags()...)
+		dsTags := ds.Tags()
+		if len(dsTags) > 0 {
+			tagPathMap[ds.Path()] = append(tagPathMap[ds.Path()], dsTags...)
 			sort.Strings(tagPathMap[ds.Path()])
 		}
 
 		for fqMeasurementName, measurement := range ds.Measurements() {
+			fqMeasurementNames = append(fqMeasurementNames, fqMeasurementName)
 			measurements[fqMeasurementName] = measurement
 		}
 
 		dsCategories := make([]*dataspace.Category, 0, len(ds.Categories()))
-		for _, category := range ds.Categories() {
+		for fqCategoryName, category := range ds.Categories() {
+			fqCategoryNames = append(fqCategoryNames, fqCategoryName)
 			dsCategories = append(dsCategories, category)
 		}
 		categoryPathMap[ds.Path()] = dsCategories
 	}
 
-	sort.Strings(measurementNames)
-	pod.measurementNames = measurementNames
+	sort.Strings(fqMeasurementNames)
+	pod.fqMeasurementNames = fqMeasurementNames
 	pod.measurements = measurements
+
+	sort.Strings(fqCategoryNames)
+	pod.fqCategoryNames = fqCategoryNames
 	pod.categoryPathMap = categoryPathMap
+
 	pod.tagPathMap = tagPathMap
 
 	pod.interpretations = interpretations.NewInterpretationsStore(pod.Epoch(), pod.Period(), pod.Granularity())
