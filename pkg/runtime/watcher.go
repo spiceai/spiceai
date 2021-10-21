@@ -117,7 +117,8 @@ func startNewPodTraining(pod *pods.Pod) error {
 		return err
 	}
 
-	err = aiengine.StartTraining(pod)
+	// Pass empty algorithm string to use pod's default
+	err = aiengine.StartTraining(pod, "")
 	if err != nil {
 		return err
 	}
