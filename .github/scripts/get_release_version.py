@@ -4,7 +4,7 @@ gitRef = os.getenv("GITHUB_REF")
 
 with open(os.getenv("GITHUB_ENV"), "a") as githubEnv:
     with open("version.txt") as f:
-            version = f.read()
+        version = f.read()
     releaseVersion = version.strip()
     is_prerelease = True
 
