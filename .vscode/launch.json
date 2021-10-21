@@ -5,17 +5,6 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "Python: upload_release_asset.py",
-      "type": "python",
-      "request": "launch",
-      "program": "${workspaceFolder}/.github/scripts/upload_release_asset.py",
-      "console": "integratedTerminal",
-      "env": {
-        "GITHUB_TOKEN": "foo"
-      },
-      "args": ["upload", "--owner", "phillipleblanc", "--repo", "spiceai"]
-    },
-    {
       "name": "Launch Package",
       "type": "go",
       "request": "launch",
