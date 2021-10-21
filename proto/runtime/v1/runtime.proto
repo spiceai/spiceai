@@ -34,6 +34,8 @@ message Flight {
 message Pod {
   string name = 1;
   string manifest_path = 2;
+  repeated string measurements = 3;
+  repeated string categories = 4;
 }
 
 message TrainModel {

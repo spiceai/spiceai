@@ -298,6 +298,7 @@ func (pod *Pod) Measurements() map[string]*dataspace.Measurement {
 	return pod.measurements
 }
 
+// Returns the list of fully-qualified measurement names
 func (pod *Pod) MeasurementNames() []string {
 	return pod.measurementNames
 }
