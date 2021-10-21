@@ -558,7 +558,3 @@ func (pod *Pod) loadParams() error {
 func (pod *Pod) LearningAlgorithm() string {
 	return pod.podParams.LearningAlgorithm
 }
-
-func (pod *Pod) SetLearningAlgorithm(algorithm string) {
-	pod.podParams.LearningAlgorithm = algorithm
-}

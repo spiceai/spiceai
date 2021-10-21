@@ -88,6 +88,7 @@ spice train logpruner.yaml
 
 		trainRequest := &runtime_pb.TrainModel{
 			LearningAlgorithm: algorithmFlag,
+			NumberEpisodes:    numberEpisodesFlag,
 		}
 		trainRequestBytes, err := json.Marshal(&trainRequest)
 		if err != nil {
@@ -129,6 +130,7 @@ spice train logpruner.yaml
 
 func init() {
 	trainCmd.Flags().StringVar(&contextFlag, "context", "docker", "Runs Spice.ai in the given context, either 'docker' or 'metal'")
-	trainCmd.Flags().StringVar(&algorithmFlag, "learning-algorithm", "", "Train the pod with specified algorithm")
+	trainCmd.Flags().StringVar(&algorithmFlag, "learning-algorithm", "", "Train the pod with specified learning algorithm")
+	trainCmd.Flags().Int64Var(&numberEpisodesFlag, "number-episodes", -1, "Train the pod for the specified number of episodes")
 	RootCmd.AddCommand(trainCmd)
 }

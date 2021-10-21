@@ -201,8 +201,6 @@ func apiPodTrainHandler(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	// Retrieving body request to overload the pod
-	overloaded_pod := pod
 	var trainRequest runtime_pb.TrainModel
 	err := json.Unmarshal(ctx.Request.Body(), &trainRequest)
 	if err != nil {
@@ -210,11 +208,8 @@ func apiPodTrainHandler(ctx *fasthttp.RequestCtx) {
 		ctx.Response.SetBodyString(err.Error())
 		return
 	}
-	if trainRequest.LearningAlgorithm != "" {
-		overloaded_pod.SetLearningAlgorithm(trainRequest.LearningAlgorithm)
-	}
 
-	err = aiengine.StartTraining(overloaded_pod)
+	err = aiengine.StartTraining(pod, trainRequest.LearningAlgorithm, trainRequest.NumberEpisodes)
 	if err != nil {
 		ctx.Response.SetStatusCode(500)
 		ctx.Response.SetBodyString(err.Error())
