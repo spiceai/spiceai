@@ -12,7 +12,7 @@ import (
 	"github.com/spiceai/spiceai/pkg/proto/aiengine_pb"
 )
 
-func StartTraining(pod *pods.Pod, algorithm string) error {
+func StartTraining(pod *pods.Pod, algorithm string, number_episodes int64) error {
 	flightId := fmt.Sprintf("%d", len(*pod.Flights())+1)
 
 	flight := flights.NewFlight(flightId, int(pod.Episodes()))
@@ -31,9 +31,12 @@ func StartTraining(pod *pods.Pod, algorithm string) error {
 		TrainingGoal:      pod.PodSpec.Training.Goal,
 		LearningAlgorithm: pod.LearningAlgorithm(),
 	}
-	// Overload pod's learning algorithm if needed
+	// Overload pod's parameters
 	if algorithm != "" {
 		trainRequest.LearningAlgorithm = algorithm
+	}
+	if number_episodes > 0 {
+		trainRequest.NumberEpisodes = number_episodes
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)

@@ -209,7 +209,7 @@ func apiPodTrainHandler(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	err = aiengine.StartTraining(pod, trainRequest.LearningAlgorithm)
+	err = aiengine.StartTraining(pod, trainRequest.LearningAlgorithm, trainRequest.NumberEpisodes)
 	if err != nil {
 		ctx.Response.SetStatusCode(500)
 		ctx.Response.SetBodyString(err.Error())
