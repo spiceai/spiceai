@@ -183,10 +183,7 @@ func (ds *Dataspace) categorySelectorMap() map[string]string {
 
 // Returns the local tag name (not fully-qualified)
 func (ds *Dataspace) Tags() []string {
-	var tags []string
-	tags = append(tags, ds.DataspaceSpec.Tags...)
-
-	return tags
+	return ds.DataspaceSpec.Tags
 }
 
 func (ds *Dataspace) ActionNames() map[string]string {

@@ -10,5 +10,6 @@ func NewPod(f *pods.Pod) *runtime_pb.Pod {
 		Name:         f.Name,
 		ManifestPath: f.ManifestPath(),
 		Measurements: f.MeasurementNames(),
+		Categories:   f.CategoryNames(),
 	}
 }
