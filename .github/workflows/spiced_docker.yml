@@ -26,7 +26,7 @@ jobs:
     steps:
       - uses: actions/checkout@v2
 
-      - name: Set REL_VERSION from tag
+      - name: Set REL_VERSION from version.txt
         run: python ./.github/scripts/get_release_version.py
 
       - name: Set up Docker Buildx
@@ -58,7 +58,7 @@ jobs:
           context: .
           file: docker/Dockerfile
           platforms: ${{ matrix.target_os }}/${{ matrix.target_arch }}
-          push: ${{ github.event_name != 'pull_request' && startswith(github.ref, 'refs/tags/v') && (github.ref == 'refs/heads/trunk' || startsWith(github.ref, 'refs/heads/release-')) }}
+          push: ${{ github.event_name != 'pull_request' && startswith(github.ref, 'refs/tags/v') }}
           build-args: |
             REL_VERSION=${{ env.REL_VERSION }}
           tags: |
