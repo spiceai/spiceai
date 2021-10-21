@@ -1,7 +1,5 @@
 import os
 
-gitRef = os.getenv("GITHUB_REF")
-
 with open(os.getenv("GITHUB_ENV"), "a") as githubEnv:
     with open("version.txt") as f:
         version = f.read()
