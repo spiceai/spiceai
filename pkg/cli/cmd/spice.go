@@ -11,8 +11,8 @@ import (
 )
 
 var (
-	contextFlag   string
-	algorithmFlag string
+	contextFlag        string
+	algorithmFlag      string
 	numberEpisodesFlag int64
 )
 

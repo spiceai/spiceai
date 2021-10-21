@@ -88,7 +88,7 @@ spice train logpruner.yaml
 
 		trainRequest := &runtime_pb.TrainModel{
 			LearningAlgorithm: algorithmFlag,
-			NumberEpisodes: numberEpisodesFlag,
+			NumberEpisodes:    numberEpisodesFlag,
 		}
 		trainRequestBytes, err := json.Marshal(&trainRequest)
 		if err != nil {
