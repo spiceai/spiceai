@@ -71,9 +71,8 @@ func apiGetObservationsHandler(ctx *fasthttp.RequestCtx) {
 	if string(ctx.Request.Header.Peek("Accept")) == "application/json" {
 		observations := []*common_pb.Observation{}
 		for _, state := range pod.CachedState() {
-			for _, o := range state.Observations() {
-				observations = append(observations, api.NewObservation(&o))
-			}
+			obs := api.NewObservationsFromState(state)
+			observations = append(observations, obs...)
 		}
 		ctx.Response.Header.Add("Content-Type", "application/json")
 		data, err := json.Marshal(observations)

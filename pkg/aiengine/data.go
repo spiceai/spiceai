@@ -72,7 +72,7 @@ func getAddDataRequest(pod *pods.Pod, s *state.State) *aiengine_pb.AddDataReques
 
 	csv := strings.Builder{}
 	csv.WriteString("time")
-	for _, field := range s.Fields() {
+	for _, field := range s.FqMeasurementsNames() {
 		if _, ok := categories[field]; ok {
 			// Don't write the comma for a category, we will handle it below
 			continue
@@ -103,7 +103,7 @@ func getAddDataRequest(pod *pods.Pod, s *state.State) *aiengine_pb.AddDataReques
 		return nil
 	}
 
-	csvPreview := getData(&csv, pod.Epoch(), s.FieldNames(), tagPathMap[s.Path()], categoryPathMap[s.Path()], observationData, 5)
+	csvPreview := getData(&csv, pod.Epoch(), s.MeasurementsNames(), tagPathMap[s.Path()], categoryPathMap[s.Path()], observationData, 5)
 
 	zaplog.Sugar().Debugf("Posting data to AI engine:\n%s", aurora.BrightYellow(fmt.Sprintf("%s%s...\n%d observations posted", csv.String(), csvPreview, len(observationData))))
 
