@@ -280,17 +280,14 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
         with open(import_path / "meta.json", "r", encoding="utf-8") as meta_file:
             algorithm = json.loads(meta_file.read())["algorithm"]
 
-        agent: SpiceAIAgent = get_agent(
-            algorithm, model_data_shape, len(data_manager.action_names)
-        )
+        agent: SpiceAIAgent = get_agent(algorithm, model_data_shape, len(data_manager.action_names))
         if not agent.load(import_path):
             return aiengine_pb2.Response(
                 result="unable_to_load_model",
                 message=f"Unable to find a model at {import_path}",
-                error=True,
-            )
+                error=True)
 
-        Trainer.SAVED_MODELS[request.pod] = request.import_path
+        Trainer.SAVED_MODELS[request.pod] = Path(request.import_path)
 
         return aiengine_pb2.Response(result="ok")
 
