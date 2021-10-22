@@ -1,20 +1,20 @@
-from datetime import datetime
 import unittest
+
 import main
 from proto.aiengine.v1 import aiengine_pb2
-from tests import common
+from tests.common import get_init_from_json
 
 
 class MainTestCase(unittest.TestCase):
     def setUp(self):
         self.aiengine = main.AIEngine()
 
-        self.trader_init_req = common.get_init_from_json(
+        self.trader_init_req = get_init_from_json(
             init_data_path="../../test/assets/aiengine/api/trader_init.json",
             pod_name="trader",
         )
 
-        with open("../../test/assets/data/csv/trader.csv", "r") as trader_data:
+        with open("../../test/assets/data/csv/trader.csv", "r", encoding="utf8") as trader_data:
             self.trader_data_csv = trader_data.read()
 
     def test_inference_not_initialized(self):

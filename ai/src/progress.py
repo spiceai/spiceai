@@ -1,7 +1,9 @@
 import math
 import datetime
-import humanize
 import os
+
+import humanize
+
 from utils import print_event
 from metrics import metrics
 
@@ -35,7 +37,7 @@ class ProgressBar:
 
         if self.show_metrics:
             print_event(self.pod_name, "")
-            print_event(self.pod_name, f"\tDebug Metrics")
+            print_event(self.pod_name, "\tDebug Metrics")
             for metric_name in metrics.get_all_metric_names():
                 total_seconds = metrics.get_metric(metric_name).total_seconds()
                 metric_value = humanize.precisedelta(

@@ -16,45 +16,37 @@ from algorithms.agent_interface import SpiceAIAgent
 from cleanup import cleanup_on_shutdown
 from connector.manager import ConnectorManager, ConnectorName
 from connector.stateful import StatefulConnector
-from data import DataManager
+from data import DataParam, DataManager
 from exception import InvalidDataShapeException
 from proto.aiengine.v1 import aiengine_pb2, aiengine_pb2_grpc
-from train import train_agent, training_lock, saved_models
+from train import Trainer
 from validation import validate_rewards
 
-data_managers: "dict[DataManager]" = {}
-connector_managers: "dict[ConnectorManager]" = {}
+data_managers: Dict[str, DataManager] = {}
+connector_managers: Dict[str, ConnectorManager] = {}
 
-training_thread = None
-init_lock = threading.Lock()
+
+class Dispatch:
+    TRAINING_THREAD = None
+    INIT_LOCK = threading.Lock()
+
+
+def train_agent(
+        pod_name: str, data_manager: DataManager, connector_manager: ConnectorManager, algorithm: str,
+        number_episodes: int, flight: str, training_goal: str):
+    Trainer(pod_name, data_manager, connector_manager, algorithm, number_episodes, flight, training_goal).train()
 
 
 def dispatch_train_agent(
-    pod_name: str,
-    data_manager: DataManager,
-    connector_manager: ConnectorManager,
-    algorithm: str,
-    number_episodes: int,
-    flight: str,
-    training_goal: str,
-):
-    if training_lock.locked():
+        pod_name: str, data_manager: DataManager, connector_manager: ConnectorManager, algorithm: str,
+        number_episodes: int, flight: str, training_goal: str):
+    if Trainer.TRAINING_LOCK.locked():
         return False
 
-    global training_thread
-    training_thread = threading.Thread(
+    Dispatch.TRAINING_THREAD = threading.Thread(
         target=train_agent,
-        args=(
-            pod_name,
-            data_manager,
-            connector_manager,
-            algorithm,
-            number_episodes,
-            flight,
-            training_goal,
-        ),
-    )
-    training_thread.start()
+        args=(pod_name, data_manager, connector_manager, algorithm, number_episodes, flight, training_goal))
+    Dispatch.TRAINING_THREAD.start()
     return True
 
 
@@ -63,7 +55,7 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
         return aiengine_pb2.Response(result="ok")
 
     def AddData(self, request: aiengine_pb2.AddDataRequest, context):
-        with init_lock:
+        with Dispatch.INIT_LOCK:
             new_data: pd.DataFrame = pd.read_csv(StringIO(request.csv_data))
             new_data["time"] = pd.to_datetime(new_data["time"], unit="s")
             new_data = new_data.set_index("time")
@@ -80,109 +72,82 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
             data_manager.merge_data(new_data)
             return aiengine_pb2.Response(result="ok")
 
-    def AddInterpretations(
-        self, request: aiengine_pb2.AddInterpretationsRequest, context
-    ):
-        data_manager: DataManager = data_managers[request.pod]
+    def AddInterpretations(self, request: aiengine_pb2.AddInterpretationsRequest, context):
+        data_manager = data_managers[request.pod]
         data_manager.add_interpretations(request.indexed_interpretations)
         return aiengine_pb2.Response(result="ok")
 
     def StartTraining(self, request: aiengine_pb2.StartTrainingRequest, context):
-        data_manager: DataManager = data_managers[request.pod]
+        data_manager = data_managers[request.pod]
         connector_manager: ConnectorManager = connector_managers[request.pod]
 
         if request.epoch_time != 0:
             new_epoch_time = pd.to_datetime(request.epoch_time, unit="s")
-            if new_epoch_time < data_manager.epoch_time:
+            if new_epoch_time < data_manager.param.epoch_time:
                 return aiengine_pb2.Response(
                     result="epoch_time_invalid",
-                    message=f"epoch time should be after {data_manager.epoch_time.timestamp()}",
+                    message=f"epoch time should be after {data_manager.param.epoch_time.timestamp()}",
                     error=True,
                 )
-            data_manager.epoch_time = new_epoch_time
-            data_manager.end_time = data_manager.epoch_time + data_manager.period_secs
+            data_manager.param.epoch_time = new_epoch_time
+            data_manager.param.end_time = data_manager.param.epoch_time + data_manager.param.period_secs
 
         algorithm = request.learning_algorithm
-        number_episodes = (
-            request.number_episodes if request.number_episodes != 0 else 30
-        )
+        number_episodes = request.number_episodes if request.number_episodes != 0 else 30
         flight = request.flight
         training_goal = request.training_goal
 
         index_of_epoch = data_manager.massive_table_filled.index.get_loc(
-            data_manager.epoch_time, "ffill"
+            data_manager.param.epoch_time, "ffill"
         )
 
-        if (
-            len(data_manager.massive_table_filled.iloc[index_of_epoch:])
-            < data_manager.get_window_span()
-        ):
+        if len(data_manager.massive_table_filled.iloc[index_of_epoch:]) < data_manager.get_window_span():
             return aiengine_pb2.Response(
                 result="not_enough_data_for_training",
                 error=True,
             )
 
         started = dispatch_train_agent(
-            request.pod,
-            data_manager,
-            connector_manager,
-            algorithm,
-            number_episodes,
-            flight,
-            training_goal,
-        )
+            request.pod, data_manager, connector_manager, algorithm, number_episodes, flight, training_goal)
         result = "started_training" if started else "already_training"
         return aiengine_pb2.Response(result=result)
 
     def GetInference(self, request: aiengine_pb2.InferenceRequest, context):
         try:
             model_exists = False
-            if request.pod in saved_models:
+            if request.pod in Trainer.SAVED_MODELS:
                 model_exists = True
 
             if request.pod not in data_managers:
                 return aiengine_pb2.InferenceResult(
-                    response=aiengine_pb2.Response(
-                        result="pod_not_initialized", error=True
-                    )
-                )
+                    response=aiengine_pb2.Response(result="pod_not_initialized", error=True))
 
             if request.tag != "latest":
                 return aiengine_pb2.InferenceResult(
                     response=aiengine_pb2.Response(
-                        result="tag_not_yet_supported",
-                        message="Support for multiple tags coming soon!",
-                        error=True,
-                    )
-                )
+                        result="tag_not_yet_supported", message="Support for multiple tags coming soon!", error=True))
 
             # Ideally we could just re-use the in-memory agent we created during training,
             # but tensorflow has issues with multi-threading in python, so we are just loading it from the file system
             data_manager = data_managers[request.pod]
             model_data_shape = data_manager.get_shape()
             if model_exists:
-                save_path = saved_models[request.pod]
+                save_path = Trainer.SAVED_MODELS[request.pod]
                 with open(save_path / "meta.json", "r", encoding="utf-8") as meta_file:
                     save_info = json.loads(meta_file.read())
                 algorithm = save_info["algorithm"]
             else:
                 algorithm = "dql"
 
-            agent: SpiceAIAgent = get_agent(
-                algorithm, model_data_shape, len(data_manager.action_names)
-            )
+            agent: SpiceAIAgent = get_agent(algorithm, model_data_shape, len(data_manager.action_names))
             if model_exists:
                 agent.load(Path(save_path))
 
-            data_manager: DataManager = data_managers[request.pod]
+            data_manager = data_managers[request.pod]
 
-            if (
-                data_manager.massive_table_filled.shape[0]
-                < data_manager.get_window_span()
-            ):
+            if data_manager.massive_table_filled.shape[0] < data_manager.get_window_span():
                 return aiengine_pb2.InferenceResult(
-                    response=aiengine_pb2.Response(result="not_enough_data", error=True)
-                )
+                    response=aiengine_pb2.Response(result="not_enough_data", error=True))
 
             latest_window = data_manager.get_latest_window()
             state = data_manager.flatten_and_normalize_window(latest_window)
@@ -192,7 +157,7 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
             result = ex.type
             message = ex.message
 
-            if training_lock.locked():
+            if Trainer.TRAINING_LOCK.locked():
                 result = "training_not_complete"
                 message = (
                     "Please wait to get a recommendation until after training completes"
@@ -210,7 +175,7 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
         action_name = data_manager.action_names[action_from_model]
 
         end_time = data_manager.massive_table_filled.last_valid_index()
-        start_time = end_time - data_manager.interval_secs
+        start_time = end_time - data_manager.param.interval_secs
 
         result = aiengine_pb2.InferenceResult()
         result.start = int(start_time.timestamp())
@@ -223,8 +188,7 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
         return result
 
     def Init(self, request: aiengine_pb2.InitRequest, context):
-        with init_lock:
-            data_manager = DataManager()
+        with Dispatch.INIT_LOCK:
             connector_manager = ConnectorManager()
 
             period_secs = pd.to_timedelta(request.period, unit="s")
@@ -246,11 +210,12 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
             if len(request.fields) == 0:
                 return aiengine_pb2.Response(result="missing_fields", error=True)
 
-            data_manager.init(
-                epoch_time=epoch_time,
-                period_secs=period_secs,
-                interval_secs=interval_secs,
-                granularity_secs=granularity_secs,
+            data_manager = DataManager(
+                param=DataParam(
+                    epoch_time=epoch_time,
+                    period_secs=period_secs,
+                    interval_secs=interval_secs,
+                    granularity_secs=granularity_secs),
                 fields=request.fields,
                 action_rewards=action_rewards,
                 actions_order=request.actions_order,
@@ -276,33 +241,27 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
             return aiengine_pb2.Response(result="ok")
 
     def ExportModel(self, request: aiengine_pb2.ExportModelRequest, context):
-        if request.pod not in saved_models:
+        if request.pod not in Trainer.SAVED_MODELS:
             return aiengine_pb2.ExportModelResult(
                 response=aiengine_pb2.Response(
                     result="pod_not_trained",
                     message="Unable to export a model that hasn't finished at least one training run",
-                    error=True,
-                )
-            )
+                    error=True))
 
         if request.pod not in data_managers:
             return aiengine_pb2.ExportModelResult(
-                resopnse=aiengine_pb2.Response(result="pod_not_initialized", error=True)
-            )
+                resopnse=aiengine_pb2.Response(result="pod_not_initialized", error=True))
 
         if request.tag != "latest":
             return aiengine_pb2.ExportModelResult(
                 response=aiengine_pb2.Response(
                     result="tag_not_yet_supported",
                     message="Support for multiple tags coming soon!",
-                    error=True,
-                )
-            )
+                    error=True))
 
         return aiengine_pb2.ExportModelResult(
             response=aiengine_pb2.Response(result="ok"),
-            model_path=str(saved_models[request.pod]),
-        )
+            model_path=str(Trainer.SAVED_MODELS[request.pod]))
 
     def ImportModel(self, request: aiengine_pb2.ImportModelRequest, context):
         if request.pod not in data_managers:
@@ -321,17 +280,14 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
         with open(import_path / "meta.json", "r", encoding="utf-8") as meta_file:
             algorithm = json.loads(meta_file.read())["algorithm"]
 
-        agent: SpiceAIAgent = get_agent(
-            algorithm, model_data_shape, len(data_manager.action_names)
-        )
+        agent: SpiceAIAgent = get_agent(algorithm, model_data_shape, len(data_manager.action_names))
         if not agent.load(import_path):
             return aiengine_pb2.Response(
                 result="unable_to_load_model",
                 message=f"Unable to find a model at {import_path}",
-                error=True,
-            )
+                error=True)
 
-        saved_models[request.pod] = Path(request.import_path)
+        Trainer.SAVED_MODELS[request.pod] = Path(request.import_path)
 
         return aiengine_pb2.Response(result="ok")
 
