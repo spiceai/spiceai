@@ -32,19 +32,19 @@ spice export trader -o ./models
 
 		directory, filename, err := getValidExportPath(podName, exportOutput)
 		if err != nil {
-			fmt.Println(err.Error())
+			cmd.Println(err.Error())
 			return
 		}
 
 		runtimeClient, err := runtime.NewRuntimeClient(podName)
 		if err != nil {
-			fmt.Println(err.Error())
+			cmd.Println(err.Error())
 			return
 		}
 
 		err = runtimeClient.ExportModel(podName, directory, filename, exportTag)
 		if err != nil {
-			fmt.Println(err.Error())
+			cmd.Println(err.Error())
 			return
 		}
 	},

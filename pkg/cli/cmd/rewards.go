@@ -29,7 +29,7 @@ spice reward add
 	Run: func(cmd *cobra.Command, args []string) {
 		manifests := pods.FindAllManifestPaths()
 		if len(manifests) == 0 {
-			fmt.Println("No pods detected!")
+			cmd.Println("No pods detected!")
 			return
 		}
 
@@ -37,7 +37,7 @@ spice reward add
 
 		pod, err := pods.LoadPodFromManifest(podPath)
 		if err != nil {
-			fmt.Println(fmt.Errorf("error loading Pod %s: %w", podPath, err))
+			cmd.Println(fmt.Errorf("error loading Pod %s: %w", podPath, err))
 			return
 		}
 
@@ -47,17 +47,17 @@ spice reward add
 			switch rewardsType {
 			case "string":
 				if pod.Training.Rewards.(string) != "uniform" {
-					fmt.Println("Rewards section malformed!  'rewards' must be either 'uniform' or an array of rewards.")
+					cmd.Println("Rewards section malformed!  'rewards' must be either 'uniform' or an array of rewards.")
 					return
 				}
 			case "[]interface {}":
 				var rewards []spec.RewardSpec
 				err := viper.UnmarshalKey("training.rewards", &rewards)
 				if err != nil {
-					fmt.Println("Rewards section malformed!  'rewards' must be either 'uniform' or an array of rewards.")
+					cmd.Println("Rewards section malformed!  'rewards' must be either 'uniform' or an array of rewards.")
 					return
 				} else if len(rewards) > 0 {
-					fmt.Println("Pod already has rewards defined!")
+					cmd.Println("Pod already has rewards defined!")
 					return
 				}
 			}
@@ -66,7 +66,7 @@ spice reward add
 		actions := pod.Actions()
 
 		if len(actions) == 0 {
-			fmt.Printf("No actions to add rewards to found in Pod %s\n", pod.Name)
+			cmd.Printf("No actions to add rewards to found in Pod %s\n", pod.Name)
 			return
 		}
 
@@ -84,13 +84,13 @@ spice reward add
 
 		marshalledPod, err := yaml.Marshal(pod.PodSpec)
 		if err != nil {
-			fmt.Println(fmt.Errorf(err.Error()))
+			cmd.Println(fmt.Errorf(err.Error()))
 			return
 		}
 
 		err = util.WriteToExistingFile(podPath, marshalledPod)
 		if err != nil {
-			fmt.Println(fmt.Errorf(err.Error()))
+			cmd.Println(fmt.Errorf(err.Error()))
 			return
 		}
 

@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"fmt"
 	"os"
 
 	"github.com/spf13/cobra"
@@ -19,7 +18,7 @@ spice run
 	Run: func(cmd *cobra.Command, args []string) {
 		err := runtime.Run(contextFlag, "")
 		if err != nil {
-			fmt.Println(err.Error())
+			cmd.Println(err.Error())
 			os.Exit(1)
 		}
 	},

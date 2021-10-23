@@ -39,14 +39,14 @@ spice train logpruner.yaml
 		} else {
 			err := runtime.Run(contextFlag, podPath)
 			if err != nil {
-				fmt.Println(err.Error())
+				cmd.Println(err.Error())
 				os.Exit(1)
 			}
 			return
 		}
 
 		if len(manifests) == 0 || podName == "" || podPath == "" {
-			fmt.Println("pod not found")
+			cmd.Println("pod not found")
 			return
 		}
 
@@ -54,7 +54,7 @@ spice train logpruner.yaml
 		for _, podPath := range manifests {
 			pod, err := pods.LoadPodFromManifest(podPath)
 			if err != nil {
-				fmt.Println(err.Error())
+				cmd.Println(err.Error())
 				return
 			}
 
@@ -64,7 +64,7 @@ spice train logpruner.yaml
 		}
 
 		if selectedPod == nil {
-			fmt.Printf("the pod '%s' does not exist\n", podNameOrPath)
+			cmd.Printf("the pod '%s' does not exist\n", podNameOrPath)
 			return
 		}
 
@@ -72,7 +72,7 @@ spice train logpruner.yaml
 		appDir := context.CurrentContext().AppDir()
 		runtimeConfig, err := config.LoadRuntimeConfiguration(v, appDir)
 		if err != nil {
-			fmt.Println("failed to load runtime configuration")
+			cmd.Println("failed to load runtime configuration")
 			return
 		}
 
@@ -80,7 +80,7 @@ spice train logpruner.yaml
 
 		err = util.IsRuntimeServerHealthy(serverBaseUrl, http.DefaultClient)
 		if err != nil {
-			fmt.Printf("failed to reach %s. is the spice runtime running?\n", serverBaseUrl)
+			cmd.Printf("failed to reach %s. is the spice runtime running?\n", serverBaseUrl)
 			return
 		}
 
@@ -97,13 +97,13 @@ spice train logpruner.yaml
 
 		response, err := http.DefaultClient.Post(trainUrl, "application/json", bytes.NewReader(trainRequestBytes))
 		if err != nil {
-			fmt.Printf("failed to start training: %s\n", err.Error())
+			cmd.Printf("failed to start training: %s\n", err.Error())
 			return
 		}
 
 		if response.StatusCode != 200 {
 			if response.StatusCode == 404 {
-				fmt.Printf("Failed to start training. The pod '%s' cannot be found. Has it been added?", podNameOrPath)
+				cmd.Printf("Failed to start training. The pod '%s' cannot be found. Has it been added?", podNameOrPath)
 				return
 			}
 
@@ -111,20 +111,20 @@ spice train logpruner.yaml
 			defer response.Body.Close()
 
 			if err != nil {
-				fmt.Printf("failed to start training: %s\n", err.Error())
+				cmd.Printf("failed to start training: %s\n", err.Error())
 				return
 			}
 
 			if len(body) > 0 {
-				fmt.Printf("failed to start training: %s\n", body)
+				cmd.Printf("failed to start training: %s\n", body)
 			} else {
-				fmt.Printf("failed to start training: %s\n", response.Status)
+				cmd.Printf("failed to start training: %s\n", response.Status)
 			}
 
 			return
 		}
 
-		fmt.Println(aurora.Green("training started!"))
+		cmd.Println(aurora.Green("training started!"))
 	},
 }
 

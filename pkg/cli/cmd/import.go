@@ -1,8 +1,6 @@
 package cmd
 
 import (
-	"fmt"
-
 	"github.com/logrusorgru/aurora"
 	"github.com/spf13/cobra"
 	"github.com/spiceai/spiceai/pkg/cli/runtime"
@@ -29,13 +27,13 @@ spice import --tag latest ./models/trader.spicepod
 
 		err := validateExtension(archivePath)
 		if err != nil {
-			fmt.Println(err.Error())
+			cmd.Println(err.Error())
 			return
 		}
 
 		relativePath, err := getRelativePathFromCurrentDirectory(archivePath)
 		if err != nil {
-			fmt.Println(err.Error())
+			cmd.Println(err.Error())
 			return
 		}
 
@@ -49,28 +47,28 @@ spice import --tag latest ./models/trader.spicepod
 			return nil
 		})
 		if err != nil {
-			fmt.Println(err.Error())
+			cmd.Println(err.Error())
 			return
 		}
 
 		if init == nil {
-			fmt.Println("Invalid spicepod: " + archivePath)
+			cmd.Println("Invalid spicepod: " + archivePath)
 			return
 		}
 
 		runtimeClient, err := runtime.NewRuntimeClient(init.Pod)
 		if err != nil {
-			fmt.Println(err.Error())
+			cmd.Println(err.Error())
 			return
 		}
 
 		err = runtimeClient.ImportModel(init.Pod, relativePath, importTag)
 		if err != nil {
-			fmt.Println(err.Error())
+			cmd.Println(err.Error())
 			return
 		}
 
-		fmt.Println(aurora.Green("Imported trained model!"))
+		cmd.Println(aurora.Green("Imported trained model!"))
 	},
 }
 
