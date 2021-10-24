@@ -504,6 +504,8 @@ func loadPod(podPath string, hash string) (*Pod, error) {
 		categoryPathMap[ds.Path()] = dsCategories
 	}
 
+	pod.dataspaceMap = dataspaceMap
+
 	sort.Strings(fqMeasurementNames)
 	pod.fqMeasurementNames = fqMeasurementNames
 	pod.measurements = measurements
