@@ -30,8 +30,8 @@ type Pod struct {
 	podParams          *PodParams
 	hash               string
 	manifestPath       string
-	dataspaces        []*dataspace.Dataspace
-	dataspaceMap	  map[string]*dataspace.Dataspace
+	dataspaces         []*dataspace.Dataspace
+	dataspaceMap       map[string]*dataspace.Dataspace
 	measurements       map[string]*dataspace.Measurement
 	fqMeasurementNames []string
 	fqCategoryNames    []string
