@@ -31,7 +31,7 @@ spice init trader
 		appRelativeManifestPath := rtcontext.GetSpiceAppRelativePath(podManifestPath)
 
 		if _, err := os.Stat(podManifestPath); !os.IsNotExist(err) {
-			fmt.Printf("Pod manifest already exists at %s. Replace (y/n)? \n", appRelativeManifestPath)
+			cmd.Printf("Pod manifest already exists at %s. Replace (y/n)? \n", appRelativeManifestPath)
 			var confirm string
 			fmt.Scanf("%s", &confirm)
 			if strings.ToLower(strings.TrimSpace(confirm)) != "y" {
@@ -52,7 +52,7 @@ spice init trader
 
 		skeletonPodContentBytes, err := yaml.Marshal(skeletonPod)
 		if err != nil {
-			fmt.Println(err)
+			cmd.Println(err)
 			return
 		}
 
@@ -67,17 +67,17 @@ spice init trader
 
 		err = os.MkdirAll(podsPath, 0766)
 		if err != nil {
-			fmt.Println(err)
+			cmd.Println(err)
 			return
 		}
 
 		err = os.WriteFile(podManifestPath, []byte(skeletonPodContent), 0766)
 		if err != nil {
-			fmt.Println(err)
+			cmd.Println(err)
 			return
 		}
 
-		fmt.Printf("Spice pod manifest initialized at %s!\n", appRelativeManifestPath)
+		cmd.Printf("Spice pod manifest initialized at %s!\n", appRelativeManifestPath)
 	},
 }
 

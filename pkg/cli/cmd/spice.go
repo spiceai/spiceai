@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"fmt"
 	"os"
 	"strings"
 
@@ -28,12 +27,12 @@ func Execute() {
 	// All CLI commands run in the "metal" context
 	err := context.SetDefaultContext()
 	if err != nil {
-		fmt.Println(err.Error())
+		RootCmd.Println(err.Error())
 		os.Exit(1)
 	}
 
 	if err := RootCmd.Execute(); err != nil {
-		fmt.Println(err)
+		RootCmd.Println(err)
 		os.Exit(-1)
 	}
 }

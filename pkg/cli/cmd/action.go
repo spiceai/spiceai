@@ -33,7 +33,7 @@ spice action add jump
 
 		manifests := pods.FindAllManifestPaths()
 		if len(manifests) == 0 {
-			fmt.Println("No pods detected!")
+			cmd.Println("No pods detected!")
 			return
 		}
 
@@ -41,14 +41,14 @@ spice action add jump
 
 		pod, err := pods.LoadPodFromManifest(podPath)
 		if err != nil {
-			fmt.Println(err.Error())
+			cmd.Println(err.Error())
 			return
 		}
 
 		actions := pod.Actions()
 
 		if _, ok := actions[cmdActionName]; ok {
-			fmt.Printf("Action %s already exists in %s. Overwrite? (y/n)\n", cmdActionName, pod.Name)
+			cmd.Printf("Action %s already exists in %s. Overwrite? (y/n)\n", cmdActionName, pod.Name)
 			var confirm string
 			fmt.Scanf("%s", &confirm)
 			if strings.ToLower(strings.TrimSpace(confirm)) != "y" {
@@ -60,17 +60,17 @@ spice action add jump
 
 		marshalledPod, err := yaml.Marshal(pod.PodSpec)
 		if err != nil {
-			fmt.Println(err.Error())
+			cmd.Println(err.Error())
 			return
 		}
 
 		err = util.WriteToExistingFile(podPath, marshalledPod)
 		if err != nil {
-			fmt.Println(err.Error())
+			cmd.Println(err.Error())
 			return
 		}
 
-		fmt.Printf("Action '%s' added to pod %s.\n", cmdActionName, pod.Name)
+		cmd.Printf("Action '%s' added to pod %s.\n", cmdActionName, pod.Name)
 	},
 }
 

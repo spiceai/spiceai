@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"fmt"
 	"os"
 
 	"github.com/spf13/cobra"
@@ -16,20 +15,20 @@ var versionCmd = &cobra.Command{
 spice version
 `,
 	Run: func(cmd *cobra.Command, args []string) {
-		fmt.Printf("CLI version:     %s\n", version.Version())
+		cmd.Printf("CLI version:     %s\n", version.Version())
 
 		var rtversion string
 		var err error
 
 		rtcontext, err := context.NewContext(contextFlag)
 		if err != nil {
-			fmt.Println(err.Error())
+			cmd.Println(err.Error())
 			os.Exit(1)
 		}
 
 		err = rtcontext.Init(true)
 		if err != nil {
-			fmt.Println(err.Error())
+			cmd.Println(err.Error())
 			os.Exit(1)
 		}
 
@@ -38,12 +37,12 @@ spice version
 		} else {
 			rtversion, err = rtcontext.Version()
 			if err != nil {
-				fmt.Printf("error getting runtime version: %s\n", err)
+				cmd.Printf("error getting runtime version: %s\n", err)
 				os.Exit(1)
 			}
 		}
 
-		fmt.Printf("Runtime version: %s\n", rtversion)
+		cmd.Printf("Runtime version: %s\n", rtversion)
 	},
 }
 
