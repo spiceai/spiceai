@@ -65,7 +65,7 @@ func getPodInitForTraining(pod *pods.Pod) *aiengine_pb.InitRequest {
 	var laws []string
 
 	var dsInitSpecs []*aiengine_pb.DataSource
-	for _, ds := range pod.DataSpaces() {
+	for _, ds := range pod.Dataspaces() {
 		for fqField, measurement := range ds.Measurements() {
 			measurementName := strings.ReplaceAll(fqField, ".", "_")
 			measurementData := &aiengine_pb.FieldData{

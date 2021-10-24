@@ -60,13 +60,7 @@ func getAddDataRequest(pod *pods.Pod, s *state.State) *aiengine_pb.AddDataReques
 
 	tagPathMap := pod.TagPathMap()
 	categoryPathMap := pod.CategoryPathMap()
-
-	var currentDataspace *dataspace.Dataspace
-	for _, ds := range pod.DataSpaces() {
-		if ds.Path() == s.Path() {
-			currentDataspace = ds
-		}
-	}
+	currentDataspace := pod.GetDataspace(s.Path())
 
 	categories := currentDataspace.Categories()
 

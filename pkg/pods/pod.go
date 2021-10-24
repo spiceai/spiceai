@@ -30,7 +30,8 @@ type Pod struct {
 	podParams          *PodParams
 	hash               string
 	manifestPath       string
-	dataSources        []*dataspace.Dataspace
+	dataspaces        []*dataspace.Dataspace
+	dataspaceMap	  map[string]*dataspace.Dataspace
 	measurements       map[string]*dataspace.Measurement
 	fqMeasurementNames []string
 	fqCategoryNames    []string
@@ -96,7 +97,7 @@ func (pod *Pod) Episodes() int {
 
 func (pod *Pod) CachedState() []*state.State {
 	var cachedState []*state.State
-	for _, ds := range pod.DataSpaces() {
+	for _, ds := range pod.Dataspaces() {
 		dsState := ds.CachedState()
 		if dsState != nil {
 			cachedState = append(cachedState, dsState...)
@@ -168,8 +169,8 @@ func (pod *Pod) CachedCsv() string {
 	return csv.String()
 }
 
-func (pod *Pod) DataSpaces() []*dataspace.Dataspace {
-	return pod.dataSources
+func (pod *Pod) Dataspaces() []*dataspace.Dataspace {
+	return pod.dataspaces
 }
 
 func (pod *Pod) Flights() *map[string]*flights.Flight {
@@ -178,6 +179,15 @@ func (pod *Pod) Flights() *map[string]*flights.Flight {
 
 func (pod *Pod) Interpretations() *interpretations.InterpretationsStore {
 	return pod.interpretations
+}
+
+func (pod *Pod) GetDataspace(path string) *dataspace.Dataspace {
+	for _, ds := range pod.Dataspaces() {
+		if ds.Path() == path {
+			return ds
+		}
+	}
+	return nil
 }
 
 func (pod *Pod) GetFlight(flight string) *flights.Flight {
@@ -195,7 +205,7 @@ func (pod *Pod) AddFlight(flightId string, flight *flights.Flight) {
 func (pod *Pod) Actions() map[string]string {
 	allDataSourceActions := make(map[string]string)
 	var dataSourcePrefixes []string
-	for _, ds := range pod.DataSpaces() {
+	for _, ds := range pod.Dataspaces() {
 		for fqActionName, fqAction := range ds.Actions() {
 			allDataSourceActions[fqActionName] = fqAction
 			dataSourcePrefixes = append(dataSourcePrefixes, fmt.Sprintf("%s.%s", ds.DataspaceSpec.From, ds.DataspaceSpec.Name))
@@ -399,7 +409,7 @@ func (pod *Pod) InitDataConnectors(handler state.StateHandler) error {
 
 	errGroup, _ := errgroup.WithContext(context.Background())
 
-	for _, ds := range pod.DataSpaces() {
+	for _, ds := range pod.Dataspaces() {
 		dsp := ds
 		errGroup.Go(func() error {
 			dsp.RegisterStateHandler(handler)
@@ -464,6 +474,7 @@ func loadPod(podPath string, hash string) (*Pod, error) {
 
 	tagPathMap := make(map[string][]string)
 	measurements := make(map[string]*dataspace.Measurement)
+	dataspaceMap := make(map[string]*dataspace.Dataspace, len(pod.PodSpec.Dataspaces))
 	categoryPathMap := make(map[string][]*dataspace.Category)
 
 	for _, dsSpec := range pod.PodSpec.Dataspaces {
@@ -471,7 +482,8 @@ func loadPod(podPath string, hash string) (*Pod, error) {
 		if err != nil {
 			return nil, err
 		}
-		pod.dataSources = append(pod.dataSources, ds)
+		pod.dataspaces = append(pod.dataspaces, ds)
+		dataspaceMap[ds.Path()] = ds
 
 		dsTags := ds.Tags()
 		if len(dsTags) > 0 {

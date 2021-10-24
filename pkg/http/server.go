@@ -126,7 +126,7 @@ func apiPostDataspaceHandler(ctx *fasthttp.RequestCtx) {
 	dataspaceName := ctx.UserValue("dataspace_name").(string)
 
 	var selectedDataspace *dataspace.Dataspace
-	for _, dataspace := range pod.DataSpaces() {
+	for _, dataspace := range pod.Dataspaces() {
 		if dataspace.DataspaceSpec.From == dataspaceFrom && dataspace.DataspaceSpec.Name == dataspaceName {
 			selectedDataspace = dataspace
 			break
