@@ -199,8 +199,8 @@ This is just the start of the journey with Spice.ai. Next, try one of the quicks
 **Try:**
 
 - [ServerOps sample](https://github.com/spiceai/samples/tree/trunk/serverops/README.md) - a more in-depth version of the quickstart you just completed, using CPU metrics from your own machine
-- [Gardener](https://github.com/spiceai/samples/tree/trunk/gardener/README.md) - Intelligently water a simulated garden
-- [Trader](https://github.com/spiceai/quickstarts/tree/trunk/trader/README.md) - a basic Bitcoin trading bot
+- [Gardener sample](https://github.com/spiceai/samples/tree/trunk/gardener/README.md) - Intelligently water a simulated garden
+- [Trader quickstart](https://github.com/spiceai/quickstarts/tree/trunk/trader/README.md) - a basic Bitcoin trading bot
 
 ## Community
 
