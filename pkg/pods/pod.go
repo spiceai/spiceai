@@ -181,13 +181,8 @@ func (pod *Pod) Interpretations() *interpretations.InterpretationsStore {
 	return pod.interpretations
 }
 
-func (pod *Pod) GetDataspace(path string) *dataspace.Dataspace {
-	for _, ds := range pod.Dataspaces() {
-		if ds.Path() == path {
-			return ds
-		}
-	}
-	return nil
+func (pod *Pod) GetDataspace(path string) *dataspace.Dataspace {	
+	return pod.dataspaceMap[path]
 }
 
 func (pod *Pod) GetFlight(flight string) *flights.Flight {
