@@ -713,7 +713,7 @@ func TestCLICmdPodsList(t *testing.T) {
 		}
 	})
 
-	output, err := cliClient.runCliCmdForOutput("pods", "list")
+	output, err := cliClient.runCliCmdOutput("pods", "list")
 	if err != nil {
 		t.Fatal(err)
 	}
