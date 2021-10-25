@@ -1,7 +1,6 @@
 package state
 
 import (
-	"fmt"
 	"os"
 	"sort"
 	"sync"
@@ -118,7 +117,6 @@ func testGetStateTagsFunc(data []byte) func(*testing.T) {
 
 		validMeasurementNames := []string{"coinbase.btcusd.open", "bitthumb.btcusd.high", "bitmex.btcusd.low", "coinbase_pro.btcusd.close", "local.btcusd.volume"}
 
-		fmt.Printf("%+v\n", data)
 		actualState, err := GetStateFromCsv(validMeasurementNames, nil, data)
 		if err != nil {
 			t.Error(err)
