@@ -49,7 +49,7 @@ func TestDataSource(t *testing.T) {
 			t.Run(fmt.Sprintf("ActionNames() - %s", dsName), testActionNamesFunc(dsSpec))
 			t.Run(fmt.Sprintf("Laws() - %s", dsName), testLawsFunc(dsSpec))
 			t.Run(fmt.Sprintf("measurementSelectorMap() - %s", dsName), testMeasurementSelectorMapFunc(dsSpec))
-			t.Run(fmt.Sprintf("categorySelectorMap() - %s", dsName), testCategorySelectorMapFunc(dsSpec))
+			t.Run(fmt.Sprintf("getCategories() - %s", dsName), testGetCategoriesFunc(dsSpec))
 		}
 	}
 }
@@ -70,17 +70,16 @@ func testMeasurementSelectorMapFunc(dsSpec spec.DataspaceSpec) func(*testing.T) 
 	}
 }
 
-func testCategorySelectorMapFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
+func testGetCategoriesFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 	return func(t *testing.T) {
+		actualCategories, actualCategorySelectors := getCategories(dsSpec)
 
-		ds, err := NewDataspace(dsSpec)
+		err := snapshotter.SnapshotMulti("categories", actualCategories)
 		if err != nil {
-			t.Error(err)
+			t.Fatal(err)
 		}
 
-		actual := ds.categorySelectorMap()
-
-		err = snapshotter.SnapshotMulti(strings.ReplaceAll(ds.Name(), "/", "_"), actual)
+		err = snapshotter.SnapshotMulti("category_selectors", actualCategorySelectors)
 		if err != nil {
 			t.Fatal(err)
 		}
