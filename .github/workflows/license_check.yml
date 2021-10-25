@@ -10,9 +10,9 @@ name: Check for forbidden licenses
 # - Go modules use go-licenses (github.com/google/go-licenses)
 # - Python packages use pip-licenses (https://github.com/raimon49/pip-licenses)
 # - Node packages use NPM License Checker (https://www.npmjs.com/package/license-checker)
-# 
+#
 # Each license listing is checked against a regex in FORBIDDEN_LICENSE_CHECK to
-# ensure no forbidden licenses are present.  If any are detected, the build is failed.  
+# ensure no forbidden licenses are present.  If any are detected, the build is failed.
 
 # List of copyleft licenses derived from Blue Oak Council Guide to Copyleft
 # (https://blueoakcouncil.org/copyleft)
@@ -25,6 +25,9 @@ on:
     branches:
       - trunk
       - release-*
+    paths-ignore:
+      - "docs/**"
+      - ".github/**"
 
 jobs:
   license-check:
