@@ -35,7 +35,6 @@ type Pod struct {
 	measurements       map[string]*dataspace.Measurement
 	fqMeasurementNames []string
 	fqCategoryNames    []string
-	categoryPathMap    map[string][]*dataspace.Category
 	tagPathMap         map[string][]string
 	flights            map[string]*flights.Flight
 	viper              *viper.Viper
@@ -181,7 +180,7 @@ func (pod *Pod) Interpretations() *interpretations.InterpretationsStore {
 	return pod.interpretations
 }
 
-func (pod *Pod) GetDataspace(path string) *dataspace.Dataspace {	
+func (pod *Pod) GetDataspace(path string) *dataspace.Dataspace {
 	return pod.dataspaceMap[path]
 }
 
@@ -311,10 +310,6 @@ func (pod *Pod) MeasurementNames() []string {
 // Returns the list of fully-qualified category names
 func (pod *Pod) CategoryNames() []string {
 	return pod.fqCategoryNames
-}
-
-func (pod *Pod) CategoryPathMap() map[string][]*dataspace.Category {
-	return pod.categoryPathMap
 }
 
 // Returns a map of datasource paths to the tags in those paths
@@ -470,7 +465,6 @@ func loadPod(podPath string, hash string) (*Pod, error) {
 	tagPathMap := make(map[string][]string)
 	measurements := make(map[string]*dataspace.Measurement)
 	dataspaceMap := make(map[string]*dataspace.Dataspace, len(pod.PodSpec.Dataspaces))
-	categoryPathMap := make(map[string][]*dataspace.Category)
 
 	for _, dsSpec := range pod.PodSpec.Dataspaces {
 		ds, err := dataspace.NewDataspace(dsSpec)
@@ -491,12 +485,11 @@ func loadPod(podPath string, hash string) (*Pod, error) {
 			measurements[fqMeasurementName] = measurement
 		}
 
-		dsCategories := make([]*dataspace.Category, 0, len(ds.Categories()))
-		for fqCategoryName, category := range ds.Categories() {
-			fqCategoryNames = append(fqCategoryNames, fqCategoryName)
+		dsCategories := make([]*dataspace.CategoryInfo, len(ds.Categories()))
+		for _, category := range ds.Categories() {
+			fqCategoryNames = append(fqCategoryNames, category.FqName)
 			dsCategories = append(dsCategories, category)
 		}
-		categoryPathMap[ds.Path()] = dsCategories
 	}
 
 	pod.dataspaceMap = dataspaceMap
@@ -507,7 +500,6 @@ func loadPod(podPath string, hash string) (*Pod, error) {
 
 	sort.Strings(fqCategoryNames)
 	pod.fqCategoryNames = fqCategoryNames
-	pod.categoryPathMap = categoryPathMap
 
 	pod.tagPathMap = tagPathMap
 

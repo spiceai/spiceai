@@ -3,6 +3,7 @@ package dataspace
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -20,9 +21,11 @@ type Measurement struct {
 	Fill         string
 }
 
-type Category struct {
+type CategoryInfo struct {
 	Name   string
+	FqName string
 	Values []string
+	EncodedFieldNames []string
 }
 
 type Dataspace struct {
@@ -104,17 +107,28 @@ func (ds *Dataspace) Actions() map[string]string {
 	return fqActions
 }
 
-// Returns a mapping of fully-qualified category names to Category
-func (ds *Dataspace) Categories() map[string]*Category {
-	categories := make(map[string]*Category)
+// Returns the list of Categories sorted by Name
+func (ds *Dataspace) Categories() []*CategoryInfo {
+	categories := make([]*CategoryInfo, 0, len(ds.DataspaceSpec.Categories))
 	for _, categorySpec := range ds.DataspaceSpec.Categories {
 		fqCategoryName := fmt.Sprintf("%s.%s.%s", ds.From, ds.DataspaceSpec.Name, categorySpec.Name)
-		categories[fqCategoryName] = &Category{
-			Name:   categorySpec.Name,
-			Values: categorySpec.Values,
+		sort.Strings(categorySpec.Values)
+		var fieldNames []string
+		for _, val := range categorySpec.Values {
+			oneHotFieldName := fmt.Sprintf("%s-%s", fqCategoryName, val)
+			oneHotFieldName = strings.ReplaceAll(oneHotFieldName, ".", "_")
+			fieldNames = append(fieldNames, oneHotFieldName)
 		}
+		
+		categories =  append(categories, &CategoryInfo{
+			Name:   categorySpec.Name,
+			FqName: fqCategoryName,
+			Values: categorySpec.Values,
+		})
 	}
-
+	sort.SliceStable(categories, func(i, j int) bool {
+		return strings.Compare(categories[i].Name, categories[j].Name) == -1
+	})
 	return categories
 }
 
@@ -183,6 +197,7 @@ func (ds *Dataspace) categorySelectorMap() map[string]string {
 
 // Returns the local tag name (not fully-qualified)
 func (ds *Dataspace) Tags() []string {
+	sort.Strings(ds.DataspaceSpec.Tags)
 	return ds.DataspaceSpec.Tags
 }
 
