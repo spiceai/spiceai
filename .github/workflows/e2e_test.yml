@@ -8,10 +8,14 @@ on:
       - release-*
     tags:
       - v*
+    paths-ignore:
+      - "docs/**"
   pull_request:
     branches:
       - trunk
       - release-*
+    paths-ignore:
+      - "docs/**"
   workflow_dispatch:
 
 jobs:
