@@ -22,9 +22,9 @@ type Measurement struct {
 }
 
 type CategoryInfo struct {
-	Name   string
-	FqName string
-	Values []string
+	Name              string
+	FqName            string
+	Values            []string
 	EncodedFieldNames []string
 }
 
@@ -46,7 +46,7 @@ func NewDataspace(dsSpec spec.DataspaceSpec) (*Dataspace, error) {
 	ds := Dataspace{
 		DataspaceSpec: dsSpec,
 		stateMutex:    &sync.RWMutex{},
-		categories: categories,
+		categories:    categories,
 	}
 
 	if dsSpec.Data != nil {
