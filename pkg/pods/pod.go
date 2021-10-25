@@ -476,8 +476,7 @@ func loadPod(podPath string, hash string) (*Pod, error) {
 
 		dsTags := ds.Tags()
 		if len(dsTags) > 0 {
-			tagPathMap[ds.Path()] = append(tagPathMap[ds.Path()], dsTags...)
-			sort.Strings(tagPathMap[ds.Path()])
+			tagPathMap[ds.Path()] = dsTags
 		}
 
 		for fqMeasurementName, measurement := range ds.Measurements() {

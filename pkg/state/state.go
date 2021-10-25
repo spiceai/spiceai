@@ -36,6 +36,7 @@ type StateHandler func(state *State, metadata map[string]string) error
 
 func NewState(path string, measurementsNames []string, tags []string, observations []observations.Observation) *State {
 	fqMeasurementsNames, measurementsNamesMap := getFieldNames(path, measurementsNames)
+	sort.Strings(fqMeasurementsNames)
 
 	return &State{
 		Time:                 time.Now(),
@@ -196,7 +197,6 @@ func (s *State) MeasurementsNames() []string {
 }
 
 func (s *State) FqMeasurementsNames() []string {
-	sort.Strings(s.fqMeasurementsNames)
 	return s.fqMeasurementsNames
 }
 
