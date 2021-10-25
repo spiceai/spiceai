@@ -695,6 +695,43 @@ func TestImportExport(t *testing.T) {
 	}
 }
 
+func TestCLICmdPodsList(t *testing.T) {
+	if !shouldRunTest {
+		t.Skip("Specify '-e2e' to run e2e tests")
+		return
+	}
+
+	err := runtime.startRuntime()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() {
+		err := runtime.shutdown()
+		if err != nil {
+			log.Fatalln(err.Error())
+		}
+	})
+
+	output, err := cliClient.runCliCmdOutput("pods", "list")
+	if err != nil {
+		t.Fatal(err)
+	}
+	outputStr := string(output)
+	assert.Contains(t, outputStr, "NAME")
+	assert.Contains(t, outputStr, "MANIFEST PATH")
+
+	// tablewriter adds padding to make columns uniform length so the header differs in
+	// padding length across metal/docker context as we are snapshotting after replacing
+	// 'testDir' and `testDir' is different across contexts
+	lines := strings.Split(outputStr, "\n")
+	partialOutput := strings.Join(lines[1:], "\n")
+
+	fixedOutput := strings.ReplaceAll(partialOutput, "/private", "")
+	fixedOutput = strings.ReplaceAll(fixedOutput, testDir, "/userapp")
+	snapshotter.SnapshotT(t, fixedOutput)
+}
+
 func validateRepoRoot(repoRoot string) error {
 	return validateExists(filepath.Join(repoRoot, "go.mod"))
 }

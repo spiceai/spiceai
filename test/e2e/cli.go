@@ -37,3 +37,8 @@ func (c *cli) startCliCmd(args ...string) (*exec.Cmd, error) {
 
 	return cmd, nil
 }
+
+func (c *cli) runCliCmdOutput(args ...string) ([]byte, error) {
+	cmd := exec.Command(c.cliPath, args...)
+	return cmd.Output()
+}

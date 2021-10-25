@@ -1,0 +1,5 @@
+  customprocessor   /userapp/spicepods/customprocessor.yaml   
+  event-categories  /userapp/spicepods/event-categories.yaml  
+  event-tags        /userapp/spicepods/event-tags.yaml        
+  trader            /userapp/spicepods/trader.yaml            
+
