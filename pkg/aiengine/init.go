@@ -80,10 +80,8 @@ func getPodInitForTraining(pod *pods.Pod) *aiengine_pb.InitRequest {
 			fields[measurementName] = measurementData
 		}
 
-		for fqCategoryName, category := range ds.Categories() {
-			for _, categoryValue := range category.Values {
-				oneHotFieldName := fmt.Sprintf("%s-%s", fqCategoryName, categoryValue)
-				oneHotFieldName = strings.ReplaceAll(oneHotFieldName, ".", "_")
+		for _, category := range ds.Categories() {
+			for _, oneHotFieldName := range category.EncodedFieldNames {
 				fields[oneHotFieldName] = &aiengine_pb.FieldData{
 					Initializer: 0.0,
 					FillMethod:  aiengine_pb.FillType_FILL_ZERO,
