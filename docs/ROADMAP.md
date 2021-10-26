@@ -27,7 +27,7 @@ Spice.ai is still under early development, so there are several gaps and limitat
 
 ## Tentative v0.4-alpha (Nov, 2021) roadmap
 
-- Improved data visalization in dashboard
+- Improved data visualization in dashboard
 - Additional ML algorithm (A2C/A3C or SAC)
 - Externally editable and testable reward functions (Python)
 
