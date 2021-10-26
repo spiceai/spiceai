@@ -130,7 +130,7 @@ func (c *DockerContext) IsRuntimeUpgradeAvailable() (string, error) {
 		return "", nil
 	}
 
-	if semver.Compare(spice_version.Version(), version) > 0 {
+	if semver.Compare(spice_version.Version(), version) < 0 {
 		return spice_version.Version(), nil
 	}
 
