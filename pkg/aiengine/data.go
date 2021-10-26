@@ -73,9 +73,8 @@ func getAddDataRequest(pod *pods.Pod, s *state.State) *aiengine_pb.AddDataReques
 			csv.WriteString(categoryFieldName)
 		}
 	}
-	for _, tagName := range ds.Tags() {
+	for _, fqTagName := range ds.FqTags() {
 		csv.WriteString(",")
-		fqTagName := fmt.Sprintf("%s.%s", ds.Path(), tagName)
 		csv.WriteString(strings.ReplaceAll(fqTagName, ".", "_"))
 	}
 	csv.WriteString("\n")
