@@ -295,7 +295,7 @@ func testAddLocalStateFunc(pod *Pod) func(*testing.T) {
 
 		<-done
 
-		newState, err := state.GetStateFromCsv(nil, fileData)
+		newState, err := state.GetStateFromCsv(nil, nil, fileData)
 		if err != nil {
 			t.Error(err)
 		}
@@ -344,12 +344,14 @@ func testAddLocalStateCachedCsvFunc(pod *Pod) func(*testing.T) {
 
 		wg.Wait()
 
-		newState, err := state.GetStateFromCsv(nil, fileData)
+		measurements := []string{"local.portfolio.usd_balance", "local.portfolio.btc_balance", "coinbase.btcusd.price"}
+
+		newState, err := state.GetStateFromCsv(measurements, nil, fileData)
 		if err != nil {
 			t.Error(err)
 		}
 
-		assert.Equal(t, 2, len(newState), "expected two state objects, one for local and one for coinbase")
+		assert.Equal(t, 1, len(newState), "expected one state object for coinbase")
 
 		pod.AddLocalState(newState...)
 

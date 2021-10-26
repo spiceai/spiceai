@@ -1,4 +1,4 @@
-package environment_test
+package environment
 
 import (
 	"context"
@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/spiceai/spiceai/pkg/aiengine"
-	"github.com/spiceai/spiceai/pkg/environment"
 	"github.com/spiceai/spiceai/pkg/pods"
 	"github.com/spiceai/spiceai/pkg/proto/aiengine_pb"
 	"github.com/stretchr/testify/assert"
@@ -47,15 +46,18 @@ func testRegisterStateHandlers() func(*testing.T) {
 
 		t.Cleanup(func() {
 			aiengine.SetAIEngineClient(nil)
+			aiengine.StopServer() //nolint
+			pods.RemovePod(pod.Name)
+			firstInitCompleted = false
 		})
 
 		go func() {
-			err := environment.InitDataConnectors()
+			err := InitDataConnectors()
 			assert.NoError(t, err)
 		}()
 
 		go func() {
-			time.Sleep(3000 * time.Millisecond)
+			time.Sleep(500 * time.Millisecond)
 			fmt.Println("expired")
 			data_received <- false
 		}()

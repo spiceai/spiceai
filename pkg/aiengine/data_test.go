@@ -68,16 +68,28 @@ func testGetAddDataRequestFunc() func(*testing.T) {
 			return
 		}
 
-		fieldNames := []string{"duration", "guest_count", "ticket_price", "event_type", "target_audience"}
+		measurementNames := []string{"duration", "guest_count", "ticket_price"}
 		tags := []string{"tagA", "tagB", "tagC"}
 
-		s := state.NewState("event.stream", fieldNames, tags, newObservations)
+		s := state.NewState("event.stream", measurementNames, tags, newObservations)
 
 		addDataRequest := getAddDataRequest(pod, s)
 
 		assert.Equal(t, "event-categories", addDataRequest.Pod)
 
-		snapshotter.SnapshotT(t, addDataRequest.CsvData)
+		csvData := strings.TrimSpace(addDataRequest.CsvData)
+
+		csvLines := strings.Split(csvData, "\n")
+		if assert.Len(t, csvLines, len(newObservations)+1, "number of csv lines does not match observations") {
+			for _, csvLine := range csvLines {
+				csvFields := strings.Split(csvLine, ",")
+				if !assert.Len(t, csvFields, 15, "number of fields does not match state") {
+					break
+				}
+			}
+		}
+
+		snapshotter.SnapshotT(t, csvData)
 	}
 }
 
@@ -121,10 +133,10 @@ func testGetCsvAllHeadersWithPreviewFunc() func(*testing.T) {
 		csv := strings.Builder{}
 		epoch := time.Unix(1605312001, 0)
 		headerLine := "open,high,low,close,volume"
-		headers := strings.Split(headerLine, ",")
+		measurementNames := strings.Split(headerLine, ",")
 		tags := make([]string, 0)
 
-		actualPreviewCsv := getData(&csv, epoch, headers, tags, nil, newObservations, 5)
+		actualPreviewCsv := getData(&csv, epoch, measurementNames, nil, tags, newObservations, 5)
 
 		expectedPreviewCsv := `1605313800,16256.42,16305,16248.6,16305,110.91971
 1605315600,16303.88,16303.88,16210.99,16222.16,231.64805
@@ -177,10 +189,10 @@ func testGetCsvSelectHeadersWithPreviewFunc() func(*testing.T) {
 
 		csv := strings.Builder{}
 		epoch := time.Unix(1605312000, 0)
-		headers := strings.Split("open,high,low,close,volume", ",")
+		measurementNames := strings.Split("open,high,low,close,volume", ",")
 		tags := make([]string, 0)
 
-		actualPreviewCsv := getData(&csv, epoch, headers, tags, nil, newObservations, 5)
+		actualPreviewCsv := getData(&csv, epoch, measurementNames, nil, tags, newObservations, 5)
 
 		expectedPreviewCsv := `1605312000,16339.56,16339.6,16240,16254.51,274.42607
 1605313800,16256.42,16305,16248.6,16305,110.91971
@@ -231,10 +243,10 @@ func testGetDataWithTagsFunc() func(*testing.T) {
 
 		csv := strings.Builder{}
 		epoch := time.Unix(1610057400, 0)
-		fieldNames := []string{"eventId", "height", "rating", "speed", "target"}
+		measurementNames := []string{"eventId", "height", "rating", "speed", "target"}
 		tags := []string{"tagA", "tagB", "tagC"}
 
-		actualPreviewCsv := getData(&csv, epoch, fieldNames, tags, nil, newObservations, 5)
+		actualPreviewCsv := getData(&csv, epoch, measurementNames, nil, tags, newObservations, 5)
 
 		expectedPreviewCsv := `1610057400,1,10,10,15,1,1,1,1
 1610057800,2,20,11,30,2,1,0,0
@@ -286,18 +298,18 @@ func testGetDataWithCategoriesFunc() func(*testing.T) {
 			return
 		}
 
-		categoriesList := []*dataspace.Category{
+		categoriesList := []*dataspace.CategoryInfo{
 			{Name: "event_type", Values: []string{"dinner", "party", "dance", "concert", "football_game"}},
 			{Name: "target_audience", Values: []string{"employees", "investors", "cohort_a"}},
 		}
 
 		csv := strings.Builder{}
 		epoch := time.Unix(1610057400, 0)
-		fieldNames := []string{"duration", "guest_count", "ticket_price", "event_type", "target_audience"}
+		measurementNames := []string{"duration", "guest_count", "ticket_price"}
 		tags := []string{"tagA", "tagB", "tagC"}
 
-		t.Log(fieldNames)
-		getData(&csv, epoch, fieldNames, tags, categoriesList, newObservations, 5)
+		t.Log(measurementNames)
+		getData(&csv, epoch, measurementNames, categoriesList, tags, newObservations, 5)
 
 		snapshotter.SnapshotT(t, csv.String())
 	}

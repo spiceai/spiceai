@@ -12,8 +12,7 @@
     measurementsNamesMap: (map[string]string) (len=1) {
       (string) (len=3) "low": (string) (len=17) "bitmex.btcusd.low"
     },
-    tags: ([]string) {
-    },
+    tags: ([]string) <nil>,
     observations: ([]observations.Observation) (len=5) {
       (observations.Observation) {
         Time: (int64) 1605312000,
@@ -80,8 +79,7 @@
     measurementsNamesMap: (map[string]string) (len=1) {
       (string) (len=4) "high": (string) (len=20) "bitthumb.btcusd.high"
     },
-    tags: ([]string) {
-    },
+    tags: ([]string) <nil>,
     observations: ([]observations.Observation) (len=5) {
       (observations.Observation) {
         Time: (int64) 1605312000,
@@ -171,10 +169,7 @@
           (string) (len=4) "open": (float64) 16339.56
         },
         Categories: (map[string]string) <nil>,
-        Tags: ([]string) (len=2) {
-          (string) (len=10) "elon_tweet",
-          (string) (len=11) "market_open"
-        }
+        Tags: ([]string) <nil>
       },
       (observations.Observation) {
         Time: (int64) 1605313800,
@@ -182,9 +177,7 @@
           (string) (len=4) "open": (float64) 16256.42
         },
         Categories: (map[string]string) <nil>,
-        Tags: ([]string) (len=1) {
-          (string) (len=12) "market_close"
-        }
+        Tags: ([]string) <nil>
       },
       (observations.Observation) {
         Time: (int64) 1605315600,
@@ -200,19 +193,7 @@
           (string) (len=4) "open": (float64) 16221.78
         },
         Categories: (map[string]string) <nil>,
-        Tags: ([]string) (len=11) {
-          (string) (len=3) "use",
-          (string) (len=5) "spice",
-          (string) (len=2) "ai",
-          (string) (len=3) "for",
-          (string) (len=3) "all",
-          (string) (len=4) "your",
-          (string) (len=11) "intelligent",
-          (string) (len=4) "time",
-          (string) (len=6) "series",
-          (string) (len=3) "app",
-          (string) (len=6) "needs!"
-        }
+        Tags: ([]string) <nil>
       },
       (observations.Observation) {
         Time: (int64) 1605319200,
@@ -247,8 +228,7 @@
     measurementsNamesMap: (map[string]string) (len=1) {
       (string) (len=5) "close": (string) (len=25) "coinbase_pro.btcusd.close"
     },
-    tags: ([]string) {
-    },
+    tags: ([]string) <nil>,
     observations: ([]observations.Observation) (len=5) {
       (observations.Observation) {
         Time: (int64) 1605312000,
@@ -328,10 +308,7 @@
           (string) (len=6) "volume": (float64) 274.42607
         },
         Categories: (map[string]string) <nil>,
-        Tags: ([]string) (len=2) {
-          (string) (len=8) "bought_1",
-          (string) (len=5) "tag_2"
-        }
+        Tags: ([]string) <nil>
       },
       (observations.Observation) {
         Time: (int64) 1605313800,
@@ -339,10 +316,7 @@
           (string) (len=6) "volume": (float64) 110.91971
         },
         Categories: (map[string]string) <nil>,
-        Tags: ([]string) (len=2) {
-          (string) (len=11) "local_tag_1",
-          (string) (len=11) "local_tag_2"
-        }
+        Tags: ([]string) <nil>
       },
       (observations.Observation) {
         Time: (int64) 1605315600,
@@ -350,10 +324,7 @@
           (string) (len=6) "volume": (float64) 231.64805
         },
         Categories: (map[string]string) <nil>,
-        Tags: ([]string) (len=2) {
-          (string) (len=11) "local_tag_1",
-          (string) (len=11) "local_tag_2"
-        }
+        Tags: ([]string) <nil>
       },
       (observations.Observation) {
         Time: (int64) 1605317400,
@@ -361,9 +332,7 @@
           (string) (len=6) "volume": (float64) 135.86161
         },
         Categories: (map[string]string) <nil>,
-        Tags: ([]string) (len=1) {
-          (string) (len=11) "local_tag_1"
-        }
+        Tags: ([]string) <nil>
       },
       (observations.Observation) {
         Time: (int64) 1605319200,
@@ -371,9 +340,7 @@
           (string) (len=6) "volume": (float64) 164.32561
         },
         Categories: (map[string]string) <nil>,
-        Tags: ([]string) (len=1) {
-          (string) (len=11) "local_tag_2"
-        }
+        Tags: ([]string) <nil>
       }
     },
     observationsMutex: (sync.RWMutex) {
