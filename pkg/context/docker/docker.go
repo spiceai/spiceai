@@ -130,7 +130,8 @@ func (c *DockerContext) IsRuntimeUpgradeAvailable() (string, error) {
 		return "", nil
 	}
 
-	if semver.Compare(spice_version.Version(), version) < 0 {
+	// If the runtime version does not equal the CLI version, then use the CLI's version
+	if semver.Compare(spice_version.Version(), version) != 0 {
 		return spice_version.Version(), nil
 	}
 
@@ -146,10 +147,7 @@ func (c *DockerContext) GetRunCmd(manifestPath string) (*exec.Cmd, error) {
 	if version == "local" {
 		fmt.Println("Found and using local dev Docker image")
 	} else {
-		version, err = c.Version()
-		if err != nil {
-			return nil, err
-		}
+		version = spice_version.Version()
 	}
 
 	cwd, err := os.Getwd()
