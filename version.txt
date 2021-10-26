@@ -1,1 +1,1 @@
-0.3-alpha-rc
+0.3.1-alpha

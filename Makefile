@@ -25,7 +25,7 @@ test: build
 	pushd dashboard && yarn test-ci && popd
 	pushd ai/src && make test && popd
 	go vet ./...
-	go test ./... -shuffle=on
+	go test ./... -count=3 -shuffle=on
 	pushd test/e2e && go test -v . -e2e && popd
 
 .PHONY: docker
