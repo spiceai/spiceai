@@ -261,7 +261,7 @@ func testStartServerFunc() func(*testing.T) {
 		getClient = func(target string) (AIEngineClient, error) {
 			return mockAIEngineClient, nil
 		}
-		
+
 		ready := make(chan bool)
 		err := StartServer(ready, false)
 		assert.NoError(t, err)

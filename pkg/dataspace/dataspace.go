@@ -278,9 +278,9 @@ func getCategories(dsSpec spec.DataspaceSpec) ([]*CategoryInfo, map[string]strin
 			fieldNames[i] = oneHotFieldName
 		}
 		categories[i] = &CategoryInfo{
-			Name:   categorySpec.Name,
-			FqName: fqCategoryName,
-			Values: categorySpec.Values,
+			Name:              categorySpec.Name,
+			FqName:            fqCategoryName,
+			Values:            categorySpec.Values,
 			EncodedFieldNames: fieldNames,
 		}
 		if categorySpec.Selector == "" {
