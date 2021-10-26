@@ -6,6 +6,9 @@ on:
     branches:
       - trunk
       - release-*
+    paths-ignore:
+      - "docs/**"
+      - ".github/**"
 
 jobs:
   golangci:
