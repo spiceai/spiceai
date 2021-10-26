@@ -1,0 +1,24 @@
+([]*dataspace.CategoryInfo) (len=2) {
+  (*dataspace.CategoryInfo)({
+    Name: (string) (len=10) "event_type",
+    FqName: (string) (len=23) "event.stream.event_type",
+    Values: ([]string) (len=5) {
+      (string) (len=7) "concert",
+      (string) (len=5) "dance",
+      (string) (len=6) "dinner",
+      (string) (len=13) "football_game",
+      (string) (len=5) "party"
+    },
+    EncodedFieldNames: ([]string) <nil>
+  }),
+  (*dataspace.CategoryInfo)({
+    Name: (string) (len=15) "target_audience",
+    FqName: (string) (len=28) "event.stream.target_audience",
+    Values: ([]string) (len=3) {
+      (string) (len=8) "cohort_a",
+      (string) (len=9) "employees",
+      (string) (len=9) "investors"
+    },
+    EncodedFieldNames: ([]string) <nil>
+  })
+}

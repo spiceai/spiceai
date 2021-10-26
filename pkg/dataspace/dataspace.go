@@ -34,6 +34,7 @@ type Dataspace struct {
 	processor dataprocessors.DataProcessor
 
 	categories []*CategoryInfo
+	measurementNames []string
 
 	stateMutex    *sync.RWMutex
 	cachedState   []*state.State
@@ -42,11 +43,13 @@ type Dataspace struct {
 
 func NewDataspace(dsSpec spec.DataspaceSpec) (*Dataspace, error) {
 	categories, categorySelectors := getCategories(dsSpec)
+	measurementNames, measurementSelectors := getMeasurements(dsSpec)
 
 	ds := Dataspace{
 		DataspaceSpec: dsSpec,
 		stateMutex:    &sync.RWMutex{},
 		categories:    categories,
+		measurementNames: measurementNames,
 	}
 
 	if dsSpec.Data != nil {
@@ -58,9 +61,7 @@ func NewDataspace(dsSpec spec.DataspaceSpec) (*Dataspace, error) {
 			return nil, fmt.Errorf("failed to initialize data processor '%s': %s", dsSpec.Data.Connector.Name, err)
 		}
 
-		measurements := ds.measurementSelectorMap()
-
-		err = processor.Init(dsSpec.Data.Connector.Params, measurements, categorySelectors)
+		err = processor.Init(dsSpec.Data.Connector.Params, measurementSelectors, categorySelectors)
 		if err != nil {
 			return nil, fmt.Errorf("failed to initialize data processor '%s': %s", dsSpec.Data.Connector.Name, err)
 		}
@@ -144,31 +145,13 @@ func (ds *Dataspace) MeasurementNameMap() map[string]string {
 	return measurementNames
 }
 
+// Returns the sorted list of loca measurement names
 func (ds *Dataspace) MeasurementNames() []string {
-	measurementNames := make([]string, 0, len(ds.DataspaceSpec.Measurements))
-	for _, v := range ds.DataspaceSpec.Measurements {
-		measurementNames = append(measurementNames, v.Name)
-	}
-
-	return measurementNames
-}
-
-func (ds *Dataspace) measurementSelectorMap() map[string]string {
-	measurements := make(map[string]string)
-	for _, m := range ds.DataspaceSpec.Measurements {
-		if m.Selector == "" {
-			measurements[m.Name] = m.Name
-		} else {
-			measurements[m.Name] = m.Selector
-		}
-	}
-
-	return measurements
+	return ds.measurementNames
 }
 
 // Returns the local tag name (not fully-qualified)
 func (ds *Dataspace) Tags() []string {
-	sort.Strings(ds.DataspaceSpec.Tags)
 	return ds.DataspaceSpec.Tags
 }
 
@@ -258,17 +241,33 @@ func (ds *Dataspace) ReadData(data []byte, metadata map[string]string) ([]byte, 
 	return data, nil
 }
 
+func getMeasurements(dsSpec spec.DataspaceSpec) ([]string, map[string]string) {
+	measurementNames := make([]string, 0, len(dsSpec.Measurements))
+	measurementSelectors := make(map[string]string)
+	for _, v := range dsSpec.Measurements {
+		measurementNames = append(measurementNames, v.Name)
+		if v.Selector == "" {
+			measurementSelectors[v.Name] = v.Name
+		} else {
+			measurementSelectors[v.Name] = v.Selector
+		}
+	}
+	sort.Strings(measurementNames)
+
+	return measurementNames, measurementSelectors
+}
+
 func getCategories(dsSpec spec.DataspaceSpec) ([]*CategoryInfo, map[string]string) {
 	categories := make([]*CategoryInfo, len(dsSpec.Categories))
 	categorySelectors := make(map[string]string)
 	for i, categorySpec := range dsSpec.Categories {
 		fqCategoryName := fmt.Sprintf("%s.%s.%s", dsSpec.From, dsSpec.Name, categorySpec.Name)
 		sort.Strings(categorySpec.Values)
-		var fieldNames []string
-		for _, val := range categorySpec.Values {
+		fieldNames := make([]string, len(categorySpec.Values)) 
+		for i, val := range categorySpec.Values {
 			oneHotFieldName := fmt.Sprintf("%s-%s", fqCategoryName, val)
 			oneHotFieldName = strings.ReplaceAll(oneHotFieldName, ".", "_")
-			fieldNames = append(fieldNames, oneHotFieldName)
+			fieldNames[i] = oneHotFieldName
 		}
 		categories[i] = &CategoryInfo{
 			Name:   categorySpec.Name,

@@ -107,12 +107,10 @@ func getData(csv *strings.Builder, epoch time.Time, fqMeasurementNames []string,
 		}
 		csv.WriteString(strconv.FormatInt(o.Time, 10))
 
-		if len(o.Measurements) > 0 {
-			for _, f := range fqMeasurementNames {
-				csv.WriteString(",")
-				if measurement, ok := o.Measurements[f]; ok {
-					csv.WriteString(strconv.FormatFloat(measurement, 'f', -1, 64))
-				}
+		for _, f := range fqMeasurementNames {
+			csv.WriteString(",")
+			if measurement, ok := o.Measurements[f]; ok {
+				csv.WriteString(strconv.FormatFloat(measurement, 'f', -1, 64))
 			}
 		}
 
