@@ -69,6 +69,7 @@ jobs:
 
       - name: go test
         run: go test -v -count=10 -shuffle=on ./...
+        working-directory: pkg
 
   aiengine:
     name: test aiengine

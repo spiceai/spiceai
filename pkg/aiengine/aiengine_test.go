@@ -244,7 +244,11 @@ func testStartServerFunc() func(*testing.T) {
 		t.Cleanup(func() {
 			getClient = NewAIEngineClient
 			aiengineClient = nil
+			aiServerCmd = nil
 		})
+
+		aiengineClient = nil
+		aiServerCmd = nil
 
 		mockAIEngineClient := &MockAIEngineClient{
 			GetHealthHandler: func(c go_context.Context, healthRequest *aiengine_pb.HealthRequest, co ...grpc.CallOption) (*aiengine_pb.Response, error) {
@@ -257,8 +261,7 @@ func testStartServerFunc() func(*testing.T) {
 		getClient = func(target string) (AIEngineClient, error) {
 			return mockAIEngineClient, nil
 		}
-
-		assert.Nil(t, aiServerCmd)
+		
 		ready := make(chan bool)
 		err := StartServer(ready, false)
 		assert.NoError(t, err)
