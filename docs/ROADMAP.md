@@ -25,29 +25,25 @@ Spice.ai is still under early development, so there are several gaps and limitat
 
 - See [Bugs](https://github.com/spiceai/spiceai/labels/bug). Feel free to file a new Issue if you see a bug and let us know on Discord.
 
-## Tentative v0.3-alpha (Nov, 2021) roadmap
+## Tentative v0.4-alpha (Nov, 2021) roadmap
 
-- Ingestion and training of categorical data
-- A basic data view in the dashboard
-- Additional ML algorithms (E.g. A2C/A3C)
+- Improved data visalization in dashboard
+- Additional ML algorithm (A2C/A3C or SAC)
+- Externally editable and testable reward functions (Python)
 
-## Tentative v0.4-alpha (Dec, 2021) roadmap
+## Tentative v0.5-alpha (Dec, 2021) roadmap
 
-- Externally editable and testable reward functions
-- Multiple AI Engine backends (E.g. PyTorch, Scikit-learn, etc.)
-- Local Pod/Flight monitoring (WebSockets)
-- Search, index, publish and browse the Spice Rack registry
 - Self-host on baremetal or VM
-
-## Tentative v0.5-alpha (Jan, 2022) roadmap
-
+- Local Pod/Flight monitoring (WebSockets)
+- Multiple AI Engine backends (E.g. PyTorch, Scikit-learn, etc.)
 - First-class simulated environment
 - Pluggable environments
-- Custom visualization hooks for DataSources
 
-## Tentative v0.6-alpha (Feb, 2022) roadmap
+## Tentative v0.6-alpha (Jan, 2022) roadmap
 
+- Search, index, publish and browse the Spice Rack registry
 - CI/CD on GitHub
+- Custom visualization hooks for Dataspaces
 - Sidecar injection on Kubernetes
 
 ## v1.0-stable roadmap
@@ -57,4 +53,4 @@ Spice.ai is still under early development, so there are several gaps and limitat
 
 ## Beyond v1.0
 
-Coming soon!
+Based on community feedback!
