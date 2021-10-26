@@ -60,12 +60,12 @@ func testGetMeasurementsFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 	return func(t *testing.T) {
 		actualMeasurements, actualMeasurementSelectors := getMeasurements(dsSpec)
 
-		err := snapshotter.SnapshotMulti(dsSpec.Name + "_measurements", actualMeasurements)
+		err := snapshotter.SnapshotMulti(dsSpec.Name+"_measurements", actualMeasurements)
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		err = snapshotter.SnapshotMulti(dsSpec.Name + "_measurement_selectors", actualMeasurementSelectors)
+		err = snapshotter.SnapshotMulti(dsSpec.Name+"_measurement_selectors", actualMeasurementSelectors)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -76,12 +76,12 @@ func testGetCategoriesFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 	return func(t *testing.T) {
 		actualCategories, actualCategorySelectors := getCategories(dsSpec)
 
-		err := snapshotter.SnapshotMulti(dsSpec.Name + "_categories", actualCategories)
+		err := snapshotter.SnapshotMulti(dsSpec.Name+"_categories", actualCategories)
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		err = snapshotter.SnapshotMulti(dsSpec.Name + "_category_selectors", actualCategorySelectors)
+		err = snapshotter.SnapshotMulti(dsSpec.Name+"_category_selectors", actualCategorySelectors)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -92,7 +92,7 @@ func testGetTagsFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 	return func(t *testing.T) {
 		fqTags := getTags(dsSpec)
 
-		err := snapshotter.SnapshotMulti(dsSpec.Name + "_tags", fqTags)
+		err := snapshotter.SnapshotMulti(dsSpec.Name+"_tags", fqTags)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -189,8 +189,8 @@ func testMeasurementNamesFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 			}
 		case "event/stream":
 			expected = map[string]string{
-				"duration": "event.stream.duration",
-				"guest_count": "event.stream.guest_count",
+				"duration":     "event.stream.duration",
+				"guest_count":  "event.stream.guest_count",
 				"ticket_price": "event.stream.ticket_price",
 			}
 		case "coinbase/btcusd":

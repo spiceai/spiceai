@@ -33,9 +33,9 @@ type Dataspace struct {
 	connector dataconnectors.DataConnector
 	processor dataprocessors.DataProcessor
 
-	categories []*CategoryInfo
+	categories       []*CategoryInfo
 	measurementNames []string
-	fqTags []string
+	fqTags           []string
 
 	stateMutex    *sync.RWMutex
 	cachedState   []*state.State
@@ -48,11 +48,11 @@ func NewDataspace(dsSpec spec.DataspaceSpec) (*Dataspace, error) {
 	fqTags := getTags(dsSpec)
 
 	ds := Dataspace{
-		DataspaceSpec: dsSpec,
-		stateMutex:    &sync.RWMutex{},
-		categories:    categories,
+		DataspaceSpec:    dsSpec,
+		stateMutex:       &sync.RWMutex{},
+		categories:       categories,
 		measurementNames: measurementNames,
-		fqTags: fqTags,
+		fqTags:           fqTags,
 	}
 
 	if dsSpec.Data != nil {
@@ -271,7 +271,7 @@ func getCategories(dsSpec spec.DataspaceSpec) ([]*CategoryInfo, map[string]strin
 	for i, categorySpec := range dsSpec.Categories {
 		fqCategoryName := fmt.Sprintf("%s.%s.%s", dsSpec.From, dsSpec.Name, categorySpec.Name)
 		sort.Strings(categorySpec.Values)
-		fieldNames := make([]string, len(categorySpec.Values)) 
+		fieldNames := make([]string, len(categorySpec.Values))
 		for i, val := range categorySpec.Values {
 			oneHotFieldName := fmt.Sprintf("%s-%s", fqCategoryName, val)
 			oneHotFieldName = strings.ReplaceAll(oneHotFieldName, ".", "_")
