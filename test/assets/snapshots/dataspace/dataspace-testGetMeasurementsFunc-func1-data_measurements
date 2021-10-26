@@ -1,0 +1,7 @@
+([]string) (len=5) {
+  (string) (len=7) "eventId",
+  (string) (len=6) "height",
+  (string) (len=6) "rating",
+  (string) (len=5) "speed",
+  (string) (len=6) "target"
+}
