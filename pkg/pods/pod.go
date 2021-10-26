@@ -483,11 +483,9 @@ func loadPod(podPath string, hash string) (*Pod, error) {
 			fqMeasurementNames = append(fqMeasurementNames, fqMeasurementName)
 			measurements[fqMeasurementName] = measurement
 		}
-
-		dsCategories := make([]*dataspace.CategoryInfo, len(ds.Categories()))
+		
 		for _, category := range ds.Categories() {
 			fqCategoryNames = append(fqCategoryNames, category.FqName)
-			dsCategories = append(dsCategories, category)
 		}
 	}
 

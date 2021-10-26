@@ -46,7 +46,7 @@ func testRegisterStateHandlers() func(*testing.T) {
 
 		t.Cleanup(func() {
 			aiengine.SetAIEngineClient(nil)
-			aiengine.StopServer()
+			aiengine.StopServer() //nolint
 			pods.RemovePod(pod.Name)
 			firstInitCompleted = false
 		})

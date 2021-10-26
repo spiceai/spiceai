@@ -24,9 +24,6 @@ type State struct {
 	measurementsNames    []string
 	fqMeasurementsNames  []string
 	measurementsNamesMap map[string]string
-	categoryNames        []string
-	fqCategoryNames      []string
-	categoryNamesMap     map[string]string
 	tags                 []string
 	observations         []observations.Observation
 	observationsMutex    sync.RWMutex
@@ -251,7 +248,7 @@ func getCsvHeaderAndLines(input io.Reader) ([]string, [][]string, error) {
 // Process CSV headers. Expected to be fully-qualified.
 func processCsvHeaders(headers []string, validMeasurementNames []string, validCategoryNames []string) (map[string]bool, []string, []string, []string, []string, error) {
 	numDataFields := len(headers) - 1
-	dataspacePathsMap := make(map[string]bool, 0)
+	dataspacePathsMap := make(map[string]bool)
 	columnToDataspacePath := make([]string, numDataFields)
 	columnToMeasurementName := make([]string, numDataFields)
 	columnToCategoryName := make([]string, numDataFields)
