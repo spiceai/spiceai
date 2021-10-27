@@ -1,67 +1,58 @@
 package cmd
 
 import (
-	"fmt"
-	"log"
-	"os"
 	"path/filepath"
 
 	"github.com/spf13/cobra"
 	"github.com/spiceai/spiceai/pkg/constants"
 	"github.com/spiceai/spiceai/pkg/context"
+	"github.com/spiceai/spiceai/pkg/version"
 	"github.com/spiceai/spiceai/pkg/github"
 	"github.com/spiceai/spiceai/pkg/util"
+	"golang.org/x/mod/semver"
 )
 
 var upgradeCmd = &cobra.Command{
-	Use:   "upgrade RuntTime",
-	Short: "upgrades Spice RunTime to the latest release",
+	Use:   "upgrade",
+	Short: "Upgrades the Spice CLI to the latest release",
 	Example: `
 spice upgrade
 `,
 	Run: func(cmd *cobra.Command, args []string) {
-
-		var upgradeVersion string
-		var err error
-		var shouldInstall bool
+		release, err := github.GetLatestCliRelease()
+		if err != nil {
+			cmd.PrintErrln("Error checking for latest release: %w", err)
+			return
+		}
 
 		rtcontext := context.CurrentContext()
+		cliVersion := version.Version()
 
-		upgradeVersion, err = rtcontext.IsRuntimeUpgradeAvailable()
+		if semver.Compare(cliVersion, release.TagName) == 0 {
+			cmd.Printf("Using the latest version %s. No upgrade required.\n", release.TagName)
+			return
+		}
+
+		assetName := github.GetAssetName(constants.SpiceCliFilename)
+		spiceBinDir := filepath.Join(rtcontext.SpiceRuntimeDir(), "bin")
+
+		cmd.Println("Upgrading the Spice.ai CLI ...")
+		
+		err = github.DownloadAsset(release, spiceBinDir, assetName)
 		if err != nil {
-			cmd.Println(err.Error())
-			os.Exit(1)
-		} else if upgradeVersion != "" {
-			shouldInstall = true
+			cmd.PrintErrln("Error downloading the spice binary: %w", err)
+			return
 		}
 
-		if shouldInstall {
-			cmd.Printf("Upgrading CLI ...")
-			release, err := github.GetLatestCliRelease()
-			if err != nil {
-				log.Println((err.Error()))
-			}
+		releaseFilePath := filepath.Join(spiceBinDir, constants.SpiceCliFilename)
 
-			assetName := github.GetAssetName(constants.SpiceCliFilename)
-			spiceBinDir := filepath.Join(rtcontext.SpiceRuntimeDir(), "bin")
-
-			err = github.DownloadAsset(release, spiceBinDir, assetName)
-			if err != nil {
-				cmd.Println("Error downloading Spice.ai runtime binaries.")
-				os.Exit(1)
-			}
-
-			releaseFilePath := filepath.Join(spiceBinDir, constants.SpiceCliFilename)
-
-			err = util.MakeFileExecutable(releaseFilePath)
-			if err != nil {
-				fmt.Println("Error downloading Spice runtime binaries.")
-				os.Exit(1)
-			}
-			fmt.Printf("Spice CLI installed into %s successfully.\n", spiceBinDir)
-		} else {
-			cmd.Println("Already Up To Date with latest CLI")
+		err = util.MakeFileExecutable(releaseFilePath)
+		if err != nil {
+			cmd.PrintErrln("Error downloading the spice binary: %w", err)
+			return
 		}
+		
+		cmd.Printf("Spice.ai CLI upgraded to %s successfully.\n", release.TagName, spiceBinDir)
 	},
 }
 
