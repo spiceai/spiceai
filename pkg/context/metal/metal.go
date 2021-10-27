@@ -12,7 +12,6 @@ import (
 	"github.com/spiceai/spiceai/pkg/constants"
 	"github.com/spiceai/spiceai/pkg/github"
 	"github.com/spiceai/spiceai/pkg/util"
-	spice_version "github.com/spiceai/spiceai/pkg/version"
 	"golang.org/x/mod/semver"
 )
 
@@ -107,7 +106,7 @@ func (c *MetalContext) InstallOrUpgradeRuntime() error {
 		return err
 	}
 
-	release, err := github.GetLatestRuntimeRelease(spice_version.Version())
+	release, err := github.GetLatestRuntimeRelease()
 	if err != nil {
 		return err
 	}
@@ -146,7 +145,7 @@ func (c *MetalContext) IsRuntimeUpgradeAvailable() (string, error) {
 		return "", nil
 	}
 
-	release, err := github.GetLatestRuntimeRelease(currentVersion)
+	release, err := github.GetLatestRuntimeRelease()
 	if err != nil {
 		return "", err
 	}
