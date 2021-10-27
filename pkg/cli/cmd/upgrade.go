@@ -52,7 +52,7 @@ spice upgrade
 			return
 		}
 		
-		cmd.Printf("Spice.ai CLI upgraded to %s successfully.\n", release.TagName, spiceBinDir)
+		cmd.Printf("Spice.ai CLI upgraded to %s successfully.\n", release.TagName)
 	},
 }
 
