@@ -35,6 +35,7 @@ type Dataspace struct {
 
 	categories       []*CategoryInfo
 	measurementNames []string
+	tags             []string
 	fqTags           []string
 
 	stateMutex    *sync.RWMutex
@@ -45,13 +46,14 @@ type Dataspace struct {
 func NewDataspace(dsSpec spec.DataspaceSpec) (*Dataspace, error) {
 	categories, categorySelectors := getCategories(dsSpec)
 	measurementNames, measurementSelectors := getMeasurements(dsSpec)
-	fqTags := getTags(dsSpec)
+	tags, fqTags := getTags(dsSpec)
 
 	ds := Dataspace{
 		DataspaceSpec:    dsSpec,
 		stateMutex:       &sync.RWMutex{},
 		categories:       categories,
 		measurementNames: measurementNames,
+		tags:             tags,
 		fqTags:           fqTags,
 	}
 
@@ -160,7 +162,7 @@ func (ds *Dataspace) FqTags() []string {
 
 // Returns the local tag name (not fully-qualified)
 func (ds *Dataspace) Tags() []string {
-	return ds.DataspaceSpec.Tags
+	return ds.tags
 }
 
 func (ds *Dataspace) ActionNames() map[string]string {
@@ -295,11 +297,20 @@ func getCategories(dsSpec spec.DataspaceSpec) ([]*CategoryInfo, map[string]strin
 	return categories, categorySelectors
 }
 
-func getTags(dsSpec spec.DataspaceSpec) []string {
-	fqTags := make([]string, len(dsSpec.Tags))
-	for i, tagName := range dsSpec.Tags {
-		fqTags[i] = fmt.Sprintf("%s.%s.%s", dsSpec.From, dsSpec.Name, tagName)
+func getTags(dsSpec spec.DataspaceSpec) ([]string, []string) {
+	numTags := 0
+	if dsSpec.Tags != nil {
+		numTags = len(dsSpec.Tags.Values)
 	}
-	sort.Strings(fqTags)
-	return fqTags
+	tags := make([]string, numTags)
+	fqTags := make([]string, numTags)
+	if numTags > 0 {
+		for i, tagName := range dsSpec.Tags.Values {
+			tags[i] = tagName
+			fqTags[i] = fmt.Sprintf("%s.%s.%s", dsSpec.From, dsSpec.Name, tagName)
+		}
+		sort.Strings(tags)
+		sort.Strings(fqTags)
+	}
+	return tags, fqTags
 }

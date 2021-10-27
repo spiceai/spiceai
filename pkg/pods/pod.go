@@ -483,7 +483,7 @@ func loadPod(podPath string, hash string) (*Pod, error) {
 			fqMeasurementNames = append(fqMeasurementNames, fqMeasurementName)
 			measurements[fqMeasurementName] = measurement
 		}
-		
+
 		for _, category := range ds.Categories() {
 			fqCategoryNames = append(fqCategoryNames, category.FqName)
 		}

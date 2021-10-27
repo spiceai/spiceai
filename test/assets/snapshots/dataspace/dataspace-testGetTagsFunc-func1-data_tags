@@ -1,5 +1,5 @@
 ([]string) (len=3) {
-  (string) (len=15) "event.data.tagA",
-  (string) (len=15) "event.data.tagB",
-  (string) (len=15) "event.data.tagC"
+  (string) (len=4) "tagA",
+  (string) (len=4) "tagB",
+  (string) (len=4) "tagC"
 }

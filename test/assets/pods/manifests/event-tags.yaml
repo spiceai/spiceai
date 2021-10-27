@@ -24,9 +24,10 @@ dataspaces:
       - name: speed
       - name: target
     tags:
-      - tagA
-      - tagB
-      - tagC
+      values:
+        - tagA
+        - tagB
+        - tagC
 
 actions:
   - name: action_one

@@ -32,7 +32,11 @@ func TestPod(t *testing.T) {
 		},
 		"event-tags.yaml": {
 			LocalStateTest: false,
-			ExpectedHash:   "16fc4b1dbaacbabb2b88b16e47e2c0de",
+			ExpectedHash:   "43f71cd2b0629a72fd5dd0dcb237c3ff",
+		},
+		"event-categories.yaml": {
+			LocalStateTest: false,
+			ExpectedHash:   "70bbb67db477c0ec3587ce1dc86be5b5",
 		},
 	}
 
@@ -78,6 +82,8 @@ func testBasePropertiesFunc(pod *Pod, expectedHash string) func(*testing.T) {
 			expected = "../../test/assets/pods/manifests/trader-infer.yaml"
 		case "event-tags":
 			expected = "../../test/assets/pods/manifests/event-tags.yaml"
+		case "event-categories":
+			expected = "../../test/assets/pods/manifests/event-categories.yaml"
 		}
 
 		assert.Equal(t, expected, actual, "invalid pod.ManifestPath()")
@@ -92,6 +98,8 @@ func testBasePropertiesFunc(pod *Pod, expectedHash string) func(*testing.T) {
 			expected = fmt.Sprintf("%d", time.Now().Add(-pod.Period()).Unix())[:8]
 		case "event-tags":
 			expected = "1610057400"
+		case "event-categories":
+			expected = "1610057400"
 		}
 
 		assert.Equal(t, expected, actual, "invalid pod.Epoch()")
@@ -104,6 +112,8 @@ func testBasePropertiesFunc(pod *Pod, expectedHash string) func(*testing.T) {
 		case "trader-infer":
 			expected = "72h0m0s"
 		case "event-tags":
+			expected = "24h0m0s"
+		case "event-categories":
 			expected = "24h0m0s"
 		}
 
@@ -118,6 +128,8 @@ func testBasePropertiesFunc(pod *Pod, expectedHash string) func(*testing.T) {
 			expected = "1m0s"
 		case "event-tags":
 			expected = "10m0s"
+		case "event-categories":
+			expected = "1h6m40s"
 		}
 
 		assert.Equal(t, expected, actual, "invalid pod.Interval()")
@@ -131,6 +143,8 @@ func testBasePropertiesFunc(pod *Pod, expectedHash string) func(*testing.T) {
 			expected = "10s"
 		case "event-tags":
 			expected = "30s"
+		case "event-categories":
+			expected = "6m40s"
 		}
 
 		assert.Equal(t, expected, actual, "invalid pod.Granularity()")
@@ -160,6 +174,12 @@ func testMeasurementNamesFunc(pod *Pod) func(*testing.T) {
 				"event.data.rating",
 				"event.data.speed",
 				"event.data.target",
+			}
+		case "event-categories":
+			expected = []string{
+				"event.stream.duration",
+				"event.stream.guest_count",
+				"event.stream.ticket_price",
 			}
 		}
 
@@ -191,6 +211,11 @@ func testRewardsFunc(pod *Pod) func(*testing.T) {
 				"action_one": "reward = 1",
 				"action_two": "reward = 1",
 			}
+		case "event-categories":
+			expected = map[string]string{
+				"action_one": "reward = 1",
+				"action_two": "reward = 1",
+			}
 		}
 
 		assert.Equal(t, expected, actual, "invalid pod.Rewards()")
@@ -217,6 +242,8 @@ func testActionsFunc(pod *Pod) func(*testing.T) {
 				"sell": "local.portfolio.usd_balance += args.price\nlocal.portfolio.btc_balance -= 1",
 			}
 		case "event-tags":
+			expected = map[string]string{"action_one": "", "action_two": ""}
+		case "event-categories":
 			expected = map[string]string{"action_one": "", "action_two": ""}
 		default:
 			t.Errorf("invalid pod %s", pod.Name)
@@ -256,6 +283,8 @@ func testTagPathMap(pod *Pod) func(*testing.T) {
 		switch pod.Name {
 		case "event-tags":
 			expected = map[string][]string{"event.data": {"tagA", "tagB", "tagC"}}
+		case "event-categories":
+			expected = map[string][]string{"event.stream": {"tagA", "tagB", "tagC"}}
 		default:
 			expected = make(map[string][]string)
 		}
