@@ -37,9 +37,10 @@ dataspaces:
           - investors
           - cohort_a
     tags:
-      - tagA
-      - tagB
-      - tagC
+      values:
+        - tagA
+        - tagB
+        - tagC
 
 actions:
   - name: action_one
