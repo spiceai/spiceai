@@ -52,6 +52,7 @@ func TestDataSource(t *testing.T) {
 			t.Run(fmt.Sprintf("getMeasurements() - %s", dsName), testGetMeasurementsFunc(dsSpec))
 			t.Run(fmt.Sprintf("getCategories() - %s", dsName), testGetCategoriesFunc(dsSpec))
 			t.Run(fmt.Sprintf("getTags() - %s", dsName), testGetTagsFunc(dsSpec))
+			t.Run(fmt.Sprintf("getTagSelectors() - %s", dsName), testGetTagSelectorsFunc(dsSpec))
 		}
 	}
 }
@@ -98,6 +99,17 @@ func testGetTagsFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 		}
 
 		err = snapshotter.SnapshotMulti(dsSpec.Name+"_fqtags", fqTags)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func testGetTagSelectorsFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
+	return func(t *testing.T) {
+		tagSelectors := getTagSelectors(dsSpec)
+
+		err := snapshotter.SnapshotMulti(dsSpec.Name+"_tag_selectors", tagSelectors)
 		if err != nil {
 			t.Fatal(err)
 		}

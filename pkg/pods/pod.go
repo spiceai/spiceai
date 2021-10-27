@@ -35,6 +35,7 @@ type Pod struct {
 	measurements       map[string]*dataspace.Measurement
 	fqMeasurementNames []string
 	fqCategoryNames    []string
+	tags []string
 	tagPathMap         map[string][]string
 	flights            map[string]*flights.Flight
 	viper              *viper.Viper
@@ -116,11 +117,16 @@ func (pod *Pod) CachedState() []*state.State {
 
 func (pod *Pod) CachedCsv() string {
 	csv := strings.Builder{}
+
 	measurementNames := pod.MeasurementNames()
+	categoryNames := pod.CategoryNames()
+	tags := pod.Tags()
+
 	tagPathMap := pod.TagPathMap()
 
-	headers := make([]string, 0, len(measurementNames)+len(tagPathMap))
-	headers = append(headers, measurementNames...)
+	headers := make([]string, 0, len(measurementNames)+len(categoryNames)+1)
+	headers = append(headers, measurementNames...)	
+	headers = append(headers, categoryNames...)
 
 	var tagPaths []string
 	for tagPath := range tagPathMap {
@@ -461,8 +467,9 @@ func loadPod(podPath string, hash string) (*Pod, error) {
 
 	var fqMeasurementNames []string
 	var fqCategoryNames []string
+	var tags []string
 
-	tagPathMap := make(map[string][]string)
+	tagsMap := make(map[string]bool)
 	measurements := make(map[string]*dataspace.Measurement)
 	dataspaceMap := make(map[string]*dataspace.Dataspace, len(pod.PodSpec.Dataspaces))
 
@@ -474,9 +481,11 @@ func loadPod(podPath string, hash string) (*Pod, error) {
 		pod.dataspaces = append(pod.dataspaces, ds)
 		dataspaceMap[ds.Path()] = ds
 
-		dsTags := ds.Tags()
-		if len(dsTags) > 0 {
-			tagPathMap[ds.Path()] = dsTags
+		for _, dsTag := range ds.Tags() {
+			if _, ok := tagsMap[dsTag]; !ok {
+				tagsMap[dsTag] = true
+				tags = append(tags, dsTag)
+			}
 		}
 
 		for fqMeasurementName, measurement := range ds.Measurements() {
@@ -498,7 +507,8 @@ func loadPod(podPath string, hash string) (*Pod, error) {
 	sort.Strings(fqCategoryNames)
 	pod.fqCategoryNames = fqCategoryNames
 
-	pod.tagPathMap = tagPathMap
+	sort.Strings(tags)
+	pod.tags = tags
 
 	pod.interpretations = interpretations.NewInterpretationsStore(pod.Epoch(), pod.Period(), pod.Granularity())
 

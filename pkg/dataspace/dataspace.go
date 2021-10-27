@@ -35,7 +35,7 @@ type Dataspace struct {
 
 	categories       []*CategoryInfo
 	measurementNames []string
-	tags             []string
+	tags []string
 	fqTags           []string
 
 	stateMutex    *sync.RWMutex
@@ -53,7 +53,7 @@ func NewDataspace(dsSpec spec.DataspaceSpec) (*Dataspace, error) {
 		stateMutex:       &sync.RWMutex{},
 		categories:       categories,
 		measurementNames: measurementNames,
-		tags:             tags,
+		tags: tags,
 		fqTags:           fqTags,
 	}
 
@@ -313,4 +313,20 @@ func getTags(dsSpec spec.DataspaceSpec) ([]string, []string) {
 		sort.Strings(fqTags)
 	}
 	return tags, fqTags
+}
+
+func getTagSelectors(dsSpec spec.DataspaceSpec) []string {
+	numSelectors := 0
+	if dsSpec.Tags != nil {
+		numSelectors = len(dsSpec.Tags.Selectors)
+	}
+	tagSelectors := make([]string, numSelectors + 1)
+	if numSelectors > 0 {
+		for i, tagSelector := range dsSpec.Tags.Selectors {
+			tagSelectors[i] = tagSelector
+		}
+	}
+	tagSelectors[numSelectors] = "_tag"
+	sort.Strings(tagSelectors)
+	return tagSelectors
 }
