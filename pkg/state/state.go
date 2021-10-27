@@ -24,6 +24,7 @@ type State struct {
 	measurementsNames    []string
 	fqMeasurementsNames  []string
 	measurementsNamesMap map[string]string
+	categoryNamesMap map[string]string
 	tags                 []string
 	observations         []observations.Observation
 	observationsMutex    sync.RWMutex
@@ -31,9 +32,11 @@ type State struct {
 
 type StateHandler func(state *State, metadata map[string]string) error
 
-func NewState(path string, measurementsNames []string, tags []string, observations []observations.Observation) *State {
+func NewState(path string, measurementsNames []string, categoryNames []string, tags []string, observations []observations.Observation) *State {
 	fqMeasurementsNames, measurementsNamesMap := getFieldNames(path, measurementsNames)
 	sort.Strings(fqMeasurementsNames)
+
+	_, categoryNamesMap := getFieldNames(path, categoryNames)
 
 	return &State{
 		Time:                 time.Now(),
@@ -42,6 +45,7 @@ func NewState(path string, measurementsNames []string, tags []string, observatio
 		measurementsNames:    measurementsNames,
 		fqMeasurementsNames:  fqMeasurementsNames,
 		measurementsNamesMap: measurementsNamesMap,
+		categoryNamesMap: categoryNamesMap,
 		tags:                 tags,
 		observations:         observations,
 	}
@@ -179,7 +183,7 @@ func GetStateFromCsv(validMeasurementNames []string, validCategoryNames []string
 		sort.Strings(dsData.categoryNames)
 		sort.Strings(tags)
 
-		result = append(result, NewState(path, dsData.measurementNames, tags, dsData.observations))
+		result = append(result, NewState(path, dsData.measurementNames, dsData.categoryNames, tags, dsData.observations))
 	}
 
 	return result, nil
@@ -200,6 +204,11 @@ func (s *State) FqMeasurementsNames() []string {
 // Returns map of measurement names to fully-qualified meausurement names
 func (s *State) MeasurementsNamesMap() map[string]string {
 	return s.measurementsNamesMap
+}
+
+// Returns map of category names to fully-qualified category names
+func (s *State) CategoryNamesMap() map[string]string {
+	return s.categoryNamesMap
 }
 
 func (s *State) Observations() []observations.Observation {

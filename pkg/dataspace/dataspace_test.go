@@ -75,9 +75,14 @@ func testGetMeasurementsFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 
 func testGetCategoriesFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 	return func(t *testing.T) {
-		actualCategories, actualCategorySelectors := getCategories(dsSpec)
+		actualCategoryNames, actualCategories, actualCategorySelectors := getCategories(dsSpec)
 
-		err := snapshotter.SnapshotMulti(dsSpec.Name+"_categories", actualCategories)
+		err := snapshotter.SnapshotMulti(dsSpec.Name+"_category_names", actualCategoryNames)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		err = snapshotter.SnapshotMulti(dsSpec.Name+"_categories", actualCategories)
 		if err != nil {
 			t.Fatal(err)
 		}

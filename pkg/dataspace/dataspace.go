@@ -35,6 +35,7 @@ type Dataspace struct {
 
 	categories       []*CategoryInfo
 	measurementNames []string
+	categoryNames []string
 	tags []string
 	fqTags           []string
 
@@ -44,7 +45,7 @@ type Dataspace struct {
 }
 
 func NewDataspace(dsSpec spec.DataspaceSpec) (*Dataspace, error) {
-	categories, categorySelectors := getCategories(dsSpec)
+	categoryNames, categories, categorySelectors := getCategories(dsSpec)
 	measurementNames, measurementSelectors := getMeasurements(dsSpec)
 	tags, fqTags := getTags(dsSpec)
 
@@ -53,6 +54,7 @@ func NewDataspace(dsSpec spec.DataspaceSpec) (*Dataspace, error) {
 		stateMutex:       &sync.RWMutex{},
 		categories:       categories,
 		measurementNames: measurementNames,
+		categoryNames: categoryNames,
 		tags: tags,
 		fqTags:           fqTags,
 	}
@@ -150,9 +152,14 @@ func (ds *Dataspace) MeasurementNameMap() map[string]string {
 	return measurementNames
 }
 
-// Returns the sorted list of loca measurement names
+// Returns the sorted list of local category names
 func (ds *Dataspace) MeasurementNames() []string {
 	return ds.measurementNames
+}
+
+// Returns the sorted list of local category names
+func (ds *Dataspace) CategoryNames() []string {
+	return ds.categoryNames
 }
 
 // Returns the list of fully-qualified tags
@@ -242,7 +249,7 @@ func (ds *Dataspace) ReadData(data []byte, metadata map[string]string) ([]byte, 
 		return nil, err
 	}
 
-	newState := state.NewState(ds.Path(), ds.MeasurementNames(), ds.Tags(), observations)
+	newState := state.NewState(ds.Path(), ds.MeasurementNames(), ds.CategoryNames(), ds.Tags(), observations)
 	err = ds.AddNewState(newState, metadata)
 	if err != nil {
 		return nil, err
@@ -267,10 +274,12 @@ func getMeasurements(dsSpec spec.DataspaceSpec) ([]string, map[string]string) {
 	return measurementNames, measurementSelectors
 }
 
-func getCategories(dsSpec spec.DataspaceSpec) ([]*CategoryInfo, map[string]string) {
+func getCategories(dsSpec spec.DataspaceSpec) ([]string, []*CategoryInfo, map[string]string) {
+	categoryNames := make([]string, len(dsSpec.Categories))
 	categories := make([]*CategoryInfo, len(dsSpec.Categories))
 	categorySelectors := make(map[string]string)
 	for i, categorySpec := range dsSpec.Categories {
+		categoryNames[i] = categorySpec.Name
 		fqCategoryName := fmt.Sprintf("%s.%s.%s", dsSpec.From, dsSpec.Name, categorySpec.Name)
 		sort.Strings(categorySpec.Values)
 		fieldNames := make([]string, len(categorySpec.Values))
@@ -291,10 +300,11 @@ func getCategories(dsSpec spec.DataspaceSpec) ([]*CategoryInfo, map[string]strin
 			categorySelectors[categorySpec.Name] = categorySpec.Selector
 		}
 	}
+	sort.Strings(categoryNames)
 	sort.SliceStable(categories, func(i, j int) bool {
 		return strings.Compare(categories[i].Name, categories[j].Name) == -1
 	})
-	return categories, categorySelectors
+	return categoryNames, categories, categorySelectors
 }
 
 func getTags(dsSpec spec.DataspaceSpec) ([]string, []string) {

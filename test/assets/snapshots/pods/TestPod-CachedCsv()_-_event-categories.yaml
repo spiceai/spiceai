@@ -1,10 +1,10 @@
-time,event.stream.duration,event.stream.guest_count,event.stream.ticket_price,event.stream._tags
-1610057400,10,10,15,tagA tagB tagC
-1610057800,20,11,30,tagA
-1610058200,30,12,45,tagA tagC
-1610058600,40,13,60,tagB tagC
-1610059000,50,14,75,tagC
-1610059400,30,12,45,tagA tagC
-1610059800,40,13,60,tagB tagC
-1610060200,50,14,75,tagC
+time,event.stream.duration,event.stream.guest_count,event.stream.ticket_price,event.stream.event_type,event.stream.target_audience,_tags
+1610057400,10,10,15,dinner,investors,tagA tagB tagC
+1610057800,20,11,30,party,employees,tagA
+1610058200,30,12,45,dance,employees,tagA tagC
+1610058600,40,13,60,concert,cohort_a,tagB tagC
+1610059000,50,14,75,football_game,employees,tagC
+1610059400,30,12,45,dance,employees,tagA tagC
+1610059800,40,13,60,concert,cohort_a,tagB tagC
+1610060200,50,14,75,football_game,employees,tagC
 
