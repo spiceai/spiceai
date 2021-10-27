@@ -35,7 +35,7 @@ type Pod struct {
 	measurements       map[string]*dataspace.Measurement
 	fqMeasurementNames []string
 	fqCategoryNames    []string
-	tagPathMap         map[string][]string
+	tags               []string
 	flights            map[string]*flights.Flight
 	viper              *viper.Viper
 
@@ -116,22 +116,15 @@ func (pod *Pod) CachedState() []*state.State {
 
 func (pod *Pod) CachedCsv() string {
 	csv := strings.Builder{}
+
 	measurementNames := pod.MeasurementNames()
-	tagPathMap := pod.TagPathMap()
+	categoryNames := pod.CategoryNames()
 
-	headers := make([]string, 0, len(measurementNames)+len(tagPathMap))
+	headers := make([]string, 0, len(measurementNames)+len(categoryNames)+1)
 	headers = append(headers, measurementNames...)
+	headers = append(headers, categoryNames...)
 
-	var tagPaths []string
-	for tagPath := range tagPathMap {
-		tagPaths = append(tagPaths, fmt.Sprintf("%s._tags", tagPath))
-	}
-	sort.Strings(tagPaths)
-
-	headers = append(headers, tagPaths...)
-
-	st := fmt.Sprintf("time,%s\n", strings.Join(headers, ","))
-	csv.WriteString(st)
+	csv.WriteString(fmt.Sprintf("time,%s,_tags\n", strings.Join(headers, ",")))
 
 	cachedState := pod.CachedState()
 	for _, state := range cachedState {
@@ -151,18 +144,21 @@ func (pod *Pod) CachedCsv() string {
 			}
 		}
 
-		for tagPath := range tagPathMap {
-			hasTags := false
-			if tagPath == state.Path() {
-				validHeaders = append(validHeaders, "_tags")
-				hasTags = true
+		for _, podFqCategoryName := range categoryNames {
+			isLocal := false
+			for categoryName, fqCategoryName := range state.CategoryNamesMap() {
+				if podFqCategoryName == fqCategoryName {
+					validHeaders = append(validHeaders, categoryName)
+					isLocal = true
+					break
+				}
 			}
-			if !hasTags {
-				validHeaders = append(validHeaders, "__SKIP__")
+			if !isLocal {
+				validHeaders = append(validHeaders, podFqCategoryName)
 			}
 		}
 
-		stateCsv := observations.GetCsv(validHeaders, tagPathMap[state.Path()], state.Observations())
+		stateCsv := observations.GetCsv(validHeaders, pod.Tags(), state.Observations())
 		csv.WriteString(stateCsv)
 	}
 	return csv.String()
@@ -312,9 +308,9 @@ func (pod *Pod) CategoryNames() []string {
 	return pod.fqCategoryNames
 }
 
-// Returns a map of datasource paths to the tags in those paths
-func (pod *Pod) TagPathMap() map[string][]string {
-	return pod.tagPathMap
+// Returns the global list of tag values
+func (pod *Pod) Tags() []string {
+	return pod.tags
 }
 
 func (pod *Pod) ValidateForTraining() error {
@@ -461,8 +457,9 @@ func loadPod(podPath string, hash string) (*Pod, error) {
 
 	var fqMeasurementNames []string
 	var fqCategoryNames []string
+	var tags []string
 
-	tagPathMap := make(map[string][]string)
+	tagsMap := make(map[string]bool)
 	measurements := make(map[string]*dataspace.Measurement)
 	dataspaceMap := make(map[string]*dataspace.Dataspace, len(pod.PodSpec.Dataspaces))
 
@@ -474,9 +471,11 @@ func loadPod(podPath string, hash string) (*Pod, error) {
 		pod.dataspaces = append(pod.dataspaces, ds)
 		dataspaceMap[ds.Path()] = ds
 
-		dsTags := ds.Tags()
-		if len(dsTags) > 0 {
-			tagPathMap[ds.Path()] = dsTags
+		for _, dsTag := range ds.Tags() {
+			if _, ok := tagsMap[dsTag]; !ok {
+				tagsMap[dsTag] = true
+				tags = append(tags, dsTag)
+			}
 		}
 
 		for fqMeasurementName, measurement := range ds.Measurements() {
@@ -498,7 +497,8 @@ func loadPod(podPath string, hash string) (*Pod, error) {
 	sort.Strings(fqCategoryNames)
 	pod.fqCategoryNames = fqCategoryNames
 
-	pod.tagPathMap = tagPathMap
+	sort.Strings(tags)
+	pod.tags = tags
 
 	pod.interpretations = interpretations.NewInterpretationsStore(pod.Epoch(), pod.Period(), pod.Granularity())
 

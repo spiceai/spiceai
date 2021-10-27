@@ -37,6 +37,10 @@ dataspaces:
           - investors
           - cohort_a
     tags:
+      selectors:
+        - tags1
+        - tags2
+        - tags3
       values:
         - tagA
         - tagB

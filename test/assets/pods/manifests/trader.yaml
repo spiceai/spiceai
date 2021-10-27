@@ -47,19 +47,12 @@ actions:
       args:
         price: coinbase.btcusd.close
   - name: hold
-training:
-  reward_init: |
-    prev_price = prev_state.coinbase.btcusd.close
-  rewards:
-    - reward: buy
-      with: |
-        new_price = new_state.coinbase.btcusd.close
-        change_in_price = prev_price - new_price
-        reward = change_in_price
-    - reward: sell
-      with: |
-        new_price = new_state.coinbase.btcusd.close
-        change_in_price = prev_price - new_price
-        reward = -change_in_price
-    - reward: hold
-      with: reward = 1
+rewards:
+  init: <code> | <func name>
+  actions:
+    - action: buy
+      name: <func name> | <code>
+    - action: sell
+      name: <func name> | <code>
+    - action: hold
+      name: <func name> | <code>
