@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 
 	"golang.org/x/mod/semver"
 )
@@ -39,8 +40,11 @@ func (r RepoReleases) Less(i, j int) bool {
 	one := r[i]
 	two := r[j]
 
+	oneTag := strings.TrimSuffix(one.TagName, "-alpha")
+	twoTag := strings.TrimSuffix(two.TagName, "-alpha")
+
 	// Compare the releases via a semver comparison in descending order
-	return semver.Compare(one.TagName, two.TagName) == 1
+	return semver.Compare(oneTag, twoTag) == 1
 }
 
 func (r RepoReleases) Swap(i, j int) {
@@ -73,7 +77,7 @@ func GetReleases(gh *GitHubClient) (RepoReleases, error) {
 	return githubRepoReleases, nil
 }
 
-func GetLatestRelease(gh *GitHubClient, tagName string, assetName string) (*RepoRelease, error) {
+func GetLatestRelease(gh *GitHubClient, assetName string) (*RepoRelease, error) {
 	releases, err := GetReleases(gh)
 	if err != nil {
 		return nil, err
@@ -87,9 +91,11 @@ func GetLatestRelease(gh *GitHubClient, tagName string, assetName string) (*Repo
 	sort.Sort(releases)
 
 	for _, release := range releases {
-		if tagName != "" && release.TagName != tagName {
+
+		if release.Draft || release.Prerelease {
 			continue
 		}
+
 		if assetName != "" && !release.HasAsset(assetName) {
 			continue
 		}
