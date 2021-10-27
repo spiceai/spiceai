@@ -2,9 +2,13 @@
 
 This is the dashboard for spice.ai that is served from `spiced` (github.com/spiceai/spiceai).
 
+The build process copies the build assets to `/pkg/dashboard/build` where they are embedded into `spiced` in `/pkg/dashboard/embedded.go`.
+
 ## Available Scripts
 
-By default the project proxies to the backend http://localhost:8000 which is the default server and port for the `spiced` runtime. It's expected that the spice.ai runtime is already running before starting the development server.
+During development and when started with `yarn start` the project proxies to the backend [http://localhost:8000](http://localhost:8000) which is the default server and port for the `spiced` runtime. It's expected that the spice.ai runtime is already running before starting the development server.
+
+I.e. Dashboard frontend -> dashboard backend (localhost:3000) ---proxied--> spiced (localhost:8000).
 
 In the project directory, you can run:
 
