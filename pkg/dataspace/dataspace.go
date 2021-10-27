@@ -152,7 +152,7 @@ func (ds *Dataspace) MeasurementNameMap() map[string]string {
 	return measurementNames
 }
 
-// Returns the sorted list of local category names
+// Returns the sorted list of local measurement names
 func (ds *Dataspace) MeasurementNames() []string {
 	return ds.measurementNames
 }
