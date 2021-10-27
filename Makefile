@@ -16,7 +16,7 @@ build:
 .PHONY: lint
 lint:
 	pushd dashboard && yarn lint && popd
-	black --check --extend-exclude proto ai/src
+#	black --check --extend-exclude proto ai/src
 	go vet ./...
 	golangci-lint run	
 
