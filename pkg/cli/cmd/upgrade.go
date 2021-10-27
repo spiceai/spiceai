@@ -9,7 +9,6 @@ import (
 	"github.com/spiceai/spiceai/pkg/version"
 	"github.com/spiceai/spiceai/pkg/github"
 	"github.com/spiceai/spiceai/pkg/util"
-	"golang.org/x/mod/semver"
 )
 
 var upgradeCmd = &cobra.Command{
@@ -28,7 +27,7 @@ spice upgrade
 		rtcontext := context.CurrentContext()
 		cliVersion := version.Version()
 
-		if semver.Compare(cliVersion, release.TagName) == 0 {
+		if (cliVersion == release.TagName) {
 			cmd.Printf("Using the latest version %s. No upgrade required.\n", release.TagName)
 			return
 		}
