@@ -9,13 +9,14 @@ import (
 	"github.com/bradleyjkemp/cupaloy"
 	"github.com/spf13/viper"
 	"github.com/spiceai/spiceai/pkg/spec"
+	"github.com/stretchr/testify/assert"
 )
 
 var snapshotter = cupaloy.New(cupaloy.SnapshotSubdirectory("../../test/assets/snapshots/dataspace"))
 
 func TestDataSource(t *testing.T) {
 
-	manifestsToTest := []string{"trader", "event-tags"}
+	manifestsToTest := []string{"trader", "event-tags", "event-categories"}
 
 	for _, manifestName := range manifestsToTest {
 		v := viper.New()
@@ -48,39 +49,55 @@ func TestDataSource(t *testing.T) {
 			t.Run(fmt.Sprintf("MeasurementNames() - %s", dsName), testMeasurementNamesFunc(dsSpec))
 			t.Run(fmt.Sprintf("ActionNames() - %s", dsName), testActionNamesFunc(dsSpec))
 			t.Run(fmt.Sprintf("Laws() - %s", dsName), testLawsFunc(dsSpec))
-			t.Run(fmt.Sprintf("measurementSelectorMap() - %s", dsName), testMeasurementSelectorMapFunc(dsSpec))
-			t.Run(fmt.Sprintf("categorySelectorMap() - %s", dsName), testCategorySelectorMapFunc(dsSpec))
+			t.Run(fmt.Sprintf("getMeasurements() - %s", dsName), testGetMeasurementsFunc(dsSpec))
+			t.Run(fmt.Sprintf("getCategories() - %s", dsName), testGetCategoriesFunc(dsSpec))
+			t.Run(fmt.Sprintf("getTags() - %s", dsName), testGetTagsFunc(dsSpec))
 		}
 	}
 }
 
-func testMeasurementSelectorMapFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
+func testGetMeasurementsFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 	return func(t *testing.T) {
-		ds, err := NewDataspace(dsSpec)
+		actualMeasurements, actualMeasurementSelectors := getMeasurements(dsSpec)
+
+		err := snapshotter.SnapshotMulti(dsSpec.Name+"_measurements", actualMeasurements)
 		if err != nil {
-			t.Error(err)
+			t.Fatal(err)
 		}
 
-		actual := ds.measurementSelectorMap()
-
-		err = snapshotter.SnapshotMulti(strings.ReplaceAll(ds.Name(), "/", "_"), actual)
+		err = snapshotter.SnapshotMulti(dsSpec.Name+"_measurement_selectors", actualMeasurementSelectors)
 		if err != nil {
 			t.Fatal(err)
 		}
 	}
 }
 
-func testCategorySelectorMapFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
+func testGetCategoriesFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 	return func(t *testing.T) {
+		actualCategories, actualCategorySelectors := getCategories(dsSpec)
 
-		ds, err := NewDataspace(dsSpec)
+		err := snapshotter.SnapshotMulti(dsSpec.Name+"_categories", actualCategories)
 		if err != nil {
-			t.Error(err)
+			t.Fatal(err)
 		}
 
-		actual := ds.categorySelectorMap()
+		err = snapshotter.SnapshotMulti(dsSpec.Name+"_category_selectors", actualCategorySelectors)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+}
 
-		err = snapshotter.SnapshotMulti(strings.ReplaceAll(ds.Name(), "/", "_"), actual)
+func testGetTagsFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
+	return func(t *testing.T) {
+		tags, fqTags := getTags(dsSpec)
+
+		err := snapshotter.SnapshotMulti(dsSpec.Name+"_tags", tags)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		err = snapshotter.SnapshotMulti(dsSpec.Name+"_fqtags", fqTags)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -123,12 +140,12 @@ func testActionsFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 			}
 		case "event/data":
 			fallthrough
+		case "event/stream":
+			fallthrough
 		case "coinbase/btcusd":
 			expected = make(map[string]string)
 		}
-		if !reflect.DeepEqual(expected, actual) {
-			t.Errorf("Expected:\n%v\nGot:\n%v", expected, actual)
-		}
+		assert.Equal(t, expected, actual)
 	}
 }
 
@@ -175,6 +192,12 @@ func testMeasurementNamesFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 				"speed":   "event.data.speed",
 				"target":  "event.data.target",
 			}
+		case "event/stream":
+			expected = map[string]string{
+				"duration":     "event.stream.duration",
+				"guest_count":  "event.stream.guest_count",
+				"ticket_price": "event.stream.ticket_price",
+			}
 		case "coinbase/btcusd":
 			expected = map[string]string{
 				"close": "coinbase.btcusd.close",
@@ -207,13 +230,13 @@ func testActionNamesFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 			}
 		case "event/data":
 			fallthrough
+		case "event/stream":
+			fallthrough
 		case "coinbase/btcusd":
 			expected = make(map[string]string)
 		}
 
-		if !reflect.DeepEqual(expected, actual) {
-			t.Errorf("Expected:\n%v\nGot:\n%v", expected, actual)
-		}
+		assert.Equal(t, expected, actual)
 	}
 }
 
@@ -236,6 +259,8 @@ func testLawsFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 				"local.portfolio.btc_balance >= 0",
 			}
 		case "coinbase/btcusd":
+			// No laws
+		case "event/stream":
 			// No laws
 		}
 

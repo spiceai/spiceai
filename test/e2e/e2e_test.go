@@ -35,7 +35,7 @@ var (
 	cliClient          *cli
 	runtime            *runtimeServer
 	snapshotter        *cupaloy.Config
-	testPods           = []string{"test/Trader@0.4.0", "test/customprocessor@0.2.0", "test/event-tags@0.2.0", "test/event-categories@0.1.0"}
+	testPods           = []string{"test/Trader@0.4.0", "test/customprocessor@0.2.0", "test/event-tags@0.3.0", "test/event-categories@0.2.0"}
 )
 
 func TestMain(m *testing.M) {
@@ -110,7 +110,7 @@ func TestMain(m *testing.M) {
 
 	podsToAdd := testPods
 	if localRegistryPath != "" {
-		fmt.Printf("Adding pods from local registry %s", aurora.BrightBlue(localRegistryPath))
+		fmt.Printf("Adding pods from local registry %s\n", aurora.BrightBlue(localRegistryPath))
 		podsToAdd = make([]string, len(testPods))
 		for _, p := range testPods {
 			pPath := strings.Split(p, "@")
