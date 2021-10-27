@@ -17,7 +17,7 @@ type DataSpec struct {
 }
 
 type TagsSpec struct {
-	Selectors string   `json:"selectors,omitempty" yaml:"selectors,omitempty" mapstructure:"selectors,omitempty"`
+	Selectors []string `json:"selectors,omitempty" yaml:"selectors,omitempty" mapstructure:"selectors,omitempty"`
 	Values    []string `json:"values,omitempty" yaml:"values,omitempty" mapstructure:"values,omitempty"`
 }
 
