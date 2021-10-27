@@ -90,9 +90,14 @@ func testGetCategoriesFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 
 func testGetTagsFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 	return func(t *testing.T) {
-		fqTags := getTags(dsSpec)
+		tags, fqTags := getTags(dsSpec)
 
-		err := snapshotter.SnapshotMulti(dsSpec.Name+"_tags", fqTags)
+		err := snapshotter.SnapshotMulti(dsSpec.Name+"_tags", tags)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		err = snapshotter.SnapshotMulti(dsSpec.Name+"_fqtags", fqTags)
 		if err != nil {
 			t.Fatal(err)
 		}

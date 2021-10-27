@@ -6,7 +6,7 @@ type DataspaceSpec struct {
 	Data         *DataSpec         `json:"data,omitempty" yaml:"data,omitempty" mapstructure:"data,omitempty"`
 	Measurements []MeasurementSpec `json:"measurements,omitempty" yaml:"measurements,omitempty" mapstructure:"measurements,omitempty"`
 	Categories   []CategorySpec    `json:"categories,omitempty" yaml:"categories,omitempty" mapstructure:"categories,omitempty"`
-	Tags         []string          `json:"tags,omitempty" yaml:"tags,omitempty" mapstructure:"tags,omitempty"`
+	Tags         *TagsSpec         `json:"tags,omitempty" yaml:"tags,omitempty" mapstructure:"tags,omitempty"`
 	Actions      map[string]string `json:"actions,omitempty" yaml:"actions,omitempty" mapstructure:"actions,omitempty"`
 	Laws         []string          `json:"laws,omitempty" yaml:"laws,omitempty" mapstructure:"laws,omitempty"`
 }
@@ -14,6 +14,11 @@ type DataspaceSpec struct {
 type DataSpec struct {
 	Connector DataConnectorSpec `json:"connector,omitempty" yaml:"connector,omitempty" mapstructure:"connector,omitempty"`
 	Processor DataProcessorSpec `json:"processor,omitempty" yaml:"processor,omitempty" mapstructure:"processor,omitempty"`
+}
+
+type TagsSpec struct {
+	Selectors []string `json:"selectors,omitempty" yaml:"selectors,omitempty" mapstructure:"selectors,omitempty"`
+	Values    []string `json:"values,omitempty" yaml:"values,omitempty" mapstructure:"values,omitempty"`
 }
 
 type MeasurementSpec struct {

@@ -35,6 +35,7 @@ type Dataspace struct {
 
 	categories       []*CategoryInfo
 	measurementNames []string
+	tags             []string
 	fqTags           []string
 
 	stateMutex    *sync.RWMutex
@@ -45,13 +46,14 @@ type Dataspace struct {
 func NewDataspace(dsSpec spec.DataspaceSpec) (*Dataspace, error) {
 	categories, categorySelectors := getCategories(dsSpec)
 	measurementNames, measurementSelectors := getMeasurements(dsSpec)
-	fqTags := getTags(dsSpec)
+	tags, fqTags := getTags(dsSpec)
 
 	ds := Dataspace{
 		DataspaceSpec:    dsSpec,
 		stateMutex:       &sync.RWMutex{},
 		categories:       categories,
 		measurementNames: measurementNames,
+		tags:             tags,
 		fqTags:           fqTags,
 	}
 
@@ -59,7 +61,7 @@ func NewDataspace(dsSpec spec.DataspaceSpec) (*Dataspace, error) {
 		var connector dataconnectors.DataConnector = nil
 		var err error
 
-		processor, err := dataprocessors.NewDataProcessor(ds.Data.Processor.Name)
+		processor, err := dataprocessors.NewDataProcessor(ds.DataspaceSpec.Data.Processor.Name)
 		if err != nil {
 			return nil, fmt.Errorf("failed to initialize data processor '%s': %s", dsSpec.Data.Connector.Name, err)
 		}
@@ -142,7 +144,7 @@ func (ds *Dataspace) Measurements() map[string]*Measurement {
 func (ds *Dataspace) MeasurementNameMap() map[string]string {
 	measurementNames := make(map[string]string, len(ds.DataspaceSpec.Measurements))
 	for _, v := range ds.DataspaceSpec.Measurements {
-		fqname := fmt.Sprintf("%s.%s.%s", ds.From, ds.DataspaceSpec.Name, v.Name)
+		fqname := fmt.Sprintf("%s.%s.%s", ds.DataspaceSpec.From, ds.DataspaceSpec.Name, v.Name)
 		measurementNames[v.Name] = fqname
 	}
 	return measurementNames
@@ -160,7 +162,7 @@ func (ds *Dataspace) FqTags() []string {
 
 // Returns the local tag name (not fully-qualified)
 func (ds *Dataspace) Tags() []string {
-	return ds.DataspaceSpec.Tags
+	return ds.tags
 }
 
 func (ds *Dataspace) ActionNames() map[string]string {
@@ -217,9 +219,9 @@ func (ds *Dataspace) RegisterStateHandler(handler func(state *state.State, metad
 
 func (ds *Dataspace) InitDataConnector(epoch time.Time, period time.Duration, interval time.Duration) error {
 	if ds.connector != nil {
-		err := ds.connector.Init(epoch, period, interval, ds.Data.Connector.Params)
+		err := ds.connector.Init(epoch, period, interval, ds.DataspaceSpec.Data.Connector.Params)
 		if err != nil {
-			return fmt.Errorf("failed to initialize data connector '%s': %s", ds.Data.Connector.Name, err)
+			return fmt.Errorf("failed to initialize data connector '%s': %s", ds.DataspaceSpec.Data.Connector.Name, err)
 		}
 	}
 	return nil
@@ -295,11 +297,20 @@ func getCategories(dsSpec spec.DataspaceSpec) ([]*CategoryInfo, map[string]strin
 	return categories, categorySelectors
 }
 
-func getTags(dsSpec spec.DataspaceSpec) []string {
-	fqTags := make([]string, len(dsSpec.Tags))
-	for i, tagName := range dsSpec.Tags {
-		fqTags[i] = fmt.Sprintf("%s.%s.%s", dsSpec.From, dsSpec.Name, tagName)
+func getTags(dsSpec spec.DataspaceSpec) ([]string, []string) {
+	numTags := 0
+	if dsSpec.Tags != nil {
+		numTags = len(dsSpec.Tags.Values)
 	}
-	sort.Strings(fqTags)
-	return fqTags
+	tags := make([]string, numTags)
+	fqTags := make([]string, numTags)
+	if numTags > 0 {
+		for i, tagName := range dsSpec.Tags.Values {
+			tags[i] = tagName
+			fqTags[i] = fmt.Sprintf("%s.%s.%s", dsSpec.From, dsSpec.Name, tagName)
+		}
+		sort.Strings(tags)
+		sort.Strings(fqTags)
+	}
+	return tags, fqTags
 }
