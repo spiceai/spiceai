@@ -8,6 +8,10 @@
     "buy": "reward = 1",
     "sell": "reward = 1"
   },
+  "actions_order": {
+    "buy": 0,
+    "sell": 1
+  },
   "fields": {
     "coinbase_btcusd_close": {},
     "local_portfolio_btc_balance": {},

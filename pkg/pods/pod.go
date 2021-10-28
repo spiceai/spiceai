@@ -32,7 +32,7 @@ type Pod struct {
 	manifestPath       string
 	dataspaces         []*dataspace.Dataspace
 	dataspaceMap       map[string]*dataspace.Dataspace
-	actions map[string]string
+	actions            map[string]string
 	measurements       map[string]*dataspace.Measurement
 	fqMeasurementNames []string
 	fqCategoryNames    []string
@@ -517,7 +517,7 @@ func (pod *Pod) LearningAlgorithm() string {
 	return pod.podParams.LearningAlgorithm
 }
 
-func (pod *Pod)getActions() map[string]string {
+func (pod *Pod) getActions() map[string]string {
 	allDataSourceActions := make(map[string]string)
 	var dataSourcePrefixes []string
 	for _, ds := range pod.Dataspaces() {

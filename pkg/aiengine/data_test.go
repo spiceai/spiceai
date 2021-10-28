@@ -69,7 +69,7 @@ func testGetAddDataRequestFunc() func(*testing.T) {
 		}
 
 		measurementNames := []string{"duration", "guest_count", "ticket_price"}
-		categoryNames := []string{"event_type", "target_audience"}		
+		categoryNames := []string{"event_type", "target_audience"}
 		tags := []string{"tagA", "tagB", "tagC"}
 
 		s := state.NewState("event.stream", measurementNames, categoryNames, tags, newObservations)
@@ -226,7 +226,7 @@ func testGetDataWithTagsFunc() func(*testing.T) {
 			"target":  "target",
 		}
 
-		tagSelectors := []string {
+		tagSelectors := []string{
 			"tags1",
 			"tags2",
 			"tags3",

@@ -8,6 +8,10 @@
     "action_one": "reward = 1",
     "action_two": "reward = 1"
   },
+  "actions_order": {
+    "action_one": 0,
+    "action_two": 1
+  },
   "fields": {
     "event_stream_duration": {
       "fill_method": 1

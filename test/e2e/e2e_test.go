@@ -288,7 +288,7 @@ func TestDataspaceData(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		err = snapshotter.SnapshotMulti(podName + "_initial_observations.csv", observations)
+		err = snapshotter.SnapshotMulti(podName+"_initial_observations.csv", observations)
 		if err != nil {
 			t.Fatal(err)
 		}
