@@ -51,7 +51,14 @@ func testGetCsvWithTagsFunc() func(*testing.T) {
 			"target":  "target",
 		}
 
-		err = dp.Init(nil, measurements, nil, nil)
+		tagSelectors := []string{
+			"tag1",
+			"tag2",
+			"tag3",
+			"_tags",
+		}
+
+		err = dp.Init(nil, measurements, nil, tagSelectors)
 		if err != nil {
 			t.Fatal(err)
 		}
