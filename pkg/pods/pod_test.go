@@ -24,7 +24,7 @@ func TestPod(t *testing.T) {
 	manifestsToTest := map[string]*TestPodParams{
 		"trader.yaml": {
 			LocalStateTest: true,
-			ExpectedHash:   "cc2224f560ef5094b12365d07c71d1ee",
+			ExpectedHash:   "d1df971155f63f748489497fbf7c1ba2",
 		},
 		"trader-infer.yaml": {
 			LocalStateTest: true,
@@ -258,7 +258,10 @@ func testTagsFunc(pod *Pod) func(*testing.T) {
 	return func(t *testing.T) {
 		actualTags := pod.Tags()
 
-		snapshotter.SnapshotMulti(pod.Name+"_tags", actualTags)
+		err := snapshotter.SnapshotMulti(pod.Name+"_tags", actualTags)
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
