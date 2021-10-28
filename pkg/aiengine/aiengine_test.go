@@ -52,6 +52,11 @@ func TestPod(t *testing.T) {
 			return
 		}
 
+		if pod == nil {
+			t.Errorf("Pod did not load from manifest %s", manifestPath)
+			return
+		}
+
 		t.Run(fmt.Sprintf("testGetPodInitForTrainingFunc() - %s", manifestToTest), testGetPodInitForTrainingFunc(pod))
 		t.Run(fmt.Sprintf("InitializePod() - %s", manifestToTest), testInitializePod(pod))
 		t.Run(fmt.Sprintf("StartTraining() already_training - %s", manifestToTest), testStartTrainingFunc(pod, "already_training"))

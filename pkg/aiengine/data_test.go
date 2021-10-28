@@ -69,9 +69,10 @@ func testGetAddDataRequestFunc() func(*testing.T) {
 		}
 
 		measurementNames := []string{"duration", "guest_count", "ticket_price"}
+		categoryNames := []string{"event_type", "target_audience"}		
 		tags := []string{"tagA", "tagB", "tagC"}
 
-		s := state.NewState("event.stream", measurementNames, tags, newObservations)
+		s := state.NewState("event.stream", measurementNames, categoryNames, tags, newObservations)
 
 		addDataRequest := getAddDataRequest(pod, s)
 
@@ -114,7 +115,7 @@ func testGetCsvAllHeadersWithPreviewFunc() func(*testing.T) {
 			"volume": "volume",
 		}
 
-		err = dp.Init(nil, measurements, nil)
+		err = dp.Init(nil, measurements, nil, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -171,7 +172,7 @@ func testGetCsvSelectHeadersWithPreviewFunc() func(*testing.T) {
 			"volume": "volume",
 		}
 
-		err = dp.Init(nil, measurements, nil)
+		err = dp.Init(nil, measurements, nil, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -225,7 +226,7 @@ func testGetDataWithTagsFunc() func(*testing.T) {
 			"target":  "target",
 		}
 
-		err = dp.Init(nil, measurements, nil)
+		err = dp.Init(nil, measurements, nil, nil)
 		if err != nil {
 			t.Fatal(err)
 		}

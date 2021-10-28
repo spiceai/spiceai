@@ -5,9 +5,9 @@
   "granularity": 17,
   "epoch_time": 1605312000,
   "actions": {
-    "buy": "prev_price = prev_state.coinbase_btcusd_close\nnew_price = new_state.coinbase_btcusd_close\nchange_in_price = prev_price - new_price\nreward = change_in_price\n",
-    "hold": "prev_price = prev_state.coinbase_btcusd_close\nreward = 1",
-    "sell": "prev_price = prev_state.coinbase_btcusd_close\nnew_price = new_state.coinbase_btcusd_close\nchange_in_price = prev_price - new_price\nreward = -change_in_price\n"
+    "buy": "reward = 1",
+    "hold": "reward = 1",
+    "sell": "reward = 1"
   },
   "actions_order": {
     "buy": 0,
