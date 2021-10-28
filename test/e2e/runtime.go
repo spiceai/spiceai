@@ -126,23 +126,29 @@ func (r *runtimeServer) postDataspace(podName string, dataspaceFrom string, data
 	return nil
 }
 
-func (r *runtimeServer) getPods() (string, error) {
+func (r *runtimeServer) getPods() ([]map[string]interface{}, error) {
 	url := fmt.Sprintf("%s/api/v0.1/pods", r.baseUrl)
 	resp, err := http.Get(url)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
 	if resp.StatusCode >= 400 {
-		return "", fmt.Errorf("unexpected status: %s", resp.Status)
+		return nil, fmt.Errorf("unexpected status: %s", resp.Status)
 	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
-	return string(body), nil
+	var pods []map[string]interface{}
+	err = json.Unmarshal(body, &pods)
+	if err != nil {
+		return nil, err
+	}
+
+	return pods, nil
 }
 
 func (r *runtimeServer) getObservations(podName string, contentType string) (string, error) {

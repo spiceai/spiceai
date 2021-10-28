@@ -47,6 +47,7 @@ actions:
       args:
         price: coinbase.btcusd.close
   - name: hold
+
 training:
   reward_init: |
     prev_price = prev_state.coinbase.btcusd.close

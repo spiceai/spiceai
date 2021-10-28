@@ -52,7 +52,11 @@ func testGetAddDataRequestFunc() func(*testing.T) {
 			"target_audience": "target_audience",
 		}
 
-		err = dp.Init(nil, measurements, categories)
+		tagSelectors := []string {
+			"tags",
+		}
+
+		err = dp.Init(nil, measurements, categories, tagSelectors)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -69,9 +73,10 @@ func testGetAddDataRequestFunc() func(*testing.T) {
 		}
 
 		measurementNames := []string{"duration", "guest_count", "ticket_price"}
+		categoryNames := []string{"event_type", "target_audience"}
 		tags := []string{"tagA", "tagB", "tagC"}
 
-		s := state.NewState("event.stream", measurementNames, tags, newObservations)
+		s := state.NewState("event.stream", measurementNames, categoryNames, tags, newObservations)
 
 		addDataRequest := getAddDataRequest(pod, s)
 
@@ -114,7 +119,7 @@ func testGetCsvAllHeadersWithPreviewFunc() func(*testing.T) {
 			"volume": "volume",
 		}
 
-		err = dp.Init(nil, measurements, nil)
+		err = dp.Init(nil, measurements, nil, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -171,7 +176,7 @@ func testGetCsvSelectHeadersWithPreviewFunc() func(*testing.T) {
 			"volume": "volume",
 		}
 
-		err = dp.Init(nil, measurements, nil)
+		err = dp.Init(nil, measurements, nil, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -225,7 +230,14 @@ func testGetDataWithTagsFunc() func(*testing.T) {
 			"target":  "target",
 		}
 
-		err = dp.Init(nil, measurements, nil)
+		tagSelectors := []string{
+			"tags1",
+			"tags2",
+			"tags3",
+			"_tags",
+		}
+
+		err = dp.Init(nil, measurements, nil, tagSelectors)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -244,18 +256,11 @@ func testGetDataWithTagsFunc() func(*testing.T) {
 		csv := strings.Builder{}
 		epoch := time.Unix(1610057400, 0)
 		measurementNames := []string{"eventId", "height", "rating", "speed", "target"}
-		tags := []string{"tagA", "tagB", "tagC"}
+		tags := []string{"tagA", "tagB", "tagC", "tagD"}
 
 		actualPreviewCsv := getData(&csv, epoch, measurementNames, nil, tags, newObservations, 5)
 
-		expectedPreviewCsv := `1610057400,1,10,10,15,1,1,1,1
-1610057800,2,20,11,30,2,1,0,0
-1610058200,4,30,12,45,3,1,0,1
-1610058600,8,40,13,60,4,0,1,1
-1610059000,16,50,14,75,5,0,0,1
-`
-
-		assert.Equal(t, expectedPreviewCsv, actualPreviewCsv, "preview csv did not match")
+		snapshotter.SnapshotT(t, actualPreviewCsv)
 	}
 }
 
@@ -282,7 +287,9 @@ func testGetDataWithCategoriesFunc() func(*testing.T) {
 			"target_audience": "target_audience",
 		}
 
-		err = dp.Init(nil, measurements, categories)
+		tagsSelectors := []string{"tags"}
+
+		err = dp.Init(nil, measurements, categories, tagsSelectors)
 		if err != nil {
 			t.Fatal(err)
 		}

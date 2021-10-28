@@ -20,13 +20,23 @@ lint:
 	go vet ./...
 	golangci-lint run	
 
+.PHONY: test-pkg
+test-pkg:
+	pushd pkg && go test ./... -count=3 -shuffle=on
+
+.PHONY: update-pkg-snapshots
+update-pkg-snapshots:
+	pushd pkg && UPDATE_SNAPSHOTS=true go test ./... -count=5
+
+.PHONY: test-e2e
+test-e2e:
+	pushd test/e2e && go test -v -e2e -context metal -shuffle=on -count=2 ./...
+
 .PHONY: test
-test: build
+test: build test-pkg test-e2e
 	pushd dashboard && yarn test-ci && popd
 	pushd ai/src && make test && popd
 	go vet ./...
-	go test ./... -count=3 -shuffle=on
-	pushd test/e2e && go test -v . -e2e && popd
 
 .PHONY: docker
 docker:

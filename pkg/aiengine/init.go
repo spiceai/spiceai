@@ -3,6 +3,7 @@ package aiengine
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -19,14 +20,6 @@ func InitializePod(pod *pods.Pod) error {
 	}
 
 	podInit := getPodInitForTraining(pod)
-
-	podInit.ActionsOrder = make(map[string]int32, len(podInit.Actions))
-
-	var order int32 = 0
-	for action := range podInit.Actions {
-		podInit.ActionsOrder[action] = order
-		order += 1
-	}
 
 	err = sendInit(podInit)
 	if err != nil {
@@ -136,8 +129,11 @@ func getPodInitForTraining(pod *pods.Pod) *aiengine_pb.InitRequest {
 
 	rewards := pod.Rewards()
 	globalActionRewards := make(map[string]string)
+	actionsOrder := make(map[string]int32, len(globalActions))
+	var actionNames []string
 	for actionName := range globalActions {
 		globalActionRewards[actionName] = rewards[actionName]
+		actionNames = append(actionNames, actionName)
 		if rewardInit != nil {
 			reward := *rewardInit + "\n" + rewards[actionName]
 			reward = replaceDotNotatedFieldNames(reward, globalFieldsWithArgs)
@@ -145,18 +141,22 @@ func getPodInitForTraining(pod *pods.Pod) *aiengine_pb.InitRequest {
 		}
 	}
 
-	epoch := pod.Epoch().Unix()
+	sort.Strings(actionNames)
+	for order, action := range actionNames {
+		actionsOrder[action] = int32(order)
+	}
 
 	podInit := aiengine_pb.InitRequest{
-		Pod:         pod.Name,
-		EpochTime:   epoch,
-		Period:      int64(pod.Period().Seconds()),
-		Interval:    int64(pod.Interval().Seconds()),
-		Granularity: int64(pod.Granularity().Seconds()),
-		Datasources: dsInitSpecs,
-		Fields:      fields,
-		Actions:     globalActionRewards,
-		Laws:        laws,
+		Pod:          pod.Name,
+		EpochTime:    pod.Epoch().Unix(),
+		Period:       int64(pod.Period().Seconds()),
+		Interval:     int64(pod.Interval().Seconds()),
+		Granularity:  int64(pod.Granularity().Seconds()),
+		Datasources:  dsInitSpecs,
+		Fields:       fields,
+		Actions:      globalActionRewards,
+		ActionsOrder: actionsOrder,
+		Laws:         laws,
 	}
 
 	return &podInit
