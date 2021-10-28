@@ -287,7 +287,9 @@ func testGetDataWithCategoriesFunc() func(*testing.T) {
 			"target_audience": "target_audience",
 		}
 
-		err = dp.Init(nil, measurements, categories, nil)
+		tagsSelectors := []string{"tags"}
+
+		err = dp.Init(nil, measurements, categories, tagsSelectors)
 		if err != nil {
 			t.Fatal(err)
 		}
