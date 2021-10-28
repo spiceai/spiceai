@@ -159,13 +159,7 @@ func TestPods(t *testing.T) {
 	})
 
 	t.Log("*** Get Pods ***")
-	observation, err := runtime.getPods()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	var pods []map[string]interface{}
-	err = json.Unmarshal([]byte(observation), &pods)
+	pods, err := runtime.getPods()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -280,13 +274,52 @@ func TestDataspaceData(t *testing.T) {
 		}
 	})
 
-	t.Log("*** Get Observations ***")
-	observation, err := runtime.getObservations("customprocessor", "")
+	pods, err := runtime.getPods()
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	err = snapshotter.SnapshotMulti("initial_observation.csv", observation)
+	for _, pod := range pods {
+		podName := pod["name"].(string)
+		t.Logf("*** Get Observations for pod %s ***", podName)
+
+		observations, err := runtime.getObservations(podName, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		err = snapshotter.SnapshotMulti(podName + "_initial_observations.csv", observations)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestDataspaceDataUpdate(t *testing.T) {
+	if !shouldRunTest {
+		t.Skip("Specify '-e2e' to run e2e tests")
+		return
+	}
+
+	err := runtime.startRuntime()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() {
+		err := runtime.shutdown()
+		if err != nil {
+			log.Fatalln(err.Error())
+		}
+	})
+
+	t.Log("*** Get Observations ***")
+	observations, err := runtime.getObservations("customprocessor", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = snapshotter.SnapshotMulti("initial_observations.csv", observations)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -305,12 +338,12 @@ func TestDataspaceData(t *testing.T) {
 	time.Sleep(1 * time.Second)
 
 	t.Log("*** Get New Observations ***")
-	observation, err = runtime.getObservations("customprocessor", "")
+	observations, err = runtime.getObservations("customprocessor", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	err = snapshotter.SnapshotMulti("new_observation.csv", observation)
+	err = snapshotter.SnapshotMulti("new_observation.csv", observations)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -329,12 +362,12 @@ func TestDataspaceData(t *testing.T) {
 	time.Sleep(1 * time.Second)
 
 	t.Log("*** Get New Observations with CSV Data ***")
-	observation, err = runtime.getObservations("customprocessor", "")
+	observations, err = runtime.getObservations("customprocessor", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	err = snapshotter.SnapshotMulti("new_observation_after_new_csv.csv", observation)
+	err = snapshotter.SnapshotMulti("new_observation_after_new_csv.csv", observations)
 	if err != nil {
 		t.Fatal(err)
 	}

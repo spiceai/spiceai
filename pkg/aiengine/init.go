@@ -20,14 +20,6 @@ func InitializePod(pod *pods.Pod) error {
 
 	podInit := getPodInitForTraining(pod)
 
-	podInit.ActionsOrder = make(map[string]int32, len(podInit.Actions))
-
-	var order int32 = 0
-	for action := range podInit.Actions {
-		podInit.ActionsOrder[action] = order
-		order += 1
-	}
-
 	err = sendInit(podInit)
 	if err != nil {
 		return err
@@ -145,6 +137,14 @@ func getPodInitForTraining(pod *pods.Pod) *aiengine_pb.InitRequest {
 		}
 	}
 
+	actionsOrder := make(map[string]int32, len(globalActionRewards))
+
+	var order int32 = 0
+	for action := range globalActionRewards {
+		actionsOrder[action] = order
+		order += 1
+	}
+
 	epoch := pod.Epoch().Unix()
 
 	podInit := aiengine_pb.InitRequest{
@@ -156,6 +156,7 @@ func getPodInitForTraining(pod *pods.Pod) *aiengine_pb.InitRequest {
 		Datasources: dsInitSpecs,
 		Fields:      fields,
 		Actions:     globalActionRewards,
+		ActionsOrder: actionsOrder,
 		Laws:        laws,
 	}
 

@@ -32,6 +32,7 @@ type Pod struct {
 	manifestPath       string
 	dataspaces         []*dataspace.Dataspace
 	dataspaceMap       map[string]*dataspace.Dataspace
+	actions map[string]string
 	measurements       map[string]*dataspace.Measurement
 	fqMeasurementNames []string
 	fqCategoryNames    []string
@@ -193,61 +194,7 @@ func (pod *Pod) AddFlight(flightId string, flight *flights.Flight) {
 }
 
 func (pod *Pod) Actions() map[string]string {
-	allDataSourceActions := make(map[string]string)
-	var dataSourcePrefixes []string
-	for _, ds := range pod.Dataspaces() {
-		for fqActionName, fqAction := range ds.Actions() {
-			allDataSourceActions[fqActionName] = fqAction
-			dataSourcePrefixes = append(dataSourcePrefixes, fmt.Sprintf("%s.%s", ds.DataspaceSpec.From, ds.DataspaceSpec.Name))
-		}
-	}
-
-	globalActions := make(map[string]string)
-	actions := make(map[string]string)
-
-	for _, globalAction := range pod.PodSpec.Actions {
-		if globalAction.Do == nil {
-			actions[globalAction.Name] = ""
-			continue
-		}
-
-		globalActions[globalAction.Name] = globalAction.Do.Name
-
-		dsAction, ok := allDataSourceActions[globalAction.Do.Name]
-		if !ok {
-			actions[globalAction.Name] = globalAction.Do.Name
-			continue
-		}
-
-		for argName, argValue := range globalAction.Do.Args {
-			action := strings.ReplaceAll(dsAction, fmt.Sprintf("args.%s", argName), argValue)
-			actions[globalAction.Name] = action
-		}
-	}
-
-	// Hoist any dataspace actions to global scope if they don't exist
-	for dsActionName, dsAction := range allDataSourceActions {
-		dsActionExistsGlobally := false
-		for globalActionName := range actions {
-			if existingDsActionName, ok := globalActions[globalActionName]; ok {
-				if dsActionName == existingDsActionName {
-					dsActionExistsGlobally = true
-					break
-				}
-			}
-		}
-		if !dsActionExistsGlobally {
-			for _, prefix := range dataSourcePrefixes {
-				if strings.HasPrefix(dsActionName, prefix) {
-					actionName := strings.TrimPrefix(dsActionName, prefix+".")
-					actions[actionName] = dsAction
-					break
-				}
-			}
-		}
-	}
-
-	return actions
+	return pod.actions
 }
 
 func (pod *Pod) ActionsArgs() []string {
@@ -490,6 +437,8 @@ func loadPod(podPath string, hash string) (*Pod, error) {
 
 	pod.dataspaceMap = dataspaceMap
 
+	pod.actions = pod.getActions()
+
 	sort.Strings(fqMeasurementNames)
 	pod.fqMeasurementNames = fqMeasurementNames
 	pod.measurements = measurements
@@ -566,4 +515,61 @@ func (pod *Pod) loadParams() error {
 
 func (pod *Pod) LearningAlgorithm() string {
 	return pod.podParams.LearningAlgorithm
+}
+
+func (pod *Pod)getActions() map[string]string {
+	allDataSourceActions := make(map[string]string)
+	var dataSourcePrefixes []string
+	for _, ds := range pod.Dataspaces() {
+		for fqActionName, fqAction := range ds.Actions() {
+			allDataSourceActions[fqActionName] = fqAction
+			dataSourcePrefixes = append(dataSourcePrefixes, fmt.Sprintf("%s.%s", ds.DataspaceSpec.From, ds.DataspaceSpec.Name))
+		}
+	}
+
+	globalActions := make(map[string]string)
+	actions := make(map[string]string)
+
+	for _, globalAction := range pod.PodSpec.Actions {
+		if globalAction.Do == nil {
+			actions[globalAction.Name] = ""
+			continue
+		}
+
+		globalActions[globalAction.Name] = globalAction.Do.Name
+
+		dsAction, ok := allDataSourceActions[globalAction.Do.Name]
+		if !ok {
+			actions[globalAction.Name] = globalAction.Do.Name
+			continue
+		}
+
+		for argName, argValue := range globalAction.Do.Args {
+			action := strings.ReplaceAll(dsAction, fmt.Sprintf("args.%s", argName), argValue)
+			actions[globalAction.Name] = action
+		}
+	}
+
+	// Hoist any dataspace actions to global scope if they don't exist
+	for dsActionName, dsAction := range allDataSourceActions {
+		dsActionExistsGlobally := false
+		for globalActionName := range actions {
+			if existingDsActionName, ok := globalActions[globalActionName]; ok {
+				if dsActionName == existingDsActionName {
+					dsActionExistsGlobally = true
+					break
+				}
+			}
+		}
+		if !dsActionExistsGlobally {
+			for _, prefix := range dataSourcePrefixes {
+				if strings.HasPrefix(dsActionName, prefix) {
+					actionName := strings.TrimPrefix(dsActionName, prefix+".")
+					actions[actionName] = dsAction
+					break
+				}
+			}
+		}
+	}
+	return actions
 }

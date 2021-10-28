@@ -41,7 +41,7 @@ func TestInfer(t *testing.T) {
 }
 
 func TestPod(t *testing.T) {
-	manifestsToTest := []string{"trader.yaml", "trader-infer.yaml", "event-tags.yaml"}
+	manifestsToTest := []string{"trader.yaml", "trader-infer.yaml", "event-tags.yaml", "event-categories.yaml"}
 
 	for _, manifestToTest := range manifestsToTest {
 		manifestPath := filepath.Join("../../test/assets/pods/manifests", manifestToTest)
