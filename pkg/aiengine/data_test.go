@@ -52,7 +52,11 @@ func testGetAddDataRequestFunc() func(*testing.T) {
 			"target_audience": "target_audience",
 		}
 
-		err = dp.Init(nil, measurements, categories, nil)
+		tagSelectors := []string {
+			"tags",
+		}
+
+		err = dp.Init(nil, measurements, categories, tagSelectors)
 		if err != nil {
 			t.Fatal(err)
 		}
