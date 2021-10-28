@@ -12,6 +12,8 @@
     measurementsNamesMap: (map[string]string) (len=1) {
       (string) (len=3) "low": (string) (len=17) "bitmex.btcusd.low"
     },
+    categoryNamesMap: (map[string]string) {
+    },
     tags: ([]string) <nil>,
     observations: ([]observations.Observation) (len=5) {
       (observations.Observation) {
@@ -79,6 +81,8 @@
     measurementsNamesMap: (map[string]string) (len=1) {
       (string) (len=4) "high": (string) (len=20) "bitthumb.btcusd.high"
     },
+    categoryNamesMap: (map[string]string) {
+    },
     tags: ([]string) <nil>,
     observations: ([]observations.Observation) (len=5) {
       (observations.Observation) {
@@ -145,6 +149,8 @@
     },
     measurementsNamesMap: (map[string]string) (len=1) {
       (string) (len=4) "open": (string) (len=20) "coinbase.btcusd.open"
+    },
+    categoryNamesMap: (map[string]string) {
     },
     tags: ([]string) (len=14) {
       (string) (len=2) "ai",
@@ -228,6 +234,8 @@
     measurementsNamesMap: (map[string]string) (len=1) {
       (string) (len=5) "close": (string) (len=25) "coinbase_pro.btcusd.close"
     },
+    categoryNamesMap: (map[string]string) {
+    },
     tags: ([]string) <nil>,
     observations: ([]observations.Observation) (len=5) {
       (observations.Observation) {
@@ -294,6 +302,8 @@
     },
     measurementsNamesMap: (map[string]string) (len=1) {
       (string) (len=6) "volume": (string) (len=19) "local.btcusd.volume"
+    },
+    categoryNamesMap: (map[string]string) {
     },
     tags: ([]string) (len=4) {
       (string) (len=8) "bought_1",

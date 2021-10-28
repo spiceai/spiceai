@@ -24,7 +24,7 @@ func TestPod(t *testing.T) {
 	manifestsToTest := map[string]*TestPodParams{
 		"trader.yaml": {
 			LocalStateTest: true,
-			ExpectedHash:   "83ba69e37dd58ba0b607c6ebd88d9f96",
+			ExpectedHash:   "cc2224f560ef5094b12365d07c71d1ee",
 		},
 		"trader-infer.yaml": {
 			LocalStateTest: true,
@@ -218,7 +218,7 @@ func testRewardsFunc(pod *Pod) func(*testing.T) {
 			}
 		}
 
-		assert.Equal(t, expected, actual, "invalid pod.Rewards()")
+		assert.Equal(t, expected, actual, "invalid pod.Rewards()", pod.Name)
 	}
 }
 

@@ -68,7 +68,12 @@ func NewDataspace(dsSpec spec.DataspaceSpec) (*Dataspace, error) {
 			return nil, fmt.Errorf("failed to initialize data processor '%s': %s", dsSpec.Data.Connector.Name, err)
 		}
 
-		err = processor.Init(dsSpec.Data.Connector.Params, measurementSelectors, categorySelectors)
+		tagSelectors := []string{"_tags"}
+		if dsSpec.Tags != nil {
+			tagSelectors = append(tagSelectors, dsSpec.Tags.Selectors...)
+		}
+
+		err = processor.Init(dsSpec.Data.Connector.Params, measurementSelectors, categorySelectors, tagSelectors)
 		if err != nil {
 			return nil, fmt.Errorf("failed to initialize data processor '%s': %s", dsSpec.Data.Connector.Name, err)
 		}

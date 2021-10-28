@@ -52,7 +52,7 @@ func testGetAddDataRequestFunc() func(*testing.T) {
 			"target_audience": "target_audience",
 		}
 
-		err = dp.Init(nil, measurements, categories)
+		err = dp.Init(nil, measurements, categories, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -282,7 +282,7 @@ func testGetDataWithCategoriesFunc() func(*testing.T) {
 			"target_audience": "target_audience",
 		}
 
-		err = dp.Init(nil, measurements, categories)
+		err = dp.Init(nil, measurements, categories, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
