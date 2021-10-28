@@ -11,7 +11,7 @@ from exception import RewardInvalidException
 from metrics import metrics
 from proto.common.v1 import common_pb2
 from proto.aiengine.v1 import aiengine_pb2
-from exec import somewhat_safe_exec
+from exec import somewhat_safe_exec, load_module_from_code
 
 
 class DataParam:
@@ -26,7 +26,7 @@ class DataParam:
 
 class DataManager:
     def __init__(self, param: DataParam, fields: Dict[str, aiengine_pb2.FieldData], action_rewards: Dict[str, str],
-                 actions_order: Dict[str, int], laws: List[str]):
+                 actions_order: Dict[str, int], external_reward_funcs: str, laws: List[str]):
         self.fields = fields
         self.laws = laws
         self.param = param
@@ -44,6 +44,9 @@ class DataManager:
 
         self.current_time: pd.Timestamp = None
         self.action_rewards = action_rewards
+
+        if len(external_reward_funcs) > 0:
+            self.reward_funcs_module = load_module_from_code(external_reward_funcs, "reward_funcs")
         self.table_lock = threading.Lock()
 
         self.action_names = [None] * len(actions_order)
@@ -210,13 +213,18 @@ class DataManager:
         new_state_pd,
         new_state_intepretations,
         action: int,
-    ):
+    ) -> float:
         prev_state_dict = {}
         new_state_dict = {}
+        action_name = self.action_names[action]
 
         for key in prev_state_pd:
             prev_state_dict[key] = list(prev_state_pd[key])[-1]
             new_state_dict[key] = list(new_state_pd[key])[-1]
+
+        if self.reward_funcs_module is not None:
+            return self.external_reward(
+                action_name, prev_state_dict, prev_state_interpretations, new_state_dict, new_state_intepretations)
 
         prev_state_dict["interpretations"] = prev_state_interpretations
         new_state_dict["interpretations"] = new_state_intepretations
@@ -229,7 +237,6 @@ class DataManager:
         loc["new_state"] = new_state
         loc["print"] = print
 
-        action_name = self.action_names[action]
         reward_func = self.action_rewards[action_name]
 
         try:
@@ -238,3 +245,13 @@ class DataManager:
             raise RewardInvalidException(repr(ex)) from ex
 
         return loc["reward"]
+
+    def external_reward(self, action_name: str, prev_state_dict: dict, prev_state_interpretations,
+                        new_state_dict: dict, new_state_intepretations) -> float:
+        try:
+            reward_func_name = self.action_rewards[action_name]
+            reward_func = getattr(self.reward_funcs_module, reward_func_name)
+
+            return reward_func(prev_state_dict, prev_state_interpretations, new_state_dict, new_state_intepretations)
+        except Exception as ex:
+            raise RewardInvalidException(repr(ex)) from ex

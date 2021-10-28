@@ -134,29 +134,38 @@ func getPodInitForTraining(pod *pods.Pod) *aiengine_pb.InitRequest {
 		}
 	}
 
-	rewards := pod.Rewards()
-	globalActionRewards := make(map[string]string)
-	for actionName := range globalActions {
-		globalActionRewards[actionName] = rewards[actionName]
-		if rewardInit != nil {
-			reward := *rewardInit + "\n" + rewards[actionName]
-			reward = replaceDotNotatedFieldNames(reward, globalFieldsWithArgs)
-			globalActionRewards[actionName] = reward
+	externalRewardFuncs, _ := pod.ExternalRewardFuncs()
+
+	actionRewards := pod.Rewards()
+
+	// If the rewards are defined inline, then process them into globalActionRewards
+	if externalRewardFuncs == "" {
+		globalActionRewards := make(map[string]string)
+		for actionName := range globalActions {
+			globalActionRewards[actionName] = actionRewards[actionName]
+			if rewardInit != nil {
+				reward := *rewardInit + "\n" + actionRewards[actionName]
+				reward = replaceDotNotatedFieldNames(reward, globalFieldsWithArgs)
+				globalActionRewards[actionName] = reward
+			}
 		}
+
+		actionRewards = globalActionRewards
 	}
 
 	epoch := pod.Epoch().Unix()
 
 	podInit := aiengine_pb.InitRequest{
-		Pod:         pod.Name,
-		EpochTime:   epoch,
-		Period:      int64(pod.Period().Seconds()),
-		Interval:    int64(pod.Interval().Seconds()),
-		Granularity: int64(pod.Granularity().Seconds()),
-		Datasources: dsInitSpecs,
-		Fields:      fields,
-		Actions:     globalActionRewards,
-		Laws:        laws,
+		Pod:                 pod.Name,
+		EpochTime:           epoch,
+		Period:              int64(pod.Period().Seconds()),
+		Interval:            int64(pod.Interval().Seconds()),
+		Granularity:         int64(pod.Granularity().Seconds()),
+		Datasources:         dsInitSpecs,
+		Fields:              fields,
+		Actions:             actionRewards,
+		Laws:                laws,
+		ExternalRewardFuncs: externalRewardFuncs,
 	}
 
 	return &podInit

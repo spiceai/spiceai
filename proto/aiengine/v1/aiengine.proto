@@ -48,6 +48,7 @@ message InitRequest {
   map<string, FieldData> fields = 8;
   repeated string laws = 9;
   repeated DataSource datasources = 10;
+  string external_reward_funcs = 11;
 }
 
 message Response {

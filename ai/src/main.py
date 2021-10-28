@@ -202,7 +202,7 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
             if len(request.actions) == 0:
                 return aiengine_pb2.Response(result="missing_actions", error=True)
             action_rewards = request.actions
-            if not validate_rewards(action_rewards):
+            if not validate_rewards(action_rewards, request.external_reward_funcs):
                 return aiengine_pb2.Response(
                     result="invalid_reward_function", error=True
                 )
@@ -219,6 +219,7 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
                 fields=request.fields,
                 action_rewards=action_rewards,
                 actions_order=request.actions_order,
+                external_reward_funcs=request.external_reward_funcs,
                 laws=request.laws,
             )
             data_managers[request.pod] = data_manager

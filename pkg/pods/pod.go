@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -38,6 +39,7 @@ type Pod struct {
 	tagPathMap         map[string][]string
 	flights            map[string]*flights.Flight
 	viper              *viper.Viper
+	externalRewardMemo string
 
 	podLocalStateMutex    sync.RWMutex
 	podLocalState         []*state.State
@@ -271,6 +273,29 @@ func (pod *Pod) ActionsArgs() []string {
 	}
 
 	return actionsArgs
+}
+
+func (pod *Pod) ExternalRewardFuncs() (string, error) {
+	if pod.Training.RewardFuncs == "" {
+		return "", nil
+	}
+
+	if !strings.HasSuffix(pod.Training.RewardFuncs, ".py") {
+		return "", errors.New("external reward functions must be defined in a single Python file - see https://docs.spiceai.org/concepts/rewards/")
+	}
+
+	// If we've already loaded the file, just return the contents
+	if pod.externalRewardMemo != "" {
+		return pod.externalRewardMemo, nil
+	}
+
+	rewardFuncBytes, err := os.ReadFile(pod.Training.RewardFuncs)
+	if err != nil {
+		return "", err
+	}
+
+	pod.externalRewardMemo = string(rewardFuncBytes)
+	return pod.externalRewardMemo, nil
 }
 
 func (pod *Pod) Rewards() map[string]string {
