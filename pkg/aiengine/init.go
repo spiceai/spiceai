@@ -127,7 +127,7 @@ func getPodInitForTraining(pod *pods.Pod) *aiengine_pb.InitRequest {
 		}
 	}
 
-	externalRewardFuncs, _ := pod.ExternalRewardFuncs()
+	externalRewardFuncs := pod.ExternalRewardFuncs()
 
 	actionRewards := pod.Rewards()
 	actionsOrder := make(map[string]int32, len(globalActions))
