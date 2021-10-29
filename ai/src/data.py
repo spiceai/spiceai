@@ -45,6 +45,7 @@ class DataManager:
         self.current_time: pd.Timestamp = None
         self.action_rewards = action_rewards
 
+        self.reward_funcs_module = None
         if len(external_reward_funcs) > 0:
             self.reward_funcs_module = load_module_from_code(external_reward_funcs, "reward_funcs")
         self.table_lock = threading.Lock()
