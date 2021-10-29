@@ -133,20 +133,18 @@ func getPodInitForTraining(pod *pods.Pod) *aiengine_pb.InitRequest {
 	actionsOrder := make(map[string]int32, len(globalActions))
 	var actionNames []string
 
-	// If the rewards are defined inline, then process them into globalActionRewards
-	if externalRewardFuncs == "" {
-		rewards := pod.Rewards()
-		globalActionRewards := make(map[string]string)
-		for actionName := range globalActions {
-			globalActionRewards[actionName] = rewards[actionName]
-			actionNames = append(actionNames, actionName)
-			if rewardInit != nil {
-				reward := *rewardInit + "\n" + rewards[actionName]
-				reward = replaceDotNotatedFieldNames(reward, globalFieldsWithArgs)
-				globalActionRewards[actionName] = reward
-			}
+	globalActionRewards := make(map[string]string)
+	for actionName := range globalActions {
+		globalActionRewards[actionName] = actionRewards[actionName]
+		actionNames = append(actionNames, actionName)
+		if rewardInit != nil {
+			reward := *rewardInit + "\n" + actionRewards[actionName]
+			reward = replaceDotNotatedFieldNames(reward, globalFieldsWithArgs)
+			globalActionRewards[actionName] = reward
 		}
+	}
 
+	if externalRewardFuncs == "" {
 		actionRewards = globalActionRewards
 	}
 
