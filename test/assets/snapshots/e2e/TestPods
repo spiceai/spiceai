@@ -47,5 +47,14 @@
       "local.portfolio.usd_balance"
     ],
     "name": "trader"
+  },
+  {
+    "manifest_path": "fixed",
+    "measurements": [
+      "coinbase.btcusd.close",
+      "local.portfolio.btc_balance",
+      "local.portfolio.usd_balance"
+    ],
+    "name": "trader-external-funcs"
   }
 ]
