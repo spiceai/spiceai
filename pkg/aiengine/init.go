@@ -3,6 +3,7 @@ package aiengine
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -19,14 +20,6 @@ func InitializePod(pod *pods.Pod) error {
 	}
 
 	podInit := getPodInitForTraining(pod)
-
-	podInit.ActionsOrder = make(map[string]int32, len(podInit.Actions))
-
-	var order int32 = 0
-	for action := range podInit.Actions {
-		podInit.ActionsOrder[action] = order
-		order += 1
-	}
 
 	err = sendInit(podInit)
 	if err != nil {
@@ -137,14 +130,18 @@ func getPodInitForTraining(pod *pods.Pod) *aiengine_pb.InitRequest {
 	externalRewardFuncs, _ := pod.ExternalRewardFuncs()
 
 	actionRewards := pod.Rewards()
+	actionsOrder := make(map[string]int32, len(globalActions))
+	var actionNames []string
 
 	// If the rewards are defined inline, then process them into globalActionRewards
 	if externalRewardFuncs == "" {
+		rewards := pod.Rewards()
 		globalActionRewards := make(map[string]string)
 		for actionName := range globalActions {
-			globalActionRewards[actionName] = actionRewards[actionName]
+			globalActionRewards[actionName] = rewards[actionName]
+			actionNames = append(actionNames, actionName)
 			if rewardInit != nil {
-				reward := *rewardInit + "\n" + actionRewards[actionName]
+				reward := *rewardInit + "\n" + rewards[actionName]
 				reward = replaceDotNotatedFieldNames(reward, globalFieldsWithArgs)
 				globalActionRewards[actionName] = reward
 			}
@@ -153,17 +150,21 @@ func getPodInitForTraining(pod *pods.Pod) *aiengine_pb.InitRequest {
 		actionRewards = globalActionRewards
 	}
 
-	epoch := pod.Epoch().Unix()
+	sort.Strings(actionNames)
+	for order, action := range actionNames {
+		actionsOrder[action] = int32(order)
+	}
 
 	podInit := aiengine_pb.InitRequest{
 		Pod:                 pod.Name,
-		EpochTime:           epoch,
+		EpochTime:           pod.Epoch().Unix(),
 		Period:              int64(pod.Period().Seconds()),
 		Interval:            int64(pod.Interval().Seconds()),
 		Granularity:         int64(pod.Granularity().Seconds()),
 		Datasources:         dsInitSpecs,
 		Fields:              fields,
 		Actions:             actionRewards,
+		ActionsOrder:        actionsOrder,
 		Laws:                laws,
 		ExternalRewardFuncs: externalRewardFuncs,
 	}

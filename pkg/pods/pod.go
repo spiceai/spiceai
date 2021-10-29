@@ -33,10 +33,11 @@ type Pod struct {
 	manifestPath       string
 	dataspaces         []*dataspace.Dataspace
 	dataspaceMap       map[string]*dataspace.Dataspace
+	actions            map[string]string
 	measurements       map[string]*dataspace.Measurement
 	fqMeasurementNames []string
 	fqCategoryNames    []string
-	tagPathMap         map[string][]string
+	tags               []string
 	flights            map[string]*flights.Flight
 	viper              *viper.Viper
 	externalRewardMemo string
@@ -118,22 +119,15 @@ func (pod *Pod) CachedState() []*state.State {
 
 func (pod *Pod) CachedCsv() string {
 	csv := strings.Builder{}
+
 	measurementNames := pod.MeasurementNames()
-	tagPathMap := pod.TagPathMap()
+	categoryNames := pod.CategoryNames()
 
-	headers := make([]string, 0, len(measurementNames)+len(tagPathMap))
+	headers := make([]string, 0, len(measurementNames)+len(categoryNames)+1)
 	headers = append(headers, measurementNames...)
+	headers = append(headers, categoryNames...)
 
-	var tagPaths []string
-	for tagPath := range tagPathMap {
-		tagPaths = append(tagPaths, fmt.Sprintf("%s._tags", tagPath))
-	}
-	sort.Strings(tagPaths)
-
-	headers = append(headers, tagPaths...)
-
-	st := fmt.Sprintf("time,%s\n", strings.Join(headers, ","))
-	csv.WriteString(st)
+	csv.WriteString(fmt.Sprintf("time,%s,_tags\n", strings.Join(headers, ",")))
 
 	cachedState := pod.CachedState()
 	for _, state := range cachedState {
@@ -153,18 +147,21 @@ func (pod *Pod) CachedCsv() string {
 			}
 		}
 
-		for tagPath := range tagPathMap {
-			hasTags := false
-			if tagPath == state.Path() {
-				validHeaders = append(validHeaders, "_tags")
-				hasTags = true
+		for _, podFqCategoryName := range categoryNames {
+			isLocal := false
+			for categoryName, fqCategoryName := range state.CategoryNamesMap() {
+				if podFqCategoryName == fqCategoryName {
+					validHeaders = append(validHeaders, categoryName)
+					isLocal = true
+					break
+				}
 			}
-			if !hasTags {
-				validHeaders = append(validHeaders, "__SKIP__")
+			if !isLocal {
+				validHeaders = append(validHeaders, podFqCategoryName)
 			}
 		}
 
-		stateCsv := observations.GetCsv(validHeaders, tagPathMap[state.Path()], state.Observations())
+		stateCsv := observations.GetCsv(validHeaders, pod.Tags(), state.Observations())
 		csv.WriteString(stateCsv)
 	}
 	return csv.String()
@@ -199,61 +196,7 @@ func (pod *Pod) AddFlight(flightId string, flight *flights.Flight) {
 }
 
 func (pod *Pod) Actions() map[string]string {
-	allDataSourceActions := make(map[string]string)
-	var dataSourcePrefixes []string
-	for _, ds := range pod.Dataspaces() {
-		for fqActionName, fqAction := range ds.Actions() {
-			allDataSourceActions[fqActionName] = fqAction
-			dataSourcePrefixes = append(dataSourcePrefixes, fmt.Sprintf("%s.%s", ds.DataspaceSpec.From, ds.DataspaceSpec.Name))
-		}
-	}
-
-	globalActions := make(map[string]string)
-	actions := make(map[string]string)
-
-	for _, globalAction := range pod.PodSpec.Actions {
-		if globalAction.Do == nil {
-			actions[globalAction.Name] = ""
-			continue
-		}
-
-		globalActions[globalAction.Name] = globalAction.Do.Name
-
-		dsAction, ok := allDataSourceActions[globalAction.Do.Name]
-		if !ok {
-			actions[globalAction.Name] = globalAction.Do.Name
-			continue
-		}
-
-		for argName, argValue := range globalAction.Do.Args {
-			action := strings.ReplaceAll(dsAction, fmt.Sprintf("args.%s", argName), argValue)
-			actions[globalAction.Name] = action
-		}
-	}
-
-	// Hoist any dataspace actions to global scope if they don't exist
-	for dsActionName, dsAction := range allDataSourceActions {
-		dsActionExistsGlobally := false
-		for globalActionName := range actions {
-			if existingDsActionName, ok := globalActions[globalActionName]; ok {
-				if dsActionName == existingDsActionName {
-					dsActionExistsGlobally = true
-					break
-				}
-			}
-		}
-		if !dsActionExistsGlobally {
-			for _, prefix := range dataSourcePrefixes {
-				if strings.HasPrefix(dsActionName, prefix) {
-					actionName := strings.TrimPrefix(dsActionName, prefix+".")
-					actions[actionName] = dsAction
-					break
-				}
-			}
-		}
-	}
-
-	return actions
+	return pod.actions
 }
 
 func (pod *Pod) ActionsArgs() []string {
@@ -337,9 +280,9 @@ func (pod *Pod) CategoryNames() []string {
 	return pod.fqCategoryNames
 }
 
-// Returns a map of datasource paths to the tags in those paths
-func (pod *Pod) TagPathMap() map[string][]string {
-	return pod.tagPathMap
+// Returns the global list of tag values
+func (pod *Pod) Tags() []string {
+	return pod.tags
 }
 
 func (pod *Pod) ValidateForTraining() error {
@@ -486,8 +429,9 @@ func loadPod(podPath string, hash string) (*Pod, error) {
 
 	var fqMeasurementNames []string
 	var fqCategoryNames []string
+	var tags []string
 
-	tagPathMap := make(map[string][]string)
+	tagsMap := make(map[string]bool)
 	measurements := make(map[string]*dataspace.Measurement)
 	dataspaceMap := make(map[string]*dataspace.Dataspace, len(pod.PodSpec.Dataspaces))
 
@@ -499,9 +443,11 @@ func loadPod(podPath string, hash string) (*Pod, error) {
 		pod.dataspaces = append(pod.dataspaces, ds)
 		dataspaceMap[ds.Path()] = ds
 
-		dsTags := ds.Tags()
-		if len(dsTags) > 0 {
-			tagPathMap[ds.Path()] = dsTags
+		for _, dsTag := range ds.Tags() {
+			if _, ok := tagsMap[dsTag]; !ok {
+				tagsMap[dsTag] = true
+				tags = append(tags, dsTag)
+			}
 		}
 
 		for fqMeasurementName, measurement := range ds.Measurements() {
@@ -516,6 +462,8 @@ func loadPod(podPath string, hash string) (*Pod, error) {
 
 	pod.dataspaceMap = dataspaceMap
 
+	pod.actions = pod.getActions()
+
 	sort.Strings(fqMeasurementNames)
 	pod.fqMeasurementNames = fqMeasurementNames
 	pod.measurements = measurements
@@ -523,7 +471,8 @@ func loadPod(podPath string, hash string) (*Pod, error) {
 	sort.Strings(fqCategoryNames)
 	pod.fqCategoryNames = fqCategoryNames
 
-	pod.tagPathMap = tagPathMap
+	sort.Strings(tags)
+	pod.tags = tags
 
 	pod.interpretations = interpretations.NewInterpretationsStore(pod.Epoch(), pod.Period(), pod.Granularity())
 
@@ -591,4 +540,61 @@ func (pod *Pod) loadParams() error {
 
 func (pod *Pod) LearningAlgorithm() string {
 	return pod.podParams.LearningAlgorithm
+}
+
+func (pod *Pod) getActions() map[string]string {
+	allDataSourceActions := make(map[string]string)
+	var dataSourcePrefixes []string
+	for _, ds := range pod.Dataspaces() {
+		for fqActionName, fqAction := range ds.Actions() {
+			allDataSourceActions[fqActionName] = fqAction
+			dataSourcePrefixes = append(dataSourcePrefixes, fmt.Sprintf("%s.%s", ds.DataspaceSpec.From, ds.DataspaceSpec.Name))
+		}
+	}
+
+	globalActions := make(map[string]string)
+	actions := make(map[string]string)
+
+	for _, globalAction := range pod.PodSpec.Actions {
+		if globalAction.Do == nil {
+			actions[globalAction.Name] = ""
+			continue
+		}
+
+		globalActions[globalAction.Name] = globalAction.Do.Name
+
+		dsAction, ok := allDataSourceActions[globalAction.Do.Name]
+		if !ok {
+			actions[globalAction.Name] = globalAction.Do.Name
+			continue
+		}
+
+		for argName, argValue := range globalAction.Do.Args {
+			action := strings.ReplaceAll(dsAction, fmt.Sprintf("args.%s", argName), argValue)
+			actions[globalAction.Name] = action
+		}
+	}
+
+	// Hoist any dataspace actions to global scope if they don't exist
+	for dsActionName, dsAction := range allDataSourceActions {
+		dsActionExistsGlobally := false
+		for globalActionName := range actions {
+			if existingDsActionName, ok := globalActions[globalActionName]; ok {
+				if dsActionName == existingDsActionName {
+					dsActionExistsGlobally = true
+					break
+				}
+			}
+		}
+		if !dsActionExistsGlobally {
+			for _, prefix := range dataSourcePrefixes {
+				if strings.HasPrefix(dsActionName, prefix) {
+					actionName := strings.TrimPrefix(dsActionName, prefix+".")
+					actions[actionName] = dsAction
+					break
+				}
+			}
+		}
+	}
+	return actions
 }

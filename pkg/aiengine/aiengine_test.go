@@ -41,7 +41,7 @@ func TestInfer(t *testing.T) {
 }
 
 func TestPod(t *testing.T) {
-	manifestsToTest := []string{"trader.yaml", "trader-infer.yaml", "event-tags.yaml"}
+	manifestsToTest := []string{"trader.yaml", "trader-infer.yaml", "event-tags.yaml", "event-categories.yaml"}
 
 	for _, manifestToTest := range manifestsToTest {
 		manifestPath := filepath.Join("../../test/assets/pods/manifests", manifestToTest)
@@ -49,6 +49,11 @@ func TestPod(t *testing.T) {
 		pod, err := pods.LoadPodFromManifest(manifestPath)
 		if err != nil {
 			t.Error(err)
+			return
+		}
+
+		if pod == nil {
+			t.Errorf("Pod did not load from manifest %s", manifestPath)
 			return
 		}
 

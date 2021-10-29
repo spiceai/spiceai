@@ -24,7 +24,7 @@ func TestPod(t *testing.T) {
 	manifestsToTest := map[string]*TestPodParams{
 		"trader.yaml": {
 			LocalStateTest: true,
-			ExpectedHash:   "83ba69e37dd58ba0b607c6ebd88d9f96",
+			ExpectedHash:   "d1df971155f63f748489497fbf7c1ba2",
 		},
 		"trader-infer.yaml": {
 			LocalStateTest: true,
@@ -36,7 +36,7 @@ func TestPod(t *testing.T) {
 		},
 		"event-categories.yaml": {
 			LocalStateTest: false,
-			ExpectedHash:   "70bbb67db477c0ec3587ce1dc86be5b5",
+			ExpectedHash:   "467a03d9b6c54745486b6820e07d5df9",
 		},
 	}
 
@@ -53,8 +53,8 @@ func TestPod(t *testing.T) {
 		t.Run(fmt.Sprintf("MeasurementNames() - %s", manifestToTest), testMeasurementNamesFunc(pod))
 		t.Run(fmt.Sprintf("Rewards() - %s", manifestToTest), testRewardsFunc(pod))
 		t.Run(fmt.Sprintf("Actions() - %s", manifestToTest), testActionsFunc(pod))
+		t.Run(fmt.Sprintf("Tags() - %s", manifestToTest), testTagsFunc(pod))
 		t.Run(fmt.Sprintf("CachedCsv() - %s", manifestToTest), testCachedCsvFunc(pod))
-		t.Run(fmt.Sprintf("TagPathMap() - %s", manifestToTest), testTagPathMap(pod))
 
 		if testParams.LocalStateTest {
 			t.Run(fmt.Sprintf("AddLocalState() - %s", manifestToTest), testAddLocalStateFunc(pod))
@@ -218,7 +218,7 @@ func testRewardsFunc(pod *Pod) func(*testing.T) {
 			}
 		}
 
-		assert.Equal(t, expected, actual, "invalid pod.Rewards()")
+		assert.Equal(t, expected, actual, "invalid pod.Rewards()", pod.Name)
 	}
 }
 
@@ -253,6 +253,18 @@ func testActionsFunc(pod *Pod) func(*testing.T) {
 	}
 }
 
+// Tests Tags() getter
+func testTagsFunc(pod *Pod) func(*testing.T) {
+	return func(t *testing.T) {
+		actualTags := pod.Tags()
+
+		err := snapshotter.SnapshotMulti(pod.Name+"_tags", actualTags)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 // Tests CachedCsv() getter
 func testCachedCsvFunc(pod *Pod) func(*testing.T) {
 	return func(t *testing.T) {
@@ -271,25 +283,6 @@ func testCachedCsvFunc(pod *Pod) func(*testing.T) {
 		actual := pod.CachedCsv()
 
 		snapshotter.SnapshotT(t, actual)
-	}
-}
-
-// Tests TagPathMap()
-func testTagPathMap(pod *Pod) func(*testing.T) {
-	return func(t *testing.T) {
-		actualMap := pod.TagPathMap()
-
-		var expected map[string][]string
-		switch pod.Name {
-		case "event-tags":
-			expected = map[string][]string{"event.data": {"tagA", "tagB", "tagC"}}
-		case "event-categories":
-			expected = map[string][]string{"event.stream": {"tagA", "tagB", "tagC"}}
-		default:
-			expected = make(map[string][]string)
-		}
-
-		assert.Equal(t, expected, actualMap)
 	}
 }
 
