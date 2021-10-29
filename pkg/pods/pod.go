@@ -28,19 +28,19 @@ import (
 
 type Pod struct {
 	spec.PodSpec
-	podParams          *PodParams
-	hash               string
-	manifestPath       string
-	dataspaces         []*dataspace.Dataspace
-	dataspaceMap       map[string]*dataspace.Dataspace
-	actions            map[string]string
-	measurements       map[string]*dataspace.Measurement
-	fqMeasurementNames []string
-	fqCategoryNames    []string
-	tags               []string
-	flights            map[string]*flights.Flight
-	viper              *viper.Viper
-	externalRewardMemo string
+	podParams           *PodParams
+	hash                string
+	manifestPath        string
+	dataspaces          []*dataspace.Dataspace
+	dataspaceMap        map[string]*dataspace.Dataspace
+	actions             map[string]string
+	measurements        map[string]*dataspace.Measurement
+	fqMeasurementNames  []string
+	fqCategoryNames     []string
+	tags                []string
+	flights             map[string]*flights.Flight
+	viper               *viper.Viper
+	externalRewardFuncs string
 
 	podLocalStateMutex    sync.RWMutex
 	podLocalState         []*state.State
@@ -218,27 +218,8 @@ func (pod *Pod) ActionsArgs() []string {
 	return actionsArgs
 }
 
-func (pod *Pod) ExternalRewardFuncs() (string, error) {
-	if pod.Training.RewardFuncs == "" {
-		return "", nil
-	}
-
-	if !strings.HasSuffix(pod.Training.RewardFuncs, ".py") {
-		return "", errors.New("external reward functions must be defined in a single Python file - see https://docs.spiceai.org/concepts/rewards/")
-	}
-
-	// If we've already loaded the file, just return the contents
-	if pod.externalRewardMemo != "" {
-		return pod.externalRewardMemo, nil
-	}
-
-	rewardFuncBytes, err := os.ReadFile(pod.Training.RewardFuncs)
-	if err != nil {
-		return "", err
-	}
-
-	pod.externalRewardMemo = string(rewardFuncBytes)
-	return pod.externalRewardMemo, nil
+func (pod *Pod) ExternalRewardFuncs() string {
+	return pod.externalRewardFuncs
 }
 
 func (pod *Pod) Rewards() map[string]string {
@@ -475,6 +456,19 @@ func loadPod(podPath string, hash string) (*Pod, error) {
 	pod.tags = tags
 
 	pod.interpretations = interpretations.NewInterpretationsStore(pod.Epoch(), pod.Period(), pod.Granularity())
+
+	if pod.Training.RewardFuncs != "" {
+		if !strings.HasSuffix(pod.Training.RewardFuncs, ".py") {
+			return nil, errors.New("external reward functions must be defined in a single Python file - see https://docs.spiceai.org/concepts/rewards/")
+		}
+
+		rewardFuncBytes, err := os.ReadFile(pod.Training.RewardFuncs)
+		if err != nil {
+			return nil, err
+		}
+
+		pod.externalRewardFuncs = string(rewardFuncBytes)
+	}
 
 	return pod, err
 }
