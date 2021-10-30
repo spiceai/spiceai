@@ -273,7 +273,10 @@ func (pod *Pod) ValidateForTraining() error {
 	if pod.PodSpec.Dataspaces == nil || len(pod.PodSpec.Dataspaces) < 1 {
 		return errors.New("at least one dataspace is required for training")
 	}
-
+	if pod.LearningAlgorithm() == "dql" && pod.LearningAlgorithm() == "vpg" {
+		errors.New(fmt.Sprintf("unsupported learning algorithm '%s'. To learn about support algorithms refer to" +
+			" https://docs.spiceai.org/deep-learning-ai/", pod.LearningAlgorithm()))
+	}
 	for _, ds := range pod.PodSpec.Dataspaces {
 		for _, f := range ds.Measurements {
 			switch f.Fill {

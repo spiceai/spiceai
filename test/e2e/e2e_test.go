@@ -480,6 +480,32 @@ func TestTrainingOutput(t *testing.T) {
 	}
 }
 
+func TestTrainingValidatesLearningAlgorithm(t *testing.T) {
+	if !shouldRunTest {
+		t.Skip("Specify '-e2e' to run e2e tests")
+		return
+	}
+
+	err := runtime.startRuntime()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() {
+		err := runtime.shutdown()
+		if err != nil {
+			log.Fatalln(err.Error())
+		}
+	})
+
+	t.Log("*** Start Training ***")
+	err = cliClient.runCliCmd("train", "trader", "--context", spicedContext, "--learning-algorithm", "abc")
+	if err == nil {
+		t.Fatal(err)
+	}
+	assert.Contains(t, err.Error(), "unsupported learning algorithm 'abc'", "expected error unsupported learning algorithm")
+}
+
 func TestPodWithTags(t *testing.T) {
 	if !shouldRunTest {
 		t.Skip("Specify '-e2e' to run e2e tests")

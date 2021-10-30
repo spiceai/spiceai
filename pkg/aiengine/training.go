@@ -2,6 +2,7 @@ package aiengine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"time"
@@ -32,8 +33,11 @@ func StartTraining(pod *pods.Pod, algorithm string, number_episodes int64) error
 		LearningAlgorithm: pod.LearningAlgorithm(),
 	}
 	// Overload pod's parameters
-	if algorithm != "" {
+	if algorithm != "" && (algorithm == "dql" || algorithm == "vpg") {
 		trainRequest.LearningAlgorithm = algorithm
+	} else {
+		errors.New(fmt.Sprintf("unsupported learning algorithm '%s'. To learn about support algorithms " +
+			"refer to https://docs.spiceai.org/deep-learning-ai/", algorithm))
 	}
 	if number_episodes > 0 {
 		trainRequest.NumberEpisodes = number_episodes
