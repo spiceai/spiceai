@@ -57,13 +57,6 @@
     }
   },
   "datasources": [
-    {
-      "connector": {
-        "name": "file",
-        "params": {
-          "path": "../../test/assets/data/csv/csv_data_with_categories.csv"
-        }
-      }
-    }
+    {}
   ]
 }
