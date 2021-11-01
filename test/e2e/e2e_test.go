@@ -35,7 +35,7 @@ var (
 	cliClient          *cli
 	runtime            *runtimeServer
 	snapshotter        *cupaloy.Config
-	testPods           = []string{"test/Trader@0.4.0", "test/customprocessor@0.2.0", "test/event-tags@0.3.0", "test/event-categories@0.2.0"}
+	testPods           = []string{"test/Trader@0.4.0", "test/customprocessor@0.2.0", "test/event-tags@0.3.0", "test/event-categories@0.2.0", "test/trader-seed-streaming@0.1.0"}
 )
 
 func TestMain(m *testing.M) {
@@ -164,7 +164,7 @@ func TestPods(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	assert.Len(t, pods, 4)
+	assert.Len(t, pods, 5)
 
 	sort.SliceStable(pods, func(i, j int) bool {
 		return strings.Compare(pods[i]["name"].(string), pods[j]["name"].(string)) == -1
@@ -254,6 +254,48 @@ func TestObservations(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestSeedAndStreamingObservations(t *testing.T) {
+	if !shouldRunTest {
+		t.Skip("Specify '-e2e' to run e2e tests")
+		return
+	}
+
+	err := runtime.startRuntime()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() {
+		err := runtime.shutdown()
+		if err != nil {
+			log.Fatalln(err.Error())
+		}
+	})
+
+	t.Log("*** Get Observations ***")
+	initialObservationsCsv, err := runtime.getObservations("trader-seed-streaming", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	assert.Greater(t, len(initialObservationsCsv), 952)
+
+	// Fetch the first 951 rows, which is the seed data
+	seedObservations := strings.Join(strings.SplitN(initialObservationsCsv, "\n", 952)[:951], "\n")
+
+	snapshotter.SnapshotT(t, seedObservations)
+
+	// Check we have additional streaming prices
+	additionalObservationsCsv, err := runtime.getObservations("trader-seed-streaming", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Fetch the first 951 rows, which is the seed data
+	additionalObservations := strings.Split(additionalObservationsCsv, "\n")
+	assert.Greater(t, len(additionalObservations), 5)
 }
 
 func TestDataspaceData(t *testing.T) {

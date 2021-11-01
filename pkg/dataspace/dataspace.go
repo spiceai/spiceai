@@ -72,7 +72,7 @@ func NewDataspace(dsSpec spec.DataspaceSpec) (*Dataspace, error) {
 	}
 
 	if dsSpec.SeedData != nil {
-		dataInfo, err := ds.getDataInfo(dsSpec.SeedData, measurementSelectors, categorySelectors, tagSelectors)
+		dataInfo, err := getDataInfo(dsSpec.SeedData, measurementSelectors, categorySelectors, tagSelectors, ds.ReadSeedData)
 		if err != nil {
 			return nil, err
 		}
@@ -80,7 +80,7 @@ func NewDataspace(dsSpec spec.DataspaceSpec) (*Dataspace, error) {
 	}
 
 	if dsSpec.Data != nil {
-		dataInfo, err := ds.getDataInfo(dsSpec.Data, measurementSelectors, categorySelectors, tagSelectors)
+		dataInfo, err := getDataInfo(dsSpec.Data, measurementSelectors, categorySelectors, tagSelectors, ds.ReadData)
 		if err != nil {
 			return nil, err
 		}
@@ -222,13 +222,13 @@ func (ds *Dataspace) RegisterStateHandler(handler func(state *state.State, metad
 }
 
 func (ds *Dataspace) InitDataConnector(epoch time.Time, period time.Duration, interval time.Duration) error {
-	if ds.seedDataInfo != nil {
+	if ds.seedDataInfo != nil && ds.seedDataInfo.connector != nil {
 		if err := ds.seedDataInfo.connector.Init(epoch, period, interval, ds.seedDataInfo.connectorSpec.Params); err != nil {
 			return fmt.Errorf("failed to initialize seed data connector '%s': %s", ds.seedDataInfo.connectorSpec.Name, err)
 		}
 	}
 
-	if ds.dataInfo != nil {
+	if ds.dataInfo != nil && ds.dataInfo.connector != nil {
 		if err := ds.dataInfo.connector.Init(epoch, period, interval, ds.dataInfo.connectorSpec.Params); err != nil {
 			return fmt.Errorf("failed to initialize data connector '%s': %s", ds.dataInfo.connectorSpec.Name, err)
 		}
@@ -237,17 +237,25 @@ func (ds *Dataspace) InitDataConnector(epoch time.Time, period time.Duration, in
 	return nil
 }
 
+func (ds *Dataspace) ReadSeedData(data []byte, metadata map[string]string) ([]byte, error) {
+	return ds.readData(ds.seedDataInfo.processor, data, metadata)
+}
+
 func (ds *Dataspace) ReadData(data []byte, metadata map[string]string) ([]byte, error) {
+	return ds.readData(ds.dataInfo.processor, data, metadata)
+}
+
+func (ds *Dataspace) readData(processor dataprocessors.DataProcessor, data []byte, metadata map[string]string) ([]byte, error) {
 	if data == nil {
 		return nil, nil
 	}
 
-	_, err := ds.dataInfo.processor.OnData(data)
+	_, err := processor.OnData(data)
 	if err != nil {
 		return nil, err
 	}
 
-	observations, err := ds.dataInfo.processor.GetObservations()
+	observations, err := processor.GetObservations()
 	if err != nil {
 		return nil, err
 	}
@@ -261,7 +269,7 @@ func (ds *Dataspace) ReadData(data []byte, metadata map[string]string) ([]byte, 
 	return data, nil
 }
 
-func (ds *Dataspace) getDataInfo(dataSpec *spec.DataSpec, measurementSelectors map[string]string, categorySelectors map[string]string, tagSelectors []string) (*DataInfo, error) {
+func getDataInfo(dataSpec *spec.DataSpec, measurementSelectors map[string]string, categorySelectors map[string]string, tagSelectors []string, readData func(data []byte, metadata map[string]string) ([]byte, error)) (*DataInfo, error) {
 	processor, err := dataprocessors.NewDataProcessor(dataSpec.Processor.Name)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize data processor '%s': %s", dataSpec.Processor.Name, err)
@@ -269,7 +277,7 @@ func (ds *Dataspace) getDataInfo(dataSpec *spec.DataSpec, measurementSelectors m
 
 	err = processor.Init(dataSpec.Connector.Params, measurementSelectors, categorySelectors, tagSelectors)
 	if err != nil {
-		return nil, fmt.Errorf("failed to initialize data processor '%s': %s", dataSpec.Connector.Name, err)
+		return nil, fmt.Errorf("failed to initialize data processor '%s': %s", dataSpec.Processor.Name, err)
 	}
 
 	var connector dataconnectors.DataConnector
@@ -279,7 +287,7 @@ func (ds *Dataspace) getDataInfo(dataSpec *spec.DataSpec, measurementSelectors m
 			return nil, fmt.Errorf("failed to initialize data connector '%s': %s", dataSpec.Connector.Name, err)
 		}
 
-		err = connector.Read(ds.ReadData)
+		err = connector.Read(readData)
 		if err != nil {
 			return nil, fmt.Errorf("'%s' data connector failed to read: %s", dataSpec.Connector.Name, err)
 		}
