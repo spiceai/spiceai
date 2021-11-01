@@ -45,15 +45,21 @@ class DataManager:
         self.current_time: pd.Timestamp = None
         self.action_rewards = action_rewards
 
-        self.reward_funcs_module = None
-        if len(external_reward_funcs) > 0:
-            self.reward_funcs_module = load_module_from_code(external_reward_funcs, "reward_funcs")
-        self.table_lock = threading.Lock()
-
         self.action_names = [None] * len(actions_order)
 
         for action in actions_order:
             self.action_names[actions_order[action]] = action
+
+        self.reward_funcs_module = None
+        if len(external_reward_funcs) > 0:
+            self.reward_funcs_module = load_module_from_code(external_reward_funcs, "reward_funcs")
+
+            self.reward_funcs_module_actions = {}
+            for action_name in self.action_names:
+                reward_func_name = self.action_rewards[action_name]
+                reward_func = getattr(self.reward_funcs_module, reward_func_name)
+                self.reward_funcs_module_actions[action_name] = reward_func
+        self.table_lock = threading.Lock()
 
     def get_window_span(self):
         return math.floor(self.param.interval_secs / self.param.granularity_secs)
@@ -224,8 +230,8 @@ class DataManager:
             new_state_dict[key] = list(new_state_pd[key])[-1]
 
         if self.reward_funcs_module is not None:
-            return self.external_reward(
-                action_name, prev_state_dict, prev_state_interpretations, new_state_dict, new_state_intepretations)
+            reward_func = self.reward_funcs_module_actions[action_name]
+            return reward_func(prev_state_dict, prev_state_interpretations, new_state_dict, new_state_intepretations)
 
         prev_state_dict["interpretations"] = prev_state_interpretations
         new_state_dict["interpretations"] = new_state_intepretations
@@ -246,13 +252,3 @@ class DataManager:
             raise RewardInvalidException(repr(ex)) from ex
 
         return loc["reward"]
-
-    def external_reward(self, action_name: str, prev_state_dict: dict, prev_state_interpretations,
-                        new_state_dict: dict, new_state_intepretations) -> float:
-        try:
-            reward_func_name = self.action_rewards[action_name]
-            reward_func = getattr(self.reward_funcs_module, reward_func_name)
-
-            return reward_func(prev_state_dict, prev_state_interpretations, new_state_dict, new_state_intepretations)
-        except Exception as ex:
-            raise RewardInvalidException(repr(ex)) from ex
