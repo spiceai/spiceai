@@ -11,6 +11,12 @@ class AiEngineException(Exception):
         return f"{self.type} {self.message}"
 
 
+class UnexpectedException(AiEngineException):
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.type = "unexpected_error"
+
+
 class LawInvalidException(AiEngineException):
     def __init__(self, message: str):
         super().__init__(message)

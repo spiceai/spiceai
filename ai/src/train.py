@@ -23,6 +23,7 @@ from utils import print_event
 class Trainer():
     TRAINING_LOCK = threading.Lock()
     SAVED_MODELS: Dict[str, Path] = {}
+    BASE_URL = "http://localhost:8000/api/v0.1/pods"
 
     def __init__(
             self, pod_name: str, data_manager: DataManager, connector_manager: ConnectorManager, algorithm: str,
@@ -37,7 +38,7 @@ class Trainer():
 
         self.action_size = len(data_manager.action_names)
 
-        self.request_url = f"http://localhost:8000/api/v0.1/pods/{pod_name}/training_runs/{flight}/episodes"
+        self.request_url = self.BASE_URL + f"/{pod_name}/training_runs/{flight}/episodes"
 
         self.training_episodes = number_episodes
         self.not_learning_threshold = 3
