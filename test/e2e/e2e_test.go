@@ -330,7 +330,11 @@ func TestDataspaceData(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		err = snapshotter.SnapshotMulti(podName+"_initial_observations.csv", observations)
+		if podName == "trader-seed-streaming" {
+			observations = strings.Join(strings.SplitN(observations, "\n", 952)[:951], "\n")
+		}
+
+		err = snapshotter.SnapshotMulti(podName + "_initial_observations.csv", observations)
 		if err != nil {
 			t.Fatal(err)
 		}
