@@ -105,12 +105,7 @@ func getPodInitForTraining(pod *pods.Pod) *aiengine_pb.InitRequest {
 		dsInitSpec := aiengine_pb.DataSource{
 			Actions: dsActions,
 		}
-		if ds.DataspaceSpec.Data != nil {
-			dsInitSpec.Connector = &aiengine_pb.DataConnector{
-				Name:   ds.DataspaceSpec.Data.Connector.Name,
-				Params: ds.DataspaceSpec.Data.Connector.Params,
-			}
-		} else {
+		if ds.DataspaceSpec.Data == nil {
 			dsInitSpec.Connector = &aiengine_pb.DataConnector{
 				Name: "localstate",
 			}

@@ -84,7 +84,7 @@ class Model:
         return np.argmax(q_value), softmax(q_value)
 
     def train(self, states, targets):
-        self.model.fit(states, targets, epochs=1)
+        self.model.fit(states, targets, epochs=1, verbose=0)
 
 
 class DeepQLearningAgent(SpiceAIAgent):

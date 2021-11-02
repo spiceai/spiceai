@@ -6,9 +6,6 @@ on:
     branches:
       - trunk
       - release-*
-    paths-ignore:
-      - "docs/**"
-      - ".github/**"
 
 jobs:
   proto_unchanged:

@@ -31,13 +31,6 @@
     "event_data_target": {}
   },
   "datasources": [
-    {
-      "connector": {
-        "name": "file",
-        "params": {
-          "path": "../../test/assets/data/csv/csv_data_with_tags.csv"
-        }
-      }
-    }
+    {}
   ]
 }
