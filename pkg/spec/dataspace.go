@@ -3,6 +3,7 @@ package spec
 type DataspaceSpec struct {
 	From         string            `json:"from,omitempty" yaml:"from,omitempty" mapstructure:"from,omitempty"`
 	Name         string            `json:"name,omitempty" yaml:"name,omitempty" mapstructure:"name,omitempty"`
+	SeedData     *DataSpec         `json:"seed_data,omitempty" yaml:"seed_data,omitempty" mapstructure:"seed_data,omitempty"`
 	Data         *DataSpec         `json:"data,omitempty" yaml:"data,omitempty" mapstructure:"data,omitempty"`
 	Measurements []MeasurementSpec `json:"measurements,omitempty" yaml:"measurements,omitempty" mapstructure:"measurements,omitempty"`
 	Categories   []CategorySpec    `json:"categories,omitempty" yaml:"categories,omitempty" mapstructure:"categories,omitempty"`

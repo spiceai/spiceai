@@ -16,7 +16,7 @@ var snapshotter = cupaloy.New(cupaloy.SnapshotSubdirectory("../../test/assets/sn
 
 func TestDataSource(t *testing.T) {
 
-	manifestsToTest := []string{"trader", "event-tags", "event-categories"}
+	manifestsToTest := []string{"trader", "trader-seed", "event-tags", "event-categories"}
 
 	for _, manifestName := range manifestsToTest {
 		v := viper.New()
@@ -134,6 +134,33 @@ func testNewDataspaceFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 		if expectedFQName != actualFQName {
 			t.Errorf("Expected '%s', got '%s'", expectedFQName, actualFQName)
 		}
+
+		switch ds.Name() {
+		case "local/portfolio":
+			assert.Nil(t, ds.Data)
+		case "event/data":
+			assert.NotNil(t, ds.Data)
+			assert.NotNil(t, ds.Data.Processor)
+			assert.NotNil(t, ds.Data.Connector)
+			assert.Nil(t, ds.SeedData)
+		case "event/stream":
+			assert.NotNil(t, ds.Data)
+			assert.NotNil(t, ds.Data.Processor)
+			assert.NotNil(t, ds.Data.Connector)
+			assert.Nil(t, ds.SeedData)
+		case "coinbase/btcusd":
+			assert.NotNil(t, ds.Data)
+			assert.NotNil(t, ds.Data.Processor)
+			assert.NotNil(t, ds.Data.Connector)
+			assert.Nil(t, ds.SeedData)
+		case "coinbase/btcusd_with_seed":
+			assert.NotNil(t, ds.Data)
+			assert.NotNil(t, ds.Data.Processor)
+			assert.NotNil(t, ds.Data.Connector)
+			assert.NotNil(t, ds.SeedData)
+			assert.NotNil(t, ds.SeedData.Processor)
+			assert.NotNil(t, ds.SeedData.Connector)
+		}
 	}
 }
 
@@ -160,6 +187,8 @@ func testActionsFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 		case "event/stream":
 			fallthrough
 		case "coinbase/btcusd":
+			expected = make(map[string]string)
+		case "coinbase/btcusd_with_seed":
 			expected = make(map[string]string)
 		}
 		assert.Equal(t, expected, actual)
@@ -219,11 +248,13 @@ func testMeasurementNamesFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 			expected = map[string]string{
 				"close": "coinbase.btcusd.close",
 			}
+		case "coinbase/btcusd_with_seed":
+			expected = map[string]string{
+				"close": "coinbase.btcusd_with_seed.close",
+			}
 		}
 
-		if !reflect.DeepEqual(expected, actual) {
-			t.Errorf("Expected:\n%v\nGot:\n%v", expected, actual)
-		}
+		assert.Equal(t, expected, actual)
 	}
 }
 
@@ -250,6 +281,8 @@ func testActionNamesFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 		case "event/stream":
 			fallthrough
 		case "coinbase/btcusd":
+			expected = make(map[string]string)
+		case "coinbase/btcusd_with_seed":
 			expected = make(map[string]string)
 		}
 
