@@ -334,7 +334,7 @@ func TestDataspaceData(t *testing.T) {
 			observations = strings.Join(strings.SplitN(observations, "\n", 952)[:951], "\n")
 		}
 
-		err = snapshotter.SnapshotMulti(podName + "_initial_observations.csv", observations)
+		err = snapshotter.SnapshotMulti(podName+"_initial_observations.csv", observations)
 		if err != nil {
 			t.Fatal(err)
 		}

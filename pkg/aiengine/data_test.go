@@ -12,6 +12,7 @@ import (
 	"github.com/spiceai/spiceai/pkg/dataspace"
 	"github.com/spiceai/spiceai/pkg/pods"
 	"github.com/spiceai/spiceai/pkg/state"
+	spice_time "github.com/spiceai/spiceai/pkg/time"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -138,10 +139,12 @@ func testGetCsvAllHeadersWithPreviewFunc() func(*testing.T) {
 		csv := strings.Builder{}
 		epoch := time.Unix(1605312001, 0)
 		headerLine := "open,high,low,close,volume"
+		timeCategories := []string{}
+		timeCategoryFields := spice_time.GenerateTimeCategoryFields(timeCategories...)
 		measurementNames := strings.Split(headerLine, ",")
 		tags := make([]string, 0)
 
-		actualPreviewCsv := getData(&csv, epoch, measurementNames, nil, tags, newObservations, 5)
+		actualPreviewCsv := getData(&csv, epoch, timeCategoryFields, measurementNames, nil, tags, newObservations, 5)
 
 		expectedPreviewCsv := `1605313800,16256.42,16305,16248.6,16305,110.91971
 1605315600,16303.88,16303.88,16210.99,16222.16,231.64805
@@ -194,10 +197,12 @@ func testGetCsvSelectHeadersWithPreviewFunc() func(*testing.T) {
 
 		csv := strings.Builder{}
 		epoch := time.Unix(1605312000, 0)
+		timeCategories := []string{}
+		timeCategoryFields := spice_time.GenerateTimeCategoryFields(timeCategories...)
 		measurementNames := strings.Split("open,high,low,close,volume", ",")
 		tags := make([]string, 0)
 
-		actualPreviewCsv := getData(&csv, epoch, measurementNames, nil, tags, newObservations, 5)
+		actualPreviewCsv := getData(&csv, epoch, timeCategoryFields, measurementNames, nil, tags, newObservations, 5)
 
 		expectedPreviewCsv := `1605312000,16339.56,16339.6,16240,16254.51,274.42607
 1605313800,16256.42,16305,16248.6,16305,110.91971
@@ -255,10 +260,12 @@ func testGetDataWithTagsFunc() func(*testing.T) {
 
 		csv := strings.Builder{}
 		epoch := time.Unix(1610057400, 0)
+		timeCategories := []string{}
+		timeCategoryFields := spice_time.GenerateTimeCategoryFields(timeCategories...)
 		measurementNames := []string{"eventId", "height", "rating", "speed", "target"}
 		tags := []string{"tagA", "tagB", "tagC", "tagD"}
 
-		actualPreviewCsv := getData(&csv, epoch, measurementNames, nil, tags, newObservations, 5)
+		actualPreviewCsv := getData(&csv, epoch, timeCategoryFields, measurementNames, nil, tags, newObservations, 5)
 
 		snapshotter.SnapshotT(t, actualPreviewCsv)
 	}
@@ -312,11 +319,13 @@ func testGetDataWithCategoriesFunc() func(*testing.T) {
 
 		csv := strings.Builder{}
 		epoch := time.Unix(1610057400, 0)
+		timeCategories := []string{}
+		timeCategoryFields := spice_time.GenerateTimeCategoryFields(timeCategories...)
 		measurementNames := []string{"duration", "guest_count", "ticket_price"}
 		tags := []string{"tagA", "tagB", "tagC"}
 
 		t.Log(measurementNames)
-		getData(&csv, epoch, measurementNames, categoriesList, tags, newObservations, 5)
+		getData(&csv, epoch, timeCategoryFields, measurementNames, categoriesList, tags, newObservations, 5)
 
 		snapshotter.SnapshotT(t, csv.String())
 	}

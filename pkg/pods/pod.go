@@ -21,15 +21,20 @@ import (
 	"github.com/spiceai/spiceai/pkg/observations"
 	"github.com/spiceai/spiceai/pkg/spec"
 	"github.com/spiceai/spiceai/pkg/state"
+	spice_time "github.com/spiceai/spiceai/pkg/time"
 	"github.com/spiceai/spiceai/pkg/util"
 	"golang.org/x/sync/errgroup"
 )
 
 type Pod struct {
 	spec.PodSpec
+	viper              *viper.Viper
 	podParams          *PodParams
 	hash               string
 	manifestPath       string
+
+	timeCategories map[string][]spice_time.TimeCategoryInfo
+
 	dataspaces         []*dataspace.Dataspace
 	dataspaceMap       map[string]*dataspace.Dataspace
 	actions            map[string]string
@@ -37,14 +42,16 @@ type Pod struct {
 	fqMeasurementNames []string
 	fqCategoryNames    []string
 	tags               []string
+
 	flights            map[string]*flights.Flight
-	viper              *viper.Viper
 
 	podLocalStateMutex    sync.RWMutex
 	podLocalState         []*state.State
 	podLocalStateHandlers []state.StateHandler
 
 	interpretations *interpretations.InterpretationsStore
+
+	fqCsvHeaders string
 }
 
 func (pod *Pod) Hash() string {
@@ -73,6 +80,10 @@ func (pod *Pod) Epoch() time.Time {
 
 func (pod *Pod) Granularity() time.Duration {
 	return pod.podParams.Granularity
+}
+
+func (pod *Pod) TimeCategories() map[string][]spice_time.TimeCategoryInfo {
+	return pod.timeCategories
 }
 
 func (pod *Pod) TrainingGoal() *string {
@@ -118,14 +129,10 @@ func (pod *Pod) CachedState() []*state.State {
 func (pod *Pod) CachedCsv() string {
 	csv := strings.Builder{}
 
+	csv.WriteString(pod.csvHeaders())
+
 	measurementNames := pod.MeasurementNames()
 	categoryNames := pod.CategoryNames()
-
-	headers := make([]string, 0, len(measurementNames)+len(categoryNames)+1)
-	headers = append(headers, measurementNames...)
-	headers = append(headers, categoryNames...)
-
-	csv.WriteString(fmt.Sprintf("time,%s,_tags\n", strings.Join(headers, ",")))
 
 	cachedState := pod.CachedState()
 	for _, state := range cachedState {
@@ -334,6 +341,10 @@ func (pod *Pod) State() []*state.State {
 	return pod.podLocalState
 }
 
+func (pod *Pod) LearningAlgorithm() string {
+	return pod.podParams.LearningAlgorithm
+}
+
 func (pod *Pod) InitDataConnectors(handler state.StateHandler) error {
 	pod.podLocalStateMutex.Lock()
 	defer pod.podLocalStateMutex.Unlock()
@@ -398,6 +409,10 @@ func loadPod(podPath string, hash string) (*Pod, error) {
 	pod.hash = hash
 	if pod.Name == "" {
 		pod.Name = strings.TrimSuffix(filepath.Base(podPath), filepath.Ext(podPath))
+	}
+
+	if pod.Time != nil && len(pod.Time.Categories) > 0 {
+		pod.timeCategories = spice_time.GenerateTimeCategoryFields(pod.Time.Categories...)
 	}
 
 	pod.flights = make(map[string]*flights.Flight)
@@ -513,10 +528,6 @@ func (pod *Pod) loadParams() error {
 	return nil
 }
 
-func (pod *Pod) LearningAlgorithm() string {
-	return pod.podParams.LearningAlgorithm
-}
-
 func (pod *Pod) getActions() map[string]string {
 	allDataSourceActions := make(map[string]string)
 	var dataSourcePrefixes []string
@@ -572,4 +583,16 @@ func (pod *Pod) getActions() map[string]string {
 		}
 	}
 	return actions
+}
+
+func (pod *Pod)csvHeaders() string {
+	if pod.fqCsvHeaders == "" {
+		headers := make([]string, 0, len(pod.fqMeasurementNames)+len(pod.fqCategoryNames))
+		headers = append(headers, pod.fqMeasurementNames...)
+		headers = append(headers, pod.fqCategoryNames...)
+
+		pod.fqCsvHeaders = fmt.Sprintf("time,%s,_tags\n", strings.Join(headers, ","))
+	}
+
+	return pod.fqCsvHeaders
 }

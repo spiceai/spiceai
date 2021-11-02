@@ -3,9 +3,14 @@ package spec
 type PodSpec struct {
 	Name       string            `json:"name,omitempty" yaml:"name,omitempty" mapstructure:"name,omitempty"`
 	Params     map[string]string `json:"params,omitempty" yaml:"params,omitempty" mapstructure:"params,omitempty"`
+	Time       *TimeSpec         `json:"time,omitempty" yaml:"time,omitempty" mapstructure:"time,omitempty"`
 	Dataspaces []DataspaceSpec   `json:"dataspaces,omitempty" yaml:"dataspaces,omitempty" mapstructure:"dataspaces,omitempty"`
 	Actions    []PodActionSpec   `json:"actions,omitempty" yaml:"actions,omitempty" mapstructure:"actions,omitempty"`
 	Training   *TrainingSpec     `json:"training,omitempty" yaml:"training,omitempty" mapstructure:"training,omitempty"`
+}
+
+type TimeSpec struct {
+	Categories []string `json:"categories,omitempty" yaml:"categories,omitempty" mapstructure:"categories,omitempty"`
 }
 
 type PodActionSpec struct {

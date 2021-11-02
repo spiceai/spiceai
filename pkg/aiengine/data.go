@@ -13,6 +13,7 @@ import (
 	"github.com/spiceai/spiceai/pkg/pods"
 	"github.com/spiceai/spiceai/pkg/proto/aiengine_pb"
 	"github.com/spiceai/spiceai/pkg/state"
+	spice_time "github.com/spiceai/spiceai/pkg/time"
 )
 
 func SendData(pod *pods.Pod, podState ...*state.State) error {
@@ -85,7 +86,7 @@ func getAddDataRequest(pod *pods.Pod, s *state.State) *aiengine_pb.AddDataReques
 		return nil
 	}
 
-	csvPreview := getData(&csv, pod.Epoch(), s.MeasurementsNames(), categories, ds.Tags(), observationData, 5)
+	csvPreview := getData(&csv, pod.Epoch(), pod.TimeCategories(), s.MeasurementsNames(), categories, ds.Tags(), observationData, 5)
 
 	zaplog.Sugar().Debugf("Posting data to AI engine:\n%s", aurora.BrightYellow(fmt.Sprintf("%s%s...\n%d observations posted", csv.String(), csvPreview, len(observationData))))
 
@@ -97,14 +98,35 @@ func getAddDataRequest(pod *pods.Pod, s *state.State) *aiengine_pb.AddDataReques
 	return addDataRequest
 }
 
-func getData(csv *strings.Builder, epoch time.Time, fqMeasurementNames []string, categories []*dataspace.CategoryInfo, tags []string, observations []observations.Observation, previewLines int) string {
+func getData(csv *strings.Builder, epoch time.Time, timeCategories map[string][]spice_time.TimeCategoryInfo, fqMeasurementNames []string, categories []*dataspace.CategoryInfo, tags []string, observations []observations.Observation, previewLines int) string {
 	epochTime := epoch.Unix()
 	var csvPreview string
 	for i, o := range observations {
 		if o.Time < epochTime {
 			continue
 		}
+		time := time.Unix(o.Time, 0)
 		csv.WriteString(strconv.FormatInt(o.Time, 10))
+
+		for timeCategory, tcInfos := range timeCategories {
+			csv.WriteString(",")
+			var tcVal int
+			switch timeCategory {
+				case spice_time.CategoryDayOfYear:
+				tcVal = time.YearDay()
+				case spice_time.CategoryMonth:
+					tcVal = int(time.Month())
+				case spice_time.CategoryDayOfMonth:
+					tcVal = time.Day()
+				case spice_time.CategoryDayOfWeek:
+					tcVal = int(time.Weekday())
+				case spice_time.CategoryHour:
+					tcVal = time.Hour()
+			}
+			for _, tcInfo := range tcInfos {
+				writeBool(csv, tcVal == tcInfo.Value)
+			}
+		}
 
 		for _, f := range fqMeasurementNames {
 			csv.WriteString(",")
@@ -116,11 +138,8 @@ func getData(csv *strings.Builder, epoch time.Time, fqMeasurementNames []string,
 		for _, category := range categories {
 			for _, val := range category.Values {
 				csv.WriteString(",")
-				if foundVal, ok := o.Categories[category.Name]; ok && foundVal == val {
-					csv.WriteString("1")
-				} else {
-					csv.WriteString("0")
-				}
+				foundVal, ok := o.Categories[category.Name]
+				writeBool(csv, ok && foundVal == val)
 			}
 		}
 
@@ -135,11 +154,7 @@ func getData(csv *strings.Builder, epoch time.Time, fqMeasurementNames []string,
 				}
 			}
 
-			if hasTag {
-				csv.WriteString("1")
-			} else {
-				csv.WriteString("0")
-			}
+			writeBool(csv, hasTag)
 		}
 		csv.WriteString("\n")
 		if previewLines > 0 && (i+1 == previewLines || (previewLines >= i && i+1 == len(observations))) {
@@ -147,4 +162,12 @@ func getData(csv *strings.Builder, epoch time.Time, fqMeasurementNames []string,
 		}
 	}
 	return csvPreview
+}
+
+func writeBool(csv *strings.Builder, value bool) {
+	if value {
+		csv.WriteString("1")
+	} else {
+		csv.WriteString("0")
+	}
 }
