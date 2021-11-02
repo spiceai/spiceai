@@ -52,7 +52,7 @@ func testGetAddDataRequestFunc() func(*testing.T) {
 			"target_audience": "target_audience",
 		}
 
-		tagSelectors := []string {
+		tagSelectors := []string{
 			"tags",
 		}
 
