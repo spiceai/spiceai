@@ -44,6 +44,7 @@ class StatefulConnectorTests(unittest.TestCase):
                 "bar_action": 1,
             },
             laws=["bar >= 0"],
+            external_reward_funcs="",
         )
 
         self.data_manager.merge_data(self.original_data)

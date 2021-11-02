@@ -11,7 +11,7 @@ from exception import RewardInvalidException
 from metrics import metrics
 from proto.common.v1 import common_pb2
 from proto.aiengine.v1 import aiengine_pb2
-from exec import somewhat_safe_exec
+from exec import somewhat_safe_exec, load_module_from_code
 
 
 class DataParam:
@@ -26,7 +26,7 @@ class DataParam:
 
 class DataManager:
     def __init__(self, param: DataParam, fields: Dict[str, aiengine_pb2.FieldData], action_rewards: Dict[str, str],
-                 actions_order: Dict[str, int], laws: List[str]):
+                 actions_order: Dict[str, int], external_reward_funcs: str, laws: List[str]):
         self.fields = fields
         self.laws = laws
         self.param = param
@@ -44,12 +44,22 @@ class DataManager:
 
         self.current_time: pd.Timestamp = None
         self.action_rewards = action_rewards
-        self.table_lock = threading.Lock()
 
         self.action_names = [None] * len(actions_order)
 
         for action in actions_order:
             self.action_names[actions_order[action]] = action
+
+        self.reward_funcs_module = None
+        if len(external_reward_funcs) > 0:
+            self.reward_funcs_module = load_module_from_code(external_reward_funcs, "reward_funcs")
+
+            self.reward_funcs_module_actions = {}
+            for action_name in self.action_names:
+                reward_func_name = self.action_rewards[action_name]
+                reward_func = getattr(self.reward_funcs_module, reward_func_name)
+                self.reward_funcs_module_actions[action_name] = reward_func
+        self.table_lock = threading.Lock()
 
     def get_window_span(self):
         return math.floor(self.param.interval_secs / self.param.granularity_secs)
@@ -210,13 +220,18 @@ class DataManager:
         new_state_pd,
         new_state_intepretations,
         action: int,
-    ):
+    ) -> float:
         prev_state_dict = {}
         new_state_dict = {}
+        action_name = self.action_names[action]
 
         for key in prev_state_pd:
             prev_state_dict[key] = list(prev_state_pd[key])[-1]
             new_state_dict[key] = list(new_state_pd[key])[-1]
+
+        if self.reward_funcs_module is not None:
+            reward_func = self.reward_funcs_module_actions[action_name]
+            return reward_func(prev_state_dict, prev_state_interpretations, new_state_dict, new_state_intepretations)
 
         prev_state_dict["interpretations"] = prev_state_interpretations
         new_state_dict["interpretations"] = new_state_intepretations
@@ -229,7 +244,6 @@ class DataManager:
         loc["new_state"] = new_state
         loc["print"] = print
 
-        action_name = self.action_names[action]
         reward_func = self.action_rewards[action_name]
 
         try:

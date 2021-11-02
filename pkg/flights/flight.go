@@ -81,7 +81,7 @@ func (f *Flight) complete(err error) {
 	f.end = time.Now()
 	f.err = err
 	if err != nil {
-		fmt.Printf("Flight '%s' stopped on episode %d with error: %s\n", f.id, len(f.Episodes())+1, aurora.Red(err))
+		fmt.Printf("Training run '%s' stopped on episode %d with error: %s\n", f.id, len(f.Episodes())+1, aurora.Red(err))
 	}
 	f.isDone <- true
 }
