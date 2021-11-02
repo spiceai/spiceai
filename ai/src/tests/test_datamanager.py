@@ -23,6 +23,7 @@ class DataManagerTestCase(unittest.TestCase):
             action_rewards={"foo": "bar"},
             actions_order={"foo": 0},
             laws=["law"],
+            external_reward_funcs="",
         )
 
         # Leave a gap at time 40
@@ -53,6 +54,7 @@ class DataManagerTestCase(unittest.TestCase):
             action_rewards={"foo": "bar"},
             actions_order={"foo": 0},
             laws=["law"],
+            external_reward_funcs="",
         )
 
         # Leave a gap at time 40
@@ -79,6 +81,7 @@ class DataManagerTestCase(unittest.TestCase):
             action_rewards={"foo": "bar"},
             actions_order={"foo": 0},
             laws=["law"],
+            external_reward_funcs="",
         )
 
         original_csv = "time,foo\n10,1.0\n20,2.0\n30,3.0"
@@ -133,6 +136,7 @@ class DataManagerTestCase(unittest.TestCase):
                 action_rewards={"foo": "bar"},
                 actions_order={"foo": 0},
                 laws=["law"],
+                external_reward_funcs="",
             )
 
             self.assertEqual(
@@ -159,6 +163,7 @@ class DataManagerTestCase(unittest.TestCase):
                 action_rewards={"foo": "bar"},
                 actions_order={"foo": 0},
                 laws=["law"],
+                external_reward_funcs="",
             )
 
             self.assertEqual(
@@ -180,6 +185,7 @@ class DataManagerTestCase(unittest.TestCase):
             action_rewards={"foo": "bar"},
             actions_order={"foo": 0},
             laws=["law"],
+            external_reward_funcs="",
         )
 
         self.assertIsNone(data_manager.current_time)
@@ -202,6 +208,7 @@ class DataManagerTestCase(unittest.TestCase):
             action_rewards={"foo": "bar"},
             actions_order={"foo": 0},
             laws=["law"],
+            external_reward_funcs="",
         )
 
         original_csv = "time,foo\n10,1.0\n20,2.0\n30,3.0"

@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -43,6 +44,7 @@ type Pod struct {
 	fqMeasurementNames []string
 	fqCategoryNames    []string
 	tags               []string
+	externalRewardFuncs string
 
 	flights map[string]*flights.Flight
 
@@ -226,6 +228,10 @@ func (pod *Pod) ActionsArgs() []string {
 	}
 
 	return actionsArgs
+}
+
+func (pod *Pod) ExternalRewardFuncs() string {
+	return pod.externalRewardFuncs
 }
 
 func (pod *Pod) Rewards() map[string]string {
@@ -476,6 +482,19 @@ func loadPod(podPath string, hash string) (*Pod, error) {
 	pod.tags = tags
 
 	pod.interpretations = interpretations.NewInterpretationsStore(pod.Epoch(), pod.Period(), pod.Granularity())
+
+	if pod.Training.RewardFuncs != "" {
+		if !strings.HasSuffix(pod.Training.RewardFuncs, ".py") {
+			return nil, errors.New("external reward functions must be defined in a single Python file - see https://docs.spiceai.org/concepts/rewards/")
+		}
+
+		rewardFuncBytes, err := os.ReadFile(pod.Training.RewardFuncs)
+		if err != nil {
+			return nil, err
+		}
+
+		pod.externalRewardFuncs = string(rewardFuncBytes)
+	}
 
 	return pod, err
 }
