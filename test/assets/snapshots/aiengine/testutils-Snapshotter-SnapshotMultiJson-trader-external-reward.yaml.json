@@ -24,14 +24,7 @@
     "local_portfolio_btc_balance \u003e= 0"
   ],
   "datasources": [
-    {
-      "connector": {
-        "name": "file",
-        "params": {
-          "path": "../../test/assets/data/btcusd.csv"
-        }
-      }
-    },
+    {},
     {
       "connector": {
         "name": "localstate"
