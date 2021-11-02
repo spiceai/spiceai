@@ -10,7 +10,6 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 
 Spice.ai is still under early development, so there are several gaps and limitations, including:
 
-- Simulated environment support is very limited
 - Splitting of data (training/testing/etc)
 - Custom environments are not yet supported
 - Custom visualizations are not yet supported
@@ -27,20 +26,19 @@ Spice.ai is still under early development, so there are several gaps and limitat
 
 ## Tentative v0.4-alpha (Nov, 2021) roadmap
 
-- Improved data visualization in dashboard
 - Additional ML algorithm (A2C/A3C or SAC)
 - Externally editable and testable reward functions (Python)
 
 ## Tentative v0.5-alpha (Dec, 2021) roadmap
 
-- Self-host on baremetal or VM
-- Local Pod/Flight monitoring (WebSockets)
+- Improved data visualization in dashboard
 - Multiple AI Engine backends (E.g. PyTorch, Scikit-learn, etc.)
-- First-class simulated environment
 - Pluggable environments
 
 ## Tentative v0.6-alpha (Jan, 2022) roadmap
 
+- Local Pod/Flight monitoring (WebSockets)
+- Self-host on baremetal or VM
 - Search, index, publish and browse the Spice Rack registry
 - CI/CD on GitHub
 - Custom visualization hooks for Dataspaces
