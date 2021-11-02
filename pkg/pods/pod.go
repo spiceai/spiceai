@@ -28,12 +28,13 @@ import (
 
 type Pod struct {
 	spec.PodSpec
-	viper              *viper.Viper
-	podParams          *PodParams
-	hash               string
-	manifestPath       string
+	viper        *viper.Viper
+	podParams    *PodParams
+	hash         string
+	manifestPath string
 
-	timeCategories map[string][]spice_time.TimeCategoryInfo
+	timeCategories    map[string][]spice_time.TimeCategoryInfo
+	timeCategoryNames []string
 
 	dataspaces         []*dataspace.Dataspace
 	dataspaceMap       map[string]*dataspace.Dataspace
@@ -43,7 +44,7 @@ type Pod struct {
 	fqCategoryNames    []string
 	tags               []string
 
-	flights            map[string]*flights.Flight
+	flights map[string]*flights.Flight
 
 	podLocalStateMutex    sync.RWMutex
 	podLocalState         []*state.State
@@ -84,6 +85,10 @@ func (pod *Pod) Granularity() time.Duration {
 
 func (pod *Pod) TimeCategories() map[string][]spice_time.TimeCategoryInfo {
 	return pod.timeCategories
+}
+
+func (pod *Pod) TimeCategoryNames() []string {
+	return pod.timeCategoryNames
 }
 
 func (pod *Pod) TrainingGoal() *string {
@@ -413,6 +418,12 @@ func loadPod(podPath string, hash string) (*Pod, error) {
 
 	if pod.Time != nil && len(pod.Time.Categories) > 0 {
 		pod.timeCategories = spice_time.GenerateTimeCategoryFields(pod.Time.Categories...)
+		names := make([]string, len(pod.timeCategories))
+		for name := range pod.timeCategories {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		pod.timeCategoryNames = names
 	}
 
 	pod.flights = make(map[string]*flights.Flight)
@@ -585,7 +596,7 @@ func (pod *Pod) getActions() map[string]string {
 	return actions
 }
 
-func (pod *Pod)csvHeaders() string {
+func (pod *Pod) csvHeaders() string {
 	if pod.fqCsvHeaders == "" {
 		headers := make([]string, 0, len(pod.fqMeasurementNames)+len(pod.fqCategoryNames))
 		headers = append(headers, pod.fqMeasurementNames...)

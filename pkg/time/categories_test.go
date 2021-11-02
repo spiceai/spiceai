@@ -9,9 +9,15 @@ import (
 var snapshotter = testutils.NewSnapshotter("../../test/assets/snapshots/time/categories")
 
 func TestGenerateTimeCategoryFieldsAll(t *testing.T) {
-	fields := []string { CategoryDayOfYear, CategoryDayOfMonth, CategoryMonth, CategoryDayOfWeek, CategoryHour }
+	fields := []string{CategoryDayOfYear, CategoryDayOfMonth, CategoryMonth, CategoryDayOfWeek, CategoryHour}
 	cols := GenerateTimeCategoryFields(fields...)
-	snapshotter.SnapshotTJson(t, cols)
+
+	for _, name := range fields {
+		err := snapshotter.SnapshotMultiJson(name, cols)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
 }
 
 func TestGenerateTimeCategoryFieldsDayOfYear(t *testing.T) {

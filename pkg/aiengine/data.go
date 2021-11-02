@@ -64,20 +64,31 @@ func getAddDataRequest(pod *pods.Pod, s *state.State) *aiengine_pb.AddDataReques
 
 	csv := strings.Builder{}
 	csv.WriteString("time")
+
+	for _, fields := range pod.TimeCategories() {
+		for _, f := range fields {
+			csv.WriteString(",")
+			csv.WriteString(f.FieldName)
+		}
+	}
+
 	for _, field := range s.FqMeasurementsNames() {
 		csv.WriteString(",")
 		csv.WriteString(strings.ReplaceAll(field, ".", "_"))
 	}
+
 	for _, category := range categories {
 		for _, categoryFieldName := range category.EncodedFieldNames {
 			csv.WriteString(",")
 			csv.WriteString(categoryFieldName)
 		}
 	}
+
 	for _, fqTagName := range ds.FqTags() {
 		csv.WriteString(",")
 		csv.WriteString(strings.ReplaceAll(fqTagName, ".", "_"))
 	}
+
 	csv.WriteString("\n")
 
 	observationData := s.Observations()
@@ -86,7 +97,7 @@ func getAddDataRequest(pod *pods.Pod, s *state.State) *aiengine_pb.AddDataReques
 		return nil
 	}
 
-	csvPreview := getData(&csv, pod.Epoch(), pod.TimeCategories(), s.MeasurementsNames(), categories, ds.Tags(), observationData, 5)
+	csvPreview := getData(&csv, pod.Epoch(), pod.TimeCategoryNames(), pod.TimeCategories(), s.MeasurementsNames(), categories, ds.Tags(), observationData, 5)
 
 	zaplog.Sugar().Debugf("Posting data to AI engine:\n%s", aurora.BrightYellow(fmt.Sprintf("%s%s...\n%d observations posted", csv.String(), csvPreview, len(observationData))))
 
@@ -98,7 +109,7 @@ func getAddDataRequest(pod *pods.Pod, s *state.State) *aiengine_pb.AddDataReques
 	return addDataRequest
 }
 
-func getData(csv *strings.Builder, epoch time.Time, timeCategories map[string][]spice_time.TimeCategoryInfo, fqMeasurementNames []string, categories []*dataspace.CategoryInfo, tags []string, observations []observations.Observation, previewLines int) string {
+func getData(csv *strings.Builder, epoch time.Time, timeCategoryNames []string, timeCategories map[string][]spice_time.TimeCategoryInfo, fqMeasurementNames []string, categories []*dataspace.CategoryInfo, tags []string, observations []observations.Observation, previewLines int) string {
 	epochTime := epoch.Unix()
 	var csvPreview string
 	for i, o := range observations {
@@ -108,22 +119,23 @@ func getData(csv *strings.Builder, epoch time.Time, timeCategories map[string][]
 		time := time.Unix(o.Time, 0)
 		csv.WriteString(strconv.FormatInt(o.Time, 10))
 
-		for timeCategory, tcInfos := range timeCategories {
-			csv.WriteString(",")
+		for _, name := range timeCategoryNames {
+			tcInfos := timeCategories[name]
 			var tcVal int
-			switch timeCategory {
-				case spice_time.CategoryDayOfYear:
+			switch name {
+			case spice_time.CategoryDayOfYear:
 				tcVal = time.YearDay()
-				case spice_time.CategoryMonth:
-					tcVal = int(time.Month())
-				case spice_time.CategoryDayOfMonth:
-					tcVal = time.Day()
-				case spice_time.CategoryDayOfWeek:
-					tcVal = int(time.Weekday())
-				case spice_time.CategoryHour:
-					tcVal = time.Hour()
+			case spice_time.CategoryMonth:
+				tcVal = int(time.Month())
+			case spice_time.CategoryDayOfMonth:
+				tcVal = time.Day()
+			case spice_time.CategoryDayOfWeek:
+				tcVal = int(time.Weekday())
+			case spice_time.CategoryHour:
+				tcVal = time.Hour()
 			}
 			for _, tcInfo := range tcInfos {
+				csv.WriteString(",")
 				writeBool(csv, tcVal == tcInfo.Value)
 			}
 		}

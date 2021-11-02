@@ -4,6 +4,10 @@ params:
   period: 24h
   interval: 4000s
   granularity: 400s
+time:
+  categories:
+    - dayofyear
+    - month
 dataspaces:
   - from: event
     name: stream
