@@ -5,11 +5,13 @@ import os
 from pathlib import Path
 import signal
 import threading
+import traceback
 from typing import Dict
 
 import grpc
 import pandas as pd
 from psutil import Process
+import requests
 
 from algorithms.factory import get_agent
 from algorithms.agent_interface import SpiceAIAgent
@@ -17,7 +19,7 @@ from cleanup import cleanup_on_shutdown
 from connector.manager import ConnectorManager, ConnectorName
 from connector.stateful import StatefulConnector
 from data import DataParam, DataManager
-from exception import InvalidDataShapeException
+from exception import UnexpectedException, InvalidDataShapeException
 from proto.aiengine.v1 import aiengine_pb2, aiengine_pb2_grpc
 from train import Trainer
 from validation import validate_rewards
@@ -34,7 +36,11 @@ class Dispatch:
 def train_agent(
         pod_name: str, data_manager: DataManager, connector_manager: ConnectorManager, algorithm: str,
         number_episodes: int, flight: str, training_goal: str):
-    Trainer(pod_name, data_manager, connector_manager, algorithm, number_episodes, flight, training_goal).train()
+    try:
+        Trainer(pod_name, data_manager, connector_manager, algorithm, number_episodes, flight, training_goal).train()
+    except Exception:
+        request_url = Trainer.BASE_URL + f"/{pod_name}/training_runs/{flight}/episodes"
+        requests.post(request_url, json=UnexpectedException(traceback.format_exc()).get_error_body())
 
 
 def dispatch_train_agent(
