@@ -31,13 +31,6 @@
         "sell": "local_portfolio_usd_balance += args.price\nlocal_portfolio_btc_balance -= 1"
       }
     },
-    {
-      "connector": {
-        "name": "file",
-        "params": {
-          "path": "../../test/assets/data/csv/COINBASE_BTCUSD, 30.csv"
-        }
-      }
-    }
+    {}
   ]
 }
