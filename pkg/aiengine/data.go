@@ -125,8 +125,6 @@ func getData(csv *strings.Builder, epoch time.Time, timeCategoryNames []string, 
 			tcInfos := timeCategories[name]
 			var tcVal int
 			switch name {
-			case spice_time.CategoryDayOfYear:
-				tcVal = time.YearDay()
 			case spice_time.CategoryMonth:
 				tcVal = int(time.Month())
 			case spice_time.CategoryDayOfMonth:

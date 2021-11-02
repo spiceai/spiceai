@@ -6,7 +6,6 @@ import (
 )
 
 const (
-	CategoryDayOfYear  = "dayofyear"
 	CategoryMonth      = "month"
 	CategoryDayOfMonth = "dayofmonth"
 	CategoryDayOfWeek  = "dayofweek"
@@ -23,13 +22,6 @@ func GenerateTimeCategoryFields(timeCategories ...string) map[string][]TimeCateg
 	for _, timeCategory := range timeCategories {
 		cols := []TimeCategoryInfo{}
 		switch timeCategory {
-		case CategoryDayOfYear:
-			for i := 1; i <= 366; i++ {
-				cols = append(cols, TimeCategoryInfo{
-					FieldName: fmt.Sprintf("time_yearday_%03d", i),
-					Value:     int(i),
-				})
-			}
 		case CategoryMonth:
 			for i := time.January; i <= time.December; i++ {
 				cols = append(cols, TimeCategoryInfo{
