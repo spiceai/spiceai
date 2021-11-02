@@ -56,5 +56,14 @@
       "local.portfolio.usd_balance"
     ],
     "name": "trader-external-funcs"
+  },
+  {
+    "manifest_path": "fixed",
+    "measurements": [
+      "coinbase.btcusd.price",
+      "local.portfolio.btc_balance",
+      "local.portfolio.usd_balance"
+    ],
+    "name": "trader-seed-streaming"
   }
 ]
