@@ -37,13 +37,13 @@ type Pod struct {
 	timeCategories    map[string][]spice_time.TimeCategoryInfo
 	timeCategoryNames []string
 
-	dataspaces         []*dataspace.Dataspace
-	dataspaceMap       map[string]*dataspace.Dataspace
-	actions            map[string]string
-	measurements       map[string]*dataspace.Measurement
-	fqMeasurementNames []string
-	fqCategoryNames    []string
-	tags               []string
+	dataspaces          []*dataspace.Dataspace
+	dataspaceMap        map[string]*dataspace.Dataspace
+	actions             map[string]string
+	measurements        map[string]*dataspace.Measurement
+	fqMeasurementNames  []string
+	fqCategoryNames     []string
+	tags                []string
 	externalRewardFuncs string
 
 	flights map[string]*flights.Flight
