@@ -106,7 +106,7 @@ func (r *runtimeServer) postObservations(podName string, newObservations []byte)
 	}
 
 	if resp.StatusCode >= 400 {
-		return fmt.Errorf("error posting new observations: %s", resp.Status)
+		return getResponseError(resp, "error posting new observations")
 	}
 
 	return nil
@@ -120,7 +120,7 @@ func (r *runtimeServer) postDataspace(podName string, dataspaceFrom string, data
 	}
 
 	if resp.StatusCode >= 400 {
-		return fmt.Errorf("error posting new data to dataspace: %s", resp.Status)
+		return getResponseError(resp, "error posting data to dataspace")
 	}
 
 	return nil
@@ -196,7 +196,7 @@ func (r *runtimeServer) postInterpretations(podName string, newInterpretations [
 	}
 
 	if resp.StatusCode >= 400 {
-		return fmt.Errorf("error posting new interpretations: %s", resp.Status)
+		return getResponseError(resp, "error posting new interpretations")
 	}
 
 	return nil
@@ -284,4 +284,12 @@ func (r *runtimeServer) waitForServerHealthy() error {
 	}
 
 	return nil
+}
+
+func getResponseError(resp *http.Response, msg string) error {
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	return fmt.Errorf("%s: %s\n%s", msg, resp.Status, body)
 }

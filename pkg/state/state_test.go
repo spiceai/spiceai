@@ -86,7 +86,7 @@ func testGetStateFunc(data []byte) func(*testing.T) {
 
 		validMeasurementNames := []string{"coinbase.btcusd.price", "local.portfolio.usd_balance", "local.portfolio.btc_balance"}
 
-		actualState, err := GetStateFromCsv(validMeasurementNames, nil, data)
+		actualState, err := GetStateFromCsv(nil, validMeasurementNames, nil, data)
 		if err != nil {
 			t.Error(err)
 			return
@@ -118,7 +118,7 @@ func testGetStateTagsFunc(data []byte) func(*testing.T) {
 
 		validMeasurementNames := []string{"coinbase.btcusd.open", "bitthumb.btcusd.high", "bitmex.btcusd.low", "coinbase_pro.btcusd.close", "local.btcusd.volume"}
 
-		actualState, err := GetStateFromCsv(validMeasurementNames, nil, data)
+		actualState, err := GetStateFromCsv(nil, validMeasurementNames, nil, data)
 		if err != nil {
 			t.Error(err)
 			return
@@ -166,7 +166,7 @@ func testGetStateTwiceFunc(data []byte) func(*testing.T) {
 
 		validMeasurementNames := []string{"coinbase.btcusd.price", "local.portfolio.usd_balance", "local.portfolio.btc_balance"}
 
-		actualState, err := GetStateFromCsv(validMeasurementNames, nil, data)
+		actualState, err := GetStateFromCsv(nil, validMeasurementNames, nil, data)
 		if err != nil {
 			t.Error(err)
 			return
@@ -188,50 +188,58 @@ func testGetStateTwiceFunc(data []byte) func(*testing.T) {
 }
 
 func TestProcessCsvHeaders(t *testing.T) {
-	headers := []string{"time", "coinbase.btcusd.open", "coinbase.btcusd._tags", "bitthumb.btcusd.high", "bitmex.btcusd.low", "coinbase_pro.btcusd.close", "local.btcusd.volume", "local.btcusd.type", "local.btcusd._tags"}
+	headers := []string{"time", "coinbase.btcusd.transaction_id", "coinbase.btcusd.open", "coinbase.btcusd._tags", "bitthumb.btcusd.high", "bitmex.btcusd.ticker_id", "bitmex.btcusd.low", "coinbase_pro.btcusd.close", "local.btcusd.volume", "local.btcusd.type", "local.btcusd._tags"}
+	validIdentifierNames := []string{"coinbase.btcusd.transaction_id", "bitmex.btcusd.ticker_id"}
 	validMeasurementNames := []string{"coinbase.btcusd.open", "bitmex.btcusd.low", "local.btcusd.volume"}
 	validCategoryNames := []string{"local.btcusd.type"}
 
-	dsPathsMap, colToDsPath, colToMeasurementName, colToCategoryName, tagsCol, err := processCsvHeaders(headers, validMeasurementNames, validCategoryNames)
+	dsPathsMap, colToDsPath, colToIdentifierName, colToMeasurementName, colToCategoryName, tagsCol, err := processCsvHeaders(headers, validIdentifierNames, validMeasurementNames, validCategoryNames)
 	assert.NoError(t, err)
 
 	expectedDsPathsMap := map[string]bool(map[string]bool{"bitmex.btcusd": true, "coinbase.btcusd": true, "local.btcusd": true})
 	assert.Equal(t, expectedDsPathsMap, dsPathsMap)
 
-	expectedColToDsPath := []string([]string{"coinbase.btcusd", "coinbase.btcusd", "", "bitmex.btcusd", "", "local.btcusd", "local.btcusd", "local.btcusd"})
+	expectedColToDsPath := []string([]string{"coinbase.btcusd", "coinbase.btcusd", "coinbase.btcusd", "", "bitmex.btcusd", "bitmex.btcusd", "", "local.btcusd", "local.btcusd", "local.btcusd"})
 	assert.Equal(t, expectedColToDsPath, colToDsPath)
 
-	expectedColToMeasurementName := []string([]string{"open", "", "", "low", "", "volume", "", ""})
+	expectedColToIdentifierName := []string([]string{"transaction_id", "", "", "", "ticker_id", "", "", "", "", ""})
+	assert.Equal(t, expectedColToIdentifierName, colToIdentifierName)
+	
+	expectedColToMeasurementName := []string([]string{"", "open", "", "", "", "low", "", "volume", "", ""})
 	assert.Equal(t, expectedColToMeasurementName, colToMeasurementName)
 
-	expectedColToCategoryName := []string([]string{"", "", "", "", "", "", "type", ""})
+	expectedColToCategoryName := []string([]string{"", "", "", "", "", "", "", "", "type", ""})
 	assert.Equal(t, expectedColToCategoryName, colToCategoryName)
 
-	expectedTagsCol := []string([]string{"", "coinbase.btcusd._tags", "", "", "", "", "", "local.btcusd._tags"})
+	expectedTagsCol := []string([]string{"", "", "coinbase.btcusd._tags", "", "", "", "", "", "", "local.btcusd._tags"})
 	assert.Equal(t, expectedTagsCol, tagsCol)
 }
 
 func TestProcessCsvHeadersNoTags(t *testing.T) {
-	headers := []string{"time", "coinbase.btcusd.open", "bitthumb.btcusd.high", "bitmex.btcusd.low", "coinbase_pro.btcusd.close", "local.btcusd.volume", "local.btcusd.type"}
+	headers := []string{"time", "coinbase.btcusd.transaction_id", "coinbase.btcusd.open", "bitthumb.btcusd.high", "bitmex.btcusd.ticker_id", "bitmex.btcusd.low", "coinbase_pro.btcusd.close", "local.btcusd.volume", "local.btcusd.type"}
+	validIdentifierNames := []string{"coinbase.btcusd.transaction_id", "bitmex.btcusd.ticker_id"}
 	validMeasurementNames := []string{"coinbase.btcusd.open", "bitmex.btcusd.low", "local.btcusd.volume"}
 	validCategoryNames := []string{"local.btcusd.type"}
 
-	dsPathsMap, colToDsPath, colToMeasurementName, colToCategoryName, tagsCol, err := processCsvHeaders(headers, validMeasurementNames, validCategoryNames)
+	dsPathsMap, colToDsPath, colToIdentifierName, colToMeasurementName, colToCategoryName, tagsCol, err := processCsvHeaders(headers, validIdentifierNames, validMeasurementNames, validCategoryNames)
 	assert.NoError(t, err)
 
 	expectedDsPathsMap := map[string]bool(map[string]bool{"bitmex.btcusd": true, "coinbase.btcusd": true, "local.btcusd": true})
 	assert.Equal(t, expectedDsPathsMap, dsPathsMap)
 
-	expectedColToDsPath := []string([]string{"coinbase.btcusd", "", "bitmex.btcusd", "", "local.btcusd", "local.btcusd"})
+	expectedColToDsPath := []string([]string{"coinbase.btcusd", "coinbase.btcusd", "", "bitmex.btcusd", "bitmex.btcusd", "", "local.btcusd", "local.btcusd"})
 	assert.Equal(t, expectedColToDsPath, colToDsPath)
 
-	expectedColToMeasurementName := []string([]string{"open", "", "low", "", "volume", ""})
+	expectedColToIdentifierName := []string([]string{"transaction_id", "", "", "ticker_id", "", "", "", ""})
+	assert.Equal(t, expectedColToIdentifierName, colToIdentifierName)
+
+	expectedColToMeasurementName := []string([]string{"", "open", "", "", "low", "", "volume", ""})
 	assert.Equal(t, expectedColToMeasurementName, colToMeasurementName)
 
-	expectedColToCategoryName := []string([]string{"", "", "", "", "", "type"})
+	expectedColToCategoryName := []string([]string{"", "", "", "", "", "", "", "type"})
 	assert.Equal(t, expectedColToCategoryName, colToCategoryName)
 
-	expectedTagsCol := []string([]string{"", "", "", "", "", ""})
+	expectedTagsCol := []string([]string{"", "", "", "", "", "", "", ""})
 	assert.Equal(t, expectedTagsCol, tagsCol)
 }
 

@@ -52,19 +52,21 @@ func NewState(path string, measurementsNames []string, categoryNames []string, t
 }
 
 type csvLineData struct {
+	identifiers   map[string]string
 	measurements map[string]float64
 	categories   map[string]string
 }
 
 type csvDataspaceData struct {
 	observations     []observations.Observation
+	identifierNames      []string
 	measurementNames []string
 	categoryNames    []string
 }
 
 // Processes into State by field path
 // CSV headers are expected to be fully-qualified field names
-func GetStateFromCsv(validMeasurementNames []string, validCategoryNames []string, data []byte) ([]*State, error) {
+func GetStateFromCsv(validIdentifierNames []string, validMeasurementNames []string, validCategoryNames []string, data []byte) ([]*State, error) {
 	reader := bytes.NewReader(data)
 	if reader == nil {
 		return nil, nil
@@ -75,7 +77,7 @@ func GetStateFromCsv(validMeasurementNames []string, validCategoryNames []string
 		return nil, fmt.Errorf("failed to process csv: %s", err)
 	}
 
-	dsPathsMap, colToDsPath, colToMeasurementName, colToCategoryName, colToTagsName, err := processCsvHeaders(headers, validMeasurementNames, validCategoryNames)
+	dsPathsMap, colToDsPath, colToIdentifierName, colToMeasurementName, colToCategoryName, colToTagsName, err := processCsvHeaders(headers, validIdentifierNames, validMeasurementNames, validCategoryNames)
 	if err != nil {
 		return nil, fmt.Errorf("failed to process csv headers: %s", err)
 	}
@@ -96,9 +98,9 @@ func GetStateFromCsv(validMeasurementNames []string, validCategoryNames []string
 		dsLineData := make(map[string]*csvLineData, len(dsPathsMap))
 
 		for col := 1; col < len(record); col++ {
-			field := record[col]
+			fieldValue := record[col]
 
-			if field == "" {
+			if fieldValue == "" {
 				continue
 			}
 
@@ -114,25 +116,19 @@ func GetStateFromCsv(validMeasurementNames []string, validCategoryNames []string
 				dsLineData[path] = lineData
 			}
 
-			if colToTagsName[fieldCol] != "" {
-				tags := strings.Split(field, " ")
-				for _, tagVal := range tags {
-					if tagVal == "" {
-						continue
-					}
-					if _, ok := dataspacePathToTagsMap[path]; !ok {
-						dataspacePathToTagsMap[path] = make(map[string]bool)
-					}
-					dataspacePathToTagsMap[path][tagVal] = true
-				}
+			// Identifiers
+			identifierName := colToIdentifierName[fieldCol]
+			if identifierName != "" {
+				lineData.identifiers[identifierName] = fieldValue
 				continue
 			}
 
+			// Measurements
 			measurementName := colToMeasurementName[fieldCol]
 			if measurementName != "" {
-				val, err := strconv.ParseFloat(field, 64)
+				val, err := strconv.ParseFloat(fieldValue, 64)
 				if err != nil {
-					log.Printf("ignoring invalid measurement field %d - %v: %v", line+1, field, err)
+					log.Printf("ignoring invalid measurement field %d - %v: %v", line+1, fieldValue, err)
 					continue
 				}
 				if lineData.measurements == nil {
@@ -142,12 +138,28 @@ func GetStateFromCsv(validMeasurementNames []string, validCategoryNames []string
 				continue
 			}
 
+			// Categories
 			categoryName := colToCategoryName[fieldCol]
 			if categoryName != "" {
 				if lineData.categories == nil {
 					lineData.categories = make(map[string]string, len(validCategoryNames))
 				}
-				lineData.categories[categoryName] = field
+				lineData.categories[categoryName] = fieldValue
+				continue
+			}
+
+			// Tags
+			if colToTagsName[fieldCol] != "" {
+				tags := strings.Split(fieldValue, " ")
+				for _, tagVal := range tags {
+					if tagVal == "" {
+						continue
+					}
+					if _, ok := dataspacePathToTagsMap[path]; !ok {
+						dataspacePathToTagsMap[path] = make(map[string]bool)
+					}
+					dataspacePathToTagsMap[path][tagVal] = true
+				}
 				continue
 			}
 		}
@@ -255,10 +267,11 @@ func getCsvHeaderAndLines(input io.Reader) ([]string, [][]string, error) {
 }
 
 // Process CSV headers. Expected to be fully-qualified.
-func processCsvHeaders(headers []string, validMeasurementNames []string, validCategoryNames []string) (map[string]bool, []string, []string, []string, []string, error) {
+func processCsvHeaders(headers []string, validIdentifierNames []string, validMeasurementNames []string, validCategoryNames []string) (map[string]bool, []string, []string, []string, []string, []string, error) {
 	numDataFields := len(headers) - 1
 	dataspacePathsMap := make(map[string]bool)
 	columnToDataspacePath := make([]string, numDataFields)
+	columnToIdentifierName := make([]string, numDataFields)
 	columnToMeasurementName := make([]string, numDataFields)
 	columnToCategoryName := make([]string, numDataFields)
 	columnToTagsName := make([]string, numDataFields)
@@ -267,13 +280,22 @@ func processCsvHeaders(headers []string, validMeasurementNames []string, validCa
 		found := false
 		dotIndex := strings.LastIndex(header, ".")
 		if dotIndex == -1 {
-			return nil, nil, nil, nil, nil, fmt.Errorf("header '%s' expected to be full-qualified", header)
+			return nil, nil, nil, nil, nil, nil, fmt.Errorf("header '%s' expected to be full-qualified", header)
 		}
-		for _, validMeasurementName := range validMeasurementNames {
-			if validMeasurementName == header {
+		for _, validIdentifierName := range validIdentifierNames {
+			if validIdentifierName == header {
 				found = true
-				columnToMeasurementName[i] = validMeasurementName[dotIndex+1:]
+				columnToIdentifierName[i] = validIdentifierName[dotIndex+1:]
 				break
+			}
+		}
+		if !found {
+			for _, validMeasurementName := range validMeasurementNames {
+				if validMeasurementName == header {
+					found = true
+					columnToMeasurementName[i] = validMeasurementName[dotIndex+1:]
+					break
+				}
 			}
 		}
 		if !found {
@@ -300,7 +322,7 @@ func processCsvHeaders(headers []string, validMeasurementNames []string, validCa
 		columnToDataspacePath[i] = dsPath
 	}
 
-	return dataspacePathsMap, columnToDataspacePath, columnToMeasurementName, columnToCategoryName, columnToTagsName, nil
+	return dataspacePathsMap, columnToDataspacePath, columnToIdentifierName, columnToMeasurementName, columnToCategoryName, columnToTagsName, nil
 }
 
 // Returns measurements, and categories grouped by datasource path

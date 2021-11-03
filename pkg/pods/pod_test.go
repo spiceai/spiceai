@@ -316,7 +316,7 @@ func testAddLocalStateFunc(pod *Pod) func(*testing.T) {
 
 		<-done
 
-		newState, err := state.GetStateFromCsv(nil, nil, fileData)
+		newState, err := state.GetStateFromCsv(nil, nil, nil, fileData)
 		if err != nil {
 			t.Error(err)
 		}
@@ -367,7 +367,7 @@ func testAddLocalStateCachedCsvFunc(pod *Pod) func(*testing.T) {
 
 		measurements := []string{"local.portfolio.usd_balance", "local.portfolio.btc_balance", "coinbase.btcusd.price"}
 
-		newState, err := state.GetStateFromCsv(measurements, nil, fileData)
+		newState, err := state.GetStateFromCsv(nil, measurements, nil, fileData)
 		if err != nil {
 			t.Error(err)
 		}

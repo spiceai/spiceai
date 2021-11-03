@@ -630,6 +630,52 @@ func TestPodWithTags(t *testing.T) {
 	}
 }
 
+func TestIdentifierRoundTripping(t *testing.T) {
+	if !shouldRunTest {
+		t.Skip("Specify '-e2e' to run e2e tests")
+		return
+	}
+
+	err := runtime.startRuntime()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() {
+		err := runtime.shutdown()
+		if err != nil {
+			log.Fatalln(err.Error())
+		}
+	})
+
+	t.Log("*** Get Observations ***")
+	initialObservationsCsv, err := runtime.getObservations("event-tags", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	snapshotter.SnapshotMulti("initial-observations", initialObservationsCsv)
+
+	newObservations, err := os.ReadFile(filepath.Join(repoRoot, "test/assets/data/csv/csv_data_with_tags_2.csv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Log("*** Post Observations ***")
+	err = runtime.postObservations("event-tags", newObservations)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Log("*** Get additional Observations ***")
+	additionalObservationsCsv, err := runtime.getObservations("event-tags", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	snapshotter.SnapshotMulti("additional-observations", additionalObservationsCsv)
+}
+
 func TestPodWithCategories(t *testing.T) {
 	if !shouldRunTest {
 		t.Skip("Specify '-e2e' to run e2e tests")
