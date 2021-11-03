@@ -19,7 +19,8 @@ from cleanup import cleanup_on_shutdown
 from connector.manager import ConnectorManager, ConnectorName
 from connector.stateful import StatefulConnector
 from data import DataParam, DataManager
-from exception import UnexpectedException, InvalidDataShapeException
+from exception import UnexpectedException
+from inference import GetInferenceHandler
 from proto.aiengine.v1 import aiengine_pb2, aiengine_pb2_grpc
 from train import Trainer
 from validation import validate_rewards
@@ -119,110 +120,8 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
         return aiengine_pb2.Response(result=result)
 
     def GetInference(self, request: aiengine_pb2.InferenceRequest, context):
-        inference_time = pd.to_datetime(request.inference_time, unit="s")
-        use_latest_time = request.inference_time == 0
-
-        def valid_inference_time(first_valid_time, last_valid_time):
-            if request.inference_time == 0:
-                return True
-            return request.inference_time >= first_valid_time and request.inference_time <= last_valid_time
-
-        try:
-            model_exists = False
-            if request.pod in Trainer.SAVED_MODELS:
-                model_exists = True
-
-            if request.pod not in data_managers:
-                return aiengine_pb2.InferenceResult(
-                    response=aiengine_pb2.Response(result="pod_not_initialized", error=True))
-
-            if request.tag != "latest":
-                return aiengine_pb2.InferenceResult(
-                    response=aiengine_pb2.Response(
-                        result="tag_not_yet_supported", message="Support for multiple tags coming soon!", error=True))
-
-            data_manager = data_managers[request.pod]
-
-            first_valid_time = (data_manager.massive_table_filled.first_valid_index() +
-                                data_manager.param.interval_secs).timestamp()
-            last_valid_time = data_manager.massive_table_filled.last_valid_index().timestamp()
-
-            if not valid_inference_time(first_valid_time, last_valid_time):
-                result = "invalid_recommendation_time"
-                message = f"The time specified ({request.inference_time}) "\
-                          f"is outside of the allowed range: ({int(first_valid_time)}, {int(last_valid_time)})"
-                return aiengine_pb2.InferenceResult(
-                    response=aiengine_pb2.Response(
-                        result=result, message=message, error=True
-                    )
-                )
-
-            # Ideally we could just re-use the in-memory agent we created during training,
-            # but tensorflow has issues with multi-threading in python, so we are just loading it from the file system
-            model_data_shape = data_manager.get_shape()
-            if model_exists:
-                save_path = Trainer.SAVED_MODELS[request.pod]
-                with open(save_path / "meta.json", "r", encoding="utf-8") as meta_file:
-                    save_info = json.loads(meta_file.read())
-                algorithm = save_info["algorithm"]
-            else:
-                algorithm = "dql"
-
-            agent: SpiceAIAgent = get_agent(algorithm, model_data_shape, len(data_manager.action_names))
-            if model_exists:
-                agent.load(Path(save_path))
-
-            data_manager = data_managers[request.pod]
-
-            if data_manager.massive_table_filled.shape[0] < data_manager.get_window_span():
-                return aiengine_pb2.InferenceResult(
-                    response=aiengine_pb2.Response(result="not_enough_data", error=True))
-
-            if use_latest_time:
-                latest_window = data_manager.get_latest_window()
-                state = data_manager.flatten_and_normalize_window(latest_window)
-            else:
-                requested_window = data_manager.get_window_at(inference_time)
-                state = data_manager.flatten_and_normalize_window(requested_window)
-
-            action_from_model, probabilities = agent.act(state)
-        except InvalidDataShapeException as ex:
-            result = ex.type
-            message = ex.message
-
-            if Trainer.TRAINING_LOCK.locked():
-                result = "training_not_complete"
-                message = (
-                    "Please wait to get a recommendation until after training completes"
-                )
-
-            return aiengine_pb2.InferenceResult(
-                response=aiengine_pb2.Response(
-                    result=result, message=message, error=True
-                )
-            )
-        confidence = f"{probabilities[action_from_model]:.3f}"
-        if not model_exists:
-            confidence = 0.0
-
-        action_name = data_manager.action_names[action_from_model]
-
-        if use_latest_time:
-            end_time = data_manager.massive_table_filled.last_valid_index()
-        else:
-            end_time = inference_time
-
-        start_time = end_time - data_manager.param.interval_secs
-
-        result = aiengine_pb2.InferenceResult()
-        result.start = int(start_time.timestamp())
-        result.end = int(end_time.timestamp())
-        result.action = action_name
-        result.confidence = float(confidence)
-        result.tag = request.tag
-        result.response.result = "ok"
-
-        return result
+        handler = GetInferenceHandler(request)
+        return handler.get_result()
 
     def Init(self, request: aiengine_pb2.InitRequest, context):
         with Dispatch.INIT_LOCK:
