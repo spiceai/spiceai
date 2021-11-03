@@ -1,9 +1,4 @@
-(map[string]*dataspace.Measurement) (len=5) {
-  (string) (len=18) "event.data.eventId": (*dataspace.Measurement)({
-    Name: (string) (len=7) "eventId",
-    InitialValue: (float64) 0,
-    Fill: (string) ""
-  }),
+(map[string]*dataspace.Measurement) (len=4) {
   (string) (len=17) "event.data.height": (*dataspace.Measurement)({
     Name: (string) (len=6) "height",
     InitialValue: (float64) 0,

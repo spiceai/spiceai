@@ -18,6 +18,7 @@
     observations: ([]observations.Observation) (len=5) {
       (observations.Observation) {
         Time: (int64) 1605312000,
+        Identifiers: (map[string]string) <nil>,
         Measurements: (map[string]float64) (len=1) {
           (string) (len=3) "low": (float64) 16240
         },
@@ -26,6 +27,7 @@
       },
       (observations.Observation) {
         Time: (int64) 1605313800,
+        Identifiers: (map[string]string) <nil>,
         Measurements: (map[string]float64) (len=1) {
           (string) (len=3) "low": (float64) 16248.6
         },
@@ -34,6 +36,7 @@
       },
       (observations.Observation) {
         Time: (int64) 1605315600,
+        Identifiers: (map[string]string) <nil>,
         Measurements: (map[string]float64) (len=1) {
           (string) (len=3) "low": (float64) 16210.99
         },
@@ -42,6 +45,7 @@
       },
       (observations.Observation) {
         Time: (int64) 1605317400,
+        Identifiers: (map[string]string) <nil>,
         Measurements: (map[string]float64) (len=1) {
           (string) (len=3) "low": (float64) 16200.01
         },
@@ -50,6 +54,7 @@
       },
       (observations.Observation) {
         Time: (int64) 1605319200,
+        Identifiers: (map[string]string) <nil>,
         Measurements: (map[string]float64) (len=1) {
           (string) (len=3) "low": (float64) 16175.62
         },
@@ -87,6 +92,7 @@
     observations: ([]observations.Observation) (len=5) {
       (observations.Observation) {
         Time: (int64) 1605312000,
+        Identifiers: (map[string]string) <nil>,
         Measurements: (map[string]float64) (len=1) {
           (string) (len=4) "high": (float64) 16339.6
         },
@@ -95,6 +101,7 @@
       },
       (observations.Observation) {
         Time: (int64) 1605313800,
+        Identifiers: (map[string]string) <nil>,
         Measurements: (map[string]float64) (len=1) {
           (string) (len=4) "high": (float64) 16305
         },
@@ -103,6 +110,7 @@
       },
       (observations.Observation) {
         Time: (int64) 1605315600,
+        Identifiers: (map[string]string) <nil>,
         Measurements: (map[string]float64) (len=1) {
           (string) (len=4) "high": (float64) 16303.88
         },
@@ -111,6 +119,7 @@
       },
       (observations.Observation) {
         Time: (int64) 1605317400,
+        Identifiers: (map[string]string) <nil>,
         Measurements: (map[string]float64) (len=1) {
           (string) (len=4) "high": (float64) 16246.92
         },
@@ -119,6 +128,7 @@
       },
       (observations.Observation) {
         Time: (int64) 1605319200,
+        Identifiers: (map[string]string) <nil>,
         Measurements: (map[string]float64) (len=1) {
           (string) (len=4) "high": (float64) 16234
         },
@@ -171,6 +181,7 @@
     observations: ([]observations.Observation) (len=5) {
       (observations.Observation) {
         Time: (int64) 1605312000,
+        Identifiers: (map[string]string) <nil>,
         Measurements: (map[string]float64) (len=1) {
           (string) (len=4) "open": (float64) 16339.56
         },
@@ -179,6 +190,7 @@
       },
       (observations.Observation) {
         Time: (int64) 1605313800,
+        Identifiers: (map[string]string) <nil>,
         Measurements: (map[string]float64) (len=1) {
           (string) (len=4) "open": (float64) 16256.42
         },
@@ -187,6 +199,7 @@
       },
       (observations.Observation) {
         Time: (int64) 1605315600,
+        Identifiers: (map[string]string) <nil>,
         Measurements: (map[string]float64) (len=1) {
           (string) (len=4) "open": (float64) 16303.88
         },
@@ -195,6 +208,7 @@
       },
       (observations.Observation) {
         Time: (int64) 1605317400,
+        Identifiers: (map[string]string) <nil>,
         Measurements: (map[string]float64) (len=1) {
           (string) (len=4) "open": (float64) 16221.78
         },
@@ -203,6 +217,7 @@
       },
       (observations.Observation) {
         Time: (int64) 1605319200,
+        Identifiers: (map[string]string) <nil>,
         Measurements: (map[string]float64) (len=1) {
           (string) (len=4) "open": (float64) 16214.26
         },
@@ -240,6 +255,7 @@
     observations: ([]observations.Observation) (len=5) {
       (observations.Observation) {
         Time: (int64) 1605312000,
+        Identifiers: (map[string]string) <nil>,
         Measurements: (map[string]float64) (len=1) {
           (string) (len=5) "close": (float64) 16254.51
         },
@@ -248,6 +264,7 @@
       },
       (observations.Observation) {
         Time: (int64) 1605313800,
+        Identifiers: (map[string]string) <nil>,
         Measurements: (map[string]float64) (len=1) {
           (string) (len=5) "close": (float64) 16305
         },
@@ -256,6 +273,7 @@
       },
       (observations.Observation) {
         Time: (int64) 1605315600,
+        Identifiers: (map[string]string) <nil>,
         Measurements: (map[string]float64) (len=1) {
           (string) (len=5) "close": (float64) 16222.16
         },
@@ -264,6 +282,7 @@
       },
       (observations.Observation) {
         Time: (int64) 1605317400,
+        Identifiers: (map[string]string) <nil>,
         Measurements: (map[string]float64) (len=1) {
           (string) (len=5) "close": (float64) 16214.15
         },
@@ -272,6 +291,7 @@
       },
       (observations.Observation) {
         Time: (int64) 1605319200,
+        Identifiers: (map[string]string) <nil>,
         Measurements: (map[string]float64) (len=1) {
           (string) (len=5) "close": (float64) 16223.08
         },
@@ -314,6 +334,7 @@
     observations: ([]observations.Observation) (len=5) {
       (observations.Observation) {
         Time: (int64) 1605312000,
+        Identifiers: (map[string]string) <nil>,
         Measurements: (map[string]float64) (len=1) {
           (string) (len=6) "volume": (float64) 274.42607
         },
@@ -322,6 +343,7 @@
       },
       (observations.Observation) {
         Time: (int64) 1605313800,
+        Identifiers: (map[string]string) <nil>,
         Measurements: (map[string]float64) (len=1) {
           (string) (len=6) "volume": (float64) 110.91971
         },
@@ -330,6 +352,7 @@
       },
       (observations.Observation) {
         Time: (int64) 1605315600,
+        Identifiers: (map[string]string) <nil>,
         Measurements: (map[string]float64) (len=1) {
           (string) (len=6) "volume": (float64) 231.64805
         },
@@ -338,6 +361,7 @@
       },
       (observations.Observation) {
         Time: (int64) 1605317400,
+        Identifiers: (map[string]string) <nil>,
         Measurements: (map[string]float64) (len=1) {
           (string) (len=6) "volume": (float64) 135.86161
         },
@@ -346,6 +370,7 @@
       },
       (observations.Observation) {
         Time: (int64) 1605319200,
+        Identifiers: (map[string]string) <nil>,
         Measurements: (map[string]float64) (len=1) {
           (string) (len=6) "volume": (float64) 164.32561
         },
