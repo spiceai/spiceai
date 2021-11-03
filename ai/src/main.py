@@ -119,6 +119,14 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
         return aiengine_pb2.Response(result=result)
 
     def GetInference(self, request: aiengine_pb2.InferenceRequest, context):
+        inference_time = pd.to_datetime(request.inference_time, unit="s")
+        use_latest_time = request.inference_time == 0
+
+        def valid_inference_time(first_valid_time, last_valid_time):
+            if request.inference_time == 0:
+                return True
+            return request.inference_time >= first_valid_time and request.inference_time <= last_valid_time
+
         try:
             model_exists = False
             if request.pod in Trainer.SAVED_MODELS:
@@ -133,9 +141,24 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
                     response=aiengine_pb2.Response(
                         result="tag_not_yet_supported", message="Support for multiple tags coming soon!", error=True))
 
+            data_manager = data_managers[request.pod]
+
+            first_valid_time = (data_manager.massive_table_filled.first_valid_index() +
+                                data_manager.param.interval_secs).timestamp()
+            last_valid_time = data_manager.massive_table_filled.last_valid_index().timestamp()
+
+            if not valid_inference_time(first_valid_time, last_valid_time):
+                result = "invalid_recommendation_time"
+                message = f"The time specified ({request.inference_time}) "\
+                          f"is outside of the allowed range: ({int(first_valid_time)}, {int(last_valid_time)})"
+                return aiengine_pb2.InferenceResult(
+                    response=aiengine_pb2.Response(
+                        result=result, message=message, error=True
+                    )
+                )
+
             # Ideally we could just re-use the in-memory agent we created during training,
             # but tensorflow has issues with multi-threading in python, so we are just loading it from the file system
-            data_manager = data_managers[request.pod]
             model_data_shape = data_manager.get_shape()
             if model_exists:
                 save_path = Trainer.SAVED_MODELS[request.pod]
@@ -155,8 +178,12 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
                 return aiengine_pb2.InferenceResult(
                     response=aiengine_pb2.Response(result="not_enough_data", error=True))
 
-            latest_window = data_manager.get_latest_window()
-            state = data_manager.flatten_and_normalize_window(latest_window)
+            if use_latest_time:
+                latest_window = data_manager.get_latest_window()
+                state = data_manager.flatten_and_normalize_window(latest_window)
+            else:
+                requested_window = data_manager.get_window_at(inference_time)
+                state = data_manager.flatten_and_normalize_window(requested_window)
 
             action_from_model, probabilities = agent.act(state)
         except InvalidDataShapeException as ex:
@@ -180,7 +207,11 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
 
         action_name = data_manager.action_names[action_from_model]
 
-        end_time = data_manager.massive_table_filled.last_valid_index()
+        if use_latest_time:
+            end_time = data_manager.massive_table_filled.last_valid_index()
+        else:
+            end_time = inference_time
+
         start_time = end_time - data_manager.param.interval_secs
 
         result = aiengine_pb2.InferenceResult()

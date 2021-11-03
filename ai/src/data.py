@@ -182,25 +182,29 @@ class DataManager:
                 if self.get_window_span() == 1 else
                 self.massive_table_filled.iloc[start_index:end_index])
 
-    def get_latest_window(self):
+    def get_window_at(self, time):
         start_index = None
         end_index = None
-        latest_time = self.massive_table_filled.last_valid_index()
 
         # If we only have a single row, use it
         if self.massive_table_filled.shape[0] == 1:
-            start_index = self.massive_table_filled.index.get_loc(latest_time)
+            start_index = self.massive_table_filled.index.get_loc(time)
             end_index = start_index
         else:
             start_index = self.massive_table_filled.index.get_loc(
-                latest_time - self.param.interval_secs, "ffill"
+                time - self.param.interval_secs, "ffill"
             )
-            end_index = self.massive_table_filled.index.get_loc(latest_time, "ffill")
+            end_index = self.massive_table_filled.index.get_loc(time, "ffill")
 
-        return (
-            self.massive_table_filled.iloc[start_index:start_index + 1]
-            if self.get_window_span() == 1 else
-            self.massive_table_filled.iloc[start_index:end_index])
+        if self.get_window_span() == 1:
+            return self.massive_table_filled.iloc[start_index:start_index + 1]
+
+        return self.massive_table_filled.iloc[start_index:end_index]
+
+    def get_latest_window(self):
+        latest_time = self.massive_table_filled.last_valid_index()
+
+        return self.get_window_at(latest_time)
 
     def rewind(self):
         self.current_time = self.param.epoch_time + self.param.interval_secs

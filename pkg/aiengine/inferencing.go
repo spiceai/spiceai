@@ -8,14 +8,15 @@ import (
 	"github.com/spiceai/spiceai/pkg/proto/aiengine_pb"
 )
 
-func Infer(pod string, tag string) (*aiengine_pb.InferenceResult, error) {
+func Infer(pod string, inferenceTime int64, tag string) (*aiengine_pb.InferenceResult, error) {
 	if !ServerReady() {
 		return nil, fmt.Errorf("not ready")
 	}
 
 	request := &aiengine_pb.InferenceRequest{
-		Pod: pod,
-		Tag: tag,
+		Pod:           pod,
+		Tag:           tag,
+		InferenceTime: inferenceTime,
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
