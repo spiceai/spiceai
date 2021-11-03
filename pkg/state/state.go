@@ -83,7 +83,7 @@ func GetStateFromCsv(validIdentifierNames []string, validMeasurementNames []stri
 	}
 
 	// Group data into dataspace paths
-	dsPathToData := getDsPathToDataMap(len(dsPathsMap), colToDsPath, colToMeasurementName, colToCategoryName)
+	dsPathToData := getDsPathToDataMap(len(dsPathsMap), colToDsPath, colToIdentifierName, colToMeasurementName, colToCategoryName)
 
 	// Map from path -> set of detected tags on that path
 	dataspacePathToTagsMap := make(map[string]map[string]bool)
@@ -119,6 +119,9 @@ func GetStateFromCsv(validIdentifierNames []string, validMeasurementNames []stri
 			// Identifiers
 			identifierName := colToIdentifierName[fieldCol]
 			if identifierName != "" {
+				if lineData.identifiers == nil {
+					lineData.identifiers = make(map[string]string, len(validIdentifierNames))
+				}
 				lineData.identifiers[identifierName] = fieldValue
 				continue
 			}
@@ -171,6 +174,7 @@ func GetStateFromCsv(validIdentifierNames []string, validMeasurementNames []stri
 			}
 			observation := observations.Observation{
 				Time:         ts.Unix(),
+				Identifiers: dsLineData.identifiers,
 				Measurements: dsLineData.measurements,
 				Categories:   dsLineData.categories,
 			}
@@ -326,7 +330,7 @@ func processCsvHeaders(headers []string, validIdentifierNames []string, validMea
 }
 
 // Returns measurements, and categories grouped by datasource path
-func getDsPathToDataMap(numDataspaces int, colToDsPath []string, colToMeasurementName []string, colToCategoryName []string) map[string]*csvDataspaceData {
+func getDsPathToDataMap(numDataspaces int, colToDsPath []string, colToIdentifierName []string, colToMeasurementName []string, colToCategoryName []string) map[string]*csvDataspaceData {
 	dsPathToData := make(map[string]*csvDataspaceData, numDataspaces)
 
 	for col, path := range colToDsPath {
@@ -337,6 +341,10 @@ func getDsPathToDataMap(numDataspaces int, colToDsPath []string, colToMeasuremen
 		if !ok {
 			dsData = &csvDataspaceData{}
 			dsPathToData[path] = dsData
+		}
+		identifierName := colToIdentifierName[col]
+		if identifierName != "" {
+			dsData.identifierNames = append(dsData.identifierNames, identifierName)
 		}
 		measurementName := colToMeasurementName[col]
 		if measurementName != "" {

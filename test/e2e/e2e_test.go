@@ -656,7 +656,7 @@ func TestIdentifierRoundTripping(t *testing.T) {
 
 	snapshotter.SnapshotMulti("initial-observations", initialObservationsCsv)
 
-	newObservations, err := os.ReadFile(filepath.Join(repoRoot, "test/assets/data/csv/csv_data_with_tags_2.csv"))
+	newObservations, err := os.ReadFile(filepath.Join(repoRoot, "test/assets/data/csv/e2e_csv_data_with_tags_2.csv"))
 	if err != nil {
 		t.Fatal(err)
 	}
