@@ -52,14 +52,14 @@ func NewState(path string, measurementsNames []string, categoryNames []string, t
 }
 
 type csvLineData struct {
-	identifiers   map[string]string
+	identifiers  map[string]string
 	measurements map[string]float64
 	categories   map[string]string
 }
 
 type csvDataspaceData struct {
 	observations     []observations.Observation
-	identifierNames      []string
+	identifierNames  []string
 	measurementNames []string
 	categoryNames    []string
 }
@@ -174,7 +174,7 @@ func GetStateFromCsv(validIdentifierNames []string, validMeasurementNames []stri
 			}
 			observation := observations.Observation{
 				Time:         ts.Unix(),
-				Identifiers: dsLineData.identifiers,
+				Identifiers:  dsLineData.identifiers,
 				Measurements: dsLineData.measurements,
 				Categories:   dsLineData.categories,
 			}

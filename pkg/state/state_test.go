@@ -108,7 +108,7 @@ func TestGetStateWithTagsFunc(t *testing.T) {
 	if err != nil {
 		t.Fatal(err.Error())
 	}
-	
+
 	if len(data) == 0 {
 		t.Fatal("no data")
 	}
@@ -158,13 +158,13 @@ func TestGetStateIdentifiers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err.Error())
 	}
-	
+
 	if len(data) == 0 {
 		t.Fatal("no data")
 	}
 
 	validIdentifierNames := []string{"event.data.event_id"}
-	validMeasurementNames := []string{"event.data.speed","event.data.target"}
+	validMeasurementNames := []string{"event.data.speed", "event.data.target"}
 	validCategoryNames := []string{"event.data.rating"}
 
 	actualState, err := GetStateFromCsv(validIdentifierNames, validMeasurementNames, validCategoryNames, data)
@@ -178,10 +178,10 @@ func TestGetStateIdentifiers(t *testing.T) {
 	assert.Equal(t, "event.data", actualState[0].Path(), "expected path incorrect")
 
 	expectedFirstObservation := observations.Observation{
-		Time:1611205740,
-		Identifiers:map[string]string{"event_id":"3"},
-		Measurements:map[string]float64{"speed":15, "target":1},
-		Categories:map[string]string{"rating":"10"},
+		Time:         1611205740,
+		Identifiers:  map[string]string{"event_id": "3"},
+		Measurements: map[string]float64{"speed": 15, "target": 1},
+		Categories:   map[string]string{"rating": "10"},
 	}
 
 	actualObservations := actualState[0].Observations()
@@ -244,7 +244,7 @@ func TestProcessCsvHeaders(t *testing.T) {
 
 	expectedColToIdentifierName := []string([]string{"transaction_id", "", "", "", "ticker_id", "", "", "", "", ""})
 	assert.Equal(t, expectedColToIdentifierName, colToIdentifierName)
-	
+
 	expectedColToMeasurementName := []string([]string{"", "open", "", "", "", "low", "", "volume", "", ""})
 	assert.Equal(t, expectedColToMeasurementName, colToMeasurementName)
 
