@@ -35,7 +35,7 @@ var (
 	cliClient          *cli
 	runtime            *runtimeServer
 	snapshotter        *cupaloy.Config
-	testPods           = []string{"test/Trader@0.4.0", "test/customprocessor@0.2.0", "test/event-tags@0.3.0", "test/event-categories@0.2.0", "test/trader-external-funcs@0.1.0", "test/trader-seed-streaming@0.1.0"}
+	testPods           = []string{"test/Trader@0.4.0", "test/customprocessor@0.2.0", "test/event-tags@0.4.0", "test/event-categories@0.2.0", "test/trader-external-funcs@0.1.0", "test/trader-seed-streaming@0.1.0"}
 )
 
 func TestMain(m *testing.M) {
