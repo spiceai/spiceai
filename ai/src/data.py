@@ -201,11 +201,6 @@ class DataManager:
 
         return self.massive_table_filled.iloc[start_index:end_index]
 
-    def get_latest_window(self):
-        latest_time = self.massive_table_filled.last_valid_index()
-
-        return self.get_window_at(latest_time)
-
     def rewind(self):
         self.current_time = self.param.epoch_time + self.param.interval_secs
 

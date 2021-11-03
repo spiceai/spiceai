@@ -72,9 +72,7 @@ class GetInferenceHandler:
 
     def get_result(self):
         try:
-            model_exists = False
-            if self.request.pod in Trainer.SAVED_MODELS:
-                model_exists = True
+            model_exists = self.request.pod in Trainer.SAVED_MODELS
 
             error = self.__validate_request()
             if error is not None:
@@ -88,12 +86,10 @@ class GetInferenceHandler:
                 return aiengine_pb2.InferenceResult(
                     response=aiengine_pb2.Response(result="not_enough_data", error=True))
 
-            if self.use_latest_time:
-                latest_window = data_manager.get_latest_window()
-                state = data_manager.flatten_and_normalize_window(latest_window)
-            else:
-                requested_window = data_manager.get_window_at(self.inference_time)
-                state = data_manager.flatten_and_normalize_window(requested_window)
+            latest_time = data_manager.massive_table_filled.last_valid_index()
+            inference_time = latest_time if self.use_latest_time else self.inference_time
+            requested_window = data_manager.get_window_at(inference_time)
+            state = data_manager.flatten_and_normalize_window(requested_window)
 
             action_from_model, probabilities = agent.act(state)
         except InvalidDataShapeException as ex:
