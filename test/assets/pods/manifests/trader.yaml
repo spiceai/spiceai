@@ -4,6 +4,10 @@ params:
   period: 17h
   interval: 17m
   granularity: 17s
+time:
+  categories:
+    - dayofweek
+    - hour
 dataspaces:
   - from: local
     name: portfolio

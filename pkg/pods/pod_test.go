@@ -24,7 +24,7 @@ func TestPod(t *testing.T) {
 	manifestsToTest := map[string]*TestPodParams{
 		"trader.yaml": {
 			LocalStateTest: true,
-			ExpectedHash:   "d1df971155f63f748489497fbf7c1ba2",
+			ExpectedHash:   "6d423c1f6dc9087139b1af70ae58280e",
 		},
 		"trader-infer.yaml": {
 			LocalStateTest: true,
@@ -36,7 +36,7 @@ func TestPod(t *testing.T) {
 		},
 		"event-categories.yaml": {
 			LocalStateTest: false,
-			ExpectedHash:   "467a03d9b6c54745486b6820e07d5df9",
+			ExpectedHash:   "9879535af17608c087d519b74a497f35",
 		},
 	}
 
