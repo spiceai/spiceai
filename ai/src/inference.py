@@ -1,19 +1,21 @@
 from pathlib import Path
+from typing import Dict
 
 import json
 import pandas as pd
 
 from algorithms.factory import get_agent
 from algorithms.agent_interface import SpiceAIAgent
+from data import DataManager
 from exception import InvalidDataShapeException
-from main import data_managers
 from proto.aiengine.v1 import aiengine_pb2
 from train import Trainer
 
 
 class GetInferenceHandler:
-    def __init__(self, request: aiengine_pb2.InferenceRequest):
+    def __init__(self, request: aiengine_pb2.InferenceRequest, data_managers: Dict[str, DataManager]):
         self.request = request
+        self.data_managers = data_managers
         self.inference_time = pd.to_datetime(request.inference_time, unit="s")
         self.use_latest_time = request.inference_time == 0
 
@@ -23,7 +25,7 @@ class GetInferenceHandler:
         return self.request.inference_time >= first_valid_time and self.request.inference_time <= last_valid_time
 
     def __validate_request(self) -> aiengine_pb2.InferenceResult:
-        if self.request.pod not in data_managers:
+        if self.request.pod not in self.data_managers:
             return aiengine_pb2.InferenceResult(
                 response=aiengine_pb2.Response(result="pod_not_initialized", error=True))
 
@@ -32,7 +34,7 @@ class GetInferenceHandler:
                 response=aiengine_pb2.Response(
                     result="tag_not_yet_supported", message="Support for multiple tags coming soon!", error=True))
 
-        data_manager = data_managers[self.request.pod]
+        data_manager = self.data_managers[self.request.pod]
 
         first_valid_time = (data_manager.massive_table_filled.first_valid_index() +
                             data_manager.param.interval_secs).timestamp()
@@ -53,7 +55,7 @@ class GetInferenceHandler:
     def __load_agent(self, model_exists) -> SpiceAIAgent:
         # Ideally we could just re-use the in-memory agent we created during training,
         # but tensorflow has issues with multi-threading in python, so we are just loading it from the file system
-        data_manager = data_managers[self.request.pod]
+        data_manager = self.data_managers[self.request.pod]
         model_data_shape = data_manager.get_shape()
         if model_exists:
             save_path = Trainer.SAVED_MODELS[self.request.pod]
@@ -80,7 +82,7 @@ class GetInferenceHandler:
 
             agent = self.__load_agent(model_exists=model_exists)
 
-            data_manager = data_managers[self.request.pod]
+            data_manager = self.data_managers[self.request.pod]
 
             if data_manager.massive_table_filled.shape[0] < data_manager.get_window_span():
                 return aiengine_pb2.InferenceResult(

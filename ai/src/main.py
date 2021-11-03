@@ -120,7 +120,7 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
         return aiengine_pb2.Response(result=result)
 
     def GetInference(self, request: aiengine_pb2.InferenceRequest, context):
-        handler = GetInferenceHandler(request)
+        handler = GetInferenceHandler(request, data_managers)
         return handler.get_result()
 
     def Init(self, request: aiengine_pb2.InitRequest, context):
