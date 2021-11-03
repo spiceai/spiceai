@@ -654,7 +654,10 @@ func TestIdentifierRoundTripping(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	snapshotter.SnapshotMulti("initial-observations", initialObservationsCsv)
+	err = snapshotter.SnapshotMulti("initial-observations", initialObservationsCsv)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	newObservations, err := os.ReadFile(filepath.Join(repoRoot, "test/assets/data/csv/e2e_csv_data_with_tags_2.csv"))
 	if err != nil {
@@ -673,7 +676,10 @@ func TestIdentifierRoundTripping(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	snapshotter.SnapshotMulti("additional-observations", additionalObservationsCsv)
+	err = snapshotter.SnapshotMulti("additional-observations", additionalObservationsCsv)
+	if err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestPodWithCategories(t *testing.T) {

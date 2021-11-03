@@ -327,30 +327,6 @@ func getMeasurements(dsSpec spec.DataspaceSpec) ([]string, map[string]string) {
 	return measurementNames, measurementSelectors
 }
 
-func getIdentifiers(dsSpec spec.DataspaceSpec) ([]string, []*IdentifierInfo, map[string]string) {
-	identifierNames := make([]string, len(dsSpec.Identifiers))
-	identifiers := make([]*IdentifierInfo, len(dsSpec.Identifiers))
-	identifierSelectors := make(map[string]string)
-	for i, identifierSpec := range dsSpec.Identifiers {
-		identifierNames[i] = identifierSpec.Name
-		fqIdentifierName := fmt.Sprintf("%s.%s.%s", dsSpec.From, dsSpec.Name, identifierSpec.Name)
-		identifiers[i] = &IdentifierInfo{
-			Name:   identifierSpec.Name,
-			FqName: fqIdentifierName,
-		}
-		if identifierSpec.Selector == "" {
-			identifierSelectors[identifierSpec.Name] = identifierSpec.Name
-		} else {
-			identifierSelectors[identifierSpec.Name] = identifierSpec.Selector
-		}
-	}
-	sort.Strings(identifierNames)
-	sort.SliceStable(identifiers, func(i, j int) bool {
-		return strings.Compare(identifiers[i].Name, identifiers[j].Name) == -1
-	})
-	return identifierNames, identifiers, identifierSelectors
-}
-
 func getCategories(dsSpec spec.DataspaceSpec) ([]string, []*CategoryInfo, map[string]string) {
 	categoryNames := make([]string, len(dsSpec.Categories))
 	categories := make([]*CategoryInfo, len(dsSpec.Categories))
