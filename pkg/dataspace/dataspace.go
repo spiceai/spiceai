@@ -15,7 +15,12 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-type Measurement struct {
+type IdentifierInfo struct {
+	Name   string
+	FqName string
+}
+
+type MeasurementInfo struct {
 	Name         string
 	InitialValue float64
 	Fill         string
@@ -40,6 +45,7 @@ type Dataspace struct {
 	seedDataInfo *DataInfo
 	dataInfo     *DataInfo
 
+	identifiers      []*IdentifierInfo
 	categories       []*CategoryInfo
 	measurementNames []string
 	categoryNames    []string
@@ -116,17 +122,22 @@ func (ds *Dataspace) Actions() map[string]string {
 	return fqActions
 }
 
+// Returns the list of Identifiers sorted by Name
+func (ds *Dataspace) Identifiers() []*IdentifierInfo {
+	return ds.identifiers
+}
+
 // Returns the list of Categories sorted by Name
 func (ds *Dataspace) Categories() []*CategoryInfo {
 	return ds.categories
 }
 
 // Returns a mapping of fully-qualified measurement names to Measurements
-func (ds *Dataspace) Measurements() map[string]*Measurement {
-	fqMeasurementInitializers := make(map[string]*Measurement)
+func (ds *Dataspace) Measurements() map[string]*MeasurementInfo {
+	fqMeasurementInitializers := make(map[string]*MeasurementInfo)
 	fqMeasurementNames := ds.MeasurementNameMap()
 	for _, measurementSpec := range ds.DataspaceSpec.Measurements {
-		measurement := &Measurement{
+		measurement := &MeasurementInfo{
 			Name:         measurementSpec.Name,
 			InitialValue: 0,
 			Fill:         measurementSpec.Fill,
@@ -314,6 +325,30 @@ func getMeasurements(dsSpec spec.DataspaceSpec) ([]string, map[string]string) {
 	sort.Strings(measurementNames)
 
 	return measurementNames, measurementSelectors
+}
+
+func getIdentifiers(dsSpec spec.DataspaceSpec) ([]string, []*IdentifierInfo, map[string]string) {
+	identifierNames := make([]string, len(dsSpec.Identifiers))
+	identifiers := make([]*IdentifierInfo, len(dsSpec.Identifiers))
+	identifierSelectors := make(map[string]string)
+	for i, identifierSpec := range dsSpec.Identifiers {
+		identifierNames[i] = identifierSpec.Name
+		fqIdentifierName := fmt.Sprintf("%s.%s.%s", dsSpec.From, dsSpec.Name, identifierSpec.Name)
+		identifiers[i] = &IdentifierInfo{
+			Name:   identifierSpec.Name,
+			FqName: fqIdentifierName,
+		}
+		if identifierSpec.Selector == "" {
+			identifierSelectors[identifierSpec.Name] = identifierSpec.Name
+		} else {
+			identifierSelectors[identifierSpec.Name] = identifierSpec.Selector
+		}
+	}
+	sort.Strings(identifierNames)
+	sort.SliceStable(identifiers, func(i, j int) bool {
+		return strings.Compare(identifiers[i].Name, identifiers[j].Name) == -1
+	})
+	return identifierNames, identifiers, identifierSelectors
 }
 
 func getCategories(dsSpec spec.DataspaceSpec) ([]string, []*CategoryInfo, map[string]string) {

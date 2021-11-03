@@ -44,10 +44,10 @@ func testGetCsvWithTagsFunc() func(*testing.T) {
 		}
 
 		measurements := map[string]string{
-			"height":  "h",
-			"rating":  "rating",
-			"speed":   "speed",
-			"target":  "target",
+			"height": "h",
+			"rating": "rating",
+			"speed":  "speed",
+			"target": "target",
 		}
 
 		tagSelectors := []string{
