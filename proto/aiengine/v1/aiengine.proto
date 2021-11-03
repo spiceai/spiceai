@@ -74,6 +74,7 @@ message StartTrainingRequest {
 message InferenceRequest {
   string pod = 1;
   string tag = 2;
+  int64 inference_time = 3;
 }
 
 message InferenceResult {

@@ -175,7 +175,7 @@ func testStartTrainingFunc(pod *pods.Pod, response string) func(t *testing.T) {
 func testInferServerNotReadyFunc() func(*testing.T) {
 	return func(t *testing.T) {
 		aiServerReady = false
-		_, err := Infer("pod_foo", "tag_bar")
+		_, err := Infer("pod_foo", 0, "tag_bar")
 		if assert.Error(t, err) {
 			assert.Equal(t, "not ready", err.Error())
 		}
@@ -213,7 +213,7 @@ func testInferServerFunc() func(*testing.T) {
 
 		SetAIEngineClient(mockAIEngineClient)
 
-		resp, err := Infer("pod_foo", "tag_bar")
+		resp, err := Infer("pod_foo", 0, "tag_bar")
 		if assert.NoError(t, err) {
 			assert.Equal(t, "ok", resp.Response.Result)
 		}
