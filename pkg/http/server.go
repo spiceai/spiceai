@@ -227,11 +227,18 @@ func apiRecommendationHandler(ctx *fasthttp.RequestCtx) {
 	pod := ctx.UserValue("pod").(string)
 	tag := ctx.UserValue("tag")
 
+	// Use a sentinel value of 0 to indicate the latest time
+	inferenceTime := 0
+	queryArgs := ctx.QueryArgs()
+	if queryArgs.Has("time") {
+		inferenceTime = queryArgs.GetUintOrZero("time")
+	}
+
 	if tag == nil || tag == "" {
 		tag = "latest"
 	}
 
-	inference, err := aiengine.Infer(pod, tag.(string))
+	inference, err := aiengine.Infer(pod, int64(inferenceTime), tag.(string))
 	if err != nil {
 		ctx.Response.SetStatusCode(500)
 		ctx.Response.SetBodyString(err.Error())
@@ -249,6 +256,7 @@ func apiRecommendationHandler(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
+	ctx.Response.Header.SetContentType("application/json")
 	ctx.Response.SetBody(body)
 }
 
@@ -268,10 +276,12 @@ func apiGetFlightsHandler(ctx *fasthttp.RequestCtx) {
 
 	response, err := json.Marshal(data)
 	if err != nil {
-		ctx.Response.Header.SetContentType("application/json")
+		ctx.Response.SetStatusCode(500)
+		ctx.Response.SetBodyString(err.Error())
 		return
 	}
 
+	ctx.Response.Header.SetContentType("application/json")
 	ctx.Response.SetBody(response)
 }
 
@@ -294,10 +304,12 @@ func apiGetFlightHandler(ctx *fasthttp.RequestCtx) {
 
 	response, err := json.Marshal(data)
 	if err != nil {
-		ctx.Response.Header.SetContentType("application/json")
+		ctx.Response.SetStatusCode(500)
+		ctx.Response.SetBodyString(err.Error())
 		return
 	}
 
+	ctx.Response.Header.SetContentType("application/json")
 	ctx.Response.SetBody(response)
 }
 
