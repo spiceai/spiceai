@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -212,14 +213,17 @@ func (r *runtimeServer) getInterpretations(podName string, startTime int64, endT
 	return data, nil
 }
 
-func (r *runtimeServer) waitForTrainingToComplete(podName string, flight string, expectedEpisodes int) error {
-	maxAttempts := 120
-	attemptCount := 0
+func (r *runtimeServer) waitForTrainingToComplete(podName string, flight string, expectedEpisodes int, secondsToWait int) error {
+	
+	startTime := time.Now()
+	timeToWait := time.Duration(secondsToWait) * time.Second
+
 	for {
 		time.Sleep(time.Second)
 
-		if attemptCount++; attemptCount > maxAttempts {
-			return fmt.Errorf("failed to verify training completed after %d attempts", attemptCount)
+		timeWaited := time.Since(startTime)
+		if timeWaited > timeToWait {
+			return fmt.Errorf("failed to verify training completed after %s", timeWaited.String())
 		}
 
 		var flightResponse runtime_pb.Flight
@@ -230,7 +234,9 @@ func (r *runtimeServer) waitForTrainingToComplete(podName string, flight string,
 			continue
 		}
 
-		if len(flightResponse.Episodes) < expectedEpisodes {
+	    episodesTrained := len(flightResponse.Episodes)
+		if episodesTrained < expectedEpisodes {
+			log.Printf("waiting for %d episodes to be trained, %d episodes trained", expectedEpisodes, episodesTrained)
 			continue
 		}
 
