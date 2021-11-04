@@ -31,7 +31,6 @@
   {
     "manifest_path": "fixed",
     "measurements": [
-      "event.data.eventId",
       "event.data.height",
       "event.data.rating",
       "event.data.speed",

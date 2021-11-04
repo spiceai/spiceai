@@ -32,7 +32,7 @@ func TestPod(t *testing.T) {
 		},
 		"event-tags.yaml": {
 			LocalStateTest: false,
-			ExpectedHash:   "a830f7a2cbdfecef1490189d593d26b0",
+			ExpectedHash:   "1dea04f71a65220474eb690252700f99",
 		},
 		"event-categories.yaml": {
 			LocalStateTest: false,
@@ -169,7 +169,6 @@ func testMeasurementNamesFunc(pod *Pod) func(*testing.T) {
 			}
 		case "event-tags":
 			expected = []string{
-				"event.data.eventId",
 				"event.data.height",
 				"event.data.rating",
 				"event.data.speed",
@@ -317,7 +316,7 @@ func testAddLocalStateFunc(pod *Pod) func(*testing.T) {
 
 		<-done
 
-		newState, err := state.GetStateFromCsv(nil, nil, fileData)
+		newState, err := state.GetStateFromCsv(nil, nil, nil, fileData)
 		if err != nil {
 			t.Error(err)
 		}
@@ -368,7 +367,7 @@ func testAddLocalStateCachedCsvFunc(pod *Pod) func(*testing.T) {
 
 		measurements := []string{"local.portfolio.usd_balance", "local.portfolio.btc_balance", "coinbase.btcusd.price"}
 
-		newState, err := state.GetStateFromCsv(measurements, nil, fileData)
+		newState, err := state.GetStateFromCsv(nil, measurements, nil, fileData)
 		if err != nil {
 			t.Error(err)
 		}

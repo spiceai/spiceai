@@ -44,11 +44,10 @@ func testGetCsvWithTagsFunc() func(*testing.T) {
 		}
 
 		measurements := map[string]string{
-			"eventId": "event_id",
-			"height":  "h",
-			"rating":  "rating",
-			"speed":   "speed",
-			"target":  "target",
+			"height": "h",
+			"rating": "rating",
+			"speed":  "speed",
+			"target": "target",
 		}
 
 		tagSelectors := []string{
@@ -74,7 +73,7 @@ func testGetCsvWithTagsFunc() func(*testing.T) {
 			return
 		}
 
-		headerLine := "eventId,height,rating,speed,target,_tags"
+		headerLine := "height,rating,speed,target,_tags"
 		headers := strings.Split(headerLine, ",")
 		tags := []string{"tagA", "tagB"}
 

@@ -40,7 +40,8 @@ type Pod struct {
 	dataspaces          []*dataspace.Dataspace
 	dataspaceMap        map[string]*dataspace.Dataspace
 	actions             map[string]string
-	measurements        map[string]*dataspace.Measurement
+	measurements        map[string]*dataspace.MeasurementInfo
+	fqIdentifierNames   []string
 	fqMeasurementNames  []string
 	fqCategoryNames     []string
 	tags                []string
@@ -259,8 +260,13 @@ func (pod *Pod) Rewards() map[string]string {
 	return rewards
 }
 
-func (pod *Pod) Measurements() map[string]*dataspace.Measurement {
+func (pod *Pod) Measurements() map[string]*dataspace.MeasurementInfo {
 	return pod.measurements
+}
+
+// Returns the list of fully-qualified identifier names
+func (pod *Pod) IdentifierNames() []string {
+	return pod.fqIdentifierNames
 }
 
 // Returns the list of fully-qualified measurement names
@@ -434,12 +440,13 @@ func loadPod(podPath string, hash string) (*Pod, error) {
 
 	pod.flights = make(map[string]*flights.Flight)
 
+	var fqIdentifierNames []string
 	var fqMeasurementNames []string
 	var fqCategoryNames []string
 	var tags []string
 
 	tagsMap := make(map[string]bool)
-	measurements := make(map[string]*dataspace.Measurement)
+	measurements := make(map[string]*dataspace.MeasurementInfo)
 	dataspaceMap := make(map[string]*dataspace.Dataspace, len(pod.PodSpec.Dataspaces))
 
 	for _, dsSpec := range pod.PodSpec.Dataspaces {
@@ -450,11 +457,8 @@ func loadPod(podPath string, hash string) (*Pod, error) {
 		pod.dataspaces = append(pod.dataspaces, ds)
 		dataspaceMap[ds.Path()] = ds
 
-		for _, dsTag := range ds.Tags() {
-			if _, ok := tagsMap[dsTag]; !ok {
-				tagsMap[dsTag] = true
-				tags = append(tags, dsTag)
-			}
+		for _, identifier := range ds.Identifiers() {
+			fqIdentifierNames = append(fqIdentifierNames, identifier.FqName)
 		}
 
 		for fqMeasurementName, measurement := range ds.Measurements() {
@@ -465,11 +469,21 @@ func loadPod(podPath string, hash string) (*Pod, error) {
 		for _, category := range ds.Categories() {
 			fqCategoryNames = append(fqCategoryNames, category.FqName)
 		}
+
+		for _, dsTag := range ds.Tags() {
+			if _, ok := tagsMap[dsTag]; !ok {
+				tagsMap[dsTag] = true
+				tags = append(tags, dsTag)
+			}
+		}
 	}
 
 	pod.dataspaceMap = dataspaceMap
 
 	pod.actions = pod.getActions()
+
+	sort.Strings(fqIdentifierNames)
+	pod.fqIdentifierNames = fqIdentifierNames
 
 	sort.Strings(fqMeasurementNames)
 	pod.fqMeasurementNames = fqMeasurementNames
@@ -617,7 +631,8 @@ func (pod *Pod) getActions() map[string]string {
 
 func (pod *Pod) csvHeaders() string {
 	if pod.fqCsvHeaders == "" {
-		headers := make([]string, 0, len(pod.fqMeasurementNames)+len(pod.fqCategoryNames))
+		headers := make([]string, 0, len(pod.fqIdentifierNames)+len(pod.fqMeasurementNames)+len(pod.fqCategoryNames))
+		headers = append(headers, pod.fqIdentifierNames...)
 		headers = append(headers, pod.fqMeasurementNames...)
 		headers = append(headers, pod.fqCategoryNames...)
 

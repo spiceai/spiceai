@@ -223,11 +223,10 @@ func testGetDataWithTagsFunc() func(*testing.T) {
 		}
 
 		measurements := map[string]string{
-			"eventId": "event_id",
-			"height":  "h",
-			"rating":  "rating",
-			"speed":   "speed",
-			"target":  "target",
+			"height": "h",
+			"rating": "rating",
+			"speed":  "speed",
+			"target": "target",
 		}
 
 		tagSelectors := []string{
@@ -257,7 +256,7 @@ func testGetDataWithTagsFunc() func(*testing.T) {
 		epoch := time.Unix(1610057400, 0)
 		timeCategoryNames := []string{}
 		timeCategoryFields := spice_time.GenerateTimeCategoryFields(timeCategoryNames...)
-		measurementNames := []string{"eventId", "height", "rating", "speed", "target"}
+		measurementNames := []string{"height", "rating", "speed", "target"}
 		tags := []string{"tagA", "tagB", "tagC", "tagD"}
 
 		actualPreviewCsv := getData(&csv, epoch, timeCategoryNames, timeCategoryFields, measurementNames, nil, tags, newObservations, 5)

@@ -232,11 +232,10 @@ func testMeasurementNamesFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 			}
 		case "event/data":
 			expected = map[string]string{
-				"eventId": "event.data.eventId",
-				"height":  "event.data.height",
-				"rating":  "event.data.rating",
-				"speed":   "event.data.speed",
-				"target":  "event.data.target",
+				"height": "event.data.height",
+				"rating": "event.data.rating",
+				"speed":  "event.data.speed",
+				"target": "event.data.target",
 			}
 		case "event/stream":
 			expected = map[string]string{

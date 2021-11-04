@@ -1,0 +1,105 @@
+([]*state.State) (len=1) {
+  (*state.State)({
+    Time: (time.Time) 2021-01-07 22:10:00 +0000 UTC,
+    TimeSentToAIEngine: (time.Time) 0001-01-01 00:00:00 +0000 UTC,
+    path: (string) (len=10) "event.data",
+    measurementsNames: ([]string) (len=2) {
+      (string) (len=5) "speed",
+      (string) (len=6) "target"
+    },
+    fqMeasurementsNames: ([]string) (len=2) {
+      (string) (len=16) "event.data.speed",
+      (string) (len=17) "event.data.target"
+    },
+    measurementsNamesMap: (map[string]string) (len=2) {
+      (string) (len=5) "speed": (string) (len=16) "event.data.speed",
+      (string) (len=6) "target": (string) (len=17) "event.data.target"
+    },
+    categoryNamesMap: (map[string]string) (len=1) {
+      (string) (len=6) "rating": (string) (len=17) "event.data.rating"
+    },
+    tags: ([]string) <nil>,
+    observations: ([]observations.Observation) (len=5) {
+      (observations.Observation) {
+        Time: (int64) 1611205740,
+        Identifiers: (map[string]string) (len=1) {
+          (string) (len=8) "event_id": (string) (len=1) "3"
+        },
+        Measurements: (map[string]float64) (len=2) {
+          (string) (len=5) "speed": (float64) 15,
+          (string) (len=6) "target": (float64) 1
+        },
+        Categories: (map[string]string) (len=1) {
+          (string) (len=6) "rating": (string) (len=2) "10"
+        },
+        Tags: ([]string) <nil>
+      },
+      (observations.Observation) {
+        Time: (int64) 1611305780,
+        Identifiers: (map[string]string) (len=1) {
+          (string) (len=8) "event_id": (string) (len=1) "5"
+        },
+        Measurements: (map[string]float64) (len=2) {
+          (string) (len=5) "speed": (float64) 30,
+          (string) (len=6) "target": (float64) 2
+        },
+        Categories: (map[string]string) (len=1) {
+          (string) (len=6) "rating": (string) (len=2) "11"
+        },
+        Tags: ([]string) <nil>
+      },
+      (observations.Observation) {
+        Time: (int64) 1611458200,
+        Identifiers: (map[string]string) (len=1) {
+          (string) (len=8) "event_id": (string) (len=1) "6"
+        },
+        Measurements: (map[string]float64) (len=2) {
+          (string) (len=5) "speed": (float64) 45,
+          (string) (len=6) "target": (float64) 3
+        },
+        Categories: (map[string]string) (len=1) {
+          (string) (len=6) "rating": (string) (len=2) "12"
+        },
+        Tags: ([]string) <nil>
+      },
+      (observations.Observation) {
+        Time: (int64) 1611558600,
+        Identifiers: (map[string]string) (len=1) {
+          (string) (len=8) "event_id": (string) (len=1) "7"
+        },
+        Measurements: (map[string]float64) (len=2) {
+          (string) (len=5) "speed": (float64) 60,
+          (string) (len=6) "target": (float64) 4
+        },
+        Categories: (map[string]string) (len=1) {
+          (string) (len=6) "rating": (string) (len=2) "13"
+        },
+        Tags: ([]string) <nil>
+      },
+      (observations.Observation) {
+        Time: (int64) 1611659000,
+        Identifiers: (map[string]string) (len=1) {
+          (string) (len=8) "event_id": (string) (len=1) "9"
+        },
+        Measurements: (map[string]float64) (len=2) {
+          (string) (len=5) "speed": (float64) 75,
+          (string) (len=6) "target": (float64) 5
+        },
+        Categories: (map[string]string) (len=1) {
+          (string) (len=6) "rating": (string) (len=2) "14"
+        },
+        Tags: ([]string) <nil>
+      }
+    },
+    observationsMutex: (sync.RWMutex) {
+      w: (sync.Mutex) {
+        state: (int32) 0,
+        sema: (uint32) 0
+      },
+      writerSem: (uint32) 0,
+      readerSem: (uint32) 0,
+      readerCount: (int32) 0,
+      readerWait: (int32) 0
+    }
+  })
+}

@@ -35,7 +35,7 @@ var (
 	cliClient          *cli
 	runtime            *runtimeServer
 	snapshotter        *cupaloy.Config
-	testPods           = []string{"test/Trader@0.4.0", "test/customprocessor@0.2.0", "test/event-tags@0.3.0", "test/event-categories@0.2.0", "test/trader-external-funcs@0.1.0", "test/trader-seed-streaming@0.1.0"}
+	testPods           = []string{"test/Trader@0.4.0", "test/customprocessor@0.2.0", "test/event-tags@0.4.0", "test/event-categories@0.2.0", "test/trader-external-funcs@0.1.0", "test/trader-seed-streaming@0.1.0"}
 )
 
 func TestMain(m *testing.M) {
@@ -627,6 +627,58 @@ func TestPodWithTags(t *testing.T) {
 
 		assert.Equal(t, 2, numActions, "expect 2 actions to be taken each episode")
 		assert.Equal(t, uint64(33), actionCount, "unexpected actions taken")
+	}
+}
+
+func TestIdentifierRoundTripping(t *testing.T) {
+	if !shouldRunTest {
+		t.Skip("Specify '-e2e' to run e2e tests")
+		return
+	}
+
+	err := runtime.startRuntime()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() {
+		err := runtime.shutdown()
+		if err != nil {
+			log.Fatalln(err.Error())
+		}
+	})
+
+	t.Log("*** Get Observations ***")
+	initialObservationsCsv, err := runtime.getObservations("event-tags", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = snapshotter.SnapshotMulti("initial-observations", initialObservationsCsv)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	newObservations, err := os.ReadFile(filepath.Join(repoRoot, "test/assets/data/csv/e2e_csv_data_with_tags_2.csv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Log("*** Post Observations ***")
+	err = runtime.postObservations("event-tags", newObservations)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Log("*** Get additional Observations ***")
+	additionalObservationsCsv, err := runtime.getObservations("event-tags", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = snapshotter.SnapshotMulti("additional-observations", additionalObservationsCsv)
+	if err != nil {
+		t.Fatal(err)
 	}
 }
 

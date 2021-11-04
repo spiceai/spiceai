@@ -15,7 +15,12 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-type Measurement struct {
+type IdentifierInfo struct {
+	Name   string
+	FqName string
+}
+
+type MeasurementInfo struct {
 	Name         string
 	InitialValue float64
 	Fill         string
@@ -40,6 +45,7 @@ type Dataspace struct {
 	seedDataInfo *DataInfo
 	dataInfo     *DataInfo
 
+	identifiers      []*IdentifierInfo
 	categories       []*CategoryInfo
 	measurementNames []string
 	categoryNames    []string
@@ -116,17 +122,22 @@ func (ds *Dataspace) Actions() map[string]string {
 	return fqActions
 }
 
+// Returns the list of Identifiers sorted by Name
+func (ds *Dataspace) Identifiers() []*IdentifierInfo {
+	return ds.identifiers
+}
+
 // Returns the list of Categories sorted by Name
 func (ds *Dataspace) Categories() []*CategoryInfo {
 	return ds.categories
 }
 
 // Returns a mapping of fully-qualified measurement names to Measurements
-func (ds *Dataspace) Measurements() map[string]*Measurement {
-	fqMeasurementInitializers := make(map[string]*Measurement)
+func (ds *Dataspace) Measurements() map[string]*MeasurementInfo {
+	fqMeasurementInitializers := make(map[string]*MeasurementInfo)
 	fqMeasurementNames := ds.MeasurementNameMap()
 	for _, measurementSpec := range ds.DataspaceSpec.Measurements {
-		measurement := &Measurement{
+		measurement := &MeasurementInfo{
 			Name:         measurementSpec.Name,
 			InitialValue: 0,
 			Fill:         measurementSpec.Fill,
