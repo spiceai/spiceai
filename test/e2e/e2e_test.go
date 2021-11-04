@@ -763,7 +763,7 @@ func TestImportExport(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = runtime.waitForTrainingToComplete("trader", "1" /*flight*/, 10)
+	err = runtime.waitForTrainingToComplete("trader", "1" /*flight*/, 20)
 	if err != nil {
 		t.Fatal(err)
 	}
