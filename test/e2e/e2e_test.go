@@ -494,7 +494,7 @@ func TestTrainingOutput(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = runtime.waitForTrainingToComplete("trader", "1" /*flight*/, 10)
+	err = runtime.waitForTrainingToComplete("trader", "1" /*flight*/, 10, 120)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -547,7 +547,7 @@ func TestTrainingWithExternalRewards(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = runtime.waitForTrainingToComplete("trader-external-funcs", "1" /*flight*/, 10)
+	err = runtime.waitForTrainingToComplete("trader-external-funcs", "1" /*flight*/, 10, 120)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -600,7 +600,7 @@ func TestPodWithTags(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = runtime.waitForTrainingToComplete("event-tags", "1" /*flight*/, 4)
+	err = runtime.waitForTrainingToComplete("event-tags", "1" /*flight*/, 4, 60)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -653,7 +653,7 @@ func TestPodWithCategories(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = runtime.waitForTrainingToComplete("event-categories", "1" /*flight*/, 4)
+	err = runtime.waitForTrainingToComplete("event-categories", "1" /*flight*/, 4, 60)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -711,7 +711,7 @@ func TestImportExport(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = runtime.waitForTrainingToComplete("trader", "1" /*flight*/, 10)
+	err = runtime.waitForTrainingToComplete("trader", "1" /*flight*/, 10, 300)
 	if err != nil {
 		t.Fatal(err)
 	}
