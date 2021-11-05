@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -22,31 +21,41 @@ import (
 	"github.com/spiceai/spiceai/pkg/observations"
 	"github.com/spiceai/spiceai/pkg/spec"
 	"github.com/spiceai/spiceai/pkg/state"
+	spice_time "github.com/spiceai/spiceai/pkg/time"
 	"github.com/spiceai/spiceai/pkg/util"
+	"github.com/spiceai/spiceai/pkg/validator"
 	"golang.org/x/sync/errgroup"
 )
 
 type Pod struct {
 	spec.PodSpec
-	podParams           *PodParams
-	hash                string
-	manifestPath        string
+	viper        *viper.Viper
+	podParams    *PodParams
+	hash         string
+	manifestPath string
+
+	timeCategories    map[string][]spice_time.TimeCategoryInfo
+	timeCategoryNames []string
+
 	dataspaces          []*dataspace.Dataspace
 	dataspaceMap        map[string]*dataspace.Dataspace
 	actions             map[string]string
-	measurements        map[string]*dataspace.Measurement
+	measurements        map[string]*dataspace.MeasurementInfo
+	fqIdentifierNames   []string
 	fqMeasurementNames  []string
 	fqCategoryNames     []string
 	tags                []string
-	flights             map[string]*flights.Flight
-	viper               *viper.Viper
 	externalRewardFuncs string
+
+	flights map[string]*flights.Flight
 
 	podLocalStateMutex    sync.RWMutex
 	podLocalState         []*state.State
 	podLocalStateHandlers []state.StateHandler
 
 	interpretations *interpretations.InterpretationsStore
+
+	fqCsvHeaders string
 }
 
 func (pod *Pod) Hash() string {
@@ -75,6 +84,14 @@ func (pod *Pod) Epoch() time.Time {
 
 func (pod *Pod) Granularity() time.Duration {
 	return pod.podParams.Granularity
+}
+
+func (pod *Pod) TimeCategories() map[string][]spice_time.TimeCategoryInfo {
+	return pod.timeCategories
+}
+
+func (pod *Pod) TimeCategoryNames() []string {
+	return pod.timeCategoryNames
 }
 
 func (pod *Pod) TrainingGoal() *string {
@@ -124,14 +141,10 @@ func (pod *Pod) CachedState() []*state.State {
 func (pod *Pod) CachedCsv() string {
 	csv := strings.Builder{}
 
+	csv.WriteString(pod.csvHeaders())
+
 	measurementNames := pod.MeasurementNames()
 	categoryNames := pod.CategoryNames()
-
-	headers := make([]string, 0, len(measurementNames)+len(categoryNames)+1)
-	headers = append(headers, measurementNames...)
-	headers = append(headers, categoryNames...)
-
-	csv.WriteString(fmt.Sprintf("time,%s,_tags\n", strings.Join(headers, ",")))
 
 	cachedState := pod.CachedState()
 	for _, state := range cachedState {
@@ -251,8 +264,13 @@ func (pod *Pod) Rewards() map[string]string {
 	return rewards
 }
 
-func (pod *Pod) Measurements() map[string]*dataspace.Measurement {
+func (pod *Pod) Measurements() map[string]*dataspace.MeasurementInfo {
 	return pod.measurements
+}
+
+// Returns the list of fully-qualified identifier names
+func (pod *Pod) IdentifierNames() []string {
+	return pod.fqIdentifierNames
 }
 
 // Returns the list of fully-qualified measurement names
@@ -285,6 +303,15 @@ func (pod *Pod) ValidateForTraining() error {
 	}
 
 	for _, ds := range pod.PodSpec.Dataspaces {
+		valid := validator.ValidateDataspaceName(ds.From)
+		if !valid {
+			return fmt.Errorf("invalid dataspace \"from\": '%s' should only contain A-Za-z0-9_", ds.From)
+		}
+		valid = validator.ValidateDataspaceName(ds.Name)
+		if !valid {
+			return fmt.Errorf("invalid dataspace \"name\": '%s' should only contain A-Za-z0-9_", ds.Name)
+		}
+
 		for _, f := range ds.Measurements {
 			switch f.Fill {
 			case "":
@@ -303,13 +330,11 @@ func (pod *Pod) ValidateForTraining() error {
 	}
 
 	// Check for args.<arg name>
-	re := regexp.MustCompile("[=| ]args\\.(\\w+)[=| \n]")
-
 	rewards := pod.Rewards()
 
 	for actionName, action := range actions {
 		numErrors := 0
-		matches := re.FindStringSubmatch(action)
+		matches := validator.GetArgsRegex().FindStringSubmatch(action)
 		errorLines := strings.Builder{}
 		for i, match := range matches {
 			if i == 0 {
@@ -342,6 +367,10 @@ func (pod *Pod) AddLocalState(newState ...*state.State) {
 
 func (pod *Pod) State() []*state.State {
 	return pod.podLocalState
+}
+
+func (pod *Pod) LearningAlgorithm() string {
+	return pod.podParams.LearningAlgorithm
 }
 
 func (pod *Pod) InitDataConnectors(handler state.StateHandler) error {
@@ -410,14 +439,25 @@ func loadPod(podPath string, hash string) (*Pod, error) {
 		pod.Name = strings.TrimSuffix(filepath.Base(podPath), filepath.Ext(podPath))
 	}
 
+	if pod.Time != nil && len(pod.Time.Categories) > 0 {
+		pod.timeCategories = spice_time.GenerateTimeCategoryFields(pod.Time.Categories...)
+		names := make([]string, len(pod.timeCategories))
+		for name := range pod.timeCategories {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		pod.timeCategoryNames = names
+	}
+
 	pod.flights = make(map[string]*flights.Flight)
 
+	var fqIdentifierNames []string
 	var fqMeasurementNames []string
 	var fqCategoryNames []string
 	var tags []string
 
 	tagsMap := make(map[string]bool)
-	measurements := make(map[string]*dataspace.Measurement)
+	measurements := make(map[string]*dataspace.MeasurementInfo)
 	dataspaceMap := make(map[string]*dataspace.Dataspace, len(pod.PodSpec.Dataspaces))
 
 	for _, dsSpec := range pod.PodSpec.Dataspaces {
@@ -428,11 +468,8 @@ func loadPod(podPath string, hash string) (*Pod, error) {
 		pod.dataspaces = append(pod.dataspaces, ds)
 		dataspaceMap[ds.Path()] = ds
 
-		for _, dsTag := range ds.Tags() {
-			if _, ok := tagsMap[dsTag]; !ok {
-				tagsMap[dsTag] = true
-				tags = append(tags, dsTag)
-			}
+		for _, identifier := range ds.Identifiers() {
+			fqIdentifierNames = append(fqIdentifierNames, identifier.FqName)
 		}
 
 		for fqMeasurementName, measurement := range ds.Measurements() {
@@ -443,11 +480,21 @@ func loadPod(podPath string, hash string) (*Pod, error) {
 		for _, category := range ds.Categories() {
 			fqCategoryNames = append(fqCategoryNames, category.FqName)
 		}
+
+		for _, dsTag := range ds.Tags() {
+			if _, ok := tagsMap[dsTag]; !ok {
+				tagsMap[dsTag] = true
+				tags = append(tags, dsTag)
+			}
+		}
 	}
 
 	pod.dataspaceMap = dataspaceMap
 
 	pod.actions = pod.getActions()
+
+	sort.Strings(fqIdentifierNames)
+	pod.fqIdentifierNames = fqIdentifierNames
 
 	sort.Strings(fqMeasurementNames)
 	pod.fqMeasurementNames = fqMeasurementNames
@@ -537,18 +584,12 @@ func (pod *Pod) loadParams() error {
 				return err
 			}
 			podParams.Interpolation = val
-		} else {
-			podParams.Interpolation = true
 		}
 	}
 
 	pod.podParams = podParams
 
 	return nil
-}
-
-func (pod *Pod) LearningAlgorithm() string {
-	return pod.podParams.LearningAlgorithm
 }
 
 func (pod *Pod) getActions() map[string]string {
@@ -606,4 +647,17 @@ func (pod *Pod) getActions() map[string]string {
 		}
 	}
 	return actions
+}
+
+func (pod *Pod) csvHeaders() string {
+	if pod.fqCsvHeaders == "" {
+		headers := make([]string, 0, len(pod.fqIdentifierNames)+len(pod.fqMeasurementNames)+len(pod.fqCategoryNames))
+		headers = append(headers, pod.fqIdentifierNames...)
+		headers = append(headers, pod.fqMeasurementNames...)
+		headers = append(headers, pod.fqCategoryNames...)
+
+		pod.fqCsvHeaders = fmt.Sprintf("time,%s,_tags\n", strings.Join(headers, ","))
+	}
+
+	return pod.fqCsvHeaders
 }

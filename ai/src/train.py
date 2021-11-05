@@ -102,6 +102,8 @@ class Trainer():
         with self.TRAINING_LOCK:
             print_event(self.pod_name, f"Training {self.training_episodes} episodes...")
 
+            not_learning_episodes = 0
+            last_episode_reward = None
             for episode in range(1, self.training_episodes + 1):
                 episode_start = math.floor(time.time())
                 self.data_manager.reset()
@@ -148,6 +150,16 @@ class Trainer():
                 }
 
                 post_episode_result(self.request_url, episode_data)
+                if last_episode_reward == episode_reward:
+                    not_learning_episodes += 1
+                else:
+                    not_learning_episodes = 0
+
+                if not_learning_episodes >= self.not_learning_threshold:
+                    self.not_learning_episodes_threshold_met = True
+                    break
+
+                last_episode_reward = episode_reward
 
                 end_of_episode(episode)
 

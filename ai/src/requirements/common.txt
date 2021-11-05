@@ -1,3 +1,4 @@
+## The following requirements were added by pip freeze:
 absl-py==0.13.0
 astunparse==1.6.3
 attrs==21.2.0
@@ -15,6 +16,9 @@ h5py==3.1.0
 humanize==3.11.0
 idna==3.2
 iniconfig==1.1.1
+keras==2.7.0
+Keras-Preprocessing==1.1.2
+libclang==12.0.0
 Markdown==3.3.4
 numpy==1.19.5
 oauthlib==3.1.1
@@ -38,8 +42,9 @@ six==1.15.0
 tensorboard==2.6.0
 tensorboard-data-server==0.6.1
 tensorboard-plugin-wit==1.8.0
-tensorflow==2.6.0
-tensorflow-estimator==2.6.0
+tensorflow==2.7.0
+tensorflow-estimator==2.7.0
+tensorflow-io-gcs-filesystem==0.21.0
 termcolor==1.1.0
 toml==0.10.2
 tornado==6.1

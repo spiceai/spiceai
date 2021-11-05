@@ -5,6 +5,7 @@ type DataspaceSpec struct {
 	Name         string            `json:"name,omitempty" yaml:"name,omitempty" mapstructure:"name,omitempty"`
 	SeedData     *DataSpec         `json:"seed_data,omitempty" yaml:"seed_data,omitempty" mapstructure:"seed_data,omitempty"`
 	Data         *DataSpec         `json:"data,omitempty" yaml:"data,omitempty" mapstructure:"data,omitempty"`
+	Identifiers  []IdentifiersSpec `json:"identifiers,omitempty" yaml:"identifiers,omitempty" mapstructure:"identifiers,omitempty"`
 	Measurements []MeasurementSpec `json:"measurements,omitempty" yaml:"measurements,omitempty" mapstructure:"measurements,omitempty"`
 	Categories   []CategorySpec    `json:"categories,omitempty" yaml:"categories,omitempty" mapstructure:"categories,omitempty"`
 	Tags         *TagsSpec         `json:"tags,omitempty" yaml:"tags,omitempty" mapstructure:"tags,omitempty"`
@@ -15,6 +16,11 @@ type DataspaceSpec struct {
 type DataSpec struct {
 	Connector DataConnectorSpec `json:"connector,omitempty" yaml:"connector,omitempty" mapstructure:"connector,omitempty"`
 	Processor DataProcessorSpec `json:"processor,omitempty" yaml:"processor,omitempty" mapstructure:"processor,omitempty"`
+}
+
+type IdentifiersSpec struct {
+	Name     string `json:"name,omitempty" yaml:"name,omitempty" mapstructure:"name,omitempty"`
+	Selector string `json:"selector,omitempty" yaml:"selector,omitempty" mapstructure:"selector,omitempty"`
 }
 
 type TagsSpec struct {

@@ -13,7 +13,6 @@
     "action_two": 1
   },
   "fields": {
-    "event_data_eventId": {},
     "event_data_height": {},
     "event_data_rating": {
       "fill_method": 1

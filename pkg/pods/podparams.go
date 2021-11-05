@@ -17,6 +17,6 @@ func NewPodParams() *PodParams {
 		Interval:          time.Minute * 1,
 		Granularity:       time.Second * 10,
 		LearningAlgorithm: "dql",
-		Interpolation:     false,
+		Interpolation:     true,
 	}
 }

@@ -8,6 +8,7 @@ import (
 
 type Observation struct {
 	Time         int64
+	Identifiers  map[string]string
 	Measurements map[string]float64
 	Categories   map[string]string
 	Tags         []string
@@ -20,14 +21,17 @@ func GetCsv(headers []string, tags []string, observations []Observation) string 
 		for _, f := range headers {
 			csv.WriteString(",")
 
-			val, ok := o.Measurements[f]
-			if ok {
-				csv.WriteString(strconv.FormatFloat(val, 'f', -1, 64))
+			if identifier, ok := o.Identifiers[f]; ok {
+				csv.WriteString(identifier)
 				continue
 			}
 
-			category, ok := o.Categories[f]
-			if ok {
+			if measurement, ok := o.Measurements[f]; ok {
+				csv.WriteString(strconv.FormatFloat(measurement, 'f', -1, 64))
+				continue
+			}
+
+			if category, ok := o.Categories[f]; ok {
 				csv.WriteString(category)
 				continue
 			}

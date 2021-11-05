@@ -15,7 +15,12 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-type Measurement struct {
+type IdentifierInfo struct {
+	Name   string
+	FqName string
+}
+
+type MeasurementInfo struct {
 	Name         string
 	InitialValue float64
 	Fill         string
@@ -40,6 +45,7 @@ type Dataspace struct {
 	seedDataInfo *DataInfo
 	dataInfo     *DataInfo
 
+	identifiers      []*IdentifierInfo
 	categories       []*CategoryInfo
 	measurementNames []string
 	categoryNames    []string
@@ -52,6 +58,7 @@ type Dataspace struct {
 }
 
 func NewDataspace(dsSpec spec.DataspaceSpec) (*Dataspace, error) {
+	_, _, identifierSelectors := getIdentifiers(dsSpec)
 	categoryNames, categories, categorySelectors := getCategories(dsSpec)
 	measurementNames, measurementSelectors := getMeasurements(dsSpec)
 	tags, fqTags := getTags(dsSpec)
@@ -72,7 +79,7 @@ func NewDataspace(dsSpec spec.DataspaceSpec) (*Dataspace, error) {
 	}
 
 	if dsSpec.SeedData != nil {
-		dataInfo, err := getDataInfo(dsSpec.SeedData, measurementSelectors, categorySelectors, tagSelectors, ds.ReadSeedData)
+		dataInfo, err := getDataInfo(dsSpec.SeedData, identifierSelectors, measurementSelectors, categorySelectors, tagSelectors, ds.ReadSeedData)
 		if err != nil {
 			return nil, err
 		}
@@ -80,7 +87,7 @@ func NewDataspace(dsSpec spec.DataspaceSpec) (*Dataspace, error) {
 	}
 
 	if dsSpec.Data != nil {
-		dataInfo, err := getDataInfo(dsSpec.Data, measurementSelectors, categorySelectors, tagSelectors, ds.ReadData)
+		dataInfo, err := getDataInfo(dsSpec.Data, identifierSelectors, measurementSelectors, categorySelectors, tagSelectors, ds.ReadData)
 		if err != nil {
 			return nil, err
 		}
@@ -116,17 +123,22 @@ func (ds *Dataspace) Actions() map[string]string {
 	return fqActions
 }
 
+// Returns the list of Identifiers sorted by Name
+func (ds *Dataspace) Identifiers() []*IdentifierInfo {
+	return ds.identifiers
+}
+
 // Returns the list of Categories sorted by Name
 func (ds *Dataspace) Categories() []*CategoryInfo {
 	return ds.categories
 }
 
 // Returns a mapping of fully-qualified measurement names to Measurements
-func (ds *Dataspace) Measurements() map[string]*Measurement {
-	fqMeasurementInitializers := make(map[string]*Measurement)
+func (ds *Dataspace) Measurements() map[string]*MeasurementInfo {
+	fqMeasurementInitializers := make(map[string]*MeasurementInfo)
 	fqMeasurementNames := ds.MeasurementNameMap()
 	for _, measurementSpec := range ds.DataspaceSpec.Measurements {
-		measurement := &Measurement{
+		measurement := &MeasurementInfo{
 			Name:         measurementSpec.Name,
 			InitialValue: 0,
 			Fill:         measurementSpec.Fill,
@@ -269,13 +281,13 @@ func (ds *Dataspace) readData(processor dataprocessors.DataProcessor, data []byt
 	return data, nil
 }
 
-func getDataInfo(dataSpec *spec.DataSpec, measurementSelectors map[string]string, categorySelectors map[string]string, tagSelectors []string, readData func(data []byte, metadata map[string]string) ([]byte, error)) (*DataInfo, error) {
+func getDataInfo(dataSpec *spec.DataSpec, identifierSelectors map[string]string, measurementSelectors map[string]string, categorySelectors map[string]string, tagSelectors []string, readData func(data []byte, metadata map[string]string) ([]byte, error)) (*DataInfo, error) {
 	processor, err := dataprocessors.NewDataProcessor(dataSpec.Processor.Name)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize data processor '%s': %s", dataSpec.Processor.Name, err)
 	}
 
-	err = processor.Init(dataSpec.Connector.Params, measurementSelectors, categorySelectors, tagSelectors)
+	err = processor.Init(dataSpec.Connector.Params, identifierSelectors, measurementSelectors, categorySelectors, tagSelectors)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize data processor '%s': %s", dataSpec.Processor.Name, err)
 	}
@@ -298,6 +310,30 @@ func getDataInfo(dataSpec *spec.DataSpec, measurementSelectors map[string]string
 		connector:     connector,
 		processor:     processor,
 	}, nil
+}
+
+func getIdentifiers(dsSpec spec.DataspaceSpec) ([]string, []*IdentifierInfo, map[string]string) {
+	identifierNames := make([]string, len(dsSpec.Identifiers))
+	identifiers := make([]*IdentifierInfo, len(dsSpec.Identifiers))
+	identifierSelectors := make(map[string]string)
+	for i, identifierSpec := range dsSpec.Identifiers {
+		identifierNames[i] = identifierSpec.Name
+		fqIdentifierName := fmt.Sprintf("%s.%s.%s", dsSpec.From, dsSpec.Name, identifierSpec.Name)
+		identifiers[i] = &IdentifierInfo{
+			Name:   identifierSpec.Name,
+			FqName: fqIdentifierName,
+		}
+		if identifierSpec.Selector == "" {
+			identifierSelectors[identifierSpec.Name] = identifierSpec.Name
+		} else {
+			identifierSelectors[identifierSpec.Name] = identifierSpec.Selector
+		}
+	}
+	sort.Strings(identifierNames)
+	sort.SliceStable(identifiers, func(i, j int) bool {
+		return strings.Compare(identifiers[i].Name, identifiers[j].Name) == -1
+	})
+	return identifierNames, identifiers, identifierSelectors
 }
 
 func getMeasurements(dsSpec spec.DataspaceSpec) ([]string, map[string]string) {

@@ -22,7 +22,8 @@ from connector.stateful import StatefulConnector
 from data_manager.base_manager import DataParam, DataManagerBase
 from data_manager.event_manager import EventDataManager
 from data_manager.time_series_manager import TimeSeriesDataManager
-from exception import UnexpectedException, InvalidDataShapeException
+from exception import UnexpectedException
+from inference import GetInferenceHandler
 from proto.aiengine.v1 import aiengine_pb2, aiengine_pb2_grpc
 from train import Trainer
 from validation import validate_rewards
@@ -117,79 +118,8 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
         return aiengine_pb2.Response(result=result)
 
     def GetInference(self, request: aiengine_pb2.InferenceRequest, context):
-        try:
-            model_exists = False
-            if request.pod in Trainer.SAVED_MODELS:
-                model_exists = True
-
-            if request.pod not in data_managers:
-                return aiengine_pb2.InferenceResult(
-                    response=aiengine_pb2.Response(result="pod_not_initialized", error=True))
-
-            if request.tag != "latest":
-                return aiengine_pb2.InferenceResult(
-                    response=aiengine_pb2.Response(
-                        result="tag_not_yet_supported", message="Support for multiple tags coming soon!", error=True))
-
-            # Ideally we could just re-use the in-memory agent we created during training,
-            # but tensorflow has issues with multi-threading in python, so we are just loading it from the file system
-            data_manager = data_managers[request.pod]
-            model_data_shape = data_manager.get_shape()
-            if model_exists:
-                save_path = Trainer.SAVED_MODELS[request.pod]
-                with open(save_path / "meta.json", "r", encoding="utf-8") as meta_file:
-                    save_info = json.loads(meta_file.read())
-                algorithm = save_info["algorithm"]
-            else:
-                algorithm = "dql"
-
-            agent: SpiceAIAgent = get_agent(algorithm, model_data_shape, len(data_manager.action_names))
-            if model_exists:
-                agent.load(Path(save_path))
-
-            data_manager = data_managers[request.pod]
-
-            if data_manager.massive_table_filled.shape[0] < data_manager.get_window_span():
-                return aiengine_pb2.InferenceResult(
-                    response=aiengine_pb2.Response(result="not_enough_data", error=True))
-
-            latest_window = data_manager.get_latest_window()
-            state = data_manager.flatten_and_normalize_window(latest_window)
-
-            action_from_model, probabilities = agent.act(state)
-        except InvalidDataShapeException as ex:
-            result = ex.type
-            message = ex.message
-
-            if Trainer.TRAINING_LOCK.locked():
-                result = "training_not_complete"
-                message = (
-                    "Please wait to get a recommendation until after training completes"
-                )
-
-            return aiengine_pb2.InferenceResult(
-                response=aiengine_pb2.Response(
-                    result=result, message=message, error=True
-                )
-            )
-        confidence = f"{probabilities[action_from_model]:.3f}"
-        if not model_exists:
-            confidence = 0.0
-
-        action_name = data_manager.action_names[action_from_model]
-
-        end_time = data_manager.massive_table_filled.last_valid_index()
-        start_time = end_time - data_manager.param.interval_secs
-
-        result = aiengine_pb2.InferenceResult()
-        result.start = int(start_time.timestamp())
-        result.end = int(end_time.timestamp())
-        result.action = action_name
-        result.confidence = float(confidence)
-        result.tag = request.tag
-        result.response.result = "ok"
-
-        return result
+        handler = GetInferenceHandler(request, data_managers)
+        return handler.get_result()
 
     def Init(self, request: aiengine_pb2.InitRequest, context):
         with Dispatch.INIT_LOCK:
@@ -226,6 +156,7 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
                     external_reward_funcs=request.external_reward_funcs,
                     laws=request.laws)
             else:
+                raise Exception('EventDataManager should not be used')
                 data_manager = EventDataManager(
                     param=DataParam(
                         epoch_time=epoch_time,

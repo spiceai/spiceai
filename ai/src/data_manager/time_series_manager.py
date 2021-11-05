@@ -1,4 +1,5 @@
 import math
+import threading
 from types import SimpleNamespace
 from typing import Dict, List
 
@@ -49,6 +50,7 @@ class TimeSeriesDataManager(DataManagerBase):
                 reward_func_name = self.action_rewards[action_name]
                 reward_func = getattr(self.reward_funcs_module, reward_func_name)
                 self.reward_funcs_module_actions[action_name] = reward_func
+        self.table_lock = threading.Lock()
 
     def get_window_span(self):
         return math.floor(self.param.interval_secs / self.param.granularity_secs)
@@ -106,21 +108,22 @@ class TimeSeriesDataManager(DataManagerBase):
 
             return expressions.where(condition, existing_values, newer_values)
 
-        if len(new_data) == 0:
-            return
+        with self.table_lock:
+            if len(new_data) == 0:
+                return
 
-        if len(new_data) == 1 and new_data.index[0] in self.massive_table_sparse.index:
-            metrics.start("merge_row")
-            self._merge_row(new_data)
-            metrics.end("merge_row")
-        else:
-            metrics.start("combine")
-            self.massive_table_sparse = self.massive_table_sparse.combine(
-                new_data, combiner
-            )
-            metrics.end("combine")
+            if len(new_data) == 1 and new_data.index[0] in self.massive_table_sparse.index:
+                metrics.start("merge_row")
+                self._merge_row(new_data)
+                metrics.end("merge_row")
+            else:
+                metrics.start("combine")
+                self.massive_table_sparse = self.massive_table_sparse.combine(
+                    new_data, combiner
+                )
+                metrics.end("combine")
 
-            self._fill_table()
+                self._fill_table()
 
     def add_interpretations(self, interpretations):
         self.interpretations = interpretations
@@ -150,25 +153,24 @@ class TimeSeriesDataManager(DataManagerBase):
             if self.get_window_span() == 1 else
             self.massive_table_filled.iloc[start_index:end_index])
 
-    def get_latest_window(self):
+    def get_window_at(self, time):
         start_index = None
         end_index = None
-        latest_time = self.massive_table_filled.last_valid_index()
 
         # If we only have a single row, use it
         if self.massive_table_filled.shape[0] == 1:
-            start_index = self.massive_table_filled.index.get_loc(latest_time)
+            start_index = self.massive_table_filled.index.get_loc(time)
             end_index = start_index
         else:
             start_index = self.massive_table_filled.index.get_loc(
-                latest_time - self.param.interval_secs, "ffill"
+                time - self.param.interval_secs, "ffill"
             )
-            end_index = self.massive_table_filled.index.get_loc(latest_time, "ffill")
+            end_index = self.massive_table_filled.index.get_loc(time, "ffill")
 
-        return (
-            self.massive_table_filled.iloc[start_index:start_index + 1]
-            if self.get_window_span() == 1 else
-            self.massive_table_filled.iloc[start_index:end_index])
+        if self.get_window_span() == 1:
+            return self.massive_table_filled.iloc[start_index:start_index + 1]
+
+        return self.massive_table_filled.iloc[start_index:end_index]
 
     def reset(self):
         self.current_time = self.param.epoch_time

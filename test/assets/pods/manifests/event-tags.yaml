@@ -14,9 +14,10 @@ dataspaces:
           path: ../../test/assets/data/csv/csv_data_with_tags.csv
       processor:
         name: csv
-    measurements:
+    identifiers:
       - name: eventId
         selector: event_id
+    measurements:
       - name: height
         selector: h
       - name: rating

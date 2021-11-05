@@ -35,7 +35,7 @@ var (
 	cliClient          *cli
 	runtime            *runtimeServer
 	snapshotter        *cupaloy.Config
-	testPods           = []string{"test/Trader@0.4.0", "test/customprocessor@0.2.0", "test/event-tags@0.3.0", "test/event-categories@0.2.0", "test/trader-external-funcs@0.1.0", "test/trader-seed-streaming@0.1.0"}
+	testPods           = []string{"test/Trader@0.4.0", "test/customprocessor@0.2.0", "test/event-tags@0.4.0", "test/event-categories@0.2.0", "test/trader-external-funcs@0.1.0", "test/trader-seed-streaming@0.1.0"}
 )
 
 func TestMain(m *testing.M) {
@@ -494,7 +494,7 @@ func TestTrainingOutput(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = runtime.waitForTrainingToComplete("trader", "1" /*flight*/, 10)
+	err = runtime.waitForTrainingToComplete("trader", "1" /*flight*/, 10, 120)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -547,7 +547,7 @@ func TestTrainingWithExternalRewards(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = runtime.waitForTrainingToComplete("trader-external-funcs", "1" /*flight*/, 10)
+	err = runtime.waitForTrainingToComplete("trader-external-funcs", "1" /*flight*/, 10, 120)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -600,7 +600,7 @@ func TestPodWithTags(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = runtime.waitForTrainingToComplete("event-tags", "1" /*flight*/, 4)
+	err = runtime.waitForTrainingToComplete("event-tags", "1" /*flight*/, 4, 60)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -630,6 +630,58 @@ func TestPodWithTags(t *testing.T) {
 	}
 }
 
+func TestIdentifierRoundTripping(t *testing.T) {
+	if !shouldRunTest {
+		t.Skip("Specify '-e2e' to run e2e tests")
+		return
+	}
+
+	err := runtime.startRuntime()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() {
+		err := runtime.shutdown()
+		if err != nil {
+			log.Fatalln(err.Error())
+		}
+	})
+
+	t.Log("*** Get Observations ***")
+	initialObservationsCsv, err := runtime.getObservations("event-tags", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = snapshotter.SnapshotMulti("initial-observations", initialObservationsCsv)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	newObservations, err := os.ReadFile(filepath.Join(repoRoot, "test/assets/data/csv/e2e_csv_data_with_tags_2.csv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Log("*** Post Observations ***")
+	err = runtime.postObservations("event-tags", newObservations)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Log("*** Get additional Observations ***")
+	additionalObservationsCsv, err := runtime.getObservations("event-tags", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = snapshotter.SnapshotMulti("additional-observations", additionalObservationsCsv)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestPodWithCategories(t *testing.T) {
 	if !shouldRunTest {
 		t.Skip("Specify '-e2e' to run e2e tests")
@@ -653,7 +705,7 @@ func TestPodWithCategories(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = runtime.waitForTrainingToComplete("event-categories", "1" /*flight*/, 4)
+	err = runtime.waitForTrainingToComplete("event-categories", "1" /*flight*/, 4, 60)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -711,7 +763,7 @@ func TestImportExport(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = runtime.waitForTrainingToComplete("trader", "1" /*flight*/, 10)
+	err = runtime.waitForTrainingToComplete("trader", "1" /*flight*/, 10, 300)
 	if err != nil {
 		t.Fatal(err)
 	}
