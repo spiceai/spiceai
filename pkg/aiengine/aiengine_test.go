@@ -22,6 +22,13 @@ func TestAIEngineGetPythonCmd(t *testing.T) {
 	origContext := context.CurrentContext()
 	t.Cleanup(func() { context.SetContext(origContext) })
 
+	algorithmsMap = map[string]*LearningAlgorithm{
+		"dql": {
+			Id: "dql",
+			Name: "Deep Q-Learning",
+		},
+	}
+
 	t.Run("getPythonCmd() -- Docker Context", testPythonCmdDockerContextFunc())
 	t.Run("getPythonCmd() -- BareMetal Context", testPythonCmdBareMetalContextFunc())
 }
@@ -31,6 +38,13 @@ func TestAIEngineStartServer(t *testing.T) {
 	t.Cleanup(func() { context.SetContext(origContext) })
 	t.Cleanup(func() { execCommand = exec.Command })
 
+	algorithmsMap = map[string]*LearningAlgorithm{
+		"dql": {
+			Id: "dql",
+			Name: "Deep Q-Learning",
+		},
+	}
+
 	t.Run("StartServer() -- Happy Path", testStartServerFunc())
 	t.Run("StartServer() -- Python server takes a few tries to return healthy", testStartServerHealthyLaterFunc())
 }
@@ -38,9 +52,23 @@ func TestAIEngineStartServer(t *testing.T) {
 func TestInfer(t *testing.T) {
 	t.Run("Infer() -- Server not ready", testInferServerNotReadyFunc())
 	t.Run("Infer() -- Expected url is called", testInferServerFunc())
+
+	algorithmsMap = map[string]*LearningAlgorithm{
+		"dql": {
+			Id: "dql",
+			Name: "Deep Q-Learning",
+		},
+	}
 }
 
 func TestPod(t *testing.T) {
+	algorithmsMap = map[string]*LearningAlgorithm{
+		"dql": {
+			Id: "dql",
+			Name: "Deep Q-Learning",
+		},
+	}
+	
 	manifestsToTest := []string{"trader.yaml", "trader-infer.yaml", "event-tags.yaml", "event-categories.yaml"}
 
 	for _, manifestToTest := range manifestsToTest {

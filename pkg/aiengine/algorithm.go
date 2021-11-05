@@ -12,13 +12,13 @@ import (
 )
 
 type LearningAlgorithm struct {
-	Id   string `json:"algorithm_id"`
-	Name string `json:"name"`
+	Id       string `json:"algorithm_id"`
+	Name     string `json:"name"`
 	DocsLink string `json:"docs_link"`
 }
 
 var (
-	algorithms []*LearningAlgorithm
+	algorithms    []*LearningAlgorithm
 	algorithmsMap map[string]*LearningAlgorithm
 )
 
@@ -28,7 +28,7 @@ func Algorithms() []*LearningAlgorithm {
 
 func LoadAlgorithms() error {
 	algorithmsMap = make(map[string]*LearningAlgorithm)
-	
+
 	algorithmsDir := filepath.Join(context.CurrentContext().AIEngineDir(), "algorithms")
 
 	entries, err := os.ReadDir(algorithmsDir)

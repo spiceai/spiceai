@@ -17,6 +17,9 @@ func StartTraining(pod *pods.Pod, algorithm *LearningAlgorithm, number_episodes 
 
 	if algorithm == nil {
 		algorithm = GetAlgorithm(pod.LearningAlgorithm())
+		if algorithm == nil {
+			return fmt.Errorf("No algorithm found for %s", pod.LearningAlgorithm())
+		}
 	}
 
 	flight := flights.NewFlight(flightId, int(pod.Episodes()), algorithm.Id)
