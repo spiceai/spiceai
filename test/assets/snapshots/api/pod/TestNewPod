@@ -1,6 +1,7 @@
 {
   "name": "event-categories",
   "manifest_path": "../../test/assets/pods/manifests/event-categories.yaml",
+  "episodes": 10,
   "measurements": [
     "event.stream.duration",
     "event.stream.guest_count",

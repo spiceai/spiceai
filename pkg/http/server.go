@@ -214,7 +214,17 @@ func apiPodTrainHandler(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	err = aiengine.StartTraining(pod, trainRequest.LearningAlgorithm, trainRequest.NumberEpisodes)
+	var algorithm *aiengine.LearningAlgorithm
+	if trainRequest.LearningAlgorithm != "" {
+		algorithm = aiengine.GetAlgorithm(trainRequest.LearningAlgorithm)
+		if algorithm == nil {
+			ctx.Response.SetStatusCode(400)
+			ctx.Response.SetBodyString(fmt.Sprintf("unknown learning algorithm %s", trainRequest.LearningAlgorithm))
+			return
+		}
+	}
+
+	err = aiengine.StartTraining(pod, algorithm, trainRequest.NumberEpisodes)
 	if err != nil {
 		ctx.Response.SetStatusCode(500)
 		ctx.Response.SetBodyString(err.Error())
@@ -269,7 +279,7 @@ func apiGetFlightsHandler(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	data := make([]*runtime_pb.Flight, 0)
+	data := make([]*api.Flight, 0)
 	for _, f := range *pod.Flights() {
 		flight := api.NewFlight(f)
 		data = append(data, flight)
@@ -524,6 +534,19 @@ func apiPostImportHandler(ctx *fasthttp.RequestCtx) {
 	ctx.Response.SetStatusCode(200)
 }
 
+func (server *server) apiGetAlgorithmsHandler(ctx *fasthttp.RequestCtx) {
+	data, err := json.Marshal(aiengine.Algorithms())
+	if err != nil {
+		ctx.Response.SetStatusCode(http.StatusInternalServerError)
+		ctx.Response.SetBodyString(err.Error())
+		return
+	}
+
+	ctx.Response.Header.Add("Content-Type", "application/json")
+	ctx.Response.SetStatusCode(http.StatusOK)
+	ctx.Response.SetBody(data)
+}
+
 func (server *server) apiGetDiagnosticsHandler(ctx *fasthttp.RequestCtx) {
 	report, err := diagnostics.GenerateReport()
 	if err != nil {
@@ -575,6 +598,8 @@ func (server *server) Start() error {
 		// Interpretations
 		api.GET("/pods/{pod}/interpretations", apiGetInterpretationsHandler)
 		api.POST("/pods/{pod}/interpretations", apiPostInterpretationsHandler)
+
+		api.GET("/algorithms", server.apiGetAlgorithmsHandler)
 
 		api.GET("/diagnostics", server.apiGetDiagnosticsHandler)
 	}

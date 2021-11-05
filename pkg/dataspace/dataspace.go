@@ -287,7 +287,7 @@ func getDataInfo(dataSpec *spec.DataSpec, identifierSelectors map[string]string,
 		return nil, fmt.Errorf("failed to initialize data processor '%s': %s", dataSpec.Processor.Name, err)
 	}
 
-	err = processor.Init(dataSpec.Connector.Params, identifierSelectors, measurementSelectors, categorySelectors, tagSelectors)
+	err = processor.Init(dataSpec.Processor.Params, identifierSelectors, measurementSelectors, categorySelectors, tagSelectors)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize data processor '%s': %s", dataSpec.Processor.Name, err)
 	}
