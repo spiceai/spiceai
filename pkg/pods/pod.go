@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -24,12 +23,8 @@ import (
 	"github.com/spiceai/spiceai/pkg/state"
 	spice_time "github.com/spiceai/spiceai/pkg/time"
 	"github.com/spiceai/spiceai/pkg/util"
+	"github.com/spiceai/spiceai/pkg/validator"
 	"golang.org/x/sync/errgroup"
-)
-
-var (
-	argsRegex          *regexp.Regexp
-	dataspaceNameRegex *regexp.Regexp
 )
 
 type Pod struct {
@@ -304,11 +299,11 @@ func (pod *Pod) ValidateForTraining() error {
 	}
 
 	for _, ds := range pod.PodSpec.Dataspaces {
-		valid := dataspaceNameRegex.MatchString(ds.From)
+		valid := validator.ValidateDataspaceName(ds.From)
 		if !valid {
 			return fmt.Errorf("invalid dataspace \"from\": '%s' should only contain A-Za-z0-9_", ds.From)
 		}
-		valid = dataspaceNameRegex.MatchString(ds.Name)
+		valid = validator.ValidateDataspaceName(ds.Name)
 		if !valid {
 			return fmt.Errorf("invalid dataspace \"name\": '%s' should only contain A-Za-z0-9_", ds.Name)
 		}
@@ -335,7 +330,7 @@ func (pod *Pod) ValidateForTraining() error {
 
 	for actionName, action := range actions {
 		numErrors := 0
-		matches := argsRegex.FindStringSubmatch(action)
+		matches := validator.GetArgsRegex().FindStringSubmatch(action)
 		errorLines := strings.Builder{}
 		for i, match := range matches {
 			if i == 0 {
@@ -652,9 +647,4 @@ func (pod *Pod) csvHeaders() string {
 	}
 
 	return pod.fqCsvHeaders
-}
-
-func init() {
-	argsRegex = regexp.MustCompile("[=| ]args\\.(\\w+)[=| \n]")
-	dataspaceNameRegex = regexp.MustCompile(`^[[:alpha:]][\w]*$`)
 }

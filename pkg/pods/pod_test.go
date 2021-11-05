@@ -466,22 +466,3 @@ func testLoadParamsFunc() func(*testing.T) {
 		assert.Equal(t, 124*time.Second, pod.Granularity())
 	}
 }
-
-func TestDataspaceNameRegex(t *testing.T) {
-	testCases := map[string]bool{
-		"hi":                 true,
-		"event_stream123":    true,
-		"event-stream":       false,
-		"    hello___ world": false,
-		"d":                  true,
-		"000asdf":            false,
-		"asdf000":            true,
-		"_asdf":              false,
-		"a_asdf":             true,
-	}
-
-	for testCase, expectedMatch := range testCases {
-		actualMatch := dataspaceNameRegex.MatchString(testCase)
-		assert.Equal(t, expectedMatch, actualMatch, fmt.Sprintf("unexpected dataspace name: %s", testCase))
-	}
-}
