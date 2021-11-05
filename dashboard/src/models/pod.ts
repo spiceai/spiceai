@@ -6,6 +6,7 @@ import { getApiPath } from '../util/api'
 export interface Pod {
   name: string
   manifest_path: string
+  episodes: number
 }
 
 export interface PodsResponse {
