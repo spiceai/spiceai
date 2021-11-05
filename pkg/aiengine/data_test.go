@@ -55,7 +55,7 @@ func TestGetAddDataRequest(t *testing.T) {
 		"tags",
 	}
 
-	err = dp.Init(nil, measurements, categories, tagSelectors)
+	err = dp.Init(nil, nil, measurements, categories, tagSelectors)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,7 +122,7 @@ func testGetCsvAllHeadersWithPreviewFunc() func(*testing.T) {
 			"volume": "volume",
 		}
 
-		err = dp.Init(nil, measurements, nil, nil)
+		err = dp.Init(nil, nil, measurements, nil, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -181,7 +181,7 @@ func testGetCsvSelectHeadersWithPreviewFunc() func(*testing.T) {
 			"volume": "volume",
 		}
 
-		err = dp.Init(nil, measurements, nil, nil)
+		err = dp.Init(nil, nil, measurements, nil, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -236,7 +236,7 @@ func testGetDataWithTagsFunc() func(*testing.T) {
 			"_tags",
 		}
 
-		err = dp.Init(nil, measurements, nil, tagSelectors)
+		err = dp.Init(nil, nil, measurements, nil, tagSelectors)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -290,7 +290,7 @@ func testGetDataWithCategoriesFunc() func(*testing.T) {
 
 		tagsSelectors := []string{"tags"}
 
-		err = dp.Init(nil, measurements, categories, tagsSelectors)
+		err = dp.Init(nil, nil, measurements, categories, tagsSelectors)
 		if err != nil {
 			t.Fatal(err)
 		}
