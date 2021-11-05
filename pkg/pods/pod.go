@@ -27,6 +27,11 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+var (
+	argsRegex          *regexp.Regexp
+	dataspaceNameRegex *regexp.Regexp
+)
+
 type Pod struct {
 	spec.PodSpec
 	viper        *viper.Viper
@@ -299,6 +304,15 @@ func (pod *Pod) ValidateForTraining() error {
 	}
 
 	for _, ds := range pod.PodSpec.Dataspaces {
+		valid := dataspaceNameRegex.MatchString(ds.From)
+		if !valid {
+			return fmt.Errorf("invalid dataspace \"from\": '%s' should only contain A-Za-z0-9_", ds.From)
+		}
+		valid = dataspaceNameRegex.MatchString(ds.Name)
+		if !valid {
+			return fmt.Errorf("invalid dataspace \"name\": '%s' should only contain A-Za-z0-9_", ds.Name)
+		}
+
 		for _, f := range ds.Measurements {
 			switch f.Fill {
 			case "":
@@ -317,13 +331,11 @@ func (pod *Pod) ValidateForTraining() error {
 	}
 
 	// Check for args.<arg name>
-	re := regexp.MustCompile("[=| ]args\\.(\\w+)[=| \n]")
-
 	rewards := pod.Rewards()
 
 	for actionName, action := range actions {
 		numErrors := 0
-		matches := re.FindStringSubmatch(action)
+		matches := argsRegex.FindStringSubmatch(action)
 		errorLines := strings.Builder{}
 		for i, match := range matches {
 			if i == 0 {
@@ -640,4 +652,9 @@ func (pod *Pod) csvHeaders() string {
 	}
 
 	return pod.fqCsvHeaders
+}
+
+func init() {
+	argsRegex = regexp.MustCompile("[=| ]args\\.(\\w+)[=| \n]")
+	dataspaceNameRegex = regexp.MustCompile(`^[[:alpha:]][\w]*$`)
 }
