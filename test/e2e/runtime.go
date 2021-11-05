@@ -214,7 +214,7 @@ func (r *runtimeServer) getInterpretations(podName string, startTime int64, endT
 }
 
 func (r *runtimeServer) waitForTrainingToComplete(podName string, flight string, expectedEpisodes int, secondsToWait int) error {
-	
+
 	startTime := time.Now()
 	timeToWait := time.Duration(secondsToWait) * time.Second
 
@@ -234,7 +234,7 @@ func (r *runtimeServer) waitForTrainingToComplete(podName string, flight string,
 			continue
 		}
 
-	    episodesTrained := len(flightResponse.Episodes)
+		episodesTrained := len(flightResponse.Episodes)
 		if episodesTrained < expectedEpisodes {
 			log.Printf("waiting for %d episodes to be trained, %d episodes trained", expectedEpisodes, episodesTrained)
 			continue
