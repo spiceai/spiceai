@@ -3,13 +3,14 @@ import unittest
 
 import pandas as pd
 
-from data import DataParam, DataManager
+from data_manager.base_manager import DataParam
+from data_manager.time_series_manager import TimeSeriesDataManager
 from proto.aiengine.v1 import aiengine_pb2
 
 
-class DataManagerTestCase(unittest.TestCase):
+class TimeSeriesDataManagerTestCase(unittest.TestCase):
     def test_zero_fill_data(self):
-        data_manager = DataManager(
+        data_manager = TimeSeriesDataManager(
             param=DataParam(
                 epoch_time=pd.to_datetime(10, unit="s"),
                 period_secs=pd.to_timedelta(1, unit="s"),
@@ -40,7 +41,7 @@ class DataManagerTestCase(unittest.TestCase):
             self.assertEqual(value, data_manager.massive_table_filled.loc[pd.to_datetime(key, unit="s")].values[0])
 
     def test_forward_fill_data(self):
-        data_manager = DataManager(
+        data_manager = TimeSeriesDataManager(
             param=DataParam(
                 epoch_time=pd.to_datetime(10, unit="s"),
                 period_secs=pd.to_timedelta(1, unit="s"),
@@ -71,7 +72,7 @@ class DataManagerTestCase(unittest.TestCase):
             self.assertEqual(value, data_manager.massive_table_filled.loc[pd.to_datetime(key, unit="s")].values[0])
 
     def test_merge_data_resampling(self):
-        data_manager = DataManager(
+        data_manager = TimeSeriesDataManager(
             param=DataParam(
                 epoch_time=pd.to_datetime(10, unit="s"),
                 period_secs=pd.to_timedelta(1, unit="s"),
@@ -126,7 +127,7 @@ class DataManagerTestCase(unittest.TestCase):
         )
 
         for test_case in test_cases:
-            data_manager = DataManager(
+            data_manager = TimeSeriesDataManager(
                 param=DataParam(
                     epoch_time=pd.to_datetime(10, unit="s"),
                     period_secs=pd.to_timedelta(1, unit="s"),
@@ -153,7 +154,7 @@ class DataManagerTestCase(unittest.TestCase):
         )
 
         for test_case in test_cases:
-            data_manager = DataManager(
+            data_manager = TimeSeriesDataManager(
                 param=DataParam(
                     epoch_time=pd.to_datetime(10, unit="s"),
                     period_secs=pd.to_timedelta(1, unit="s"),
@@ -172,10 +173,10 @@ class DataManagerTestCase(unittest.TestCase):
                 test_case,
             )
 
-    def test_rewind(self):
+    def test_reset(self):
         epoch_time = pd.to_datetime(10, unit="s")
         interval = pd.to_timedelta(100, unit="s")
-        data_manager = DataManager(
+        data_manager = TimeSeriesDataManager(
             param=DataParam(
                 epoch_time=epoch_time,
                 period_secs=pd.to_timedelta(1, unit="s"),
@@ -189,16 +190,15 @@ class DataManagerTestCase(unittest.TestCase):
         )
 
         self.assertIsNone(data_manager.current_time)
-        data_manager.rewind()
-        expected_current_time = epoch_time + interval
-        self.assertEqual(data_manager.current_time, expected_current_time)
+        data_manager.reset()
+        self.assertEqual(data_manager.current_time, epoch_time)
 
     def test_advance(self):
         epoch_time = pd.to_datetime(0, unit="s")
         period = pd.to_timedelta(20, unit="s")
         interval = pd.to_timedelta(10, unit="s")
         granularity = pd.to_timedelta(1, unit="s")
-        data_manager = DataManager(
+        data_manager = TimeSeriesDataManager(
             param=DataParam(
                 epoch_time=epoch_time,
                 period_secs=period,
@@ -218,9 +218,9 @@ class DataManagerTestCase(unittest.TestCase):
 
         data_manager.merge_data(original_data)
 
-        data_manager.rewind()
+        data_manager.reset()
 
-        expected_current_time = epoch_time + interval
+        expected_current_time = epoch_time
         self.assertEqual(data_manager.current_time, expected_current_time)
 
         expected_steps = int((period - interval) / granularity)

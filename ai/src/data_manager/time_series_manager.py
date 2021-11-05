@@ -34,7 +34,6 @@ class TimeSeriesDataManager(DataManagerBase):
 
         self.current_time: pd.Timestamp = None
         self.action_rewards = action_rewards
-        self.reset()
 
         self.action_names = [None] * len(actions_order)
 

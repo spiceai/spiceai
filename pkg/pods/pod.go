@@ -537,6 +537,8 @@ func (pod *Pod) loadParams() error {
 				return err
 			}
 			podParams.Interpolation = val
+		} else {
+			podParams.Interpolation = true
 		}
 	}
 
