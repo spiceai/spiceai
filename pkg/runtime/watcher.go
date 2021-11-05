@@ -118,7 +118,7 @@ func startNewPodTraining(pod *pods.Pod) error {
 	}
 
 	// Pass empty algorithm and negative episode number string to use pod's default
-	err = aiengine.StartTraining(pod, "", -1)
+	err = aiengine.StartTraining(pod, nil, -1)
 	if err != nil {
 		return err
 	}
