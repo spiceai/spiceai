@@ -326,7 +326,7 @@ func getIdentifiers(dsSpec spec.DataspaceSpec) ([]string, []*IdentifierInfo, map
 		if identifierSpec.Selector == "" {
 			identifierSelectors[identifierSpec.Name] = identifierSpec.Name
 		} else {
-			identifierSelectors[identifierSpec.Name] = identifierSpec.Selector
+			identifierSelectors[identifierSpec.Name] = strings.TrimSpace(identifierSpec.Selector)
 		}
 	}
 	sort.Strings(identifierNames)
@@ -344,7 +344,7 @@ func getMeasurements(dsSpec spec.DataspaceSpec) ([]string, map[string]string) {
 		if v.Selector == "" {
 			measurementSelectors[v.Name] = v.Name
 		} else {
-			measurementSelectors[v.Name] = v.Selector
+			measurementSelectors[v.Name] = strings.TrimSpace(v.Selector)
 		}
 	}
 	sort.Strings(measurementNames)
@@ -375,7 +375,7 @@ func getCategories(dsSpec spec.DataspaceSpec) ([]string, []*CategoryInfo, map[st
 		if categorySpec.Selector == "" {
 			categorySelectors[categorySpec.Name] = categorySpec.Name
 		} else {
-			categorySelectors[categorySpec.Name] = categorySpec.Selector
+			categorySelectors[categorySpec.Name] = strings.TrimSpace(categorySpec.Selector)
 		}
 	}
 	sort.Strings(categoryNames)
