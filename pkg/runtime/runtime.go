@@ -57,6 +57,11 @@ func (r *SpiceRuntime) SingleRun(manifestPath string) error {
 		return err
 	}
 
+	err = aiengine.Init()
+	if err != nil {
+		return err
+	}
+
 	aiEngineReady := make(chan bool, 1)
 	err = aiengine.StartServer(aiEngineReady, true)
 	if err != nil {
@@ -95,6 +100,11 @@ func (r *SpiceRuntime) SingleRun(manifestPath string) error {
 
 func (r *SpiceRuntime) Run() error {
 	err := r.startRuntime()
+	if err != nil {
+		return err
+	}
+
+	err = aiengine.Init()
 	if err != nil {
 		return err
 	}
