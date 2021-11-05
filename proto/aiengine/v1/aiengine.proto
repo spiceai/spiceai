@@ -49,6 +49,7 @@ message InitRequest {
   repeated string laws = 9;
   repeated DataSource datasources = 10;
   string external_reward_funcs = 11;
+  bool interpolation = 12;
 }
 
 message Response {

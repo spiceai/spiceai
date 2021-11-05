@@ -160,6 +160,7 @@ func getPodInitForTraining(pod *pods.Pod) *aiengine_pb.InitRequest {
 		ActionsOrder:        actionsOrder,
 		Laws:                laws,
 		ExternalRewardFuncs: externalRewardFuncs,
+		Interpolation:       pod.Interpolation(),
 	}
 
 	return &podInit

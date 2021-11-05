@@ -102,13 +102,13 @@ class StatefulConnectorTests(unittest.TestCase):
         self.assertTrue(np.isnan(actual_foo))
 
     def test_is_calling_merge_row(self):
-        original_fill_table = self.data_manager.fill_table
+        original_fill_table = self.data_manager._fill_table  # pylint: disable=protected-access
 
         def new_fill_table():
             raise Exception("Should not call this on apply_action")
 
         try:
-            self.data_manager.fill_table = new_fill_table
+            self.data_manager._fill_table = new_fill_table  # pylint: disable=protected-access
 
             action_effects = {
                 "foo_action": "foo += 5\nbar -= 1",
@@ -121,7 +121,7 @@ class StatefulConnectorTests(unittest.TestCase):
             is_valid = stateful_connector.apply_action(0, current_window)
             self.assertTrue(is_valid)
         finally:
-            self.data_manager.fill_table = original_fill_table
+            self.data_manager._fill_table = original_fill_table  # pylint: disable=protected-access
 
 
 if __name__ == "__main__":
