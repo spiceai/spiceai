@@ -58,7 +58,7 @@ type Dataspace struct {
 }
 
 func NewDataspace(dsSpec spec.DataspaceSpec) (*Dataspace, error) {
-	_, _, identifierSelectors := getIdentifiers(dsSpec)
+	_, identifiers, identifierSelectors := getIdentifiers(dsSpec)
 	categoryNames, categories, categorySelectors := getCategories(dsSpec)
 	measurementNames, measurementSelectors := getMeasurements(dsSpec)
 	tags, fqTags := getTags(dsSpec)
@@ -66,6 +66,7 @@ func NewDataspace(dsSpec spec.DataspaceSpec) (*Dataspace, error) {
 	ds := Dataspace{
 		DataspaceSpec:    dsSpec,
 		stateMutex:       &sync.RWMutex{},
+		identifiers: 	identifiers,
 		categories:       categories,
 		measurementNames: measurementNames,
 		categoryNames:    categoryNames,
