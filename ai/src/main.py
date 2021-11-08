@@ -1,5 +1,4 @@
 from concurrent import futures
-from io import StringIO
 import json
 import os
 from pathlib import Path
@@ -7,6 +6,7 @@ import signal
 import threading
 import traceback
 from typing import Dict
+import multiprocessing
 
 import grpc
 import pandas as pd
@@ -16,15 +16,16 @@ import requests
 from algorithms.factory import get_agent
 from algorithms.agent_interface import SpiceAIAgent
 from cleanup import cleanup_on_shutdown
-from connector.manager import ConnectorManager, ConnectorName
-from connector.stateful import StatefulConnector
-from data import DataParam, DataManager
+from connector.manager import ConnectorManager
+from data import DataManager
+from event_loop import EventLoop
 from exception import UnexpectedException
 from inference import GetInferenceHandler
 from proto.aiengine.v1 import aiengine_pb2, aiengine_pb2_grpc
 from train import Trainer
 from validation import validate_rewards
 
+work_queue = multiprocessing.SimpleQueue()
 data_managers: Dict[str, DataManager] = {}
 connector_managers: Dict[str, ConnectorManager] = {}
 
@@ -62,22 +63,9 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
         return aiengine_pb2.Response(result="ok")
 
     def AddData(self, request: aiengine_pb2.AddDataRequest, context):
-        with Dispatch.INIT_LOCK:
-            new_data: pd.DataFrame = pd.read_csv(StringIO(request.csv_data))
-            new_data["time"] = pd.to_datetime(new_data["time"], unit="s")
-            new_data = new_data.set_index("time")
+        work_queue.put(("add_data", request))
 
-            data_manager: DataManager = data_managers[request.pod]
-            for field in new_data.columns:
-                if field not in data_manager.fields.keys():
-                    return aiengine_pb2.Response(
-                        result="unexpected_field",
-                        message=f"Unexpected field: '{field}'",
-                        error=True,
-                    )
-
-            data_manager.merge_data(new_data)
-            return aiengine_pb2.Response(result="ok")
+        return aiengine_pb2.Response(result="ok")
 
     def AddInterpretations(self, request: aiengine_pb2.AddInterpretationsRequest, context):
         data_manager = data_managers[request.pod]
@@ -124,58 +112,20 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
         return handler.get_result()
 
     def Init(self, request: aiengine_pb2.InitRequest, context):
-        with Dispatch.INIT_LOCK:
-            connector_manager = ConnectorManager()
-
-            period_secs = pd.to_timedelta(request.period, unit="s")
-            interval_secs = pd.to_timedelta(request.interval, unit="s")
-            granularity_secs = pd.to_timedelta(request.granularity, unit="s")
-
-            epoch_time = pd.Timestamp.now() - period_secs
-            if request.epoch_time != 0:
-                epoch_time = pd.to_datetime(request.epoch_time, unit="s")
-
-            if len(request.actions) == 0:
-                return aiengine_pb2.Response(result="missing_actions", error=True)
-            action_rewards = request.actions
-            if not validate_rewards(action_rewards, request.external_reward_funcs):
-                return aiengine_pb2.Response(
-                    result="invalid_reward_function", error=True
-                )
-
-            if len(request.fields) == 0:
-                return aiengine_pb2.Response(result="missing_fields", error=True)
-
-            data_manager = DataManager(
-                param=DataParam(
-                    epoch_time=epoch_time,
-                    period_secs=period_secs,
-                    interval_secs=interval_secs,
-                    granularity_secs=granularity_secs),
-                fields=request.fields,
-                action_rewards=action_rewards,
-                actions_order=request.actions_order,
-                external_reward_funcs=request.external_reward_funcs,
-                laws=request.laws,
+        if len(request.actions) == 0:
+            return aiengine_pb2.Response(result="missing_actions", error=True)
+        action_rewards = request.actions
+        if not validate_rewards(action_rewards, request.external_reward_funcs):
+            return aiengine_pb2.Response(
+                result="invalid_reward_function", error=True
             )
-            data_managers[request.pod] = data_manager
-            connector_managers[request.pod] = connector_manager
 
-            datasources_data = request.datasources
+        if len(request.fields) == 0:
+            return aiengine_pb2.Response(result="missing_fields", error=True)
 
-            for datasource_data in datasources_data:
-                connector_data = datasource_data.connector
-                connector_name: ConnectorName = connector_data.name
+        work_queue.put(("init", request))
 
-                datasource_actions = datasource_data.actions
-
-                if connector_name == ConnectorName.STATEFUL.value:
-                    new_connector = StatefulConnector(
-                        data_manager=data_manager,
-                        action_effects=datasource_actions,
-                    )
-                    connector_manager.add_connector(new_connector)
-            return aiengine_pb2.Response(result="ok")
+        return aiengine_pb2.Response(result="ok")
 
     def ExportModel(self, request: aiengine_pb2.ExportModelRequest, context):
         if request.pod not in Trainer.SAVED_MODELS:
@@ -250,6 +200,9 @@ def main():
     server.add_insecure_port("[::]:8004")
     server.start()
     print(f"AIEngine: gRPC server listening on port {8004}")
+
+    event_loop = EventLoop(work_queue=work_queue, data_managers=data_managers, connector_managers=connector_managers)
+    event_loop.start()
 
     wait_parent_process()
     cleanup_on_shutdown()
