@@ -32,7 +32,6 @@ connector_managers: Dict[str, ConnectorManager] = {}
 
 class Dispatch:
     TRAINING_THREAD = None
-    INIT_LOCK = threading.Lock()
 
 
 def train_agent(
