@@ -19,11 +19,49 @@ DESCRIPTOR = _descriptor.FileDescriptor(
   syntax='proto3',
   serialized_options=b'Z.github.com/spiceai/spiceai/pkg/proto/common_pb',
   create_key=_descriptor._internal_create_key,
-  serialized_pb=b'\n\x1cproto/common/v1/common.proto\x12\x06\x63ommon\"\x87\x02\n\x0bObservation\x12\x0c\n\x04time\x18\x01 \x01(\x03\x12;\n\x0cmeasurements\x18\x02 \x03(\x0b\x32%.common.Observation.MeasurementsEntry\x12\x37\n\ncategories\x18\x03 \x03(\x0b\x32#.common.Observation.CategoriesEntry\x12\x0c\n\x04tags\x18\x04 \x03(\t\x1a\x33\n\x11MeasurementsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\x01:\x02\x38\x01\x1a\x31\n\x0f\x43\x61tegoriesEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\"Y\n\x0eInterpretation\x12\r\n\x05start\x18\x01 \x01(\x03\x12\x0b\n\x03\x65nd\x18\x02 \x01(\x03\x12\x0c\n\x04name\x18\x03 \x01(\t\x12\x0f\n\x07\x61\x63tions\x18\x04 \x03(\t\x12\x0c\n\x04tags\x18\x05 \x03(\t\"-\n\x15InterpretationIndices\x12\x14\n\x08indicies\x18\x01 \x03(\rB\x02\x10\x01\"\xd0\x01\n\x16IndexedInterpretations\x12/\n\x0finterpretations\x18\x01 \x03(\x0b\x32\x16.common.Interpretation\x12\x38\n\x05index\x18\x02 \x03(\x0b\x32).common.IndexedInterpretations.IndexEntry\x1aK\n\nIndexEntry\x12\x0b\n\x03key\x18\x01 \x01(\x03\x12,\n\x05value\x18\x02 \x01(\x0b\x32\x1d.common.InterpretationIndices:\x02\x38\x01\x42\x30Z.github.com/spiceai/spiceai/pkg/proto/common_pbb\x06proto3'
+  serialized_pb=b'\n\x1cproto/common/v1/common.proto\x12\x06\x63ommon\"\xf6\x02\n\x0bObservation\x12\x0c\n\x04time\x18\x01 \x01(\x03\x12\x39\n\x0bidentifiers\x18\x02 \x03(\x0b\x32$.common.Observation.IdentifiersEntry\x12;\n\x0cmeasurements\x18\x03 \x03(\x0b\x32%.common.Observation.MeasurementsEntry\x12\x37\n\ncategories\x18\x04 \x03(\x0b\x32#.common.Observation.CategoriesEntry\x12\x0c\n\x04tags\x18\x05 \x03(\t\x1a\x32\n\x10IdentifiersEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\x1a\x33\n\x11MeasurementsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\x01:\x02\x38\x01\x1a\x31\n\x0f\x43\x61tegoriesEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\"Y\n\x0eInterpretation\x12\r\n\x05start\x18\x01 \x01(\x03\x12\x0b\n\x03\x65nd\x18\x02 \x01(\x03\x12\x0c\n\x04name\x18\x03 \x01(\t\x12\x0f\n\x07\x61\x63tions\x18\x04 \x03(\t\x12\x0c\n\x04tags\x18\x05 \x03(\t\"-\n\x15InterpretationIndices\x12\x14\n\x08indicies\x18\x01 \x03(\rB\x02\x10\x01\"\xd0\x01\n\x16IndexedInterpretations\x12/\n\x0finterpretations\x18\x01 \x03(\x0b\x32\x16.common.Interpretation\x12\x38\n\x05index\x18\x02 \x03(\x0b\x32).common.IndexedInterpretations.IndexEntry\x1aK\n\nIndexEntry\x12\x0b\n\x03key\x18\x01 \x01(\x03\x12,\n\x05value\x18\x02 \x01(\x0b\x32\x1d.common.InterpretationIndices:\x02\x38\x01\x42\x30Z.github.com/spiceai/spiceai/pkg/proto/common_pbb\x06proto3'
 )
 
 
 
+
+_OBSERVATION_IDENTIFIERSENTRY = _descriptor.Descriptor(
+  name='IdentifiersEntry',
+  full_name='common.Observation.IdentifiersEntry',
+  filename=None,
+  file=DESCRIPTOR,
+  containing_type=None,
+  create_key=_descriptor._internal_create_key,
+  fields=[
+    _descriptor.FieldDescriptor(
+      name='key', full_name='common.Observation.IdentifiersEntry.key', index=0,
+      number=1, type=9, cpp_type=9, label=1,
+      has_default_value=False, default_value=b"".decode('utf-8'),
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      serialized_options=None, file=DESCRIPTOR,  create_key=_descriptor._internal_create_key),
+    _descriptor.FieldDescriptor(
+      name='value', full_name='common.Observation.IdentifiersEntry.value', index=1,
+      number=2, type=9, cpp_type=9, label=1,
+      has_default_value=False, default_value=b"".decode('utf-8'),
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      serialized_options=None, file=DESCRIPTOR,  create_key=_descriptor._internal_create_key),
+  ],
+  extensions=[
+  ],
+  nested_types=[],
+  enum_types=[
+  ],
+  serialized_options=b'8\001',
+  is_extendable=False,
+  syntax='proto3',
+  extension_ranges=[],
+  oneofs=[
+  ],
+  serialized_start=261,
+  serialized_end=311,
+)
 
 _OBSERVATION_MEASUREMENTSENTRY = _descriptor.Descriptor(
   name='MeasurementsEntry',
@@ -59,8 +97,8 @@ _OBSERVATION_MEASUREMENTSENTRY = _descriptor.Descriptor(
   extension_ranges=[],
   oneofs=[
   ],
-  serialized_start=202,
-  serialized_end=253,
+  serialized_start=313,
+  serialized_end=364,
 )
 
 _OBSERVATION_CATEGORIESENTRY = _descriptor.Descriptor(
@@ -97,8 +135,8 @@ _OBSERVATION_CATEGORIESENTRY = _descriptor.Descriptor(
   extension_ranges=[],
   oneofs=[
   ],
-  serialized_start=255,
-  serialized_end=304,
+  serialized_start=366,
+  serialized_end=415,
 )
 
 _OBSERVATION = _descriptor.Descriptor(
@@ -117,22 +155,29 @@ _OBSERVATION = _descriptor.Descriptor(
       is_extension=False, extension_scope=None,
       serialized_options=None, file=DESCRIPTOR,  create_key=_descriptor._internal_create_key),
     _descriptor.FieldDescriptor(
-      name='measurements', full_name='common.Observation.measurements', index=1,
+      name='identifiers', full_name='common.Observation.identifiers', index=1,
       number=2, type=11, cpp_type=10, label=3,
       has_default_value=False, default_value=[],
       message_type=None, enum_type=None, containing_type=None,
       is_extension=False, extension_scope=None,
       serialized_options=None, file=DESCRIPTOR,  create_key=_descriptor._internal_create_key),
     _descriptor.FieldDescriptor(
-      name='categories', full_name='common.Observation.categories', index=2,
+      name='measurements', full_name='common.Observation.measurements', index=2,
       number=3, type=11, cpp_type=10, label=3,
       has_default_value=False, default_value=[],
       message_type=None, enum_type=None, containing_type=None,
       is_extension=False, extension_scope=None,
       serialized_options=None, file=DESCRIPTOR,  create_key=_descriptor._internal_create_key),
     _descriptor.FieldDescriptor(
-      name='tags', full_name='common.Observation.tags', index=3,
-      number=4, type=9, cpp_type=9, label=3,
+      name='categories', full_name='common.Observation.categories', index=3,
+      number=4, type=11, cpp_type=10, label=3,
+      has_default_value=False, default_value=[],
+      message_type=None, enum_type=None, containing_type=None,
+      is_extension=False, extension_scope=None,
+      serialized_options=None, file=DESCRIPTOR,  create_key=_descriptor._internal_create_key),
+    _descriptor.FieldDescriptor(
+      name='tags', full_name='common.Observation.tags', index=4,
+      number=5, type=9, cpp_type=9, label=3,
       has_default_value=False, default_value=[],
       message_type=None, enum_type=None, containing_type=None,
       is_extension=False, extension_scope=None,
@@ -140,7 +185,7 @@ _OBSERVATION = _descriptor.Descriptor(
   ],
   extensions=[
   ],
-  nested_types=[_OBSERVATION_MEASUREMENTSENTRY, _OBSERVATION_CATEGORIESENTRY, ],
+  nested_types=[_OBSERVATION_IDENTIFIERSENTRY, _OBSERVATION_MEASUREMENTSENTRY, _OBSERVATION_CATEGORIESENTRY, ],
   enum_types=[
   ],
   serialized_options=None,
@@ -150,7 +195,7 @@ _OBSERVATION = _descriptor.Descriptor(
   oneofs=[
   ],
   serialized_start=41,
-  serialized_end=304,
+  serialized_end=415,
 )
 
 
@@ -209,8 +254,8 @@ _INTERPRETATION = _descriptor.Descriptor(
   extension_ranges=[],
   oneofs=[
   ],
-  serialized_start=306,
-  serialized_end=395,
+  serialized_start=417,
+  serialized_end=506,
 )
 
 
@@ -241,8 +286,8 @@ _INTERPRETATIONINDICES = _descriptor.Descriptor(
   extension_ranges=[],
   oneofs=[
   ],
-  serialized_start=397,
-  serialized_end=442,
+  serialized_start=508,
+  serialized_end=553,
 )
 
 
@@ -280,8 +325,8 @@ _INDEXEDINTERPRETATIONS_INDEXENTRY = _descriptor.Descriptor(
   extension_ranges=[],
   oneofs=[
   ],
-  serialized_start=578,
-  serialized_end=653,
+  serialized_start=689,
+  serialized_end=764,
 )
 
 _INDEXEDINTERPRETATIONS = _descriptor.Descriptor(
@@ -318,12 +363,14 @@ _INDEXEDINTERPRETATIONS = _descriptor.Descriptor(
   extension_ranges=[],
   oneofs=[
   ],
-  serialized_start=445,
-  serialized_end=653,
+  serialized_start=556,
+  serialized_end=764,
 )
 
+_OBSERVATION_IDENTIFIERSENTRY.containing_type = _OBSERVATION
 _OBSERVATION_MEASUREMENTSENTRY.containing_type = _OBSERVATION
 _OBSERVATION_CATEGORIESENTRY.containing_type = _OBSERVATION
+_OBSERVATION.fields_by_name['identifiers'].message_type = _OBSERVATION_IDENTIFIERSENTRY
 _OBSERVATION.fields_by_name['measurements'].message_type = _OBSERVATION_MEASUREMENTSENTRY
 _OBSERVATION.fields_by_name['categories'].message_type = _OBSERVATION_CATEGORIESENTRY
 _INDEXEDINTERPRETATIONS_INDEXENTRY.fields_by_name['value'].message_type = _INTERPRETATIONINDICES
@@ -337,6 +384,13 @@ DESCRIPTOR.message_types_by_name['IndexedInterpretations'] = _INDEXEDINTERPRETAT
 _sym_db.RegisterFileDescriptor(DESCRIPTOR)
 
 Observation = _reflection.GeneratedProtocolMessageType('Observation', (_message.Message,), {
+
+  'IdentifiersEntry' : _reflection.GeneratedProtocolMessageType('IdentifiersEntry', (_message.Message,), {
+    'DESCRIPTOR' : _OBSERVATION_IDENTIFIERSENTRY,
+    '__module__' : 'proto.common.v1.common_pb2'
+    # @@protoc_insertion_point(class_scope:common.Observation.IdentifiersEntry)
+    })
+  ,
 
   'MeasurementsEntry' : _reflection.GeneratedProtocolMessageType('MeasurementsEntry', (_message.Message,), {
     'DESCRIPTOR' : _OBSERVATION_MEASUREMENTSENTRY,
@@ -356,6 +410,7 @@ Observation = _reflection.GeneratedProtocolMessageType('Observation', (_message.
   # @@protoc_insertion_point(class_scope:common.Observation)
   })
 _sym_db.RegisterMessage(Observation)
+_sym_db.RegisterMessage(Observation.IdentifiersEntry)
 _sym_db.RegisterMessage(Observation.MeasurementsEntry)
 _sym_db.RegisterMessage(Observation.CategoriesEntry)
 
@@ -390,6 +445,7 @@ _sym_db.RegisterMessage(IndexedInterpretations.IndexEntry)
 
 
 DESCRIPTOR._options = None
+_OBSERVATION_IDENTIFIERSENTRY._options = None
 _OBSERVATION_MEASUREMENTSENTRY._options = None
 _OBSERVATION_CATEGORIESENTRY._options = None
 _INTERPRETATIONINDICES.fields_by_name['indicies']._options = None

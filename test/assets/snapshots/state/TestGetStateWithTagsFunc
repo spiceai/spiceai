@@ -3,6 +3,10 @@
     Time: (time.Time) 2021-01-07 22:10:00 +0000 UTC,
     TimeSentToAIEngine: (time.Time) 0001-01-01 00:00:00 +0000 UTC,
     path: (string) (len=13) "bitmex.btcusd",
+    fqIdentifierNames: ([]string) {
+    },
+    identifiersNamesMap: (map[string]string) {
+    },
     measurementsNames: ([]string) (len=1) {
       (string) (len=3) "low"
     },
@@ -77,6 +81,10 @@
     Time: (time.Time) 2021-01-07 22:10:00 +0000 UTC,
     TimeSentToAIEngine: (time.Time) 0001-01-01 00:00:00 +0000 UTC,
     path: (string) (len=15) "bitthumb.btcusd",
+    fqIdentifierNames: ([]string) {
+    },
+    identifiersNamesMap: (map[string]string) {
+    },
     measurementsNames: ([]string) (len=1) {
       (string) (len=4) "high"
     },
@@ -151,6 +159,10 @@
     Time: (time.Time) 2021-01-07 22:10:00 +0000 UTC,
     TimeSentToAIEngine: (time.Time) 0001-01-01 00:00:00 +0000 UTC,
     path: (string) (len=15) "coinbase.btcusd",
+    fqIdentifierNames: ([]string) {
+    },
+    identifiersNamesMap: (map[string]string) {
+    },
     measurementsNames: ([]string) (len=1) {
       (string) (len=4) "open"
     },
@@ -240,6 +252,10 @@
     Time: (time.Time) 2021-01-07 22:10:00 +0000 UTC,
     TimeSentToAIEngine: (time.Time) 0001-01-01 00:00:00 +0000 UTC,
     path: (string) (len=19) "coinbase_pro.btcusd",
+    fqIdentifierNames: ([]string) {
+    },
+    identifiersNamesMap: (map[string]string) {
+    },
     measurementsNames: ([]string) (len=1) {
       (string) (len=5) "close"
     },
@@ -314,6 +330,10 @@
     Time: (time.Time) 2021-01-07 22:10:00 +0000 UTC,
     TimeSentToAIEngine: (time.Time) 0001-01-01 00:00:00 +0000 UTC,
     path: (string) (len=12) "local.btcusd",
+    fqIdentifierNames: ([]string) {
+    },
+    identifiersNamesMap: (map[string]string) {
+    },
     measurementsNames: ([]string) (len=1) {
       (string) (len=6) "volume"
     },

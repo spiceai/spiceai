@@ -45,12 +45,15 @@ type Dataspace struct {
 	seedDataInfo *DataInfo
 	dataInfo     *DataInfo
 
-	identifiers      []*IdentifierInfo
-	categories       []*CategoryInfo
+	identifiers []*IdentifierInfo
+	categories  []*CategoryInfo
+
+	identifiersNames []string
 	measurementNames []string
 	categoryNames    []string
-	tags             []string
-	fqTags           []string
+
+	tags   []string
+	fqTags []string
 
 	stateMutex    *sync.RWMutex
 	cachedState   []*state.State
@@ -58,7 +61,7 @@ type Dataspace struct {
 }
 
 func NewDataspace(dsSpec spec.DataspaceSpec) (*Dataspace, error) {
-	_, identifiers, identifierSelectors := getIdentifiers(dsSpec)
+	identifiersNames, identifiers, identifierSelectors := getIdentifiers(dsSpec)
 	categoryNames, categories, categorySelectors := getCategories(dsSpec)
 	measurementNames, measurementSelectors := getMeasurements(dsSpec)
 	tags, fqTags := getTags(dsSpec)
@@ -66,9 +69,10 @@ func NewDataspace(dsSpec spec.DataspaceSpec) (*Dataspace, error) {
 	ds := Dataspace{
 		DataspaceSpec:    dsSpec,
 		stateMutex:       &sync.RWMutex{},
-		identifiers: 	identifiers,
-		categories:       categories,
+		identifiers:      identifiers,
+		identifiersNames: identifiersNames,
 		measurementNames: measurementNames,
+		categories:       categories,
 		categoryNames:    categoryNames,
 		tags:             tags,
 		fqTags:           fqTags,
@@ -160,6 +164,11 @@ func (ds *Dataspace) MeasurementNameMap() map[string]string {
 		measurementNames[v.Name] = fqname
 	}
 	return measurementNames
+}
+
+// Returns the sorted list of local identifiers names
+func (ds *Dataspace) IdentifiersNames() []string {
+	return ds.identifiersNames
 }
 
 // Returns the sorted list of local measurement names
@@ -273,7 +282,7 @@ func (ds *Dataspace) readData(processor dataprocessors.DataProcessor, data []byt
 		return nil, err
 	}
 
-	newState := state.NewState(ds.Path(), ds.MeasurementNames(), ds.CategoryNames(), ds.Tags(), observations)
+	newState := state.NewState(ds.Path(), ds.IdentifiersNames(), ds.MeasurementNames(), ds.CategoryNames(), ds.Tags(), observations)
 	err = ds.AddNewState(newState, metadata)
 	if err != nil {
 		return nil, err
