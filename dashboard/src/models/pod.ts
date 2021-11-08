@@ -7,6 +7,9 @@ export interface Pod {
   name: string
   manifest_path: string
   episodes: number
+  identifiers: string[]
+  measurements: string[]
+  categories: string[]
 }
 
 export interface PodsResponse {

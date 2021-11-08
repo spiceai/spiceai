@@ -24,7 +24,7 @@ func TestAIEngineGetPythonCmd(t *testing.T) {
 
 	algorithmsMap = map[string]*LearningAlgorithm{
 		"dql": {
-			Id: "dql",
+			Id:   "dql",
 			Name: "Deep Q-Learning",
 		},
 	}
@@ -40,7 +40,7 @@ func TestAIEngineStartServer(t *testing.T) {
 
 	algorithmsMap = map[string]*LearningAlgorithm{
 		"dql": {
-			Id: "dql",
+			Id:   "dql",
 			Name: "Deep Q-Learning",
 		},
 	}
@@ -55,7 +55,7 @@ func TestInfer(t *testing.T) {
 
 	algorithmsMap = map[string]*LearningAlgorithm{
 		"dql": {
-			Id: "dql",
+			Id:   "dql",
 			Name: "Deep Q-Learning",
 		},
 	}
@@ -64,11 +64,11 @@ func TestInfer(t *testing.T) {
 func TestPod(t *testing.T) {
 	algorithmsMap = map[string]*LearningAlgorithm{
 		"dql": {
-			Id: "dql",
+			Id:   "dql",
 			Name: "Deep Q-Learning",
 		},
 	}
-	
+
 	manifestsToTest := []string{"trader.yaml", "trader-infer.yaml", "event-tags.yaml", "event-categories.yaml"}
 
 	for _, manifestToTest := range manifestsToTest {
