@@ -52,7 +52,7 @@ const PodPage: React.FunctionComponent<PodProps> = () => {
         ? Object.keys(firstObservation.categories)
         : []
       const colWidth =
-        (gridWidth - timeCol.width - 17) / (measurementsKeys.length + categoriesKeys.length + 1)
+        (gridWidth - timeCol.width - 32) / (measurementsKeys.length + categoriesKeys.length + 1)
 
       for (const m of measurementsKeys) {
         cols.push({ title: m, width: colWidth })
@@ -147,7 +147,7 @@ const PodPage: React.FunctionComponent<PodProps> = () => {
                   getCellContent={gridProps.gridDataFunc}
                   columns={gridProps.columns}
                   rows={observations.length}
-                  rowMarkers={false}
+                  rowMarkers="number"
                 />
               </DataEditorContainer>
             )}
