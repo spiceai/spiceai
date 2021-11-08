@@ -6,9 +6,10 @@ option go_package = "github.com/spiceai/spiceai/pkg/proto/common_pb";
 
 message Observation {
   int64 time = 1;
-  map<string, double> measurements = 2;
-  map<string, string> categories = 3;
-  repeated string tags = 4;
+  map<string, string> identifiers = 2;
+  map<string, double> measurements = 3;
+  map<string, string> categories = 4;
+  repeated string tags = 5;
 }
 
 message Interpretation {

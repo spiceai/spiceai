@@ -32,6 +32,9 @@
   },
   {
     "episodes": 10,
+    "identifiers": [
+      "event.data.eventId"
+    ],
     "manifest_path": "fixed",
     "measurements": [
       "event.data.height",
