@@ -25,7 +25,7 @@ from proto.aiengine.v1 import aiengine_pb2, aiengine_pb2_grpc
 from train import Trainer
 from validation import validate_rewards
 
-work_queue = multiprocessing.SimpleQueue()
+data_queue = multiprocessing.SimpleQueue()
 data_managers: Dict[str, DataManager] = {}
 connector_managers: Dict[str, ConnectorManager] = {}
 
@@ -62,7 +62,7 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
         return aiengine_pb2.Response(result="ok")
 
     def AddData(self, request: aiengine_pb2.AddDataRequest, context):
-        work_queue.put(("add_data", request))
+        data_queue.put(("add_data", request))
 
         return aiengine_pb2.Response(result="ok")
 
@@ -122,7 +122,7 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
         if len(request.fields) == 0:
             return aiengine_pb2.Response(result="missing_fields", error=True)
 
-        work_queue.put(("init", request))
+        data_queue.put(("init", request))
 
         return aiengine_pb2.Response(result="ok")
 
@@ -200,7 +200,7 @@ def main():
     server.start()
     print(f"AIEngine: gRPC server listening on port {8004}")
 
-    event_loop = EventLoop(work_queue=work_queue, data_managers=data_managers, connector_managers=connector_managers)
+    event_loop = EventLoop(work_queue=data_queue, data_managers=data_managers, connector_managers=connector_managers)
     event_loop.start()
 
     wait_parent_process()
