@@ -519,7 +519,7 @@ func loadPod(podPath string, hash string) (*Pod, error) {
 
 	pod.interpretations = interpretations.NewInterpretationsStore(pod.Epoch(), pod.Period(), pod.Granularity())
 
-	if pod.Training.RewardFuncs != "" {
+	if pod.Training != nil && pod.Training.RewardFuncs != "" {
 		if !strings.HasSuffix(pod.Training.RewardFuncs, ".py") {
 			return nil, errors.New("external reward functions must be defined in a single Python file - see https://docs.spiceai.org/concepts/rewards/")
 		}
