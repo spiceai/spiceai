@@ -5,19 +5,19 @@ import os
 import humanize
 
 from utils import print_event
-from metrics import metrics
 
 PROGRESS_STEPS = 1000
 
 
 class ProgressBar:
-    def __init__(self, pod_name, episode_num, total_steps):
+    def __init__(self, pod_name, episode_num, total_steps, metrics):
         self.pod_name = pod_name
         self.episode_num = episode_num
         self.total_steps = total_steps
         self.step = 0
         self.timer = datetime.datetime.now()
         self.show_metrics = os.getenv("SPICE_DEBUG") == "1"
+        self.metrics = metrics
 
     def next(self):
         self.step += 1
@@ -38,8 +38,8 @@ class ProgressBar:
         if self.show_metrics:
             print_event(self.pod_name, "")
             print_event(self.pod_name, "\tDebug Metrics")
-            for metric_name in metrics.get_all_metric_names():
-                total_seconds = metrics.get_metric(metric_name).total_seconds()
+            for metric_name in self.metrics.get_all_metric_names():
+                total_seconds = self.metrics.get_metric(metric_name).total_seconds()
                 metric_value = humanize.precisedelta(
                     datetime.timedelta(seconds=total_seconds)
                 )
