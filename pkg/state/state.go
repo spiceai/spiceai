@@ -21,6 +21,8 @@ type State struct {
 	Time                 time.Time
 	TimeSentToAIEngine   time.Time
 	path                 string
+	fqIdentifierNames    []string
+	identifiersNamesMap  map[string]string
 	measurementsNames    []string
 	fqMeasurementsNames  []string
 	measurementsNamesMap map[string]string
@@ -32,7 +34,10 @@ type State struct {
 
 type StateHandler func(state *State, metadata map[string]string) error
 
-func NewState(path string, measurementsNames []string, categoryNames []string, tags []string, observations []observations.Observation) *State {
+func NewState(path string, identifierNames []string, measurementsNames []string, categoryNames []string, tags []string, observations []observations.Observation) *State {
+	fqIdentifierNames, identifiersNamesMap := getFieldNames(path, identifierNames)
+	sort.Strings(fqIdentifierNames)
+
 	fqMeasurementsNames, measurementsNamesMap := getFieldNames(path, measurementsNames)
 	sort.Strings(fqMeasurementsNames)
 
@@ -42,6 +47,8 @@ func NewState(path string, measurementsNames []string, categoryNames []string, t
 		Time:                 time.Now(),
 		TimeSentToAIEngine:   time.Time{},
 		path:                 path,
+		fqIdentifierNames:    fqIdentifierNames,
+		identifiersNamesMap:  identifiersNamesMap,
 		measurementsNames:    measurementsNames,
 		fqMeasurementsNames:  fqMeasurementsNames,
 		measurementsNamesMap: measurementsNamesMap,
@@ -195,11 +202,12 @@ func GetStateFromCsv(validIdentifierNames []string, validMeasurementNames []stri
 			tags = append(tags, tagVal)
 		}
 
+		sort.Strings(dsData.identifierNames)
 		sort.Strings(dsData.measurementNames)
 		sort.Strings(dsData.categoryNames)
 		sort.Strings(tags)
 
-		result = append(result, NewState(path, dsData.measurementNames, dsData.categoryNames, tags, dsData.observations))
+		result = append(result, NewState(path, dsData.identifierNames, dsData.measurementNames, dsData.categoryNames, tags, dsData.observations))
 	}
 
 	return result, nil
@@ -215,6 +223,11 @@ func (s *State) MeasurementsNames() []string {
 
 func (s *State) FqMeasurementsNames() []string {
 	return s.fqMeasurementsNames
+}
+
+// Returns map of identifiers names to fully-qualified identifiers names
+func (s *State) IdentifiersNamesMap() map[string]string {
+	return s.identifiersNamesMap
 }
 
 // Returns map of measurement names to fully-qualified meausurement names

@@ -8,7 +8,7 @@ import pandas as pd
 from pandas.core.computation import expressions
 
 from exception import RewardInvalidException
-from metrics import metrics
+from metrics import Metrics
 from proto.common.v1 import common_pb2
 from proto.aiengine.v1 import aiengine_pb2
 from exec import somewhat_safe_exec, load_module_from_code
@@ -30,6 +30,7 @@ class DataManager:
         self.fields = fields
         self.laws = laws
         self.param = param
+        self.metrics = Metrics()
 
         new_series = {}
         for field_name in fields:
@@ -70,11 +71,11 @@ class DataManager:
         self.fill_table()
 
     def fill_table(self):
-        metrics.start("resample")
+        self.metrics.start("resample")
         self.massive_table_sparse = self.massive_table_sparse.resample(self.param.granularity_secs).mean()
-        metrics.end("resample")
+        self.metrics.end("resample")
 
-        metrics.start("ffill")
+        self.metrics.start("ffill")
         self.massive_table_filled = self.massive_table_sparse.copy()
         for col_name in self.massive_table_sparse:
             fill_method = self.fields[col_name].fill_method
@@ -86,13 +87,13 @@ class DataManager:
                 self.massive_table_filled[col_name] = self.massive_table_sparse[
                     col_name
                 ].fillna(0)
-        metrics.end("ffill")
+        self.metrics.end("ffill")
 
-        metrics.start("reindex")
+        self.metrics.start("reindex")
         self.massive_table_filled.index = (
             self.massive_table_filled.index.drop_duplicates(keep="first")
         )
-        metrics.end("reindex")
+        self.metrics.end("reindex")
 
     def merge_row(self, new_row):
         index = new_row.index[0]
@@ -101,9 +102,9 @@ class DataManager:
 
             self.massive_table_sparse.loc[index][column_name] = value
 
-        metrics.start("ffill")
+        self.metrics.start("ffill")
         self.massive_table_filled = self.massive_table_sparse.ffill()
-        metrics.end("ffill")
+        self.metrics.end("ffill")
 
     def merge_data(self, new_data):
         def combiner(existing, newer):
@@ -122,16 +123,16 @@ class DataManager:
                 return
 
             if len(new_data) == 1 and new_data.index[0] in self.massive_table_sparse.index:
-                metrics.start("merge_row")
+                self.metrics.start("merge_row")
                 self.merge_row(new_data)
-                metrics.end("merge_row")
+                self.metrics.end("merge_row")
                 return
 
-            metrics.start("combine")
+            self.metrics.start("combine")
             self.massive_table_sparse = self.massive_table_sparse.combine(
                 new_data, combiner
             )
-            metrics.end("combine")
+            self.metrics.end("combine")
 
             self.fill_table()
 
