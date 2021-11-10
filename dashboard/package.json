@@ -4,7 +4,7 @@
   "license": "Apache-2.0",
   "private": true,
   "dependencies": {
-    "@glideapps/glide-data-grid": "^2.2.13",
+    "@glideapps/glide-data-grid": "^3.0.3",
     "@testing-library/dom": "^8.1.0",
     "@testing-library/jest-dom": "^5.11.4",
     "@testing-library/react": "^11.1.0",
@@ -75,6 +75,11 @@
       "last 1 chrome version",
       "last 1 firefox version",
       "last 1 safari version"
+    ]
+  },
+  "jest": {
+    "transformIgnorePatterns": [
+      "node_modules/(?!(react-native|@glideapps/glide-data-grid)/)"
     ]
   },
   "proxy": "http://localhost:8000"
