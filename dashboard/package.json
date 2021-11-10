@@ -77,5 +77,10 @@
       "last 1 safari version"
     ]
   },
+  "jest": {
+    "transformIgnorePatterns": [
+      "node_modules/(?!(react-native|@glideapps/glide-data-grid)/)"
+    ]
+  },
   "proxy": "http://localhost:8000"
 }
