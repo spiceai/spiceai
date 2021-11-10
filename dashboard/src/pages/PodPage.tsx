@@ -179,7 +179,7 @@ const PodPage: React.FunctionComponent<PodProps> = () => {
                   getCellContent={gridProps.gridDataFunc}
                   columns={gridProps.columns}
                   rows={observations.length}
-                  rowMarkers={false}
+                  rowMarkers="number"
                 />
               </DataEditorContainer>
             )}

@@ -1325,16 +1325,14 @@
     minimatch "^3.0.4"
     strip-json-comments "^3.1.1"
 
-"@glideapps/glide-data-grid@^2.2.13":
-  version "2.2.13"
-  resolved "https://registry.yarnpkg.com/@glideapps/glide-data-grid/-/glide-data-grid-2.2.13.tgz#1c1325e385c4a6a9549ab7b52fa32ada583c86c8"
-  integrity sha512-O5HKpBegpqC6mHbH6uJg5t3Bzmze8gzdNfvWBYLhj/hz9APsxjEJjYaWyn7l3ly9kNXgeGdee65QwtJK2QEriA==
+"@glideapps/glide-data-grid@^3.0.3":
+  version "3.0.3"
+  resolved "https://registry.yarnpkg.com/@glideapps/glide-data-grid/-/glide-data-grid-3.0.3.tgz#35798f79841b25f41f68ce4a3bb3bd8822a5ddd7"
+  integrity sha512-tE0lhqN7SuPXJIyAlSFsNMALpjcHFNIY06N/C0BbWQodXLDXaDHuFLgp+HqHHhV0jhoQutEkHAmcTRzqPYWi9Q==
   dependencies:
-    collection-utils "^1.0.1"
     copy-to-clipboard "^3.1.0"
     react-number-format "^4.4.1"
     react-virtualized-auto-sizer "^1.0.2"
-    utility-types "^3.10.0"
 
 "@hapi/address@2.x.x":
   version "2.1.4"
@@ -3584,7 +3582,7 @@ char-regex@^1.0.2:
   resolved "https://registry.npmjs.org/char-regex/-/char-regex-1.0.2.tgz"
   integrity sha512-kWWXztvZ5SBQV+eRgKFeh8q5sLuZY2+8WUIzlxWVTg+oGwY14qylx1KbKzHd8P6ZYkAg0xyIDU9JMHhyJMZ1jw==
 
-chart.js@^3.5.1:
+chart.js@^3.6.0:
   version "3.6.0"
   resolved "https://registry.yarnpkg.com/chart.js/-/chart.js-3.6.0.tgz#a87fce8431d4e7c5523d721f487f53aada1e42fe"
   integrity sha512-iOzzDKePL+bj+ccIsVAgWQehCXv8xOKGbaU2fO/myivH736zcx535PGJzQGanvcSGVOqX6yuLZsN3ygcQ35UgQ==
@@ -3751,11 +3749,6 @@ collect-v8-coverage@^1.0.0:
   version "1.0.1"
   resolved "https://registry.npmjs.org/collect-v8-coverage/-/collect-v8-coverage-1.0.1.tgz"
   integrity sha512-iBPtljfCNcTKNAto0KEtDfZ3qzjJvqE3aTGZsbhjSBlorqpXJlaWWtPO35D+ZImoC3KWejX64o+yPGxhWSTzfg==
-
-collection-utils@^1.0.1:
-  version "1.0.1"
-  resolved "https://registry.yarnpkg.com/collection-utils/-/collection-utils-1.0.1.tgz#31d14336488674f27aefc0a7c5eccacf6df78044"
-  integrity sha512-LA2YTIlR7biSpXkKYwwuzGjwL5rjWEZVOSnvdUc7gObvWe4WkjxOpfrdhoP7Hs09YWDVfg0Mal9BpAqLfVEzQg==
 
 collection-visit@^1.0.0:
   version "1.0.0"
@@ -12320,11 +12313,6 @@ utila@~0.4:
   version "0.4.0"
   resolved "https://registry.npmjs.org/utila/-/utila-0.4.0.tgz"
   integrity sha1-ihagXURWV6Oupe7MWxKk+lN5dyw=
-
-utility-types@^3.10.0:
-  version "3.10.0"
-  resolved "https://registry.yarnpkg.com/utility-types/-/utility-types-3.10.0.tgz#ea4148f9a741015f05ed74fd615e1d20e6bed82b"
-  integrity sha512-O11mqxmi7wMKCo6HKFt5AhO4BwY3VV68YU07tgxfz8zJTIxr4BpsezN49Ffwy9j3ZpwwJp4fkRwjRzq3uWE6Rg==
 
 utils-merge@1.0.1:
   version "1.0.1"
