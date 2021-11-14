@@ -143,12 +143,27 @@ func (pod *Pod) CachedCsv() string {
 
 	csv.WriteString(pod.csvHeaders())
 
+	identifierNames := pod.IdentifierNames()
 	measurementNames := pod.MeasurementNames()
 	categoryNames := pod.CategoryNames()
 
 	cachedState := pod.CachedState()
 	for _, state := range cachedState {
 		var validHeaders []string
+
+		for _, podFqIdentifierName := range identifierNames {
+			isLocal := false
+			for identifierName, fqIdentifierName := range state.IdentifiersNamesMap() {
+				if podFqIdentifierName == fqIdentifierName {
+					validHeaders = append(validHeaders, identifierName)
+					isLocal = true
+					break
+				}
+			}
+			if !isLocal {
+				validHeaders = append(validHeaders, podFqIdentifierName)
+			}
+		}
 
 		for _, podFqMeasurementName := range measurementNames {
 			isLocal := false
@@ -508,7 +523,7 @@ func loadPod(podPath string, hash string) (*Pod, error) {
 
 	pod.interpretations = interpretations.NewInterpretationsStore(pod.Epoch(), pod.Period(), pod.Granularity())
 
-	if pod.Training.RewardFuncs != "" {
+	if pod.Training != nil && pod.Training.RewardFuncs != "" {
 		if !strings.HasSuffix(pod.Training.RewardFuncs, ".py") {
 			return nil, errors.New("external reward functions must be defined in a single Python file - see https://docs.spiceai.org/concepts/rewards/")
 		}

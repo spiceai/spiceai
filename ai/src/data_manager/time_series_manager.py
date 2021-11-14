@@ -9,7 +9,7 @@ from pandas.core.computation import expressions
 
 from data_manager.base_manager import DataManagerBase, DataParam
 from exception import RewardInvalidException
-from metrics import metrics
+from metrics import Metrics
 from proto.common.v1 import common_pb2
 from proto.aiengine.v1 import aiengine_pb2
 from exec import somewhat_safe_exec, load_module_from_code
@@ -21,6 +21,7 @@ class TimeSeriesDataManager(DataManagerBase):
         self.fields = fields
         self.laws = laws
         self.param = param
+        self.metrics = Metrics()
 
         new_series = {}
         for field_name in fields:
@@ -60,12 +61,12 @@ class TimeSeriesDataManager(DataManagerBase):
 
         self._fill_table()
 
-    def _fill_table(self):
-        metrics.start("resample")
+    def fill_table(self):
+        self.metrics.start("resample")
         self.massive_table_sparse = self.massive_table_sparse.resample(self.param.granularity_secs).mean()
-        metrics.end("resample")
+        self.metrics.end("resample")
 
-        metrics.start("ffill")
+        self.metrics.start("ffill")
         self.massive_table_filled = self.massive_table_sparse.copy()
         for col_name in self.massive_table_sparse:
             fill_method = self.fields[col_name].fill_method
@@ -77,13 +78,13 @@ class TimeSeriesDataManager(DataManagerBase):
                 self.massive_table_filled[col_name] = self.massive_table_sparse[
                     col_name
                 ].fillna(0)
-        metrics.end("ffill")
+        self.metrics.end("ffill")
 
-        metrics.start("reindex")
+        self.metrics.start("reindex")
         self.massive_table_filled.index = (
             self.massive_table_filled.index.drop_duplicates(keep="first")
         )
-        metrics.end("reindex")
+        self.metrics.end("reindex")
 
     def _merge_row(self, new_row):
         index = new_row.index[0]
@@ -92,9 +93,9 @@ class TimeSeriesDataManager(DataManagerBase):
 
             self.massive_table_sparse.loc[index][column_name] = value
 
-        metrics.start("ffill")
+        self.metrics.start("ffill")
         self.massive_table_filled = self.massive_table_sparse.ffill()
-        metrics.end("ffill")
+        self.metrics.end("ffill")
 
     def merge_data(self, new_data):
         def combiner(existing, newer):
@@ -113,17 +114,16 @@ class TimeSeriesDataManager(DataManagerBase):
                 return
 
             if len(new_data) == 1 and new_data.index[0] in self.massive_table_sparse.index:
-                metrics.start("merge_row")
-                self._merge_row(new_data)
-                metrics.end("merge_row")
-            else:
-                metrics.start("combine")
-                self.massive_table_sparse = self.massive_table_sparse.combine(
-                    new_data, combiner
-                )
-                metrics.end("combine")
+                self.metrics.start("merge_row")
+                self.merge_row(new_data)
+                self.metrics.end("merge_row")
+                return
 
-                self._fill_table()
+            self.metrics.start("combine")
+            self.massive_table_sparse = self.massive_table_sparse.combine(new_data, combiner)
+            self.metrics.end("combine")
+
+            self.fill_table()
 
     def add_interpretations(self, interpretations):
         self.interpretations = interpretations

@@ -56,12 +56,13 @@ func TestGetStateFromCsv(t *testing.T) {
 func testNewState() func(*testing.T) {
 	return func(t *testing.T) {
 		expectedPath := "test.path"
+		expectedIdentifiersNames := []string{"i-1", "i-2"}
 		expectedMeasurementsNames := []string{"m-1", "m-2", "m-3"}
 		expectedCategoryNames := []string{"c-1", "c-2", "c-3"}
 		expectedTags := []string{}
 		expectedObservations := []observations.Observation{}
 
-		newState := NewState(expectedPath, expectedMeasurementsNames, expectedCategoryNames, expectedTags, expectedObservations)
+		newState := NewState(expectedPath, expectedIdentifiersNames, expectedMeasurementsNames, expectedCategoryNames, expectedTags, expectedObservations)
 
 		assert.Equal(t, expectedPath, newState.Path(), "Path() not equal")
 		assert.Equal(t, expectedMeasurementsNames, newState.MeasurementsNames(), "MeasurementNames() not equal")

@@ -12,10 +12,17 @@ import (
 	"github.com/spiceai/spiceai/pkg/proto/aiengine_pb"
 )
 
-func StartTraining(pod *pods.Pod, algorithm string, number_episodes int64) error {
+func StartTraining(pod *pods.Pod, algorithm *LearningAlgorithm, number_episodes int64) error {
 	flightId := fmt.Sprintf("%d", len(*pod.Flights())+1)
 
-	flight := flights.NewFlight(flightId, int(pod.Episodes()))
+	if algorithm == nil {
+		algorithm = GetAlgorithm(pod.LearningAlgorithm())
+		if algorithm == nil {
+			return fmt.Errorf("No algorithm found for %s", pod.LearningAlgorithm())
+		}
+	}
+
+	flight := flights.NewFlight(flightId, int(pod.Episodes()), algorithm.Id)
 
 	// Once we have an AI engine -> spiced gRPC channel, this should be done on demand
 	err := sendInterpretations(pod, pod.Interpretations().IndexedInterpretations())
@@ -29,12 +36,10 @@ func StartTraining(pod *pods.Pod, algorithm string, number_episodes int64) error
 		Flight:            flightId,
 		NumberEpisodes:    int64(flight.ExpectedEpisodes()),
 		TrainingGoal:      pod.PodSpec.Training.Goal,
-		LearningAlgorithm: pod.LearningAlgorithm(),
+		LearningAlgorithm: algorithm.Id,
 	}
+
 	// Overload pod's parameters
-	if algorithm != "" {
-		trainRequest.LearningAlgorithm = algorithm
-	}
 	if number_episodes > 0 {
 		trainRequest.NumberEpisodes = number_episodes
 	}

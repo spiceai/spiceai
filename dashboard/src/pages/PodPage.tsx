@@ -1,69 +1,75 @@
-import React, { useEffect, useState } from 'react';
-import { useLocation } from 'react-router-dom';
+import React, { useEffect, useState } from 'react'
+import { useLocation } from 'react-router-dom'
 
-import PodHeader from '../components/app/PodHeader';
-import Card from '../components/layout/Card';
-import { usePod } from '../models/pod';
-import { useFlights } from '../models/flight';
-import { useObservations } from '../models/observation';
-import FlightChart from '../components/flights/FlightChart';
+import PodHeader from '../components/app/PodHeader'
+import Card from '../components/layout/Card'
+import { usePod } from '../models/pod'
+import { useFlights } from '../models/flight'
+import { useObservations } from '../models/observation'
+import FlightChart from '../components/flights/FlightChart'
 import DataEditor, {
   DataEditorContainer,
   GridColumn,
   GridCell,
   GridCellKind,
-} from '@glideapps/glide-data-grid';
+} from '@glideapps/glide-data-grid'
 
 interface PodProps {
-  podName: string;
+  podName: string
 }
 
 interface GridProps {
-  columns: GridColumn[];
-  gridDataFunc: ([col, row]: readonly [number, number]) => GridCell;
+  columns: GridColumn[]
+  gridDataFunc: ([col, row]: readonly [number, number]) => GridCell
 }
 
 // TODO: Resize dynamically
-const gridWidth = 900;
-const gridHeight = 600;
+const gridWidth = 900
+const gridHeight = 600
 
 const PodPage: React.FunctionComponent<PodProps> = () => {
-  const location = useLocation();
-  const podNamePathIndex = location.pathname.lastIndexOf('/') + 1;
-  const podName = location.pathname.substring(podNamePathIndex);
+  const location = useLocation()
+  const podNamePathIndex = location.pathname.lastIndexOf('/') + 1
+  const podName = location.pathname.substring(podNamePathIndex)
 
-  const { data: pod, error: podError } = usePod(podName);
-  const { data: flights, error: flightsError } = useFlights(podName);
-  const { data: observations, error: observationsError } = useObservations(podName);
+  const { data: pod, error: podError } = usePod(podName)
+  const { data: flights, error: flightsError } = useFlights(podName)
+  const { data: observations, error: observationsError } = useObservations(podName)
 
-  const [gridProps, setGridProps] = useState<GridProps>();
+  const [gridProps, setGridProps] = useState<GridProps>()
 
   useEffect(() => {
+    if (!pod) {
+      return
+    }
+
+    const cols: GridColumn[] = []
+    const timeCol = { title: 'time', width: 180 }
+    cols.push(timeCol)
+
+    const identifiersKeys = pod.identifiers || []
+    const measurementsKeys = pod.measurements || []
+    const categoriesKeys = pod.categories || []
+
+    const numColumns =
+      identifiersKeys.length + measurementsKeys.length + categoriesKeys.length + 1 /* tags */
+    const colWidth = (gridWidth - timeCol.width - 17) / numColumns
+
+    for (const i of identifiersKeys) {
+      cols.push({ title: getColumnTitle(i), width: colWidth })
+    }
+
+    for (const m of measurementsKeys) {
+      cols.push({ title: getColumnTitle(m), width: colWidth })
+    }
+
+    for (const c of categoriesKeys) {
+      cols.push({ title: getColumnTitle(c), width: colWidth })
+    }
+
+    cols.push({ title: 'tags', width: colWidth })
+
     if (observations && observations.length) {
-      const cols = [];
-      const timeCol = { title: 'time', width: 180 };
-      cols.push(timeCol);
-      const firstObservation = observations[0];
-
-      const measurementsKeys = firstObservation.measurements
-        ? Object.keys(firstObservation.measurements)
-        : [];
-      const categoriesKeys = firstObservation.categories
-        ? Object.keys(firstObservation.categories)
-        : [];
-      const colWidth =
-        (gridWidth - timeCol.width - 17) / (measurementsKeys.length + categoriesKeys.length + 1);
-
-      for (const m of measurementsKeys) {
-        cols.push({ title: m, width: colWidth });
-      }
-
-      for (const c of categoriesKeys) {
-        cols.push({ title: c, width: colWidth });
-      }
-
-      cols.push({ title: 'tags', width: colWidth });
-
       const getGridDataFunc = ([col, row]: readonly [number, number]): GridCell => {
         if (row >= observations.length) {
           return {
@@ -71,50 +77,75 @@ const PodPage: React.FunctionComponent<PodProps> = () => {
             data: undefined,
             displayData: '',
             allowOverlay: false,
-          };
+          }
         }
-        const observation = observations[observations.length - row - 1];
-        if (col === 0) {
+        const observation = observations[observations.length - row - 1]
+
+        let startCol = 0
+        let endCol = startCol + 1
+        if (col === startCol) {
           return {
             kind: GridCellKind.Number,
             data: observation.time,
             displayData: new Date(observation.time * 1000).toLocaleString(),
             allowOverlay: false,
-          };
+          }
         }
 
-        if (col >= 1 && col <= measurementsKeys.length) {
-          const measurement = observation.measurements[measurementsKeys[col - 1]];
+        startCol = endCol
+        endCol = startCol + identifiersKeys.length
+
+        if (col >= startCol && col < endCol) {
+          console.log(observation.identifiers)
+          const identifier = observation.identifiers
+            ? observation.identifiers[identifiersKeys[col - startCol]]
+            : ''
+          return {
+            kind: GridCellKind.Text,
+            data: identifier,
+            displayData: identifier,
+            allowOverlay: false,
+          }
+        }
+
+        startCol = endCol
+        endCol = startCol + measurementsKeys.length
+
+        if (col >= startCol && col < endCol) {
+          const measurement = observation.measurements
+            ? observation.measurements[measurementsKeys[col - startCol]]
+            : undefined
           return {
             kind: GridCellKind.Number,
             data: measurement,
-            displayData: measurement.toString(),
+            displayData: measurement?.toString() || '',
             allowOverlay: false,
-          };
+          }
         }
 
-        if (
-          col > measurementsKeys.length &&
-          col <= measurementsKeys.length + categoriesKeys.length
-        ) {
-          const category =
-            observation.categories[categoriesKeys[col - measurementsKeys.length - 1]];
+        startCol = endCol
+        endCol = startCol + categoriesKeys.length
+
+        if (col >= startCol && col < endCol) {
+          const category = observation.categories
+            ? observation.categories[categoriesKeys[col - startCol]]
+            : ''
           return {
             kind: GridCellKind.Text,
             data: category,
             displayData: category,
             allowOverlay: false,
-          };
+          }
         }
 
-        if (col == measurementsKeys.length + categoriesKeys.length + 1) {
-          const tags = observation.tags ? observation.tags.join(' ') : '';
+        if (col == numColumns) {
+          const tags = observation.tags ? observation.tags.join(' ') : ''
           return {
             kind: GridCellKind.Text,
             data: tags,
             displayData: tags,
             allowOverlay: false,
-          };
+          }
         }
 
         return {
@@ -122,15 +153,15 @@ const PodPage: React.FunctionComponent<PodProps> = () => {
           data: row,
           displayData: row.toString(),
           allowOverlay: false,
-        };
-      };
+        }
+      }
 
       setGridProps({
         columns: cols,
         gridDataFunc: getGridDataFunc,
-      });
+      })
     }
-  }, [observations]);
+  }, [observations])
 
   return (
     <div className="flex flex-col flex-grow">
@@ -148,7 +179,7 @@ const PodPage: React.FunctionComponent<PodProps> = () => {
                   getCellContent={gridProps.gridDataFunc}
                   columns={gridProps.columns}
                   rows={observations.length}
-                  rowMarkers={false}
+                  rowMarkers="number"
                 />
               </DataEditorContainer>
             )}
@@ -161,7 +192,7 @@ const PodPage: React.FunctionComponent<PodProps> = () => {
               flights.map((flight, i) => (
                 <div key={i}>
                   <Card>
-                    <FlightChart flight={flight} />
+                    <FlightChart pod={pod} flight={flight} />
                   </Card>
                 </div>
               ))}
@@ -170,7 +201,12 @@ const PodPage: React.FunctionComponent<PodProps> = () => {
         </div>
       )}
     </div>
-  );
-};
+  )
+}
 
-export default PodPage;
+const getColumnTitle = (title: string): string => {
+  const lastDotIndex = title.lastIndexOf('.')
+  return `${title.substr(lastDotIndex + 1)} (${title.substr(0, lastDotIndex)})`
+}
+
+export default PodPage

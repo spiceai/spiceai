@@ -45,12 +45,15 @@ type Dataspace struct {
 	seedDataInfo *DataInfo
 	dataInfo     *DataInfo
 
-	identifiers      []*IdentifierInfo
-	categories       []*CategoryInfo
+	identifiers []*IdentifierInfo
+	categories  []*CategoryInfo
+
+	identifiersNames []string
 	measurementNames []string
 	categoryNames    []string
-	tags             []string
-	fqTags           []string
+
+	tags   []string
+	fqTags []string
 
 	stateMutex    *sync.RWMutex
 	cachedState   []*state.State
@@ -58,7 +61,7 @@ type Dataspace struct {
 }
 
 func NewDataspace(dsSpec spec.DataspaceSpec) (*Dataspace, error) {
-	_, _, identifierSelectors := getIdentifiers(dsSpec)
+	identifiersNames, identifiers, identifierSelectors := getIdentifiers(dsSpec)
 	categoryNames, categories, categorySelectors := getCategories(dsSpec)
 	measurementNames, measurementSelectors := getMeasurements(dsSpec)
 	tags, fqTags := getTags(dsSpec)
@@ -66,8 +69,10 @@ func NewDataspace(dsSpec spec.DataspaceSpec) (*Dataspace, error) {
 	ds := Dataspace{
 		DataspaceSpec:    dsSpec,
 		stateMutex:       &sync.RWMutex{},
-		categories:       categories,
+		identifiers:      identifiers,
+		identifiersNames: identifiersNames,
 		measurementNames: measurementNames,
+		categories:       categories,
 		categoryNames:    categoryNames,
 		tags:             tags,
 		fqTags:           fqTags,
@@ -159,6 +164,11 @@ func (ds *Dataspace) MeasurementNameMap() map[string]string {
 		measurementNames[v.Name] = fqname
 	}
 	return measurementNames
+}
+
+// Returns the sorted list of local identifiers names
+func (ds *Dataspace) IdentifiersNames() []string {
+	return ds.identifiersNames
 }
 
 // Returns the sorted list of local measurement names
@@ -272,7 +282,7 @@ func (ds *Dataspace) readData(processor dataprocessors.DataProcessor, data []byt
 		return nil, err
 	}
 
-	newState := state.NewState(ds.Path(), ds.MeasurementNames(), ds.CategoryNames(), ds.Tags(), observations)
+	newState := state.NewState(ds.Path(), ds.IdentifiersNames(), ds.MeasurementNames(), ds.CategoryNames(), ds.Tags(), observations)
 	err = ds.AddNewState(newState, metadata)
 	if err != nil {
 		return nil, err
@@ -287,7 +297,7 @@ func getDataInfo(dataSpec *spec.DataSpec, identifierSelectors map[string]string,
 		return nil, fmt.Errorf("failed to initialize data processor '%s': %s", dataSpec.Processor.Name, err)
 	}
 
-	err = processor.Init(dataSpec.Connector.Params, identifierSelectors, measurementSelectors, categorySelectors, tagSelectors)
+	err = processor.Init(dataSpec.Processor.Params, identifierSelectors, measurementSelectors, categorySelectors, tagSelectors)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize data processor '%s': %s", dataSpec.Processor.Name, err)
 	}
@@ -326,7 +336,7 @@ func getIdentifiers(dsSpec spec.DataspaceSpec) ([]string, []*IdentifierInfo, map
 		if identifierSpec.Selector == "" {
 			identifierSelectors[identifierSpec.Name] = identifierSpec.Name
 		} else {
-			identifierSelectors[identifierSpec.Name] = identifierSpec.Selector
+			identifierSelectors[identifierSpec.Name] = strings.TrimSpace(identifierSpec.Selector)
 		}
 	}
 	sort.Strings(identifierNames)
@@ -344,7 +354,7 @@ func getMeasurements(dsSpec spec.DataspaceSpec) ([]string, map[string]string) {
 		if v.Selector == "" {
 			measurementSelectors[v.Name] = v.Name
 		} else {
-			measurementSelectors[v.Name] = v.Selector
+			measurementSelectors[v.Name] = strings.TrimSpace(v.Selector)
 		}
 	}
 	sort.Strings(measurementNames)
@@ -375,7 +385,7 @@ func getCategories(dsSpec spec.DataspaceSpec) ([]string, []*CategoryInfo, map[st
 		if categorySpec.Selector == "" {
 			categorySelectors[categorySpec.Name] = categorySpec.Name
 		} else {
-			categorySelectors[categorySpec.Name] = categorySpec.Selector
+			categorySelectors[categorySpec.Name] = strings.TrimSpace(categorySpec.Selector)
 		}
 	}
 	sort.Strings(categoryNames)

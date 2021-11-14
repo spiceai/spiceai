@@ -15,7 +15,6 @@ from data_manager.base_manager import DataManagerBase
 from data_manager.time_series_manager import TimeSeriesDataManager
 from exec import somewhat_safe_eval
 from exception import DataSourceActionInvalidException, LawInvalidException, RewardInvalidException
-from metrics import metrics
 from progress import ProgressBar
 from utils import print_event
 
@@ -55,7 +54,7 @@ class Trainer():
         episode_reward = 0
         episode_actions = [0] * len(self.data_manager.action_names)
         while True:
-            metrics.start("episode")
+            self.data_manager.metrics.start("episode")
             action, _ = self.agent.act(model_state)
             progress_bar.next()
 
@@ -94,7 +93,7 @@ class Trainer():
             episode_actions[action] += 1
             model_state = model_state_prime
             raw_state = raw_state_prime
-            metrics.end("episode")
+            self.data_manager.metrics.end("episode")
 
         return episode_reward, episode_actions
 
@@ -115,8 +114,8 @@ class Trainer():
                     math.floor(self.data_manager.param.period_secs / self.data_manager.param.granularity_secs)
                     if isinstance(self.data_manager, TimeSeriesDataManager) else
                     len(self.data_manager.data_frame))
-                progress_bar = ProgressBar(self.pod_name, episode, total_steps)
-                metrics.reset()
+                progress_bar = ProgressBar(self.pod_name, episode, total_steps, self.data_manager.metrics)
+                self.data_manager.metrics.reset()
 
                 episode_reward, episode_actions = self.run_episode(
                     model_state, raw_state, raw_state_prime_interpretations, progress_bar)

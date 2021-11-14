@@ -1,5 +1,6 @@
 [
   {
+    "episodes": 10,
     "manifest_path": "fixed",
     "measurements": [
       "csv.processor.eventId",
@@ -20,6 +21,7 @@
       "event.stream.event_type",
       "event.stream.target_audience"
     ],
+    "episodes": 10,
     "manifest_path": "fixed",
     "measurements": [
       "event.stream.duration",
@@ -29,6 +31,10 @@
     "name": "event-categories"
   },
   {
+    "episodes": 10,
+    "identifiers": [
+      "event.data.eventId"
+    ],
     "manifest_path": "fixed",
     "measurements": [
       "event.data.height",
@@ -39,6 +45,7 @@
     "name": "event-tags"
   },
   {
+    "episodes": 10,
     "manifest_path": "fixed",
     "measurements": [
       "coinbase.btcusd.close",
@@ -48,6 +55,7 @@
     "name": "trader"
   },
   {
+    "episodes": 10,
     "manifest_path": "fixed",
     "measurements": [
       "coinbase.btcusd.close",
@@ -57,6 +65,7 @@
     "name": "trader-external-funcs"
   },
   {
+    "episodes": 10,
     "manifest_path": "fixed",
     "measurements": [
       "coinbase.btcusd.price",
