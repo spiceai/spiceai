@@ -16,9 +16,11 @@ import requests
 from algorithms.factory import get_agent
 from algorithms.agent_interface import SpiceAIAgent
 from cleanup import cleanup_on_shutdown
-from connector.manager import ConnectorManager
-from data import DataManager
-from event_loop import EventLoop
+from connector.manager import ConnectorManager, ConnectorName
+from connector.stateful import StatefulConnector
+from data import DataParam, DataManager
+from dispatcher.data_dispatcher import DataDispatcher
+from dispatcher import locks
 from exception import UnexpectedException
 from inference import GetInferenceHandler
 from proto.aiengine.v1 import aiengine_pb2, aiengine_pb2_grpc
@@ -111,6 +113,16 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
         return handler.get_result()
 
     def Init(self, request: aiengine_pb2.InitRequest, context):
+        connector_manager = ConnectorManager()
+
+        period_secs = pd.to_timedelta(request.period, unit="s")
+        interval_secs = pd.to_timedelta(request.interval, unit="s")
+        granularity_secs = pd.to_timedelta(request.granularity, unit="s")
+
+        epoch_time = pd.Timestamp.now() - period_secs
+        if request.epoch_time != 0:
+            epoch_time = pd.to_datetime(request.epoch_time, unit="s")
+
         if len(request.actions) == 0:
             return aiengine_pb2.Response(result="missing_actions", error=True)
         action_rewards = request.actions
@@ -122,7 +134,37 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
         if len(request.fields) == 0:
             return aiengine_pb2.Response(result="missing_fields", error=True)
 
-        data_queue.put(("init", request))
+        data_manager = DataManager(
+            param=DataParam(
+                epoch_time=epoch_time,
+                period_secs=period_secs,
+                interval_secs=interval_secs,
+                granularity_secs=granularity_secs),
+            fields=request.fields,
+            action_rewards=action_rewards,
+            actions_order=request.actions_order,
+            external_reward_funcs=request.external_reward_funcs,
+            laws=request.laws,
+            dataspace_hash=request.dataspace_hash
+        )
+        datasources_data = request.datasources
+
+        for datasource_data in datasources_data:
+            connector_data = datasource_data.connector
+            connector_name: ConnectorName = connector_data.name
+
+            datasource_actions = datasource_data.actions
+
+            if connector_name == ConnectorName.STATEFUL.value:
+                new_connector = StatefulConnector(
+                    data_manager=data_manager,
+                    action_effects=datasource_actions,
+                )
+                connector_manager.add_connector(new_connector)
+
+        with locks.INIT_LOCK:
+            data_managers[request.pod] = data_manager
+            connector_managers[request.pod] = connector_manager
 
         return aiengine_pb2.Response(result="ok")
 
@@ -200,8 +242,9 @@ def main():
     server.start()
     print(f"AIEngine: gRPC server listening on port {8004}")
 
-    event_loop = EventLoop(work_queue=data_queue, data_managers=data_managers, connector_managers=connector_managers)
-    event_loop.start()
+    data_dispatcher = DataDispatcher(work_queue=data_queue, data_managers=data_managers,
+                                     connector_managers=connector_managers)
+    data_dispatcher.start()
 
     wait_parent_process()
     cleanup_on_shutdown()

@@ -3,6 +3,7 @@ package pods
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cnf/structhash"
 	"github.com/spf13/viper"
 	"github.com/spiceai/spiceai/pkg/constants"
 	"github.com/spiceai/spiceai/pkg/dataspace"
@@ -29,10 +31,11 @@ import (
 
 type Pod struct {
 	spec.PodSpec
-	viper        *viper.Viper
-	podParams    *PodParams
-	hash         string
-	manifestPath string
+	viper         *viper.Viper
+	podParams     *PodParams
+	hash          string
+	dataspaceHash string
+	manifestPath  string
 
 	timeCategories    map[string][]spice_time.TimeCategoryInfo
 	timeCategoryNames []string
@@ -60,6 +63,11 @@ type Pod struct {
 
 func (pod *Pod) Hash() string {
 	return pod.hash
+}
+
+// Returns the hash value of the logical dataspace configuration
+func (pod *Pod) DataspaceHash() string {
+	return pod.dataspaceHash
 }
 
 func (f *Pod) ManifestPath() string {
@@ -470,6 +478,14 @@ func loadPod(podPath string, hash string) (*Pod, error) {
 	tagsMap := make(map[string]bool)
 	measurements := make(map[string]*dataspace.MeasurementInfo)
 	dataspaceMap := make(map[string]*dataspace.Dataspace, len(pod.PodSpec.Dataspaces))
+
+	dsEncodedBytes := structhash.Dump(pod.PodSpec.Dataspaces, 1)
+	dsEncodedBytesReader := bytes.NewReader(dsEncodedBytes)
+	dsHashBytes, err := util.ComputeHash(dsEncodedBytesReader)
+	if err != nil {
+		return nil, err
+	}
+	pod.dataspaceHash = hex.EncodeToString(dsHashBytes)
 
 	for _, dsSpec := range pod.PodSpec.Dataspaces {
 		ds, err := dataspace.NewDataspace(dsSpec)

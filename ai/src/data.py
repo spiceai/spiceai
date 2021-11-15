@@ -1,5 +1,4 @@
 import math
-import threading
 from types import SimpleNamespace
 from typing import Dict, List
 
@@ -26,10 +25,11 @@ class DataParam:
 
 class DataManager:
     def __init__(self, param: DataParam, fields: Dict[str, aiengine_pb2.FieldData], action_rewards: Dict[str, str],
-                 actions_order: Dict[str, int], external_reward_funcs: str, laws: List[str]):
+                 actions_order: Dict[str, int], external_reward_funcs: str, laws: List[str], dataspace_hash: str):
         self.fields = fields
         self.laws = laws
         self.param = param
+        self.dataspace_hash = dataspace_hash
         self.metrics = Metrics()
 
         new_series = {}
@@ -60,7 +60,6 @@ class DataManager:
                 reward_func_name = self.action_rewards[action_name]
                 reward_func = getattr(self.reward_funcs_module, reward_func_name)
                 self.reward_funcs_module_actions[action_name] = reward_func
-        self.table_lock = threading.Lock()
 
     def get_window_span(self):
         return math.floor(self.param.interval_secs / self.param.granularity_secs)
@@ -118,23 +117,22 @@ class DataManager:
 
             return expressions.where(condition, existing_values, newer_values)
 
-        with self.table_lock:
-            if len(new_data) == 0:
-                return
+        if len(new_data) == 0:
+            return
 
-            if len(new_data) == 1 and new_data.index[0] in self.massive_table_sparse.index:
-                self.metrics.start("merge_row")
-                self.merge_row(new_data)
-                self.metrics.end("merge_row")
-                return
+        if len(new_data) == 1 and new_data.index[0] in self.massive_table_sparse.index:
+            self.metrics.start("merge_row")
+            self.merge_row(new_data)
+            self.metrics.end("merge_row")
+            return
 
-            self.metrics.start("combine")
-            self.massive_table_sparse = self.massive_table_sparse.combine(
-                new_data, combiner
-            )
-            self.metrics.end("combine")
+        self.metrics.start("combine")
+        self.massive_table_sparse = self.massive_table_sparse.combine(
+            new_data, combiner
+        )
+        self.metrics.end("combine")
 
-            self.fill_table()
+        self.fill_table()
 
     def add_interpretations(self, interpretations):
         self.interpretations = interpretations
@@ -168,20 +166,19 @@ class DataManager:
         return np.nan_to_num(result_array)
 
     def get_current_window(self):
-        with self.table_lock:
-            # This will get the nearest previous index that matches the timestamp,
-            # so we don't need to specify the timestamps exactly
-            start_index = self.massive_table_filled.index.get_loc(
-                self.current_time - self.param.interval_secs, "ffill"
-            )
-            end_index = self.massive_table_filled.index.get_loc(
-                self.current_time, "ffill"
-            )
+        # This will get the nearest previous index that matches the timestamp,
+        # so we don't need to specify the timestamps exactly
+        start_index = self.massive_table_filled.index.get_loc(
+            self.current_time - self.param.interval_secs, "ffill"
+        )
+        end_index = self.massive_table_filled.index.get_loc(
+            self.current_time, "ffill"
+        )
 
-            return (
-                self.massive_table_filled.iloc[start_index:start_index + 1]
-                if self.get_window_span() == 1 else
-                self.massive_table_filled.iloc[start_index:end_index])
+        return (
+            self.massive_table_filled.iloc[start_index:start_index + 1]
+            if self.get_window_span() == 1 else
+            self.massive_table_filled.iloc[start_index:end_index])
 
     def get_window_at(self, time):
         start_index = None

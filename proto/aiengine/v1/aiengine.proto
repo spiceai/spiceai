@@ -49,6 +49,7 @@ message InitRequest {
   repeated string laws = 9;
   repeated DataSource datasources = 10;
   string external_reward_funcs = 11;
+  string dataspace_hash = 12;
 }
 
 message Response {
@@ -89,6 +90,7 @@ message InferenceResult {
 message AddDataRequest {
   string pod = 1;
   string csv_data = 2;
+  string dataspace_hash = 3;
 }
 
 message AddInterpretationsRequest {

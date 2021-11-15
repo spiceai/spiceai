@@ -6,8 +6,10 @@ from typing import Dict
 import pandas as pd
 
 from connector.manager import ConnectorManager
+from dispatcher import locks
 from data import DataManager
 from proto.aiengine.v1.aiengine_pb2 import AddDataRequest
+from train import Trainer
 
 
 class DataDispatcher:
@@ -39,11 +41,16 @@ class DataDispatcher:
         new_data["time"] = pd.to_datetime(new_data["time"], unit="s")
         new_data = new_data.set_index("time")
 
-        data_manager: DataManager = self.data_managers[request.pod]
-        for field in new_data.columns:
-            if field not in data_manager.fields.keys():
-                print(f"Unexpected field: '{field}'")
+        with locks.INIT_LOCK:
+            data_manager: DataManager = self.data_managers[request.pod]
+            for field in new_data.columns:
+                if field not in data_manager.fields.keys():
+                    print(f"Unexpected field: '{field}'")
+                    return
+
+            if data_manager.dataspace_hash != request.dataspace_hash:
+                print("Dataspace hash doesn't match current data_manager")
                 return
 
-        data_manager = self.data_managers[request.pod]
-        data_manager.merge_data(new_data)
+            with Trainer.TRAINING_LOCK:
+                data_manager.merge_data(new_data)

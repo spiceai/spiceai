@@ -104,8 +104,9 @@ func getAddDataRequest(pod *pods.Pod, s *state.State) *aiengine_pb.AddDataReques
 	zaplog.Sugar().Debugf("Posting data to AI engine:\n%s", aurora.BrightYellow(fmt.Sprintf("%s%s...\n%d observations posted", csv.String(), csvPreview, len(observationData))))
 
 	addDataRequest := &aiengine_pb.AddDataRequest{
-		Pod:     pod.Name,
-		CsvData: csv.String(),
+		Pod:           pod.Name,
+		CsvData:       csv.String(),
+		DataspaceHash: pod.DataspaceHash(),
 	}
 
 	return addDataRequest
