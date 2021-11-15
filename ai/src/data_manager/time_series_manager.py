@@ -1,6 +1,5 @@
 import math
 import threading
-from types import SimpleNamespace
 from typing import Dict, List
 
 import numpy as np
@@ -8,20 +7,13 @@ import pandas as pd
 from pandas.core.computation import expressions
 
 from data_manager.base_manager import DataManagerBase, DataParam
-from exception import RewardInvalidException
-from metrics import Metrics
-from proto.common.v1 import common_pb2
 from proto.aiengine.v1 import aiengine_pb2
-from exec import somewhat_safe_exec, load_module_from_code
 
 
 class TimeSeriesDataManager(DataManagerBase):
     def __init__(self, param: DataParam, fields: Dict[str, aiengine_pb2.FieldData], action_rewards: Dict[str, str],
                  actions_order: Dict[str, int], external_reward_funcs: str, laws: List[str]):
-        self.fields = fields
-        self.laws = laws
-        self.param = param
-        self.metrics = Metrics()
+        super().__init__(param, fields, action_rewards, actions_order, external_reward_funcs, laws)
 
         new_series = {}
         for field_name in fields:
@@ -32,25 +24,7 @@ class TimeSeriesDataManager(DataManagerBase):
         self.massive_table_filled = None
         self._fill_table()
 
-        self.interpretations: common_pb2.IndexedInterpretations = None
-
         self.current_time: pd.Timestamp = None
-        self.action_rewards = action_rewards
-
-        self.action_names = [None] * len(actions_order)
-
-        for action in actions_order:
-            self.action_names[actions_order[action]] = action
-
-        self.reward_funcs_module = None
-        if len(external_reward_funcs) > 0:
-            self.reward_funcs_module = load_module_from_code(external_reward_funcs, "reward_funcs")
-
-            self.reward_funcs_module_actions = {}
-            for action_name in self.action_names:
-                reward_func_name = self.action_rewards[action_name]
-                reward_func = getattr(self.reward_funcs_module, reward_func_name)
-                self.reward_funcs_module_actions[action_name] = reward_func
         self.table_lock = threading.Lock()
 
     def get_window_span(self):
@@ -61,7 +35,7 @@ class TimeSeriesDataManager(DataManagerBase):
 
         self._fill_table()
 
-    def fill_table(self):
+    def _fill_table(self):
         self.metrics.start("resample")
         self.massive_table_sparse = self.massive_table_sparse.resample(self.param.granularity_secs).mean()
         self.metrics.end("resample")
@@ -115,7 +89,7 @@ class TimeSeriesDataManager(DataManagerBase):
 
             if len(new_data) == 1 and new_data.index[0] in self.massive_table_sparse.index:
                 self.metrics.start("merge_row")
-                self.merge_row(new_data)
+                self._merge_row(new_data)
                 self.metrics.end("merge_row")
                 return
 
@@ -123,7 +97,7 @@ class TimeSeriesDataManager(DataManagerBase):
             self.massive_table_sparse = self.massive_table_sparse.combine(new_data, combiner)
             self.metrics.end("combine")
 
-            self.fill_table()
+            self._fill_table()
 
     def add_interpretations(self, interpretations):
         self.interpretations = interpretations
@@ -182,38 +156,3 @@ class TimeSeriesDataManager(DataManagerBase):
         self.current_time += self.param.granularity_secs
 
         return True
-
-    def reward(
-            self, prev_state_pd, prev_state_interpretations,
-            new_state_pd, new_state_intepretations, action: int,) -> float:
-        prev_state_dict = {}
-        new_state_dict = {}
-        action_name = self.action_names[action]
-
-        for key in prev_state_pd:
-            prev_state_dict[key] = list(prev_state_pd[key])[-1]
-            new_state_dict[key] = list(new_state_pd[key])[-1]
-
-        if self.reward_funcs_module is not None:
-            reward_func = self.reward_funcs_module_actions[action_name]
-            return reward_func(prev_state_dict, prev_state_interpretations, new_state_dict, new_state_intepretations)
-
-        prev_state_dict["interpretations"] = prev_state_interpretations
-        new_state_dict["interpretations"] = new_state_intepretations
-
-        prev_state = SimpleNamespace(**prev_state_dict)
-        new_state = SimpleNamespace(**new_state_dict)
-
-        loc = {}
-        loc["prev_state"] = prev_state
-        loc["new_state"] = new_state
-        loc["print"] = print
-
-        reward_func = self.action_rewards[action_name]
-
-        try:
-            loc = somewhat_safe_exec(reward_func, loc)
-        except Exception as ex:
-            raise RewardInvalidException(repr(ex)) from ex
-
-        return loc["reward"]

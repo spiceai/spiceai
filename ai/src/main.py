@@ -156,7 +156,6 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
                     external_reward_funcs=request.external_reward_funcs,
                     laws=request.laws)
             else:
-                raise Exception('EventDataManager should not be used')
                 data_manager = EventDataManager(
                     param=DataParam(
                         epoch_time=epoch_time,
