@@ -110,8 +110,7 @@ generate-acknowledgements:
 	echo -e "# Open Source Acknowledgements\n\nSpice.ai would like to acknowledge the following open source projects for making this project possible:\n\n## Python Packages\n" > $(ACKNOWLEDGEMENTS_PATH)
 	
 	# Python Packages
-	python -m venv venv-acknowledgments
-	source venv-acknowledgments/bin/activate
+	python3 -m venv venv-acknowledgments
 	venv-acknowledgments/bin/pip install -r ai/src/requirements/production.txt
 	venv-acknowledgments/bin/pip install -r ai/src/requirements/development.txt
 	venv-acknowledgments/bin/pip install -r ai/src/requirements/common.txt
@@ -130,6 +129,13 @@ generate-acknowledgements:
 	pushd dashboard && yarn install && npx license-checker --csv 2>/dev/null >> ../$(ACKNOWLEDGEMENTS_PATH) && popd
 
 	# Apply Formatting
-	sed -i 's/\"//g' $(ACKNOWLEDGEMENTS_PATH)
-	sed -i 's/,/, /g' $(ACKNOWLEDGEMENTS_PATH)
-	sed -i 's/,  /, /g' $(ACKNOWLEDGEMENTS_PATH)
+	if [[ $(uname) -eq "Darwin" ]]; then\
+		sed -i '' 's/\"//g' $(ACKNOWLEDGEMENTS_PATH)\
+		sed -i '' 's/,/, /g' $(ACKNOWLEDGEMENTS_PATH)\
+		sed -i '' 's/,  /, /g' $(ACKNOWLEDGEMENTS_PATH)\
+	else\
+		sed -i 's/\"//g' $(ACKNOWLEDGEMENTS_PATH)\
+		sed -i 's/,/, /g' $(ACKNOWLEDGEMENTS_PATH)\
+		sed -i 's/,  /, /g' $(ACKNOWLEDGEMENTS_PATH)\
+	fi
+	  
