@@ -86,7 +86,7 @@ class TimeSeriesDataManager(DataManagerBase):
 
         if len(new_data) == 1 and new_data.index[0] in self.massive_table_sparse.index:
             self.metrics.start("merge_row")
-            self.merge_row(new_data)
+            self._merge_row(new_data)
             self.metrics.end("merge_row")
             return
 

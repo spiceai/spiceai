@@ -34,6 +34,7 @@ def get_init_from_json(init_data_path: str, pod_name: str) -> aiengine_pb2.InitR
         actions=pod_init_json["actions"],
         actions_order=pod_init_json["actions_order"],
         laws=pod_init_json["laws"],
+        dataspace_hash=pod_init_json["dataspace_hash"]
     )
     for datasource in pod_init_json["datasources"]:
         ai_datasource = aiengine_pb2.DataSource(

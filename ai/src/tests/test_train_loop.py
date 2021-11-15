@@ -10,7 +10,7 @@ import pandas as pd
 from cleanup import cleanup_on_shutdown
 import main
 from proto.aiengine.v1 import aiengine_pb2
-from tests import common
+from tests import common, test_main
 import train
 
 
@@ -26,6 +26,10 @@ class TrainingLoopTests(unittest.TestCase):
         tf.compat.v1.disable_eager_execution()
 
         self.aiengine = main.AIEngine()
+
+        self.pod_dataspace_hashes = {
+            "trader": "ddc99ce6cbdf8c7fb0a5ae5a7eaea2f28c4e9ca24c9b4593f977218f9fd9c9e6"
+        }
 
         self.trader_init_req = common.get_init_from_json(
             init_data_path="../../test/assets/aiengine/api/trader_init.json",
@@ -59,11 +63,14 @@ class TrainingLoopTests(unittest.TestCase):
         self.assertEqual(resp.error, expected_error)
         self.assertEqual(resp.result, expected_result)
 
-    def add_data(self, pod_name: str, csv_data: str):
+    def add_data(self, pod_name: str, csv_data: str, dataspace_hash: str):
         resp = self.aiengine.AddData(
-            aiengine_pb2.AddDataRequest(pod=pod_name, csv_data=csv_data), None
+            aiengine_pb2.AddDataRequest(
+                pod=pod_name, csv_data=csv_data, dataspace_hash=dataspace_hash), None
         )
         self.assertFalse(resp.error)
+
+        test_main.process_add_data(self)
 
     def start_training(
             self, pod_name: str, flight: str = None, number_episodes: int = None, epoch_time: int = None,
@@ -121,7 +128,7 @@ class TrainingLoopTests(unittest.TestCase):
         self.init(self.trader_init_req)
 
         # Step 2, load the csv data
-        self.add_data("trader", self.trader_data_csv)
+        self.add_data("trader", self.trader_data_csv, self.pod_dataspace_hashes["trader"])
 
         flight = "1"
         number_episodes = 10
@@ -151,7 +158,7 @@ class TrainingLoopTests(unittest.TestCase):
         self.init(self.trader_init_req)
 
         # Step 2, load the csv data
-        self.add_data("trader", self.trader_data_csv)
+        self.add_data("trader", self.trader_data_csv, self.pod_dataspace_hashes["trader"])
 
         flight = "1"
         number_episodes = 10
@@ -183,8 +190,8 @@ class TrainingLoopTests(unittest.TestCase):
             gap_data_1 = data.read()
 
         self.init(self.trader_init_req)
-        self.add_data("trader", gap_data_0)
-        self.add_data("trader", gap_data_1)
+        self.add_data("trader", gap_data_0, self.pod_dataspace_hashes["trader"])
+        self.add_data("trader", gap_data_1, self.pod_dataspace_hashes["trader"])
 
         flight = "1"
         number_episodes = 10
@@ -222,7 +229,7 @@ class TrainingLoopTests(unittest.TestCase):
             gap_data_1 = data.read()
 
         self.init(self.trader_init_req)
-        self.add_data("trader", gap_data_0)
+        self.add_data("trader", gap_data_0, self.pod_dataspace_hashes["trader"])
 
         flight = "1"
         number_episodes = 10
@@ -244,7 +251,7 @@ class TrainingLoopTests(unittest.TestCase):
         episode_5_lock.acquire()  # pylint: disable=consider-using-with
 
         print("Posting gap_data_1")
-        self.add_data("trader", gap_data_1)
+        self.add_data("trader", gap_data_1, self.pod_dataspace_hashes["trader"])
         post_data_lock.release()
 
         self.wait_for_training()
@@ -268,18 +275,18 @@ class TrainingLoopTests(unittest.TestCase):
 
     def test_epoch_earlier_than_data(self):
         self.init(self.trader_init_req)
-        self.add_data("trader", self.trader_data_csv)
+        self.add_data("trader", self.trader_data_csv, self.pod_dataspace_hashes["trader"])
         self.start_training("trader", "1", 10, 1626697400, expected_error=True, expected_result="epoch_time_invalid")
 
     def test_epoch_offset_from_data(self):
         self.init(self.trader_init_req)
-        self.add_data("trader", self.trader_data_csv)
+        self.add_data("trader", self.trader_data_csv, self.pod_dataspace_hashes["trader"])
         self.start_training("trader", "1", 1, 1626697485, expected_error=False, expected_result="started_training")
         self.wait_for_training()
 
     def test_epoch_after_latest_data(self):
         self.init(self.trader_init_req)
-        self.add_data("trader", self.trader_data_csv)
+        self.add_data("trader", self.trader_data_csv, self.pod_dataspace_hashes["trader"])
         self.start_training(
             "trader", "1", 10, 1626699240, expected_error=True, expected_result="not_enough_data_for_training")
 
@@ -289,7 +296,7 @@ class TrainingLoopTests(unittest.TestCase):
 
     def test_not_enough_data_for_training_late_epoch(self):
         self.init(self.trader_init_req)
-        self.add_data("trader", self.trader_data_csv)
+        self.add_data("trader", self.trader_data_csv, self.pod_dataspace_hashes["trader"])
         self.start_training(
             "trader", "1", 10, epoch_time=1626698020,
             expected_error=True, expected_result="not_enough_data_for_training")
@@ -330,7 +337,7 @@ class TrainingLoopTests(unittest.TestCase):
 
         self.init(trader_init)
 
-        self.add_data("trader", self.trader_data_csv)
+        self.add_data("trader", self.trader_data_csv, self.pod_dataspace_hashes["trader"])
 
         flight = "1"
         number_episodes = 10
@@ -353,7 +360,7 @@ class TrainingLoopTests(unittest.TestCase):
 
         self.init(trader_init)
 
-        self.add_data("trader", self.trader_data_csv)
+        self.add_data("trader", self.trader_data_csv, self.pod_dataspace_hashes["trader"])
 
         flight = "1"
         number_episodes = 10
@@ -374,7 +381,7 @@ class TrainingLoopTests(unittest.TestCase):
 
         self.init(trader_init)
 
-        self.add_data("trader", self.trader_data_csv)
+        self.add_data("trader", self.trader_data_csv, self.pod_dataspace_hashes["trader"])
 
         flight = "1"
         number_episodes = 10
@@ -398,7 +405,7 @@ class TrainingLoopTests(unittest.TestCase):
 
         self.init(trader_init)
 
-        self.add_data("trader", self.trader_data_csv)
+        self.add_data("trader", self.trader_data_csv, self.pod_dataspace_hashes["trader"])
 
         flight = "1"
         number_episodes = 10
@@ -438,7 +445,7 @@ class TrainingLoopTests(unittest.TestCase):
             row = [unix_seconds, None, None, 123]
             writer.writerow(row)
 
-        self.add_data("trader", csv_data.getvalue())
+        self.add_data("trader", csv_data.getvalue(), self.pod_dataspace_hashes["trader"])
 
         flight = "1"
         number_episodes = 10

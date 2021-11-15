@@ -25,6 +25,7 @@ class TimeSeriesDataManagerTestCase(unittest.TestCase):
             actions_order={"foo": 0},
             laws=["law"],
             external_reward_funcs="",
+            dataspace_hash="",
         )
 
         # Leave a gap at time 40
@@ -56,6 +57,7 @@ class TimeSeriesDataManagerTestCase(unittest.TestCase):
             actions_order={"foo": 0},
             laws=["law"],
             external_reward_funcs="",
+            dataspace_hash="",
         )
 
         # Leave a gap at time 40
@@ -83,6 +85,7 @@ class TimeSeriesDataManagerTestCase(unittest.TestCase):
             actions_order={"foo": 0},
             laws=["law"],
             external_reward_funcs="",
+            dataspace_hash="",
         )
 
         original_csv = "time,foo\n10,1.0\n20,2.0\n30,3.0"
@@ -138,6 +141,7 @@ class TimeSeriesDataManagerTestCase(unittest.TestCase):
                 actions_order={"foo": 0},
                 laws=["law"],
                 external_reward_funcs="",
+                dataspace_hash="",
             )
 
             self.assertEqual(
@@ -165,6 +169,7 @@ class TimeSeriesDataManagerTestCase(unittest.TestCase):
                 actions_order={"foo": 0},
                 laws=["law"],
                 external_reward_funcs="",
+                dataspace_hash="",
             )
 
             self.assertEqual(
@@ -187,6 +192,7 @@ class TimeSeriesDataManagerTestCase(unittest.TestCase):
             actions_order={"foo": 0},
             laws=["law"],
             external_reward_funcs="",
+            dataspace_hash="",
         )
 
         self.assertIsNone(data_manager.current_time)
@@ -209,6 +215,7 @@ class TimeSeriesDataManagerTestCase(unittest.TestCase):
             actions_order={"foo": 0},
             laws=["law"],
             external_reward_funcs="",
+            dataspace_hash="",
         )
 
         original_csv = "time,foo\n10,1.0\n20,2.0\n30,3.0"

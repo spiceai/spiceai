@@ -1,8 +1,17 @@
 import unittest
+from dispatcher.data_dispatcher import DataDispatcher
 
 import main
 from proto.aiengine.v1 import aiengine_pb2
 from tests.common import get_init_from_json
+
+
+def process_add_data(self):
+    data_dispatcher = DataDispatcher(work_queue=main.data_queue,
+                                     data_managers=main.data_managers, connector_managers=main.connector_managers)
+    event_name, params = main.data_queue.get()
+    self.assertEqual("add_data", event_name)
+    data_dispatcher._add_data(params)
 
 
 class MainTestCase(unittest.TestCase):
@@ -20,6 +29,10 @@ class MainTestCase(unittest.TestCase):
         with open("../../test/assets/data/csv/trader.csv", "r", encoding="utf8") as trader_data:
             self.trader_data_csv = trader_data.read()
 
+        dataspace_hash = "ddc99ce6cbdf8c7fb0a5ae5a7eaea2f28c4e9ca24c9b4593f977218f9fd9c9e6"
+        self.add_data_request = aiengine_pb2.AddDataRequest(
+            pod="trader", csv_data=self.trader_data_csv, dataspace_hash=dataspace_hash)
+
     def test_inference_not_initialized(self):
         req = aiengine_pb2.InferenceRequest(pod="trader", tag="latest")
         resp = self.aiengine.GetInference(req, None)
@@ -34,11 +47,10 @@ class MainTestCase(unittest.TestCase):
         self.assertEqual(resp.result, "ok")
 
         # Step 2, load the csv data
-        resp = self.aiengine.AddData(
-            aiengine_pb2.AddDataRequest(pod="trader", csv_data=self.trader_data_csv),
-            None,
-        )
+        resp = self.aiengine.AddData(self.add_data_request, None)
         self.assertFalse(resp.error)
+
+        process_add_data(self)
 
         # Step 3, inference
         resp = self.aiengine.GetInference(
@@ -57,11 +69,10 @@ class MainTestCase(unittest.TestCase):
         self.assertEqual(resp.result, "ok")
 
         # Step 2, load the csv data
-        resp = self.aiengine.AddData(
-            aiengine_pb2.AddDataRequest(pod="trader", csv_data=self.trader_data_csv),
-            None,
-        )
+        resp = self.aiengine.AddData(self.add_data_request, None)
         self.assertFalse(resp.error)
+
+        process_add_data(self)
 
     def inference_time_test(self, inference_time, should_error):
         self.load_trader_with_data()
