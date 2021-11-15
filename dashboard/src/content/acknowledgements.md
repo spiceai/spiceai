@@ -203,9 +203,7 @@ github.com/google/flatbuffers/go, https://github.com/google/flatbuffers/blob/mas
 
 ## Node Packages
 
-Need to install the following packages:
-  license-checker
-Ok to proceed? (y) module name, license, repository
+module name, license, repository
 @babel/code-frame@7.10.4, MIT, https://github.com/babel/babel
 @babel/code-frame@7.12.11, MIT, https://github.com/babel/babel
 @babel/code-frame@7.12.13, MIT, https://github.com/babel/babel
@@ -330,7 +328,7 @@ Ok to proceed? (y) module name, license, repository
 @babel/plugin-transform-unicode-regex@7.12.13, MIT, https://github.com/babel/babel
 @babel/preset-env@7.12.1, MIT, https://github.com/babel/babel
 @babel/preset-env@7.12.17, MIT, https://github.com/babel/babel
-@babel/preset-modules@0.1.4, MIT, 
+@babel/preset-modules@0.1.4, MIT,
 @babel/preset-react@7.12.1, MIT, https://github.com/babel/babel
 @babel/preset-react@7.12.13, MIT, https://github.com/babel/babel
 @babel/preset-typescript@7.12.1, MIT, https://github.com/babel/babel
@@ -473,15 +471,15 @@ Ok to proceed? (y) module name, license, repository
 @typescript-eslint/visitor-keys@5.3.1, MIT, https://github.com/typescript-eslint/typescript-eslint
 @webassemblyjs/ast@1.9.0, MIT, https://github.com/xtuc/webassemblyjs
 @webassemblyjs/floating-point-hex-parser@1.9.0, MIT, https://github.com/xtuc/webassemblyjs
-@webassemblyjs/helper-api-error@1.9.0, MIT, 
+@webassemblyjs/helper-api-error@1.9.0, MIT,
 @webassemblyjs/helper-buffer@1.9.0, MIT, https://github.com/xtuc/webassemblyjs
 @webassemblyjs/helper-code-frame@1.9.0, MIT, https://github.com/xtuc/webassemblyjs
-@webassemblyjs/helper-fsm@1.9.0, ISC, 
+@webassemblyjs/helper-fsm@1.9.0, ISC,
 @webassemblyjs/helper-module-context@1.9.0, MIT, https://github.com/xtuc/webassemblyjs
 @webassemblyjs/helper-wasm-bytecode@1.9.0, MIT, https://github.com/xtuc/webassemblyjs
 @webassemblyjs/helper-wasm-section@1.9.0, MIT, https://github.com/xtuc/webassemblyjs
-@webassemblyjs/ieee754@1.9.0, MIT, 
-@webassemblyjs/leb128@1.9.0, MIT, 
+@webassemblyjs/ieee754@1.9.0, MIT,
+@webassemblyjs/leb128@1.9.0, MIT,
 @webassemblyjs/utf8@1.9.0, MIT, https://github.com/xtuc/webassemblyjs
 @webassemblyjs/wasm-edit@1.9.0, MIT, https://github.com/xtuc/webassemblyjs
 @webassemblyjs/wasm-gen@1.9.0, MIT, https://github.com/xtuc/webassemblyjs
@@ -803,7 +801,7 @@ domhandler@2.4.2, BSD-2-Clause, https://github.com/fb55/DomHandler
 domutils@1.7.0, BSD-2-Clause, https://github.com/FB55/domutils
 dot-case@3.0.4, MIT, https://github.com/blakeembrey/change-case
 dot-prop@5.3.0, MIT, https://github.com/sindresorhus/dot-prop
-dotenv-expand@5.1.0, BSD-2-Clause, 
+dotenv-expand@5.1.0, BSD-2-Clause,
 dotenv@8.2.0, BSD-2-Clause, https://github.com/motdotla/dotenv
 duplexer@0.1.2, MIT, https://github.com/Raynos/duplexer
 duplexify@3.7.1, MIT, https://github.com/mafintosh/duplexify
@@ -1253,9 +1251,9 @@ minimalistic-assert@1.0.1, ISC, https://github.com/calvinmetcalf/minimalistic-as
 minimalistic-crypto-utils@1.0.1, MIT, https://github.com/indutny/minimalistic-crypto-utils
 minimatch@3.0.4, ISC, https://github.com/isaacs/minimatch
 minimist@1.2.5, MIT, https://github.com/substack/minimist
-minipass-collect@1.0.2, ISC, 
+minipass-collect@1.0.2, ISC,
 minipass-flush@1.0.5, ISC, https://github.com/isaacs/minipass-flush
-minipass-pipeline@1.2.4, ISC, 
+minipass-pipeline@1.2.4, ISC,
 minipass@3.1.3, ISC, https://github.com/isaacs/minipass
 minizlib@2.1.2, MIT, https://github.com/isaacs/minizlib
 mississippi@3.0.0, BSD-2-Clause, https://github.com/maxogden/mississippi
@@ -1580,8 +1578,8 @@ resolve@2.0.0-next.3, MIT, https://github.com/browserify/resolve
 ret@0.1.15, MIT, https://github.com/fent/ret.js
 retry@0.12.0, MIT, https://github.com/tim-kos/node-retry
 reusify@1.0.4, MIT, https://github.com/mcollina/reusify
-rework-visit@1.0.0, MIT, 
-rework@1.0.1, MIT*, https://github.com/reworkcss/rework
+rework-visit@1.0.0, MIT,
+rework@1.0.1, MIT\*, https://github.com/reworkcss/rework
 rgb-regex@1.0.1, MIT, https://github.com/regexps/rgb-regex
 rgba-regex@1.0.0, MIT, https://github.com/johnotander/rgba-regex
 rimraf@2.7.1, ISC, https://github.com/isaacs/rimraf
@@ -1661,7 +1659,7 @@ spdx-expression-parse@3.0.1, MIT, https://github.com/jslicense/spdx-expression-p
 spdx-license-ids@3.0.7, CC0-1.0, https://github.com/jslicense/spdx-license-ids
 spdy-transport@3.0.0, MIT, https://github.com/spdy-http2/spdy-transport
 spdy@4.0.2, MIT, https://github.com/indutny/node-spdy
-spice.ai-dashboard@0.1.0, UNLICENSED, 
+spice.ai-dashboard@0.1.0, UNLICENSED,
 split-string@3.1.0, MIT, https://github.com/jonschlinkert/split-string
 split@0.3.3, MIT, https://github.com/dominictarr/split
 sprintf-js@1.0.3, BSD-3-Clause, https://github.com/alexei/sprintf.js
