@@ -11,29 +11,32 @@ Werkzeug, 2.0.1, BSD License, Armin Ronacher, https://palletsprojects.com/p/werk
 absl-py, 0.13.0, Apache Software License, The Abseil Authors, https://github.com/abseil/abseil-py
 astunparse, 1.6.3, BSD License, UNKNOWN, https://github.com/simonpercivall/astunparse
 attrs, 21.2.0, MIT License, Hynek Schlawack, https://www.attrs.org/
+cached-property, 1.5.2, BSD License, Daniel Greenfeld, https://github.com/pydanny/cached-property
 cachetools, 4.2.2, MIT License, Thomas Kemmer, https://github.com/tkem/cachetools/
 certifi, 2021.5.30, Mozilla Public License 2.0 (MPL 2.0), Kenneth Reitz, https://certifiio.readthedocs.io/en/latest/
 charset-normalizer, 2.0.4, MIT License, Ahmed TAHRI @Ousret, https://github.com/ousret/charset_normalizer
+clang, 5.0, University of Illinois/NCSA Open Source License, LLVM team, http://clang.llvm.org/
 flatbuffers, 1.12, Apache Software License, FlatBuffers Contributors, https://google.github.io/flatbuffers/
 gast, 0.4.0, BSD License, serge-sans-paille, https://github.com/serge-sans-paille/gast/
 google-auth, 1.35.0, Apache Software License, Google Cloud Platform, https://github.com/googleapis/google-auth-library-python
 google-auth-oauthlib, 0.4.5, Apache Software License, Google Cloud Platform, https://github.com/GoogleCloudPlatform/google-auth-library-python-oauthlib
 google-pasta, 0.2.0, Apache Software License, Nick Smith, https://github.com/google/pasta
-grpcio, 1.34.1, Apache Software License, The gRPC Authors, https://grpc.io
+grpcio, 1.41.0, Apache Software License, The gRPC Authors, https://grpc.io
 grpcio-tools, 1.34.1, Apache Software License, The gRPC Authors, https://grpc.io
 h5py, 3.1.0, BSD License, Andrew Collette, http://www.h5py.org
 humanize, 3.11.0, MIT License, Jason Moiron, https://github.com/jmoiron/humanize
 idna, 3.2, BSD License, Kim Davies, https://github.com/kjd/idna
+importlib-metadata, 4.8.2, Apache Software License, Jason R. Coombs, https://github.com/python/importlib_metadata
 iniconfig, 1.1.1, MIT License, Ronny Pfannschmidt, Holger Krekel, http://github.com/RonnyPfannschmidt/iniconfig
 jupyter-client, 6.1.12, BSD License, Jupyter Development Team, https://jupyter.org
 jupyter-core, 4.7.1, BSD License, Jupyter Development Team, https://jupyter.org
-keras-nightly, 2.5.0.dev2021032900, Apache Software License, Google Inc., https://keras.io/
+keras, 2.7.0, Apache Software License, Keras team, https://keras.io/
+libclang, 12.0.0, Apache Software License, Tao He, https://github.com/sighingnow/libclang
 numpy, 1.19.5, BSD, Travis E. Oliphant et al., https://www.numpy.org
 oauthlib, 3.1.1, BSD License, The OAuthlib Community, https://github.com/oauthlib/oauthlib
 opt-einsum, 3.3.0, MIT, Daniel Smith, https://github.com/dgasmith/opt_einsum
 packaging, 21.0, Apache Software License; BSD License, Donald Stufft and individual contributors, https://github.com/pypa/packaging
 pandas, 1.3.2, BSD License, The Pandas Development Team, https://pandas.pydata.org
-pkg-resources, 0.0.0, UNKNOWN, UNKNOWN, UNKNOWN
 pluggy, 0.13.1, MIT License, Holger Krekel, https://github.com/pytest-dev/pluggy
 protobuf, 3.17.3, 3-Clause BSD License, UNKNOWN, https://developers.google.com/protocol-buffers/
 psutil, 5.8.0, BSD License, Giampaolo Rodola, https://github.com/giampaolo/psutil
@@ -53,8 +56,9 @@ six, 1.15.0, MIT License, Benjamin Peterson, https://github.com/benjaminp/six
 tensorboard, 2.6.0, Apache Software License, Google Inc., https://github.com/tensorflow/tensorboard
 tensorboard-data-server, 0.6.1, Apache Software License, Google Inc., https://github.com/tensorflow/tensorboard/tree/master/tensorboard/data/server
 tensorboard-plugin-wit, 1.8.0, Apache 2.0, Google Inc., https://whatif-tool.dev
-tensorflow, 2.5.1, Apache Software License, Google Inc., https://www.tensorflow.org/
-tensorflow-estimator, 2.5.0, Apache Software License, Google Inc., https://www.tensorflow.org/
+tensorflow, 2.7.0, Apache Software License, Google Inc., https://www.tensorflow.org/
+tensorflow-estimator, 2.7.0, Apache Software License, Google Inc., https://www.tensorflow.org/
+tensorflow-io-gcs-filesystem, 0.21.0, Apache Software License, Google Inc., https://github.com/tensorflow/io
 termcolor, 1.1.0, MIT License, Konstantin Lepa, http://pypi.python.org/pypi/termcolor
 toml, 0.10.2, MIT License, William Pearson, https://github.com/uiri/toml
 tornado, 6.1, Apache Software License, Facebook, http://www.tornadoweb.org/
@@ -62,135 +66,140 @@ traitlets, 5.1.0, BSD License, IPython Development Team, https://github.com/ipyt
 typing-extensions, 3.7.4.3, Python Software Foundation License, Guido van Rossum, Jukka Lehtosalo, Lukasz Langa, Michael Lee, https://github.com/python/typing/blob/master/typing_extensions/README.rst
 urllib3, 1.26.6, MIT License, Andrey Petrov, https://urllib3.readthedocs.io/
 wrapt, 1.12.1, BSD License, Graham Dumpleton, https://github.com/GrahamDumpleton/wrapt
+zipp, 3.6.0, MIT License, Jason R. Coombs, https://github.com/jaraco/zipp
 
 ## Go Modules
 
-github.com/spf13/cast, https://github.com/spf13/cast/blob/master/LICENSE, MIT
-github.com/subosito/gotenv, https://github.com/subosito/gotenv/blob/master/LICENSE, MIT
-go.uber.org/zap, Unknown, MIT
-github.com/benbjohnson/immutable, https://github.com/benbjohnson/immutable/blob/master/LICENSE, MIT
-go.skia.org/infra/go, Unknown, BSD-3-Clause
-google.golang.org/grpc, Unknown, Apache-2.0
-golang.org/x/net, Unknown, BSD-3-Clause
-github.com/pkg/errors, https://github.com/pkg/errors/blob/master/LICENSE, BSD-2-Clause
-github.com/google/flatbuffers/go, https://github.com/google/flatbuffers/blob/master/go/LICENSE.txt, Apache-2.0
-github.com/google/go-cmp/cmp, https://github.com/google/go-cmp/blob/master/cmp/LICENSE, BSD-3-Clause
-github.com/andreyvit/diff, https://github.com/andreyvit/diff/blob/master/LICENSE, MIT
-github.com/opentracing/opentracing-go, https://github.com/opentracing/opentracing-go/blob/master/LICENSE, Apache-2.0
-github.com/xeipuuv/gojsonpointer, https://github.com/xeipuuv/gojsonpointer/blob/master/LICENSE-APACHE-2.0.txt, Apache-2.0
-github.com/spiceai/data-components-contrib, https://github.com/spiceai/data-components-contrib/blob/master/LICENSE, MIT
-github.com/xeipuuv/gojsonschema, https://github.com/xeipuuv/gojsonschema/blob/master/LICENSE-APACHE-2.0.txt, Apache-2.0
-github.com/jcgregorio/logger, https://github.com/jcgregorio/logger/blob/master/LICENSE, Apache-2.0
-github.com/hashicorp/errwrap, https://github.com/hashicorp/errwrap/blob/master/LICENSE, MPL-2.0
-github.com/spf13/cobra, https://github.com/spf13/cobra/blob/master/LICENSE.txt, Apache-2.0
-github.com/cespare/xxhash/v2, https://github.com/cespare/xxhash/blob/master/v2/LICENSE.txt, MIT
-github.com/fsnotify/fsnotify, https://github.com/fsnotify/fsnotify/blob/master/LICENSE, BSD-3-Clause
-gopkg.in/ini.v1, Unknown, Apache-2.0
-github.com/influxdata/influxdb-client-go, https://github.com/influxdata/influxdb-client-go/blob/master/LICENSE, MIT
-github.com/uber/jaeger-client-go, https://github.com/uber/jaeger-client-go/blob/master/LICENSE, Apache-2.0
-github.com/spiceai/spiceai, https://github.com/haardvark/spiceai/blob/master/LICENSE, Apache-2.0
-github.com/spf13/jwalterweatherman, https://github.com/spf13/jwalterweatherman/blob/master/LICENSE, MIT
-gopkg.in/yaml.v2, Unknown, Apache-2.0
-go.uber.org/multierr, Unknown, MIT
 golang.org/x/xerrors, Unknown, BSD-3-Clause
-github.com/gofrs/uuid, https://github.com/gofrs/uuid/blob/master/LICENSE, MIT
-github.com/zeebo/bencode, https://github.com/zeebo/bencode/blob/master/LICENSE, MIT
-golang.org/x/sys, Unknown, BSD-3-Clause
-golang.org/x/text, Unknown, BSD-3-Clause
-github.com/golang/protobuf, https://github.com/golang/protobuf/blob/master/LICENSE, BSD-3-Clause
-github.com/influxdata/flux, https://github.com/influxdata/flux/blob/master/LICENSE, MIT
-github.com/uber/jaeger-lib/metrics, https://github.com/uber/jaeger-lib/blob/master/metrics/LICENSE, Apache-2.0
-github.com/jcgregorio/slog, https://github.com/jcgregorio/slog/blob/master/LICENSE, Apache-2.0
-github.com/logrusorgru/aurora, https://github.com/logrusorgru/aurora/blob/master/LICENSE, Unlicense
-github.com/magiconair/properties, https://github.com/magiconair/properties/blob/master/LICENSE.md, BSD-2-Clause
-github.com/hashicorp/go-retryablehttp, https://github.com/hashicorp/go-retryablehttp/blob/master/LICENSE, MPL-2.0
-github.com/pelletier/go-toml, https://github.com/pelletier/go-toml/blob/master/LICENSE, Apache-2.0
-github.com/apache/arrow/go/arrow, https://github.com/apache/arrow/blob/master/go/arrow/LICENSE.txt, Apache-2.0
-github.com/hashicorp/hcl, https://github.com/hashicorp/hcl/blob/master/LICENSE, MPL-2.0
-github.com/hashicorp/go-multierror, https://github.com/hashicorp/go-multierror/blob/master/LICENSE, MPL-2.0
-github.com/mitchellh/mapstructure, https://github.com/mitchellh/mapstructure/blob/master/LICENSE, MIT
-github.com/alecthomas/jsonschema, https://github.com/alecthomas/jsonschema/blob/master/COPYING, MIT
-github.com/xeipuuv/gojsonreference, https://github.com/xeipuuv/gojsonreference/blob/master/LICENSE-APACHE-2.0.txt, Apache-2.0
-github.com/hashicorp/go-cleanhttp, https://github.com/hashicorp/go-cleanhttp/blob/master/LICENSE, MPL-2.0
-github.com/spf13/viper, https://github.com/spf13/viper/blob/master/LICENSE, MIT
-golang.org/x/mod/semver, Unknown, BSD-3-Clause
-github.com/influxdata/line-protocol, https://github.com/influxdata/line-protocol/blob/master/LICENSE, MIT
-github.com/spf13/afero, https://github.com/spf13/afero/blob/master/LICENSE.txt, Apache-2.0
-google.golang.org/protobuf, Unknown, BSD-3-Clause
-google.golang.org/genproto/googleapis/rpc/status, Unknown, Apache-2.0
-golang.org/x/sync/errgroup, Unknown, BSD-3-Clause
-go.uber.org/atomic, Unknown, MIT
-gopkg.in/natefinch/lumberjack.v2, Unknown, MIT
-github.com/apache/arrow/go/arrow/internal/cpu, https://github.com/apache/arrow/blob/master/go/arrow/internal/cpu/README.md, Apache-2.0
-github.com/iancoleman/orderedmap, https://github.com/iancoleman/orderedmap/blob/master/LICENSE, MIT
-github.com/spf13/pflag, https://github.com/spf13/pflag/blob/master/LICENSE, BSD-3-Clause
-github.com/deepmap/oapi-codegen/pkg, https://github.com/deepmap/oapi-codegen/blob/master/pkg/LICENSE, Apache-2.0
-github.com/sergi/go-diff/diffmatchpatch, https://github.com/sergi/go-diff/blob/master/diffmatchpatch/LICENSE, MIT
-github.com/influxdata/influxdb-client-go, https://github.com/influxdata/influxdb-client-go/blob/master/LICENSE, MIT
-google.golang.org/protobuf, Unknown, BSD-3-Clause
-go.uber.org/zap, Unknown, MIT
-github.com/apache/arrow/go/arrow, https://github.com/apache/arrow/blob/master/go/arrow/LICENSE.txt, Apache-2.0
-github.com/google/go-cmp/cmp, https://github.com/google/go-cmp/blob/master/cmp/LICENSE, BSD-3-Clause
-github.com/hashicorp/go-multierror, https://github.com/hashicorp/go-multierror/blob/master/LICENSE, MPL-2.0
-github.com/hashicorp/errwrap, https://github.com/hashicorp/errwrap/blob/master/LICENSE, MPL-2.0
-github.com/fasthttp/router, https://github.com/fasthttp/router/blob/master/LICENSE, BSD-3-Clause
-github.com/savsgio/gotils, https://github.com/savsgio/gotils/blob/master/LICENSE, Apache-2.0
-github.com/mitchellh/mapstructure, https://github.com/mitchellh/mapstructure/blob/master/LICENSE, MIT
-go.uber.org/multierr, Unknown, MIT
-github.com/iancoleman/orderedmap, https://github.com/iancoleman/orderedmap/blob/master/LICENSE, MIT
-github.com/xeipuuv/gojsonreference, https://github.com/xeipuuv/gojsonreference/blob/master/LICENSE-APACHE-2.0.txt, Apache-2.0
-github.com/hashicorp/hcl, https://github.com/hashicorp/hcl/blob/master/LICENSE, MPL-2.0
-github.com/golang/protobuf, https://github.com/golang/protobuf/blob/master/LICENSE, BSD-3-Clause
-go.uber.org/atomic, Unknown, MIT
-gopkg.in/natefinch/lumberjack.v2, Unknown, MIT
-github.com/apache/arrow/go/arrow/internal/cpu, https://github.com/apache/arrow/blob/master/go/arrow/internal/cpu/README.md, Apache-2.0
-github.com/andreyvit/diff, https://github.com/andreyvit/diff/blob/master/LICENSE, MIT
-gopkg.in/yaml.v2, Unknown, Apache-2.0
-google.golang.org/grpc, Unknown, Apache-2.0
 github.com/opentracing/opentracing-go, https://github.com/opentracing/opentracing-go/blob/master/LICENSE, Apache-2.0
-github.com/alecthomas/jsonschema, https://github.com/alecthomas/jsonschema/blob/master/COPYING, MIT
-github.com/gofrs/uuid, https://github.com/gofrs/uuid/blob/master/LICENSE, MIT
-github.com/sergi/go-diff/diffmatchpatch, https://github.com/sergi/go-diff/blob/master/diffmatchpatch/LICENSE, MIT
-github.com/spiceai/spiceai, https://github.com/haardvark/spiceai/blob/master/LICENSE, Apache-2.0
-gopkg.in/ini.v1, Unknown, Apache-2.0
-golang.org/x/mod/semver, Unknown, BSD-3-Clause
-github.com/influxdata/flux, https://github.com/influxdata/flux/blob/master/LICENSE, MIT
-github.com/jcgregorio/logger, https://github.com/jcgregorio/logger/blob/master/LICENSE, Apache-2.0
-github.com/jcgregorio/slog, https://github.com/jcgregorio/slog/blob/master/LICENSE, Apache-2.0
-golang.org/x/sys, Unknown, BSD-3-Clause
-golang.org/x/net, Unknown, BSD-3-Clause
-google.golang.org/genproto/googleapis/rpc/status, Unknown, Apache-2.0
-github.com/google/flatbuffers/go, https://github.com/google/flatbuffers/blob/master/go/LICENSE.txt, Apache-2.0
-github.com/uber/jaeger-client-go, https://github.com/uber/jaeger-client-go/blob/master/LICENSE, Apache-2.0
-github.com/uber/jaeger-lib/metrics, https://github.com/uber/jaeger-lib/blob/master/metrics/LICENSE, Apache-2.0
-github.com/magiconair/properties, https://github.com/magiconair/properties/blob/master/LICENSE.md, BSD-2-Clause
-github.com/spiceai/data-components-contrib, https://github.com/spiceai/data-components-contrib/blob/master/LICENSE, MIT
-github.com/logrusorgru/aurora, https://github.com/logrusorgru/aurora/blob/master/LICENSE, Unlicense
-github.com/spf13/cobra, https://github.com/spf13/cobra/blob/master/LICENSE.txt, Apache-2.0
-github.com/spf13/jwalterweatherman, https://github.com/spf13/jwalterweatherman/blob/master/LICENSE, MIT
-github.com/deepmap/oapi-codegen/pkg, https://github.com/deepmap/oapi-codegen/blob/master/pkg/LICENSE, Apache-2.0
-github.com/pkg/errors, https://github.com/pkg/errors/blob/master/LICENSE, BSD-2-Clause
-github.com/benbjohnson/immutable, https://github.com/benbjohnson/immutable/blob/master/LICENSE, MIT
-github.com/xeipuuv/gojsonpointer, https://github.com/xeipuuv/gojsonpointer/blob/master/LICENSE-APACHE-2.0.txt, Apache-2.0
-github.com/valyala/fasthttp, https://github.com/valyala/fasthttp/blob/master/LICENSE, MIT
-github.com/fsnotify/fsnotify, https://github.com/fsnotify/fsnotify/blob/master/LICENSE, BSD-3-Clause
-golang.org/x/text, Unknown, BSD-3-Clause
-go.skia.org/infra/go, Unknown, BSD-3-Clause
-github.com/spf13/pflag, https://github.com/spf13/pflag/blob/master/LICENSE, BSD-3-Clause
-github.com/cespare/xxhash/v2, https://github.com/cespare/xxhash/blob/master/v2/LICENSE.txt, MIT
-golang.org/x/xerrors, Unknown, BSD-3-Clause
-github.com/pelletier/go-toml, https://github.com/pelletier/go-toml/blob/master/LICENSE, Apache-2.0
-golang.org/x/sync/errgroup, Unknown, BSD-3-Clause
+go.uber.org/zap, Unknown, MIT
 github.com/valyala/bytebufferpool, https://github.com/valyala/bytebufferpool/blob/master/LICENSE, MIT
-github.com/xeipuuv/gojsonschema, https://github.com/xeipuuv/gojsonschema/blob/master/LICENSE-APACHE-2.0.txt, Apache-2.0
-github.com/zeebo/bencode, https://github.com/zeebo/bencode/blob/master/LICENSE, MIT
-github.com/spf13/cast, https://github.com/spf13/cast/blob/master/LICENSE, MIT
-github.com/subosito/gotenv, https://github.com/subosito/gotenv/blob/master/LICENSE, MIT
-github.com/influxdata/line-protocol, https://github.com/influxdata/line-protocol/blob/master/LICENSE, MIT
-github.com/andybalholm/brotli, https://github.com/andybalholm/brotli/blob/master/LICENSE, MIT
 github.com/klauspost/compress, https://github.com/klauspost/compress/blob/master/LICENSE, BSD-3-Clause
-github.com/spf13/viper, https://github.com/spf13/viper/blob/master/LICENSE, MIT
+github.com/mattn/go-runewidth, https://github.com/mattn/go-runewidth/blob/master/LICENSE, MIT
+github.com/pkg/errors, https://github.com/pkg/errors/blob/master/LICENSE, BSD-2-Clause
+github.com/influxdata/flux, https://github.com/influxdata/flux/blob/master/LICENSE, MIT
+github.com/gofrs/uuid, https://github.com/gofrs/uuid/blob/master/LICENSE, MIT
+github.com/cespare/xxhash/v2, https://github.com/cespare/xxhash/blob/master/v2/LICENSE.txt, MIT
+github.com/andybalholm/brotli, https://github.com/andybalholm/brotli/blob/master/LICENSE, MIT
+github.com/spf13/pflag, https://github.com/spf13/pflag/blob/master/LICENSE, BSD-3-Clause
+github.com/gorilla/websocket, https://github.com/gorilla/websocket/blob/master/LICENSE, BSD-2-Clause
+github.com/influxdata/line-protocol, https://github.com/influxdata/line-protocol/blob/master/LICENSE, MIT
+github.com/apache/arrow/go/arrow, https://github.com/apache/arrow/blob/master/go/arrow/LICENSE.txt, Apache-2.0
+github.com/google/go-cmp/cmp, https://github.com/google/go-cmp/blob/master/cmp/LICENSE, BSD-3-Clause
+golang.org/x/text, Unknown, BSD-3-Clause
+github.com/sergi/go-diff/diffmatchpatch, https://github.com/sergi/go-diff/blob/master/diffmatchpatch/LICENSE, MIT
+github.com/valyala/fasthttp, https://github.com/valyala/fasthttp/blob/master/LICENSE, MIT
+gopkg.in/yaml.v2, Unknown, Apache-2.0
+github.com/spiceai/data-components-contrib, https://github.com/spiceai/data-components-contrib/blob/master/LICENSE, MIT
+github.com/dghubble/sling, https://github.com/dghubble/sling/blob/master/LICENSE, MIT
+github.com/savsgio/gotils, https://github.com/savsgio/gotils/blob/master/LICENSE, Apache-2.0
+github.com/spf13/cobra, https://github.com/spf13/cobra/blob/master/LICENSE.txt, Apache-2.0
+github.com/spf13/cast, https://github.com/spf13/cast/blob/master/LICENSE, MIT
+github.com/gocarina/gocsv, https://github.com/gocarina/gocsv/blob/master/LICENSE, MIT
+github.com/olekukonko/tablewriter, https://github.com/olekukonko/tablewriter/blob/master/LICENSE.md, MIT
+github.com/magiconair/properties, https://github.com/magiconair/properties/blob/master/LICENSE.md, BSD-2-Clause
+golang.org/x/mod/semver, Unknown, BSD-3-Clause
+github.com/dghubble/go-twitter/twitter, https://github.com/dghubble/go-twitter/blob/master/twitter/LICENSE, MIT
+google.golang.org/grpc, Unknown, Apache-2.0
+golang.org/x/net, Unknown, BSD-3-Clause
+github.com/pelletier/go-toml, https://github.com/pelletier/go-toml/blob/master/LICENSE, Apache-2.0
+github.com/fsnotify/fsnotify, https://github.com/fsnotify/fsnotify/blob/master/LICENSE, BSD-3-Clause
+golang.org/x/sys, Unknown, BSD-3-Clause
+github.com/mitchellh/mapstructure, https://github.com/mitchellh/mapstructure/blob/master/LICENSE, MIT
 github.com/spf13/afero, https://github.com/spf13/afero/blob/master/LICENSE.txt, Apache-2.0
+github.com/dghubble/oauth1, https://github.com/dghubble/oauth1/blob/master/LICENSE, MIT
+github.com/andreyvit/diff, https://github.com/andreyvit/diff/blob/master/LICENSE, MIT
+github.com/hashicorp/go-retryablehttp, https://github.com/hashicorp/go-retryablehttp/blob/master/LICENSE, MPL-2.0
+github.com/spf13/viper, https://github.com/spf13/viper/blob/master/LICENSE, MIT
+github.com/spf13/jwalterweatherman, https://github.com/spf13/jwalterweatherman/blob/master/LICENSE, MIT
+github.com/google/go-querystring/query, https://github.com/google/go-querystring/blob/master/query/LICENSE, BSD-3-Clause
+github.com/spiceai/spiceai, Unknown, Apache-2.0
+github.com/deepmap/oapi-codegen/pkg, https://github.com/deepmap/oapi-codegen/blob/master/pkg/LICENSE, Apache-2.0
+github.com/hashicorp/go-cleanhttp, https://github.com/hashicorp/go-cleanhttp/blob/master/LICENSE, MPL-2.0
+google.golang.org/protobuf, Unknown, BSD-3-Clause
+github.com/benbjohnson/immutable, https://github.com/benbjohnson/immutable/blob/master/LICENSE, MIT
+github.com/uber/jaeger-client-go, https://github.com/uber/jaeger-client-go/blob/master/LICENSE, Apache-2.0
+gopkg.in/natefinch/lumberjack.v2, Unknown, MIT
+github.com/influxdata/influxdb-client-go, https://github.com/influxdata/influxdb-client-go/blob/master/LICENSE, MIT
+github.com/subosito/gotenv, https://github.com/subosito/gotenv/blob/master/LICENSE, MIT
+github.com/apache/arrow/go/arrow/internal/cpu, https://github.com/apache/arrow/blob/master/go/arrow/internal/cpu/README.md, Apache-2.0
+github.com/google/flatbuffers/go, https://github.com/google/flatbuffers/blob/master/go/LICENSE.txt, Apache-2.0
+go.uber.org/atomic, Unknown, MIT
+go.uber.org/multierr, Unknown, MIT
+google.golang.org/genproto/googleapis/rpc/status, Unknown, Apache-2.0
+github.com/logrusorgru/aurora, https://github.com/logrusorgru/aurora/blob/master/LICENSE, Unlicense
+github.com/golang/protobuf, https://github.com/golang/protobuf/blob/master/LICENSE, BSD-3-Clause
+github.com/cenkalti/backoff, https://github.com/cenkalti/backoff/blob/master/LICENSE, MIT
+github.com/uber/jaeger-lib/metrics, https://github.com/uber/jaeger-lib/blob/master/metrics/LICENSE, Apache-2.0
+gopkg.in/ini.v1, Unknown, Apache-2.0
+golang.org/x/sync/errgroup, Unknown, BSD-3-Clause
+github.com/fasthttp/router, https://github.com/fasthttp/router/blob/master/LICENSE, BSD-3-Clause
+github.com/hashicorp/hcl, https://github.com/hashicorp/hcl/blob/master/LICENSE, MPL-2.0
+golang.org/x/text, Unknown, BSD-3-Clause
+go.uber.org/zap, Unknown, MIT
+google.golang.org/genproto/googleapis/rpc/status, Unknown, Apache-2.0
+github.com/hashicorp/go-cleanhttp, https://github.com/hashicorp/go-cleanhttp/blob/master/LICENSE, MPL-2.0
+github.com/andybalholm/brotli, https://github.com/andybalholm/brotli/blob/master/LICENSE, MIT
+github.com/mitchellh/mapstructure, https://github.com/mitchellh/mapstructure/blob/master/LICENSE, MIT
+github.com/pelletier/go-toml, https://github.com/pelletier/go-toml/blob/master/LICENSE, Apache-2.0
+go.uber.org/multierr, Unknown, MIT
+github.com/influxdata/flux, https://github.com/influxdata/flux/blob/master/LICENSE, MIT
+github.com/spiceai/spiceai, Unknown, Apache-2.0
+github.com/gorilla/websocket, https://github.com/gorilla/websocket/blob/master/LICENSE, BSD-2-Clause
+github.com/dghubble/oauth1, https://github.com/dghubble/oauth1/blob/master/LICENSE, MIT
+github.com/valyala/fasthttp, https://github.com/valyala/fasthttp/blob/master/LICENSE, MIT
+github.com/spf13/cast, https://github.com/spf13/cast/blob/master/LICENSE, MIT
+github.com/klauspost/compress, https://github.com/klauspost/compress/blob/master/LICENSE, BSD-3-Clause
+github.com/google/go-cmp/cmp, https://github.com/google/go-cmp/blob/master/cmp/LICENSE, BSD-3-Clause
+github.com/andreyvit/diff, https://github.com/andreyvit/diff/blob/master/LICENSE, MIT
+github.com/opentracing/opentracing-go, https://github.com/opentracing/opentracing-go/blob/master/LICENSE, Apache-2.0
+golang.org/x/sys, Unknown, BSD-3-Clause
+github.com/mattn/go-runewidth, https://github.com/mattn/go-runewidth/blob/master/LICENSE, MIT
+github.com/influxdata/influxdb-client-go, https://github.com/influxdata/influxdb-client-go/blob/master/LICENSE, MIT
+github.com/google/go-querystring/query, https://github.com/google/go-querystring/blob/master/query/LICENSE, BSD-3-Clause
+github.com/cespare/xxhash/v2, https://github.com/cespare/xxhash/blob/master/v2/LICENSE.txt, MIT
+github.com/fasthttp/router, https://github.com/fasthttp/router/blob/master/LICENSE, BSD-3-Clause
+github.com/spf13/cobra, https://github.com/spf13/cobra/blob/master/LICENSE.txt, Apache-2.0
+github.com/spf13/afero, https://github.com/spf13/afero/blob/master/LICENSE.txt, Apache-2.0
+github.com/spiceai/data-components-contrib, https://github.com/spiceai/data-components-contrib/blob/master/LICENSE, MIT
+github.com/dghubble/go-twitter/twitter, https://github.com/dghubble/go-twitter/blob/master/twitter/LICENSE, MIT
+github.com/logrusorgru/aurora, https://github.com/logrusorgru/aurora/blob/master/LICENSE, Unlicense
+github.com/savsgio/gotils, https://github.com/savsgio/gotils/blob/master/LICENSE, Apache-2.0
+github.com/fsnotify/fsnotify, https://github.com/fsnotify/fsnotify/blob/master/LICENSE, BSD-3-Clause
+github.com/sergi/go-diff/diffmatchpatch, https://github.com/sergi/go-diff/blob/master/diffmatchpatch/LICENSE, MIT
+github.com/uber/jaeger-lib/metrics, https://github.com/uber/jaeger-lib/blob/master/metrics/LICENSE, Apache-2.0
+github.com/gocarina/gocsv, https://github.com/gocarina/gocsv/blob/master/LICENSE, MIT
+github.com/cenkalti/backoff, https://github.com/cenkalti/backoff/blob/master/LICENSE, MIT
+github.com/uber/jaeger-client-go, https://github.com/uber/jaeger-client-go/blob/master/LICENSE, Apache-2.0
+gopkg.in/natefinch/lumberjack.v2, Unknown, MIT
+github.com/deepmap/oapi-codegen/pkg, https://github.com/deepmap/oapi-codegen/blob/master/pkg/LICENSE, Apache-2.0
+go.uber.org/atomic, Unknown, MIT
+google.golang.org/protobuf, Unknown, BSD-3-Clause
+github.com/subosito/gotenv, https://github.com/subosito/gotenv/blob/master/LICENSE, MIT
+gopkg.in/yaml.v2, Unknown, Apache-2.0
+github.com/olekukonko/tablewriter, https://github.com/olekukonko/tablewriter/blob/master/LICENSE.md, MIT
+golang.org/x/mod/semver, Unknown, BSD-3-Clause
+github.com/spf13/jwalterweatherman, https://github.com/spf13/jwalterweatherman/blob/master/LICENSE, MIT
+gopkg.in/ini.v1, Unknown, Apache-2.0
+github.com/apache/arrow/go/arrow/internal/cpu, https://github.com/apache/arrow/blob/master/go/arrow/internal/cpu/README.md, Apache-2.0
+github.com/golang/protobuf, https://github.com/golang/protobuf/blob/master/LICENSE, BSD-3-Clause
+golang.org/x/sync/errgroup, Unknown, BSD-3-Clause
+github.com/dghubble/sling, https://github.com/dghubble/sling/blob/master/LICENSE, MIT
+golang.org/x/net, Unknown, BSD-3-Clause
+github.com/hashicorp/go-retryablehttp, https://github.com/hashicorp/go-retryablehttp/blob/master/LICENSE, MPL-2.0
+github.com/hashicorp/hcl, https://github.com/hashicorp/hcl/blob/master/LICENSE, MPL-2.0
+github.com/pkg/errors, https://github.com/pkg/errors/blob/master/LICENSE, BSD-2-Clause
+github.com/apache/arrow/go/arrow, https://github.com/apache/arrow/blob/master/go/arrow/LICENSE.txt, Apache-2.0
+github.com/gofrs/uuid, https://github.com/gofrs/uuid/blob/master/LICENSE, MIT
+github.com/spf13/viper, https://github.com/spf13/viper/blob/master/LICENSE, MIT
+golang.org/x/xerrors, Unknown, BSD-3-Clause
+github.com/valyala/bytebufferpool, https://github.com/valyala/bytebufferpool/blob/master/LICENSE, MIT
+github.com/benbjohnson/immutable, https://github.com/benbjohnson/immutable/blob/master/LICENSE, MIT
+google.golang.org/grpc, Unknown, Apache-2.0
+github.com/spf13/pflag, https://github.com/spf13/pflag/blob/master/LICENSE, BSD-3-Clause
+github.com/magiconair/properties, https://github.com/magiconair/properties/blob/master/LICENSE.md, BSD-2-Clause
+github.com/influxdata/line-protocol, https://github.com/influxdata/line-protocol/blob/master/LICENSE, MIT
+github.com/google/flatbuffers/go, https://github.com/google/flatbuffers/blob/master/go/LICENSE.txt, Apache-2.0
 
 ## Node Packages
 
@@ -198,21 +207,28 @@ module name, license, repository
 @babel/code-frame@7.10.4, MIT, https://github.com/babel/babel
 @babel/code-frame@7.12.11, MIT, https://github.com/babel/babel
 @babel/code-frame@7.12.13, MIT, https://github.com/babel/babel
+@babel/code-frame@7.15.8, MIT, https://github.com/babel/babel
 @babel/compat-data@7.12.13, MIT, https://github.com/babel/babel
 @babel/core@7.12.17, MIT, https://github.com/babel/babel
 @babel/core@7.12.3, MIT, https://github.com/babel/babel
 @babel/generator@7.12.17, MIT, https://github.com/babel/babel
+@babel/generator@7.15.8, MIT, https://github.com/babel/babel
 @babel/helper-annotate-as-pure@7.12.13, MIT, https://github.com/babel/babel
+@babel/helper-annotate-as-pure@7.15.4, MIT, https://github.com/babel/babel
 @babel/helper-builder-binary-assignment-operator-visitor@7.12.13, MIT, https://github.com/babel/babel
 @babel/helper-compilation-targets@7.12.17, MIT, https://github.com/babel/babel
 @babel/helper-create-class-features-plugin@7.12.17, MIT, https://github.com/babel/babel
 @babel/helper-create-regexp-features-plugin@7.12.17, MIT, https://github.com/babel/babel
 @babel/helper-explode-assignable-expression@7.12.13, MIT, https://github.com/babel/babel
 @babel/helper-function-name@7.12.13, MIT, https://github.com/babel/babel
+@babel/helper-function-name@7.15.4, MIT, https://github.com/babel/babel
 @babel/helper-get-function-arity@7.12.13, MIT, https://github.com/babel/babel
+@babel/helper-get-function-arity@7.15.4, MIT, https://github.com/babel/babel
 @babel/helper-hoist-variables@7.12.13, MIT, https://github.com/babel/babel
+@babel/helper-hoist-variables@7.15.4, MIT, https://github.com/babel/babel
 @babel/helper-member-expression-to-functions@7.12.17, MIT, https://github.com/babel/babel
 @babel/helper-module-imports@7.12.13, MIT, https://github.com/babel/babel
+@babel/helper-module-imports@7.15.4, MIT, https://github.com/babel/babel
 @babel/helper-module-transforms@7.12.17, MIT, https://github.com/babel/babel
 @babel/helper-optimise-call-expression@7.12.13, MIT, https://github.com/babel/babel
 @babel/helper-plugin-utils@7.12.13, MIT, https://github.com/babel/babel
@@ -221,12 +237,16 @@ module name, license, repository
 @babel/helper-simple-access@7.12.13, MIT, https://github.com/babel/babel
 @babel/helper-skip-transparent-expression-wrappers@7.12.1, MIT, https://github.com/babel/babel
 @babel/helper-split-export-declaration@7.12.13, MIT, https://github.com/babel/babel
+@babel/helper-split-export-declaration@7.15.4, MIT, https://github.com/babel/babel
 @babel/helper-validator-identifier@7.12.11, MIT, https://github.com/babel/babel
+@babel/helper-validator-identifier@7.15.7, MIT, https://github.com/babel/babel
 @babel/helper-validator-option@7.12.17, MIT, https://github.com/babel/babel
 @babel/helper-wrap-function@7.12.13, MIT, https://github.com/babel/babel
 @babel/helpers@7.12.17, MIT, https://github.com/babel/babel
 @babel/highlight@7.12.13, MIT, https://github.com/babel/babel
+@babel/highlight@7.14.5, MIT, https://github.com/babel/babel
 @babel/parser@7.12.17, MIT, https://github.com/babel/babel
+@babel/parser@7.15.8, MIT, https://github.com/babel/babel
 @babel/plugin-proposal-async-generator-functions@7.12.13, MIT, https://github.com/babel/babel
 @babel/plugin-proposal-class-properties@7.12.1, MIT, https://github.com/babel/babel
 @babel/plugin-proposal-class-properties@7.12.13, MIT, https://github.com/babel/babel
@@ -308,7 +328,7 @@ module name, license, repository
 @babel/plugin-transform-unicode-regex@7.12.13, MIT, https://github.com/babel/babel
 @babel/preset-env@7.12.1, MIT, https://github.com/babel/babel
 @babel/preset-env@7.12.17, MIT, https://github.com/babel/babel
-@babel/preset-modules@0.1.4, MIT, 
+@babel/preset-modules@0.1.4, MIT,
 @babel/preset-react@7.12.1, MIT, https://github.com/babel/babel
 @babel/preset-react@7.12.13, MIT, https://github.com/babel/babel
 @babel/preset-typescript@7.12.1, MIT, https://github.com/babel/babel
@@ -317,14 +337,22 @@ module name, license, repository
 @babel/runtime@7.12.18, MIT, https://github.com/babel/babel
 @babel/runtime@7.15.3, MIT, https://github.com/babel/babel
 @babel/template@7.12.13, MIT, https://github.com/babel/babel
+@babel/template@7.15.4, MIT, https://github.com/babel/babel
 @babel/traverse@7.12.17, MIT, https://github.com/babel/babel
+@babel/traverse@7.15.4, MIT, https://github.com/babel/babel
 @babel/types@7.12.17, MIT, https://github.com/babel/babel
+@babel/types@7.15.6, MIT, https://github.com/babel/babel
 @bcoe/v8-coverage@0.2.3, MIT, https://github.com/demurgos/v8-coverage
 @cnakazawa/watch@1.0.4, Apache-2.0, https://github.com/mikeal/watch
 @csstools/convert-colors@1.4.0, CC0-1.0, https://github.com/jonathantneal/convert-colors
 @csstools/normalize.css@10.1.0, CC0-1.0, https://github.com/csstools/normalize.css
+@emotion/is-prop-valid@0.8.8, MIT, https://github.com/emotion-js/emotion/tree/master/packages/is-prop-valid
+@emotion/memoize@0.7.4, MIT, https://github.com/emotion-js/emotion/tree/master/packages/memoize
+@emotion/stylis@0.8.5, MIT, https://github.com/emotion-js/emotion/tree/master/packages/stylis
+@emotion/unitless@0.7.5, MIT, https://github.com/emotion-js/emotion/tree/master/packages/unitless
 @eslint/eslintrc@0.3.0, MIT, https://github.com/eslint/eslintrc
 @eslint/eslintrc@0.4.3, MIT, https://github.com/eslint/eslintrc
+@glideapps/glide-data-grid@3.0.3, MIT, https://github.com/glideapps/glide-data-grid
 @hapi/address@2.1.4, BSD-3-Clause, https://github.com/hapijs/address
 @hapi/bourne@1.3.2, BSD-3-Clause, https://github.com/hapijs/bourne
 @hapi/hoek@8.5.1, BSD-3-Clause, https://github.com/hapijs/hoek
@@ -397,7 +425,7 @@ module name, license, repository
 @types/json-schema@7.0.7, MIT, https://github.com/DefinitelyTyped/DefinitelyTyped
 @types/json-schema@7.0.9, MIT, https://github.com/DefinitelyTyped/DefinitelyTyped
 @types/json5@0.0.29, MIT, https://github.com/DefinitelyTyped/DefinitelyTyped
-@types/marked@3.0.0, MIT, https://github.com/DefinitelyTyped/DefinitelyTyped
+@types/marked@3.0.3, MIT, https://github.com/DefinitelyTyped/DefinitelyTyped
 @types/minimatch@3.0.3, MIT, https://github.com/DefinitelyTyped/DefinitelyTyped
 @types/node@12.20.19, MIT, https://github.com/DefinitelyTyped/DefinitelyTyped
 @types/node@14.14.31, MIT, https://github.com/DefinitelyTyped/DefinitelyTyped
@@ -424,34 +452,34 @@ module name, license, repository
 @types/yargs@15.0.13, MIT, https://github.com/DefinitelyTyped/DefinitelyTyped
 @types/yargs@16.0.4, MIT, https://github.com/DefinitelyTyped/DefinitelyTyped
 @typescript-eslint/eslint-plugin@4.15.2, MIT, https://github.com/typescript-eslint/typescript-eslint
-@typescript-eslint/eslint-plugin@4.29.2, MIT, https://github.com/typescript-eslint/typescript-eslint
+@typescript-eslint/eslint-plugin@5.3.1, MIT, https://github.com/typescript-eslint/typescript-eslint
 @typescript-eslint/experimental-utils@3.10.1, MIT, https://github.com/typescript-eslint/typescript-eslint
 @typescript-eslint/experimental-utils@4.15.2, MIT, https://github.com/typescript-eslint/typescript-eslint
-@typescript-eslint/experimental-utils@4.29.2, MIT, https://github.com/typescript-eslint/typescript-eslint
+@typescript-eslint/experimental-utils@5.3.1, MIT, https://github.com/typescript-eslint/typescript-eslint
 @typescript-eslint/parser@4.15.2, BSD-2-Clause, https://github.com/typescript-eslint/typescript-eslint
-@typescript-eslint/parser@4.29.2, BSD-2-Clause, https://github.com/typescript-eslint/typescript-eslint
+@typescript-eslint/parser@5.3.1, BSD-2-Clause, https://github.com/typescript-eslint/typescript-eslint
 @typescript-eslint/scope-manager@4.15.2, MIT, https://github.com/typescript-eslint/typescript-eslint
-@typescript-eslint/scope-manager@4.29.2, MIT, https://github.com/typescript-eslint/typescript-eslint
+@typescript-eslint/scope-manager@5.3.1, MIT, https://github.com/typescript-eslint/typescript-eslint
 @typescript-eslint/types@3.10.1, MIT, https://github.com/typescript-eslint/typescript-eslint
 @typescript-eslint/types@4.15.2, MIT, https://github.com/typescript-eslint/typescript-eslint
-@typescript-eslint/types@4.29.2, MIT, https://github.com/typescript-eslint/typescript-eslint
+@typescript-eslint/types@5.3.1, MIT, https://github.com/typescript-eslint/typescript-eslint
 @typescript-eslint/typescript-estree@3.10.1, BSD-2-Clause, https://github.com/typescript-eslint/typescript-eslint
 @typescript-eslint/typescript-estree@4.15.2, BSD-2-Clause, https://github.com/typescript-eslint/typescript-eslint
-@typescript-eslint/typescript-estree@4.29.2, BSD-2-Clause, https://github.com/typescript-eslint/typescript-eslint
+@typescript-eslint/typescript-estree@5.3.1, BSD-2-Clause, https://github.com/typescript-eslint/typescript-eslint
 @typescript-eslint/visitor-keys@3.10.1, MIT, https://github.com/typescript-eslint/typescript-eslint
 @typescript-eslint/visitor-keys@4.15.2, MIT, https://github.com/typescript-eslint/typescript-eslint
-@typescript-eslint/visitor-keys@4.29.2, MIT, https://github.com/typescript-eslint/typescript-eslint
+@typescript-eslint/visitor-keys@5.3.1, MIT, https://github.com/typescript-eslint/typescript-eslint
 @webassemblyjs/ast@1.9.0, MIT, https://github.com/xtuc/webassemblyjs
 @webassemblyjs/floating-point-hex-parser@1.9.0, MIT, https://github.com/xtuc/webassemblyjs
-@webassemblyjs/helper-api-error@1.9.0, MIT, 
+@webassemblyjs/helper-api-error@1.9.0, MIT,
 @webassemblyjs/helper-buffer@1.9.0, MIT, https://github.com/xtuc/webassemblyjs
 @webassemblyjs/helper-code-frame@1.9.0, MIT, https://github.com/xtuc/webassemblyjs
-@webassemblyjs/helper-fsm@1.9.0, ISC, 
+@webassemblyjs/helper-fsm@1.9.0, ISC,
 @webassemblyjs/helper-module-context@1.9.0, MIT, https://github.com/xtuc/webassemblyjs
 @webassemblyjs/helper-wasm-bytecode@1.9.0, MIT, https://github.com/xtuc/webassemblyjs
 @webassemblyjs/helper-wasm-section@1.9.0, MIT, https://github.com/xtuc/webassemblyjs
-@webassemblyjs/ieee754@1.9.0, MIT, 
-@webassemblyjs/leb128@1.9.0, MIT, 
+@webassemblyjs/ieee754@1.9.0, MIT,
+@webassemblyjs/leb128@1.9.0, MIT,
 @webassemblyjs/utf8@1.9.0, MIT, https://github.com/xtuc/webassemblyjs
 @webassemblyjs/wasm-edit@1.9.0, MIT, https://github.com/xtuc/webassemblyjs
 @webassemblyjs/wasm-gen@1.9.0, MIT, https://github.com/xtuc/webassemblyjs
@@ -524,7 +552,7 @@ async@2.6.3, MIT, https://github.com/caolan/async
 asynckit@0.4.0, MIT, https://github.com/alexindigo/asynckit
 at-least-node@1.0.0, ISC, https://github.com/RyanZim/at-least-node
 atob@2.1.2, (MIT OR Apache-2.0), git://git.coolaj86.com/coolaj86/atob.js
-autoprefixer@10.3.1, MIT, https://github.com/postcss/autoprefixer
+autoprefixer@10.4.0, MIT, https://github.com/postcss/autoprefixer
 autoprefixer@9.8.6, MIT, https://github.com/postcss/autoprefixer
 aws-sign2@0.7.0, Apache-2.0, https://github.com/mikeal/aws-sign
 aws4@1.11.0, MIT, https://github.com/mhart/aws4
@@ -539,6 +567,8 @@ babel-plugin-istanbul@6.0.0, BSD-3-Clause, https://github.com/istanbuljs/babel-p
 babel-plugin-jest-hoist@26.6.2, MIT, https://github.com/facebook/jest
 babel-plugin-macros@2.8.0, MIT, https://github.com/kentcdodds/babel-plugin-macros
 babel-plugin-named-asset-import@0.3.7, MIT, https://github.com/facebook/create-react-app
+babel-plugin-styled-components@1.13.3, MIT, https://github.com/styled-components/babel-plugin-styled-components
+babel-plugin-syntax-jsx@6.18.0, MIT, https://github.com/babel/babel/tree/master/packages/babel-plugin-syntax-jsx
 babel-plugin-syntax-object-rest-spread@6.13.0, MIT, https://github.com/babel/babel/tree/master/packages/babel-plugin-syntax-object-rest-spread
 babel-plugin-transform-object-rest-spread@6.26.0, MIT, https://github.com/babel/babel/tree/master/packages/babel-plugin-transform-object-rest-spread
 babel-plugin-transform-react-remove-prop-types@0.4.24, MIT, https://github.com/oliviertassinari/babel-plugin-transform-react-remove-prop-types
@@ -556,6 +586,7 @@ bfj@7.0.2, MIT, git+https://gitlab.com/philbooth/bfj
 big.js@5.2.2, MIT, https://github.com/MikeMcl/big.js
 binary-extensions@1.13.1, MIT, https://github.com/sindresorhus/binary-extensions
 binary-extensions@2.2.0, MIT, https://github.com/sindresorhus/binary-extensions
+bindings@1.5.0, MIT, https://github.com/TooTallNate/node-bindings
 bluebird@3.7.2, MIT, https://github.com/petkaantonov/bluebird
 bn.js@4.11.9, MIT, https://github.com/indutny/bn.js
 bn.js@5.1.3, MIT, https://github.com/indutny/bn.js
@@ -575,7 +606,7 @@ browserify-sign@4.2.1, ISC, https://github.com/crypto-browserify/browserify-sign
 browserify-zlib@0.2.0, MIT, https://github.com/devongovett/browserify-zlib
 browserslist@4.14.2, MIT, https://github.com/browserslist/browserslist
 browserslist@4.16.3, MIT, https://github.com/browserslist/browserslist
-browserslist@4.16.8, MIT, https://github.com/browserslist/browserslist
+browserslist@4.17.6, MIT, https://github.com/browserslist/browserslist
 bser@2.1.1, Apache-2.0, https://github.com/facebook/watchman
 buffer-from@1.1.1, MIT, https://github.com/LinusU/buffer-from
 buffer-indexof@1.1.1, MIT, https://github.com/soldair/node-buffer-indexof
@@ -597,8 +628,10 @@ camel-case@4.1.2, MIT, https://github.com/blakeembrey/change-case
 camelcase-css@2.0.1, MIT, https://github.com/stevenvachon/camelcase-css
 camelcase@5.3.1, MIT, https://github.com/sindresorhus/camelcase
 camelcase@6.2.0, MIT, https://github.com/sindresorhus/camelcase
+camelize@1.0.0, MIT, https://github.com/substack/camelize
 caniuse-api@3.0.0, MIT, https://github.com/nyalab/caniuse-api
 caniuse-lite@1.0.30001251, CC-BY-4.0, https://github.com/browserslist/caniuse-lite
+caniuse-lite@1.0.30001279, CC-BY-4.0, https://github.com/browserslist/caniuse-lite
 capture-exit@2.0.0, ISC, https://github.com/stefanpenner/capture-exit
 case-sensitive-paths-webpack-plugin@2.3.0, MIT, https://github.com/Urthen/case-sensitive-paths-webpack-plugin
 caseless@0.12.0, Apache-2.0, https://github.com/mikeal/caseless
@@ -608,7 +641,7 @@ chalk@3.0.0, MIT, https://github.com/chalk/chalk
 chalk@4.1.0, MIT, https://github.com/chalk/chalk
 chalk@4.1.2, MIT, https://github.com/chalk/chalk
 char-regex@1.0.2, MIT, https://github.com/Richienb/char-regex
-chart.js@3.5.1, MIT, https://github.com/chartjs/Chart.js
+chart.js@3.6.0, MIT, https://github.com/chartjs/Chart.js
 check-types@11.1.2, MIT, git+https://gitlab.com/philbooth/check-types.js
 chokidar-cli@3.0.0, MIT, https://github.com/open-npm-tools/chokidar-cli
 chokidar@2.1.8, MIT, https://github.com/paulmillr/chokidar
@@ -621,6 +654,7 @@ ci-info@2.0.0, MIT, https://github.com/watson/ci-info
 cipher-base@1.0.4, MIT, https://github.com/crypto-browserify/cipher-base
 cjs-module-lexer@0.6.0, MIT, https://github.com/guybedford/cjs-module-lexer
 class-utils@0.3.6, MIT, https://github.com/jonschlinkert/class-utils
+classnames@2.3.1, MIT, https://github.com/JedWatson/classnames
 clean-css@4.2.3, MIT, https://github.com/jakubpawlowicz/clean-css
 clean-stack@2.2.0, MIT, https://github.com/sindresorhus/clean-stack
 cliui@5.0.0, ISC, https://github.com/yargs/cliui
@@ -635,7 +669,7 @@ color-name@1.1.3, MIT, https://github.com/dfcreative/color-name
 color-name@1.1.4, MIT, https://github.com/colorjs/color-name
 color-string@1.6.0, MIT, https://github.com/Qix-/color-string
 color@3.1.3, MIT, https://github.com/Qix-/color
-color@3.2.1, MIT, https://github.com/Qix-/color
+color@4.0.1, MIT, https://github.com/Qix-/color
 colorette@1.3.0, MIT, https://github.com/jorgebucaran/colorette
 combined-stream@1.0.8, MIT, https://github.com/felixge/node-combined-stream
 commander@2.20.3, MIT, https://github.com/tj/commander.js
@@ -662,6 +696,7 @@ cookie-signature@1.0.6, MIT, https://github.com/visionmedia/node-cookie-signatur
 cookie@0.4.0, MIT, https://github.com/jshttp/cookie
 copy-concurrently@1.0.5, ISC, https://github.com/npm/copy-concurrently
 copy-descriptor@0.1.1, MIT, https://github.com/jonschlinkert/copy-descriptor
+copy-to-clipboard@3.3.1, MIT, https://github.com/sudodoki/copy-to-clipboard
 core-js-compat@3.9.0, MIT, https://github.com/zloirock/core-js
 core-js-pure@3.9.0, MIT, https://github.com/zloirock/core-js
 core-js@2.6.12, MIT, https://github.com/zloirock/core-js
@@ -670,6 +705,7 @@ core-util-is@1.0.2, MIT, https://github.com/isaacs/core-util-is
 cosmiconfig@5.2.1, MIT, https://github.com/davidtheclark/cosmiconfig
 cosmiconfig@6.0.0, MIT, https://github.com/davidtheclark/cosmiconfig
 cosmiconfig@7.0.0, MIT, https://github.com/davidtheclark/cosmiconfig
+cosmiconfig@7.0.1, MIT, https://github.com/davidtheclark/cosmiconfig
 create-ecdh@4.0.4, MIT, https://github.com/crypto-browserify/createECDH
 create-hash@1.2.0, MIT, https://github.com/crypto-browserify/createHash
 create-hmac@1.1.7, MIT, https://github.com/crypto-browserify/createHmac
@@ -679,6 +715,7 @@ cross-spawn@7.0.3, MIT, https://github.com/moxystudio/node-cross-spawn
 crypto-browserify@3.12.0, MIT, https://github.com/crypto-browserify/crypto-browserify
 crypto-random-string@1.0.0, MIT, https://github.com/sindresorhus/crypto-random-string
 css-blank-pseudo@0.1.4, CC0-1.0, https://github.com/csstools/css-blank-pseudo
+css-color-keywords@1.0.0, ISC, https://github.com/sonicdoe/css-color-keywords
 css-color-names@0.0.4, MIT, https://github.com/bahamas10/css-color-names
 css-declaration-sorter@4.0.1, MIT, https://github.com/Siilwyn/css-declaration-sorter
 css-has-pseudo@0.10.0, CC0-1.0, https://github.com/csstools/css-has-pseudo
@@ -686,6 +723,7 @@ css-loader@4.3.0, MIT, https://github.com/webpack-contrib/css-loader
 css-prefers-color-scheme@3.1.1, CC0-1.0, https://github.com/csstools/css-prefers-color-scheme
 css-select-base-adapter@0.1.1, MIT, https://github.com/nrkn/css-select-base-adapter
 css-select@2.1.0, BSD-2-Clause, https://github.com/fb55/css-select
+css-to-react-native@3.0.0, MIT, https://github.com/styled-components/css-to-react-native
 css-tree@1.0.0-alpha.37, MIT, https://github.com/csstree/csstree
 css-tree@1.1.2, MIT, https://github.com/csstree/csstree
 css-unit-converter@1.1.2, MIT, https://github.com/andyjansson/css-unit-converter
@@ -744,6 +782,7 @@ diff-sequences@26.6.2, MIT, https://github.com/facebook/jest
 diff-sequences@27.0.6, MIT, https://github.com/facebook/jest
 diffie-hellman@5.0.3, MIT, https://github.com/crypto-browserify/diffie-hellman
 dir-glob@3.0.1, MIT, https://github.com/kevva/dir-glob
+direction@1.0.4, MIT, https://github.com/wooorm/direction
 dlv@1.1.3, MIT, https://github.com/developit/dlv
 dns-equal@1.0.0, MIT, https://github.com/watson/dns-equal
 dns-packet@1.3.4, MIT, https://github.com/mafintosh/dns-packet
@@ -762,7 +801,7 @@ domhandler@2.4.2, BSD-2-Clause, https://github.com/fb55/DomHandler
 domutils@1.7.0, BSD-2-Clause, https://github.com/FB55/domutils
 dot-case@3.0.4, MIT, https://github.com/blakeembrey/change-case
 dot-prop@5.3.0, MIT, https://github.com/sindresorhus/dot-prop
-dotenv-expand@5.1.0, BSD-2-Clause, 
+dotenv-expand@5.1.0, BSD-2-Clause,
 dotenv@8.2.0, BSD-2-Clause, https://github.com/motdotla/dotenv
 duplexer@0.1.2, MIT, https://github.com/Raynos/duplexer
 duplexify@3.7.1, MIT, https://github.com/mafintosh/duplexify
@@ -770,7 +809,7 @@ ecc-jsbn@0.1.2, MIT, https://github.com/quartzjer/ecc-jsbn
 ee-first@1.1.1, MIT, https://github.com/jonathanong/ee-first
 ejs@2.7.4, Apache-2.0, https://github.com/mde/ejs
 electron-to-chromium@1.3.671, ISC, https://github.com/kilian/electron-to-chromium
-electron-to-chromium@1.3.812, ISC, https://github.com/kilian/electron-to-chromium
+electron-to-chromium@1.3.893, ISC, https://github.com/kilian/electron-to-chromium
 elliptic@6.5.4, MIT, https://github.com/indutny/elliptic
 emittery@0.7.2, MIT, https://github.com/sindresorhus/emittery
 emoji-regex@7.0.3, MIT, https://github.com/mathiasbynens/emoji-regex
@@ -819,6 +858,7 @@ eslint-utils@2.1.0, MIT, https://github.com/mysticatea/eslint-utils
 eslint-utils@3.0.0, MIT, https://github.com/mysticatea/eslint-utils
 eslint-visitor-keys@1.3.0, Apache-2.0, https://github.com/eslint/eslint-visitor-keys
 eslint-visitor-keys@2.0.0, Apache-2.0, https://github.com/eslint/eslint-visitor-keys
+eslint-visitor-keys@3.1.0, Apache-2.0, https://github.com/eslint/eslint-visitor-keys
 eslint-webpack-plugin@2.5.2, MIT, https://github.com/webpack-contrib/eslint-webpack-plugin
 eslint@7.20.0, MIT, https://github.com/eslint/eslint
 eslint@7.32.0, MIT, https://github.com/eslint/eslint
@@ -863,6 +903,7 @@ fb-watchman@2.0.1, Apache-2.0, https://github.com/facebook/watchman
 figgy-pudding@3.5.2, ISC, https://github.com/npm/figgy-pudding
 file-entry-cache@6.0.1, MIT, https://github.com/royriojas/file-entry-cache
 file-loader@6.1.1, MIT, https://github.com/webpack-contrib/file-loader
+file-uri-to-path@1.0.0, MIT, https://github.com/TooTallNate/file-uri-to-path
 filesize@6.1.0, BSD-3-Clause, https://github.com/avoidwork/filesize.js
 fill-range@4.0.0, MIT, https://github.com/jonschlinkert/fill-range
 fill-range@7.0.1, MIT, https://github.com/jonschlinkert/fill-range
@@ -895,6 +936,8 @@ fs-extra@9.1.0, MIT, https://github.com/jprichardson/node-fs-extra
 fs-minipass@2.1.0, ISC, https://github.com/npm/fs-minipass
 fs-write-stream-atomic@1.0.10, ISC, https://github.com/npm/fs-write-stream-atomic
 fs.realpath@1.0.0, ISC, https://github.com/isaacs/fs.realpath
+fsevents@1.2.13, MIT, https://github.com/strongloop/fsevents
+fsevents@2.3.2, MIT, https://github.com/fsevents/fsevents
 function-bind@1.1.1, MIT, https://github.com/Raynos/function-bind
 functional-red-black-tree@1.0.1, MIT, https://github.com/mikolalysenko/functional-red-black-tree
 gensync@1.0.0-beta.2, MIT, https://github.com/loganfsmyth/gensync
@@ -909,7 +952,7 @@ getpass@0.1.7, MIT, https://github.com/arekinath/node-getpass
 glob-parent@3.1.0, ISC, https://github.com/es128/glob-parent
 glob-parent@5.1.1, ISC, https://github.com/gulpjs/glob-parent
 glob-parent@5.1.2, ISC, https://github.com/gulpjs/glob-parent
-glob-parent@6.0.1, ISC, https://github.com/gulpjs/glob-parent
+glob-parent@6.0.2, ISC, https://github.com/gulpjs/glob-parent
 glob@7.1.6, ISC, https://github.com/isaacs/node-glob
 glob@7.1.7, ISC, https://github.com/isaacs/node-glob
 global-modules@2.0.0, MIT, https://github.com/jonschlinkert/global-modules
@@ -977,6 +1020,7 @@ ieee754@1.2.1, BSD-3-Clause, https://github.com/feross/ieee754
 iferr@0.1.5, MIT, https://github.com/shesek/iferr
 ignore@4.0.6, MIT, https://github.com/kaelzhang/node-ignore
 ignore@5.1.8, MIT, https://github.com/kaelzhang/node-ignore
+ignore@5.1.9, MIT, https://github.com/kaelzhang/node-ignore
 immer@8.0.1, MIT, https://github.com/immerjs/immer
 import-cwd@2.1.0, MIT, https://github.com/sindresorhus/import-cwd
 import-cwd@3.0.0, MIT, https://github.com/sindresorhus/import-cwd
@@ -1032,6 +1076,7 @@ is-fullwidth-code-point@3.0.0, MIT, https://github.com/sindresorhus/is-fullwidth
 is-generator-fn@2.1.0, MIT, https://github.com/sindresorhus/is-generator-fn
 is-glob@3.1.0, MIT, https://github.com/jonschlinkert/is-glob
 is-glob@4.0.1, MIT, https://github.com/micromatch/is-glob
+is-glob@4.0.3, MIT, https://github.com/micromatch/is-glob
 is-module@1.0.0, MIT, https://github.com/component/is-module
 is-negative-zero@2.0.1, MIT, https://github.com/inspect-js/is-negative-zero
 is-number-object@1.0.6, MIT, https://github.com/inspect-js/is-number-object
@@ -1178,7 +1223,7 @@ makeerror@1.0.11, BSD-3-Clause, https://github.com/daaku/nodejs-makeerror
 map-cache@0.2.2, MIT, https://github.com/jonschlinkert/map-cache
 map-stream@0.1.0, Custom: https://github.com/dominictarr/event-stream, https://github.com/dominictarr/map-stream
 map-visit@1.0.0, MIT, https://github.com/jonschlinkert/map-visit
-marked@3.0.3, MIT, https://github.com/markedjs/marked
+marked@3.0.8, MIT, https://github.com/markedjs/marked
 md5.js@1.3.5, MIT, https://github.com/crypto-browserify/md5.js
 mdn-data@2.0.14, CC0-1.0, https://github.com/mdn/data
 mdn-data@2.0.4, CC0-1.0, https://github.com/mdn/data
@@ -1206,9 +1251,9 @@ minimalistic-assert@1.0.1, ISC, https://github.com/calvinmetcalf/minimalistic-as
 minimalistic-crypto-utils@1.0.1, MIT, https://github.com/indutny/minimalistic-crypto-utils
 minimatch@3.0.4, ISC, https://github.com/isaacs/minimatch
 minimist@1.2.5, MIT, https://github.com/substack/minimist
-minipass-collect@1.0.2, ISC, 
+minipass-collect@1.0.2, ISC,
 minipass-flush@1.0.5, ISC, https://github.com/isaacs/minipass-flush
-minipass-pipeline@1.2.4, ISC, 
+minipass-pipeline@1.2.4, ISC,
 minipass@3.1.3, ISC, https://github.com/isaacs/minipass
 minizlib@2.1.2, MIT, https://github.com/isaacs/minizlib
 mississippi@3.0.0, BSD-2-Clause, https://github.com/maxogden/mississippi
@@ -1223,6 +1268,7 @@ ms@2.1.2, MIT, https://github.com/zeit/ms
 ms@2.1.3, MIT, https://github.com/vercel/ms
 multicast-dns-service-types@1.1.0, MIT, https://github.com/mafintosh/multicast-dns-service-types
 multicast-dns@6.2.3, MIT, https://github.com/mafintosh/multicast-dns
+nan@2.14.2, MIT, https://github.com/nodejs/nan
 nanoid@3.1.25, MIT, https://github.com/ai/nanoid
 nanomatch@1.2.13, MIT, https://github.com/micromatch/nanomatch
 native-url@0.2.6, Apache-2.0, https://github.com/GoogleChromeLabs/native-url
@@ -1239,7 +1285,7 @@ node-libs-browser@2.2.1, MIT, https://github.com/webpack/node-libs-browser
 node-modules-regexp@1.0.0, MIT, https://github.com/jamestalmage/node-modules-regexp
 node-notifier@8.0.1, MIT, https://github.com/mikaelbr/node-notifier
 node-releases@1.1.70, MIT, https://github.com/chicoxyzzy/node-releases
-node-releases@1.1.75, MIT, https://github.com/chicoxyzzy/node-releases
+node-releases@2.0.1, MIT, https://github.com/chicoxyzzy/node-releases
 normalize-package-data@2.5.0, BSD-2-Clause, https://github.com/npm/normalize-package-data
 normalize-path@2.1.1, MIT, https://github.com/jonschlinkert/normalize-path
 normalize-path@3.0.0, MIT, https://github.com/jonschlinkert/normalize-path
@@ -1323,6 +1369,7 @@ path-type@4.0.0, MIT, https://github.com/sindresorhus/path-type
 pause-stream@0.0.11, MIT, Apache2, https://github.com/dominictarr/pause-stream
 pbkdf2@3.1.1, MIT, https://github.com/crypto-browserify/pbkdf2
 performance-now@2.1.0, MIT, https://github.com/braveg1rl/performance-now
+picocolors@1.0.0, ISC, https://github.com/alexeyraspopov/picocolors
 picomatch@2.2.2, MIT, https://github.com/micromatch/picomatch
 picomatch@2.3.0, MIT, https://github.com/micromatch/picomatch
 pify@2.3.0, MIT, https://github.com/sindresorhus/pify
@@ -1381,7 +1428,7 @@ postcss-modules-extract-imports@2.0.0, ISC, https://github.com/css-modules/postc
 postcss-modules-local-by-default@3.0.3, MIT, https://github.com/css-modules/postcss-modules-local-by-default
 postcss-modules-scope@2.2.0, ISC, https://github.com/css-modules/postcss-modules-scope
 postcss-modules-values@3.0.0, ISC, https://github.com/css-modules/postcss-modules-values
-postcss-nested@5.0.5, MIT, https://github.com/postcss/postcss-nested
+postcss-nested@5.0.6, MIT, https://github.com/postcss/postcss-nested
 postcss-nesting@7.0.1, CC0-1.0, https://github.com/jonathantneal/postcss-nesting
 postcss-normalize-charset@4.0.1, MIT, https://github.com/cssnano/cssnano
 postcss-normalize-display-values@4.0.2, MIT, https://github.com/cssnano/cssnano
@@ -1465,14 +1512,18 @@ raw-body@2.4.0, MIT, https://github.com/stream-utils/raw-body
 react-app-polyfill@2.0.0, MIT, https://github.com/facebook/create-react-app
 react-dev-utils@11.0.4, MIT, https://github.com/facebook/create-react-app
 react-dom@17.0.2, MIT, https://github.com/facebook/react
+react-easy-swipe@0.0.21, MIT, https://github.com/leandrowd/react-easy-swipe
 react-error-overlay@6.0.9, MIT, https://github.com/facebook/create-react-app
 react-is@16.13.1, MIT, https://github.com/facebook/react
 react-is@17.0.1, MIT, https://github.com/facebook/react
+react-number-format@4.7.3, MIT, https://github.com/s-yadav/react-number-format
 react-refresh@0.8.3, MIT, https://github.com/facebook/react
+react-responsive-carousel@3.2.21, MIT, https://github.com/leandrowd/react-responsive-carousel
 react-router-dom@5.2.0, MIT, https://github.com/ReactTraining/react-router
 react-router@5.2.0, MIT, https://github.com/ReactTraining/react-router
 react-scripts@4.0.3, MIT, https://github.com/facebook/create-react-app
 react-sparklines@1.7.0, MIT, https://github.com/borisyankov/react-sparklines
+react-virtualized-auto-sizer@1.0.6, MIT, https://github.com/bvaughn/react-virtualized-auto-sizer
 react@17.0.2, MIT, https://github.com/facebook/react
 read-pkg-up@1.0.1, MIT, https://github.com/sindresorhus/read-pkg-up
 read-pkg-up@2.0.0, MIT, https://github.com/sindresorhus/read-pkg-up
@@ -1497,6 +1548,7 @@ regex-not@1.0.2, MIT, https://github.com/jonschlinkert/regex-not
 regex-parser@2.2.11, MIT, https://github.com/IonicaBizau/regex-parser.js
 regexp.prototype.flags@1.3.1, MIT, https://github.com/es-shims/RegExp.prototype.flags
 regexpp@3.1.0, MIT, https://github.com/mysticatea/regexpp
+regexpp@3.2.0, MIT, https://github.com/mysticatea/regexpp
 regexpu-core@4.7.1, MIT, https://github.com/mathiasbynens/regexpu-core
 regjsgen@0.5.2, MIT, https://github.com/bnjmnt4n/regjsgen
 regjsparser@0.6.7, BSD-2-Clause, https://github.com/jviereck/regjsparser
@@ -1526,8 +1578,8 @@ resolve@2.0.0-next.3, MIT, https://github.com/browserify/resolve
 ret@0.1.15, MIT, https://github.com/fent/ret.js
 retry@0.12.0, MIT, https://github.com/tim-kos/node-retry
 reusify@1.0.4, MIT, https://github.com/mcollina/reusify
-rework-visit@1.0.0, MIT, 
-rework@1.0.1, MIT*, https://github.com/reworkcss/rework
+rework-visit@1.0.0, MIT,
+rework@1.0.1, MIT\*, https://github.com/reworkcss/rework
 rgb-regex@1.0.1, MIT, https://github.com/regexps/rgb-regex
 rgba-regex@1.0.0, MIT, https://github.com/johnotander/rgba-regex
 rimraf@2.7.1, ISC, https://github.com/isaacs/rimraf
@@ -1572,6 +1624,7 @@ setimmediate@1.0.5, MIT, https://github.com/YuzuJS/setImmediate
 setprototypeof@1.1.0, ISC, https://github.com/wesleytodd/setprototypeof
 setprototypeof@1.1.1, ISC, https://github.com/wesleytodd/setprototypeof
 sha.js@2.4.11, (MIT AND BSD-3-Clause), https://github.com/crypto-browserify/sha.js
+shallowequal@1.1.0, MIT, https://github.com/dashed/shallowequal
 shebang-command@1.2.0, MIT, https://github.com/kevva/shebang-command
 shebang-command@2.0.0, MIT, https://github.com/kevva/shebang-command
 shebang-regex@1.0.0, MIT, https://github.com/sindresorhus/shebang-regex
@@ -1606,7 +1659,7 @@ spdx-expression-parse@3.0.1, MIT, https://github.com/jslicense/spdx-expression-p
 spdx-license-ids@3.0.7, CC0-1.0, https://github.com/jslicense/spdx-license-ids
 spdy-transport@3.0.0, MIT, https://github.com/spdy-http2/spdy-transport
 spdy@4.0.2, MIT, https://github.com/indutny/node-spdy
-spice.ai-dashboard@0.1.0, UNLICENSED, 
+spice.ai-dashboard@0.1.0, UNLICENSED,
 split-string@3.1.0, MIT, https://github.com/jonschlinkert/split-string
 split@0.3.3, MIT, https://github.com/dominictarr/split
 sprintf-js@1.0.3, BSD-3-Clause, https://github.com/alexei/sprintf.js
@@ -1651,6 +1704,7 @@ strip-final-newline@2.0.0, MIT, https://github.com/sindresorhus/strip-final-newl
 strip-indent@3.0.0, MIT, https://github.com/sindresorhus/strip-indent
 strip-json-comments@3.1.1, MIT, https://github.com/sindresorhus/strip-json-comments
 style-loader@1.3.0, MIT, https://github.com/webpack-contrib/style-loader
+styled-components@5.3.1, MIT, https://github.com/styled-components/styled-components
 stylehacks@4.0.3, MIT, https://github.com/cssnano/cssnano
 supports-color@2.0.0, MIT, https://github.com/chalk/supports-color
 supports-color@5.5.0, MIT, https://github.com/chalk/supports-color
@@ -1659,11 +1713,11 @@ supports-color@7.2.0, MIT, https://github.com/chalk/supports-color
 supports-hyperlinks@2.1.0, MIT, https://github.com/jamestalmage/supports-hyperlinks
 svg-parser@2.0.4, MIT, https://github.com/Rich-Harris/svg-parser
 svgo@1.3.2, MIT, https://github.com/svg/svgo
-swr@0.5.6, MIT, https://github.com/vercel/swr
+swr@1.0.1, MIT, https://github.com/vercel/swr
 symbol-tree@3.2.4, MIT, https://github.com/jsdom/js-symbol-tree
 table@6.0.7, BSD-3-Clause, https://github.com/gajus/table
 table@6.7.1, BSD-3-Clause, https://github.com/gajus/table
-tailwindcss@2.2.7, MIT, https://github.com/tailwindlabs/tailwindcss
+tailwindcss@2.2.19, MIT, https://github.com/tailwindlabs/tailwindcss
 tapable@1.1.3, MIT, https://github.com/webpack/tapable
 tar@6.1.10, ISC, https://github.com/npm/node-tar
 temp-dir@1.0.0, MIT, https://github.com/sindresorhus/temp-dir
@@ -1691,6 +1745,7 @@ to-object-path@0.3.0, MIT, https://github.com/jonschlinkert/to-object-path
 to-regex-range@2.1.1, MIT, https://github.com/micromatch/to-regex-range
 to-regex-range@5.0.1, MIT, https://github.com/micromatch/to-regex-range
 to-regex@3.0.2, MIT, https://github.com/jonschlinkert/to-regex
+toggle-selection@1.0.6, MIT, https://github.com/sudodoki/toggle-selection
 toidentifier@1.0.0, MIT, https://github.com/component/toidentifier
 tough-cookie@2.5.0, BSD-3-Clause, https://github.com/salesforce/tough-cookie
 tough-cookie@3.0.1, BSD-3-Clause, https://github.com/salesforce/tough-cookie
@@ -1718,7 +1773,7 @@ type@1.2.0, ISC, https://github.com/medikoo/type
 type@2.3.0, ISC, https://github.com/medikoo/type
 typedarray-to-buffer@3.1.5, MIT, https://github.com/feross/typedarray-to-buffer
 typedarray@0.0.6, MIT, https://github.com/substack/typedarray
-typescript@4.3.5, Apache-2.0, https://github.com/Microsoft/TypeScript
+typescript@4.4.4, Apache-2.0, https://github.com/Microsoft/TypeScript
 unbox-primitive@1.0.1, MIT, https://github.com/ljharb/unbox-primitive
 unicode-canonical-property-names-ecmascript@1.0.4, MIT, https://github.com/mathiasbynens/unicode-canonical-property-names-ecmascript
 unicode-match-property-ecmascript@1.0.4, MIT, https://github.com/mathiasbynens/unicode-match-property-ecmascript
