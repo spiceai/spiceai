@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react'
+import React, { useEffect, useState, useCallback } from 'react'
 import { useLocation } from 'react-router-dom'
 
 import PodHeader from '../components/app/PodHeader'
@@ -24,7 +24,7 @@ interface GridProps {
 }
 
 // TODO: Resize dynamically
-const gridWidth = 900
+const gridWidth = 1000
 const gridHeight = 600
 
 const PodPage: React.FunctionComponent<PodProps> = () => {
@@ -44,7 +44,7 @@ const PodPage: React.FunctionComponent<PodProps> = () => {
     }
 
     const cols: GridColumn[] = []
-    const timeCol = { title: 'time', width: 180 }
+    const timeCol = { title: 'time', width: 160 }
     cols.push(timeCol)
 
     const identifiersKeys = pod.identifiers || []
@@ -53,7 +53,7 @@ const PodPage: React.FunctionComponent<PodProps> = () => {
 
     const numColumns =
       identifiersKeys.length + measurementsKeys.length + categoriesKeys.length + 1 /* tags */
-    const colWidth = (gridWidth - timeCol.width - 17) / numColumns
+    const colWidth = (gridWidth - timeCol.width - 32) / numColumns
 
     for (const i of identifiersKeys) {
       cols.push({ title: getColumnTitle(i), width: colWidth })
@@ -163,6 +163,27 @@ const PodPage: React.FunctionComponent<PodProps> = () => {
     }
   }, [observations])
 
+  const onColumnResized = useCallback(
+    (col: GridColumn, newSize: number) => {
+      if (!gridProps) {
+        return
+      }
+
+      const cols = gridProps.columns || []
+      const index = cols.indexOf(col)
+      const newCols = [...cols]
+      newCols[index] = {
+        ...newCols[index],
+        width: newSize,
+      }
+      setGridProps({
+        columns: newCols,
+        gridDataFunc: gridProps.gridDataFunc,
+      })
+    },
+    [gridProps]
+  )
+
   return (
     <div className="flex flex-col flex-grow">
       {!podError && pod && (
@@ -180,6 +201,7 @@ const PodPage: React.FunctionComponent<PodProps> = () => {
                   columns={gridProps.columns}
                   rows={observations.length}
                   rowMarkers="number"
+                  onColumnResized={onColumnResized}
                 />
               </DataEditorContainer>
             )}
