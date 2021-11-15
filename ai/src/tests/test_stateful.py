@@ -5,7 +5,8 @@ import pandas as pd
 import numpy as np
 
 from connector.stateful import StatefulConnector
-from data import DataParam, DataManager
+from data_manager.base_manager import DataParam
+from data_manager.time_series_manager import TimeSeriesDataManager
 from proto.aiengine.v1 import aiengine_pb2
 
 
@@ -24,7 +25,7 @@ class StatefulConnectorTests(unittest.TestCase):
         self.interval = pd.to_timedelta(20, unit="s")
 
     def setUp(self):
-        self.data_manager = DataManager(
+        self.data_manager = TimeSeriesDataManager(
             param=DataParam(
                 epoch_time=self.epoch_time,
                 period_secs=self.period,
@@ -48,7 +49,7 @@ class StatefulConnectorTests(unittest.TestCase):
         )
 
         self.data_manager.merge_data(self.original_data)
-        self.data_manager.rewind()
+        self.data_manager.reset()
 
     def test_apply_action(self):
         action_effects = {
@@ -102,13 +103,13 @@ class StatefulConnectorTests(unittest.TestCase):
         self.assertTrue(np.isnan(actual_foo))
 
     def test_is_calling_merge_row(self):
-        original_fill_table = self.data_manager.fill_table
+        original_fill_table = self.data_manager._fill_table  # pylint: disable=protected-access
 
         def new_fill_table():
             raise Exception("Should not call this on apply_action")
 
         try:
-            self.data_manager.fill_table = new_fill_table
+            self.data_manager._fill_table = new_fill_table  # pylint: disable=protected-access
 
             action_effects = {
                 "foo_action": "foo += 5\nbar -= 1",
@@ -121,7 +122,7 @@ class StatefulConnectorTests(unittest.TestCase):
             is_valid = stateful_connector.apply_action(0, current_window)
             self.assertTrue(is_valid)
         finally:
-            self.data_manager.fill_table = original_fill_table
+            self.data_manager._fill_table = original_fill_table  # pylint: disable=protected-access
 
 
 if __name__ == "__main__":

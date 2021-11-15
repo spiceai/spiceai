@@ -1,36 +1,18 @@
 import math
-import threading
-from types import SimpleNamespace
 from typing import Dict, List
 
 import numpy as np
 import pandas as pd
 from pandas.core.computation import expressions
 
-from exception import RewardInvalidException
-from metrics import Metrics
-from proto.common.v1 import common_pb2
+from data_manager.base_manager import DataManagerBase, DataParam
 from proto.aiengine.v1 import aiengine_pb2
-from exec import somewhat_safe_exec, load_module_from_code
 
 
-class DataParam:
-    def __init__(self, epoch_time: pd.Timestamp, period_secs: pd.Timedelta, interval_secs: pd.Timedelta,
-                 granularity_secs: pd.Timedelta):
-        self.interval_secs = interval_secs
-        self.granularity_secs = granularity_secs
-        self.epoch_time = epoch_time
-        self.period_secs = period_secs
-        self.end_time = epoch_time + self.period_secs
-
-
-class DataManager:
+class TimeSeriesDataManager(DataManagerBase):
     def __init__(self, param: DataParam, fields: Dict[str, aiengine_pb2.FieldData], action_rewards: Dict[str, str],
                  actions_order: Dict[str, int], external_reward_funcs: str, laws: List[str]):
-        self.fields = fields
-        self.laws = laws
-        self.param = param
-        self.metrics = Metrics()
+        super().__init__(param, fields, action_rewards, actions_order, external_reward_funcs, laws)
 
         new_series = {}
         for field_name in fields:
@@ -39,28 +21,9 @@ class DataManager:
         self.massive_table_sparse = pd.DataFrame(new_series, index={self.param.epoch_time})
         self.massive_table_sparse = self.massive_table_sparse.resample(self.param.granularity_secs).mean()
         self.massive_table_filled = None
-        self.fill_table()
-
-        self.interpretations: common_pb2.IndexedInterpretations = None
+        self._fill_table()
 
         self.current_time: pd.Timestamp = None
-        self.action_rewards = action_rewards
-
-        self.action_names = [None] * len(actions_order)
-
-        for action in actions_order:
-            self.action_names[actions_order[action]] = action
-
-        self.reward_funcs_module = None
-        if len(external_reward_funcs) > 0:
-            self.reward_funcs_module = load_module_from_code(external_reward_funcs, "reward_funcs")
-
-            self.reward_funcs_module_actions = {}
-            for action_name in self.action_names:
-                reward_func_name = self.action_rewards[action_name]
-                reward_func = getattr(self.reward_funcs_module, reward_func_name)
-                self.reward_funcs_module_actions[action_name] = reward_func
-        self.table_lock = threading.Lock()
 
     def get_window_span(self):
         return math.floor(self.param.interval_secs / self.param.granularity_secs)
@@ -68,9 +31,9 @@ class DataManager:
     def overwrite_data(self, new_data):
         self.massive_table_sparse = new_data
 
-        self.fill_table()
+        self._fill_table()
 
-    def fill_table(self):
+    def _fill_table(self):
         self.metrics.start("resample")
         self.massive_table_sparse = self.massive_table_sparse.resample(self.param.granularity_secs).mean()
         self.metrics.end("resample")
@@ -95,7 +58,7 @@ class DataManager:
         )
         self.metrics.end("reindex")
 
-    def merge_row(self, new_row):
+    def _merge_row(self, new_row):
         index = new_row.index[0]
         for column_name in list(new_row.keys()):
             value = new_row[column_name].array[0]
@@ -124,17 +87,15 @@ class DataManager:
 
             if len(new_data) == 1 and new_data.index[0] in self.massive_table_sparse.index:
                 self.metrics.start("merge_row")
-                self.merge_row(new_data)
+                self._merge_row(new_data)
                 self.metrics.end("merge_row")
                 return
 
             self.metrics.start("combine")
-            self.massive_table_sparse = self.massive_table_sparse.combine(
-                new_data, combiner
-            )
+            self.massive_table_sparse = self.massive_table_sparse.combine(new_data, combiner)
             self.metrics.end("combine")
 
-            self.fill_table()
+            self._fill_table()
 
     def add_interpretations(self, interpretations):
         self.interpretations = interpretations
@@ -154,30 +115,12 @@ class DataManager:
     def get_shape(self):
         return np.shape([0] * self.get_window_span() * len(self.fields))
 
-    @staticmethod
-    def flatten_and_normalize_window(current_window):
-        result_array = []
-        for col in current_window:
-            denominator = np.linalg.norm(current_window[col])
-            denominator = 1 if denominator == 0 else denominator
-
-            norm_rows = current_window[col] / denominator
-
-            for row in norm_rows:
-                result_array.append(row)
-        return np.nan_to_num(result_array)
-
-    def get_current_window(self):
+    def get_current_window(self) -> pd.DataFrame:
         with self.table_lock:
             # This will get the nearest previous index that matches the timestamp,
             # so we don't need to specify the timestamps exactly
-            start_index = self.massive_table_filled.index.get_loc(
-                self.current_time - self.param.interval_secs, "ffill"
-            )
-            end_index = self.massive_table_filled.index.get_loc(
-                self.current_time, "ffill"
-            )
-
+            start_index = self.massive_table_filled.index.get_loc(self.current_time, "ffill")
+            end_index = self.massive_table_filled.index.get_loc(self.current_time + self.param.interval_secs, "ffill")
             return (
                 self.massive_table_filled.iloc[start_index:start_index + 1]
                 if self.get_window_span() == 1 else
@@ -202,53 +145,13 @@ class DataManager:
 
         return self.massive_table_filled.iloc[start_index:end_index]
 
-    def rewind(self):
-        self.current_time = self.param.epoch_time + self.param.interval_secs
+    def reset(self):
+        self.current_time = self.param.epoch_time
 
-    def advance(self):
-        if self.current_time >= self.param.end_time:
+    def advance(self) -> bool:
+        if self.current_time >= self.param.end_time - self.param.interval_secs:
             return False
 
         self.current_time += self.param.granularity_secs
 
         return True
-
-    def reward(
-        self,
-        prev_state_pd,
-        prev_state_interpretations,
-        new_state_pd,
-        new_state_intepretations,
-        action: int,
-    ) -> float:
-        prev_state_dict = {}
-        new_state_dict = {}
-        action_name = self.action_names[action]
-
-        for key in prev_state_pd:
-            prev_state_dict[key] = list(prev_state_pd[key])[-1]
-            new_state_dict[key] = list(new_state_pd[key])[-1]
-
-        if self.reward_funcs_module is not None:
-            reward_func = self.reward_funcs_module_actions[action_name]
-            return reward_func(prev_state_dict, prev_state_interpretations, new_state_dict, new_state_intepretations)
-
-        prev_state_dict["interpretations"] = prev_state_interpretations
-        new_state_dict["interpretations"] = new_state_intepretations
-
-        prev_state = SimpleNamespace(**prev_state_dict)
-        new_state = SimpleNamespace(**new_state_dict)
-
-        loc = {}
-        loc["prev_state"] = prev_state
-        loc["new_state"] = new_state
-        loc["print"] = print
-
-        reward_func = self.action_rewards[action_name]
-
-        try:
-            loc = somewhat_safe_exec(reward_func, loc)
-        except Exception as ex:
-            raise RewardInvalidException(repr(ex)) from ex
-
-        return loc["reward"]
