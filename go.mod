@@ -37,6 +37,7 @@ require (
 )
 
 require (
+	github.com/cnf/structhash v0.0.0-20201127153200-e1b16c1ebc08
 	github.com/gocarina/gocsv v0.0.0-20211020200912-82fc2684cc48
 	github.com/olekukonko/tablewriter v0.0.5
 	github.com/spf13/pflag v1.0.5
@@ -48,7 +49,6 @@ require (
 	github.com/benbjohnson/immutable v0.2.1 // indirect
 	github.com/cenkalti/backoff v2.2.1+incompatible // indirect
 	github.com/cespare/xxhash/v2 v2.1.2 // indirect
-	github.com/cnf/structhash v0.0.0-20201127153200-e1b16c1ebc08 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/dghubble/go-twitter v0.0.0-20210609183100-2fdbf421508e // indirect
 	github.com/dghubble/oauth1 v0.7.0 // indirect

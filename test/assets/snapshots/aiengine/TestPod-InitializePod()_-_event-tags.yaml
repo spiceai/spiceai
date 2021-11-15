@@ -32,5 +32,6 @@
   "datasources": [
     {}
   ],
+  "interpolation": true,
   "dataspace_hash": "d4216f194d6af2ad918f548b94d0035b80dca822c3043af1d63fcba5fc4a3d29"
 }

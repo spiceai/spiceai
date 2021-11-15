@@ -122,6 +122,10 @@ func (pod *Pod) Episodes() int {
 	return 10
 }
 
+func (pod *Pod) Interpolation() bool {
+	return pod.podParams.Interpolation
+}
+
 func (pod *Pod) CachedState() []*state.State {
 	var cachedState []*state.State
 	for _, ds := range pod.Dataspaces() {
@@ -602,6 +606,15 @@ func (pod *Pod) loadParams() error {
 				return err
 			}
 			podParams.Granularity = val
+		}
+
+		str, ok = pod.PodSpec.Params["interpolation"]
+		if ok {
+			val, err := strconv.ParseBool(str)
+			if err != nil {
+				return err
+			}
+			podParams.Interpolation = val
 		}
 	}
 

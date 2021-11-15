@@ -49,7 +49,8 @@ message InitRequest {
   repeated string laws = 9;
   repeated DataSource datasources = 10;
   string external_reward_funcs = 11;
-  string dataspace_hash = 12;
+  bool interpolation = 12;
+  string dataspace_hash = 13;
 }
 
 message Response {

@@ -59,5 +59,6 @@
   "datasources": [
     {}
   ],
+  "interpolation": true,
   "dataspace_hash": "ddc99ce6cbdf8c7fb0a5ae5a7eaea2f28c4e9ca24c9b4593f977218f9fd9c9e6"
 }

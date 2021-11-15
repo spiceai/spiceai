@@ -3,13 +3,13 @@ from typing import Dict
 
 import pandas as pd
 
-from data import DataManager
+from data_manager.base_manager import DataManagerBase
 from exception import LawInvalidException, DataSourceActionInvalidException
 from exec import somewhat_safe_exec, somewhat_safe_eval
 
 
 class StatefulConnector:
-    def __init__(self, data_manager: DataManager, action_effects: Dict[str, str]):
+    def __init__(self, data_manager: DataManagerBase, action_effects: Dict[str, str]):
         self.action_effects = action_effects
         self.data_manager = data_manager
 
