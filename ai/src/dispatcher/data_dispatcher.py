@@ -7,7 +7,7 @@ import pandas as pd
 
 from connector.manager import ConnectorManager
 from dispatcher import locks
-from data import DataManager
+from data_manager.base_manager import DataManagerBase
 from proto.aiengine.v1.aiengine_pb2 import AddDataRequest
 from train import Trainer
 
@@ -15,7 +15,7 @@ from train import Trainer
 class DataDispatcher:
     def __init__(self,
                  work_queue: multiprocessing.SimpleQueue,
-                 data_managers: Dict[str, DataManager],
+                 data_managers: Dict[str, DataManagerBase],
                  connector_managers: Dict[str, ConnectorManager]):
         self.loop_thread = None
         self.work_queue = work_queue
@@ -42,7 +42,7 @@ class DataDispatcher:
         new_data = new_data.set_index("time")
 
         with locks.INIT_LOCK:
-            data_manager: DataManager = self.data_managers[request.pod]
+            data_manager: DataManagerBase = self.data_managers[request.pod]
             for field in new_data.columns:
                 if field not in data_manager.fields.keys():
                     print(f"Unexpected field: '{field}'")

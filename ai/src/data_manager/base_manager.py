@@ -25,10 +25,11 @@ class DataParam:
 
 class DataManagerBase(ABC):
     def __init__(self, param: DataParam, fields: Dict[str, aiengine_pb2.FieldData], action_rewards: Dict[str, str],
-                 actions_order: Dict[str, int], external_reward_funcs: str, laws: List[str]):
+                 actions_order: Dict[str, int], external_reward_funcs: str, laws: List[str], dataspace_hash: str):
         self.fields = fields
         self.laws = laws
         self.param = param
+        self.dataspace_hash = dataspace_hash
         self.metrics = Metrics()
 
         self.data_frame = pd.DataFrame(columns=fields)
