@@ -35,5 +35,6 @@
       }
     }
   ],
-  "external_reward_funcs": "def calculate_price_change(curr_state: dict, new_state: dict):\n    curr_price = curr_state[\"coinbase_btcusd_close\"]\n    next_price = new_state[\"coinbase_btcusd_close\"]\n    return curr_price - next_price\n\n\ndef buy(curr_state: dict, prev_interps, new_state: dict, new_interps):\n    return calculate_price_change(curr_state=curr_state, new_state=new_state)\n\n\ndef sell(curr_state: dict, prev_interps, new_state: dict, new_interps):\n    return -calculate_price_change(curr_state=curr_state, new_state=new_state)\n\n\ndef hold(curr_state: dict, prev_interps, new_state: dict, new_interps):\n    return -0.1\n"
+  "external_reward_funcs": "def calculate_price_change(curr_state: dict, new_state: dict):\n    curr_price = curr_state[\"coinbase_btcusd_close\"]\n    next_price = new_state[\"coinbase_btcusd_close\"]\n    return curr_price - next_price\n\n\ndef buy(curr_state: dict, prev_interps, new_state: dict, new_interps):\n    return calculate_price_change(curr_state=curr_state, new_state=new_state)\n\n\ndef sell(curr_state: dict, prev_interps, new_state: dict, new_interps):\n    return -calculate_price_change(curr_state=curr_state, new_state=new_state)\n\n\ndef hold(curr_state: dict, prev_interps, new_state: dict, new_interps):\n    return -0.1\n",
+  "interpolation": true
 }
