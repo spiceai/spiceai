@@ -28,7 +28,8 @@ class EventDataManager(DataManagerBase):
         return None
 
     def get_current_window(self) -> pd.DataFrame:
-        return self.data_frame[self.current_index: self.current_index + 1]
+        with self.table_lock:
+            return self.data_frame[self.current_index: self.current_index + 1]
 
     def get_shape(self) -> tuple:
         return (self.data_frame.shape[1],)

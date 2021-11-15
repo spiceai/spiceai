@@ -118,14 +118,15 @@ class TimeSeriesDataManager(DataManagerBase):
         return np.shape([0] * self.get_window_span() * len(self.fields))
 
     def get_current_window(self) -> pd.DataFrame:
-        # This will get the nearest previous index that matches the timestamp,
-        # so we don't need to specify the timestamps exactly
-        start_index = self.massive_table_filled.index.get_loc(self.current_time, "ffill")
-        end_index = self.massive_table_filled.index.get_loc(self.current_time + self.param.interval_secs, "ffill")
-        return (
-            self.massive_table_filled.iloc[start_index:start_index + 1]
-            if self.get_window_span() == 1 else
-            self.massive_table_filled.iloc[start_index:end_index])
+        with self.table_lock:
+            # This will get the nearest previous index that matches the timestamp,
+            # so we don't need to specify the timestamps exactly
+            start_index = self.massive_table_filled.index.get_loc(self.current_time, "ffill")
+            end_index = self.massive_table_filled.index.get_loc(self.current_time + self.param.interval_secs, "ffill")
+            return (
+                self.massive_table_filled.iloc[start_index:start_index + 1]
+                if self.get_window_span() == 1 else
+                self.massive_table_filled.iloc[start_index:end_index])
 
     def get_window_at(self, time):
         start_index = None
