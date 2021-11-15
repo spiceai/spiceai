@@ -144,7 +144,8 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
                 action_rewards=action_rewards,
                 actions_order=request.actions_order,
                 external_reward_funcs=request.external_reward_funcs,
-                laws=request.laws)
+                laws=request.laws,
+                dataspace_hash=request.dataspace_hash)
         else:
             data_manager = EventDataManager(
                 param=DataParam(
@@ -156,7 +157,8 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
                 action_rewards=action_rewards,
                 actions_order=request.actions_order,
                 external_reward_funcs=request.external_reward_funcs,
-                laws=request.laws)
+                laws=request.laws,
+                dataspace_hash=request.dataspace_hash)
 
         datasources_data = request.datasources
 

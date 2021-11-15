@@ -6,8 +6,8 @@ from typing import Dict
 import pandas as pd
 
 from connector.manager import ConnectorManager
-from dispatcher import locks
 from data_manager.base_manager import DataManagerBase
+from dispatcher import locks
 from proto.aiengine.v1.aiengine_pb2 import AddDataRequest
 from train import Trainer
 

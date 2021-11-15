@@ -8,8 +8,8 @@ from proto.aiengine.v1 import aiengine_pb2
 
 class EventDataManager(DataManagerBase):
     def __init__(self, param: DataParam, fields: Dict[str, aiengine_pb2.FieldData], action_rewards: Dict[str, str],
-                 actions_order: Dict[str, int], external_reward_funcs: str, laws: List[str]):
-        super().__init__(param, fields, action_rewards, actions_order, external_reward_funcs, laws)
+                 actions_order: Dict[str, int], external_reward_funcs: str, laws: List[str], dataspace_hash: str):
+        super().__init__(param, fields, action_rewards, actions_order, external_reward_funcs, laws, dataspace_hash)
 
         self.data_frame = pd.DataFrame(columns=fields)
         self.current_index = 0
