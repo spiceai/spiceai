@@ -1,5 +1,7 @@
 SHELL := /bin/bash
 PROTOC ?=protoc
+UNAME := $(shell uname)
+
 
 ################################################################################
 # Target: all                                                                 #
@@ -129,13 +131,12 @@ generate-acknowledgements:
 	pushd dashboard && yarn install && npx license-checker --csv 2>/dev/null >> ../$(ACKNOWLEDGEMENTS_PATH) && popd
 
 	# Apply Formatting
-	if [[ $(uname) -eq "Darwin" ]]; then\
-		sed -i '' 's/\"//g' $(ACKNOWLEDGEMENTS_PATH)\
-		sed -i '' 's/,/, /g' $(ACKNOWLEDGEMENTS_PATH)\
-		sed -i '' 's/,  /, /g' $(ACKNOWLEDGEMENTS_PATH)\
+	@if [[ $(UNAME) -eq "Darwin" ]]; then\
+		sed -i '' 's/\"//g' $(ACKNOWLEDGEMENTS_PATH); \
+		sed -i '' 's/,/, /g' $(ACKNOWLEDGEMENTS_PATH); \
+		sed -i '' 's/,  /, /g' $(ACKNOWLEDGEMENTS_PATH); \
 	else\
-		sed -i 's/\"//g' $(ACKNOWLEDGEMENTS_PATH)\
-		sed -i 's/,/, /g' $(ACKNOWLEDGEMENTS_PATH)\
-		sed -i 's/,  /, /g' $(ACKNOWLEDGEMENTS_PATH)\
+		sed -i 's/\"//g' $(ACKNOWLEDGEMENTS_PATH); \
+		sed -i 's/,/, /g' $(ACKNOWLEDGEMENTS_PATH); \
+		sed -i 's/,  /, /g' $(ACKNOWLEDGEMENTS_PATH); \
 	fi
-	  
