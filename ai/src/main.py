@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import sys
 import threading
 import traceback
 from typing import Dict
@@ -18,14 +19,16 @@ from algorithms.agent_interface import SpiceAIAgent
 from cleanup import cleanup_on_shutdown
 from connector.manager import ConnectorManager, ConnectorName
 from connector.stateful import StatefulConnector
-from data import DataParam, DataManager
+from data_manager.base_manager import DataParam, DataManagerBase
+from data_manager.event_manager import EventDataManager
+from data_manager.time_series_manager import TimeSeriesDataManager
 from exception import UnexpectedException
 from inference import GetInferenceHandler
 from proto.aiengine.v1 import aiengine_pb2, aiengine_pb2_grpc
 from train import Trainer
 from validation import validate_rewards
 
-data_managers: Dict[str, DataManager] = {}
+data_managers: Dict[str, DataManagerBase] = {}
 connector_managers: Dict[str, ConnectorManager] = {}
 
 
@@ -35,17 +38,18 @@ class Dispatch:
 
 
 def train_agent(
-        pod_name: str, data_manager: DataManager, connector_manager: ConnectorManager, algorithm: str,
+        pod_name: str, data_manager: DataManagerBase, connector_manager: ConnectorManager, algorithm: str,
         number_episodes: int, flight: str, training_goal: str):
     try:
         Trainer(pod_name, data_manager, connector_manager, algorithm, number_episodes, flight, training_goal).train()
     except Exception:
+        sys.stdout.flush()
         request_url = Trainer.BASE_URL + f"/{pod_name}/training_runs/{flight}/episodes"
         requests.post(request_url, json=UnexpectedException(traceback.format_exc()).get_error_body())
 
 
 def dispatch_train_agent(
-        pod_name: str, data_manager: DataManager, connector_manager: ConnectorManager, algorithm: str,
+        pod_name: str, data_manager: DataManagerBase, connector_manager: ConnectorManager, algorithm: str,
         number_episodes: int, flight: str, training_goal: str):
     if Trainer.TRAINING_LOCK.locked():
         return False
@@ -67,14 +71,13 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
             new_data["time"] = pd.to_datetime(new_data["time"], unit="s")
             new_data = new_data.set_index("time")
 
-            data_manager: DataManager = data_managers[request.pod]
+            data_manager = data_managers[request.pod]
             for field in new_data.columns:
                 if field not in data_manager.fields.keys():
                     return aiengine_pb2.Response(
                         result="unexpected_field",
                         message=f"Unexpected field: '{field}'",
-                        error=True,
-                    )
+                        error=True)
 
             data_manager.merge_data(new_data)
             return aiengine_pb2.Response(result="ok")
@@ -104,15 +107,10 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
         flight = request.flight
         training_goal = request.training_goal
 
-        index_of_epoch = data_manager.massive_table_filled.index.get_loc(
-            data_manager.param.epoch_time, "ffill"
-        )
-
-        if len(data_manager.massive_table_filled.iloc[index_of_epoch:]) < data_manager.get_window_span():
-            return aiengine_pb2.Response(
-                result="not_enough_data_for_training",
-                error=True,
-            )
+        if isinstance(data_manager, TimeSeriesDataManager):
+            index_of_epoch = data_manager.massive_table_filled.index.get_loc(data_manager.param.epoch_time, "ffill")
+            if len(data_manager.massive_table_filled.iloc[index_of_epoch:]) < data_manager.get_window_span():
+                return aiengine_pb2.Response(result="not_enough_data_for_training", error=True)
 
         started = dispatch_train_agent(
             request.pod, data_manager, connector_manager, algorithm, number_episodes, flight, training_goal)
@@ -139,25 +137,36 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
                 return aiengine_pb2.Response(result="missing_actions", error=True)
             action_rewards = request.actions
             if not validate_rewards(action_rewards, request.external_reward_funcs):
-                return aiengine_pb2.Response(
-                    result="invalid_reward_function", error=True
-                )
+                return aiengine_pb2.Response(result="invalid_reward_function", error=True)
 
             if len(request.fields) == 0:
                 return aiengine_pb2.Response(result="missing_fields", error=True)
 
-            data_manager = DataManager(
-                param=DataParam(
-                    epoch_time=epoch_time,
-                    period_secs=period_secs,
-                    interval_secs=interval_secs,
-                    granularity_secs=granularity_secs),
-                fields=request.fields,
-                action_rewards=action_rewards,
-                actions_order=request.actions_order,
-                external_reward_funcs=request.external_reward_funcs,
-                laws=request.laws,
-            )
+            data_manager: DataManagerBase = None
+            if request.interpolation:
+                data_manager = TimeSeriesDataManager(
+                    param=DataParam(
+                        epoch_time=epoch_time,
+                        period_secs=period_secs,
+                        interval_secs=interval_secs,
+                        granularity_secs=granularity_secs),
+                    fields=request.fields,
+                    action_rewards=action_rewards,
+                    actions_order=request.actions_order,
+                    external_reward_funcs=request.external_reward_funcs,
+                    laws=request.laws)
+            else:
+                data_manager = EventDataManager(
+                    param=DataParam(
+                        epoch_time=epoch_time,
+                        period_secs=period_secs,
+                        interval_secs=interval_secs,
+                        granularity_secs=granularity_secs),
+                    fields=request.fields,
+                    action_rewards=action_rewards,
+                    actions_order=request.actions_order,
+                    external_reward_funcs=request.external_reward_funcs,
+                    laws=request.laws)
             data_managers[request.pod] = data_manager
             connector_managers[request.pod] = connector_manager
 

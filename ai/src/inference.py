@@ -6,14 +6,14 @@ import pandas as pd
 
 from algorithms.factory import get_agent
 from algorithms.agent_interface import SpiceAIAgent
-from data import DataManager
+from data_manager.base_manager import DataManagerBase
 from exception import InvalidDataShapeException
 from proto.aiengine.v1 import aiengine_pb2
 from train import Trainer
 
 
 class GetInferenceHandler:
-    def __init__(self, request: aiengine_pb2.InferenceRequest, data_managers: Dict[str, DataManager]):
+    def __init__(self, request: aiengine_pb2.InferenceRequest, data_managers: Dict[str, DataManagerBase]):
         self.request = request
         self.data_managers = data_managers
         self.inference_time = pd.to_datetime(request.inference_time, unit="s")

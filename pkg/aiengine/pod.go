@@ -165,6 +165,7 @@ func getPodInitForTraining(pod *pods.Pod) *aiengine_pb.InitRequest {
 		Period:              int64(pod.Period().Seconds()),
 		Interval:            int64(pod.Interval().Seconds()),
 		Granularity:         int64(pod.Granularity().Seconds()),
+		Interpolation:       pod.Interpolation(),
 		Datasources:         dsInitSpecs,
 		Fields:              fields,
 		Actions:             actionRewards,

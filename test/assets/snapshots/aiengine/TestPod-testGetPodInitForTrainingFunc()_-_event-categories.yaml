@@ -58,5 +58,6 @@
   },
   "datasources": [
     {}
-  ]
+  ],
+  "interpolation": true
 }
