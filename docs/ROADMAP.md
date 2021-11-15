@@ -10,7 +10,7 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 
 Spice.ai is still under early development, so there are several gaps and limitations, including:
 
-- Splitting of data (training/testing/etc)
+- Automated splitting of data (training/testing/etc)
 - Custom environments are not yet supported
 - Custom visualizations are not yet supported
 - Environment and reward function code must be written in Python 3. The plan is to enable these to be written in any language that compiles to Web Assembly.
@@ -24,30 +24,30 @@ Spice.ai is still under early development, so there are several gaps and limitat
 
 - See [Bugs](https://github.com/spiceai/spiceai/labels/bug). Feel free to file a new Issue if you see a bug and let us know on Discord.
 
-## Tentative v0.4-alpha (Nov, 2021) roadmap
-
-- Additional ML algorithm (A2C/A3C or SAC)
-- Externally editable and testable reward functions (Python)
-
 ## Tentative v0.5-alpha (Dec, 2021) roadmap
 
+- Darwin/ARM64 support
 - Improved data visualization in dashboard
-- Multiple AI Engine backends (E.g. PyTorch, Scikit-learn, etc.)
-- Pluggable environments
+- Additional ML algorithm (A2C/A3C or SAC)
 
 ## Tentative v0.6-alpha (Jan, 2022) roadmap
 
 - Local Pod/Flight monitoring (WebSockets)
-- Self-host on baremetal or VM
+- Custom visualization hooks for Dataspaces
+
+## Tentative v0.7-alpha (Feb, 2022) roadmap
+
 - Search, index, publish and browse the Spice Rack registry
 - CI/CD on GitHub
-- Custom visualization hooks for Dataspaces
-- Sidecar injection on Kubernetes
 
 ## v1.0-stable roadmap
 
+- Self-host on baremetal or VM
+- Pluggable environments
+- Multiple AI Engine backends (E.g. PyTorch, Scikit-learn, etc.)
 - A/B testing and flighting
 - Distributed learning
+- Sidecar injection on Kubernetes
 
 ## Beyond v1.0
 
