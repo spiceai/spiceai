@@ -1,5 +1,4 @@
 import math
-import threading
 from typing import Dict, List
 
 import numpy as np
@@ -25,7 +24,6 @@ class TimeSeriesDataManager(DataManagerBase):
         self._fill_table()
 
         self.current_time: pd.Timestamp = None
-        self.table_lock = threading.Lock()
 
     def get_window_span(self):
         return math.floor(self.param.interval_secs / self.param.granularity_secs)

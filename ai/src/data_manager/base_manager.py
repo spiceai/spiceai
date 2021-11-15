@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+import threading
 from types import SimpleNamespace
 from typing import Dict, List
 
@@ -47,6 +48,8 @@ class DataManagerBase(ABC):
                 reward_func_name = self.action_rewards[action_name]
                 reward_func = getattr(self.reward_funcs_module, reward_func_name)
                 self.reward_funcs_module_actions[action_name] = reward_func
+        self.interpretations = None
+        self.table_lock = threading.Lock()
 
     @staticmethod
     def flatten_and_normalize_window(current_window) -> np.ndarray:
