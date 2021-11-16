@@ -65,6 +65,26 @@ class DataManagerBase(ABC):
         return np.nan_to_num(result_array)
 
     @abstractmethod
+    def __enter__(self):
+        """
+        Python Docs: https://docs.python.org/3/library/stdtypes.html#contextmanager.__enter__
+
+        Used to indicate to the datamanager that the pod is currently training. This should
+        trigger the data manager to make a deep copy of the underlying data to be used for training.
+        """
+        raise RuntimeError('Not Implemented')
+
+    @abstractmethod
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """
+        Python Docs: https://docs.python.org/3/library/stdtypes.html#contextmanager.__exit__
+
+        Used to indicate to the datamanager that the pod has stopped training and can clean up the 
+        copy of the data used for training.
+        """
+        raise RuntimeError('Not Implemented')
+
+    @abstractmethod
     def add_interpretations(self, interpretations):
         raise RuntimeError('Not Implemented')
 
