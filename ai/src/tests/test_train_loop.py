@@ -8,6 +8,7 @@ import unittest
 import pandas as pd
 
 from cleanup import cleanup_on_shutdown
+from dispatcher.data_dispatcher import DataDispatcher
 import main
 from proto.aiengine.v1 import aiengine_pb2
 from tests import common, test_main
@@ -15,7 +16,7 @@ import train
 
 
 class TrainingLoopTests(unittest.TestCase):
-    ALGORITHM = os.environ["ALGORITHM"]
+    ALGORITHM = os.environ.get("ALGORITHM")
 
     def setUp(self):
         # Preventing tensorflow verbose initialization
@@ -24,6 +25,9 @@ class TrainingLoopTests(unittest.TestCase):
 
         # Eager execution is too slow to use, so disabling
         tf.compat.v1.disable_eager_execution()
+
+        if self.ALGORITHM is None:
+            self.ALGORITHM = "dql"  # pylint: disable=invalid-name
 
         self.aiengine = main.AIEngine()
 
@@ -52,6 +56,8 @@ class TrainingLoopTests(unittest.TestCase):
         train.post_episode_result = self.original_post_episode_result
         train.end_of_episode = self.original_end_of_episode
         cleanup_on_shutdown()
+        main.data_managers.clear()
+        main.connector_managers.clear()
 
     def init(
         self,
@@ -63,14 +69,15 @@ class TrainingLoopTests(unittest.TestCase):
         self.assertEqual(resp.error, expected_error)
         self.assertEqual(resp.result, expected_result)
 
-    def add_data(self, pod_name: str, csv_data: str, dataspace_hash: str):
+    def add_data(self, pod_name: str, csv_data: str, dataspace_hash: str, process: bool = True):
         resp = self.aiengine.AddData(
             aiengine_pb2.AddDataRequest(
                 pod=pod_name, csv_data=csv_data, dataspace_hash=dataspace_hash), None
         )
         self.assertFalse(resp.error)
 
-        test_main.process_add_data(self)
+        if process:
+            test_main.process_add_data(self)
 
     def start_training(
             self, pod_name: str, flight: str = None, number_episodes: int = None, epoch_time: int = None,
@@ -84,8 +91,8 @@ class TrainingLoopTests(unittest.TestCase):
 
         resp = self.aiengine.StartTraining(train_req, None)
 
-        self.assertEqual(resp.error, expected_error)
         self.assertEqual(resp.result, expected_result)
+        self.assertEqual(resp.error, expected_error)
 
     def wait_for_training(self):
         self.assertIsNotNone(main.Dispatch.TRAINING_THREAD)
@@ -228,50 +235,60 @@ class TrainingLoopTests(unittest.TestCase):
         with open("./tests/assets/csv/training_loop_gap_1.csv", "r", encoding="utf-8") as data:
             gap_data_1 = data.read()
 
-        self.init(self.trader_init_req)
-        self.add_data("trader", gap_data_0, self.pod_dataspace_hashes["trader"])
+        # start data dispatcher
+        data_dispatcher = DataDispatcher(work_queue=main.data_queue,
+                                         data_managers=main.data_managers, connector_managers=main.connector_managers)
+        data_dispatcher.start()
+        add_data_done = threading.Event()
 
-        flight = "1"
-        number_episodes = 10
-        self.start_training("trader", flight, number_episodes)
+        def data_added(response):
+            if response is not None:
+                self.assertFalse(response.error)
+            add_data_done.set()
+        data_dispatcher._test_hook_callback["add_data"] = data_added  # pylint: disable=protected-access
 
-        post_data_lock = threading.Lock()
-        episode_5_lock = threading.Lock()
-        episode_5_lock.acquire()  # pylint: disable=consider-using-with
+        try:
+            self.init(self.trader_init_req)
+            self.add_data("trader", gap_data_0, self.pod_dataspace_hashes["trader"], process=False)
 
-        def release_lock_on_episode_5(episode: int):
-            if episode == 5 and episode_5_lock.locked():
-                episode_5_lock.release()
-                post_data_lock.acquire()  # pylint: disable=consider-using-with
+            flight = "1"
+            number_episodes = 10
 
-        train.end_of_episode = release_lock_on_episode_5
+            add_data_done.wait()
+            self.start_training("trader", flight, number_episodes)
 
-        # wait for episode 5
-        post_data_lock.acquire()  # pylint: disable=consider-using-with
-        episode_5_lock.acquire()  # pylint: disable=consider-using-with
+            post_data_lock = threading.Lock()
+            episode_5_lock = threading.Lock()
+            episode_5_lock.acquire()  # pylint: disable=consider-using-with
 
-        print("Posting gap_data_1")
-        self.add_data("trader", gap_data_1, self.pod_dataspace_hashes["trader"])
-        post_data_lock.release()
+            def release_lock_on_episode_5(episode: int):
+                if episode == 5 and episode_5_lock.locked():
+                    episode_5_lock.release()
+                    post_data_lock.acquire()  # pylint: disable=consider-using-with
 
-        self.wait_for_training()
-        episode_5_lock.release()
-        post_data_lock.release()
+            train.end_of_episode = release_lock_on_episode_5
 
-        self.validate_episode_data(
-            "trader",
-            flight,
-            5,
-            num_actions=10,
-            episode_results=self.episode_results[0:5],
-        )
-        self.validate_episode_data(
-            "trader",
-            flight,
-            5,
-            num_actions=50,
-            episode_results=self.episode_results[5:],
-        )
+            # wait for episode 5
+            post_data_lock.acquire()  # pylint: disable=consider-using-with
+            episode_5_lock.acquire()  # pylint: disable=consider-using-with
+
+            print("Posting gap_data_1")
+            self.add_data("trader", gap_data_1, self.pod_dataspace_hashes["trader"], process=False)
+            post_data_lock.release()
+
+            self.wait_for_training()
+            episode_5_lock.release()
+            post_data_lock.release()
+
+            self.validate_episode_data(
+                "trader",
+                flight,
+                10,
+                num_actions=10,
+                episode_results=self.episode_results,
+            )
+        finally:
+            data_dispatcher.stop()
 
     def test_epoch_earlier_than_data(self):
         self.init(self.trader_init_req)
@@ -478,10 +495,14 @@ class TrainingLoopTests(unittest.TestCase):
             row = [unix_seconds, None, None, 123]
             writer.writerow(row)
 
-        resp = self.aiengine.AddData(
-            aiengine_pb2.AddDataRequest(pod="trader", csv_data=csv_data.getvalue()),
+        self.aiengine.AddData(
+            aiengine_pb2.AddDataRequest(pod="trader", csv_data=csv_data.getvalue(),
+                                        dataspace_hash=self.pod_dataspace_hashes["trader"]),
             None,
         )
+
+        resp = test_main.process_add_data(self)
+
         self.assertTrue(resp.error)
         self.assertEqual(resp.result, "unexpected_field")
         self.assertEqual(resp.message, "Unexpected field: 'non_exist'")

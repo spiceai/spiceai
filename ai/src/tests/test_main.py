@@ -11,15 +11,12 @@ def process_add_data(self):
                                      data_managers=main.data_managers, connector_managers=main.connector_managers)
     event_name, params = main.data_queue.get()
     self.assertEqual("add_data", event_name)
-    data_dispatcher._add_data(params)
+    return data_dispatcher._add_data(params)
 
 
 class MainTestCase(unittest.TestCase):
     def setUp(self):
         self.aiengine = main.AIEngine()
-
-        main.data_managers.clear()
-        main.connector_managers.clear()
 
         self.trader_init_req = get_init_from_json(
             init_data_path="../../test/assets/aiengine/api/trader_init.json",
@@ -29,9 +26,15 @@ class MainTestCase(unittest.TestCase):
         with open("../../test/assets/data/csv/trader.csv", "r", encoding="utf8") as trader_data:
             self.trader_data_csv = trader_data.read()
 
-        dataspace_hash = "ddc99ce6cbdf8c7fb0a5ae5a7eaea2f28c4e9ca24c9b4593f977218f9fd9c9e6"
+        self.dataspace_hash = "ddc99ce6cbdf8c7fb0a5ae5a7eaea2f28c4e9ca24c9b4593f977218f9fd9c9e6"
         self.add_data_request = aiengine_pb2.AddDataRequest(
-            pod="trader", csv_data=self.trader_data_csv, dataspace_hash=dataspace_hash)
+            pod="trader", csv_data=self.trader_data_csv, dataspace_hash=self.dataspace_hash)
+
+    def tearDown(self):
+        main.data_managers.clear()
+        main.connector_managers.clear()
+        if not main.data_queue.empty():
+            raise Exception("data_queue not empty")
 
     def test_inference_not_initialized(self):
         req = aiengine_pb2.InferenceRequest(pod="trader", tag="latest")
@@ -133,9 +136,11 @@ class MainTestCase(unittest.TestCase):
 
         # Step 2, load too little data
         tiny_data = "\n".join(self.trader_data_csv.splitlines()[0:3])
-        resp = self.aiengine.AddData(
-            aiengine_pb2.AddDataRequest(pod="trader", csv_data=tiny_data), None
+        self.aiengine.AddData(
+            aiengine_pb2.AddDataRequest(pod="trader", csv_data=tiny_data, dataspace_hash=self.dataspace_hash), None
         )
+
+        resp = process_add_data(self)
         self.assertFalse(resp.error)
 
         # Step 3, inference
