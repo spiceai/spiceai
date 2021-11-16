@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"path/filepath"
 	"sync"
 
 	"github.com/logrusorgru/aurora"
@@ -213,23 +212,9 @@ func (r *SpiceRuntime) scanForPods() error {
 		return nil
 	}
 
-	d, err := os.Open(podsManifestDir)
-	if err != nil {
-		return err
-	}
+	manifestPaths := pods.FindAllManifestPaths()
 
-	files, err := d.Readdir(-1)
-	d.Close()
-	if err != nil {
-		return err
-	}
-
-	for _, f := range files {
-		if f.IsDir() {
-			continue
-		}
-
-		manifestPath := filepath.Join(podsManifestDir, f.Name())
+	for _, manifestPath := range manifestPaths {
 		_, err = initializePod(manifestPath)
 		if err != nil {
 			log.Println(fmt.Errorf("error loading pod manifest %s: %w", manifestPath, err))
