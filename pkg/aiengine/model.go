@@ -21,7 +21,7 @@ func importModel(pod *pods.Pod, tag string) error {
 		ImportPath: modelPath,
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second * 30)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*30)
 	defer cancel()
 	response, err := aiengineClient.ImportModel(ctx, importRequest)
 	if err != nil {
