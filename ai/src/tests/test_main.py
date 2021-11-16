@@ -11,7 +11,7 @@ def process_add_data(self):
                                      data_managers=main.data_managers, connector_managers=main.connector_managers)
     event_name, params = main.data_queue.get()
     self.assertEqual("add_data", event_name)
-    return data_dispatcher._add_data(params)
+    return data_dispatcher._add_data(params)  # pylint: disable=protected-access
 
 
 class MainTestCase(unittest.TestCase):
