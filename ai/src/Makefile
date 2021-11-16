@@ -1,3 +1,5 @@
+UNAME := $(shell uname)
+
 .PHONY: test
 test: venv
 	ALGORITHM="dql" venv/bin/python3 -m pytest --timeout 10
@@ -7,6 +9,14 @@ venv:
 	python3 -m venv venv
 	venv/bin/pip3 install --upgrade pip
 	venv/bin/pip3 install -r requirements/production.txt
+
+.PHONY: lint
+lint: venv
+	@if [[ "$(UNAME)" -eq "Darwin" ]]; then\
+		find . -name '*.py' -not -path './proto/*' -and -not -path './venv/*' | xargs venv/bin/pylint; \
+	else\
+		find -name '*.py' -not -path './proto/*' -and -not -path './venv/*' | xargs venv/bin/pylint; \
+	fi
 
 .PHONY: venv-dev
 venv-dev:

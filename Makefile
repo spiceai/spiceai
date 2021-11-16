@@ -18,7 +18,7 @@ build:
 .PHONY: lint
 lint:
 	pushd dashboard && yarn lint && popd
-#	black --check --extend-exclude proto ai/src
+	pushd ai/src && make lint && popd
 	go vet ./...
 	golangci-lint run	
 
@@ -131,7 +131,7 @@ generate-acknowledgements:
 	pushd dashboard && yarn install && npx license-checker --csv 2>/dev/null >> ../$(ACKNOWLEDGEMENTS_PATH) && popd
 
 	# Apply Formatting
-	@if [[ $(UNAME) -eq "Darwin" ]]; then\
+	@if [[ "$(UNAME)" -eq "Darwin" ]]; then\
 		sed -i '' 's/\"//g' $(ACKNOWLEDGEMENTS_PATH); \
 		sed -i '' 's/,/, /g' $(ACKNOWLEDGEMENTS_PATH); \
 		sed -i '' 's/,  /, /g' $(ACKNOWLEDGEMENTS_PATH); \
