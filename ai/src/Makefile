@@ -1,4 +1,5 @@
 UNAME := $(shell uname)
+SHELL := /bin/bash
 
 .PHONY: test
 test: venv
@@ -12,11 +13,7 @@ venv:
 
 .PHONY: lint
 lint: venv
-	@if [[ "$(UNAME)" -eq "Darwin" ]]; then\
-		find . -name '*.py' -not -path './proto/*' -and -not -path './venv/*' | xargs venv/bin/pylint; \
-	else\
-		find -name '*.py' -not -path './proto/*' -and -not -path './venv/*' | xargs venv/bin/pylint; \
-	fi
+	find . -name '*.py' -not -path './proto/*' -and -not -path './venv/*' | xargs venv/bin/pylint
 
 .PHONY: venv-dev
 venv-dev:
