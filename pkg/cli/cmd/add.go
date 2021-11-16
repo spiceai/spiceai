@@ -7,7 +7,6 @@ import (
 	"github.com/spiceai/spiceai/pkg/context"
 	"github.com/spiceai/spiceai/pkg/github"
 	"github.com/spiceai/spiceai/pkg/registry"
-	"github.com/spiceai/spiceai/pkg/version"
 )
 
 var addCmd = &cobra.Command{
@@ -38,15 +37,7 @@ spice add samples/LogPruner
 
 		cmd.Printf("Added %s\n", relativePath)
 
-		release, err := github.GetLatestCliRelease()
-		if err != nil {
-			return
-		}
-		cliVersion := version.Version()
-		if cliVersion != release.TagName {
-			cmd.Printf("Note: New CLI version %s is now available! \nNote: Run \"spice upgrade\" to update CLI \n", release.TagName)
-			return
-		}
+		github.CheckForLatestVersion()
 	},
 }
 

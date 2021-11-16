@@ -45,15 +45,7 @@ spice version
 
 		cmd.Printf("Runtime version: %s\n", rtversion)
 
-		release, err := github.GetLatestCliRelease()
-		if err != nil {
-			return
-		}
-		cliVersion := version.Version()
-		if cliVersion != release.TagName {
-			cmd.Printf("Note: New CLI version %s is now available!\nNote: Run \"spice upgrade\" to update CLI \n", release.TagName)
-			return
-		}
+		github.CheckForLatestVersion()
 	},
 }
 
