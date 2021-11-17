@@ -86,6 +86,12 @@ func (r *SpiceRackRegistry) GetPod(podFullPath string) (string, error) {
 
 	for _, f := range zipReader.File {
 		fpath := filepath.Join(podsPath, f.Name)
+
+		err = util.SanitizeExtractPath(fpath, podsPath)
+		if err != nil {
+			return "", err
+		}
+
 		if f.FileInfo().IsDir() {
 			err := os.MkdirAll(fpath, podsPerm)
 			if err != nil {
@@ -94,13 +100,7 @@ func (r *SpiceRackRegistry) GetPod(podFullPath string) (string, error) {
 			continue
 		}
 
-		extractDir := filepath.Dir(fpath)
-		err = util.SanitizeExtractPath(fpath, extractDir)
-		if err != nil {
-			return "", err
-		}
-
-		err = os.MkdirAll(extractDir, podsPerm)
+		err = os.MkdirAll(podsPath, podsPerm)
 		if err != nil {
 			return "", err
 		}
