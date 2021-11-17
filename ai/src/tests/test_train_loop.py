@@ -202,7 +202,7 @@ class TrainingLoopTests(unittest.TestCase):
 
         gap_start = pd.to_datetime(1626697640, unit="s")
         gap_end = pd.to_datetime(1626697860, unit="s")
-        table = main.data_managers["trader"].massive_table_filled
+        table = main.data_managers["trader"].massive_table_sparse
         price = list(table[gap_start:gap_start].coinbase_btcusd_close)[-1]
 
         # Validate the forward filling is working.
