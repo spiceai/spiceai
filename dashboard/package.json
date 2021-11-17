@@ -23,12 +23,11 @@
     "direction": "^1.0.4",
     "lodash": "^4.17.21",
     "marked": "^3.0.7",
-    "postcss": "^8.3.6",
+    "postcss": "^8.3.11",
     "react": "^17.0.2",
     "react-dom": "^17.0.2",
     "react-responsive-carousel": "^3.2.21",
     "react-router-dom": "^5.2.0",
-    "react-scripts": "4.0.3",
     "react-sparklines": "^1.7.0",
     "react-virtualized-auto-sizer": "^1.0.6",
     "styled-components": "^5.3.1",
@@ -46,7 +45,8 @@
     "eslint-config-prettier": "8.3.0",
     "eslint-plugin-prettier": "3.4.0",
     "eslint-plugin-react": "^7.24.0",
-    "prettier": "2.3.2"
+    "prettier": "2.3.2",
+    "react-scripts": "4.0.3"
   },
   "scripts": {
     "build:tailwind": "tailwind build -i src/tailwind.css -o src/tailwind.output.css",
