@@ -14,6 +14,12 @@ class EventDataManager(DataManagerBase):
         self.data_frame = pd.DataFrame(columns=fields)
         self.current_index = 0
 
+    def start_training(self):
+        pass
+
+    def end_training(self):
+        pass
+
     def add_interpretations(self, interpretations):
         self.interpretations = interpretations
 
@@ -32,10 +38,13 @@ class EventDataManager(DataManagerBase):
             return self.data_frame[self.current_index: self.current_index + 1]
 
     def get_window_at(self, _time: pd.Timestamp):
-        raise NotImplementedError("get_window_at not implemented yet")
+        raise RuntimeError("get_window_at not implemented yet")
 
     def get_shape(self) -> tuple:
         return (self.data_frame.shape[1],)
+
+    def merge_training_row(self, _new_row):
+        raise RuntimeError('Not Implemented')
 
     def merge_data(self, new_data: pd.DataFrame):
         if len(new_data) == 0:
