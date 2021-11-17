@@ -11,7 +11,7 @@ from typing import Dict
 
 import grpc
 import pandas as pd
-from psutil import Process
+from psutil import Process, TimeoutExpired
 import requests
 
 from algorithms.factory import get_agent
@@ -30,6 +30,8 @@ from validation import validate_rewards
 
 data_managers: Dict[str, DataManagerBase] = {}
 connector_managers: Dict[str, ConnectorManager] = {}
+
+shutdown_event = threading.Event()
 
 
 class Dispatch:
@@ -242,7 +244,18 @@ def wait_parent_process():
     current_process = Process(os.getpid())
     parent_process: Process = current_process.parent()
 
-    parent_process.wait()
+    while True:
+        try:
+            parent_process.wait(0.1)
+        except TimeoutExpired:
+            if shutdown_event.is_set():
+                return
+            continue
+
+
+def interrupt_handler(_signum, _frame):
+    shutdown_event.set()
+    print('\r  ')
 
 
 def main():
@@ -253,7 +266,7 @@ def main():
     # Eager execution is too slow to use, so disabling
     tf.compat.v1.disable_eager_execution()
 
-    signal.signal(signal.SIGINT, cleanup_on_shutdown)
+    signal.signal(signal.SIGINT, interrupt_handler)
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
     aiengine_pb2_grpc.add_AIEngineServicer_to_server(AIEngine(), server)
     server.add_insecure_port("[::]:8004")
@@ -262,6 +275,8 @@ def main():
 
     wait_parent_process()
     cleanup_on_shutdown()
+    grpc_shutdown = server.stop(grace=0.1)
+    grpc_shutdown.wait()
 
 
 if __name__ == "__main__":
