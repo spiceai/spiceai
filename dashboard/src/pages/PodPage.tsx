@@ -1,5 +1,6 @@
 import React, { useEffect, useState, useCallback } from 'react'
 import { useLocation } from 'react-router-dom'
+import ReactAutoSizer from 'react-virtualized-auto-sizer'
 
 import PodHeader from '../components/app/PodHeader'
 import Card from '../components/layout/Card'
@@ -193,19 +194,23 @@ const PodPage: React.FunctionComponent<PodProps> = () => {
           {observationsError && (
             <span>An error occurred fetching observations: {observationsError}</span>
           )}
-          <div className="border-1 border-gray-300">
-            {!observationsError && observations && gridProps && (
-              <DataEditorContainer width={gridWidth} height={gridHeight}>
-                <DataEditor
-                  getCellContent={gridProps.gridDataFunc}
-                  columns={gridProps.columns}
-                  rows={observations.length}
-                  rowMarkers="number"
-                  onColumnResized={onColumnResized}
-                />
-              </DataEditorContainer>
-            )}
-          </div>
+          {!observationsError && observations && gridProps && (
+            <div className="border-1 border-gray-300">
+              <ReactAutoSizer disableHeight={true}>
+                {(props: { width?: number }) => (
+                  <DataEditorContainer width={props.width ?? gridWidth} height={gridHeight}>
+                    <DataEditor
+                      getCellContent={gridProps.gridDataFunc}
+                      columns={gridProps.columns}
+                      rows={observations.length}
+                      rowMarkers="number"
+                      onColumnResized={onColumnResized}
+                    />
+                  </DataEditorContainer>
+                )}
+              </ReactAutoSizer>
+            </div>
+          )}
           <h2 className="mt-4 ml-2 mb-2 font-spice tracking-spice text-s uppercase">
             Training Runs
           </h2>
