@@ -15,6 +15,9 @@ func TestTime(t *testing.T) {
 	t.Run("ParseTime() - rfc1123z", testParseTimeFunc("Mon, 27 Sep 2021 15:29:36 +0000", "rfc1123z", time.Date(2021, 9, 27, 15, 29, 36, 0, time.UTC)))
 	t.Run("ParseTime() - rfc822z", testParseTimeFunc("27 Sep 21 15:29 +0000", "rfc822z", time.Date(2021, 9, 27, 15, 29, 0, 0, time.UTC)))
 	t.Run("ParseTime() - custom format", testParseTimeFunc("2019-03-19 12:41:58+00:00", "2006-01-02 15:04:05-07:00", time.Date(2019, time.March, 19, 12, 41, 58, 0, time.UTC)))
+	t.Run("ParseTime() - hex", testParseTimeFunc("618C6F9F", "hex", time.Date(2021, time.November, 11, 1, 19, 27, 0, time.UTC)))
+	t.Run("ParseTime() - hex with prefix", testParseTimeFunc("0x618C6F9F", "hex", time.Date(2021, time.November, 11, 1, 19, 27, 0, time.UTC)))
+	t.Run("ParseTime() - detected hex by prefix", testParseTimeFunc("0x618C6F9F", "", time.Date(2021, time.November, 11, 1, 19, 27, 0, time.UTC)))
 }
 
 func TestNumIntervals(t *testing.T) {
@@ -26,6 +29,8 @@ func BenchmarkTime(b *testing.B) {
 	b.Run("ParseTime() - rfc3339 no format", benchParseTimeFunc("2009-01-01T12:59:59Z", ""))
 	b.Run("ParseTime() - rfc3339 format specified", benchParseTimeFunc("2009-01-01T12:59:59Z", "rfc3339"))
 	b.Run("ParseTime() - iso8601", benchParseTimeFunc("2016-07-25T02:22:33+0000", "iso8601"))
+	b.Run("ParseTime() - hex detected by prefix", benchParseTimeFunc("0x618C6F9F", ""))
+	b.Run("ParseTime() - hex", benchParseTimeFunc("0x618C6F9F", "hex"))
 }
 
 // Tests "ParseTime() success"

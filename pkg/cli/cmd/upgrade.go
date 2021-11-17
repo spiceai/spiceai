@@ -18,6 +18,7 @@ var upgradeCmd = &cobra.Command{
 spice upgrade
 `,
 	Run: func(cmd *cobra.Command, args []string) {
+		cmd.Println("Checking for latest Spice CLI release...")
 		release, err := github.GetLatestCliRelease()
 		if err != nil {
 			cmd.PrintErrln("Error checking for latest release: %w", err)
