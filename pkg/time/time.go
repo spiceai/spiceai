@@ -17,6 +17,13 @@ type Time struct {
 
 func ParseTime(str string, format string) (time.Time, error) {
 	if format == "" {
+		if strings.HasPrefix(str, "0x") {
+			t, err := parseHexTime(str[2:])
+			if err != nil {
+				return time.Time{}, fmt.Errorf("incorrectly formatted time '%s': %s", str, err.Error())
+			}
+			return t, nil
+		}
 		if ts, err := strconv.ParseInt(str, 10, 64); err == nil {
 			return time.Unix(ts, 0).UTC(), nil
 		}
@@ -24,6 +31,18 @@ func ParseTime(str string, format string) (time.Time, error) {
 			return t.UTC(), nil
 		}
 		return time.Time{}, fmt.Errorf("incorrectly formatted time '%s', expected unix timestamp or rfc3339", str)
+	}
+
+	if format == "hex" {
+		timeStr := str
+		if strings.HasPrefix(str, "0x") {
+			timeStr = str[2:]
+		}
+		t, err := parseHexTime(timeStr)
+		if err != nil {
+			return time.Time{}, fmt.Errorf("incorrectly formatted time '%s': %s", str, err.Error())
+		}
+		return t, nil
 	}
 
 	if strings.EqualFold(format, "rfc3339") {
@@ -80,4 +99,12 @@ func (x *Time) UnmarshalJSON(data []byte) error {
 
 func (x *Time) MarshalJSON() ([]byte, error) {
 	return spice_json.MarshalUnion(x.Integer, x.String, nil)
+}
+
+func parseHexTime(str string) (time.Time, error) {
+	ts, err := strconv.ParseInt(str, 16, 64)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return time.Unix(ts, 0).UTC(), nil
 }
