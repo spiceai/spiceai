@@ -1,9 +1,10 @@
 package cmd
 
 import (
+	"os"
+
 	"github.com/spf13/cobra"
 	"github.com/spiceai/spiceai/pkg/cli/runtime"
-	"github.com/spiceai/spiceai/pkg/github"
 )
 
 var runCmd = &cobra.Command{
@@ -20,7 +21,13 @@ spice run
 		if err != nil {
 			return
 		}
-		github.CheckForLatestVersion()
+
+		err = checkLatestCliReleaseVersion()
+		if err != nil {
+			cmd.Println(err.Error())
+			os.Exit(1)
+		}
+
 	},
 }
 

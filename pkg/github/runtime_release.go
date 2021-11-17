@@ -5,7 +5,6 @@ import (
 	"runtime"
 
 	"github.com/spiceai/spiceai/pkg/constants"
-	"github.com/spiceai/spiceai/pkg/version"
 )
 
 var (
@@ -18,17 +17,6 @@ const (
 	runtimeRepo  = "spiceai"
 )
 
-func CheckForLatestVersion() {
-	release, err := GetLatestCliRelease()
-	if err != nil {
-		return
-	}
-	cliVersion := version.Version()
-	if cliVersion != release.TagName {
-		fmt.Printf("Note: New CLI version %s is now available!\nNote: Run \"spice upgrade\" to update CLI \n", release.TagName)
-		return
-	}
-}
 
 func GetLatestRuntimeRelease() (*RepoRelease, error) {
 	fmt.Println("Checking for latest Spice runtime release...")

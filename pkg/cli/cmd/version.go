@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"fmt"
 	"os"
 
 	"github.com/spf13/cobra"
@@ -45,8 +46,24 @@ spice version
 
 		cmd.Printf("Runtime version: %s\n", rtversion)
 
-		github.CheckForLatestVersion()
+		err = checkLatestCliReleaseVersion()
+		if err != nil {
+			cmd.Println(err.Error())
+			os.Exit(1)
+		}
 	},
+}
+
+func checkLatestCliReleaseVersion() error {
+	release, err := github.GetLatestCliRelease()
+	if err != nil {
+		return err
+	}
+	cliVersion := version.Version()
+	if cliVersion != release.TagName {
+		fmt.Printf("Note: New CLI version %s is now available!\nNote: Run \"spice upgrade\" to update CLI \n", release.TagName)
+	}
+	return nil
 }
 
 func init() {
