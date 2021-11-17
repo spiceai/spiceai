@@ -38,7 +38,7 @@ class TimeSeriesDataManagerTestCase(unittest.TestCase):
         original_data = original_data.set_index("time")
 
         data_manager.merge_data(original_data)
-        filled_table = data_manager._fill_table(data_manager.massive_table_sparse)
+        filled_table = data_manager._fill_table(data_manager.massive_table_sparse)  # pylint: disable=protected-access
 
         expected_data = {10: 1.0, 20: 2.0, 30: 3.0, 40: 0.0, 50: 4.0}
 
@@ -55,7 +55,7 @@ class TimeSeriesDataManagerTestCase(unittest.TestCase):
         original_data = original_data.set_index("time")
 
         data_manager.merge_data(original_data)
-        filled_table = data_manager._fill_table(data_manager.massive_table_sparse)
+        filled_table = data_manager._fill_table(data_manager.massive_table_sparse)  # pylint: disable=protected-access
 
         expected_data = {10: 10.0, 20: 2.0, 30: 3.0, 40: 0.0, 50: 4.0}
 
@@ -72,7 +72,7 @@ class TimeSeriesDataManagerTestCase(unittest.TestCase):
         original_data = original_data.set_index("time")
 
         data_manager.merge_data(original_data)
-        filled_table = data_manager._fill_table(data_manager.massive_table_sparse)
+        filled_table = data_manager._fill_table(data_manager.massive_table_sparse)  # pylint: disable=protected-access
 
         expected_data = {10: 4.0, 20: 4.0, 30: 3.0, 40: 2.0}
 
@@ -89,7 +89,7 @@ class TimeSeriesDataManagerTestCase(unittest.TestCase):
         original_data = original_data.set_index("time")
 
         data_manager.merge_data(original_data)
-        filled_table = data_manager._fill_table(data_manager.massive_table_sparse)
+        filled_table = data_manager._fill_table(data_manager.massive_table_sparse)  # pylint: disable=protected-access
 
         expected_data = {10: 1.0, 20: 2.0, 30: 3.0, 40: 3.0, 50: 4.0}
 

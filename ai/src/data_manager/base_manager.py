@@ -77,7 +77,7 @@ class DataManagerBase(ABC):
         """
         Python Docs: https://docs.python.org/3/library/stdtypes.html#contextmanager.__exit__
 
-        Used to indicate to the datamanager that the pod has stopped training and can clean up the 
+        Used to indicate to the datamanager that the pod has stopped training and can clean up the
         copy of the data used for training.
         """
         self.end_training()

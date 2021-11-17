@@ -3,7 +3,6 @@ from typing import Dict, List
 
 import numpy as np
 import pandas as pd
-from pandas.core.computation import expressions
 
 from data_manager.base_manager import DataManagerBase, DataParam
 from proto.aiengine.v1 import aiengine_pb2
