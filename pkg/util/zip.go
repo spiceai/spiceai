@@ -56,7 +56,7 @@ func ExtractZipFileToDir(zipArchive string, targetDirectory string) error {
 		}
 		defer reader.Close()
 
-		if err := sanitizeExtractPath(f.Name, targetDirectory); err != nil {
+		if err := SanitizeExtractPath(f.Name, targetDirectory); err != nil {
 			return err
 		}
 
@@ -89,7 +89,7 @@ func ExtractZipFileToDir(zipArchive string, targetDirectory string) error {
 	return nil
 }
 
-func sanitizeExtractPath(filePath string, destination string) error {
+func SanitizeExtractPath(filePath string, destination string) error {
 	destpath := filepath.Join(destination, filePath)
 	if !strings.HasPrefix(destpath, filepath.Clean(destination)+string(os.PathSeparator)) {
 		return fmt.Errorf("%s: illegal file path", filePath)

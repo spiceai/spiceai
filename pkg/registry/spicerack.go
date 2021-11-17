@@ -94,7 +94,13 @@ func (r *SpiceRackRegistry) GetPod(podFullPath string) (string, error) {
 			continue
 		}
 
-		err = os.MkdirAll(filepath.Dir(fpath), podsPerm)
+		extractDir := filepath.Dir(fpath)
+		err = util.SanitizeExtractPath(fpath, extractDir)
+		if err != nil {
+			return "", err
+		}
+
+		err = os.MkdirAll(extractDir, podsPerm)
 		if err != nil {
 			return "", err
 		}
