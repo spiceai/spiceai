@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"errors"
-	"os"
 
 	"github.com/spf13/cobra"
 	"github.com/spiceai/spiceai/pkg/context"
@@ -37,11 +36,11 @@ spice add samples/LogPruner
 
 		cmd.Printf("Added %s\n", relativePath)
 
-		err = checkLatestCliReleaseVersion()
-		if err != nil {
-			cmd.Println(err.Error())
-			os.Exit(1)
-		}
+		//err = checkLatestCliReleaseVersion()
+		//if err != nil {
+		//	cmd.Println(err.Error())
+		//	os.Exit(1)
+		//}
 	},
 }
 

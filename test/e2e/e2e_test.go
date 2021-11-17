@@ -842,6 +842,8 @@ func TestImportExport(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	time.Sleep(time.Second)
+
 	t.Log("*** Get Recommendation again ***")
 	newInference, err := runtime.getRecommendation("trader", "latest")
 	if err != nil {
