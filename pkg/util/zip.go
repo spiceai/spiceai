@@ -91,7 +91,7 @@ func ExtractZipFileToDir(zipArchive string, targetDirectory string) error {
 
 func sanitizeExtractPath(filePath string, destination string) error {
 	destpath := filepath.Join(destination, filePath)
-	if !strings.HasPrefix(destpath, filepath.Clean(destination) + string(os.PathSeparator)) {
+	if !strings.HasPrefix(destpath, filepath.Clean(destination)+string(os.PathSeparator)) {
 		return fmt.Errorf("%s: illegal file path", filePath)
 	}
 	return nil
