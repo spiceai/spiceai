@@ -196,7 +196,7 @@ const PodPage: React.FunctionComponent<PodProps> = () => {
           )}
           {!observationsError && observations && gridProps && (
             <div className="border-1 border-gray-300">
-              <ReactAutoSizer disableHeight={true}>
+              <ReactAutoSizer disableHeight={true} defaultHeight={gridHeight}>
                 {(props: { width?: number }) => (
                   <DataEditorContainer width={props.width ?? gridWidth} height={gridHeight}>
                     <DataEditor
