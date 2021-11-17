@@ -17,7 +17,6 @@ const (
 	runtimeRepo  = "spiceai"
 )
 
-
 func GetLatestRuntimeRelease() (*RepoRelease, error) {
 	fmt.Println("Checking for latest Spice runtime release...")
 
