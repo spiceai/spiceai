@@ -61,7 +61,7 @@ func checkLatestCliReleaseVersion() error {
 	}
 	cliVersion := version.Version()
 	if cliVersion != release.TagName {
-		fmt.Printf("Note: New CLI version %s is now available!\nNote: Run \"spice upgrade\" to update CLI \n", release.TagName)
+		fmt.Printf("New CLI version %s is now available!\nRun \"spice upgrade\" to upgrade.\n", release.TagName)
 	}
 	return nil
 }
