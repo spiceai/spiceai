@@ -19,7 +19,6 @@ class TimeSeriesDataManager(DataManagerBase):
             new_series[field_name] = [fields[field_name].initializer]
 
         self.massive_table_sparse = pd.DataFrame(new_series, index={self.param.epoch_time})
-        self.massive_table_training_sparse = None
         self.massive_table_training_filled = None
 
         self.current_time: pd.Timestamp = None
@@ -33,12 +32,12 @@ class TimeSeriesDataManager(DataManagerBase):
             raise Exception("unable to start a new training run before the previous has finished")
         self.is_training = True
         self.metrics.start("copy_training_table")
-        self.massive_table_training_sparse = self._fill_table(self.massive_table_sparse)
+        self.massive_table_training_filled = self._fill_table(self.massive_table_sparse)
         self.metrics.end("copy_training_table")
 
     def end_training(self):
         self.is_training = False
-        self.massive_table_training_sparse = None
+        self.massive_table_training_filled = None
 
     def _resample_table(self, table_to_resample: pd.DataFrame) -> pd.DataFrame:
         self.metrics.start("resample")
@@ -75,7 +74,7 @@ class TimeSeriesDataManager(DataManagerBase):
         for column_name in list(new_row.keys()):
             value = new_row[column_name].array[0]
 
-            self.massive_table_training_sparse.loc[index][column_name] = value
+            self.massive_table_training_filled.loc[index][column_name] = value
 
     def merge_data(self, new_data: pd.DataFrame):
         if len(new_data) == 0:

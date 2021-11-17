@@ -69,8 +69,8 @@ class StatefulConnectorTests(unittest.TestCase):
         index_to_check = pd.to_datetime(30, unit="s")
         expected_bar = 4.0
         expected_foo = 15.0
-        actual_bar = self.data_manager.massive_table_training.loc[index_to_check]["bar"]
-        actual_foo = self.data_manager.massive_table_training.loc[index_to_check]["foo"]
+        actual_bar = self.data_manager.massive_table_training_filled.loc[index_to_check]["bar"]
+        actual_foo = self.data_manager.massive_table_training_filled.loc[index_to_check]["foo"]
         self.assertEqual(expected_bar, actual_bar)
         self.assertEqual(expected_foo, actual_foo)
 
@@ -80,12 +80,6 @@ class StatefulConnectorTests(unittest.TestCase):
                     "bar"
                 ]
             )
-        )
-        self.assertEqual(
-            expected_bar,
-            self.data_manager.massive_table_training.loc[index_to_check + self.granularity][
-                "bar"
-            ],
         )
 
     def test_laws(self):
