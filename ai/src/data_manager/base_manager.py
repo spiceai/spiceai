@@ -73,7 +73,7 @@ class DataManagerBase(ABC):
         """
         self.start_training()
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(self, _exc_type, _exc_val, _exc_tb):
         """
         Python Docs: https://docs.python.org/3/library/stdtypes.html#contextmanager.__exit__
 
