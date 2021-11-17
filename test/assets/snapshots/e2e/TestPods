@@ -45,7 +45,7 @@
     "name": "event-tags"
   },
   {
-    "episodes": 10,
+    "episodes": 5,
     "manifest_path": "fixed",
     "measurements": [
       "coinbase.btcusd.close",
@@ -55,7 +55,7 @@
     "name": "trader"
   },
   {
-    "episodes": 10,
+    "episodes": 5,
     "manifest_path": "fixed",
     "measurements": [
       "coinbase.btcusd.close",
@@ -65,7 +65,7 @@
     "name": "trader-external-funcs"
   },
   {
-    "episodes": 10,
+    "episodes": 5,
     "manifest_path": "fixed",
     "measurements": [
       "coinbase.btcusd.price",
