@@ -35,7 +35,14 @@ var (
 	cliClient          *cli
 	runtime            *runtimeServer
 	snapshotter        *cupaloy.Config
-	testPods           = []string{"test/Trader@0.4.0", "test/customprocessor@0.2.0", "test/event-tags@0.4.0", "test/event-categories@0.2.0", "test/trader-external-funcs@0.1.0", "test/trader-seed-streaming@0.1.0"}
+	testPods           = []string{
+		"test/Trader/ac6b4e4e0a83c49a09bbda6ac0ee385bc5e86433",
+		"test/customprocessor@0.2.0",
+		"test/event-tags@0.4.0",
+		"test/event-categories@0.2.0",
+		"test/trader-external-funcs/07149acdbf4154e2b7527a8af07d4f43f876cd0f",
+		"test/trader-seed-streaming/c8a6e1326034706b47c0f633e9372838cf6e5804",
+	}
 )
 
 func TestMain(m *testing.M) {
@@ -494,7 +501,8 @@ func TestTrainingOutput(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = runtime.waitForTrainingToComplete("trader", "1" /*flight*/, 10, 120)
+	expectedNumberOfEpisodes := 5
+	err = runtime.waitForTrainingToComplete("trader", "1" /*training runs*/, expectedNumberOfEpisodes, 120)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -507,7 +515,7 @@ func TestTrainingOutput(t *testing.T) {
 
 	assert.Equal(t, len(flights), 1, "expect 1 flight to be returned")
 	flight := flights[0]
-	assert.Equal(t, len(flight.Episodes), 10, "expect 10 episodes to be returned")
+	assert.Equal(t, len(flight.Episodes), expectedNumberOfEpisodes, "unexpected number of episodes returned")
 	for _, episode := range flight.Episodes {
 		assert.Empty(t, episode.Error)
 		assert.Empty(t, episode.ErrorMessage)
@@ -547,7 +555,8 @@ func TestTrainingWithExternalRewards(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = runtime.waitForTrainingToComplete("trader-external-funcs", "1" /*flight*/, 10, 120)
+	expectedNumberOfEpisodes := 5
+	err = runtime.waitForTrainingToComplete("trader-external-funcs", "1" /*flight*/, expectedNumberOfEpisodes, 120)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -560,7 +569,7 @@ func TestTrainingWithExternalRewards(t *testing.T) {
 
 	assert.Equal(t, len(flights), 1, "expect 1 flight to be returned")
 	flight := flights[0]
-	assert.Equal(t, len(flight.Episodes), 10, "expect 10 episodes to be returned")
+	assert.Equal(t, len(flight.Episodes), expectedNumberOfEpisodes, "unexpected number of episodes returned")
 	for _, episode := range flight.Episodes {
 		assert.Empty(t, episode.Error)
 		assert.Empty(t, episode.ErrorMessage)
@@ -763,7 +772,7 @@ func TestImportExport(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = runtime.waitForTrainingToComplete("trader", "1" /*flight*/, 10, 300)
+	err = runtime.waitForTrainingToComplete("trader", "1" /*flight*/, 5, 300)
 	if err != nil {
 		t.Fatal(err)
 	}
