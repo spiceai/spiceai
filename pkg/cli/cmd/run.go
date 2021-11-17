@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"log"
 	"os"
 
 	"github.com/spf13/cobra"
@@ -16,9 +17,17 @@ spice run
 # See more at: https://docs.spiceai.org/
 `,
 	Run: func(cmd *cobra.Command, args []string) {
-		err := runtime.Run(contextFlag, "")
+		
+		err := checkLatestCliReleaseVersion()
 		if err != nil {
 			cmd.Println(err.Error())
+			os.Exit(1)
+		}
+
+		err = runtime.Run(contextFlag, "")
+
+		if err != nil {
+			log.Println(err.Error())
 			os.Exit(1)
 		}
 	},
