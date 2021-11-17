@@ -266,6 +266,9 @@ func testPythonCmdBareMetalContextFunc() func(*testing.T) {
 		rtcontext, err := context.NewContext("metal")
 		assert.NoError(t, err)
 
+		err = rtcontext.Init(true)
+		assert.NoError(t, err)
+
 		actual := rtcontext.AIEnginePythonCmdPath()
 		assert.Equal(t, expectedPython, actual)
 	}
