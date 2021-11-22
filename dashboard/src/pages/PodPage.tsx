@@ -24,9 +24,8 @@ interface GridProps {
   gridDataFunc: ([col, row]: readonly [number, number]) => GridCell
 }
 
-// TODO: Resize dynamically
-const gridWidth = 1000
-const gridHeight = 600
+const defaultGridWidth = 1000
+const defaultGridHeight = 600
 
 const PodPage: React.FunctionComponent<PodProps> = () => {
   const location = useLocation()
@@ -54,18 +53,18 @@ const PodPage: React.FunctionComponent<PodProps> = () => {
 
     const numColumns =
       identifiersKeys.length + measurementsKeys.length + categoriesKeys.length + 1 /* tags */
-    const colWidth = (gridWidth - timeCol.width - 32) / numColumns
+    const colWidth = (defaultGridWidth - timeCol.width - 32) / numColumns
 
     for (const i of identifiersKeys) {
-      cols.push({ title: getColumnTitle(i), width: colWidth })
+      cols.push(getColumn(i, colWidth))
     }
 
     for (const m of measurementsKeys) {
-      cols.push({ title: getColumnTitle(m), width: colWidth })
+      cols.push(getColumn(m, colWidth))
     }
 
     for (const c of categoriesKeys) {
-      cols.push({ title: getColumnTitle(c), width: colWidth })
+      cols.push(getColumn(c, colWidth))
     }
 
     cols.push({ title: 'tags', width: colWidth })
@@ -97,7 +96,6 @@ const PodPage: React.FunctionComponent<PodProps> = () => {
         endCol = startCol + identifiersKeys.length
 
         if (col >= startCol && col < endCol) {
-          console.log(observation.identifiers)
           const identifier = observation.identifiers
             ? observation.identifiers[identifiersKeys[col - startCol]]
             : ''
@@ -196,9 +194,12 @@ const PodPage: React.FunctionComponent<PodProps> = () => {
           )}
           {!observationsError && observations && gridProps && (
             <div className="border-1 border-gray-300">
-              <ReactAutoSizer disableHeight={true} defaultHeight={gridHeight}>
+              <ReactAutoSizer disableHeight={true} defaultHeight={defaultGridHeight}>
                 {(props: { width?: number }) => (
-                  <DataEditorContainer width={props.width ?? gridWidth} height={gridHeight}>
+                  <DataEditorContainer
+                    width={props.width ?? defaultGridWidth}
+                    height={defaultGridHeight}
+                  >
                     <DataEditor
                       getCellContent={gridProps.gridDataFunc}
                       columns={gridProps.columns}
@@ -231,9 +232,13 @@ const PodPage: React.FunctionComponent<PodProps> = () => {
   )
 }
 
-const getColumnTitle = (title: string): string => {
+const getColumn = (title: string, width: number): GridColumn => {
   const lastDotIndex = title.lastIndexOf('.')
-  return `${title.substr(lastDotIndex + 1)} (${title.substr(0, lastDotIndex)})`
+  return {
+    title: title.substr(lastDotIndex + 1),
+    group: title.substr(0, lastDotIndex),
+    width: width,
+  }
 }
 
 export default PodPage
