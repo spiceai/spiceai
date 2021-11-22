@@ -59,12 +59,6 @@ class TimeSeriesDataManager(DataManagerBase):
                     col_name
                 ].fillna(0)
         self.metrics.end("ffill")
-
-        self.metrics.start("reindex")
-        table_to_fill.index = (
-            table_to_fill.index.drop_duplicates(keep="first")
-        )
-        self.metrics.end("reindex")
         return table_to_fill
 
     def merge_training_row(self, new_row: pd.DataFrame):
@@ -89,9 +83,9 @@ class TimeSeriesDataManager(DataManagerBase):
                 initial_row[key] = val
 
         self.metrics.start("concat")
-        self.massive_table_sparse = pd.concat([self.massive_table_sparse, new_data_resampled])
+        concat_table = pd.concat([self.massive_table_sparse, new_data_resampled])
         self.metrics.end("concat")
-        self.massive_table_sparse = self._resample_table(self.massive_table_sparse)
+        self.massive_table_sparse = self._resample_table(concat_table)
 
     def add_interpretations(self, interpretations):
         self.interpretations = interpretations
