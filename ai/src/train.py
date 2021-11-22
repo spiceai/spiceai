@@ -98,7 +98,7 @@ class Trainer():
         return episode_reward, episode_actions
 
     def train(self):
-        with self.TRAINING_LOCK:
+        with self.TRAINING_LOCK, self.data_manager:
             print_event(self.pod_name, f"Training {self.training_episodes} episodes...")
 
             not_learning_episodes = 0

@@ -14,7 +14,7 @@ class StatefulConnectorTests(unittest.TestCase):
     def __init__(self, method_name='runTest'):
         super().__init__(method_name)
 
-        self.original_csv = "time,baz\n10,1.0\n20,2.0\n30,3.0\n40,4.0\n50,5.0"
+        self.original_csv = "time,baz\n5,0.0\n9,2.0\n20,2.0\n30,3.0\n40,4.0\n50,5.0"
         self.original_data = pd.read_csv(StringIO(self.original_csv))
         self.original_data["time"] = pd.to_datetime(self.original_data["time"], unit="s")
         self.original_data = self.original_data.set_index("time")
@@ -50,6 +50,10 @@ class StatefulConnectorTests(unittest.TestCase):
 
         self.data_manager.merge_data(self.original_data)
         self.data_manager.reset()
+        self.data_manager.start_training()
+
+    def tearDown(self):
+        self.data_manager.end_training()
 
     def test_apply_action(self):
         action_effects = {
@@ -65,8 +69,8 @@ class StatefulConnectorTests(unittest.TestCase):
         index_to_check = pd.to_datetime(30, unit="s")
         expected_bar = 4.0
         expected_foo = 15.0
-        actual_bar = self.data_manager.massive_table_sparse.loc[index_to_check]["bar"]
-        actual_foo = self.data_manager.massive_table_sparse.loc[index_to_check]["foo"]
+        actual_bar = self.data_manager.massive_table_training_filled.loc[index_to_check]["bar"]
+        actual_foo = self.data_manager.massive_table_training_filled.loc[index_to_check]["foo"]
         self.assertEqual(expected_bar, actual_bar)
         self.assertEqual(expected_foo, actual_foo)
 
@@ -76,12 +80,6 @@ class StatefulConnectorTests(unittest.TestCase):
                     "bar"
                 ]
             )
-        )
-        self.assertEqual(
-            expected_bar,
-            self.data_manager.massive_table_filled.loc[index_to_check + self.granularity][
-                "bar"
-            ],
         )
 
     def test_laws(self):

@@ -110,8 +110,8 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
         training_goal = request.training_goal
 
         if isinstance(data_manager, TimeSeriesDataManager):
-            index_of_epoch = data_manager.massive_table_filled.index.get_loc(data_manager.param.epoch_time, "ffill")
-            if len(data_manager.massive_table_filled.iloc[index_of_epoch:]) < data_manager.get_window_span():
+            index_of_epoch = data_manager.massive_table_sparse.index.get_loc(data_manager.param.epoch_time, "ffill")
+            if len(data_manager.massive_table_sparse.iloc[index_of_epoch:]) < data_manager.get_window_span():
                 return aiengine_pb2.Response(result="not_enough_data_for_training", error=True)
 
         started = dispatch_train_agent(
