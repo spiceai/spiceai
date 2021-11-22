@@ -64,6 +64,32 @@ class DataManagerBase(ABC):
                 result_array.append(row)
         return np.nan_to_num(result_array)
 
+    def __enter__(self):
+        """
+        Python Docs: https://docs.python.org/3/library/stdtypes.html#contextmanager.__enter__
+
+        Used to indicate to the datamanager that the pod is currently training. This should
+        trigger the data manager to make a deep copy of the underlying data to be used for training.
+        """
+        self.start_training()
+
+    def __exit__(self, _exc_type, _exc_val, _exc_tb):
+        """
+        Python Docs: https://docs.python.org/3/library/stdtypes.html#contextmanager.__exit__
+
+        Used to indicate to the datamanager that the pod has stopped training and can clean up the
+        copy of the data used for training.
+        """
+        self.end_training()
+
+    @abstractmethod
+    def start_training(self):
+        raise RuntimeError('Not Implemented')
+
+    @abstractmethod
+    def end_training(self):
+        raise RuntimeError('Not Implemented')
+
     @abstractmethod
     def add_interpretations(self, interpretations):
         raise RuntimeError('Not Implemented')
@@ -73,11 +99,19 @@ class DataManagerBase(ABC):
         raise RuntimeError('Not Implemented')
 
     @abstractmethod
+    def get_window_at(self, time: pd.Timestamp) -> pd.DataFrame:
+        raise RuntimeError('Not Implemented')
+
+    @abstractmethod
     def get_shape(self) -> tuple:
         raise RuntimeError('Not Implemented')
 
     @abstractmethod
     def merge_data(self, new_data):
+        raise RuntimeError('Not Implemented')
+
+    @abstractmethod
+    def merge_training_row(self, new_row):
         raise RuntimeError('Not Implemented')
 
     @abstractmethod
