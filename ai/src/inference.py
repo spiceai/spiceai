@@ -36,9 +36,9 @@ class GetInferenceHandler:
 
         data_manager = self.data_managers[self.request.pod]
 
-        first_valid_time = (data_manager.massive_table_filled.first_valid_index() +
+        first_valid_time = (data_manager.massive_table_sparse.first_valid_index() +
                             data_manager.param.interval_secs).timestamp()
-        last_valid_time = data_manager.massive_table_filled.last_valid_index().timestamp()
+        last_valid_time = data_manager.massive_table_sparse.last_valid_index().timestamp()
 
         if not self.__is_valid_inference_time(first_valid_time, last_valid_time):
             result = "invalid_recommendation_time"
@@ -82,11 +82,11 @@ class GetInferenceHandler:
 
             data_manager = self.data_managers[self.request.pod]
 
-            if data_manager.massive_table_filled.shape[0] < data_manager.get_window_span():
+            if data_manager.massive_table_sparse.shape[0] < data_manager.get_window_span():
                 return aiengine_pb2.InferenceResult(
                     response=aiengine_pb2.Response(result="not_enough_data", error=True))
 
-            latest_time = data_manager.massive_table_filled.last_valid_index()
+            latest_time = data_manager.massive_table_sparse.last_valid_index()
             inference_time = latest_time if self.use_latest_time else self.inference_time
             requested_window = data_manager.get_window_at(inference_time)
             state = data_manager.flatten_and_normalize_window(requested_window)
@@ -114,7 +114,7 @@ class GetInferenceHandler:
         action_name = data_manager.action_names[action_from_model]
 
         if self.use_latest_time:
-            end_time = data_manager.massive_table_filled.last_valid_index()
+            end_time = data_manager.massive_table_sparse.last_valid_index()
         else:
             end_time = self.inference_time
 

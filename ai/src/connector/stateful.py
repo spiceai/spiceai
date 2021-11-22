@@ -19,7 +19,7 @@ class StatefulConnector:
             new_series[data] = [new_data[data]]
         new_data_frame = pd.DataFrame(new_series, index={next_timestamp})
 
-        self.data_manager.merge_data(new_data_frame)
+        self.data_manager.merge_training_row(new_data_frame)
 
     def apply_action(self, action: int, data_row: pd.DataFrame) -> bool:
         action_name = self.data_manager.action_names[action]
