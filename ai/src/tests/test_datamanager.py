@@ -1,4 +1,5 @@
 from io import StringIO
+from typing import Dict
 import unittest
 
 import pandas as pd
@@ -8,18 +9,27 @@ from data_manager.time_series_manager import TimeSeriesDataManager
 from proto.aiengine.v1 import aiengine_pb2
 
 
-def get_test_data_manager(fill_method=aiengine_pb2.FILL_ZERO):
+def get_test_fields(fill_method) -> Dict[str, aiengine_pb2.FieldData]:
+    return {
+        "foo": aiengine_pb2.FieldData(
+            initializer=10.0, fill_method=fill_method
+        ),
+        "bar": aiengine_pb2.FieldData(
+            initializer=0.0, fill_method=fill_method
+        )
+    }
+
+
+def get_test_data_manager(fill_method=aiengine_pb2.FILL_ZERO, fields=None):
+    if fields is None:
+        fields = get_test_fields(fill_method)
     return TimeSeriesDataManager(
         param=DataParam(
             epoch_time=pd.to_datetime(10, unit="s"),
             period_secs=pd.to_timedelta(1, unit="s"),
             interval_secs=pd.to_timedelta(1, unit="s"),
             granularity_secs=pd.to_timedelta(10, unit="s")),
-        fields={
-            "foo": aiengine_pb2.FieldData(
-                initializer=10.0, fill_method=fill_method
-            )
-        },
+        fields=fields,
         action_rewards={"foo": "bar"},
         actions_order={"foo": 0},
         laws=["law"],
@@ -28,6 +38,40 @@ def get_test_data_manager(fill_method=aiengine_pb2.FILL_ZERO):
 
 
 class TimeSeriesDataManagerTestCase(unittest.TestCase):
+    def test_column_order_changing(self):
+        reversed_fields = {
+            "bar": aiengine_pb2.FieldData(
+                initializer=0.0, fill_method=aiengine_pb2.FILL_FORWARD
+            ),
+            "foo": aiengine_pb2.FieldData(
+                initializer=10.0, fill_method=aiengine_pb2.FILL_FORWARD
+            )
+        }
+
+        normal_data_manager = get_test_data_manager(fill_method=aiengine_pb2.FILL_FORWARD)
+
+        original_csv = "time,foo\n20,2.0\n30,3.0\n50,4.0"
+        original_data = pd.read_csv(StringIO(original_csv))
+        original_data["time"] = pd.to_datetime(original_data["time"], unit="s")
+        original_data = original_data.set_index("time")
+
+        normal_data_manager.merge_data(original_data)
+
+        reversed_data_manager = get_test_data_manager(fields=reversed_fields)
+        reversed_data_manager.merge_data(original_data)
+
+        window_index = normal_data_manager.massive_table_sparse.last_valid_index()
+
+        normal_window = normal_data_manager.get_window_at(window_index)
+        normal_flattened = normal_data_manager.flatten_and_normalize_window(normal_window)
+        reversed_window = reversed_data_manager.get_window_at(window_index)
+        reversed_flattened = reversed_data_manager.flatten_and_normalize_window(reversed_window)
+
+        self.assertEqual(len(normal_flattened), len(reversed_flattened))
+
+        for i, _ in enumerate(normal_flattened):
+            self.assertEqual(normal_flattened[i], reversed_flattened[i])
+
     def test_zero_fill_data(self):
         data_manager = get_test_data_manager(fill_method=aiengine_pb2.FILL_ZERO)
 
@@ -43,7 +87,7 @@ class TimeSeriesDataManagerTestCase(unittest.TestCase):
         expected_data = {10: 1.0, 20: 2.0, 30: 3.0, 40: 0.0, 50: 4.0}
 
         for key, value in expected_data.items():
-            self.assertEqual(value, filled_table.loc[pd.to_datetime(key, unit="s")].values[0])
+            self.assertEqual(value, filled_table["foo"].loc[pd.to_datetime(key, unit="s")])
 
     def test_initial_data_preserved(self):
         data_manager = get_test_data_manager(fill_method=aiengine_pb2.FILL_ZERO)
@@ -60,7 +104,7 @@ class TimeSeriesDataManagerTestCase(unittest.TestCase):
         expected_data = {10: 10.0, 20: 2.0, 30: 3.0, 40: 0.0, 50: 4.0}
 
         for key, value in expected_data.items():
-            self.assertEqual(value, filled_table.loc[pd.to_datetime(key, unit="s")].values[0])
+            self.assertEqual(value, filled_table["foo"].loc[pd.to_datetime(key, unit="s")])
 
     def test_new_data_out_of_order(self):
         data_manager = get_test_data_manager(fill_method=aiengine_pb2.FILL_FORWARD)
@@ -77,7 +121,7 @@ class TimeSeriesDataManagerTestCase(unittest.TestCase):
         expected_data = {10: 4.0, 20: 4.0, 30: 3.0, 40: 2.0}
 
         for key, value in expected_data.items():
-            self.assertEqual(value, filled_table.loc[pd.to_datetime(key, unit="s")].values[0])
+            self.assertEqual(value, filled_table["foo"].loc[pd.to_datetime(key, unit="s")])
 
     def test_forward_fill_data(self):
         data_manager = get_test_data_manager(fill_method=aiengine_pb2.FILL_FORWARD)
@@ -94,7 +138,7 @@ class TimeSeriesDataManagerTestCase(unittest.TestCase):
         expected_data = {10: 1.0, 20: 2.0, 30: 3.0, 40: 3.0, 50: 4.0}
 
         for key, value in expected_data.items():
-            self.assertEqual(value, filled_table.loc[pd.to_datetime(key, unit="s")].values[0])
+            self.assertEqual(value, filled_table["foo"].loc[pd.to_datetime(key, unit="s")])
 
     def test_merge_data_resampling(self):
         data_manager = get_test_data_manager(fill_method=aiengine_pb2.FILL_FORWARD)
@@ -113,7 +157,7 @@ class TimeSeriesDataManagerTestCase(unittest.TestCase):
 
         data_manager.merge_data(new_data)
 
-        self.assertEqual(data_manager.massive_table_sparse.shape, (3, 1))
+        self.assertEqual(data_manager.massive_table_sparse.shape, (3, 2))
         self.assertEqual(data_manager.massive_table_sparse["foo"][0], 2.0)
 
     def test_get_shape(self):

@@ -14,7 +14,8 @@ class TimeSeriesDataManager(DataManagerBase):
         super().__init__(param, fields, action_rewards, actions_order, external_reward_funcs, laws)
 
         new_series = {}
-        for field_name in fields:
+        sorted_field_names = sorted(fields)
+        for field_name in sorted_field_names:
             new_series[field_name] = [fields[field_name].initializer]
 
         self.massive_table_sparse = pd.DataFrame(new_series, index={self.param.epoch_time})
@@ -88,7 +89,7 @@ class TimeSeriesDataManager(DataManagerBase):
                 initial_row[key] = val
 
         self.metrics.start("concat")
-        self.massive_table_sparse = pd.concat([self.massive_table_sparse, new_data])
+        self.massive_table_sparse = pd.concat([self.massive_table_sparse, new_data_resampled])
         self.metrics.end("concat")
         self.massive_table_sparse = self._resample_table(self.massive_table_sparse)
 
