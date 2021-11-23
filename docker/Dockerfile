@@ -1,4 +1,4 @@
-FROM node as dashboard
+FROM node:16 as dashboard
 
 WORKDIR /build-dashboard
 
