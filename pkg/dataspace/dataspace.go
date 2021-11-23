@@ -3,6 +3,7 @@ package dataspace
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -14,21 +15,45 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-type Measurement struct {
+type IdentifierInfo struct {
+	Name   string
+	FqName string
+}
+
+type MeasurementInfo struct {
 	Name         string
 	InitialValue float64
 	Fill         string
 }
 
-type Category struct {
-	Name   string
-	Values []string
+type CategoryInfo struct {
+	Name              string
+	FqName            string
+	Values            []string
+	EncodedFieldNames []string
+}
+
+type DataInfo struct {
+	connectorSpec *spec.DataConnectorSpec
+	connector     dataconnectors.DataConnector
+	processor     dataprocessors.DataProcessor
 }
 
 type Dataspace struct {
 	spec.DataspaceSpec
-	connector dataconnectors.DataConnector
-	processor dataprocessors.DataProcessor
+
+	seedDataInfo *DataInfo
+	dataInfo     *DataInfo
+
+	identifiers []*IdentifierInfo
+	categories  []*CategoryInfo
+
+	identifiersNames []string
+	measurementNames []string
+	categoryNames    []string
+
+	tags   []string
+	fqTags []string
 
 	stateMutex    *sync.RWMutex
 	cachedState   []*state.State
@@ -36,43 +61,42 @@ type Dataspace struct {
 }
 
 func NewDataspace(dsSpec spec.DataspaceSpec) (*Dataspace, error) {
+	identifiersNames, identifiers, identifierSelectors := getIdentifiers(dsSpec)
+	categoryNames, categories, categorySelectors := getCategories(dsSpec)
+	measurementNames, measurementSelectors := getMeasurements(dsSpec)
+	tags, fqTags := getTags(dsSpec)
+
 	ds := Dataspace{
-		DataspaceSpec: dsSpec,
-		stateMutex:    &sync.RWMutex{},
+		DataspaceSpec:    dsSpec,
+		stateMutex:       &sync.RWMutex{},
+		identifiers:      identifiers,
+		identifiersNames: identifiersNames,
+		measurementNames: measurementNames,
+		categories:       categories,
+		categoryNames:    categoryNames,
+		tags:             tags,
+		fqTags:           fqTags,
+	}
+
+	tagSelectors := []string{"_tags"}
+	if dsSpec.Tags != nil {
+		tagSelectors = append(tagSelectors, dsSpec.Tags.Selectors...)
+	}
+
+	if dsSpec.SeedData != nil {
+		dataInfo, err := getDataInfo(dsSpec.SeedData, identifierSelectors, measurementSelectors, categorySelectors, tagSelectors, ds.ReadSeedData)
+		if err != nil {
+			return nil, err
+		}
+		ds.seedDataInfo = dataInfo
 	}
 
 	if dsSpec.Data != nil {
-		var connector dataconnectors.DataConnector = nil
-		var err error
-
-		processor, err := dataprocessors.NewDataProcessor(ds.Data.Processor.Name)
+		dataInfo, err := getDataInfo(dsSpec.Data, identifierSelectors, measurementSelectors, categorySelectors, tagSelectors, ds.ReadData)
 		if err != nil {
-			return nil, fmt.Errorf("failed to initialize data processor '%s': %s", dsSpec.Data.Connector.Name, err)
+			return nil, err
 		}
-
-		measurements := ds.measurementSelectorMap()
-		categories := ds.categorySelectorMap()
-
-		err = processor.Init(dsSpec.Data.Connector.Params, measurements, categories)
-		if err != nil {
-			return nil, fmt.Errorf("failed to initialize data processor '%s': %s", dsSpec.Data.Connector.Name, err)
-		}
-
-		ds.processor = processor
-
-		if dsSpec.Data.Connector.Name != "" {
-			connector, err = dataconnectors.NewDataConnector(dsSpec.Data.Connector.Name)
-			if err != nil {
-				return nil, fmt.Errorf("failed to initialize data connector '%s': %s", dsSpec.Data.Connector.Name, err)
-			}
-
-			err = connector.Read(ds.ReadData)
-			if err != nil {
-				return nil, fmt.Errorf("'%s' data connector failed to read: %s", dsSpec.Data.Connector.Name, err)
-			}
-		}
-
-		ds.connector = connector
+		ds.dataInfo = dataInfo
 	}
 
 	return &ds, nil
@@ -104,26 +128,22 @@ func (ds *Dataspace) Actions() map[string]string {
 	return fqActions
 }
 
-// Returns a mapping of fully-qualified category names to Category
-func (ds *Dataspace) Categories() map[string]*Category {
-	categories := make(map[string]*Category)
-	for _, categorySpec := range ds.DataspaceSpec.Categories {
-		fqCategoryName := fmt.Sprintf("%s.%s.%s", ds.From, ds.DataspaceSpec.Name, categorySpec.Name)
-		categories[fqCategoryName] = &Category{
-			Name:   categorySpec.Name,
-			Values: categorySpec.Values,
-		}
-	}
+// Returns the list of Identifiers sorted by Name
+func (ds *Dataspace) Identifiers() []*IdentifierInfo {
+	return ds.identifiers
+}
 
-	return categories
+// Returns the list of Categories sorted by Name
+func (ds *Dataspace) Categories() []*CategoryInfo {
+	return ds.categories
 }
 
 // Returns a mapping of fully-qualified measurement names to Measurements
-func (ds *Dataspace) Measurements() map[string]*Measurement {
-	fqMeasurementInitializers := make(map[string]*Measurement)
+func (ds *Dataspace) Measurements() map[string]*MeasurementInfo {
+	fqMeasurementInitializers := make(map[string]*MeasurementInfo)
 	fqMeasurementNames := ds.MeasurementNameMap()
 	for _, measurementSpec := range ds.DataspaceSpec.Measurements {
-		measurement := &Measurement{
+		measurement := &MeasurementInfo{
 			Name:         measurementSpec.Name,
 			InitialValue: 0,
 			Fill:         measurementSpec.Fill,
@@ -140,50 +160,35 @@ func (ds *Dataspace) Measurements() map[string]*Measurement {
 func (ds *Dataspace) MeasurementNameMap() map[string]string {
 	measurementNames := make(map[string]string, len(ds.DataspaceSpec.Measurements))
 	for _, v := range ds.DataspaceSpec.Measurements {
-		fqname := fmt.Sprintf("%s.%s.%s", ds.From, ds.DataspaceSpec.Name, v.Name)
+		fqname := fmt.Sprintf("%s.%s.%s", ds.DataspaceSpec.From, ds.DataspaceSpec.Name, v.Name)
 		measurementNames[v.Name] = fqname
 	}
 	return measurementNames
 }
 
+// Returns the sorted list of local identifiers names
+func (ds *Dataspace) IdentifiersNames() []string {
+	return ds.identifiersNames
+}
+
+// Returns the sorted list of local measurement names
 func (ds *Dataspace) MeasurementNames() []string {
-	measurementNames := make([]string, 0, len(ds.DataspaceSpec.Measurements))
-	for _, v := range ds.DataspaceSpec.Measurements {
-		measurementNames = append(measurementNames, v.Name)
-	}
-
-	return measurementNames
+	return ds.measurementNames
 }
 
-func (ds *Dataspace) measurementSelectorMap() map[string]string {
-	measurements := make(map[string]string)
-	for _, m := range ds.DataspaceSpec.Measurements {
-		if m.Selector == "" {
-			measurements[m.Name] = m.Name
-		} else {
-			measurements[m.Name] = m.Selector
-		}
-	}
-
-	return measurements
+// Returns the sorted list of local category names
+func (ds *Dataspace) CategoryNames() []string {
+	return ds.categoryNames
 }
 
-func (ds *Dataspace) categorySelectorMap() map[string]string {
-	categories := make(map[string]string)
-	for _, c := range ds.DataspaceSpec.Categories {
-		if c.Selector == "" {
-			categories[c.Name] = c.Name
-		} else {
-			categories[c.Name] = c.Selector
-		}
-	}
-
-	return categories
+// Returns the list of fully-qualified tags
+func (ds *Dataspace) FqTags() []string {
+	return ds.fqTags
 }
 
 // Returns the local tag name (not fully-qualified)
 func (ds *Dataspace) Tags() []string {
-	return ds.DataspaceSpec.Tags
+	return ds.tags
 }
 
 func (ds *Dataspace) ActionNames() map[string]string {
@@ -239,35 +244,187 @@ func (ds *Dataspace) RegisterStateHandler(handler func(state *state.State, metad
 }
 
 func (ds *Dataspace) InitDataConnector(epoch time.Time, period time.Duration, interval time.Duration) error {
-	if ds.connector != nil {
-		err := ds.connector.Init(epoch, period, interval, ds.Data.Connector.Params)
-		if err != nil {
-			return fmt.Errorf("failed to initialize data connector '%s': %s", ds.Data.Connector.Name, err)
+	if ds.seedDataInfo != nil && ds.seedDataInfo.connector != nil {
+		if err := ds.seedDataInfo.connector.Init(epoch, period, interval, ds.seedDataInfo.connectorSpec.Params); err != nil {
+			return fmt.Errorf("failed to initialize seed data connector '%s': %s", ds.seedDataInfo.connectorSpec.Name, err)
 		}
 	}
+
+	if ds.dataInfo != nil && ds.dataInfo.connector != nil {
+		if err := ds.dataInfo.connector.Init(epoch, period, interval, ds.dataInfo.connectorSpec.Params); err != nil {
+			return fmt.Errorf("failed to initialize data connector '%s': %s", ds.dataInfo.connectorSpec.Name, err)
+		}
+	}
+
 	return nil
 }
 
+func (ds *Dataspace) ReadSeedData(data []byte, metadata map[string]string) ([]byte, error) {
+	return ds.readData(ds.seedDataInfo.processor, data, metadata)
+}
+
 func (ds *Dataspace) ReadData(data []byte, metadata map[string]string) ([]byte, error) {
+	return ds.readData(ds.dataInfo.processor, data, metadata)
+}
+
+func (ds *Dataspace) readData(processor dataprocessors.DataProcessor, data []byte, metadata map[string]string) ([]byte, error) {
 	if data == nil {
 		return nil, nil
 	}
 
-	_, err := ds.processor.OnData(data)
+	_, err := processor.OnData(data)
 	if err != nil {
 		return nil, err
 	}
 
-	observations, err := ds.processor.GetObservations()
+	observations, err := processor.GetObservations()
 	if err != nil {
 		return nil, err
 	}
 
-	newState := state.NewState(ds.Path(), ds.MeasurementNames(), ds.Tags(), observations)
+	newState := state.NewState(ds.Path(), ds.IdentifiersNames(), ds.MeasurementNames(), ds.CategoryNames(), ds.Tags(), observations)
 	err = ds.AddNewState(newState, metadata)
 	if err != nil {
 		return nil, err
 	}
 
 	return data, nil
+}
+
+func getDataInfo(dataSpec *spec.DataSpec, identifierSelectors map[string]string, measurementSelectors map[string]string, categorySelectors map[string]string, tagSelectors []string, readData func(data []byte, metadata map[string]string) ([]byte, error)) (*DataInfo, error) {
+	processor, err := dataprocessors.NewDataProcessor(dataSpec.Processor.Name)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize data processor '%s': %s", dataSpec.Processor.Name, err)
+	}
+
+	err = processor.Init(dataSpec.Processor.Params, identifierSelectors, measurementSelectors, categorySelectors, tagSelectors)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize data processor '%s': %s", dataSpec.Processor.Name, err)
+	}
+
+	var connector dataconnectors.DataConnector
+	if dataSpec.Connector.Name != "" {
+		connector, err = dataconnectors.NewDataConnector(dataSpec.Connector.Name)
+		if err != nil {
+			return nil, fmt.Errorf("failed to initialize data connector '%s': %s", dataSpec.Connector.Name, err)
+		}
+
+		err = connector.Read(readData)
+		if err != nil {
+			return nil, fmt.Errorf("'%s' data connector failed to read: %s", dataSpec.Connector.Name, err)
+		}
+	}
+
+	return &DataInfo{
+		connectorSpec: &dataSpec.Connector,
+		connector:     connector,
+		processor:     processor,
+	}, nil
+}
+
+func getIdentifiers(dsSpec spec.DataspaceSpec) ([]string, []*IdentifierInfo, map[string]string) {
+	identifierNames := make([]string, len(dsSpec.Identifiers))
+	identifiers := make([]*IdentifierInfo, len(dsSpec.Identifiers))
+	identifierSelectors := make(map[string]string)
+	for i, identifierSpec := range dsSpec.Identifiers {
+		identifierNames[i] = identifierSpec.Name
+		fqIdentifierName := fmt.Sprintf("%s.%s.%s", dsSpec.From, dsSpec.Name, identifierSpec.Name)
+		identifiers[i] = &IdentifierInfo{
+			Name:   identifierSpec.Name,
+			FqName: fqIdentifierName,
+		}
+		if identifierSpec.Selector == "" {
+			identifierSelectors[identifierSpec.Name] = identifierSpec.Name
+		} else {
+			identifierSelectors[identifierSpec.Name] = strings.TrimSpace(identifierSpec.Selector)
+		}
+	}
+	sort.Strings(identifierNames)
+	sort.SliceStable(identifiers, func(i, j int) bool {
+		return strings.Compare(identifiers[i].Name, identifiers[j].Name) == -1
+	})
+	return identifierNames, identifiers, identifierSelectors
+}
+
+func getMeasurements(dsSpec spec.DataspaceSpec) ([]string, map[string]string) {
+	measurementNames := make([]string, 0, len(dsSpec.Measurements))
+	measurementSelectors := make(map[string]string)
+	for _, v := range dsSpec.Measurements {
+		measurementNames = append(measurementNames, v.Name)
+		if v.Selector == "" {
+			measurementSelectors[v.Name] = v.Name
+		} else {
+			measurementSelectors[v.Name] = strings.TrimSpace(v.Selector)
+		}
+	}
+	sort.Strings(measurementNames)
+
+	return measurementNames, measurementSelectors
+}
+
+func getCategories(dsSpec spec.DataspaceSpec) ([]string, []*CategoryInfo, map[string]string) {
+	categoryNames := make([]string, len(dsSpec.Categories))
+	categories := make([]*CategoryInfo, len(dsSpec.Categories))
+	categorySelectors := make(map[string]string)
+	for i, categorySpec := range dsSpec.Categories {
+		categoryNames[i] = categorySpec.Name
+		fqCategoryName := fmt.Sprintf("%s.%s.%s", dsSpec.From, dsSpec.Name, categorySpec.Name)
+		sort.Strings(categorySpec.Values)
+		fieldNames := make([]string, len(categorySpec.Values))
+		for i, val := range categorySpec.Values {
+			oneHotFieldName := fmt.Sprintf("%s-%s", fqCategoryName, val)
+			oneHotFieldName = strings.ReplaceAll(oneHotFieldName, ".", "_")
+			fieldNames[i] = oneHotFieldName
+		}
+		categories[i] = &CategoryInfo{
+			Name:              categorySpec.Name,
+			FqName:            fqCategoryName,
+			Values:            categorySpec.Values,
+			EncodedFieldNames: fieldNames,
+		}
+		if categorySpec.Selector == "" {
+			categorySelectors[categorySpec.Name] = categorySpec.Name
+		} else {
+			categorySelectors[categorySpec.Name] = strings.TrimSpace(categorySpec.Selector)
+		}
+	}
+	sort.Strings(categoryNames)
+	sort.SliceStable(categories, func(i, j int) bool {
+		return strings.Compare(categories[i].Name, categories[j].Name) == -1
+	})
+	return categoryNames, categories, categorySelectors
+}
+
+func getTags(dsSpec spec.DataspaceSpec) ([]string, []string) {
+	numTags := 0
+	if dsSpec.Tags != nil {
+		numTags = len(dsSpec.Tags.Values)
+	}
+	tags := make([]string, numTags)
+	fqTags := make([]string, numTags)
+	if numTags > 0 {
+		for i, tagName := range dsSpec.Tags.Values {
+			tags[i] = tagName
+			fqTags[i] = fmt.Sprintf("%s.%s.%s", dsSpec.From, dsSpec.Name, tagName)
+		}
+		sort.Strings(tags)
+		sort.Strings(fqTags)
+	}
+	return tags, fqTags
+}
+
+func getTagSelectors(dsSpec spec.DataspaceSpec) []string {
+	numSelectors := 0
+	if dsSpec.Tags != nil {
+		numSelectors = len(dsSpec.Tags.Selectors)
+	}
+	tagSelectors := make([]string, numSelectors+1)
+	if numSelectors > 0 {
+		for i, tagSelector := range dsSpec.Tags.Selectors {
+			tagSelectors[i] = tagSelector
+		}
+	}
+	tagSelectors[numSelectors] = "_tag"
+	sort.Strings(tagSelectors)
+	return tagSelectors
 }

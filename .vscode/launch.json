@@ -15,7 +15,7 @@
       }
     },
     {
-      "name": "spice add action hold",
+      "name": "spice action add hold",
       "type": "go",
       "request": "launch",
       "mode": "auto",
@@ -23,12 +23,41 @@
       "args": ["action", "add", "hold"]
     },
     {
-      "name": "spice e2e test docker",
+      "name": "spice add <pod>",
       "type": "go",
       "request": "launch",
       "mode": "auto",
+      "program": "${workspaceFolder}/cmd/spice/main.go",
+      "args": [
+        "add",
+        "test/trader-seed-streaming@c8a6e1326034706b47c0f633e9372838cf6e5804"
+      ]
+    },
+    {
+      "name": "spice e2e test docker",
+      "type": "go",
+      "request": "launch",
+      "mode": "test",
+      "runtimeArgs": ["-test.v"],
       "program": "${workspaceFolder}/test/e2e/e2e_test.go",
       "args": ["-e2e"]
+    },
+    {
+      "name": "spice e2e test metal",
+      "type": "go",
+      "request": "launch",
+      "mode": "test",
+      "runtimeArgs": ["-test.v"],
+      "program": "${workspaceFolder}/test/e2e/e2e_test.go",
+      "args": ["-e2e", "--context", "metal"]
+    },
+    {
+      "name": "spiced",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "program": "${workspaceFolder}/cmd/spiced/main.go",
+      "args": []
     },
     {
       "name": "Test Current File",

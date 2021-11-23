@@ -19,7 +19,9 @@ Spice.ai takes a developer-first approach, and is focused on a fast, iterative, 
 
 📢 Read the Spice.ai announcement blog post at [blog.spiceai.org](https://blog.spiceai.org).
 
-📺 View a 60 second demo of Spice.ai in action [here](https://www.youtube.com/watch?v=FPPGyPq41kQ).
+📺 View a getting started walkthrough of Spice.ai in action [here](https://www.youtube.com/watch?v=DKBLjuAz_lI).
+
+💻 Learn about our [approach to building intelligent applications](https://blog.spiceai.org/posts/2021/11/05/making-apps-that-learn-and-adapt/) and not just "doing AI"
 
 ## Features
 
@@ -81,7 +83,7 @@ Thank you for sharing this journey with us.
 
 First, ⭐️ star this repo! Thank you for your support! 🙏
 
-Then, follow this guide to get started quickly with Spice.ai. For a more comprehensive guide, see the full [online documentation](https://docs.spiceai.org/).
+Then, follow this guide to get started quickly with Spice.ai. For a more comprehensive guide, see the full [online documentation](https://docs.spiceai.org/). Also check out our video walkthrough on [getting started](https://www.youtube.com/watch?v=DKBLjuAz_lI).
 
 ### Current hosting limitations
 

@@ -18,21 +18,35 @@ var snapshotter = cupaloy.New(cupaloy.SnapshotSubdirectory("../../test/assets/sn
 
 func TestPod(t *testing.T) {
 	type TestPodParams struct {
-		LocalStateTest bool
-		ExpectedHash   string
+		LocalStateTest   bool
+		ExpectedHash     string
+		ValidForTraining bool
 	}
 	manifestsToTest := map[string]*TestPodParams{
 		"trader.yaml": {
-			LocalStateTest: true,
-			ExpectedHash:   "83ba69e37dd58ba0b607c6ebd88d9f96",
+			LocalStateTest:   true,
+			ExpectedHash:     "6d423c1f6dc9087139b1af70ae58280e",
+			ValidForTraining: true,
 		},
 		"trader-infer.yaml": {
-			LocalStateTest: true,
-			ExpectedHash:   "ea70b58d28538842a1cb52fdb7d5b11f",
+			LocalStateTest:   true,
+			ExpectedHash:     "ea70b58d28538842a1cb52fdb7d5b11f",
+			ValidForTraining: false,
 		},
 		"event-tags.yaml": {
-			LocalStateTest: false,
-			ExpectedHash:   "16fc4b1dbaacbabb2b88b16e47e2c0de",
+			LocalStateTest:   false,
+			ExpectedHash:     "1dea04f71a65220474eb690252700f99",
+			ValidForTraining: true,
+		},
+		"event-tags-invalid.yaml": {
+			LocalStateTest:   false,
+			ExpectedHash:     "d0e9abb23337df113999fb51560165d2",
+			ValidForTraining: false,
+		},
+		"event-categories.yaml": {
+			LocalStateTest:   false,
+			ExpectedHash:     "9879535af17608c087d519b74a497f35",
+			ValidForTraining: true,
 		},
 	}
 
@@ -49,12 +63,23 @@ func TestPod(t *testing.T) {
 		t.Run(fmt.Sprintf("MeasurementNames() - %s", manifestToTest), testMeasurementNamesFunc(pod))
 		t.Run(fmt.Sprintf("Rewards() - %s", manifestToTest), testRewardsFunc(pod))
 		t.Run(fmt.Sprintf("Actions() - %s", manifestToTest), testActionsFunc(pod))
+		t.Run(fmt.Sprintf("Tags() - %s", manifestToTest), testTagsFunc(pod))
 		t.Run(fmt.Sprintf("CachedCsv() - %s", manifestToTest), testCachedCsvFunc(pod))
-		t.Run(fmt.Sprintf("TagPathMap() - %s", manifestToTest), testTagPathMap(pod))
+		t.Run(fmt.Sprintf("ValidateForTraining() - %s", manifestToTest), testValidateForTraining(pod, testParams.ValidForTraining))
 
 		if testParams.LocalStateTest {
 			t.Run(fmt.Sprintf("AddLocalState() - %s", manifestToTest), testAddLocalStateFunc(pod))
 			t.Run(fmt.Sprintf("AddLocalState()/CachedCsv() - %s", manifestToTest), testAddLocalStateCachedCsvFunc(pod))
+		}
+	}
+}
+
+func testValidateForTraining(pod *Pod, validForTraining bool) func(*testing.T) {
+	return func(t *testing.T) {
+		if validForTraining {
+			assert.NoError(t, pod.ValidateForTraining())
+		} else {
+			assert.Error(t, pod.ValidateForTraining())
 		}
 	}
 }
@@ -78,6 +103,10 @@ func testBasePropertiesFunc(pod *Pod, expectedHash string) func(*testing.T) {
 			expected = "../../test/assets/pods/manifests/trader-infer.yaml"
 		case "event-tags":
 			expected = "../../test/assets/pods/manifests/event-tags.yaml"
+		case "event-tags-invalid":
+			expected = "../../test/assets/pods/manifests/event-tags-invalid.yaml"
+		case "event-categories":
+			expected = "../../test/assets/pods/manifests/event-categories.yaml"
 		}
 
 		assert.Equal(t, expected, actual, "invalid pod.ManifestPath()")
@@ -91,6 +120,10 @@ func testBasePropertiesFunc(pod *Pod, expectedHash string) func(*testing.T) {
 			actual = actual[:8] // Reduce precision to test
 			expected = fmt.Sprintf("%d", time.Now().Add(-pod.Period()).Unix())[:8]
 		case "event-tags":
+			fallthrough
+		case "event-tags-invalid":
+			expected = "1610057400"
+		case "event-categories":
 			expected = "1610057400"
 		}
 
@@ -104,6 +137,10 @@ func testBasePropertiesFunc(pod *Pod, expectedHash string) func(*testing.T) {
 		case "trader-infer":
 			expected = "72h0m0s"
 		case "event-tags":
+			fallthrough
+		case "event-tags-invalid":
+			expected = "24h0m0s"
+		case "event-categories":
 			expected = "24h0m0s"
 		}
 
@@ -117,7 +154,11 @@ func testBasePropertiesFunc(pod *Pod, expectedHash string) func(*testing.T) {
 		case "trader-infer":
 			expected = "1m0s"
 		case "event-tags":
+			fallthrough
+		case "event-tags-invalid":
 			expected = "10m0s"
+		case "event-categories":
+			expected = "1h6m40s"
 		}
 
 		assert.Equal(t, expected, actual, "invalid pod.Interval()")
@@ -130,7 +171,11 @@ func testBasePropertiesFunc(pod *Pod, expectedHash string) func(*testing.T) {
 		case "trader-infer":
 			expected = "10s"
 		case "event-tags":
+			fallthrough
+		case "event-tags-invalid":
 			expected = "30s"
+		case "event-categories":
+			expected = "6m40s"
 		}
 
 		assert.Equal(t, expected, actual, "invalid pod.Granularity()")
@@ -155,11 +200,23 @@ func testMeasurementNamesFunc(pod *Pod) func(*testing.T) {
 			}
 		case "event-tags":
 			expected = []string{
-				"event.data.eventId",
 				"event.data.height",
 				"event.data.rating",
 				"event.data.speed",
 				"event.data.target",
+			}
+		case "event-tags-invalid":
+			expected = []string{
+				"event.data-invalid.height",
+				"event.data-invalid.rating",
+				"event.data-invalid.speed",
+				"event.data-invalid.target",
+			}
+		case "event-categories":
+			expected = []string{
+				"event.stream.duration",
+				"event.stream.guest_count",
+				"event.stream.ticket_price",
 			}
 		}
 
@@ -187,13 +244,20 @@ func testRewardsFunc(pod *Pod) func(*testing.T) {
 				"sell": "reward = 1",
 			}
 		case "event-tags":
+			fallthrough
+		case "event-tags-invalid":
+			expected = map[string]string{
+				"action_one": "reward = 1",
+				"action_two": "reward = 1",
+			}
+		case "event-categories":
 			expected = map[string]string{
 				"action_one": "reward = 1",
 				"action_two": "reward = 1",
 			}
 		}
 
-		assert.Equal(t, expected, actual, "invalid pod.Rewards()")
+		assert.Equal(t, expected, actual, "invalid pod.Rewards()", pod.Name)
 	}
 }
 
@@ -217,12 +281,28 @@ func testActionsFunc(pod *Pod) func(*testing.T) {
 				"sell": "local.portfolio.usd_balance += args.price\nlocal.portfolio.btc_balance -= 1",
 			}
 		case "event-tags":
+			fallthrough
+		case "event-tags-invalid":
+			expected = map[string]string{"action_one": "", "action_two": ""}
+		case "event-categories":
 			expected = map[string]string{"action_one": "", "action_two": ""}
 		default:
 			t.Errorf("invalid pod %s", pod.Name)
 		}
 
 		assert.Equal(t, expected, actual, "invalid pod.Actions()")
+	}
+}
+
+// Tests Tags() getter
+func testTagsFunc(pod *Pod) func(*testing.T) {
+	return func(t *testing.T) {
+		actualTags := pod.Tags()
+
+		err := snapshotter.SnapshotMulti(pod.Name+"_tags", actualTags)
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
@@ -244,23 +324,6 @@ func testCachedCsvFunc(pod *Pod) func(*testing.T) {
 		actual := pod.CachedCsv()
 
 		snapshotter.SnapshotT(t, actual)
-	}
-}
-
-// Tests TagPathMap()
-func testTagPathMap(pod *Pod) func(*testing.T) {
-	return func(t *testing.T) {
-		actualMap := pod.TagPathMap()
-
-		var expected map[string][]string
-		switch pod.Name {
-		case "event-tags":
-			expected = map[string][]string{"event.data": {"tagA", "tagB", "tagC"}}
-		default:
-			expected = make(map[string][]string)
-		}
-
-		assert.Equal(t, expected, actualMap)
 	}
 }
 
@@ -295,7 +358,7 @@ func testAddLocalStateFunc(pod *Pod) func(*testing.T) {
 
 		<-done
 
-		newState, err := state.GetStateFromCsv(nil, fileData)
+		newState, err := state.GetStateFromCsv(nil, nil, nil, fileData)
 		if err != nil {
 			t.Error(err)
 		}
@@ -344,12 +407,14 @@ func testAddLocalStateCachedCsvFunc(pod *Pod) func(*testing.T) {
 
 		wg.Wait()
 
-		newState, err := state.GetStateFromCsv(nil, fileData)
+		measurements := []string{"local.portfolio.usd_balance", "local.portfolio.btc_balance", "coinbase.btcusd.price"}
+
+		newState, err := state.GetStateFromCsv(nil, measurements, nil, fileData)
 		if err != nil {
 			t.Error(err)
 		}
 
-		assert.Equal(t, 2, len(newState), "expected two state objects, one for local and one for coinbase")
+		assert.Equal(t, 1, len(newState), "expected one state object for coinbase")
 
 		pod.AddLocalState(newState...)
 

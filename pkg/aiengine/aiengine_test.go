@@ -22,6 +22,13 @@ func TestAIEngineGetPythonCmd(t *testing.T) {
 	origContext := context.CurrentContext()
 	t.Cleanup(func() { context.SetContext(origContext) })
 
+	algorithmsMap = map[string]*LearningAlgorithm{
+		"dql": {
+			Id:   "dql",
+			Name: "Deep Q-Learning",
+		},
+	}
+
 	t.Run("getPythonCmd() -- Docker Context", testPythonCmdDockerContextFunc())
 	t.Run("getPythonCmd() -- BareMetal Context", testPythonCmdBareMetalContextFunc())
 }
@@ -31,6 +38,13 @@ func TestAIEngineStartServer(t *testing.T) {
 	t.Cleanup(func() { context.SetContext(origContext) })
 	t.Cleanup(func() { execCommand = exec.Command })
 
+	algorithmsMap = map[string]*LearningAlgorithm{
+		"dql": {
+			Id:   "dql",
+			Name: "Deep Q-Learning",
+		},
+	}
+
 	t.Run("StartServer() -- Happy Path", testStartServerFunc())
 	t.Run("StartServer() -- Python server takes a few tries to return healthy", testStartServerHealthyLaterFunc())
 }
@@ -38,10 +52,24 @@ func TestAIEngineStartServer(t *testing.T) {
 func TestInfer(t *testing.T) {
 	t.Run("Infer() -- Server not ready", testInferServerNotReadyFunc())
 	t.Run("Infer() -- Expected url is called", testInferServerFunc())
+
+	algorithmsMap = map[string]*LearningAlgorithm{
+		"dql": {
+			Id:   "dql",
+			Name: "Deep Q-Learning",
+		},
+	}
 }
 
 func TestPod(t *testing.T) {
-	manifestsToTest := []string{"trader.yaml", "trader-infer.yaml", "event-tags.yaml"}
+	algorithmsMap = map[string]*LearningAlgorithm{
+		"dql": {
+			Id:   "dql",
+			Name: "Deep Q-Learning",
+		},
+	}
+
+	manifestsToTest := []string{"trader.yaml", "trader-infer.yaml", "event-tags.yaml", "event-categories.yaml"}
 
 	for _, manifestToTest := range manifestsToTest {
 		manifestPath := filepath.Join("../../test/assets/pods/manifests", manifestToTest)
@@ -49,6 +77,11 @@ func TestPod(t *testing.T) {
 		pod, err := pods.LoadPodFromManifest(manifestPath)
 		if err != nil {
 			t.Error(err)
+			return
+		}
+
+		if pod == nil {
+			t.Errorf("Pod did not load from manifest %s", manifestPath)
 			return
 		}
 
@@ -148,7 +181,7 @@ func testStartTrainingFunc(pod *pods.Pod, response string) func(t *testing.T) {
 
 		aiengineClient = mockAIEngineClient
 
-		err := StartTraining(pod, "", -1)
+		err := StartTraining(pod, nil, -1)
 		switch response {
 		case "already_training":
 			assert.EqualError(t, err, fmt.Sprintf("%s -> training is already in progress", pod.Name))
@@ -170,7 +203,7 @@ func testStartTrainingFunc(pod *pods.Pod, response string) func(t *testing.T) {
 func testInferServerNotReadyFunc() func(*testing.T) {
 	return func(t *testing.T) {
 		aiServerReady = false
-		_, err := Infer("pod_foo", "tag_bar")
+		_, err := Infer("pod_foo", 0, "tag_bar")
 		if assert.Error(t, err) {
 			assert.Equal(t, "not ready", err.Error())
 		}
@@ -208,7 +241,7 @@ func testInferServerFunc() func(*testing.T) {
 
 		SetAIEngineClient(mockAIEngineClient)
 
-		resp, err := Infer("pod_foo", "tag_bar")
+		resp, err := Infer("pod_foo", 0, "tag_bar")
 		if assert.NoError(t, err) {
 			assert.Equal(t, "ok", resp.Response.Result)
 		}
@@ -233,6 +266,9 @@ func testPythonCmdBareMetalContextFunc() func(*testing.T) {
 		rtcontext, err := context.NewContext("metal")
 		assert.NoError(t, err)
 
+		err = rtcontext.Init(true)
+		assert.NoError(t, err)
+
 		actual := rtcontext.AIEnginePythonCmdPath()
 		assert.Equal(t, expectedPython, actual)
 	}
@@ -244,7 +280,11 @@ func testStartServerFunc() func(*testing.T) {
 		t.Cleanup(func() {
 			getClient = NewAIEngineClient
 			aiengineClient = nil
+			aiServerCmd = nil
 		})
+
+		aiengineClient = nil
+		aiServerCmd = nil
 
 		mockAIEngineClient := &MockAIEngineClient{
 			GetHealthHandler: func(c go_context.Context, healthRequest *aiengine_pb.HealthRequest, co ...grpc.CallOption) (*aiengine_pb.Response, error) {
@@ -258,7 +298,6 @@ func testStartServerFunc() func(*testing.T) {
 			return mockAIEngineClient, nil
 		}
 
-		assert.Nil(t, aiServerCmd)
 		ready := make(chan bool)
 		err := StartServer(ready, false)
 		assert.NoError(t, err)

@@ -16,9 +16,15 @@ spice run
 # See more at: https://docs.spiceai.org/
 `,
 	Run: func(cmd *cobra.Command, args []string) {
-		err := runtime.Run(contextFlag, "")
+
+		err := checkLatestCliReleaseVersion()
+		if err != nil && IsDebug() {
+			cmd.PrintErrf("failed to check for latest CLI release version: %s\n", err.Error())
+		}
+
+		err = runtime.Run(contextFlag, "")
 		if err != nil {
-			cmd.Println(err.Error())
+			cmd.PrintErrln(err.Error())
 			os.Exit(1)
 		}
 	},

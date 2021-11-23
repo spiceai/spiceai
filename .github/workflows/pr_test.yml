@@ -6,9 +6,6 @@ on:
     branches:
       - trunk
       - release-*
-    paths-ignore:
-      - "docs/**"
-      - ".github/**"
 
 jobs:
   proto_unchanged:
@@ -68,7 +65,8 @@ jobs:
         run: go vet ./...
 
       - name: go test
-        run: go test -v ./... -shuffle=on
+        run: go test -v -count=10 -shuffle=on ./...
+        working-directory: pkg
 
   aiengine:
     name: test aiengine

@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"path/filepath"
 	"sync"
 
 	"github.com/logrusorgru/aurora"
@@ -57,6 +56,11 @@ func (r *SpiceRuntime) SingleRun(manifestPath string) error {
 		return err
 	}
 
+	err = aiengine.Init()
+	if err != nil {
+		return err
+	}
+
 	aiEngineReady := make(chan bool, 1)
 	err = aiengine.StartServer(aiEngineReady, true)
 	if err != nil {
@@ -83,7 +87,7 @@ func (r *SpiceRuntime) SingleRun(manifestPath string) error {
 	}
 
 	// Pass empty algorithm and negative episode number string to use pod's default
-	err = aiengine.StartTraining(pod, "", -1)
+	err = aiengine.StartTraining(pod, nil, -1)
 	if err != nil {
 		return err
 	}
@@ -95,6 +99,11 @@ func (r *SpiceRuntime) SingleRun(manifestPath string) error {
 
 func (r *SpiceRuntime) Run() error {
 	err := r.startRuntime()
+	if err != nil {
+		return err
+	}
+
+	err = aiengine.Init()
 	if err != nil {
 		return err
 	}
@@ -203,23 +212,9 @@ func (r *SpiceRuntime) scanForPods() error {
 		return nil
 	}
 
-	d, err := os.Open(podsManifestDir)
-	if err != nil {
-		return err
-	}
+	manifestPaths := pods.FindAllManifestPaths()
 
-	files, err := d.Readdir(-1)
-	d.Close()
-	if err != nil {
-		return err
-	}
-
-	for _, f := range files {
-		if f.IsDir() {
-			continue
-		}
-
-		manifestPath := filepath.Join(podsManifestDir, f.Name())
+	for _, manifestPath := range manifestPaths {
 		_, err = initializePod(manifestPath)
 		if err != nil {
 			log.Println(fmt.Errorf("error loading pod manifest %s: %w", manifestPath, err))

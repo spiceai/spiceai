@@ -2,9 +2,11 @@ package util
 
 import (
 	"archive/zip"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 type ProcessFunc func([]byte) error
@@ -54,6 +56,10 @@ func ExtractZipFileToDir(zipArchive string, targetDirectory string) error {
 		}
 		defer reader.Close()
 
+		if err := SanitizeExtractPath(f.Name, targetDirectory); err != nil {
+			return err
+		}
+
 		if f.FileInfo().IsDir() {
 			// Copy file mask from target directory
 			stat, err := os.Stat(targetDirectory)
@@ -80,5 +86,13 @@ func ExtractZipFileToDir(zipArchive string, targetDirectory string) error {
 		}
 	}
 
+	return nil
+}
+
+func SanitizeExtractPath(filePath string, destination string) error {
+	destpath := filepath.Join(destination, filePath)
+	if !strings.HasPrefix(destpath, filepath.Clean(destination)+string(os.PathSeparator)) {
+		return fmt.Errorf("%s: illegal file path", filePath)
+	}
 	return nil
 }

@@ -1,5 +1,7 @@
 SHELL := /bin/bash
 PROTOC ?=protoc
+UNAME := $(shell uname)
+
 
 ################################################################################
 # Target: all                                                                 #
@@ -16,17 +18,27 @@ build:
 .PHONY: lint
 lint:
 	pushd dashboard && yarn lint && popd
-	black --check --extend-exclude proto ai/src
+	pushd ai/src && make lint && popd
 	go vet ./...
 	golangci-lint run	
 
+.PHONY: test-pkg
+test-pkg:
+	pushd pkg && go test ./... -count=3 -shuffle=on
+
+.PHONY: update-pkg-snapshots
+update-pkg-snapshots:
+	pushd pkg && UPDATE_SNAPSHOTS=true go test ./... -count=5
+
+.PHONY: test-e2e
+test-e2e:
+	pushd test/e2e && go test -v -e2e -context metal -shuffle=on -count=2 ./...
+
 .PHONY: test
-test: build
+test: build test-pkg test-e2e
 	pushd dashboard && yarn test-ci && popd
 	pushd ai/src && make test && popd
 	go vet ./...
-	go test ./... -shuffle=on
-	pushd test/e2e && go test -v . -e2e && popd
 
 .PHONY: docker
 docker:
@@ -100,8 +112,7 @@ generate-acknowledgements:
 	echo -e "# Open Source Acknowledgements\n\nSpice.ai would like to acknowledge the following open source projects for making this project possible:\n\n## Python Packages\n" > $(ACKNOWLEDGEMENTS_PATH)
 	
 	# Python Packages
-	python -m venv venv-acknowledgments
-	source venv-acknowledgments/bin/activate
+	python3 -m venv venv-acknowledgments
 	venv-acknowledgments/bin/pip install -r ai/src/requirements/production.txt
 	venv-acknowledgments/bin/pip install -r ai/src/requirements/development.txt
 	venv-acknowledgments/bin/pip install -r ai/src/requirements/common.txt
@@ -120,6 +131,12 @@ generate-acknowledgements:
 	pushd dashboard && yarn install && npx license-checker --csv 2>/dev/null >> ../$(ACKNOWLEDGEMENTS_PATH) && popd
 
 	# Apply Formatting
-	sed -i 's/\"//g' $(ACKNOWLEDGEMENTS_PATH)
-	sed -i 's/,/, /g' $(ACKNOWLEDGEMENTS_PATH)
-	sed -i 's/,  /, /g' $(ACKNOWLEDGEMENTS_PATH)
+	@if [[ "$(UNAME)" -eq "Darwin" ]]; then\
+		sed -i '' 's/\"//g' $(ACKNOWLEDGEMENTS_PATH); \
+		sed -i '' 's/,/, /g' $(ACKNOWLEDGEMENTS_PATH); \
+		sed -i '' 's/,  /, /g' $(ACKNOWLEDGEMENTS_PATH); \
+	else\
+		sed -i 's/\"//g' $(ACKNOWLEDGEMENTS_PATH); \
+		sed -i 's/,/, /g' $(ACKNOWLEDGEMENTS_PATH); \
+		sed -i 's/,  /, /g' $(ACKNOWLEDGEMENTS_PATH); \
+	fi

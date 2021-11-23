@@ -3,6 +3,7 @@
   "period": 259200,
   "interval": 60,
   "granularity": 10,
+  "interpolation": true,
   "datasources": [
     {
       "connector": { "name": "localstate" },

@@ -48,17 +48,11 @@ func StartServer(ready chan bool, isSingleRun bool) error {
 	aiSingleTrainingRun = isSingleRun
 
 	outputFormatter := func(line string) {
-		parts := strings.SplitN(line, "->", 2)
-		if len(parts) == 2 {
-			infoPart := parts[1]
-			if strings.Contains(infoPart, "completed with score of") {
-				message := aurora.BrightCyan(infoPart)
-				log.Printf("%s->%s\n", parts[0], message)
-				return
-			}
+		if strings.Contains(line, "completed with score of") {
+			log.Println(aurora.BrightCyan(line))
+		} else {
+			log.Println(line)
 		}
-
-		log.Println(line)
 	}
 
 	rtcontext := spice_context.CurrentContext()
@@ -104,12 +98,10 @@ func StartServer(ready chan bool, isSingleRun bool) error {
 		go func() {
 			for outScanner.Scan() {
 				line := outScanner.Text()
-				if strings.Contains(line, "->") {
-					if outputFormatter != nil {
-						outputFormatter(line)
-					} else {
-						log.Println(line)
-					}
+				if outputFormatter != nil {
+					outputFormatter(line)
+				} else {
+					log.Println(line)
 				}
 
 				if fileLogger != nil {
@@ -265,5 +257,5 @@ func isTestEnvironment() bool {
 
 func SetAIEngineClient(newClient AIEngineClient) {
 	aiengineClient = newClient
-	aiServerReady = true
+	aiServerReady = newClient != nil
 }

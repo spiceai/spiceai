@@ -10,6 +10,7 @@ import (
 
 type Flight struct {
 	id            string
+	algorithm     string
 	start         time.Time
 	end           time.Time
 	episodes      []*Episode
@@ -18,14 +19,19 @@ type Flight struct {
 	err           error
 }
 
-func NewFlight(id string, episodes int) *Flight {
+func NewFlight(id string, episodes int, algorithm string) *Flight {
 	return &Flight{
-		id:       id,
-		start:    time.Now(),
-		episodes: make([]*Episode, 0, episodes),
-		isDone:   make(chan bool, 1),
-		err:      nil,
+		id:        id,
+		algorithm: algorithm,
+		start:     time.Now(),
+		episodes:  make([]*Episode, 0, episodes),
+		isDone:    make(chan bool, 1),
+		err:       nil,
 	}
+}
+
+func (f *Flight) Algorithm() string {
+	return f.algorithm
 }
 
 func (f *Flight) WaitForDoneChan() *chan bool {
@@ -81,7 +87,7 @@ func (f *Flight) complete(err error) {
 	f.end = time.Now()
 	f.err = err
 	if err != nil {
-		fmt.Printf("Flight '%s' stopped on episode %d with error: %s\n", f.id, len(f.Episodes())+1, aurora.Red(err))
+		fmt.Printf("Training run '%s' stopped on episode %d with error: %s\n", f.id, len(f.Episodes())+1, aurora.Red(err))
 	}
 	f.isDone <- true
 }

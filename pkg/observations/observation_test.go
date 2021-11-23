@@ -43,15 +43,25 @@ func testGetCsvWithTagsFunc() func(*testing.T) {
 			t.Error(err)
 		}
 
-		measurements := map[string]string{
-			"eventId": "event_id",
-			"height":  "h",
-			"rating":  "rating",
-			"speed":   "speed",
-			"target":  "target",
+		identifiers := map[string]string{
+			"event_id": "event_id",
 		}
 
-		err = dp.Init(nil, measurements, nil)
+		measurements := map[string]string{
+			"height": "h",
+			"rating": "rating",
+			"speed":  "speed",
+			"target": "target",
+		}
+
+		tagSelectors := []string{
+			"tag1",
+			"tag2",
+			"tag3",
+			"_tags",
+		}
+
+		err = dp.Init(nil, identifiers, measurements, nil, tagSelectors)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -67,7 +77,7 @@ func testGetCsvWithTagsFunc() func(*testing.T) {
 			return
 		}
 
-		headerLine := "eventId,height,rating,speed,target,_tags"
+		headerLine := "event_id,height,rating,speed,target,_tags"
 		headers := strings.Split(headerLine, ",")
 		tags := []string{"tagA", "tagB"}
 
@@ -98,7 +108,7 @@ func testGetCsvAllHeadersFunc() func(*testing.T) {
 			"volume": "volume",
 		}
 
-		err = dp.Init(nil, measurements, nil)
+		err = dp.Init(nil, nil, measurements, nil, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -144,7 +154,7 @@ func testGetCsvSelectHeadersFunc() func(*testing.T) {
 			"volume": "volume",
 		}
 
-		err = dp.Init(nil, measurements, nil)
+		err = dp.Init(nil, nil, measurements, nil, nil)
 		if err != nil {
 			t.Fatal(err)
 		}

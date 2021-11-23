@@ -4,6 +4,10 @@ params:
   period: 17h
   interval: 17m
   granularity: 17s
+time:
+  categories:
+    - dayofweek
+    - hour
 dataspaces:
   - from: local
     name: portfolio
@@ -47,6 +51,7 @@ actions:
       args:
         price: coinbase.btcusd.close
   - name: hold
+
 training:
   reward_init: |
     prev_price = prev_state.coinbase.btcusd.close

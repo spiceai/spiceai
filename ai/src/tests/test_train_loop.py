@@ -15,7 +15,7 @@ import train
 
 
 class TrainingLoopTests(unittest.TestCase):
-    ALGORITHM = os.environ["ALGORITHM"]
+    ALGORITHM = os.environ.get("ALGORITHM")
 
     def setUp(self):
         # Preventing tensorflow verbose initialization
@@ -24,6 +24,9 @@ class TrainingLoopTests(unittest.TestCase):
 
         # Eager execution is too slow to use, so disabling
         tf.compat.v1.disable_eager_execution()
+
+        if self.ALGORITHM is None:
+            self.ALGORITHM = "dql"  # pylint: disable=invalid-name
 
         self.aiengine = main.AIEngine()
 
@@ -202,13 +205,14 @@ class TrainingLoopTests(unittest.TestCase):
 
         gap_start = pd.to_datetime(1626697640, unit="s")
         gap_end = pd.to_datetime(1626697860, unit="s")
-        table = main.data_managers["trader"].massive_table_filled
-        price = list(table[gap_start:gap_start].coinbase_btcusd_close)[-1]
+        table = main.data_managers["trader"].massive_table_sparse
+        filled_table = main.data_managers["trader"]._fill_table(table)  # pylint: disable=protected-access
+        price = list(filled_table[gap_start:gap_start].coinbase_btcusd_close)[-1]
 
         # Validate the forward filling is working.
         current_time = gap_start
         while current_time < gap_end:
-            next_price = list(table[current_time:current_time].coinbase_btcusd_close)[
+            next_price = list(filled_table[current_time:current_time].coinbase_btcusd_close)[
                 -1
             ]
             self.assertEqual(price, next_price)
@@ -254,16 +258,9 @@ class TrainingLoopTests(unittest.TestCase):
         self.validate_episode_data(
             "trader",
             flight,
-            5,
+            10,
             num_actions=10,
-            episode_results=self.episode_results[0:5],
-        )
-        self.validate_episode_data(
-            "trader",
-            flight,
-            5,
-            num_actions=50,
-            episode_results=self.episode_results[5:],
+            episode_results=self.episode_results,
         )
 
     def test_epoch_earlier_than_data(self):
@@ -327,6 +324,8 @@ class TrainingLoopTests(unittest.TestCase):
     def test_invalid_reward_post_error(self):
         trader_init = copy.deepcopy(self.trader_init_req)
         trader_init.actions["buy"] = "reward = foo"
+        trader_init.actions["sell"] = "reward = foo"
+        trader_init.actions["hold"] = "reward = foo"
 
         self.init(trader_init)
 
@@ -347,9 +346,10 @@ class TrainingLoopTests(unittest.TestCase):
 
     def test_unsafe_reward_error(self):
         trader_init = copy.deepcopy(self.trader_init_req)
-        trader_init.actions[
-            "buy"
-        ] = "open('/tmp/FILE','w').write('this is unsafe!'); reward = 1"
+        unsafe_action = "open('/tmp/FILE','w').write('this is unsafe!'); reward = 1"
+        trader_init.actions["buy"] = unsafe_action
+        trader_init.actions["sell"] = unsafe_action
+        trader_init.actions["hold"] = unsafe_action
 
         self.init(trader_init)
 

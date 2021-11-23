@@ -26,7 +26,7 @@ func TestMetaContext(t *testing.T) {
 		assert.NoError(t, err)
 
 		if assert.Len(t, cmd.Args, 2) {
-			assert.Equal(t, "/.spice/bin/spiced", strings.TrimPrefix(cmd.Args[0], homeDir))
+			assert.Equal(t, "spiced", strings.TrimPrefix(cmd.Args[0], homeDir))
 			assert.Equal(t, "test-manifest-path", cmd.Args[1])
 		}
 	})

@@ -12,7 +12,6 @@ import (
 	"github.com/spiceai/spiceai/pkg/constants"
 	"github.com/spiceai/spiceai/pkg/github"
 	"github.com/spiceai/spiceai/pkg/util"
-	spice_version "github.com/spiceai/spiceai/pkg/version"
 	"golang.org/x/mod/semver"
 )
 
@@ -27,19 +26,7 @@ type MetalContext struct {
 }
 
 func NewMetalContext() *MetalContext {
-	homeDir := os.Getenv("HOME")
-
-	spiceRuntimeDir := filepath.Join(homeDir, constants.DotSpice)
-	spiceBinDir := filepath.Join(spiceRuntimeDir, "bin")
-	aiEngineDir := filepath.Join(spiceBinDir, "ai")
-	aiEnginePythonCmdPath := filepath.Join(aiEngineDir, "venv", "bin", constants.PythonCmd)
-
-	return &MetalContext{
-		spiceRuntimeDir:       spiceRuntimeDir,
-		spiceBinDir:           spiceBinDir,
-		aiEngineDir:           aiEngineDir,
-		aiEnginePythonCmdPath: aiEnginePythonCmdPath,
-	}
+	return &MetalContext{}
 }
 
 func (c *MetalContext) Name() string {
@@ -67,10 +54,21 @@ func (c *MetalContext) PodsDir() string {
 }
 
 func (c *MetalContext) Init(isDevelopmentMode bool) error {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+
+	c.spiceRuntimeDir = filepath.Join(homeDir, constants.DotSpice)
+	c.spiceBinDir = filepath.Join(c.spiceRuntimeDir, "bin")
+	c.aiEngineDir = filepath.Join(c.spiceBinDir, "ai")
+	c.aiEnginePythonCmdPath = filepath.Join(c.aiEngineDir, "venv", "bin", constants.PythonCmd)
+
 	cwd, err := os.Getwd()
 	if err != nil {
 		return err
 	}
+
 	c.appDir = cwd
 	c.podsDir = filepath.Join(c.appDir, constants.SpicePodsDirectoryName)
 	c.isDevelopmentMode = isDevelopmentMode
@@ -107,7 +105,7 @@ func (c *MetalContext) InstallOrUpgradeRuntime() error {
 		return err
 	}
 
-	release, err := github.GetLatestRuntimeRelease(spice_version.Version())
+	release, err := github.GetLatestRuntimeRelease()
 	if err != nil {
 		return err
 	}
@@ -146,7 +144,7 @@ func (c *MetalContext) IsRuntimeUpgradeAvailable() (string, error) {
 		return "", nil
 	}
 
-	release, err := github.GetLatestRuntimeRelease(currentVersion)
+	release, err := github.GetLatestRuntimeRelease()
 	if err != nil {
 		return "", err
 	}

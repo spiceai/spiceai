@@ -1,48 +1,46 @@
 package observations
 
 import (
+	"sort"
 	"strconv"
 	"strings"
 )
 
 type Observation struct {
 	Time         int64
+	Identifiers  map[string]string
 	Measurements map[string]float64
 	Categories   map[string]string
 	Tags         []string
 }
 
-func GetCsv(headers []string, validTags []string, observations []Observation) string {
+func GetCsv(headers []string, tags []string, observations []Observation) string {
 	csv := strings.Builder{}
 	for _, o := range observations {
 		csv.WriteString(strconv.FormatInt(o.Time, 10))
 		for _, f := range headers {
 			csv.WriteString(",")
 
-			if f == "_tags" {
-				var observationValidTags []string
-				for _, observationTag := range o.Tags {
-					for _, validTag := range validTags {
-						if validTag == observationTag {
-							observationValidTags = append(observationValidTags, observationTag)
-						}
-					}
-				}
-				csv.WriteString(strings.Join(observationValidTags, " "))
+			if identifier, ok := o.Identifiers[f]; ok {
+				csv.WriteString(identifier)
 				continue
 			}
 
-			val, ok := o.Measurements[f]
-			if ok {
-				csv.WriteString(strconv.FormatFloat(val, 'f', -1, 64))
+			if measurement, ok := o.Measurements[f]; ok {
+				csv.WriteString(strconv.FormatFloat(measurement, 'f', -1, 64))
 				continue
 			}
 
-			category, ok := o.Categories[f]
-			if ok {
+			if category, ok := o.Categories[f]; ok {
 				csv.WriteString(category)
 				continue
 			}
+		}
+
+		csv.WriteString(",")
+		if len(o.Tags) > 0 {
+			sort.Strings(o.Tags)
+			csv.WriteString(strings.Join(o.Tags, " "))
 		}
 
 		csv.WriteString("\n")

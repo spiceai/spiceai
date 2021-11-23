@@ -110,13 +110,13 @@ If you are running in GitHub Codespaces or other Ubuntu/Debian environment, you 
 ```
 
 ### Building the Dashboard
-```bash
- cd dashboard
- make
-```
+
+See the dashboard [README.md](dashboard/README.md)
 
 ### Run Makefile in Project Root
+
 This is necessary before building the CLI or Runtime
+
 ```bash
  make
 ```

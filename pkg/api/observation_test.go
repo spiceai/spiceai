@@ -11,7 +11,6 @@ import (
 func TestNewObservationsFromState(t *testing.T) {
 	snapshotter := testutils.NewSnapshotter("../../test/assets/snapshots/api/observations")
 
-	measurementNames := []string{"m-1", "m-2"}
 	tags := []string{"a", "b", "c"}
 	observations := []observations.Observation{
 		{
@@ -42,7 +41,11 @@ func TestNewObservationsFromState(t *testing.T) {
 		},
 	}
 
-	s := state.NewState("my.test.path", measurementNames, tags, observations)
+	identifiersNames := []string{"i-1", "i-2"}
+	measurementNames := []string{"m-1", "m-2"}
+	categoryNames := []string{"c-1", "c-2"}
+
+	s := state.NewState("my.test.path", identifiersNames, measurementNames, categoryNames, tags, observations)
 
 	apiObservation := NewObservationsFromState(s)
 

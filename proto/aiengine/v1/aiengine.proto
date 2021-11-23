@@ -48,6 +48,8 @@ message InitRequest {
   map<string, FieldData> fields = 8;
   repeated string laws = 9;
   repeated DataSource datasources = 10;
+  string external_reward_funcs = 11;
+  bool interpolation = 12;
 }
 
 message Response {
@@ -73,6 +75,7 @@ message StartTrainingRequest {
 message InferenceRequest {
   string pod = 1;
   string tag = 2;
+  int64 inference_time = 3;
 }
 
 message InferenceResult {

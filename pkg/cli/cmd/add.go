@@ -35,6 +35,11 @@ spice add samples/LogPruner
 		relativePath := context.CurrentContext().GetSpiceAppRelativePath(downloadPath)
 
 		cmd.Printf("Added %s\n", relativePath)
+
+		err = checkLatestCliReleaseVersion()
+		if err != nil && IsDebug() {
+			cmd.PrintErrf("failed to check for latest CLI release version: %s\n", err.Error())
+		}
 	},
 }
 

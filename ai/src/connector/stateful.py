@@ -3,13 +3,13 @@ from typing import Dict
 
 import pandas as pd
 
-from data import DataManager
+from data_manager.base_manager import DataManagerBase
 from exception import LawInvalidException, DataSourceActionInvalidException
 from exec import somewhat_safe_exec, somewhat_safe_eval
 
 
 class StatefulConnector:
-    def __init__(self, data_manager: DataManager, action_effects: Dict[str, str]):
+    def __init__(self, data_manager: DataManagerBase, action_effects: Dict[str, str]):
         self.action_effects = action_effects
         self.data_manager = data_manager
 
@@ -19,7 +19,7 @@ class StatefulConnector:
             new_series[data] = [new_data[data]]
         new_data_frame = pd.DataFrame(new_series, index={next_timestamp})
 
-        self.data_manager.merge_data(new_data_frame)
+        self.data_manager.merge_training_row(new_data_frame)
 
     def apply_action(self, action: int, data_row: pd.DataFrame) -> bool:
         action_name = self.data_manager.action_names[action]

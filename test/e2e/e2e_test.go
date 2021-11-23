@@ -35,7 +35,14 @@ var (
 	cliClient          *cli
 	runtime            *runtimeServer
 	snapshotter        *cupaloy.Config
-	testPods           = []string{"test/Trader@0.4.0", "test/customprocessor@0.2.0", "test/event-tags@0.2.0", "test/event-categories@0.1.0"}
+	testPods           = []string{
+		"test/Trader/ac6b4e4e0a83c49a09bbda6ac0ee385bc5e86433",
+		"test/customprocessor@0.2.0",
+		"test/event-tags@0.4.0",
+		"test/event-categories@0.2.0",
+		"test/trader-external-funcs/07149acdbf4154e2b7527a8af07d4f43f876cd0f",
+		"test/trader-seed-streaming/c8a6e1326034706b47c0f633e9372838cf6e5804",
+	}
 )
 
 func TestMain(m *testing.M) {
@@ -110,7 +117,7 @@ func TestMain(m *testing.M) {
 
 	podsToAdd := testPods
 	if localRegistryPath != "" {
-		fmt.Printf("Adding pods from local registry %s", aurora.BrightBlue(localRegistryPath))
+		fmt.Printf("Adding pods from local registry %s\n", aurora.BrightBlue(localRegistryPath))
 		podsToAdd = make([]string, len(testPods))
 		for _, p := range testPods {
 			pPath := strings.Split(p, "@")
@@ -159,18 +166,10 @@ func TestPods(t *testing.T) {
 	})
 
 	t.Log("*** Get Pods ***")
-	observation, err := runtime.getPods()
+	pods, err := runtime.getPods()
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	var pods []map[string]interface{}
-	err = json.Unmarshal([]byte(observation), &pods)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	assert.Len(t, pods, 4)
 
 	sort.SliceStable(pods, func(i, j int) bool {
 		return strings.Compare(pods[i]["name"].(string), pods[j]["name"].(string)) == -1
@@ -262,7 +261,7 @@ func TestObservations(t *testing.T) {
 	}
 }
 
-func TestDataspaceData(t *testing.T) {
+func TestSeedAndStreamingObservations(t *testing.T) {
 	if !shouldRunTest {
 		t.Skip("Specify '-e2e' to run e2e tests")
 		return
@@ -281,12 +280,97 @@ func TestDataspaceData(t *testing.T) {
 	})
 
 	t.Log("*** Get Observations ***")
-	observation, err := runtime.getObservations("customprocessor", "")
+	initialObservationsCsv, err := runtime.getObservations("trader-seed-streaming", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	err = snapshotter.SnapshotMulti("initial_observation.csv", observation)
+	assert.Greater(t, len(initialObservationsCsv), 952)
+
+	// Fetch the first 951 rows, which is the seed data
+	seedObservations := strings.Join(strings.SplitN(initialObservationsCsv, "\n", 952)[:951], "\n")
+
+	snapshotter.SnapshotT(t, seedObservations)
+
+	// Check we have additional streaming prices
+	additionalObservationsCsv, err := runtime.getObservations("trader-seed-streaming", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Fetch the first 951 rows, which is the seed data
+	additionalObservations := strings.Split(additionalObservationsCsv, "\n")
+	assert.Greater(t, len(additionalObservations), 5)
+}
+
+func TestDataspaceData(t *testing.T) {
+	if !shouldRunTest {
+		t.Skip("Specify '-e2e' to run e2e tests")
+		return
+	}
+
+	err := runtime.startRuntime()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() {
+		err := runtime.shutdown()
+		if err != nil {
+			log.Fatalln(err.Error())
+		}
+	})
+
+	pods, err := runtime.getPods()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, pod := range pods {
+		podName := pod["name"].(string)
+		t.Logf("*** Get Observations for pod %s ***", podName)
+
+		observations, err := runtime.getObservations(podName, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if podName == "trader-seed-streaming" {
+			observations = strings.Join(strings.SplitN(observations, "\n", 952)[:951], "\n")
+		}
+
+		err = snapshotter.SnapshotMulti(podName+"_initial_observations.csv", observations)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestDataspaceDataUpdate(t *testing.T) {
+	if !shouldRunTest {
+		t.Skip("Specify '-e2e' to run e2e tests")
+		return
+	}
+
+	err := runtime.startRuntime()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() {
+		err := runtime.shutdown()
+		if err != nil {
+			log.Fatalln(err.Error())
+		}
+	})
+
+	t.Log("*** Get Observations ***")
+	observations, err := runtime.getObservations("customprocessor", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = snapshotter.SnapshotMulti("initial_observations.csv", observations)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -305,12 +389,12 @@ func TestDataspaceData(t *testing.T) {
 	time.Sleep(1 * time.Second)
 
 	t.Log("*** Get New Observations ***")
-	observation, err = runtime.getObservations("customprocessor", "")
+	observations, err = runtime.getObservations("customprocessor", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	err = snapshotter.SnapshotMulti("new_observation.csv", observation)
+	err = snapshotter.SnapshotMulti("new_observation.csv", observations)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -329,12 +413,12 @@ func TestDataspaceData(t *testing.T) {
 	time.Sleep(1 * time.Second)
 
 	t.Log("*** Get New Observations with CSV Data ***")
-	observation, err = runtime.getObservations("customprocessor", "")
+	observations, err = runtime.getObservations("customprocessor", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	err = snapshotter.SnapshotMulti("new_observation_after_new_csv.csv", observation)
+	err = snapshotter.SnapshotMulti("new_observation_after_new_csv.csv", observations)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -417,7 +501,8 @@ func TestTrainingOutput(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = runtime.waitForTrainingToComplete("trader", "1" /*flight*/, 10)
+	expectedNumberOfEpisodes := 5
+	err = runtime.waitForTrainingToComplete("trader", "1" /*training runs*/, expectedNumberOfEpisodes, 120)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -430,7 +515,7 @@ func TestTrainingOutput(t *testing.T) {
 
 	assert.Equal(t, len(flights), 1, "expect 1 flight to be returned")
 	flight := flights[0]
-	assert.Equal(t, len(flight.Episodes), 10, "expect 10 episodes to be returned")
+	assert.Equal(t, len(flight.Episodes), expectedNumberOfEpisodes, "unexpected number of episodes returned")
 	for _, episode := range flight.Episodes {
 		assert.Empty(t, episode.Error)
 		assert.Empty(t, episode.ErrorMessage)
@@ -444,6 +529,60 @@ func TestTrainingOutput(t *testing.T) {
 
 		assert.Equal(t, 3, numActions, "expect 3 actions to be taken each episode")
 		assert.Equal(t, uint64(1428), actionCount, "unexpected actions taken")
+	}
+}
+
+func TestTrainingWithExternalRewards(t *testing.T) {
+	if !shouldRunTest {
+		t.Skip("Specify '-e2e' to run e2e tests")
+		return
+	}
+
+	err := runtime.startRuntime()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() {
+		err := runtime.shutdown()
+		if err != nil {
+			log.Fatalln(err.Error())
+		}
+	})
+
+	err = cliClient.runCliCmd("train", "trader-external-funcs", "--context", spicedContext, "--learning-algorithm", learningAlgorithm)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	expectedNumberOfEpisodes := 5
+	err = runtime.waitForTrainingToComplete("trader-external-funcs", "1" /*flight*/, expectedNumberOfEpisodes, 120)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Log("*** Get Flights ***")
+	flights, err := runtime.getFlights("trader-external-funcs")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	assert.Equal(t, len(flights), 1, "expect 1 flight to be returned")
+	flight := flights[0]
+	assert.Equal(t, len(flight.Episodes), expectedNumberOfEpisodes, "unexpected number of episodes returned")
+	for _, episode := range flight.Episodes {
+		assert.Empty(t, episode.Error)
+		assert.Empty(t, episode.ErrorMessage)
+
+		var actionCount uint64
+		var numActions int
+		for _, count := range episode.ActionsTaken {
+			actionCount += count
+			numActions++
+		}
+
+		assert.Equal(t, 3, numActions, "expect 3 actions to be taken each episode")
+		assert.Equal(t, uint64(27), actionCount, "unexpected actions taken")
 	}
 }
 
@@ -470,7 +609,7 @@ func TestPodWithTags(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = runtime.waitForTrainingToComplete("event-tags", "1" /*flight*/, 4)
+	err = runtime.waitForTrainingToComplete("event-tags", "1" /*flight*/, 4, 60)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -500,6 +639,58 @@ func TestPodWithTags(t *testing.T) {
 	}
 }
 
+func TestIdentifierRoundTripping(t *testing.T) {
+	if !shouldRunTest {
+		t.Skip("Specify '-e2e' to run e2e tests")
+		return
+	}
+
+	err := runtime.startRuntime()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() {
+		err := runtime.shutdown()
+		if err != nil {
+			log.Fatalln(err.Error())
+		}
+	})
+
+	t.Log("*** Get Observations ***")
+	initialObservationsCsv, err := runtime.getObservations("event-tags", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = snapshotter.SnapshotMulti("initial-observations", initialObservationsCsv)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	newObservations, err := os.ReadFile(filepath.Join(repoRoot, "test/assets/data/csv/e2e_csv_data_with_tags_2.csv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Log("*** Post Observations ***")
+	err = runtime.postObservations("event-tags", newObservations)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Log("*** Get additional Observations ***")
+	additionalObservationsCsv, err := runtime.getObservations("event-tags", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = snapshotter.SnapshotMulti("additional-observations", additionalObservationsCsv)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestPodWithCategories(t *testing.T) {
 	if !shouldRunTest {
 		t.Skip("Specify '-e2e' to run e2e tests")
@@ -523,7 +714,7 @@ func TestPodWithCategories(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = runtime.waitForTrainingToComplete("event-categories", "1" /*flight*/, 4)
+	err = runtime.waitForTrainingToComplete("event-categories", "1" /*flight*/, 4, 60)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -581,7 +772,7 @@ func TestImportExport(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = runtime.waitForTrainingToComplete("trader", "1" /*flight*/, 10)
+	err = runtime.waitForTrainingToComplete("trader", "1" /*flight*/, 5, 300)
 	if err != nil {
 		t.Fatal(err)
 	}

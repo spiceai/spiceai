@@ -9,13 +9,14 @@ import (
 	"github.com/bradleyjkemp/cupaloy"
 	"github.com/spf13/viper"
 	"github.com/spiceai/spiceai/pkg/spec"
+	"github.com/stretchr/testify/assert"
 )
 
 var snapshotter = cupaloy.New(cupaloy.SnapshotSubdirectory("../../test/assets/snapshots/dataspace"))
 
 func TestDataSource(t *testing.T) {
 
-	manifestsToTest := []string{"trader", "event-tags"}
+	manifestsToTest := []string{"trader", "trader-seed", "event-tags", "event-categories"}
 
 	for _, manifestName := range manifestsToTest {
 		v := viper.New()
@@ -48,39 +49,72 @@ func TestDataSource(t *testing.T) {
 			t.Run(fmt.Sprintf("MeasurementNames() - %s", dsName), testMeasurementNamesFunc(dsSpec))
 			t.Run(fmt.Sprintf("ActionNames() - %s", dsName), testActionNamesFunc(dsSpec))
 			t.Run(fmt.Sprintf("Laws() - %s", dsName), testLawsFunc(dsSpec))
-			t.Run(fmt.Sprintf("measurementSelectorMap() - %s", dsName), testMeasurementSelectorMapFunc(dsSpec))
-			t.Run(fmt.Sprintf("categorySelectorMap() - %s", dsName), testCategorySelectorMapFunc(dsSpec))
+			t.Run(fmt.Sprintf("getMeasurements() - %s", dsName), testGetMeasurementsFunc(dsSpec))
+			t.Run(fmt.Sprintf("getCategories() - %s", dsName), testGetCategoriesFunc(dsSpec))
+			t.Run(fmt.Sprintf("getTags() - %s", dsName), testGetTagsFunc(dsSpec))
+			t.Run(fmt.Sprintf("getTagSelectors() - %s", dsName), testGetTagSelectorsFunc(dsSpec))
 		}
 	}
 }
 
-func testMeasurementSelectorMapFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
+func testGetMeasurementsFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 	return func(t *testing.T) {
-		ds, err := NewDataspace(dsSpec)
+		actualMeasurements, actualMeasurementSelectors := getMeasurements(dsSpec)
+
+		err := snapshotter.SnapshotMulti(dsSpec.Name+"_measurements", actualMeasurements)
 		if err != nil {
-			t.Error(err)
+			t.Fatal(err)
 		}
 
-		actual := ds.measurementSelectorMap()
-
-		err = snapshotter.SnapshotMulti(strings.ReplaceAll(ds.Name(), "/", "_"), actual)
+		err = snapshotter.SnapshotMulti(dsSpec.Name+"_measurement_selectors", actualMeasurementSelectors)
 		if err != nil {
 			t.Fatal(err)
 		}
 	}
 }
 
-func testCategorySelectorMapFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
+func testGetCategoriesFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 	return func(t *testing.T) {
+		actualCategoryNames, actualCategories, actualCategorySelectors := getCategories(dsSpec)
 
-		ds, err := NewDataspace(dsSpec)
+		err := snapshotter.SnapshotMulti(dsSpec.Name+"_category_names", actualCategoryNames)
 		if err != nil {
-			t.Error(err)
+			t.Fatal(err)
 		}
 
-		actual := ds.categorySelectorMap()
+		err = snapshotter.SnapshotMulti(dsSpec.Name+"_categories", actualCategories)
+		if err != nil {
+			t.Fatal(err)
+		}
 
-		err = snapshotter.SnapshotMulti(strings.ReplaceAll(ds.Name(), "/", "_"), actual)
+		err = snapshotter.SnapshotMulti(dsSpec.Name+"_category_selectors", actualCategorySelectors)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func testGetTagsFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
+	return func(t *testing.T) {
+		tags, fqTags := getTags(dsSpec)
+
+		err := snapshotter.SnapshotMulti(dsSpec.Name+"_tags", tags)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		err = snapshotter.SnapshotMulti(dsSpec.Name+"_fqtags", fqTags)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func testGetTagSelectorsFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
+	return func(t *testing.T) {
+		tagSelectors := getTagSelectors(dsSpec)
+
+		err := snapshotter.SnapshotMulti(dsSpec.Name+"_tag_selectors", tagSelectors)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -99,6 +133,33 @@ func testNewDataspaceFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 		actualFQName := ds.Name()
 		if expectedFQName != actualFQName {
 			t.Errorf("Expected '%s', got '%s'", expectedFQName, actualFQName)
+		}
+
+		switch ds.Name() {
+		case "local/portfolio":
+			assert.Nil(t, ds.Data)
+		case "event/data":
+			assert.NotNil(t, ds.Data)
+			assert.NotNil(t, ds.Data.Processor)
+			assert.NotNil(t, ds.Data.Connector)
+			assert.Nil(t, ds.SeedData)
+		case "event/stream":
+			assert.NotNil(t, ds.Data)
+			assert.NotNil(t, ds.Data.Processor)
+			assert.NotNil(t, ds.Data.Connector)
+			assert.Nil(t, ds.SeedData)
+		case "coinbase/btcusd":
+			assert.NotNil(t, ds.Data)
+			assert.NotNil(t, ds.Data.Processor)
+			assert.NotNil(t, ds.Data.Connector)
+			assert.Nil(t, ds.SeedData)
+		case "coinbase/btcusd_with_seed":
+			assert.NotNil(t, ds.Data)
+			assert.NotNil(t, ds.Data.Processor)
+			assert.NotNil(t, ds.Data.Connector)
+			assert.NotNil(t, ds.SeedData)
+			assert.NotNil(t, ds.SeedData.Processor)
+			assert.NotNil(t, ds.SeedData.Connector)
 		}
 	}
 }
@@ -123,12 +184,14 @@ func testActionsFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 			}
 		case "event/data":
 			fallthrough
+		case "event/stream":
+			fallthrough
 		case "coinbase/btcusd":
 			expected = make(map[string]string)
+		case "coinbase/btcusd_with_seed":
+			expected = make(map[string]string)
 		}
-		if !reflect.DeepEqual(expected, actual) {
-			t.Errorf("Expected:\n%v\nGot:\n%v", expected, actual)
-		}
+		assert.Equal(t, expected, actual)
 	}
 }
 
@@ -169,21 +232,28 @@ func testMeasurementNamesFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 			}
 		case "event/data":
 			expected = map[string]string{
-				"eventId": "event.data.eventId",
-				"height":  "event.data.height",
-				"rating":  "event.data.rating",
-				"speed":   "event.data.speed",
-				"target":  "event.data.target",
+				"height": "event.data.height",
+				"rating": "event.data.rating",
+				"speed":  "event.data.speed",
+				"target": "event.data.target",
+			}
+		case "event/stream":
+			expected = map[string]string{
+				"duration":     "event.stream.duration",
+				"guest_count":  "event.stream.guest_count",
+				"ticket_price": "event.stream.ticket_price",
 			}
 		case "coinbase/btcusd":
 			expected = map[string]string{
 				"close": "coinbase.btcusd.close",
 			}
+		case "coinbase/btcusd_with_seed":
+			expected = map[string]string{
+				"close": "coinbase.btcusd_with_seed.close",
+			}
 		}
 
-		if !reflect.DeepEqual(expected, actual) {
-			t.Errorf("Expected:\n%v\nGot:\n%v", expected, actual)
-		}
+		assert.Equal(t, expected, actual)
 	}
 }
 
@@ -207,13 +277,15 @@ func testActionNamesFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 			}
 		case "event/data":
 			fallthrough
+		case "event/stream":
+			fallthrough
 		case "coinbase/btcusd":
+			expected = make(map[string]string)
+		case "coinbase/btcusd_with_seed":
 			expected = make(map[string]string)
 		}
 
-		if !reflect.DeepEqual(expected, actual) {
-			t.Errorf("Expected:\n%v\nGot:\n%v", expected, actual)
-		}
+		assert.Equal(t, expected, actual)
 	}
 }
 
@@ -236,6 +308,8 @@ func testLawsFunc(dsSpec spec.DataspaceSpec) func(*testing.T) {
 				"local.portfolio.btc_balance >= 0",
 			}
 		case "coinbase/btcusd":
+			// No laws
+		case "event/stream":
 			// No laws
 		}
 
