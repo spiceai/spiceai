@@ -21,7 +21,7 @@ EPSILON_MIN = 0.01
 BATCH_SIZE = 256
 
 
-def softmax(q_values):
+def normed_softmax(q_values):
     """
     Softmax function to calculate action probabilities
 
@@ -31,7 +31,8 @@ def softmax(q_values):
     Returns:
         list of probabilities for each action
     """
-    exp_q_values = np.exp(q_values)
+    normed_values = q_values / np.max(np.abs(q_values))
+    exp_q_values = np.exp(normed_values)
     return exp_q_values / np.sum(exp_q_values)
 
 
@@ -81,7 +82,7 @@ class Model:
         q_value = self.predict(state)
         if np.random.random() < self.epsilon:
             return random.randint(0, self.action_size - 1), np.zeros(self.action_size)
-        return np.argmax(q_value), softmax(q_value)
+        return np.argmax(q_value), normed_softmax(q_value)
 
     def train(self, states, targets):
         self.model.fit(states, targets, epochs=1, verbose=0)
