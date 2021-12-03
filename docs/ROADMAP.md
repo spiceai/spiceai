@@ -22,28 +22,34 @@ Spice.ai is still under early development, so there are several gaps and limitat
 ## Tentative v0.5-alpha (Dec, 2021) roadmap
 
 - Performance improvements for large datasets
-- Darwin/ARM64 support
-- Improved data visualization in dashboard
 - Addition of the Soft-Actor-Critic (SAC) algorithm
 
-## Tentative v0.6-alpha (Jan, 2022) roadmap
+## Tentative v0.6-alpha (Dec, 2021) roadmap
 
-- Local Pod/Flight monitoring (WebSockets)
-- Custom visualization hooks for Dataspaces
+- HTTP Data Connector
+- Continuous Actions (AI Engine)
+- Tensorboard monitoring
+- WebSocket support for dashboard data
 
-## Tentative v0.7-alpha (Feb, 2022) roadmap
+## Tentative v0.7-alpha (Jan, 2022) roadmap
 
-- Search, index, publish and browse the Spice Rack registry
+- Continuous Actions (Dashboard)
+- Parallel Actions (AI Engine)
+- Darwin/ARM64 support
+
+## Tentative v0.8-alpha (Feb, 2022) roadmap
+
 - CI/CD on GitHub
+- A/B testing and flighting
 
 ## v1.0-stable roadmap
 
 - Self-host on baremetal or VM
 - Pluggable environments
-- Multiple AI Engine backends (E.g. PyTorch, Scikit-learn, etc.)
-- A/B testing and flighting
+- Search, index, publish and browse the Spice Rack registry
 - Distributed learning
-- Sidecar injection on Kubernetes
+- Improved data visualization in dashboard
+- Custom visualization hooks for Dataspaces
 
 ## Beyond v1.0
 
