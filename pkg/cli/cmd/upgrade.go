@@ -1,7 +1,10 @@
 package cmd
 
 import (
+	"os"
 	"path/filepath"
+	"strconv"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/spiceai/spiceai/pkg/constants"
@@ -21,7 +24,7 @@ spice upgrade
 		cmd.Println("Checking for latest Spice CLI release...")
 		release, err := github.GetLatestCliRelease()
 		if err != nil {
-			cmd.PrintErrln("Error checking for latest release: %w", err)
+			cmd.PrintErrln("Error checking for latest release:", err)
 			return
 		}
 
@@ -38,17 +41,41 @@ spice upgrade
 
 		cmd.Println("Upgrading the Spice.ai CLI ...")
 
-		err = github.DownloadAsset(release, spiceBinDir, assetName)
+		stat, err := os.Stat(spiceBinDir)
 		if err != nil {
-			cmd.PrintErrln("Error downloading the spice binary: %w", err)
+			cmd.PrintErrln("Error upgrading the spice binary:", err)
+			return
+		}
+
+		tmpDirName := strconv.FormatInt(time.Now().Unix(), 16)
+		tmpDir := filepath.Join(spiceBinDir, tmpDirName)
+
+		err = os.Mkdir(tmpDir, stat.Mode())
+		if err != nil {
+			cmd.PrintErrln("Error upgrading the spice binary:", err)
+			return
+		}
+		defer os.RemoveAll(tmpDir)
+
+		err = github.DownloadAsset(release, tmpDir, assetName)
+		if err != nil {
+			cmd.PrintErrln("Error downloading the spice binary:", err)
+			return
+		}
+
+		tempFilePath := filepath.Join(tmpDir, constants.SpiceCliFilename)
+
+		err = util.MakeFileExecutable(tempFilePath)
+		if err != nil {
+			cmd.PrintErrln("Error upgrading the spice binary:", err)
 			return
 		}
 
 		releaseFilePath := filepath.Join(spiceBinDir, constants.SpiceCliFilename)
 
-		err = util.MakeFileExecutable(releaseFilePath)
+		err = os.Rename(tempFilePath, releaseFilePath)
 		if err != nil {
-			cmd.PrintErrln("Error downloading the spice binary: %w", err)
+			cmd.PrintErrln("Error upgrading the spice binary:", err)
 			return
 		}
 

@@ -8,11 +8,12 @@ console.log("Updating version...");
 
 console.log(`Reading ${versionFilePath}...`);
 const versionContent = fs.readFileSync(versionFilePath, "utf8");
-console.log(`Read version: ${versionContent}`);
+const trimmedVersion = versionContent.trim();
+console.log(`Read version: ${trimmedVersion}`);
 
 console.log(`Reading ${constantsFilePath}...`);
 const originalConstantsContent = fs.readFileSync(constantsFilePath, "utf8");
-const replacementVersionFile = `SPICE_VERSION = 'v${versionContent}'`;
+const replacementVersionFile = `SPICE_VERSION = 'v${trimmedVersion}'`;
 
 const updatedContent = originalConstantsContent.replace(
   new RegExp("SPICE_VERSION = .*", "g"),

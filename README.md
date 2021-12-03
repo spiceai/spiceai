@@ -21,6 +21,8 @@ Spice.ai takes a developer-first approach, and is focused on a fast, iterative, 
 
 📺 View a getting started walkthrough of Spice.ai in action [here](https://www.youtube.com/watch?v=DKBLjuAz_lI).
 
+💻 Learn about our [approach to building intelligent applications](https://blog.spiceai.org/posts/2021/11/05/making-apps-that-learn-and-adapt/) and not just "doing AI"
+
 ## Features
 
 The Spice.ai runtime is written in Golang and Python and runs as a container or microservice. It's deployable to any public cloud, on-premises, and edge. It is configured with a simple manifest and accessed by HTTP APIs.
