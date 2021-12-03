@@ -15,6 +15,14 @@
       }
     },
     {
+      "name": "spice version",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "program": "${workspaceFolder}/cmd/spice/main.go",
+      "args": ["version"]
+    },
+    {
       "name": "spice action add hold",
       "type": "go",
       "request": "launch",
