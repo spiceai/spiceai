@@ -25,7 +25,7 @@ func TestPod(t *testing.T) {
 	manifestsToTest := map[string]*TestPodParams{
 		"trader.yaml": {
 			LocalStateTest:   true,
-			ExpectedHash:     "6d423c1f6dc9087139b1af70ae58280e",
+			ExpectedHash:     "f5d076339a77c6036e1535f1647cf5ab",
 			ValidForTraining: true,
 		},
 		"trader-infer.yaml": {
@@ -234,8 +234,8 @@ func testRewardsFunc(pod *Pod) func(*testing.T) {
 		switch pod.Name {
 		case "trader":
 			expected = map[string]string{
-				"buy":  "new_price = new_state.coinbase.btcusd.close\nchange_in_price = prev_price - new_price\nreward = change_in_price\n",
-				"sell": "new_price = new_state.coinbase.btcusd.close\nchange_in_price = prev_price - new_price\nreward = -change_in_price\n",
+				"buy":  "new_price = next_state[\"coinbase_btcusd_close\"]\nchange_in_price = prev_price - new_price\nreward = change_in_price\n",
+				"sell": "new_price = next_state[\"coinbase_btcusd_close\"]\nchange_in_price = prev_price - new_price\nreward = -change_in_price\n",
 				"hold": "reward = 1",
 			}
 		case "trader-infer":

@@ -57,16 +57,16 @@ actions:
 
 training:
   reward_init: |
-    prev_price = prev_state.coinbase.btcusd.close
+    prev_price = current_state["coinbase_btcusd_close"]
   rewards:
     - reward: buy
       with: |
-        new_price = new_state.coinbase.btcusd.close
+        new_price = next_state["coinbase_btcusd_close"]
         change_in_price = prev_price - new_price
         reward = change_in_price
     - reward: sell
       with: |
-        new_price = new_state.coinbase.btcusd.close
+        new_price = next_state["coinbase_btcusd_close"]
         change_in_price = prev_price - new_price
         reward = -change_in_price
     - reward: hold
