@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/fsnotify/fsnotify"
 	"github.com/spiceai/spiceai/pkg/aiengine"
@@ -60,10 +61,46 @@ func watchPods() error {
 func processNotifyEvent(event fsnotify.Event) error {
 	manifestPath := event.Name
 	ext := filepath.Ext(manifestPath)
-	if ext != ".yml" && ext != ".yaml" {
-		// Ignore non-YAML files
+
+	switch ext {
+	case ".yml":
+		fallthrough
+	case ".yaml":
+		return processPodManifestEvent(event)
+	case ".py":
+		return processRewardFuncEvent(event)
+	}
+
+	return nil
+}
+
+func processRewardFuncEvent(event fsnotify.Event) error {
+	rewardFuncPath := event.Name
+	fmt.Println(rewardFuncPath)
+
+	var pod *pods.Pod
+
+	// Find the pod that this reward func is mapped to
+	for _, p := range pods.Pods() {
+		if strings.Contains(rewardFuncPath, p.Training.RewardFuncs) {
+			pod = p
+		}
+	}
+
+	if pod == nil {
 		return nil
 	}
+
+	err := startNewPodTraining(pod)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func processPodManifestEvent(event fsnotify.Event) error {
+	manifestPath := event.Name
 
 	switch event.Op {
 	case fsnotify.Create:
