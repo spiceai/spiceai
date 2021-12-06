@@ -36,12 +36,12 @@ var (
 	runtime            *runtimeServer
 	snapshotter        *cupaloy.Config
 	testPods           = []string{
-		"test/Trader/46691940c4670ffe3a9c586012d27180fcb8b409",
-		"test/customprocessor/46691940c4670ffe3a9c586012d27180fcb8b409",
-		"test/event-tags/46691940c4670ffe3a9c586012d27180fcb8b409",
-		"test/event-categories/46691940c4670ffe3a9c586012d27180fcb8b409",
-		"test/trader-external-funcs/46691940c4670ffe3a9c586012d27180fcb8b409",
-		"test/trader-seed-streaming/46691940c4670ffe3a9c586012d27180fcb8b409",
+		"test/Trader/6ca57230ded0c58ec7445398a58186f719b0cfbe",
+		"test/customprocessor/6ca57230ded0c58ec7445398a58186f719b0cfbe",
+		"test/event-tags/6ca57230ded0c58ec7445398a58186f719b0cfbe",
+		"test/event-categories/6ca57230ded0c58ec7445398a58186f719b0cfbe",
+		"test/trader-external-funcs/6ca57230ded0c58ec7445398a58186f719b0cfbe",
+		"test/trader-seed-streaming/6ca57230ded0c58ec7445398a58186f719b0cfbe",
 	}
 )
 
