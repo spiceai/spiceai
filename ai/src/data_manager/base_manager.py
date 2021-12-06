@@ -134,7 +134,11 @@ class DataManagerBase(ABC):
 
         if self.reward_funcs_module is not None:
             reward_func = self.reward_funcs_module_actions[action_name]
-            return reward_func(current_state_dict, current_state_interpretations, next_state_dict, next_state_intepretations)
+            return reward_func(
+                current_state_dict,
+                current_state_interpretations,
+                next_state_dict,
+                next_state_intepretations)
 
         loc = {}
         loc["current_state"] = current_state_dict
