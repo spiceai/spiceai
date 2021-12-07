@@ -21,8 +21,8 @@
     }
   },
   "actions": {
-    "buy": "reward = new_state.coinbase_btcusd_close - prev_state.coinbase_btcusd_close",
-    "hold": "reward = -(new_state.coinbase_btcusd_close - prev_state.coinbase_btcusd_close)",
+    "buy": "reward = next_state[\"coinbase_btcusd_close\"] - current_state[\"coinbase_btcusd_close\"]",
+    "hold": "reward = -(next_state[\"coinbase_btcusd_close\"] - current_state[\"coinbase_btcusd_close\"])",
     "sell": "reward = -1"
   },
   "actions_order": {
