@@ -11,6 +11,7 @@ Werkzeug, 2.0.1, BSD License, Armin Ronacher, https://palletsprojects.com/p/werk
 absl-py, 0.13.0, Apache Software License, The Abseil Authors, https://github.com/abseil/abseil-py
 astunparse, 1.6.3, BSD License, UNKNOWN, https://github.com/simonpercivall/astunparse
 attrs, 21.2.0, MIT License, Hynek Schlawack, https://www.attrs.org/
+cached-property, 1.5.2, BSD License, Daniel Greenfeld, https://github.com/pydanny/cached-property
 cachetools, 4.2.2, MIT License, Thomas Kemmer, https://github.com/tkem/cachetools/
 certifi, 2021.5.30, Mozilla Public License 2.0 (MPL 2.0), Kenneth Reitz, https://certifiio.readthedocs.io/en/latest/
 charset-normalizer, 2.0.4, MIT License, Ahmed TAHRI @Ousret, https://github.com/ousret/charset_normalizer
@@ -25,6 +26,7 @@ grpcio-tools, 1.34.1, Apache Software License, The gRPC Authors, https://grpc.io
 h5py, 3.1.0, BSD License, Andrew Collette, http://www.h5py.org
 humanize, 3.11.0, MIT License, Jason Moiron, https://github.com/jmoiron/humanize
 idna, 3.2, BSD License, Kim Davies, https://github.com/kjd/idna
+importlib-metadata, 4.8.2, Apache Software License, Jason R. Coombs, https://github.com/python/importlib_metadata
 iniconfig, 1.1.1, MIT License, Ronny Pfannschmidt, Holger Krekel, http://github.com/RonnyPfannschmidt/iniconfig
 jupyter-client, 6.1.12, BSD License, Jupyter Development Team, https://jupyter.org
 jupyter-core, 4.7.1, BSD License, Jupyter Development Team, https://jupyter.org
@@ -35,7 +37,6 @@ oauthlib, 3.1.1, BSD License, The OAuthlib Community, https://github.com/oauthli
 opt-einsum, 3.3.0, MIT, Daniel Smith, https://github.com/dgasmith/opt_einsum
 packaging, 21.0, Apache Software License; BSD License, Donald Stufft and individual contributors, https://github.com/pypa/packaging
 pandas, 1.3.2, BSD License, The Pandas Development Team, https://pandas.pydata.org
-pkg-resources, 0.0.0, UNKNOWN, UNKNOWN, UNKNOWN
 pluggy, 0.13.1, MIT License, Holger Krekel, https://github.com/pytest-dev/pluggy
 protobuf, 3.17.3, 3-Clause BSD License, UNKNOWN, https://developers.google.com/protocol-buffers/
 psutil, 5.8.0, BSD License, Giampaolo Rodola, https://github.com/giampaolo/psutil
@@ -65,143 +66,144 @@ traitlets, 5.1.0, BSD License, IPython Development Team, https://github.com/ipyt
 typing-extensions, 3.7.4.3, Python Software Foundation License, Guido van Rossum, Jukka Lehtosalo, Lukasz Langa, Michael Lee, https://github.com/python/typing/blob/master/typing_extensions/README.rst
 urllib3, 1.26.6, MIT License, Andrey Petrov, https://urllib3.readthedocs.io/
 wrapt, 1.12.1, BSD License, Graham Dumpleton, https://github.com/GrahamDumpleton/wrapt
+zipp, 3.6.0, MIT License, Jason R. Coombs, https://github.com/jaraco/zipp
 
 ## Go Modules
 
-github.com/spf13/cobra, https://github.com/spf13/cobra/blob/master/LICENSE.txt, Apache-2.0
-github.com/fsnotify/fsnotify, https://github.com/fsnotify/fsnotify/blob/master/LICENSE, BSD-3-Clause
-github.com/mitchellh/mapstructure, https://github.com/mitchellh/mapstructure/blob/master/LICENSE, MIT
-github.com/cenkalti/backoff/v4, https://github.com/cenkalti/backoff/blob/master/v4/LICENSE, MIT
-github.com/uber/jaeger-client-go, https://github.com/uber/jaeger-client-go/blob/master/LICENSE, Apache-2.0
+github.com/google/go-querystring/query, https://github.com/google/go-querystring/blob/master/query/LICENSE, BSD-3-Clause
+go.uber.org/atomic, Unknown, MIT
+github.com/andybalholm/brotli, https://github.com/andybalholm/brotli/blob/master/LICENSE, MIT
+github.com/spf13/cast, https://github.com/spf13/cast/blob/master/LICENSE, MIT
+github.com/pelletier/go-toml, https://github.com/pelletier/go-toml/blob/master/LICENSE, Apache-2.0
 github.com/dghubble/sling, https://github.com/dghubble/sling/blob/master/LICENSE, MIT
+golang.org/x/xerrors, Unknown, BSD-3-Clause
+github.com/opentracing/opentracing-go, https://github.com/opentracing/opentracing-go/blob/master/LICENSE, Apache-2.0
+github.com/klauspost/compress, https://github.com/klauspost/compress/blob/master/LICENSE, Apache-2.0
+github.com/spf13/viper, https://github.com/spf13/viper/blob/master/LICENSE, MIT
+golang.org/x/sync/errgroup, Unknown, BSD-3-Clause
+github.com/cenkalti/backoff/v4, https://github.com/cenkalti/backoff/blob/master/v4/LICENSE, MIT
+github.com/andreyvit/diff, https://github.com/andreyvit/diff/blob/master/LICENSE, MIT
+github.com/uber/jaeger-lib/metrics, https://github.com/uber/jaeger-lib/blob/master/metrics/LICENSE, Apache-2.0
+golang.org/x/net, Unknown, BSD-3-Clause
+github.com/olekukonko/tablewriter, https://github.com/olekukonko/tablewriter/blob/master/LICENSE.md, MIT
+github.com/mattn/go-runewidth, https://github.com/mattn/go-runewidth/blob/master/LICENSE, MIT
+github.com/influxdata/flux, https://github.com/influxdata/flux/blob/master/LICENSE, MIT
+github.com/benbjohnson/immutable, https://github.com/benbjohnson/immutable/blob/master/LICENSE, MIT
+github.com/google/go-cmp/cmp, https://github.com/google/go-cmp/blob/master/cmp/LICENSE, BSD-3-Clause
+github.com/apache/arrow/go/arrow/internal/cpu, https://github.com/apache/arrow/blob/master/go/arrow/internal/cpu/README.md, Apache-2.0
+github.com/hashicorp/go-retryablehttp, https://github.com/hashicorp/go-retryablehttp/blob/master/LICENSE, MPL-2.0
+github.com/spf13/pflag, https://github.com/spf13/pflag/blob/master/LICENSE, BSD-3-Clause
+github.com/dghubble/oauth1, https://github.com/dghubble/oauth1/blob/master/LICENSE, MIT
 github.com/cespare/xxhash/v2, https://github.com/cespare/xxhash/blob/master/v2/LICENSE.txt, MIT
 go.uber.org/multierr, Unknown, MIT
-github.com/andybalholm/brotli, https://github.com/andybalholm/brotli/blob/master/LICENSE, MIT
-github.com/spiceai/data-components-contrib, https://github.com/spiceai/data-components-contrib/blob/master/LICENSE, MIT
-golang.org/x/xerrors, Unknown, BSD-3-Clause
-github.com/benbjohnson/immutable, https://github.com/benbjohnson/immutable/blob/master/LICENSE, MIT
-github.com/spf13/jwalterweatherman, https://github.com/spf13/jwalterweatherman/blob/master/LICENSE, MIT
-github.com/mattn/go-runewidth, https://github.com/mattn/go-runewidth/blob/master/LICENSE, MIT
-github.com/apache/arrow/go/arrow, https://github.com/apache/arrow/blob/master/go/arrow/LICENSE.txt, Apache-2.0
-github.com/google/flatbuffers/go, https://github.com/google/flatbuffers/blob/master/go/LICENSE.txt, Apache-2.0
-go.uber.org/atomic, Unknown, MIT
-golang.org/x/mod/semver, Unknown, BSD-3-Clause
-github.com/gorilla/websocket, https://github.com/gorilla/websocket/blob/master/LICENSE, BSD-2-Clause
-github.com/pkg/errors, https://github.com/pkg/errors/blob/master/LICENSE, BSD-2-Clause
-github.com/fasthttp/router, https://github.com/fasthttp/router/blob/master/LICENSE, BSD-3-Clause
-github.com/spf13/cast, https://github.com/spf13/cast/blob/master/LICENSE, MIT
-github.com/rivo/uniseg, https://github.com/rivo/uniseg/blob/master/LICENSE.txt, MIT
-golang.org/x/sync/errgroup, Unknown, BSD-3-Clause
-github.com/influxdata/line-protocol, https://github.com/influxdata/line-protocol/blob/master/LICENSE, MIT
-github.com/dghubble/go-twitter/twitter, https://github.com/dghubble/go-twitter/blob/master/twitter/LICENSE, MIT
-github.com/hashicorp/go-retryablehttp, https://github.com/hashicorp/go-retryablehttp/blob/master/LICENSE, MPL-2.0
-github.com/magiconair/properties, https://github.com/magiconair/properties/blob/master/LICENSE.md, BSD-2-Clause
-github.com/spf13/afero, https://github.com/spf13/afero/blob/master/LICENSE.txt, Apache-2.0
-github.com/subosito/gotenv, https://github.com/subosito/gotenv/blob/master/LICENSE, MIT
-github.com/gofrs/uuid, https://github.com/gofrs/uuid/blob/master/LICENSE, MIT
-gopkg.in/natefinch/lumberjack.v2, Unknown, MIT
-github.com/klauspost/compress, https://github.com/klauspost/compress/blob/master/LICENSE, Apache-2.0
-golang.org/x/net, Unknown, BSD-3-Clause
-gopkg.in/ini.v1, Unknown, Apache-2.0
-google.golang.org/protobuf, Unknown, BSD-3-Clause
-github.com/olekukonko/tablewriter, https://github.com/olekukonko/tablewriter/blob/master/LICENSE.md, MIT
-github.com/influxdata/influxdb-client-go, https://github.com/influxdata/influxdb-client-go/blob/master/LICENSE, MIT
-github.com/deepmap/oapi-codegen/pkg, https://github.com/deepmap/oapi-codegen/blob/master/pkg/LICENSE, Apache-2.0
-github.com/google/go-cmp/cmp, https://github.com/google/go-cmp/blob/master/cmp/LICENSE, BSD-3-Clause
-github.com/andreyvit/diff, https://github.com/andreyvit/diff/blob/master/LICENSE, MIT
-github.com/savsgio/gotils, https://github.com/savsgio/gotils/blob/master/LICENSE, Apache-2.0
-golang.org/x/text, Unknown, BSD-3-Clause
-gopkg.in/yaml.v2, Unknown, Apache-2.0
-golang.org/x/sys, Unknown, BSD-3-Clause
-github.com/apache/arrow/go/arrow/internal/cpu, https://github.com/apache/arrow/blob/master/go/arrow/internal/cpu/README.md, Apache-2.0
-github.com/uber/jaeger-lib/metrics, https://github.com/uber/jaeger-lib/blob/master/metrics/LICENSE, Apache-2.0
-github.com/valyala/fasthttp, https://github.com/valyala/fasthttp/blob/master/LICENSE, MIT
-github.com/opentracing/opentracing-go, https://github.com/opentracing/opentracing-go/blob/master/LICENSE, Apache-2.0
-github.com/influxdata/flux/internal/zoneinfo, https://github.com/influxdata/flux/blob/master/internal/zoneinfo/LICENSE, BSD-3-Clause
-go.uber.org/zap, Unknown, MIT
-github.com/spf13/viper, https://github.com/spf13/viper/blob/master/LICENSE, MIT
-github.com/google/go-querystring/query, https://github.com/google/go-querystring/blob/master/query/LICENSE, BSD-3-Clause
-github.com/golang/protobuf, https://github.com/golang/protobuf/blob/master/LICENSE, BSD-3-Clause
-github.com/spiceai/spiceai, https://github.com/lukekim/spiceai/blob/master/LICENSE, Apache-2.0
-github.com/hashicorp/hcl, https://github.com/hashicorp/hcl/blob/master/LICENSE, MPL-2.0
-github.com/pelletier/go-toml, https://github.com/pelletier/go-toml/blob/master/LICENSE, Apache-2.0
-github.com/dghubble/oauth1, https://github.com/dghubble/oauth1/blob/master/LICENSE, MIT
-github.com/influxdata/flux, https://github.com/influxdata/flux/blob/master/LICENSE, MIT
-google.golang.org/grpc, Unknown, Apache-2.0
-google.golang.org/genproto/googleapis/rpc/status, Unknown, Apache-2.0
-github.com/logrusorgru/aurora, https://github.com/logrusorgru/aurora/blob/master/LICENSE, Unlicense
-github.com/spf13/pflag, https://github.com/spf13/pflag/blob/master/LICENSE, BSD-3-Clause
-github.com/gocarina/gocsv, https://github.com/gocarina/gocsv/blob/master/LICENSE, MIT
-github.com/sergi/go-diff/diffmatchpatch, https://github.com/sergi/go-diff/blob/master/diffmatchpatch/LICENSE, MIT
-github.com/valyala/bytebufferpool, https://github.com/valyala/bytebufferpool/blob/master/LICENSE, MIT
-github.com/hashicorp/go-cleanhttp, https://github.com/hashicorp/go-cleanhttp/blob/master/LICENSE, MPL-2.0
-github.com/hashicorp/go-retryablehttp, https://github.com/hashicorp/go-retryablehttp/blob/master/LICENSE, MPL-2.0
-github.com/magiconair/properties, https://github.com/magiconair/properties/blob/master/LICENSE.md, BSD-2-Clause
-github.com/pelletier/go-toml, https://github.com/pelletier/go-toml/blob/master/LICENSE, Apache-2.0
-github.com/olekukonko/tablewriter, https://github.com/olekukonko/tablewriter/blob/master/LICENSE.md, MIT
-golang.org/x/mod/semver, Unknown, BSD-3-Clause
-go.uber.org/atomic, Unknown, MIT
-github.com/pkg/errors, https://github.com/pkg/errors/blob/master/LICENSE, BSD-2-Clause
-golang.org/x/sys, Unknown, BSD-3-Clause
-golang.org/x/sync/errgroup, Unknown, BSD-3-Clause
-github.com/spf13/viper, https://github.com/spf13/viper/blob/master/LICENSE, MIT
-github.com/spf13/jwalterweatherman, https://github.com/spf13/jwalterweatherman/blob/master/LICENSE, MIT
-golang.org/x/net, Unknown, BSD-3-Clause
-github.com/valyala/fasthttp, https://github.com/valyala/fasthttp/blob/master/LICENSE, MIT
-github.com/spf13/cobra, https://github.com/spf13/cobra/blob/master/LICENSE.txt, Apache-2.0
-github.com/spiceai/data-components-contrib, https://github.com/spiceai/data-components-contrib/blob/master/LICENSE, MIT
-github.com/gorilla/websocket, https://github.com/gorilla/websocket/blob/master/LICENSE, BSD-2-Clause
-github.com/google/go-querystring/query, https://github.com/google/go-querystring/blob/master/query/LICENSE, BSD-3-Clause
-github.com/google/go-cmp/cmp, https://github.com/google/go-cmp/blob/master/cmp/LICENSE, BSD-3-Clause
-github.com/spiceai/spiceai, https://github.com/lukekim/spiceai/blob/master/LICENSE, Apache-2.0
-github.com/spf13/cast, https://github.com/spf13/cast/blob/master/LICENSE, MIT
-github.com/benbjohnson/immutable, https://github.com/benbjohnson/immutable/blob/master/LICENSE, MIT
-github.com/cenkalti/backoff/v4, https://github.com/cenkalti/backoff/blob/master/v4/LICENSE, MIT
-golang.org/x/xerrors, Unknown, BSD-3-Clause
-github.com/mitchellh/mapstructure, https://github.com/mitchellh/mapstructure/blob/master/LICENSE, MIT
-github.com/spf13/afero, https://github.com/spf13/afero/blob/master/LICENSE.txt, Apache-2.0
-github.com/gocarina/gocsv, https://github.com/gocarina/gocsv/blob/master/LICENSE, MIT
-go.uber.org/multierr, Unknown, MIT
-google.golang.org/protobuf, Unknown, BSD-3-Clause
-github.com/deepmap/oapi-codegen/pkg, https://github.com/deepmap/oapi-codegen/blob/master/pkg/LICENSE, Apache-2.0
-gopkg.in/natefinch/lumberjack.v2, Unknown, MIT
-github.com/apache/arrow/go/arrow, https://github.com/apache/arrow/blob/master/go/arrow/LICENSE.txt, Apache-2.0
-github.com/andybalholm/brotli, https://github.com/andybalholm/brotli/blob/master/LICENSE, MIT
-github.com/influxdata/influxdb-client-go, https://github.com/influxdata/influxdb-client-go/blob/master/LICENSE, MIT
-github.com/dghubble/sling, https://github.com/dghubble/sling/blob/master/LICENSE, MIT
-github.com/influxdata/flux/internal/zoneinfo, https://github.com/influxdata/flux/blob/master/internal/zoneinfo/LICENSE, BSD-3-Clause
-github.com/golang/protobuf, https://github.com/golang/protobuf/blob/master/LICENSE, BSD-3-Clause
-gopkg.in/yaml.v2, Unknown, Apache-2.0
-google.golang.org/genproto/googleapis/rpc/status, Unknown, Apache-2.0
-github.com/hashicorp/go-cleanhttp, https://github.com/hashicorp/go-cleanhttp/blob/master/LICENSE, MPL-2.0
-github.com/influxdata/line-protocol, https://github.com/influxdata/line-protocol/blob/master/LICENSE, MIT
-github.com/dghubble/go-twitter/twitter, https://github.com/dghubble/go-twitter/blob/master/twitter/LICENSE, MIT
-github.com/dghubble/oauth1, https://github.com/dghubble/oauth1/blob/master/LICENSE, MIT
-github.com/influxdata/flux, https://github.com/influxdata/flux/blob/master/LICENSE, MIT
-github.com/google/flatbuffers/go, https://github.com/google/flatbuffers/blob/master/go/LICENSE.txt, Apache-2.0
-github.com/cespare/xxhash/v2, https://github.com/cespare/xxhash/blob/master/v2/LICENSE.txt, MIT
-github.com/spf13/pflag, https://github.com/spf13/pflag/blob/master/LICENSE, BSD-3-Clause
-gopkg.in/ini.v1, Unknown, Apache-2.0
-github.com/klauspost/compress, https://github.com/klauspost/compress/blob/master/LICENSE, Apache-2.0
-github.com/andreyvit/diff, https://github.com/andreyvit/diff/blob/master/LICENSE, MIT
-github.com/sergi/go-diff/diffmatchpatch, https://github.com/sergi/go-diff/blob/master/diffmatchpatch/LICENSE, MIT
-github.com/opentracing/opentracing-go, https://github.com/opentracing/opentracing-go/blob/master/LICENSE, Apache-2.0
-github.com/uber/jaeger-client-go, https://github.com/uber/jaeger-client-go/blob/master/LICENSE, Apache-2.0
-github.com/valyala/bytebufferpool, https://github.com/valyala/bytebufferpool/blob/master/LICENSE, MIT
-github.com/fasthttp/router, https://github.com/fasthttp/router/blob/master/LICENSE, BSD-3-Clause
 github.com/fsnotify/fsnotify, https://github.com/fsnotify/fsnotify/blob/master/LICENSE, BSD-3-Clause
-github.com/hashicorp/hcl, https://github.com/hashicorp/hcl/blob/master/LICENSE, MPL-2.0
-github.com/mattn/go-runewidth, https://github.com/mattn/go-runewidth/blob/master/LICENSE, MIT
-go.uber.org/zap, Unknown, MIT
-github.com/apache/arrow/go/arrow/internal/cpu, https://github.com/apache/arrow/blob/master/go/arrow/internal/cpu/README.md, Apache-2.0
-github.com/uber/jaeger-lib/metrics, https://github.com/uber/jaeger-lib/blob/master/metrics/LICENSE, Apache-2.0
+github.com/magiconair/properties, https://github.com/magiconair/properties/blob/master/LICENSE.md, BSD-2-Clause
 golang.org/x/text, Unknown, BSD-3-Clause
-github.com/subosito/gotenv, https://github.com/subosito/gotenv/blob/master/LICENSE, MIT
-google.golang.org/grpc, Unknown, Apache-2.0
+github.com/hashicorp/hcl, https://github.com/hashicorp/hcl/blob/master/LICENSE, MPL-2.0
 github.com/rivo/uniseg, https://github.com/rivo/uniseg/blob/master/LICENSE.txt, MIT
-github.com/logrusorgru/aurora, https://github.com/logrusorgru/aurora/blob/master/LICENSE, Unlicense
+github.com/apache/arrow/go/arrow, https://github.com/apache/arrow/blob/master/go/arrow/LICENSE.txt, Apache-2.0
+github.com/spiceai/spiceai, Unknown, Apache-2.0
+github.com/spf13/cobra, https://github.com/spf13/cobra/blob/master/LICENSE.txt, Apache-2.0
+github.com/gocarina/gocsv, https://github.com/gocarina/gocsv/blob/master/LICENSE, MIT
+github.com/fasthttp/router, https://github.com/fasthttp/router/blob/master/LICENSE, BSD-3-Clause
+github.com/hashicorp/go-cleanhttp, https://github.com/hashicorp/go-cleanhttp/blob/master/LICENSE, MPL-2.0
+github.com/uber/jaeger-client-go, https://github.com/uber/jaeger-client-go/blob/master/LICENSE, Apache-2.0
+github.com/mitchellh/mapstructure, https://github.com/mitchellh/mapstructure/blob/master/LICENSE, MIT
+google.golang.org/protobuf, Unknown, BSD-3-Clause
+github.com/deepmap/oapi-codegen/pkg, https://github.com/deepmap/oapi-codegen/blob/master/pkg/LICENSE, Apache-2.0
+github.com/pkg/errors, https://github.com/pkg/errors/blob/master/LICENSE, BSD-2-Clause
+github.com/influxdata/line-protocol, https://github.com/influxdata/line-protocol/blob/master/LICENSE, MIT
+github.com/dghubble/go-twitter/twitter, https://github.com/dghubble/go-twitter/blob/master/twitter/LICENSE, MIT
+github.com/google/flatbuffers/go, https://github.com/google/flatbuffers/blob/master/go/LICENSE.txt, Apache-2.0
+google.golang.org/genproto/googleapis/rpc/status, Unknown, Apache-2.0
+golang.org/x/mod/semver, Unknown, BSD-3-Clause
+github.com/spiceai/data-components-contrib, https://github.com/spiceai/data-components-contrib/blob/master/LICENSE, MIT
+github.com/influxdata/influxdb-client-go, https://github.com/influxdata/influxdb-client-go/blob/master/LICENSE, MIT
 github.com/gofrs/uuid, https://github.com/gofrs/uuid/blob/master/LICENSE, MIT
+gopkg.in/natefinch/lumberjack.v2, Unknown, MIT
+github.com/golang/protobuf, https://github.com/golang/protobuf/blob/master/LICENSE, BSD-3-Clause
+golang.org/x/sys, Unknown, BSD-3-Clause
+github.com/spf13/afero, https://github.com/spf13/afero/blob/master/LICENSE.txt, Apache-2.0
+github.com/sergi/go-diff/diffmatchpatch, https://github.com/sergi/go-diff/blob/master/diffmatchpatch/LICENSE, MIT
+github.com/valyala/fasthttp, https://github.com/valyala/fasthttp/blob/master/LICENSE, MIT
+github.com/logrusorgru/aurora, https://github.com/logrusorgru/aurora/blob/master/LICENSE, Unlicense
+gopkg.in/yaml.v2, Unknown, Apache-2.0
+github.com/subosito/gotenv, https://github.com/subosito/gotenv/blob/master/LICENSE, MIT
+gopkg.in/ini.v1, Unknown, Apache-2.0
+github.com/gorilla/websocket, https://github.com/gorilla/websocket/blob/master/LICENSE, BSD-2-Clause
+github.com/valyala/bytebufferpool, https://github.com/valyala/bytebufferpool/blob/master/LICENSE, MIT
+github.com/spf13/jwalterweatherman, https://github.com/spf13/jwalterweatherman/blob/master/LICENSE, MIT
+github.com/influxdata/flux/internal/zoneinfo, https://github.com/influxdata/flux/blob/master/internal/zoneinfo/LICENSE, BSD-3-Clause
+go.uber.org/zap, Unknown, MIT
+google.golang.org/grpc, Unknown, Apache-2.0
 github.com/savsgio/gotils, https://github.com/savsgio/gotils/blob/master/LICENSE, Apache-2.0
+github.com/apache/arrow/go/arrow/internal/cpu, https://github.com/apache/arrow/blob/master/go/arrow/internal/cpu/README.md, Apache-2.0
+github.com/influxdata/flux/internal/zoneinfo, https://github.com/influxdata/flux/blob/master/internal/zoneinfo/LICENSE, BSD-3-Clause
+google.golang.org/grpc, Unknown, Apache-2.0
+github.com/andybalholm/brotli, https://github.com/andybalholm/brotli/blob/master/LICENSE, MIT
+github.com/hashicorp/go-cleanhttp, https://github.com/hashicorp/go-cleanhttp/blob/master/LICENSE, MPL-2.0
+github.com/magiconair/properties, https://github.com/magiconair/properties/blob/master/LICENSE.md, BSD-2-Clause
+google.golang.org/protobuf, Unknown, BSD-3-Clause
+github.com/gofrs/uuid, https://github.com/gofrs/uuid/blob/master/LICENSE, MIT
+github.com/uber/jaeger-lib/metrics, https://github.com/uber/jaeger-lib/blob/master/metrics/LICENSE, Apache-2.0
+github.com/spf13/pflag, https://github.com/spf13/pflag/blob/master/LICENSE, BSD-3-Clause
+golang.org/x/sys, Unknown, BSD-3-Clause
+github.com/spf13/jwalterweatherman, https://github.com/spf13/jwalterweatherman/blob/master/LICENSE, MIT
+golang.org/x/sync/errgroup, Unknown, BSD-3-Clause
+github.com/influxdata/flux, https://github.com/influxdata/flux/blob/master/LICENSE, MIT
+golang.org/x/xerrors, Unknown, BSD-3-Clause
+github.com/google/go-cmp/cmp, https://github.com/google/go-cmp/blob/master/cmp/LICENSE, BSD-3-Clause
+golang.org/x/text, Unknown, BSD-3-Clause
+github.com/deepmap/oapi-codegen/pkg, https://github.com/deepmap/oapi-codegen/blob/master/pkg/LICENSE, Apache-2.0
+github.com/valyala/bytebufferpool, https://github.com/valyala/bytebufferpool/blob/master/LICENSE, MIT
+go.uber.org/atomic, Unknown, MIT
+github.com/dghubble/oauth1, https://github.com/dghubble/oauth1/blob/master/LICENSE, MIT
+github.com/andreyvit/diff, https://github.com/andreyvit/diff/blob/master/LICENSE, MIT
+github.com/spiceai/spiceai, Unknown, Apache-2.0
+github.com/fsnotify/fsnotify, https://github.com/fsnotify/fsnotify/blob/master/LICENSE, BSD-3-Clause
+golang.org/x/mod/semver, Unknown, BSD-3-Clause
+github.com/influxdata/influxdb-client-go, https://github.com/influxdata/influxdb-client-go/blob/master/LICENSE, MIT
+github.com/benbjohnson/immutable, https://github.com/benbjohnson/immutable/blob/master/LICENSE, MIT
+github.com/opentracing/opentracing-go, https://github.com/opentracing/opentracing-go/blob/master/LICENSE, Apache-2.0
+google.golang.org/genproto/googleapis/rpc/status, Unknown, Apache-2.0
+github.com/klauspost/compress, https://github.com/klauspost/compress/blob/master/LICENSE, Apache-2.0
+github.com/spf13/afero, https://github.com/spf13/afero/blob/master/LICENSE.txt, Apache-2.0
+github.com/spf13/cast, https://github.com/spf13/cast/blob/master/LICENSE, MIT
+github.com/olekukonko/tablewriter, https://github.com/olekukonko/tablewriter/blob/master/LICENSE.md, MIT
+github.com/spiceai/data-components-contrib, https://github.com/spiceai/data-components-contrib/blob/master/LICENSE, MIT
+github.com/mitchellh/mapstructure, https://github.com/mitchellh/mapstructure/blob/master/LICENSE, MIT
+github.com/hashicorp/hcl, https://github.com/hashicorp/hcl/blob/master/LICENSE, MPL-2.0
+github.com/uber/jaeger-client-go, https://github.com/uber/jaeger-client-go/blob/master/LICENSE, Apache-2.0
+github.com/golang/protobuf, https://github.com/golang/protobuf/blob/master/LICENSE, BSD-3-Clause
+github.com/valyala/fasthttp, https://github.com/valyala/fasthttp/blob/master/LICENSE, MIT
+github.com/pelletier/go-toml, https://github.com/pelletier/go-toml/blob/master/LICENSE, Apache-2.0
+github.com/hashicorp/go-retryablehttp, https://github.com/hashicorp/go-retryablehttp/blob/master/LICENSE, MPL-2.0
+gopkg.in/ini.v1, Unknown, Apache-2.0
+github.com/logrusorgru/aurora, https://github.com/logrusorgru/aurora/blob/master/LICENSE, Unlicense
+github.com/gorilla/websocket, https://github.com/gorilla/websocket/blob/master/LICENSE, BSD-2-Clause
+github.com/cenkalti/backoff/v4, https://github.com/cenkalti/backoff/blob/master/v4/LICENSE, MIT
+github.com/sergi/go-diff/diffmatchpatch, https://github.com/sergi/go-diff/blob/master/diffmatchpatch/LICENSE, MIT
+github.com/spf13/viper, https://github.com/spf13/viper/blob/master/LICENSE, MIT
+gopkg.in/natefinch/lumberjack.v2, Unknown, MIT
+github.com/cespare/xxhash/v2, https://github.com/cespare/xxhash/blob/master/v2/LICENSE.txt, MIT
+github.com/savsgio/gotils, https://github.com/savsgio/gotils/blob/master/LICENSE, Apache-2.0
+gopkg.in/yaml.v2, Unknown, Apache-2.0
+github.com/gocarina/gocsv, https://github.com/gocarina/gocsv/blob/master/LICENSE, MIT
+github.com/rivo/uniseg, https://github.com/rivo/uniseg/blob/master/LICENSE.txt, MIT
+github.com/google/go-querystring/query, https://github.com/google/go-querystring/blob/master/query/LICENSE, BSD-3-Clause
+github.com/google/flatbuffers/go, https://github.com/google/flatbuffers/blob/master/go/LICENSE.txt, Apache-2.0
+golang.org/x/net, Unknown, BSD-3-Clause
+github.com/subosito/gotenv, https://github.com/subosito/gotenv/blob/master/LICENSE, MIT
+github.com/mattn/go-runewidth, https://github.com/mattn/go-runewidth/blob/master/LICENSE, MIT
+go.uber.org/multierr, Unknown, MIT
+github.com/pkg/errors, https://github.com/pkg/errors/blob/master/LICENSE, BSD-2-Clause
+github.com/apache/arrow/go/arrow, https://github.com/apache/arrow/blob/master/go/arrow/LICENSE.txt, Apache-2.0
+github.com/spf13/cobra, https://github.com/spf13/cobra/blob/master/LICENSE.txt, Apache-2.0
+github.com/influxdata/line-protocol, https://github.com/influxdata/line-protocol/blob/master/LICENSE, MIT
+go.uber.org/zap, Unknown, MIT
+github.com/dghubble/go-twitter/twitter, https://github.com/dghubble/go-twitter/blob/master/twitter/LICENSE, MIT
+github.com/dghubble/sling, https://github.com/dghubble/sling/blob/master/LICENSE, MIT
+github.com/fasthttp/router, https://github.com/fasthttp/router/blob/master/LICENSE, BSD-3-Clause
 
 ## Node Packages
 
@@ -580,6 +582,7 @@ bfj@7.0.2, MIT, git+https://gitlab.com/philbooth/bfj
 big.js@5.2.2, MIT, https://github.com/MikeMcl/big.js
 binary-extensions@1.13.1, MIT, https://github.com/sindresorhus/binary-extensions
 binary-extensions@2.2.0, MIT, https://github.com/sindresorhus/binary-extensions
+bindings@1.5.0, MIT, https://github.com/TooTallNate/node-bindings
 bluebird@3.7.2, MIT, https://github.com/petkaantonov/bluebird
 bn.js@4.12.0, MIT, https://github.com/indutny/bn.js
 bn.js@5.2.0, MIT, https://github.com/indutny/bn.js
@@ -880,6 +883,7 @@ fb-watchman@2.0.1, Apache-2.0, https://github.com/facebook/watchman
 figgy-pudding@3.5.2, ISC, https://github.com/npm/figgy-pudding
 file-entry-cache@6.0.1, MIT, https://github.com/royriojas/file-entry-cache
 file-loader@6.1.1, MIT, https://github.com/webpack-contrib/file-loader
+file-uri-to-path@1.0.0, MIT, https://github.com/TooTallNate/file-uri-to-path
 filesize@6.1.0, BSD-3-Clause, https://github.com/avoidwork/filesize.js
 fill-range@4.0.0, MIT, https://github.com/jonschlinkert/fill-range
 fill-range@7.0.1, MIT, https://github.com/jonschlinkert/fill-range
@@ -911,6 +915,8 @@ fs-extra@9.1.0, MIT, https://github.com/jprichardson/node-fs-extra
 fs-minipass@2.1.0, ISC, https://github.com/npm/fs-minipass
 fs-write-stream-atomic@1.0.10, ISC, https://github.com/npm/fs-write-stream-atomic
 fs.realpath@1.0.0, ISC, https://github.com/isaacs/fs.realpath
+fsevents@1.2.13, MIT, https://github.com/strongloop/fsevents
+fsevents@2.3.2, MIT, https://github.com/fsevents/fsevents
 function-bind@1.1.1, MIT, https://github.com/Raynos/function-bind
 functional-red-black-tree@1.0.1, MIT, https://github.com/mikolalysenko/functional-red-black-tree
 gensync@1.0.0-beta.2, MIT, https://github.com/loganfsmyth/gensync
@@ -1223,6 +1229,7 @@ ms@2.1.2, MIT, https://github.com/zeit/ms
 ms@2.1.3, MIT, https://github.com/vercel/ms
 multicast-dns-service-types@1.1.0, MIT, https://github.com/mafintosh/multicast-dns-service-types
 multicast-dns@6.2.3, MIT, https://github.com/mafintosh/multicast-dns
+nan@2.15.0, MIT, https://github.com/nodejs/nan
 nanoid@3.1.30, MIT, https://github.com/ai/nanoid
 nanomatch@1.2.13, MIT, https://github.com/micromatch/nanomatch
 native-url@0.2.6, Apache-2.0, https://github.com/GoogleChromeLabs/native-url
