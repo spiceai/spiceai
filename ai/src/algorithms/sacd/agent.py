@@ -6,7 +6,7 @@ import numpy as np
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import optimizers
-from tensorflow.keras.layers import Dense
+from tensorflow.keras import layers
 import tensorflow_probability as tfp
 
 from algorithms.agent_interface import SpiceAIAgent
@@ -16,47 +16,32 @@ tf.keras.backend.set_floatx("float64")
 
 
 class SACD(keras.Model):
+    ACTIVATION = 'leaky_relu'
     LEARNING_RATE = 1e-3
     REWARD_DISCOUNT = 0.95
     TARGET_ENTROPY_SCALE = 0.2
     TARGET_MOMEMTUM = 0.05
 
+    @staticmethod
+    def create_network(input_dim: int, output_dim: int, final_activation: str = None) -> keras.Model:
+        return keras.Sequential([
+            keras.Input(input_dim),
+            layers.Dense(128, activation=SACD.ACTIVATION),
+            layers.Dense(128, activation=SACD.ACTIVATION),
+            layers.Dense(64, activation=SACD.ACTIVATION),
+            layers.Dense(32, activation=SACD.ACTIVATION),
+            layers.Dense(output_dim, activation=final_activation)])
+
     class Actor(keras.Model):
-        ACTIVATION = 'leaky_relu'
 
         def __init__(self, state_dim: int, action_dim: int):
             super().__init__()
-            self.seq = keras.Sequential([
-                keras.Input(state_dim),
-                Dense(128, activation=self.ACTIVATION),
-                Dense(128, activation=self.ACTIVATION),
-                Dense(64, activation=self.ACTIVATION),
-                Dense(32, activation=self.ACTIVATION),
-                Dense(action_dim, activation='softmax')])
+            self.seq = SACD.create_network(state_dim, action_dim, 'softmax')
 
         def call(self, input_tensor: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor]:
             action_probs = self.seq(input_tensor)
             distribution = tfp.distributions.Categorical(action_probs)
             return distribution.sample(), action_probs
-
-    class Critic(keras.Model):
-        ACTIVATION = 'leaky_relu'
-
-        def __init__(self, state_dim: int, action_dim: int):
-            super().__init__()
-            self.seq = keras.Sequential([
-                keras.Input(state_dim),
-                Dense(128, activation=self.ACTIVATION),
-                Dense(128, activation=self.ACTIVATION),
-                Dense(64, activation=self.ACTIVATION),
-                Dense(32, activation=self.ACTIVATION),
-                Dense(action_dim)])
-
-        def get_config(self):
-            return {"seq": self.seq}
-
-        def call(self, input_tensor: tf.Tensor) -> tf.Tensor:
-            return self.seq(input_tensor)
 
     def __init__(self, state_shape: tuple, action_size):
         super().__init__()
@@ -64,10 +49,10 @@ class SACD(keras.Model):
         self.action_size = action_size
 
         self.actor = self.Actor(state_shape[0], action_size)
-        self._critic_1 = self.Critic(state_shape[0], action_size)
-        self._critic_2 = self.Critic(state_shape[0], action_size)
-        self._target_critic_1 = self.Critic(state_shape[0], action_size)
-        self._target_critic_2 = self.Critic(state_shape[0], action_size)
+        self._critic_1 = SACD.create_network(state_shape[0], action_size)
+        self._critic_2 = SACD.create_network(state_shape[0], action_size)
+        self._target_critic_1 = SACD.create_network(state_shape[0], action_size)
+        self._target_critic_2 = SACD.create_network(state_shape[0], action_size)
 
         self.target_entropy = -np.log((1.0 / action_size)) * self.TARGET_ENTROPY_SCALE
         self.log_alpha = tf.Variable([1.0], trainable=True, name='log_alpha', dtype=tf.float64)
