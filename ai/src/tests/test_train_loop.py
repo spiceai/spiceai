@@ -127,7 +127,7 @@ class TrainingLoopTests(unittest.TestCase):
         self.add_data("trader", self.trader_data_csv)
 
         flight = "1"
-        number_episodes = 10
+        number_episodes = 5
         # Step 3, train
         self.start_training("trader", flight, number_episodes)
 
@@ -157,7 +157,7 @@ class TrainingLoopTests(unittest.TestCase):
         self.add_data("trader", self.trader_data_csv)
 
         flight = "1"
-        number_episodes = 10
+        number_episodes = 5
         # Step 3, train
         self.start_training("trader", flight, number_episodes, 1626697490)
 
@@ -190,7 +190,7 @@ class TrainingLoopTests(unittest.TestCase):
         self.add_data("trader", gap_data_1)
 
         flight = "1"
-        number_episodes = 10
+        number_episodes = 5
         self.start_training("trader", flight, number_episodes)
 
         self.wait_for_training()
@@ -229,7 +229,7 @@ class TrainingLoopTests(unittest.TestCase):
         self.add_data("trader", gap_data_0)
 
         flight = "1"
-        number_episodes = 10
+        number_episodes = 5
         self.start_training("trader", flight, number_episodes)
 
         post_data_lock = threading.Lock()
@@ -258,7 +258,7 @@ class TrainingLoopTests(unittest.TestCase):
         self.validate_episode_data(
             "trader",
             flight,
-            10,
+            number_episodes,
             num_actions=10,
             episode_results=self.episode_results,
         )
@@ -332,7 +332,7 @@ class TrainingLoopTests(unittest.TestCase):
         self.add_data("trader", self.trader_data_csv)
 
         flight = "1"
-        number_episodes = 10
+        number_episodes = 5
         self.start_training("trader", flight, number_episodes, 1626697490)
 
         self.wait_for_training()
@@ -356,7 +356,7 @@ class TrainingLoopTests(unittest.TestCase):
         self.add_data("trader", self.trader_data_csv)
 
         flight = "1"
-        number_episodes = 10
+        number_episodes = 5
         self.start_training("trader", flight, number_episodes, 1626697490)
 
         self.wait_for_training()
@@ -377,7 +377,7 @@ class TrainingLoopTests(unittest.TestCase):
         self.add_data("trader", self.trader_data_csv)
 
         flight = "1"
-        number_episodes = 10
+        number_episodes = 5
         self.start_training("trader", flight, number_episodes, 1626697490)
 
         self.wait_for_training()
@@ -401,7 +401,7 @@ class TrainingLoopTests(unittest.TestCase):
         self.add_data("trader", self.trader_data_csv)
 
         flight = "1"
-        number_episodes = 10
+        number_episodes = 5
         self.start_training("trader", flight, number_episodes, 1626697490)
 
         self.wait_for_training()
@@ -441,7 +441,7 @@ class TrainingLoopTests(unittest.TestCase):
         self.add_data("trader", csv_data.getvalue())
 
         flight = "1"
-        number_episodes = 10
+        number_episodes = 5
         self.start_training("trader", flight, number_episodes, expected_error=False)
 
         # Counts will be unstable due to timing.  The important thing is that we launch training with enough data.
