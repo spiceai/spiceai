@@ -126,7 +126,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        algorithm: [vpg, dql]
+        algorithm: [vpg, dql, sacd]
         context: [metal, docker]
     steps:
       - uses: actions/checkout@v2
@@ -208,7 +208,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        algorithm: [vpg, dql]
+        algorithm: [vpg, dql, sacd]
         context: [metal, docker]
     steps:
       - uses: actions/checkout@v2

@@ -2,6 +2,7 @@ package e2e
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -777,17 +778,34 @@ func TestImportExport(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Log("*** Training Completed ***")
-	time.Sleep(time.Second)
 
 	t.Log("*** Export Pod ***")
-	err = cliClient.runCliCmd("export", "trader")
-	if err != nil {
-		t.Fatal(err)
-	}
+	// There can be a delay from when the training finishes to when the model is
+	// saved and available to be exported.
+	// Run the export command in a loop until the output either doesn't contain "pod_not_trained"
+	// or we reach a timeout.
+	podReadyToExport := false
+	podReadyTimeout := time.Second * 10
+	startTime := time.Now()
+	for !podReadyToExport {
+		if time.Since(startTime) > podReadyTimeout {
+			t.Fatal(errors.New("Pod was not available for export within time"))
+		}
 
-	_, err = os.Stat(filepath.Join(testDir, "trader.spicepod"))
-	if err != nil {
-		t.Fatal(fmt.Errorf("didn't see expected exported spicepod: %w", err))
+		err := cliClient.runCliCmd("export", "trader")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		_, err = os.Stat(filepath.Join(testDir, "trader.spicepod"))
+		if err == nil {
+			elapsedTime := time.Since(startTime)
+			t.Logf("elapsed time: %v", elapsedTime)
+			podReadyToExport = true
+			continue
+		}
+
+		time.Sleep(50 * time.Millisecond)
 	}
 
 	t.Log("*** Import Pod ***")
