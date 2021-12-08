@@ -5,6 +5,7 @@ SHELL := /bin/bash
 test: venv
 	ALGORITHM="dql" venv/bin/python3 -m pytest --timeout 30
 	ALGORITHM="vpg" venv/bin/python3 -m pytest --timeout 30
+	ALGORITHM="sacd" venv/bin/python3 -m pytest --timeout 30
 
 venv:
 	python3 -m venv venv
