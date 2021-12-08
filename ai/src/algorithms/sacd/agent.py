@@ -132,7 +132,7 @@ class SACD(keras.Model):
         self._copy_target_models()
 
 
-class SACDAgent(SpiceAIAgent):
+class SoftActorCriticDiscreteAgent(SpiceAIAgent):
     BATCH_SIZE = 128
     UPDATE_STEPS = 10
 
