@@ -3,8 +3,8 @@ SHELL := /bin/bash
 
 .PHONY: test
 test: venv
-	ALGORITHM="dql" venv/bin/python3 -m pytest --timeout 10
-	ALGORITHM="vpg" venv/bin/python3 -m pytest --timeout 10
+	ALGORITHM="dql" venv/bin/python3 -m pytest --timeout 30
+	ALGORITHM="vpg" venv/bin/python3 -m pytest --timeout 30
 
 venv:
 	python3 -m venv venv
