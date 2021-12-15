@@ -29,7 +29,8 @@ const PodHeader: React.FunctionComponent<PodHeaderProps> = (props) => {
     }
     const resp = await fetch(url, options)
     if (!resp.ok) {
-      setErrorMessage(`failed to start training - ${resp.statusText}`)
+      setTrainingRequested(false)
+      setErrorMessage(`failed to start training - ${await resp.text()}`)
     }
   }
 
@@ -39,13 +40,14 @@ const PodHeader: React.FunctionComponent<PodHeaderProps> = (props) => {
       if (!flight.end || flight.end.getTime() < flight.start.getTime()) {
         setTrainingRequested(false)
         setTrainButtonText('Training...')
-      } else {
-        if (trainingRequested) {
-          setTrainButtonText('Starting...')
-          return
-        }
-        setTrainButtonText('Start Training')
+        return
+      } else if (trainingRequested) {
+        setTrainButtonText('Starting...')
+        return
       }
+    }
+    if (!trainingRequested) {
+      setTrainButtonText('Start Training')
     }
   }, [flights, trainingRequested])
 
