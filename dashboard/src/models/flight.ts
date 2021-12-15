@@ -43,7 +43,7 @@ export function useFlights(podName: string): FlightsResponse {
             return {
               algorithm: flight.algorithm,
               start: new Date(flight.start * 1000),
-              end: new Date(flight.end * 1000),
+              end: flight.end ? new Date(flight.end * 1000) : null,
               episodes: flight.episodes ? flight.episodes.map((ep: any) => newEpisode(ep)) : [],
             } as Flight
           }) as Flight[]

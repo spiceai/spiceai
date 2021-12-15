@@ -187,7 +187,7 @@ const PodPage: React.FunctionComponent<PodProps> = () => {
     <div className="flex flex-col flex-grow">
       {!podError && pod && (
         <div className="mb-2">
-          <PodHeader pod={pod}></PodHeader>
+          <PodHeader pod={pod} flights={flights}></PodHeader>
           <h2 className="ml-2 mb-2 font-spice tracking-spice text-s uppercase">Observations</h2>
           {observationsError && (
             <span>An error occurred fetching observations: {observationsError}</span>
