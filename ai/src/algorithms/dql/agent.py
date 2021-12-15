@@ -84,16 +84,16 @@ class Model:
             return random.randint(0, self.action_size - 1), np.zeros(self.action_size)
         return np.argmax(q_value), normed_softmax(q_value)
 
-    def train(self, states, targets):
-        self.model.fit(states, targets, epochs=1, verbose=0)
+    def train(self, states, targets, callbacks):
+        self.model.fit(states, targets, epochs=1, verbose=0, callbacks=callbacks)
 
 
 class DeepQLearningAgent(SpiceAIAgent):
-    def __init__(self, state_shape, action_size):
-        super().__init__(state_shape, action_size)
+    def __init__(self, state_shape, action_size, log_dir):
+        super().__init__(state_shape, action_size, log_dir)
 
-        self.model = Model(self.state_shape, self.action_size)
-        self.target_model = Model(self.state_shape, self.action_size)
+        self.model = Model(self.state_shape, self.action_size, log_dir)
+        self.target_model = Model(self.state_shape, self.action_size, log_dir)
         self.update_target()
 
         self.buffer = ReplayBuffer(BATCH_SIZE)
@@ -150,4 +150,4 @@ class DeepQLearningAgent(SpiceAIAgent):
                 np.argmax(self.model.predict(next_states), axis=1),
             ]
             targets[range(BATCH_SIZE), actions] = rewards + next_q_values * GAMMA
-            self.model.train(states, targets)
+            self.model.train(states, targets, self.log_dir)

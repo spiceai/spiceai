@@ -50,6 +50,7 @@ message InitRequest {
   repeated DataSource datasources = 10;
   string external_reward_funcs = 11;
   bool interpolation = 12;
+  bool tensorboard_enabled = 13;
 }
 
 message Response {

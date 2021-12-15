@@ -86,6 +86,14 @@ func (pod *Pod) Granularity() time.Duration {
 	return pod.podParams.Granularity
 }
 
+func (pod *Pod) Interpolation() bool {
+	return pod.podParams.Interpolation
+}
+
+func (pod *Pod) TensorBoardEnabled() bool {
+	return pod.podParams.TensorBoardEnabled
+}
+
 func (pod *Pod) TimeCategories() map[string][]spice_time.TimeCategoryInfo {
 	return pod.timeCategories
 }
@@ -112,10 +120,6 @@ func (pod *Pod) Episodes() int {
 		}
 	}
 	return 10
-}
-
-func (pod *Pod) Interpolation() bool {
-	return pod.podParams.Interpolation
 }
 
 func (pod *Pod) CachedState() []*state.State {

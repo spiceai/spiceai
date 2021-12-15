@@ -166,6 +166,7 @@ func getPodInitForTraining(pod *pods.Pod) *aiengine_pb.InitRequest {
 		Interval:            int64(pod.Interval().Seconds()),
 		Granularity:         int64(pod.Granularity().Seconds()),
 		Interpolation:       pod.Interpolation(),
+		TensorboardEnabled:  pod.TensorBoardEnabled(),
 		Datasources:         dsInitSpecs,
 		Fields:              fields,
 		Actions:             actionRewards,
