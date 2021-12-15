@@ -15,7 +15,7 @@ max-line-length=120
 max-args=16
 
 # Maximum number of attributes for a class (see R0902).
-max-attributes=16
+max-attributes=32
 
 # Minimum number of public methods for a class (see R0903).
 min-public-methods=0

@@ -1,6 +1,5 @@
 from abc import ABC, abstractmethod
 import threading
-from types import SimpleNamespace
 from typing import Dict, List
 
 import pandas as pd
@@ -123,29 +122,29 @@ class DataManagerBase(ABC):
         raise RuntimeError('Not Implemented')
 
     def reward(
-            self, prev_state_pd, prev_state_interpretations,
-            new_state_pd, new_state_intepretations, action: int) -> float:
-        prev_state_dict = {}
-        new_state_dict = {}
+            self, current_state_pd, current_state_interpretations,
+            next_state_pd, next_state_intepretations, action: int) -> float:
+        current_state_dict = {}
+        next_state_dict = {}
         action_name = self.action_names[action]
 
-        for key in prev_state_pd:
-            prev_state_dict[key] = list(prev_state_pd[key])[-1]
-            new_state_dict[key] = list(new_state_pd[key])[-1]
+        for key in current_state_pd:
+            current_state_dict[key] = list(current_state_pd[key])[-1]
+            next_state_dict[key] = list(next_state_pd[key])[-1]
 
         if self.reward_funcs_module is not None:
             reward_func = self.reward_funcs_module_actions[action_name]
-            return reward_func(prev_state_dict, prev_state_interpretations, new_state_dict, new_state_intepretations)
-
-        prev_state_dict["interpretations"] = prev_state_interpretations
-        new_state_dict["interpretations"] = new_state_intepretations
-
-        prev_state = SimpleNamespace(**prev_state_dict)
-        new_state = SimpleNamespace(**new_state_dict)
+            return reward_func(
+                current_state_dict,
+                current_state_interpretations,
+                next_state_dict,
+                next_state_intepretations)
 
         loc = {}
-        loc["prev_state"] = prev_state
-        loc["new_state"] = new_state
+        loc["current_state"] = current_state_dict
+        loc["next_state"] = next_state_dict
+        loc["current_state_interpretations"] = current_state_interpretations
+        loc["next_state_interpretations"] = next_state_intepretations
         loc["print"] = print
 
         reward_func = self.action_rewards[action_name]

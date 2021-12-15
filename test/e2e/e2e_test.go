@@ -2,6 +2,7 @@ package e2e
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -36,12 +37,12 @@ var (
 	runtime            *runtimeServer
 	snapshotter        *cupaloy.Config
 	testPods           = []string{
-		"test/Trader/ac6b4e4e0a83c49a09bbda6ac0ee385bc5e86433",
-		"test/customprocessor@0.2.0",
-		"test/event-tags@0.4.0",
-		"test/event-categories@0.2.0",
-		"test/trader-external-funcs/07149acdbf4154e2b7527a8af07d4f43f876cd0f",
-		"test/trader-seed-streaming/c8a6e1326034706b47c0f633e9372838cf6e5804",
+		"test/Trader/6ca57230ded0c58ec7445398a58186f719b0cfbe",
+		"test/customprocessor/6ca57230ded0c58ec7445398a58186f719b0cfbe",
+		"test/event-tags/6ca57230ded0c58ec7445398a58186f719b0cfbe",
+		"test/event-categories/6ca57230ded0c58ec7445398a58186f719b0cfbe",
+		"test/trader-external-funcs/6ca57230ded0c58ec7445398a58186f719b0cfbe",
+		"test/trader-seed-streaming/6ca57230ded0c58ec7445398a58186f719b0cfbe",
 	}
 )
 
@@ -777,17 +778,34 @@ func TestImportExport(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Log("*** Training Completed ***")
-	time.Sleep(time.Second)
 
 	t.Log("*** Export Pod ***")
-	err = cliClient.runCliCmd("export", "trader")
-	if err != nil {
-		t.Fatal(err)
-	}
+	// There can be a delay from when the training finishes to when the model is
+	// saved and available to be exported.
+	// Run the export command in a loop until the output either doesn't contain "pod_not_trained"
+	// or we reach a timeout.
+	podReadyToExport := false
+	podReadyTimeout := time.Second * 10
+	startTime := time.Now()
+	for !podReadyToExport {
+		if time.Since(startTime) > podReadyTimeout {
+			t.Fatal(errors.New("Pod was not available for export within time"))
+		}
 
-	_, err = os.Stat(filepath.Join(testDir, "trader.spicepod"))
-	if err != nil {
-		t.Fatal(fmt.Errorf("didn't see expected exported spicepod: %w", err))
+		err := cliClient.runCliCmd("export", "trader")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		_, err = os.Stat(filepath.Join(testDir, "trader.spicepod"))
+		if err == nil {
+			elapsedTime := time.Since(startTime)
+			t.Logf("elapsed time: %v", elapsedTime)
+			podReadyToExport = true
+			continue
+		}
+
+		time.Sleep(50 * time.Millisecond)
 	}
 
 	t.Log("*** Import Pod ***")

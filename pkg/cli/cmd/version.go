@@ -72,7 +72,7 @@ func checkLatestCliReleaseVersion() error {
 	var latestReleaseVersion string
 	versionFilePath := filepath.Join(rtcontext.SpiceRuntimeDir(), "cli_version.txt")
 	if stat, err := os.Stat(versionFilePath); !os.IsNotExist(err) {
-		if time.Until(stat.ModTime()) < 24*time.Hour {
+		if time.Since(stat.ModTime()) < 24*time.Hour {
 			versionData, err := os.ReadFile(versionFilePath)
 			if err == nil {
 				latestReleaseVersion = strings.TrimSpace(string(versionData))
