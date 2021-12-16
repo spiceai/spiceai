@@ -16,7 +16,7 @@ message ImportModel {
 }
 
 message Episode {
-  uint64 episode = 1;
+  int64 episode = 1;
   int64 start = 2;
   int64 end = 3;
   double score = 4;

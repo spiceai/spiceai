@@ -59,7 +59,7 @@ class Trainer:
         self.training_episodes = number_episodes
         self.not_learning_threshold = 3
 
-        self.log_dir = Path(self.training_data_dir, "log")
+        self.log_dir = str(Path(self.training_data_dir, "log"))
 
         self.model_data_shape = data_manager.get_shape()
         self.agent: SpiceAIAgent = get_agent(

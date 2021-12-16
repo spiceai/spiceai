@@ -67,6 +67,10 @@ func (c *DockerContext) AIEngineDir() string {
 	return dockerAiEnginePath
 }
 
+func (c *DockerContext) AIEngineBinDir() string {
+	return dockerAiEnginePath
+}
+
 func (c *DockerContext) AIEnginePythonCmdPath() string {
 	return constants.PythonCmd
 }

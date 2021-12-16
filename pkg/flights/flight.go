@@ -82,6 +82,16 @@ func (f *Flight) Episodes() []*Episode {
 	return f.episodes
 }
 
+func (f *Flight) GetEpisode(episodeId int64) *Episode {
+	for _, e := range f.Episodes() {
+		if e.EpisodeId == episodeId {
+			return e
+		}
+	}
+
+	return nil
+}
+
 func (f *Flight) ExpectedEpisodes() int {
 	return cap(f.episodes)
 }

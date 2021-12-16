@@ -91,7 +91,7 @@ class Model:
 
 
 class DeepQLearningAgent(SpiceAIAgent):
-    def __init__(self, state_shape, action_size, loggers, log_dir):
+    def __init__(self, state_shape, action_size, loggers, log_dir: str):
         super().__init__(state_shape, action_size, loggers, log_dir)
 
         callbacks = []
@@ -102,7 +102,10 @@ class DeepQLearningAgent(SpiceAIAgent):
                 if logger == "tensorboard":
                     callbacks.append(
                         tf.keras.callbacks.TensorBoard(
-                            log_dir=log_dir, histogram_freq=1, write_graph=True
+                            log_dir=log_dir,
+                            update_freq=1,
+                            histogram_freq=1,
+                            write_graph=True,
                         )
                     )
 
