@@ -156,7 +156,7 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
         flight = request.flight
         training_goal = request.training_goal
         training_data_dir = request.training_data_dir
-        training_loggers = request.loggers
+        training_loggers = request.training_loggers
 
         if isinstance(data_manager, TimeSeriesDataManager):
             index_of_epoch = data_manager.massive_table_sparse.index.get_loc(

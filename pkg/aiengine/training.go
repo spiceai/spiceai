@@ -60,7 +60,7 @@ func StartTraining(pod *pods.Pod, trainModel *runtime_pb.TrainModel) error {
 		NumberEpisodes:    int64(flight.ExpectedEpisodes()),
 		TrainingGoal:      pod.PodSpec.Training.Goal,
 		LearningAlgorithm: algorithm.Id,
-		Loggers:           trainModel.Loggers,
+		TrainingLoggers:   trainModel.Loggers,
 		TrainingDataDir:   flight.DataDir(),
 	}
 
