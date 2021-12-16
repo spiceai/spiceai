@@ -15,8 +15,8 @@ type TensorboardLogger struct {
 	LogDir string
 
 	cmdMutex sync.Mutex
-	cmd *exec.Cmd
-	address string
+	cmd      *exec.Cmd
+	address  string
 }
 
 func (t *TensorboardLogger) Name() string {
@@ -33,25 +33,24 @@ func (l *TensorboardLogger) Open() (string, error) {
 
 	rtcontext := context.CurrentContext()
 	tensorboardCmd := filepath.Join(rtcontext.AIEngineBinDir(), "tensorboard")
-	cmd := exec.Command(tensorboardCmd, "--logdir", l.LogDir)
+	cmd := exec.Command(tensorboardCmd, "--reuse_port", "True", "--logdir", l.LogDir)
 
-	stdOutPipe, err := cmd.StdoutPipe()
+	stderrPipe, err := cmd.StderrPipe()
 	if err != nil {
 		return "", err
 	}
-	defer stdOutPipe.Close()
+	defer stderrPipe.Close()
 
-	outScanner := bufio.NewScanner(stdOutPipe)
+	outScanner := bufio.NewScanner(stderrPipe)
 
 	startedLineChan := make(chan string, 1)
 
 	go func() {
 		for outScanner.Scan() {
 			line := outScanner.Text()
-			fmt.Println(line)
-			if strings.Contains(line, "(Press CTRL+C to quit)") {
+			if strings.HasPrefix(line, "TensorBoard ") && strings.HasSuffix(line, "(Press CTRL+C to quit)") {
 				startedLineChan <- line
-				break
+				return
 			}
 		}
 		startedLineChan <- ""
@@ -61,7 +60,7 @@ func (l *TensorboardLogger) Open() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	
+
 	startedLine := <-startedLineChan
 
 	if outScanner.Err() != nil {
