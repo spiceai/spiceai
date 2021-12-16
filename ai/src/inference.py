@@ -13,7 +13,11 @@ from train import Trainer
 
 
 class GetInferenceHandler:
-    def __init__(self, request: aiengine_pb2.InferenceRequest, data_managers: Dict[str, DataManagerBase]):
+    def __init__(
+        self,
+        request: aiengine_pb2.InferenceRequest,
+        data_managers: Dict[str, DataManagerBase],
+    ):
         self.request = request
         self.data_managers = data_managers
         self.inference_time = pd.to_datetime(request.inference_time, unit="s")
@@ -22,28 +26,42 @@ class GetInferenceHandler:
     def __is_valid_inference_time(self, first_valid_time, last_valid_time):
         if self.request.inference_time == 0:
             return True
-        return self.request.inference_time >= first_valid_time and self.request.inference_time <= last_valid_time
+        return (
+            self.request.inference_time >= first_valid_time
+            and self.request.inference_time <= last_valid_time
+        )
 
     def __validate_request(self) -> aiengine_pb2.InferenceResult:
         if self.request.pod not in self.data_managers:
             return aiengine_pb2.InferenceResult(
-                response=aiengine_pb2.Response(result="pod_not_initialized", error=True))
+                response=aiengine_pb2.Response(result="pod_not_initialized", error=True)
+            )
 
         if self.request.tag != "latest":
             return aiengine_pb2.InferenceResult(
                 response=aiengine_pb2.Response(
-                    result="tag_not_yet_supported", message="Support for multiple tags coming soon!", error=True))
+                    result="tag_not_yet_supported",
+                    message="Support for multiple tags coming soon!",
+                    error=True,
+                )
+            )
 
         data_manager = self.data_managers[self.request.pod]
 
-        first_valid_time = (data_manager.massive_table_sparse.first_valid_index() +
-                            data_manager.param.interval_secs).timestamp()
-        last_valid_time = data_manager.massive_table_sparse.last_valid_index().timestamp()
+        first_valid_time = (
+            data_manager.massive_table_sparse.first_valid_index()
+            + data_manager.param.interval_secs
+        ).timestamp()
+        last_valid_time = (
+            data_manager.massive_table_sparse.last_valid_index().timestamp()
+        )
 
         if not self.__is_valid_inference_time(first_valid_time, last_valid_time):
             result = "invalid_recommendation_time"
-            message = f"The time specified ({self.request.inference_time}) "\
-                      f"is outside of the allowed range: ({int(first_valid_time)}, {int(last_valid_time)})"
+            message = (
+                f"The time specified ({self.request.inference_time}) "
+                f"is outside of the allowed range: ({int(first_valid_time)}, {int(last_valid_time)})"
+            )
             return aiengine_pb2.InferenceResult(
                 response=aiengine_pb2.Response(
                     result=result, message=message, error=True
@@ -65,7 +83,9 @@ class GetInferenceHandler:
         else:
             algorithm = "dql"
 
-        agent: SpiceAIAgent = get_agent(algorithm, model_data_shape, len(data_manager.action_names))
+        agent: SpiceAIAgent = get_agent(
+            algorithm, model_data_shape, len(data_manager.action_names), None, None
+        )
         if model_exists:
             agent.load(Path(save_path))
         return agent
@@ -82,12 +102,18 @@ class GetInferenceHandler:
 
             data_manager = self.data_managers[self.request.pod]
 
-            if data_manager.massive_table_sparse.shape[0] < data_manager.get_window_span():
+            if (
+                data_manager.massive_table_sparse.shape[0]
+                < data_manager.get_window_span()
+            ):
                 return aiengine_pb2.InferenceResult(
-                    response=aiengine_pb2.Response(result="not_enough_data", error=True))
+                    response=aiengine_pb2.Response(result="not_enough_data", error=True)
+                )
 
             latest_time = data_manager.massive_table_sparse.last_valid_index()
-            inference_time = latest_time if self.use_latest_time else self.inference_time
+            inference_time = (
+                latest_time if self.use_latest_time else self.inference_time
+            )
             requested_window = data_manager.get_window_at(inference_time)
             state = data_manager.flatten_and_normalize_window(requested_window)
 

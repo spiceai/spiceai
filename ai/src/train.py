@@ -1,6 +1,5 @@
 import math
 from pathlib import Path
-import tempfile
 import threading
 import time
 from typing import Dict
@@ -9,7 +8,6 @@ import requests
 
 from algorithms.factory import get_agent
 from algorithms.agent_interface import SpiceAIAgent
-from cleanup import directories_to_delete
 from connector.manager import ConnectorManager
 from data_manager.base_manager import DataManagerBase
 from data_manager.time_series_manager import TimeSeriesDataManager

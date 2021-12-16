@@ -8,13 +8,13 @@ def get_agent(
     name: str, state_shape, action_size: int, loggers, log_dir: str
 ) -> SpiceAIAgent:
     if name == "vpg":
-        return VanillaPolicyGradientAgent(state_shape, action_size)
+        return VanillaPolicyGradientAgent(state_shape, action_size, loggers, log_dir)
 
     if name == "dql":
         return DeepQLearningAgent(state_shape, action_size, loggers, log_dir)
 
     if name == "sacd":
-        return SoftActorCriticDiscreteAgent(state_shape, action_size)
+        return SoftActorCriticDiscreteAgent(state_shape, action_size, loggers, log_dir)
 
     raise NotImplementedError(
         f"Unable to find agent for the learning algorithm '{name}'"

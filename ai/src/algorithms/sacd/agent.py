@@ -180,8 +180,8 @@ class SoftActorCriticDiscreteAgent(SpiceAIAgent):
     BATCH_SIZE = 128
     UPDATE_STEPS = 10
 
-    def __init__(self, state_shape: tuple, action_size):
-        super().__init__(state_shape, action_size)
+    def __init__(self, state_shape: tuple, action_size, loggers, log_dir: str):
+        super().__init__(state_shape, action_size, loggers, log_dir)
 
         self.model = SACD(state_shape, action_size)
         self.model.compile(loss="mse", optimizer=optimizers.SGD())

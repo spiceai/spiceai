@@ -306,7 +306,7 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
             algorithm = json.loads(meta_file.read())["algorithm"]
 
         agent: SpiceAIAgent = get_agent(
-            algorithm, model_data_shape, len(data_manager.action_names)
+            algorithm, model_data_shape, len(data_manager.action_names), None, None
         )
         if not agent.load(import_path):
             return aiengine_pb2.Response(
