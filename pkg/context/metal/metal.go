@@ -19,7 +19,7 @@ type MetalContext struct {
 	spiceRuntimeDir       string
 	spiceBinDir           string
 	aiEngineDir           string
-	aiEngineBinDir 	  string
+	aiEngineBinDir        string
 	aiEnginePythonCmdPath string
 	appDir                string
 	podsDir               string

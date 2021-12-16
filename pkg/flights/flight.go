@@ -45,6 +45,10 @@ func NewFlight(id string, episodes int64, algorithm string, loggers []string) (*
 	}, nil
 }
 
+func (f *Flight) Id() string {
+	return f.id
+}
+
 func (f *Flight) DataDir() string {
 	return f.dataDir
 }

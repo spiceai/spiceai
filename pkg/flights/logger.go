@@ -7,11 +7,11 @@ import (
 	"github.com/spiceai/spiceai/pkg/flights/loggers"
 )
 
-type TrainingLogger interface {	
+type TrainingLogger interface {
 	Open() error
 }
 
-func (f *Flight)LoadLogger(loggerId string) (TrainingLogger, error) {
+func (f *Flight) LoadLogger(loggerId string) (TrainingLogger, error) {
 	switch loggerId {
 	case "tensorboard":
 		logDir := filepath.Join(f.DataDir(), "log")

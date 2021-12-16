@@ -152,8 +152,10 @@ const FlightChart: React.FunctionComponent<FlightChartProps> = (props) => {
         <div className="flex flex-grow"></div>
         <div className="mt-1 mr-2">
           {props.flight.loggers &&
-            props.flight.loggers.map((logger) => {
-              return <TrainingLogger id={logger} />
+            props.flight.loggers.map((logger, i) => {
+              return (
+                <TrainingLogger key={i} pod={props.pod} flight={props.flight} loggerId={logger} />
+              )
             })}
         </div>
       </div>

@@ -5,6 +5,7 @@ import { getApiPath } from '../util/api'
 import { Episode, newEpisode } from './episode'
 
 export interface Flight {
+  id: string
   algorithm: string
   start: Date
   end: Date
@@ -42,6 +43,7 @@ export function useFlights(podName: string): FlightsResponse {
         (
           data.map((flight: any) => {
             return {
+              id: flight.id,
               algorithm: flight.algorithm,
               start: new Date(flight.start * 1000),
               end: flight.end ? new Date(flight.end * 1000) : null,
