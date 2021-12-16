@@ -38,11 +38,10 @@ def normed_softmax(q_values):
 
 
 class Model:
-    def __init__(self, state_shape, action_size, loggers, log_dir: str):
+    def __init__(self, state_shape, action_size, callbacks):
         self.state_shape = state_shape
         self.action_size = action_size
-        self.loggers = loggers
-        self.log_dir = self.log_dir
+        self.callbacks = callbacks
         self.epsilon = EPSILON_INIT
 
         self.model = self.nn_model()
@@ -95,20 +94,20 @@ class DeepQLearningAgent(SpiceAIAgent):
     def __init__(self, state_shape, action_size, loggers, log_dir):
         super().__init__(state_shape, action_size, loggers, log_dir)
 
+        callbacks = []
         if len(loggers) > 0:
-            if not os.Exists(log_dir):
-                os.MkDir(log_dir)
-            self.callbacks = []
+            if not os.path.exists(log_dir):
+                os.mkdir(log_dir)
             for logger in loggers:
                 if logger == "tensorboard":
-                    self.callbacks.append(
+                    callbacks.append(
                         tf.keras.callbacks.TensorBoard(
                             log_dir=log_dir, histogram_freq=1, write_graph=True
                         )
                     )
 
-        self.model = Model(self.state_shape, self.action_size)
-        self.target_model = Model(self.state_shape, self.action_size)
+        self.model = Model(self.state_shape, self.action_size, callbacks)
+        self.target_model = Model(self.state_shape, self.action_size, callbacks)
         self.update_target()
 
         self.buffer = ReplayBuffer(BATCH_SIZE)
