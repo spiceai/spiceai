@@ -53,6 +53,14 @@ func StartTraining(pod *pods.Pod, trainModel *runtime_pb.TrainModel) error {
 		return err
 	}
 
+	for _, loggerId := range trainModel.Loggers {
+		logger, err := flight.LoadLogger(loggerId)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("%s -> Using training logger %s\n", pod.Name, logger.Name())
+	}
+
 	trainRequest := &aiengine_pb.StartTrainingRequest{
 		Pod:               pod.Name,
 		EpochTime:         pod.Epoch().Unix(),

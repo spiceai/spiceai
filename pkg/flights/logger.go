@@ -8,6 +8,7 @@ import (
 )
 
 type TrainingLogger interface {
+	Name() string
 	Open() error
 }
 

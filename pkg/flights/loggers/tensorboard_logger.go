@@ -11,6 +11,10 @@ type TensorboardLogger struct {
 	LogDir string
 }
 
+func (t *TensorboardLogger) Name() string {
+	return "TensorBoard"
+}
+
 func (l *TensorboardLogger) Open() error {
 	rtcontext := context.CurrentContext()
 	cmd := exec.Command(rtcontext.AIEngineBinDir(), "tensorboard", "--logdir", l.LogDir)
