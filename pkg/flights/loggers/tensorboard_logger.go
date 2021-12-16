@@ -2,6 +2,7 @@ package loggers
 
 import (
 	"os/exec"
+	"path/filepath"
 
 	"github.com/spiceai/spiceai/pkg/context"
 	"github.com/spiceai/spiceai/pkg/util"
@@ -17,6 +18,7 @@ func (t *TensorboardLogger) Name() string {
 
 func (l *TensorboardLogger) Open() error {
 	rtcontext := context.CurrentContext()
-	cmd := exec.Command(rtcontext.AIEngineBinDir(), "tensorboard", "--logdir", l.LogDir)
+	tensorboardCmd := filepath.Join(rtcontext.AIEngineBinDir(), "tensorboard")
+	cmd := exec.Command(tensorboardCmd, "--logdir", l.LogDir)
 	return util.RunCommand(cmd)
 }
