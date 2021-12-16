@@ -50,7 +50,6 @@ message InitRequest {
   repeated DataSource datasources = 10;
   string external_reward_funcs = 11;
   bool interpolation = 12;
-  bool tensorboard_enabled = 13;
 }
 
 message Response {
@@ -71,6 +70,7 @@ message StartTrainingRequest {
   string training_goal = 4;
   int64 epoch_time = 5;
   string learning_algorithm = 6;
+  bool tensor_board_enabled = 7;
 }
 
 message InferenceRequest {

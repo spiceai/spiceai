@@ -206,7 +206,7 @@ func apiPodTrainHandler(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	var trainRequest runtime_pb.TrainModel
+	var trainRequest *runtime_pb.TrainModel
 	err := json.Unmarshal(ctx.Request.Body(), &trainRequest)
 	if err != nil {
 		ctx.Response.SetStatusCode(400)
@@ -214,17 +214,7 @@ func apiPodTrainHandler(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	var algorithm *aiengine.LearningAlgorithm
-	if trainRequest.LearningAlgorithm != "" {
-		algorithm = aiengine.GetAlgorithm(trainRequest.LearningAlgorithm)
-		if algorithm == nil {
-			ctx.Response.SetStatusCode(400)
-			ctx.Response.SetBodyString(fmt.Sprintf("unknown learning algorithm %s", trainRequest.LearningAlgorithm))
-			return
-		}
-	}
-
-	err = aiengine.StartTraining(pod, algorithm, trainRequest.NumberEpisodes)
+	err = aiengine.StartTraining(pod, trainRequest)
 	if err != nil {
 		ctx.Response.SetStatusCode(500)
 		ctx.Response.SetBodyString(err.Error())

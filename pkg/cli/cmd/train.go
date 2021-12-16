@@ -87,8 +87,9 @@ spice train logpruner.yaml
 		trainUrl := fmt.Sprintf("%s/api/v0.1/pods/%s/train", serverBaseUrl, selectedPod.Name)
 
 		trainRequest := &runtime_pb.TrainModel{
-			LearningAlgorithm: algorithmFlag,
-			NumberEpisodes:    numberEpisodesFlag,
+			LearningAlgorithm:  algorithmFlag,
+			NumberEpisodes:     numberEpisodesFlag,
+			TensorBoardEnabled: tensorBoardEnabledFlag,
 		}
 		trainRequestBytes, err := json.Marshal(&trainRequest)
 		if err != nil {
@@ -132,5 +133,6 @@ func init() {
 	trainCmd.Flags().StringVar(&contextFlag, "context", "docker", "Runs Spice.ai in the given context, either 'docker' or 'metal'")
 	trainCmd.Flags().StringVar(&algorithmFlag, "learning-algorithm", "", "Train the pod with specified learning algorithm")
 	trainCmd.Flags().Int64Var(&numberEpisodesFlag, "number-episodes", -1, "Train the pod for the specified number of episodes")
+	trainCmd.Flags().BoolVar(&tensorBoardEnabledFlag, "tensorboard-enabled", false, "Enabled TensorBoard logging for this training run")
 	RootCmd.AddCommand(trainCmd)
 }

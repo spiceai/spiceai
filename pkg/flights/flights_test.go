@@ -14,7 +14,7 @@ func TestFlight(t *testing.T) {
 
 func testRecordEpisode() func(*testing.T) {
 	return func(t *testing.T) {
-		flight := flights.NewFlight("test", 1, "vpg")
+		flight := flights.NewFlight("test", 1, "vpg", false)
 		episode := flights.Episode{
 			EpisodeId: 1,
 		}

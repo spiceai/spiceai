@@ -92,7 +92,7 @@ func (r *SpiceRackRegistry) GetPod(podFullPath string) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		
+
 		if f.FileInfo().IsDir() {
 			err := os.MkdirAll(fpath, podsPerm)
 			if err != nil {

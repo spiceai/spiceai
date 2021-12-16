@@ -6,10 +6,11 @@ import (
 )
 
 type Flight struct {
-	Algorithm string                `json:"algorithm"`
-	Start     int64                 `json:"start"`
-	End       int64                 `json:"end"`
-	Episodes  []*runtime_pb.Episode `json:"episodes"`
+	Algorithm          string                `json:"algorithm"`
+	TensorBoardEnabled bool                  `json:"tensorboard_enabled"`
+	Start              int64                 `json:"start"`
+	End                int64                 `json:"end"`
+	Episodes           []*runtime_pb.Episode `json:"episodes"`
 }
 
 func NewFlight(f *flights.Flight) *Flight {
@@ -20,9 +21,10 @@ func NewFlight(f *flights.Flight) *Flight {
 	}
 
 	return &Flight{
-		Algorithm: f.Algorithm(),
-		Start:     f.Start().Unix(),
-		End:       f.End().Unix(),
-		Episodes:  episodes,
+		Algorithm:          f.Algorithm(),
+		TensorBoardEnabled: f.TensorBoardEnabled(),
+		Start:              f.Start().Unix(),
+		End:                f.End().Unix(),
+		Episodes:           episodes,
 	}
 }

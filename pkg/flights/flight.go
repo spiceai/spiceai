@@ -9,29 +9,38 @@ import (
 )
 
 type Flight struct {
-	id            string
-	algorithm     string
-	start         time.Time
-	end           time.Time
-	episodes      []*Episode
+	id                 string
+	algorithm          string
+	tensorBoardEnabled bool
+
+	start time.Time
+	end   time.Time
+
 	episodesMutex sync.RWMutex
-	isDone        chan bool
-	err           error
+	episodes      []*Episode
+
+	isDone chan bool
+	err    error
 }
 
-func NewFlight(id string, episodes int, algorithm string) *Flight {
+func NewFlight(id string, episodes int, algorithm string, tensorboardEnabled bool) *Flight {
 	return &Flight{
-		id:        id,
-		algorithm: algorithm,
-		start:     time.Now(),
-		episodes:  make([]*Episode, 0, episodes),
-		isDone:    make(chan bool, 1),
-		err:       nil,
+		id:                 id,
+		algorithm:          algorithm,
+		tensorBoardEnabled: tensorboardEnabled,
+		start:              time.Now(),
+		episodes:           make([]*Episode, 0, episodes),
+		isDone:             make(chan bool, 1),
+		err:                nil,
 	}
 }
 
 func (f *Flight) Algorithm() string {
 	return f.algorithm
+}
+
+func (f *Flight) TensorBoardEnabled() bool {
+	return f.tensorBoardEnabled
 }
 
 func (f *Flight) WaitForDoneChan() *chan bool {

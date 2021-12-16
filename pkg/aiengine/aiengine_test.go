@@ -181,7 +181,7 @@ func testStartTrainingFunc(pod *pods.Pod, response string) func(t *testing.T) {
 
 		aiengineClient = mockAIEngineClient
 
-		err := StartTraining(pod, nil, -1)
+		err := StartTraining(pod, nil)
 		switch response {
 		case "already_training":
 			assert.EqualError(t, err, fmt.Sprintf("%s -> training is already in progress", pod.Name))

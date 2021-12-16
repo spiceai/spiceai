@@ -10,9 +10,10 @@ import (
 )
 
 var (
-	contextFlag        string
-	algorithmFlag      string
-	numberEpisodesFlag int64
+	contextFlag            string
+	algorithmFlag          string
+	numberEpisodesFlag     int64
+	tensorBoardEnabledFlag bool
 )
 
 var RootCmd = &cobra.Command{

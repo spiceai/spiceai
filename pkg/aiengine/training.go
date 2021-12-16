@@ -10,19 +10,29 @@ import (
 	"github.com/spiceai/spiceai/pkg/flights"
 	"github.com/spiceai/spiceai/pkg/pods"
 	"github.com/spiceai/spiceai/pkg/proto/aiengine_pb"
+	"github.com/spiceai/spiceai/pkg/proto/runtime_pb"
 )
 
-func StartTraining(pod *pods.Pod, algorithm *LearningAlgorithm, number_episodes int64) error {
-	flightId := fmt.Sprintf("%d", len(*pod.Flights())+1)
-
-	if algorithm == nil {
-		algorithm = GetAlgorithm(pod.LearningAlgorithm())
-		if algorithm == nil {
-			return fmt.Errorf("No algorithm found for %s", pod.LearningAlgorithm())
+func StartTraining(pod *pods.Pod, trainModel *runtime_pb.TrainModel) error {
+	if trainModel == nil {
+		trainModel = &runtime_pb.TrainModel{
+			LearningAlgorithm: "",
+			NumberEpisodes:    -1,
 		}
 	}
 
-	flight := flights.NewFlight(flightId, int(pod.Episodes()), algorithm.Id)
+	algorithmId := trainModel.LearningAlgorithm
+	if algorithmId == "" {
+		algorithmId = pod.LearningAlgorithm()
+	}
+
+	algorithm := GetAlgorithm(algorithmId)
+	if algorithm == nil {
+		return fmt.Errorf("Learning algorithm %s not found", algorithmId)
+	}
+
+	flightId := fmt.Sprintf("%d", len(*pod.Flights())+1)
+	flight := flights.NewFlight(flightId, int(pod.Episodes()), algorithm.Id, trainModel.TensorBoardEnabled)
 
 	// Once we have an AI engine -> spiced gRPC channel, this should be done on demand
 	err := sendInterpretations(pod, pod.Interpretations().IndexedInterpretations())
@@ -40,8 +50,8 @@ func StartTraining(pod *pods.Pod, algorithm *LearningAlgorithm, number_episodes 
 	}
 
 	// Overload pod's parameters
-	if number_episodes > 0 {
-		trainRequest.NumberEpisodes = number_episodes
+	if trainModel.NumberEpisodes > 0 {
+		trainRequest.NumberEpisodes = trainModel.NumberEpisodes
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
