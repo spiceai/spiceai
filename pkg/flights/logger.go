@@ -9,7 +9,7 @@ import (
 
 type TrainingLogger interface {
 	Name() string
-	Open() error
+	Open() (string, error)
 }
 
 func (f *Flight) LoadLogger(loggerId string) (TrainingLogger, error) {

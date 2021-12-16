@@ -43,7 +43,13 @@ const TrainingLogger: React.FunctionComponent<ITrainingLoggerProps> = (props) =>
     const url = `/api/v0.1/pods/${pod.name}/training_runs/${flight.id}/loggers/${id}`
     const resp = await fetch(url, options)
     if (!resp.ok) {
-      console.error(await resp.text())
+      console.error(resp.status, resp.statusText, await resp.text())
+      return
+    }
+
+    const address = await resp.text()
+    if (address) {
+      window.open(address, '_blank')
     }
   }
 
