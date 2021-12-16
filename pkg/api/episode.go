@@ -12,5 +12,7 @@ func NewEpisode(ep *flights.Episode) *runtime_pb.Episode {
 		End:          ep.End.Unix(),
 		Score:        ep.Score,
 		ActionsTaken: ep.ActionsTaken,
+		Error:        ep.Error,
+		ErrorMessage: ep.ErrorMessage,
 	}
 }

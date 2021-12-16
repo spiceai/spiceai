@@ -147,7 +147,11 @@ const FlightChart: React.FunctionComponent<FlightChartProps> = (props) => {
 
   return (
     <div className="rounded relative">
-      <div>{props.flight.loggers && props.flight.loggers.length && <div>{props.flight.loggers[0]}</div>}</div>
+      <div>
+        {props.flight.loggers && props.flight.loggers.length && (
+          <div>{props.flight.loggers[0]}</div>
+        )}
+      </div>
       <canvas className="p-2" ref={chartRef}></canvas>
     </div>
   )
