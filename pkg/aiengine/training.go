@@ -58,7 +58,7 @@ func StartTraining(pod *pods.Pod, trainModel *runtime_pb.TrainModel) error {
 		if err != nil {
 			return err
 		}
-		fmt.Printf("%s -> Using training logger %s\n", pod.Name, logger.Name())
+		fmt.Printf("%s -> Training logging to %s\n", pod.Name, logger.Name())
 	}
 
 	trainRequest := &aiengine_pb.StartTrainingRequest{

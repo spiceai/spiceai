@@ -38,12 +38,6 @@ const TrainingLogger: React.FunctionComponent<ITrainingLoggerProps> = (props) =>
   const onClick = async () => {
     const options = {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        command: 'open',
-      }),
     }
 
     const url = `/api/v0.1/pods/${pod.name}/training_runs/${flight.id}/loggers/${id}`
