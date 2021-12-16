@@ -37,6 +37,8 @@ class Trainer:
         number_episodes: int,
         flight: str,
         training_goal: str,
+        training_data_dir: str,
+        training_loggers,
     ):
         self.pod_name = pod_name
         self.data_manager = data_manager
@@ -45,6 +47,8 @@ class Trainer:
         self.number_episodes = number_episodes
         self.flight = flight
         self.training_goal = training_goal
+        self.training_data_dir = training_data_dir
+        self.training_loggers = training_loggers
 
         self.action_size = len(data_manager.action_names)
 
@@ -55,13 +59,15 @@ class Trainer:
         self.training_episodes = number_episodes
         self.not_learning_threshold = 3
 
-        self.temp_data_dir = tempfile.mkdtemp(prefix="spiceai_")
-        self.train_data_path = Path(self.temp_data_dir, f"{self.pod_name}_train")
-        log_dir = Path(self.temp_data_dir, "logs")
+        self.log_dir = Path(self.training_data_dir, "log")
 
         self.model_data_shape = data_manager.get_shape()
         self.agent: SpiceAIAgent = get_agent(
-            algorithm, self.model_data_shape, self.action_size, log_dir
+            algorithm,
+            self.model_data_shape,
+            self.action_size,
+            self.training_loggers,
+            self.log_dir,
         )
 
         self.custom_training_goal_met = False
@@ -228,12 +234,8 @@ class Trainer:
                     f"Max training episodes ({self.training_episodes}) reached!",
                 )
 
-        if not Path.exists(self.train_data_path):
-            self.train_data_path.mkdir(parents=True)
-
-        directories_to_delete.append(self.temp_data_dir)
-        self.agent.save(self.train_data_path)
-        self.SAVED_MODELS[self.pod_name] = self.train_data_path
+        self.agent.save(self.training_data_dir)
+        self.SAVED_MODELS[self.pod_name] = self.training_data_dir
 
 
 def end_of_episode(_episode: int):

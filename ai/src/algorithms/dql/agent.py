@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 import random
+import os
 
 import numpy as np
 import tensorflow as tf
@@ -37,9 +38,11 @@ def normed_softmax(q_values):
 
 
 class Model:
-    def __init__(self, state_shape, action_size):
+    def __init__(self, state_shape, action_size, loggers, log_dir: str):
         self.state_shape = state_shape
         self.action_size = action_size
+        self.loggers = loggers
+        self.log_dir = self.log_dir
         self.epsilon = EPSILON_INIT
 
         self.model = self.nn_model()
@@ -84,16 +87,28 @@ class Model:
             return random.randint(0, self.action_size - 1), np.zeros(self.action_size)
         return np.argmax(q_value), normed_softmax(q_value)
 
-    def train(self, states, targets, callbacks):
-        self.model.fit(states, targets, epochs=1, verbose=0, callbacks=callbacks)
+    def train(self, states, targets):
+        self.model.fit(states, targets, epochs=1, verbose=0, callbacks=self.callbacks)
 
 
 class DeepQLearningAgent(SpiceAIAgent):
-    def __init__(self, state_shape, action_size, log_dir):
-        super().__init__(state_shape, action_size, log_dir)
+    def __init__(self, state_shape, action_size, loggers, log_dir):
+        super().__init__(state_shape, action_size, loggers, log_dir)
 
-        self.model = Model(self.state_shape, self.action_size, log_dir)
-        self.target_model = Model(self.state_shape, self.action_size, log_dir)
+        if len(loggers) > 0:
+            if not os.Exists(log_dir):
+                os.MkDir(log_dir)
+            self.callbacks = []
+            for logger in loggers:
+                if logger == "tensorboard":
+                    self.callbacks.append(
+                        tf.keras.callbacks.TensorBoard(
+                            log_dir=log_dir, histogram_freq=1, write_graph=True
+                        )
+                    )
+
+        self.model = Model(self.state_shape, self.action_size)
+        self.target_model = Model(self.state_shape, self.action_size)
         self.update_target()
 
         self.buffer = ReplayBuffer(BATCH_SIZE)
@@ -150,4 +165,4 @@ class DeepQLearningAgent(SpiceAIAgent):
                 np.argmax(self.model.predict(next_states), axis=1),
             ]
             targets[range(BATCH_SIZE), actions] = rewards + next_q_values * GAMMA
-            self.model.train(states, targets, self.log_dir)
+            self.model.train(states, targets)

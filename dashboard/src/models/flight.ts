@@ -9,6 +9,7 @@ export interface Flight {
   start: Date
   end: Date
   episodes: Episode[]
+  loggers: string[]
 }
 
 export interface FlightsResponse {
@@ -45,6 +46,7 @@ export function useFlights(podName: string): FlightsResponse {
               start: new Date(flight.start * 1000),
               end: flight.end ? new Date(flight.end * 1000) : null,
               episodes: flight.episodes ? flight.episodes.map((ep: any) => newEpisode(ep)) : [],
+              loggers: flight.loggers,
             } as Flight
           }) as Flight[]
         ).sort((a, b) => {

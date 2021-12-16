@@ -70,7 +70,8 @@ message StartTrainingRequest {
   string training_goal = 4;
   int64 epoch_time = 5;
   string learning_algorithm = 6;
-  bool tensor_board_enabled = 7;
+  string training_data_dir = 7;
+  repeated string loggers = 8;
 }
 
 message InferenceRequest {

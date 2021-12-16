@@ -15,10 +15,16 @@ import (
 
 func StartTraining(pod *pods.Pod, trainModel *runtime_pb.TrainModel) error {
 	if trainModel == nil {
+		// Use pod defaults
 		trainModel = &runtime_pb.TrainModel{
-			LearningAlgorithm: "",
-			NumberEpisodes:    -1,
+			LearningAlgorithm: pod.LearningAlgorithm(),
+			NumberEpisodes:    pod.Episodes(),
+			Loggers:           pod.TrainingLoggers(),
 		}
+	}
+
+	if trainModel.NumberEpisodes <= 0 {
+		trainModel.NumberEpisodes = int64(pod.Episodes())
 	}
 
 	algorithmId := trainModel.LearningAlgorithm
@@ -31,11 +37,18 @@ func StartTraining(pod *pods.Pod, trainModel *runtime_pb.TrainModel) error {
 		return fmt.Errorf("Learning algorithm %s not found", algorithmId)
 	}
 
-	flightId := fmt.Sprintf("%d", len(*pod.Flights())+1)
-	flight := flights.NewFlight(flightId, int(pod.Episodes()), algorithm.Id, trainModel.TensorBoardEnabled)
+	if len(trainModel.Loggers) == 0 {
+		trainModel.Loggers = pod.TrainingLoggers()
+	}
 
 	// Once we have an AI engine -> spiced gRPC channel, this should be done on demand
 	err := sendInterpretations(pod, pod.Interpretations().IndexedInterpretations())
+	if err != nil {
+		return err
+	}
+
+	flightId := fmt.Sprintf("%d", len(*pod.Flights())+1)
+	flight, err := flights.NewFlight(flightId, trainModel.NumberEpisodes, algorithm.Id, trainModel.Loggers)
 	if err != nil {
 		return err
 	}
@@ -47,6 +60,8 @@ func StartTraining(pod *pods.Pod, trainModel *runtime_pb.TrainModel) error {
 		NumberEpisodes:    int64(flight.ExpectedEpisodes()),
 		TrainingGoal:      pod.PodSpec.Training.Goal,
 		LearningAlgorithm: algorithm.Id,
+		Loggers:           trainModel.Loggers,
+		TrainingDataDir:   flight.DataDir(),
 	}
 
 	// Overload pod's parameters
