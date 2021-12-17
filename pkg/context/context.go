@@ -21,6 +21,7 @@ type RuntimeContext interface {
 	AppDir() string
 	PodsDir() string
 	AIEngineDir() string
+	AIEngineBinDir() string
 	AIEnginePythonCmdPath() string
 	GetRunCmd(manifestPath string) (*exec.Cmd, error)
 	GetSpiceAppRelativePath(absolutePath string) string

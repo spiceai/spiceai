@@ -70,6 +70,8 @@ message StartTrainingRequest {
   string training_goal = 4;
   int64 epoch_time = 5;
   string learning_algorithm = 6;
+  string training_data_dir = 7;
+  repeated string training_loggers = 8;
 }
 
 message InferenceRequest {

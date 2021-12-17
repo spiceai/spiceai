@@ -6,7 +6,9 @@ import (
 )
 
 type Flight struct {
+	Id        string                `json:"id"`
 	Algorithm string                `json:"algorithm"`
+	Loggers   []string              `json:"loggers"`
 	Start     int64                 `json:"start"`
 	End       int64                 `json:"end"`
 	Episodes  []*runtime_pb.Episode `json:"episodes"`
@@ -20,7 +22,9 @@ func NewFlight(f *flights.Flight) *Flight {
 	}
 
 	return &Flight{
+		Id:        f.Id(),
 		Algorithm: f.Algorithm(),
+		Loggers:   f.Loggers(),
 		Start:     f.Start().Unix(),
 		End:       f.End().Unix(),
 		Episodes:  episodes,

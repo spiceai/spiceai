@@ -4,6 +4,7 @@ import Chart from 'chart.js/auto'
 
 import { Pod } from '../../models/pod'
 import { Flight } from '../../models/flight'
+import TrainingLogger from './TrainingLogger'
 
 interface FlightChartProps {
   pod: Pod
@@ -147,6 +148,17 @@ const FlightChart: React.FunctionComponent<FlightChartProps> = (props) => {
 
   return (
     <div className="rounded relative">
+      <div className="flex">
+        <div className="flex flex-grow"></div>
+        <div className="mt-1 mr-2">
+          {props.flight.loggers &&
+            props.flight.loggers.map((logger, i) => {
+              return (
+                <TrainingLogger key={i} pod={props.pod} flight={props.flight} loggerId={logger} />
+              )
+            })}
+        </div>
+      </div>
       <canvas className="p-2" ref={chartRef}></canvas>
     </div>
   )

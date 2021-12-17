@@ -2,36 +2,63 @@ package flights
 
 import (
 	"fmt"
+	"os"
 	"sync"
 	"time"
 
 	"github.com/logrusorgru/aurora"
+	"github.com/spiceai/spiceai/pkg/tempdir"
 )
 
 type Flight struct {
-	id            string
-	algorithm     string
-	start         time.Time
-	end           time.Time
-	episodes      []*Episode
+	id      string
+	dataDir string
+
+	algorithm string
+	loggers   []string
+
+	start time.Time
+	end   time.Time
+
 	episodesMutex sync.RWMutex
-	isDone        chan bool
-	err           error
+	episodes      []*Episode
+
+	isDone chan bool
+	err    error
 }
 
-func NewFlight(id string, episodes int, algorithm string) *Flight {
+func NewFlight(id string, episodes int64, algorithm string, loggers []string) (*Flight, error) {
+	dataDir, err := tempdir.CreateTempDir(fmt.Sprintf("flight_%s_data", id))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temp data dir: %w", err)
+	}
+
 	return &Flight{
 		id:        id,
+		dataDir:   dataDir,
 		algorithm: algorithm,
+		loggers:   loggers,
 		start:     time.Now(),
 		episodes:  make([]*Episode, 0, episodes),
 		isDone:    make(chan bool, 1),
 		err:       nil,
-	}
+	}, nil
+}
+
+func (f *Flight) Id() string {
+	return f.id
+}
+
+func (f *Flight) DataDir() string {
+	return f.dataDir
 }
 
 func (f *Flight) Algorithm() string {
 	return f.algorithm
+}
+
+func (f *Flight) Loggers() []string {
+	return f.loggers
 }
 
 func (f *Flight) WaitForDoneChan() *chan bool {
@@ -59,6 +86,16 @@ func (f *Flight) Episodes() []*Episode {
 	return f.episodes
 }
 
+func (f *Flight) GetEpisode(episodeId int64) *Episode {
+	for _, e := range f.Episodes() {
+		if e.EpisodeId == episodeId {
+			return e
+		}
+	}
+
+	return nil
+}
+
 func (f *Flight) ExpectedEpisodes() int {
 	return cap(f.episodes)
 }
@@ -81,6 +118,10 @@ func (f *Flight) Duration() time.Duration {
 	}
 
 	return time.Since(f.start)
+}
+
+func (f *Flight) Close() error {
+	return os.RemoveAll(f.dataDir)
 }
 
 func (f *Flight) complete(err error) {

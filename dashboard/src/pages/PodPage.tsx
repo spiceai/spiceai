@@ -220,7 +220,20 @@ const PodPage: React.FunctionComponent<PodProps> = () => {
               flights.map((flight, i) => (
                 <div key={i}>
                   <Card>
-                    <FlightChart pod={pod} flight={flight} />
+                    {flight.episodes?.length && flight.episodes[0].error ? (
+                      <div className="m-2 flex flex-col items-center justify-center">
+                        <div className="text-red-500 text-center">
+                          <h4 className="uppercase font-semibold">Flight Error</h4>
+                          {flight.episodes.map((episode, i) => (
+                            <div key={i}>
+                              {episode.error}: {episode.error_message}
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    ) : (
+                      <FlightChart pod={pod} flight={flight} />
+                    )}
                   </Card>
                 </div>
               ))}

@@ -14,9 +14,11 @@ class SpiceAIAgent(metaclass=abc.ABCMeta):
         action_size: How many actions our agent is able to take.
     """
 
-    def __init__(self, state_shape, action_size):
+    def __init__(self, state_shape, action_size, loggers, log_dir: Path):
         self.state_shape = state_shape
         self.action_size = action_size
+        self.loggers = loggers
+        self.log_dir = log_dir
 
     @abc.abstractmethod
     def act(self, state) -> Tuple[int, list]:

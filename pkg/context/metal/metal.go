@@ -19,6 +19,7 @@ type MetalContext struct {
 	spiceRuntimeDir       string
 	spiceBinDir           string
 	aiEngineDir           string
+	aiEngineBinDir        string
 	aiEnginePythonCmdPath string
 	appDir                string
 	podsDir               string
@@ -39,6 +40,10 @@ func (c *MetalContext) SpiceRuntimeDir() string {
 
 func (c *MetalContext) AIEngineDir() string {
 	return c.aiEngineDir
+}
+
+func (c *MetalContext) AIEngineBinDir() string {
+	return c.aiEngineBinDir
 }
 
 func (c *MetalContext) AIEnginePythonCmdPath() string {
@@ -62,7 +67,9 @@ func (c *MetalContext) Init(isDevelopmentMode bool) error {
 	c.spiceRuntimeDir = filepath.Join(homeDir, constants.DotSpice)
 	c.spiceBinDir = filepath.Join(c.spiceRuntimeDir, "bin")
 	c.aiEngineDir = filepath.Join(c.spiceBinDir, "ai")
-	c.aiEnginePythonCmdPath = filepath.Join(c.aiEngineDir, "venv", "bin", constants.PythonCmd)
+	c.aiEngineBinDir = filepath.Join(c.aiEngineDir, "venv", "bin")
+
+	c.aiEnginePythonCmdPath = filepath.Join(c.aiEngineBinDir, constants.PythonCmd)
 
 	cwd, err := os.Getwd()
 	if err != nil {

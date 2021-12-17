@@ -54,7 +54,14 @@ class VanillaPolicyGradientAgent(SpiceAIAgent):
     """Sets up a reinforcement learning agent."""
 
     def __init__(
-        self, state_shape, action_size, gamma=0.9, learning_rate=0.02, hidden_neurons=10
+        self,
+        state_shape,
+        action_size,
+        loggers,
+        log_dir,
+        gamma=0.9,
+        learning_rate=0.02,
+        hidden_neurons=10,
     ):
         """Initializes the agent with Policy Gradient networks
             and memory sub-classes.
@@ -64,7 +71,7 @@ class VanillaPolicyGradientAgent(SpiceAIAgent):
             action_size: How many actions our agent is able to take.
             gamma: The discount factor for rewards that occur earlier on.
         """
-        super().__init__(state_shape, action_size)
+        super().__init__(state_shape, action_size, loggers, log_dir)
 
         policy, predict = build_networks(
             state_shape, action_size, learning_rate, hidden_neurons

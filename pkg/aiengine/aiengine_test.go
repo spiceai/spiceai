@@ -161,6 +161,7 @@ func testStartTrainingFunc(pod *pods.Pod, response string) func(t *testing.T) {
 			NumberEpisodes:    10,
 			TrainingGoal:      pod.PodSpec.Training.Goal,
 			LearningAlgorithm: "dql",
+			TrainingLoggers:   nil,
 		}
 
 		t.Cleanup(func() {
@@ -170,6 +171,7 @@ func testStartTrainingFunc(pod *pods.Pod, response string) func(t *testing.T) {
 		mockAIEngineClient := &MockAIEngineClient{
 			StartTrainingHandler: func(c go_context.Context, actualTrainRequest *aiengine_pb.StartTrainingRequest, co ...grpc.CallOption) (*aiengine_pb.Response, error) {
 				expectedTrainRequest.EpochTime = actualTrainRequest.EpochTime
+				expectedTrainRequest.TrainingDataDir = actualTrainRequest.TrainingDataDir
 
 				assert.Equal(t, expectedTrainRequest, actualTrainRequest)
 
@@ -181,7 +183,7 @@ func testStartTrainingFunc(pod *pods.Pod, response string) func(t *testing.T) {
 
 		aiengineClient = mockAIEngineClient
 
-		err := StartTraining(pod, nil, -1)
+		err := StartTraining(pod, nil)
 		switch response {
 		case "already_training":
 			assert.EqualError(t, err, fmt.Sprintf("%s -> training is already in progress", pod.Name))

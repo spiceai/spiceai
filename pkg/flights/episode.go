@@ -3,7 +3,7 @@ package flights
 import "time"
 
 type Episode struct {
-	EpisodeId    uint64
+	EpisodeId    int64
 	Start        time.Time
 	End          time.Time
 	Score        float64

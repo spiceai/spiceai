@@ -206,7 +206,7 @@ func apiPodTrainHandler(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	var trainRequest runtime_pb.TrainModel
+	var trainRequest *runtime_pb.TrainModel
 	err := json.Unmarshal(ctx.Request.Body(), &trainRequest)
 	if err != nil {
 		ctx.Response.SetStatusCode(400)
@@ -214,17 +214,7 @@ func apiPodTrainHandler(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	var algorithm *aiengine.LearningAlgorithm
-	if trainRequest.LearningAlgorithm != "" {
-		algorithm = aiengine.GetAlgorithm(trainRequest.LearningAlgorithm)
-		if algorithm == nil {
-			ctx.Response.SetStatusCode(400)
-			ctx.Response.SetBodyString(fmt.Sprintf("unknown learning algorithm %s", trainRequest.LearningAlgorithm))
-			return
-		}
-	}
-
-	err = aiengine.StartTraining(pod, algorithm, trainRequest.NumberEpisodes)
+	err = aiengine.StartTraining(pod, trainRequest)
 	if err != nil {
 		ctx.Response.SetStatusCode(500)
 		ctx.Response.SetBodyString(err.Error())
@@ -360,6 +350,44 @@ func apiPostFlightEpisodeHandler(ctx *fasthttp.RequestCtx) {
 	flight.RecordEpisode(episode)
 
 	ctx.Response.SetStatusCode(201)
+}
+
+func apiPostFlightLoggerHandler(ctx *fasthttp.RequestCtx) {
+	podParam := ctx.UserValue("pod").(string)
+	pod := pods.GetPod(podParam)
+	if pod == nil {
+		ctx.Response.SetStatusCode(404)
+		return
+	}
+
+	flightParam := ctx.UserValue("flight").(string)
+	flight := pod.GetFlight(flightParam)
+	if flight == nil {
+		ctx.Response.SetStatusCode(404)
+		return
+	}
+
+	loggerIdParam := ctx.UserValue("loggerId").(string)
+	logger, err := flight.LoadLogger(loggerIdParam)
+	if err != nil {
+		ctx.Response.SetStatusCode(404)
+		ctx.Response.SetBodyString(err.Error())
+		return
+	}
+
+	address, err := logger.Open()
+	if err != nil {
+		ctx.Response.SetStatusCode(500)
+		ctx.Response.SetBodyString(err.Error())
+		return
+	}
+
+	_, err = ctx.WriteString(address)
+	if err != nil {
+		ctx.Response.SetStatusCode(500)
+		ctx.Response.SetBodyString(err.Error())
+		return
+	}
 }
 
 func apiGetInterpretationsHandler(ctx *fasthttp.RequestCtx) {
@@ -594,6 +622,7 @@ func (server *server) Start() error {
 		api.GET("/pods/{pod}/training_runs", apiGetFlightsHandler)
 		api.GET("/pods/{pod}/training_runs/{flight}", apiGetFlightHandler)
 		api.POST("/pods/{pod}/training_runs/{flight}/episodes", apiPostFlightEpisodeHandler)
+		api.POST("/pods/{pod}/training_runs/{flight}/loggers/{loggerId}", apiPostFlightLoggerHandler)
 
 		// Interpretations
 		api.GET("/pods/{pod}/interpretations", apiGetInterpretationsHandler)

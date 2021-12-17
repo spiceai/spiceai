@@ -86,6 +86,14 @@ func (pod *Pod) Granularity() time.Duration {
 	return pod.podParams.Granularity
 }
 
+func (pod *Pod) Interpolation() bool {
+	return pod.podParams.Interpolation
+}
+
+func (pod *Pod) TrainingLoggers() []string {
+	return pod.podParams.TrainingLoggers
+}
+
 func (pod *Pod) TimeCategories() map[string][]spice_time.TimeCategoryInfo {
 	return pod.timeCategories
 }
@@ -102,20 +110,16 @@ func (pod *Pod) TrainingGoal() *string {
 	return &pod.PodSpec.Training.Goal
 }
 
-func (pod *Pod) Episodes() int {
+func (pod *Pod) Episodes() int64 {
 	if pod.PodSpec.Params != nil {
 		episodesParam, ok := pod.PodSpec.Params["episodes"]
 		if ok {
-			if episodes, err := strconv.ParseInt(episodesParam, 0, 0); err == nil {
-				return int(episodes)
+			if episodes, err := strconv.ParseInt(episodesParam, 0, 64); err == nil {
+				return episodes
 			}
 		}
 	}
 	return 10
-}
-
-func (pod *Pod) Interpolation() bool {
-	return pod.podParams.Interpolation
 }
 
 func (pod *Pod) CachedState() []*state.State {
@@ -599,6 +603,14 @@ func (pod *Pod) loadParams() error {
 				return err
 			}
 			podParams.Interpolation = val
+		}
+
+		str, ok = pod.PodSpec.Params["training_loggers"]
+		if ok && str != "" {
+			loggers := strings.Split(str, ",")
+			if len(loggers) > 0 {
+				podParams.TrainingLoggers = loggers
+			}
 		}
 	}
 

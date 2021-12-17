@@ -1,6 +1,5 @@
 import math
 from pathlib import Path
-import tempfile
 import threading
 import time
 from typing import Dict
@@ -9,24 +8,36 @@ import requests
 
 from algorithms.factory import get_agent
 from algorithms.agent_interface import SpiceAIAgent
-from cleanup import directories_to_delete
 from connector.manager import ConnectorManager
 from data_manager.base_manager import DataManagerBase
 from data_manager.time_series_manager import TimeSeriesDataManager
 from exec import somewhat_safe_eval
-from exception import DataSourceActionInvalidException, LawInvalidException, RewardInvalidException
+from exception import (
+    DataSourceActionInvalidException,
+    LawInvalidException,
+    RewardInvalidException,
+)
 from progress import ProgressBar
 from utils import print_event
 
 
-class Trainer():
+class Trainer:
     TRAINING_LOCK = threading.Lock()
     SAVED_MODELS: Dict[str, Path] = {}
     BASE_URL = "http://localhost:8000/api/v0.1/pods"
 
     def __init__(
-            self, pod_name: str, data_manager: DataManagerBase, connector_manager: ConnectorManager, algorithm: str,
-            number_episodes: int, flight: str, training_goal: str):
+        self,
+        pod_name: str,
+        data_manager: DataManagerBase,
+        connector_manager: ConnectorManager,
+        algorithm: str,
+        number_episodes: int,
+        flight: str,
+        training_goal: str,
+        training_data_dir: str,
+        training_loggers,
+    ):
         self.pod_name = pod_name
         self.data_manager = data_manager
         self.connector_manager = connector_manager
@@ -34,23 +45,37 @@ class Trainer():
         self.number_episodes = number_episodes
         self.flight = flight
         self.training_goal = training_goal
+        self.training_data_dir = Path(training_data_dir)
+        self.training_loggers = training_loggers
 
         self.action_size = len(data_manager.action_names)
 
-        self.request_url = self.BASE_URL + f"/{pod_name}/training_runs/{flight}/episodes"
+        self.request_url = (
+            self.BASE_URL + f"/{pod_name}/training_runs/{flight}/episodes"
+        )
 
         self.training_episodes = number_episodes
         self.not_learning_threshold = 3
 
+        self.log_dir = self.training_data_dir / "log"
+
         self.model_data_shape = data_manager.get_shape()
-        self.agent: SpiceAIAgent = get_agent(algorithm, self.model_data_shape, self.action_size)
+        self.agent: SpiceAIAgent = get_agent(
+            algorithm,
+            self.model_data_shape,
+            self.action_size,
+            self.training_loggers,
+            self.log_dir,
+        )
 
         self.custom_training_goal_met = False
         self.not_learning_episodes_threshold_met = False
 
         self.should_stop = False
 
-    def run_episode(self, model_state, raw_state, raw_state_prime_interpretations, progress_bar):
+    def run_episode(
+        self, model_state, raw_state, raw_state_prime_interpretations, progress_bar
+    ):
         episode_reward = 0
         episode_actions = [0] * len(self.data_manager.action_names)
         while True:
@@ -69,20 +94,27 @@ class Trainer():
                 break
 
             raw_state_prime = self.data_manager.get_current_window()
-            model_state_prime = self.data_manager.flatten_and_normalize_window(raw_state_prime)
+            model_state_prime = self.data_manager.flatten_and_normalize_window(
+                raw_state_prime
+            )
             if model_state_prime.shape != self.model_data_shape:
                 break
 
             raw_state_interpretations = raw_state_prime_interpretations
-            raw_state_prime_interpretations = self.data_manager.get_interpretations_for_interval()
+            raw_state_prime_interpretations = (
+                self.data_manager.get_interpretations_for_interval()
+            )
 
             reward = -5
             if is_valid:
                 try:
                     reward = self.data_manager.reward(
-                        raw_state, raw_state_interpretations,
-                        raw_state_prime, raw_state_prime_interpretations,
-                        action)
+                        raw_state,
+                        raw_state_interpretations,
+                        raw_state_prime,
+                        raw_state_prime_interpretations,
+                        action,
+                    )
                 except RewardInvalidException as ex:
                     post_episode_result(self.request_url, ex.get_error_body())
                     self.should_stop = True
@@ -107,18 +139,28 @@ class Trainer():
                 episode_start = math.floor(time.time())
                 self.data_manager.reset()
                 raw_state = self.data_manager.get_current_window()
-                raw_state_prime_interpretations = self.data_manager.get_interpretations_for_interval()
+                raw_state_prime_interpretations = (
+                    self.data_manager.get_interpretations_for_interval()
+                )
                 model_state = self.data_manager.flatten_and_normalize_window(raw_state)
 
                 total_steps = (
-                    math.floor(self.data_manager.param.period_secs / self.data_manager.param.granularity_secs)
-                    if isinstance(self.data_manager, TimeSeriesDataManager) else
-                    len(self.data_manager.data_frame))
-                progress_bar = ProgressBar(self.pod_name, episode, total_steps, self.data_manager.metrics)
+                    self.data_manager.param.period_secs
+                    // self.data_manager.param.granularity_secs
+                    if isinstance(self.data_manager, TimeSeriesDataManager)
+                    else len(self.data_manager.data_frame)
+                )
+                progress_bar = ProgressBar(
+                    self.pod_name, episode, total_steps, self.data_manager.metrics
+                )
                 self.data_manager.metrics.reset()
 
                 episode_reward, episode_actions = self.run_episode(
-                    model_state, raw_state, raw_state_prime_interpretations, progress_bar)
+                    model_state,
+                    raw_state,
+                    raw_state_prime_interpretations,
+                    progress_bar,
+                )
                 if self.should_stop:
                     return
 
@@ -127,7 +169,9 @@ class Trainer():
                 if self.training_goal != "":
                     loc = {}
                     loc["score"] = episode_reward
-                    self.custom_training_goal_met = somewhat_safe_eval(self.training_goal, loc)
+                    self.custom_training_goal_met = somewhat_safe_eval(
+                        self.training_goal, loc
+                    )
 
                 self.agent.learn()
                 print_event(
@@ -135,10 +179,20 @@ class Trainer():
                     f"Episode {episode} completed with score of {round(episode_reward, 2)}.",
                 )
 
-                episode_actions_name = dict(zip(self.data_manager.action_names, episode_actions))
-                print_event(self.pod_name, "Action Counts: " + ', '.join(
-                    [f"{action_name} = {action_count}"
-                     for action_name, action_count in episode_actions_name.items()]) + ".")
+                episode_actions_name = dict(
+                    zip(self.data_manager.action_names, episode_actions)
+                )
+                print_event(
+                    self.pod_name,
+                    "Action Counts: "
+                    + ", ".join(
+                        [
+                            f"{action_name} = {action_count}"
+                            for action_name, action_count in episode_actions_name.items()
+                        ]
+                    )
+                    + ".",
+                )
 
                 episode_data = {
                     "episode": episode,
@@ -163,16 +217,22 @@ class Trainer():
                 end_of_episode(episode)
 
             if self.custom_training_goal_met:
-                print_event(self.pod_name, f"Training goal '{self.training_goal}' reached!")
+                print_event(
+                    self.pod_name, f"Training goal '{self.training_goal}' reached!"
+                )
             elif self.not_learning_episodes_threshold_met:
-                print_event(self.pod_name, "Training goal 'score_variance < 1' reached!")
+                print_event(
+                    self.pod_name, "Training goal 'score_variance < 1' reached!"
+                )
             else:
-                print_event(self.pod_name, f"Max training episodes ({self.training_episodes}) reached!")
+                print_event(
+                    self.pod_name,
+                    f"Max training episodes ({self.training_episodes}) reached!",
+                )
 
-        tmpdir = tempfile.mkdtemp(prefix="spiceai_")
-        save_path = Path(tmpdir, f"{self.pod_name}_train")
-        save_path.mkdir(parents=True)
-        directories_to_delete.append(tmpdir)
+        save_path = self.training_data_dir / f"{self.pod_name}_train"
+        if not save_path.exists():
+            save_path.mkdir()
         self.agent.save(save_path)
         self.SAVED_MODELS[self.pod_name] = save_path
 

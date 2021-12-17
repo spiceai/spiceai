@@ -14,7 +14,12 @@ func TestFlight(t *testing.T) {
 
 func testRecordEpisode() func(*testing.T) {
 	return func(t *testing.T) {
-		flight := flights.NewFlight("test", 1, "vpg")
+		flight, err := flights.NewFlight("test", 1, "vpg", nil)
+		if err != nil {
+			t.Fatalf("failed to create flight: %v", err)
+		}
+		defer flight.Close()
+
 		episode := flights.Episode{
 			EpisodeId: 1,
 		}
