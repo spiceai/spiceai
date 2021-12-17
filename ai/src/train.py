@@ -145,7 +145,8 @@ class Trainer:
                 model_state = self.data_manager.flatten_and_normalize_window(raw_state)
 
                 total_steps = (
-                    self.data_manager.param.period_secs // self.data_manager.param.granularity_secs
+                    self.data_manager.param.period_secs
+                    // self.data_manager.param.granularity_secs
                     if isinstance(self.data_manager, TimeSeriesDataManager)
                     else len(self.data_manager.data_frame)
                 )
@@ -230,7 +231,8 @@ class Trainer:
                 )
 
         save_path = self.training_data_dir / f"{self.pod_name}_train"
-        save_path.mkdir(parents=True)
+        if not save_path.exists():
+            save_path.mkdir()
         self.agent.save(save_path)
         self.SAVED_MODELS[self.pod_name] = save_path
 
