@@ -229,8 +229,10 @@ class Trainer:
                     f"Max training episodes ({self.training_episodes}) reached!",
                 )
 
-        self.agent.save(self.training_data_dir)
-        self.SAVED_MODELS[self.pod_name] = self.training_data_dir
+        save_path = self.training_data_dir / f"{self.pod_name}_train"
+        save_path.mkdir(parents=True)
+        self.agent.save(save_path)
+        self.SAVED_MODELS[self.pod_name] = save_path
 
 
 def end_of_episode(_episode: int):
