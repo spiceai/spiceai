@@ -128,7 +128,7 @@ class SACD(keras.Model):
         )
 
         with tf.name_scope("critic_loss"):
-            next_action_probs = self.actor(next_state_batch)
+            _next_action, next_action_probs = self.actor(next_state_batch)
             next_action_logprobs = tf.math.log(next_action_probs)
             q1_next_target = self._critic_1(next_state_batch)
             q2_next_target = self._critic_2(next_state_batch)
