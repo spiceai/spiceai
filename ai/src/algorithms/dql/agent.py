@@ -1,7 +1,6 @@
 import json
 from pathlib import Path
 import random
-import os
 
 import numpy as np
 import tensorflow as tf
