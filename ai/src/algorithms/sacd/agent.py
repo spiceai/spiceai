@@ -43,7 +43,7 @@ class SACD(keras.Model):
             self.seq = SACD.create_network(state_dim, action_dim, "softmax")
 
         def call(self, input_tensor: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor]:
-            _action, action_probs = self.seq(input_tensor)
+            action_probs = self.seq(input_tensor)
             distribution = tfp.distributions.Categorical(action_probs)
             return distribution.sample(), action_probs
 
