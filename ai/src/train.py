@@ -145,10 +145,7 @@ class Trainer:
                 model_state = self.data_manager.flatten_and_normalize_window(raw_state)
 
                 total_steps = (
-                    math.floor(
-                        self.data_manager.param.period_secs
-                        / self.data_manager.param.granularity_secs
-                    )
+                    self.data_manager.param.period_secs // self.data_manager.param.granularity_secs
                     if isinstance(self.data_manager, TimeSeriesDataManager)
                     else len(self.data_manager.data_frame)
                 )
