@@ -110,7 +110,7 @@ class SACD(keras.Model):
 
         with tf.name_scope("actor_loss"):
             with tf.GradientTape() as actor_tape:
-                action_probs = self.actor(state_batch)
+                _action, action_probs = self.actor(state_batch)
                 action_logprobs = tf.math.log(action_probs)
                 q1_value = self._critic_1(state_batch)
                 q2_value = self._critic_2(state_batch)
