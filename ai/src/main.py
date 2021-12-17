@@ -271,7 +271,7 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
 
         if request.pod not in data_managers:
             return aiengine_pb2.ExportModelResult(
-                resopnse=aiengine_pb2.Response(result="pod_not_initialized", error=True)
+                response=aiengine_pb2.Response(result="pod_not_initialized", error=True)
             )
 
         if request.tag != "latest":

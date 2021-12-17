@@ -145,7 +145,8 @@ class Trainer:
                 model_state = self.data_manager.flatten_and_normalize_window(raw_state)
 
                 total_steps = (
-                    self.data_manager.param.period_secs // self.data_manager.param.granularity_secs
+                    self.data_manager.param.period_secs
+                    // self.data_manager.param.granularity_secs
                     if isinstance(self.data_manager, TimeSeriesDataManager)
                     else len(self.data_manager.data_frame)
                 )
@@ -229,8 +230,11 @@ class Trainer:
                     f"Max training episodes ({self.training_episodes}) reached!",
                 )
 
-        self.agent.save(self.training_data_dir)
-        self.SAVED_MODELS[self.pod_name] = self.training_data_dir
+        save_path = self.training_data_dir / f"{self.pod_name}_train"
+        if not save_path.exists():
+            save_path.mkdir()
+        self.agent.save(save_path)
+        self.SAVED_MODELS[self.pod_name] = save_path
 
 
 def end_of_episode(_episode: int):

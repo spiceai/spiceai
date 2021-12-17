@@ -19,7 +19,7 @@ const loggers = new Map<string, ITrainingLogger>([
     'tensorboard',
     {
       name: 'TensorBoard',
-      color: 'orange',
+      color: 'yellow-400',
     },
   ],
 ])
@@ -54,10 +54,7 @@ const TrainingLogger: React.FunctionComponent<ITrainingLoggerProps> = (props) =>
   }
 
   return (
-    <button
-      onClick={onClick}
-      className={`bg-${logger?.color}-500 hover:bg-${logger?.color}-700 text-xs rounded py-1 px-2 text-white`}
-    >
+    <button onClick={onClick} className={`bg-${logger?.color} text-xs rounded py-1 px-2`}>
       {logger?.name}
     </button>
   )
