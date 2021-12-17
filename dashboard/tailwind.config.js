@@ -1,5 +1,5 @@
 module.exports = {
-  purge: ['src/**/*.js', 'src/**/*.jsx', 'src/**/*.ts', 'src/**/*.tsx', 'public/**/*.html'],
+  content: ['src/**/*.js', 'src/**/*.jsx', 'src/**/*.ts', 'src/**/*.tsx', 'public/**/*.html'],
   theme: {
     extend: {
       colors: {
@@ -47,9 +47,6 @@ module.exports = {
         120: '30rem',
       },
     },
-  },
-  variants: {
-    opacity: ['responsive', 'hover', 'focus', 'disabled'],
   },
   plugins: [],
 }
