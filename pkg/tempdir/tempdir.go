@@ -3,33 +3,35 @@ package tempdir
 import (
 	"fmt"
 	"os"
-	"path/filepath"
+	"sync"
 	"time"
 )
 
-var tempDirectories []string
+var (
+	mutex           sync.Mutex
+	tempDirectories []string
+)
 
 func CreateTempDir(purpose string) (string, error) {
 	tempDir := os.TempDir()
-	stat, err := os.Stat(tempDir)
-	if err != nil {
-		return "", nil
-	}
+	pattern := fmt.Sprintf("spice_%s_%v_*", purpose, time.Now().Unix())
 
-	spiceDir := fmt.Sprintf("spice_%s_%v", purpose, time.Now().Unix())
-	tempDir = filepath.Join(tempDir, spiceDir)
-
-	err = os.Mkdir(tempDir, stat.Mode())
+	path, err := os.MkdirTemp(tempDir, pattern)
 	if err != nil {
 		return "", err
 	}
 
-	tempDirectories = append(tempDirectories, tempDir)
+	mutex.Lock()
+	tempDirectories = append(tempDirectories, path)
+	mutex.Unlock()
 
-	return tempDir, nil
+	return path, nil
 }
 
 func RemoveAllCreatedTempDirectories() error {
+	mutex.Lock()
+	defer mutex.Unlock()
+
 	for _, tempDir := range tempDirectories {
 		err := os.RemoveAll(tempDir)
 		if err != nil {
@@ -37,11 +39,5 @@ func RemoveAllCreatedTempDirectories() error {
 		}
 	}
 
-	tempDirectories = make([]string, 0)
-
 	return nil
-}
-
-func init() {
-	tempDirectories = make([]string, 0)
 }
