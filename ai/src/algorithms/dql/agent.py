@@ -94,7 +94,7 @@ class DeepQLearningAgent(SpiceAIAgent):
         super().__init__(state_shape, action_size, loggers, log_dir)
 
         callbacks = []
-        if len(loggers) > 0:
+        if loggers and len(loggers) > 0:
             if not log_dir.exists():
                 log_dir.mkdir()
             for logger in loggers:

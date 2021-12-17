@@ -2,7 +2,7 @@
 jobs=4
 
 [MESSAGES CONTROL]
-disable=missing-docstring,broad-except
+disable=missing-docstring,broad-except,R0801
 
 [TYPECHECK]
 generated-members=proto.*
