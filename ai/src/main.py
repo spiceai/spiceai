@@ -47,7 +47,7 @@ def train_agent(
     number_episodes: int,
     flight: str,
     training_goal: str,
-    training_data_dir: str,
+    training_data_dir: Path,
     loggers,
 ):
     try:
@@ -79,7 +79,7 @@ def dispatch_train_agent(
     number_episodes: int,
     flight: str,
     training_goal: str,
-    training_data_dir: str,
+    training_data_dir: Path,
     loggers,
 ):
     if Trainer.TRAINING_LOCK.locked():

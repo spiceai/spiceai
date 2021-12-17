@@ -45,7 +45,7 @@ class Trainer:
         self.number_episodes = number_episodes
         self.flight = flight
         self.training_goal = training_goal
-        self.training_data_dir = training_data_dir
+        self.training_data_dir = Path(training_data_dir)
         self.training_loggers = training_loggers
 
         self.action_size = len(data_manager.action_names)
@@ -57,7 +57,7 @@ class Trainer:
         self.training_episodes = number_episodes
         self.not_learning_threshold = 3
 
-        self.log_dir = str(Path(self.training_data_dir, "log"))
+        self.log_dir = self.training_data_dir / "log"
 
         self.model_data_shape = data_manager.get_shape()
         self.agent: SpiceAIAgent = get_agent(
@@ -232,9 +232,8 @@ class Trainer:
                     f"Max training episodes ({self.training_episodes}) reached!",
                 )
 
-        data_path = Path(self.training_data_dir)
-        self.agent.save(data_path)
-        self.SAVED_MODELS[self.pod_name] = data_path
+        self.agent.save(self.training_data_dir)
+        self.SAVED_MODELS[self.pod_name] = self.training_data_dir
 
 
 def end_of_episode(_episode: int):
