@@ -147,7 +147,7 @@ class SACD(keras.Model):
 
 class SoftActorCriticDiscreteAgent(SpiceAIAgent):
     BATCH_SIZE = 128
-    UPDATE_STEPS = 10
+    UPDATE_STEPS = 1
 
     def __init__(self, state_shape: tuple, action_size, loggers, log_dir: Path):
         super().__init__(state_shape, action_size, loggers, log_dir)
