@@ -140,10 +140,9 @@ class SACD(keras.Model):
         return [
             ('metrics/actor_loss', actor_loss),
             *[(f'metrics/critic_{critic_index}_loss', critic_loss)
-             for critic_index, critic_loss in enumerate(critic_losses)],
+              for critic_index, critic_loss in enumerate(critic_losses)],
             ('metrics/alpha_loss', alpha_loss),
             ('metrics/entropy', tf.reduce_mean(-neg_entropy))]
-
 
 
 class SoftActorCriticDiscreteAgent(SpiceAIAgent):
