@@ -8,7 +8,7 @@ test: venv
 	ALGORITHM="sacd" venv/bin/python3 -m pytest --timeout 30
 
 venv:
-	python3 -m venv venv
+	python3 -m venv -p 3.9 venv
 	venv/bin/pip3 install --upgrade pip
 	venv/bin/pip3 install -r requirements/production.txt
 

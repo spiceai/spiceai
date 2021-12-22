@@ -60,6 +60,7 @@ class Trainer:
         self.log_dir = self.training_data_dir / "log"
 
         self.model_data_shape = data_manager.get_shape()
+        print('Getting agent')
         self.agent: SpiceAIAgent = get_agent(
             algorithm,
             self.model_data_shape,
