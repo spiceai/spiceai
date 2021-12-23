@@ -1,6 +1,6 @@
 import json
 from pathlib import Path
-from typing import List, Tuple
+from typing import Tuple
 
 import numpy as np
 import tensorflow as tf
@@ -68,9 +68,11 @@ class SACD(keras.Model):
         self._critic_2(init_input)
         self._target_critic_1(init_input)
         self._target_critic_2(init_input)
-        for critic_var, target_var in zip(self._critic_1.trainable_variables, self._target_critic_1.trainable_variables):
+        for critic_var, target_var in zip(
+                self._critic_1.trainable_variables, self._target_critic_1.trainable_variables):
             target_var.assign(critic_var)
-        for critic_var, target_var in zip(self._critic_2.trainable_variables, self._target_critic_2.trainable_variables):
+        for critic_var, target_var in zip(
+                self._critic_2.trainable_variables, self._target_critic_2.trainable_variables):
             target_var.assign(critic_var)
 
         self._actor_optimizer = optimizers.Adam(learning_rate=self.LEARNING_RATE)
@@ -86,9 +88,11 @@ class SACD(keras.Model):
 
     @tf.function
     def _copy_target_models(self):
-        for critic_var, target_var in zip(self._critic_1.trainable_variables, self._target_critic_1.trainable_variables):
+        for critic_var, target_var in zip(
+                self._critic_1.trainable_variables, self._target_critic_1.trainable_variables):
             target_var.assign(self.TARGET_MOMEMTUM * critic_var + (1.0 - self.TARGET_MOMEMTUM) * target_var)
-        for critic_var, target_var in zip(self._critic_2.trainable_variables, self._target_critic_2.trainable_variables):
+        for critic_var, target_var in zip(
+                self._critic_2.trainable_variables, self._target_critic_2.trainable_variables):
             target_var.assign(self.TARGET_MOMEMTUM * critic_var + (1.0 - self.TARGET_MOMEMTUM) * target_var)
 
     def train(self, data):
