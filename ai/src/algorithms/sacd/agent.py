@@ -176,7 +176,7 @@ class SoftActorCriticDiscreteAgent(SpiceAIAgent):
         self.buffer.store(state, action, reward, next_state)
 
     def act(self, state):
-        action, action_probs = self.model.actor(np.expand_dims(state, 0))
+        action, action_probs = self.model.actor.predict(np.expand_dims(state, 0))
         return action[0], action_probs[0]
 
     def save(self, path: Path):
