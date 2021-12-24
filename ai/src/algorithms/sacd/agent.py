@@ -176,8 +176,12 @@ class SoftActorCriticDiscreteAgent(SpiceAIAgent):
         self.buffer.store(state, action, reward, next_state)
 
     def act(self, state):
-        action, action_probs = self.model.actor(np.expand_dims(state, 0))
-        return action[0].numpy(), action_probs[0].numpy()
+        if tf.executing_eagerly():
+            action, action_probs = self.model.actor(np.expand_dims(state, 0))
+            return action[0].numpy(), action_probs[0].numpy()
+
+        action, action_probs = self.model.actor.predict(np.expand_dims(state, 0))
+        return action[0], action_probs[0]
 
     def save(self, path: Path):
         model_name = "model.pb"
@@ -190,9 +194,7 @@ class SoftActorCriticDiscreteAgent(SpiceAIAgent):
         if (path / "meta.json").exists():
             with open(path / "meta.json", "r", encoding="utf-8") as meta_file:
                 meta_info = json.loads(meta_file.read())
-            self.model.actor = keras.models.load_model(
-                str(path / meta_info["model_name"])
-            )
+            self.model.actor = keras.models.load_model(str(path / meta_info["model_name"]), compile=False)
             return True
         return False
 
