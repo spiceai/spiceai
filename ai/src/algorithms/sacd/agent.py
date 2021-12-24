@@ -22,7 +22,7 @@ class SACD(keras.Model):
     TARGET_ENTROPY_SCALE = 0.2
     TARGET_MOMEMTUM = 0.05
 
-    UPDATE_STEPS = 1
+    UPDATE_STEPS = 10
 
     @staticmethod
     def create_network(output_dim: int, final_activation: str = None) -> keras.Model:
@@ -176,8 +176,8 @@ class SoftActorCriticDiscreteAgent(SpiceAIAgent):
         self.buffer.store(state, action, reward, next_state)
 
     def act(self, state):
-        action, action_probs = self.model.actor.predict(np.expand_dims(state, 0))
-        return action[0], action_probs[0]
+        action, action_probs = self.model.actor(np.expand_dims(state, 0))
+        return action[0].numpy(), action_probs[0].numpy()
 
     def save(self, path: Path):
         model_name = "model.pb"
