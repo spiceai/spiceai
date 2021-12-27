@@ -92,6 +92,7 @@ class Model:
 class DeepQLearningAgent(SpiceAIAgent):
     def __init__(self, state_shape, action_size, loggers, log_dir: Path):
         super().__init__(state_shape, action_size, loggers, log_dir)
+        tf.compat.v1.disable_eager_execution()
 
         callbacks = []
         if loggers and len(loggers) > 0:
