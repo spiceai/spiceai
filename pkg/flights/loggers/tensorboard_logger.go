@@ -50,7 +50,6 @@ func (l *TensorboardLogger) Open() (string, error) {
 			return l.address, nil
 		}
 		
-		cmd.Process.Kill()
 		delete(tensorboardInstances, runsDir)
 		cmd = nil
 	}
