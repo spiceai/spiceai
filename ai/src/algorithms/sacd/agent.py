@@ -80,7 +80,7 @@ class SACD(keras.Model):
         self._critic_2_optimizer = optimizers.Adam(learning_rate=self.LEARNING_RATE)
         self._alpha_optimizer = optimizers.Adam(learning_rate=self.LEARNING_RATE)
 
-        self.writer = tf.summary.create_file_writer(str(log_dir / 'sacd')) if log_dir else None
+        self.writer = tf.summary.create_file_writer(str(log_dir)) if log_dir else None
         self.global_step = 0
 
     def call(self, input_tensor: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor]:
