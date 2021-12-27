@@ -3,19 +3,20 @@ package flights
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
 	"github.com/logrusorgru/aurora"
-	"github.com/spiceai/spiceai/pkg/tempdir"
+	"github.com/spiceai/spiceai/pkg/util"
 )
 
 type Flight struct {
-	id      string
-	dataDir string
+	id string
 
 	algorithm string
 	loggers   []string
+	logDir    string
 
 	start time.Time
 	end   time.Time
@@ -27,30 +28,35 @@ type Flight struct {
 	err    error
 }
 
-func NewFlight(id string, episodes int64, algorithm string, loggers []string) (*Flight, error) {
-	dataDir, err := tempdir.CreateTempDir(fmt.Sprintf("flight_%s_data", id))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create temp data dir: %w", err)
-	}
-
-	return &Flight{
+func NewFlight(id string, episodes int64, algorithm string, loggers []string, logDir string) (*Flight, error) {
+	f := &Flight{
 		id:        id,
-		dataDir:   dataDir,
 		algorithm: algorithm,
 		loggers:   loggers,
 		start:     time.Now(),
 		episodes:  make([]*Episode, 0, episodes),
 		isDone:    make(chan bool, 1),
 		err:       nil,
-	}, nil
+	}
+
+	if len(loggers) > 0 {
+		path := filepath.Join(logDir, "runs", fmt.Sprintf("run_%s", id))
+		_, err := util.MkDirAllInheritPerm(path)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create temp log dir %s: %w", path, err)
+		}
+		f.logDir = path
+	}
+
+	return f, nil
 }
 
 func (f *Flight) Id() string {
 	return f.id
 }
 
-func (f *Flight) DataDir() string {
-	return f.dataDir
+func (f *Flight) LogDir() string {
+	return f.logDir
 }
 
 func (f *Flight) Algorithm() string {
@@ -121,7 +127,7 @@ func (f *Flight) Duration() time.Duration {
 }
 
 func (f *Flight) Close() error {
-	return os.RemoveAll(f.dataDir)
+	return os.RemoveAll(f.logDir)
 }
 
 func (f *Flight) complete(err error) {

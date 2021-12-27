@@ -27,6 +27,9 @@ const loggers = new Map<string, ITrainingLogger>([
 const TrainingLogger: React.FunctionComponent<ITrainingLoggerProps> = (props) => {
   const { pod, flight, loggerId: id } = props
   const [logger, setLogger] = useState<ITrainingLogger>()
+  const [isOpening, setIsOpening] = useState(false)
+
+  let openedWindow: Window | null = null
 
   useEffect(() => {
     const l = loggers.get(id)
@@ -40,22 +43,30 @@ const TrainingLogger: React.FunctionComponent<ITrainingLoggerProps> = (props) =>
       method: 'POST',
     }
 
+    setIsOpening(true)
+
     const url = `/api/v0.1/pods/${pod.name}/training_runs/${flight.id}/loggers/${id}`
     const resp = await fetch(url, options)
     if (!resp.ok) {
+      setIsOpening(false)
       console.error(resp.status, resp.statusText, await resp.text())
       return
     }
 
     const address = await resp.text()
     if (address) {
-      window.open(address, '_blank')
+      if (openedWindow) {
+        openedWindow.location = address
+      } else {
+        openedWindow = window.open(address, '_blank')
+      }
     }
+    setIsOpening(false)
   }
 
   return (
     <button onClick={onClick} className={`bg-${logger?.color} text-xs rounded py-1 px-2`}>
-      {logger?.name}
+      {(isOpening ? 'Opening ' : 'Open ') + logger?.name}
     </button>
   )
 }
