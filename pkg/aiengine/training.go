@@ -47,8 +47,13 @@ func StartTraining(pod *pods.Pod, trainModel *runtime_pb.TrainModel) error {
 		return err
 	}
 
+	podLogDir, err := pod.GetLogDir()
+	if err != nil {
+		return err
+	}
+
 	flightId := fmt.Sprintf("%d", len(*pod.Flights())+1)
-	flight, err := flights.NewFlight(flightId, trainModel.NumberEpisodes, algorithm.Id, trainModel.Loggers)
+	flight, err := flights.NewFlight(flightId, trainModel.NumberEpisodes, algorithm.Id, trainModel.Loggers, podLogDir)
 	if err != nil {
 		return err
 	}
@@ -69,7 +74,7 @@ func StartTraining(pod *pods.Pod, trainModel *runtime_pb.TrainModel) error {
 		TrainingGoal:      pod.PodSpec.Training.Goal,
 		LearningAlgorithm: algorithm.Id,
 		TrainingLoggers:   trainModel.Loggers,
-		TrainingDataDir:   flight.DataDir(),
+		TrainingDataDir:   flight.LogDir(),
 	}
 
 	// Overload pod's parameters

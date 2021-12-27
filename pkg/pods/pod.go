@@ -21,6 +21,7 @@ import (
 	"github.com/spiceai/spiceai/pkg/observations"
 	"github.com/spiceai/spiceai/pkg/spec"
 	"github.com/spiceai/spiceai/pkg/state"
+	"github.com/spiceai/spiceai/pkg/tempdir"
 	spice_time "github.com/spiceai/spiceai/pkg/time"
 	"github.com/spiceai/spiceai/pkg/util"
 	"github.com/spiceai/spiceai/pkg/validator"
@@ -48,6 +49,7 @@ type Pod struct {
 	externalRewardFuncs string
 
 	flights map[string]*flights.Flight
+	logDir  string
 
 	podLocalStateMutex    sync.RWMutex
 	podLocalState         []*state.State
@@ -305,6 +307,17 @@ func (pod *Pod) CategoryNames() []string {
 // Returns the global list of tag values
 func (pod *Pod) Tags() []string {
 	return pod.tags
+}
+
+func (pod *Pod) GetLogDir() (string, error) {
+	if pod.logDir == "" {
+		logDir, err := tempdir.CreateTempDir(pod.Name)
+		if err != nil {
+			return "", err
+		}
+		pod.logDir = logDir
+	}
+	return pod.logDir, nil
 }
 
 func (pod *Pod) ValidateForTraining() error {

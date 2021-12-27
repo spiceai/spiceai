@@ -57,15 +57,13 @@ class Trainer:
         self.training_episodes = number_episodes
         self.not_learning_threshold = 3
 
-        self.log_dir = self.training_data_dir / "log"
-
         self.model_data_shape = data_manager.get_shape()
         self.agent: SpiceAIAgent = get_agent(
             algorithm,
             self.model_data_shape,
             self.action_size,
             self.training_loggers,
-            self.log_dir,
+            self.training_data_dir,
         )
 
         self.custom_training_goal_met = False
