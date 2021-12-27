@@ -33,6 +33,7 @@ Create an endgame issue with the following content:
 - [ ] Reddit announcement to [reddit.com/r/spiceai](https://reddit.com/r/spiceai)
 - [ ] Discord announcement to [#announcements](https://discord.gg/zv8ahzZVpf)
 - [ ] For major releases, [blog.spiceai.org](https://blog.spiceai.org) announcement
+- [ ] Update `version.txt` to the next release version.
 
 ## PR reference:
 ```
