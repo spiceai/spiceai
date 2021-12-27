@@ -9,6 +9,7 @@ Keras-Preprocessing, 1.1.2, MIT License, Keras Team, https://github.com/keras-te
 Markdown, 3.3.4, BSD License, Manfred Stienstra, Yuri takhteyev and Waylan limberg, https://Python-Markdown.github.io/
 Werkzeug, 2.0.1, BSD License, Armin Ronacher, https://palletsprojects.com/p/werkzeug/
 absl-py, 0.13.0, Apache Software License, The Abseil Authors, https://github.com/abseil/abseil-py
+astroid, 2.7.3, GNU Lesser General Public License v2 (LGPLv2), Python Code Quality Authority, https://github.com/PyCQA/astroid
 astunparse, 1.6.3, BSD License, UNKNOWN, https://github.com/simonpercivall/astunparse
 attrs, 21.2.0, MIT License, Hynek Schlawack, https://www.attrs.org/
 cached-property, 1.5.2, BSD License, Daniel Greenfeld, https://github.com/pydanny/cached-property
@@ -16,6 +17,9 @@ cachetools, 4.2.2, MIT License, Thomas Kemmer, https://github.com/tkem/cachetool
 certifi, 2021.5.30, Mozilla Public License 2.0 (MPL 2.0), Kenneth Reitz, https://certifiio.readthedocs.io/en/latest/
 charset-normalizer, 2.0.4, MIT License, Ahmed TAHRI @Ousret, https://github.com/ousret/charset_normalizer
 clang, 5.0, University of Illinois/NCSA Open Source License, LLVM team, http://clang.llvm.org/
+cloudpickle, 2.0.0, BSD License, Cloudpipe, https://github.com/cloudpipe/cloudpickle
+decorator, 5.1.0, BSD License, Michele Simionato, https://github.com/micheles/decorator
+dm-tree, 0.1.6, Apache Software License, DeepMind, https://github.com/deepmind/tree
 flatbuffers, 1.12, Apache Software License, FlatBuffers Contributors, https://google.github.io/flatbuffers/
 gast, 0.4.0, BSD License, serge-sans-paille, https://github.com/serge-sans-paille/gast/
 google-auth, 1.35.0, Apache Software License, Google Cloud Platform, https://github.com/googleapis/google-auth-library-python
@@ -26,23 +30,28 @@ grpcio-tools, 1.34.1, Apache Software License, The gRPC Authors, https://grpc.io
 h5py, 3.1.0, BSD License, Andrew Collette, http://www.h5py.org
 humanize, 3.11.0, MIT License, Jason Moiron, https://github.com/jmoiron/humanize
 idna, 3.2, BSD License, Kim Davies, https://github.com/kjd/idna
-importlib-metadata, 4.8.2, Apache Software License, Jason R. Coombs, https://github.com/python/importlib_metadata
+importlib-metadata, 4.10.0, Apache Software License, Jason R. Coombs, https://github.com/python/importlib_metadata
 iniconfig, 1.1.1, MIT License, Ronny Pfannschmidt, Holger Krekel, http://github.com/RonnyPfannschmidt/iniconfig
+isort, 5.10.1, MIT License, Timothy Crosley, https://pycqa.github.io/isort/
 jupyter-client, 6.1.12, BSD License, Jupyter Development Team, https://jupyter.org
 jupyter-core, 4.7.1, BSD License, Jupyter Development Team, https://jupyter.org
 keras, 2.7.0, Apache Software License, Keras team, https://keras.io/
+lazy-object-proxy, 1.7.1, BSD License, Ionel Cristian Mărieș, https://github.com/ionelmc/python-lazy-object-proxy
 libclang, 12.0.0, Apache Software License, Tao He, https://github.com/sighingnow/libclang
+mccabe, 0.6.1, MIT License, Ian Cordasco, https://github.com/pycqa/mccabe
 numpy, 1.19.5, BSD, Travis E. Oliphant et al., https://www.numpy.org
 oauthlib, 3.1.1, BSD License, The OAuthlib Community, https://github.com/oauthlib/oauthlib
 opt-einsum, 3.3.0, MIT, Daniel Smith, https://github.com/dgasmith/opt_einsum
 packaging, 21.0, Apache Software License; BSD License, Donald Stufft and individual contributors, https://github.com/pypa/packaging
 pandas, 1.3.2, BSD License, The Pandas Development Team, https://pandas.pydata.org
+platformdirs, 2.4.1, MIT License, UNKNOWN, https://github.com/platformdirs/platformdirs
 pluggy, 0.13.1, MIT License, Holger Krekel, https://github.com/pytest-dev/pluggy
 protobuf, 3.17.3, 3-Clause BSD License, UNKNOWN, https://developers.google.com/protocol-buffers/
 psutil, 5.8.0, BSD License, Giampaolo Rodola, https://github.com/giampaolo/psutil
 py, 1.10.0, MIT License, holger krekel, Ronny Pfannschmidt, Benjamin Peterson and others, https://py.readthedocs.io/
 pyasn1, 0.4.8, BSD License, Ilya Etingof, https://github.com/etingof/pyasn1
 pyasn1-modules, 0.2.8, BSD License, Ilya Etingof, https://github.com/etingof/pyasn1-modules
+pylint, 2.10.2, GNU General Public License v2 (GPLv2), Python Code Quality Authority, https://github.com/PyCQA/pylint
 pyparsing, 2.4.7, MIT License, Paul McGuire, https://github.com/pyparsing/pyparsing/
 pytest, 6.2.3, MIT License, Holger Krekel, Bruno Oliveira, Ronny Pfannschmidt, Floris Bruynooghe, Brianna Laugher, Florian Bruhin and others, https://docs.pytest.org/en/latest/
 pytest-timeout, 1.4.2, DFSG approved; MIT License, Floris Bruynooghe, http://github.com/pytest-dev/pytest-timeout/
@@ -59,10 +68,12 @@ tensorboard-plugin-wit, 1.8.0, Apache 2.0, Google Inc., https://whatif-tool.dev
 tensorflow, 2.7.0, Apache Software License, Google Inc., https://www.tensorflow.org/
 tensorflow-estimator, 2.7.0, Apache Software License, Google Inc., https://www.tensorflow.org/
 tensorflow-io-gcs-filesystem, 0.21.0, Apache Software License, Google Inc., https://github.com/tensorflow/io
+tensorflow-probability, 0.15.0, Apache Software License, Google LLC, http://github.com/tensorflow/probability
 termcolor, 1.1.0, MIT License, Konstantin Lepa, http://pypi.python.org/pypi/termcolor
 toml, 0.10.2, MIT License, William Pearson, https://github.com/uiri/toml
 tornado, 6.1, Apache Software License, Facebook, http://www.tornadoweb.org/
 traitlets, 5.1.0, BSD License, IPython Development Team, https://github.com/ipython/traitlets
+typed-ast, 1.4.3, Apache License 2.0, David Fisher, https://github.com/python/typed_ast
 typing-extensions, 3.7.4.3, Python Software Foundation License, Guido van Rossum, Jukka Lehtosalo, Lukasz Langa, Michael Lee, https://github.com/python/typing/blob/master/typing_extensions/README.rst
 urllib3, 1.26.6, MIT License, Andrey Petrov, https://urllib3.readthedocs.io/
 wrapt, 1.12.1, BSD License, Graham Dumpleton, https://github.com/GrahamDumpleton/wrapt
@@ -70,140 +81,140 @@ zipp, 3.6.0, MIT License, Jason R. Coombs, https://github.com/jaraco/zipp
 
 ## Go Modules
 
-github.com/google/go-querystring/query, https://github.com/google/go-querystring/blob/master/query/LICENSE, BSD-3-Clause
-go.uber.org/atomic, Unknown, MIT
-github.com/andybalholm/brotli, https://github.com/andybalholm/brotli/blob/master/LICENSE, MIT
-github.com/spf13/cast, https://github.com/spf13/cast/blob/master/LICENSE, MIT
-github.com/pelletier/go-toml, https://github.com/pelletier/go-toml/blob/master/LICENSE, Apache-2.0
-github.com/dghubble/sling, https://github.com/dghubble/sling/blob/master/LICENSE, MIT
-golang.org/x/xerrors, Unknown, BSD-3-Clause
-github.com/opentracing/opentracing-go, https://github.com/opentracing/opentracing-go/blob/master/LICENSE, Apache-2.0
-github.com/klauspost/compress, https://github.com/klauspost/compress/blob/master/LICENSE, Apache-2.0
-github.com/spf13/viper, https://github.com/spf13/viper/blob/master/LICENSE, MIT
-golang.org/x/sync/errgroup, Unknown, BSD-3-Clause
 github.com/cenkalti/backoff/v4, https://github.com/cenkalti/backoff/blob/master/v4/LICENSE, MIT
-github.com/andreyvit/diff, https://github.com/andreyvit/diff/blob/master/LICENSE, MIT
-github.com/uber/jaeger-lib/metrics, https://github.com/uber/jaeger-lib/blob/master/metrics/LICENSE, Apache-2.0
-golang.org/x/net, Unknown, BSD-3-Clause
-github.com/olekukonko/tablewriter, https://github.com/olekukonko/tablewriter/blob/master/LICENSE.md, MIT
-github.com/mattn/go-runewidth, https://github.com/mattn/go-runewidth/blob/master/LICENSE, MIT
-github.com/influxdata/flux, https://github.com/influxdata/flux/blob/master/LICENSE, MIT
-github.com/benbjohnson/immutable, https://github.com/benbjohnson/immutable/blob/master/LICENSE, MIT
-github.com/google/go-cmp/cmp, https://github.com/google/go-cmp/blob/master/cmp/LICENSE, BSD-3-Clause
-github.com/apache/arrow/go/arrow/internal/cpu, https://github.com/apache/arrow/blob/master/go/arrow/internal/cpu/README.md, Apache-2.0
-github.com/hashicorp/go-retryablehttp, https://github.com/hashicorp/go-retryablehttp/blob/master/LICENSE, MPL-2.0
-github.com/spf13/pflag, https://github.com/spf13/pflag/blob/master/LICENSE, BSD-3-Clause
-github.com/dghubble/oauth1, https://github.com/dghubble/oauth1/blob/master/LICENSE, MIT
-github.com/cespare/xxhash/v2, https://github.com/cespare/xxhash/blob/master/v2/LICENSE.txt, MIT
-go.uber.org/multierr, Unknown, MIT
-github.com/fsnotify/fsnotify, https://github.com/fsnotify/fsnotify/blob/master/LICENSE, BSD-3-Clause
-github.com/magiconair/properties, https://github.com/magiconair/properties/blob/master/LICENSE.md, BSD-2-Clause
-golang.org/x/text, Unknown, BSD-3-Clause
-github.com/hashicorp/hcl, https://github.com/hashicorp/hcl/blob/master/LICENSE, MPL-2.0
-github.com/rivo/uniseg, https://github.com/rivo/uniseg/blob/master/LICENSE.txt, MIT
-github.com/apache/arrow/go/arrow, https://github.com/apache/arrow/blob/master/go/arrow/LICENSE.txt, Apache-2.0
-github.com/spiceai/spiceai, Unknown, Apache-2.0
-github.com/spf13/cobra, https://github.com/spf13/cobra/blob/master/LICENSE.txt, Apache-2.0
-github.com/gocarina/gocsv, https://github.com/gocarina/gocsv/blob/master/LICENSE, MIT
-github.com/fasthttp/router, https://github.com/fasthttp/router/blob/master/LICENSE, BSD-3-Clause
-github.com/hashicorp/go-cleanhttp, https://github.com/hashicorp/go-cleanhttp/blob/master/LICENSE, MPL-2.0
-github.com/uber/jaeger-client-go, https://github.com/uber/jaeger-client-go/blob/master/LICENSE, Apache-2.0
-github.com/mitchellh/mapstructure, https://github.com/mitchellh/mapstructure/blob/master/LICENSE, MIT
-google.golang.org/protobuf, Unknown, BSD-3-Clause
-github.com/deepmap/oapi-codegen/pkg, https://github.com/deepmap/oapi-codegen/blob/master/pkg/LICENSE, Apache-2.0
-github.com/pkg/errors, https://github.com/pkg/errors/blob/master/LICENSE, BSD-2-Clause
-github.com/influxdata/line-protocol, https://github.com/influxdata/line-protocol/blob/master/LICENSE, MIT
-github.com/dghubble/go-twitter/twitter, https://github.com/dghubble/go-twitter/blob/master/twitter/LICENSE, MIT
 github.com/google/flatbuffers/go, https://github.com/google/flatbuffers/blob/master/go/LICENSE.txt, Apache-2.0
-google.golang.org/genproto/googleapis/rpc/status, Unknown, Apache-2.0
-golang.org/x/mod/semver, Unknown, BSD-3-Clause
-github.com/spiceai/data-components-contrib, https://github.com/spiceai/data-components-contrib/blob/master/LICENSE, MIT
-github.com/influxdata/influxdb-client-go, https://github.com/influxdata/influxdb-client-go/blob/master/LICENSE, MIT
-github.com/gofrs/uuid, https://github.com/gofrs/uuid/blob/master/LICENSE, MIT
-gopkg.in/natefinch/lumberjack.v2, Unknown, MIT
-github.com/golang/protobuf, https://github.com/golang/protobuf/blob/master/LICENSE, BSD-3-Clause
-golang.org/x/sys, Unknown, BSD-3-Clause
-github.com/spf13/afero, https://github.com/spf13/afero/blob/master/LICENSE.txt, Apache-2.0
-github.com/sergi/go-diff/diffmatchpatch, https://github.com/sergi/go-diff/blob/master/diffmatchpatch/LICENSE, MIT
-github.com/valyala/fasthttp, https://github.com/valyala/fasthttp/blob/master/LICENSE, MIT
-github.com/logrusorgru/aurora, https://github.com/logrusorgru/aurora/blob/master/LICENSE, Unlicense
-gopkg.in/yaml.v2, Unknown, Apache-2.0
-github.com/subosito/gotenv, https://github.com/subosito/gotenv/blob/master/LICENSE, MIT
-gopkg.in/ini.v1, Unknown, Apache-2.0
-github.com/gorilla/websocket, https://github.com/gorilla/websocket/blob/master/LICENSE, BSD-2-Clause
-github.com/valyala/bytebufferpool, https://github.com/valyala/bytebufferpool/blob/master/LICENSE, MIT
-github.com/spf13/jwalterweatherman, https://github.com/spf13/jwalterweatherman/blob/master/LICENSE, MIT
-github.com/influxdata/flux/internal/zoneinfo, https://github.com/influxdata/flux/blob/master/internal/zoneinfo/LICENSE, BSD-3-Clause
-go.uber.org/zap, Unknown, MIT
-google.golang.org/grpc, Unknown, Apache-2.0
-github.com/savsgio/gotils, https://github.com/savsgio/gotils/blob/master/LICENSE, Apache-2.0
-github.com/apache/arrow/go/arrow/internal/cpu, https://github.com/apache/arrow/blob/master/go/arrow/internal/cpu/README.md, Apache-2.0
-github.com/influxdata/flux/internal/zoneinfo, https://github.com/influxdata/flux/blob/master/internal/zoneinfo/LICENSE, BSD-3-Clause
-google.golang.org/grpc, Unknown, Apache-2.0
-github.com/andybalholm/brotli, https://github.com/andybalholm/brotli/blob/master/LICENSE, MIT
-github.com/hashicorp/go-cleanhttp, https://github.com/hashicorp/go-cleanhttp/blob/master/LICENSE, MPL-2.0
-github.com/magiconair/properties, https://github.com/magiconair/properties/blob/master/LICENSE.md, BSD-2-Clause
-google.golang.org/protobuf, Unknown, BSD-3-Clause
-github.com/gofrs/uuid, https://github.com/gofrs/uuid/blob/master/LICENSE, MIT
-github.com/uber/jaeger-lib/metrics, https://github.com/uber/jaeger-lib/blob/master/metrics/LICENSE, Apache-2.0
-github.com/spf13/pflag, https://github.com/spf13/pflag/blob/master/LICENSE, BSD-3-Clause
+github.com/influxdata/line-protocol, https://github.com/influxdata/line-protocol/blob/master/LICENSE, MIT
+github.com/spf13/viper, https://github.com/spf13/viper/blob/master/LICENSE, MIT
 golang.org/x/sys, Unknown, BSD-3-Clause
 github.com/spf13/jwalterweatherman, https://github.com/spf13/jwalterweatherman/blob/master/LICENSE, MIT
 golang.org/x/sync/errgroup, Unknown, BSD-3-Clause
-github.com/influxdata/flux, https://github.com/influxdata/flux/blob/master/LICENSE, MIT
-golang.org/x/xerrors, Unknown, BSD-3-Clause
-github.com/google/go-cmp/cmp, https://github.com/google/go-cmp/blob/master/cmp/LICENSE, BSD-3-Clause
-golang.org/x/text, Unknown, BSD-3-Clause
-github.com/deepmap/oapi-codegen/pkg, https://github.com/deepmap/oapi-codegen/blob/master/pkg/LICENSE, Apache-2.0
-github.com/valyala/bytebufferpool, https://github.com/valyala/bytebufferpool/blob/master/LICENSE, MIT
-go.uber.org/atomic, Unknown, MIT
-github.com/dghubble/oauth1, https://github.com/dghubble/oauth1/blob/master/LICENSE, MIT
-github.com/andreyvit/diff, https://github.com/andreyvit/diff/blob/master/LICENSE, MIT
-github.com/spiceai/spiceai, Unknown, Apache-2.0
-github.com/fsnotify/fsnotify, https://github.com/fsnotify/fsnotify/blob/master/LICENSE, BSD-3-Clause
-golang.org/x/mod/semver, Unknown, BSD-3-Clause
 github.com/influxdata/influxdb-client-go, https://github.com/influxdata/influxdb-client-go/blob/master/LICENSE, MIT
-github.com/benbjohnson/immutable, https://github.com/benbjohnson/immutable/blob/master/LICENSE, MIT
-github.com/opentracing/opentracing-go, https://github.com/opentracing/opentracing-go/blob/master/LICENSE, Apache-2.0
-google.golang.org/genproto/googleapis/rpc/status, Unknown, Apache-2.0
+github.com/dghubble/oauth1, https://github.com/dghubble/oauth1/blob/master/LICENSE, MIT
+gopkg.in/natefinch/lumberjack.v2, Unknown, MIT
+github.com/spiceai/spiceai, Unknown, Apache-2.0
+github.com/golang/protobuf, https://github.com/golang/protobuf/blob/master/LICENSE, BSD-3-Clause
+github.com/subosito/gotenv, https://github.com/subosito/gotenv/blob/master/LICENSE, MIT
+github.com/andybalholm/brotli, https://github.com/andybalholm/brotli/blob/master/LICENSE, MIT
+golang.org/x/text, Unknown, BSD-3-Clause
+github.com/sergi/go-diff/diffmatchpatch, https://github.com/sergi/go-diff/blob/master/diffmatchpatch/LICENSE, MIT
+github.com/spf13/afero, https://github.com/spf13/afero/blob/master/LICENSE.txt, Apache-2.0
+github.com/gocarina/gocsv, https://github.com/gocarina/gocsv/blob/master/LICENSE, MIT
+github.com/savsgio/gotils, https://github.com/savsgio/gotils/blob/master/LICENSE, Apache-2.0
 github.com/klauspost/compress, https://github.com/klauspost/compress/blob/master/LICENSE, Apache-2.0
+github.com/logrusorgru/aurora, https://github.com/logrusorgru/aurora/blob/master/LICENSE, Unlicense
+github.com/dghubble/go-twitter/twitter, https://github.com/dghubble/go-twitter/blob/master/twitter/LICENSE, MIT
+github.com/benbjohnson/immutable, https://github.com/benbjohnson/immutable/blob/master/LICENSE, MIT
+github.com/gofrs/uuid, https://github.com/gofrs/uuid/blob/master/LICENSE, MIT
+github.com/cespare/xxhash/v2, https://github.com/cespare/xxhash/blob/master/v2/LICENSE.txt, MIT
+google.golang.org/grpc, Unknown, Apache-2.0
+gopkg.in/yaml.v2, Unknown, Apache-2.0
+github.com/spf13/cast, https://github.com/spf13/cast/blob/master/LICENSE, MIT
+golang.org/x/mod/semver, Unknown, BSD-3-Clause
+github.com/deepmap/oapi-codegen/pkg, https://github.com/deepmap/oapi-codegen/blob/master/pkg/LICENSE, Apache-2.0
+github.com/uber/jaeger-client-go, https://github.com/uber/jaeger-client-go/blob/master/LICENSE, Apache-2.0
+github.com/hashicorp/go-retryablehttp, https://github.com/hashicorp/go-retryablehttp/blob/master/LICENSE, MPL-2.0
+github.com/hashicorp/go-cleanhttp, https://github.com/hashicorp/go-cleanhttp/blob/master/LICENSE, MPL-2.0
+github.com/spf13/cobra, https://github.com/spf13/cobra/blob/master/LICENSE.txt, Apache-2.0
+github.com/apache/arrow/go/arrow, https://github.com/apache/arrow/blob/master/go/arrow/LICENSE.txt, Apache-2.0
+go.uber.org/zap, Unknown, MIT
+github.com/influxdata/flux, https://github.com/influxdata/flux/blob/master/LICENSE, MIT
+github.com/mitchellh/mapstructure, https://github.com/mitchellh/mapstructure/blob/master/LICENSE, MIT
+github.com/dghubble/sling, https://github.com/dghubble/sling/blob/master/LICENSE, MIT
+github.com/influxdata/flux/internal/zoneinfo, https://github.com/influxdata/flux/blob/master/internal/zoneinfo/LICENSE, BSD-3-Clause
+github.com/spf13/pflag, https://github.com/spf13/pflag/blob/master/LICENSE, BSD-3-Clause
+github.com/pelletier/go-toml, https://github.com/pelletier/go-toml/blob/master/LICENSE, Apache-2.0
+github.com/rivo/uniseg, https://github.com/rivo/uniseg/blob/master/LICENSE.txt, MIT
+github.com/pkg/errors, https://github.com/pkg/errors/blob/master/LICENSE, BSD-2-Clause
+github.com/google/go-cmp/cmp, https://github.com/google/go-cmp/blob/master/cmp/LICENSE, BSD-3-Clause
+github.com/fsnotify/fsnotify, https://github.com/fsnotify/fsnotify/blob/master/LICENSE, BSD-3-Clause
+github.com/hashicorp/hcl, https://github.com/hashicorp/hcl/blob/master/LICENSE, MPL-2.0
+github.com/olekukonko/tablewriter, https://github.com/olekukonko/tablewriter/blob/master/LICENSE.md, MIT
+github.com/valyala/bytebufferpool, https://github.com/valyala/bytebufferpool/blob/master/LICENSE, MIT
+github.com/valyala/fasthttp, https://github.com/valyala/fasthttp/blob/master/LICENSE, MIT
+github.com/magiconair/properties, https://github.com/magiconair/properties/blob/master/LICENSE.md, BSD-2-Clause
+github.com/andreyvit/diff, https://github.com/andreyvit/diff/blob/master/LICENSE, MIT
+go.uber.org/atomic, Unknown, MIT
+golang.org/x/net, Unknown, BSD-3-Clause
+github.com/fasthttp/router, https://github.com/fasthttp/router/blob/master/LICENSE, BSD-3-Clause
+gopkg.in/ini.v1, Unknown, Apache-2.0
+github.com/gorilla/websocket, https://github.com/gorilla/websocket/blob/master/LICENSE, BSD-2-Clause
+github.com/google/go-querystring/query, https://github.com/google/go-querystring/blob/master/query/LICENSE, BSD-3-Clause
+golang.org/x/xerrors, Unknown, BSD-3-Clause
+github.com/opentracing/opentracing-go, https://github.com/opentracing/opentracing-go/blob/master/LICENSE, Apache-2.0
+github.com/uber/jaeger-lib/metrics, https://github.com/uber/jaeger-lib/blob/master/metrics/LICENSE, Apache-2.0
+google.golang.org/protobuf, Unknown, BSD-3-Clause
+go.uber.org/multierr, Unknown, MIT
+github.com/spiceai/data-components-contrib, https://github.com/spiceai/data-components-contrib/blob/master/LICENSE, MIT
+github.com/apache/arrow/go/arrow/internal/cpu, https://github.com/apache/arrow/blob/master/go/arrow/internal/cpu/README.md, Apache-2.0
+google.golang.org/genproto/googleapis/rpc/status, Unknown, Apache-2.0
+github.com/mattn/go-runewidth, https://github.com/mattn/go-runewidth/blob/master/LICENSE, MIT
+golang.org/x/xerrors, Unknown, BSD-3-Clause
+github.com/mitchellh/mapstructure, https://github.com/mitchellh/mapstructure/blob/master/LICENSE, MIT
+gopkg.in/natefinch/lumberjack.v2, Unknown, MIT
+github.com/influxdata/influxdb-client-go, https://github.com/influxdata/influxdb-client-go/blob/master/LICENSE, MIT
+github.com/cespare/xxhash/v2, https://github.com/cespare/xxhash/blob/master/v2/LICENSE.txt, MIT
+github.com/mattn/go-runewidth, https://github.com/mattn/go-runewidth/blob/master/LICENSE, MIT
+golang.org/x/sync/errgroup, Unknown, BSD-3-Clause
+github.com/google/go-querystring/query, https://github.com/google/go-querystring/blob/master/query/LICENSE, BSD-3-Clause
+github.com/dghubble/oauth1, https://github.com/dghubble/oauth1/blob/master/LICENSE, MIT
+github.com/uber/jaeger-client-go, https://github.com/uber/jaeger-client-go/blob/master/LICENSE, Apache-2.0
+gopkg.in/yaml.v2, Unknown, Apache-2.0
+go.uber.org/zap, Unknown, MIT
+github.com/logrusorgru/aurora, https://github.com/logrusorgru/aurora/blob/master/LICENSE, Unlicense
+github.com/google/go-cmp/cmp, https://github.com/google/go-cmp/blob/master/cmp/LICENSE, BSD-3-Clause
+github.com/pkg/errors, https://github.com/pkg/errors/blob/master/LICENSE, BSD-2-Clause
+github.com/dghubble/sling, https://github.com/dghubble/sling/blob/master/LICENSE, MIT
+golang.org/x/sys, Unknown, BSD-3-Clause
 github.com/spf13/afero, https://github.com/spf13/afero/blob/master/LICENSE.txt, Apache-2.0
 github.com/spf13/cast, https://github.com/spf13/cast/blob/master/LICENSE, MIT
-github.com/olekukonko/tablewriter, https://github.com/olekukonko/tablewriter/blob/master/LICENSE.md, MIT
-github.com/spiceai/data-components-contrib, https://github.com/spiceai/data-components-contrib/blob/master/LICENSE, MIT
-github.com/mitchellh/mapstructure, https://github.com/mitchellh/mapstructure/blob/master/LICENSE, MIT
-github.com/hashicorp/hcl, https://github.com/hashicorp/hcl/blob/master/LICENSE, MPL-2.0
-github.com/uber/jaeger-client-go, https://github.com/uber/jaeger-client-go/blob/master/LICENSE, Apache-2.0
+github.com/gocarina/gocsv, https://github.com/gocarina/gocsv/blob/master/LICENSE, MIT
+github.com/google/flatbuffers/go, https://github.com/google/flatbuffers/blob/master/go/LICENSE.txt, Apache-2.0
 github.com/golang/protobuf, https://github.com/golang/protobuf/blob/master/LICENSE, BSD-3-Clause
 github.com/valyala/fasthttp, https://github.com/valyala/fasthttp/blob/master/LICENSE, MIT
-github.com/pelletier/go-toml, https://github.com/pelletier/go-toml/blob/master/LICENSE, Apache-2.0
-github.com/hashicorp/go-retryablehttp, https://github.com/hashicorp/go-retryablehttp/blob/master/LICENSE, MPL-2.0
-gopkg.in/ini.v1, Unknown, Apache-2.0
-github.com/logrusorgru/aurora, https://github.com/logrusorgru/aurora/blob/master/LICENSE, Unlicense
-github.com/gorilla/websocket, https://github.com/gorilla/websocket/blob/master/LICENSE, BSD-2-Clause
+github.com/andybalholm/brotli, https://github.com/andybalholm/brotli/blob/master/LICENSE, MIT
+github.com/klauspost/compress, https://github.com/klauspost/compress/blob/master/LICENSE, Apache-2.0
+github.com/spf13/jwalterweatherman, https://github.com/spf13/jwalterweatherman/blob/master/LICENSE, MIT
 github.com/cenkalti/backoff/v4, https://github.com/cenkalti/backoff/blob/master/v4/LICENSE, MIT
-github.com/sergi/go-diff/diffmatchpatch, https://github.com/sergi/go-diff/blob/master/diffmatchpatch/LICENSE, MIT
-github.com/spf13/viper, https://github.com/spf13/viper/blob/master/LICENSE, MIT
-gopkg.in/natefinch/lumberjack.v2, Unknown, MIT
-github.com/cespare/xxhash/v2, https://github.com/cespare/xxhash/blob/master/v2/LICENSE.txt, MIT
+google.golang.org/grpc, Unknown, Apache-2.0
 github.com/savsgio/gotils, https://github.com/savsgio/gotils/blob/master/LICENSE, Apache-2.0
-gopkg.in/yaml.v2, Unknown, Apache-2.0
-github.com/gocarina/gocsv, https://github.com/gocarina/gocsv/blob/master/LICENSE, MIT
-github.com/rivo/uniseg, https://github.com/rivo/uniseg/blob/master/LICENSE.txt, MIT
-github.com/google/go-querystring/query, https://github.com/google/go-querystring/blob/master/query/LICENSE, BSD-3-Clause
-github.com/google/flatbuffers/go, https://github.com/google/flatbuffers/blob/master/go/LICENSE.txt, Apache-2.0
-golang.org/x/net, Unknown, BSD-3-Clause
-github.com/subosito/gotenv, https://github.com/subosito/gotenv/blob/master/LICENSE, MIT
-github.com/mattn/go-runewidth, https://github.com/mattn/go-runewidth/blob/master/LICENSE, MIT
-go.uber.org/multierr, Unknown, MIT
-github.com/pkg/errors, https://github.com/pkg/errors/blob/master/LICENSE, BSD-2-Clause
-github.com/apache/arrow/go/arrow, https://github.com/apache/arrow/blob/master/go/arrow/LICENSE.txt, Apache-2.0
-github.com/spf13/cobra, https://github.com/spf13/cobra/blob/master/LICENSE.txt, Apache-2.0
+github.com/opentracing/opentracing-go, https://github.com/opentracing/opentracing-go/blob/master/LICENSE, Apache-2.0
 github.com/influxdata/line-protocol, https://github.com/influxdata/line-protocol/blob/master/LICENSE, MIT
-go.uber.org/zap, Unknown, MIT
+github.com/deepmap/oapi-codegen/pkg, https://github.com/deepmap/oapi-codegen/blob/master/pkg/LICENSE, Apache-2.0
+github.com/influxdata/flux, https://github.com/influxdata/flux/blob/master/LICENSE, MIT
+github.com/benbjohnson/immutable, https://github.com/benbjohnson/immutable/blob/master/LICENSE, MIT
+github.com/spiceai/spiceai, Unknown, Apache-2.0
+golang.org/x/mod/semver, Unknown, BSD-3-Clause
+github.com/spiceai/data-components-contrib, https://github.com/spiceai/data-components-contrib/blob/master/LICENSE, MIT
+github.com/andreyvit/diff, https://github.com/andreyvit/diff/blob/master/LICENSE, MIT
+gopkg.in/ini.v1, Unknown, Apache-2.0
+go.uber.org/atomic, Unknown, MIT
+golang.org/x/net, Unknown, BSD-3-Clause
+github.com/valyala/bytebufferpool, https://github.com/valyala/bytebufferpool/blob/master/LICENSE, MIT
+github.com/spf13/pflag, https://github.com/spf13/pflag/blob/master/LICENSE, BSD-3-Clause
+github.com/magiconair/properties, https://github.com/magiconair/properties/blob/master/LICENSE.md, BSD-2-Clause
+github.com/apache/arrow/go/arrow, https://github.com/apache/arrow/blob/master/go/arrow/LICENSE.txt, Apache-2.0
+github.com/sergi/go-diff/diffmatchpatch, https://github.com/sergi/go-diff/blob/master/diffmatchpatch/LICENSE, MIT
+github.com/apache/arrow/go/arrow/internal/cpu, https://github.com/apache/arrow/blob/master/go/arrow/internal/cpu/README.md, Apache-2.0
+github.com/hashicorp/hcl, https://github.com/hashicorp/hcl/blob/master/LICENSE, MPL-2.0
+github.com/pelletier/go-toml, https://github.com/pelletier/go-toml/blob/master/LICENSE, Apache-2.0
+github.com/olekukonko/tablewriter, https://github.com/olekukonko/tablewriter/blob/master/LICENSE.md, MIT
+google.golang.org/protobuf, Unknown, BSD-3-Clause
+github.com/hashicorp/go-cleanhttp, https://github.com/hashicorp/go-cleanhttp/blob/master/LICENSE, MPL-2.0
+github.com/fsnotify/fsnotify, https://github.com/fsnotify/fsnotify/blob/master/LICENSE, BSD-3-Clause
+golang.org/x/text, Unknown, BSD-3-Clause
+github.com/rivo/uniseg, https://github.com/rivo/uniseg/blob/master/LICENSE.txt, MIT
+github.com/gofrs/uuid, https://github.com/gofrs/uuid/blob/master/LICENSE, MIT
+github.com/influxdata/flux/internal/zoneinfo, https://github.com/influxdata/flux/blob/master/internal/zoneinfo/LICENSE, BSD-3-Clause
+github.com/spf13/cobra, https://github.com/spf13/cobra/blob/master/LICENSE.txt, Apache-2.0
+go.uber.org/multierr, Unknown, MIT
+github.com/gorilla/websocket, https://github.com/gorilla/websocket/blob/master/LICENSE, BSD-2-Clause
 github.com/dghubble/go-twitter/twitter, https://github.com/dghubble/go-twitter/blob/master/twitter/LICENSE, MIT
-github.com/dghubble/sling, https://github.com/dghubble/sling/blob/master/LICENSE, MIT
+github.com/subosito/gotenv, https://github.com/subosito/gotenv/blob/master/LICENSE, MIT
+google.golang.org/genproto/googleapis/rpc/status, Unknown, Apache-2.0
 github.com/fasthttp/router, https://github.com/fasthttp/router/blob/master/LICENSE, BSD-3-Clause
+github.com/hashicorp/go-retryablehttp, https://github.com/hashicorp/go-retryablehttp/blob/master/LICENSE, MPL-2.0
+github.com/spf13/viper, https://github.com/spf13/viper/blob/master/LICENSE, MIT
+github.com/uber/jaeger-lib/metrics, https://github.com/uber/jaeger-lib/blob/master/metrics/LICENSE, Apache-2.0
 
 ## Node Packages
 
@@ -215,12 +226,14 @@ module name, license, repository
 @babel/core@7.12.3, MIT, https://github.com/babel/babel
 @babel/core@7.16.0, MIT, https://github.com/babel/babel
 @babel/generator@7.16.0, MIT, https://github.com/babel/babel
+@babel/generator@7.16.5, MIT, https://github.com/babel/babel
 @babel/helper-annotate-as-pure@7.16.0, MIT, https://github.com/babel/babel
 @babel/helper-builder-binary-assignment-operator-visitor@7.16.0, MIT, https://github.com/babel/babel
 @babel/helper-compilation-targets@7.16.3, MIT, https://github.com/babel/babel
 @babel/helper-create-class-features-plugin@7.16.0, MIT, https://github.com/babel/babel
 @babel/helper-create-regexp-features-plugin@7.16.0, MIT, https://github.com/babel/babel
 @babel/helper-define-polyfill-provider@0.3.0, MIT, https://github.com/babel/babel-polyfills
+@babel/helper-environment-visitor@7.16.5, MIT, https://github.com/babel/babel
 @babel/helper-explode-assignable-expression@7.16.0, MIT, https://github.com/babel/babel
 @babel/helper-function-name@7.16.0, MIT, https://github.com/babel/babel
 @babel/helper-get-function-arity@7.16.0, MIT, https://github.com/babel/babel
@@ -241,6 +254,7 @@ module name, license, repository
 @babel/helpers@7.16.3, MIT, https://github.com/babel/babel
 @babel/highlight@7.16.0, MIT, https://github.com/babel/babel
 @babel/parser@7.16.4, MIT, https://github.com/babel/babel
+@babel/parser@7.16.6, MIT, https://github.com/babel/babel
 @babel/plugin-bugfix-safari-id-destructuring-collision-in-function-expression@7.16.2, MIT, https://github.com/babel/babel
 @babel/plugin-bugfix-v8-spread-parameters-in-optional-chaining@7.16.0, MIT, https://github.com/babel/babel
 @babel/plugin-proposal-async-generator-functions@7.16.4, MIT, https://github.com/babel/babel
@@ -337,6 +351,7 @@ module name, license, repository
 @babel/runtime@7.16.3, MIT, https://github.com/babel/babel
 @babel/template@7.16.0, MIT, https://github.com/babel/babel
 @babel/traverse@7.16.3, MIT, https://github.com/babel/babel
+@babel/traverse@7.16.5, MIT, https://github.com/babel/babel
 @babel/types@7.16.0, MIT, https://github.com/babel/babel
 @bcoe/v8-coverage@0.2.3, MIT, https://github.com/demurgos/v8-coverage
 @cnakazawa/watch@1.0.4, Apache-2.0, https://github.com/mikeal/watch
@@ -348,7 +363,7 @@ module name, license, repository
 @emotion/unitless@0.7.5, MIT, https://github.com/emotion-js/emotion/tree/master/packages/unitless
 @eslint/eslintrc@0.4.3, MIT, https://github.com/eslint/eslintrc
 @gar/promisify@1.1.2, MIT, https://github.com/wraithgar/gar-promisify
-@glideapps/glide-data-grid@3.0.4, MIT, https://github.com/glideapps/glide-data-grid
+@glideapps/glide-data-grid@3.2.1, MIT, https://github.com/glideapps/glide-data-grid
 @hapi/address@2.1.4, BSD-3-Clause, https://github.com/hapijs/address
 @hapi/bourne@1.3.2, BSD-3-Clause, https://github.com/hapijs/bourne
 @hapi/hoek@8.5.1, BSD-3-Clause, https://github.com/hapijs/hoek
@@ -564,7 +579,7 @@ babel-plugin-named-asset-import@0.3.7, MIT, https://github.com/facebook/create-r
 babel-plugin-polyfill-corejs2@0.3.0, MIT, https://github.com/babel/babel-polyfills
 babel-plugin-polyfill-corejs3@0.4.0, MIT, https://github.com/babel/babel-polyfills
 babel-plugin-polyfill-regenerator@0.3.0, MIT, https://github.com/babel/babel-polyfills
-babel-plugin-styled-components@1.13.3, MIT, https://github.com/styled-components/babel-plugin-styled-components
+babel-plugin-styled-components@2.0.2, MIT, https://github.com/styled-components/babel-plugin-styled-components
 babel-plugin-syntax-jsx@6.18.0, MIT, https://github.com/babel/babel/tree/master/packages/babel-plugin-syntax-jsx
 babel-plugin-syntax-object-rest-spread@6.13.0, MIT, https://github.com/babel/babel/tree/master/packages/babel-plugin-syntax-object-rest-spread
 babel-plugin-transform-object-rest-spread@6.26.0, MIT, https://github.com/babel/babel/tree/master/packages/babel-plugin-transform-object-rest-spread
@@ -611,7 +626,6 @@ builtin-modules@3.2.0, MIT, https://github.com/sindresorhus/builtin-modules
 builtin-status-codes@3.0.0, MIT, https://github.com/bendrucker/builtin-status-codes
 bytes@3.0.0, MIT, https://github.com/visionmedia/bytes.js
 bytes@3.1.0, MIT, https://github.com/visionmedia/bytes.js
-bytes@3.1.1, MIT, https://github.com/visionmedia/bytes.js
 cacache@12.0.4, ISC, https://github.com/npm/cacache
 cacache@15.3.0, ISC, https://github.com/npm/cacache
 cache-base@1.0.1, MIT, https://github.com/jonschlinkert/cache-base
@@ -661,11 +675,9 @@ color-name@1.1.3, MIT, https://github.com/dfcreative/color-name
 color-name@1.1.4, MIT, https://github.com/colorjs/color-name
 color-string@1.6.0, MIT, https://github.com/Qix-/color-string
 color@3.2.1, MIT, https://github.com/Qix-/color
-color@4.0.1, MIT, https://github.com/Qix-/color
 combined-stream@1.0.8, MIT, https://github.com/felixge/node-combined-stream
 commander@2.20.3, MIT, https://github.com/tj/commander.js
 commander@4.1.1, MIT, https://github.com/tj/commander.js
-commander@6.2.1, MIT, https://github.com/tj/commander.js
 common-tags@1.8.2, MIT, https://github.com/zspecza/common-tags
 commondir@1.0.1, MIT, https://github.com/substack/node-commondir
 component-emitter@1.3.0, MIT, https://github.com/component/emitter
@@ -687,7 +699,6 @@ cookie-signature@1.0.6, MIT, https://github.com/visionmedia/node-cookie-signatur
 cookie@0.4.0, MIT, https://github.com/jshttp/cookie
 copy-concurrently@1.0.5, ISC, https://github.com/npm/copy-concurrently
 copy-descriptor@0.1.1, MIT, https://github.com/jonschlinkert/copy-descriptor
-copy-to-clipboard@3.3.1, MIT, https://github.com/sudodoki/copy-to-clipboard
 core-js-compat@3.19.1, MIT, https://github.com/zloirock/core-js
 core-js-pure@3.19.1, MIT, https://github.com/zloirock/core-js
 core-js@2.6.12, MIT, https://github.com/zloirock/core-js
@@ -717,7 +728,6 @@ css-select@4.1.3, BSD-2-Clause, https://github.com/fb55/css-select
 css-to-react-native@3.0.0, MIT, https://github.com/styled-components/css-to-react-native
 css-tree@1.0.0-alpha.37, MIT, https://github.com/csstree/csstree
 css-tree@1.1.3, MIT, https://github.com/csstree/csstree
-css-unit-converter@1.1.2, MIT, https://github.com/andyjansson/css-unit-converter
 css-what@3.4.2, BSD-2-Clause, https://github.com/fb55/css-what
 css-what@5.1.0, BSD-2-Clause, https://github.com/fb55/css-what
 css.escape@1.5.1, MIT, https://github.com/mathiasbynens/CSS.escape
@@ -744,6 +754,7 @@ data-urls@2.0.0, MIT, https://github.com/jsdom/data-urls
 debug@2.6.9, MIT, https://github.com/visionmedia/debug
 debug@3.2.7, MIT, https://github.com/visionmedia/debug
 debug@4.3.2, MIT, https://github.com/visionmedia/debug
+debug@4.3.3, MIT, https://github.com/debug-js/debug
 decamelize@1.2.0, MIT, https://github.com/sindresorhus/decamelize
 decimal.js@10.3.1, MIT, https://github.com/MikeMcl/decimal.js
 decode-uri-component@0.2.0, MIT, https://github.com/SamVerschueren/decode-uri-component
@@ -908,7 +919,6 @@ fragment-cache@0.2.1, MIT, https://github.com/jonschlinkert/fragment-cache
 fresh@0.5.2, MIT, https://github.com/jshttp/fresh
 from2@2.3.0, MIT, https://github.com/hughsk/from2
 from@0.1.7, MIT, https://github.com/dominictarr/from
-fs-extra@10.0.0, MIT, https://github.com/jprichardson/node-fs-extra
 fs-extra@7.0.1, MIT, https://github.com/jprichardson/node-fs-extra
 fs-extra@8.1.0, MIT, https://github.com/jprichardson/node-fs-extra
 fs-extra@9.1.0, MIT, https://github.com/jprichardson/node-fs-extra
@@ -971,7 +981,6 @@ html-encoding-sniffer@2.0.1, MIT, https://github.com/jsdom/html-encoding-sniffer
 html-entities@1.4.0, MIT, https://github.com/mdevils/node-html-entities
 html-escaper@2.0.2, MIT, https://github.com/WebReflection/html-escaper
 html-minifier-terser@5.1.1, MIT, https://github.com/DanielRuf/html-minifier-terser
-html-tags@3.1.0, MIT, https://github.com/sindresorhus/html-tags
 html-webpack-plugin@4.5.0, MIT, https://github.com/jantimon/html-webpack-plugin
 htmlparser2@6.1.0, MIT, https://github.com/fb55/htmlparser2
 http-deceiver@1.2.7, MIT, https://github.com/indutny/http-deceiver
@@ -1167,7 +1176,6 @@ lodash.merge@4.6.2, MIT, https://github.com/lodash/lodash
 lodash.template@4.5.0, MIT, https://github.com/lodash/lodash
 lodash.templatesettings@4.2.0, MIT, https://github.com/lodash/lodash
 lodash.throttle@4.1.1, MIT, https://github.com/lodash/lodash
-lodash.topath@4.5.2, MIT, https://github.com/lodash/lodash
 lodash.truncate@4.4.2, MIT, https://github.com/lodash/lodash
 lodash.uniq@4.5.0, MIT, https://github.com/lodash/lodash
 lodash@4.17.21, MIT, https://github.com/lodash/lodash
@@ -1221,7 +1229,6 @@ mississippi@3.0.0, BSD-2-Clause, https://github.com/maxogden/mississippi
 mixin-deep@1.3.2, MIT, https://github.com/jonschlinkert/mixin-deep
 mkdirp@0.5.5, MIT, https://github.com/substack/node-mkdirp
 mkdirp@1.0.4, MIT, https://github.com/isaacs/node-mkdirp
-modern-normalize@1.1.0, MIT, https://github.com/sindresorhus/modern-normalize
 move-concurrently@1.0.1, ISC, https://github.com/npm/move-concurrently
 ms@2.0.0, MIT, https://github.com/zeit/ms
 ms@2.1.1, MIT, https://github.com/zeit/ms
@@ -1239,7 +1246,6 @@ neo-async@2.6.2, MIT, https://github.com/suguru03/neo-async
 next-tick@1.0.0, MIT, https://github.com/medikoo/next-tick
 nice-try@1.0.5, MIT, https://github.com/electerious/nice-try
 no-case@3.0.4, MIT, https://github.com/blakeembrey/change-case
-node-emoji@1.11.0, MIT, https://github.com/omnidan/node-emoji
 node-forge@0.10.0, (BSD-3-Clause OR GPL-2.0), https://github.com/digitalbazaar/forge
 node-int64@0.4.0, MIT, https://github.com/broofa/node-int64
 node-libs-browser@2.2.1, MIT, https://github.com/webpack/node-libs-browser
@@ -1413,14 +1419,17 @@ postcss-selector-not@4.0.1, MIT, https://github.com/postcss/postcss-selector-not
 postcss-selector-parser@3.1.2, MIT, https://github.com/postcss/postcss-selector-parser
 postcss-selector-parser@5.0.0, MIT, https://github.com/postcss/postcss-selector-parser
 postcss-selector-parser@6.0.6, MIT, https://github.com/postcss/postcss-selector-parser
+postcss-selector-parser@6.0.7, MIT, https://github.com/postcss/postcss-selector-parser
 postcss-svgo@4.0.3, MIT, https://github.com/cssnano/cssnano
 postcss-unique-selectors@4.0.1, MIT, https://github.com/cssnano/cssnano
 postcss-value-parser@3.3.1, MIT, https://github.com/TrySound/postcss-value-parser
 postcss-value-parser@4.1.0, MIT, https://github.com/TrySound/postcss-value-parser
+postcss-value-parser@4.2.0, MIT, https://github.com/TrySound/postcss-value-parser
 postcss-values-parser@2.0.1, MIT, https://github.com/lesshint/postcss-values-parser
 postcss@7.0.36, MIT, https://github.com/postcss/postcss
 postcss@7.0.39, MIT, https://github.com/postcss/postcss
 postcss@8.3.11, MIT, https://github.com/postcss/postcss
+postcss@8.4.5, MIT, https://github.com/postcss/postcss
 prelude-ls@1.1.2, MIT, https://github.com/gkz/prelude-ls
 prelude-ls@1.2.1, MIT, https://github.com/gkz/prelude-ls
 prepend-http@1.0.4, MIT, https://github.com/sindresorhus/prepend-http
@@ -1430,7 +1439,6 @@ pretty-bytes@5.6.0, MIT, https://github.com/sindresorhus/pretty-bytes
 pretty-error@2.1.2, MIT, https://github.com/AriaMinaei/pretty-error
 pretty-format@26.6.2, MIT, https://github.com/facebook/jest
 pretty-format@27.3.1, MIT, https://github.com/facebook/jest
-pretty-hrtime@1.0.3, MIT, https://github.com/robrich/pretty-hrtime
 process-nextick-args@2.0.1, MIT, https://github.com/calvinmetcalf/process-nextick-args
 process@0.11.10, MIT, https://github.com/shtylman/node-process
 progress@2.0.3, MIT, https://github.com/visionmedia/node-progress
@@ -1439,6 +1447,7 @@ promise@8.1.0, MIT, https://github.com/then/promise
 prompts@2.4.0, MIT, https://github.com/terkelg/prompts
 prompts@2.4.2, MIT, https://github.com/terkelg/prompts
 prop-types@15.7.2, MIT, https://github.com/facebook/prop-types
+prop-types@15.8.0, MIT, https://github.com/facebook/prop-types
 proxy-addr@2.0.7, MIT, https://github.com/jshttp/proxy-addr
 prr@1.0.1, MIT, https://github.com/rvagg/prr
 ps-tree@1.2.0, MIT, https://github.com/indexzero/ps-tree
@@ -1451,7 +1460,6 @@ pumpify@1.5.1, MIT, https://github.com/mafintosh/pumpify
 punycode@1.3.2, MIT, https://github.com/bestiejs/punycode.js
 punycode@1.4.1, MIT, https://github.com/bestiejs/punycode.js
 punycode@2.1.1, MIT, https://github.com/bestiejs/punycode.js
-purgecss@4.0.3, MIT, https://github.com/FullHuman/purgecss
 q@1.5.1, MIT, https://github.com/kriskowal/q
 qs@6.7.0, BSD-3-Clause, https://github.com/ljharb/qs
 query-string@4.3.4, MIT, https://github.com/sindresorhus/query-string
@@ -1473,7 +1481,7 @@ react-easy-swipe@0.0.21, MIT, https://github.com/leandrowd/react-easy-swipe
 react-error-overlay@6.0.9, MIT, https://github.com/facebook/create-react-app
 react-is@16.13.1, MIT, https://github.com/facebook/react
 react-is@17.0.2, MIT, https://github.com/facebook/react
-react-number-format@4.8.0, MIT, https://github.com/s-yadav/react-number-format
+react-number-format@4.9.0, MIT, https://github.com/s-yadav/react-number-format
 react-refresh@0.8.3, MIT, https://github.com/facebook/react
 react-responsive-carousel@3.2.22, MIT, https://github.com/leandrowd/react-responsive-carousel
 react-router-dom@5.3.0, MIT, https://github.com/ReactTraining/react-router
@@ -1492,7 +1500,6 @@ readdirp@2.2.1, MIT, https://github.com/paulmillr/readdirp
 readdirp@3.6.0, MIT, https://github.com/paulmillr/readdirp
 recursive-readdir@2.2.2, MIT, https://github.com/jergason/recursive-readdir
 redent@3.0.0, MIT, https://github.com/sindresorhus/redent
-reduce-css-calc@2.1.8, MIT, https://github.com/MoOx/reduce-css-calc
 regenerate-unicode-properties@9.0.0, MIT, https://github.com/mathiasbynens/regenerate-unicode-properties
 regenerate@1.4.2, MIT, https://github.com/mathiasbynens/regenerate
 regenerator-runtime@0.11.1, MIT, https://github.com/facebook/regenerator/tree/master/packages/regenerator-runtime
@@ -1595,6 +1602,7 @@ sockjs@0.3.21, MIT, https://github.com/sockjs/sockjs-node
 sort-keys@1.1.2, MIT, https://github.com/sindresorhus/sort-keys
 source-list-map@2.0.1, MIT, https://github.com/webpack/source-list-map
 source-map-js@0.6.2, BSD-3-Clause, https://github.com/7rulnik/source-map
+source-map-js@1.0.1, BSD-3-Clause, https://github.com/7rulnik/source-map
 source-map-resolve@0.5.3, MIT, https://github.com/lydell/source-map-resolve
 source-map-resolve@0.6.0, MIT, https://github.com/lydell/source-map-resolve
 source-map-support@0.5.20, MIT, https://github.com/evanw/node-source-map-support
@@ -1663,7 +1671,7 @@ svgo@1.3.2, MIT, https://github.com/svg/svgo
 swr@1.0.1, MIT, https://github.com/vercel/swr
 symbol-tree@3.2.4, MIT, https://github.com/jsdom/js-symbol-tree
 table@6.7.3, BSD-3-Clause, https://github.com/gajus/table
-tailwindcss@2.2.19, MIT, https://github.com/tailwindlabs/tailwindcss
+tailwindcss@3.0.6, MIT, https://github.com/tailwindlabs/tailwindcss
 tapable@1.1.3, MIT, https://github.com/webpack/tapable
 tar@6.1.11, ISC, https://github.com/npm/node-tar
 temp-dir@1.0.0, MIT, https://github.com/sindresorhus/temp-dir
@@ -1691,7 +1699,6 @@ to-object-path@0.3.0, MIT, https://github.com/jonschlinkert/to-object-path
 to-regex-range@2.1.1, MIT, https://github.com/micromatch/to-regex-range
 to-regex-range@5.0.1, MIT, https://github.com/micromatch/to-regex-range
 to-regex@3.0.2, MIT, https://github.com/jonschlinkert/to-regex
-toggle-selection@1.0.6, MIT, https://github.com/sudodoki/toggle-selection
 toidentifier@1.0.0, MIT, https://github.com/component/toidentifier
 tough-cookie@4.0.0, BSD-3-Clause, https://github.com/salesforce/tough-cookie
 tr46@2.1.0, MIT, https://github.com/jsdom/tr46
