@@ -45,12 +45,14 @@ func (l *TensorboardLogger) Open() (string, error) {
 
 	cmd, ok := tensorboardInstances[runsDir]
 	if ok && cmd != nil {
-		if cmd.ProcessState.Exited() {
-			delete(tensorboardInstances, runsDir)
-			cmd = nil
-		} else {
+		_, err = net.DialTimeout("tcp", l.address, time.Second)
+		if err == nil {
 			return l.address, nil
 		}
+		
+		cmd.Process.Kill()
+		delete(tensorboardInstances, runsDir)
+		cmd = nil
 	}
 
 	rtcontext := context.CurrentContext()

@@ -56,7 +56,11 @@ const TrainingLogger: React.FunctionComponent<ITrainingLoggerProps> = (props) =>
     const address = await resp.text()
     if (address) {
       if (openedWindow) {
-        openedWindow.location = address
+        if (openedWindow.location.href != address) {
+          openedWindow.location.href = address
+        } else {
+          openedWindow.location.reload()
+        }
       } else {
         openedWindow = window.open(address, '_blank')
       }
