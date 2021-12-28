@@ -25,7 +25,7 @@ type DockerContext struct {
 
 const (
 	spicedDockerImg        = "ghcr.io/spiceai/spiceai"
-	spicedDockerCmd        = "run -p %d:%d %s --add-host=host.docker.internal:host-gateway -v %s:/userapp --rm %s"
+	spicedDockerCmd        = "run -p %d:%d %s --add-host=host.docker.internal:host-gateway -p 6006-6016:6006-6016 -v %s:/userapp --rm %s"
 	dockerAppPath          = "/userapp"
 	dockerSpiceRuntimePath = "/.spice"
 	dockerAiEnginePath     = "/app/ai"
