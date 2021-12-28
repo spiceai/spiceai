@@ -6,6 +6,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/spiceai/spiceai/pkg/context"
 	"github.com/spiceai/spiceai/pkg/registry"
+	"github.com/spiceai/spiceai/pkg/util"
 )
 
 var addCmd = &cobra.Command{
@@ -37,7 +38,7 @@ spice add samples/LogPruner
 		cmd.Printf("Added %s\n", relativePath)
 
 		err = checkLatestCliReleaseVersion()
-		if err != nil && IsDebug() {
+		if err != nil && util.IsDebug() {
 			cmd.PrintErrf("failed to check for latest CLI release version: %s\n", err.Error())
 		}
 	},
