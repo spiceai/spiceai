@@ -20,10 +20,6 @@ class TrainingLoopTests(unittest.TestCase):
     def setUp(self):
         # Preventing tensorflow verbose initialization
         os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-        import tensorflow as tf  # pylint: disable=import-outside-toplevel
-
-        # Eager execution is too slow to use, so disabling
-        tf.compat.v1.disable_eager_execution()
 
         if self.ALGORITHM is None:
             self.ALGORITHM = "dql"  # pylint: disable=invalid-name

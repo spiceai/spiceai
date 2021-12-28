@@ -72,6 +72,7 @@ class VanillaPolicyGradientAgent(SpiceAIAgent):
             gamma: The discount factor for rewards that occur earlier on.
         """
         super().__init__(state_shape, action_size, loggers, log_dir)
+        tf.compat.v1.disable_eager_execution()
 
         policy, predict = build_networks(
             state_shape, action_size, learning_rate, hidden_neurons

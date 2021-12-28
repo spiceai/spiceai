@@ -80,6 +80,7 @@ jobs:
         working-directory: ai/src
         run: |
           pip install -r requirements/production.txt
+          pip install -r requirements/development.txt
           pip install -r requirements/common.txt
 
       - name: Install pip-licenses

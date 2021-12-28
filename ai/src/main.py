@@ -341,10 +341,6 @@ def interrupt_handler(_signum, _frame):
 def main():
     # Preventing tensorflow verbose initialization
     os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-    import tensorflow as tf  # pylint: disable=import-outside-toplevel
-
-    # Eager execution is too slow to use, so disabling
-    tf.compat.v1.disable_eager_execution()
 
     signal.signal(signal.SIGINT, interrupt_handler)
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
