@@ -3,6 +3,5 @@
 jupyter-client==6.1.12
 jupyter-core==4.7.1
 grpcio-tools~=1.34.1
-pylint==2.10.2
 pytest==6.2.3
 pytest-timeout==1.4.2

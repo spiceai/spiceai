@@ -58,7 +58,7 @@ Now imagine learning Python or R, neural networks, deep-learning algorithms and 
 
 ### Pre-release software
 
-⚠️ The vision to make it easy to build intelligent applications that learn is a vast undertaking. We haven't figured it all out or solved all the problems yet (we only started in June 2021!), so we’re inviting you on this journey and are looking for feedback the direction.
+⚠️ The vision to make it easy to build intelligent applications that learn is a vast undertaking. We haven't figured it all out or solved all the problems yet, so we’re inviting you on this journey and are looking for feedback the direction.
 
 Spice.ai and spicerack.org are both pre-release, early, alpha software. Until v1.0, Spice.ai may have gaps, including limited deep learning algorithms, training-at-scale, and simulated environments. Also, Spicepods aren't searchable or listed on spicerack.org yet.
 
@@ -211,7 +211,7 @@ Spice.ai started with the vision to make AI easy for developers. We are building
 - Discord: [![Discord Banner](https://discord.com/api/guilds/803820740868571196/widget.png?style=shield)](https://discord.gg/kZnTfneP5u)
 - Reddit: [![Subreddit subscribers](https://img.shields.io/reddit/subreddit-subscribers/spiceai?style=social)](https://www.reddit.com/r/spiceai)
 - Twitter: [@SpiceAIHQ](https://twitter.com/spiceaihq)
-- Email: [team@spiceai.io](mailto:team@spiceai.io)
+- Email: [hey@spiceai.io](mailto:hey@spiceai.io)
 
 ### Contributing to Spice.ai
 
