@@ -3,8 +3,8 @@ package loggers
 import (
 	"fmt"
 	"log"
-	"os"
 
+	"github.com/spiceai/spiceai/pkg/util"
 	"go.uber.org/zap"
 )
 
@@ -18,7 +18,7 @@ func ZapLogger() *zap.Logger {
 	}
 
 	var err error
-	if os.Getenv("SPICE_DEBUG") == "1" {
+	if util.IsDebug() {
 		zapLogger, err = zap.NewDevelopment()
 	} else {
 		zapLogger, err = zap.NewProduction()

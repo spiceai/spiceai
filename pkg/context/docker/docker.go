@@ -13,6 +13,7 @@ import (
 	"github.com/spf13/viper"
 	"github.com/spiceai/spiceai/pkg/config"
 	"github.com/spiceai/spiceai/pkg/constants"
+	"github.com/spiceai/spiceai/pkg/util"
 	spice_version "github.com/spiceai/spiceai/pkg/version"
 	"golang.org/x/mod/semver"
 )
@@ -25,7 +26,7 @@ type DockerContext struct {
 
 const (
 	spicedDockerImg        = "ghcr.io/spiceai/spiceai"
-	spicedDockerCmd        = "run -p %d:%d %s --add-host=host.docker.internal:host-gateway -p 6006-6016:6006-6016 -v %s:/userapp --rm %s"
+	spicedDockerCmd        = "run -p 6006-6016:6006-6016 -p %d:%d %s --add-host=host.docker.internal:host-gateway -v %s:/userapp --rm %s"
 	dockerAppPath          = "/userapp"
 	dockerSpiceRuntimePath = "/.spice"
 	dockerAiEnginePath     = "/app/ai"
@@ -199,6 +200,11 @@ func (c *DockerContext) getDockerArgs(args string) []string {
 
 	if c.isDevelopmentMode {
 		argsTrimmedOfEmptyStrings = append(argsTrimmedOfEmptyStrings, "--development")
+	}
+
+	if util.IsDebug() {
+		argsTrimmedOfEmptyStrings = append(argsTrimmedOfEmptyStrings, "-e")
+		argsTrimmedOfEmptyStrings = append(argsTrimmedOfEmptyStrings, "SPICE_DEBUG=1")
 	}
 
 	return argsTrimmedOfEmptyStrings

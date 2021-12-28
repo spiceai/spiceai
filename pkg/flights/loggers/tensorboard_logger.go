@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/spiceai/spiceai/pkg/context"
+	"github.com/spiceai/spiceai/pkg/util"
 )
 
 var (
@@ -49,13 +50,18 @@ func (l *TensorboardLogger) Open() (string, error) {
 		if err == nil {
 			return l.address, nil
 		}
-		
+
 		delete(tensorboardInstances, runsDir)
 		cmd = nil
 	}
 
 	rtcontext := context.CurrentContext()
-	tensorboardCmd := filepath.Join(rtcontext.AIEngineBinDir(), "tensorboard")
+	var tensorboardCmd string
+	if rtcontext.Name() == "docker" {
+		tensorboardCmd = "tensorboard"
+	} else {
+		tensorboardCmd = filepath.Join(rtcontext.AIEngineBinDir(), "tensorboard")
+	}
 	cmd = exec.Command(tensorboardCmd, "--logdir", runsDir)
 	tensorboardInstances[runsDir] = cmd
 
@@ -69,9 +75,15 @@ func (l *TensorboardLogger) Open() (string, error) {
 
 	startedLineChan := make(chan string, 1)
 
+	outBuilder := strings.Builder{}
+
 	go func() {
 		for outScanner.Scan() {
 			line := outScanner.Text()
+			outBuilder.WriteString(line)
+			if util.IsDebug() {
+				fmt.Println(line)
+			}
 			if strings.HasPrefix(line, "TensorBoard ") && strings.HasSuffix(line, "(Press CTRL+C to quit)") {
 				startedLineChan <- line
 				return
@@ -92,12 +104,12 @@ func (l *TensorboardLogger) Open() (string, error) {
 	}
 
 	if startedLine == "" {
-		return "", fmt.Errorf("Tensorboard failed to start: %s", outScanner.Text())
+		return "", fmt.Errorf("Tensorboard failed to start: %s", outBuilder.String())
 	}
 
 	parts := strings.Split(startedLine, " ")
 	if len(parts) < 5 {
-		return "", fmt.Errorf("Tensorboard failed to start: %s", outScanner.Text())
+		return "", fmt.Errorf("Tensorboard failed to start: %s", outBuilder.String())
 	}
 
 	fmt.Printf("Opening %s %s %s %s\n", parts[0], parts[1], parts[2], parts[3])
