@@ -27,8 +27,8 @@ var (
 )
 
 type TensorboardLogger struct {
-	RunId   string
-	LogDir  string
+	RunId  string
+	LogDir string
 }
 
 func (t *TensorboardLogger) Name() string {
