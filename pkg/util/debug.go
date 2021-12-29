@@ -12,7 +12,8 @@ var (
 func IsDebug() bool {
 	if isDebug == nil {
 		spiceDebug := os.Getenv("SPICE_DEBUG")
-		*isDebug = spiceDebug == "1" || strings.EqualFold(spiceDebug, "true")
+		d := spiceDebug == "1" || strings.EqualFold(spiceDebug, "true")
+		isDebug = &d
 	}
 
 	return *isDebug

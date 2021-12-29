@@ -9,7 +9,6 @@ type PodParams struct {
 	Granularity       time.Duration
 	LearningAlgorithm string
 	Interpolation     bool
-	TrainingLoggers   []string
 }
 
 func NewPodParams() *PodParams {
@@ -19,6 +18,5 @@ func NewPodParams() *PodParams {
 		Granularity:       time.Second * 10,
 		LearningAlgorithm: "dql",
 		Interpolation:     true,
-		TrainingLoggers:   nil,
 	}
 }

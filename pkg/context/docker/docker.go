@@ -13,7 +13,6 @@ import (
 	"github.com/spf13/viper"
 	"github.com/spiceai/spiceai/pkg/config"
 	"github.com/spiceai/spiceai/pkg/constants"
-	"github.com/spiceai/spiceai/pkg/util"
 	spice_version "github.com/spiceai/spiceai/pkg/version"
 	"golang.org/x/mod/semver"
 )
@@ -200,11 +199,6 @@ func (c *DockerContext) getDockerArgs(args string) []string {
 
 	if c.isDevelopmentMode {
 		argsTrimmedOfEmptyStrings = append(argsTrimmedOfEmptyStrings, "--development")
-	}
-
-	if util.IsDebug() {
-		argsTrimmedOfEmptyStrings = append(argsTrimmedOfEmptyStrings, "-e")
-		argsTrimmedOfEmptyStrings = append(argsTrimmedOfEmptyStrings, "SPICE_DEBUG=1")
 	}
 
 	return argsTrimmedOfEmptyStrings
