@@ -93,7 +93,10 @@ func (pod *Pod) Interpolation() bool {
 }
 
 func (pod *Pod) TrainingLoggers() []string {
-	return pod.podParams.TrainingLoggers
+	if pod.PodSpec.Training != nil {
+		return pod.PodSpec.Training.Loggers
+	}
+	return nil
 }
 
 func (pod *Pod) TimeCategories() map[string][]spice_time.TimeCategoryInfo {
@@ -616,14 +619,6 @@ func (pod *Pod) loadParams() error {
 				return err
 			}
 			podParams.Interpolation = val
-		}
-
-		str, ok = pod.PodSpec.Params["training_loggers"]
-		if ok && str != "" {
-			loggers := strings.Split(str, ",")
-			if len(loggers) > 0 {
-				podParams.TrainingLoggers = loggers
-			}
 		}
 	}
 

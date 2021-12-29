@@ -5,6 +5,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/spiceai/spiceai/pkg/cli/runtime"
+	"github.com/spiceai/spiceai/pkg/util"
 )
 
 var runCmd = &cobra.Command{
@@ -18,7 +19,7 @@ spice run
 	Run: func(cmd *cobra.Command, args []string) {
 
 		err := checkLatestCliReleaseVersion()
-		if err != nil && IsDebug() {
+		if err != nil && util.IsDebug() {
 			cmd.PrintErrf("failed to check for latest CLI release version: %s\n", err.Error())
 		}
 
