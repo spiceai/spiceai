@@ -2,12 +2,13 @@ import copy
 import csv
 import io
 import os
+import tempfile
 import threading
 import unittest
 
 import pandas as pd
 
-from cleanup import cleanup_on_shutdown
+from cleanup import cleanup_on_shutdown, directories_to_delete
 import main
 from proto.aiengine.v1 import aiengine_pb2
 from tests import common
@@ -43,6 +44,9 @@ class TrainingLoopTests(unittest.TestCase):
         )
         self.original_end_of_episode = train.end_of_episode
 
+        self.temp_dir = tempfile.mkdtemp(prefix='spice_test_')
+        directories_to_delete.append(self.temp_dir)
+
     def tearDown(self):
         train.post_episode_result = self.original_post_episode_result
         train.end_of_episode = self.original_end_of_episode
@@ -72,7 +76,8 @@ class TrainingLoopTests(unittest.TestCase):
             number_episodes=number_episodes,
             flight=flight,
             epoch_time=epoch_time,
-            learning_algorithm=self.ALGORITHM)
+            learning_algorithm=self.ALGORITHM,
+            training_data_dir=self.temp_dir)
 
         resp = self.aiengine.StartTraining(train_req, None)
 
