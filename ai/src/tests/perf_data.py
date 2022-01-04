@@ -1,9 +1,9 @@
 from io import StringIO
-import pandas as pd
 import time
 
-from proto.aiengine.v1 import aiengine_pb2
+import pandas as pd
 
+from proto.aiengine.v1 import aiengine_pb2
 import main
 from tests import common
 
