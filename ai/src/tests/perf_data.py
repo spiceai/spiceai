@@ -8,17 +8,26 @@ import main
 from tests import common
 
 
+class DataSource:
+    def __init__(self, name, init_json_path, data_path):
+        self.name = name
+        self.init_req = common.get_init_from_json(init_data_path=init_json_path, pod_name=name)
+        with open(data_path, "r", encoding="utf8") as data_file:
+            self.csv_data = data_file.read()
+
+
 class PerfData():
     def __init__(self):
         print("Starting performance test for data\n")
         self.aiengine = main.AIEngine()
 
-        self.trader_init_req = common.get_init_from_json(
-            init_data_path="../../test/assets/aiengine/api/trader_init.json",
-            pod_name="trader",
-        )
-        with open("../../test/assets/data/csv/trader.csv", "r", encoding="utf8") as trader_data:
-            self.trader_data_csv = trader_data.read()
+        self.data_sources = {
+            "trader": DataSource(
+                "trader", "../../test/assets/aiengine/api/trader_init.json", "../../test/assets/data/csv/trader.csv"),
+            "coinbase": DataSource(
+                "coinbase", "../../test/assets/aiengine/api/coinbase_init.json",
+                "../../test/assets/data/csv/COINBASE_BTCUSD, 30.csv")
+        }
 
     def init(self, init_req: aiengine_pb2.InitRequest, expected_error: bool = False, expected_result: str = "ok"):
         resp = self.aiengine.Init(init_req, None)
@@ -30,25 +39,31 @@ class PerfData():
         assert resp.error is False
 
     def pandas_load(self):
-        print("Pandas data loading time:", end="")
-        start_time = time.time()
-        for _ in range(1000):
-            pd.read_csv(StringIO(self.trader_data_csv))
-        end_time = time.time()
+        print("Pandas data loading time")
+        for data_name, data_source in self.data_sources.items():
+            print(f"{data_name}:", end="", flush=True)
+            start_time = time.time()
+            for _ in range(1000):
+                pd.read_csv(StringIO(data_source.csv_data))
+            end_time = time.time()
 
-        print(f" {end_time - start_time:.02f}ms")
+            print(f" {end_time - start_time:.02f}ms")
+        print()
 
     def aiengine_load(self):
-        self.init(self.trader_init_req)
 
         accumulation = 1000
-        print(f"AIEngine loading {accumulation}x data:", end="", flush=True)
-        start_time = time.time()
-        for _ in range(accumulation):
-            self.add_data("trader", self.trader_data_csv)
-        end_time = time.time()
+        print(f"AIEngine loading {accumulation}x data")
+        for data_name, data_source in self.data_sources.items():
+            print(f"{data_name}:", end="", flush=True)
+            self.init(data_source.init_req)
+            start_time = time.time()
+            for _ in range(accumulation):
+                self.add_data(data_name, data_source.csv_data)
+            end_time = time.time()
 
-        print(f" {end_time - start_time:.02f}s")
+            print(f" {end_time - start_time:.02f}s")
+        print()
 
 
 if __name__ == "__main__":
