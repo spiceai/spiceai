@@ -7,6 +7,10 @@ test: venv
 	ALGORITHM="vpg" venv/bin/python3 -m pytest --timeout 30
 	ALGORITHM="sacd" venv/bin/python3 -m pytest --timeout 30
 
+.PHONY: perf
+perf: venv
+	@PYTHONPATH=. venv/bin/python3 tests/perf_data.py
+
 venv:
 	python3 -m venv venv
 	venv/bin/pip3 install --upgrade pip
