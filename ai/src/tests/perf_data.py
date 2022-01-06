@@ -1,7 +1,8 @@
-from io import StringIO
+from io import BytesIO, StringIO
 import time
 
 import pandas as pd
+from pyarrow import csv
 
 from proto.aiengine.v1 import aiengine_pb2
 import main
@@ -13,7 +14,8 @@ class DataSource:
         self.name = name
         self.init_req = common.get_init_from_json(init_data_path=init_json_path, pod_name=name)
         with open(data_path, "r", encoding="utf8") as data_file:
-            self.csv_data = data_file.read()
+            self.csv_string = data_file.read()
+        self.csv_bytes = self.csv_string.encode()
 
 
 class PerfData():
@@ -38,13 +40,25 @@ class PerfData():
         resp = self.aiengine.AddData(aiengine_pb2.AddDataRequest(pod=pod_name, csv_data=csv_data), None)
         assert resp.error is False
 
+    def arrow_load(self):
+        print("Arrow data loading time")
+        for data_name, data_source in self.data_sources.items():
+            print(f"{data_name}:", end="", flush=True)
+            start_time = time.time()
+            for _ in range(1000):
+                csv.read_csv(BytesIO(data_source.csv_bytes))
+            end_time = time.time()
+
+            print(f" {end_time - start_time:.02f}ms")
+        print()
+
     def pandas_load(self):
         print("Pandas data loading time")
         for data_name, data_source in self.data_sources.items():
             print(f"{data_name}:", end="", flush=True)
             start_time = time.time()
             for _ in range(1000):
-                pd.read_csv(StringIO(data_source.csv_data))
+                pd.read_csv(StringIO(data_source.csv_string))
             end_time = time.time()
 
             print(f" {end_time - start_time:.02f}ms")
@@ -59,7 +73,7 @@ class PerfData():
             self.init(data_source.init_req)
             start_time = time.time()
             for _ in range(accumulation):
-                self.add_data(data_name, data_source.csv_data)
+                self.add_data(data_name, data_source.csv_bytes)
             end_time = time.time()
 
             print(f" {end_time - start_time:.02f}s")
@@ -68,5 +82,6 @@ class PerfData():
 
 if __name__ == "__main__":
     suite = PerfData()
+    suite.arrow_load()
     suite.pandas_load()
     suite.aiengine_load()

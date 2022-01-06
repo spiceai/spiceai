@@ -1,5 +1,5 @@
 from concurrent import futures
-from io import StringIO
+from io import BytesIO
 import json
 import os
 from pathlib import Path
@@ -12,6 +12,7 @@ from typing import Dict
 import grpc
 import pandas as pd
 from psutil import Process, TimeoutExpired
+from pyarrow import csv
 import requests
 
 from algorithms.factory import get_agent
@@ -109,7 +110,8 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
 
     def AddData(self, request: aiengine_pb2.AddDataRequest, context):
         with Dispatch.INIT_LOCK:
-            new_data: pd.DataFrame = pd.read_csv(StringIO(request.csv_data))
+            data = csv.read_csv(BytesIO(request.csv_data.encode()))
+            new_data = data.to_pandas()
             new_data["time"] = pd.to_datetime(new_data["time"], unit="s")
             new_data = new_data.set_index("time")
 
