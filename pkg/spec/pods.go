@@ -25,6 +25,7 @@ type DoSpec struct {
 
 type TrainingSpec struct {
 	Goal        string            `json:"goal,omitempty" yaml:"goal,omitempty" mapstructure:"goal,omitempty"`
+	Loggers     []string          `json:"loggers,omitempty" yaml:"loggers,omitempty" mapstructure:"loggers,omitempty"`
 	RewardFuncs string            `json:"reward_funcs,omitempty" yaml:"reward_funcs,omitempty" mapstructure:"reward_funcs,omitempty"`
 	RewardInit  string            `json:"reward_init,omitempty" yaml:"reward_init,omitempty" mapstructure:"reward_init,omitempty"`
 	RewardArgs  map[string]string `json:"reward_args,omitempty" yaml:"reward_args,omitempty" mapstructure:"reward_args,omitempty"`

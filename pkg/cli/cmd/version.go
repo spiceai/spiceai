@@ -12,6 +12,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/spiceai/spiceai/pkg/context"
 	"github.com/spiceai/spiceai/pkg/github"
+	"github.com/spiceai/spiceai/pkg/util"
 	"github.com/spiceai/spiceai/pkg/version"
 )
 
@@ -52,7 +53,7 @@ spice version
 		cmd.Printf("Runtime version: %s\n", rtversion)
 
 		err = checkLatestCliReleaseVersion()
-		if err != nil && IsDebug() {
+		if err != nil && util.IsDebug() {
 			cmd.PrintErrf("failed to check for latest CLI release version: %s\n", err.Error())
 		}
 	},
@@ -86,7 +87,7 @@ func checkLatestCliReleaseVersion() error {
 			return err
 		}
 		err = os.WriteFile(versionFilePath, []byte(release.TagName+"\n"), 0644)
-		if err != nil && IsDebug() {
+		if err != nil && util.IsDebug() {
 			log.Printf("failed to write version file: %s\n", err.Error())
 		}
 		latestReleaseVersion = release.TagName

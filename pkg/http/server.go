@@ -382,7 +382,7 @@ func apiPostFlightLoggerHandler(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	_, err = ctx.WriteString(address)
+	_, err = ctx.WriteString(address.String())
 	if err != nil {
 		ctx.Response.SetStatusCode(500)
 		ctx.Response.SetBodyString(err.Error())
