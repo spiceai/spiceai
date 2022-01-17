@@ -1,6 +1,7 @@
 package aiengine
 
 import (
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -65,7 +66,14 @@ func TestGetAddDataRequest(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	newObservations, err := dp.GetObservations()
+	record, err := dp.GetRecord()
+	if err != nil {
+		t.Error(err)
+		return
+	}
+
+	newObservations, err := dataspace.ArrowToObservations(record)
+	record.Release()
 	if err != nil {
 		t.Error(err)
 		return
@@ -133,7 +141,14 @@ func testGetCsvAllHeadersWithPreviewFunc() func(*testing.T) {
 			t.Fatal(err)
 		}
 
-		newObservations, err := dp.GetObservations()
+		record, err := dp.GetRecord()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+
+		newObservations, err := dataspace.ArrowToObservations(record)
+		record.Release()
 		if err != nil {
 			t.Error(err)
 			return
@@ -192,7 +207,14 @@ func testGetCsvSelectHeadersWithPreviewFunc() func(*testing.T) {
 			t.Fatal(err)
 		}
 
-		newObservations, err := dp.GetObservations()
+		record, err := dp.GetRecord()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+
+		newObservations, err := dataspace.ArrowToObservations(record)
+		record.Release()
 		if err != nil {
 			t.Error(err)
 			return
@@ -242,12 +264,20 @@ func testGetDataWithTagsFunc() func(*testing.T) {
 			t.Fatal(err)
 		}
 
+		fmt.Println(string(data))
 		_, err = dp.OnData(data)
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		newObservations, err := dp.GetObservations()
+		record, err := dp.GetRecord()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+
+		newObservations, err := dataspace.ArrowToObservations(record)
+		record.Release()
 		if err != nil {
 			t.Error(err)
 			return
@@ -301,7 +331,14 @@ func testGetDataWithCategoriesFunc() func(*testing.T) {
 			t.Fatal(err)
 		}
 
-		newObservations, err := dp.GetObservations()
+		record, err := dp.GetRecord()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+
+		newObservations, err := dataspace.ArrowToObservations(record)
+		record.Release()
 		if err != nil {
 			t.Error(err)
 			return

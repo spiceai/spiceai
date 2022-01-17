@@ -8,6 +8,7 @@ import (
 	"github.com/bradleyjkemp/cupaloy"
 	"github.com/spiceai/data-components-contrib/dataprocessors"
 	"github.com/spiceai/data-components-contrib/dataprocessors/csv"
+	"github.com/spiceai/spiceai/pkg/dataspace"
 	"github.com/spiceai/spiceai/pkg/observations"
 )
 
@@ -55,9 +56,9 @@ func testGetCsvWithTagsFunc() func(*testing.T) {
 		}
 
 		tagSelectors := []string{
-			"tag1",
-			"tag2",
-			"tag3",
+			"tags1",
+			"tags2",
+			"tags3",
 			"_tags",
 		}
 
@@ -71,7 +72,14 @@ func testGetCsvWithTagsFunc() func(*testing.T) {
 			t.Fatal(err)
 		}
 
-		newObservations, err := dp.GetObservations()
+		record, err := dp.GetRecord()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+
+		newObservations, err := dataspace.ArrowToObservations(record)
+		record.Release()
 		if err != nil {
 			t.Error(err)
 			return
@@ -118,7 +126,14 @@ func testGetCsvAllHeadersFunc() func(*testing.T) {
 			t.Fatal(err)
 		}
 
-		newObservations, err := dp.GetObservations()
+		record, err := dp.GetRecord()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+
+		newObservations, err := dataspace.ArrowToObservations(record)
+		record.Release()
 		if err != nil {
 			t.Error(err)
 			return
@@ -164,7 +179,14 @@ func testGetCsvSelectHeadersFunc() func(*testing.T) {
 			t.Fatal(err)
 		}
 
-		newObservations, err := dp.GetObservations()
+		record, err := dp.GetRecord()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+
+		newObservations, err := dataspace.ArrowToObservations(record)
+		record.Release()
 		if err != nil {
 			t.Error(err)
 			return
