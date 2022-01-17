@@ -22,7 +22,7 @@
     "chokidar-cli": "^3.0.0",
     "direction": "^1.0.4",
     "lodash": "^4.17.21",
-    "marked": "^3.0.7",
+    "marked": "^4.0.10",
     "postcss": "^8.4.5",
     "react": "^17.0.2",
     "react-dom": "^17.0.2",
