@@ -2,14 +2,16 @@ package state
 
 import (
 	"os"
-	"sort"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/apache/arrow/go/v6/arrow"
+	"github.com/apache/arrow/go/v6/arrow/array"
+	"github.com/apache/arrow/go/v6/arrow/memory"
 	"github.com/bradleyjkemp/cupaloy"
 	"github.com/spiceai/data-components-contrib/dataconnectors/file"
-	"github.com/spiceai/spiceai/pkg/observations"
+	"github.com/spiceai/data-components-contrib/dataprocessors/csv"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -55,20 +57,28 @@ func TestGetStateFromCsv(t *testing.T) {
 // Tests NewState() creates State correctly with valid getter values
 func testNewState() func(*testing.T) {
 	return func(t *testing.T) {
-		expectedPath := "test.path"
-		expectedIdentifiersNames := []string{"i-1", "i-2"}
-		expectedMeasurementsNames := []string{"m-1", "m-2", "m-3"}
-		expectedCategoryNames := []string{"c-1", "c-2", "c-3"}
-		expectedTags := []string{}
-		expectedObservations := []observations.Observation{}
+		expectedOrigin := "test.path"
+		fields := []arrow.Field{
+			{Name: "time", Type: arrow.PrimitiveTypes.Int64},
+			{Name: "id.i-1", Type: arrow.PrimitiveTypes.Float64},
+			{Name: "id.i-2", Type: arrow.PrimitiveTypes.Float64},
+			{Name: "measure.m-1", Type: arrow.PrimitiveTypes.Float64},
+			{Name: "measure.m-2", Type: arrow.PrimitiveTypes.Float64},
+			{Name: "measure.m-3", Type: arrow.PrimitiveTypes.Float64},
+			{Name: "cat.c-1", Type: arrow.PrimitiveTypes.Float64},
+			{Name: "cat.c-2", Type: arrow.PrimitiveTypes.Float64},
+			{Name: "cat.c-3", Type: arrow.PrimitiveTypes.Float64},
+		}
+		pool := memory.NewGoAllocator()
+		recordBuilder := array.NewRecordBuilder(pool, arrow.NewSchema(fields, nil))
+		defer recordBuilder.Release()
+		expectedRecord := recordBuilder.NewRecord()
+		defer expectedRecord.Release()
 
-		newState := NewState(expectedPath, expectedIdentifiersNames, expectedMeasurementsNames, expectedCategoryNames, expectedTags, expectedObservations)
+		newState := NewState(expectedOrigin, expectedRecord)
 
-		assert.Equal(t, expectedPath, newState.Path(), "Path() not equal")
-		assert.Equal(t, expectedMeasurementsNames, newState.MeasurementsNames(), "MeasurementNames() not equal")
-
-		expectedFqMeasurementNames := []string{"test.path.m-1", "test.path.m-2", "test.path.m-3"}
-		assert.Equal(t, expectedFqMeasurementNames, newState.FqMeasurementsNames(), "FqMeasurementsNames() not equal")
+		assert.Equal(t, expectedOrigin, newState.Origin(), "Path() not equal")
+		assert.Equal(t, []string{"measure.m-1", "measure.m-2", "measure.m-3"}, newState.MeasurementNames(), "MeasurementNames() not equal")
 	}
 }
 
@@ -79,28 +89,44 @@ func testGetStateFunc(data []byte) func(*testing.T) {
 			t.Fatal("no data")
 		}
 
-		validMeasurementNames := []string{"coinbase.btcusd.price", "local.portfolio.usd_balance", "local.portfolio.btc_balance"}
+		measurements := map[string]string{
+			"coinbase.btcusd.price":       "coinbase.btcusd.price",
+			"local.portfolio.usd_balance": "local.portfolio.usd_balance",
+			"local.portfolio.btc_balance": "local.portfolio.btc_balance",
+		}
 
-		actualState, err := GetStateFromCsv(nil, validMeasurementNames, nil, data)
+		dp := csv.NewCsvProcessor()
+		err := dp.Init(nil, nil, measurements, nil, nil)
+		assert.NoError(t, err)
+
+		_, err = dp.OnData(data)
+		assert.NoError(t, err)
+
+		actualRecord, err := dp.GetRecord()
 		if err != nil {
 			t.Error(err)
 			return
 		}
+		actualStates := GetStatesFromRecord(actualRecord)
 
-		assert.Equal(t, 1, len(actualState), "expected two state objects")
+		assert.Equal(t, 2, len(actualStates), "expected two state objects")
+		assert.Equal(t, "coinbase.btcusd", actualStates[0].Origin(), "expected origin incorrect")
 
-		assert.Equal(t, "coinbase.btcusd", actualState[0].Path(), "expected path incorrect")
-
-		expectedFirstObservation := observations.Observation{
-			Time: 1626697480,
-			Measurements: map[string]float64{
-				"price": 31232.709090909084,
-			},
+		fields := []arrow.Field{
+			{Name: "time", Type: arrow.PrimitiveTypes.Int64},
+			{Name: "measure.price", Type: arrow.PrimitiveTypes.Float64},
 		}
+		pool := memory.NewGoAllocator()
+		recordBuilder := array.NewRecordBuilder(pool, arrow.NewSchema(fields, nil))
+		defer recordBuilder.Release()
+		recordBuilder.Field(0).(*array.Int64Builder).AppendValues([]int64{1626697480}, nil)
+		recordBuilder.Field(1).(*array.Float64Builder).AppendValues([]float64{31232.709090909084}, nil)
 
-		actualObservations := actualState[0].Observations()
-		assert.Len(t, actualObservations, 57, "number of observations incorrect")
-		assert.Equal(t, expectedFirstObservation, actualState[0].Observations()[0], "First Observation not correct")
+		expectedRecord := recordBuilder.NewRecord()
+		defer expectedRecord.Release()
+
+		assert.Equal(t, actualStates[0].Record().NumRows(), int64(57), "number of observations incorrect")
+		assert.True(t, array.RecordEqual(expectedRecord, actualStates[0].Record().NewSlice(0, 1)), "First Record not correct")
 	}
 }
 
@@ -114,44 +140,67 @@ func TestGetStateWithTagsFunc(t *testing.T) {
 		t.Fatal("no data")
 	}
 
-	validMeasurementNames := []string{"coinbase.btcusd.open", "bitthumb.btcusd.high", "bitmex.btcusd.low", "coinbase_pro.btcusd.close", "local.btcusd.volume"}
+	measurements := map[string]string{
+		"coinbase.btcusd.open":      "coinbase.btcusd.open",
+		"bitthumb.btcusd.high":      "bitthumb.btcusd.high",
+		"bitmex.btcusd.low":         "bitmex.btcusd.low",
+		"coinbase_pro.btcusd.close": "coinbase_pro.btcusd.close",
+		"local.btcusd.volume":       "local.btcusd.volume",
+	}
+	tags := []string{"coinbase.btcusd._tags", "local.btcusd._tags"}
+	dp := csv.NewCsvProcessor()
+	err = dp.Init(nil, nil, measurements, nil, tags)
+	assert.NoError(t, err)
 
-	actualState, err := GetStateFromCsv(nil, validMeasurementNames, nil, data)
+	_, err = dp.OnData(data)
+	assert.NoError(t, err)
+
+	actualRecord, err := dp.GetRecord()
 	if err != nil {
 		t.Error(err)
 		return
 	}
+	actualStates := GetStatesFromRecord(actualRecord)
 
-	assert.Equal(t, 5, len(actualState), "expected five state objects")
+	assert.Equal(t, 5, len(actualStates), "expected five state objects")
 
-	sort.Slice(actualState, func(i, j int) bool {
-		return actualState[i].Path() < actualState[j].Path()
-	})
+	assert.Equal(t, "bitmex.btcusd", actualStates[0].Origin(), "expected origin incorrect")
+	assert.Equal(t, "bitthumb.btcusd", actualStates[1].Origin(), "expected origin incorrect")
+	assert.Equal(t, "coinbase.btcusd", actualStates[2].Origin(), "expected origin incorrect")
+	assert.Equal(t, "coinbase_pro.btcusd", actualStates[3].Origin(), "expected origin incorrect")
+	assert.Equal(t, "local.btcusd", actualStates[4].Origin(), "expected origin incorrect")
 
-	assert.Equal(t, "bitmex.btcusd", actualState[0].Path(), "expected path incorrect")
-	assert.Equal(t, "bitthumb.btcusd", actualState[1].Path(), "expected path incorrect")
-	assert.Equal(t, "coinbase.btcusd", actualState[2].Path(), "expected path incorrect")
-	assert.Equal(t, "coinbase_pro.btcusd", actualState[3].Path(), "expected path incorrect")
-	assert.Equal(t, "local.btcusd", actualState[4].Path(), "expected path incorrect")
-
-	expectedFirstObservation := observations.Observation{
-		Time: 1605312000,
-		Measurements: map[string]float64{
-			"low": 16240,
-		},
+	fields := []arrow.Field{
+		{Name: "time", Type: arrow.PrimitiveTypes.Int64},
+		{Name: "measure.low", Type: arrow.PrimitiveTypes.Float64},
+		{Name: "tags", Type: arrow.ListOf(arrow.BinaryTypes.String)},
 	}
+	pool := memory.NewGoAllocator()
+	recordBuilder := array.NewRecordBuilder(pool, arrow.NewSchema(fields, nil))
+	defer recordBuilder.Release()
+	recordBuilder.Field(0).(*array.Int64Builder).AppendValues([]int64{1605312000}, nil)
+	recordBuilder.Field(1).(*array.Float64Builder).AppendValues([]float64{16240}, nil)
+	listBuilder := recordBuilder.Field(2).(*array.ListBuilder)
+	valueBuilder := listBuilder.ValueBuilder().(*array.StringBuilder)
+	listBuilder.Append(true)
+	valueBuilder.Append("elon_tweet")
+	valueBuilder.Append("market_open")
+	valueBuilder.Append("bought_1")
+	valueBuilder.Append("tag_2")
 
-	actualObservations := actualState[0].Observations()
-	assert.Equal(t, expectedFirstObservation, actualState[0].Observations()[0], "First Observation not correct")
-	assert.Equal(t, 5, len(actualObservations), "number of observations incorrect")
+	expectedRecord := recordBuilder.NewRecord()
+	defer expectedRecord.Release()
+
+	assert.True(t, array.RecordEqual(expectedRecord, actualStates[0].Record().NewSlice(0, 1)), "First Record not correct")
+	assert.Equal(t, actualStates[0].Record().NumRows(), int64(5), "record length incorrect")
 
 	testTime := time.Unix(1610057400, 0)
 	testTime = testTime.UTC()
-	for _, state := range actualState {
+	for _, state := range actualStates {
 		state.Time = testTime
 	}
 
-	snapshotter.SnapshotT(t, actualState)
+	snapshotter.SnapshotT(t, actualStates)
 }
 
 func TestGetStateIdentifiers(t *testing.T) {
@@ -164,38 +213,62 @@ func TestGetStateIdentifiers(t *testing.T) {
 		t.Fatal("no data")
 	}
 
-	validIdentifierNames := []string{"event.data.event_id"}
-	validMeasurementNames := []string{"event.data.speed", "event.data.target"}
-	validCategoryNames := []string{"event.data.rating"}
+	identifiers := map[string]string{
+		"event.data.event_id": "event.data.event_id",
+	}
+	measurements := map[string]string{
+		"event.data.speed":  "event.data.speed",
+		"event.data.target": "event.data.target",
+	}
+	categories := map[string]string{
+		"event.data.rating": "event.data.rating",
+	}
+	dp := csv.NewCsvProcessor()
+	err = dp.Init(nil, identifiers, measurements, categories, nil)
+	assert.NoError(t, err)
 
-	actualState, err := GetStateFromCsv(validIdentifierNames, validMeasurementNames, validCategoryNames, data)
+	_, err = dp.OnData(data)
+	assert.NoError(t, err)
+
+	actualRecord, err := dp.GetRecord()
 	if err != nil {
 		t.Error(err)
 		return
 	}
+	actualStates := GetStatesFromRecord(actualRecord)
 
-	assert.Equal(t, 1, len(actualState), "expected one state object")
+	assert.Equal(t, 1, len(actualStates), "expected one state object")
+	assert.Equal(t, "event.data", actualStates[0].Origin(), "expected origin incorrect")
 
-	assert.Equal(t, "event.data", actualState[0].Path(), "expected path incorrect")
-
-	expectedFirstObservation := observations.Observation{
-		Time:         1611205740,
-		Identifiers:  map[string]string{"event_id": "3"},
-		Measurements: map[string]float64{"speed": 15, "target": 1},
-		Categories:   map[string]string{"rating": "10"},
+	fields := []arrow.Field{
+		{Name: "time", Type: arrow.PrimitiveTypes.Int64},
+		{Name: "id.event_id", Type: arrow.BinaryTypes.String},
+		{Name: "measure.speed", Type: arrow.PrimitiveTypes.Float64},
+		{Name: "measure.target", Type: arrow.PrimitiveTypes.Float64},
+		{Name: "cat.rating", Type: arrow.BinaryTypes.String},
 	}
+	pool := memory.NewGoAllocator()
+	recordBuilder := array.NewRecordBuilder(pool, arrow.NewSchema(fields, nil))
+	defer recordBuilder.Release()
+	recordBuilder.Field(0).(*array.Int64Builder).AppendValues([]int64{1611205740}, nil)
+	recordBuilder.Field(1).(*array.StringBuilder).AppendValues([]string{"3"}, nil)
+	recordBuilder.Field(2).(*array.Float64Builder).AppendValues([]float64{15}, nil)
+	recordBuilder.Field(3).(*array.Float64Builder).AppendValues([]float64{1}, nil)
+	recordBuilder.Field(4).(*array.StringBuilder).AppendValues([]string{"10"}, nil)
 
-	actualObservations := actualState[0].Observations()
-	assert.Equal(t, expectedFirstObservation, actualState[0].Observations()[0], "First Observation not correct")
-	assert.Equal(t, 5, len(actualObservations), "number of observations incorrect")
+	expectedRecord := recordBuilder.NewRecord()
+	defer expectedRecord.Release()
+
+	assert.True(t, array.RecordEqual(expectedRecord, actualStates[0].Record().NewSlice(0, 1)), "First Record not correct")
+	assert.Equal(t, actualStates[0].Record().NumRows(), int64(5), "record length incorrect")
 
 	testTime := time.Unix(1610057400, 0)
 	testTime = testTime.UTC()
-	for _, state := range actualState {
+	for _, state := range actualStates {
 		state.Time = testTime
 	}
 
-	snapshotter.SnapshotT(t, actualState)
+	snapshotter.SnapshotT(t, actualStates)
 }
 
 // Tests "GetState()" called twice
@@ -205,107 +278,42 @@ func testGetStateTwiceFunc(data []byte) func(*testing.T) {
 			t.Fatal("no data")
 		}
 
-		validMeasurementNames := []string{"coinbase.btcusd.price", "local.portfolio.usd_balance", "local.portfolio.btc_balance"}
+		measurements := map[string]string{
+			"coinbase.btcusd.price":       "coinbase.btcusd.price",
+			"local.portfolio.usd_balance": "local.portfolio.usd_balance",
+			"local.portfolio.btc_balance": "local.portfolio.btc_balance",
+		}
+		dp := csv.NewCsvProcessor()
+		err := dp.Init(nil, nil, measurements, nil, nil)
+		assert.NoError(t, err)
 
-		actualState, err := GetStateFromCsv(nil, validMeasurementNames, nil, data)
+		_, err = dp.OnData(data)
+		assert.NoError(t, err)
+
+		actualRecord, err := dp.GetRecord()
 		if err != nil {
 			t.Error(err)
 			return
 		}
+		actualStates := GetStatesFromRecord(actualRecord)
 
-		assert.Equal(t, "coinbase.btcusd", actualState[0].Path(), "expected path incorrect")
+		assert.Equal(t, 2, len(actualStates), "expected two state objects")
+		assert.Equal(t, "coinbase.btcusd", actualStates[0].Origin(), "expected origin incorrect")
 
-		expectedFirstObservation := observations.Observation{
-			Time: 1626697480,
-			Measurements: map[string]float64{
-				"price": 31232.709090909084,
-			},
+		fields := []arrow.Field{
+			{Name: "time", Type: arrow.PrimitiveTypes.Int64},
+			{Name: "measure.price", Type: arrow.PrimitiveTypes.Float64},
 		}
+		pool := memory.NewGoAllocator()
+		recordBuilder := array.NewRecordBuilder(pool, arrow.NewSchema(fields, nil))
+		defer recordBuilder.Release()
+		recordBuilder.Field(0).(*array.Int64Builder).AppendValues([]int64{1626697480}, nil)
+		recordBuilder.Field(1).(*array.Float64Builder).AppendValues([]float64{31232.709090909084}, nil)
 
-		actualObservations := actualState[0].Observations()
-		assert.Equal(t, expectedFirstObservation, actualState[0].Observations()[0], "First Observation not correct")
-		assert.Equal(t, 57, len(actualObservations), "number of observations incorrect")
-	}
-}
+		expectedRecord := recordBuilder.NewRecord()
+		defer expectedRecord.Release()
 
-func TestProcessCsvHeaders(t *testing.T) {
-	headers := []string{"time", "coinbase.btcusd.transaction_id", "coinbase.btcusd.open", "coinbase.btcusd._tags", "bitthumb.btcusd.high", "bitmex.btcusd.ticker_id", "bitmex.btcusd.low", "coinbase_pro.btcusd.close", "local.btcusd.volume", "local.btcusd.type", "local.btcusd._tags"}
-	validIdentifierNames := []string{"coinbase.btcusd.transaction_id", "bitmex.btcusd.ticker_id"}
-	validMeasurementNames := []string{"coinbase.btcusd.open", "bitmex.btcusd.low", "local.btcusd.volume"}
-	validCategoryNames := []string{"local.btcusd.type"}
-
-	dsPathsMap, colToDsPath, colToIdentifierName, colToMeasurementName, colToCategoryName, tagsCol, err := processCsvHeaders(headers, validIdentifierNames, validMeasurementNames, validCategoryNames)
-	assert.NoError(t, err)
-
-	expectedDsPathsMap := map[string]bool(map[string]bool{"bitmex.btcusd": true, "coinbase.btcusd": true, "local.btcusd": true})
-	assert.Equal(t, expectedDsPathsMap, dsPathsMap)
-
-	expectedColToDsPath := []string([]string{"coinbase.btcusd", "coinbase.btcusd", "coinbase.btcusd", "", "bitmex.btcusd", "bitmex.btcusd", "", "local.btcusd", "local.btcusd", "local.btcusd"})
-	assert.Equal(t, expectedColToDsPath, colToDsPath)
-
-	expectedColToIdentifierName := []string([]string{"transaction_id", "", "", "", "ticker_id", "", "", "", "", ""})
-	assert.Equal(t, expectedColToIdentifierName, colToIdentifierName)
-
-	expectedColToMeasurementName := []string([]string{"", "open", "", "", "", "low", "", "volume", "", ""})
-	assert.Equal(t, expectedColToMeasurementName, colToMeasurementName)
-
-	expectedColToCategoryName := []string([]string{"", "", "", "", "", "", "", "", "type", ""})
-	assert.Equal(t, expectedColToCategoryName, colToCategoryName)
-
-	expectedTagsCol := []string([]string{"", "", "coinbase.btcusd._tags", "", "", "", "", "", "", "local.btcusd._tags"})
-	assert.Equal(t, expectedTagsCol, tagsCol)
-}
-
-func TestProcessCsvHeadersNoTags(t *testing.T) {
-	headers := []string{"time", "coinbase.btcusd.transaction_id", "coinbase.btcusd.open", "bitthumb.btcusd.high", "bitmex.btcusd.ticker_id", "bitmex.btcusd.low", "coinbase_pro.btcusd.close", "local.btcusd.volume", "local.btcusd.type"}
-	validIdentifierNames := []string{"coinbase.btcusd.transaction_id", "bitmex.btcusd.ticker_id"}
-	validMeasurementNames := []string{"coinbase.btcusd.open", "bitmex.btcusd.low", "local.btcusd.volume"}
-	validCategoryNames := []string{"local.btcusd.type"}
-
-	dsPathsMap, colToDsPath, colToIdentifierName, colToMeasurementName, colToCategoryName, tagsCol, err := processCsvHeaders(headers, validIdentifierNames, validMeasurementNames, validCategoryNames)
-	assert.NoError(t, err)
-
-	expectedDsPathsMap := map[string]bool(map[string]bool{"bitmex.btcusd": true, "coinbase.btcusd": true, "local.btcusd": true})
-	assert.Equal(t, expectedDsPathsMap, dsPathsMap)
-
-	expectedColToDsPath := []string([]string{"coinbase.btcusd", "coinbase.btcusd", "", "bitmex.btcusd", "bitmex.btcusd", "", "local.btcusd", "local.btcusd"})
-	assert.Equal(t, expectedColToDsPath, colToDsPath)
-
-	expectedColToIdentifierName := []string([]string{"transaction_id", "", "", "ticker_id", "", "", "", ""})
-	assert.Equal(t, expectedColToIdentifierName, colToIdentifierName)
-
-	expectedColToMeasurementName := []string([]string{"", "open", "", "", "low", "", "volume", ""})
-	assert.Equal(t, expectedColToMeasurementName, colToMeasurementName)
-
-	expectedColToCategoryName := []string([]string{"", "", "", "", "", "", "", "type"})
-	assert.Equal(t, expectedColToCategoryName, colToCategoryName)
-
-	expectedTagsCol := []string([]string{"", "", "", "", "", "", "", ""})
-	assert.Equal(t, expectedTagsCol, tagsCol)
-}
-
-func TestGetDsPathToDataMap(t *testing.T) {
-	dsPathsMap := map[string]bool(map[string]bool{"bitmex.btcusd": true, "coinbase.btcusd": true, "local.btcusd": true})
-	colToDsPath := []string([]string{"coinbase.btcusd", "", "bitmex.btcusd", "", "local.btcusd", "local.btcusd"})
-	colToIdentifierName := []string([]string{"", "transaction_id", "", "", "", ""})
-	colToMeasurementName := []string([]string{"open", "", "low", "", "volume", ""})
-	colToCategoryName := []string([]string{"", "", "", "", "", "type"})
-
-	dsPathToDataMap := getDsPathToDataMap(len(dsPathsMap), colToDsPath, colToIdentifierName, colToMeasurementName, colToCategoryName)
-
-	snapshotter.SnapshotT(t, dsPathToDataMap)
-}
-
-func TestGetFieldNames(t *testing.T) {
-	names := []string{"a", "b", "c"}
-	fqNames, namesMap := getFieldNames("my.test.path", names)
-
-	expectedFqNames := []string{"my.test.path.a", "my.test.path.b", "my.test.path.c"}
-	assert.Equal(t, expectedFqNames, fqNames)
-
-	assert.Len(t, namesMap, len(names))
-
-	for i, n := range names {
-		assert.Equal(t, namesMap[n], expectedFqNames[i])
+		assert.True(t, array.RecordEqual(expectedRecord, actualStates[0].Record().NewSlice(0, 1)), "First Record not correct")
+		assert.Equal(t, actualStates[0].Record().NumRows(), int64(57), "number of observations incorrect")
 	}
 }
