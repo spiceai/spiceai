@@ -3,17 +3,14 @@ package aiengine
 import (
 	"context"
 	"fmt"
-	"strconv"
-	"strings"
+	// "strconv"
+	// "strings"
 	"time"
 
 	"github.com/logrusorgru/aurora"
-	"github.com/spiceai/spiceai/pkg/dataspace"
-	"github.com/spiceai/spiceai/pkg/observations"
 	"github.com/spiceai/spiceai/pkg/pods"
 	"github.com/spiceai/spiceai/pkg/proto/aiengine_pb"
 	"github.com/spiceai/spiceai/pkg/state"
-	spice_time "github.com/spiceai/spiceai/pkg/time"
 )
 
 func SendData(pod *pods.Pod, podState ...*state.State) error {
@@ -34,7 +31,7 @@ func SendData(pod *pods.Pod, podState ...*state.State) error {
 			continue
 		}
 
-		zaplog.Sugar().Debug(aurora.BrightMagenta(fmt.Sprintf("Sending data %d", len(addDataRequest.CsvData))))
+		// zaplog.Sugar().Debug(aurora.BrightMagenta(fmt.Sprintf("Sending data %d", len(addDataRequest.CsvData))))
 
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
@@ -59,127 +56,130 @@ func getAddDataRequest(pod *pods.Pod, s *state.State) *aiengine_pb.AddDataReques
 		return nil
 	}
 
-	ds := pod.GetDataspace(s.Path())
-	categories := ds.Categories()
-	timeCategories := pod.TimeCategories()
+	// ds := pod.GetDataspace(s.Origin())
+	// categories := ds.Categories()
+	// timeCategories := pod.TimeCategories()
 
-	csv := strings.Builder{}
-	csv.WriteString("time")
+	// csv := strings.Builder{}
+	// csv.WriteString("time")
 
-	for _, name := range pod.TimeCategoryNames() {
-		fields := timeCategories[name]
-		for _, f := range fields {
-			csv.WriteString(",")
-			csv.WriteString(f.FieldName)
-		}
-	}
+	// for _, name := range pod.TimeCategoryNames() {
+	// 	fields := timeCategories[name]
+	// 	for _, f := range fields {
+	// 		csv.WriteString(",")
+	// 		csv.WriteString(f.FieldName)
+	// 	}
+	// }
 
-	for _, field := range s.FqMeasurementsNames() {
-		csv.WriteString(",")
-		csv.WriteString(strings.ReplaceAll(field, ".", "_"))
-	}
+	// for _, measurementName := range s.MeasurementNames() {
+	// 	csv.WriteString(",")
+	// 	csv.WriteString(strings.ReplaceAll(s.Origin()+"_"+measurementName, ".", "_"))
+	// }
 
-	for _, category := range categories {
-		for _, categoryFieldName := range category.EncodedFieldNames {
-			csv.WriteString(",")
-			csv.WriteString(categoryFieldName)
-		}
-	}
+	// for _, category := range categories {
+	// 	for _, categoryFieldName := range category.EncodedFieldNames {
+	// 		csv.WriteString(",")
+	// 		csv.WriteString(categoryFieldName)
+	// 	}
+	// }
 
-	for _, fqTagName := range ds.FqTags() {
-		csv.WriteString(",")
-		csv.WriteString(strings.ReplaceAll(fqTagName, ".", "_"))
-	}
+	// for _, fqTagName := range ds.FqTags() {
+	// 	csv.WriteString(",")
+	// 	csv.WriteString(strings.ReplaceAll(fqTagName, ".", "_"))
+	// }
 
-	csv.WriteString("\n")
+	// csv.WriteString("\n")
 
-	observationData := s.Observations()
+	// record := s.Record()
 
-	if len(observationData) == 0 {
-		return nil
-	}
+	// if (*record).NumRows() == 0 {
+	// 	return nil
+	// }
 
-	csvPreview := getData(&csv, pod.Epoch(), pod.TimeCategoryNames(), timeCategories, s.MeasurementsNames(), categories, ds.Tags(), observationData, 5)
+	// csvPreview := getData(&csv, pod.Epoch(), pod.TimeCategoryNames(), timeCategories, s.MeasurementNames(), categories, ds.Tags(), record, 5)
 
-	zaplog.Sugar().Debugf("Posting data to AI engine:\n%s", aurora.BrightYellow(fmt.Sprintf("%s%s...\n%d observations posted", csv.String(), csvPreview, len(observationData))))
+	// zaplog.Sugar().Debugf("Posting data to AI engine:\n%s", aurora.BrightYellow(fmt.Sprintf("%s%s...\n%d observations posted", csv.String(), csvPreview, (*record).NumRows())))
+
+	zaplog.Sugar().Debugf(
+		"Posting data to AI engine:\n%s", aurora.BrightYellow(
+			fmt.Sprintf("record of lenght %d posted", (*s.Record()).NumRows())))
 
 	addDataRequest := &aiengine_pb.AddDataRequest{
-		Pod:     pod.Name,
-		CsvData: csv.String(),
+		Pod: pod.Name,
 	}
 
 	return addDataRequest
 }
 
-func getData(csv *strings.Builder, epoch time.Time, timeCategoryNames []string, timeCategories map[string][]spice_time.TimeCategoryInfo, fqMeasurementNames []string, categories []*dataspace.CategoryInfo, tags []string, observations []observations.Observation, previewLines int) string {
-	epochTime := epoch.Unix()
-	var csvPreview string
-	for i, o := range observations {
-		if o.Time < epochTime {
-			continue
-		}
-		time := time.Unix(o.Time, 0)
-		csv.WriteString(strconv.FormatInt(o.Time, 10))
+// func getData(csv *strings.Builder, epoch time.Time, timeCategoryNames []string, timeCategories map[string][]spice_time.TimeCategoryInfo, measurementNames []string, categories []*dataspace.CategoryInfo, tags []string, record *array.Record, previewLines int) string {
+// 	epochTime := epoch.Unix()
+// 	var csvPreview string
+// 	for i, o := range observations {
+// 		if o.Time < epochTime {
+// 			continue
+// 		}
+// 		time := time.Unix(o.Time, 0)
+// 		csv.WriteString(strconv.FormatInt(o.Time, 10))
 
-		for _, name := range timeCategoryNames {
-			tcInfos := timeCategories[name]
-			var tcVal int
-			switch name {
-			case spice_time.CategoryMonth:
-				tcVal = int(time.Month())
-			case spice_time.CategoryDayOfMonth:
-				tcVal = time.Day()
-			case spice_time.CategoryDayOfWeek:
-				tcVal = int(time.Weekday())
-			case spice_time.CategoryHour:
-				tcVal = time.Hour()
-			}
-			for _, tcInfo := range tcInfos {
-				csv.WriteString(",")
-				writeBool(csv, tcVal == tcInfo.Value)
-			}
-		}
+// 		for _, name := range timeCategoryNames {
+// 			tcInfos := timeCategories[name]
+// 			var tcVal int
+// 			switch name {
+// 			case spice_time.CategoryMonth:
+// 				tcVal = int(time.Month())
+// 			case spice_time.CategoryDayOfMonth:
+// 				tcVal = time.Day()
+// 			case spice_time.CategoryDayOfWeek:
+// 				tcVal = int(time.Weekday())
+// 			case spice_time.CategoryHour:
+// 				tcVal = time.Hour()
+// 			}
+// 			for _, tcInfo := range tcInfos {
+// 				csv.WriteString(",")
+// 				writeBool(csv, tcVal == tcInfo.Value)
+// 			}
+// 		}
 
-		for _, f := range fqMeasurementNames {
-			csv.WriteString(",")
-			if measurement, ok := o.Measurements[f]; ok {
-				csv.WriteString(strconv.FormatFloat(measurement, 'f', -1, 64))
-			}
-		}
+// 		for _, f := range measurementNames {
+// 			csv.WriteString(",")
+// 			if measurement, ok := o.Measurements[f]; ok {
+// 				csv.WriteString(strconv.FormatFloat(measurement, 'f', -1, 64))
+// 			}
+// 		}
 
-		for _, category := range categories {
-			for _, val := range category.Values {
-				csv.WriteString(",")
-				foundVal, ok := o.Categories[category.Name]
-				writeBool(csv, ok && foundVal == val)
-			}
-		}
+// 		for _, category := range categories {
+// 			for _, val := range category.Values {
+// 				csv.WriteString(",")
+// 				foundVal, ok := o.Categories[category.Name]
+// 				writeBool(csv, ok && foundVal == val)
+// 			}
+// 		}
 
-		for _, t := range tags {
-			csv.WriteString(",")
+// 		for _, t := range tags {
+// 			csv.WriteString(",")
 
-			hasTag := false
-			for _, observationTag := range o.Tags {
-				if observationTag == t {
-					hasTag = true
-					break
-				}
-			}
+// 			hasTag := false
+// 			for _, observationTag := range o.Tags {
+// 				if observationTag == t {
+// 					hasTag = true
+// 					break
+// 				}
+// 			}
 
-			writeBool(csv, hasTag)
-		}
-		csv.WriteString("\n")
-		if previewLines > 0 && (i+1 == previewLines || (previewLines >= i && i+1 == len(observations))) {
-			csvPreview = csv.String()
-		}
-	}
-	return csvPreview
-}
+// 			writeBool(csv, hasTag)
+// 		}
+// 		csv.WriteString("\n")
+// 		if previewLines > 0 && (i+1 == previewLines || (previewLines >= i && i+1 == len(observations))) {
+// 			csvPreview = csv.String()
+// 		}
+// 	}
+// 	return csvPreview
+// }
 
-func writeBool(csv *strings.Builder, value bool) {
-	if value {
-		csv.WriteString("1")
-	} else {
-		csv.WriteString("0")
-	}
-}
+// func writeBool(csv *strings.Builder, value bool) {
+// 	if value {
+// 		csv.WriteString("1")
+// 	} else {
+// 		csv.WriteString("0")
+// 	}
+// }

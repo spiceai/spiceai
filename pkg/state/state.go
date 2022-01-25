@@ -18,6 +18,7 @@ type State struct {
 	identifierNames    []string
 	measurementNames   []string
 	categoryNames      []string
+	columnMap          map[string]int
 	tags               []string
 	tagMap             map[string]bool
 	record             array.Record
@@ -36,19 +37,25 @@ type StateInfo struct {
 type StateHandler func(state *State, metadata map[string]string) error
 
 func NewState(origin string, record array.Record) *State {
+	if record == nil {
+		return nil
+	}
 
 	var identifierNames []string
 	var measurementNames []string
 	var categoryNames []string
+	columnMap := make(map[string]int)
 	var tags []string
 	tagMap := make(map[string]bool)
 
-	for _, field := range record.Schema().Fields() {
+	for columnIndex, field := range record.Schema().Fields() {
+		columnMap[field.Name] = columnIndex
 		switch {
 		case strings.HasPrefix(field.Name, "measure."):
 			measurementNames = append(measurementNames, field.Name)
 		case strings.HasPrefix(field.Name, "cat."):
 			categoryNames = append(categoryNames, field.Name)
+			columnMap[field.Name] = columnIndex
 		case strings.HasPrefix(field.Name, "id."):
 			identifierNames = append(identifierNames, field.Name)
 		}
@@ -63,6 +70,7 @@ func NewState(origin string, record array.Record) *State {
 		identifierNames:    identifierNames,
 		measurementNames:   measurementNames,
 		categoryNames:      categoryNames,
+		columnMap:          columnMap,
 		tags:               tags,
 		tagMap:             tagMap,
 		record:             record,
@@ -70,6 +78,10 @@ func NewState(origin string, record array.Record) *State {
 }
 
 func GetStatesFromRecord(record array.Record) []*State {
+	if record == nil {
+		return []*State{}
+	}
+
 	timeCol := -1
 	tagCol := -1
 	stateInfoMap := make(map[string]*StateInfo)
@@ -129,9 +141,9 @@ func GetStatesFromRecord(record array.Record) []*State {
 			fields = append(fields, record.Schema().Field(tagCol))
 			columns = append(columns, record.Column(tagCol))
 		}
-		result = append(
-			result,
-			NewState(origin, array.NewRecord(arrow.NewSchema(fields, nil), columns, record.NumRows())))
+		newRecord := array.NewRecord(arrow.NewSchema(fields, nil), columns, record.NumRows())
+		newRecord.Retain()
+		result = append(result, NewState(origin, newRecord))
 	}
 	return result
 }
@@ -152,8 +164,12 @@ func (s *State) CategoryNames() []string {
 	return s.categoryNames
 }
 
-func (s *State) Record() array.Record {
-	return s.record
+func (s *State) ColumnMap() map[string]int {
+	return s.columnMap
+}
+
+func (s *State) Record() *array.Record {
+	return &s.record
 }
 
 func (s *State) Tags() []string {
@@ -176,7 +192,7 @@ func (s *State) AddData(newRecord array.Record) {
 		newCol, _ := array.Concatenate([]array.Interface{col, newRecord.Column(colIndex)}, pool)
 		cols = append(cols, newCol)
 	}
-	mergedRecord := array.NewRecord(s.Record().Schema(), cols, s.record.NumRows()+newRecord.NumRows())
+	mergedRecord := array.NewRecord((*s.Record()).Schema(), cols, s.record.NumRows()+newRecord.NumRows())
 	s.record.Release()
 	newRecord.Release()
 	s.record = mergedRecord

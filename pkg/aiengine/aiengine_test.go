@@ -11,6 +11,7 @@ import (
 	"github.com/spiceai/spiceai/pkg/context"
 	"github.com/spiceai/spiceai/pkg/pods"
 	"github.com/spiceai/spiceai/pkg/proto/aiengine_pb"
+	"github.com/spiceai/spiceai/pkg/tempdir"
 	"github.com/spiceai/spiceai/pkg/testutils"
 	"github.com/stretchr/testify/assert"
 	"google.golang.org/grpc"
@@ -62,6 +63,7 @@ func TestInfer(t *testing.T) {
 }
 
 func TestPod(t *testing.T) {
+	defer tempdir.RemoveAllCreatedTempDirectories()
 	algorithmsMap = map[string]*LearningAlgorithm{
 		"dql": {
 			Id:   "dql",

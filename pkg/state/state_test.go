@@ -125,8 +125,8 @@ func testGetStateFunc(data []byte) func(*testing.T) {
 		expectedRecord := recordBuilder.NewRecord()
 		defer expectedRecord.Release()
 
-		assert.Equal(t, actualStates[0].Record().NumRows(), int64(57), "number of observations incorrect")
-		assert.True(t, array.RecordEqual(expectedRecord, actualStates[0].Record().NewSlice(0, 1)), "First Record not correct")
+		assert.Equal(t, (*actualStates[0].Record()).NumRows(), int64(57), "number of observations incorrect")
+		assert.True(t, array.RecordEqual(expectedRecord, (*actualStates[0].Record()).NewSlice(0, 1)), "First Record not correct")
 	}
 }
 
@@ -191,8 +191,8 @@ func TestGetStateWithTagsFunc(t *testing.T) {
 	expectedRecord := recordBuilder.NewRecord()
 	defer expectedRecord.Release()
 
-	assert.True(t, array.RecordEqual(expectedRecord, actualStates[0].Record().NewSlice(0, 1)), "First Record not correct")
-	assert.Equal(t, actualStates[0].Record().NumRows(), int64(5), "record length incorrect")
+	assert.True(t, array.RecordEqual(expectedRecord, (*actualStates[0].Record()).NewSlice(0, 1)), "First Record not correct")
+	assert.Equal(t, (*actualStates[0].Record()).NumRows(), int64(5), "record length incorrect")
 
 	testTime := time.Unix(1610057400, 0)
 	testTime = testTime.UTC()
@@ -259,8 +259,8 @@ func TestGetStateIdentifiers(t *testing.T) {
 	expectedRecord := recordBuilder.NewRecord()
 	defer expectedRecord.Release()
 
-	assert.True(t, array.RecordEqual(expectedRecord, actualStates[0].Record().NewSlice(0, 1)), "First Record not correct")
-	assert.Equal(t, actualStates[0].Record().NumRows(), int64(5), "record length incorrect")
+	assert.True(t, array.RecordEqual(expectedRecord, (*actualStates[0].Record()).NewSlice(0, 1)), "First Record not correct")
+	assert.Equal(t, (*actualStates[0].Record()).NumRows(), int64(5), "record length incorrect")
 
 	testTime := time.Unix(1610057400, 0)
 	testTime = testTime.UTC()
@@ -313,7 +313,7 @@ func testGetStateTwiceFunc(data []byte) func(*testing.T) {
 		expectedRecord := recordBuilder.NewRecord()
 		defer expectedRecord.Release()
 
-		assert.True(t, array.RecordEqual(expectedRecord, actualStates[0].Record().NewSlice(0, 1)), "First Record not correct")
-		assert.Equal(t, actualStates[0].Record().NumRows(), int64(57), "number of observations incorrect")
+		assert.True(t, array.RecordEqual(expectedRecord, (*actualStates[0].Record()).NewSlice(0, 1)), "First Record not correct")
+		assert.Equal(t, (*actualStates[0].Record()).NumRows(), int64(57), "number of observations incorrect")
 	}
 }

@@ -9,6 +9,7 @@ import (
 
 	"github.com/bradleyjkemp/cupaloy"
 	"github.com/spiceai/data-components-contrib/dataconnectors/file"
+	"github.com/spiceai/data-components-contrib/dataprocessors/csv"
 	"github.com/spiceai/spiceai/pkg/spec"
 	"github.com/spiceai/spiceai/pkg/state"
 	"github.com/stretchr/testify/assert"
@@ -322,7 +323,6 @@ func testCachedCsvFunc(pod *Pod) func(*testing.T) {
 		<-done
 
 		actual := pod.CachedCsv()
-
 		snapshotter.SnapshotT(t, actual)
 	}
 }
@@ -358,12 +358,21 @@ func testAddLocalStateFunc(pod *Pod) func(*testing.T) {
 
 		<-done
 
-		newState, err := state.GetStateFromCsv(nil, nil, nil, fileData)
+		dp := csv.NewCsvProcessor()
+		err = dp.Init(nil, nil, nil, nil, nil)
+		assert.NoError(t, err)
+
+		_, err = dp.OnData(fileData)
+		assert.NoError(t, err)
+
+		newRecord, err := dp.GetRecord()
 		if err != nil {
 			t.Error(err)
+			return
 		}
+		newStates := state.GetStatesFromRecord(newRecord)
 
-		pod.AddLocalState(newState...)
+		pod.AddLocalState(newStates...)
 	}
 }
 
@@ -407,19 +416,31 @@ func testAddLocalStateCachedCsvFunc(pod *Pod) func(*testing.T) {
 
 		wg.Wait()
 
-		measurements := []string{"local.portfolio.usd_balance", "local.portfolio.btc_balance", "coinbase.btcusd.price"}
-
-		newState, err := state.GetStateFromCsv(nil, measurements, nil, fileData)
-		if err != nil {
-			t.Error(err)
+		measurements := map[string]string{
+			"local.portfolio.usd_balance": "local.portfolio.usd_balance",
+			"local.portfolio.btc_balance": "local.portfolio.btc_balance",
+			"coinbase.btcusd.price":       "coinbase.btcusd.price",
 		}
 
-		assert.Equal(t, 1, len(newState), "expected one state object for coinbase")
+		dp := csv.NewCsvProcessor()
+		err = dp.Init(nil, nil, measurements, nil, nil)
+		assert.NoError(t, err)
 
-		pod.AddLocalState(newState...)
+		_, err = dp.OnData(fileData)
+		assert.NoError(t, err)
+
+		newRecord, err := dp.GetRecord()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		newStates := state.GetStatesFromRecord(newRecord)
+
+		assert.Equal(t, 2, len(newStates), "expected two states")
+
+		pod.AddLocalState(newStates...)
 
 		actual := pod.CachedCsv()
-
 		snapshotter.SnapshotT(t, actual)
 	}
 }

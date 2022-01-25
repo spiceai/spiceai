@@ -2,18 +2,11 @@ package dataspace
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/apache/arrow/go/v6/arrow/array"
 	"github.com/spiceai/spiceai/pkg/observations"
 )
-
-// type Observation struct {
-// 	Time         int64
-// 	Identifiers  map[string]string
-// 	Measurements map[string]float64
-// 	Categories   map[string]string
-// 	Tags         []string
-// }
 
 const (
 	colTypeTime = iota
@@ -53,21 +46,21 @@ func ArrowToObservations(record array.Record) ([]observations.Observation, error
 			columnInfo[colIndex].Type = colTypeTime
 			columnInfo[colIndex].Name = "time"
 			columnInfo[colIndex].IntColumn = record.Column(colIndex).(*array.Int64)
-		case len(field.Name) > 3 && field.Name[:3] == "id.":
+		case strings.HasPrefix(field.Name[:3], "id."):
 			if !hasId {
 				hasId = true
 			}
 			columnInfo[colIndex].Type = colTypeIdentifier
 			columnInfo[colIndex].Name = field.Name
 			columnInfo[colIndex].StringColumn = record.Column(colIndex).(*array.String)
-		case len(field.Name) > 8 && field.Name[:8] == "measure.":
+		case strings.HasPrefix(field.Name[:3], "measure."):
 			if !hasMeasure {
 				hasMeasure = true
 			}
 			columnInfo[colIndex].Type = colTypeMeasurement
 			columnInfo[colIndex].Name = field.Name
 			columnInfo[colIndex].FloatColumn = record.Column(colIndex).(*array.Float64)
-		case len(field.Name) > 4 && field.Name[:4] == "cat.":
+		case strings.HasPrefix(field.Name[:3], "cat."):
 			if !hasCategory {
 				hasCategory = true
 			}
@@ -108,10 +101,9 @@ func ArrowToObservations(record array.Record) ([]observations.Observation, error
 		}
 		if tagColumn >= 0 {
 			if tags.IsValid(rowIndex) {
-				for j := pos; j < int(offsets[rowIndex]); j++ {
-					observation.Tags = append(observation.Tags, tags.Value(j))
+				for ; pos < int(offsets[rowIndex]); pos++ {
+					observation.Tags = append(observation.Tags, tags.Value(int(pos)))
 				}
-				pos = int(offsets[rowIndex])
 			}
 		}
 		for _, colInfo := range columnInfo {

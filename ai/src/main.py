@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import socket
 import sys
 import threading
 import traceback
@@ -13,6 +14,7 @@ import grpc
 import pandas as pd
 from psutil import Process, TimeoutExpired
 from pyarrow import csv
+import pyarrow.ipc
 import requests
 
 from algorithms.factory import get_agent
@@ -110,10 +112,15 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
 
     def AddData(self, request: aiengine_pb2.AddDataRequest, context):
         with Dispatch.INIT_LOCK:
-            data = csv.read_csv(BytesIO(request.csv_data.encode()))
-            new_data = data.to_pandas()
-            new_data["time"] = pd.to_datetime(new_data["time"], unit="s")
-            new_data = new_data.set_index("time")
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as arrow_socket:
+                arrow_socket.connect(('localhost', 8088))
+                reader = pyarrow.ipc.RecordBatchStreamReader(arrow_socket)
+                data = reader.read_pandas()
+
+            # data = csv.read_csv(BytesIO(request.csv_data.encode()))
+            # new_data = data.to_pandas()
+            data["time"] = pd.to_datetime(data["time"], unit="s")
+            new_data = data.set_index("time")
 
             data_manager = data_managers[request.pod]
             for field in new_data.columns:
