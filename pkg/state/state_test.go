@@ -68,6 +68,7 @@ func testNewState() func(*testing.T) {
 			{Name: "cat.c-1", Type: arrow.PrimitiveTypes.Float64},
 			{Name: "cat.c-2", Type: arrow.PrimitiveTypes.Float64},
 			{Name: "cat.c-3", Type: arrow.PrimitiveTypes.Float64},
+			{Name: "tags", Type: arrow.ListOf(arrow.BinaryTypes.String)},
 		}
 		pool := memory.NewGoAllocator()
 		recordBuilder := array.NewRecordBuilder(pool, arrow.NewSchema(fields, nil))
@@ -115,12 +116,16 @@ func testGetStateFunc(data []byte) func(*testing.T) {
 		fields := []arrow.Field{
 			{Name: "time", Type: arrow.PrimitiveTypes.Int64},
 			{Name: "measure.price", Type: arrow.PrimitiveTypes.Float64},
+			{Name: "tags", Type: arrow.ListOf(arrow.BinaryTypes.String)},
 		}
 		pool := memory.NewGoAllocator()
 		recordBuilder := array.NewRecordBuilder(pool, arrow.NewSchema(fields, nil))
 		defer recordBuilder.Release()
 		recordBuilder.Field(0).(*array.Int64Builder).AppendValues([]int64{1626697480}, nil)
 		recordBuilder.Field(1).(*array.Float64Builder).AppendValues([]float64{31232.709090909084}, nil)
+		listBuilder := recordBuilder.Field(2).(*array.ListBuilder)
+		defer listBuilder.Release()
+		listBuilder.Append(true)
 
 		expectedRecord := recordBuilder.NewRecord()
 		defer expectedRecord.Release()
@@ -246,6 +251,7 @@ func TestGetStateIdentifiers(t *testing.T) {
 		{Name: "measure.speed", Type: arrow.PrimitiveTypes.Float64},
 		{Name: "measure.target", Type: arrow.PrimitiveTypes.Float64},
 		{Name: "cat.rating", Type: arrow.BinaryTypes.String},
+		{Name: "tags", Type: arrow.ListOf(arrow.BinaryTypes.String)},
 	}
 	pool := memory.NewGoAllocator()
 	recordBuilder := array.NewRecordBuilder(pool, arrow.NewSchema(fields, nil))
@@ -255,6 +261,9 @@ func TestGetStateIdentifiers(t *testing.T) {
 	recordBuilder.Field(2).(*array.Float64Builder).AppendValues([]float64{15}, nil)
 	recordBuilder.Field(3).(*array.Float64Builder).AppendValues([]float64{1}, nil)
 	recordBuilder.Field(4).(*array.StringBuilder).AppendValues([]string{"10"}, nil)
+	listBuilder := recordBuilder.Field(5).(*array.ListBuilder)
+	defer listBuilder.Release()
+	listBuilder.Append(true)
 
 	expectedRecord := recordBuilder.NewRecord()
 	defer expectedRecord.Release()
@@ -303,12 +312,16 @@ func testGetStateTwiceFunc(data []byte) func(*testing.T) {
 		fields := []arrow.Field{
 			{Name: "time", Type: arrow.PrimitiveTypes.Int64},
 			{Name: "measure.price", Type: arrow.PrimitiveTypes.Float64},
+			{Name: "tags", Type: arrow.ListOf(arrow.BinaryTypes.String)},
 		}
 		pool := memory.NewGoAllocator()
 		recordBuilder := array.NewRecordBuilder(pool, arrow.NewSchema(fields, nil))
 		defer recordBuilder.Release()
 		recordBuilder.Field(0).(*array.Int64Builder).AppendValues([]int64{1626697480}, nil)
 		recordBuilder.Field(1).(*array.Float64Builder).AppendValues([]float64{31232.709090909084}, nil)
+		listBuilder := recordBuilder.Field(2).(*array.ListBuilder)
+		defer listBuilder.Release()
+		listBuilder.Append(true)
 
 		expectedRecord := recordBuilder.NewRecord()
 		defer expectedRecord.Release()

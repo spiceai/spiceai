@@ -8,6 +8,11 @@
       (string) (len=11) "measure.low"
     },
     categoryNames: ([]string) <nil>,
+    columnMap: (map[string]int) (len=3) {
+      (string) (len=11) "measure.low": (int) 1,
+      (string) (len=4) "tags": (int) 2,
+      (string) (len=4) "time": (int) 0
+    },
     tags: ([]string) <nil>,
     tagMap: (map[string]bool) {
     },
@@ -42,6 +47,11 @@
       (string) (len=12) "measure.high"
     },
     categoryNames: ([]string) <nil>,
+    columnMap: (map[string]int) (len=3) {
+      (string) (len=12) "measure.high": (int) 1,
+      (string) (len=4) "tags": (int) 2,
+      (string) (len=4) "time": (int) 0
+    },
     tags: ([]string) <nil>,
     tagMap: (map[string]bool) {
     },
@@ -76,6 +86,11 @@
       (string) (len=12) "measure.open"
     },
     categoryNames: ([]string) <nil>,
+    columnMap: (map[string]int) (len=3) {
+      (string) (len=12) "measure.open": (int) 1,
+      (string) (len=4) "tags": (int) 2,
+      (string) (len=4) "time": (int) 0
+    },
     tags: ([]string) <nil>,
     tagMap: (map[string]bool) {
     },
@@ -110,6 +125,11 @@
       (string) (len=13) "measure.close"
     },
     categoryNames: ([]string) <nil>,
+    columnMap: (map[string]int) (len=3) {
+      (string) (len=13) "measure.close": (int) 1,
+      (string) (len=4) "tags": (int) 2,
+      (string) (len=4) "time": (int) 0
+    },
     tags: ([]string) <nil>,
     tagMap: (map[string]bool) {
     },
@@ -144,6 +164,11 @@
       (string) (len=14) "measure.volume"
     },
     categoryNames: ([]string) <nil>,
+    columnMap: (map[string]int) (len=3) {
+      (string) (len=14) "measure.volume": (int) 1,
+      (string) (len=4) "tags": (int) 2,
+      (string) (len=4) "time": (int) 0
+    },
     tags: ([]string) <nil>,
     tagMap: (map[string]bool) {
     },
