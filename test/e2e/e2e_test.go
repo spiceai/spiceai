@@ -134,6 +134,12 @@ func TestMain(m *testing.M) {
 		err = cliClient.runCliCmd("add", testPod)
 		if err != nil {
 			log.Println(err.Error())
+
+			err = tempdir.RemoveAllCreatedTempDirectories()
+			if err != nil {
+				log.Println(err.Error())
+			}
+
 			os.Exit(1)
 		}
 	}

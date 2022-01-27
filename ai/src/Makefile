@@ -12,7 +12,7 @@ perf: venv
 	@PYTHONPATH=. venv/bin/python3 tests/perf_data.py
 
 venv:
-	python3 -m venv venv
+	python3.9 -m venv venv
 	venv/bin/pip3 install --upgrade pip
 	venv/bin/pip3 install -r requirements/production.txt
 
@@ -22,13 +22,13 @@ lint: venv
 
 .PHONY: venv-dev
 venv-dev:
-	python3 -m venv venv
+	python3.9 -m venv venv
 	venv/bin/pip3 install --upgrade pip
 	venv/bin/pip3 install -r requirements/development.txt
 
 .PHONY: venv-gen-proto
 venv-gen-proto:
-	python3 -m venv venv
+	python3.9 -m venv venv
 	venv/bin/pip3 install --upgrade pip
 	venv/bin/pip3 install grpcio-tools
 

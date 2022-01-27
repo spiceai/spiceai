@@ -32,7 +32,7 @@ require (
 )
 
 require (
-	github.com/apache/arrow/go/v6 v6.0.1
+	github.com/apache/arrow/go/v7 v7.0.0-20220125092355-231d0a6b30e7
 	github.com/gocarina/gocsv v0.0.0-20211020200912-82fc2684cc48
 	github.com/olekukonko/tablewriter v0.0.5
 	github.com/spf13/pflag v1.0.5
@@ -49,6 +49,7 @@ require (
 	github.com/dghubble/go-twitter v0.0.0-20211115160449-93a8679adecb // indirect
 	github.com/dghubble/oauth1 v0.7.0 // indirect
 	github.com/dghubble/sling v1.4.0 // indirect
+	github.com/goccy/go-json v0.7.10 // indirect
 	github.com/gofrs/uuid v4.1.0+incompatible // indirect
 	github.com/golang-jwt/jwt/v4 v4.2.0 // indirect
 	github.com/golang/protobuf v1.5.2 // indirect
@@ -66,6 +67,7 @@ require (
 	github.com/mitchellh/mapstructure v1.4.2 // indirect
 	github.com/opentracing/opentracing-go v1.2.0 // indirect
 	github.com/pelletier/go-toml v1.9.4 // indirect
+	github.com/pierrec/lz4/v4 v4.1.9 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/rivo/uniseg v0.2.0 // indirect
@@ -77,6 +79,7 @@ require (
 	github.com/uber/jaeger-client-go v2.29.1+incompatible // indirect
 	github.com/uber/jaeger-lib v2.4.1+incompatible // indirect
 	github.com/valyala/bytebufferpool v1.0.0 // indirect
+	golang.org/x/tools v0.1.5 // indirect
 	golang.org/x/xerrors v0.0.0-20200804184101-5ec99f83aff1 // indirect
 	google.golang.org/genproto v0.0.0-20211208223120-3a66f561d7aa // indirect
 	gopkg.in/ini.v1 v1.64.0 // indirect

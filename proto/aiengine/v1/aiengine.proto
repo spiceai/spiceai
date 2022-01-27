@@ -91,6 +91,7 @@ message InferenceResult {
 
 message AddDataRequest {
   string pod = 1;
+  string unix_socket = 2;
 }
 
 message AddInterpretationsRequest {

@@ -69,22 +69,22 @@ func apiGetObservationsHandler(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	// if string(ctx.Request.Header.Peek("Accept")) == "application/json" {
-	// 	observations := []*common_pb.Observation{}
-	// 	for _, state := range pod.CachedState() {
-	// 		obs := api.NewObservationsFromState(state)
-	// 		observations = append(observations, obs...)
-	// 	}
-	// 	ctx.Response.Header.Add("Content-Type", "application/json")
-	// 	data, err := json.Marshal(observations)
-	// 	if err != nil {
-	// 		ctx.Response.SetStatusCode(500)
-	// 		fmt.Fprintf(ctx, "error getting observations: %s", err.Error())
-	// 		return
-	// 	}
-	// 	_, _ = ctx.Write(data)
-	// 	return
-	// }
+	if string(ctx.Request.Header.Peek("Accept")) == "application/json" {
+		// 	observations := []*common_pb.Observation{}
+		// 	for _, state := range pod.CachedState() {
+		// 		obs := api.NewObservationsFromState(state)
+		// 		observations = append(observations, obs...)
+		// 	}
+		ctx.Response.Header.Add("Content-Type", "application/json")
+		// 	data, err := json.Marshal(observations)
+		// 	if err != nil {
+		// 		ctx.Response.SetStatusCode(500)
+		// 		fmt.Fprintf(ctx, "error getting observations: %s", err.Error())
+		// 		return
+		// 	}
+		_, _ = ctx.WriteString(pod.CachedJson())
+		return
+	}
 
 	ctx.Response.Header.Add("Content-Type", "text/csv")
 	csv := pod.CachedCsv()

@@ -1,5 +1,4 @@
 from concurrent import futures
-from io import BytesIO
 import json
 import os
 from pathlib import Path
@@ -13,7 +12,6 @@ from typing import Dict
 import grpc
 import pandas as pd
 from psutil import Process, TimeoutExpired
-from pyarrow import csv
 import pyarrow.ipc
 import requests
 
@@ -112,22 +110,28 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
 
     def AddData(self, request: aiengine_pb2.AddDataRequest, context):
         with Dispatch.INIT_LOCK:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as arrow_socket:
-                arrow_socket.connect(('localhost', 8088))
-                reader = pyarrow.ipc.RecordBatchStreamReader(arrow_socket)
-                data = reader.read_pandas()
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as arrow_socket:
+                arrow_socket.settimeout(1)
+                try:
+                    arrow_socket.connect(request.unix_socket)
+                except Exception:
+                    return aiengine_pb2.Response(
+                        result="connection_error",
+                        message="connection error",
+                        error=True,
+                    )
+                reader = pyarrow.ipc.RecordBatchStreamReader(arrow_socket.makefile(mode="rb"))
+                new_data = reader.read_pandas()
 
-            # data = csv.read_csv(BytesIO(request.csv_data.encode()))
-            # new_data = data.to_pandas()
-            data["time"] = pd.to_datetime(data["time"], unit="s")
-            new_data = data.set_index("time")
+            new_data["time"] = pd.to_datetime(new_data["time"], unit="s")
+            new_data = new_data.set_index("time")
 
             data_manager = data_managers[request.pod]
-            for field in new_data.columns:
-                if field not in data_manager.fields.keys():
+            for field in new_data.columns[:-1]:
+                if field not in data_manager.fields:
                     return aiengine_pb2.Response(
                         result="unexpected_field",
-                        message=f"Unexpected field: '{field}'",
+                        message=f"Unexpected field: '{field}' {data_manager.fields}",
                         error=True,
                     )
 
@@ -356,7 +360,7 @@ def main():
     aiengine_pb2_grpc.add_AIEngineServicer_to_server(AIEngine(), server)
     server.add_insecure_port("[::]:8004")
     server.start()
-    print(f"AIEngine: gRPC server listening on port {8004}")
+    print(f"AIEngine: gRPC server listening on port {8004}", flush=True)
 
     wait_parent_process()
     cleanup_on_shutdown()

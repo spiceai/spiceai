@@ -14,10 +14,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/apache/arrow/go/v6/arrow"
-	"github.com/apache/arrow/go/v6/arrow/array"
-	"github.com/apache/arrow/go/v6/arrow/csv"
-	"github.com/apache/arrow/go/v6/arrow/memory"
+	"github.com/apache/arrow/go/v7/arrow"
+	"github.com/apache/arrow/go/v7/arrow/array"
+	"github.com/apache/arrow/go/v7/arrow/csv"
+	"github.com/apache/arrow/go/v7/arrow/memory"
 	"github.com/spf13/viper"
 	"github.com/spiceai/spiceai/pkg/constants"
 	"github.com/spiceai/spiceai/pkg/dataspace"
@@ -151,11 +151,7 @@ func (pod *Pod) CachedState() []*state.State {
 	return cachedState
 }
 
-func (pod *Pod) CachedCsv() string {
-	if len(pod.CachedState()) == 0 {
-		return ""
-	}
-
+func (pod *Pod) CachedRecord(csvTag bool) arrow.Record {
 	// Mapping the states and grouping them by starting time (with the first state being the longest)
 	stateMap := make(map[int64][]*state.State) // keep track of states from their starting time
 	var startTimeList []int64
@@ -186,20 +182,27 @@ func (pod *Pod) CachedCsv() string {
 	identifierValuesMap := make(map[string][]array.Interface)
 	categoryValuesMap := make(map[string][]array.Interface)
 	for _, idName := range pod.fqIdentifierNames {
-		fqFields = append(fqFields, arrow.Field{Name: idName, Type: arrow.BinaryTypes.String})
+		fqFields = append(fqFields, arrow.Field{Name: strings.ReplaceAll(idName, ".", "_"), Type: arrow.BinaryTypes.String})
 		identifierValuesMap[idName] = []array.Interface{}
 	}
 	for _, measurementName := range pod.fqMeasurementNames {
-		fqFields = append(fqFields, arrow.Field{Name: measurementName, Type: arrow.PrimitiveTypes.Float64})
+		fqFields = append(fqFields, arrow.Field{Name: strings.ReplaceAll(measurementName, ".", "_"), Type: arrow.PrimitiveTypes.Float64})
 		measurementValuesMap[measurementName] = []array.Interface{}
 	}
 	for _, catName := range pod.fqCategoryNames {
-		fqFields = append(fqFields, arrow.Field{Name: catName, Type: arrow.BinaryTypes.String})
+		fqFields = append(fqFields, arrow.Field{Name: strings.ReplaceAll(catName, ".", "_"), Type: arrow.BinaryTypes.String})
 		categoryValuesMap[catName] = []array.Interface{}
 	}
-	fqFields = append(fqFields, arrow.Field{Name: "tags", Type: arrow.BinaryTypes.String})
+	if csvTag {
+		fqFields = append(fqFields, arrow.Field{Name: "tags", Type: arrow.BinaryTypes.String})
+	} else {
+		fqFields = append(fqFields, arrow.Field{Name: "tags", Type: arrow.ListOf(arrow.BinaryTypes.String)})
+	}
 	tagBuilder := array.NewStringBuilder(pool)
 	defer tagBuilder.Release()
+	tagListBuilder := array.NewListBuilder(pool, arrow.BinaryTypes.String)
+	defer tagListBuilder.Release()
+	tagValueBuilder := tagListBuilder.ValueBuilder().(*array.StringBuilder)
 
 	// Accumulating values in the builder to create the merged record
 	numRows := int64(0)
@@ -327,30 +330,42 @@ func (pod *Pod) CachedCsv() string {
 			}
 		}
 		for i := 0; i < int(chunkLen); i++ {
-			var rowTags []string
-			for _, statePointer := range stateMap[startTime] {
-				if (*(*statePointer).Record()).NumRows() == chunkLen {
-					tagCol := (*(*statePointer).Record()).Column(int((*(*statePointer).Record()).NumCols() - 1)).(*array.List)
-					endOffset := tagCol.Offsets()[i+1]
-					tagValues := tagCol.ListValues().(*array.String)
-					if tagValues.IsValid(i) {
-						for pos := tagCol.Offsets()[i]; pos < endOffset; pos++ {
-							rowTags = append(rowTags, tagValues.Value(int(pos)))
+			if csvTag {
+				var rowTags []string
+				for _, statePointer := range stateMap[startTime] {
+					if (*(*statePointer).Record()).NumRows() == chunkLen {
+						tagCol := (*(*statePointer).Record()).Column(int((*(*statePointer).Record()).NumCols() - 1)).(*array.List)
+						endOffset := tagCol.Offsets()[i+1]
+						tagValues := tagCol.ListValues().(*array.String)
+						if tagValues.IsValid(i) {
+							for pos := tagCol.Offsets()[i]; pos < endOffset; pos++ {
+								rowTags = append(rowTags, tagValues.Value(int(pos)))
+							}
+						}
+					}
+				}
+				if len(rowTags) == 0 {
+					tagBuilder.AppendNull()
+				} else {
+					tagBuilder.Append(strings.Join(rowTags, " "))
+				}
+			} else {
+				tagListBuilder.Append(true)
+				for _, statePointer := range stateMap[startTime] {
+					if (*(*statePointer).Record()).NumRows() == chunkLen {
+						tagCol := (*(*statePointer).Record()).Column(int((*(*statePointer).Record()).NumCols() - 1)).(*array.List)
+						endOffset := tagCol.Offsets()[i+1]
+						tagValues := tagCol.ListValues().(*array.String)
+						if tagValues.IsValid(i) {
+							for pos := tagCol.Offsets()[i]; pos < endOffset; pos++ {
+								tagValueBuilder.Append(tagValues.Value(int(pos)))
+							}
 						}
 					}
 				}
 			}
-			if len(rowTags) == 0 {
-				tagBuilder.AppendNull()
-			} else {
-				tagBuilder.Append(strings.Join(rowTags, " "))
-			}
 		}
 	}
-
-	schema := arrow.NewSchema(fqFields, nil)
-	bytebuffer := new(bytes.Buffer)
-	writer := csv.NewWriter(bytebuffer, schema, csv.WithHeader(true), csv.WithComma(','), csv.WithNullWriter(""))
 
 	timeCol, _ := array.Concatenate(timeValues, pool)
 	cols := []array.Interface{timeCol}
@@ -375,16 +390,117 @@ func (pod *Pod) CachedCsv() string {
 		}
 		cols = append(cols, newCol)
 	}
-	cols = append(cols, tagBuilder.NewArray())
-	newrecord := array.NewRecord(schema, cols, numRows)
-	writer.Write(newrecord)
+	schema := arrow.NewSchema(fqFields, nil)
+	if csvTag {
+		cols = append(cols, tagBuilder.NewArray())
+	} else {
+		cols = append(cols, tagListBuilder.NewArray())
+	}
+	record := array.NewRecord(schema, cols, numRows)
 
-	timeCol.Release()
-	for _, col := range cols {
-		col.Release()
+	return record
+}
+
+func (pod *Pod) CachedCsv() string {
+	if len(pod.CachedState()) == 0 {
+		return ""
 	}
 
+	record := pod.CachedRecord(true)
+	bytebuffer := new(bytes.Buffer)
+	writer := csv.NewWriter(bytebuffer, record.Schema(), csv.WithHeader(true), csv.WithComma(','), csv.WithNullWriter(""))
+	writer.Write(record)
+
 	return string(bytebuffer.Bytes())
+}
+
+func (pod *Pod) CachedJson() string {
+	if len(pod.CachedState()) == 0 {
+		return "[]"
+	}
+	record := pod.CachedRecord(false)
+	builder := strings.Builder{}
+	builder.WriteString("[\n")
+
+	tagCol := record.Column(int(record.NumCols() - 1)).(*array.List)
+	tagOffsets := tagCol.Offsets()[1:]
+	tagValues := tagCol.ListValues().(*array.String)
+	tagPos := 0
+
+	rowIndex := 0
+	for {
+		builder.WriteString("  {\n")
+		builder.WriteString(
+			fmt.Sprintf("    \"time\": %d,\n", record.Column(0).(*array.Int64).Value(rowIndex)))
+		colIndex := 1
+		if len(pod.fqIdentifierNames) > 0 {
+			builder.WriteString("    \"identifiers\": {\n")
+			for idIndex, colName := range pod.fqIdentifierNames {
+				builder.WriteString(
+					fmt.Sprintf("      \"%s\": \"%s\"", colName, record.Column(colIndex).(*array.String).Value(rowIndex)))
+				if idIndex < len(pod.fqIdentifierNames)-1 {
+					builder.WriteString(",\n")
+				} else {
+					builder.WriteString("\n")
+				}
+				colIndex++
+			}
+			builder.WriteString("    },\n")
+		}
+		if len(pod.fqMeasurementNames) > 0 {
+			builder.WriteString("    \"measurements\": {\n")
+			for measurementIndex, colName := range pod.fqMeasurementNames {
+				builder.WriteString(
+					fmt.Sprintf("      \"%s\": %f", colName, record.Column(colIndex).(*array.Float64).Value(rowIndex)))
+				if measurementIndex < len(pod.fqMeasurementNames)-1 {
+					builder.WriteString(",\n")
+				} else {
+					builder.WriteString("\n")
+				}
+				colIndex++
+			}
+			builder.WriteString("    },\n")
+		}
+		if len(pod.fqCategoryNames) > 0 {
+			builder.WriteString("    \"categories\": {\n")
+			for catIndex, colName := range pod.fqCategoryNames {
+				builder.WriteString(
+					fmt.Sprintf("      \"%s\": \"%s\"", colName, record.Column(colIndex).(*array.String).Value(rowIndex)))
+				if catIndex < len(pod.fqCategoryNames)-1 {
+					builder.WriteString(",\n")
+				} else {
+					builder.WriteString("\n")
+				}
+				colIndex++
+			}
+			builder.WriteString("    },\n")
+		}
+		builder.WriteString("    \"tags\": [\n")
+		if tagValues.IsValid(rowIndex) {
+			if tagPos < int(tagOffsets[rowIndex]) {
+				for {
+					builder.WriteString(fmt.Sprintf("      \"%s\"", tagValues.Value(int(tagPos))))
+					tagPos++
+					if tagPos < int(tagOffsets[rowIndex]) {
+						builder.WriteString(",\n")
+					} else {
+						builder.WriteString("\n")
+					}
+				}
+			}
+		}
+		builder.WriteString("    ]\n")
+		rowIndex++
+		if rowIndex < int(record.NumRows()) {
+			builder.WriteString("  },\n")
+		} else {
+			builder.WriteString("  }\n")
+			break
+		}
+	}
+
+	builder.WriteString("]\n")
+	return builder.String()
 }
 
 func (pod *Pod) Dataspaces() []*dataspace.Dataspace {

@@ -71,7 +71,7 @@ func TestGetAddDataRequest(t *testing.T) {
 
 	s := state.NewState("event.stream", record)
 
-	addDataRequest := getAddDataRequest(pod, s)
+	addDataRequest := getAddDataRequest(pod, s, "")
 
 	assert.Equal(t, "event-categories", addDataRequest.Pod)
 

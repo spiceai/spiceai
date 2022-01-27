@@ -1,4 +1,4 @@
-time,event.data-invalid.eventId,event.data-invalid.height,event.data-invalid.rating,event.data-invalid.speed,event.data-invalid.target,tags
+time,event_data-invalid_eventId,event_data-invalid_height,event_data-invalid_rating,event_data-invalid_speed,event_data-invalid_target,tags
 1610057400,1,10,10,15,1,tagA tagB tagC tagD
 1610057800,2,20,11,30,2,tagA tagD
 1610058200,4,30,12,45,3,tagA tagC
