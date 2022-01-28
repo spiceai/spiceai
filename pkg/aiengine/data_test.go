@@ -1,7 +1,9 @@
 package aiengine
 
 import (
+	"fmt"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/spiceai/data-components-contrib/dataprocessors"
@@ -10,6 +12,7 @@ import (
 	// "github.com/spiceai/spiceai/pkg/dataspace"
 	"github.com/spiceai/spiceai/pkg/pods"
 	"github.com/spiceai/spiceai/pkg/state"
+
 	// spice_time "github.com/spiceai/spiceai/pkg/time"
 	"github.com/stretchr/testify/assert"
 )
@@ -69,30 +72,38 @@ func TestGetAddDataRequest(t *testing.T) {
 		return
 	}
 
-	s := state.NewState("event.stream", record)
+	newState := state.NewState("event.stream", record)
+	pod.AddLocalState(newState)
 
-	addDataRequest := getAddDataRequest(pod, s, "")
+	addDataRequest := getAddDataRequest(pod, newState, "")
 
 	assert.Equal(t, "event-categories", addDataRequest.Pod)
 
 	// csvData := strings.TrimSpace(addDataRequest.CsvData)
+	csvData := pod.CachedCsv()
 
-	// expectedNumberOfFields := 1 /* time */ + len(measurementNames) + len(categoryNames) + len(tags) + 6 /* category values in the data */
-	// for _, fields := range pod.TimeCategories() {
-	// 	expectedNumberOfFields += len(fields)
-	// }
+	expectedNumberOfFields := 1 /* time */ + len(measurements) + len(tagSelectors) + 5 /* category event_type */ + 3 /* category target_audience */
+	fmt.Printf("Expected number of fields: %d\n", expectedNumberOfFields)
+	fmt.Println(pod.TimeCategories())
+	for _, fields := range pod.TimeCategories() {
+		expectedNumberOfFields += len(fields)
+	}
+	fmt.Printf("Expected number of fields: %d\n", expectedNumberOfFields)
 
-	// csvLines := strings.Split(csvData, "\n")
-	// if assert.Len(t, csvLines, int(record.NumRows())+1, "number of csv lines does not match observations") {
-	// 	for _, csvLine := range csvLines {
-	// 		csvFields := strings.Split(csvLine, ",")
-	// 		if !assert.Len(t, csvFields, expectedNumberOfFields, "number of fields does not match state") {
-	// 			break
-	// 		}
-	// 	}
-	// }
+	fmt.Println(csvData)
+	fmt.Println(pod.CachedRecord(false))
+	csvLines := strings.Split(csvData, "\n")
+	// Arrow CSV writter add an empty line at the end so the number of lines should be header + rows + 1
+	if assert.Equal(t, len(csvLines), int(record.NumRows())+2, "number of csv lines does not match record") {
+		for _, csvLine := range csvLines[:len(csvLines)-1] {
+			csvFields := strings.Split(csvLine, ",")
+			if !assert.Equal(t, expectedNumberOfFields, len(csvFields), "number of fields does not match state") {
+				break
+			}
+		}
+	}
 
-	// snapshotter.SnapshotT(t, csvData)
+	snapshotter.SnapshotT(t, csvData)
 }
 
 // Tests "GetCsv() - All headers with preview

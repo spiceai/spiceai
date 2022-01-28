@@ -152,10 +152,15 @@ func (pod *Pod) CachedState() []*state.State {
 }
 
 func (pod *Pod) CachedRecord(csvTag bool) arrow.Record {
+	cacheStates := pod.CachedState()
+	if len(cacheStates) == 0 {
+		return nil
+	}
+
 	// Mapping the states and grouping them by starting time (with the first state being the longest)
 	stateMap := make(map[int64][]*state.State) // keep track of states from their starting time
 	var startTimeList []int64
-	for _, statePointer := range pod.CachedState() {
+	for _, statePointer := range cacheStates {
 		record := *statePointer.Record()
 		startTime := record.Column(0).(*array.Int64).Value(0)
 		stateList, ok := stateMap[startTime]
@@ -178,9 +183,18 @@ func (pod *Pod) CachedRecord(csvTag bool) arrow.Record {
 		{Name: "time", Type: arrow.PrimitiveTypes.Int64},
 	}
 	var timeValues []array.Interface
+	timeValuesMap := make(map[string][]array.Interface)
 	measurementValuesMap := make(map[string][]array.Interface)
 	identifierValuesMap := make(map[string][]array.Interface)
 	categoryValuesMap := make(map[string][]array.Interface)
+	categoryOneHotMap := make(map[string]map[string]int) // map[fqCategoryName][value] = field index
+	categoryOneHotNameMap := make(map[string][]string)   // map[fqCategoryNames] = [oneHotName1, oneHotName2, ...]
+	for _, timeCategoryName := range pod.timeCategoryNames {
+		for _, timeCategory := range pod.timeCategories[timeCategoryName] {
+			fqFields = append(fqFields, arrow.Field{Name: timeCategory.FieldName, Type: arrow.PrimitiveTypes.Int8})
+			timeValuesMap[timeCategory.FieldName] = []array.Interface{}
+		}
+	}
 	for _, idName := range pod.fqIdentifierNames {
 		fqFields = append(fqFields, arrow.Field{Name: strings.ReplaceAll(idName, ".", "_"), Type: arrow.BinaryTypes.String})
 		identifierValuesMap[idName] = []array.Interface{}
@@ -189,9 +203,17 @@ func (pod *Pod) CachedRecord(csvTag bool) arrow.Record {
 		fqFields = append(fqFields, arrow.Field{Name: strings.ReplaceAll(measurementName, ".", "_"), Type: arrow.PrimitiveTypes.Float64})
 		measurementValuesMap[measurementName] = []array.Interface{}
 	}
-	for _, catName := range pod.fqCategoryNames {
-		fqFields = append(fqFields, arrow.Field{Name: strings.ReplaceAll(catName, ".", "_"), Type: arrow.BinaryTypes.String})
-		categoryValuesMap[catName] = []array.Interface{}
+	for _, dataspace := range pod.Dataspaces() {
+		for _, category := range dataspace.Categories() {
+			categoryOneHotMap[category.FqName] = make(map[string]int)
+			categoryOneHotNameMap[category.FqName] = category.EncodedFieldNames
+			for valueIndex, oneHotName := range category.EncodedFieldNames {
+				categoryOneHotMap[category.FqName][category.Values[valueIndex]] = valueIndex
+				fqFields = append(
+					fqFields, arrow.Field{Name: oneHotName, Type: arrow.PrimitiveTypes.Int8})
+				categoryValuesMap[oneHotName] = []array.Interface{}
+			}
+		}
 	}
 	if csvTag {
 		fqFields = append(fqFields, arrow.Field{Name: "tags", Type: arrow.BinaryTypes.String})
@@ -215,6 +237,41 @@ func (pod *Pod) CachedRecord(csvTag bool) arrow.Record {
 				chunkLen = record.NumRows()
 				numRows += chunkLen
 				timeValues = append(timeValues, record.Column(0))
+				for _, timeCategoryName := range pod.timeCategoryNames {
+					recordTimeValues := record.Column(0).(*array.Int64)
+					valueBuilders := make([]*array.Int8Builder, len(pod.timeCategories[timeCategoryName]))
+					categoryValues := make([]int, len(valueBuilders))
+					for valueIndex := range valueBuilders {
+						valueBuilders[valueIndex] = array.NewInt8Builder(pool)
+						categoryValues[valueIndex] = pod.timeCategories[timeCategoryName][valueIndex].Value
+					}
+					for i := int64(0); i < chunkLen; i++ {
+						rowTime := time.Unix(recordTimeValues.Value(int(i)), 0)
+						var rowValue int
+						switch timeCategoryName {
+						case spice_time.CategoryMonth:
+							rowValue = int(rowTime.Month())
+						case spice_time.CategoryDayOfMonth:
+							rowValue = rowTime.Day()
+						case spice_time.CategoryDayOfWeek:
+							rowValue = int(rowTime.Weekday())
+						case spice_time.CategoryHour:
+							rowValue = rowTime.Hour()
+						}
+						for valueIndex, builder := range valueBuilders {
+							if categoryValues[valueIndex] == int(rowValue) {
+								builder.Append(1)
+							} else {
+								builder.Append(0)
+							}
+						}
+					}
+					for timeIndex, timeCategory := range pod.timeCategories[timeCategoryName] {
+						valueList := timeValuesMap[timeCategory.FieldName]
+						timeValuesMap[timeCategory.FieldName] = append(valueList, valueBuilders[timeIndex].NewArray())
+						valueBuilders[timeIndex].Release()
+					}
+				}
 			}
 			for _, name := range (*statePointer).IdentifierNames() {
 				fqName := (*statePointer).Origin() + "." + strings.Join(strings.Split(name, ".")[1:], ".")
@@ -232,7 +289,7 @@ func (pod *Pod) CachedRecord(csvTag bool) arrow.Record {
 					} else {
 						newBuilder := array.NewStringBuilder(pool)
 						defer newBuilder.Release()
-						for i := int64(0); i < numRows; i++ {
+						for i := int64(0); i < chunkLen; i++ {
 							newBuilder.AppendNull()
 						}
 						valueList = append(valueList, newBuilder.NewArray())
@@ -249,7 +306,7 @@ func (pod *Pod) CachedRecord(csvTag bool) arrow.Record {
 				}
 				valueList, ok := measurementValuesMap[fqName]
 				if !ok {
-					// fmt.Printf("Measurement column not found during CSV generation: %s\n", fqName)
+					fmt.Printf("Measurement column not found during CSV generation: %s\n", fqName)
 				} else {
 					if record.NumRows() == chunkLen {
 						valueList = append(valueList, record.Column((*statePointer).ColumnMap()[name]))
@@ -272,23 +329,43 @@ func (pod *Pod) CachedRecord(csvTag bool) arrow.Record {
 					fmt.Printf("Column already parsed during CSV generation at start time %d: %s\n", startTime, fqName)
 					continue
 				}
-				valueList, ok := categoryValuesMap[fqName]
+				valueMap, ok := categoryOneHotMap[fqName]
 				if !ok {
 					fmt.Printf("Measurement column not found during CSV generation: %s\n", fqName)
 				} else {
-					if record.NumRows() == chunkLen {
-						valueList = append(valueList, record.Column((*statePointer).ColumnMap()[name]))
-						parsedColumnMap[fqName] = true
-					} else {
-						newBuilder := array.NewStringBuilder(pool)
-						defer newBuilder.Release()
-						for i := int64(0); i < numRows; i++ {
-							newBuilder.AppendNull()
-						}
-						valueList = append(valueList, newBuilder.NewArray())
-						parsedColumnMap[fqName] = true
+					valueBuilders := make([]*array.Int8Builder, len(valueMap))
+					for valueIndex := range valueBuilders {
+						valueBuilders[valueIndex] = array.NewInt8Builder(pool)
 					}
-					categoryValuesMap[fqName] = valueList
+					if record.NumRows() == chunkLen {
+						recordValues := record.Column((*statePointer).ColumnMap()[name]).(*array.String)
+						for i := int64(0); i < chunkLen; i++ {
+							recordValueIndex := valueMap[recordValues.Value(int(i))]
+							for valueIndex, builder := range valueBuilders {
+								if valueIndex == recordValueIndex {
+									builder.Append(1)
+								} else {
+									builder.Append(0)
+								}
+							}
+						}
+						for valueIndex, oneHotName := range categoryOneHotNameMap[fqName] {
+							parsedColumnMap[oneHotName] = true
+							valueList, _ := categoryValuesMap[oneHotName]
+							categoryValuesMap[oneHotName] = append(valueList, valueBuilders[valueIndex].NewArray())
+							valueBuilders[valueIndex].Release()
+						}
+					} else {
+						for _, oneHotName := range categoryOneHotNameMap[fqName] {
+							newBuilder := array.NewBooleanBuilder(pool)
+							defer newBuilder.Release()
+							for i := int64(0); i < numRows; i++ {
+								newBuilder.Append(false)
+							}
+							valueList, _ := categoryValuesMap[oneHotName]
+							categoryValuesMap[oneHotName] = append(valueList, newBuilder.NewArray())
+						}
+					}
 				}
 			}
 			// Filling lacking data
@@ -316,16 +393,22 @@ func (pod *Pod) CachedRecord(csvTag bool) arrow.Record {
 					identifierValuesMap[fqName] = append(valueList, newList)
 				}
 			}
-			for fqName, valueList := range categoryValuesMap {
-				if !parsedColumnMap[fqName] {
-					newBuilder := array.NewStringBuilder(pool)
-					defer newBuilder.Release()
-					for i := int64(0); i < chunkLen; i++ {
-						newBuilder.AppendNull()
+			// for fqName, valueList := range categoryValuesMap {
+			for _, dataspace := range pod.Dataspaces() {
+				for _, category := range dataspace.Categories() {
+					for _, fqName := range category.EncodedFieldNames {
+						if !parsedColumnMap[fqName] {
+							newBuilder := array.NewInt8Builder(pool)
+							defer newBuilder.Release()
+							for i := int64(0); i < chunkLen; i++ {
+								newBuilder.AppendNull()
+							}
+							newList := newBuilder.NewArray()
+							parsedColumnMap[fqName] = true
+							valueList := categoryValuesMap[fqName]
+							categoryValuesMap[fqName] = append(valueList, newList)
+						}
 					}
-					newList := newBuilder.NewArray()
-					parsedColumnMap[fqName] = true
-					categoryValuesMap[fqName] = append(valueList, newList)
 				}
 			}
 		}
@@ -369,6 +452,15 @@ func (pod *Pod) CachedRecord(csvTag bool) arrow.Record {
 
 	timeCol, _ := array.Concatenate(timeValues, pool)
 	cols := []array.Interface{timeCol}
+	for _, timeCategoryName := range pod.timeCategoryNames {
+		for _, timeCategory := range pod.timeCategories[timeCategoryName] {
+			newCol, err := array.Concatenate(timeValuesMap[timeCategory.FieldName], pool)
+			if err != nil {
+				log.Fatalf("Error while creating column %s: %q\n", timeCategory.FieldName, err)
+			}
+			cols = append(cols, newCol)
+		}
+	}
 	for _, idName := range pod.fqIdentifierNames {
 		newCol, err := array.Concatenate(identifierValuesMap[idName], pool)
 		if err != nil {
@@ -383,12 +475,16 @@ func (pod *Pod) CachedRecord(csvTag bool) arrow.Record {
 		}
 		cols = append(cols, newCol)
 	}
-	for _, catName := range pod.fqCategoryNames {
-		newCol, err := array.Concatenate(categoryValuesMap[catName], pool)
-		if err != nil {
-			log.Fatalf("Error while creating column %s: %q\n", catName, err)
+	for _, dataspace := range pod.Dataspaces() {
+		for _, category := range dataspace.Categories() {
+			for _, fqName := range category.EncodedFieldNames {
+				newCol, err := array.Concatenate(categoryValuesMap[fqName], pool)
+				if err != nil {
+					log.Fatalf("Error while creating column %s: %q\n", fqName, err)
+				}
+				cols = append(cols, newCol)
+			}
 		}
-		cols = append(cols, newCol)
 	}
 	schema := arrow.NewSchema(fqFields, nil)
 	if csvTag {
@@ -465,7 +561,7 @@ func (pod *Pod) CachedJson() string {
 			builder.WriteString("    \"categories\": {\n")
 			for catIndex, colName := range pod.fqCategoryNames {
 				builder.WriteString(
-					fmt.Sprintf("      \"%s\": \"%s\"", colName, record.Column(colIndex).(*array.String).Value(rowIndex)))
+					fmt.Sprintf("      \"%s\": \"%d\"", colName, record.Column(colIndex).(*array.Int8).Value(rowIndex)))
 				if catIndex < len(pod.fqCategoryNames)-1 {
 					builder.WriteString(",\n")
 				} else {
