@@ -331,7 +331,7 @@ func (pod *Pod) CachedRecord(csvTag bool) arrow.Record {
 				}
 				valueMap, ok := categoryOneHotMap[fqName]
 				if !ok {
-					fmt.Printf("Measurement column not found during CSV generation: %s\n", fqName)
+					fmt.Printf("Category column not found during CSV generation: %s\n", fqName)
 				} else {
 					valueBuilders := make([]*array.Int8Builder, len(valueMap))
 					for valueIndex := range valueBuilders {

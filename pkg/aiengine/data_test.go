@@ -1,11 +1,12 @@
 package aiengine
 
 import (
-	"fmt"
+	"bytes"
 	"os"
 	"strings"
 	"testing"
 
+	"github.com/apache/arrow/go/v7/arrow/csv"
 	"github.com/spiceai/data-components-contrib/dataprocessors"
 	// "github.com/spiceai/data-components-contrib/dataprocessors/csv"
 	"github.com/spiceai/data-components-contrib/dataprocessors/json"
@@ -79,19 +80,17 @@ func TestGetAddDataRequest(t *testing.T) {
 
 	assert.Equal(t, "event-categories", addDataRequest.Pod)
 
-	// csvData := strings.TrimSpace(addDataRequest.CsvData)
-	csvData := pod.CachedCsv()
+	record = getProcessedRecord(pod, newState)
+	bytebuffer := new(bytes.Buffer)
+	writer := csv.NewWriter(bytebuffer, record.Schema(), csv.WithHeader(true), csv.WithComma(','), csv.WithNullWriter(""))
+	writer.Write(record)
+	csvData := string(bytebuffer.Bytes())
 
-	expectedNumberOfFields := 1 /* time */ + len(measurements) + len(tagSelectors) + 5 /* category event_type */ + 3 /* category target_audience */
-	fmt.Printf("Expected number of fields: %d\n", expectedNumberOfFields)
-	fmt.Println(pod.TimeCategories())
+	expectedNumberOfFields := 1 /* time */ + len(measurements) + 5 /* category event_type */ + 3 /* category target_audience */ + 3 /* tags */
 	for _, fields := range pod.TimeCategories() {
 		expectedNumberOfFields += len(fields)
 	}
-	fmt.Printf("Expected number of fields: %d\n", expectedNumberOfFields)
 
-	fmt.Println(csvData)
-	fmt.Println(pod.CachedRecord(false))
 	csvLines := strings.Split(csvData, "\n")
 	// Arrow CSV writter add an empty line at the end so the number of lines should be header + rows + 1
 	if assert.Equal(t, len(csvLines), int(record.NumRows())+2, "number of csv lines does not match record") {
