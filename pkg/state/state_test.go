@@ -174,6 +174,15 @@ func TestGetStateWithTagsFunc(t *testing.T) {
 	assert.Equal(t, "coinbase.btcusd", actualStates[2].Origin(), "expected origin incorrect")
 	assert.Equal(t, "coinbase_pro.btcusd", actualStates[3].Origin(), "expected origin incorrect")
 	assert.Equal(t, "local.btcusd", actualStates[4].Origin(), "expected origin incorrect")
+	for _, state := range actualStates {
+		assert.Equal(
+			t,
+			[]string{
+				"elon_tweet", "market_open", "bought_1", "tag_2", "market_close", "local_tag_1", "local_tag_2",
+				"use", "spice", "ai", "for", "all", "your", "intelligent", "time", "series", "app", "needs!"},
+			state.tags,
+			"expected tags incorrect")
+	}
 
 	fields := []arrow.Field{
 		{Name: "time", Type: arrow.PrimitiveTypes.Int64},

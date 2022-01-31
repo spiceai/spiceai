@@ -61,9 +61,7 @@ func NewState(origin string, record array.Record) *State {
 		}
 	}
 
-	// TODO: parse record to add tags
-
-	return &State{
+	newState := State{
 		Time:               time.Now(),
 		TimeSentToAIEngine: time.Time{},
 		origin:             origin,
@@ -75,6 +73,8 @@ func NewState(origin string, record array.Record) *State {
 		tagMap:             tagMap,
 		record:             record,
 	}
+	newState.addRecordTags(record)
+	return &newState
 }
 
 func GetStatesFromRecord(record array.Record) []*State {
@@ -184,7 +184,7 @@ func (s *State) AddData(newRecord array.Record) {
 	s.recordsMutex.Lock()
 	defer s.recordsMutex.Unlock()
 
-	// TODO: parse record to add tags
+	s.addRecordTags(newRecord)
 
 	pool := memory.NewGoAllocator()
 	var cols []array.Interface
@@ -196,4 +196,23 @@ func (s *State) AddData(newRecord array.Record) {
 	s.record.Release()
 	newRecord.Release()
 	s.record = mergedRecord
+}
+
+func (s *State) addRecordTags(record array.Record) {
+	tagCol := record.Column(int(record.NumCols() - 1)).(*array.List)
+	tagOffsets := tagCol.Offsets()[1:]
+	tagValues := tagCol.ListValues().(*array.String)
+	tagPos := 0
+	for rowIndex := 0; rowIndex < int(record.NumRows()); rowIndex++ {
+		if tagValues.IsValid(rowIndex) {
+			for tagPos < int(tagOffsets[rowIndex]) {
+				tagValue := tagValues.Value(tagPos)
+				if _, ok := s.tagMap[tagValue]; !ok {
+					s.tagMap[tagValue] = true
+					s.tags = append(s.tags, tagValue)
+				}
+				tagPos++
+			}
+		}
+	}
 }

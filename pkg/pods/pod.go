@@ -581,6 +581,7 @@ func (pod *Pod) CachedJson() string {
 						builder.WriteString(",\n")
 					} else {
 						builder.WriteString("\n")
+						break
 					}
 				}
 			}
