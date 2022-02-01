@@ -53,11 +53,11 @@ func SendData(pod *pods.Pod, podState ...*state.State) error {
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
 
-		// record := pod.CachedRecord(false)
 		record := getProcessedRecord(pod, state)
+		fmt.Println(record)
 
 		go func() {
-			if _, err := os.Stat(ipcPath); os.IsExist(err) {
+			if _, err := os.Stat(ipcPath); err == nil {
 				os.Remove(ipcPath)
 			}
 			listener, err := net.Listen("unix", ipcPath)
@@ -129,7 +129,6 @@ func getProcessedRecord(pod *pods.Pod, state *state.State) arrow.Record {
 			timeBuilderMap[timeCategory.FieldName] = array.NewInt8Builder(pool)
 		}
 	}
-	// fields = append(fields, record.Schema().Fields()[1:len(state.IdentifierNames())+len(state.MeasurementNames())+1]...)
 	for _, field := range record.Schema().Fields()[1 : len(state.IdentifierNames())+len(state.MeasurementNames())+1] {
 		fields = append(fields, arrow.Field{
 			Name: strings.Join(append(strings.Split(state.Origin(), "."), strings.Split(field.Name, ".")[1:]...), "_"),
@@ -202,7 +201,9 @@ func getProcessedRecord(pod *pods.Pod, state *state.State) arrow.Record {
 		if tagValues.IsValid(rowIndex) {
 			for tagPos < int(tagOffsets[rowIndex]) {
 				tagValue := tagValues.Value(tagPos)
-				tagBuilderMap[tagValue].Append(1)
+				if builder, ok := tagBuilderMap[tagValue]; ok {
+					builder.Append(1)
+				}
 				tagPos++
 			}
 		}
