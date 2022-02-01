@@ -109,7 +109,6 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
         return aiengine_pb2.Response(result="ok")
 
     def AddData(self, request: aiengine_pb2.AddDataRequest, context):
-        print(f"AIEngine AddData with request: {request}", flush=True)
         with Dispatch.INIT_LOCK:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as arrow_socket:
                 arrow_socket.settimeout(1)
@@ -203,7 +202,6 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
         return handler.get_result()
 
     def Init(self, request: aiengine_pb2.InitRequest, context):
-        print(f"AIEngine Init with request: {request}", flush=True)
         with Dispatch.INIT_LOCK:
             connector_manager = ConnectorManager()
 
@@ -350,7 +348,7 @@ def wait_parent_process():
 
 def interrupt_handler(_signum, _frame):
     shutdown_event.set()
-    print("\r  ")
+    print("\r  ", flush=True)
 
 
 def main():

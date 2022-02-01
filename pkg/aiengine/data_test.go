@@ -259,7 +259,6 @@ func TestGetAddDataRequest(t *testing.T) {
 // 			t.Fatal(err)
 // 		}
 
-// 		fmt.Println(string(data))
 // 		_, err = dp.OnData(data)
 // 		if err != nil {
 // 			t.Fatal(err)

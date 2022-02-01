@@ -54,7 +54,6 @@ func SendData(pod *pods.Pod, podState ...*state.State) error {
 		defer cancel()
 
 		record := getProcessedRecord(pod, state)
-		fmt.Println(record)
 
 		go func() {
 			if _, err := os.Stat(ipcPath); err == nil {
@@ -129,7 +128,7 @@ func getProcessedRecord(pod *pods.Pod, state *state.State) arrow.Record {
 			timeBuilderMap[timeCategory.FieldName] = array.NewInt8Builder(pool)
 		}
 	}
-	for _, field := range record.Schema().Fields()[1 : len(state.IdentifierNames())+len(state.MeasurementNames())+1] {
+	for _, field := range record.Schema().Fields()[1+len(state.IdentifierNames()) : len(state.MeasurementNames())+1] {
 		fields = append(fields, arrow.Field{
 			Name: strings.Join(append(strings.Split(state.Origin(), "."), strings.Split(field.Name, ".")[1:]...), "_"),
 			Type: field.Type})
@@ -222,7 +221,7 @@ func getProcessedRecord(pod *pods.Pod, state *state.State) arrow.Record {
 			builder.Release()
 		}
 	}
-	cols = append(cols, record.Columns()[1:len(state.IdentifierNames())+len(state.MeasurementNames())+1]...)
+	cols = append(cols, record.Columns()[1+len(state.IdentifierNames()):len(state.MeasurementNames())+1]...)
 	for _, category := range categories {
 		for _, oneHotName := range category.EncodedFieldNames {
 			cols = append(cols, categoryBuilderMap[oneHotName].NewArray())
