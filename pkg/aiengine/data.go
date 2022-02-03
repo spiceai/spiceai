@@ -66,7 +66,11 @@ func SendData(pod *pods.Pod, podState ...*state.State) error {
 			}
 			defer listener.Close()
 			unixListener := listener.(*net.UnixListener)
-			unixListener.SetDeadline(time.Now().Add(time.Second * 2))
+			err = unixListener.SetDeadline(time.Now().Add(time.Second * 2))
+			if err != nil {
+				fmt.Printf("failed to set IPC connection timeout for pod %s : %s\n", pod.Name, err)
+				return
+			}
 
 			connection, err := unixListener.Accept()
 			if err != nil {
@@ -79,8 +83,11 @@ func SendData(pod *pods.Pod, podState ...*state.State) error {
 			writer := ipc.NewWriter(connection, ipc.WithSchema(record.Schema()))
 			defer writer.Close()
 
-			// writer.Write(*s.Record())
-			writer.Write(record)
+			err = writer.Write(record)
+			if err != nil {
+				fmt.Printf("failed to write record to IPC for pod %s : %s\n", pod.Name, err)
+				return
+			}
 		}()
 
 		response, err := aiengineClient.AddData(ctx, addDataRequest)

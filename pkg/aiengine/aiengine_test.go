@@ -63,7 +63,12 @@ func TestInfer(t *testing.T) {
 }
 
 func TestPod(t *testing.T) {
-	defer tempdir.RemoveAllCreatedTempDirectories()
+	defer func() {
+		err := tempdir.RemoveAllCreatedTempDirectories()
+		if err != nil {
+			t.Fatalf("Error while removing temp file: %s", err)
+		}
+	}()
 	algorithmsMap = map[string]*LearningAlgorithm{
 		"dql": {
 			Id:   "dql",

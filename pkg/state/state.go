@@ -21,22 +21,22 @@ type State struct {
 	columnMap          map[string]int
 	tags               []string
 	tagMap             map[string]bool
-	record             array.Record
+	record             arrow.Record
 	recordsMutex       sync.RWMutex
 }
 
 type StateInfo struct {
 	idFields            []arrow.Field
-	idColumns           []array.Interface
+	idColumns           []arrow.Array
 	measurementFields   []arrow.Field
-	measurementsColumns []array.Interface
+	measurementsColumns []arrow.Array
 	categoryFields      []arrow.Field
-	categoryColumns     []array.Interface
+	categoryColumns     []arrow.Array
 }
 
 type StateHandler func(state *State, metadata map[string]string) error
 
-func NewState(origin string, record array.Record) *State {
+func NewState(origin string, record arrow.Record) *State {
 	if record == nil {
 		return nil
 	}
@@ -77,7 +77,7 @@ func NewState(origin string, record array.Record) *State {
 	return &newState
 }
 
-func GetStatesFromRecord(record array.Record) []*State {
+func GetStatesFromRecord(record arrow.Record) []*State {
 	if record == nil {
 		return []*State{}
 	}
@@ -133,7 +133,7 @@ func GetStatesFromRecord(record array.Record) []*State {
 		fields = append(fields, stateInfo.idFields...)
 		fields = append(fields, stateInfo.measurementFields...)
 		fields = append(fields, stateInfo.categoryFields...)
-		columns := []array.Interface{record.Column(timeCol)}
+		columns := []arrow.Array{record.Column(timeCol)}
 		columns = append(columns, stateInfo.idColumns...)
 		columns = append(columns, stateInfo.measurementsColumns...)
 		columns = append(columns, stateInfo.categoryColumns...)
@@ -168,7 +168,7 @@ func (s *State) ColumnMap() map[string]int {
 	return s.columnMap
 }
 
-func (s *State) Record() *array.Record {
+func (s *State) Record() *arrow.Record {
 	return &s.record
 }
 
@@ -180,16 +180,16 @@ func (s *State) Sent() {
 	s.TimeSentToAIEngine = time.Now()
 }
 
-func (s *State) AddData(newRecord array.Record) {
+func (s *State) AddData(newRecord arrow.Record) {
 	s.recordsMutex.Lock()
 	defer s.recordsMutex.Unlock()
 
 	s.addRecordTags(newRecord)
 
 	pool := memory.NewGoAllocator()
-	var cols []array.Interface
+	var cols []arrow.Array
 	for colIndex, col := range s.record.Columns() {
-		newCol, _ := array.Concatenate([]array.Interface{col, newRecord.Column(colIndex)}, pool)
+		newCol, _ := array.Concatenate([]arrow.Array{col, newRecord.Column(colIndex)}, pool)
 		cols = append(cols, newCol)
 	}
 	mergedRecord := array.NewRecord((*s.Record()).Schema(), cols, s.record.NumRows()+newRecord.NumRows())
@@ -198,7 +198,7 @@ func (s *State) AddData(newRecord array.Record) {
 	s.record = mergedRecord
 }
 
-func (s *State) addRecordTags(record array.Record) {
+func (s *State) addRecordTags(record arrow.Record) {
 	tagCol := record.Column(int(record.NumCols() - 1)).(*array.List)
 	tagOffsets := tagCol.Offsets()[1:]
 	tagValues := tagCol.ListValues().(*array.String)

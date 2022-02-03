@@ -83,8 +83,12 @@ func TestGetAddDataRequest(t *testing.T) {
 	record = getProcessedRecord(pod, newState)
 	bytebuffer := new(bytes.Buffer)
 	writer := csv.NewWriter(bytebuffer, record.Schema(), csv.WithHeader(true), csv.WithComma(','), csv.WithNullWriter(""))
-	writer.Write(record)
-	csvData := string(bytebuffer.Bytes())
+	err = writer.Write(record)
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	csvData := bytebuffer.String()
 
 	expectedNumberOfFields := 1 /* time */ + len(measurements) + 5 /* category event_type */ + 3 /* category target_audience */ + 3 /* tags */
 	for _, fields := range pod.TimeCategories() {

@@ -60,8 +60,6 @@ type Pod struct {
 	podLocalStateHandlers []state.StateHandler
 
 	interpretations *interpretations.InterpretationsStore
-
-	fqCsvHeaders string
 }
 
 func (pod *Pod) Hash() string {
@@ -183,26 +181,26 @@ func (pod *Pod) CachedRecord(csvTag bool) arrow.Record {
 	fqFields := []arrow.Field{
 		{Name: "time", Type: arrow.PrimitiveTypes.Int64},
 	}
-	var timeValues []array.Interface
-	timeValuesMap := make(map[string][]array.Interface)
-	measurementValuesMap := make(map[string][]array.Interface)
-	identifierValuesMap := make(map[string][]array.Interface)
-	categoryValuesMap := make(map[string][]array.Interface)
+	var timeValues []arrow.Array
+	timeValuesMap := make(map[string][]arrow.Array)
+	measurementValuesMap := make(map[string][]arrow.Array)
+	identifierValuesMap := make(map[string][]arrow.Array)
+	categoryValuesMap := make(map[string][]arrow.Array)
 	categoryOneHotMap := make(map[string]map[string]int) // map[fqCategoryName][value] = field index
 	categoryOneHotNameMap := make(map[string][]string)   // map[fqCategoryNames] = [oneHotName1, oneHotName2, ...]
 	for _, timeCategoryName := range pod.timeCategoryNames {
 		for _, timeCategory := range pod.timeCategories[timeCategoryName] {
 			fqFields = append(fqFields, arrow.Field{Name: timeCategory.FieldName, Type: arrow.PrimitiveTypes.Int8})
-			timeValuesMap[timeCategory.FieldName] = []array.Interface{}
+			timeValuesMap[timeCategory.FieldName] = []arrow.Array{}
 		}
 	}
 	for _, idName := range pod.fqIdentifierNames {
 		fqFields = append(fqFields, arrow.Field{Name: idName, Type: arrow.BinaryTypes.String})
-		identifierValuesMap[idName] = []array.Interface{}
+		identifierValuesMap[idName] = []arrow.Array{}
 	}
 	for _, measurementName := range pod.fqMeasurementNames {
 		fqFields = append(fqFields, arrow.Field{Name: measurementName, Type: arrow.PrimitiveTypes.Float64})
-		measurementValuesMap[measurementName] = []array.Interface{}
+		measurementValuesMap[measurementName] = []arrow.Array{}
 	}
 	for _, dataspace := range pod.Dataspaces() {
 		for _, category := range dataspace.Categories() {
@@ -212,7 +210,7 @@ func (pod *Pod) CachedRecord(csvTag bool) arrow.Record {
 				categoryOneHotMap[category.FqName][category.Values[valueIndex]] = valueIndex
 				fqFields = append(
 					fqFields, arrow.Field{Name: oneHotName, Type: arrow.PrimitiveTypes.Int8})
-				categoryValuesMap[oneHotName] = []array.Interface{}
+				categoryValuesMap[oneHotName] = []arrow.Array{}
 			}
 		}
 	}
@@ -358,7 +356,7 @@ func (pod *Pod) CachedRecord(csvTag bool) arrow.Record {
 						}
 						for valueIndex, oneHotName := range categoryOneHotNameMap[fqName] {
 							parsedColumnMap[oneHotName] = true
-							valueList, _ := categoryValuesMap[oneHotName]
+							valueList := categoryValuesMap[oneHotName]
 							categoryValuesMap[oneHotName] = append(valueList, valueBuilders[valueIndex].NewArray())
 							valueBuilders[valueIndex].Release()
 						}
@@ -369,7 +367,7 @@ func (pod *Pod) CachedRecord(csvTag bool) arrow.Record {
 							for i := int64(0); i < numRows; i++ {
 								newBuilder.Append(false)
 							}
-							valueList, _ := categoryValuesMap[oneHotName]
+							valueList := categoryValuesMap[oneHotName]
 							categoryValuesMap[oneHotName] = append(valueList, newBuilder.NewArray())
 						}
 					}
@@ -464,7 +462,7 @@ func (pod *Pod) CachedRecord(csvTag bool) arrow.Record {
 	} else {
 		timeCol, _ = array.Concatenate(timeValues, pool)
 	}
-	cols := []array.Interface{timeCol}
+	cols := []arrow.Array{timeCol}
 	for _, timeCategoryName := range pod.timeCategoryNames {
 		if numRows == 0 {
 			builder := array.NewInt8Builder(pool)
@@ -538,9 +536,12 @@ func (pod *Pod) CachedCsv() string {
 	record := pod.CachedRecord(true)
 	bytebuffer := new(bytes.Buffer)
 	writer := csv.NewWriter(bytebuffer, record.Schema(), csv.WithHeader(true), csv.WithComma(','), csv.WithNullWriter(""))
-	writer.Write(record)
+	err := writer.Write(record)
+	if err != nil {
+		log.Fatalf("Error while writing CSV: %s\n", err)
+	}
 
-	return string(bytebuffer.Bytes())
+	return bytebuffer.String()
 }
 
 func (pod *Pod) CachedJson() string {
@@ -1126,17 +1127,4 @@ func (pod *Pod) getActions() map[string]string {
 		}
 	}
 	return actions
-}
-
-func (pod *Pod) csvHeaders() string {
-	if pod.fqCsvHeaders == "" {
-		headers := make([]string, 0, len(pod.fqIdentifierNames)+len(pod.fqMeasurementNames)+len(pod.fqCategoryNames))
-		headers = append(headers, pod.fqIdentifierNames...)
-		headers = append(headers, pod.fqMeasurementNames...)
-		headers = append(headers, pod.fqCategoryNames...)
-
-		pod.fqCsvHeaders = fmt.Sprintf("time,%s,_tags\n", strings.Join(headers, ","))
-	}
-
-	return pod.fqCsvHeaders
 }
