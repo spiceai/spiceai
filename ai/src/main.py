@@ -114,10 +114,10 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
                 arrow_socket.settimeout(1)
                 try:
                     arrow_socket.connect(request.unix_socket)
-                except Exception:
+                except Exception as error:
                     return aiengine_pb2.Response(
                         result="connection_error",
-                        message="connection error",
+                        message=f"connection error: {error}",
                         error=True,
                     )
                 reader = pyarrow.ipc.RecordBatchStreamReader(arrow_socket.makefile(mode="rb"))
@@ -127,11 +127,11 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
             new_data = new_data.set_index("time")
 
             data_manager = data_managers[request.pod]
-            for field in new_data.columns[:-1]:
+            for field in new_data.columns:
                 if field not in data_manager.fields:
                     return aiengine_pb2.Response(
                         result="unexpected_field",
-                        message=f"Unexpected field: '{field}' {data_manager.fields}",
+                        message=f"Unexpected field: '{field}'",
                         error=True,
                     )
 

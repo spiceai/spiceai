@@ -2,11 +2,15 @@ import copy
 import csv
 import io
 import os
+from pathlib import Path
+import socket
 import tempfile
 import threading
 import unittest
 
 import pandas as pd
+import pyarrow as pa
+from pyarrow import csv as arrow_csv
 
 from cleanup import cleanup_on_shutdown, directories_to_delete
 import main
@@ -17,6 +21,7 @@ import train
 
 class TrainingLoopTests(unittest.TestCase):
     ALGORITHM = os.environ.get("ALGORITHM")
+    IPC_PATH = Path("/", "tmp", "spice_ai_test_loop.sock")
 
     def setUp(self):
         # Preventing tensorflow verbose initialization
@@ -62,11 +67,38 @@ class TrainingLoopTests(unittest.TestCase):
         self.assertEqual(resp.error, expected_error)
         self.assertEqual(resp.result, expected_result)
 
-    def add_data(self, pod_name: str, csv_data: str):
+    def add_data(self, pod_name: str, csv_data: str, should_error=False):
+        table = arrow_csv.read_csv(io.BytesIO(csv_data.encode()))
+        ready_barrier = threading.Barrier(2, timeout=2)
+        ipc_thread = threading.Thread(target=self.ipc_server, args=(self.IPC_PATH, table, ready_barrier,))
+        ipc_thread.start()
+        ready_barrier.wait()
         resp = self.aiengine.AddData(
-            aiengine_pb2.AddDataRequest(pod=pod_name, csv_data=csv_data), None
+            aiengine_pb2.AddDataRequest(pod=pod_name, unix_socket=str(self.IPC_PATH)), None
         )
-        self.assertFalse(resp.error)
+        ipc_thread.join()
+        if not should_error:
+            self.assertFalse(resp.error)
+        return resp
+
+    @staticmethod
+    def ipc_server(ipc_path: Path, table: pa.Table, ready_barrier: threading.Barrier):
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as arrow_socket:
+            if ipc_path.exists():
+                ipc_path.unlink()
+            try:
+                arrow_socket.settimeout(2)
+                arrow_socket.bind(str(ipc_path).encode())
+                arrow_socket.listen(1)
+                ready_barrier.wait()
+                connection, _address = arrow_socket.accept()
+                with connection:
+                    writer = pa.ipc.RecordBatchStreamWriter(connection.makefile(mode="wb"), table.schema)
+                    writer.write_table(table)
+            except OSError as error:
+                print(error)
+            arrow_socket.shutdown(socket.SHUT_RDWR)
+        ipc_path.unlink()
 
     def start_training(
             self, pod_name: str, flight: str = None, number_episodes: int = None, epoch_time: int = None,
@@ -472,10 +504,7 @@ class TrainingLoopTests(unittest.TestCase):
             row = [unix_seconds, None, None, 123]
             writer.writerow(row)
 
-        resp = self.aiengine.AddData(
-            aiengine_pb2.AddDataRequest(pod="trader", csv_data=csv_data.getvalue()),
-            None,
-        )
+        resp = self.add_data("trader", csv_data.getvalue(), should_error=True)
         self.assertTrue(resp.error)
         self.assertEqual(resp.result, "unexpected_field")
         self.assertEqual(resp.message, "Unexpected field: 'non_exist'")
