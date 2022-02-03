@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/fasthttp/router"
+	"github.com/spiceai/data-components-contrib/dataprocessors/csv"
 	"github.com/spiceai/spiceai/pkg/aiengine"
 	"github.com/spiceai/spiceai/pkg/api"
 	"github.com/spiceai/spiceai/pkg/dashboard"
@@ -18,8 +19,6 @@ import (
 	"github.com/spiceai/spiceai/pkg/flights"
 	"github.com/spiceai/spiceai/pkg/loggers"
 	"github.com/spiceai/spiceai/pkg/pods"
-	// "github.com/spiceai/spiceai/pkg/proto/common_pb"
-	"github.com/spiceai/data-components-contrib/dataprocessors/csv"
 	"github.com/spiceai/spiceai/pkg/proto/runtime_pb"
 	"github.com/spiceai/spiceai/pkg/state"
 	spice_time "github.com/spiceai/spiceai/pkg/time"
@@ -70,18 +69,7 @@ func apiGetObservationsHandler(ctx *fasthttp.RequestCtx) {
 	}
 
 	if string(ctx.Request.Header.Peek("Accept")) == "application/json" {
-		// 	observations := []*common_pb.Observation{}
-		// 	for _, state := range pod.CachedState() {
-		// 		obs := api.NewObservationsFromState(state)
-		// 		observations = append(observations, obs...)
-		// 	}
 		ctx.Response.Header.Add("Content-Type", "application/json")
-		// 	data, err := json.Marshal(observations)
-		// 	if err != nil {
-		// 		ctx.Response.SetStatusCode(500)
-		// 		fmt.Fprintf(ctx, "error getting observations: %s", err.Error())
-		// 		return
-		// 	}
 		_, _ = ctx.WriteString(pod.CachedJson())
 		return
 	}
@@ -133,16 +121,6 @@ func apiPostObservationsHandler(ctx *fasthttp.RequestCtx) {
 		return
 	}
 	newState := state.GetStatesFromRecord(record)
-
-	// validIdentifierNames := pod.IdentifierNames()
-	// validMeasurementNames := pod.MeasurementNames()
-	// validCategoryNames := pod.CategoryNames()
-	// newState, err := state.GetStateFromCsv(validIdentifierNames, validMeasurementNames, validCategoryNames, ctx.Request.Body())
-	// if err != nil {
-	// 	ctx.Response.SetStatusCode(400)
-	// 	fmt.Fprintf(ctx, "error processing csv: %s", err.Error())
-	// 	return
-	// }
 
 	pod.AddLocalState(newState...)
 

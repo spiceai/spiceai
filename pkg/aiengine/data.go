@@ -121,6 +121,8 @@ func getProcessedRecord(pod *pods.Pod, state *state.State) arrow.Record {
 
 	pool := memory.NewGoAllocator()
 
+	timeBuilder := array.NewInt64Builder(pool)
+	defer timeBuilder.Release()
 	timeBuilderMap := make(map[string]*array.Int8Builder)
 	for _, timeCategoryName := range pod.TimeCategoryNames() {
 		for _, timeCategory := range pod.TimeCategories()[timeCategoryName] {
@@ -128,10 +130,15 @@ func getProcessedRecord(pod *pods.Pod, state *state.State) arrow.Record {
 			timeBuilderMap[timeCategory.FieldName] = array.NewInt8Builder(pool)
 		}
 	}
-	for _, field := range record.Schema().Fields()[1+len(state.IdentifierNames()) : len(state.MeasurementNames())+1] {
-		fields = append(fields, arrow.Field{
-			Name: strings.Join(append(strings.Split(state.Origin(), "."), strings.Split(field.Name, ".")[1:]...), "_"),
-			Type: field.Type})
+
+	measurementBuilderMap := make(map[string]*array.Float64Builder)
+	var measurementNames []string
+	for _, measurementName := range state.MeasurementNames() {
+		colName := strings.ReplaceAll(
+			state.Origin()+"_"+strings.Join(strings.Split(measurementName, ".")[1:], "_"), ".", "_")
+		fields = append(fields, arrow.Field{Name: colName, Type: arrow.PrimitiveTypes.Float64})
+		measurementNames = append(measurementNames, colName)
+		measurementBuilderMap[colName] = array.NewFloat64Builder(pool)
 	}
 
 	var categories []*dataspace.CategoryInfo
@@ -158,13 +165,27 @@ func getProcessedRecord(pod *pods.Pod, state *state.State) arrow.Record {
 		}
 	}
 
+	epochTime := pod.Epoch().Unix()
+	epochEnd := pod.Epoch().Add(pod.Period()).Unix()
 	recordTimeValues := record.Column(0).(*array.Int64)
 	tagCol := record.Column(int(record.NumCols() - 1)).(*array.List)
 	tagOffsets := tagCol.Offsets()[1:]
 	tagValues := tagCol.ListValues().(*array.String)
 	tagPos := 0
+	numRows := 0
 	for rowIndex := 0; rowIndex < int(record.NumRows()); rowIndex++ {
-
+		timeValue := recordTimeValues.Value(rowIndex)
+		if timeValue < epochTime || timeValue > epochEnd {
+			// Advance tagPos for the next row
+			if tagValues.IsValid(rowIndex) {
+				for tagPos < int(tagOffsets[rowIndex]) {
+					tagPos++
+				}
+			}
+			continue
+		}
+		timeBuilder.Append(timeValue)
+		numRows++
 		for _, timeCategoryName := range pod.TimeCategoryNames() {
 			rowTime := time.Unix(recordTimeValues.Value(rowIndex), 0)
 			var rowValue int
@@ -185,6 +206,11 @@ func getProcessedRecord(pod *pods.Pod, state *state.State) arrow.Record {
 					timeBuilderMap[timeCategory.FieldName].Append(0)
 				}
 			}
+		}
+
+		for measureIndex, measurementName := range measurementNames {
+			measurementBuilderMap[measurementName].Append(
+				record.Column(1 + len(state.IdentifierNames()) + measureIndex).(*array.Float64).Value(rowIndex))
 		}
 
 		for _, category := range categories {
@@ -213,7 +239,7 @@ func getProcessedRecord(pod *pods.Pod, state *state.State) arrow.Record {
 		}
 	}
 
-	cols := []arrow.Array{record.Column(0)}
+	cols := []arrow.Array{timeBuilder.NewArray()}
 	for _, timeCategoryName := range pod.TimeCategoryNames() {
 		for _, timeCategory := range pod.TimeCategories()[timeCategoryName] {
 			builder := timeBuilderMap[timeCategory.FieldName]
@@ -221,7 +247,11 @@ func getProcessedRecord(pod *pods.Pod, state *state.State) arrow.Record {
 			builder.Release()
 		}
 	}
-	cols = append(cols, record.Columns()[1+len(state.IdentifierNames()):len(state.MeasurementNames())+1]...)
+	for _, measurementName := range measurementNames {
+		builder := measurementBuilderMap[measurementName]
+		cols = append(cols, builder.NewArray())
+		builder.Release()
+	}
 	for _, category := range categories {
 		for _, oneHotName := range category.EncodedFieldNames {
 			cols = append(cols, categoryBuilderMap[oneHotName].NewArray())
@@ -233,5 +263,5 @@ func getProcessedRecord(pod *pods.Pod, state *state.State) arrow.Record {
 		cols = append(cols, builder.NewArray())
 		builder.Release()
 	}
-	return array.NewRecord(arrow.NewSchema(fields, nil), cols, record.NumRows())
+	return array.NewRecord(arrow.NewSchema(fields, nil), cols, int64(numRows))
 }

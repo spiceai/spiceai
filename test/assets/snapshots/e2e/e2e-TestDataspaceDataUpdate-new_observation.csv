@@ -1,4 +1,4 @@
-time,csv.processor.eventId,csv.processor.height,csv.processor.rating,csv.processor.speed,csv.processor.target,json.processor.eventId,json.processor.height,json.processor.rating,json.processor.speed,json.processor.target,_tags
+time,csv.processor.eventId,csv.processor.height,csv.processor.rating,csv.processor.speed,csv.processor.target,json.processor.eventId,json.processor.height,json.processor.rating,json.processor.speed,json.processor.target,tags
 1605312000,,,,,,806.42,29,86,15,42,
 84,,,,,,85675.8,21,66,70,80,
 1600121040,,,,,,5723.42,6,22,45,8,
