@@ -2,8 +2,6 @@ module github.com/spiceai/spiceai
 
 go 1.17
 
-replace github.com/spiceai/data-components-contrib v0.0.1-fake-version => ../data-components-contrib
-
 require (
 	github.com/andybalholm/brotli v1.0.4 // indirect
 	github.com/bradleyjkemp/cupaloy v2.3.0+incompatible
@@ -17,7 +15,6 @@ require (
 	github.com/spf13/cast v1.4.1 // indirect
 	github.com/spf13/cobra v1.2.1
 	github.com/spf13/viper v1.9.0
-	github.com/spiceai/data-components-contrib v0.0.0-20220110133640-91525049ac3c
 	github.com/stretchr/testify v1.7.0
 	github.com/valyala/fasthttp v1.31.0
 	go.uber.org/atomic v1.9.0 // indirect
@@ -26,7 +23,7 @@ require (
 	golang.org/x/mod v0.5.1
 	golang.org/x/net v0.0.0-20211116231205-47ca1ff31462 // indirect
 	golang.org/x/sync v0.0.0-20210220032951-036812b2e83c
-	golang.org/x/sys v0.0.0-20211116061358-0a5406a5449c // indirect
+	golang.org/x/sys v0.0.0-20211205182925-97ca703d548d // indirect
 	golang.org/x/text v0.3.7 // indirect
 	google.golang.org/grpc v1.42.0
 	google.golang.org/protobuf v1.27.1
@@ -35,9 +32,11 @@ require (
 )
 
 require (
+	github.com/apache/arrow/go/v6 v6.0.1
 	github.com/gocarina/gocsv v0.0.0-20211020200912-82fc2684cc48
 	github.com/olekukonko/tablewriter v0.0.5
 	github.com/spf13/pflag v1.0.5
+	github.com/spiceai/data-components-contrib v0.0.0-20220117122209-262715e8d0eb
 )
 
 require (
@@ -51,7 +50,7 @@ require (
 	github.com/dghubble/oauth1 v0.7.0 // indirect
 	github.com/dghubble/sling v1.4.0 // indirect
 	github.com/gofrs/uuid v4.1.0+incompatible // indirect
-	github.com/golang-jwt/jwt/v4 v4.1.0 // indirect
+	github.com/golang-jwt/jwt/v4 v4.2.0 // indirect
 	github.com/golang/protobuf v1.5.2 // indirect
 	github.com/google/flatbuffers v2.0.0+incompatible // indirect
 	github.com/google/go-cmp v0.5.6 // indirect
@@ -79,7 +78,7 @@ require (
 	github.com/uber/jaeger-lib v2.4.1+incompatible // indirect
 	github.com/valyala/bytebufferpool v1.0.0 // indirect
 	golang.org/x/xerrors v0.0.0-20200804184101-5ec99f83aff1 // indirect
-	google.golang.org/genproto v0.0.0-20211116182654-e63d96a377c4 // indirect
+	google.golang.org/genproto v0.0.0-20211208223120-3a66f561d7aa // indirect
 	gopkg.in/ini.v1 v1.64.0 // indirect
 	gopkg.in/yaml.v3 v3.0.0-20210107192922-496545a6307b // indirect
 )

@@ -277,7 +277,15 @@ func (ds *Dataspace) readData(processor dataprocessors.DataProcessor, data []byt
 		return nil, err
 	}
 
-	observations, err := processor.GetObservations()
+	record, err := processor.GetRecord()
+	if err != nil {
+		return nil, err
+	}
+
+	observations, err := ArrowToObservations(record)
+	if record != nil {
+		record.Release()
+	}
 	if err != nil {
 		return nil, err
 	}
