@@ -36,7 +36,7 @@ require (
 	github.com/gocarina/gocsv v0.0.0-20211203214250-4735fba0c1d9
 	github.com/olekukonko/tablewriter v0.0.5
 	github.com/spf13/pflag v1.0.5
-	github.com/spiceai/data-components-contrib v0.0.0-20220205042313-6c709f2b1f35
+	github.com/spiceai/data-components-contrib v0.0.0-20220207051059-5929e51fbca1
 )
 
 require (
