@@ -245,7 +245,7 @@ func (pod *Pod) CachedRecord(csvTag bool) arrow.Record {
 						categoryValues[valueIndex] = pod.timeCategories[timeCategoryName][valueIndex].Value
 					}
 					for i := int64(0); i < chunkLen; i++ {
-						rowTime := time.Unix(recordTimeValues.Value(int(i)), 0)
+						rowTime := time.Unix(recordTimeValues.Value(int(i)), 0).UTC()
 						var rowValue int
 						switch timeCategoryName {
 						case spice_time.CategoryMonth:
@@ -1027,7 +1027,7 @@ func (pod *Pod) loadParams() error {
 			if err != nil {
 				return err
 			}
-			podParams.Epoch = time.Unix(intVal, 0)
+			podParams.Epoch = time.Unix(intVal, 0).UTC()
 		}
 
 		str, ok = pod.PodSpec.Params["period"]

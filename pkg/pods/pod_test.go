@@ -330,7 +330,7 @@ func testCachedCsvFunc(pod *Pod) func(*testing.T) {
 // Tests AddLocalState()
 func testAddLocalStateFunc(pod *Pod) func(*testing.T) {
 	return func(t *testing.T) {
-		epoch := time.Unix(1605312000, 0)
+		epoch := time.Unix(1605312000, 0).UTC()
 		period := 7 * 24 * time.Hour
 		interval := time.Hour
 
@@ -379,7 +379,7 @@ func testAddLocalStateFunc(pod *Pod) func(*testing.T) {
 // Tests CachedCsv() called after AddLocalState()
 func testAddLocalStateCachedCsvFunc(pod *Pod) func(*testing.T) {
 	return func(t *testing.T) {
-		epoch := time.Unix(1605312000, 0)
+		epoch := time.Unix(1605312000, 0).UTC()
 		period := 7 * 24 * time.Hour
 		interval := time.Hour
 

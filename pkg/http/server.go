@@ -351,8 +351,8 @@ func apiPostFlightEpisodeHandler(ctx *fasthttp.RequestCtx) {
 
 	episode := &flights.Episode{
 		EpisodeId:    apiEpisode.Episode,
-		Start:        time.Unix(apiEpisode.Start, 0),
-		End:          time.Unix(apiEpisode.End, 0),
+		Start:        time.Unix(apiEpisode.Start, 0).UTC(),
+		End:          time.Unix(apiEpisode.End, 0).UTC(),
 		Score:        apiEpisode.Score,
 		ActionsTaken: apiEpisode.ActionsTaken,
 		Error:        apiEpisode.Error,

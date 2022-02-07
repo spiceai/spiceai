@@ -194,7 +194,7 @@ func getProcessedRecord(pod *pods.Pod, state *state.State) arrow.Record {
 		timeBuilder.Append(timeValue)
 		numRows++
 		for _, timeCategoryName := range pod.TimeCategoryNames() {
-			rowTime := time.Unix(recordTimeValues.Value(rowIndex), 0)
+			rowTime := time.Unix(recordTimeValues.Value(rowIndex), 0).UTC()
 			var rowValue int
 			switch timeCategoryName {
 			case spice_time.CategoryMonth:

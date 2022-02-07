@@ -154,7 +154,7 @@ func TestGetAddDataRequest(t *testing.T) {
 // 		}
 
 // 		csv := strings.Builder{}
-// 		epoch := time.Unix(1605312001, 0)
+// 		epoch := time.Unix(1605312001, 0).UTC()
 // 		headerLine := "open,high,low,close,volume"
 // 		timeCategoryNames := []string{}
 // 		timeCategoryFields := spice_time.GenerateTimeCategoryFields(timeCategoryNames...)
@@ -220,7 +220,7 @@ func TestGetAddDataRequest(t *testing.T) {
 // 		}
 
 // 		csv := strings.Builder{}
-// 		epoch := time.Unix(1605312000, 0)
+// 		epoch := time.Unix(1605312000, 0).UTC()
 // 		timeCategoryNames := []string{"month", "dayofweek"}
 // 		timeCategoryFields := spice_time.GenerateTimeCategoryFields(timeCategoryNames...)
 // 		measurementNames := strings.Split("open,high,low,close,volume", ",")
@@ -282,7 +282,7 @@ func TestGetAddDataRequest(t *testing.T) {
 // 		}
 
 // 		csv := strings.Builder{}
-// 		epoch := time.Unix(1610057400, 0)
+// 		epoch := time.Unix(1610057400, 0).UTC()
 // 		timeCategoryNames := []string{}
 // 		timeCategoryFields := spice_time.GenerateTimeCategoryFields(timeCategoryNames...)
 // 		measurementNames := []string{"height", "rating", "speed", "target"}
@@ -348,7 +348,7 @@ func TestGetAddDataRequest(t *testing.T) {
 // 		}
 
 // 		csv := strings.Builder{}
-// 		epoch := time.Unix(1610057400, 0)
+// 		epoch := time.Unix(1610057400, 0).UTC()
 // 		timeCategoryNames := []string{}
 // 		timeCategoryFields := spice_time.GenerateTimeCategoryFields(timeCategoryNames...)
 // 		measurementNames := []string{"duration", "guest_count", "ticket_price"}
