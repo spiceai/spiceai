@@ -58,7 +58,7 @@ func testRegisterStateHandlers() func(*testing.T) {
 
 		go func() {
 			time.Sleep(500 * time.Millisecond)
-			fmt.Println("expired")
+			fmt.Println("Time to receive data expired")
 			data_received <- false
 		}()
 

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -14,6 +15,7 @@ import (
 	"github.com/apache/arrow/go/v7/arrow/ipc"
 	"github.com/apache/arrow/go/v7/arrow/memory"
 	"github.com/logrusorgru/aurora"
+	"github.com/spiceai/spiceai/pkg/constants"
 	"github.com/spiceai/spiceai/pkg/dataspace"
 	"github.com/spiceai/spiceai/pkg/pods"
 	"github.com/spiceai/spiceai/pkg/proto/aiengine_pb"
@@ -24,8 +26,6 @@ import (
 var (
 	ipcMutex sync.RWMutex
 )
-
-const ipcPath = "/tmp/spice_ipc.sock"
 
 func SendData(pod *pods.Pod, podState ...*state.State) error {
 	if len(podState) == 0 {
@@ -42,6 +42,17 @@ func SendData(pod *pods.Pod, podState ...*state.State) error {
 		ipcMutex.Lock()
 		defer ipcMutex.Unlock()
 
+		homeDir, err := os.UserHomeDir()
+		if err != nil {
+			return fmt.Errorf("failed to find home directory for %s: %s\n", pod.Name, err)
+		}
+		if _, err := os.Stat(filepath.Join(homeDir, constants.DotSpice)); os.IsNotExist(err) {
+			err = os.Mkdir(filepath.Join(homeDir, constants.DotSpice), 0755)
+			if err != nil {
+				return fmt.Errorf("failed to create dotfile directory for %s: %s\n", pod.Name, err)
+			}
+		}
+		ipcPath := filepath.Join(homeDir, constants.DotSpice, "spice_ipc.sock")
 		addDataRequest := getAddDataRequest(pod, state, ipcPath)
 
 		if addDataRequest == nil {
@@ -55,31 +66,29 @@ func SendData(pod *pods.Pod, podState ...*state.State) error {
 
 		record := getProcessedRecord(pod, state)
 
-		go func() {
-			if _, err := os.Stat(ipcPath); err == nil {
-				os.Remove(ipcPath)
-			}
-			listener, err := net.Listen("unix", ipcPath)
-			if err != nil {
-				fmt.Printf("failed to create IPC server for pod %s: %s\n", pod.Name, err)
-				return
-			}
-			defer listener.Close()
-			unixListener := listener.(*net.UnixListener)
-			err = unixListener.SetDeadline(time.Now().Add(time.Second * 2))
-			if err != nil {
-				fmt.Printf("failed to set IPC connection timeout for pod %s : %s\n", pod.Name, err)
-				return
-			}
+		// Prepare UNIX socket
+		if _, err := os.Stat(ipcPath); err == nil {
+			os.Remove(ipcPath)
+		}
+		listener, err := net.Listen("unix", ipcPath)
+		if err != nil {
+			return fmt.Errorf("failed to create IPC server for pod %s: %s\n", pod.Name, err)
+		}
+		unixListener := listener.(*net.UnixListener)
+		err = unixListener.SetDeadline(time.Now().Add(time.Second * 2))
+		if err != nil {
+			return fmt.Errorf("failed to set IPC connection timeout for pod %s : %s\n", pod.Name, err)
+		}
 
+		go func() {
+			defer listener.Close()
 			connection, err := unixListener.Accept()
 			if err != nil {
-				fmt.Printf("failed to accept IPC connection for pod %s : %s\n", pod.Name, err)
+				fmt.Printf("aiengine failed to accept IPC connection for pod %s : %s\n", pod.Name, err)
 				return
 			}
 			defer connection.Close()
 
-			// writer := ipc.NewWriter(connection, ipc.WithSchema((*s.Record()).Schema()))
 			writer := ipc.NewWriter(connection, ipc.WithSchema(record.Schema()))
 			defer writer.Close()
 
