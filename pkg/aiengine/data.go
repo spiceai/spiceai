@@ -46,6 +46,9 @@ func SendData(pod *pods.Pod, podState ...*state.State) error {
 		if err != nil {
 			return fmt.Errorf("failed to find home directory for %s: %s\n", pod.Name, err)
 		}
+		if _, err := os.Stat(filepath.Join(homeDir, constants.DotSpice)); os.IsNotExist(err) {
+			os.Mkdir(filepath.Join(homeDir, constants.DotSpice), 0755)
+		}
 		ipcPath := filepath.Join(homeDir, constants.DotSpice, "spice_ipc.sock")
 		addDataRequest := getAddDataRequest(pod, state, ipcPath)
 
