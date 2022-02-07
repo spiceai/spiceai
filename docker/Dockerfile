@@ -39,6 +39,7 @@ WORKDIR /app
 ENV HOME=/app/home
 
 COPY ai/src/requirements/common.txt ai/src/requirements/production.txt ./
+RUN python3 -m pip install --upgrade pip
 RUN python3 -m pip install -r production.txt
 
 COPY ai/src/*.py ./ai/

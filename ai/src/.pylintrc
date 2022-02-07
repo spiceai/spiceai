@@ -6,6 +6,7 @@ disable=missing-docstring,broad-except,R0801
 
 [TYPECHECK]
 generated-members=proto.*
+ignored-modules=tensorflow.keras
 
 [FORMAT]
 max-line-length=120
