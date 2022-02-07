@@ -16,8 +16,8 @@ type Interpretation struct {
 
 func NewInterpretationFromApi(apiInterpretation *Interpretation) (*interpretations.Interpretation, error) {
 	i, err := interpretations.NewInterpretation(
-		time.Unix(apiInterpretation.Start, 0),
-		time.Unix(apiInterpretation.End, 0),
+		time.Unix(apiInterpretation.Start, 0).UTC(),
+		time.Unix(apiInterpretation.End, 0).UTC(),
 		apiInterpretation.Name,
 	)
 

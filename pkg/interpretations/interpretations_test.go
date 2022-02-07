@@ -117,7 +117,7 @@ func testGetInterpretationsFunc() func(*testing.T) {
 // Tests TimeIndex()
 func testTimeIndexFunc() func(*testing.T) {
 	return func(t *testing.T) {
-		epoch := time.Unix(1631590387, 0)
+		epoch := time.Unix(1631590387, 0).UTC()
 		period := 1000 * time.Second
 		granularity := time.Second
 

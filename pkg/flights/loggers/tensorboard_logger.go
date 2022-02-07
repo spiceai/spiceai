@@ -11,57 +11,71 @@ import (
 	"sync"
 	"time"
 
+	"github.com/logrusorgru/aurora"
 	"github.com/spiceai/spiceai/pkg/context"
+	"github.com/spiceai/spiceai/pkg/util"
 )
+
+type TensorBoard struct {
+	cmd *exec.Cmd
+	url *url.URL
+}
 
 var (
 	cmdMutex             sync.Mutex
-	tensorboardInstances map[string]*exec.Cmd
+	tensorboardInstances map[string]*TensorBoard
 )
 
 type TensorboardLogger struct {
-	RunId   string
-	LogDir  string
-	address string
+	RunId  string
+	LogDir string
 }
 
 func (t *TensorboardLogger) Name() string {
 	return "TensorBoard"
 }
 
-func (l *TensorboardLogger) Open() (string, error) {
+func (l *TensorboardLogger) Open() (*url.URL, error) {
 	// Open to the run parent, to allow comparison across runs
 	runsDir, err := filepath.Abs(filepath.Dir(l.LogDir))
 	if err != nil {
-		return "", fmt.Errorf("failed to get runs dir: %w", err)
+		return nil, fmt.Errorf("failed to get runs dir: %w", err)
 	}
 
 	cmdMutex.Lock()
 	defer cmdMutex.Unlock()
 
 	if len(tensorboardInstances) == 0 {
-		tensorboardInstances = make(map[string]*exec.Cmd)
+		tensorboardInstances = make(map[string]*TensorBoard)
+	} else {
+		tb, ok := tensorboardInstances[runsDir]
+		if ok && tb != nil {
+			conn, err := net.DialTimeout("tcp", tb.url.Host, time.Second)
+			if err == nil {
+				conn.Close()
+				return tb.url, nil
+			}
+
+			delete(tensorboardInstances, runsDir)
+		}
 	}
 
-	cmd, ok := tensorboardInstances[runsDir]
-	if ok && cmd != nil {
-		_, err = net.DialTimeout("tcp", l.address, time.Second)
-		if err == nil {
-			return l.address, nil
-		}
-		
-		delete(tensorboardInstances, runsDir)
-		cmd = nil
-	}
+	args := []string{"--logdir", runsDir}
 
 	rtcontext := context.CurrentContext()
-	tensorboardCmd := filepath.Join(rtcontext.AIEngineBinDir(), "tensorboard")
-	cmd = exec.Command(tensorboardCmd, "--logdir", runsDir)
-	tensorboardInstances[runsDir] = cmd
+	var tensorboardCmd string
+	if rtcontext.Name() == "docker" {
+		tensorboardCmd = "tensorboard"
+		args = append(args, "--bind_all")
+	} else {
+		tensorboardCmd = filepath.Join(rtcontext.AIEngineBinDir(), "tensorboard")
+	}
+
+	cmd := exec.Command(tensorboardCmd, args...)
 
 	stderrPipe, err := cmd.StderrPipe()
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	defer stderrPipe.Close()
 
@@ -69,9 +83,15 @@ func (l *TensorboardLogger) Open() (string, error) {
 
 	startedLineChan := make(chan string, 1)
 
+	outBuilder := strings.Builder{}
+
 	go func() {
 		for outScanner.Scan() {
 			line := outScanner.Text()
+			outBuilder.WriteString(line)
+			if util.IsDebug() {
+				fmt.Println(aurora.BrightYellow(line))
+			}
 			if strings.HasPrefix(line, "TensorBoard ") && strings.HasSuffix(line, "(Press CTRL+C to quit)") {
 				startedLineChan <- line
 				return
@@ -82,37 +102,41 @@ func (l *TensorboardLogger) Open() (string, error) {
 
 	err = cmd.Start()
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
 	startedLine := <-startedLineChan
 
 	if outScanner.Err() != nil {
-		return "", outScanner.Err()
+		return nil, outScanner.Err()
 	}
 
 	if startedLine == "" {
-		return "", fmt.Errorf("Tensorboard failed to start: %s", outScanner.Text())
+		return nil, fmt.Errorf("Tensorboard failed to start: %s", outBuilder.String())
 	}
 
 	parts := strings.Split(startedLine, " ")
 	if len(parts) < 5 {
-		return "", fmt.Errorf("Tensorboard failed to start: %s", outScanner.Text())
+		return nil, fmt.Errorf("Tensorboard failed to start: %s", outBuilder.String())
 	}
-
-	fmt.Printf("Opening %s %s %s %s\n", parts[0], parts[1], parts[2], parts[3])
 
 	url, err := url.Parse(parts[3])
 	if err != nil {
-		return "", fmt.Errorf("Tensorboard failed to start: %w", err)
+		return nil, fmt.Errorf("Tensorboard failed to start: %w", err)
 	}
+
+	if rtcontext.Name() == "docker" {
+		url.Host = fmt.Sprintf("localhost:%s", url.Port())
+	}
+
+	fmt.Printf("Opening %s %s %s %s\n", parts[0], parts[1], parts[2], url.String())
 
 	tries := 0
 
 	for {
 		tries++
 		if tries > 10 {
-			return "", fmt.Errorf("Tensorboard failed to start: timed out")
+			return nil, fmt.Errorf("Tensorboard failed to start: timed out")
 		}
 		timeout := time.Second
 		conn, _ := net.DialTimeout("tcp", url.Host, timeout)
@@ -122,7 +146,10 @@ func (l *TensorboardLogger) Open() (string, error) {
 		}
 	}
 
-	l.address = parts[3]
+	tensorboardInstances[runsDir] = &TensorBoard{
+		cmd: cmd,
+		url: url,
+	}
 
-	return l.address, err
+	return url, err
 }

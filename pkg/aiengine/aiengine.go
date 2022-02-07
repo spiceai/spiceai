@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/logrusorgru/aurora"
@@ -35,8 +36,9 @@ var (
 	getClient           = NewAIEngineClient
 	aiServerCmd         *exec.Cmd
 	aiServerRunning     chan bool
-	aiServerReady       bool        = false
-	aiSingleTrainingRun bool        = false
+	aiServerReady       bool = false
+	aiSingleTrainingRun bool = false
+	shutdownMutex       sync.Mutex
 	zaplog              *zap.Logger = loggers.ZapLogger()
 )
 
@@ -57,7 +59,9 @@ func StartServer(ready chan bool, isSingleRun bool) error {
 
 	rtcontext := spice_context.CurrentContext()
 	aiServerPath := filepath.Join(rtcontext.AIEngineDir(), pythonServerFilename)
+	shutdownMutex.Lock()
 	aiServerCmd = execCommand(rtcontext.AIEnginePythonCmdPath(), aiServerPath)
+	shutdownMutex.Unlock()
 	aiServerRunning := make(chan bool, 1)
 
 	var err error
@@ -120,6 +124,7 @@ func StartServer(ready chan bool, isSingleRun bool) error {
 			}
 		}()
 
+		time.Sleep(time.Millisecond * 50)
 		err = aiServerCmd.Start()
 		if err != nil {
 			log.Println(fmt.Errorf("error starting %s: %w", aiServerCmd.Path, err))
@@ -134,16 +139,19 @@ func StartServer(ready chan bool, isSingleRun bool) error {
 			waitForServerHealthy(30)
 			aiServerReady = true
 			ready <- true
+			serverCmdPath := aiServerCmd.Path
 			appErr := aiServerCmd.Wait()
 
+			shutdownMutex.Lock()
+			defer shutdownMutex.Unlock()
 			if appErr != nil {
-				log.Println(fmt.Errorf("process %s exited with error: %w", aiServerCmd.Path, appErr))
+				log.Println(fmt.Errorf("process %s exited with error: %w", serverCmdPath, appErr))
 			}
 			if fileLogger != nil {
 				_ = fileLogger.Sync()
 			}
 
-			if appErr != nil && !aiServerCmd.ProcessState.Success() && !isTestEnvironment() {
+			if appErr != nil && aiServerCmd != nil && !aiServerCmd.ProcessState.Success() && !isTestEnvironment() {
 				// If the AI engine crashes, pass on its exit status
 				os.Exit(aiServerCmd.ProcessState.ExitCode())
 			}
@@ -161,6 +169,8 @@ func StartServer(ready chan bool, isSingleRun bool) error {
 }
 
 func StopServer() error {
+	shutdownMutex.Lock()
+	defer shutdownMutex.Unlock()
 	aiServerReady = false
 	if aiServerCmd != nil {
 		err := aiServerCmd.Process.Kill()

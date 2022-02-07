@@ -2,13 +2,14 @@ package flights
 
 import (
 	"fmt"
+	"net/url"
 
 	"github.com/spiceai/spiceai/pkg/flights/loggers"
 )
 
 type TrainingLogger interface {
 	Name() string
-	Open() (string, error)
+	Open() (*url.URL, error)
 }
 
 func (f *Flight) LoadLogger(loggerId string) (TrainingLogger, error) {

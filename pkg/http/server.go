@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/fasthttp/router"
+	"github.com/spiceai/data-components-contrib/dataprocessors/csv"
 	"github.com/spiceai/spiceai/pkg/aiengine"
 	"github.com/spiceai/spiceai/pkg/api"
 	"github.com/spiceai/spiceai/pkg/dashboard"
@@ -18,7 +19,6 @@ import (
 	"github.com/spiceai/spiceai/pkg/flights"
 	"github.com/spiceai/spiceai/pkg/loggers"
 	"github.com/spiceai/spiceai/pkg/pods"
-	"github.com/spiceai/spiceai/pkg/proto/common_pb"
 	"github.com/spiceai/spiceai/pkg/proto/runtime_pb"
 	"github.com/spiceai/spiceai/pkg/state"
 	spice_time "github.com/spiceai/spiceai/pkg/time"
@@ -69,19 +69,8 @@ func apiGetObservationsHandler(ctx *fasthttp.RequestCtx) {
 	}
 
 	if string(ctx.Request.Header.Peek("Accept")) == "application/json" {
-		observations := []*common_pb.Observation{}
-		for _, state := range pod.CachedState() {
-			obs := api.NewObservationsFromState(state)
-			observations = append(observations, obs...)
-		}
 		ctx.Response.Header.Add("Content-Type", "application/json")
-		data, err := json.Marshal(observations)
-		if err != nil {
-			ctx.Response.SetStatusCode(500)
-			fmt.Fprintf(ctx, "error getting observations: %s", err.Error())
-			return
-		}
-		_, _ = ctx.Write(data)
+		_, _ = ctx.WriteString(pod.CachedJson())
 		return
 	}
 
@@ -99,16 +88,39 @@ func apiPostObservationsHandler(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	validIdentifierNames := pod.IdentifierNames()
-	validMeasurementNames := pod.MeasurementNames()
-	validCategoryNames := pod.CategoryNames()
+	idMap := make(map[string]string)
+	for _, name := range pod.IdentifierNames() {
+		idMap[name] = name
+	}
+	measureMap := make(map[string]string)
+	for _, name := range pod.MeasurementNames() {
+		measureMap[name] = name
+	}
+	catMap := make(map[string]string)
+	for _, name := range pod.CategoryNames() {
+		catMap[name] = name
+	}
 
-	newState, err := state.GetStateFromCsv(validIdentifierNames, validMeasurementNames, validCategoryNames, ctx.Request.Body())
+	dp := csv.NewCsvProcessor()
+	err := dp.Init(nil, idMap, measureMap, catMap, nil)
 	if err != nil {
 		ctx.Response.SetStatusCode(400)
 		fmt.Fprintf(ctx, "error processing csv: %s", err.Error())
 		return
 	}
+	_, err = dp.OnData(ctx.Request.Body())
+	if err != nil {
+		ctx.Response.SetStatusCode(400)
+		fmt.Fprintf(ctx, "error processing csv: %s", err.Error())
+		return
+	}
+	record, err := dp.GetRecord()
+	if err != nil {
+		ctx.Response.SetStatusCode(400)
+		fmt.Fprintf(ctx, "error processing csv: %s", err.Error())
+		return
+	}
+	newState := state.GetStatesFromRecord(record)
 
 	pod.AddLocalState(newState...)
 
@@ -339,8 +351,8 @@ func apiPostFlightEpisodeHandler(ctx *fasthttp.RequestCtx) {
 
 	episode := &flights.Episode{
 		EpisodeId:    apiEpisode.Episode,
-		Start:        time.Unix(apiEpisode.Start, 0),
-		End:          time.Unix(apiEpisode.End, 0),
+		Start:        time.Unix(apiEpisode.Start, 0).UTC(),
+		End:          time.Unix(apiEpisode.End, 0).UTC(),
 		Score:        apiEpisode.Score,
 		ActionsTaken: apiEpisode.ActionsTaken,
 		Error:        apiEpisode.Error,
@@ -382,7 +394,7 @@ func apiPostFlightLoggerHandler(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	_, err = ctx.WriteString(address)
+	_, err = ctx.WriteString(address.String())
 	if err != nil {
 		ctx.Response.SetStatusCode(500)
 		ctx.Response.SetBodyString(err.Error())

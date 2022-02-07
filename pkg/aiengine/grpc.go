@@ -5,6 +5,7 @@ import (
 
 	"github.com/spiceai/spiceai/pkg/proto/aiengine_pb"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 type AIEngineClient interface {
@@ -18,7 +19,7 @@ type aiEngineClient struct {
 }
 
 func NewAIEngineClient(target string) (AIEngineClient, error) {
-	conn, err := grpc.Dial(target, grpc.WithInsecure())
+	conn, err := grpc.Dial(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return nil, err
 	}
