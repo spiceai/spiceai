@@ -134,6 +134,12 @@ func TestMain(m *testing.M) {
 		err = cliClient.runCliCmd("add", testPod)
 		if err != nil {
 			log.Println(err.Error())
+
+			err = tempdir.RemoveAllCreatedTempDirectories()
+			if err != nil {
+				log.Println(err.Error())
+			}
+
 			os.Exit(1)
 		}
 	}
@@ -206,7 +212,7 @@ func TestObservations(t *testing.T) {
 		}
 	})
 
-	t.Log("*** Get Observations ***")
+	t.Log("*** Get CSV Observations ***")
 	initialObservationsCsv, err := runtime.getObservations("trader", "")
 	if err != nil {
 		t.Fatal(err)
@@ -217,6 +223,7 @@ func TestObservations(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	t.Log("*** Get JSON Observations ***")
 	initialObservationsJson, err := runtime.getObservations("trader", "application/json")
 	if err != nil {
 		t.Fatal(err)

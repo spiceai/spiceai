@@ -1,4 +1,4 @@
-time,coinbase.btcusd.price,local.portfolio.btc_balance,local.portfolio.usd_balance,_tags
+time,coinbase.btcusd.price,local.portfolio.btc_balance,local.portfolio.usd_balance,tags
 1635767156,61982.1,,,
 1635767157,61982.1,,,
 1635767157,61979.4,,,

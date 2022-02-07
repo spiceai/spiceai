@@ -2,102 +2,46 @@
   (*state.State)({
     Time: (time.Time) 2021-01-07 22:10:00 +0000 UTC,
     TimeSentToAIEngine: (time.Time) 0001-01-01 00:00:00 +0000 UTC,
-    path: (string) (len=10) "event.data",
-    fqIdentifierNames: ([]string) (len=1) {
-      (string) (len=19) "event.data.event_id"
+    origin: (string) (len=10) "event.data",
+    identifierNames: ([]string) (len=1) {
+      (string) (len=11) "id.event_id"
     },
-    identifiersNamesMap: (map[string]string) (len=1) {
-      (string) (len=8) "event_id": (string) (len=19) "event.data.event_id"
+    measurementNames: ([]string) (len=2) {
+      (string) (len=13) "measure.speed",
+      (string) (len=14) "measure.target"
     },
-    measurementsNames: ([]string) (len=2) {
-      (string) (len=5) "speed",
-      (string) (len=6) "target"
+    categoryNames: ([]string) (len=1) {
+      (string) (len=10) "cat.rating"
     },
-    fqMeasurementsNames: ([]string) (len=2) {
-      (string) (len=16) "event.data.speed",
-      (string) (len=17) "event.data.target"
-    },
-    measurementsNamesMap: (map[string]string) (len=2) {
-      (string) (len=5) "speed": (string) (len=16) "event.data.speed",
-      (string) (len=6) "target": (string) (len=17) "event.data.target"
-    },
-    categoryNamesMap: (map[string]string) (len=1) {
-      (string) (len=6) "rating": (string) (len=17) "event.data.rating"
+    columnMap: (map[string]int) (len=6) {
+      (string) (len=10) "cat.rating": (int) 4,
+      (string) (len=11) "id.event_id": (int) 1,
+      (string) (len=13) "measure.speed": (int) 2,
+      (string) (len=14) "measure.target": (int) 3,
+      (string) (len=4) "tags": (int) 5,
+      (string) (len=4) "time": (int) 0
     },
     tags: ([]string) <nil>,
-    observations: ([]observations.Observation) (len=5) {
-      (observations.Observation) {
-        Time: (int64) 1611205740,
-        Identifiers: (map[string]string) (len=1) {
-          (string) (len=8) "event_id": (string) (len=1) "3"
-        },
-        Measurements: (map[string]float64) (len=2) {
-          (string) (len=5) "speed": (float64) 15,
-          (string) (len=6) "target": (float64) 1
-        },
-        Categories: (map[string]string) (len=1) {
-          (string) (len=6) "rating": (string) (len=2) "10"
-        },
-        Tags: ([]string) <nil>
-      },
-      (observations.Observation) {
-        Time: (int64) 1611305780,
-        Identifiers: (map[string]string) (len=1) {
-          (string) (len=8) "event_id": (string) (len=1) "5"
-        },
-        Measurements: (map[string]float64) (len=2) {
-          (string) (len=5) "speed": (float64) 30,
-          (string) (len=6) "target": (float64) 2
-        },
-        Categories: (map[string]string) (len=1) {
-          (string) (len=6) "rating": (string) (len=2) "11"
-        },
-        Tags: ([]string) <nil>
-      },
-      (observations.Observation) {
-        Time: (int64) 1611458200,
-        Identifiers: (map[string]string) (len=1) {
-          (string) (len=8) "event_id": (string) (len=1) "6"
-        },
-        Measurements: (map[string]float64) (len=2) {
-          (string) (len=5) "speed": (float64) 45,
-          (string) (len=6) "target": (float64) 3
-        },
-        Categories: (map[string]string) (len=1) {
-          (string) (len=6) "rating": (string) (len=2) "12"
-        },
-        Tags: ([]string) <nil>
-      },
-      (observations.Observation) {
-        Time: (int64) 1611558600,
-        Identifiers: (map[string]string) (len=1) {
-          (string) (len=8) "event_id": (string) (len=1) "7"
-        },
-        Measurements: (map[string]float64) (len=2) {
-          (string) (len=5) "speed": (float64) 60,
-          (string) (len=6) "target": (float64) 4
-        },
-        Categories: (map[string]string) (len=1) {
-          (string) (len=6) "rating": (string) (len=2) "13"
-        },
-        Tags: ([]string) <nil>
-      },
-      (observations.Observation) {
-        Time: (int64) 1611659000,
-        Identifiers: (map[string]string) (len=1) {
-          (string) (len=8) "event_id": (string) (len=1) "9"
-        },
-        Measurements: (map[string]float64) (len=2) {
-          (string) (len=5) "speed": (float64) 75,
-          (string) (len=6) "target": (float64) 5
-        },
-        Categories: (map[string]string) (len=1) {
-          (string) (len=6) "rating": (string) (len=2) "14"
-        },
-        Tags: ([]string) <nil>
-      }
+    tagMap: (map[string]bool) {
     },
-    observationsMutex: (sync.RWMutex) {
+    record: (*array.simpleRecord)(record:
+  schema:
+  fields: 6
+    - time: type=int64
+    - id.event_id: type=utf8
+    - measure.speed: type=float64
+    - measure.target: type=float64
+    - cat.rating: type=utf8
+    - tags: type=list<item: utf8, nullable>
+  rows: 5
+  col[0][time]: [1611205740 1611305780 1611458200 1611558600 1611659000]
+  col[1][id.event_id]: ["3" "5" "6" "7" "9"]
+  col[2][measure.speed]: [15 30 45 60 75]
+  col[3][measure.target]: [1 2 3 4 5]
+  col[4][cat.rating]: ["10" "11" "12" "13" "14"]
+  col[5][tags]: [[] [] [] [] []]
+),
+    recordsMutex: (sync.RWMutex) {
       w: (sync.Mutex) {
         state: (int32) 0,
         sema: (uint32) 0

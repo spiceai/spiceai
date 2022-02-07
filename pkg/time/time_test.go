@@ -8,7 +8,7 @@ import (
 )
 
 func TestTime(t *testing.T) {
-	t.Run("ParseTime() - unix no format", testParseTimeFunc("1605312000", "", time.Unix(1605312000, 0)))
+	t.Run("ParseTime() - unix no format", testParseTimeFunc("1605312000", "", time.Unix(1605312000, 0).UTC()))
 	t.Run("ParseTime() - rfc3339 no format", testParseTimeFunc("2009-01-01T12:59:59Z", "", time.Date(2009, 01, 01, 12, 59, 59, 0, time.UTC)))
 	t.Run("ParseTime() - rfc3339 with format", testParseTimeFunc("2009-01-01T12:59:59Z", "rfc3339", time.Date(2009, 01, 01, 12, 59, 59, 0, time.UTC)))
 	t.Run("ParseTime() - ISO8601", testParseTimeFunc("2016-07-25T02:22:33+0000", "iso8601", time.Date(2016, 7, 25, 2, 22, 33, 0, time.UTC)))

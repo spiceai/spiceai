@@ -222,7 +222,9 @@ func (ds *Dataspace) AddNewState(state *state.State, metadata map[string]string)
 	ds.stateMutex.Lock()
 	defer ds.stateMutex.Unlock()
 
-	ds.cachedState = append(ds.cachedState, state)
+	if state != nil {
+		ds.cachedState = append(ds.cachedState, state)
+	}
 
 	errGroup, _ := errgroup.WithContext(context.Background())
 
@@ -281,16 +283,8 @@ func (ds *Dataspace) readData(processor dataprocessors.DataProcessor, data []byt
 	if err != nil {
 		return nil, err
 	}
+	newState := state.NewState(ds.Path(), record)
 
-	observations, err := ArrowToObservations(record)
-	if record != nil {
-		record.Release()
-	}
-	if err != nil {
-		return nil, err
-	}
-
-	newState := state.NewState(ds.Path(), ds.IdentifiersNames(), ds.MeasurementNames(), ds.CategoryNames(), ds.Tags(), observations)
 	err = ds.AddNewState(newState, metadata)
 	if err != nil {
 		return nil, err

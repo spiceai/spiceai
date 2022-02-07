@@ -35,7 +35,7 @@ jobs:
 
       # Manually exclude packages that have a clause allowing a permissive license *or* a copyleft license to be used
       EXCLUDE_JS_PACKAGES: node-forge@0.10.0
-      EXCLUDE_PYTHON_PACKAGES: pyzmq
+      EXCLUDE_PYTHON_PACKAGES: pyzmq pylint astroid
 
       FORBIDDEN_LICENSE_CHECK: |
         grep -E "GPL|CC-BY-SA|CC-BY-NC|CC-BY-NC-SA|CC-BY-NC-ND|APSL|CPAL|EUPL|NPOSL|OSL|SSPL|Parity|RPL|QPL|Sleepycat|copyleft|CDDL|CPL|EPL|ErlPL|IPL|MS-RL|SPL|Facebook|Commons-Clause" | grep . && exit 1 || echo "ok"

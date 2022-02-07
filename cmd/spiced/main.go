@@ -67,6 +67,7 @@ var RootCmd = &cobra.Command{
 			err = runtime.Run()
 		}
 		if err != nil {
+			runtime.Shutdown()
 			log.Fatalln(err)
 		}
 		defer runtime.Shutdown()
