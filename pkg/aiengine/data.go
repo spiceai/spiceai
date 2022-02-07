@@ -26,7 +26,7 @@ var (
 	serverMutex sync.RWMutex
 )
 
-const ipcPath = "/tmp/spice_ipc.sock"
+var ipcPath = os.TempDir() + "/spice_ipc.sock"
 
 func SendData(pod *pods.Pod, podState ...*state.State) error {
 	if len(podState) == 0 {
