@@ -27,9 +27,6 @@ var (
 	ipcMutex sync.RWMutex
 )
 
-var homeDir = ""
-var ipcPath = filepath.Join("~", constants.DotSpice, "spice_ipc.sock")
-
 func SendData(pod *pods.Pod, podState ...*state.State) error {
 	if len(podState) == 0 {
 		// Nothing to do
@@ -45,6 +42,11 @@ func SendData(pod *pods.Pod, podState ...*state.State) error {
 		ipcMutex.Lock()
 		defer ipcMutex.Unlock()
 
+		homeDir, err := os.UserHomeDir()
+		if err != nil {
+			return fmt.Errorf("failed to find home directory for %s: %s\n", pod.Name, err)
+		}
+		ipcPath := filepath.Join(homeDir, constants.DotSpice, "spice_ipc.sock")
 		addDataRequest := getAddDataRequest(pod, state, ipcPath)
 
 		if addDataRequest == nil {
@@ -59,14 +61,6 @@ func SendData(pod *pods.Pod, podState ...*state.State) error {
 		record := getProcessedRecord(pod, state)
 
 		// Prepare UNIX socket
-		if homeDir == "" {
-			homeDir, err := os.UserHomeDir()
-			if err == nil {
-				ipcPath = filepath.Join(homeDir, constants.DotSpice, "spice_ipc.sock")
-			} else {
-				return fmt.Errorf("failed to find home directory for %s: %s\n", pod.Name, err)
-			}
-		}
 		if _, err := os.Stat(ipcPath); err == nil {
 			os.Remove(ipcPath)
 		}
