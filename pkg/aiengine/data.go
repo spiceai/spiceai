@@ -74,7 +74,6 @@ func SendData(pod *pods.Pod, podState ...*state.State) error {
 		if err != nil {
 			return fmt.Errorf("failed to create IPC server for pod %s: %s\n", pod.Name, err)
 		}
-		defer listener.Close()
 		unixListener := listener.(*net.UnixListener)
 		err = unixListener.SetDeadline(time.Now().Add(time.Second * 2))
 		if err != nil {
@@ -82,6 +81,7 @@ func SendData(pod *pods.Pod, podState ...*state.State) error {
 		}
 
 		go func() {
+			defer listener.Close()
 			connection, err := unixListener.Accept()
 			if err != nil {
 				fmt.Printf("aiengine failed to accept IPC connection for pod %s : %s\n", pod.Name, err)
