@@ -22,7 +22,8 @@ import (
 )
 
 var (
-	ipcMutex sync.RWMutex
+	ipcMutex    sync.RWMutex
+	serverMutex sync.RWMutex
 )
 
 const ipcPath = "/tmp/spice_ipc.sock"
@@ -55,6 +56,7 @@ func SendData(pod *pods.Pod, podState ...*state.State) error {
 
 		record := getProcessedRecord(pod, state)
 
+		serverMutex.Lock()
 		go func() {
 			if _, err := os.Stat(ipcPath); err == nil {
 				os.Remove(ipcPath)
@@ -62,6 +64,7 @@ func SendData(pod *pods.Pod, podState ...*state.State) error {
 			listener, err := net.Listen("unix", ipcPath)
 			if err != nil {
 				fmt.Printf("failed to create IPC server for pod %s: %s\n", pod.Name, err)
+				serverMutex.Unlock()
 				return
 			}
 			defer listener.Close()
@@ -69,12 +72,14 @@ func SendData(pod *pods.Pod, podState ...*state.State) error {
 			err = unixListener.SetDeadline(time.Now().Add(time.Second * 2))
 			if err != nil {
 				fmt.Printf("failed to set IPC connection timeout for pod %s : %s\n", pod.Name, err)
+				serverMutex.Unlock()
 				return
 			}
 
+			serverMutex.Unlock()
 			connection, err := unixListener.Accept()
 			if err != nil {
-				fmt.Printf("failed to accept IPC connection for pod %s : %s\n", pod.Name, err)
+				fmt.Printf("aiengine failed to accept IPC connection for pod %s : %s\n", pod.Name, err)
 				return
 			}
 			defer connection.Close()
@@ -89,6 +94,8 @@ func SendData(pod *pods.Pod, podState ...*state.State) error {
 				return
 			}
 		}()
+		serverMutex.Lock()
+		serverMutex.Unlock()
 
 		response, err := aiengineClient.AddData(ctx, addDataRequest)
 		if err != nil {
