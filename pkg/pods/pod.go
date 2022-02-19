@@ -424,7 +424,7 @@ func (pod *Pod) CachedRecord(csvTag bool) arrow.Record {
 						tagCol := (*(*statePointer).Record()).Column(int((*(*statePointer).Record()).NumCols() - 1)).(*array.List)
 						endOffset := tagCol.Offsets()[i+1]
 						tagValues := tagCol.ListValues().(*array.String)
-						if tagValues.IsValid(i) {
+						if tagCol.IsValid(i) {
 							for pos := tagCol.Offsets()[i]; pos < endOffset; pos++ {
 								rowTags = append(rowTags, tagValues.Value(int(pos)))
 							}
@@ -443,7 +443,7 @@ func (pod *Pod) CachedRecord(csvTag bool) arrow.Record {
 						tagCol := (*(*statePointer).Record()).Column(int((*(*statePointer).Record()).NumCols() - 1)).(*array.List)
 						endOffset := tagCol.Offsets()[i+1]
 						tagValues := tagCol.ListValues().(*array.String)
-						if tagValues.IsValid(i) {
+						if tagCol.IsValid(i) {
 							for pos := tagCol.Offsets()[i]; pos < endOffset; pos++ {
 								tagValueBuilder.Append(tagValues.Value(int(pos)))
 							}
@@ -625,7 +625,7 @@ func (pod *Pod) CachedJson() string {
 			}
 			builder.WriteString("}")
 		}
-		if tagValues.IsValid(rowIndex) {
+		if tagCol.IsValid(rowIndex) {
 			if tagPos < int(tagOffsets[rowIndex]) {
 				builder.WriteString(",\"tags\":[")
 				for {

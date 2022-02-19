@@ -204,7 +204,7 @@ func (s *State) addRecordTags(record arrow.Record) {
 	tagValues := tagCol.ListValues().(*array.String)
 	tagPos := 0
 	for rowIndex := 0; rowIndex < int(record.NumRows()); rowIndex++ {
-		if tagValues.IsValid(rowIndex) {
+		if tagCol.IsValid(rowIndex) {
 			for tagPos < int(tagOffsets[rowIndex]) {
 				tagValue := tagValues.Value(tagPos)
 				if _, ok := s.tagMap[tagValue]; !ok {

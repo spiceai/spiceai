@@ -19,33 +19,29 @@ Spice.ai is still under early development, so there are several gaps and limitat
 
 - See [Bugs](https://github.com/spiceai/spiceai/labels/bug). Feel free to file a new Issue if you see a bug and let us know on Discord.
 
-## Tentative v0.6-alpha (Dec, 2021) roadmap
+## Tentative v0.7-alpha (Mar, 2022) roadmap
 
-- Continuous Actions (AI Engine)
-- Tensorboard monitoring
+- AI engine migration from pandas to pyarrow
+- Apache Flight data connector
 
-## Tentative v0.7-alpha (Jan, 2022) roadmap
+## Tentative v0.8-alpha (Apr, 2022) roadmap
 
-- Performance improvements for large datasets
-- HTTP Data Connector
-- Continuous Actions (Dashboard)
-- Darwin/ARM64 support
+- Goals - E.g. maximize "a" or minimize "b"
+- WebSocket support for dashboard data
 
-## Tentative v0.8-alpha (Feb, 2022) roadmap
-
-- Parallel Actions (AI Engine)
-- A/B testing and flighting
-
-## v1.0-stable roadmap
+## Fetures being considered for v1.0-stable
 
 - CI/CD on GitHub
-- WebSocket support for dashboard data
 - Self-host on baremetal or VM
 - Pluggable environments
 - Search, index, publish and browse the Spice Rack registry
 - Distributed learning
 - Improved data visualization in dashboard
 - Custom visualization hooks for Dataspaces
+- Parallel Actions (AI Engine)
+- A/B testing and flighting
+- Continuous Actions
+- Darwin/ARM64 support
 
 ## Beyond v1.0
 

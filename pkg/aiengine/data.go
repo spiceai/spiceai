@@ -107,8 +107,8 @@ func SendData(pod *pods.Pod, podState ...*state.State) error {
 		if response.Error {
 			return fmt.Errorf("failed to post new data to pod %s: %s", pod.Name, response.Message)
 		}
-	 zaplog.Sugar().Debugf(
-		  "Posting data to AI engine:\n%s", aurora.BrightYellow(
+		zaplog.Sugar().Debugf(
+			"Posting data to AI engine:\n%s", aurora.BrightYellow(
 				fmt.Sprintf("record of length %d posted", record.NumRows())))
 
 		state.Sent()
@@ -122,7 +122,6 @@ func getAddDataRequest(pod *pods.Pod, s *state.State, ipcPath string) *aiengine_
 		// Already sent
 		return nil
 	}
-
 
 	addDataRequest := &aiengine_pb.AddDataRequest{
 		Pod:        pod.Name,
@@ -194,7 +193,7 @@ func getProcessedRecord(pod *pods.Pod, state *state.State) arrow.Record {
 		timeValue := recordTimeValues.Value(rowIndex)
 		if timeValue < epochTime || timeValue > epochEnd {
 			// Advance tagPos for the next row
-			if tagValues.IsValid(rowIndex) {
+			if tagCol.IsValid(rowIndex) {
 				for tagPos < int(tagOffsets[rowIndex]) {
 					tagPos++
 				}
@@ -240,7 +239,7 @@ func getProcessedRecord(pod *pods.Pod, state *state.State) arrow.Record {
 				}
 			}
 		}
-		if tagValues.IsValid(rowIndex) {
+		if tagCol.IsValid(rowIndex) {
 			for tagPos < int(tagOffsets[rowIndex]) {
 				tagValue := tagValues.Value(tagPos)
 				if builder, ok := tagBuilderMap[tagValue]; ok {
