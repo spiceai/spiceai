@@ -8,7 +8,8 @@ import { usePod } from '../models/pod'
 import { useFlights } from '../models/flight'
 import { useObservations } from '../models/observation'
 import FlightChart from '../components/flights/FlightChart'
-import DataEditor, {
+import {
+  DataEditor,
   DataEditorContainer,
   GridColumn,
   GridCell,
