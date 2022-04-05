@@ -117,7 +117,7 @@ class AIEngine(aiengine_pb2_grpc.AIEngineServicer):
                 except Exception as error:
                     return aiengine_pb2.Response(
                         result="connection_error",
-                        message=f"connection error: {error}",
+                        message=f"connection to {request.unix_socket} error: {error}",
                         error=True,
                     )
                 reader = pyarrow.ipc.RecordBatchStreamReader(arrow_socket.makefile(mode="rb"))
