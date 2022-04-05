@@ -12,7 +12,7 @@ jobs:
     name: lint golang code
     runs-on: ubuntu-latest
     env:
-      GOVER: 1.17
+      GOVER: 1.18
 
     steps:
       - uses: actions/checkout@v2
