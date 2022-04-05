@@ -8,13 +8,7 @@ import { usePod } from '../models/pod'
 import { useFlights } from '../models/flight'
 import { useObservations } from '../models/observation'
 import FlightChart from '../components/flights/FlightChart'
-import {
-  DataEditor,
-  DataEditorContainer,
-  GridColumn,
-  GridCell,
-  GridCellKind,
-} from '@glideapps/glide-data-grid'
+import { DataEditor, GridColumn, GridCell, GridCellKind } from '@glideapps/glide-data-grid'
 
 interface PodProps {
   podName: string
@@ -197,18 +191,15 @@ const PodPage: React.FunctionComponent<PodProps> = () => {
             <div className="border-1 border-gray-300">
               <ReactAutoSizer disableHeight={true} defaultHeight={defaultGridHeight}>
                 {(props: { width?: number }) => (
-                  <DataEditorContainer
+                  <DataEditor
                     width={props.width ?? defaultGridWidth}
                     height={defaultGridHeight}
-                  >
-                    <DataEditor
-                      getCellContent={gridProps.gridDataFunc}
-                      columns={gridProps.columns}
-                      rows={observations.length}
-                      rowMarkers="number"
-                      onColumnResized={onColumnResized}
-                    />
-                  </DataEditorContainer>
+                    getCellContent={gridProps.gridDataFunc}
+                    columns={gridProps.columns}
+                    rows={observations.length}
+                    rowMarkers="number"
+                    onColumnResized={onColumnResized}
+                  />
                 )}
               </ReactAutoSizer>
             </div>
