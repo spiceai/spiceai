@@ -114,13 +114,13 @@ generate-acknowledgements:
 	echo -e "# Open Source Acknowledgements\n\nSpice.ai would like to acknowledge the following open source projects for making this project possible:\n\n## Python Packages\n" > $(ACKNOWLEDGEMENTS_PATH)
 
 # Python Packages
-	python3 -m venv venv-acknowledgments
-	venv-acknowledgments/bin/pip install -r ai/src/requirements/production.txt
-	venv-acknowledgments/bin/pip install -r ai/src/requirements/development.txt
-	venv-acknowledgments/bin/pip install -r ai/src/requirements/common.txt
-	venv-acknowledgments/bin/pip install pip-licenses
-	venv-acknowledgments/bin/pip-licenses -f csv --with-authors --with-urls 2>/dev/null >> $(ACKNOWLEDGEMENTS_PATH)
-	rm -rf venv-acknowledgments
+	python3 -m venv venv_acknowledgments
+	venv_acknowledgments/bin/pip install -r ai/src/requirements/production.txt
+	venv_acknowledgments/bin/pip install -r ai/src/requirements/development.txt
+	venv_acknowledgments/bin/pip install -r ai/src/requirements/common.txt
+	venv_acknowledgments/bin/pip install pip-licenses
+	venv_acknowledgments/bin/pip-licenses -f csv --with-authors --with-urls 2>/dev/null >> $(ACKNOWLEDGEMENTS_PATH)
+	rm -rf venv_acknowledgments
 
 # Go Modules
 	echo -e "\n## Go Modules\n" >> $(ACKNOWLEDGEMENTS_PATH)

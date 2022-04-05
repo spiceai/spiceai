@@ -1,12 +1,12 @@
-import React from 'react';
-import { BrowserRouter, Route, Switch } from 'react-router-dom';
-import Header from './components/layout/Header';
-import ContentPanel from './components/layout/ContentPanel';
-import Footer from './components/layout/Footer';
-import Dashboard from './pages/Dashboard';
-import PodPage from './pages/PodPage';
-import AcknowledgementsPage from './pages/Acknowledgements';
-import './App.css';
+import React from 'react'
+import { BrowserRouter, Route, Switch } from 'react-router-dom'
+import Header from './components/layout/Header'
+import ContentPanel from './components/layout/ContentPanel'
+import Footer from './components/layout/Footer'
+import Dashboard from './pages/Dashboard'
+import PodPage from './pages/PodPage'
+import AcknowledgementsPage from './pages/Acknowledgements'
+import './App.css'
 
 function App(): JSX.Element {
   return (
@@ -30,7 +30,7 @@ function App(): JSX.Element {
         <div id="portal" />
       </div>
     </BrowserRouter>
-  );
+  )
 }
 
-export default App;
+export default App
