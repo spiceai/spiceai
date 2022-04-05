@@ -19,18 +19,18 @@ Spice.ai is still under early development, so there are several gaps and limitat
 
 - See [Bugs](https://github.com/spiceai/spiceai/labels/bug). Feel free to file a new Issue if you see a bug and let us know on Discord.
 
-## Tentative v0.7-alpha (Mar, 2022) roadmap
+## Tentative v0.7-alpha (Apr, 2022) roadmap
 
-- AI engine migration from pandas to pyarrow
 - Apache Flight data connector
 
-## Tentative v0.8-alpha (Apr, 2022) roadmap
+## Tentative v0.8-alpha roadmap
 
+- AI engine migration from pandas to pyarrow
 - Goals - E.g. maximize "a" or minimize "b"
-- WebSocket support for dashboard data
 
 ## Fetures being considered for v1.0-stable
 
+- WebSocket support for dashboard data
 - CI/CD on GitHub
 - Self-host on baremetal or VM
 - Pluggable environments
