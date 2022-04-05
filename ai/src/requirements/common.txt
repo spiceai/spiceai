@@ -13,7 +13,7 @@ gast==0.4.0
 google-auth==1.35.0
 google-auth-oauthlib==0.4.5
 google-pasta==0.2.0
-grpcio==1.43.0
+grpcio==1.44.0
 h5py==3.1.0
 humanize==3.11.0
 idna==3.2
