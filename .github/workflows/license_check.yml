@@ -34,7 +34,7 @@ jobs:
       GOVER: 1.17
 
       # Manually exclude packages that have a clause allowing a permissive license *or* a copyleft license to be used
-      EXCLUDE_JS_PACKAGES: node-forge@0.10.0
+      EXCLUDE_JS_PACKAGES: node-forge
       EXCLUDE_PYTHON_PACKAGES: pyzmq pylint astroid
 
       FORBIDDEN_LICENSE_CHECK: |
