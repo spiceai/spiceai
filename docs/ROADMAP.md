@@ -19,11 +19,6 @@ Spice.ai is still under early development, so there are several gaps and limitat
 
 - See [Bugs](https://github.com/spiceai/spiceai/labels/bug). Feel free to file a new Issue if you see a bug and let us know on Discord.
 
-## Tentative v0.6-alpha (Dec, 2021) roadmap
-
-- Continuous Actions (AI Engine)
-- Tensorboard monitoring
-
 ## Tentative v0.7-alpha (Jan, 2022) roadmap
 
 - Performance improvements for large datasets
