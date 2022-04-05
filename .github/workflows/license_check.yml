@@ -31,7 +31,7 @@ jobs:
     name: license check
     runs-on: ubuntu-latest
     env:
-      GOVER: 1.17
+      GOVER: 1.18
 
       # Manually exclude packages that have a clause allowing a permissive license *or* a copyleft license to be used
       EXCLUDE_JS_PACKAGES: node-forge
