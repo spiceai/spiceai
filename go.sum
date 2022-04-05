@@ -728,8 +728,6 @@ github.com/spf13/pflag v1.0.5/go.mod h1:McXfInJRrz4CZXVZOBLb0bTZqETkiAhM9Iw0y3An
 github.com/spf13/viper v1.10.0/go.mod h1:SoyBPwAtKDzypXNDFKN5kzH7ppppbGZtls1UpIy5AsM=
 github.com/spf13/viper v1.10.1 h1:nuJZuYpG7gTj/XqiUwg8bA0cp1+M2mC3J4g5luUYBKk=
 github.com/spf13/viper v1.10.1/go.mod h1:IGlFPqhNAPKRxohIzWpI5QEy4kuI7tcl5WvR+8qy1rU=
-github.com/spiceai/data-components-contrib v0.0.0-20220207051059-5929e51fbca1 h1:RZPzIVzO208Q0sXQN2GBiAU3MZWmsHsK9cz6WCRs2Ms=
-github.com/spiceai/data-components-contrib v0.0.0-20220207051059-5929e51fbca1/go.mod h1:Eqnto0zEOCwjcNSH0p+fm/XTFH+p7tN2ikG/cxAY+to=
 github.com/spiceai/data-components-contrib v0.0.0-20220208013641-e057512aeef2 h1:znxzoRi6SCKa4Jx3BO0VNQDapwUdOH3nYkpd2zvVtoM=
 github.com/spiceai/data-components-contrib v0.0.0-20220208013641-e057512aeef2/go.mod h1:Eqnto0zEOCwjcNSH0p+fm/XTFH+p7tN2ikG/cxAY+to=
 github.com/streadway/amqp v0.0.0-20190404075320-75d898a42a94/go.mod h1:AZpEONHx3DKn8O/DFsRAY58/XVQiIPMTMB1SddzLXVw=

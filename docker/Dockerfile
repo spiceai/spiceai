@@ -28,7 +28,7 @@ COPY pkg pkg/
 
 WORKDIR /build/cmd/spiced
 
-RUN go mod tidy -compat=1.17
+RUN go mod tidy
 RUN make
 
 FROM python:3.8.12-slim
