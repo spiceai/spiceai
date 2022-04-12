@@ -56,7 +56,7 @@ A good way to communicate before investing too much time is to create a "Work-in
 
 ## Security Vulnerability Reporting
 
-Spice.ai takes security and our users' trust very seriously. If you believe you have found a security issue in any of our open source projects, please responsibly disclose it by contacting security@spiceai.io.
+Spice.ai takes security and our users' trust very seriously. If you believe you have found a security issue in any of our open source projects, please responsibly disclose it by contacting security@spice.ai.
 
 ### Use of Third-party code
 
