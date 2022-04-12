@@ -91,7 +91,7 @@ func testDashboardCssHandler() func(*testing.T) {
 		body, err := ioutil.ReadAll(res.Body)
 		assert.NoError(t, err)
 
-		assert.Contains(t, string(body), "chunk.css")
+		assert.Contains(t, string(body), ".css")
 	}
 }
 
@@ -163,10 +163,10 @@ func getFirstStaticAssetUrl(typeName string) (string, error) {
 	// Look for first matching chunk
 	var filename string
 	var suffix string
-	if typeName == "svg" || typeName == "md" {
-		suffix = fmt.Sprintf(".%s", typeName)
-	} else {
+	if typeName == "js" {
 		suffix = fmt.Sprintf(".chunk.%s", typeName)
+	} else {
+		suffix = fmt.Sprintf(".%s", typeName)
 	}
 
 	for _, asset := range assets {

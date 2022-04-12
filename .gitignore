@@ -29,6 +29,10 @@ __debug_bin
 
 dist
 
+venv
+venv-acknowledgements
+venv_acknowledgements
+
 # AI
 __pycache__
 venv
