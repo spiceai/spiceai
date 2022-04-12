@@ -1,7 +1,7 @@
 ---
 name: Milestone Endgame
 about: Ship a milestone!
-title: ''
+title: 'v0.x.x-alpha endgame'
 labels: 'endgame'
 assignees: ''
 
