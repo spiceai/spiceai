@@ -69,10 +69,10 @@ Our intention with this preview is to work with developers early to define and c
 We greatly appreciate and value your support! You can help Spice.ai in a number of ways:
 
 - ⭐️ Star this repo.
-- Build an app with Spice.ai and send us feedback and suggestions at [hey@spiceai.io](mailto:hey@spiceai.io) or on [Discord](https://discord.gg/kZnTfneP5u).
+- Build an app with Spice.ai and send us feedback and suggestions at [hey@spice.ai](mailto:hey@spice.ai) or on [Discord](https://discord.gg/kZnTfneP5u).
 - [File an issue](https://github.com/spiceai/spiceai/issues/new) if you see something not quite working correctly.
 - Follow us on [Reddit](https://www.reddit.com/r/spiceai), [Twitter](https://twitter.com/SpiceAIHQ), and [LinkedIn](https://www.linkedin.com/company/74148478).
-- Join our team ([We’re hiring!](https://spiceai.io/careers))
+- Join our team ([We’re hiring!](https://spice.ai/careers))
 - Contribute code or documentation to the project (see [CONTRIBUTING.md](CONTRIBUTING.md)).
 
 We’re also starting a community call series soon!
@@ -211,7 +211,7 @@ Spice.ai started with the vision to make AI easy for developers. We are building
 - Discord: [![Discord Banner](https://discord.com/api/guilds/803820740868571196/widget.png?style=shield)](https://discord.gg/kZnTfneP5u)
 - Reddit: [![Subreddit subscribers](https://img.shields.io/reddit/subreddit-subscribers/spiceai?style=social)](https://www.reddit.com/r/spiceai)
 - Twitter: [@SpiceAIHQ](https://twitter.com/spiceaihq)
-- Email: [hey@spiceai.io](mailto:hey@spiceai.io)
+- Email: [hey@spice.ai](mailto:hey@spice.ai)
 
 ### Contributing to Spice.ai
 
