@@ -19,12 +19,9 @@ Spice.ai is still under early development, so there are several gaps and limitat
 
 - See [Bugs](https://github.com/spiceai/spiceai/labels/bug). Feel free to file a new Issue if you see a bug and let us know on Discord.
 
-## Tentative v0.7-alpha (Apr, 2022) roadmap
+## Tentative v0.7-alpha roadmap
 
-- Apache Flight data connector
-
-## Tentative v0.8-alpha roadmap
-
+- Darwin/ARM64 support
 - AI engine migration from pandas to pyarrow
 - Goals - E.g. maximize "a" or minimize "b"
 
@@ -41,7 +38,6 @@ Spice.ai is still under early development, so there are several gaps and limitat
 - Parallel Actions (AI Engine)
 - A/B testing and flighting
 - Continuous Actions
-- Darwin/ARM64 support
 
 ## Beyond v1.0
 
