@@ -45,7 +45,7 @@ six==1.15.0
 tensorboard==2.8.0
 tensorboard-data-server==0.6.1
 tensorboard-plugin-wit==1.8.1
-tensorflow==2.8.0
+tensorflow==2.8.1
 tensorflow-estimator==2.7.0
 tensorflow-io-gcs-filesystem==0.24.0
 tensorflow-probability==0.15.0
