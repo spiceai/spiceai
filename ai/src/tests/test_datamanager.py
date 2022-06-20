@@ -69,8 +69,8 @@ class TimeSeriesDataManagerTestCase(unittest.TestCase):
 
         self.assertEqual(len(normal_flattened), len(reversed_flattened))
 
-        for i, _ in enumerate(normal_flattened):
-            self.assertEqual(normal_flattened[i], reversed_flattened[i])
+        for i, item in enumerate(normal_flattened):
+            self.assertEqual(item, reversed_flattened[i])
 
     def test_zero_fill_data(self):
         data_manager = get_test_data_manager(fill_method=aiengine_pb2.FILL_ZERO)

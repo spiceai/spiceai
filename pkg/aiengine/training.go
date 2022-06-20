@@ -98,7 +98,7 @@ func StartTraining(pod *pods.Pod, trainModel *runtime_pb.TrainModel) error {
 		return fmt.Errorf("%s -> epoch time %d invalid: %s", pod.Name, pod.Epoch().Unix(), response.Message)
 	case "started_training":
 		pod.AddFlight(flightId, flight)
-		log.Println(fmt.Sprintf("%s -> %s", pod.Name, aurora.BrightCyan("Starting training...")))
+		log.Printf("%s -> %s\n", pod.Name, aurora.BrightCyan("Starting training..."))
 	default:
 		return fmt.Errorf("%s -> failed to verify training has started: %s", pod.Name, response.Result)
 	}

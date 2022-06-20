@@ -422,9 +422,7 @@ func getTagSelectors(dsSpec spec.DataspaceSpec) []string {
 	}
 	tagSelectors := make([]string, numSelectors+1)
 	if numSelectors > 0 {
-		for i, tagSelector := range dsSpec.Tags.Selectors {
-			tagSelectors[i] = tagSelector
-		}
+		copy(tagSelectors, dsSpec.Tags.Selectors)
 	}
 	tagSelectors[numSelectors] = "_tag"
 	sort.Strings(tagSelectors)
