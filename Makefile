@@ -111,7 +111,7 @@ ACKNOWLEDGEMENTS_PATH := dashboard/src/content/acknowledgements.md
 
 .PHONY: generate-acknowledgements
 generate-acknowledgements:
-	echo -e "# Open Source Acknowledgements\n\nSpice.ai would like to acknowledge the following open source projects for making this project possible:\n\n## Python Packages\n" > $(ACKNOWLEDGEMENTS_PATH)
+	echo -e "# Open Source Acknowledgements\n\nSpice.ai acknowledges the following open source projects for making this project possible:\n\n## Python Packages\n" > $(ACKNOWLEDGEMENTS_PATH)
 
 # Python Packages
 	python3 -m venv venv_acknowledgments
