@@ -87,7 +87,7 @@ Then, follow this guide to get started quickly with Spice.ai. For a more compreh
 
 ### Current hosting limitations
 
-- Docker is required. Self-host and metal support is on the roadmap.
+- Docker is required (>= 20.10.0). Self-host and metal support is on the roadmap.
 - Only macOS and Linux are natively supported. [WSL 2](https://docs.microsoft.com/en-us/windows/wsl/install-win10) is required for Windows.
 - darwin/arm64 is not yet supported (i.e. Apple's M1 Macs). We use M1s ourselves, so we hope to support this very soon. :-)
 
