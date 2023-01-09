@@ -39,14 +39,14 @@ type RewardSpec struct {
 }
 
 type MonitorSpec struct {
-	Triggers []*TriggerSpec `json:"triggers,omitempty" yaml:"triggers,omitempty" mapstructure:"triggers,omitempty"`
-	Alerts   []*AlertSpec   `json:"alerts,omitempty" yaml:"alerts,omitempty" mapstructure:"alerts,omitempty"`
+	Triggers []TriggerSpec `json:"triggers,omitempty" yaml:"triggers,omitempty" mapstructure:"triggers,omitempty"`
+	Alerts   []AlertSpec   `json:"alerts,omitempty" yaml:"alerts,omitempty" mapstructure:"alerts,omitempty"`
 }
 
 type TriggerSpec struct {
-	Dataspace   string           `json:"dataspace,omitempty" yaml:"dataspace,omitempty" mapstructure:"dataspace,omitempty"`
-	Measurement string           `json:"measurement,omitempty" yaml:"measurement,omitempty" mapstructure:"measurement,omitempty"`
-	Thresholds  []*ThresholdSpec `json:"thresholds,omitempty" yaml:"thresholds,omitempty" mapstructure:"thresholds,omitempty"`
+	Dataspace   string          `json:"dataspace,omitempty" yaml:"dataspace,omitempty" mapstructure:"dataspace,omitempty"`
+	Measurement string          `json:"measurement,omitempty" yaml:"measurement,omitempty" mapstructure:"measurement,omitempty"`
+	Thresholds  []ThresholdSpec `json:"thresholds,omitempty" yaml:"thresholds,omitempty" mapstructure:"thresholds,omitempty"`
 }
 
 type ThresholdSpec struct {
