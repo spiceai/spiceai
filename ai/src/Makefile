@@ -30,7 +30,7 @@ venv-dev:
 venv-gen-proto:
 	python3 -m venv venv
 	venv/bin/pip3 install --upgrade pip
-	venv/bin/pip3 install grpcio-tools
+	venv/bin/pip3 install grpcio-tools==1.44.0
 
 .PHONY: install-codespaces
 install-codespaces:
@@ -46,7 +46,7 @@ GRPC_PROTOS:=common aiengine runtime
 define genProtoc
 .PHONY: gen-proto-$(1)
 gen-proto-$(1):
-	venv/bin/python3 -m grpc_tools.protoc --proto_path=../.. --python_out=. --grpc_python_out=. --pyi_out=. proto/$(1)/v1/$(1).proto
+	venv/bin/python3 -m grpc_tools.protoc --proto_path=../.. --python_out=. --grpc_python_out=. proto/$(1)/v1/$(1).proto
 endef
 
 $(foreach ITEM,$(GRPC_PROTOS),$(eval $(call genProtoc,$(ITEM))))
