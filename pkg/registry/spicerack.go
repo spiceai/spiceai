@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -59,7 +58,7 @@ func (r *SpiceRackRegistry) GetPod(podFullPath string) (string, error) {
 		return "", fmt.Errorf("an error occurred fetching pod '%s'", podPath)
 	}
 
-	tmpFile, err := ioutil.TempFile(os.TempDir(), "spice-")
+	tmpFile, err := os.CreateTemp(os.TempDir(), "spice-")
 	if err != nil {
 		return "", err
 	}

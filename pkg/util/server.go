@@ -3,7 +3,7 @@ package util
 import (
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 )
 
@@ -18,7 +18,7 @@ func IsRuntimeServerHealthy(serverBaseUrl string, httpClient *http.Client) error
 		return errors.New(resp.Status)
 	}
 
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil || string(body) != "ok" {
 		return errors.New(string(body))
 	}

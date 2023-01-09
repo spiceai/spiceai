@@ -3,7 +3,7 @@ package dashboard_test
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -38,7 +38,7 @@ func testDashboardIndexHandler() func(*testing.T) {
 		assert.EqualValues(t, 200, res.StatusCode)
 		assert.EqualValues(t, "text/html; charset=utf-8", res.Header.Get("Content-Type"))
 
-		body, err := ioutil.ReadAll(res.Body)
+		body, err := io.ReadAll(res.Body)
 		assert.NoError(t, err)
 
 		assert.Contains(t, string(body), "Spice.ai")
@@ -63,7 +63,7 @@ func testDashboardJsHandler() func(*testing.T) {
 		assert.EqualValues(t, 200, res.StatusCode)
 		assert.EqualValues(t, "application/javascript", res.Header.Get("Content-Type"))
 
-		body, err := ioutil.ReadAll(res.Body)
+		body, err := io.ReadAll(res.Body)
 		assert.NoError(t, err)
 
 		assert.Contains(t, string(body), "chunk.js")
@@ -88,7 +88,7 @@ func testDashboardCssHandler() func(*testing.T) {
 		assert.EqualValues(t, 200, res.StatusCode)
 		assert.EqualValues(t, "text/css; charset=utf-8", res.Header.Get("Content-Type"))
 
-		body, err := ioutil.ReadAll(res.Body)
+		body, err := io.ReadAll(res.Body)
 		assert.NoError(t, err)
 
 		assert.Contains(t, string(body), ".css")
@@ -113,7 +113,7 @@ func testDashboardMediaHandler(mediaType string, contentType string) func(*testi
 		assert.EqualValues(t, 200, res.StatusCode)
 		assert.EqualValues(t, contentType, res.Header.Get("Content-Type"))
 
-		body, err := ioutil.ReadAll(res.Body)
+		body, err := io.ReadAll(res.Body)
 		assert.NoError(t, err)
 
 		assert.Contains(t, string(body), mediaType)
