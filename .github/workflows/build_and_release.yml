@@ -15,7 +15,7 @@ jobs:
     name: Build dashboard
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
 
       - name: Build and copy dashboard
         run: make
@@ -26,7 +26,7 @@ jobs:
         working-directory: dashboard
 
       - name: Upload dashboard artifact
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@v3
         with:
           name: dashboard_build
           path: dashboard/build
@@ -60,7 +60,7 @@ jobs:
             target_arch: amd64
 
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
 
       - name: Set REL_VERSION from version.txt
         run: python ./.github/scripts/get_release_version.py
@@ -71,7 +71,7 @@ jobs:
           go-version: ${{ env.GOVER }}
 
       - name: Download dashboard
-        uses: actions/download-artifact@v2
+        uses: actions/download-artifact@v3
         with:
           name: dashboard_build
           path: pkg/dashboard/build
@@ -99,13 +99,13 @@ jobs:
         if: matrix.target_os != 'windows'
         run: ./spiced version
 
-      - uses: actions/upload-artifact@v2
+      - uses: actions/upload-artifact@v3
         if: matrix.target_os != 'windows'
         with:
           name: spiced_${{ matrix.target_os }}_${{ matrix.target_arch }}
           path: spiced_${{ matrix.target_os }}_${{ matrix.target_arch }}.tar.gz
 
-      - uses: actions/upload-artifact@v2
+      - uses: actions/upload-artifact@v3
         if: matrix.target_os == 'windows'
         with:
           name: spiced_${{ matrix.target_os }}_${{ matrix.target_arch }}
@@ -123,13 +123,13 @@ jobs:
         working-directory: cmd/spice
         run: ./spice version
 
-      - uses: actions/upload-artifact@v2
+      - uses: actions/upload-artifact@v3
         if: matrix.target_os != 'windows'
         with:
           name: spice_${{ matrix.target_os }}_${{ matrix.target_arch }}
           path: cmd/spice/spice_${{ matrix.target_os }}_${{ matrix.target_arch }}.tar.gz
 
-      - uses: actions/upload-artifact@v2
+      - uses: actions/upload-artifact@v3
         if: matrix.target_os == 'windows'
         with:
           name: spice_${{ matrix.target_os }}_${{ matrix.target_arch }}
@@ -158,7 +158,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out code into the Go module directory
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
 
       - name: Set REL_VERSION from version.txt
         run: python ./.github/scripts/get_release_version.py
