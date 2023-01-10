@@ -22,7 +22,7 @@ jobs:
     name: Build dashboard
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
 
       - name: Cache dashboard
         id: cache-dashboard
@@ -42,7 +42,7 @@ jobs:
         working-directory: dashboard
 
       - name: Upload dashboard artifact
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@v3
         with:
           name: dashboard_build
           path: pkg/dashboard/build
@@ -54,7 +54,7 @@ jobs:
     env:
       GOVER: 1.19
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
 
       - name: Set up Go
         uses: actions/setup-go@v3
@@ -62,7 +62,7 @@ jobs:
           go-version: ${{ env.GOVER }}
 
       - name: Download dashboard
-        uses: actions/download-artifact@v2
+        uses: actions/download-artifact@v3
         with:
           name: dashboard_build
           path: pkg/dashboard/build
@@ -76,13 +76,13 @@ jobs:
         working-directory: cmd/spiced
 
       - name: Upload spice
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@v3
         with:
           name: spice
           path: cmd/spice/spice
 
       - name: Upload spiced
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@v3
         with:
           name: spiced
           path: cmd/spiced/spiced
@@ -95,7 +95,7 @@ jobs:
       matrix:
         target: [production]
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
 
       - name: Set up Python 3.8
         uses: actions/setup-python@v1
@@ -129,7 +129,7 @@ jobs:
         algorithm: [vpg, dql, sacd]
         context: [metal, docker]
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
 
       - name: Set up Python 3.8
         if: matrix.context == 'metal'
@@ -153,14 +153,14 @@ jobs:
           python -m pip install -r requirements/production.txt
 
       - name: Download spice
-        uses: actions/download-artifact@v2
+        uses: actions/download-artifact@v3
         with:
           name: spice
           path: .
 
       - name: Download spiced
         if: matrix.context == 'metal'
-        uses: actions/download-artifact@v2
+        uses: actions/download-artifact@v3
         with:
           name: spiced
           path: .
@@ -211,7 +211,7 @@ jobs:
         algorithm: [vpg, dql, sacd]
         context: [metal, docker]
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
 
       - name: Set up Go
         uses: actions/setup-go@v3
@@ -240,13 +240,13 @@ jobs:
           python -m pip install -r requirements/production.txt
 
       - name: Download spice
-        uses: actions/download-artifact@v2
+        uses: actions/download-artifact@v3
         with:
           name: spice
           path: cmd/spice
 
       - name: Download spiced
-        uses: actions/download-artifact@v2
+        uses: actions/download-artifact@v3
         with:
           name: spiced
           path: cmd/spiced
