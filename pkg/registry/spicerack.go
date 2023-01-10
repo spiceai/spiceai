@@ -18,7 +18,7 @@ import (
 )
 
 const (
-	spiceRackBaseUrl string = "https://api.spicerack.org/api/v0.1"
+	spiceRackBaseUrl string = "https://api.spicerack.org/v0.1"
 )
 
 var (
@@ -37,11 +37,11 @@ func (r *SpiceRackRegistry) GetPod(podFullPath string) (string, error) {
 	}
 	podName := filepath.Base(podPath)
 
-	url := fmt.Sprintf("%s/pods/%s", spiceRackBaseUrl, podPath)
+	url := fmt.Sprintf("%s/spicepods/%s", spiceRackBaseUrl, podPath)
 	if podVersion != "" {
 		url = fmt.Sprintf("%s/%s", url, podVersion)
 	}
-	failureMessage := fmt.Sprintf("An error occurred while fetching pod '%s' from spicerack.org", podFullPath)
+	failureMessage := fmt.Sprintf("An error occurred while fetching Spicepod '%s' from spicerack.org", podFullPath)
 
 	response, err := spice_http.Get(url, "application/zip")
 	if err != nil {
@@ -51,11 +51,11 @@ func (r *SpiceRackRegistry) GetPod(podFullPath string) (string, error) {
 	defer response.Body.Close()
 
 	if response.StatusCode == 404 {
-		return "", NewRegistryItemNotFound(fmt.Errorf("pod %s not found", podPath))
+		return "", NewRegistryItemNotFound(fmt.Errorf("Spicepod %s not found", podPath))
 	}
 
 	if response.StatusCode != 200 {
-		return "", fmt.Errorf("an error occurred fetching pod '%s'", podPath)
+		return "", fmt.Errorf("an error occurred fetching Spicepod '%s'", podPath)
 	}
 
 	tmpFile, err := os.CreateTemp(os.TempDir(), "spice-")
