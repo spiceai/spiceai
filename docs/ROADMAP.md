@@ -25,7 +25,7 @@ Spice.ai is still under early development, so there are several gaps and limitat
 - AI engine migration from pandas to pyarrow
 - Goals - E.g. maximize "a" or minimize "b"
 
-## Fetures being considered for v1.0-stable
+## Features being considered for v1.0-stable
 
 - WebSocket support for dashboard data
 - CI/CD on GitHub
