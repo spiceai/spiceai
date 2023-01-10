@@ -28,7 +28,7 @@ opt-einsum==3.3.0
 packaging==21.0
 pandas==1.4.2
 pluggy==0.13.1
-protobuf==3.19.4
+protobuf==3.19.5
 psutil==5.8.0
 py==1.11.0
 pyarrow==8.0.0
