@@ -24,7 +24,7 @@ jobs:
             target_os: linux
 
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
 
       - name: Set REL_VERSION from version.txt
         run: python ./.github/scripts/get_release_version.py
