@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"os"
 
@@ -109,7 +109,7 @@ spice train LogPruner --loggers=tensorboard
 				return
 			}
 
-			body, err := ioutil.ReadAll(response.Body)
+			body, err := io.ReadAll(response.Body)
 			defer response.Body.Close()
 
 			if err != nil {

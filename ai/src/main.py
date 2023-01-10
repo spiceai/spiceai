@@ -69,6 +69,7 @@ def train_agent(
         requests.post(
             request_url,
             json=UnexpectedException(traceback.format_exc()).get_error_body(),
+            timeout=30,
         )
 
 

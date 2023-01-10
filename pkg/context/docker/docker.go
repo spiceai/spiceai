@@ -3,7 +3,7 @@ package docker
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"os"
 	"os/exec"
 	"path"
@@ -230,7 +230,7 @@ func getDockerImageVersion() (string, error) {
 	}
 
 	reader := bytes.NewReader(output)
-	images, err := ioutil.ReadAll(reader)
+	images, err := io.ReadAll(reader)
 	if err != nil {
 		return "", err
 	}
