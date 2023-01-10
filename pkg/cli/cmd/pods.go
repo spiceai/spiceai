@@ -3,7 +3,7 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"sort"
 	"strings"
@@ -61,7 +61,7 @@ spice pods list
 			return
 		}
 
-		body, _ := ioutil.ReadAll(response.Body)
+		body, _ := io.ReadAll(response.Body)
 		if err != nil {
 			cmd.Printf("failed to get currently loaded pods from runtime: %s\n", err.Error())
 			return

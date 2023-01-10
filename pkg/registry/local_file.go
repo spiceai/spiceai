@@ -18,7 +18,7 @@ func (r *LocalFileRegistry) GetPod(podPath string) (string, error) {
 	stat, err := os.Stat(podPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return "", fmt.Errorf("the pod directory '%s' does not exist.", podPath)
+			return "", fmt.Errorf("the pod directory '%s' does not exist", podPath)
 		}
 		return "", fmt.Errorf("pod not found at %s: %w", podPath, err)
 	}

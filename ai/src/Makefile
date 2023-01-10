@@ -30,7 +30,7 @@ venv-dev:
 venv-gen-proto:
 	python3 -m venv venv
 	venv/bin/pip3 install --upgrade pip
-	venv/bin/pip3 install grpcio-tools
+	venv/bin/pip3 install grpcio-tools==1.44.0
 
 .PHONY: install-codespaces
 install-codespaces:

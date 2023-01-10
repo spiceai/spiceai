@@ -241,6 +241,6 @@ def end_of_episode(_episode: int):
 
 def post_episode_result(request_url, episode_data):
     try:
-        requests.post(request_url, json=episode_data)
+        requests.post(request_url, json=episode_data, timeout=30)
     except Exception as error:
         print(f"Failed to update episode result: {error}")
