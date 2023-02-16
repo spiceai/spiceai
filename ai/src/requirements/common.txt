@@ -56,5 +56,5 @@ tornado==6.1
 traitlets==5.1.0
 typing_extensions==4.0.1
 urllib3==1.26.6
-Werkzeug==2.0.1
+Werkzeug==2.2.3
 wrapt==1.12.1
