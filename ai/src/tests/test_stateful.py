@@ -8,6 +8,7 @@ from connector.stateful import StatefulConnector
 from data_manager.base_manager import DataParam
 from data_manager.time_series_manager import TimeSeriesDataManager
 from proto.aiengine.v1 import aiengine_pb2
+from exception import AiEngineException
 
 
 class StatefulConnectorTests(unittest.TestCase):
@@ -104,7 +105,7 @@ class StatefulConnectorTests(unittest.TestCase):
         original_fill_table = self.data_manager._fill_table  # pylint: disable=protected-access
 
         def new_fill_table():
-            raise Exception("Should not call this on apply_action")
+            raise AiEngineException("Should not call this on apply_action")
 
         try:
             self.data_manager._fill_table = new_fill_table  # pylint: disable=protected-access
