@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 
 from data_manager.base_manager import DataManagerBase, DataParam
+from exception import AiEngineException
 from proto.aiengine.v1 import aiengine_pb2
 
 
@@ -29,7 +30,7 @@ class TimeSeriesDataManager(DataManagerBase):
 
     def start_training(self):
         if self.is_training:
-            raise Exception("unable to start a new training run before the previous has finished")
+            raise AiEngineException("unable to start a new training run before the previous has finished")
         self.is_training = True
         self.metrics.start("copy_training_table")
         self.massive_table_training_filled = self._fill_table(self.massive_table_sparse)
@@ -63,7 +64,7 @@ class TimeSeriesDataManager(DataManagerBase):
 
     def merge_training_row(self, new_row: pd.DataFrame):
         if not self.is_training:
-            raise Exception("only valid to call merge_training_row during a training run")
+            raise AiEngineException("only valid to call merge_training_row during a training run")
         index = new_row.index[0]
         for column_name in list(new_row.keys()):
             value = new_row[column_name].array[0]
@@ -108,7 +109,7 @@ class TimeSeriesDataManager(DataManagerBase):
     # This method should only be called during training.
     def get_current_window(self) -> pd.DataFrame:
         if not self.is_training:
-            raise Exception("Start training before calling get_current_window()")
+            raise AiEngineException("Start training before calling get_current_window()")
 
         # This will get the nearest previous index that matches the timestamp,
         # so we don't need to specify the timestamps exactly
