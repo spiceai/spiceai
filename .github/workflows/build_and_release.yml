@@ -43,8 +43,8 @@ jobs:
     strategy:
       matrix:
         os: [self-hosted, ubuntu-latest, macOS-latest]
-        # target_arch: [amd64, arm64]
-        target_arch: [amd64]
+        target_arch: [amd64, arm64]
+        # target_arch: [amd64]
         include:
           - os: ubuntu-latest
             target_os: linux
