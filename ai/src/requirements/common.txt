@@ -52,7 +52,7 @@ tensorflow-probability==0.15.0
 termcolor==1.1.0
 tf-estimator-nightly==2.8.0.dev2021122109
 toml==0.10.2
-tornado==6.1
+tornado==6.3.3
 traitlets==5.1.0
 typing_extensions==4.0.1
 urllib3==1.26.6
