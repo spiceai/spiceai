@@ -93,11 +93,11 @@ pub struct PricesClient {
 }
 
 impl PricesClient {
-    pub fn new(base_url: Option<&str>, api_key: &str) -> Self {
+    pub fn new(base_url: Option<String>, api_key: String) -> Self {
         let default_url = "https://data.spiceai.io".to_string();
         let client = reqwest::Client::new();
         PricesClient {
-            base_url: base_url.unwrap_or(&default_url).to_string(),
+            base_url: base_url.unwrap_or(default_url).to_string(),
             _api_key: api_key.to_string(),
             client,
         }
