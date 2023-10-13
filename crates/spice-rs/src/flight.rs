@@ -20,7 +20,11 @@ impl SqlFlightClient {
     }
 
     pub async fn authenticate(&mut self) -> Result<(), Box<dyn Error>> {
-        match self.client.handshake("", &self.api_key).await {
+        let parts: Vec<&str> = self.api_key.split("|").collect();
+        if parts.len() < 2 {
+            return Err("Invalid API key format".into());
+        }
+        match self.client.handshake(parts[0], parts[1]).await {
             Err(e) => Err(e.into()),
             Ok(v) => {
                 self.client.set_token(String::from_utf8(v.to_vec()).expect("something"));
