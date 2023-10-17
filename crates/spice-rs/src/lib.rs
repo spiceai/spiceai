@@ -1,9 +1,10 @@
 
 mod client;
 mod flight;
+mod prices; 
+mod tls;
 
-pub use client::{Client, RequestOptions};
-pub use flight::{FlightClient, FlightDescriptor, Ticket, FlightInfo, FlightEndpoint, Location, FlightData};
-pub use flight::DescriptorType;
+pub use client::{SpiceClient as Client};
+pub use flight::{SqlFlightClient};
 
 // Further public exports and integrations
