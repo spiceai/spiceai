@@ -117,10 +117,13 @@ impl PricesClient {
         Ok(response)
     }
 
-    pub async fn get_latest_prices(&self, pairs: &[&str]) -> Result<LatestPricesResponse, Box<dyn Error>> {
-        let url = format!("{}/v1/prices/latest?pair={}", self.base_url, pairs.join(","));
-        let request = self.client.get(&url);
-        let resp = self.add_headers(request).send().await?;
+    pub async fn get_prices(
+        &self,
+        pair: &str,
+    ) -> Result<LatestPricesResponse, Box<dyn Error>> {
+        let mut url = format!("{}/v1/prices?pairs={}", self.base_url, pair);
+
+        let resp = self.add_headers(self.client.get(&url)).send().await?;
         match resp.status() {
             reqwest::StatusCode::OK => {
                 let response: LatestPricesResponse = resp.json().await?;
@@ -130,7 +133,7 @@ impl PricesClient {
             reqwest::StatusCode::TOO_MANY_REQUESTS => Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, "Rate limit exceeded, slow down"))),
             reqwest::StatusCode::INTERNAL_SERVER_ERROR => Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, "Internal server error"))),
             _ => Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("Unexpected response status: {}", resp.status())))),
-        }
+        }        
     }
 
     pub async fn get_historical_prices(
@@ -140,7 +143,7 @@ impl PricesClient {
         end: Option<i64>, 
         granularity: Option<&str>
     ) -> Result<HashMap<String, Vec<HistoricalPriceData>>, Box<dyn Error>> {
-        let mut url = format!("{}/v1/prices?pair={}", self.base_url, pairs.join(","));
+        let mut url = format!("{}/v1/prices/historical?pairs={}", self.base_url, pairs.join(","));
         
         if let Some(start_time) = start {
             url.push_str(&format!("&start={}", start_time));
