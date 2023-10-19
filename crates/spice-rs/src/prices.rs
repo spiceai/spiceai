@@ -157,6 +157,7 @@ impl PricesClient {
             url.push_str(&format!("&granularity={}", gran));
         }
         
+        println!("URL: {}", url);
         let resp = self.add_headers(self.client.get(&url)).send().await?;
         match resp.status() {
             reqwest::StatusCode::OK => {

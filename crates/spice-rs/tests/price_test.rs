@@ -7,8 +7,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_prices() {
-        dotenv::from_path(Path::new(".env.local")).ok();
-        let api_key = env::var("API_KEY").expect("API_KEY not found");
+        let api_key = env::var("API_KEY").expect("API_KEY not set");
         let http_addr = "https://data.spiceai.io".to_string();
         let flight_addr = "grpc+tls://flight.spiceai.io".to_string();
         let firecache_addr = "grpc+tls://firecache.spiceai.io".to_string();
@@ -33,8 +32,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_historical_prices() {
-        dotenv::from_path(Path::new(".env.local")).ok();
-        let api_key = env::var("API_KEY").expect("API_KEY not found");
+        let api_key = env::var("API_KEY").expect("API_KEY not set");
         let http_addr = "https://data.spiceai.io".to_string();
         let flight_addr = "grpc+tls://flight.spiceai.io".to_string();
         let firecache_addr = "grpc+tls://firecache.spiceai.io".to_string();
@@ -48,14 +46,16 @@ mod tests {
         assert!(result.is_ok());
         // Code for evaluate results received
         // match spice_client.prices.get_historical_prices(&[pair1, pair2], Some(1672531200000), Some(1675209600000), Some("1h")).await {
-        // match spice_client.prices.get_historical_prices(&[pair1, pair2], None, None, Some("1h")).await {
-        //     Ok(r) => {
-        //         println!("{:?}",r)
-        //     }
-        //     Err(e) => {
-        //         println!("{:?}",e)
-        //     }
-        // }
+        match spice_client.prices.get_historical_prices(&[pair1, pair2], None, None, Some("1h")).await {
+            Ok(r) => {
+                assert!(r.contains_key("BTC-USD"));
+                assert!(r.contains_key("ETH-USD"));
+                // TODO: Check timepoints are between 1672531200000 & 1675209600000
+            }
+            Err(e) => {
+                assert!(false, "Error: {}", e);
+            }
+        }
     }
     
     // Further tests for the client module
