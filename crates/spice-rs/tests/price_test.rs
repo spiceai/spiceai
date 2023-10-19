@@ -45,8 +45,8 @@ mod tests {
         let result = spice_client.prices.get_historical_prices(&[pair1, pair2], None, None, Some("1h")).await;
         assert!(result.is_ok());
         // Code for evaluate results received
-        // match spice_client.prices.get_historical_prices(&[pair1, pair2], Some(1672531200000), Some(1675209600000), Some("1h")).await {
-        match spice_client.prices.get_historical_prices(&[pair1, pair2], None, None, Some("1h")).await {
+        match spice_client.prices.get_historical_prices(&[pair1, pair2], Some(1697669766), Some(1697756166), Some("1h")).await {
+        // match spice_client.prices.get_historical_prices(&[pair1, pair2], None, None, Some("1h")).await {
             Ok(r) => {
                 assert!(r.contains_key("BTC-USD"));
                 assert!(r.contains_key("ETH-USD"));
