@@ -1,10 +1,9 @@
-
 mod client;
 mod flight;
-mod prices; 
+mod prices;
 mod tls;
 
-pub use client::{SpiceClient as Client, new_spice_client};
-pub use flight::{SqlFlightClient};
+pub use client::{new_spice_client, SpiceClient as Client};
+pub use flight::SqlFlightClient;
 
 // Further public exports and integrations
