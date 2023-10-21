@@ -9,8 +9,8 @@ pub async fn new_spice_client(api_key: String) -> Result<SpiceClient, Box<dyn Er
     return new_spice_client_with_address(
         api_key.to_string(),
         "https://data.spiceai.io".to_string(),
-        "grpc+tls://flight.spiceai.io".to_string(),
-        "grpc+tls://firecache.spiceai.io".to_string(),
+        "https://flight.spiceai.io".to_string(),
+        "https://firecache.spiceai.io".to_string(),
     )
     .await;
 }

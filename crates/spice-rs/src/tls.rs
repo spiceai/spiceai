@@ -1,12 +1,13 @@
 use std::error::Error;
-use tonic::{transport::Channel};
-use tonic::transport::channel::{Endpoint, ClientTlsConfig};
-
+use tonic::transport::channel::{ClientTlsConfig, Endpoint};
+use tonic::transport::Channel;
 
 pub fn system_tls_certificate() -> Result<tonic::transport::Certificate, Box<dyn Error>> {
+    // Load root certificates found in the platform’s native certificate store.
     let certs = rustls_native_certs::load_native_certs()?;
-    
-    let concatenated_pems = certs.iter()
+
+    let concatenated_pems = certs
+        .iter()
         .filter_map(|cert| {
             let mut buf = &cert.0[..];
             rustls_pemfile::certs(&mut buf).ok()?.pop()
@@ -17,28 +18,27 @@ pub fn system_tls_certificate() -> Result<tonic::transport::Certificate, Box<dyn
     Ok(tonic::transport::Certificate::from_pem(concatenated_pems))
 }
 
-
 pub async fn new_tls_flight_channel(https_url: String) -> Result<Channel, Box<dyn Error>> {
     let endpoint_result = Endpoint::from_shared(https_url.clone());
     if endpoint_result.is_err() {
-        return Err(endpoint_result.err().expect("").into())
+        return Err(endpoint_result.err().expect("").into());
     }
     let mut endpoint = endpoint_result.expect("");
 
-    if https_url.starts_with("grpc+tls://") {
+    if https_url.starts_with("https://") {
         match system_tls_certificate() {
-            Err(e) => {return Err(e.into())},
+            Err(e) => return Err(e.into()),
             Ok(cert) => {
                 let tls_config = ClientTlsConfig::new()
                     .ca_certificate(cert)
-                    .domain_name(https_url.trim_start_matches("grpc+tls://"));
+                    .domain_name(https_url.trim_start_matches("https://"));
                 endpoint = endpoint.tls_config(tls_config)?;
             }
         }
     }
 
     match endpoint.connect().await {
-        Ok(c) => {Ok(c)},
-        Err(e) => {Err(e.into())},
+        Ok(c) => Ok(c),
+        Err(e) => Err(e.into()),
     }
 }
