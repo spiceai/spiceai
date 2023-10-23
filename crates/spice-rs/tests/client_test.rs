@@ -27,7 +27,8 @@ mod tests {
                     println!("{:?}", r);
                 }
                 Err(e) => {
-                    println!("{:?}",e)
+                    println!("{:?}",e);
+                    assert!(false, "Error: {}", e);
                 }
             };
     }
@@ -41,8 +42,9 @@ mod tests {
                 Ok(r) => {
                     println!("{:?}", r);
                 }
-                Err(e) => {
-                    println!("{:?}",e)
+                Err(e) => {                    
+                    println!("{:?}",e);
+                    assert!(false, "Error: {}", e);
                 }
             };
     }
