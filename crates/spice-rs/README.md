@@ -8,7 +8,7 @@ Add the following to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-spice-rs = { git = "https://github.com/spiceai/spice-rs", tag = "v1.0.0" }
+spice-rs = { git = "https://github.com/spiceai/spice-rs", tag = "v1.0.1" }
 ```
 
 ## Usage
