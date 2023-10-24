@@ -1,13 +1,7 @@
 use crate::{flight::SqlFlightClient, prices::PricesClient, tls::new_tls_flight_channel};
-use arrow_flight::sql::client::FlightSqlServiceClient;
-use arrow_flight::FlightData;
+use arrow_flight::decode::FlightRecordBatchStream;
 use std::error::Error;
 use tonic::transport::Channel;
-use tonic::Streaming;
-
-use arrow_flight::{
-    decode::FlightRecordBatchStream, flight_service_client::FlightServiceClient, Ticket,
-};
 
 pub async fn new_spice_client(api_key: String) -> Result<SpiceClient, Box<dyn Error>> {
     return new_spice_client_with_address(
@@ -61,13 +55,5 @@ impl SpiceClient {
         timeout: Option<u32>,
     ) -> Result<FlightRecordBatchStream, Box<dyn Error>> {
         self.flight.query(query, timeout).await
-    }
-
-    pub async fn firecache_query(
-        &mut self,
-        query: String,
-        timeout: Option<u32>,
-    ) -> Result<FlightRecordBatchStream, Box<dyn Error>> {
-        self.firecache.query(query, timeout).await
     }
 }

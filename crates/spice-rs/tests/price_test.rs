@@ -17,15 +17,6 @@ mod tests {
         let pair = "BTC-USD";
         let result = spice_client.prices.get_prices(pair).await;
         assert!(result.is_ok());
-        // Code for evaluate results received
-        // match spice_client.prices.get_prices(pair).await {
-        //     Ok(r) => {
-        //         println!("{:?}", r)
-        //     }
-        //     Err(e) => {
-        //         println!("{:?}", e)
-        //     }
-        // }
     }
 
     #[tokio::test]
@@ -44,23 +35,5 @@ mod tests {
             )
             .await;
         assert!(result.is_ok());
-        // Code for evaluate results received
-        // match spice_client
-        //     .prices
-        //     .get_historical_prices(
-        //         &[pair1, pair2],
-        //         Some(1697669766),
-        //         Some(1697756166),
-        //         Some("1h"),
-        //     )
-        //     .await
-        // {
-        //     Ok(r) => {
-        //         println!("{:?}", r)
-        //     }
-        //     Err(e) => {
-        //         println!("{:?}", e)
-        //     }
-        // }
     }
 }
