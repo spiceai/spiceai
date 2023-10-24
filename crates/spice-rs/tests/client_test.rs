@@ -1,7 +1,6 @@
 #[cfg(test)]
 mod tests {
     use futures::stream::StreamExt;
-    use spice_rs::Client;
     use spice_rs::*;
     use std::env;
     use std::path::Path;
