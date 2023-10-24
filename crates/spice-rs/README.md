@@ -21,7 +21,7 @@ spice-rs = { git = "https://github.com/spiceai/spice-rs", tag = "v1.0.0" }
 use spice_rs::new_spice_client;
 
 let client = new_spice_client("API_KEY".to_string());
-let data = client.query("SELECT * FROM eth.recent_blocks LIMIT 10;".to_string(), Some(5*60)).await;
+let data = client.query("SELECT * FROM eth.recent_blocks LIMIT 10;".to_string()).await;
 ```
 
 ### HTTP API
