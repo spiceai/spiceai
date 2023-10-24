@@ -8,7 +8,6 @@ pub async fn new_spice_client(api_key: String) -> Result<SpiceClient, Box<dyn Er
         api_key.to_string(),
         "https://data.spiceai.io".to_string(),
         "https://flight.spiceai.io".to_string(),
-        "https://firecache.spiceai.io".to_string(),
     )
     .await;
 }
@@ -17,35 +16,22 @@ pub async fn new_spice_client_with_address(
     api_key: String,
     http_addr: String,
     flight_addr: String,
-    firecache_addr: String,
 ) -> Result<SpiceClient, Box<dyn Error>> {
-    let flight_chan = new_tls_flight_channel(flight_addr).await;
-    if flight_chan.is_err() {
-        return Err(flight_chan.err().expect("").into());
-    }
-
-    match new_tls_flight_channel(firecache_addr).await {
+    match new_tls_flight_channel(flight_addr).await {
         Err(e) => Err(e.into()),
-        Ok(firecache_chan) => Ok(SpiceClient::new(
-            http_addr,
-            api_key,
-            flight_chan.expect(""),
-            firecache_chan,
-        )),
+        Ok(flight_chan) => Ok(SpiceClient::new(http_addr, api_key, flight_chan)),
     }
 }
 
 pub struct SpiceClient {
     pub flight: SqlFlightClient,
-    pub firecache: SqlFlightClient,
     pub prices: PricesClient,
 }
 
 impl SpiceClient {
-    pub fn new(http_addr: String, api_key: String, flight: Channel, firecache: Channel) -> Self {
+    pub fn new(http_addr: String, api_key: String, flight: Channel) -> Self {
         Self {
             flight: SqlFlightClient::new(flight, api_key.clone()),
-            firecache: SqlFlightClient::new(firecache, api_key.clone()),
             prices: PricesClient::new(Some(http_addr), api_key),
         }
     }
