@@ -35,11 +35,7 @@ impl SpiceClient {
             prices: PricesClient::new(Some(http_addr), api_key),
         }
     }
-    pub async fn query(
-        &mut self,
-        query: String,
-        timeout: Option<u32>,
-    ) -> Result<FlightRecordBatchStream, Box<dyn Error>> {
-        self.flight.query(query, timeout).await
+    pub async fn query(&mut self, query: String) -> Result<FlightRecordBatchStream, Box<dyn Error>> {
+        self.flight.query(query).await
     }
 }

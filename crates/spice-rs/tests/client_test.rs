@@ -22,7 +22,7 @@ mod tests {
         let mut spice_client = new_client().await;
         match spice_client.query(
             "SELECT number, \"timestamp\", base_fee_per_gas, base_fee_per_gas / 1e9 AS base_fee_per_gas_gwei FROM eth.recent_blocks limit 10".to_string(),
-            None).await {
+            ).await {
                 Ok(mut flight_data_stream) => {
                       // Read back RecordBatches
                     while let Some(batch) = flight_data_stream.next().await {
@@ -48,7 +48,7 @@ mod tests {
         let mut spice_client = new_client().await;
         match spice_client.query(
             "SELECT number, \"timestamp\", base_fee_per_gas, base_fee_per_gas / 1e9 AS base_fee_per_gas_gwei FROM eth.blocks limit 2000".to_string(),
-            None).await {
+            ).await {
                 Ok(mut flight_data_stream) => {
                       // Read back RecordBatches
                     let mut num_batches = 0;

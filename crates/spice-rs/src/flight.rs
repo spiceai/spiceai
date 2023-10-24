@@ -1,5 +1,6 @@
 use arrow_flight::decode::FlightRecordBatchStream;
 use arrow_flight::sql::client::FlightSqlServiceClient;
+use core::panic;
 use std::error::Error;
 use tonic::transport::Channel;
 
@@ -28,13 +29,13 @@ impl SqlFlightClient {
 
     pub async fn query(
         &mut self,
-        query: String,
-        _timeout: Option<u32>,
+        query: String
     ) -> std::result::Result<FlightRecordBatchStream, Box<dyn Error>> {
         match self.authenticate().await {
             Err(e) => return Err(e.into()),
             Ok(()) => {}
         };
+
         match self.client.execute(query, Option::None).await {
             Ok(resp) => {
                 for ep in resp.endpoint {

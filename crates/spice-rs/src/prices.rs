@@ -10,16 +10,17 @@ use serde_derive::Deserialize;
 pub struct HistoricalPriceData {
     pub timestamp: DateTime<Utc>,
     pub price: f64,
-    pub high: f64,
-    pub low: f64,
-    pub open: f64,
-    pub close: f64,
+    pub high: Option<f64>,
+    pub low: Option<f64>,
+    pub open: Option<f64>,
+    pub close: Option<f64>,
 }
+
 impl fmt::Display for HistoricalPriceData {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
-            "Timestamp: {}, Price: {}, High: {}, Low: {}, Open: {}, Close: {}",
+            "Timestamp: {}, Price: {}, High: {:?}, Low: {:?}, Open: {:?}, Close: {:?}",
             self.timestamp, self.price, self.high, self.low, self.open, self.close
         )
     }
@@ -139,8 +140,8 @@ impl PricesClient {
         Ok(response)
     }
 
-    pub async fn get_prices(&self, pair: &str) -> Result<LatestPricesResponse, Box<dyn Error>> {
-        let mut url = format!("{}/v1/prices?pairs={}", self.base_url, pair);
+    pub async fn get_prices(&self, pairs: &[&str]) -> Result<LatestPricesResponse, Box<dyn Error>> {
+        let url = format!("{}/v1/prices?pairs={}", self.base_url, pairs.join(","));
 
         let resp = self.add_headers(self.client.get(&url)).send().await?;
         match resp.status() {
@@ -170,8 +171,8 @@ impl PricesClient {
     pub async fn get_historical_prices(
         &self,
         pairs: &[&str],
-        start: Option<i64>,
-        end: Option<i64>,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
         granularity: Option<&str>,
     ) -> Result<HashMap<String, Vec<HistoricalPriceData>>, Box<dyn Error>> {
         let mut url = format!(
@@ -179,14 +180,17 @@ impl PricesClient {
             self.base_url,
             pairs.join(",")
         );
-
+    
         if let Some(start_time) = start {
-            url.push_str(&format!("&start={}", start_time));
+            let timestamp = start_time.timestamp();
+            url.push_str(&format!("&start={}", timestamp));
         }
-
+    
         if let Some(end_time) = end {
-            url.push_str(&format!("&end={}", end_time));
+            let timestamp = end_time.timestamp();
+            url.push_str(&format!("&end={}", timestamp));
         }
+    
 
         if let Some(gran) = granularity {
             url.push_str(&format!("&granularity={}", gran));
