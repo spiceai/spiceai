@@ -29,7 +29,7 @@ impl SqlFlightClient {
 
     pub async fn query(
         &mut self,
-        query: String
+        query: String,
     ) -> std::result::Result<FlightRecordBatchStream, Box<dyn Error>> {
         match self.authenticate().await {
             Err(e) => return Err(e.into()),
