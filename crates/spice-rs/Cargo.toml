@@ -4,18 +4,20 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-arrow-flight = { version = "47.0.0", features = ["flight-sql-experimental"] }
+arrow-flight = { version = "48.0.0", features = ["flight-sql-experimental"] }
 bytes = "1.5.0"
 prost = "0.12.1"
 prost-types = "0.12.1"
 rustls = "0.21.7"
 tokio = "1.32.0"
 rustls-native-certs = "0.6.3"
-tonic = { version = "0.10.0", default-features = false, features = ["transport", "tls"] }
+tonic = { version = "0.10.0", default-features = false, features = ["transport", "tls", "tls-roots"] }
 rustls-pemfile = "1.0.3"
 reqwest = { version = "0.11.21", features = ["json"] }
 serde = "1.0.188"
 serde_derive = "1.0.188"
 serde_json = "1.0.107"
 chrono = { version = "0.4.31", features = ["serde"] }
-
+dotenv = "0.15.0"
+arrow = "48.0.0"
+futures = "0.3.28"

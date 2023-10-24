@@ -2,10 +2,9 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_derive::Deserialize;
-use chrono::{DateTime, Utc};
-
 
 #[derive(Debug, Deserialize)]
 pub struct HistoricalPriceData {
@@ -18,8 +17,11 @@ pub struct HistoricalPriceData {
 }
 impl fmt::Display for HistoricalPriceData {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "Timestamp: {}, Price: {}, High: {}, Low: {}, Open: {}, Close: {}",
-               self.timestamp, self.price, self.high, self.low, self.open, self.close)
+        write!(
+            f,
+            "Timestamp: {}, Price: {}, High: {}, Low: {}, Open: {}, Close: {}",
+            self.timestamp, self.price, self.high, self.low, self.open, self.close
+        )
     }
 }
 
@@ -27,24 +29,40 @@ impl fmt::Display for HistoricalPriceData {
 pub struct LatestPriceDetail {
     #[serde(deserialize_with = "string_to_float_map")]
     pub prices: HashMap<String, f64>,
-    #[serde(rename="minPrice", default, deserialize_with = "string_to_float_option")]
+    #[serde(
+        rename = "minPrice",
+        default,
+        deserialize_with = "string_to_float_option"
+    )]
     pub min_price: Option<f64>,
-    #[serde(rename="maxPrice", default, deserialize_with = "string_to_float_option")]
+    #[serde(
+        rename = "maxPrice",
+        default,
+        deserialize_with = "string_to_float_option"
+    )]
     pub max_price: Option<f64>,
-    #[serde(rename="meanPrice", default, deserialize_with = "string_to_float_option")]
+    #[serde(
+        rename = "meanPrice",
+        default,
+        deserialize_with = "string_to_float_option"
+    )]
     pub mean_price: Option<f64>,
 }
 impl fmt::Display for LatestPriceDetail {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let prices_str = self.prices.iter()
+        let prices_str = self
+            .prices
+            .iter()
             .map(|(k, v)| format!("{}: {}", k, v))
             .collect::<Vec<_>>()
             .join(", ");
-        write!(f, "Prices: [{}], Min Price: {:?}, Max Price: {:?}, Mean Price: {:?}",
-               prices_str, self.min_price, self.max_price, self.mean_price)
+        write!(
+            f,
+            "Prices: [{}], Min Price: {:?}, Max Price: {:?}, Mean Price: {:?}",
+            prices_str, self.min_price, self.max_price, self.mean_price
+        )
     }
 }
-
 
 #[derive(Debug, Deserialize)]
 pub struct LatestPricesResponse {
@@ -55,7 +73,9 @@ pub struct LatestPricesResponse {
 
 impl fmt::Display for LatestPricesResponse {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let prices_str = self.prices.iter()
+        let prices_str = self
+            .prices
+            .iter()
             .map(|(pair, detail)| format!("Pair: {}, Details: [{}]", pair, detail))
             .collect::<Vec<_>>()
             .join("\n");
@@ -69,9 +89,9 @@ where
 {
     let map = HashMap::<String, String>::deserialize(deserializer)?;
     map.into_iter()
-       .map(|(k, v)| v.parse::<f64>().map(|v_f64| (k, v_f64)))
-       .collect::<Result<HashMap<String, f64>, std::num::ParseFloatError>>()
-       .map_err(serde::de::Error::custom)
+        .map(|(k, v)| v.parse::<f64>().map(|v_f64| (k, v_f64)))
+        .collect::<Result<HashMap<String, f64>, std::num::ParseFloatError>>()
+        .map_err(serde::de::Error::custom)
 }
 
 fn string_to_float_option<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
@@ -80,11 +100,13 @@ where
 {
     let s: Option<String> = Option::deserialize(deserializer)?;
     match s {
-        Some(str_val) => str_val.parse::<f64>().map(Some).map_err(serde::de::Error::custom),
-        None => Ok(None)
+        Some(str_val) => str_val
+            .parse::<f64>()
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+        None => Ok(None),
     }
 }
-
 
 pub struct PricesClient {
     base_url: String,
@@ -117,35 +139,51 @@ impl PricesClient {
         Ok(response)
     }
 
-    pub async fn get_latest_prices(&self, pairs: &[&str]) -> Result<LatestPricesResponse, Box<dyn Error>> {
-        let url = format!("{}/v1/prices/latest?pair={}", self.base_url, pairs.join(","));
-        let request = self.client.get(&url);
-        let resp = self.add_headers(request).send().await?;
+    pub async fn get_prices(&self, pair: &str) -> Result<LatestPricesResponse, Box<dyn Error>> {
+        let mut url = format!("{}/v1/prices?pairs={}", self.base_url, pair);
+
+        let resp = self.add_headers(self.client.get(&url)).send().await?;
         match resp.status() {
             reqwest::StatusCode::OK => {
                 let response: LatestPricesResponse = resp.json().await?;
                 Ok(response)
-            },
-            reqwest::StatusCode::BAD_REQUEST => Err(Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Bad request"))),
-            reqwest::StatusCode::TOO_MANY_REQUESTS => Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, "Rate limit exceeded, slow down"))),
-            reqwest::StatusCode::INTERNAL_SERVER_ERROR => Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, "Internal server error"))),
-            _ => Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("Unexpected response status: {}", resp.status())))),
+            }
+            reqwest::StatusCode::BAD_REQUEST => Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Bad request",
+            ))),
+            reqwest::StatusCode::TOO_MANY_REQUESTS => Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "Rate limit exceeded, slow down",
+            ))),
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR => Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "Internal server error",
+            ))),
+            _ => Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Unexpected response status: {}", resp.status()),
+            ))),
         }
     }
 
     pub async fn get_historical_prices(
-        &self, 
-        pairs: &[&str], 
-        start: Option<i64>, 
-        end: Option<i64>, 
-        granularity: Option<&str>
+        &self,
+        pairs: &[&str],
+        start: Option<i64>,
+        end: Option<i64>,
+        granularity: Option<&str>,
     ) -> Result<HashMap<String, Vec<HistoricalPriceData>>, Box<dyn Error>> {
-        let mut url = format!("{}/v1/prices?pair={}", self.base_url, pairs.join(","));
-        
+        let mut url = format!(
+            "{}/v1/prices/historical?pairs={}",
+            self.base_url,
+            pairs.join(",")
+        );
+
         if let Some(start_time) = start {
             url.push_str(&format!("&start={}", start_time));
         }
-        
+
         if let Some(end_time) = end {
             url.push_str(&format!("&end={}", end_time));
         }
@@ -153,17 +191,30 @@ impl PricesClient {
         if let Some(gran) = granularity {
             url.push_str(&format!("&granularity={}", gran));
         }
-        
+
+        println!("URL: {}", url);
         let resp = self.add_headers(self.client.get(&url)).send().await?;
         match resp.status() {
             reqwest::StatusCode::OK => {
                 let response: HashMap<String, Vec<HistoricalPriceData>> = resp.json().await?;
                 Ok(response)
-            },
-            reqwest::StatusCode::BAD_REQUEST => Err(Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Bad request"))),
-            reqwest::StatusCode::TOO_MANY_REQUESTS => Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, "Rate limit exceeded, slow down"))),
-            reqwest::StatusCode::INTERNAL_SERVER_ERROR => Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, "Internal server error"))),
-            _ => Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("Unexpected response status: {}", resp.status())))),
+            }
+            reqwest::StatusCode::BAD_REQUEST => Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Bad request",
+            ))),
+            reqwest::StatusCode::TOO_MANY_REQUESTS => Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "Rate limit exceeded, slow down",
+            ))),
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR => Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "Internal server error",
+            ))),
+            _ => Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Unexpected response status: {}", resp.status()),
+            ))),
         }
     }
 }
