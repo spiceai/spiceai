@@ -24,7 +24,7 @@ pub async fn new_spice_client_with_address(
 }
 
 pub struct SpiceClient {
-    pub flight: SqlFlightClient,
+    flight: SqlFlightClient,
     pub prices: PricesClient,
 }
 
