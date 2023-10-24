@@ -1,11 +1,7 @@
-use arrow_flight::sql::{client::FlightSqlServiceClient, CommandStatementQuery, ProstMessageExt};
-use arrow_flight::FlightData;
-use arrow_flight::FlightDescriptor;
-use prost::Message;
-use core::panic;
+use arrow_flight::decode::FlightRecordBatchStream;
+use arrow_flight::sql::client::FlightSqlServiceClient;
 use std::error::Error;
-use tonic::transport::channel::{ClientTlsConfig, Endpoint};
-use tonic::{transport::Channel, Request, Streaming};
+use tonic::transport::Channel;
 
 pub struct SqlFlightClient {
     client: FlightSqlServiceClient<Channel>,
@@ -20,7 +16,7 @@ impl SqlFlightClient {
         }
     }
 
-    pub async fn authenticate(&mut self) -> Result<(), Box<dyn Error>> {
+    pub async fn authenticate(&mut self) -> std::result::Result<(), Box<dyn Error>> {
         if self.api_key.split("|").collect::<String>().len() < 2 {
             return Err("Invalid API key format".into());
         }
@@ -34,7 +30,7 @@ impl SqlFlightClient {
         &mut self,
         query: String,
         _timeout: Option<u32>,
-    ) -> Result<Streaming<FlightData>, Box<dyn Error>> {
+    ) -> std::result::Result<FlightRecordBatchStream, Box<dyn Error>> {
         match self.authenticate().await {
             Err(e) => return Err(e.into()),
             Ok(()) => {}

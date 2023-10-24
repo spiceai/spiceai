@@ -5,6 +5,10 @@ use std::error::Error;
 use tonic::transport::Channel;
 use tonic::Streaming;
 
+use arrow_flight::{
+    decode::FlightRecordBatchStream, flight_service_client::FlightServiceClient, Ticket,
+};
+
 pub async fn new_spice_client(api_key: String) -> Result<SpiceClient, Box<dyn Error>> {
     return new_spice_client_with_address(
         api_key.to_string(),
@@ -55,7 +59,7 @@ impl SpiceClient {
         &mut self,
         query: String,
         timeout: Option<u32>,
-    ) -> Result<Streaming<FlightData>, Box<dyn Error>> {
+    ) -> Result<FlightRecordBatchStream, Box<dyn Error>> {
         self.flight.query(query, timeout).await
     }
 
@@ -63,7 +67,7 @@ impl SpiceClient {
         &mut self,
         query: String,
         timeout: Option<u32>,
-    ) -> Result<Streaming<FlightData>, Box<dyn Error>> {
+    ) -> Result<FlightRecordBatchStream, Box<dyn Error>> {
         self.firecache.query(query, timeout).await
     }
 }
