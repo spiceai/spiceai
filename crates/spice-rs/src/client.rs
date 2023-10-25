@@ -3,24 +3,26 @@ use arrow_flight::decode::FlightRecordBatchStream;
 use std::error::Error;
 use tonic::transport::Channel;
 
-pub async fn new_spice_client(api_key: String) -> SpiceClient {
-    return new_spice_client_with_address(
-        api_key.to_string(),
-        "https://data.spiceai.io".to_string(),
-        "https://flight.spiceai.io".to_string(),
-    )
-    .await
-    .expect("Error Initiating Client");
+pub struct SpiceClientConfig {
+    pub https_addr: String,
+    pub flight_channel: Channel,
 }
 
-pub async fn new_spice_client_with_address(
-    api_key: String,
-    http_addr: String,
-    flight_addr: String,
-) -> Result<SpiceClient, Box<dyn Error>> {
-    match new_tls_flight_channel(flight_addr).await {
-        Err(e) => Err(e.into()),
-        Ok(flight_chan) => Ok(SpiceClient::new(http_addr, api_key, flight_chan)),
+impl SpiceClientConfig {
+    pub fn new(https_addr: String, flight_channel: Channel) -> Self {
+        SpiceClientConfig {
+            https_addr: https_addr,
+            flight_channel: flight_channel,
+        }
+    }
+
+    pub async fn load_from_default() -> Result<SpiceClientConfig, Box<dyn Error>> {
+        let https_addr = "https://data.spiceai.io".to_string();
+        let flight_addr = "https://flight.spiceai.io".to_string();
+        match new_tls_flight_channel(flight_addr.clone()).await {
+            Err(e) => Err(e.into()),
+            Ok(flight_chan) => Ok(SpiceClientConfig::new(https_addr, flight_chan)),
+        }
     }
 }
 
@@ -30,16 +32,17 @@ pub struct SpiceClient {
 }
 
 impl SpiceClient {
-    pub fn new(http_addr: String, api_key: String, flight: Channel) -> Self {
+    pub async fn new(api_key: &str) -> Self {
+        let config = SpiceClientConfig::load_from_default()
+            .await
+            .expect("Error Loading Client Config");
         Self {
-            flight: SqlFlightClient::new(flight, api_key.clone()),
-            prices: PricesClient::new(Some(http_addr), api_key),
+            flight: SqlFlightClient::new(config.flight_channel, api_key.to_string()),
+            prices: PricesClient::new(Some(config.https_addr), api_key.to_string()),
         }
     }
-    pub async fn query(
-        &mut self,
-        query: String,
-    ) -> Result<FlightRecordBatchStream, Box<dyn Error>> {
+
+    pub async fn query(&mut self, query: &str) -> Result<FlightRecordBatchStream, Box<dyn Error>> {
         self.flight.query(query).await
     }
 }

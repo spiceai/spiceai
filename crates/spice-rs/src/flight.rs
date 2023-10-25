@@ -29,14 +29,14 @@ impl SqlFlightClient {
 
     pub async fn query(
         &mut self,
-        query: String,
+        query: &str,
     ) -> std::result::Result<FlightRecordBatchStream, Box<dyn Error>> {
         match self.authenticate().await {
             Err(e) => return Err(e.into()),
             Ok(()) => {}
         };
 
-        match self.client.execute(query, Option::None).await {
+        match self.client.execute(query.to_string(), Option::None).await {
             Ok(resp) => {
                 for ep in resp.endpoint {
                     if let Some(tkt) = ep.ticket {

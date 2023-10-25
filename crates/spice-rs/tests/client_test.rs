@@ -1,14 +1,14 @@
 #[cfg(test)]
 mod tests {
     use futures::stream::StreamExt;
-    use spice_rs::*;
+    use spice_rs::Client;
     use std::env;
     use std::path::Path;
 
     async fn new_client() -> Client {
         dotenv::from_path(Path::new(".env.local")).ok();
         let api_key = env::var("API_KEY").expect("API_KEY not found");
-        let spice_client = new_spice_client(api_key).await;
+        let spice_client = Client::new(&api_key).await;
         return spice_client;
     }
 
@@ -21,7 +21,7 @@ mod tests {
     async fn test_query() {
         let mut spice_client = new_client().await;
         match spice_client.query(
-            "SELECT number, \"timestamp\", base_fee_per_gas, base_fee_per_gas / 1e9 AS base_fee_per_gas_gwei FROM eth.recent_blocks limit 10".to_string(),
+            "SELECT number, \"timestamp\", base_fee_per_gas, base_fee_per_gas / 1e9 AS base_fee_per_gas_gwei FROM eth.recent_blocks limit 10",
             ).await {
                 Ok(mut flight_data_stream) => {
                       // Read back RecordBatches
@@ -47,7 +47,7 @@ mod tests {
     async fn test_query_streaming() {
         let mut spice_client = new_client().await;
         match spice_client.query(
-            "SELECT number, \"timestamp\", base_fee_per_gas, base_fee_per_gas / 1e9 AS base_fee_per_gas_gwei FROM eth.blocks limit 2000".to_string(),
+            "SELECT number, \"timestamp\", base_fee_per_gas, base_fee_per_gas / 1e9 AS base_fee_per_gas_gwei FROM eth.blocks limit 2000",
             ).await {
                 Ok(mut flight_data_stream) => {
                       // Read back RecordBatches

@@ -120,8 +120,8 @@ impl PricesClient {
         let default_url = "https://data.spiceai.io".to_string();
         let client = reqwest::Client::new();
         PricesClient {
-            base_url: base_url.unwrap_or(default_url).to_string(),
-            _api_key: api_key.to_string(),
+            base_url: base_url.unwrap_or(default_url),
+            _api_key: api_key,
             client,
         }
     }
@@ -180,17 +180,16 @@ impl PricesClient {
             self.base_url,
             pairs.join(",")
         );
-    
+
         if let Some(start_time) = start {
             let timestamp = start_time.timestamp();
             url.push_str(&format!("&start={}", timestamp));
         }
-    
+
         if let Some(end_time) = end {
             let timestamp = end_time.timestamp();
             url.push_str(&format!("&end={}", timestamp));
         }
-    
 
         if let Some(gran) = granularity {
             url.push_str(&format!("&granularity={}", gran));
