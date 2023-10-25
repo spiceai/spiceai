@@ -8,20 +8,19 @@ Add the following to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-spice-rs = { git = "https://github.com/spiceai/spice-rs", tag = "v1.0.1" }
+spice-rs = { git = "https://github.com/spiceai/spice-rs", tag = "v1.0.2" }
 ```
 
 ## Usage
-
+<!-- NOTE: If you're changing the code examples below, make sure you update `tests/readme_test.rs`. -->
 ### Arrow Query
-
 **SQL Query**
 
 ```rust
-use spice_rs::new_spice_client;
+use spice_rs::Client;
 
-let client = new_spice_client("API_KEY".to_string());
-let data = client.query("SELECT * FROM eth.recent_blocks LIMIT 10;".to_string()).await;
+let mut client = Client::new("API_KEY").await;
+let data = client.query("SELECT * FROM eth.recent_blocks LIMIT 10;").await;
 ```
 
 ### HTTP API

@@ -8,6 +8,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_readme() {
+        // NOTE: If you're changing the code below, make sure you update the README.md.
         dotenv::from_path(Path::new(".env.local")).ok();
         let api_key = env::var("API_KEY").expect("API_KEY not found");
 
