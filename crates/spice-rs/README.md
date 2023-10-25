@@ -48,4 +48,4 @@ let historical_price_data = client.prices.get_historical_prices(&["BTC-USDC"], S
 ```
 
 ## Documentation
-Check out our [Documentation](https://docs.spice.ai/sdks/rust) to learn more about how to use the Rust SDK.
+Check out our [Documentation](https://docs.spice.ai/sdks/rust-sdk) to learn more about how to use the Rust SDK.
