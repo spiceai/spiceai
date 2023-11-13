@@ -1,6 +1,6 @@
 use arrow_flight::decode::FlightRecordBatchStream;
 use arrow_flight::sql::client::FlightSqlServiceClient;
-use core::panic;
+
 use std::error::Error;
 use tonic::transport::Channel;
 
