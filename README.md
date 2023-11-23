@@ -30,7 +30,6 @@ The Spice.ai runtime is written in Golang and Python and runs as a container or 
 Spice.ai includes:
 
 - A lightweight, portable ML runtime accessible by simple HTTP APIs, allowing developers to use their preferred languages and frameworks
-- A dashboard to visualize data and learning
 - A developer-friendly CLI
 - Simple, git-committable, configuration and code
 

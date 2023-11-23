@@ -12,7 +12,6 @@ import (
 	"github.com/spiceai/data-components-contrib/dataprocessors/csv"
 	"github.com/spiceai/spiceai/pkg/aiengine"
 	"github.com/spiceai/spiceai/pkg/api"
-	"github.com/spiceai/spiceai/pkg/dashboard"
 	"github.com/spiceai/spiceai/pkg/dataspace"
 	"github.com/spiceai/spiceai/pkg/diagnostics"
 	"github.com/spiceai/spiceai/pkg/environment"
@@ -610,8 +609,6 @@ func (server *server) Start() error {
 	r := router.New()
 	r.GET("/health", healthHandler)
 
-	// Static Dashboard
-	dashboardServer := dashboard.NewDashboardEmbedded()
 	var err error
 
 	api := r.Group("/api/v0.1")
@@ -645,22 +642,12 @@ func (server *server) Start() error {
 		api.GET("/diagnostics", server.apiGetDiagnosticsHandler)
 	}
 
-	static := r.Group("/static")
-	{
-		static.GET("/js/{file}", dashboardServer.JsHandler)
-		static.GET("/css/{file}", dashboardServer.CssHandler)
-		static.GET("/media/{file}", dashboardServer.MediaHandler)
-	}
-
-	r.GET("/manifest.json", dashboardServer.ManifestJsonHandler)
 	r.GET("/{filepath:*}", func(ctx *fasthttp.RequestCtx) {
 		if strings.Contains(ctx.URI().String(), "/api/") {
 			ctx.Response.SetStatusCode(http.StatusNotFound)
 			return
 		}
-		dashboardServer.IndexHandler(ctx)
 	})
-	r.GET("/", dashboardServer.IndexHandler)
 
 	serverLogger, err := zap.NewStdLogAt(zaplog, zap.DebugLevel)
 	if err != nil {

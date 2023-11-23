@@ -18,38 +18,8 @@ on:
   workflow_dispatch:
 
 jobs:
-  build_dashboard:
-    name: Build dashboard
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v3
-
-      - name: Cache dashboard
-        id: cache-dashboard
-        uses: actions/cache@v2
-        with:
-          path: pkg/dashboard/build
-          key: ${{ runner.os }}-${{ hashFiles('dashboard/**') }}
-
-      - name: Build and copy dashboard
-        if: steps.cache-dashboard.outputs.cache-hit != 'true'
-        run: make
-        working-directory: dashboard
-
-      - name: Test dashboard
-        if: steps.cache-dashboard.outputs.cache-hit != 'true'
-        run: yarn test
-        working-directory: dashboard
-
-      - name: Upload dashboard artifact
-        uses: actions/upload-artifact@v3
-        with:
-          name: dashboard_build
-          path: pkg/dashboard/build
-
   build_binaries:
     name: build spice and spiced
-    needs: build_dashboard
     runs-on: ubuntu-latest
     env:
       GOVER: 1.19
@@ -60,12 +30,6 @@ jobs:
         uses: actions/setup-go@v3
         with:
           go-version: ${{ env.GOVER }}
-
-      - name: Download dashboard
-        uses: actions/download-artifact@v3
-        with:
-          name: dashboard_build
-          path: pkg/dashboard/build
 
       - name: Build spice
         run: make

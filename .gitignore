@@ -4,7 +4,6 @@
 *.dll
 *.so
 *.dylib
-pkg/dashboard/build
 cmd/spice/spice
 cmd/spice/.spice
 cmd/spice/data
@@ -37,6 +36,3 @@ venv_acknowledgements
 __pycache__
 venv
 .venv
-
-# Dashboard
-*.fasthttp.br

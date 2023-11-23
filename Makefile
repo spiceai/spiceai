@@ -11,13 +11,11 @@ all: build docker
 
 .PHONY: build
 build:
-	pushd dashboard && yarn install && yarn build && cp -rf build ../pkg/dashboard/ && popd
 	pushd cmd/spice && go build . && popd
 	pushd cmd/spiced && go build . && popd
 
 .PHONY: lint
 lint:
-	pushd dashboard && yarn lint && popd
 	pushd ai/src && make lint && popd
 	go vet ./...
 	golangci-lint run
@@ -36,7 +34,6 @@ test-e2e:
 
 .PHONY: test
 test: build test-pkg test-e2e
-	pushd dashboard && yarn test-ci && popd
 	pushd ai/src && make test && popd
 	go vet ./...
 
@@ -103,42 +100,3 @@ check-proto-diff:
 	git diff --exit-code ./ai/src/proto/aiengine/v1/aiengine_pb2_grpc.py # check no changes
 	git diff --exit-code ./ai/src/proto/runtime/v1/runtime_pb2.py # check no changes
 	git diff --exit-code ./ai/src/proto/runtime/v1/runtime_pb2_grpc.py # check no changes
-
-################################################################################
-# Target: generate-acknowledgements                                            #
-################################################################################
-ACKNOWLEDGEMENTS_PATH := dashboard/src/content/acknowledgements.md
-
-.PHONY: generate-acknowledgements
-generate-acknowledgements:
-	echo -e "# Open Source Acknowledgements\n\nSpice.ai acknowledges the following open source projects for making this project possible:\n\n## Python Packages\n" > $(ACKNOWLEDGEMENTS_PATH)
-
-# Python Packages
-	python3 -m venv venv_acknowledgments
-	venv_acknowledgments/bin/pip install -r ai/src/requirements/production.txt
-	venv_acknowledgments/bin/pip install -r ai/src/requirements/development.txt
-	venv_acknowledgments/bin/pip install -r ai/src/requirements/common.txt
-	venv_acknowledgments/bin/pip install pip-licenses
-	venv_acknowledgments/bin/pip-licenses -f csv --with-authors --with-urls 2>/dev/null >> $(ACKNOWLEDGEMENTS_PATH)
-	rm -rf venv_acknowledgments
-
-# Go Modules
-	echo -e "\n## Go Modules\n" >> $(ACKNOWLEDGEMENTS_PATH)
-	go get github.com/google/go-licenses
-	pushd cmd/spice && go-licenses csv . 2>/dev/null >> ../../$(ACKNOWLEDGEMENTS_PATH) && popd
-	pushd cmd/spiced && go-licenses csv . 2>/dev/null >> ../../$(ACKNOWLEDGEMENTS_PATH) && popd
-
-# Node Packages
-	echo -e "\n## Node Packages\n" >> $(ACKNOWLEDGEMENTS_PATH)
-	pushd dashboard && yarn install && npx license-checker --csv 2>/dev/null >> ../$(ACKNOWLEDGEMENTS_PATH) && popd
-
-# Apply Formatting
-	@if [[ "$(UNAME)" -eq "Darwin" ]]; then\
-		sed -i '' 's/\"//g' $(ACKNOWLEDGEMENTS_PATH); \
-		sed -i '' 's/,/, /g' $(ACKNOWLEDGEMENTS_PATH); \
-		sed -i '' 's/,  /, /g' $(ACKNOWLEDGEMENTS_PATH); \
-	else\
-		sed -i 's/\"//g' $(ACKNOWLEDGEMENTS_PATH); \
-		sed -i 's/,/, /g' $(ACKNOWLEDGEMENTS_PATH); \
-		sed -i 's/,  /, /g' $(ACKNOWLEDGEMENTS_PATH); \
-	fi

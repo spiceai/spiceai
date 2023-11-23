@@ -1,25 +1,9 @@
-FROM node:16 as dashboard
-
-WORKDIR /build-dashboard
-
-COPY dashboard dashboard/
-COPY version.txt /build-dashboard/version.txt
-
-WORKDIR /build-dashboard/dashboard
-
-RUN npm install --global npm
-RUN npm install --global yarn --force
-RUN yarn install
-RUN yarn build
-
 FROM golang AS build
 
 ARG REL_VERSION
 ENV REL_VERSION=${REL_VERSION:-local}
 
 WORKDIR /build
-
-COPY --from=dashboard /build-dashboard/dashboard/build /build/pkg/dashboard/build
 
 COPY go.mod go.mod
 COPY go.sum go.sum
