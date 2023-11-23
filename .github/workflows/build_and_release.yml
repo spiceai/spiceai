@@ -11,29 +11,8 @@ on:
   workflow_dispatch:
 
 jobs:
-  build_dashboard:
-    name: Build dashboard
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v3
-
-      - name: Build and copy dashboard
-        run: make
-        working-directory: dashboard
-
-      - name: Test dashboard
-        run: yarn test
-        working-directory: dashboard
-
-      - name: Upload dashboard artifact
-        uses: actions/upload-artifact@v3
-        with:
-          name: dashboard_build
-          path: dashboard/build
-
   build:
     name: Build ${{ matrix.target_os }}_${{ matrix.target_arch }} binaries
-    needs: build_dashboard
     runs-on: ${{ matrix.os }}
     env:
       GOVER: 1.19
@@ -70,12 +49,6 @@ jobs:
         uses: actions/setup-go@v3
         with:
           go-version: ${{ env.GOVER }}
-
-      - name: Download dashboard
-        uses: actions/download-artifact@v3
-        with:
-          name: dashboard_build
-          path: pkg/dashboard/build
 
       - name: Build spiced
         run: make

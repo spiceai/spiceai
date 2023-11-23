@@ -53,14 +53,6 @@ jobs:
         with:
           go-version: ${{ env.GOVER }}
 
-      - name: Build and copy dashboard
-        working-directory: dashboard
-        run: make
-
-      - name: Test dashboard
-        run: yarn test
-        working-directory: dashboard
-
       - name: go vet
         run: go vet ./...
 

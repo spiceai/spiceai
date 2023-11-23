@@ -27,13 +27,11 @@ Spice.ai is still under early development, so there are several gaps and limitat
 
 ## Features being considered for v1.0-stable
 
-- WebSocket support for dashboard data
 - CI/CD on GitHub
 - Self-host on baremetal or VM
 - Pluggable environments
 - Search, index, publish and browse the Spice Rack registry
 - Distributed learning
-- Improved data visualization in dashboard
 - Custom visualization hooks for Dataspaces
 - Parallel Actions (AI Engine)
 - A/B testing and flighting

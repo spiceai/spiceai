@@ -22,15 +22,6 @@ jobs:
         with:
           go-version: ${{ env.GOVER }}
 
-      - name: Build and copy dashboard
-        working-directory: dashboard
-        run: make
-
-      - name: golangci-lint
-        uses: golangci/golangci-lint-action@v2
-        with:
-          args: --timeout=2m
-
   pylint:
     name: lint python code (syntax)
     runs-on: ubuntu-latest

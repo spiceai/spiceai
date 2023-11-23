@@ -61,16 +61,6 @@ jobs:
         run: |
           go-licenses csv . |& ${{ env.FORBIDDEN_LICENSE_CHECK }}
 
-      - name: Install dashboard packages
-        working-directory: dashboard
-        run: |
-          yarn install
-
-      - name: Check dashboard package licenses
-        working-directory: dashboard
-        run: |
-          npx license-checker --excludePackage ${{ env.EXCLUDE_JS_PACKAGES }} |& ${{ env.FORBIDDEN_LICENSE_CHECK }}
-
       - name: Set up Python 3.8
         uses: actions/setup-python@v1
         with:
