@@ -31,7 +31,7 @@ pluggy==0.13.1
 protobuf==3.19.5
 psutil==5.8.0
 py==1.11.0
-pyarrow==8.0.0
+pyarrow==14.0.1
 pyasn1==0.4.8
 pyasn1-modules==0.2.8
 pyparsing==2.4.7
