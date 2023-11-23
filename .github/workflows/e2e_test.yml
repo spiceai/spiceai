@@ -22,7 +22,7 @@ jobs:
     name: build spice and spiced
     runs-on: ubuntu-latest
     env:
-      GOVER: 1.19
+      GOVER: 1.21
     steps:
       - uses: actions/checkout@v3
 
@@ -86,7 +86,7 @@ jobs:
     needs: [cache_pip, build_binaries]
     runs-on: ubuntu-latest
     env:
-      GOVER: 1.19
+      GOVER: 1.21
     strategy:
       fail-fast: false
       matrix:
@@ -168,7 +168,7 @@ jobs:
     needs: [cache_pip, build_binaries]
     runs-on: ubuntu-latest
     env:
-      GOVER: 1.19
+      GOVER: 1.21
     strategy:
       fail-fast: false
       matrix:
