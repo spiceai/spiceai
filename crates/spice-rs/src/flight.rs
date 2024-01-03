@@ -1,5 +1,6 @@
 use arrow_flight::decode::FlightRecordBatchStream;
 use arrow_flight::sql::client::FlightSqlServiceClient;
+use arrow_flight::Ticket;
 
 use std::error::Error;
 use tonic::transport::Channel;
@@ -30,6 +31,7 @@ impl SqlFlightClient {
     pub async fn query(
         &mut self,
         query: &str,
+        firecache: bool,
     ) -> std::result::Result<FlightRecordBatchStream, Box<dyn Error>> {
         match self.authenticate().await {
             Err(e) => return Err(e.into()),
@@ -40,7 +42,20 @@ impl SqlFlightClient {
             Ok(resp) => {
                 for ep in resp.endpoint {
                     if let Some(tkt) = ep.ticket {
-                        return self.client.do_get(tkt).await.map_err(|e| e.into());
+                        // There seems to be an issue with ticket parsing in arrow-flight crate
+                        // This is a workaround to fix the issue
+                        let fixed_ticket = if firecache {
+                            Ticket::new(
+                                tkt.ticket
+                                    .into_iter()
+                                    .skip_while(|&x| x != b'}')
+                                    .skip(1)
+                                    .collect::<Vec<u8>>(),
+                            )
+                        } else {
+                            tkt
+                        };
+                        return self.client.do_get(fixed_ticket).await.map_err(|e| e.into());
                     }
                 }
                 Err("no tickets for flight endpoint".into())
