@@ -45,13 +45,7 @@ impl SqlFlightClient {
                         // There seems to be an issue with ticket parsing in arrow-flight crate
                         // This is a workaround to fix the issue
                         let fixed_ticket = if firecache {
-                            Ticket::new(
-                                tkt.ticket
-                                    .into_iter()
-                                    .skip_while(|&x| x != b'}')
-                                    .skip(1)
-                                    .collect::<Vec<u8>>(),
-                            )
+                            Ticket::new(query.to_string())
                         } else {
                             tkt
                         };
