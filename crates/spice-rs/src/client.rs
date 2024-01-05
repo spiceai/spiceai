@@ -1,7 +1,7 @@
 use crate::{flight::SqlFlightClient, prices::PricesClient, tls::new_tls_flight_channel};
 use arrow_flight::decode::FlightRecordBatchStream;
+use futures::join;
 use std::error::Error;
-use tokio::join;
 use tonic::transport::Channel;
 
 pub struct SpiceClientConfig {
