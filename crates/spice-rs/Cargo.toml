@@ -20,3 +20,4 @@ chrono = { version = "0.4.31", features = ["serde"] }
 dotenv = "0.15.0"
 arrow = "48.0.0"
 futures = "0.3.28"
+base64 = "0.21.5"
