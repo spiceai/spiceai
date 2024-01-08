@@ -1,4 +1,5 @@
 mod client;
+mod config;
 mod flight;
 mod prices;
 mod tls;

@@ -1,4 +1,5 @@
 use std::error::Error;
+use std::str::FromStr;
 use tonic::transport::channel::{ClientTlsConfig, Endpoint};
 use tonic::transport::Channel;
 
@@ -18,27 +19,16 @@ pub fn system_tls_certificate() -> Result<tonic::transport::Certificate, Box<dyn
     Ok(tonic::transport::Certificate::from_pem(concatenated_pems))
 }
 
-pub async fn new_tls_flight_channel(https_url: String) -> Result<Channel, Box<dyn Error>> {
-    let endpoint_result = Endpoint::from_shared(https_url.clone());
-    if endpoint_result.is_err() {
-        return Err(endpoint_result.err().expect("").into());
-    }
-    let mut endpoint = endpoint_result.expect("");
+pub async fn new_tls_flight_channel(https_url: &str) -> Result<Channel, Box<dyn Error>> {
+    let mut endpoint = Endpoint::from_str(https_url)?;
 
     if https_url.starts_with("https://") {
-        match system_tls_certificate() {
-            Err(e) => return Err(e.into()),
-            Ok(cert) => {
-                let tls_config = ClientTlsConfig::new()
-                    .ca_certificate(cert)
-                    .domain_name(https_url.trim_start_matches("https://"));
-                endpoint = endpoint.tls_config(tls_config)?;
-            }
-        }
+        let cert = system_tls_certificate()?;
+        let tls_config = ClientTlsConfig::new()
+            .ca_certificate(cert)
+            .domain_name(https_url.trim_start_matches("https://"));
+        endpoint = endpoint.tls_config(tls_config)?;
     }
 
-    match endpoint.connect().await {
-        Ok(c) => Ok(c),
-        Err(e) => Err(e.into()),
-    }
+    Ok(endpoint.connect().await?)
 }
