@@ -10,4 +10,5 @@ LDFLAGS:="-X $(BASE_PACKAGE_NAME)/pkg/version.version=$(SPICE_VERSION)"
 
 .PHONY: all
 all:
-	go build -v -ldflags=$(LDFLAGS)
+	mkdir target 2> /dev/null|| true
+	go build -v -ldflags=$(LDFLAGS) -o target/spice

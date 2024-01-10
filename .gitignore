@@ -12,6 +12,8 @@ cmd/spiced/.spice
 cmd/spiced/data
 spicepods
 
+target/
+
 # Debug binaries
 __debug_bin
 
