@@ -1,7 +1,0 @@
-  customprocessor        /userapp/spicepods/customprocessor.yaml        10        
-  event-categories       /userapp/spicepods/event-categories.yaml       10        
-  event-tags             /userapp/spicepods/event-tags.yaml             10        
-  trader                 /userapp/spicepods/trader.yaml                 5         
-  trader-external-funcs  /userapp/spicepods/trader-external-funcs.yaml  5         
-  trader-seed-streaming  /userapp/spicepods/trader-seed-streaming.yaml  5         
-

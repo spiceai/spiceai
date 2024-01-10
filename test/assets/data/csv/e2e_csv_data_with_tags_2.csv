@@ -1,6 +1,0 @@
-time,event.data.event_id,event.data.h,event.data.rating,event.data.speed,event.data.target,event.data.tags1,event.data.tags2,event.data.tags3
-1611205740,3,1,10,15,1,tagA,tagB,tagC
-1611305780,5,2,11,30,2,tagA,,
-1611458200,6,3,12,45,3,tagA,tagC,
-1611558600,7,4,13,60,4,,tagB,tagC
-1611659000,9,5,14,75,5,,,tagC

@@ -43,7 +43,7 @@ getSystemInfo() {
 }
 
 verifySupported() {
-    local supported=(darwin-amd64 linux-amd64)
+    local supported=(darwin-amd64 linux-amd64 darwin-arm64 linux-arm64)
     local current_osarch="${OS}-${ARCH}"
 
     for osarch in "${supported[@]}"; do
@@ -51,12 +51,6 @@ verifySupported() {
             return
         fi
     done
-
-    if [ "$current_osarch" == "darwin-arm64" ]; then
-        echo "darwin_arm64 arch is not yet supported. See the Spice.ai roadmap at https://github.com/spiceai/spiceai/blob/trunk/docs/ROADMAP.md."
-        return
-    fi
-
 
     echo "No prebuilt binary for ${current_osarch}"
     exit 1

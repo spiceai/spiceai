@@ -1,2 +1,0 @@
-# Specifies only production-specific requirements
--r common.txt

@@ -1,5 +1,0 @@
-{
-    "algorithm_id": "sacd",
-    "name": "Soft Actor Critic Discrete",
-    "docs_link": "https://docs.spiceai.org/deep-learning-ai/sac/"
-}

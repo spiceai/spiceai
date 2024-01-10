@@ -1,6 +1,0 @@
-([]string) (len=4) {
-  (string) (len=6) "height",
-  (string) (len=6) "rating",
-  (string) (len=5) "speed",
-  (string) (len=6) "target"
-}

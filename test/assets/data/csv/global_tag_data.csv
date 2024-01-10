@@ -1,6 +1,0 @@
-time,coinbase.btcusd.open,coinbase.btcusd._tags,bitthumb.btcusd.high,bitmex.btcusd.low,coinbase_pro.btcusd.close,local.btcusd.volume,local.btcusd._tags
-1605312000,16339.56,elon_tweet market_open,16339.6,16240,16254.51,274.42607,bought_1 tag_2
-1605313800,16256.42,market_close,16305,16248.6,16305,110.91971,local_tag_1 local_tag_2
-1605315600,16303.88,,16303.88,16210.99,16222.16,231.64805,local_tag_1 local_tag_2
-1605317400,16221.78,use spice ai for all your intelligent time series app needs!,16246.92,16200.01,16214.15,135.86161,local_tag_1
-1605319200,16214.26,,16234,16175.62,16223.08,164.32561,local_tag_2

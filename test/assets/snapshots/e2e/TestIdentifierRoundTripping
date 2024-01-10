@@ -1,7 +1,0 @@
-time,event.data.height,event.data.rating,event.data.speed,event.data.target,tags
-1610057400,10,10,15,1,tagA tagB tagC
-1610057800,20,11,30,2,tagA
-1610058200,30,12,45,3,tagA tagC
-1610058600,40,13,60,4,tagB tagC
-1610059000,50,14,75,5,tagC
-
