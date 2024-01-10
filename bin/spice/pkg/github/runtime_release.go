@@ -29,7 +29,6 @@ func GetLatestRuntimeRelease() (*RepoRelease, error) {
 }
 
 func GetLatestCliRelease() (*RepoRelease, error) {
-
 	release, err := GetLatestRelease(githubClient, GetAssetName(constants.SpiceCliFilename))
 	if err != nil {
 		return nil, err

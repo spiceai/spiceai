@@ -69,7 +69,7 @@ func (r *SpiceRackRegistry) GetPod(podFullPath string) (string, error) {
 		return "", err
 	}
 
-	podsPath := context.CurrentContext().PodsDir()
+	podsPath := context.NewContext().PodsDir()
 
 	podsPerm, err := util.MkDirAllInheritPerm(podsPath)
 	if err != nil {

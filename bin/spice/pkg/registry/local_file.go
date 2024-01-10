@@ -34,9 +34,11 @@ func (r *LocalFileRegistry) GetPod(podPath string) (string, error) {
 		}
 	}
 
+	rtcontext := context.NewContext()
+
 	// Validate source
 	podManifestFileName := fmt.Sprintf("%s.yaml", strings.ToLower(filepath.Base(podPath)))
-	podManifestPath := filepath.Join(context.CurrentContext().PodsDir(), podManifestFileName)
+	podManifestPath := filepath.Join(rtcontext.PodsDir(), podManifestFileName)
 
 	if _, err := os.Stat(filepath.Join(podPath, podManifestFileName)); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -46,7 +48,7 @@ func (r *LocalFileRegistry) GetPod(podPath string) (string, error) {
 	}
 
 	// Prepare destination
-	podsDir := context.CurrentContext().PodsDir()
+	podsDir := rtcontext.PodsDir()
 	if _, err = os.Stat(podsDir); err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
 			return "", fmt.Errorf("error fetching pod %s: %w", podPath, err)
