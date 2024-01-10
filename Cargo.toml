@@ -1,0 +1,22 @@
+[workspace]
+members = [
+    "bin/spiced/",
+]
+default-members = ["bin/spiced"]
+
+# Explicitly set the resolver to version 2, which is the default for packages with edition >= 2021
+# https://doc.rust-lang.org/edition-guide/rust-2021/default-cargo-resolver.html
+resolver = "2"
+
+[workspace.package]
+version = "0.10.0-alpha.0"
+edition = "2021"
+rust-version = "1.75"
+license = "Apache-2.0"
+homepage = "https://spice.ai"
+repository = "https://github.com/spiceai/spiceai"
+exclude = [".github/"]
+
+[workspace.dependencies]
+spiced = { path = "bin/spiced" }
+clap = { version = "4.4.14", features = ["derive"] }
