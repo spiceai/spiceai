@@ -33,10 +33,6 @@ jobs:
     env:
       GOVER: 1.21
 
-      # Manually exclude packages that have a clause allowing a permissive license *or* a copyleft license to be used
-      EXCLUDE_JS_PACKAGES: node-forge@1.3.1
-      EXCLUDE_PYTHON_PACKAGES: pyzmq pylint astroid
-
       FORBIDDEN_LICENSE_CHECK: |
         grep -B 1 -E "GPL|CC-BY-SA|CC-BY-NC|CC-BY-NC-SA|CC-BY-NC-ND|APSL|CPAL|EUPL|NPOSL|OSL|SSPL|Parity|RPL|QPL|Sleepycat|copyleft|CDDL|CPL|EPL|ErlPL|IPL|MS-RL|SPL|Facebook|Commons-Clause" | grep . && exit 1 || echo "ok"
 
@@ -55,30 +51,3 @@ jobs:
         working-directory: cmd/spice
         run: |
           go-licenses csv . |& ${{ env.FORBIDDEN_LICENSE_CHECK }}
-
-      - name: Check spiced licenses
-        working-directory: cmd/spiced
-        run: |
-          go-licenses csv . |& ${{ env.FORBIDDEN_LICENSE_CHECK }}
-
-      - name: Set up Python 3.8
-        uses: actions/setup-python@v1
-        with:
-          python-version: 3.8
-
-      - name: Install AI packages
-        working-directory: ai/src
-        run: |
-          pip install -r requirements/production.txt
-          pip install -r requirements/development.txt
-          pip install -r requirements/common.txt
-
-      - name: Install pip-licenses
-        working-directory: ai/src
-        run: |
-          pip install pip-licenses
-
-      - name: Check AI package licenses
-        working-directory: ai/src
-        run: |
-          pip-licenses --ignore-packages ${{ env.EXCLUDE_PYTHON_PACKAGES}} |& ${{ env.FORBIDDEN_LICENSE_CHECK }}

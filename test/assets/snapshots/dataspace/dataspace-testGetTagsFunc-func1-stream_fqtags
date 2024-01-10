@@ -1,5 +1,0 @@
-([]string) (len=3) {
-  (string) (len=17) "event.stream.tagA",
-  (string) (len=17) "event.stream.tagB",
-  (string) (len=17) "event.stream.tagC"
-}

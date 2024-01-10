@@ -1,7 +1,0 @@
-(map[string]*dataspace.MeasurementInfo) (len=1) {
-  (string) (len=31) "coinbase.btcusd_with_seed.close": (*dataspace.MeasurementInfo)({
-    Name: (string) (len=5) "close",
-    InitialValue: (float64) 0,
-    Fill: (string) ""
-  })
-}

@@ -1,5 +1,0 @@
-(map[string]string) (len=3) {
-  (string) (len=8) "duration": (string) (len=14) "length_of_time",
-  (string) (len=11) "guest_count": (string) (len=10) "num_guests",
-  (string) (len=12) "ticket_price": (string) (len=12) "ticket_price"
-}

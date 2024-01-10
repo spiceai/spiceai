@@ -1,7 +1,0 @@
-time,event.data-invalid.eventId,event.data-invalid.height,event.data-invalid.rating,event.data-invalid.speed,event.data-invalid.target,tags
-1610057400,1,10,10,15,1,tagA tagB tagC tagD
-1610057800,2,20,11,30,2,tagA tagD
-1610058200,4,30,12,45,3,tagA tagC
-1610058600,8,40,13,60,4,tagB tagC tagD
-1610059000,16,50,14,75,5,tagC
-
