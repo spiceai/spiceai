@@ -23,7 +23,7 @@ spice run
 			cmd.PrintErrf("failed to check for latest CLI release version: %s\n", err.Error())
 		}
 
-		err = runtime.Run(contextFlag, "")
+		err = runtime.Run()
 		if err != nil {
 			cmd.PrintErrln(err.Error())
 			os.Exit(1)
@@ -32,7 +32,6 @@ spice run
 }
 
 func init() {
-	runCmd.Flags().StringVar(&contextFlag, "context", "docker", "Runs Spice.ai in the given context, either 'docker' or 'metal'")
 	runCmd.Flags().BoolP("help", "h", false, "Print this help message")
 	RootCmd.AddCommand(runCmd)
 }

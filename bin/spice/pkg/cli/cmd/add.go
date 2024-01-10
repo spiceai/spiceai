@@ -33,7 +33,7 @@ spice add samples/LogPruner
 			return
 		}
 
-		relativePath := context.CurrentContext().GetSpiceAppRelativePath(downloadPath)
+		relativePath := context.NewContext().GetSpiceAppRelativePath(downloadPath)
 
 		cmd.Printf("Added %s\n", relativePath)
 

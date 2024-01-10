@@ -6,7 +6,6 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
-	"github.com/spiceai/spiceai/bin/spice/pkg/context"
 )
 
 var (
@@ -24,13 +23,6 @@ var RootCmd = &cobra.Command{
 // Execute adds all child commands to the root command.
 func Execute() {
 	cobra.OnInitialize(initConfig)
-
-	// All CLI commands run in the "metal" context
-	err := context.SetDefaultContext()
-	if err != nil {
-		RootCmd.Println(err.Error())
-		os.Exit(1)
-	}
 
 	if err := RootCmd.Execute(); err != nil {
 		RootCmd.Println(err)

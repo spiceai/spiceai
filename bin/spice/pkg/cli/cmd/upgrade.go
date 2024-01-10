@@ -28,7 +28,7 @@ spice upgrade
 			return
 		}
 
-		rtcontext := context.CurrentContext()
+		rtcontext := context.NewContext()
 		cliVersion := version.Version()
 
 		if cliVersion == release.TagName {

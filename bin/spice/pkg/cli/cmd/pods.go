@@ -33,7 +33,7 @@ spice pods list
 `,
 	Run: func(cmd *cobra.Command, args []string) {
 		v := viper.New()
-		appDir := context.CurrentContext().AppDir()
+		appDir := context.NewContext().AppDir()
 		runtimeConfig, err := config.LoadRuntimeConfiguration(v, appDir)
 		if err != nil {
 			cmd.Println("failed to load runtime configuration")

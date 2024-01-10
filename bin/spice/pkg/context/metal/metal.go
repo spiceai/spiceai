@@ -15,11 +15,10 @@ import (
 )
 
 type MetalContext struct {
-	spiceRuntimeDir   string
-	spiceBinDir       string
-	appDir            string
-	podsDir           string
-	isDevelopmentMode bool
+	spiceRuntimeDir string
+	spiceBinDir     string
+	appDir          string
+	podsDir         string
 }
 
 func NewMetalContext() *MetalContext {
@@ -42,7 +41,7 @@ func (c *MetalContext) PodsDir() string {
 	return c.podsDir
 }
 
-func (c *MetalContext) Init(isDevelopmentMode bool) error {
+func (c *MetalContext) Init() error {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		return err
@@ -58,7 +57,6 @@ func (c *MetalContext) Init(isDevelopmentMode bool) error {
 
 	c.appDir = cwd
 	c.podsDir = filepath.Join(c.appDir, constants.SpicePodsDirectoryName)
-	c.isDevelopmentMode = isDevelopmentMode
 
 	return nil
 }
@@ -145,15 +143,10 @@ func (c *MetalContext) GetSpiceAppRelativePath(absolutePath string) string {
 	return absolutePath
 }
 
-func (c *MetalContext) GetRunCmd(manifestPath string) (*exec.Cmd, error) {
+func (c *MetalContext) GetRunCmd() (*exec.Cmd, error) {
 	spiceCMD := c.binaryFilePath("spiced")
 
-	args := []string{manifestPath}
-	if c.isDevelopmentMode {
-		args = append(args, "--development")
-	}
-
-	cmd := exec.Command(spiceCMD, args...)
+	cmd := exec.Command(spiceCMD)
 
 	return cmd, nil
 }

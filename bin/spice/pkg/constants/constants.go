@@ -6,7 +6,6 @@ const (
 	SpicePodsDirectoryName = "spicepods"
 	SpiceRuntimeFilename   = "spiced"
 	SpicePodFileExtension  = ".spicepod"
-	PythonCmd              = "python3"
 	SpiceEnvVarPrefix      = "SPICE_"
 	SpiceCliFilename       = "spice"
 )

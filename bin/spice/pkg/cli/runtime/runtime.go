@@ -9,16 +9,12 @@ import (
 	"github.com/spiceai/spiceai/bin/spice/pkg/util"
 )
 
-func Run(contextFlag string, manifestPath string) error {
+func Run() error {
 	fmt.Println("Spice.ai runtime starting...")
 
-	rtcontext, err := context.NewContext(contextFlag)
-	if err != nil {
-		fmt.Println(err.Error())
-		os.Exit(1)
-	}
+	rtcontext := context.NewContext()
 
-	err = rtcontext.Init(true)
+	err := rtcontext.Init()
 	if err != nil {
 		fmt.Println(err.Error())
 		os.Exit(1)
@@ -45,7 +41,7 @@ func Run(contextFlag string, manifestPath string) error {
 		}
 	}
 
-	cmd, err := rtcontext.GetRunCmd(manifestPath)
+	cmd, err := rtcontext.GetRunCmd()
 	if err != nil {
 		return err
 	}

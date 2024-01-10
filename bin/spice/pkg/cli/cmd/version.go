@@ -28,13 +28,8 @@ spice version
 		var rtversion string
 		var err error
 
-		rtcontext, err := context.NewContext(contextFlag)
-		if err != nil {
-			cmd.Println(err.Error())
-			os.Exit(1)
-		}
-
-		err = rtcontext.Init(true)
+		rtcontext := context.NewContext()
+		err = rtcontext.Init()
 		if err != nil {
 			cmd.Println(err.Error())
 			os.Exit(1)
@@ -60,12 +55,9 @@ spice version
 }
 
 func checkLatestCliReleaseVersion() error {
-	rtcontext, err := context.NewContext("metal") // CLI is always metal context
-	if err != nil {
-		return err
-	}
+	rtcontext := context.NewContext()
 
-	err = rtcontext.Init(true)
+	err := rtcontext.Init()
 	if err != nil {
 		return err
 	}

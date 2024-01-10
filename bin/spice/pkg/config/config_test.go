@@ -35,7 +35,7 @@ func testRuntimeConfigLoads(testConfigPath string) func(*testing.T) {
 		defer os.Remove(tempConfigPath)
 
 		viper := viper.New()
-		rtcontext := context.CurrentContext()
+		rtcontext := context.NewContext()
 		spiceConfiguration, err := config.LoadRuntimeConfiguration(viper, rtcontext.AppDir())
 		if err != nil {
 			t.Error(err)
@@ -70,7 +70,7 @@ func testRuntimeConfigReplacesEnvironmentVariables(testConfigPath string) func(*
 		defer os.Remove(tempConfigPath)
 
 		viper := viper.New()
-		rtcontext := context.CurrentContext()
+		rtcontext := context.NewContext()
 		spiceConfiguration, err := config.LoadRuntimeConfiguration(viper, rtcontext.AppDir())
 		if err != nil {
 			t.Error(err)
