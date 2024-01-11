@@ -94,6 +94,5 @@ func checkLatestCliReleaseVersion() error {
 }
 
 func init() {
-	versionCmd.Flags().StringVar(&contextFlag, "context", "docker", "Runs Spice.ai in the given context, either 'docker' or 'metal'")
 	RootCmd.AddCommand(versionCmd)
 }
