@@ -77,29 +77,24 @@ pub enum SpicepodKind {
 
 pub fn load(path: impl Into<PathBuf>) -> Result<SpicepodDefinition> {
     let path = path.into();
-    let dir: ReadDir = std::fs::read_dir(path).context(UnableToReadDirectoryContentsSnafu{ path })?;
 
-    for entry in dir {
-        let entry = entry.context(UnableToReadDirectoryContentsSnafu { path })?;
-        let file_name = entry.file_name();
-        let entry_path = entry.path();
-        if entry_path.is_file() {
-            if file_name == "spicepod.yaml" || file_name == "spicepod.yml" {
-                let spicepod_definition_yaml = File::open(entry_path).context(UnableToOpenFileSnafu { path: entry_path })?;
+    let spicepod_files = vec!["spicepod.yaml", "spicepod.yml"];
+    
+    for spicepod_file in spicepod_files {
+        let spicepod_path = path.join(spicepod_file);
+        if let Some(spicepod_definition) = File::open(&spicepod_path).ok() {
+            let mut spicepod_definition: SpicepodDefinition =
+                serde_yaml::from_reader(spicepod_definition).context(UnableToParseSpicepodSnafu)?;
 
-                let mut spicepod_definition: SpicepodDefinition =
-                    serde_yaml::from_reader(spicepod_definition_yaml).context(UnableToParseSpicepodSnafu)?;
+            // expand spicepod components
+            spicepod_definition.datasets =
+                expand_spicepod(&path, spicepod_definition.datasets, "dataset")?;
 
-                // expand spicepod components
-                spicepod_definition.datasets =
-                    expand_spicepod(&path, spicepod_definition.datasets, "dataset")?;
-
-                return Ok(spicepod_definition);
-            }
+            return Ok(spicepod_definition);
         }
     }
 
-    SpicepodNotFoundSnafu { path }.fail()
+    SpicepodNotFoundSnafu { path: &path }.fail()
 }
 
 pub fn expand_spicepod<ComponentType>(
@@ -111,7 +106,7 @@ where
     ComponentType: Clone + DeserializeOwned + Debug + WithDependsOn<ComponentType>,
 {
     let base_path: PathBuf = base_path.into();
-    let expanded: Result<Vec<ComponentOrReference<ComponentType>>> = items
+    items
         .iter()
         .map(|item| match item {
             ComponentOrReference::Component(component) => {
@@ -120,12 +115,12 @@ where
             ComponentOrReference::Reference(reference) => {
                 // Get base path from reference.from
                 let reference_path = PathBuf::from(&reference.from);
-                let reference_base_path = reference_path.parent().ok_or(Error::InvalidComponentReference { path: reference_path })?;
+                let reference_base_path = reference_path.parent().ok_or(Error::InvalidComponentReference { path: reference_path.clone() })?;
                 let component_dir_path = base_path.join(reference_base_path);
-                let dir: ReadDir = std::fs::read_dir(component_dir_path).context(UnableToReadDirectoryContentsSnafu{ path: component_dir_path })?;
+                let dir: ReadDir = std::fs::read_dir(&component_dir_path).context(UnableToReadDirectoryContentsSnafu{ path: &component_dir_path })?;
 
                 for entry in dir {
-                    let entry = entry.context(UnableToReadDirectoryContentsSnafu { path: component_dir_path })?;
+                    let entry = entry.context(UnableToReadDirectoryContentsSnafu { path: &component_dir_path })?;
                     let file_name = entry.file_name();
                     let file_name = match file_name.to_str() {
                         Some(file_name) => file_name,
@@ -137,11 +132,11 @@ where
                     {
                         let filepath = base_path.join(file_name);
                         let reference_definition = File::open(
-                            filepath,
+                            &filepath,
                         )
-                        .context(UnableToOpenFileSnafu { path: filepath })?;
+                        .context(UnableToOpenFileSnafu { path: &filepath })?;
                         let component_definition: ComponentType =
-                            serde_yaml::from_reader(reference_definition).context(UnableToParseSpicepodComponentSnafu { path: filepath })?;
+                            serde_yaml::from_reader(reference_definition).context(UnableToParseSpicepodComponentSnafu { path: &filepath })?;
 
                         let component = ComponentOrReference::Component(
                             component_definition.new(reference.depends_on.clone()),
@@ -151,10 +146,8 @@ where
                     }
                 }
 
-                InvalidComponentReferenceSnafu { path }.fail()
+                InvalidComponentReferenceSnafu { path: &reference_path }.fail()
             }
         })
-        .collect();
-
-    expanded
+        .collect()
 }
