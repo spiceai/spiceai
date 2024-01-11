@@ -275,6 +275,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "snafu"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d342c51730e54029130d7dc9fd735d28c4cd360f1368c01981d4f03ff207f096"
+dependencies = [
+ "snafu-derive",
+]
+
+[[package]]
+name = "snafu-derive"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "080c44971436b1af15d6f61ddd8b543995cf63ab8e677d46b00cc06f4ef267a0"
+dependencies = [
+ "heck",
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "spiced"
 version = "0.10.0-alpha.0"
 dependencies = [
@@ -290,6 +311,7 @@ version = "0.10.0-alpha.0"
 dependencies = [
  "serde",
  "serde_yaml",
+ "snafu",
 ]
 
 [[package]]

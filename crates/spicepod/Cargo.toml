@@ -10,3 +10,4 @@ repository.workspace = true
 [dependencies]
 serde = { workspace = true, features = ["derive"] }
 serde_yaml.workspace = true
+snafu.workspace = true
