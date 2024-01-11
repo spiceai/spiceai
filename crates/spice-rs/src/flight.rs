@@ -38,7 +38,7 @@ impl SqlFlightClient {
         }
     }
 
-    pub async fn handshake(&mut self, username: &str, password: &str) -> Result<Bytes, ArrowError> {
+    async fn handshake(&mut self, username: &str, password: &str) -> Result<Bytes, ArrowError> {
         let cmd = HandshakeRequest {
             protocol_version: 0,
             payload: Default::default(),
@@ -81,7 +81,7 @@ impl SqlFlightClient {
         Ok(resp)
     }
 
-    pub async fn authenticate(&mut self) -> std::result::Result<(), Box<dyn Error>> {
+    async fn authenticate(&mut self) -> std::result::Result<(), Box<dyn Error>> {
         if self.api_key.split('|').collect::<String>().len() < 2 {
             return Err("Invalid API key format".into());
         }

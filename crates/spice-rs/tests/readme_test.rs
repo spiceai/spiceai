@@ -19,19 +19,18 @@ mod tests {
         if data.is_err() {
             panic!("failed to query: {:#?}", data.expect_err(""))
         }
-        let supported_pairs = client.prices.get_supported_pairs().await;
+        let supported_pairs = client.get_supported_pairs().await;
         if supported_pairs.is_err() {
             panic!(
                 "failed to get supported pairs: {:#?}",
                 supported_pairs.expect_err("")
             )
         }
-        let price_data = client.prices.get_prices(&["BTC-USDC"]).await;
+        let price_data = client.get_prices(&["BTC-USDC"]).await;
         if price_data.is_err() {
             panic!("failed to get prices: {:#?}", price_data.expect_err(""))
         }
         let historical_price_data = client
-            .prices
             .get_historical_prices(&["BTC-USDC"], Option::None, Option::None, Option::None)
             .await;
         if historical_price_data.is_err() {
@@ -44,7 +43,6 @@ mod tests {
         let start = now.sub(Duration::seconds(3600));
 
         let historical_price_data = client
-            .prices
             .get_historical_prices(&["BTC-USDC"], Some(start), Some(now), Option::None)
             .await;
         if historical_price_data.is_err() {

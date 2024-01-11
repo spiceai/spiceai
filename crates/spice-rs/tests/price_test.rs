@@ -16,7 +16,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_supported_pairs() {
         let spice_client = new_client().await;
-        let result = spice_client.prices.get_supported_pairs().await;
+        let result = spice_client.get_supported_pairs().await;
         assert!(result.is_ok());
     }
 
@@ -24,7 +24,7 @@ mod tests {
     async fn test_get_prices() {
         let spice_client = new_client().await;
         let pair = "BTC-USD";
-        let result = spice_client.prices.get_prices(&[pair]).await;
+        let result = spice_client.get_prices(&[pair]).await;
         assert!(result.is_ok());
     }
 
@@ -38,7 +38,6 @@ mod tests {
         let end_time = Utc.timestamp_opt(1697756166, 0).single();
 
         let result = spice_client
-            .prices
             .get_historical_prices(&[pair1, pair2], start_time, end_time, Some("1h"))
             .await;
         assert!(result.is_ok());

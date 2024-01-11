@@ -11,7 +11,11 @@ prost-types = "0.12.1"
 rustls = "0.21.7"
 tokio = "1.32.0"
 rustls-native-certs = "0.6.3"
-tonic = { version = "0.10.0", default-features = false, features = ["transport", "tls", "tls-roots"] }
+tonic = { version = "0.10.0", default-features = false, features = [
+  "transport",
+  "tls",
+  "tls-roots",
+] }
 rustls-pemfile = "1.0.3"
 reqwest = { version = "0.11.21", features = ["json"] }
 serde = { version = "1.0", features = ["derive"] }
