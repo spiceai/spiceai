@@ -1,5 +1,5 @@
 use clap::Parser;
-use spicepod::spicepod;
+use spicepod;
 
 #[derive(Parser, Debug)]
 pub struct Args {
@@ -13,7 +13,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             println!("spicepod_definition: {:?}", spicepod_definition);
         },
         Err(err) => {
-            println!("err: {:?}", err);
+            eprintln!("err: {:?}", err);
         }
     }
 
