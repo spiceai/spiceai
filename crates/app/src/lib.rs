@@ -19,8 +19,6 @@ pub enum Error {
         source: spicepod::Error,
         path: PathBuf,
     },
-    #[snafu(display("Invalid path"))]
-    InvalidPath,
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
