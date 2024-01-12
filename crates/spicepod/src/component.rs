@@ -1,9 +1,8 @@
 use serde::{Deserialize, Serialize};
-
 pub mod dataset;
 
 pub trait WithDependsOn<T> {
-    fn new(&self, depends_on: Vec<String>) -> T;
+    fn depends_on(&self, depends_on: &[String]) -> T;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -31,42 +31,42 @@ pub struct Dataset {
 }
 
 impl WithDependsOn<Dataset> for Dataset {
-    fn new(&self, depends_on: Vec<String>) -> Dataset {
+    fn depends_on(&self, depends_on: &[String]) -> Dataset {
         Dataset {
             name: self.name.clone(),
             r#type: self.r#type.clone(),
             description: self.description.clone(),
             firecache: self.firecache.clone(),
 
-            depends_on: depends_on.clone(),
+            depends_on: depends_on.to_vec(),
         }
     }
 }
 
 pub mod firecache {
-  use serde::{Deserialize, Serialize};
+    use serde::{Deserialize, Serialize};
 
-  #[derive(Debug, Clone, Serialize, Deserialize)]
-  pub struct Firecache {
-      pub enabled: bool,
-      pub trigger: Trigger,
-      pub time_column: TimeColumn,
-  }
-  
-  #[derive(Debug, Clone, Serialize, Deserialize)]
-  #[serde(rename_all = "snake_case")]
-  pub enum Trigger {
-      BlockNumber,
-      BlockSlot,
-      Number,
-      Height,
-      BlockHeight,
-  }
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct Firecache {
+        pub enabled: bool,
+        pub trigger: Trigger,
+        pub time_column: TimeColumn,
+    }
 
-  #[derive(Debug, Clone, Serialize, Deserialize)]
-  #[serde(rename_all = "snake_case")]
-  pub enum TimeColumn {
-      BlockTimestamp,
-      Timestamp,
-  }
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum Trigger {
+        BlockNumber,
+        BlockSlot,
+        Number,
+        Height,
+        BlockHeight,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum TimeColumn {
+        BlockTimestamp,
+        Timestamp,
+    }
 }

@@ -1,5 +1,7 @@
+#![allow(clippy::missing_errors_doc)]
+
 use clap::Parser;
-use spicepod;
+use std::error::Error;
 
 #[derive(Parser, Debug)]
 pub struct Args {
@@ -7,13 +9,13 @@ pub struct Args {
     query: String,
 }
 
-pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+pub fn run() -> Result<(), Box<dyn Error>> {
     match spicepod::load(".") {
         Ok(spicepod_definition) => {
-            println!("spicepod_definition: {:?}", spicepod_definition);
-        },
+            println!("spicepod_definition: {spicepod_definition:?}");
+        }
         Err(err) => {
-            eprintln!("err: {:?}", err);
+            eprintln!("err: {err:?}");
         }
     }
 
