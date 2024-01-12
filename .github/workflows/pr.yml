@@ -1,0 +1,52 @@
+---
+name: pr
+
+on:
+  pull_request:
+    branches:
+      - trunk
+      - rust
+      - release-*
+
+  workflow_dispatch:
+
+jobs:
+  lint:
+    name: Run Go & Rust Linters
+    runs-on: ubuntu-latest
+    env:
+      GOVER: 1.21
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Go
+        uses: actions/setup-go@v3
+        with:
+          go-version: ${{ env.GOVER }}
+      
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: clippy,rustfmt
+
+      - run: make lint
+
+  build:
+    name: Build Go & Rust
+    runs-on: ubuntu-latest
+    env:
+      GOVER: 1.21
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Go
+        uses: actions/setup-go@v3
+        with:
+          go-version: ${{ env.GOVER }}
+
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - run: make build
