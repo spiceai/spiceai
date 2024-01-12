@@ -46,6 +46,9 @@ jobs:
         with:
           go-version: ${{ env.GOVER }}
 
+      - name: Install golangci-lint
+        run: curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(go env GOPATH)/bin
+
       - name: Set up Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
 
