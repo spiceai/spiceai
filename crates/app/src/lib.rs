@@ -1,9 +1,7 @@
 #![allow(clippy::missing_errors_doc)]
 
-use std::path::PathBuf;
-
 use snafu::prelude::*;
-use spicepod::component::dataset::Dataset;
+use spicepod::{component::dataset::Dataset, Spicepod};
 
 #[derive(Debug)]
 pub struct App {
@@ -14,18 +12,23 @@ pub struct App {
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to read directory contents from {}", path.display()))]
-    UnableToReadDirectoryContents {
-        source: std::io::Error,
-        path: PathBuf,
+    #[snafu(display("Unable to load spicepod {}", path))]
+    UnableToLoadSpicepod {
+        source: spicepod::Error,
+        path: String,
     },
-    NotImplemented,
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-// This will load an app's spicepod.yaml file and all of its components and dependencies.
-pub fn load(path: impl Into<PathBuf>) -> Result<App> {
-    let _path = path.into();
-    NotImplementedSnafu.fail()
+impl App {
+    // This will load an app's spicepod.yaml file and all of its components and dependencies.
+    pub fn new(path: &str) -> Result<Self> {
+        let spicepod_root = Spicepod::load(path).context(UnableToLoadSpicepodSnafu { path })?;
+
+        Ok(App {
+            name: spicepod_root.name,
+            datasets: spicepod_root.datasets,
+        })
+    }
 }

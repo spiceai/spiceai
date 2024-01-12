@@ -1,6 +1,6 @@
 #![allow(clippy::missing_errors_doc)]
 
-use std::io;
+use std::{io, path::Path};
 
 use snafu::prelude::*;
 
@@ -31,3 +31,21 @@ impl ReadablePath for StdFileSystem {
         Ok(Box::new(file))
     }
 }
+
+pub trait ReadableYaml: ReadablePath {
+    fn open_yaml(&self, base_path: &str, basename: &str) -> Option<Box<dyn std::io::Read>> {
+        let yaml_files = vec![format!("{basename}.yaml"), format!("{basename}.yml")];
+        let base_path = Path::new(base_path);
+
+        for yaml_file in yaml_files {
+            let yaml_path = base_path.join(&yaml_file);
+            if let Ok(yaml_file) = self.open(yaml_path.to_str()?) {
+                return Some(yaml_file);
+            }
+        }
+
+        None
+    }
+}
+
+impl<T: ReadablePath> ReadableYaml for T {}
