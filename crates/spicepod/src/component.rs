@@ -42,8 +42,8 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-pub fn resolve_component_references<ComponentType>(
-    fs: &impl reader::ReadableYaml,
+pub fn resolve_component_references<ComponentType, T>(
+    fs: &impl reader::ReadableYaml<T>,
     base_path: impl Into<PathBuf>,
     items: &[ComponentOrReference<ComponentType>],
     component_name: &str,
