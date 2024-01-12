@@ -10,5 +10,5 @@ LDFLAGS:="-X $(BASE_PACKAGE_NAME)/pkg/version.version=$(SPICE_VERSION)"
 
 .PHONY: all
 all:
-	mkdir target 2> /dev/null|| true
-	go build -v -ldflags=$(LDFLAGS) -o target/spice
+	mkdir -p ../../target/release 2> /dev/null|| true
+	go build -v -ldflags=$(LDFLAGS) -o ../../target/release/spice

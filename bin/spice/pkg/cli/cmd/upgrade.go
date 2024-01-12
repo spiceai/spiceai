@@ -84,6 +84,5 @@ spice upgrade
 }
 
 func init() {
-	upgradeCmd.Flags().StringVar(&contextFlag, "context", "docker", "Runs Spice.ai in the given context, either 'docker' or 'metal'")
 	RootCmd.AddCommand(upgradeCmd)
 }

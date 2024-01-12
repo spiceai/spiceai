@@ -1,15 +1,13 @@
 [package]
-name = "spiced"
+name = "spicepod"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
-description = "Spice OSS"
 
 [dependencies]
-backtrace = "0.3"
-clap = { workspace = true, features = ["derive"] }
-libc = { version = "0.2" }
-spicepod = { path = "../../crates/spicepod" }
+serde = { workspace = true, features = ["derive"] }
+serde_yaml.workspace = true
+snafu.workspace = true
