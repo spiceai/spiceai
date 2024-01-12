@@ -2,13 +2,19 @@
 #![allow(clippy::module_name_repetitions)]
 
 use snafu::prelude::*;
-use std::{collections::HashMap, fmt::Debug, fs::File, path::PathBuf};
+use std::{
+    collections::HashMap,
+    fmt::Debug,
+    io,
+    path::{Path, PathBuf},
+};
 
 use component::{dataset::Dataset, ComponentOrReference, WithDependsOn};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_yaml::{self, Value};
 
 pub mod component;
+pub mod reader;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -22,6 +28,8 @@ pub enum Error {
         source: std::io::Error,
         path: PathBuf,
     },
+    #[snafu(display("Unable to convert the path into a string"))]
+    UnableToConvertPath,
     #[snafu(display("Unable to parse spicepod.yaml"))]
     UnableToParseSpicepod { source: serde_yaml::Error },
     #[snafu(display("Unable to parse spicepod component {}", path.display()))]
@@ -43,7 +51,7 @@ pub enum SpicepodVersion {
     V1Beta1,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct SpicepodDefinition {
     pub name: String,
 
@@ -69,24 +77,26 @@ pub enum SpicepodKind {
     Spicepod,
 }
 
-pub fn load(path: impl Into<PathBuf>) -> Result<SpicepodDefinition> {
-    let path = path.into();
+pub fn load_from(fs: &impl reader::ReadablePath, path: &str) -> Result<SpicepodDefinition> {
+    let spicepod_rdr = open_yaml(fs, path, "spicepod")
+        .ok_or_else(|| Error::SpicepodNotFound { path: path.into() })?;
 
-    if let Some(spicepod_file) = file_open_yaml(&path, "spicepod") {
-        let mut spicepod_definition: SpicepodDefinition =
-            serde_yaml::from_reader(spicepod_file).context(UnableToParseSpicepodSnafu)?;
+    let mut spicepod_definition: SpicepodDefinition =
+        serde_yaml::from_reader(spicepod_rdr).context(UnableToParseSpicepodSnafu)?;
 
-        // resolve spicepod component references
-        spicepod_definition.datasets =
-            resolve_component_references(&path, &spicepod_definition.datasets, "dataset")?;
+    // resolve spicepod component references
+    spicepod_definition.datasets =
+        resolve_component_references(fs, path, &spicepod_definition.datasets, "dataset")?;
 
-        return Ok(spicepod_definition);
-    }
+    Ok(spicepod_definition)
+}
 
-    SpicepodNotFoundSnafu { path: &path }.fail()
+pub fn load(path: &str) -> Result<SpicepodDefinition> {
+    load_from(&reader::StdFileSystem, path)
 }
 
 fn resolve_component_references<ComponentType>(
+    fs: &impl reader::ReadablePath,
     base_path: impl Into<PathBuf>,
     items: &[ComponentOrReference<ComponentType>],
     component_name: &str,
@@ -102,39 +112,47 @@ where
                 Ok(ComponentOrReference::Component(component.clone()))
             }
             ComponentOrReference::Reference(reference) => {
-                let component_dir_path = base_path.join(&reference.from);
+                let component_base_path = base_path.join(&reference.from);
+                let component_base_path_str = component_base_path
+                    .to_str()
+                    .ok_or(Error::UnableToConvertPath)?;
 
-                if let Some(component_file) = file_open_yaml(&component_dir_path, component_name) {
-                    let component_definition: ComponentType = serde_yaml::from_reader(
-                        &component_file,
-                    )
-                    .context(UnableToParseSpicepodComponentSnafu {
-                        path: &component_dir_path,
+                let component_rdr = open_yaml(fs, component_base_path_str, component_name)
+                    .ok_or_else(|| Error::InvalidComponentReference {
+                        path: component_base_path.clone(),
                     })?;
 
-                    let component = ComponentOrReference::Component(
-                        component_definition.depends_on(&reference.depends_on),
-                    );
+                let component_definition: ComponentType = serde_yaml::from_reader(component_rdr)
+                    .context(UnableToParseSpicepodComponentSnafu {
+                        path: component_base_path,
+                    })?;
 
-                    return Ok(component);
-                }
+                let component = ComponentOrReference::Component(
+                    component_definition.depends_on(&reference.depends_on),
+                );
 
-                InvalidComponentReferenceSnafu {
-                    path: &component_dir_path,
-                }
-                .fail()
+                Ok(component)
             }
         })
         .collect()
 }
 
-fn file_open_yaml(base_path: impl Into<PathBuf>, basename: &str) -> Option<File> {
+fn open_yaml(
+    fs: &impl reader::ReadablePath,
+    base_path: &str,
+    basename: &str,
+) -> Option<Box<dyn io::Read>> {
     let yaml_files = vec![format!("{basename}.yaml"), format!("{basename}.yml")];
-    let base_path: PathBuf = base_path.into();
+    let base_path = Path::new(base_path);
 
     for yaml_file in yaml_files {
         let spicepod_path = base_path.join(yaml_file);
-        if let Ok(yaml_file) = File::open(&spicepod_path) {
+        let spicepod_path = spicepod_path.to_str();
+        if spicepod_path.is_none() {
+            continue;
+        }
+        let spicepod_path = spicepod_path?;
+        if let Ok(yaml_file) = fs.open(spicepod_path) {
             return Some(yaml_file);
         }
     }
