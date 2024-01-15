@@ -1,14 +1,13 @@
 [package]
-name = "spiced"
+name = "app"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
-description = "Spice OSS"
+description = "All loaded components from the root Spicepod and its dependencies"
 
 [dependencies]
-clap = { workspace = true, features = ["derive"] }
-spicepod = { path = "../../crates/spicepod" }
-app = { path = "../../crates/app" }
+snafu.workspace = true
+spicepod = { path = "../spicepod" }
