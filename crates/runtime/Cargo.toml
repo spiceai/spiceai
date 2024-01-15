@@ -1,19 +1,18 @@
 [package]
-name = "spiced"
+name = "runtime"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
-description = "Spice OSS"
+description = "The spiced runtime"
 
 [dependencies]
 snafu.workspace = true
-clap = { workspace = true, features = ["derive"] }
-spicepod = { path = "../../crates/spicepod" }
-app = { path = "../../crates/app" }
-runtime = { path = "../../crates/runtime" }
+spicepod = { path = "../spicepod" }
+app = { path = "../app" }
+axum = "0.7.4"
 tokio.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
+clap.workspace = true

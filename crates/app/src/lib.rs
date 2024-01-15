@@ -10,6 +10,8 @@ pub struct App {
     pub name: String,
 
     pub datasets: Vec<Dataset>,
+
+    pub spicepods: Vec<Spicepod>,
 }
 
 #[derive(Debug, Snafu)]
@@ -30,9 +32,12 @@ impl App {
         let spicepod_root =
             Spicepod::load(&path).context(UnableToLoadSpicepodSnafu { path: path.clone() })?;
         let mut datasets: Vec<Dataset> = vec![];
-        for dataset in spicepod_root.datasets {
-            datasets.push(dataset);
+        for dataset in &spicepod_root.datasets {
+            datasets.push(dataset.clone());
         }
+
+        let root_spicepod_name = spicepod_root.name.clone();
+        let mut spicepods: Vec<Spicepod> = vec![];
 
         for dependency in &spicepod_root.dependencies {
             let dependency_path = path.join("spicepods").join(dependency);
@@ -40,14 +45,18 @@ impl App {
                 Spicepod::load(&dependency_path).context(UnableToLoadSpicepodSnafu {
                     path: &dependency_path,
                 })?;
-            for dataset in dependent_spicepod.datasets {
-                datasets.push(dataset);
+            for dataset in &dependent_spicepod.datasets {
+                datasets.push(dataset.clone());
             }
+            spicepods.push(dependent_spicepod);
         }
 
+        spicepods.push(spicepod_root);
+
         Ok(App {
-            name: spicepod_root.name,
+            name: root_spicepod_name,
             datasets,
+            spicepods,
         })
     }
 }

@@ -1,6 +1,38 @@
+use tokio::runtime::Runtime;
+use tracing::level_filters::LevelFilter;
+
 fn main() {
-    if let Err(err) = spiced::run() {
-        eprintln!("Error: {err:?}");
+    if let Err(err) = init_tracing() {
+        eprintln!("Unable to initialize tracing: {err:?}");
         std::process::exit(1);
     }
+
+    let tokio_runtime = match Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            tracing::error!("Unable to start Tokio runtime: {}", err);
+            std::process::exit(1);
+        }
+    };
+
+    tracing::trace!("Starting Spice Runtime!");
+
+    if let Err(err) = tokio_runtime.block_on(spiced::run()) {
+        tracing::error!("Spice Runtime error: {}", err);
+    }
+}
+
+fn init_tracing() -> Result<(), tracing::subscriber::SetGlobalDefaultError> {
+    let filter = tracing_subscriber::EnvFilter::builder()
+        .with_default_directive(LevelFilter::TRACE.into())
+        .with_env_var("SPICED_LOG")
+        .from_env_lossy();
+
+    let subscriber = tracing_subscriber::FmtSubscriber::builder()
+        .with_env_filter(filter)
+        .with_ansi(true)
+        .finish();
+    tracing::subscriber::set_global_default(subscriber)?;
+
+    Ok(())
 }
