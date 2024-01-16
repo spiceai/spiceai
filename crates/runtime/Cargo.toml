@@ -16,3 +16,4 @@ axum = "0.7.4"
 tokio.workspace = true
 tracing.workspace = true
 clap.workspace = true
+metrics.workspace = true
