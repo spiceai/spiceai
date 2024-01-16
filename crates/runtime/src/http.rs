@@ -27,7 +27,7 @@ where
         .context(UnableToBindServerToPortSnafu)?;
     tracing::info!("Spice Runtime listening on {bind_address:?}");
 
-    metrics::counter!("spiced.runtime.http.server.start").increment(1);
+    metrics::counter!("spiced_runtime_http_server_start").increment(1);
 
     axum::serve(listener, routes)
         .with_graceful_shutdown(shutdown_signal)
