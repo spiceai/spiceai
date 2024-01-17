@@ -1,19 +1,19 @@
 ## Spice.ai Style Guide
 
-This document provides a set of guidelines for writing idiomatic Rust code for Spice.ai.
+This document provides guidelines for writing idiomatic Rust code in the context of Spice.ai.
 
-As with everything we do at Spice, we start with outlining the principles that inform our work.
+The principles guiding this work are as follows:
 
 ### Principles
 
-- **Simplicity**: We write simple code that is easy to understand and maintain. If it takes you more than a few seconds to understand a piece of code, it's too complex.
-- **Consistency**: We follow the conventions of the Rust community and the Rust language. We don't invent our own conventions.
-- **Unsurprising**: Our code, especially our public interfaces, should strive to be intuitive enough that if a Rust developer had to guess, they would guess correctly.
-- **Modular**: We are thoughtful about how we organize our code into crates and modules. We prefer smaller, focused crates and modules over large, monolithic ones.
+- **Simplicity**: Code should be simple, easy to understand, and maintainable. Code that takes more than a few seconds to comprehend is too complex.
+- **Consistency**: Adherence to Rust community conventions and language standards is required.
+- **Unsurprising**: Code, particularly public interfaces, aims to be intuitive, allowing a Rust developer to make accurate assumptions.
+- **Modular**: Thoughtful organization of code into crates and modules is practiced. Smaller, focused crates and modules are preferred over large, monolithic structures.
 
 ### Style
 
-**Error handling**: Error handling in Rust is a nuanced topic with many different approaches. We follow the [Snafu design philosophy](https://docs.rs/snafu/latest/snafu/guide/philosophy/index.html#snafus-design-philosophy) and use the [Snafu crate](https://docs.rs/snafu/latest/snafu/index.html) to define and use error types.
+**Error handling**: Error handling in Rust is a nuanced topic with many different approaches. The [Snafu design philosophy](https://docs.rs/snafu/latest/snafu/guide/philosophy/index.html#snafus-design-philosophy) is followed, utilizing the the [Snafu crate](https://docs.rs/snafu/latest/snafu/index.html) for defining and using error types.
 
 ### All errors use SNAFU functionality
 
@@ -40,12 +40,12 @@ pub enum Error {
 }
 ```
 
-### Use the `ensure!` macro to check a condition and return an error
+### Employing the `ensure!` macro for condition checking and error return
 
 *Good*:
 
-* Reads more like an `assert!`
-* Is more concise
+* Resembles `assert!`
+* More concise
 
 ```rust
 ensure!(!self.schema_sample.is_empty(), NeedsAtLeastOneLine);
@@ -59,12 +59,12 @@ if self.schema_sample.is_empty() {
 }
 ```
 
-### Errors should be defined in the module they are instantiated
+### Define errors in their originating module
 
 *Good*:
 
-* Groups related error conditions together most closely with the code that produces them
-* Reduces the need to `match` on unrelated errors that would never happen
+* Grouping related error conditions with their generating code
+* Minimizing unnecessary `match` statements on irrelevant errors
 
 ```rust
 #[derive(Debug, Snafu)]
@@ -88,7 +88,7 @@ ensure!(foo.is_implemented(), NotImplemented {
 })
 ```
 
-### The `Result` type alias should be defined in each module
+### Establishing the `Result` type alias in each module
 
 *Good*:
 
@@ -107,7 +107,7 @@ fn foo() -> Result<bool> { true }
 fn foo() -> Result<bool, Error> { true }
 ```
 
-### Use `context` to wrap underlying errors into module specific errors
+### Utilize `context` to encapsulate underlying errors into module-specific errors
 
 *Good*:
 
@@ -132,7 +132,7 @@ input_reader
     })?;
 ```
 
-### Each error cause in a module should have a distinct `Error` enum variant
+### Create distinct `Error` enum variants for each error cause in a module
 
 Specific error types are preferred over a generic error with a `message` or `kind` field.
 
@@ -140,8 +140,8 @@ Specific error types are preferred over a generic error with a `message` or `kin
 
 - Makes it easier to track down the offending code based on a specific failure
 - Reduces the size of the error enum
-- Makes it easier to remove vestigial errors
-- Is more concise
+- Simplifying removal of outdated errors
+- More concise
 
 ```rust
 #[derive(Debug, Snafu)]
@@ -178,6 +178,6 @@ close_writer.context(WritingError {
 })?;
 ```
 
-**Code linting**: We use [Clippy](https://doc.rust-lang.org/stable/clippy/index.html) to lint our code and make it more idiomatic. We treat all warnings as errors and enable several non-default lints. Using `#[allow(...)]` to disable lints is expected for lints that don't make sense given the context. Use your best judgement.
+**Code linting**: [Clippy](https://doc.rust-lang.org/stable/clippy/index.html) is used for code linting to enhance idiomatic Rust usage. All warnings are treated as errors, with several non-standard lints enabled. Disabling lints using `#[allow(...)]` is acceptable when the lint is not applicable in certain contexts.
 
-**API Guidelines**: We follow the [Rust API Guidelines](https://rust-lang.github.io/api-guidelines/about.html) for all public interfaces.
+**API Guidelines**: The [Rust API Guidelines](https://rust-lang.github.io/api-guidelines/about.html) are followed for all public interfaces.
