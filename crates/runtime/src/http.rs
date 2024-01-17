@@ -24,7 +24,6 @@ where
     let routes = Router::new()
         .route("/", get(|| async { "Hello, World!" }))
         .route("/api/v1/pods", get(|| async { pods_json }));
-    
 
     let listener = TcpListener::bind(&bind_address)
         .await
