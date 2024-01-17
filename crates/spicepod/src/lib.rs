@@ -1,9 +1,9 @@
 #![allow(clippy::missing_errors_doc)]
 #![allow(clippy::module_name_repetitions)]
 
+use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use std::{fmt::Debug, path::PathBuf};
-use serde::{Deserialize, Serialize};
 
 use component::dataset::Dataset;
 use spec::SpicepodDefinition;
