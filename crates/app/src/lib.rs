@@ -4,8 +4,9 @@ use std::path::PathBuf;
 
 use snafu::prelude::*;
 use spicepod::{component::dataset::Dataset, Spicepod};
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct App {
     pub name: String,
 

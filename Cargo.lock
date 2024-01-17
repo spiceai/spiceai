@@ -90,6 +90,7 @@ dependencies = [
 name = "app"
 version = "0.10.0-alpha.0"
 dependencies = [
+ "serde",
  "snafu",
  "spicepod",
  "tracing",
@@ -1006,6 +1007,7 @@ dependencies = [
  "axum",
  "clap",
  "metrics",
+ "serde_json",
  "snafu",
  "spicepod",
  "tokio",

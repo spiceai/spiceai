@@ -27,7 +27,7 @@ impl Runtime {
     }
 
     pub async fn start_server(&self) -> Result<()> {
-        http::start(shutdown_signal(), self.config.http_bind_address)
+        http::start(shutdown_signal(), self.config.http_bind_address, &self.app)
             .await
             .context(UnableToStartHttpServerSnafu)
     }

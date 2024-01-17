@@ -9,6 +9,7 @@ repository.workspace = true
 description = "All loaded components from the root Spicepod and its dependencies"
 
 [dependencies]
+serde.workspace = true
 snafu.workspace = true
 spicepod = { path = "../spicepod" }
 tracing.workspace = true

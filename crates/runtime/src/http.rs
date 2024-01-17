@@ -15,12 +15,16 @@ pub enum Error {
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
-pub(crate) async fn start<F, A>(shutdown_signal: F, bind_address: A) -> Result<()>
+pub(crate) async fn start<F, A>(shutdown_signal: F, bind_address: A, app: &app::App) -> Result<()>
 where
     F: Future<Output = ()> + Send + Sync + 'static,
     A: ToSocketAddrs + Debug,
 {
-    let routes = Router::new().route("/", get(|| async { "Hello, World!" }));
+    let pods_json = serde_json::to_string(&app.spicepods).unwrap();
+    let routes = Router::new()
+        .route("/", get(|| async { "Hello, World!" }))
+        .route("/api/v1/pods", get(|| async{ pods_json }));
+    
 
     let listener = TcpListener::bind(&bind_address)
         .await

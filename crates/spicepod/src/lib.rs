@@ -3,6 +3,7 @@
 
 use snafu::prelude::*;
 use std::{fmt::Debug, path::PathBuf};
+use serde::{Deserialize, Serialize};
 
 use component::dataset::Dataset;
 use spec::SpicepodDefinition;
@@ -26,7 +27,7 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Spicepod {
     pub name: String,
 
