@@ -23,7 +23,7 @@ where
     let pods_json = serde_json::to_string(&app.spicepods).unwrap();
     let routes = Router::new()
         .route("/", get(|| async { "Hello, World!" }))
-        .route("/api/v1/pods", get(|| async{ pods_json }));
+        .route("/api/v1/pods", get(|| async { pods_json }));
     
 
     let listener = TcpListener::bind(&bind_address)
