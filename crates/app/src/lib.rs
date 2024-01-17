@@ -2,9 +2,9 @@
 
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use spicepod::{component::dataset::Dataset, Spicepod};
-use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct App {
