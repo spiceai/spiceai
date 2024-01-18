@@ -17,12 +17,12 @@ use arrow_flight::{
 
 use crate::datafusion::DataFusion;
 
-pub struct FlightServiceImpl {
+pub struct ServiceImpl {
     data_fusion: DataFusion,
 }
 
 #[tonic::async_trait]
-impl FlightService for FlightServiceImpl {
+impl FlightService for ServiceImpl {
     type HandshakeStream = BoxStream<'static, Result<HandshakeResponse, Status>>;
     type ListFlightsStream = BoxStream<'static, Result<FlightInfo, Status>>;
     type DoGetStream = BoxStream<'static, Result<FlightData, Status>>;
@@ -158,7 +158,7 @@ pub async fn start(bind_address: std::net::SocketAddr) -> Result<(), Box<dyn std
     let df = DataFusion::new();
     df.register_parquet("test", "./test.parquet").await?;
 
-    let service = FlightServiceImpl { data_fusion: df };
+    let service = ServiceImpl { data_fusion: df };
     let svc = FlightServiceServer::new(service);
 
     tracing::info!("Spice Runtime Flight listening on {bind_address}");
