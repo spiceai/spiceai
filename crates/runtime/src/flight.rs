@@ -61,17 +61,13 @@ impl FlightService for FlightServiceImpl {
         let ticket = request.into_inner();
         match std::str::from_utf8(&ticket.ticket) {
             Ok(sql) => {
-                // create the DataFrame
                 let df = self.data_fusion.ctx.sql(sql).await.map_err(to_tonic_err)?;
-
-                // execute the query
                 let schema = df.schema().clone().into();
                 let results = df.collect().await.map_err(to_tonic_err)?;
                 if results.is_empty() {
                     return Err(Status::internal("There were no results from ticket"));
                 }
 
-                // add an initial FlightData message that sends schema
                 let options = datafusion::arrow::ipc::writer::IpcWriteOptions::default();
                 let schema_flight_data = SchemaAsIpc::new(&schema, &options);
 
@@ -96,20 +92,6 @@ impl FlightService for FlightServiceImpl {
         }
     }
 
-    async fn handshake(
-        &self,
-        _request: Request<Streaming<HandshakeRequest>>,
-    ) -> Result<Response<Self::HandshakeStream>, Status> {
-        Err(Status::unimplemented("Not yet implemented"))
-    }
-
-    async fn list_flights(
-        &self,
-        _request: Request<Criteria>,
-    ) -> Result<Response<Self::ListFlightsStream>, Status> {
-        Err(Status::unimplemented("Not yet implemented"))
-    }
-
     async fn get_flight_info(
         &self,
         _request: Request<FlightDescriptor>,
@@ -125,6 +107,21 @@ impl FlightService for FlightServiceImpl {
             }],
             ..Default::default()
         }))
+    }
+
+    async fn handshake(
+        &self,
+        _request: Request<Streaming<HandshakeRequest>>,
+    ) -> Result<Response<Self::HandshakeStream>, Status> {
+        // TODO: Implement auth
+        Err(Status::unimplemented("Not yet implemented"))
+    }
+
+    async fn list_flights(
+        &self,
+        _request: Request<Criteria>,
+    ) -> Result<Response<Self::ListFlightsStream>, Status> {
+        Err(Status::unimplemented("Not yet implemented"))
     }
 
     async fn do_put(
