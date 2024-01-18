@@ -5,9 +5,9 @@ use snafu::prelude::*;
 use tokio::signal;
 
 pub mod config;
-mod http;
-mod flight;
 mod datafusion;
+mod flight;
+mod http;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -15,7 +15,7 @@ pub enum Error {
     UnableToStartHttpServer { source: http::Error },
 
     #[snafu(display("Unable to start Flight server"))]
-    UnableToStartFlightServer { source: Box<dyn snafu::Error>},
+    UnableToStartFlightServer { source: Box<dyn snafu::Error> },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

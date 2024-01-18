@@ -1,7 +1,7 @@
 use arrow::ipc::writer::{DictionaryTracker, IpcDataGenerator};
 use std::sync::Arc;
 
-use arrow_flight::{SchemaAsIpc, FlightEndpoint};
+use arrow_flight::{FlightEndpoint, SchemaAsIpc};
 use datafusion::arrow::error::ArrowError;
 use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::listing::{ListingOptions, ListingTableUrl};
@@ -10,9 +10,9 @@ use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 
 use arrow_flight::{
-    flight_service_server::FlightService, flight_service_server::FlightServiceServer,
-    Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightInfo,
-    HandshakeRequest, HandshakeResponse, PutResult, SchemaResult, Ticket,
+    flight_service_server::FlightService, flight_service_server::FlightServiceServer, Action,
+    ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightInfo, HandshakeRequest,
+    HandshakeResponse, PutResult, SchemaResult, Ticket,
 };
 
 use crate::datafusion::DataFusion;
@@ -38,8 +38,7 @@ impl FlightService for FlightServiceImpl {
         let request = request.into_inner();
 
         let listing_options = ListingOptions::new(Arc::new(ParquetFormat::default()));
-        let table_path =
-            ListingTableUrl::parse(&request.path[0]).map_err(to_tonic_err)?;
+        let table_path = ListingTableUrl::parse(&request.path[0]).map_err(to_tonic_err)?;
 
         let schema = listing_options
             .infer_schema(&self.data_fusion.ctx.state(), &table_path)
@@ -100,9 +99,7 @@ impl FlightService for FlightServiceImpl {
         Ok(Response::new(FlightInfo {
             flight_descriptor: Some(fd.clone()),
             endpoint: vec![FlightEndpoint {
-                ticket: Some(Ticket {
-                    ticket: fd.cmd,
-                }),
+                ticket: Some(Ticket { ticket: fd.cmd }),
                 ..Default::default()
             }],
             ..Default::default()
@@ -161,13 +158,16 @@ pub async fn start(bind_address: std::net::SocketAddr) -> Result<(), Box<dyn std
     let df = DataFusion::new();
     df.register_parquet("test", "./test.parquet").await?;
 
-    let service = FlightServiceImpl {data_fusion: df};
+    let service = FlightServiceImpl { data_fusion: df };
     let svc = FlightServiceServer::new(service);
 
     tracing::info!("Spice Runtime Flight listening on {bind_address}");
     metrics::counter!("spiced_runtime_flight_server_start").increment(1);
 
-    Server::builder().add_service(svc).serve(bind_address).await?;
+    Server::builder()
+        .add_service(svc)
+        .serve(bind_address)
+        .await?;
 
     Ok(())
 }
