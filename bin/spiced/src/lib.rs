@@ -13,8 +13,8 @@ pub enum Error {
     #[snafu(display("Unable to construct spice app"))]
     UnableToConstructSpiceApp { source: app::Error },
 
-    #[snafu(display("Unable to start Spice Runtime HTTP server"))]
-    UnableToStartHttpServer { source: runtime::Error },
+    #[snafu(display("Unable to start Spice Runtime servers"))]
+    UnableToStartServers { source: runtime::Error },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -36,9 +36,9 @@ pub async fn run(args: Args) -> Result<()> {
 
     let rt: Runtime = Runtime::new(args.runtime, app);
 
-    rt.start_server()
+    rt.start_servers()
         .await
-        .context(UnableToStartHttpServerSnafu)?;
+        .context(UnableToStartServersSnafu)?;
 
     Ok(())
 }
