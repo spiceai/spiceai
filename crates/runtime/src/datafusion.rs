@@ -6,8 +6,11 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to register parquet file"))]
-    RegisterParquet { source: DataFusionError },
+    #[snafu(display("Unable to register parquet file {}", file))]
+    RegisterParquet {
+        source: DataFusionError,
+        file: String,
+    },
 }
 
 pub struct DataFusion {
@@ -26,6 +29,6 @@ impl DataFusion {
         self.ctx
             .register_parquet(table_name, path, ParquetReadOptions::default())
             .await
-            .context(RegisterParquetSnafu)
+            .context(RegisterParquetSnafu { file: path })
     }
 }
