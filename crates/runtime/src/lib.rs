@@ -7,6 +7,7 @@ use tokio::signal;
 pub mod config;
 mod http;
 mod flight;
+mod datafusion;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -38,7 +39,6 @@ impl Runtime {
             http_res = http_server_future => http_res.context(UnableToStartHttpServerSnafu),
             flight_res = flight_server_future => flight_res.context(UnableToStartFlightServerSnafu),
         }
-
     }
 }
 

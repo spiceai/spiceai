@@ -9,16 +9,17 @@ use futures::stream::BoxStream;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 
-use datafusion::prelude::*;
-
 use arrow_flight::{
     flight_service_server::FlightService, flight_service_server::FlightServiceServer,
     Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightInfo,
     HandshakeRequest, HandshakeResponse, PutResult, SchemaResult, Ticket,
 };
 
-#[derive(Clone)]
-pub struct FlightServiceImpl {}
+use crate::datafusion::DataFusion;
+
+pub struct FlightServiceImpl {
+    data_fusion: DataFusion,
+}
 
 #[tonic::async_trait]
 impl FlightService for FlightServiceImpl {
@@ -40,9 +41,8 @@ impl FlightService for FlightServiceImpl {
         let table_path =
             ListingTableUrl::parse(&request.path[0]).map_err(to_tonic_err)?;
 
-        let ctx = SessionContext::new();
         let schema = listing_options
-            .infer_schema(&ctx.state(), &table_path)
+            .infer_schema(&self.data_fusion.ctx.state(), &table_path)
             .await
             .unwrap();
 
@@ -61,22 +61,8 @@ impl FlightService for FlightServiceImpl {
         let ticket = request.into_inner();
         match std::str::from_utf8(&ticket.ticket) {
             Ok(sql) => {
-                println!("do_get: {sql}");
-
-                // create local execution context
-                let ctx = SessionContext::new();
-
-                // register parquet file with the execution context
-                ctx.register_parquet(
-                    "test",
-                    "./test.parquet",
-                    ParquetReadOptions::default(),
-                )
-                .await
-                .map_err(to_tonic_err)?;
-
                 // create the DataFrame
-                let df = ctx.sql(sql).await.map_err(to_tonic_err)?;
+                let df = self.data_fusion.ctx.sql(sql).await.map_err(to_tonic_err)?;
 
                 // execute the query
                 let schema = df.schema().clone().into();
@@ -175,7 +161,10 @@ fn to_tonic_err(e: datafusion::error::DataFusionError) -> Status {
 }
 
 pub async fn start(bind_address: std::net::SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
-    let service = FlightServiceImpl {};
+    let df = DataFusion::new();
+    df.register_parquet("test", "./test.parquet").await?;
+
+    let service = FlightServiceImpl {data_fusion: df};
     let svc = FlightServiceServer::new(service);
 
     tracing::info!("Spice Runtime Flight listening on {bind_address}");
