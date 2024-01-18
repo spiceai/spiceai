@@ -1,6 +1,7 @@
 use arrow::ipc::writer::{DictionaryTracker, IpcDataGenerator};
 use std::sync::Arc;
 
+use crate::datafusion::DataFusion;
 use arrow_flight::{FlightEndpoint, SchemaAsIpc};
 use datafusion::arrow::error::ArrowError;
 use datafusion::datasource::file_format::parquet::ParquetFormat;
@@ -14,8 +15,6 @@ use arrow_flight::{
     ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightInfo, HandshakeRequest,
     HandshakeResponse, PutResult, SchemaResult, Ticket,
 };
-
-use crate::datafusion::DataFusion;
 
 pub struct Service {
     data_fusion: DataFusion,
@@ -43,7 +42,7 @@ impl FlightService for Service {
         let schema = listing_options
             .infer_schema(&self.data_fusion.ctx.state(), &table_path)
             .await
-            .unwrap();
+            .map_err(to_tonic_err)?;
 
         let options = arrow::ipc::writer::IpcWriteOptions::default();
         let schema_result = SchemaAsIpc::new(&schema, &options)
@@ -150,6 +149,7 @@ impl FlightService for Service {
     }
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn to_tonic_err(e: datafusion::error::DataFusionError) -> Status {
     Status::internal(format!("{e:?}"))
 }
