@@ -1,4 +1,7 @@
+use arrow::array::{Int32Array, StringArray};
+use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::writer::{DictionaryTracker, IpcDataGenerator};
+use arrow::record_batch::RecordBatch;
 use std::sync::Arc;
 
 use crate::datafusion::DataFusion;
@@ -156,7 +159,22 @@ fn to_tonic_err(e: datafusion::error::DataFusionError) -> Status {
 
 pub async fn start(bind_address: std::net::SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
     let df = DataFusion::new();
-    df.register_parquet("test", "./test.parquet").await?;
+    // Register test parquet file.
+    df.register_parquet("test-parquet", "./test.parquet")
+        .await?;
+    // Register test in-memory data.
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("a", DataType::Utf8, false),
+        Field::new("b", DataType::Int32, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec!["a", "b", "c", "d"])),
+            Arc::new(Int32Array::from(vec![1, 10, 10, 100])),
+        ],
+    )?;
+    df.ctx.register_batch("test-memory", batch)?;
 
     let service = Service { data_fusion: df };
     let svc = FlightServiceServer::new(service);
