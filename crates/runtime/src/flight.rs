@@ -9,6 +9,7 @@ use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::listing::{ListingOptions, ListingTableUrl};
 use futures::stream::BoxStream;
 use futures::Stream;
+use snafu::prelude::*;
 use std::pin::Pin;
 use std::sync::Arc;
 use tonic::metadata::MetadataValue;
@@ -174,11 +175,30 @@ fn to_tonic_err(e: datafusion::error::DataFusionError) -> Status {
     Status::internal(format!("{e:?}"))
 }
 
-pub async fn start(bind_address: std::net::SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display("A test error"))]
+    Arrow { source: ArrowError },
+
+    #[snafu(display("Unable to register parquet file"))]
+    RegisterParquet { source: crate::datafusion::Error },
+
+    DataFusion {
+        source: datafusion::error::DataFusionError,
+    },
+
+    #[snafu(display("Unable to start Flight server"))]
+    UnableToStartFlightServer { source: tonic::transport::Error },
+}
+
+type Result<T, E = Error> = std::result::Result<T, E>;
+
+pub async fn start(bind_address: std::net::SocketAddr) -> Result<()> {
     let df = DataFusion::new();
     // Register test parquet file.
     df.register_parquet("test-parquet", "./test.parquet")
-        .await?;
+        .await
+        .context(RegisterParquetSnafu)?;
     // Register test in-memory data.
     let schema = Arc::new(Schema::new(vec![
         Field::new("a", DataType::Utf8, false),
@@ -190,8 +210,11 @@ pub async fn start(bind_address: std::net::SocketAddr) -> Result<(), Box<dyn std
             Arc::new(StringArray::from(vec!["a", "b", "c", "d"])),
             Arc::new(Int32Array::from(vec![1, 10, 10, 100])),
         ],
-    )?;
-    df.ctx.register_batch("test-memory", batch)?;
+    )
+    .context(ArrowSnafu)?;
+    df.ctx
+        .register_batch("test-memory", batch)
+        .context(DataFusionSnafu)?;
 
     let service = Service { data_fusion: df };
     let svc = FlightServiceServer::new(service);
@@ -202,7 +225,8 @@ pub async fn start(bind_address: std::net::SocketAddr) -> Result<(), Box<dyn std
     Server::builder()
         .add_service(svc)
         .serve(bind_address)
-        .await?;
+        .await
+        .context(UnableToStartFlightServerSnafu)?;
 
     Ok(())
 }
