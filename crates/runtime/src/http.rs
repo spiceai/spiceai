@@ -1,4 +1,4 @@
-use std::{fmt::Debug, future::Future};
+use std::fmt::Debug;
 
 use axum::{routing::get, Router};
 use snafu::prelude::*;
@@ -15,9 +15,8 @@ pub enum Error {
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
-pub(crate) async fn start<F, A>(shutdown_signal: F, bind_address: A) -> Result<()>
+pub(crate) async fn start<A>(bind_address: A) -> Result<()>
 where
-    F: Future<Output = ()> + Send + Sync + 'static,
     A: ToSocketAddrs + Debug,
 {
     let routes = Router::new().route("/", get(|| async { "Hello, World!" }));
@@ -30,7 +29,6 @@ where
     metrics::counter!("spiced_runtime_http_server_start").increment(1);
 
     axum::serve(listener, routes)
-        .with_graceful_shutdown(shutdown_signal)
         .await
         .context(UnableToStartHttpServerSnafu)?;
     Ok(())
