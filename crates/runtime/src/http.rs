@@ -25,7 +25,7 @@ where
     let listener = TcpListener::bind(&bind_address)
         .await
         .context(UnableToBindServerToPortSnafu)?;
-    tracing::info!("Spice Runtime listening on {bind_address:?}");
+    tracing::info!("Spice Runtime HTTP listening on {bind_address:?}");
 
     metrics::counter!("spiced_runtime_http_server_start").increment(1);
 

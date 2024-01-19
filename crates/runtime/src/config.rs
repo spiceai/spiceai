@@ -10,4 +10,12 @@ pub struct Config {
         action
     )]
     pub http_bind_address: SocketAddr,
+    /// Configure runtime Flight address.
+    #[arg(
+        long = "flight",
+        value_name = "FLIGHT_BIND_ADDRESS",
+        default_value = "127.0.0.1:50051",
+        action
+    )]
+    pub flight_bind_address: SocketAddr,
 }
