@@ -16,7 +16,7 @@ fn main() {
     let tokio_runtime = match Runtime::new() {
         Ok(runtime) => runtime,
         Err(err) => {
-            tracing::error!("Unable to start Tokio runtime: {}", err);
+            tracing::error!("Unable to start Tokio runtime: {err:?}");
             std::process::exit(1);
         }
     };
@@ -24,7 +24,7 @@ fn main() {
     tracing::trace!("Starting Spice Runtime!");
 
     if let Err(err) = tokio_runtime.block_on(start_runtime(args)) {
-        tracing::error!("Spice Runtime error: {}", err);
+        tracing::error!("Spice Runtime error: {err:?}");
     }
 }
 
