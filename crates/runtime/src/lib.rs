@@ -1,11 +1,18 @@
 #![allow(clippy::missing_errors_doc)]
 
+use std::sync::Arc;
+
 use config::Config;
 use snafu::prelude::*;
 use tokio::signal;
 
+use crate::datafusion::DataFusion;
+
 pub mod config;
+mod databackend;
 mod datafusion;
+mod datamanager;
+mod dataprovider;
 mod flight;
 mod http;
 
@@ -23,17 +30,22 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub struct Runtime {
     pub app: app::App,
     pub config: config::Config,
+    pub df: Arc<DataFusion>,
 }
 
 impl Runtime {
     #[must_use]
     pub fn new(config: Config, app: app::App) -> Self {
-        Runtime { app, config }
+        Runtime {
+            app,
+            config,
+            df: Arc::new(DataFusion::new()),
+        }
     }
 
     pub async fn start_servers(&self) -> Result<()> {
         let http_server_future = http::start(self.config.http_bind_address);
-        let flight_server_future = flight::start(self.config.flight_bind_address);
+        let flight_server_future = flight::start(self.config.flight_bind_address, self.df.clone());
 
         tokio::select! {
             http_res = http_server_future => http_res.context(UnableToStartHttpServerSnafu),

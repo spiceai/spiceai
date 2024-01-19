@@ -32,3 +32,9 @@ impl DataFusion {
             .context(RegisterParquetSnafu { file: path })
     }
 }
+
+impl Default for DataFusion {
+    fn default() -> Self {
+        Self::new()
+    }
+}

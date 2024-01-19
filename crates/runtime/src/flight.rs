@@ -24,7 +24,7 @@ use arrow_flight::{
 };
 
 pub struct Service {
-    data_fusion: DataFusion,
+    data_fusion: Arc<DataFusion>,
 }
 
 #[tonic::async_trait]
@@ -99,9 +99,9 @@ impl FlightService for Service {
 
     async fn get_flight_info(
         &self,
-        _request: Request<FlightDescriptor>,
+        request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        let fd = _request.into_inner();
+        let fd = request.into_inner();
         Ok(Response::new(FlightInfo {
             flight_descriptor: Some(fd.clone()),
             endpoint: vec![FlightEndpoint {
@@ -193,8 +193,7 @@ pub enum Error {
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
-pub async fn start(bind_address: std::net::SocketAddr) -> Result<()> {
-    let df = DataFusion::new();
+pub async fn start(bind_address: std::net::SocketAddr, df: Arc<DataFusion>) -> Result<()> {
     // Register test parquet file.
     df.register_parquet("test-parquet", "./test.parquet")
         .await
