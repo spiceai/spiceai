@@ -1,17 +1,20 @@
+use crate::datafusion::DataFusion;
 use arrow::array::{Int32Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::writer::{DictionaryTracker, IpcDataGenerator};
 use arrow::record_batch::RecordBatch;
-use std::sync::Arc;
-
-use crate::datafusion::DataFusion;
 use arrow_flight::{FlightEndpoint, SchemaAsIpc};
 use datafusion::arrow::error::ArrowError;
 use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::listing::{ListingOptions, ListingTableUrl};
 use futures::stream::BoxStream;
+use futures::Stream;
+use std::pin::Pin;
+use std::sync::Arc;
+use tonic::metadata::MetadataValue;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
+use uuid::Uuid;
 
 use arrow_flight::{
     flight_service_server::FlightService, flight_service_server::FlightServiceServer, Action,
@@ -112,8 +115,22 @@ impl FlightService for Service {
         &self,
         _request: Request<Streaming<HandshakeRequest>>,
     ) -> Result<Response<Self::HandshakeStream>, Status> {
-        // TODO: Implement auth
-        Err(Status::unimplemented("Not yet implemented"))
+        // THIS IS PLACEHOLDER NO-OP AUTH THAT DOES NOT CHECK THE PROVIDED TOKEN AND SIMPLY RETURNS A UUID.
+        // TODO: Implement proper auth.
+        let token = Uuid::new_v4().to_string();
+        let result = HandshakeResponse {
+            protocol_version: 0,
+            payload: token.as_bytes().to_vec().into(),
+        };
+        let result = Ok(result);
+        let output = futures::stream::iter(vec![result]);
+        let str = format!("Bearer {token}");
+        let mut resp: Response<Pin<Box<dyn Stream<Item = Result<_, _>> + Send>>> =
+            Response::new(Box::pin(output));
+        let md = MetadataValue::try_from(str)
+            .map_err(|_| Status::internal("generated authorization could not be parsed"))?;
+        resp.metadata_mut().insert("authorization", md);
+        Ok(resp)
     }
 
     async fn list_flights(
