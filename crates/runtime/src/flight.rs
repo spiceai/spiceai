@@ -128,7 +128,7 @@ impl FlightService for Service {
         let mut resp: Response<Pin<Box<dyn Stream<Item = Result<_, _>> + Send>>> =
             Response::new(Box::pin(output));
         let md = MetadataValue::try_from(str)
-            .map_err(|_| Status::invalid_argument("authorization not parsable"))?;
+            .map_err(|_| Status::internal("generated authorization could not be parsed"))?;
         resp.metadata_mut().insert("authorization", md);
         Ok(resp)
     }
