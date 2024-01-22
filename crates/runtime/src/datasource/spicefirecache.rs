@@ -1,3 +1,9 @@
+use futures_core::Stream;
+
 pub struct SpiceFirecache {}
 
-impl DataSource for SpiceFirecache {}
+impl super::DataSource for SpiceFirecache {
+    fn get_data(&self) -> impl Stream<Item = super::DataUpdate> {
+        todo!()
+    }
+}

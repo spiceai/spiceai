@@ -1,20 +1,29 @@
 #![allow(clippy::missing_errors_doc)]
 
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use app::App;
 use clap::Parser;
 use runtime::config::Config as RuntimeConfig;
-use runtime::Runtime;
+use runtime::{databackend, datasource, Runtime};
 use snafu::prelude::*;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Unable to construct spice app"))]
-    UnableToConstructSpiceApp { source: app::Error },
+    UnableToConstructSpiceApp {
+        source: app::Error,
+    },
 
     #[snafu(display("Unable to start Spice Runtime servers"))]
-    UnableToStartServers { source: runtime::Error },
+    UnableToStartServers {
+        source: runtime::Error,
+    },
+
+    UnableToAttachDataSource {
+        source: runtime::datafusion::Error,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -35,6 +44,24 @@ pub async fn run(args: Args) -> Result<()> {
     let app = App::new(".").context(UnableToConstructSpiceAppSnafu)?;
 
     let rt: Runtime = Runtime::new(args.runtime, app);
+
+    // for ds in rt.app.datasets.iter() {
+    //     let data_source = datasource::DataSource::new(ds.clone());
+    //     rt.df.attach(
+    //         &ds.name,
+    //         data_source,
+    //         databackend::DataBackendType::default(),
+    //     )
+    // }
+    rt.df
+        .attach(
+            "test-stream",
+            datasource::debug::DebugSource {
+                sleep_duration: Duration::from_secs(1),
+            },
+            databackend::DataBackendType::default(),
+        )
+        .context(UnableToAttachDataSourceSnafu)?;
 
     rt.start_servers()
         .await

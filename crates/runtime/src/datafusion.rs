@@ -4,6 +4,7 @@ use crate::databackend::{self, memtable::MemTableBackend, DataBackend};
 use crate::datasource;
 use datafusion::error::DataFusionError;
 use datafusion::execution::{context::SessionContext, options::ParquetReadOptions};
+use futures::StreamExt;
 use snafu::prelude::*;
 use tokio::task;
 
@@ -45,11 +46,12 @@ impl DataFusion {
             .context(RegisterParquetSnafu { file: path })
     }
 
+    #[allow(clippy::needless_pass_by_value)]
     pub fn attach(
         &mut self,
         table_name: &str,
         data_source: impl datasource::DataSource + Send + 'static,
-        backend: &databackend::DataBackendType,
+        backend: databackend::DataBackendType,
     ) -> Result<()> {
         let table_exists = self.ctx.table_exist(table_name).context(DataFusionSnafu)?;
         if table_exists {
@@ -66,10 +68,11 @@ impl DataFusion {
         };
 
         let task_handle = task::spawn(async move {
+            let mut stream = Box::pin(data_source.get_data());
             loop {
-                let future_result = data_source.get_data().await;
+                let future_result = stream.next().await;
                 match future_result {
-                    Ok(data_update) => {
+                    Some(data_update) => {
                         match data_backend
                             .add_data(data_update.log_sequence_number, data_update.data)
                             .await
@@ -78,7 +81,7 @@ impl DataFusion {
                             Err(e) => tracing::error!("Error adding data: {e:?}"),
                         }
                     }
-                    Err(e) => tracing::error!("Error getting data: {e:?}"),
+                    None => continue,
                 };
             }
         });

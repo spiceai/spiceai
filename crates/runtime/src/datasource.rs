@@ -1,6 +1,9 @@
 use arrow::record_batch::RecordBatch;
+use futures_core::Stream;
 use snafu::prelude::*;
-use std::future::Future;
+
+pub mod debug;
+// mod spicefirecache;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -15,5 +18,5 @@ pub struct DataUpdate {
 }
 
 pub trait DataSource {
-    fn get_data(&self) -> impl Future<Output = Result<DataUpdate>> + Send;
+    fn get_data(&self) -> impl Stream<Item = DataUpdate> + Send;
 }

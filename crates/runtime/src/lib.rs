@@ -1,6 +1,6 @@
 #![allow(clippy::missing_errors_doc)]
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, RwLock};
 
 use config::Config;
 use snafu::prelude::*;
@@ -9,9 +9,9 @@ use tokio::signal;
 use crate::datafusion::DataFusion;
 
 pub mod config;
-mod databackend;
-mod datafusion;
-mod datasource;
+pub mod databackend;
+pub mod datafusion;
+pub mod datasource;
 mod flight;
 mod http;
 
@@ -29,7 +29,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub struct Runtime {
     pub app: app::App,
     pub config: config::Config,
-    pub df: Arc<DataFusion>,
+    pub df: Arc<RwLock<DataFusion>>,
 }
 
 impl Runtime {
@@ -38,7 +38,7 @@ impl Runtime {
         Runtime {
             app,
             config,
-            df: Arc::new(DataFusion::new()),
+            df: Arc::new(RwLock::new(DataFusion::new())),
         }
     }
 
