@@ -14,7 +14,6 @@ mod datafusion;
 mod datasource;
 mod flight;
 mod http;
-mod sync;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
