@@ -3,6 +3,7 @@ use futures_core::Stream;
 use snafu::prelude::*;
 
 pub mod debug;
+pub mod spicefirecache;
 // mod spicefirecache;
 
 #[derive(Debug, Snafu)]
@@ -18,5 +19,5 @@ pub struct DataUpdate {
 }
 
 pub trait DataSource {
-    fn get_data(&self) -> impl Stream<Item = DataUpdate> + Send;
+    fn get_data(&mut self) -> impl Stream<Item = DataUpdate> + Send;
 }

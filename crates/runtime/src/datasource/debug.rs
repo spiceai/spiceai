@@ -8,7 +8,7 @@ pub struct DebugSource {
 }
 
 impl super::DataSource for DebugSource {
-    fn get_data(&self) -> impl Stream<Item = super::DataUpdate> {
+    fn get_data(&mut self) -> impl Stream<Item = super::DataUpdate> {
         stream! {
           loop {
               tokio::time::sleep(self.sleep_duration).await;

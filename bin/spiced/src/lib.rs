@@ -8,6 +8,7 @@ use clap::Parser;
 use runtime::config::Config as RuntimeConfig;
 use runtime::{databackend, datasource, Runtime};
 use snafu::prelude::*;
+use spice_rs::Client;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -57,6 +58,19 @@ pub async fn run(args: Args) -> Result<()> {
         .attach(
             "test-stream",
             datasource::debug::DebugSource {
+                sleep_duration: Duration::from_secs(1),
+            },
+            databackend::DataBackendType::default(),
+        )
+        .context(UnableToAttachDataSourceSnafu)?;
+    rt.df
+        .attach(
+            "firecache-stream",
+            datasource::spicefirecache::SpiceFirecache {
+                // TODO: Get API key from the config
+                spice_client: Client::new(args.runtime.api_key)
+                    .await
+                    .unwrap(),
                 sleep_duration: Duration::from_secs(1),
             },
             databackend::DataBackendType::default(),
