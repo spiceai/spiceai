@@ -1,15 +1,30 @@
-use arrow::{datatypes::SchemaRef, record_batch::RecordBatch};
-use datafusion::datasource::MemTable;
+use arrow::record_batch::RecordBatch;
+use datafusion::error::DataFusionError;
+use snafu::prelude::*;
+use std::{future::Future, pin::Pin};
 
-pub struct InMemoryBackend {
-    pub mem_table: MemTable,
+pub mod duckdb;
+pub mod memtable;
+
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display("Unable to add data"))]
+    UnableToAddData { source: DataFusionError },
 }
 
-impl InMemoryBackend {
-    #[must_use]
-    pub fn new(schema: SchemaRef, records: Vec<RecordBatch>) -> Self {
-        InMemoryBackend {
-            mem_table: MemTable::try_new(schema, vec![records]),
-        }
-    }
+type Result<T, E = Error> = std::result::Result<T, E>;
+
+#[derive(Debug, Default)]
+pub enum DataBackendType {
+    #[default]
+    Memtable,
+    DuckDB,
+}
+
+pub trait DataBackend: Send {
+    fn add_data(
+        &mut self,
+        log_sequence_number: u64,
+        data: Vec<RecordBatch>,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
 }

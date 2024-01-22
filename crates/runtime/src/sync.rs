@@ -3,19 +3,16 @@ use snafu::prelude::*;
 #[derive(Debug, Snafu)]
 #[allow(clippy::enum_variant_names)]
 pub enum Error {
-    #[snafu(display("Cursor length must be exactly 24 bytes"))]
-    InvalidLength {
-        context: &'static str,
-    },
+    #[snafu(display("Invalid length"))]
+    InvalidLength { context: &'static str },
 
     #[snafu(display("Invalid magic bytes"))]
     InvalidMagicBytes,
 
     #[snafu(display("Invalid prefix"))]
-    InvalidPrefix {
-        source: std::string::FromUtf8Error,
-    },
+    InvalidPrefix { source: std::string::FromUtf8Error },
 
+    #[snafu(display("Invalid LSN"))]
     InvalidLogSequenceNumber,
 }
 

@@ -11,10 +11,10 @@ use crate::datafusion::DataFusion;
 pub mod config;
 mod databackend;
 mod datafusion;
-mod datamanager;
-mod dataprovider;
+mod datasource;
 mod flight;
 mod http;
+mod sync;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
