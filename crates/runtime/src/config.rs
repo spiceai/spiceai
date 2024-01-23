@@ -10,6 +10,7 @@ pub struct Config {
         action
     )]
     pub http_bind_address: SocketAddr,
+
     /// Configure runtime Flight address.
     #[arg(
         long = "flight",
@@ -18,7 +19,4 @@ pub struct Config {
         action
     )]
     pub flight_bind_address: SocketAddr,
-    // Configure runtime API key.
-    // #[arg(long = "api_key", value_name = "API_KEY", action)]
-    // pub api_key: String,
 }
