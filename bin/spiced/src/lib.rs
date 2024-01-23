@@ -8,7 +8,7 @@ use clap::Parser;
 use runtime::config::Config as RuntimeConfig;
 use runtime::{databackend, datasource, Runtime};
 use snafu::prelude::*;
-use spice_rs::Client;
+// use spice_rs::Client;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -44,7 +44,7 @@ pub struct Args {
 pub async fn run(args: Args) -> Result<()> {
     let app = App::new(".").context(UnableToConstructSpiceAppSnafu)?;
 
-    let rt: Runtime = Runtime::new(args.runtime, app);
+    let mut df = runtime::datafusion::DataFusion::new();
 
     // for ds in rt.app.datasets.iter() {
     //     let data_source = datasource::DataSource::new(ds.clone());
@@ -54,28 +54,29 @@ pub async fn run(args: Args) -> Result<()> {
     //         databackend::DataBackendType::default(),
     //     )
     // }
-    rt.df
-        .attach(
-            "test-stream",
-            datasource::debug::DebugSource {
-                sleep_duration: Duration::from_secs(1),
-            },
-            databackend::DataBackendType::default(),
-        )
-        .context(UnableToAttachDataSourceSnafu)?;
-    rt.df
-        .attach(
-            "firecache-stream",
-            datasource::spicefirecache::SpiceFirecache {
-                // TODO: Get API key from the config
-                spice_client: Client::new(args.runtime.api_key)
-                    .await
-                    .unwrap(),
-                sleep_duration: Duration::from_secs(1),
-            },
-            databackend::DataBackendType::default(),
-        )
-        .context(UnableToAttachDataSourceSnafu)?;
+    df.attach(
+        "test-stream",
+        datasource::debug::DebugSource {
+            sleep_duration: Duration::from_secs(1),
+        },
+        databackend::DataBackendType::default(),
+    )
+    .context(UnableToAttachDataSourceSnafu)?;
+    // rt.df
+    //     .attach(
+    //         "firecache-stream",
+    //         datasource::spicefirecache::SpiceFirecache {
+    //             // TODO: Get API key from the config
+    //             spice_client: Client::new(args.runtime.api_key)
+    //                 .await
+    //                 .unwrap(),
+    //             sleep_duration: Duration::from_secs(1),
+    //         },
+    //         databackend::DataBackendType::default(),
+    //     )
+    //     .context(UnableToAttachDataSourceSnafu)?;
+
+    let rt: Runtime = Runtime::new(args.runtime, app, df);
 
     rt.start_servers()
         .await

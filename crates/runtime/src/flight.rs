@@ -1,8 +1,5 @@
 use crate::datafusion::DataFusion;
-use arrow::array::{Int32Array, StringArray};
-use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::writer::{DictionaryTracker, IpcDataGenerator};
-use arrow::record_batch::RecordBatch;
 use arrow_flight::{FlightEndpoint, SchemaAsIpc};
 use datafusion::arrow::error::ArrowError;
 use datafusion::datasource::file_format::parquet::ParquetFormat;
@@ -11,7 +8,7 @@ use futures::stream::BoxStream;
 use futures::Stream;
 use snafu::prelude::*;
 use std::pin::Pin;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use tonic::metadata::MetadataValue;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
@@ -24,7 +21,7 @@ use arrow_flight::{
 };
 
 pub struct Service {
-    data_fusion: Arc<RwLock<DataFusion>>,
+    data_fusion: Arc<DataFusion>,
 }
 
 #[tonic::async_trait]
@@ -46,9 +43,8 @@ impl FlightService for Service {
         let listing_options = ListingOptions::new(Arc::new(ParquetFormat::default()));
         let table_path = ListingTableUrl::parse(&request.path[0]).map_err(to_tonic_err)?;
 
-        let df = self.data_fusion.read().map_err(to_tonic_err)?;
         let schema = listing_options
-            .infer_schema(&df.ctx.state(), &table_path)
+            .infer_schema(&self.data_fusion.ctx.state(), &table_path)
             .await
             .map_err(to_tonic_err)?;
 
@@ -67,8 +63,7 @@ impl FlightService for Service {
         let ticket = request.into_inner();
         match std::str::from_utf8(&ticket.ticket) {
             Ok(sql) => {
-                let df_read = self.data_fusion.read().map_err(to_tonic_err)?;
-                let df = df_read.ctx.sql(sql).await.map_err(to_tonic_err)?;
+                let df = self.data_fusion.ctx.sql(sql).await.map_err(to_tonic_err)?;
                 let schema = df.schema().clone().into();
                 let results = df.collect().await.map_err(to_tonic_err)?;
                 if results.is_empty() {
@@ -194,39 +189,11 @@ pub enum Error {
 
     #[snafu(display("Unable to start Flight server"))]
     UnableToStartFlightServer { source: tonic::transport::Error },
-
-    UnableToAcquireLock {
-        source: std::sync::PoisonError<std::sync::RwLockReadGuard<'static, DataFusion>>,
-    },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
-pub async fn start(bind_address: std::net::SocketAddr, df: Arc<RwLock<DataFusion>>) -> Result<()> {
-    let df_guard = df.read().context(UnableToAcquireLockSnafu)?;
-    // Register test parquet file.
-    df_guard
-        .register_parquet("test-parquet", "./test.parquet")
-        .await
-        .context(RegisterParquetSnafu)?;
-    // Register test in-memory data.
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("a", DataType::Utf8, false),
-        Field::new("b", DataType::Int32, false),
-    ]));
-    let batch = RecordBatch::try_new(
-        schema,
-        vec![
-            Arc::new(StringArray::from(vec!["a", "b", "c", "d"])),
-            Arc::new(Int32Array::from(vec![1, 10, 10, 100])),
-        ],
-    )
-    .context(ArrowSnafu)?;
-    df_guard
-        .ctx
-        .register_batch("test-memory", batch)
-        .context(DataFusionSnafu)?;
-
+pub async fn start(bind_address: std::net::SocketAddr, df: Arc<DataFusion>) -> Result<()> {
     let service = Service {
         data_fusion: df.clone(),
     };

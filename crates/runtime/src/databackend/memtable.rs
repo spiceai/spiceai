@@ -4,7 +4,12 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
-use datafusion::{datasource::MemTable, execution::context::SessionContext, sql::TableReference};
+use datafusion::{
+    datasource::MemTable,
+    execution::context::SessionContext,
+    physical_plan::collect,
+    sql::{parser::DFParser, sqlparser::dialect::AnsiDialect, TableReference},
+};
 
 pub struct MemTableBackend {
     ctx: Arc<SessionContext>,
@@ -36,6 +41,7 @@ impl super::DataBackend for MemTableBackend {
             }
 
             if !self.table_created {
+                tracing::trace!("Creating table for log sequence number {log_sequence_number}");
                 let schema = data[0].schema();
                 let table =
                     MemTable::try_new(schema, vec![data]).context(super::UnableToAddDataSnafu)?;
@@ -44,6 +50,7 @@ impl super::DataBackend for MemTableBackend {
                     .register_table(TableReference::from(self.name.clone()), Arc::new(table))
                     .context(super::UnableToAddDataSnafu)?;
 
+                tracing::trace!("Created table for log sequence number {log_sequence_number}");
                 self.table_created = true;
                 return Ok(());
             }
@@ -75,8 +82,8 @@ impl MemTableInsert {
         let schema = data[0].schema();
         let table = MemTable::try_new(schema, vec![data]).context(super::UnableToAddDataSnafu)?;
 
+        // There is probably a better way to do this than registering a temp table
         let temp_table_name = MemTableInsert::temp_table_name(&self.name, self.log_sequence_number);
-        // Register the arrow records as a temporary table
         self.ctx
             .register_table(
                 TableReference::from(temp_table_name.clone()),
@@ -84,15 +91,35 @@ impl MemTableInsert {
             )
             .context(super::UnableToAddDataSnafu)?;
 
-        // Insert the data into the main table
-        self.ctx
-            .sql(&format!(
-                "INSERT INTO {name} SELECT * FROM {temp_table_name}",
-                name = self.name,
-                temp_table_name = temp_table_name
-            ))
-            .await
-            .context(super::UnableToAddDataSnafu)?;
+        let sql_stmt = format!(
+            r#"INSERT INTO "{name}" SELECT * FROM "{temp_table_name}""#,
+            name = self.name,
+        );
+        tracing::trace!("Inserting data with SQL: {sql_stmt}");
+        let statements = DFParser::parse_sql_with_dialect(&sql_stmt, &AnsiDialect {})
+            .context(super::UnableToParseSqlSnafu)?;
+        for statement in statements {
+            let plan = self
+                .ctx
+                .state()
+                .statement_to_plan(statement)
+                .await
+                .context(super::UnableToAddDataSnafu)?;
+            let df = self
+                .ctx
+                .execute_logical_plan(plan)
+                .await
+                .context(super::UnableToAddDataSnafu)?;
+            let physical_plan = df
+                .create_physical_plan()
+                .await
+                .context(super::UnableToAddDataSnafu)?;
+            let task_ctx = self.ctx.task_ctx();
+            collect(physical_plan, task_ctx.clone())
+                .await
+                .context(super::UnableToAddDataSnafu)?;
+        }
+
         Ok(())
     }
 }

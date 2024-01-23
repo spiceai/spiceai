@@ -1,6 +1,6 @@
 #![allow(clippy::missing_errors_doc)]
 
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::Arc;
 
 use config::Config;
 use snafu::prelude::*;
@@ -29,16 +29,16 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub struct Runtime {
     pub app: app::App,
     pub config: config::Config,
-    pub df: Arc<RwLock<DataFusion>>,
+    pub df: Arc<DataFusion>,
 }
 
 impl Runtime {
     #[must_use]
-    pub fn new(config: Config, app: app::App) -> Self {
+    pub fn new(config: Config, app: app::App, df: DataFusion) -> Self {
         Runtime {
             app,
             config,
-            df: Arc::new(RwLock::new(DataFusion::new())),
+            df: Arc::new(df),
         }
     }
 
