@@ -8,6 +8,7 @@ use tokio::signal;
 
 use crate::datafusion::DataFusion;
 
+pub mod auth;
 pub mod config;
 pub mod databackend;
 pub mod datafusion;
