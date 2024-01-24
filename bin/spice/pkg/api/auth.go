@@ -1,7 +1,7 @@
 package api
 
 type AuthConfig struct {
-	Auth *Auth `json:"auth,omitempty" csv:"auth" tom:"auth"`
+	Auth *Auth `json:"auth,omitempty" csv:"auth" toml:"auth"`
 }
 
 type Auth struct {
