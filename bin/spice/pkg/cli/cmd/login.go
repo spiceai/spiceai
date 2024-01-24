@@ -73,6 +73,7 @@ spice login
 		_, err = f.Write(authConfigBytes)
 		if err != nil {
 			cmd.Println(err.Error())
+			os.Exit(1)
 		}
 
 		cmd.Println(aurora.BrightGreen("Successfully logged in to Spice.ai"))
