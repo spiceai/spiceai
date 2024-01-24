@@ -10,6 +10,7 @@ pub struct Config {
         action
     )]
     pub http_bind_address: SocketAddr,
+
     /// Configure runtime Flight address.
     #[arg(
         long = "flight",

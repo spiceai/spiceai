@@ -1,14 +1,12 @@
 use crate::datafusion::DataFusion;
-use arrow::array::{Int32Array, StringArray};
-use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::writer::{DictionaryTracker, IpcDataGenerator};
-use arrow::record_batch::RecordBatch;
 use arrow_flight::{FlightEndpoint, SchemaAsIpc};
 use datafusion::arrow::error::ArrowError;
 use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::listing::{ListingOptions, ListingTableUrl};
 use futures::stream::BoxStream;
 use futures::Stream;
+use snafu::prelude::*;
 use std::pin::Pin;
 use std::sync::Arc;
 use tonic::metadata::MetadataValue;
@@ -23,7 +21,7 @@ use arrow_flight::{
 };
 
 pub struct Service {
-    data_fusion: DataFusion,
+    data_fusion: Arc<DataFusion>,
 }
 
 #[tonic::async_trait]
@@ -98,9 +96,9 @@ impl FlightService for Service {
 
     async fn get_flight_info(
         &self,
-        _request: Request<FlightDescriptor>,
+        request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        let fd = _request.into_inner();
+        let fd = request.into_inner();
         Ok(Response::new(FlightInfo {
             flight_descriptor: Some(fd.clone()),
             endpoint: vec![FlightEndpoint {
@@ -170,30 +168,35 @@ impl FlightService for Service {
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn to_tonic_err(e: datafusion::error::DataFusionError) -> Status {
+fn to_tonic_err<E>(e: E) -> Status
+where
+    E: std::fmt::Debug,
+{
     Status::internal(format!("{e:?}"))
 }
 
-pub async fn start(bind_address: std::net::SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
-    let df = DataFusion::new();
-    // Register test parquet file.
-    df.register_parquet("test-parquet", "./test.parquet")
-        .await?;
-    // Register test in-memory data.
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("a", DataType::Utf8, false),
-        Field::new("b", DataType::Int32, false),
-    ]));
-    let batch = RecordBatch::try_new(
-        schema,
-        vec![
-            Arc::new(StringArray::from(vec!["a", "b", "c", "d"])),
-            Arc::new(Int32Array::from(vec![1, 10, 10, 100])),
-        ],
-    )?;
-    df.ctx.register_batch("test-memory", batch)?;
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display("A test error"))]
+    Arrow { source: ArrowError },
 
-    let service = Service { data_fusion: df };
+    #[snafu(display("Unable to register parquet file"))]
+    RegisterParquet { source: crate::datafusion::Error },
+
+    DataFusion {
+        source: datafusion::error::DataFusionError,
+    },
+
+    #[snafu(display("Unable to start Flight server"))]
+    UnableToStartFlightServer { source: tonic::transport::Error },
+}
+
+type Result<T, E = Error> = std::result::Result<T, E>;
+
+pub async fn start(bind_address: std::net::SocketAddr, df: Arc<DataFusion>) -> Result<()> {
+    let service = Service {
+        data_fusion: df.clone(),
+    };
     let svc = FlightServiceServer::new(service);
 
     tracing::info!("Spice Runtime Flight listening on {bind_address}");
@@ -202,7 +205,8 @@ pub async fn start(bind_address: std::net::SocketAddr) -> Result<(), Box<dyn std
     Server::builder()
         .add_service(svc)
         .serve(bind_address)
-        .await?;
+        .await
+        .context(UnableToStartFlightServerSnafu)?;
 
     Ok(())
 }
