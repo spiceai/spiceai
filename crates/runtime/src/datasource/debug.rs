@@ -14,17 +14,21 @@ pub struct DebugSource {
 }
 
 impl DataSource for DebugSource {
-    fn new<T: crate::auth::Auth>(auth: T) -> Self {
+    fn new<T: crate::auth::Auth>(_auth: T) -> Self {
         Self {
             sleep_duration: Duration::from_secs(1),
         }
     }
 
-    fn supports_data_streaming(&self, dataset: &str) -> bool {
+    fn supports_data_streaming(&self, _dataset: &str) -> bool {
         true
     }
 
-    fn get_all_data(&self, dataset: &str) -> Vec<RecordBatch> {
+    fn get_all_data_refresh_interval(&self, _dataset: &str) -> Option<Duration> {
+        Some(self.sleep_duration)
+    }
+
+    fn get_all_data(&self, _dataset: &str) -> Vec<RecordBatch> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("a", DataType::Utf8, false),
             Field::new("b", DataType::Int32, false),
@@ -42,7 +46,7 @@ impl DataSource for DebugSource {
         }
     }
 
-    fn stream_data_updates<'a>(&self, dataset: &str) -> BoxStream<'a, DataUpdate> {
+    fn stream_data_updates<'a>(&self, _dataset: &str) -> BoxStream<'a, DataUpdate> {
         let sleep_duration = self.sleep_duration;
         Box::pin(stream! {
           loop {
