@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::databackend::{self, memtable::MemTableBackend, DataBackend};
-use crate::datasource;
+use crate::datasource::DataSource;
 use datafusion::error::DataFusionError;
 use datafusion::execution::{context::SessionContext, options::ParquetReadOptions};
 use futures::StreamExt;
@@ -49,38 +49,34 @@ impl DataFusion {
     #[allow(clippy::needless_pass_by_value)]
     pub fn attach(
         &mut self,
-        table_name: &str,
-        data_source: impl datasource::DataSource + Send + 'static,
+        dataset: &str,
+        data_source: &'static dyn DataSource,
         backend: databackend::DataBackendType,
     ) -> Result<()> {
-        let table_exists = self.ctx.table_exist(table_name).context(DataFusionSnafu)?;
+        let table_exists = self.ctx.table_exist(dataset).context(DataFusionSnafu)?;
         if table_exists {
             return TableAlreadyExistsSnafu.fail();
         }
 
         let mut data_backend: Box<dyn DataBackend> = match backend {
             databackend::DataBackendType::Memtable => {
-                Box::new(MemTableBackend::new(self.ctx.clone(), table_name))
+                Box::new(MemTableBackend::new(self.ctx.clone(), dataset))
             }
             databackend::DataBackendType::DuckDB => {
                 todo!("DuckDB backend not implemented yet");
             }
         };
 
+        let dataset = dataset.to_string();
         let task_handle = task::spawn(async move {
-            let mut stream = Box::pin(data_source.get_data());
+            let mut stream = data_source.get_data(dataset.as_str());
             loop {
                 let future_result = stream.next().await;
                 match future_result {
-                    Some(data_update) => {
-                        match data_backend
-                            .add_data(data_update.log_sequence_number, data_update.data)
-                            .await
-                        {
-                            Ok(()) => (),
-                            Err(e) => tracing::error!("Error adding data: {e:?}"),
-                        }
-                    }
+                    Some(data_update) => match data_backend.add_data(data_update).await {
+                        Ok(()) => (),
+                        Err(e) => tracing::error!("Error adding data: {e:?}"),
+                    },
                     None => continue,
                 };
             }
