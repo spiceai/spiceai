@@ -12,6 +12,9 @@ cmd/spiced/.spice
 cmd/spiced/data
 spicepods
 
+*.parquet
+spicepod.yaml
+
 target/
 
 # Debug binaries

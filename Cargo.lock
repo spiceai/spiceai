@@ -1218,6 +1218,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "flightpublisher"
+version = "0.10.0-alpha.0"
+dependencies = [
+ "arrow",
+ "arrow-flight",
+ "async-stream",
+ "clap",
+ "futures",
+ "parquet",
+ "tokio",
+ "tonic",
+]
+
+[[package]]
+name = "flightsubscriber"
+version = "0.10.0-alpha.0"
+dependencies = [
+ "arrow",
+ "arrow-flight",
+ "async-stream",
+ "clap",
+ "futures",
+ "parquet",
+ "tokio",
+ "tonic",
+]
+
+[[package]]
 name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2583,6 +2611,7 @@ dependencies = [
  "app",
  "arrow",
  "arrow-flight",
+ "arrow-ipc",
  "async-stream",
  "axum 0.7.4",
  "clap",

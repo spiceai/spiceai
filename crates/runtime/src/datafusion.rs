@@ -1,6 +1,7 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::databackend::{self, memtable::MemTableBackend, DataBackend};
+use crate::databackend::{DataBackend, DataBackendType};
 use crate::datasource::DataSource;
 use datafusion::error::DataFusionError;
 use datafusion::execution::{context::SessionContext, options::ParquetReadOptions};
@@ -28,6 +29,7 @@ pub enum Error {
 pub struct DataFusion {
     pub ctx: Arc<SessionContext>,
     tasks: Vec<task::JoinHandle<()>>,
+    backends: HashMap<String, Arc<Box<dyn DataBackend>>>,
 }
 
 impl DataFusion {
@@ -36,6 +38,7 @@ impl DataFusion {
         DataFusion {
             ctx: Arc::new(SessionContext::new()),
             tasks: Vec::new(),
+            backends: HashMap::new(),
         }
     }
 
@@ -47,25 +50,41 @@ impl DataFusion {
     }
 
     #[allow(clippy::needless_pass_by_value)]
+    pub fn attach_backend(&mut self, dataset: &str, backend: DataBackendType) -> Result<()> {
+        let table_exists = self.ctx.table_exist(dataset).context(DataFusionSnafu)?;
+        if table_exists {
+            return TableAlreadyExistsSnafu.fail();
+        }
+
+        let data_backend: Box<dyn DataBackend> =
+            <dyn DataBackend>::get(&self.ctx, dataset, &backend);
+
+        self.backends
+            .insert(dataset.to_string(), Arc::new(data_backend));
+
+        Ok(())
+    }
+
+    #[must_use]
+    #[allow(clippy::borrowed_box)]
+    pub fn get_backend(&self, dataset: &str) -> Option<&Arc<Box<dyn DataBackend>>> {
+        self.backends.get(dataset)
+    }
+
+    #[allow(clippy::needless_pass_by_value)]
     pub fn attach(
         &mut self,
         dataset: &str,
         data_source: &'static dyn DataSource,
-        backend: databackend::DataBackendType,
+        backend: DataBackendType,
     ) -> Result<()> {
         let table_exists = self.ctx.table_exist(dataset).context(DataFusionSnafu)?;
         if table_exists {
             return TableAlreadyExistsSnafu.fail();
         }
 
-        let mut data_backend: Box<dyn DataBackend> = match backend {
-            databackend::DataBackendType::Memtable => {
-                Box::new(MemTableBackend::new(self.ctx.clone(), dataset))
-            }
-            databackend::DataBackendType::DuckDB => {
-                todo!("DuckDB backend not implemented yet");
-            }
-        };
+        let data_backend: Box<dyn DataBackend> =
+            <dyn DataBackend>::get(&self.ctx, dataset, &backend);
 
         let dataset = dataset.to_string();
         let task_handle = task::spawn(async move {
