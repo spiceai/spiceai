@@ -1,14 +1,19 @@
 use crate::datafusion::DataFusion;
+use crate::dataupdate::{DataUpdate, UpdateType};
 use arrow::ipc::writer::{DictionaryTracker, IpcDataGenerator};
 use arrow_flight::{FlightEndpoint, SchemaAsIpc};
+use arrow_ipc::convert::try_schema_from_flatbuffer_bytes;
+use arrow_ipc::writer;
 use datafusion::arrow::error::ArrowError;
 use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::listing::{ListingOptions, ListingTableUrl};
-use futures::stream::BoxStream;
+use futures::stream::{self, BoxStream, StreamExt};
 use futures::Stream;
 use snafu::prelude::*;
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
+use tokio::sync::broadcast;
 use tonic::metadata::MetadataValue;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
@@ -21,7 +26,8 @@ use arrow_flight::{
 };
 
 pub struct Service {
-    data_fusion: Arc<DataFusion>,
+    datafusion: Arc<DataFusion>,
+    channel: Arc<broadcast::Sender<DataUpdate>>,
 }
 
 #[tonic::async_trait]
@@ -44,7 +50,7 @@ impl FlightService for Service {
         let table_path = ListingTableUrl::parse(&request.path[0]).map_err(to_tonic_err)?;
 
         let schema = listing_options
-            .infer_schema(&self.data_fusion.ctx.state(), &table_path)
+            .infer_schema(&self.datafusion.ctx.state(), &table_path)
             .await
             .map_err(to_tonic_err)?;
 
@@ -63,7 +69,7 @@ impl FlightService for Service {
         let ticket = request.into_inner();
         match std::str::from_utf8(&ticket.ticket) {
             Ok(sql) => {
-                let df = self.data_fusion.ctx.sql(sql).await.map_err(to_tonic_err)?;
+                let df = self.datafusion.ctx.sql(sql).await.map_err(to_tonic_err)?;
                 let schema = df.schema().clone().into();
                 let results = df.collect().await.map_err(to_tonic_err)?;
                 if results.is_empty() {
@@ -140,9 +146,102 @@ impl FlightService for Service {
 
     async fn do_put(
         &self,
-        _request: Request<Streaming<FlightData>>,
+        request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoPutStream>, Status> {
-        Err(Status::unimplemented("Not yet implemented"))
+        let mut streaming_flight = request.into_inner();
+
+        let Ok(Some(message)) = streaming_flight.message().await else {
+            return Err(Status::invalid_argument("No flight data provided"));
+        };
+        let Some(fd) = &message.flight_descriptor else {
+            return Err(Status::invalid_argument("No flight descriptor provided"));
+        };
+        if fd.path.is_empty() {
+            return Err(Status::invalid_argument("No path provided"));
+        };
+
+        let path = fd.path.join(".");
+
+        let Some(backend) = self.datafusion.get_backend(&path) else {
+            return Err(Status::invalid_argument(format!(
+                "No backend registered for path: {path:?}",
+            )));
+        };
+        let backend = Arc::clone(backend);
+
+        let schema = try_schema_from_flatbuffer_bytes(&message.data_header).map_err(|e| {
+            Status::internal(format!("Unable to get schema from data header: {e:?}"))
+        })?;
+        let schema = Arc::new(schema);
+        let dictionaries_by_id = Arc::new(HashMap::new());
+
+        // Sometimes the first message only contains the schema and no data
+        let first_batch = arrow_flight::utils::flight_data_to_arrow_batch(
+            &message,
+            schema.clone(),
+            &dictionaries_by_id,
+        )
+        .ok();
+
+        let mut batches = vec![];
+        if let Some(first_batch) = first_batch {
+            batches.push(first_batch);
+        }
+
+        let channel = Arc::clone(&self.channel);
+
+        let response_stream = stream::unfold(streaming_flight, move |mut flight| {
+            let schema = Arc::clone(&schema);
+            let dictionaries_by_id = Arc::clone(&dictionaries_by_id);
+            let backend = Arc::clone(&backend);
+            let channel = Arc::clone(&channel);
+            async move {
+                match flight.message().await {
+                    Ok(Some(message)) => {
+                        let new_batch = match arrow_flight::utils::flight_data_to_arrow_batch(
+                            &message,
+                            schema.clone(),
+                            &dictionaries_by_id,
+                        ) {
+                            Ok(batches) => batches,
+                            Err(e) => {
+                                tracing::trace!("Unable to convert flight data to batches: {e:?}");
+                                return None;
+                            }
+                        };
+                        tracing::trace!("Received batch with {} rows", new_batch.num_rows());
+
+                        let data_update = DataUpdate {
+                            data: vec![new_batch],
+                            log_sequence_number: None,
+                            update_type: UpdateType::Append,
+                        };
+
+                        let _ = channel.send(data_update.clone());
+
+                        if let Err(err) = backend
+                            .add_data(data_update)
+                            .await
+                            .map_err(|e| Status::internal(format!("Unable to add data: {e:?}")))
+                        {
+                            return Some((Err(err), flight));
+                        };
+
+                        Some((Ok(PutResult::default()), flight))
+                    }
+                    Ok(None) => {
+                        // End of the stream
+                        None
+                    }
+                    Err(e) => Some((
+                        Err(Status::internal(format!("Error reading message: {e:?}"))),
+                        flight,
+                    )),
+                }
+            }
+        });
+
+        Ok(Response::new(response_stream.boxed()))
     }
 
     async fn do_action(
@@ -163,7 +262,51 @@ impl FlightService for Service {
         &self,
         _request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoExchangeStream>, Status> {
-        Err(Status::unimplemented("Not yet implemented"))
+        let rx = self.channel.subscribe();
+        let response_stream = stream::unfold(rx, move |mut rx| {
+            let encoder = IpcDataGenerator::default();
+            let mut tracker = DictionaryTracker::new(false);
+            let write_options = writer::IpcWriteOptions::default();
+            async move {
+                match rx.recv().await {
+                    Ok(data_update) => {
+                        let mut schema_sent: bool = false;
+
+                        let mut flights = vec![];
+
+                        for batch in &data_update.data {
+                            if !schema_sent {
+                                let schema = batch.schema();
+                                flights.push(FlightData::from(SchemaAsIpc::new(
+                                    &schema,
+                                    &write_options,
+                                )));
+                                schema_sent = true;
+                            }
+                            let Ok((flight_dictionaries, flight_batch)) =
+                                encoder.encoded_batch(batch, &mut tracker, &write_options)
+                            else {
+                                panic!("Unable to encode batch")
+                            };
+
+                            flights.extend(flight_dictionaries.into_iter().map(Into::into));
+                            flights.push(flight_batch.into());
+                        }
+
+                        let output = futures::stream::iter(flights.into_iter().map(Ok));
+
+                        Some((output, rx))
+                    }
+                    Err(_e) => {
+                        let output = futures::stream::iter(vec![].into_iter().map(Ok));
+                        Some((output, rx))
+                    }
+                }
+            }
+        })
+        .flat_map(|x| x);
+
+        Ok(Response::new(response_stream.boxed()))
     }
 }
 
@@ -194,8 +337,10 @@ pub enum Error {
 type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub async fn start(bind_address: std::net::SocketAddr, df: Arc<DataFusion>) -> Result<()> {
+    let (channel, _rx) = broadcast::channel(100);
     let service = Service {
-        data_fusion: df.clone(),
+        datafusion: df.clone(),
+        channel: Arc::new(channel),
     };
     let svc = FlightServiceServer::new(service);
 

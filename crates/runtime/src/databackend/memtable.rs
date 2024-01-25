@@ -17,7 +17,6 @@ use super::{DataBackend, Result, UnableToAddDataSnafu, UnableToParseSqlSnafu};
 pub struct MemTableBackend {
     ctx: Arc<SessionContext>,
     name: String,
-    table_created: bool,
 }
 
 impl MemTableBackend {
@@ -26,14 +25,13 @@ impl MemTableBackend {
         MemTableBackend {
             ctx,
             name: name.to_string(),
-            table_created: false,
         }
     }
 }
 
 impl DataBackend for MemTableBackend {
     fn add_data(
-        &mut self,
+        &self,
         data_update: DataUpdate,
     ) -> Pin<Box<(dyn Future<Output = Result<()>> + Send + '_)>> {
         Box::pin(async move {
@@ -45,7 +43,12 @@ impl DataBackend for MemTableBackend {
                 return Ok(());
             }
 
-            if !self.table_created {
+            let table_exists = self
+                .ctx
+                .table_exist(TableReference::from(self.name.clone()))
+                .context(UnableToAddDataSnafu)?;
+
+            if !table_exists {
                 tracing::trace!(
                     "Creating table for log sequence number {log_sequence_number:?}",
                     log_sequence_number = data_update.log_sequence_number
@@ -62,7 +65,6 @@ impl DataBackend for MemTableBackend {
                     "Created table for log sequence number {log_sequence_number:?}",
                     log_sequence_number = data_update.log_sequence_number
                 );
-                self.table_created = true;
                 return Ok(());
             }
 
