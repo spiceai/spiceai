@@ -24,6 +24,9 @@ pub enum Error {
 
     #[snafu(display("Unable to start Flight server"))]
     UnableToStartFlightServer { source: flight::Error },
+
+    #[snafu(display("No home directory found"))]
+    NoHomeDirectory {},
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

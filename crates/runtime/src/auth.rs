@@ -1,3 +1,8 @@
+use dirs;
+use std::fs::File;
+use std::io::{Read, Result};
+use std::path::PathBuf;
+
 pub trait Auth {
     fn get_token(&self) -> String;
 }
@@ -10,7 +15,10 @@ pub mod spiceai;
 
 impl AuthProviders {
     #[must_use]
-    pub fn get_auth(name: &str) -> Box<dyn Auth> {
+    pub fn get_auth() -> crate::Result<Box<dyn Auth>> {
+        let home_dir = dirs::home_dir().ok_or(crate::NoHomeDirectorySnafu)?;
+
+
         match name {
             "spiceai" => {
                 todo!("SpiceAI auth not implemented yet")
