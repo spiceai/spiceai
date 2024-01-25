@@ -1,4 +1,4 @@
-use arrow::record_batch::RecordBatch;
+use crate::dataupdate::DataUpdate;
 use datafusion::{error::DataFusionError, sql::sqlparser};
 use snafu::prelude::*;
 use std::{future::Future, pin::Pin};
@@ -28,7 +28,6 @@ pub enum DataBackendType {
 pub trait DataBackend: Send {
     fn add_data(
         &mut self,
-        log_sequence_number: u64,
-        data: Vec<RecordBatch>,
+        data_update: DataUpdate,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
 }

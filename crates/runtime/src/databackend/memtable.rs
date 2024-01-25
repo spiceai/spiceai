@@ -3,6 +3,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use crate::dataupdate::DataUpdate;
 use arrow::record_batch::RecordBatch;
 use datafusion::{
     datasource::MemTable,
@@ -10,6 +11,8 @@ use datafusion::{
     physical_plan::collect,
     sql::{parser::DFParser, sqlparser::dialect::AnsiDialect, TableReference},
 };
+
+use super::{DataBackend, Result, UnableToAddDataSnafu, UnableToParseSqlSnafu};
 
 pub struct MemTableBackend {
     ctx: Arc<SessionContext>,
@@ -28,32 +31,42 @@ impl MemTableBackend {
     }
 }
 
-impl super::DataBackend for MemTableBackend {
+impl DataBackend for MemTableBackend {
     fn add_data(
         &mut self,
-        log_sequence_number: u64,
-        data: Vec<RecordBatch>,
-    ) -> Pin<Box<(dyn Future<Output = super::Result<()>> + Send + '_)>> {
+        data_update: DataUpdate,
+    ) -> Pin<Box<(dyn Future<Output = Result<()>> + Send + '_)>> {
         Box::pin(async move {
-            if data.is_empty() {
-                tracing::trace!("No data to add for log sequence number {log_sequence_number}");
+            if data_update.data.is_empty() {
+                tracing::trace!(
+                    "No data to add for log sequence number {log_sequence_number:?}",
+                    log_sequence_number = data_update.log_sequence_number
+                );
                 return Ok(());
             }
 
             if !self.table_created {
-                tracing::trace!("Creating table for log sequence number {log_sequence_number}");
-                let schema = data[0].schema();
-                let table =
-                    MemTable::try_new(schema, vec![data]).context(super::UnableToAddDataSnafu)?;
+                tracing::trace!(
+                    "Creating table for log sequence number {log_sequence_number:?}",
+                    log_sequence_number = data_update.log_sequence_number
+                );
+                let schema = data_update.data[0].schema();
+                let table = MemTable::try_new(schema, vec![data_update.data])
+                    .context(UnableToAddDataSnafu)?;
 
                 self.ctx
                     .register_table(TableReference::from(self.name.clone()), Arc::new(table))
-                    .context(super::UnableToAddDataSnafu)?;
+                    .context(UnableToAddDataSnafu)?;
 
-                tracing::trace!("Created table for log sequence number {log_sequence_number}");
+                tracing::trace!(
+                    "Created table for log sequence number {log_sequence_number:?}",
+                    log_sequence_number = data_update.log_sequence_number
+                );
                 self.table_created = true;
                 return Ok(());
             }
+
+            let log_sequence_number = data_update.log_sequence_number.unwrap_or_default();
 
             let table_insert = MemTableInsert {
                 log_sequence_number,
@@ -61,7 +74,7 @@ impl super::DataBackend for MemTableBackend {
                 ctx: self.ctx.clone(),
             };
 
-            table_insert.insert(data).await?;
+            table_insert.insert(data_update.data).await?;
             Ok(())
         })
     }
@@ -78,9 +91,9 @@ impl MemTableInsert {
         format!("{name}_{log_sequence_number}")
     }
 
-    async fn insert(&self, data: Vec<RecordBatch>) -> super::Result<()> {
+    async fn insert(&self, data: Vec<RecordBatch>) -> Result<()> {
         let schema = data[0].schema();
-        let table = MemTable::try_new(schema, vec![data]).context(super::UnableToAddDataSnafu)?;
+        let table = MemTable::try_new(schema, vec![data]).context(UnableToAddDataSnafu)?;
 
         // There is probably a better way to do this than registering a temp table
         let temp_table_name = MemTableInsert::temp_table_name(&self.name, self.log_sequence_number);
@@ -89,7 +102,7 @@ impl MemTableInsert {
                 TableReference::from(temp_table_name.clone()),
                 Arc::new(table),
             )
-            .context(super::UnableToAddDataSnafu)?;
+            .context(UnableToAddDataSnafu)?;
 
         let sql_stmt = format!(
             r#"INSERT INTO "{name}" SELECT * FROM "{temp_table_name}""#,
@@ -97,27 +110,27 @@ impl MemTableInsert {
         );
         tracing::trace!("Inserting data with SQL: {sql_stmt}");
         let statements = DFParser::parse_sql_with_dialect(&sql_stmt, &AnsiDialect {})
-            .context(super::UnableToParseSqlSnafu)?;
+            .context(UnableToParseSqlSnafu)?;
         for statement in statements {
             let plan = self
                 .ctx
                 .state()
                 .statement_to_plan(statement)
                 .await
-                .context(super::UnableToAddDataSnafu)?;
+                .context(UnableToAddDataSnafu)?;
             let df = self
                 .ctx
                 .execute_logical_plan(plan)
                 .await
-                .context(super::UnableToAddDataSnafu)?;
+                .context(UnableToAddDataSnafu)?;
             let physical_plan = df
                 .create_physical_plan()
                 .await
-                .context(super::UnableToAddDataSnafu)?;
+                .context(UnableToAddDataSnafu)?;
             let task_ctx = self.ctx.task_ctx();
             collect(physical_plan, task_ctx.clone())
                 .await
-                .context(super::UnableToAddDataSnafu)?;
+                .context(UnableToAddDataSnafu)?;
         }
 
         Ok(())
