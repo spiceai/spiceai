@@ -9,6 +9,6 @@ type AuthConfig struct {
 }
 
 type Auth struct {
-	Type string `json:"type,omitempty" csv:"type" toml:"type"`
-	Key  string `json:"key,omitempty" csv:"key" toml:"key"`
+	ProviderType string `json:"provider_type,omitempty" csv:"provider_type" toml:"provider_type"`
+	Key          string `json:"key,omitempty" csv:"key" toml:"key"`
 }

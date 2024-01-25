@@ -42,6 +42,8 @@ pub struct Args {
 
 pub async fn run(args: Args) -> Result<()> {
     let app = App::new(".").context(UnableToConstructSpiceAppSnafu)?;
+    let auth = runtime::auth::get();
+    tracing::info!("Auth token: {}", auth.get_token());
 
     let mut df = runtime::datafusion::DataFusion::new();
 

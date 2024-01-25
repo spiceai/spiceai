@@ -28,3 +28,5 @@ async-stream = "0.3.5"
 futures-core = "0.3"
 spice-rs = { git = "https://github.com/spiceai/spice-rs" }
 dirs = "5.0.1"
+toml = "0.8.8"
+serde.workspace = true
