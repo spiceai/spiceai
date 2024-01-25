@@ -21,9 +21,14 @@ impl DataSource for SpiceAI {
     }
 
     fn get_all_data(&mut self, dataset: &str) -> Vec<RecordBatch> {
+        tracing::debug!("Getting all data for dataset: {}", dataset);
         let flight_record_batch_stream_result = block_on(
             self.spice_client
                 .query(format!("SELECT * FROM {dataset}").as_str()),
+        );
+        tracing::debug!(
+            "Got flight record batch stream result: {:?}",
+            flight_record_batch_stream_result
         );
         let mut flight_record_batch_stream = match flight_record_batch_stream_result {
             Ok(stream) => stream,
@@ -33,10 +38,12 @@ impl DataSource for SpiceAI {
             }
         };
 
+        tracing::debug!("Reading flight record batch stream");
         let mut result_data = vec![];
         while let Some(batch) = block_on(flight_record_batch_stream.next()) {
             match batch {
                 Ok(batch) => {
+                    tracing::debug!("Got batch: {:?}", batch);
                     result_data.push(batch);
                 }
                 Err(error) => {
@@ -46,6 +53,7 @@ impl DataSource for SpiceAI {
             };
         }
 
+        tracing::debug!("Returning result data: {:?}", result_data);
         result_data
     }
 

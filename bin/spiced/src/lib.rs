@@ -45,6 +45,9 @@ pub async fn run(args: Args) -> Result<()> {
 
     let mut df = runtime::datafusion::DataFusion::new();
 
+    df.attach_backend("test", databackend::DataBackendType::Memtable)
+        .context(UnableToAttachDataSourceSnafu)?;
+
     for ds in &app.datasets {
         // TODO: Handle multiple data sources
         // TODO: Use configured auth
@@ -72,9 +75,6 @@ pub async fn run(args: Args) -> Result<()> {
     //     databackend::DataBackendType::default(),
     // )
     // .context(UnableToAttachDataSourceSnafu)?;
-
-    // df.attach_backend("test", databackend::DataBackendType::Memtable)
-    //     .context(UnableToAttachDataSourceSnafu)?;
 
     let rt: Runtime = Runtime::new(args.runtime, app, df);
 
