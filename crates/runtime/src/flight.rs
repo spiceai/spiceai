@@ -1,12 +1,14 @@
 use crate::datafusion::DataFusion;
 use arrow::ipc::writer::{DictionaryTracker, IpcDataGenerator};
 use arrow_flight::{FlightEndpoint, SchemaAsIpc};
+use arrow_ipc::convert::try_schema_from_flatbuffer_bytes;
 use datafusion::arrow::error::ArrowError;
 use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::listing::{ListingOptions, ListingTableUrl};
-use futures::stream::BoxStream;
+use futures::stream::{self, BoxStream, StreamExt};
 use futures::Stream;
 use snafu::prelude::*;
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use tonic::metadata::MetadataValue;
@@ -140,9 +142,73 @@ impl FlightService for Service {
 
     async fn do_put(
         &self,
-        _request: Request<Streaming<FlightData>>,
+        request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoPutStream>, Status> {
-        Err(Status::unimplemented("Not yet implemented"))
+        let mut streaming_flight = request.into_inner();
+
+        let Ok(Some(message)) = streaming_flight.message().await else {
+            return Err(Status::invalid_argument("No flight data provided"));
+        };
+        let Some(fd) = &message.flight_descriptor else {
+            return Err(Status::invalid_argument("No flight descriptor provided"));
+        };
+        if fd.path.is_empty() {
+            return Err(Status::invalid_argument("No path provided"));
+        };
+
+        let schema = try_schema_from_flatbuffer_bytes(&message.data_header).map_err(|e| {
+            Status::internal(format!("Unable to get schema from data header: {e:?}"))
+        })?;
+        let schema = Arc::new(schema);
+        let dictionaries_by_id = Arc::new(HashMap::new());
+
+        // Sometimes the first message only contains the schema and no data
+        let first_batch = arrow_flight::utils::flight_data_to_arrow_batch(
+            &message,
+            schema.clone(),
+            &dictionaries_by_id,
+        )
+        .ok();
+
+        let mut batches = vec![];
+        if let Some(first_batch) = first_batch {
+            batches.push(first_batch);
+        }
+
+        let response_stream = stream::unfold(streaming_flight, move |mut flight| {
+            let schema = Arc::clone(&schema);
+            let dictionaries_by_id = Arc::clone(&dictionaries_by_id);
+            async move {
+                match flight.message().await {
+                    Ok(Some(message)) => {
+                        let new_batch = match arrow_flight::utils::flight_data_to_arrow_batch(
+                            &message,
+                            schema.clone(),
+                            &dictionaries_by_id,
+                        ) {
+                            Ok(batches) => batches,
+                            Err(e) => {
+                                tracing::trace!("Unable to convert flight data to batches: {e:?}");
+                                return None;
+                            }
+                        };
+                        tracing::trace!("Received batch with {} rows", new_batch.num_rows());
+
+                        Some((Ok(PutResult::default()), flight))
+                    }
+                    Ok(None) => {
+                        // End of the stream
+                        None
+                    }
+                    Err(e) => Some((
+                        Err(Status::internal(format!("Error reading message: {e:?}"))),
+                        flight,
+                    )),
+                }
+            }
+        });
+
+        Ok(Response::new(response_stream.boxed()))
     }
 
     async fn do_action(

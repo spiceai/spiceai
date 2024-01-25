@@ -20,6 +20,7 @@ metrics.workspace = true
 datafusion = "34.0.0"
 arrow = "49.0.0"
 arrow-flight = "49.0.0"
+arrow-ipc = "49.0.0"
 tonic = "0.10.2"
 futures = "0.3.30"
 uuid = "1.6.1"
