@@ -78,10 +78,10 @@ impl DataFusion {
         data_source: &'static mut dyn DataSource,
         backend: DataBackendType,
     ) -> Result<()> {
-        let table_exists = self.ctx.table_exist(dataset).context(DataFusionSnafu)?;
-        if table_exists {
-            return TableAlreadyExistsSnafu.fail();
-        }
+        // let table_exists = self.ctx.table_exist(dataset).context(DataFusionSnafu)?;
+        // if table_exists {
+        //     return TableAlreadyExistsSnafu.fail();
+        // }
 
         let data_backend: Box<dyn DataBackend> =
             <dyn DataBackend>::get(&self.ctx, dataset, &backend);

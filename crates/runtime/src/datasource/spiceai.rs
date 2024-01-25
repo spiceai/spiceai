@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use crate::auth::Auth;
 use arrow::record_batch::RecordBatch;
+use futures::executor::block_on;
 use futures::StreamExt;
 use spice_rs::Client;
 
@@ -20,8 +21,7 @@ impl DataSource for SpiceAI {
     }
 
     fn get_all_data(&mut self, dataset: &str) -> Vec<RecordBatch> {
-        let handle = tokio::runtime::Handle::current();
-        let flight_record_batch_stream_result = handle.block_on(
+        let flight_record_batch_stream_result = block_on(
             self.spice_client
                 .query(format!("SELECT * FROM {dataset}").as_str()),
         );
@@ -34,7 +34,7 @@ impl DataSource for SpiceAI {
         };
 
         let mut result_data = vec![];
-        while let Some(batch) = handle.block_on(flight_record_batch_stream.next()) {
+        while let Some(batch) = block_on(flight_record_batch_stream.next()) {
             match batch {
                 Ok(batch) => {
                     result_data.push(batch);
@@ -53,9 +53,8 @@ impl DataSource for SpiceAI {
     where
         Self: Sized,
     {
-        let handle = tokio::runtime::Handle::current();
         SpiceAI {
-            spice_client: handle.block_on(Client::new(&auth.get_token())).unwrap(),
+            spice_client: block_on(Client::new(&auth.get_token())).unwrap(),
             sleep_duration: Duration::from_secs(1),
         }
     }
