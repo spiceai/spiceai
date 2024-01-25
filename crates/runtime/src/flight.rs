@@ -1,4 +1,5 @@
 use crate::datafusion::DataFusion;
+use crate::dataupdate::{DataUpdate, UpdateType};
 use arrow::ipc::writer::{DictionaryTracker, IpcDataGenerator};
 use arrow_flight::{FlightEndpoint, SchemaAsIpc};
 use arrow_ipc::convert::try_schema_from_flatbuffer_bytes;
@@ -23,7 +24,7 @@ use arrow_flight::{
 };
 
 pub struct Service {
-    data_fusion: Arc<DataFusion>,
+    datafusion: Arc<DataFusion>,
 }
 
 #[tonic::async_trait]
@@ -46,7 +47,7 @@ impl FlightService for Service {
         let table_path = ListingTableUrl::parse(&request.path[0]).map_err(to_tonic_err)?;
 
         let schema = listing_options
-            .infer_schema(&self.data_fusion.ctx.state(), &table_path)
+            .infer_schema(&self.datafusion.ctx.state(), &table_path)
             .await
             .map_err(to_tonic_err)?;
 
@@ -65,7 +66,7 @@ impl FlightService for Service {
         let ticket = request.into_inner();
         match std::str::from_utf8(&ticket.ticket) {
             Ok(sql) => {
-                let df = self.data_fusion.ctx.sql(sql).await.map_err(to_tonic_err)?;
+                let df = self.datafusion.ctx.sql(sql).await.map_err(to_tonic_err)?;
                 let schema = df.schema().clone().into();
                 let results = df.collect().await.map_err(to_tonic_err)?;
                 if results.is_empty() {
@@ -156,6 +157,15 @@ impl FlightService for Service {
             return Err(Status::invalid_argument("No path provided"));
         };
 
+        let path = fd.path.join(".");
+
+        let Some(backend) = self.datafusion.get_backend(&path) else {
+            return Err(Status::invalid_argument(format!(
+                "No backend registered for path: {path:?}",
+            )));
+        };
+        let backend = Arc::clone(backend);
+
         let schema = try_schema_from_flatbuffer_bytes(&message.data_header).map_err(|e| {
             Status::internal(format!("Unable to get schema from data header: {e:?}"))
         })?;
@@ -178,6 +188,7 @@ impl FlightService for Service {
         let response_stream = stream::unfold(streaming_flight, move |mut flight| {
             let schema = Arc::clone(&schema);
             let dictionaries_by_id = Arc::clone(&dictionaries_by_id);
+            let backend = Arc::clone(&backend);
             async move {
                 match flight.message().await {
                     Ok(Some(message)) => {
@@ -193,6 +204,18 @@ impl FlightService for Service {
                             }
                         };
                         tracing::trace!("Received batch with {} rows", new_batch.num_rows());
+
+                        if let Err(err) = backend
+                            .add_data(DataUpdate {
+                                data: vec![new_batch],
+                                log_sequence_number: None,
+                                update_type: UpdateType::Append,
+                            })
+                            .await
+                            .map_err(|e| Status::internal(format!("Unable to add data: {e:?}")))
+                        {
+                            return Some((Err(err), flight));
+                        };
 
                         Some((Ok(PutResult::default()), flight))
                     }
@@ -261,7 +284,7 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub async fn start(bind_address: std::net::SocketAddr, df: Arc<DataFusion>) -> Result<()> {
     let service = Service {
-        data_fusion: df.clone(),
+        datafusion: df.clone(),
     };
     let svc = FlightServiceServer::new(service);
 

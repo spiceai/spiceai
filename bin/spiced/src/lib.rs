@@ -67,6 +67,9 @@ pub async fn run(args: Args) -> Result<()> {
     )
     .context(UnableToAttachDataSourceSnafu)?;
 
+    df.attach_backend("test", databackend::DataBackendType::Memtable)
+        .context(UnableToAttachDataSourceSnafu)?;
+
     let rt: Runtime = Runtime::new(args.runtime, app, df);
 
     rt.start_servers()
