@@ -61,21 +61,21 @@ pub async fn run(args: Args) -> Result<()> {
         .context(UnableToAttachDataSourceSnafu)?;
     }
 
-    let debug_source = datasource::debug::DebugSource {
-        sleep_duration: Duration::from_secs(1),
-    };
-    // Ok to leak here since we want it to live for the lifetime of the process anyway
-    let debug_source = Box::leak(Box::new(debug_source));
+    // let debug_source = datasource::debug::DebugSource {
+    //     sleep_duration: Duration::from_secs(1),
+    // };
+    // // Ok to leak here since we want it to live for the lifetime of the process anyway
+    // let debug_source = Box::leak(Box::new(debug_source));
 
-    df.attach(
-        "test-stream",
-        debug_source,
-        databackend::DataBackendType::default(),
-    )
-    .context(UnableToAttachDataSourceSnafu)?;
+    // df.attach(
+    //     "test-stream",
+    //     debug_source,
+    //     databackend::DataBackendType::default(),
+    // )
+    // .context(UnableToAttachDataSourceSnafu)?;
 
-    df.attach_backend("test", databackend::DataBackendType::Memtable)
-        .context(UnableToAttachDataSourceSnafu)?;
+    // df.attach_backend("test", databackend::DataBackendType::Memtable)
+    //     .context(UnableToAttachDataSourceSnafu)?;
 
     let rt: Runtime = Runtime::new(args.runtime, app, df);
 
