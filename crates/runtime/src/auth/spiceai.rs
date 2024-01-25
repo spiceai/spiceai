@@ -9,3 +9,10 @@ impl Auth for SpiceAuth {
         self.api_key.clone()
     }
 }
+
+impl SpiceAuth {
+    #[must_use]
+    pub fn new(api_key: String) -> Self {
+        SpiceAuth { api_key }
+    }
+}

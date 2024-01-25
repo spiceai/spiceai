@@ -28,7 +28,7 @@ impl DataSource for DebugSource {
         Some(self.sleep_duration)
     }
 
-    fn get_all_data(&self, _dataset: &str) -> Vec<RecordBatch> {
+    fn get_all_data(&mut self, _dataset: &str) -> Vec<RecordBatch> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("a", DataType::Utf8, false),
             Field::new("b", DataType::Int32, false),

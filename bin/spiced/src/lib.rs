@@ -1,11 +1,13 @@
 #![allow(clippy::missing_errors_doc)]
 
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use app::App;
 use clap::Parser;
 use runtime::config::Config as RuntimeConfig;
-use runtime::{databackend, Runtime};
+use runtime::datasource::DataSource;
+use runtime::{databackend, datasource, Runtime};
 use snafu::prelude::*;
 
 #[derive(Debug, Snafu)]
@@ -44,27 +46,33 @@ pub async fn run(args: Args) -> Result<()> {
 
     let mut df = runtime::datafusion::DataFusion::new();
 
-    // for ds in rt.app.datasets.iter() {
-    //     let data_source = datasource::DataSource::new(ds.clone());
-    //     rt.df.attach(
-    //         &ds.name,
-    //         data_source,
-    //         databackend::DataBackendType::default(),
-    //     )
-    // }
+    for ds in &app.datasets {
+        // TODO: Handle multiple data sources
+        // TODO: Use configured auth
+        let auth = runtime::auth::spiceai::SpiceAuth::new(
+            "383030|7eeb01de04b84361add0d384b4b10eac".to_string(),
+        );
+        let data_source = Box::leak(Box::new(datasource::spiceai::SpiceAI::new(auth)));
+        df.attach(
+            &ds.name,
+            data_source,
+            databackend::DataBackendType::default(),
+        )
+        .context(UnableToAttachDataSourceSnafu)?;
+    }
 
-    // let debug_source = datasource::debug::DebugSource {
-    //     sleep_duration: Duration::from_secs(1),
-    // };
-    // // Ok to leak here since we want it to live for the lifetime of the process anyway
-    // let debug_source = Box::leak(Box::new(debug_source));
+    let debug_source = datasource::debug::DebugSource {
+        sleep_duration: Duration::from_secs(1),
+    };
+    // Ok to leak here since we want it to live for the lifetime of the process anyway
+    let debug_source = Box::leak(Box::new(debug_source));
 
-    // df.attach(
-    //     "test-stream",
-    //     debug_source,
-    //     databackend::DataBackendType::default(),
-    // )
-    // .context(UnableToAttachDataSourceSnafu)?;
+    df.attach(
+        "test-stream",
+        debug_source,
+        databackend::DataBackendType::default(),
+    )
+    .context(UnableToAttachDataSourceSnafu)?;
 
     df.attach_backend("test", databackend::DataBackendType::Memtable)
         .context(UnableToAttachDataSourceSnafu)?;

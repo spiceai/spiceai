@@ -8,6 +8,7 @@ use crate::auth::Auth;
 use crate::dataupdate::{DataUpdate, UpdateType};
 
 pub mod debug;
+pub mod spiceai;
 
 /// A `DataSource` knows how to retrieve data for a given dataset.
 ///
@@ -39,16 +40,16 @@ pub trait DataSource: Send + Sync {
         None
     }
     /// Returns all data for the given dataset.
-    fn get_all_data(&self, dataset: &str) -> Vec<RecordBatch>;
+    fn get_all_data(&mut self, dataset: &str) -> Vec<RecordBatch>;
 }
 
 impl dyn DataSource + '_ {
-    pub fn get_data<'a>(&'a self, dataset: &'a str) -> BoxStream<'_, DataUpdate> {
+    pub fn get_data<'a>(&'a mut self, dataset: &'a str) -> BoxStream<'_, DataUpdate> {
         if self.supports_data_streaming(dataset) {
             return self.stream_data_updates(dataset);
         }
 
-        // If a refresh_internal is defined, refresh the data on that interval.
+        // If a refresh_interval is defined, refresh the data on that interval.
         if let Some(refresh_interval) = self.get_all_data_refresh_interval(dataset) {
             return Box::pin(stream! {
                 loop {

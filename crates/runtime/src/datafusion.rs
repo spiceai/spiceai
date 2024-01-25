@@ -75,7 +75,7 @@ impl DataFusion {
     pub fn attach(
         &mut self,
         dataset: &str,
-        data_source: &'static dyn DataSource,
+        data_source: &'static mut dyn DataSource,
         backend: DataBackendType,
     ) -> Result<()> {
         let table_exists = self.ctx.table_exist(dataset).context(DataFusionSnafu)?;
