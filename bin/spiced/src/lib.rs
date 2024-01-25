@@ -1,7 +1,6 @@
 #![allow(clippy::missing_errors_doc)]
 
 use std::net::SocketAddr;
-use std::time::Duration;
 
 use app::App;
 use clap::Parser;
