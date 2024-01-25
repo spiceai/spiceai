@@ -1,12 +1,12 @@
 [package]
-name = "flightcli"
+name = "flightpublisher"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
-description = "Spice OSS Flight CLI"
+description = "Spice OSS Flight Publisher"
 
 [dependencies]
 arrow = "49.0.0"

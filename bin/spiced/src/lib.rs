@@ -1,12 +1,11 @@
 #![allow(clippy::missing_errors_doc)]
 
 use std::net::SocketAddr;
-use std::time::Duration;
 
 use app::App;
 use clap::Parser;
 use runtime::config::Config as RuntimeConfig;
-use runtime::{databackend, datasource, Runtime};
+use runtime::{databackend, Runtime};
 use snafu::prelude::*;
 
 #[derive(Debug, Snafu)]
@@ -54,18 +53,18 @@ pub async fn run(args: Args) -> Result<()> {
     //     )
     // }
 
-    let debug_source = datasource::debug::DebugSource {
-        sleep_duration: Duration::from_secs(1),
-    };
-    // Ok to leak here since we want it to live for the lifetime of the process anyway
-    let debug_source = Box::leak(Box::new(debug_source));
+    // let debug_source = datasource::debug::DebugSource {
+    //     sleep_duration: Duration::from_secs(1),
+    // };
+    // // Ok to leak here since we want it to live for the lifetime of the process anyway
+    // let debug_source = Box::leak(Box::new(debug_source));
 
-    df.attach(
-        "test-stream",
-        debug_source,
-        databackend::DataBackendType::default(),
-    )
-    .context(UnableToAttachDataSourceSnafu)?;
+    // df.attach(
+    //     "test-stream",
+    //     debug_source,
+    //     databackend::DataBackendType::default(),
+    // )
+    // .context(UnableToAttachDataSourceSnafu)?;
 
     df.attach_backend("test", databackend::DataBackendType::Memtable)
         .context(UnableToAttachDataSourceSnafu)?;

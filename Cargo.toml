@@ -1,7 +1,8 @@
 [workspace]
 members = [
     "bin/spiced/",
-    "bin/flightcli/",
+    "bin/flightpublisher/",
+    "bin/flightsubscriber/",
 ]
 default-members = ["bin/spiced"]
 

@@ -1197,7 +1197,21 @@ dependencies = [
 ]
 
 [[package]]
-name = "flightcli"
+name = "flightpublisher"
+version = "0.10.0-alpha.0"
+dependencies = [
+ "arrow",
+ "arrow-flight",
+ "async-stream",
+ "clap",
+ "futures",
+ "parquet",
+ "tokio",
+ "tonic",
+]
+
+[[package]]
+name = "flightsubscriber"
 version = "0.10.0-alpha.0"
 dependencies = [
  "arrow",

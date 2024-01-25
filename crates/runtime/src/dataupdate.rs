@@ -1,10 +1,12 @@
 use arrow::record_batch::RecordBatch;
 
+#[derive(Debug, Clone)]
 pub enum UpdateType {
     Append,
     Overwrite,
 }
 
+#[derive(Debug, Clone)]
 pub struct DataUpdate {
     /// The unique identifier associated with this DataUpdate.
     /// If the runtime sees two DataUpdates with the same log_sequence_number,
