@@ -1,9 +1,9 @@
-use super::Auth;
+use super::AuthProvider;
 
 #[allow(clippy::module_name_repetitions)]
 pub struct NoneAuth {}
 
-impl Auth for NoneAuth {
+impl AuthProvider for NoneAuth {
     fn get_token(&self) -> String {
         String::new()
     }

@@ -6,7 +6,7 @@ use async_stream::stream;
 use futures_core::stream::BoxStream;
 use std::future::Future;
 
-use crate::auth::Auth;
+use crate::auth::AuthProvider;
 use crate::dataupdate::{DataUpdate, UpdateType};
 
 pub mod debug;
@@ -27,7 +27,7 @@ pub mod spiceai;
 /// ```
 pub trait DataSource: Send + Sync {
     /// Create a new `DataSource` with the given `Auth`.
-    fn new<T: Auth>(auth: T) -> Self
+    fn new<T: AuthProvider>(auth: T) -> Self
     where
         Self: Sized;
     /// Returns true if the given dataset supports streaming by this `DataSource`.
