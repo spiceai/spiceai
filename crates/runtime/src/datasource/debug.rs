@@ -6,6 +6,7 @@ use arrow::{
 };
 use async_stream::stream;
 use futures_core::stream::BoxStream;
+use std::{future::Future, pin::Pin};
 use std::{sync::Arc, time::Duration};
 
 #[allow(clippy::module_name_repetitions)]
@@ -28,22 +29,27 @@ impl DataSource for DebugSource {
         Some(self.sleep_duration)
     }
 
-    fn get_all_data(&self, _dataset: &str) -> Vec<RecordBatch> {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("a", DataType::Utf8, false),
-            Field::new("b", DataType::Int32, false),
-        ]));
-        if let Ok(batch) = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(StringArray::from(vec!["a", "b", "c", "d"])),
-                Arc::new(Int32Array::from(vec![1, 10, 10, 100])),
-            ],
-        ) {
-            vec![batch]
-        } else {
-            vec![]
-        }
+    fn get_all_data(
+        &self,
+        _dataset: &str,
+    ) -> Pin<Box<dyn Future<Output = Vec<RecordBatch>> + Send>> {
+        Box::pin(async move {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("a", DataType::Utf8, false),
+                Field::new("b", DataType::Int32, false),
+            ]));
+            if let Ok(batch) = RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(StringArray::from(vec!["a", "b", "c", "d"])),
+                    Arc::new(Int32Array::from(vec![1, 10, 10, 100])),
+                ],
+            ) {
+                vec![batch]
+            } else {
+                vec![]
+            }
+        })
     }
 
     fn stream_data_updates<'a>(&self, _dataset: &str) -> BoxStream<'a, DataUpdate> {
