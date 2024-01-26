@@ -2,6 +2,9 @@
 
 use super::DataSource;
 
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::auth::Auth;
@@ -9,9 +12,10 @@ use arrow::record_batch::RecordBatch;
 use futures::executor::block_on;
 use futures::StreamExt;
 use spice_rs::Client;
+use tokio::sync::Mutex;
 
 pub struct SpiceAI {
-    pub spice_client: Client,
+    pub spice_client: Arc<Mutex<Client>>,
     pub sleep_duration: Duration,
 }
 
@@ -20,41 +24,40 @@ impl DataSource for SpiceAI {
         Some(self.sleep_duration)
     }
 
-    fn get_all_data(&mut self, dataset: &str) -> Vec<RecordBatch> {
-        tracing::debug!("Getting all data for dataset: {}", dataset);
-        let flight_record_batch_stream_result = block_on(
-            self.spice_client
-                .query(format!("SELECT * FROM {dataset}").as_str()),
-        );
-        tracing::debug!(
-            "Got flight record batch stream result: {:?}",
-            flight_record_batch_stream_result
-        );
-        let mut flight_record_batch_stream = match flight_record_batch_stream_result {
-            Ok(stream) => stream,
-            Err(error) => {
-                tracing::error!("Failed to query with spice client: {:?}", error);
-                return vec![];
-            }
-        };
+    fn get_all_data(
+        &self,
+        dataset: &str,
+    ) -> Pin<Box<dyn Future<Output = Vec<RecordBatch>> + Send>> {
+        let client = self.spice_client.clone();
+        let dataset = dataset.to_string();
+        Box::pin(async move {
+            let flight_record_batch_stream_result = client.lock().await
+                .query(format!("SELECT * FROM {dataset}").as_str())
+                .await;
 
-        tracing::debug!("Reading flight record batch stream");
-        let mut result_data = vec![];
-        while let Some(batch) = block_on(flight_record_batch_stream.next()) {
-            match batch {
-                Ok(batch) => {
-                    tracing::debug!("Got batch: {:?}", batch);
-                    result_data.push(batch);
-                }
+            let mut flight_record_batch_stream = match flight_record_batch_stream_result {
+                Ok(stream) => stream,
                 Err(error) => {
-                    tracing::error!("Failed to read batch from spice client: {:?}", error);
-                    continue;
+                    tracing::error!("Failed to query with spice client: {:?}", error);
+                    return vec![];
                 }
             };
-        }
 
-        tracing::debug!("Returning result data: {:?}", result_data);
-        result_data
+            let mut result_data = vec![];
+            while let Some(batch) = flight_record_batch_stream.next().await {
+                match batch {
+                    Ok(batch) => {
+                        result_data.push(batch);
+                    }
+                    Err(error) => {
+                        tracing::error!("Failed to read batch from spice client: {:?}", error);
+                        continue;
+                    }
+                };
+            }
+
+            result_data
+        })
     }
 
     fn new<T: Auth>(auth: T) -> Self
@@ -62,7 +65,9 @@ impl DataSource for SpiceAI {
         Self: Sized,
     {
         SpiceAI {
-            spice_client: block_on(Client::new(&auth.get_token())).unwrap(),
+            spice_client: Arc::new(Mutex::new(
+                block_on(Client::new(&auth.get_token())).unwrap(),
+            )),
             sleep_duration: Duration::from_secs(1),
         }
     }

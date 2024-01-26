@@ -47,7 +47,7 @@ pub trait DataSource: Send + Sync {
 }
 
 impl dyn DataSource + '_ {
-    pub fn get_data<'a>(&'a mut self, dataset: &'a str) -> BoxStream<'_, DataUpdate> {
+    pub fn get_data<'a>(&'a self, dataset: &'a str) -> BoxStream<'_, DataUpdate> {
         if self.supports_data_streaming(dataset) {
             return self.stream_data_updates(dataset);
         }

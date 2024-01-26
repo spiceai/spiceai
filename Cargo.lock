@@ -2916,7 +2916,7 @@ dependencies = [
 [[package]]
 name = "spice-rs"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/spice-rs#c73347a9309907343fb14073a0d9c8458f729cf5"
+source = "git+https://github.com/spiceai/spice-rs?branch=phillip/240126-errors#1f1bde24647f54821551dfc20396f570bda56f07"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -2933,6 +2933,7 @@ dependencies = [
  "rustls-pemfile",
  "serde",
  "serde_json",
+ "snafu 0.8.0",
  "tokio",
  "tonic",
 ]
