@@ -79,6 +79,9 @@ impl DataFusion {
         backend: DataBackendType,
     ) -> Result<()> {
         let internal_dataset = dataset.replace('.', "_");
+
+        // Appears the linter is wrong here, removing the borrow causes a compile error on lifetime of self.
+        #[allow(clippy::needless_borrows_for_generic_args)]
         let table_exists = self.ctx.table_exist(&internal_dataset).unwrap_or(false);
         if table_exists {
             return TableAlreadyExistsSnafu.fail();
