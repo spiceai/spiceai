@@ -1,10 +1,13 @@
-use dirs;
-use snafu::prelude::*;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
 
+use dirs;
 use serde::Deserialize;
+use snafu::prelude::*;
+
+pub mod none;
+pub mod spiceai;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -21,7 +24,8 @@ pub enum Error {
     UnableToParseAuthFile { source: toml::de::Error },
 }
 
-pub trait Auth {
+#[allow(clippy::module_name_repetitions)]
+pub trait AuthProvider {
     fn get_token(&self) -> String;
 }
 
@@ -32,22 +36,19 @@ pub struct AuthProviders {
 }
 
 #[allow(clippy::module_name_repetitions)]
+pub type AuthConfig = HashMap<String, Auth>;
+
 #[derive(Deserialize)]
-pub struct AuthProvider {
+pub struct Auth {
     pub provider_type: String,
     pub key: String,
 }
 
-#[allow(clippy::module_name_repetitions)]
-pub type AuthConfig = HashMap<String, AuthProvider>;
 pub type Result<T, E = Error> = std::result::Result<T, E>;
-
-pub mod none;
-pub mod spiceai;
 
 impl AuthProviders {
     #[must_use]
-    pub fn get(&self, name: &str) -> Box<dyn Auth> {
+    pub fn get(&self, name: &str) -> Box<dyn AuthProvider> {
         let auth_provider = if let Some(auth_provider) = self.auth.get(name) {
             tracing::info!("Using auth provider: {}", auth_provider.provider_type);
             auth_provider
