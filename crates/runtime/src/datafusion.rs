@@ -51,7 +51,7 @@ impl DataFusion {
 
     #[allow(clippy::needless_pass_by_value)]
     pub fn attach_backend(&mut self, dataset: &str, backend: DataBackendType) -> Result<()> {
-        let table_exists = self.ctx.table_exist(dataset).context(DataFusionSnafu)?;
+        let table_exists = self.ctx.table_exist(dataset).unwrap_or(false);
         if table_exists {
             return TableAlreadyExistsSnafu.fail();
         }
@@ -78,10 +78,11 @@ impl DataFusion {
         data_source: &'static mut dyn DataSource,
         backend: DataBackendType,
     ) -> Result<()> {
-        // let table_exists = self.ctx.table_exist(dataset).context(DataFusionSnafu)?;
-        // if table_exists {
-        //     return TableAlreadyExistsSnafu.fail();
-        // }
+        let internal_dataset = dataset.replace('.', "_");
+        let table_exists = self.ctx.table_exist(&internal_dataset).unwrap_or(false);
+        if table_exists {
+            return TableAlreadyExistsSnafu.fail();
+        }
 
         let data_backend: Box<dyn DataBackend> =
             <dyn DataBackend>::get(&self.ctx, dataset, &backend);

@@ -56,9 +56,6 @@ pub async fn run(args: Args) -> Result<()> {
 
     let mut df = runtime::datafusion::DataFusion::new();
 
-    df.attach_backend("test", databackend::DataBackendType::Memtable)
-        .context(UnableToAttachDataSourceSnafu)?;
-
     for ds in &app.datasets {
         // TODO: Handle multiple data sources
         let spice_auth = auth.get("spice.ai");
@@ -83,6 +80,9 @@ pub async fn run(args: Args) -> Result<()> {
     //     databackend::DataBackendType::default(),
     // )
     // .context(UnableToAttachDataSourceSnafu)?;
+
+    df.attach_backend("test", databackend::DataBackendType::Memtable)
+        .context(UnableToAttachDataSourceSnafu)?;
 
     let rt: Runtime = Runtime::new(args.runtime, app, df);
 
