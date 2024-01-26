@@ -15,7 +15,7 @@ pub struct DebugSource {
 }
 
 impl DataSource for DebugSource {
-    fn new<T: crate::auth::AuthProvider>(_auth: T) -> Self {
+    fn new<T: crate::auth::AuthProvider>(_auth_provider: T) -> Self {
         Self {
             sleep_duration: Duration::from_secs(1),
         }
