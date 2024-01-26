@@ -47,9 +47,10 @@ spice login
 			os.Exit(1)
 		}
 
-		authConfig := &api.AuthConfig{
-			Auth: &api.Auth{
-				Key: key,
+		authConfig := map[string]*api.Auth{
+			api.AUTH_TYPE_SPICE_AI: {
+				Key:          key,
+				ProviderType: api.AUTH_TYPE_SPICE_AI,
 			},
 		}
 		authConfigBytes, err := toml.Marshal(authConfig)

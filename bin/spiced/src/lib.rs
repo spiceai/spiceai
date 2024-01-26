@@ -42,6 +42,18 @@ pub struct Args {
 pub async fn run(args: Args) -> Result<()> {
     let app = App::new(".").context(UnableToConstructSpiceAppSnafu)?;
 
+    let mut auth = runtime::auth::AuthProviders::default();
+    match auth.parse_from_config() {
+        Ok(()) => {}
+        Err(e) => {
+            tracing::error!(
+                "Unable to parse auth from config, proceeding without auth: {}",
+                e
+            );
+        }
+    }
+    tracing::info!("Spice Auth token: {}", auth.get("spice.ai").get_token());
+
     let mut df = runtime::datafusion::DataFusion::new();
 
     // for ds in rt.app.datasets.iter() {
