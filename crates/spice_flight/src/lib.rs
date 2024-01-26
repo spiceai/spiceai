@@ -59,8 +59,8 @@ impl SpiceFlightClient {
     /// # Errors
     ///
     /// Returns an error if unable to create the `SpiceFlightClient`.
-    pub async fn new(api_key: String) -> Result<Self> {
-        let flight_channel = tls::new_tls_flight_channel("https://flight.spiceai.io")
+    pub async fn new(url: &str, api_key: String) -> Result<Self> {
+        let flight_channel = tls::new_tls_flight_channel(url)
             .await
             .context(UnableToConnectToServerSnafu)?;
 

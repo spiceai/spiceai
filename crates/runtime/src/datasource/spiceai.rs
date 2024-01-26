@@ -26,7 +26,11 @@ impl DataSource for SpiceAI {
     {
         SpiceAI {
             spice_client: Arc::new(Mutex::new(
-                block_on(SpiceFlightClient::new(auth_provider.get_token())).unwrap(),
+                block_on(SpiceFlightClient::new(
+                    "https://flight.spiceai.io",
+                    auth_provider.get_token(),
+                ))
+                .unwrap(),
             )),
             sleep_duration: Duration::from_secs(10),
         }
