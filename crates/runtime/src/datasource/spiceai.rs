@@ -7,7 +7,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::auth::Auth;
+use crate::auth::AuthProvider;
 use arrow::record_batch::RecordBatch;
 use futures::executor::block_on;
 use futures::StreamExt;
@@ -20,6 +20,18 @@ pub struct SpiceAI {
 }
 
 impl DataSource for SpiceAI {
+    fn new(auth_provider: Box<dyn AuthProvider>) -> Self
+    where
+        Self: Sized,
+    {
+        SpiceAI {
+            spice_client: Arc::new(Mutex::new(
+                block_on(Client::new(&auth_provider.get_token())).unwrap(),
+            )),
+            sleep_duration: Duration::from_secs(10),
+        }
+    }
+
     fn get_all_data_refresh_interval(&self, _dataset: &str) -> Option<Duration> {
         Some(self.sleep_duration)
     }
@@ -60,17 +72,5 @@ impl DataSource for SpiceAI {
 
             result_data
         })
-    }
-
-    fn new<T: Auth>(auth: T) -> Self
-    where
-        Self: Sized,
-    {
-        SpiceAI {
-            spice_client: Arc::new(Mutex::new(
-                block_on(Client::new(&auth.get_token())).unwrap(),
-            )),
-            sleep_duration: Duration::from_secs(10),
-        }
     }
 }

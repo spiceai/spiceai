@@ -26,6 +26,9 @@ pub enum Error {
 
 #[allow(clippy::module_name_repetitions)]
 pub trait AuthProvider {
+    fn new(auth: &Auth) -> Self
+    where
+        Self: Sized;
     fn get_token(&self) -> String;
 }
 
@@ -38,7 +41,7 @@ pub struct AuthProviders {
 #[allow(clippy::module_name_repetitions)]
 pub type AuthConfig = HashMap<String, Auth>;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 pub struct Auth {
     pub provider_type: String,
     pub key: String,
@@ -49,17 +52,17 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 impl AuthProviders {
     #[must_use]
     pub fn get(&self, name: &str) -> Box<dyn AuthProvider> {
-        let auth_provider = if let Some(auth_provider) = self.auth.get(name) {
-            tracing::info!("Using auth provider: {}", auth_provider.provider_type);
-            auth_provider
+        let auth = if let Some(auth) = self.auth.get(name) {
+            tracing::info!("Using auth provider: {}", auth.provider_type);
+            auth
         } else {
             tracing::info!("No auth provider found for {}", name);
-            return Box::new(none::NoneAuth::new());
+            return Box::new(none::NoneAuth::new(&Auth::default()));
         };
 
-        match auth_provider.provider_type.as_str() {
-            "spice.ai" => Box::new(spiceai::SpiceAuth::new(auth_provider.key.to_string())),
-            _ => Box::new(none::NoneAuth::new()),
+        match auth.provider_type.as_str() {
+            "spice.ai" => Box::new(spiceai::SpiceAuth::new(auth)),
+            _ => Box::new(none::NoneAuth::new(&Auth::default())),
         }
     }
 

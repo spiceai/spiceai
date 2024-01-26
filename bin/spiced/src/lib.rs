@@ -53,7 +53,6 @@ pub async fn run(args: Args) -> Result<()> {
             );
         }
     }
-    tracing::info!("Spice Auth token: {}", auth.get("spice.ai").get_token());
 
     let mut df = runtime::datafusion::DataFusion::new();
 
@@ -62,11 +61,8 @@ pub async fn run(args: Args) -> Result<()> {
 
     for ds in &app.datasets {
         // TODO: Handle multiple data sources
-        // TODO: Use configured auth
-        let auth = runtime::auth::spiceai::SpiceAuth::new(
-            "383030|7eeb01de04b84361add0d384b4b10eac".to_string(),
-        );
-        let data_source = Box::leak(Box::new(datasource::spiceai::SpiceAI::new(auth)));
+        let spice_auth = auth.get("spice.ai");
+        let data_source = Box::leak(Box::new(datasource::spiceai::SpiceAI::new(spice_auth)));
         df.attach(
             &ds.name,
             data_source,

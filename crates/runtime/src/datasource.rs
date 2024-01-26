@@ -27,7 +27,7 @@ pub mod spiceai;
 /// ```
 pub trait DataSource: Send + Sync {
     /// Create a new `DataSource` with the given `AuthProvider`.
-    fn new<T: AuthProvider>(auth_provider: T) -> Self
+    fn new(auth_provider: Box<dyn AuthProvider>) -> Self
     where
         Self: Sized;
     /// Returns true if the given dataset supports streaming by this `DataSource`.

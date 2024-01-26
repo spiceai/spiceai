@@ -1,3 +1,8 @@
+use crate::auth::AuthProvider;
+
+use std::{future::Future, pin::Pin};
+use std::{sync::Arc, time::Duration};
+
 use super::{DataSource, DataUpdate, UpdateType};
 use arrow::{
     array::{Int32Array, StringArray},
@@ -6,8 +11,6 @@ use arrow::{
 };
 use async_stream::stream;
 use futures_core::stream::BoxStream;
-use std::{future::Future, pin::Pin};
-use std::{sync::Arc, time::Duration};
 
 #[allow(clippy::module_name_repetitions)]
 pub struct DebugSource {
@@ -15,7 +18,7 @@ pub struct DebugSource {
 }
 
 impl DataSource for DebugSource {
-    fn new<T: crate::auth::AuthProvider>(_auth_provider: T) -> Self {
+    fn new(_auth_provider: Box<dyn AuthProvider>) -> Self {
         Self {
             sleep_duration: Duration::from_secs(1),
         }
