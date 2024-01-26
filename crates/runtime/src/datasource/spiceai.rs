@@ -11,11 +11,11 @@ use crate::auth::AuthProvider;
 use arrow::record_batch::RecordBatch;
 use futures::executor::block_on;
 use futures::StreamExt;
-use spice_rs::Client;
+use spice_flight::SpiceFlightClient;
 use tokio::sync::Mutex;
 
 pub struct SpiceAI {
-    pub spice_client: Arc<Mutex<Client>>,
+    pub spice_client: Arc<Mutex<SpiceFlightClient>>,
     pub sleep_duration: Duration,
 }
 
@@ -26,7 +26,7 @@ impl DataSource for SpiceAI {
     {
         SpiceAI {
             spice_client: Arc::new(Mutex::new(
-                block_on(Client::new(&auth_provider.get_token())).unwrap(),
+                block_on(SpiceFlightClient::new(auth_provider.get_token())).unwrap(),
             )),
             sleep_duration: Duration::from_secs(10),
         }

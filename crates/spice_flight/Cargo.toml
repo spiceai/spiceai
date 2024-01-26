@@ -1,0 +1,26 @@
+[package]
+name = "spice_flight"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+exclude.workspace = true
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+arrow-flight = { version = "49.0.0", features = ["flight-sql-experimental"] }
+base64 = "0.21.7"
+bytes = "1.5.0"
+futures = "0.3.30"
+snafu.workspace = true
+rustls = "0.21.7"
+rustls-native-certs = "0.6.3"
+rustls-pemfile = "1.0.3"
+tonic = { version = "0.10.2", default-features = false, features = [
+  "transport",
+  "tls",
+  "tls-roots",
+] }
