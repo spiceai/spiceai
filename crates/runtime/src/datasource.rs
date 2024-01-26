@@ -1,8 +1,10 @@
+use std::pin::Pin;
 use std::time::Duration;
 
 use arrow::record_batch::RecordBatch;
 use async_stream::stream;
 use futures_core::stream::BoxStream;
+use std::future::Future;
 
 use crate::auth::Auth;
 use crate::dataupdate::{DataUpdate, UpdateType};
@@ -39,7 +41,8 @@ pub trait DataSource: Send + Sync {
         None
     }
     /// Returns all data for the given dataset.
-    fn get_all_data(&self, dataset: &str) -> Vec<RecordBatch>;
+    fn get_all_data(&self, dataset: &str)
+        -> Pin<Box<dyn Future<Output = Vec<RecordBatch>> + Send>>;
 }
 
 impl dyn DataSource + '_ {
@@ -55,7 +58,7 @@ impl dyn DataSource + '_ {
                     tokio::time::sleep(refresh_interval).await;
                     yield DataUpdate {
                         log_sequence_number: None,
-                        data: self.get_all_data(dataset),
+                        data: self.get_all_data(dataset).await,
                         update_type: UpdateType::Overwrite,
                     };
                 }
@@ -66,7 +69,7 @@ impl dyn DataSource + '_ {
         Box::pin(stream! {
             yield DataUpdate {
                 log_sequence_number: None,
-                data: self.get_all_data(dataset),
+                data: self.get_all_data(dataset).await,
                 update_type: UpdateType::Overwrite,
             };
         })
