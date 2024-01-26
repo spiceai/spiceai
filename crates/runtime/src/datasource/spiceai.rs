@@ -31,7 +31,9 @@ impl DataSource for SpiceAI {
         let client = self.spice_client.clone();
         let dataset = dataset.to_string();
         Box::pin(async move {
-            let flight_record_batch_stream_result = client.lock().await
+            let flight_record_batch_stream_result = client
+                .lock()
+                .await
                 .query(format!("SELECT * FROM {dataset}").as_str())
                 .await;
 
@@ -51,7 +53,7 @@ impl DataSource for SpiceAI {
                     }
                     Err(error) => {
                         tracing::error!("Failed to read batch from spice client: {:?}", error);
-                        continue;
+                        return result_data;
                     }
                 };
             }
@@ -68,7 +70,7 @@ impl DataSource for SpiceAI {
             spice_client: Arc::new(Mutex::new(
                 block_on(Client::new(&auth.get_token())).unwrap(),
             )),
-            sleep_duration: Duration::from_secs(1),
+            sleep_duration: Duration::from_secs(10),
         }
     }
 }
