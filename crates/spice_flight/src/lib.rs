@@ -73,7 +73,11 @@ impl SpiceFlightClient {
         })
     }
 
-    /// Performs a query.
+    /// Queries the flight service with the specified query.
+    ///
+    /// # Arguments
+    ///
+    /// * `query` - The query string.
     ///
     /// # Errors
     ///
@@ -110,32 +114,31 @@ impl SpiceFlightClient {
             .context(UnableToQuerySnafu)?
             .into_inner();
 
-        for ep in info.endpoint {
-            if let Some(tkt) = ep.ticket {
-                let mut req = tkt.into_request();
-                let auth_header_value = match self.token.clone() {
-                    Some(token) => format!("Bearer {token}")
-                        .parse()
-                        .context(InvalidMetadataSnafu)?,
-                    None => {
-                        return UnauthorizedSnafu.fail();
-                    }
-                };
-                req.metadata_mut()
-                    .insert("authorization", auth_header_value);
-                let (md, response_stream, _ext) = self
-                    .flight_client
-                    .clone()
-                    .do_get(req)
-                    .await
-                    .context(UnableToQuerySnafu)?
-                    .into_parts();
+        let ep = info.endpoint[0].clone();
+        if let Some(ticket) = ep.ticket {
+            let mut req = ticket.into_request();
+            let auth_header_value = match self.token.clone() {
+                Some(token) => format!("Bearer {token}")
+                    .parse()
+                    .context(InvalidMetadataSnafu)?,
+                None => {
+                    return UnauthorizedSnafu.fail();
+                }
+            };
+            req.metadata_mut()
+                .insert("authorization", auth_header_value);
+            let (md, response_stream, _ext) = self
+                .flight_client
+                .clone()
+                .do_get(req)
+                .await
+                .context(UnableToQuerySnafu)?
+                .into_parts();
 
-                return Ok(FlightRecordBatchStream::new_from_flight_data(
-                    response_stream.map_err(FlightError::Tonic),
-                )
-                .with_headers(md));
-            }
+            return Ok(FlightRecordBatchStream::new_from_flight_data(
+                response_stream.map_err(FlightError::Tonic),
+            )
+            .with_headers(md));
         }
 
         NoEndpointsFoundSnafu.fail()
