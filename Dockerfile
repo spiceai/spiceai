@@ -18,6 +18,9 @@ RUN \
   --mount=type=cache,id=spiceai_target,sharing=locked,target=/spiceai/target \
   cargo build --target-dir /spiceai/target --release
 
+RUN ls -l /spiceai/target
+RUN ls -l /spiceai/target/release
+
 FROM debian:bookworm-slim
 
 RUN apt update \
