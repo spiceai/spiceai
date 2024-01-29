@@ -67,9 +67,13 @@ pub async fn run(args: Args) -> Result<()> {
     for ds in &app.datasets {
         match &ds.source {
             Some(source) => {
+                let auth_name = match &ds.auth {
+                    Some(auth_name) => auth_name,
+                    None => source,
+                };
                 let data_source: Box<dyn DataSource> = match source.as_str() {
                     "spice.ai" => {
-                        let spice_auth = auth.get(source);
+                        let spice_auth = auth.get(auth_name);
                         Box::new(
                             datasource::spiceai::SpiceAI::new(spice_auth)
                                 .await
