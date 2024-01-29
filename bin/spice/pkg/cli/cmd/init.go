@@ -25,6 +25,12 @@ spice init trader
 		podManifestFileName := fmt.Sprintf("%s.yaml", strings.ToLower(podName))
 
 		rtcontext := context.NewContext()
+		err := rtcontext.Init()
+		if err != nil {
+			cmd.Println(err)
+			return
+		}
+
 		podsPath := rtcontext.PodsDir()
 		podManifestPath := filepath.Join(podsPath, podManifestFileName)
 		appRelativeManifestPath := rtcontext.GetSpiceAppRelativePath(podManifestPath)
