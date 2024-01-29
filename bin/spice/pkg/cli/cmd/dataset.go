@@ -49,7 +49,7 @@ spice dataset configure
 		datasetName = strings.TrimSuffix(datasetName, "\n")
 
 	datasetSourcePrompt:
-		cmd.Println("\nWhat is the dataset source?")
+		cmd.Println("\nWhere is your dataset located?")
 		for i, option := range datasetSourceOptions {
 			cmd.Printf("\t[%d] %s\n", i, api.DataSourceToHumanReadable(option))
 		}
