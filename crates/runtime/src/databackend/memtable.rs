@@ -3,7 +3,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use crate::dataupdate::DataUpdate;
+use crate::dataupdate::{DataUpdate, UpdateType};
 use arrow::record_batch::RecordBatch;
 use datafusion::{
     datasource::MemTable,
@@ -70,35 +70,40 @@ impl DataBackend for MemTableBackend {
 
             let log_sequence_number = data_update.log_sequence_number.unwrap_or_default();
 
-            let table_insert = MemTableInsert {
+            let table_update = MemTableUpdate {
                 log_sequence_number,
                 name: self.name.clone(),
+                data: data_update.data,
+                update_type: data_update.update_type,
                 ctx: self.ctx.clone(),
             };
 
-            table_insert.insert(data_update.data).await?;
+            table_update.update().await?;
             Ok(())
         })
     }
 }
 
-struct MemTableInsert {
+struct MemTableUpdate {
     log_sequence_number: u64,
     name: String,
+    data: Vec<RecordBatch>,
+    update_type: UpdateType,
     ctx: Arc<SessionContext>,
 }
 
-impl MemTableInsert {
+impl MemTableUpdate {
     fn temp_table_name(name: &str, log_sequence_number: u64) -> String {
         format!("{name}_{log_sequence_number}")
     }
 
-    async fn insert(&self, data: Vec<RecordBatch>) -> Result<()> {
-        let schema = data[0].schema();
-        let table = MemTable::try_new(schema, vec![data]).context(UnableToAddDataSnafu)?;
+    async fn update(&self) -> Result<()> {
+        let schema = self.data[0].schema();
+        let table =
+            MemTable::try_new(schema, vec![self.data.clone()]).context(UnableToAddDataSnafu)?;
 
         // There is probably a better way to do this than registering a temp table
-        let temp_table_name = MemTableInsert::temp_table_name(&self.name, self.log_sequence_number);
+        let temp_table_name = MemTableUpdate::temp_table_name(&self.name, self.log_sequence_number);
         self.ctx
             .register_table(
                 TableReference::from(temp_table_name.clone()),
@@ -106,10 +111,22 @@ impl MemTableInsert {
             )
             .context(UnableToAddDataSnafu)?;
 
-        let sql_stmt = format!(
-            r#"INSERT INTO "{name}" SELECT * FROM "{temp_table_name}""#,
-            name = self.name,
-        );
+        let sql_stmt = match self.update_type {
+            UpdateType::Overwrite => format!(
+                r#"CREATE OR REPLACE TABLE "{name}" AS SELECT * FROM "{temp_table_name}""#,
+                name = self.name,
+                temp_table_name = temp_table_name,
+            ),
+            UpdateType::Append => {
+                self.create_table_if_not_exists()?;
+                format!(
+                    r#"INSERT INTO "{name}" SELECT * FROM "{temp_table_name}""#,
+                    name = self.name,
+                    temp_table_name = temp_table_name,
+                )
+            }
+        };
+
         tracing::trace!("Inserting data with SQL: {sql_stmt}");
         let statements = DFParser::parse_sql_with_dialect(&sql_stmt, &AnsiDialect {})
             .context(UnableToParseSqlSnafu)?;
@@ -137,11 +154,38 @@ impl MemTableInsert {
 
         Ok(())
     }
+
+    fn create_table_if_not_exists(&self) -> Result<()> {
+        let table_exists = self
+            .ctx
+            .table_exist(TableReference::from(self.name.clone()))
+            .unwrap_or(false);
+
+        if !table_exists {
+            tracing::trace!(
+                "Creating table for log sequence number {:?}",
+                self.log_sequence_number
+            );
+            let schema = self.data[0].schema();
+            let table =
+                MemTable::try_new(schema, vec![self.data.clone()]).context(UnableToAddDataSnafu)?;
+
+            self.ctx
+                .register_table(TableReference::from(self.name.clone()), Arc::new(table))
+                .context(UnableToAddDataSnafu)?;
+
+            tracing::trace!(
+                "Created table for log sequence number {:?}",
+                self.log_sequence_number
+            );
+        };
+        Ok(())
+    }
 }
 
-impl Drop for MemTableInsert {
+impl Drop for MemTableUpdate {
     fn drop(&mut self) {
-        let temp_table_name = TableReference::from(MemTableInsert::temp_table_name(
+        let temp_table_name = TableReference::from(MemTableUpdate::temp_table_name(
             self.name.as_str(),
             self.log_sequence_number,
         ));
