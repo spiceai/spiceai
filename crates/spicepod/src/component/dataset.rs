@@ -26,6 +26,8 @@ pub struct Dataset {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
 
+    pub auth: Option<String>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acceleration: Option<acceleration::Acceleration>,
 
@@ -41,6 +43,7 @@ impl WithDependsOn<Dataset> for Dataset {
             r#type: self.r#type.clone(),
             description: self.description.clone(),
             source: self.source.clone(),
+            auth: self.auth.clone(),
             acceleration: self.acceleration.clone(),
 
             depends_on: depends_on.to_vec(),
