@@ -32,6 +32,7 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           components: clippy,rustfmt
+          cache: false
 
       - run: make lint
 
@@ -51,6 +52,8 @@ jobs:
 
       - name: Set up Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
 
       - run: make build
 
