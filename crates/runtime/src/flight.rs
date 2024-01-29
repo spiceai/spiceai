@@ -37,7 +37,9 @@ async fn get_sender_channel(
 ) -> Option<Arc<Sender<DataUpdate>>> {
     let channel_map_read = channel_map.read().await;
     if channel_map_read.contains_key(&path) {
-        let channel = channel_map_read.get(&path).unwrap();
+        let Some(channel) = channel_map_read.get(&path) else {
+            return None;
+        };
         Some(Arc::clone(channel))
     } else {
         None
@@ -314,8 +316,7 @@ impl FlightService for Service {
 
         let channel_map = Arc::clone(&self.channel_map);
         let channel_map_read = channel_map.read().await;
-        let (tx, rx) = if channel_map_read.contains_key(&data_path) {
-            let channel = channel_map_read.get(&data_path).unwrap();
+        let (tx, rx) = if let Some(channel) = channel_map_read.get(&data_path) {
             (Arc::clone(channel), channel.subscribe())
         } else {
             drop(channel_map_read);

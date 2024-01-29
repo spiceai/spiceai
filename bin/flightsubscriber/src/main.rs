@@ -57,9 +57,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn init_tracing() -> Result<(), tracing::subscriber::SetGlobalDefaultError> {
+fn init_tracing() -> Result<(), Box<dyn std::error::Error>> {
     let filter = tracing_subscriber::EnvFilter::builder()
-        .with_default_directive("flightsubscriber".parse::<Directive>().unwrap())
+        .with_default_directive("flightsubscriber".parse::<Directive>()?)
         .with_env_var("SPICED_LOG")
         .from_env_lossy();
 
