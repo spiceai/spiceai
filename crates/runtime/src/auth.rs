@@ -53,10 +53,10 @@ impl AuthProviders {
     #[must_use]
     pub fn get(&self, name: &str) -> Box<dyn AuthProvider> {
         let auth = if let Some(auth) = self.auth.get(name) {
-            tracing::info!("Using auth provider: {}", auth.provider_type);
+            tracing::trace!("Using auth provider: {}", auth.provider_type);
             auth
         } else {
-            tracing::info!("No auth provider found for {}", name);
+            tracing::trace!("No auth provider found for {}", name);
             return Box::new(none::NoneAuth::new(&Auth::default()));
         };
 

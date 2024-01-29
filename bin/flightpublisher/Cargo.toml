@@ -12,7 +12,7 @@ description = "Spice OSS Flight Publisher"
 arrow = "49.0.0"
 arrow-flight = "49.0.0"
 parquet = "49.0.0"
-clap.workspace = true
+clap = { workspace = true, features = ["derive"] }
 tokio.workspace = true
 tonic = { version = "0.10.0", default-features = false, features = [
   "transport",
