@@ -10,6 +10,7 @@ use crate::auth::AuthProvider;
 use crate::dataupdate::{DataUpdate, UpdateType};
 
 pub mod debug;
+pub mod spiceai;
 
 /// A `DataSource` knows how to retrieve data for a given dataset.
 ///
@@ -26,7 +27,7 @@ pub mod debug;
 /// ```
 pub trait DataSource: Send + Sync {
     /// Create a new `DataSource` with the given `AuthProvider`.
-    fn new<T: AuthProvider>(auth_provider: T) -> Self
+    fn new(auth_provider: Box<dyn AuthProvider>) -> Self
     where
         Self: Sized;
     /// Returns true if the given dataset supports streaming by this `DataSource`.
@@ -51,7 +52,7 @@ impl dyn DataSource + '_ {
             return self.stream_data_updates(dataset);
         }
 
-        // If a refresh_internal is defined, refresh the data on that interval.
+        // If a refresh_interval is defined, refresh the data on that interval.
         if let Some(refresh_interval) = self.get_all_data_refresh_interval(dataset) {
             return Box::pin(stream! {
                 loop {

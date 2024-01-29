@@ -1,3 +1,4 @@
+use super::Auth;
 use super::AuthProvider;
 
 pub struct SpiceAuth {
@@ -5,14 +6,17 @@ pub struct SpiceAuth {
 }
 
 impl AuthProvider for SpiceAuth {
+    #[must_use]
+    fn new(auth: &Auth) -> Self
+    where
+        Self: Sized,
+    {
+        SpiceAuth {
+            api_key: auth.key.clone(),
+        }
+    }
+
     fn get_token(&self) -> String {
         self.api_key.clone()
-    }
-}
-
-impl SpiceAuth {
-    #[must_use]
-    pub fn new(api_key: String) -> Self {
-        SpiceAuth { api_key }
     }
 }

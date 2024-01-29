@@ -24,7 +24,7 @@ impl MemTableBackend {
     pub fn new(ctx: Arc<SessionContext>, name: &str) -> Self {
         MemTableBackend {
             ctx,
-            name: name.to_string(),
+            name: name.replace('.', "_").to_string(),
         }
     }
 }
@@ -46,7 +46,7 @@ impl DataBackend for MemTableBackend {
             let table_exists = self
                 .ctx
                 .table_exist(TableReference::from(self.name.clone()))
-                .context(UnableToAddDataSnafu)?;
+                .unwrap_or(false);
 
             if !table_exists {
                 tracing::trace!(

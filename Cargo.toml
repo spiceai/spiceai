@@ -2,7 +2,7 @@
 members = [
     "bin/spiced/",
     "bin/flightpublisher/",
-    "bin/flightsubscriber/",
+    "bin/flightsubscriber/", "crates/spice_flight",
 ]
 default-members = ["bin/spiced"]
 

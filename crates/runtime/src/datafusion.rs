@@ -51,7 +51,7 @@ impl DataFusion {
 
     #[allow(clippy::needless_pass_by_value)]
     pub fn attach_backend(&mut self, dataset: &str, backend: DataBackendType) -> Result<()> {
-        let table_exists = self.ctx.table_exist(dataset).context(DataFusionSnafu)?;
+        let table_exists = self.ctx.table_exist(dataset).unwrap_or(false);
         if table_exists {
             return TableAlreadyExistsSnafu.fail();
         }
@@ -75,10 +75,14 @@ impl DataFusion {
     pub fn attach(
         &mut self,
         dataset: &str,
-        data_source: &'static dyn DataSource,
+        data_source: &'static mut dyn DataSource,
         backend: DataBackendType,
     ) -> Result<()> {
-        let table_exists = self.ctx.table_exist(dataset).context(DataFusionSnafu)?;
+        let internal_dataset = dataset.replace('.', "_");
+
+        // Appears the linter is wrong here, removing the borrow causes a compile error on lifetime of self.
+        #[allow(clippy::needless_borrows_for_generic_args)]
+        let table_exists = self.ctx.table_exist(&internal_dataset).unwrap_or(false);
         if table_exists {
             return TableAlreadyExistsSnafu.fail();
         }

@@ -4,20 +4,15 @@ use super::AuthProvider;
 pub struct NoneAuth {}
 
 impl AuthProvider for NoneAuth {
-    fn get_token(&self) -> String {
-        String::new()
-    }
-}
-
-impl NoneAuth {
     #[must_use]
-    pub fn new() -> Self {
+    fn new(_auth: &super::Auth) -> Self
+    where
+        Self: Sized,
+    {
         NoneAuth {}
     }
-}
 
-impl Default for NoneAuth {
-    fn default() -> Self {
-        Self::new()
+    fn get_token(&self) -> String {
+        String::new()
     }
 }

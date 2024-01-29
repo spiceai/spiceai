@@ -5,7 +5,8 @@ use std::net::SocketAddr;
 use app::App;
 use clap::Parser;
 use runtime::config::Config as RuntimeConfig;
-use runtime::{databackend, Runtime};
+use runtime::datasource::DataSource;
+use runtime::{databackend, datasource, Runtime};
 use snafu::prelude::*;
 
 #[derive(Debug, Snafu)]
@@ -52,18 +53,20 @@ pub async fn run(args: Args) -> Result<()> {
             );
         }
     }
-    tracing::info!("Spice Auth token: {}", auth.get("spice.ai").get_token());
 
     let mut df = runtime::datafusion::DataFusion::new();
 
-    // for ds in rt.app.datasets.iter() {
-    //     let data_source = datasource::DataSource::new(ds.clone());
-    //     rt.df.attach(
-    //         &ds.name,
-    //         data_source,
-    //         databackend::DataBackendType::default(),
-    //     )
-    // }
+    for ds in &app.datasets {
+        // TODO: Handle multiple data sources
+        let spice_auth = auth.get("spice.ai");
+        let data_source = Box::leak(Box::new(datasource::spiceai::SpiceAI::new(spice_auth)));
+        df.attach(
+            &ds.name,
+            data_source,
+            databackend::DataBackendType::default(),
+        )
+        .context(UnableToAttachDataSourceSnafu)?;
+    }
 
     // let debug_source = datasource::debug::DebugSource {
     //     sleep_duration: Duration::from_secs(1),
