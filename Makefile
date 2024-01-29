@@ -20,6 +20,15 @@ lint:
 		-Dclippy::unwrap_used \
 		-Dclippy::expect_used
 
+.PHONY: docker
+docker:
+	docker buildx build -t spiceai-rust:local-dev .
+
+.PHONY: docker-run
+docker-run:
+	docker stop spiceai && docker rm spiceai || true
+	docker run --name spiceai -p 3000:3000 -p 50051:50051 spiceai-rust:local-dev
+
 ################################################################################
 # Target: install                                                              #
 ################################################################################
