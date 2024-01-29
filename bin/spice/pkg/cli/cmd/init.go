@@ -22,7 +22,7 @@ spice init trader
 		podName := args[0]
 		podPath := "./spicepod.yaml"
 		if _, err := os.Stat(podPath); !os.IsNotExist(err) {
-			cmd.Println("Pod manifest already exists. Replace (y/n)? \n")
+			cmd.Println("Pod manifest already exists. Replace (y/n)?")
 			var confirm string
 			fmt.Scanf("%s", &confirm)
 			if strings.ToLower(strings.TrimSpace(confirm)) != "y" {
