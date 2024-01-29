@@ -5,6 +5,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/logrusorgru/aurora"
 	"github.com/spf13/cobra"
 	"github.com/spiceai/spiceai/bin/spice/pkg/spec"
 	"gopkg.in/yaml.v2"
@@ -46,7 +47,7 @@ spice init trader
 			return
 		}
 
-		cmd.Printf("Spice pod manifest initialized!\n")
+		cmd.Println(aurora.BrightGreen("Spice pod manifest initialized!"))
 	},
 }
 
