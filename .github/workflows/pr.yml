@@ -62,7 +62,7 @@ jobs:
           fi
           rustup toolchain install stable
 
-      - run: make build
+      - run: make ci
 
   build-docker:
     name: Build Docker Image

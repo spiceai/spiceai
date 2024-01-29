@@ -9,6 +9,11 @@ build:
 	make -C bin/spice
 	cargo build --release
 
+.PHONY: ci
+ci:
+	make -C bin/spice
+	cargo build --release --target-dir /workspace/spiceai/target
+
 .PHONY: lint
 lint:
 	go vet ./...
