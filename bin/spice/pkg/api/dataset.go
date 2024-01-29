@@ -3,12 +3,20 @@ package api
 import "time"
 
 const (
-	DATASOURCE_SPICE_AI   = "spice.ai"
-	DATASOURCE_SPICE_OSS  = "spice-oss"
-	DATASOURCE_DATABRICKS = "databricks"
+	DATA_SOURCE_SPICE_AI   = "spice.ai"
+	DATA_SOURCE_SPICE_OSS  = "spice-oss"
+	DATA_SOURCE_DATABRICKS = "databricks"
 
 	DATASET_TYPE_OVERWRITE = "overwrite"
 	DATASET_TYPE_APPEND    = "append"
+)
+
+var (
+	DATA_SOURCES = []string{
+		DATA_SOURCE_SPICE_AI,
+		DATA_SOURCE_SPICE_OSS,
+		DATA_SOURCE_DATABRICKS,
+	}
 )
 
 type Dataset struct {
@@ -25,11 +33,11 @@ type Acceleration struct {
 
 func DataSourceToHumanReadable(source string) string {
 	switch source {
-	case DATASOURCE_SPICE_AI:
+	case DATA_SOURCE_SPICE_AI:
 		return "Spice AI Platform (https://spice.ai)"
-	case DATASOURCE_SPICE_OSS:
+	case DATA_SOURCE_SPICE_OSS:
 		return "Another Spice.ai OSS instance"
-	case DATASOURCE_DATABRICKS:
+	case DATA_SOURCE_DATABRICKS:
 		return "Databricks (https://databricks.com)"
 	default:
 		return source

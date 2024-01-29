@@ -19,10 +19,6 @@ var datasetCmd = &cobra.Command{
 	Short: "Dataset operations",
 }
 
-var (
-	datasetSourceOptions = []string{api.DATASOURCE_SPICE_AI, api.DATASOURCE_SPICE_OSS, api.DATASOURCE_DATABRICKS}
-)
-
 var configureCmd = &cobra.Command{
 	Use:   "configure",
 	Short: "Configure a dataset",
@@ -44,7 +40,7 @@ spice dataset configure
 
 	datasetSourcePrompt:
 		cmd.Println("\nWhere is your dataset located?")
-		for i, option := range datasetSourceOptions {
+		for i, option := range api.DATA_SOURCES {
 			cmd.Printf("\t[%d] %s\n", i, api.DataSourceToHumanReadable(option))
 		}
 		datasetOptionString, err := reader.ReadString('\n')
@@ -54,11 +50,11 @@ spice dataset configure
 		}
 		datasetOptionString = strings.TrimSuffix(datasetOptionString, "\n")
 		datasetOption, err := strconv.ParseInt(datasetOptionString, 10, 64)
-		if err != nil || datasetOption < 0 || datasetOption >= int64(len(datasetSourceOptions)) {
+		if err != nil || datasetOption < 0 || datasetOption >= int64(len(api.DATA_SOURCES)) {
 			cmd.Println(aurora.BrightRed("Invalid input"))
 			goto datasetSourcePrompt
 		}
-		datasetSource := datasetSourceOptions[datasetOption]
+		datasetSource := api.DATA_SOURCES[datasetOption]
 
 		cmd.Print("\nLocally accelerate this dataset (y/n)? ")
 		accelerateDatasetString, err := reader.ReadString('\n')
