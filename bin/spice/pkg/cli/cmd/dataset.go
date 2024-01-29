@@ -11,7 +11,6 @@ import (
 	"github.com/logrusorgru/aurora"
 	"github.com/spf13/cobra"
 	"github.com/spiceai/spiceai/bin/spice/pkg/api"
-	"github.com/spiceai/spiceai/bin/spice/pkg/util"
 	"gopkg.in/yaml.v2"
 )
 
@@ -33,11 +32,6 @@ spice dataset configure
 # See more at: https://docs.spiceai.org/
 `,
 	Run: func(cmd *cobra.Command, args []string) {
-		err := checkLatestCliReleaseVersion()
-		if err != nil && util.IsDebug() {
-			cmd.PrintErrf("failed to check for latest CLI release version: %s\n", err.Error())
-		}
-
 		reader := bufio.NewReader(os.Stdin)
 
 		cmd.Print("What is the dataset name? ")
