@@ -26,7 +26,10 @@ jobs:
           go-version: ${{ env.GOVER }}
       
       - name: Install golangci-lint
-        run: curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(go env GOPATH)/bin
+        run: |
+          if ! command -v golangci-lint &> /dev/null ; then
+            curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(go env GOPATH)/bin
+          fi
 
       - name: Set up Rust
         run: |
