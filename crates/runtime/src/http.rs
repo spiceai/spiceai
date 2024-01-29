@@ -19,7 +19,9 @@ pub(crate) async fn start<A>(bind_address: A) -> Result<()>
 where
     A: ToSocketAddrs + Debug,
 {
-    let routes = Router::new().route("/", get(|| async { "Hello, World!" }));
+    let routes = Router::new()
+        .route("/", get(|| async { "Hello, World!" }))
+        .route("/health", get(|| async { "OK" }));
 
     let listener = TcpListener::bind(&bind_address)
         .await
