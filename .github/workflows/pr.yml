@@ -30,9 +30,9 @@ jobs:
 
       - name: Set up Rust
         run: |
+          echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> $GITHUB_PATH
           if ! command -v rustup &> /dev/null ; then
-            curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused -fsSL "https://sh.rustup.rs" | sh -s -- --default-toolchain none -y
-            echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> $GITHUB_PATH
+            curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused -fsSL "https://sh.rustup.rs" | sh -s -- --default-toolchain none -y  
           fi
           rustup toolchain install stable
 
@@ -54,9 +54,9 @@ jobs:
 
       - name: Set up Rust
         run: |
+          echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> $GITHUB_PATH
           if ! command -v rustup &> /dev/null ; then
-            curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused -fsSL "https://sh.rustup.rs" | sh -s -- --default-toolchain none -y
-            echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> $GITHUB_PATH
+            curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused -fsSL "https://sh.rustup.rs" | sh -s -- --default-toolchain none -y  
           fi
           rustup toolchain install stable
 
