@@ -13,7 +13,7 @@ on:
 jobs:
   lint:
     name: Run Go & Rust Linters
-    runs-on: ubuntu-latest
+    runs-on: rust
     env:
       GOVER: 1.21
 
