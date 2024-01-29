@@ -37,7 +37,7 @@ jobs:
 
   build:
     name: Build Go & Rust
-    runs-on: ubuntu-latest
+    runs-on: rust
     env:
       GOVER: 1.21
 
