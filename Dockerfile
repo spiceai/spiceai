@@ -10,16 +10,15 @@ RUN apt update \
     && rm -rf /var/lib/{apt,dpkg,cache,log}
 
 COPY . /build
-
 WORKDIR /build
+
+ARG CARGO_INCREMENTAL=yes
+ENV CARGO_INCREMENTAL=$CARGO_INCREMENTAL
 
 RUN \
   --mount=type=cache,id=spiceai_registry,sharing=locked,target=/usr/local/cargo/registry \
-  --mount=type=cache,id=spiceai_target,sharing=locked,target=/spiceai/target \
-  cargo build --target-dir /spiceai/target --release
-
-RUN ls -l /spiceai/target
-RUN ls -l /spiceai/target/release
+  --mount=type=cache,id=spiceai_target,sharing=locked,target=/build/target \
+  cargo build --release
 
 FROM debian:bookworm-slim
 
@@ -27,7 +26,7 @@ RUN apt update \
     && apt install --yes ca-certificates libssl3 --no-install-recommends \
     && rm -rf /var/lib/{apt,dpkg,cache,log}
 
-COPY --from=build /spiceai/target/release/spiced /usr/local/bin/spiced
+COPY --from=build /build/target/release/spiced /usr/local/bin/spiced
 
 EXPOSE 3000 50051
 
