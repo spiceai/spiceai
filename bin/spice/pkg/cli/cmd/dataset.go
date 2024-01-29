@@ -78,21 +78,21 @@ spice dataset configure
 		datasetBytes, err := yaml.Marshal(dataset)
 		if err != nil {
 			cmd.Println(err)
-			return
+			os.Exit(1)
 		}
 
 		dirPath := fmt.Sprintf("./datasets/%s", dataset.Name)
 		err = os.MkdirAll(dirPath, 0766)
 		if err != nil {
 			cmd.Println(err)
-			return
+			os.Exit(1)
 		}
 
 		filePath := fmt.Sprintf("%s/dataset.yaml", dirPath)
 		err = os.WriteFile(filePath, datasetBytes, 0766)
 		if err != nil {
 			cmd.Println(err)
-			return
+			os.Exit(1)
 		}
 
 		cmd.Println(aurora.BrightGreen(fmt.Sprintf("Dataset settings written to `%s`!", filePath)))
