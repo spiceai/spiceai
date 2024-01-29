@@ -4,22 +4,38 @@ use arrow_flight::{
     flight_service_client::FlightServiceClient,
     FlightData, FlightDescriptor,
 };
+use clap::Parser;
 use futures::{stream, StreamExt};
 use tonic::transport::Channel;
 use tracing_subscriber::filter::Directive;
+
+#[derive(Parser)]
+#[clap(about = "Spice.ai Flight Subscriber Utility")]
+pub struct Args {
+    #[arg(
+        long,
+        value_name = "FLIGHT_ENDPOINT",
+        default_value = "http://localhost:50051"
+    )]
+    pub flight_endpoint: String,
+
+    #[arg(long, value_name = "DATASET_PATH", default_value = "test")]
+    pub path: String,
+}
 
 /// Reads a Parquet file and sends it via DoPut to an Apache Arrow Flight endpoint.
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = init_tracing();
+    let args = Args::parse();
 
     // Set up the Flight client
-    let channel = Channel::from_static("http://localhost:50051")
+    let channel = Channel::from_shared(args.flight_endpoint)?
         .connect()
         .await?;
     let mut client = FlightServiceClient::new(channel);
 
-    let flight_descriptor = FlightDescriptor::new_path(vec!["test".to_string()]);
+    let flight_descriptor = FlightDescriptor::new_path(vec![args.path]);
     let subscription_request =
         stream::iter(vec![FlightData::new().with_descriptor(flight_descriptor)].into_iter());
 
