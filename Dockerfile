@@ -18,7 +18,8 @@ ENV CARGO_INCREMENTAL=$CARGO_INCREMENTAL
 RUN \
   --mount=type=cache,id=spiceai_registry,sharing=locked,target=/usr/local/cargo/registry \
   --mount=type=cache,id=spiceai_target,sharing=locked,target=/build/target \
-  cargo build --release
+  cargo build --release && \
+  cp /build/target/release/spiced /root/spiced
 
 FROM debian:bookworm-slim
 
@@ -26,7 +27,7 @@ RUN apt update \
     && apt install --yes ca-certificates libssl3 --no-install-recommends \
     && rm -rf /var/lib/{apt,dpkg,cache,log}
 
-COPY --from=build /build/target/release/spiced /usr/local/bin/spiced
+COPY --from=build /root/spiced /usr/local/bin/spiced
 
 EXPOSE 3000 50051
 
