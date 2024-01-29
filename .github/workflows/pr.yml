@@ -83,5 +83,3 @@ jobs:
           push: false
           tags: |
             ghcr.io/spiceai/spiceai-rust:ci
-          cache-from: type=local,src=/workspace/.buildx-cache
-          cache-to: type=local,dest=/workspace/.buildx-cache,mode=max
