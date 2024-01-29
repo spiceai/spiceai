@@ -13,10 +13,13 @@ COPY . /build
 WORKDIR /build
 
 ARG CARGO_INCREMENTAL=yes
-ENV CARGO_INCREMENTAL=$CARGO_INCREMENTAL
+ARG CARGO_NET_GIT_FETCH_WITH_CLI=false
+ENV CARGO_INCREMENTAL=$CARGO_INCREMENTAL \
+    CARGO_NET_GIT_FETCH_WITH_CLI=$CARGO_NET_GIT_FETCH_WITH_CLI
 
 RUN \
   --mount=type=cache,id=spiceai_registry,sharing=locked,target=/usr/local/cargo/registry \
+  --mount=type=cache,id=spiceai_git,sharing=locked,target=/usr/local/cargo/git \
   --mount=type=cache,id=spiceai_target,sharing=locked,target=/build/target \
   cargo build --release && \
   cp /build/target/release/spiced /root/spiced
