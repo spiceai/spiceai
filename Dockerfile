@@ -9,7 +9,12 @@ COPY . /build
 
 WORKDIR /build
 
-RUN cargo build --release
+RUN \
+  --mount=type=cache,id=spiceai_rustup,sharing=locked,target=/usr/local/rustup \
+  --mount=type=cache,id=spiceai_registry,sharing=locked,target=/usr/local/cargo/registry \
+  --mount=type=cache,id=spiceai_git,sharing=locked,target=/usr/local/cargo/git \
+  --mount=type=cache,id=spiceai_target,sharing=locked,target=/build/target \
+  cargo build --release
 
 FROM debian:bookworm-slim
 
