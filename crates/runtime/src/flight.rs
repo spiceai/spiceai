@@ -13,7 +13,8 @@ use snafu::prelude::*;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::broadcast;
+use tokio::sync::broadcast::Sender;
+use tokio::sync::{broadcast, RwLock};
 use tonic::metadata::MetadataValue;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
@@ -27,7 +28,22 @@ use arrow_flight::{
 
 pub struct Service {
     datafusion: Arc<DataFusion>,
-    channel: Arc<broadcast::Sender<DataUpdate>>,
+    channel_map: Arc<RwLock<HashMap<String, Arc<Sender<DataUpdate>>>>>,
+}
+
+async fn get_sender_channel(
+    channel_map: Arc<RwLock<HashMap<String, Arc<Sender<DataUpdate>>>>>,
+    path: String,
+) -> Option<Arc<Sender<DataUpdate>>> {
+    let channel_map_read = channel_map.read().await;
+    if channel_map_read.contains_key(&path) {
+        let Some(channel) = channel_map_read.get(&path) else {
+            return None;
+        };
+        Some(Arc::clone(channel))
+    } else {
+        None
+    }
 }
 
 #[tonic::async_trait]
@@ -188,13 +204,14 @@ impl FlightService for Service {
             batches.push(first_batch);
         }
 
-        let channel = Arc::clone(&self.channel);
+        let channel_map = Arc::clone(&self.channel_map);
 
         let response_stream = stream::unfold(streaming_flight, move |mut flight| {
             let schema = Arc::clone(&schema);
             let dictionaries_by_id = Arc::clone(&dictionaries_by_id);
             let backend = Arc::clone(&backend);
-            let channel = Arc::clone(&channel);
+            let path = path.clone();
+            let channel_map = Arc::clone(&channel_map);
             async move {
                 match flight.message().await {
                     Ok(Some(message)) => {
@@ -217,7 +234,9 @@ impl FlightService for Service {
                             update_type: UpdateType::Append,
                         };
 
-                        let _ = channel.send(data_update.clone());
+                        if let Some(channel) = get_sender_channel(channel_map, path).await {
+                            let _ = channel.send(data_update.clone());
+                        };
 
                         if let Err(err) = backend
                             .add_data(data_update)
@@ -258,11 +277,56 @@ impl FlightService for Service {
         Err(Status::unimplemented("Not yet implemented"))
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn do_exchange(
         &self,
-        _request: Request<Streaming<FlightData>>,
+        request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoExchangeStream>, Status> {
-        let rx = self.channel.subscribe();
+        let mut streaming_request = request.into_inner();
+        let req = streaming_request.next().await;
+        let Some(subscription_request) = req else {
+            return Err(Status::invalid_argument(
+                "Need to send a FlightData message with a FlightDescriptor to subscribe to",
+            ));
+        };
+
+        let subscription_request = match subscription_request {
+            Ok(subscription_request) => subscription_request,
+            Err(e) => {
+                return Err(Status::invalid_argument(format!(
+                    "Unable to read subscription request: {e:?}",
+                )));
+            }
+        };
+
+        // TODO: Support multiple flight descriptors to subscribe to multiple data sources
+        let Some(flight_descriptor) = subscription_request.flight_descriptor else {
+            return Err(Status::invalid_argument(
+                "Flight descriptor required to indicate which data to subscribe to",
+            ));
+        };
+
+        if flight_descriptor.path.is_empty() {
+            return Err(Status::invalid_argument(
+                "Flight descriptor needs to specify a path to indicate which data to subscribe to",
+            ));
+        };
+
+        let data_path = flight_descriptor.path.join(".");
+
+        let channel_map = Arc::clone(&self.channel_map);
+        let channel_map_read = channel_map.read().await;
+        let (tx, rx) = if let Some(channel) = channel_map_read.get(&data_path) {
+            (Arc::clone(channel), channel.subscribe())
+        } else {
+            drop(channel_map_read);
+            let mut channel_map_write = channel_map.write().await;
+            let (tx, rx) = broadcast::channel(100);
+            let tx = Arc::new(tx);
+            channel_map_write.insert(data_path.clone(), Arc::clone(&tx));
+            (tx, rx)
+        };
+
         let response_stream = stream::unfold(rx, move |mut rx| {
             let encoder = IpcDataGenerator::default();
             let mut tracker = DictionaryTracker::new(false);
@@ -306,6 +370,32 @@ impl FlightService for Service {
         })
         .flat_map(|x| x);
 
+        let datafusion = Arc::clone(&self.datafusion);
+        tokio::spawn(async move {
+            let Ok(df) = datafusion
+                .ctx
+                .sql(&format!(r#"SELECT * FROM "{data_path}""#))
+                .await
+            else {
+                return;
+            };
+            let Ok(results) = df.collect().await else {
+                return;
+            };
+            if results.is_empty() {
+                return;
+            }
+
+            for batch in &results {
+                let data_update = DataUpdate {
+                    data: vec![batch.clone()],
+                    log_sequence_number: None,
+                    update_type: UpdateType::Append,
+                };
+                let _ = tx.send(data_update);
+            }
+        });
+
         Ok(Response::new(response_stream.boxed()))
     }
 }
@@ -337,10 +427,9 @@ pub enum Error {
 type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub async fn start(bind_address: std::net::SocketAddr, df: Arc<DataFusion>) -> Result<()> {
-    let (channel, _rx) = broadcast::channel(100);
     let service = Service {
         datafusion: df.clone(),
-        channel: Arc::new(channel),
+        channel_map: Arc::new(RwLock::new(HashMap::new())),
     };
     let svc = FlightServiceServer::new(service);
 
