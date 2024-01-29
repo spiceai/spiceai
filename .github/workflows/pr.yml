@@ -29,10 +29,12 @@ jobs:
         run: curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(go env GOPATH)/bin
 
       - name: Set up Rust
-        uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          components: clippy,rustfmt
-          cache: false
+        run: |
+          if ! command -v rustup &> /dev/null ; then
+            curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused -fsSL "https://sh.rustup.rs" | sh -s -- --default-toolchain none -y
+            echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> $GITHUB_PATH
+          fi
+          rustup toolchain install stable
 
       - run: make lint
 
@@ -51,9 +53,12 @@ jobs:
           go-version: ${{ env.GOVER }}
 
       - name: Set up Rust
-        uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          cache: false
+        run: |
+          if ! command -v rustup &> /dev/null ; then
+            curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused -fsSL "https://sh.rustup.rs" | sh -s -- --default-toolchain none -y
+            echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> $GITHUB_PATH
+          fi
+          rustup toolchain install stable
 
       - run: make build
 
