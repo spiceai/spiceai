@@ -1,5 +1,3 @@
-#![allow(clippy::unwrap_used)]
-
 use super::DataSource;
 
 use std::future::Future;
