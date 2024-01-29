@@ -9,7 +9,6 @@ use std::time::Duration;
 
 use crate::auth::AuthProvider;
 use arrow::record_batch::RecordBatch;
-use futures::executor::block_on;
 use futures::StreamExt;
 use spice_flight::SpiceFlightClient;
 use tokio::sync::Mutex;
@@ -20,20 +19,22 @@ pub struct SpiceAI {
 }
 
 impl DataSource for SpiceAI {
-    fn new(auth_provider: Box<dyn AuthProvider>) -> Self
+    fn new(
+        auth_provider: Box<dyn AuthProvider>,
+    ) -> Pin<Box<dyn Future<Output = super::Result<Self>>>>
     where
         Self: Sized,
     {
-        SpiceAI {
-            spice_client: Arc::new(Mutex::new(
-                block_on(SpiceFlightClient::new(
-                    "https://flight.spiceai.io",
-                    auth_provider.get_token(),
-                ))
-                .unwrap(),
-            )),
-            sleep_duration: Duration::from_secs(10),
-        }
+        Box::pin(async move {
+            let spice_flight_client =
+                SpiceFlightClient::new("https://flight.spiceai.io", auth_provider.get_token())
+                    .await
+                    .map_err(|e| super::Error::UnableToCreateDataSource { source: e.into() })?;
+            Ok(SpiceAI {
+                spice_client: Arc::new(Mutex::new(spice_flight_client)),
+                sleep_duration: Duration::from_secs(10),
+            })
+        })
     }
 
     fn get_all_data_refresh_interval(&self, _dataset: &str) -> Option<Duration> {

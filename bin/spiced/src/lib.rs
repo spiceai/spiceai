@@ -1,6 +1,7 @@
 #![allow(clippy::missing_errors_doc)]
 
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use app::App;
 use clap::Parser;
@@ -12,18 +13,25 @@ use snafu::prelude::*;
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Unable to construct spice app"))]
-    UnableToConstructSpiceApp {
-        source: app::Error,
-    },
+    UnableToConstructSpiceApp { source: app::Error },
 
     #[snafu(display("Unable to start Spice Runtime servers"))]
-    UnableToStartServers {
-        source: runtime::Error,
-    },
+    UnableToStartServers { source: runtime::Error },
 
+    #[snafu(display("Unable to attach data source: {data_source}"))]
     UnableToAttachDataSource {
         source: runtime::datafusion::Error,
+        data_source: String,
     },
+
+    #[snafu(display("Unable to initialize data source: {data_source}"))]
+    UnableToInitializeDataSource {
+        source: runtime::datasource::Error,
+        data_source: String,
+    },
+
+    #[snafu(display("Unknown data source: {data_source}"))]
+    UnknownDataSource { data_source: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -47,7 +55,7 @@ pub async fn run(args: Args) -> Result<()> {
     match auth.parse_from_config() {
         Ok(()) => {}
         Err(e) => {
-            tracing::error!(
+            tracing::warn!(
                 "Unable to parse auth from config, proceeding without auth: {}",
                 e
             );
@@ -57,32 +65,49 @@ pub async fn run(args: Args) -> Result<()> {
     let mut df = runtime::datafusion::DataFusion::new();
 
     for ds in &app.datasets {
-        // TODO: Handle multiple data sources
-        let spice_auth = auth.get("spice.ai");
-        let data_source = Box::leak(Box::new(datasource::spiceai::SpiceAI::new(spice_auth)));
-        df.attach(
-            &ds.name,
-            data_source,
-            databackend::DataBackendType::default(),
-        )
-        .context(UnableToAttachDataSourceSnafu)?;
+        match &ds.source {
+            Some(source) => {
+                let data_source: Box<dyn DataSource> = match source.as_str() {
+                    "spice.ai" => {
+                        let spice_auth = auth.get(source);
+                        Box::new(
+                            datasource::spiceai::SpiceAI::new(spice_auth)
+                                .await
+                                .context(UnableToInitializeDataSourceSnafu {
+                                    data_source: source.clone(),
+                                })?,
+                        )
+                    }
+                    "debug" => Box::new(datasource::debug::DebugSource {
+                        sleep_duration: Duration::from_secs(1),
+                    }),
+                    _ => UnknownDataSourceSnafu {
+                        data_source: source.clone(),
+                    }
+                    .fail()?,
+                };
+
+                let data_source = Box::leak(data_source);
+
+                df.attach(
+                    &ds.name,
+                    data_source,
+                    databackend::DataBackendType::default(),
+                )
+                .context(UnableToAttachDataSourceSnafu {
+                    data_source: source,
+                })?;
+            }
+            None => {
+                df.attach_backend(&ds.name, databackend::DataBackendType::Memtable)
+                    .context(UnableToAttachDataSourceSnafu {
+                        data_source: "direct",
+                    })?;
+            }
+        }
+
+        tracing::trace!("Loaded dataset: {}", ds.name);
     }
-
-    // let debug_source = datasource::debug::DebugSource {
-    //     sleep_duration: Duration::from_secs(1),
-    // };
-    // // Ok to leak here since we want it to live for the lifetime of the process anyway
-    // let debug_source = Box::leak(Box::new(debug_source));
-
-    // df.attach(
-    //     "test-stream",
-    //     debug_source,
-    //     databackend::DataBackendType::default(),
-    // )
-    // .context(UnableToAttachDataSourceSnafu)?;
-
-    df.attach_backend("test", databackend::DataBackendType::Memtable)
-        .context(UnableToAttachDataSourceSnafu)?;
 
     let rt: Runtime = Runtime::new(args.runtime, app, df);
 

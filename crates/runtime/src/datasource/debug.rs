@@ -18,10 +18,13 @@ pub struct DebugSource {
 }
 
 impl DataSource for DebugSource {
-    fn new(_auth_provider: Box<dyn AuthProvider>) -> Self {
-        Self {
-            sleep_duration: Duration::from_secs(1),
-        }
+    fn new(
+        _auth_provider: Box<dyn AuthProvider>,
+    ) -> Pin<Box<dyn Future<Output = super::Result<Self>>>> {
+        Box::pin(async move {
+            let sleep_duration = Duration::from_secs(1);
+            Ok(Self { sleep_duration })
+        })
     }
 
     fn supports_data_streaming(&self, _dataset: &str) -> bool {
