@@ -43,31 +43,6 @@ impl DataBackend for MemTableBackend {
                 return Ok(());
             }
 
-            let table_exists = self
-                .ctx
-                .table_exist(TableReference::from(self.name.clone()))
-                .unwrap_or(false);
-
-            if !table_exists {
-                tracing::trace!(
-                    "Creating table for log sequence number {log_sequence_number:?}",
-                    log_sequence_number = data_update.log_sequence_number
-                );
-                let schema = data_update.data[0].schema();
-                let table = MemTable::try_new(schema, vec![data_update.data])
-                    .context(UnableToAddDataSnafu)?;
-
-                self.ctx
-                    .register_table(TableReference::from(self.name.clone()), Arc::new(table))
-                    .context(UnableToAddDataSnafu)?;
-
-                tracing::trace!(
-                    "Created table for log sequence number {log_sequence_number:?}",
-                    log_sequence_number = data_update.log_sequence_number
-                );
-                return Ok(());
-            }
-
             let log_sequence_number = data_update.log_sequence_number.unwrap_or_default();
 
             let table_update = MemTableUpdate {
