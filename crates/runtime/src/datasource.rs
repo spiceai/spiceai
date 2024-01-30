@@ -11,6 +11,7 @@ use crate::auth::AuthProvider;
 use crate::dataupdate::{DataUpdate, UpdateType};
 
 pub mod debug;
+pub mod dremio;
 pub mod spiceai;
 
 #[derive(Debug, Snafu)]

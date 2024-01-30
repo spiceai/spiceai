@@ -11,12 +11,12 @@ use flight_client::FlightClient;
 use futures::StreamExt;
 use tokio::sync::Mutex;
 
-pub struct SpiceAI {
-    pub spice_client: Arc<Mutex<FlightClient>>,
+pub struct Dremio {
+    pub dremio_client: Arc<Mutex<FlightClient>>,
     pub sleep_duration: Duration,
 }
 
-impl DataSource for SpiceAI {
+impl DataSource for Dremio {
     fn new(
         auth_provider: Box<dyn AuthProvider>,
     ) -> Pin<Box<dyn Future<Output = super::Result<Self>>>>
@@ -24,16 +24,16 @@ impl DataSource for SpiceAI {
         Self: Sized,
     {
         Box::pin(async move {
-            let spice_flight_client = FlightClient::new(
-                "https://flight.spiceai.io",
-                Some(auth_provider.get_token()),
+            let dremio_flight_client = FlightClient::new(
+                "http://dremio-4mimamg7rdeve.eastus.cloudapp.azure.com:32010",
                 None,
-                None,
+                Some(auth_provider.get_username()),
+                Some(auth_provider.get_password()),
             )
             .await
             .map_err(|e| super::Error::UnableToCreateDataSource { source: e.into() })?;
-            Ok(SpiceAI {
-                spice_client: Arc::new(Mutex::new(spice_flight_client)),
+            Ok(Dremio {
+                dremio_client: Arc::new(Mutex::new(dremio_flight_client)),
                 sleep_duration: Duration::from_secs(10),
             })
         })
@@ -47,7 +47,7 @@ impl DataSource for SpiceAI {
         &self,
         dataset: &str,
     ) -> Pin<Box<dyn Future<Output = Vec<RecordBatch>> + Send>> {
-        let client = self.spice_client.clone();
+        let client = self.dremio_client.clone();
         let dataset = dataset.to_string();
         Box::pin(async move {
             let flight_record_batch_stream_result = client
@@ -59,7 +59,7 @@ impl DataSource for SpiceAI {
             let mut flight_record_batch_stream = match flight_record_batch_stream_result {
                 Ok(stream) => stream,
                 Err(error) => {
-                    tracing::error!("Failed to query with spice client: {:?}", error);
+                    tracing::error!("Failed to query with dremio client: {:?}", error);
                     return vec![];
                 }
             };
@@ -71,7 +71,7 @@ impl DataSource for SpiceAI {
                         result_data.push(batch);
                     }
                     Err(error) => {
-                        tracing::error!("Failed to read batch from spice client: {:?}", error);
+                        tracing::error!("Failed to read batch from dremio client: {:?}", error);
                         return result_data;
                     }
                 };

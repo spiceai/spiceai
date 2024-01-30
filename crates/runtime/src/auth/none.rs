@@ -11,8 +11,4 @@ impl AuthProvider for NoneAuth {
     {
         NoneAuth {}
     }
-
-    fn get_token(&self) -> String {
-        String::new()
-    }
 }

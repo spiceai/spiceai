@@ -12,7 +12,7 @@ impl AuthProvider for SpiceAuth {
         Self: Sized,
     {
         SpiceAuth {
-            api_key: auth.key.clone(),
+            api_key: auth.key.clone().unwrap_or_default(),
         }
     }
 

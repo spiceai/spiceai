@@ -82,6 +82,14 @@ pub async fn run(args: Args) -> Result<()> {
                                 })?,
                         )
                     }
+                    "dremio" => {
+                        let dremio_auth = auth.get(auth_name);
+                        Box::new(datasource::dremio::Dremio::new(dremio_auth).await.context(
+                            UnableToInitializeDataSourceSnafu {
+                                data_source: source.clone(),
+                            },
+                        )?)
+                    }
                     "debug" => Box::new(datasource::debug::DebugSource {
                         sleep_duration: Duration::from_secs(1),
                     }),
