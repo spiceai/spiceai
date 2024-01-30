@@ -21,7 +21,7 @@ var (
 
 type Dataset struct {
 	Name         string        `json:"name,omitempty" csv:"name" yaml:"name,omitempty"`
-	Type         string        `json:"type,omitempty" csv:"type" 	yaml:"type,omitempty"`
+	Type         string        `json:"type,omitempty" csv:"type" yaml:"type,omitempty"`
 	Source       string        `json:"source,omitempty" csv:"source" yaml:"source,omitempty"`
 	Acceleration *Acceleration `json:"acceleration,omitempty" csv:"acceleration" yaml:"acceleration,omitempty"`
 }
