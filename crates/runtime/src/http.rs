@@ -21,7 +21,7 @@ where
 {
     let routes = Router::new()
         .route("/", get(|| async { "Hello, World!" }))
-        .route("/health", get(|| async { "OK" }));
+        .route("/health", get(|| async { "ok\n" }));
 
     let listener = TcpListener::bind(&bind_address)
         .await
