@@ -56,7 +56,7 @@ impl FlightClient {
     /// # Arguments
     ///
     /// * `username` - The username to use.
-    /// * `password` - The password to use, if using an API key with Spice then provide it as `password` with an empty username.
+    /// * `password` - The password to use.
     ///
     /// # Errors
     ///
