@@ -26,6 +26,7 @@ pub struct Dataset {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
 
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<String>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -58,5 +59,6 @@ pub mod acceleration {
     pub struct Acceleration {
         #[serde(default)]
         pub enabled: bool,
+        pub refresh: String,
     }
 }

@@ -20,15 +20,15 @@ var (
 )
 
 type Dataset struct {
-	Name         string        `json:"name,omitempty" csv:"name"`
-	Type         string        `json:"type,omitempty" csv:"type"`
-	Source       string        `json:"source,omitempty" csv:"source"`
-	Acceleration *Acceleration `json:"acceleration,omitempty" csv:"acceleration"`
+	Name         string        `json:"name,omitempty" csv:"name" yaml:"name,omitempty"`
+	Type         string        `json:"type,omitempty" csv:"type" 	yaml:"type,omitempty"`
+	Source       string        `json:"source,omitempty" csv:"source" yaml:"source,omitempty"`
+	Acceleration *Acceleration `json:"acceleration,omitempty" csv:"acceleration" yaml:"acceleration,omitempty"`
 }
 
 type Acceleration struct {
-	Enabled bool          `json:"enabled,omitempty" csv:"enabled"`
-	Refresh time.Duration `json:"refresh,omitempty" csv:"refresh"`
+	Enabled bool          `json:"enabled,omitempty" csv:"enabled" yaml:"enabled,omitempty"`
+	Refresh time.Duration `json:"refresh,omitempty" csv:"refresh" yaml:"refresh,omitempty"`
 }
 
 func DataSourceToHumanReadable(source string) string {

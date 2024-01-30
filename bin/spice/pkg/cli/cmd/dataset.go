@@ -81,7 +81,7 @@ spice dataset configure
 			os.Exit(1)
 		}
 
-		dirPath := fmt.Sprintf("./datasets/%s", dataset.Name)
+		dirPath := fmt.Sprintf("datasets/%s", dataset.Name)
 		err = os.MkdirAll(dirPath, 0766)
 		if err != nil {
 			cmd.Println(err)
@@ -93,6 +93,44 @@ spice dataset configure
 		if err != nil {
 			cmd.Println(err)
 			os.Exit(1)
+		}
+
+		spicepodBytes, err := os.ReadFile("spicepod.yaml")
+		if err != nil {
+			cmd.Println(err)
+			os.Exit(1)
+		}
+
+		var spicePod api.Pod
+		err = yaml.Unmarshal(spicepodBytes, &spicePod)
+		if err != nil {
+			cmd.Println(err)
+			os.Exit(1)
+		}
+
+		var datasetReferenced bool
+		for _, dataset := range spicePod.Datasets {
+			if dataset.From == dirPath {
+				datasetReferenced = true
+				break
+			}
+		}
+
+		if !datasetReferenced {
+			spicePod.Datasets = append(spicePod.Datasets, &api.Reference{
+				From: dirPath,
+			})
+			spicepodBytes, err = yaml.Marshal(spicePod)
+			if err != nil {
+				cmd.Println(err)
+				os.Exit(1)
+			}
+
+			err = os.WriteFile("spicepod.yaml", spicepodBytes, 0766)
+			if err != nil {
+				cmd.Println(err)
+				os.Exit(1)
+			}
 		}
 
 		cmd.Println(aurora.BrightGreen(fmt.Sprintf("Dataset settings written to `%s`!", filePath)))
