@@ -222,7 +222,7 @@ impl FlightService for Service {
                         ) {
                             Ok(batches) => batches,
                             Err(e) => {
-                                tracing::trace!("Unable to convert flight data to batches: {e:?}");
+                                tracing::error!("Unable to convert flight data to batches: {e:?}");
                                 return None;
                             }
                         };
