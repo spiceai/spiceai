@@ -29,7 +29,7 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct Runtime {
-    pub app: app::App,
+    pub app: Arc<app::App>,
     pub config: config::Config,
     pub df: Arc<DataFusion>,
 }
@@ -38,14 +38,14 @@ impl Runtime {
     #[must_use]
     pub fn new(config: Config, app: app::App, df: DataFusion) -> Self {
         Runtime {
-            app,
+            app: Arc::new(app),
             config,
             df: Arc::new(df),
         }
     }
 
     pub async fn start_servers(&self) -> Result<()> {
-        let http_server_future = http::start(self.config.http_bind_address);
+        let http_server_future = http::start(self.config.http_bind_address, self.app.clone());
         let flight_server_future = flight::start(self.config.flight_bind_address, self.df.clone());
 
         tokio::select! {
