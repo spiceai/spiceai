@@ -1,11 +1,8 @@
-use std::{fmt::Debug, sync::Arc};
+use std::fmt::Debug;
 
-use app::App;
+use axum::{routing::get, Router};
 use snafu::prelude::*;
 use tokio::net::{TcpListener, ToSocketAddrs};
-
-mod routes;
-mod v1;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -18,11 +15,13 @@ pub enum Error {
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
-pub(crate) async fn start<A>(bind_address: A, app: Arc<App>) -> Result<()>
+pub(crate) async fn start<A>(bind_address: A) -> Result<()>
 where
     A: ToSocketAddrs + Debug,
 {
-    let routes = routes::routes(app);
+    let routes = Router::new()
+        .route("/", get(|| async { "Hello, World!" }))
+        .route("/health", get(|| async { "ok\n" }));
 
     let listener = TcpListener::bind(&bind_address)
         .await

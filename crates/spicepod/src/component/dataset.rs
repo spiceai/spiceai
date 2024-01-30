@@ -59,8 +59,6 @@ pub mod acceleration {
     pub struct Acceleration {
         #[serde(default)]
         pub enabled: bool,
-
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub refresh: Option<String>,
+        pub refresh: String,
     }
 }
