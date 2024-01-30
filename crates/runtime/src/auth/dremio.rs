@@ -26,8 +26,4 @@ impl AuthProvider for DremioAuth {
     fn get_password(&self) -> String {
         self.password.clone()
     }
-
-    fn get_token(&self) -> String {
-        format!("{}:{}", self.username, self.password)
-    }
 }

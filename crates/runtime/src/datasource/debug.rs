@@ -20,6 +20,7 @@ pub struct DebugSource {
 impl DataSource for DebugSource {
     fn new(
         _auth_provider: Box<dyn AuthProvider>,
+        _url: String,
     ) -> Pin<Box<dyn Future<Output = super::Result<Self>>>> {
         Box::pin(async move {
             let sleep_duration = Duration::from_secs(1);

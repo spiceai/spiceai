@@ -75,20 +75,33 @@ pub async fn run(args: Args) -> Result<()> {
                     "spice.ai" => {
                         let spice_auth = auth.get(auth_name);
                         Box::new(
-                            datasource::spiceai::SpiceAI::new(spice_auth)
-                                .await
-                                .context(UnableToInitializeDataSourceSnafu {
+                            datasource::flight::Flight::new(
+                                spice_auth,
+                                "https://flight.spiceai.io".to_string(),
+                            )
+                            .await
+                            .context(
+                                UnableToInitializeDataSourceSnafu {
                                     data_source: source.clone(),
-                                })?,
+                                },
+                            )?,
                         )
                     }
                     "dremio" => {
                         let dremio_auth = auth.get(auth_name);
-                        Box::new(datasource::dremio::Dremio::new(dremio_auth).await.context(
-                            UnableToInitializeDataSourceSnafu {
-                                data_source: source.clone(),
-                            },
-                        )?)
+                        Box::new(
+                            datasource::flight::Flight::new(
+                                dremio_auth,
+                                "http://dremio-4mimamg7rdeve.eastus.cloudapp.azure.com:32010"
+                                    .to_string(),
+                            )
+                            .await
+                            .context(
+                                UnableToInitializeDataSourceSnafu {
+                                    data_source: source.clone(),
+                                },
+                            )?,
+                        )
                     }
                     "debug" => Box::new(datasource::debug::DebugSource {
                         sleep_duration: Duration::from_secs(1),

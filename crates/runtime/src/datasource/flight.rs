@@ -11,28 +11,29 @@ use flight_client::FlightClient;
 use futures::StreamExt;
 use tokio::sync::Mutex;
 
-pub struct Dremio {
-    pub dremio_client: Arc<Mutex<FlightClient>>,
+pub struct Flight {
+    pub client: Arc<Mutex<FlightClient>>,
     pub sleep_duration: Duration,
 }
 
-impl DataSource for Dremio {
+impl DataSource for Flight {
     fn new(
         auth_provider: Box<dyn AuthProvider>,
+        url: String,
     ) -> Pin<Box<dyn Future<Output = super::Result<Self>>>>
     where
         Self: Sized,
     {
         Box::pin(async move {
-            let dremio_flight_client = FlightClient::new(
-                "http://dremio-4mimamg7rdeve.eastus.cloudapp.azure.com:32010",
+            let flight_client = FlightClient::new(
+                url.as_str(),
                 auth_provider.get_username(),
                 auth_provider.get_password(),
             )
             .await
             .map_err(|e| super::Error::UnableToCreateDataSource { source: e.into() })?;
-            Ok(Dremio {
-                dremio_client: Arc::new(Mutex::new(dremio_flight_client)),
+            Ok(Flight {
+                client: Arc::new(Mutex::new(flight_client)),
                 sleep_duration: Duration::from_secs(10),
             })
         })
@@ -46,7 +47,7 @@ impl DataSource for Dremio {
         &self,
         dataset: &str,
     ) -> Pin<Box<dyn Future<Output = Vec<RecordBatch>> + Send>> {
-        let client = self.dremio_client.clone();
+        let client = self.client.clone();
         let dataset = dataset.to_string();
         Box::pin(async move {
             let flight_record_batch_stream_result = client
@@ -58,7 +59,7 @@ impl DataSource for Dremio {
             let mut flight_record_batch_stream = match flight_record_batch_stream_result {
                 Ok(stream) => stream,
                 Err(error) => {
-                    tracing::error!("Failed to query with dremio client: {:?}", error);
+                    tracing::error!("Failed to query with flight client: {:?}", error);
                     return vec![];
                 }
             };
@@ -70,7 +71,7 @@ impl DataSource for Dremio {
                         result_data.push(batch);
                     }
                     Err(error) => {
-                        tracing::error!("Failed to read batch from dremio client: {:?}", error);
+                        tracing::error!("Failed to read batch from flight client: {:?}", error);
                         return result_data;
                     }
                 };
