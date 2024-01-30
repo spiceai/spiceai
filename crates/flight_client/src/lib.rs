@@ -46,9 +46,8 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub struct FlightClient {
     token: Option<String>,
     flight_client: FlightServiceClient<Channel>,
-    api_key: Option<String>,
-    username: Option<String>,
-    password: Option<String>,
+    username: String,
+    password: String,
 }
 
 impl FlightClient {
@@ -56,25 +55,18 @@ impl FlightClient {
     ///
     /// # Arguments
     ///
-    /// * `api_key` - The API key to use.
-    /// * `username` - The username to use, ignored if `api_key` is provided.
-    /// * `password` - The password to use, ignored if `api_key` is provided.
+    /// * `username` - The username to use.
+    /// * `password` - The password to use, if using an API key with Spice then provide it as `password` with an empty username.
     ///
     /// # Errors
     ///
     /// Returns an error if unable to create the `FlightClient`.
-    pub async fn new(
-        url: &str,
-        api_key: Option<String>,
-        username: Option<String>,
-        password: Option<String>,
-    ) -> Result<Self> {
+    pub async fn new(url: &str, username: String, password: String) -> Result<Self> {
         let flight_channel = tls::new_tls_flight_channel(url)
             .await
             .context(UnableToConnectToServerSnafu)?;
 
         Ok(FlightClient {
-            api_key,
             flight_client: FlightServiceClient::new(flight_channel)
                 .max_encoding_message_size(100 * 1024 * 1024)
                 .max_decoding_message_size(100 * 1024 * 1024),
@@ -94,19 +86,11 @@ impl FlightClient {
     ///
     /// Returns an error if the query fails.
     pub async fn query(&mut self, query: &str) -> Result<FlightRecordBatchStream> {
-        if let Some(api_key) = self.api_key.clone() {
-            self.authenticate_basic_token("", api_key.as_str()).await?;
-        } else {
-            match (self.username.clone(), self.password.clone()) {
-                (Some(username), Some(password)) => {
-                    self.authenticate_basic_token(username.as_str(), password.as_str())
-                        .await?;
-                }
-                _ => {
-                    return UnauthorizedSnafu.fail();
-                }
-            }
-        }
+        self.authenticate_basic_token(
+            self.username.clone().as_str(),
+            self.password.clone().as_str(),
+        )
+        .await?;
 
         let descriptor = FlightDescriptor::new_cmd(query.to_string());
         let mut req = descriptor.into_request();

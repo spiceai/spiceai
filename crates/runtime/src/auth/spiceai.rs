@@ -16,6 +16,10 @@ impl AuthProvider for SpiceAuth {
         }
     }
 
+    fn get_password(&self) -> String {
+        self.api_key.clone()
+    }
+
     fn get_token(&self) -> String {
         self.api_key.clone()
     }

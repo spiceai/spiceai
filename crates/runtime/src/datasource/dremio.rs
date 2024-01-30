@@ -26,9 +26,8 @@ impl DataSource for Dremio {
         Box::pin(async move {
             let dremio_flight_client = FlightClient::new(
                 "http://dremio-4mimamg7rdeve.eastus.cloudapp.azure.com:32010",
-                None,
-                Some(auth_provider.get_username()),
-                Some(auth_provider.get_password()),
+                auth_provider.get_username(),
+                auth_provider.get_password(),
             )
             .await
             .map_err(|e| super::Error::UnableToCreateDataSource { source: e.into() })?;

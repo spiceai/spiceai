@@ -26,9 +26,8 @@ impl DataSource for SpiceAI {
         Box::pin(async move {
             let spice_flight_client = FlightClient::new(
                 "https://flight.spiceai.io",
-                Some(auth_provider.get_token()),
-                None,
-                None,
+                auth_provider.get_username(),
+                auth_provider.get_password(),
             )
             .await
             .map_err(|e| super::Error::UnableToCreateDataSource { source: e.into() })?;
