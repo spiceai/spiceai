@@ -57,6 +57,8 @@ impl FlightClient {
     /// # Arguments
     ///
     /// * `api_key` - The API key to use.
+    /// * `username` - The username to use, ignored if `api_key` is provided.
+    /// * `password` - The password to use, ignored if `api_key` is provided.
     ///
     /// # Errors
     ///
