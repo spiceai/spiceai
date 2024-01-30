@@ -78,7 +78,7 @@ impl DataFusion {
         data_source: &'static mut dyn DataSource,
         backend: DataBackendType,
     ) -> Result<()> {
-        let internal_dataset = dataset.replace('.', "_");
+        let internal_dataset = get_internal_dataset_name(dataset);
 
         // Appears the linter is wrong here, removing the borrow causes a compile error on lifetime of self.
         #[allow(clippy::needless_borrows_for_generic_args)]
@@ -123,4 +123,9 @@ impl Default for DataFusion {
     fn default() -> Self {
         Self::new()
     }
+}
+
+#[must_use]
+pub fn get_internal_dataset_name(dataset: &str) -> String {
+    dataset.replace('.', "_").replace('"', "")
 }

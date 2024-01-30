@@ -11,7 +11,7 @@ use crate::auth::AuthProvider;
 use crate::dataupdate::{DataUpdate, UpdateType};
 
 pub mod debug;
-pub mod spiceai;
+pub mod flight;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -37,7 +37,10 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// ```
 pub trait DataSource: Send + Sync {
     /// Create a new `DataSource` with the given `AuthProvider`.
-    fn new(auth_provider: Box<dyn AuthProvider>) -> Pin<Box<dyn Future<Output = Result<Self>>>>
+    fn new(
+        auth_provider: Box<dyn AuthProvider>,
+        url: String,
+    ) -> Pin<Box<dyn Future<Output = Result<Self>>>>
     where
         Self: Sized;
     /// Returns true if the given dataset supports streaming by this `DataSource`.

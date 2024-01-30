@@ -1200,6 +1200,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "flight_client"
+version = "0.10.0-alpha.0"
+dependencies = [
+ "arrow-flight",
+ "base64",
+ "bytes",
+ "futures",
+ "rustls",
+ "rustls-native-certs",
+ "rustls-pemfile",
+ "snafu 0.8.0",
+ "tonic",
+]
+
+[[package]]
 name = "flightpublisher"
 version = "0.10.0-alpha.0"
 dependencies = [
@@ -2554,12 +2569,12 @@ dependencies = [
  "clap",
  "datafusion",
  "dirs",
+ "flight_client",
  "futures",
  "futures-core",
  "metrics",
  "serde",
  "snafu 0.8.0",
- "spice_flight",
  "spicepod",
  "tokio",
  "tokio-stream",
@@ -2909,21 +2924,6 @@ checksum = "7b5fac59a5cb5dd637972e5fca70daf0523c9067fcdc4842f053dae04a18f8e9"
 dependencies = [
  "libc",
  "windows-sys 0.48.0",
-]
-
-[[package]]
-name = "spice_flight"
-version = "0.10.0-alpha.0"
-dependencies = [
- "arrow-flight",
- "base64",
- "bytes",
- "futures",
- "rustls",
- "rustls-native-certs",
- "rustls-pemfile",
- "snafu 0.8.0",
- "tonic",
 ]
 
 [[package]]

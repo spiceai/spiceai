@@ -24,7 +24,7 @@ impl MemTableBackend {
     pub fn new(ctx: Arc<SessionContext>, name: &str) -> Self {
         MemTableBackend {
             ctx,
-            name: name.replace('.', "_").to_string(),
+            name: crate::datafusion::get_internal_dataset_name(name),
         }
     }
 }

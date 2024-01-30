@@ -43,33 +43,36 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-pub struct SpiceFlightClient {
+pub struct FlightClient {
     token: Option<String>,
     flight_client: FlightServiceClient<Channel>,
-    api_key: String,
+    username: String,
+    password: String,
 }
 
-impl SpiceFlightClient {
-    /// Creates a new instance of `SpiceFlightClient`.
+impl FlightClient {
+    /// Creates a new instance of `FlightClient`.
     ///
     /// # Arguments
     ///
-    /// * `api_key` - The API key to use.
+    /// * `username` - The username to use.
+    /// * `password` - The password to use, if using an API key with Spice then provide it as `password` with an empty username.
     ///
     /// # Errors
     ///
-    /// Returns an error if unable to create the `SpiceFlightClient`.
-    pub async fn new(url: &str, api_key: String) -> Result<Self> {
+    /// Returns an error if unable to create the `FlightClient`.
+    pub async fn new(url: &str, username: String, password: String) -> Result<Self> {
         let flight_channel = tls::new_tls_flight_channel(url)
             .await
             .context(UnableToConnectToServerSnafu)?;
 
-        Ok(SpiceFlightClient {
-            api_key,
+        Ok(FlightClient {
             flight_client: FlightServiceClient::new(flight_channel)
                 .max_encoding_message_size(100 * 1024 * 1024)
                 .max_decoding_message_size(100 * 1024 * 1024),
             token: None,
+            username,
+            password,
         })
     }
 
@@ -83,7 +86,11 @@ impl SpiceFlightClient {
     ///
     /// Returns an error if the query fails.
     pub async fn query(&mut self, query: &str) -> Result<FlightRecordBatchStream> {
-        self.authenticate_basic_token(&self.api_key.clone()).await?;
+        self.authenticate_basic_token(
+            self.username.clone().as_str(),
+            self.password.clone().as_str(),
+        )
+        .await?;
 
         let descriptor = FlightDescriptor::new_cmd(query.to_string());
         let mut req = descriptor.into_request();
@@ -144,13 +151,13 @@ impl SpiceFlightClient {
         NoEndpointsFoundSnafu.fail()
     }
 
-    async fn authenticate_basic_token(&mut self, api_key: &str) -> Result<()> {
+    async fn authenticate_basic_token(&mut self, username: &str, password: &str) -> Result<()> {
         let cmd = HandshakeRequest {
             protocol_version: 0,
             payload: Bytes::default(),
         };
         let mut req = tonic::Request::new(stream::iter(vec![cmd]));
-        let val = BASE64_STANDARD.encode(format!(":{api_key}"));
+        let val = BASE64_STANDARD.encode(format!("{username}:{password}"));
         let val = format!("Basic {val}")
             .parse()
             .context(InvalidMetadataSnafu)?;

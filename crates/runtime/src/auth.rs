@@ -6,6 +6,7 @@ use dirs;
 use serde::Deserialize;
 use snafu::prelude::*;
 
+pub mod dremio;
 pub mod none;
 pub mod spiceai;
 
@@ -29,7 +30,15 @@ pub trait AuthProvider {
     fn new(auth: &Auth) -> Self
     where
         Self: Sized;
-    fn get_token(&self) -> String;
+    fn get_token(&self) -> String {
+        String::new()
+    }
+    fn get_username(&self) -> String {
+        String::new()
+    }
+    fn get_password(&self) -> String {
+        String::new()
+    }
 }
 
 #[allow(clippy::module_name_repetitions)]
@@ -44,7 +53,15 @@ pub type AuthConfig = HashMap<String, Auth>;
 #[derive(Deserialize, Default)]
 pub struct Auth {
     pub provider_type: String,
-    pub key: String,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -62,6 +79,7 @@ impl AuthProviders {
 
         match auth.provider_type.as_str() {
             "spice.ai" => Box::new(spiceai::SpiceAuth::new(auth)),
+            "dremio" => Box::new(dremio::DremioAuth::new(auth)),
             _ => Box::new(none::NoneAuth::new(&Auth::default())),
         }
     }
