@@ -1,7 +1,6 @@
 #![allow(clippy::missing_errors_doc)]
 
 use std::net::SocketAddr;
-use std::time::Duration;
 
 use app::App;
 use clap::Parser;
@@ -27,6 +26,14 @@ pub enum Error {
     #[snafu(display("Unable to initialize data source: {data_source}"))]
     UnableToInitializeDataSource {
         source: runtime::datasource::Error,
+        data_source: String,
+    },
+
+    #[snafu(display(
+        "A required parameter ({parameter}) is missing for data source: {data_source}",
+    ))]
+    RequiredParameterMissing {
+        parameter: &'static str,
         data_source: String,
     },
 
@@ -65,15 +72,12 @@ pub async fn run(args: Args) -> Result<()> {
     let mut df = runtime::datafusion::DataFusion::new();
 
     for ds in &app.datasets {
-        let mut from_parts: Vec<&str> = ds.from.split('/').collect();
-        let source = from_parts[0];
-        from_parts.remove(0);
-        let dataset_path = from_parts.join(".");
-
-        let data_source: Box<dyn DataSource> = match source {
+        let source = ds.source();
+        let source = source.as_str();
+        let data_source: Option<Box<dyn DataSource>> = match source {
             "spice.ai" => {
                 let spice_auth = auth.get(source);
-                Box::new(
+                Some(Box::new(
                     datasource::flight::Flight::new(
                         spice_auth,
                         "https://flight.spiceai.io".to_string(),
@@ -82,43 +86,50 @@ pub async fn run(args: Args) -> Result<()> {
                     .context(UnableToInitializeDataSourceSnafu {
                         data_source: source,
                     })?,
-                )
+                ))
             }
             "dremio" => {
                 let dremio_auth = auth.get(source);
-                Box::new(
-                    datasource::flight::Flight::new(
-                        dremio_auth,
-                        "http://dremio-4mimamg7rdeve.eastus.cloudapp.azure.com:32010".to_string(),
-                    )
-                    .await
-                    .context(UnableToInitializeDataSourceSnafu {
-                        data_source: source,
-                    })?,
-                )
+                let Some(url) = ds.params.get("url") else {
+                    RequiredParameterMissingSnafu {
+                        parameter: "url",
+                        data_source: source.to_owned(),
+                    }
+                    .fail()?
+                };
+                Some(Box::new(
+                    datasource::flight::Flight::new(dremio_auth, url.to_string())
+                        .await
+                        .context(UnableToInitializeDataSourceSnafu {
+                            data_source: source,
+                        })?,
+                ))
             }
-            "debug" => Box::new(datasource::debug::DebugSource {
-                sleep_duration: Duration::from_secs(1),
-            }),
+            "localhost" => None,
+            "debug" => Some(Box::new(datasource::debug::DebugSource {})),
             _ => UnknownDataSourceSnafu {
                 data_source: source,
             }
             .fail()?,
         };
 
-        let data_source = Box::leak(data_source);
+        match data_source {
+            Some(data_source) => {
+                let data_source = Box::leak(data_source);
 
-        let fq_dataset_name = format!("{}.{}", dataset_path, ds.name);
-        df.attach(
-            fq_dataset_name.as_str(),
-            data_source,
-            databackend::DataBackendType::default(),
-        )
-        .context(UnableToAttachDataSourceSnafu {
-            data_source: source,
-        })?;
+                df.attach(ds, data_source, databackend::DataBackendType::default())
+                    .context(UnableToAttachDataSourceSnafu {
+                        data_source: source,
+                    })?;
+            }
+            None => df
+                .attach_backend(&ds.name, databackend::DataBackendType::default())
+                .context(UnableToAttachDataSourceSnafu {
+                    data_source: source,
+                })?,
+        }
 
-        tracing::trace!("Loaded dataset: {}", fq_dataset_name);
+        tracing::trace!("Loaded dataset: {}", ds.name);
     }
 
     let rt: Runtime = Runtime::new(args.runtime, app, df);

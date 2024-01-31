@@ -11,34 +11,26 @@ use arrow::{
 };
 use async_stream::stream;
 use futures_core::stream::BoxStream;
+use spicepod::component::dataset::Dataset;
 
 #[allow(clippy::module_name_repetitions)]
-pub struct DebugSource {
-    pub sleep_duration: Duration,
-}
+pub struct DebugSource {}
 
 impl DataSource for DebugSource {
     fn new(
         _auth_provider: Box<dyn AuthProvider>,
         _url: String,
     ) -> Pin<Box<dyn Future<Output = super::Result<Self>>>> {
-        Box::pin(async move {
-            let sleep_duration = Duration::from_secs(1);
-            Ok(Self { sleep_duration })
-        })
+        Box::pin(async move { Ok(Self {}) })
     }
 
-    fn supports_data_streaming(&self, _dataset: &str) -> bool {
+    fn supports_data_streaming(&self, _dataset: &Dataset) -> bool {
         true
-    }
-
-    fn get_all_data_refresh_interval(&self, _dataset: &str) -> Option<Duration> {
-        Some(self.sleep_duration)
     }
 
     fn get_all_data(
         &self,
-        _dataset: &str,
+        _dataset: &Dataset,
     ) -> Pin<Box<dyn Future<Output = Vec<RecordBatch>> + Send>> {
         Box::pin(async move {
             let schema = Arc::new(Schema::new(vec![
@@ -59,8 +51,12 @@ impl DataSource for DebugSource {
         })
     }
 
-    fn stream_data_updates<'a>(&self, _dataset: &str) -> BoxStream<'a, DataUpdate> {
-        let sleep_duration = self.sleep_duration;
+    fn stream_data_updates<'a>(&self, dataset: &Dataset) -> BoxStream<'a, DataUpdate> {
+        let sleep_duration = dataset.refresh_interval();
+        let sleep_duration = match sleep_duration {
+            Some(duration) => duration,
+            None => Duration::from_secs(1),
+        };
         Box::pin(stream! {
           loop {
               tokio::time::sleep(sleep_duration).await;

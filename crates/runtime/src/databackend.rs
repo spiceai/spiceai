@@ -33,15 +33,12 @@ pub trait DataBackend: Send + Sync {
         data_update: DataUpdate,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
 }
+
 impl dyn DataBackend {
     #[must_use]
-    pub fn get(
-        ctx: &Arc<SessionContext>,
-        dataset: &str,
-        backend_type: &DataBackendType,
-    ) -> Box<Self> {
+    pub fn new(ctx: &Arc<SessionContext>, name: &str, backend_type: &DataBackendType) -> Box<Self> {
         match backend_type {
-            DataBackendType::Memtable => Box::new(MemTableBackend::new(Arc::clone(ctx), dataset)),
+            DataBackendType::Memtable => Box::new(MemTableBackend::new(Arc::clone(ctx), name)),
             DataBackendType::DuckDB => {
                 todo!("DuckDB backend not implemented yet");
             }

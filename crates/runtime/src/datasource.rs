@@ -1,6 +1,6 @@
 use snafu::prelude::*;
+use spicepod::component::dataset::Dataset;
 use std::pin::Pin;
-use std::time::Duration;
 
 use arrow::record_batch::RecordBatch;
 use async_stream::stream;
@@ -43,30 +43,32 @@ pub trait DataSource: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<Self>>>>
     where
         Self: Sized;
+
     /// Returns true if the given dataset supports streaming by this `DataSource`.
-    fn supports_data_streaming(&self, _dataset: &str) -> bool {
+    fn supports_data_streaming(&self, _dataset: &Dataset) -> bool {
         false
     }
+
     /// Returns a stream of `DataUpdates` for the given dataset.
-    fn stream_data_updates<'a>(&self, dataset: &str) -> BoxStream<'a, DataUpdate> {
-        panic!("stream_data_updates not implemented for {dataset}")
+    fn stream_data_updates<'a>(&self, dataset: &Dataset) -> BoxStream<'a, DataUpdate> {
+        panic!("stream_data_updates not implemented for {}", dataset.name)
     }
-    fn get_all_data_refresh_interval(&self, _dataset: &str) -> Option<Duration> {
-        None
-    }
+
     /// Returns all data for the given dataset.
-    fn get_all_data(&self, dataset: &str)
-        -> Pin<Box<dyn Future<Output = Vec<RecordBatch>> + Send>>;
+    fn get_all_data(
+        &self,
+        dataset: &Dataset,
+    ) -> Pin<Box<dyn Future<Output = Vec<RecordBatch>> + Send>>;
 }
 
 impl dyn DataSource + '_ {
-    pub fn get_data<'a>(&'a self, dataset: &'a str) -> BoxStream<'_, DataUpdate> {
+    pub fn get_data<'a>(&'a self, dataset: &'a Dataset) -> BoxStream<'_, DataUpdate> {
         if self.supports_data_streaming(dataset) {
             return self.stream_data_updates(dataset);
         }
 
         // If a refresh_interval is defined, refresh the data on that interval.
-        if let Some(refresh_interval) = self.get_all_data_refresh_interval(dataset) {
+        if let Some(refresh_interval) = dataset.refresh_interval() {
             return Box::pin(stream! {
                 loop {
                     tokio::time::sleep(refresh_interval).await;

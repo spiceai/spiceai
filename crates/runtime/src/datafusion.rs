@@ -7,6 +7,7 @@ use datafusion::error::DataFusionError;
 use datafusion::execution::{context::SessionContext, options::ParquetReadOptions};
 use futures::StreamExt;
 use snafu::prelude::*;
+use spicepod::component::dataset::Dataset;
 use tokio::task;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -50,17 +51,17 @@ impl DataFusion {
     }
 
     #[allow(clippy::needless_pass_by_value)]
-    pub fn attach_backend(&mut self, dataset: &str, backend: DataBackendType) -> Result<()> {
-        let table_exists = self.ctx.table_exist(dataset).unwrap_or(false);
+    pub fn attach_backend(&mut self, table_name: &str, backend: DataBackendType) -> Result<()> {
+        let table_exists = self.ctx.table_exist(table_name).unwrap_or(false);
         if table_exists {
             return TableAlreadyExistsSnafu.fail();
         }
 
         let data_backend: Box<dyn DataBackend> =
-            <dyn DataBackend>::get(&self.ctx, dataset, &backend);
+            <dyn DataBackend>::new(&self.ctx, table_name, &backend);
 
         self.backends
-            .insert(dataset.to_string(), Arc::new(data_backend));
+            .insert(table_name.to_string(), Arc::new(data_backend));
 
         Ok(())
     }
@@ -74,25 +75,22 @@ impl DataFusion {
     #[allow(clippy::needless_pass_by_value)]
     pub fn attach(
         &mut self,
-        dataset: &str,
+        dataset: &Dataset,
         data_source: &'static mut dyn DataSource,
         backend: DataBackendType,
     ) -> Result<()> {
-        let internal_dataset = get_internal_dataset_name(dataset);
-
-        // Appears the linter is wrong here, removing the borrow causes a compile error on lifetime of self.
-        #[allow(clippy::needless_borrows_for_generic_args)]
-        let table_exists = self.ctx.table_exist(&internal_dataset).unwrap_or(false);
+        let table_name = dataset.name.as_str();
+        let table_exists = self.ctx.table_exist(table_name).unwrap_or(false);
         if table_exists {
             return TableAlreadyExistsSnafu.fail();
         }
 
         let data_backend: Box<dyn DataBackend> =
-            <dyn DataBackend>::get(&self.ctx, dataset, &backend);
+            <dyn DataBackend>::new(&self.ctx, table_name, &backend);
 
-        let dataset = dataset.to_string();
+        let dataset_clone = dataset.clone();
         let task_handle = task::spawn(async move {
-            let mut stream = data_source.get_data(dataset.as_str());
+            let mut stream = data_source.get_data(&dataset_clone);
             loop {
                 let future_result = stream.next().await;
                 match future_result {
@@ -123,9 +121,4 @@ impl Default for DataFusion {
     fn default() -> Self {
         Self::new()
     }
-}
-
-#[must_use]
-pub fn get_internal_dataset_name(dataset: &str) -> String {
-    dataset.replace('.', "_").replace('"', "")
 }
