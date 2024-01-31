@@ -8,6 +8,7 @@ use crate::component::{dataset::Dataset, ComponentOrReference};
 #[serde(rename_all = "lowercase")]
 pub enum SpicepodVersion {
     V1Beta1,
+    V1Beta2,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

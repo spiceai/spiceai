@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"fmt"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
@@ -38,23 +37,13 @@ spice dataset configure
 		}
 		datasetName = strings.TrimSuffix(datasetName, "\n")
 
-	datasetSourcePrompt:
-		cmd.Println("\nWhere is your dataset located?")
-		for i, option := range api.DATA_SOURCES {
-			cmd.Printf("\t[%d] %s\n", i, api.DataSourceToHumanReadable(option))
-		}
-		datasetOptionString, err := reader.ReadString('\n')
+		cmd.Print("\nWhere is your dataset located? ")
+		datasetLocation, err := reader.ReadString('\n')
 		if err != nil {
 			cmd.Println(err.Error())
 			os.Exit(1)
 		}
-		datasetOptionString = strings.TrimSuffix(datasetOptionString, "\n")
-		datasetOption, err := strconv.ParseInt(datasetOptionString, 10, 64)
-		if err != nil || datasetOption < 0 || datasetOption >= int64(len(api.DATA_SOURCES)) {
-			cmd.Println(aurora.BrightRed("Invalid input"))
-			goto datasetSourcePrompt
-		}
-		datasetSource := api.DATA_SOURCES[datasetOption]
+		datasetLocation = strings.TrimSuffix(datasetLocation, "\n")
 
 		cmd.Print("\nLocally accelerate this dataset (y/n)? ")
 		accelerateDatasetString, err := reader.ReadString('\n')
@@ -66,12 +55,13 @@ spice dataset configure
 		accelerateDataset := strings.ToLower(accelerateDatasetString) == "y"
 
 		dataset := api.Dataset{
-			Name:   datasetName,
-			Type:   api.DATASET_TYPE_OVERWRITE,
-			Source: datasetSource,
+			From: datasetLocation,
+			Name: datasetName,
 			Acceleration: &api.Acceleration{
-				Enabled: accelerateDataset,
-				Refresh: time.Hour,
+				Enabled:         accelerateDataset,
+				RefreshInterval: time.Hour,
+				RefreshMode:     api.REFRESH_MODE_FULL,
+				Retention:       30 * time.Minute,
 			},
 		}
 

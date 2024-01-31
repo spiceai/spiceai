@@ -52,8 +52,6 @@ pub type AuthConfig = HashMap<String, Auth>;
 
 #[derive(Deserialize, Default)]
 pub struct Auth {
-    pub provider_type: String,
-
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
 
@@ -70,14 +68,14 @@ impl AuthProviders {
     #[must_use]
     pub fn get(&self, name: &str) -> Box<dyn AuthProvider> {
         let auth = if let Some(auth) = self.auth.get(name) {
-            tracing::trace!("Using auth provider: {}", auth.provider_type);
+            tracing::trace!("Using auth provider: {}", name);
             auth
         } else {
             tracing::trace!("No auth provider found for {}", name);
             return Box::new(none::NoneAuth::new(&Auth::default()));
         };
 
-        match auth.provider_type.as_str() {
+        match name {
             "spice.ai" => Box::new(spiceai::SpiceAuth::new(auth)),
             "dremio" => Box::new(dremio::DremioAuth::new(auth)),
             _ => Box::new(none::NoneAuth::new(&Auth::default())),

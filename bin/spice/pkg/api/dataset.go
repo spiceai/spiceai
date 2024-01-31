@@ -3,43 +3,22 @@ package api
 import "time"
 
 const (
-	DATA_SOURCE_SPICE_AI  = "spice.ai"
-	DATA_SOURCE_SPICE_OSS = "spice-oss"
-	DATA_SOURCE_DREMIO    = "dremio"
-
-	DATASET_TYPE_OVERWRITE = "overwrite"
-	DATASET_TYPE_APPEND    = "append"
-)
-
-var (
-	DATA_SOURCES = []string{
-		DATA_SOURCE_SPICE_AI,
-		DATA_SOURCE_SPICE_OSS,
-		DATA_SOURCE_DREMIO,
-	}
+	REFRESH_MODE_FULL   = "full"
+	REFRESH_MODE_APPEND = "append"
 )
 
 type Dataset struct {
-	Name         string        `json:"name,omitempty" csv:"name" yaml:"name,omitempty"`
-	Type         string        `json:"type,omitempty" csv:"type" yaml:"type,omitempty"`
-	Source       string        `json:"source,omitempty" csv:"source" yaml:"source,omitempty"`
-	Acceleration *Acceleration `json:"acceleration,omitempty" csv:"acceleration" yaml:"acceleration,omitempty"`
+	From         string            `json:"from,omitempty" csv:"from" yaml:"from,omitempty"`
+	Name         string            `json:"name,omitempty" csv:"name" yaml:"name,omitempty"`
+	Params       map[string]string `json:"params,omitempty" csv:"params" yaml:"params,omitempty"`
+	Acceleration *Acceleration     `json:"acceleration,omitempty" csv:"acceleration" yaml:"acceleration,omitempty"`
 }
 
 type Acceleration struct {
-	Enabled bool          `json:"enabled,omitempty" csv:"enabled" yaml:"enabled,omitempty"`
-	Refresh time.Duration `json:"refresh,omitempty" csv:"refresh" yaml:"refresh,omitempty"`
-}
-
-func DataSourceToHumanReadable(source string) string {
-	switch source {
-	case DATA_SOURCE_SPICE_AI:
-		return "Spice AI Platform (https://spice.ai)"
-	case DATA_SOURCE_SPICE_OSS:
-		return "Another Spice.ai OSS instance"
-	case DATA_SOURCE_DREMIO:
-		return "Dremio (https://www.dremio.com)"
-	default:
-		return source
-	}
+	Enabled         bool          `json:"enabled,omitempty" csv:"enabled" yaml:"enabled,omitempty"`
+	Mode            string        `json:"mode,omitempty" csv:"mode" yaml:"mode,omitempty"`
+	Engine          string        `json:"engine,omitempty" csv:"engine" yaml:"engine,omitempty"`
+	RefreshInterval time.Duration `json:"refresh_interval,omitempty" csv:"refresh_interval" yaml:"refresh_interval,omitempty"`
+	RefreshMode     string        `json:"refresh_mode,omitempty" csv:"refresh_mode" yaml:"refresh_mode,omitempty"`
+	Retention       time.Duration `json:"retention,omitempty" csv:"retention" yaml:"retention,omitempty"`
 }

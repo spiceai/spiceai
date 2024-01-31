@@ -7,7 +7,7 @@ import (
 
 	"github.com/logrusorgru/aurora"
 	"github.com/spf13/cobra"
-	"github.com/spiceai/spiceai/bin/spice/pkg/spec"
+	"github.com/spiceai/spiceai/bin/spice/pkg/api"
 	"gopkg.in/yaml.v2"
 )
 
@@ -31,8 +31,10 @@ spice init trader
 			}
 		}
 
-		skeletonPod := &spec.PodSpec{
-			Name: podName,
+		skeletonPod := &api.Pod{
+			Name:    podName,
+			Version: "v1beta2",
+			Kind:    "Spicepod",
 		}
 
 		skeletonPodContentBytes, err := yaml.Marshal(skeletonPod)

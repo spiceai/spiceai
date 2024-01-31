@@ -37,8 +37,7 @@ spice login
 		}
 
 		mergeAuthConfig(cmd, api.AUTH_TYPE_SPICE_AI, &api.Auth{
-			Key:          key,
-			ProviderType: api.AUTH_TYPE_SPICE_AI,
+			Key: key,
 		})
 
 		cmd.Println(aurora.BrightGreen("Successfully logged in to Spice.ai"))
@@ -78,9 +77,8 @@ spice login dremio --username <username> --password <password>
 		}
 
 		mergeAuthConfig(cmd, api.AUTH_TYPE_DREMIO, &api.Auth{
-			Password:     password,
-			Username:     username,
-			ProviderType: api.AUTH_TYPE_DREMIO,
+			Password: password,
+			Username: username,
 		},
 		)
 

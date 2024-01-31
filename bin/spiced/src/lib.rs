@@ -65,73 +65,60 @@ pub async fn run(args: Args) -> Result<()> {
     let mut df = runtime::datafusion::DataFusion::new();
 
     for ds in &app.datasets {
-        match &ds.source {
-            Some(source) => {
-                let auth_name = match &ds.auth {
-                    Some(auth_name) => auth_name,
-                    None => source,
-                };
-                let data_source: Box<dyn DataSource> = match source.as_str() {
-                    "spice.ai" => {
-                        let spice_auth = auth.get(auth_name);
-                        Box::new(
-                            datasource::flight::Flight::new(
-                                spice_auth,
-                                "https://flight.spiceai.io".to_string(),
-                            )
-                            .await
-                            .context(
-                                UnableToInitializeDataSourceSnafu {
-                                    data_source: source.clone(),
-                                },
-                            )?,
-                        )
-                    }
-                    "dremio" => {
-                        let dremio_auth = auth.get(auth_name);
-                        Box::new(
-                            datasource::flight::Flight::new(
-                                dremio_auth,
-                                "http://dremio-4mimamg7rdeve.eastus.cloudapp.azure.com:32010"
-                                    .to_string(),
-                            )
-                            .await
-                            .context(
-                                UnableToInitializeDataSourceSnafu {
-                                    data_source: source.clone(),
-                                },
-                            )?,
-                        )
-                    }
-                    "debug" => Box::new(datasource::debug::DebugSource {
-                        sleep_duration: Duration::from_secs(1),
-                    }),
-                    _ => UnknownDataSourceSnafu {
-                        data_source: source.clone(),
-                    }
-                    .fail()?,
-                };
+        let mut from_parts: Vec<&str> = ds.from.split('/').collect();
+        let source = from_parts[0];
+        from_parts.remove(0);
+        let dataset_path = from_parts.join(".");
 
-                let data_source = Box::leak(data_source);
-
-                df.attach(
-                    &ds.name,
-                    data_source,
-                    databackend::DataBackendType::default(),
+        let data_source: Box<dyn DataSource> = match source {
+            "spice.ai" => {
+                let spice_auth = auth.get(source);
+                Box::new(
+                    datasource::flight::Flight::new(
+                        spice_auth,
+                        "https://flight.spiceai.io".to_string(),
+                    )
+                    .await
+                    .context(UnableToInitializeDataSourceSnafu {
+                        data_source: source,
+                    })?,
                 )
-                .context(UnableToAttachDataSourceSnafu {
-                    data_source: source,
-                })?;
             }
-            None => {
-                df.attach_backend(&ds.name, databackend::DataBackendType::Memtable)
-                    .context(UnableToAttachDataSourceSnafu {
-                        data_source: "direct",
-                    })?;
+            "dremio" => {
+                let dremio_auth = auth.get(source);
+                Box::new(
+                    datasource::flight::Flight::new(
+                        dremio_auth,
+                        "http://dremio-4mimamg7rdeve.eastus.cloudapp.azure.com:32010".to_string(),
+                    )
+                    .await
+                    .context(UnableToInitializeDataSourceSnafu {
+                        data_source: source,
+                    })?,
+                )
             }
-        }
+            "debug" => Box::new(datasource::debug::DebugSource {
+                sleep_duration: Duration::from_secs(1),
+            }),
+            _ => UnknownDataSourceSnafu {
+                data_source: source,
+            }
+            .fail()?,
+        };
 
-        tracing::trace!("Loaded dataset: {}", ds.name);
+        let data_source = Box::leak(data_source);
+
+        let fq_dataset_name = format!("{}.{}", dataset_path, ds.name);
+        df.attach(
+            fq_dataset_name.as_str(),
+            data_source,
+            databackend::DataBackendType::default(),
+        )
+        .context(UnableToAttachDataSourceSnafu {
+            data_source: source,
+        })?;
+
+        tracing::trace!("Loaded dataset: {}", fq_dataset_name);
     }
 
     let rt: Runtime = Runtime::new(args.runtime, app, df);
