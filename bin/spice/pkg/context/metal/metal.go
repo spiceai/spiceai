@@ -63,7 +63,7 @@ func (c *MetalContext) Init() error {
 
 func (c *MetalContext) Version() (string, error) {
 	spiceCMD := c.binaryFilePath(constants.SpiceRuntimeFilename)
-	version, err := exec.Command(spiceCMD, "version").Output()
+	version, err := exec.Command(spiceCMD, "--version").Output()
 	if err != nil {
 		return "", err
 	}

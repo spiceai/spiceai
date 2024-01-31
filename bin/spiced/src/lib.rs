@@ -51,6 +51,10 @@ pub struct Args {
     #[arg(long, value_name = "BIND_ADDRESS", help_heading = "Metrics")]
     pub metrics: Option<SocketAddr>,
 
+    /// Print the version and exit.
+    #[arg(long)]
+    pub version: bool,
+
     /// All runtime related arguments
     #[clap(flatten)]
     pub runtime: RuntimeConfig,
