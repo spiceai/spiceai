@@ -106,7 +106,7 @@ spice dataset configure
 
 		var datasetReferenced bool
 		for _, dataset := range spicePod.Datasets {
-			if dataset.Import == dirPath {
+			if dataset.Ref == dirPath {
 				datasetReferenced = true
 				break
 			}
@@ -114,7 +114,7 @@ spice dataset configure
 
 		if !datasetReferenced {
 			spicePod.Datasets = append(spicePod.Datasets, &api.Reference{
-				Import: dirPath,
+				Ref: dirPath,
 			})
 			spicepodBytes, err = yaml.Marshal(spicePod)
 			if err != nil {
