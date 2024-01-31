@@ -1,3 +1,5 @@
+use async_stream::stream;
+use futures_core::stream::BoxStream;
 use snafu::prelude::*;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -6,6 +8,8 @@ use std::{collections::HashMap, future::Future};
 use spicepod::component::dataset::Dataset;
 
 use crate::auth::AuthProvider;
+use crate::dataupdate::{DataUpdate, UpdateType};
+use spicepod::component::dataset::acceleration::RefreshMode;
 
 use super::{flight::Flight, DataSource};
 
@@ -39,6 +43,26 @@ impl DataSource for SpiceAI {
             Ok(Self {
                 flight: flight.await?,
             })
+        })
+    }
+
+    fn supports_data_streaming(&self, dataset: &Dataset) -> bool {
+        dataset
+            .acceleration
+            .as_ref()
+            .map_or(false, |acc| acc.refresh_mode == RefreshMode::Append)
+    }
+
+    /// Returns a stream of `DataUpdates` for the given dataset.
+    fn stream_data_updates<'a>(&self, dataset: &Dataset) -> BoxStream<'a, DataUpdate> {
+        Box::pin(stream! {
+          loop {
+            yield DataUpdate {
+                log_sequence_number: None,
+                data: vec![],
+                update_type: UpdateType::Overwrite,
+            };
+          }
         })
     }
 

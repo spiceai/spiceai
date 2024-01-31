@@ -100,7 +100,7 @@ impl WithDependsOn<Dataset> for Dataset {
 pub mod acceleration {
     use serde::{Deserialize, Serialize};
 
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
     #[serde(rename_all = "lowercase")]
     pub enum RefreshMode {
         Full,
