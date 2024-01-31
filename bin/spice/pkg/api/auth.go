@@ -3,10 +3,12 @@ package api
 const (
 	AUTH_TYPE_SPICE_AI = "spice.ai"
 	AUTH_TYPE_DREMIO   = "dremio"
+
+	AUTH_PARAM_KEY      = "key"
+	AUTH_PARAM_PASSWORD = "password"
+	AUTH_PARAM_USERNAME = "username"
 )
 
 type Auth struct {
-	Key      string `json:"key,omitempty" csv:"key" toml:"key,omitempty"`
-	Username string `json:"username,omitempty" csv:"username" toml:"username,omitempty"`
-	Password string `json:"password,omitempty" csv:"password" toml:"password,omitempty"`
+	Params map[string]string `json:"params,omitempty" csv:"params" toml:"params,omitempty"`
 }

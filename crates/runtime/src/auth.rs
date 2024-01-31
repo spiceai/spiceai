@@ -6,10 +6,6 @@ use dirs;
 use serde::Deserialize;
 use snafu::prelude::*;
 
-pub mod dremio;
-pub mod none;
-pub mod spiceai;
-
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Unable to find home directory"))]
@@ -26,60 +22,34 @@ pub enum Error {
 }
 
 #[allow(clippy::module_name_repetitions)]
-pub trait AuthProvider {
-    fn new(auth: &Auth) -> Self
-    where
-        Self: Sized;
-    fn get_token(&self) -> String {
-        String::new()
-    }
-    fn get_username(&self) -> String {
-        String::new()
-    }
-    fn get_password(&self) -> String {
-        String::new()
-    }
-}
-
-#[allow(clippy::module_name_repetitions)]
 #[derive(Default)]
 pub struct AuthProviders {
-    pub auth: AuthConfig,
+    pub auth_configs: AuthConfigs,
 }
 
 #[allow(clippy::module_name_repetitions)]
-pub type AuthConfig = HashMap<String, Auth>;
+pub type AuthConfigs = HashMap<String, AuthConfig>;
 
-#[derive(Deserialize, Default)]
-pub struct Auth {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub key: Option<String>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub username: Option<String>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub password: Option<String>,
+#[allow(clippy::module_name_repetitions)]
+#[derive(Default, Deserialize, Clone)]
+pub struct AuthConfig {
+    pub params: HashMap<String, String>,
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 impl AuthProviders {
     #[must_use]
-    pub fn get(&self, name: &str) -> Box<dyn AuthProvider> {
-        let auth = if let Some(auth) = self.auth.get(name) {
+    pub fn get(&self, name: &str) -> Box<AuthProvider> {
+        let auth = if let Some(auth) = self.auth_configs.get(name) {
             tracing::trace!("Using auth provider: {}", name);
             auth
         } else {
             tracing::trace!("No auth provider found for {}", name);
-            return Box::new(none::NoneAuth::new(&Auth::default()));
+            return Box::new(AuthProvider::new(AuthConfig::default()));
         };
 
-        match name {
-            "spice.ai" => Box::new(spiceai::SpiceAuth::new(auth)),
-            "dremio" => Box::new(dremio::DremioAuth::new(auth)),
-            _ => Box::new(none::NoneAuth::new(&Auth::default())),
-        }
+        Box::new(AuthProvider::new(auth.clone()))
     }
 
     pub fn parse_from_config(&mut self) -> Result<()> {
@@ -92,8 +62,31 @@ impl AuthProviders {
             .read_to_string(&mut auth_contents)
             .context(UnableToReadAuthFileSnafu)?;
 
-        self.auth =
-            toml::from_str::<AuthConfig>(&auth_contents).context(UnableToParseAuthFileSnafu)?;
+        self.auth_configs =
+            toml::from_str::<AuthConfigs>(&auth_contents).context(UnableToParseAuthFileSnafu)?;
         Ok(())
+    }
+}
+
+#[allow(clippy::module_name_repetitions)]
+pub struct AuthProvider {
+    pub auth_config: AuthConfig,
+}
+
+impl AuthProvider {
+    #[must_use]
+    pub fn new(auth_config: AuthConfig) -> Self
+    where
+        Self: Sized,
+    {
+        AuthProvider { auth_config }
+    }
+
+    #[must_use]
+    pub fn get_param(&self, param: &str) -> Option<&str> {
+        self.auth_config
+            .params
+            .get(&param.to_string())
+            .map(std::string::String::as_str)
     }
 }

@@ -19,7 +19,7 @@ pub struct DebugSource {}
 
 impl DataSource for DebugSource {
     fn new(
-        _auth_provider: Box<dyn AuthProvider>,
+        _auth_provider: Box<AuthProvider>,
         _params: Arc<Option<HashMap<String, String>>>,
     ) -> Pin<Box<dyn Future<Output = super::Result<Self>>>> {
         Box::pin(async move { Ok(Self {}) })

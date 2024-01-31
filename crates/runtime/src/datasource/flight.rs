@@ -13,7 +13,7 @@ pub struct Flight {
 impl Flight {
     #[must_use]
     pub(crate) fn new(
-        auth_provider: Box<dyn AuthProvider>,
+        auth_provider: Box<AuthProvider>,
         endpoint: String,
     ) -> Pin<Box<dyn Future<Output = super::Result<Self>>>>
     where
@@ -22,8 +22,8 @@ impl Flight {
         Box::pin(async move {
             let flight_client = FlightClient::new(
                 endpoint.as_str(),
-                auth_provider.get_username(),
-                auth_provider.get_password(),
+                auth_provider.get_param("username").unwrap_or_default(),
+                auth_provider.get_param("password").unwrap_or_default(),
             )
             .await
             .map_err(|e| super::Error::UnableToCreateDataSource { source: e.into() })?;
