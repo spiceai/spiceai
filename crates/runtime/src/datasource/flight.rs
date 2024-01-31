@@ -1,15 +1,13 @@
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 
 use crate::auth::AuthProvider;
 use arrow::record_batch::RecordBatch;
 use flight_client::FlightClient;
 use futures::StreamExt;
-use tokio::sync::Mutex;
 
 pub struct Flight {
-    pub client: Arc<Mutex<FlightClient>>,
+    pub client: FlightClient,
 }
 
 impl Flight {
@@ -30,7 +28,7 @@ impl Flight {
             .await
             .map_err(|e| super::Error::UnableToCreateDataSource { source: e.into() })?;
             Ok(Flight {
-                client: Arc::new(Mutex::new(flight_client)),
+                client: flight_client,
             })
         })
     }
@@ -39,12 +37,10 @@ impl Flight {
         &self,
         dataset_path: &str,
     ) -> Pin<Box<dyn Future<Output = Vec<RecordBatch>> + Send>> {
-        let client = self.client.clone();
+        let mut client = self.client.clone();
         let dataset_path = dataset_path.to_owned();
         Box::pin(async move {
             let flight_record_batch_stream_result = client
-                .lock()
-                .await
                 .query(format!("SELECT * FROM {dataset_path}").as_str())
                 .await;
 
