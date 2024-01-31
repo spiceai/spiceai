@@ -10,8 +10,7 @@ build:
 
 .PHONY: ci
 ci:
-	make -C bin/spice
-	cargo build --release --target-dir /workspace/spiceai/target
+	export SPICED_TARGET_DIR=/workspace/spiceai/target; make -C bin/spice
 
 .PHONY: lint
 lint:
