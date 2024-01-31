@@ -87,6 +87,6 @@ impl AuthProvider {
         self.auth_config
             .params
             .get(&param.to_string())
-            .map(std::string::String::as_str)
+            .map(String::as_str)
     }
 }
