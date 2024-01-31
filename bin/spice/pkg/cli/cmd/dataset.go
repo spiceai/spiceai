@@ -57,7 +57,7 @@ spice dataset configure
 		params := map[string]string{}
 		if strings.Split(datasetLocation, "/")[0] == api.DATA_SOURCE_DREMIO {
 			// TODO: Allow user to specify own dremio instance. Needs UX design for how the command should handle.
-			params["url"] = "http://dremio-4mimamg7rdeve.eastus.cloudapp.azure.com:32010"
+			params["endpoint"] = "http://dremio-4mimamg7rdeve.eastus.cloudapp.azure.com:32010"
 		}
 
 		dataset := api.Dataset{
