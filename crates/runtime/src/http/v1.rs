@@ -23,12 +23,7 @@ pub(crate) mod datasets {
     ) -> Json<Vec<Dataset>> {
         let datasets: Vec<Dataset> = match filter.source {
             Some(source) => match source {
-                DatasetSource::Sink => app
-                    .datasets
-                    .iter()
-                    .filter(|d| d.source.is_none())
-                    .cloned()
-                    .collect(),
+                DatasetSource::Sink => app.datasets.clone(),
             },
             None => app.datasets.clone(),
         };
