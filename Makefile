@@ -7,7 +7,6 @@ all: build
 .PHONY: build
 build:
 	make -C bin/spice
-	cargo build --release
 
 .PHONY: ci
 ci:
