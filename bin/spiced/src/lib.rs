@@ -129,19 +129,7 @@ pub async fn run(args: Args) -> Result<()> {
                 })?,
         }
 
-        let data_source = Box::leak(data_source);
-
-        let fq_dataset_name = format!("{}.{}", dataset_path, ds.name);
-        df.attach(
-            fq_dataset_name.as_str(),
-            data_source,
-            databackend::DataBackendType::default(),
-        )
-        .context(UnableToAttachDataSourceSnafu {
-            data_source: source,
-        })?;
-
-        tracing::trace!("Loaded dataset: {}", fq_dataset_name);
+        tracing::trace!("Loaded dataset: {}", ds.name);
     }
 
     let rt: Runtime = Runtime::new(args.runtime, app, df);
