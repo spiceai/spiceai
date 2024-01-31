@@ -1,3 +1,4 @@
+use futures::stream;
 use snafu::prelude::*;
 use spicepod::component::dataset::Dataset;
 use std::collections::HashMap;
@@ -73,25 +74,28 @@ impl dyn DataSource + '_ {
 
         // If a refresh_interval is defined, refresh the data on that interval.
         if let Some(refresh_interval) = dataset.refresh_interval() {
+            tracing::trace!("stream::interval");
             return Box::pin(stream! {
                 loop {
-                    tokio::time::sleep(refresh_interval).await;
+                    tracing::info!("Refreshing data for {}", dataset.name);
                     yield DataUpdate {
                         log_sequence_number: None,
                         data: self.get_all_data(dataset).await,
                         update_type: UpdateType::Overwrite,
                     };
+                    tokio::time::sleep(refresh_interval).await;
                 }
             });
         }
 
+        tracing::trace!("stream::once");
         // Otherwise, just return the data once.
-        Box::pin(stream! {
-            yield DataUpdate {
+        Box::pin(stream::once(async move {
+            DataUpdate {
                 log_sequence_number: None,
                 data: self.get_all_data(dataset).await,
                 update_type: UpdateType::Overwrite,
-            };
-        })
+            }
+        }))
     }
 }

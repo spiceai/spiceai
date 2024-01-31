@@ -98,7 +98,7 @@ impl DataFusion {
                         Ok(()) => (),
                         Err(e) => tracing::error!("Error adding data: {e:?}"),
                     },
-                    None => continue,
+                    None => break,
                 };
             }
         });
