@@ -5,6 +5,9 @@ import "time"
 const (
 	REFRESH_MODE_FULL   = "full"
 	REFRESH_MODE_APPEND = "append"
+
+	DATA_SOURCE_SPICEAI = "spice.ai"
+	DATA_SOURCE_DREMIO  = "dremio"
 )
 
 type Dataset struct {
