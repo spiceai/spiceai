@@ -1,6 +1,7 @@
 #![allow(clippy::missing_errors_doc)]
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use app::App;
 use clap::Parser;
@@ -74,37 +75,22 @@ pub async fn run(args: Args) -> Result<()> {
     for ds in &app.datasets {
         let source = ds.source();
         let source = source.as_str();
+        let params = Arc::new(ds.params.clone());
         let data_source: Option<Box<dyn DataSource>> = match source {
-            "spice.ai" => {
-                let spice_auth = auth.get(source);
-                Some(Box::new(
-                    datasource::flight::Flight::new(
-                        spice_auth,
-                        "https://flight.spiceai.io".to_string(),
-                    )
+            "spice.ai" => Some(Box::new(
+                datasource::spiceai::SpiceAI::new(auth.get(source), params)
                     .await
                     .context(UnableToInitializeDataSourceSnafu {
                         data_source: source,
                     })?,
-                ))
-            }
-            "dremio" => {
-                let dremio_auth = auth.get(source);
-                let Some(url) = ds.params.get("url") else {
-                    RequiredParameterMissingSnafu {
-                        parameter: "url",
-                        data_source: source.to_owned(),
-                    }
-                    .fail()?
-                };
-                Some(Box::new(
-                    datasource::flight::Flight::new(dremio_auth, url.to_string())
-                        .await
-                        .context(UnableToInitializeDataSourceSnafu {
-                            data_source: source,
-                        })?,
-                ))
-            }
+            )),
+            "dremio" => Some(Box::new(
+                datasource::dremio::Dremio::new(auth.get(source), params)
+                    .await
+                    .context(UnableToInitializeDataSourceSnafu {
+                        data_source: source,
+                    })?,
+            )),
             "localhost" => None,
             "debug" => Some(Box::new(datasource::debug::DebugSource {})),
             _ => UnknownDataSourceSnafu {

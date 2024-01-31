@@ -1,5 +1,6 @@
 use crate::auth::AuthProvider;
 
+use std::collections::HashMap;
 use std::{future::Future, pin::Pin};
 use std::{sync::Arc, time::Duration};
 
@@ -19,7 +20,7 @@ pub struct DebugSource {}
 impl DataSource for DebugSource {
     fn new(
         _auth_provider: Box<dyn AuthProvider>,
-        _url: String,
+        _params: Arc<Option<HashMap<String, String>>>,
     ) -> Pin<Box<dyn Future<Output = super::Result<Self>>>> {
         Box::pin(async move { Ok(Self {}) })
     }
