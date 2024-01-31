@@ -36,8 +36,9 @@ impl DataSource for SpiceAI {
                 .and_then(|params| params.get("url").cloned())
                 .unwrap_or_else(|| "https://flight.spiceai.io".to_string());
             let flight = Flight::new(auth_provider, url);
-            let flight = flight.await?;
-            Ok(Self { flight })
+            Ok(Self {
+                flight: flight.await?,
+            })
         })
     }
 

@@ -29,8 +29,9 @@ impl DataSource for Dremio {
                     source: "Missing required parameter: url".into(),
                 })?;
             let flight = Flight::new(auth_provider, url);
-            let flight = flight.await?;
-            Ok(Self { flight })
+            Ok(Self {
+                flight: flight.await?,
+            })
         })
     }
 
