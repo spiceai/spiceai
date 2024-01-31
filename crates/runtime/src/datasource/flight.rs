@@ -13,7 +13,7 @@ pub struct Flight {
 impl Flight {
     #[must_use]
     pub(crate) fn new(
-        auth_provider: Box<AuthProvider>,
+        auth_provider: AuthProvider,
         endpoint: String,
     ) -> Pin<Box<dyn Future<Output = super::Result<Self>>>>
     where

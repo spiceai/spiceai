@@ -14,7 +14,7 @@ pub struct Dremio {
 
 impl DataSource for Dremio {
     fn new(
-        auth_provider: Box<AuthProvider>,
+        auth_provider: AuthProvider,
         params: Arc<Option<HashMap<String, String>>>,
     ) -> Pin<Box<dyn Future<Output = super::Result<Self>>>>
     where

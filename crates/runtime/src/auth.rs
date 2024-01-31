@@ -40,16 +40,16 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 impl AuthProviders {
     #[must_use]
-    pub fn get(&self, name: &str) -> Box<AuthProvider> {
+    pub fn get(&self, name: &str) -> AuthProvider {
         let auth = if let Some(auth) = self.auth_configs.get(name) {
             tracing::trace!("Using auth provider: {}", name);
             auth
         } else {
             tracing::trace!("No auth provider found for {}", name);
-            return Box::new(AuthProvider::new(AuthConfig::default()));
+            return AuthProvider::new(AuthConfig::default());
         };
 
-        Box::new(AuthProvider::new(auth.clone()))
+        AuthProvider::new(auth.clone())
     }
 
     pub fn parse_from_config(&mut self) -> Result<()> {
