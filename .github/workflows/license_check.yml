@@ -24,6 +24,7 @@ on:
   pull_request:
     branches:
       - trunk
+      - rust
       - release-*
 
 jobs:
