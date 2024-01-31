@@ -54,9 +54,16 @@ spice dataset configure
 		accelerateDatasetString = strings.TrimSuffix(accelerateDatasetString, "\n")
 		accelerateDataset := strings.ToLower(accelerateDatasetString) == "y"
 
+		params := map[string]string{}
+		if strings.Split(datasetLocation, "/")[0] == api.DATA_SOURCE_DREMIO {
+			// TODO: Allow user to specify own dremio instance. Needs UX design for how the command should handle.
+			params["url"] = "http://dremio-4mimamg7rdeve.eastus.cloudapp.azure.com:32010"
+		}
+
 		dataset := api.Dataset{
-			From: datasetLocation,
-			Name: datasetName,
+			From:   datasetLocation,
+			Name:   datasetName,
+			Params: params,
 			Acceleration: &api.Acceleration{
 				Enabled:         accelerateDataset,
 				RefreshInterval: time.Hour,
@@ -99,7 +106,7 @@ spice dataset configure
 
 		var datasetReferenced bool
 		for _, dataset := range spicePod.Datasets {
-			if dataset.From == dirPath {
+			if dataset.Import == dirPath {
 				datasetReferenced = true
 				break
 			}
@@ -107,7 +114,7 @@ spice dataset configure
 
 		if !datasetReferenced {
 			spicePod.Datasets = append(spicePod.Datasets, &api.Reference{
-				From: dirPath,
+				Import: dirPath,
 			})
 			spicepodBytes, err = yaml.Marshal(spicePod)
 			if err != nil {
