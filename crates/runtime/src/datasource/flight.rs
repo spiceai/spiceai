@@ -14,14 +14,14 @@ impl Flight {
     #[must_use]
     pub(crate) fn new(
         auth_provider: Box<dyn AuthProvider>,
-        url: String,
+        endpoint: String,
     ) -> Pin<Box<dyn Future<Output = super::Result<Self>>>>
     where
         Self: Sized,
     {
         Box::pin(async move {
             let flight_client = FlightClient::new(
-                url.as_str(),
+                endpoint.as_str(),
                 auth_provider.get_username(),
                 auth_provider.get_password(),
             )

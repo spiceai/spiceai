@@ -12,6 +12,6 @@ type Pod struct {
 }
 
 type Reference struct {
-	Import    string `json:"import,omitempty" csv:"import" yaml:"import,omitempty"`
+	Ref       string `json:"ref,omitempty" csv:"ref" yaml:"ref,omitempty"`
 	DependsOn string `json:"depends_on,omitempty" csv:"depends_on" yaml:"dependsOn,omitempty"`
 }
