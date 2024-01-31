@@ -1,5 +1,3 @@
-use super::DataSource;
-
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -8,15 +6,15 @@ use crate::auth::AuthProvider;
 use arrow::record_batch::RecordBatch;
 use flight_client::FlightClient;
 use futures::StreamExt;
-use spicepod::component::dataset::Dataset;
 use tokio::sync::Mutex;
 
 pub struct Flight {
     pub client: Arc<Mutex<FlightClient>>,
 }
 
-impl DataSource for Flight {
-    fn new(
+impl Flight {
+    #[must_use]
+    pub(crate) fn new(
         auth_provider: Box<dyn AuthProvider>,
         url: String,
     ) -> Pin<Box<dyn Future<Output = super::Result<Self>>>>
@@ -37,19 +35,17 @@ impl DataSource for Flight {
         })
     }
 
-    fn get_all_data(
+    pub(crate) fn get_all_data(
         &self,
-        dataset: &Dataset,
+        dataset_path: &str,
     ) -> Pin<Box<dyn Future<Output = Vec<RecordBatch>> + Send>> {
         let client = self.client.clone();
-
-        // TODO: Until we have separate SpiceAI Datasources
-        let fq_dataset = format!("{}.{}", dataset.path(), dataset.name);
+        let dataset_path = dataset_path.to_owned();
         Box::pin(async move {
             let flight_record_batch_stream_result = client
                 .lock()
                 .await
-                .query(format!("SELECT * FROM {fq_dataset}").as_str())
+                .query(format!("SELECT * FROM {dataset_path}").as_str())
                 .await;
 
             let mut flight_record_batch_stream = match flight_record_batch_stream_result {
