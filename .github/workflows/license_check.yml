@@ -49,6 +49,6 @@ jobs:
         run: go get github.com/google/go-licenses
 
       - name: Check spice licenses
-        working-directory: cmd/spice
+        working-directory: bin/spice
         run: |
           go-licenses csv . |& ${{ env.FORBIDDEN_LICENSE_CHECK }}
