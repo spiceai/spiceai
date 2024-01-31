@@ -372,7 +372,6 @@ impl FlightService for Service {
 
         let datafusion = Arc::clone(&self.datafusion);
         tokio::spawn(async move {
-            let data_path = crate::datafusion::get_internal_dataset_name(data_path.as_str());
             let Ok(df) = datafusion
                 .ctx
                 .sql(&format!(r#"SELECT * FROM "{data_path}""#))

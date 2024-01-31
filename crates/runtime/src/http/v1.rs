@@ -7,14 +7,8 @@ pub(crate) mod datasets {
     use spicepod::component::dataset::Dataset;
 
     #[derive(Debug, Deserialize)]
-    #[serde(rename_all = "lowercase")]
-    pub(crate) enum DatasetSource {
-        Sink,
-    }
-
-    #[derive(Debug, Deserialize)]
     pub(crate) struct DatasetFilter {
-        source: Option<DatasetSource>,
+        source: Option<String>,
     }
 
     pub(crate) async fn get(
@@ -22,9 +16,12 @@ pub(crate) mod datasets {
         Query(filter): Query<DatasetFilter>,
     ) -> Json<Vec<Dataset>> {
         let datasets: Vec<Dataset> = match filter.source {
-            Some(source) => match source {
-                DatasetSource::Sink => app.datasets.clone(),
-            },
+            Some(source) => app
+                .datasets
+                .iter()
+                .filter(|d| d.source() == source)
+                .cloned()
+                .collect(),
             None => app.datasets.clone(),
         };
 

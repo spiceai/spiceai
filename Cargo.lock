@@ -1275,6 +1275,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "fundu"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c04cb831a8dccadfe3774b07cba4574a1ec24974d761510e65d8a543c2d7cb4"
+dependencies = [
+ "fundu-core",
+]
+
+[[package]]
+name = "fundu-core"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "76a889e633afd839fb5b04fe53adfd588cefe518e71ec8d3c929698c6daf2acd"
+
+[[package]]
 name = "futures"
 version = "0.3.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2946,9 +2961,11 @@ dependencies = [
 name = "spicepod"
 version = "0.10.0-alpha.0"
 dependencies = [
+ "fundu",
  "serde",
  "serde_yaml",
  "snafu 0.8.0",
+ "tracing",
 ]
 
 [[package]]

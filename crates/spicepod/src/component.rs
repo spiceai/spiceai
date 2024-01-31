@@ -13,7 +13,7 @@ pub trait WithDependsOn<T> {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ComponentReference {
-    pub from: String,
+    pub import: String,
 
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(rename = "dependsOn", default)]
@@ -57,7 +57,7 @@ where
         .map(|item| match item {
             ComponentOrReference::Component(component) => Ok(component.clone()),
             ComponentOrReference::Reference(reference) => {
-                let component_base_path = base_path.join(&reference.from);
+                let component_base_path = base_path.join(&reference.import);
                 let component_base_path_str = component_base_path
                     .to_str()
                     .ok_or(Error::UnableToConvertPath)?;
