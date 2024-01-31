@@ -31,8 +31,8 @@ impl DataSource for SpiceAI {
     {
         Box::pin(async move {
             let url: String = params
-                .as_ref()
-                .as_ref()
+                .as_ref() // &Option<HashMap<String, String>>
+                .as_ref() // Option<&HashMap<String, String>>
                 .and_then(|params| params.get("url").cloned())
                 .unwrap_or_else(|| "https://flight.spiceai.io".to_string());
             let flight = Flight::new(auth_provider, url);

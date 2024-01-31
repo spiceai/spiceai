@@ -22,8 +22,8 @@ impl DataSource for Dremio {
     {
         Box::pin(async move {
             let url: String = params
-                .as_ref()
-                .as_ref()
+                .as_ref() // &Option<HashMap<String, String>>
+                .as_ref() // Option<&HashMap<String, String>>
                 .and_then(|params| params.get("url").cloned())
                 .ok_or_else(|| super::Error::UnableToCreateDataSource {
                     source: "Missing required parameter: url".into(),
