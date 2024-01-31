@@ -61,7 +61,6 @@ spice dataset configure
 				Enabled:         accelerateDataset,
 				RefreshInterval: time.Hour,
 				RefreshMode:     api.REFRESH_MODE_FULL,
-				Retention:       30 * time.Minute,
 			},
 		}
 

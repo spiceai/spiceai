@@ -33,7 +33,7 @@ spice init trader
 
 		skeletonPod := &api.Pod{
 			Name:    podName,
-			Version: "v1beta2",
+			Version: "v1beta1",
 			Kind:    "Spicepod",
 		}
 
