@@ -57,7 +57,13 @@ impl DataSource for SpiceAI {
         let mut flight = flight.clone();
         let spice_dataset_path = Self::spice_dataset_path(dataset);
         Box::pin(stream! {
-          let mut stream = flight.subscribe(&spice_dataset_path).await.unwrap();
+          let mut stream = match flight.subscribe(&spice_dataset_path).await {
+            Ok(stream) => stream,
+            Err(error) => {
+              tracing::error!("Unable to subscribe to {spice_dataset_path}: {:?}", error);
+              return;
+            }
+          };
           loop {
             match stream.next().await {
               Some(Ok(decoded_data)) => match decoded_data.payload {
