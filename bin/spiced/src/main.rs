@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use clap::Parser;
 use metrics_exporter_prometheus::PrometheusBuilder;
 use tokio::runtime::Runtime;
-use tracing::level_filters::LevelFilter;
+use tracing_subscriber::EnvFilter;
 
 fn main() {
     let args = spiced::Args::parse();
@@ -48,11 +48,18 @@ async fn start_runtime(args: spiced::Args) -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
-fn init_tracing() -> Result<(), tracing::subscriber::SetGlobalDefaultError> {
-    let filter = tracing_subscriber::EnvFilter::builder()
-        .with_default_directive(LevelFilter::TRACE.into())
-        .with_env_var("SPICED_LOG")
-        .from_env_lossy();
+fn init_tracing() -> Result<(), Box<dyn std::error::Error>> {
+    let default_directives = if cfg!(release) {
+        "spiced=INFO,runtime=INFO"
+    } else {
+        "spiced=TRACE,runtime=TRACE"
+    };
+
+    let filter = if let Ok(env_log) = std::env::var("SPICED_LOG") {
+        EnvFilter::new(env_log)
+    } else {
+        EnvFilter::new(default_directives)
+    };
 
     let subscriber = tracing_subscriber::FmtSubscriber::builder()
         .with_env_filter(filter)
