@@ -62,7 +62,7 @@ impl FlightClient {
     /// # Errors
     ///
     /// Returns an error if unable to create the `FlightClient`.
-    pub async fn new(url: &str, username: String, password: String) -> Result<Self> {
+    pub async fn new(url: &str, username: &str, password: &str) -> Result<Self> {
         let flight_channel = tls::new_tls_flight_channel(url)
             .await
             .context(UnableToConnectToServerSnafu)?;
@@ -72,8 +72,8 @@ impl FlightClient {
                 .max_encoding_message_size(100 * 1024 * 1024)
                 .max_decoding_message_size(100 * 1024 * 1024),
             token: None,
-            username,
-            password,
+            username: username.to_string(),
+            password: password.to_string(),
         })
     }
 
@@ -87,11 +87,7 @@ impl FlightClient {
     ///
     /// Returns an error if the query fails.
     pub async fn query(&mut self, query: &str) -> Result<FlightRecordBatchStream> {
-        self.authenticate_basic_token(
-            self.username.clone().as_str(),
-            self.password.clone().as_str(),
-        )
-        .await?;
+        self.authenticate_basic_token().await?;
 
         let descriptor = FlightDescriptor::new_cmd(query.to_string());
         let mut req = descriptor.into_request();
@@ -152,13 +148,13 @@ impl FlightClient {
         NoEndpointsFoundSnafu.fail()
     }
 
-    async fn authenticate_basic_token(&mut self, username: &str, password: &str) -> Result<()> {
+    async fn authenticate_basic_token(&mut self) -> Result<()> {
         let cmd = HandshakeRequest {
             protocol_version: 0,
             payload: Bytes::default(),
         };
         let mut req = tonic::Request::new(stream::iter(vec![cmd]));
-        let val = BASE64_STANDARD.encode(format!("{username}:{password}"));
+        let val = BASE64_STANDARD.encode(format!("{}:{}", self.username, self.password));
         let val = format!("Basic {val}")
             .parse()
             .context(InvalidMetadataSnafu)?;

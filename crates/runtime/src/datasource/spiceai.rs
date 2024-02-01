@@ -23,7 +23,7 @@ pub struct SpiceAI {
 
 impl DataSource for SpiceAI {
     fn new(
-        auth_provider: Box<dyn AuthProvider>,
+        auth_provider: AuthProvider,
         params: Arc<Option<HashMap<String, String>>>,
     ) -> Pin<Box<dyn Future<Output = super::Result<Self>>>>
     where
