@@ -66,7 +66,7 @@ spice dataset configure
 			Params: params,
 			Acceleration: &api.Acceleration{
 				Enabled:         accelerateDataset,
-				RefreshInterval: time.Hour,
+				RefreshInterval: time.Second * 10,
 				RefreshMode:     api.REFRESH_MODE_FULL,
 			},
 		}
