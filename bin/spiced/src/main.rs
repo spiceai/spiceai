@@ -49,16 +49,10 @@ async fn start_runtime(args: spiced::Args) -> Result<(), Box<dyn std::error::Err
 }
 
 fn init_tracing() -> Result<(), Box<dyn std::error::Error>> {
-    let default_directives = if cfg!(release) {
-        "spiced=INFO,runtime=INFO"
-    } else {
-        "spiced=TRACE,runtime=TRACE"
-    };
-
     let filter = if let Ok(env_log) = std::env::var("SPICED_LOG") {
         EnvFilter::new(env_log)
     } else {
-        EnvFilter::new(default_directives)
+        EnvFilter::new("spiced=INFO,runtime=INFO")
     };
 
     let subscriber = tracing_subscriber::FmtSubscriber::builder()
