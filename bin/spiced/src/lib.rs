@@ -119,7 +119,7 @@ pub async fn run(args: Args) -> Result<()> {
                 })?,
         }
 
-        tracing::trace!("Loaded dataset: {}", ds.name);
+        tracing::info!("Loaded dataset: {}", ds.name);
     }
 
     let rt: Runtime = Runtime::new(args.runtime, app, df);
