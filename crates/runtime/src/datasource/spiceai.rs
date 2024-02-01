@@ -1,4 +1,6 @@
+use arrow_flight::decode::DecodedPayload;
 use async_stream::stream;
+use futures::StreamExt;
 use futures_core::stream::BoxStream;
 use snafu::prelude::*;
 use std::pin::Pin;
@@ -9,7 +11,6 @@ use spicepod::component::dataset::Dataset;
 
 use crate::auth::AuthProvider;
 use crate::dataupdate::{DataUpdate, UpdateType};
-use spicepod::component::dataset::acceleration::RefreshMode;
 
 use super::{flight::Flight, DataSource};
 
@@ -37,7 +38,7 @@ impl DataSource for SpiceAI {
             let url: String = params
                 .as_ref() // &Option<HashMap<String, String>>
                 .as_ref() // Option<&HashMap<String, String>>
-                .and_then(|params| params.get("url").cloned())
+                .and_then(|params| params.get("endpoint").cloned())
                 .unwrap_or_else(|| "https://flight.spiceai.io".to_string());
             let flight = Flight::new(auth_provider, url);
             Ok(Self {
@@ -46,21 +47,39 @@ impl DataSource for SpiceAI {
         })
     }
 
-    fn supports_data_streaming(&self, dataset: &Dataset) -> bool {
-        dataset
-            .acceleration
-            .as_ref()
-            .map_or(false, |acc| acc.refresh_mode == RefreshMode::Append)
+    fn supports_data_streaming(&self, _dataset: &Dataset) -> bool {
+        true
     }
 
     /// Returns a stream of `DataUpdates` for the given dataset.
     fn stream_data_updates<'a>(&self, dataset: &Dataset) -> BoxStream<'a, DataUpdate> {
+        let flight = &self.flight.client;
+        let mut flight = flight.clone();
+        let spice_dataset_path = Self::spice_dataset_path(dataset);
         Box::pin(stream! {
+          let mut stream = flight.subscribe(&spice_dataset_path).await.unwrap();
           loop {
-            yield DataUpdate {
-                log_sequence_number: None,
-                data: vec![],
-                update_type: UpdateType::Overwrite,
+            match stream.next().await {
+              Some(Ok(decoded_data)) => match decoded_data.payload {
+                  DecodedPayload::RecordBatch(batch) => {
+                      yield DataUpdate {
+                        log_sequence_number: None,
+                        data: vec![batch],
+                        update_type: UpdateType::Append,
+                      };
+                  }
+                  _ => {
+                      continue;
+                  }
+                }
+              Some(Err(error)) => {
+                tracing::error!("Error in subscription to {spice_dataset_path}: {:?}", error);
+                continue;
+              },
+              None => {
+                tracing::error!("Flight stream ended for {spice_dataset_path}");
+                break;
+              }
             };
           }
         })
