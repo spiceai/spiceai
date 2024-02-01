@@ -81,7 +81,7 @@ impl MemTableUpdate {
         let temp_table_name = MemTableUpdate::temp_table_name(&self.name, self.log_sequence_number);
         self.ctx
             .register_table(
-                TableReference::from(temp_table_name.clone()),
+                TableReference::bare(temp_table_name.clone()),
                 Arc::new(table),
             )
             .context(UnableToAddDataSnafu)?;
@@ -133,7 +133,7 @@ impl MemTableUpdate {
     fn create_table_if_not_exists(&self) -> Result<()> {
         let table_exists = self
             .ctx
-            .table_exist(TableReference::from(self.name.clone()))
+            .table_exist(TableReference::bare(self.name.clone()))
             .unwrap_or(false);
 
         if !table_exists {
@@ -146,7 +146,7 @@ impl MemTableUpdate {
                 MemTable::try_new(schema, vec![self.data.clone()]).context(UnableToAddDataSnafu)?;
 
             self.ctx
-                .register_table(TableReference::from(self.name.clone()), Arc::new(table))
+                .register_table(TableReference::bare(self.name.clone()), Arc::new(table))
                 .context(UnableToAddDataSnafu)?;
 
             tracing::trace!(
@@ -160,7 +160,7 @@ impl MemTableUpdate {
 
 impl Drop for MemTableUpdate {
     fn drop(&mut self) {
-        let temp_table_name = TableReference::from(MemTableUpdate::temp_table_name(
+        let temp_table_name = TableReference::bare(MemTableUpdate::temp_table_name(
             self.name.as_str(),
             self.log_sequence_number,
         ));
