@@ -1,5 +1,6 @@
 use futures::stream;
 use snafu::prelude::*;
+use spicepod::component::dataset::acceleration::RefreshMode;
 use spicepod::component::dataset::Dataset;
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -68,7 +69,12 @@ pub trait DataSource: Send + Sync {
 
 impl dyn DataSource + '_ {
     pub fn get_data<'a>(&'a self, dataset: &'a Dataset) -> BoxStream<'_, DataUpdate> {
-        if self.supports_data_streaming(dataset) {
+        let refresh_mode = dataset
+            .acceleration
+            .as_ref()
+            .map_or(RefreshMode::Full, |acc| acc.refresh_mode.clone());
+
+        if refresh_mode == RefreshMode::Append && self.supports_data_streaming(dataset) {
             return self.stream_data_updates(dataset);
         }
 

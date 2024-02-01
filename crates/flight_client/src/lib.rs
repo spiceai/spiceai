@@ -1,15 +1,19 @@
+use arrow_flight::decode::FlightDataDecoder;
 use arrow_flight::decode::FlightRecordBatchStream;
 use arrow_flight::error::FlightError;
 use arrow_flight::flight_service_client::FlightServiceClient;
+use arrow_flight::FlightData;
 use arrow_flight::FlightDescriptor;
 use arrow_flight::HandshakeRequest;
 use base64::prelude::BASE64_STANDARD;
 use base64::Engine;
 use bytes::Bytes;
+use futures::StreamExt;
 use futures::{stream, TryStreamExt};
 use snafu::prelude::*;
 use tonic::transport::Channel;
 use tonic::IntoRequest;
+use tonic::IntoStreamingRequest;
 
 mod tls;
 
@@ -146,6 +150,47 @@ impl FlightClient {
         }
 
         NoEndpointsFoundSnafu.fail()
+    }
+
+    /// Subscribes to a datastream via the `DoExchange` Flight method.
+    ///
+    /// # Arguments
+    ///
+    /// * `dataset_path` - The dataset to subscribe to.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the dataset is not available for subscription.
+    pub async fn subscribe(&mut self, dataset_path: &str) -> Result<FlightDataDecoder> {
+        self.authenticate_basic_token().await?;
+
+        let flight_descriptor = FlightDescriptor::new_path(vec![dataset_path.to_string()]);
+        let subscription_request =
+            stream::iter(vec![FlightData::new().with_descriptor(flight_descriptor)].into_iter());
+
+        let mut req = subscription_request.into_streaming_request();
+        let auth_header_value = match self.token.clone() {
+            Some(token) => format!("Bearer {token}")
+                .parse()
+                .context(InvalidMetadataSnafu)?,
+            None => {
+                return UnauthorizedSnafu.fail();
+            }
+        };
+        req.metadata_mut()
+            .insert("authorization", auth_header_value);
+
+        let (_md, response_stream, _ext) = self
+            .flight_client
+            .clone()
+            .do_exchange(req)
+            .await
+            .context(UnableToQuerySnafu)?
+            .into_parts();
+
+        Ok(FlightDataDecoder::new(
+            response_stream.map(|r| r.map_err(FlightError::Tonic)),
+        ))
     }
 
     async fn authenticate_basic_token(&mut self) -> Result<()> {
