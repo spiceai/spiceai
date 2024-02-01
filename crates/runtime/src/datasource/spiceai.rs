@@ -34,12 +34,17 @@ impl DataSource for SpiceAI {
     where
         Self: Sized,
     {
+        let default_flight_url = if cfg!(release) {
+            "https://flight.spiceai.io".to_string()
+        } else {
+            "https://dev-flight.spiceai.io".to_string()
+        };
         Box::pin(async move {
             let url: String = params
                 .as_ref() // &Option<HashMap<String, String>>
                 .as_ref() // Option<&HashMap<String, String>>
                 .and_then(|params| params.get("endpoint").cloned())
-                .unwrap_or_else(|| "https://flight.spiceai.io".to_string());
+                .unwrap_or(default_flight_url);
             let flight = Flight::new(auth_provider, url);
             Ok(Self {
                 flight: flight.await?,

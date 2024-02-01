@@ -72,6 +72,11 @@ impl DataFusion {
         self.backends.get(dataset)
     }
 
+    #[must_use]
+    pub fn has_backend(&self, dataset: &str) -> bool {
+        self.backends.contains_key(dataset)
+    }
+
     #[allow(clippy::needless_pass_by_value)]
     pub fn attach(
         &mut self,
