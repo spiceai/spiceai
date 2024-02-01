@@ -314,6 +314,12 @@ impl FlightService for Service {
 
         let data_path = flight_descriptor.path.join(".");
 
+        if !self.datafusion.has_backend(&data_path) {
+            return Err(Status::invalid_argument(format!(
+                r#"Unknown dataset: "{data_path}""#,
+            )));
+        };
+
         let channel_map = Arc::clone(&self.channel_map);
         let channel_map_read = channel_map.read().await;
         let (tx, rx) = if let Some(channel) = channel_map_read.get(&data_path) {
