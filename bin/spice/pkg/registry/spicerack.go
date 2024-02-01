@@ -17,15 +17,21 @@ import (
 	"go.uber.org/zap"
 )
 
-const (
-	spiceRackBaseUrl string = "https://api.spicerack.org/v0.1"
-)
-
 var (
 	zaplog *zap.Logger = loggers.ZapLogger()
 )
 
 type SpiceRackRegistry struct{}
+
+func getSpiceRackBaseUrl() string {
+	rtcontext := context.NewContext()
+	version, _ := rtcontext.Version()
+	if version == "local" {
+		return "https://dev-data.spiceai.io/v0.1"
+	} else {
+		return "https://api.spicerack.org/v0.1"
+	}
+}
 
 func (r *SpiceRackRegistry) GetPod(podFullPath string) (string, error) {
 	parts := strings.Split(podFullPath, "@")
@@ -37,7 +43,7 @@ func (r *SpiceRackRegistry) GetPod(podFullPath string) (string, error) {
 	}
 	podName := filepath.Base(podPath)
 
-	url := fmt.Sprintf("%s/spicepods/%s", spiceRackBaseUrl, podPath)
+	url := fmt.Sprintf("%s/spicepods/%s", getSpiceRackBaseUrl(), podPath)
 	if podVersion != "" {
 		url = fmt.Sprintf("%s/%s", url, podVersion)
 	}
@@ -51,7 +57,7 @@ func (r *SpiceRackRegistry) GetPod(podFullPath string) (string, error) {
 	defer response.Body.Close()
 
 	if response.StatusCode == 404 {
-		return "", NewRegistryItemNotFound(fmt.Errorf("Spicepod %s not found", podPath))
+		return "", NewRegistryItemNotFound(fmt.Errorf("spicepod %s not found", podPath))
 	}
 
 	if response.StatusCode != 200 {
@@ -70,8 +76,9 @@ func (r *SpiceRackRegistry) GetPod(podFullPath string) (string, error) {
 	}
 
 	podsPath := context.NewContext().PodsDir()
+	podsPathWithName := filepath.Join(podsPath, podName)
 
-	podsPerm, err := util.MkDirAllInheritPerm(podsPath)
+	podsPerm, err := util.MkDirAllInheritPerm(podsPathWithName)
 	if err != nil {
 		return "", err
 	}
@@ -81,10 +88,8 @@ func (r *SpiceRackRegistry) GetPod(podFullPath string) (string, error) {
 		return "", err
 	}
 
-	var manifestPath string
-
 	for _, f := range zipReader.File {
-		fpath := filepath.Join(podsPath, f.Name)
+		fpath := filepath.Join(podsPathWithName, f.Name)
 
 		extractDir := filepath.Dir(fpath)
 		err = util.SanitizeExtractPath(fpath, extractDir)
@@ -121,11 +126,7 @@ func (r *SpiceRackRegistry) GetPod(podFullPath string) (string, error) {
 		if err != nil {
 			return "", err
 		}
-
-		if strings.EqualFold(filepath.Base(outFile.Name()), fmt.Sprintf("%s.yaml", podName)) {
-			manifestPath = outFile.Name()
-		}
 	}
 
-	return manifestPath, nil
+	return podsPathWithName, nil
 }
