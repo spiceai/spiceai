@@ -21,5 +21,9 @@ type RuntimeContext interface {
 }
 
 func NewContext() RuntimeContext {
-	return metal.NewMetalContext()
+	rtcontext := metal.NewMetalContext()
+	if err := rtcontext.Init(); err != nil {
+		panic(err)
+	}
+	return rtcontext
 }
