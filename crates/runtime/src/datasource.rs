@@ -43,7 +43,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub trait DataSource: Send + Sync {
     /// Create a new `DataSource` with the given `AuthProvider`.
     fn new(
-        auth_provider: Box<dyn AuthProvider>,
+        auth_provider: AuthProvider,
         params: Arc<Option<HashMap<String, String>>>,
     ) -> Pin<Box<dyn Future<Output = Result<Self>>>>
     where

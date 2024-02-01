@@ -14,21 +14,21 @@ pub struct Dremio {
 
 impl DataSource for Dremio {
     fn new(
-        auth_provider: Box<dyn AuthProvider>,
+        auth_provider: AuthProvider,
         params: Arc<Option<HashMap<String, String>>>,
     ) -> Pin<Box<dyn Future<Output = super::Result<Self>>>>
     where
         Self: Sized,
     {
         Box::pin(async move {
-            let url: String = params
+            let endpoint: String = params
                 .as_ref() // &Option<HashMap<String, String>>
                 .as_ref() // Option<&HashMap<String, String>>
-                .and_then(|params| params.get("url").cloned())
+                .and_then(|params| params.get("endpoint").cloned())
                 .ok_or_else(|| super::Error::UnableToCreateDataSource {
-                    source: "Missing required parameter: url".into(),
+                    source: "Missing required parameter: endpoint".into(),
                 })?;
-            let flight = Flight::new(auth_provider, url);
+            let flight = Flight::new(auth_provider, endpoint);
             Ok(Self {
                 flight: flight.await?,
             })

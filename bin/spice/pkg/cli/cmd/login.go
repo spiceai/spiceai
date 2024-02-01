@@ -37,7 +37,10 @@ spice login
 		}
 
 		mergeAuthConfig(cmd, api.AUTH_TYPE_SPICE_AI, &api.Auth{
-			Key: key,
+			Params: map[string]string{
+				api.AUTH_PARAM_KEY:      key,
+				api.AUTH_PARAM_PASSWORD: key,
+			},
 		})
 
 		cmd.Println(aurora.BrightGreen("Successfully logged in to Spice.ai"))
@@ -72,17 +75,19 @@ spice login dremio --username <username> --password <password>
 		}
 
 		if password == "" {
-			cmd.Println("No username provided, use --password or -p to provide a password")
+			cmd.Println("No password provided, use --password or -p to provide a password")
 			os.Exit(1)
 		}
 
 		mergeAuthConfig(cmd, api.AUTH_TYPE_DREMIO, &api.Auth{
-			Password: password,
-			Username: username,
+			Params: map[string]string{
+				api.AUTH_PARAM_USERNAME: username,
+				api.AUTH_PARAM_PASSWORD: password,
+			},
 		},
 		)
 
-		cmd.Println(aurora.BrightGreen("Successfully logged in to Spice.ai"))
+		cmd.Println(aurora.BrightGreen("Successfully logged in to Dremio"))
 	},
 }
 

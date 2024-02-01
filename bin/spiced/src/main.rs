@@ -13,6 +13,17 @@ fn main() {
         std::process::exit(1);
     }
 
+    if args.version {
+        let version = if cfg!(feature = "release") {
+            env!("CARGO_PKG_VERSION")
+        } else {
+            "local"
+        };
+
+        println!("{version}");
+        return;
+    }
+
     let tokio_runtime = match Runtime::new() {
         Ok(runtime) => runtime,
         Err(err) => {
