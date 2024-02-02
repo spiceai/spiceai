@@ -39,7 +39,7 @@ spice login
 		signInDetails, err := supabaseClient.Auth.SignInWithProvider(supabase.ProviderSignInOptions{
 			Provider:   "github",
 			Scopes:     []string{"read:user", "user:email", "read:org"},
-			RedirectTo: "https://cloud-git-mitch-device-auth-spice.vercel.app/auth/login", //?cli-callback=%s", url.QueryEscape("http://localhost:3000/auth/callback)")),
+			RedirectTo: "http://localhost:3000/auth/callback",
 			FlowType:   supabase.PKCE,
 		})
 		if err != nil {
@@ -72,7 +72,7 @@ spice login
 		fmt.Println(auth.ProviderToken)
 		fmt.Println(auth.ProviderRefreshToken)
 
-		req, err := http.NewRequest("GET", "https://cloud-git-mitch-device-auth-spice.vercel.app/api/orgs", nil)
+		req, err := http.NewRequest("GET", "https://dev.spice.xyz/api/orgs", nil)
 		if err != nil {
 			cmd.Println(err.Error())
 			os.Exit(1)
