@@ -1,11 +1,18 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
+	"io"
+	"log"
+	"net/http"
 	"os"
+	"time"
 
 	"github.com/logrusorgru/aurora"
+	supabase "github.com/nedpals/supabase-go"
 	toml "github.com/pelletier/go-toml"
+	"github.com/pkg/browser"
 	"github.com/spf13/cobra"
 	"github.com/spiceai/spiceai/bin/spice/pkg/api"
 )
@@ -25,26 +32,148 @@ spice login
 # See more at: https://docs.spiceai.org/
 `,
 	Run: func(cmd *cobra.Command, args []string) {
-		key, err := cmd.Flags().GetString(apiKeyFlag)
+		supabaseClient := supabase.CreateClient(
+			"https://gkxlaoqvfeytpsffjksw.supabase.co",
+			"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJvbGUiOiJhbm9uIiwiaWF0IjoxNjQyOTk1NTQ4LCJleHAiOjE5NTg1NzE1NDh9.0JJQtnO2nqRIXGBQHcTRYb-tMQJEU9fbS3o0MaGd5gA",
+		)
+		signInDetails, err := supabaseClient.Auth.SignInWithProvider(supabase.ProviderSignInOptions{
+			Provider:   "github",
+			Scopes:     []string{"read:user", "user:email", "read:org"},
+			RedirectTo: "http://localhost:3000/auth/callback",
+			FlowType:   supabase.PKCE,
+		})
+		if err != nil {
+			cmd.Println(err.Error())
+			os.Exit(1)
+		}
+		err = browser.OpenURL(signInDetails.URL)
 		if err != nil {
 			cmd.Println(err.Error())
 			os.Exit(1)
 		}
 
-		if key == "" {
-			cmd.Println("No API key provided, use --key or -k to provide an API key")
+		code, err := listenAndGetAuthCode()
+		if err != nil {
+			cmd.Println(err.Error())
 			os.Exit(1)
 		}
 
-		mergeAuthConfig(cmd, api.AUTH_TYPE_SPICE_AI, &api.Auth{
-			Params: map[string]string{
-				api.AUTH_PARAM_KEY:      key,
-				api.AUTH_PARAM_PASSWORD: key,
-			},
+		fmt.Println(code)
+
+		auth, err := supabaseClient.Auth.ExchangeCode(context.Background(), supabase.ExchangeCodeOpts{
+			AuthCode:     code,
+			CodeVerifier: signInDetails.CodeVerifier,
 		})
+		if err != nil {
+			cmd.Println(err.Error())
+			os.Exit(1)
+		}
+
+		fmt.Println(auth.ProviderToken)
+		fmt.Println(auth.ProviderRefreshToken)
+
+		req, err := http.NewRequest("GET", "https://dev.spice.xyz/api/orgs", nil)
+		if err != nil {
+			cmd.Println(err.Error())
+			os.Exit(1)
+		}
+		req.AddCookie(&http.Cookie{
+			Name:    "gh_token",
+			Value:   auth.ProviderToken,
+			Expires: time.Now().Add(time.Hour * 7),
+		})
+		req.AddCookie(&http.Cookie{
+			Name:    "gh_refresh_token",
+			Value:   auth.ProviderRefreshToken,
+			Expires: time.Now().Add(time.Hour * 24 * 180),
+		})
+
+		client := &http.Client{}
+		resp, err := client.Do(req)
+		if err != nil {
+			cmd.Println(err.Error())
+			os.Exit(1)
+		}
+		defer resp.Body.Close()
+
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			cmd.Println(err.Error())
+			os.Exit(1)
+		}
+
+		if resp.StatusCode != 200 {
+			cmd.Println("Failed to retrieve orgs: " + string(body))
+			os.Exit(1)
+		}
+
+		println(string(body))
+
+		// mergeAuthConfig(cmd, api.AUTH_TYPE_SPICE_AI, &api.Auth{
+		// 	Params: map[string]string{
+		// 		api.AUTH_PARAM_KEY:      key,
+		// 		api.AUTH_PARAM_PASSWORD: key,
+		// 	},
+		// })
 
 		cmd.Println(aurora.BrightGreen("Successfully logged in to Spice.ai"))
 	},
+}
+
+func listenAndGetAuthCode() (string, error) {
+	codeChan := make(chan string)
+
+	// TODO: Make this a pretty web page that matches our branding. Also move focus back to terminal.
+	http.HandleFunc("/auth/callback", func(w http.ResponseWriter, r *http.Request) {
+		code := r.URL.Query().Get("code")
+		if code == "" {
+			fmt.Printf("Authorization failed. Did not receive code.")
+			codeChan <- ""
+			return
+		}
+
+		// r.RequestURI = ""
+		// r.URL.Scheme = "https"
+		// r.URL.Host = "dev.spice.xyz"
+		// r.Host = "dev.spice.xyz"
+
+		// client := &http.Client{}
+		// resp, err := client.Do(r)
+		// if err != nil {
+		// 	fmt.Printf("Failed to send authorization code to Spice.ai: %s", err.Error())
+		// 	codeChan <- ""
+		// 	return
+		// }
+		// defer resp.Body.Close()
+
+		// body, err := io.ReadAll(resp.Body)
+		// if err != nil {
+		// 	fmt.Printf("Failed to read response from Spice.ai: %s", err.Error())
+		// 	codeChan <- ""
+		// 	return
+		// }
+
+		// if resp.StatusCode != 200 {
+		// 	fmt.Printf("Internal error. Authorization failed: %s", string(body))
+		// 	codeChan <- ""
+		// 	return
+		// }
+
+		fmt.Println("Authorization successful. You can now return to the CLI.")
+		codeChan <- code
+	})
+
+	go func() {
+		if err := http.ListenAndServe(":3000", nil); err != nil {
+			log.Fatal("ListenAndServe: ", err)
+		}
+	}()
+
+	code := <-codeChan
+	if code == "" {
+		return "", fmt.Errorf("failed to receive authorization code")
+	}
+	return code, nil
 }
 
 var dremioCmd = &cobra.Command{
