@@ -18,7 +18,6 @@ import (
 )
 
 const (
-	apiKeyFlag   = "key"
 	usernameFlag = "username"
 	passwordFlag = "password"
 )
@@ -132,33 +131,6 @@ func listenAndGetAuthCode() (string, error) {
 			return
 		}
 
-		// r.RequestURI = ""
-		// r.URL.Scheme = "https"
-		// r.URL.Host = "dev.spice.xyz"
-		// r.Host = "dev.spice.xyz"
-
-		// client := &http.Client{}
-		// resp, err := client.Do(r)
-		// if err != nil {
-		// 	fmt.Printf("Failed to send authorization code to Spice.ai: %s", err.Error())
-		// 	codeChan <- ""
-		// 	return
-		// }
-		// defer resp.Body.Close()
-
-		// body, err := io.ReadAll(resp.Body)
-		// if err != nil {
-		// 	fmt.Printf("Failed to read response from Spice.ai: %s", err.Error())
-		// 	codeChan <- ""
-		// 	return
-		// }
-
-		// if resp.StatusCode != 200 {
-		// 	fmt.Printf("Internal error. Authorization failed: %s", string(body))
-		// 	codeChan <- ""
-		// 	return
-		// }
-
 		fmt.Println("Authorization successful. You can now return to the CLI.")
 		codeChan <- code
 	})
@@ -271,6 +243,5 @@ func init() {
 	loginCmd.AddCommand(dremioCmd)
 
 	loginCmd.Flags().BoolP("help", "h", false, "Print this help message")
-	loginCmd.Flags().StringP(apiKeyFlag, "k", "", "API key")
 	RootCmd.AddCommand(loginCmd)
 }
