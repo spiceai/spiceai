@@ -1,0 +1,18 @@
+[package]
+name = "duckdb_datafusion"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+exclude.workspace = true
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+duckdb = { version = "0.9.2", features = ["bundled", "r2d2"] }
+datafusion = "34.0.0"
+async-trait = "0.1.77"
+r2d2 = "0.8.10"
+snafu.workspace = true
