@@ -33,12 +33,12 @@ spice login
 	Run: func(cmd *cobra.Command, args []string) {
 		supabaseClient := supabase.CreateClient(
 			"https://gkxlaoqvfeytpsffjksw.supabase.co",
-			"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJvbGUiOiJhbm9uIiwiaWF0IjoxNjQyOTk1NTQ4LCJleHAiOjE5NTg1NzE1NDh9.0JJQtnO2nqRIXGBQHcTRYb-tMQJEU9fbS3o0MaGd5gA",
+			"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJvbGUiOiJzZXJ2aWNlX3JvbGUiLCJpYXQiOjE2NDI5OTU1NDgsImV4cCI6MTk1ODU3MTU0OH0.OycN8sI4oNCzPVfGtB-bK8v6r61K2KM1SqhnDub6iTU",
 		)
 		signInDetails, err := supabaseClient.Auth.SignInWithProvider(supabase.ProviderSignInOptions{
 			Provider:   "github",
 			Scopes:     []string{"read:user", "user:email", "read:org"},
-			RedirectTo: "http://localhost:3000/auth/callback",
+			RedirectTo: "https://cloud-git-mitch-device-auth-spice.vercel.app/auth/login", //?cli-callback=%s", url.QueryEscape("http://localhost:3000/auth/callback)")),
 			FlowType:   supabase.PKCE,
 		})
 		if err != nil {
@@ -71,7 +71,7 @@ spice login
 		fmt.Println(auth.ProviderToken)
 		fmt.Println(auth.ProviderRefreshToken)
 
-		req, err := http.NewRequest("GET", "https://dev.spice.xyz/api/orgs", nil)
+		req, err := http.NewRequest("GET", "https://cloud-git-mitch-device-auth-spice.vercel.app/api/orgs", nil)
 		if err != nil {
 			cmd.Println(err.Error())
 			os.Exit(1)
