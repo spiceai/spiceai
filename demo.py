@@ -2,6 +2,7 @@ import time
 from time import sleep
 from spicepy import Client
 
+
 client = Client('REPLACE_WITH_API_KEY', 'grpc+tls://dev-flight.spiceai.io')
 
 startTime = time.time()
@@ -13,6 +14,8 @@ print(pd.to_string() + "\n")
 print("Query Time: " + str(endTime - startTime) + " seconds\n")
 
 exit()
+
+client = Client('REPLACE_WITH_API_KEY', 'grpc://127.0.0.1:50051')
 
 ###########################
 #   Spice AI Datasource   #
