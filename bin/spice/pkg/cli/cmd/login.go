@@ -33,7 +33,7 @@ spice login
 	Run: func(cmd *cobra.Command, args []string) {
 		supabaseClient := supabase.CreateClient(
 			"https://gkxlaoqvfeytpsffjksw.supabase.co",
-			"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJvbGUiOiJzZXJ2aWNlX3JvbGUiLCJpYXQiOjE2NDI5OTU1NDgsImV4cCI6MTk1ODU3MTU0OH0.OycN8sI4oNCzPVfGtB-bK8v6r61K2KM1SqhnDub6iTU",
+			"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJvbGUiOiJhbm9uIiwiaWF0IjoxNjQyOTk1NTQ4LCJleHAiOjE5NTg1NzE1NDh9.0JJQtnO2nqRIXGBQHcTRYb-tMQJEU9fbS3o0MaGd5gA",
 		)
 		signInDetails, err := supabaseClient.Auth.SignInWithProvider(supabase.ProviderSignInOptions{
 			Provider:   "github",
