@@ -210,7 +210,7 @@ impl ExecutionPlan for DuckDBExec {
             "SELECT {columns} FROM {table_reference} {limit_expr}",
             table_reference = self.table_reference,
         );
-        println!("sql: {sql}");
+        tracing::debug!("duckdb sql: {sql}");
 
         let mut stmt = conn.prepare(&sql).map_err(to_execution_error)?;
 
@@ -232,31 +232,49 @@ mod tests {
 
     use datafusion::execution::context::SessionContext;
     use duckdb::DuckdbConnectionManager;
+    use tracing::level_filters::LevelFilter;
 
     use crate::DuckDBTable;
 
+    fn setup_tracing() {
+        tracing_subscriber::fmt()
+            .with_max_level(LevelFilter::DEBUG)
+            .init();
+    }
+
     #[tokio::test]
     async fn test_duckdb_table() -> Result<(), Box<dyn Error>> {
+        setup_tracing();
         let ctx = SessionContext::new();
-
         let conn = DuckdbConnectionManager::memory()?;
-
         let pool = r2d2::Pool::new(conn)?;
-
         let db_conn = pool.get()?;
         db_conn.execute_batch(
             "CREATE TABLE test (a INTEGER, b VARCHAR); INSERT INTO test VALUES (3, 'bar');",
         )?;
-
         let duckdb_table = DuckDBTable::new(pool, "test")?;
-
         ctx.register_table("test_datafusion", Arc::new(duckdb_table))?;
-
         let sql = "SELECT * FROM test_datafusion limit 1";
         let df = ctx.sql(sql).await?;
-
         df.show().await?;
+        Ok(())
+    }
 
+    #[tokio::test]
+    async fn test_duckdb_table_filter() -> Result<(), Box<dyn Error>> {
+        setup_tracing();
+        let ctx = SessionContext::new();
+        let conn = DuckdbConnectionManager::memory()?;
+        let pool = r2d2::Pool::new(conn)?;
+        let db_conn = pool.get()?;
+        db_conn.execute_batch(
+            "CREATE TABLE test (a INTEGER, b VARCHAR); INSERT INTO test VALUES (3, 'bar');",
+        )?;
+        let duckdb_table = DuckDBTable::new(pool, "test")?;
+        ctx.register_table("test_datafusion", Arc::new(duckdb_table))?;
+        let sql = "SELECT * FROM test_datafusion where a > 1 limit 1";
+        let df = ctx.sql(sql).await?;
+        df.show().await?;
         Ok(())
     }
 }
