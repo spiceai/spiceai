@@ -74,12 +74,9 @@ impl DuckDBTable {
             .prepare(&format!("SELECT * FROM {table_reference} LIMIT 0"))
             .context(UnableToQueryDuckDBSnafu)?;
 
-        let mut result: duckdb::Arrow<'_> =
-            stmt.query_arrow([]).context(UnableToQueryDuckDBSnafu)?;
+        let result: duckdb::Arrow<'_> = stmt.query_arrow([]).context(UnableToQueryDuckDBSnafu)?;
 
-        let schema = result.next().ok_or(Error::ResultExpected)?.schema();
-
-        Ok(schema)
+        Ok(result.get_schema())
     }
 
     fn create_physical_plan(
