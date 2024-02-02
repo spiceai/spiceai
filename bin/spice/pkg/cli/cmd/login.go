@@ -1,16 +1,12 @@
 package cmd
 
 import (
-	"context"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"os"
-	"time"
 
 	"github.com/logrusorgru/aurora"
-	supabase "github.com/nedpals/supabase-go"
 	toml "github.com/pelletier/go-toml"
 	"github.com/pkg/browser"
 	"github.com/spf13/cobra"
@@ -22,6 +18,11 @@ const (
 	passwordFlag = "password"
 )
 
+type CloudAuth struct {
+	ProviderToken        string `json:"provider_token"`
+	ProviderRefreshToken string `json:"provider_refresh_token"`
+}
+
 var loginCmd = &cobra.Command{
 	Use:   "login",
 	Short: "Login to Spice.ai",
@@ -31,83 +32,83 @@ spice login
 # See more at: https://docs.spiceai.org/
 `,
 	Run: func(cmd *cobra.Command, args []string) {
-		supabaseClient := supabase.CreateClient(
-			"https://gkxlaoqvfeytpsffjksw.supabase.co",
-			// Public Key
-			"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImdreGxhb3F2ZmV5dHBzZmZqa3N3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3MDY5MTE1NTUsImV4cCI6MjAyMjQ4NzU1NX0.nYCRqu8QW3YhZDxA7GnN5J1BPRx6m8UVyVEuJ7VXpF4",
-		)
-		signInDetails, err := supabaseClient.Auth.SignInWithProvider(supabase.ProviderSignInOptions{
-			Provider:   "github",
-			Scopes:     []string{"read:user", "user:email", "read:org"},
-			RedirectTo: "http://localhost:3000/auth/callback",
-			FlowType:   supabase.PKCE,
-		})
-		if err != nil {
-			cmd.Println(err.Error())
-			os.Exit(1)
-		}
-		err = browser.OpenURL(signInDetails.URL)
-		if err != nil {
-			cmd.Println(err.Error())
-			os.Exit(1)
-		}
-
-		code, err := listenAndGetAuthCode()
+		// supabaseClient := supabase.CreateClient(
+		// 	"https://gkxlaoqvfeytpsffjksw.supabase.co",
+		// 	// Public Key
+		// 	"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImdreGxhb3F2ZmV5dHBzZmZqa3N3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3MDY5MTE1NTUsImV4cCI6MjAyMjQ4NzU1NX0.nYCRqu8QW3YhZDxA7GnN5J1BPRx6m8UVyVEuJ7VXpF4",
+		// )
+		// signInDetails, err := supabaseClient.Auth.SignInWithProvider(supabase.ProviderSignInOptions{
+		// 	Provider:   "github",
+		// 	Scopes:     []string{"read:user", "user:email", "read:org"},
+		// 	RedirectTo: "http://localhost:3000/auth/callback",
+		// 	FlowType:   supabase.PKCE,
+		// })
+		// if err != nil {
+		// 	cmd.Println(err.Error())
+		// 	os.Exit(1)
+		// }
+		err := browser.OpenURL(fmt.Sprintf("https://cloud-git-mitch-device-auth-spice.vercel.app/login?cli-callback=true")) //, url.QueryEscape("http://localhost:3000/auth/callback")))
 		if err != nil {
 			cmd.Println(err.Error())
 			os.Exit(1)
 		}
 
-		fmt.Println(code)
-
-		auth, err := supabaseClient.Auth.ExchangeCode(context.Background(), supabase.ExchangeCodeOpts{
-			AuthCode:     code,
-			CodeVerifier: signInDetails.CodeVerifier,
-		})
+		auth, err := listenAndGetAuth()
 		if err != nil {
 			cmd.Println(err.Error())
 			os.Exit(1)
 		}
 
-		fmt.Println(auth.ProviderToken)
-		fmt.Println(auth.ProviderRefreshToken)
+		fmt.Println(auth)
 
-		req, err := http.NewRequest("GET", "https://dev.spice.xyz/api/orgs", nil)
-		if err != nil {
-			cmd.Println(err.Error())
-			os.Exit(1)
-		}
-		req.AddCookie(&http.Cookie{
-			Name:    "gh_token",
-			Value:   auth.ProviderToken,
-			Expires: time.Now().Add(time.Hour * 7),
-		})
-		req.AddCookie(&http.Cookie{
-			Name:    "gh_refresh_token",
-			Value:   auth.ProviderRefreshToken,
-			Expires: time.Now().Add(time.Hour * 24 * 180),
-		})
+		// auth, err := supabaseClient.Auth.ExchangeCode(context.Background(), supabase.ExchangeCodeOpts{
+		// 	AuthCode:     code,
+		// 	CodeVerifier: signInDetails.CodeVerifier,
+		// })
+		// if err != nil {
+		// 	cmd.Println(err.Error())
+		// 	os.Exit(1)
+		// }
 
-		client := &http.Client{}
-		resp, err := client.Do(req)
-		if err != nil {
-			cmd.Println(err.Error())
-			os.Exit(1)
-		}
-		defer resp.Body.Close()
+		// fmt.Println(auth.ProviderToken)
+		// fmt.Println(auth.ProviderRefreshToken)
 
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			cmd.Println(err.Error())
-			os.Exit(1)
-		}
+		// req, err := http.NewRequest("GET", "https://dev.spice.xyz/api/orgs", nil)
+		// if err != nil {
+		// 	cmd.Println(err.Error())
+		// 	os.Exit(1)
+		// }
+		// req.AddCookie(&http.Cookie{
+		// 	Name:    "gh_token",
+		// 	Value:   auth.ProviderToken,
+		// 	Expires: time.Now().Add(time.Hour * 7),
+		// })
+		// req.AddCookie(&http.Cookie{
+		// 	Name:    "gh_refresh_token",
+		// 	Value:   auth.ProviderRefreshToken,
+		// 	Expires: time.Now().Add(time.Hour * 24 * 180),
+		// })
 
-		if resp.StatusCode != 200 {
-			cmd.Println("Failed to retrieve orgs: " + string(body))
-			os.Exit(1)
-		}
+		// client := &http.Client{}
+		// resp, err := client.Do(req)
+		// if err != nil {
+		// 	cmd.Println(err.Error())
+		// 	os.Exit(1)
+		// }
+		// defer resp.Body.Close()
 
-		println(string(body))
+		// body, err := io.ReadAll(resp.Body)
+		// if err != nil {
+		// 	cmd.Println(err.Error())
+		// 	os.Exit(1)
+		// }
+
+		// if resp.StatusCode != 200 {
+		// 	cmd.Println("Failed to retrieve orgs: " + string(body))
+		// 	os.Exit(1)
+		// }
+
+		//println(string(body))
 
 		// mergeAuthConfig(cmd, api.AUTH_TYPE_SPICE_AI, &api.Auth{
 		// 	Params: map[string]string{
@@ -120,20 +121,32 @@ spice login
 	},
 }
 
-func listenAndGetAuthCode() (string, error) {
-	codeChan := make(chan string)
+func listenAndGetAuth() (*CloudAuth, error) {
+	authChan := make(chan *CloudAuth)
 
 	// TODO: Make this a pretty web page that matches our branding. Also move focus back to terminal.
 	http.HandleFunc("/auth/callback", func(w http.ResponseWriter, r *http.Request) {
-		code := r.URL.Query().Get("code")
-		if code == "" {
-			fmt.Printf("Authorization failed. Did not receive code.")
-			codeChan <- ""
+		fmt.Print(r)
+
+		token, err := r.Cookie("gh_token")
+		if err != nil {
+			fmt.Printf("Authorization failed. Did not receive token.")
+			authChan <- &CloudAuth{}
+			return
+		}
+
+		refreshToken, err := r.Cookie("gh_refresh_token")
+		if err != nil {
+			fmt.Printf("Authorization failed. Did not receive refresh token.")
+			authChan <- &CloudAuth{}
 			return
 		}
 
 		fmt.Println("Authorization successful. You can now return to the CLI.")
-		codeChan <- code
+		authChan <- &CloudAuth{
+			ProviderToken:        token.Value,
+			ProviderRefreshToken: refreshToken.Value,
+		}
 	})
 
 	go func() {
@@ -142,11 +155,8 @@ func listenAndGetAuthCode() (string, error) {
 		}
 	}()
 
-	code := <-codeChan
-	if code == "" {
-		return "", fmt.Errorf("failed to receive authorization code")
-	}
-	return code, nil
+	auth := <-authChan
+	return auth, nil
 }
 
 var dremioCmd = &cobra.Command{
