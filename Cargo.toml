@@ -3,7 +3,6 @@ members = [
     "bin/spiced/",
     "bin/flightpublisher/",
     "bin/flightsubscriber/",
-    "bin/duckdb_test/",
     "crates/flight_client",
     "crates/spicepod",
     "crates/app",

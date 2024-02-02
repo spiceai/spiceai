@@ -206,12 +206,13 @@ impl ExecutionPlan for DuckDBExec {
             None => String::new(),
         };
 
-        let mut stmt = conn
-            .prepare(&format!(
-                "SELECT {columns} FROM {table_reference} {limit_expr}",
-                table_reference = self.table_reference,
-            ))
-            .map_err(to_execution_error)?;
+        let sql = format!(
+            "SELECT {columns} FROM {table_reference} {limit_expr}",
+            table_reference = self.table_reference,
+        );
+        println!("sql: {sql}");
+
+        let mut stmt = conn.prepare(&sql).map_err(to_execution_error)?;
 
         let result: duckdb::Arrow<'_> = stmt.query_arrow([]).map_err(to_execution_error)?;
         let recs = result.collect::<Vec<_>>();
@@ -223,4 +224,39 @@ impl ExecutionPlan for DuckDBExec {
 #[allow(clippy::needless_pass_by_value)]
 fn to_execution_error(e: impl Into<Box<dyn std::error::Error>>) -> DataFusionError {
     DataFusionError::Execution(format!("{}", e.into()).to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{error::Error, sync::Arc};
+
+    use datafusion::execution::context::SessionContext;
+    use duckdb::DuckdbConnectionManager;
+
+    use crate::DuckDBTable;
+
+    #[tokio::test]
+    async fn test_duckdb_table() -> Result<(), Box<dyn Error>> {
+        let ctx = SessionContext::new();
+
+        let conn = DuckdbConnectionManager::memory()?;
+
+        let pool = r2d2::Pool::new(conn)?;
+
+        let db_conn = pool.get()?;
+        db_conn.execute_batch(
+            "CREATE TABLE test (a INTEGER, b VARCHAR); INSERT INTO test VALUES (3, 'bar');",
+        )?;
+
+        let duckdb_table = DuckDBTable::new(pool, "test")?;
+
+        ctx.register_table("test_datafusion", Arc::new(duckdb_table))?;
+
+        let sql = "SELECT * FROM test_datafusion limit 1";
+        let df = ctx.sql(sql).await?;
+
+        df.show().await?;
+
+        Ok(())
+    }
 }

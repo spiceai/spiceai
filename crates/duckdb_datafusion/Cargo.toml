@@ -16,3 +16,4 @@ datafusion = "34.0.0"
 async-trait = "0.1.77"
 r2d2 = "0.8.10"
 snafu.workspace = true
+tokio.workspace = true

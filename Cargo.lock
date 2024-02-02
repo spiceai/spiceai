@@ -1257,24 +1257,7 @@ dependencies = [
  "duckdb",
  "r2d2",
  "snafu 0.8.0",
-]
-
-[[package]]
-name = "duckdb_test"
-version = "0.10.0-alpha.0"
-dependencies = [
- "arrow",
- "arrow-flight",
- "async-stream",
- "clap",
- "datafusion",
- "duckdb",
- "duckdb_datafusion",
- "futures",
- "r2d2",
  "tokio",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
