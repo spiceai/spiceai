@@ -34,7 +34,8 @@ spice login
 # See more at: https://docs.spiceai.org/
 `,
 	Run: func(cmd *cobra.Command, args []string) {
-		err := browser.OpenURL(fmt.Sprintf("https://cloud-git-mitch-device-auth-spice.vercel.app/login?cli-callback=true")) //, url.QueryEscape("http://localhost:3000/auth/callback")))
+
+		err := browser.OpenURL(fmt.Sprintf("https://cloud-git-mitch-device-auth-spice.vercel.app/login?cli-callback=true"))
 		if err != nil {
 			cmd.Println(err.Error())
 			os.Exit(1)
