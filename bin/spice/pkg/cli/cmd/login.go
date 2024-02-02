@@ -2,9 +2,11 @@ package cmd
 
 import (
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
+	"time"
 
 	"github.com/logrusorgru/aurora"
 	toml "github.com/pelletier/go-toml"
@@ -32,21 +34,6 @@ spice login
 # See more at: https://docs.spiceai.org/
 `,
 	Run: func(cmd *cobra.Command, args []string) {
-		// supabaseClient := supabase.CreateClient(
-		// 	"https://gkxlaoqvfeytpsffjksw.supabase.co",
-		// 	// Public Key
-		// 	"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImdreGxhb3F2ZmV5dHBzZmZqa3N3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3MDY5MTE1NTUsImV4cCI6MjAyMjQ4NzU1NX0.nYCRqu8QW3YhZDxA7GnN5J1BPRx6m8UVyVEuJ7VXpF4",
-		// )
-		// signInDetails, err := supabaseClient.Auth.SignInWithProvider(supabase.ProviderSignInOptions{
-		// 	Provider:   "github",
-		// 	Scopes:     []string{"read:user", "user:email", "read:org"},
-		// 	RedirectTo: "http://localhost:3000/auth/callback",
-		// 	FlowType:   supabase.PKCE,
-		// })
-		// if err != nil {
-		// 	cmd.Println(err.Error())
-		// 	os.Exit(1)
-		// }
 		err := browser.OpenURL(fmt.Sprintf("https://cloud-git-mitch-device-auth-spice.vercel.app/login?cli-callback=true")) //, url.QueryEscape("http://localhost:3000/auth/callback")))
 		if err != nil {
 			cmd.Println(err.Error())
@@ -61,52 +48,40 @@ spice login
 
 		fmt.Println(auth)
 
-		// auth, err := supabaseClient.Auth.ExchangeCode(context.Background(), supabase.ExchangeCodeOpts{
-		// 	AuthCode:     code,
-		// 	CodeVerifier: signInDetails.CodeVerifier,
-		// })
-		// if err != nil {
-		// 	cmd.Println(err.Error())
-		// 	os.Exit(1)
-		// }
+		req, err := http.NewRequest("GET", "https://cloud-git-mitch-device-auth-spice.vercel.app/api/orgs", nil)
+		if err != nil {
+			cmd.Println(err.Error())
+			os.Exit(1)
+		}
+		req.AddCookie(&http.Cookie{
+			Name:    "gh_token",
+			Value:   auth.ProviderToken,
+			Expires: time.Now().Add(time.Hour * 7),
+		})
+		req.AddCookie(&http.Cookie{
+			Name:    "gh_refresh_token",
+			Value:   auth.ProviderRefreshToken,
+			Expires: time.Now().Add(time.Hour * 24 * 180),
+		})
 
-		// fmt.Println(auth.ProviderToken)
-		// fmt.Println(auth.ProviderRefreshToken)
+		client := &http.Client{}
+		resp, err := client.Do(req)
+		if err != nil {
+			cmd.Println(err.Error())
+			os.Exit(1)
+		}
+		defer resp.Body.Close()
 
-		// req, err := http.NewRequest("GET", "https://dev.spice.xyz/api/orgs", nil)
-		// if err != nil {
-		// 	cmd.Println(err.Error())
-		// 	os.Exit(1)
-		// }
-		// req.AddCookie(&http.Cookie{
-		// 	Name:    "gh_token",
-		// 	Value:   auth.ProviderToken,
-		// 	Expires: time.Now().Add(time.Hour * 7),
-		// })
-		// req.AddCookie(&http.Cookie{
-		// 	Name:    "gh_refresh_token",
-		// 	Value:   auth.ProviderRefreshToken,
-		// 	Expires: time.Now().Add(time.Hour * 24 * 180),
-		// })
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			cmd.Println(err.Error())
+			os.Exit(1)
+		}
 
-		// client := &http.Client{}
-		// resp, err := client.Do(req)
-		// if err != nil {
-		// 	cmd.Println(err.Error())
-		// 	os.Exit(1)
-		// }
-		// defer resp.Body.Close()
-
-		// body, err := io.ReadAll(resp.Body)
-		// if err != nil {
-		// 	cmd.Println(err.Error())
-		// 	os.Exit(1)
-		// }
-
-		// if resp.StatusCode != 200 {
-		// 	cmd.Println("Failed to retrieve orgs: " + string(body))
-		// 	os.Exit(1)
-		// }
+		if resp.StatusCode != 200 {
+			cmd.Println("Failed to retrieve orgs: " + string(body))
+			os.Exit(1)
+		}
 
 		//println(string(body))
 
