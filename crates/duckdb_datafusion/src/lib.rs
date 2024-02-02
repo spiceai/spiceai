@@ -21,11 +21,11 @@ use datafusion::{
 
 #[derive(Debug, Snafu)]
 pub enum Error {
+    #[snafu(display("Unable to get a DuckDB connection from the pool: {}", source))]
     UnableToGetConnectionFromPool { source: r2d2::Error },
 
+    #[snafu(display("Unable to query DuckDB: {}", source))]
     UnableToQueryDuckDB { source: duckdb::Error },
-
-    ResultExpected,
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
