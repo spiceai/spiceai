@@ -6,7 +6,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"time"
 
 	"github.com/logrusorgru/aurora"
 	toml "github.com/pelletier/go-toml"
@@ -23,6 +22,7 @@ const (
 type CloudAuth struct {
 	ProviderToken        string `json:"provider_token"`
 	ProviderRefreshToken string `json:"provider_refresh_token"`
+	AuthToken            string `json:"auth_token"`
 }
 
 var loginCmd = &cobra.Command{
@@ -55,15 +55,19 @@ spice login
 			os.Exit(1)
 		}
 		req.AddCookie(&http.Cookie{
-			Name:    "gh_token",
-			Value:   auth.ProviderToken,
-			Expires: time.Now().Add(time.Hour * 7),
+			Name:  "gh_token",
+			Value: auth.ProviderToken,
 		})
 		req.AddCookie(&http.Cookie{
-			Name:    "gh_refresh_token",
-			Value:   auth.ProviderRefreshToken,
-			Expires: time.Now().Add(time.Hour * 24 * 180),
+			Name:  "gh_refresh_token",
+			Value: auth.ProviderRefreshToken,
 		})
+		req.AddCookie(&http.Cookie{
+			Name:  "sb-gkxlaoqvfeytpsffjksw-auth-token",
+			Value: auth.AuthToken,
+		})
+
+		fmt.Println(req)
 
 		client := &http.Client{}
 		resp, err := client.Do(req)
@@ -102,26 +106,32 @@ func listenAndGetAuth() (*CloudAuth, error) {
 
 	// TODO: Make this a pretty web page that matches our branding. Also move focus back to terminal.
 	http.HandleFunc("/auth/callback", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Print(r)
-
-		token, err := r.Cookie("gh_token")
-		if err != nil {
+		token := r.URL.Query().Get("gh_token")
+		if token == "" {
 			fmt.Printf("Authorization failed. Did not receive token.")
 			authChan <- &CloudAuth{}
 			return
 		}
 
-		refreshToken, err := r.Cookie("gh_refresh_token")
-		if err != nil {
+		refreshToken := r.URL.Query().Get("gh_refresh_token")
+		if refreshToken == "" {
 			fmt.Printf("Authorization failed. Did not receive refresh token.")
+			authChan <- &CloudAuth{}
+			return
+		}
+
+		sbAuthToken, err := r.Cookie("supabase-auth-token")
+		if err != nil {
+			fmt.Printf("Authorization failed. Did not receive Supabase auth token.")
 			authChan <- &CloudAuth{}
 			return
 		}
 
 		fmt.Println("Authorization successful. You can now return to the CLI.")
 		authChan <- &CloudAuth{
-			ProviderToken:        token.Value,
-			ProviderRefreshToken: refreshToken.Value,
+			ProviderToken:        token,
+			ProviderRefreshToken: refreshToken,
+			AuthToken:            sbAuthToken.Value,
 		}
 	})
 
