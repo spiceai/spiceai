@@ -11,13 +11,15 @@ use datafusion::{
     datasource::TableProvider,
     error::{DataFusionError, Result as DataFusionResult},
     execution::{context::SessionState, TaskContext},
-    logical_expr::{Expr, TableType},
+    logical_expr::{Expr, TableProviderFilterPushDown, TableType},
     physical_plan::{
         memory::MemoryStream, project_schema, DisplayAs, DisplayFormatType, ExecutionPlan,
         SendableRecordBatchStream,
     },
     sql::TableReference,
 };
+
+mod expr;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -26,6 +28,9 @@ pub enum Error {
 
     #[snafu(display("Unable to query DuckDB: {}", source))]
     UnableToQueryDuckDB { source: duckdb::Error },
+
+    #[snafu(display("Unable to generate SQL: {}", source))]
+    UnableToGenerateSQL { source: expr::Error },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -83,6 +88,7 @@ impl DuckDBTable {
         &self,
         projections: Option<&Vec<usize>>,
         schema: &SchemaRef,
+        filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(DuckDBExec::new(
@@ -90,6 +96,7 @@ impl DuckDBTable {
             schema,
             &self.table_reference,
             Arc::clone(&self.pool),
+            filters,
             limit,
         )?))
     }
@@ -109,14 +116,29 @@ impl TableProvider for DuckDBTable {
         TableType::Base
     }
 
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
+        let mut filter_push_down = vec![];
+        for filter in filters {
+            match expr::expr_to_sql(filter) {
+                Ok(_) => filter_push_down.push(TableProviderFilterPushDown::Exact),
+                Err(_) => filter_push_down.push(TableProviderFilterPushDown::Unsupported),
+            }
+        }
+
+        Ok(filter_push_down)
+    }
+
     async fn scan(
         &self,
         _state: &SessionState,
         projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
+        filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        return self.create_physical_plan(projection, &self.schema(), limit);
+        return self.create_physical_plan(projection, &self.schema(), filters, limit);
     }
 }
 
@@ -125,6 +147,7 @@ struct DuckDBExec {
     projected_schema: SchemaRef,
     table_reference: OwnedTableReference,
     pool: Arc<r2d2::Pool<DuckdbConnectionManager>>,
+    filters: Vec<Expr>,
     limit: Option<usize>,
 }
 
@@ -134,6 +157,7 @@ impl DuckDBExec {
         schema: &SchemaRef,
         table_reference: &OwnedTableReference,
         pool: Arc<r2d2::Pool<DuckdbConnectionManager>>,
+        filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Self> {
         let projected_schema = project_schema(schema, projections)?;
@@ -141,20 +165,55 @@ impl DuckDBExec {
             projected_schema,
             table_reference: table_reference.clone(),
             pool,
+            filters: filters.to_vec(),
             limit,
         })
+    }
+
+    fn sql(&self) -> Result<String> {
+        let columns = self
+            .projected_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let limit_expr = match self.limit {
+            Some(limit) => format!("LIMIT {limit}"),
+            None => String::new(),
+        };
+
+        let where_expr = if self.filters.is_empty() {
+            String::new()
+        } else {
+            let filter_expr = self
+                .filters
+                .iter()
+                .map(expr::expr_to_sql)
+                .collect::<expr::Result<Vec<_>>>()
+                .context(UnableToGenerateSQLSnafu)?;
+            format!("WHERE {}", filter_expr.join(" AND "))
+        };
+
+        Ok(format!(
+            "SELECT {columns} FROM {table_reference} {where_expr} {limit_expr}",
+            table_reference = self.table_reference,
+        ))
     }
 }
 
 impl std::fmt::Debug for DuckDBExec {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "DuckDBExec")
+        let sql = self.sql().unwrap_or_default();
+        write!(f, "DuckDBExec sql={sql}")
     }
 }
 
 impl DisplayAs for DuckDBExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> std::fmt::Result {
-        write!(f, "DuckDB")
+        let sql = self.sql().unwrap_or_default();
+        write!(f, "DuckDB sql={sql}")
     }
 }
 
@@ -193,24 +252,8 @@ impl ExecutionPlan for DuckDBExec {
     ) -> DataFusionResult<SendableRecordBatchStream> {
         let conn = self.pool.get().map_err(to_execution_error)?;
 
-        let columns = self
-            .projected_schema
-            .fields()
-            .iter()
-            .map(|f| f.name().as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        let limit_expr = match self.limit {
-            Some(limit) => format!("LIMIT {limit}"),
-            None => String::new(),
-        };
-
-        let sql = format!(
-            "SELECT {columns} FROM {table_reference} {limit_expr}",
-            table_reference = self.table_reference,
-        );
-        println!("sql: {sql}");
+        let sql = self.sql().map_err(to_execution_error)?;
+        tracing::debug!("duckdb sql: {sql}");
 
         let mut stmt = conn.prepare(&sql).map_err(to_execution_error)?;
 
@@ -232,31 +275,49 @@ mod tests {
 
     use datafusion::execution::context::SessionContext;
     use duckdb::DuckdbConnectionManager;
+    use tracing::level_filters::LevelFilter;
 
     use crate::DuckDBTable;
 
+    fn setup_tracing() {
+        tracing_subscriber::fmt()
+            .with_max_level(LevelFilter::DEBUG)
+            .init();
+    }
+
     #[tokio::test]
     async fn test_duckdb_table() -> Result<(), Box<dyn Error>> {
+        setup_tracing();
         let ctx = SessionContext::new();
-
         let conn = DuckdbConnectionManager::memory()?;
-
         let pool = r2d2::Pool::new(conn)?;
-
         let db_conn = pool.get()?;
         db_conn.execute_batch(
             "CREATE TABLE test (a INTEGER, b VARCHAR); INSERT INTO test VALUES (3, 'bar');",
         )?;
-
         let duckdb_table = DuckDBTable::new(pool, "test")?;
-
         ctx.register_table("test_datafusion", Arc::new(duckdb_table))?;
-
         let sql = "SELECT * FROM test_datafusion limit 1";
         let df = ctx.sql(sql).await?;
-
         df.show().await?;
+        Ok(())
+    }
 
+    #[tokio::test]
+    async fn test_duckdb_table_filter() -> Result<(), Box<dyn Error>> {
+        setup_tracing();
+        let ctx = SessionContext::new();
+        let conn = DuckdbConnectionManager::memory()?;
+        let pool = r2d2::Pool::new(conn)?;
+        let db_conn = pool.get()?;
+        db_conn.execute_batch(
+            "CREATE TABLE test (a INTEGER, b VARCHAR); INSERT INTO test VALUES (3, 'bar');",
+        )?;
+        let duckdb_table = DuckDBTable::new(pool, "test")?;
+        ctx.register_table("test_datafusion", Arc::new(duckdb_table))?;
+        let sql = "SELECT * FROM test_datafusion where a > 1 and b = 'bar' limit 1";
+        let df = ctx.sql(sql).await?;
+        df.show().await?;
         Ok(())
     }
 }

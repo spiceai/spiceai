@@ -17,3 +17,5 @@ async-trait = "0.1.77"
 r2d2 = "0.8.10"
 snafu.workspace = true
 tokio.workspace = true
+tracing = "0.1.40"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
