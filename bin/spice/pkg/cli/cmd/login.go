@@ -36,9 +36,13 @@ spice login
 		cmd.Printf("Auth Code: %s\n", authCode)
 
 		spiceApiClient := api.NewSpiceApiClient()
-		spiceApiClient.Init()
+		err := spiceApiClient.Init()
+		if err != nil {
+			cmd.Println(err.Error())
+			os.Exit(1)
+		}
 
-		err := browser.OpenURL(spiceApiClient.GetAuthUrl(authCode))
+		err = browser.OpenURL(spiceApiClient.GetAuthUrl(authCode))
 		if err != nil {
 			cmd.Println(err.Error())
 			os.Exit(1)
