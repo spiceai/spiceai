@@ -40,7 +40,7 @@ func (s *SpiceApiClient) GetAuthUrl(authCode string) string {
 	return fmt.Sprintf("%s/auth/device?code=%s", s.baseUrl, authCode)
 }
 
-func (s *SpiceApiClient) GetUser(accessToken string) (user SpiceUser, err error) {
+func (s *SpiceApiClient) GetUser(accessToken string) (SpiceUser, error) {
 	var spiceUser SpiceUser
 
 	request, err := http.NewRequest("GET", fmt.Sprintf("%s/api/device/user", s.baseUrl), nil)
