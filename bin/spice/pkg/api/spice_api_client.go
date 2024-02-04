@@ -45,7 +45,7 @@ func (s *SpiceApiClient) GetUser(accessToken string) (SpiceUser, error) {
 
 	request, err := http.NewRequest("GET", fmt.Sprintf("%s/api/device/user", s.baseUrl), nil)
 	if err != nil {
-		fmt.Println(err)
+		return spiceUser, err
 	}
 
 	request.Header.Set("Authorization", fmt.Sprintf("Bearer %s", accessToken))
@@ -53,21 +53,18 @@ func (s *SpiceApiClient) GetUser(accessToken string) (SpiceUser, error) {
 	client := &http.Client{}
 	response, err := client.Do(request)
 	if err != nil {
-		fmt.Println(err)
 		return spiceUser, err
 	}
 	defer response.Body.Close()
 
 	body, err := io.ReadAll(response.Body)
 	if err != nil {
-		fmt.Println("Error:", err)
 		return spiceUser, err
 	}
 
 	err = json.Unmarshal(body, &spiceUser)
 
 	if err != nil {
-		fmt.Println("Error:", err)
 		return spiceUser, err
 	}
 
@@ -83,13 +80,11 @@ func (s *SpiceApiClient) ExchangeCode(authCode string) (AccessTokenResponse, err
 
 	jsonBody, err := json.Marshal(payload)
 	if err != nil {
-		fmt.Println("Error:", err)
 		return authStatusResponse, err
 	}
 
 	request, err := http.NewRequest("POST", fmt.Sprintf("%s/auth/device/exchange", s.baseUrl), bytes.NewReader(jsonBody))
 	if err != nil {
-		fmt.Println("Error:", err)
 		return authStatusResponse, err
 	}
 	request.Header.Set("Content-Type", "application/json")
@@ -97,21 +92,18 @@ func (s *SpiceApiClient) ExchangeCode(authCode string) (AccessTokenResponse, err
 	client := &http.Client{}
 	response, err := client.Do(request)
 	if err != nil {
-		fmt.Println("Error:", err)
 		return authStatusResponse, err
 	}
 	defer response.Body.Close()
 
 	body, err := io.ReadAll(response.Body)
 	if err != nil {
-		fmt.Println("Error:", err)
 		return authStatusResponse, err
 	}
 
 	err = json.Unmarshal(body, &authStatusResponse)
 
 	if err != nil {
-		fmt.Println("Error:", err)
 		return authStatusResponse, err
 	}
 
