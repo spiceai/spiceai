@@ -57,7 +57,7 @@ spice login
 
 			authStatusResponse, err := spiceApiClient.ExchangeCode(authCode)
 			if err != nil {
-				fmt.Println("Error:", err)
+				cmd.Println("Error:", err)
 				continue
 			}
 
