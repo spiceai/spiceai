@@ -2,10 +2,9 @@ package cmd
 
 import (
 	"crypto/rand"
-	"encoding/base64"
 	"fmt"
+	"math/big"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/logrusorgru/aurora"
@@ -19,6 +18,7 @@ const (
 	apiKeyFlag   = "key"
 	usernameFlag = "username"
 	passwordFlag = "password"
+	charset      = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 )
 
 var loginCmd = &cobra.Command{
@@ -183,15 +183,15 @@ func init() {
 }
 
 func generateAuthCode() string {
-	randomBytes := make([]byte, 6)
+	randomString := make([]byte, 8)
+	charsetLength := big.NewInt(int64(len(charset)))
 
-	_, err := rand.Read(randomBytes)
-	if err != nil {
-		panic(err)
+	for i := 0; i < 8; i++ {
+		randomIndex, _ := rand.Int(rand.Reader, charsetLength)
+		randomString[i] = charset[randomIndex.Int64()]
 	}
 
-	authCode := base64.URLEncoding.EncodeToString(randomBytes)
-	authCode = strings.ToUpper(authCode)[:8]
+	authCode := string(randomString)
 
 	return authCode
 }
