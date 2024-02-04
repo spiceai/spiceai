@@ -33,7 +33,7 @@ spice login
 		authCode := generateAuthCode()
 
 		cmd.Println("Opening browser to authenticate with Spice.ai")
-		cmd.Printf("Auth Code: %s\n", authCode)
+		cmd.Printf("Auth Code: %s-%s\n", authCode[:4], authCode[4:])
 
 		spiceApiClient := api.NewSpiceApiClient()
 		err := spiceApiClient.Init()
