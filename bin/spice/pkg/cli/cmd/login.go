@@ -69,7 +69,7 @@ spice login
 
 		user, err := spiceApiClient.GetUser(accessToken)
 		if err != nil {
-			fmt.Println("Error:", err)
+			cmd.Println("Error:", err)
 			os.Exit(1)
 		}
 
