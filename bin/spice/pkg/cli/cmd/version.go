@@ -86,7 +86,7 @@ func checkLatestCliReleaseVersion() error {
 	}
 
 	cliVersion := version.Version()
-	if cliVersion != "local" && cliVersion != latestReleaseVersion {
+	if !strings.HasPrefix(cliVersion, "local") && cliVersion != latestReleaseVersion {
 		fmt.Printf("\nCLI version %s is now available!\nTo upgrade, run \"spice upgrade\".\n", aurora.BrightGreen(latestReleaseVersion))
 	}
 
