@@ -1,5 +1,6 @@
 use arrow_flight::decode::DecodedPayload;
 use async_stream::stream;
+use flight_client::FlightClient;
 use futures::StreamExt;
 use futures_core::stream::BoxStream;
 use snafu::prelude::*;
@@ -34,10 +35,10 @@ impl DataSource for SpiceAI {
     where
         Self: Sized,
     {
-        let default_flight_url = if cfg!(release) {
-            "https://flight.spiceai.io".to_string()
-        } else {
+        let default_flight_url = if cfg!(dev) {
             "https://dev-flight.spiceai.io".to_string()
+        } else {
+            "https://flight.spiceai.io".to_string()
         };
         Box::pin(async move {
             let url: String = params
@@ -45,10 +46,16 @@ impl DataSource for SpiceAI {
                 .as_ref() // Option<&HashMap<String, String>>
                 .and_then(|params| params.get("endpoint").cloned())
                 .unwrap_or(default_flight_url);
-            let flight = Flight::new(auth_provider, url);
-            Ok(Self {
-                flight: flight.await?,
-            })
+            tracing::trace!("Connecting to SpiceAI with flight url: {url}");
+            let flight_client = FlightClient::new(
+                url.as_str(),
+                "",
+                auth_provider.get_param("key").unwrap_or_default(),
+            )
+            .await
+            .map_err(|e| super::Error::UnableToCreateDataSource { source: e.into() })?;
+            let flight = Flight::new(flight_client);
+            Ok(Self { flight })
         })
     }
 

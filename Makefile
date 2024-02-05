@@ -7,10 +7,17 @@ all: build
 .PHONY: build
 build:
 	make -C bin/spice
+	make -C bin/spiced
+
+.PHONY: build-dev
+build-dev:
+	make -C bin/spice
+	export DEV=true; make -C bin/spiced
 
 .PHONY: ci
 ci:
-	export SPICED_TARGET_DIR=/workspace/spiceai/target; make -C bin/spice
+	make -C bin/spice
+	export SPICED_TARGET_DIR=/workspace/spiceai/target; make -C bin/spiced
 
 .PHONY: lint
 lint:
@@ -37,6 +44,15 @@ docker-run:
 ################################################################################
 .PHONY: install
 install: build
+	mkdir -p ~/.spice/bin
+	install -m 755 target/release/spice ~/.spice/bin/spice
+	install -m 755 target/release/spiced ~/.spice/bin/spiced
+
+################################################################################
+# Target: install-dev                                                          #
+################################################################################
+.PHONY: install-dev
+install-dev: build-dev
 	mkdir -p ~/.spice/bin
 	install -m 755 target/release/spice ~/.spice/bin/spice
 	install -m 755 target/release/spiced ~/.spice/bin/spiced

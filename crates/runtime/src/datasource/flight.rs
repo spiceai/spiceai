@@ -1,7 +1,6 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::auth::AuthProvider;
 use arrow::record_batch::RecordBatch;
 use flight_client::FlightClient;
 use futures::StreamExt;
@@ -12,25 +11,13 @@ pub struct Flight {
 
 impl Flight {
     #[must_use]
-    pub(crate) fn new(
-        auth_provider: AuthProvider,
-        endpoint: String,
-    ) -> Pin<Box<dyn Future<Output = super::Result<Self>>>>
+    pub(crate) fn new(flight_client: FlightClient) -> Self
     where
         Self: Sized,
     {
-        Box::pin(async move {
-            let flight_client = FlightClient::new(
-                endpoint.as_str(),
-                auth_provider.get_param("username").unwrap_or_default(),
-                auth_provider.get_param("password").unwrap_or_default(),
-            )
-            .await
-            .map_err(|e| super::Error::UnableToCreateDataSource { source: e.into() })?;
-            Ok(Flight {
-                client: flight_client,
-            })
-        })
+        Flight {
+            client: flight_client,
+        }
     }
 
     pub(crate) fn get_all_data(
