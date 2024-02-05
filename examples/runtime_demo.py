@@ -3,10 +3,10 @@ from time import sleep
 from spicepy import Client
 
 
-client = Client('REPLACE_WITH_API_KEY', 'grpc+tls://dev-flight.spiceai.io')
+client = Client('3630|0308bd3f63f04176ad7ee1295b68be52', 'grpc://127.0.0.1:50051')
 
 startTime = time.time()
-data = client.query('SELECT * FROM eth.recent_blocks ORDER BY number DESC LIMIT 100')
+data = client.query('SELECT * FROM eth_recent_blocks')
 endTime = time.time()
 pd = data.read_pandas()
 

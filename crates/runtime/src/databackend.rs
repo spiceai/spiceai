@@ -3,10 +3,11 @@ use datafusion::{error::DataFusionError, execution::context::SessionContext, sql
 use snafu::prelude::*;
 use std::{future::Future, pin::Pin, sync::Arc};
 
-use self::memtable::MemTableBackend;
+use self::{memtable::MemTableBackend, viewtable::ViewTableBackend};
 
 pub mod duckdb;
 pub mod memtable;
+pub mod viewtable;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -15,6 +16,18 @@ pub enum Error {
 
     UnableToParseSql {
         source: sqlparser::parser::ParserError,
+    },
+
+    #[snafu(display("Unable to create table: {}", reason))]
+    UnableToCreateTable { reason: String },
+
+    #[snafu(display("Unable to create table"))]
+    UnableToCreateTableDataFusion { source: DataFusionError },
+
+    #[snafu(display("Unsupported operation {} for backend {:?}", operation, backend))]
+    UnsupportedOperation {
+        operation: String,
+        backend: DataBackendType,
     },
 }
 
@@ -25,6 +38,7 @@ pub enum DataBackendType {
     #[default]
     Memtable,
     DuckDB,
+    ViewTable,
 }
 
 pub trait DataBackend: Send + Sync {
@@ -35,10 +49,17 @@ pub trait DataBackend: Send + Sync {
 }
 
 impl dyn DataBackend {
-    #[must_use]
-    pub fn new(ctx: &Arc<SessionContext>, name: &str, backend_type: &DataBackendType) -> Box<Self> {
+    pub async fn new(
+        ctx: &Arc<SessionContext>,
+        name: &str,
+        backend_type: &DataBackendType,
+        sql: Option<&str>,
+    ) -> Result<Box<Self>> {
         match backend_type {
-            DataBackendType::Memtable => Box::new(MemTableBackend::new(Arc::clone(ctx), name)),
+            DataBackendType::Memtable => Ok(Box::new(MemTableBackend::new(Arc::clone(ctx), name))),
+            DataBackendType::ViewTable => Ok(Box::new(
+                ViewTableBackend::new(Arc::clone(ctx), name, sql.unwrap_or_default()).await?,
+            )),
             DataBackendType::DuckDB => {
                 todo!("DuckDB backend not implemented yet");
             }

@@ -24,6 +24,10 @@ pub enum Error {
         source: DataFusionError,
     },
 
+    UnableToCreateBackend {
+        source: crate::databackend::Error,
+    },
+
     TableAlreadyExists {},
 }
 
@@ -51,14 +55,21 @@ impl DataFusion {
     }
 
     #[allow(clippy::needless_pass_by_value)]
-    pub fn attach_backend(&mut self, table_name: &str, backend: DataBackendType) -> Result<()> {
+    pub async fn attach_backend(
+        &mut self,
+        table_name: &str,
+        backend: DataBackendType,
+        sql: &str,
+    ) -> Result<()> {
         let table_exists = self.ctx.table_exist(table_name).unwrap_or(false);
         if table_exists {
             return TableAlreadyExistsSnafu.fail();
         }
 
         let data_backend: Box<dyn DataBackend> =
-            <dyn DataBackend>::new(&self.ctx, table_name, &backend);
+            <dyn DataBackend>::new(&self.ctx, table_name, &backend, Some(sql))
+                .await
+                .context(UnableToCreateBackendSnafu)?;
 
         self.backends
             .insert(table_name.to_string(), Arc::new(data_backend));
@@ -78,7 +89,7 @@ impl DataFusion {
     }
 
     #[allow(clippy::needless_pass_by_value)]
-    pub fn attach(
+    pub async fn attach(
         &mut self,
         dataset: &Dataset,
         data_source: &'static mut dyn DataSource,
@@ -91,7 +102,9 @@ impl DataFusion {
         }
 
         let data_backend: Box<dyn DataBackend> =
-            <dyn DataBackend>::new(&self.ctx, table_name, &backend);
+            <dyn DataBackend>::new(&self.ctx, table_name, &backend, None)
+                .await
+                .context(UnableToCreateBackendSnafu)?;
 
         let dataset_clone = dataset.clone();
         let task_handle = task::spawn(async move {

@@ -95,7 +95,7 @@ pub async fn run(args: Args) -> Result<()> {
                         data_source: source,
                     })?,
             )),
-            "localhost" => None,
+            "localhost" | "" => None,
             "debug" => Some(Box::new(datasource::debug::DebugSource {})),
             _ => UnknownDataSourceSnafu {
                 data_source: source,
@@ -108,12 +108,18 @@ pub async fn run(args: Args) -> Result<()> {
                 let data_source = Box::leak(data_source);
 
                 df.attach(ds, data_source, databackend::DataBackendType::default())
+                    .await
                     .context(UnableToAttachDataSourceSnafu {
                         data_source: source,
                     })?;
             }
             None => df
-                .attach_backend(&ds.name, databackend::DataBackendType::default())
+                .attach_backend(
+                    &ds.name,
+                    databackend::DataBackendType::ViewTable,
+                    ds.sql.clone().unwrap_or_default().as_str(),
+                )
+                .await
                 .context(UnableToAttachDataSourceSnafu {
                     data_source: source,
                 })?,
