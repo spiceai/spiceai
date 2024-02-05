@@ -51,13 +51,13 @@ func (s *SpiceApiClient) Init() error {
 }
 
 func (s *SpiceApiClient) GetAuthUrl(authCode string) string {
-	return fmt.Sprintf("%s/auth/device?code=%s", s.baseUrl, authCode)
+	return fmt.Sprintf("%s/auth/token?code=%s", s.baseUrl, authCode)
 }
 
 func (s *SpiceApiClient) GetUser(accessToken string) (SpiceUser, error) {
 	var spiceUser SpiceUser
 
-	request, err := http.NewRequest("GET", fmt.Sprintf("%s/api/device/user", s.baseUrl), nil)
+	request, err := http.NewRequest("GET", fmt.Sprintf("%s/api/spice-cli/user", s.baseUrl), nil)
 	if err != nil {
 		return spiceUser, err
 	}
@@ -97,7 +97,7 @@ func (s *SpiceApiClient) ExchangeCode(authCode string) (AccessTokenResponse, err
 		return authStatusResponse, err
 	}
 
-	request, err := http.NewRequest("POST", fmt.Sprintf("%s/auth/device/exchange", s.baseUrl), bytes.NewReader(jsonBody))
+	request, err := http.NewRequest("POST", fmt.Sprintf("%s/auth/token/exchange", s.baseUrl), bytes.NewReader(jsonBody))
 	if err != nil {
 		return authStatusResponse, err
 	}
