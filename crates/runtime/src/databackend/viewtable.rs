@@ -36,6 +36,8 @@ impl ViewTableBackend {
         }
 
         let view: ViewTable;
+        let mut backoff = Duration::from_secs(1);
+        let mut attempts = 1;
         // Tables are currently lazily created (i.e. not created until first data is received) so that we know the table schema.
         // This means that we can't create a view on top of a table until the first data is received for all dependent tables and therefore
         // the tables are created. To handle this, if view creation fails with a plan error, we retry until the table is created.
@@ -49,12 +51,19 @@ impl ViewTableBackend {
                 }
                 Err(e) => match e {
                     DataFusionError::Plan(_) => {
+                        if attempts > 5 {
+                            return Err(e).context(UnableToCreateTableDataFusionSnafu);
+                        }
+
                         tracing::error!(
-                            "Plan error for {}, waiting 1 second and retrying: {}",
+                            "Plan error for {}, retrying in {:?}: {}",
                             name,
+                            backoff,
                             e
                         );
-                        thread::sleep(Duration::from_secs(1));
+                        thread::sleep(backoff);
+                        backoff *= 2;
+                        attempts += 1;
                         continue;
                     }
                     _ => return Err(e).context(UnableToCreateTableDataFusionSnafu),
