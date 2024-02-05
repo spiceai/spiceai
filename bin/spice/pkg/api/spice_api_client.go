@@ -28,7 +28,8 @@ type SpiceApp struct {
 }
 
 type AccessTokenResponse struct {
-	AccessToken string `json:"access_token,omitempty"`
+	AccessDenied bool   `json:"access_denied,omitempty"`
+	AccessToken  string `json:"access_token,omitempty"`
 }
 
 type SpiceApiClient struct {

@@ -61,6 +61,11 @@ spice login
 				continue
 			}
 
+			if authStatusResponse.AccessDenied {
+				cmd.Println("Access denied")
+				os.Exit(1)
+			}
+
 			if authStatusResponse.AccessToken != "" {
 				accessToken = authStatusResponse.AccessToken
 				break
