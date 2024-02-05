@@ -7,6 +7,7 @@ const (
 	AUTH_PARAM_KEY      = "key"
 	AUTH_PARAM_PASSWORD = "password"
 	AUTH_PARAM_USERNAME = "username"
+	AUTH_PARAM_TOKEN    = "token"
 )
 
 type Auth struct {

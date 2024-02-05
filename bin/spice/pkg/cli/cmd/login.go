@@ -1,11 +1,15 @@
 package cmd
 
 import (
+	"crypto/rand"
 	"fmt"
+	"math/big"
 	"os"
+	"time"
 
 	"github.com/logrusorgru/aurora"
 	toml "github.com/pelletier/go-toml"
+	"github.com/pkg/browser"
 	"github.com/spf13/cobra"
 	"github.com/spiceai/spiceai/bin/spice/pkg/api"
 )
@@ -14,6 +18,7 @@ const (
 	apiKeyFlag   = "key"
 	usernameFlag = "username"
 	passwordFlag = "password"
+	charset      = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 )
 
 var loginCmd = &cobra.Command{
@@ -25,25 +30,63 @@ spice login
 # See more at: https://docs.spiceai.org/
 `,
 	Run: func(cmd *cobra.Command, args []string) {
-		key, err := cmd.Flags().GetString(apiKeyFlag)
+		authCode := generateAuthCode()
+
+		cmd.Println("Opening browser to authenticate with Spice.ai")
+		cmd.Printf("Auth Code: %s-%s\n", authCode[:4], authCode[4:])
+
+		spiceApiClient := api.NewSpiceApiClient()
+		err := spiceApiClient.Init()
 		if err != nil {
 			cmd.Println(err.Error())
 			os.Exit(1)
 		}
 
-		if key == "" {
-			cmd.Println("No API key provided, use --key or -k to provide an API key")
+		err = browser.OpenURL(spiceApiClient.GetAuthUrl(authCode))
+		if err != nil {
+			cmd.Println(err.Error())
+			os.Exit(1)
+		}
+
+		var accessToken string
+
+		cmd.Println("Waiting for authentication...")
+		// poll for auth status
+		for {
+			time.Sleep(time.Second)
+
+			authStatusResponse, err := spiceApiClient.ExchangeCode(authCode)
+			if err != nil {
+				cmd.Println("Error:", err)
+				continue
+			}
+
+			if authStatusResponse.AccessDenied {
+				cmd.Println("Access denied")
+				os.Exit(1)
+			}
+
+			if authStatusResponse.AccessToken != "" {
+				accessToken = authStatusResponse.AccessToken
+				break
+			}
+		}
+
+		user, err := spiceApiClient.GetUser(accessToken)
+		if err != nil {
+			cmd.Println("Error:", err)
 			os.Exit(1)
 		}
 
 		mergeAuthConfig(cmd, api.AUTH_TYPE_SPICE_AI, &api.Auth{
 			Params: map[string]string{
-				api.AUTH_PARAM_KEY:      key,
-				api.AUTH_PARAM_PASSWORD: key,
+				api.AUTH_PARAM_TOKEN: accessToken,
+				api.AUTH_PARAM_KEY:   user.App.ApiKey,
 			},
 		})
 
-		cmd.Println(aurora.BrightGreen("Successfully logged in to Spice.ai"))
+		cmd.Println(aurora.BrightGreen(fmt.Sprintf("Successfully logged in to Spice.ai as %s (%s)", user.Username, user.Email)))
+		cmd.Println(aurora.BrightGreen(fmt.Sprintf("Using app %s/%s", user.PersonalOrg.Name, user.App.Name)))
 	},
 }
 
@@ -144,4 +187,18 @@ func init() {
 	loginCmd.Flags().BoolP("help", "h", false, "Print this help message")
 	loginCmd.Flags().StringP(apiKeyFlag, "k", "", "API key")
 	RootCmd.AddCommand(loginCmd)
+}
+
+func generateAuthCode() string {
+	randomString := make([]byte, 8)
+	charsetLength := big.NewInt(int64(len(charset)))
+
+	for i := 0; i < 8; i++ {
+		randomIndex, _ := rand.Int(rand.Reader, charsetLength)
+		randomString[i] = charset[randomIndex.Int64()]
+	}
+
+	authCode := string(randomString)
+
+	return authCode
 }
