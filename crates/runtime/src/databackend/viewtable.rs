@@ -2,6 +2,7 @@ use std::{pin::Pin, sync::Arc, thread, time::Duration};
 
 use datafusion::{
     datasource::ViewTable,
+    error::DataFusionError,
     execution::context::SessionContext,
     sql::{parser::DFParser, sqlparser::dialect::AnsiDialect},
 };
@@ -21,11 +22,6 @@ pub struct ViewTableBackend {
 
 impl ViewTableBackend {
     pub async fn new(ctx: Arc<SessionContext>, name: &str, sql: &str) -> Result<Self> {
-        // TODO: Tables are currently lazily created (i.e. not created until first data is received) so that we know the table schema.
-        // This means that we can't create a view on top of a table until the first data is received for all dependent tables and therefore
-        // the tables are created. We need a way to know that all dependent tables have been created and then create the view. For now, just sleep.
-        thread::sleep(Duration::from_secs(1));
-
         let statements = DFParser::parse_sql_with_dialect(sql, &AnsiDialect {})
             .context(UnableToParseSqlSnafu)?;
         if statements.len() != 1 {
@@ -39,12 +35,31 @@ impl ViewTableBackend {
             .fail();
         }
 
-        let plan = ctx
-            .state()
-            .statement_to_plan(statements[0].clone())
-            .await
-            .context(UnableToCreateTableDataFusionSnafu)?;
-        let view = ViewTable::try_new(plan, Some(sql.to_string())).context(UnableToAddDataSnafu)?;
+        let view: ViewTable;
+        loop {
+            let plan_result = ctx.state().statement_to_plan(statements[0].clone()).await;
+
+            match plan_result {
+                Ok(plan) => {
+                    view = ViewTable::try_new(plan, Some(sql.to_string()))
+                        .context(UnableToAddDataSnafu)?;
+                    break;
+                }
+                Err(e) => match e {
+                    DataFusionError::Plan(_) => {
+                        tracing::error!(
+                            "Plan error for {}, waiting 1 second and retrying: {}",
+                            name,
+                            e
+                        );
+                        thread::sleep(Duration::from_secs(1));
+                        continue;
+                    }
+                    _ => return Err(e).context(UnableToCreateTableDataFusionSnafu),
+                },
+            }
+        }
+
         ctx.register_table(name, Arc::new(view))
             .context(UnableToCreateTableDataFusionSnafu)?;
 
