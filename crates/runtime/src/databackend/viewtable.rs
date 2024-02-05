@@ -41,7 +41,6 @@ impl ViewTableBackend {
         // the tables are created. To handle this, if view creation fails with a plan error, we retry until the table is created.
         loop {
             let plan_result = ctx.state().statement_to_plan(statements[0].clone()).await;
-
             match plan_result {
                 Ok(plan) => {
                     view = ViewTable::try_new(plan, Some(sql.to_string()))
