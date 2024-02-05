@@ -11,7 +11,7 @@ build:
 
 .PHONY: build-dev
 build-dev:
-	make -C bin/spice
+	export DEV=true; make -C bin/spice
 	export DEV=true; make -C bin/spiced
 
 .PHONY: ci

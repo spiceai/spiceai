@@ -7,7 +7,11 @@ else
 	SPICE_VERSION := local
 endif
 
-LDFLAGS:="-X $(BASE_PACKAGE_NAME)/pkg/version.version=$(SPICE_VERSION)"
+ifdef DEV
+	SPICE_VERSION := local-dev
+endif
+
+LDFLAGS:="-X $(BASE_PACKAGE_NAME)/bin/spice/pkg/version.version=$(SPICE_VERSION)"
 
 .PHONY: all
 all:

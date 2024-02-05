@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	spice_http "github.com/spiceai/spiceai/bin/spice/pkg/http"
+	"github.com/spiceai/spiceai/bin/spice/pkg/version"
 
 	"github.com/spiceai/spiceai/bin/spice/pkg/context"
 	"github.com/spiceai/spiceai/bin/spice/pkg/loggers"
@@ -24,9 +25,7 @@ var (
 type SpiceRackRegistry struct{}
 
 func getSpiceRackBaseUrl() string {
-	rtcontext := context.NewContext()
-	version, _ := rtcontext.Version()
-	if version == "local" {
+	if version.Version() == "local-dev" {
 		return "https://dev-data.spiceai.io/v0.1"
 	} else {
 		return "https://api.spicerack.org/v0.1"

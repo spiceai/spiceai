@@ -1,6 +1,9 @@
 package version
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 var (
 	// Values for these are injected by the build.
@@ -8,9 +11,9 @@ var (
 )
 
 // Version returns the Spice version. This is either a semantic version
-// number or else, in the case of unreleased code, the string "local".
+// number or else, in the case of unreleased code, the string prefix "local".
 func Version() string {
-	if version == "local" {
+	if strings.HasPrefix(version, "local") {
 		return version
 	}
 
