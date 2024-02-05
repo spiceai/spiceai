@@ -36,6 +36,9 @@ impl ViewTableBackend {
         }
 
         let view: ViewTable;
+        // TODO: Tables are currently lazily created (i.e. not created until first data is received) so that we know the table schema.
+        // This means that we can't create a view on top of a table until the first data is received for all dependent tables and therefore
+        // the tables are created. To handle this, if view creation fails with a plan error, we retry until the table is created.
         loop {
             let plan_result = ctx.state().statement_to_plan(statements[0].clone()).await;
 
