@@ -10,8 +10,21 @@ import (
 )
 
 type SpiceUser struct {
-	Email    string `json:"email,omitempty"`
-	Username string `json:"username,omitempty"`
+	Email       string   `json:"email,omitempty"`
+	Username    string   `json:"username,omitempty"`
+	PersonalOrg SpiceOrg `json:"personal_org,omitempty"`
+	App         SpiceApp `json:"app,omitempty"`
+}
+
+type SpiceOrg struct {
+	Id   int64  `json:"id,omitempty"`
+	Name string `json:"name,omitempty"`
+}
+
+type SpiceApp struct {
+	Id     int64  `json:"id,omitempty"`
+	Name   string `json:"name,omitempty"`
+	ApiKey string `json:"api_key,omitempty"`
 }
 
 type AccessTokenResponse struct {

@@ -76,10 +76,12 @@ spice login
 		mergeAuthConfig(cmd, api.AUTH_TYPE_SPICE_AI, &api.Auth{
 			Params: map[string]string{
 				api.AUTH_PARAM_TOKEN: accessToken,
+				api.AUTH_PARAM_KEY:   user.App.ApiKey,
 			},
 		})
 
 		cmd.Println(aurora.BrightGreen(fmt.Sprintf("Successfully logged in to Spice.ai as %s (%s)", user.Username, user.Email)))
+		cmd.Println(aurora.BrightGreen(fmt.Sprintf("Using app %s/%s", user.PersonalOrg.Name, user.App.Name)))
 	},
 }
 
