@@ -7,7 +7,7 @@ use app::App;
 use clap::Parser;
 use runtime::config::Config as RuntimeConfig;
 use runtime::datasource::DataSource;
-use runtime::{databackend, datasource, Runtime};
+use runtime::{datasource, Runtime};
 use snafu::prelude::*;
 
 #[derive(Debug, Snafu)]
@@ -77,6 +77,11 @@ pub async fn run(args: Args) -> Result<()> {
     let mut df = runtime::datafusion::DataFusion::new();
 
     for ds in &app.datasets {
+        let Some(ref acceleration) = ds.acceleration else {
+            tracing::warn!("No acceleration specified for dataset: {}", ds.name);
+            continue;
+        };
+
         let source = ds.source();
         let source = source.as_str();
         let params = Arc::new(ds.params.clone());
@@ -107,13 +112,18 @@ pub async fn run(args: Args) -> Result<()> {
             Some(data_source) => {
                 let data_source = Box::leak(data_source);
 
-                df.attach(ds, data_source, databackend::DataBackendType::default())
-                    .context(UnableToAttachDataSourceSnafu {
-                        data_source: source,
-                    })?;
+                df.attach(
+                    ds,
+                    data_source,
+                    &acceleration.engine(),
+                    &acceleration.mode(),
+                )
+                .context(UnableToAttachDataSourceSnafu {
+                    data_source: source,
+                })?;
             }
             None => df
-                .attach_backend(&ds.name, databackend::DataBackendType::default())
+                .attach_backend(&ds.name, &acceleration.engine(), &acceleration.mode())
                 .context(UnableToAttachDataSourceSnafu {
                     data_source: source,
                 })?,

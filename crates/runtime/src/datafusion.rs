@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::databackend::{DataBackend, DataBackendType};
+use crate::databackend::{self, DataBackend};
 use crate::datasource::DataSource;
 use datafusion::error::DataFusionError;
 use datafusion::execution::{context::SessionContext, options::ParquetReadOptions};
 use futures::StreamExt;
 use snafu::prelude::*;
+use spicepod::component::dataset::acceleration::{Engine, Mode};
 use spicepod::component::dataset::Dataset;
 use tokio::task;
 
@@ -24,7 +25,12 @@ pub enum Error {
         source: DataFusionError,
     },
 
+    #[snafu(display("Table already exists"))]
     TableAlreadyExists {},
+
+    DatasetConfigurationError {
+        source: databackend::Error,
+    },
 }
 
 pub struct DataFusion {
@@ -50,15 +56,15 @@ impl DataFusion {
             .context(RegisterParquetSnafu { file: path })
     }
 
-    #[allow(clippy::needless_pass_by_value)]
-    pub fn attach_backend(&mut self, table_name: &str, backend: DataBackendType) -> Result<()> {
+    pub fn attach_backend(&mut self, table_name: &str, engine: &Engine, mode: &Mode) -> Result<()> {
         let table_exists = self.ctx.table_exist(table_name).unwrap_or(false);
         if table_exists {
             return TableAlreadyExistsSnafu.fail();
         }
 
         let data_backend: Box<dyn DataBackend> =
-            <dyn DataBackend>::new(&self.ctx, table_name, &backend);
+            <dyn DataBackend>::new(&self.ctx, table_name, engine, mode)
+                .context(DatasetConfigurationSnafu)?;
 
         self.backends
             .insert(table_name.to_string(), Arc::new(data_backend));
@@ -82,7 +88,8 @@ impl DataFusion {
         &mut self,
         dataset: &Dataset,
         data_source: &'static mut dyn DataSource,
-        backend: DataBackendType,
+        engine: &Engine,
+        mode: &Mode,
     ) -> Result<()> {
         let table_name = dataset.name.as_str();
         let table_exists = self.ctx.table_exist(table_name).unwrap_or(false);
@@ -91,7 +98,8 @@ impl DataFusion {
         }
 
         let data_backend: Box<dyn DataBackend> =
-            <dyn DataBackend>::new(&self.ctx, table_name, &backend);
+            <dyn DataBackend>::new(&self.ctx, table_name, engine, mode)
+                .context(DatasetConfigurationSnafu)?;
 
         let dataset_clone = dataset.clone();
         let task_handle = task::spawn(async move {

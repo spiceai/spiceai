@@ -107,16 +107,32 @@ pub mod acceleration {
         Append,
     }
 
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+    #[serde(rename_all = "lowercase")]
+    pub enum Mode {
+        #[default]
+        Memory,
+        File,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+    #[serde(rename_all = "lowercase")]
+    pub enum Engine {
+        #[default]
+        Arrow,
+        DuckDB,
+    }
+
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct Acceleration {
         #[serde(default)]
         pub enabled: bool,
 
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub mode: Option<String>,
+        pub mode: Option<Mode>,
 
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub engine: Option<String>,
+        pub engine: Option<Engine>,
 
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub refresh_interval: Option<String>,
@@ -125,5 +141,17 @@ pub mod acceleration {
 
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub retention: Option<String>,
+    }
+
+    impl Acceleration {
+        #[must_use]
+        pub fn mode(&self) -> Mode {
+            self.mode.clone().unwrap_or_default()
+        }
+
+        #[must_use]
+        pub fn engine(&self) -> Engine {
+            self.engine.clone().unwrap_or_default()
+        }
     }
 }
