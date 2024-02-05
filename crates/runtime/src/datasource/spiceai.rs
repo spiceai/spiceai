@@ -35,7 +35,7 @@ impl DataSource for SpiceAI {
     where
         Self: Sized,
     {
-        let default_flight_url = if cfg!(dev) {
+        let default_flight_url = if cfg!(feature = "dev") {
             "https://dev-flight.spiceai.io".to_string()
         } else {
             "https://flight.spiceai.io".to_string()

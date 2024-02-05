@@ -31,3 +31,6 @@ dirs = "5.0.1"
 toml = "0.8.8"
 serde.workspace = true
 flight_client = { version = "0.10.0-alpha.0", path = "../flight_client" }
+
+[features]
+dev = []

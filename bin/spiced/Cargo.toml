@@ -22,4 +22,4 @@ metrics-exporter-prometheus = "0.13.0"
 
 [features]
 release = []
-dev = []
+dev = ["runtime/dev"]
