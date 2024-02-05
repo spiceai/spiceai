@@ -7,16 +7,13 @@ else
 	SPICE_VERSION := local
 endif
 
-ifdef SPICED_TARGET_DIR
-	TARGET_DIR := $(SPICED_TARGET_DIR)
-else
-	TARGET_DIR := ../../target
+ifdef DEV
+	SPICE_VERSION := local-dev
 endif
 
-LDFLAGS:="-X $(BASE_PACKAGE_NAME)/pkg/version.version=$(SPICE_VERSION)"
+LDFLAGS:="-X $(BASE_PACKAGE_NAME)/bin/spice/pkg/version.version=$(SPICE_VERSION)"
 
 .PHONY: all
 all:
 	mkdir -p ../../target/release 2> /dev/null|| true
 	go build -v -ldflags=$(LDFLAGS) -o ../../target/release/spice
-	cargo build --release $(SPICED_FEATURES) --target-dir $(TARGET_DIR)

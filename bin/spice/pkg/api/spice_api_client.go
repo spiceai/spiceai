@@ -7,6 +7,8 @@ import (
 	"io"
 	"net/http"
 	"os"
+
+	"github.com/spiceai/spiceai/bin/spice/pkg/version"
 )
 
 type SpiceUser struct {
@@ -41,7 +43,11 @@ func NewSpiceApiClient() *SpiceApiClient {
 }
 
 func (s *SpiceApiClient) Init() error {
-	s.baseUrl = "https://spice.ai"
+	if version.Version() == "local-dev" {
+		s.baseUrl = "https://dev.spice.xyz"
+	} else {
+		s.baseUrl = "https://spice.ai"
+	}
 
 	if os.Getenv("SPICE_BASE_URL") != "" {
 		s.baseUrl = os.Getenv("SPICE_BASE_URL")

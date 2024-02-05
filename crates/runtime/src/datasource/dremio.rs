@@ -2,6 +2,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::{collections::HashMap, future::Future};
 
+use flight_client::FlightClient;
 use spicepod::component::dataset::Dataset;
 
 use crate::auth::AuthProvider;
@@ -28,10 +29,15 @@ impl DataSource for Dremio {
                 .ok_or_else(|| super::Error::UnableToCreateDataSource {
                     source: "Missing required parameter: endpoint".into(),
                 })?;
-            let flight = Flight::new(auth_provider, endpoint);
-            Ok(Self {
-                flight: flight.await?,
-            })
+            let flight_client = FlightClient::new(
+                endpoint.as_str(),
+                auth_provider.get_param("username").unwrap_or_default(),
+                auth_provider.get_param("password").unwrap_or_default(),
+            )
+            .await
+            .map_err(|e| super::Error::UnableToCreateDataSource { source: e.into() })?;
+            let flight = Flight::new(flight_client);
+            Ok(Self { flight })
         })
     }
 

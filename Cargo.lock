@@ -1353,6 +1353,7 @@ dependencies = [
  "rustls-pemfile",
  "snafu 0.8.0",
  "tonic",
+ "tracing",
 ]
 
 [[package]]
