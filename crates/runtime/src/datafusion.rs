@@ -139,7 +139,7 @@ impl DataFusion {
         Ok(())
     }
 
-    pub async fn attach_view(&mut self, dataset: &Dataset) -> Result<()> {
+    pub async fn attach_view(&self, dataset: &Dataset) -> Result<()> {
         let table_name = dataset.name.as_str();
         let table_exists = self.ctx.table_exist(table_name).unwrap_or(false);
         if table_exists {
