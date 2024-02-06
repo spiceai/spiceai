@@ -6,6 +6,7 @@ use snafu::prelude::*;
 
 use crate::reader;
 pub mod dataset;
+pub mod model;
 
 pub trait WithDependsOn<T> {
     fn depends_on(&self, depends_on: &[String]) -> T;

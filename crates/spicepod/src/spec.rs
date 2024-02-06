@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_yaml::{self, Value};
 use std::{collections::HashMap, fmt::Debug};
 
-use crate::component::{dataset::Dataset, ComponentOrReference};
+use crate::component::{dataset::Dataset, model::Model, ComponentOrReference};
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -25,6 +25,10 @@ pub struct SpicepodDefinition {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(default)]
     pub datasets: Vec<ComponentOrReference<Dataset>>,
+
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
+    pub models: Vec<ComponentOrReference<Model>>,
 
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(default)]

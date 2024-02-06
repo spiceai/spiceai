@@ -5,6 +5,7 @@ use snafu::prelude::*;
 use std::{fmt::Debug, path::PathBuf};
 
 use component::dataset::Dataset;
+use component::model::Model;
 use spec::SpicepodDefinition;
 
 pub mod component;
@@ -31,6 +32,8 @@ pub struct Spicepod {
     pub name: String,
 
     pub datasets: Vec<Dataset>,
+
+    pub models: Vec<Model>,
 
     pub dependencies: Vec<String>,
 }
@@ -62,15 +65,24 @@ impl Spicepod {
         )
         .context(UnableToResolveSpicepodComponentsSnafu { path: path.clone() })?;
 
-        Ok(from_definition(spicepod_definition, resolved_datasets))
+        let resolved_models = component::resolve_component_references(
+            fs,
+            &path,
+            &spicepod_definition.models,
+            "model",
+        )
+        .context(UnableToResolveSpicepodComponentsSnafu { path: path.clone() })?;
+
+        Ok(from_definition(spicepod_definition, resolved_datasets, resolved_models))
     }
 }
 
 #[must_use]
-fn from_definition(spicepod_definition: SpicepodDefinition, datasets: Vec<Dataset>) -> Spicepod {
+fn from_definition(spicepod_definition: SpicepodDefinition, datasets: Vec<Dataset>, models: Vec<Model>) -> Spicepod {
     Spicepod {
         name: spicepod_definition.name,
         datasets,
+        models,
         dependencies: spicepod_definition.dependencies,
     }
 }

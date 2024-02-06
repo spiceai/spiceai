@@ -12,6 +12,7 @@ pub mod auth;
 pub mod config;
 pub mod databackend;
 pub mod datafusion;
+pub mod modelformat;
 pub mod datasource;
 pub mod dataupdate;
 mod flight;
