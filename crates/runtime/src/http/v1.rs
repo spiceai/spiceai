@@ -9,6 +9,8 @@ pub(crate) mod datasets {
     #[derive(Debug, Deserialize)]
     pub(crate) struct DatasetFilter {
         source: Option<String>,
+
+        #[serde(default)]
         remove_views: bool,
     }
 
