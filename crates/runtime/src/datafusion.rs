@@ -82,8 +82,7 @@ impl DataFusion {
         }
 
         let data_backend: Box<dyn DataBackend> =
-            <dyn DataBackend>::new(&self.ctx, table_name, &backend)
-                .context(UnableToCreateBackendSnafu)?;
+            <dyn DataBackend>::new(&self.ctx, table_name, &backend);
 
         self.backends
             .insert(table_name.to_string(), Arc::new(data_backend));
@@ -116,8 +115,7 @@ impl DataFusion {
         }
 
         let data_backend: Box<dyn DataBackend> =
-            <dyn DataBackend>::new(&self.ctx, table_name, &backend)
-                .context(UnableToCreateBackendSnafu)?;
+            <dyn DataBackend>::new(&self.ctx, table_name, &backend);
 
         let dataset_clone = dataset.clone();
         let task_handle = task::spawn(async move {

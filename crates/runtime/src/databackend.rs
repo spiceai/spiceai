@@ -35,6 +35,7 @@ pub trait DataBackend: Send + Sync {
 }
 
 impl dyn DataBackend {
+    #[must_use]
     pub fn new(ctx: &Arc<SessionContext>, name: &str, backend_type: &DataBackendType) -> Box<Self> {
         match backend_type {
             DataBackendType::Memtable => Box::new(MemTableBackend::new(Arc::clone(ctx), name)),
