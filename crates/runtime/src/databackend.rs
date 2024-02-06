@@ -6,6 +6,7 @@ use std::{future::Future, pin::Pin, sync::Arc};
 
 use self::memtable::MemTableBackend;
 
+#[cfg(feature = "duckdb")]
 pub mod duckdb;
 pub mod memtable;
 
@@ -46,6 +47,7 @@ impl dyn DataBackend {
                 }
                 .fail()?,
             },
+            #[cfg(feature = "duckdb")]
             Engine::DuckDB => {
                 todo!("DuckDB backend not implemented yet");
             }

@@ -1,5 +1,3 @@
-// TODO!
-
-// pub struct DuckDBBackend {
-//     connection: duckdb::Connection,
-// }
+pub struct DuckDBBackend {
+    connection: duckdb::Connection,
+}

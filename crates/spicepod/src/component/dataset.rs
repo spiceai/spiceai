@@ -120,6 +120,7 @@ pub mod acceleration {
     pub enum Engine {
         #[default]
         Arrow,
+        #[cfg(feature = "duckdb")]
         DuckDB,
     }
 

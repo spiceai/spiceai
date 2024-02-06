@@ -2867,6 +2867,8 @@ dependencies = [
  "clap",
  "datafusion",
  "dirs",
+ "duckdb",
+ "duckdb_datafusion",
  "flight_client",
  "futures",
  "futures-core",
