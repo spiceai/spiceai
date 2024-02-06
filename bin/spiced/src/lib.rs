@@ -40,6 +40,9 @@ pub enum Error {
 
     #[snafu(display("Unknown data source: {data_source}"))]
     UnknownDataSource { data_source: String },
+
+    #[snafu(display("Unable to create data backend"))]
+    UnableToCreateBackend { source: runtime::datafusion::Error },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -77,7 +80,7 @@ pub async fn run(args: Args) -> Result<()> {
     let mut df = runtime::datafusion::DataFusion::new();
 
     for ds in &app.datasets {
-        let Some(ref acceleration) = ds.acceleration else {
+        let Some(_) = ds.acceleration else {
             tracing::warn!("No acceleration specified for dataset: {}", ds.name);
             continue;
         };
@@ -108,25 +111,23 @@ pub async fn run(args: Args) -> Result<()> {
             .fail()?,
         };
 
+        let data_backend = df.new_backend(ds).context(UnableToCreateBackendSnafu)?;
+
         match data_source {
             Some(data_source) => {
                 let data_source = Box::leak(data_source);
 
-                df.attach(
-                    ds,
-                    data_source,
-                    &acceleration.engine(),
-                    &acceleration.mode(),
-                )
-                .context(UnableToAttachDataSourceSnafu {
-                    data_source: source,
-                })?;
+                df.attach(ds, data_source, data_backend).context(
+                    UnableToAttachDataSourceSnafu {
+                        data_source: source,
+                    },
+                )?;
             }
-            None => df
-                .attach_backend(&ds.name, &acceleration.engine(), &acceleration.mode())
-                .context(UnableToAttachDataSourceSnafu {
+            None => df.attach_backend(&ds.name, data_backend).context(
+                UnableToAttachDataSourceSnafu {
                     data_source: source,
-                })?,
+                },
+            )?,
         }
 
         tracing::info!("Loaded dataset: {}", ds.name);

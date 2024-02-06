@@ -2873,6 +2873,7 @@ dependencies = [
  "futures",
  "futures-core",
  "metrics",
+ "r2d2",
  "serde",
  "snafu 0.8.0",
  "spicepod",

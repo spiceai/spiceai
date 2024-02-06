@@ -7,7 +7,6 @@ use datafusion::error::DataFusionError;
 use datafusion::execution::{context::SessionContext, options::ParquetReadOptions};
 use futures::StreamExt;
 use snafu::prelude::*;
-use spicepod::component::dataset::acceleration::{Engine, Mode};
 use spicepod::component::dataset::Dataset;
 use tokio::task;
 
@@ -30,6 +29,10 @@ pub enum Error {
 
     DatasetConfigurationError {
         source: databackend::Error,
+    },
+
+    InvalidConfiguration {
+        msg: String,
     },
 }
 
@@ -56,20 +59,44 @@ impl DataFusion {
             .context(RegisterParquetSnafu { file: path })
     }
 
-    pub fn attach_backend(&mut self, table_name: &str, engine: &Engine, mode: &Mode) -> Result<()> {
+    pub fn attach_backend(
+        &mut self,
+        table_name: &str,
+        backend: Box<dyn DataBackend>,
+    ) -> Result<()> {
         let table_exists = self.ctx.table_exist(table_name).unwrap_or(false);
         if table_exists {
             return TableAlreadyExistsSnafu.fail();
         }
 
-        let data_backend: Box<dyn DataBackend> =
-            <dyn DataBackend>::new(&self.ctx, table_name, engine, mode)
-                .context(DatasetConfigurationSnafu)?;
-
         self.backends
-            .insert(table_name.to_string(), Arc::new(data_backend));
+            .insert(table_name.to_string(), Arc::new(backend));
 
         Ok(())
+    }
+
+    pub fn new_backend(&self, dataset: &Dataset) -> Result<Box<dyn DataBackend>> {
+        let table_name = dataset.name.as_str();
+        let acceleration =
+            dataset
+                .acceleration
+                .as_ref()
+                .ok_or_else(|| Error::InvalidConfiguration {
+                    msg: "No acceleration configuration found".to_string(),
+                })?;
+
+        let params: Arc<Option<HashMap<String, String>>> = Arc::new(dataset.params.clone());
+
+        let data_backend: Box<dyn DataBackend> = <dyn DataBackend>::new(
+            &self.ctx,
+            table_name,
+            acceleration.engine(),
+            acceleration.mode(),
+            params,
+        )
+        .context(DatasetConfigurationSnafu)?;
+
+        Ok(data_backend)
     }
 
     #[must_use]
@@ -88,8 +115,7 @@ impl DataFusion {
         &mut self,
         dataset: &Dataset,
         data_source: &'static mut dyn DataSource,
-        engine: &Engine,
-        mode: &Mode,
+        backend: Box<dyn DataBackend>,
     ) -> Result<()> {
         let table_name = dataset.name.as_str();
         let table_exists = self.ctx.table_exist(table_name).unwrap_or(false);
@@ -97,17 +123,13 @@ impl DataFusion {
             return TableAlreadyExistsSnafu.fail();
         }
 
-        let data_backend: Box<dyn DataBackend> =
-            <dyn DataBackend>::new(&self.ctx, table_name, engine, mode)
-                .context(DatasetConfigurationSnafu)?;
-
         let dataset_clone = dataset.clone();
         let task_handle = task::spawn(async move {
             let mut stream = data_source.get_data(&dataset_clone);
             loop {
                 let future_result = stream.next().await;
                 match future_result {
-                    Some(data_update) => match data_backend.add_data(data_update).await {
+                    Some(data_update) => match backend.add_data(data_update).await {
                         Ok(()) => (),
                         Err(e) => tracing::error!("Error adding data: {e:?}"),
                     },

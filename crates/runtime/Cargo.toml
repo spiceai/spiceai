@@ -33,8 +33,9 @@ serde.workspace = true
 flight_client = { version = "0.10.0-alpha.0", path = "../flight_client" }
 duckdb = { version = "0.9.2", features = ["bundled", "r2d2"], optional = true }
 duckdb_datafusion = { path = "../duckdb_datafusion", optional = true }
+r2d2 = { version = "0.8.10", optional = true }
 
 [features]
 default = ["duckdb"]
 dev = []
-duckdb = ["dep:duckdb", "duckdb_datafusion"]
+duckdb = ["dep:duckdb", "duckdb_datafusion", "r2d2"]
