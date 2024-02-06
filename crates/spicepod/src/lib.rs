@@ -73,12 +73,20 @@ impl Spicepod {
         )
         .context(UnableToResolveSpicepodComponentsSnafu { path: path.clone() })?;
 
-        Ok(from_definition(spicepod_definition, resolved_datasets, resolved_models))
+        Ok(from_definition(
+            spicepod_definition,
+            resolved_datasets,
+            resolved_models,
+        ))
     }
 }
 
 #[must_use]
-fn from_definition(spicepod_definition: SpicepodDefinition, datasets: Vec<Dataset>, models: Vec<Model>) -> Spicepod {
+fn from_definition(
+    spicepod_definition: SpicepodDefinition,
+    datasets: Vec<Dataset>,
+    models: Vec<Model>,
+) -> Spicepod {
     Spicepod {
         name: spicepod_definition.name,
         datasets,

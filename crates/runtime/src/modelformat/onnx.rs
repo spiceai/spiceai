@@ -1,2 +1,1 @@
-pub struct Onnx {
-}
+pub struct Onnx {}

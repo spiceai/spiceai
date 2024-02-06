@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use super::WithDependsOn;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Model {
@@ -10,7 +10,6 @@ pub struct Model {
     #[serde(rename = "datasets", default)]
     pub datasets: Vec<String>,
 }
-
 
 impl WithDependsOn<Model> for Model {
     fn depends_on(&self, depends_on: &[String]) -> Model {
