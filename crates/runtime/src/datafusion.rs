@@ -137,14 +137,15 @@ impl DataFusion {
         Ok(())
     }
 
-    pub async fn attach_view(&mut self, dataset: &Dataset, sql: &str) -> Result<()> {
+    pub async fn attach_view(&mut self, dataset: &Dataset) -> Result<()> {
         let table_name = dataset.name.as_str();
         let table_exists = self.ctx.table_exist(table_name).unwrap_or(false);
         if table_exists {
             return TableAlreadyExistsSnafu.fail();
         }
 
-        let statements = DFParser::parse_sql_with_dialect(sql, &AnsiDialect {})
+        let sql = dataset.sql.clone().unwrap_or_default();
+        let statements = DFParser::parse_sql_with_dialect(sql.as_str(), &AnsiDialect {})
             .context(UnableToParseSqlSnafu)?;
         if statements.len() != 1 {
             return UnableToCreateViewSnafu {
