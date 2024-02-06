@@ -16,12 +16,6 @@ pub enum Error {
     UnableToParseSql {
         source: sqlparser::parser::ParserError,
     },
-
-    #[snafu(display("Unsupported operation {} for backend {:?}", operation, backend))]
-    UnsupportedOperation {
-        operation: String,
-        backend: DataBackendType,
-    },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
