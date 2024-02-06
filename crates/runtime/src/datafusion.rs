@@ -168,7 +168,7 @@ impl DataFusion {
             loop {
                 if !self.ctx.table_exist(&dependent_table_name).unwrap_or(false) {
                     tracing::error!(
-                        "Dependent table {dependent_table_name} for {table_name} does not exist"
+                        "Dependent table {dependent_table_name} for {table_name} does not exist, retrying in 1s..."
                     );
                     thread::sleep(Duration::from_secs(1));
                     continue;
