@@ -35,13 +35,9 @@ pub trait DataBackend: Send + Sync {
 }
 
 impl dyn DataBackend {
-    pub fn new(
-        ctx: &Arc<SessionContext>,
-        name: &str,
-        backend_type: &DataBackendType,
-    ) -> Result<Box<Self>> {
+    pub fn new(ctx: &Arc<SessionContext>, name: &str, backend_type: &DataBackendType) -> Box<Self> {
         match backend_type {
-            DataBackendType::Memtable => Ok(Box::new(MemTableBackend::new(Arc::clone(ctx), name))),
+            DataBackendType::Memtable => Box::new(MemTableBackend::new(Arc::clone(ctx), name)),
             DataBackendType::DuckDB => {
                 todo!("DuckDB backend not implemented yet");
             }
