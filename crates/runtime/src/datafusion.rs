@@ -8,8 +8,10 @@ use crate::datasource::DataSource;
 use datafusion::datasource::ViewTable;
 use datafusion::error::DataFusionError;
 use datafusion::execution::{context::SessionContext, options::ParquetReadOptions};
+use datafusion::sql::parser;
 use datafusion::sql::parser::DFParser;
 use datafusion::sql::sqlparser;
+use datafusion::sql::sqlparser::ast::{self, SetExpr, TableFactor};
 use datafusion::sql::sqlparser::dialect::AnsiDialect;
 use futures::StreamExt;
 use snafu::prelude::*;
@@ -150,7 +152,7 @@ impl DataFusion {
         if statements.len() != 1 {
             return UnableToCreateViewSnafu {
                 reason: format!(
-                    "Expected 1 statement to create view, received {}",
+                    "Expected 1 statement to create view from, received {}",
                     statements.len()
                 )
                 .to_string(),
@@ -158,51 +160,85 @@ impl DataFusion {
             .fail();
         }
 
-        let view: ViewTable;
-        let mut backoff = Duration::from_secs(1);
-        let mut attempts = 1;
         // Tables are currently lazily created (i.e. not created until first data is received) so that we know the table schema.
         // This means that we can't create a view on top of a table until the first data is received for all dependent tables and therefore
-        // the tables are created. To handle this, if view creation fails with a plan error, we retry until the table is created.
-        loop {
-            let plan_result = self
-                .ctx
-                .state()
-                .statement_to_plan(statements[0].clone())
-                .await;
-            match plan_result {
-                Ok(plan) => {
-                    view = ViewTable::try_new(plan, Some(sql.to_string()))
-                        .context(UnableToCreateViewDataFusionSnafu)?;
-                    break;
+        // the tables are created. To handle this, wait until all tables are created.
+        let dependent_table_names = DataFusion::get_dependent_table_names(&statements[0]);
+        for dependent_table_name in dependent_table_names {
+            loop {
+                if !self.ctx.table_exist(&dependent_table_name).unwrap_or(false) {
+                    tracing::error!(
+                        "Dependent table {dependent_table_name} for {table_name} does not exist"
+                    );
+                    thread::sleep(Duration::from_secs(1));
+                    continue;
                 }
-                Err(e) => match e {
-                    DataFusionError::Plan(_) => {
-                        if attempts > 5 {
-                            return Err(e).context(UnableToCreateViewDataFusionSnafu);
-                        }
-
-                        tracing::error!(
-                            "Plan error for {}, retrying in {:?}: {}",
-                            table_name,
-                            backoff,
-                            e
-                        );
-                        thread::sleep(backoff);
-                        backoff *= 2;
-                        attempts += 1;
-                        continue;
-                    }
-                    _ => return Err(e).context(UnableToCreateViewDataFusionSnafu),
-                },
+                break;
             }
         }
 
+        let plan = self
+            .ctx
+            .state()
+            .statement_to_plan(statements[0].clone())
+            .await
+            .context(UnableToCreateViewDataFusionSnafu)?;
+        let view = ViewTable::try_new(plan, Some(sql.to_string()))
+            .context(UnableToCreateViewDataFusionSnafu)?;
         self.ctx
             .register_table(table_name, Arc::new(view))
             .context(UnableToCreateViewDataFusionSnafu)?;
 
         Ok(())
+    }
+
+    fn get_dependent_table_names(statement: &parser::Statement) -> Vec<String> {
+        let mut table_names = Vec::new();
+        match statement.clone() {
+            parser::Statement::Statement(statement) => match *statement {
+                ast::Statement::Query(statement) => match *statement.body {
+                    SetExpr::Select(select_statement) => {
+                        for from in select_statement.from {
+                            if let TableFactor::Table {
+                                name,
+                                alias: _,
+                                args: _,
+                                with_hints: _,
+                                version: _,
+                                partitions: _,
+                            } = from.relation
+                            {
+                                table_names.push(name.to_string());
+                            }
+
+                            for join in from.joins {
+                                if let TableFactor::Table {
+                                    name,
+                                    alias: _,
+                                    args: _,
+                                    with_hints: _,
+                                    version: _,
+                                    partitions: _,
+                                } = join.relation
+                                {
+                                    table_names.push(name.to_string());
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        return table_names;
+                    }
+                },
+                _ => {
+                    return table_names;
+                }
+            },
+            _ => {
+                return table_names;
+            }
+        }
+        table_names
     }
 }
 
