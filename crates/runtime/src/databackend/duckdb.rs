@@ -7,7 +7,6 @@ use duckdb::{
     DuckdbConnectionManager,
 };
 use duckdb_datafusion::DuckDBTable;
-use r2d2::ManageConnection;
 use snafu::{prelude::*, ResultExt};
 use spicepod::component::dataset::acceleration;
 
@@ -79,22 +78,17 @@ impl DuckDBBackend {
         mode: Mode,
         params: Arc<Option<HashMap<String, String>>>,
     ) -> Result<Self> {
-        let pool = match mode {
-            Mode::Memory => {
-                let manager = DuckdbConnectionManager::memory().context(DuckDBSnafu)?;
-                Arc::new(r2d2::Pool::new(manager).context(ConnectionPoolSnafu)?)
-            }
-            Mode::File => {
-                let manager = DuckdbConnectionManager::file(get_duckdb_file(name, &params))
-                    .context(DuckDBSnafu)?;
-                let conn = manager.connect().context(DuckDBSnafu)?;
-
-                conn.register_table_function::<ArrowVTab>("arrow")
-                    .context(DuckDBSnafu)?;
-
-                Arc::new(r2d2::Pool::new(manager).context(ConnectionPoolSnafu)?)
-            }
+        let manager = match mode {
+            Mode::Memory => DuckdbConnectionManager::memory().context(DuckDBSnafu)?,
+            Mode::File => DuckdbConnectionManager::file(get_duckdb_file(name, &params))
+                .context(DuckDBSnafu)?,
         };
+
+        let pool = Arc::new(r2d2::Pool::new(manager).context(ConnectionPoolSnafu)?);
+
+        let conn = pool.get().context(ConnectionPoolSnafu)?;
+        conn.register_table_function::<ArrowVTab>("arrow")
+            .context(DuckDBSnafu)?;
 
         let name = name.to_string();
 
@@ -155,7 +149,7 @@ impl DuckDBUpdate {
         match self.update_type {
             UpdateType::Overwrite => self.create_table()?,
             UpdateType::Append => {
-                if !self.table_exists()? {
+                if !self.table_exists() {
                     self.create_table()?;
                 }
             }
@@ -190,7 +184,7 @@ impl DuckDBUpdate {
     }
 
     fn create_table(&mut self) -> Result<()> {
-        let table_exists = self.table_exists()?;
+        let table_exists = self.table_exists();
         if table_exists {
             let sql = format!(r#"DROP TABLE "{name}""#, name = self.name);
             self.duckdb_conn.execute(&sql, []).context(DuckDBSnafu)?;
@@ -213,7 +207,7 @@ impl DuckDBUpdate {
         Ok(())
     }
 
-    fn table_exists(&self) -> Result<bool> {
+    fn table_exists(&self) -> bool {
         let sql = format!(
             r#"SELECT EXISTS (
               SELECT 1
@@ -224,8 +218,8 @@ impl DuckDBUpdate {
         );
 
         self.duckdb_conn
-            .query_row(&sql, [], |row| row.get(0))
-            .context(DuckDBSnafu)
+            .query_row(&sql, [], |row| row.get::<usize, bool>(0))
+            .unwrap_or(false)
     }
 }
 
@@ -237,24 +231,18 @@ mod tests {
     use arrow::array::{Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
-    use r2d2::Pool;
 
     #[tokio::test]
     async fn test_add_data() {
         let ctx = Arc::new(SessionContext::new());
         let name = "test_add_data";
-        let pool = create_pool();
-        let backend = DuckDBBackend {
-            ctx,
-            name: name.to_string(),
-            pool,
-        };
+        let backend =
+            DuckDBBackend::new(Arc::clone(&ctx), name, Mode::Memory, Arc::new(None)).unwrap();
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("a", DataType::Utf8, false),
             Field::new("b", DataType::Int32, false),
         ]));
-
         let data = if let Ok(batch) = RecordBatch::try_new(
             schema,
             vec![
@@ -273,10 +261,8 @@ mod tests {
         };
 
         backend.add_data(data_update).await.unwrap();
-    }
 
-    fn create_pool() -> Arc<Pool<DuckdbConnectionManager>> {
-        let manager = DuckdbConnectionManager::memory().unwrap();
-        Arc::new(r2d2::Pool::new(manager).unwrap())
+        let df = ctx.sql("SELECT * FROM test_add_data").await.unwrap();
+        let _ = df.show().await;
     }
 }
