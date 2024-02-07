@@ -228,3 +228,55 @@ impl DuckDBUpdate {
             .context(DuckDBSnafu)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use arrow::array::{Int32Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use r2d2::Pool;
+
+    #[tokio::test]
+    async fn test_add_data() {
+        let ctx = Arc::new(SessionContext::new());
+        let name = "test_add_data";
+        let pool = create_pool();
+        let backend = DuckDBBackend {
+            ctx,
+            name: name.to_string(),
+            pool,
+        };
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Utf8, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+
+        let data = if let Ok(batch) = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["a", "b", "c", "d"])),
+                Arc::new(Int32Array::from(vec![1, 10, 10, 100])),
+            ],
+        ) {
+            vec![batch]
+        } else {
+            panic!("Unable to create record batch");
+        };
+        let data_update = DataUpdate {
+            log_sequence_number: Some(1),
+            data,
+            update_type: UpdateType::Overwrite,
+        };
+
+        backend.add_data(data_update).await.unwrap();
+    }
+
+    fn create_pool() -> Arc<Pool<DuckdbConnectionManager>> {
+        let manager = DuckdbConnectionManager::memory().unwrap();
+        Arc::new(r2d2::Pool::new(manager).unwrap())
+    }
+}
