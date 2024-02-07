@@ -20,7 +20,7 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub trait ModelSource {
-    fn pull(&self, params: Arc<Option<HashMap<String, String>>>) -> bool;
+    fn pull(&self, params: Arc<Option<HashMap<String, String>>>) -> Result<String>;
 }
 
 pub fn ensure_model_path(name: &str) -> Result<String> {
