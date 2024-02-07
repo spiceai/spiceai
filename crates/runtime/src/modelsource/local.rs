@@ -12,8 +12,11 @@ impl super::ModelSource for Local {
             .as_ref()
             .and_then(|p| p.get("name"))
             .map(|n| n.to_string());
+        
+        let path = super::ensure_model_path(name.unwrap().as_str());
 
-        tracing::debug!("{:?}", super::ensure_model_path(name.unwrap().as_str()));
+        tracing::info!("path: {:?}", path);
+
         return false;
     }
 }
