@@ -164,12 +164,10 @@ impl DataFusion {
             for dependent_table_name in dependent_table_names {
                 let mut attempts = 0;
                 loop {
-                    if !ctx.table_exist(&dependent_table_name).unwrap_or(false)
-                        && attempts % 10 == 0
-                    {
-                        tracing::error!(
-                        "Dependent table {dependent_table_name} for {table_name} does not exist, retrying..."
-                    );
+                    if !ctx.table_exist(&dependent_table_name).unwrap_or(false) {
+                        if attempts % 10 == 0 {
+                            tracing::error!("Dependent table {dependent_table_name} for {table_name} does not exist, retrying...");
+                        }
                         attempts += 1;
                         sleep(Duration::from_secs(1)).await;
                         continue;
