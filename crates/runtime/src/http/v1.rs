@@ -9,13 +9,16 @@ pub(crate) mod datasets {
     #[derive(Debug, Deserialize)]
     pub(crate) struct DatasetFilter {
         source: Option<String>,
+
+        #[serde(default)]
+        remove_views: bool,
     }
 
     pub(crate) async fn get(
         Extension(app): Extension<Arc<App>>,
         Query(filter): Query<DatasetFilter>,
     ) -> Json<Vec<Dataset>> {
-        let datasets: Vec<Dataset> = match filter.source {
+        let mut datasets: Vec<Dataset> = match filter.source {
             Some(source) => app
                 .datasets
                 .iter()
@@ -24,6 +27,10 @@ pub(crate) mod datasets {
                 .collect(),
             None => app.datasets.clone(),
         };
+
+        if filter.remove_views {
+            datasets.retain(|d| d.sql.is_none());
+        }
 
         Json(datasets)
     }
