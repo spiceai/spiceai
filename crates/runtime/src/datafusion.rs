@@ -15,8 +15,8 @@ use datafusion::sql::sqlparser::dialect::AnsiDialect;
 use futures::StreamExt;
 use snafu::prelude::*;
 use spicepod::component::dataset::Dataset;
-use tokio::task;
 use tokio::time::sleep;
+use tokio::{spawn, task};
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -41,11 +41,6 @@ pub enum Error {
     #[snafu(display("Unable to create view: {}", reason))]
     UnableToCreateView {
         reason: String,
-    },
-
-    #[snafu(display("Unable to create view"))]
-    UnableToCreateViewDataFusion {
-        source: DataFusionError,
     },
 
     UnableToParseSql {
@@ -139,9 +134,8 @@ impl DataFusion {
         Ok(())
     }
 
-    pub async fn attach_view(&self, dataset: &Dataset) -> Result<()> {
-        let table_name = dataset.name.as_str();
-        let table_exists = self.ctx.table_exist(table_name).unwrap_or(false);
+    pub fn attach_view(&self, dataset: &Dataset) -> Result<()> {
+        let table_exists = self.ctx.table_exist(dataset.name.as_str()).unwrap_or(false);
         if table_exists {
             return TableAlreadyExistsSnafu.fail();
         }
@@ -160,34 +154,44 @@ impl DataFusion {
             .fail();
         }
 
-        // Tables are currently lazily created (i.e. not created until first data is received) so that we know the table schema.
-        // This means that we can't create a view on top of a table until the first data is received for all dependent tables and therefore
-        // the tables are created. To handle this, wait until all tables are created.
-        let dependent_table_names = DataFusion::get_dependent_table_names(&statements[0]);
-        for dependent_table_name in dependent_table_names {
-            loop {
-                if !self.ctx.table_exist(&dependent_table_name).unwrap_or(false) {
-                    tracing::error!(
+        let ctx = self.ctx.clone();
+        let table_name = dataset.name.clone();
+        spawn(async move {
+            // Tables are currently lazily created (i.e. not created until first data is received) so that we know the table schema.
+            // This means that we can't create a view on top of a table until the first data is received for all dependent tables and therefore
+            // the tables are created. To handle this, wait until all tables are created.
+            let dependent_table_names = DataFusion::get_dependent_table_names(&statements[0]);
+            for dependent_table_name in dependent_table_names {
+                loop {
+                    if !ctx.table_exist(&dependent_table_name).unwrap_or(false) {
+                        tracing::error!(
                         "Dependent table {dependent_table_name} for {table_name} does not exist, retrying in 1s..."
                     );
-                    sleep(Duration::from_secs(1)).await;
-                    continue;
+                        sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
+                    break;
                 }
-                break;
             }
-        }
 
-        let plan = self
-            .ctx
-            .state()
-            .statement_to_plan(statements[0].clone())
-            .await
-            .context(UnableToCreateViewDataFusionSnafu)?;
-        let view = ViewTable::try_new(plan, Some(sql.to_string()))
-            .context(UnableToCreateViewDataFusionSnafu)?;
-        self.ctx
-            .register_table(table_name, Arc::new(view))
-            .context(UnableToCreateViewDataFusionSnafu)?;
+            let plan = match ctx.state().statement_to_plan(statements[0].clone()).await {
+                Ok(plan) => plan,
+                Err(e) => {
+                    tracing::error!("Unable to create view: {e:?}");
+                    return;
+                }
+            };
+            let view = match ViewTable::try_new(plan, Some(sql.to_string())) {
+                Ok(view) => view,
+                Err(e) => {
+                    tracing::error!("Unable to create view: {e:?}");
+                    return;
+                }
+            };
+            if let Err(e) = ctx.register_table(table_name.as_str(), Arc::new(view)) {
+                tracing::error!("Unable to create view: {e:?}");
+            };
+        });
 
         Ok(())
     }

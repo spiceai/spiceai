@@ -117,7 +117,7 @@ pub async fn run(args: Args) -> Result<()> {
             }
             None => match &ds.sql {
                 Some(_) => {
-                    df.attach_view(ds).await.context(UnableToAttachViewSnafu)?;
+                    df.attach_view(ds).context(UnableToAttachViewSnafu)?;
                 }
                 None => {
                     df.attach_backend(&ds.name, databackend::DataBackendType::default())
