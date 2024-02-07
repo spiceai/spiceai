@@ -236,8 +236,8 @@ mod tests {
     async fn test_add_data() {
         let ctx = Arc::new(SessionContext::new());
         let name = "test_add_data";
-        let backend =
-            DuckDBBackend::new(Arc::clone(&ctx), name, Mode::Memory, Arc::new(None)).unwrap();
+        let backend = DuckDBBackend::new(Arc::clone(&ctx), name, Mode::Memory, Arc::new(None))
+            .expect("Unable to create DuckDBBackend");
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("a", DataType::Utf8, false),
@@ -260,9 +260,15 @@ mod tests {
             update_type: UpdateType::Overwrite,
         };
 
-        backend.add_data(data_update).await.unwrap();
+        backend
+            .add_data(data_update)
+            .await
+            .expect("Unable to add data");
 
-        let df = ctx.sql("SELECT * FROM test_add_data").await.unwrap();
+        let df = ctx
+            .sql("SELECT * FROM test_add_data")
+            .await
+            .expect("Unable to execute query");
         let _ = df.show().await;
     }
 }
