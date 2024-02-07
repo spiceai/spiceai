@@ -17,7 +17,7 @@ pub struct ComponentReference {
     pub r#ref: String,
 
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    #[serde(rename = "dependsOn", default)]
+    #[serde(rename = "dependsOn", alias = "datasets", default)]
     pub depends_on: Vec<String>,
 }
 
