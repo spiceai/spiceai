@@ -8,7 +8,8 @@ use clap::Parser;
 use runtime::config::Config as RuntimeConfig;
 use runtime::datasource::DataSource;
 
-use runtime::{databackend, datasource, Runtime};
+use runtime::modelsource::ModelSource;
+use runtime::{databackend, datasource, modelsource, Runtime};
 use snafu::prelude::*;
 
 #[derive(Debug, Snafu)]
@@ -79,6 +80,30 @@ pub async fn run(args: Args) -> Result<()> {
     }
 
     let mut df = runtime::datafusion::DataFusion::new();
+
+    for model in &app.models {
+        let source = model.source();
+        let source = source.as_str();
+
+        // create a params contains model name and model from
+
+        let mut params = std::collections::HashMap::new();
+
+        params.insert("name".to_string(), model.name.to_string());
+        params.insert("from".to_string(), model.from.to_string());
+        
+
+        match source {
+            "local" => {
+                let local = modelsource::local::Local{};
+                let created = local.pull(Arc::new(Option::from(params)));
+                tracing::info!("Model created: {:?}", created);
+            },
+            _ => UnknownDataSourceSnafu {
+                data_source: source,
+            }.fail()?,
+        }
+    }
 
     for ds in &app.datasets {
         let source = ds.source();

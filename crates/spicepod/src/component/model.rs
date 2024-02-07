@@ -20,3 +20,11 @@ impl WithDependsOn<Model> for Model {
         }
     }
 }
+
+
+impl Model {
+    #[must_use]
+    pub fn source(&self) -> String {
+        self.from.split('/').next().unwrap_or_default().to_string()
+    }
+}
