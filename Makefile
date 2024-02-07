@@ -27,7 +27,8 @@ lint:
 	cargo clippy --all-targets --workspace -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
-		-Dclippy::unwrap_used
+		-Dclippy::unwrap_used \
+		-Dclippy::expect_used
 
 .PHONY: docker
 docker:
