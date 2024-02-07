@@ -24,6 +24,15 @@ impl WithDependsOn<Model> for Model {
 impl Model {
     #[must_use]
     pub fn source(&self) -> String {
-        self.from.split('/').next().unwrap_or_default().to_string()
+        let from = self.from.clone();
+
+        // teset if from contains file:/
+        if from.starts_with("file:/") {
+            return "local".to_string();
+        } else if from.starts_with("spice.ai") {
+            return "spice.ai".to_string();
+        } else {
+            return "debug".to_string();
+        }
     }
 }

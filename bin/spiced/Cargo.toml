@@ -19,6 +19,8 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus = "0.13.0"
+tract-core = "0.21.0"
+tract-onnx = "0.21.0"
 
 [features]
 release = []

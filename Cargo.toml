@@ -33,3 +33,5 @@ tokio = { version = "1.35.1", features = ["rt-multi-thread", "signal"] }
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 metrics = "0.22.0"
+ndarray = "0.15.3"
+ndarray-npy = { version = "0.8.0", features = [ "compressed_npz" ] }

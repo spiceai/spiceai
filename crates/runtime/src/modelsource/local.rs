@@ -1,9 +1,10 @@
 pub struct Local {}
+use super::ModelSource;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-impl super::ModelSource for Local {
-    fn pull(&self, params: Arc<Option<HashMap<String, String>>>) -> bool {
+impl ModelSource for Local {
+    fn pull(&self, params: Arc<Option<HashMap<String, String>>>) -> super::Result<String> {
         tracing::debug!("ModelSource::pull, {:?}", params);
 
         // fetch name from params
@@ -12,11 +13,14 @@ impl super::ModelSource for Local {
             .as_ref()
             .and_then(|p| p.get("name"))
             .map(|n| n.to_string());
+
+        let _ = super::ensure_model_path(name.unwrap().as_str());
+
+        let path = params.as_ref().as_ref().and_then(|p| p.get("from")).map(|n| n.to_string());
         
-        let path = super::ensure_model_path(name.unwrap().as_str());
+        // trim local path
+        let path = path.map(|p| p.trim_start_matches("file:").to_string());
 
-        tracing::info!("path: {:?}", path);
-
-        return false;
+        return Ok(path.unwrap());
     }
 }

@@ -8,8 +8,9 @@ use clap::Parser;
 use runtime::config::Config as RuntimeConfig;
 use runtime::datasource::DataSource;
 
+use runtime::modelruntime::ModelRuntime;
 use runtime::modelsource::ModelSource;
-use runtime::{databackend, datasource, modelsource, Runtime};
+use runtime::{databackend, datasource, modelruntime, modelsource, Runtime};
 use snafu::prelude::*;
 
 #[derive(Debug, Snafu)]
@@ -92,7 +93,19 @@ pub async fn run(args: Args) -> Result<()> {
         match source {
             "local" => {
                 let local = modelsource::local::Local {};
-                let _ = local.pull(Arc::new(Option::from(params)));
+                let path = local.pull(Arc::new(Option::from(params)));
+
+                let path = path.unwrap().clone();
+
+                let model = modelruntime::tract::Tract {
+                    path: path.to_string()
+                }
+                .load();
+
+                if model.is_ok() {
+                    let result = model.unwrap().run();
+                    tracing::info!("Model loaded: {:?}", result);
+                }
             }
             _ => UnknownDataSourceSnafu {
                 data_source: source,
