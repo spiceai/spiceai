@@ -1,14 +1,17 @@
-use std::{collections::HashMap, ops::Deref, sync::Arc};
+use std::{collections::HashMap, mem, sync::Arc};
 
-use datafusion::execution::context::SessionContext;
-use duckdb::DuckdbConnectionManager;
+use arrow::record_batch::RecordBatch;
+use datafusion::{execution::context::SessionContext, sql::TableReference};
+use duckdb::{
+    vtab::arrow::{arrow_recordbatch_to_query_params, ArrowVTab},
+    DuckdbConnectionManager,
+};
 use duckdb_datafusion::DuckDBTable;
+use r2d2::ManageConnection;
 use snafu::{prelude::*, ResultExt};
 use spicepod::component::dataset::acceleration;
-use std::sync::Once;
-use tokio::sync::RwLock;
 
-use crate::dataupdate::DataUpdate;
+use crate::dataupdate::{DataUpdate, UpdateType};
 
 use super::{AddDataResult, DataBackend};
 
@@ -37,8 +40,6 @@ pub struct DuckDBBackend {
     ctx: Arc<SessionContext>,
     name: String,
     pool: Arc<r2d2::Pool<DuckdbConnectionManager>>,
-    df_initialized: Once,
-    df_initialization_result: RwLock<Result<()>>,
 }
 
 pub enum Mode {
@@ -49,13 +50,22 @@ pub enum Mode {
 impl DataBackend for DuckDBBackend {
     fn add_data(&self, data_update: DataUpdate) -> AddDataResult {
         let pool = Arc::clone(&self.pool);
+        let name = self.name.clone();
         Box::pin(async move {
-            let conn = pool.get().context(ConnectionPoolSnafu)?;
-            //conn.execute(&data_update.sql).context(DuckDBError)?;
+            let conn: r2d2::PooledConnection<DuckdbConnectionManager> =
+                pool.get().context(ConnectionPoolSnafu)?;
 
-            self.initialize_datafusion();
-            let r = self.df_initialization_result.read().await;
-            let result = r.as_ref().map_err(|e| e.clone())?;
+            let mut duckdb_update = DuckDBUpdate {
+                log_sequence_number: data_update.log_sequence_number.unwrap_or_default(),
+                name,
+                data: data_update.data,
+                update_type: data_update.update_type,
+                duckdb_conn: conn,
+            };
+
+            duckdb_update.update()?;
+
+            self.initialize_datafusion()?;
             Ok(())
         })
     }
@@ -77,48 +87,41 @@ impl DuckDBBackend {
             Mode::File => {
                 let manager = DuckdbConnectionManager::file(get_duckdb_file(name, &params))
                     .context(DuckDBSnafu)?;
+                let conn = manager.connect().context(DuckDBSnafu)?;
+
+                conn.register_table_function::<ArrowVTab>("arrow")
+                    .context(DuckDBSnafu)?;
+
                 Arc::new(r2d2::Pool::new(manager).context(ConnectionPoolSnafu)?)
             }
         };
 
         let name = name.to_string();
 
-        Ok(DuckDBBackend {
-            ctx,
-            name,
-            pool,
-            df_initialized: Once::new(),
-            df_initialization_result: RwLock::new(Ok(())),
-        })
+        Ok(DuckDBBackend { ctx, name, pool })
     }
 
-    fn initialize_datafusion(&self) {
-        if self.df_initialized.is_completed() {
-            return;
+    fn initialize_datafusion(&self) -> Result<()> {
+        let table_exists = self
+            .ctx
+            .table_exist(TableReference::bare(self.name.clone()))
+            .context(DataFusionSnafu)?;
+        if table_exists {
+            return Ok(());
         }
 
-        self.df_initialized.call_once(|| {
-            let table = match DuckDBTable::new(&self.pool, self.name.clone())
-                .context(DuckDBDataFusionSnafu)
-            {
-                Ok(table) => table,
-                Err(e) => {
-                    tracing::error!("Failed to create DuckDBTable: {}", e);
-                    let mut r = self.df_initialization_result.blocking_write();
-                    *r = Err(e);
-                    return;
-                }
-            };
+        let table = match DuckDBTable::new(&self.pool, TableReference::bare(self.name.clone()))
+            .context(DuckDBDataFusionSnafu)
+        {
+            Ok(table) => table,
+            Err(e) => return Err(e),
+        };
 
-            if let Err(e) = self.ctx.register_table(&self.name, Arc::new(table)) {
-                tracing::error!(
-                    r#"Failed to register DuckDBTable "{name}" in DataFusion: {e}"#,
-                    name = self.name
-                );
-                let mut r = self.df_initialization_result.blocking_write();
-                *r = Err(Error::DataFusion { source: e });
-            };
-        });
+        self.ctx
+            .register_table(&self.name, Arc::new(table))
+            .context(DataFusionSnafu)?;
+
+        Ok(())
     }
 }
 
@@ -136,5 +139,92 @@ impl From<acceleration::Mode> for Mode {
             acceleration::Mode::File => Mode::File,
             acceleration::Mode::Memory => Mode::Memory,
         }
+    }
+}
+
+struct DuckDBUpdate {
+    log_sequence_number: u64,
+    name: String,
+    data: Vec<RecordBatch>,
+    update_type: UpdateType,
+    duckdb_conn: r2d2::PooledConnection<DuckdbConnectionManager>,
+}
+
+impl DuckDBUpdate {
+    fn update(&mut self) -> Result<()> {
+        match self.update_type {
+            UpdateType::Overwrite => self.create_table()?,
+            UpdateType::Append => {
+                if !self.table_exists()? {
+                    self.create_table()?;
+                }
+            }
+        };
+
+        let data = mem::take(&mut self.data);
+        for batch in data {
+            self.insert_batch(batch)?;
+        }
+
+        tracing::trace!(
+            "Processed update to DuckDB table {name} for log sequence number {lsn:?}",
+            name = self.name,
+            lsn = self.log_sequence_number
+        );
+
+        Ok(())
+    }
+
+    fn insert_batch(&self, batch: RecordBatch) -> Result<()> {
+        let params = arrow_recordbatch_to_query_params(batch);
+        let sql = format!(
+            r#"INSERT INTO "{name}" SELECT * FROM arrow(?, ?)"#,
+            name = self.name
+        );
+
+        self.duckdb_conn
+            .execute(&sql, params)
+            .context(DuckDBSnafu)?;
+
+        Ok(())
+    }
+
+    fn create_table(&mut self) -> Result<()> {
+        let table_exists = self.table_exists()?;
+        if table_exists {
+            let sql = format!(r#"DROP TABLE "{name}""#, name = self.name);
+            self.duckdb_conn.execute(&sql, []).context(DuckDBSnafu)?;
+        }
+
+        let Some(batch) = self.data.pop() else {
+            return Ok(());
+        };
+
+        let arrow_params = arrow_recordbatch_to_query_params(batch);
+        let sql = format!(
+            r#"CREATE TABLE "{name}" AS SELECT * FROM arrow(?, ?)"#,
+            name = self.name
+        );
+
+        self.duckdb_conn
+            .execute(&sql, arrow_params)
+            .context(DuckDBSnafu)?;
+
+        Ok(())
+    }
+
+    fn table_exists(&self) -> Result<bool> {
+        let sql = format!(
+            r#"SELECT EXISTS (
+              SELECT 1
+              FROM information_schema.tables 
+              WHERE table_name = "{name}"
+            )"#,
+            name = self.name
+        );
+
+        self.duckdb_conn
+            .query_row(&sql, [], |row| row.get(0))
+            .context(DuckDBSnafu)
     }
 }
