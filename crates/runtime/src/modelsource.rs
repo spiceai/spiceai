@@ -28,7 +28,6 @@ pub fn ensure_model_path(name: &str) -> Result<String> {
     model_path.push(".spice/models");
     model_path.push(name);
 
-    // create model path folder
     if !model_path.exists() {
         std::fs::create_dir_all(&model_path).context(UnableToCreateModelPathSnafu)?;
     }

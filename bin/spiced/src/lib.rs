@@ -95,8 +95,7 @@ pub async fn run(args: Args) -> Result<()> {
         match source {
             "local" => {
                 let local = modelsource::local::Local {};
-                let created = local.pull(Arc::new(Option::from(params)));
-                tracing::info!("Model created: {:?}", created);
+                let _ = local.pull(Arc::new(Option::from(params)));
             }
             _ => UnknownDataSourceSnafu {
                 data_source: source,
