@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::thread;
 use std::time::Duration;
 
 use crate::databackend::{DataBackend, DataBackendType};
@@ -17,6 +16,7 @@ use futures::StreamExt;
 use snafu::prelude::*;
 use spicepod::component::dataset::Dataset;
 use tokio::task;
+use tokio::time::sleep;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -170,7 +170,7 @@ impl DataFusion {
                     tracing::error!(
                         "Dependent table {dependent_table_name} for {table_name} does not exist, retrying in 1s..."
                     );
-                    thread::sleep(Duration::from_secs(1));
+                    sleep(Duration::from_secs(1));
                     continue;
                 }
                 break;
