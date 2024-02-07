@@ -1,14 +1,22 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::databackend::{DataBackend, DataBackendType};
 use crate::datasource::DataSource;
+use datafusion::datasource::ViewTable;
 use datafusion::error::DataFusionError;
 use datafusion::execution::{context::SessionContext, options::ParquetReadOptions};
+use datafusion::sql::parser;
+use datafusion::sql::parser::DFParser;
+use datafusion::sql::sqlparser;
+use datafusion::sql::sqlparser::ast::{self, SetExpr, TableFactor};
+use datafusion::sql::sqlparser::dialect::AnsiDialect;
 use futures::StreamExt;
 use snafu::prelude::*;
 use spicepod::component::dataset::Dataset;
-use tokio::task;
+use tokio::time::sleep;
+use tokio::{spawn, task};
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -24,7 +32,20 @@ pub enum Error {
         source: DataFusionError,
     },
 
+    UnableToCreateBackend {
+        source: crate::databackend::Error,
+    },
+
     TableAlreadyExists {},
+
+    #[snafu(display("Unable to create view: {}", reason))]
+    UnableToCreateView {
+        reason: String,
+    },
+
+    UnableToParseSql {
+        source: sqlparser::parser::ParserError,
+    },
 }
 
 pub struct DataFusion {
@@ -111,6 +132,119 @@ impl DataFusion {
         self.tasks.push(task_handle);
 
         Ok(())
+    }
+
+    pub fn attach_view(&self, dataset: &Dataset) -> Result<()> {
+        let table_exists = self.ctx.table_exist(dataset.name.as_str()).unwrap_or(false);
+        if table_exists {
+            return TableAlreadyExistsSnafu.fail();
+        }
+
+        let sql = dataset.sql.clone().unwrap_or_default();
+        let statements = DFParser::parse_sql_with_dialect(sql.as_str(), &AnsiDialect {})
+            .context(UnableToParseSqlSnafu)?;
+        if statements.len() != 1 {
+            return UnableToCreateViewSnafu {
+                reason: format!(
+                    "Expected 1 statement to create view from, received {}",
+                    statements.len()
+                )
+                .to_string(),
+            }
+            .fail();
+        }
+
+        let ctx = self.ctx.clone();
+        let table_name = dataset.name.clone();
+        spawn(async move {
+            // Tables are currently lazily created (i.e. not created until first data is received) so that we know the table schema.
+            // This means that we can't create a view on top of a table until the first data is received for all dependent tables and therefore
+            // the tables are created. To handle this, wait until all tables are created.
+            let dependent_table_names = DataFusion::get_dependent_table_names(&statements[0]);
+            for dependent_table_name in dependent_table_names {
+                let mut attempts = 0;
+                loop {
+                    if !ctx.table_exist(&dependent_table_name).unwrap_or(false) {
+                        if attempts % 10 == 0 {
+                            tracing::error!("Dependent table {dependent_table_name} for {table_name} does not exist, retrying...");
+                        }
+                        attempts += 1;
+                        sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
+                    break;
+                }
+            }
+
+            let plan = match ctx.state().statement_to_plan(statements[0].clone()).await {
+                Ok(plan) => plan,
+                Err(e) => {
+                    tracing::error!("Unable to create view: {e:?}");
+                    return;
+                }
+            };
+            let view = match ViewTable::try_new(plan, Some(sql.to_string())) {
+                Ok(view) => view,
+                Err(e) => {
+                    tracing::error!("Unable to create view: {e:?}");
+                    return;
+                }
+            };
+            if let Err(e) = ctx.register_table(table_name.as_str(), Arc::new(view)) {
+                tracing::error!("Unable to create view: {e:?}");
+            };
+        });
+
+        Ok(())
+    }
+
+    fn get_dependent_table_names(statement: &parser::Statement) -> Vec<String> {
+        let mut table_names = Vec::new();
+        match statement.clone() {
+            parser::Statement::Statement(statement) => match *statement {
+                ast::Statement::Query(statement) => match *statement.body {
+                    SetExpr::Select(select_statement) => {
+                        for from in select_statement.from {
+                            if let TableFactor::Table {
+                                name,
+                                alias: _,
+                                args: _,
+                                with_hints: _,
+                                version: _,
+                                partitions: _,
+                            } = from.relation
+                            {
+                                table_names.push(name.to_string());
+                            }
+
+                            for join in from.joins {
+                                if let TableFactor::Table {
+                                    name,
+                                    alias: _,
+                                    args: _,
+                                    with_hints: _,
+                                    version: _,
+                                    partitions: _,
+                                } = join.relation
+                                {
+                                    table_names.push(name.to_string());
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        return table_names;
+                    }
+                },
+                _ => {
+                    return table_names;
+                }
+            },
+            _ => {
+                return table_names;
+            }
+        }
+        table_names
     }
 }
 
