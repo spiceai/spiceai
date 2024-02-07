@@ -21,7 +21,6 @@ impl WithDependsOn<Model> for Model {
     }
 }
 
-
 impl Model {
     #[must_use]
     pub fn source(&self) -> String {

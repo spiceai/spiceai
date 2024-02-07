@@ -91,17 +91,17 @@ pub async fn run(args: Args) -> Result<()> {
 
         params.insert("name".to_string(), model.name.to_string());
         params.insert("from".to_string(), model.from.to_string());
-        
 
         match source {
             "local" => {
-                let local = modelsource::local::Local{};
+                let local = modelsource::local::Local {};
                 let created = local.pull(Arc::new(Option::from(params)));
                 tracing::info!("Model created: {:?}", created);
-            },
+            }
             _ => UnknownDataSourceSnafu {
                 data_source: source,
-            }.fail()?,
+            }
+            .fail()?,
         }
     }
 

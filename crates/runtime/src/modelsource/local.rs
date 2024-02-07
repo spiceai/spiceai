@@ -7,7 +7,8 @@ impl super::ModelSource for Local {
         tracing::debug!("ModelSource::pull, {:?}", params);
 
         // fetch name from params
-        let name = params.as_ref()
+        let name = params
+            .as_ref()
             .as_ref()
             .and_then(|p| p.get("name"))
             .map(|n| n.to_string());
