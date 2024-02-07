@@ -170,7 +170,7 @@ impl DataFusion {
                     tracing::error!(
                         "Dependent table {dependent_table_name} for {table_name} does not exist, retrying in 1s..."
                     );
-                    sleep(Duration::from_secs(1));
+                    sleep(Duration::from_secs(1)).await;
                     continue;
                 }
                 break;
