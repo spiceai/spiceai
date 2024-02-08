@@ -22,6 +22,7 @@ arrow = "49.0.0"
 arrow-flight = "49.0.0"
 arrow-ipc = "49.0.0"
 tonic = "0.10.2"
+tonic_0_9_0 = { version = "0.9.0", package = "tonic", features = ["gzip"] }
 futures = "0.3.30"
 uuid = "1.6.1"
 tokio-stream = "0.1"
@@ -34,6 +35,12 @@ flight_client = { version = "0.10.0-alpha.0", path = "../flight_client" }
 tract-core = "0.21.0"
 tract-onnx = "0.21.0"
 ndarray-npy.workspace = true
+duckdb = { git = "https://github.com/spicehq/duckdb-rs.git", rev = "8b57b1496eed1009c45734df7790960313d31e3d",  features = ["bundled", "r2d2", "vtab", "vtab-arrow"], optional = true }
+duckdb_datafusion = { path = "../duckdb_datafusion", optional = true }
+r2d2 = { version = "0.8.10", optional = true }
+opentelemetry-proto = { version = "0.4.0", features = ["gen-tonic-messages", "gen-tonic", "metrics"] }
 
 [features]
+default = ["duckdb"]
 dev = []
+duckdb = ["dep:duckdb", "duckdb_datafusion", "r2d2"]

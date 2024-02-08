@@ -1,47 +1,56 @@
 use crate::dataupdate::DataUpdate;
-use datafusion::{error::DataFusionError, execution::context::SessionContext, sql::sqlparser};
+use datafusion::execution::context::SessionContext;
 use snafu::prelude::*;
-use std::{future::Future, pin::Pin, sync::Arc};
+use spicepod::component::dataset::acceleration::{Engine, Mode};
+use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
 
-use self::memtable::MemTableBackend;
+use self::{duckdb::DuckDBBackend, memtable::MemTableBackend};
 
+#[cfg(feature = "duckdb")]
 pub mod duckdb;
 pub mod memtable;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to add data"))]
-    UnableToAddData { source: DataFusionError },
+    #[snafu(display("Invalid configuration: {msg}"))]
+    InvalidConfiguration { msg: String },
 
-    UnableToParseSql {
-        source: sqlparser::parser::ParserError,
+    #[snafu(display("Backend creation failed"))]
+    BackendCreationFailed {
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
 }
 
-type Result<T, E = Error> = std::result::Result<T, E>;
-
-#[derive(Debug, Default)]
-pub enum DataBackendType {
-    #[default]
-    Memtable,
-    DuckDB,
-}
+pub type AddDataResult<'a> =
+    Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error>>> + Send + 'a>>;
 
 pub trait DataBackend: Send + Sync {
-    fn add_data(
-        &self,
-        data_update: DataUpdate,
-    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
+    fn add_data(&self, data_update: DataUpdate) -> AddDataResult;
 }
 
 impl dyn DataBackend {
-    #[must_use]
-    pub fn new(ctx: &Arc<SessionContext>, name: &str, backend_type: &DataBackendType) -> Box<Self> {
-        match backend_type {
-            DataBackendType::Memtable => Box::new(MemTableBackend::new(Arc::clone(ctx), name)),
-            DataBackendType::DuckDB => {
-                todo!("DuckDB backend not implemented yet");
-            }
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn new(
+        ctx: &Arc<SessionContext>,
+        name: &str,
+        engine: Engine,
+        mode: Mode,
+        params: Arc<Option<HashMap<String, String>>>,
+    ) -> std::result::Result<Box<Self>, Error> {
+        match engine {
+            Engine::Arrow => match mode {
+                Mode::Memory => Ok(Box::new(MemTableBackend::new(Arc::clone(ctx), name))),
+                Mode::File => InvalidConfigurationSnafu {
+                    msg: "File mode not supported for Arrow engine".to_string(),
+                }
+                .fail()?,
+            },
+            #[cfg(feature = "duckdb")]
+            Engine::DuckDB => Ok(Box::new(
+                DuckDBBackend::new(Arc::clone(ctx), name, mode.into(), params)
+                    .boxed()
+                    .context(BackendCreationFailedSnafu)?,
+            )),
         }
     }
 }

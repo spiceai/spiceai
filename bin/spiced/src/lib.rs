@@ -8,7 +8,7 @@ use clap::Parser;
 use runtime::config::Config as RuntimeConfig;
 use runtime::datasource::DataSource;
 
-use runtime::{databackend, datasource, Runtime};
+use runtime::{datasource, Runtime};
 use snafu::prelude::*;
 
 #[derive(Debug, Snafu)]
@@ -44,6 +44,9 @@ pub enum Error {
 
     #[snafu(display("Unknown data source: {data_source}"))]
     UnknownDataSource { data_source: String },
+
+    #[snafu(display("Unable to create data backend"))]
+    UnableToCreateBackend { source: runtime::datafusion::Error },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -81,6 +84,11 @@ pub async fn run(args: Args) -> Result<()> {
     let mut df = runtime::datafusion::DataFusion::new();
 
     for ds in &app.datasets {
+        let Some(_) = ds.acceleration else {
+            tracing::warn!("No acceleration specified for dataset: {}", ds.name);
+            continue;
+        };
+
         let source = ds.source();
         let source = source.as_str();
         let params = Arc::new(ds.params.clone());
@@ -107,24 +115,28 @@ pub async fn run(args: Args) -> Result<()> {
             .fail()?,
         };
 
+        let data_backend = df.new_backend(ds).context(UnableToCreateBackendSnafu)?;
+
         match data_source {
             Some(data_source) => {
                 let data_source = Box::leak(data_source);
 
-                df.attach(ds, data_source, databackend::DataBackendType::default())
-                    .context(UnableToAttachDataSourceSnafu {
+                df.attach(ds, data_source, data_backend).context(
+                    UnableToAttachDataSourceSnafu {
                         data_source: source,
-                    })?;
+                    },
+                )?;
             }
             None => match &ds.sql {
                 Some(_) => {
                     df.attach_view(ds).context(UnableToAttachViewSnafu)?;
                 }
                 None => {
-                    df.attach_backend(&ds.name, databackend::DataBackendType::default())
-                        .context(UnableToAttachDataSourceSnafu {
+                    df.attach_backend(&ds.name, data_backend).context(
+                        UnableToAttachDataSourceSnafu {
                             data_source: source,
-                        })?;
+                        },
+                    )?;
                 }
             },
         }
