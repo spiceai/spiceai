@@ -16,6 +16,7 @@ pub mod datasource;
 pub mod dataupdate;
 mod flight;
 mod http;
+pub mod modelformat;
 mod opentelemetry;
 
 #[derive(Debug, Snafu)]
