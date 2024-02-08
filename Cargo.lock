@@ -1371,6 +1371,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "flightrepl"
+version = "0.10.0-alpha.0"
+dependencies = [
+ "arrow",
+ "arrow-flight",
+ "async-stream",
+ "clap",
+ "datafusion",
+ "futures",
+ "parquet",
+ "tokio",
+ "tonic 0.10.2",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "flightsubscriber"
 version = "0.10.0-alpha.0"
 dependencies = [
