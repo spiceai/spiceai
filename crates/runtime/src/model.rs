@@ -62,11 +62,11 @@ impl Model {
         tracing::info!("to be implemented {:?}", self.inference_template);
         tracing::info!("to be implemented {:?}", self.datasets);
 
-        let sql = "select number as ts, (number::double / 100) as y, (number::double) / 100 as y2 from datafusion.public.eth_blocks limit 100";
+        let sql = "select number as ts, (number::double / 100) as y, (number::double) / 100 as y2 from datafusion.public.eth_blocks order by ts desc limit 100";
 
         let data = df.ctx.sql(sql).await.unwrap().collect().await.unwrap();
 
-        tracing::info!("{:?}", data);
+        // tracing::info!("{:?}", data);
 
         return self.runnable.run(data).unwrap();
     }

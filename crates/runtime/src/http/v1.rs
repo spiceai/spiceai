@@ -43,17 +43,20 @@ pub(crate) mod inference {
     use arrow::array::Float32Array;
     use axum::{debug_handler, extract::Path, Extension, Json};
     use std::sync::Arc;
+    use std::collections::HashMap;
 
     #[debug_handler]
     pub(crate) async fn get(
         Extension(app): Extension<Arc<App>>,
         Extension(df): Extension<Arc<DataFusion>>,
         Path(name): Path<String>,
-    ) -> Json<Vec<f32>> {
+    ) -> Json<HashMap<String, Vec<f32>>> {
         let model = app.models.iter().find(|m| m.name == name);
 
+        let mut final_result: HashMap<String, Vec<f32>> = HashMap::new();
+
         if model.is_none() {
-            return Json(vec![]);
+            return Json(final_result);
         }
 
         let runnable = Model::load(&(model.unwrap())).unwrap();
@@ -72,6 +75,8 @@ pub(crate) mod inference {
             return_val.push(*v);
         });
 
-        Json(return_val)
+        final_result.insert("forecast".to_string(), return_val);
+
+        Json(final_result)
     }
 }
