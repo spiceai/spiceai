@@ -40,12 +40,11 @@ pub(crate) mod inference {
     use crate::datafusion::DataFusion;
     use crate::model::Model;
     use app::App;
-    use arrow::{array::Array, datatypes::Schema};
-    use arrow::record_batch::RecordBatch;
     use arrow::array::Float32Array;
-    use axum::{extract::Path, Extension, Json};
+    use axum::{debug_handler, extract::Path, Extension, Json};
     use std::sync::Arc;
 
+    #[debug_handler]
     pub(crate) async fn get(
         Extension(app): Extension<Arc<App>>,
         Extension(df): Extension<Arc<DataFusion>>,
@@ -53,13 +52,15 @@ pub(crate) mod inference {
     ) -> Json<Vec<f32>> {
         let model = app.models.iter().find(|m| m.name == name);
 
-        let mut result = RecordBatch::new_empty(Arc::new(Schema::empty()));
-        if model.is_some() {
-            let runnable = Model::load(&(model.unwrap())).unwrap();
-
-            result = runnable.run(df);
+        if model.is_none() {
+            return Json(vec![]);
         }
-        let result = result.column_by_name("result")
+
+        let runnable = Model::load(&(model.unwrap())).unwrap();
+        let result = runnable.run(df);
+        let a = result
+            .await
+            .column_by_name("result")
             .unwrap()
             .as_any()
             .downcast_ref::<Float32Array>()
@@ -67,7 +68,7 @@ pub(crate) mod inference {
             .clone();
 
         let mut return_val = Vec::new();
-        result.values().iter().for_each(|v| {
+        a.values().iter().for_each(|v| {
             return_val.push(*v);
         });
 

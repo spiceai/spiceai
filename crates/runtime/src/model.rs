@@ -1,13 +1,12 @@
 use crate::modelruntime::ModelRuntime;
-use crate::DataFusion;
 use crate::modelruntime::Runnable;
 use crate::modelsource::ModelSource;
-use arrow::datatypes::{Field,Schema,DataType};
+use crate::DataFusion;
+use arrow::array::Float32Array;
+use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use snafu::prelude::*;
-use arrow::array::Float32Array;
 use std::sync::Arc;
-
 pub struct Model {
     runnable: Box<dyn Runnable>,
     spicepod_model: spicepod::component::model::Model,
@@ -63,13 +62,12 @@ impl Model {
         }
     }
 
-    pub fn run(&self, _: Arc<DataFusion>) -> RecordBatch {
-        let result = self.runnable.run();
+    pub async fn run(&self, df: Arc<DataFusion>) -> RecordBatch {
+        let sql = "select 1 as ts, 2 as y";
 
-        tracing::info!("result: {:?}", result);
-        let id_array = Float32Array::from(vec![1.0, 2.0, 3.0, 4.0, 5.0]);
-        let schema = Schema::new(vec![
-                Field::new("result", DataType::Float32, false),]);
-        return RecordBatch::try_new(Arc::new(schema), vec![Arc::new(id_array)]).unwrap();
+        // todo this needs to be more idiomatic
+        let data = df.ctx.sql(sql).await.unwrap().collect().await.unwrap();
+
+        return self.runnable.run(data).unwrap();
     }
 }

@@ -1,9 +1,10 @@
-use std::ops::Deref;
-
 use super::ModelRuntime;
 use super::Runnable;
+use arrow::array::Float32Array;
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
 use snafu::ResultExt;
-use tract_core::ndarray::{IxDyn, OwnedRepr};
+use std::sync::Arc;
 use tract_onnx::prelude::*;
 
 pub struct Tract {
@@ -32,29 +33,10 @@ fn load_tract_model(
 }
 
 impl Runnable for TractModel {
-    fn run(&self) -> Vec<Vec<f32>> {
-        let io = std::fs::File::open("/Users/yong/Downloads/io.npz").unwrap();
-        let npz = ndarray_npy::NpzReader::new(io);
-
-        if npz.is_ok() {
-            let input = npz
-                .unwrap()
-                .by_name::<OwnedRepr<f32>, IxDyn>("input.npy")
-                .unwrap()
-                .into_tensor();
-            let tensors = self.model.run(tvec![input.into()]).unwrap();
-
-            let mut result: Vec<Vec<f32>> = vec![];
-
-            tensors.into_iter().for_each(|x| {
-                let tensor = x.deref();
-                tensor.as_slice::<f32>().unwrap().iter().for_each(|y| {
-                    result.push(vec![*y]);
-                })
-            });
-
-            return result;
-        }
-        todo!()
+    fn run(&self, _input: Vec<RecordBatch>) -> super::Result<RecordBatch> {
+        let id_array = Float32Array::from(vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+        let schema = Schema::new(vec![Field::new("result", DataType::Float32, false)]);
+        return RecordBatch::try_new(Arc::new(schema), vec![Arc::new(id_array)])
+            .context(super::ArrowSnafu);
     }
 }
