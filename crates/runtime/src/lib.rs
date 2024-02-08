@@ -49,7 +49,11 @@ impl Runtime {
     }
 
     pub async fn start_servers(&self) -> Result<()> {
-        let http_server_future = http::start(self.config.http_bind_address, self.app.clone());
+        let http_server_future = http::start(
+            self.config.http_bind_address,
+            self.app.clone(),
+            self.df.clone(),
+        );
         let flight_server_future = flight::start(self.config.flight_bind_address, self.df.clone());
 
         tokio::select! {
