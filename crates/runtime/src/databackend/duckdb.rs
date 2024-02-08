@@ -1,4 +1,8 @@
-use std::{collections::HashMap, mem, sync::Arc};
+use std::{
+    collections::HashMap,
+    fmt, mem,
+    sync::{Arc, PoisonError},
+};
 
 use arrow::record_batch::RecordBatch;
 use datafusion::{execution::context::SessionContext, sql::TableReference};
@@ -31,6 +35,11 @@ pub enum Error {
     DataFusion {
         source: datafusion::error::DataFusionError,
     },
+
+    #[snafu(display("Lock is poisoned: {message}"))]
+    LockPoisoned {
+        message: String,
+    },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -39,6 +48,7 @@ pub struct DuckDBBackend {
     ctx: Arc<SessionContext>,
     name: String,
     pool: Arc<r2d2::Pool<DuckdbConnectionManager>>,
+    create_mutex: std::sync::Mutex<()>,
 }
 
 pub enum Mode {
@@ -60,6 +70,7 @@ impl DataBackend for DuckDBBackend {
                 data: data_update.data,
                 update_type: data_update.update_type,
                 duckdb_conn: conn,
+                create_mutex: &self.create_mutex,
             };
 
             duckdb_update.update()?;
@@ -92,7 +103,12 @@ impl DuckDBBackend {
 
         let name = name.to_string();
 
-        Ok(DuckDBBackend { ctx, name, pool })
+        Ok(DuckDBBackend {
+            ctx,
+            name,
+            pool,
+            create_mutex: std::sync::Mutex::new(()),
+        })
     }
 
     fn initialize_datafusion(&self) -> Result<()> {
@@ -136,21 +152,22 @@ impl From<acceleration::Mode> for Mode {
     }
 }
 
-struct DuckDBUpdate {
+struct DuckDBUpdate<'a> {
     log_sequence_number: u64,
     name: String,
     data: Vec<RecordBatch>,
     update_type: UpdateType,
     duckdb_conn: r2d2::PooledConnection<DuckdbConnectionManager>,
+    create_mutex: &'a std::sync::Mutex<()>,
 }
 
-impl DuckDBUpdate {
+impl<'a> DuckDBUpdate<'a> {
     fn update(&mut self) -> Result<()> {
         match self.update_type {
-            UpdateType::Overwrite => self.create_table()?,
+            UpdateType::Overwrite => self.create_table(true)?,
             UpdateType::Append => {
                 if !self.table_exists() {
-                    self.create_table()?;
+                    self.create_table(false)?;
                 }
             }
         };
@@ -175,6 +192,7 @@ impl DuckDBUpdate {
             r#"INSERT INTO "{name}" SELECT * FROM arrow(?, ?)"#,
             name = self.name
         );
+        tracing::trace!("{sql}");
 
         self.duckdb_conn
             .execute(&sql, params)
@@ -183,11 +201,17 @@ impl DuckDBUpdate {
         Ok(())
     }
 
-    fn create_table(&mut self) -> Result<()> {
-        let table_exists = self.table_exists();
-        if table_exists {
-            let sql = format!(r#"DROP TABLE "{name}""#, name = self.name);
-            self.duckdb_conn.execute(&sql, []).context(DuckDBSnafu)?;
+    fn create_table(&mut self, drop_if_exists: bool) -> Result<()> {
+        let _lock = self.create_mutex.lock().map_err(handle_poison)?;
+
+        if self.table_exists() {
+            if drop_if_exists {
+                let sql = format!(r#"DROP TABLE "{}""#, self.name);
+                tracing::trace!("{sql}");
+                self.duckdb_conn.execute(&sql, []).context(DuckDBSnafu)?;
+            } else {
+                return Ok(());
+            }
         }
 
         let Some(batch) = self.data.pop() else {
@@ -199,6 +223,7 @@ impl DuckDBUpdate {
             r#"CREATE TABLE "{name}" AS SELECT * FROM arrow(?, ?)"#,
             name = self.name
         );
+        tracing::trace!("{sql}");
 
         self.duckdb_conn
             .execute(&sql, arrow_params)
@@ -212,14 +237,22 @@ impl DuckDBUpdate {
             r#"SELECT EXISTS (
               SELECT 1
               FROM information_schema.tables 
-              WHERE table_name = "{name}"
+              WHERE table_name = '{name}'
             )"#,
             name = self.name
         );
+        tracing::trace!("{sql}");
 
         self.duckdb_conn
             .query_row(&sql, [], |row| row.get::<usize, bool>(0))
             .unwrap_or(false)
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn handle_poison<T: fmt::Debug>(e: PoisonError<T>) -> Error {
+    Error::LockPoisoned {
+        message: format!("{e:?}"),
     }
 }
 

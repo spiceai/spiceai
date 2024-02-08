@@ -37,10 +37,11 @@ impl MetricsService for Service {
             for scope_metric in resource_metric.scope_metrics {
                 for metric in scope_metric.metrics {
                     total_data_points += 1;
+                    tracing::debug!("Metric: {:?}", metric.name);
                     match metric.data {
                         Some(data) => {
                             // TODO: Check if localhost table exists and write to Databackend
-                            tracing::info!("Data: {:?}", data);
+                            tracing::debug!("Data: {:?}", data);
                         }
                         None => {
                             rejected_data_points += 1;
