@@ -12,6 +12,8 @@ use snafu::ResultExt;
 use std::fs::File;
 use tract_core::tract_data::itertools::Itertools;
 
+use snafu::ResultExt;
+use std::sync::Arc;
 use tract_onnx::prelude::*;
 
 pub struct Tract {
@@ -116,19 +118,8 @@ fn load_tract_model(
 }
 
 impl Runnable for TractModel {
-    fn run(&self) -> super::Result<RecordBatch> {
+    fn run(&self, _input: Vec<RecordBatch>) -> super::Result<RecordBatch> {
         let lookback_size = 10;
-        let file = File::open("/Users/jeadie/Github/spiceai/input.parquet").unwrap();
-
-        let data: Vec<RecordBatch> = ParquetRecordBatchReaderBuilder::try_new(file)
-            .map_err(|e| e.to_string())
-            .unwrap() // TODO stop using `unwrap()`.
-            .build()
-            .map_err(|e| e.to_string())
-            .unwrap()
-            .flatten()
-            .collect_vec();
-
-        self.run_inference(data, lookback_size)
+        self.run_inference(_input, lookback_size)
     }
 }

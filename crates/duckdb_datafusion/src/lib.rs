@@ -43,36 +43,34 @@ pub struct DuckDBTable {
 
 impl DuckDBTable {
     pub fn new(
-        pool: impl Into<r2d2::Pool<DuckdbConnectionManager>>,
+        pool: &Arc<r2d2::Pool<DuckdbConnectionManager>>,
         table_reference: impl Into<OwnedTableReference>,
     ) -> Result<Self> {
-        let pool = pool.into();
         let table_reference = table_reference.into();
-        let schema = Self::get_schema(&pool, &table_reference)?;
+        let schema = Self::get_schema(pool, &table_reference)?;
         Ok(Self {
-            pool: Arc::new(pool),
+            pool: Arc::clone(pool),
             schema,
             table_reference,
         })
     }
 
     pub fn new_with_schema(
-        pool: impl Into<r2d2::Pool<DuckdbConnectionManager>>,
+        pool: &Arc<r2d2::Pool<DuckdbConnectionManager>>,
         schema: impl Into<SchemaRef>,
         table_reference: impl Into<OwnedTableReference>,
     ) -> Self {
         Self {
-            pool: Arc::new(pool.into()),
+            pool: Arc::clone(pool),
             schema: schema.into(),
             table_reference: table_reference.into(),
         }
     }
 
     pub fn get_schema<'a>(
-        pool: impl Into<&'a r2d2::Pool<DuckdbConnectionManager>>,
+        pool: &Arc<r2d2::Pool<DuckdbConnectionManager>>,
         table_reference: impl Into<TableReference<'a>>,
     ) -> Result<SchemaRef> {
-        let pool = pool.into();
         let table_reference = table_reference.into();
         let conn = pool.get().context(UnableToGetConnectionFromPoolSnafu)?;
         let mut stmt = conn
@@ -275,49 +273,54 @@ mod tests {
 
     use datafusion::execution::context::SessionContext;
     use duckdb::DuckdbConnectionManager;
-    use tracing::level_filters::LevelFilter;
+    use tracing::{level_filters::LevelFilter, subscriber::DefaultGuard, Dispatch};
 
     use crate::DuckDBTable;
 
-    fn setup_tracing() {
-        tracing_subscriber::fmt()
+    fn setup_tracing() -> DefaultGuard {
+        let subscriber: tracing_subscriber::FmtSubscriber = tracing_subscriber::fmt()
             .with_max_level(LevelFilter::DEBUG)
-            .init();
+            .finish();
+
+        let dispatch = Dispatch::new(subscriber);
+        tracing::dispatcher::set_default(&dispatch)
     }
 
     #[tokio::test]
     async fn test_duckdb_table() -> Result<(), Box<dyn Error>> {
-        setup_tracing();
+        let t = setup_tracing();
         let ctx = SessionContext::new();
         let conn = DuckdbConnectionManager::memory()?;
-        let pool = r2d2::Pool::new(conn)?;
+        let pool = Arc::new(r2d2::Pool::new(conn)?);
         let db_conn = pool.get()?;
         db_conn.execute_batch(
             "CREATE TABLE test (a INTEGER, b VARCHAR); INSERT INTO test VALUES (3, 'bar');",
         )?;
-        let duckdb_table = DuckDBTable::new(pool, "test")?;
+        let duckdb_table = DuckDBTable::new(&pool, "test")?;
         ctx.register_table("test_datafusion", Arc::new(duckdb_table))?;
         let sql = "SELECT * FROM test_datafusion limit 1";
         let df = ctx.sql(sql).await?;
         df.show().await?;
+        drop(t);
         Ok(())
     }
 
     #[tokio::test]
     async fn test_duckdb_table_filter() -> Result<(), Box<dyn Error>> {
-        setup_tracing();
+        let t = setup_tracing();
         let ctx = SessionContext::new();
         let conn = DuckdbConnectionManager::memory()?;
-        let pool = r2d2::Pool::new(conn)?;
+        let pool = Arc::new(r2d2::Pool::new(conn)?);
         let db_conn = pool.get()?;
         db_conn.execute_batch(
             "CREATE TABLE test (a INTEGER, b VARCHAR); INSERT INTO test VALUES (3, 'bar');",
         )?;
-        let duckdb_table = DuckDBTable::new(pool, "test")?;
+        let duckdb_table = DuckDBTable::new(&pool, "test")?;
         ctx.register_table("test_datafusion", Arc::new(duckdb_table))?;
         let sql = "SELECT * FROM test_datafusion where a > 1 and b = 'bar' limit 1";
         let df = ctx.sql(sql).await?;
         df.show().await?;
+        drop(t);
         Ok(())
     }
 }
