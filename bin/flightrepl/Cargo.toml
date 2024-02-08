@@ -24,3 +24,4 @@ futures = "0.3.30"
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 datafusion = "34.0.0"
+rustyline = "13.0.0"

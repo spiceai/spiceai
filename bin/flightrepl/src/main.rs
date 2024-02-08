@@ -1,5 +1,3 @@
-use std::io;
-use std::io::Write;
 use std::sync::Arc;
 
 use arrow_flight::{
@@ -12,6 +10,8 @@ use datafusion::datasource::{provider_as_source, MemTable};
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::{LogicalPlanBuilder, UNNAMED_TABLE};
 use futures::{StreamExt, TryStreamExt};
+use rustyline::error::ReadlineError;
+use rustyline::DefaultEditor;
 use tonic::transport::Channel;
 use tonic::IntoRequest;
 use tracing_subscriber::filter::Directive;
@@ -39,11 +39,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     let mut client = FlightServiceClient::new(channel);
 
+    let mut rl = DefaultEditor::new()?;
+
     loop {
-        print!("query> ");
-        let _ = io::stdout().flush();
-        let mut line = String::new();
-        let _ = io::stdin().read_line(&mut line);
+        let line_result = rl.readline("query> ");
+        let line = match line_result {
+            Ok(line) => line,
+            Err(ReadlineError::Interrupted | ReadlineError::Eof) => {
+                break;
+            }
+            Err(err) => {
+                println!("Error reading line: {err}");
+                continue;
+            }
+        };
 
         let line = line.trim();
         if line.is_empty() {
@@ -60,6 +69,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             _ => {}
         }
+
+        let _ = rl.add_history_entry(line);
 
         let request = FlightDescriptor::new_cmd(line.to_string());
 
