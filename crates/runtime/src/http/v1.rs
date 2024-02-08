@@ -60,7 +60,7 @@ pub(crate) mod inference {
         let result = runnable.run(df);
         let a = result
             .await
-            .column_by_name("result")
+            .column_by_name("y")
             .unwrap()
             .as_any()
             .downcast_ref::<Float32Array>()

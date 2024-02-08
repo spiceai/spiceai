@@ -7,12 +7,8 @@ use arrow::datatypes::DataType;
 use arrow::datatypes::Field;
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use snafu::ResultExt;
-use std::fs::File;
 use tract_core::tract_data::itertools::Itertools;
-
-use snafu::ResultExt;
 use std::sync::Arc;
 use tract_onnx::prelude::*;
 

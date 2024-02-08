@@ -61,9 +61,11 @@ impl Model {
     }
 
     pub async fn run(&self, df: Arc<DataFusion>) -> RecordBatch {
-        let sql = "select number from datafusion.public.eth_blocks limit 10";
+        let sql = "select number as ts, (number::double / 100) as y, (number::double) / 100 as y2 from datafusion.public.eth_blocks limit 100";
 
         let data = df.ctx.sql(sql).await.unwrap().collect().await.unwrap();
+
+        tracing::info!("{:?}", data);
 
         return self.runnable.run(data).unwrap();
     }
