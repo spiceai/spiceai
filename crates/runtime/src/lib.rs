@@ -35,25 +35,25 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub struct Runtime {
     pub app: Arc<app::App>,
     pub config: config::Config,
-    pub df: &'static DataFusion,
+    pub df: Arc<DataFusion>,
 }
 
 impl Runtime {
     #[must_use]
-    pub fn new(config: Config, app: app::App, df: &'static DataFusion) -> Self {
+    pub fn new(config: Config, app: app::App, df: DataFusion) -> Self {
         Runtime {
             app: Arc::new(app),
             config,
-            df,
+            df: Arc::new(df),
         }
     }
 
     pub async fn start_servers(&self) -> Result<()> {
         let http_server_future = http::start(self.config.http_bind_address, self.app.clone());
-        let flight_server_future = flight::start(self.config.flight_bind_address, self.df);
+        let flight_server_future = flight::start(self.config.flight_bind_address, self.df.clone());
         let open_telemetry_server_future = opentelemetry::start(
             self.config.open_telemetry_bind_address,
-            self.df, // It's safe to leak datafusion here, we know the server will live for the entire duration of the program.
+            Box::leak(Box::new(self.df.clone())), // It's safe to leak datafusion here, we know the server will live for the entire duration of the program.
         );
 
         tokio::select! {

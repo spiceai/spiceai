@@ -27,7 +27,7 @@ use arrow_flight::{
 };
 
 pub struct Service {
-    datafusion: &'static DataFusion,
+    datafusion: Arc<DataFusion>,
     channel_map: Arc<RwLock<HashMap<String, Arc<Sender<DataUpdate>>>>>,
 }
 
@@ -376,7 +376,7 @@ impl FlightService for Service {
         })
         .flat_map(|x| x);
 
-        let datafusion = self.datafusion;
+        let datafusion = Arc::clone(&self.datafusion);
         tokio::spawn(async move {
             let Ok(df) = datafusion
                 .ctx
@@ -432,9 +432,9 @@ pub enum Error {
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
-pub async fn start(bind_address: std::net::SocketAddr, df: &'static DataFusion) -> Result<()> {
+pub async fn start(bind_address: std::net::SocketAddr, df: Arc<DataFusion>) -> Result<()> {
     let service = Service {
-        datafusion: df,
+        datafusion: df.clone(),
         channel_map: Arc::new(RwLock::new(HashMap::new())),
     };
     let svc = FlightServiceServer::new(service);
