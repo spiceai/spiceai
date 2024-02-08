@@ -62,7 +62,7 @@ pub(crate) mod inference {
         let runnable = Model::load(&(model.unwrap())).unwrap();
         let result = runnable.run(df);
         let a = result
-            .await
+            .await.unwrap()
             .column_by_name("y")
             .unwrap()
             .as_any()

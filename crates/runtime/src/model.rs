@@ -20,6 +20,11 @@ pub enum Error {
 
     #[snafu(display("Unable to load model"))]
     UnableToLoadModel { source: crate::modelruntime::Error },
+
+    #[snafu(display("Unable to query"))]
+    UnableToQuery {
+        source: datafusion::error::DataFusionError,
+    },
 }
 
 impl Model {
@@ -57,17 +62,24 @@ impl Model {
         }
     }
 
-    pub async fn run(&self, df: Arc<DataFusion>) -> RecordBatch {
+    pub async fn run(&self, df: Arc<DataFusion>) -> Result<RecordBatch> {
         // todo
         tracing::info!("to be implemented {:?}", self.inference_template);
         tracing::info!("to be implemented {:?}", self.datasets);
 
         let sql = "select number as ts, (number::double / 100) as y, (number::double) / 100 as y2 from datafusion.public.eth_blocks order by ts desc limit 100";
 
-        let data = df.ctx.sql(sql).await.unwrap().collect().await.unwrap();
+        let data = df
+            .ctx
+            .sql(sql)
+            .await
+            .context(UnableToQuerySnafu {})?
+            .collect()
+            .await
+            .context(UnableToQuerySnafu {})?;
 
         // tracing::info!("{:?}", data);
 
-        return self.runnable.run(data).unwrap();
+        return Ok(self.runnable.run(data).unwrap());
     }
 }
