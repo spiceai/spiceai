@@ -42,8 +42,8 @@ pub(crate) mod inference {
     use app::App;
     use arrow::array::Float32Array;
     use axum::{debug_handler, extract::Path, Extension, Json};
-    use std::sync::Arc;
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     #[debug_handler]
     pub(crate) async fn get(
@@ -62,7 +62,8 @@ pub(crate) mod inference {
         let runnable = Model::load(&(model.unwrap())).unwrap();
         let result = runnable.run(df);
         let a = result
-            .await.unwrap()
+            .await
+            .unwrap()
             .column_by_name("y")
             .unwrap()
             .as_any()

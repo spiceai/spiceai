@@ -8,8 +8,8 @@ use arrow::datatypes::Field;
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 use snafu::ResultExt;
-use tract_core::tract_data::itertools::Itertools;
 use std::sync::Arc;
+use tract_core::tract_data::itertools::Itertools;
 use tract_onnx::prelude::*;
 
 pub struct Tract {
