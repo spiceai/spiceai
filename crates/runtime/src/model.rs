@@ -2,8 +2,6 @@ use crate::modelruntime::ModelRuntime;
 use crate::modelruntime::Runnable;
 use crate::modelsource::ModelSource;
 use crate::DataFusion;
-use arrow::array::Float32Array;
-use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use snafu::prelude::*;
 use std::sync::Arc;
