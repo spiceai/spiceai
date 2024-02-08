@@ -43,8 +43,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         print!("query> ");
         let _ = io::stdout().flush();
         let mut line = String::new();
-        let stdin = std::io::stdin();
-        let _ = stdin.read_line(&mut line);
+        let _ = io::stdin().read_line(&mut line);
 
         let line = line.trim();
         if line.is_empty() {
