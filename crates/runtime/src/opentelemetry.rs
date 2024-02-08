@@ -64,28 +64,37 @@ impl MetricsService for Service {
                         total_data_points += accepted_points + rejected_points;
                         rejected_data_points += rejected_points;
 
-                        let Some(backend) = self.data_fusion.get_backend(metric.name.as_str())
-                        else {
-                            tracing::warn!("No backend found for metric {}", metric.name);
-                            rejected_data_points += accepted_points;
-                            continue;
-                        };
+                        match record_batch_result {
+                            Ok(record_batch) => {
+                                let Some(backend) =
+                                    self.data_fusion.get_backend(metric.name.as_str())
+                                else {
+                                    tracing::warn!("No backend found for metric {}", metric.name);
+                                    rejected_data_points += accepted_points;
+                                    continue;
+                                };
 
-                        if let Ok(record_batch) = record_batch_result {
-                            tracing::info!("Original {} {:?}", metric.name, data);
-                            tracing::info!(
-                                "Adding data to backend {} {:?}",
-                                metric.name,
-                                record_batch
-                            );
-                            results.push((
-                                backend.add_data(DataUpdate {
-                                    log_sequence_number: None,
-                                    data: vec![record_batch],
-                                    update_type: UpdateType::Append,
-                                }),
-                                accepted_points,
-                            ));
+                                tracing::info!("Original {} {:?}", metric.name, data);
+                                tracing::info!(
+                                    "Adding data to backend {} {:?}",
+                                    metric.name,
+                                    record_batch
+                                );
+                                results.push((
+                                    backend.add_data(DataUpdate {
+                                        log_sequence_number: None,
+                                        data: vec![record_batch],
+                                        update_type: UpdateType::Append,
+                                    }),
+                                    accepted_points,
+                                ));
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    "Failed to add OpenTelemetry data to backend: {}",
+                                    e
+                                );
+                            }
                         }
                     }
                 }
@@ -121,9 +130,6 @@ pub fn metric_data_to_record_batch(data: &Data) -> (Result<RecordBatch>, i64, i6
     match data {
         Data::Gauge(gauge) => number_data_points_to_record_batch(&gauge.data_points),
         Data::Sum(sum) => number_data_points_to_record_batch(&sum.data_points),
-        // Data::Histogram(histogram) => histogram.data_points,
-        // Data::ExponentialHistogram(exponential_histogram) => exponential_histogram.data_points,
-        // Data::Summary(summary) => summary.data_points,
         _ => (UnsupportedMetricDataTypeSnafu.fail(), 0, 0),
     }
 }
