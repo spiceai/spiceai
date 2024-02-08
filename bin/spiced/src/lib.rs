@@ -84,7 +84,7 @@ pub async fn run(args: Args) -> Result<()> {
     let mut df = runtime::datafusion::DataFusion::new();
 
     for ds in &app.datasets {
-        let Some(_) = ds.acceleration else {
+        if ds.acceleration.is_none() && ds.sql.is_none() {
             tracing::warn!("No acceleration specified for dataset: {}", ds.name);
             continue;
         };
@@ -115,11 +115,10 @@ pub async fn run(args: Args) -> Result<()> {
             .fail()?,
         };
 
-        let data_backend = df.new_backend(ds).context(UnableToCreateBackendSnafu)?;
-
         match data_source {
             Some(data_source) => {
                 let data_source = Box::leak(data_source);
+                let data_backend = df.new_backend(ds).context(UnableToCreateBackendSnafu)?;
 
                 df.attach(ds, data_source, data_backend).context(
                     UnableToAttachDataSourceSnafu {
@@ -132,6 +131,7 @@ pub async fn run(args: Args) -> Result<()> {
                     df.attach_view(ds).context(UnableToAttachViewSnafu)?;
                 }
                 None => {
+                    let data_backend = df.new_backend(ds).context(UnableToCreateBackendSnafu)?;
                     df.attach_backend(&ds.name, data_backend).context(
                         UnableToAttachDataSourceSnafu {
                             data_source: source,
