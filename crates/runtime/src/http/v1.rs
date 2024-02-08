@@ -37,24 +37,29 @@ pub(crate) mod datasets {
 }
 
 pub(crate) mod inference {
+    use crate::model::Model;
     use app::App;
+    use axum::{extract::Path, Extension, Json};
     use std::collections::HashMap;
     use std::sync::Arc;
-    use axum::{Extension, Json, extract::Path};
-    use crate::model::Model;
 
-    pub(crate) async fn get(Extension(app): Extension<Arc<App>>, Path(name): Path<String>) -> Json<HashMap<String, String>> {
+    pub(crate) async fn get(
+        Extension(app): Extension<Arc<App>>,
+        Path(name): Path<String>,
+    ) -> Json<HashMap<String, String>> {
         tracing::info!("app models: {:?}", app.models);
 
-        let model = app
-            .models
-            .iter()
-            .find(|m| m.name == name);
+        let model = app.models.iter().find(|m| m.name == name);
 
         if model.is_none() {
+            tracing::info!("model not found: {}", name);
             return Json(HashMap::new());
         } else {
-            let _ = Model::load(&(model.unwrap())).unwrap();
+            let runnable = Model::load(&(model.unwrap())).unwrap();
+
+            let result = runnable.run();
+
+            tracing::info!("result: {:?}", result);
         }
 
         Json(HashMap::new())

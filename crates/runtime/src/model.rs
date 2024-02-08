@@ -35,11 +35,13 @@ impl Model {
                 return crate::modelruntime::tract::Tract {
                     path: path.to_string(),
                 }
-                .load().context(UnableToLoadModelSnafu {});
+                .load()
+                .context(UnableToLoadModelSnafu {});
             }
             _ => UnknownDataSourceSnafu {
                 model_source: source,
-            }.fail()?,
+            }
+            .fail()?,
         }
     }
 }
