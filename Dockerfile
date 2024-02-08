@@ -6,7 +6,7 @@ FROM rust:${RUST_VERSION}-slim-bookworm as build
 USER root
 
 RUN apt update \
-    && apt install --yes pkg-config libssl-dev \
+    && apt install --yes pkg-config libssl-dev build-essential \
     && rm -rf /var/lib/{apt,dpkg,cache,log}
 
 COPY . /build

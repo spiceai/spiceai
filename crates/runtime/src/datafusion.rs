@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::databackend::{DataBackend, DataBackendType};
+use crate::databackend::{self, DataBackend};
 use crate::datasource::DataSource;
 use datafusion::datasource::ViewTable;
 use datafusion::error::DataFusionError;
@@ -32,11 +32,20 @@ pub enum Error {
         source: DataFusionError,
     },
 
+    #[snafu(display("Table already exists"))]
+    TableAlreadyExists {},
+
+    DatasetConfigurationError {
+        source: databackend::Error,
+    },
+
+    InvalidConfiguration {
+        msg: String,
+    },
+
     UnableToCreateBackend {
         source: crate::databackend::Error,
     },
-
-    TableAlreadyExists {},
 
     #[snafu(display("Unable to create view: {}", reason))]
     UnableToCreateView {
@@ -71,20 +80,44 @@ impl DataFusion {
             .context(RegisterParquetSnafu { file: path })
     }
 
-    #[allow(clippy::needless_pass_by_value)]
-    pub fn attach_backend(&mut self, table_name: &str, backend: DataBackendType) -> Result<()> {
+    pub fn attach_backend(
+        &mut self,
+        table_name: &str,
+        backend: Box<dyn DataBackend>,
+    ) -> Result<()> {
         let table_exists = self.ctx.table_exist(table_name).unwrap_or(false);
         if table_exists {
             return TableAlreadyExistsSnafu.fail();
         }
 
-        let data_backend: Box<dyn DataBackend> =
-            <dyn DataBackend>::new(&self.ctx, table_name, &backend);
-
         self.backends
-            .insert(table_name.to_string(), Arc::new(data_backend));
+            .insert(table_name.to_string(), Arc::new(backend));
 
         Ok(())
+    }
+
+    pub fn new_backend(&self, dataset: &Dataset) -> Result<Box<dyn DataBackend>> {
+        let table_name = dataset.name.as_str();
+        let acceleration =
+            dataset
+                .acceleration
+                .as_ref()
+                .ok_or_else(|| Error::InvalidConfiguration {
+                    msg: "No acceleration configuration found".to_string(),
+                })?;
+
+        let params: Arc<Option<HashMap<String, String>>> = Arc::new(dataset.params.clone());
+
+        let data_backend: Box<dyn DataBackend> = <dyn DataBackend>::new(
+            &self.ctx,
+            table_name,
+            acceleration.engine(),
+            acceleration.mode(),
+            params,
+        )
+        .context(DatasetConfigurationSnafu)?;
+
+        Ok(data_backend)
     }
 
     #[must_use]
@@ -103,7 +136,7 @@ impl DataFusion {
         &mut self,
         dataset: &Dataset,
         data_source: &'static mut dyn DataSource,
-        backend: DataBackendType,
+        backend: Box<dyn DataBackend>,
     ) -> Result<()> {
         let table_name = dataset.name.as_str();
         let table_exists = self.ctx.table_exist(table_name).unwrap_or(false);
@@ -111,16 +144,13 @@ impl DataFusion {
             return TableAlreadyExistsSnafu.fail();
         }
 
-        let data_backend: Box<dyn DataBackend> =
-            <dyn DataBackend>::new(&self.ctx, table_name, &backend);
-
         let dataset_clone = dataset.clone();
         let task_handle = task::spawn(async move {
             let mut stream = data_source.get_data(&dataset_clone);
             loop {
                 let future_result = stream.next().await;
                 match future_result {
-                    Some(data_update) => match data_backend.add_data(data_update).await {
+                    Some(data_update) => match backend.add_data(data_update).await {
                         Ok(()) => (),
                         Err(e) => tracing::error!("Error adding data: {e:?}"),
                     },

@@ -1,18 +1,36 @@
 use snafu::prelude::*;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::dataupdate::{DataUpdate, UpdateType};
 use arrow::record_batch::RecordBatch;
 use datafusion::{
     datasource::MemTable,
+    error::DataFusionError,
     execution::context::SessionContext,
     physical_plan::collect,
-    sql::{parser::DFParser, sqlparser::dialect::AnsiDialect, TableReference},
+    sql::{
+        parser::DFParser,
+        sqlparser::{self, dialect::AnsiDialect},
+        TableReference,
+    },
 };
 
-use super::{DataBackend, Result, UnableToAddDataSnafu, UnableToParseSqlSnafu};
+use super::{AddDataResult, DataBackend};
+
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display("Unable to add data"))]
+    UnableToAddData { source: DataFusionError },
+
+    UnableToParseSql {
+        source: sqlparser::parser::ParserError,
+    },
+
+    #[snafu(display("Invalid configuration: {msg}"))]
+    InvalidConfiguration { msg: String },
+}
+
+type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct MemTableBackend {
     ctx: Arc<SessionContext>,
@@ -30,10 +48,7 @@ impl MemTableBackend {
 }
 
 impl DataBackend for MemTableBackend {
-    fn add_data(
-        &self,
-        data_update: DataUpdate,
-    ) -> Pin<Box<(dyn Future<Output = Result<()>> + Send + '_)>> {
+    fn add_data(&self, data_update: DataUpdate) -> AddDataResult {
         Box::pin(async move {
             if data_update.data.is_empty() {
                 tracing::trace!(

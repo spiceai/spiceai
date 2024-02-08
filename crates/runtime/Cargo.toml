@@ -31,8 +31,13 @@ futures-core = "0.3"
 dirs = "5.0.1"
 toml = "0.8.8"
 serde.workspace = true
-flight_client = { path = "../flight_client" }
+flight_client = { version = "0.10.0-alpha.0", path = "../flight_client" }
+duckdb = { git = "https://github.com/spicehq/duckdb-rs.git", rev = "c36fe7041a080ef457d4931985d28ca231de4139",  features = ["bundled", "r2d2", "vtab", "vtab-arrow"], optional = true }
+duckdb_datafusion = { path = "../duckdb_datafusion", optional = true }
+r2d2 = { version = "0.8.10", optional = true }
 opentelemetry-proto = { version = "0.4.0", features = ["gen-tonic-messages", "gen-tonic", "metrics"] }
 
 [features]
+default = ["duckdb"]
 dev = []
+duckdb = ["dep:duckdb", "duckdb_datafusion", "r2d2"]
