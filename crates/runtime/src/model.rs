@@ -61,9 +61,8 @@ impl Model {
     }
 
     pub async fn run(&self, df: Arc<DataFusion>) -> RecordBatch {
-        let sql = "select 1 as ts, 2 as y";
+        let sql = "select number from datafusion.public.eth_blocks limit 10";
 
-        // todo this needs to be more idiomatic
         let data = df.ctx.sql(sql).await.unwrap().collect().await.unwrap();
 
         return self.runnable.run(data).unwrap();
