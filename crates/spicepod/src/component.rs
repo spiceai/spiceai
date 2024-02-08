@@ -6,6 +6,7 @@ use snafu::prelude::*;
 
 use crate::reader;
 pub mod dataset;
+pub mod model;
 
 pub trait WithDependsOn<T> {
     fn depends_on(&self, depends_on: &[String]) -> T;
@@ -16,7 +17,7 @@ pub struct ComponentReference {
     pub r#ref: String,
 
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    #[serde(rename = "dependsOn", default)]
+    #[serde(rename = "dependsOn", alias = "datasets", default)]
     pub depends_on: Vec<String>,
 }
 
