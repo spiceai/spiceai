@@ -6,9 +6,13 @@ use super::WithDependsOn;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Dataset {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub from: String,
 
     pub name: String,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sql: Option<String>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<HashMap<String, String>>,
@@ -90,6 +94,7 @@ impl WithDependsOn<Dataset> for Dataset {
         Dataset {
             from: self.from.clone(),
             name: self.name.clone(),
+            sql: self.sql.clone(),
             params: self.params.clone(),
             acceleration: self.acceleration.clone(),
             depends_on: depends_on.to_vec(),

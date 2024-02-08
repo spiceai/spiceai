@@ -27,6 +27,9 @@ pub enum Error {
         data_source: String,
     },
 
+    #[snafu(display("Unable to attach view"))]
+    UnableToAttachView { source: runtime::datafusion::Error },
+
     #[snafu(display("Unable to initialize data source: {data_source}"))]
     UnableToInitializeDataSource {
         source: runtime::datasource::Error,
@@ -137,7 +140,7 @@ pub async fn run(args: Args) -> Result<()> {
                         data_source: source,
                     })?,
             )),
-            "localhost" => None,
+            "localhost" | "" => None,
             "debug" => Some(Box::new(datasource::debug::DebugSource {})),
             _ => UnknownDataSourceSnafu {
                 data_source: source,
@@ -154,11 +157,17 @@ pub async fn run(args: Args) -> Result<()> {
                         data_source: source,
                     })?;
             }
-            None => df
-                .attach_backend(&ds.name, databackend::DataBackendType::default())
-                .context(UnableToAttachDataSourceSnafu {
-                    data_source: source,
-                })?,
+            None => match &ds.sql {
+                Some(_) => {
+                    df.attach_view(ds).context(UnableToAttachViewSnafu)?;
+                }
+                None => {
+                    df.attach_backend(&ds.name, databackend::DataBackendType::default())
+                        .context(UnableToAttachDataSourceSnafu {
+                            data_source: source,
+                        })?;
+                }
+            },
         }
 
         tracing::info!("Loaded dataset: {}", ds.name);

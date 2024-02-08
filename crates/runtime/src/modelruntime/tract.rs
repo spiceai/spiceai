@@ -6,12 +6,12 @@ use arrow::array::Float64Array;
 use arrow::datatypes::DataType;
 use arrow::datatypes::Field;
 use arrow::datatypes::Schema;
-use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use snafu::ResultExt;
 use std::fs::File;
 use tract_core::tract_data::itertools::Itertools;
+
 use tract_onnx::prelude::*;
 
 pub struct Tract {
@@ -21,6 +21,7 @@ pub struct Tract {
 pub struct TractModel {
     model: SimplePlan<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>,
 }
+
 impl TractModel {
     fn run_inference(
         &self,
@@ -96,7 +97,6 @@ impl TractModel {
         .unwrap())
     }
 }
-
 impl ModelRuntime for Tract {
     fn load(&self) -> super::Result<Box<dyn Runnable>> {
         let model = load_tract_model(self.path.as_str()).context(super::TractSnafu)?;
@@ -111,7 +111,7 @@ fn load_tract_model(
     return tract_onnx::onnx()
         .model_for_path(path)?
         .into_optimized()?
-        .with_input_fact(0, f32::fact([1, 20]).into())?
+        .with_input_fact(0, f32::fact([1, 20]).into())? // TODO: remove
         .into_runnable();
 }
 
