@@ -5,10 +5,9 @@ use crate::DataFusion;
 use arrow::record_batch::RecordBatch;
 use snafu::prelude::*;
 use std::sync::Arc;
+
 pub struct Model {
     runnable: Box<dyn Runnable>,
-    spicepod_model: spicepod::component::model::Model,
-    path: String,
     inference_template: String,
     datasets: Vec<String>,
 }
@@ -47,8 +46,6 @@ impl Model {
 
                 return Ok(Self {
                     runnable: tract,
-                    spicepod_model: model.clone(),
-                    path,
                     inference_template: "select * from {{dataset}}".to_string(),
                     datasets: model.datasets.clone(),
                 });
@@ -61,6 +58,10 @@ impl Model {
     }
 
     pub async fn run(&self, df: Arc<DataFusion>) -> RecordBatch {
+        // todo
+        tracing::info!("to be implemented {:?}", self.inference_template);
+        tracing::info!("to be implemented {:?}", self.datasets);
+
         let sql = "select number as ts, (number::double / 100) as y, (number::double) / 100 as y2 from datafusion.public.eth_blocks limit 100";
 
         let data = df.ctx.sql(sql).await.unwrap().collect().await.unwrap();
