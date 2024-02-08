@@ -1,3 +1,5 @@
+use std::ops::Deref;
+
 use super::ModelRuntime;
 use super::Runnable;
 use snafu::ResultExt;
@@ -40,9 +42,18 @@ impl Runnable for TractModel {
                 .by_name::<OwnedRepr<f32>, IxDyn>("input.npy")
                 .unwrap()
                 .into_tensor();
-            let result = self.model.run(tvec![input.into()]).unwrap();
+            let tensors = self.model.run(tvec![input.into()]).unwrap();
 
-            tracing::info!("result {:?}", result);
+            let mut result: Vec<Vec<f32>> = vec![];
+
+            tensors.into_iter().for_each(|x| {
+                let tensor = x.deref();
+                tensor.as_slice::<f32>().unwrap().iter().for_each(|y| {
+                    result.push(vec![*y]);
+                })
+            });
+
+            return result;
         }
         todo!()
     }
