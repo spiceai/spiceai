@@ -44,6 +44,7 @@ impl TractModel {
                     }
                     if data[i].len() >= lookback_size {
                         // This particular column has all data.
+                        // TODO: Stop early if all columns have `lookback_size` data.
                         return;
                     }
 
