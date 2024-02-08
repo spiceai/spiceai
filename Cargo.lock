@@ -3196,6 +3196,7 @@ dependencies = [
  "futures-core",
  "metrics",
  "ndarray-npy",
+ "parquet",
  "serde",
  "snafu 0.8.0",
  "spicepod",

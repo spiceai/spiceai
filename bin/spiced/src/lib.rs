@@ -98,13 +98,17 @@ pub async fn run(args: Args) -> Result<()> {
                 let path = path.unwrap().clone();
 
                 let model = modelruntime::tract::Tract {
-                    path: path.to_string()
+                    path: path.to_string(),
                 }
                 .load();
-
-                if model.is_ok() {
-                    let result = model.unwrap().run();
-                    tracing::info!("Model loaded: {:?}", result);
+                match model {
+                    Ok(m) => {
+                        let result = m.run();
+                        tracing::info!("Model loaded: {:?}", result);
+                    }
+                    Err(e) => {
+                        tracing::error!("Error loading model: {:?}", e);
+                    }
                 }
             }
             _ => UnknownDataSourceSnafu {
