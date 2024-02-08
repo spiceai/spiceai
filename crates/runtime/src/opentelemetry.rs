@@ -39,7 +39,7 @@ impl MetricsService for Service {
                     total_data_points += 1;
                     match metric.data {
                         Some(data) => {
-                            // TODO: Write to DataFusion table
+                            // TODO: Check if localhost table exists and write to Databackend
                             tracing::info!("Data: {:?}", data);
                         }
                         None => {
