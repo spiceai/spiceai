@@ -17,8 +17,9 @@ pub mod dataupdate;
 mod flight;
 mod http;
 pub mod modelformat;
-pub mod modelsource;
 pub mod modelruntime;
+pub mod modelsource;
+pub mod model;
 
 #[derive(Debug, Snafu)]
 pub enum Error {

@@ -35,7 +35,8 @@ impl Runnable for TractModel {
         let npz = ndarray_npy::NpzReader::new(io);
 
         if npz.is_ok() {
-            let input = npz.unwrap()
+            let input = npz
+                .unwrap()
                 .by_name::<OwnedRepr<f32>, IxDyn>("input.npy")
                 .unwrap()
                 .into_tensor();
