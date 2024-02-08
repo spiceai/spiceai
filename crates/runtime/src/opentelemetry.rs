@@ -13,8 +13,6 @@ use tonic_0_9_0::Request;
 use tonic_0_9_0::Response;
 use tonic_0_9_0::Status;
 
-use crate::datafusion::DataFusion;
-
 type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Snafu)]
@@ -25,9 +23,7 @@ pub enum Error {
     },
 }
 
-pub struct Service {
-    datafusion: &'static DataFusion,
-}
+pub struct Service;
 
 #[async_trait]
 impl MetricsService for Service {
@@ -35,16 +31,12 @@ impl MetricsService for Service {
         &self,
         request: Request<ExportMetricsServiceRequest>,
     ) -> std::result::Result<Response<ExportMetricsServiceResponse>, Status> {
-        let df = self.datafusion;
         let mut rejected_data_points = 0;
         let mut total_data_points = 0;
         for resource_metric in request.into_inner().resource_metrics {
             for scope_metric in resource_metric.scope_metrics {
                 for metric in scope_metric.metrics {
                     total_data_points += 1;
-                    if !df.ctx.table_exist(metric.name.clone()).unwrap_or(false) {
-                        rejected_data_points += 1;
-                    }
                     match metric.data {
                         Some(data) => {
                             // TODO: Write to DataFusion table
@@ -76,8 +68,8 @@ impl MetricsService for Service {
     }
 }
 
-pub async fn start(bind_address: SocketAddr, df: &'static DataFusion) -> Result<()> {
-    let service = Service { datafusion: df };
+pub async fn start(bind_address: SocketAddr) -> Result<()> {
+    let service = Service;
     let svc = MetricsServiceServer::new(service).accept_compressed(CompressionEncoding::Gzip);
 
     tracing::info!("Spice Runtime OpenTelemetry listening on {bind_address}");
