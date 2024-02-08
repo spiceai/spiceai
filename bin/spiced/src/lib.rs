@@ -85,45 +85,6 @@ pub async fn run(args: Args) -> Result<()> {
 
     let mut df = runtime::datafusion::DataFusion::new();
 
-    for model in &app.models {
-        let source = model.source();
-        let source = source.as_str();
-
-        // create a params contains model name and model from
-
-        let mut params = std::collections::HashMap::new();
-
-        params.insert("name".to_string(), model.name.to_string());
-        params.insert("from".to_string(), model.from.to_string());
-
-        match source {
-            "local" => {
-                let local = modelsource::local::Local {};
-                let path = local.pull(Arc::new(Option::from(params)));
-
-                let path = path.unwrap().clone();
-
-                let model = modelruntime::tract::Tract {
-                    path: path.to_string(),
-                }
-                .load();
-                match model {
-                    Ok(m) => {
-                        let result = m.run();
-                        tracing::info!("Model loaded: {:?}", result);
-                    }
-                    Err(e) => {
-                        tracing::error!("Error loading model: {:?}", e);
-                    }
-                }
-            }
-            _ => UnknownDataSourceSnafu {
-                data_source: source,
-            }
-            .fail()?,
-        }
-    }
-
     for ds in &app.datasets {
         let Some(_) = ds.acceleration else {
             tracing::warn!("No acceleration specified for dataset: {}", ds.name);
