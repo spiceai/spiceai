@@ -1,7 +1,4 @@
-use std::future::Future;
 use std::net::SocketAddr;
-use std::pin::Pin;
-use std::sync::Arc;
 
 use opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_server::MetricsService;
 use opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_server::MetricsServiceServer;
@@ -9,6 +6,7 @@ use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsPartialSucc
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceResponse;
 use snafu::prelude::*;
+use tonic::async_trait;
 use tonic_0_9_0::codec::CompressionEncoding;
 use tonic_0_9_0::transport::Server;
 use tonic_0_9_0::Request;
@@ -28,36 +26,23 @@ pub enum Error {
 }
 
 pub struct Service {
-    datafusion: Arc<DataFusion>,
+    datafusion: &'static DataFusion,
 }
 
+#[async_trait]
 impl MetricsService for Service {
-    fn export<'life0, 'async_trait>(
-        &'life0 self,
+    async fn export(
+        &self,
         request: Request<ExportMetricsServiceRequest>,
-    ) -> Pin<
-        Box<
-            dyn Future<Output = Result<Response<ExportMetricsServiceResponse>, Status>>
-                + Send
-                + 'async_trait,
-        >,
-    >
-    where
-        'life0: 'async_trait,
-        Self: 'async_trait,
-    {
+    ) -> std::result::Result<Response<ExportMetricsServiceResponse>, Status> {
+        let df = self.datafusion;
         let mut rejected_data_points = 0;
         let mut total_data_points = 0;
         for resource_metric in request.into_inner().resource_metrics {
             for scope_metric in resource_metric.scope_metrics {
                 for metric in scope_metric.metrics {
                     total_data_points += 1;
-                    if !self
-                        .datafusion
-                        .ctx
-                        .table_exist(metric.name.clone())
-                        .unwrap_or(false)
-                    {
+                    if !df.ctx.table_exist(metric.name.clone()).unwrap_or(false) {
                         rejected_data_points += 1;
                     }
                     match metric.data {
@@ -74,9 +59,7 @@ impl MetricsService for Service {
         }
 
         if rejected_data_points == total_data_points {
-            return Box::pin(async {
-                Err(Status::invalid_argument("All data points were rejected"))
-            });
+            return Err(Status::invalid_argument("All data points were rejected"));
         }
 
         let partial_success = if rejected_data_points == 0 {
@@ -87,16 +70,13 @@ impl MetricsService for Service {
                 rejected_data_points,
             })
         };
-
-        Box::pin(async {
-            Ok(Response::new(ExportMetricsServiceResponse {
-                partial_success,
-            }))
-        })
+        Ok(Response::new(ExportMetricsServiceResponse {
+            partial_success,
+        }))
     }
 }
 
-pub async fn start(bind_address: SocketAddr, df: Arc<DataFusion>) -> Result<()> {
+pub async fn start(bind_address: SocketAddr, df: &'static DataFusion) -> Result<()> {
     let service = Service { datafusion: df };
     let svc = MetricsServiceServer::new(service).accept_compressed(CompressionEncoding::Gzip);
 

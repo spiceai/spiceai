@@ -3357,6 +3357,7 @@ dependencies = [
  "clap",
  "metrics",
  "metrics-exporter-prometheus",
+ "once_cell",
  "runtime",
  "snafu 0.8.0",
  "spicepod",

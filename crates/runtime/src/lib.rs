@@ -17,7 +17,6 @@ pub mod dataupdate;
 mod flight;
 mod http;
 mod opentelemetry;
-pub mod modelformat;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -36,26 +35,27 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub struct Runtime {
     pub app: Arc<app::App>,
     pub config: config::Config,
-    pub df: Arc<DataFusion>,
+    pub df: &'static DataFusion,
 }
 
 impl Runtime {
     #[must_use]
-    pub fn new(config: Config, app: app::App, df: DataFusion) -> Self {
+    pub fn new(config: Config, app: app::App, df: &'static DataFusion) -> Self {
         Runtime {
             app: Arc::new(app),
             config,
-            df: Arc::new(df),
+            df,
         }
     }
 
     pub async fn start_servers(&self) -> Result<()> {
         let http_server_future = http::start(self.config.http_bind_address, self.app.clone());
-        let flight_server_future = flight::start(self.config.flight_bind_address, self.df.clone());
+        let flight_server_future = flight::start(self.config.flight_bind_address, self.df);
         let open_telemetry_server_future = opentelemetry::start(
             self.config.open_telemetry_bind_address,
-            self.df.clone(), // It's safe to leak datafusion here, we know the server will live for the entire duration of the program.
+            self.df, // It's safe to leak datafusion here, we know the server will live for the entire duration of the program.
         );
+
         tokio::select! {
             http_res = http_server_future => http_res.context(UnableToStartHttpServerSnafu),
             flight_res = flight_server_future => flight_res.context(UnableToStartFlightServerSnafu),

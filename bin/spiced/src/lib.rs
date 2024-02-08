@@ -5,7 +5,9 @@ use std::sync::Arc;
 
 use app::App;
 use clap::Parser;
+use once_cell::sync::Lazy;
 use runtime::config::Config as RuntimeConfig;
+use runtime::datafusion::DataFusion;
 use runtime::datasource::DataSource;
 
 use runtime::{databackend, datasource, Runtime};
@@ -64,6 +66,8 @@ pub struct Args {
     pub runtime: RuntimeConfig,
 }
 
+static mut MUT_DATA_FUSION: Lazy<DataFusion> = Lazy::new(runtime::datafusion::DataFusion::new);
+
 pub async fn run(args: Args) -> Result<()> {
     let app = App::new(".").context(UnableToConstructSpiceAppSnafu)?;
 
@@ -78,8 +82,7 @@ pub async fn run(args: Args) -> Result<()> {
         }
     }
 
-    let mut df = runtime::datafusion::DataFusion::new();
-
+    let df = unsafe { &MUT_DATA_FUSION };
     for ds in &app.datasets {
         let source = ds.source();
         let source = source.as_str();
@@ -111,20 +114,26 @@ pub async fn run(args: Args) -> Result<()> {
             Some(data_source) => {
                 let data_source = Box::leak(data_source);
 
-                df.attach(ds, data_source, databackend::DataBackendType::default())
-                    .context(UnableToAttachDataSourceSnafu {
-                        data_source: source,
-                    })?;
+                unsafe {
+                    MUT_DATA_FUSION
+                        .attach(ds, data_source, databackend::DataBackendType::default())
+                        .context(UnableToAttachDataSourceSnafu {
+                            data_source: source,
+                        })
+                }?;
             }
             None => match &ds.sql {
                 Some(_) => {
                     df.attach_view(ds).context(UnableToAttachViewSnafu)?;
                 }
                 None => {
-                    df.attach_backend(&ds.name, databackend::DataBackendType::default())
-                        .context(UnableToAttachDataSourceSnafu {
-                            data_source: source,
-                        })?;
+                    unsafe {
+                        MUT_DATA_FUSION
+                            .attach_backend(&ds.name, databackend::DataBackendType::default())
+                            .context(UnableToAttachDataSourceSnafu {
+                                data_source: source,
+                            })
+                    }?;
                 }
             },
         }
