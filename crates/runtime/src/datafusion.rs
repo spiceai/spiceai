@@ -6,6 +6,7 @@ use crate::databackend::{self, DataBackend};
 use crate::datasource::DataSource;
 use datafusion::datasource::ViewTable;
 use datafusion::error::DataFusionError;
+use datafusion::execution::context::SessionConfig;
 use datafusion::execution::{context::SessionContext, options::ParquetReadOptions};
 use datafusion::sql::parser;
 use datafusion::sql::parser::DFParser;
@@ -67,7 +68,9 @@ impl DataFusion {
     #[must_use]
     pub fn new() -> Self {
         DataFusion {
-            ctx: Arc::new(SessionContext::new()),
+            ctx: Arc::new(SessionContext::new_with_config(
+                SessionConfig::new().with_information_schema(true),
+            )),
             tasks: Vec::new(),
             backends: HashMap::new(),
         }
