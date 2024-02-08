@@ -17,6 +17,7 @@ pub mod dataupdate;
 mod flight;
 mod http;
 mod opentelemetry;
+pub mod modelformat;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
