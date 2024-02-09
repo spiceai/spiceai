@@ -4,7 +4,6 @@ use std::time::Duration;
 
 use crate::databackend::{self, DataBackend};
 use crate::datasource::DataSource;
-use arrow::datatypes::Schema;
 use datafusion::datasource::ViewTable;
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::SessionConfig;
@@ -140,13 +139,13 @@ impl DataFusion {
         self.backends.contains_key(dataset)
     }
 
-    pub async fn get_arrow_schema(&self, dataset: &str) -> Result<Schema> {
+    pub async fn get_arrow_schema(&self, dataset: &str) -> Result<arrow::datatypes::Schema> {
         let data_frame = self
             .ctx
             .table(dataset)
             .await
             .context(UnableToGetTableSnafu)?;
-        Ok(Schema::from(data_frame.schema()))
+        Ok(arrow::datatypes::Schema::from(data_frame.schema()))
     }
 
     #[allow(clippy::needless_pass_by_value)]
