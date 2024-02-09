@@ -45,7 +45,7 @@ pub enum Error {
         source: tonic_0_9_0::transport::Error,
     },
 
-    #[snafu(display("Failed to build record batch"))]
+    #[snafu(display("Failed to build record batch from OpenTelemetry metrics: {}", source))]
     FailedToBuildRecordBatch { source: arrow::error::ArrowError },
 
     #[snafu(display("Unsupported metric data type"))]
@@ -53,6 +53,9 @@ pub enum Error {
 
     #[snafu(display("Unsupported metric attribute type"))]
     UnsupportedMetricAttributeType {},
+
+    #[snafu(display("Metric with no data points"))]
+    MetricWithNoDataPoints {},
 }
 
 pub struct Service {
@@ -97,7 +100,7 @@ impl MetricsService for Service {
                             }
                             Err(e) => {
                                 tracing::error!(
-                                    "Failed build arrow data from OpenTelemetry metrics: {}",
+                                    "Failed to build arrow data from OpenTelemetry metrics: {}",
                                     e
                                 );
                             }
@@ -142,6 +145,7 @@ pub fn metric_data_to_record_batch(metric: &str, data: &Data) -> (Result<RecordB
             number_data_points_to_record_batch(metric, &sum.data_points),
             sum.data_points.len() as u64,
         ),
+        // TODO: Support other metric data types
         _ => (UnsupportedMetricDataTypeSnafu.fail(), 0),
     }
 }
@@ -150,26 +154,68 @@ fn number_data_points_to_record_batch(
     metric: &str,
     data_points: &Vec<NumberDataPoint>,
 ) -> Result<RecordBatch> {
-    let mut values_builder = Float64Builder::new();
+    let mut values_builder: Option<Box<dyn ArrayBuilder>> = None;
+    let mut data_points_type = DataType::Null;
     let mut attributes = Vec::new();
     for data_point in data_points {
         if let Some(value) = &data_point.value {
             match value {
-                Value::AsDouble(double_value) => {
-                    values_builder.append_value(*double_value);
-                }
-                Value::AsInt(int_value) => {
-                    values_builder.append_value(*int_value as f64);
-                }
+                Value::AsDouble(double_value) => match &mut values_builder {
+                    Some(builder) => {
+                        if let Some(float_builder) =
+                            builder.as_any_mut().downcast_mut::<Float64Builder>()
+                        {
+                            float_builder.append_value(*double_value);
+                        } else {
+                            tracing::error!("Metric has data points with multiple types: {metric}");
+                            continue;
+                        }
+                    }
+                    None => {
+                        let mut float_builder = Float64Builder::new();
+                        float_builder.append_value(*double_value);
+                        values_builder = Some(Box::new(float_builder));
+                        data_points_type = DataType::Float64;
+                    }
+                },
+                Value::AsInt(int_value) => match &mut values_builder {
+                    Some(builder) => {
+                        if let Some(int_builder) =
+                            builder.as_any_mut().downcast_mut::<Int64Builder>()
+                        {
+                            int_builder.append_value(*int_value);
+                        } else {
+                            tracing::error!("Metric has data points with multiple types: {metric}");
+                            continue;
+                        }
+                    }
+                    None => {
+                        let mut int_builder = Int64Builder::new();
+                        int_builder.append_value(*int_value);
+                        values_builder = Some(Box::new(int_builder));
+                        data_points_type = DataType::Int64;
+                    }
+                },
             }
-        } else {
-            values_builder.append_null();
+        } else if let Some(builder) = &mut values_builder {
+            if let Some(float_64_builder) = builder.as_any_mut().downcast_mut::<Float64Builder>() {
+                float_64_builder.append_null();
+            } else if let Some(int_64_builder) = builder.as_any_mut().downcast_mut::<Int64Builder>()
+            {
+                int_64_builder.append_null();
+            }
         }
         attributes.push(&data_point.attributes);
     }
 
-    let mut fields = vec![Field::new("value", DataType::Float64, true)];
-    let mut columns: Vec<ArrayRef> = vec![Arc::new(values_builder.finish())];
+    let mut columns: Vec<ArrayRef>;
+    let mut fields: Vec<Field>;
+    if let Some(builder) = &mut values_builder {
+        fields = vec![Field::new("value", data_points_type, true)];
+        columns = vec![Arc::new(builder.finish())];
+    } else {
+        return MetricWithNoDataPointsSnafu.fail();
+    }
 
     let (attribute_fields_map, attribute_columns_map) =
         attributes_to_fields_and_columns(metric, attributes);
@@ -333,26 +379,81 @@ fn attributes_to_fields_and_columns(
                                 }
                             };
                         }
+                        // TODO: Support other attribute types
                         _ => {
                             tracing::error!(
                                 "Unsupported metric attribute type for {metric}.{:?}",
                                 attribute
                             );
-                            continue;
+                            append_null(&mut fields, &mut columns, key_str);
                         }
                     },
                     None => {
-                        continue;
+                        append_null(&mut fields, &mut columns, key_str);
                     }
                 },
                 None => {
-                    continue;
+                    append_null(&mut fields, &mut columns, key_str);
                 }
             };
         }
     }
 
     (fields, columns)
+}
+
+fn append_null(
+    fields: &mut IndexMap<String, Field>,
+    columns: &mut IndexMap<String, Box<dyn ArrayBuilder>>,
+    key: &str,
+) {
+    if let Some(field) = fields.get_mut(key) {
+        match field.data_type() {
+            DataType::Utf8 => {
+                if let Some(column) = columns.get_mut(key) {
+                    if let Some(string_builder) =
+                        column.as_any_mut().downcast_mut::<StringBuilder>()
+                    {
+                        string_builder.append_null();
+                    }
+                }
+            }
+            DataType::Boolean => {
+                if let Some(column) = columns.get_mut(key) {
+                    if let Some(bool_builder) = column.as_any_mut().downcast_mut::<BooleanBuilder>()
+                    {
+                        bool_builder.append_null();
+                    }
+                }
+            }
+            DataType::Int64 => {
+                if let Some(column) = columns.get_mut(key) {
+                    if let Some(int_builder) = column.as_any_mut().downcast_mut::<Int64Builder>() {
+                        int_builder.append_null();
+                    }
+                }
+            }
+            DataType::Float64 => {
+                if let Some(column) = columns.get_mut(key) {
+                    if let Some(double_builder) =
+                        column.as_any_mut().downcast_mut::<Float64Builder>()
+                    {
+                        double_builder.append_null();
+                    }
+                }
+            }
+            DataType::Binary => {
+                if let Some(column) = columns.get_mut(key) {
+                    if let Some(binary_builder) =
+                        column.as_any_mut().downcast_mut::<BinaryBuilder>()
+                    {
+                        binary_builder.append_null();
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 pub async fn start(bind_address: SocketAddr, data_fusion: Arc<DataFusion>) -> Result<()> {
