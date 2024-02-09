@@ -352,55 +352,28 @@ fn attributes_to_fields_and_columns(
     (fields, columns)
 }
 
+macro_rules! append_null {
+    ($columns:expr, $key:expr, $builder_type:ty) => {
+        if let Some(column) = $columns.get_mut($key) {
+            if let Some(builder) = column.as_any_mut().downcast_mut::<$builder_type>() {
+                builder.append_null();
+            }
+        }
+    };
+}
+
 fn append_null(
     fields: &mut IndexMap<String, Field>,
     columns: &mut IndexMap<String, Box<dyn ArrayBuilder>>,
     key: &str,
 ) {
-    if let Some(field) = fields.get_mut(key) {
+    if let Some(field) = fields.get(key) {
         match field.data_type() {
-            DataType::Utf8 => {
-                if let Some(column) = columns.get_mut(key) {
-                    if let Some(string_builder) =
-                        column.as_any_mut().downcast_mut::<StringBuilder>()
-                    {
-                        string_builder.append_null();
-                    }
-                }
-            }
-            DataType::Boolean => {
-                if let Some(column) = columns.get_mut(key) {
-                    if let Some(bool_builder) = column.as_any_mut().downcast_mut::<BooleanBuilder>()
-                    {
-                        bool_builder.append_null();
-                    }
-                }
-            }
-            DataType::Int64 => {
-                if let Some(column) = columns.get_mut(key) {
-                    if let Some(int_builder) = column.as_any_mut().downcast_mut::<Int64Builder>() {
-                        int_builder.append_null();
-                    }
-                }
-            }
-            DataType::Float64 => {
-                if let Some(column) = columns.get_mut(key) {
-                    if let Some(double_builder) =
-                        column.as_any_mut().downcast_mut::<Float64Builder>()
-                    {
-                        double_builder.append_null();
-                    }
-                }
-            }
-            DataType::Binary => {
-                if let Some(column) = columns.get_mut(key) {
-                    if let Some(binary_builder) =
-                        column.as_any_mut().downcast_mut::<BinaryBuilder>()
-                    {
-                        binary_builder.append_null();
-                    }
-                }
-            }
+            DataType::Utf8 => append_null!(columns, key, StringBuilder),
+            DataType::Boolean => append_null!(columns, key, BooleanBuilder),
+            DataType::Int64 => append_null!(columns, key, Int64Builder),
+            DataType::Float64 => append_null!(columns, key, Float64Builder),
+            DataType::Binary => append_null!(columns, key, BinaryBuilder),
             _ => {}
         }
     }
