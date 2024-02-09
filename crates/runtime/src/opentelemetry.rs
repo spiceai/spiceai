@@ -412,17 +412,22 @@ fn attributes_to_fields_and_columns(
                         // TODO: Support List and Map attribute types
                         _ => {
                             tracing::warn!(
-                                "Metric {metric} has attribute with unsupported type, appending null for attribute if possible {:?}",
-                                attribute
+                                "Metric {metric} has attribute {key_str} with unsupported type, appending null for attribute if possible"
                             );
                             append_null(&mut fields, &mut columns, key_str);
                         }
                     },
                     None => {
+                        tracing::warn!(
+                            "Metric {metric} has attribute {key_str} with no value, appending null for attribute if possible"
+                        );
                         append_null(&mut fields, &mut columns, key_str);
                     }
                 },
                 None => {
+                    tracing::warn!(
+                        "Metric {metric} has attribute {key_str} with no value, appending null for attribute if possible"
+                    );
                     append_null(&mut fields, &mut columns, key_str);
                 }
             };

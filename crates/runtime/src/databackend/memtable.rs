@@ -19,7 +19,7 @@ use super::{AddDataResult, DataBackend};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to add data"))]
+    #[snafu(display("Unable to add data: {source}"))]
     UnableToAddData { source: DataFusionError },
 
     UnableToParseSql {
