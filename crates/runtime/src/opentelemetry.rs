@@ -1,16 +1,26 @@
+use std::i64::MAX;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use arrow::array::Float64Array;
+use arrow::array::ArrayBuilder;
+use arrow::array::ArrayRef;
+use arrow::array::BinaryBuilder;
+use arrow::array::BooleanBuilder;
+use arrow::array::Float64Builder;
+use arrow::array::Int64Builder;
+use arrow::array::StringBuilder;
 use arrow::datatypes::DataType;
 use arrow::datatypes::Field;
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
+use indexmap::IndexMap;
 use opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_server::MetricsService;
 use opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_server::MetricsServiceServer;
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsPartialSuccess;
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceResponse;
+use opentelemetry_proto::tonic::common::v1::any_value;
+use opentelemetry_proto::tonic::common::v1::KeyValue;
 use opentelemetry_proto::tonic::metrics::v1::metric::Data;
 use opentelemetry_proto::tonic::metrics::v1::number_data_point::Value;
 use opentelemetry_proto::tonic::metrics::v1::NumberDataPoint;
@@ -40,6 +50,9 @@ pub enum Error {
 
     #[snafu(display("Unsupported metric data type"))]
     UnsupportedMetricDataType {},
+
+    #[snafu(display("Unsupported metric attribute type"))]
+    UnsupportedMetricAttributeType {},
 }
 
 pub struct Service {
@@ -59,39 +72,32 @@ impl MetricsService for Service {
             for scope_metric in resource_metric.scope_metrics {
                 for metric in scope_metric.metrics {
                     if let Some(data) = metric.data {
-                        let (record_batch_result, accepted_points, rejected_points) =
-                            metric_data_to_record_batch(&data);
-                        total_data_points += accepted_points + rejected_points;
-                        rejected_data_points += rejected_points;
+                        let (record_batch_result, data_point_count) =
+                            metric_data_to_record_batch(metric.name.as_str(), &data);
+                        total_data_points += data_point_count;
 
                         match record_batch_result {
                             Ok(record_batch) => {
                                 let Some(backend) =
                                     self.data_fusion.get_backend(metric.name.as_str())
                                 else {
-                                    tracing::warn!("No backend found for metric {}", metric.name);
-                                    rejected_data_points += accepted_points;
+                                    tracing::warn!("No dataset defined for metric {}", metric.name);
+                                    rejected_data_points += data_point_count;
                                     continue;
                                 };
 
-                                tracing::info!("Original {} {:?}", metric.name, data);
-                                tracing::info!(
-                                    "Adding data to backend {} {:?}",
-                                    metric.name,
-                                    record_batch
-                                );
                                 results.push((
                                     backend.add_data(DataUpdate {
                                         log_sequence_number: None,
                                         data: vec![record_batch],
                                         update_type: UpdateType::Append,
                                     }),
-                                    accepted_points,
+                                    data_point_count,
                                 ));
                             }
                             Err(e) => {
                                 tracing::error!(
-                                    "Failed to add OpenTelemetry data to backend: {}",
+                                    "Failed build arrow data from OpenTelemetry metrics: {}",
                                     e
                                 );
                             }
@@ -101,9 +107,9 @@ impl MetricsService for Service {
             }
         }
 
-        for (result, accepted_points) in results {
+        for (result, data_points_count) in results {
             if let Err(e) = result.await {
-                rejected_data_points += accepted_points;
+                rejected_data_points += data_points_count;
                 tracing::error!("Failed to add OpenTelemetry data to backend: {}", e);
             }
         }
@@ -117,7 +123,7 @@ impl MetricsService for Service {
         } else {
             Some(ExportMetricsPartialSuccess {
                 error_message: "Some data points were rejected".to_string(),
-                rejected_data_points,
+                rejected_data_points: rejected_data_points.try_into().unwrap_or(MAX),
             })
         };
         Ok(Response::new(ExportMetricsServiceResponse {
@@ -126,53 +132,227 @@ impl MetricsService for Service {
     }
 }
 
-pub fn metric_data_to_record_batch(data: &Data) -> (Result<RecordBatch>, i64, i64) {
+pub fn metric_data_to_record_batch(metric: &str, data: &Data) -> (Result<RecordBatch>, u64) {
     match data {
-        Data::Gauge(gauge) => number_data_points_to_record_batch(&gauge.data_points),
-        Data::Sum(sum) => number_data_points_to_record_batch(&sum.data_points),
-        _ => (UnsupportedMetricDataTypeSnafu.fail(), 0, 0),
+        Data::Gauge(gauge) => (
+            number_data_points_to_record_batch(metric, &gauge.data_points),
+            gauge.data_points.len() as u64,
+        ),
+        Data::Sum(sum) => (
+            number_data_points_to_record_batch(metric, &sum.data_points),
+            sum.data_points.len() as u64,
+        ),
+        _ => (UnsupportedMetricDataTypeSnafu.fail(), 0),
     }
 }
 
 fn number_data_points_to_record_batch(
+    metric: &str,
     data_points: &Vec<NumberDataPoint>,
-) -> (Result<RecordBatch>, i64, i64) {
-    let mut accepted_data_points = 0;
-    let mut rejected_data_points = 0;
-
-    let mut values = Vec::new();
+) -> Result<RecordBatch> {
+    let mut values_builder = Float64Builder::new();
+    let mut attributes = Vec::new();
     for data_point in data_points {
         if let Some(value) = &data_point.value {
-            accepted_data_points += 1;
             match value {
                 Value::AsDouble(double_value) => {
-                    values.push(*double_value);
+                    values_builder.append_value(*double_value);
                 }
                 Value::AsInt(int_value) => {
-                    values.push(*int_value as f64);
+                    values_builder.append_value(*int_value as f64);
                 }
             }
         } else {
-            rejected_data_points += 1;
-            continue;
+            values_builder.append_null();
+        }
+        attributes.push(&data_point.attributes);
+    }
+
+    let mut fields = vec![Field::new("value", DataType::Float64, true)];
+    let mut columns: Vec<ArrayRef> = vec![Arc::new(values_builder.finish())];
+
+    let (attribute_fields_map, attribute_columns_map) =
+        attributes_to_fields_and_columns(metric, attributes);
+    let attribute_fields: Vec<Field> = attribute_fields_map.into_iter().map(|(_, v)| v).collect();
+    fields.extend(attribute_fields);
+    columns.extend(
+        attribute_columns_map
+            .into_iter()
+            .map(|(_, mut v)| v.finish()),
+    );
+
+    match RecordBatch::try_new(Arc::new(Schema::new(fields)), columns) {
+        Ok(record_batch) => Ok(record_batch),
+        Err(e) => Err(e).context(FailedToBuildRecordBatchSnafu),
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn attributes_to_fields_and_columns(
+    metric: &str,
+    attributes: Vec<&Vec<KeyValue>>,
+) -> (
+    IndexMap<String, Field>,
+    IndexMap<String, Box<dyn ArrayBuilder>>,
+) {
+    let mut fields: IndexMap<String, Field> = IndexMap::new();
+    let mut columns: IndexMap<String, Box<dyn ArrayBuilder>> = IndexMap::new();
+    for inner_attributes in attributes {
+        for attribute in inner_attributes {
+            let key_str = attribute.key.as_str();
+            match &attribute.value {
+                Some(any_value) => match &any_value.value {
+                    Some(value) => match value {
+                        any_value::Value::StringValue(string_value) => {
+                            match columns.get_mut(key_str) {
+                                None => {
+                                    fields.insert(
+                                        attribute.key.clone(),
+                                        Field::new(key_str, DataType::Utf8, true),
+                                    );
+                                    let mut string_builder = StringBuilder::new();
+                                    string_builder.append_value(string_value);
+                                    columns.insert(attribute.key.clone(), Box::new(string_builder));
+                                }
+                                Some(builder) => {
+                                    if let Some(string_builder) =
+                                        builder.as_any_mut().downcast_mut::<StringBuilder>()
+                                    {
+                                        string_builder.append_value(string_value);
+                                    } else {
+                                        tracing::error!(
+                                            "Attribute defined multiple times with multiple types: {metric}.{:?}",
+                                            key_str
+                                        );
+                                        continue;
+                                    }
+                                }
+                            };
+                        }
+                        any_value::Value::BoolValue(bool_value) => {
+                            match columns.get_mut(key_str) {
+                                None => {
+                                    fields.insert(
+                                        attribute.key.clone(),
+                                        Field::new(key_str, DataType::Boolean, true),
+                                    );
+                                    let mut bool_builder = BooleanBuilder::new();
+                                    bool_builder.append_value(*bool_value);
+                                    columns.insert(attribute.key.clone(), Box::new(bool_builder));
+                                }
+                                Some(builder) => {
+                                    if let Some(bool_builder) =
+                                        builder.as_any_mut().downcast_mut::<BooleanBuilder>()
+                                    {
+                                        bool_builder.append_value(*bool_value);
+                                    } else {
+                                        tracing::error!(
+                                            "Attribute defined multiple times with multiple types: {metric}.{:?}",
+                                            key_str
+                                        );
+                                        continue;
+                                    }
+                                }
+                            };
+                        }
+                        any_value::Value::IntValue(int_value) => {
+                            match columns.get_mut(key_str) {
+                                None => {
+                                    fields.insert(
+                                        attribute.key.clone(),
+                                        Field::new(key_str, DataType::Int64, true),
+                                    );
+                                    let mut int_builder = Int64Builder::new();
+                                    int_builder.append_value(*int_value);
+                                    columns.insert(attribute.key.clone(), Box::new(int_builder));
+                                }
+                                Some(builder) => {
+                                    if let Some(int_builder) =
+                                        builder.as_any_mut().downcast_mut::<Int64Builder>()
+                                    {
+                                        int_builder.append_value(*int_value);
+                                    } else {
+                                        tracing::error!(
+                                            "Attribute defined multiple times with multiple types: {metric}.{:?}",
+                                            key_str
+                                        );
+                                        continue;
+                                    }
+                                }
+                            };
+                        }
+                        any_value::Value::DoubleValue(double_value) => {
+                            match columns.get_mut(key_str) {
+                                None => {
+                                    fields.insert(
+                                        attribute.key.clone(),
+                                        Field::new(key_str, DataType::Float64, true),
+                                    );
+                                    let mut double_builder = Float64Builder::new();
+                                    double_builder.append_value(*double_value);
+                                    columns.insert(attribute.key.clone(), Box::new(double_builder));
+                                }
+                                Some(builder) => {
+                                    if let Some(double_builder) =
+                                        builder.as_any_mut().downcast_mut::<Float64Builder>()
+                                    {
+                                        double_builder.append_value(*double_value);
+                                    } else {
+                                        tracing::error!(
+                                            "Attribute defined multiple times with multiple types: {metric}.{:?}",
+                                            key_str
+                                        );
+                                        continue;
+                                    }
+                                }
+                            };
+                        }
+                        any_value::Value::BytesValue(bytes_value) => {
+                            match columns.get_mut(key_str) {
+                                None => {
+                                    fields.insert(
+                                        attribute.key.clone(),
+                                        Field::new(key_str, DataType::Binary, true),
+                                    );
+                                    let mut binary_builder = BinaryBuilder::new();
+                                    binary_builder.append_value(bytes_value);
+                                    columns.insert(attribute.key.clone(), Box::new(binary_builder));
+                                }
+                                Some(builder) => {
+                                    if let Some(binary_builder) =
+                                        builder.as_any_mut().downcast_mut::<BinaryBuilder>()
+                                    {
+                                        binary_builder.append_value(bytes_value);
+                                    } else {
+                                        tracing::error!(
+                                            "Attribute defined multiple times with multiple types: {metric}.{:?}",
+                                            key_str
+                                        );
+                                        continue;
+                                    }
+                                }
+                            };
+                        }
+                        _ => {
+                            tracing::error!(
+                                "Unsupported metric attribute type for {metric}.{:?}",
+                                attribute
+                            );
+                            continue;
+                        }
+                    },
+                    None => {
+                        continue;
+                    }
+                },
+                None => {
+                    continue;
+                }
+            };
         }
     }
 
-    match RecordBatch::try_new(
-        Arc::new(Schema::new(vec![Field::new(
-            "value",
-            DataType::Float64,
-            false,
-        )])),
-        vec![Arc::new(Float64Array::from(values))],
-    ) {
-        Ok(record_batch) => (Ok(record_batch), accepted_data_points, rejected_data_points),
-        Err(e) => (
-            Err(e).context(FailedToBuildRecordBatchSnafu),
-            0,
-            accepted_data_points + rejected_data_points,
-        ),
-    }
+    (fields, columns)
 }
 
 pub async fn start(bind_address: SocketAddr, data_fusion: Arc<DataFusion>) -> Result<()> {

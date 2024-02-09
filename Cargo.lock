@@ -3046,6 +3046,7 @@ dependencies = [
  "flight_client",
  "futures",
  "futures-core",
+ "indexmap 2.2.2",
  "metrics",
  "opentelemetry-proto",
  "r2d2",
