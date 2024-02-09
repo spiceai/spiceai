@@ -444,6 +444,11 @@ fn initialize_attribute_schema(
 ) {
     if let Some(s) = schema {
         for field in s.fields() {
+            // Skip value field because it is not an attribute and is already handled.
+            if field.name() == VALUE_COLUMN_NAME {
+                continue;
+            }
+
             fields.insert(field.name().clone(), field.clone());
             match field.data_type() {
                 DataType::Utf8 => {
@@ -479,10 +484,6 @@ fn initialize_attribute_schema(
                 _ => {}
             }
         }
-
-        // Remove value field and column if it exists since it is not an attribute and is already handled.
-        fields.shift_remove(VALUE_COLUMN_NAME);
-        columns.shift_remove(VALUE_COLUMN_NAME);
     }
 }
 
