@@ -222,8 +222,12 @@ fn number_data_points_to_record_batch(
 
     let (attribute_fields_map, attribute_columns_map) =
         attributes_to_fields_and_columns(metric, attributes);
-    let attribute_fields: Vec<Field> = attribute_fields_map.into_iter().map(|(_, v)| v).collect();
-    fields.extend(attribute_fields);
+    fields.extend(
+        attribute_fields_map
+            .into_iter()
+            .map(|(_, v)| v)
+            .collect::<Vec<Field>>(),
+    );
     columns.extend(
         attribute_columns_map
             .into_iter()
