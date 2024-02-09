@@ -452,34 +452,19 @@ fn initialize_attribute_schema(
             fields.insert(field.name().clone(), field.clone());
             match field.data_type() {
                 DataType::Utf8 => {
-                    columns.insert(
-                        field.name().clone(),
-                        Box::new(StringBuilder::new()) as Box<dyn ArrayBuilder>,
-                    );
+                    columns.insert(field.name().clone(), Box::new(StringBuilder::new()));
                 }
                 DataType::Boolean => {
-                    columns.insert(
-                        field.name().clone(),
-                        Box::new(BooleanBuilder::new()) as Box<dyn ArrayBuilder>,
-                    );
+                    columns.insert(field.name().clone(), Box::new(BooleanBuilder::new()));
                 }
                 DataType::Int64 => {
-                    columns.insert(
-                        field.name().clone(),
-                        Box::new(Int64Builder::new()) as Box<dyn ArrayBuilder>,
-                    );
+                    columns.insert(field.name().clone(), Box::new(Int64Builder::new()));
                 }
                 DataType::Float64 => {
-                    columns.insert(
-                        field.name().clone(),
-                        Box::new(Float64Builder::new()) as Box<dyn ArrayBuilder>,
-                    );
+                    columns.insert(field.name().clone(), Box::new(Float64Builder::new()));
                 }
                 DataType::Binary => {
-                    columns.insert(
-                        field.name().clone(),
-                        Box::new(BinaryBuilder::new()) as Box<dyn ArrayBuilder>,
-                    );
+                    columns.insert(field.name().clone(), Box::new(BinaryBuilder::new()));
                 }
                 _ => {}
             }
