@@ -167,7 +167,7 @@ impl MetricsService for Service {
     }
 }
 
-fn metric_data_to_record_batch(
+pub fn metric_data_to_record_batch(
     metric: &str,
     data: &Data,
     existing_schema: &Option<Schema>,
@@ -208,7 +208,7 @@ macro_rules! append_value {
 }
 
 #[allow(clippy::too_many_lines)]
-pub fn number_data_points_to_record_batch(
+fn number_data_points_to_record_batch(
     metric: &str,
     data_points: &Vec<NumberDataPoint>,
     existing_schema: &Option<Schema>,
