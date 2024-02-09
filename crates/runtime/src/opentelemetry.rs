@@ -194,6 +194,23 @@ fn number_data_points_to_record_batch(
     let mut values_builder: Option<Box<dyn ArrayBuilder>> = None;
     let mut data_points_type = DataType::Null;
     let mut attributes = Vec::new();
+
+    if let Some(s) = schema {
+        if let Ok(value_field) = s.field_with_name(VALUE_COLUMN_NAME) {
+            match value_field.data_type() {
+                DataType::Float64 => {
+                    values_builder = Some(Box::new(Float64Builder::new()));
+                    data_points_type = DataType::Float64;
+                }
+                DataType::Int64 => {
+                    values_builder = Some(Box::new(Int64Builder::new()));
+                    data_points_type = DataType::Int64;
+                }
+                _ => {}
+            }
+        }
+    }
+
     for data_point in data_points {
         if let Some(value) = &data_point.value {
             match value {
