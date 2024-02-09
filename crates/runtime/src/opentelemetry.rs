@@ -239,6 +239,9 @@ fn number_data_points_to_record_batch(
             } else if let Some(int_64_builder) = builder.as_any_mut().downcast_mut::<Int64Builder>()
             {
                 int_64_builder.append_null();
+            } else {
+                tracing::error!("First data point for metric {metric} has no value and therefore is not valid for establishing schema");
+                continue;
             }
         }
         attributes.push(data_point.attributes.as_slice());
