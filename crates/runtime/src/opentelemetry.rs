@@ -40,12 +40,12 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to serve"))]
+    #[snafu(display("Unable to serve: {source}"))]
     UnableToServe {
         source: tonic_0_9_0::transport::Error,
     },
 
-    #[snafu(display("Failed to build record batch from OpenTelemetry metrics: {}", source))]
+    #[snafu(display("Failed to build record batch from OpenTelemetry metrics: {source}"))]
     FailedToBuildRecordBatch { source: arrow::error::ArrowError },
 
     #[snafu(display("Unsupported metric data type"))]
@@ -56,6 +56,11 @@ pub enum Error {
 
     #[snafu(display("Metric with no data points"))]
     MetricWithNoDataPoints {},
+
+    #[snafu(display(
+        "Existing table for metric {metric} has unsupported `value` column data type {data_type}"
+    ))]
+    UnsupportedExistingMetricValueColumnType { metric: String, data_type: DataType },
 }
 
 const VALUE_COLUMN_NAME: &str = "value";
@@ -206,7 +211,13 @@ fn number_data_points_to_record_batch(
                     values_builder = Some(Box::new(Int64Builder::new()));
                     data_points_type = DataType::Int64;
                 }
-                _ => {}
+                _ => {
+                    return UnsupportedExistingMetricValueColumnTypeSnafu {
+                        metric,
+                        data_type: value_field.data_type().clone(),
+                    }
+                    .fail();
+                }
             }
         }
     }
