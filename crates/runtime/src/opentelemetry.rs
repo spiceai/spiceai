@@ -183,13 +183,13 @@ fn metric_data_to_record_batch(
 }
 
 macro_rules! append_value {
-    ($values_builder:expr, $data_points_type:expr, $value:expr, $builder_type:ty, $data_type:expr) => {
+    ($values_builder:expr, $data_points_type:expr, $value:expr, $builder_type:ty, $data_type:expr, $metric:expr) => {
         match &mut $values_builder {
             Some(builder) => {
                 if let Some(typed_builder) = builder.as_any_mut().downcast_mut::<$builder_type>() {
                     typed_builder.append_value(*$value);
                 } else {
-                    tracing::error!("Metric has data points with multiple types");
+                    tracing::warn!("Metric {} has data points with different types, skipping data point that introduces new type", $metric);
                     continue;
                 }
             }
@@ -244,7 +244,8 @@ pub fn number_data_points_to_record_batch(
                         data_points_type,
                         double_value,
                         Float64Builder,
-                        DataType::Float64
+                        DataType::Float64,
+                        metric
                     );
                 }
                 Value::AsInt(int_value) => {
@@ -253,7 +254,8 @@ pub fn number_data_points_to_record_batch(
                         data_points_type,
                         int_value,
                         Int64Builder,
-                        DataType::Int64
+                        DataType::Int64,
+                        metric
                     );
                 }
             }
@@ -320,11 +322,12 @@ macro_rules! append_attribute {
                 if let Some(builder) = column.as_any_mut().downcast_mut::<$builder_type>() {
                     builder.append_value($value);
                 } else {
-                    tracing::error!(
-                        "Attribute defined multiple times with multiple types: {}.{}",
+                    tracing::warn!(
+                        "Metric {} has attribute {} with different types, appending null for attribute that introduces new type",
                         $metric,
                         key_str
                     );
+                    append_null(&mut $fields, &mut $columns, key_str);
                 }
             }
         };
@@ -408,8 +411,8 @@ fn attributes_to_fields_and_columns(
                         }
                         // TODO: Support List and Map attribute types
                         _ => {
-                            tracing::error!(
-                                "Unsupported metric attribute type for {metric}.{:?}",
+                            tracing::warn!(
+                                "Unsupported metric attribute type for {metric}.{:?}, appending null",
                                 attribute
                             );
                             append_null(&mut fields, &mut columns, key_str);
