@@ -67,7 +67,7 @@ impl MetricsService for Service {
     ) -> std::result::Result<Response<ExportMetricsServiceResponse>, Status> {
         let mut rejected_data_points = 0;
         let mut total_data_points = 0;
-        let mut results = Vec::new();
+        let mut add_data_futures = Vec::new();
         for resource_metric in request.into_inner().resource_metrics {
             for scope_metric in resource_metric.scope_metrics {
                 for metric in scope_metric.metrics {
@@ -86,7 +86,7 @@ impl MetricsService for Service {
                                     continue;
                                 };
 
-                                results.push((
+                                add_data_futures.push((
                                     backend.add_data(DataUpdate {
                                         log_sequence_number: None,
                                         data: vec![record_batch],
@@ -107,8 +107,8 @@ impl MetricsService for Service {
             }
         }
 
-        for (result, data_points_count) in results {
-            if let Err(e) = result.await {
+        for (add_data_future, data_points_count) in add_data_futures {
+            if let Err(e) = add_data_future.await {
                 rejected_data_points += data_points_count;
                 tracing::error!("Failed to add OpenTelemetry data to backend: {}", e);
             }
