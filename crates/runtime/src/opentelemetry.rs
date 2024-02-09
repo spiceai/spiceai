@@ -75,8 +75,16 @@ impl MetricsService for Service {
             for scope_metric in resource_metric.scope_metrics {
                 for metric in scope_metric.metrics {
                     if let Some(data) = metric.data {
+                        let schema = match self
+                            .data_fusion
+                            .get_arrow_schema(metric.name.as_str())
+                            .await
+                        {
+                            Ok(schema) => Some(schema),
+                            Err(_) => None,
+                        };
                         let (record_batch_result, data_point_count) =
-                            metric_data_to_record_batch(metric.name.as_str(), &data);
+                            metric_data_to_record_batch(metric.name.as_str(), &data, &schema);
                         total_data_points += data_point_count;
 
                         match record_batch_result {
@@ -84,7 +92,10 @@ impl MetricsService for Service {
                                 let Some(backend) =
                                     self.data_fusion.get_backend(metric.name.as_str())
                                 else {
-                                    tracing::warn!("No dataset defined for metric {}", metric.name);
+                                    tracing::warn!(
+                                        "No dataset defined for metric {}, skipping",
+                                        metric.name
+                                    );
                                     rejected_data_points += data_point_count;
                                     continue;
                                 };
@@ -135,14 +146,18 @@ impl MetricsService for Service {
     }
 }
 
-pub fn metric_data_to_record_batch(metric: &str, data: &Data) -> (Result<RecordBatch>, u64) {
+pub fn metric_data_to_record_batch(
+    metric: &str,
+    data: &Data,
+    schema: &Option<Schema>,
+) -> (Result<RecordBatch>, u64) {
     match data {
         Data::Gauge(gauge) => (
-            number_data_points_to_record_batch(metric, &gauge.data_points),
+            number_data_points_to_record_batch(metric, &gauge.data_points, schema),
             gauge.data_points.len() as u64,
         ),
         Data::Sum(sum) => (
-            number_data_points_to_record_batch(metric, &sum.data_points),
+            number_data_points_to_record_batch(metric, &sum.data_points, schema),
             sum.data_points.len() as u64,
         ),
         // TODO: Support other metric data types
@@ -174,6 +189,7 @@ macro_rules! append_value {
 fn number_data_points_to_record_batch(
     metric: &str,
     data_points: &Vec<NumberDataPoint>,
+    schema: &Option<Schema>,
 ) -> Result<RecordBatch> {
     let mut values_builder: Option<Box<dyn ArrayBuilder>> = None;
     let mut data_points_type = DataType::Null;
@@ -212,21 +228,21 @@ fn number_data_points_to_record_batch(
     }
 
     let mut columns: Vec<ArrayRef>;
-    let mut fields: Vec<Field>;
+    let mut fields: Vec<Arc<Field>>;
     if let Some(builder) = &mut values_builder {
-        fields = vec![Field::new("value", data_points_type, true)];
+        fields = vec![Arc::new(Field::new("value", data_points_type, true))];
         columns = vec![Arc::new(builder.finish())];
     } else {
         return MetricWithNoDataPointsSnafu.fail();
     }
 
     let (attribute_fields_map, attribute_columns_map) =
-        attributes_to_fields_and_columns(metric, attributes);
+        attributes_to_fields_and_columns(metric, attributes, schema);
     fields.extend(
         attribute_fields_map
             .into_iter()
             .map(|(_, v)| v)
-            .collect::<Vec<Field>>(),
+            .collect::<Vec<Arc<Field>>>(),
     );
     columns.extend(
         attribute_columns_map
@@ -245,7 +261,10 @@ macro_rules! append_attribute {
         let key_str = $key.as_str();
         match $columns.get_mut(key_str) {
             None => {
-                $fields.insert($key.clone(), Field::new(key_str, $data_type, true));
+                $fields.insert(
+                    $key.clone(),
+                    Arc::new(Field::new(key_str, $data_type, true)),
+                );
                 let mut builder = <$builder_type>::new();
                 builder.append_value($value);
                 $columns.insert($key.clone(), Box::new(builder));
@@ -268,12 +287,16 @@ macro_rules! append_attribute {
 fn attributes_to_fields_and_columns(
     metric: &str,
     attributes: Vec<&KeyValue>,
+    schema: &Option<Schema>,
 ) -> (
-    IndexMap<String, Field>,
+    IndexMap<String, Arc<Field>>,
     IndexMap<String, Box<dyn ArrayBuilder>>,
 ) {
-    let mut fields: IndexMap<String, Field> = IndexMap::new();
+    let mut fields: IndexMap<String, Arc<Field>> = IndexMap::new();
     let mut columns: IndexMap<String, Box<dyn ArrayBuilder>> = IndexMap::new();
+
+    initialize_attribute_schema(&mut fields, &mut columns, schema);
+
     for attribute in attributes {
         let key_str = attribute.key.as_str();
         match &attribute.value {
@@ -356,6 +379,55 @@ fn attributes_to_fields_and_columns(
     (fields, columns)
 }
 
+fn initialize_attribute_schema(
+    fields: &mut IndexMap<String, Arc<Field>>,
+    columns: &mut IndexMap<String, Box<dyn ArrayBuilder>>,
+    schema: &Option<Schema>,
+) {
+    if let Some(s) = schema {
+        for field in s.fields() {
+            fields.insert(field.name().clone(), field.clone());
+            match field.data_type() {
+                DataType::Utf8 => {
+                    columns.insert(
+                        field.name().clone(),
+                        Box::new(StringBuilder::new()) as Box<dyn ArrayBuilder>,
+                    );
+                }
+                DataType::Boolean => {
+                    columns.insert(
+                        field.name().clone(),
+                        Box::new(BooleanBuilder::new()) as Box<dyn ArrayBuilder>,
+                    );
+                }
+                DataType::Int64 => {
+                    columns.insert(
+                        field.name().clone(),
+                        Box::new(Int64Builder::new()) as Box<dyn ArrayBuilder>,
+                    );
+                }
+                DataType::Float64 => {
+                    columns.insert(
+                        field.name().clone(),
+                        Box::new(Float64Builder::new()) as Box<dyn ArrayBuilder>,
+                    );
+                }
+                DataType::Binary => {
+                    columns.insert(
+                        field.name().clone(),
+                        Box::new(BinaryBuilder::new()) as Box<dyn ArrayBuilder>,
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        // Remove value field and column if it exists since it is not an attribute and is already handled.
+        fields.shift_remove("value");
+        columns.shift_remove("value");
+    }
+}
+
 macro_rules! append_null {
     ($columns:expr, $key:expr, $builder_type:ty) => {
         if let Some(column) = $columns.get_mut($key) {
@@ -367,7 +439,7 @@ macro_rules! append_null {
 }
 
 fn append_null(
-    fields: &mut IndexMap<String, Field>,
+    fields: &mut IndexMap<String, Arc<Field>>,
     columns: &mut IndexMap<String, Box<dyn ArrayBuilder>>,
     key: &str,
 ) {

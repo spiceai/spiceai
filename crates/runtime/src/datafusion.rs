@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use crate::databackend::{self, DataBackend};
 use crate::datasource::DataSource;
+use arrow::datatypes::Schema;
 use datafusion::datasource::ViewTable;
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::SessionConfig;
@@ -55,6 +56,11 @@ pub enum Error {
 
     UnableToParseSql {
         source: sqlparser::parser::ParserError,
+    },
+
+    #[snafu(display("Unable to get table: {}", source))]
+    UnableToGetTable {
+        source: DataFusionError,
     },
 }
 
@@ -132,6 +138,15 @@ impl DataFusion {
     #[must_use]
     pub fn has_backend(&self, dataset: &str) -> bool {
         self.backends.contains_key(dataset)
+    }
+
+    pub async fn get_arrow_schema(&self, dataset: &str) -> Result<Schema> {
+        let data_frame = self
+            .ctx
+            .table(dataset)
+            .await
+            .context(UnableToGetTableSnafu)?;
+        Ok(Schema::from(data_frame.schema()))
     }
 
     #[allow(clippy::needless_pass_by_value)]
