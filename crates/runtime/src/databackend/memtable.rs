@@ -1,5 +1,5 @@
 use snafu::prelude::*;
-use std::sync::Arc;
+use std::{mem, sync::Arc};
 
 use crate::dataupdate::{DataUpdate, UpdateType};
 use arrow::record_batch::RecordBatch;
@@ -60,7 +60,7 @@ impl DataBackend for MemTableBackend {
 
             let log_sequence_number = data_update.log_sequence_number.unwrap_or_default();
 
-            let table_update = MemTableUpdate {
+            let mut table_update = MemTableUpdate {
                 log_sequence_number,
                 name: self.name.clone(),
                 data: data_update.data,
@@ -87,10 +87,10 @@ impl MemTableUpdate {
         format!("{name}_{log_sequence_number}")
     }
 
-    async fn update(&self) -> Result<()> {
+    async fn update(&mut self) -> Result<()> {
         let schema = self.data[0].schema();
-        let table =
-            MemTable::try_new(schema, vec![self.data.clone()]).context(UnableToAddDataSnafu)?;
+        let data = mem::take(&mut self.data);
+        let table = MemTable::try_new(schema, vec![data]).context(UnableToAddDataSnafu)?;
 
         // There is probably a better way to do this than registering a temp table
         let temp_table_name = MemTableUpdate::temp_table_name(&self.name, self.log_sequence_number);
