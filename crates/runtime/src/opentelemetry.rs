@@ -268,7 +268,7 @@ pub fn number_data_points_to_record_batch(
             }
         } else if let Some(builder) = &mut values_builder {
             if (data_point.flags & DataPointFlags::NoRecordedValueMask as u32)
-                == DataPointFlags::NoRecordedValueMask as u32
+                != DataPointFlags::NoRecordedValueMask as u32
             {
                 tracing::warn!(
                     "Metric {} has data point with no recorded value without flag set to indicate no recorded value, skipping",
@@ -282,9 +282,9 @@ pub fn number_data_points_to_record_batch(
             } else if let Some(int_64_builder) = builder.as_any_mut().downcast_mut::<Int64Builder>()
             {
                 int_64_builder.append_null();
-            } else {
-                return FirstMetricDataPointHasNoValueSnafu { metric }.fail();
             }
+        } else {
+            return FirstMetricDataPointHasNoValueSnafu { metric }.fail();
         }
         attributes.push(data_point.attributes.as_slice());
         time_unix_nano_builder.append_value(data_point.time_unix_nano);
