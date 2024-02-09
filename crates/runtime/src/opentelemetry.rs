@@ -267,7 +267,9 @@ pub fn number_data_points_to_record_batch(
                 }
             }
         } else if let Some(builder) = &mut values_builder {
-            if data_point.flags != DataPointFlags::NoRecordedValueMask as u32 {
+            if (data_point.flags & DataPointFlags::NoRecordedValueMask as u32)
+                == DataPointFlags::NoRecordedValueMask as u32
+            {
                 tracing::warn!(
                     "Metric {} has data point with no recorded value without flag set to indicate no recorded value, skipping",
                     metric
