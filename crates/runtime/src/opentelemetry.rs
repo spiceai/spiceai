@@ -90,7 +90,7 @@ impl MetricsService for Service {
             for scope_metric in resource_metric.scope_metrics {
                 for metric in scope_metric.metrics {
                     if let Some(data) = metric.data {
-                        let schema = match self
+                        let existing_schema = match self
                             .data_fusion
                             .get_arrow_schema(metric.name.as_str())
                             .await
@@ -98,8 +98,11 @@ impl MetricsService for Service {
                             Ok(schema) => Some(schema),
                             Err(_) => None,
                         };
-                        let (record_batch_result, data_points_count) =
-                            metric_data_to_record_batch(metric.name.as_str(), &data, &schema);
+                        let (record_batch_result, data_points_count) = metric_data_to_record_batch(
+                            metric.name.as_str(),
+                            &data,
+                            &existing_schema,
+                        );
                         total_data_points += data_points_count;
 
                         match record_batch_result {
@@ -163,15 +166,15 @@ impl MetricsService for Service {
 fn metric_data_to_record_batch(
     metric: &str,
     data: &Data,
-    schema: &Option<Schema>,
+    existing_schema: &Option<Schema>,
 ) -> (Result<RecordBatch>, u64) {
     match data {
         Data::Gauge(gauge) => (
-            number_data_points_to_record_batch(metric, &gauge.data_points, schema),
+            number_data_points_to_record_batch(metric, &gauge.data_points, existing_schema),
             gauge.data_points.len() as u64,
         ),
         Data::Sum(sum) => (
-            number_data_points_to_record_batch(metric, &sum.data_points, schema),
+            number_data_points_to_record_batch(metric, &sum.data_points, existing_schema),
             sum.data_points.len() as u64,
         ),
         // TODO: Support other metric data types
@@ -200,16 +203,16 @@ macro_rules! append_value {
     };
 }
 
-fn number_data_points_to_record_batch(
+pub fn number_data_points_to_record_batch(
     metric: &str,
     data_points: &Vec<NumberDataPoint>,
-    schema: &Option<Schema>,
+    existing_schema: &Option<Schema>,
 ) -> Result<RecordBatch> {
     let mut values_builder: Option<Box<dyn ArrayBuilder>> = None;
     let mut data_points_type = DataType::Null;
     let mut attributes = Vec::new();
 
-    if let Some(s) = schema {
+    if let Some(s) = existing_schema {
         if let Ok(value_field) = s.field_with_name(VALUE_COLUMN_NAME) {
             match value_field.data_type() {
                 DataType::Float64 => {
@@ -281,7 +284,7 @@ fn number_data_points_to_record_batch(
     }
 
     let (attribute_fields_map, attribute_columns_map) =
-        attributes_to_fields_and_columns(metric, attributes.as_slice(), schema);
+        attributes_to_fields_and_columns(metric, attributes.as_slice(), existing_schema);
     fields.extend(
         attribute_fields_map
             .into_iter()
@@ -332,7 +335,7 @@ macro_rules! append_attribute {
 fn attributes_to_fields_and_columns(
     metric: &str,
     attributes: &[&[KeyValue]],
-    schema: &Option<Schema>,
+    existing_schema: &Option<Schema>,
 ) -> (
     IndexMap<String, Arc<Field>>,
     IndexMap<String, Box<dyn ArrayBuilder>>,
@@ -340,7 +343,7 @@ fn attributes_to_fields_and_columns(
     let mut fields: IndexMap<String, Arc<Field>> = IndexMap::new();
     let mut columns: IndexMap<String, Box<dyn ArrayBuilder>> = IndexMap::new();
 
-    initialize_attribute_schema(&mut fields, &mut columns, schema);
+    initialize_attribute_schema(&mut fields, &mut columns, existing_schema);
 
     for (i, inner_attributes) in attributes.iter().enumerate() {
         for attribute in *inner_attributes {
@@ -440,9 +443,9 @@ fn attributes_to_fields_and_columns(
 fn initialize_attribute_schema(
     fields: &mut IndexMap<String, Arc<Field>>,
     columns: &mut IndexMap<String, Box<dyn ArrayBuilder>>,
-    schema: &Option<Schema>,
+    existing_schema: &Option<Schema>,
 ) {
-    if let Some(s) = schema {
+    if let Some(s) = existing_schema {
         for field in s.fields() {
             // Skip value field because it is not an attribute and is already handled.
             if field.name() == VALUE_COLUMN_NAME {
