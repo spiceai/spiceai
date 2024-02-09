@@ -208,7 +208,7 @@ fn number_data_points_to_record_batch(
                 int_64_builder.append_null();
             }
         }
-        attributes.push(&data_point.attributes);
+        attributes.extend(&data_point.attributes);
     }
 
     let mut columns: Vec<ArrayRef>;
@@ -267,92 +267,90 @@ macro_rules! append_attribute {
 
 fn attributes_to_fields_and_columns(
     metric: &str,
-    attributes: Vec<&Vec<KeyValue>>,
+    attributes: Vec<&KeyValue>,
 ) -> (
     IndexMap<String, Field>,
     IndexMap<String, Box<dyn ArrayBuilder>>,
 ) {
     let mut fields: IndexMap<String, Field> = IndexMap::new();
     let mut columns: IndexMap<String, Box<dyn ArrayBuilder>> = IndexMap::new();
-    for inner_attributes in attributes {
-        for attribute in inner_attributes {
-            let key_str = attribute.key.as_str();
-            match &attribute.value {
-                Some(any_value) => match &any_value.value {
-                    Some(value) => match value {
-                        any_value::Value::StringValue(string_value) => {
-                            append_attribute!(
-                                columns,
-                                fields,
-                                attribute.key,
-                                string_value,
-                                StringBuilder,
-                                DataType::Utf8,
-                                metric
-                            );
-                        }
-                        any_value::Value::BoolValue(bool_value) => {
-                            append_attribute!(
-                                columns,
-                                fields,
-                                attribute.key,
-                                *bool_value,
-                                BooleanBuilder,
-                                DataType::Boolean,
-                                metric
-                            );
-                        }
-                        any_value::Value::IntValue(int_value) => {
-                            append_attribute!(
-                                columns,
-                                fields,
-                                attribute.key,
-                                *int_value,
-                                Int64Builder,
-                                DataType::Int64,
-                                metric
-                            );
-                        }
-                        any_value::Value::DoubleValue(double_value) => {
-                            append_attribute!(
-                                columns,
-                                fields,
-                                attribute.key,
-                                *double_value,
-                                Float64Builder,
-                                DataType::Float64,
-                                metric
-                            );
-                        }
-                        any_value::Value::BytesValue(bytes_value) => {
-                            append_attribute!(
-                                columns,
-                                fields,
-                                attribute.key,
-                                bytes_value,
-                                BinaryBuilder,
-                                DataType::Binary,
-                                metric
-                            );
-                        }
-                        // TODO: Support List and Map attribute types
-                        _ => {
-                            tracing::error!(
-                                "Unsupported metric attribute type for {metric}.{:?}",
-                                attribute
-                            );
-                            append_null(&mut fields, &mut columns, key_str);
-                        }
-                    },
-                    None => {
+    for attribute in attributes {
+        let key_str = attribute.key.as_str();
+        match &attribute.value {
+            Some(any_value) => match &any_value.value {
+                Some(value) => match value {
+                    any_value::Value::StringValue(string_value) => {
+                        append_attribute!(
+                            columns,
+                            fields,
+                            attribute.key,
+                            string_value,
+                            StringBuilder,
+                            DataType::Utf8,
+                            metric
+                        );
+                    }
+                    any_value::Value::BoolValue(bool_value) => {
+                        append_attribute!(
+                            columns,
+                            fields,
+                            attribute.key,
+                            *bool_value,
+                            BooleanBuilder,
+                            DataType::Boolean,
+                            metric
+                        );
+                    }
+                    any_value::Value::IntValue(int_value) => {
+                        append_attribute!(
+                            columns,
+                            fields,
+                            attribute.key,
+                            *int_value,
+                            Int64Builder,
+                            DataType::Int64,
+                            metric
+                        );
+                    }
+                    any_value::Value::DoubleValue(double_value) => {
+                        append_attribute!(
+                            columns,
+                            fields,
+                            attribute.key,
+                            *double_value,
+                            Float64Builder,
+                            DataType::Float64,
+                            metric
+                        );
+                    }
+                    any_value::Value::BytesValue(bytes_value) => {
+                        append_attribute!(
+                            columns,
+                            fields,
+                            attribute.key,
+                            bytes_value,
+                            BinaryBuilder,
+                            DataType::Binary,
+                            metric
+                        );
+                    }
+                    // TODO: Support List and Map attribute types
+                    _ => {
+                        tracing::error!(
+                            "Unsupported metric attribute type for {metric}.{:?}",
+                            attribute
+                        );
                         append_null(&mut fields, &mut columns, key_str);
                     }
                 },
                 None => {
                     append_null(&mut fields, &mut columns, key_str);
                 }
-            };
-        }
+            },
+            None => {
+                append_null(&mut fields, &mut columns, key_str);
+            }
+        };
     }
 
     (fields, columns)
