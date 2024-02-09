@@ -58,7 +58,7 @@ pub enum Error {
     MetricWithNoDataPoints {},
 }
 
-static VALUE_COLUMN_NAME: &str = "value";
+const VALUE_COLUMN_NAME: &str = "value";
 
 pub struct Service {
     data_fusion: Arc<DataFusion>,
