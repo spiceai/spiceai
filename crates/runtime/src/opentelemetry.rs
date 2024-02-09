@@ -58,9 +58,13 @@ pub enum Error {
     MetricWithNoDataPoints {},
 
     #[snafu(display(
-        "Existing table for metric {metric} has unsupported `value` column data type {data_type}"
+        "Existing table for metric {metric} has unsupported `value` column data type {data_type} for data point type {data_point_type}"
     ))]
-    UnsupportedExistingMetricValueColumnType { metric: String, data_type: DataType },
+    UnsupportedExistingMetricValueColumnType {
+        metric: String,
+        data_type: DataType,
+        data_point_type: String,
+    },
 }
 
 const VALUE_COLUMN_NAME: &str = "value";
@@ -215,6 +219,7 @@ fn number_data_points_to_record_batch(
                     return UnsupportedExistingMetricValueColumnTypeSnafu {
                         metric,
                         data_type: value_field.data_type().clone(),
+                        data_point_type: "NumberDataPoint",
                     }
                     .fail();
                 }
