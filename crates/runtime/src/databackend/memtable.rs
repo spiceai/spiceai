@@ -51,17 +51,11 @@ impl DataBackend for MemTableBackend {
     fn add_data(&self, data_update: DataUpdate) -> AddDataResult {
         Box::pin(async move {
             if data_update.data.is_empty() {
-                tracing::trace!(
-                    "No data to add for log sequence number {log_sequence_number:?}",
-                    log_sequence_number = data_update.log_sequence_number
-                );
+                tracing::trace!("No data to add");
                 return Ok(());
             }
 
-            let log_sequence_number = data_update.log_sequence_number.unwrap_or_default();
-
             let mut table_update = MemTableUpdate {
-                log_sequence_number,
                 name: self.name.clone(),
                 data: data_update.data,
                 update_type: data_update.update_type,
@@ -75,25 +69,24 @@ impl DataBackend for MemTableBackend {
 }
 
 struct MemTableUpdate {
-    log_sequence_number: u64,
     name: String,
     data: Vec<RecordBatch>,
     update_type: UpdateType,
     ctx: Arc<SessionContext>,
 }
 
-impl MemTableUpdate {
-    fn temp_table_name(name: &str, log_sequence_number: u64) -> String {
-        format!("{name}_{log_sequence_number}")
-    }
+fn temp_table_name(name: &str) -> String {
+    format!("{name}_update")
+}
 
+impl MemTableUpdate {
     async fn update(&mut self) -> Result<()> {
         let schema = self.data[0].schema();
         let data = mem::take(&mut self.data);
         let table = MemTable::try_new(schema, vec![data]).context(UnableToAddDataSnafu)?;
 
         // There is probably a better way to do this than registering a temp table
-        let temp_table_name = MemTableUpdate::temp_table_name(&self.name, self.log_sequence_number);
+        let temp_table_name = temp_table_name(&self.name);
         self.ctx
             .register_table(
                 TableReference::bare(temp_table_name.clone()),
@@ -152,10 +145,6 @@ impl MemTableUpdate {
             .unwrap_or(false);
 
         if !table_exists {
-            tracing::trace!(
-                "Creating table for log sequence number {:?}",
-                self.log_sequence_number
-            );
             let schema = self.data[0].schema();
             let table =
                 MemTable::try_new(schema, vec![self.data.clone()]).context(UnableToAddDataSnafu)?;
@@ -164,10 +153,7 @@ impl MemTableUpdate {
                 .register_table(TableReference::bare(self.name.clone()), Arc::new(table))
                 .context(UnableToAddDataSnafu)?;
 
-            tracing::trace!(
-                "Created table for log sequence number {:?}",
-                self.log_sequence_number
-            );
+            tracing::trace!("Created table {} in memory", self.name);
         };
         Ok(())
     }
@@ -175,10 +161,7 @@ impl MemTableUpdate {
 
 impl Drop for MemTableUpdate {
     fn drop(&mut self) {
-        let temp_table_name = TableReference::bare(MemTableUpdate::temp_table_name(
-            self.name.as_str(),
-            self.log_sequence_number,
-        ));
+        let temp_table_name = TableReference::bare(temp_table_name(self.name.as_str()));
         let deregister_result = self.ctx.deregister_table(temp_table_name);
         if let Err(e) = deregister_result {
             tracing::error!("Error dropping temp table: {e:?}");

@@ -65,7 +65,6 @@ impl DataBackend for DuckDBBackend {
                 pool.get().context(ConnectionPoolSnafu)?;
 
             let mut duckdb_update = DuckDBUpdate {
-                log_sequence_number: data_update.log_sequence_number.unwrap_or_default(),
                 name,
                 data: data_update.data,
                 update_type: data_update.update_type,
@@ -153,7 +152,6 @@ impl From<acceleration::Mode> for Mode {
 }
 
 struct DuckDBUpdate<'a> {
-    log_sequence_number: u64,
     name: String,
     data: Vec<RecordBatch>,
     update_type: UpdateType,
@@ -177,11 +175,7 @@ impl<'a> DuckDBUpdate<'a> {
             self.insert_batch(batch)?;
         }
 
-        tracing::trace!(
-            "Processed update to DuckDB table {name} for log sequence number {lsn:?}",
-            name = self.name,
-            lsn = self.log_sequence_number
-        );
+        tracing::trace!("Processed update to DuckDB table {name}", name = self.name,);
 
         Ok(())
     }
@@ -288,7 +282,6 @@ mod tests {
             panic!("Unable to create record batch");
         };
         let data_update = DataUpdate {
-            log_sequence_number: Some(1),
             data,
             update_type: UpdateType::Overwrite,
         };

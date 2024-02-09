@@ -81,7 +81,6 @@ impl DataSource for SpiceAI {
               Some(Ok(decoded_data)) => match decoded_data.payload {
                   DecodedPayload::RecordBatch(batch) => {
                       yield DataUpdate {
-                        log_sequence_number: None,
                         data: vec![batch],
                         update_type: UpdateType::Append,
                       };

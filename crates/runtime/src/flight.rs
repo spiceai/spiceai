@@ -230,7 +230,6 @@ impl FlightService for Service {
 
                         let data_update = DataUpdate {
                             data: vec![new_batch],
-                            log_sequence_number: None,
                             update_type: UpdateType::Append,
                         };
 
@@ -395,7 +394,6 @@ impl FlightService for Service {
             for batch in &results {
                 let data_update = DataUpdate {
                     data: vec![batch.clone()],
-                    log_sequence_number: None,
                     update_type: UpdateType::Append,
                 };
                 let _ = tx.send(data_update);

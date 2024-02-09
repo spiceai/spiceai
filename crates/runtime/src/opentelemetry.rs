@@ -91,7 +91,6 @@ impl MetricsService for Service {
 
                                 add_data_futures.push((
                                     backend.add_data(DataUpdate {
-                                        log_sequence_number: None,
                                         data: vec![record_batch],
                                         update_type: UpdateType::Append,
                                     }),

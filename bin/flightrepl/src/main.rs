@@ -54,11 +54,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
-        let line = line.trim();
+        let line = line.trim().to_string();
         if line.is_empty() {
             continue;
         }
-        match line {
+        match line.as_str() {
             ".exit" | "exit" | "quit" | "q" => break,
             "help" => {
                 println!("Available commands:\n");
@@ -70,9 +70,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ => {}
         }
 
-        let _ = rl.add_history_entry(line);
+        let mut query = line;
+        while !query.ends_with(';') {
+            let line_result = rl.readline("...> ");
+            let line = match line_result {
+                Ok(line) => line,
+                Err(ReadlineError::Interrupted | ReadlineError::Eof) => {
+                    break;
+                }
+                Err(err) => {
+                    println!("Error reading line: {err}");
+                    continue;
+                }
+            };
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            query.push(' ');
+            query.push_str(line);
+        }
 
-        let request = FlightDescriptor::new_cmd(line.to_string());
+        let _ = rl.add_history_entry(&query);
+
+        let request = FlightDescriptor::new_cmd(query);
 
         let mut flight_info = client.get_flight_info(request).await?.into_inner();
         let Some(endpoint) = flight_info.endpoint.pop() else {
