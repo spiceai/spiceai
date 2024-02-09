@@ -88,19 +88,7 @@ impl MemTableUpdate {
     }
 
     async fn update(&self) -> Result<()> {
-        let schema = self.data[0].schema();
-        let table =
-            MemTable::try_new(schema, vec![self.data.clone()]).context(UnableToAddDataSnafu)?;
-
-        // There is probably a better way to do this than registering a temp table
         let temp_table_name = MemTableUpdate::temp_table_name(&self.name, self.log_sequence_number);
-        self.ctx
-            .register_table(
-                TableReference::bare(temp_table_name.clone()),
-                Arc::new(table),
-            )
-            .context(UnableToAddDataSnafu)?;
-
         let sql_stmt = match self.update_type {
             UpdateType::Overwrite => format!(
                 r#"CREATE OR REPLACE TABLE "{name}" AS SELECT * FROM "{temp_table_name}""#,
@@ -108,7 +96,12 @@ impl MemTableUpdate {
                 temp_table_name = temp_table_name,
             ),
             UpdateType::Append => {
-                self.create_table_if_not_exists()?;
+                let table_created = self.create_table_if_not_exists()?;
+                // If the table was created then it will have been populated with the data.
+                if table_created {
+                    return Ok(());
+                }
+
                 format!(
                     r#"INSERT INTO "{name}" SELECT * FROM "{temp_table_name}""#,
                     name = self.name,
@@ -116,6 +109,17 @@ impl MemTableUpdate {
                 )
             }
         };
+
+        // There is probably a better way to do this than registering a temp table
+        let schema = self.data[0].schema();
+        let table =
+            MemTable::try_new(schema, vec![self.data.clone()]).context(UnableToAddDataSnafu)?;
+        self.ctx
+            .register_table(
+                TableReference::bare(temp_table_name.clone()),
+                Arc::new(table),
+            )
+            .context(UnableToAddDataSnafu)?;
 
         tracing::trace!("Inserting data with SQL: {sql_stmt}");
         let statements = DFParser::parse_sql_with_dialect(&sql_stmt, &AnsiDialect {})
@@ -145,7 +149,7 @@ impl MemTableUpdate {
         Ok(())
     }
 
-    fn create_table_if_not_exists(&self) -> Result<()> {
+    fn create_table_if_not_exists(&self) -> Result<bool> {
         let table_exists = self
             .ctx
             .table_exist(TableReference::bare(self.name.clone()))
@@ -168,8 +172,10 @@ impl MemTableUpdate {
                 "Created table for log sequence number {:?}",
                 self.log_sequence_number
             );
+
+            return Ok(true);
         };
-        Ok(())
+        Ok(false)
     }
 }
 
