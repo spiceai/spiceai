@@ -9,6 +9,7 @@ use arrow::array::BooleanBuilder;
 use arrow::array::Float64Builder;
 use arrow::array::Int64Builder;
 use arrow::array::StringBuilder;
+use arrow::array::UInt64Builder;
 use arrow::datatypes::DataType;
 use arrow::datatypes::Field;
 use arrow::datatypes::Schema;
@@ -23,6 +24,7 @@ use opentelemetry_proto::tonic::common::v1::any_value;
 use opentelemetry_proto::tonic::common::v1::KeyValue;
 use opentelemetry_proto::tonic::metrics::v1::metric::Data;
 use opentelemetry_proto::tonic::metrics::v1::number_data_point::Value;
+use opentelemetry_proto::tonic::metrics::v1::DataPointFlags;
 use opentelemetry_proto::tonic::metrics::v1::NumberDataPoint;
 use snafu::prelude::*;
 use tonic_0_9_0::async_trait;
@@ -73,6 +75,8 @@ pub enum Error {
 }
 
 const VALUE_COLUMN_NAME: &str = "value";
+const TIME_UNIX_NANO_COLUMN_NAME: &str = "time_unix_nano";
+const START_TIME_UNIX_NANO_COLUMN_NAME: &str = "start_time_unix_nano";
 
 pub struct Service {
     data_fusion: Arc<DataFusion>,
@@ -203,13 +207,16 @@ macro_rules! append_value {
     };
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn number_data_points_to_record_batch(
     metric: &str,
     data_points: &Vec<NumberDataPoint>,
     existing_schema: &Option<Schema>,
 ) -> Result<RecordBatch> {
     let mut values_builder: Option<Box<dyn ArrayBuilder>> = None;
-    let mut data_points_type = DataType::Null;
+    let mut values_type = DataType::Null;
+    let mut time_unix_nano_builder = UInt64Builder::new();
+    let mut start_time_unix_nano_builder = UInt64Builder::new();
     let mut attributes = Vec::new();
 
     if let Some(s) = existing_schema {
@@ -217,11 +224,11 @@ pub fn number_data_points_to_record_batch(
             match value_field.data_type() {
                 DataType::Float64 => {
                     values_builder = Some(Box::new(Float64Builder::new()));
-                    data_points_type = DataType::Float64;
+                    values_type = DataType::Float64;
                 }
                 DataType::Int64 => {
                     values_builder = Some(Box::new(Int64Builder::new()));
-                    data_points_type = DataType::Int64;
+                    values_type = DataType::Int64;
                 }
                 _ => {
                     return UnsupportedExistingMetricValueColumnTypeSnafu {
@@ -241,7 +248,7 @@ pub fn number_data_points_to_record_batch(
                 Value::AsDouble(double_value) => {
                     append_value!(
                         values_builder,
-                        data_points_type,
+                        values_type,
                         double_value,
                         Float64Builder,
                         DataType::Float64,
@@ -251,7 +258,7 @@ pub fn number_data_points_to_record_batch(
                 Value::AsInt(int_value) => {
                     append_value!(
                         values_builder,
-                        data_points_type,
+                        values_type,
                         int_value,
                         Int64Builder,
                         DataType::Int64,
@@ -260,6 +267,14 @@ pub fn number_data_points_to_record_batch(
                 }
             }
         } else if let Some(builder) = &mut values_builder {
+            if data_point.flags != DataPointFlags::NoRecordedValueMask as u32 {
+                tracing::warn!(
+                    "Metric {} has data point with no recorded value without flag set to indicate no recorded value, skipping",
+                    metric
+                );
+                continue;
+            }
+
             if let Some(float_64_builder) = builder.as_any_mut().downcast_mut::<Float64Builder>() {
                 float_64_builder.append_null();
             } else if let Some(int_64_builder) = builder.as_any_mut().downcast_mut::<Int64Builder>()
@@ -270,17 +285,31 @@ pub fn number_data_points_to_record_batch(
             }
         }
         attributes.push(data_point.attributes.as_slice());
+        time_unix_nano_builder.append_value(data_point.time_unix_nano);
+        start_time_unix_nano_builder.append_value(data_point.start_time_unix_nano);
     }
 
     let mut columns: Vec<ArrayRef>;
     let mut fields: Vec<Arc<Field>>;
     if let Some(builder) = &mut values_builder {
-        fields = vec![Arc::new(Field::new(
-            VALUE_COLUMN_NAME,
-            data_points_type,
-            true,
-        ))];
-        columns = vec![Arc::new(builder.finish())];
+        fields = vec![
+            Arc::new(Field::new(VALUE_COLUMN_NAME, values_type, true)),
+            Arc::new(Field::new(
+                TIME_UNIX_NANO_COLUMN_NAME,
+                DataType::UInt64,
+                true,
+            )),
+            Arc::new(Field::new(
+                START_TIME_UNIX_NANO_COLUMN_NAME,
+                DataType::UInt64,
+                true,
+            )),
+        ];
+        columns = vec![
+            Arc::new(builder.finish()),
+            Arc::new(time_unix_nano_builder.finish()),
+            Arc::new(start_time_unix_nano_builder.finish()),
+        ];
     } else {
         return MetricWithNoDataPointsSnafu.fail();
     }
@@ -456,7 +485,10 @@ fn initialize_attribute_schema(
     if let Some(s) = existing_schema {
         for field in s.fields() {
             // Skip value field because it is not an attribute and is already handled.
-            if field.name() == VALUE_COLUMN_NAME {
+            if field.name() == VALUE_COLUMN_NAME
+                || field.name() == TIME_UNIX_NANO_COLUMN_NAME
+                || field.name() == START_TIME_UNIX_NANO_COLUMN_NAME
+            {
                 continue;
             }
 
