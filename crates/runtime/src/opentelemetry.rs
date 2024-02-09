@@ -331,7 +331,7 @@ fn attributes_to_fields_and_columns(
                                 metric
                             );
                         }
-                        // TODO: Support other attribute types
+                        // TODO: Support List and Map attribute types
                         _ => {
                             tracing::error!(
                                 "Unsupported metric attribute type for {metric}.{:?}",
