@@ -58,6 +58,8 @@ pub enum Error {
     MetricWithNoDataPoints {},
 }
 
+static VALUE_COLUMN_NAME: &str = "value";
+
 pub struct Service {
     data_fusion: Arc<DataFusion>,
 }
@@ -228,7 +230,11 @@ fn number_data_points_to_record_batch(
     let mut columns: Vec<ArrayRef>;
     let mut fields: Vec<Arc<Field>>;
     if let Some(builder) = &mut values_builder {
-        fields = vec![Arc::new(Field::new("value", data_points_type, true))];
+        fields = vec![Arc::new(Field::new(
+            VALUE_COLUMN_NAME,
+            data_points_type,
+            true,
+        ))];
         columns = vec![Arc::new(builder.finish())];
     } else {
         return MetricWithNoDataPointsSnafu.fail();
@@ -435,8 +441,8 @@ fn initialize_attribute_schema(
         }
 
         // Remove value field and column if it exists since it is not an attribute and is already handled.
-        fields.shift_remove("value");
-        columns.shift_remove("value");
+        fields.shift_remove(VALUE_COLUMN_NAME);
+        columns.shift_remove(VALUE_COLUMN_NAME);
     }
 }
 
