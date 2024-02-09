@@ -150,6 +150,27 @@ pub fn metric_data_to_record_batch(metric: &str, data: &Data) -> (Result<RecordB
     }
 }
 
+macro_rules! append_value {
+    ($values_builder:expr, $data_points_type:expr, $value:expr, $builder_type:ty, $data_type:expr) => {
+        match &mut $values_builder {
+            Some(builder) => {
+                if let Some(typed_builder) = builder.as_any_mut().downcast_mut::<$builder_type>() {
+                    typed_builder.append_value(*$value);
+                } else {
+                    tracing::error!("Metric has data points with multiple types");
+                    continue;
+                }
+            }
+            None => {
+                let mut new_builder = <$builder_type>::new();
+                new_builder.append_value(*$value);
+                $values_builder = Some(Box::new(new_builder));
+                $data_points_type = $data_type;
+            }
+        }
+    };
+}
+
 fn number_data_points_to_record_batch(
     metric: &str,
     data_points: &Vec<NumberDataPoint>,
@@ -160,42 +181,24 @@ fn number_data_points_to_record_batch(
     for data_point in data_points {
         if let Some(value) = &data_point.value {
             match value {
-                Value::AsDouble(double_value) => match &mut values_builder {
-                    Some(builder) => {
-                        if let Some(float_builder) =
-                            builder.as_any_mut().downcast_mut::<Float64Builder>()
-                        {
-                            float_builder.append_value(*double_value);
-                        } else {
-                            tracing::error!("Metric has data points with multiple types: {metric}");
-                            continue;
-                        }
-                    }
-                    None => {
-                        let mut float_builder = Float64Builder::new();
-                        float_builder.append_value(*double_value);
-                        values_builder = Some(Box::new(float_builder));
-                        data_points_type = DataType::Float64;
-                    }
-                },
-                Value::AsInt(int_value) => match &mut values_builder {
-                    Some(builder) => {
-                        if let Some(int_builder) =
-                            builder.as_any_mut().downcast_mut::<Int64Builder>()
-                        {
-                            int_builder.append_value(*int_value);
-                        } else {
-                            tracing::error!("Metric has data points with multiple types: {metric}");
-                            continue;
-                        }
-                    }
-                    None => {
-                        let mut int_builder = Int64Builder::new();
-                        int_builder.append_value(*int_value);
-                        values_builder = Some(Box::new(int_builder));
-                        data_points_type = DataType::Int64;
-                    }
-                },
+                Value::AsDouble(double_value) => {
+                    append_value!(
+                        values_builder,
+                        data_points_type,
+                        double_value,
+                        Float64Builder,
+                        DataType::Float64
+                    );
+                }
+                Value::AsInt(int_value) => {
+                    append_value!(
+                        values_builder,
+                        data_points_type,
+                        int_value,
+                        Int64Builder,
+                        DataType::Int64
+                    );
+                }
             }
         } else if let Some(builder) = &mut values_builder {
             if let Some(float_64_builder) = builder.as_any_mut().downcast_mut::<Float64Builder>() {
