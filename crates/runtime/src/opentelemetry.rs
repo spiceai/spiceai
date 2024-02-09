@@ -65,6 +65,11 @@ pub enum Error {
         data_type: DataType,
         data_point_type: String,
     },
+
+    #[snafu(display(
+        "First data point for metric {metric} has no value and therefore is not valid for establishing schema"
+    ))]
+    FirstMetricDataPointHasNoValue { metric: String },
 }
 
 const VALUE_COLUMN_NAME: &str = "value";
@@ -256,8 +261,7 @@ fn number_data_points_to_record_batch(
             {
                 int_64_builder.append_null();
             } else {
-                tracing::error!("First data point for metric {metric} has no value and therefore is not valid for establishing schema");
-                continue;
+                return FirstMetricDataPointHasNoValueSnafu { metric }.fail();
             }
         }
         attributes.push(data_point.attributes.as_slice());
