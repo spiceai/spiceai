@@ -70,7 +70,6 @@ impl MetricsService for Service {
     ) -> std::result::Result<Response<ExportMetricsServiceResponse>, Status> {
         let mut rejected_data_points = 0;
         let mut total_data_points = 0;
-        let mut add_data_futures = Vec::new();
         for resource_metric in request.into_inner().resource_metrics {
             for scope_metric in resource_metric.scope_metrics {
                 for metric in scope_metric.metrics {
@@ -83,9 +82,9 @@ impl MetricsService for Service {
                             Ok(schema) => Some(schema),
                             Err(_) => None,
                         };
-                        let (record_batch_result, data_point_count) =
+                        let (record_batch_result, data_points_count) =
                             metric_data_to_record_batch(metric.name.as_str(), &data, &schema);
-                        total_data_points += data_point_count;
+                        total_data_points += data_points_count;
 
                         match record_batch_result {
                             Ok(record_batch) => {
@@ -96,18 +95,24 @@ impl MetricsService for Service {
                                         "No dataset defined for metric {}, skipping",
                                         metric.name
                                     );
-                                    rejected_data_points += data_point_count;
+                                    rejected_data_points += data_points_count;
                                     continue;
                                 };
 
-                                add_data_futures.push((
-                                    backend.add_data(DataUpdate {
-                                        log_sequence_number: None,
-                                        data: vec![record_batch],
-                                        update_type: UpdateType::Append,
-                                    }),
-                                    data_point_count,
-                                ));
+                                let add_data_future = backend.add_data(DataUpdate {
+                                    log_sequence_number: None,
+                                    data: vec![record_batch],
+                                    update_type: UpdateType::Append,
+                                });
+                                // We need to await the Future here in case it adds new columns to the schema and later metrics will need
+                                // to respect that schema.
+                                if let Err(e) = add_data_future.await {
+                                    rejected_data_points += data_points_count;
+                                    tracing::error!(
+                                        "Failed to add OpenTelemetry data to backend: {}",
+                                        e
+                                    );
+                                }
                             }
                             Err(e) => {
                                 tracing::error!(
@@ -118,13 +123,6 @@ impl MetricsService for Service {
                         }
                     }
                 }
-            }
-        }
-
-        for (add_data_future, data_points_count) in add_data_futures {
-            if let Err(e) = add_data_future.await {
-                rejected_data_points += data_points_count;
-                tracing::error!("Failed to add OpenTelemetry data to backend: {}", e);
             }
         }
 
@@ -146,7 +144,7 @@ impl MetricsService for Service {
     }
 }
 
-pub fn metric_data_to_record_batch(
+fn metric_data_to_record_batch(
     metric: &str,
     data: &Data,
     schema: &Option<Schema>,
