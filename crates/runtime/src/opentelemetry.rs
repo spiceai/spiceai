@@ -233,7 +233,7 @@ fn number_data_points_to_record_batch(
     }
 }
 
-macro_rules! handle_attribute {
+macro_rules! insert_attribute {
     ($columns:expr, $fields:expr, $key:expr, $value:expr, $builder_type:ty, $data_type:expr, $metric:expr) => {{
         let key_str = $key.as_str();
         match $columns.get_mut(key_str) {
@@ -275,7 +275,7 @@ fn attributes_to_fields_and_columns(
                 Some(any_value) => match &any_value.value {
                     Some(value) => match value {
                         any_value::Value::StringValue(string_value) => {
-                            handle_attribute!(
+                            insert_attribute!(
                                 columns,
                                 fields,
                                 attribute.key,
@@ -286,7 +286,7 @@ fn attributes_to_fields_and_columns(
                             );
                         }
                         any_value::Value::BoolValue(bool_value) => {
-                            handle_attribute!(
+                            insert_attribute!(
                                 columns,
                                 fields,
                                 attribute.key,
@@ -297,7 +297,7 @@ fn attributes_to_fields_and_columns(
                             );
                         }
                         any_value::Value::IntValue(int_value) => {
-                            handle_attribute!(
+                            insert_attribute!(
                                 columns,
                                 fields,
                                 attribute.key,
@@ -308,7 +308,7 @@ fn attributes_to_fields_and_columns(
                             );
                         }
                         any_value::Value::DoubleValue(double_value) => {
-                            handle_attribute!(
+                            insert_attribute!(
                                 columns,
                                 fields,
                                 attribute.key,
@@ -319,7 +319,7 @@ fn attributes_to_fields_and_columns(
                             );
                         }
                         any_value::Value::BytesValue(bytes_value) => {
-                            handle_attribute!(
+                            insert_attribute!(
                                 columns,
                                 fields,
                                 attribute.key,
