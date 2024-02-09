@@ -233,6 +233,31 @@ fn number_data_points_to_record_batch(
     }
 }
 
+macro_rules! handle_attribute {
+    ($columns:expr, $fields:expr, $key:expr, $value:expr, $builder_type:ty, $data_type:expr, $metric:expr) => {{
+        let key_str = $key.as_str();
+        match $columns.get_mut(key_str) {
+            None => {
+                $fields.insert($key.clone(), Field::new(key_str, $data_type, true));
+                let mut builder = <$builder_type>::new();
+                builder.append_value($value);
+                $columns.insert($key.clone(), Box::new(builder));
+            }
+            Some(column) => {
+                if let Some(builder) = column.as_any_mut().downcast_mut::<$builder_type>() {
+                    builder.append_value($value);
+                } else {
+                    tracing::error!(
+                        "Attribute defined multiple times with multiple types: {}.{}",
+                        $metric,
+                        key_str
+                    );
+                }
+            }
+        };
+    }};
+}
+
 #[allow(clippy::too_many_lines)]
 fn attributes_to_fields_and_columns(
     metric: &str,
@@ -250,134 +275,59 @@ fn attributes_to_fields_and_columns(
                 Some(any_value) => match &any_value.value {
                     Some(value) => match value {
                         any_value::Value::StringValue(string_value) => {
-                            match columns.get_mut(key_str) {
-                                None => {
-                                    fields.insert(
-                                        attribute.key.clone(),
-                                        Field::new(key_str, DataType::Utf8, true),
-                                    );
-                                    let mut string_builder = StringBuilder::new();
-                                    string_builder.append_value(string_value);
-                                    columns.insert(attribute.key.clone(), Box::new(string_builder));
-                                }
-                                Some(builder) => {
-                                    if let Some(string_builder) =
-                                        builder.as_any_mut().downcast_mut::<StringBuilder>()
-                                    {
-                                        string_builder.append_value(string_value);
-                                    } else {
-                                        tracing::error!(
-                                            "Attribute defined multiple times with multiple types: {metric}.{:?}",
-                                            key_str
-                                        );
-                                        continue;
-                                    }
-                                }
-                            };
+                            handle_attribute!(
+                                columns,
+                                fields,
+                                attribute.key,
+                                string_value,
+                                StringBuilder,
+                                DataType::Utf8,
+                                metric
+                            );
                         }
                         any_value::Value::BoolValue(bool_value) => {
-                            match columns.get_mut(key_str) {
-                                None => {
-                                    fields.insert(
-                                        attribute.key.clone(),
-                                        Field::new(key_str, DataType::Boolean, true),
-                                    );
-                                    let mut bool_builder = BooleanBuilder::new();
-                                    bool_builder.append_value(*bool_value);
-                                    columns.insert(attribute.key.clone(), Box::new(bool_builder));
-                                }
-                                Some(builder) => {
-                                    if let Some(bool_builder) =
-                                        builder.as_any_mut().downcast_mut::<BooleanBuilder>()
-                                    {
-                                        bool_builder.append_value(*bool_value);
-                                    } else {
-                                        tracing::error!(
-                                            "Attribute defined multiple times with multiple types: {metric}.{:?}",
-                                            key_str
-                                        );
-                                        continue;
-                                    }
-                                }
-                            };
+                            handle_attribute!(
+                                columns,
+                                fields,
+                                attribute.key,
+                                *bool_value,
+                                BooleanBuilder,
+                                DataType::Boolean,
+                                metric
+                            );
                         }
                         any_value::Value::IntValue(int_value) => {
-                            match columns.get_mut(key_str) {
-                                None => {
-                                    fields.insert(
-                                        attribute.key.clone(),
-                                        Field::new(key_str, DataType::Int64, true),
-                                    );
-                                    let mut int_builder = Int64Builder::new();
-                                    int_builder.append_value(*int_value);
-                                    columns.insert(attribute.key.clone(), Box::new(int_builder));
-                                }
-                                Some(builder) => {
-                                    if let Some(int_builder) =
-                                        builder.as_any_mut().downcast_mut::<Int64Builder>()
-                                    {
-                                        int_builder.append_value(*int_value);
-                                    } else {
-                                        tracing::error!(
-                                            "Attribute defined multiple times with multiple types: {metric}.{:?}",
-                                            key_str
-                                        );
-                                        continue;
-                                    }
-                                }
-                            };
+                            handle_attribute!(
+                                columns,
+                                fields,
+                                attribute.key,
+                                *int_value,
+                                Int64Builder,
+                                DataType::Int64,
+                                metric
+                            );
                         }
                         any_value::Value::DoubleValue(double_value) => {
-                            match columns.get_mut(key_str) {
-                                None => {
-                                    fields.insert(
-                                        attribute.key.clone(),
-                                        Field::new(key_str, DataType::Float64, true),
-                                    );
-                                    let mut double_builder = Float64Builder::new();
-                                    double_builder.append_value(*double_value);
-                                    columns.insert(attribute.key.clone(), Box::new(double_builder));
-                                }
-                                Some(builder) => {
-                                    if let Some(double_builder) =
-                                        builder.as_any_mut().downcast_mut::<Float64Builder>()
-                                    {
-                                        double_builder.append_value(*double_value);
-                                    } else {
-                                        tracing::error!(
-                                            "Attribute defined multiple times with multiple types: {metric}.{:?}",
-                                            key_str
-                                        );
-                                        continue;
-                                    }
-                                }
-                            };
+                            handle_attribute!(
+                                columns,
+                                fields,
+                                attribute.key,
+                                *double_value,
+                                Float64Builder,
+                                DataType::Float64,
+                                metric
+                            );
                         }
                         any_value::Value::BytesValue(bytes_value) => {
-                            match columns.get_mut(key_str) {
-                                None => {
-                                    fields.insert(
-                                        attribute.key.clone(),
-                                        Field::new(key_str, DataType::Binary, true),
-                                    );
-                                    let mut binary_builder = BinaryBuilder::new();
-                                    binary_builder.append_value(bytes_value);
-                                    columns.insert(attribute.key.clone(), Box::new(binary_builder));
-                                }
-                                Some(builder) => {
-                                    if let Some(binary_builder) =
-                                        builder.as_any_mut().downcast_mut::<BinaryBuilder>()
-                                    {
-                                        binary_builder.append_value(bytes_value);
-                                    } else {
-                                        tracing::error!(
-                                            "Attribute defined multiple times with multiple types: {metric}.{:?}",
-                                            key_str
-                                        );
-                                        continue;
-                                    }
-                                }
-                            };
+                            handle_attribute!(
+                                columns,
+                                fields,
+                                attribute.key,
+                                bytes_value,
+                                BinaryBuilder,
+                                DataType::Binary,
+                                metric
+                            );
                         }
                         // TODO: Support other attribute types
                         _ => {
