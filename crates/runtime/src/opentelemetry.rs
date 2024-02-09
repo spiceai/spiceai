@@ -261,7 +261,6 @@ macro_rules! append_attribute {
     }};
 }
 
-#[allow(clippy::too_many_lines)]
 fn attributes_to_fields_and_columns(
     metric: &str,
     attributes: Vec<&Vec<KeyValue>>,
