@@ -41,52 +41,59 @@ pub(crate) mod inference {
     use crate::model::Model;
     use app::App;
     use arrow::array::Float32Array;
-    use axum::{debug_handler, extract::Path, Extension, Json};
+    use axum::{
+        extract::Path,
+        http::StatusCode,
+        response::{IntoResponse, Response},
+        Extension, Json,
+    };
     use serde::Serialize;
     use std::sync::Arc;
     use std::time::Instant;
     use tract_core::tract_data::itertools::Itertools;
 
     #[derive(Serialize)]
-    pub struct Response {
+    pub struct JsonResponse {
         forecast: Vec<f32>,
         duration_ms: u128,
     }
 
-    #[debug_handler]
     pub(crate) async fn get(
         Extension(app): Extension<Arc<App>>,
         Extension(df): Extension<Arc<DataFusion>>,
         Path(name): Path<String>,
-    ) -> Json<Response> {
+    ) -> Response {
         let start_time = Instant::now();
 
         let model = app.models.iter().find(|m| m.name == name);
-        if model.is_none() {
-            return Json(Response {
-                forecast: Vec::new(),
-                duration_ms: start_time.elapsed().as_millis(),
-            });
+
+        let Some(model) = model else {
+            return (StatusCode::NOT_FOUND, format!("Model {name} not found")).into_response();
+        };
+
+        let Ok(runnable) = Model::load(model) else {
+            return (StatusCode::INTERNAL_SERVER_ERROR,).into_response();
+        };
+
+        match runnable.run(df).await {
+            Ok(inference_result) => match inference_result.column_by_name("y") {
+                Some(column_data) => match column_data.as_any().downcast_ref::<Float32Array>() {
+                    Some(array) => {
+                        let result = array.values().iter().copied().collect_vec();
+                        (
+                            StatusCode::OK,
+                            Json(JsonResponse {
+                                forecast: result,
+                                duration_ms: start_time.elapsed().as_millis(),
+                            }),
+                        )
+                            .into_response()
+                    }
+                    None => (StatusCode::INTERNAL_SERVER_ERROR,).into_response(),
+                },
+                None => (StatusCode::INTERNAL_SERVER_ERROR,).into_response(),
+            },
+            Err(_) => (StatusCode::INTERNAL_SERVER_ERROR,).into_response(),
         }
-
-        let runnable = Model::load(&(model.unwrap())).unwrap();
-        let result: Vec<f32> = runnable
-            .run(df)
-            .await
-            .unwrap()
-            .column_by_name("y")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<Float32Array>()
-            .unwrap()
-            .values()
-            .iter()
-            .copied()
-            .collect_vec();
-
-        Json(Response {
-            forecast: result,
-            duration_ms: start_time.elapsed().as_millis(),
-        })
     }
 }
