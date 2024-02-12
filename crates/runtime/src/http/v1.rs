@@ -47,7 +47,7 @@ pub(crate) mod inference {
         response::{IntoResponse, Response},
         Extension, Json,
     };
-    use serde::Serialize;
+    use serde::{Deserialize, Serialize};
     use std::sync::Arc;
     use std::time::Instant;
     use tract_core::tract_data::itertools::Itertools;
@@ -58,7 +58,7 @@ pub(crate) mod inference {
         duration_ms: u128,
     }
 
-    #[derive(Debug, Serialize)]
+    #[derive(Debug, Deserialize)]
     pub(crate) struct ModelQueryInfo {
         #[serde(default = "default_lookback")]
         lookback: usize,
