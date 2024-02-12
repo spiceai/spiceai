@@ -1,10 +1,10 @@
-use std::{fmt::Debug, sync::Arc};
+use std::{collections::HashMap, fmt::Debug, sync::Arc};
 
 use app::App;
 use snafu::prelude::*;
 use tokio::net::{TcpListener, ToSocketAddrs};
 
-use crate::datafusion::DataFusion;
+use crate::{datafusion::DataFusion, model::Model};
 
 mod routes;
 mod v1;
@@ -20,11 +20,16 @@ pub enum Error {
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
-pub(crate) async fn start<A>(bind_address: A, app: Arc<App>, df: Arc<DataFusion>) -> Result<()>
+pub(crate) async fn start<A>(
+    bind_address: A,
+    app: Arc<App>,
+    df: Arc<DataFusion>,
+    models: Arc<HashMap<String, Model>>,
+) -> Result<()>
 where
     A: ToSocketAddrs + Debug,
 {
-    let routes = routes::routes(app, df);
+    let routes = routes::routes(app, df, models);
 
     let listener = TcpListener::bind(&bind_address)
         .await

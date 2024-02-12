@@ -43,6 +43,7 @@ pub(crate) mod inference {
     use arrow::array::Float32Array;
     use axum::{debug_handler, extract::Path, Extension, Json};
     use serde::Serialize;
+    use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::Instant;
     use tract_core::tract_data::itertools::Itertools;
@@ -57,11 +58,12 @@ pub(crate) mod inference {
     pub(crate) async fn get(
         Extension(app): Extension<Arc<App>>,
         Extension(df): Extension<Arc<DataFusion>>,
+        Extension(models): Extension<Arc<HashMap<String, Model>>>,
         Path(name): Path<String>,
     ) -> Json<InferenceResponse> {
         let start_time = Instant::now();
 
-        let model = app.models.iter().find(|m| m.name == name);
+        let model = models.get(&name);
         if model.is_none() {
             return Json(InferenceResponse {
                 forecast: Vec::new(),
@@ -69,8 +71,8 @@ pub(crate) mod inference {
             });
         }
 
-        let runnable = Model::load(&(model.unwrap())).unwrap();
-        let result: Vec<f32> = runnable
+        let result: Vec<f32> = model
+            .unwrap()
             .run(df)
             .await
             .unwrap()

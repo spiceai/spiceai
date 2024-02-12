@@ -1,5 +1,6 @@
 #![allow(clippy::missing_errors_doc)]
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -8,6 +9,7 @@ use clap::Parser;
 use runtime::config::Config as RuntimeConfig;
 use runtime::datasource::DataSource;
 
+use runtime::model::Model;
 use runtime::{datasource, Runtime};
 use snafu::prelude::*;
 
@@ -144,7 +146,23 @@ pub async fn run(args: Args) -> Result<()> {
         tracing::info!("Loaded dataset: {}", ds.name);
     }
 
-    let rt: Runtime = Runtime::new(args.runtime, app, df);
+    let mut model_map = HashMap::with_capacity(app.models.len());
+    for m in &app.models {
+        match Model::load(m) {
+            Ok(in_m) => {
+                model_map.insert(m.name.clone(), in_m);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Unable to load runnable model from spicepod {}, error: {}",
+                    m.name.clone(),
+                    e
+                );
+            }
+        }
+    }
+
+    let rt: Runtime = Runtime::new(args.runtime, app, df, model_map);
 
     rt.start_servers()
         .await
