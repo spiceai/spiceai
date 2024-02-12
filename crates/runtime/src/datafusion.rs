@@ -72,6 +72,8 @@ pub struct DataFusion {
 impl DataFusion {
     #[must_use]
     pub fn new() -> Self {
+        let mut df_config = SessionConfig::new().with_information_schema(true);
+        df_config.options_mut().sql_parser.dialect = "PostgreSQL".to_string();
         DataFusion {
             ctx: Arc::new(SessionContext::new_with_config(
                 SessionConfig::new().with_information_schema(true),
