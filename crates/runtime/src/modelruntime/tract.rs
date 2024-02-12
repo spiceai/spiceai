@@ -3,16 +3,12 @@ use super::Runnable;
 use arrow::array::ArrayRef;
 use arrow::array::Float32Array;
 use arrow::array::Float64Array;
-use arrow::array::Int64Array;
 use arrow::datatypes::DataType;
 use arrow::datatypes::Field;
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
-use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
 use snafu::ResultExt;
-use std::fs::File;
 use std::sync::Arc;
-use std::time::Instant;
 
 use tract_core::tract_data::itertools::Itertools;
 use tract_onnx::prelude::*;
