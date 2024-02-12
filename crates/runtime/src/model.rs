@@ -8,7 +8,6 @@ use std::sync::Arc;
 
 pub struct Model {
     runnable: Box<dyn Runnable>,
-    inference_template: String,
     datasets: Vec<String>,
 }
 
@@ -51,7 +50,6 @@ impl Model {
 
                 return Ok(Self {
                     runnable: tract,
-                    inference_template: "select * from {{dataset}}".to_string(),
                     datasets: model.datasets.clone(),
                 });
             }
@@ -63,22 +61,16 @@ impl Model {
     }
 
     pub async fn run(&self, df: Arc<DataFusion>) -> Result<RecordBatch> {
-        // todo
-        tracing::info!("to be implemented {:?}", self.inference_template);
-        tracing::info!("to be implemented {:?}", self.datasets);
-
-        let sql = "select number as ts, (number::double / 100) as y, (number::double) / 100 as y2 from datafusion.public.eth_blocks order by ts desc limit 100";
+        let sql = format!("select * from datafusion.public.{}", self.datasets[0]);
 
         let data = df
             .ctx
-            .sql(sql)
+            .sql(&sql)
             .await
             .context(UnableToQuerySnafu {})?
             .collect()
             .await
             .context(UnableToQuerySnafu {})?;
-
-        // tracing::info!("{:?}", data);
 
         return Ok(self.runnable.run(data).unwrap());
     }
