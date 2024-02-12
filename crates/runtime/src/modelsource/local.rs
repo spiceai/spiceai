@@ -2,6 +2,7 @@ pub struct Local {}
 
 use super::ModelSource;
 use std::collections::HashMap;
+use std::string::ToString;
 use std::sync::Arc;
 
 impl ModelSource for Local {
@@ -10,7 +11,7 @@ impl ModelSource for Local {
             .as_ref()
             .as_ref()
             .and_then(|p| p.get("name"))
-            .map(std::string::ToString::to_string);
+            .map(ToString::to_string);
 
         let Some(name) = name else {
             return Err(super::Error::UnableToCreateModelPath {
@@ -27,7 +28,7 @@ impl ModelSource for Local {
             .as_ref()
             .as_ref()
             .and_then(|p| p.get("from"))
-            .map(std::string::ToString::to_string);
+            .map(ToString::to_string);
 
         let Some(path) = path else {
             return Err(super::Error::UnableToCreateModelPath {
