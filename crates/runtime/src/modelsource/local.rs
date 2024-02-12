@@ -6,9 +6,6 @@ use std::sync::Arc;
 
 impl ModelSource for Local {
     fn pull(&self, params: Arc<Option<HashMap<String, String>>>) -> super::Result<String> {
-        tracing::debug!("ModelSource::pull, {:?}", params);
-
-        // fetch name from params
         let name = params
             .as_ref()
             .as_ref()
