@@ -26,13 +26,12 @@ impl Model {
     pub fn source(&self) -> String {
         let from = self.from.clone();
 
-        // teset if from contains file:/
         if from.starts_with("file:/") {
             return "local".to_string();
         } else if from.starts_with("spice.ai") {
             return "spice.ai".to_string();
-        } else {
-            return "debug".to_string();
         }
+
+        "debug".to_string()
     }
 }

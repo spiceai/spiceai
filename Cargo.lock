@@ -3353,6 +3353,7 @@ dependencies = [
  "futures-core",
  "indexmap 2.2.2",
  "metrics",
+ "ndarray",
  "ndarray-npy",
  "opentelemetry-proto",
  "parquet",

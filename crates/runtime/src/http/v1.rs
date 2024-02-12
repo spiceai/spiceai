@@ -48,7 +48,7 @@ pub(crate) mod inference {
     use tract_core::tract_data::itertools::Itertools;
 
     #[derive(Serialize)]
-    pub struct InferenceResponse {
+    pub struct Response {
         forecast: Vec<f32>,
         duration_ms: u128,
     }
@@ -58,12 +58,12 @@ pub(crate) mod inference {
         Extension(app): Extension<Arc<App>>,
         Extension(df): Extension<Arc<DataFusion>>,
         Path(name): Path<String>,
-    ) -> Json<InferenceResponse> {
+    ) -> Json<Response> {
         let start_time = Instant::now();
 
         let model = app.models.iter().find(|m| m.name == name);
         if model.is_none() {
-            return Json(InferenceResponse {
+            return Json(Response {
                 forecast: Vec::new(),
                 duration_ms: start_time.elapsed().as_millis(),
             });
@@ -81,10 +81,10 @@ pub(crate) mod inference {
             .unwrap()
             .values()
             .iter()
-            .map(|v| *v)
+            .copied()
             .collect_vec();
 
-        Json(InferenceResponse {
+        Json(Response {
             forecast: result,
             duration_ms: start_time.elapsed().as_millis(),
         })

@@ -13,7 +13,7 @@ pub enum Error {
     #[snafu(display("Unable to find home directory"))]
     UnableToFindHomeDir {},
 
-    #[snafu(display("Unable to create modle path"))]
+    #[snafu(display("Unable to create model path"))]
     UnableToCreateModelPath { source: std::io::Error },
 }
 
@@ -32,5 +32,11 @@ pub fn ensure_model_path(name: &str) -> Result<String> {
         std::fs::create_dir_all(&model_path).context(UnableToCreateModelPathSnafu)?;
     }
 
-    Ok(model_path.to_str().unwrap().to_string())
+    let Some(model_path) = model_path.to_str() else {
+        return Err(Error::UnableToCreateModelSource {
+            source: "Unable to create model path".into(),
+        });
+    };
+
+    Ok(model_path.to_string())
 }

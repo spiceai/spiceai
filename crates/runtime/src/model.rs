@@ -17,13 +17,19 @@ pub enum Error {
     #[snafu(display("Unknown data source: {model_source}"))]
     UnknownDataSource { model_source: String },
 
-    #[snafu(display("Unable to load model"))]
-    UnableToLoadModel { source: crate::modelruntime::Error },
+    #[snafu(display("Unable to load model from path"))]
+    UnableToLoadModelFromPath { source: crate::modelsource::Error },
+
+    #[snafu(display("Unable to init model"))]
+    UnableToInitModel { source: crate::modelruntime::Error },
 
     #[snafu(display("Unable to query"))]
     UnableToQuery {
         source: datafusion::error::DataFusionError,
     },
+
+    #[snafu(display("Unable to run model"))]
+    UnableToRunModel { source: crate::modelruntime::Error },
 }
 
 impl Model {
@@ -38,20 +44,22 @@ impl Model {
         match source {
             "local" => {
                 let local = crate::modelsource::local::Local {};
-                let path = local.pull(Arc::new(Option::from(params)));
+                let path = local
+                    .pull(Arc::new(Option::from(params)))
+                    .context(UnableToLoadModelFromPathSnafu {})?;
 
-                let path = path.unwrap().clone();
+                let path = path.clone();
 
                 let tract = crate::modelruntime::tract::Tract {
                     path: path.to_string(),
                 }
                 .load()
-                .context(UnableToLoadModelSnafu {})?;
+                .context(UnableToInitModelSnafu {})?;
 
-                return Ok(Self {
+                Ok(Self {
                     runnable: tract,
                     datasets: model.datasets.clone(),
-                });
+                })
             }
             _ => UnknownDataSourceSnafu {
                 model_source: source,
@@ -72,6 +80,8 @@ impl Model {
             .await
             .context(UnableToQuerySnafu {})?;
 
-        return Ok(self.runnable.run(data).unwrap());
+        let result = self.runnable.run(data).context(UnableToRunModelSnafu {})?;
+
+        Ok(result)
     }
 }

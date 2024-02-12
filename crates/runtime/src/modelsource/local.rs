@@ -13,19 +13,34 @@ impl ModelSource for Local {
             .as_ref()
             .as_ref()
             .and_then(|p| p.get("name"))
-            .map(|n| n.to_string());
+            .map(std::string::ToString::to_string);
 
-        let _ = super::ensure_model_path(name.unwrap().as_str());
+        let Some(name) = name else {
+            return Err(super::Error::UnableToCreateModelPath {
+                source: std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "Unable to create model path",
+                ),
+            });
+        };
+
+        let _ = super::ensure_model_path(name.as_str());
 
         let path = params
             .as_ref()
             .as_ref()
             .and_then(|p| p.get("from"))
-            .map(|n| n.to_string());
+            .map(std::string::ToString::to_string);
 
-        // trim local path
-        let path = path.map(|p| p.trim_start_matches("file:").to_string());
+        let Some(path) = path else {
+            return Err(super::Error::UnableToCreateModelPath {
+                source: std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "Unable to create model path",
+                ),
+            });
+        };
 
-        return Ok(path.unwrap());
+        Ok(path.trim_start_matches("file:").to_string())
     }
 }

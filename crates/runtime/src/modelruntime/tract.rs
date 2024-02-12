@@ -17,22 +17,29 @@ pub struct Tract {
     pub path: String,
 }
 
-pub struct TractModel {
-    model: SimplePlan<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>,
+type Plan = SimplePlan<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>;
+pub struct Model {
+    model: Plan,
 }
 
-impl TractModel {
+impl Model {
     fn run_inference(
         &self,
-        reader: Vec<RecordBatch>,
+        reader: &[RecordBatch],
         lookback_size: usize,
     ) -> super::Result<RecordBatch> {
-        let schema = reader.first().unwrap().schema();
+        let return_schema = Schema::new(vec![Field::new("y", DataType::Float32, false)]);
+
+        let Some(first_record) = reader.first() else {
+            return Ok(RecordBatch::new_empty(Arc::new(return_schema)));
+        };
+
+        let schema = first_record.schema();
         let fields = schema.fields();
         let mut data: Vec<Vec<f64>> = fields.iter().map(|_| Vec::new()).collect_vec();
         let n_cols = data.len() - 1;
 
-        reader.iter().for_each(|batch| {
+        for batch in reader {
             batch
                 .columns()
                 .iter()
@@ -47,17 +54,15 @@ impl TractModel {
                         // TODO: Stop early if all columns have `lookback_size` data.
                         return;
                     }
-                    let col: Vec<f64> = a
-                        .as_any()
-                        .downcast_ref::<Float64Array>()
-                        .unwrap()
-                        .into_iter()
-                        .flatten()
-                        .collect_vec();
+
+                    let Some(float_col) = a.as_any().downcast_ref::<Float64Array>() else {
+                        return;
+                    };
+                    let col = float_col.into_iter().flatten().collect_vec();
                     let end_idx: usize = std::cmp::min(lookback_size - data[i].len(), col.len());
                     data[i].append(&mut col[..end_idx].to_vec().clone());
-                })
-        });
+                });
+        }
         let inp = data
             .iter()
             .enumerate()
@@ -72,53 +77,53 @@ impl TractModel {
 
         let small_vec: Tensor =
             tract_ndarray::Array2::from_shape_vec((1, lookback_size * n_cols), inp)
-                .unwrap()
+                .context(super::ShapeSnafu)?
                 .into();
 
         let output = self
             .model
             .run(tvec!(small_vec
                 .cast_to_dt(DatumType::F32)
-                .unwrap()
+                .context(super::TractSnafu)?
                 .deep_clone()
                 .into()))
-            .unwrap();
+            .context(super::TractSnafu)?;
 
         let result: Vec<f32> = output[0]
             .to_array_view::<f32>()
-            .unwrap()
+            .context(super::TractSnafu)?
             .iter()
-            .cloned()
+            .copied()
             .collect_vec();
 
-        Ok(RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new("y", DataType::Float32, false)])),
+        let record_batch = RecordBatch::try_new(
+            Arc::new(return_schema),
             vec![Arc::new(Float32Array::from(result))],
         )
-        .unwrap())
+        .context(super::ArrowSnafu)?;
+
+        Ok(record_batch)
     }
 }
 
 impl ModelRuntime for Tract {
     fn load(&self) -> super::Result<Box<dyn Runnable>> {
         let model = load_tract_model(self.path.as_str()).context(super::TractSnafu)?;
-        return Ok(Box::new(TractModel { model }));
+        Ok(Box::new(Model { model }))
     }
 }
 
-fn load_tract_model(
-    path: &str,
-) -> TractResult<SimplePlan<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>> {
-    return tract_onnx::onnx()
+fn load_tract_model(path: &str) -> TractResult<Plan> {
+    tract_onnx::onnx()
         .model_for_path(path)?
         .into_optimized()?
-        .with_input_fact(0, f32::fact([1, 20]).into())? // TODO: remove
-        .into_runnable();
+        .with_input_fact(0, f32::fact([1, 20]))? // TODO: remove
+        .into_runnable()
 }
 
-impl Runnable for TractModel {
-    fn run(&self, _input: Vec<RecordBatch>) -> super::Result<RecordBatch> {
+impl Runnable for Model {
+    fn run(&self, input: Vec<RecordBatch>) -> super::Result<RecordBatch> {
         let lookback_size = 10;
-        self.run_inference(_input, lookback_size)
+        self.run_inference(&input, lookback_size)
     }
 }
