@@ -2,6 +2,7 @@
 
 use std::env;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use app::App;
@@ -74,7 +75,7 @@ pub struct Args {
 
 pub async fn run(args: Args) -> Result<()> {
 
-    let current_dir = env::current_dir().unwrap();
+    let current_dir = env::current_dir().unwrap_or(PathBuf::from("."));
 
     let app = App::new(current_dir.clone()).context(UnableToConstructSpiceAppSnafu)?;
 
@@ -154,7 +155,7 @@ pub async fn run(args: Args) -> Result<()> {
 
     let pods_watcher = PodsWatcher::new(current_dir.clone());
 
-    let rt: Runtime = Runtime::new(args.runtime, app, df, pods_watcher);
+    let mut rt: Runtime = Runtime::new(args.runtime, app, df, pods_watcher);
 
     rt.start_pods_watcher()
         .context(UnableToInitializePodsWatcherSnafu)?;
