@@ -60,7 +60,7 @@ impl Runtime {
         );
         let flight_server_future = flight::start(self.config.flight_bind_address, self.df.clone());
         let open_telemetry_server_future =
-            opentelemetry::start(self.config.open_telemetry_bind_address);
+            opentelemetry::start(self.config.open_telemetry_bind_address, self.df.clone());
 
         tokio::select! {
             http_res = http_server_future => http_res.context(UnableToStartHttpServerSnafu),
