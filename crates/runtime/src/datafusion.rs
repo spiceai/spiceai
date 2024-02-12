@@ -12,7 +12,7 @@ use datafusion::sql::parser;
 use datafusion::sql::parser::DFParser;
 use datafusion::sql::sqlparser;
 use datafusion::sql::sqlparser::ast::{self, SetExpr, TableFactor};
-use datafusion::sql::sqlparser::dialect::AnsiDialect;
+use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use futures::StreamExt;
 use snafu::prelude::*;
 use spicepod::component::dataset::Dataset;
@@ -188,7 +188,7 @@ impl DataFusion {
         }
 
         let sql = dataset.sql.clone().unwrap_or_default();
-        let statements = DFParser::parse_sql_with_dialect(sql.as_str(), &AnsiDialect {})
+        let statements = DFParser::parse_sql_with_dialect(sql.as_str(), &PostgreSqlDialect {})
             .context(UnableToParseSqlSnafu)?;
         if statements.len() != 1 {
             return UnableToCreateViewSnafu {
