@@ -10,7 +10,7 @@ use datafusion::{
     physical_plan::collect,
     sql::{
         parser::DFParser,
-        sqlparser::{self, dialect::AnsiDialect},
+        sqlparser::{self, dialect::PostgreSqlDialect},
         TableReference,
     },
 };
@@ -122,7 +122,7 @@ impl MemTableUpdate {
             .context(UnableToAddDataSnafu)?;
 
         tracing::trace!("Inserting data with SQL: {sql_stmt}");
-        let statements = DFParser::parse_sql_with_dialect(&sql_stmt, &AnsiDialect {})
+        let statements = DFParser::parse_sql_with_dialect(&sql_stmt, &PostgreSqlDialect {})
             .context(UnableToParseSqlSnafu)?;
         for statement in statements {
             let plan = self
