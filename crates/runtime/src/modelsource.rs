@@ -16,7 +16,7 @@ pub enum Error {
     #[snafu(display("Unable to create model path"))]
     UnableToCreateModelPath { source: std::io::Error },
 
-    #[snafu(display("Unable to create model path"))]
+    #[snafu(display("Unable to load the configuration"))]
     UnableToLoadConfig {},
 }
 
