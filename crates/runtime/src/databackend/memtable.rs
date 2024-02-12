@@ -15,12 +15,15 @@ use datafusion::{
     },
 };
 
-use super::{AddDataResult, DataBackend};
+use super::{BackendAsyncResult, DataBackend};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Unable to add data"))]
     UnableToAddData { source: DataFusionError },
+
+    #[snafu(display("Unable to execute SQL statement"))]
+    UnableToExecuteSql { source: DataFusionError },
 
     UnableToParseSql {
         source: sqlparser::parser::ParserError,
@@ -45,10 +48,34 @@ impl MemTableBackend {
             name: name.to_owned(),
         }
     }
+
+    async fn sql(ctx: Arc<SessionContext>, sql: &str) -> Result<()> {
+        let statements = DFParser::parse_sql_with_dialect(sql, &AnsiDialect {})
+            .context(UnableToParseSqlSnafu)?;
+        for statement in statements {
+            let plan = ctx
+                .state()
+                .statement_to_plan(statement)
+                .await
+                .context(UnableToExecuteSqlSnafu)?;
+            let df = ctx
+                .execute_logical_plan(plan)
+                .await
+                .context(UnableToExecuteSqlSnafu)?;
+            let physical_plan = df
+                .create_physical_plan()
+                .await
+                .context(UnableToExecuteSqlSnafu)?;
+            collect(physical_plan, ctx.task_ctx())
+                .await
+                .context(UnableToExecuteSqlSnafu)?;
+        }
+        Ok(())
+    }
 }
 
 impl DataBackend for MemTableBackend {
-    fn add_data(&self, data_update: DataUpdate) -> AddDataResult {
+    fn add_data(&self, data_update: DataUpdate) -> BackendAsyncResult {
         Box::pin(async move {
             if data_update.data.is_empty() {
                 tracing::trace!("No data to add");
@@ -111,29 +138,7 @@ impl MemTableUpdate {
         };
 
         tracing::trace!("Inserting data with SQL: {sql_stmt}");
-        let statements = DFParser::parse_sql_with_dialect(&sql_stmt, &AnsiDialect {})
-            .context(UnableToParseSqlSnafu)?;
-        for statement in statements {
-            let plan = self
-                .ctx
-                .state()
-                .statement_to_plan(statement)
-                .await
-                .context(UnableToAddDataSnafu)?;
-            let df = self
-                .ctx
-                .execute_logical_plan(plan)
-                .await
-                .context(UnableToAddDataSnafu)?;
-            let physical_plan = df
-                .create_physical_plan()
-                .await
-                .context(UnableToAddDataSnafu)?;
-            let task_ctx = self.ctx.task_ctx();
-            collect(physical_plan, task_ctx.clone())
-                .await
-                .context(UnableToAddDataSnafu)?;
-        }
+        MemTableBackend::sql(Arc::clone(&self.ctx), &sql_stmt).await?;
 
         Ok(())
     }

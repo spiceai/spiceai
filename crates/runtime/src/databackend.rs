@@ -1,5 +1,5 @@
 use crate::dataupdate::DataUpdate;
-use datafusion::execution::context::SessionContext;
+use datafusion::{execution::context::SessionContext, logical_expr::Expr};
 use snafu::prelude::*;
 use spicepod::component::dataset::acceleration::{Engine, Mode};
 use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
@@ -13,19 +13,37 @@ pub mod memtable;
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Invalid configuration: {msg}"))]
-    InvalidConfiguration { msg: String },
+    InvalidConfiguration { msg: &'static str },
 
     #[snafu(display("Backend creation failed"))]
     BackendCreationFailed {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[snafu(display("Backend doesn't support deleting data"))]
+    BackendDeleteUnsupported,
 }
 
-pub type AddDataResult<'a> =
+pub type BackendAsyncResult<'a> =
     Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error>>> + Send + 'a>>;
 
 pub trait DataBackend: Send + Sync {
-    fn add_data(&self, data_update: DataUpdate) -> AddDataResult;
+    fn add_data(&self, data_update: DataUpdate) -> BackendAsyncResult;
+
+    fn set_primary_keys(&mut self, _primary_keys: Vec<String>) -> BackendAsyncResult {
+        Box::pin(async {
+            Err(Error::InvalidConfiguration {
+                msg: "Backend doesn't support setting primary keys",
+            }
+            .into())
+        })
+    }
+
+    /// Delete data from the backend matching the given filter
+    /// The filter is a list of expressions that are `ANDed` together
+    fn delete_data(&self, _delete_filter: &[Expr]) -> BackendAsyncResult {
+        Box::pin(async { Err(Error::BackendDeleteUnsupported.into()) })
+    }
 }
 
 impl dyn DataBackend {
@@ -41,7 +59,7 @@ impl dyn DataBackend {
             Engine::Arrow => match mode {
                 Mode::Memory => Ok(Box::new(MemTableBackend::new(Arc::clone(ctx), name))),
                 Mode::File => InvalidConfigurationSnafu {
-                    msg: "File mode not supported for Arrow engine".to_string(),
+                    msg: "File mode not supported for Arrow engine",
                 }
                 .fail()?,
             },

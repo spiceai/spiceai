@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     collections::HashMap,
     fmt, mem,
     sync::{Arc, PoisonError},
@@ -16,7 +17,7 @@ use spicepod::component::dataset::acceleration;
 
 use crate::dataupdate::{DataUpdate, UpdateType};
 
-use super::{AddDataResult, DataBackend};
+use super::{BackendAsyncResult, DataBackend};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -49,6 +50,7 @@ pub struct DuckDBBackend {
     name: String,
     pool: Arc<r2d2::Pool<DuckdbConnectionManager>>,
     create_mutex: std::sync::Mutex<()>,
+    primary_keys: Option<Vec<String>>,
 }
 
 pub enum Mode {
@@ -57,7 +59,7 @@ pub enum Mode {
 }
 
 impl DataBackend for DuckDBBackend {
-    fn add_data(&self, data_update: DataUpdate) -> AddDataResult {
+    fn add_data(&self, data_update: DataUpdate) -> BackendAsyncResult {
         let pool = Arc::clone(&self.pool);
         let name = self.name.clone();
         Box::pin(async move {
@@ -75,6 +77,24 @@ impl DataBackend for DuckDBBackend {
             duckdb_update.update()?;
 
             self.initialize_datafusion()?;
+            Ok(())
+        })
+    }
+
+    fn set_primary_keys(&mut self, primary_keys: Vec<String>) -> BackendAsyncResult {
+        Box::pin(async {
+            let _lock = self.create_mutex.lock().map_err(handle_poison)?;
+            let mut conn: r2d2::PooledConnection<DuckdbConnectionManager> =
+                self.pool.get().context(ConnectionPoolSnafu)?;
+
+            let tx = conn.transaction().context(DuckDBSnafu)?;
+
+            if Self::table_exists(&conn, &self.name) {
+                todo!("Set primary keys");
+            };
+
+            self.primary_keys = Some(primary_keys);
+
             Ok(())
         })
     }
@@ -107,6 +127,7 @@ impl DuckDBBackend {
             name,
             pool,
             create_mutex: std::sync::Mutex::new(()),
+            primary_keys: None,
         })
     }
 
@@ -129,6 +150,94 @@ impl DuckDBBackend {
         self.ctx
             .register_table(&self.name, Arc::new(table))
             .context(DataFusionSnafu)?;
+
+        Ok(())
+    }
+
+    fn insert_batch(
+        conn: &r2d2::PooledConnection<DuckdbConnectionManager>,
+        table_name: &str,
+        batch: RecordBatch,
+    ) -> Result<()> {
+        let params = arrow_recordbatch_to_query_params(batch);
+        let sql = format!(r#"INSERT INTO "{table_name}" SELECT * FROM arrow(?, ?)"#,);
+        tracing::trace!("{sql}");
+
+        conn.execute(&sql, params).context(DuckDBSnafu)?;
+
+        Ok(())
+    }
+
+    fn table_exists(
+        conn: &r2d2::PooledConnection<DuckdbConnectionManager>,
+        table_name: &str,
+    ) -> bool {
+        let sql = format!(
+            r#"SELECT EXISTS (
+              SELECT 1
+              FROM information_schema.tables 
+              WHERE table_name = '{table_name}'
+            )"#,
+        );
+        tracing::trace!("{sql}");
+
+        conn.query_row(&sql, [], |row| row.get::<usize, bool>(0))
+            .unwrap_or(false)
+    }
+
+    fn existing_primary_keys(
+        conn: &r2d2::PooledConnection<DuckdbConnectionManager>,
+        table_name: &str,
+    ) -> Option<Vec<String>> {
+        let sql = format!(
+            r#"SELECT column_name
+              FROM information_schema.table_constraints
+              WHERE table_name = '{table_name}'
+              AND constraint_type = 'PRIMARY KEY'"#,
+        );
+        tracing::trace!("{sql}");
+
+        let mut stmt = conn.prepare(&sql).context(DuckDBSnafu)?;
+        let mut rows = stmt.query([]).context(DuckDBSnafu)?;
+
+        let mut primary_keys = Vec::new();
+        while let Some(row) = rows.next().context(DuckDBSnafu)? {
+            primary_keys.push(row.get(0)?);
+        }
+
+        if primary_keys.is_empty() {
+            None
+        } else {
+            Some(primary_keys)
+        }
+    }
+
+    fn create_table(
+        conn: &r2d2::PooledConnection<DuckdbConnectionManager>,
+        name: &str,
+        batch: &mut Option<RecordBatch>,
+        primary_keys: Option<Vec<String>>,
+        drop_if_exists: bool,
+    ) -> Result<()> {
+        if DuckDBBackend::table_exists(conn, name) {
+            if drop_if_exists {
+                let sql = format!(r#"DROP TABLE "{name}""#);
+                tracing::trace!("{sql}");
+                conn.execute(&sql, []).context(DuckDBSnafu)?;
+            } else {
+                return Ok(());
+            }
+        }
+
+        let Some(batch) = batch.take() else {
+            return Ok(());
+        };
+
+        let arrow_params = arrow_recordbatch_to_query_params(batch);
+        let sql = format!(r#"CREATE TABLE "{name}" AS SELECT * FROM arrow(?, ?)"#,);
+        tracing::trace!("{sql}");
+
+        conn.execute(&sql, arrow_params).context(DuckDBSnafu)?;
 
         Ok(())
     }
@@ -161,85 +270,46 @@ struct DuckDBUpdate<'a> {
 
 impl<'a> DuckDBUpdate<'a> {
     fn update(&mut self) -> Result<()> {
+        let lock = self.create_mutex.lock().map_err(handle_poison)?;
+        let mut data = mem::take(&mut self.data);
+        let mut first_batch = data.pop();
+        if let None = first_batch {
+            return Ok(());
+        };
         match self.update_type {
-            UpdateType::Overwrite => self.create_table(true)?,
+            UpdateType::Overwrite => DuckDBBackend::create_table(
+                &self.duckdb_conn,
+                &self.name,
+                &mut first_batch,
+                None,
+                true,
+            )?,
             UpdateType::Append => {
-                if !self.table_exists() {
-                    self.create_table(false)?;
+                if !DuckDBBackend::table_exists(&self.duckdb_conn, &self.name) {
+                    DuckDBBackend::create_table(
+                        &self.duckdb_conn,
+                        &self.name,
+                        &mut first_batch,
+                        None,
+                        false,
+                    )?;
                 }
             }
         };
+        drop(lock);
 
-        let data = mem::take(&mut self.data);
+        match first_batch {
+            Some(batch) => DuckDBBackend::insert_batch(&self.duckdb_conn, &self.name, batch)?,
+            None => {}
+        }
+
         for batch in data {
-            self.insert_batch(batch)?;
+            DuckDBBackend::insert_batch(&self.duckdb_conn, &self.name, batch)?;
         }
 
         tracing::trace!("Processed update to DuckDB table {name}", name = self.name,);
 
         Ok(())
-    }
-
-    fn insert_batch(&self, batch: RecordBatch) -> Result<()> {
-        let params = arrow_recordbatch_to_query_params(batch);
-        let sql = format!(
-            r#"INSERT INTO "{name}" SELECT * FROM arrow(?, ?)"#,
-            name = self.name
-        );
-        tracing::trace!("{sql}");
-
-        self.duckdb_conn
-            .execute(&sql, params)
-            .context(DuckDBSnafu)?;
-
-        Ok(())
-    }
-
-    fn create_table(&mut self, drop_if_exists: bool) -> Result<()> {
-        let _lock = self.create_mutex.lock().map_err(handle_poison)?;
-
-        if self.table_exists() {
-            if drop_if_exists {
-                let sql = format!(r#"DROP TABLE "{}""#, self.name);
-                tracing::trace!("{sql}");
-                self.duckdb_conn.execute(&sql, []).context(DuckDBSnafu)?;
-            } else {
-                return Ok(());
-            }
-        }
-
-        let Some(batch) = self.data.pop() else {
-            return Ok(());
-        };
-
-        let arrow_params = arrow_recordbatch_to_query_params(batch);
-        let sql = format!(
-            r#"CREATE TABLE "{name}" AS SELECT * FROM arrow(?, ?)"#,
-            name = self.name
-        );
-        tracing::trace!("{sql}");
-
-        self.duckdb_conn
-            .execute(&sql, arrow_params)
-            .context(DuckDBSnafu)?;
-
-        Ok(())
-    }
-
-    fn table_exists(&self) -> bool {
-        let sql = format!(
-            r#"SELECT EXISTS (
-              SELECT 1
-              FROM information_schema.tables 
-              WHERE table_name = '{name}'
-            )"#,
-            name = self.name
-        );
-        tracing::trace!("{sql}");
-
-        self.duckdb_conn
-            .query_row(&sql, [], |row| row.get::<usize, bool>(0))
-            .unwrap_or(false)
     }
 }
 

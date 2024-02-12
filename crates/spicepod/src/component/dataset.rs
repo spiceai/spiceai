@@ -15,13 +15,18 @@ pub struct Dataset {
     pub sql: Option<String>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_keys: Option<Vec<String>>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_column: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<HashMap<String, String>>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acceleration: Option<acceleration::Acceleration>,
 
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    #[serde(rename = "dependsOn", default)]
     pub depends_on: Vec<String>,
 }
 
@@ -95,6 +100,8 @@ impl WithDependsOn<Dataset> for Dataset {
             from: self.from.clone(),
             name: self.name.clone(),
             sql: self.sql.clone(),
+            primary_keys: self.primary_keys.clone(),
+            time_column: self.time_column.clone(),
             params: self.params.clone(),
             acceleration: self.acceleration.clone(),
             depends_on: depends_on.to_vec(),

@@ -6,8 +6,7 @@ pub struct Model {
     pub from: String,
     pub name: String,
 
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    #[serde(rename = "datasets", default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub datasets: Vec<String>,
 }
 
