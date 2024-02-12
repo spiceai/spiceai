@@ -56,6 +56,11 @@ pub enum Error {
     UnableToParseSql {
         source: sqlparser::parser::ParserError,
     },
+
+    #[snafu(display("Unable to get table: {}", source))]
+    UnableToGetTable {
+        source: DataFusionError,
+    },
 }
 
 pub struct DataFusion {
@@ -132,6 +137,15 @@ impl DataFusion {
     #[must_use]
     pub fn has_backend(&self, dataset: &str) -> bool {
         self.backends.contains_key(dataset)
+    }
+
+    pub async fn get_arrow_schema(&self, dataset: &str) -> Result<arrow::datatypes::Schema> {
+        let data_frame = self
+            .ctx
+            .table(dataset)
+            .await
+            .context(UnableToGetTableSnafu)?;
+        Ok(arrow::datatypes::Schema::from(data_frame.schema()))
     }
 
     #[allow(clippy::needless_pass_by_value)]
