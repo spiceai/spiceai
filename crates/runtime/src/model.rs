@@ -1,6 +1,6 @@
 use crate::modelruntime::ModelRuntime;
 use crate::modelruntime::Runnable;
-use crate::modelsource::ModelSource;
+use crate::modelsource::create_source_from;
 use crate::DataFusion;
 use arrow::record_batch::RecordBatch;
 use snafu::prelude::*;
@@ -14,14 +14,19 @@ pub struct Model {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unknown data source: {model_source}"))]
-    UnknownDataSource { model_source: String },
+    UnknownModelSource {
+        source: crate::modelsource::Error,
+    },
 
     #[snafu(display("Unable to load model from path"))]
-    UnableToLoadModelFromPath { source: crate::modelsource::Error },
+    UnableToLoadModelFromPath {
+        source: crate::modelsource::Error,
+    },
 
     #[snafu(display("Unable to init model"))]
-    UnableToInitModel { source: crate::modelruntime::Error },
+    UnableToInitModel {
+        source: crate::modelruntime::Error,
+    },
 
     #[snafu(display("Unable to query"))]
     UnableToQuery {
@@ -29,7 +34,9 @@ pub enum Error {
     },
 
     #[snafu(display("Unable to run model"))]
-    UnableToRunModel { source: crate::modelruntime::Error },
+    UnableToRunModel {
+        source: crate::modelruntime::Error,
+    },
 }
 
 impl Model {
@@ -41,31 +48,21 @@ impl Model {
         params.insert("name".to_string(), model.name.to_string());
         params.insert("from".to_string(), model.from.to_string());
 
-        match source {
-            "localhost" => {
-                let local = crate::modelsource::local::Local {};
-                let path = local
-                    .pull(Arc::new(Option::from(params)))
-                    .context(UnableToLoadModelFromPathSnafu {})?;
-
-                let path = path.clone();
-
-                let tract = crate::modelruntime::tract::Tract {
-                    path: path.to_string(),
-                }
-                .load()
-                .context(UnableToInitModelSnafu {})?;
-
-                Ok(Self {
-                    runnable: tract,
-                    datasets: model.datasets.clone(),
-                })
-            }
-            _ => UnknownDataSourceSnafu {
-                model_source: source,
-            }
-            .fail()?,
+        let tract = crate::modelruntime::tract::Tract {
+            path: create_source_from(source)
+                .context(UnknownModelSourceSnafu)?
+                .pull(Arc::new(Option::from(params)))
+                .context(UnableToLoadModelFromPathSnafu)?
+                .clone()
+                .to_string(),
         }
+        .load()
+        .context(UnableToInitModelSnafu {})?;
+
+        Ok(Self {
+            runnable: tract,
+            datasets: model.datasets.clone(),
+        })
     }
 
     pub async fn run(&self, df: Arc<DataFusion>, lookback_size: usize) -> Result<RecordBatch> {

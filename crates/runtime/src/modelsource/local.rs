@@ -1,12 +1,12 @@
-pub struct Local {}
-
 use super::ModelSource;
+use crate::auth::AuthProvider;
 use std::collections::HashMap;
 use std::string::ToString;
 use std::sync::Arc;
 
+pub struct Local {}
 impl ModelSource for Local {
-    fn pull(&self, params: Arc<Option<HashMap<String, String>>>) -> super::Result<String> {
+    fn pull(&self, _: AuthProvider, params: Arc<Option<HashMap<String, String>>>) -> super::Result<String> {
         let name = params
             .as_ref()
             .as_ref()
