@@ -14,15 +14,11 @@ impl ModelSource for Local {
             .map(ToString::to_string);
 
         let Some(name) = name else {
-            return Err(super::Error::UnableToCreateModelPath {
-                source: std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "Unable to create model path",
-                ),
-            });
+            return Err(super::UnableToLoadConfigSnafu {}.build());
         };
 
-        let _ = super::ensure_model_path(name.as_str());
+        // it is not copying local model into .spice folder
+        let _ = super::ensure_model_path(name.as_str())?;
 
         let path = params
             .as_ref()
@@ -31,12 +27,7 @@ impl ModelSource for Local {
             .map(ToString::to_string);
 
         let Some(path) = path else {
-            return Err(super::Error::UnableToCreateModelPath {
-                source: std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "Unable to create model path",
-                ),
-            });
+            return Err(super::UnableToLoadConfigSnafu {}.build());
         };
 
         Ok(path.trim_start_matches("file:").to_string())

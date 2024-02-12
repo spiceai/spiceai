@@ -69,7 +69,10 @@ impl Model {
     }
 
     pub async fn run(&self, df: Arc<DataFusion>, lookback_size: usize) -> Result<RecordBatch> {
-        let sql = format!("select * from datafusion.public.{} order by ts asc", self.datasets[0]);
+        let sql = format!(
+            "select * from datafusion.public.{} order by ts asc",
+            self.datasets[0]
+        );
 
         let data = df
             .ctx

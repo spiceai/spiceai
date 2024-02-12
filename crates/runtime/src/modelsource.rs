@@ -15,6 +15,9 @@ pub enum Error {
 
     #[snafu(display("Unable to create model path"))]
     UnableToCreateModelPath { source: std::io::Error },
+
+    #[snafu(display("Unable to create model path"))]
+    UnableToLoadConfig {},
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
