@@ -42,26 +42,36 @@ pub(crate) mod inference {
     use app::App;
     use arrow::array::Float32Array;
     use axum::{debug_handler, extract::Path, Extension, Json};
-    use std::collections::HashMap;
+    use serde::Serialize;
     use std::sync::Arc;
+    use std::time::Instant;
+    use tract_core::tract_data::itertools::Itertools;
+
+    #[derive(Serialize)]
+    pub struct InferenceResponse {
+        forecast: Vec<f32>,
+        duration_ms: u128,
+    }
 
     #[debug_handler]
     pub(crate) async fn get(
         Extension(app): Extension<Arc<App>>,
         Extension(df): Extension<Arc<DataFusion>>,
         Path(name): Path<String>,
-    ) -> Json<HashMap<String, Vec<f32>>> {
+    ) -> Json<InferenceResponse> {
+        let start_time = Instant::now();
+
         let model = app.models.iter().find(|m| m.name == name);
-
-        let mut final_result: HashMap<String, Vec<f32>> = HashMap::new();
-
         if model.is_none() {
-            return Json(final_result);
+            return Json(InferenceResponse {
+                forecast: Vec::new(),
+                duration_ms: start_time.elapsed().as_millis(),
+            });
         }
 
         let runnable = Model::load(&(model.unwrap())).unwrap();
-        let result = runnable.run(df);
-        let a = result
+        let result: Vec<f32> = runnable
+            .run(df)
             .await
             .unwrap()
             .column_by_name("y")
@@ -69,15 +79,14 @@ pub(crate) mod inference {
             .as_any()
             .downcast_ref::<Float32Array>()
             .unwrap()
-            .clone();
+            .values()
+            .iter()
+            .map(|v| *v)
+            .collect_vec();
 
-        let mut return_val = Vec::new();
-        a.values().iter().for_each(|v| {
-            return_val.push(*v);
-        });
-
-        final_result.insert("forecast".to_string(), return_val);
-
-        Json(final_result)
+        Json(InferenceResponse {
+            forecast: result,
+            duration_ms: start_time.elapsed().as_millis(),
+        })
     }
 }
