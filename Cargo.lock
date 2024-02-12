@@ -3343,7 +3343,6 @@ dependencies = [
  "ndarray",
  "ndarray-npy",
  "opentelemetry-proto",
- "parquet",
  "r2d2",
  "serde",
  "snafu 0.8.0",

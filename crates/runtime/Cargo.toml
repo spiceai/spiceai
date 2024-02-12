@@ -36,7 +36,6 @@ tract-core = "0.21.0"
 tract-onnx = "0.21.0"
 ndarray-npy.workspace = true
 ndarray.workspace = true
-parquet = "49.0.0"
 duckdb = { git = "https://github.com/spicehq/duckdb-rs.git", rev = "8b57b1496eed1009c45734df7790960313d31e3d",  features = ["bundled", "r2d2", "vtab", "vtab-arrow"], optional = true }
 duckdb_datafusion = { path = "../duckdb_datafusion", optional = true }
 r2d2 = { version = "0.8.10", optional = true }
