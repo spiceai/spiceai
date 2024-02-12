@@ -486,7 +486,7 @@ fn initialize_attribute_schema(
 ) {
     if let Some(s) = existing_schema {
         for field in s.fields() {
-            // Skip value and time fields sbecause they are not attributes and are already handled.
+            // Skip value and time fields because they are not attributes and are already handled.
             if field.name() == VALUE_COLUMN_NAME
                 || field.name() == TIME_UNIX_NANO_COLUMN_NAME
                 || field.name() == START_TIME_UNIX_NANO_COLUMN_NAME
