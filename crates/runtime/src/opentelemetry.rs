@@ -9,6 +9,7 @@ use arrow::array::BooleanBuilder;
 use arrow::array::Float64Builder;
 use arrow::array::Int64Builder;
 use arrow::array::StringBuilder;
+use arrow::array::UInt64Builder;
 use arrow::datatypes::DataType;
 use arrow::datatypes::Field;
 use arrow::datatypes::Schema;
@@ -23,6 +24,7 @@ use opentelemetry_proto::tonic::common::v1::any_value;
 use opentelemetry_proto::tonic::common::v1::KeyValue;
 use opentelemetry_proto::tonic::metrics::v1::metric::Data;
 use opentelemetry_proto::tonic::metrics::v1::number_data_point::Value;
+use opentelemetry_proto::tonic::metrics::v1::DataPointFlags;
 use opentelemetry_proto::tonic::metrics::v1::NumberDataPoint;
 use snafu::prelude::*;
 use tonic_0_9_0::async_trait;
@@ -40,12 +42,12 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to serve"))]
+    #[snafu(display("Unable to serve: {source}"))]
     UnableToServe {
         source: tonic_0_9_0::transport::Error,
     },
 
-    #[snafu(display("Failed to build record batch from OpenTelemetry metrics: {}", source))]
+    #[snafu(display("Failed to build record batch from OpenTelemetry metrics: {source}"))]
     FailedToBuildRecordBatch { source: arrow::error::ArrowError },
 
     #[snafu(display("Unsupported metric data type"))]
@@ -56,7 +58,25 @@ pub enum Error {
 
     #[snafu(display("Metric with no data points"))]
     MetricWithNoDataPoints {},
+
+    #[snafu(display(
+        "Existing table for metric {metric} has unsupported `value` column data type {data_type} for data point type {data_point_type}"
+    ))]
+    UnsupportedExistingMetricValueColumnType {
+        metric: String,
+        data_type: DataType,
+        data_point_type: String,
+    },
+
+    #[snafu(display(
+        "First data point for metric {metric} has no value and therefore is not valid for establishing schema"
+    ))]
+    FirstMetricDataPointHasNoValue { metric: String },
 }
+
+const VALUE_COLUMN_NAME: &str = "value";
+const TIME_UNIX_NANO_COLUMN_NAME: &str = "time_unix_nano";
+const START_TIME_UNIX_NANO_COLUMN_NAME: &str = "start_time_unix_nano";
 
 pub struct Service {
     data_fusion: Arc<DataFusion>,
@@ -70,33 +90,52 @@ impl MetricsService for Service {
     ) -> std::result::Result<Response<ExportMetricsServiceResponse>, Status> {
         let mut rejected_data_points = 0;
         let mut total_data_points = 0;
-        let mut add_data_futures = Vec::new();
         for resource_metric in request.into_inner().resource_metrics {
             for scope_metric in resource_metric.scope_metrics {
                 for metric in scope_metric.metrics {
                     if let Some(data) = metric.data {
-                        let (record_batch_result, data_point_count) =
-                            metric_data_to_record_batch(metric.name.as_str(), &data);
-                        total_data_points += data_point_count;
+                        let existing_schema = match self
+                            .data_fusion
+                            .get_arrow_schema(metric.name.as_str())
+                            .await
+                        {
+                            Ok(schema) => Some(schema),
+                            Err(_) => None,
+                        };
+                        let (record_batch_result, data_points_count) = metric_data_to_record_batch(
+                            metric.name.as_str(),
+                            &data,
+                            &existing_schema,
+                        );
+                        total_data_points += data_points_count;
 
                         match record_batch_result {
                             Ok(record_batch) => {
                                 let Some(backend) =
                                     self.data_fusion.get_backend(metric.name.as_str())
                                 else {
-                                    tracing::warn!("No dataset defined for metric {}", metric.name);
-                                    rejected_data_points += data_point_count;
+                                    tracing::warn!(
+                                        "No dataset defined for metric {}, skipping",
+                                        metric.name
+                                    );
+                                    rejected_data_points += data_points_count;
                                     continue;
                                 };
 
-                                add_data_futures.push((
-                                    backend.add_data(DataUpdate {
-                                        log_sequence_number: None,
-                                        data: vec![record_batch],
-                                        update_type: UpdateType::Append,
-                                    }),
-                                    data_point_count,
-                                ));
+                                let add_data_future = backend.add_data(DataUpdate {
+                                    log_sequence_number: None,
+                                    data: vec![record_batch],
+                                    update_type: UpdateType::Append,
+                                });
+                                // We need to await the Future here in case it adds new columns to the schema and later metrics will need
+                                // to respect that schema.
+                                if let Err(e) = add_data_future.await {
+                                    rejected_data_points += data_points_count;
+                                    tracing::error!(
+                                        "Failed to add OpenTelemetry data to backend: {}",
+                                        e
+                                    );
+                                }
                             }
                             Err(e) => {
                                 tracing::error!(
@@ -107,13 +146,6 @@ impl MetricsService for Service {
                         }
                     }
                 }
-            }
-        }
-
-        for (add_data_future, data_points_count) in add_data_futures {
-            if let Err(e) = add_data_future.await {
-                rejected_data_points += data_points_count;
-                tracing::error!("Failed to add OpenTelemetry data to backend: {}", e);
             }
         }
 
@@ -135,14 +167,18 @@ impl MetricsService for Service {
     }
 }
 
-pub fn metric_data_to_record_batch(metric: &str, data: &Data) -> (Result<RecordBatch>, u64) {
+pub fn metric_data_to_record_batch(
+    metric: &str,
+    data: &Data,
+    existing_schema: &Option<Schema>,
+) -> (Result<RecordBatch>, u64) {
     match data {
         Data::Gauge(gauge) => (
-            number_data_points_to_record_batch(metric, &gauge.data_points),
+            number_data_points_to_record_batch(metric, &gauge.data_points, existing_schema),
             gauge.data_points.len() as u64,
         ),
         Data::Sum(sum) => (
-            number_data_points_to_record_batch(metric, &sum.data_points),
+            number_data_points_to_record_batch(metric, &sum.data_points, existing_schema),
             sum.data_points.len() as u64,
         ),
         // TODO: Support other metric data types
@@ -151,13 +187,13 @@ pub fn metric_data_to_record_batch(metric: &str, data: &Data) -> (Result<RecordB
 }
 
 macro_rules! append_value {
-    ($values_builder:expr, $data_points_type:expr, $value:expr, $builder_type:ty, $data_type:expr) => {
+    ($values_builder:expr, $data_points_type:expr, $value:expr, $builder_type:ty, $data_type:expr, $metric:expr) => {
         match &mut $values_builder {
             Some(builder) => {
                 if let Some(typed_builder) = builder.as_any_mut().downcast_mut::<$builder_type>() {
                     typed_builder.append_value(*$value);
                 } else {
-                    tracing::error!("Metric has data points with multiple types");
+                    tracing::warn!("Metric {} has data points with different types, skipping data point that introduces new type", $metric);
                     continue;
                 }
             }
@@ -171,62 +207,122 @@ macro_rules! append_value {
     };
 }
 
+#[allow(clippy::too_many_lines)]
 fn number_data_points_to_record_batch(
     metric: &str,
     data_points: &Vec<NumberDataPoint>,
+    existing_schema: &Option<Schema>,
 ) -> Result<RecordBatch> {
     let mut values_builder: Option<Box<dyn ArrayBuilder>> = None;
-    let mut data_points_type = DataType::Null;
+    let mut values_type = DataType::Null;
+    let mut time_unix_nano_builder = UInt64Builder::new();
+    let mut start_time_unix_nano_builder = UInt64Builder::new();
     let mut attributes = Vec::new();
+
+    if let Some(s) = existing_schema {
+        if let Ok(value_field) = s.field_with_name(VALUE_COLUMN_NAME) {
+            match value_field.data_type() {
+                DataType::Float64 => {
+                    values_builder = Some(Box::new(Float64Builder::new()));
+                    values_type = DataType::Float64;
+                }
+                DataType::Int64 => {
+                    values_builder = Some(Box::new(Int64Builder::new()));
+                    values_type = DataType::Int64;
+                }
+                _ => {
+                    return UnsupportedExistingMetricValueColumnTypeSnafu {
+                        metric,
+                        data_type: value_field.data_type().clone(),
+                        data_point_type: "NumberDataPoint",
+                    }
+                    .fail();
+                }
+            }
+        }
+    }
+
     for data_point in data_points {
         if let Some(value) = &data_point.value {
             match value {
                 Value::AsDouble(double_value) => {
                     append_value!(
                         values_builder,
-                        data_points_type,
+                        values_type,
                         double_value,
                         Float64Builder,
-                        DataType::Float64
+                        DataType::Float64,
+                        metric
                     );
                 }
                 Value::AsInt(int_value) => {
                     append_value!(
                         values_builder,
-                        data_points_type,
+                        values_type,
                         int_value,
                         Int64Builder,
-                        DataType::Int64
+                        DataType::Int64,
+                        metric
                     );
                 }
             }
         } else if let Some(builder) = &mut values_builder {
+            if (data_point.flags & DataPointFlags::NoRecordedValueMask as u32)
+                != DataPointFlags::NoRecordedValueMask as u32
+            {
+                tracing::warn!(
+                    "Metric {} has data point with no recorded value without flag set to indicate no recorded value, skipping",
+                    metric
+                );
+                continue;
+            }
+
             if let Some(float_64_builder) = builder.as_any_mut().downcast_mut::<Float64Builder>() {
                 float_64_builder.append_null();
             } else if let Some(int_64_builder) = builder.as_any_mut().downcast_mut::<Int64Builder>()
             {
                 int_64_builder.append_null();
             }
+        } else {
+            return FirstMetricDataPointHasNoValueSnafu { metric }.fail();
         }
-        attributes.extend(&data_point.attributes);
+        attributes.push(data_point.attributes.as_slice());
+        time_unix_nano_builder.append_value(data_point.time_unix_nano);
+        start_time_unix_nano_builder.append_value(data_point.start_time_unix_nano);
     }
 
     let mut columns: Vec<ArrayRef>;
-    let mut fields: Vec<Field>;
+    let mut fields: Vec<Arc<Field>>;
     if let Some(builder) = &mut values_builder {
-        fields = vec![Field::new("value", data_points_type, true)];
-        columns = vec![Arc::new(builder.finish())];
+        fields = vec![
+            Arc::new(Field::new(VALUE_COLUMN_NAME, values_type, true)),
+            Arc::new(Field::new(
+                TIME_UNIX_NANO_COLUMN_NAME,
+                DataType::UInt64,
+                true,
+            )),
+            Arc::new(Field::new(
+                START_TIME_UNIX_NANO_COLUMN_NAME,
+                DataType::UInt64,
+                true,
+            )),
+        ];
+        columns = vec![
+            Arc::new(builder.finish()),
+            Arc::new(time_unix_nano_builder.finish()),
+            Arc::new(start_time_unix_nano_builder.finish()),
+        ];
     } else {
         return MetricWithNoDataPointsSnafu.fail();
     }
 
     let (attribute_fields_map, attribute_columns_map) =
-        attributes_to_fields_and_columns(metric, attributes);
+        attributes_to_fields_and_columns(metric, attributes.as_slice(), existing_schema);
     fields.extend(
         attribute_fields_map
             .into_iter()
             .map(|(_, v)| v)
-            .collect::<Vec<Field>>(),
+            .collect::<Vec<Arc<Field>>>(),
     );
     columns.extend(
         attribute_columns_map
@@ -245,7 +341,10 @@ macro_rules! append_attribute {
         let key_str = $key.as_str();
         match $columns.get_mut(key_str) {
             None => {
-                $fields.insert($key.clone(), Field::new(key_str, $data_type, true));
+                $fields.insert(
+                    $key.clone(),
+                    Arc::new(Field::new(key_str, $data_type, true)),
+                );
                 let mut builder = <$builder_type>::new();
                 builder.append_value($value);
                 $columns.insert($key.clone(), Box::new(builder));
@@ -254,106 +353,168 @@ macro_rules! append_attribute {
                 if let Some(builder) = column.as_any_mut().downcast_mut::<$builder_type>() {
                     builder.append_value($value);
                 } else {
-                    tracing::error!(
-                        "Attribute defined multiple times with multiple types: {}.{}",
+                    tracing::warn!(
+                        "Metric {} has attribute {} with different types, appending null for attribute that introduces new type",
                         $metric,
                         key_str
                     );
+                    append_null(&mut $fields, &mut $columns, key_str);
                 }
             }
         };
     }};
 }
 
+#[allow(clippy::type_complexity)]
 fn attributes_to_fields_and_columns(
     metric: &str,
-    attributes: Vec<&KeyValue>,
+    attributes: &[&[KeyValue]],
+    existing_schema: &Option<Schema>,
 ) -> (
-    IndexMap<String, Field>,
+    IndexMap<String, Arc<Field>>,
     IndexMap<String, Box<dyn ArrayBuilder>>,
 ) {
-    let mut fields: IndexMap<String, Field> = IndexMap::new();
+    let mut fields: IndexMap<String, Arc<Field>> = IndexMap::new();
     let mut columns: IndexMap<String, Box<dyn ArrayBuilder>> = IndexMap::new();
-    for attribute in attributes {
-        let key_str = attribute.key.as_str();
-        match &attribute.value {
-            Some(any_value) => match &any_value.value {
-                Some(value) => match value {
-                    any_value::Value::StringValue(string_value) => {
-                        append_attribute!(
-                            columns,
-                            fields,
-                            attribute.key,
-                            string_value,
-                            StringBuilder,
-                            DataType::Utf8,
-                            metric
-                        );
-                    }
-                    any_value::Value::BoolValue(bool_value) => {
-                        append_attribute!(
-                            columns,
-                            fields,
-                            attribute.key,
-                            *bool_value,
-                            BooleanBuilder,
-                            DataType::Boolean,
-                            metric
-                        );
-                    }
-                    any_value::Value::IntValue(int_value) => {
-                        append_attribute!(
-                            columns,
-                            fields,
-                            attribute.key,
-                            *int_value,
-                            Int64Builder,
-                            DataType::Int64,
-                            metric
-                        );
-                    }
-                    any_value::Value::DoubleValue(double_value) => {
-                        append_attribute!(
-                            columns,
-                            fields,
-                            attribute.key,
-                            *double_value,
-                            Float64Builder,
-                            DataType::Float64,
-                            metric
-                        );
-                    }
-                    any_value::Value::BytesValue(bytes_value) => {
-                        append_attribute!(
-                            columns,
-                            fields,
-                            attribute.key,
-                            bytes_value,
-                            BinaryBuilder,
-                            DataType::Binary,
-                            metric
-                        );
-                    }
-                    // TODO: Support List and Map attribute types
-                    _ => {
-                        tracing::error!(
-                            "Unsupported metric attribute type for {metric}.{:?}",
-                            attribute
+
+    initialize_attribute_schema(&mut fields, &mut columns, existing_schema);
+
+    for (i, inner_attributes) in attributes.iter().enumerate() {
+        for attribute in *inner_attributes {
+            let key_str = attribute.key.as_str();
+            match &attribute.value {
+                Some(any_value) => match &any_value.value {
+                    Some(value) => match value {
+                        any_value::Value::StringValue(string_value) => {
+                            append_attribute!(
+                                columns,
+                                fields,
+                                attribute.key,
+                                string_value,
+                                StringBuilder,
+                                DataType::Utf8,
+                                metric
+                            );
+                        }
+                        any_value::Value::BoolValue(bool_value) => {
+                            append_attribute!(
+                                columns,
+                                fields,
+                                attribute.key,
+                                *bool_value,
+                                BooleanBuilder,
+                                DataType::Boolean,
+                                metric
+                            );
+                        }
+                        any_value::Value::IntValue(int_value) => {
+                            append_attribute!(
+                                columns,
+                                fields,
+                                attribute.key,
+                                *int_value,
+                                Int64Builder,
+                                DataType::Int64,
+                                metric
+                            );
+                        }
+                        any_value::Value::DoubleValue(double_value) => {
+                            append_attribute!(
+                                columns,
+                                fields,
+                                attribute.key,
+                                *double_value,
+                                Float64Builder,
+                                DataType::Float64,
+                                metric
+                            );
+                        }
+                        any_value::Value::BytesValue(bytes_value) => {
+                            append_attribute!(
+                                columns,
+                                fields,
+                                attribute.key,
+                                bytes_value,
+                                BinaryBuilder,
+                                DataType::Binary,
+                                metric
+                            );
+                        }
+                        // TODO: Support List and Map attribute types
+                        _ => {
+                            tracing::warn!(
+                                "Metric {metric} has attribute {key_str} with unsupported type, appending null for attribute if possible"
+                            );
+                            append_null(&mut fields, &mut columns, key_str);
+                        }
+                    },
+                    None => {
+                        tracing::warn!(
+                            "Metric {metric} has attribute {key_str} with no value, appending null for attribute if possible"
                         );
                         append_null(&mut fields, &mut columns, key_str);
                     }
                 },
                 None => {
+                    tracing::warn!(
+                        "Metric {metric} has attribute {key_str} with no value, appending null for attribute if possible"
+                    );
                     append_null(&mut fields, &mut columns, key_str);
                 }
-            },
-            None => {
-                append_null(&mut fields, &mut columns, key_str);
+            };
+        }
+
+        // If an attribute previously existed but is missing from this metric, append a null value.
+        let mut needs_null = Vec::new();
+        for (column_name, column_values) in columns.as_slice() {
+            if column_values.len() < i + 1 {
+                needs_null.push(column_name.clone());
             }
-        };
+        }
+        for column_name in needs_null {
+            append_null(&mut fields, &mut columns, column_name.as_str());
+        }
     }
 
     (fields, columns)
+}
+
+fn initialize_attribute_schema(
+    fields: &mut IndexMap<String, Arc<Field>>,
+    columns: &mut IndexMap<String, Box<dyn ArrayBuilder>>,
+    existing_schema: &Option<Schema>,
+) {
+    if let Some(s) = existing_schema {
+        for field in s.fields() {
+            // Skip value and time fields because they are not attributes and are already handled.
+            if field.name() == VALUE_COLUMN_NAME
+                || field.name() == TIME_UNIX_NANO_COLUMN_NAME
+                || field.name() == START_TIME_UNIX_NANO_COLUMN_NAME
+            {
+                continue;
+            }
+
+            fields.insert(field.name().clone(), field.clone());
+            match field.data_type() {
+                DataType::Utf8 => {
+                    columns.insert(field.name().clone(), Box::new(StringBuilder::new()));
+                }
+                DataType::Boolean => {
+                    columns.insert(field.name().clone(), Box::new(BooleanBuilder::new()));
+                }
+                DataType::Int64 => {
+                    columns.insert(field.name().clone(), Box::new(Int64Builder::new()));
+                }
+                DataType::Float64 => {
+                    columns.insert(field.name().clone(), Box::new(Float64Builder::new()));
+                }
+                DataType::Binary => {
+                    columns.insert(field.name().clone(), Box::new(BinaryBuilder::new()));
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 macro_rules! append_null {
@@ -367,7 +528,7 @@ macro_rules! append_null {
 }
 
 fn append_null(
-    fields: &mut IndexMap<String, Field>,
+    fields: &mut IndexMap<String, Arc<Field>>,
     columns: &mut IndexMap<String, Box<dyn ArrayBuilder>>,
     key: &str,
 ) {
