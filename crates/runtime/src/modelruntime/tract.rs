@@ -1,5 +1,4 @@
-use super::ModelRuntime;
-use super::Runnable;
+use super::{ModelRuntime, Runnable};
 use arrow::array::ArrayRef;
 use arrow::array::Float32Array;
 use arrow::array::Float64Array;
