@@ -7,6 +7,7 @@ use arrow::datatypes::DataType;
 use arrow::datatypes::Field;
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
+use snafu::prelude::*;
 use snafu::ResultExt;
 use std::sync::Arc;
 
@@ -17,14 +18,24 @@ pub struct Tract {
     pub path: String,
 }
 
+#[derive(Debug, Snafu)]
+pub enum Error {
+    TractError { source: tract_core::anyhow::Error },
+
+    ArrowError { source: arrow::error::ArrowError },
+
+    ShapeError { source: ndarray::ShapeError },
+}
+pub type Result<T, E = Error> = std::result::Result<T, E>;
+
 type Plan = SimplePlan<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>;
 pub struct Model {
     model: Plan,
 }
 
 impl ModelRuntime for Tract {
-    fn load(&self) -> super::Result<Box<dyn Runnable>> {
-        let model = load_tract_model(self.path.as_str()).context(super::TractSnafu)?;
+    fn load(&self) -> std::result::Result<Box<dyn Runnable>, super::Error> {
+        let model = load_tract_model(self.path.as_str()).context(TractSnafu)?;
         Ok(Box::new(Model { model }))
     }
 }
@@ -38,7 +49,11 @@ fn load_tract_model(path: &str) -> TractResult<Plan> {
 }
 
 impl Runnable for Model {
-    fn run(&self, input: Vec<RecordBatch>, lookback_size: usize) -> super::Result<RecordBatch> {
+    fn run(
+        &self,
+        input: Vec<RecordBatch>,
+        lookback_size: usize,
+    ) -> std::result::Result<RecordBatch, super::Error> {
         {
             let this = &self;
             let reader: &[RecordBatch] = &input;
@@ -92,21 +107,21 @@ impl Runnable for Model {
 
             let small_vec: Tensor =
                 tract_ndarray::Array2::from_shape_vec((1, lookback_size * n_cols), inp)
-                    .context(super::ShapeSnafu)?
+                    .context(ShapeSnafu)?
                     .into();
 
             let output = this
                 .model
                 .run(tvec!(small_vec
                     .cast_to_dt(DatumType::F32)
-                    .context(super::TractSnafu)?
+                    .context(TractSnafu)?
                     .deep_clone()
                     .into()))
-                .context(super::TractSnafu)?;
+                .context(TractSnafu)?;
 
             let result: Vec<f32> = output[0]
                 .to_array_view::<f32>()
-                .context(super::TractSnafu)?
+                .context(TractSnafu)?
                 .iter()
                 .copied()
                 .collect_vec();
@@ -115,7 +130,7 @@ impl Runnable for Model {
                 Arc::new(return_schema),
                 vec![Arc::new(Float32Array::from(result))],
             )
-            .context(super::ArrowSnafu)?;
+            .context(ArrowSnafu)?;
 
             Ok(record_batch)
         }
