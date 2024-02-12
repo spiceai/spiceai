@@ -27,9 +27,9 @@ impl Model {
         let from = self.from.clone();
 
         if from.starts_with("file:/") {
-            return "local".to_string();
+            return "localhost".to_string();
         } else if from.starts_with("spice.ai") {
-            return "spice.ai".to_string();
+            return "spiceai".to_string();
         }
 
         "debug".to_string()

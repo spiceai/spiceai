@@ -14,7 +14,7 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub trait Runnable: Send + Sync {
-    fn run(&self, input: Vec<RecordBatch>) -> Result<RecordBatch>;
+    fn run(&self, input: Vec<RecordBatch>, loopback_size: usize) -> Result<RecordBatch>;
 }
 
 pub trait ModelRuntime {

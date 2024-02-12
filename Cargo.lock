@@ -3797,8 +3797,6 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "tract-core",
- "tract-onnx",
 ]
 
 [[package]]

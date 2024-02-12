@@ -42,7 +42,7 @@ impl Model {
         params.insert("from".to_string(), model.from.to_string());
 
         match source {
-            "local" => {
+            "localhost" => {
                 let local = crate::modelsource::local::Local {};
                 let path = local
                     .pull(Arc::new(Option::from(params)))
@@ -68,7 +68,7 @@ impl Model {
         }
     }
 
-    pub async fn run(&self, df: Arc<DataFusion>) -> Result<RecordBatch> {
+    pub async fn run(&self, df: Arc<DataFusion>, lookback_size: usize) -> Result<RecordBatch> {
         let sql = format!("select * from datafusion.public.{}", self.datasets[0]);
 
         let data = df
@@ -80,7 +80,10 @@ impl Model {
             .await
             .context(UnableToQuerySnafu {})?;
 
-        let result = self.runnable.run(data).context(UnableToRunModelSnafu {})?;
+        let result = self
+            .runnable
+            .run(data, lookback_size)
+            .context(UnableToRunModelSnafu {})?;
 
         Ok(result)
     }
