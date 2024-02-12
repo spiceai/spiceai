@@ -3,12 +3,17 @@ use super::Runnable;
 use arrow::array::ArrayRef;
 use arrow::array::Float32Array;
 use arrow::array::Float64Array;
+use arrow::array::Int64Array;
 use arrow::datatypes::DataType;
 use arrow::datatypes::Field;
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
+use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder};
 use snafu::ResultExt;
+use std::fs::File;
 use std::sync::Arc;
+use std::time::Instant;
+
 use tract_core::tract_data::itertools::Itertools;
 use tract_onnx::prelude::*;
 
@@ -46,7 +51,6 @@ impl TractModel {
                         // TODO: Stop early if all columns have `lookback_size` data.
                         return;
                     }
-
                     let col: Vec<f64> = a
                         .as_any()
                         .downcast_ref::<Float64Array>()
@@ -63,10 +67,13 @@ impl TractModel {
             .enumerate()
             .filter(|(i, _)| schema.field(*i).name() != "ts") //: (usize, ArrayRef)
             .map(|(_, x)| x)
-            .fold(Vec::new(), |mut acc: Vec<f64>, b| {
-                acc.extend(b);
+            .fold(Vec::new(), |mut acc: Vec<f64>, b: &Vec<f64>| {
+                let mut c = b.clone();
+                c.reverse();
+                acc.extend(c);
                 acc
             });
+
         let small_vec: Tensor =
             tract_ndarray::Array2::from_shape_vec((1, lookback_size * n_cols), inp)
                 .unwrap()
@@ -95,10 +102,10 @@ impl TractModel {
         .unwrap())
     }
 }
+
 impl ModelRuntime for Tract {
     fn load(&self) -> super::Result<Box<dyn Runnable>> {
         let model = load_tract_model(self.path.as_str()).context(super::TractSnafu)?;
-
         return Ok(Box::new(TractModel { model }));
     }
 }
