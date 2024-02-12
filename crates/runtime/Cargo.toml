@@ -36,6 +36,7 @@ duckdb = { git = "https://github.com/spicehq/duckdb-rs.git", rev = "8b57b1496eed
 duckdb_datafusion = { path = "../duckdb_datafusion", optional = true }
 r2d2 = { version = "0.8.10", optional = true }
 opentelemetry-proto = { version = "0.4.0", features = ["gen-tonic-messages", "gen-tonic", "metrics"] }
+notify = "6.1.1"
 
 [features]
 default = ["duckdb"]

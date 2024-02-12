@@ -1,5 +1,6 @@
 #![allow(clippy::missing_errors_doc)]
 
+use std::env;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -8,6 +9,7 @@ use clap::Parser;
 use runtime::config::Config as RuntimeConfig;
 use runtime::datasource::DataSource;
 
+use runtime::podswatcher::PodsWatcher;
 use runtime::{datasource, Runtime};
 use snafu::prelude::*;
 
@@ -47,6 +49,9 @@ pub enum Error {
 
     #[snafu(display("Unable to create data backend"))]
     UnableToCreateBackend { source: runtime::datafusion::Error },
+
+    #[snafu(display("Failed to start pods watcher: {source}"))]
+    UnableToInitializePodsWatcher { source: runtime::NotifyError },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -68,7 +73,10 @@ pub struct Args {
 }
 
 pub async fn run(args: Args) -> Result<()> {
-    let app = App::new(".").context(UnableToConstructSpiceAppSnafu)?;
+
+    let current_dir = env::current_dir().unwrap();
+
+    let app = App::new(current_dir.clone()).context(UnableToConstructSpiceAppSnafu)?;
 
     let mut auth = runtime::auth::AuthProviders::default();
     match auth.parse_from_config() {
@@ -144,7 +152,12 @@ pub async fn run(args: Args) -> Result<()> {
         tracing::info!("Loaded dataset: {}", ds.name);
     }
 
-    let rt: Runtime = Runtime::new(args.runtime, app, df);
+    let pods_watcher = PodsWatcher::new(current_dir.clone());
+
+    let rt: Runtime = Runtime::new(args.runtime, app, df, pods_watcher);
+
+    rt.start_pods_watcher()
+        .context(UnableToInitializePodsWatcherSnafu)?;
 
     rt.start_servers()
         .await

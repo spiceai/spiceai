@@ -1,6 +1,6 @@
 #![allow(clippy::missing_errors_doc)]
 
-use std::sync::Arc;
+use std::{cell::RefCell, sync::Arc};
 
 use config::Config;
 use snafu::prelude::*;
@@ -18,6 +18,8 @@ mod flight;
 mod http;
 pub mod modelformat;
 mod opentelemetry;
+pub mod podswatcher;
+pub use notify::Error as NotifyError;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -37,15 +39,17 @@ pub struct Runtime {
     pub app: Arc<app::App>,
     pub config: config::Config,
     pub df: Arc<DataFusion>,
+    pub pods_watcher: RefCell<podswatcher::PodsWatcher>,
 }
 
 impl Runtime {
     #[must_use]
-    pub fn new(config: Config, app: app::App, df: DataFusion) -> Self {
+    pub fn new(config: Config, app: app::App, df: DataFusion, pods_watcher: podswatcher::PodsWatcher) -> Self {
         Runtime {
             app: Arc::new(app),
             config,
             df: Arc::new(df),
+            pods_watcher: RefCell::new(pods_watcher),
         }
     }
 
@@ -64,6 +68,27 @@ impl Runtime {
                 Ok(())
             },
         }
+    }
+
+    pub fn start_pods_watcher(&self) -> notify::Result<()> {
+        let mut current_app = self.app.clone();
+
+        let handle_event = move |event: podswatcher::PodsWatcherEvent| {
+            match event {
+                podswatcher::PodsWatcherEvent::PodsUpdated(new_app) => {
+                    tracing::info!("updated pods information: {:?}", new_app);
+                    tracing::info!("previous pods information: {:?}", current_app);
+
+                    // TODO: update runtime based on current_app vs new_app info
+
+                    current_app = Arc::new(new_app);
+                }
+            }
+        };
+
+        self.pods_watcher.borrow_mut().watch(handle_event)?;
+
+        Ok(())
     }
 }
 
