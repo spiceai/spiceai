@@ -4,6 +4,8 @@ use app::App;
 use snafu::prelude::*;
 use tokio::net::{TcpListener, ToSocketAddrs};
 
+use crate::datafusion::DataFusion;
+
 mod routes;
 mod v1;
 
@@ -18,11 +20,11 @@ pub enum Error {
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
-pub(crate) async fn start<A>(bind_address: A, app: Arc<App>) -> Result<()>
+pub(crate) async fn start<A>(bind_address: A, app: Arc<App>, df: Arc<DataFusion>) -> Result<()>
 where
     A: ToSocketAddrs + Debug,
 {
-    let routes = routes::routes(app);
+    let routes = routes::routes(app, df);
 
     let listener = TcpListener::bind(&bind_address)
         .await

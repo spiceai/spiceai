@@ -16,7 +16,10 @@ pub mod datasource;
 pub mod dataupdate;
 mod flight;
 mod http;
+pub mod model;
 pub mod modelformat;
+pub mod modelruntime;
+pub mod modelsource;
 mod opentelemetry;
 
 #[derive(Debug, Snafu)]
@@ -50,7 +53,11 @@ impl Runtime {
     }
 
     pub async fn start_servers(&self) -> Result<()> {
-        let http_server_future = http::start(self.config.http_bind_address, self.app.clone());
+        let http_server_future = http::start(
+            self.config.http_bind_address,
+            self.app.clone(),
+            self.df.clone(),
+        );
         let flight_server_future = flight::start(self.config.flight_bind_address, self.df.clone());
         let open_telemetry_server_future =
             opentelemetry::start(self.config.open_telemetry_bind_address, self.df.clone());

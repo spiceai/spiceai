@@ -20,3 +20,18 @@ impl WithDependsOn<Model> for Model {
         }
     }
 }
+
+impl Model {
+    #[must_use]
+    pub fn source(&self) -> String {
+        let from = self.from.clone();
+
+        if from.starts_with("file:/") {
+            return "localhost".to_string();
+        } else if from.starts_with("spice.ai") {
+            return "spiceai".to_string();
+        }
+
+        "debug".to_string()
+    }
+}
