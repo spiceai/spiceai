@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::{future::Future, pin::Pin};
 use std::{sync::Arc, time::Duration};
 
-use super::{DataSource, DataUpdate, UpdateType};
+use super::{DataConnector, DataUpdate, UpdateType};
 use arrow::{
     array::{Int32Array, StringArray},
     datatypes::{DataType, Field, Schema},
@@ -17,7 +17,7 @@ use spicepod::component::dataset::Dataset;
 #[allow(clippy::module_name_repetitions)]
 pub struct DebugSource {}
 
-impl DataSource for DebugSource {
+impl DataConnector for DebugSource {
     fn new(
         _auth_provider: AuthProvider,
         _params: Arc<Option<HashMap<String, String>>>,

@@ -21,14 +21,14 @@ pub mod spiceai;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    UnableToCreateDataSource {
+    UnableToCreateDataConnector {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// A `DataSource` knows how to retrieve data for a given dataset.
+/// A `DataConnector` knows how to retrieve and modify data for a given dataset.
 ///
 /// Implementing `get_all_data` is required, but `stream_data_updates` & `supports_data_streaming` is optional.
 /// If `stream_data_updates` is not supported for a dataset, the runtime will fall back to polling `get_all_data` and returning a
@@ -40,8 +40,8 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 ///    update_type: UpdateType::Overwrite,
 /// }
 /// ```
-pub trait DataSource: Send + Sync {
-    /// Create a new `DataSource` with the given `AuthProvider`.
+pub trait DataConnector: Send + Sync {
+    /// Create a new `DataConnector` with the given `AuthProvider`.
     fn new(
         auth_provider: AuthProvider,
         params: Arc<Option<HashMap<String, String>>>,
@@ -49,7 +49,7 @@ pub trait DataSource: Send + Sync {
     where
         Self: Sized;
 
-    /// Returns true if the given dataset supports streaming by this `DataSource`.
+    /// Returns true if the given dataset supports streaming by this `DataConnector`.
     fn supports_data_streaming(&self, _dataset: &Dataset) -> bool {
         false
     }
@@ -65,7 +65,7 @@ pub trait DataSource: Send + Sync {
         dataset: &Dataset,
     ) -> Pin<Box<dyn Future<Output = Vec<RecordBatch>> + Send>>;
 
-    /// Returns true if the given dataset supports writing data back to this `DataSource`.
+    /// Returns true if the given dataset supports writing data back to this `DataConnector`.
     fn supports_data_writes(&self, _dataset: &Dataset) -> bool {
         false
     }
@@ -80,7 +80,7 @@ pub trait DataSource: Send + Sync {
     }
 }
 
-impl dyn DataSource + '_ {
+impl dyn DataConnector + '_ {
     pub fn get_data<'a>(&'a self, dataset: &'a Dataset) -> BoxStream<'_, DataUpdate> {
         let refresh_mode = dataset
             .acceleration

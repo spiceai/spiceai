@@ -14,8 +14,8 @@ pub struct Model {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unknown data source: {model_source}"))]
-    UnknownDataSource { model_source: String },
+    #[snafu(display("Unknown model source: {model_source}"))]
+    UnknownModelSource { model_source: String },
 
     #[snafu(display("Unable to load model from path"))]
     UnableToLoadModelFromPath { source: crate::modelsource::Error },
@@ -61,7 +61,7 @@ impl Model {
                     datasets: model.datasets.clone(),
                 })
             }
-            _ => UnknownDataSourceSnafu {
+            _ => UnknownModelSourceSnafu {
                 model_source: source,
             }
             .fail()?,

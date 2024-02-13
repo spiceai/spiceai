@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::databackend::{self, DataBackend};
-use crate::datasource::DataSource;
+use crate::dataconnector::DataConnector;
 use datafusion::datasource::ViewTable;
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::SessionConfig;
@@ -154,7 +154,7 @@ impl DataFusion {
     pub fn attach(
         &mut self,
         dataset: &Dataset,
-        data_source: &'static mut dyn DataSource,
+        data_connector: &'static mut dyn DataConnector,
         backend: Box<dyn DataBackend>,
     ) -> Result<()> {
         let table_name = dataset.name.as_str();
@@ -165,7 +165,7 @@ impl DataFusion {
 
         let dataset_clone = dataset.clone();
         let task_handle = task::spawn(async move {
-            let mut stream = data_source.get_data(&dataset_clone);
+            let mut stream = data_connector.get_data(&dataset_clone);
             loop {
                 let future_result = stream.next().await;
                 match future_result {

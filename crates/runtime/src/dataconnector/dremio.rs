@@ -7,13 +7,13 @@ use spicepod::component::dataset::Dataset;
 
 use crate::auth::AuthProvider;
 
-use super::{flight::Flight, DataSource};
+use super::{flight::Flight, DataConnector};
 
 pub struct Dremio {
     flight: Flight,
 }
 
-impl DataSource for Dremio {
+impl DataConnector for Dremio {
     fn new(
         auth_provider: AuthProvider,
         params: Arc<Option<HashMap<String, String>>>,
@@ -26,7 +26,7 @@ impl DataSource for Dremio {
                 .as_ref() // &Option<HashMap<String, String>>
                 .as_ref() // Option<&HashMap<String, String>>
                 .and_then(|params| params.get("endpoint").cloned())
-                .ok_or_else(|| super::Error::UnableToCreateDataSource {
+                .ok_or_else(|| super::Error::UnableToCreateDataConnector {
                     source: "Missing required parameter: endpoint".into(),
                 })?;
             let flight_client = FlightClient::new(
@@ -35,7 +35,7 @@ impl DataSource for Dremio {
                 auth_provider.get_param("password").unwrap_or_default(),
             )
             .await
-            .map_err(|e| super::Error::UnableToCreateDataSource { source: e.into() })?;
+            .map_err(|e| super::Error::UnableToCreateDataConnector { source: e.into() })?;
             let flight = Flight::new(flight_client);
             Ok(Self { flight })
         })
