@@ -20,6 +20,7 @@ use super::{AddDataResult, DataBackend};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
+    #[snafu(display("DuckDBError: {source}"))]
     DuckDBError {
         source: duckdb::Error,
     },
