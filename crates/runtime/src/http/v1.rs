@@ -83,12 +83,9 @@ pub(crate) mod inference {
             return (StatusCode::NOT_FOUND, format!("Model {name} not found")).into_response();
         };
 
-        let runnable = match models.get(&model.name) {
-            Some(model) => model,
-            None => {
-                tracing::debug!("Model {name} not found");
-                return (StatusCode::NOT_FOUND, format!("Model {name} not found")).into_response();
-            }
+        let Some(runnable) = models.get(&model.name) else {
+            tracing::debug!("Model {name} not found");
+            return (StatusCode::NOT_FOUND, format!("Model {name} not found")).into_response();
         };
 
         match runnable.run(df, params.lookback).await {
