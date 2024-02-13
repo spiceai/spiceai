@@ -36,7 +36,6 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 ///
 /// ```rust
 /// DataUpdate {
-///    log_sequence_number: None,
 ///    data: get_all_data(dataset),
 ///    update_type: UpdateType::Overwrite,
 /// }
@@ -65,6 +64,20 @@ pub trait DataSource: Send + Sync {
         &self,
         dataset: &Dataset,
     ) -> Pin<Box<dyn Future<Output = Vec<RecordBatch>> + Send>>;
+
+    /// Returns true if the given dataset supports writing data back to this `DataSource`.
+    fn supports_data_writes(&self, _dataset: &Dataset) -> bool {
+        false
+    }
+
+    /// Adds data ingested locally back to the source.
+    fn add_data(
+        &self,
+        dataset: &Dataset,
+        _data: DataUpdate,
+    ) -> Pin<Box<dyn Future<Output = Result<()>>>> {
+        panic!("add_data not implemented for {}", dataset.name)
+    }
 }
 
 impl dyn DataSource + '_ {
