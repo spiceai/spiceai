@@ -6,7 +6,11 @@ use std::sync::Arc;
 
 pub struct Local {}
 impl ModelSource for Local {
-    fn pull(&self, _: AuthProvider, params: Arc<Option<HashMap<String, String>>>) -> super::Result<String> {
+    fn pull(
+        &self,
+        _: AuthProvider,
+        params: Arc<Option<HashMap<String, String>>>,
+    ) -> super::Result<String> {
         let name = params
             .as_ref()
             .as_ref()

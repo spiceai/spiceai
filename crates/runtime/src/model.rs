@@ -1,3 +1,4 @@
+use crate::auth::AuthProvider;
 use crate::modelruntime::ModelRuntime;
 use crate::modelruntime::Runnable;
 use crate::modelsource::create_source_from;
@@ -40,7 +41,7 @@ pub enum Error {
 }
 
 impl Model {
-    pub fn load(model: &spicepod::component::model::Model) -> Result<Self> {
+    pub fn load(model: &spicepod::component::model::Model, auth: AuthProvider) -> Result<Self> {
         let source = model.source();
         let source = source.as_str();
 
@@ -51,7 +52,7 @@ impl Model {
         let tract = crate::modelruntime::tract::Tract {
             path: create_source_from(source)
                 .context(UnknownModelSourceSnafu)?
-                .pull(Arc::new(Option::from(params)))
+                .pull(auth, Arc::new(Option::from(params)))
                 .context(UnableToLoadModelFromPathSnafu)?
                 .clone()
                 .to_string(),
@@ -66,14 +67,14 @@ impl Model {
     }
 
     pub async fn run(&self, df: Arc<DataFusion>, lookback_size: usize) -> Result<RecordBatch> {
-        let sql = format!(
-            "select * from datafusion.public.{} order by ts asc",
-            self.datasets[0]
-        );
-
         let data = df
             .ctx
-            .sql(&sql)
+            .sql(
+                &(format!(
+                    "select * from datafusion.public.{} order by ts asc",
+                    self.datasets[0]
+                )),
+            )
             .await
             .context(UnableToQuerySnafu {})?
             .collect()

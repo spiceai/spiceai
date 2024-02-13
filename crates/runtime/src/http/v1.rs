@@ -48,8 +48,8 @@ pub(crate) mod inference {
         Extension, Json,
     };
     use serde::{Deserialize, Serialize};
-    use std::sync::Arc;
     use std::time::Instant;
+    use std::{collections::HashMap, sync::Arc};
     use tract_core::tract_data::itertools::Itertools;
 
     #[derive(Serialize)]
@@ -73,6 +73,7 @@ pub(crate) mod inference {
         Extension(df): Extension<Arc<DataFusion>>,
         Path(name): Path<String>,
         Query(params): Query<ModelQueryInfo>,
+        Extension(models): Extension<Arc<HashMap<String, Model>>>,
     ) -> Response {
         let start_time = Instant::now();
 
@@ -82,8 +83,12 @@ pub(crate) mod inference {
             return (StatusCode::NOT_FOUND, format!("Model {name} not found")).into_response();
         };
 
-        let Ok(runnable) = Model::load(model) else {
-            return (StatusCode::INTERNAL_SERVER_ERROR,).into_response();
+        let runnable = match models.get(&model.name) {
+            Some(model) => model,
+            None => {
+                tracing::debug!("Model {name} not found");
+                return (StatusCode::NOT_FOUND, format!("Model {name} not found")).into_response();
+            }
         };
 
         match runnable.run(df, params.lookback).await {
