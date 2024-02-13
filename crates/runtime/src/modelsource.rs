@@ -1,8 +1,10 @@
+use crate::auth::AuthProvider;
 use snafu::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 pub mod local;
+pub mod spiceai;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -10,20 +12,33 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    #[snafu(display("Unable to load the model: {source}"))]
+    UnableToFetchModel { source: reqwest::Error },
+
+    #[snafu(display("Unable to parse metadata"))]
+    UnableToParseMetadata {},
+
     #[snafu(display("Unable to find home directory"))]
     UnableToFindHomeDir {},
 
-    #[snafu(display("Unable to create model path"))]
+    #[snafu(display("Unable to create model path: {source}"))]
     UnableToCreateModelPath { source: std::io::Error },
 
-    #[snafu(display("Unable to load the configuration"))]
-    UnableToLoadConfig {},
+    #[snafu(display("Unable to load the configuration: {reason}"))]
+    UnableToLoadConfig { reason: String },
+
+    #[snafu(display("Unknown data source: {model_source}"))]
+    UnknownModelSource { model_source: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub trait ModelSource {
-    fn pull(&self, params: Arc<Option<HashMap<String, String>>>) -> Result<String>;
+    fn pull(
+        &self,
+        auth_provider: AuthProvider,
+        params: Arc<Option<HashMap<String, String>>>,
+    ) -> Result<String>;
 }
 
 pub fn ensure_model_path(name: &str) -> Result<String> {
@@ -42,4 +57,15 @@ pub fn ensure_model_path(name: &str) -> Result<String> {
     };
 
     Ok(model_path.to_string())
+}
+
+pub fn create_source_from(source: &str) -> Result<Box<dyn ModelSource>> {
+    match source {
+        "localhost" => Ok(Box::new(local::Local {})),
+        "spice.ai" => Ok(Box::new(spiceai::SpiceAI {})),
+        _ => UnknownModelSourceSnafu {
+            model_source: source,
+        }
+        .fail(),
+    }
 }
