@@ -7,6 +7,7 @@ Spice.ai is built upon a foundation of first principles.
 - Developer experience first
 - Bring data and ML to your application
 - API first
+- Composable from community driven-components
 - First class extensibility
 
 ### Developer experience first
@@ -20,6 +21,10 @@ Instead of sending valuable application data into another service, bring data an
 ### API first
 
 All functionality is available through the HTTP API on the Spice.ai runtime: `spiced`
+
+### Composable from community driven-components
+
+A Spice.ai project consists of Datasets and Models, which are composable through community built-components available through the spicerack.org registry or defined locally.
 
 ### First class extensibility
 
