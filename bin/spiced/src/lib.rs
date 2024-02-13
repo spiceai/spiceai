@@ -151,6 +151,7 @@ pub async fn run(args: Args) -> Result<()> {
         match Model::load(m, auth.get(m.source().as_str())) {
             Ok(in_m) => {
                 model_map.insert(m.name.clone(), in_m);
+                tracing::info!("Loaded model: {}", m.name);
             }
             Err(e) => {
                 tracing::warn!(
