@@ -19,8 +19,8 @@ pub enum Error {
         source: crate::modelsource::Error,
     },
 
-    #[snafu(display("Unable to load model from path"))]
-    UnableToLoadModelFromPath {
+    #[snafu(display("Unable to load model from path: {}", source))]
+    UnableToLoadModel {
         source: crate::modelsource::Error,
     },
 
@@ -53,7 +53,7 @@ impl Model {
             path: create_source_from(source)
                 .context(UnknownModelSourceSnafu)?
                 .pull(auth, Arc::new(Option::from(params)))
-                .context(UnableToLoadModelFromPathSnafu)?
+                .context(UnableToLoadModelSnafu)?
                 .clone()
                 .to_string(),
         }

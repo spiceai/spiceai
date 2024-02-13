@@ -12,14 +12,20 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    #[snafu(display("Unable to load the model: {source}"))]
+    UnableToFetchModel { source: reqwest::Error },
+
+    #[snafu(display("Unable to parse metadata"))]
+    UnableToParseMetadata {},
+
     #[snafu(display("Unable to find home directory"))]
     UnableToFindHomeDir {},
 
-    #[snafu(display("Unable to create model path"))]
+    #[snafu(display("Unable to create model path: {source}"))]
     UnableToCreateModelPath { source: std::io::Error },
 
-    #[snafu(display("Unable to load the configuration"))]
-    UnableToLoadConfig {},
+    #[snafu(display("Unable to load the configuration: {reason}"))]
+    UnableToLoadConfig { reason: String },
 
     #[snafu(display("Unknown data source: {model_source}"))]
     UnknownModelSource { model_source: String },
@@ -56,7 +62,7 @@ pub fn ensure_model_path(name: &str) -> Result<String> {
 pub fn create_source_from(source: &str) -> Result<Box<dyn ModelSource>> {
     match source {
         "localhost" => Ok(Box::new(local::Local {})),
-        "spiceai" => Ok(Box::new(spiceai::SpiceAI {})),
+        "spice.ai" => Ok(Box::new(spiceai::SpiceAI {})),
         _ => UnknownModelSourceSnafu {
             model_source: source,
         }

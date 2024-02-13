@@ -1,5 +1,6 @@
 #![allow(clippy::missing_errors_doc)]
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -149,14 +150,14 @@ pub async fn run(args: Args) -> Result<()> {
     for m in &app.models {
         match Model::load(m, auth.get(m.source().as_str())) {
             Ok(in_m) => {
-                model_map.insert(m.name, in_m);
+                model_map.insert(m.name.clone(), in_m);
             }
             Err(e) => {
                 tracing::warn!(
                     "Unable to load runnable model from spicepod {}, error: {}",
                     m.name,
+                    e,
                 );
-                e;
             }
         }
     }

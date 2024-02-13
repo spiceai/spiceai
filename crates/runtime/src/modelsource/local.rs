@@ -18,7 +18,10 @@ impl ModelSource for Local {
             .map(ToString::to_string);
 
         let Some(name) = name else {
-            return Err(super::UnableToLoadConfigSnafu {}.build());
+            return Err(super::UnableToLoadConfigSnafu {
+                reason: "name is required",
+            }
+            .build());
         };
 
         // it is not copying local model into .spice folder
@@ -31,7 +34,10 @@ impl ModelSource for Local {
             .map(ToString::to_string);
 
         let Some(path) = path else {
-            return Err(super::UnableToLoadConfigSnafu {}.build());
+            return Err(super::UnableToLoadConfigSnafu {
+                reason: "from is required",
+            }
+            .build());
         };
 
         Ok(path.trim_start_matches("file:").to_string())
