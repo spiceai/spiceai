@@ -74,7 +74,6 @@ pub struct Args {
 }
 
 pub async fn run(args: Args) -> Result<()> {
-
     let current_dir = env::current_dir().unwrap_or(PathBuf::from("."));
 
     let app = App::new(current_dir.clone()).context(UnableToConstructSpiceAppSnafu)?;

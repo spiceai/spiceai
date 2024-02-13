@@ -47,12 +47,17 @@ pub struct Runtime {
 
 impl Runtime {
     #[must_use]
-    pub fn new(config: Config, app: app::App, df: DataFusion, pods_watcher: podswatcher::PodsWatcher) -> Self {
+    pub fn new(
+        config: Config,
+        app: app::App,
+        df: DataFusion,
+        pods_watcher: podswatcher::PodsWatcher,
+    ) -> Self {
         Runtime {
             app: Arc::new(app),
             config,
             df: Arc::new(df),
-            pods_watcher: pods_watcher,
+            pods_watcher,
         }
     }
 
