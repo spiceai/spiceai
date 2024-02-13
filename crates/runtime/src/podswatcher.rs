@@ -1,5 +1,5 @@
 use notify::{event::{CreateKind, ModifyKind, RemoveKind}, EventKind, RecursiveMode, Watcher};
-use std::path::{PathBuf};
+use std::path::PathBuf;
 
 use app::App;
 
@@ -14,7 +14,6 @@ pub struct PodsWatcher {
 }
 
 impl PodsWatcher {
-   
     #[must_use]
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self {
@@ -29,13 +28,27 @@ impl PodsWatcher {
     {
         let root_path = self.root_path.clone();
 
+        let root_spicepod_path = vec![
+            root_path.join("spicepod.yaml"),
+            root_path.join("spicepod.yml"),
+        ];
+
+        let mut watch_paths = get_watch_paths(&root_path);
+
         let mut watcher = notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
             match res {
                 Ok(event) => {
-                    if !is_spicepods_modification_event(&root_path, &event) {
+                    if !is_spicepods_modification_event(&watch_paths, &event) {
                         return;
                     }
                     tracing::debug!("Detected pods content changes: {:?}", event);
+
+                    // check if main spicepod file has been modified to update watching paths
+                    for event_path in event.paths.iter() {
+                        if root_spicepod_path.iter().any(|dir| event_path.eq(dir)) {
+                            watch_paths = get_watch_paths(&root_path);
+                        }
+                    }
 
                     if let Ok(app) = App::new(root_path.clone()) {
                         event_handler(PodsWatcherEvent::PodsUpdated(app));
@@ -55,14 +68,51 @@ impl PodsWatcher {
     }
 }
 
-fn is_spicepods_modification_event(app_path: impl Into<PathBuf>, event: &notify::Event) -> bool {
-   let root_dir = app_path.into();
-    
-    let spicepod_paths = vec![
-        root_dir.join("spicepods/"),
+fn get_watch_paths(app_path: impl Into<PathBuf>) -> Vec<PathBuf> {
+
+    let root_dir: PathBuf = app_path.into();
+
+    let mut dirs = vec![
+        // self.root_path.join("spicepods/"),
         root_dir.join("spicepod.yaml"),
         root_dir.join("spicepod.yml"),
     ];
+
+    // attempt to open root spicepod definition file
+    if let Ok(spicepod) = spicepod::Spicepod::load_definition(&root_dir) {
+        // watch dependencies
+        for dep in spicepod.dependencies {
+            let dep_path = root_dir.join("spicepods").join(dep);
+            dirs.push(dep_path);
+        }
+
+        // watch ref datasets folders
+        for dataset in spicepod.datasets {
+            match dataset {
+                spicepod::component::ComponentOrReference::Reference(reference) => {
+                    let ref_path = root_dir.join(&reference.r#ref);
+                    dirs.push(root_dir.join(ref_path));
+                }
+                _ => { /* ignore component */ }
+            }
+        }
+
+        // watch ref datasets folders
+        for model in spicepod.models {
+            match model {
+                spicepod::component::ComponentOrReference::Reference(reference) => {
+                    let ref_path = root_dir.join(&reference.r#ref);
+                    dirs.push(root_dir.join(ref_path));
+                }
+                _ => { /* ignore component */ }
+            }
+        }
+    }
+    
+    dirs
+}
+
+fn is_spicepods_modification_event(spicepod_paths: &Vec<PathBuf>, event: &notify::Event) -> bool {
     
     match event.kind {
         EventKind::Create(CreateKind::File) |
