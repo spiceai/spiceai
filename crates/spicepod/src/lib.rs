@@ -79,6 +79,27 @@ impl Spicepod {
             resolved_models,
         ))
     }
+
+    pub fn load_definition(path: impl Into<PathBuf>) -> Result<SpicepodDefinition> {
+        Self::load_definition_from(&reader::StdFileSystem, path)
+    }
+
+    pub fn load_definition_from<T>(
+        fs: &impl reader::ReadableYaml<T>,
+        path: impl Into<PathBuf>,
+    ) -> Result<SpicepodDefinition> {
+        let path = path.into();
+        let path_str = path.to_string_lossy().to_string();
+
+        let spicepod_rdr = fs
+            .open_yaml(&path_str, "spicepod")
+            .ok_or_else(|| Error::SpicepodNotFound { path: path.clone() })?;
+
+        let spicepod_definition: SpicepodDefinition =
+            serde_yaml::from_reader(spicepod_rdr).context(UnableToParseSpicepodSnafu)?;
+
+        Ok(spicepod_definition)
+    }
 }
 
 #[must_use]

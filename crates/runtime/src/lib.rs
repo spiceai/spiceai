@@ -22,6 +22,8 @@ pub mod modelformat;
 pub mod modelruntime;
 pub mod modelsource;
 mod opentelemetry;
+pub mod podswatcher;
+pub use notify::Error as NotifyError;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -42,6 +44,7 @@ pub struct Runtime {
     pub config: config::Config,
     pub df: Arc<DataFusion>,
     pub models: Arc<HashMap<String, Model>>,
+    pub pods_watcher: podswatcher::PodsWatcher,
 }
 
 impl Runtime {
@@ -51,12 +54,14 @@ impl Runtime {
         app: app::App,
         df: DataFusion,
         models: HashMap<String, Model>,
+        pods_watcher: podswatcher::PodsWatcher,
     ) -> Self {
         Runtime {
             app: Arc::new(app),
             config,
             df: Arc::new(df),
             models: Arc::new(models),
+            pods_watcher,
         }
     }
 
@@ -80,6 +85,27 @@ impl Runtime {
                 Ok(())
             },
         }
+    }
+
+    pub fn start_pods_watcher(&mut self) -> notify::Result<()> {
+        let mut current_app = Arc::clone(&self.app);
+
+        let handle_event = move |event: podswatcher::PodsWatcherEvent| {
+            match event {
+                podswatcher::PodsWatcherEvent::PodsUpdated(new_app) => {
+                    tracing::debug!("Updated pods information: {:?}", new_app);
+                    tracing::debug!("Previous pods information: {:?}", current_app);
+
+                    // TODO: update runtime based on current_app vs new_app info
+
+                    current_app = Arc::new(new_app);
+                }
+            }
+        };
+
+        self.pods_watcher.watch(handle_event)?;
+
+        Ok(())
     }
 }
 
