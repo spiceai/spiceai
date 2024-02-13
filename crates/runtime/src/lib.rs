@@ -1,8 +1,9 @@
 #![allow(clippy::missing_errors_doc)]
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use config::Config;
+use model::Model;
 use snafu::prelude::*;
 use tokio::signal;
 
@@ -42,6 +43,7 @@ pub struct Runtime {
     pub app: Arc<app::App>,
     pub config: config::Config,
     pub df: Arc<DataFusion>,
+    pub models: Arc<HashMap<String, Model>>,
     pub pods_watcher: podswatcher::PodsWatcher,
 }
 
@@ -51,12 +53,14 @@ impl Runtime {
         config: Config,
         app: app::App,
         df: DataFusion,
+        models: HashMap<String, Model>,
         pods_watcher: podswatcher::PodsWatcher,
     ) -> Self {
         Runtime {
             app: Arc::new(app),
             config,
             df: Arc::new(df),
+            models: Arc::new(models),
             pods_watcher,
         }
     }
@@ -66,6 +70,7 @@ impl Runtime {
             self.config.http_bind_address,
             self.app.clone(),
             self.df.clone(),
+            self.models.clone(),
         );
         let flight_server_future = flight::start(self.config.flight_bind_address, self.df.clone());
         let open_telemetry_server_future =

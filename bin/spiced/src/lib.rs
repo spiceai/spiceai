@@ -1,6 +1,7 @@
 #![allow(clippy::missing_errors_doc)]
 
 use std::env;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -9,6 +10,7 @@ use app::App;
 use clap::Parser;
 use runtime::config::Config as RuntimeConfig;
 use runtime::datasource::DataSource;
+use runtime::model::Model;
 
 use runtime::podswatcher::PodsWatcher;
 use runtime::{datasource, Runtime};
@@ -152,9 +154,26 @@ pub async fn run(args: Args) -> Result<()> {
         tracing::info!("Loaded dataset: {}", ds.name);
     }
 
+    let mut model_map = HashMap::with_capacity(app.models.len());
+    for m in &app.models {
+        match Model::load(m, auth.get(m.source().as_str())) {
+            Ok(in_m) => {
+                model_map.insert(m.name.clone(), in_m);
+                tracing::info!("Loaded model: {}", m.name);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Unable to load runnable model from spicepod {}, error: {}",
+                    m.name,
+                    e,
+                );
+            }
+        }
+    }
+
     let pods_watcher = PodsWatcher::new(current_dir.clone());
 
-    let mut rt: Runtime = Runtime::new(args.runtime, app, df, pods_watcher);
+    let mut rt: Runtime = Runtime::new(args.runtime, app, df, model_map, pods_watcher);
 
     rt.start_pods_watcher()
         .context(UnableToInitializePodsWatcherSnafu)?;
