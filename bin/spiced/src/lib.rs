@@ -1,7 +1,7 @@
 #![allow(clippy::missing_errors_doc)]
 
-use std::env;
 use std::collections::HashMap;
+use std::env;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
