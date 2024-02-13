@@ -33,7 +33,7 @@ pub struct Model {
     model: Plan,
 }
 
-fn transpose_and_flatten(matrix: Vec<Vec<f64>>) -> Vec<f64> {
+fn transpose_and_flatten(matrix: &[Vec<f64>]) -> Vec<f64> {
     if matrix.is_empty() || matrix[0].is_empty() {
         return Vec::new();
     }
@@ -42,16 +42,17 @@ fn transpose_and_flatten(matrix: Vec<Vec<f64>>) -> Vec<f64> {
     let ncols = matrix[0].len();
 
     // Check for uniformity in inner vector lengths
-    for row in &matrix {
-        if row.len() != ncols {
-            panic!("All rows must have the same number of columns");
-        }
+    for row in matrix {
+        assert!(
+            row.len() == ncols,
+            "All rows must have the same number of columns"
+        );
     }
 
     let mut result = Vec::with_capacity(nrows * ncols);
 
     for col in 0..ncols {
-        for row in &matrix {
+        for row in matrix {
             result.push(row[col]);
         }
     }
@@ -125,7 +126,7 @@ impl Runnable for Model {
 
         let small_vec: Tensor = tract_ndarray::Array2::from_shape_vec(
             (1, lookback_size * n_cols),
-            transpose_and_flatten(inp),
+            transpose_and_flatten(&inp),
         )
         .context(ShapeSnafu)?
         .into();
