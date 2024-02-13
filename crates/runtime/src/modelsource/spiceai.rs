@@ -24,7 +24,7 @@ impl ModelSource for SpiceAI {
 
         let Some(name) = name else {
             return Err(super::UnableToLoadConfigSnafu {
-                reason: "name is required",
+                reason: "Name is required",
             }
             .build());
         };
@@ -40,7 +40,7 @@ impl ModelSource for SpiceAI {
 
         let Some(remote) = remote else {
             return Err(super::UnableToLoadConfigSnafu {
-                reason: "from is required",
+                reason: "From is required",
             }
             .build());
         };
@@ -49,13 +49,13 @@ impl ModelSource for SpiceAI {
             r"\Aspice\.ai\/(?<org>[\w\-]+)\/(?<app>[\w\-]+)\/(?<model>[\w\-]+)@(?<version>[\w\d\-\.]+)\z",
         ) else {
             return Err(super::UnableToLoadConfigSnafu {
-                reason: "invalid regex",
+                reason: "Invalid regex",
             }
             .build());
         };
         let Some(caps) = re.captures(remote.as_str()) else {
             return Err(super::UnableToLoadConfigSnafu {
-                reason: "from is invalid for spice.ai source",
+                reason: "From is invalid for spice.ai source",
             }
             .build());
         };

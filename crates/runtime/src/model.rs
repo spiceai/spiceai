@@ -15,29 +15,22 @@ pub struct Model {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Debug, Snafu)]
 pub enum Error {
-    UnknownModelSource {
-        source: crate::modelsource::Error,
-    },
+    #[snafu(display("Unknown model source: {source}"))]
+    UnknownModelSource { source: crate::modelsource::Error },
 
-    #[snafu(display("Unable to load model from path: {}", source))]
-    UnableToLoadModel {
-        source: crate::modelsource::Error,
-    },
+    #[snafu(display("Unable to load model from path: {source}"))]
+    UnableToLoadModel { source: crate::modelsource::Error },
 
-    #[snafu(display("Unable to init model"))]
-    UnableToInitModel {
-        source: crate::modelruntime::Error,
-    },
+    #[snafu(display("Unable to init model: {source}"))]
+    UnableToInitModel { source: crate::modelruntime::Error },
 
     #[snafu(display("Unable to query"))]
     UnableToQuery {
         source: datafusion::error::DataFusionError,
     },
 
-    #[snafu(display("Unable to run model"))]
-    UnableToRunModel {
-        source: crate::modelruntime::Error,
-    },
+    #[snafu(display("Unable to run model: {source}"))]
+    UnableToRunModel { source: crate::modelruntime::Error },
 }
 
 impl Model {

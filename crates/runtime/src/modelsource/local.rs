@@ -19,7 +19,7 @@ impl ModelSource for Local {
 
         let Some(name) = name else {
             return Err(super::UnableToLoadConfigSnafu {
-                reason: "name is required",
+                reason: "Name is required",
             }
             .build());
         };
@@ -35,7 +35,7 @@ impl ModelSource for Local {
 
         let Some(path) = path else {
             return Err(super::UnableToLoadConfigSnafu {
-                reason: "from is required",
+                reason: "From is required",
             }
             .build());
         };
