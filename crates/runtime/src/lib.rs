@@ -88,8 +88,8 @@ impl Runtime {
         let handle_event = move |event: podswatcher::PodsWatcherEvent| {
             match event {
                 podswatcher::PodsWatcherEvent::PodsUpdated(new_app) => {
-                    tracing::debug!("updated pods information: {:?}", new_app);
-                    tracing::debug!("previous pods information: {:?}", current_app);
+                    tracing::debug!("Updated pods information: {:?}", new_app);
+                    tracing::debug!("Previous pods information: {:?}", current_app);
 
                     // TODO: update runtime based on current_app vs new_app info
 

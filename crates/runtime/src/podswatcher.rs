@@ -77,20 +77,16 @@ fn get_watch_paths(app_path: impl Into<PathBuf>) -> Vec<PathBuf> {
     let root_dir: PathBuf = app_path.into();
 
     let mut dirs = vec![
-        // self.root_path.join("spicepods/"),
         root_dir.join("spicepod.yaml"),
         root_dir.join("spicepod.yml"),
     ];
 
-    // attempt to open root spicepod definition file
     if let Ok(spicepod) = spicepod::Spicepod::load_definition(&root_dir) {
-        // watch dependencies
         for dep in spicepod.dependencies {
             let dep_path = root_dir.join("spicepods").join(dep);
             dirs.push(dep_path);
         }
 
-        // watch ref datasets folders
         for dataset in spicepod.datasets {
             match dataset {
                 ComponentOrReference::Reference(reference) => {
@@ -101,7 +97,6 @@ fn get_watch_paths(app_path: impl Into<PathBuf>) -> Vec<PathBuf> {
             }
         }
 
-        // watch ref datasets folders
         for model in spicepod.models {
             match model {
                 ComponentOrReference::Reference(reference) => {
@@ -121,8 +116,6 @@ fn is_spicepods_modification_event(spicepod_paths: &[PathBuf], event: &notify::E
         EventKind::Create(CreateKind::File)
         | EventKind::Remove(RemoveKind::File)
         | EventKind::Modify(ModifyKind::Data(_)) => {
-            // iterate through all paths in the event and
-            // check if relative path is within the `spicepods` dir
             for event_path in &event.paths {
                 if spicepod_paths.iter().any(|dir| event_path.starts_with(dir)) {
                     return true;
