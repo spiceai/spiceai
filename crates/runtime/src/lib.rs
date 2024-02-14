@@ -6,7 +6,7 @@ use config::Config;
 use model::Model;
 use snafu::prelude::*;
 use spicepod::component::dataset;
-use tokio::signal;
+use tokio::{signal, sync::RwLock};
 
 use crate::{dataconnector::DataConnector, datafusion::DataFusion};
 pub use notify::Error as NotifyError;
@@ -82,7 +82,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub struct Runtime {
     pub app: Arc<app::App>,
     pub config: config::Config,
-    pub df: Arc<DataFusion>,
+    pub df: Arc<RwLock<DataFusion>>,
     pub models: Arc<HashMap<String, Model>>,
     pub pods_watcher: podswatcher::PodsWatcher,
 }
@@ -99,7 +99,7 @@ impl Runtime {
         Runtime {
             app: Arc::new(app),
             config,
-            df: Arc::new(df),
+            df: Arc::new(RwLock::new(df)),
             models: Arc::new(models),
             pods_watcher,
         }

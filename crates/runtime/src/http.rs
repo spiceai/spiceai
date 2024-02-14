@@ -2,7 +2,7 @@ use std::{collections::HashMap, fmt::Debug, sync::Arc};
 
 use app::App;
 use snafu::prelude::*;
-use tokio::net::{TcpListener, ToSocketAddrs};
+use tokio::{net::{TcpListener, ToSocketAddrs}, sync::RwLock};
 
 use crate::{datafusion::DataFusion, model::Model};
 
@@ -23,7 +23,7 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 pub(crate) async fn start<A>(
     bind_address: A,
     app: Arc<App>,
-    df: Arc<DataFusion>,
+    df: Arc<RwLock<DataFusion>>,
     models: Arc<HashMap<String, Model>>,
 ) -> Result<()>
 where
