@@ -4,13 +4,9 @@ use notify::{
 };
 use spicepod::component::ComponentOrReference;
 use std::path::PathBuf;
+use tokio::sync::mpsc::{channel, Receiver};
 
 use app::App;
-
-#[derive(Debug)]
-pub enum PodsWatcherEvent {
-    PodsUpdated(App),
-}
 
 pub struct PodsWatcher {
     root_path: PathBuf,
@@ -26,11 +22,10 @@ impl PodsWatcher {
         }
     }
 
-    pub fn watch<F>(&mut self, mut event_handler: F) -> notify::Result<()>
-    where
-        F: FnMut(PodsWatcherEvent) + 'static + Send,
-    {
+    pub fn watch(&mut self) -> notify::Result<Receiver<App>> {
         let root_path = self.root_path.clone();
+
+        let (tx, rx) = channel(100);
 
         let root_spicepod_path = vec![
             root_path.join("spicepod.yaml"),
@@ -39,8 +34,8 @@ impl PodsWatcher {
 
         let mut watch_paths = get_watch_paths(&root_path);
 
-        let mut watcher =
-            notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
+        let mut watcher = notify::recommended_watcher(
+            move |res: Result<notify::Event, notify::Error>| {
                 match res {
                     Ok(event) => {
                         if !is_spicepods_modification_event(&watch_paths, &event) {
@@ -56,20 +51,25 @@ impl PodsWatcher {
                         }
 
                         if let Ok(app) = App::new(root_path.clone()) {
-                            event_handler(PodsWatcherEvent::PodsUpdated(app));
+                            futures::executor::block_on(async {
+                                if let Err(err) = tx.send(app).await {
+                                    tracing::error!("Pods content watcher is unable to notify detected state change: {:?}", err);
+                                }
+                            });
                         } else {
                             tracing::debug!("Invalid app state detected, ignoring changes.");
                         }
                     }
                     Err(e) => tracing::error!("Pods content watcher error: {:?}", e),
                 }
-            })?;
+            },
+        )?;
 
         watcher.watch(&self.root_path, RecursiveMode::Recursive)?;
 
         self.watcher = Some(watcher);
 
-        Ok(())
+        Ok(rx)
     }
 }
 
