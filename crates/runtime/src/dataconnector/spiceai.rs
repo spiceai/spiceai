@@ -13,7 +13,7 @@ use spicepod::component::dataset::Dataset;
 use crate::auth::AuthProvider;
 use crate::dataupdate::{DataUpdate, UpdateType};
 
-use super::{flight::Flight, DataSource};
+use super::{flight::Flight, DataConnector};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -27,7 +27,7 @@ pub struct SpiceAI {
     flight: Flight,
 }
 
-impl DataSource for SpiceAI {
+impl DataConnector for SpiceAI {
     fn new(
         auth_provider: AuthProvider,
         params: Arc<Option<HashMap<String, String>>>,
@@ -53,7 +53,7 @@ impl DataSource for SpiceAI {
                 auth_provider.get_param("key").unwrap_or_default(),
             )
             .await
-            .map_err(|e| super::Error::UnableToCreateDataSource { source: e.into() })?;
+            .map_err(|e| super::Error::UnableToCreateDataConnector { source: e.into() })?;
             let flight = Flight::new(flight_client);
             Ok(Self { flight })
         })

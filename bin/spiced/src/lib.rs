@@ -9,11 +9,11 @@ use std::sync::Arc;
 use app::App;
 use clap::Parser;
 use runtime::config::Config as RuntimeConfig;
-use runtime::datasource::DataSource;
+use runtime::dataconnector::DataConnector;
 use runtime::model::Model;
 
 use runtime::podswatcher::PodsWatcher;
-use runtime::{datasource, Runtime};
+use runtime::{dataconnector, Runtime};
 use snafu::prelude::*;
 
 #[derive(Debug, Snafu)]
@@ -24,31 +24,31 @@ pub enum Error {
     #[snafu(display("Unable to start Spice Runtime servers"))]
     UnableToStartServers { source: runtime::Error },
 
-    #[snafu(display("Unable to attach data source: {data_source}"))]
-    UnableToAttachDataSource {
+    #[snafu(display("Unable to attach data connector: {data_connector}"))]
+    UnableToAttachDataConnector {
         source: runtime::datafusion::Error,
-        data_source: String,
+        data_connector: String,
     },
 
     #[snafu(display("Unable to attach view"))]
     UnableToAttachView { source: runtime::datafusion::Error },
 
-    #[snafu(display("Unable to initialize data source: {data_source}"))]
-    UnableToInitializeDataSource {
-        source: runtime::datasource::Error,
-        data_source: String,
+    #[snafu(display("Unable to initialize data connector: {data_connector}"))]
+    UnableToInitializeDataConnector {
+        source: runtime::dataconnector::Error,
+        data_connector: String,
     },
 
     #[snafu(display(
-        "A required parameter ({parameter}) is missing for data source: {data_source}",
+        "A required parameter ({parameter}) is missing for data connector: {data_connector}",
     ))]
     RequiredParameterMissing {
         parameter: &'static str,
-        data_source: String,
+        data_connector: String,
     },
 
-    #[snafu(display("Unknown data source: {data_source}"))]
-    UnknownDataSource { data_source: String },
+    #[snafu(display("Unknown data connector: {data_connector}"))]
+    UnknownDataConnector { data_connector: String },
 
     #[snafu(display("Unable to create data backend"))]
     UnableToCreateBackend { source: runtime::datafusion::Error },
@@ -102,37 +102,37 @@ pub async fn run(args: Args) -> Result<()> {
         let source = ds.source();
         let source = source.as_str();
         let params = Arc::new(ds.params.clone());
-        let data_source: Option<Box<dyn DataSource>> = match source {
+        let data_connector: Option<Box<dyn DataConnector>> = match source {
             "spice.ai" => Some(Box::new(
-                datasource::spiceai::SpiceAI::new(auth.get(source), params)
+                dataconnector::spiceai::SpiceAI::new(auth.get(source), params)
                     .await
-                    .context(UnableToInitializeDataSourceSnafu {
-                        data_source: source,
+                    .context(UnableToInitializeDataConnectorSnafu {
+                        data_connector: source,
                     })?,
             )),
             "dremio" => Some(Box::new(
-                datasource::dremio::Dremio::new(auth.get(source), params)
+                dataconnector::dremio::Dremio::new(auth.get(source), params)
                     .await
-                    .context(UnableToInitializeDataSourceSnafu {
-                        data_source: source,
+                    .context(UnableToInitializeDataConnectorSnafu {
+                        data_connector: source,
                     })?,
             )),
             "localhost" | "" => None,
-            "debug" => Some(Box::new(datasource::debug::DebugSource {})),
-            _ => UnknownDataSourceSnafu {
-                data_source: source,
+            "debug" => Some(Box::new(dataconnector::debug::DebugSource {})),
+            _ => UnknownDataConnectorSnafu {
+                data_connector: source,
             }
             .fail()?,
         };
 
-        match data_source {
-            Some(data_source) => {
-                let data_source = Box::leak(data_source);
+        match data_connector {
+            Some(data_connector) => {
+                let data_connector = Box::leak(data_connector);
                 let data_backend = df.new_backend(ds).context(UnableToCreateBackendSnafu)?;
 
-                df.attach(ds, data_source, data_backend).context(
-                    UnableToAttachDataSourceSnafu {
-                        data_source: source,
+                df.attach(ds, data_connector, data_backend).context(
+                    UnableToAttachDataConnectorSnafu {
+                        data_connector: source,
                     },
                 )?;
             }
@@ -143,8 +143,8 @@ pub async fn run(args: Args) -> Result<()> {
                 None => {
                     let data_backend = df.new_backend(ds).context(UnableToCreateBackendSnafu)?;
                     df.attach_backend(&ds.name, data_backend).context(
-                        UnableToAttachDataSourceSnafu {
-                            data_source: source,
+                        UnableToAttachDataConnectorSnafu {
+                            data_connector: source,
                         },
                     )?;
                 }
