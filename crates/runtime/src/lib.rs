@@ -41,22 +41,22 @@ pub enum Error {
     #[snafu(display("Unknown data source: {data_source}"))]
     UnknownDataSource { data_source: String },
 
-    #[snafu(display("Unable to create data backend"))]
+    #[snafu(display("Unable to create data backend: {source}"))]
     UnableToCreateBackend { source: datafusion::Error },
 
-    #[snafu(display("Unable to attach data source: {data_source}"))]
+    #[snafu(display("Unable to attach data source {data_source}: {source}"))]
     UnableToAttachDataSource {
         source: datafusion::Error,
         data_source: String,
     },
 
-    #[snafu(display("Unable to attach view"))]
+    #[snafu(display("Unable to attach view: {source}"))]
     UnableToAttachView { source: datafusion::Error },
 
     #[snafu(display("Failed to start pods watcher: {source}"))]
     UnableToInitializePodsWatcher { source: NotifyError },
 
-    #[snafu(display("Unable to initialize data connector: {data_connector}"))]
+    #[snafu(display("Unable to initialize data connector {data_connector}: {source}"))]
     UnableToInitializeDataConnector {
         source: dataconnector::Error,
         data_connector: String,
@@ -70,7 +70,7 @@ pub enum Error {
         source: spicepod::component::dataset::Error,
     },
 
-    #[snafu(display("Unable to attach data connector: {data_connector}"))]
+    #[snafu(display("Unable to attach data connector {data_connector}: {source}"))]
     UnableToAttachDataConnector {
         source: datafusion::Error,
         data_connector: String,
