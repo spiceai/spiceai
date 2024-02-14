@@ -82,6 +82,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub struct Runtime {
     pub app: Arc<app::App>,
     pub config: config::Config,
+    pub auth: Arc<auth::AuthProviders>,
     pub df: Arc<RwLock<DataFusion>>,
     pub models: Arc<HashMap<String, Model>>,
     pub pods_watcher: podswatcher::PodsWatcher,
@@ -92,6 +93,7 @@ impl Runtime {
     pub fn new(
         config: Config,
         app: app::App,
+        auth: auth::AuthProviders,
         df: DataFusion,
         models: HashMap<String, Model>,
         pods_watcher: podswatcher::PodsWatcher,
@@ -99,6 +101,7 @@ impl Runtime {
         Runtime {
             app: Arc::new(app),
             config,
+            auth: Arc::new(auth),
             df: Arc::new(RwLock::new(df)),
             models: Arc::new(models),
             pods_watcher,
@@ -202,14 +205,6 @@ impl Runtime {
 
         let mut rx = self.pods_watcher.watch()?;
 
-        let mut auth = auth::AuthProviders::default();
-        if let Err(err) = auth.parse_from_config() {
-            tracing::error!(
-                "Unable to parse auth from config, proceeding without auth: {}",
-                err
-            );
-        }
-
         while let Some(new_app) = rx.recv().await {
             tracing::debug!("Updated pods information: {:?}", new_app);
             tracing::debug!("Previous pods information: {:?}", current_app);
@@ -223,7 +218,7 @@ impl Runtime {
             for ds in &new_app.datasets {
                 if !existing_dataset_names.contains(&ds.name) {
                     if let Err(err) =
-                        Runtime::load_dataset(ds, &auth, &mut *self.df.write().await).await
+                        Runtime::load_dataset(ds, &self.auth, &mut *self.df.write().await).await
                     {
                         tracing::error!("Unable to load dataset: {err:?}");
                     }

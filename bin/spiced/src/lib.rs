@@ -64,14 +64,11 @@ pub async fn run(args: Args) -> Result<()> {
     let app = App::new(current_dir.clone()).context(UnableToConstructSpiceAppSnafu)?;
 
     let mut auth = runtime::auth::AuthProviders::default();
-    match auth.parse_from_config() {
-        Ok(()) => {}
-        Err(e) => {
-            tracing::warn!(
-                "Unable to parse auth from config, proceeding without auth: {}",
-                e
-            );
-        }
+    if let Err(e) = auth.parse_from_config() {
+        tracing::warn!(
+            "Unable to parse auth from config, proceeding without auth: {}",
+            e
+        );
     }
 
     let mut df = runtime::datafusion::DataFusion::new();
@@ -102,7 +99,7 @@ pub async fn run(args: Args) -> Result<()> {
 
     let pods_watcher = PodsWatcher::new(current_dir.clone());
 
-    let mut rt: Runtime = Runtime::new(args.runtime, app, df, model_map, pods_watcher);
+    let mut rt: Runtime = Runtime::new(args.runtime, app, auth, df, model_map, pods_watcher);
 
     rt.start_servers()
         .await
