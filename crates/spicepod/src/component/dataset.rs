@@ -143,7 +143,8 @@ pub mod acceleration {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub refresh_interval: Option<String>,
 
-        pub refresh_mode: RefreshMode,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub refresh_mode: Option<RefreshMode>,
 
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub retention: Option<String>,
