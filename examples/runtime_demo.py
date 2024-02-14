@@ -6,7 +6,7 @@ from spicepy import Client
 
 API_KEY=os.environ.get("API_KEY")
 
-client = Client(API_KEY, 'grpc+tls://dev-flight.spiceai.io')
+client = Client(API_KEY)
 
 startTime = time.time()
 
