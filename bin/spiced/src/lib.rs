@@ -33,21 +33,21 @@ pub enum Error {
     #[snafu(display("Unable to attach view"))]
     UnableToAttachView { source: runtime::datafusion::Error },
 
-    #[snafu(display("Unable to initialize data source: {data_connector}"))]
+    #[snafu(display("Unable to initialize data connector: {data_connector}"))]
     UnableToInitializeDataConnector {
         source: runtime::dataconnector::Error,
         data_connector: String,
     },
 
     #[snafu(display(
-        "A required parameter ({parameter}) is missing for data source: {data_connector}",
+        "A required parameter ({parameter}) is missing for data connector: {data_connector}",
     ))]
     RequiredParameterMissing {
         parameter: &'static str,
         data_connector: String,
     },
 
-    #[snafu(display("Unknown data source: {data_connector}"))]
+    #[snafu(display("Unknown data connector: {data_connector}"))]
     UnknownDataConnector { data_connector: String },
 
     #[snafu(display("Unable to create data backend"))]
