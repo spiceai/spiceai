@@ -91,10 +91,10 @@ spice login
 }
 
 var dremioCmd = &cobra.Command{
-	Use:   "dremio",
+	Use:   "dremio-cloud",
 	Short: "Login to a Dremio instance",
 	Example: `
-spice login dremio --username <username> --password <password>
+spice login dremio-cloud --username <username> --password <password>
 
 # See more at: https://docs.spiceai.org/
 `,
