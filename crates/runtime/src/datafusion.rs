@@ -232,6 +232,7 @@ impl DataFusion {
                     return;
                 }
             };
+
             let view = match ViewTable::try_new(plan, Some(sql.to_string())) {
                 Ok(view) => view,
                 Err(e) => {
@@ -249,42 +250,65 @@ impl DataFusion {
 
     fn get_dependent_table_names(statement: &parser::Statement) -> Vec<String> {
         let mut table_names = Vec::new();
+        let mut with_to_tables = HashMap::new();
+
         match statement.clone() {
             parser::Statement::Statement(statement) => match *statement {
-                ast::Statement::Query(statement) => match *statement.body {
-                    SetExpr::Select(select_statement) => {
-                        for from in select_statement.from {
-                            if let TableFactor::Table {
-                                name,
-                                alias: _,
-                                args: _,
-                                with_hints: _,
-                                version: _,
-                                partitions: _,
-                            } = from.relation
-                            {
-                                table_names.push(name.to_string());
-                            }
+                ast::Statement::Query(statement) => {
+                    if let Some(with) = statement.with {
+                        for table in with.cte_tables {
+                            let with_table_names = DataFusion::get_dependent_table_names(
+                                &parser::Statement::Statement(Box::new(ast::Statement::Query(
+                                    table.query,
+                                ))),
+                            );
+                            with_to_tables.insert(table.alias.name.to_string(), with_table_names);
+                        }
+                    };
+                    match *statement.body {
+                        SetExpr::Select(select_statement) => {
+                            for from in select_statement.from {
+                                let mut relations = vec![];
+                                relations.push(from.relation.clone());
+                                for join in from.joins {
+                                    relations.push(join.relation.clone());
+                                }
 
-                            for join in from.joins {
-                                if let TableFactor::Table {
-                                    name,
-                                    alias: _,
-                                    args: _,
-                                    with_hints: _,
-                                    version: _,
-                                    partitions: _,
-                                } = join.relation
-                                {
-                                    table_names.push(name.to_string());
+                                for relation in relations {
+                                    match relation {
+                                        TableFactor::Table {
+                                            name,
+                                            alias: _,
+                                            args: _,
+                                            with_hints: _,
+                                            version: _,
+                                            partitions: _,
+                                        } => {
+                                            table_names.push(name.to_string());
+                                        }
+                                        TableFactor::Derived {
+                                            lateral: _,
+                                            subquery,
+                                            alias: _,
+                                        } => {
+                                            table_names.extend(
+                                                DataFusion::get_dependent_table_names(
+                                                    &parser::Statement::Statement(Box::new(
+                                                        ast::Statement::Query(subquery),
+                                                    )),
+                                                ),
+                                            );
+                                        }
+                                        _ => (),
+                                    }
                                 }
                             }
                         }
+                        _ => {
+                            return table_names;
+                        }
                     }
-                    _ => {
-                        return table_names;
-                    }
-                },
+                }
                 _ => {
                     return table_names;
                 }
@@ -293,7 +317,20 @@ impl DataFusion {
                 return table_names;
             }
         }
-        table_names
+
+        let mut result = vec![];
+
+        for table in table_names {
+            if let Some(with_table_names) = with_to_tables.get(&table) {
+                for with_table_name in with_table_names {
+                    result.push(with_table_name.to_string());
+                }
+            } else {
+                result.push(table);
+            }
+        }
+
+        result
     }
 }
 
