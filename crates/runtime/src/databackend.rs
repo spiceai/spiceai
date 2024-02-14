@@ -15,7 +15,7 @@ pub enum Error {
     #[snafu(display("Invalid configuration: {msg}"))]
     InvalidConfiguration { msg: String },
 
-    #[snafu(display("Backend creation failed"))]
+    #[snafu(display("Backend creation failed: {source}"))]
     BackendCreationFailed {
         source: Box<dyn std::error::Error + Send + Sync>,
     },

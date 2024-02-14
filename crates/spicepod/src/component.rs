@@ -32,7 +32,7 @@ pub enum ComponentOrReference<T> {
 pub enum Error {
     #[snafu(display("Unable to convert the path into a string"))]
     UnableToConvertPath,
-    #[snafu(display("Unable to parse spicepod component {}", path.display()))]
+    #[snafu(display("Unable to parse spicepod component {}: {source}", path.display()))]
     UnableToParseSpicepodComponent {
         source: serde_yaml::Error,
         path: PathBuf,

@@ -4,13 +4,13 @@ use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to load system TLS certificate"))]
+    #[snafu(display("Unable to load system TLS certificate: {source}"))]
     FailedToLoadCerts { source: std::io::Error },
 
-    #[snafu(display("Unable to convert PEMs to string"))]
+    #[snafu(display("Unable to convert PEMs to string: {source}"))]
     FailedToConvertPems { source: std::string::FromUtf8Error },
 
-    #[snafu(display("Unable to connect to endpoint"))]
+    #[snafu(display("Unable to connect to endpoint: {source}"))]
     UnableToConnectToEndpoint { source: tonic::transport::Error },
 }
 
