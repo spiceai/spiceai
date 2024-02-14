@@ -1,9 +1,12 @@
+import os 
 import time
 from time import sleep
 from spicepy import Client
 
 
-client = Client('REPLACE_WITH_API_KEY', 'grpc+tls://dev-flight.spiceai.io')
+API_KEY=os.environ.get("API_KEY")
+
+client = Client(API_KEY, 'grpc+tls://dev-flight.spiceai.io')
 
 startTime = time.time()
 data = client.query('SELECT * FROM eth.recent_blocks ORDER BY number DESC LIMIT 100')
@@ -15,11 +18,12 @@ print("Query Time: " + str(endTime - startTime) + " seconds\n")
 
 exit()
 
-client = Client('REPLACE_WITH_API_KEY', 'grpc://127.0.0.1:50051')
 
 ###########################
 #   Spice AI Datasource   #
 ###########################
+
+client = Client(API_KEY, 'grpc://127.0.0.1:50051')
 
 while True:
     startTime = time.time()
