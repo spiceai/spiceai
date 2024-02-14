@@ -3,7 +3,6 @@ package cmd
 import (
 	"errors"
 	"os"
-	"path/filepath"
 
 	"github.com/spf13/cobra"
 	"github.com/spiceai/spiceai/bin/spice/pkg/api"
@@ -25,7 +24,6 @@ spice add samples/LogPruner
 
 		cmd.Printf("Getting Pod %s ...\n", podPath)
 
-		podName := filepath.Base(podPath)
 		r := registry.GetRegistry(podPath)
 		downloadPath, err := r.GetPod(podPath)
 		if err != nil {
@@ -55,14 +53,14 @@ spice add samples/LogPruner
 
 		var podReferenced bool
 		for _, dependency := range spicePod.Dependencies {
-			if dependency == podName {
+			if dependency == podPath {
 				podReferenced = true
 				break
 			}
 		}
 
 		if !podReferenced {
-			spicePod.Dependencies = append(spicePod.Dependencies, podName)
+			spicePod.Dependencies = append(spicePod.Dependencies, podPath)
 			spicepodBytes, err = yaml.Marshal(spicePod)
 			if err != nil {
 				cmd.Println(err)
