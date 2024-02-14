@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -252,93 +252,67 @@ impl DataFusion {
 
     fn get_dependent_table_names(statement: &parser::Statement) -> Vec<String> {
         let mut table_names = Vec::new();
-        let mut with_to_tables = HashMap::new();
+        let mut cte_names = HashSet::new();
 
-        match statement.clone() {
-            parser::Statement::Statement(statement) => match *statement {
-                ast::Statement::Query(statement) => {
-                    if let Some(with) = statement.with {
-                        for table in with.cte_tables {
-                            let with_table_names = DataFusion::get_dependent_table_names(
-                                &parser::Statement::Statement(Box::new(ast::Statement::Query(
-                                    table.query,
-                                ))),
-                            );
-                            with_to_tables.insert(table.alias.name.to_string(), with_table_names);
+        if let parser::Statement::Statement(statement) = statement.clone() {
+            if let ast::Statement::Query(statement) = *statement {
+                // Collect names of CTEs
+                if let Some(with) = statement.with {
+                    for table in with.cte_tables {
+                        cte_names.insert(table.alias.name.to_string());
+                        let cte_table_names =
+                            DataFusion::get_dependent_table_names(&parser::Statement::Statement(
+                                Box::new(ast::Statement::Query(table.query)),
+                            ));
+                        // This might include actual table names used within the CTE
+                        table_names.extend(cte_table_names);
+                    }
+                }
+                // Process the main query body
+                if let SetExpr::Select(select_statement) = *statement.body {
+                    for from in select_statement.from {
+                        let mut relations = vec![];
+                        relations.push(from.relation.clone());
+                        for join in from.joins {
+                            relations.push(join.relation.clone());
                         }
-                    };
-                    match *statement.body {
-                        SetExpr::Select(select_statement) => {
-                            for from in select_statement.from {
-                                let mut relations = vec![];
-                                relations.push(from.relation.clone());
-                                for join in from.joins {
-                                    relations.push(join.relation.clone());
-                                }
 
-                                for relation in relations {
-                                    match relation {
-                                        TableFactor::Table {
-                                            name,
-                                            alias: _,
-                                            args: _,
-                                            with_hints: _,
-                                            version: _,
-                                            partitions: _,
-                                        } => {
-                                            table_names.push(name.to_string());
-                                        }
-                                        TableFactor::Derived {
-                                            lateral: _,
-                                            subquery,
-                                            alias: _,
-                                        } => {
-                                            table_names.extend(
-                                                DataFusion::get_dependent_table_names(
-                                                    &parser::Statement::Statement(Box::new(
-                                                        ast::Statement::Query(subquery),
-                                                    )),
-                                                ),
-                                            );
-                                        }
-                                        _ => (),
-                                    }
+                        for relation in relations {
+                            match relation {
+                                TableFactor::Table {
+                                    name,
+                                    alias: _,
+                                    args: _,
+                                    with_hints: _,
+                                    version: _,
+                                    partitions: _,
+                                } => {
+                                    table_names.push(name.to_string());
                                 }
+                                TableFactor::Derived {
+                                    lateral: _,
+                                    subquery,
+                                    alias: _,
+                                } => {
+                                    table_names.extend(DataFusion::get_dependent_table_names(
+                                        &parser::Statement::Statement(Box::new(
+                                            ast::Statement::Query(subquery),
+                                        )),
+                                    ));
+                                }
+                                _ => (),
                             }
                         }
-                        _ => {
-                            return table_names;
-                        }
-                    }
-                }
-                _ => {
-                    return table_names;
-                }
-            },
-            _ => {
-                return table_names;
-            }
-        }
-
-        // Filter out CTE names if they're not also referenced outside their definition
-        let mut result = vec![];
-
-        for table in table_names {
-            let included_in_with_table =
-                with_to_tables.get(&table).map_or(false, |v| !v.is_empty());
-            if !included_in_with_table {
-                result.push(table);
-            } else if let Some(dependencies) = with_to_tables.get(&table) {
-                // Ensure dependencies of a CTE are still considered if they reference other, non-CTE tables
-                for dependency in dependencies {
-                    if !with_to_tables.contains_key(dependency) {
-                        result.push(dependency.clone());
                     }
                 }
             }
         }
 
-        result
+        // Filter out CTEs that are not referenced outside their definition
+        table_names
+            .into_iter()
+            .filter(|name| !cte_names.contains(name))
+            .collect()
     }
 }
 
