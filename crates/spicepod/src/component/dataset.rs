@@ -1,8 +1,20 @@
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, fs, time::Duration};
 
 use serde::{Deserialize, Serialize};
 
 use super::WithDependsOn;
+use snafu::prelude::*;
+
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display("Unable to load SQL file {file}: {source}"))]
+    UnableToLoadSqlFile {
+        file: String,
+        source: std::io::Error,
+    },
+}
+
+pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Dataset {
@@ -11,8 +23,13 @@ pub struct Dataset {
 
     pub name: String,
 
+    /// Inline SQL that describes a view.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sql: Option<String>,
+    sql: Option<String>,
+
+    /// Reference to a SQL file that describes a view.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sql_ref: Option<String>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<HashMap<String, String>>,
@@ -87,6 +104,25 @@ impl Dataset {
 
         None
     }
+
+    #[must_use]
+    pub fn is_view(&self) -> bool {
+        self.sql.is_some() || self.sql_ref.is_some()
+    }
+
+    pub fn view_sql(&self) -> Result<Option<String>> {
+        if let Some(sql) = &self.sql {
+            return Ok(Some(sql.clone()));
+        }
+
+        if let Some(sql_ref) = &self.sql_ref {
+            let sql =
+                fs::read_to_string(sql_ref).context(UnableToLoadSqlFileSnafu { file: sql_ref })?;
+            return Ok(Some(sql));
+        }
+
+        Ok(None)
+    }
 }
 
 impl WithDependsOn<Dataset> for Dataset {
@@ -95,6 +131,7 @@ impl WithDependsOn<Dataset> for Dataset {
             from: self.from.clone(),
             name: self.name.clone(),
             sql: self.sql.clone(),
+            sql_ref: self.sql_ref.clone(),
             params: self.params.clone(),
             acceleration: self.acceleration.clone(),
             depends_on: depends_on.to_vec(),
@@ -143,7 +180,8 @@ pub mod acceleration {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub refresh_interval: Option<String>,
 
-        pub refresh_mode: RefreshMode,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub refresh_mode: Option<RefreshMode>,
 
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub retention: Option<String>,

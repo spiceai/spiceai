@@ -29,7 +29,7 @@ pub(crate) mod datasets {
         };
 
         if filter.remove_views {
-            datasets.retain(|d| d.sql.is_none());
+            datasets.retain(|d| !d.is_view());
         }
 
         Json(datasets)

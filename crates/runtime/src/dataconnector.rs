@@ -85,7 +85,11 @@ impl dyn DataConnector + '_ {
         let refresh_mode = dataset
             .acceleration
             .as_ref()
-            .map_or(RefreshMode::Full, |acc| acc.refresh_mode.clone());
+            .map_or(RefreshMode::Full, |acc| {
+                acc.refresh_mode
+                    .as_ref()
+                    .map_or(RefreshMode::Full, Clone::clone)
+            });
 
         if refresh_mode == RefreshMode::Append && self.supports_data_streaming(dataset) {
             return self.stream_data_updates(dataset);
