@@ -243,6 +243,8 @@ impl DataFusion {
             if let Err(e) = ctx.register_table(table_name.as_str(), Arc::new(view)) {
                 tracing::error!("Unable to create view: {e:?}");
             };
+
+            tracing::info!("Created view {table_name}");
         });
 
         Ok(())
@@ -318,15 +320,21 @@ impl DataFusion {
             }
         }
 
+        // Filter out CTE names if they're not also referenced outside their definition
         let mut result = vec![];
 
         for table in table_names {
-            if let Some(with_table_names) = with_to_tables.get(&table) {
-                for with_table_name in with_table_names {
-                    result.push(with_table_name.to_string());
-                }
-            } else {
+            let included_in_with_table =
+                with_to_tables.get(&table).map_or(false, |v| !v.is_empty());
+            if !included_in_with_table {
                 result.push(table);
+            } else if let Some(dependencies) = with_to_tables.get(&table) {
+                // Ensure dependencies of a CTE are still considered if they reference other, non-CTE tables
+                for dependency in dependencies {
+                    if !with_to_tables.contains_key(dependency) {
+                        result.push(dependency.clone());
+                    }
+                }
             }
         }
 
