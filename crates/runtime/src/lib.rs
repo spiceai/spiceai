@@ -206,15 +206,16 @@ impl Runtime {
             tracing::debug!("Updated pods information: {:?}", new_app);
             tracing::debug!("Previous pods information: {:?}", current_app);
 
-            // TODO: This is a placeholder to demo/test that datasets could be loaded here
-            // To be replaced with actual implementation using shared ds/datafusion instance
 
-            // let mut df = datafusion::DataFusion::new();
-            // let auth = auth::AuthProviders::default();
+            let existing_dataset_names = current_app.datasets.iter().map(|ds| ds.name.clone()).collect::<Vec<String>>();
 
-            // if let Err(err) = Runtime::load_dataset(&new_app.datasets[0], &auth, &mut df).await {
-            //     tracing::error!("Unable to load dataset: {err:?}");
-            // }
+            for ds in &new_app.datasets {
+                if !existing_dataset_names.contains(&ds.name) {
+                    if let Err(err) = Runtime::load_dataset(ds, &auth::AuthProviders::default(), &mut *self.df.write().await).await {
+                        tracing::error!("Unable to load dataset: {err:?}");
+                    }
+                }
+            }
 
             current_app = Arc::new(new_app);
         }
