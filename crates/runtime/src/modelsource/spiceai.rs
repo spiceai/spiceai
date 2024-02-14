@@ -46,7 +46,7 @@ impl ModelSource for SpiceAI {
         };
 
         let Ok(re) = Regex::new(
-            r"\Aspice\.ai\/(?<org>[\w\-]+)\/(?<app>[\w\-]+)\/(?<model>[\w\-]+)@(?<version>[\w\d\-\.]+)\z",
+            r"\Aspice\.ai\/(?<org>[\w\-]+)\/(?<app>[\w\-]+)\/models\/(?<model>[\w\-]+):(?<version>[\w\d\-\.]+)\z",
         ) else {
             return Err(super::UnableToLoadConfigSnafu {
                 reason: "Invalid regex",
@@ -66,13 +66,25 @@ impl ModelSource for SpiceAI {
             "https://spice.ai".to_string()
         };
 
-        let url = format!(
+        let mut url = format!(
             "{}/api/orgs/{}/apps/{}/models/{}",
             default_url,
             caps["org"].to_owned(),
             caps["app"].to_owned(),
             caps["model"].to_owned(),
         );
+
+        let version = match caps["version"].to_owned() {
+            s if s.is_empty() => "latest".to_string(),
+            _ => caps["version"].to_string(),
+        };
+
+        match version.as_str() {
+            "latest" => {}
+            _ => {
+                url.push_str(&format!("?training_run_id={version}"));
+            }
+        }
 
         let client = reqwest::blocking::Client::new();
         let data = client
@@ -99,11 +111,6 @@ impl ModelSource for SpiceAI {
             .ok_or(super::UnableToParseMetadataSnafu {}.build())?
             .as_str()
             .ok_or(super::UnableToParseMetadataSnafu {}.build())?;
-
-        let version = match caps["version"].to_owned() {
-            s if s.is_empty() => "latest".to_string(),
-            _ => caps["version"].to_string(),
-        };
 
         let versioned_path = format!("{path}/{version}");
         let file_name = format!("{versioned_path}/model.onnx");
