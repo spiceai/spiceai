@@ -264,7 +264,7 @@ impl DataFusion {
                             DataFusion::get_dependent_table_names(&parser::Statement::Statement(
                                 Box::new(ast::Statement::Query(table.query)),
                             ));
-                        // This might include actual table names used within the CTE
+                        // Extend table_names with names found in CTEs if they reference actual tables
                         table_names.extend(cte_table_names);
                     }
                 }
@@ -308,7 +308,7 @@ impl DataFusion {
             }
         }
 
-        // Filter out CTEs that are not referenced outside their definition
+        // Filter out CTEs and temporary views (aliases of subqueries)
         table_names
             .into_iter()
             .filter(|name| !cte_names.contains(name))
