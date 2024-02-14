@@ -19,10 +19,13 @@ pub struct Tract {
 
 #[derive(Debug, Snafu)]
 pub enum Error {
+    #[snafu(display("{source}"))]
     TractError { source: tract_core::anyhow::Error },
 
+    #[snafu(display("{source}"))]
     ArrowError { source: arrow::error::ArrowError },
 
+    #[snafu(display("{source}"))]
     ShapeError { source: ndarray::ShapeError },
 }
 pub type Result<T, E = Error> = std::result::Result<T, E>;

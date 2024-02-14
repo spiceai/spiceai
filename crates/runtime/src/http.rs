@@ -11,10 +11,10 @@ mod v1;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to bind to address"))]
+    #[snafu(display("Unable to bind to address: {source}"))]
     UnableToBindServerToPort { source: std::io::Error },
 
-    #[snafu(display("Unable to start HTTP server"))]
+    #[snafu(display("Unable to start HTTP server: {source}"))]
     UnableToStartHttpServer { source: std::io::Error },
 }
 
