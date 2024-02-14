@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"crypto/rand"
+	"encoding/json"
 	"fmt"
 	"math/big"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"github.com/pkg/browser"
 	"github.com/spf13/cobra"
 	"github.com/spiceai/spiceai/bin/spice/pkg/api"
+	"github.com/valyala/fasthttp"
 )
 
 const (
@@ -122,6 +124,11 @@ spice login dremio --username <username> --password <password>
 			os.Exit(1)
 		}
 
+		if !dremioAuth(username, password) {
+			cmd.Println("Invalid dremio username or password")
+			os.Exit(1)
+		}
+
 		mergeAuthConfig(cmd, api.AUTH_TYPE_DREMIO, &api.Auth{
 			Params: map[string]string{
 				api.AUTH_PARAM_USERNAME: username,
@@ -132,6 +139,51 @@ spice login dremio --username <username> --password <password>
 
 		cmd.Println(aurora.BrightGreen("Successfully logged in to Dremio"))
 	},
+}
+
+func dremioAuth(username string, password string) bool {
+
+	type userCredentials struct {
+		UserName string `json:"userName"`
+		Password string `json:"password"`
+	}
+
+	// TODO: Allow user to specify their own dremio host. Needs UX design for how the command should handle.
+	// TODO: Do we ultimately want to use dremio token instead of username/password in the following dremio requests?
+	const dremioHost = "dremio-4mimamg7rdeve.eastus.cloudapp.azure.com:9047"
+	dremioLoginAddr := fmt.Sprintf("http://%s/apiv2/login", dremioHost)
+
+	creds := userCredentials{
+		UserName: username,
+		Password: password,
+	}
+
+	jsonData, err := json.Marshal(creds)
+	if err != nil {
+		fmt.Println("Error marshaling JSON:", err)
+	}
+
+	req := fasthttp.AcquireRequest()
+	defer fasthttp.ReleaseRequest(req)
+
+	req.SetRequestURI(dremioLoginAddr)
+	req.Header.SetMethod("POST")
+	req.Header.SetContentType("application/json")
+	req.SetBody(jsonData)
+
+	resp := fasthttp.AcquireResponse()
+	defer fasthttp.ReleaseResponse(resp)
+
+	err = fasthttp.Do(req, resp)
+	if err != nil {
+		fmt.Println("Error sending request:", err)
+	}
+
+	if resp.StatusCode() == fasthttp.StatusOK {
+		return true
+	}
+
+	return false
 }
 
 func mergeAuthConfig(cmd *cobra.Command, updatedAuthName string, updatedAuthConfig *api.Auth) {
