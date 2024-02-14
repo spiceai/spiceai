@@ -24,8 +24,8 @@ exit()
 #   Spice AI Datasource   #
 ###########################
 
-client = Client(API_KEY, 'grpc://127.0.0.1:50051')
 API_KEY=os.environ.get("API_KEY")
+client = Client(API_KEY, 'grpc://127.0.0.1:50051')
 
 while True:
     startTime = time.time()
@@ -50,8 +50,8 @@ while True:
 #    Dremio Datasource    #
 ###########################
 
-client = Client(API_KEY, 'grpc://127.0.0.1:50051')
 API_KEY=os.environ.get("API_KEY")
+client = Client(API_KEY, 'grpc://127.0.0.1:50051')
 
 while True:
     startTime = time.time()
@@ -76,8 +76,8 @@ while True:
 # Spice/Dremio Datasource #
 ###########################
     
-client = Client(API_KEY, 'grpc://127.0.0.1:50051')
 API_KEY=os.environ.get("API_KEY")
+client = Client(API_KEY, 'grpc://127.0.0.1:50051')
 
 while True:
     startTime = time.time()
