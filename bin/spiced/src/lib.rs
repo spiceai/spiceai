@@ -156,10 +156,11 @@ pub async fn run(args: Args) -> Result<()> {
 
     let mut model_map = HashMap::with_capacity(app.models.len());
     for m in &app.models {
+        tracing::info!("Deploying model [{}] from {}...", m.name, m.from);
         match Model::load(m, auth.get(m.source().as_str())) {
             Ok(in_m) => {
                 model_map.insert(m.name.clone(), in_m);
-                tracing::info!("Loaded model: {}", m.name);
+                tracing::info!("Model [{}] deployed, ready for inferencing", m.name);
             }
             Err(e) => {
                 tracing::warn!(

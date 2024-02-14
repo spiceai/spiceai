@@ -106,7 +106,10 @@ pub(crate) mod inference {
                 },
                 None => (StatusCode::INTERNAL_SERVER_ERROR,).into_response(),
             },
-            Err(_) => (StatusCode::INTERNAL_SERVER_ERROR,).into_response(),
+            Err(e) => {
+                tracing::error!("Unable to run inference: {}", e);
+                (StatusCode::INTERNAL_SERVER_ERROR,).into_response()
+            }
         }
     }
 }

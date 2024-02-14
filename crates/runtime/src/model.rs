@@ -24,7 +24,7 @@ pub enum Error {
     #[snafu(display("Unable to init model: {source}"))]
     UnableToInitModel { source: crate::modelruntime::Error },
 
-    #[snafu(display("Unable to query"))]
+    #[snafu(display("Unable to query: {source}"))]
     UnableToQuery {
         source: datafusion::error::DataFusionError,
     },

@@ -225,6 +225,24 @@ impl DataFusion {
                 }
             }
 
+            let mut attempts = 1;
+            loop {
+                if ctx
+                    .state()
+                    .statement_to_plan(statements[0].clone())
+                    .await
+                    .is_ok()
+                {
+                    break;
+                }
+
+                if attempts % 10 == 0 {
+                    tracing::error!("Unable to generate plan for view, retrying...");
+                }
+                attempts += 1;
+                sleep(Duration::from_secs(1)).await;
+            }
+
             let plan = match ctx.state().statement_to_plan(statements[0].clone()).await {
                 Ok(plan) => plan,
                 Err(e) => {
@@ -232,6 +250,7 @@ impl DataFusion {
                     return;
                 }
             };
+
             let view = match ViewTable::try_new(plan, Some(sql.to_string())) {
                 Ok(view) => view,
                 Err(e) => {
