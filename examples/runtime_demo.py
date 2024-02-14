@@ -9,7 +9,8 @@ API_KEY=os.environ.get("API_KEY")
 client = Client(API_KEY, 'grpc+tls://dev-flight.spiceai.io')
 
 startTime = time.time()
-data = client.query('SELECT * FROM eth.recent_blocks ORDER BY number DESC LIMIT 100')
+
+data = client.query('SELECT * FROM eth.recent_blocks ORDER BY number DESC')
 endTime = time.time()
 pd = data.read_pandas()
 
@@ -27,7 +28,7 @@ client = Client(API_KEY, 'grpc://127.0.0.1:50051')
 
 while True:
     startTime = time.time()
-    data = client.query('SELECT * FROM eth_blocks ORDER BY number DESC LIMIT 100')
+    data = client.query('SELECT * FROM eth_blocks ORDER BY number ASC')
     endTime = time.time()
     pd = data.read_pandas()
 
@@ -35,7 +36,7 @@ while True:
     print("Query Time: " + str(endTime - startTime) + " seconds\n")
 
     startTime = time.time()
-    data = client.query('SELECT number FROM eth_blocks ORDER BY number DESC LIMIT 10')
+    data = client.query('SELECT number FROM eth_blocks ORDER BY number ASC')
     endTime = time.time()
     pd = data.read_pandas()
 
@@ -50,7 +51,7 @@ while True:
 
 while True:
     startTime = time.time()
-    data = client.query('SELECT * FROM taxi_trips ORDER BY pickup_datetime DESC LIMIT 100')
+    data = client.query('SELECT * FROM taxi_trips ORDER BY pickup_datetime ASC')
     endTime = time.time()
     pd = data.read_pandas()
 
@@ -80,8 +81,7 @@ while True:
         FROM eth_blocks 
         LEFT JOIN taxi_trips 
         ON eth_blocks.number%100 = taxi_trips.trip_distance_mi*10
-        ORDER BY eth_blocks.number DESC                
-        LIMIT 10
+        ORDER BY eth_blocks.number ASC                
         """)
     endTime = time.time()
     pd = data.read_pandas()
