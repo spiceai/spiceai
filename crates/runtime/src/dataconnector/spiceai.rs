@@ -38,7 +38,7 @@ impl DataConnector for SpiceAI {
         let default_flight_url = if cfg!(feature = "dev") {
             "https://dev-flight.spiceai.io".to_string()
         } else {
-            "https://flight-proxied.spiceai.io".to_string()
+            "https://flight.spiceai.io".to_string()
         };
         Box::pin(async move {
             let url: String = params
