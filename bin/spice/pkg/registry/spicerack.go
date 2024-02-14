@@ -40,7 +40,6 @@ func (r *SpiceRackRegistry) GetPod(podFullPath string) (string, error) {
 		podPath = parts[0]
 		podVersion = parts[1]
 	}
-	podName := filepath.Base(podPath)
 
 	url := fmt.Sprintf("%s/spicepods/%s", getSpiceRackBaseUrl(), podPath)
 	if podVersion != "" {
@@ -75,7 +74,7 @@ func (r *SpiceRackRegistry) GetPod(podFullPath string) (string, error) {
 	}
 
 	podsPath := context.NewContext().PodsDir()
-	podsPathWithName := filepath.Join(podsPath, podName)
+	podsPathWithName := filepath.Join(podsPath, podPath)
 
 	podsPerm, err := util.MkDirAllInheritPerm(podsPathWithName)
 	if err != nil {
