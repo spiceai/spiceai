@@ -14,9 +14,9 @@ mod spec;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to parse spicepod.yaml"))]
+    #[snafu(display("Unable to parse spicepod.yaml: {source}"))]
     UnableToParseSpicepod { source: serde_yaml::Error },
-    #[snafu(display("Unable to resolve spicepod components {}", path.display()))]
+    #[snafu(display("Unable to resolve spicepod components {}: {source}", path.display()))]
     UnableToResolveSpicepodComponents {
         source: component::Error,
         path: PathBuf,

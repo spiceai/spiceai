@@ -23,13 +23,13 @@ mod expr;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to get a DuckDB connection from the pool: {}", source))]
+    #[snafu(display("Unable to get a DuckDB connection from the pool: {source}"))]
     UnableToGetConnectionFromPool { source: r2d2::Error },
 
-    #[snafu(display("Unable to query DuckDB: {}", source))]
+    #[snafu(display("Unable to query DuckDB: {source}"))]
     UnableToQueryDuckDB { source: duckdb::Error },
 
-    #[snafu(display("Unable to generate SQL: {}", source))]
+    #[snafu(display("Unable to generate SQL: {source}"))]
     UnableToGenerateSQL { source: expr::Error },
 }
 

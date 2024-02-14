@@ -29,13 +29,13 @@ pub(crate) mod tracers;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to start HTTP server"))]
+    #[snafu(display("Unable to start HTTP server: {source}"))]
     UnableToStartHttpServer { source: http::Error },
 
-    #[snafu(display("Unable to start Flight server"))]
+    #[snafu(display("Unable to start Flight server: {source}"))]
     UnableToStartFlightServer { source: flight::Error },
 
-    #[snafu(display("Unable to start OpenTelemetry server"))]
+    #[snafu(display("Unable to start OpenTelemetry server: {source}"))]
     UnableToStartOpenTelemetryServer { source: opentelemetry::Error },
 
     #[snafu(display("Unknown data source: {data_source}"))]

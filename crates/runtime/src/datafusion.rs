@@ -23,7 +23,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to register parquet file {}", file))]
+    #[snafu(display("Unable to register parquet file {file}: {source}"))]
     RegisterParquet {
         source: DataFusionError,
         file: String,

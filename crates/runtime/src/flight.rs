@@ -427,17 +427,15 @@ where
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("A test error"))]
-    Arrow { source: ArrowError },
-
-    #[snafu(display("Unable to register parquet file"))]
+    #[snafu(display("Unable to register parquet file: {source}"))]
     RegisterParquet { source: crate::datafusion::Error },
 
+    #[snafu(display("{source}"))]
     DataFusion {
         source: datafusion::error::DataFusionError,
     },
 
-    #[snafu(display("Unable to start Flight server"))]
+    #[snafu(display("Unable to start Flight server: {source}"))]
     UnableToStartFlightServer { source: tonic::transport::Error },
 }
 

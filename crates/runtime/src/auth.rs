@@ -11,13 +11,13 @@ pub enum Error {
     #[snafu(display("Unable to find home directory"))]
     UnableToFindHomeDir {},
 
-    #[snafu(display("Unable to open auth file"))]
+    #[snafu(display("Unable to open auth file: {source}"))]
     UnableToOpenAuthFile { source: std::io::Error },
 
-    #[snafu(display("Unable to read auth file"))]
+    #[snafu(display("Unable to read auth file: {source}"))]
     UnableToReadAuthFile { source: std::io::Error },
 
-    #[snafu(display("Unable to parse auth file"))]
+    #[snafu(display("Unable to parse auth file: {source}"))]
     UnableToParseAuthFile { source: toml::de::Error },
 }
 

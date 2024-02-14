@@ -22,6 +22,7 @@ pub enum Error {
     #[snafu(display("Unable to add data: {source}"))]
     UnableToAddData { source: DataFusionError },
 
+    #[snafu(display("Unable to parse SQL: {source}"))]
     UnableToParseSql {
         source: sqlparser::parser::ParserError,
     },
