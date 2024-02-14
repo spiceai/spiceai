@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -29,38 +29,36 @@ pub enum Error {
         file: String,
     },
 
-    DataFusion {
-        source: DataFusionError,
-    },
-
     #[snafu(display("Table already exists"))]
     TableAlreadyExists {},
 
-    DatasetConfigurationError {
-        source: databackend::Error,
-    },
+    #[snafu(display("Unable to get table: {source}"))]
+    DatasetConfigurationError { source: databackend::Error },
 
-    InvalidConfiguration {
-        msg: String,
-    },
+    #[snafu(display("Invalid configuration: {msg}"))]
+    InvalidConfiguration { msg: String },
 
-    UnableToCreateBackend {
-        source: crate::databackend::Error,
-    },
+    #[snafu(display("Unable to create dataset acceleration: {source}"))]
+    UnableToCreateBackend { source: databackend::Error },
 
-    #[snafu(display("Unable to create view: {}", reason))]
-    UnableToCreateView {
-        reason: String,
-    },
+    #[snafu(display("Unable to create view: {reason}"))]
+    UnableToCreateView { reason: String },
 
+    #[snafu(display("Unable to parse SQL: {source}"))]
     UnableToParseSql {
         source: sqlparser::parser::ParserError,
     },
 
-    #[snafu(display("Unable to get table: {}", source))]
-    UnableToGetTable {
-        source: DataFusionError,
+    #[snafu(display("Unable to get table: {source}"))]
+    UnableToGetTable { source: DataFusionError },
+
+    #[snafu(display("Unable to create view: {source}"))]
+    InvalidSQLView {
+        source: spicepod::component::dataset::Error,
     },
+
+    #[snafu(display("Expected a SQL view statement, received nothing."))]
+    ExpectedSqlView,
 }
 
 pub struct DataFusion {
@@ -189,7 +187,9 @@ impl DataFusion {
             return TableAlreadyExistsSnafu.fail();
         }
 
-        let sql = dataset.sql.clone().unwrap_or_default();
+        let Some(sql) = dataset.view_sql().context(InvalidSQLViewSnafu)? else {
+            return ExpectedSqlViewSnafu.fail();
+        };
         let statements = DFParser::parse_sql_with_dialect(sql.as_str(), &PostgreSqlDialect {})
             .context(UnableToParseSqlSnafu)?;
         if statements.len() != 1 {
@@ -243,6 +243,8 @@ impl DataFusion {
             if let Err(e) = ctx.register_table(table_name.as_str(), Arc::new(view)) {
                 tracing::error!("Unable to create view: {e:?}");
             };
+
+            tracing::info!("Created view {table_name}");
         });
 
         Ok(())
@@ -250,87 +252,67 @@ impl DataFusion {
 
     fn get_dependent_table_names(statement: &parser::Statement) -> Vec<String> {
         let mut table_names = Vec::new();
-        let mut with_to_tables = HashMap::new();
+        let mut cte_names = HashSet::new();
 
-        match statement.clone() {
-            parser::Statement::Statement(statement) => match *statement {
-                ast::Statement::Query(statement) => {
-                    if let Some(with) = statement.with {
-                        for table in with.cte_tables {
-                            let with_table_names = DataFusion::get_dependent_table_names(
-                                &parser::Statement::Statement(Box::new(ast::Statement::Query(
-                                    table.query,
-                                ))),
-                            );
-                            with_to_tables.insert(table.alias.name.to_string(), with_table_names);
+        if let parser::Statement::Statement(statement) = statement.clone() {
+            if let ast::Statement::Query(statement) = *statement {
+                // Collect names of CTEs
+                if let Some(with) = statement.with {
+                    for table in with.cte_tables {
+                        cte_names.insert(table.alias.name.to_string());
+                        let cte_table_names =
+                            DataFusion::get_dependent_table_names(&parser::Statement::Statement(
+                                Box::new(ast::Statement::Query(table.query)),
+                            ));
+                        // Extend table_names with names found in CTEs if they reference actual tables
+                        table_names.extend(cte_table_names);
+                    }
+                }
+                // Process the main query body
+                if let SetExpr::Select(select_statement) = *statement.body {
+                    for from in select_statement.from {
+                        let mut relations = vec![];
+                        relations.push(from.relation.clone());
+                        for join in from.joins {
+                            relations.push(join.relation.clone());
                         }
-                    };
-                    match *statement.body {
-                        SetExpr::Select(select_statement) => {
-                            for from in select_statement.from {
-                                let mut relations = vec![];
-                                relations.push(from.relation.clone());
-                                for join in from.joins {
-                                    relations.push(join.relation.clone());
-                                }
 
-                                for relation in relations {
-                                    match relation {
-                                        TableFactor::Table {
-                                            name,
-                                            alias: _,
-                                            args: _,
-                                            with_hints: _,
-                                            version: _,
-                                            partitions: _,
-                                        } => {
-                                            table_names.push(name.to_string());
-                                        }
-                                        TableFactor::Derived {
-                                            lateral: _,
-                                            subquery,
-                                            alias: _,
-                                        } => {
-                                            table_names.extend(
-                                                DataFusion::get_dependent_table_names(
-                                                    &parser::Statement::Statement(Box::new(
-                                                        ast::Statement::Query(subquery),
-                                                    )),
-                                                ),
-                                            );
-                                        }
-                                        _ => (),
-                                    }
+                        for relation in relations {
+                            match relation {
+                                TableFactor::Table {
+                                    name,
+                                    alias: _,
+                                    args: _,
+                                    with_hints: _,
+                                    version: _,
+                                    partitions: _,
+                                } => {
+                                    table_names.push(name.to_string());
                                 }
+                                TableFactor::Derived {
+                                    lateral: _,
+                                    subquery,
+                                    alias: _,
+                                } => {
+                                    table_names.extend(DataFusion::get_dependent_table_names(
+                                        &parser::Statement::Statement(Box::new(
+                                            ast::Statement::Query(subquery),
+                                        )),
+                                    ));
+                                }
+                                _ => (),
                             }
-                        }
-                        _ => {
-                            return table_names;
                         }
                     }
                 }
-                _ => {
-                    return table_names;
-                }
-            },
-            _ => {
-                return table_names;
             }
         }
 
-        let mut result = vec![];
-
-        for table in table_names {
-            if let Some(with_table_names) = with_to_tables.get(&table) {
-                for with_table_name in with_table_names {
-                    result.push(with_table_name.to_string());
-                }
-            } else {
-                result.push(table);
-            }
-        }
-
-        result
+        // Filter out CTEs and temporary views (aliases of subqueries)
+        table_names
+            .into_iter()
+            .filter(|name| !cte_names.contains(name))
+            .collect()
     }
 }
 

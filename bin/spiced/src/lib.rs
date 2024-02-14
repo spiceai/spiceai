@@ -55,6 +55,11 @@ pub enum Error {
 
     #[snafu(display("Failed to start pods watcher: {source}"))]
     UnableToInitializePodsWatcher { source: runtime::NotifyError },
+
+    #[snafu(display("Unable to create view: {source}"))]
+    InvalidSQLView {
+        source: spicepod::component::dataset::Error,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -94,7 +99,7 @@ pub async fn run(args: Args) -> Result<()> {
     let mut df = runtime::datafusion::DataFusion::new();
 
     for ds in &app.datasets {
-        if ds.acceleration.is_none() && ds.sql.is_none() {
+        if ds.acceleration.is_none() && !ds.is_view() {
             tracing::warn!("No acceleration specified for dataset: {}", ds.name);
             continue;
         };
@@ -125,6 +130,8 @@ pub async fn run(args: Args) -> Result<()> {
             .fail()?,
         };
 
+        let view_sql = ds.view_sql().context(InvalidSQLViewSnafu)?;
+
         match data_connector {
             Some(data_connector) => {
                 let data_connector = Box::leak(data_connector);
@@ -136,11 +143,10 @@ pub async fn run(args: Args) -> Result<()> {
                     },
                 )?;
             }
-            None => match &ds.sql {
-                Some(_) => {
+            None => {
+                if view_sql.is_some() {
                     df.attach_view(ds).context(UnableToAttachViewSnafu)?;
-                }
-                None => {
+                } else {
                     let data_backend = df.new_backend(ds).context(UnableToCreateBackendSnafu)?;
                     df.attach_backend(&ds.name, data_backend).context(
                         UnableToAttachDataConnectorSnafu {
@@ -148,7 +154,7 @@ pub async fn run(args: Args) -> Result<()> {
                         },
                     )?;
                 }
-            },
+            }
         }
 
         tracing::info!("Loaded dataset: {}", ds.name);
