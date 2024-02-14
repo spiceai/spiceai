@@ -6,7 +6,7 @@ use snafu::prelude::*;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to open path {}", path.display()))]
+    #[snafu(display("Unable to open path {}: {source}", path.display()))]
     UnableToOpenPath {
         source: std::io::Error,
         path: PathBuf,

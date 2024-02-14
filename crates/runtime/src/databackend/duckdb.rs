@@ -21,26 +21,21 @@ use super::{AddDataResult, DataBackend};
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("DuckDBError: {source}"))]
-    DuckDBError {
-        source: duckdb::Error,
-    },
+    DuckDBError { source: duckdb::Error },
 
-    ConnectionPoolError {
-        source: r2d2::Error,
-    },
+    #[snafu(display("ConnectionPoolError: {source}"))]
+    ConnectionPoolError { source: r2d2::Error },
 
-    DuckDBDataFusion {
-        source: duckdb_datafusion::Error,
-    },
+    #[snafu(display("DuckDBDataFusionError: {source}"))]
+    DuckDBDataFusion { source: duckdb_datafusion::Error },
 
+    #[snafu(display("DataFusionError: {source}"))]
     DataFusion {
         source: datafusion::error::DataFusionError,
     },
 
     #[snafu(display("Lock is poisoned: {message}"))]
-    LockPoisoned {
-        message: String,
-    },
+    LockPoisoned { message: String },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;

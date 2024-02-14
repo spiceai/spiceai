@@ -21,6 +21,7 @@ pub mod spiceai;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
+    #[snafu(display("Unable to create data connector: {source}"))]
     UnableToCreateDataConnector {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
