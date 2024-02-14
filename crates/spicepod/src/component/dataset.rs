@@ -7,8 +7,11 @@ use snafu::prelude::*;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to load SQL file: {source}"))]
-    UnableToLoadSqlFile { source: std::io::Error },
+    #[snafu(display("Unable to load SQL file {file}: {source}"))]
+    UnableToLoadSqlFile {
+        file: String,
+        source: std::io::Error,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -113,7 +116,8 @@ impl Dataset {
         }
 
         if let Some(sql_ref) = &self.sql_ref {
-            let sql = fs::read_to_string(sql_ref).context(UnableToLoadSqlFileSnafu)?;
+            let sql =
+                fs::read_to_string(sql_ref).context(UnableToLoadSqlFileSnafu { file: sql_ref })?;
             return Ok(Some(sql));
         }
 
