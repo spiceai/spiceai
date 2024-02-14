@@ -29,38 +29,36 @@ pub enum Error {
         file: String,
     },
 
-    DataFusion {
-        source: DataFusionError,
-    },
-
     #[snafu(display("Table already exists"))]
     TableAlreadyExists {},
 
-    DatasetConfigurationError {
-        source: databackend::Error,
-    },
+    #[snafu(display("Unable to get table: {source}"))]
+    DatasetConfigurationError { source: databackend::Error },
 
-    InvalidConfiguration {
-        msg: String,
-    },
+    #[snafu(display("Invalid configuration: {msg}"))]
+    InvalidConfiguration { msg: String },
 
-    UnableToCreateBackend {
-        source: crate::databackend::Error,
-    },
+    #[snafu(display("Unable to create dataset acceleration: {source}"))]
+    UnableToCreateBackend { source: databackend::Error },
 
-    #[snafu(display("Unable to create view: {}", reason))]
-    UnableToCreateView {
-        reason: String,
-    },
+    #[snafu(display("Unable to create view: {reason}"))]
+    UnableToCreateView { reason: String },
 
+    #[snafu(display("Unable to parse SQL: {source}"))]
     UnableToParseSql {
         source: sqlparser::parser::ParserError,
     },
 
-    #[snafu(display("Unable to get table: {}", source))]
-    UnableToGetTable {
-        source: DataFusionError,
+    #[snafu(display("Unable to get table: {source}"))]
+    UnableToGetTable { source: DataFusionError },
+
+    #[snafu(display("Unable to create view: {source}"))]
+    InvalidSQLView {
+        source: spicepod::component::dataset::Error,
     },
+
+    #[snafu(display("Expected a SQL view statement, received nothing."))]
+    ExpectedSqlView,
 }
 
 pub struct DataFusion {
@@ -189,7 +187,9 @@ impl DataFusion {
             return TableAlreadyExistsSnafu.fail();
         }
 
-        let sql = dataset.sql.clone().unwrap_or_default();
+        let Some(sql) = dataset.view_sql().context(InvalidSQLViewSnafu)? else {
+            return ExpectedSqlViewSnafu.fail();
+        };
         let statements = DFParser::parse_sql_with_dialect(sql.as_str(), &PostgreSqlDialect {})
             .context(UnableToParseSqlSnafu)?;
         if statements.len() != 1 {
