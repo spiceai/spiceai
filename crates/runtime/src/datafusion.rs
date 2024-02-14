@@ -236,8 +236,9 @@ impl DataFusion {
                     break;
                 }
 
-                if attempts % 10 == 0 {
+                if attempts == 10 {
                     tracing::error!("Unable to generate plan for view, retrying...");
+                    return;
                 }
                 attempts += 1;
                 sleep(Duration::from_secs(1)).await;
