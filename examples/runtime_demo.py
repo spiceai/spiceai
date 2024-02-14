@@ -6,7 +6,7 @@ from spicepy import Client
 
 API_KEY=os.environ.get("API_KEY")
 
-client = Client(API_KEY, 'grpc+tls://dev-flight.spiceai.io')
+client = Client(API_KEY)
 
 startTime = time.time()
 
@@ -24,11 +24,12 @@ exit()
 #   Spice AI Datasource   #
 ###########################
 
+API_KEY=os.environ.get("API_KEY")
 client = Client(API_KEY, 'grpc://127.0.0.1:50051')
 
 while True:
     startTime = time.time()
-    data = client.query('SELECT * FROM eth_blocks ORDER BY number ASC')
+    data = client.query('SELECT * FROM eth_recent_blocks ORDER BY number ASC')
     endTime = time.time()
     pd = data.read_pandas()
 
@@ -36,7 +37,7 @@ while True:
     print("Query Time: " + str(endTime - startTime) + " seconds\n")
 
     startTime = time.time()
-    data = client.query('SELECT number FROM eth_blocks ORDER BY number ASC')
+    data = client.query('SELECT number FROM eth_recent_blocks ORDER BY number DESC LIMIT 10')
     endTime = time.time()
     pd = data.read_pandas()
 
@@ -48,6 +49,9 @@ while True:
 ###########################
 #    Dremio Datasource    #
 ###########################
+
+API_KEY=os.environ.get("API_KEY")
+client = Client(API_KEY, 'grpc://127.0.0.1:50051')
 
 while True:
     startTime = time.time()
@@ -71,6 +75,9 @@ while True:
 ###########################
 # Spice/Dremio Datasource #
 ###########################
+    
+API_KEY=os.environ.get("API_KEY")
+client = Client(API_KEY, 'grpc://127.0.0.1:50051')
 
 while True:
     startTime = time.time()
