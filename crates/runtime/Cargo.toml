@@ -31,6 +31,7 @@ futures-core = "0.3"
 dirs = "5.0.1"
 toml = "0.8.8"
 serde.workspace = true
+serde_json = "1.0.1"
 flight_client = { version = "0.10.0-alpha.0", path = "../flight_client" }
 tract-core = "0.21.0"
 tract-onnx = "0.21.0"
@@ -41,6 +42,9 @@ duckdb_datafusion = { path = "../duckdb_datafusion", optional = true }
 r2d2 = { version = "0.8.10", optional = true }
 opentelemetry-proto = { version = "0.4.0", features = ["gen-tonic-messages", "gen-tonic", "metrics"] }
 indexmap = "2.2.2"
+regex = "1.10.3"
+reqwest = { version = "0.11.24", features = ["blocking", "json"] }
+notify = "6.1.1"
 
 [features]
 default = ["duckdb"]

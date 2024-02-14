@@ -1,6 +1,7 @@
+use crate::auth::AuthProvider;
 use crate::modelruntime::ModelRuntime;
 use crate::modelruntime::Runnable;
-use crate::modelsource::ModelSource;
+use crate::modelsource::create_source_from;
 use crate::DataFusion;
 use arrow::record_batch::RecordBatch;
 use snafu::prelude::*;
@@ -14,13 +15,13 @@ pub struct Model {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unknown model source: {model_source}"))]
-    UnknownModelSource { model_source: String },
+    #[snafu(display("Unknown model source: {source}"))]
+    UnknownModelSource { source: crate::modelsource::Error },
 
-    #[snafu(display("Unable to load model from path"))]
-    UnableToLoadModelFromPath { source: crate::modelsource::Error },
+    #[snafu(display("Unable to load model from path: {source}"))]
+    UnableToLoadModel { source: crate::modelsource::Error },
 
-    #[snafu(display("Unable to init model"))]
+    #[snafu(display("Unable to init model: {source}"))]
     UnableToInitModel { source: crate::modelruntime::Error },
 
     #[snafu(display("Unable to query"))]
@@ -28,12 +29,12 @@ pub enum Error {
         source: datafusion::error::DataFusionError,
     },
 
-    #[snafu(display("Unable to run model"))]
+    #[snafu(display("Unable to run model: {source}"))]
     UnableToRunModel { source: crate::modelruntime::Error },
 }
 
 impl Model {
-    pub fn load(model: &spicepod::component::model::Model) -> Result<Self> {
+    pub fn load(model: &spicepod::component::model::Model, auth: AuthProvider) -> Result<Self> {
         let source = model.source();
         let source = source.as_str();
 
@@ -41,42 +42,32 @@ impl Model {
         params.insert("name".to_string(), model.name.to_string());
         params.insert("from".to_string(), model.from.to_string());
 
-        match source {
-            "localhost" => {
-                let local = crate::modelsource::local::Local {};
-                let path = local
-                    .pull(Arc::new(Option::from(params)))
-                    .context(UnableToLoadModelFromPathSnafu {})?;
-
-                let path = path.clone();
-
-                let tract = crate::modelruntime::tract::Tract {
-                    path: path.to_string(),
-                }
-                .load()
-                .context(UnableToInitModelSnafu {})?;
-
-                Ok(Self {
-                    runnable: tract,
-                    datasets: model.datasets.clone(),
-                })
-            }
-            _ => UnknownModelSourceSnafu {
-                model_source: source,
-            }
-            .fail()?,
+        let tract = crate::modelruntime::tract::Tract {
+            path: create_source_from(source)
+                .context(UnknownModelSourceSnafu)?
+                .pull(auth, Arc::new(Option::from(params)))
+                .context(UnableToLoadModelSnafu)?
+                .clone()
+                .to_string(),
         }
+        .load()
+        .context(UnableToInitModelSnafu {})?;
+
+        Ok(Self {
+            runnable: tract,
+            datasets: model.datasets.clone(),
+        })
     }
 
     pub async fn run(&self, df: Arc<DataFusion>, lookback_size: usize) -> Result<RecordBatch> {
-        let sql = format!(
-            "select * from datafusion.public.{} order by ts asc",
-            self.datasets[0]
-        );
-
         let data = df
             .ctx
-            .sql(&sql)
+            .sql(
+                &(format!(
+                    "select * from datafusion.public.{} order by ts asc",
+                    self.datasets[0]
+                )),
+            )
             .await
             .context(UnableToQuerySnafu {})?
             .collect()
