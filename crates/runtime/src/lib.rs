@@ -8,6 +8,7 @@ use snafu::prelude::*;
 use tokio::signal;
 
 use crate::datafusion::DataFusion;
+pub use notify::Error as NotifyError;
 
 pub mod auth;
 pub mod config;
@@ -23,7 +24,7 @@ pub mod modelruntime;
 pub mod modelsource;
 mod opentelemetry;
 pub mod podswatcher;
-pub use notify::Error as NotifyError;
+pub(crate) mod tracers;
 
 #[derive(Debug, Snafu)]
 pub enum Error {

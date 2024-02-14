@@ -37,6 +37,7 @@ use tonic_0_9_0::Status;
 use crate::datafusion::DataFusion;
 use crate::dataupdate::DataUpdate;
 use crate::dataupdate::UpdateType;
+use crate::{tracers::OnceTracer, warn_once};
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -80,6 +81,7 @@ const START_TIME_UNIX_NANO_COLUMN_NAME: &str = "start_time_unix_nano";
 
 pub struct Service {
     data_fusion: Arc<DataFusion>,
+    once_tracer: OnceTracer,
 }
 
 #[async_trait]
@@ -114,7 +116,8 @@ impl MetricsService for Service {
                                 let Some(backend) =
                                     self.data_fusion.get_backend(metric.name.as_str())
                                 else {
-                                    tracing::warn!(
+                                    warn_once!(
+                                        self.once_tracer,
                                         "No dataset defined for metric {}, skipping",
                                         metric.name
                                     );
@@ -545,7 +548,10 @@ fn append_null(
 }
 
 pub async fn start(bind_address: SocketAddr, data_fusion: Arc<DataFusion>) -> Result<()> {
-    let service = Service { data_fusion };
+    let service = Service {
+        data_fusion,
+        once_tracer: OnceTracer::new(),
+    };
     let svc = MetricsServiceServer::new(service).accept_compressed(CompressionEncoding::Gzip);
 
     tracing::info!("Spice Runtime OpenTelemetry listening on {bind_address}");
