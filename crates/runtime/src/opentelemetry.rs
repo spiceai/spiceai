@@ -117,9 +117,8 @@ impl MetricsService for Service {
                         match record_batch_result {
                             Ok(record_batch) => {
                                 let df = self.data_fusion.read().await;
-                                
-                                let Some(backend) = df.get_backend(metric.name.as_str())
-                                else {
+
+                                let Some(backend) = df.get_backend(metric.name.as_str()) else {
                                     warn_once!(
                                         self.once_tracer,
                                         "No dataset defined for metric {}, skipping",

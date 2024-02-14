@@ -2,7 +2,10 @@ use std::{collections::HashMap, fmt::Debug, sync::Arc};
 
 use app::App;
 use snafu::prelude::*;
-use tokio::{net::{TcpListener, ToSocketAddrs}, sync::RwLock};
+use tokio::{
+    net::{TcpListener, ToSocketAddrs},
+    sync::RwLock,
+};
 
 use crate::{datafusion::DataFusion, model::Model};
 

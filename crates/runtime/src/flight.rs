@@ -85,7 +85,14 @@ impl FlightService for Service {
         let ticket = request.into_inner();
         match std::str::from_utf8(&ticket.ticket) {
             Ok(sql) => {
-                let df = self.datafusion.read().await.ctx.sql(sql).await.map_err(to_tonic_err)?;
+                let df = self
+                    .datafusion
+                    .read()
+                    .await
+                    .ctx
+                    .sql(sql)
+                    .await
+                    .map_err(to_tonic_err)?;
                 let schema = df.schema().clone().into();
                 let results = df.collect().await.map_err(to_tonic_err)?;
                 if results.is_empty() {
