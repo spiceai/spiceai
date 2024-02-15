@@ -2,6 +2,7 @@
 
 use std::{collections::HashMap, sync::Arc};
 
+use app::App;
 use config::Config;
 use model::Model;
 use snafu::prelude::*;
@@ -82,7 +83,7 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct Runtime {
-    pub app: Arc<app::App>,
+    pub app: Arc<RwLock<App>>,
     pub config: config::Config,
     pub df: Arc<RwLock<DataFusion>>,
     pub models: Arc<HashMap<String, Model>>,
@@ -93,13 +94,13 @@ impl Runtime {
     #[must_use]
     pub fn new(
         config: Config,
-        app: app::App,
+        app: App,
         df: DataFusion,
         models: HashMap<String, Model>,
         pods_watcher: podswatcher::PodsWatcher,
     ) -> Self {
         Runtime {
-            app: Arc::new(app),
+            app: Arc::new(RwLock::new(app)),
             config,
             df: Arc::new(RwLock::new(df)),
             models: Arc::new(models),
@@ -257,14 +258,19 @@ impl Runtime {
     }
 
     pub async fn start_pods_watcher(&mut self) -> notify::Result<()> {
-        let mut current_app = Arc::clone(&self.app);
 
         let mut rx = self.pods_watcher.watch()?;
 
         while let Some(new_app) = rx.recv().await {
+            let current_app = self.app.read().await;
+            let current_datasets = current_app.datasets.clone();
+
             tracing::debug!("Updated pods information: {:?}", new_app);
             tracing::debug!("Previous pods information: {:?}", current_app);
 
+            drop(current_app);
+
+    
             let mut auth = auth::AuthProviders::default();
             if let Err(e) = auth.parse_from_config() {
                 tracing::warn!(
@@ -273,14 +279,8 @@ impl Runtime {
                 );
             }
 
-            let existing_dataset_names = current_app
-                .datasets
-                .iter()
-                .map(|ds| ds.name.clone())
-                .collect::<Vec<String>>();
-
             for ds in &new_app.datasets {
-                if !existing_dataset_names.contains(&ds.name) {
+                if !current_datasets.iter().any(|d| d.name == ds.name){
                     if let Err(err) =
                         Runtime::load_dataset(ds, &mut *self.df.write().await, &auth).await
                     {
@@ -289,7 +289,7 @@ impl Runtime {
                 }
             }
 
-            current_app = Arc::new(new_app);
+            *self.app.write().await = new_app;
         }
 
         Ok(())

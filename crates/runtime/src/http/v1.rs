@@ -5,6 +5,7 @@ pub(crate) mod datasets {
     use axum::{extract::Query, Extension, Json};
     use serde::Deserialize;
     use spicepod::component::dataset::Dataset;
+    use tokio::sync::RwLock;
 
     #[derive(Debug, Deserialize)]
     pub(crate) struct DatasetFilter {
@@ -15,17 +16,19 @@ pub(crate) mod datasets {
     }
 
     pub(crate) async fn get(
-        Extension(app): Extension<Arc<App>>,
+        Extension(app): Extension<Arc<RwLock<App>>>,
         Query(filter): Query<DatasetFilter>,
     ) -> Json<Vec<Dataset>> {
         let mut datasets: Vec<Dataset> = match filter.source {
             Some(source) => app
+                .read()
+                .await
                 .datasets
                 .iter()
                 .filter(|d| d.source() == source)
                 .cloned()
                 .collect(),
-            None => app.datasets.clone(),
+            None => app.read().await.datasets.clone(),
         };
 
         if filter.remove_views {
@@ -112,7 +115,7 @@ pub(crate) mod inference {
     }
 
     pub(crate) async fn get(
-        Extension(app): Extension<Arc<App>>,
+        Extension(app): Extension<Arc<RwLock<App>>>,
         Extension(df): Extension<Arc<RwLock<DataFusion>>>,
         Path(model_name): Path<String>,
         Query(params): Query<PredictParams>,
@@ -137,7 +140,7 @@ pub(crate) mod inference {
     }
 
     pub(crate) async fn post(
-        Extension(app): Extension<Arc<App>>,
+        Extension(app): Extension<Arc<RwLock<App>>>,
         Extension(df): Extension<Arc<RwLock<DataFusion>>>,
         Extension(models): Extension<Arc<HashMap<String, Model>>>,
         Json(payload): Json<BatchPredictRequest>,
@@ -172,7 +175,7 @@ pub(crate) mod inference {
     }
 
     async fn run_inference(
-        app: Arc<App>,
+        app: Arc<RwLock<App>>,
         df: Arc<RwLock<DataFusion>>,
         models: Arc<HashMap<String, Model>>,
         model_name: String,
@@ -180,7 +183,8 @@ pub(crate) mod inference {
     ) -> PredictResponse {
         let start_time = Instant::now();
 
-        let model = app.models.iter().find(|m| m.name == model_name);
+        let readable_app = app.read().await;
+        let model = readable_app.models.iter().find(|m| m.name == model_name);
 
         let Some(model) = model else {
             tracing::debug!("Model {model_name} not found");
