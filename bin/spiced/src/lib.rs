@@ -218,26 +218,37 @@ async fn initialize_dataconnector(
             let data_backend = df
                 .new_accelerated_backend(Arc::clone(ds))
                 .context(UnableToCreateBackendSnafu)?;
+            let data_backend = Arc::new(data_backend);
 
             if ds.mode() == Mode::ReadWrite {
                 if let Some(data_publisher) = data_connector.get_data_publisher() {
-                    df.attach_publisher(&ds.name.clone(), Arc::clone(ds), data_publisher)
+                    df.attach_publisher(&ds.name.clone(), Arc::clone(ds), Arc::new(data_publisher))
                         .await
                         .context(UnableToAttachDataConnectorSnafu {
                             data_connector: source,
                         })?;
                 } else {
                     tracing::warn!(
-                    "Data connector {source} does not support writes, but dataset {ds_name} is in read-write mode",
-                    ds_name = ds.name
-                );
+                        "Data connector {source} does not support writes, but dataset {ds_name} is in read-write mode",
+                        ds_name = ds.name
+                    );
                 }
+
+                df.attach_publisher(&ds.name.clone(), Arc::clone(ds), Arc::clone(&data_backend))
+                    .await
+                    .context(UnableToAttachDataConnectorSnafu {
+                        data_connector: source,
+                    })?;
             }
 
-            df.attach_connector_to_publisher(Arc::clone(ds), data_connector, data_backend)
-                .context(UnableToAttachDataConnectorSnafu {
-                    data_connector: source,
-                })?;
+            df.attach_connector_to_publisher(
+                Arc::clone(ds),
+                data_connector,
+                Arc::clone(&data_backend),
+            )
+            .context(UnableToAttachDataConnectorSnafu {
+                data_connector: source,
+            })?;
         }
         None => {
             if view_sql.is_some() {
@@ -246,7 +257,7 @@ async fn initialize_dataconnector(
                 let data_backend = df
                     .new_accelerated_backend(Arc::clone(ds))
                     .context(UnableToCreateBackendSnafu)?;
-                df.attach_publisher(&ds.name.clone(), Arc::clone(ds), data_backend)
+                df.attach_publisher(&ds.name.clone(), Arc::clone(ds), Arc::new(data_backend))
                     .await
                     .context(UnableToAttachDataConnectorSnafu {
                         data_connector: source,

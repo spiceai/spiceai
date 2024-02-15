@@ -75,6 +75,10 @@ impl DataPublisher for DuckDBBackend {
             Ok(())
         })
     }
+
+    fn name(&self) -> &str {
+        "DuckDB"
+    }
 }
 
 impl DuckDBBackend {

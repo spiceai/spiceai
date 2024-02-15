@@ -133,20 +133,31 @@ impl MetricsService for Service {
                                     update_type: UpdateType::Append,
                                 };
 
+                                let mut all_publishers_failed = true;
                                 let data_publishers = data_publishers.read().await;
                                 for publisher in data_publishers.iter() {
+                                    tracing::trace!(
+                                        "Adding OpenTelemetry data for {} to publisher {}",
+                                        metric.name.as_str(),
+                                        publisher.name()
+                                    );
                                     // We need to await the Future here in case it adds new columns to the schema and later metrics will need
                                     // to respect that schema.
                                     if let Err(e) = publisher
                                         .add_data(Arc::clone(&dataset), data_update.clone())
                                         .await
                                     {
-                                        rejected_data_points += data_points_count;
                                         tracing::error!(
                                             "Failed to add OpenTelemetry data to backend: {}",
                                             e
                                         );
+                                    } else {
+                                        all_publishers_failed = false;
                                     }
+                                }
+
+                                if all_publishers_failed {
+                                    rejected_data_points += data_points_count;
                                 }
                             }
                             Err(e) => {

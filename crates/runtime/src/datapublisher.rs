@@ -11,4 +11,6 @@ pub type AddDataResult<'a> =
 
 pub trait DataPublisher: Send + Sync {
     fn add_data(&self, dataset: Arc<Dataset>, data_update: DataUpdate) -> AddDataResult;
+
+    fn name(&self) -> &str;
 }

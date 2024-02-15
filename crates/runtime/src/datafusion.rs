@@ -63,7 +63,7 @@ pub enum Error {
     ExpectedSqlView,
 }
 
-type PublisherList = Arc<RwLock<Vec<Box<dyn DataPublisher>>>>;
+type PublisherList = Arc<RwLock<Vec<Arc<Box<dyn DataPublisher>>>>>;
 
 type DatasetAndPublishers = (Arc<Dataset>, PublisherList);
 
@@ -98,7 +98,7 @@ impl DataFusion {
         &mut self,
         table_name: &str,
         dataset: Arc<Dataset>,
-        publisher: Box<dyn DataPublisher>,
+        publisher: Arc<Box<dyn DataPublisher>>,
     ) -> Result<()> {
         let entry = self
             .data_publishers
@@ -163,7 +163,7 @@ impl DataFusion {
         &mut self,
         dataset: Arc<Dataset>,
         data_connector: Box<dyn DataConnector>,
-        publisher: Box<dyn DataPublisher>,
+        publisher: Arc<Box<dyn DataPublisher>>,
     ) -> Result<()> {
         let table_name = dataset.name.as_str();
         let table_exists = self.ctx.table_exist(table_name).unwrap_or(false);

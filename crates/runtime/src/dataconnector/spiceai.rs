@@ -147,6 +147,10 @@ impl DataPublisher for SpiceAI {
             Ok(())
         })
     }
+
+    fn name(&self) -> &str {
+        "SpiceAI"
+    }
 }
 
 impl SpiceAI {

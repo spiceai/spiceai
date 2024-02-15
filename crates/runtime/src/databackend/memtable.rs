@@ -69,6 +69,10 @@ impl DataPublisher for MemTableBackend {
             Ok(())
         })
     }
+
+    fn name(&self) -> &str {
+        "MemTable"
+    }
 }
 
 struct MemTableUpdate {
