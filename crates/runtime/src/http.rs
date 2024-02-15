@@ -27,7 +27,7 @@ pub(crate) async fn start<A>(
     bind_address: A,
     app: Arc<RwLock<App>>,
     df: Arc<RwLock<DataFusion>>,
-    models: Arc<HashMap<String, Model>>,
+    models: Arc<RwLock<HashMap<String, Model>>>,
 ) -> Result<()>
 where
     A: ToSocketAddrs + Debug,

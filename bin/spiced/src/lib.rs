@@ -81,7 +81,11 @@ pub async fn run(args: Args) -> Result<()> {
             .context(UnableToLoadDatasetSnafu)?;
     }
 
-    let model_map = load_models(&app, &auth);
+    let mut model_map = HashMap::with_capacity(app.models.len());
+
+    for model in &app.models {
+        Runtime:load_model(&model_map, &model, &auth);
+    }
 
     let pods_watcher = PodsWatcher::new(current_dir.clone());
 
@@ -103,26 +107,4 @@ fn load_auth_providers() -> runtime::auth::AuthProviders {
         );
     }
     auth
-}
-
-fn load_models(app: &App, auth: &runtime::auth::AuthProviders) -> HashMap<String, Model> {
-    let mut model_map = HashMap::with_capacity(app.models.len());
-    for m in &app.models {
-        tracing::info!("Deploying model [{}] from {}...", m.name, m.from);
-        match Model::load(m, auth.get(m.source().as_str())) {
-            Ok(in_m) => {
-                model_map.insert(m.name.clone(), in_m);
-                tracing::info!("Model [{}] deployed, ready for inferencing", m.name);
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Unable to load runnable model from spicepod {}, error: {}",
-                    m.name,
-                    e,
-                );
-            }
-        }
-    }
-
-    model_map
 }

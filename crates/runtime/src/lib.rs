@@ -86,7 +86,7 @@ pub struct Runtime {
     pub app: Arc<RwLock<App>>,
     pub config: config::Config,
     pub df: Arc<RwLock<DataFusion>>,
-    pub models: Arc<HashMap<String, Model>>,
+    pub models: Arc<RwLock<HashMap<String, Model>>>,
     pub pods_watcher: podswatcher::PodsWatcher,
 }
 
@@ -103,7 +103,7 @@ impl Runtime {
             app: Arc::new(RwLock::new(app)),
             config,
             df: Arc::new(RwLock::new(df)),
-            models: Arc::new(models),
+            models: Arc::new(RwLock::new(models)),
             pods_watcher,
         }
     }
@@ -233,6 +233,24 @@ impl Runtime {
         Ok(())
     }
 
+    pub fn load_model(models_map: &mut HashMap<String, Model>, m: &Model, auth: &auth::AuthProviders) -> HashMap<String, Model> {
+    {
+        tracing::info!("Deploying model [{}] from {}...", m.name, m.from);
+        match Model::load(m, auth.get(m.source().as_str())) {
+            Ok(in_m) => {
+                model_map.insert(m.name.clone(), in_m);
+                tracing::info!("Model [{}] deployed, ready for inferencing", m.name);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Unable to load runnable model from spicepod {}, error: {}",
+                    m.name,
+                    e,
+                );
+            }
+        }
+    }
+
     pub async fn start_servers(&mut self) -> Result<()> {
         let http_server_future = http::start(
             self.config.http_bind_address,
@@ -264,6 +282,7 @@ impl Runtime {
         while let Some(new_app) = rx.recv().await {
             let current_app = self.app.read().await;
             let current_datasets = current_app.datasets.clone();
+            let current_models = current_app.models.clone();
 
             tracing::debug!("Updated pods information: {:?}", new_app);
             tracing::debug!("Previous pods information: {:?}", current_app);
@@ -286,6 +305,27 @@ impl Runtime {
                     {
                         tracing::error!("Unable to load dataset: {err:?}");
                     }
+                }
+            }
+
+            for model in &new_app.models {
+                if !current_models.iter().any(|m| m.name == model.name) {
+                    tracing::info!("TODO: load new model: {model:?}");
+
+                    // tracing::info!("Deploying model [{}] from {}...", model.name, model.from);
+                    // match Model::load(model, auth.get(model.source().as_str())) {
+                    //     Ok(in_m) => {
+                    //         self.models.write().await.insert(model.name.clone(), in_m);
+                    //         tracing::info!("Model [{}] deployed, ready for inferencing", model.name);
+                    //     }
+                    //     Err(e) => {
+                    //         tracing::warn!(
+                    //             "Unable to load runnable model from spicepod {}, error: {}",
+                    //             model.name,
+                    //             e,
+                    //         );
+                    //     }
+                    // }
                 }
             }
 

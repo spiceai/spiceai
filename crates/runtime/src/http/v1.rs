@@ -119,7 +119,7 @@ pub(crate) mod inference {
         Extension(df): Extension<Arc<RwLock<DataFusion>>>,
         Path(model_name): Path<String>,
         Query(params): Query<PredictParams>,
-        Extension(models): Extension<Arc<HashMap<String, Model>>>,
+        Extension(models): Extension<Arc<RwLock<HashMap<String, Model>>>>,
     ) -> Response {
         let model_predict_response =
             run_inference(app, df, models, model_name, params.lookback).await;
@@ -142,7 +142,7 @@ pub(crate) mod inference {
     pub(crate) async fn post(
         Extension(app): Extension<Arc<RwLock<App>>>,
         Extension(df): Extension<Arc<RwLock<DataFusion>>>,
-        Extension(models): Extension<Arc<HashMap<String, Model>>>,
+        Extension(models): Extension<Arc<RwLock<HashMap<String, Model>>>>,
         Json(payload): Json<BatchPredictRequest>,
     ) -> Response {
         let start_time = Instant::now();
@@ -177,7 +177,7 @@ pub(crate) mod inference {
     async fn run_inference(
         app: Arc<RwLock<App>>,
         df: Arc<RwLock<DataFusion>>,
-        models: Arc<HashMap<String, Model>>,
+        models: Arc<RwLock<HashMap<String, Model>>>,
         model_name: String,
         lookback: usize,
     ) -> PredictResponse {
@@ -185,7 +185,6 @@ pub(crate) mod inference {
 
         let readable_app = app.read().await;
         let model = readable_app.models.iter().find(|m| m.name == model_name);
-
         let Some(model) = model else {
             tracing::debug!("Model {model_name} not found");
             return PredictResponse {
@@ -199,7 +198,8 @@ pub(crate) mod inference {
             };
         };
 
-        let Some(runnable) = models.get(&model.name) else {
+        let loaded_models = models.read().await;
+        let Some(runnable) = loaded_models.get(&model.name) else {
             tracing::debug!("Model {model_name} not found");
             return PredictResponse {
                 status: PredictStatus::BadRequest,
