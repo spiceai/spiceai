@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 use app::App;
 use clap::Parser;
+use flightrepl::ReplConfig;
 use runtime::config::Config as RuntimeConfig;
 use runtime::model::Model;
 
@@ -56,6 +57,13 @@ pub struct Args {
     /// All runtime related arguments
     #[clap(flatten)]
     pub runtime: RuntimeConfig,
+
+    /// Starts a SQL REPL to interactively query against the runtime's Flight endpoint.
+    #[arg(long, help_heading = "SQL REPL")]
+    pub repl: bool,
+
+    #[clap(flatten)]
+    pub repl_config: ReplConfig,
 }
 
 pub async fn run(args: Args) -> Result<()> {

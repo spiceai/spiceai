@@ -3933,6 +3933,7 @@ version = "0.10.0-alpha.0"
 dependencies = [
  "app",
  "clap",
+ "flightrepl",
  "metrics",
  "metrics-exporter-prometheus",
  "runtime",
