@@ -27,6 +27,7 @@ use opentelemetry_proto::tonic::metrics::v1::number_data_point::Value;
 use opentelemetry_proto::tonic::metrics::v1::DataPointFlags;
 use opentelemetry_proto::tonic::metrics::v1::NumberDataPoint;
 use snafu::prelude::*;
+use tokio::sync::RwLock;
 use tonic_0_9_0::async_trait;
 use tonic_0_9_0::codec::CompressionEncoding;
 use tonic_0_9_0::transport::Server;
@@ -80,7 +81,7 @@ const TIME_UNIX_NANO_COLUMN_NAME: &str = "time_unix_nano";
 const START_TIME_UNIX_NANO_COLUMN_NAME: &str = "start_time_unix_nano";
 
 pub struct Service {
-    data_fusion: Arc<DataFusion>,
+    data_fusion: Arc<RwLock<DataFusion>>,
     once_tracer: OnceTracer,
 }
 
@@ -98,6 +99,8 @@ impl MetricsService for Service {
                     if let Some(data) = metric.data {
                         let existing_schema = match self
                             .data_fusion
+                            .read()
+                            .await
                             .get_arrow_schema(metric.name.as_str())
                             .await
                         {
@@ -113,9 +116,9 @@ impl MetricsService for Service {
 
                         match record_batch_result {
                             Ok(record_batch) => {
-                                let Some(backend) =
-                                    self.data_fusion.get_backend(metric.name.as_str())
-                                else {
+                                let df = self.data_fusion.read().await;
+
+                                let Some(backend) = df.get_backend(metric.name.as_str()) else {
                                     warn_once!(
                                         self.once_tracer,
                                         "No dataset defined for metric {}, skipping",
@@ -547,7 +550,7 @@ fn append_null(
     }
 }
 
-pub async fn start(bind_address: SocketAddr, data_fusion: Arc<DataFusion>) -> Result<()> {
+pub async fn start(bind_address: SocketAddr, data_fusion: Arc<RwLock<DataFusion>>) -> Result<()> {
     let service = Service {
         data_fusion,
         once_tracer: OnceTracer::new(),
