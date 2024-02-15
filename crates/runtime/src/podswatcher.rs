@@ -55,7 +55,7 @@ impl PodsWatcher {
                                 tracing::error!("Pods content watcher is unable to notify detected state change: {:?}", err);
                             }
                         } else {
-                            tracing::debug!("Invalid app state detected, ignoring changes.");
+                            tracing::warn!("Invalid app state detected, unable to load pods information");
                         }
                     }
                     Err(e) => tracing::error!("Pods content watcher error: {:?}", e),
