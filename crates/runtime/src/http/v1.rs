@@ -96,7 +96,7 @@ pub(crate) mod inference {
         pub lookback: usize,
 
         #[serde(skip_serializing_if = "Vec::is_empty")]
-        pub forecast: Vec<f32>,
+        pub prediction: Vec<f32>,
 
         pub duration_ms: u128,
     }
@@ -186,7 +186,7 @@ pub(crate) mod inference {
                 error_message: Some(format!("Model {model_name} not found")),
                 model_name,
                 lookback,
-                forecast: vec![],
+                prediction: vec![],
                 duration_ms: start_time.elapsed().as_millis(),
             };
         };
@@ -198,7 +198,7 @@ pub(crate) mod inference {
                 error_message: Some(format!("Model {model_name} not found")),
                 model_name,
                 lookback,
-                forecast: vec![],
+                prediction: vec![],
                 duration_ms: start_time.elapsed().as_millis(),
             };
         };
@@ -213,7 +213,7 @@ pub(crate) mod inference {
                             error_message: None,
                             model_name,
                             lookback,
-                            forecast: result,
+                            prediction: result,
                             duration_ms: start_time.elapsed().as_millis(),
                         };
                     }
@@ -227,7 +227,7 @@ pub(crate) mod inference {
                         ),
                         model_name,
                         lookback,
-                        forecast: vec![],
+                        prediction: vec![],
                         duration_ms: start_time.elapsed().as_millis(),
                     };
                 }
@@ -241,7 +241,7 @@ pub(crate) mod inference {
                     ),
                     model_name,
                     lookback,
-                    forecast: vec![],
+                    prediction: vec![],
                     duration_ms: start_time.elapsed().as_millis(),
                 }
             }
@@ -252,7 +252,7 @@ pub(crate) mod inference {
                     error_message: Some(e.to_string()),
                     model_name,
                     lookback,
-                    forecast: vec![],
+                    prediction: vec![],
                     duration_ms: start_time.elapsed().as_millis(),
                 }
             }
