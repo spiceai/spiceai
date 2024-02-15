@@ -19,23 +19,23 @@ mod tls;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to connect to server"))]
+    #[snafu(display("Unable to connect to server:m {source}"))]
     UnableToConnectToServer { source: tls::Error },
 
-    #[snafu(display("Invalid metadata value"))]
+    #[snafu(display("Invalid metadata value: {source}"))]
     InvalidMetadata {
         source: tonic::metadata::errors::InvalidMetadataValue,
     },
 
-    #[snafu(display("Unable to perform handshake"))]
+    #[snafu(display("Unable to perform handshake: {source}"))]
     UnableToPerformHandshake { source: tonic::Status },
 
-    #[snafu(display("Unable to convert metadata to string"))]
+    #[snafu(display("Unable to convert metadata to string: {source}"))]
     UnableToConvertMetadataToString {
         source: tonic::metadata::errors::ToStrError,
     },
 
-    #[snafu(display("Unable to query"))]
+    #[snafu(display("Unable to query: {source}"))]
     UnableToQuery { source: tonic::Status },
 
     #[snafu(display("Unauthorized"))]

@@ -18,7 +18,7 @@ pub struct App {
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to load spicepod {}", path.display()))]
+    #[snafu(display("Unable to load spicepod {}: {source}", path.display()))]
     UnableToLoadSpicepod {
         source: spicepod::Error,
         path: PathBuf,
