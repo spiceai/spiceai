@@ -1460,6 +1460,7 @@ dependencies = [
 name = "flight_client"
 version = "0.10.0-alpha.0"
 dependencies = [
+ "arrow",
  "arrow-flight",
  "base64",
  "bytes",

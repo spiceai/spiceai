@@ -65,8 +65,9 @@ pub(crate) mod inference {
         lookback: usize,
     }
 
+    // This needs to come from the training_run postgres table in cloud, for the specific training run that made the model.
     fn default_lookback() -> usize {
-        10
+        4
     }
 
     pub(crate) async fn get(
