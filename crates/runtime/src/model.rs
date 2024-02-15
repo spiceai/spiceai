@@ -10,7 +10,7 @@ use tokio::sync::RwLock;
 
 pub struct Model {
     runnable: Box<dyn Runnable>,
-    datasets: Vec<String>,
+    model: spicepod::component::model::Model,
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -56,7 +56,7 @@ impl Model {
 
         Ok(Self {
             runnable: tract,
-            datasets: model.datasets.clone(),
+            model: model.clone(),
         })
     }
 
@@ -72,7 +72,7 @@ impl Model {
             .sql(
                 &(format!(
                     "select * from datafusion.public.{} order by ts asc",
-                    self.datasets[0]
+                    self.model.datasets[0]
                 )),
             )
             .await

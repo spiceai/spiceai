@@ -93,6 +93,9 @@ pub(crate) mod inference {
 
         pub model_name: String,
 
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub model_version: Option<String>,
+
         pub lookback: usize,
 
         #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -185,6 +188,7 @@ pub(crate) mod inference {
                 status: PredictStatus::BadRequest,
                 error_message: Some(format!("Model {model_name} not found")),
                 model_name,
+                model_version: None,
                 lookback,
                 prediction: vec![],
                 duration_ms: start_time.elapsed().as_millis(),
@@ -197,6 +201,7 @@ pub(crate) mod inference {
                 status: PredictStatus::BadRequest,
                 error_message: Some(format!("Model {model_name} not found")),
                 model_name,
+                model_version: Some(model.version()),
                 lookback,
                 prediction: vec![],
                 duration_ms: start_time.elapsed().as_millis(),
@@ -212,6 +217,7 @@ pub(crate) mod inference {
                             status: PredictStatus::Success,
                             error_message: None,
                             model_name,
+                            model_version: Some(model.version()),
                             lookback,
                             prediction: result,
                             duration_ms: start_time.elapsed().as_millis(),
@@ -226,6 +232,7 @@ pub(crate) mod inference {
                             "Unable to cast inference result to Float32Array".to_string(),
                         ),
                         model_name,
+                        model_version: Some(model.version()),
                         lookback,
                         prediction: vec![],
                         duration_ms: start_time.elapsed().as_millis(),
@@ -240,6 +247,7 @@ pub(crate) mod inference {
                         "Unable to find column 'y' in inference result".to_string(),
                     ),
                     model_name,
+                    model_version: Some(model.version()),
                     lookback,
                     prediction: vec![],
                     duration_ms: start_time.elapsed().as_millis(),
@@ -251,6 +259,7 @@ pub(crate) mod inference {
                     status: PredictStatus::InternalError,
                     error_message: Some(e.to_string()),
                     model_name,
+                    model_version: Some(model.version()),
                     lookback,
                     prediction: vec![],
                     duration_ms: start_time.elapsed().as_millis(),
