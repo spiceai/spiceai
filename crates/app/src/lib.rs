@@ -55,6 +55,9 @@ impl App {
             for dataset in &dependent_spicepod.datasets {
                 datasets.push(dataset.clone());
             }
+            for model in &dependent_spicepod.models {
+                models.push(model.clone());
+            }
             spicepods.push(dependent_spicepod);
         }
 

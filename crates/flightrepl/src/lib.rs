@@ -14,35 +14,34 @@ use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 use tonic::transport::Channel;
 use tonic::IntoRequest;
-use tracing_subscriber::filter::Directive;
 
 #[derive(Parser)]
 #[clap(about = "Spice.ai Flight Query Utility")]
-pub struct Args {
+pub struct ReplConfig {
     #[arg(
         long,
         value_name = "FLIGHT_ENDPOINT",
-        default_value = "http://localhost:50051"
+        default_value = "http://localhost:50051",
+        help_heading = "SQL REPL"
     )]
-    pub flight_endpoint: String,
+    pub repl_flight_endpoint: String,
 }
 
-/// Reads a Parquet file and sends it via DoPut to an Apache Arrow Flight endpoint.
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let _ = init_tracing();
-    let args = Args::parse();
-
+#[allow(clippy::missing_errors_doc)]
+pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Error>> {
     // Set up the Flight client
-    let channel = Channel::from_shared(args.flight_endpoint)?
+    let channel = Channel::from_shared(repl_config.repl_flight_endpoint)?
         .connect()
         .await?;
     let mut client = FlightServiceClient::new(channel);
 
     let mut rl = DefaultEditor::new()?;
 
+    println!("Welcome to the interactive Spice.ai SQL Query Utility! Type 'help' for help.\n");
+    println!("show tables; -- list available tables");
+
     loop {
-        let line_result = rl.readline("query> ");
+        let line_result = rl.readline("sql> ");
         let line = match line_result {
             Ok(line) => line,
             Err(ReadlineError::Interrupted | ReadlineError::Eof) => {
@@ -117,21 +116,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Error displaying results: {e}");
         };
     }
-
-    Ok(())
-}
-
-fn init_tracing() -> Result<(), Box<dyn std::error::Error>> {
-    let filter = tracing_subscriber::EnvFilter::builder()
-        .with_default_directive("flightrepl".parse::<Directive>()?)
-        .with_env_var("REPL_LOG")
-        .from_env_lossy();
-
-    let subscriber = tracing_subscriber::FmtSubscriber::builder()
-        .with_env_filter(filter)
-        .with_ansi(true)
-        .finish();
-    tracing::subscriber::set_global_default(subscriber)?;
 
     Ok(())
 }

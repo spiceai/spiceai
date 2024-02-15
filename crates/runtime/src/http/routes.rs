@@ -7,13 +7,12 @@ use axum::{
     routing::{get, Router},
     Extension,
 };
-use tokio::sync::RwLock;
 
 use super::v1;
 
 pub(crate) fn routes(
     app: Arc<App>,
-    df: Arc<RwLock<DataFusion>>,
+    df: Arc<DataFusion>,
     models: Arc<HashMap<String, Model>>,
 ) -> Router {
     Router::new()
