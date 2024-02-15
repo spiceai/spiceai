@@ -27,7 +27,7 @@ use arrow_flight::{
 };
 
 pub struct Service {
-    datafusion: Arc<DataFusion>,
+    datafusion: Arc<RwLock<DataFusion>>,
     channel_map: Arc<RwLock<HashMap<String, Arc<Sender<DataUpdate>>>>>,
 }
 
@@ -66,7 +66,7 @@ impl FlightService for Service {
         let table_path = ListingTableUrl::parse(&request.path[0]).map_err(to_tonic_err)?;
 
         let schema = listing_options
-            .infer_schema(&self.datafusion.ctx.state(), &table_path)
+            .infer_schema(&self.datafusion.read().await.ctx.state(), &table_path)
             .await
             .map_err(to_tonic_err)?;
 
@@ -85,7 +85,14 @@ impl FlightService for Service {
         let ticket = request.into_inner();
         match std::str::from_utf8(&ticket.ticket) {
             Ok(sql) => {
-                let df = self.datafusion.ctx.sql(sql).await.map_err(to_tonic_err)?;
+                let df = self
+                    .datafusion
+                    .read()
+                    .await
+                    .ctx
+                    .sql(sql)
+                    .await
+                    .map_err(to_tonic_err)?;
                 let schema = df.schema().clone().into();
                 let results = df.collect().await.map_err(to_tonic_err)?;
                 if results.is_empty() {
@@ -178,7 +185,9 @@ impl FlightService for Service {
 
         let path = fd.path.join(".");
 
-        let Some(publishers) = self.datafusion.get_publisher(&path) else {
+        let df = self.datafusion.read().await;
+
+        let Some(publishers) = df.get_publisher(&path) else {
             return Err(Status::invalid_argument(format!(
                 "No publishers registered for path: {path:?}",
             )));
@@ -318,7 +327,7 @@ impl FlightService for Service {
 
         let data_path = flight_descriptor.path.join(".");
 
-        if !self.datafusion.has_publisher(&data_path) {
+        if !self.datafusion.read().await.has_publisher(&data_path) {
             return Err(Status::invalid_argument(format!(
                 r#"Unknown dataset: "{data_path}""#,
             )));
@@ -383,6 +392,8 @@ impl FlightService for Service {
         let datafusion = Arc::clone(&self.datafusion);
         tokio::spawn(async move {
             let Ok(df) = datafusion
+                .read()
+                .await
                 .ctx
                 .sql(&format!(r#"SELECT * FROM "{data_path}""#))
                 .await
@@ -433,7 +444,7 @@ pub enum Error {
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
-pub async fn start(bind_address: std::net::SocketAddr, df: Arc<DataFusion>) -> Result<()> {
+pub async fn start(bind_address: std::net::SocketAddr, df: Arc<RwLock<DataFusion>>) -> Result<()> {
     let service = Service {
         datafusion: df.clone(),
         channel_map: Arc::new(RwLock::new(HashMap::new())),

@@ -6,6 +6,7 @@ use crate::DataFusion;
 use arrow::record_batch::RecordBatch;
 use snafu::prelude::*;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 
 pub struct Model {
     runnable: Box<dyn Runnable>,
@@ -59,8 +60,14 @@ impl Model {
         })
     }
 
-    pub async fn run(&self, df: Arc<DataFusion>, lookback_size: usize) -> Result<RecordBatch> {
+    pub async fn run(
+        &self,
+        df: Arc<RwLock<DataFusion>>,
+        lookback_size: usize,
+    ) -> Result<RecordBatch> {
         let data = df
+            .read()
+            .await
             .ctx
             .sql(
                 &(format!(
