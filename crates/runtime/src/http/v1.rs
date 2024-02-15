@@ -48,9 +48,9 @@ pub(crate) mod inference {
         Extension, Json,
     };
     use serde::{Deserialize, Serialize};
-    use tokio::sync::RwLock;
     use std::time::Instant;
     use std::{collections::HashMap, sync::Arc};
+    use tokio::sync::RwLock;
     use tract_core::tract_data::itertools::Itertools;
 
     #[derive(Serialize)]
