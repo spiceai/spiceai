@@ -117,9 +117,8 @@ impl MetricsService for Service {
                         match record_batch_result {
                             Ok(record_batch) => {
                                 let df = self.data_fusion.read().await;
-                            
-                                let Some(publishers) =
-                                    df.get_publisher(metric.name.as_str())
+
+                                let Some(publishers) = df.get_publisher(metric.name.as_str())
                                 else {
                                     warn_once!(
                                         self.once_tracer,
