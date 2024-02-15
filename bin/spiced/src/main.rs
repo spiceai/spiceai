@@ -32,6 +32,13 @@ fn main() {
         }
     };
 
+    if args.repl {
+        if let Err(e) = tokio_runtime.block_on(flightrepl::run(args.repl_config)) {
+            tracing::error!("Flight REPL error: {e}");
+        };
+        return;
+    }
+
     tracing::trace!("Starting Spice Runtime!");
 
     if let Err(err) = tokio_runtime.block_on(start_runtime(args)) {
