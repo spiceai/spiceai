@@ -1,7 +1,11 @@
 use snafu::prelude::*;
+use spicepod::component::dataset::Dataset;
 use std::sync::Arc;
 
-use crate::dataupdate::{DataUpdate, UpdateType};
+use crate::{
+    datapublisher::{AddDataResult, DataPublisher},
+    dataupdate::{DataUpdate, UpdateType},
+};
 use arrow::record_batch::RecordBatch;
 use datafusion::{
     datasource::MemTable,
@@ -14,8 +18,6 @@ use datafusion::{
         TableReference,
     },
 };
-
-use super::{AddDataResult, DataBackend};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -48,21 +50,15 @@ impl MemTableBackend {
     }
 }
 
-impl DataBackend for MemTableBackend {
-    fn add_data(&self, data_update: DataUpdate) -> AddDataResult {
+impl DataPublisher for MemTableBackend {
+    fn add_data(&self, _dataset: Arc<Dataset>, data_update: DataUpdate) -> AddDataResult {
         Box::pin(async move {
             if data_update.data.is_empty() {
-                tracing::trace!(
-                    "No data to add for log sequence number {log_sequence_number:?}",
-                    log_sequence_number = data_update.log_sequence_number
-                );
+                tracing::trace!("No data to add");
                 return Ok(());
             }
 
-            let log_sequence_number = data_update.log_sequence_number.unwrap_or_default();
-
             let table_update = MemTableUpdate {
-                log_sequence_number,
                 name: self.name.clone(),
                 data: data_update.data,
                 update_type: data_update.update_type,
@@ -76,7 +72,6 @@ impl DataBackend for MemTableBackend {
 }
 
 struct MemTableUpdate {
-    log_sequence_number: u64,
     name: String,
     data: Vec<RecordBatch>,
     update_type: UpdateType,
@@ -84,12 +79,12 @@ struct MemTableUpdate {
 }
 
 impl MemTableUpdate {
-    fn temp_table_name(name: &str, log_sequence_number: u64) -> String {
-        format!("{name}_{log_sequence_number}")
+    fn temp_table_name(name: &str) -> String {
+        format!("{name}_temp")
     }
 
     async fn update(&self) -> Result<()> {
-        let temp_table_name = MemTableUpdate::temp_table_name(&self.name, self.log_sequence_number);
+        let temp_table_name = MemTableUpdate::temp_table_name(&self.name);
         let sql_stmt = match self.update_type {
             UpdateType::Overwrite => format!(
                 r#"CREATE OR REPLACE TABLE "{name}" AS SELECT * FROM "{temp_table_name}""#,
@@ -157,10 +152,7 @@ impl MemTableUpdate {
             .unwrap_or(false);
 
         if !table_exists {
-            tracing::trace!(
-                "Creating table for log sequence number {:?}",
-                self.log_sequence_number
-            );
+            tracing::trace!("Creating table");
             let schema = self.data[0].schema();
             let table =
                 MemTable::try_new(schema, vec![self.data.clone()]).context(UnableToAddDataSnafu)?;
@@ -169,10 +161,7 @@ impl MemTableUpdate {
                 .register_table(TableReference::bare(self.name.clone()), Arc::new(table))
                 .context(UnableToAddDataSnafu)?;
 
-            tracing::trace!(
-                "Created table for log sequence number {:?}",
-                self.log_sequence_number
-            );
+            tracing::trace!("Created table");
 
             return Ok(true);
         };
@@ -182,10 +171,8 @@ impl MemTableUpdate {
 
 impl Drop for MemTableUpdate {
     fn drop(&mut self) {
-        let temp_table_name = TableReference::bare(MemTableUpdate::temp_table_name(
-            self.name.as_str(),
-            self.log_sequence_number,
-        ));
+        let temp_table_name =
+            TableReference::bare(MemTableUpdate::temp_table_name(self.name.as_str()));
         let deregister_result = self.ctx.deregister_table(temp_table_name);
         if let Err(e) = deregister_result {
             tracing::error!("Error dropping temp table: {e:?}");

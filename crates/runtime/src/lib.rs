@@ -15,6 +15,7 @@ pub mod config;
 pub mod databackend;
 pub mod dataconnector;
 pub mod datafusion;
+pub mod datapublisher;
 pub mod dataupdate;
 mod flight;
 mod http;

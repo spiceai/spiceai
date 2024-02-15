@@ -113,8 +113,8 @@ impl MetricsService for Service {
 
                         match record_batch_result {
                             Ok(record_batch) => {
-                                let Some(backend) =
-                                    self.data_fusion.get_backend(metric.name.as_str())
+                                let Some(publishers) =
+                                    self.data_fusion.get_publisher(metric.name.as_str())
                                 else {
                                     warn_once!(
                                         self.once_tracer,
@@ -125,19 +125,28 @@ impl MetricsService for Service {
                                     continue;
                                 };
 
-                                let add_data_future = backend.add_data(DataUpdate {
-                                    log_sequence_number: None,
+                                let dataset = Arc::clone(&publishers.0);
+                                let data_publishers = Arc::clone(&publishers.1);
+
+                                let data_update = DataUpdate {
                                     data: vec![record_batch],
                                     update_type: UpdateType::Append,
-                                });
-                                // We need to await the Future here in case it adds new columns to the schema and later metrics will need
-                                // to respect that schema.
-                                if let Err(e) = add_data_future.await {
-                                    rejected_data_points += data_points_count;
-                                    tracing::error!(
-                                        "Failed to add OpenTelemetry data to backend: {}",
-                                        e
-                                    );
+                                };
+
+                                let data_publishers = data_publishers.read().await;
+                                for publisher in data_publishers.iter() {
+                                    // We need to await the Future here in case it adds new columns to the schema and later metrics will need
+                                    // to respect that schema.
+                                    if let Err(e) = publisher
+                                        .add_data(Arc::clone(&dataset), data_update.clone())
+                                        .await
+                                    {
+                                        rejected_data_points += data_points_count;
+                                        tracing::error!(
+                                            "Failed to add OpenTelemetry data to backend: {}",
+                                            e
+                                        );
+                                    }
                                 }
                             }
                             Err(e) => {

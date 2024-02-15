@@ -43,6 +43,19 @@ pub struct Dataset {
 }
 
 impl Dataset {
+    #[must_use]
+    pub fn new(from: String, name: String) -> Self {
+        Dataset {
+            from,
+            name,
+            sql: None,
+            sql_ref: None,
+            params: Option::default(),
+            acceleration: None,
+            depends_on: Vec::default(),
+        }
+    }
+
     /// Returns the dataset source - the first part of the `from` field before the first `/`.
     ///
     /// # Examples

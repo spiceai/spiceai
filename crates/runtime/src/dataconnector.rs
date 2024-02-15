@@ -104,7 +104,6 @@ impl dyn DataConnector + '_ {
                 loop {
                     tracing::info!("Refreshing data for {}", dataset.name);
                     yield DataUpdate {
-                        log_sequence_number: None,
                         data: self.get_all_data(dataset).await,
                         update_type: UpdateType::Overwrite,
                     };
@@ -117,7 +116,6 @@ impl dyn DataConnector + '_ {
         // Otherwise, just return the data once.
         Box::pin(stream::once(async move {
             DataUpdate {
-                log_sequence_number: None,
                 data: self.get_all_data(dataset).await,
                 update_type: UpdateType::Overwrite,
             }

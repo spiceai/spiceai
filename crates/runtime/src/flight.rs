@@ -178,12 +178,13 @@ impl FlightService for Service {
 
         let path = fd.path.join(".");
 
-        let Some(backend) = self.datafusion.get_backend(&path) else {
+        let Some(publishers) = self.datafusion.get_publisher(&path) else {
             return Err(Status::invalid_argument(format!(
-                "No backend registered for path: {path:?}",
+                "No publishers registered for path: {path:?}",
             )));
         };
-        let backend = Arc::clone(backend);
+        let dataset = Arc::clone(&publishers.0);
+        let data_publishers = Arc::clone(&publishers.1);
 
         let schema = try_schema_from_flatbuffer_bytes(&message.data_header).map_err(|e| {
             Status::internal(format!("Unable to get schema from data header: {e:?}"))
@@ -209,7 +210,8 @@ impl FlightService for Service {
         let response_stream = stream::unfold(streaming_flight, move |mut flight| {
             let schema = Arc::clone(&schema);
             let dictionaries_by_id = Arc::clone(&dictionaries_by_id);
-            let backend = Arc::clone(&backend);
+            let dataset = Arc::clone(&dataset);
+            let data_publishers = Arc::clone(&data_publishers);
             let path = path.clone();
             let channel_map = Arc::clone(&channel_map);
             async move {
@@ -230,7 +232,6 @@ impl FlightService for Service {
 
                         let data_update = DataUpdate {
                             data: vec![new_batch],
-                            log_sequence_number: None,
                             update_type: UpdateType::Append,
                         };
 
@@ -238,13 +239,16 @@ impl FlightService for Service {
                             let _ = channel.send(data_update.clone());
                         };
 
-                        if let Err(err) = backend
-                            .add_data(data_update)
-                            .await
-                            .map_err(|e| Status::internal(format!("Unable to add data: {e:?}")))
-                        {
-                            return Some((Err(err), flight));
-                        };
+                        let data_publishers = data_publishers.read().await;
+                        for publisher in data_publishers.iter() {
+                            if let Err(err) = publisher
+                                .add_data(Arc::clone(&dataset), data_update.clone())
+                                .await
+                                .map_err(|e| Status::internal(format!("Unable to add data: {e:?}")))
+                            {
+                                return Some((Err(err), flight));
+                            };
+                        }
 
                         Some((Ok(PutResult::default()), flight))
                     }
@@ -314,7 +318,7 @@ impl FlightService for Service {
 
         let data_path = flight_descriptor.path.join(".");
 
-        if !self.datafusion.has_backend(&data_path) {
+        if !self.datafusion.has_publisher(&data_path) {
             return Err(Status::invalid_argument(format!(
                 r#"Unknown dataset: "{data_path}""#,
             )));
@@ -395,7 +399,6 @@ impl FlightService for Service {
             for batch in &results {
                 let data_update = DataUpdate {
                     data: vec![batch.clone()],
-                    log_sequence_number: None,
                     update_type: UpdateType::Append,
                 };
                 let _ = tx.send(data_update);

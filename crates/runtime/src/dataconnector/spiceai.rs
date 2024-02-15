@@ -4,6 +4,7 @@ use flight_client::FlightClient;
 use futures::StreamExt;
 use futures_core::stream::BoxStream;
 use snafu::prelude::*;
+use std::borrow::Borrow;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,6 +13,7 @@ use std::{collections::HashMap, future::Future};
 use spicepod::component::dataset::Dataset;
 
 use crate::auth::AuthProvider;
+use crate::datapublisher::{AddDataResult, DataPublisher};
 use crate::dataupdate::{DataUpdate, UpdateType};
 use crate::info_spaced;
 use crate::tracers::SpacedTracer;
@@ -91,7 +93,6 @@ impl DataConnector for SpiceAI {
               Some(Ok(decoded_data)) => match decoded_data.payload {
                   DecodedPayload::RecordBatch(batch) => {
                       yield DataUpdate {
-                        log_sequence_number: None,
                         data: vec![batch],
                         update_type: UpdateType::Append,
                       };
@@ -125,13 +126,11 @@ impl DataConnector for SpiceAI {
     fn supports_data_writes(&self, _dataset: &Dataset) -> bool {
         true
     }
+}
 
+impl DataPublisher for SpiceAI {
     /// Adds data ingested locally back to the source.
-    fn add_data(
-        &self,
-        dataset: &Dataset,
-        data_update: DataUpdate,
-    ) -> Pin<Box<dyn Future<Output = super::AnyErrorResult>>> {
+    fn add_data(&self, dataset: Arc<Dataset>, data_update: DataUpdate) -> AddDataResult {
         let dataset_path = Self::spice_dataset_path(dataset);
         let mut client = self.flight.client.clone();
         let spaced_trace = Arc::clone(&self.spaced_trace);
@@ -167,7 +166,8 @@ impl SpiceAI {
     ///
     /// This function returns the full dataset path for the given dataset as you would query for it in Spice.
     /// i.e. `<org>.<app>.<dataset_name>`
-    fn spice_dataset_path(dataset: &Dataset) -> String {
+    fn spice_dataset_path<T: Borrow<Dataset>>(dataset: T) -> String {
+        let dataset = dataset.borrow();
         let path = dataset.path();
         let path_parts: Vec<&str> = path.split('/').collect();
 

@@ -88,6 +88,7 @@ pub struct Args {
     pub repl_config: ReplConfig,
 }
 
+#[allow(clippy::too_many_lines)]
 pub async fn run(args: Args) -> Result<()> {
     let current_dir = env::current_dir().unwrap_or(PathBuf::from("."));
 
@@ -107,6 +108,8 @@ pub async fn run(args: Args) -> Result<()> {
     let mut df = runtime::datafusion::DataFusion::new();
 
     for ds in &app.datasets {
+        let ds_name = ds.name.clone();
+        let ds = Arc::new(ds.clone());
         if ds.acceleration.is_none() && !ds.is_view() {
             tracing::warn!("No acceleration specified for dataset: {}", ds.name);
             continue;
@@ -143,29 +146,32 @@ pub async fn run(args: Args) -> Result<()> {
         match data_connector {
             Some(data_connector) => {
                 let data_connector = Box::leak(data_connector);
-                let data_backend = df.new_backend(ds).context(UnableToCreateBackendSnafu)?;
+                let data_backend = df
+                    .new_accelerated_backend(Arc::clone(&ds))
+                    .context(UnableToCreateBackendSnafu)?;
 
-                df.attach(ds, data_connector, data_backend).context(
-                    UnableToAttachDataConnectorSnafu {
+                df.attach_connector_to_publisher(ds, data_connector, data_backend)
+                    .context(UnableToAttachDataConnectorSnafu {
                         data_connector: source,
-                    },
-                )?;
+                    })?;
             }
             None => {
                 if view_sql.is_some() {
-                    df.attach_view(ds).context(UnableToAttachViewSnafu)?;
+                    df.attach_view(&ds).context(UnableToAttachViewSnafu)?;
                 } else {
-                    let data_backend = df.new_backend(ds).context(UnableToCreateBackendSnafu)?;
-                    df.attach_backend(&ds.name, data_backend).context(
-                        UnableToAttachDataConnectorSnafu {
+                    let data_backend = df
+                        .new_accelerated_backend(Arc::clone(&ds))
+                        .context(UnableToCreateBackendSnafu)?;
+                    df.attach_publisher(&ds.name.clone(), Arc::clone(&ds), data_backend)
+                        .await
+                        .context(UnableToAttachDataConnectorSnafu {
                             data_connector: source,
-                        },
-                    )?;
+                        })?;
                 }
             }
         }
 
-        tracing::info!("Loaded dataset: {}", ds.name);
+        tracing::info!("Loaded dataset: {}", ds_name);
     }
 
     let mut model_map = HashMap::with_capacity(app.models.len());
