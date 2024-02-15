@@ -67,6 +67,12 @@ pub(crate) mod inference {
         pub lookback: usize,
     }
 
+    #[derive(Deserialize)]
+    pub struct ModelPredictParams {
+        #[serde(default = "default_lookback")]
+        pub lookback: usize,
+    }
+
     // TODO(jeadie): This needs to come from the training_run postgres table in cloud, for the specific training run that made the model.
     fn default_lookback() -> usize {
         4
@@ -105,12 +111,12 @@ pub(crate) mod inference {
     pub(crate) async fn get(
         Extension(app): Extension<Arc<App>>,
         Extension(df): Extension<Arc<RwLock<DataFusion>>>,
-        Path(name): Path<String>,
-        Query(mut params): Query<ModelPredictRequest>,
+        Path(model_name): Path<String>,
+        Query(params): Query<ModelPredictParams>,
         Extension(models): Extension<Arc<HashMap<String, Model>>>,
     ) -> Response {
-        params.model_name = name;
-        let model_predict_response = run_inference(app, df, models, params).await;
+        let model_predict_response =
+            run_inference(app, df, models, model_name, params.lookback).await;
 
         match model_predict_response.status {
             ModelPredictStatus::Success => {
@@ -142,7 +148,8 @@ pub(crate) mod inference {
                 app.clone(),
                 df.clone(),
                 models.clone(),
-                model_predict_request,
+                model_predict_request.model_name,
+                model_predict_request.lookback,
             );
             model_prediction_futures.push(prediction_future);
         }
@@ -165,49 +172,38 @@ pub(crate) mod inference {
         app: Arc<App>,
         df: Arc<RwLock<DataFusion>>,
         models: Arc<HashMap<String, Model>>,
-        model_predict_request: ModelPredictRequest,
+        model_name: String,
+        lookback: usize,
     ) -> ModelPredictResponse {
         let start_time = Instant::now();
 
-        let model = app
-            .models
-            .iter()
-            .find(|m| m.name == model_predict_request.model_name);
+        let model = app.models.iter().find(|m| m.name == model_name);
 
         let Some(model) = model else {
-            tracing::debug!("Model {} not found", model_predict_request.model_name);
+            tracing::debug!("Model {model_name} not found");
             return ModelPredictResponse {
                 status: ModelPredictStatus::BadRequest,
-                error_message: Some(format!(
-                    "Model {} not found",
-                    model_predict_request.model_name
-                )),
-                model_name: model_predict_request.model_name,
-                lookback: model_predict_request.lookback,
+                error_message: Some(format!("Model {model_name} not found")),
+                model_name,
+                lookback,
                 forecast: vec![],
                 duration_ms: start_time.elapsed().as_millis(),
             };
         };
 
         let Some(runnable) = models.get(&model.name) else {
-            tracing::debug!("Model {} not found", model_predict_request.model_name);
+            tracing::debug!("Model {model_name} not found");
             return ModelPredictResponse {
                 status: ModelPredictStatus::BadRequest,
-                error_message: Some(format!(
-                    "Model {} not found",
-                    model_predict_request.model_name
-                )),
-                model_name: model_predict_request.model_name,
-                lookback: model_predict_request.lookback,
+                error_message: Some(format!("Model {model_name} not found")),
+                model_name,
+                lookback,
                 forecast: vec![],
                 duration_ms: start_time.elapsed().as_millis(),
             };
         };
 
-        match runnable
-            .run(df.clone(), model_predict_request.lookback)
-            .await
-        {
+        match runnable.run(df.clone(), lookback).await {
             Ok(inference_result) => {
                 if let Some(column_data) = inference_result.column_by_name("y") {
                     if let Some(array) = column_data.as_any().downcast_ref::<Float32Array>() {
@@ -215,50 +211,47 @@ pub(crate) mod inference {
                         return ModelPredictResponse {
                             status: ModelPredictStatus::Success,
                             error_message: None,
-                            model_name: model_predict_request.model_name,
-                            lookback: model_predict_request.lookback,
+                            model_name,
+                            lookback,
                             forecast: result,
                             duration_ms: start_time.elapsed().as_millis(),
                         };
                     }
                     tracing::error!(
-                        "Unable to cast inference result for model {} to Float32Array: {:?}",
-                        model_predict_request.model_name,
-                        column_data
+                        "Unable to cast inference result for model {model_name} to Float32Array: {column_data:?}"
                     );
                     return ModelPredictResponse {
                         status: ModelPredictStatus::InternalError,
                         error_message: Some(
                             "Unable to cast inference result to Float32Array".to_string(),
                         ),
-                        model_name: model_predict_request.model_name,
-                        lookback: model_predict_request.lookback,
+                        model_name,
+                        lookback,
                         forecast: vec![],
                         duration_ms: start_time.elapsed().as_millis(),
                     };
                 }
                 tracing::error!(
-                    "Unable to find column 'y' in inference result for model {}",
-                    model_predict_request.model_name
+                    "Unable to find column 'y' in inference result for model {model_name}"
                 );
                 ModelPredictResponse {
                     status: ModelPredictStatus::InternalError,
                     error_message: Some(
                         "Unable to find column 'y' in inference result".to_string(),
                     ),
-                    model_name: model_predict_request.model_name,
-                    lookback: model_predict_request.lookback,
+                    model_name,
+                    lookback,
                     forecast: vec![],
                     duration_ms: start_time.elapsed().as_millis(),
                 }
             }
             Err(e) => {
-                tracing::error!("Unable to run inference: {}", e);
+                tracing::error!("Unable to run inference: {e}");
                 ModelPredictResponse {
                     status: ModelPredictStatus::InternalError,
                     error_message: Some(e.to_string()),
-                    model_name: model_predict_request.model_name,
-                    lookback: model_predict_request.lookback,
+                    model_name,
+                    lookback,
                     forecast: vec![],
                     duration_ms: start_time.elapsed().as_millis(),
                 }
