@@ -3469,6 +3469,7 @@ dependencies = [
  "arrow",
  "arrow-flight",
  "arrow-ipc",
+ "arrow-json",
  "async-stream",
  "axum 0.7.4",
  "clap",
