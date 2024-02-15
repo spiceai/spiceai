@@ -95,33 +95,27 @@ impl Runnable for Model {
                         data[i].append(&mut col[..end_idx].to_vec().clone());
                     });
             }
-            let inp = data
+            let inp: Vec<Vec<f64>> = data
                 .iter()
                 .enumerate()
                 .filter(|(i, _)| schema.field(*i).name() != "ts") //: (usize, ArrayRef)
-                .map(|(_, x)| x)
-                .fold(Vec::new(), |mut acc: Vec<f64>, b: &Vec<f64>| {
-                    let mut c = b.clone();
-                    c.reverse();
-                    acc.extend(c);
-                    acc
-                });
+                .map(|(_, x)| x.clone())
+                .collect_vec();
 
-            let small_vec: Tensor =
-                tract_ndarray::Array2::from_shape_vec((1, lookback_size * n_cols), inp)
-                    .context(ShapeSnafu)?
-                    .into();
+            let small_vec: Tensor = tract_ndarray::Array3::from_shape_vec(
+                (1, lookback_size, n_cols),
+                inp.into_iter().concat(),
+            )
+            .context(ShapeSnafu)?
+            .into_tensor();
 
-            let output = this
-                .model
-                .run(tvec!(small_vec
-                    .cast_to_dt(DatumType::F32)
-                    .context(TractSnafu)?
-                    .deep_clone()
-                    .into()))
-                .context(TractSnafu)?;
+            let output = this.model.run(tvec!(small_vec
+                .cast_to_dt(DatumType::F32)
+                .context(TractSnafu)?
+                .deep_clone()
+                .into()));
 
-            let result: Vec<f32> = output[0]
+            let result: Vec<f32> = output.unwrap()[0]
                 .to_array_view::<f32>()
                 .context(TractSnafu)?
                 .iter()
