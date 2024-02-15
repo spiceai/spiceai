@@ -51,11 +51,9 @@ impl PodsWatcher {
                         }
 
                         if let Ok(app) = App::new(root_path.clone()) {
-                            futures::executor::block_on(async {
-                                if let Err(err) = tx.send(app).await {
-                                    tracing::error!("Pods content watcher is unable to notify detected state change: {:?}", err);
-                                }
-                            });
+                            if let Err(err) = tx.blocking_send(app) {
+                                tracing::error!("Pods content watcher is unable to notify detected state change: {:?}", err);
+                            }
                         } else {
                             tracing::debug!("Invalid app state detected, ignoring changes.");
                         }
