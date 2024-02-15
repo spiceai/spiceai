@@ -50,6 +50,7 @@ pub(crate) mod inference {
     use serde::{Deserialize, Serialize};
     use std::time::Instant;
     use std::{collections::HashMap, sync::Arc};
+    use tokio::sync::RwLock;
     use tract_core::tract_data::itertools::Itertools;
 
     #[derive(Serialize)]
@@ -71,7 +72,7 @@ pub(crate) mod inference {
 
     pub(crate) async fn get(
         Extension(app): Extension<Arc<App>>,
-        Extension(df): Extension<Arc<DataFusion>>,
+        Extension(df): Extension<Arc<RwLock<DataFusion>>>,
         Path(name): Path<String>,
         Query(params): Query<ModelQueryInfo>,
         Extension(models): Extension<Arc<HashMap<String, Model>>>,
