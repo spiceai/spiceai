@@ -67,7 +67,7 @@ impl Runnable for Model {
             let schema = first_record.schema();
             let fields = schema.fields();
             let mut data: Vec<Vec<f64>> = fields.iter().map(|_| Vec::new()).collect_vec();
-            
+
             for batch in reader {
                 batch
                     .columns()
@@ -101,6 +101,7 @@ impl Runnable for Model {
                 .collect_vec();
 
             let n_cols = inp.len();
+
             let small_vec: Tensor = tract_ndarray::Array3::from_shape_vec(
                 (1, lookback_size, n_cols),
                 inp.into_iter().concat(),
