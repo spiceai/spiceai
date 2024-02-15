@@ -54,13 +54,13 @@ pub(crate) mod inference {
     use tract_core::tract_data::itertools::Itertools;
 
     #[derive(Deserialize)]
-    pub struct PredictRequest {
+    pub struct BatchPredictRequest {
         #[serde(default)]
-        pub predictions: Vec<ModelPredictRequest>,
+        pub predictions: Vec<PredictRequest>,
     }
 
     #[derive(Deserialize)]
-    pub struct ModelPredictRequest {
+    pub struct PredictRequest {
         pub model_name: String,
 
         #[serde(default = "default_lookback")]
@@ -68,7 +68,7 @@ pub(crate) mod inference {
     }
 
     #[derive(Deserialize)]
-    pub struct ModelPredictParams {
+    pub struct PredictParams {
         #[serde(default = "default_lookback")]
         pub lookback: usize,
     }
@@ -79,13 +79,13 @@ pub(crate) mod inference {
     }
 
     #[derive(Serialize)]
-    pub struct PredictResponse {
-        pub predictions: Vec<ModelPredictResponse>,
+    pub struct BatchPredictResponse {
+        pub predictions: Vec<PredictResponse>,
         pub duration_ms: u128,
     }
 
     #[derive(Serialize)]
-    pub struct ModelPredictResponse {
+    pub struct PredictResponse {
         pub status: ModelPredictStatus,
 
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -112,7 +112,7 @@ pub(crate) mod inference {
         Extension(app): Extension<Arc<App>>,
         Extension(df): Extension<Arc<RwLock<DataFusion>>>,
         Path(model_name): Path<String>,
-        Query(params): Query<ModelPredictParams>,
+        Query(params): Query<PredictParams>,
         Extension(models): Extension<Arc<HashMap<String, Model>>>,
     ) -> Response {
         let model_predict_response =
@@ -137,7 +137,7 @@ pub(crate) mod inference {
         Extension(app): Extension<Arc<App>>,
         Extension(df): Extension<Arc<RwLock<DataFusion>>>,
         Extension(models): Extension<Arc<HashMap<String, Model>>>,
-        Json(payload): Json<PredictRequest>,
+        Json(payload): Json<BatchPredictRequest>,
     ) -> Response {
         let start_time = Instant::now();
         let mut model_predictions = Vec::new();
@@ -160,7 +160,7 @@ pub(crate) mod inference {
 
         (
             StatusCode::OK,
-            Json(PredictResponse {
+            Json(BatchPredictResponse {
                 duration_ms: start_time.elapsed().as_millis(),
                 predictions: model_predictions,
             }),
@@ -174,14 +174,14 @@ pub(crate) mod inference {
         models: Arc<HashMap<String, Model>>,
         model_name: String,
         lookback: usize,
-    ) -> ModelPredictResponse {
+    ) -> PredictResponse {
         let start_time = Instant::now();
 
         let model = app.models.iter().find(|m| m.name == model_name);
 
         let Some(model) = model else {
             tracing::debug!("Model {model_name} not found");
-            return ModelPredictResponse {
+            return PredictResponse {
                 status: ModelPredictStatus::BadRequest,
                 error_message: Some(format!("Model {model_name} not found")),
                 model_name,
@@ -193,7 +193,7 @@ pub(crate) mod inference {
 
         let Some(runnable) = models.get(&model.name) else {
             tracing::debug!("Model {model_name} not found");
-            return ModelPredictResponse {
+            return PredictResponse {
                 status: ModelPredictStatus::BadRequest,
                 error_message: Some(format!("Model {model_name} not found")),
                 model_name,
@@ -208,7 +208,7 @@ pub(crate) mod inference {
                 if let Some(column_data) = inference_result.column_by_name("y") {
                     if let Some(array) = column_data.as_any().downcast_ref::<Float32Array>() {
                         let result = array.values().iter().copied().collect_vec();
-                        return ModelPredictResponse {
+                        return PredictResponse {
                             status: ModelPredictStatus::Success,
                             error_message: None,
                             model_name,
@@ -220,7 +220,7 @@ pub(crate) mod inference {
                     tracing::error!(
                         "Unable to cast inference result for model {model_name} to Float32Array: {column_data:?}"
                     );
-                    return ModelPredictResponse {
+                    return PredictResponse {
                         status: ModelPredictStatus::InternalError,
                         error_message: Some(
                             "Unable to cast inference result to Float32Array".to_string(),
@@ -234,7 +234,7 @@ pub(crate) mod inference {
                 tracing::error!(
                     "Unable to find column 'y' in inference result for model {model_name}"
                 );
-                ModelPredictResponse {
+                PredictResponse {
                     status: ModelPredictStatus::InternalError,
                     error_message: Some(
                         "Unable to find column 'y' in inference result".to_string(),
@@ -247,7 +247,7 @@ pub(crate) mod inference {
             }
             Err(e) => {
                 tracing::error!("Unable to run inference: {e}");
-                ModelPredictResponse {
+                PredictResponse {
                     status: ModelPredictStatus::InternalError,
                     error_message: Some(e.to_string()),
                     model_name,
