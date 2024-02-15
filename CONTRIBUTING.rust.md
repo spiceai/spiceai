@@ -15,3 +15,15 @@ In VSCode, you can add the following in your User Settings JSON file:
   "rust-analyzer.check.features": "all",
   "rust-analyzer.check.extraArgs": ["--", "-Dclippy::pedantic", "-Dclippy::unwrap_used", "-Dclippy::expect_used"]
 ```
+
+# Dev Setup
+
+## Mac
+
+```bash
+
+# Install Homebrew
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+
+# Install Rust
+brew install rust
