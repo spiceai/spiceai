@@ -50,12 +50,16 @@ impl PodsWatcher {
                             }
                         }
 
-                        if let Ok(app) = App::new(root_path.clone()) {
-                            if let Err(err) = tx.blocking_send(app) {
-                                tracing::error!("Pods content watcher is unable to notify detected state change: {:?}", err);
+                        match App::new(root_path.clone()) {
+                            Ok(app) => {
+                                if let Err(e) = tx.blocking_send(app) {
+                                    tracing::error!("Pods content watcher is unable to notify detected state change: {}", e);
+                                }
                             }
-                        } else {
-                            tracing::warn!("Invalid app state detected, unable to load pods information");
+                            Err(e) => tracing::warn!(
+                                "Invalid app state detected, unable to load pods information: {}",
+                                e
+                            ),
                         }
                     }
                     Err(e) => tracing::error!("Pods content watcher error: {:?}", e),
