@@ -12,6 +12,7 @@ use futures_core::stream::BoxStream;
 use std::future::Future;
 
 use crate::auth::AuthProvider;
+use crate::datapublisher::DataPublisher;
 use crate::dataupdate::{DataUpdate, UpdateType};
 
 pub mod debug;
@@ -67,18 +68,8 @@ pub trait DataConnector: Send + Sync {
         dataset: &Dataset,
     ) -> Pin<Box<dyn Future<Output = Vec<RecordBatch>> + Send>>;
 
-    /// Returns true if the given dataset supports writing data back to this `DataConnector`.
-    fn supports_data_writes(&self, _dataset: &Dataset) -> bool {
-        false
-    }
-
-    /// Adds data ingested locally back to the source.
-    fn add_data(
-        &self,
-        dataset: &Dataset,
-        _data: DataUpdate,
-    ) -> Pin<Box<dyn Future<Output = AnyErrorResult>>> {
-        panic!("add_data not implemented for {}", dataset.name)
+    fn get_data_publisher(&self) -> Option<Box<dyn DataPublisher>> {
+        None
     }
 }
 

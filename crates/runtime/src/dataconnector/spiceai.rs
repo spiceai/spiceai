@@ -31,6 +31,7 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+#[derive(Clone)]
 pub struct SpiceAI {
     flight: Flight,
     spaced_trace: Arc<SpacedTracer>,
@@ -122,9 +123,8 @@ impl DataConnector for SpiceAI {
         self.flight.get_all_data(&spice_dataset_path)
     }
 
-    /// Returns true if the given dataset supports writing data back to this `DataConnector`.
-    fn supports_data_writes(&self, _dataset: &Dataset) -> bool {
-        true
+    fn get_data_publisher(&self) -> Option<Box<dyn DataPublisher>> {
+        Some(Box::new(self.clone()))
     }
 }
 

@@ -162,7 +162,7 @@ impl DataFusion {
     pub fn attach_connector_to_publisher(
         &mut self,
         dataset: Arc<Dataset>,
-        data_connector: &'static mut dyn DataConnector,
+        data_connector: Box<dyn DataConnector>,
         publisher: Box<dyn DataPublisher>,
     ) -> Result<()> {
         let table_name = dataset.name.as_str();

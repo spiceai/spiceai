@@ -16,12 +16,23 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum Mode {
+    Read,
+    ReadWrite,
+    Append,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Dataset {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub from: String,
 
     pub name: String,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mode: Option<Mode>,
 
     /// Inline SQL that describes a view.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -48,6 +59,7 @@ impl Dataset {
         Dataset {
             from,
             name,
+            mode: None,
             sql: None,
             sql_ref: None,
             params: Option::default(),
@@ -136,6 +148,11 @@ impl Dataset {
 
         Ok(None)
     }
+
+    #[must_use]
+    pub fn mode(&self) -> Mode {
+        self.mode.clone().unwrap_or(Mode::Read)
+    }
 }
 
 impl WithDependsOn<Dataset> for Dataset {
@@ -143,6 +160,7 @@ impl WithDependsOn<Dataset> for Dataset {
         Dataset {
             from: self.from.clone(),
             name: self.name.clone(),
+            mode: self.mode.clone(),
             sql: self.sql.clone(),
             sql_ref: self.sql_ref.clone(),
             params: self.params.clone(),
