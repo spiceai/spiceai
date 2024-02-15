@@ -11,11 +11,11 @@ import (
 	"github.com/spiceai/spiceai/bin/spice/pkg/version"
 )
 
-type SpiceUser struct {
-	Email       string   `json:"email,omitempty"`
-	Username    string   `json:"username,omitempty"`
-	PersonalOrg SpiceOrg `json:"personal_org,omitempty"`
-	App         SpiceApp `json:"app,omitempty"`
+type SpiceAuthContext struct {
+	Email    string   `json:"email,omitempty"`
+	Username string   `json:"username,omitempty"`
+	Org      SpiceOrg `json:"org,omitempty"`
+	App      SpiceApp `json:"app,omitempty"`
 }
 
 type SpiceOrg struct {
@@ -60,12 +60,14 @@ func (s *SpiceApiClient) GetAuthUrl(authCode string) string {
 	return fmt.Sprintf("%s/auth/token?code=%s", s.baseUrl, authCode)
 }
 
-func (s *SpiceApiClient) GetUser(accessToken string) (SpiceUser, error) {
-	var spiceUser SpiceUser
+func (s *SpiceApiClient) GetAuthContext(accessToken string, orgName *string, appName *string) (SpiceAuthContext, error) {
+	var spiceAuthContext SpiceAuthContext
 
-	request, err := http.NewRequest("GET", fmt.Sprintf("%s/api/spice-cli/user", s.baseUrl), nil)
+	url := fmt.Sprintf("%s/api/spice-cli/auth?org_name=%s&app_name=%s", s.baseUrl, *orgName, *appName)
+
+	request, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		return spiceUser, err
+		return spiceAuthContext, err
 	}
 
 	request.Header.Set("Authorization", fmt.Sprintf("Bearer %s", accessToken))
@@ -73,22 +75,22 @@ func (s *SpiceApiClient) GetUser(accessToken string) (SpiceUser, error) {
 	client := &http.Client{}
 	response, err := client.Do(request)
 	if err != nil {
-		return spiceUser, err
+		return spiceAuthContext, err
 	}
 	defer response.Body.Close()
 
 	body, err := io.ReadAll(response.Body)
 	if err != nil {
-		return spiceUser, err
+		return spiceAuthContext, err
 	}
 
-	err = json.Unmarshal(body, &spiceUser)
+	err = json.Unmarshal(body, &spiceAuthContext)
 
 	if err != nil {
-		return spiceUser, err
+		return spiceAuthContext, err
 	}
 
-	return spiceUser, err
+	return spiceAuthContext, nil
 }
 
 func (s *SpiceApiClient) ExchangeCode(authCode string) (AccessTokenResponse, error) {
