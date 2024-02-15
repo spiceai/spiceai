@@ -12,9 +12,9 @@ client = Client('353231|e9dd434b7ba54fc99b027a7c6d326ecd')
 startTime = time.time()
 data = client.query('SELECT * FROM eth.recent_traces trace JOIN eth.recent_transactions trans ON trace.transaction_hash = trans.hash ORDER BY trans.block_number DESC;')
 endTime = time.time()
-pd = data.read_pandas()
+pd = data.read_all()
 
-print(pd.to_string() + "\n")
+print(pd)
 print("Query Time: " + str(endTime - startTime) + " seconds\n")
 
 exit()
@@ -29,17 +29,17 @@ while True:
     startTime = time.time()
     data = client.query('SELECT * FROM eth_recent_traces trace JOIN eth_recent_transactions trans ON trace.transaction_hash = trans.hash ORDER BY trans.block_number DESC;')
     endTime = time.time()
-    pd = data.read_pandas()
+    pd = data.read_all()
 
-    print(pd.to_string() + "\n")
+    print(pd)
     print("Query Time: " + str(endTime - startTime) + " seconds\n")
 
     # startTime = time.time()
     # data = client.query('SELECT * FROM eth.recent_traces trace JOIN eth.recent_transactions trans ON trace.transaction_hash = trans.hash ORDER BY trans.block_number DESC;')
     # endTime = time.time()
-    # pd = data.read_pandas()
+    # pd = data.read_all()
 
-    # print(pd.to_string() + "\n")
+    # print(pd)
     # print("Query Time: " + str(endTime - startTime) + " seconds\n")
 
     sleep(5)
@@ -52,17 +52,17 @@ while True:
     startTime = time.time()
     data = client.query('SELECT * FROM taxi_trips ORDER BY pickup_datetime DESC LIMIT 100')
     endTime = time.time()
-    pd = data.read_pandas()
+    pd = data.read_all()
 
-    print(pd.to_string() + "\n")
+    print(pd)
     print("Query Time: " + str(endTime - startTime) + " seconds\n")
 
     startTime = time.time()
     data = client.query('SELECT count(*) FROM taxi_trips')
     endTime = time.time()
-    pd = data.read_pandas()
+    pd = data.read_all()
 
-    print(pd.to_string() + "\n")
+    print(pd)
     print("Query Time: " + str(endTime - startTime) + " seconds\n")
 
     sleep(5)
@@ -84,9 +84,9 @@ while True:
         LIMIT 10
         """)
     endTime = time.time()
-    pd = data.read_pandas()
+    pd = data.read_all()
 
-    print(pd.to_string() + "\n")
+    print(pd)
     print("Query Time: " + str(endTime - startTime) + " seconds\n")
 
     sleep(5)
