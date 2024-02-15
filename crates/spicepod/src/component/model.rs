@@ -32,4 +32,9 @@ impl Model {
             _ => "debug".to_string(),
         }
     }
+
+    #[must_use]
+    pub fn version(&self) -> String {
+        self.from.split(':').last().unwrap_or("").to_string()
+    }
 }
