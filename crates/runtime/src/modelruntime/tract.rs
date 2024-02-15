@@ -46,7 +46,6 @@ fn load_tract_model(path: &str) -> TractResult<Plan> {
     tract_onnx::onnx()
         .model_for_path(path)?
         .into_optimized()?
-        .with_input_fact(0, f32::fact([1, 20]))? // TODO: remove
         .into_runnable()
 }
 
@@ -68,8 +67,7 @@ impl Runnable for Model {
             let schema = first_record.schema();
             let fields = schema.fields();
             let mut data: Vec<Vec<f64>> = fields.iter().map(|_| Vec::new()).collect_vec();
-            let n_cols = data.len() - 1;
-
+            
             for batch in reader {
                 batch
                     .columns()
@@ -102,6 +100,7 @@ impl Runnable for Model {
                 .map(|(_, x)| x.clone())
                 .collect_vec();
 
+            let n_cols = inp.len();
             let small_vec: Tensor = tract_ndarray::Array3::from_shape_vec(
                 (1, lookback_size, n_cols),
                 inp.into_iter().concat(),
