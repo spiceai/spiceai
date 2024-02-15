@@ -28,6 +28,7 @@ pub enum Error {
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+pub type AnyErrorResult = std::result::Result<(), Box<dyn std::error::Error>>;
 
 /// A `DataConnector` knows how to retrieve and modify data for a given dataset.
 ///
@@ -76,7 +77,7 @@ pub trait DataConnector: Send + Sync {
         &self,
         dataset: &Dataset,
         _data: DataUpdate,
-    ) -> Pin<Box<dyn Future<Output = Result<()>>>> {
+    ) -> Pin<Box<dyn Future<Output = AnyErrorResult>>> {
         panic!("add_data not implemented for {}", dataset.name)
     }
 }

@@ -1,5 +1,9 @@
+use std::task::Poll;
+
+use arrow::record_batch::RecordBatch;
 use arrow_flight::decode::FlightDataDecoder;
 use arrow_flight::decode::FlightRecordBatchStream;
+use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::error::FlightError;
 use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::FlightData;
@@ -9,7 +13,7 @@ use base64::prelude::BASE64_STANDARD;
 use base64::Engine;
 use bytes::Bytes;
 use futures::StreamExt;
-use futures::{stream, TryStreamExt};
+use futures::{ready, stream, TryStreamExt};
 use snafu::prelude::*;
 use tonic::transport::Channel;
 use tonic::IntoRequest;
@@ -191,6 +195,64 @@ impl FlightClient {
         Ok(FlightDataDecoder::new(
             response_stream.map(|r| r.map_err(FlightError::Tonic)),
         ))
+    }
+
+    /// Publishes data to a dataset via the `DoPut` Flight method.
+    ///
+    /// # Arguments
+    ///
+    /// * `dataset_path` - The dataset to publish to.
+    /// * `data` - The data to publish.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the data cannot be published to the flight source via `DoPut`.
+    pub async fn publish(&mut self, dataset_path: &str, data: Vec<RecordBatch>) -> Result<()> {
+        self.authenticate_basic_token().await?;
+
+        let flight_descriptor = FlightDescriptor::new_path(vec![dataset_path.to_string()]);
+
+        let converted_input_stream = futures::stream::iter(data.into_iter().map(Ok));
+
+        let flight_data_stream = FlightDataEncoderBuilder::new()
+            .with_flight_descriptor(Some(flight_descriptor))
+            .build(converted_input_stream);
+
+        let mut request = Box::pin(flight_data_stream); // Pin to heap
+        let request_stream = futures::stream::poll_fn(move |cx| {
+            Poll::Ready(match ready!(request.poll_next_unpin(cx)) {
+                Some(Ok(data)) => Some(data),
+                Some(Err(_)) | None => None,
+            })
+        });
+
+        let mut publish_request = request_stream.into_streaming_request();
+        let auth_header_value = match self.token.clone() {
+            Some(token) => format!("Bearer {token}")
+                .parse()
+                .context(InvalidMetadataSnafu)?,
+            None => {
+                return UnauthorizedSnafu.fail();
+            }
+        };
+
+        publish_request
+            .metadata_mut()
+            .insert("authorization", auth_header_value);
+
+        let resp = self
+            .flight_client
+            .clone()
+            .do_put(publish_request)
+            .await
+            .context(UnableToQuerySnafu)?;
+
+        let resp = resp.into_inner();
+
+        // Wait for the server to acknowledge the data
+        resp.for_each(|_| async {}).await;
+
+        Ok(())
     }
 
     async fn authenticate_basic_token(&mut self) -> Result<()> {
