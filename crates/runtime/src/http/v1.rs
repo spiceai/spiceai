@@ -42,6 +42,7 @@ pub(crate) mod inference {
     use app::App;
     use arrow::array::Float32Array;
     use axum::{
+        extract::{Path, Query},
         http::StatusCode,
         response::{IntoResponse, Response},
         Extension, Json,
@@ -99,6 +100,31 @@ pub(crate) mod inference {
         Success,
         BadRequest,
         InternalError,
+    }
+
+    pub(crate) async fn get(
+        Extension(app): Extension<Arc<App>>,
+        Extension(df): Extension<Arc<RwLock<DataFusion>>>,
+        Path(name): Path<String>,
+        Query(mut params): Query<ModelPredictRequest>,
+        Extension(models): Extension<Arc<HashMap<String, Model>>>,
+    ) -> Response {
+        params.model_name = name;
+        let model_predict_response = run_inference(app, df, models, params).await;
+
+        match model_predict_response.status {
+            ModelPredictStatus::Success => {
+                (StatusCode::OK, Json(model_predict_response)).into_response()
+            }
+            ModelPredictStatus::BadRequest => {
+                (StatusCode::BAD_REQUEST, Json(model_predict_response)).into_response()
+            }
+            ModelPredictStatus::InternalError => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(model_predict_response),
+            )
+                .into_response(),
+        }
     }
 
     pub(crate) async fn post(
