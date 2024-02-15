@@ -86,7 +86,7 @@ pub(crate) mod inference {
 
     #[derive(Serialize)]
     pub struct PredictResponse {
-        pub status: ModelPredictStatus,
+        pub status: PredictStatus,
 
         #[serde(skip_serializing_if = "Option::is_none")]
         pub error_message: Option<String>,
@@ -102,7 +102,7 @@ pub(crate) mod inference {
     }
 
     #[derive(Serialize)]
-    pub enum ModelPredictStatus {
+    pub enum PredictStatus {
         Success,
         BadRequest,
         InternalError,
@@ -119,13 +119,13 @@ pub(crate) mod inference {
             run_inference(app, df, models, model_name, params.lookback).await;
 
         match model_predict_response.status {
-            ModelPredictStatus::Success => {
+            PredictStatus::Success => {
                 (StatusCode::OK, Json(model_predict_response)).into_response()
             }
-            ModelPredictStatus::BadRequest => {
+            PredictStatus::BadRequest => {
                 (StatusCode::BAD_REQUEST, Json(model_predict_response)).into_response()
             }
-            ModelPredictStatus::InternalError => (
+            PredictStatus::InternalError => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(model_predict_response),
             )
@@ -182,7 +182,7 @@ pub(crate) mod inference {
         let Some(model) = model else {
             tracing::debug!("Model {model_name} not found");
             return PredictResponse {
-                status: ModelPredictStatus::BadRequest,
+                status: PredictStatus::BadRequest,
                 error_message: Some(format!("Model {model_name} not found")),
                 model_name,
                 lookback,
@@ -194,7 +194,7 @@ pub(crate) mod inference {
         let Some(runnable) = models.get(&model.name) else {
             tracing::debug!("Model {model_name} not found");
             return PredictResponse {
-                status: ModelPredictStatus::BadRequest,
+                status: PredictStatus::BadRequest,
                 error_message: Some(format!("Model {model_name} not found")),
                 model_name,
                 lookback,
@@ -209,7 +209,7 @@ pub(crate) mod inference {
                     if let Some(array) = column_data.as_any().downcast_ref::<Float32Array>() {
                         let result = array.values().iter().copied().collect_vec();
                         return PredictResponse {
-                            status: ModelPredictStatus::Success,
+                            status: PredictStatus::Success,
                             error_message: None,
                             model_name,
                             lookback,
@@ -221,7 +221,7 @@ pub(crate) mod inference {
                         "Unable to cast inference result for model {model_name} to Float32Array: {column_data:?}"
                     );
                     return PredictResponse {
-                        status: ModelPredictStatus::InternalError,
+                        status: PredictStatus::InternalError,
                         error_message: Some(
                             "Unable to cast inference result to Float32Array".to_string(),
                         ),
@@ -235,7 +235,7 @@ pub(crate) mod inference {
                     "Unable to find column 'y' in inference result for model {model_name}"
                 );
                 PredictResponse {
-                    status: ModelPredictStatus::InternalError,
+                    status: PredictStatus::InternalError,
                     error_message: Some(
                         "Unable to find column 'y' in inference result".to_string(),
                     ),
@@ -248,7 +248,7 @@ pub(crate) mod inference {
             Err(e) => {
                 tracing::error!("Unable to run inference: {e}");
                 PredictResponse {
-                    status: ModelPredictStatus::InternalError,
+                    status: PredictStatus::InternalError,
                     error_message: Some(e.to_string()),
                     model_name,
                     lookback,
