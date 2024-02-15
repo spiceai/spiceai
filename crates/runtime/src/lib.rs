@@ -209,6 +209,14 @@ impl Runtime {
             tracing::debug!("Updated pods information: {:?}", new_app);
             tracing::debug!("Previous pods information: {:?}", current_app);
 
+            let mut auth = auth::AuthProviders::default();
+            if let Err(e) = auth.parse_from_config() {
+                tracing::warn!(
+                    "Unable to parse auth from config, proceeding without auth: {}",
+                    e
+                );
+            }
+
             let existing_dataset_names = current_app
                 .datasets
                 .iter()
@@ -218,7 +226,7 @@ impl Runtime {
             for ds in &new_app.datasets {
                 if !existing_dataset_names.contains(&ds.name) {
                     if let Err(err) =
-                        Runtime::load_dataset(ds, &self.auth, &mut *self.df.write().await).await
+                        Runtime::load_dataset(ds, &auth, &mut *self.df.write().await).await
                     {
                         tracing::error!("Unable to load dataset: {err:?}");
                     }
