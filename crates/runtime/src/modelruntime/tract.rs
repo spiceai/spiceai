@@ -115,7 +115,7 @@ impl Runnable for Model {
                 .deep_clone()
                 .into()));
 
-            let result: Vec<f32> = output.unwrap()[0]
+            let result: Vec<f32> = output?[0]
                 .to_array_view::<f32>()
                 .context(TractSnafu)?
                 .iter()
