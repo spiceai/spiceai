@@ -73,7 +73,7 @@ spice login
 			}
 		}
 
-		// try reading spicepod.yaml, to check if we have preffered org and app
+		// try reading spicepod.yaml, to check if we have preferred org and app
 		var orgName string
 		var appName string
 		spicepodBytes, err := os.ReadFile("spicepod.yaml")
