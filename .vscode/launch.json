@@ -4,6 +4,15 @@
   // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
   "version": "0.2.0",
   "configurations": [
+      {
+        "type": "lldb",
+        "request": "launch",
+        "name": "[Rust] Launch spiced",
+        "program": "${workspaceFolder}/target/debug/spiced",
+        "args": [],
+        "cwd": "${workspaceFolder}",
+        "preLaunchTask": "rust: cargo build",
+    },
     {
       "name": "Launch Package",
       "type": "go",
