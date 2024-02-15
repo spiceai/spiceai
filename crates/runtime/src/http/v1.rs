@@ -16,8 +16,15 @@ pub(crate) mod query {
         Extension(df): Extension<Arc<RwLock<DataFusion>>>,
         body: Bytes,
     ) -> Response {
-        let query = &String::from_utf8_lossy(&body);
-        let data_frame = match df.read().await.ctx.sql(query).await {
+        let query = match String::from_utf8(body.to_vec()) {
+            Ok(query) => query,
+            Err(e) => {
+                tracing::debug!("Error reading query: {e}");
+                return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+            }
+        };
+
+        let data_frame = match df.read().await.ctx.sql(&query).await {
             Ok(data_frame) => data_frame,
             Err(e) => {
                 tracing::debug!("Error running query: {e}");
