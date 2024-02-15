@@ -75,7 +75,6 @@ impl DataConnector for DebugSource {
                   ],
               ) {
                 yield DataUpdate {
-                  log_sequence_number: None,
                   update_type: UpdateType::Append,
                   data: vec![batch],
                 };

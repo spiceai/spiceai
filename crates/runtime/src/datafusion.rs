@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use crate::databackend::{self, DataBackend};
 use crate::dataconnector::DataConnector;
+use crate::datapublisher::DataPublisher;
 use datafusion::datasource::ViewTable;
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::SessionConfig;
@@ -16,6 +17,7 @@ use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use futures::StreamExt;
 use snafu::prelude::*;
 use spicepod::component::dataset::Dataset;
+use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tokio::{spawn, task};
 
@@ -61,10 +63,14 @@ pub enum Error {
     ExpectedSqlView,
 }
 
+type PublisherList = Arc<RwLock<Vec<Arc<Box<dyn DataPublisher>>>>>;
+
+type DatasetAndPublishers = (Arc<Dataset>, PublisherList);
+
 pub struct DataFusion {
     pub ctx: Arc<SessionContext>,
     tasks: Vec<task::JoinHandle<()>>,
-    backends: HashMap<String, Arc<Box<dyn DataBackend>>>,
+    data_publishers: HashMap<String, DatasetAndPublishers>,
 }
 
 impl DataFusion {
@@ -77,7 +83,7 @@ impl DataFusion {
                 SessionConfig::new().with_information_schema(true),
             )),
             tasks: Vec::new(),
-            backends: HashMap::new(),
+            data_publishers: HashMap::new(),
         }
     }
 
@@ -88,23 +94,27 @@ impl DataFusion {
             .context(RegisterParquetSnafu { file: path })
     }
 
-    pub fn attach_backend(
+    pub async fn attach_publisher(
         &mut self,
         table_name: &str,
-        backend: Box<dyn DataBackend>,
+        dataset: Arc<Dataset>,
+        publisher: Arc<Box<dyn DataPublisher>>,
     ) -> Result<()> {
-        let table_exists = self.ctx.table_exist(table_name).unwrap_or(false);
-        if table_exists {
-            return TableAlreadyExistsSnafu.fail();
-        }
+        let entry = self
+            .data_publishers
+            .entry(table_name.to_string())
+            .or_insert_with(|| {
+                // If it does not exist, initialize it with the dataset and a new Vec for publishers
+                (dataset, Arc::new(RwLock::new(Vec::new())))
+            });
 
-        self.backends
-            .insert(table_name.to_string(), Arc::new(backend));
+        entry.1.write().await.push(publisher);
 
         Ok(())
     }
 
-    pub fn new_backend(&self, dataset: &Dataset) -> Result<Box<dyn DataBackend>> {
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn new_accelerated_backend(&self, dataset: Arc<Dataset>) -> Result<Box<dyn DataPublisher>> {
         let table_name = dataset.name.as_str();
         let acceleration =
             dataset
@@ -116,7 +126,7 @@ impl DataFusion {
 
         let params: Arc<Option<HashMap<String, String>>> = Arc::new(dataset.params.clone());
 
-        let data_backend: Box<dyn DataBackend> = <dyn DataBackend>::new(
+        let data_backend: Box<dyn DataPublisher> = DataBackend::new(
             &self.ctx,
             table_name,
             acceleration.engine(),
@@ -130,13 +140,13 @@ impl DataFusion {
 
     #[must_use]
     #[allow(clippy::borrowed_box)]
-    pub fn get_backend(&self, dataset: &str) -> Option<&Arc<Box<dyn DataBackend>>> {
-        self.backends.get(dataset)
+    pub fn get_publisher(&self, dataset: &str) -> Option<&DatasetAndPublishers> {
+        self.data_publishers.get(dataset)
     }
 
     #[must_use]
-    pub fn has_backend(&self, dataset: &str) -> bool {
-        self.backends.contains_key(dataset)
+    pub fn has_publisher(&self, dataset: &str) -> bool {
+        self.data_publishers.contains_key(dataset)
     }
 
     pub async fn get_arrow_schema(&self, dataset: &str) -> Result<arrow::datatypes::Schema> {
@@ -149,11 +159,11 @@ impl DataFusion {
     }
 
     #[allow(clippy::needless_pass_by_value)]
-    pub fn attach(
+    pub fn attach_connector_to_publisher(
         &mut self,
-        dataset: &Dataset,
-        data_connector: &'static mut dyn DataConnector,
-        backend: Box<dyn DataBackend>,
+        dataset: Arc<Dataset>,
+        data_connector: Box<dyn DataConnector>,
+        publisher: Arc<Box<dyn DataPublisher>>,
     ) -> Result<()> {
         let table_name = dataset.name.as_str();
         let table_exists = self.ctx.table_exist(table_name).unwrap_or(false);
@@ -167,10 +177,12 @@ impl DataFusion {
             loop {
                 let future_result = stream.next().await;
                 match future_result {
-                    Some(data_update) => match backend.add_data(data_update).await {
-                        Ok(()) => (),
-                        Err(e) => tracing::error!("Error adding data: {e:?}"),
-                    },
+                    Some(data_update) => {
+                        match publisher.add_data(Arc::clone(&dataset), data_update).await {
+                            Ok(()) => (),
+                            Err(e) => tracing::error!("Error adding data: {e:?}"),
+                        }
+                    }
                     None => break,
                 };
             }
@@ -181,7 +193,7 @@ impl DataFusion {
         Ok(())
     }
 
-    pub fn attach_view(&self, dataset: &Dataset) -> Result<()> {
+    pub fn attach_view(&self, dataset: &Arc<Dataset>) -> Result<()> {
         let table_exists = self.ctx.table_exist(dataset.name.as_str()).unwrap_or(false);
         if table_exists {
             return TableAlreadyExistsSnafu.fail();

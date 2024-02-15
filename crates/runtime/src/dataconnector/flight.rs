@@ -5,6 +5,7 @@ use arrow::record_batch::RecordBatch;
 use flight_client::FlightClient;
 use futures::StreamExt;
 
+#[derive(Debug, Clone)]
 pub struct Flight {
     pub client: FlightClient,
 }
