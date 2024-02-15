@@ -8,11 +8,11 @@ import (
 	"github.com/spiceai/spiceai/bin/spice/pkg/util"
 )
 
-var queryCmd = &cobra.Command{
-	Use:   "query",
+var sqlCmd = &cobra.Command{
+	Use:   "sql",
 	Short: "Start an interactive SQL query session against the Spice.ai runtime",
 	Example: `
-$ spice query
+$ spice sql
 Welcome to the interactive Spice.ai SQL Query Utility! Type 'help' for help.
 
 show tables;  -- list available tables
@@ -50,6 +50,6 @@ sql> show tables
 }
 
 func init() {
-	queryCmd.Flags().BoolP("help", "h", false, "Print this help message")
-	RootCmd.AddCommand(queryCmd)
+	sqlCmd.Flags().BoolP("help", "h", false, "Print this help message")
+	RootCmd.AddCommand(sqlCmd)
 }
