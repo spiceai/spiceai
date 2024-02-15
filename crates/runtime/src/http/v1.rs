@@ -137,7 +137,7 @@ pub(crate) mod inference {
 
     async fn run_inference(
         app: Arc<App>,
-        df: Arc<DataFusion>,
+        df: Arc<RwLock<DataFusion>>,
         models: Arc<HashMap<String, Model>>,
         model_predict_request: ModelPredictRequest,
     ) -> ModelPredictResponse {
