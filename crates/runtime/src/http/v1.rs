@@ -42,7 +42,6 @@ pub(crate) mod inference {
     use app::App;
     use arrow::array::Float32Array;
     use axum::{
-        extract::{Path, Query},
         http::StatusCode,
         response::{IntoResponse, Response},
         Extension, Json,
@@ -52,65 +51,158 @@ pub(crate) mod inference {
     use std::{collections::HashMap, sync::Arc};
     use tract_core::tract_data::itertools::Itertools;
 
-    #[derive(Serialize)]
-    pub struct ForecastResponse {
-        forecast: Vec<f32>,
-        duration_ms: u128,
+    #[derive(Deserialize)]
+    pub struct PredictRequest {
+        #[serde(default)]
+        pub predictions: Vec<ModelPredictRequest>,
     }
 
-    #[derive(Debug, Deserialize)]
-    pub(crate) struct ModelQueryInfo {
+    #[derive(Deserialize)]
+    pub struct ModelPredictRequest {
+        pub model_name: String,
         #[serde(default = "default_lookback")]
-        lookback: usize,
+        pub lookback: usize,
     }
 
-    // This needs to come from the training_run postgres table in cloud, for the specific training run that made the model.
+    // TODO(jeadie): This needs to come from the training_run postgres table in cloud, for the specific training run that made the model.
     fn default_lookback() -> usize {
         4
     }
 
-    pub(crate) async fn get(
+    #[derive(Serialize)]
+    pub struct PredictResponse {
+        pub predictions: Vec<ModelPredictResponse>,
+    }
+
+    #[derive(Serialize)]
+    pub struct ModelPredictResponse {
+        pub status: ModelPredictStatus,
+
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub error_message: Option<String>,
+
+        pub model_name: String,
+
+        pub lookback: usize,
+
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        pub forecast: Vec<f32>,
+
+        pub duration_ms: u128,
+    }
+
+    #[derive(Serialize)]
+    pub enum ModelPredictStatus {
+        Success,
+        BadRequest,
+        InternalError,
+    }
+
+    pub(crate) async fn post(
         Extension(app): Extension<Arc<App>>,
         Extension(df): Extension<Arc<DataFusion>>,
-        Path(name): Path<String>,
-        Query(params): Query<ModelQueryInfo>,
         Extension(models): Extension<Arc<HashMap<String, Model>>>,
+        Json(payload): Json<PredictRequest>,
     ) -> Response {
-        let start_time = Instant::now();
+        let mut predictions = Vec::new();
 
-        let model = app.models.iter().find(|m| m.name == name);
+        for prediction_request in payload.predictions {
+            let start_time = Instant::now();
 
-        let Some(model) = model else {
-            return (StatusCode::NOT_FOUND, format!("Model {name} not found")).into_response();
-        };
+            let model = app
+                .models
+                .iter()
+                .find(|m| m.name == prediction_request.model_name);
 
-        let Some(runnable) = models.get(&model.name) else {
-            tracing::debug!("Model {name} not found");
-            return (StatusCode::NOT_FOUND, format!("Model {name} not found")).into_response();
-        };
+            let Some(model) = model else {
+                tracing::debug!("Model {} not found", prediction_request.model_name);
+                predictions.push(ModelPredictResponse {
+                    status: ModelPredictStatus::BadRequest,
+                    error_message: Some(format!(
+                        "Model {} not found",
+                        prediction_request.model_name
+                    )),
+                    model_name: prediction_request.model_name,
+                    lookback: prediction_request.lookback,
+                    forecast: vec![],
+                    duration_ms: start_time.elapsed().as_millis(),
+                });
+                continue;
+            };
 
-        match runnable.run(df, params.lookback).await {
-            Ok(inference_result) => match inference_result.column_by_name("y") {
-                Some(column_data) => match column_data.as_any().downcast_ref::<Float32Array>() {
-                    Some(array) => {
-                        let result = array.values().iter().copied().collect_vec();
-                        (
-                            StatusCode::OK,
-                            Json(ForecastResponse {
+            let Some(runnable) = models.get(&model.name) else {
+                tracing::debug!("Model {} not found", prediction_request.model_name);
+                predictions.push(ModelPredictResponse {
+                    status: ModelPredictStatus::BadRequest,
+                    error_message: Some(format!(
+                        "Model {} not found",
+                        prediction_request.model_name
+                    )),
+                    model_name: prediction_request.model_name,
+                    lookback: prediction_request.lookback,
+                    forecast: vec![],
+                    duration_ms: start_time.elapsed().as_millis(),
+                });
+                continue;
+            };
+
+            match runnable.run(df.clone(), prediction_request.lookback).await {
+                Ok(inference_result) => {
+                    if let Some(column_data) = inference_result.column_by_name("y") {
+                        if let Some(array) = column_data.as_any().downcast_ref::<Float32Array>() {
+                            let result = array.values().iter().copied().collect_vec();
+                            predictions.push(ModelPredictResponse {
+                                status: ModelPredictStatus::Success,
+                                error_message: None,
+                                model_name: prediction_request.model_name,
+                                lookback: prediction_request.lookback,
                                 forecast: result,
                                 duration_ms: start_time.elapsed().as_millis(),
-                            }),
-                        )
-                            .into_response()
+                            });
+                        } else {
+                            tracing::error!("Unable to cast inference result for model {} to Float32Array: {:?}", prediction_request.model_name, column_data);
+                            predictions.push(ModelPredictResponse {
+                                status: ModelPredictStatus::InternalError,
+                                error_message: Some(
+                                    "Unable to cast inference result to Float32Array".to_string(),
+                                ),
+                                model_name: prediction_request.model_name,
+                                lookback: prediction_request.lookback,
+                                forecast: vec![],
+                                duration_ms: start_time.elapsed().as_millis(),
+                            });
+                        }
+                    } else {
+                        tracing::error!(
+                            "Unable to find column 'y' in inference result for model {}",
+                            prediction_request.model_name
+                        );
+                        predictions.push(ModelPredictResponse {
+                            status: ModelPredictStatus::InternalError,
+                            error_message: Some(
+                                "Unable to find column 'y' in inference result".to_string(),
+                            ),
+                            model_name: prediction_request.model_name,
+                            lookback: prediction_request.lookback,
+                            forecast: vec![],
+                            duration_ms: start_time.elapsed().as_millis(),
+                        });
                     }
-                    None => (StatusCode::INTERNAL_SERVER_ERROR,).into_response(),
-                },
-                None => (StatusCode::INTERNAL_SERVER_ERROR,).into_response(),
-            },
-            Err(e) => {
-                tracing::error!("Unable to run inference: {}", e);
-                (StatusCode::INTERNAL_SERVER_ERROR,).into_response()
+                }
+                Err(e) => {
+                    tracing::error!("Unable to run inference: {}", e);
+                    predictions.push(ModelPredictResponse {
+                        status: ModelPredictStatus::InternalError,
+                        error_message: Some(e.to_string()),
+                        model_name: prediction_request.model_name,
+                        lookback: prediction_request.lookback,
+                        forecast: vec![],
+                        duration_ms: start_time.elapsed().as_millis(),
+                    });
+                }
             }
         }
+
+        (StatusCode::OK, Json(PredictResponse { predictions })).into_response()
     }
 }
