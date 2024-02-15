@@ -87,10 +87,6 @@ pub async fn run(args: Args) -> Result<()> {
 
     let mut rt: Runtime = Runtime::new(args.runtime, app, df, model_map, pods_watcher);
 
-    rt.start_pods_watcher()
-        .await
-        .context(UnableToInitializePodsWatcherSnafu)?;
-
     rt.start_servers()
         .await
         .context(UnableToStartServersSnafu)?;
