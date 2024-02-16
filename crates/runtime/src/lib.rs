@@ -122,9 +122,8 @@ impl Runtime {
         let ds = ds.clone();
         let df = Arc::clone(&self.df);
         let auth = Arc::clone(auth);
-        let retries = self.config.dataset_load_retries;
         tokio::spawn(async move {
-            for _i in 0..retries {
+            loop {
                 let ds = Arc::new(ds.clone());
                 if ds.acceleration.is_none() && !ds.is_view() {
                     tracing::warn!("No acceleration specified for dataset: {}", ds.name);
