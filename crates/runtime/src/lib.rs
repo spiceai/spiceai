@@ -148,8 +148,13 @@ impl Runtime {
                         }
                     };
 
-                match Runtime::initialize_dataconnector(data_connector, df.clone(), source, &ds)
-                    .await
+                match Runtime::initialize_dataconnector(
+                    data_connector,
+                    Arc::clone(&df),
+                    source,
+                    &ds,
+                )
+                .await
                 {
                     Ok(()) => (),
                     Err(err) => {
