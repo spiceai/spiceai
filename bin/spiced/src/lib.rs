@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::env;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use app::App;
 use clap::Parser;
@@ -14,6 +15,7 @@ use runtime::model::Model;
 use runtime::podswatcher::PodsWatcher;
 use runtime::Runtime;
 use snafu::prelude::*;
+use tokio::sync::RwLock;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -68,24 +70,21 @@ pub struct Args {
 
 pub async fn run(args: Args) -> Result<()> {
     let current_dir = env::current_dir().unwrap_or(PathBuf::from("."));
-
-    let app = App::new(current_dir.clone()).context(UnableToConstructSpiceAppSnafu)?;
-
-    let auth = load_auth_providers();
-
-    let mut df = runtime::datafusion::DataFusion::new();
-
-    for ds in &app.datasets {
-        Runtime::load_dataset(ds, &mut df, &auth)
-            .await
-            .context(UnableToLoadDatasetSnafu)?;
-    }
-
+    let app = Arc::new(App::new(current_dir.clone()).context(UnableToConstructSpiceAppSnafu)?);
+    let auth = Arc::new(load_auth_providers());
+    let df = Arc::new(RwLock::new(runtime::datafusion::DataFusion::new()));
     let model_map = load_models(&app, &auth);
-
     let pods_watcher = PodsWatcher::new(current_dir.clone());
 
-    let mut rt: Runtime = Runtime::new(args.runtime, app, df, model_map, pods_watcher);
+    let mut rt: Runtime = Runtime::new(
+        args.runtime,
+        Arc::clone(&app),
+        df,
+        model_map,
+        pods_watcher,
+        Arc::clone(&auth),
+    );
+    rt.load_datasets(&auth);
 
     rt.start_servers()
         .await
