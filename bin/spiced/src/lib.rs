@@ -1,6 +1,5 @@
 #![allow(clippy::missing_errors_doc)]
 
-use std::collections::HashMap;
 use std::env;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -10,7 +9,6 @@ use app::App;
 use clap::Parser;
 use flightrepl::ReplConfig;
 use runtime::config::Config as RuntimeConfig;
-use runtime::model::Model;
 
 use runtime::podswatcher::PodsWatcher;
 use runtime::Runtime;
@@ -70,28 +68,23 @@ pub struct Args {
 
 pub async fn run(args: Args) -> Result<()> {
     let current_dir = env::current_dir().unwrap_or(PathBuf::from("."));
-    let app = Arc::new(App::new(current_dir.clone()).context(UnableToConstructSpiceAppSnafu)?);
+    let app = Arc::new(RwLock::new(
+        App::new(current_dir.clone()).context(UnableToConstructSpiceAppSnafu)?,
+    ));
     let auth = Arc::new(load_auth_providers());
     let df = Arc::new(RwLock::new(runtime::datafusion::DataFusion::new()));
-
-    let mut model_map = HashMap::with_capacity(app.models.len());
-
-    for model in &app.models {
-        Runtime:load_model(&model_map, &model, &auth);
-    }
-    
-    //let model_map = load_models(&app, &auth);
     let pods_watcher = PodsWatcher::new(current_dir.clone());
 
     let mut rt: Runtime = Runtime::new(
         args.runtime,
         Arc::clone(&app),
         df,
-        model_map,
         pods_watcher,
         Arc::clone(&auth),
     );
-    rt.load_datasets(&auth);
+    rt.load_datasets(&auth).await;
+
+    rt.load_models(&auth).await;
 
     rt.start_servers()
         .await

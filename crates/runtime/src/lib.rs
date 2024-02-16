@@ -100,9 +100,8 @@ impl Runtime {
     #[must_use]
     pub fn new(
         config: Config,
-        app: Arc<app::App>,
+        app: Arc<RwLock<app::App>>,
         df: Arc<RwLock<DataFusion>>,
-        models: HashMap<String, Model>,
         pods_watcher: podswatcher::PodsWatcher,
         auth: Arc<auth::AuthProviders>,
     ) -> Self {
@@ -110,15 +109,15 @@ impl Runtime {
             app,
             config,
             df,
-            models: Arc::new(models),
+            models: Arc::new(RwLock::new(HashMap::new())),
             pods_watcher,
             auth,
             spaced_tracer: Arc::new(tracers::SpacedTracer::new(Duration::from_secs(15))),
         }
     }
 
-    pub fn load_datasets(&self, auth: &Arc<auth::AuthProviders>) {
-        for ds in self.app.datasets.clone() {
+    pub async fn load_datasets(&self, auth: &Arc<auth::AuthProviders>) {
+        for ds in self.app.read().await.datasets.clone() {
             self.load_dataset(ds, auth);
         }
     }
@@ -280,9 +279,20 @@ impl Runtime {
         Ok(())
     }
 
-    pub fn load_model(models_map: &mut HashMap<String, Model>, m: &Model, auth: &auth::AuthProviders) -> HashMap<String, Model> {
-    {
-        tracing::info!("Deploying model [{}] from {}...", m.name, m.from);
+    pub async fn load_models(&self, auth: &Arc<auth::AuthProviders>) {
+        for model in self.app.read().await.models.clone() {
+            self.load_model(&model, auth).await;
+        }
+    }
+
+    pub async fn load_model(
+        &self,
+        m: &spicepod::component::model::Model,
+        auth: &auth::AuthProviders,
+    ) {
+        tracing::info!("Loading model [{}] from {}...", m.name, m.from);
+        let mut model_map = self.models.write().await;
+
         match Model::load(m, auth.get(m.source().as_str())) {
             Ok(in_m) => {
                 model_map.insert(m.name.clone(), in_m);
@@ -323,7 +333,6 @@ impl Runtime {
     }
 
     pub async fn start_pods_watcher(&mut self) -> notify::Result<()> {
-
         let mut rx = self.pods_watcher.watch()?;
 
         while let Some(new_app) = rx.recv().await {
@@ -336,7 +345,6 @@ impl Runtime {
 
             drop(current_app);
 
-    
             let mut auth = auth::AuthProviders::default();
             if let Err(e) = auth.parse_from_config() {
                 tracing::warn!(
@@ -347,33 +355,14 @@ impl Runtime {
             let auth_arc = Arc::new(auth);
 
             for ds in &new_app.datasets {
-                if !current_datasets.iter().any(|d| d.name == ds.name){
-                    if let Err(err) =
-                        Runtime::load_dataset(ds, &mut *self.df.write().await, &auth).await
-                    {
-                        tracing::error!("Unable to load dataset: {err:?}");
-                    }
+                if !current_datasets.iter().any(|d| d.name == ds.name) {
+                    self.load_dataset(ds.clone(), &auth_arc);
                 }
             }
 
             for model in &new_app.models {
                 if !current_models.iter().any(|m| m.name == model.name) {
-                    tracing::info!("TODO: load new model: {model:?}");
-
-                    // tracing::info!("Deploying model [{}] from {}...", model.name, model.from);
-                    // match Model::load(model, auth.get(model.source().as_str())) {
-                    //     Ok(in_m) => {
-                    //         self.models.write().await.insert(model.name.clone(), in_m);
-                    //         tracing::info!("Model [{}] deployed, ready for inferencing", model.name);
-                    //     }
-                    //     Err(e) => {
-                    //         tracing::warn!(
-                    //             "Unable to load runnable model from spicepod {}, error: {}",
-                    //             model.name,
-                    //             e,
-                    //         );
-                    //     }
-                    // }
+                    self.load_model(model, &auth_arc).await;
                 }
             }
 
