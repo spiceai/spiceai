@@ -42,43 +42,6 @@ while True:
 
     sleep(1)
 
-#####################################
-#    High-RPS Queries Simulation    #
-#####################################
-
-def simulate_spice_user(user_id):
-    print("User " + str(user_id) + " started")
-    # make a new client for each user
-    client = Client(API_KEY, 'grpc://127.0.0.1:50051')
-    start = time.time()
-    # make a query
-    data = client.query('SELECT * FROM eth_recent_blocks DESC;')
-    pd = data.read_all()
-    end = time.time()
-    total = end - start
-    
-    print("User " + str(user_id) + ": " + str(total) + " seconds")
- 
-# simulate the number of users
-num_users = 500
-threads = []
- 
-start_time = time.time()
- 
-for user_id in range(num_users):
-    t = threading.Thread(target=simulate_spice_user, args=(user_id,))
-    threads.append(t)
-    t.start()
- 
-for thread in threads:
-    thread.join()
- 
-end_time = time.time()
-total_time = end_time - start_time
- 
-print("Total Time: " + str(total_time) + " seconds\n")
- 
-exit()
 
 ###########################
 #    Dremio Datasource    #
@@ -124,3 +87,82 @@ while True:
     print("Query Time: " + str(endTime - startTime) + " seconds\n")
 
     sleep(5)
+
+
+#####################################
+#    High-RPS Queries Simulation    #
+#####################################
+
+# update the yaml before running this code
+
+def simulate_runtime_duckdb(user_id):
+    #print("User " + str(user_id) + " started")
+    # make a new client for each user
+    client = Client(API_KEY, 'grpc://127.0.0.1:50051')
+    start = time.time()
+    # make a query
+    data = client.query('SELECT * FROM eth_recent_blocks_duckdb DESC;')
+    pd = data.read_all()
+    end = time.time()
+    total = end - start
+    
+    print("User " + str(user_id) + ": " + str(total) + " seconds")
+
+def simulate_runtime_arrow_mem(user_id):
+    #print("User " + str(user_id) + " started")
+    # make a new client for each user
+    client = Client(API_KEY, 'grpc://127.0.0.1:50051')
+    start = time.time()
+    # make a query
+    data = client.query('SELECT * FROM eth_recent_blocks_arrow_memory DESC;')
+    pd = data.read_all()
+    end = time.time()
+    total = end - start
+    
+    print("User " + str(user_id) + ": " + str(total) + " seconds")
+
+def simulate_sdk(user_id):
+    #print("User " + str(user_id) + " started")
+    # make a new client for each user
+    client = Client(API_KEY)
+    start = time.time()
+    # make a query
+    data = client.query('SELECT * FROM eth.recent_blocks DESC;')
+    pd = data.read_all()
+    end = time.time()
+    total = end - start
+    
+    print("User " + str(user_id) + ": " + str(total) + " seconds")
+ 
+# simulate the number of users
+def simulate_concurrent_queries(num_users, function_name):
+    threads = []
+ 
+    start_time = time.time()
+ 
+    for user_id in range(num_users):
+        t = threading.Thread(target=function_name, args=(user_id,))
+        threads.append(t)
+        t.start()
+ 
+    for thread in threads:
+        thread.join()
+ 
+    end_time = time.time()
+    total_time = end_time - start_time
+ 
+    print("\n")
+
+    return total_time
+
+total_users = 50
+time_sdk = simulate_concurrent_queries(total_users, simulate_sdk)
+time_runtime_duckdb = simulate_concurrent_queries(total_users, simulate_runtime_duckdb)
+time_runtime_arrow_mem = simulate_concurrent_queries(total_users, simulate_runtime_arrow_mem)
+
+print("Simulating " + str(total_users) + " concurrent users making queries..")
+print("Total Time for SDK: " + str(time_sdk) + " seconds")
+print("Total Time for In Memory Runtime: " + str(time_runtime_arrow_mem) + " seconds")
+print("Total Time for DuckDB Runtime: " + str(time_runtime_duckdb) + " seconds")
+
+exit()
