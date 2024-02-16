@@ -78,11 +78,11 @@ pub async fn run(args: Args) -> Result<()> {
 
     let mut rt: Runtime = Runtime::new(
         args.runtime,
-        app.clone(),
+        Arc::clone(&app),
         df,
         model_map,
         pods_watcher,
-        auth.clone(),
+        Arc::clone(&auth),
     );
     rt.load_datasets(&auth);
 

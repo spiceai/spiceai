@@ -120,8 +120,8 @@ impl Runtime {
 
     pub fn load_dataset(&self, ds: &Dataset, auth: &Arc<auth::AuthProviders>) {
         let ds = ds.clone();
-        let df = self.df.clone();
-        let auth = auth.clone();
+        let df = Arc::clone(&self.df);
+        let auth = Arc::clone(auth);
         let retries = self.config.dataset_load_retries;
         tokio::spawn(async move {
             for _i in 0..retries {
