@@ -118,7 +118,7 @@ impl MetricsService for Service {
                             Ok(record_batch) => {
                                 let df = self.data_fusion.read().await;
 
-                                let Some(publishers) = df.get_publisher(metric.name.as_str())
+                                let Some(publishers) = df.get_publishers(metric.name.as_str())
                                 else {
                                     warn_once!(
                                         self.once_tracer,
@@ -147,16 +147,18 @@ impl MetricsService for Service {
                                     );
                                     // We need to await the Future here in case it adds new columns to the schema and later metrics will need
                                     // to respect that schema.
-                                    if let Err(e) = publisher
+                                    match publisher
                                         .add_data(Arc::clone(&dataset), data_update.clone())
                                         .await
                                     {
-                                        tracing::error!(
-                                            "Failed to add OpenTelemetry data to backend: {}",
-                                            e
-                                        );
-                                    } else {
-                                        all_publishers_failed = false;
+                                        Ok(()) => {
+                                            all_publishers_failed = false;
+                                        }
+                                        Err(e) => {
+                                            tracing::error!(
+                                                "Failed to add OpenTelemetry data to backend: {e}"
+                                            );
+                                        }
                                     }
                                 }
 

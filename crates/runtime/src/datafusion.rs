@@ -1,3 +1,4 @@
+use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -97,7 +98,7 @@ impl DataFusion {
     pub async fn attach_publisher(
         &mut self,
         table_name: &str,
-        dataset: Arc<Dataset>,
+        dataset: Dataset,
         publisher: Arc<Box<dyn DataPublisher>>,
     ) -> Result<()> {
         let entry = self
@@ -105,7 +106,7 @@ impl DataFusion {
             .entry(table_name.to_string())
             .or_insert_with(|| {
                 // If it does not exist, initialize it with the dataset and a new Vec for publishers
-                (dataset, Arc::new(RwLock::new(Vec::new())))
+                (Arc::new(dataset), Arc::new(RwLock::new(Vec::new())))
             });
 
         entry.1.write().await.push(publisher);
@@ -114,7 +115,11 @@ impl DataFusion {
     }
 
     #[allow(clippy::needless_pass_by_value)]
-    pub fn new_accelerated_backend(&self, dataset: Arc<Dataset>) -> Result<Box<dyn DataPublisher>> {
+    pub fn new_accelerated_backend(
+        &self,
+        dataset: impl Borrow<Dataset>,
+    ) -> Result<Box<dyn DataPublisher>> {
+        let dataset = dataset.borrow();
         let table_name = dataset.name.as_str();
         let acceleration =
             dataset
@@ -140,12 +145,12 @@ impl DataFusion {
 
     #[must_use]
     #[allow(clippy::borrowed_box)]
-    pub fn get_publisher(&self, dataset: &str) -> Option<&DatasetAndPublishers> {
+    pub fn get_publishers(&self, dataset: &str) -> Option<&DatasetAndPublishers> {
         self.data_publishers.get(dataset)
     }
 
     #[must_use]
-    pub fn has_publisher(&self, dataset: &str) -> bool {
+    pub fn has_publishers(&self, dataset: &str) -> bool {
         self.data_publishers.contains_key(dataset)
     }
 
@@ -161,7 +166,7 @@ impl DataFusion {
     #[allow(clippy::needless_pass_by_value)]
     pub fn attach_connector_to_publisher(
         &mut self,
-        dataset: Arc<Dataset>,
+        dataset: Dataset,
         data_connector: Box<dyn DataConnector>,
         publisher: Arc<Box<dyn DataPublisher>>,
     ) -> Result<()> {
@@ -171,9 +176,9 @@ impl DataFusion {
             return TableAlreadyExistsSnafu.fail();
         }
 
-        let dataset_clone = dataset.clone();
         let task_handle = task::spawn(async move {
-            let mut stream = data_connector.get_data(&dataset_clone);
+            let dataset = Arc::new(dataset);
+            let mut stream = data_connector.get_data(&dataset);
             loop {
                 let future_result = stream.next().await;
                 match future_result {
@@ -193,7 +198,8 @@ impl DataFusion {
         Ok(())
     }
 
-    pub fn attach_view(&self, dataset: &Arc<Dataset>) -> Result<()> {
+    pub fn attach_view(&self, dataset: impl Borrow<Dataset>) -> Result<()> {
+        let dataset = dataset.borrow();
         let table_exists = self.ctx.table_exist(dataset.name.as_str()).unwrap_or(false);
         if table_exists {
             return TableAlreadyExistsSnafu.fail();
