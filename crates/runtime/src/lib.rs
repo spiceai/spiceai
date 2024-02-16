@@ -91,7 +91,7 @@ pub struct Runtime {
     pub df: Arc<RwLock<DataFusion>>,
     pub models: Arc<RwLock<HashMap<String, Model>>>,
     pub pods_watcher: podswatcher::PodsWatcher,
-    pub auth: Arc<auth::AuthProviders>,
+    pub auth: Arc<RwLock<auth::AuthProviders>>,
 
     spaced_tracer: Arc<tracers::SpacedTracer>,
 }
@@ -103,7 +103,7 @@ impl Runtime {
         app: Arc<RwLock<app::App>>,
         df: Arc<RwLock<DataFusion>>,
         pods_watcher: podswatcher::PodsWatcher,
-        auth: Arc<auth::AuthProviders>,
+        auth: Arc<RwLock<auth::AuthProviders>>,
     ) -> Self {
         Runtime {
             app,
@@ -116,22 +116,25 @@ impl Runtime {
         }
     }
 
-    pub async fn load_datasets(&self, auth: &Arc<auth::AuthProviders>) {
+    pub async fn load_datasets(&self) {
         for ds in self.app.read().await.datasets.clone() {
-            self.load_dataset(ds, auth);
+            self.load_dataset(ds);
         }
     }
 
-    pub fn load_dataset(&self, ds: Dataset, auth: &Arc<auth::AuthProviders>) {
+    pub fn load_dataset(&self, ds: Dataset) {
         let df = Arc::clone(&self.df);
-        let auth = Arc::clone(auth);
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
+        let shared_auth = Arc::clone(&self.auth);
+
         tokio::spawn(async move {
             loop {
                 if ds.acceleration.is_none() && !ds.is_view() {
                     tracing::warn!("No acceleration specified for dataset: {}", ds.name);
                     break;
                 };
+
+                let auth = shared_auth.read().await;
 
                 let source = ds.source();
                 let source = source.as_str();
@@ -279,19 +282,16 @@ impl Runtime {
         Ok(())
     }
 
-    pub async fn load_models(&self, auth: &Arc<auth::AuthProviders>) {
+    pub async fn load_models(&self) {
         for model in self.app.read().await.models.clone() {
-            self.load_model(&model, auth).await;
+            self.load_model(&model).await;
         }
     }
 
-    pub async fn load_model(
-        &self,
-        m: &spicepod::component::model::Model,
-        auth: &auth::AuthProviders,
-    ) {
+    pub async fn load_model(&self, m: &spicepod::component::model::Model) {
         tracing::info!("Loading model [{}] from {}...", m.name, m.from);
         let mut model_map = self.models.write().await;
+        let auth = self.auth.read().await;
 
         match Model::load(m, auth.get(m.source().as_str())) {
             Ok(in_m) => {
@@ -336,39 +336,41 @@ impl Runtime {
         let mut rx = self.pods_watcher.watch()?;
 
         while let Some(new_app) = rx.recv().await {
-            let current_app = self.app.read().await;
+            let mut current_app = self.app.write().await;
 
             tracing::debug!("Updated pods information: {:?}", new_app);
             tracing::debug!("Previous pods information: {:?}", current_app);
 
-            let mut auth = auth::AuthProviders::default();
-            if let Err(e) = auth.parse_from_config() {
-                tracing::warn!(
-                    "Unable to parse auth from config, proceeding without auth: {}",
-                    e
-                );
-            }
-            let auth_arc = Arc::new(auth);
+            *self.auth.write().await = load_auth_providers();
 
             for ds in &new_app.datasets {
                 if !current_app.datasets.iter().any(|d| d.name == ds.name) {
-                    self.load_dataset(ds.clone(), &auth_arc);
+                    self.load_dataset(ds.clone());
                 }
             }
 
             for model in &new_app.models {
                 if !current_app.models.iter().any(|m| m.name == model.name) {
-                    self.load_model(model, &auth_arc).await;
+                    self.load_model(model).await;
                 }
             }
 
-            drop(current_app);
-
-            *self.app.write().await = new_app;
+            *current_app = new_app;
         }
 
         Ok(())
     }
+}
+
+pub fn load_auth_providers() -> auth::AuthProviders {
+    let mut auth = auth::AuthProviders::default();
+    if let Err(e) = auth.parse_from_config() {
+        tracing::warn!(
+            "Unable to parse auth from config, proceeding without auth: {}",
+            e
+        );
+    }
+    auth
 }
 
 async fn shutdown_signal() {

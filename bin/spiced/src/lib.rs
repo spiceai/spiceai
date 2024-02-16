@@ -71,35 +71,18 @@ pub async fn run(args: Args) -> Result<()> {
     let app = Arc::new(RwLock::new(
         App::new(current_dir.clone()).context(UnableToConstructSpiceAppSnafu)?,
     ));
-    let auth = Arc::new(load_auth_providers());
+    let auth = Arc::new(RwLock::new(runtime::load_auth_providers()));
     let df = Arc::new(RwLock::new(runtime::datafusion::DataFusion::new()));
     let pods_watcher = PodsWatcher::new(current_dir.clone());
 
-    let mut rt: Runtime = Runtime::new(
-        args.runtime,
-        Arc::clone(&app),
-        df,
-        pods_watcher,
-        Arc::clone(&auth),
-    );
-    rt.load_datasets(&auth).await;
+    let mut rt: Runtime = Runtime::new(args.runtime, app, df, pods_watcher, auth);
+    rt.load_datasets().await;
 
-    rt.load_models(&auth).await;
+    rt.load_models().await;
 
     rt.start_servers()
         .await
         .context(UnableToStartServersSnafu)?;
 
     Ok(())
-}
-
-fn load_auth_providers() -> runtime::auth::AuthProviders {
-    let mut auth = runtime::auth::AuthProviders::default();
-    if let Err(e) = auth.parse_from_config() {
-        tracing::warn!(
-            "Unable to parse auth from config, proceeding without auth: {}",
-            e
-        );
-    }
-    auth
 }
