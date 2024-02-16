@@ -114,7 +114,7 @@ def simulate_runtime_arrow_mem(user_id):
     client = Client(API_KEY, 'grpc://127.0.0.1:50051')
     start = time.time()
     # make a query
-    data = client.query('SELECT * FROM eth_recent_blocks_arrow_memory DESC;')
+    data = client.query('SELECT * FROM eth_recent_blocks DESC;')
     pd = data.read_all()
     end = time.time()
     total = end - start
