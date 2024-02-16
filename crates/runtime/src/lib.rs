@@ -337,13 +337,9 @@ impl Runtime {
 
         while let Some(new_app) = rx.recv().await {
             let current_app = self.app.read().await;
-            let current_datasets = current_app.datasets.clone();
-            let current_models = current_app.models.clone();
 
             tracing::debug!("Updated pods information: {:?}", new_app);
             tracing::debug!("Previous pods information: {:?}", current_app);
-
-            drop(current_app);
 
             let mut auth = auth::AuthProviders::default();
             if let Err(e) = auth.parse_from_config() {
@@ -355,16 +351,18 @@ impl Runtime {
             let auth_arc = Arc::new(auth);
 
             for ds in &new_app.datasets {
-                if !current_datasets.iter().any(|d| d.name == ds.name) {
+                if !current_app.datasets.iter().any(|d| d.name == ds.name) {
                     self.load_dataset(ds.clone(), &auth_arc);
                 }
             }
 
             for model in &new_app.models {
-                if !current_models.iter().any(|m| m.name == model.name) {
+                if !current_app.models.iter().any(|m| m.name == model.name) {
                     self.load_model(model, &auth_arc).await;
                 }
             }
+
+            drop(current_app);
 
             *self.app.write().await = new_app;
         }
