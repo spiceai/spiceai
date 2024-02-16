@@ -145,12 +145,12 @@ impl DataFusion {
 
     #[must_use]
     #[allow(clippy::borrowed_box)]
-    pub fn get_publisher(&self, dataset: &str) -> Option<&DatasetAndPublishers> {
+    pub fn get_publishers(&self, dataset: &str) -> Option<&DatasetAndPublishers> {
         self.data_publishers.get(dataset)
     }
 
     #[must_use]
-    pub fn has_publisher(&self, dataset: &str) -> bool {
+    pub fn has_publishers(&self, dataset: &str) -> bool {
         self.data_publishers.contains_key(dataset)
     }
 

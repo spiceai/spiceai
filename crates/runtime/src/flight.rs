@@ -183,7 +183,7 @@ impl FlightService for Service {
 
         let df = self.datafusion.read().await;
 
-        let Some(publishers) = df.get_publisher(&path) else {
+        let Some(publishers) = df.get_publishers(&path) else {
             return Err(Status::invalid_argument(format!(
                 "No publishers registered for path: {path:?}",
             )));
@@ -323,7 +323,7 @@ impl FlightService for Service {
 
         let data_path = flight_descriptor.path.join(".");
 
-        if !self.datafusion.read().await.has_publisher(&data_path) {
+        if !self.datafusion.read().await.has_publishers(&data_path) {
             return Err(Status::invalid_argument(format!(
                 r#"Unknown dataset: "{data_path}""#,
             )));
