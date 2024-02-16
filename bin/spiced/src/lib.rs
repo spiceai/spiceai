@@ -84,7 +84,7 @@ pub async fn run(args: Args) -> Result<()> {
         pods_watcher,
         auth.clone(),
     );
-    rt.load_datasets();
+    rt.load_datasets(&auth);
 
     rt.start_servers()
         .await

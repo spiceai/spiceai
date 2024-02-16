@@ -112,16 +112,16 @@ impl Runtime {
         }
     }
 
-    pub fn load_datasets(&self) {
+    pub fn load_datasets(&self, auth: &Arc<auth::AuthProviders>) {
         for ds in self.app.datasets.clone() {
-            self.load_dataset(&ds);
+            self.load_dataset(&ds, auth);
         }
     }
 
-    pub fn load_dataset(&self, ds: &Dataset) {
+    pub fn load_dataset(&self, ds: &Dataset, auth: &Arc<auth::AuthProviders>) {
         let ds = ds.clone();
         let df = self.df.clone();
-        let auth = self.auth.clone();
+        let auth = auth.clone();
         let retries = self.config.dataset_load_retries;
         tokio::spawn(async move {
             for _i in 0..retries {
@@ -324,6 +324,7 @@ impl Runtime {
                     e
                 );
             }
+            let auth_arc = Arc::new(auth);
 
             let existing_dataset_names = current_app
                 .datasets
@@ -333,7 +334,7 @@ impl Runtime {
 
             for ds in &new_app.datasets {
                 if !existing_dataset_names.contains(&ds.name) {
-                    self.load_dataset(ds);
+                    self.load_dataset(ds, &auth_arc);
                 }
             }
 
