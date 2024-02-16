@@ -95,10 +95,6 @@ impl FlightService for Service {
                     .map_err(to_tonic_err)?;
                 let schema = df.schema().clone().into();
                 let results = df.collect().await.map_err(to_tonic_err)?;
-                if results.is_empty() {
-                    return Err(Status::internal("There were no results from ticket"));
-                }
-
                 let options = datafusion::arrow::ipc::writer::IpcWriteOptions::default();
                 let schema_flight_data = SchemaAsIpc::new(&schema, &options);
 
