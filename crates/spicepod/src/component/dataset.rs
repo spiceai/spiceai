@@ -46,6 +46,9 @@ pub struct Dataset {
     pub params: Option<HashMap<String, String>>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replication: Option<replication::Replication>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acceleration: Option<acceleration::Acceleration>,
 
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -63,6 +66,7 @@ impl Dataset {
             sql: None,
             sql_ref: None,
             params: Option::default(),
+            replication: None,
             acceleration: None,
             depends_on: Vec::default(),
         }
@@ -164,6 +168,7 @@ impl WithDependsOn<Dataset> for Dataset {
             sql: self.sql.clone(),
             sql_ref: self.sql_ref.clone(),
             params: self.params.clone(),
+            replication: self.replication.clone(),
             acceleration: self.acceleration.clone(),
             depends_on: depends_on.to_vec(),
         }
@@ -228,5 +233,15 @@ pub mod acceleration {
         pub fn engine(&self) -> Engine {
             self.engine.clone().unwrap_or_default()
         }
+    }
+}
+
+pub mod replication {
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct Replication {
+        #[serde(default)]
+        pub enabled: bool,
     }
 }

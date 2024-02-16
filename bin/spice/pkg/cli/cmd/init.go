@@ -49,7 +49,7 @@ spice init trader
 			return
 		}
 
-		cmd.Println(aurora.BrightGreen("Spice pod manifest initialized!"))
+		cmd.Println(aurora.BrightGreen("Spicepod manifest initialized!"))
 	},
 }
 

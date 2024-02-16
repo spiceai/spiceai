@@ -45,6 +45,7 @@ indexmap = "2.2.2"
 regex = "1.10.3"
 reqwest = { version = "0.11.24", features = ["blocking", "json"] }
 notify = "6.1.1"
+arrow-json = "49.0.0"
 
 [features]
 default = ["duckdb"]
