@@ -1,3 +1,72 @@
+pub(crate) mod query {
+    use std::sync::Arc;
+
+    use arrow::record_batch::RecordBatch;
+    use axum::{
+        body::Bytes,
+        http::StatusCode,
+        response::{IntoResponse, Response},
+        Extension,
+    };
+    use tokio::sync::RwLock;
+
+    use crate::datafusion::DataFusion;
+
+    pub(crate) async fn post(
+        Extension(df): Extension<Arc<RwLock<DataFusion>>>,
+        body: Bytes,
+    ) -> Response {
+        let query = match String::from_utf8(body.to_vec()) {
+            Ok(query) => query,
+            Err(e) => {
+                tracing::debug!("Error reading query: {e}");
+                return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+            }
+        };
+
+        let data_frame = match df.read().await.ctx.sql(&query).await {
+            Ok(data_frame) => data_frame,
+            Err(e) => {
+                tracing::debug!("Error running query: {e}");
+                return (StatusCode::BAD_REQUEST, query.to_string()).into_response();
+            }
+        };
+
+        let results = match data_frame.collect().await {
+            Ok(results) => results,
+            Err(e) => {
+                tracing::debug!("Error collecting results: {e}");
+                return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+            }
+        };
+
+        let buf = Vec::new();
+        let mut writer = arrow_json::ArrayWriter::new(buf);
+
+        if let Err(e) =
+            writer.write_batches(results.iter().collect::<Vec<&RecordBatch>>().as_slice())
+        {
+            tracing::debug!("Error converting results to JSON: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
+        if let Err(e) = writer.finish() {
+            tracing::debug!("Error finishing JSON conversion: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
+
+        let buf = writer.into_inner();
+        let res = match String::from_utf8(buf) {
+            Ok(res) => res,
+            Err(e) => {
+                tracing::debug!("Error converting JSON buffer to string: {e}");
+                return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+            }
+        };
+
+        (StatusCode::OK, res).into_response()
+    }
+}
+
 pub(crate) mod datasets {
     use std::sync::Arc;
 
