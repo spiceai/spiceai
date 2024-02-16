@@ -76,8 +76,15 @@ pub async fn run(args: Args) -> Result<()> {
     let model_map = load_models(&app, &auth);
     let pods_watcher = PodsWatcher::new(current_dir.clone());
 
-    let mut rt: Runtime = Runtime::new(args.runtime, app.clone(), df, model_map, pods_watcher);
-    rt.load_datasets(&auth);
+    let mut rt: Runtime = Runtime::new(
+        args.runtime,
+        app.clone(),
+        df,
+        model_map,
+        pods_watcher,
+        auth.clone(),
+    );
+    rt.load_datasets();
 
     rt.start_servers()
         .await

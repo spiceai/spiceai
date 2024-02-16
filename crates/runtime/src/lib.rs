@@ -89,6 +89,7 @@ pub struct Runtime {
     pub df: Arc<RwLock<DataFusion>>,
     pub models: Arc<HashMap<String, Model>>,
     pub pods_watcher: podswatcher::PodsWatcher,
+    pub auth: Arc<auth::AuthProviders>,
 }
 
 impl Runtime {
@@ -99,6 +100,7 @@ impl Runtime {
         df: Arc<RwLock<DataFusion>>,
         models: HashMap<String, Model>,
         pods_watcher: podswatcher::PodsWatcher,
+        auth: Arc<auth::AuthProviders>,
     ) -> Self {
         Runtime {
             app,
@@ -106,19 +108,20 @@ impl Runtime {
             df,
             models: Arc::new(models),
             pods_watcher,
+            auth,
         }
     }
 
-    pub fn load_datasets(&self, auth: &Arc<auth::AuthProviders>) {
+    pub fn load_datasets(&self) {
         for ds in self.app.datasets.clone() {
-            self.load_dataset(&ds, auth);
+            self.load_dataset(&ds);
         }
     }
 
-    pub fn load_dataset(&self, ds: &Dataset, auth: &Arc<auth::AuthProviders>) {
+    pub fn load_dataset(&self, ds: &Dataset) {
         let ds = ds.clone();
         let df = self.df.clone();
-        let auth = auth.clone();
+        let auth = self.auth.clone();
         let retries = self.config.dataset_load_retries;
         tokio::spawn(async move {
             for _i in 0..retries {
@@ -321,7 +324,6 @@ impl Runtime {
                     e
                 );
             }
-            let auth_arc = Arc::new(auth);
 
             let existing_dataset_names = current_app
                 .datasets
@@ -331,7 +333,7 @@ impl Runtime {
 
             for ds in &new_app.datasets {
                 if !existing_dataset_names.contains(&ds.name) {
-                    self.load_dataset(ds, &auth_arc);
+                    self.load_dataset(ds);
                 }
             }
 
