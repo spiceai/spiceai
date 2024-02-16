@@ -4,13 +4,15 @@ use std::{collections::HashMap, sync::Arc};
 
 use config::Config;
 use model::Model;
+pub use notify::Error as NotifyError;
 use snafu::prelude::*;
 use spicepod::component::dataset::Dataset;
 use spicepod::component::dataset::Mode;
+use std::time::Duration;
+use tokio::time::sleep;
 use tokio::{signal, sync::RwLock};
 
 use crate::{dataconnector::DataConnector, datafusion::DataFusion};
-pub use notify::Error as NotifyError;
 
 pub mod auth;
 pub mod config;
@@ -93,49 +95,75 @@ impl Runtime {
     #[must_use]
     pub fn new(
         config: Config,
-        app: app::App,
-        df: DataFusion,
+        app: Arc<app::App>,
+        df: Arc<RwLock<DataFusion>>,
         models: HashMap<String, Model>,
         pods_watcher: podswatcher::PodsWatcher,
     ) -> Self {
         Runtime {
-            app: Arc::new(app),
+            app,
             config,
-            df: Arc::new(RwLock::new(df)),
+            df,
             models: Arc::new(models),
             pods_watcher,
         }
     }
 
-    pub async fn load_dataset(
-        ds: &Dataset,
-        df: &mut datafusion::DataFusion,
-        auth: &auth::AuthProviders,
-    ) -> Result<()> {
-        let ds = Arc::new(ds.clone());
-        if ds.acceleration.is_none() && !ds.is_view() {
-            tracing::warn!("No acceleration specified for dataset: {}", ds.name);
-            return Ok(());
-        };
+    pub fn load_dataset(&self, ds: &Dataset, auth: &Arc<auth::AuthProviders>) {
+        let ds = ds.clone();
+        let df = self.df.clone();
+        let auth = auth.clone();
+        let retries = self.config.remote_dataset_retries;
+        tokio::spawn(async move {
+            for _i in 0..retries {
+                let ds = Arc::new(ds.clone());
+                if ds.acceleration.is_none() && !ds.is_view() {
+                    tracing::warn!("No acceleration specified for dataset: {}", ds.name);
+                    break;
+                };
 
-        let source = ds.source();
-        let source = source.as_str();
-        let params = Arc::new(ds.params.clone());
-        let data_connector: Option<Box<dyn DataConnector>> =
-            Runtime::get_dataconnector_from_source(source, auth, Arc::clone(&params)).await?;
+                let source = ds.source();
+                let source = source.as_str();
+                let params = Arc::new(ds.params.clone());
+                let data_connector: Option<Box<dyn DataConnector + Send>> =
+                    match Runtime::get_dataconnector_from_source(source, &auth, Arc::clone(&params))
+                        .await
+                    {
+                        Ok(data_connector) => data_connector,
+                        Err(err) => {
+                            tracing::warn!(
+                                "Unable to get data connector from source for dataset {}, retrying: {err:?}", ds.name
+                            );
+                            sleep(Duration::from_secs(1)).await;
+                            continue;
+                        }
+                    };
 
-        Runtime::initialize_dataconnector(data_connector, df, source, &ds).await?;
+                match Runtime::initialize_dataconnector(data_connector, df.clone(), source, &ds)
+                    .await
+                {
+                    Ok(()) => (),
+                    Err(err) => {
+                        tracing::warn!(
+                            "Unable to initialize data connector for dataset {}, retrying: {err:?}",
+                            ds.name
+                        );
+                        sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
+                };
 
-        tracing::info!("Loaded dataset: {}", &ds.name);
-
-        Ok(())
+                tracing::info!("Loaded dataset: {}", &ds.name);
+                break;
+            }
+        });
     }
 
     async fn get_dataconnector_from_source(
         source: &str,
         auth: &auth::AuthProviders,
         params: Arc<Option<HashMap<String, String>>>,
-    ) -> Result<Option<Box<dyn DataConnector>>> {
+    ) -> Result<Option<Box<dyn DataConnector + Send>>> {
         match source {
             "spice.ai" => Ok(Some(Box::new(
                 dataconnector::spiceai::SpiceAI::new(auth.get(source), params)
@@ -161,8 +189,8 @@ impl Runtime {
     }
 
     async fn initialize_dataconnector(
-        data_connector: Option<Box<dyn DataConnector>>,
-        df: &mut DataFusion,
+        data_connector: Option<Box<dyn DataConnector + Send>>,
+        df: Arc<RwLock<DataFusion>>,
         source: &str,
         ds: &Arc<Dataset>,
     ) -> Result<()> {
@@ -171,21 +199,25 @@ impl Runtime {
         match data_connector {
             Some(data_connector) => {
                 let data_backend = df
+                    .read()
+                    .await
                     .new_accelerated_backend(Arc::clone(ds))
                     .context(UnableToCreateBackendSnafu)?;
                 let data_backend = Arc::new(data_backend);
 
                 if ds.mode() == Mode::ReadWrite {
                     if let Some(data_publisher) = data_connector.get_data_publisher() {
-                        df.attach_publisher(
-                            &ds.name.clone(),
-                            Arc::clone(ds),
-                            Arc::new(data_publisher),
-                        )
-                        .await
-                        .context(UnableToAttachDataConnectorSnafu {
-                            data_connector: source,
-                        })?;
+                        df.write()
+                            .await
+                            .attach_publisher(
+                                &ds.name.clone(),
+                                Arc::clone(ds),
+                                Arc::new(data_publisher),
+                            )
+                            .await
+                            .context(UnableToAttachDataConnectorSnafu {
+                                data_connector: source,
+                            })?;
                     } else {
                         tracing::warn!(
                             "Data connector {source} does not support writes, but dataset {ds_name} is in read-write mode",
@@ -193,34 +225,45 @@ impl Runtime {
                         );
                     }
 
-                    df.attach_publisher(
-                        &ds.name.clone(),
+                    df.write()
+                        .await
+                        .attach_publisher(
+                            &ds.name.clone(),
+                            Arc::clone(ds),
+                            Arc::clone(&data_backend),
+                        )
+                        .await
+                        .context(UnableToAttachDataConnectorSnafu {
+                            data_connector: source,
+                        })?;
+                }
+
+                df.write()
+                    .await
+                    .attach_connector_to_publisher(
                         Arc::clone(ds),
+                        data_connector,
                         Arc::clone(&data_backend),
                     )
-                    .await
                     .context(UnableToAttachDataConnectorSnafu {
                         data_connector: source,
                     })?;
-                }
-
-                df.attach_connector_to_publisher(
-                    Arc::clone(ds),
-                    data_connector,
-                    Arc::clone(&data_backend),
-                )
-                .context(UnableToAttachDataConnectorSnafu {
-                    data_connector: source,
-                })?;
             }
             None => {
                 if view_sql.is_some() {
-                    df.attach_view(ds).context(UnableToAttachViewSnafu)?;
+                    df.read()
+                        .await
+                        .attach_view(ds)
+                        .context(UnableToAttachViewSnafu)?;
                 } else {
                     let data_backend = df
+                        .read()
+                        .await
                         .new_accelerated_backend(Arc::clone(ds))
                         .context(UnableToCreateBackendSnafu)?;
-                    df.attach_publisher(&ds.name.clone(), Arc::clone(ds), Arc::new(data_backend))
+                    df.write()
+                        .await
+                        .attach_publisher(&ds.name.clone(), Arc::clone(ds), Arc::new(data_backend))
                         .await
                         .context(UnableToAttachDataConnectorSnafu {
                             data_connector: source,
@@ -272,6 +315,7 @@ impl Runtime {
                     e
                 );
             }
+            let auth_arc = Arc::new(auth);
 
             let existing_dataset_names = current_app
                 .datasets
@@ -281,11 +325,7 @@ impl Runtime {
 
             for ds in &new_app.datasets {
                 if !existing_dataset_names.contains(&ds.name) {
-                    if let Err(err) =
-                        Runtime::load_dataset(ds, &mut *self.df.write().await, &auth).await
-                    {
-                        tracing::error!("Unable to load dataset: {err:?}");
-                    }
+                    self.load_dataset(ds, &auth_arc);
                 }
             }
 

@@ -28,4 +28,13 @@ pub struct Config {
         action
     )]
     pub open_telemetry_bind_address: SocketAddr,
+
+    /// Configure remote dataset retry attempts.
+    #[arg(
+        long = "remote_dataset_retries",
+        value_name = "REMOTE_DATASET_RETRIES",
+        default_value = "5",
+        action
+    )]
+    pub remote_dataset_retries: u32,
 }
