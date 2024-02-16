@@ -1,14 +1,16 @@
 import time
 from time import sleep
-import threading
 from spicepy import Client
+import threading
+
+API_KEY = 'YOUR_API_KEY_HERE'
 
 ###########################
 #   Spice AI Platform     #
 ###########################
 
-# use API key from SpiceAI app to instantiate a client
-client = Client('YOUR_API_KEY',)
+# use API key from Spice.ai app to instantiate a client
+client = Client(API_KEY)
 
 startTime = time.time()
 data = client.query('SELECT * FROM eth.recent_traces trace JOIN eth.recent_transactions trans ON trace.transaction_hash = trans.hash ORDER BY trans.block_number DESC;')
@@ -22,7 +24,7 @@ exit()
 ########################################
 #   DO NOT COMMENT OUT THE LINE BELOW  #
 ########################################
-client = Client('YOUR_API_KEY', 'grpc://127.0.0.1:50051')
+client = Client(API_KEY, 'grpc://127.0.0.1:50051')
 
 ###########################
 #   Spice AI Datasource   #
@@ -30,59 +32,53 @@ client = Client('YOUR_API_KEY', 'grpc://127.0.0.1:50051')
 
 while True:
     startTime = time.time()
-    data = client.query('SELECT * FROM eth_recent_traces trace JOIN eth_recent_transactions trans ON trace.transaction_hash = trans.hash ORDER BY trans.block_number DESC;')
+    data = client.query('SELECT trace.block_number FROM eth_recent_traces trace JOIN eth_recent_transactions trans ON trace.transaction_hash = trans.hash ORDER BY trans.block_number DESC;')
+    pd = data.read_pandas()
     endTime = time.time()
-    pd = data.read_all()
 
-    print(pd.to_string() + "\n")
+    print(pd.head(5))
+ 
     print("Query Time: " + str(endTime - startTime) + " seconds\n")
 
-    # startTime = time.time()
-    # data = client.query('SELECT * FROM eth_recent_traces trace JOIN eth_recent_transactions trans ON trace.transaction_hash = trans.hash ORDER BY trans.block_number DESC LIMIT 10;')
-    # endTime = time.time()
-    # pd = data.read_all()
-
-    # print(pd.to_string() + "\n")
-    # print("Query Time: " + str(endTime - startTime) + " seconds\n")
-
-    sleep(5)
+    sleep(1)
 
 #####################################
 #    High-RPS Queries Simulation    #
 #####################################
+
 def simulate_spice_user(user_id):
-    print("User " + str(user_id) + " started\n")
+    print("User " + str(user_id) + " started")
     # make a new client for each user
-    client = Client('YOUR_API_KEY', 'grpc://127.0.0.1:50051')
+    client = Client(API_KEY, 'grpc://127.0.0.1:50051')
     start = time.time()
     # make a query
-    data = client.query('SELECT * FROM eth_recent_traces trace JOIN eth_recent_transactions trans ON trace.transaction_hash = trans.hash ORDER BY trans.block_number DESC;')
+    data = client.query('SELECT * FROM eth_recent_blocks DESC;')
     pd = data.read_all()
     end = time.time()
     total = end - start
     
-    print("User" + str(user_id) + " took " + str(total) + " seconds\n")
-
+    print("User " + str(user_id) + ": " + str(total) + " seconds")
+ 
 # simulate the number of users
-num_users = 10
+num_users = 500
 threads = []
-
+ 
 start_time = time.time()
-
+ 
 for user_id in range(num_users):
     t = threading.Thread(target=simulate_spice_user, args=(user_id,))
     threads.append(t)
     t.start()
-
+ 
 for thread in threads:
     thread.join()
-
+ 
 end_time = time.time()
-
-print("Total Time: " + str(end_time - start_time) + " seconds\n")
-
+total_time = end_time - start_time
+ 
+print("Total Time: " + str(total_time) + " seconds\n")
+ 
 exit()
-
 
 ###########################
 #    Dremio Datasource    #
@@ -104,8 +100,6 @@ while True:
 
     print(pd.to_string() + "\n")
     print("Query Time: " + str(endTime - startTime) + " seconds\n")
-
-    sleep(5)
 
 ###########################
 # Spice/Dremio Datasource #
