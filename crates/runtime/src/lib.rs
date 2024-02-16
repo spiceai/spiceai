@@ -113,7 +113,7 @@ impl Runtime {
         let ds = ds.clone();
         let df = self.df.clone();
         let auth = auth.clone();
-        let retries = self.config.remote_dataset_retries;
+        let retries = self.config.dataset_load_retries;
         tokio::spawn(async move {
             for _i in 0..retries {
                 let ds = Arc::new(ds.clone());
