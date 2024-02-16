@@ -48,7 +48,7 @@ pub trait DataConnector: Send + Sync {
     fn new(
         auth_provider: AuthProvider,
         params: Arc<Option<HashMap<String, String>>>,
-    ) -> Pin<Box<dyn Future<Output = Result<Self>>>>
+    ) -> Pin<Box<dyn Future<Output = Result<Self>> + Send>>
     where
         Self: Sized;
 
