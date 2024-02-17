@@ -2,6 +2,7 @@ use crate::auth::AuthProvider;
 use snafu::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tonic::async_trait;
 
 pub mod local;
 pub mod spiceai;
@@ -32,9 +33,9 @@ pub enum Error {
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
-
+#[async_trait]
 pub trait ModelSource {
-    fn pull(
+    async fn pull(
         &self,
         auth_provider: AuthProvider,
         params: Arc<Option<HashMap<String, String>>>,

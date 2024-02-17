@@ -35,7 +35,10 @@ pub enum Error {
 }
 
 impl Model {
-    pub fn load(model: &spicepod::component::model::Model, auth: AuthProvider) -> Result<Self> {
+    pub async fn load(
+        model: &spicepod::component::model::Model,
+        auth: AuthProvider,
+    ) -> Result<Self> {
         let source = model.source();
         let source = source.as_str();
 
@@ -47,6 +50,7 @@ impl Model {
             path: create_source_from(source)
                 .context(UnknownModelSourceSnafu)?
                 .pull(auth, Arc::new(Option::from(params)))
+                .await
                 .context(UnableToLoadModelSnafu)?
                 .clone()
                 .to_string(),

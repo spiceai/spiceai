@@ -1,3 +1,5 @@
+use tonic::async_trait;
+
 use super::ModelSource;
 use crate::auth::AuthProvider;
 use std::collections::HashMap;
@@ -5,8 +7,9 @@ use std::string::ToString;
 use std::sync::Arc;
 
 pub struct Local {}
+#[async_trait]
 impl ModelSource for Local {
-    fn pull(
+    async fn pull(
         &self,
         _: AuthProvider,
         params: Arc<Option<HashMap<String, String>>>,

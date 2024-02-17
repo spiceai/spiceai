@@ -6,12 +6,14 @@ use std::collections::HashMap;
 use std::io::Cursor;
 use std::string::ToString;
 use std::sync::Arc;
+use tonic::async_trait;
 
 use crate::auth::AuthProvider;
 use regex::Regex;
 
+#[async_trait]
 impl ModelSource for SpiceAI {
-    fn pull(
+    async fn pull(
         &self,
         auth_provider: AuthProvider,
         params: Arc<Option<HashMap<String, String>>>,
@@ -86,13 +88,15 @@ impl ModelSource for SpiceAI {
             }
         }
 
-        let client = reqwest::blocking::Client::new();
+        let client = reqwest::Client::new();
         let data = client
             .get(url.clone())
             .bearer_auth(auth_provider.get_param("token").unwrap_or_default())
             .send()
+            .await
             .context(super::UnableToFetchModelSnafu)?
             .json::<HashMap<String, serde_json::value::Value>>()
+            .await
             .context(super::UnableToFetchModelSnafu)?;
 
         // Given we are still actively developing the model response, we'll only fetch the frist
@@ -118,12 +122,13 @@ impl ModelSource for SpiceAI {
         let response = client
             .get(download_url)
             .send()
+            .await
             .context(super::UnableToFetchModelSnafu {})?;
 
         std::fs::create_dir_all(versioned_path).context(super::UnableToCreateModelPathSnafu {})?;
         let mut file = std::fs::File::create(file_name.clone())
             .context(super::UnableToCreateModelPathSnafu {})?;
-        let mut content = Cursor::new(response.bytes().unwrap_or_default());
+        let mut content = Cursor::new(response.bytes().await.unwrap_or_default());
         std::io::copy(&mut content, &mut file).context(super::UnableToCreateModelPathSnafu {})?;
 
         Ok(file_name)
