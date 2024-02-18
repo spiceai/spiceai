@@ -13,7 +13,6 @@ pub trait Runnable: Send + Sync {
     fn run(&self, input: Vec<RecordBatch>, loopback_size: usize) -> Result<RecordBatch, Error>;
 }
 
-
 /// A `ModelRuntime` loads a model into it supported `ModelFormat`.
 /// Currently only `Tract` + `Onnx` is supported
 ///

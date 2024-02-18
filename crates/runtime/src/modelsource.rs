@@ -33,7 +33,6 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-
 /// A `ModelSource` pulls a model from a source into a local directory
 ///
 /// Implementing `pull` is required, which will fetch the model from the source (either local or
