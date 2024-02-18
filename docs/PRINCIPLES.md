@@ -9,6 +9,7 @@ Spice.ai is built upon a foundation of first principles.
 - API first
 - Composable from community driven-components
 - First class extensibility
+- Seamless data and model versioning
 
 ### Developer experience first
 
@@ -29,3 +30,7 @@ A Spice.ai project consists of Datasets and Models, which are composable through
 ### First class extensibility
 
 Spice.ai is designed to be extended. All components are behind well-defined interfaces, and new components can be added dynamically without code changes to the core project.
+
+### First class model and data versioning
+
+Spice.ai prioritizes seamless data & model versioning. Versioning mechanism is considered to be a first-class citizen of Spice.ai.
