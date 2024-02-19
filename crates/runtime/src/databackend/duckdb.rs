@@ -12,35 +12,31 @@ use duckdb::{
 };
 use duckdb_datafusion::DuckDBTable;
 use snafu::{prelude::*, ResultExt};
-use spicepod::component::dataset::acceleration;
+use spicepod::component::dataset::{acceleration, Dataset};
 
-use crate::dataupdate::{DataUpdate, UpdateType};
-
-use super::{AddDataResult, DataBackend};
+use crate::{
+    datapublisher::{AddDataResult, DataPublisher},
+    dataupdate::{DataUpdate, UpdateType},
+};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("DuckDBError: {source}"))]
-    DuckDBError {
-        source: duckdb::Error,
-    },
+    DuckDBError { source: duckdb::Error },
 
-    ConnectionPoolError {
-        source: r2d2::Error,
-    },
+    #[snafu(display("ConnectionPoolError: {source}"))]
+    ConnectionPoolError { source: r2d2::Error },
 
-    DuckDBDataFusion {
-        source: duckdb_datafusion::Error,
-    },
+    #[snafu(display("DuckDBDataFusionError: {source}"))]
+    DuckDBDataFusion { source: duckdb_datafusion::Error },
 
+    #[snafu(display("DataFusionError: {source}"))]
     DataFusion {
         source: datafusion::error::DataFusionError,
     },
 
     #[snafu(display("Lock is poisoned: {message}"))]
-    LockPoisoned {
-        message: String,
-    },
+    LockPoisoned { message: String },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -57,8 +53,8 @@ pub enum Mode {
     File,
 }
 
-impl DataBackend for DuckDBBackend {
-    fn add_data(&self, data_update: DataUpdate) -> AddDataResult {
+impl DataPublisher for DuckDBBackend {
+    fn add_data(&self, _dataset: Arc<Dataset>, data_update: DataUpdate) -> AddDataResult {
         let pool = Arc::clone(&self.pool);
         let name = self.name.clone();
         Box::pin(async move {
@@ -66,7 +62,6 @@ impl DataBackend for DuckDBBackend {
                 pool.get().context(ConnectionPoolSnafu)?;
 
             let mut duckdb_update = DuckDBUpdate {
-                log_sequence_number: data_update.log_sequence_number.unwrap_or_default(),
                 name,
                 data: data_update.data,
                 update_type: data_update.update_type,
@@ -79,6 +74,10 @@ impl DataBackend for DuckDBBackend {
             self.initialize_datafusion()?;
             Ok(())
         })
+    }
+
+    fn name(&self) -> &str {
+        "DuckDB"
     }
 }
 
@@ -154,7 +153,6 @@ impl From<acceleration::Mode> for Mode {
 }
 
 struct DuckDBUpdate<'a> {
-    log_sequence_number: u64,
     name: String,
     data: Vec<RecordBatch>,
     update_type: UpdateType,
@@ -178,11 +176,7 @@ impl<'a> DuckDBUpdate<'a> {
             self.insert_batch(batch)?;
         }
 
-        tracing::trace!(
-            "Processed update to DuckDB table {name} for log sequence number {lsn:?}",
-            name = self.name,
-            lsn = self.log_sequence_number
-        );
+        tracing::trace!("Processed update to DuckDB table {name}", name = self.name,);
 
         Ok(())
     }
@@ -289,13 +283,14 @@ mod tests {
             panic!("Unable to create record batch");
         };
         let data_update = DataUpdate {
-            log_sequence_number: Some(1),
             data,
             update_type: UpdateType::Overwrite,
         };
 
+        let dataset = Arc::new(Dataset::new("test".to_string(), "test".to_string()));
+
         backend
-            .add_data(data_update)
+            .add_data(dataset, data_update)
             .await
             .expect("Unable to add data");
 

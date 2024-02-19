@@ -18,7 +18,7 @@ pub struct App {
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to load spicepod {}", path.display()))]
+    #[snafu(display("Unable to load spicepod {}: {source}", path.display()))]
     UnableToLoadSpicepod {
         source: spicepod::Error,
         path: PathBuf,
@@ -54,6 +54,9 @@ impl App {
                 })?;
             for dataset in &dependent_spicepod.datasets {
                 datasets.push(dataset.clone());
+            }
+            for model in &dependent_spicepod.models {
+                models.push(model.clone());
             }
             spicepods.push(dependent_spicepod);
         }

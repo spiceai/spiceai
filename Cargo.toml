@@ -3,11 +3,11 @@ members = [
     "bin/spiced/",
     "bin/flightpublisher/",
     "bin/flightsubscriber/",
-    "bin/flightrepl/",
     "crates/flight_client",
     "crates/spicepod",
     "crates/app",
     "crates/duckdb_datafusion",
+    "crates/flightrepl",
 ]
 default-members = ["bin/spiced"]
 

@@ -19,10 +19,13 @@ pub struct Tract {
 
 #[derive(Debug, Snafu)]
 pub enum Error {
+    #[snafu(display("{source}"))]
     TractError { source: tract_core::anyhow::Error },
 
+    #[snafu(display("{source}"))]
     ArrowError { source: arrow::error::ArrowError },
 
+    #[snafu(display("{source}"))]
     ShapeError { source: ndarray::ShapeError },
 }
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -43,7 +46,6 @@ fn load_tract_model(path: &str) -> TractResult<Plan> {
     tract_onnx::onnx()
         .model_for_path(path)?
         .into_optimized()?
-        .with_input_fact(0, f32::fact([1, 20]))? // TODO: remove
         .into_runnable()
 }
 
@@ -65,7 +67,6 @@ impl Runnable for Model {
             let schema = first_record.schema();
             let fields = schema.fields();
             let mut data: Vec<Vec<f64>> = fields.iter().map(|_| Vec::new()).collect_vec();
-            let n_cols = data.len() - 1;
 
             for batch in reader {
                 batch
@@ -92,33 +93,29 @@ impl Runnable for Model {
                         data[i].append(&mut col[..end_idx].to_vec().clone());
                     });
             }
-            let inp = data
+            let inp: Vec<Vec<f64>> = data
                 .iter()
                 .enumerate()
                 .filter(|(i, _)| schema.field(*i).name() != "ts") //: (usize, ArrayRef)
-                .map(|(_, x)| x)
-                .fold(Vec::new(), |mut acc: Vec<f64>, b: &Vec<f64>| {
-                    let mut c = b.clone();
-                    c.reverse();
-                    acc.extend(c);
-                    acc
-                });
+                .map(|(_, x)| x.clone())
+                .collect_vec();
 
-            let small_vec: Tensor =
-                tract_ndarray::Array2::from_shape_vec((1, lookback_size * n_cols), inp)
-                    .context(ShapeSnafu)?
-                    .into();
+            let n_cols = inp.len();
 
-            let output = this
-                .model
-                .run(tvec!(small_vec
-                    .cast_to_dt(DatumType::F32)
-                    .context(TractSnafu)?
-                    .deep_clone()
-                    .into()))
-                .context(TractSnafu)?;
+            let small_vec: Tensor = tract_ndarray::Array3::from_shape_vec(
+                (1, lookback_size, n_cols),
+                inp.into_iter().concat(),
+            )
+            .context(ShapeSnafu)?
+            .into_tensor();
 
-            let result: Vec<f32> = output[0]
+            let output = this.model.run(tvec!(small_vec
+                .cast_to_dt(DatumType::F32)
+                .context(TractSnafu)?
+                .deep_clone()
+                .into()));
+
+            let result: Vec<f32> = output?[0]
                 .to_array_view::<f32>()
                 .context(TractSnafu)?
                 .iter()

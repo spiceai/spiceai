@@ -21,7 +21,7 @@ impl DataConnector for DebugSource {
     fn new(
         _auth_provider: AuthProvider,
         _params: Arc<Option<HashMap<String, String>>>,
-    ) -> Pin<Box<dyn Future<Output = super::Result<Self>>>> {
+    ) -> Pin<Box<dyn Future<Output = super::Result<Self>> + Send>> {
         Box::pin(async move { Ok(Self {}) })
     }
 
@@ -75,7 +75,6 @@ impl DataConnector for DebugSource {
                   ],
               ) {
                 yield DataUpdate {
-                  log_sequence_number: None,
                   update_type: UpdateType::Append,
                   data: vec![batch],
                 };

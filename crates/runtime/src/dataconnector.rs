@@ -12,6 +12,7 @@ use futures_core::stream::BoxStream;
 use std::future::Future;
 
 use crate::auth::AuthProvider;
+use crate::datapublisher::DataPublisher;
 use crate::dataupdate::{DataUpdate, UpdateType};
 
 pub mod debug;
@@ -21,12 +22,14 @@ pub mod spiceai;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
+    #[snafu(display("Unable to create data connector: {source}"))]
     UnableToCreateDataConnector {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+pub type AnyErrorResult = std::result::Result<(), Box<dyn std::error::Error>>;
 
 /// A `DataConnector` knows how to retrieve and modify data for a given dataset.
 ///
@@ -45,7 +48,7 @@ pub trait DataConnector: Send + Sync {
     fn new(
         auth_provider: AuthProvider,
         params: Arc<Option<HashMap<String, String>>>,
-    ) -> Pin<Box<dyn Future<Output = Result<Self>>>>
+    ) -> Pin<Box<dyn Future<Output = Result<Self>> + Send>>
     where
         Self: Sized;
 
@@ -65,18 +68,8 @@ pub trait DataConnector: Send + Sync {
         dataset: &Dataset,
     ) -> Pin<Box<dyn Future<Output = Vec<RecordBatch>> + Send>>;
 
-    /// Returns true if the given dataset supports writing data back to this `DataConnector`.
-    fn supports_data_writes(&self, _dataset: &Dataset) -> bool {
-        false
-    }
-
-    /// Adds data ingested locally back to the source.
-    fn add_data(
-        &self,
-        dataset: &Dataset,
-        _data: DataUpdate,
-    ) -> Pin<Box<dyn Future<Output = Result<()>>>> {
-        panic!("add_data not implemented for {}", dataset.name)
+    fn get_data_publisher(&self) -> Option<Box<dyn DataPublisher>> {
+        None
     }
 }
 
@@ -102,7 +95,6 @@ impl dyn DataConnector + '_ {
                 loop {
                     tracing::info!("Refreshing data for {}", dataset.name);
                     yield DataUpdate {
-                        log_sequence_number: None,
                         data: self.get_all_data(dataset).await,
                         update_type: UpdateType::Overwrite,
                     };
@@ -115,7 +107,6 @@ impl dyn DataConnector + '_ {
         // Otherwise, just return the data once.
         Box::pin(stream::once(async move {
             DataUpdate {
-                log_sequence_number: None,
                 data: self.get_all_data(dataset).await,
                 update_type: UpdateType::Overwrite,
             }

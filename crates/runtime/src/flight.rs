@@ -27,7 +27,7 @@ use arrow_flight::{
 };
 
 pub struct Service {
-    datafusion: Arc<DataFusion>,
+    datafusion: Arc<RwLock<DataFusion>>,
     channel_map: Arc<RwLock<HashMap<String, Arc<Sender<DataUpdate>>>>>,
 }
 
@@ -66,7 +66,7 @@ impl FlightService for Service {
         let table_path = ListingTableUrl::parse(&request.path[0]).map_err(to_tonic_err)?;
 
         let schema = listing_options
-            .infer_schema(&self.datafusion.ctx.state(), &table_path)
+            .infer_schema(&self.datafusion.read().await.ctx.state(), &table_path)
             .await
             .map_err(to_tonic_err)?;
 
@@ -85,13 +85,16 @@ impl FlightService for Service {
         let ticket = request.into_inner();
         match std::str::from_utf8(&ticket.ticket) {
             Ok(sql) => {
-                let df = self.datafusion.ctx.sql(sql).await.map_err(to_tonic_err)?;
+                let df = self
+                    .datafusion
+                    .read()
+                    .await
+                    .ctx
+                    .sql(sql)
+                    .await
+                    .map_err(to_tonic_err)?;
                 let schema = df.schema().clone().into();
                 let results = df.collect().await.map_err(to_tonic_err)?;
-                if results.is_empty() {
-                    return Err(Status::internal("There were no results from ticket"));
-                }
-
                 let options = datafusion::arrow::ipc::writer::IpcWriteOptions::default();
                 let schema_flight_data = SchemaAsIpc::new(&schema, &options);
 
@@ -178,12 +181,15 @@ impl FlightService for Service {
 
         let path = fd.path.join(".");
 
-        let Some(backend) = self.datafusion.get_backend(&path) else {
+        let df = self.datafusion.read().await;
+
+        let Some(publishers) = df.get_publishers(&path) else {
             return Err(Status::invalid_argument(format!(
-                "No backend registered for path: {path:?}",
+                "No publishers registered for path: {path:?}",
             )));
         };
-        let backend = Arc::clone(backend);
+        let dataset = Arc::clone(&publishers.0);
+        let data_publishers = Arc::clone(&publishers.1);
 
         let schema = try_schema_from_flatbuffer_bytes(&message.data_header).map_err(|e| {
             Status::internal(format!("Unable to get schema from data header: {e:?}"))
@@ -209,7 +215,8 @@ impl FlightService for Service {
         let response_stream = stream::unfold(streaming_flight, move |mut flight| {
             let schema = Arc::clone(&schema);
             let dictionaries_by_id = Arc::clone(&dictionaries_by_id);
-            let backend = Arc::clone(&backend);
+            let dataset = Arc::clone(&dataset);
+            let data_publishers = Arc::clone(&data_publishers);
             let path = path.clone();
             let channel_map = Arc::clone(&channel_map);
             async move {
@@ -230,7 +237,6 @@ impl FlightService for Service {
 
                         let data_update = DataUpdate {
                             data: vec![new_batch],
-                            log_sequence_number: None,
                             update_type: UpdateType::Append,
                         };
 
@@ -238,13 +244,16 @@ impl FlightService for Service {
                             let _ = channel.send(data_update.clone());
                         };
 
-                        if let Err(err) = backend
-                            .add_data(data_update)
-                            .await
-                            .map_err(|e| Status::internal(format!("Unable to add data: {e:?}")))
-                        {
-                            return Some((Err(err), flight));
-                        };
+                        let data_publishers = data_publishers.read().await;
+                        for publisher in data_publishers.iter() {
+                            if let Err(err) = publisher
+                                .add_data(Arc::clone(&dataset), data_update.clone())
+                                .await
+                                .map_err(|e| Status::internal(format!("Unable to add data: {e:?}")))
+                            {
+                                return Some((Err(err), flight));
+                            };
+                        }
 
                         Some((Ok(PutResult::default()), flight))
                     }
@@ -314,7 +323,7 @@ impl FlightService for Service {
 
         let data_path = flight_descriptor.path.join(".");
 
-        if !self.datafusion.has_backend(&data_path) {
+        if !self.datafusion.read().await.has_publishers(&data_path) {
             return Err(Status::invalid_argument(format!(
                 r#"Unknown dataset: "{data_path}""#,
             )));
@@ -379,6 +388,8 @@ impl FlightService for Service {
         let datafusion = Arc::clone(&self.datafusion);
         tokio::spawn(async move {
             let Ok(df) = datafusion
+                .read()
+                .await
                 .ctx
                 .sql(&format!(r#"SELECT * FROM "{data_path}""#))
                 .await
@@ -395,7 +406,6 @@ impl FlightService for Service {
             for batch in &results {
                 let data_update = DataUpdate {
                     data: vec![batch.clone()],
-                    log_sequence_number: None,
                     update_type: UpdateType::Append,
                 };
                 let _ = tx.send(data_update);
@@ -416,23 +426,21 @@ where
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("A test error"))]
-    Arrow { source: ArrowError },
-
-    #[snafu(display("Unable to register parquet file"))]
+    #[snafu(display("Unable to register parquet file: {source}"))]
     RegisterParquet { source: crate::datafusion::Error },
 
+    #[snafu(display("{source}"))]
     DataFusion {
         source: datafusion::error::DataFusionError,
     },
 
-    #[snafu(display("Unable to start Flight server"))]
+    #[snafu(display("Unable to start Flight server: {source}"))]
     UnableToStartFlightServer { source: tonic::transport::Error },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
-pub async fn start(bind_address: std::net::SocketAddr, df: Arc<DataFusion>) -> Result<()> {
+pub async fn start(bind_address: std::net::SocketAddr, df: Arc<RwLock<DataFusion>>) -> Result<()> {
     let service = Service {
         datafusion: df.clone(),
         channel_map: Arc::new(RwLock::new(HashMap::new())),

@@ -6,10 +6,11 @@ use crate::DataFusion;
 use arrow::record_batch::RecordBatch;
 use snafu::prelude::*;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 
 pub struct Model {
     runnable: Box<dyn Runnable>,
-    datasets: Vec<String>,
+    model: spicepod::component::model::Model,
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -34,7 +35,10 @@ pub enum Error {
 }
 
 impl Model {
-    pub fn load(model: &spicepod::component::model::Model, auth: AuthProvider) -> Result<Self> {
+    pub async fn load(
+        model: &spicepod::component::model::Model,
+        auth: AuthProvider,
+    ) -> Result<Self> {
         let source = model.source();
         let source = source.as_str();
 
@@ -46,6 +50,7 @@ impl Model {
             path: create_source_from(source)
                 .context(UnknownModelSourceSnafu)?
                 .pull(auth, Arc::new(Option::from(params)))
+                .await
                 .context(UnableToLoadModelSnafu)?
                 .clone()
                 .to_string(),
@@ -55,17 +60,23 @@ impl Model {
 
         Ok(Self {
             runnable: tract,
-            datasets: model.datasets.clone(),
+            model: model.clone(),
         })
     }
 
-    pub async fn run(&self, df: Arc<DataFusion>, lookback_size: usize) -> Result<RecordBatch> {
+    pub async fn run(
+        &self,
+        df: Arc<RwLock<DataFusion>>,
+        lookback_size: usize,
+    ) -> Result<RecordBatch> {
         let data = df
+            .read()
+            .await
             .ctx
             .sql(
                 &(format!(
                     "select * from datafusion.public.{} order by ts asc",
-                    self.datasets[0]
+                    self.model.datasets[0]
                 )),
             )
             .await

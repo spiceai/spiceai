@@ -2,7 +2,10 @@ use std::{collections::HashMap, fmt::Debug, sync::Arc};
 
 use app::App;
 use snafu::prelude::*;
-use tokio::net::{TcpListener, ToSocketAddrs};
+use tokio::{
+    net::{TcpListener, ToSocketAddrs},
+    sync::RwLock,
+};
 
 use crate::{datafusion::DataFusion, model::Model};
 
@@ -11,10 +14,10 @@ mod v1;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to bind to address"))]
+    #[snafu(display("Unable to bind to address: {source}"))]
     UnableToBindServerToPort { source: std::io::Error },
 
-    #[snafu(display("Unable to start HTTP server"))]
+    #[snafu(display("Unable to start HTTP server: {source}"))]
     UnableToStartHttpServer { source: std::io::Error },
 }
 
@@ -22,9 +25,9 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub(crate) async fn start<A>(
     bind_address: A,
-    app: Arc<App>,
-    df: Arc<DataFusion>,
-    models: Arc<HashMap<String, Model>>,
+    app: Arc<RwLock<App>>,
+    df: Arc<RwLock<DataFusion>>,
+    models: Arc<RwLock<HashMap<String, Model>>>,
 ) -> Result<()>
 where
     A: ToSocketAddrs + Debug,
