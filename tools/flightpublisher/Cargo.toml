@@ -9,8 +9,8 @@ repository.workspace = true
 description = "Spice OSS Flight Publisher"
 
 [dependencies]
-arrow = "49.0.0"
-arrow-flight = "49.0.0"
+arrow.workspace = true
+arrow-flight.workspace = true
 parquet = "49.0.0"
 clap = { workspace = true, features = ["derive"] }
 tokio.workspace = true

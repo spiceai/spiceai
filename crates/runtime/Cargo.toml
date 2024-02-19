@@ -17,9 +17,9 @@ tokio.workspace = true
 tracing.workspace = true
 clap.workspace = true
 metrics.workspace = true
-datafusion = "34.0.0"
-arrow = "49.0.0"
-arrow-flight = "49.0.0"
+datafusion.workspace = true
+arrow.workspace = true
+arrow-flight.workspace = true
 arrow-ipc = "49.0.0"
 tonic = "0.10.2"
 tonic_0_9_0 = { version = "0.9.0", package = "tonic", features = ["gzip"] }
@@ -37,7 +37,7 @@ tract-core = "0.21.0"
 tract-onnx = "0.21.0"
 ndarray = "0.15.3"
 ndarray-npy = { version = "0.8.0", features = [ "compressed_npz" ] }
-duckdb = { git = "https://github.com/spicehq/duckdb-rs.git", rev = "8b57b1496eed1009c45734df7790960313d31e3d",  features = ["bundled", "r2d2", "vtab", "vtab-arrow"], optional = true }
+duckdb = { workspace = true,  features = ["bundled", "r2d2", "vtab", "vtab-arrow"], optional = true }
 duckdb_datafusion = { path = "../duckdb_datafusion", optional = true }
 r2d2 = { version = "0.8.10", optional = true }
 opentelemetry-proto = { version = "0.4.0", features = ["gen-tonic-messages", "gen-tonic", "metrics"] }

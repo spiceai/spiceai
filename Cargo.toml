@@ -1,13 +1,13 @@
 [workspace]
 members = [
     "bin/spiced/",
-    "bin/flightpublisher/",
-    "bin/flightsubscriber/",
     "crates/flight_client",
     "crates/spicepod",
     "crates/app",
     "crates/duckdb_datafusion",
     "crates/flightrepl",
+    "tools/flightpublisher/",
+    "tools/flightsubscriber/",
 ]
 default-members = ["bin/spiced"]
 
@@ -34,3 +34,7 @@ tokio = { version = "1.35.1", features = ["rt-multi-thread", "signal"] }
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 metrics = "0.22.0"
+datafusion = "34.0.0"
+arrow = "49.0.0"
+arrow-flight = "49.0.0"
+duckdb.workspace = true
