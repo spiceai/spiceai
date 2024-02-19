@@ -73,7 +73,7 @@ pub async fn run(args: Args) -> Result<()> {
     let app = Arc::new(App::new(current_dir.clone()).context(UnableToConstructSpiceAppSnafu)?);
     let auth = Arc::new(load_auth_providers());
     let df = Arc::new(RwLock::new(runtime::datafusion::DataFusion::new()));
-    let model_map = load_models(&app, &auth);
+    let model_map = load_models(&app, &auth).await;
     let pods_watcher = PodsWatcher::new(current_dir.clone());
 
     let mut rt: Runtime = Runtime::new(
@@ -104,11 +104,11 @@ fn load_auth_providers() -> runtime::auth::AuthProviders {
     auth
 }
 
-fn load_models(app: &App, auth: &runtime::auth::AuthProviders) -> HashMap<String, Model> {
+async fn load_models(app: &App, auth: &runtime::auth::AuthProviders) -> HashMap<String, Model> {
     let mut model_map = HashMap::with_capacity(app.models.len());
     for m in &app.models {
         tracing::info!("Deploying model [{}] from {}...", m.name, m.from);
-        match Model::load(m, auth.get(m.source().as_str())) {
+        match Model::load(m, auth.get(m.source().as_str())).await {
             Ok(in_m) => {
                 model_map.insert(m.name.clone(), in_m);
                 tracing::info!("Model [{}] deployed, ready for inferencing", m.name);

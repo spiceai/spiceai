@@ -43,9 +43,10 @@ r2d2 = { version = "0.8.10", optional = true }
 opentelemetry-proto = { version = "0.4.0", features = ["gen-tonic-messages", "gen-tonic", "metrics"] }
 indexmap = "2.2.2"
 regex = "1.10.3"
-reqwest = { version = "0.11.24", features = ["blocking", "json"] }
+reqwest = { version = "0.11.24", features = ["json"] }
 notify = "6.1.1"
 arrow-json = "49.0.0"
+async-trait = "0.1.77"
 
 [features]
 default = ["duckdb"]

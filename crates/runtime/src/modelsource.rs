@@ -1,4 +1,5 @@
 use crate::auth::AuthProvider;
+use async_trait::async_trait;
 use snafu::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -32,9 +33,9 @@ pub enum Error {
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
-
+#[async_trait]
 pub trait ModelSource {
-    fn pull(
+    async fn pull(
         &self,
         auth_provider: AuthProvider,
         params: Arc<Option<HashMap<String, String>>>,
