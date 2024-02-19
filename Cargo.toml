@@ -37,4 +37,9 @@ metrics = "0.22.0"
 datafusion = "34.0.0"
 arrow = "49.0.0"
 arrow-flight = "49.0.0"
-duckdb.workspace = true
+duckdb = { git = "https://github.com/spicehq/duckdb-rs.git", rev = "8b57b1496eed1009c45734df7790960313d31e3d" }
+tonic = "0.10.2"
+futures = "0.3.30"
+r2d2 = "0.8.10"
+async-stream = "0.3.5"
+async-trait = "0.1.77"

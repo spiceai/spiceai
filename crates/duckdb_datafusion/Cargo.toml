@@ -13,9 +13,11 @@ exclude.workspace = true
 [dependencies]
 duckdb = { workspace = true,  features = ["bundled", "r2d2", "vtab", "vtab-arrow"] }
 datafusion.workspace = true
-async-trait = "0.1.77"
-r2d2 = "0.8.10"
+async-trait.workspace = true
+r2d2.workspace = true
 snafu.workspace = true
 tokio.workspace = true
-tracing = "0.1.40"
+tracing.workspace = true
+
+[dev-dependencies]
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
