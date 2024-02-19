@@ -1,4 +1,5 @@
 use crate::auth::AuthProvider;
+use async_trait::async_trait;
 use snafu::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -38,9 +39,9 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// Implementing `pull` is required, which will fetch the model from the source (either local or
 /// remote) and store it in the local directory. The local directory is returned for further
 /// processing by `ModelRuntime`.
+#[async_trait]
 pub trait ModelSource {
-    // Pull the model from the source
-    fn pull(
+    async fn pull(
         &self,
         auth_provider: AuthProvider,
         params: Arc<Option<HashMap<String, String>>>,

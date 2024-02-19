@@ -3,12 +3,14 @@
 use std::borrow::Borrow;
 use std::{collections::HashMap, sync::Arc};
 
+use app::App;
 use config::Config;
 use model::Model;
 pub use notify::Error as NotifyError;
 use snafu::prelude::*;
 use spicepod::component::dataset::Dataset;
 use spicepod::component::dataset::Mode;
+use spicepod::component::model::Model as SpicepodModel;
 use std::time::Duration;
 use tokio::time::sleep;
 use tokio::{signal, sync::RwLock};
@@ -85,12 +87,12 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct Runtime {
-    pub app: Arc<app::App>,
+    pub app: Arc<RwLock<App>>,
     pub config: config::Config,
     pub df: Arc<RwLock<DataFusion>>,
-    pub models: Arc<HashMap<String, Model>>,
+    pub models: Arc<RwLock<HashMap<String, Model>>>,
     pub pods_watcher: podswatcher::PodsWatcher,
-    pub auth: Arc<auth::AuthProviders>,
+    pub auth: Arc<RwLock<auth::AuthProviders>>,
 
     spaced_tracer: Arc<tracers::SpacedTracer>,
 }
@@ -99,39 +101,41 @@ impl Runtime {
     #[must_use]
     pub fn new(
         config: Config,
-        app: Arc<app::App>,
+        app: Arc<RwLock<app::App>>,
         df: Arc<RwLock<DataFusion>>,
-        models: HashMap<String, Model>,
         pods_watcher: podswatcher::PodsWatcher,
-        auth: Arc<auth::AuthProviders>,
+        auth: Arc<RwLock<auth::AuthProviders>>,
     ) -> Self {
         Runtime {
             app,
             config,
             df,
-            models: Arc::new(models),
+            models: Arc::new(RwLock::new(HashMap::new())),
             pods_watcher,
             auth,
             spaced_tracer: Arc::new(tracers::SpacedTracer::new(Duration::from_secs(15))),
         }
     }
 
-    pub fn load_datasets(&self, auth: &Arc<auth::AuthProviders>) {
-        for ds in self.app.datasets.clone() {
-            self.load_dataset(ds, auth);
+    pub async fn load_datasets(&self) {
+        for ds in self.app.read().await.datasets.clone() {
+            self.load_dataset(ds);
         }
     }
 
-    pub fn load_dataset(&self, ds: Dataset, auth: &Arc<auth::AuthProviders>) {
+    pub fn load_dataset(&self, ds: Dataset) {
         let df = Arc::clone(&self.df);
-        let auth = Arc::clone(auth);
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
+        let shared_auth = Arc::clone(&self.auth);
+
         tokio::spawn(async move {
             loop {
                 if ds.acceleration.is_none() && !ds.is_view() {
                     tracing::warn!("No acceleration specified for dataset: {}", ds.name);
                     break;
                 };
+
+                let auth = shared_auth.read().await;
 
                 let source = ds.source();
                 let source = source.as_str();
@@ -279,6 +283,32 @@ impl Runtime {
         Ok(())
     }
 
+    pub async fn load_models(&self) {
+        for model in &self.app.read().await.models {
+            self.load_model(model).await;
+        }
+    }
+
+    pub async fn load_model(&self, m: &SpicepodModel) {
+        tracing::info!("Loading model [{}] from {}...", m.name, m.from);
+        let mut model_map = self.models.write().await;
+        let auth = self.auth.read().await;
+
+        match Model::load(m, auth.get(m.source().as_str())).await {
+            Ok(in_m) => {
+                model_map.insert(m.name.clone(), in_m);
+                tracing::info!("Model [{}] deployed, ready for inferencing", m.name);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Unable to load runnable model from spicepod {}, error: {}",
+                    m.name,
+                    e,
+                );
+            }
+        }
+    }
+
     pub async fn start_servers(&mut self) -> Result<()> {
         let http_server_future = http::start(
             self.config.http_bind_address,
@@ -304,40 +334,44 @@ impl Runtime {
     }
 
     pub async fn start_pods_watcher(&mut self) -> notify::Result<()> {
-        let mut current_app = Arc::clone(&self.app);
-
         let mut rx = self.pods_watcher.watch()?;
 
         while let Some(new_app) = rx.recv().await {
+            let mut current_app = self.app.write().await;
+
             tracing::debug!("Updated pods information: {:?}", new_app);
             tracing::debug!("Previous pods information: {:?}", current_app);
 
-            let mut auth = auth::AuthProviders::default();
-            if let Err(e) = auth.parse_from_config() {
-                tracing::warn!(
-                    "Unable to parse auth from config, proceeding without auth: {}",
-                    e
-                );
-            }
-            let auth_arc = Arc::new(auth);
-
-            let existing_dataset_names = current_app
-                .datasets
-                .iter()
-                .map(|ds| ds.name.clone())
-                .collect::<Vec<String>>();
+            *self.auth.write().await = load_auth_providers();
 
             for ds in &new_app.datasets {
-                if !existing_dataset_names.contains(&ds.name) {
-                    self.load_dataset(ds.clone(), &auth_arc);
+                if !current_app.datasets.iter().any(|d| d.name == ds.name) {
+                    self.load_dataset(ds.clone());
                 }
             }
 
-            current_app = Arc::new(new_app);
+            for model in &new_app.models {
+                if !current_app.models.iter().any(|m| m.name == model.name) {
+                    self.load_model(model).await;
+                }
+            }
+
+            *current_app = new_app;
         }
 
         Ok(())
     }
+}
+
+pub fn load_auth_providers() -> auth::AuthProviders {
+    let mut auth = auth::AuthProviders::default();
+    if let Err(e) = auth.parse_from_config() {
+        tracing::warn!(
+            "Unable to parse auth from config, proceeding without auth: {}",
+            e
+        );
+    }
+    auth
 }
 
 async fn shutdown_signal() {
