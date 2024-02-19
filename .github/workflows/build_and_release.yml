@@ -86,7 +86,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: spice_${{ matrix.target_os }}_${{ matrix.target_arch }}
-          path: cmd/spice/spice_${{ matrix.target_os }}_${{ matrix.target_arch }}.tar.gz
+          path: spice_${{ matrix.target_os }}_${{ matrix.target_arch }}.tar.gz
 
   publish:
     name: Publish ${{ matrix.target_os }}-${{ matrix.target_arch }} binaries
