@@ -36,12 +36,8 @@ jobs:
     steps:
       - uses: actions/checkout@v3
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12.2'
-
       - name: Set REL_VERSION from version.txt
-        run: python ./.github/scripts/get_release_version.py
+        run: python3 ./.github/scripts/get_release_version.py
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -111,12 +107,8 @@ jobs:
     steps:
       - uses: actions/checkout@v3
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12.2'
-
       - name: Set REL_VERSION from version.txt
-        run: python ./.github/scripts/get_release_version.py
+        run: python3 ./.github/scripts/get_release_version.py
 
       - name: download artifacts - spice_${{ matrix.target_os }}_${{ matrix.target_arch }}
         uses: actions/download-artifact@v4
