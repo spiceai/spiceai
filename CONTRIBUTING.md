@@ -66,7 +66,7 @@ Spice.ai takes security and our users' trust very seriously. If you believe you 
 
 ### Installing Dependencies
 
-Spice.ai requires Go 1.21, Python 3.8.x and Docker.
+Spice.ai requires Rust 1.71.
 
 #### Go 1.21
 
