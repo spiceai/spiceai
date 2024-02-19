@@ -1,4 +1,4 @@
-use tonic::async_trait;
+use async_trait::async_trait;
 
 use super::ModelSource;
 use crate::auth::AuthProvider;

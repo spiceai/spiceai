@@ -1,12 +1,12 @@
 pub struct SpiceAI {}
 
 use super::ModelSource;
+use async_trait::async_trait;
 use snafu::prelude::*;
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::string::ToString;
 use std::sync::Arc;
-use tonic::async_trait;
 
 use crate::auth::AuthProvider;
 use regex::Regex;

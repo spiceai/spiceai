@@ -1,8 +1,8 @@
 use crate::auth::AuthProvider;
+use async_trait::async_trait;
 use snafu::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tonic::async_trait;
 
 pub mod local;
 pub mod spiceai;

@@ -3451,6 +3451,7 @@ dependencies = [
  "arrow-ipc",
  "arrow-json",
  "async-stream",
+ "async-trait",
  "axum 0.7.4",
  "clap",
  "datafusion",
