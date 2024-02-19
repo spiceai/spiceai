@@ -25,9 +25,9 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub(crate) async fn start<A>(
     bind_address: A,
-    app: Arc<App>,
+    app: Arc<RwLock<App>>,
     df: Arc<RwLock<DataFusion>>,
-    models: Arc<HashMap<String, Model>>,
+    models: Arc<RwLock<HashMap<String, Model>>>,
 ) -> Result<()>
 where
     A: ToSocketAddrs + Debug,

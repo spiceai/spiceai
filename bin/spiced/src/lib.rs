@@ -1,6 +1,5 @@
 #![allow(clippy::missing_errors_doc)]
 
-use std::collections::HashMap;
 use std::env;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -10,7 +9,6 @@ use app::App;
 use clap::Parser;
 use flightrepl::ReplConfig;
 use runtime::config::Config as RuntimeConfig;
-use runtime::model::Model;
 
 use runtime::podswatcher::PodsWatcher;
 use runtime::Runtime;
@@ -70,58 +68,21 @@ pub struct Args {
 
 pub async fn run(args: Args) -> Result<()> {
     let current_dir = env::current_dir().unwrap_or(PathBuf::from("."));
-    let app = Arc::new(App::new(current_dir.clone()).context(UnableToConstructSpiceAppSnafu)?);
-    let auth = Arc::new(load_auth_providers());
+    let app = Arc::new(RwLock::new(
+        App::new(current_dir.clone()).context(UnableToConstructSpiceAppSnafu)?,
+    ));
+    let auth = Arc::new(RwLock::new(runtime::load_auth_providers()));
     let df = Arc::new(RwLock::new(runtime::datafusion::DataFusion::new()));
-    let model_map = load_models(&app, &auth).await;
     let pods_watcher = PodsWatcher::new(current_dir.clone());
 
-    let mut rt: Runtime = Runtime::new(
-        args.runtime,
-        Arc::clone(&app),
-        df,
-        model_map,
-        pods_watcher,
-        Arc::clone(&auth),
-    );
-    rt.load_datasets(&auth);
+    let mut rt: Runtime = Runtime::new(args.runtime, app, df, pods_watcher, auth);
+    rt.load_datasets().await;
+
+    rt.load_models().await;
 
     rt.start_servers()
         .await
         .context(UnableToStartServersSnafu)?;
 
     Ok(())
-}
-
-fn load_auth_providers() -> runtime::auth::AuthProviders {
-    let mut auth = runtime::auth::AuthProviders::default();
-    if let Err(e) = auth.parse_from_config() {
-        tracing::warn!(
-            "Unable to parse auth from config, proceeding without auth: {}",
-            e
-        );
-    }
-    auth
-}
-
-async fn load_models(app: &App, auth: &runtime::auth::AuthProviders) -> HashMap<String, Model> {
-    let mut model_map = HashMap::with_capacity(app.models.len());
-    for m in &app.models {
-        tracing::info!("Deploying model [{}] from {}...", m.name, m.from);
-        match Model::load(m, auth.get(m.source().as_str())).await {
-            Ok(in_m) => {
-                model_map.insert(m.name.clone(), in_m);
-                tracing::info!("Model [{}] deployed, ready for inferencing", m.name);
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Unable to load runnable model from spicepod {}, error: {}",
-                    m.name,
-                    e,
-                );
-            }
-        }
-    }
-
-    model_map
 }
