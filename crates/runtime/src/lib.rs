@@ -293,7 +293,7 @@ impl Runtime {
         let mut model_map = self.models.write().await;
         let auth = self.auth.read().await;
 
-        match Model::load(m, auth.get(m.source().as_str())) {
+        match Model::load(m, auth.get(m.source().as_str())).await {
             Ok(in_m) => {
                 model_map.insert(m.name.clone(), in_m);
                 tracing::info!("Model [{}] deployed, ready for inferencing", m.name);
