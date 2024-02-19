@@ -25,7 +25,7 @@ Spice.ai takes a developer-first approach, and is focused on a fast, iterative, 
 
 ## Features
 
-The Spice.ai runtime is written in Golang and Python and runs as a container or microservice. It's deployable to any public cloud, on-premises, and edge. It is configured with a simple manifest and accessed by HTTP APIs.
+The Spice.ai runtime is written in Rust and runs as a container or microservice. It's deployable to any public cloud, on-premises, and edge. It is configured with a simple manifest and accessed by HTTP APIs.
 
 Spice.ai includes:
 
@@ -94,28 +94,19 @@ Then, follow this guide to get started quickly with Spice.ai. For a more compreh
 
 ### Installation (local machine)
 
-1. Install Docker
-2. Install the Spice CLI
+1. Install the Spice CLI.
 
-**Step 1. Install Docker**: While self-hosting on baremetal hardware will be supported, the Developer Preview currently requires Docker. To install Docker, please follow [these instructions](https://docs.docker.com/get-docker/).
-
-**Step 2. Install the Spice CLI**: Run the following `curl` command in your terminal.
+**Step 1. Clone the Rust branch of the SpicaAI repo**: Use the following command to clone the SpiceAI repo's Rust branch in your working directory:
 
 ```bash
-curl https://install.spiceai.org | /bin/bash
+git clone -b rust https://github.com/spiceai/spiceai.git
 ```
 
-You may need to restart your terminal for the `spice` command to be added to your PATH.
+**Step 2. Install the CLI**: Running the following command will compile the source code and add the Spice command to your path:
 
-### Getting started with Codespaces
-
-The recommended way to get started with Spice.ai is to use GitHub Codespaces.
-
-Create a new GitHub Codespace in the `spiceai/quickstarts` repo at [github.com/spiceai/quickstarts/codespaces](https://github.com/spiceai/quickstarts/codespaces).
-
-<img src="https://user-images.githubusercontent.com/80174/130397022-e882fc26-06fd-49da-ae35-03383221c63d.png" width="300">
-
-Once you open the Codespace, Spice.ai and everything you need to get started will already be installed. Continue on to train your first pod.
+```bash
+Make install
+```
 
 ### Create your first Spicepod and train it
 
