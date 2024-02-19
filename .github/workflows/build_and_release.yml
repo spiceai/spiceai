@@ -1,0 +1,138 @@
+name: build_and_release
+
+on:
+  push:
+    branches:
+      - trunk
+      - release-*
+    tags:
+      - v*
+
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build ${{ matrix.target_os }}_${{ matrix.target_arch }} binaries
+    runs-on: ${{ matrix.runner }}
+    env:
+      GOVER: 1.22
+      GOOS: ${{ matrix.target_os }}
+      GOARCH: ${{ matrix.target_arch }}
+
+    strategy:
+      matrix:
+        runner: [rust, macos-14]
+        target_arch: [amd64, arm64]
+        include:
+          - runner: ubuntu-latest
+            target_os: linux
+          - runner: macos-14
+            target_os: darwin
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set REL_VERSION from version.txt
+        run: python ./.github/scripts/get_release_version.py
+
+      - name: Set up Go
+        uses: actions/setup-go@v3
+        with:
+          go-version: ${{ env.GOVER }}
+
+      - name: Build spiced
+        run: make -C bin/spiced
+
+      - name: Build spice
+        run: make -C bin/spice
+
+      - name: tar binary
+        run: |
+          mv target/release/spiced spiced
+          chmod +x spiced
+          tar cf spiced_${{ matrix.target_os }}_${{ matrix.target_arch }}.tar.gz spiced
+
+      - name: Print version
+        if: matrix.target_os != 'windows'
+        run: ./spiced version
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spiced_${{ matrix.target_os }}_${{ matrix.target_arch }}
+          path: spiced_${{ matrix.target_os }}_${{ matrix.target_arch }}.tar.gz
+
+      - name: tar binary
+        run: |
+          mv target/release/spice spice
+          chmod +x spice
+          tar cf spice_${{ matrix.target_os }}_${{ matrix.target_arch }}.tar.gz spice
+
+      - name: Print version
+        run: ./spice version
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spice_${{ matrix.target_os }}_${{ matrix.target_arch }}
+          path: cmd/spice/spice_${{ matrix.target_os }}_${{ matrix.target_arch }}.tar.gz
+
+  publish:
+    name: Publish ${{ matrix.target_os }}-${{ matrix.target_arch }} binaries
+    needs: build
+    if: startswith(github.ref, 'refs/tags/v') && github.event_name != 'pull_request'
+    env:
+      ARTIFACT_DIR: ./release
+
+    strategy:
+      matrix:
+        target_os: [linux, darwin]
+        target_arch: [amd64, arm64]
+
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code into the Go module directory
+        uses: actions/checkout@v3
+
+      - name: Set REL_VERSION from version.txt
+        run: python ./.github/scripts/get_release_version.py
+
+      - name: download artifacts - spice_${{ matrix.target_os }}_${{ matrix.target_arch }}
+        uses: actions/download-artifact@v4
+        with:
+          name: spice_${{ matrix.target_os }}_${{ matrix.target_arch }}
+          path: ${{ env.ARTIFACT_DIR }}
+
+      - name: download artifacts - spiced_${{ matrix.target_os }}_${{ matrix.target_arch }}
+        uses: actions/download-artifact@v4
+        with:
+          name: spiced_${{ matrix.target_os }}_${{ matrix.target_arch }}
+          path: ${{ env.ARTIFACT_DIR }}
+
+      - name: lists artifacts
+        run: ls -l ${{ env.ARTIFACT_DIR }}
+
+      - name: publish ${{ matrix.target_os }}/${{ matrix.target_arch }} binaries to github
+        run: |
+          # Parse repository to get owner and repo names
+          OWNER_NAME="${GITHUB_REPOSITORY%%/*}"
+          REPO_NAME="${GITHUB_REPOSITORY#*/}"
+          export GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }}
+          # Get the list of files
+          RELEASE_ARTIFACT=(${ARTIFACT_DIR}/*)
+          # Delete existing release artifact
+          python ./.github/scripts/github_release.py delete \
+            --owner $OWNER_NAME --repo $REPO_NAME \
+            --tag "v${{ env.REL_VERSION }}" \
+            ${RELEASE_ARTIFACT[*]}
+          if [ "$LATEST_RELEASE" = "true" ]; then
+            export RELEASE_BODY=`cat ./docs/release_notes/v${{ env.REL_VERSION }}.md`
+          else
+            export RELEASE_BODY="This is the release candidate ${{ env.REL_VERSION }}"
+          fi
+          echo "Uploading Spice.ai Binaries to GitHub Release"
+          python ./.github/scripts/github_release.py upload \
+            --owner $OWNER_NAME --repo $REPO_NAME \
+            --tag "v${{ env.REL_VERSION }}" \
+            --release-name "Spice.ai v${{ env.REL_VERSION }}" \
+            --body "${RELEASE_BODY}" \
+            --prerelease "$PRE_RELEASE" \
+            ${RELEASE_ARTIFACT[*]}
