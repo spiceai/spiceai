@@ -67,7 +67,7 @@ jobs:
 
       - name: Print version
         if: matrix.target_os != 'windows'
-        run: ./spiced version
+        run: ./spiced --version
 
       - uses: actions/upload-artifact@v4
         with:
