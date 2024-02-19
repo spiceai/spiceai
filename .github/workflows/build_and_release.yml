@@ -23,13 +23,16 @@ jobs:
 
     strategy:
       matrix:
-        runner: [rust, macos-14]
-        target_arch: [amd64, arm64]
         include:
-          - runner: ubuntu-latest
+          - runner: rust
             target_os: linux
+            target_arch: amd64
+          - runner: rust
+            target_os: linux
+            target_arch: arm64
           - runner: macos-14
             target_os: darwin
+            target_arch: arm64
 
     steps:
       - uses: actions/checkout@v3
@@ -86,8 +89,13 @@ jobs:
 
     strategy:
       matrix:
-        target_os: [linux, darwin]
-        target_arch: [amd64, arm64]
+        include:
+          - target_os: linux
+            target_arch: amd64
+          - target_os: linux
+            target_arch: arm64
+          - target_os: darwin
+            target_arch: arm64
 
     runs-on: ubuntu-latest
     steps:
