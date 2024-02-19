@@ -10,6 +10,7 @@ pub use notify::Error as NotifyError;
 use snafu::prelude::*;
 use spicepod::component::dataset::Dataset;
 use spicepod::component::dataset::Mode;
+use spicepod::component::model::Model as SpicepodModel;
 use std::time::Duration;
 use tokio::time::sleep;
 use tokio::{signal, sync::RwLock};
@@ -283,12 +284,12 @@ impl Runtime {
     }
 
     pub async fn load_models(&self) {
-        for model in self.app.read().await.models.clone() {
-            self.load_model(&model).await;
+        for model in &self.app.read().await.models {
+            self.load_model(model).await;
         }
     }
 
-    pub async fn load_model(&self, m: &spicepod::component::model::Model) {
+    pub async fn load_model(&self, m: &SpicepodModel) {
         tracing::info!("Loading model [{}] from {}...", m.name, m.from);
         let mut model_map = self.models.write().await;
         let auth = self.auth.read().await;
