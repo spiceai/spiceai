@@ -6,11 +6,11 @@ use std::{
 
 use arrow::record_batch::RecordBatch;
 use datafusion::{execution::context::SessionContext, sql::TableReference};
-use duckdb::{vtab::arrow::arrow_recordbatch_to_query_params, DuckdbConnectionManager};
+use duckdb::vtab::arrow::arrow_recordbatch_to_query_params;
 use snafu::{prelude::*, ResultExt};
 use spicepod::component::dataset::Dataset;
 use sql_provider_datafusion::{
-    dbconnection::DbConnection,
+    dbconnection::{self, DbConnection},
     dbconnectionpool::{duckdb::DuckDbConnectionPool, DbConnectionPool, Mode},
     DuckDBTable,
 };
@@ -31,6 +31,9 @@ pub enum Error {
     ConnectionPool {
         source: sql_provider_datafusion::dbconnectionpool::Error,
     },
+
+    #[snafu(display("DuckDBError: {source}"))]
+    DuckDB { source: duckdb::Error },
 
     #[snafu(display("DuckDBDataFusionError: {source}"))]
     DuckDBDataFusion {
@@ -60,7 +63,7 @@ impl DataPublisher for DuckDBBackend {
         let pool = Arc::clone(&self.pool);
         let name = self.name.clone();
         Box::pin(async move {
-            let conn = pool.connect().context(ConnectionPoolSnafu)?;
+            let conn = pool.connect_downcast().context(ConnectionPoolSnafu)?;
 
             let mut duckdb_update = DuckDBUpdate {
                 name,
@@ -125,7 +128,7 @@ struct DuckDBUpdate<'a> {
     name: String,
     data: Vec<RecordBatch>,
     update_type: UpdateType,
-    duckdb_conn: Box<dyn DbConnection<DuckdbConnectionManager>>,
+    duckdb_conn: dbconnection::duckdb::DuckDbConnection,
     create_mutex: &'a std::sync::Mutex<()>,
 }
 
@@ -159,8 +162,9 @@ impl<'a> DuckDBUpdate<'a> {
         tracing::trace!("{sql}");
 
         self.duckdb_conn
+            .conn
             .execute(&sql, params)
-            .context(DbConnectionSnafu)?;
+            .context(DuckDBSnafu)?;
 
         Ok(())
     }
@@ -172,9 +176,7 @@ impl<'a> DuckDBUpdate<'a> {
             if drop_if_exists {
                 let sql = format!(r#"DROP TABLE "{}""#, self.name);
                 tracing::trace!("{sql}");
-                self.duckdb_conn
-                    .execute(&sql, [])
-                    .context(DbConnectionSnafu)?;
+                self.duckdb_conn.execute(&sql).context(DbConnectionSnafu)?;
             } else {
                 return Ok(());
             }
@@ -192,8 +194,9 @@ impl<'a> DuckDBUpdate<'a> {
         tracing::trace!("{sql}");
 
         self.duckdb_conn
+            .conn
             .execute(&sql, arrow_params)
-            .context(DbConnectionSnafu)?;
+            .context(DuckDBSnafu)?;
 
         Ok(())
     }
@@ -210,6 +213,7 @@ impl<'a> DuckDBUpdate<'a> {
         tracing::trace!("{sql}");
 
         self.duckdb_conn
+            .conn
             .query_row(&sql, [], |row| row.get::<usize, bool>(0))
             .unwrap_or(false)
     }

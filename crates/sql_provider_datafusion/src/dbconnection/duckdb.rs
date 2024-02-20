@@ -8,7 +8,7 @@ use super::DuckDBSnafu;
 use super::Result;
 
 pub struct DuckDbConnection {
-    conn: r2d2::PooledConnection<DuckdbConnectionManager>,
+    pub conn: r2d2::PooledConnection<DuckdbConnectionManager>,
 }
 
 impl DbConnection<DuckdbConnectionManager> for DuckDbConnection {
@@ -38,8 +38,8 @@ impl DbConnection<DuckdbConnectionManager> for DuckDbConnection {
         Ok(result.collect())
     }
 
-    fn execute(&self, sql: &str, params: [usize; 2]) -> Result<usize> {
+    fn execute(&self, sql: &str) -> Result<usize> {
         let mut stmt = self.conn.prepare(sql).context(DuckDBSnafu)?;
-        stmt.execute(params).context(DuckDBSnafu)
+        stmt.execute([]).context(DuckDBSnafu)
     }
 }

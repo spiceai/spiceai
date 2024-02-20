@@ -18,5 +18,5 @@ pub trait DbConnection<T: r2d2::ManageConnection> {
         Self: Sized;
     fn get_schema(&self, table_reference: &str) -> Result<SchemaRef>;
     fn query_arrow(&self, sql: &str) -> Result<Vec<RecordBatch>>;
-    fn execute(&self, sql: &str, params: [usize; 2]) -> Result<usize>;
+    fn execute(&self, sql: &str) -> Result<usize>;
 }

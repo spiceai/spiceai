@@ -11,14 +11,15 @@ exclude.workspace = true
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-duckdb-rs = { workspace = true,  features = ["bundled", "r2d2", "vtab", "vtab-arrow"] }
+# Can't be imported from the workspace as workspace dependencies cannot be renamed
+duckdb-rs = { git = "https://github.com/spicehq/duckdb-rs.git", rev = "8b57b1496eed1009c45734df7790960313d31e3d",  features = ["bundled", "r2d2", "vtab", "vtab-arrow"], package = "duckdb" }
 datafusion.workspace = true
 async-trait.workspace = true
 r2d2.workspace = true
 snafu.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+spicepod = { path = "../spicepod" }
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
-spicepod = { path = "../spicepod" }
