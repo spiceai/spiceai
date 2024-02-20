@@ -1,5 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
 
+use postgres::types::ToSql;
 use r2d2_postgres::{postgres::NoTls, PostgresConnectionManager};
 use snafu::ResultExt;
 
@@ -10,7 +11,7 @@ pub struct PostgresConnectionPool {
     pool: Arc<r2d2::Pool<PostgresConnectionManager<NoTls>>>,
 }
 
-impl DbConnectionPool<PostgresConnectionManager<NoTls>, PostgresConnection>
+impl DbConnectionPool<PostgresConnectionManager<NoTls>, PostgresConnection, &'static dyn ToSql>
     for PostgresConnectionPool
 {
     fn new(_name: &str, _mode: Mode, _params: Arc<Option<HashMap<String, String>>>) -> Result<Self> {
@@ -23,7 +24,7 @@ impl DbConnectionPool<PostgresConnectionManager<NoTls>, PostgresConnection>
         Ok(PostgresConnectionPool { pool })
     }
 
-    fn connect(&self) -> Result<Box<dyn DbConnection<PostgresConnectionManager<NoTls>>>> {
+    fn connect(&self) -> Result<Box<dyn DbConnection<PostgresConnectionManager<NoTls>, &'static dyn ToSql>>> {
         let pool = Arc::clone(&self.pool);
         let conn = pool.get().context(ConnectionPoolSnafu)?;
         Ok(Box::new(PostgresConnection::new(conn)))
