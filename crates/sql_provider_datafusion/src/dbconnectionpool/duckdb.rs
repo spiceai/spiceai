@@ -11,10 +11,7 @@ pub struct DuckDbConnectionPool {
 }
 
 impl DbConnectionPool<DuckdbConnectionManager, DuckDbConnection> for DuckDbConnectionPool {
-    fn new(name: &str, mode: Mode, params: Arc<Option<HashMap<String, String>>>) -> Result<Self>
-    where
-        Self: Sized,
-    {
+    fn new(name: &str, mode: Mode, params: Arc<Option<HashMap<String, String>>>) -> Result<Self> {
         let manager = match mode {
             Mode::Memory => DuckdbConnectionManager::memory().context(DuckDBSnafu)?,
             Mode::File => DuckdbConnectionManager::file(get_duckdb_file(name, &params))

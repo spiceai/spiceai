@@ -32,7 +32,7 @@ impl From<acceleration::Mode> for Mode {
     }
 }
 
-pub trait DbConnectionPool<P: r2d2::ManageConnection, C> where  {
+pub trait DbConnectionPool<P: r2d2::ManageConnection, C> {
     fn new(name: &str, mode: Mode, params: Arc<Option<HashMap<String, String>>>) -> Result<Self>
     where
         Self: Sized;
