@@ -309,6 +309,23 @@ impl Runtime {
         }
     }
 
+    pub async fn remove_model(&self, m: &SpicepodModel) {
+        let mut model_map = self.models.write().await;
+        if !model_map.contains_key(&m.name) {
+            tracing::warn!(
+                "Unable to unload runnable model {}: model not found",
+                m.name,
+            );
+        }
+        model_map.remove(&m.name);
+        tracing::info!("Model [{}] has been unloaded", m.name);
+    }
+
+    pub async fn update_model(&self, m: &SpicepodModel) {
+        self.remove_model(m).await;
+        self.load_model(m).await;
+    }
+
     pub async fn start_servers(&mut self) -> Result<()> {
         let http_server_future = http::start(
             self.config.http_bind_address,
@@ -339,6 +356,10 @@ impl Runtime {
         while let Some(new_app) = rx.recv().await {
             let mut current_app = self.app.write().await;
 
+            if *current_app == new_app {
+                continue;
+            }
+
             tracing::debug!("Updated pods information: {:?}", new_app);
             tracing::debug!("Previous pods information: {:?}", current_app);
 
@@ -350,9 +371,23 @@ impl Runtime {
                 }
             }
 
+            // check for new and updated models
             for model in &new_app.models {
-                if !current_app.models.iter().any(|m| m.name == model.name) {
+                if let Some(current_model) =
+                    current_app.models.iter().find(|m| m.name == model.name)
+                {
+                    if current_model != model {
+                        self.update_model(model).await;
+                    }
+                } else {
                     self.load_model(model).await;
+                }
+            }
+
+            // Remove models that are no longer in the app
+            for model in &current_app.models {
+                if !new_app.models.iter().any(|m| m.name == model.name) {
+                    self.remove_model(model).await;
                 }
             }
 
