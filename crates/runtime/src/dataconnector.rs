@@ -1,3 +1,4 @@
+use datafusion::datasource::TableProvider;
 use futures::stream;
 use snafu::prelude::*;
 use spicepod::component::dataset::acceleration::RefreshMode;
@@ -69,6 +70,10 @@ pub trait DataConnector: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Vec<RecordBatch>> + Send>>;
 
     fn get_data_publisher(&self) -> Option<Box<dyn DataPublisher>> {
+        None
+    }
+
+    fn get_table_provider(&self) -> Option<Box<dyn TableProvider>> {
         None
     }
 }
