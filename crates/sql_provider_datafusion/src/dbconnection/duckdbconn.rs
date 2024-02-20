@@ -39,8 +39,8 @@ impl DbConnection<DuckdbConnectionManager> for DuckDbConnection {
         Ok(result.collect())
     }
 
-    fn execute(&self, sql: &str) -> Result<usize> {
-        let mut stmt = self.conn.prepare(sql).context(DuckDBSnafu)?;
-        stmt.execute([]).context(DuckDBSnafu)
+    fn execute(&mut self, sql: &str) -> Result<u64> {
+        let rows_modified = self.conn.execute(sql, []).context(DuckDBSnafu)?;
+        Ok(rows_modified as u64)
     }
 }
