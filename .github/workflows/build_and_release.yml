@@ -35,12 +35,12 @@ jobs:
             target_arch: aarch64
             target_arch_go: arm64
           - name: macOS x64 (Intel)
-            runner: macos-13
+            runner: rust-osx-x64
             target_os: darwin
             target_arch: x86_64
             target_arch_go: amd64
           - name: Windows x64
-            runner: windows-latest
+            runner: rust-windows-x64
             target_os: windows
             target_arch: x86_64
             target_arch_go: amd64
@@ -61,8 +61,53 @@ jobs:
         with:
           os: ${{ matrix.target_os }}
 
+      - name: Restore build cache (macOS)
+        if: matrix.target_os == 'darwin'
+        run: |
+          mkdir -p target
+          if [ -d /Users/spiceai/build/target ]; then
+            cp -a /Users/spiceai/build/target/* target/
+          fi
+
+      - name: Restore build cache (Linux)
+        if: matrix.target_os == 'linux'
+        run: |
+          mkdir -p target
+          if [ -d /home/spiceai/build/target ]; then
+            cp -a /home/spiceai/build/target/* target/
+          fi
+
+      - name: Restore build cache (Windows)
+        if: matrix.target_os == 'windows'
+        run: |
+          mkdir -p target
+          if (Test-Path C:/spiceai/build/target) {
+            Copy-Item -Recurse -Force C:/spiceai/build/target/* target/
+          }
+
       - name: Build spiced
         run: make -C bin/spiced
+
+      - name: Update build cache (macOS)
+        if: matrix.target_os == 'darwin'
+        run: |
+          if [ -d /Users/spiceai/build/target ]; then
+            rsync -a target/ /Users/spiceai/build/target
+          fi
+
+      - name: Update build cache (Linux)
+        if: matrix.target_os == 'linux'
+        run: |
+          if [ -d /home/spiceai/build/target ]; then
+            rsync -a target/ /home/spiceai/build/target
+          fi
+
+      - name: Update build cache (Windows)
+        if: matrix.target_os == 'windows'
+        run: |
+          if (Test-Path C:/spiceai/build/target) {
+            Copy-Item -Recurse -Force target/* C:/spiceai/build/target
+          }
 
       - name: Build spice
         run: make -C bin/spice
