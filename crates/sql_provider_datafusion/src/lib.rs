@@ -242,7 +242,7 @@ impl<T: r2d2::ManageConnection, C: 'static, P: 'static> ExecutionPlan for SqlExe
         let sql = self.sql().map_err(to_execution_error)?;
         tracing::debug!("SqlExec sql: {sql}");
 
-        let recs = conn.query_arrow(&sql).map_err(to_execution_error)?;
+        let recs = conn.query_arrow(&sql, &[]).map_err(to_execution_error)?;
 
         Ok(Box::pin(MemoryStream::try_new(recs, self.schema(), None)?))
     }

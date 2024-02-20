@@ -32,10 +32,10 @@ impl DbConnection<DuckdbConnectionManager, &dyn ToSql> for DuckDbConnection {
         Ok(result.get_schema())
     }
 
-    fn query_arrow(&mut self, sql: &str) -> Result<Vec<RecordBatch>> {
+    fn query_arrow(&mut self, sql: &str, params: &[&dyn ToSql]) -> Result<Vec<RecordBatch>> {
         let mut stmt = self.conn.prepare(sql).context(super::DuckDBSnafu)?;
 
-        let result: duckdb::Arrow<'_> = stmt.query_arrow([]).context(DuckDBSnafu)?;
+        let result: duckdb::Arrow<'_> = stmt.query_arrow(params).context(DuckDBSnafu)?;
 
         Ok(result.collect())
     }
