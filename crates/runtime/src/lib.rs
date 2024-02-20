@@ -155,7 +155,7 @@ impl Runtime {
                     && !ds.is_view()
                     && !has_table_provider(&data_connector)
                 {
-                    tracing::warn!("Dataset cannot be loaded: {}", ds.name);
+                    tracing::warn!("No acceleration specified for dataset: {}", ds.name);
                     break;
                 };
 
