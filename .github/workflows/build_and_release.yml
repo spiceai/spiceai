@@ -57,13 +57,9 @@ jobs:
           go-version: ${{ env.GOVER }}
 
       - name: Set up Rust
-        run: |
-          echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> $GITHUB_PATH
-          source $HOME/.cargo/env || true
-          if ! command -v rustup &> /dev/null ; then
-            curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused -fsSL "https://sh.rustup.rs" | sh -s -- --default-toolchain none -y  
-          fi
-          rustup toolchain install stable
+        uses: ./.github/actions/setup-rust
+        with:
+          os: ${{ matrix.target_os }}
 
       - name: Build spiced
         run: make -C bin/spiced
