@@ -66,7 +66,7 @@ jobs:
         run: |
           mkdir -p target
           if [ -d /Users/spiceai/build/target ]; then
-            cp -a /Users/spiceai/build/target/* target/
+            rsync -av /Users/spiceai/build/target/ target/
           fi
 
       - name: Restore build cache (Linux)
@@ -74,7 +74,7 @@ jobs:
         run: |
           mkdir -p target
           if [ -d /home/spiceai/build/target ]; then
-            cp -a /home/spiceai/build/target/* target/
+            rsync -av /home/spiceai/build/target/ target/
           fi
 
       - name: Restore build cache (Windows)
@@ -92,14 +92,14 @@ jobs:
         if: matrix.target_os == 'darwin'
         run: |
           if [ -d /Users/spiceai/build/target ]; then
-            rsync -a target/ /Users/spiceai/build/target
+            rsync -av target/ /Users/spiceai/build/target/
           fi
 
       - name: Update build cache (Linux)
         if: matrix.target_os == 'linux'
         run: |
           if [ -d /home/spiceai/build/target ]; then
-            rsync -a target/ /home/spiceai/build/target
+            rsync -av target/ /home/spiceai/build/target/
           fi
 
       - name: Update build cache (Windows)
