@@ -3,11 +3,15 @@ use datafusion::{arrow::datatypes::SchemaRef, sql::TableReference};
 use snafu::prelude::*;
 
 pub mod duckdbconn;
+pub mod postgresconn;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("DuckDBError: {source}"))]
     DuckDBError { source: duckdb::Error },
+
+    #[snafu(display("PostgresError: {source}"))]
+    PostgresError { source: postgres::Error },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
