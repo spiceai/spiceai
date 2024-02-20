@@ -316,6 +316,7 @@ impl Runtime {
                 "Unable to unload runnable model {}: model not found",
                 m.name,
             );
+            return;
         }
         model_map.remove(&m.name);
         tracing::info!("Model [{}] has been unloaded", m.name);
