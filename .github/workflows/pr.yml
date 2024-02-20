@@ -15,7 +15,7 @@ jobs:
     name: Run Go & Rust Linters
     runs-on: rust
     env:
-      GOVER: 1.21
+      GOVER: 1.22
 
     steps:
       - uses: actions/checkout@v4
@@ -47,7 +47,7 @@ jobs:
     name: Build Go & Rust
     runs-on: rust
     env:
-      GOVER: 1.21
+      GOVER: 1.22
 
     steps:
       - uses: actions/checkout@v4
@@ -59,13 +59,9 @@ jobs:
           cache: false
 
       - name: Set up Rust
-        run: |
-          echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> $GITHUB_PATH
-          source $HOME/.cargo/env || true
-          if ! command -v rustup &> /dev/null ; then
-            curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused -fsSL "https://sh.rustup.rs" | sh -s -- --default-toolchain none -y  
-          fi
-          rustup toolchain install stable
+        uses: ./.github/actions/setup-rust
+        with:
+          os: 'linux'
 
       - run: make ci
 
