@@ -162,7 +162,7 @@ impl Runtime {
                 };
 
                 if ds.acceleration.is_none() && !ds.is_view() && !has_table_provider {
-                    tracing::warn!("No acceleration specified for dataset and no table provider found for dataset's connector: {}", ds.name);
+                    tracing::warn!("No acceleration specified for dataset '{}' and no table provider found for dataset's connector '{}'", ds.name, source);
                     break;
                 };
 
