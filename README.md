@@ -25,17 +25,29 @@ Highlight three use cases.
 
 ## Quikc Start
 
-\*\* Step 1. Install the SpiceAI CLI:
+**Step 1.** Install the SpiceAI CLI:
 
 ```bash
 curl https://install.spiceai.org | /bin/bash
 ```
 
-**Step 2. Navigate to `https://spice.ai/` and create a new account by clicking on Try for Free.**
+**Step 2.** Navigate to `https://spice.ai/` and create a new account by clicking on Try for Free.
 
 <p align="center">
   <img src="spiceai_try_for_free.png" width="600" />
 </p>
+
+**Step 3.** In a new empty directory, login and authenticate from the command line. A pop up browser window will prompt yuou to authenticate:
+
+```bash
+spice login
+```
+
+**Step 4.** Initiate a new project
+
+```bash
+spice init <PROJECT_NAME_HERE>
+```
 
 ### Run through a data demo step by step here. Include a video showing the steps
 
@@ -100,3 +112,7 @@ Spice.ai started with the vision to make AI easy for developers. We are building
 ### Contributing to Spice.ai
 
 See [CONTRIBUTING.md](/CONTRIBUTING.md).
+
+```
+
+```
