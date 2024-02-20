@@ -6,13 +6,13 @@ use std::{
 
 use arrow::record_batch::RecordBatch;
 use datafusion::{execution::context::SessionContext, sql::TableReference};
-use duckdb::vtab::arrow::arrow_recordbatch_to_query_params;
+use duckdb::{vtab::arrow::arrow_recordbatch_to_query_params, DuckdbConnectionManager};
 use snafu::{prelude::*, ResultExt};
 use spicepod::component::dataset::Dataset;
 use sql_provider_datafusion::{
-    dbconnection::{self, DbConnection},
+    dbconnection::{self, duckdb::DuckDbConnection, DbConnection},
     dbconnectionpool::{duckdb::DuckDbConnectionPool, DbConnectionPool, Mode},
-    DuckDBTable,
+    SqlProviderTable,
 };
 
 use crate::{
@@ -54,7 +54,7 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 pub struct DuckDBBackend {
     ctx: Arc<SessionContext>,
     name: String,
-    pool: Arc<DuckDbConnectionPool>,
+    pool: Arc<dyn DbConnectionPool<DuckdbConnectionManager, DuckDbConnection> + Send + Sync>,
     create_mutex: std::sync::Mutex<()>,
 }
 
@@ -111,10 +111,11 @@ impl DuckDBBackend {
             return Ok(());
         }
 
-        let table = match DuckDBTable::new(&self.pool, &self.name).context(DuckDBDataFusionSnafu) {
-            Ok(table) => table,
-            Err(e) => return Err(e),
-        };
+        let table =
+            match SqlProviderTable::new(&self.pool, &self.name).context(DuckDBDataFusionSnafu) {
+                Ok(table) => table,
+                Err(e) => return Err(e),
+            };
 
         self.ctx
             .register_table(&self.name, Arc::new(table))
