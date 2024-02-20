@@ -14,9 +14,6 @@ pub enum Error {
 
     #[snafu(display("ConnectionPoolError: {source}"))]
     ConnectionPoolError { source: r2d2::Error },
-
-    #[snafu(display("PostgresError: {source}"))]
-    PostgresError { source: postgres::Error },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;

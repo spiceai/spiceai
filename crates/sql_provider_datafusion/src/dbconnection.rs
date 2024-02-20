@@ -8,9 +8,6 @@ pub mod duckdbconn;
 pub enum Error {
     #[snafu(display("DuckDBError: {source}"))]
     DuckDBError { source: duckdb::Error },
-
-    #[snafu(display("PostgresError: {source}"))]
-    PostgresError { source: postgres::Error },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
