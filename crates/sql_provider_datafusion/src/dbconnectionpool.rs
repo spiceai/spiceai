@@ -36,10 +36,10 @@ impl From<acceleration::Mode> for Mode {
     }
 }
 
-pub trait DbConnectionPool<P: r2d2::ManageConnection, C> {
+pub trait DbConnectionPool<T: r2d2::ManageConnection, C, P: 'static>  {
     fn new(name: &str, mode: Mode, params: Arc<Option<HashMap<String, String>>>) -> Result<Self>
     where
         Self: Sized;
-    fn connect(&self) -> Result<Box<dyn DbConnection<P>>>;
+    fn connect(&self) -> Result<Box<dyn DbConnection<T, P>>>;
     fn connect_downcast(&self) -> Result<C>;
 }
