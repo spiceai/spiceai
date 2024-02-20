@@ -25,13 +25,13 @@ Highlight three use cases.
 
 ## Quikc Start
 
-\*\*Step 1. Install the SpiceAI CLI:
+\*\* Step 1. Install the SpiceAI CLI:
 
 ```bash
 curl https://install.spiceai.org | /bin/bash
 ```
 
-\*\*Step 2. Navigate to `https://spice.ai/` and create a new account by clicking on Try for Free.
+**Step 2. Navigate to `https://spice.ai/` and create a new account by clicking on Try for Free.**
 
 <p align="center">
   <img src="spiceai_try_for_free.png" width="600" />
