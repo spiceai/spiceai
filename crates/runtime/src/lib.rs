@@ -151,18 +151,11 @@ impl Runtime {
                         }
                     };
 
-                let mut has_table_provider = false;
-
-                if data_connector.is_some()
-                    && data_connector
-                        .as_ref()
-                        .is_some_and(|dc| dc.get_table_provider().is_some())
+                if ds.acceleration.is_none()
+                    && !ds.is_view()
+                    && !has_table_provider(&data_connector)
                 {
-                    has_table_provider = true;
-                };
-
-                if ds.acceleration.is_none() && !ds.is_view() && !has_table_provider {
-                    tracing::warn!("No acceleration specified for dataset '{}' and no table provider found for dataset's connector '{}'", ds.name, source);
+                    tracing::warn!("Dataset cannot be loaded: {}", ds.name);
                     break;
                 };
 
@@ -371,6 +364,13 @@ impl Runtime {
 
         Ok(())
     }
+}
+
+fn has_table_provider(data_connector: &Option<Box<dyn DataConnector + Send>>) -> bool {
+    data_connector.is_some()
+        && data_connector
+            .as_ref()
+            .is_some_and(|dc| dc.get_table_provider().is_some())
 }
 
 pub fn load_auth_providers() -> auth::AuthProviders {
