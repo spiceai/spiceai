@@ -1,16 +1,9 @@
 use ::duckdb::arrow::array::RecordBatch;
 use datafusion::{arrow::datatypes::SchemaRef, sql::TableReference};
-use snafu::prelude::*;
 
 pub mod duckdbconn;
 
-#[derive(Debug, Snafu)]
-pub enum Error {
-    #[snafu(display("DuckDBError: {source}"))]
-    DuckDBError { source: duckdb::Error },
-}
-
-type Result<T, E = Error> = std::result::Result<T, E>;
+type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 pub trait DbConnection<T: r2d2::ManageConnection, P> {
     fn new(conn: r2d2::PooledConnection<T>) -> Self

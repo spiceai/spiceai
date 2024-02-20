@@ -1,22 +1,12 @@
 use std::{collections::HashMap, sync::Arc};
 
-use snafu::prelude::*;
 use spicepod::component::dataset::acceleration;
 
 use crate::dbconnection::DbConnection;
 
 pub mod duckdbpool;
 
-#[derive(Debug, Snafu)]
-pub enum Error {
-    #[snafu(display("DuckDBError: {source}"))]
-    DuckDBError { source: duckdb::Error },
-
-    #[snafu(display("ConnectionPoolError: {source}"))]
-    ConnectionPoolError { source: r2d2::Error },
-}
-
-type Result<T, E = Error> = std::result::Result<T, E>;
+type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 pub enum Mode {
     Memory,
