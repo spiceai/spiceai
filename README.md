@@ -7,7 +7,7 @@
 [![Subreddit subscribers](https://img.shields.io/reddit/subreddit-subscribers/spiceai?style=social)](https://www.reddit.com/r/spiceai)
 [![Follow on Twitter](https://img.shields.io/twitter/follow/spiceaihq.svg?style=social&logo=twitter)](https://twitter.com/intent/follow?screen_name=spiceaihq)
 
-**Spice.ai** is a runtime environment that enables developers to leverage rapid access to time-series data for smart applications and edge devices.
+**Spice.ai** is an open source runtime environment that enables developers to leverage rapid access to time-series data for building applications at the edge.
 
 ⚠️ **DEVELOPER PREVIEW ONLY** Spice.ai is under active **alpha** stage development and is not intended to be used in production until its **1.0-stable** release.
 
@@ -16,38 +16,26 @@
 Highlight three use cases.
 
 1.  Front ends that need to be continuously updated
-2.  Accelerate querying without the need to query the cloud (expensive)
+2.  High performance queries for data applications.
 3.  Machine learning at the edge. Empowering edge devices to continuously improve inference
 
 ---
 
 📺 View a getting started walkthrough of Spice.ai in action [here] TODO: NEW VIDEO HERE. Should showcase how to create a local spicepod form cloud database (Dremio, Postgress, etc).
 
-## Features
+## Quikc Start
 
-The Spice.ai runtime is written in (Golang for CLI) Rust and runs as a container or microservice. It's deployable to any public cloud, on-premises, and edge. It is configured with a simple manifest and accessed by HTTP APIs.
-
-Spice.ai includes:
-
-- A lightweight, portable runtime accessible by simple HTTP APIs, allowing developers to use their preferred languages and frameworks
-- A developer-friendly CLI
-- Simple, git-committable, configuration and code
-
-## Installation/Quikc Start
-
-This should be done using the bash script. Once that's ready, I'll update the ReadME accordingly.
-
-**Step 1. Clone the SpiceAI repo**:
+\*\*Step 1. Install the SpiceAI CLI:
 
 ```bash
-git clone -b rust https://github.com/spiceai/spiceai.git
+curl https://install.spiceai.org | /bin/bash
 ```
 
-**Step 2. Install the CLI**: Running the following command will compile the source code and add the Spice command to your path:
+\*\*Step 2. Navigate to `https://spice.ai/` and create a new account by clicking on Try for Free.
 
-```bash
-Make install
-```
+<p align="center">
+  <img src="spiceai_try_for_free.png" width="600" />
+</p>
 
 ### Run through a data demo step by step here. Include a video showing the steps
 
