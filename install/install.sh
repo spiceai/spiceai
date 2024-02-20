@@ -30,8 +30,8 @@ getSystemInfo() {
     ARCH=$(uname -m)
     case $ARCH in
         armv7*) ARCH="arm";;
-        aarch64) ARCH="arm64";;
-        x86_64) ARCH="amd64";;
+        arm64) ARCH="aarch64";;
+        amd64) ARCH="x86_64";;
     esac
 
     OS=$(echo `uname`|tr '[:upper:]' '[:lower:]')
@@ -43,7 +43,7 @@ getSystemInfo() {
 }
 
 verifySupported() {
-    local supported=(darwin-amd64 linux-amd64 darwin-arm64 linux-arm64)
+    local supported=(linux-x86_64 darwin-aarch64)
     local current_osarch="${OS}-${ARCH}"
 
     for osarch in "${supported[@]}"; do
@@ -239,7 +239,7 @@ downloadFile $ret_val
 installFile
 cleanup
 
-SHELLS_TO_CHECK=(".bashrc" ".bash_profile" ".zshrc" ".config/fish/config.fish")
+SHELLS_TO_CHECK=(".bashrc" ".bash_profile" ".zshrc" ".zprofile" ".config/fish/config.fish")
 
 for i in "${SHELLS_TO_CHECK[@]}"; do checkShell $i; done
 

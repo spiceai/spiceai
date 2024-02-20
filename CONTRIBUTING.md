@@ -62,89 +62,59 @@ Spice.ai takes security and our users' trust very seriously. If you believe you 
 
 - Third-party code must include licenses.
 
-## Building from Source
+## Setting up your development environment
 
-### Installing Dependencies
-
-Spice.ai requires Go 1.21, Python 3.8.x and Docker.
-
-#### Go 1.21
-
-Download & install the latest 1.21 release for Go: https://golang.org/dl/ or run `brew install golang`
-
-To make it easy to manage multiple versions of Go on your machine, see https://github.com/moovweb/gvm
-
-#### Docker
-
-Download and install Docker from: https://www.docker.com/products/docker-desktop
-
-#### Python 3.8
-
-Download & install the latest release for Python: https://www.python.org/downloads/
-
-To make it easy to manage multiple versions of Python on your machine, see https://github.com/pyenv/pyenv
-
-##### Set up Python venv and install python dependencies
-
-It is a best practice to use a virtual environment (venv) when working with Python projects. To set up a venv for the AI Engine, run the following:
+### MacOS
 
 ```bash
-$ cd ai/src
-# Ensure python 3+ is installed
-$ python --version
-Python 3.8.12
-$ python -m venv venv
+# Install Xcode Command Line Tools
+xcode-select --install
+
+# Install Homebrew
+# Note: Be sure to follow the steps in the Homebrew installation output to add Homebrew to your PATH.
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+
+# Install Rust
+brew install rust
+
+# Install Go
+brew install go
+
+# Clone SpiceAI OSS Repo
+git clone https://github.com/spiceai/spiceai.git
+cd spiceai
+
+# Build and install OSS project
+make install
+
+# Run the following to temporarily add spice to your PATH.
+# Add it to the end of your .bashrc or .zshrc to permanently add spice to your PATH.
+export PATH="$PATH:$HOME/.spice/bin"
+
+# Initialize and run a test app to ensure everything is working
+cd ../
+mkdir test-app
+cd test-app
+spice init test-app
+spice run
 ```
 
-Activate the venv and install the python dependencies:
+### VSCode Configuration
 
-```bash
-$ source venv/bin/activate
-$ pip install -r requirements/development.txt
-```
+Configuring VSCode to automatically apply the rustfmt style on save.
 
-If you are running in GitHub Codespaces or other Ubuntu/Debian environment, you may need to install additional libraries. Do this by running:
+Also configure VSCode to us the same Clippy rules we enforce in CI as the default.
 
-```bash
- make install-codespaces
-```
+Add the following in your User Settings JSON file:
 
-### Run Makefile in Project Root
-
-This is necessary before building the CLI or Runtime
-
-```bash
- make
-```
-
-### Building the Spice CLI
-
-```bash
- cd cmd/spice
- make
-```
-
-### Building the Spice Runtime (spiced)
-
-```bash
- cd cmd/spiced
- make
-```
-
-### Running the AI Engine
-
-```bash
- cd ai/src
- source venv/bin/activate
- python main.py
-```
-
-### Running test suite
-
-```bash
- go test ./...
- cd ai/src
- python -m unittest discover -s ./tests
+```json
+  "[rust]": {
+    "editor.defaultFormatter": "rust-lang.rust-analyzer",
+    "editor.formatOnSave": true,
+  },
+  "rust-analyzer.check.command": "clippy",
+  "rust-analyzer.check.features": "all",
+  "rust-analyzer.check.extraArgs": ["--", "-Dclippy::pedantic", "-Dclippy::unwrap_used", "-Dclippy::expect_used"]
 ```
 
 **Thank You!** - Your contributions to open source, large or small, make projects like this possible. Thank you for taking the time to contribute.
