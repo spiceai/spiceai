@@ -11,10 +11,18 @@ pub struct PostgresConnectionPool {
     pool: Arc<r2d2::Pool<PostgresConnectionManager<NoTls>>>,
 }
 
-impl DbConnectionPool<PostgresConnectionManager<NoTls>, PostgresConnection, &'static dyn ToSql>
-    for PostgresConnectionPool
+impl
+    DbConnectionPool<
+        PostgresConnectionManager<NoTls>,
+        PostgresConnection,
+        &'static (dyn ToSql + Sync),
+    > for PostgresConnectionPool
 {
-    fn new(_name: &str, _mode: Mode, _params: Arc<Option<HashMap<String, String>>>) -> Result<Self> {
+    fn new(
+        _name: &str,
+        _mode: Mode,
+        _params: Arc<Option<HashMap<String, String>>>,
+    ) -> Result<Self> {
         let parsed_config = match "host=localhost user=postgres".parse() {
             Ok(parsed_config) => parsed_config,
             Err(e) => return Err(e).context(PostgresSnafu),
@@ -24,7 +32,10 @@ impl DbConnectionPool<PostgresConnectionManager<NoTls>, PostgresConnection, &'st
         Ok(PostgresConnectionPool { pool })
     }
 
-    fn connect(&self) -> Result<Box<dyn DbConnection<PostgresConnectionManager<NoTls>, &'static dyn ToSql>>> {
+    fn connect(
+        &self,
+    ) -> Result<Box<dyn DbConnection<PostgresConnectionManager<NoTls>, &'static (dyn ToSql + Sync)>>>
+    {
         let pool = Arc::clone(&self.pool);
         let conn = pool.get().context(ConnectionPoolSnafu)?;
         Ok(Box::new(PostgresConnection::new(conn)))

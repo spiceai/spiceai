@@ -15,7 +15,7 @@ pub struct PostgresConnection {
     pub conn: r2d2::PooledConnection<PostgresConnectionManager<NoTls>>,
 }
 
-impl DbConnection<PostgresConnectionManager<NoTls>, &dyn ToSql> for PostgresConnection {
+impl DbConnection<PostgresConnectionManager<NoTls>, &(dyn ToSql + Sync)> for PostgresConnection {
     fn new(conn: r2d2::PooledConnection<PostgresConnectionManager<NoTls>>) -> Self
     where
         Self: Sized,
@@ -27,11 +27,15 @@ impl DbConnection<PostgresConnectionManager<NoTls>, &dyn ToSql> for PostgresConn
         todo!()
     }
 
-    fn query_arrow(&mut self, _sql: &str, _params: &[&dyn ToSql]) -> Result<Vec<RecordBatch>> {
+    fn query_arrow(
+        &mut self,
+        _sql: &str,
+        _params: &[&(dyn ToSql + Sync)],
+    ) -> Result<Vec<RecordBatch>> {
         todo!()
     }
 
-    fn execute(&mut self, sql: &str, params: &[&dyn ToSql]) -> Result<u64> {
+    fn execute(&mut self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<u64> {
         self.conn.execute(sql, params).context(PostgresSnafu)
     }
 }
