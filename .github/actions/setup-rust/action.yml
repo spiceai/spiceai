@@ -7,7 +7,7 @@ inputs:
     required: false
   os:
     description: 'Operating system to set up the toolchain for'
-    default: 'linux' # 'linux', 'macos', 'windows'
+    default: 'linux' # 'linux', 'darwin', 'windows'
 
 runs:
   using: "composite"
