@@ -16,6 +16,10 @@ runs:
       if: inputs.os != 'windows'
       shell: bash
       run: |
+        echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> $GITHUB_PATH
+        if [ -d $HOME/.cargo ]; then
+          source $HOME/.cargo/env || true
+        fi
         if ! command -v rustup &> /dev/null ; then
           curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused -fsSL "https://sh.rustup.rs" | sh -s -- --default-toolchain none -y
           source $HOME/.cargo/env || true
