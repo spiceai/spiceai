@@ -61,7 +61,7 @@ Modern developers build with the community by leveraging registries such as npm,
 
 As the community shares their ML building blocks (aka Spicepods, or pods for short), developers can quickly add them to their Spice.ai applications enabling them to stream data and upload pre-trained models into their applications quickly and easily.
 
-This image should either be accompanied by a step by step explanation of what's going on or should be removed altogether.
+#### This diagram should be accompanied by a summary or step by step explanation.
 
 <p align="center">
   <img src="https://user-images.githubusercontent.com/80174/132382372-c32cc8b7-25f2-4f82-8f9f-e4778fb69254.png" width="600" />
