@@ -19,6 +19,8 @@ snafu.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 spicepod = { path = "../spicepod" }
+r2d2_postgres.workspace = true
+postgres.workspace = true
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
