@@ -7,7 +7,7 @@
 [![Subreddit subscribers](https://img.shields.io/reddit/subreddit-subscribers/spiceai?style=social)](https://www.reddit.com/r/spiceai)
 [![Follow on Twitter](https://img.shields.io/twitter/follow/spiceaihq.svg?style=social&logo=twitter)](https://twitter.com/intent/follow?screen_name=spiceaihq)
 
-**Spice.ai** is a runtime environment that enables developers to leverage rapid access to time-series data for edge-based devices and applications. (Note: Not only edge devices)
+**Spice.ai** is a runtime environment that enables developers to leverage rapid access to time-series data for smart applications and edge devices.
 
 ⚠️ **DEVELOPER PREVIEW ONLY** Spice.ai is under active **alpha** stage development and is not intended to be used in production until its **1.0-stable** release.
 
@@ -21,11 +21,7 @@ Highlight three use cases.
 
 ---
 
-📢 Read the Spice.ai announcement blog post at [blog.spiceai.org] TODO: NEW BLOG POST HERE.
-
 📺 View a getting started walkthrough of Spice.ai in action [here] TODO: NEW VIDEO HERE. Should showcase how to create a local spicepod form cloud database (Dremio, Postgress, etc).
-
-💻 Learn about our [approach to building intelligent applications] TODO:
 
 ## Features
 
@@ -37,11 +33,11 @@ Spice.ai includes:
 - A developer-friendly CLI
 - Simple, git-committable, configuration and code
 
-### Installation (local machine)
+## Installation (local machine)
 
 This should be done using the bash script. Once that's ready, I'll update the ReadME accordingly.
 
-**Step 1. Clone the SpiceAI repo**: Use the following command to clone the SpiceAI repo in your working directory:
+**Step 1. Clone the SpiceAI repo**:
 
 ```bash
 git clone -b rust https://github.com/spiceai/spiceai.git
@@ -64,6 +60,8 @@ Modern developers build with the community by leveraging registries such as npm,
 ### INSERT EXAMPLE OF A SPICEPOD YAML HERE
 
 As the community shares their ML building blocks (aka Spicepods, or pods for short), developers can quickly add them to their Spice.ai applications enabling them to stream data and upload pre-trained models into their applications quickly and easily.
+
+This image should either be accompanied by a step by step explanation of what's going on or should be removed altogether.
 
 <p align="center">
   <img src="https://user-images.githubusercontent.com/80174/132382372-c32cc8b7-25f2-4f82-8f9f-e4778fb69254.png" width="600" />
