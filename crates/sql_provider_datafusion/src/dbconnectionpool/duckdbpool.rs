@@ -1,6 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
 
-use duckdb::{vtab::arrow::ArrowVTab, DuckdbConnectionManager};
+use duckdb::{vtab::arrow::ArrowVTab, DuckdbConnectionManager, ToSql};
 use snafu::ResultExt;
 
 use super::{ConnectionPoolSnafu, DbConnectionPool, DuckDBSnafu, Mode, Result};
@@ -10,7 +10,9 @@ pub struct DuckDbConnectionPool {
     pool: Arc<r2d2::Pool<DuckdbConnectionManager>>,
 }
 
-impl DbConnectionPool<DuckdbConnectionManager, DuckDbConnection> for DuckDbConnectionPool {
+impl DbConnectionPool<DuckdbConnectionManager, DuckDbConnection, &'static dyn ToSql>
+    for DuckDbConnectionPool
+{
     fn new(name: &str, mode: Mode, params: Arc<Option<HashMap<String, String>>>) -> Result<Self> {
         let manager = match mode {
             Mode::Memory => DuckdbConnectionManager::memory().context(DuckDBSnafu)?,
@@ -27,7 +29,9 @@ impl DbConnectionPool<DuckdbConnectionManager, DuckDbConnection> for DuckDbConne
         Ok(DuckDbConnectionPool { pool })
     }
 
-    fn connect(&self) -> Result<Box<dyn DbConnection<DuckdbConnectionManager>>> {
+    fn connect(
+        &self,
+    ) -> Result<Box<dyn DbConnection<DuckdbConnectionManager, &'static dyn ToSql>>> {
         let pool = Arc::clone(&self.pool);
         let conn: r2d2::PooledConnection<DuckdbConnectionManager> =
             pool.get().context(ConnectionPoolSnafu)?;

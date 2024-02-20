@@ -2,6 +2,7 @@ use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::sql::TableReference;
 use duckdb::DuckdbConnectionManager;
+use duckdb::ToSql;
 use snafu::ResultExt;
 
 use super::DbConnection;
@@ -12,7 +13,7 @@ pub struct DuckDbConnection {
     pub conn: r2d2::PooledConnection<DuckdbConnectionManager>,
 }
 
-impl DbConnection<DuckdbConnectionManager> for DuckDbConnection {
+impl DbConnection<DuckdbConnectionManager, &dyn ToSql> for DuckDbConnection {
     fn new(conn: r2d2::PooledConnection<DuckdbConnectionManager>) -> Self
     where
         Self: Sized,
@@ -39,8 +40,8 @@ impl DbConnection<DuckdbConnectionManager> for DuckDbConnection {
         Ok(result.collect())
     }
 
-    fn execute(&mut self, sql: &str) -> Result<u64> {
-        let rows_modified = self.conn.execute(sql, []).context(DuckDBSnafu)?;
+    fn execute(&mut self, sql: &str, params: &[&dyn ToSql]) -> Result<u64> {
+        let rows_modified = self.conn.execute(sql, params).context(DuckDBSnafu)?;
         Ok(rows_modified as u64)
     }
 }
