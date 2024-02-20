@@ -392,18 +392,7 @@ async fn shutdown_signal() {
         }
     };
 
-    let terminate = async {
-        match signal::unix::signal(signal::unix::SignalKind::terminate()) {
-            Ok(mut signal) => signal.recv().await,
-            Err(err) => {
-                tracing::error!("Unable to listen to shutdown signal: {err:?}");
-                None
-            }
-        }
-    };
-
     tokio::select! {
         () = ctrl_c => {},
-        _ = terminate => {},
     }
 }

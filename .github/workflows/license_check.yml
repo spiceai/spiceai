@@ -32,7 +32,7 @@ jobs:
     name: license check
     runs-on: ubuntu-latest
     env:
-      GOVER: 1.21
+      GOVER: 1.22
 
       FORBIDDEN_LICENSE_CHECK: |
         grep -B 1 -E "GPL|CC-BY-SA|CC-BY-NC|CC-BY-NC-SA|CC-BY-NC-ND|APSL|CPAL|EUPL|NPOSL|OSL|SSPL|Parity|RPL|QPL|Sleepycat|copyleft|CDDL|CPL|EPL|ErlPL|IPL|MS-RL|SPL|Facebook|Commons-Clause" | grep . && exit 1 || echo "ok"
