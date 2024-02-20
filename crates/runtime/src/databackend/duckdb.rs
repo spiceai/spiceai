@@ -12,7 +12,7 @@ use spicepod::component::dataset::Dataset;
 use sql_provider_datafusion::{
     dbconnection::{self, duckdb::DuckDbConnection, DbConnection},
     dbconnectionpool::{duckdb::DuckDbConnectionPool, DbConnectionPool, Mode},
-    SqlProviderTable,
+    SqlTable,
 };
 
 use crate::{
