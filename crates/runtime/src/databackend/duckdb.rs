@@ -28,7 +28,7 @@ pub enum Error {
     },
 
     #[snafu(display("DbConnectionPoolError: {source}"))]
-    ConnectionPool {
+    DbConnectionPoolError {
         source: sql_provider_datafusion::dbconnectionpool::Error,
     },
 
@@ -63,7 +63,7 @@ impl DataPublisher for DuckDBBackend {
         let pool = Arc::clone(&self.pool);
         let name = self.name.clone();
         Box::pin(async move {
-            let conn = pool.connect_downcast().context(ConnectionPoolSnafu)?;
+            let conn = pool.connect_downcast().context(DbConnectionPoolSnafu)?;
 
             let mut duckdb_update = DuckDBUpdate {
                 name,
@@ -93,7 +93,7 @@ impl DuckDBBackend {
         mode: Mode,
         params: Arc<Option<HashMap<String, String>>>,
     ) -> Result<Self> {
-        let pool = DuckDbConnectionPool::new(name, mode, params).context(ConnectionPoolSnafu)?;
+        let pool = DuckDbConnectionPool::new(name, mode, params).context(DbConnectionPoolSnafu)?;
         Ok(DuckDBBackend {
             ctx,
             name: name.to_string(),
