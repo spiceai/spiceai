@@ -20,7 +20,7 @@ impl DbConnection<DuckdbConnectionManager> for DuckDbConnection {
         DuckDbConnection { conn }
     }
 
-    fn get_schema(&self, table_reference: &TableReference) -> Result<SchemaRef> {
+    fn get_schema(&mut self, table_reference: &TableReference) -> Result<SchemaRef> {
         let mut stmt = self
             .conn
             .prepare(&format!("SELECT * FROM {table_reference} LIMIT 0"))
@@ -31,7 +31,7 @@ impl DbConnection<DuckdbConnectionManager> for DuckDbConnection {
         Ok(result.get_schema())
     }
 
-    fn query_arrow(&self, sql: &str) -> Result<Vec<RecordBatch>> {
+    fn query_arrow(&mut self, sql: &str) -> Result<Vec<RecordBatch>> {
         let mut stmt = self.conn.prepare(sql).context(super::DuckDBSnafu)?;
 
         let result: duckdb::Arrow<'_> = stmt.query_arrow([]).context(DuckDBSnafu)?;

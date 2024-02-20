@@ -48,7 +48,7 @@ impl<P: r2d2::ManageConnection, C> SqlTable<P, C> {
         table_reference: impl Into<OwnedTableReference>,
     ) -> Result<Self> {
         let table_reference = table_reference.into();
-        let conn = pool.connect().context(UnableToGetConnectionFromPoolSnafu)?;
+        let mut conn = pool.connect().context(UnableToGetConnectionFromPoolSnafu)?;
         let schema = conn
             .get_schema(&table_reference)
             .context(UnableToQueryDbConnectionSnafu)?;
@@ -237,7 +237,7 @@ impl<P: r2d2::ManageConnection, C: 'static> ExecutionPlan for SqlExec<P, C> {
         _partition: usize,
         _context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-        let conn = self.pool.connect().map_err(to_execution_error)?;
+        let mut conn = self.pool.connect().map_err(to_execution_error)?;
 
         let sql = self.sql().map_err(to_execution_error)?;
         tracing::debug!("SqlExec sql: {sql}");
