@@ -1,5 +1,6 @@
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::sql::TableReference;
 use duckdb_rs::DuckdbConnectionManager;
 use snafu::ResultExt;
 
@@ -19,10 +20,10 @@ impl DbConnection<DuckdbConnectionManager> for DuckDbConnection {
         DuckDbConnection { conn }
     }
 
-    fn get_schema(&self, table: &str) -> Result<SchemaRef> {
+    fn get_schema(&self, table_reference: &TableReference) -> Result<SchemaRef> {
         let mut stmt = self
             .conn
-            .prepare(&format!("SELECT * FROM {table} LIMIT 0"))
+            .prepare(&format!("SELECT * FROM {table_reference} LIMIT 0"))
             .context(DuckDBSnafu)?;
 
         let result: duckdb_rs::Arrow<'_> = stmt.query_arrow([]).context(DuckDBSnafu)?;

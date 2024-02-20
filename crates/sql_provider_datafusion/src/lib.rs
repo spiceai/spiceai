@@ -43,11 +43,14 @@ pub struct SqlTable<P: r2d2::ManageConnection, C: 'static> {
 }
 
 impl<P: r2d2::ManageConnection, C> SqlTable<P, C> {
-    pub fn new(pool: &Arc<dyn DbConnectionPool<P, C> + Send + Sync>, table: &str) -> Result<Self> {
-        let table_reference = table.to_string().into();
+    pub fn new(
+        pool: &Arc<dyn DbConnectionPool<P, C> + Send + Sync>,
+        table_reference: impl Into<OwnedTableReference>,
+    ) -> Result<Self> {
+        let table_reference = table_reference.into();
         let conn = pool.connect().context(UnableToGetConnectionFromPoolSnafu)?;
         let schema = conn
-            .get_schema(table)
+            .get_schema(&table_reference)
             .context(UnableToQueryDbConnectionSnafu)?;
         Ok(Self {
             pool: Arc::clone(pool),

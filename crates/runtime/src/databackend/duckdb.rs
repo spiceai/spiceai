@@ -111,7 +111,9 @@ impl DuckDBBackend {
             return Ok(());
         }
 
-        let table = match SqlTable::new(&self.pool, &self.name).context(DuckDBDataFusionSnafu) {
+        let table = match SqlTable::new(&self.pool, TableReference::bare(self.name.clone()))
+            .context(DuckDBDataFusionSnafu)
+        {
             Ok(table) => table,
             Err(e) => return Err(e),
         };
