@@ -149,7 +149,7 @@ checksum = "d301b3b94cb4b2f23d7917810addbbaff90738e0ca2be692bd027e70d7e0330c"
 
 [[package]]
 name = "app"
-version = "0.10.0-alpha.0"
+version = "0.7.0-alpha"
 dependencies = [
  "snafu 0.8.0",
  "spicepod",
@@ -1444,7 +1444,7 @@ dependencies = [
 
 [[package]]
 name = "flight_client"
-version = "0.10.0-alpha.0"
+version = "0.7.0-alpha"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -1461,7 +1461,7 @@ dependencies = [
 
 [[package]]
 name = "flightpublisher"
-version = "0.10.0-alpha.0"
+version = "0.7.0-alpha"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -1475,7 +1475,7 @@ dependencies = [
 
 [[package]]
 name = "flightrepl"
-version = "0.10.0-alpha.0"
+version = "0.7.0-alpha"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -1493,7 +1493,7 @@ dependencies = [
 
 [[package]]
 name = "flightsubscriber"
-version = "0.10.0-alpha.0"
+version = "0.7.0-alpha"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -3429,7 +3429,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "0.10.0-alpha.0"
+version = "0.7.0-alpha"
 dependencies = [
  "app",
  "arrow",
@@ -3898,7 +3898,7 @@ dependencies = [
 
 [[package]]
 name = "spiced"
-version = "0.10.0-alpha.0"
+version = "0.7.0-alpha"
 dependencies = [
  "app",
  "clap",
@@ -3915,7 +3915,7 @@ dependencies = [
 
 [[package]]
 name = "spicepod"
-version = "0.10.0-alpha.0"
+version = "0.7.0-alpha"
 dependencies = [
  "fundu",
  "serde",
