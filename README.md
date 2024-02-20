@@ -11,6 +11,14 @@
 
 ⚠️ **DEVELOPER PREVIEW ONLY** Spice.ai is under active **alpha** stage development and is not intended to be used in production until its **1.0-stable** release.
 
+## Why Spice.ai? Use case section
+
+Highlight three use cases.
+
+1.  Front ends that need to be continuously updated
+2.  Accelerate querying without the need to query the cloud (expensive)
+3.  Machine learning at the edge. Empowering edge devices to continuously improve inference
+
 ---
 
 📢 Read the Spice.ai announcement blog post at [blog.spiceai.org] TODO: NEW BLOG POST HERE.
@@ -46,14 +54,6 @@ As the community shares their ML building blocks (aka Spicepods, or pods for sho
 <p align="center">
   <img src="https://user-images.githubusercontent.com/80174/132382372-c32cc8b7-25f2-4f82-8f9f-e4778fb69254.png" width="600" />
 </p>
-
-## Why Spice.ai? Use case section
-
-Spice.ai is for developers who want to build intelligent applications but don't have the time or resources to learn, build and integrate the required ML to do so.
-
-Imagine you have timestamped measurements of the room temperature and access to air-conditioning controls. If you had a time-series ML engine, your application could optimize when the A/C activates. You could reduce energy usage by not overcooling the room as the temperature drops.
-
-Now imagine learning Python or R, neural networks, deep-learning algorithms and building a system that streams and processes time-series data to do that. With Spice.ai — which includes a time-series ML engine accessible over HTTP APIs, a library of community-driven components for data streaming and processing, and an ecosystem of pre-created ML configurations — you can build upon the experience of the community instead of doing it all yourself. You can focus on business logic and building your application instead of the ML.
 
 ### Pre-release software
 
