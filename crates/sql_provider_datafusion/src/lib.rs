@@ -25,10 +25,10 @@ mod expr;
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Unable to get a DB connection from the pool: {source}"))]
-    UnableToGetConnectionFromPool { source: Box<dyn std::error::Error> },
+    UnableToGetConnectionFromPool { source: dbconnectionpool::Error },
 
     #[snafu(display("Unable to query DB connection: {source}"))]
-    UnableToQueryDbConnection { source: Box<dyn std::error::Error> },
+    UnableToQueryDbConnection { source: dbconnection::Error },
 
     #[snafu(display("Unable to generate SQL: {source}"))]
     UnableToGenerateSQL { source: expr::Error },

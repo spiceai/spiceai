@@ -1,19 +1,10 @@
 use std::{collections::HashMap, sync::Arc};
 
 use duckdb::{vtab::arrow::ArrowVTab, DuckdbConnectionManager, ToSql};
-use snafu::{prelude::*, ResultExt};
+use snafu::ResultExt;
 
-use super::{DbConnectionPool, Mode, Result};
+use super::{ConnectionPoolSnafu, DbConnectionPool, DuckDBSnafu, Mode, Result};
 use crate::dbconnection::{duckdbconn::DuckDbConnection, DbConnection};
-
-#[derive(Debug, Snafu)]
-pub enum Error {
-    #[snafu(display("DuckDBError: {source}"))]
-    DuckDBError { source: duckdb::Error },
-
-    #[snafu(display("ConnectionPoolError: {source}"))]
-    ConnectionPoolError { source: r2d2::Error },
-}
 
 pub struct DuckDbConnectionPool {
     pool: Arc<r2d2::Pool<DuckdbConnectionManager>>,
