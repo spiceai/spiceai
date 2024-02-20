@@ -111,11 +111,10 @@ impl DuckDBBackend {
             return Ok(());
         }
 
-        let table =
-            match SqlProviderTable::new(&self.pool, &self.name).context(DuckDBDataFusionSnafu) {
-                Ok(table) => table,
-                Err(e) => return Err(e),
-            };
+        let table = match SqlTable::new(&self.pool, &self.name).context(DuckDBDataFusionSnafu) {
+            Ok(table) => table,
+            Err(e) => return Err(e),
+        };
 
         self.ctx
             .register_table(&self.name, Arc::new(table))
