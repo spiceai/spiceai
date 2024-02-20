@@ -33,7 +33,7 @@ Spice.ai includes:
 - A developer-friendly CLI
 - Simple, git-committable, configuration and code
 
-## Installation (local machine)
+## Installation/Quikc Start
 
 This should be done using the bash script. Once that's ready, I'll update the ReadME accordingly.
 
@@ -48,6 +48,8 @@ git clone -b rust https://github.com/spiceai/spiceai.git
 ```bash
 Make install
 ```
+
+### Run through a data demo step by step here. Include a video showing the steps
 
 ### Community-Driven Data Components
 
@@ -97,14 +99,6 @@ Thank you for sharing this journey with us.
 First, ⭐️ star this repo! Thank you for your support! 🙏
 
 Then, follow this guide to get started quickly with Spice.ai. For a more comprehensive guide, see the full [online documentation](https://docs.spiceai.org/). ADD A VIDEO OF THE DATA DEMO HERE.
-
-### Current hosting limitations
-
-- Only macOS and Linux are natively supported. [WSL 2](https://docs.microsoft.com/en-us/windows/wsl/install-win10) is required for Windows.
-
-⭐️ We highly recommend using [GitHub Codespaces](https://github.com/features/codespaces) to get started. Codespaces enables you to run Spice.ai in a virtual environment in the cloud. If you use Codespaces, the install is not required and you may skip to the [Getting Started with Codespaces](#getting-started-with-codespaces) section.
-
-### Run the data demo
 
 ## Community
 
