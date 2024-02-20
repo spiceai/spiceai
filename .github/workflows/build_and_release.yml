@@ -113,33 +113,60 @@ jobs:
         run: make -C bin/spice
 
       - name: tar binary
+        if: matrix.target_os != 'windows'
         run: |
           mv target/release/spiced spiced
           chmod +x spiced
           tar cf spiced_${{ matrix.target_os }}_${{ matrix.target_arch }}.tar.gz spiced
+
+      - name: copy binary
+        if: matrix.target_os == 'windows'
+        run: |
+          mv target/release/spiced.exe spiced.exe
 
       - name: Print version
         if: matrix.target_os != 'windows'
         run: ./spiced --version
 
       - uses: actions/upload-artifact@v4
+        if: matrix.target_os != 'windows'
         with:
           name: spiced_${{ matrix.target_os }}_${{ matrix.target_arch }}
           path: spiced_${{ matrix.target_os }}_${{ matrix.target_arch }}.tar.gz
 
+      - uses: actions/upload-artifact@v4
+        if: matrix.target_os == 'windows'
+        with:
+          name: spiced_${{ matrix.target_os }}_${{ matrix.target_arch }}
+          path: spiced.exe
+
       - name: tar binary
+        if: matrix.target_os != 'windows'
         run: |
           mv target/release/spice spice
           chmod +x spice
           tar cf spice_${{ matrix.target_os }}_${{ matrix.target_arch }}.tar.gz spice
 
+      - name: copy binary
+        if: matrix.target_os == 'windows'
+        run: |
+          mv target/release/spice.exe spice.exe
+
       - name: Print version
+        if: matrix.target_os != 'windows'
         run: ./spice version
 
       - uses: actions/upload-artifact@v4
+        if: matrix.target_os != 'windows'
         with:
           name: spice_${{ matrix.target_os }}_${{ matrix.target_arch }}
           path: spice_${{ matrix.target_os }}_${{ matrix.target_arch }}.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        if: matrix.target_os == 'windows'
+        with:
+          name: spice_${{ matrix.target_os }}_${{ matrix.target_arch }}
+          path: spice.exe
 
   publish:
     name: Publish ${{ matrix.target_os }}-${{ matrix.target_arch }} binaries
