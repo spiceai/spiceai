@@ -28,7 +28,7 @@ pub enum Error {
     UnableToGetConnectionFromPool { source: dbconnectionpool::Error },
 
     #[snafu(display("Unable to query DB connection: {source}"))]
-    UnableToQuerySqlProvider { source: dbconnection::Error },
+    UnableToQueryDbConnection { source: dbconnection::Error },
 
     #[snafu(display("Unable to generate SQL: {source}"))]
     UnableToGenerateSQL { source: expr::Error },
@@ -36,19 +36,19 @@ pub enum Error {
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
-pub struct SqlProviderTable<P: r2d2::ManageConnection, C: 'static> {
+pub struct SqlTable<P: r2d2::ManageConnection, C: 'static> {
     pool: Arc<dyn DbConnectionPool<P, C> + Send + Sync>,
     schema: SchemaRef,
     table_reference: OwnedTableReference,
 }
 
-impl<P: r2d2::ManageConnection, C> SqlProviderTable<P, C> {
+impl<P: r2d2::ManageConnection, C> SqlTable<P, C> {
     pub fn new(pool: &Arc<dyn DbConnectionPool<P, C> + Send + Sync>, table: &str) -> Result<Self> {
         let table_reference = table.to_string().into();
         let conn = pool.connect().context(UnableToGetConnectionFromPoolSnafu)?;
         let schema = conn
             .get_schema(table)
-            .context(UnableToQuerySqlProviderSnafu)?;
+            .context(UnableToQueryDbConnectionSnafu)?;
         Ok(Self {
             pool: Arc::clone(pool),
             schema,
@@ -75,7 +75,7 @@ impl<P: r2d2::ManageConnection, C> SqlProviderTable<P, C> {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(SqlProviderExec::new(
+        Ok(Arc::new(SqlExec::new(
             projections,
             schema,
             &self.table_reference,
@@ -87,7 +87,7 @@ impl<P: r2d2::ManageConnection, C> SqlProviderTable<P, C> {
 }
 
 #[async_trait]
-impl<P: r2d2::ManageConnection, C> TableProvider for SqlProviderTable<P, C> {
+impl<P: r2d2::ManageConnection, C> TableProvider for SqlTable<P, C> {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -127,7 +127,7 @@ impl<P: r2d2::ManageConnection, C> TableProvider for SqlProviderTable<P, C> {
 }
 
 #[derive(Clone)]
-struct SqlProviderExec<P, C> {
+struct SqlExec<P, C> {
     projected_schema: SchemaRef,
     table_reference: OwnedTableReference,
     pool: Arc<dyn DbConnectionPool<P, C> + Send + Sync>,
@@ -135,7 +135,7 @@ struct SqlProviderExec<P, C> {
     limit: Option<usize>,
 }
 
-impl<P: r2d2::ManageConnection, C> SqlProviderExec<P, C> {
+impl<P: r2d2::ManageConnection, C> SqlExec<P, C> {
     fn new(
         projections: Option<&Vec<usize>>,
         schema: &SchemaRef,
@@ -187,21 +187,21 @@ impl<P: r2d2::ManageConnection, C> SqlProviderExec<P, C> {
     }
 }
 
-impl<P: r2d2::ManageConnection, C> std::fmt::Debug for SqlProviderExec<P, C> {
+impl<P: r2d2::ManageConnection, C> std::fmt::Debug for SqlExec<P, C> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         let sql = self.sql().unwrap_or_default();
-        write!(f, "SqlProviderExec sql={sql}")
+        write!(f, "SqlExec sql={sql}")
     }
 }
 
-impl<P: r2d2::ManageConnection, C> DisplayAs for SqlProviderExec<P, C> {
+impl<P: r2d2::ManageConnection, C> DisplayAs for SqlExec<P, C> {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> std::fmt::Result {
         let sql = self.sql().unwrap_or_default();
-        write!(f, "SqlProvider sql={sql}")
+        write!(f, "SqlExec sql={sql}")
     }
 }
 
-impl<P: r2d2::ManageConnection, C: 'static> ExecutionPlan for SqlProviderExec<P, C> {
+impl<P: r2d2::ManageConnection, C: 'static> ExecutionPlan for SqlExec<P, C> {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -237,7 +237,7 @@ impl<P: r2d2::ManageConnection, C: 'static> ExecutionPlan for SqlProviderExec<P,
         let conn = self.pool.connect().map_err(to_execution_error)?;
 
         let sql = self.sql().map_err(to_execution_error)?;
-        tracing::debug!("sqlprovider sql: {sql}");
+        tracing::debug!("SqlExec sql: {sql}");
 
         let recs = conn.query_arrow(&sql).map_err(to_execution_error)?;
 
@@ -261,7 +261,7 @@ mod tests {
     use crate::{
         dbconnection::duckdb::DuckDbConnection,
         dbconnectionpool::{duckdb::DuckDbConnectionPool, DbConnectionPool, Mode},
-        SqlProviderTable,
+        SqlTable,
     };
 
     fn setup_tracing() -> DefaultGuard {
@@ -288,7 +288,7 @@ mod tests {
         db_conn.conn.execute_batch(
             "CREATE TABLE test (a INTEGER, b VARCHAR); INSERT INTO test VALUES (3, 'bar');",
         )?;
-        let duckdb_table = SqlProviderTable::new(&pool, "test")?;
+        let duckdb_table = SqlTable::new(&pool, "test")?;
         ctx.register_table("test_datafusion", Arc::new(duckdb_table))?;
         let sql = "SELECT * FROM test_datafusion limit 1";
         let df = ctx.sql(sql).await?;
@@ -312,7 +312,7 @@ mod tests {
         db_conn.conn.execute_batch(
             "CREATE TABLE test (a INTEGER, b VARCHAR); INSERT INTO test VALUES (3, 'bar');",
         )?;
-        let duckdb_table = SqlProviderTable::new(&pool, "test")?;
+        let duckdb_table = SqlTable::new(&pool, "test")?;
         ctx.register_table("test_datafusion", Arc::new(duckdb_table))?;
         let sql = "SELECT * FROM test_datafusion where a > 1 and b = 'bar' limit 1";
         let df = ctx.sql(sql).await?;
