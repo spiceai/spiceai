@@ -130,11 +130,6 @@ impl Runtime {
 
         tokio::spawn(async move {
             loop {
-                if ds.acceleration.is_none() && !ds.is_view() {
-                    tracing::warn!("No acceleration specified for dataset: {}", ds.name);
-                    break;
-                };
-
                 let auth = shared_auth.read().await;
 
                 let source = ds.source();
@@ -155,6 +150,14 @@ impl Runtime {
                             continue;
                         }
                     };
+
+                if ds.acceleration.is_none()
+                    && !ds.is_view()
+                    && !has_table_provider(&data_connector)
+                {
+                    tracing::warn!("No acceleration specified for dataset: {}", ds.name);
+                    break;
+                };
 
                 match Runtime::initialize_dataconnector(
                     data_connector,
@@ -361,6 +364,13 @@ impl Runtime {
 
         Ok(())
     }
+}
+
+fn has_table_provider(data_connector: &Option<Box<dyn DataConnector + Send>>) -> bool {
+    data_connector.is_some()
+        && data_connector
+            .as_ref()
+            .is_some_and(|dc| dc.get_table_provider().is_some())
 }
 
 pub fn load_auth_providers() -> auth::AuthProviders {
