@@ -1,3 +1,3 @@
-# DuckDB DataFusion TableProvider
+# SQL DataFusion TableProvider
 
-This crate implements a DuckDB TableProvider for DataFusion.
+This crate implements a SQL TableProvider for DataFusion.
