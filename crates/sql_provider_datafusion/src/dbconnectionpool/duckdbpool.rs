@@ -1,10 +1,10 @@
 use std::{collections::HashMap, sync::Arc};
 
-use duckdb_rs::{vtab::arrow::ArrowVTab, DuckdbConnectionManager};
+use duckdb::{vtab::arrow::ArrowVTab, DuckdbConnectionManager};
 use snafu::ResultExt;
 
 use super::{ConnectionPoolSnafu, DbConnectionPool, DuckDBSnafu, Mode, Result};
-use crate::dbconnection::{duckdb::DuckDbConnection, DbConnection};
+use crate::dbconnection::{duckdbconn::DuckDbConnection, DbConnection};
 
 pub struct DuckDbConnectionPool {
     pool: Arc<r2d2::Pool<DuckdbConnectionManager>>,

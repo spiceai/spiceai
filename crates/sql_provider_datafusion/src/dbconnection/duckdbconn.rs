@@ -1,7 +1,7 @@
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::sql::TableReference;
-use duckdb_rs::DuckdbConnectionManager;
+use duckdb::DuckdbConnectionManager;
 use snafu::ResultExt;
 
 use super::DbConnection;
@@ -26,7 +26,7 @@ impl DbConnection<DuckdbConnectionManager> for DuckDbConnection {
             .prepare(&format!("SELECT * FROM {table_reference} LIMIT 0"))
             .context(DuckDBSnafu)?;
 
-        let result: duckdb_rs::Arrow<'_> = stmt.query_arrow([]).context(DuckDBSnafu)?;
+        let result: duckdb::Arrow<'_> = stmt.query_arrow([]).context(DuckDBSnafu)?;
 
         Ok(result.get_schema())
     }
@@ -34,7 +34,7 @@ impl DbConnection<DuckdbConnectionManager> for DuckDbConnection {
     fn query_arrow(&self, sql: &str) -> Result<Vec<RecordBatch>> {
         let mut stmt = self.conn.prepare(sql).context(super::DuckDBSnafu)?;
 
-        let result: duckdb_rs::Arrow<'_> = stmt.query_arrow([]).context(DuckDBSnafu)?;
+        let result: duckdb::Arrow<'_> = stmt.query_arrow([]).context(DuckDBSnafu)?;
 
         Ok(result.collect())
     }

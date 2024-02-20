@@ -5,12 +5,12 @@ use spicepod::component::dataset::acceleration;
 
 use crate::dbconnection::DbConnection;
 
-pub mod duckdb;
+pub mod duckdbpool;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("DuckDBError: {source}"))]
-    DuckDBError { source: duckdb_rs::Error },
+    DuckDBError { source: duckdb::Error },
 
     #[snafu(display("ConnectionPoolError: {source}"))]
     ConnectionPoolError { source: r2d2::Error },

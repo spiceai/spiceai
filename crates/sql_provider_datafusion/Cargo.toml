@@ -12,7 +12,7 @@ exclude.workspace = true
 
 [dependencies]
 # Can't be imported from the workspace as workspace dependencies cannot be renamed
-duckdb-rs = { git = "https://github.com/spicehq/duckdb-rs.git", rev = "8b57b1496eed1009c45734df7790960313d31e3d",  features = ["bundled", "r2d2", "vtab", "vtab-arrow"], package = "duckdb" }
+duckdb = { workspace = true,  features = ["bundled", "r2d2", "vtab", "vtab-arrow"] }
 datafusion.workspace = true
 async-trait.workspace = true
 r2d2.workspace = true

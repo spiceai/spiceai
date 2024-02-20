@@ -10,8 +10,8 @@ use duckdb::{vtab::arrow::arrow_recordbatch_to_query_params, DuckdbConnectionMan
 use snafu::{prelude::*, ResultExt};
 use spicepod::component::dataset::Dataset;
 use sql_provider_datafusion::{
-    dbconnection::{self, duckdb::DuckDbConnection, DbConnection},
-    dbconnectionpool::{duckdb::DuckDbConnectionPool, DbConnectionPool, Mode},
+    dbconnection::{self, duckdbconn::DuckDbConnection, DbConnection},
+    dbconnectionpool::{duckdbpool::DuckDbConnectionPool, DbConnectionPool, Mode},
     SqlTable,
 };
 
@@ -130,7 +130,7 @@ struct DuckDBUpdate<'a> {
     name: String,
     data: Vec<RecordBatch>,
     update_type: UpdateType,
-    duckdb_conn: dbconnection::duckdb::DuckDbConnection,
+    duckdb_conn: dbconnection::duckdbconn::DuckDbConnection,
     create_mutex: &'a std::sync::Mutex<()>,
 }
 

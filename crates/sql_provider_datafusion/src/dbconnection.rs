@@ -1,13 +1,13 @@
-use ::duckdb_rs::arrow::array::RecordBatch;
+use ::duckdb::arrow::array::RecordBatch;
 use datafusion::{arrow::datatypes::SchemaRef, sql::TableReference};
 use snafu::prelude::*;
 
-pub mod duckdb;
+pub mod duckdbconn;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("DuckDBError: {source}"))]
-    DuckDBError { source: duckdb_rs::Error },
+    DuckDBError { source: duckdb::Error },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;

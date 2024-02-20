@@ -258,12 +258,12 @@ mod tests {
     use std::{error::Error, sync::Arc};
 
     use datafusion::execution::context::SessionContext;
-    use duckdb_rs::DuckdbConnectionManager;
+    use duckdb::DuckdbConnectionManager;
     use tracing::{level_filters::LevelFilter, subscriber::DefaultGuard, Dispatch};
 
     use crate::{
-        dbconnection::duckdb::DuckDbConnection,
-        dbconnectionpool::{duckdb::DuckDbConnectionPool, DbConnectionPool, Mode},
+        dbconnection::duckdbconn::DuckDbConnection,
+        dbconnectionpool::{duckdbpool::DuckDbConnectionPool, DbConnectionPool, Mode},
         SqlTable,
     };
 
