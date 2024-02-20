@@ -3,7 +3,6 @@ use datafusion::{arrow::datatypes::SchemaRef, sql::TableReference};
 use snafu::prelude::*;
 
 pub mod duckdbconn;
-pub mod postgresconn;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
