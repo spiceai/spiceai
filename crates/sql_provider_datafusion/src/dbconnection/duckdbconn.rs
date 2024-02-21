@@ -1,8 +1,7 @@
 use std::any::Any;
 
+use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef;
-use datafusion::execution::SendableRecordBatchStream;
-use datafusion::physical_plan::memory::MemoryStream;
 use datafusion::sql::TableReference;
 use duckdb::DuckdbConnectionManager;
 use duckdb::ToSql;
@@ -37,17 +36,12 @@ impl DbConnection<DuckdbConnectionManager, &dyn ToSql> for DuckDbConnection {
         Ok(result.get_schema())
     }
 
-    fn query_arrow(
-        &mut self,
-        sql: &str,
-        params: &[&dyn ToSql],
-    ) -> Result<SendableRecordBatchStream> {
+    fn query_arrow(&mut self, sql: &str, params: &[&dyn ToSql]) -> Result<Vec<RecordBatch>> {
         let mut stmt = self.conn.prepare(sql).context(DuckDBSnafu)?;
 
         let result: duckdb::Arrow<'_> = stmt.query_arrow(params).context(DuckDBSnafu)?;
-        let schema = result.get_schema();
-        let recs = result.collect();
-        Ok(Box::pin(MemoryStream::try_new(recs, schema, None)?))
+
+        Ok(result.collect())
     }
 
     fn execute(&mut self, sql: &str, params: &[&dyn ToSql]) -> Result<u64> {

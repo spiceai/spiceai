@@ -13,7 +13,8 @@ use datafusion::{
     execution::{context::SessionState, TaskContext},
     logical_expr::{Expr, TableProviderFilterPushDown, TableType},
     physical_plan::{
-        project_schema, DisplayAs, DisplayFormatType, ExecutionPlan, SendableRecordBatchStream,
+        memory::MemoryStream, project_schema, DisplayAs, DisplayFormatType, ExecutionPlan,
+        SendableRecordBatchStream,
     },
 };
 
@@ -241,8 +242,9 @@ impl<T: r2d2::ManageConnection, P: 'static> ExecutionPlan for SqlExec<T, P> {
         let sql = self.sql().map_err(to_execution_error)?;
         tracing::debug!("SqlExec sql: {sql}");
 
-        let stream = conn.query_arrow(&sql, &[]).map_err(to_execution_error)?;
-        Ok(stream)
+        let recs = conn.query_arrow(&sql, &[]).map_err(to_execution_error)?;
+
+        Ok(Box::pin(MemoryStream::try_new(recs, self.schema(), None)?))
     }
 }
 

@@ -4010,9 +4010,11 @@ name = "sql_provider_datafusion"
 version = "0.7.0-alpha"
 dependencies = [
  "arrow-flight",
+ "arrow-schema",
  "async-trait",
  "datafusion",
  "duckdb",
+ "futures",
  "postgres",
  "r2d2",
  "r2d2_postgres",

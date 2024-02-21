@@ -26,6 +26,8 @@ tonic = { workspace = true, default-features = false, features = [
   "tls",
   "tls-roots",
 ] }
+futures.workspace = true
+arrow-schema = "49.0.0"
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }

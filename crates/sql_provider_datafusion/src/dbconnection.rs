@@ -1,8 +1,7 @@
 use std::any::Any;
 
-use datafusion::{
-    arrow::datatypes::SchemaRef, execution::SendableRecordBatchStream, sql::TableReference,
-};
+use ::duckdb::arrow::array::RecordBatch;
+use datafusion::{arrow::datatypes::SchemaRef, sql::TableReference};
 
 pub mod duckdbconn;
 pub mod postgresconn;
@@ -15,7 +14,7 @@ pub trait DbConnection<T: r2d2::ManageConnection, P> {
     where
         Self: Sized;
     fn get_schema(&mut self, table_reference: &TableReference) -> Result<SchemaRef>;
-    fn query_arrow(&mut self, sql: &str, params: &[P]) -> Result<SendableRecordBatchStream>;
+    fn query_arrow(&mut self, sql: &str, params: &[P]) -> Result<Vec<RecordBatch>>;
     fn execute(&mut self, sql: &str, params: &[P]) -> Result<u64>;
 
     fn as_any(&self) -> &dyn Any;

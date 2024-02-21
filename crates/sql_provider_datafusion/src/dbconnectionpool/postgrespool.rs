@@ -1,10 +1,11 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, str::FromStr, sync::Arc};
 
 use arrow_flight::sql::client::FlightSqlServiceClient;
 use async_trait::async_trait;
 use postgres::types::ToSql;
 use r2d2_postgres::{postgres::NoTls, PostgresConnectionManager};
 use snafu::{prelude::*, ResultExt};
+use tokio::sync::Mutex;
 use tonic::transport::Endpoint;
 
 use super::{DbConnectionPool, Mode, Result};
@@ -17,11 +18,14 @@ pub enum Error {
 
     #[snafu(display("ConnectionPoolError: {source}"))]
     ConnectionPoolError { source: r2d2::Error },
+
+    #[snafu(display("Unable to connect to endpoint: {source}"))]
+    UnableToConnectToEndpoint { source: tonic::transport::Error },
 }
 
 pub struct PostgresConnectionPool {
     pool: Arc<r2d2::Pool<PostgresConnectionManager<NoTls>>>,
-    flight_sql_client: Arc<FlightSqlServiceClient<tonic::transport::Channel>>,
+    flight_sql_client: Arc<Mutex<FlightSqlServiceClient<tonic::transport::Channel>>>,
 }
 
 #[async_trait]
@@ -39,12 +43,12 @@ impl DbConnectionPool<PostgresConnectionManager<NoTls>, &'static (dyn ToSql + Sy
         let manager = PostgresConnectionManager::new(parsed_config, NoTls);
         let pool = Arc::new(r2d2::Pool::new(manager).context(ConnectionPoolSnafu)?);
 
-        let channel = Endpoint::try_from("grpc://127.0.0.1:15432")
-            .unwrap()
+        let channel = Endpoint::from_str("grpc://127.0.0.1:15432")
+            .context(UnableToConnectToEndpointSnafu)?
             .connect()
             .await
-            .unwrap();
-        let flight_sql_client = Arc::new(FlightSqlServiceClient::new(channel));
+            .context(UnableToConnectToEndpointSnafu)?;
+        let flight_sql_client = Arc::new(Mutex::new(FlightSqlServiceClient::new(channel)));
 
         Ok(PostgresConnectionPool {
             pool,
