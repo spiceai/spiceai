@@ -1,18 +1,25 @@
 use std::{collections::HashMap, sync::Arc};
 
 use duckdb::{vtab::arrow::ArrowVTab, DuckdbConnectionManager, ToSql};
-use snafu::ResultExt;
+use snafu::{prelude::*, ResultExt};
 
-use super::{ConnectionPoolSnafu, DbConnectionPool, DuckDBSnafu, Mode, Result};
+use super::{DbConnectionPool, Mode, Result};
 use crate::dbconnection::{duckdbconn::DuckDbConnection, DbConnection};
+
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display("DuckDBError: {source}"))]
+    DuckDBError { source: duckdb::Error },
+
+    #[snafu(display("ConnectionPoolError: {source}"))]
+    ConnectionPoolError { source: r2d2::Error },
+}
 
 pub struct DuckDbConnectionPool {
     pool: Arc<r2d2::Pool<DuckdbConnectionManager>>,
 }
 
-impl DbConnectionPool<DuckdbConnectionManager, DuckDbConnection, &'static dyn ToSql>
-    for DuckDbConnectionPool
-{
+impl DbConnectionPool<DuckdbConnectionManager, &'static dyn ToSql> for DuckDbConnectionPool {
     fn new(name: &str, mode: Mode, params: Arc<Option<HashMap<String, String>>>) -> Result<Self> {
         let manager = match mode {
             Mode::Memory => DuckdbConnectionManager::memory().context(DuckDBSnafu)?,
@@ -36,13 +43,6 @@ impl DbConnectionPool<DuckdbConnectionManager, DuckDbConnection, &'static dyn To
         let conn: r2d2::PooledConnection<DuckdbConnectionManager> =
             pool.get().context(ConnectionPoolSnafu)?;
         Ok(Box::new(DuckDbConnection::new(conn)))
-    }
-
-    fn connect_downcast(&self) -> Result<DuckDbConnection> {
-        let pool = Arc::clone(&self.pool);
-        let conn: r2d2::PooledConnection<DuckdbConnectionManager> =
-            pool.get().context(ConnectionPoolSnafu)?;
-        Ok(DuckDbConnection::new(conn))
     }
 }
 

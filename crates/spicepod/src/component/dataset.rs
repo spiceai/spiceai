@@ -24,7 +24,7 @@ pub enum Mode {
     Append,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Dataset {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub from: String,
@@ -202,7 +202,7 @@ pub mod acceleration {
         DuckDB,
     }
 
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
     pub struct Acceleration {
         #[serde(default)]
         pub enabled: bool,
@@ -239,7 +239,7 @@ pub mod acceleration {
 pub mod replication {
     use serde::{Deserialize, Serialize};
 
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
     pub struct Replication {
         #[serde(default)]
         pub enabled: bool,

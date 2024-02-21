@@ -47,6 +47,9 @@ pub enum Error {
 
     #[snafu(display("Lock is poisoned: {message}"))]
     LockPoisoned { message: String },
+
+    #[snafu(display("Unable to downcast DbConnection to DuckDbConnection"))]
+    UnableToDowncastDbConnection {},
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -54,11 +57,7 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 pub struct DuckDBBackend {
     ctx: Arc<SessionContext>,
     name: String,
-    pool: Arc<
-        dyn DbConnectionPool<DuckdbConnectionManager, DuckDbConnection, &'static dyn ToSql>
-            + Send
-            + Sync,
-    >,
+    pool: Arc<dyn DbConnectionPool<DuckdbConnectionManager, &'static dyn ToSql> + Send + Sync>,
     create_mutex: std::sync::Mutex<()>,
 }
 
@@ -67,7 +66,12 @@ impl DataPublisher for DuckDBBackend {
         let pool = Arc::clone(&self.pool);
         let name = self.name.clone();
         Box::pin(async move {
-            let conn = pool.connect_downcast().context(DbConnectionPoolSnafu)?;
+            let mut conn = pool.connect().context(DbConnectionPoolSnafu)?;
+            let Some(conn) = conn.as_any_mut().downcast_mut::<DuckDbConnection>() else {
+                return Err(
+                    Box::new(Error::UnableToDowncastDbConnection {}) as Box<dyn std::error::Error>
+                );
+            };
 
             let mut duckdb_update = DuckDBUpdate {
                 name,
@@ -134,7 +138,7 @@ struct DuckDBUpdate<'a> {
     name: String,
     data: Vec<RecordBatch>,
     update_type: UpdateType,
-    duckdb_conn: dbconnection::duckdbconn::DuckDbConnection,
+    duckdb_conn: &'a mut dbconnection::duckdbconn::DuckDbConnection,
     create_mutex: &'a std::sync::Mutex<()>,
 }
 
