@@ -9,7 +9,7 @@
 
 ## What is SpiceAI?
 
-**Spice.ai** is an open source runtime environment that enables developers to leverage rapid access to time-series data for data driven applications. The Spice AI Runtime enables the best in class high performance queries that can power an array of data driven applications.
+**Spice.ai** is an open source runtime environment that enables developers to leverage rapid access to time-series data. The Spice AI Runtime enables the best in class high performance queries for powering an array of data driven applications.
 
 ⚠️ **DEVELOPER PREVIEW ONLY** Spice.ai is under active **alpha** stage development and is not intended to be used in production until its **1.0-stable** release.
 
