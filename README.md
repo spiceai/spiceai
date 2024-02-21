@@ -119,19 +119,15 @@ You can enter custom queries:
 sql> SELECT topics FROM eth_recent_logs LIMIT 5;
 ```
 
-### Run through a data demo step by step here. Include a video showing the steps
+TODO: ADD VIDEO SHOWING HOW TO RUN THE ABOVE STEPS HERE.
 
-### Community-Driven Data Components
+## Importing a predefined set of datasets using Spicepods
 
-## Will this feature be available in the future?
+TODO: Use `spice add <public_spicd_pod>
 
-### Spicepod registry
+## Importing dataset from dremio using dummie login credentials
 
-Modern developers build with the community by leveraging registries such as npm, NuGet, and pip. The Spice.ai platform includes [spicerack.org](https://spicerack.org), the registry for publically avaialble datasets and machine learning models.
-
-### INSERT EXAMPLE OF A SPICEPOD YAML HERE
-
-As the community shares their ML building blocks (aka Spicepods, or pods for short), developers can quickly add them to their Spice.ai applications enabling them to stream data and upload pre-trained models into their applications quickly and easily.
+TODO: Use `spice dataset configure` for a Dremio dataset.
 
 #### This diagram should be accompanied by a summary or step by step explanation.
 
@@ -139,50 +135,20 @@ As the community shares their ML building blocks (aka Spicepods, or pods for sho
   <img src="https://user-images.githubusercontent.com/80174/132382372-c32cc8b7-25f2-4f82-8f9f-e4778fb69254.png" width="600" />
 </p>
 
-### Pre-release software
+### Upcoming Features
 
-⚠️ The vision to make it easy to build intelligent applications that learn is a vast undertaking. We haven't figured it all out or solved all the problems yet, so we’re inviting you on this journey and are looking for feedback the direction.
+🚀 See the [Roadmap to v1.0-stable](https://github.com/spiceai/spiceai/blob/rust/docs/RELEASE.md) for upcoming features.
 
-The team at SpiceAI is committed to creating a developer community
-
-Spice.ai and spicerack.org are both pre-release, early, alpha software. Until v1.0, Spice.ai may have gaps, including limited deep learning algorithms, training-at-scale, and simulated environments..
-
-Our intention with this preview is to work with developers early to define and create the developer experience together. 🚀 See the [Roadmap to v1.0-stable](https://github.com/spiceai/spiceai/blob/rust/docs/RELEASE.md) for upcoming features.
-
-### Join us!
+### Connect with us!
 
 We greatly appreciate and value your support! You can help Spice.ai in a number of ways:
 
-- ⭐️ Star this repo.
 - Build an app with Spice.ai and send us feedback and suggestions at [hey@spice.ai](mailto:hey@spice.ai) or on [Discord](https://discord.gg/kZnTfneP5u).
 - [File an issue](https://github.com/spiceai/spiceai/issues/new) if you see something not quite working correctly.
-- Follow us on [Reddit](https://www.reddit.com/r/spiceai), [Twitter](https://twitter.com/SpiceAIHQ), and [LinkedIn](https://www.linkedin.com/company/74148478).
+  [Twitter](https://twitter.com/SpiceAIHQ), and [LinkedIn](https://www.linkedin.com/company/74148478).
 - Join our team ([We’re hiring!](https://spice.ai/careers))
 - Contribute code or documentation to the project (see [CONTRIBUTING.md](CONTRIBUTING.md)).
 
-We’re also starting a community call series soon!
+⭐️ star this repo! Thank you for your support! 🙏
 
-Thank you for sharing this journey with us.
-
-## Getting started with Spice.ai
-
-First, ⭐️ star this repo! Thank you for your support! 🙏
-
-Then, follow this guide to get started quickly with Spice.ai. For a more comprehensive guide, see the full [online documentation](https://docs.spiceai.org/). ADD A VIDEO OF THE DATA DEMO HERE.
-
-## Community
-
-Spice.ai started with the vision to make AI easy for developers. We are building Spice.ai in the open and with the community. Reach out on Discord or by email to get involved. We will be starting a community call series soon!
-
-- Discord: [![Discord Banner](https://discord.com/api/guilds/803820740868571196/widget.png?style=shield)](https://discord.gg/kZnTfneP5u)
-- Reddit: [![Subreddit subscribers](https://img.shields.io/reddit/subreddit-subscribers/spiceai?style=social)](https://www.reddit.com/r/spiceai)
-- Twitter: [@SpiceAIHQ](https://twitter.com/spiceaihq)
-- Email: [hey@spice.ai](mailto:hey@spice.ai)
-
-### Contributing to Spice.ai
-
-See [CONTRIBUTING.md](/CONTRIBUTING.md).
-
-```
-
-```
+For a more comprehensive guide, see the full [online documentation](https://docs.spiceai.org/).
