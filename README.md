@@ -27,25 +27,56 @@ Highlight three use cases.
 curl https://install.spiceai.org | /bin/bash
 ```
 
-**Step 6** Start the SpiceAI Runtime
+**Step 2** Initialize a new project
+
+```bash
+spice init <PROJECT_NAME>
+```
+
+This creates a spicepod.yaml file in your directory.
+
+```
+version: v1beta1
+kind: Spicepod
+name: PROJECT_NAME
+```
+
+**Step 3** start the SpiceAI runtime
 
 ```bash
 spice run
 ```
 
-You should now see the following:
+You should see the following output:
 
 ```bash
 Spice.ai runtime starting...
 Using latest 'local' runtime version.
-2024-02-20T23:54:31.313288Z  INFO runtime::http: Spice Runtime HTTP listening on 127.0.0.1:3000
-2024-02-20T23:54:31.313347Z  INFO runtime::flight: Spice Runtime Flight listening on 127.0.0.1:50051
-2024-02-20T23:54:31.313532Z  INFO runtime::opentelemetry: Spice Runtime OpenTelemetry listening on 127.0.0.1:50052
-2024-02-20T23:54:32.208615Z  INFO runtime: Loaded dataset: eth_recent_logs
-2024-02-20T23:54:32.209376Z  INFO runtime::dataconnector: Refreshing data for eth_recent_logs
+2024-02-21T06:11:56.381793Z  INFO runtime::http: Spice Runtime HTTP listening on 127.0.0.1:3000
+2024-02-21T06:11:56.381853Z  INFO runtime::flight: Spice Runtime Flight listening on 127.0.0.1:50051
+2024-02-21T06:11:56.382038Z  INFO runtime::opentelemetry: Spice Runtime OpenTelemetry listening on 127.0.0.1:50052
 ```
 
-**Step 7** In a seperate terminal window, you can query against the dataset using the spice sql tool:
+**Step 4** Add a public pre-defined spicepod.
+In a new terminal window, enter the following command:
+
+```bash
+spice add <NAME_OF_PUBLIC_SPICEPOD>
+```
+
+You should see the runtime updated with the new dataset.
+Also, the spicepod.yaml file will be updated with a new dependency that
+references the imported spicepod.
+
+```
+version: v1beta1
+kind: Spicepod
+name: PROJECT_NAME
+dependencies:
+- <SPICEPOD_PATH>
+```
+
+**Step 5** You can now query against the dataset using the spice sql tool:
 
 ```bash
 spice sql
@@ -60,6 +91,7 @@ show tables; -- list available tables
 ```
 
 Entering `show tables;` should print out the following table:
+TODO: REPLACE TABLE WITH TABLE FROM THE DATASET IN THE PUBLIC SPICEPOD
 
 ```
 sql> show tables;
@@ -75,6 +107,7 @@ sql> show tables;
 ```
 
 You can enter custom queries:
+TODO: MODIFY THE QUERY TO REFLECT COLUMNS FROM THE PUBLIC DATASET
 
 ```bash
 sql> SELECT topics FROM eth_recent_logs LIMIT 5;
@@ -90,7 +123,7 @@ TODO: Use `spice add <public_spicd_pod>`
 
 TODO: Use `spice dataset configure` for a web3 dataset from spiceAI.
 
-**Step 1** Configure a public datasets from spice.ai. You can select from any publically available dataset listed here: https://docs.spice.ai/building-blocks/datasets. We will use the eth.recent_logs dataset, but you can choose any available dataset from the list.
+Configure a public datasets from spice.ai. You can select from any publically available dataset listed here: https://docs.spice.ai/building-blocks/datasets. We will use the eth.recent_logs dataset, but you can choose any available dataset from the list.
 
 In order access these datasets, you will first need to create an account.
 
@@ -149,7 +182,7 @@ We greatly appreciate and value your support! You can help Spice.ai in a number 
 
 - Build an app with Spice.ai and send us feedback and suggestions at [hey@spice.ai](mailto:hey@spice.ai) or on [Discord](https://discord.gg/kZnTfneP5u).
 - [File an issue](https://github.com/spiceai/spiceai/issues/new) if you see something not quite working correctly.
-  [Twitter](https://twitter.com/SpiceAIHQ), and [LinkedIn](https://www.linkedin.com/company/74148478).
+  [X](https://twitter.com/SpiceAIHQ), and [LinkedIn](https://www.linkedin.com/company/74148478).
 - Join our team ([We’re hiring!](https://spice.ai/careers))
 - Contribute code or documentation to the project (see [CONTRIBUTING.md](CONTRIBUTING.md)).
 
