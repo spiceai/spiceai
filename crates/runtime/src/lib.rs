@@ -402,6 +402,8 @@ impl Runtime {
                 }
 
                 *current_app = new_app;
+            } else {
+                self.app = Some(Arc::new(RwLock::new(new_app)));
             }
         }
 
