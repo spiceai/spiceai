@@ -249,7 +249,7 @@ impl<T: r2d2::ManageConnection, P: 'static> ExecutionPlan for SqlExec<T, P> {
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn to_execution_error(e: impl Into<Box<dyn std::error::Error>>) -> DataFusionError {
+fn to_execution_error(e: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> DataFusionError {
     DataFusionError::Execution(format!("{}", e.into()).to_string())
 }
 
@@ -277,7 +277,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_duckdb_table() -> Result<(), Box<dyn Error>> {
+    async fn test_duckdb_table() -> Result<(), Box<dyn Error + Send + Sync>> {
         let t = setup_tracing();
         let ctx = SessionContext::new();
         let pool: Arc<dyn DbConnectionPool<DuckdbConnectionManager, &dyn ToSql> + Send + Sync> =
@@ -304,7 +304,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_duckdb_table_filter() -> Result<(), Box<dyn Error>> {
+    async fn test_duckdb_table_filter() -> Result<(), Box<dyn Error + Send + Sync>> {
         let t = setup_tracing();
         let ctx = SessionContext::new();
         let pool: Arc<dyn DbConnectionPool<DuckdbConnectionManager, &dyn ToSql> + Send + Sync> =

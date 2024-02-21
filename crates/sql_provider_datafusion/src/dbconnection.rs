@@ -1,17 +1,11 @@
-use std::{any::Any, fmt::Debug};
+use std::any::Any;
 
 use ::duckdb::arrow::array::RecordBatch;
 use datafusion::{arrow::datatypes::SchemaRef, sql::TableReference};
-use snafu::prelude::*;
 
 pub mod duckdbconn;
 
-#[derive(Debug, Snafu)]
-pub enum Error {
-    #[snafu(display("DuckDBError: {source}"))]
-    DuckDBError { source: duckdb::Error },
-}
-
+pub type Error = Box<dyn std::error::Error + Send + Sync>;
 type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub trait DbConnection<T: r2d2::ManageConnection, P> {

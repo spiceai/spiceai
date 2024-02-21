@@ -5,11 +5,16 @@ use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::sql::TableReference;
 use duckdb::DuckdbConnectionManager;
 use duckdb::ToSql;
-use snafu::ResultExt;
+use snafu::{prelude::*, ResultExt};
 
 use super::DbConnection;
-use super::DuckDBSnafu;
 use super::Result;
+
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display("DuckDBError: {source}"))]
+    DuckDBError { source: duckdb::Error },
+}
 
 pub struct DuckDbConnection {
     pub conn: r2d2::PooledConnection<DuckdbConnectionManager>,
@@ -32,7 +37,7 @@ impl DbConnection<DuckdbConnectionManager, &dyn ToSql> for DuckDbConnection {
     }
 
     fn query_arrow(&mut self, sql: &str, params: &[&dyn ToSql]) -> Result<Vec<RecordBatch>> {
-        let mut stmt = self.conn.prepare(sql).context(super::DuckDBSnafu)?;
+        let mut stmt = self.conn.prepare(sql).context(DuckDBSnafu)?;
 
         let result: duckdb::Arrow<'_> = stmt.query_arrow(params).context(DuckDBSnafu)?;
 
