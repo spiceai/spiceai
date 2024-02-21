@@ -1,5 +1,5 @@
 [package]
-name = "duckdb_datafusion"
+name = "sql_provider_datafusion"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
