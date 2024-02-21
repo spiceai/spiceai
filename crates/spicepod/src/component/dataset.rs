@@ -24,7 +24,7 @@ pub enum Mode {
     Append,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Dataset {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub from: String,
@@ -202,7 +202,7 @@ pub mod acceleration {
         DuckDB,
     }
 
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
     pub struct Acceleration {
         #[serde(default)]
         pub enabled: bool,
@@ -236,10 +236,19 @@ pub mod acceleration {
     }
 }
 
+impl From<acceleration::Mode> for sql_provider_datafusion::dbconnectionpool::Mode {
+    fn from(m: acceleration::Mode) -> Self {
+        match m {
+            acceleration::Mode::File => sql_provider_datafusion::dbconnectionpool::Mode::File,
+            acceleration::Mode::Memory => sql_provider_datafusion::dbconnectionpool::Mode::Memory,
+        }
+    }
+}
+
 pub mod replication {
     use serde::{Deserialize, Serialize};
 
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
     pub struct Replication {
         #[serde(default)]
         pub enabled: bool,

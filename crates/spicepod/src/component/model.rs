@@ -1,7 +1,7 @@
 use super::WithDependsOn;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Model {
     pub from: String,
     pub name: String,

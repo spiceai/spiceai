@@ -9,6 +9,7 @@ Spice.ai is built upon a foundation of first principles.
 - API first
 - Composable from community driven-components
 - First class extensibility
+- Leverage model versioning
 
 ### Developer experience first
 
@@ -29,3 +30,7 @@ A Spice.ai project consists of Datasets and Models, which are composable through
 ### First class extensibility
 
 Spice.ai is designed to be extended. All components are behind well-defined interfaces, and new components can be added dynamically without code changes to the core project.
+
+### Leverage model versioning
+
+Spice.ai supports pulling the models in specific versions defined in a Spicepod, which ensures your ML applications are comparable and traceable.
