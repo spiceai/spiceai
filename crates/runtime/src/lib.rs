@@ -189,15 +189,12 @@ impl Runtime {
     }
 
     pub async fn remove_dataset(&self, ds: &Dataset) {
+        let mut df = self.df.write().await;
 
-        if ds.is_view() {
-            match self.df.read().await.remove_table(&ds.name) {
-                Ok(()) => (),
-                Err(e) => {
-                    tracing::warn!("Unable to detach view: {}", e);
-                    return;
-                }
-                
+        if df.table_exists(&ds.name) {
+            if let Err(e) = df.remove_table(&ds.name) {
+                tracing::warn!("Unable to unload dataset {}: {}", &ds.name, e);
+                return;
             }
         }
 
