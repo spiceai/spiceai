@@ -35,7 +35,7 @@ pub enum Error {
         source: flight_client::Error,
     },
 
-    Tokio {},
+    NoSchema,
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -52,10 +52,10 @@ impl FlightSQLTable {
         table_reference: impl Into<OwnedTableReference>,
     ) -> Result<Self> {
         let table_reference = table_reference.into();
-        let schema = Self::get_schema(client.clone(), &table_reference);
+        let schema = Self::get_schema(client.clone(), &table_reference)?;
         Ok(Self {
             client,
-            schema: schema.unwrap(),
+            schema,
             table_reference,
         })
     }
@@ -78,21 +78,20 @@ impl FlightSQLTable {
     ) -> Result<SchemaRef> {
         tokio::task::block_in_place(move || {
             Handle::current().block_on(async {
-                let flight_record_batch_stream_result = client
+                let mut stream = client
                     .clone()
                     .query(format!("SELECT * FROM {} limit 1", table_reference.into()).as_str())
-                    .await;
+                    .await
+                    .map_err(|error| Error::Flight { source: error })?;
 
-                match flight_record_batch_stream_result {
-                    Ok(mut stream) => {
-                        stream.next().await;
-                        let schema = stream.schema();
-                        Ok(Arc::clone(schema.unwrap()))
+                if stream.next().await.is_some() {
+                    if let Some(schema) = stream.schema() {
+                        Ok(Arc::clone(schema))
+                    } else {
+                        Err(Error::NoSchema {})
                     }
-                    Err(error) => {
-                        tracing::error!("Failed to query with flight client: {:?}", error);
-                        todo!()
-                    }
+                } else {
+                    Err(Error::NoSchema {})
                 }
             })
         })
@@ -264,12 +263,10 @@ impl ExecutionPlan for FlightSQLExec {
         _partition: usize,
         _context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-        let sql = self.sql().map_err(to_execution_error);
-        let Ok(sql) = sql else {
-            return Err(to_execution_error(sql.unwrap_err()));
+        let sql = match self.sql().map_err(to_execution_error) {
+            Ok(sql) => sql,
+            Err(error) => return Err(error),
         };
-
-        tracing::info!("Executing SQL: {sql}");
 
         let data = tokio::task::block_in_place(move || {
             Handle::current().block_on(async {
@@ -300,11 +297,10 @@ impl ExecutionPlan for FlightSQLExec {
             })
         });
 
-        Ok(Box::pin(MemoryStream::try_new(
-            data.unwrap(),
-            self.schema(),
-            None,
-        )?))
+        match data {
+            Ok(data) => Ok(Box::pin(MemoryStream::try_new(data, self.schema(), None)?)),
+            Err(error) => Err(error),
+        }
     }
 }
 

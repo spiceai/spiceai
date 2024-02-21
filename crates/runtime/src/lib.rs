@@ -233,15 +233,14 @@ impl Runtime {
             return Ok(());
         }
 
-        let has_data_connector = data_connector.is_some();
-        let data_connector = data_connector.unwrap();
-
         if ds.acceleration.is_none() {
-            df.read()
-                .await
-                .attach_remote(ds, &data_connector)
-                .context(UnableToAttachViewSnafu)?;
-            return Ok(());
+            if let Some(data_connector) = data_connector {
+                df.read()
+                    .await
+                    .attach_remote(ds, data_connector)
+                    .context(UnableToAttachViewSnafu)?;
+                return Ok(());
+            }
         }
 
         let data_backend = df
@@ -261,7 +260,7 @@ impl Runtime {
                 })?;
         }
 
-        if has_data_connector {
+        if let Some(data_connector) = data_connector {
             let replicate = ds.replication.as_ref().map_or(false, |r| r.enabled);
 
             // Attach data publisher only if replicate is true and mode is ReadWrite

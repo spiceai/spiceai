@@ -55,6 +55,9 @@ pub enum Error {
     #[snafu(display("Unable to get table: {source}"))]
     UnableToGetTable { source: DataFusionError },
 
+    #[snafu(display("Unable to register table: {source}"))]
+    UnableToRegisterTable { source: crate::dataconnector::Error },
+
     #[snafu(display("Unable to create view: {source}"))]
     InvalidSQLView {
         source: spicepod::component::dataset::Error,
@@ -198,10 +201,11 @@ impl DataFusion {
         Ok(())
     }
 
+    #[allow(clippy::needless_pass_by_value)]
     pub fn attach_remote(
         &self,
         dataset: impl Borrow<Dataset>,
-        data_connector: &Box<dyn DataConnector + Send>,
+        data_connector: Box<dyn DataConnector>,
     ) -> Result<()> {
         let dataset = dataset.borrow();
         let table_exists = self.ctx.table_exist(dataset.name.as_str()).unwrap_or(false);
@@ -214,13 +218,12 @@ impl DataFusion {
 
         match provider {
             Ok(provider) => {
-                self.ctx
+                let _ = self
+                    .ctx
                     .register_table(dataset.name.as_str(), Arc::clone(&provider));
                 Ok(())
             }
-            Err(error) => Err(Error::UnableToCreateView {
-                reason: "test".to_string(),
-            }),
+            Err(error) => Err(Error::UnableToRegisterTable { source: error }),
         }
     }
 
