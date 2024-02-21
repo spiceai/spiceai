@@ -29,10 +29,10 @@ https://go.dev/doc/install
 curl https://install.spiceai.org | /bin/bash
 ```
 
-**Step 2.** Choose a project name and initialize a new project
+**Step 2.** Choose a project name and initialize a new project:
 
 ```bash
-spice init <PROJECT_NAME>
+spice init my_spiceai_project
 ```
 
 This creates a spicepod.yaml file in your directory.
@@ -43,7 +43,7 @@ kind: Spicepod
 name: PROJECT_NAME
 ```
 
-**Step 3.** start the SpiceAI runtime
+**Step 3.** start the SpiceAI runtime:
 
 ```bash
 spice run
@@ -78,7 +78,7 @@ dependencies:
 - <SPICEPOD_PATH>
 ```
 
-**Step 5.** You can now query against the dataset using the SpiceAI SQL REPL. Enter the command below:
+**Step 5.** You can now query against the dataset using the SpiceAI SQL REPL. Enter the command below to start the REPL:
 
 ```bash
 spice sql
@@ -106,6 +106,8 @@ sql> show tables;
 | datafusion    | information_schema | columns         | VIEW       |
 | datafusion    | information_schema | df_settings     | VIEW       |
 +---------------+--------------------+-----------------+------------+
+
+Query took: 0.007368789 seconds
 ```
 
 You can enter custom queries:
@@ -122,6 +124,8 @@ TODO: ADD VIDEO SHOWING HOW TO RUN THE ABOVE STEPS HERE.
 You can use any number of predefined datasets available from Spice.ai in the SpiceAI Runtime. You can also import your own datasets hosted in Dremio (and Postgres).
 
 A list of publically available datasets from Spice.ai can be found here: https://docs.spice.ai/building-blocks/datasets.
+
+For this demonstration, we will be using the Spice.ai/eth.recent_transactions dataset.
 
 In order access these datasets, you will first need to create an account with Spice.ai by selecting the free tier membership.
 
@@ -147,11 +151,17 @@ You will now be able to access datasets from Spice.ai.
 spice login
 ```
 
-**Step 2.** Initialize a new project and name it. We will call it "spice-demo" here.
+**Step 2.** Initialize a new project if you haven't already done so. Then, start the runtime:
 
 ```bash
-spice init spice-demo
+spice init my_spiceai_project
 ```
+
+```bash
+spice run
+```
+
+**Step 3.** Configure the dataset:
 
 ```bash
 spice dataset configure
@@ -166,10 +176,10 @@ Enter the location of the dataset:
 Select `y` when prompted whether you want to accelerate the data:
 `Locally accelerate this dataset (y/n)? y`
 
-**Step 3.** Start the SpiceAI Runtime.
+You should see the following outpout from your runtime terminal:
 
-```bash
-spice run
+```
+2024-02-21T22:49:10.038461Z  INFO runtime: Loaded dataset: eth_recent_transactions
 ```
 
 **Step 4.** In a new terminal window, use the SpiceAI SQL RPL to query the dataset
@@ -179,10 +189,26 @@ spice sql
 ```
 
 ```bash
-sql> SELECT * FROM spice-demo LIMIT 5;
+sql> SELECT block_number FROM eth_recent_transactions LIMIT 5;
 ```
 
-You can experiment with the time it takes to generate queries when using non-accelerated datasets. You can change the acceleration setting from `true` to `false` in the datasets.yaml file. Note that you will need to restart the runtime in order for the change to take effect.
+You should see the following output:
+
+```bash
++--------------+
+| block_number |
++--------------+
+| 19279103     |
+| 19279103     |
+| 19279103     |
+| 19279103     |
+| 19279103     |
++--------------+
+
+Query took: 0.004165246 seconds
+```
+
+You can experiment with the time it takes to generate queries when using non-accelerated datasets. You can change the acceleration setting from `true` to `false` in the datasets.yaml file.
 
 ## Importing dataset from Dremio (using dummie login credentials)
 
