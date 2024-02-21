@@ -27,7 +27,7 @@ Highlight three use cases.
 curl https://install.spiceai.org | /bin/bash
 ```
 
-**Step 2** Initialize a new project
+**Step 2** Choose a project name and initialize a new project
 
 ```bash
 spice init <PROJECT_NAME>
@@ -76,7 +76,7 @@ dependencies:
 - <SPICEPOD_PATH>
 ```
 
-**Step 5** You can now query against the dataset using the spice sql tool:
+**Step 5** You can now query against the dataset using the SpiceAI SQL REPL. Enter the command below:
 
 ```bash
 spice sql
@@ -158,9 +158,69 @@ Enter the location of the dataset:
 Select `y` when prompted whether you want to accelerate the data:
 `Locally accelerate this dataset (y/n)? y`
 
+**Step 5** Start the SpiceAI Runtime.
+
+```bash
+spice run
+```
+
+**Step 6** In a new terminal window, use the SpiceAI SQL RPL to query the dataset
+
+```bash
+spice sql
+```
+
+```bash
+sql> SELECT * FROM eth_recent_transactions LIMIT 5;
+```
+
 ## Importing dataset from dremio using dummie login credentials
 
-TODO: Use `spice dataset configure` for a Dremio dataset.
+**Step 1** Log in to dremio. You can use the following credentials to access the taxi_trips dataset
+
+```bash
+spice login dremio -u <USERNAME> -p <PASSWORD>
+```
+
+**Step2** We now configure the dataset:
+
+```bash
+spice dataset configure
+```
+
+We will now be prompted for the name. Enter "taxi_trips"
+
+```bash
+What is the dataset name? taxi_trips
+```
+
+TODO: Update the location of the dataset.
+Specify the location of the dataset as "dremio/datasets.taxi_trips"
+
+```bash
+Where is your dataset located? dremio/datasets.taxi_trips
+```
+
+Select "y" when prompted whether to locally accelerate the dataset:
+
+```bash
+Locally accelerate this dataset (y/n)? y
+```
+
+We should now see the following output:
+
+```
+Dataset settings written to `datasets/taxi_trips/dataset.yaml`!
+```
+
+If our login credentials were entered correctly, the taxi_trips datasets has been loaded into the runtime. You should see the following in the SpiceAI runtime terminal :
+
+```
+2024-02-14T18:34:15.174564Z  INFO spiced: Loaded dataset: taxi_trips
+2024-02-14T18:34:15.175189Z  INFO runtime::datasource: Refreshing data for taxi_trips
+```
+
+**Step3** Run queries against the dataset using the SpiceAI SQL REPL.
 
 ## Sample project using the SpiceAI runtime.
 
