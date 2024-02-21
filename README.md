@@ -171,14 +171,20 @@ You will be prompted to enter a name. Enter a name that represents the contents 
 `What is the dataset name? eth_recent_transactions`
 
 Enter the location of the dataset:
-`Where is your dataset located? spice.ai/eth.recent_transactions`
+
+```bash
+Where is your dataset located? spice.ai/eth.recent_transactions
+```
 
 Select `y` when prompted whether you want to accelerate the data:
-`Locally accelerate this dataset (y/n)? y`
+
+```bash
+Locally accelerate this dataset (y/n)? y
+```
 
 You should see the following outpout from your runtime terminal:
 
-```
+```bash
 2024-02-21T22:49:10.038461Z  INFO runtime: Loaded dataset: eth_recent_transactions
 ```
 
