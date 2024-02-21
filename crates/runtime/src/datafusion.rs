@@ -133,9 +133,9 @@ impl DataFusion {
 
         let data_backend: Box<dyn DataPublisher> =
             DataBackendBuilder::new(Arc::clone(&self.ctx), table_name)
-                .with_engine(acceleration.engine())
-                .with_mode(acceleration.mode())
-                .with_params(params)
+                .engine(acceleration.engine())
+                .mode(acceleration.mode())
+                .params(params)
                 .build()
                 .context(DatasetConfigurationSnafu)?;
 
