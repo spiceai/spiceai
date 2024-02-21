@@ -76,7 +76,7 @@ type DatasetAndPublishers = (Arc<Dataset>, PublisherList);
 
 pub struct DataFusion {
     pub ctx: Arc<SessionContext>,
-    tasks: HashMap<String, task::JoinHandle<()>>,
+    connectors_tasks: HashMap<String, task::JoinHandle<()>>,
     data_publishers: HashMap<String, DatasetAndPublishers>,
 }
 
@@ -89,7 +89,7 @@ impl DataFusion {
             ctx: Arc::new(SessionContext::new_with_config(
                 SessionConfig::new().with_information_schema(true),
             )),
-            tasks: HashMap::new(),
+            connectors_tasks: HashMap::new(),
             data_publishers: HashMap::new(),
         }
     }
@@ -199,7 +199,7 @@ impl DataFusion {
             }
         });
 
-        self.tasks.insert(table_name, task_handle);
+        self.connectors_tasks.insert(table_name, task_handle);
 
         Ok(())
     }
@@ -222,8 +222,8 @@ impl DataFusion {
             .fail();
         }
 
-        if self.tasks.contains_key(dataset_name) {
-            if let Some(data_connector_stream) = self.tasks.remove(dataset_name) {
+        if self.connectors_tasks.contains_key(dataset_name) {
+            if let Some(data_connector_stream) = self.connectors_tasks.remove(dataset_name) {
                 data_connector_stream.abort();
             }
         }
@@ -373,11 +373,11 @@ impl DataFusion {
 
 impl Drop for DataFusion {
     fn drop(&mut self) {
-        for task in self.tasks.values() {
+        for task in self.connectors_tasks.values() {
             task.abort();
         }
 
-        self.tasks.clear();
+        self.connectors_tasks.clear();
     }
 }
 
