@@ -84,7 +84,7 @@ Welcome to the interactive Spice.ai SQL Query Utility! Type 'help' for help.
 show tables; -- list available tables
 ```
 
-Entering `show tables;` should print out the following table:
+Entering `show tables;` should print out the following table along with the time it took to generate the query:
 TODO: REPLACE TABLE WITH TABLE FROM THE DATASET IN THE PUBLIC SPICEPOD
 
 ```
