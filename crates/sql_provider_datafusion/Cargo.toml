@@ -18,7 +18,6 @@ r2d2.workspace = true
 snafu.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-spicepod = { path = "../spicepod" }
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
