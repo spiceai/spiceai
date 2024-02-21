@@ -101,11 +101,7 @@ spice run
 
 ### VSCode Configuration
 
-Configuring VSCode to automatically apply the rustfmt style on save.
-
-Also configure VSCode to us the same Clippy rules we enforce in CI as the default.
-
-Add the following in your User Settings JSON file:
+To configure VSCode to automatically apply the rustfmt style on save and to use the same Clippy rules we enforce in our CI as the default, add the following in your User Settings JSON file:
 
 ```json
   "[rust]": {
@@ -116,5 +112,13 @@ Add the following in your User Settings JSON file:
   "rust-analyzer.check.features": "all",
   "rust-analyzer.check.extraArgs": ["--", "-Dclippy::pedantic", "-Dclippy::unwrap_used", "-Dclippy::expect_used"]
 ```
+
+By default, `rust-analyzer` will attempt to rebuild all dependencies when a change is made to a `cargo.toml` file. To prevent this and only rebuild what has changed, add the following in your User Settings JSON file, setting the value to your architecture:
+
+```json
+   "rust-analyzer.cargo.target": "aarch64-apple-darwin",
+```
+
+To see all valid values use `rustc --print target-list`.
 
 **Thank You!** - Your contributions to open source, large or small, make projects like this possible. Thank you for taking the time to contribute.

@@ -38,7 +38,7 @@ tract-onnx = "0.21.0"
 ndarray = "0.15.3"
 ndarray-npy = { version = "0.8.0", features = [ "compressed_npz" ] }
 duckdb = { workspace = true,  features = ["bundled", "r2d2", "vtab", "vtab-arrow"], optional = true }
-duckdb_datafusion = { path = "../duckdb_datafusion", optional = true }
+sql_provider_datafusion = { path = "../sql_provider_datafusion", optional = true }
 r2d2 = { workspace = true, optional = true }
 opentelemetry-proto = { version = "0.4.0", features = ["gen-tonic-messages", "gen-tonic", "metrics"] }
 indexmap = "2.2.2"
@@ -51,4 +51,4 @@ async-trait.workspace = true
 [features]
 default = ["duckdb"]
 dev = []
-duckdb = ["dep:duckdb", "duckdb_datafusion", "r2d2"]
+duckdb = ["dep:duckdb", "sql_provider_datafusion", "r2d2"]

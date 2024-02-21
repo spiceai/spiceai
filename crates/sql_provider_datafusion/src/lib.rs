@@ -1,7 +1,7 @@
 #![allow(clippy::missing_errors_doc)]
 
 use async_trait::async_trait;
-use duckdb::DuckdbConnectionManager;
+use dbconnectionpool::DbConnectionPool;
 use snafu::prelude::*;
 use std::{any::Any, fmt, sync::Arc};
 
@@ -16,18 +16,19 @@ use datafusion::{
         memory::MemoryStream, project_schema, DisplayAs, DisplayFormatType, ExecutionPlan,
         SendableRecordBatchStream,
     },
-    sql::TableReference,
 };
 
+pub mod dbconnection;
+pub mod dbconnectionpool;
 mod expr;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to get a DuckDB connection from the pool: {source}"))]
-    UnableToGetConnectionFromPool { source: r2d2::Error },
+    #[snafu(display("Unable to get a DB connection from the pool: {source}"))]
+    UnableToGetConnectionFromPool { source: dbconnectionpool::Error },
 
-    #[snafu(display("Unable to query DuckDB: {source}"))]
-    UnableToQueryDuckDB { source: duckdb::Error },
+    #[snafu(display("Unable to query DB connection: {source}"))]
+    UnableToQueryDbConnection { source: dbconnection::Error },
 
     #[snafu(display("Unable to generate SQL: {source}"))]
     UnableToGenerateSQL { source: expr::Error },
@@ -35,19 +36,22 @@ pub enum Error {
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
-pub struct DuckDBTable {
-    pool: Arc<r2d2::Pool<DuckdbConnectionManager>>,
+pub struct SqlTable<T: r2d2::ManageConnection, P: 'static> {
+    pool: Arc<dyn DbConnectionPool<T, P> + Send + Sync>,
     schema: SchemaRef,
     table_reference: OwnedTableReference,
 }
 
-impl DuckDBTable {
+impl<T: r2d2::ManageConnection, P> SqlTable<T, P> {
     pub fn new(
-        pool: &Arc<r2d2::Pool<DuckdbConnectionManager>>,
+        pool: &Arc<dyn DbConnectionPool<T, P> + Send + Sync>,
         table_reference: impl Into<OwnedTableReference>,
     ) -> Result<Self> {
         let table_reference = table_reference.into();
-        let schema = Self::get_schema(pool, &table_reference)?;
+        let mut conn = pool.connect().context(UnableToGetConnectionFromPoolSnafu)?;
+        let schema = conn
+            .get_schema(&table_reference)
+            .context(UnableToQueryDbConnectionSnafu)?;
         Ok(Self {
             pool: Arc::clone(pool),
             schema,
@@ -56,7 +60,7 @@ impl DuckDBTable {
     }
 
     pub fn new_with_schema(
-        pool: &Arc<r2d2::Pool<DuckdbConnectionManager>>,
+        pool: &Arc<dyn DbConnectionPool<T, P> + Send + Sync>,
         schema: impl Into<SchemaRef>,
         table_reference: impl Into<OwnedTableReference>,
     ) -> Self {
@@ -67,21 +71,6 @@ impl DuckDBTable {
         }
     }
 
-    pub fn get_schema<'a>(
-        pool: &Arc<r2d2::Pool<DuckdbConnectionManager>>,
-        table_reference: impl Into<TableReference<'a>>,
-    ) -> Result<SchemaRef> {
-        let table_reference = table_reference.into();
-        let conn = pool.get().context(UnableToGetConnectionFromPoolSnafu)?;
-        let mut stmt = conn
-            .prepare(&format!("SELECT * FROM {table_reference} LIMIT 0"))
-            .context(UnableToQueryDuckDBSnafu)?;
-
-        let result: duckdb::Arrow<'_> = stmt.query_arrow([]).context(UnableToQueryDuckDBSnafu)?;
-
-        Ok(result.get_schema())
-    }
-
     fn create_physical_plan(
         &self,
         projections: Option<&Vec<usize>>,
@@ -89,7 +78,7 @@ impl DuckDBTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(DuckDBExec::new(
+        Ok(Arc::new(SqlExec::new(
             projections,
             schema,
             &self.table_reference,
@@ -101,7 +90,7 @@ impl DuckDBTable {
 }
 
 #[async_trait]
-impl TableProvider for DuckDBTable {
+impl<T: r2d2::ManageConnection, P> TableProvider for SqlTable<T, P> {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -141,20 +130,20 @@ impl TableProvider for DuckDBTable {
 }
 
 #[derive(Clone)]
-struct DuckDBExec {
+struct SqlExec<T, P> {
     projected_schema: SchemaRef,
     table_reference: OwnedTableReference,
-    pool: Arc<r2d2::Pool<DuckdbConnectionManager>>,
+    pool: Arc<dyn DbConnectionPool<T, P> + Send + Sync>,
     filters: Vec<Expr>,
     limit: Option<usize>,
 }
 
-impl DuckDBExec {
+impl<T: r2d2::ManageConnection, P> SqlExec<T, P> {
     fn new(
         projections: Option<&Vec<usize>>,
         schema: &SchemaRef,
         table_reference: &OwnedTableReference,
-        pool: Arc<r2d2::Pool<DuckdbConnectionManager>>,
+        pool: Arc<dyn DbConnectionPool<T, P> + Send + Sync>,
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Self> {
@@ -201,21 +190,21 @@ impl DuckDBExec {
     }
 }
 
-impl std::fmt::Debug for DuckDBExec {
+impl<T: r2d2::ManageConnection, P> std::fmt::Debug for SqlExec<T, P> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         let sql = self.sql().unwrap_or_default();
-        write!(f, "DuckDBExec sql={sql}")
+        write!(f, "SqlExec sql={sql}")
     }
 }
 
-impl DisplayAs for DuckDBExec {
+impl<T: r2d2::ManageConnection, P> DisplayAs for SqlExec<T, P> {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> std::fmt::Result {
         let sql = self.sql().unwrap_or_default();
-        write!(f, "DuckDB sql={sql}")
+        write!(f, "SqlExec sql={sql}")
     }
 }
 
-impl ExecutionPlan for DuckDBExec {
+impl<T: r2d2::ManageConnection, P: 'static> ExecutionPlan for SqlExec<T, P> {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -248,22 +237,19 @@ impl ExecutionPlan for DuckDBExec {
         _partition: usize,
         _context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-        let conn = self.pool.get().map_err(to_execution_error)?;
+        let mut conn = self.pool.connect().map_err(to_execution_error)?;
 
         let sql = self.sql().map_err(to_execution_error)?;
-        tracing::debug!("duckdb sql: {sql}");
+        tracing::debug!("SqlExec sql: {sql}");
 
-        let mut stmt = conn.prepare(&sql).map_err(to_execution_error)?;
-
-        let result: duckdb::Arrow<'_> = stmt.query_arrow([]).map_err(to_execution_error)?;
-        let recs = result.collect::<Vec<_>>();
+        let recs = conn.query_arrow(&sql, &[]).map_err(to_execution_error)?;
 
         Ok(Box::pin(MemoryStream::try_new(recs, self.schema(), None)?))
     }
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn to_execution_error(e: impl Into<Box<dyn std::error::Error>>) -> DataFusionError {
+fn to_execution_error(e: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> DataFusionError {
     DataFusionError::Execution(format!("{}", e.into()).to_string())
 }
 
@@ -272,10 +258,14 @@ mod tests {
     use std::{error::Error, sync::Arc};
 
     use datafusion::execution::context::SessionContext;
-    use duckdb::DuckdbConnectionManager;
+    use duckdb::{DuckdbConnectionManager, ToSql};
     use tracing::{level_filters::LevelFilter, subscriber::DefaultGuard, Dispatch};
 
-    use crate::DuckDBTable;
+    use crate::{
+        dbconnection::duckdbconn::DuckDbConnection,
+        dbconnectionpool::{duckdbpool::DuckDbConnectionPool, DbConnectionPool, Mode},
+        SqlTable,
+    };
 
     fn setup_tracing() -> DefaultGuard {
         let subscriber: tracing_subscriber::FmtSubscriber = tracing_subscriber::fmt()
@@ -287,16 +277,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_duckdb_table() -> Result<(), Box<dyn Error>> {
+    async fn test_duckdb_table() -> Result<(), Box<dyn Error + Send + Sync>> {
         let t = setup_tracing();
         let ctx = SessionContext::new();
-        let conn = DuckdbConnectionManager::memory()?;
-        let pool = Arc::new(r2d2::Pool::new(conn)?);
-        let db_conn = pool.get()?;
-        db_conn.execute_batch(
+        let pool: Arc<dyn DbConnectionPool<DuckdbConnectionManager, &dyn ToSql> + Send + Sync> =
+            Arc::new(DuckDbConnectionPool::new(
+                "test",
+                Mode::Memory,
+                Arc::new(Option::None),
+            )?);
+        let conn = pool.connect()?;
+        let db_conn = conn
+            .as_any()
+            .downcast_ref::<DuckDbConnection>()
+            .expect("Unable to downcast to DuckDbConnection");
+        db_conn.conn.execute_batch(
             "CREATE TABLE test (a INTEGER, b VARCHAR); INSERT INTO test VALUES (3, 'bar');",
         )?;
-        let duckdb_table = DuckDBTable::new(&pool, "test")?;
+        let duckdb_table = SqlTable::new(&pool, "test")?;
         ctx.register_table("test_datafusion", Arc::new(duckdb_table))?;
         let sql = "SELECT * FROM test_datafusion limit 1";
         let df = ctx.sql(sql).await?;
@@ -306,16 +304,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_duckdb_table_filter() -> Result<(), Box<dyn Error>> {
+    async fn test_duckdb_table_filter() -> Result<(), Box<dyn Error + Send + Sync>> {
         let t = setup_tracing();
         let ctx = SessionContext::new();
-        let conn = DuckdbConnectionManager::memory()?;
-        let pool = Arc::new(r2d2::Pool::new(conn)?);
-        let db_conn = pool.get()?;
-        db_conn.execute_batch(
+        let pool: Arc<dyn DbConnectionPool<DuckdbConnectionManager, &dyn ToSql> + Send + Sync> =
+            Arc::new(DuckDbConnectionPool::new(
+                "test",
+                Mode::Memory,
+                Arc::new(Option::None),
+            )?);
+        let conn = pool.connect()?;
+        let db_conn = conn
+            .as_any()
+            .downcast_ref::<DuckDbConnection>()
+            .expect("Unable to downcast to DuckDbConnection");
+        db_conn.conn.execute_batch(
             "CREATE TABLE test (a INTEGER, b VARCHAR); INSERT INTO test VALUES (3, 'bar');",
         )?;
-        let duckdb_table = DuckDBTable::new(&pool, "test")?;
+        let duckdb_table = SqlTable::new(&pool, "test")?;
         ctx.register_table("test_datafusion", Arc::new(duckdb_table))?;
         let sql = "SELECT * FROM test_datafusion where a > 1 and b = 'bar' limit 1";
         let df = ctx.sql(sql).await?;

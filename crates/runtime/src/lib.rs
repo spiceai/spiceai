@@ -132,11 +132,6 @@ impl Runtime {
 
         tokio::spawn(async move {
             loop {
-                if ds.acceleration.is_none() && !ds.is_view() {
-                    tracing::warn!("No acceleration specified for dataset: {}", ds.name);
-                    break;
-                };
-
                 let auth = shared_auth.read().await;
 
                 let source = ds.source();
@@ -157,6 +152,14 @@ impl Runtime {
                             continue;
                         }
                     };
+
+                if ds.acceleration.is_none()
+                    && !ds.is_view()
+                    && !has_table_provider(&data_connector)
+                {
+                    tracing::warn!("No acceleration specified for dataset: {}", ds.name);
+                    break;
+                };
 
                 match Runtime::initialize_dataconnector(
                     data_connector,
@@ -313,6 +316,24 @@ impl Runtime {
         }
     }
 
+    pub async fn remove_model(&self, m: &SpicepodModel) {
+        let mut model_map = self.models.write().await;
+        if !model_map.contains_key(&m.name) {
+            tracing::warn!(
+                "Unable to unload runnable model {}: model not found",
+                m.name,
+            );
+            return;
+        }
+        model_map.remove(&m.name);
+        tracing::info!("Model [{}] has been unloaded", m.name);
+    }
+
+    pub async fn update_model(&self, m: &SpicepodModel) {
+        self.remove_model(m).await;
+        self.load_model(m).await;
+    }
+
     pub async fn start_servers(&mut self) -> Result<()> {
         let http_server_future = http::start(
             self.config.http_bind_address,
@@ -345,6 +366,10 @@ impl Runtime {
             if let Some(app) = &self.app {
                 let mut current_app = app.write().await;
 
+                if *current_app == new_app {
+                    continue;
+                }
+
                 tracing::debug!("Updated pods information: {:?}", new_app);
                 tracing::debug!("Previous pods information: {:?}", current_app);
 
@@ -356,18 +381,37 @@ impl Runtime {
                     }
                 }
 
+                // check for new and updated models
                 for model in &new_app.models {
-                    if !current_app.models.iter().any(|m| m.name == model.name) {
+                    if let Some(current_model) =
+                        current_app.models.iter().find(|m| m.name == model.name)
+                    {
+                        if current_model != model {
+                            self.update_model(model).await;
+                        }
+                    } else {
                         self.load_model(model).await;
+                }
+
+                // Remove models that are no longer in the app
+                for model in &current_app.models {
+                    if !new_app.models.iter().any(|m| m.name == model.name) {
+                        self.remove_model(model).await;
                     }
                 }
 
                 *current_app = new_app;
-            }
         }
 
         Ok(())
     }
+}
+
+fn has_table_provider(data_connector: &Option<Box<dyn DataConnector + Send>>) -> bool {
+    data_connector.is_some()
+        && data_connector
+            .as_ref()
+            .is_some_and(|dc| dc.get_table_provider().is_some())
 }
 
 pub fn load_auth_providers() -> auth::AuthProviders {

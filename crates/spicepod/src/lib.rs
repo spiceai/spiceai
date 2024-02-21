@@ -27,7 +27,7 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct Spicepod {
     pub name: String,
 
