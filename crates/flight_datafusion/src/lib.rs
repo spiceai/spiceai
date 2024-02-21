@@ -5,7 +5,7 @@ use flight_client::FlightClient;
 use futures::StreamExt;
 use snafu::prelude::*;
 use std::{any::Any, fmt, sync::Arc};
-use tokio::runtime::Runtime;
+use tokio::runtime::Handle;
 
 use datafusion::{
     arrow::datatypes::SchemaRef,
@@ -76,26 +76,25 @@ impl FlightSQLTable {
         client: FlightClient,
         table_reference: impl Into<TableReference<'a>>,
     ) -> Result<SchemaRef> {
-        let tokio_runtime = match Runtime::new() {
-            Ok(runtime) => runtime,
-            Err(_) => {
-                return Err(Error::Tokio {});
-            }
-        };
+        tokio::task::block_in_place(move || {
+            Handle::current().block_on(async {
+                let flight_record_batch_stream_result = client
+                    .clone()
+                    .query(format!("SELECT * FROM {} limit 1", table_reference.into()).as_str())
+                    .await;
 
-        tokio_runtime.block_on(async {
-            let flight_record_batch_stream_result = client
-                .clone()
-                .query(format!("SELECT * FROM {} limit 0", table_reference.into()).as_str())
-                .await;
-
-            match flight_record_batch_stream_result {
-                Ok(stream) => Ok(Arc::clone(stream.schema().unwrap())),
-                Err(error) => {
-                    tracing::error!("Failed to query with flight client: {:?}", error);
-                    todo!()
+                match flight_record_batch_stream_result {
+                    Ok(mut stream) => {
+                        stream.next().await;
+                        let schema = stream.schema();
+                        Ok(Arc::clone(schema.unwrap()))
+                    }
+                    Err(error) => {
+                        tracing::error!("Failed to query with flight client: {:?}", error);
+                        todo!()
+                    }
                 }
-            }
+            })
         })
     }
 
@@ -221,14 +220,14 @@ impl FlightSQLExec {
 impl std::fmt::Debug for FlightSQLExec {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         let sql = self.sql().unwrap_or_default();
-        write!(f, "DuckDBExec sql={sql}")
+        write!(f, "FlightSQLExec sql={sql}")
     }
 }
 
 impl DisplayAs for FlightSQLExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> std::fmt::Result {
         let sql = self.sql().unwrap_or_default();
-        write!(f, "DuckDB sql={sql}")
+        write!(f, "FlightSQL sql={sql}")
     }
 }
 
@@ -265,43 +264,40 @@ impl ExecutionPlan for FlightSQLExec {
         _partition: usize,
         _context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-        let tokio_runtime = match Runtime::new() {
-            Ok(runtime) => runtime,
-            Err(_) => {
-                return Err(to_execution_error(Error::Tokio {}));
-            }
-        };
-
         let sql = self.sql().map_err(to_execution_error);
         let Ok(sql) = sql else {
             return Err(to_execution_error(sql.unwrap_err()));
         };
 
-        let data = tokio_runtime.block_on(async {
-            let result = self.client.clone().query(sql.as_str()).await;
+        tracing::info!("Executing SQL: {sql}");
 
-            let mut flight_record_batch_stream = match result {
-                Ok(stream) => stream,
-                Err(error) => {
-                    tracing::error!("Failed to query with flight client: {:?}", error);
-                    return Err(to_execution_error(error));
-                }
-            };
+        let data = tokio::task::block_in_place(move || {
+            Handle::current().block_on(async {
+                let result = self.client.clone().query(sql.as_str()).await;
 
-            let mut result_data = vec![];
-            while let Some(batch) = flight_record_batch_stream.next().await {
-                match batch {
-                    Ok(batch) => {
-                        result_data.push(batch);
-                    }
+                let mut flight_record_batch_stream = match result {
+                    Ok(stream) => stream,
                     Err(error) => {
-                        tracing::error!("Failed to read batch from flight client: {:?}", error);
+                        tracing::error!("Failed to query with flight client: {:?}", error);
                         return Err(to_execution_error(error));
                     }
                 };
-            }
 
-            Ok(result_data)
+                let mut result_data = vec![];
+                while let Some(batch) = flight_record_batch_stream.next().await {
+                    match batch {
+                        Ok(batch) => {
+                            result_data.push(batch);
+                        }
+                        Err(error) => {
+                            tracing::error!("Failed to read batch from flight client: {:?}", error);
+                            return Err(to_execution_error(error));
+                        }
+                    };
+                }
+
+                Ok(result_data)
+            })
         });
 
         Ok(Box::pin(MemoryStream::try_new(

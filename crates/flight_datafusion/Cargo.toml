@@ -20,6 +20,3 @@ snafu.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 flight_client = { path = "../flight_client" }
-
-[dev-dependencies]
-tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
