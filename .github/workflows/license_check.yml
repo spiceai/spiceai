@@ -38,7 +38,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Check licenses of 
+      - name: Check Rust Licenses
         run: make dep-licenses |& ${{ env.FORBIDDEN_LICENSE_CHECK }}
 
   license-check-go:
