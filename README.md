@@ -174,7 +174,7 @@ spice sql
 sql> SELECT * FROM eth_recent_transactions LIMIT 5;
 ```
 
-## Importing dataset from dremio using dummie login credentials
+## Importing dataset from Dremio (using dummie login credentials)
 
 **Step 1** Log in to dremio. You can use the following credentials to access the taxi_trips dataset
 
@@ -225,12 +225,15 @@ If our login credentials were entered correctly, the taxi_trips datasets has bee
 ## Sample project using the SpiceAI runtime.
 
 TODO: Make a simple app that showcases the data querying from the runtime.
+This should replace the Python script in the examples folder.
 
-#### This diagram should be accompanied by a summary or step by step explanation.
+Removing the runtime diagram.
+
+<!-- #### This diagram should be accompanied by a summary or step by step explanation.
 
 <p align="center">
   <img src="https://user-images.githubusercontent.com/80174/132382372-c32cc8b7-25f2-4f82-8f9f-e4778fb69254.png" width="600" />
-</p>
+</p> -->
 
 ### Upcoming Features
 
