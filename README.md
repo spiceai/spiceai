@@ -237,14 +237,6 @@ If our login credentials were entered correctly, the taxi_trips datasets has bee
 TODO: Make a simple app that showcases the data querying from the runtime.
 This should replace the Python script in the examples folder.
 
-Removing the runtime diagram.
-
-<!-- #### This diagram should be accompanied by a summary or step by step explanation.
-
-<p align="center">
-  <img src="https://user-images.githubusercontent.com/80174/132382372-c32cc8b7-25f2-4f82-8f9f-e4778fb69254.png" width="600" />
-</p> -->
-
 ### Upcoming Features
 
 🚀 See the [Roadmap to v1.0-stable](https://github.com/spiceai/spiceai/blob/rust/docs/RELEASE.md) for upcoming features.
@@ -253,9 +245,8 @@ Removing the runtime diagram.
 
 We greatly appreciate and value your support! You can help Spice.ai in a number of ways:
 
-- Build an app with Spice.ai and send us feedback and suggestions at [hey@spice.ai](mailto:hey@spice.ai) or on [Discord](https://discord.gg/kZnTfneP5u).
+- Build an app with Spice.ai and send us feedback and suggestions at [hey@spice.ai](mailto:hey@spice.ai) or on [Discord](https://discord.gg/kZnTfneP5u), [X] (https://twitter.com/SpiceAIHQ), or [LinkedIn](https://www.linkedin.com/company/74148478).
 - [File an issue](https://github.com/spiceai/spiceai/issues/new) if you see something not quite working correctly.
-  [X](https://twitter.com/SpiceAIHQ), and [LinkedIn](https://www.linkedin.com/company/74148478).
 - Join our team ([We’re hiring!](https://spice.ai/careers))
 - Contribute code or documentation to the project (see [CONTRIBUTING.md](CONTRIBUTING.md)).
 
