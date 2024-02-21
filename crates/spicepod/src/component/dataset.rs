@@ -236,6 +236,15 @@ pub mod acceleration {
     }
 }
 
+impl From<acceleration::Mode> for sql_provider_datafusion::dbconnectionpool::Mode {
+    fn from(m: acceleration::Mode) -> Self {
+        match m {
+            acceleration::Mode::File => sql_provider_datafusion::dbconnectionpool::Mode::File,
+            acceleration::Mode::Memory => sql_provider_datafusion::dbconnectionpool::Mode::Memory,
+        }
+    }
+}
+
 pub mod replication {
     use serde::{Deserialize, Serialize};
 
