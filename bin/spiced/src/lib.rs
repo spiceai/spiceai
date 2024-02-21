@@ -17,7 +17,7 @@ use tokio::sync::RwLock;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to construct spice app"))]
+    #[snafu(display("Unable to construct spice app: {source}"))]
     UnableToConstructSpiceApp { source: app::Error },
 
     #[snafu(display("Unable to start Spice Runtime servers"))]
@@ -74,7 +74,7 @@ pub async fn run(args: Args) -> Result<()> {
     let app = match App::new(current_dir.clone()).context(UnableToConstructSpiceAppSnafu) {
         Ok(app) => Some(Arc::new(RwLock::new(app))),
         Err(e) => {
-            tracing::error!("{:?}", e);
+            tracing::warn!("{}", e);
             None
         }
     };
