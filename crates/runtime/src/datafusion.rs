@@ -198,6 +198,31 @@ impl DataFusion {
         Ok(())
     }
 
+    pub fn attach_remote(
+        &self,
+        dataset: impl Borrow<Dataset>,
+        data_connector: &Box<dyn DataConnector + Send>,
+    ) -> Result<()> {
+        let dataset = dataset.borrow();
+        let table_exists = self.ctx.table_exist(dataset.name.as_str()).unwrap_or(false);
+        if table_exists {
+            return TableAlreadyExistsSnafu.fail();
+        }
+
+        // TODO, add spawn
+        let provider = data_connector.get_table_provider(dataset.clone());
+
+        match provider {
+            Ok(provider) => {
+                self
+                .ctx
+                .register_table(dataset.name.as_str(), Arc::clone(&provider));
+                Ok(())
+            }
+            Err(error) => Err(Error::UnableToCreateView { reason: "test".to_string() }),
+        }
+    }
+
     pub fn attach_view(&self, dataset: impl Borrow<Dataset>) -> Result<()> {
         let dataset = dataset.borrow();
         let table_exists = self.ctx.table_exist(dataset.name.as_str()).unwrap_or(false);

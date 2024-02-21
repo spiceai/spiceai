@@ -1474,6 +1474,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "flight_datafusion"
+version = "0.7.0-alpha"
+dependencies = [
+ "arrow",
+ "async-trait",
+ "datafusion",
+ "flight_client",
+ "futures",
+ "r2d2",
+ "snafu 0.8.0",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "flightpublisher"
 version = "0.7.0-alpha"
 dependencies = [
@@ -3459,6 +3475,7 @@ dependencies = [
  "duckdb",
  "duckdb_datafusion",
  "flight_client",
+ "flight_datafusion",
  "futures",
  "futures-core",
  "indexmap 2.2.3",

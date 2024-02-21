@@ -251,6 +251,13 @@ impl Runtime {
         }
 
         if let Some(data_connector) = data_connector {
+            if ds.acceleration.is_none() {
+                df.read()
+                    .await
+                    .attach_remote(ds, &data_connector)
+                    .context(UnableToAttachViewSnafu)?;
+            }
+
             let replicate = ds.replication.as_ref().map_or(false, |r| r.enabled);
 
             // Attach data publisher only if replicate is true and mode is ReadWrite
@@ -370,7 +377,7 @@ fn has_table_provider(data_connector: &Option<Box<dyn DataConnector + Send>>) ->
     data_connector.is_some()
         && data_connector
             .as_ref()
-            .is_some_and(|dc| dc.get_table_provider().is_some())
+            .is_some_and(|dc| dc.has_table_provider())
 }
 
 pub fn load_auth_providers() -> auth::AuthProviders {

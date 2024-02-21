@@ -27,6 +27,11 @@ pub enum Error {
     UnableToCreateDataConnector {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[snafu(display("Unable to get table provider: {source}"))]
+    UnableToGetTableProvider {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -73,8 +78,10 @@ pub trait DataConnector: Send + Sync {
         None
     }
 
-    fn get_table_provider(&self) -> Option<Box<dyn TableProvider>> {
-        None
+    fn has_table_provider(&self) -> bool;
+
+    fn get_table_provider(&self, dataset: Dataset) -> Result<Arc<dyn TableProvider>> {
+        panic!("get_table_provider not implemented for {}", dataset.name)
     }
 }
 

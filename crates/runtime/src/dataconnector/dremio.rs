@@ -49,4 +49,8 @@ impl DataConnector for Dremio {
 
         self.flight.get_all_data(&dremio_path)
     }
+
+    fn has_table_provider(&self) -> bool {
+        true
+    }
 }

@@ -12,6 +12,8 @@ use std::{collections::HashMap, future::Future};
 
 use spicepod::component::dataset::Dataset;
 
+use flight_datafusion::FlightSQLTable;
+
 use crate::auth::AuthProvider;
 use crate::datapublisher::{AddDataResult, DataPublisher};
 use crate::dataupdate::{DataUpdate, UpdateType};
@@ -27,6 +29,7 @@ pub enum Error {
 
     #[snafu(display("Unable to publish data to SpiceAI: {source}"))]
     UnableToPublishData { source: flight_client::Error },
+
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -125,6 +128,24 @@ impl DataConnector for SpiceAI {
 
     fn get_data_publisher(&self) -> Option<Box<dyn DataPublisher>> {
         Some(Box::new(self.clone()))
+    }
+
+    fn has_table_provider(&self) -> bool {
+        true
+    }
+
+    fn get_table_provider(
+        &self,
+        dataset: Dataset,
+    ) -> std::result::Result<Arc<dyn datafusion::datasource::TableProvider>, super::Error> {
+        let dataset_path = Self::spice_dataset_path(dataset);
+
+        let provider = FlightSQLTable::new(self.flight.client.clone(), dataset_path);
+
+        match provider {
+            Ok(provider) => Ok(Arc::new(provider)),
+            Err(error) => Err(super::Error::UnableToGetTableProvider { source: error.into() }),
+        }
     }
 }
 
