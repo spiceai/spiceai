@@ -1,3 +1,5 @@
+use std::any::Any;
+
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::sql::TableReference;
@@ -43,5 +45,13 @@ impl DbConnection<DuckdbConnectionManager, &dyn ToSql> for DuckDbConnection {
     fn execute(&mut self, sql: &str, params: &[&dyn ToSql]) -> Result<u64> {
         let rows_modified = self.conn.execute(sql, params).context(DuckDBSnafu)?;
         Ok(rows_modified as u64)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
 }
