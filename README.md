@@ -157,8 +157,8 @@ spice init spice-demo
 spice dataset configure
 ```
 
-You will be prompted to enter a name. Enter the same name you used when initializing the project in the previous step.
-`What is the dataset name? spice-demo`
+You will be prompted to enter a name. Enter a name that represents the contents of the dataset
+`What is the dataset name? eth_recent_transactions`
 
 Enter the location of the dataset:
 `Where is your dataset located? spice.ai/eth.recent_transactions`
