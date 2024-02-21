@@ -117,13 +117,19 @@ A list of publically available datasets from Spice.ai can be found here: https:/
 
 In order access these datasets, you will first need to create an account with Spice.ai by selecting the free tier membership.
 
-Navigate to `https://spice.ai/` and create a new account by clicking on Try for Free.
+Navigate to https://spice.ai/` and create a new account by clicking on Try for Free.
 
 <p align="center">
   <img src="spiceai_try_for_free.png" width="600" />
 </p>
 
-After creating an app, you will now have access to all the blockchain datasets from Spice.ai.
+After creating an account, you will need to create an app in order to create to an API key.
+
+<p align="center">
+  <img src="create_app.png" width="400" />
+</p>
+
+You will now be able to access datasets from Spice.ai.
 
 ## Importing a public dataset from SpiceAI
 
