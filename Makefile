@@ -39,7 +39,6 @@ docker-run:
 	docker stop spiceai && docker rm spiceai || true
 	docker run --name spiceai -p 3000:3000 -p 50051:50051 spiceai-rust:local-dev
 
-
 .PHONY: deps-licenses
 dep-licenses:
 	@cargo install cargo-license --quiet
@@ -49,6 +48,7 @@ dep-licenses:
 display-deps:
 	@cargo install cargo-license --quiet
 	@cargo license -d  --tsv --direct-deps-only
+
 
 ################################################################################
 # Target: install                                                              #
