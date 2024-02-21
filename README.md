@@ -29,7 +29,7 @@ https://go.dev/doc/install
 curl https://install.spiceai.org | /bin/bash
 ```
 
-**Step 2** Choose a project name and initialize a new project
+**Step 2.** Choose a project name and initialize a new project
 
 ```bash
 spice init <PROJECT_NAME>
@@ -43,7 +43,7 @@ kind: Spicepod
 name: PROJECT_NAME
 ```
 
-**Step 3** start the SpiceAI runtime
+**Step 3.** start the SpiceAI runtime
 
 ```bash
 spice run
@@ -59,7 +59,7 @@ Using latest 'local' runtime version.
 2024-02-21T06:11:56.382038Z  INFO runtime::opentelemetry: Spice Runtime OpenTelemetry listening on 127.0.0.1:50052
 ```
 
-**Step 4** Add a public pre-defined spicepod.
+**Step 4.** Add a public pre-defined spicepod.
 In a new terminal window, enter the following command:
 
 ```bash
@@ -78,7 +78,7 @@ dependencies:
 - <SPICEPOD_PATH>
 ```
 
-**Step 5** You can now query against the dataset using the SpiceAI SQL REPL. Enter the command below:
+**Step 5.** You can now query against the dataset using the SpiceAI SQL REPL. Enter the command below:
 
 ```bash
 spice sql
@@ -166,13 +166,13 @@ Enter the location of the dataset:
 Select `y` when prompted whether you want to accelerate the data:
 `Locally accelerate this dataset (y/n)? y`
 
-**Step 3** Start the SpiceAI Runtime.
+**Step 3.** Start the SpiceAI Runtime.
 
 ```bash
 spice run
 ```
 
-**Step 4** In a new terminal window, use the SpiceAI SQL RPL to query the dataset
+**Step 4.** In a new terminal window, use the SpiceAI SQL RPL to query the dataset
 
 ```bash
 spice sql
@@ -186,13 +186,13 @@ You can experiment with the time it takes to generate queries when using non-acc
 
 ## Importing dataset from Dremio (using dummie login credentials)
 
-**Step 1** Log in to dremio. You can use the following credentials to access the taxi_trips dataset
+**Step 1.** Log in to dremio. You can use the following credentials to access the taxi_trips dataset
 
 ```bash
 spice login dremio -u <USERNAME> -p <PASSWORD>
 ```
 
-**Step2** We now configure the dataset:
+**Step 2.** We now configure the dataset:
 
 ```bash
 spice dataset configure
@@ -230,7 +230,7 @@ If our login credentials were entered correctly, the taxi_trips datasets has bee
 2024-02-14T18:34:15.175189Z  INFO runtime::datasource: Refreshing data for taxi_trips
 ```
 
-**Step3** Run queries against the dataset using the SpiceAI SQL REPL.
+**Step 3.** Run queries against the dataset using the SpiceAI SQL REPL.
 
 ## Sample project using the SpiceAI runtime.
 
