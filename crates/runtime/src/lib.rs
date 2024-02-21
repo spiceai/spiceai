@@ -198,7 +198,7 @@ impl Runtime {
                         data_connector: source,
                     })?,
             ))),
-            "dremio" => Ok(Some(Box::new(
+            "dremio-cloud" => Ok(Some(Box::new(
                 dataconnector::dremio::Dremio::new(auth.get(source), params)
                     .await
                     .context(UnableToInitializeDataConnectorSnafu {
