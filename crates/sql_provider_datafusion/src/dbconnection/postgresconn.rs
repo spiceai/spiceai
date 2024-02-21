@@ -1,14 +1,21 @@
+use std::any::Any;
+
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::sql::TableReference;
 use postgres::types::ToSql;
 use r2d2_postgres::postgres::NoTls;
 use r2d2_postgres::PostgresConnectionManager;
-use snafu::ResultExt;
+use snafu::{prelude::*, ResultExt};
 
 use super::DbConnection;
-use super::PostgresSnafu;
 use super::Result;
+
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display("PostgresError: {source}"))]
+    PostgresError { source: postgres::Error },
+}
 
 #[allow(clippy::module_name_repetitions)]
 pub struct PostgresConnection {
@@ -36,6 +43,15 @@ impl DbConnection<PostgresConnectionManager<NoTls>, &(dyn ToSql + Sync)> for Pos
     }
 
     fn execute(&mut self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<u64> {
-        self.conn.execute(sql, params).context(PostgresSnafu)
+        let rows_modified = self.conn.execute(sql, params).context(PostgresSnafu)?;
+        Ok(rows_modified)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
 }
