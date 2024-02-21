@@ -7,17 +7,11 @@
 [![Subreddit subscribers](https://img.shields.io/reddit/subreddit-subscribers/spiceai?style=social)](https://www.reddit.com/r/spiceai)
 [![Follow on Twitter](https://img.shields.io/twitter/follow/spiceaihq.svg?style=social&logo=twitter)](https://twitter.com/intent/follow?screen_name=spiceaihq)
 
-**Spice.ai** is an open source runtime environment that enables developers to leverage rapid access to time-series data for building applications at the edge.
+## What is SpiceAI?
+
+**Spice.ai** is an open source runtime environment that enables developers to leverage rapid access to time-series data for data driven applications. The Spice AI Runtime enables the best in class high performance queries that can power an array of data driven applications.
 
 ⚠️ **DEVELOPER PREVIEW ONLY** Spice.ai is under active **alpha** stage development and is not intended to be used in production until its **1.0-stable** release.
-
-## Why Spice.ai? Use case section
-
-Highlight three use cases.
-
-1.  Front ends that need to be continuously updated
-2.  High performance queries for data applications.
-3.  Machine learning at the edge. Empowering edge devices to continuously improve inference
 
 ## Quick Start
 
