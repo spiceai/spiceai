@@ -1327,20 +1327,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "duckdb_datafusion"
-version = "0.7.0-alpha"
-dependencies = [
- "async-trait",
- "datafusion",
- "duckdb",
- "r2d2",
- "snafu 0.8.0",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "dyn-clone"
 version = "1.0.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3472,7 +3458,6 @@ dependencies = [
  "datafusion",
  "dirs",
  "duckdb",
- "duckdb_datafusion",
  "flight_client",
  "flight_datafusion",
  "futures",
@@ -3490,6 +3475,7 @@ dependencies = [
  "serde_json",
  "snafu 0.8.0",
  "spicepod",
+ "sql_provider_datafusion",
  "tokio",
  "tokio-stream",
  "toml",
@@ -3951,6 +3937,7 @@ dependencies = [
  "serde",
  "serde_yaml",
  "snafu 0.8.0",
+ "sql_provider_datafusion",
  "tracing",
 ]
 
@@ -3959,6 +3946,20 @@ name = "spin"
 version = "0.9.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
+
+[[package]]
+name = "sql_provider_datafusion"
+version = "0.7.0-alpha"
+dependencies = [
+ "async-trait",
+ "datafusion",
+ "duckdb",
+ "r2d2",
+ "snafu 0.8.0",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
 
 [[package]]
 name = "sqlparser"
