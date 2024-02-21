@@ -214,12 +214,13 @@ impl DataFusion {
 
         match provider {
             Ok(provider) => {
-                self
-                .ctx
-                .register_table(dataset.name.as_str(), Arc::clone(&provider));
+                self.ctx
+                    .register_table(dataset.name.as_str(), Arc::clone(&provider));
                 Ok(())
             }
-            Err(error) => Err(Error::UnableToCreateView { reason: "test".to_string() }),
+            Err(error) => Err(Error::UnableToCreateView {
+                reason: "test".to_string(),
+            }),
         }
     }
 

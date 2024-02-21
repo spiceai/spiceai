@@ -29,7 +29,6 @@ pub enum Error {
 
     #[snafu(display("Unable to publish data to SpiceAI: {source}"))]
     UnableToPublishData { source: flight_client::Error },
-
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -144,7 +143,9 @@ impl DataConnector for SpiceAI {
 
         match provider {
             Ok(provider) => Ok(Arc::new(provider)),
-            Err(error) => Err(super::Error::UnableToGetTableProvider { source: error.into() }),
+            Err(error) => Err(super::Error::UnableToGetTableProvider {
+                source: error.into(),
+            }),
         }
     }
 }
