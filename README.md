@@ -119,7 +119,7 @@ TODO: ADD VIDEO SHOWING HOW TO RUN THE ABOVE STEPS HERE.
 
 ## Next Steps
 
-You can use any number of predefined datasets available from Spice.ai in the SpiceAI Runtime. You can also import your own datasets hosted in Dremio (and Postgress).
+You can use any number of predefined datasets available from Spice.ai in the SpiceAI Runtime. You can also import your own datasets hosted in Dremio (and Postgres).
 
 A list of publically available datasets from Spice.ai can be found here: https://docs.spice.ai/building-blocks/datasets.
 
