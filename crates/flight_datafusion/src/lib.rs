@@ -188,7 +188,7 @@ impl FlightSQLExec {
             .projected_schema
             .fields()
             .iter()
-            .map(|f| f.name().as_str())
+            .map(|f| format!("\"{}\"", f.name()))
             .collect::<Vec<_>>()
             .join(", ");
 
