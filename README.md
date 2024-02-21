@@ -49,6 +49,76 @@ spice login
 spice init <PROJECT_NAME_HERE>
 ```
 
+**Step 5** Configure a new datasets. You can select from any publically available dataset listed in Spice.ai: https://docs.spice.ai/building-blocks/datasets
+
+For this example, we'll use eth.recent_logs.
+
+```bash
+spice dataset configure
+```
+
+You will be prompted to enter a name:
+`What is the dataset name? eth_recent_logs`
+
+Enter the location of the dataset:
+`Where is your dataset located? spice.ail/eth.recent_logs`
+
+Select `y` when prompted whether you want to accelerate the data:
+`Locally accelerate this dataset (y/n)? y`
+
+**Step 6** Start the SpiceAI Runtime
+
+```bash
+spice run
+```
+
+You should now see the following:
+
+```bash
+Spice.ai runtime starting...
+Using latest 'local' runtime version.
+2024-02-20T23:54:31.313288Z  INFO runtime::http: Spice Runtime HTTP listening on 127.0.0.1:3000
+2024-02-20T23:54:31.313347Z  INFO runtime::flight: Spice Runtime Flight listening on 127.0.0.1:50051
+2024-02-20T23:54:31.313532Z  INFO runtime::opentelemetry: Spice Runtime OpenTelemetry listening on 127.0.0.1:50052
+2024-02-20T23:54:32.208615Z  INFO runtime: Loaded dataset: eth_recent_logs
+2024-02-20T23:54:32.209376Z  INFO runtime::dataconnector: Refreshing data for eth_recent_logs
+```
+
+**Step 7** In a seperate terminal window, you can query against the dataset using the spice sql tool:
+
+```bash
+spice sql
+```
+
+You should now see:
+
+```bash
+Welcome to the interactive Spice.ai SQL Query Utility! Type 'help' for help.
+
+show tables; -- list available tables
+```
+
+Entering `show tables;` should print out the following table:
+
+```
+sql> show tables;
++---------------+--------------------+-----------------+------------+
+| table_catalog | table_schema       | table_name      | table_type |
++---------------+--------------------+-----------------+------------+
+| datafusion    | public             | eth_recent_logs | BASE TABLE |
+| datafusion    | information_schema | tables          | VIEW       |
+| datafusion    | information_schema | views           | VIEW       |
+| datafusion    | information_schema | columns         | VIEW       |
+| datafusion    | information_schema | df_settings     | VIEW       |
++---------------+--------------------+-----------------+------------+
+```
+
+You can enter custom queries:
+
+```bash
+sql> SELECT topics FROM eth_recent_logs LIMIT 5;
+```
+
 ### Run through a data demo step by step here. Include a video showing the steps
 
 ### Community-Driven Data Components
