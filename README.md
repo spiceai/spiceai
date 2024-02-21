@@ -19,10 +19,6 @@ Highlight three use cases.
 2.  High performance queries for data applications.
 3.  Machine learning at the edge. Empowering edge devices to continuously improve inference
 
----
-
-📺 View a getting started walkthrough of Spice.ai in action [here] TODO: NEW VIDEO HERE. Should showcase how to create a local spicepod form cloud database (Dremio, Postgress, etc).
-
 ## Quikc Start
 
 **Step 1.** Install the SpiceAI CLI:
@@ -30,41 +26,6 @@ Highlight three use cases.
 ```bash
 curl https://install.spiceai.org | /bin/bash
 ```
-
-**Step 2.** Navigate to `https://spice.ai/` and create a new account by clicking on Try for Free.
-
-<p align="center">
-  <img src="spiceai_try_for_free.png" width="600" />
-</p>
-
-**Step 3.** In a new empty directory, login and authenticate from the command line. A pop up browser window will prompt yuou to authenticate:
-
-```bash
-spice login
-```
-
-**Step 4.** Initiate a new project
-
-```bash
-spice init <PROJECT_NAME_HERE>
-```
-
-**Step 5** Configure a new datasets. You can select from any publically available dataset listed in Spice.ai: https://docs.spice.ai/building-blocks/datasets
-
-For this example, we'll use eth.recent_logs.
-
-```bash
-spice dataset configure
-```
-
-You will be prompted to enter a name:
-`What is the dataset name? eth_recent_logs`
-
-Enter the location of the dataset:
-`Where is your dataset located? spice.ail/eth.recent_logs`
-
-Select `y` when prompted whether you want to accelerate the data:
-`Locally accelerate this dataset (y/n)? y`
 
 **Step 6** Start the SpiceAI Runtime
 
@@ -123,11 +84,54 @@ TODO: ADD VIDEO SHOWING HOW TO RUN THE ABOVE STEPS HERE.
 
 ## Importing a predefined set of datasets using Spicepods
 
-TODO: Use `spice add <public_spicd_pod>
+TODO: Use `spice add <public_spicd_pod>`
+
+## Importing a public dataset from SpiceAI
+
+TODO: Use `spice dataset configure` for a web3 dataset from spiceAI.
+
+**Step 1** Configure a public datasets from spice.ai. You can select from any publically available dataset listed here: https://docs.spice.ai/building-blocks/datasets. We will use the eth.recent_logs dataset, but you can choose any available dataset from the list.
+
+In order access these datasets, you will first need to create an account.
+
+**Step 1.** Navigate to `https://spice.ai/` and create a new account by clicking on Try for Free.
+
+<p align="center">
+  <img src="spiceai_try_for_free.png" width="600" />
+</p>
+
+**Step 2.** In a new empty directory, login and authenticate from the command line. A pop up browser window will prompt you to authenticate:
+
+```bash
+spice login
+```
+
+**Step 3.** Initiate a new project
+
+```bash
+spice init <PROJECT_NAME_HERE>
+```
+
+```bash
+spice dataset configure
+```
+
+You will be prompted to enter a name:
+`What is the dataset name? eth_recent_logs`
+
+Enter the location of the dataset:
+`Where is your dataset located? spice.ail/eth.recent_logs`
+
+Select `y` when prompted whether you want to accelerate the data:
+`Locally accelerate this dataset (y/n)? y`
 
 ## Importing dataset from dremio using dummie login credentials
 
 TODO: Use `spice dataset configure` for a Dremio dataset.
+
+## Sample project using the SpiceAI runtime.
+
+TODO: Make a simple app that showcases the data querying from the runtime.
 
 #### This diagram should be accompanied by a summary or step by step explanation.
 
