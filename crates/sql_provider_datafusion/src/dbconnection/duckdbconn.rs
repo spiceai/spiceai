@@ -16,10 +16,7 @@ pub struct DuckDbConnection {
 }
 
 impl DbConnection<DuckdbConnectionManager, &dyn ToSql> for DuckDbConnection {
-    fn new(conn: r2d2::PooledConnection<DuckdbConnectionManager>) -> Self
-    where
-        Self: Sized,
-    {
+    fn new(conn: r2d2::PooledConnection<DuckdbConnectionManager>) -> Self {
         DuckDbConnection { conn }
     }
 
