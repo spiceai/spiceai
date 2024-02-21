@@ -174,6 +174,8 @@ spice sql
 sql> SELECT * FROM eth_recent_transactions LIMIT 5;
 ```
 
+You can experiment with the time it takes to generate queries when using non-accelerated datasets. You can change the acceleration setting from `true` to `false` in the datasets.yaml file. Note that you will need to restart the runtime in order for the change to take effect.
+
 ## Importing dataset from Dremio (using dummie login credentials)
 
 **Step 1** Log in to dremio. You can use the following credentials to access the taxi_trips dataset
