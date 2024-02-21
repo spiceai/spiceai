@@ -26,7 +26,7 @@ pub struct DataBackend;
 impl DataBackend {
     #[allow(clippy::needless_pass_by_value)]
     #[allow(clippy::new_ret_no_self)]
-    pub fn new(
+    pub async fn new(
         ctx: &Arc<SessionContext>,
         name: &str,
         engine: Engine,
@@ -44,6 +44,7 @@ impl DataBackend {
             #[cfg(feature = "duckdb")]
             Engine::DuckDB => Ok(Box::new(
                 DuckDBBackend::new(Arc::clone(ctx), name, mode.into(), params)
+                    .await
                     .boxed()
                     .context(BackendCreationFailedSnafu)?,
             )),

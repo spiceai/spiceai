@@ -1,12 +1,15 @@
 use std::any::Any;
+use std::sync::Arc;
 
-use datafusion::arrow::array::RecordBatch;
+use arrow_flight::sql::client::FlightSqlServiceClient;
 use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::execution::SendableRecordBatchStream;
 use datafusion::sql::TableReference;
 use postgres::types::ToSql;
 use r2d2_postgres::postgres::NoTls;
 use r2d2_postgres::PostgresConnectionManager;
 use snafu::{prelude::*, ResultExt};
+use tonic::transport::Channel;
 
 use super::DbConnection;
 use super::Result;
@@ -20,6 +23,19 @@ pub enum Error {
 #[allow(clippy::module_name_repetitions)]
 pub struct PostgresConnection {
     pub conn: r2d2::PooledConnection<PostgresConnectionManager<NoTls>>,
+    flight_sql_client: Option<Arc<FlightSqlServiceClient<Channel>>>,
+}
+
+impl PostgresConnection {
+    pub fn new(
+        conn: r2d2::PooledConnection<PostgresConnectionManager<NoTls>>,
+        flight_sql_client: Option<Arc<FlightSqlServiceClient<Channel>>>,
+    ) -> Self {
+        PostgresConnection {
+            conn,
+            flight_sql_client,
+        }
+    }
 }
 
 impl DbConnection<PostgresConnectionManager<NoTls>, &(dyn ToSql + Sync)> for PostgresConnection {
@@ -27,7 +43,10 @@ impl DbConnection<PostgresConnectionManager<NoTls>, &(dyn ToSql + Sync)> for Pos
     where
         Self: Sized,
     {
-        PostgresConnection { conn }
+        PostgresConnection {
+            conn,
+            flight_sql_client: None,
+        }
     }
 
     fn get_schema(&mut self, _table_reference: &TableReference) -> Result<SchemaRef> {
@@ -38,7 +57,7 @@ impl DbConnection<PostgresConnectionManager<NoTls>, &(dyn ToSql + Sync)> for Pos
         &mut self,
         _sql: &str,
         _params: &[&(dyn ToSql + Sync)],
-    ) -> Result<Vec<RecordBatch>> {
+    ) -> Result<SendableRecordBatchStream> {
         todo!()
     }
 

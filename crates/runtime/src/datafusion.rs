@@ -115,7 +115,7 @@ impl DataFusion {
     }
 
     #[allow(clippy::needless_pass_by_value)]
-    pub fn new_accelerated_backend(
+    pub async fn new_accelerated_backend(
         &self,
         dataset: impl Borrow<Dataset>,
     ) -> Result<Box<dyn DataPublisher>> {
@@ -138,6 +138,7 @@ impl DataFusion {
             acceleration.mode(),
             params,
         )
+        .await
         .context(DatasetConfigurationSnafu)?;
 
         Ok(data_backend)

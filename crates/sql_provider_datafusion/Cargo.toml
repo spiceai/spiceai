@@ -20,6 +20,12 @@ tokio.workspace = true
 tracing.workspace = true
 r2d2_postgres.workspace = true
 postgres.workspace = true
+arrow-flight = { workspace = true, features = ["flight-sql-experimental"] }
+tonic = { workspace = true, default-features = false, features = [
+  "transport",
+  "tls",
+  "tls-roots",
+] }
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
