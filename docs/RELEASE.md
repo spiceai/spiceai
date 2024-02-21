@@ -48,8 +48,4 @@ Create an endgame issue with the following content:
 
 ## Acknowledgements update
 
-- Run the `generate-acknowledgements` target and commit the result for each in:
-  - spiceai
-  - quickstarts
-  - samples
-  - data-components-contrib
+- Run the `generate-acknowledgements` target and commit the result
