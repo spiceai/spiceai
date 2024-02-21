@@ -17,10 +17,10 @@ The principles guiding this work are as follows:
 
 ### All errors use SNAFU functionality
 
-*Good*:
+_Good_:
 
-* Derives `Snafu` and `Debug` functionality
-* Has a useful, end-user-friendly display message
+- Derives `Snafu` and `Debug` functionality
+- Has a useful, end-user-friendly display message
 
 ```rust
 #[derive(Snafu, Debug)]
@@ -31,7 +31,7 @@ pub enum Error {
 }
 ```
 
-*Bad*:
+_Bad_:
 
 ```rust
 pub enum Error {
@@ -42,16 +42,16 @@ pub enum Error {
 
 ### Employing the `ensure!` macro for condition checking and error return
 
-*Good*:
+_Good_:
 
-* Resembles `assert!`
-* More concise
+- Resembles `assert!`
+- More concise
 
 ```rust
 ensure!(!self.schema_sample.is_empty(), NeedsAtLeastOneLine);
 ```
 
-*Bad*:
+_Bad_:
 
 ```rust
 if self.schema_sample.is_empty() {
@@ -61,10 +61,10 @@ if self.schema_sample.is_empty() {
 
 ### Define errors in their originating module
 
-*Good*:
+_Good_:
 
-* Grouping related error conditions with their generating code
-* Minimizing unnecessary `match` statements on irrelevant errors
+- Grouping related error conditions with their generating code
+- Minimizing unnecessary `match` statements on irrelevant errors
 
 ```rust
 #[derive(Debug, Snafu)]
@@ -78,7 +78,7 @@ ensure!(foo.has_cowbell(), NeedsMoreCowbell {
 })
 ```
 
-*Bad*:
+_Bad_:
 
 ```rust
 use crate::errors::NeedsMoreCowbell;
@@ -90,9 +90,9 @@ ensure!(foo.is_implemented(), NotImplemented {
 
 ### Establishing the `Result` type alias in each module
 
-*Good*:
+_Good_:
 
-* Reduces repetition
+- Reduces repetition
 
 ```rust
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -100,7 +100,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 fn foo() -> Result<bool> { true }
 ```
 
-*Bad*:
+_Bad_:
 
 ```rust
 ...
@@ -109,9 +109,9 @@ fn foo() -> Result<bool, Error> { true }
 
 ### Utilize `context` to encapsulate underlying errors into module-specific errors
 
-*Good*:
+_Good_:
 
-* Reduces boilerplate
+- Reduces boilerplate
 
 ```rust
 input_reader
@@ -121,7 +121,7 @@ input_reader
     })?;
 ```
 
-*Bad*:
+_Bad_:
 
 ```rust
 input_reader
@@ -136,7 +136,7 @@ input_reader
 
 Specific error types are preferred over a generic error with a `message` or `kind` field.
 
-*Good*:
+_Good_:
 
 - Makes it easier to track down the offending code based on a specific failure
 - Reduces the size of the error enum
@@ -159,7 +159,7 @@ write_lines.context(UnableToWriteGoodLines)?;
 close_writer.context(UnableToCloseTableWriter)?;
 ```
 
-*Bad*:
+_Bad_:
 
 ```rust
 pub enum Error {
