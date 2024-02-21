@@ -16,12 +16,23 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum Mode {
+    Read,
+    ReadWrite,
+    Append,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Dataset {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub from: String,
 
     pub name: String,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mode: Option<Mode>,
 
     /// Inline SQL that describes a view.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -35,6 +46,9 @@ pub struct Dataset {
     pub params: Option<HashMap<String, String>>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replication: Option<replication::Replication>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acceleration: Option<acceleration::Acceleration>,
 
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -43,6 +57,21 @@ pub struct Dataset {
 }
 
 impl Dataset {
+    #[must_use]
+    pub fn new(from: String, name: String) -> Self {
+        Dataset {
+            from,
+            name,
+            mode: None,
+            sql: None,
+            sql_ref: None,
+            params: Option::default(),
+            replication: None,
+            acceleration: None,
+            depends_on: Vec::default(),
+        }
+    }
+
     /// Returns the dataset source - the first part of the `from` field before the first `/`.
     ///
     /// # Examples
@@ -123,6 +152,11 @@ impl Dataset {
 
         Ok(None)
     }
+
+    #[must_use]
+    pub fn mode(&self) -> Mode {
+        self.mode.clone().unwrap_or(Mode::Read)
+    }
 }
 
 impl WithDependsOn<Dataset> for Dataset {
@@ -130,9 +164,11 @@ impl WithDependsOn<Dataset> for Dataset {
         Dataset {
             from: self.from.clone(),
             name: self.name.clone(),
+            mode: self.mode.clone(),
             sql: self.sql.clone(),
             sql_ref: self.sql_ref.clone(),
             params: self.params.clone(),
+            replication: self.replication.clone(),
             acceleration: self.acceleration.clone(),
             depends_on: depends_on.to_vec(),
         }
@@ -166,7 +202,7 @@ pub mod acceleration {
         DuckDB,
     }
 
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
     pub struct Acceleration {
         #[serde(default)]
         pub enabled: bool,
@@ -197,5 +233,24 @@ pub mod acceleration {
         pub fn engine(&self) -> Engine {
             self.engine.clone().unwrap_or_default()
         }
+    }
+}
+
+impl From<acceleration::Mode> for sql_provider_datafusion::dbconnectionpool::Mode {
+    fn from(m: acceleration::Mode) -> Self {
+        match m {
+            acceleration::Mode::File => sql_provider_datafusion::dbconnectionpool::Mode::File,
+            acceleration::Mode::Memory => sql_provider_datafusion::dbconnectionpool::Mode::Memory,
+        }
+    }
+}
+
+pub mod replication {
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    pub struct Replication {
+        #[serde(default)]
+        pub enabled: bool,
     }
 }

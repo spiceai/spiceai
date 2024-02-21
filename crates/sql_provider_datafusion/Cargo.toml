@@ -1,5 +1,5 @@
 [package]
-name = "duckdb_datafusion"
+name = "sql_provider_datafusion"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,11 +11,13 @@ exclude.workspace = true
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-duckdb = { git = "https://github.com/spicehq/duckdb-rs.git", rev = "8b57b1496eed1009c45734df7790960313d31e3d",  features = ["bundled", "r2d2", "vtab", "vtab-arrow"] }
-datafusion = "34.0.0"
-async-trait = "0.1.77"
-r2d2 = "0.8.10"
+duckdb = { workspace = true,  features = ["bundled", "r2d2", "vtab", "vtab-arrow"] }
+datafusion.workspace = true
+async-trait.workspace = true
+r2d2.workspace = true
 snafu.workspace = true
 tokio.workspace = true
-tracing = "0.1.40"
+tracing.workspace = true
+
+[dev-dependencies]
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }

@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use snafu::prelude::*;
 use spicepod::{component::dataset::Dataset, component::model::Model, Spicepod};
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct App {
     pub name: String,
 
@@ -54,6 +54,9 @@ impl App {
                 })?;
             for dataset in &dependent_spicepod.datasets {
                 datasets.push(dataset.clone());
+            }
+            for model in &dependent_spicepod.models {
+                models.push(model.clone());
             }
             spicepods.push(dependent_spicepod);
         }

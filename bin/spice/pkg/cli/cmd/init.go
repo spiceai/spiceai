@@ -16,7 +16,7 @@ var initCmd = &cobra.Command{
 	Short: "Initialize Pod - initializes a new pod in the project",
 	Example: `
 spice init <pod name>
-spice init trader
+spice init my_app
 `,
 	Args: cobra.MinimumNArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
@@ -49,7 +49,7 @@ spice init trader
 			return
 		}
 
-		cmd.Println(aurora.BrightGreen("Spice pod manifest initialized!"))
+		cmd.Println(aurora.BrightGreen("Spicepod manifest initialized!"))
 	},
 }
 

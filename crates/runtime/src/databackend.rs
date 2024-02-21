@@ -1,8 +1,8 @@
-use crate::dataupdate::DataUpdate;
+use crate::datapublisher::DataPublisher;
 use datafusion::execution::context::SessionContext;
 use snafu::prelude::*;
 use spicepod::component::dataset::acceleration::{Engine, Mode};
-use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 
 use self::{duckdb::DuckDBBackend, memtable::MemTableBackend};
 
@@ -21,22 +21,18 @@ pub enum Error {
     },
 }
 
-pub type AddDataResult<'a> =
-    Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error>>> + Send + 'a>>;
+pub struct DataBackend;
 
-pub trait DataBackend: Send + Sync {
-    fn add_data(&self, data_update: DataUpdate) -> AddDataResult;
-}
-
-impl dyn DataBackend {
+impl DataBackend {
     #[allow(clippy::needless_pass_by_value)]
+    #[allow(clippy::new_ret_no_self)]
     pub fn new(
         ctx: &Arc<SessionContext>,
         name: &str,
         engine: Engine,
         mode: Mode,
         params: Arc<Option<HashMap<String, String>>>,
-    ) -> std::result::Result<Box<Self>, Error> {
+    ) -> std::result::Result<Box<dyn DataPublisher>, Error> {
         match engine {
             Engine::Arrow => match mode {
                 Mode::Memory => Ok(Box::new(MemTableBackend::new(Arc::clone(ctx), name))),

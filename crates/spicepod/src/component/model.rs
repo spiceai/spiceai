@@ -1,7 +1,7 @@
 use super::WithDependsOn;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Model {
     pub from: String,
     pub name: String,
@@ -31,5 +31,10 @@ impl Model {
             s if s.starts_with("file:/") => "localhost".to_string(),
             _ => "debug".to_string(),
         }
+    }
+
+    #[must_use]
+    pub fn version(&self) -> String {
+        self.from.split(':').last().unwrap_or("").to_string()
     }
 }

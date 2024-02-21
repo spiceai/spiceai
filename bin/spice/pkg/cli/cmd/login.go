@@ -12,6 +12,7 @@ import (
 	"github.com/pkg/browser"
 	"github.com/spf13/cobra"
 	"github.com/spiceai/spiceai/bin/spice/pkg/api"
+	"gopkg.in/yaml.v2"
 )
 
 const (
@@ -72,7 +73,22 @@ spice login
 			}
 		}
 
-		user, err := spiceApiClient.GetUser(accessToken)
+		// try reading spicepod.yaml, to check if we have preferred org and app
+		var orgName string
+		var appName string
+		spicepodBytes, err := os.ReadFile("spicepod.yaml")
+		if err == nil {
+			var spicePod api.Pod
+			err = yaml.Unmarshal(spicepodBytes, &spicePod)
+			if err == nil {
+				if spicePod.Metadata != nil {
+					orgName = spicePod.Metadata["org"]
+				}
+				appName = spicePod.Name
+			}
+		}
+
+		spiceAuthContext, err := spiceApiClient.GetAuthContext(accessToken, &orgName, &appName)
 		if err != nil {
 			cmd.Println("Error:", err)
 			os.Exit(1)
@@ -81,12 +97,12 @@ spice login
 		mergeAuthConfig(cmd, api.AUTH_TYPE_SPICE_AI, &api.Auth{
 			Params: map[string]string{
 				api.AUTH_PARAM_TOKEN: accessToken,
-				api.AUTH_PARAM_KEY:   user.App.ApiKey,
+				api.AUTH_PARAM_KEY:   spiceAuthContext.App.ApiKey,
 			},
 		})
 
-		cmd.Println(aurora.BrightGreen(fmt.Sprintf("Successfully logged in to Spice.ai as %s (%s)", user.Username, user.Email)))
-		cmd.Println(aurora.BrightGreen(fmt.Sprintf("Using app %s/%s", user.PersonalOrg.Name, user.App.Name)))
+		cmd.Println(aurora.BrightGreen(fmt.Sprintf("Successfully logged in to Spice.ai as %s (%s)", spiceAuthContext.Username, spiceAuthContext.Email)))
+		cmd.Println(aurora.BrightGreen(fmt.Sprintf("Using app %s/%s", spiceAuthContext.Org.Name, spiceAuthContext.App.Name)))
 	},
 }
 

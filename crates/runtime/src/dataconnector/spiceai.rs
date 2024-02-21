@@ -4,34 +4,44 @@ use flight_client::FlightClient;
 use futures::StreamExt;
 use futures_core::stream::BoxStream;
 use snafu::prelude::*;
+use std::borrow::Borrow;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 use std::{collections::HashMap, future::Future};
 
 use spicepod::component::dataset::Dataset;
 
 use crate::auth::AuthProvider;
+use crate::datapublisher::{AddDataResult, DataPublisher};
 use crate::dataupdate::{DataUpdate, UpdateType};
+use crate::info_spaced;
+use crate::tracers::SpacedTracer;
 
 use super::{flight::Flight, DataConnector};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to parse SpiceAI dataset path: {}", dataset_path))]
+    #[snafu(display("Unable to parse SpiceAI dataset path: {dataset_path}"))]
     UnableToParseDatasetPath { dataset_path: String },
+
+    #[snafu(display("Unable to publish data to SpiceAI: {source}"))]
+    UnableToPublishData { source: flight_client::Error },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+#[derive(Clone)]
 pub struct SpiceAI {
     flight: Flight,
+    spaced_trace: Arc<SpacedTracer>,
 }
 
 impl DataConnector for SpiceAI {
     fn new(
         auth_provider: AuthProvider,
         params: Arc<Option<HashMap<String, String>>>,
-    ) -> Pin<Box<dyn Future<Output = super::Result<Self>>>>
+    ) -> Pin<Box<dyn Future<Output = super::Result<Self>> + Send>>
     where
         Self: Sized,
     {
@@ -55,7 +65,10 @@ impl DataConnector for SpiceAI {
             .await
             .map_err(|e| super::Error::UnableToCreateDataConnector { source: e.into() })?;
             let flight = Flight::new(flight_client);
-            Ok(Self { flight })
+            Ok(Self {
+                flight,
+                spaced_trace: Arc::new(SpacedTracer::new(Duration::from_secs(15))),
+            })
         })
     }
 
@@ -81,7 +94,6 @@ impl DataConnector for SpiceAI {
               Some(Ok(decoded_data)) => match decoded_data.payload {
                   DecodedPayload::RecordBatch(batch) => {
                       yield DataUpdate {
-                        log_sequence_number: None,
                         data: vec![batch],
                         update_type: UpdateType::Append,
                       };
@@ -110,6 +122,35 @@ impl DataConnector for SpiceAI {
         let spice_dataset_path = Self::spice_dataset_path(dataset);
         self.flight.get_all_data(&spice_dataset_path)
     }
+
+    fn get_data_publisher(&self) -> Option<Box<dyn DataPublisher>> {
+        Some(Box::new(self.clone()))
+    }
+}
+
+impl DataPublisher for SpiceAI {
+    /// Adds data ingested locally back to the source.
+    fn add_data(&self, dataset: Arc<Dataset>, data_update: DataUpdate) -> AddDataResult {
+        let dataset_path = Self::spice_dataset_path(dataset);
+        let mut client = self.flight.client.clone();
+        let spaced_trace = Arc::clone(&self.spaced_trace);
+        Box::pin(async move {
+            tracing::debug!("Adding data to {dataset_path}");
+
+            client
+                .publish(&dataset_path, data_update.data)
+                .await
+                .context(UnableToPublishDataSnafu)?;
+
+            info_spaced!(spaced_trace, "Data published to {}", &dataset_path);
+
+            Ok(())
+        })
+    }
+
+    fn name(&self) -> &str {
+        "SpiceAI"
+    }
 }
 
 impl SpiceAI {
@@ -129,7 +170,8 @@ impl SpiceAI {
     ///
     /// This function returns the full dataset path for the given dataset as you would query for it in Spice.
     /// i.e. `<org>.<app>.<dataset_name>`
-    fn spice_dataset_path(dataset: &Dataset) -> String {
+    fn spice_dataset_path<T: Borrow<Dataset>>(dataset: T) -> String {
+        let dataset = dataset.borrow();
         let path = dataset.path();
         let path_parts: Vec<&str> = path.split('/').collect();
 
