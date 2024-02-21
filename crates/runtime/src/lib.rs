@@ -391,6 +391,7 @@ impl Runtime {
                         }
                     } else {
                         self.load_model(model).await;
+                    }
                 }
 
                 // Remove models that are no longer in the app
@@ -401,6 +402,7 @@ impl Runtime {
                 }
 
                 *current_app = new_app;
+            }
         }
 
         Ok(())
