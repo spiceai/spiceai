@@ -19,7 +19,7 @@ Highlight three use cases.
 2.  High performance queries for data applications.
 3.  Machine learning at the edge. Empowering edge devices to continuously improve inference
 
-## Quikc Start
+## Quick Start
 
 **Step 1.** Install the SpiceAI CLI:
 
