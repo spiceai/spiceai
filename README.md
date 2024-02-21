@@ -192,7 +192,17 @@ You can experiment with the time it takes to generate queries when using non-acc
 spice login dremio -u <USERNAME> -p <PASSWORD>
 ```
 
-**Step 2.** We now configure the dataset:
+**Step 2.** If you haven't already initialized a new project, you need to do so. Then, start the SpiceAI Runtime.
+
+```bash
+spice init dremio-demo-project
+```
+
+```bash
+spice run
+```
+
+**Step 3.** We now configure the dataset from Dremio:
 
 ```bash
 spice dataset configure
@@ -204,7 +214,6 @@ We will now be prompted for the name. Enter "taxi_trips"
 What is the dataset name? taxi_trips
 ```
 
-TODO: Update the location of the dataset.
 Specify the location of the dataset as "dremio/datasets.taxi_trips"
 
 ```bash
@@ -230,7 +239,17 @@ If our login credentials were entered correctly, the taxi_trips datasets has bee
 2024-02-14T18:34:15.175189Z  INFO runtime::datasource: Refreshing data for taxi_trips
 ```
 
-**Step 3.** Run queries against the dataset using the SpiceAI SQL REPL.
+**Step 4.** Run queries against the dataset using the SpiceAI SQL REPL.
+
+In a new terminal, start the SpiceAI SQL REPL
+
+```bash
+spice sql
+```
+
+```bash
+sql> SELECT * FROM taxi_trips LIMIT 5
+```
 
 ## Sample project using the SpiceAI runtime.
 
