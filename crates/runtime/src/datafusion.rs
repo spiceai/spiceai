@@ -199,13 +199,14 @@ impl DataFusion {
             }
         });
 
-        self.tasks.insert(String::from(table_name), task_handle);
+        self.tasks.insert(table_name, task_handle);
 
         Ok(())
     }
 
+    #[must_use]
     pub fn table_exists(&self, dataset_name: &str) -> bool {
-        return self.ctx.table_exist(dataset_name).unwrap_or(false);
+        self.ctx.table_exist(dataset_name).unwrap_or(false)
     }
 
     pub fn remove_table(&mut self, dataset_name: &str) -> Result<()> {
@@ -217,13 +218,14 @@ impl DataFusion {
         if let Err(e) = self.ctx.deregister_table(dataset_name) {
             return UnableToDeleteTableSnafu {
                 reason: e.to_string(),
-            }.fail();
+            }
+            .fail();
         }
 
         if self.tasks.contains_key(dataset_name) {
             if let Some(data_connector_stream) = self.tasks.remove(dataset_name) {
                 data_connector_stream.abort();
-            } 
+            }
         }
 
         if self.data_publishers.contains_key(dataset_name) {
@@ -376,7 +378,6 @@ impl Drop for DataFusion {
         }
 
         self.tasks.clear();
-
     }
 }
 

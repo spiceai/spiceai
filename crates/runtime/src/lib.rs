@@ -185,7 +185,6 @@ impl Runtime {
                 break;
             }
         });
-
     }
 
     pub async fn remove_dataset(&self, ds: &Dataset) {
@@ -392,9 +391,7 @@ impl Runtime {
 
             // check for new and updated datasets
             for ds in &new_app.datasets {
-                if let Some(current_ds) =
-                    current_app.datasets.iter().find(|d| d.name == ds.name)
-                {
+                if let Some(current_ds) = current_app.datasets.iter().find(|d| d.name == ds.name) {
                     if current_ds != ds {
                         self.update_dataset(ds).await;
                     }
