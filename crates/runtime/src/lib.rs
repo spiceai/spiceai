@@ -87,7 +87,7 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct Runtime {
-    pub app: Arc<RwLock<App>>,
+    pub app: Option<Arc<RwLock<App>>>,
     pub config: config::Config,
     pub df: Arc<RwLock<DataFusion>>,
     pub models: Arc<RwLock<HashMap<String, Model>>>,
@@ -101,7 +101,7 @@ impl Runtime {
     #[must_use]
     pub fn new(
         config: Config,
-        app: Arc<RwLock<app::App>>,
+        app: Option<Arc<RwLock<app::App>>>,
         df: Arc<RwLock<DataFusion>>,
         pods_watcher: podswatcher::PodsWatcher,
         auth: Arc<RwLock<auth::AuthProviders>>,
@@ -118,8 +118,10 @@ impl Runtime {
     }
 
     pub async fn load_datasets(&self) {
-        for ds in self.app.read().await.datasets.clone() {
-            self.load_dataset(ds);
+        if let Some(app) = &self.app {
+            for ds in app.read().await.datasets.clone() {
+                self.load_dataset(ds);
+            }
         }
     }
 
@@ -284,8 +286,10 @@ impl Runtime {
     }
 
     pub async fn load_models(&self) {
-        for model in &self.app.read().await.models {
-            self.load_model(model).await;
+        if let Some(app) = &self.app {
+            for model in &app.read().await.models {
+                self.load_model(model).await;
+            }
         }
     }
 
@@ -316,6 +320,7 @@ impl Runtime {
             self.df.clone(),
             self.models.clone(),
         );
+
         let flight_server_future = flight::start(self.config.flight_bind_address, self.df.clone());
         let open_telemetry_server_future =
             opentelemetry::start(self.config.open_telemetry_bind_address, self.df.clone());
@@ -337,26 +342,28 @@ impl Runtime {
         let mut rx = self.pods_watcher.watch()?;
 
         while let Some(new_app) = rx.recv().await {
-            let mut current_app = self.app.write().await;
+            if let Some(app) = &self.app {
+                let mut current_app = app.write().await;
 
-            tracing::debug!("Updated pods information: {:?}", new_app);
-            tracing::debug!("Previous pods information: {:?}", current_app);
+                tracing::debug!("Updated pods information: {:?}", new_app);
+                tracing::debug!("Previous pods information: {:?}", current_app);
 
-            *self.auth.write().await = load_auth_providers();
+                *self.auth.write().await = load_auth_providers();
 
-            for ds in &new_app.datasets {
-                if !current_app.datasets.iter().any(|d| d.name == ds.name) {
-                    self.load_dataset(ds.clone());
+                for ds in &new_app.datasets {
+                    if !current_app.datasets.iter().any(|d| d.name == ds.name) {
+                        self.load_dataset(ds.clone());
+                    }
                 }
-            }
 
-            for model in &new_app.models {
-                if !current_app.models.iter().any(|m| m.name == model.name) {
-                    self.load_model(model).await;
+                for model in &new_app.models {
+                    if !current_app.models.iter().any(|m| m.name == model.name) {
+                        self.load_model(model).await;
+                    }
                 }
-            }
 
-            *current_app = new_app;
+                *current_app = new_app;
+            }
         }
 
         Ok(())
