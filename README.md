@@ -147,21 +147,21 @@ You will now be able to access datasets from Spice.ai.
 spice login
 ```
 
-**Step 2.** Initialize a new project
+**Step 2.** Initialize a new project and name it. We will call it "spice-demo" here.
 
 ```bash
-spice init <PROJECT_NAME_HERE>
+spice init spice-demo
 ```
 
 ```bash
 spice dataset configure
 ```
 
-You will be prompted to enter a name:
-`What is the dataset name? PROJECT_NAME`
+You will be prompted to enter a name. Enter the same name you used when initializing the project in the previous step.
+`What is the dataset name? spice-demo`
 
 Enter the location of the dataset:
-`Where is your dataset located? spice.ai/eth.recent_logs`
+`Where is your dataset located? spice.ai/eth.recent_transactions`
 
 Select `y` when prompted whether you want to accelerate the data:
 `Locally accelerate this dataset (y/n)? y`
@@ -179,7 +179,7 @@ spice sql
 ```
 
 ```bash
-sql> SELECT * FROM eth_recent_transactions LIMIT 5;
+sql> SELECT * FROM spice-demo LIMIT 5;
 ```
 
 You can experiment with the time it takes to generate queries when using non-accelerated datasets. You can change the acceleration setting from `true` to `false` in the datasets.yaml file. Note that you will need to restart the runtime in order for the change to take effect.
