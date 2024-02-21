@@ -18,7 +18,6 @@ r2d2.workspace = true
 snafu.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-spicepod = { path = "../spicepod" }
 r2d2_postgres.workspace = true
 postgres.workspace = true
 

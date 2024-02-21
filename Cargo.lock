@@ -3995,6 +3995,7 @@ dependencies = [
  "serde",
  "serde_yaml",
  "snafu 0.8.0",
+ "sql_provider_datafusion",
  "tracing",
 ]
 
@@ -4015,7 +4016,6 @@ dependencies = [
  "r2d2",
  "r2d2_postgres",
  "snafu 0.8.0",
- "spicepod",
  "tokio",
  "tracing",
  "tracing-subscriber",
