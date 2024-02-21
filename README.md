@@ -150,7 +150,7 @@ spice dataset configure
 ```
 
 You will be prompted to enter a name:
-`What is the dataset name? PROJECT_NAME
+`What is the dataset name? PROJECT_NAME`
 
 Enter the location of the dataset:
 `Where is your dataset located? spice.ai/eth.recent_logs`
@@ -158,13 +158,13 @@ Enter the location of the dataset:
 Select `y` when prompted whether you want to accelerate the data:
 `Locally accelerate this dataset (y/n)? y`
 
-**Step 5** Start the SpiceAI Runtime.
+**Step 3** Start the SpiceAI Runtime.
 
 ```bash
 spice run
 ```
 
-**Step 6** In a new terminal window, use the SpiceAI SQL RPL to query the dataset
+**Step 4** In a new terminal window, use the SpiceAI SQL RPL to query the dataset
 
 ```bash
 spice sql
