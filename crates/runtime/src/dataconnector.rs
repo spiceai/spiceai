@@ -80,7 +80,7 @@ pub trait DataConnector: Send + Sync {
 
     fn has_table_provider(&self) -> bool;
 
-    fn get_table_provider(&self, dataset: Dataset) -> Result<Arc<dyn TableProvider>> {
+    fn get_table_provider(&self, dataset: &Dataset) -> Result<Arc<dyn TableProvider>> {
         panic!("get_table_provider not implemented for {}", dataset.name)
     }
 }

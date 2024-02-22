@@ -213,8 +213,7 @@ impl DataFusion {
             return TableAlreadyExistsSnafu.fail();
         }
 
-        // TODO, add spawn
-        let provider = data_connector.get_table_provider(dataset.clone());
+        let provider = data_connector.get_table_provider(dataset);
 
         match provider {
             Ok(provider) => {

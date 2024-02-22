@@ -135,7 +135,7 @@ impl DataConnector for SpiceAI {
 
     fn get_table_provider(
         &self,
-        dataset: Dataset,
+        dataset: &Dataset,
     ) -> std::result::Result<Arc<dyn datafusion::datasource::TableProvider>, super::Error> {
         let dataset_path = Self::spice_dataset_path(dataset);
 
