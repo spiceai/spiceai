@@ -25,7 +25,6 @@ impl DataConnector for Dremio {
         Self: Sized,
     {
         Box::pin(async move {
-
             let endpoint: String = params
                 .as_ref() // &Option<HashMap<String, String>>
                 .as_ref() // Option<&HashMap<String, String>>
