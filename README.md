@@ -11,6 +11,12 @@
 
 **Spice.ai** is an open source runtime environment that enables developers to leverage rapid access to time-series data. The Spice AI Runtime enables the best in class high performance queries for powering an array of data driven applications.
 
+## Why Spice AI?
+
+The SpiceAI Runtime accelerates the ability to query real time data. If your are building a data application with low latency requirements, SpiceAI can deliver real-time data to end users without the need to access the cloud for every query.
+
+If your edge device has intermittent connectivity due to geographical constraints and needs to perform inferencing reliably at all times, the SpiceAI runtime can host the model, ensuring that your edge device is capable of generating predictions and recommentations at all times even when access to the cloud is unnavailable.
+
 ⚠️ **DEVELOPER PREVIEW ONLY** Spice.ai is under active **alpha** stage development and is not intended to be used in production until its **1.0-stable** release.
 
 ## Quick Start
