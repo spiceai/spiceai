@@ -101,11 +101,30 @@ impl Dataset {
         }
     }
 
+    /// Returns the dataset path - the remainder of the `from` field after the first `:` or the whole string if no `:`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use spicepod::component::dataset::Dataset;
+    ///
+    /// let dataset = Dataset::new("foo:bar".to_string(), "bar".to_string());
+    ///
+    /// assert_eq!(dataset.path(), "bar".to_string());
+    /// ```
+    ///
+    /// ```
+    /// use spicepod::component::dataset::Dataset;
+    ///
+    /// let dataset = Dataset::new("foo".to_string(), "bar".to_string());
+    ///
+    /// assert_eq!(dataset.path(), "foo".to_string());
+    /// ```
     #[must_use]
     pub fn path(&self) -> String {
-        match self.from.find('/') {
+        match self.from.find(':') {
             Some(index) => self.from[index + 1..].to_string(),
-            None => String::new(),
+            None => self.from.clone(),
         }
     }
 
