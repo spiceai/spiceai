@@ -118,15 +118,17 @@ impl Runtime {
     }
 
     pub async fn load_datasets(&self) {
-        for ds in self.app.read().await.datasets.clone() {
+        for ds in &self.app.read().await.datasets {
             self.load_dataset(ds);
         }
     }
 
-    pub fn load_dataset(&self, ds: Dataset) {
+    pub fn load_dataset(&self, ds: &Dataset) {
         let df = Arc::clone(&self.df);
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
         let shared_auth = Arc::clone(&self.auth);
+
+        let ds = ds.clone();
 
         tokio::spawn(async move {
             loop {
@@ -183,6 +185,24 @@ impl Runtime {
                 break;
             }
         });
+    }
+
+    pub async fn remove_dataset(&self, ds: &Dataset) {
+        let mut df = self.df.write().await;
+
+        if df.table_exists(&ds.name) {
+            if let Err(e) = df.remove_table(&ds.name) {
+                tracing::warn!("Unable to unload dataset {}: {}", &ds.name, e);
+                return;
+            }
+        }
+
+        tracing::info!("Unloaded dataset: {}", &ds.name);
+    }
+
+    pub async fn update_dataset(&self, ds: &Dataset) {
+        self.remove_dataset(ds).await;
+        self.load_dataset(ds);
     }
 
     async fn get_dataconnector_from_source(
@@ -369,9 +389,14 @@ impl Runtime {
 
             *self.auth.write().await = load_auth_providers();
 
+            // check for new and updated datasets
             for ds in &new_app.datasets {
-                if !current_app.datasets.iter().any(|d| d.name == ds.name) {
-                    self.load_dataset(ds.clone());
+                if let Some(current_ds) = current_app.datasets.iter().find(|d| d.name == ds.name) {
+                    if current_ds != ds {
+                        self.update_dataset(ds).await;
+                    }
+                } else {
+                    self.load_dataset(ds);
                 }
             }
 
@@ -392,6 +417,13 @@ impl Runtime {
             for model in &current_app.models {
                 if !new_app.models.iter().any(|m| m.name == model.name) {
                     self.remove_model(model).await;
+                }
+            }
+
+            // Remove datasets that are no longer in the app
+            for ds in &current_app.datasets {
+                if !new_app.datasets.iter().any(|d| d.name == ds.name) {
+                    self.remove_dataset(ds).await;
                 }
             }
 
