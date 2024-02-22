@@ -162,7 +162,7 @@ impl<T: r2d2::ManageConnection, P> SqlExec<T, P> {
             .projected_schema
             .fields()
             .iter()
-            .map(|f| format!("\"{}\"", f.name()))
+            .map(|f| f.name().as_str())
             .collect::<Vec<_>>()
             .join(", ");
 

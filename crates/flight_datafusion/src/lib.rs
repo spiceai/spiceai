@@ -192,8 +192,6 @@ impl FlightSQLExec {
             .collect::<Vec<_>>()
             .join(", ");
 
-        tracing::info!("columns: {columns}");
-
         let limit_expr = match self.limit {
             Some(limit) => format!("LIMIT {limit}"),
             None => String::new(),

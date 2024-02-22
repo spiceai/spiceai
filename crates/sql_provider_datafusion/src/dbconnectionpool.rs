@@ -3,7 +3,6 @@ use std::{collections::HashMap, sync::Arc};
 use crate::dbconnection::DbConnection;
 
 pub mod duckdbpool;
-pub mod flightpool;
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 type Result<T, E = Error> = std::result::Result<T, E>;
