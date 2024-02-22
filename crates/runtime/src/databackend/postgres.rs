@@ -179,6 +179,7 @@ impl<'a> PostgresUpdate<'a> {
     }
 
     fn insert_batch(&mut self, batch: RecordBatch) -> Result<()> {
+        // TODO: Write RecordBatch
         let sql = format!(
             r#"INSERT INTO {name} (id, description) VALUES
             (1, 'First'),
@@ -210,6 +211,7 @@ impl<'a> PostgresUpdate<'a> {
             return Ok(());
         };
 
+        // TODO: Write RecordBatch
         let sql = format!(
             r#"CREATE TABLE "{name}" AS
                 SELECT *
