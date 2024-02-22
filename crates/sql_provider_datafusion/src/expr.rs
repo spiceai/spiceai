@@ -7,14 +7,14 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-pub(crate) fn expr_to_sql(expr: &Expr) -> Result<String> {
+pub fn to_sql(expr: &Expr) -> Result<String> {
     match expr {
         Expr::BinaryExpr(binary_expr) => {
-            let left = expr_to_sql(&binary_expr.left)?;
-            let right = expr_to_sql(&binary_expr.right)?;
+            let left = to_sql(&binary_expr.left)?;
+            let right = to_sql(&binary_expr.right)?;
             Ok(format!("{} {} {}", left, binary_expr.op, right))
         }
-        Expr::Column(name) => Ok(name.to_string()),
+        Expr::Column(name) => Ok(format!("\"{name}\"")),
         Expr::Literal(value) => match value {
             ScalarValue::Null => Ok(value.to_string()),
             ScalarValue::Int16(Some(value)) => Ok(value.to_string()),
