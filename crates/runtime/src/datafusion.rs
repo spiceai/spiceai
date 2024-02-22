@@ -234,7 +234,7 @@ impl DataFusion {
     }
 
     #[allow(clippy::needless_pass_by_value)]
-    pub fn attach_mesh(
+    pub async fn attach_mesh(
         &self,
         dataset: impl Borrow<Dataset>,
         data_connector: Box<dyn DataConnector>,
@@ -245,7 +245,7 @@ impl DataFusion {
             return TableAlreadyExistsSnafu.fail();
         }
 
-        let provider = data_connector.get_table_provider(dataset);
+        let provider = data_connector.get_table_provider(dataset).await;
 
         match provider {
             Ok(provider) => {

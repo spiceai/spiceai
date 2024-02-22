@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::{collections::HashMap, future::Future};
@@ -14,6 +15,7 @@ pub struct Dremio {
     flight: Flight,
 }
 
+#[async_trait]
 impl DataConnector for Dremio {
     fn new(
         auth_provider: AuthProvider,
@@ -55,13 +57,13 @@ impl DataConnector for Dremio {
         true
     }
 
-    fn get_table_provider(
+    async fn get_table_provider(
         &self,
         dataset: &Dataset,
     ) -> std::result::Result<Arc<dyn datafusion::datasource::TableProvider>, super::Error> {
         let dremio_path = dataset.path();
 
-        let provider = FlightTable::new(self.flight.client.clone(), dremio_path);
+        let provider = FlightTable::new(self.flight.client.clone(), dremio_path).await;
 
         match provider {
             Ok(provider) => Ok(Arc::new(provider)),

@@ -258,6 +258,7 @@ impl Runtime {
                 df.read()
                     .await
                     .attach_mesh(ds, data_connector)
+                    .await
                     .context(UnableToAttachViewSnafu)?;
                 return Ok(());
             }

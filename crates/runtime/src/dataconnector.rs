@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
 use futures::stream;
 use snafu::prelude::*;
@@ -49,6 +50,7 @@ pub type AnyErrorResult = std::result::Result<(), Box<dyn std::error::Error>>;
 ///    update_type: UpdateType::Overwrite,
 /// }
 /// ```
+#[async_trait]
 pub trait DataConnector: Send + Sync {
     /// Create a new `DataConnector` with the given `AuthProvider`.
     fn new(
@@ -82,7 +84,10 @@ pub trait DataConnector: Send + Sync {
         false
     }
 
-    fn get_table_provider(&self, dataset: &Dataset) -> Result<Arc<dyn TableProvider>> {
+    async fn get_table_provider(
+        &self,
+        dataset: &Dataset,
+    ) -> Result<Arc<dyn TableProvider + 'static>> {
         panic!("get_table_provider not implemented for {}", dataset.name)
     }
 }

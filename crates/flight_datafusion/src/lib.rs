@@ -8,7 +8,6 @@ use futures::{Stream, StreamExt};
 use snafu::prelude::*;
 use sql_provider_datafusion::expr;
 use std::{any::Any, fmt, pin::Pin, sync::Arc, task::Poll};
-use tokio::runtime::Handle;
 
 use arrow_flight::error::FlightError;
 use datafusion::{
@@ -49,12 +48,12 @@ pub struct FlightTable {
 
 #[allow(clippy::needless_pass_by_value)]
 impl FlightTable {
-    pub fn new(
+    pub async fn new(
         client: FlightClient,
         table_reference: impl Into<OwnedTableReference>,
     ) -> Result<Self> {
         let table_reference = table_reference.into();
-        let schema = Self::get_schema(client.clone(), &table_reference)?;
+        let schema = Self::get_schema(client.clone(), &table_reference).await?;
         Ok(Self {
             client: client.clone(),
             schema,
@@ -63,29 +62,25 @@ impl FlightTable {
     }
 
     #[allow(clippy::needless_pass_by_value)]
-    fn get_schema<'a>(
+    async fn get_schema<'a>(
         client: FlightClient,
         table_reference: impl Into<TableReference<'a>>,
     ) -> Result<SchemaRef> {
-        tokio::task::block_in_place(move || {
-            Handle::current().block_on(async {
-                let mut stream = client
-                    .clone()
-                    .query(format!("SELECT * FROM {} limit 1", table_reference.into()).as_str())
-                    .await
-                    .map_err(|error| Error::Flight { source: error })?;
+        let mut stream = client
+            .clone()
+            .query(format!("SELECT * FROM {} limit 1", table_reference.into()).as_str())
+            .await
+            .map_err(|error| Error::Flight { source: error })?;
 
-                if stream.next().await.is_some() {
-                    if let Some(schema) = stream.schema() {
-                        Ok(Arc::clone(schema))
-                    } else {
-                        Err(Error::NoSchema {})
-                    }
-                } else {
-                    Err(Error::NoSchema {})
-                }
-            })
-        })
+        if stream.next().await.is_some() {
+            if let Some(schema) = stream.schema() {
+                Ok(Arc::clone(schema))
+            } else {
+                Err(Error::NoSchema {})
+            }
+        } else {
+            Err(Error::NoSchema {})
+        }
     }
 
     fn create_physical_plan(
