@@ -7,211 +7,324 @@
 [![Subreddit subscribers](https://img.shields.io/reddit/subreddit-subscribers/spiceai?style=social)](https://www.reddit.com/r/spiceai)
 [![Follow on Twitter](https://img.shields.io/twitter/follow/spiceaihq.svg?style=social&logo=twitter)](https://twitter.com/intent/follow?screen_name=spiceaihq)
 
-**Spice.ai** makes it easy for developers to build apps that learn and adapt by streamlining the use of machine learning (ML) in software. Combined with time-series data, developers can create applications that continuously improve using ML recommendations.
+## What is SpiceAI?
 
-Spice.ai takes a developer-first approach, and is focused on a fast, iterative, inner development loop, enabling developers to get started with ML in minutes instead of months.
+**Spice.ai** is an open source runtime environment that enables developers to leverage rapid access to time-series data. The Spice AI Runtime enables the best in class high performance queries for powering an array of data driven applications.
 
----
+## Why Spice AI?
+
+The SpiceAI Runtime accelerates the ability to query real time data. If your are building a data application with low latency requirements, SpiceAI can deliver real-time data to end users without the need to access the cloud for every query.
+
+If your edge device has intermittent connectivity due to geographical constraints and needs to perform inferencing reliably at all times, the SpiceAI runtime can host the model, ensuring that your edge device is capable of generating predictions and recommentations at all times even when access to the cloud is unnavailable.
 
 ⚠️ **DEVELOPER PREVIEW ONLY** Spice.ai is under active **alpha** stage development and is not intended to be used in production until its **1.0-stable** release.
 
----
+## Quick Start
 
-📢 Read the Spice.ai announcement blog post at [blog.spiceai.org](https://blog.spiceai.org).
-
-📺 View a getting started walkthrough of Spice.ai in action [here](https://www.youtube.com/watch?v=DKBLjuAz_lI).
-
-💻 Learn about our [approach to building intelligent applications](https://blog.spiceai.org/posts/2021/11/05/making-apps-that-learn-and-adapt/) and not just "doing AI"
-
-## Features
-
-The Spice.ai runtime is written in Golang and Python and runs as a container or microservice. It's deployable to any public cloud, on-premises, and edge. It is configured with a simple manifest and accessed by HTTP APIs.
-
-Spice.ai includes:
-
-- A lightweight, portable ML runtime accessible by simple HTTP APIs, allowing developers to use their preferred languages and frameworks
-- A developer-friendly CLI
-- Simple, git-committable, configuration and code
-
-### Community-Driven Data Components
-
-Spice.ai also includes a library of community-driven [data components](https://github.com/spiceai/data-components-contrib) for streaming and processing time series data, enabling developers to quickly and easily combine data with learning to create intelligent models.
-
-### Spicepod registry
-
-Modern developers build with the community by leveraging registries such as npm, NuGet, and pip. The Spice.ai platform includes [spicerack.org](https://spicerack.org), the registry for ML building blocks.
-
-As the community shares their ML building blocks (aka Spicepods, or pods for short), developers can quickly add them to their Spice.ai applications enabling them to stream data and build learning into their applications quickly and easily. Initially, Spicepods contain simple definitions of how the app should learn, and eventually will enable the sharing and use of fully-trained models.
-
-<p align="center">
-  <img src="https://user-images.githubusercontent.com/80174/132382372-c32cc8b7-25f2-4f82-8f9f-e4778fb69254.png" width="600" />
-</p>
-
-## Why Spice.ai?
-
-Spice.ai is for developers who want to build intelligent applications but don't have the time or resources to learn, build and integrate the required ML to do so.
-
-Imagine you have timestamped measurements of the room temperature and access to air-conditioning controls. If you had a time-series ML engine, your application could optimize when the A/C activates. You could reduce energy usage by not overcooling the room as the temperature drops.
-
-Now imagine learning Python or R, neural networks, deep-learning algorithms and building a system that streams and processes time-series data to do that. With Spice.ai — which includes a time-series ML engine accessible over HTTP APIs, a library of community-driven components for data streaming and processing, and an ecosystem of pre-created ML configurations — you can build upon the experience of the community instead of doing it all yourself. You can focus on business logic and building your application instead of the ML.
-
-### Pre-release software
-
-⚠️ The vision to make it easy to build intelligent applications that learn is a vast undertaking. We haven't figured it all out or solved all the problems yet, so we’re inviting you on this journey and are looking for feedback the direction.
-
-Spice.ai and spicerack.org are both pre-release, early, alpha software. Until v1.0, Spice.ai may have gaps, including limited deep learning algorithms, training-at-scale, and simulated environments. Also, Spicepods aren't searchable or listed on spicerack.org yet.
-
-Our intention with this preview is to work with developers early to define and create the developer experience together. 🚀 See the [Roadmap to v1.0-stable](https://github.com/spiceai/spiceai/blob/trunk/docs/ROADMAP.md#spice-ai-v10-stable-roadmap) for upcoming features.
-
-### Join us!
-
-We greatly appreciate and value your support! You can help Spice.ai in a number of ways:
-
-- ⭐️ Star this repo.
-- Build an app with Spice.ai and send us feedback and suggestions at [hey@spice.ai](mailto:hey@spice.ai) or on [Discord](https://discord.gg/kZnTfneP5u).
-- [File an issue](https://github.com/spiceai/spiceai/issues/new) if you see something not quite working correctly.
-- Follow us on [Reddit](https://www.reddit.com/r/spiceai), [Twitter](https://twitter.com/SpiceAIHQ), and [LinkedIn](https://www.linkedin.com/company/74148478).
-- Join our team ([We’re hiring!](https://spice.ai/careers))
-- Contribute code or documentation to the project (see [CONTRIBUTING.md](CONTRIBUTING.md)).
-
-We’re also starting a community call series soon!
-
-Thank you for sharing this journey with us.
-
-## Getting started with Spice.ai
-
-First, ⭐️ star this repo! Thank you for your support! 🙏
-
-Then, follow this guide to get started quickly with Spice.ai. For a more comprehensive guide, see the full [online documentation](https://docs.spiceai.org/). Also check out our video walkthrough on [getting started](https://www.youtube.com/watch?v=DKBLjuAz_lI).
-
-### Current hosting limitations
-
-- Docker is required. Self-host and metal support is on the roadmap.
-- Only macOS and Linux are natively supported. [WSL 2](https://docs.microsoft.com/en-us/windows/wsl/install-win10) is required for Windows.
-- darwin/arm64 is not yet supported (i.e. Apple's M1 Macs). We use M1s ourselves, so we hope to support this very soon. :-)
-
-⭐️ We highly recommend using [GitHub Codespaces](https://github.com/features/codespaces) to get started. Codespaces enables you to run Spice.ai in a virtual environment in the cloud. If you use Codespaces, the install is not required and you may skip to the [Getting Started with Codespaces](#getting-started-with-codespaces) section.
-
-### Installation (local machine)
-
-1. Install Docker
-2. Install the Spice CLI
-
-**Step 1. Install Docker**: While self-hosting on baremetal hardware will be supported, the Developer Preview currently requires Docker. To install Docker, please follow [these instructions](https://docs.docker.com/get-docker/).
-
-**Step 2. Install the Spice CLI**: Run the following `curl` command in your terminal.
+**Step 1.** Install the SpiceAI CLI:
 
 ```bash
 curl https://install.spiceai.org | /bin/bash
 ```
 
-You may need to restart your terminal for the `spice` command to be added to your PATH.
-
-### Getting started with Codespaces
-
-The recommended way to get started with Spice.ai is to use GitHub Codespaces.
-
-Create a new GitHub Codespace in the `spiceai/quickstarts` repo at [github.com/spiceai/quickstarts/codespaces](https://github.com/spiceai/quickstarts/codespaces).
-
-<img src="https://user-images.githubusercontent.com/80174/130397022-e882fc26-06fd-49da-ae35-03383221c63d.png" width="300">
-
-Once you open the Codespace, Spice.ai and everything you need to get started will already be installed. Continue on to train your first pod.
-
-### Create your first Spicepod and train it
-
-A [Spicepod](https://docs.spiceai.org/concepts/#pod) is simply a collection of configuration and data that is used to train and deploy your own AI.
-
-We will add intelligence to a sample application, **ServerOps**, by creating and training a Spicepod that offers recommendations to the application for different server operations, such as performing server maintenance.
-
-If you are using GitHub Codespaces, skip Step 1. and continue with Step 2., as the repository will already be cloned.
-
-Step 1. Clone the Spice.ai quickstarts repository:
+**Step 2.** Choose a project name and initialize a new project with the `spice init` command:
 
 ```bash
-cd $HOME
-git clone https://github.com/spiceai/quickstarts
-cd quickstarts/serverops
+spice init my_spiceai_project
 ```
 
-Step 2. Start the Spice runtime with `spice run`:
+This creates a spicepod.yaml file in your directory.
+
+**Step 3.** Log in to Dremio in order to access the dataset. Use the credentials below:
+:
 
 ```bash
-cd $HOME/quickstarts/serverops
+spice login dremio -u demo -p demo1234
+```
+
+**Step 4.** Start the SpiceAI runtime:
+
+```bash
 spice run
 ```
 
-Step. 3. In a new terminal, add the ServerOps quickstart pod:
-
-So that we can leave Spice.ai running, add the quickstart pod in a new terminal tab or window. If you are running in GitHub Codespaces, you can open a new terminal by clicking the split-terminal button in VS Code.
+You should see the following output (with timestamps reflecting when you started the runtime):
 
 ```bash
-spice add quickstarts/serverops
+Spice.ai runtime starting...
+Using latest 'local' runtime version.
+2024-02-21T06:11:56.381793Z  INFO runtime::http: Spice Runtime HTTP listening on 127.0.0.1:3000
+2024-02-21T06:11:56.381853Z  INFO runtime::flight: Spice Runtime Flight listening on 127.0.0.1:50051
+2024-02-21T06:11:56.382038Z  INFO runtime::opentelemetry: Spice Runtime OpenTelemetry listening on 127.0.0.1:50052
 ```
 
-The Spice.ai CLI will download the ServerOps quickstart pod and add the pod manifest to your project at `spicepods/serverops.yaml`.
-
-The Spice runtime will then automatically detect the pod and start your first training run!
-
-> Note, automatic training relies on your system's filewatcher. In some cases, this might be disabled or not work as expected. If training does not start, follow the command to [retrain the pod](#retrain-the-pod) below.
-
-### Observe the pod training
-
-Navigate to [http://localhost:8000](http://localhost:8000) in your favorite browser. You will see an overview of your pods. From here, you can click on the `serverops` pod to see a chart of the pod's training progress.
-
-### Retrain the pod
-
-In addition to automatic training on each manifest change, training can be started by using the Spice CLI from within your app directory.
+**Step 5.** In a new terminal window, import the spicepod. The spicepod contains information about how datasets and other components are configured. You can add public spicepods using `spice add` command:
 
 ```bash
-spice train serverops
+spice add spiceai/quickstart
 ```
 
-### Get a recommendation
+You should see the runtime updated with the new datasets.
+Also, the spicepod.yaml file will be updated with a new dependency that
+references the spiceai/quickstart spicepod.
 
-After training the pod, you can now get a recommendation for an action from it!
+```yaml
+version: v1beta1
+kind: Spicepod
+name: PROJECT_NAME
+dependencies:
+  - spiceai/quickstart
+```
+
+In the runtime terminal window, you should see that the a new dataset has been added to the runtime:
 
 ```bash
-curl http://localhost:8000/api/v0.1/pods/serverops/recommendation
+2024-02-22T05:53:48.222952Z  INFO runtime: Loaded dataset: taxi_trips
+2024-02-22T05:53:48.223101Z  INFO runtime::dataconnector: Refreshing data for taxi_trips
 ```
 
-### Run the ServerOps application
-
-To see how Spice.ai makes creating intelligent applications easy, try running and reviewing the sample ServerOps Node or Powershell apps, `serverops.js` and `serverops.ps1`.
-
-Node:
+**Step 6.** You can now query the dataset using the SpiceAI SQL REPL. Enter the command below to start the REPL:
 
 ```bash
-npm install
-node serverops.js
+spice sql
 ```
 
-Powershell:
+You should now see:
 
-```ps
-./serverops.ps1
+```bash
+Welcome to the interactive Spice.ai SQL Query Utility! Type 'help' for help.
+
+show tables; -- list available tables
 ```
 
-### Next steps
+Entering `show tables;` prints out the following table along with the time it took to execute the query:
 
-Congratulations! In just a few minutes you downloaded and installed the Spice.ai CLI and runtime, created your first Spicepod, trained it, and got a recommendation from it.
+```
+sql> show tables;
++---------------+--------------------+-------------+------------+
+| table_catalog | table_schema       | table_name  | table_type |
++---------------+--------------------+-------------+------------+
+| datafusion    | public             | taxi_trips  | BASE TABLE |
+| datafusion    | information_schema | tables      | VIEW       |
+| datafusion    | information_schema | views       | VIEW       |
+| datafusion    | information_schema | columns     | VIEW       |
+| datafusion    | information_schema | df_settings | VIEW       |
++---------------+--------------------+-------------+------------+
 
-This is just the start of the journey with Spice.ai. Next, try one of the quickstart tutorials or in-depth samples for creating intelligent applications.
+Query took: 0.004728897 seconds
+```
 
-**Try:**
+You can enter custom queries:
 
-- [ServerOps sample](https://github.com/spiceai/samples/tree/trunk/serverops/README.md) - a more in-depth version of the quickstart you just completed, using CPU metrics from your own machine
-- [Gardener sample](https://github.com/spiceai/samples/tree/trunk/gardener/README.md) - Intelligently water a simulated garden
-- [Trader quickstart](https://github.com/spiceai/quickstarts/tree/trunk/trader/README.md) - a basic Bitcoin trading bot
+```bash
+sql> SELECT trip_distance_mi, fare_amount FROM taxi_trips LIMIT 10;
+```
 
-## Community
+Output:
 
-Spice.ai started with the vision to make AI easy for developers. We are building Spice.ai in the open and with the community. Reach out on Discord or by email to get involved. We will be starting a community call series soon!
+```bash
++------------------+-------------+
+| trip_distance_mi | fare_amount |
++------------------+-------------+
+| 1.1              | 7.5         |
+| 6.1              | 23.0        |
+| 0.6              | 4.5         |
+| 16.7             | 52.0        |
+| 11.3             | 37.5        |
+| 1.1              | 6.0         |
+| 5.3              | 18.5        |
+| 1.3              | 7.0         |
+| 1.0              | 7.0         |
+| 3.5              | 17.5        |
++------------------+-------------+
 
-- Discord: [![Discord Banner](https://discord.com/api/guilds/803820740868571196/widget.png?style=shield)](https://discord.gg/kZnTfneP5u)
-- Reddit: [![Subreddit subscribers](https://img.shields.io/reddit/subreddit-subscribers/spiceai?style=social)](https://www.reddit.com/r/spiceai)
-- Twitter: [@SpiceAIHQ](https://twitter.com/spiceaihq)
-- Email: [hey@spice.ai](mailto:hey@spice.ai)
+Query took: 0.002458976 seconds
+```
 
-### Contributing to Spice.ai
+TODO: ADD VIDEO SHOWING HOW TO RUN THE ABOVE STEPS HERE.
 
-See [CONTRIBUTING.md](/CONTRIBUTING.md).
+## Next Steps
+
+You can use any number of predefined datasets available from Spice.ai in the SpiceAI Runtime.
+
+A list of publically available datasets from Spice.ai can be found here: https://docs.spice.ai/building-blocks/datasets.
+
+In order to access public datasets from SpiceAI, you will first need to create an account with Spice.ai by selecting the free tier membership.
+
+Navigate to https://spice.ai/ and create a new account by clicking on Try for Free.
+
+<img width="500" alt="spiceai_try_for_free-1" src="https://github.com/spiceai/spiceai/assets/112157037/27fb47ed-4825-4fa8-94bd-48197406cfaa">
+
+After creating an account, you will need to create an app in order to create to an API key.
+
+![create_app-1](https://github.com/spiceai/spiceai/assets/112157037/d2446406-1f06-40fb-8373-1b6d692cb5f7)
+
+You will now be able to access datasets from Spice.ai. For this demonstration, we will be using the Spice.ai/eth.recent_blocks dataset.
+
+**Step 1.** In a new directory, log in and authenticate from the command line using the `spice login` command. A pop up browser window will prompt you to authenticate:
+
+```bash
+spice login
+```
+
+**Step 2.** Initialize a new project if you haven't already done so. Then, start the runtime:
+
+```bash
+spice init my_spiceai_project
+```
+
+```bash
+spice run
+```
+
+**Step 3.** Configure the dataset:
+
+In a new terminal window, configure a new dataset using the `spice dataset configure` command:
+
+```bash
+spice dataset configure
+```
+
+You will be prompted to enter a name. Enter a name that represents the contents of the dataset
+
+```bash
+What is the dataset name? eth_recent_blocks
+```
+
+Enter the location of the dataset:
+
+```bash
+Where is your dataset located? spice.ai/eth.recent_blocks
+```
+
+Select `y` when prompted whether to accelerate the data:
+
+```bash
+Locally accelerate this dataset (y/n)? y
+```
+
+You should see the following output from your runtime terminal:
+
+```bash
+2024-02-21T22:49:10.038461Z  INFO runtime: Loaded dataset: eth_recent_blocks
+```
+
+**Step 4.** In a new terminal window, use the SpiceAI SQL REPL to query the dataset
+
+```bash
+spice sql
+```
+
+```bash
+sql> select number, size, gas_used from eth_recent_blocks Limit 10;
+```
+
+The output displays the results of the query along with the query execution time:
+
+```bash
++----------+--------+----------+
+| number   | size   | gas_used |
++----------+--------+----------+
+| 19281345 | 400378 | 16150051 |
+| 19281344 | 200501 | 16480224 |
+| 19281343 | 97758  | 12605531 |
+| 19281342 | 89629  | 12035385 |
+| 19281341 | 133649 | 13335719 |
+| 19281340 | 307584 | 18389159 |
+| 19281339 | 89233  | 13391332 |
+| 19281338 | 75250  | 12806684 |
+| 19281337 | 100721 | 11823522 |
+| 19281336 | 150137 | 13418403 |
++----------+--------+----------+
+
+Query took: 0.004057791 seconds
+```
+
+You can experiment with the time it takes to generate queries when using non-accelerated datasets. You can change the acceleration setting from `true` to `false` in the datasets.yaml file.
+
+## Importing dataset from Dremio
+
+**Step 1.** If you have a dataset hosted in Dremio, you can load it into the SpiceAI Runtime as follows:
+
+```bash
+spice login dremio -u <USERNAME> -p <PASSWORD>
+```
+
+**Step 2.** If you haven't already initialized a new project, you need to do so. Then, start the SpiceAI Runtime.
+
+```bash
+spice init dremio-demo-project
+```
+
+```bash
+spice run
+```
+
+**Step 3.** We now configure the dataset from Dremio:
+
+```bash
+spice dataset configure
+```
+
+Enter the name of the dataset:
+
+```bash
+What is the dataset name? my_dataset
+```
+
+Specify the location of the dataset:
+
+```bash
+Where is your dataset located? dremio/datasets.my_dataset
+```
+
+Select "y" when prompted whether to locally accelerate the dataset:
+
+```bash
+Locally accelerate this dataset (y/n)? y
+```
+
+We should now see the following output:
+
+```
+Dataset settings written to `datasets/my_dataset/dataset.yaml`!
+```
+
+If the login credentials were entered correctly, your dataset will have loaded into the runtime. You should see the following in the SpiceAI runtime terminal :
+
+```
+2024-02-14T18:34:15.174564Z  INFO spiced: Loaded dataset: my_dataset
+2024-02-14T18:34:15.175189Z  INFO runtime::datasource: Refreshing data for my_dataset
+```
+
+**Step 4.** Run queries against the dataset using the SpiceAI SQL REPL.
+
+In a new terminal, start the SpiceAI SQL REPL
+
+```bash
+spice sql
+```
+
+You can now now query `my_dataset` in the runtime.
+
+## Sample project using the SpiceAI runtime.
+
+TODO: Make a simple app that showcases the data querying from the runtime.
+This will replace the Python script in the examples folder.
+
+### Upcoming Features
+
+🚀 See the [Roadmap to v1.0-stable](https://github.com/spiceai/spiceai/blob/rust/docs/RELEASE.md) for upcoming features.
+
+### Connect with us!
+
+We greatly appreciate and value your support! You can help Spice.ai in a number of ways:
+
+- Build an app with Spice.ai and send us feedback and suggestions at [hey@spice.ai](mailto:hey@spice.ai) or on [Discord](https://discord.gg/kZnTfneP5u), [X] (https://twitter.com/SpiceAIHQ), or [LinkedIn](https://www.linkedin.com/company/74148478).
+- [File an issue](https://github.com/spiceai/spiceai/issues/new) if you see something not quite working correctly.
+- Join our team ([We’re hiring!](https://spice.ai/careers))
+- Contribute code or documentation to the project (see [CONTRIBUTING.md](CONTRIBUTING.md)).
+
+⭐️ star this repo! Thank you for your support! 🙏
+
+For a more comprehensive guide, see the full [online documentation](https://docs.spiceai.org/).
