@@ -35,9 +35,6 @@ pub enum Error {
     #[snafu(display("Table already exists"))]
     TableAlreadyExists {},
 
-    #[snafu(display("Table does not exist"))]
-    TableDoesNotExist {},
-
     #[snafu(display("Unable to get table: {source}"))]
     DatasetConfigurationError { source: databackend::Error },
 
@@ -209,9 +206,8 @@ impl DataFusion {
     }
 
     pub fn remove_table(&mut self, dataset_name: &str) -> Result<()> {
-        let table_exists = self.ctx.table_exist(dataset_name).unwrap_or(false);
-        if !table_exists {
-            return TableDoesNotExistSnafu.fail();
+        if !self.ctx.table_exist(dataset_name).unwrap_or(false) {
+            return Ok(());
         }
 
         if let Err(e) = self.ctx.deregister_table(dataset_name) {
