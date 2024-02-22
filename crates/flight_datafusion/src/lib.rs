@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use flight_client::FlightClient;
 use futures::StreamExt;
 use snafu::prelude::*;
-use std::{any::Any, fmt, sync::Arc};
+use std::{any::Any, fmt, ops::Deref, sync::Arc};
 use tokio::runtime::Handle;
 
 use datafusion::{
@@ -41,18 +41,18 @@ pub enum Error {
 type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct FlightSQLTable {
-    client: FlightClient,
+    client: Arc<FlightClient>,
     schema: SchemaRef,
     table_reference: OwnedTableReference,
 }
 
 impl FlightSQLTable {
     pub fn new(
-        client: FlightClient,
+        client: Arc<FlightClient>,
         table_reference: impl Into<OwnedTableReference>,
     ) -> Result<Self> {
         let table_reference = table_reference.into();
-        let schema = Self::get_schema(client.clone(), &table_reference)?;
+        let schema = Self::get_schema(Arc::clone(&client), &table_reference)?;
         Ok(Self {
             client,
             schema,
@@ -61,7 +61,7 @@ impl FlightSQLTable {
     }
 
     pub fn new_with_schema(
-        client: FlightClient,
+        client: Arc<FlightClient>,
         schema: impl Into<SchemaRef>,
         table_reference: impl Into<OwnedTableReference>,
     ) -> Self {
@@ -72,14 +72,15 @@ impl FlightSQLTable {
         }
     }
 
+    #[allow(clippy::needless_pass_by_value)]
     fn get_schema<'a>(
-        client: FlightClient,
+        client: Arc<FlightClient>,
         table_reference: impl Into<TableReference<'a>>,
     ) -> Result<SchemaRef> {
+        let mut client = client.deref().clone();
         tokio::task::block_in_place(move || {
             Handle::current().block_on(async {
                 let mut stream = client
-                    .clone()
                     .query(format!("SELECT * FROM {} limit 1", table_reference.into()).as_str())
                     .await
                     .map_err(|error| Error::Flight { source: error })?;
@@ -108,7 +109,7 @@ impl FlightSQLTable {
             projections,
             schema,
             &self.table_reference,
-            self.client.clone(),
+            Arc::clone(&self.client),
             filters,
             limit,
         )?))
@@ -159,7 +160,7 @@ impl TableProvider for FlightSQLTable {
 struct FlightSQLExec {
     projected_schema: SchemaRef,
     table_reference: OwnedTableReference,
-    client: FlightClient,
+    client: Arc<FlightClient>,
     filters: Vec<Expr>,
     limit: Option<usize>,
 }
@@ -169,7 +170,7 @@ impl FlightSQLExec {
         projections: Option<&Vec<usize>>,
         schema: &SchemaRef,
         table_reference: &OwnedTableReference,
-        client: FlightClient,
+        client: Arc<FlightClient>,
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Self> {
@@ -268,9 +269,10 @@ impl ExecutionPlan for FlightSQLExec {
             Err(error) => return Err(error),
         };
 
+        let mut client = self.client.deref().clone();
         let data = tokio::task::block_in_place(move || {
             Handle::current().block_on(async {
-                let result = self.client.clone().query(sql.as_str()).await;
+                let result = client.query(sql.as_str()).await;
 
                 let mut flight_record_batch_stream = match result {
                     Ok(stream) => stream,
