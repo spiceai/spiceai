@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Instant;
 
 use arrow_flight::{
     decode::FlightRecordBatchStream, error::FlightError,
@@ -73,6 +74,7 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
 
         let request = FlightDescriptor::new_cmd(line.to_string());
 
+        let start_time = Instant::now();
         let mut flight_info = client.get_flight_info(request).await?.into_inner();
         let Some(endpoint) = flight_info.endpoint.pop() else {
             println!("No endpoint");
@@ -115,6 +117,8 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
         if let Err(e) = df.show().await {
             println!("Error displaying results: {e}");
         };
+        let elapsed = start_time.elapsed();
+        println!("\nQuery took: {} seconds", elapsed.as_secs_f64());
     }
 
     Ok(())

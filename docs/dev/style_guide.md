@@ -1,4 +1,4 @@
-## Spice.ai Style Guide
+## Spice.ai Rust Style Guide
 
 This document provides guidelines for writing idiomatic Rust code in the context of Spice.ai.
 

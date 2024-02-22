@@ -6,13 +6,14 @@ use std::{
 
 use arrow::record_batch::RecordBatch;
 use datafusion::{execution::context::SessionContext, sql::TableReference};
-use duckdb::{
-    vtab::arrow::{arrow_recordbatch_to_query_params, ArrowVTab},
-    DuckdbConnectionManager,
-};
-use duckdb_datafusion::DuckDBTable;
+use duckdb::{vtab::arrow::arrow_recordbatch_to_query_params, DuckdbConnectionManager, ToSql};
 use snafu::{prelude::*, ResultExt};
-use spicepod::component::dataset::{acceleration, Dataset};
+use spicepod::component::dataset::Dataset;
+use sql_provider_datafusion::{
+    dbconnection::{self, duckdbconn::DuckDbConnection, DbConnection},
+    dbconnectionpool::{duckdbpool::DuckDbConnectionPool, DbConnectionPool, Mode},
+    SqlTable,
+};
 
 use crate::{
     datapublisher::{AddDataResult, DataPublisher},
@@ -21,14 +22,23 @@ use crate::{
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("DuckDBError: {source}"))]
-    DuckDBError { source: duckdb::Error },
+    #[snafu(display("DbConnectionError: {source}"))]
+    DbConnectionError {
+        source: sql_provider_datafusion::dbconnection::Error,
+    },
 
-    #[snafu(display("ConnectionPoolError: {source}"))]
-    ConnectionPoolError { source: r2d2::Error },
+    #[snafu(display("DbConnectionPoolError: {source}"))]
+    DbConnectionPoolError {
+        source: sql_provider_datafusion::dbconnectionpool::Error,
+    },
+
+    #[snafu(display("DuckDBError: {source}"))]
+    DuckDB { source: duckdb::Error },
 
     #[snafu(display("DuckDBDataFusionError: {source}"))]
-    DuckDBDataFusion { source: duckdb_datafusion::Error },
+    DuckDBDataFusion {
+        source: sql_provider_datafusion::Error,
+    },
 
     #[snafu(display("DataFusionError: {source}"))]
     DataFusion {
@@ -37,6 +47,9 @@ pub enum Error {
 
     #[snafu(display("Lock is poisoned: {message}"))]
     LockPoisoned { message: String },
+
+    #[snafu(display("Unable to downcast DbConnection to DuckDbConnection"))]
+    UnableToDowncastDbConnection {},
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -44,13 +57,9 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 pub struct DuckDBBackend {
     ctx: Arc<SessionContext>,
     name: String,
-    pool: Arc<r2d2::Pool<DuckdbConnectionManager>>,
+    pool: Arc<dyn DbConnectionPool<DuckdbConnectionManager, &'static dyn ToSql> + Send + Sync>,
     create_mutex: std::sync::Mutex<()>,
-}
-
-pub enum Mode {
-    Memory,
-    File,
+    _primary_keys: Option<Vec<String>>,
 }
 
 impl DataPublisher for DuckDBBackend {
@@ -58,8 +67,12 @@ impl DataPublisher for DuckDBBackend {
         let pool = Arc::clone(&self.pool);
         let name = self.name.clone();
         Box::pin(async move {
-            let conn: r2d2::PooledConnection<DuckdbConnectionManager> =
-                pool.get().context(ConnectionPoolSnafu)?;
+            let mut conn = pool.connect().context(DbConnectionPoolSnafu)?;
+            let Some(conn) = conn.as_any_mut().downcast_mut::<DuckDbConnection>() else {
+                return Err(
+                    Box::new(Error::UnableToDowncastDbConnection {}) as Box<dyn std::error::Error>
+                );
+            };
 
             let mut duckdb_update = DuckDBUpdate {
                 name,
@@ -88,26 +101,15 @@ impl DuckDBBackend {
         name: &str,
         mode: Mode,
         params: Arc<Option<HashMap<String, String>>>,
+        primary_keys: Option<Vec<String>>,
     ) -> Result<Self> {
-        let manager = match mode {
-            Mode::Memory => DuckdbConnectionManager::memory().context(DuckDBSnafu)?,
-            Mode::File => DuckdbConnectionManager::file(get_duckdb_file(name, &params))
-                .context(DuckDBSnafu)?,
-        };
-
-        let pool = Arc::new(r2d2::Pool::new(manager).context(ConnectionPoolSnafu)?);
-
-        let conn = pool.get().context(ConnectionPoolSnafu)?;
-        conn.register_table_function::<ArrowVTab>("arrow")
-            .context(DuckDBSnafu)?;
-
-        let name = name.to_string();
-
+        let pool = DuckDbConnectionPool::new(name, mode, params).context(DbConnectionPoolSnafu)?;
         Ok(DuckDBBackend {
             ctx,
-            name,
-            pool,
+            name: name.to_string(),
+            pool: Arc::new(pool),
             create_mutex: std::sync::Mutex::new(()),
+            _primary_keys: primary_keys,
         })
     }
 
@@ -120,7 +122,7 @@ impl DuckDBBackend {
             return Ok(());
         }
 
-        let table = match DuckDBTable::new(&self.pool, TableReference::bare(self.name.clone()))
+        let table = match SqlTable::new(&self.pool, TableReference::bare(self.name.clone()))
             .context(DuckDBDataFusionSnafu)
         {
             Ok(table) => table,
@@ -135,28 +137,11 @@ impl DuckDBBackend {
     }
 }
 
-fn get_duckdb_file(name: &str, params: &Arc<Option<HashMap<String, String>>>) -> String {
-    params
-        .as_ref()
-        .as_ref()
-        .and_then(|params| params.get("duckdb_file").cloned())
-        .unwrap_or(format!("{name}.db"))
-}
-
-impl From<acceleration::Mode> for Mode {
-    fn from(m: acceleration::Mode) -> Self {
-        match m {
-            acceleration::Mode::File => Mode::File,
-            acceleration::Mode::Memory => Mode::Memory,
-        }
-    }
-}
-
 struct DuckDBUpdate<'a> {
     name: String,
     data: Vec<RecordBatch>,
     update_type: UpdateType,
-    duckdb_conn: r2d2::PooledConnection<DuckdbConnectionManager>,
+    duckdb_conn: &'a mut dbconnection::duckdbconn::DuckDbConnection,
     create_mutex: &'a std::sync::Mutex<()>,
 }
 
@@ -181,7 +166,7 @@ impl<'a> DuckDBUpdate<'a> {
         Ok(())
     }
 
-    fn insert_batch(&self, batch: RecordBatch) -> Result<()> {
+    fn insert_batch(&mut self, batch: RecordBatch) -> Result<()> {
         let params = arrow_recordbatch_to_query_params(batch);
         let sql = format!(
             r#"INSERT INTO "{name}" SELECT * FROM arrow(?, ?)"#,
@@ -190,8 +175,11 @@ impl<'a> DuckDBUpdate<'a> {
         tracing::trace!("{sql}");
 
         self.duckdb_conn
-            .execute(&sql, params)
-            .context(DuckDBSnafu)?;
+            .execute(
+                &sql,
+                &params.iter().map(|p| p as &dyn ToSql).collect::<Vec<_>>(),
+            )
+            .context(DbConnectionSnafu)?;
 
         Ok(())
     }
@@ -203,7 +191,9 @@ impl<'a> DuckDBUpdate<'a> {
             if drop_if_exists {
                 let sql = format!(r#"DROP TABLE "{}""#, self.name);
                 tracing::trace!("{sql}");
-                self.duckdb_conn.execute(&sql, []).context(DuckDBSnafu)?;
+                self.duckdb_conn
+                    .execute(&sql, &[])
+                    .context(DbConnectionSnafu)?;
             } else {
                 return Ok(());
             }
@@ -221,8 +211,14 @@ impl<'a> DuckDBUpdate<'a> {
         tracing::trace!("{sql}");
 
         self.duckdb_conn
-            .execute(&sql, arrow_params)
-            .context(DuckDBSnafu)?;
+            .execute(
+                &sql,
+                &arrow_params
+                    .iter()
+                    .map(|p| p as &dyn ToSql)
+                    .collect::<Vec<_>>(),
+            )
+            .context(DbConnectionSnafu)?;
 
         Ok(())
     }
@@ -239,6 +235,7 @@ impl<'a> DuckDBUpdate<'a> {
         tracing::trace!("{sql}");
 
         self.duckdb_conn
+            .conn
             .query_row(&sql, [], |row| row.get::<usize, bool>(0))
             .unwrap_or(false)
     }
@@ -264,8 +261,9 @@ mod tests {
     async fn test_add_data() {
         let ctx = Arc::new(SessionContext::new());
         let name = "test_add_data";
-        let backend = DuckDBBackend::new(Arc::clone(&ctx), name, Mode::Memory, Arc::new(None))
-            .expect("Unable to create DuckDBBackend");
+        let backend =
+            DuckDBBackend::new(Arc::clone(&ctx), name, Mode::Memory, Arc::new(None), None)
+                .expect("Unable to create DuckDBBackend");
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("a", DataType::Utf8, false),

@@ -1,85 +1,86 @@
 #![allow(clippy::missing_errors_doc)]
 
+use arrow::array::RecordBatch;
+use async_stream::stream;
 use async_trait::async_trait;
-use duckdb::DuckdbConnectionManager;
+use flight_client::FlightClient;
+use futures::{Stream, StreamExt};
 use snafu::prelude::*;
-use std::{any::Any, fmt, sync::Arc};
+use sql_provider_datafusion::expr;
+use std::{any::Any, fmt, pin::Pin, sync::Arc, task::Poll};
 
+use arrow_flight::error::FlightError;
 use datafusion::{
     arrow::datatypes::SchemaRef,
     common::OwnedTableReference,
     datasource::TableProvider,
     error::{DataFusionError, Result as DataFusionResult},
-    execution::{context::SessionState, TaskContext},
+    execution::{context::SessionState, RecordBatchStream, TaskContext},
     logical_expr::{Expr, TableProviderFilterPushDown, TableType},
     physical_plan::{
-        memory::MemoryStream, project_schema, DisplayAs, DisplayFormatType, ExecutionPlan,
-        SendableRecordBatchStream,
+        project_schema, DisplayAs, DisplayFormatType, ExecutionPlan, SendableRecordBatchStream,
     },
     sql::TableReference,
 };
 
-mod expr;
-
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to get a DuckDB connection from the pool: {source}"))]
-    UnableToGetConnectionFromPool { source: r2d2::Error },
-
-    #[snafu(display("Unable to query DuckDB: {source}"))]
-    UnableToQueryDuckDB { source: duckdb::Error },
-
     #[snafu(display("Unable to generate SQL: {source}"))]
     UnableToGenerateSQL { source: expr::Error },
+
+    #[snafu(display("Unable to query FlightSQL: {source}"))]
+    Flight { source: flight_client::Error },
+
+    #[snafu(display("Unable to query FlightSQL: {source}"))]
+    ArrowFlight { source: FlightError },
+
+    #[snafu(display("Unable to retrieve schema"))]
+    NoSchema,
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
-pub struct DuckDBTable {
-    pool: Arc<r2d2::Pool<DuckdbConnectionManager>>,
+pub struct FlightTable {
+    client: FlightClient,
     schema: SchemaRef,
     table_reference: OwnedTableReference,
 }
 
-impl DuckDBTable {
-    pub fn new(
-        pool: &Arc<r2d2::Pool<DuckdbConnectionManager>>,
+#[allow(clippy::needless_pass_by_value)]
+impl FlightTable {
+    pub async fn new(
+        client: FlightClient,
         table_reference: impl Into<OwnedTableReference>,
     ) -> Result<Self> {
         let table_reference = table_reference.into();
-        let schema = Self::get_schema(pool, &table_reference)?;
+        let schema = Self::get_schema(client.clone(), &table_reference).await?;
         Ok(Self {
-            pool: Arc::clone(pool),
+            client: client.clone(),
             schema,
             table_reference,
         })
     }
 
-    pub fn new_with_schema(
-        pool: &Arc<r2d2::Pool<DuckdbConnectionManager>>,
-        schema: impl Into<SchemaRef>,
-        table_reference: impl Into<OwnedTableReference>,
-    ) -> Self {
-        Self {
-            pool: Arc::clone(pool),
-            schema: schema.into(),
-            table_reference: table_reference.into(),
-        }
-    }
-
-    pub fn get_schema<'a>(
-        pool: &Arc<r2d2::Pool<DuckdbConnectionManager>>,
+    #[allow(clippy::needless_pass_by_value)]
+    async fn get_schema<'a>(
+        client: FlightClient,
         table_reference: impl Into<TableReference<'a>>,
     ) -> Result<SchemaRef> {
-        let table_reference = table_reference.into();
-        let conn = pool.get().context(UnableToGetConnectionFromPoolSnafu)?;
-        let mut stmt = conn
-            .prepare(&format!("SELECT * FROM {table_reference} LIMIT 0"))
-            .context(UnableToQueryDuckDBSnafu)?;
+        let mut stream = client
+            .clone()
+            .query(format!("SELECT * FROM {} limit 1", table_reference.into()).as_str())
+            .await
+            .map_err(|error| Error::Flight { source: error })?;
 
-        let result: duckdb::Arrow<'_> = stmt.query_arrow([]).context(UnableToQueryDuckDBSnafu)?;
-
-        Ok(result.get_schema())
+        if stream.next().await.is_some() {
+            if let Some(schema) = stream.schema() {
+                Ok(Arc::clone(schema))
+            } else {
+                Err(Error::NoSchema {})
+            }
+        } else {
+            Err(Error::NoSchema {})
+        }
     }
 
     fn create_physical_plan(
@@ -89,11 +90,11 @@ impl DuckDBTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(DuckDBExec::new(
+        Ok(Arc::new(FlightExec::new(
             projections,
             schema,
             &self.table_reference,
-            Arc::clone(&self.pool),
+            self.client.clone(),
             filters,
             limit,
         )?))
@@ -101,7 +102,7 @@ impl DuckDBTable {
 }
 
 #[async_trait]
-impl TableProvider for DuckDBTable {
+impl TableProvider for FlightTable {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -120,7 +121,7 @@ impl TableProvider for DuckDBTable {
     ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
         let mut filter_push_down = vec![];
         for filter in filters {
-            match expr::expr_to_sql(filter) {
+            match expr::to_sql(filter) {
                 Ok(_) => filter_push_down.push(TableProviderFilterPushDown::Exact),
                 Err(_) => filter_push_down.push(TableProviderFilterPushDown::Unsupported),
             }
@@ -141,20 +142,20 @@ impl TableProvider for DuckDBTable {
 }
 
 #[derive(Clone)]
-struct DuckDBExec {
+struct FlightExec {
     projected_schema: SchemaRef,
     table_reference: OwnedTableReference,
-    pool: Arc<r2d2::Pool<DuckdbConnectionManager>>,
+    client: FlightClient,
     filters: Vec<Expr>,
     limit: Option<usize>,
 }
 
-impl DuckDBExec {
+impl FlightExec {
     fn new(
         projections: Option<&Vec<usize>>,
         schema: &SchemaRef,
         table_reference: &OwnedTableReference,
-        pool: Arc<r2d2::Pool<DuckdbConnectionManager>>,
+        client: FlightClient,
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Self> {
@@ -162,7 +163,7 @@ impl DuckDBExec {
         Ok(Self {
             projected_schema,
             table_reference: table_reference.clone(),
-            pool,
+            client,
             filters: filters.to_vec(),
             limit,
         })
@@ -173,7 +174,7 @@ impl DuckDBExec {
             .projected_schema
             .fields()
             .iter()
-            .map(|f| f.name().as_str())
+            .map(|f| format!("\"{}\"", f.name()))
             .collect::<Vec<_>>()
             .join(", ");
 
@@ -188,7 +189,7 @@ impl DuckDBExec {
             let filter_expr = self
                 .filters
                 .iter()
-                .map(expr::expr_to_sql)
+                .map(expr::to_sql)
                 .collect::<expr::Result<Vec<_>>>()
                 .context(UnableToGenerateSQLSnafu)?;
             format!("WHERE {}", filter_expr.join(" AND "))
@@ -201,21 +202,21 @@ impl DuckDBExec {
     }
 }
 
-impl std::fmt::Debug for DuckDBExec {
+impl std::fmt::Debug for FlightExec {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         let sql = self.sql().unwrap_or_default();
-        write!(f, "DuckDBExec sql={sql}")
+        write!(f, "FlightExec sql={sql}")
     }
 }
 
-impl DisplayAs for DuckDBExec {
+impl DisplayAs for FlightExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> std::fmt::Result {
         let sql = self.sql().unwrap_or_default();
-        write!(f, "DuckDB sql={sql}")
+        write!(f, "FlightExec sql={sql}")
     }
 }
 
-impl ExecutionPlan for DuckDBExec {
+impl ExecutionPlan for FlightExec {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -248,79 +249,78 @@ impl ExecutionPlan for DuckDBExec {
         _partition: usize,
         _context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-        let conn = self.pool.get().map_err(to_execution_error)?;
+        let sql = match self.sql().map_err(to_execution_error) {
+            Ok(sql) => sql,
+            Err(error) => return Err(error),
+        };
 
-        let sql = self.sql().map_err(to_execution_error)?;
-        tracing::debug!("duckdb sql: {sql}");
+        Ok(Box::pin(StreamConverter::new(
+            self.client.clone(),
+            sql.as_str(),
+            self.schema(),
+        )))
+    }
+}
 
-        let mut stmt = conn.prepare(&sql).map_err(to_execution_error)?;
+#[allow(clippy::needless_pass_by_value)]
+fn to_stream(client: FlightClient, sql: &str) -> impl Stream<Item = Result<RecordBatch>> {
+    let mut client = client.clone();
+    let sql = sql.to_string();
+    stream! {
+        match client.query(sql.as_str()).await {
+            Ok(mut stream) => {
+                while let Some(batch) = stream.next().await {
+                    match batch {
+                        Ok(batch) => yield Ok(batch),
+                        Err(error) => {
+                            yield Err(Error::ArrowFlight { source: error });
+                        }
+                    }
+                }
+            }
+            Err(error) => yield Err(Error::Flight{ source: error})
+        }
+    }
+}
 
-        let result: duckdb::Arrow<'_> = stmt.query_arrow([]).map_err(to_execution_error)?;
-        let recs = result.collect::<Vec<_>>();
+struct StreamConverter {
+    stream: Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>>,
+    schema: SchemaRef,
+}
 
-        Ok(Box::pin(MemoryStream::try_new(recs, self.schema(), None)?))
+impl StreamConverter {
+    fn new(client: FlightClient, sql: &str, schema: SchemaRef) -> Self {
+        let stream = to_stream(client, sql);
+        Self {
+            stream: Box::pin(stream),
+            schema,
+        }
+    }
+}
+
+impl RecordBatchStream for StreamConverter {
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+}
+
+impl Stream for StreamConverter {
+    type Item = datafusion::common::Result<RecordBatch>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        match self.stream.poll_next_unpin(cx) {
+            Poll::Ready(Some(Ok(record_batch))) => Poll::Ready(Some(Ok(record_batch))),
+            Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(to_execution_error(error)))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
 #[allow(clippy::needless_pass_by_value)]
 fn to_execution_error(e: impl Into<Box<dyn std::error::Error>>) -> DataFusionError {
     DataFusionError::Execution(format!("{}", e.into()).to_string())
-}
-
-#[cfg(test)]
-mod tests {
-    use std::{error::Error, sync::Arc};
-
-    use datafusion::execution::context::SessionContext;
-    use duckdb::DuckdbConnectionManager;
-    use tracing::{level_filters::LevelFilter, subscriber::DefaultGuard, Dispatch};
-
-    use crate::DuckDBTable;
-
-    fn setup_tracing() -> DefaultGuard {
-        let subscriber: tracing_subscriber::FmtSubscriber = tracing_subscriber::fmt()
-            .with_max_level(LevelFilter::DEBUG)
-            .finish();
-
-        let dispatch = Dispatch::new(subscriber);
-        tracing::dispatcher::set_default(&dispatch)
-    }
-
-    #[tokio::test]
-    async fn test_duckdb_table() -> Result<(), Box<dyn Error>> {
-        let t = setup_tracing();
-        let ctx = SessionContext::new();
-        let conn = DuckdbConnectionManager::memory()?;
-        let pool = Arc::new(r2d2::Pool::new(conn)?);
-        let db_conn = pool.get()?;
-        db_conn.execute_batch(
-            "CREATE TABLE test (a INTEGER, b VARCHAR); INSERT INTO test VALUES (3, 'bar');",
-        )?;
-        let duckdb_table = DuckDBTable::new(&pool, "test")?;
-        ctx.register_table("test_datafusion", Arc::new(duckdb_table))?;
-        let sql = "SELECT * FROM test_datafusion limit 1";
-        let df = ctx.sql(sql).await?;
-        df.show().await?;
-        drop(t);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_duckdb_table_filter() -> Result<(), Box<dyn Error>> {
-        let t = setup_tracing();
-        let ctx = SessionContext::new();
-        let conn = DuckdbConnectionManager::memory()?;
-        let pool = Arc::new(r2d2::Pool::new(conn)?);
-        let db_conn = pool.get()?;
-        db_conn.execute_batch(
-            "CREATE TABLE test (a INTEGER, b VARCHAR); INSERT INTO test VALUES (3, 'bar');",
-        )?;
-        let duckdb_table = DuckDBTable::new(&pool, "test")?;
-        ctx.register_table("test_datafusion", Arc::new(duckdb_table))?;
-        let sql = "SELECT * FROM test_datafusion where a > 1 and b = 'bar' limit 1";
-        let df = ctx.sql(sql).await?;
-        df.show().await?;
-        drop(t);
-        Ok(())
-    }
 }

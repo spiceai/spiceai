@@ -21,13 +21,13 @@ pub enum Error {
         source: component::Error,
         path: PathBuf,
     },
-    #[snafu(display("spicepod.yaml not found in {}", path.display()))]
+    #[snafu(display("spicepod.yaml not found in {}, run `spice init <name>` to initialize spicepod.yaml", path.display()))]
     SpicepodNotFound { path: PathBuf },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct Spicepod {
     pub name: String,
 

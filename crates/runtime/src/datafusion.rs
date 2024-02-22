@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::databackend::{self, DataBackend};
+use crate::databackend::{self, DataBackendBuilder};
 use crate::dataconnector::DataConnector;
 use crate::datapublisher::DataPublisher;
 use datafusion::datasource::ViewTable;
@@ -47,6 +47,9 @@ pub enum Error {
     #[snafu(display("Unable to create view: {reason}"))]
     UnableToCreateView { reason: String },
 
+    #[snafu(display("Unable to delete table: {reason}"))]
+    UnableToDeleteTable { reason: String },
+
     #[snafu(display("Unable to parse SQL: {source}"))]
     UnableToParseSql {
         source: sqlparser::parser::ParserError,
@@ -54,6 +57,9 @@ pub enum Error {
 
     #[snafu(display("Unable to get table: {source}"))]
     UnableToGetTable { source: DataFusionError },
+
+    #[snafu(display("Unable to register table: {source}"))]
+    UnableToRegisterTable { source: crate::dataconnector::Error },
 
     #[snafu(display("Unable to create view: {source}"))]
     InvalidSQLView {
@@ -70,7 +76,7 @@ type DatasetAndPublishers = (Arc<Dataset>, PublisherList);
 
 pub struct DataFusion {
     pub ctx: Arc<SessionContext>,
-    tasks: Vec<task::JoinHandle<()>>,
+    connectors_tasks: HashMap<String, task::JoinHandle<()>>,
     data_publishers: HashMap<String, DatasetAndPublishers>,
 }
 
@@ -83,7 +89,7 @@ impl DataFusion {
             ctx: Arc::new(SessionContext::new_with_config(
                 SessionConfig::new().with_information_schema(true),
             )),
-            tasks: Vec::new(),
+            connectors_tasks: HashMap::new(),
             data_publishers: HashMap::new(),
         }
     }
@@ -120,7 +126,7 @@ impl DataFusion {
         dataset: impl Borrow<Dataset>,
     ) -> Result<Box<dyn DataPublisher>> {
         let dataset = dataset.borrow();
-        let table_name = dataset.name.as_str();
+        let table_name = dataset.name.to_string();
         let acceleration =
             dataset
                 .acceleration
@@ -131,14 +137,13 @@ impl DataFusion {
 
         let params: Arc<Option<HashMap<String, String>>> = Arc::new(dataset.params.clone());
 
-        let data_backend: Box<dyn DataPublisher> = DataBackend::new(
-            &self.ctx,
-            table_name,
-            acceleration.engine(),
-            acceleration.mode(),
-            params,
-        )
-        .context(DatasetConfigurationSnafu)?;
+        let data_backend: Box<dyn DataPublisher> =
+            DataBackendBuilder::new(Arc::clone(&self.ctx), table_name)
+                .engine(acceleration.engine())
+                .mode(acceleration.mode())
+                .params(params)
+                .build()
+                .context(DatasetConfigurationSnafu)?;
 
         Ok(data_backend)
     }
@@ -170,8 +175,8 @@ impl DataFusion {
         data_connector: Box<dyn DataConnector>,
         publisher: Arc<Box<dyn DataPublisher>>,
     ) -> Result<()> {
-        let table_name = dataset.name.as_str();
-        let table_exists = self.ctx.table_exist(table_name).unwrap_or(false);
+        let table_name = dataset.name.clone();
+        let table_exists = self.ctx.table_exist(table_name.as_str()).unwrap_or(false);
         if table_exists {
             return TableAlreadyExistsSnafu.fail();
         }
@@ -193,9 +198,64 @@ impl DataFusion {
             }
         });
 
-        self.tasks.push(task_handle);
+        self.connectors_tasks.insert(table_name, task_handle);
 
         Ok(())
+    }
+
+    #[must_use]
+    pub fn table_exists(&self, dataset_name: &str) -> bool {
+        self.ctx.table_exist(dataset_name).unwrap_or(false)
+    }
+
+    pub fn remove_table(&mut self, dataset_name: &str) -> Result<()> {
+        if !self.ctx.table_exist(dataset_name).unwrap_or(false) {
+            return Ok(());
+        }
+
+        if let Err(e) = self.ctx.deregister_table(dataset_name) {
+            return UnableToDeleteTableSnafu {
+                reason: e.to_string(),
+            }
+            .fail();
+        }
+
+        if self.connectors_tasks.contains_key(dataset_name) {
+            if let Some(data_connector_stream) = self.connectors_tasks.remove(dataset_name) {
+                data_connector_stream.abort();
+            }
+        }
+
+        if self.data_publishers.contains_key(dataset_name) {
+            self.data_publishers.remove(dataset_name);
+        }
+
+        Ok(())
+    }
+
+    #[allow(clippy::needless_pass_by_value)]
+    pub async fn attach_mesh(
+        &self,
+        dataset: impl Borrow<Dataset>,
+        data_connector: Box<dyn DataConnector>,
+    ) -> Result<()> {
+        let dataset = dataset.borrow();
+        let table_exists = self.ctx.table_exist(dataset.name.as_str()).unwrap_or(false);
+        if table_exists {
+            return TableAlreadyExistsSnafu.fail();
+        }
+
+        let provider = data_connector.get_table_provider(dataset).await;
+
+        match provider {
+            Ok(provider) => {
+                let _ = self
+                    .ctx
+                    .register_table(dataset.name.as_str(), Arc::clone(&provider));
+                Ok(())
+            }
+            Err(error) => Err(Error::UnableToRegisterTable { source: error }),
+        }
     }
 
     pub fn attach_view(&self, dataset: impl Borrow<Dataset>) -> Result<()> {
@@ -336,9 +396,11 @@ impl DataFusion {
 
 impl Drop for DataFusion {
     fn drop(&mut self) {
-        for task in self.tasks.drain(..) {
+        for task in self.connectors_tasks.values() {
             task.abort();
         }
+
+        self.connectors_tasks.clear();
     }
 }
 

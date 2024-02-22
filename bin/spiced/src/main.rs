@@ -59,7 +59,7 @@ fn init_tracing() -> Result<(), Box<dyn std::error::Error>> {
     let filter = if let Ok(env_log) = std::env::var("SPICED_LOG") {
         EnvFilter::new(env_log)
     } else {
-        EnvFilter::new("spiced=INFO,runtime=INFO")
+        EnvFilter::new("spiced=INFO,runtime=INFO,flight_datafusion=INFO")
     };
 
     let subscriber = tracing_subscriber::FmtSubscriber::builder()

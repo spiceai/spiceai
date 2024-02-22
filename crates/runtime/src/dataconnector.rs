@@ -1,3 +1,5 @@
+use async_trait::async_trait;
+use datafusion::datasource::TableProvider;
 use futures::stream;
 use snafu::prelude::*;
 use spicepod::component::dataset::acceleration::RefreshMode;
@@ -26,6 +28,11 @@ pub enum Error {
     UnableToCreateDataConnector {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[snafu(display("Unable to get table provider: {source}"))]
+    UnableToGetTableProvider {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -43,6 +50,7 @@ pub type AnyErrorResult = std::result::Result<(), Box<dyn std::error::Error>>;
 ///    update_type: UpdateType::Overwrite,
 /// }
 /// ```
+#[async_trait]
 pub trait DataConnector: Send + Sync {
     /// Create a new `DataConnector` with the given `AuthProvider`.
     fn new(
@@ -70,6 +78,17 @@ pub trait DataConnector: Send + Sync {
 
     fn get_data_publisher(&self) -> Option<Box<dyn DataPublisher>> {
         None
+    }
+
+    fn has_table_provider(&self) -> bool {
+        false
+    }
+
+    async fn get_table_provider(
+        &self,
+        dataset: &Dataset,
+    ) -> Result<Arc<dyn TableProvider + 'static>> {
+        panic!("get_table_provider not implemented for {}", dataset.name)
     }
 }
 

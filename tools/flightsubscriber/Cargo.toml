@@ -9,17 +9,17 @@ repository.workspace = true
 description = "Spice OSS Flight Subscriber"
 
 [dependencies]
-arrow = "49.0.0"
-arrow-flight = "49.0.0"
+arrow.workspace = true
+arrow-flight.workspace = true
 parquet = "49.0.0"
 clap.workspace = true
 tokio.workspace = true
-tonic = { version = "0.10.0", default-features = false, features = [
+tonic = { workspace = true, default-features = false, features = [
   "transport",
   "tls",
   "tls-roots",
 ] }
-async-stream = "0.3.5"
-futures = "0.3.30"
-tracing = "0.1.40"
+async-stream.workspace = true
+futures.workspace = true
+tracing.workspace = true
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
