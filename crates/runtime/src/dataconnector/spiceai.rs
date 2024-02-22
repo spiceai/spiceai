@@ -4,6 +4,8 @@ use flight_client::FlightClient;
 use futures::StreamExt;
 use futures_core::stream::BoxStream;
 use snafu::prelude::*;
+use sql_provider_datafusion::dbconnectionpool::flightpool::FlightConnectionPool;
+use sql_provider_datafusion::SqlTable;
 use std::borrow::Borrow;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -21,6 +23,11 @@ use crate::info_spaced;
 use crate::tracers::SpacedTracer;
 
 use super::{flight::Flight, DataConnector};
+use duckdb::{vtab::arrow::arrow_recordbatch_to_query_params, DuckdbConnectionManager, ToSql};
+use sql_provider_datafusion::{
+    dbconnection::{self, flight::FlightConnection, DbConnection},
+    dbconnectionpool::{DbConnectionPool, Mode},
+};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -37,6 +44,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub struct SpiceAI {
     flight: Flight,
     spaced_trace: Arc<SpacedTracer>,
+    pool: Arc<dyn DbConnectionPool<DuckdbConnectionManager, &'static dyn ToSql> + Send + Sync>,
 }
 
 impl DataConnector for SpiceAI {
@@ -67,8 +75,12 @@ impl DataConnector for SpiceAI {
             .await
             .map_err(|e| super::Error::UnableToCreateDataConnector { source: e.into() })?;
             let flight = Flight::new(flight_client);
+
+            let pool = FlightConnectionPool::new_with_client(flight.client.clone());
+
             Ok(Self {
                 flight,
+                pool: Arc::new(pool),
                 spaced_trace: Arc::new(SpacedTracer::new(Duration::from_secs(15))),
             })
         })
@@ -138,8 +150,7 @@ impl DataConnector for SpiceAI {
         dataset: Dataset,
     ) -> std::result::Result<Arc<dyn datafusion::datasource::TableProvider>, super::Error> {
         let dataset_path = Self::spice_dataset_path(dataset);
-
-        let provider = FlightSQLTable::new(self.flight.client.clone(), dataset_path);
+        let provider = SqlTable::new(&self.pool, dataset_path);
 
         match provider {
             Ok(provider) => Ok(Arc::new(provider)),

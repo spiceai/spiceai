@@ -14,7 +14,7 @@ pub(crate) fn expr_to_sql(expr: &Expr) -> Result<String> {
             let right = expr_to_sql(&binary_expr.right)?;
             Ok(format!("{} {} {}", left, binary_expr.op, right))
         }
-        Expr::Column(name) => Ok(name.to_string()),
+        Expr::Column(name) => Ok(format!("\"{}\"", name)),
         Expr::Literal(value) => match value {
             ScalarValue::Null => Ok(value.to_string()),
             ScalarValue::Int16(Some(value)) => Ok(value.to_string()),

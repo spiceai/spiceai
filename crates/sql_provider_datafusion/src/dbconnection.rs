@@ -4,6 +4,7 @@ use ::duckdb::arrow::array::RecordBatch;
 use datafusion::{arrow::datatypes::SchemaRef, sql::TableReference};
 
 pub mod duckdbconn;
+pub mod flight;
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 type Result<T, E = Error> = std::result::Result<T, E>;
