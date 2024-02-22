@@ -84,6 +84,6 @@ impl DataConnector for DebugSource {
     }
 
     fn has_table_provider(&self) -> bool {
-        true
+        false
     }
 }

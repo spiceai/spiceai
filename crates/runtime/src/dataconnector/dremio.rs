@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::{collections::HashMap, future::Future};
 
 use flight_client::FlightClient;
+use flight_datafusion::FlightSQLTable;
 use spicepod::component::dataset::Dataset;
 
 use crate::auth::AuthProvider;
@@ -52,5 +53,21 @@ impl DataConnector for Dremio {
 
     fn has_table_provider(&self) -> bool {
         true
+    }
+
+    fn get_table_provider(
+        &self,
+        dataset: &Dataset,
+    ) -> std::result::Result<Arc<dyn datafusion::datasource::TableProvider>, super::Error> {
+        let dremio_path = dataset.path();
+
+        let provider = FlightSQLTable::new(Arc::new(self.flight.client.clone()), dremio_path);
+
+        match provider {
+            Ok(provider) => Ok(Arc::new(provider)),
+            Err(error) => Err(super::Error::UnableToGetTableProvider {
+                source: error.into(),
+            }),
+        }
     }
 }
