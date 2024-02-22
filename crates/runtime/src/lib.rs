@@ -135,11 +135,14 @@ impl Runtime {
                 let auth = shared_auth.read().await;
 
                 let source = ds.source();
-                let source = source.as_str();
                 let params = Arc::new(ds.params.clone());
                 let data_connector: Option<Box<dyn DataConnector + Send>> =
-                    match Runtime::get_dataconnector_from_source(source, &auth, Arc::clone(&params))
-                        .await
+                    match Runtime::get_dataconnector_from_source(
+                        &source,
+                        &auth,
+                        Arc::clone(&params),
+                    )
+                    .await
                     {
                         Ok(data_connector) => data_connector,
                         Err(err) => {
@@ -164,7 +167,7 @@ impl Runtime {
                 match Runtime::initialize_dataconnector(
                     data_connector,
                     Arc::clone(&df),
-                    source,
+                    &source,
                     &ds,
                 )
                 .await
@@ -211,7 +214,7 @@ impl Runtime {
         params: Arc<Option<HashMap<String, String>>>,
     ) -> Result<Option<Box<dyn DataConnector + Send>>> {
         match source {
-            "spice.ai" => Ok(Some(Box::new(
+            "spiceai" => Ok(Some(Box::new(
                 dataconnector::spiceai::SpiceAI::new(auth.get(source), params)
                     .await
                     .context(UnableToInitializeDataConnectorSnafu {
@@ -225,7 +228,7 @@ impl Runtime {
                         data_connector: source,
                     })?,
             ))),
-            "localhost" | "" => Ok(None),
+            "localhost" => Ok(None),
             "debug" => Ok(Some(Box::new(dataconnector::debug::DebugSource {}))),
             _ => UnknownDataConnectorSnafu {
                 data_connector: source,
