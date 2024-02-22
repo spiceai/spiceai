@@ -87,7 +87,7 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct Runtime {
-    pub app: Option<Arc<RwLock<App>>>,
+    pub app: Arc<RwLock<Option<App>>>,
     pub config: config::Config,
     pub df: Arc<RwLock<DataFusion>>,
     pub models: Arc<RwLock<HashMap<String, Model>>>,
@@ -101,7 +101,7 @@ impl Runtime {
     #[must_use]
     pub fn new(
         config: Config,
-        app: Option<Arc<RwLock<app::App>>>,
+        app: Arc<RwLock<Option<app::App>>>,
         df: Arc<RwLock<DataFusion>>,
         pods_watcher: podswatcher::PodsWatcher,
         auth: Arc<RwLock<auth::AuthProviders>>,
@@ -118,8 +118,9 @@ impl Runtime {
     }
 
     pub async fn load_datasets(&self) {
-        if let Some(app) = &self.app {
-            for ds in app.read().await.datasets.clone() {
+        let app_lock = self.app.read().await;
+        if let Some(app) = app_lock.as_ref() {
+            for ds in app.datasets.clone() {
                 self.load_dataset(ds);
             }
         }
@@ -289,8 +290,9 @@ impl Runtime {
     }
 
     pub async fn load_models(&self) {
-        if let Some(app) = &self.app {
-            for model in &app.read().await.models {
+        let app_lock = self.app.read().await;
+        if let Some(app) = app_lock.as_ref() {
+            for model in &app.models {
                 self.load_model(model).await;
             }
         }
@@ -363,9 +365,8 @@ impl Runtime {
         let mut rx = self.pods_watcher.watch()?;
 
         while let Some(new_app) = rx.recv().await {
-            if let Some(app) = &self.app {
-                let mut current_app = app.write().await;
-
+            let mut app_lock = self.app.write().await;
+            if let Some(current_app) = app_lock.as_mut() {
                 if *current_app == new_app {
                     continue;
                 }
@@ -403,7 +404,7 @@ impl Runtime {
 
                 *current_app = new_app;
             } else {
-                self.app = Some(Arc::new(RwLock::new(new_app)));
+                *app_lock = Some(new_app);
             }
         }
 

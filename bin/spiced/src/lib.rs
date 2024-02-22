@@ -71,13 +71,14 @@ pub async fn run(args: Args) -> Result<()> {
     let auth = Arc::new(RwLock::new(runtime::load_auth_providers()));
     let df = Arc::new(RwLock::new(runtime::datafusion::DataFusion::new()));
     let pods_watcher = PodsWatcher::new(current_dir.clone());
-    let app = match App::new(current_dir.clone()).context(UnableToConstructSpiceAppSnafu) {
-        Ok(app) => Some(Arc::new(RwLock::new(app))),
-        Err(e) => {
-            tracing::warn!("{}", e);
-            None
-        }
-    };
+    let app: Arc<RwLock<Option<App>>> =
+        match App::new(current_dir.clone()).context(UnableToConstructSpiceAppSnafu) {
+            Ok(app) => Arc::new(RwLock::new(Some(app))),
+            Err(e) => {
+                tracing::warn!("{}", e);
+                Arc::new(RwLock::new(None))
+            }
+        };
 
     let mut rt: Runtime = Runtime::new(args.runtime, app, df, pods_watcher, auth);
 
