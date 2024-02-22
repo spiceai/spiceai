@@ -19,14 +19,22 @@ pub struct Dremio {
 impl DataConnector for Dremio {
     fn new(
         auth_provider: AuthProvider,
-        _params: Arc<Option<HashMap<String, String>>>,
+        params: Arc<Option<HashMap<String, String>>>,
     ) -> Pin<Box<dyn Future<Output = super::Result<Self>> + Send>>
     where
         Self: Sized,
     {
         Box::pin(async move {
+
+            let endpoint: String = params
+                .as_ref() // &Option<HashMap<String, String>>
+                .as_ref() // Option<&HashMap<String, String>>
+                .and_then(|params| params.get("endpoint").cloned())
+                .ok_or_else(|| super::Error::UnableToCreateDataConnector {
+                    source: "Missing required parameter: endpoint".into(),
+                })?;
             let flight_client = FlightClient::new(
-                auth_provider.get_param("endpoint").unwrap_or_default(),
+                endpoint.as_str(),
                 auth_provider.get_param("username").unwrap_or_default(),
                 auth_provider.get_param("password").unwrap_or_default(),
             )
