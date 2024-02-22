@@ -2,6 +2,8 @@ use std::any::Any;
 
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::execution::SendableRecordBatchStream;
+use datafusion::physical_plan::memory::MemoryStream;
 use datafusion::sql::TableReference;
 use duckdb::DuckdbConnectionManager;
 use duckdb::ToSql;
@@ -14,6 +16,11 @@ use super::Result;
 pub enum Error {
     #[snafu(display("DuckDBError: {source}"))]
     DuckDBError { source: duckdb::Error },
+
+    #[snafu(display("DataFusionError: {source}"))]
+    DataFusionError {
+        source: datafusion::error::DataFusionError,
+    },
 }
 
 pub struct DuckDbConnection {
@@ -36,12 +43,19 @@ impl DbConnection<DuckdbConnectionManager, &dyn ToSql> for DuckDbConnection {
         Ok(result.get_schema())
     }
 
-    fn query_arrow(&mut self, sql: &str, params: &[&dyn ToSql]) -> Result<Vec<RecordBatch>> {
+    fn query_arrow(
+        &mut self,
+        sql: &str,
+        params: &[&dyn ToSql],
+    ) -> Result<SendableRecordBatchStream> {
         let mut stmt = self.conn.prepare(sql).context(DuckDBSnafu)?;
 
         let result: duckdb::Arrow<'_> = stmt.query_arrow(params).context(DuckDBSnafu)?;
-
-        Ok(result.collect())
+        let schema = result.get_schema();
+        let recs = result.collect();
+        Ok(Box::pin(
+            MemoryStream::try_new(recs, schema, None).context(DataFusionSnafu)?,
+        ))
     }
 
     fn execute(&mut self, sql: &str, params: &[&dyn ToSql]) -> Result<u64> {

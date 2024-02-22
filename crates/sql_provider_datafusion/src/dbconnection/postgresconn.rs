@@ -1,10 +1,15 @@
 use std::any::Any;
 use std::sync::Arc;
 
+use arrow::record_batch::RecordBatch;
 use arrow_flight::sql::client::FlightSqlServiceClient;
+use arrow_schema::Schema;
+use async_stream::stream;
+use async_stream::try_stream;
 use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::execution::SendableRecordBatchStream;
 use datafusion::sql::TableReference;
-use duckdb::arrow::array::RecordBatch;
+use futures::stream::BoxStream;
 use futures::StreamExt;
 use postgres::types::ToSql;
 use r2d2_postgres::postgres::NoTls;
@@ -15,6 +20,7 @@ use tokio::sync::Mutex;
 use tonic::transport::Channel;
 
 use super::DbConnection;
+use super::FlightStream;
 use super::Result;
 
 #[derive(Debug, Snafu)]
@@ -109,49 +115,39 @@ impl<'a> DbConnection<PostgresConnectionManager<NoTls>, &'a (dyn ToSql + Sync)>
         &mut self,
         sql: &str,
         _params: &[&'a (dyn ToSql + Sync)],
-    ) -> Result<Vec<RecordBatch>> {
-        // DataFusion ExecutionPlan does not support async, so we can't make the query_arrow method async and
-        // instead need to block.
-        tokio::task::block_in_place(move || {
-            Handle::current().block_on(async {
-                let Some(client) = &self.flight_sql_client else {
-                    return NoFlightSqlClientSnafu.fail()?;
+    ) -> Result<SendableRecordBatchStream> {
+        let schema = SchemaRef::new(Schema::empty());
+        let query = sql.clone().to_string();
+        let stream = Box::pin(try_stream! {
+            let client = &self.flight_sql_client.unwrap();
+
+            let mut stmt = client
+                .lock()
+                .await
+                .prepare(query, None)
+                .await
+                .unwrap();
+
+            let flight_info = stmt.execute().await.unwrap();
+
+            let ticket = flight_info.endpoint[0].ticket.as_ref().unwrap();
+            let mut flight_record_batch_stream =
+                client.lock().await.do_get(ticket.clone()).await.unwrap();
+
+            while let Some(batch) = flight_record_batch_stream.next().await {
+                match batch {
+                    Ok(batch) => {
+                        schema = batch.schema();
+                        yield batch;
+                    }
+                    Err(error) => {
+                        tracing::error!("Failed to read batch from flight client: {:?}", error);
+                    }
                 };
+            }
+        });
 
-                let mut stmt = client
-                    .lock()
-                    .await
-                    .prepare(sql.to_string(), None)
-                    .await
-                    .context(UnableToQuerySnafu)?;
-
-                let flight_info = stmt.execute().await.context(UnableToQuerySnafu)?;
-
-                let Some(ticket) = flight_info.endpoint[0].ticket.as_ref() else {
-                    return NoTicketReceivedSnafu.fail()?;
-                };
-                let mut flight_record_batch_stream = client
-                    .lock()
-                    .await
-                    .do_get(ticket.clone())
-                    .await
-                    .context(UnableToQuerySnafu)?;
-
-                let mut result_data = vec![];
-                while let Some(batch) = flight_record_batch_stream.next().await {
-                    match batch {
-                        Ok(batch) => {
-                            result_data.push(batch);
-                        }
-                        Err(error) => {
-                            tracing::error!("Failed to read batch from flight client: {:?}", error);
-                            return Ok(result_data);
-                        }
-                    };
-                }
-                Ok(result_data)
-            })
-        })
+        Ok(Box::pin(FlightStream::new(stream, schema)))
     }
 
     fn execute(&mut self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<u64> {

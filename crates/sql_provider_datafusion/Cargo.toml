@@ -28,6 +28,10 @@ tonic = { workspace = true, default-features = false, features = [
 ] }
 futures.workspace = true
 arrow-schema = "49.0.0"
+arrow.workspace = true
+async-stream.workspace = true
+datafusion-common = "36.0.0"
+futures-util = "0.3.30"
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }

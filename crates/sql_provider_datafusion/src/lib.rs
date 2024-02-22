@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use dbconnectionpool::DbConnectionPool;
+use futures::Stream;
 use snafu::prelude::*;
 use std::{any::Any, fmt, sync::Arc};
 
@@ -13,8 +14,7 @@ use datafusion::{
     execution::{context::SessionState, TaskContext},
     logical_expr::{Expr, TableProviderFilterPushDown, TableType},
     physical_plan::{
-        memory::MemoryStream, project_schema, DisplayAs, DisplayFormatType, ExecutionPlan,
-        SendableRecordBatchStream,
+        project_schema, DisplayAs, DisplayFormatType, ExecutionPlan, SendableRecordBatchStream,
     },
 };
 
@@ -242,9 +242,7 @@ impl<T: r2d2::ManageConnection, P: 'static> ExecutionPlan for SqlExec<T, P> {
         let sql = self.sql().map_err(to_execution_error)?;
         tracing::debug!("SqlExec sql: {sql}");
 
-        let recs = conn.query_arrow(&sql, &[]).map_err(to_execution_error)?;
-
-        Ok(Box::pin(MemoryStream::try_new(recs, self.schema(), None)?))
+        Ok(conn.query_arrow(&sql, &[]).map_err(to_execution_error)?)
     }
 }
 
