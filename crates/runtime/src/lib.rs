@@ -120,8 +120,9 @@ impl Runtime {
     pub async fn load_datasets(&self) {
         let app_lock = self.app.read().await;
         if let Some(app) = app_lock.as_ref() {
-        for ds in &self.app.read().await.datasets {
-            self.load_dataset(ds);
+            for ds in &app.datasets {
+                self.load_dataset(ds);
+            }
         }
     }
 
@@ -395,14 +396,17 @@ impl Runtime {
 
                 *self.auth.write().await = load_auth_providers();
 
-            // check for new and updated datasets
+                // check for new and updated datasets
                 for ds in &new_app.datasets {
-                    if let Some(current_ds) = current_app.datasets.iter().find(|d| d.name == ds.name) {
+                    if let Some(current_ds) =
+                        current_app.datasets.iter().find(|d| d.name == ds.name)
+                    {
                         if current_ds != ds {
                             self.update_dataset(ds).await;
                         }
                     } else {
                         self.load_dataset(ds);
+                    }
                 }
 
                 // check for new and updated models
@@ -424,8 +428,8 @@ impl Runtime {
                         self.remove_model(model).await;
                     }
                 }
-                  
-                 // Remove datasets that are no longer in the app
+
+                // Remove datasets that are no longer in the app
                 for ds in &current_app.datasets {
                     if !new_app.datasets.iter().any(|d| d.name == ds.name) {
                         self.remove_dataset(ds).await;
