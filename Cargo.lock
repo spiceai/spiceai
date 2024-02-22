@@ -1464,6 +1464,8 @@ name = "flight_datafusion"
 version = "0.7.0-alpha"
 dependencies = [
  "arrow",
+ "arrow-flight",
+ "async-stream",
  "async-trait",
  "datafusion",
  "flight_client",

@@ -12,6 +12,8 @@ exclude.workspace = true
 
 [dependencies]
 arrow.workspace = true
+arrow-flight.workspace = true
+async-stream.workspace = true
 datafusion.workspace = true
 futures.workspace = true
 async-trait.workspace = true

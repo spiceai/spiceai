@@ -1,18 +1,21 @@
 #![allow(clippy::missing_errors_doc)]
 
+use arrow::array::RecordBatch;
+use async_stream::stream;
 use async_trait::async_trait;
 use flight_client::FlightClient;
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 use snafu::prelude::*;
-use std::{any::Any, fmt, ops::Deref, sync::Arc};
+use std::{any::Any, fmt, ops::Deref, pin::Pin, sync::Arc, task::Poll};
 use tokio::runtime::Handle;
 
+use arrow_flight::decode::FlightRecordBatchStream;
 use datafusion::{
     arrow::datatypes::SchemaRef,
     common::OwnedTableReference,
     datasource::TableProvider,
     error::{DataFusionError, Result as DataFusionResult},
-    execution::{context::SessionState, TaskContext},
+    execution::{context::SessionState, RecordBatchStream, TaskContext},
     logical_expr::{Expr, TableProviderFilterPushDown, TableType},
     physical_plan::{
         memory::MemoryStream, project_schema, DisplayAs, DisplayFormatType, ExecutionPlan,
@@ -269,39 +272,63 @@ impl ExecutionPlan for FlightSQLExec {
             Err(error) => return Err(error),
         };
 
-        let mut client = self.client.deref().clone();
-        let data = tokio::task::block_in_place(move || {
-            Handle::current().block_on(async {
-                let result = client.query(sql.as_str()).await;
+        Ok(Box::pin(MyOwnStream::new(
+            Arc::clone(&self.client),
+            sql.as_str(),
+            self.schema(),
+        )))
+    }
+}
 
-                let mut flight_record_batch_stream = match result {
-                    Ok(stream) => stream,
-                    Err(error) => {
-                        tracing::error!("Failed to query with flight client: {:?}", error);
-                        return Err(to_execution_error(error));
-                    }
-                };
-
-                let mut result_data = vec![];
-                while let Some(batch) = flight_record_batch_stream.next().await {
-                    match batch {
-                        Ok(batch) => {
-                            result_data.push(batch);
-                        }
-                        Err(error) => {
-                            tracing::error!("Failed to read batch from flight client: {:?}", error);
-                            return Err(to_execution_error(error));
-                        }
-                    };
+fn to_stream(client: Arc<FlightClient>, sql: &str) -> impl Stream<Item = Result<RecordBatch>> {
+    let mut client = client.deref().clone();
+    let sql = sql.to_string();
+    stream! {
+        let mut stream = client.query(sql.as_str()).await.unwrap();
+        while let Some(batch) = stream.next().await {
+            match batch {
+                Ok(batch) => yield Ok(batch),
+                Err(_) => {
+                    yield Err(Error::NoSchema {});
                 }
+            }
+        }
+    }
+}
 
-                Ok(result_data)
-            })
-        });
+struct MyOwnStream {
+    stream: Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>>,
+    schema: SchemaRef,
+}
 
-        match data {
-            Ok(data) => Ok(Box::pin(MemoryStream::try_new(data, self.schema(), None)?)),
-            Err(error) => Err(error),
+impl MyOwnStream {
+    fn new(client: Arc<FlightClient>, sql: &str, schema: SchemaRef) -> Self {
+        let stream = to_stream(client, sql);
+        Self {
+            stream: Box::pin(stream),
+            schema,
+        }
+    }
+}
+
+impl RecordBatchStream for MyOwnStream {
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+}
+
+impl Stream for MyOwnStream {
+    type Item = datafusion::common::Result<RecordBatch>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        match self.stream.poll_next_unpin(cx) {
+            Poll::Ready(Some(Ok(record_batch))) => Poll::Ready(Some(Ok(record_batch))),
+            Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(to_execution_error(error)))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
         }
     }
 }
