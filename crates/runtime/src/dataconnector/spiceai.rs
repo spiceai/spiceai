@@ -1,5 +1,6 @@
 use arrow_flight::decode::DecodedPayload;
 use async_stream::stream;
+use async_trait::async_trait;
 use flight_client::FlightClient;
 use futures::StreamExt;
 use futures_core::stream::BoxStream;
@@ -11,6 +12,8 @@ use std::time::Duration;
 use std::{collections::HashMap, future::Future};
 
 use spicepod::component::dataset::Dataset;
+
+use flight_datafusion::FlightTable;
 
 use crate::auth::AuthProvider;
 use crate::datapublisher::{AddDataResult, DataPublisher};
@@ -37,6 +40,7 @@ pub struct SpiceAI {
     spaced_trace: Arc<SpacedTracer>,
 }
 
+#[async_trait]
 impl DataConnector for SpiceAI {
     fn new(
         auth_provider: AuthProvider,
@@ -125,6 +129,26 @@ impl DataConnector for SpiceAI {
 
     fn get_data_publisher(&self) -> Option<Box<dyn DataPublisher>> {
         Some(Box::new(self.clone()))
+    }
+
+    fn has_table_provider(&self) -> bool {
+        true
+    }
+
+    async fn get_table_provider(
+        &self,
+        dataset: &Dataset,
+    ) -> std::result::Result<Arc<dyn datafusion::datasource::TableProvider>, super::Error> {
+        let dataset_path = Self::spice_dataset_path(dataset);
+
+        let provider = FlightTable::new(self.flight.client.clone(), dataset_path).await;
+
+        match provider {
+            Ok(provider) => Ok(Arc::new(provider)),
+            Err(error) => Err(super::Error::UnableToGetTableProvider {
+                source: error.into(),
+            }),
+        }
     }
 }
 

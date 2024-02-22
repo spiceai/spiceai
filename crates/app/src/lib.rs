@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use snafu::prelude::*;
 use spicepod::{component::dataset::Dataset, component::model::Model, Spicepod};
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct App {
     pub name: String,
 

@@ -87,7 +87,7 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct Runtime {
-    pub app: Arc<RwLock<App>>,
+    pub app: Arc<RwLock<Option<App>>>,
     pub config: config::Config,
     pub df: Arc<RwLock<DataFusion>>,
     pub models: Arc<RwLock<HashMap<String, Model>>>,
@@ -101,7 +101,7 @@ impl Runtime {
     #[must_use]
     pub fn new(
         config: Config,
-        app: Arc<RwLock<app::App>>,
+        app: Arc<RwLock<Option<app::App>>>,
         df: Arc<RwLock<DataFusion>>,
         pods_watcher: podswatcher::PodsWatcher,
         auth: Arc<RwLock<auth::AuthProviders>>,
@@ -118,23 +118,23 @@ impl Runtime {
     }
 
     pub async fn load_datasets(&self) {
-        for ds in self.app.read().await.datasets.clone() {
-            self.load_dataset(ds);
+        let app_lock = self.app.read().await;
+        if let Some(app) = app_lock.as_ref() {
+            for ds in &app.datasets {
+                self.load_dataset(ds);
+            }
         }
     }
 
-    pub fn load_dataset(&self, ds: Dataset) {
+    pub fn load_dataset(&self, ds: &Dataset) {
         let df = Arc::clone(&self.df);
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
         let shared_auth = Arc::clone(&self.auth);
 
+        let ds = ds.clone();
+
         tokio::spawn(async move {
             loop {
-                if ds.acceleration.is_none() && !ds.is_view() {
-                    tracing::warn!("No acceleration specified for dataset: {}", ds.name);
-                    break;
-                };
-
                 let auth = shared_auth.read().await;
 
                 let source = ds.source();
@@ -155,6 +155,14 @@ impl Runtime {
                             continue;
                         }
                     };
+
+                if ds.acceleration.is_none()
+                    && !ds.is_view()
+                    && !has_table_provider(&data_connector)
+                {
+                    tracing::warn!("No acceleration specified for dataset: {}", ds.name);
+                    break;
+                };
 
                 match Runtime::initialize_dataconnector(
                     data_connector,
@@ -180,6 +188,24 @@ impl Runtime {
                 break;
             }
         });
+    }
+
+    pub async fn remove_dataset(&self, ds: &Dataset) {
+        let mut df = self.df.write().await;
+
+        if df.table_exists(&ds.name) {
+            if let Err(e) = df.remove_table(&ds.name) {
+                tracing::warn!("Unable to unload dataset {}: {}", &ds.name, e);
+                return;
+            }
+        }
+
+        tracing::info!("Unloaded dataset: {}", &ds.name);
+    }
+
+    pub async fn update_dataset(&self, ds: &Dataset) {
+        self.remove_dataset(ds).await;
+        self.load_dataset(ds);
     }
 
     async fn get_dataconnector_from_source(
@@ -228,6 +254,17 @@ impl Runtime {
                 .attach_view(ds)
                 .context(UnableToAttachViewSnafu)?;
             return Ok(());
+        }
+
+        if ds.acceleration.is_none() {
+            if let Some(data_connector) = data_connector {
+                df.read()
+                    .await
+                    .attach_mesh(ds, data_connector)
+                    .await
+                    .context(UnableToAttachViewSnafu)?;
+                return Ok(());
+            }
         }
 
         let data_backend = df
@@ -284,8 +321,11 @@ impl Runtime {
     }
 
     pub async fn load_models(&self) {
-        for model in &self.app.read().await.models {
-            self.load_model(model).await;
+        let app_lock = self.app.read().await;
+        if let Some(app) = app_lock.as_ref() {
+            for model in &app.models {
+                self.load_model(model).await;
+            }
         }
     }
 
@@ -309,6 +349,24 @@ impl Runtime {
         }
     }
 
+    pub async fn remove_model(&self, m: &SpicepodModel) {
+        let mut model_map = self.models.write().await;
+        if !model_map.contains_key(&m.name) {
+            tracing::warn!(
+                "Unable to unload runnable model {}: model not found",
+                m.name,
+            );
+            return;
+        }
+        model_map.remove(&m.name);
+        tracing::info!("Model [{}] has been unloaded", m.name);
+    }
+
+    pub async fn update_model(&self, m: &SpicepodModel) {
+        self.remove_model(m).await;
+        self.load_model(m).await;
+    }
+
     pub async fn start_servers(&mut self) -> Result<()> {
         let http_server_future = http::start(
             self.config.http_bind_address,
@@ -316,6 +374,7 @@ impl Runtime {
             self.df.clone(),
             self.models.clone(),
         );
+
         let flight_server_future = flight::start(self.config.flight_bind_address, self.df.clone());
         let open_telemetry_server_future =
             opentelemetry::start(self.config.open_telemetry_bind_address, self.df.clone());
@@ -337,30 +396,72 @@ impl Runtime {
         let mut rx = self.pods_watcher.watch()?;
 
         while let Some(new_app) = rx.recv().await {
-            let mut current_app = self.app.write().await;
-
-            tracing::debug!("Updated pods information: {:?}", new_app);
-            tracing::debug!("Previous pods information: {:?}", current_app);
-
-            *self.auth.write().await = load_auth_providers();
-
-            for ds in &new_app.datasets {
-                if !current_app.datasets.iter().any(|d| d.name == ds.name) {
-                    self.load_dataset(ds.clone());
+            let mut app_lock = self.app.write().await;
+            if let Some(current_app) = app_lock.as_mut() {
+                if *current_app == new_app {
+                    continue;
                 }
-            }
 
-            for model in &new_app.models {
-                if !current_app.models.iter().any(|m| m.name == model.name) {
-                    self.load_model(model).await;
+                tracing::debug!("Updated pods information: {:?}", new_app);
+                tracing::debug!("Previous pods information: {:?}", current_app);
+
+                *self.auth.write().await = load_auth_providers();
+
+                // check for new and updated datasets
+                for ds in &new_app.datasets {
+                    if let Some(current_ds) =
+                        current_app.datasets.iter().find(|d| d.name == ds.name)
+                    {
+                        if current_ds != ds {
+                            self.update_dataset(ds).await;
+                        }
+                    } else {
+                        self.load_dataset(ds);
+                    }
                 }
-            }
 
-            *current_app = new_app;
+                // check for new and updated models
+                for model in &new_app.models {
+                    if let Some(current_model) =
+                        current_app.models.iter().find(|m| m.name == model.name)
+                    {
+                        if current_model != model {
+                            self.update_model(model).await;
+                        }
+                    } else {
+                        self.load_model(model).await;
+                    }
+                }
+
+                // Remove models that are no longer in the app
+                for model in &current_app.models {
+                    if !new_app.models.iter().any(|m| m.name == model.name) {
+                        self.remove_model(model).await;
+                    }
+                }
+
+                // Remove datasets that are no longer in the app
+                for ds in &current_app.datasets {
+                    if !new_app.datasets.iter().any(|d| d.name == ds.name) {
+                        self.remove_dataset(ds).await;
+                    }
+                }
+
+                *current_app = new_app;
+            } else {
+                *app_lock = Some(new_app);
+            }
         }
 
         Ok(())
     }
+}
+
+fn has_table_provider(data_connector: &Option<Box<dyn DataConnector + Send>>) -> bool {
+    data_connector.is_some()
+        && data_connector
+            .as_ref()
+            .is_some_and(|dc| dc.has_table_provider())
 }
 
 pub fn load_auth_providers() -> auth::AuthProviders {
@@ -382,18 +483,7 @@ async fn shutdown_signal() {
         }
     };
 
-    let terminate = async {
-        match signal::unix::signal(signal::unix::SignalKind::terminate()) {
-            Ok(mut signal) => signal.recv().await,
-            Err(err) => {
-                tracing::error!("Unable to listen to shutdown signal: {err:?}");
-                None
-            }
-        }
-    };
-
     tokio::select! {
         () = ctrl_c => {},
-        _ = terminate => {},
     }
 }
