@@ -39,14 +39,14 @@ pub struct Spicepod {
 }
 
 impl Spicepod {
-    pub fn load(path: impl Into<PathBuf>) -> Result<Self> {
+    pub fn load(path: impl Into<PathBuf>) -> Result<Option<Self>> {
         Self::load_from(&reader::StdFileSystem, path)
     }
 
     pub fn load_from<T>(
         fs: &impl reader::ReadableYaml<T>,
         path: impl Into<PathBuf>,
-    ) -> Result<Spicepod> {
+    ) -> Result<Option<Spicepod>> {
         let path = path.into();
         let path_str = path.to_string_lossy().to_string();
 
@@ -73,11 +73,11 @@ impl Spicepod {
         )
         .context(UnableToResolveSpicepodComponentsSnafu { path: path.clone() })?;
 
-        Ok(from_definition(
+        Ok(Some(from_definition(
             spicepod_definition,
             resolved_datasets,
             resolved_models,
-        ))
+        )))
     }
 
     pub fn load_definition(path: impl Into<PathBuf>) -> Result<SpicepodDefinition> {

@@ -25,7 +25,7 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub(crate) async fn start<A>(
     bind_address: A,
-    app: Option<Arc<RwLock<App>>>,
+    app: Arc<RwLock<App>>,
     df: Arc<RwLock<DataFusion>>,
     models: Arc<RwLock<HashMap<String, Model>>>,
 ) -> Result<()>
