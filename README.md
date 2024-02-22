@@ -66,7 +66,7 @@ Using latest 'local' runtime version.
 2024-02-21T06:11:56.382038Z  INFO runtime::opentelemetry: Spice Runtime OpenTelemetry listening on 127.0.0.1:50052
 ```
 
-**Step 5** In a new terminal window, import the spicepod. The spicepod contains information about how datasets and other components are configured. You can add public spicepods using `spice add` command:
+**Step 5.** In a new terminal window, import the spicepod. The spicepod contains information about how datasets and other components are configured. You can add public spicepods using `spice add` command:
 
 ```bash
 spice add spiceai/quickstart
@@ -91,7 +91,7 @@ In the runtime terminal window, you should see that the a new dataset has been a
 2024-02-22T05:53:48.223101Z  INFO runtime::dataconnector: Refreshing data for taxi_trips
 ```
 
-**Step 7.** You can now query against the dataset using the SpiceAI SQL REPL. Enter the command below to start the REPL:
+**Step 6.** You can now query the dataset using the SpiceAI SQL REPL. Enter the command below to start the REPL:
 
 ```bash
 spice sql
@@ -105,7 +105,7 @@ Welcome to the interactive Spice.ai SQL Query Utility! Type 'help' for help.
 show tables; -- list available tables
 ```
 
-Entering `show tables;` should print out the following table along with the time it took to generate the query:
+Entering `show tables;` prints out the following table along with the time it took to execute the query:
 
 ```
 sql> show tables;
@@ -198,7 +198,10 @@ spice dataset configure
 ```
 
 You will be prompted to enter a name. Enter a name that represents the contents of the dataset
-`What is the dataset name? eth_recent_blocks`
+
+```bash
+What is the dataset name? eth_recent_blocks
+```
 
 Enter the location of the dataset:
 
@@ -206,7 +209,7 @@ Enter the location of the dataset:
 Where is your dataset located? spice.ai/eth.recent_blocks
 ```
 
-Select `y` when prompted whether you want to accelerate the data:
+Select `y` when prompted whether to accelerate the data:
 
 ```bash
 Locally accelerate this dataset (y/n)? y
@@ -314,7 +317,7 @@ In a new terminal, start the SpiceAI SQL REPL
 spice sql
 ```
 
-You can now now make queries to my_dataset in the runtime.
+You can now now query `my_dataset` in the runtime.
 
 ## Sample project using the SpiceAI runtime.
 
