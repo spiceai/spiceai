@@ -21,7 +21,7 @@ pub enum Error {
         source: component::Error,
         path: PathBuf,
     },
-    #[snafu(display("spicepod.yaml not found in {}, run `spice init <pod>` to initiate spicepod.yaml", path.display()))]
+    #[snafu(display("spicepod.yaml not found in {}, run `spice init <name>` to initialize spicepod.yaml", path.display()))]
     SpicepodNotFound { path: PathBuf },
 }
 
