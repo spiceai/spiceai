@@ -33,14 +33,23 @@ pub fn system_tls_certificate() -> Result<tonic::transport::Certificate> {
     Ok(tonic::transport::Certificate::from_pem(concatenated_pems))
 }
 
-pub async fn new_tls_flight_channel(https_url: &str) -> Result<Channel> {
-    let mut endpoint = Endpoint::from_str(https_url).context(UnableToConnectToEndpointSnafu)?;
+pub async fn new_tls_flight_channel(endpoint_str: &str) -> Result<Channel> {
+    let mut endpoint = Endpoint::from_str(endpoint_str).context(UnableToConnectToEndpointSnafu)?;
 
-    if https_url.starts_with("https://") {
+    let mut tls_domain_name = None;
+    let tls_prefixes = ["https://", "grpc+tls://"];
+    for prefix in &tls_prefixes {
+        if endpoint_str.starts_with(prefix) {
+            tls_domain_name = Some(endpoint_str.trim_start_matches(prefix));
+            break;
+        }
+    }
+
+    if let Some(tls_domain_name) = tls_domain_name {
         let cert = system_tls_certificate()?;
         let tls_config = ClientTlsConfig::new()
             .ca_certificate(cert)
-            .domain_name(https_url.trim_start_matches("https://"));
+            .domain_name(tls_domain_name);
         endpoint = endpoint
             .tls_config(tls_config)
             .context(UnableToConnectToEndpointSnafu)?;
