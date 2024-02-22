@@ -87,12 +87,12 @@ Using latest 'local' runtime version.
 In a new terminal window, enter the following command:
 
 ```bash
-spice add <NAME_OF_PUBLIC_SPICEPOD>
+spice add Lukekim/demo
 ```
 
-You should see the runtime updated with the new dataset.
+You should see the runtime updated with the new datasets.
 Also, the spicepod.yaml file will be updated with a new dependency that
-references the imported spicepod.
+references the Lukekim/demo spicepod.
 
 ```
 version: v1beta1
@@ -138,7 +138,7 @@ You can enter custom queries:
 TODO: MODIFY THE QUERY TO REFLECT COLUMNS FROM THE PUBLIC DATASET
 
 ```bash
-sql> SELECT topics FROM eth_recent_logs LIMIT 5;
+sql> SELECT block_number FROM eth_recent_transactions LIMIT 5;
 ```
 
 TODO: ADD VIDEO SHOWING HOW TO RUN THE ABOVE STEPS HERE.
