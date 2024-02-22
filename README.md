@@ -215,7 +215,7 @@ You should see the following outpout from your runtime terminal:
 2024-02-21T22:49:10.038461Z  INFO runtime: Loaded dataset: eth_recent_blocks
 ```
 
-**Step 4.** In a new terminal window, use the SpiceAI SQL RPL to query the dataset
+**Step 4.** In a new terminal window, use the SpiceAI SQL REPL to query the dataset
 
 ```bash
 spice sql
