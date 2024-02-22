@@ -21,7 +21,7 @@ pub(crate) fn routes(
         .route("/v1/sql", post(v1::query::post))
         .route("/v1/datasets", get(v1::datasets::get))
         .route("/v1/models/:name/predict", get(v1::inference::get))
-        .route("/v1/models/predict", post(v1::inference::post))
+        .route("/v1/predict", post(v1::inference::post))
         .layer(Extension(app))
         .layer(Extension(df))
         .layer(Extension(models))
