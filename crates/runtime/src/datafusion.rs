@@ -234,7 +234,7 @@ impl DataFusion {
     }
 
     #[allow(clippy::needless_pass_by_value)]
-    pub fn attach_remote(
+    pub fn attach_mesh(
         &self,
         dataset: impl Borrow<Dataset>,
         data_connector: Box<dyn DataConnector>,

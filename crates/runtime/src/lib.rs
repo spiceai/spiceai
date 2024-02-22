@@ -257,7 +257,7 @@ impl Runtime {
             if let Some(data_connector) = data_connector {
                 df.read()
                     .await
-                    .attach_remote(ds, data_connector)
+                    .attach_mesh(ds, data_connector)
                     .context(UnableToAttachViewSnafu)?;
                 return Ok(());
             }

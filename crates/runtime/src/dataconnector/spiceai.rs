@@ -12,7 +12,7 @@ use std::{collections::HashMap, future::Future};
 
 use spicepod::component::dataset::Dataset;
 
-use flight_datafusion::FlightSQLTable;
+use flight_datafusion::FlightTable;
 
 use crate::auth::AuthProvider;
 use crate::datapublisher::{AddDataResult, DataPublisher};
@@ -139,7 +139,7 @@ impl DataConnector for SpiceAI {
     ) -> std::result::Result<Arc<dyn datafusion::datasource::TableProvider>, super::Error> {
         let dataset_path = Self::spice_dataset_path(dataset);
 
-        let provider = FlightSQLTable::new(Arc::new(self.flight.client.clone()), dataset_path);
+        let provider = FlightTable::new(self.flight.client.clone(), dataset_path);
 
         match provider {
             Ok(provider) => Ok(Arc::new(provider)),

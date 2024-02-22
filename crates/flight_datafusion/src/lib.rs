@@ -7,7 +7,7 @@ use flight_client::FlightClient;
 use futures::{Stream, StreamExt};
 use snafu::prelude::*;
 use sql_provider_datafusion::expr;
-use std::{any::Any, fmt, ops::Deref, pin::Pin, sync::Arc, task::Poll};
+use std::{any::Any, fmt, pin::Pin, sync::Arc, task::Poll};
 use tokio::runtime::Handle;
 
 use arrow_flight::error::FlightError;
@@ -41,21 +41,22 @@ pub enum Error {
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
-pub struct FlightSQLTable {
-    client: Arc<FlightClient>,
+pub struct FlightTable {
+    client: FlightClient,
     schema: SchemaRef,
     table_reference: OwnedTableReference,
 }
 
-impl FlightSQLTable {
+#[allow(clippy::needless_pass_by_value)]
+impl FlightTable {
     pub fn new(
-        client: Arc<FlightClient>,
+        client: FlightClient,
         table_reference: impl Into<OwnedTableReference>,
     ) -> Result<Self> {
         let table_reference = table_reference.into();
-        let schema = Self::get_schema(Arc::clone(&client), &table_reference)?;
+        let schema = Self::get_schema(client.clone(), &table_reference)?;
         Ok(Self {
-            client,
+            client: client.clone(),
             schema,
             table_reference,
         })
@@ -63,13 +64,13 @@ impl FlightSQLTable {
 
     #[allow(clippy::needless_pass_by_value)]
     fn get_schema<'a>(
-        client: Arc<FlightClient>,
+        client: FlightClient,
         table_reference: impl Into<TableReference<'a>>,
     ) -> Result<SchemaRef> {
-        let mut client = client.deref().clone();
         tokio::task::block_in_place(move || {
             Handle::current().block_on(async {
                 let mut stream = client
+                    .clone()
                     .query(format!("SELECT * FROM {} limit 1", table_reference.into()).as_str())
                     .await
                     .map_err(|error| Error::Flight { source: error })?;
@@ -94,11 +95,11 @@ impl FlightSQLTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(FlightSQLExec::new(
+        Ok(Arc::new(FlightExec::new(
             projections,
             schema,
             &self.table_reference,
-            Arc::clone(&self.client),
+            self.client.clone(),
             filters,
             limit,
         )?))
@@ -106,7 +107,7 @@ impl FlightSQLTable {
 }
 
 #[async_trait]
-impl TableProvider for FlightSQLTable {
+impl TableProvider for FlightTable {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -146,20 +147,20 @@ impl TableProvider for FlightSQLTable {
 }
 
 #[derive(Clone)]
-struct FlightSQLExec {
+struct FlightExec {
     projected_schema: SchemaRef,
     table_reference: OwnedTableReference,
-    client: Arc<FlightClient>,
+    client: FlightClient,
     filters: Vec<Expr>,
     limit: Option<usize>,
 }
 
-impl FlightSQLExec {
+impl FlightExec {
     fn new(
         projections: Option<&Vec<usize>>,
         schema: &SchemaRef,
         table_reference: &OwnedTableReference,
-        client: Arc<FlightClient>,
+        client: FlightClient,
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Self> {
@@ -206,21 +207,21 @@ impl FlightSQLExec {
     }
 }
 
-impl std::fmt::Debug for FlightSQLExec {
+impl std::fmt::Debug for FlightExec {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         let sql = self.sql().unwrap_or_default();
-        write!(f, "FlightSQLExec sql={sql}")
+        write!(f, "FlightExec sql={sql}")
     }
 }
 
-impl DisplayAs for FlightSQLExec {
+impl DisplayAs for FlightExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> std::fmt::Result {
         let sql = self.sql().unwrap_or_default();
-        write!(f, "FlightSQL sql={sql}")
+        write!(f, "FlightExec sql={sql}")
     }
 }
 
-impl ExecutionPlan for FlightSQLExec {
+impl ExecutionPlan for FlightExec {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -259,7 +260,7 @@ impl ExecutionPlan for FlightSQLExec {
         };
 
         Ok(Box::pin(StreamConverter::new(
-            Arc::clone(&self.client),
+            self.client.clone(),
             sql.as_str(),
             self.schema(),
         )))
@@ -267,8 +268,8 @@ impl ExecutionPlan for FlightSQLExec {
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn to_stream(client: Arc<FlightClient>, sql: &str) -> impl Stream<Item = Result<RecordBatch>> {
-    let mut client = client.deref().clone();
+fn to_stream(client: FlightClient, sql: &str) -> impl Stream<Item = Result<RecordBatch>> {
+    let mut client = client.clone();
     let sql = sql.to_string();
     stream! {
         match client.query(sql.as_str()).await {
@@ -293,7 +294,7 @@ struct StreamConverter {
 }
 
 impl StreamConverter {
-    fn new(client: Arc<FlightClient>, sql: &str, schema: SchemaRef) -> Self {
+    fn new(client: FlightClient, sql: &str, schema: SchemaRef) -> Self {
         let stream = to_stream(client, sql);
         Self {
             stream: Box::pin(stream),
