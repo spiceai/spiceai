@@ -72,20 +72,14 @@ impl Dataset {
         }
     }
 
-    /// Returns the dataset source - the first part of the `from` field before the first `/`.
+    /// Returns the dataset source - the first part of the `from` field before the first `:`.
     ///
     /// # Examples
     ///
     /// ```
     /// use spicepod::component::dataset::Dataset;
     ///
-    /// let dataset = Dataset {
-    ///    from: "foo/bar".to_string(),
-    ///    name: "bar".to_string(),
-    ///    acceleration: None,
-    ///    params: Default::default(),
-    ///    depends_on: Default::default(),
-    /// };
+    /// let dataset = Dataset::new("foo:bar".to_string(), "bar".to_string());
     ///
     /// assert_eq!(dataset.source(), "foo".to_string());
     /// ```
@@ -93,26 +87,44 @@ impl Dataset {
     /// ```
     /// use spicepod::component::dataset::Dataset;
     ///
-    /// let dataset = Dataset {
-    ///   from: "foo".to_string(),
-    ///   name: "bar".to_string(),
-    ///   acceleration: None,
-    ///   params: Default::default(),
-    ///   depends_on: Default::default(),
-    /// };
+    /// let dataset = Dataset::new("foo".to_string(), "bar".to_string());
     ///
-    /// assert_eq!(dataset.source(), "foo".to_string());
+    /// assert_eq!(dataset.source(), "spiceai");
     /// ```
     #[must_use]
     pub fn source(&self) -> String {
-        self.from.split('/').next().unwrap_or_default().to_string()
+        let parts: Vec<&str> = self.from.splitn(2, ':').collect();
+        if parts.len() > 1 {
+            parts[0].to_string()
+        } else {
+            "spiceai".to_string()
+        }
     }
 
+    /// Returns the dataset path - the remainder of the `from` field after the first `:` or the whole string if no `:`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use spicepod::component::dataset::Dataset;
+    ///
+    /// let dataset = Dataset::new("foo:bar".to_string(), "bar".to_string());
+    ///
+    /// assert_eq!(dataset.path(), "bar".to_string());
+    /// ```
+    ///
+    /// ```
+    /// use spicepod::component::dataset::Dataset;
+    ///
+    /// let dataset = Dataset::new("foo".to_string(), "bar".to_string());
+    ///
+    /// assert_eq!(dataset.path(), "foo".to_string());
+    /// ```
     #[must_use]
     pub fn path(&self) -> String {
-        match self.from.find('/') {
+        match self.from.find(':') {
             Some(index) => self.from[index + 1..].to_string(),
-            None => String::new(),
+            None => self.from.clone(),
         }
     }
 
