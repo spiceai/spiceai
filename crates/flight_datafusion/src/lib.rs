@@ -27,22 +27,15 @@ use datafusion::{
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Unable to generate SQL: {source}"))]
-    UnableToGenerateSQL {
-        source: expr::Error,
-    },
+    UnableToGenerateSQL { source: expr::Error },
 
     #[snafu(display("Unable to query FlightSQL: {source}"))]
-    Flight {
-        source: flight_client::Error,
-    },
+    Flight { source: flight_client::Error },
 
     #[snafu(display("Unable to query FlightSQL: {source}"))]
-    ArrowFlight {
-        source: FlightError,
-    },
+    ArrowFlight { source: FlightError },
 
-    UnableToQuery {},
-
+    #[snafu(display("Unable to retrieve schema"))]
     NoSchema,
 }
 
