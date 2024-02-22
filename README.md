@@ -147,15 +147,11 @@ In order to access public datasets from SpiceAI, you will first need to create a
 
 Navigate to https://spice.ai/ and create a new account by clicking on Try for Free.
 
-<p align="center">
-  <img src="spiceai_try_for_free.png" width="600" />
-</p>
+<img width="500" alt="spiceai_try_for_free-1" src="https://github.com/spiceai/spiceai/assets/112157037/27fb47ed-4825-4fa8-94bd-48197406cfaa">
 
 After creating an account, you will need to create an app in order to create to an API key.
 
-<p align="center">
-  <img src="create_app.png" width="400" />
-</p>
+![create_app-1](https://github.com/spiceai/spiceai/assets/112157037/d2446406-1f06-40fb-8373-1b6d692cb5f7)
 
 You will now be able to access datasets from Spice.ai. For this demonstration, we will be using the Spice.ai/eth.recent_blocks dataset.
 
