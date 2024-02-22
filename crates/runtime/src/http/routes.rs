@@ -12,7 +12,7 @@ use tokio::sync::RwLock;
 use super::v1;
 
 pub(crate) fn routes(
-    app: Arc<RwLock<App>>,
+    app: Arc<RwLock<Option<App>>>,
     df: Arc<RwLock<DataFusion>>,
     models: Arc<RwLock<HashMap<String, Model>>>,
 ) -> Router {

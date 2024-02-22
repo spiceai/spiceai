@@ -87,7 +87,7 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct Runtime {
-    pub app: Arc<RwLock<App>>,
+    pub app: Arc<RwLock<Option<App>>>,
     pub config: config::Config,
     pub df: Arc<RwLock<DataFusion>>,
     pub models: Arc<RwLock<HashMap<String, Model>>>,
@@ -101,7 +101,7 @@ impl Runtime {
     #[must_use]
     pub fn new(
         config: Config,
-        app: Arc<RwLock<app::App>>,
+        app: Arc<RwLock<Option<app::App>>>,
         df: Arc<RwLock<DataFusion>>,
         pods_watcher: podswatcher::PodsWatcher,
         auth: Arc<RwLock<auth::AuthProviders>>,
@@ -118,8 +118,11 @@ impl Runtime {
     }
 
     pub async fn load_datasets(&self) {
-        for ds in &self.app.read().await.datasets {
-            self.load_dataset(ds);
+        let app_lock = self.app.read().await;
+        if let Some(app) = app_lock.as_ref() {
+            for ds in &app.datasets {
+                self.load_dataset(ds);
+            }
         }
     }
 
@@ -256,6 +259,17 @@ impl Runtime {
             return Ok(());
         }
 
+        if ds.acceleration.is_none() {
+            if let Some(data_connector) = data_connector {
+                df.read()
+                    .await
+                    .attach_mesh(ds, data_connector)
+                    .await
+                    .context(UnableToAttachViewSnafu)?;
+                return Ok(());
+            }
+        }
+
         let data_backend = df
             .read()
             .await
@@ -310,8 +324,11 @@ impl Runtime {
     }
 
     pub async fn load_models(&self) {
-        for model in &self.app.read().await.models {
-            self.load_model(model).await;
+        let app_lock = self.app.read().await;
+        if let Some(app) = app_lock.as_ref() {
+            for model in &app.models {
+                self.load_model(model).await;
+            }
         }
     }
 
@@ -360,6 +377,7 @@ impl Runtime {
             self.df.clone(),
             self.models.clone(),
         );
+
         let flight_server_future = flight::start(self.config.flight_bind_address, self.df.clone());
         let open_telemetry_server_future =
             opentelemetry::start(self.config.open_telemetry_bind_address, self.df.clone());
@@ -381,56 +399,61 @@ impl Runtime {
         let mut rx = self.pods_watcher.watch()?;
 
         while let Some(new_app) = rx.recv().await {
-            let mut current_app = self.app.write().await;
+            let mut app_lock = self.app.write().await;
+            if let Some(current_app) = app_lock.as_mut() {
+                if *current_app == new_app {
+                    continue;
+                }
 
-            if *current_app == new_app {
-                continue;
-            }
+                tracing::debug!("Updated pods information: {:?}", new_app);
+                tracing::debug!("Previous pods information: {:?}", current_app);
 
-            tracing::debug!("Updated pods information: {:?}", new_app);
-            tracing::debug!("Previous pods information: {:?}", current_app);
+                *self.auth.write().await = load_auth_providers();
 
-            *self.auth.write().await = load_auth_providers();
-
-            // check for new and updated datasets
-            for ds in &new_app.datasets {
-                if let Some(current_ds) = current_app.datasets.iter().find(|d| d.name == ds.name) {
-                    if current_ds != ds {
-                        self.update_dataset(ds).await;
+                // check for new and updated datasets
+                for ds in &new_app.datasets {
+                    if let Some(current_ds) =
+                        current_app.datasets.iter().find(|d| d.name == ds.name)
+                    {
+                        if current_ds != ds {
+                            self.update_dataset(ds).await;
+                        }
+                    } else {
+                        self.load_dataset(ds);
                     }
-                } else {
-                    self.load_dataset(ds);
                 }
-            }
 
-            // check for new and updated models
-            for model in &new_app.models {
-                if let Some(current_model) =
-                    current_app.models.iter().find(|m| m.name == model.name)
-                {
-                    if current_model != model {
-                        self.update_model(model).await;
+                // check for new and updated models
+                for model in &new_app.models {
+                    if let Some(current_model) =
+                        current_app.models.iter().find(|m| m.name == model.name)
+                    {
+                        if current_model != model {
+                            self.update_model(model).await;
+                        }
+                    } else {
+                        self.load_model(model).await;
                     }
-                } else {
-                    self.load_model(model).await;
                 }
-            }
 
-            // Remove models that are no longer in the app
-            for model in &current_app.models {
-                if !new_app.models.iter().any(|m| m.name == model.name) {
-                    self.remove_model(model).await;
+                // Remove models that are no longer in the app
+                for model in &current_app.models {
+                    if !new_app.models.iter().any(|m| m.name == model.name) {
+                        self.remove_model(model).await;
+                    }
                 }
-            }
 
-            // Remove datasets that are no longer in the app
-            for ds in &current_app.datasets {
-                if !new_app.datasets.iter().any(|d| d.name == ds.name) {
-                    self.remove_dataset(ds).await;
+                // Remove datasets that are no longer in the app
+                for ds in &current_app.datasets {
+                    if !new_app.datasets.iter().any(|d| d.name == ds.name) {
+                        self.remove_dataset(ds).await;
+                    }
                 }
-            }
 
-            *current_app = new_app;
+                *current_app = new_app;
+            } else {
+                *app_lock = Some(new_app);
+            }
         }
 
         Ok(())
@@ -441,7 +464,7 @@ fn has_table_provider(data_connector: &Option<Box<dyn DataConnector + Send>>) ->
     data_connector.is_some()
         && data_connector
             .as_ref()
-            .is_some_and(|dc| dc.get_table_provider().is_some())
+            .is_some_and(|dc| dc.has_table_provider())
 }
 
 pub fn load_auth_providers() -> auth::AuthProviders {

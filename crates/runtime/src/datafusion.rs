@@ -58,6 +58,9 @@ pub enum Error {
     #[snafu(display("Unable to get table: {source}"))]
     UnableToGetTable { source: DataFusionError },
 
+    #[snafu(display("Unable to register table: {source}"))]
+    UnableToRegisterTable { source: crate::dataconnector::Error },
+
     #[snafu(display("Unable to create view: {source}"))]
     InvalidSQLView {
         source: spicepod::component::dataset::Error,
@@ -228,6 +231,31 @@ impl DataFusion {
         }
 
         Ok(())
+    }
+
+    #[allow(clippy::needless_pass_by_value)]
+    pub async fn attach_mesh(
+        &self,
+        dataset: impl Borrow<Dataset>,
+        data_connector: Box<dyn DataConnector>,
+    ) -> Result<()> {
+        let dataset = dataset.borrow();
+        let table_exists = self.ctx.table_exist(dataset.name.as_str()).unwrap_or(false);
+        if table_exists {
+            return TableAlreadyExistsSnafu.fail();
+        }
+
+        let provider = data_connector.get_table_provider(dataset).await;
+
+        match provider {
+            Ok(provider) => {
+                let _ = self
+                    .ctx
+                    .register_table(dataset.name.as_str(), Arc::clone(&provider));
+                Ok(())
+            }
+            Err(error) => Err(Error::UnableToRegisterTable { source: error }),
+        }
     }
 
     pub fn attach_view(&self, dataset: impl Borrow<Dataset>) -> Result<()> {
