@@ -256,6 +256,17 @@ impl Runtime {
             return Ok(());
         }
 
+        if ds.acceleration.is_none() {
+            if let Some(data_connector) = data_connector {
+                df.read()
+                    .await
+                    .attach_mesh(ds, data_connector)
+                    .await
+                    .context(UnableToAttachViewSnafu)?;
+                return Ok(());
+            }
+        }
+
         let data_backend = df
             .read()
             .await
@@ -450,7 +461,7 @@ fn has_table_provider(data_connector: &Option<Box<dyn DataConnector + Send>>) ->
     data_connector.is_some()
         && data_connector
             .as_ref()
-            .is_some_and(|dc| dc.get_table_provider().is_some())
+            .is_some_and(|dc| dc.has_table_provider())
 }
 
 pub fn load_auth_providers() -> auth::AuthProviders {
