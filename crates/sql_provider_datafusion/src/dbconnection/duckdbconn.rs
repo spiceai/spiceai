@@ -28,7 +28,9 @@ pub struct DuckDbConnection {
 }
 
 #[async_trait]
-impl DbConnection<DuckdbConnectionManager, &dyn ToSql> for DuckDbConnection {
+impl DbConnection<r2d2::PooledConnection<DuckdbConnectionManager>, &dyn ToSql>
+    for DuckDbConnection
+{
     fn new(conn: r2d2::PooledConnection<DuckdbConnectionManager>) -> Self {
         DuckDbConnection { conn }
     }

@@ -32,6 +32,7 @@ arrow.workspace = true
 async-stream.workspace = true
 datafusion-common = "36.0.0"
 futures-util = "0.3.30"
+flight_client = { path = "../flight_client" }
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }

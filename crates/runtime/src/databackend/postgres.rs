@@ -1,13 +1,10 @@
-use std::{
-    collections::HashMap,
-    fmt, mem,
-    sync::{Arc, PoisonError},
-};
+use std::{collections::HashMap, mem, sync::Arc};
 
-use arrow::record_batch::RecordBatch;
+use arrow::{array::BooleanArray, record_batch::RecordBatch};
+use arrow_flight::sql::client::FlightSqlServiceClient;
 use datafusion::{execution::context::SessionContext, sql::TableReference};
+use futures::StreamExt;
 use postgres::types::ToSql;
-use r2d2_postgres::{postgres::NoTls, PostgresConnectionManager};
 use snafu::{prelude::*, ResultExt};
 use spicepod::component::dataset::Dataset;
 use sql_provider_datafusion::{
@@ -15,6 +12,8 @@ use sql_provider_datafusion::{
     dbconnectionpool::{postgrespool::PostgresConnectionPool, DbConnectionPool, Mode},
     SqlTable,
 };
+use tokio::sync::Mutex;
+use tonic::transport::Channel;
 
 use crate::{
     datapublisher::{AddDataResult, DataPublisher},
@@ -60,11 +59,11 @@ pub struct PostgresBackend {
     ctx: Arc<SessionContext>,
     name: String,
     pool: Arc<
-        dyn DbConnectionPool<PostgresConnectionManager<NoTls>, &'static (dyn ToSql + Sync)>
+        dyn DbConnectionPool<FlightSqlServiceClient<Channel>, &'static (dyn ToSql + Sync)>
             + Send
             + Sync,
     >,
-    create_mutex: std::sync::Mutex<()>,
+    create_mutex: Mutex<()>,
     _primary_keys: Option<Vec<String>>,
 }
 
@@ -88,7 +87,7 @@ impl DataPublisher for PostgresBackend {
                 create_mutex: &self.create_mutex,
             };
 
-            postgres_update.update()?;
+            postgres_update.update().await?;
 
             self.initialize_datafusion().await?;
             Ok(())
@@ -116,7 +115,7 @@ impl PostgresBackend {
             ctx,
             name: name.to_string(),
             pool: Arc::new(pool),
-            create_mutex: std::sync::Mutex::new(()),
+            create_mutex: Mutex::new(()),
             _primary_keys: primary_keys,
         })
     }
@@ -151,16 +150,16 @@ struct PostgresUpdate<'a> {
     data: Vec<RecordBatch>,
     update_type: UpdateType,
     postgres_conn: &'a mut dbconnection::postgresconn::PostgresConnection,
-    create_mutex: &'a std::sync::Mutex<()>,
+    create_mutex: &'a Mutex<()>,
 }
 
 impl<'a> PostgresUpdate<'a> {
-    fn update(&mut self) -> Result<()> {
+    async fn update(&mut self) -> Result<()> {
         match self.update_type {
-            UpdateType::Overwrite => self.create_table(true)?,
+            UpdateType::Overwrite => self.create_table(true).await?,
             UpdateType::Append => {
-                if !self.table_exists() {
-                    self.create_table(false)?;
+                if !self.table_exists().await {
+                    self.create_table(false).await?;
                 }
             }
         };
@@ -178,7 +177,7 @@ impl<'a> PostgresUpdate<'a> {
         Ok(())
     }
 
-    fn insert_batch(&mut self, batch: RecordBatch) -> Result<()> {
+    fn insert_batch(&mut self, _batch: RecordBatch) -> Result<()> {
         // TODO: Write RecordBatch
         let sql = format!(
             r#"INSERT INTO {name} (id, description) VALUES
@@ -189,13 +188,17 @@ impl<'a> PostgresUpdate<'a> {
         );
         tracing::trace!("{sql}");
 
+        self.postgres_conn
+            .execute(&sql, &[])
+            .context(DbConnectionSnafu)?;
+
         Ok(())
     }
 
-    fn create_table(&mut self, drop_if_exists: bool) -> Result<()> {
-        let _lock = self.create_mutex.lock().map_err(handle_poison)?;
+    async fn create_table(&mut self, drop_if_exists: bool) -> Result<()> {
+        let _lock = self.create_mutex.lock().await;
 
-        if self.table_exists() {
+        if self.table_exists().await {
             if drop_if_exists {
                 let sql = format!(r#"DROP TABLE "{}""#, self.name);
                 tracing::trace!("{sql}");
@@ -207,7 +210,7 @@ impl<'a> PostgresUpdate<'a> {
             }
         }
 
-        let Some(batch) = self.data.pop() else {
+        let Some(_batch) = self.data.pop() else {
             return Ok(());
         };
 
@@ -224,10 +227,14 @@ impl<'a> PostgresUpdate<'a> {
         );
         tracing::trace!("{sql}");
 
+        self.postgres_conn
+            .execute(&sql, &[])
+            .context(DbConnectionSnafu)?;
+
         Ok(())
     }
 
-    fn table_exists(&mut self) -> bool {
+    async fn table_exists(&mut self) -> bool {
         let sql = format!(
             r#"SELECT EXISTS (
               SELECT 1
@@ -238,18 +245,29 @@ impl<'a> PostgresUpdate<'a> {
         );
         tracing::trace!("{sql}");
 
-        let Ok(row) = self.postgres_conn.conn.query_one(&sql, &[]) else {
+        let Ok(mut stream) = self.postgres_conn.query_arrow(&sql, &[]) else {
             return false;
         };
 
-        let exists: bool = row.get(0);
-        exists
-    }
-}
+        let mut recs: Vec<RecordBatch> = Vec::new();
+        while let Some(batch) = stream.next().await {
+            match batch {
+                Ok(batch) => {
+                    recs.push(batch);
+                }
+                Err(_) => {
+                    break;
+                }
+            };
+        }
 
-#[allow(clippy::needless_pass_by_value)]
-fn handle_poison<T: fmt::Debug>(e: PoisonError<T>) -> Error {
-    Error::LockPoisoned {
-        message: format!("{e:?}"),
+        let Some(rec) = recs.first() else {
+            return false;
+        };
+
+        let Some(col) = rec.column(0).as_any().downcast_ref::<BooleanArray>() else {
+            return false;
+        };
+        col.value(0)
     }
 }

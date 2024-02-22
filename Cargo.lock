@@ -4313,6 +4313,7 @@ dependencies = [
  "datafusion",
  "datafusion-common 36.0.0",
  "duckdb",
+ "flight_client",
  "futures",
  "futures-util",
  "postgres",

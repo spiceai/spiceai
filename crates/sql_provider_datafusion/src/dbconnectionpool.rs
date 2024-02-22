@@ -16,7 +16,7 @@ pub enum Mode {
 }
 
 #[async_trait]
-pub trait DbConnectionPool<T: r2d2::ManageConnection, P: 'static> {
+pub trait DbConnectionPool<T, P: 'static> {
     async fn new(
         name: &str,
         mode: Mode,

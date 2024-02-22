@@ -10,9 +10,8 @@ use datafusion::execution::SendableRecordBatchStream;
 use datafusion::sql::TableReference;
 use futures::StreamExt;
 use postgres::types::ToSql;
-use r2d2_postgres::postgres::NoTls;
-use r2d2_postgres::PostgresConnectionManager;
 use snafu::{prelude::*, ResultExt};
+use tokio::runtime::Handle;
 use tonic::transport::Channel;
 
 use super::DbConnection;
@@ -39,41 +38,26 @@ pub enum Error {
 
 #[allow(clippy::module_name_repetitions)]
 pub struct PostgresConnection {
-    pub conn: r2d2::PooledConnection<PostgresConnectionManager<NoTls>>,
-    flight_sql_client: Option<FlightSqlServiceClient<Channel>>,
-}
-
-impl PostgresConnection {
-    pub fn new(
-        conn: r2d2::PooledConnection<PostgresConnectionManager<NoTls>>,
-        flight_sql_client: Option<FlightSqlServiceClient<Channel>>,
-    ) -> Self {
-        PostgresConnection {
-            conn,
-            flight_sql_client,
-        }
-    }
+    pub conn: FlightSqlServiceClient<Channel>,
 }
 
 #[async_trait]
-impl<'a> DbConnection<PostgresConnectionManager<NoTls>, &'a (dyn ToSql + Sync)>
+impl<'a> DbConnection<FlightSqlServiceClient<Channel>, &'a (dyn ToSql + Sync)>
     for PostgresConnection
 {
-    fn new(conn: r2d2::PooledConnection<PostgresConnectionManager<NoTls>>) -> Self
+    fn new(conn: FlightSqlServiceClient<Channel>) -> Self
     where
         Self: Sized,
     {
-        PostgresConnection {
-            conn,
-            flight_sql_client: None,
-        }
+        PostgresConnection { conn }
     }
 
     async fn get_schema(&mut self, table_reference: &TableReference) -> Result<SchemaRef> {
-        let Some(client) = &self.flight_sql_client else {
-            return NoFlightSqlClientSnafu.fail()?;
-        };
-        let mut client = client.clone();
+        let mut client = self.conn.clone();
+        client
+            .handshake("postgres", "postgres")
+            .await
+            .context(UnableToQuerySnafu)?;
 
         let sql = &format!("SELECT * FROM {table_reference} LIMIT 0");
         let mut stmt = client
@@ -105,14 +89,14 @@ impl<'a> DbConnection<PostgresConnectionManager<NoTls>, &'a (dyn ToSql + Sync)>
         sql: &str,
         _params: &[&'a (dyn ToSql + Sync)],
     ) -> Result<SendableRecordBatchStream> {
-        let Some(client) = &self.flight_sql_client else {
-            return NoFlightSqlClientSnafu.fail()?;
-        };
-        let mut client = client.clone();
+        let mut client = self.conn.clone();
         let sql = sql.to_string();
         let schema = SchemaRef::new(Schema::empty());
 
         let stream = Box::pin(try_stream! {
+            client.handshake("postgres", "postgres")
+                .await
+                .map_err(to_execution_error)?;
             let mut stmt = client
                 .prepare(sql.to_string(), None)
                 .await
@@ -142,9 +126,23 @@ impl<'a> DbConnection<PostgresConnectionManager<NoTls>, &'a (dyn ToSql + Sync)>
         Ok(Box::pin(FlightStream::new(stream, schema)))
     }
 
-    fn execute(&mut self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<u64> {
-        let rows_modified = self.conn.execute(sql, params).context(PostgresSnafu)?;
-        Ok(rows_modified)
+    fn execute(&mut self, sql: &str, _params: &[&(dyn ToSql + Sync)]) -> Result<u64> {
+        let mut client = self.conn.clone();
+        tokio::task::block_in_place(move || {
+            Handle::current().block_on(async {
+                client
+                    .handshake("postgres", "postgres")
+                    .await
+                    .context(UnableToQuerySnafu)?;
+                let mut stmt = client
+                    .prepare(sql.to_string(), None)
+                    .await
+                    .context(UnableToQuerySnafu)?;
+                let rows_modified = stmt.execute_update().await.context(UnableToQuerySnafu)?;
+                #[allow(clippy::cast_sign_loss)] // Rows modified will never be negative
+                Ok(rows_modified as u64)
+            })
+        })
     }
 
     fn as_any(&self) -> &dyn Any {

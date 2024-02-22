@@ -16,7 +16,7 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-pub fn system_tls_certificate() -> Result<tonic::transport::Certificate> {
+fn system_tls_certificate() -> Result<tonic::transport::Certificate> {
     // Load root certificates found in the platform’s native certificate store.
     let certs = rustls_native_certs::load_native_certs().context(FailedToLoadCertsSnafu)?;
 
@@ -33,6 +33,11 @@ pub fn system_tls_certificate() -> Result<tonic::transport::Certificate> {
     Ok(tonic::transport::Certificate::from_pem(concatenated_pems))
 }
 
+/// Create a new TLS flight channel.
+///
+/// # Errors
+///
+/// This function can return an error if there is a problem connecting to the endpoint.
 pub async fn new_tls_flight_channel(endpoint_str: &str) -> Result<Channel> {
     let mut endpoint = Endpoint::from_str(endpoint_str).context(UnableToConnectToEndpointSnafu)?;
 
