@@ -37,12 +37,6 @@ spice init my_spiceai_project
 
 This creates a spicepod.yaml file in your directory.
 
-```yaml
-version: v1beta1
-kind: Spicepod
-name: my_spiceai_project
-```
-
 **Step 3.** Log in to Dremio in order to access the dataset. Use the credentials below:
 :
 
