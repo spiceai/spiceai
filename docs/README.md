@@ -2,6 +2,7 @@
 
 The project docs for contributors and community. For user documentation of the Spice.ai platform, see [docs.spiceai.org](https://docs.spiceai.org).
 
+- [Principles] (PRINCIPLES.md)
 - [Roadmap](ROADMAP.md)
 
 ## Contributing
