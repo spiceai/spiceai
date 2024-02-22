@@ -95,35 +95,35 @@ mod tests {
         spiced.kill().await;
     }
 
-    // #[tokio::test]
-    // #[traced_test]
-    // async fn  dyn_spicepods_dataset() {
+    #[tokio::test]
+    #[traced_test]
+    async fn  dyn_spicepods_dataset() {
         
-    //     let utils = setup().await;
+        let utils = setup().await;
 
-    //     let res = utils.run_once(utils.spice_cmd().arg("init").arg("test-app")).await;
-    //     assert_eq!(res.success(), true, "should successfully initialize a new spicepod");
+        let res = utils.run_once(utils.spice_cmd().arg("init").arg("test-app")).await;
+        assert_eq!(res.success(), true, "should successfully initialize a new spicepod");
 
-    //     let mut spiced = utils.run_spiced().await;
+        let mut spiced = utils.run_spiced().await;
 
-    //     // allow app to initialize
-    //     utils.wait_for(Duration::from_secs(5)).await;
+        // allow app to initialize
+        utils.wait_for(Duration::from_secs(5)).await;
 
-    //     assert_eq!(spiced.is_running(), true, "should successfully start the spiced");
+        assert_eq!(spiced.is_running(), true, "should successfully start the spiced");
 
-    //     let res = utils.run_once(utils.spice_cmd().arg("add").arg("lukekim/demo")).await;
+        let res = utils.run_once(utils.spice_cmd().arg("add").arg("lukekim/demo")).await;
 
-    //     // allow app to initialize
-    //     utils.wait_for(Duration::from_secs(3)).await;
+        // allow app to initialize
+        utils.wait_for(Duration::from_secs(3)).await;
 
-    //     assert_eq!(res.success(), true, "should be able to add a new spicepod dynamically");
+        assert_eq!(res.success(), true, "should be able to add a new spicepod dynamically");
 
-    //     assert_eq!(utils.output_contains(&spiced, "Loaded dataset: eth_recent_blocks").await, true, "should be able to load eth_recent_blocks dynamically");
+        assert_eq!(utils.output_contains(&spiced, "Loaded dataset: eth_recent_blocks").await, true, "should be able to load eth_recent_blocks dynamically");
     
-    //     assert_eq!(utils.output_contains(&spiced, "Runtime error").await, false, "should not contain runtime errors");
+        assert_eq!(utils.output_contains(&spiced, "Runtime error").await, false, "should not contain runtime errors");
 
-    //     spiced.kill().await;
-    // }
+        spiced.kill().await;
+    }
 }
 
 
