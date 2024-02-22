@@ -33,7 +33,7 @@ client = Client(API_KEY, 'grpc://127.0.0.1:50051')
 while True:
     startTime = time.time()
     data = client.query('SELECT trace.block_number FROM eth_recent_traces trace JOIN eth_recent_transactions trans ON trace.transaction_hash = trans.hash ORDER BY trans.block_number DESC;')
-    pd = data.read_pandas()
+    pd = data.read_chunk()
     endTime = time.time()
 
     print(pd.head(5))
@@ -50,16 +50,16 @@ while True:
 while True:
     startTime = time.time()
     data = client.query('SELECT * FROM taxi_trips ORDER BY pickup_datetime DESC LIMIT 100')
-    endTime = time.time()
     pd = data.read_pandas()
+    endTime = time.time()
 
     print(pd.to_string() + "\n")
     print("Query Time: " + str(endTime - startTime) + " seconds\n")
 
     startTime = time.time()
     data = client.query('SELECT count(*) FROM taxi_trips')
-    endTime = time.time()
     pd = data.read_pandas()
+    endTime = time.time()
 
     print(pd.to_string() + "\n")
     print("Query Time: " + str(endTime - startTime) + " seconds\n")
@@ -80,8 +80,8 @@ while True:
         ORDER BY eth_recent_blocks.number DESC                
         LIMIT 10
         """)
-    endTime = time.time()
     pd = data.read_pandas()
+    endTime = time.time()
 
     print(pd.to_string() + "\n")
     print("Query Time: " + str(endTime - startTime) + " seconds\n")
