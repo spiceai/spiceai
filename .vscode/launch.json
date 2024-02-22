@@ -12,7 +12,36 @@
       "args": [],
       "cwd": "${workspaceFolder}",
       "preLaunchTask": "rust: cargo build",
+      "env": {
+        // "SPICED_LOG" : "debug",
+        // "RUST_BACKTRACE": "1"
+      },
     },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "[Rust] Debug Tests",
+      "cargo": {
+        "args": [
+            "test",
+            "--no-run",
+            "--verbose",
+            "nocapture",
+            "--package=spiced"
+        ],
+        "filter": {
+            "name": "app_start_test",
+            // "kind": "lib"
+        }
+    },
+    "args": [],
+    "env": {
+      "SPICED_LOG" : "debug",
+      // "RUST_BACKTRACE": "1"
+    },
+    "cwd": "${workspaceFolder}",
+    "preLaunchTask": "rust: cargo build",
+  },
     {
       "name": "spice version",
       "type": "go",
