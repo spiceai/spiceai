@@ -1,22 +1,18 @@
 use std::any::Any;
-use std::sync::Arc;
 
-use arrow::record_batch::RecordBatch;
 use arrow_flight::sql::client::FlightSqlServiceClient;
 use arrow_schema::Schema;
-use async_stream::stream;
 use async_stream::try_stream;
+use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::sql::TableReference;
-use futures::stream::BoxStream;
 use futures::StreamExt;
 use postgres::types::ToSql;
 use r2d2_postgres::postgres::NoTls;
 use r2d2_postgres::PostgresConnectionManager;
 use snafu::{prelude::*, ResultExt};
-use tokio::runtime::Handle;
-use tokio::sync::Mutex;
 use tonic::transport::Channel;
 
 use super::DbConnection;
@@ -44,13 +40,13 @@ pub enum Error {
 #[allow(clippy::module_name_repetitions)]
 pub struct PostgresConnection {
     pub conn: r2d2::PooledConnection<PostgresConnectionManager<NoTls>>,
-    flight_sql_client: Option<Arc<Mutex<FlightSqlServiceClient<Channel>>>>,
+    flight_sql_client: Option<FlightSqlServiceClient<Channel>>,
 }
 
 impl PostgresConnection {
     pub fn new(
         conn: r2d2::PooledConnection<PostgresConnectionManager<NoTls>>,
-        flight_sql_client: Option<Arc<Mutex<FlightSqlServiceClient<Channel>>>>,
+        flight_sql_client: Option<FlightSqlServiceClient<Channel>>,
     ) -> Self {
         PostgresConnection {
             conn,
@@ -59,6 +55,7 @@ impl PostgresConnection {
     }
 }
 
+#[async_trait]
 impl<'a> DbConnection<PostgresConnectionManager<NoTls>, &'a (dyn ToSql + Sync)>
     for PostgresConnection
 {
@@ -72,43 +69,35 @@ impl<'a> DbConnection<PostgresConnectionManager<NoTls>, &'a (dyn ToSql + Sync)>
         }
     }
 
-    fn get_schema(&mut self, table_reference: &TableReference) -> Result<SchemaRef> {
+    async fn get_schema(&mut self, table_reference: &TableReference) -> Result<SchemaRef> {
+        let Some(client) = &self.flight_sql_client else {
+            return NoFlightSqlClientSnafu.fail()?;
+        };
+        let mut client = client.clone();
+
         let sql = &format!("SELECT * FROM {table_reference} LIMIT 0");
+        let mut stmt = client
+            .prepare(sql.to_string(), None)
+            .await
+            .context(UnableToQuerySnafu)?;
 
-        tokio::task::block_in_place(move || {
-            Handle::current().block_on(async {
-                let Some(client) = &self.flight_sql_client else {
-                    return NoFlightSqlClientSnafu.fail()?;
-                };
+        let flight_info = stmt.execute().await.context(UnableToQuerySnafu)?;
 
-                let mut stmt = client
-                    .lock()
-                    .await
-                    .prepare(sql.to_string(), None)
-                    .await
-                    .context(UnableToQuerySnafu)?;
+        let Some(ticket) = flight_info.endpoint[0].ticket.as_ref() else {
+            return NoTicketReceivedSnafu.fail()?;
+        };
+        let mut flight_record_batch_stream = client
+            .do_get(ticket.clone())
+            .await
+            .context(UnableToQuerySnafu)?;
 
-                let flight_info = stmt.execute().await.context(UnableToQuerySnafu)?;
-
-                let Some(ticket) = flight_info.endpoint[0].ticket.as_ref() else {
-                    return NoTicketReceivedSnafu.fail()?;
-                };
-                let mut flight_record_batch_stream = client
-                    .lock()
-                    .await
-                    .do_get(ticket.clone())
-                    .await
-                    .context(UnableToQuerySnafu)?;
-
-                while let Some(_batch) = flight_record_batch_stream.next().await {
-                    continue;
-                }
-                let Some(schema) = flight_record_batch_stream.schema() else {
-                    return NoSchemaReturnedSnafu.fail()?;
-                };
-                Ok(schema.to_owned())
-            })
-        })
+        while let Some(_batch) = flight_record_batch_stream.next().await {
+            continue;
+        }
+        let Some(schema) = flight_record_batch_stream.schema() else {
+            return NoSchemaReturnedSnafu.fail()?;
+        };
+        Ok(schema.to_owned())
     }
 
     fn query_arrow(
@@ -116,35 +105,38 @@ impl<'a> DbConnection<PostgresConnectionManager<NoTls>, &'a (dyn ToSql + Sync)>
         sql: &str,
         _params: &[&'a (dyn ToSql + Sync)],
     ) -> Result<SendableRecordBatchStream> {
+        let Some(client) = &self.flight_sql_client else {
+            return NoFlightSqlClientSnafu.fail()?;
+        };
+        let mut client = client.clone();
+        let sql = sql.to_string();
         let schema = SchemaRef::new(Schema::empty());
-        let query = sql.clone().to_string();
+
         let stream = Box::pin(try_stream! {
-            let client = &self.flight_sql_client.unwrap();
-
             let mut stmt = client
-                .lock()
+                .prepare(sql.to_string(), None)
                 .await
-                .prepare(query, None)
-                .await
-                .unwrap();
+                .map_err(to_execution_error)?;
 
-            let flight_info = stmt.execute().await.unwrap();
+            let flight_info = stmt.execute().await.map_err(to_execution_error)?;
 
-            let ticket = flight_info.endpoint[0].ticket.as_ref().unwrap();
+            let Some(ticket) = flight_info.endpoint[0].ticket.as_ref() else {
+                Err(DataFusionError::Execution("No ticket received for query".to_string()))?;
+                return;
+            };
             let mut flight_record_batch_stream =
-                client.lock().await.do_get(ticket.clone()).await.unwrap();
+                client.do_get(ticket.clone()).await.map_err(to_execution_error)?;
 
             while let Some(batch) = flight_record_batch_stream.next().await {
                 match batch {
                     Ok(batch) => {
-                        schema = batch.schema();
                         yield batch;
                     }
-                    Err(error) => {
-                        tracing::error!("Failed to read batch from flight client: {:?}", error);
+                    Err(e) => {
+                        Err(to_execution_error(e))?;
                     }
                 };
-            }
+            };
         });
 
         Ok(Box::pin(FlightStream::new(stream, schema)))
@@ -162,4 +154,9 @@ impl<'a> DbConnection<PostgresConnectionManager<NoTls>, &'a (dyn ToSql + Sync)>
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn to_execution_error(e: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> DataFusionError {
+    DataFusionError::Execution(format!("{}", e.into()).to_string())
 }

@@ -5,7 +5,6 @@ use async_trait::async_trait;
 use postgres::types::ToSql;
 use r2d2_postgres::{postgres::NoTls, PostgresConnectionManager};
 use snafu::{prelude::*, ResultExt};
-use tokio::sync::Mutex;
 use tonic::transport::Endpoint;
 
 use super::{DbConnectionPool, Mode, Result};
@@ -25,7 +24,7 @@ pub enum Error {
 
 pub struct PostgresConnectionPool {
     pool: Arc<r2d2::Pool<PostgresConnectionManager<NoTls>>>,
-    flight_sql_client: Arc<Mutex<FlightSqlServiceClient<tonic::transport::Channel>>>,
+    flight_sql_client: FlightSqlServiceClient<tonic::transport::Channel>,
 }
 
 #[async_trait]
@@ -48,7 +47,7 @@ impl DbConnectionPool<PostgresConnectionManager<NoTls>, &'static (dyn ToSql + Sy
             .connect()
             .await
             .context(UnableToConnectToEndpointSnafu)?;
-        let flight_sql_client = Arc::new(Mutex::new(FlightSqlServiceClient::new(channel)));
+        let flight_sql_client = FlightSqlServiceClient::new(channel);
 
         Ok(PostgresConnectionPool {
             pool,
@@ -64,7 +63,7 @@ impl DbConnectionPool<PostgresConnectionManager<NoTls>, &'static (dyn ToSql + Sy
         let conn = pool.get().context(ConnectionPoolSnafu)?;
         Ok(Box::new(PostgresConnection::new(
             conn,
-            Some(Arc::clone(&self.flight_sql_client)),
+            Some(self.flight_sql_client.clone()),
         )))
     }
 }

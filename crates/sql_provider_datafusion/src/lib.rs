@@ -2,7 +2,6 @@
 
 use async_trait::async_trait;
 use dbconnectionpool::DbConnectionPool;
-use futures::Stream;
 use snafu::prelude::*;
 use std::{any::Any, fmt, sync::Arc};
 
@@ -43,7 +42,7 @@ pub struct SqlTable<T: r2d2::ManageConnection, P: 'static> {
 }
 
 impl<T: r2d2::ManageConnection, P> SqlTable<T, P> {
-    pub fn new(
+    pub async fn new(
         pool: &Arc<dyn DbConnectionPool<T, P> + Send + Sync>,
         table_reference: impl Into<OwnedTableReference>,
     ) -> Result<Self> {
@@ -51,6 +50,7 @@ impl<T: r2d2::ManageConnection, P> SqlTable<T, P> {
         let mut conn = pool.connect().context(UnableToGetConnectionFromPoolSnafu)?;
         let schema = conn
             .get_schema(&table_reference)
+            .await
             .context(UnableToQueryDbConnectionSnafu)?;
         Ok(Self {
             pool: Arc::clone(pool),
@@ -242,7 +242,8 @@ impl<T: r2d2::ManageConnection, P: 'static> ExecutionPlan for SqlExec<T, P> {
         let sql = self.sql().map_err(to_execution_error)?;
         tracing::debug!("SqlExec sql: {sql}");
 
-        Ok(conn.query_arrow(&sql, &[]).map_err(to_execution_error)?)
+        let stream = conn.query_arrow(&sql, &[]).map_err(to_execution_error)?;
+        Ok(stream)
     }
 }
 
@@ -290,7 +291,7 @@ mod tests {
         db_conn.conn.execute_batch(
             "CREATE TABLE test (a INTEGER, b VARCHAR); INSERT INTO test VALUES (3, 'bar');",
         )?;
-        let duckdb_table = SqlTable::new(&pool, "test")?;
+        let duckdb_table = SqlTable::new(&pool, "test").await?;
         ctx.register_table("test_datafusion", Arc::new(duckdb_table))?;
         let sql = "SELECT * FROM test_datafusion limit 1";
         let df = ctx.sql(sql).await?;
@@ -315,7 +316,7 @@ mod tests {
         db_conn.conn.execute_batch(
             "CREATE TABLE test (a INTEGER, b VARCHAR); INSERT INTO test VALUES (3, 'bar');",
         )?;
-        let duckdb_table = SqlTable::new(&pool, "test")?;
+        let duckdb_table = SqlTable::new(&pool, "test").await?;
         ctx.register_table("test_datafusion", Arc::new(duckdb_table))?;
         let sql = "SELECT * FROM test_datafusion where a > 1 and b = 'bar' limit 1";
         let df = ctx.sql(sql).await?;

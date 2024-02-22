@@ -84,7 +84,7 @@ impl DataPublisher for DuckDBBackend {
 
             duckdb_update.update()?;
 
-            self.initialize_datafusion()?;
+            self.initialize_datafusion().await?;
             Ok(())
         })
     }
@@ -115,7 +115,7 @@ impl DuckDBBackend {
         })
     }
 
-    fn initialize_datafusion(&self) -> Result<()> {
+    async fn initialize_datafusion(&self) -> Result<()> {
         let table_exists = self
             .ctx
             .table_exist(TableReference::bare(self.name.clone()))
@@ -125,6 +125,7 @@ impl DuckDBBackend {
         }
 
         let table = match SqlTable::new(&self.pool, TableReference::bare(self.name.clone()))
+            .await
             .context(DuckDBDataFusionSnafu)
         {
             Ok(table) => table,
@@ -265,6 +266,7 @@ mod tests {
         let name = "test_add_data";
         let backend =
             DuckDBBackend::new(Arc::clone(&ctx), name, Mode::Memory, Arc::new(None), None)
+                .await
                 .expect("Unable to create DuckDBBackend");
 
         let schema = Arc::new(Schema::new(vec![

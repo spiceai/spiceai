@@ -74,8 +74,8 @@ impl DataBackendBuilder {
     ///
     /// Panics if the backend fails to build
     #[must_use]
-    pub fn must_build(self) -> Box<dyn DataPublisher> {
-        match self.build() {
+    pub async fn must_build(self) -> Box<dyn DataPublisher> {
+        match self.build().await {
             Ok(backend) => backend,
             Err(e) => panic!("Failed to build backend: {e}"),
         }
@@ -105,7 +105,7 @@ impl DataBackendBuilder {
         }
     }
 
-    pub fn build(self) -> std::result::Result<Box<dyn DataPublisher>, Error> {
+    pub async fn build(self) -> std::result::Result<Box<dyn DataPublisher>, Error> {
         self.validate()?;
         let engine = self.engine.unwrap_or_default();
         let mode = self.mode.unwrap_or_default();
@@ -124,6 +124,19 @@ impl DataBackendBuilder {
                     self.params,
                     self.primary_keys,
                 )
+                .await
+                .boxed()
+                .context(BackendCreationFailedSnafu)?,
+            )),
+            Engine::Postgres => Ok(Box::new(
+                postgres::PostgresBackend::new(
+                    Arc::clone(&self.ctx),
+                    self.name.as_str(),
+                    mode.into(),
+                    self.params,
+                    self.primary_keys,
+                )
+                .await
                 .boxed()
                 .context(BackendCreationFailedSnafu)?,
             )),

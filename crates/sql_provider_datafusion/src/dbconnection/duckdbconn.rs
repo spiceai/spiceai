@@ -1,6 +1,6 @@
 use std::any::Any;
 
-use datafusion::arrow::array::RecordBatch;
+use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::memory::MemoryStream;
@@ -27,12 +27,13 @@ pub struct DuckDbConnection {
     pub conn: r2d2::PooledConnection<DuckdbConnectionManager>,
 }
 
+#[async_trait]
 impl DbConnection<DuckdbConnectionManager, &dyn ToSql> for DuckDbConnection {
     fn new(conn: r2d2::PooledConnection<DuckdbConnectionManager>) -> Self {
         DuckDbConnection { conn }
     }
 
-    fn get_schema(&mut self, table_reference: &TableReference) -> Result<SchemaRef> {
+    async fn get_schema(&mut self, table_reference: &TableReference) -> Result<SchemaRef> {
         let mut stmt = self
             .conn
             .prepare(&format!("SELECT * FROM {table_reference} LIMIT 0"))

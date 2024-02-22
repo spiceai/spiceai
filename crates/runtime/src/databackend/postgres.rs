@@ -55,6 +55,7 @@ pub enum Error {
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
+#[allow(clippy::module_name_repetitions)]
 pub struct PostgresBackend {
     ctx: Arc<SessionContext>,
     name: String,
@@ -64,6 +65,7 @@ pub struct PostgresBackend {
             + Sync,
     >,
     create_mutex: std::sync::Mutex<()>,
+    _primary_keys: Option<Vec<String>>,
 }
 
 impl DataPublisher for PostgresBackend {
@@ -88,7 +90,7 @@ impl DataPublisher for PostgresBackend {
 
             postgres_update.update()?;
 
-            self.initialize_datafusion()?;
+            self.initialize_datafusion().await?;
             Ok(())
         })
     }
@@ -105,6 +107,7 @@ impl PostgresBackend {
         name: &str,
         mode: Mode,
         params: Arc<Option<HashMap<String, String>>>,
+        primary_keys: Option<Vec<String>>,
     ) -> Result<Self> {
         let pool = PostgresConnectionPool::new(name, mode, params)
             .await
@@ -114,10 +117,11 @@ impl PostgresBackend {
             name: name.to_string(),
             pool: Arc::new(pool),
             create_mutex: std::sync::Mutex::new(()),
+            _primary_keys: primary_keys,
         })
     }
 
-    fn initialize_datafusion(&self) -> Result<()> {
+    async fn initialize_datafusion(&self) -> Result<()> {
         let table_exists = self
             .ctx
             .table_exist(TableReference::bare(self.name.clone()))
@@ -127,6 +131,7 @@ impl PostgresBackend {
         }
 
         let table = match SqlTable::new(&self.pool, TableReference::bare(self.name.clone()))
+            .await
             .context(PostgresDataFusionSnafu)
         {
             Ok(table) => table,
@@ -224,7 +229,7 @@ impl<'a> PostgresUpdate<'a> {
         let sql = format!(
             r#"SELECT EXISTS (
               SELECT 1
-              FROM information_schema.tables 
+              FROM information_schema.tables
               WHERE table_name = '{name}'
             )"#,
             name = self.name

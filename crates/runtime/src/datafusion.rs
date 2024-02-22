@@ -143,6 +143,7 @@ impl DataFusion {
                 .mode(acceleration.mode())
                 .params(params)
                 .build()
+                .await
                 .context(DatasetConfigurationSnafu)?;
 
         Ok(data_backend)
