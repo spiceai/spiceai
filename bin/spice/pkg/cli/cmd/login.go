@@ -19,6 +19,7 @@ const (
 	apiKeyFlag   = "key"
 	usernameFlag = "username"
 	passwordFlag = "password"
+	endpointFlag = "endpoint"
 	charset      = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 )
 
@@ -138,10 +139,22 @@ spice login dremio --username <username> --password <password>
 			os.Exit(1)
 		}
 
+		endpoint, err := cmd.Flags().GetString(endpointFlag)
+		if err != nil {
+			cmd.Println(err.Error())
+			os.Exit(1)
+		}
+
+		if endpoint == "" {
+			cmd.Println("No endpoint provided, use --endpoint or -p to provide an endpoint")
+			os.Exit(1)
+		}
+
 		mergeAuthConfig(cmd, api.AUTH_TYPE_DREMIO, &api.Auth{
 			Params: map[string]string{
 				api.AUTH_PARAM_USERNAME: username,
 				api.AUTH_PARAM_PASSWORD: password,
+				api.AUTH_PARAM_ENDPOINT: endpoint,
 			},
 		},
 		)
@@ -198,6 +211,7 @@ func init() {
 	dremioCmd.Flags().BoolP("help", "h", false, "Print this help message")
 	dremioCmd.Flags().StringP(usernameFlag, "u", "", "Username")
 	dremioCmd.Flags().StringP(passwordFlag, "p", "", "Password")
+	dremioCmd.Flags().StringP(endpointFlag, "e", "", "Endpoint")
 	loginCmd.AddCommand(dremioCmd)
 
 	loginCmd.Flags().BoolP("help", "h", false, "Print this help message")

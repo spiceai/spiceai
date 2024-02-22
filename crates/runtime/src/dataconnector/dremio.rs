@@ -25,15 +25,8 @@ impl DataConnector for Dremio {
         Self: Sized,
     {
         Box::pin(async move {
-            let endpoint: String = params
-                .as_ref() // &Option<HashMap<String, String>>
-                .as_ref() // Option<&HashMap<String, String>>
-                .and_then(|params| params.get("endpoint").cloned())
-                .ok_or_else(|| super::Error::UnableToCreateDataConnector {
-                    source: "Missing required parameter: endpoint".into(),
-                })?;
             let flight_client = FlightClient::new(
-                endpoint.as_str(),
+                auth_provider.get_param("endpoint").unwrap_or_default(),
                 auth_provider.get_param("username").unwrap_or_default(),
                 auth_provider.get_param("password").unwrap_or_default(),
             )
