@@ -23,13 +23,37 @@ https://www.rust-lang.org/tools/install
 **Install Go**
 https://go.dev/doc/install
 
-**Step 1.** Install the SpiceAI CLI:
+**Step 1.** Create an account with Spice.ai:
+
+In order to access public datasets from SpiceAI, you will first need to create an account with Spice.ai by selecting the free tier membership.
+
+Navigate to https://spice.ai/` and create a new account by clicking on Try for Free.
+
+<p align="center">
+  <img src="spiceai_try_for_free.png" width="600" />
+</p>
+
+After creating an account, you will need to create an app in order to create to an API key.
+
+<p align="center">
+  <img src="create_app.png" width="400" />
+</p>
+
+You will now be able to access datasets from Spice.ai.
+
+**Step 2.** Install the SpiceAI CLI:
 
 ```bash
 curl https://install.spiceai.org | /bin/bash
 ```
 
-**Step 2.** Choose a project name and initialize a new project:
+**Step 3.** Login and authenticate with SpiceAI. A pop up browser window will prompt you to authenticate:
+
+```bash
+spice login
+```
+
+**Step 4.** Choose a project name and initialize a new project:
 
 ```bash
 spice init my_spiceai_project
@@ -43,7 +67,7 @@ kind: Spicepod
 name: PROJECT_NAME
 ```
 
-**Step 3.** start the SpiceAI runtime:
+**Step 5.** start the SpiceAI runtime:
 
 ```bash
 spice run
@@ -59,7 +83,7 @@ Using latest 'local' runtime version.
 2024-02-21T06:11:56.382038Z  INFO runtime::opentelemetry: Spice Runtime OpenTelemetry listening on 127.0.0.1:50052
 ```
 
-**Step 4.** Add a public pre-defined spicepod.
+**Step 6.** Add a public pre-defined spicepod.
 In a new terminal window, enter the following command:
 
 ```bash
@@ -78,7 +102,7 @@ dependencies:
 - <SPICEPOD_PATH>
 ```
 
-**Step 5.** You can now query against the dataset using the SpiceAI SQL REPL. Enter the command below to start the REPL:
+**Step 7.** You can now query against the dataset using the SpiceAI SQL REPL. Enter the command below to start the REPL:
 
 ```bash
 spice sql
@@ -127,25 +151,9 @@ A list of publically available datasets from Spice.ai can be found here: https:/
 
 For this demonstration, we will be using the Spice.ai/eth.recent_transactions dataset.
 
-In order access these datasets, you will first need to create an account with Spice.ai by selecting the free tier membership.
+## Importing and configuring a public dataset from SpiceAI
 
-Navigate to https://spice.ai/` and create a new account by clicking on Try for Free.
-
-<p align="center">
-  <img src="spiceai_try_for_free.png" width="600" />
-</p>
-
-After creating an account, you will need to create an app in order to create to an API key.
-
-<p align="center">
-  <img src="create_app.png" width="400" />
-</p>
-
-You will now be able to access datasets from Spice.ai.
-
-## Importing a public dataset from SpiceAI
-
-**Step 1.** In a new empty directory, login and authenticate from the command line. A pop up browser window will prompt you to authenticate:
+**Step 1.** In a new empty directory, login and authenticate from the command line if you haven't already done so:
 
 ```bash
 spice login
@@ -198,7 +206,7 @@ spice sql
 sql> SELECT block_number FROM eth_recent_transactions LIMIT 5;
 ```
 
-You should see the following output:
+You should see an output that displays the latest Ethereum block numbers along with the time it took to execute the query:
 
 ```bash
 +--------------+
@@ -218,7 +226,7 @@ You can experiment with the time it takes to generate queries when using non-acc
 
 ## Importing dataset from Dremio (using dummie login credentials)
 
-**Step 1.** Log in to dremio. You can use the following credentials to access the taxi_trips dataset
+**Step 1.** If you have a dataset hosted in Dremio, you can load it into the SpiceAI Runtime as follows:
 
 ```bash
 spice login dremio -u <USERNAME> -p <PASSWORD>
@@ -240,16 +248,16 @@ spice run
 spice dataset configure
 ```
 
-We will now be prompted for the name. Enter "taxi_trips"
+We will now be prompted for the name. Enter "my_dataset":
 
 ```bash
 What is the dataset name? taxi_trips
 ```
 
-Specify the location of the dataset as "dremio/datasets.taxi_trips"
+Specify the location of the dataset as "dremio/datasets.my_dataset":
 
 ```bash
-Where is your dataset located? dremio/datasets.taxi_trips
+Where is your dataset located? dremio/datasets.my_dataset
 ```
 
 Select "y" when prompted whether to locally accelerate the dataset:
@@ -261,14 +269,14 @@ Locally accelerate this dataset (y/n)? y
 We should now see the following output:
 
 ```
-Dataset settings written to `datasets/taxi_trips/dataset.yaml`!
+Dataset settings written to `datasets/my_dataset/dataset.yaml`!
 ```
 
-If our login credentials were entered correctly, the taxi_trips datasets has been loaded into the runtime. You should see the following in the SpiceAI runtime terminal :
+If our login credentials were entered correctly, your dataset will have loaded into the runtime. You should see the following in the SpiceAI runtime terminal :
 
 ```
-2024-02-14T18:34:15.174564Z  INFO spiced: Loaded dataset: taxi_trips
-2024-02-14T18:34:15.175189Z  INFO runtime::datasource: Refreshing data for taxi_trips
+2024-02-14T18:34:15.174564Z  INFO spiced: Loaded dataset: my_dataset
+2024-02-14T18:34:15.175189Z  INFO runtime::datasource: Refreshing data for my_dataset
 ```
 
 **Step 4.** Run queries against the dataset using the SpiceAI SQL REPL.
@@ -280,13 +288,13 @@ spice sql
 ```
 
 ```bash
-sql> SELECT * FROM taxi_trips LIMIT 5
+sql> SELECT * FROM my_dataset LIMIT 5
 ```
 
 ## Sample project using the SpiceAI runtime.
 
 TODO: Make a simple app that showcases the data querying from the runtime.
-This should replace the Python script in the examples folder.
+This will replace the Python script in the examples folder.
 
 ### Upcoming Features
 
