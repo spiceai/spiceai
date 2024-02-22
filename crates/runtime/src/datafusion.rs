@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::databackend::{self, DataBackend};
+use crate::databackend::{self, DataBackendBuilder};
 use crate::dataconnector::DataConnector;
 use crate::datapublisher::DataPublisher;
 use datafusion::datasource::ViewTable;
@@ -126,7 +126,7 @@ impl DataFusion {
         dataset: impl Borrow<Dataset>,
     ) -> Result<Box<dyn DataPublisher>> {
         let dataset = dataset.borrow();
-        let table_name = dataset.name.as_str();
+        let table_name = dataset.name.to_string();
         let acceleration =
             dataset
                 .acceleration
@@ -137,14 +137,13 @@ impl DataFusion {
 
         let params: Arc<Option<HashMap<String, String>>> = Arc::new(dataset.params.clone());
 
-        let data_backend: Box<dyn DataPublisher> = DataBackend::new(
-            &self.ctx,
-            table_name,
-            acceleration.engine(),
-            acceleration.mode(),
-            params,
-        )
-        .context(DatasetConfigurationSnafu)?;
+        let data_backend: Box<dyn DataPublisher> =
+            DataBackendBuilder::new(Arc::clone(&self.ctx), table_name)
+                .engine(acceleration.engine())
+                .mode(acceleration.mode())
+                .params(params)
+                .build()
+                .context(DatasetConfigurationSnafu)?;
 
         Ok(data_backend)
     }
