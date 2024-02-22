@@ -17,10 +17,10 @@
 
 SpiceAI uses Go and Rust. Be sure to have both of these installed before proceeding.
 
-**Install Rust**
+**Install Rust:**
 https://www.rust-lang.org/tools/install
 
-**Install Go**
+**Install Go:**
 https://go.dev/doc/install
 
 **Step 1.** Install the SpiceAI CLI:
