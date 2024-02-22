@@ -47,6 +47,8 @@ reqwest = { version = "0.11.24", features = ["json"] }
 notify = "6.1.1"
 arrow-json = "49.0.0"
 async-trait.workspace = true
+r2d2_postgres.workspace = true
+postgres.workspace = true
 
 [features]
 default = ["duckdb"]
