@@ -222,6 +222,7 @@ mod tests {
                 "lukekim.demo.my_data",
             ),
             ("lukekim/demo/my_data".to_string(), "lukekim.demo.my_data"),
+            ("eth.recent_blocks".to_string(), "eth.recent_blocks"),
         ];
 
         for (input, expected) in tests {
