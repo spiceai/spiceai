@@ -1472,6 +1472,7 @@ dependencies = [
  "futures",
  "r2d2",
  "snafu 0.8.0",
+ "sql_provider_datafusion",
  "tokio",
  "tracing",
 ]

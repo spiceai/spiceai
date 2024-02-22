@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use flight_client::FlightClient;
 use futures::{Stream, StreamExt};
 use snafu::prelude::*;
+use sql_provider_datafusion::expr;
 use std::{any::Any, fmt, ops::Deref, pin::Pin, sync::Arc, task::Poll};
 use tokio::runtime::Handle;
 
@@ -22,8 +23,6 @@ use datafusion::{
     },
     sql::TableReference,
 };
-
-mod expr;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -145,7 +144,7 @@ impl TableProvider for FlightSQLTable {
     ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
         let mut filter_push_down = vec![];
         for filter in filters {
-            match expr::expr_to_sql(filter) {
+            match expr::to_sql(filter) {
                 Ok(_) => filter_push_down.push(TableProviderFilterPushDown::Exact),
                 Err(_) => filter_push_down.push(TableProviderFilterPushDown::Unsupported),
             }
@@ -213,7 +212,7 @@ impl FlightSQLExec {
             let filter_expr = self
                 .filters
                 .iter()
-                .map(expr::expr_to_sql)
+                .map(expr::to_sql)
                 .collect::<expr::Result<Vec<_>>>()
                 .context(UnableToGenerateSQLSnafu)?;
             format!("WHERE {}", filter_expr.join(" AND "))
