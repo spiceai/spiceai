@@ -74,7 +74,7 @@ spice add spiceai/quickstart
 
 You should see the runtime updated with the new datasets.
 Also, the spicepod.yaml file will be updated with a new dependency that
-references the Lukekim/demo spicepod.
+references the spiceai/quickstart spicepod.
 
 ```yaml
 version: v1beta1
