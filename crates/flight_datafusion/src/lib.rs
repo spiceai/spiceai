@@ -9,7 +9,7 @@ use snafu::prelude::*;
 use std::{any::Any, fmt, ops::Deref, pin::Pin, sync::Arc, task::Poll};
 use tokio::runtime::Handle;
 
-use arrow_flight::decode::FlightRecordBatchStream;
+use arrow_flight::error::FlightError;
 use datafusion::{
     arrow::datatypes::SchemaRef,
     common::OwnedTableReference,
@@ -18,8 +18,7 @@ use datafusion::{
     execution::{context::SessionState, RecordBatchStream, TaskContext},
     logical_expr::{Expr, TableProviderFilterPushDown, TableType},
     physical_plan::{
-        memory::MemoryStream, project_schema, DisplayAs, DisplayFormatType, ExecutionPlan,
-        SendableRecordBatchStream,
+        project_schema, DisplayAs, DisplayFormatType, ExecutionPlan, SendableRecordBatchStream,
     },
     sql::TableReference,
 };
@@ -37,6 +36,13 @@ pub enum Error {
     Flight {
         source: flight_client::Error,
     },
+
+    #[snafu(display("Unable to query FlightSQL: {source}"))]
+    ArrowFlight {
+        source: FlightError,
+    },
+
+    UnableToQuery {},
 
     NoSchema,
 }
@@ -272,7 +278,7 @@ impl ExecutionPlan for FlightSQLExec {
             Err(error) => return Err(error),
         };
 
-        Ok(Box::pin(MyOwnStream::new(
+        Ok(Box::pin(StreamConverter::new(
             Arc::clone(&self.client),
             sql.as_str(),
             self.schema(),
@@ -280,28 +286,33 @@ impl ExecutionPlan for FlightSQLExec {
     }
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn to_stream(client: Arc<FlightClient>, sql: &str) -> impl Stream<Item = Result<RecordBatch>> {
     let mut client = client.deref().clone();
     let sql = sql.to_string();
     stream! {
-        let mut stream = client.query(sql.as_str()).await.unwrap();
-        while let Some(batch) = stream.next().await {
-            match batch {
-                Ok(batch) => yield Ok(batch),
-                Err(_) => {
-                    yield Err(Error::NoSchema {});
+        match client.query(sql.as_str()).await {
+            Ok(mut stream) => {
+                while let Some(batch) = stream.next().await {
+                    match batch {
+                        Ok(batch) => yield Ok(batch),
+                        Err(error) => {
+                            yield Err(Error::ArrowFlight { source: error });
+                        }
+                    }
                 }
             }
+            Err(error) => yield Err(Error::Flight{ source: error})
         }
     }
 }
 
-struct MyOwnStream {
+struct StreamConverter {
     stream: Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>>,
     schema: SchemaRef,
 }
 
-impl MyOwnStream {
+impl StreamConverter {
     fn new(client: Arc<FlightClient>, sql: &str, schema: SchemaRef) -> Self {
         let stream = to_stream(client, sql);
         Self {
@@ -311,13 +322,13 @@ impl MyOwnStream {
     }
 }
 
-impl RecordBatchStream for MyOwnStream {
+impl RecordBatchStream for StreamConverter {
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
 }
 
-impl Stream for MyOwnStream {
+impl Stream for StreamConverter {
     type Item = datafusion::common::Result<RecordBatch>;
 
     fn poll_next(
