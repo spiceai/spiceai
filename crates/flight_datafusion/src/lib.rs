@@ -61,18 +61,6 @@ impl FlightSQLTable {
         })
     }
 
-    pub fn new_with_schema(
-        client: Arc<FlightClient>,
-        schema: impl Into<SchemaRef>,
-        table_reference: impl Into<OwnedTableReference>,
-    ) -> Self {
-        Self {
-            client,
-            schema: schema.into(),
-            table_reference: table_reference.into(),
-        }
-    }
-
     #[allow(clippy::needless_pass_by_value)]
     fn get_schema<'a>(
         client: Arc<FlightClient>,
