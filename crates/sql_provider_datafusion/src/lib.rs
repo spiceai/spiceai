@@ -20,7 +20,7 @@ use datafusion::{
 
 pub mod dbconnection;
 pub mod dbconnectionpool;
-mod expr;
+pub mod expr;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -109,7 +109,7 @@ impl<T: r2d2::ManageConnection, P> TableProvider for SqlTable<T, P> {
     ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
         let mut filter_push_down = vec![];
         for filter in filters {
-            match expr::expr_to_sql(filter) {
+            match expr::to_sql(filter) {
                 Ok(_) => filter_push_down.push(TableProviderFilterPushDown::Exact),
                 Err(_) => filter_push_down.push(TableProviderFilterPushDown::Unsupported),
             }
@@ -162,7 +162,7 @@ impl<T: r2d2::ManageConnection, P> SqlExec<T, P> {
             .projected_schema
             .fields()
             .iter()
-            .map(|f| f.name().as_str())
+            .map(|f| format!("\"{}\"", f.name()))
             .collect::<Vec<_>>()
             .join(", ");
 
@@ -177,7 +177,7 @@ impl<T: r2d2::ManageConnection, P> SqlExec<T, P> {
             let filter_expr = self
                 .filters
                 .iter()
-                .map(expr::expr_to_sql)
+                .map(expr::to_sql)
                 .collect::<expr::Result<Vec<_>>>()
                 .context(UnableToGenerateSQLSnafu)?;
             format!("WHERE {}", filter_expr.join(" AND "))

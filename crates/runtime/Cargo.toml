@@ -49,6 +49,7 @@ arrow-json = "49.0.0"
 async-trait.workspace = true
 r2d2_postgres.workspace = true
 postgres.workspace = true
+flight_datafusion = { path = "../flight_datafusion" }
 
 [features]
 default = ["duckdb"]

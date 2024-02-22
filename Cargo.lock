@@ -628,6 +628,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "arrow_sql_gen"
+version = "0.7.0-alpha"
+dependencies = [
+ "arrow 49.0.0",
+ "sea-query",
+ "tracing",
+]
+
+[[package]]
 name = "async-compression"
 version = "0.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1704,6 +1713,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "flight_datafusion"
+version = "0.7.0-alpha"
+dependencies = [
+ "arrow 49.0.0",
+ "arrow-flight",
+ "async-stream",
+ "async-trait",
+ "datafusion",
+ "flight_client",
+ "futures",
+ "r2d2",
+ "snafu 0.8.0",
+ "sql_provider_datafusion",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "flightpublisher"
 version = "0.7.0-alpha"
 dependencies = [
@@ -2255,6 +2282,17 @@ checksum = "233cf39063f058ea2caae4091bf4a3ef70a653afbc026f5c4a4135d114e3c177"
 dependencies = [
  "equivalent",
  "hashbrown 0.14.3",
+]
+
+[[package]]
+name = "inherent"
+version = "1.0.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0122b7114117e64a63ac49f752a5ca4624d534c7b1c7de796ac196381cd2d947"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.49",
 ]
 
 [[package]]
@@ -3750,6 +3788,7 @@ dependencies = [
  "dirs",
  "duckdb",
  "flight_client",
+ "flight_datafusion",
  "futures",
  "futures-core",
  "indexmap 2.2.3",
@@ -3965,6 +4004,29 @@ checksum = "da046153aa2352493d6cb7da4b6e5c0c057d8a1d0a9aa8560baffdd945acd414"
 dependencies = [
  "ring",
  "untrusted",
+]
+
+[[package]]
+name = "sea-query"
+version = "0.30.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4166a1e072292d46dc91f31617c2a1cdaf55a8be4b5c9f4bf2ba248e3ac4999b"
+dependencies = [
+ "inherent",
+ "sea-query-derive",
+]
+
+[[package]]
+name = "sea-query-derive"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "25a82fcb49253abcb45cdcb2adf92956060ec0928635eb21b4f7a6d8f25ab0bc"
+dependencies = [
+ "heck",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.49",
+ "thiserror",
 ]
 
 [[package]]
