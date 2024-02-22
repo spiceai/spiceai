@@ -209,7 +209,7 @@ Select `y` when prompted whether to accelerate the data:
 Locally accelerate this dataset (y/n)? y
 ```
 
-You should see the following outpout from your runtime terminal:
+You should see the following output from your runtime terminal:
 
 ```bash
 2024-02-21T22:49:10.038461Z  INFO runtime: Loaded dataset: eth_recent_blocks
