@@ -54,6 +54,7 @@ impl<'a> DbConnection<FlightSqlServiceClient<Channel>, &'a (dyn ToSql + Sync)>
 
     async fn get_schema(&mut self, table_reference: &TableReference) -> Result<SchemaRef> {
         let mut client = self.conn.clone();
+        client.set_header("x-flight-sql-database", "flight-sql-test");
         client
             .handshake("postgres", "postgres")
             .await
@@ -90,6 +91,7 @@ impl<'a> DbConnection<FlightSqlServiceClient<Channel>, &'a (dyn ToSql + Sync)>
         _params: &[&'a (dyn ToSql + Sync)],
     ) -> Result<SendableRecordBatchStream> {
         let mut client = self.conn.clone();
+        client.set_header("x-flight-sql-database", "flight-sql-test");
         let sql = sql.to_string();
         let schema = SchemaRef::new(Schema::empty());
 
@@ -128,6 +130,7 @@ impl<'a> DbConnection<FlightSqlServiceClient<Channel>, &'a (dyn ToSql + Sync)>
 
     fn execute(&mut self, sql: &str, _params: &[&(dyn ToSql + Sync)]) -> Result<u64> {
         let mut client = self.conn.clone();
+        client.set_header("x-flight-sql-database", "flight-sql-test");
         tokio::task::block_in_place(move || {
             Handle::current().block_on(async {
                 client
