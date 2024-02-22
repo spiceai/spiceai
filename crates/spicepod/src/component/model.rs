@@ -27,9 +27,9 @@ impl Model {
         let from = self.from.clone();
 
         match from {
-            s if s.starts_with("spice.ai") => "spice.ai".to_string(),
+            s if s.starts_with("spiceai:") => "spiceai".to_string(),
             s if s.starts_with("file:/") => "localhost".to_string(),
-            _ => "debug".to_string(),
+            _ => "spiceai".to_string(),
         }
     }
 
