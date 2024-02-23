@@ -1,7 +1,7 @@
 package api
 
 const (
-	AUTH_TYPE_SPICE_AI = "spice.ai"
+	AUTH_TYPE_SPICE_AI = "spiceai"
 	AUTH_TYPE_DREMIO   = "dremio"
 
 	AUTH_PARAM_KEY      = "key"

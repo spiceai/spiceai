@@ -12,7 +12,7 @@ pub enum Mode {
     File,
 }
 
-pub trait DbConnectionPool<T: r2d2::ManageConnection, P: 'static> {
+pub trait DbConnectionPool<T, P: 'static> {
     fn new(name: &str, mode: Mode, params: Arc<Option<HashMap<String, String>>>) -> Result<Self>
     where
         Self: Sized;

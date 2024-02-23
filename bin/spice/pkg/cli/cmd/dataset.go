@@ -45,20 +45,29 @@ spice dataset configure
 		}
 		datasetLocation = strings.TrimSuffix(datasetLocation, "\n")
 
+		params := map[string]string{}
+		if strings.Split(datasetLocation, ":")[0] == api.DATA_SOURCE_DREMIO {
+
+			cmd.Print("\nWhat is your dremio endpoint? ")
+			endpoint, err := reader.ReadString('\n')
+			if err != nil {
+				cmd.Println(err.Error())
+				os.Exit(1)
+			}
+			endpoint = strings.TrimSuffix(endpoint, "\n")
+
+			params["endpoint"] = endpoint
+		}
+
 		cmd.Print("\nLocally accelerate this dataset (y/n)? ")
 		accelerateDatasetString, err := reader.ReadString('\n')
 		if err != nil {
 			cmd.Println(err.Error())
 			os.Exit(1)
 		}
+
 		accelerateDatasetString = strings.TrimSuffix(accelerateDatasetString, "\n")
 		accelerateDataset := strings.ToLower(accelerateDatasetString) == "y"
-
-		params := map[string]string{}
-		if strings.Split(datasetLocation, "/")[0] == api.DATA_SOURCE_DREMIO {
-			// TODO: Allow user to specify own dremio instance. Needs UX design for how the command should handle.
-			params["endpoint"] = "http://dremio-4mimamg7rdeve.eastus.cloudapp.azure.com:32010"
-		}
 
 		dataset := api.Dataset{
 			From:   datasetLocation,

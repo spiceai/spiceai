@@ -1,8 +1,10 @@
+use async_trait::async_trait;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::{collections::HashMap, future::Future};
 
 use flight_client::FlightClient;
+use flight_datafusion::FlightTable;
 use spicepod::component::dataset::Dataset;
 
 use crate::auth::AuthProvider;
@@ -13,6 +15,7 @@ pub struct Dremio {
     flight: Flight,
 }
 
+#[async_trait]
 impl DataConnector for Dremio {
     fn new(
         auth_provider: AuthProvider,
@@ -48,5 +51,25 @@ impl DataConnector for Dremio {
         let dremio_path = dataset.path();
 
         self.flight.get_all_data(&dremio_path)
+    }
+
+    fn has_table_provider(&self) -> bool {
+        true
+    }
+
+    async fn get_table_provider(
+        &self,
+        dataset: &Dataset,
+    ) -> std::result::Result<Arc<dyn datafusion::datasource::TableProvider>, super::Error> {
+        let dremio_path = dataset.path();
+
+        let provider = FlightTable::new(self.flight.client.clone(), dremio_path).await;
+
+        match provider {
+            Ok(provider) => Ok(Arc::new(provider)),
+            Err(error) => Err(super::Error::UnableToGetTableProvider {
+                source: error.into(),
+            }),
+        }
     }
 }

@@ -1,5 +1,6 @@
 use arrow_flight::decode::DecodedPayload;
 use async_stream::stream;
+use async_trait::async_trait;
 use flight_client::FlightClient;
 use futures::StreamExt;
 use futures_core::stream::BoxStream;
@@ -11,6 +12,8 @@ use std::time::Duration;
 use std::{collections::HashMap, future::Future};
 
 use spicepod::component::dataset::Dataset;
+
+use flight_datafusion::FlightTable;
 
 use crate::auth::AuthProvider;
 use crate::datapublisher::{AddDataResult, DataPublisher};
@@ -37,6 +40,7 @@ pub struct SpiceAI {
     spaced_trace: Arc<SpacedTracer>,
 }
 
+#[async_trait]
 impl DataConnector for SpiceAI {
     fn new(
         auth_provider: AuthProvider,
@@ -126,6 +130,26 @@ impl DataConnector for SpiceAI {
     fn get_data_publisher(&self) -> Option<Box<dyn DataPublisher>> {
         Some(Box::new(self.clone()))
     }
+
+    fn has_table_provider(&self) -> bool {
+        true
+    }
+
+    async fn get_table_provider(
+        &self,
+        dataset: &Dataset,
+    ) -> std::result::Result<Arc<dyn datafusion::datasource::TableProvider>, super::Error> {
+        let dataset_path = Self::spice_dataset_path(dataset);
+
+        let provider = FlightTable::new(self.flight.client.clone(), dataset_path).await;
+
+        match provider {
+            Ok(provider) => Ok(Arc::new(provider)),
+            Err(error) => Err(super::Error::UnableToGetTableProvider {
+                source: error.into(),
+            }),
+        }
+    }
 }
 
 impl DataPublisher for SpiceAI {
@@ -156,10 +180,10 @@ impl DataPublisher for SpiceAI {
 impl SpiceAI {
     /// Parses a dataset path from a Spice AI dataset definition.
     ///
-    /// Spice AI datasets have three possible formats for `dataset.path()`:
-    /// 1. `<org>/<app>/datasets/<dataset_name>`.
-    /// 2. `<org>/<app>`.
-    /// 3. `some.blessed.dataset`.
+    /// Spice AI datasets have several possible formats for `dataset.path()`:
+    /// 1. `<org>/<app>/datasets/<dataset_name>` or `spice.ai/<org>/<app>/datasets/<dataset_name>`.
+    /// 2. `<org>/<app>` or `spice.ai/<org>/<app>`.
+    /// 3. `some.blessed.dataset` or `spice.ai/some.blessed.dataset`.
     ///
     /// The second format is a shorthand for the first format, where the dataset name
     /// is the same as the local table name specified in `name`.
@@ -170,15 +194,64 @@ impl SpiceAI {
     ///
     /// This function returns the full dataset path for the given dataset as you would query for it in Spice.
     /// i.e. `<org>.<app>.<dataset_name>`
+    #[allow(clippy::match_same_arms)]
     fn spice_dataset_path<T: Borrow<Dataset>>(dataset: T) -> String {
         let dataset = dataset.borrow();
         let path = dataset.path();
+        let path = path.trim_start_matches("spice.ai/");
         let path_parts: Vec<&str> = path.split('/').collect();
 
         match path_parts.as_slice() {
             [org, app] => format!("{org}.{app}.{dataset_name}", dataset_name = dataset.name),
             [org, app, "datasets", dataset_name] => format!("{org}.{app}.{dataset_name}"),
-            _ => path,
+            [org, app, dataset_name] => format!("{org}.{app}.{dataset_name}"),
+            _ => path.to_string(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_spice_dataset_path() {
+        let tests = vec![
+            (
+                "spiceai:spice.ai/lukekim/demo/datasets/my_data".to_string(),
+                "lukekim.demo.my_data",
+            ),
+            (
+                "spiceai:spice.ai/lukekim/demo/my_data".to_string(),
+                "lukekim.demo.my_data",
+            ),
+            (
+                "spiceai:lukekim/demo/datasets/my_data".to_string(),
+                "lukekim.demo.my_data",
+            ),
+            (
+                "spiceai:lukekim/demo/my_data".to_string(),
+                "lukekim.demo.my_data",
+            ),
+            (
+                "spice.ai/lukekim/demo/datasets/my_data".to_string(),
+                "lukekim.demo.my_data",
+            ),
+            (
+                "spice.ai/lukekim/demo/my_data".to_string(),
+                "lukekim.demo.my_data",
+            ),
+            (
+                "lukekim/demo/datasets/my_data".to_string(),
+                "lukekim.demo.my_data",
+            ),
+            ("lukekim/demo/my_data".to_string(), "lukekim.demo.my_data"),
+            ("eth.recent_blocks".to_string(), "eth.recent_blocks"),
+        ];
+
+        for (input, expected) in tests {
+            let dataset = Dataset::new(input.clone(), "bar".to_string());
+            assert_eq!(SpiceAI::spice_dataset_path(dataset), expected, "{input}");
         }
     }
 }
