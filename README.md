@@ -21,7 +21,7 @@ Spice makes querying data by SQL across one or more data sources simple and fast
 <img width="973" alt="old" src="https://github.com/spiceai/spiceai/assets/80174/1a0a883e-8bd7-4ac3-a524-33a9ddad6e47">
 
 ### With Spice
-<img width="1268" alt="new" src="https://github.com/spiceai/spiceai/assets/80174/d4c663ce-2baf-47b5-9e26-ef9ea69564bd">
+<img width="1261" alt="new" src="https://github.com/spiceai/spiceai/assets/80174/9bc84831-a75a-4fca-9643-ef7a86345ef0">
 
 ### Example Use-Cases
 
