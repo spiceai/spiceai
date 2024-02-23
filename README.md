@@ -117,7 +117,7 @@ Query took: 0.004728897 seconds
 You can enter custom queries:
 
 ```bash
-sql> SELECT trip_distance_mi, fare_amount FROM taxi_trips LIMIT 10;
+SELECT trip_distance_mi, fare_amount FROM taxi_trips LIMIT 10;
 ```
 
 Output:
@@ -140,8 +140,6 @@ Output:
 
 Query took: 0.002458976 seconds
 ```
-
-TODO: ADD VIDEO SHOWING HOW TO RUN THE ABOVE STEPS HERE.
 
 ## Next Steps
 
@@ -216,7 +214,7 @@ spice sql
 ```
 
 ```bash
-sql> select number, size, gas_used from eth_recent_blocks Limit 10;
+SELECT number, size, gas_used from eth_recent_blocks LIMIT 10;
 ```
 
 The output displays the results of the query along with the query execution time:
@@ -306,11 +304,6 @@ spice sql
 ```
 
 You can now now query `my_dataset` in the runtime.
-
-## Sample project using the SpiceAI runtime.
-
-TODO: Make a simple app that showcases the data querying from the runtime.
-This will replace the Python script in the examples folder.
 
 ### Upcoming Features
 
