@@ -1,4 +1,0 @@
-([]string) (len=2) {
-  (string) (len=10) "event_type",
-  (string) (len=15) "target_audience"
-}

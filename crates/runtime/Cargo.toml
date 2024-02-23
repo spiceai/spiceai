@@ -1,0 +1,55 @@
+[package]
+name = "runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "The spiced runtime"
+
+[dependencies]
+snafu.workspace = true
+spicepod = { path = "../spicepod" }
+app = { path = "../app" }
+axum = { version = "0.7.4", features = ["macros"]}
+tokio.workspace = true
+tracing.workspace = true
+clap.workspace = true
+metrics.workspace = true
+datafusion.workspace = true
+arrow.workspace = true
+arrow-flight.workspace = true
+arrow-ipc = "49.0.0"
+tonic.workspace = true
+tonic_0_9_0 = { version = "0.9.0", package = "tonic", features = ["gzip"] }
+futures.workspace = true
+uuid = "1.6.1"
+tokio-stream = "0.1"
+async-stream.workspace = true
+futures-core = "0.3"
+dirs = "5.0.1"
+toml = "0.8.8"
+serde.workspace = true
+serde_json = "1.0.1"
+flight_client = { path = "../flight_client" }
+tract-core = "0.21.0"
+tract-onnx = "0.21.0"
+ndarray = "0.15.3"
+ndarray-npy = { version = "0.8.0", features = [ "compressed_npz" ] }
+duckdb = { workspace = true,  features = ["bundled", "r2d2", "vtab", "vtab-arrow"], optional = true }
+sql_provider_datafusion = { path = "../sql_provider_datafusion", optional = true }
+r2d2 = { workspace = true, optional = true }
+opentelemetry-proto = { version = "0.4.0", features = ["gen-tonic-messages", "gen-tonic", "metrics"] }
+indexmap = "2.2.2"
+regex = "1.10.3"
+reqwest = { version = "0.11.24", features = ["json"] }
+notify = "6.1.1"
+arrow-json = "49.0.0"
+async-trait.workspace = true
+flight_datafusion = { path = "../flight_datafusion" }
+
+[features]
+default = ["duckdb"]
+dev = []
+duckdb = ["dep:duckdb", "sql_provider_datafusion", "r2d2"]

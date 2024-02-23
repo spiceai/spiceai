@@ -1,8 +1,0 @@
-# Specifies only dev-specific requirements
--r common.txt
-jupyter-client==6.1.12
-jupyter-core==4.11.2
-grpcio-tools~=1.44.0
-pylint==2.12.2
-pytest==6.2.3
-pytest-timeout==1.4.2

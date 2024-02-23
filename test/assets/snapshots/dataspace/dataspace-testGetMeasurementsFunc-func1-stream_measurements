@@ -1,5 +1,0 @@
-([]string) (len=3) {
-  (string) (len=8) "duration",
-  (string) (len=11) "guest_count",
-  (string) (len=12) "ticket_price"
-}

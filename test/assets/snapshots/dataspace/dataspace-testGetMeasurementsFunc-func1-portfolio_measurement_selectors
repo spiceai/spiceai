@@ -1,4 +1,0 @@
-(map[string]string) (len=2) {
-  (string) (len=11) "btc_balance": (string) (len=11) "btc_balance",
-  (string) (len=11) "usd_balance": (string) (len=11) "usd_balance"
-}

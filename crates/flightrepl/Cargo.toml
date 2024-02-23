@@ -1,0 +1,27 @@
+[package]
+name = "flightrepl"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Spice OSS Flight Query Repl"
+
+[dependencies]
+arrow.workspace = true
+arrow-flight.workspace = true
+parquet = "49.0.0"
+clap.workspace = true
+tokio.workspace = true
+tonic = { workspace = true, default-features = false, features = [
+  "transport",
+  "tls",
+  "tls-roots",
+] }
+async-stream.workspace = true
+futures.workspace = true
+tracing.workspace = true
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+datafusion.workspace = true
+rustyline = "13.0.0"

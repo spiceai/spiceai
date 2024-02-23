@@ -1,5 +1,0 @@
-([]string) (len=3) {
-  (string) (len=4) "tagA",
-  (string) (len=4) "tagB",
-  (string) (len=4) "tagC"
-}

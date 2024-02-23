@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - trunk
+      - rust
       - release-*
     tags:
       - v*
@@ -12,102 +13,159 @@ on:
 
 jobs:
   build:
-    name: Build ${{ matrix.target_os }}_${{ matrix.target_arch }} binaries
-    runs-on: ${{ matrix.os }}
+    name: Build ${{ matrix.name }} binaries
+    runs-on: ${{ matrix.runner }}
     env:
-      GOVER: 1.21
+      GOVER: 1.22
       GOOS: ${{ matrix.target_os }}
-      GOARCH: ${{ matrix.target_arch }}
+      GOARCH: ${{ matrix.target_arch_go }}
 
     strategy:
       matrix:
-        os: [self-hosted, ubuntu-latest, macOS-latest]
-        # target_arch: [amd64, arm64]
-        target_arch: [amd64]
         include:
-          - os: ubuntu-latest
+          - name: Linux x64
+            runner: rust
             target_os: linux
-          - os: macOS-latest
+            target_arch: x86_64
+            target_arch_go: amd64
+          - name: macOS aarch64 (Apple Silicon)
+            runner: macos-14
             target_os: darwin
-          - os: self-hosted
+            target_arch: aarch64
+            target_arch_go: arm64
+          - name: macOS x64 (Intel)
+            runner: rust-osx-x64
             target_os: darwin
-        exclude:
-          - os: ubuntu-latest
-            target_arch: arm64
-          - os: macOS-latest
-            target_arch: arm64
-          - os: self-hosted
-            target_arch: amd64
+            target_arch: x86_64
+            target_arch_go: amd64
+          - name: Windows x64
+            runner: rust-windows-x64
+            target_os: windows
+            target_arch: x86_64
+            target_arch_go: amd64
 
     steps:
       - uses: actions/checkout@v3
 
       - name: Set REL_VERSION from version.txt
-        run: python ./.github/scripts/get_release_version.py
+        run: python3 ./.github/scripts/get_release_version.py
 
       - name: Set up Go
-        uses: actions/setup-go@v3
+        uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GOVER }}
 
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          os: ${{ matrix.target_os }}
+
+      - name: Restore build cache (macOS)
+        if: matrix.target_os == 'darwin'
+        run: |
+          mkdir -p target
+          if [ -d /Users/spiceai/build/target ]; then
+            rsync -av /Users/spiceai/build/target/ target/
+          fi
+
+      - name: Restore build cache (Linux)
+        if: matrix.target_os == 'linux'
+        run: |
+          mkdir -p target
+          if [ -d /home/spiceai/build/target ]; then
+            rsync -av /home/spiceai/build/target/ target/
+          fi
+
+      - name: Restore build cache (Windows)
+        if: matrix.target_os == 'windows'
+        run: |
+          mkdir -p target
+          if (Test-Path C:/spiceai/build/target) {
+            Copy-Item -Recurse -Force C:/spiceai/build/target/* target/
+          }
+
       - name: Build spiced
-        run: make
-        working-directory: cmd/spiced
+        run: make -C bin/spiced
+
+      - name: Update build cache (macOS)
+        if: matrix.target_os == 'darwin'
+        run: |
+          if [ -d /Users/spiceai/build/target ]; then
+            rsync -av target/ /Users/spiceai/build/target/
+          fi
+
+      - name: Update build cache (Linux)
+        if: matrix.target_os == 'linux'
+        run: |
+          if [ -d /home/spiceai/build/target ]; then
+            rsync -av target/ /home/spiceai/build/target/
+          fi
+
+      - name: Update build cache (Windows)
+        if: matrix.target_os == 'windows'
+        run: |
+          if (Test-Path C:/spiceai/build/target) {
+            Copy-Item -Recurse -Force target/* C:/spiceai/build/target
+          }
 
       - name: Build spice
-        run: make
-        working-directory: cmd/spice
-
-      - name: Run go test
-        if: matrix.target_os != 'windows'
-        run: go test -v ./... -shuffle=on
+        run: make -C bin/spice
 
       - name: tar binary
         if: matrix.target_os != 'windows'
         run: |
-          mv cmd/spiced/spiced spiced
+          mv target/release/spiced spiced
           chmod +x spiced
           tar cf spiced_${{ matrix.target_os }}_${{ matrix.target_arch }}.tar.gz spiced
 
+      - name: copy binary
+        if: matrix.target_os == 'windows'
+        run: |
+          mv target/release/spiced.exe spiced.exe
+
       - name: Print version
         if: matrix.target_os != 'windows'
-        run: ./spiced version
+        run: ./spiced --version
 
-      - uses: actions/upload-artifact@v3
+      - uses: actions/upload-artifact@v4
         if: matrix.target_os != 'windows'
         with:
           name: spiced_${{ matrix.target_os }}_${{ matrix.target_arch }}
           path: spiced_${{ matrix.target_os }}_${{ matrix.target_arch }}.tar.gz
 
-      - uses: actions/upload-artifact@v3
+      - uses: actions/upload-artifact@v4
         if: matrix.target_os == 'windows'
         with:
           name: spiced_${{ matrix.target_os }}_${{ matrix.target_arch }}
-          path: cmd/spiced/spiced.exe
+          path: spiced.exe
 
       - name: tar binary
         if: matrix.target_os != 'windows'
-        working-directory: cmd/spice
         run: |
+          mv target/release/spice spice
           chmod +x spice
           tar cf spice_${{ matrix.target_os }}_${{ matrix.target_arch }}.tar.gz spice
 
+      - name: copy binary
+        if: matrix.target_os == 'windows'
+        run: |
+          mv target/release/spice.exe spice.exe
+
       - name: Print version
         if: matrix.target_os != 'windows'
-        working-directory: cmd/spice
         run: ./spice version
 
-      - uses: actions/upload-artifact@v3
+      - uses: actions/upload-artifact@v4
         if: matrix.target_os != 'windows'
         with:
           name: spice_${{ matrix.target_os }}_${{ matrix.target_arch }}
-          path: cmd/spice/spice_${{ matrix.target_os }}_${{ matrix.target_arch }}.tar.gz
+          path: spice_${{ matrix.target_os }}_${{ matrix.target_arch }}.tar.gz
 
-      - uses: actions/upload-artifact@v3
+      - uses: actions/upload-artifact@v4
         if: matrix.target_os == 'windows'
         with:
           name: spice_${{ matrix.target_os }}_${{ matrix.target_arch }}
-          path: cmd/spice/spice.exe
+          path: spice.exe
 
   publish:
     name: Publish ${{ matrix.target_os }}-${{ matrix.target_arch }} binaries
@@ -118,34 +176,31 @@ jobs:
 
     strategy:
       matrix:
-        os: [ubuntu-latest, macOS-latest]
-        # target_arch: [amd64, arm64]
-        target_arch: [amd64]
         include:
-          - os: ubuntu-latest
-            target_os: linux
-          - os: macOS-latest
-            target_os: darwin
-        exclude:
-          - os: ubuntu-latest
-            target_arch: arm64
+          - target_os: linux
+            target_arch: x86_64
+          - target_os: darwin
+            target_arch: aarch64
+          - target_os: darwin
+            target_arch: x86_64
+          - target_os: windows
+            target_arch: x86_64
 
     runs-on: ubuntu-latest
     steps:
-      - name: Check out code into the Go module directory
-        uses: actions/checkout@v3
+      - uses: actions/checkout@v3
 
       - name: Set REL_VERSION from version.txt
-        run: python ./.github/scripts/get_release_version.py
+        run: python3 ./.github/scripts/get_release_version.py
 
       - name: download artifacts - spice_${{ matrix.target_os }}_${{ matrix.target_arch }}
-        uses: actions/download-artifact@master
+        uses: actions/download-artifact@v4
         with:
           name: spice_${{ matrix.target_os }}_${{ matrix.target_arch }}
           path: ${{ env.ARTIFACT_DIR }}
 
       - name: download artifacts - spiced_${{ matrix.target_os }}_${{ matrix.target_arch }}
-        uses: actions/download-artifact@master
+        uses: actions/download-artifact@v4
         with:
           name: spiced_${{ matrix.target_os }}_${{ matrix.target_arch }}
           path: ${{ env.ARTIFACT_DIR }}

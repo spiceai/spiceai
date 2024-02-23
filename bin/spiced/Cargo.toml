@@ -1,0 +1,26 @@
+[package]
+name = "spiced"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Spice OSS"
+
+[dependencies]
+snafu.workspace = true
+clap = { workspace = true, features = ["derive"] }
+spicepod = { path = "../../crates/spicepod" }
+app = { path = "../../crates/app" }
+runtime = { path = "../../crates/runtime" }
+flightrepl = { path = "../../crates/flightrepl" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+metrics.workspace = true
+metrics-exporter-prometheus = "0.13.0"
+
+[features]
+release = []
+dev = ["runtime/dev"]

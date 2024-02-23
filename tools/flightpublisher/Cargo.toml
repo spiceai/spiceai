@@ -1,0 +1,23 @@
+[package]
+name = "flightpublisher"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Spice OSS Flight Publisher"
+
+[dependencies]
+arrow.workspace = true
+arrow-flight.workspace = true
+parquet = "49.0.0"
+clap = { workspace = true, features = ["derive"] }
+tokio.workspace = true
+tonic = { workspace = true, default-features = false, features = [
+  "transport",
+  "tls",
+  "tls-roots",
+] }
+async-stream.workspace = true
+futures.workspace = true

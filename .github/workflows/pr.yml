@@ -1,0 +1,83 @@
+---
+name: pr
+
+on:
+  pull_request:
+    branches:
+      - trunk
+      - rust
+      - release-*
+
+  workflow_dispatch:
+
+jobs:
+  lint:
+    name: Run Go & Rust Linters
+    runs-on: rust
+    env:
+      GOVER: 1.22
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GOVER }}
+          cache: false
+      
+      - name: Install golangci-lint
+        run: |
+          if ! command -v golangci-lint &> /dev/null ; then
+            curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(go env GOPATH)/bin
+          fi
+
+      - name: Set up Rust
+        run: |
+          echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> $GITHUB_PATH
+          source $HOME/.cargo/env || true
+          if ! command -v rustup &> /dev/null ; then
+            curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused -fsSL "https://sh.rustup.rs" | sh -s -- --default-toolchain none -y  
+          fi
+          rustup toolchain install stable
+
+      - run: make lint
+
+  build:
+    name: Build Go & Rust
+    runs-on: rust
+    env:
+      GOVER: 1.22
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GOVER }}
+          cache: false
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          os: 'linux'
+
+      - run: make ci
+
+  build-docker:
+    name: Build Docker Image
+    runs-on: rust
+    
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and push Docker images
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: false
+          tags: |
+            ghcr.io/spiceai/spiceai-rust:ci

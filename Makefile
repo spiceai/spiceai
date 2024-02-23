@@ -1,56 +1,72 @@
-SHELL := /bin/bash
-PROTOC ?=protoc
-UNAME := $(shell uname)
-
-
 ################################################################################
 # Target: all                                                                 #
 ################################################################################
 .PHONY: all
-all: build docker
+all: build
 
 .PHONY: build
 build:
-	pushd cmd/spice && go build . && popd
-	pushd cmd/spiced && go build . && popd
+	make -C bin/spice
+	make -C bin/spiced
+
+.PHONY: build-dev
+build-dev:
+	export DEV=true; make -C bin/spice
+	export DEV=true; make -C bin/spiced
+
+.PHONY: ci
+ci:
+	make -C bin/spice
+	export SPICED_TARGET_DIR=/workspace/spiceai/target; make -C bin/spiced
 
 .PHONY: lint
 lint:
-	pushd ai/src && make lint && popd
 	go vet ./...
 	golangci-lint run
-
-.PHONY: test-pkg
-test-pkg:
-	pushd pkg && go test ./... -count=3 -shuffle=on
-
-.PHONY: update-pkg-snapshots
-update-pkg-snapshots:
-	pushd pkg && UPDATE_SNAPSHOTS=true go test ./... -count=5
-
-.PHONY: test-e2e
-test-e2e:
-	pushd test/e2e && go test -v -e2e -context metal -shuffle=on -count=2 ./...
-
-.PHONY: test
-test: build test-pkg test-e2e
-	pushd ai/src && make test && popd
-	go vet ./...
+	cargo fmt --all -- --check
+	cargo clippy --all-targets --workspace -- \
+		-Dwarnings \
+		-Dclippy::pedantic \
+		-Dclippy::unwrap_used \
+		-Dclippy::expect_used
 
 .PHONY: docker
 docker:
-	docker build -t ghcr.io/spiceai/spiceai:local -f docker/Dockerfile .
+	docker buildx build -t spiceai-rust:local-dev .
 
-.PHONY: metal-symlinks
-metal-symlinks:
+.PHONY: docker-run
+docker-run:
+	docker stop spiceai && docker rm spiceai || true
+	docker run --name spiceai -p 3000:3000 -p 50051:50051 spiceai-rust:local-dev
+
+.PHONY: deps-licenses
+dep-licenses:
+	@cargo install cargo-license --quiet
+	@cargo license -d 
+
+.PHONY: display-deps
+display-deps:
+	@cargo install cargo-license --quiet
+	@cargo license -d  --tsv --direct-deps-only
+
+
+################################################################################
+# Target: install                                                              #
+################################################################################
+.PHONY: install
+install: build
 	mkdir -p ~/.spice/bin
-	if [[ -e "${HOME}/.spice/bin/ai" ]]; then rm -rf "${HOME}/.spice/bin/ai"; fi
-	ln -s $(shell pwd)/ai/src ${HOME}/.spice/bin/ai
-	if [[ -e "${HOME}/.spice/bin/spice" ]]; then rm -rf "${HOME}/.spice/bin/spice"; fi
-	if [[ -e "${HOME}/.spice/bin/spiced" ]]; then rm -rf "${HOME}/.spice/bin/spiced"; fi
-	if [[ -f "$(shell pwd)/cmd/spice/spice" ]]; then ln -s "$(shell pwd)/cmd/spice/spice" ${HOME}/.spice/bin/spice; fi
-	if [[ -f "$(shell pwd)/cmd/spiced/spiced" ]]; then ln -s "$(shell pwd)/cmd/spiced/spiced" ${HOME}/.spice/bin/spiced; fi
-	ls -la ~/.spice/bin
+	install -m 755 target/release/spice ~/.spice/bin/spice
+	install -m 755 target/release/spiced ~/.spice/bin/spiced
+
+################################################################################
+# Target: install-dev                                                          #
+################################################################################
+.PHONY: install-dev
+install-dev: build-dev
+	mkdir -p ~/.spice/bin
+	install -m 755 target/release/spice ~/.spice/bin/spice
+	install -m 755 target/release/spiced ~/.spice/bin/spiced
 
 ################################################################################
 # Target: modtidy                                                              #
@@ -59,44 +75,46 @@ metal-symlinks:
 modtidy:
 	go mod tidy
 
-################################################################################
-# Target: init-proto                                                           #
-################################################################################
-.PHONY: init-proto
-init-proto:
-	go get google.golang.org/grpc/cmd/protoc-gen-go-grpc
-	go install google.golang.org/protobuf/cmd/protoc-gen-go
-	go install google.golang.org/grpc/cmd/protoc-gen-go-grpc
 
 ################################################################################
-# Target: gen-proto                                                            #
+# Target: generate-acknowledgements                                            #
 ################################################################################
-GRPC_PROTOS:=common aiengine runtime
-PROTO_PREFIX:=github.com/spiceai/spiceai
+ACKNOWLEDGEMENTS_PATH := acknowledgements.md
 
-define genProtoc
-.PHONY: gen-proto-$(1)
-gen-proto-$(1):
-	$(PROTOC) --go_out=. --go_opt=module=$(PROTO_PREFIX) --go-grpc_out=. --go-grpc_opt=require_unimplemented_servers=false,module=$(PROTO_PREFIX) ./proto/$(1)/v1/*.proto
-endef
+.PHONY: generate-acknowledgements
+generate-acknowledgements:
+	echo "# Open Source Acknowledgements\n\nSpice.ai acknowledges the following open source projects for making this project possible:\n\n" > $(ACKNOWLEDGEMENTS_PATH)
+	make generate-acknowledgements-go
+	make generate-acknowledgements-rust
+	make generate-acknowledgements-formatting
 
-$(foreach ITEM,$(GRPC_PROTOS),$(eval $(call genProtoc,$(ITEM))))
+.PHONY: generate-acknowledgements-go
+generate-acknowledgements-go:
+	echo "\n## Go Modules\n" >> $(ACKNOWLEDGEMENTS_PATH)
+	go install github.com/google/go-licenses
+	pushd bin/spice && go-licenses csv . 2>/dev/null >> ../../$(ACKNOWLEDGEMENTS_PATH) && popd
 
-GEN_PROTOS:=$(foreach ITEM,$(GRPC_PROTOS),gen-proto-$(ITEM))
+.PHONY: generate-acknowledgements-rust
+generate-acknowledgements-rust:
+	@echo "\n## Rust Crates\n" >> "$(ACKNOWLEDGEMENTS_PATH)"
+	@make display-deps 2>/dev/null | awk 'BEGIN { \
+		FS="\t"; \
+		print "| name | version | authors | repository | license | license_file | description |"; \
+		print "|------|---------|---------|------------|---------|--------------|-------------|"; \
+	} \
+	{ \
+		printf("| %s | %s | %s | %s | %s | %s | %s |\n", $$1, $$2, $$3, $$4, $$5, $$6, $$7); \
+	}' >> "$(ACKNOWLEDGEMENTS_PATH)"
 
-.PHONY: gen-proto
-gen-proto: $(GEN_PROTOS) modtidy
-	cd ai/src && make gen-proto
 
-################################################################################
-# Target: check-proto-diff                                                           #
-################################################################################
-.PHONY: check-proto-diff
-check-proto-diff:
-	git diff --exit-code ./pkg/proto/aiengine_pb/aiengine.pb.go # check no changes
-	git diff --exit-code ./pkg/proto/aiengine_pb/aiengine_grpc.pb.go # check no changes
-	git diff --exit-code ./pkg/proto/runtime_pb/runtime.pb.go # check no changes
-	git diff --exit-code ./ai/src/proto/aiengine/v1/aiengine_pb2.py # check no changes
-	git diff --exit-code ./ai/src/proto/aiengine/v1/aiengine_pb2_grpc.py # check no changes
-	git diff --exit-code ./ai/src/proto/runtime/v1/runtime_pb2.py # check no changes
-	git diff --exit-code ./ai/src/proto/runtime/v1/runtime_pb2_grpc.py # check no changes
+.PHONY: generate-acknowledgements-formatting
+generate-acknowledgements-formatting:
+	@if [[ "$(UNAME)" -eq "Darwin" ]]; then\
+		sed -i '' 's/\"//g' $(ACKNOWLEDGEMENTS_PATH); \
+		sed -i '' 's/,/, /g' $(ACKNOWLEDGEMENTS_PATH); \
+		sed -i '' 's/,  /, /g' $(ACKNOWLEDGEMENTS_PATH); \
+	else\
+		sed -i 's/\"//g' $(ACKNOWLEDGEMENTS_PATH); \
+		sed -i 's/,/, /g' $(ACKNOWLEDGEMENTS_PATH); \
+		sed -i 's/,  /, /g' $(ACKNOWLEDGEMENTS_PATH); \
+	fi
