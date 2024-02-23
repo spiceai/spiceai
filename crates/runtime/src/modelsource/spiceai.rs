@@ -32,15 +32,15 @@ impl ModelSource for SpiceAI {
         };
 
         // it is not copying local model into .spice folder
-        let path = super::ensure_model_path(name.as_str())?;
+        let local_path = super::ensure_model_path(name.as_str())?;
 
-        let remote = params
+        let remote_path = params
             .as_ref()
             .as_ref()
-            .and_then(|p| p.get("from"))
+            .and_then(|p| p.get("path"))
             .map(ToString::to_string);
 
-        let Some(remote) = remote else {
+        let Some(remote_path) = remote_path else {
             return Err(super::UnableToLoadConfigSnafu {
                 reason: "From is required",
             }
@@ -48,16 +48,16 @@ impl ModelSource for SpiceAI {
         };
 
         let Ok(re) = Regex::new(
-            r"\Aspice\.ai\/(?<org>[\w\-]+)\/(?<app>[\w\-]+)\/models\/(?<model>[\w\-]+):(?<version>[\w\d\-\.]+)\z",
+            r"\A(?:spice\.ai\/)?(?<org>[\w\-]+)\/(?<app>[\w\-]+)(?:\/models)?\/(?<model>[\w\-]+):(?<version>[\w\d\-\.]+)\z",
         ) else {
             return Err(super::UnableToLoadConfigSnafu {
                 reason: "Invalid regex",
             }
             .build());
         };
-        let Some(caps) = re.captures(remote.as_str()) else {
+        let Some(caps) = re.captures(remote_path.as_str()) else {
             return Err(super::UnableToLoadConfigSnafu {
-                reason: "From is invalid for spice.ai source",
+                reason: format!("from is invalid for spice.ai source: {remote_path}"),
             }
             .build());
         };
@@ -116,7 +116,7 @@ impl ModelSource for SpiceAI {
             .as_str()
             .ok_or(super::UnableToParseMetadataSnafu {}.build())?;
 
-        let versioned_path = format!("{path}/{version}");
+        let versioned_path = format!("{local_path}/{version}");
         let file_name = format!("{versioned_path}/model.onnx");
 
         let response = client

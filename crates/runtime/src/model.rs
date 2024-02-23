@@ -39,12 +39,12 @@ impl Model {
         model: &spicepod::component::model::Model,
         auth: AuthProvider,
     ) -> Result<Self> {
-        let source = model.source();
+        let source = source(&model.from);
         let source = source.as_str();
 
         let mut params = std::collections::HashMap::new();
         params.insert("name".to_string(), model.name.to_string());
-        params.insert("from".to_string(), model.from.to_string());
+        params.insert("path".to_string(), path(&model.from));
 
         let tract = crate::modelruntime::tract::Tract {
             path: create_source_from(source)
@@ -92,4 +92,35 @@ impl Model {
 
         Ok(result)
     }
+}
+
+#[must_use]
+pub(crate) fn source(from: &str) -> String {
+    match from {
+        s if s.starts_with("spiceai:") => "spiceai".to_string(),
+        s if s.starts_with("file:/") => "localhost".to_string(),
+        _ => "spiceai".to_string(),
+    }
+}
+
+#[must_use]
+pub(crate) fn path(from: &str) -> String {
+    let sources = vec!["spiceai:"];
+
+    for source in &sources {
+        if from.starts_with(source) {
+            match from.find(':') {
+                Some(index) => return from[index + 1..].to_string(),
+                None => return from.to_string(),
+            }
+        }
+    }
+
+    from.to_string()
+}
+
+#[must_use]
+pub fn version(from: &str) -> String {
+    let path = path(from);
+    path.split(':').last().unwrap_or("").to_string()
 }
