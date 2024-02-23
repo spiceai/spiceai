@@ -1,54 +1,69 @@
-# Spice.ai
+# Spice
 
-[![build](https://github.com/spiceai/spiceai/actions/workflows/e2e_test.yml/badge.svg?branch=trunk&event=push)](https://github.com/spiceai/spiceai/actions/workflows/e2e_test.yml)
 [![CodeQL](https://github.com/spiceai/spiceai/actions/workflows/codeql-analysis.yml/badge.svg?branch=trunk&event=push)](https://github.com/spiceai/spiceai/actions/workflows/codeql-analysis.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Discord](https://img.shields.io/discord/803820740868571196)](https://discord.gg/kZnTfneP5u)
-[![Subreddit subscribers](https://img.shields.io/reddit/subreddit-subscribers/spiceai?style=social)](https://www.reddit.com/r/spiceai)
-[![Follow on Twitter](https://img.shields.io/twitter/follow/spiceaihq.svg?style=social&logo=twitter)](https://twitter.com/intent/follow?screen_name=spiceaihq)
+[![Follow on Twitter](https://img.shields.io/twitter/follow/spice_ai.svg?style=social&logo=twitter)](https://twitter.com/intent/follow?screen_name=spice_ai)
 
-## What is SpiceAI?
+## What is Spice?
 
-**Spice.ai** is an open source runtime environment that enables developers to leverage rapid access to time-series data. The Spice AI Runtime enables the best in class high performance queries for powering an array of data driven applications.
+**Spice** is a portable runtime that provides developers with a unified SQL query interface to locally accelerate and query data tables sourced from any database, data warehouse, or data lake.
 
-## Why Spice AI?
+Spice makes it easy to build data-driven and data-intensive applications by streamlining the use of data and machine learning (ML) in software.
 
-The SpiceAI Runtime accelerates the ability to query real time data. If your are building a data application with low latency requirements, SpiceAI can deliver real-time data to end users without the need to access the cloud for every query.
+The Spice runtime is written in Rust and leverages industry leading technologies like Apache DataFusion, Apache Arrow, Apache Arrow Flight, and DuckDB.
 
-If your edge device has intermittent connectivity due to geographical constraints and needs to perform inferencing reliably at all times, the SpiceAI runtime can host the model, ensuring that your edge device is capable of generating predictions and recommentations at all times even when access to the cloud is unnavailable.
+## Why Spice?
 
-⚠️ **DEVELOPER PREVIEW ONLY** Spice.ai is under active **alpha** stage development and is not intended to be used in production until its **1.0-stable** release.
+Spice makes querying data by SQL across one or more data sources simple and fast. Easily co-locate a managed working set of your data with your application or ML, locally accelerated in-memory, with DuckDB, or with an attached database like PostgreSQL for high-performance, low-latency queries.
 
-## Quick Start
+### Before Spice
 
-**Step 1.** Install the SpiceAI CLI:
+<img width="750" alt="old" src="https://github.com/spiceai/spiceai/assets/80174/1a0a883e-8bd7-4ac3-a524-33a9ddad6e47">
+
+### With Spice
+
+<img width="1024" alt="new" src="https://github.com/spiceai/spiceai/assets/80174/9bc84831-a75a-4fca-9643-ef7a86345ef0">
+
+### Example Use-Cases
+
+**1. Faster frontends.** Accelerate and co-locate data views with your frontend application, to serve more concurrent users with faster page loads and data updates.
+
+**2. Faster analytics and BI.**
+
+**3. Faster machine learning training and inferencing.**
+
+⚠️ **DEVELOPER PREVIEW** Spice is under active **alpha** stage development and is not intended to be used in production until its **1.0-stable** release.
+
+## Quickstart
+
+**Step 1.** Install the Spice CLI:
 
 ```bash
 curl https://install.spiceai.org | /bin/bash
 ```
 
-**Step 2.** Choose a project name and initialize a new project with the `spice init` command:
+**Step 2.** Initialize a new Spice app with the `spice init` command:
 
 ```bash
-spice init my_spiceai_project
+spice init spice_app
 ```
 
-This creates a spicepod.yaml file in your directory.
+A `Spicepod.yaml` file is created in the working directory.
 
-**Step 3.** Log in to Dremio in order to access the dataset. Use the credentials below:
-:
+**Step 3.** Connect to the sample Dremio instance to access the sample data:
 
 ```bash
 spice login dremio -u demo -p demo1234
 ```
 
-**Step 4.** Start the SpiceAI runtime:
+**Step 4.** Start the Spice runtime:
 
 ```bash
 spice run
 ```
 
-You should see the following output (with timestamps reflecting when you started the runtime):
+Example output will be shown as follows:
 
 ```bash
 Spice.ai runtime starting...
@@ -58,15 +73,15 @@ Using latest 'local' runtime version.
 2024-02-21T06:11:56.382038Z  INFO runtime::opentelemetry: Spice Runtime OpenTelemetry listening on 127.0.0.1:50052
 ```
 
-**Step 5.** In a new terminal window, import the spicepod. The spicepod contains information about how datasets and other components are configured. You can add public spicepods using `spice add` command:
+The runtime is now started and ready for queries.
+
+**Step 5.** In a new terminal window, add the `spiceai/quickstart` Spicepod. A Spicepod is a package of configuration defining datasets and ML models.
 
 ```bash
 spice add spiceai/quickstart
 ```
 
-You should see the runtime updated with the new datasets.
-Also, the spicepod.yaml file will be updated with a new dependency that
-references the spiceai/quickstart spicepod.
+The `Spicepod.yaml` file will be updated with the `spiceai/quickstart` dependency.
 
 ```yaml
 version: v1beta1
@@ -76,31 +91,33 @@ dependencies:
   - spiceai/quickstart
 ```
 
-In the runtime terminal window, you should see that the a new dataset has been added to the runtime:
+The `spiceai/quickstart` Spicepod will add a `taxi_trips` data table to the runtime which is now available to query by SQL.
 
 ```bash
 2024-02-22T05:53:48.222952Z  INFO runtime: Loaded dataset: taxi_trips
 2024-02-22T05:53:48.223101Z  INFO runtime::dataconnector: Refreshing data for taxi_trips
 ```
 
-**Step 6.** You can now query the dataset using the SpiceAI SQL REPL. Enter the command below to start the REPL:
+**Step 6.** Start the Spice SQL REPL:
 
 ```bash
 spice sql
 ```
 
-You should now see:
+The SQL REPL inferface will be shown:
 
-```bash
+```
 Welcome to the interactive Spice.ai SQL Query Utility! Type 'help' for help.
 
 show tables; -- list available tables
+sql>
 ```
 
-Entering `show tables;` prints out the following table along with the time it took to execute the query:
+Enter `show tables;` to display the available tables for query:
 
 ```
 sql> show tables;
+
 +---------------+--------------------+-------------+------------+
 | table_catalog | table_schema       | table_name  | table_type |
 +---------------+--------------------+-------------+------------+
@@ -114,15 +131,15 @@ sql> show tables;
 Query took: 0.004728897 seconds
 ```
 
-You can enter custom queries:
+Enter a query to display the most expensive tax trips:
 
-```bash
-SELECT trip_distance_mi, fare_amount FROM taxi_trips LIMIT 10;
+```
+sql> SELECT trip_distance_mi, fare_amount FROM taxi_trips ORDER BY fare_amount LIMIT 10;
 ```
 
 Output:
 
-```bash
+```
 +------------------+-------------+
 | trip_distance_mi | fare_amount |
 +------------------+-------------+
@@ -143,11 +160,11 @@ Query took: 0.002458976 seconds
 
 ## Next Steps
 
-You can use any number of predefined datasets available from Spice.ai in the SpiceAI Runtime.
+You can use any number of predefined datasets available from Spice.ai in the Spice Runtime.
 
 A list of publically available datasets from Spice.ai can be found here: https://docs.spice.ai/building-blocks/datasets.
 
-In order to access public datasets from SpiceAI, you will first need to create an account with Spice.ai by selecting the free tier membership.
+In order to access public datasets from Spice, you will first need to create an account with Spice.ai by selecting the free tier membership.
 
 Navigate to https://spice.ai/ and create a new account by clicking on Try for Free.
 
@@ -207,7 +224,7 @@ You should see the following output from your runtime terminal:
 2024-02-21T22:49:10.038461Z  INFO runtime: Loaded dataset: eth_recent_blocks
 ```
 
-**Step 4.** In a new terminal window, use the SpiceAI SQL REPL to query the dataset
+**Step 4.** In a new terminal window, use the Spice SQL REPL to query the dataset
 
 ```bash
 spice sql
@@ -242,13 +259,13 @@ You can experiment with the time it takes to generate queries when using non-acc
 
 ## Importing dataset from Dremio
 
-**Step 1.** If you have a dataset hosted in Dremio, you can load it into the SpiceAI Runtime as follows:
+**Step 1.** If you have a dataset hosted in Dremio, you can load it into the Spice Runtime as follows:
 
 ```bash
 spice login dremio -u <USERNAME> -p <PASSWORD>
 ```
 
-**Step 2.** If you haven't already initialized a new project, you need to do so. Then, start the SpiceAI Runtime.
+**Step 2.** If you haven't already initialized a new project, you need to do so. Then, start the Spice Runtime.
 
 ```bash
 spice init dremio-demo-project
@@ -288,16 +305,16 @@ We should now see the following output:
 Dataset settings written to `datasets/my_dataset/dataset.yaml`!
 ```
 
-If the login credentials were entered correctly, your dataset will have loaded into the runtime. You should see the following in the SpiceAI runtime terminal :
+If the login credentials were entered correctly, your dataset will have loaded into the runtime. You should see the following in the Spice runtime terminal :
 
 ```
 2024-02-14T18:34:15.174564Z  INFO spiced: Loaded dataset: my_dataset
 2024-02-14T18:34:15.175189Z  INFO runtime::datasource: Refreshing data for my_dataset
 ```
 
-**Step 4.** Run queries against the dataset using the SpiceAI SQL REPL.
+**Step 4.** Run queries against the dataset using the Spice SQL REPL.
 
-In a new terminal, start the SpiceAI SQL REPL
+In a new terminal, start the Spice SQL REPL
 
 ```bash
 spice sql
@@ -307,13 +324,13 @@ You can now now query `my_dataset` in the runtime.
 
 ### Upcoming Features
 
-🚀 See the [Roadmap to v1.0-stable](https://github.com/spiceai/spiceai/blob/rust/docs/RELEASE.md) for upcoming features.
+🚀 See the [Roadmap to v1.0-stable](https://github.com/spiceai/spiceai/blob/trunk/docs/RELEASE.md) for upcoming features.
 
 ### Connect with us!
 
-We greatly appreciate and value your support! You can help Spice.ai in a number of ways:
+We greatly appreciate and value your support! You can help Spice in a number of ways:
 
-- Build an app with Spice.ai and send us feedback and suggestions at [hey@spice.ai](mailto:hey@spice.ai) or on [Discord](https://discord.gg/kZnTfneP5u), [X] (https://twitter.com/SpiceAIHQ), or [LinkedIn](https://www.linkedin.com/company/74148478).
+- Build an app with Spice.ai and send us feedback and suggestions at [hey@spice.ai](mailto:hey@spice.ai) or on [Discord](https://discord.gg/kZnTfneP5u), [X] (https://twitter.com/spice_ai), or [LinkedIn](https://www.linkedin.com/company/74148478).
 - [File an issue](https://github.com/spiceai/spiceai/issues/new) if you see something not quite working correctly.
 - Join our team ([We’re hiring!](https://spice.ai/careers))
 - Contribute code or documentation to the project (see [CONTRIBUTING.md](CONTRIBUTING.md)).
