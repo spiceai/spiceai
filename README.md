@@ -1,19 +1,17 @@
 # Spice.ai
 
-[![build](https://github.com/spiceai/spiceai/actions/workflows/e2e_test.yml/badge.svg?branch=trunk&event=push)](https://github.com/spiceai/spiceai/actions/workflows/e2e_test.yml)
 [![CodeQL](https://github.com/spiceai/spiceai/actions/workflows/codeql-analysis.yml/badge.svg?branch=trunk&event=push)](https://github.com/spiceai/spiceai/actions/workflows/codeql-analysis.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Discord](https://img.shields.io/discord/803820740868571196)](https://discord.gg/kZnTfneP5u)
-[![Subreddit subscribers](https://img.shields.io/reddit/subreddit-subscribers/spiceai?style=social)](https://www.reddit.com/r/spiceai)
-[![Follow on Twitter](https://img.shields.io/twitter/follow/spiceaihq.svg?style=social&logo=twitter)](https://twitter.com/intent/follow?screen_name=spiceaihq)
+[![Follow on Twitter](https://img.shields.io/twitter/follow/spiceaihq.svg?style=social&logo=twitter)](https://twitter.com/intent/follow?screen_name=spice_ai)
 
-## What is SpiceAI?
+## What is Spice AI?
 
 **Spice.ai** is an open source runtime environment that enables developers to leverage rapid access to time-series data. The Spice AI Runtime enables the best in class high performance queries for powering an array of data driven applications.
 
 ## Why Spice AI?
 
-The SpiceAI Runtime accelerates the ability to query real time data. If your are building a data application with low latency requirements, SpiceAI can deliver real-time data to end users without the need to access the cloud for every query.
+The Spice AI Runtime accelerates the ability to query real time data. If your are building a data application with low latency requirements, SpiceAI can deliver real-time data to end users without the need to access the cloud for every query.
 
 If your edge device has intermittent connectivity due to geographical constraints and needs to perform inferencing reliably at all times, the SpiceAI runtime can host the model, ensuring that your edge device is capable of generating predictions and recommentations at all times even when access to the cloud is unnavailable.
 
