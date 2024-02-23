@@ -69,7 +69,7 @@ pub fn ensure_model_path(name: &str) -> Result<String> {
 pub fn create_source_from(source: &str) -> Result<Box<dyn ModelSource>> {
     match source {
         "localhost" => Ok(Box::new(local::Local {})),
-        "spice.ai" => Ok(Box::new(spiceai::SpiceAI {})),
+        "spiceai" => Ok(Box::new(spiceai::SpiceAI {})),
         _ => UnknownModelSourceSnafu {
             model_source: source,
         }
