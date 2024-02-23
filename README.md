@@ -117,7 +117,7 @@ Query took: 0.004728897 seconds
 You can enter custom queries:
 
 ```bash
-sql> SELECT trip_distance_mi, fare_amount FROM taxi_trips LIMIT 10;
+SELECT trip_distance_mi, fare_amount FROM taxi_trips LIMIT 10;
 ```
 
 Output:
@@ -216,7 +216,7 @@ spice sql
 ```
 
 ```bash
-select number, size, gas_used from eth_recent_blocks Limit 10;
+SELECT number, size, gas_used from eth_recent_blocks LIMIT 10;
 ```
 
 The output displays the results of the query along with the query execution time:
