@@ -46,7 +46,7 @@ spice dataset configure
 		datasetLocation = strings.TrimSuffix(datasetLocation, "\n")
 
 		params := map[string]string{}
-		if strings.Split(datasetLocation, "/")[0] == api.DATA_SOURCE_DREMIO {
+		if strings.Split(datasetLocation, ":")[0] == api.DATA_SOURCE_DREMIO {
 
 			cmd.Print("\nWhat is your dremio endpoint? ")
 			endpoint, err := reader.ReadString('\n')
