@@ -12,10 +12,6 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 
 - See [Bugs](https://github.com/spiceai/spiceai/labels/bug). Feel free to file a new Issue if you see a bug and let us know on Discord.
 
-## Tentative v0.7-alpha roadmap
-
-- Comming soon!
-
 ## Features being considered for v1.0-stable
 
 - CI/CD on GitHub
