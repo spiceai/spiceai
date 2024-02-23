@@ -326,7 +326,7 @@ You can now now query `my_dataset` in the runtime.
 
 ### Upcoming Features
 
-🚀 See the [Roadmap to v1.0-stable](https://github.com/spiceai/spiceai/blob/trunk/docs/RELEASE.md) for upcoming features.
+🚀 See the [Roadmap to v1.0-stable](https://github.com/spiceai/spiceai/blob/trunk/docs/ROADMAP.md) for upcoming features.
 
 ### Connect with us!
 
