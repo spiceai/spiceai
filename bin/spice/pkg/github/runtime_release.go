@@ -8,8 +8,7 @@ import (
 )
 
 var (
-	assetNameMemo string
-	githubClient  = NewGitHubClient(runtimeOwner, runtimeRepo)
+	githubClient = NewGitHubClient(runtimeOwner, runtimeRepo)
 )
 
 const (
@@ -39,6 +38,7 @@ func GetLatestCliRelease() (*RepoRelease, error) {
 
 func DownloadRuntimeAsset(release *RepoRelease, downloadPath string) error {
 	assetName := GetRuntimeAssetName()
+	fmt.Println("Downloading Spice runtime...", assetName)
 	return DownloadReleaseAsset(githubClient, release, assetName, downloadPath)
 }
 
@@ -47,24 +47,14 @@ func DownloadAsset(release *RepoRelease, downloadPath string, assetName string) 
 }
 
 func GetRuntimeAssetName() string {
-	if assetNameMemo != "" {
-		return assetNameMemo
-	}
-
 	assetName := fmt.Sprintf("%s_%s_%s.tar.gz", constants.SpiceRuntimeFilename, runtime.GOOS, getRustArch())
 
-	assetNameMemo = assetName
 	return assetName
 }
 
 func GetAssetName(assetFileName string) string {
-	if assetNameMemo != "" {
-		return assetNameMemo
-	}
-
 	assetName := fmt.Sprintf("%s_%s_%s.tar.gz", assetFileName, runtime.GOOS, getRustArch())
 
-	assetNameMemo = assetName
 	return assetName
 }
 
