@@ -37,6 +37,8 @@ Spice makes querying data by SQL across one or more data sources simple and fast
 
 ## Quickstart
 
+https://github.com/spiceai/spiceai/assets/112157037/c9cfdaeb-ac6a-484f-a382-4c2735833f71
+
 **Step 1.** Install the Spice CLI:
 
 ```bash
