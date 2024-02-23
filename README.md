@@ -322,20 +322,15 @@ spice sql
 
 You can now now query `my_dataset` in the runtime.
 
-## Sample project using the Spice runtime.
-
-TODO: Make a simple app that showcases the data querying from the runtime.
-This will replace the Python script in the examples folder.
-
 ### Upcoming Features
 
-🚀 See the [Roadmap to v1.0-stable](https://github.com/spiceai/spiceai/blob/rust/docs/RELEASE.md) for upcoming features.
+🚀 See the [Roadmap to v1.0-stable](https://github.com/spiceai/spiceai/blob/trunk/docs/RELEASE.md) for upcoming features.
 
 ### Connect with us!
 
-We greatly appreciate and value your support! You can help Spice.ai in a number of ways:
+We greatly appreciate and value your support! You can help Spice in a number of ways:
 
-- Build an app with Spice.ai and send us feedback and suggestions at [hey@spice.ai](mailto:hey@spice.ai) or on [Discord](https://discord.gg/kZnTfneP5u), [X] (https://twitter.com/SpiceHQ), or [LinkedIn](https://www.linkedin.com/company/74148478).
+- Build an app with Spice.ai and send us feedback and suggestions at [hey@spice.ai](mailto:hey@spice.ai) or on [Discord](https://discord.gg/kZnTfneP5u), [X] (https://twitter.com/spice_ai), or [LinkedIn](https://www.linkedin.com/company/74148478).
 - [File an issue](https://github.com/spiceai/spiceai/issues/new) if you see something not quite working correctly.
 - Join our team ([We’re hiring!](https://spice.ai/careers))
 - Contribute code or documentation to the project (see [CONTRIBUTING.md](CONTRIBUTING.md)).
