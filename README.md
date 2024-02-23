@@ -18,9 +18,11 @@ The Spice runtime is written in Rust and leverages industry leading technologies
 Spice makes querying data by SQL across one or more data sources simple and fast. Easily co-locate a managed working set of your data with your application or ML, locally accelerated in-memory, with DuckDB, or with an attached database like PostgreSQL for high-performance, low-latency queries.
 
 ### Before Spice
+
 <img width="750" alt="old" src="https://github.com/spiceai/spiceai/assets/80174/1a0a883e-8bd7-4ac3-a524-33a9ddad6e47">
 
 ### With Spice
+
 <img width="1024" alt="new" src="https://github.com/spiceai/spiceai/assets/80174/9bc84831-a75a-4fca-9643-ef7a86345ef0">
 
 ### Example Use-Cases
@@ -158,11 +160,11 @@ Query took: 0.002458976 seconds
 
 ## Next Steps
 
-You can use any number of predefined datasets available from Spice.ai in the SpiceAI Runtime.
+You can use any number of predefined datasets available from Spice.ai in the Spice Runtime.
 
 A list of publically available datasets from Spice.ai can be found here: https://docs.spice.ai/building-blocks/datasets.
 
-In order to access public datasets from SpiceAI, you will first need to create an account with Spice.ai by selecting the free tier membership.
+In order to access public datasets from Spice, you will first need to create an account with Spice.ai by selecting the free tier membership.
 
 Navigate to https://spice.ai/ and create a new account by clicking on Try for Free.
 
@@ -222,7 +224,7 @@ You should see the following output from your runtime terminal:
 2024-02-21T22:49:10.038461Z  INFO runtime: Loaded dataset: eth_recent_blocks
 ```
 
-**Step 4.** In a new terminal window, use the SpiceAI SQL REPL to query the dataset
+**Step 4.** In a new terminal window, use the Spice SQL REPL to query the dataset
 
 ```bash
 spice sql
@@ -257,13 +259,13 @@ You can experiment with the time it takes to generate queries when using non-acc
 
 ## Importing dataset from Dremio
 
-**Step 1.** If you have a dataset hosted in Dremio, you can load it into the SpiceAI Runtime as follows:
+**Step 1.** If you have a dataset hosted in Dremio, you can load it into the Spice Runtime as follows:
 
 ```bash
 spice login dremio -u <USERNAME> -p <PASSWORD>
 ```
 
-**Step 2.** If you haven't already initialized a new project, you need to do so. Then, start the SpiceAI Runtime.
+**Step 2.** If you haven't already initialized a new project, you need to do so. Then, start the Spice Runtime.
 
 ```bash
 spice init dremio-demo-project
@@ -303,16 +305,16 @@ We should now see the following output:
 Dataset settings written to `datasets/my_dataset/dataset.yaml`!
 ```
 
-If the login credentials were entered correctly, your dataset will have loaded into the runtime. You should see the following in the SpiceAI runtime terminal :
+If the login credentials were entered correctly, your dataset will have loaded into the runtime. You should see the following in the Spice runtime terminal :
 
 ```
 2024-02-14T18:34:15.174564Z  INFO spiced: Loaded dataset: my_dataset
 2024-02-14T18:34:15.175189Z  INFO runtime::datasource: Refreshing data for my_dataset
 ```
 
-**Step 4.** Run queries against the dataset using the SpiceAI SQL REPL.
+**Step 4.** Run queries against the dataset using the Spice SQL REPL.
 
-In a new terminal, start the SpiceAI SQL REPL
+In a new terminal, start the Spice SQL REPL
 
 ```bash
 spice sql
@@ -320,7 +322,7 @@ spice sql
 
 You can now now query `my_dataset` in the runtime.
 
-## Sample project using the SpiceAI runtime.
+## Sample project using the Spice runtime.
 
 TODO: Make a simple app that showcases the data querying from the runtime.
 This will replace the Python script in the examples folder.
@@ -333,7 +335,7 @@ This will replace the Python script in the examples folder.
 
 We greatly appreciate and value your support! You can help Spice.ai in a number of ways:
 
-- Build an app with Spice.ai and send us feedback and suggestions at [hey@spice.ai](mailto:hey@spice.ai) or on [Discord](https://discord.gg/kZnTfneP5u), [X] (https://twitter.com/SpiceAIHQ), or [LinkedIn](https://www.linkedin.com/company/74148478).
+- Build an app with Spice.ai and send us feedback and suggestions at [hey@spice.ai](mailto:hey@spice.ai) or on [Discord](https://discord.gg/kZnTfneP5u), [X] (https://twitter.com/SpiceHQ), or [LinkedIn](https://www.linkedin.com/company/74148478).
 - [File an issue](https://github.com/spiceai/spiceai/issues/new) if you see something not quite working correctly.
 - Join our team ([We’re hiring!](https://spice.ai/careers))
 - Contribute code or documentation to the project (see [CONTRIBUTING.md](CONTRIBUTING.md)).
