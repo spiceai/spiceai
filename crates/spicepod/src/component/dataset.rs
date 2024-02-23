@@ -97,6 +97,9 @@ impl Dataset {
         if parts.len() > 1 {
             parts[0].to_string()
         } else {
+            if self.from == "localhost" || self.from.is_empty() {
+                return "localhost".to_string();
+            }
             "spiceai".to_string()
         }
     }
