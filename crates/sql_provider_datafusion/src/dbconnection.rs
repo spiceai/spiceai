@@ -8,8 +8,8 @@ pub mod duckdbconn;
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 type Result<T, E = Error> = std::result::Result<T, E>;
 
-pub trait DbConnection<T: r2d2::ManageConnection, P> {
-    fn new(conn: r2d2::PooledConnection<T>) -> Self
+pub trait DbConnection<T, P> {
+    fn new(conn: T) -> Self
     where
         Self: Sized;
     fn get_schema(&mut self, table_reference: &TableReference) -> Result<SchemaRef>;
