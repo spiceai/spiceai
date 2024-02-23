@@ -110,6 +110,7 @@ pub(crate) mod datasets {
 
 pub(crate) mod inference {
     use crate::datafusion::DataFusion;
+    use crate::model::version as model_version;
     use crate::model::Model;
     use app::App;
     use arrow::array::Float32Array;
@@ -274,7 +275,7 @@ pub(crate) mod inference {
                 status: PredictStatus::BadRequest,
                 error_message: Some(format!("Model {model_name} not found")),
                 model_name,
-                model_version: Some(model.version()),
+                model_version: Some(model_version(&model.from)),
                 lookback,
                 prediction: vec![],
                 duration_ms: start_time.elapsed().as_millis(),
@@ -290,7 +291,7 @@ pub(crate) mod inference {
                             status: PredictStatus::Success,
                             error_message: None,
                             model_name,
-                            model_version: Some(model.version()),
+                            model_version: Some(model_version(&model.from)),
                             lookback,
                             prediction: result,
                             duration_ms: start_time.elapsed().as_millis(),
@@ -305,7 +306,7 @@ pub(crate) mod inference {
                             "Unable to cast inference result to Float32Array".to_string(),
                         ),
                         model_name,
-                        model_version: Some(model.version()),
+                        model_version: Some(model_version(&model.from)),
                         lookback,
                         prediction: vec![],
                         duration_ms: start_time.elapsed().as_millis(),
@@ -320,7 +321,7 @@ pub(crate) mod inference {
                         "Unable to find column 'y' in inference result".to_string(),
                     ),
                     model_name,
-                    model_version: Some(model.version()),
+                    model_version: Some(model_version(&model.from)),
                     lookback,
                     prediction: vec![],
                     duration_ms: start_time.elapsed().as_millis(),
@@ -332,7 +333,7 @@ pub(crate) mod inference {
                     status: PredictStatus::InternalError,
                     error_message: Some(e.to_string()),
                     model_name,
-                    model_version: Some(model.version()),
+                    model_version: Some(model_version(&model.from)),
                     lookback,
                     prediction: vec![],
                     duration_ms: start_time.elapsed().as_millis(),

@@ -231,7 +231,7 @@ spice sql
 ```
 
 ```bash
-sql> select number, size, gas_used from eth_recent_blocks Limit 10;
+SELECT number, size, gas_used from eth_recent_blocks LIMIT 10;
 ```
 
 The output displays the results of the query along with the query execution time:
