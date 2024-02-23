@@ -19,7 +19,9 @@ pub struct DuckDbConnectionPool {
     pool: Arc<r2d2::Pool<DuckdbConnectionManager>>,
 }
 
-impl DbConnectionPool<DuckdbConnectionManager, &'static dyn ToSql> for DuckDbConnectionPool {
+impl DbConnectionPool<r2d2::PooledConnection<DuckdbConnectionManager>, &'static dyn ToSql>
+    for DuckDbConnectionPool
+{
     fn new(name: &str, mode: Mode, params: Arc<Option<HashMap<String, String>>>) -> Result<Self> {
         let manager = match mode {
             Mode::Memory => DuckdbConnectionManager::memory().context(DuckDBSnafu)?,
@@ -38,7 +40,9 @@ impl DbConnectionPool<DuckdbConnectionManager, &'static dyn ToSql> for DuckDbCon
 
     fn connect(
         &self,
-    ) -> Result<Box<dyn DbConnection<DuckdbConnectionManager, &'static dyn ToSql>>> {
+    ) -> Result<
+        Box<dyn DbConnection<r2d2::PooledConnection<DuckdbConnectionManager>, &'static dyn ToSql>>,
+    > {
         let pool = Arc::clone(&self.pool);
         let conn: r2d2::PooledConnection<DuckdbConnectionManager> =
             pool.get().context(ConnectionPoolSnafu)?;

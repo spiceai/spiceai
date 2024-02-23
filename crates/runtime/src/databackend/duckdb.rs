@@ -57,7 +57,11 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 pub struct DuckDBBackend {
     ctx: Arc<SessionContext>,
     name: String,
-    pool: Arc<dyn DbConnectionPool<DuckdbConnectionManager, &'static dyn ToSql> + Send + Sync>,
+    pool: Arc<
+        dyn DbConnectionPool<r2d2::PooledConnection<DuckdbConnectionManager>, &'static dyn ToSql>
+            + Send
+            + Sync,
+    >,
     create_mutex: std::sync::Mutex<()>,
     _primary_keys: Option<Vec<String>>,
 }
