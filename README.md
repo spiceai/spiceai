@@ -1,52 +1,65 @@
-# Spice.ai
+# Spice
 
 [![CodeQL](https://github.com/spiceai/spiceai/actions/workflows/codeql-analysis.yml/badge.svg?branch=trunk&event=push)](https://github.com/spiceai/spiceai/actions/workflows/codeql-analysis.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Discord](https://img.shields.io/discord/803820740868571196)](https://discord.gg/kZnTfneP5u)
-[![Follow on Twitter](https://img.shields.io/twitter/follow/spiceaihq.svg?style=social&logo=twitter)](https://twitter.com/intent/follow?screen_name=spice_ai)
+[![Follow on Twitter](https://img.shields.io/twitter/follow/spice_ai.svg?style=social&logo=twitter)](https://twitter.com/intent/follow?screen_name=spice_ai)
 
-## What is Spice AI?
+## What is Spice?
 
-**Spice.ai** is an open source runtime environment that enables developers to leverage rapid access to time-series data. The Spice AI Runtime enables the best in class high performance queries for powering an array of data driven applications.
+**Spice** is a portable runtime that provides developers with a unified SQL query interface to locally accelerate and query data tables sourced from any database, data warehouse, or data lake.
 
-## Why Spice AI?
+Spice makes it easy to build data-driven and data-intensive applications by streamlining the use of data and machine learning (ML) in software.
 
-The Spice AI Runtime accelerates the ability to query real time data. If your are building a data application with low latency requirements, SpiceAI can deliver real-time data to end users without the need to access the cloud for every query.
+The Spice runtime is written in Rust and leverages industry leading technologies like Apache DataFusion, Apache Arrow, Apache Arrow Flight, and DuckDB.
 
-If your edge device has intermittent connectivity due to geographical constraints and needs to perform inferencing reliably at all times, the SpiceAI runtime can host the model, ensuring that your edge device is capable of generating predictions and recommentations at all times even when access to the cloud is unnavailable.
+## Why Spice?
 
-⚠️ **DEVELOPER PREVIEW ONLY** Spice.ai is under active **alpha** stage development and is not intended to be used in production until its **1.0-stable** release.
+Spice makes querying data by SQL across one or more data sources simple and fast. Easily co-locate a managed working set of your data with your application or ML, locally accelerated in-memory, with DuckDB, or with an attached database like PostgreSQL for high-performance, low-latency queries.
 
-## Quick Start
+### Before Spice
 
-**Step 1.** Install the SpiceAI CLI:
+### With Spice
+
+### Example Use-Cases
+
+**1. Faster frontends.** Accelerate and co-locate data views with your frontend application, to serve more concurrent users with faster page loads and data updates.
+
+**2. Faster analytics and BI.**
+
+**3. Faster machine learning training and inferencing.**
+
+⚠️ **DEVELOPER PREVIEW** Spice is under active **alpha** stage development and is not intended to be used in production until its **1.0-stable** release.
+
+## Quickstart
+
+**Step 1.** Install the Spice CLI:
 
 ```bash
 curl https://install.spiceai.org | /bin/bash
 ```
 
-**Step 2.** Choose a project name and initialize a new project with the `spice init` command:
+**Step 2.** Initialize a new Spice app with the `spice init` command:
 
 ```bash
-spice init my_spiceai_project
+spice init spice_app
 ```
 
-This creates a spicepod.yaml file in your directory.
+A `Spicepod.yaml` file is created in the working directory.
 
-**Step 3.** Log in to Dremio in order to access the dataset. Use the credentials below:
-:
+**Step 3.** Connect to the sample Dremio instance to access the sample data:
 
 ```bash
 spice login dremio -u demo -p demo1234
 ```
 
-**Step 4.** Start the SpiceAI runtime:
+**Step 4.** Start the Spice runtime:
 
 ```bash
 spice run
 ```
 
-You should see the following output (with timestamps reflecting when you started the runtime):
+Example output will be shown as follows:
 
 ```bash
 Spice.ai runtime starting...
@@ -56,15 +69,15 @@ Using latest 'local' runtime version.
 2024-02-21T06:11:56.382038Z  INFO runtime::opentelemetry: Spice Runtime OpenTelemetry listening on 127.0.0.1:50052
 ```
 
-**Step 5.** In a new terminal window, import the spicepod. The spicepod contains information about how datasets and other components are configured. You can add public spicepods using `spice add` command:
+The runtime is now started and ready for queries.
+
+**Step 5.** In a new terminal window, add the `spiceai/quickstart` Spicepod. A Spicepod is a package of configuration defining datasets and ML models.
 
 ```bash
 spice add spiceai/quickstart
 ```
 
-You should see the runtime updated with the new datasets.
-Also, the spicepod.yaml file will be updated with a new dependency that
-references the spiceai/quickstart spicepod.
+The `Spicepod.yaml` file will be updated with the `spiceai/quickstart` dependency.
 
 ```yaml
 version: v1beta1
@@ -74,31 +87,33 @@ dependencies:
   - spiceai/quickstart
 ```
 
-In the runtime terminal window, you should see that the a new dataset has been added to the runtime:
+The `spiceai/quickstart` Spicepod will add a `taxi_trips` data table to the runtime which is now available to query by SQL.
 
 ```bash
 2024-02-22T05:53:48.222952Z  INFO runtime: Loaded dataset: taxi_trips
 2024-02-22T05:53:48.223101Z  INFO runtime::dataconnector: Refreshing data for taxi_trips
 ```
 
-**Step 6.** You can now query the dataset using the SpiceAI SQL REPL. Enter the command below to start the REPL:
+**Step 6.** Start the Spice SQL REPL:
 
 ```bash
 spice sql
 ```
 
-You should now see:
+The SQL REPL inferface will be shown:
 
-```bash
+```
 Welcome to the interactive Spice.ai SQL Query Utility! Type 'help' for help.
 
 show tables; -- list available tables
+sql>
 ```
 
-Entering `show tables;` prints out the following table along with the time it took to execute the query:
+Enter `show tables;` to display the available tables for query:
 
 ```
 sql> show tables;
+
 +---------------+--------------------+-------------+------------+
 | table_catalog | table_schema       | table_name  | table_type |
 +---------------+--------------------+-------------+------------+
@@ -112,15 +127,15 @@ sql> show tables;
 Query took: 0.004728897 seconds
 ```
 
-You can enter custom queries:
+Enter a query to display the most expensive tax trips:
 
-```bash
-sql> SELECT trip_distance_mi, fare_amount FROM taxi_trips LIMIT 10;
+```
+sql> SELECT trip_distance_mi, fare_amount FROM taxi_trips ORDER BY fare_amount LIMIT 10;
 ```
 
 Output:
 
-```bash
+```
 +------------------+-------------+
 | trip_distance_mi | fare_amount |
 +------------------+-------------+
@@ -138,8 +153,6 @@ Output:
 
 Query took: 0.002458976 seconds
 ```
-
-TODO: ADD VIDEO SHOWING HOW TO RUN THE ABOVE STEPS HERE.
 
 ## Next Steps
 
