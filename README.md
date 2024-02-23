@@ -143,8 +143,7 @@ Query took: 0.002458976 seconds
 
 Quickstart video demo:
 
-https://github.com/spiceai/spiceai/assets/112157037/b75bd4df-08e3-4cae-ba8b-c5ebaed95904
-
+https://github.com/spiceai/spiceai/assets/112157037/c9cfdaeb-ac6a-484f-a382-4c2735833f71
 
 ## Next Steps
 
