@@ -141,8 +141,6 @@ Output:
 Query took: 0.002458976 seconds
 ```
 
-TODO: ADD VIDEO SHOWING HOW TO RUN THE ABOVE STEPS HERE.
-
 ## Next Steps
 
 You can use any number of predefined datasets available from Spice.ai in the SpiceAI Runtime.
@@ -306,11 +304,6 @@ spice sql
 ```
 
 You can now now query `my_dataset` in the runtime.
-
-## Sample project using the SpiceAI runtime.
-
-TODO: Make a simple app that showcases the data querying from the runtime.
-This will replace the Python script in the examples folder.
 
 ### Upcoming Features
 
