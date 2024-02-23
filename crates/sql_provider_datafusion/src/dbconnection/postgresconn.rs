@@ -60,13 +60,10 @@ impl<'a> DbConnection<FlightSqlServiceClient<Channel>, &'a (dyn ToSql + Sync)>
             .await
             .context(UnableToQuerySnafu)?;
 
-        let sql = &format!("SELECT * FROM {table_reference} LIMIT 0");
-        let mut stmt = client
-            .prepare(sql.to_string(), None)
+        let flight_info = client
+            .execute(format!("SELECT * FROM {table_reference} LIMIT 0"), None)
             .await
             .context(UnableToQuerySnafu)?;
-
-        let flight_info = stmt.execute().await.context(UnableToQuerySnafu)?;
 
         let Some(ticket) = flight_info.endpoint[0].ticket.as_ref() else {
             return NoTicketReceivedSnafu.fail()?;
@@ -99,12 +96,8 @@ impl<'a> DbConnection<FlightSqlServiceClient<Channel>, &'a (dyn ToSql + Sync)>
             client.handshake("postgres", "postgres")
                 .await
                 .map_err(to_execution_error)?;
-            let mut stmt = client
-                .prepare(sql.to_string(), None)
-                .await
-                .map_err(to_execution_error)?;
 
-            let flight_info = stmt.execute().await.map_err(to_execution_error)?;
+            let flight_info = client.execute(sql.to_string(), None).await.map_err(to_execution_error)?;
 
             let Some(ticket) = flight_info.endpoint[0].ticket.as_ref() else {
                 Err(DataFusionError::Execution("No ticket received for query".to_string()))?;
@@ -131,17 +124,18 @@ impl<'a> DbConnection<FlightSqlServiceClient<Channel>, &'a (dyn ToSql + Sync)>
     fn execute(&mut self, sql: &str, _params: &[&(dyn ToSql + Sync)]) -> Result<u64> {
         let mut client = self.conn.clone();
         client.set_header("x-flight-sql-database", "flight-sql-test");
+
         tokio::task::block_in_place(move || {
             Handle::current().block_on(async {
                 client
                     .handshake("postgres", "postgres")
                     .await
                     .context(UnableToQuerySnafu)?;
-                let mut stmt = client
-                    .prepare(sql.to_string(), None)
+
+                let rows_modified = client
+                    .execute_update(sql.to_string(), None)
                     .await
                     .context(UnableToQuerySnafu)?;
-                let rows_modified = stmt.execute_update().await.context(UnableToQuerySnafu)?;
                 #[allow(clippy::cast_sign_loss)] // Rows modified will never be negative
                 Ok(rows_modified as u64)
             })
