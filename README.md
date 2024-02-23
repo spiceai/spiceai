@@ -141,6 +141,11 @@ Output:
 Query took: 0.002458976 seconds
 ```
 
+Quickstart video demo:
+
+https://github.com/spiceai/spiceai/assets/112157037/b75bd4df-08e3-4cae-ba8b-c5ebaed95904
+
+
 ## Next Steps
 
 You can use any number of predefined datasets available from Spice.ai in the SpiceAI Runtime.
