@@ -38,7 +38,7 @@ func GetLatestCliRelease() (*RepoRelease, error) {
 
 func DownloadRuntimeAsset(release *RepoRelease, downloadPath string) error {
 	assetName := GetRuntimeAssetName()
-	fmt.Println("Downloading Spice runtime...", assetName)
+	fmt.Println("Downloading the Spice runtime...", assetName)
 	return DownloadReleaseAsset(githubClient, release, assetName, downloadPath)
 }
 
