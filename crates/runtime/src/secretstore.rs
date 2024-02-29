@@ -3,6 +3,9 @@ use std::collections::HashMap;
 use serde::Deserialize;
 use snafu::Snafu;
 
+pub mod file;
+pub mod keyring;
+
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Unable to find home directory"))]
@@ -24,6 +27,11 @@ pub struct AuthProviders {
     pub auth_configs: AuthConfigs,
 }
 
+#[derive(Default, Clone)]
+pub struct AuthConfig {
+    pub params: HashMap<String, String>,
+}
+
 #[allow(clippy::module_name_repetitions)]
 pub type AuthConfigs = HashMap<String, AuthConfig>;
 
@@ -36,6 +44,11 @@ pub struct Secret {
 #[allow(clippy::module_name_repetitions)]
 pub struct SecretStore {
     pub secret: Secret,
+}
+
+#[derive(Clone)]
+pub struct AuthProvider {
+    auth_config: AuthConfig,
 }
 
 impl AuthProvider {
