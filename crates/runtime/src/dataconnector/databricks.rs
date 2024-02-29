@@ -25,7 +25,7 @@ pub struct Databricks {
 impl DataConnector for Databricks {
     fn new(
         auth_provider: AuthProvider,
-        params: Arc<Option<HashMap<String, String>>>,
+        _params: Arc<Option<HashMap<String, String>>>,
     ) -> Pin<Box<dyn Future<Output = super::Result<Self>> + Send>>
     where
         Self: Sized,
