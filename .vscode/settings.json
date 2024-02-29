@@ -1,3 +1,0 @@
-{
-  "rust-analyzer.linkedProjects": ["./crates/runtime/Cargo.toml"]
-}
