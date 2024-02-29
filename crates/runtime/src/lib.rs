@@ -151,9 +151,6 @@ impl Runtime {
             None => "".to_string(),
         };
 
-        println!("!!!: secret store: {}", secret_store_key);
-        println!("!!!: secret key: {}", secret_key);
-
         tokio::spawn(async move {
             loop {
                 let source = ds.source();
