@@ -5,8 +5,8 @@ use dirs;
 use snafu::prelude::*;
 
 use super::{
-    Error, Secret, UnableToFindHomeDirSnafu, UnableToOpenAuthFileSnafu, UnableToParseAuthFileSnafu,
-    UnableToReadAuthFileSnafu,
+    Error, Secret, SecretStore, UnableToFindHomeDirSnafu, UnableToOpenAuthFileSnafu,
+    UnableToParseAuthFileSnafu, UnableToReadAuthFileSnafu,
 };
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -16,8 +16,16 @@ pub struct FileSecretStore {
 }
 
 impl FileSecretStore {
+    pub fn new() -> Self {
+        Self {
+            secrets: HashMap::new(),
+        }
+    }
+}
+
+impl SecretStore for FileSecretStore {
     #[must_use]
-    pub fn get_secret(&self, key: &str) -> Secret {
+    fn get_secret(&self, key: &str) -> Secret {
         let secret = if let Some(auth) = self.secrets.get(key) {
             tracing::trace!("Using file auth provider secret key: {}", key);
             auth
@@ -29,7 +37,7 @@ impl FileSecretStore {
         Secret::new()
     }
 
-    pub fn init(&mut self) -> Result<()> {
+    fn init(&mut self) -> Result<()> {
         let mut auth_path = dirs::home_dir().context(UnableToFindHomeDirSnafu)?;
         auth_path.push(".spice/auth");
 

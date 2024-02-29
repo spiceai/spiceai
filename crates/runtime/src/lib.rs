@@ -7,6 +7,7 @@ use app::App;
 use config::Config;
 use model::Model;
 pub use notify::Error as NotifyError;
+use secretstore::file::FileSecretStore;
 use secretstore::{Secret, SecretStores};
 use snafu::prelude::*;
 use spicepod::component::dataset::Dataset;
@@ -83,6 +84,9 @@ pub enum Error {
         source: datafusion::Error,
         data_connector: String,
     },
+
+    #[snafu(display("Unable to load secret store: {secret_store}"))]
+    UnableToLoadSecretStore { secret_store: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -145,18 +149,26 @@ impl Runtime {
 
         tokio::spawn(async move {
             loop {
+                let source = ds.source();
                 let secret_stores = shared_secret_stores.read().await;
 
-                let source = ds.source();
+                let secret_store =
+                    match secret_stores.get_store(&secret_store_key).ok_or_else(|| {
+                        UnableToLoadSecretStoreSnafu {
+                            secret_store: source.clone(),
+                        }
+                    }) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            continue;
+                        }
+                    };
+
                 let params = Arc::new(ds.params.clone());
                 let data_connector: Option<Box<dyn DataConnector + Send>> =
                     match Runtime::get_dataconnector_from_source(
                         &source,
-                        &secret_stores
-                            .get_store(&secret_store_key)
-                            .unwrap()
-                            .get(secret_key.as_str())
-                            .unwrap(),
+                        &secret_store.get_secret(secret_key.as_str()),
                         Arc::clone(&params),
                     )
                     .await
@@ -351,19 +363,17 @@ impl Runtime {
         let mut model_map = self.models.write().await;
 
         let secret_stores = self.secret_stores.read().await;
-        let secret_store = match secret_stores.get_store("file") {
-            Some(s) => s,
-            None => {
-                return;
-            }
-        };
+        let secret_store =
+            match secret_stores
+                .get_store("files")
+                .ok_or_else(|| UnableToLoadSecretStoreSnafu {
+                    secret_store: model::source(&m.from).as_str().to_string(),
+                }) {
+                Ok(s) => s,
+                Err(e) => return,
+            };
 
-        match Model::load(
-            m,
-            secret_store.get(model::source(&m.from).as_str()).unwrap(),
-        )
-        .await
-        {
+        match Model::load(m, secret_store.get_secret(model::source(&m.from).as_str())).await {
             Ok(in_m) => {
                 model_map.insert(m.name.clone(), in_m);
                 tracing::info!("Model [{}] deployed, ready for inferencing", m.name);
@@ -494,13 +504,12 @@ fn has_table_provider(data_connector: &Option<Box<dyn DataConnector + Send>>) ->
 }
 
 pub fn initialize_secret_stores() -> secretstore::SecretStores {
-    let stores = secretstore::SecretStores::new();
-    // if let Err(e) = stores.init() {
-    //     tracing::warn!(
-    //         "Unable to initialize secret stores, proceeding without auth: {}",
-    //         e
-    //     );
-    // }
+    let mut stores = secretstore::SecretStores::new();
+
+    let file_secret_store = FileSecretStore::new();
+
+    stores.add_store("file".to_string(), Box::new(file_secret_store));
+
     stores
 }
 
