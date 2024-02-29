@@ -408,7 +408,7 @@ impl Runtime {
                 tracing::debug!("Updated pods information: {:?}", new_app);
                 tracing::debug!("Previous pods information: {:?}", current_app);
 
-                *self.auth.write().await = load_auth_providers();
+                *self.auth.write().await = initialize_secret_stores();
 
                 // check for new and updated datasets
                 for ds in &new_app.datasets {
@@ -467,15 +467,15 @@ fn has_table_provider(data_connector: &Option<Box<dyn DataConnector + Send>>) ->
             .is_some_and(|dc| dc.has_table_provider())
 }
 
-pub fn load_auth_providers() -> secretstore::AuthProviders {
-    let mut auth = secretstore::AuthProviders::default();
-    if let Err(e) = auth.parse_from_config() {
+pub fn initialize_secret_stores() -> secretstore::SecretStores {
+    let mut stores = secretstore::SecretStores::default();
+    if let Err(e) = stores.init() {
         tracing::warn!(
-            "Unable to parse auth from config, proceeding without auth: {}",
+            "Unable to initialize secret stores, proceeding without auth: {}",
             e
         );
     }
-    auth
+    stores
 }
 
 async fn shutdown_signal() {

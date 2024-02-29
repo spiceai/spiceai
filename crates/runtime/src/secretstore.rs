@@ -23,17 +23,14 @@ pub enum Error {
 
 #[allow(clippy::module_name_repetitions)]
 #[derive(Default)]
-pub struct AuthProviders {
-    pub auth_configs: AuthConfigs,
+pub struct SecretStores {
+    pub stores: HashMap<String, SecretStore>,
 }
 
 #[derive(Default, Clone)]
 pub struct AuthConfig {
     pub params: HashMap<String, String>,
 }
-
-#[allow(clippy::module_name_repetitions)]
-pub type AuthConfigs = HashMap<String, AuthConfig>;
 
 #[allow(clippy::module_name_repetitions)]
 #[derive(Default, Deserialize, Clone)]
@@ -43,28 +40,24 @@ pub struct Secret {
 
 #[allow(clippy::module_name_repetitions)]
 pub struct SecretStore {
-    pub secret: Secret,
+    pub secrets: HashMap<String, Secret>,
 }
 
-#[derive(Clone)]
-pub struct AuthProvider {
-    auth_config: AuthConfig,
-}
-
-impl AuthProvider {
+impl SecretStore {
     #[must_use]
-    pub fn new(auth_config: AuthConfig) -> Self
+    pub fn new() -> Self
     where
         Self: Sized,
     {
-        AuthProvider { auth_config }
+        Self {
+            secrets: HashMap::new(),
+        }
     }
 
     #[must_use]
-    pub fn get_param(&self, param: &str) -> Option<&str> {
-        self.auth_config
-            .params
-            .get(&param.to_string())
+    pub fn get_secret(&self, key: &str) -> Option<&str> {
+        self.secrets
+            .get(&key.to_string())
             .map(String::as_str)
     }
 }

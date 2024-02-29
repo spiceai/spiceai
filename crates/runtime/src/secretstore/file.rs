@@ -19,19 +19,19 @@ pub struct FileSecretStore {
 
 impl FileSecretStore {
     #[must_use]
-    pub fn get(&self, name: &str) -> AuthProvider {
-        let auth = if let Some(auth) = self.auth_configs.get(name) {
-            tracing::trace!("Using auth provider: {}", name);
+    pub fn get_secret(&self, key: &str) -> Secret {
+        let auth = if let Some(auth) = self.auth_configs.get(key) {
+            tracing::trace!("Using file auth provider secret key: {}", key);
             auth
         } else {
-            tracing::trace!("No auth provider found for {}", name);
-            return AuthProvider::new(AuthConfig::default());
+            tracing::trace!("No secret found for key {}", key);
+            return Secret::new(AuthConfig::default());
         };
 
-        AuthProvider::new(auth.clone())
+        Secret::new(auth.clone())
     }
 
-    pub fn parse_from_config(&mut self) -> Result<()> {
+    pub fn init(&mut self) -> Result<()> {
         let mut auth_path = dirs::home_dir().context(UnableToFindHomeDirSnafu)?;
         auth_path.push(".spice/auth");
 
