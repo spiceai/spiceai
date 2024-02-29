@@ -48,6 +48,8 @@ notify = "6.1.1"
 arrow-json = "49.0.0"
 async-trait.workspace = true
 flight_datafusion = { path = "../flight_datafusion" }
+deltalake = { version = "0.17.0", features = ["datafusion-ext", "s3"] }
+itertools = "0.12"
 
 [features]
 default = ["duckdb"]

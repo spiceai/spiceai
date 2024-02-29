@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use deltalake::open_table_with_storage_options;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::{collections::HashMap, future::Future};
@@ -9,26 +10,25 @@ use crate::auth::AuthProvider;
 
 use super::DataConnector;
 
-pub struct Databricks {}
+pub struct Databricks {
+    auth_provider: AuthProvider,
+    params: Arc<Option<HashMap<String, String>>>,
+}
 
 #[async_trait]
 impl DataConnector for Databricks {
     fn new(
-        _auth_provider: AuthProvider,
+        auth_provider: AuthProvider,
         params: Arc<Option<HashMap<String, String>>>,
     ) -> Pin<Box<dyn Future<Output = super::Result<Self>> + Send>>
     where
         Self: Sized,
     {
         Box::pin(async move {
-            let _table_uri: String = params
-                .as_ref() // &Option<HashMap<String, String>>
-                .as_ref() // Option<&HashMap<String, String>>
-                .and_then(|params| params.get("table_uri").cloned())
-                .ok_or_else(|| super::Error::UnableToCreateDataConnector {
-                    source: "Missing required parameter: table_uri".into(),
-                })?;
-            Ok(Self {})
+            Ok(Self {
+                auth_provider,
+                params,
+            })
         })
     }
 
@@ -36,6 +36,9 @@ impl DataConnector for Databricks {
         &self,
         _dataset: &Dataset,
     ) -> Pin<Box<dyn Future<Output = Vec<arrow::record_batch::RecordBatch>> + Send>> {
+        let table_uri = "s3://databricks-workspace-stack-f0780-bucket/unity-catalog/686830279408652/__unitystorage/catalogs/1c3649de-309b-4c73-805e-8cf93aa4ee25/tables/d8f8978b-565d-4322-9ef2-15f4c431f8f0";
+        let _table = open_table_with_storage_options(table_uri, HashMap::new());
+
         unimplemented!()
     }
 
