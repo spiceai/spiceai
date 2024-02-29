@@ -418,8 +418,8 @@ name = "arrow_sql_gen"
 version = "0.7.0-alpha"
 dependencies = [
  "arrow",
- "rust_decimal",
  "postgres",
+ "rust_decimal",
  "sea-query",
  "snafu 0.8.0",
  "tracing",
