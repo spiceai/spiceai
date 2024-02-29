@@ -13,14 +13,6 @@ exclude.workspace = true
 [dependencies]
 tracing.workspace = true
 arrow.workspace = true
-sea-query = "0.30.7"
-arrow-flight.workspace = true
-arrow-ipc = "49.0.0"
-arrow-json = "49.0.0"
-postgres = "0.19.7"
-tokio-postgres = "0.7.10"
-arrow-schema = "50.0.0"
-datafusion.workspace = true
-tokio.workspace = true
 snafu.workspace = true
-postgres-types = "0.2.6"
+sea-query = "0.30.7"
+postgres = "0.19.7"
