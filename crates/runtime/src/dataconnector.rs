@@ -17,6 +17,7 @@ use crate::auth::AuthProvider;
 use crate::datapublisher::DataPublisher;
 use crate::dataupdate::{DataUpdate, UpdateType};
 
+pub mod databricks;
 pub mod debug;
 pub mod dremio;
 pub mod flight;
