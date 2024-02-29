@@ -7,6 +7,7 @@ use app::App;
 use config::Config;
 use model::Model;
 pub use notify::Error as NotifyError;
+use secretstore::SecretStores;
 use snafu::prelude::*;
 use spicepod::component::dataset::Dataset;
 use spicepod::component::dataset::Mode;
@@ -92,7 +93,7 @@ pub struct Runtime {
     pub df: Arc<RwLock<DataFusion>>,
     pub models: Arc<RwLock<HashMap<String, Model>>>,
     pub pods_watcher: podswatcher::PodsWatcher,
-    pub secrets: Arc<RwLock<HashMap<String, secretstore::SecretStore>>>,
+    pub secrets: Arc<RwLock<SecretStores>>,
 
     spaced_tracer: Arc<tracers::SpacedTracer>,
 }
@@ -104,7 +105,7 @@ impl Runtime {
         app: Arc<RwLock<Option<app::App>>>,
         df: Arc<RwLock<DataFusion>>,
         pods_watcher: podswatcher::PodsWatcher,
-        secrets: Arc<RwLock<HashMap<String, secretstore::SecretStore>>>,
+        secrets: Arc<RwLock<SecretStores>>,
     ) -> Self {
         Runtime {
             app,
@@ -213,19 +214,30 @@ impl Runtime {
 
     async fn get_dataconnector_from_source(
         source: &str,
-        secret_stores: &HashMap<String, secretstore::SecretStore>,
+        secret_stores: &SecretStores,
         params: Arc<Option<HashMap<String, String>>>,
     ) -> Result<Option<Box<dyn DataConnector + Send>>> {
+        // TODO: load secret store from spicepod
+        let secret_store = match secret_stores.get_store("file") {
+            Some(s) => s,
+            None => {
+                return UnknownDataSourceSnafu {
+                    data_source: source,
+                }
+                .fail()?
+            }
+        };
+
         match source {
             "spiceai" => Ok(Some(Box::new(
-                dataconnector::spiceai::SpiceAI::new(secret_stores.get(source), params)
+                dataconnector::spiceai::SpiceAI::new(secret_store.get(source).unwrap(), params)
                     .await
                     .context(UnableToInitializeDataConnectorSnafu {
                         data_connector: source,
                     })?,
             ))),
             "dremio" => Ok(Some(Box::new(
-                dataconnector::dremio::Dremio::new(secret_stores.get(source), params)
+                dataconnector::dremio::Dremio::new(secret_store.get(source).unwrap(), params)
                     .await
                     .context(UnableToInitializeDataConnectorSnafu {
                         data_connector: source,
@@ -468,13 +480,13 @@ fn has_table_provider(data_connector: &Option<Box<dyn DataConnector + Send>>) ->
 }
 
 pub fn initialize_secret_stores() -> secretstore::SecretStores {
-    let mut stores = secretstore::SecretStores::default();
-    if let Err(e) = stores.init() {
-        tracing::warn!(
-            "Unable to initialize secret stores, proceeding without auth: {}",
-            e
-        );
-    }
+    let mut stores = secretstore::SecretStores::new();
+    // if let Err(e) = stores.init() {
+    //     tracing::warn!(
+    //         "Unable to initialize secret stores, proceeding without auth: {}",
+    //         e
+    //     );
+    // }
     stores
 }
 
