@@ -8,7 +8,7 @@ use config::Config;
 use model::Model;
 pub use notify::Error as NotifyError;
 use secretstore::file::FileSecretStore;
-use secretstore::{Secret, SecretStores};
+use secretstore::{Secret, SecretStore, SecretStores};
 use snafu::prelude::*;
 use spicepod::component::dataset::Dataset;
 use spicepod::component::dataset::Mode;
@@ -122,6 +122,10 @@ impl Runtime {
         }
     }
 
+    pub async fn init(&self) {
+        *self.secret_stores.write().await = initialize_secret_stores();
+    }
+
     pub async fn load_datasets(&self) {
         let app_lock = self.app.read().await;
         if let Some(app) = app_lock.as_ref() {
@@ -147,6 +151,9 @@ impl Runtime {
             None => "".to_string(),
         };
 
+        println!("!!!: secret store: {}", secret_store_key);
+        println!("!!!: secret key: {}", secret_key);
+
         tokio::spawn(async move {
             loop {
                 let source = ds.source();
@@ -168,7 +175,7 @@ impl Runtime {
                 let data_connector: Option<Box<dyn DataConnector + Send>> =
                     match Runtime::get_dataconnector_from_source(
                         &source,
-                        &secret_store.get_secret(secret_key.as_str()),
+                        &secret_store.get_secret(source.as_str()),
                         Arc::clone(&params),
                     )
                     .await
@@ -444,8 +451,6 @@ impl Runtime {
                 tracing::debug!("Updated pods information: {:?}", new_app);
                 tracing::debug!("Previous pods information: {:?}", current_app);
 
-                *self.secret_stores.write().await = initialize_secret_stores();
-
                 // check for new and updated datasets
                 for ds in &new_app.datasets {
                     if let Some(current_ds) =
@@ -506,7 +511,13 @@ fn has_table_provider(data_connector: &Option<Box<dyn DataConnector + Send>>) ->
 pub fn initialize_secret_stores() -> secretstore::SecretStores {
     let mut stores = secretstore::SecretStores::new();
 
-    let file_secret_store = FileSecretStore::new();
+    let mut file_secret_store = FileSecretStore::new();
+    match file_secret_store.init() {
+        Ok(()) => {}
+        Err(err) => {
+            tracing::error!("Unable to initialize file secret store: {err:?}");
+        }
+    }
 
     stores.add_store("file".to_string(), Box::new(file_secret_store));
 

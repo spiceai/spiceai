@@ -2,6 +2,7 @@ use std::io::Read;
 use std::{collections::HashMap, fs::File};
 
 use dirs;
+use serde::Deserialize;
 use snafu::prelude::*;
 
 use super::{
@@ -11,8 +12,17 @@ use super::{
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+#[allow(clippy::module_name_repetitions)]
+pub type AuthConfigs = HashMap<String, AuthConfig>;
+
+#[allow(clippy::module_name_repetitions)]
+#[derive(Default, Deserialize, Clone)]
+pub struct AuthConfig {
+    pub params: HashMap<String, String>,
+}
+
 pub struct FileSecretStore {
-    secrets: HashMap<String, String>,
+    secrets: HashMap<String, HashMap<String, String>>,
 }
 
 impl FileSecretStore {
@@ -31,10 +41,10 @@ impl SecretStore for FileSecretStore {
             auth
         } else {
             tracing::trace!("No secret found for key {}", key);
-            return Secret::new();
+            return Secret::new(HashMap::new());
         };
 
-        Secret::new()
+        Secret::new(secret.clone())
     }
 
     fn init(&mut self) -> Result<()> {
@@ -47,8 +57,13 @@ impl SecretStore for FileSecretStore {
             .read_to_string(&mut auth_contents)
             .context(UnableToReadAuthFileSnafu)?;
 
-        self.secrets = toml::from_str::<HashMap<String, String>>(&auth_contents)
-            .context(UnableToParseAuthFileSnafu)?;
+        let auth_configs =
+            toml::from_str::<AuthConfigs>(&auth_contents).context(UnableToParseAuthFileSnafu)?;
+
+        self.secrets = auth_configs
+            .iter()
+            .map(|(k, v)| (k.clone(), v.params.clone()))
+            .collect();
 
         Ok(())
     }

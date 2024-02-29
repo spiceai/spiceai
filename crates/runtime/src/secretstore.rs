@@ -62,19 +62,17 @@ impl Secret {
         self.data.get(&key.to_string()).map(String::as_str)
     }
 
-    pub fn new() -> Self
+    pub fn new(data: HashMap<String, String>) -> Self
     where
         Self: Sized,
     {
-        Self {
-            data: HashMap::new(),
-        }
+        Self { data: data }
     }
 }
 
 pub trait SecretStore {
     fn get_secret(&self, key: &str) -> Secret {
-        Secret::new()
+        Secret::new(HashMap::new())
     }
     fn init(&mut self) -> Result<()> {
         Ok(())
