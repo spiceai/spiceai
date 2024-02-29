@@ -9,10 +9,10 @@ use crate::auth::AuthProvider;
 
 use super::DataConnector;
 
-pub struct Delta {}
+pub struct Databricks {}
 
 #[async_trait]
-impl DataConnector for Delta {
+impl DataConnector for Databricks {
     fn new(
         _auth_provider: AuthProvider,
         params: Arc<Option<HashMap<String, String>>>,
