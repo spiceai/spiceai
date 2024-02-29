@@ -1,13 +1,13 @@
-use std::fs::File;
+use std::{clone, fs::File};
 
-use arrow::record_batch::RecordBatch;
-use arrow_flight::{encode::FlightDataEncoderBuilder, FlightClient, FlightDescriptor, PutResult};
+use arrow_flight::{decode::FlightRecordBatchStream, encode::FlightDataEncoderBuilder, flight_descriptor::DescriptorType, flight_service_client::FlightServiceClient, FlightClient, FlightData, FlightDescriptor, PutResult, Ticket};
 use clap::Parser;
-use futures::stream::TryStreamExt;
+use futures::{stream::TryStreamExt, StreamExt};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use tonic::transport::Channel;
+use tonic::{transport::Channel, IntoRequest};
+use arrow::record_batch::RecordBatch;
 
-use tokio::time::{self, Duration};
+use tokio::time::{self, error::Elapsed, Duration};
 
 #[derive(Parser)]
 #[clap(about = "Spice.ai Flight Publisher Utility")]
@@ -27,20 +27,43 @@ pub struct Args {
     pub path: String,
 }
 
+
+async fn get_test_batch(query: &str) -> RecordBatch{
+    let channel = Channel::from_static("https://flight.spiceai.io").connect().await.unwrap();
+    let mut client = FlightClient::new(channel);
+
+    let _ = client.add_header("Authorization", "Bearer 313834|0666ecca421b4b33ba4d0dd2e90d6daa");
+
+    let req = FlightDescriptor::new_cmd(query.to_string());
+
+    let flight_info = client.get_flight_info(req).await.unwrap();
+
+    let ticket = flight_info.endpoint[0]
+        // Extract the ticket
+        .ticket
+        .clone()
+        .expect("expected ticket");
+
+    let mut data_stream =  client.do_get(ticket).await.expect("error fetching data");
+
+    let res = data_stream.next().await.unwrap();
+
+    match res {
+        Ok(batch) => {          
+            return batch;
+        },
+        Err(e) => {
+            /* handle error */
+            panic!("Error while processing Flight data stream: {}", e)
+        },
+    }
+
+}
+
 /// Reads a Parquet file and sends it via DoPut to an Apache Arrow Flight endpoint.
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-
-    let file = File::open(args.parquet_file)?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| e.to_string())?;
-
-    let mut reader = builder.build().map_err(|e| e.to_string())?;
-
-    let mut batches: Vec<RecordBatch> = vec![];
-    while let Some(Ok(batch)) = reader.next() {
-        batches.push(batch);
-    }
 
     // Set up the Flight client
     let channel = Channel::from_shared(args.flight_endpoint)?
@@ -50,15 +73,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let path = args.path;
 
-
     loop {
 
+        let batch = get_test_batch("SELECT number, hash, parent_hash, \"timestamp\" FROM goerli.blocks limit 100;").await;
+
         let flight_descriptor = FlightDescriptor::new_path(vec![path.clone()]);
+        let input_stream = futures::stream::iter(vec![Ok(batch)]);
+
         let flight_data_stream = FlightDataEncoderBuilder::new()
-        .with_flight_descriptor(Some(flight_descriptor))
-        .build(futures::stream::iter(
-            batches.clone().into_iter().map(Ok).collect::<Vec<_>>(),
-        ));
+            .with_flight_descriptor(Some(flight_descriptor))
+            .build(input_stream);
+
 
         let _response: Vec<PutResult> = client
             .do_put(flight_data_stream)
@@ -72,7 +97,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
         time::sleep(Duration::from_secs(3)).await;
     }
-    
 
     Ok(())
 }
