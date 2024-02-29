@@ -3,6 +3,7 @@ use std::sync::Arc;
 use arrow::array::ArrayBuilder;
 use arrow::array::ArrayRef;
 use arrow::array::RecordBatch;
+use arrow::array::RecordBatchOptions;
 use arrow::datatypes::DataType;
 use arrow::datatypes::Field;
 use arrow::datatypes::Schema;
@@ -212,7 +213,8 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
         .map(|mut builder| builder.finish())
         .collect::<Vec<ArrayRef>>();
 
-    match RecordBatch::try_new(Arc::new(Schema::new(arrow_fields)), columns) {
+    let options = &RecordBatchOptions::new().with_row_count(Some(rows.len()));
+    match RecordBatch::try_new_with_options(Arc::new(Schema::new(arrow_fields)), columns, options) {
         Ok(record_batch) => Ok(record_batch),
         Err(e) => Err(e).context(FailedToBuildRecordBatchSnafu),
     }

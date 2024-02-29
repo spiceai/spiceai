@@ -45,11 +45,12 @@ impl
         let rows = tokio::task::block_in_place(move || {
             Handle::current().block_on(async {
                 self.conn
-                    .query(&format!("SELECT * FROM {table_reference} LIMIT 0"), &[])
+                    .query(&format!("SELECT * FROM {table_reference} LIMIT 1"), &[])
                     .await
             })
         })
         .context(QuerySnafu)?;
+        tracing::error!("rows: {:?}", rows);
         let rec = rows_to_arrow(rows.as_slice()).context(ConversionSnafu)?;
         let schema = rec.schema();
         Ok(schema)
