@@ -7,6 +7,8 @@ use app::App;
 use config::Config;
 use model::Model;
 pub use notify::Error as NotifyError;
+use object_store::aws::{AmazonS3Builder, AwsCredential, AwsCredentialProvider};
+use object_store::CredentialProvider;
 use snafu::prelude::*;
 use spicepod::component::dataset::Dataset;
 use spicepod::component::dataset::Mode;
@@ -231,6 +233,14 @@ impl Runtime {
                         data_connector: source,
                     })?,
             ))),
+            "minio" => {
+                let p = auth.get(source);
+                match dataconnector::aws::from_auth_provider(p).await {
+                    Ok(pp) => tracing::warn!(" auth provider: {:?}", pp),
+                    Err(e) => tracing::warn!("Empty minio auth provider: {:#?}", e),
+                };
+                Ok(Some(Box::new(dataconnector::debug::DebugSource {})))
+            }
             "localhost" => Ok(None),
             "debug" => Ok(Some(Box::new(dataconnector::debug::DebugSource {}))),
             _ => UnknownDataConnectorSnafu {

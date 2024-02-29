@@ -1,3 +1,7 @@
+use snafu::prelude::*;
+use crate::auth::AuthProvider;
+use object_store::aws::AwsCredential;
+
 use aws_config::meta::credentials::CredentialsProviderChain;
 use aws_config::profile::ProfileFileCredentialsProvider;
 use aws_config::BehaviorVersion;
@@ -6,15 +10,19 @@ use aws_config::default_provider::credentials::DefaultCredentialsChain;
 use crate::auth::AuthProvider;
 
 
-fn from_auth_provider(auth: Optional<AuthProvider>) -> Option<SharedCredentialsProvider> {
-    match cfg {
-        Ok(cfg) => {
-            // ProfileFileCredentialsProvider::builder().build();
-            // CredentialsProviderChain::first_try(name, provider)
-            // .with_custom_credential_source().profile_name(name).region(region).;
-            let cred_builder = DefaultCredentialsChain::builder().build(); 
-            cred_builder.build()
-        }
-        None() => None
-    }
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display("No AWS access secret provided for credentials"))]
+    NoAccessSecret ,
+
+    #[snafu(display("No AWS access key provided for credentials"))]
+    NoAccessKey ,
+}
+
+pub async fn from_auth_provider(auth: AuthProvider) -> Result<AwsCredential, Error> {
+    Ok(AwsCredential {
+        key_id: auth.get_param("key").context(NoAccessKeySnafu)?.to_string(),
+        secret_key: auth.get_param("secret").context(NoAccessSecretSnafu)?.to_string(),
+        token: None
+    })
 }

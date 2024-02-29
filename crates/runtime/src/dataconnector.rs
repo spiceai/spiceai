@@ -21,6 +21,7 @@ pub mod debug;
 pub mod dremio;
 pub mod flight;
 pub mod spiceai;
+pub mod aws;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
