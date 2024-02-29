@@ -51,12 +51,6 @@ pub enum Error {
     #[snafu(display("Unable to create data backend: {source}"))]
     UnableToCreateBackend { source: datafusion::Error },
 
-    #[snafu(display("Unable to attach data source {data_source}: {source}"))]
-    UnableToAttachDataSource {
-        source: datafusion::Error,
-        data_source: String,
-    },
-
     #[snafu(display("Unable to attach view: {source}"))]
     UnableToAttachView { source: datafusion::Error },
 
@@ -272,7 +266,9 @@ impl Runtime {
                     .await
                     .attach_mesh(ds, data_connector)
                     .await
-                    .context(UnableToAttachViewSnafu)?;
+                    .context(UnableToAttachDataConnectorSnafu {
+                        data_connector: source,
+                    })?;
                 return Ok(());
             }
         }
