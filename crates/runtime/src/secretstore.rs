@@ -71,32 +71,11 @@ impl Secret {
 }
 
 pub trait SecretStore {
-    fn get_secret(&self, key: &str) -> Secret {
+    fn get_secret(&self, _: &str) -> Secret {
         Secret::new(HashMap::new())
     }
+
     fn init(&mut self) -> Result<()> {
         Ok(())
     }
 }
-
-// #[allow(clippy::module_name_repetitions)]
-// pub struct SecretStore {
-//     pub secrets: HashMap<String, Secret>,
-// }
-
-// impl SecretStore {
-//     #[must_use]
-//     pub fn new() -> Self
-//     where
-//         Self: Sized,
-//     {
-//         Self {
-//             secrets: HashMap::new(),
-//         }
-//     }
-
-//     #[must_use]
-//     pub fn get(&self, key: &str) -> Option<Secret> {
-//         self.secrets.get(&key.to_string()).cloned()
-//     }
-// }

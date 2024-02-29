@@ -1,10 +1,10 @@
-use keyring::{Entry, Result};
+use keyring::Result;
 
 pub struct KeyringSecretStore;
 
 impl KeyringSecretStore {
     fn get(&self, name: &str) -> Result<()> {
-        let entry = Entry::new(name, "my_app");
+        // let entry = Entry::new(name, "my_app");
 
         Ok(())
     }

@@ -122,10 +122,6 @@ impl Runtime {
         }
     }
 
-    pub async fn init(&self) {
-        *self.secret_stores.write().await = initialize_secret_stores();
-    }
-
     pub async fn load_datasets(&self) {
         let app_lock = self.app.read().await;
         if let Some(app) = app_lock.as_ref() {
@@ -146,25 +142,27 @@ impl Runtime {
             Some(ref auth) => auth.secret_store.clone(),
             None => "file".to_string(),
         };
-        let secret_key = match ds.auth {
-            Some(ref auth) => auth.secret_key.clone(),
-            None => "".to_string(),
-        };
 
         tokio::spawn(async move {
             loop {
                 let source = ds.source();
+                let secret_key = match ds.auth {
+                    Some(ref auth) => auth.secret_key.clone(),
+                    None => source.clone(),
+                };
+
                 let secret_stores = shared_secret_stores.read().await;
 
                 let secret_store =
                     match secret_stores.get_store(&secret_store_key).ok_or_else(|| {
                         UnableToLoadSecretStoreSnafu {
-                            secret_store: source.clone(),
+                            secret_store: secret_key.clone(),
                         }
                     }) {
                         Ok(s) => s,
-                        Err(e) => {
-                            continue;
+                        Err(_) => {
+                            tracing::error!("Unable to load secret store: {:?}", ds.auth);
+                            break;
                         }
                     };
 
@@ -172,7 +170,7 @@ impl Runtime {
                 let data_connector: Option<Box<dyn DataConnector + Send>> =
                     match Runtime::get_dataconnector_from_source(
                         &source,
-                        &secret_store.get_secret(source.as_str()),
+                        &secret_store.get_secret(secret_key.as_str().clone()),
                         Arc::clone(&params),
                     )
                     .await
@@ -366,18 +364,19 @@ impl Runtime {
         tracing::info!("Loading model [{}] from {}...", m.name, m.from);
         let mut model_map = self.models.write().await;
 
+        let source = model::source(&m.from);
         let secret_stores = self.secret_stores.read().await;
         let secret_store =
             match secret_stores
                 .get_store("files")
                 .ok_or_else(|| UnableToLoadSecretStoreSnafu {
-                    secret_store: model::source(&m.from).as_str().to_string(),
+                    secret_store: source.clone(),
                 }) {
                 Ok(s) => s,
-                Err(e) => return,
+                Err(_) => return,
             };
 
-        match Model::load(m, secret_store.get_secret(model::source(&m.from).as_str())).await {
+        match Model::load(m, secret_store.get_secret(source.as_str())).await {
             Ok(in_m) => {
                 model_map.insert(m.name.clone(), in_m);
                 tracing::info!("Model [{}] deployed, ready for inferencing", m.name);
