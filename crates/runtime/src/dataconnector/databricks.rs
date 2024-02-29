@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use datafusion::execution::context::SessionContext;
+use deltalake::aws::storage::s3_constants::AWS_S3_ALLOW_UNSAFE_RENAME;
 use deltalake::protocol::SaveMode;
 use deltalake::{open_table_with_storage_options, DeltaOps};
 use serde::Deserialize;
@@ -133,6 +134,7 @@ async fn get_delta_table(
         }
         storage_options.insert(key.to_string(), value.to_string());
     }
+    storage_options.insert(AWS_S3_ALLOW_UNSAFE_RENAME.to_string(), "true".to_string());
 
     let delta_table = open_table_with_storage_options(table_uri, storage_options)
         .await
