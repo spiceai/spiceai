@@ -83,11 +83,6 @@ impl InsertTableBuilder {
         insert_stmt: &mut InsertStatement,
         record_batch: &RecordBatch,
     ) {
-        let num = "2.02";
-        let val = Decimal::from_str(num).unwrap();
-        let v: Value = val.into();
-        let out: Decimal = v.unwrap();
-        assert_eq!(out.to_string(), num);
         for row in 0..record_batch.num_rows() {
             let mut row_values: Vec<SimpleExpr> = vec![];
             for col in 0..record_batch.num_columns() {

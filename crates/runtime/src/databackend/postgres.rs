@@ -214,6 +214,8 @@ impl<'a> PostgresUpdate<'a> {
             .execute(&sql, &[])
             .context(DbConnectionSnafu)?;
 
+        self.insert_batch(batch)?;
+
         Ok(())
     }
 

@@ -50,7 +50,6 @@ impl
             })
         })
         .context(QuerySnafu)?;
-        tracing::error!("rows: {:?}", rows);
         let rec = rows_to_arrow(rows.as_slice()).context(ConversionSnafu)?;
         let schema = rec.schema();
         Ok(schema)
