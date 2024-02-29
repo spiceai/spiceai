@@ -7,6 +7,8 @@ use futures::stream::TryStreamExt;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use tonic::transport::Channel;
 
+use tokio::time::{self, Duration};
+
 #[derive(Parser)]
 #[clap(about = "Spice.ai Flight Publisher Utility")]
 pub struct Args {
@@ -21,7 +23,7 @@ pub struct Args {
     )]
     pub flight_endpoint: String,
 
-    #[arg(long, value_name = "DATASET_PATH", default_value = "test")]
+    #[arg(long, value_name = "DATASET_PATH", default_value = "databricks_demo_accelerated")]
     pub path: String,
 }
 
@@ -46,22 +48,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     let mut client = FlightClient::new(channel);
 
-    let flight_descriptor = FlightDescriptor::new_path(vec![args.path]);
-    let flight_data_stream = FlightDataEncoderBuilder::new()
+    let path = args.path;
+
+
+    loop {
+
+        let flight_descriptor = FlightDescriptor::new_path(vec![path.clone()]);
+        let flight_data_stream = FlightDataEncoderBuilder::new()
         .with_flight_descriptor(Some(flight_descriptor))
         .build(futures::stream::iter(
-            batches.into_iter().map(Ok).collect::<Vec<_>>(),
+            batches.clone().into_iter().map(Ok).collect::<Vec<_>>(),
         ));
 
-    let _response: Vec<PutResult> = client
-        .do_put(flight_data_stream)
-        .await
-        .map_err(|e| e.to_string())?
-        .try_collect()
-        .await
-        .map_err(|e| e.to_string())?;
+        let _response: Vec<PutResult> = client
+            .do_put(flight_data_stream)
+            .await
+            .map_err(|e| e.to_string())?
+            .try_collect()
+            .await
+            .map_err(|e| e.to_string())?;
 
-    println!("Data sent to Apache Arrow Flight endpoint.");
+        println!("Data sent to Apache Arrow Flight endpoint.");
+    
+        time::sleep(Duration::from_secs(3)).await;
+    }
+    
 
     Ok(())
 }
