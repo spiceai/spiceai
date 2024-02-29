@@ -1,20 +1,19 @@
-use std::fs::File;
 use std::io::Read;
+use std::{collections::HashMap, fs::File};
 
 use app::Result;
 use dirs;
 use snafu::prelude::*;
 
 use super::{
-    AuthConfigs, AuthProvider, UnableToFindHomeDirSnafu, UnableToOpenAuthFileSnafu,
-    UnableToParseAuthFileSnafu, UnableToReadAuthFileSnafu,
+    Secret, UnableToFindHomeDirSnafu, UnableToOpenAuthFileSnafu, UnableToParseAuthFileSnafu,
+    UnableToReadAuthFileSnafu,
 };
-use crate::secretstore::AuthConfig;
 
 // pub type Result<T, E = dyn Error> = std::result::Result<T, E>;
 
 pub struct FileSecretStore {
-    auth_configs: AuthConfigs,
+    secrets: HashMap<String, String>,
 }
 
 impl FileSecretStore {
@@ -25,7 +24,7 @@ impl FileSecretStore {
             auth
         } else {
             tracing::trace!("No secret found for key {}", key);
-            return Secret::new(AuthConfig::default());
+            return Secret::new();
         };
 
         Secret::new(auth.clone())
@@ -41,8 +40,8 @@ impl FileSecretStore {
             .read_to_string(&mut auth_contents)
             .context(UnableToReadAuthFileSnafu)?;
 
-        self.auth_configs =
-            toml::from_str::<AuthConfigs>(&auth_contents).context(UnableToParseAuthFileSnafu)?;
+        self.secrets = toml::from_str::<HashMap<String, String>>(&auth_contents)
+            .context(UnableToParseAuthFileSnafu)?;
 
         Ok(())
     }

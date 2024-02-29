@@ -27,11 +27,6 @@ pub struct SecretStores {
     pub stores: HashMap<String, SecretStore>,
 }
 
-#[derive(Default, Clone)]
-pub struct AuthConfig {
-    pub params: HashMap<String, String>,
-}
-
 #[allow(clippy::module_name_repetitions)]
 #[derive(Default, Deserialize, Clone)]
 pub struct Secret {
@@ -56,8 +51,6 @@ impl SecretStore {
 
     #[must_use]
     pub fn get_secret(&self, key: &str) -> Option<&str> {
-        self.secrets
-            .get(&key.to_string())
-            .map(String::as_str)
+        self.secrets.get(&key.to_string()).map(String::as_str)
     }
 }
