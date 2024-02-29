@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
+use datafusion::execution::context::SessionContext;
 use futures::stream;
 use snafu::prelude::*;
 use spicepod::component::dataset::acceleration::RefreshMode;
@@ -88,6 +89,7 @@ pub trait DataConnector: Send + Sync {
 
     async fn get_table_provider(
         &self,
+        sessionContext: Arc<SessionContext>,
         dataset: &Dataset,
     ) -> Result<Arc<dyn TableProvider + 'static>> {
         panic!("get_table_provider not implemented for {}", dataset.name)

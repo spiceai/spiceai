@@ -57,19 +57,19 @@ impl DataConnector for Dremio {
         true
     }
 
-    async fn get_table_provider(
-        &self,
-        dataset: &Dataset,
-    ) -> std::result::Result<Arc<dyn datafusion::datasource::TableProvider>, super::Error> {
-        let dremio_path = dataset.path();
+    // async fn get_table_provider(
+    //     &self,
+    //     dataset: &Dataset,
+    // ) -> std::result::Result<Arc<dyn datafusion::datasource::TableProvider>, super::Error> {
+    //     let dremio_path = dataset.path();
 
-        let provider = FlightTable::new(self.flight.client.clone(), dremio_path).await;
+    //     let provider = FlightTable::new(self.flight.client.clone(), dremio_path).await;
 
-        match provider {
-            Ok(provider) => Ok(Arc::new(provider)),
-            Err(error) => Err(super::Error::UnableToGetTableProvider {
-                source: error.into(),
-            }),
-        }
-    }
+    //     match provider {
+    //         Ok(provider) => Ok(Arc::new(provider)),
+    //         Err(error) => Err(super::Error::UnableToGetTableProvider {
+    //             source: error.into(),
+    //         }),
+    //     }
+    // }
 }

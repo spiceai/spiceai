@@ -245,7 +245,7 @@ impl DataFusion {
             return TableAlreadyExistsSnafu.fail();
         }
 
-        let provider = data_connector.get_table_provider(dataset).await;
+        let provider = data_connector.get_table_provider(self.ctx.clone(), dataset).await;
 
         match provider {
             Ok(provider) => {
