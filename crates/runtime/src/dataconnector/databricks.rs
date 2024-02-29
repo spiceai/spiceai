@@ -60,12 +60,6 @@ impl DataConnector for Databricks {
             }
             storage_options.insert(key.to_string(), value.to_string());
         }
-        // TODO: Figure out a way to avoid this default hashmap
-        let default_hashmap = HashMap::new();
-        for (key, value) in self.params.as_ref().as_ref().unwrap_or(&default_hashmap) {
-            storage_options.insert(key.to_string(), value.to_string());
-        }
-        drop(default_hashmap);
 
         let delta_table: deltalake::DeltaTable =
             open_table_with_storage_options(table_uri, storage_options)
