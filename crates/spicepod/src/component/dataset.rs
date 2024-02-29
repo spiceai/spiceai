@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use super::WithDependsOn;
 use snafu::prelude::*;
 
+use crate::component::auth;
+
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Unable to load SQL file {file}: {source}"))]
@@ -46,6 +48,9 @@ pub struct Dataset {
     pub params: Option<HashMap<String, String>>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<auth::Auth>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replication: Option<replication::Replication>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -66,6 +71,7 @@ impl Dataset {
             sql: None,
             sql_ref: None,
             params: Option::default(),
+            auth: None,
             replication: None,
             acceleration: None,
             depends_on: Vec::default(),
@@ -183,6 +189,7 @@ impl WithDependsOn<Dataset> for Dataset {
             sql: self.sql.clone(),
             sql_ref: self.sql_ref.clone(),
             params: self.params.clone(),
+            auth: self.auth.clone(),
             replication: self.replication.clone(),
             acceleration: self.acceleration.clone(),
             depends_on: depends_on.to_vec(),

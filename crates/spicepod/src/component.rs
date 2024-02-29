@@ -5,6 +5,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use snafu::prelude::*;
 
 use crate::reader;
+pub mod auth;
 pub mod dataset;
 pub mod model;
 
