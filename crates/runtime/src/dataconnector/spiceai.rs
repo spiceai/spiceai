@@ -64,7 +64,7 @@ impl DataConnector for SpiceAI {
             let flight_client = FlightClient::new(
                 url.as_str(),
                 "",
-                auth_secret.get_param("key").unwrap_or_default(),
+                auth_secret.get_secret("key").unwrap_or_default(),
             )
             .await
             .map_err(|e| super::Error::UnableToCreateDataConnector { source: e.into() })?;

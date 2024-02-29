@@ -213,19 +213,19 @@ impl Runtime {
 
     async fn get_dataconnector_from_source(
         source: &str,
-        secrets: &HashMap<String, secretstore::SecretStore>,
+        secret_stores: &HashMap<String, secretstore::SecretStore>,
         params: Arc<Option<HashMap<String, String>>>,
     ) -> Result<Option<Box<dyn DataConnector + Send>>> {
         match source {
             "spiceai" => Ok(Some(Box::new(
-                dataconnector::spiceai::SpiceAI::new(secrets.get(source), params)
+                dataconnector::spiceai::SpiceAI::new(secret_stores.get(source), params)
                     .await
                     .context(UnableToInitializeDataConnectorSnafu {
                         data_connector: source,
                     })?,
             ))),
             "dremio" => Ok(Some(Box::new(
-                dataconnector::dremio::Dremio::new(secrets.get(source), params)
+                dataconnector::dremio::Dremio::new(secret_stores.get(source), params)
                     .await
                     .context(UnableToInitializeDataConnectorSnafu {
                         data_connector: source,

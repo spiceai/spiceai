@@ -57,7 +57,7 @@ impl SecretStore {
     }
 
     #[must_use]
-    pub fn get_secret(&self, key: &str) -> Option<&str> {
+    pub fn get(&self, key: &str) -> Option<&str> {
         self.secrets.get(&key.to_string()).map(String::as_str)
     }
 }
