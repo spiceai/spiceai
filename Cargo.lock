@@ -4568,6 +4568,7 @@ dependencies = [
  "app",
  "clap",
  "flightrepl",
+ "keyring",
  "metrics",
  "metrics-exporter-prometheus",
  "runtime",

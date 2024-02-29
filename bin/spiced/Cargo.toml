@@ -20,6 +20,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus = "0.13.0"
+keyring = "2.3.2"
 
 [features]
 release = []
