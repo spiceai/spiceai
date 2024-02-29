@@ -70,7 +70,7 @@ impl
         Ok(Box::pin(MemoryStream::try_new(recs, schema, None)?))
     }
 
-    fn execute(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<u64> {
+    fn execute(&self, _sql: &str, _params: &[&(dyn ToSql + Sync)]) -> Result<u64> {
         todo!()
     }
 
