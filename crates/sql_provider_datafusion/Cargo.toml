@@ -19,6 +19,8 @@ snafu.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 futures.workspace = true
+bb8 = "0.7"
+bb8-postgres = "0.7"
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }

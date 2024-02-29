@@ -4,6 +4,7 @@ use crate::dbconnection::DbConnection;
 use async_trait::async_trait;
 
 pub mod duckdbpool;
+pub mod postgrespool;
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 type Result<T, E = Error> = std::result::Result<T, E>;
