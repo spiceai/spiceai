@@ -231,6 +231,13 @@ impl Runtime {
                         data_connector: source,
                     })?,
             ))),
+            "databricks" => Ok(Some(Box::new(
+                dataconnector::databricks::Databricks::new(auth.get(source), params)
+                    .await
+                    .context(UnableToInitializeDataConnectorSnafu {
+                        data_connector: source,
+                    })?,
+            ))),
             "localhost" => Ok(None),
             "debug" => Ok(Some(Box::new(dataconnector::debug::DebugSource {}))),
             _ => UnknownDataConnectorSnafu {

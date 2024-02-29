@@ -1,8 +1,11 @@
 use async_trait::async_trait;
 use deltalake::open_table_with_storage_options;
+use snafu::prelude::*;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::{collections::HashMap, future::Future};
+
+use deltalake::aws::storage::s3_constants::{AWS_ACCESS_KEY_ID, AWS_REGION, AWS_SECRET_ACCESS_KEY};
 
 use spicepod::component::dataset::Dataset;
 
@@ -24,6 +27,8 @@ impl DataConnector for Databricks {
     where
         Self: Sized,
     {
+        // Needed to be able to load the s3:// scheme
+        deltalake::aws::register_handlers(None);
         Box::pin(async move {
             Ok(Self {
                 auth_provider,
@@ -36,14 +41,11 @@ impl DataConnector for Databricks {
         &self,
         _dataset: &Dataset,
     ) -> Pin<Box<dyn Future<Output = Vec<arrow::record_batch::RecordBatch>> + Send>> {
-        let table_uri = "s3://databricks-workspace-stack-f0780-bucket/unity-catalog/686830279408652/__unitystorage/catalogs/1c3649de-309b-4c73-805e-8cf93aa4ee25/tables/d8f8978b-565d-4322-9ef2-15f4c431f8f0";
-        let _table = open_table_with_storage_options(table_uri, HashMap::new());
-
         unimplemented!()
     }
 
     fn has_table_provider(&self) -> bool {
-        false
+        true
     }
 
     async fn get_table_provider(
