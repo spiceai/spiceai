@@ -27,7 +27,7 @@ pub enum Error {
 }
 
 pub struct S3 {
-    _s3: Arc<AmazonS3>,
+    s3: Arc<AmazonS3>,
 }
 impl S3 {
     #[must_use]
@@ -52,7 +52,9 @@ impl DataConnector for S3 {
         Self: Sized,
     {
         Box::pin(async move {
-            let mut s3_builder = AmazonS3Builder::new().with_bucket_name("").with_allow_http(true);
+            let mut s3_builder = AmazonS3Builder::new()
+                .with_bucket_name("mldataplatform")
+                .with_allow_http(true);
 
             if let Some(region) = Self::get_from_params(&params, "region") {
                 s3_builder = s3_builder.with_region(region);
@@ -71,8 +73,23 @@ impl DataConnector for S3 {
                 .build()
                 .map_err(|e| super::Error::UnableToCreateDataConnector { source: e.into() })?;
 
-            Ok(Self { _s3: Arc::new(s3) })
+            Ok(Self { s3: Arc::new(s3) })
         })
+    }
+
+    fn has_object_store(&self) -> bool {
+        true
+    }
+
+    fn get_object_store(
+        &self,
+        dataset: &Dataset,
+    ) -> std::result::Result<(Url, Arc<dyn object_store::ObjectStore + 'static>), super::Error>
+    {
+        let s3_url = Url::parse(&dataset.from)
+            .map_err(|e| super::Error::UnableToGetTableProvider { source: e.into() })?;
+
+        Ok((s3_url, self.s3.clone()))
     }
 
     fn supports_data_streaming(&self, _dataset: &Dataset) -> bool {
@@ -118,7 +135,7 @@ impl DataConnector for S3 {
 
         let _ = ctx
             .runtime_env()
-            .register_object_store(&url, self._s3.clone());
+            .register_object_store(&url, self.s3.clone());
 
         let df = ctx
             .read_parquet(&dataset.from, ParquetReadOptions::default())
