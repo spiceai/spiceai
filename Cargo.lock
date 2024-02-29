@@ -4067,6 +4067,7 @@ dependencies = [
  "async-trait",
  "datafusion",
  "duckdb",
+ "futures",
  "r2d2",
  "snafu 0.8.0",
  "tokio",

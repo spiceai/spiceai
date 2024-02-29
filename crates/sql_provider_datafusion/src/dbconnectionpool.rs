@@ -1,6 +1,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use crate::dbconnection::DbConnection;
+use async_trait::async_trait;
 
 pub mod duckdbpool;
 
@@ -12,9 +13,14 @@ pub enum Mode {
     File,
 }
 
+#[async_trait]
 pub trait DbConnectionPool<T, P: 'static> {
-    fn new(name: &str, mode: Mode, params: Arc<Option<HashMap<String, String>>>) -> Result<Self>
+    async fn new(
+        name: &str,
+        mode: Mode,
+        params: Arc<Option<HashMap<String, String>>>,
+    ) -> Result<Self>
     where
         Self: Sized;
-    fn connect(&self) -> Result<Box<dyn DbConnection<T, P>>>;
+    async fn connect(&self) -> Result<Box<dyn DbConnection<T, P>>>;
 }
