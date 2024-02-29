@@ -47,9 +47,9 @@ spice dataset configure
 
 		params := map[string]string{}
 		datasetPrefix := strings.Split(datasetLocation, ":")[0]
-		if datasetPrefix == api.DATA_SOURCE_DREMIO || datasetPrefix == api.DATA_SOURCE_DATABRICKS {
+		if datasetPrefix == api.DATA_SOURCE_DREMIO {
 
-			cmd.Printf("\nWhat is your %s endpoint?", datasetPrefix)
+			cmd.Printf("\nWhat is your %s endpoint? ", datasetPrefix)
 			endpoint, err := reader.ReadString('\n')
 			if err != nil {
 				cmd.Println(err.Error())
@@ -58,6 +58,16 @@ spice dataset configure
 			endpoint = strings.TrimSuffix(endpoint, "\n")
 
 			params["endpoint"] = endpoint
+		} else if datasetPrefix == api.DATA_SOURCE_DATABRICKS {
+			cmd.Printf("What is your %s table uri? ", datasetPrefix)
+			endpoint, err := reader.ReadString('\n')
+			if err != nil {
+				cmd.Println(err.Error())
+				os.Exit(1)
+			}
+			endpoint = strings.TrimSuffix(endpoint, "\n")
+
+			params["table_uri"] = endpoint
 		}
 
 		cmd.Print("\nLocally accelerate this dataset (y/n)? ")
