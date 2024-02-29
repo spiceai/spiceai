@@ -32,6 +32,7 @@ impl DataConnector for Databricks {
     {
         // Needed to be able to load the s3:// scheme
         deltalake::aws::register_handlers(None);
+        deltalake::azure::register_handlers(None);
         Box::pin(async move { Ok(Self { auth_provider }) })
     }
 
@@ -127,7 +128,7 @@ async fn get_delta_table(
 
     let mut storage_options = HashMap::new();
     for (key, value) in auth_provider.iter() {
-        if !key.starts_with("AWS_") {
+        if key == "token" {
             continue;
         }
         storage_options.insert(key.to_string(), value.to_string());
