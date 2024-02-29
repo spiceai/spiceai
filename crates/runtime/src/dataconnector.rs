@@ -1,13 +1,14 @@
 use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
-use datafusion::execution::context::SessionContext;
 use futures::stream;
+use object_store::ObjectStore;
 use snafu::prelude::*;
 use spicepod::component::dataset::acceleration::RefreshMode;
 use spicepod::component::dataset::Dataset;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
+use url::Url;
 
 use arrow::record_batch::RecordBatch;
 use async_stream::stream;
@@ -87,9 +88,19 @@ pub trait DataConnector: Send + Sync {
         false
     }
 
+    fn has_object_store(&self) -> bool {
+        false
+    }
+
+    fn get_object_store(
+        &self,
+        dataset: &Dataset,
+    ) -> std::result::Result<(Url, Arc<dyn ObjectStore + 'static>), Error> {
+        panic!("get_object_store not implemented for {}", dataset.name)
+    }
+
     async fn get_table_provider(
         &self,
-        sessionContext: Arc<SessionContext>,
         dataset: &Dataset,
     ) -> Result<Arc<dyn TableProvider + 'static>> {
         panic!("get_table_provider not implemented for {}", dataset.name)

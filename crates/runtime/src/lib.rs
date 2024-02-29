@@ -232,8 +232,9 @@ impl Runtime {
                     })?,
             ))),
             "s3" => Ok(Some(Box::new(
-                dataconnector::s3::S3::new(auth.get(source), params).await.context(
-                    UnableToInitializeDataConnectorSnafu {
+                dataconnector::s3::S3::new(auth.get(source), params)
+                    .await
+                    .context(UnableToInitializeDataConnectorSnafu {
                         data_connector: source,
                     })?,
             ))),

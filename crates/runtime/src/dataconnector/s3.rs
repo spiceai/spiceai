@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::options::ParquetReadOptions;
 use object_store::aws::AmazonS3Builder;
+use object_store::ObjectStore;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::{collections::HashMap, future::Future};
@@ -22,6 +23,9 @@ pub enum Error {
 
     #[snafu(display("No AWS access key provided for credentials"))]
     NoAccessKey,
+
+    #[snafu(display("Unable to parse URL: {url}"))]
+    UnableToParseURL { url: String },
 }
 
 pub struct S3 {
@@ -71,16 +75,15 @@ impl DataConnector for S3 {
         true
     }
 
-    async fn get_table_provider(
-        &self,
-        ctx: Arc<SessionContext>,
-        dataset: &Dataset,
-    ) -> std::result::Result<Arc<dyn datafusion::datasource::TableProvider>, super::Error> {
-        // the region must be set to the region where the bucket exists until the following
-        // issue is resolved
-        // https://github.com/apache/arrow-rs/issues/2795
-        let region = "";
+    fn has_object_store(&self) -> bool {
+        true
+    }
 
+    fn get_object_store(
+        &self,
+        dataset: &Dataset,
+    ) -> std::result::Result<(Url, Arc<dyn ObjectStore + 'static>), super::Error> {
+        let region = "";
         let s3 = AmazonS3Builder::new()
             .with_region(region)
             .with_bucket_name("mldataplatform")
@@ -89,27 +92,36 @@ impl DataConnector for S3 {
             .with_endpoint("http://localhost:9000")
             .with_allow_http(true)
             .build()
-            .unwrap();
+            .map_err(|e| super::Error::UnableToCreateDataConnector { source: e.into() })?;
+        let path = dataset.path();
 
-        let path = format!("s3://mldataplatform");
-        let s3_url = Url::parse(&path).unwrap();
-        tracing::info!("Registering object store: {s3_url}");
-        ctx.runtime_env()
-            .register_object_store(&s3_url, Arc::new(s3));
+        let path = format!("s3:{path}");
+        let s3_url = Url::parse(&path)
+            .map_err(|e| super::Error::UnableToGetTableProvider { source: e.into() })?;
+
+        Ok((s3_url, Arc::new(s3)))
+    }
+
+    async fn get_table_provider(
+        &self,
+        dataset: &Dataset,
+    ) -> std::result::Result<Arc<dyn datafusion::datasource::TableProvider>, super::Error> {
+        let path = dataset.path();
+
+        let ctx = SessionContext::new();
+
+        let (url, store) = self
+            .get_object_store(dataset)
+            .map_err(|e| super::Error::UnableToGetTableProvider { source: e.into() })?;
+
+        let _ = ctx.runtime_env().register_object_store(&url, store);
 
         let df = ctx
-            .read_parquet(
-                "s3://mldataplatform/smart-stats/failures/failures_data.parquet",
-                ParquetReadOptions::default(),
-            )
-            .await;
+            .read_parquet(path, ParquetReadOptions::default())
+            .await
+            .map_err(|e| super::Error::UnableToGetTableProvider { source: e.into() })?;
 
-        // ctx.register_table("test", df.unwrap().into_view());
-
-        // let df = ctx.sql("SELECT * FROM test").await;
-        // tracing::info!("df: {:?}", df);
-
-        Ok(df.unwrap().into_view())
+        Ok(df.into_view())
     }
 }
 
