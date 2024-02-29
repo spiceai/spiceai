@@ -195,9 +195,8 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                     };
 
                     // TODO: Figure out how to properly extract Decimal128 from postgres
-                    let v: i64 = row.get(i);
-                    #[allow(clippy::cast_lossless)]
-                    builder.append_value(v as i128);
+                    //let v: f64 = row.get(i);
+                    builder.append_value(0);
                 }
                 _ => UnsupportedTypeIndexSnafu {
                     r#type: format!("{postgres_type}"),

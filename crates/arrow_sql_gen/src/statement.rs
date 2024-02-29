@@ -165,7 +165,9 @@ impl InsertTableBuilder {
                         let array = column.as_any().downcast_ref::<array::Decimal128Array>();
                         if let Some(valid_array) = array {
                             let value: i128 = valid_array.value(row);
-                            let decimal_value = Decimal::from_i128_with_scale(value, *scale as u32);
+                            let decimal_value =
+                                Decimal::try_from_i128_with_scale(value, *scale as u32)
+                                    .unwrap_or(Decimal::new(0, 0));
                             row_values.push(decimal_value.into());
                         }
                     }
