@@ -21,6 +21,9 @@ pub enum Error {
 
     #[snafu(display("No AWS access key provided for credentials"))]
     NoAccessKey,
+
+    #[snafu(display("Unable to parse URL: {url}"))]
+    UnableToParseURL { url: String },
 }
 
 pub struct S3 {
@@ -91,18 +94,19 @@ impl DataConnector for S3 {
         &self,
         dataset: &Dataset,
     ) -> std::result::Result<Arc<dyn datafusion::datasource::TableProvider>, super::Error> {
+        let path = dataset.path();
+
         let ctx = SessionContext::new();
 
-        let s3_url =
-            Url::parse(&dataset.from).map_err(|_| super::Error::UnableToGetTableProvider {
-                source: "unable to parse `from` field in spicepod as an S3 path".into(),
-            })?;
+        let url = Url::parse(&dataset.from)
+            .map_err(|e| super::Error::UnableToGetTableProvider { source: e.into() })?;
 
-        ctx.runtime_env()
-            .register_object_store(&s3_url, self._s3.clone());
+        let _ = ctx
+            .runtime_env()
+            .register_object_store(&url, self._s3.clone());
 
         let df = ctx
-            .read_parquet(&dataset.from, ParquetReadOptions::default())
+            .read_parquet(path, ParquetReadOptions::default())
             .await
             .map_err(|e| super::Error::UnableToGetTableProvider { source: e.into() })?;
 

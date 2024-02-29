@@ -36,19 +36,29 @@ pub enum Error {
     TableAlreadyExists {},
 
     #[snafu(display("Unable to get table: {source}"))]
-    DatasetConfigurationError { source: databackend::Error },
+    DatasetConfigurationError {
+        source: databackend::Error,
+    },
 
     #[snafu(display("Invalid configuration: {msg}"))]
-    InvalidConfiguration { msg: String },
+    InvalidConfiguration {
+        msg: String,
+    },
 
     #[snafu(display("Unable to create dataset acceleration: {source}"))]
-    UnableToCreateBackend { source: databackend::Error },
+    UnableToCreateBackend {
+        source: databackend::Error,
+    },
 
     #[snafu(display("Unable to create view: {reason}"))]
-    UnableToCreateView { reason: String },
+    UnableToCreateView {
+        reason: String,
+    },
 
     #[snafu(display("Unable to delete table: {reason}"))]
-    UnableToDeleteTable { reason: String },
+    UnableToDeleteTable {
+        reason: String,
+    },
 
     #[snafu(display("Unable to parse SQL: {source}"))]
     UnableToParseSql {
@@ -56,10 +66,14 @@ pub enum Error {
     },
 
     #[snafu(display("Unable to get table: {source}"))]
-    UnableToGetTable { source: DataFusionError },
+    UnableToGetTable {
+        source: DataFusionError,
+    },
 
     #[snafu(display("Unable to register table: {source}"))]
-    UnableToRegisterTable { source: crate::dataconnector::Error },
+    UnableToRegisterTable {
+        source: crate::dataconnector::Error,
+    },
 
     #[snafu(display("Unable to create view: {source}"))]
     InvalidSQLView {
@@ -68,6 +82,8 @@ pub enum Error {
 
     #[snafu(display("Expected a SQL view statement, received nothing."))]
     ExpectedSqlView,
+
+    InvalidObjectStore,
 }
 
 type PublisherList = Arc<RwLock<Vec<Arc<Box<dyn DataPublisher>>>>>;
@@ -240,6 +256,18 @@ impl DataFusion {
         data_connector: Box<dyn DataConnector>,
     ) -> Result<()> {
         let dataset = dataset.borrow();
+
+        if data_connector.has_object_store() {
+            let Ok((key, store)) = data_connector.get_object_store(dataset) else {
+                return Err(Error::InvalidObjectStore);
+            };
+
+            let _ = self
+                .ctx
+                .runtime_env()
+                .register_object_store(&key, Arc::clone(&store));
+        }
+
         let table_exists = self.ctx.table_exist(dataset.name.as_str()).unwrap_or(false);
         if table_exists {
             return TableAlreadyExistsSnafu.fail();
