@@ -123,7 +123,7 @@ async fn get_delta_table(
     auth_provider: AuthProvider,
     dataset: &Dataset,
 ) -> std::result::Result<deltalake::DeltaTable, super::Error> {
-    let table_uri = resolve_table_uri(dataset)
+    let table_uri = resolve_table_uri(dataset, &auth_provider)
         .await
         .context(super::UnableToGetTableProviderSnafu)?;
 
@@ -151,6 +151,7 @@ struct DatabricksTablesApiResponse {
 
 pub async fn resolve_table_uri(
     dataset: &Dataset,
+    auth_provider: &AuthProvider
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let endpoint = match &dataset.params {
         None => return Err("Dataset params not found".into()),
@@ -161,8 +162,6 @@ pub async fn resolve_table_uri(
     };
 
     let table_name = dataset.path();
-
-    let auth_provider = crate::load_auth_providers().get("databricks");
 
     let token = auth_provider
         .get_param("token")
@@ -181,7 +180,6 @@ pub async fn resolve_table_uri(
         let api_response: DatabricksTablesApiResponse = response.json().await?;
         Ok(api_response.storage_location)
     } else {
-        // Handle different status codes here if needed
         Err(format!(
             "Failed to retrieve databricks table URI. Status: {}",
             response.status()
