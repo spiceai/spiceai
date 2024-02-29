@@ -19,6 +19,7 @@ const (
 	apiKeyFlag     = "key"
 	usernameFlag   = "username"
 	passwordFlag   = "password"
+	token          = "token"
 	awsRegion      = "aws-region"
 	awsAccessKeyId = "aws-access-key-id"
 	awsSecret      = "aws-secret-access-key"
@@ -157,19 +158,19 @@ var databricksCmd = &cobra.Command{
 	Use:   "databricks",
 	Short: "Login to a Databricks instance",
 	Example: `
-spice login databricks --key <access-token> --aws-region <aws-region> --aws-access-key-id <aws-access-key-id> --aws-secret-access-key <aws-secret-access-key>
+spice login databricks --token <access-token> --aws-region <aws-region> --aws-access-key-id <aws-access-key-id> --aws-secret-access-key <aws-secret-access-key>
 
 # See more at: https://docs.spiceai.org/
 `,
 	Run: func(cmd *cobra.Command, args []string) {
 
-		key, err := cmd.Flags().GetString(apiKeyFlag)
+		token, err := cmd.Flags().GetString(token)
 		if err != nil {
 			cmd.Println(err.Error())
 			os.Exit(1)
 		}
 
-		if key == "" {
+		if token == "" {
 			cmd.Println("No Databricks Access Token provided, use --key")
 			os.Exit(1)
 		}
@@ -209,7 +210,7 @@ spice login databricks --key <access-token> --aws-region <aws-region> --aws-acce
 
 		mergeAuthConfig(cmd, api.AUTH_TYPE_DATABRICKS, &api.Auth{
 			Params: map[string]string{
-				api.AUTH_PARAM_KEY:                   key,
+				api.AUTH_PARAM_TOKEN:                 token,
 				api.AUTH_PARAM_AWS_DEFAULT_REGION:    awsRegion,
 				api.AUTH_PARAM_AWS_ACCESS_KEY_ID:     awsAccessKeyId,
 				api.AUTH_PARAM_AWS_SECRET_ACCESS_KEY: awsSecret,
@@ -271,7 +272,7 @@ func init() {
 	dremioCmd.Flags().StringP(passwordFlag, "p", "", "Password")
 	loginCmd.AddCommand(dremioCmd)
 
-	databricksCmd.Flags().StringP(apiKeyFlag, "k", "", "Access Token")
+	databricksCmd.Flags().StringP(token, "p", "", "Access Token")
 	databricksCmd.Flags().String(awsRegion, "", "AWS Region")
 	databricksCmd.Flags().String(awsAccessKeyId, "", "AWS Access Key ID")
 	databricksCmd.Flags().String(awsSecret, "", "AWS Secret Access Key")
