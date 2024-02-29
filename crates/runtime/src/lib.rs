@@ -7,7 +7,7 @@ use app::App;
 use config::Config;
 use model::Model;
 pub use notify::Error as NotifyError;
-use secretstore::SecretStores;
+use secretstore::{Secret, SecretStores};
 use snafu::prelude::*;
 use spicepod::component::dataset::Dataset;
 use spicepod::component::dataset::Mode;
@@ -130,20 +130,33 @@ impl Runtime {
     pub fn load_dataset(&self, ds: &Dataset) {
         let df = Arc::clone(&self.df);
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
-        let shared_auth = Arc::clone(&self.secrets);
+        let shared_secret_stores = Arc::clone(&self.secrets);
 
         let ds = ds.clone();
 
+        let secret_store_key = match ds.auth {
+            Some(ref auth) => auth.secret_store.clone(),
+            None => "file".to_string(),
+        };
+        let secret_key = match ds.auth {
+            Some(ref auth) => auth.secret_key.clone(),
+            None => "".to_string(),
+        };
+
         tokio::spawn(async move {
             loop {
-                let auth = shared_auth.read().await;
+                let secret_stores = shared_secret_stores.read().await;
 
                 let source = ds.source();
                 let params = Arc::new(ds.params.clone());
                 let data_connector: Option<Box<dyn DataConnector + Send>> =
                     match Runtime::get_dataconnector_from_source(
                         &source,
-                        &auth,
+                        &secret_stores
+                            .get_store(&secret_store_key)
+                            .unwrap()
+                            .get(secret_key.as_str())
+                            .unwrap(),
                         Arc::clone(&params),
                     )
                     .await
@@ -214,30 +227,19 @@ impl Runtime {
 
     async fn get_dataconnector_from_source(
         source: &str,
-        secret_stores: &SecretStores,
+        secret: &Secret,
         params: Arc<Option<HashMap<String, String>>>,
     ) -> Result<Option<Box<dyn DataConnector + Send>>> {
-        // TODO: load secret store from spicepod
-        let secret_store = match secret_stores.get_store("file") {
-            Some(s) => s,
-            None => {
-                return UnknownDataSourceSnafu {
-                    data_source: source,
-                }
-                .fail()?
-            }
-        };
-
         match source {
             "spiceai" => Ok(Some(Box::new(
-                dataconnector::spiceai::SpiceAI::new(secret_store.get(source).unwrap(), params)
+                dataconnector::spiceai::SpiceAI::new(secret.clone(), params)
                     .await
                     .context(UnableToInitializeDataConnectorSnafu {
                         data_connector: source,
                     })?,
             ))),
             "dremio" => Ok(Some(Box::new(
-                dataconnector::dremio::Dremio::new(secret_store.get(source).unwrap(), params)
+                dataconnector::dremio::Dremio::new(secret.clone(), params)
                     .await
                     .context(UnableToInitializeDataConnectorSnafu {
                         data_connector: source,
@@ -492,7 +494,7 @@ fn has_table_provider(data_connector: &Option<Box<dyn DataConnector + Send>>) ->
 }
 
 pub fn initialize_secret_stores() -> secretstore::SecretStores {
-    let mut stores = secretstore::SecretStores::new();
+    let stores = secretstore::SecretStores::new();
     // if let Err(e) = stores.init() {
     //     tracing::warn!(
     //         "Unable to initialize secret stores, proceeding without auth: {}",
