@@ -7,7 +7,7 @@ use flight_client::FlightClient;
 use flight_datafusion::FlightTable;
 use spicepod::component::dataset::Dataset;
 
-use crate::auth::AuthProvider;
+use crate::secretstore::AuthProvider;
 
 use super::{flight::Flight, DataConnector};
 

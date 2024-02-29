@@ -1,4 +1,4 @@
-use crate::auth::AuthProvider;
+use crate::secretstore::AuthProvider;
 use async_trait::async_trait;
 use snafu::prelude::*;
 use std::collections::HashMap;

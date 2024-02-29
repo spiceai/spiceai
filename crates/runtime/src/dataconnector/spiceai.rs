@@ -15,7 +15,7 @@ use spicepod::component::dataset::Dataset;
 
 use flight_datafusion::FlightTable;
 
-use crate::auth::AuthProvider;
+use crate::secretstore::AuthProvider;
 use crate::datapublisher::{AddDataResult, DataPublisher};
 use crate::dataupdate::{DataUpdate, UpdateType};
 use crate::info_spaced;

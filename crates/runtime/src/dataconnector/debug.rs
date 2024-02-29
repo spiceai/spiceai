@@ -1,4 +1,4 @@
-use crate::auth::AuthProvider;
+use crate::secretstore::AuthProvider;
 
 use std::collections::HashMap;
 use std::{future::Future, pin::Pin};

@@ -17,7 +17,7 @@ use tokio::{signal, sync::RwLock};
 
 use crate::{dataconnector::DataConnector, datafusion::DataFusion};
 
-pub mod auth;
+pub mod secretstore;
 pub mod config;
 pub mod databackend;
 pub mod dataconnector;
@@ -92,7 +92,7 @@ pub struct Runtime {
     pub df: Arc<RwLock<DataFusion>>,
     pub models: Arc<RwLock<HashMap<String, Model>>>,
     pub pods_watcher: podswatcher::PodsWatcher,
-    pub auth: Arc<RwLock<auth::AuthProviders>>,
+    pub auth: Arc<RwLock<secretstore::AuthProviders>>,
 
     spaced_tracer: Arc<tracers::SpacedTracer>,
 }
@@ -104,7 +104,7 @@ impl Runtime {
         app: Arc<RwLock<Option<app::App>>>,
         df: Arc<RwLock<DataFusion>>,
         pods_watcher: podswatcher::PodsWatcher,
-        auth: Arc<RwLock<auth::AuthProviders>>,
+        auth: Arc<RwLock<secretstore::AuthProviders>>,
     ) -> Self {
         Runtime {
             app,
@@ -213,7 +213,7 @@ impl Runtime {
 
     async fn get_dataconnector_from_source(
         source: &str,
-        auth: &auth::AuthProviders,
+        auth: &secretstore::AuthProviders,
         params: Arc<Option<HashMap<String, String>>>,
     ) -> Result<Option<Box<dyn DataConnector + Send>>> {
         match source {
@@ -467,8 +467,8 @@ fn has_table_provider(data_connector: &Option<Box<dyn DataConnector + Send>>) ->
             .is_some_and(|dc| dc.has_table_provider())
 }
 
-pub fn load_auth_providers() -> auth::AuthProviders {
-    let mut auth = auth::AuthProviders::default();
+pub fn load_auth_providers() -> secretstore::AuthProviders {
+    let mut auth = secretstore::AuthProviders::default();
     if let Err(e) = auth.parse_from_config() {
         tracing::warn!(
             "Unable to parse auth from config, proceeding without auth: {}",

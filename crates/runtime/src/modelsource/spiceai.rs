@@ -8,7 +8,7 @@ use std::io::Cursor;
 use std::string::ToString;
 use std::sync::Arc;
 
-use crate::auth::AuthProvider;
+use crate::secretstore::AuthProvider;
 use regex::Regex;
 
 #[async_trait]

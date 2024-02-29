@@ -13,7 +13,7 @@ use async_stream::stream;
 use futures_core::stream::BoxStream;
 use std::future::Future;
 
-use crate::auth::AuthProvider;
+use crate::secretstore::AuthProvider;
 use crate::datapublisher::DataPublisher;
 use crate::dataupdate::{DataUpdate, UpdateType};
 

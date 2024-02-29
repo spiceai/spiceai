@@ -1,4 +1,4 @@
-use crate::auth::AuthProvider;
+use crate::secretstore::AuthProvider;
 use crate::modelruntime::ModelRuntime;
 use crate::modelruntime::Runnable;
 use crate::modelsource::create_source_from;
