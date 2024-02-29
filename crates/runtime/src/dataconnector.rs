@@ -13,9 +13,9 @@ use async_stream::stream;
 use futures_core::stream::BoxStream;
 use std::future::Future;
 
-use crate::secretstore::AuthProvider;
 use crate::datapublisher::DataPublisher;
 use crate::dataupdate::{DataUpdate, UpdateType};
+use crate::secretstore::Secret;
 
 pub mod debug;
 pub mod dremio;
@@ -54,7 +54,7 @@ pub type AnyErrorResult = std::result::Result<(), Box<dyn std::error::Error>>;
 pub trait DataConnector: Send + Sync {
     /// Create a new `DataConnector` with the given `AuthProvider`.
     fn new(
-        auth_provider: AuthProvider,
+        auth_secret: Secret,
         params: Arc<Option<HashMap<String, String>>>,
     ) -> Pin<Box<dyn Future<Output = Result<Self>> + Send>>
     where

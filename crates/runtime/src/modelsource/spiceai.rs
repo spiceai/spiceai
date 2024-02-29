@@ -8,14 +8,14 @@ use std::io::Cursor;
 use std::string::ToString;
 use std::sync::Arc;
 
-use crate::secretstore::AuthProvider;
+use crate::secretstore::Secret;
 use regex::Regex;
 
 #[async_trait]
 impl ModelSource for SpiceAI {
     async fn pull(
         &self,
-        auth_provider: AuthProvider,
+        auth_secret: Secret,
         params: Arc<Option<HashMap<String, String>>>,
     ) -> super::Result<String> {
         let name = params

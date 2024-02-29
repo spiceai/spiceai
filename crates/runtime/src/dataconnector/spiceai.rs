@@ -15,10 +15,10 @@ use spicepod::component::dataset::Dataset;
 
 use flight_datafusion::FlightTable;
 
-use crate::secretstore::AuthProvider;
 use crate::datapublisher::{AddDataResult, DataPublisher};
 use crate::dataupdate::{DataUpdate, UpdateType};
 use crate::info_spaced;
+use crate::secretstore::Secret;
 use crate::tracers::SpacedTracer;
 
 use super::{flight::Flight, DataConnector};
@@ -43,7 +43,7 @@ pub struct SpiceAI {
 #[async_trait]
 impl DataConnector for SpiceAI {
     fn new(
-        auth_provider: AuthProvider,
+        auth_secret: Secret,
         params: Arc<Option<HashMap<String, String>>>,
     ) -> Pin<Box<dyn Future<Output = super::Result<Self>> + Send>>
     where
@@ -64,7 +64,7 @@ impl DataConnector for SpiceAI {
             let flight_client = FlightClient::new(
                 url.as_str(),
                 "",
-                auth_provider.get_param("key").unwrap_or_default(),
+                auth_secret.get_param("key").unwrap_or_default(),
             )
             .await
             .map_err(|e| super::Error::UnableToCreateDataConnector { source: e.into() })?;
