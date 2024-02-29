@@ -8,6 +8,7 @@ use crate::reader;
 pub mod auth;
 pub mod dataset;
 pub mod model;
+pub mod secret;
 
 pub trait WithDependsOn<T> {
     fn depends_on(&self, depends_on: &[String]) -> T;

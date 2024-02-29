@@ -21,6 +21,9 @@ pub enum Error {
 
     #[snafu(display("Unable to parse auth file: {source}"))]
     UnableToParseAuthFile { source: toml::de::Error },
+
+    #[snafu(display("test"))]
+    TestError {},
 }
 
 #[allow(clippy::module_name_repetitions)]

@@ -2,10 +2,10 @@ use std::{collections::HashMap, fs, time::Duration};
 
 use serde::{Deserialize, Serialize};
 
-use super::WithDependsOn;
+use super::{auth, WithDependsOn};
 use snafu::prelude::*;
 
-use crate::component::auth;
+use crate::component::secret;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -50,6 +50,9 @@ pub struct Dataset {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<auth::Auth>,
 
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub secrets: Vec<secret::Secret>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replication: Option<replication::Replication>,
 
@@ -71,6 +74,7 @@ impl Dataset {
             sql: None,
             sql_ref: None,
             params: Option::default(),
+            secrets: Vec::default(),
             auth: None,
             replication: None,
             acceleration: None,
@@ -190,6 +194,7 @@ impl WithDependsOn<Dataset> for Dataset {
             sql_ref: self.sql_ref.clone(),
             params: self.params.clone(),
             auth: self.auth.clone(),
+            secrets: self.secrets.clone(),
             replication: self.replication.clone(),
             acceleration: self.acceleration.clone(),
             depends_on: depends_on.to_vec(),

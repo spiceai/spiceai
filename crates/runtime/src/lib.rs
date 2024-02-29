@@ -13,6 +13,7 @@ use snafu::prelude::*;
 use spicepod::component::dataset::Dataset;
 use spicepod::component::dataset::Mode;
 use spicepod::component::model::Model as SpicepodModel;
+use spicepod::component::secret;
 use std::time::Duration;
 use tokio::time::sleep;
 use tokio::{signal, sync::RwLock};
@@ -138,39 +139,45 @@ impl Runtime {
 
         let ds = ds.clone();
 
-        let secret_store_key = match ds.auth {
-            Some(ref auth) => auth.secret_store.clone(),
-            None => "file".to_string(),
-        };
+        // let secret_store_key = match ds.auth {
+        //     Some(ref auth) => auth.secret_store.clone(),
+        //     None => "file".to_string(),
+        // };
 
         tokio::spawn(async move {
             loop {
                 let source = ds.source();
-                let secret_key = match ds.auth {
-                    Some(ref auth) => auth.secret_key.clone(),
-                    None => source.clone(),
-                };
 
-                let secret_stores = shared_secret_stores.read().await;
+                let dataset_secrets = Runtime::load_component_secrets(
+                    shared_secret_stores.clone(),
+                    ds.secrets.clone(),
+                )
+                .await;
 
-                let secret_store =
-                    match secret_stores.get_store(&secret_store_key).ok_or_else(|| {
-                        UnableToLoadSecretStoreSnafu {
-                            secret_store: secret_key.clone(),
-                        }
-                    }) {
-                        Ok(s) => s,
-                        Err(_) => {
-                            tracing::error!("Unable to load secret store: {:?}", ds.auth);
-                            break;
-                        }
-                    };
+                // let secret_key = match ds.auth {
+                //     Some(ref auth) => auth.secret_key.clone(),
+                //     None => source.clone(),
+                // };
+
+                // let secret_store =
+                //     match secret_stores.get_store(&secret_store_key).ok_or_else(|| {
+                //         UnableToLoadSecretStoreSnafu {
+                //             secret_store: secret_key.clone(),
+                //         }
+                //     }) {
+                //         Ok(s) => s,
+                //         Err(_) => {
+                //             tracing::error!("Unable to load secret store: {:?}", ds.auth);
+                //             break;
+                //         }
+                //     };
 
                 let params = Arc::new(ds.params.clone());
                 let data_connector: Option<Box<dyn DataConnector + Send>> =
                     match Runtime::get_dataconnector_from_source(
                         &source,
-                        &secret_store.get_secret(secret_key.as_str().clone()),
+                        dataset_secrets,
+                        // &secret_store.get_secret(secret_key.as_str().clone()),
                         Arc::clone(&params),
                     )
                     .await
@@ -241,24 +248,33 @@ impl Runtime {
 
     async fn get_dataconnector_from_source(
         source: &str,
-        secret: &Secret,
+        // secret: &Secret,
+        dataset_secrets: HashMap<String, String>,
         params: Arc<Option<HashMap<String, String>>>,
     ) -> Result<Option<Box<dyn DataConnector + Send>>> {
         match source {
-            "spiceai" => Ok(Some(Box::new(
-                dataconnector::spiceai::SpiceAI::new(secret.clone(), params)
-                    .await
-                    .context(UnableToInitializeDataConnectorSnafu {
-                        data_connector: source,
-                    })?,
-            ))),
-            "dremio" => Ok(Some(Box::new(
-                dataconnector::dremio::Dremio::new(secret.clone(), params)
-                    .await
-                    .context(UnableToInitializeDataConnectorSnafu {
-                        data_connector: source,
-                    })?,
-            ))),
+            "spiceai" => {
+                println!("spiceai");
+
+                Ok(Some(Box::new(
+                    dataconnector::spiceai::SpiceAI::new(Secret::new(dataset_secrets), params)
+                        .await
+                        .context(UnableToInitializeDataConnectorSnafu {
+                            data_connector: source,
+                        })?,
+                )))
+            }
+            "dremio" => {
+                println!("dremio");
+
+                Ok(Some(Box::new(
+                    dataconnector::dremio::Dremio::new(Secret::new(dataset_secrets), params)
+                        .await
+                        .context(UnableToInitializeDataConnectorSnafu {
+                            data_connector: source,
+                        })?,
+                )))
+            }
             "localhost" => Ok(None),
             "debug" => Ok(Some(Box::new(dataconnector::debug::DebugSource {}))),
             _ => UnknownDataConnectorSnafu {
@@ -495,6 +511,43 @@ impl Runtime {
 
         Ok(())
     }
+
+    pub async fn load_component_secrets(
+        secret_stores: Arc<RwLock<SecretStores>>,
+        secrets: Vec<secret::Secret>,
+    ) -> HashMap<String, String> {
+        let mut component_secrets: HashMap<String, String> = HashMap::new();
+
+        let shared_secret_stores = Arc::clone(&secret_stores);
+        let secret_stores = shared_secret_stores.read().await;
+
+        for s in secrets {
+            let secret_store = match secret_stores.get_store(&s.store).ok_or_else(|| {
+                UnableToLoadSecretStoreSnafu {
+                    secret_store: &s.store,
+                }
+            }) {
+                Ok(s) => s,
+                Err(_) => {
+                    tracing::error!("Unable to load secret store: {:?}", &s.store);
+                    break;
+                }
+            };
+
+            let secret = secret_store.get_secret(&s.store_key.as_str().clone());
+            let value = match secret.get_secret(&s.data_key) {
+                Some(v) => v,
+                None => {
+                    tracing::error!("Unable to load secret: {:?}", &s.key);
+                    break;
+                }
+            };
+
+            component_secrets.insert(s.key, value.to_string());
+        }
+
+        component_secrets
+    }
 }
 
 fn has_table_provider(data_connector: &Option<Box<dyn DataConnector + Send>>) -> bool {
@@ -516,6 +569,16 @@ pub fn initialize_secret_stores() -> secretstore::SecretStores {
     }
 
     stores.add_store("file".to_string(), Box::new(file_secret_store));
+
+    let mut keyring_secret_store = secretstore::keyring::KeyringSecretStore::new();
+    match keyring_secret_store.init() {
+        Ok(()) => {}
+        Err(err) => {
+            tracing::error!("Unable to initialize keyring secret store: {err:?}");
+        }
+    }
+
+    stores.add_store("keyring".to_string(), Box::new(keyring_secret_store));
 
     stores
 }

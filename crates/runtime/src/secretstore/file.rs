@@ -6,11 +6,9 @@ use serde::Deserialize;
 use snafu::prelude::*;
 
 use super::{
-    Error, Secret, SecretStore, UnableToFindHomeDirSnafu, UnableToOpenAuthFileSnafu,
+    Result, Secret, SecretStore, UnableToFindHomeDirSnafu, UnableToOpenAuthFileSnafu,
     UnableToParseAuthFileSnafu, UnableToReadAuthFileSnafu,
 };
-
-pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[allow(clippy::module_name_repetitions)]
 pub type AuthConfigs = HashMap<String, AuthConfig>;
