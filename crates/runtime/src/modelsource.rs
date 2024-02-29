@@ -4,6 +4,7 @@ use snafu::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+pub mod huggingface;
 pub mod local;
 pub mod spiceai;
 
@@ -70,6 +71,7 @@ pub fn create_source_from(source: &str) -> Result<Box<dyn ModelSource>> {
     match source {
         "localhost" => Ok(Box::new(local::Local {})),
         "spiceai" => Ok(Box::new(spiceai::SpiceAI {})),
+        "huggingface" => Ok(Box::new(huggingface::Huggingface {})),
         _ => UnknownModelSourceSnafu {
             model_source: source,
         }

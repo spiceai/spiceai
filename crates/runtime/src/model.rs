@@ -111,6 +111,7 @@ impl Model {
 pub(crate) fn source(from: &str) -> String {
     match from {
         s if s.starts_with("spiceai:") => "spiceai".to_string(),
+        s if s.starts_with("huggingface:") => "huggingface".to_string(),
         s if s.starts_with("file:/") => "localhost".to_string(),
         _ => "spiceai".to_string(),
     }
