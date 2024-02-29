@@ -76,5 +76,3 @@ impl DataConnector for Databricks {
         Ok(Arc::new(delta_table))
     }
 }
-    }
-}
