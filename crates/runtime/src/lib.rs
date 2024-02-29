@@ -260,7 +260,7 @@ impl Runtime {
             return Ok(());
         }
 
-        if ds.acceleration.is_none() {
+        if ds.acceleration.is_none() || ds.acceleration.as_ref().map_or(false, |acc| !acc.enabled) {
             if let Some(data_connector) = data_connector {
                 df.read()
                     .await
