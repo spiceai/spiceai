@@ -13,7 +13,6 @@ use spicepod::component::dataset::Dataset;
 use crate::auth::AuthProvider;
 
 use super::DataConnector;
-use object_store::aws::AwsCredential;
 use snafu::prelude::*;
 
 #[derive(Debug, Snafu)]
@@ -29,15 +28,14 @@ pub enum Error {
 }
 
 pub struct S3 {
-    auth_provider: AuthProvider,
-    path: String,
+    _auth_provider: AuthProvider,
 }
 
 #[async_trait]
 impl DataConnector for S3 {
     fn new(
         auth_provider: AuthProvider,
-        params: Arc<Option<HashMap<String, String>>>,
+        _params: Arc<Option<HashMap<String, String>>>,
     ) -> Pin<Box<dyn Future<Output = super::Result<Self>> + Send>>
     where
         Self: Sized,
@@ -54,8 +52,7 @@ impl DataConnector for S3 {
             // let cred_builder = DefaultCredentialsChain::builder().build();
 
             Ok(Self {
-                path: "".to_string(),
-                auth_provider,
+                _auth_provider: auth_provider,
             })
         })
     }
@@ -66,7 +63,7 @@ impl DataConnector for S3 {
 
     fn get_all_data(
         &self,
-        dataset: &Dataset,
+        _dataset: &Dataset,
     ) -> Pin<Box<dyn Future<Output = Vec<arrow::record_batch::RecordBatch>> + Send>> {
         todo!()
     }
@@ -93,10 +90,8 @@ impl DataConnector for S3 {
             .with_allow_http(true)
             .build()
             .map_err(|e| super::Error::UnableToCreateDataConnector { source: e.into() })?;
-        let path = dataset.path();
 
-        let path = format!("s3:{path}");
-        let s3_url = Url::parse(&path)
+        let s3_url = Url::parse(&dataset.from)
             .map_err(|e| super::Error::UnableToGetTableProvider { source: e.into() })?;
 
         Ok((s3_url, Arc::new(s3)))
@@ -123,15 +118,4 @@ impl DataConnector for S3 {
 
         Ok(df.into_view())
     }
-}
-
-pub fn from_auth_provider(auth: AuthProvider) -> Result<AwsCredential, Error> {
-    Ok(AwsCredential {
-        key_id: auth.get_param("key").context(NoAccessKeySnafu)?.to_string(),
-        secret_key: auth
-            .get_param("secret")
-            .context(NoAccessSecretSnafu)?
-            .to_string(),
-        token: None,
-    })
 }

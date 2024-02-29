@@ -135,21 +135,21 @@ impl DataConnector for SpiceAI {
         true
     }
 
-    // async fn get_table_provider(
-    //     &self,
-    //     dataset: &Dataset,
-    // ) -> std::result::Result<Arc<dyn datafusion::datasource::TableProvider>, super::Error> {
-    //     let dataset_path = Self::spice_dataset_path(dataset);
+    async fn get_table_provider(
+        &self,
+        dataset: &Dataset,
+    ) -> std::result::Result<Arc<dyn datafusion::datasource::TableProvider>, super::Error> {
+        let dataset_path = Self::spice_dataset_path(dataset);
 
-    //     let provider = FlightTable::new(self.flight.client.clone(), dataset_path).await;
+        let provider = FlightTable::new(self.flight.client.clone(), dataset_path).await;
 
-    //     match provider {
-    //         Ok(provider) => Ok(Arc::new(provider)),
-    //         Err(error) => Err(super::Error::UnableToGetTableProvider {
-    //             source: error.into(),
-    //         }),
-    //     }
-    // }
+        match provider {
+            Ok(provider) => Ok(Arc::new(provider)),
+            Err(error) => Err(super::Error::UnableToGetTableProvider {
+                source: error.into(),
+            }),
+        }
+    }
 }
 
 impl DataPublisher for SpiceAI {
