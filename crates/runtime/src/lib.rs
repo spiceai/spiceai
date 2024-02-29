@@ -255,6 +255,7 @@ impl Runtime {
         match source {
             "spiceai" => {
                 println!("spiceai");
+                // TODO: fallback to default file auth
 
                 Ok(Some(Box::new(
                     dataconnector::spiceai::SpiceAI::new(Secret::new(dataset_secrets), params)
@@ -266,6 +267,7 @@ impl Runtime {
             }
             "dremio" => {
                 println!("dremio");
+                // TODO: fallback to default file auth
 
                 Ok(Some(Box::new(
                     dataconnector::dremio::Dremio::new(Secret::new(dataset_secrets), params)
