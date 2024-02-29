@@ -52,7 +52,7 @@ impl DataConnector for S3 {
         Self: Sized,
     {
         Box::pin(async move {
-            let mut s3_builder = AmazonS3Builder::new().with_bucket_name("");
+            let mut s3_builder = AmazonS3Builder::new().with_bucket_name("").with_allow_http(true);
 
             if let Some(region) = Self::get_from_params(&params, "region") {
                 s3_builder = s3_builder.with_region(region);
