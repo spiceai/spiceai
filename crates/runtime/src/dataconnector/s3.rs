@@ -112,7 +112,7 @@ impl DataConnector for S3 {
         let _ = ctx.runtime_env().register_object_store(&url, store);
 
         let df = ctx
-            .read_parquet(path, ParquetReadOptions::default())
+            .read_parquet(format!("s3:{path}"), ParquetReadOptions::default())
             .await
             .map_err(|e| super::Error::UnableToGetTableProvider { source: e.into() })?;
 
