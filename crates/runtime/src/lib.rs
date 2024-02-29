@@ -347,9 +347,21 @@ impl Runtime {
     pub async fn load_model(&self, m: &SpicepodModel) {
         tracing::info!("Loading model [{}] from {}...", m.name, m.from);
         let mut model_map = self.models.write().await;
-        let auth = self.secrets.read().await;
 
-        match Model::load(m, auth.get(model::source(&m.from).as_str())).await {
+        let secret_stores = self.secrets.read().await;
+        let secret_store = match secret_stores.get_store("file") {
+            Some(s) => s,
+            None => {
+                return;
+            }
+        };
+
+        match Model::load(
+            m,
+            secret_store.get(model::source(&m.from).as_str()).unwrap(),
+        )
+        .await
+        {
             Ok(in_m) => {
                 model_map.insert(m.name.clone(), in_m);
                 tracing::info!("Model [{}] deployed, ready for inferencing", m.name);
