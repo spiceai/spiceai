@@ -1,10 +1,11 @@
 use async_trait::async_trait;
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::options::ParquetReadOptions;
-use object_store::aws::AmazonS3Builder;
+use object_store::aws::{AmazonS3, AmazonS3Builder};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::{collections::HashMap, future::Future};
+use tract_onnx::pb_helpers::OptionExt;
 use url::Url;
 
 use spicepod::component::dataset::Dataset;
@@ -27,6 +28,18 @@ pub enum Error {
 pub struct S3 {
     auth_provider: AuthProvider,
     path: String,
+    _s3: Arc<AmazonS3>,
+}
+impl S3 {
+    pub fn get_from_params(
+        params: Arc<Option<HashMap<String, String>>>,
+        key: &str,
+    ) -> Option<String> {
+        params
+            .as_ref()
+            .as_ref()
+            .and_then(|params| params.get(key).cloned())
+    }
 }
 
 #[async_trait]
@@ -39,17 +52,30 @@ impl DataConnector for S3 {
         Self: Sized,
     {
         Box::pin(async move {
-            // let path: String = params
-            //     .as_ref()
-            //     .as_ref()
-            //     .and_then(|params| params.get("path").cloned())
-            //     .ok_or_else(|| super::Error::UnableToCreateDataConnector {
-            //         source: "Missing required parameter: path".into(),
-            //     })?;
+            let mut s3Builder = AmazonS3Builder::new().with_bucket_name("");
 
-            // let cred_builder = DefaultCredentialsChain::builder().build();
+            if let Some(region) = Self::get_from_params(params.clone(), "region") {
+                s3Builder = s3Builder.with_region(region)
+            }
+            if let Some(endpoint) = Self::get_from_params(params, "endpoint") {
+                s3Builder = s3Builder.with_endpoint(endpoint)
+            }
 
-            Ok(Self { path: "".to_string(), auth_provider })
+            if let Some(key) = auth_provider.get_param("key") {
+                s3Builder = s3Builder.with_access_key_id(key)
+            };
+            if let Some(secret) = auth_provider.get_param("secret") {
+                s3Builder = s3Builder.with_secret_access_key(secret)
+            };
+            let s3 = s3Builder
+                .build()
+                .map_err(|e| super::Error::UnableToCreateDataConnector { source: e.into() })?;
+
+            Ok(Self {
+                path: "".to_string(),
+                auth_provider,
+                _s3: Arc::new(s3),
+            })
         })
     }
 
@@ -74,38 +100,14 @@ impl DataConnector for S3 {
     ) -> std::result::Result<Arc<dyn datafusion::datasource::TableProvider>, super::Error> {
         let ctx = SessionContext::new();
 
-        // the region must be set to the region where the bucket exists until the following
-        // issue is resolved
-        // https://github.com/apache/arrow-rs/issues/2795
-        let region = "us-east-1";
-
-        let s3 = AmazonS3Builder::new()
-            .with_bucket_name("")
-            .with_region(region)
-            .with_access_key_id("minio")
-            .with_secret_access_key("minio123")
-            .with_endpoint("localhost:9000")
-            .build()
-            .unwrap();
-
-        let path = format!("s3://btc1/blocks/start_block=00745100/end_block=00745199");
-        let s3_url = Url::parse(&path).unwrap();
+        let s3_url = Url::parse(&dataset.from).unwrap();
         ctx.runtime_env()
-            .register_object_store(&s3_url, Arc::new(s3));
+            .register_object_store(&s3_url, self._s3.clone());
 
-        let df = ctx.read_parquet("*", ParquetReadOptions::default()).await;
+        let df = ctx
+            .read_parquet(&dataset.from, ParquetReadOptions::default())
+            .await;
 
         Ok(df.unwrap().into_view())
     }
-}
-
-pub fn from_auth_provider(auth: AuthProvider) -> Result<AwsCredential, Error> {
-    Ok(AwsCredential {
-        key_id: auth.get_param("key").context(NoAccessKeySnafu)?.to_string(),
-        secret_key: auth
-            .get_param("secret")
-            .context(NoAccessSecretSnafu)?
-            .to_string(),
-        token: None,
-    })
 }
