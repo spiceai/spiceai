@@ -49,7 +49,7 @@ impl<T, P> SqlTable<T, P> {
         table_reference: impl Into<OwnedTableReference>,
     ) -> Result<Self> {
         let table_reference = table_reference.into();
-        let mut conn = pool
+        let conn = pool
             .connect()
             .await
             .context(UnableToGetConnectionFromPoolSnafu)?;
@@ -256,7 +256,7 @@ async fn get_stream<T, P: 'static>(
     pool: Arc<dyn DbConnectionPool<T, P> + Send + Sync>,
     sql: String,
 ) -> DataFusionResult<SendableRecordBatchStream> {
-    let mut conn = pool.connect().await.map_err(to_execution_error)?;
+    let conn = pool.connect().await.map_err(to_execution_error)?;
     conn.query_arrow(&sql, &[]).map_err(to_execution_error)
 }
 

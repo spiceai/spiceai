@@ -4132,6 +4132,9 @@ checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
 name = "sql_provider_datafusion"
 version = "0.7.0-alpha"
 dependencies = [
+ "arrow",
+ "arrow_sql_gen",
+ "async-stream",
  "async-trait",
  "bb8",
  "bb8-postgres",

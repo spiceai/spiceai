@@ -34,7 +34,7 @@ pub struct PostgresConnectionPool {
 impl
     DbConnectionPool<
         bb8::PooledConnection<'static, PostgresConnectionManager<NoTls>>,
-        &'static dyn ToSql,
+        &'static (dyn ToSql + Sync),
     > for PostgresConnectionPool
 {
     async fn new(
@@ -62,7 +62,7 @@ impl
         Box<
             dyn DbConnection<
                 bb8::PooledConnection<'static, PostgresConnectionManager<NoTls>>,
-                &'static dyn ToSql,
+                &'static (dyn ToSql + Sync),
             >,
         >,
     > {

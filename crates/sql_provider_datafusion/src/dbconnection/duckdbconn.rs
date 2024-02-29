@@ -1,5 +1,6 @@
 use std::any::Any;
 
+use arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::memory::MemoryStream;
@@ -28,7 +29,7 @@ impl DbConnection<r2d2::PooledConnection<DuckdbConnectionManager>, &dyn ToSql>
         DuckDbConnection { conn }
     }
 
-    fn get_schema(&mut self, table_reference: &TableReference) -> Result<SchemaRef> {
+    fn get_schema(&self, table_reference: &TableReference) -> Result<SchemaRef> {
         let mut stmt = self
             .conn
             .prepare(&format!("SELECT * FROM {table_reference} LIMIT 0"))
@@ -39,20 +40,16 @@ impl DbConnection<r2d2::PooledConnection<DuckdbConnectionManager>, &dyn ToSql>
         Ok(result.get_schema())
     }
 
-    fn query_arrow(
-        &mut self,
-        sql: &str,
-        params: &[&dyn ToSql],
-    ) -> Result<SendableRecordBatchStream> {
+    fn query_arrow(&self, sql: &str, params: &[&dyn ToSql]) -> Result<SendableRecordBatchStream> {
         let mut stmt = self.conn.prepare(sql).context(DuckDBSnafu)?;
 
         let result: duckdb::Arrow<'_> = stmt.query_arrow(params).context(DuckDBSnafu)?;
         let schema = result.get_schema();
-        let recs = result.collect();
+        let recs: Vec<RecordBatch> = result.collect();
         Ok(Box::pin(MemoryStream::try_new(recs, schema, None)?))
     }
 
-    fn execute(&mut self, sql: &str, params: &[&dyn ToSql]) -> Result<u64> {
+    fn execute(&self, sql: &str, params: &[&dyn ToSql]) -> Result<u64> {
         let rows_modified = self.conn.execute(sql, params).context(DuckDBSnafu)?;
         Ok(rows_modified as u64)
     }

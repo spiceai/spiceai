@@ -21,6 +21,9 @@ tracing.workspace = true
 futures.workspace = true
 bb8 = "0.7"
 bb8-postgres = "0.7"
+async-stream.workspace = true
+arrow_sql_gen = { path = "../arrow_sql_gen" }
+arrow.workspace = true
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
