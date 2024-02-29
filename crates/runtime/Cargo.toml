@@ -53,6 +53,7 @@ aws-types = "1.1.7"
 object_store = { version="0.9.0", features = ["aws"] }
 quick-xml = { version = "0.23.0-alpha3" }
 
+
 [features]
 default = ["duckdb"]
 dev = []

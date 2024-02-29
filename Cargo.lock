@@ -4371,6 +4371,7 @@ name = "spiced"
 version = "0.7.0-alpha"
 dependencies = [
  "app",
+ "aws-config",
  "clap",
  "flightrepl",
  "metrics",

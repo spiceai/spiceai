@@ -1,7 +1,13 @@
-
 use snafu::prelude::*;
 use crate::auth::AuthProvider;
 use object_store::aws::AwsCredential;
+
+use aws_config::meta::credentials::CredentialsProviderChain;
+use aws_config::profile::ProfileFileCredentialsProvider;
+use aws_config::BehaviorVersion;
+use aws_config::default_provider::credentials::DefaultCredentialsChain;
+
+use crate::auth::AuthProvider;
 
 
 #[derive(Debug, Snafu)]
