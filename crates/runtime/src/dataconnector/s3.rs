@@ -94,8 +94,6 @@ impl DataConnector for S3 {
         &self,
         dataset: &Dataset,
     ) -> std::result::Result<Arc<dyn datafusion::datasource::TableProvider>, super::Error> {
-        let path = dataset.path();
-
         let ctx = SessionContext::new();
 
         let url = Url::parse(&dataset.from)
@@ -106,7 +104,7 @@ impl DataConnector for S3 {
             .register_object_store(&url, self._s3.clone());
 
         let df = ctx
-            .read_parquet(path, ParquetReadOptions::default())
+            .read_parquet(&dataset.from, ParquetReadOptions::default())
             .await
             .map_err(|e| super::Error::UnableToGetTableProvider { source: e.into() })?;
 
