@@ -75,7 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     loop {
 
-        let batch = get_test_batch("SELECT number, hash, parent_hash, \"timestamp\" FROM goerli.blocks limit 100;").await;
+        let batch = get_test_batch("SELECT number, hash, parent_hash, \"timestamp\" FROM goerli.blocks order by number desc limit 1;").await;
 
         let flight_descriptor = FlightDescriptor::new_path(vec![path.clone()]);
         let input_stream = futures::stream::iter(vec![Ok(batch)]);
