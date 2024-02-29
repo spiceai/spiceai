@@ -55,6 +55,9 @@ impl DataConnector for Databricks {
 
         let mut storage_options = HashMap::new();
         for (key, value) in self.auth_provider.iter() {
+            if !key.starts_with("AWS_") {
+                continue;
+            }
             storage_options.insert(key.to_string(), value.to_string());
         }
         // TODO: Figure out a way to avoid this default hashmap
