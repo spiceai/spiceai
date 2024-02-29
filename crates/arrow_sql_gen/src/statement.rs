@@ -1,6 +1,6 @@
 use arrow::{
     array::{array, Array, RecordBatch},
-    datatypes::{DataType, Schema},
+    datatypes::{DataType, SchemaRef},
 };
 use rust_decimal::Decimal;
 
@@ -9,19 +9,18 @@ use sea_query::{
     PostgresQueryBuilder, Query, SimpleExpr, Table, Value,
 };
 use std::str::FromStr;
-use std::sync::Arc;
 
 pub struct CreateTableBuilder {
-    schema: Schema,
+    schema: SchemaRef,
     table_name: String,
     primary_keys: Vec<String>,
 }
 
 impl CreateTableBuilder {
     #[must_use]
-    pub fn new(schema: &Schema, table_name: &str) -> Self {
+    pub fn new(schema: SchemaRef, table_name: &str) -> Self {
         Self {
-            schema: schema.clone(),
+            schema,
             table_name: table_name.to_string(),
             primary_keys: Vec::new(),
         }

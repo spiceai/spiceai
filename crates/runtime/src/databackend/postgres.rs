@@ -1,6 +1,7 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, mem, sync::Arc};
 
 use arrow::record_batch::RecordBatch;
+use arrow_sql_gen::statement::{CreateTableBuilder, InsertTableBuilder};
 use bb8_postgres::{
     tokio_postgres::{types::ToSql, NoTls},
     PostgresConnectionManager,
@@ -13,6 +14,7 @@ use sql_provider_datafusion::{
     dbconnectionpool::{postgrespool::PostgresConnectionPool, DbConnectionPool, Mode},
     SqlTable,
 };
+use tokio::sync::Mutex;
 
 use crate::{
     datapublisher::{AddDataResult, DataPublisher},
@@ -50,6 +52,7 @@ pub enum Error {
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
+#[allow(clippy::module_name_repetitions)]
 pub struct PostgresBackend {
     ctx: Arc<SessionContext>,
     name: String,
@@ -60,7 +63,7 @@ pub struct PostgresBackend {
             > + Send
             + Sync,
     >,
-    create_mutex: std::sync::Mutex<()>,
+    create_mutex: Mutex<()>,
     _primary_keys: Option<Vec<String>>,
 }
 
@@ -84,7 +87,7 @@ impl DataPublisher for PostgresBackend {
                 create_mutex: &self.create_mutex,
             };
 
-            postgres_update.update()?;
+            postgres_update.update().await?;
 
             self.initialize_datafusion().await?;
             Ok(())
@@ -112,7 +115,7 @@ impl PostgresBackend {
             ctx,
             name: name.to_string(),
             pool: Arc::new(pool),
-            create_mutex: std::sync::Mutex::new(()),
+            create_mutex: Mutex::new(()),
             _primary_keys: primary_keys,
         })
     }
@@ -147,23 +150,89 @@ struct PostgresUpdate<'a> {
     data: Vec<RecordBatch>,
     update_type: UpdateType,
     postgres_conn: &'a mut dbconnection::postgresconn::PostgresConnection,
-    create_mutex: &'a std::sync::Mutex<()>,
+    create_mutex: &'a Mutex<()>,
 }
 
 impl<'a> PostgresUpdate<'a> {
-    fn update(&mut self) -> Result<()> {
-        todo!()
+    async fn update(&mut self) -> Result<()> {
+        match self.update_type {
+            UpdateType::Overwrite => self.create_table(true).await?,
+            UpdateType::Append => {
+                if !self.table_exists().await {
+                    self.create_table(false).await?;
+                }
+            }
+        };
+
+        let data = mem::take(&mut self.data);
+        for batch in data {
+            self.insert_batch(batch)?;
+        }
+
+        tracing::trace!(
+            "Processed update to Postgres table {name}",
+            name = self.name,
+        );
+
+        Ok(())
     }
 
     fn insert_batch(&mut self, batch: RecordBatch) -> Result<()> {
-        todo!()
+        let insert_table_builder = InsertTableBuilder::new(&self.name, &vec![batch]);
+        let sql = insert_table_builder.build();
+
+        self.postgres_conn
+            .execute(&sql, &[])
+            .context(DbConnectionSnafu)?;
+
+        Ok(())
     }
 
-    fn create_table(&mut self, drop_if_exists: bool) -> Result<()> {
-        todo!()
+    async fn create_table(&mut self, drop_if_exists: bool) -> Result<()> {
+        let _lock = self.create_mutex.lock();
+
+        if self.table_exists().await {
+            if drop_if_exists {
+                let sql = format!(r#"DROP TABLE "{}""#, self.name);
+                tracing::trace!("{sql}");
+                self.postgres_conn
+                    .execute(&sql, &[])
+                    .context(DbConnectionSnafu)?;
+            } else {
+                return Ok(());
+            }
+        }
+
+        let Some(batch) = self.data.pop() else {
+            return Ok(());
+        };
+
+        let create_table_statement = CreateTableBuilder::new(batch.schema(), &self.name);
+        let sql = create_table_statement.build();
+
+        self.postgres_conn
+            .execute(&sql, &[])
+            .context(DbConnectionSnafu)?;
+
+        Ok(())
     }
 
-    fn table_exists(&self) -> bool {
-        todo!()
+    async fn table_exists(&self) -> bool {
+        let sql = format!(
+            r#"SELECT EXISTS (
+              SELECT 1
+              FROM information_schema.tables 
+              WHERE table_name = '{name}'
+            )"#,
+            name = self.name
+        );
+        tracing::trace!("{sql}");
+
+        let Ok(row) = self.postgres_conn.conn.query_one(&sql, &[]).await else {
+            return false;
+        };
+
+        let exists: bool = row.get(0);
+        exists
     }
 }

@@ -70,8 +70,11 @@ impl
         Ok(Box::pin(MemoryStream::try_new(recs, schema, None)?))
     }
 
-    fn execute(&self, _sql: &str, _params: &[&(dyn ToSql + Sync)]) -> Result<u64> {
-        todo!()
+    fn execute(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<u64> {
+        Ok(tokio::task::block_in_place(move || {
+            Handle::current().block_on(async { self.conn.execute(sql, params).await })
+        })
+        .context(QuerySnafu)?)
     }
 
     fn as_any(&self) -> &dyn Any {
