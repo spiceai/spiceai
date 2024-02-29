@@ -6,9 +6,8 @@ use rust_decimal::Decimal;
 
 use sea_query::{
     Alias, ColumnDef, ColumnType, Index, InsertStatement, IntoIden, IntoIndexColumn,
-    PostgresQueryBuilder, Query, SimpleExpr, Table, Value,
+    PostgresQueryBuilder, Query, SimpleExpr, Table,
 };
-use std::str::FromStr;
 
 pub struct CreateTableBuilder {
     schema: SchemaRef,
@@ -69,10 +68,10 @@ pub struct InsertTableBuilder {
 
 impl InsertTableBuilder {
     #[must_use]
-    pub fn new(table_name: &str, record_batches: &Vec<RecordBatch>) -> Self {
+    pub fn new(table_name: &str, record_batches: Vec<RecordBatch>) -> Self {
         Self {
             table_name: table_name.to_string(),
-            record_batches: record_batches.clone(),
+            record_batches,
         }
     }
 
@@ -165,6 +164,7 @@ impl InsertTableBuilder {
                         let array = column.as_any().downcast_ref::<array::Decimal128Array>();
                         if let Some(valid_array) = array {
                             let value: i128 = valid_array.value(row);
+                            #[allow(clippy::cast_sign_loss)]
                             let decimal_value =
                                 Decimal::try_from_i128_with_scale(value, *scale as u32)
                                     .unwrap_or(Decimal::new(0, 0));
@@ -192,7 +192,7 @@ impl InsertTableBuilder {
 
     #[must_use]
     pub fn build(self) -> String {
-        let columns: Vec<Alias> = (&self.record_batches[0])
+        let columns: Vec<Alias> = (self.record_batches[0])
             .schema()
             .fields()
             .iter()
@@ -205,7 +205,7 @@ impl InsertTableBuilder {
             .to_owned();
 
         for record_batch in &self.record_batches {
-            self.construct_insert_stmt(&mut insert_stmt, &record_batch);
+            self.construct_insert_stmt(&mut insert_stmt, record_batch);
         }
         insert_stmt.to_string(PostgresQueryBuilder)
     }
@@ -235,7 +235,10 @@ fn map_data_type_to_column_type(data_type: &DataType) -> ColumnType {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema};
 
@@ -246,7 +249,7 @@ mod tests {
             Field::new("name", DataType::Utf8, false),
             Field::new("age", DataType::Int32, true),
         ]);
-        let sql = CreateTableBuilder::new(&schema, "users").build();
+        let sql = CreateTableBuilder::new(SchemaRef::new(schema), "users").build();
 
         assert_eq!(sql, "CREATE TABLE IF NOT EXISTS \"users\" ( \"id\" integer NOT NULL, \"name\" text NOT NULL, \"age\" integer )");
     }
@@ -289,7 +292,7 @@ mod tests {
         .unwrap();
         let record_batches = vec![batch1, batch2];
 
-        let sql = InsertTableBuilder::new("users", &record_batches).build();
+        let sql = InsertTableBuilder::new("users", record_batches).build();
         assert_eq!(sql, "INSERT INTO \"users\" (\"id\", \"name\", \"age\") VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', 30), (1, 'a', 10), (2, 'b', 20), (3, 'c', 30)");
     }
 
@@ -301,7 +304,7 @@ mod tests {
             Field::new("name", DataType::Utf8, false),
             Field::new("age", DataType::Int32, true),
         ]);
-        let sql = CreateTableBuilder::new(&schema, "users")
+        let sql = CreateTableBuilder::new(SchemaRef::new(schema), "users")
             .primary_keys(vec!["id", "id2"])
             .build();
 

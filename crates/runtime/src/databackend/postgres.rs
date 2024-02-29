@@ -178,7 +178,7 @@ impl<'a> PostgresUpdate<'a> {
     }
 
     fn insert_batch(&mut self, batch: RecordBatch) -> Result<()> {
-        let insert_table_builder = InsertTableBuilder::new(&self.name, &vec![batch]);
+        let insert_table_builder = InsertTableBuilder::new(&self.name, vec![batch]);
         let sql = insert_table_builder.build();
 
         self.postgres_conn
