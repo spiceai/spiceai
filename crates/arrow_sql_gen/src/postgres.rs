@@ -228,7 +228,7 @@ fn map_column_type_to_data_type(column_type: &Type, column_name: &str) -> Result
         Type::TEXT => Ok(DataType::Utf8),
         Type::BOOL => Ok(DataType::Boolean),
         // TODO: Figure out how to handle decimal scale and precision, it isn't specified as a type in postgres types
-        Type::NUMERIC => Ok(DataType::Decimal128(38, 9)),
+        Type::NUMERIC => Ok(DataType::Decimal128(38, 10)),
         _ => UnsupportedTypeSnafu {
             r#type: format!("{column_type}"),
             col: column_name.to_string(),
