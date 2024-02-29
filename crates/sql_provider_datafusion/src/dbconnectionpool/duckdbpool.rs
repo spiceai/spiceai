@@ -1,5 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
 
+use async_trait::async_trait;
 use duckdb::{vtab::arrow::ArrowVTab, DuckdbConnectionManager, ToSql};
 use snafu::{prelude::*, ResultExt};
 
@@ -19,10 +20,15 @@ pub struct DuckDbConnectionPool {
     pool: Arc<r2d2::Pool<DuckdbConnectionManager>>,
 }
 
+#[async_trait]
 impl DbConnectionPool<r2d2::PooledConnection<DuckdbConnectionManager>, &'static dyn ToSql>
     for DuckDbConnectionPool
 {
-    fn new(name: &str, mode: Mode, params: Arc<Option<HashMap<String, String>>>) -> Result<Self> {
+    async fn new(
+        name: &str,
+        mode: Mode,
+        params: Arc<Option<HashMap<String, String>>>,
+    ) -> Result<Self> {
         let manager = match mode {
             Mode::Memory => DuckdbConnectionManager::memory().context(DuckDBSnafu)?,
             Mode::File => DuckdbConnectionManager::file(get_duckdb_file(name, &params))
@@ -38,7 +44,7 @@ impl DbConnectionPool<r2d2::PooledConnection<DuckdbConnectionManager>, &'static 
         Ok(DuckDbConnectionPool { pool })
     }
 
-    fn connect(
+    async fn connect(
         &self,
     ) -> Result<
         Box<dyn DbConnection<r2d2::PooledConnection<DuckdbConnectionManager>, &'static dyn ToSql>>,
