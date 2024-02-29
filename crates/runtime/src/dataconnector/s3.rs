@@ -81,9 +81,26 @@ impl DataConnector for S3 {
 
     fn get_all_data(
         &self,
-        _dataset: &Dataset,
+        dataset: &Dataset,
     ) -> Pin<Box<dyn Future<Output = Vec<arrow::record_batch::RecordBatch>> + Send>> {
-        todo!()
+        let path = dataset.path();
+
+        let ctx = SessionContext::new();
+        if let Ok((url, store)) = self.get_object_store(dataset) {
+            let _ = ctx.runtime_env().register_object_store(&url, store);
+        } else {
+            return Box::pin(async move { vec![] });
+        }
+
+        Box::pin(async move {
+            if let Ok(df) = ctx
+                .read_parquet(format!("s3:{path}"), ParquetReadOptions::default())
+                .await
+            {
+                return df.collect().await.unwrap();
+            }
+            vec![]
+        })
     }
 
     fn has_table_provider(&self) -> bool {
