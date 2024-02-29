@@ -5,7 +5,6 @@ use object_store::aws::{AmazonS3, AmazonS3Builder};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::{collections::HashMap, future::Future};
-use tract_onnx::pb_helpers::OptionExt;
 use url::Url;
 
 use spicepod::component::dataset::Dataset;
@@ -13,7 +12,6 @@ use spicepod::component::dataset::Dataset;
 use crate::auth::AuthProvider;
 
 use super::DataConnector;
-use object_store::aws::AwsCredential;
 use snafu::prelude::*;
 
 #[derive(Debug, Snafu)]
@@ -26,13 +24,12 @@ pub enum Error {
 }
 
 pub struct S3 {
-    auth_provider: AuthProvider,
-    path: String,
     _s3: Arc<AmazonS3>,
 }
 impl S3 {
+    #[must_use]
     pub fn get_from_params(
-        params: Arc<Option<HashMap<String, String>>>,
+        params: &Arc<Option<HashMap<String, String>>>,
         key: &str,
     ) -> Option<String> {
         params
@@ -52,30 +49,26 @@ impl DataConnector for S3 {
         Self: Sized,
     {
         Box::pin(async move {
-            let mut s3Builder = AmazonS3Builder::new().with_bucket_name("");
+            let mut s3_builder = AmazonS3Builder::new().with_bucket_name("");
 
-            if let Some(region) = Self::get_from_params(params.clone(), "region") {
-                s3Builder = s3Builder.with_region(region)
+            if let Some(region) = Self::get_from_params(&params, "region") {
+                s3_builder = s3_builder.with_region(region);
             }
-            if let Some(endpoint) = Self::get_from_params(params, "endpoint") {
-                s3Builder = s3Builder.with_endpoint(endpoint)
+            if let Some(endpoint) = Self::get_from_params(&params, "endpoint") {
+                s3_builder = s3_builder.with_endpoint(endpoint);
             }
 
             if let Some(key) = auth_provider.get_param("key") {
-                s3Builder = s3Builder.with_access_key_id(key)
+                s3_builder = s3_builder.with_access_key_id(key);
             };
             if let Some(secret) = auth_provider.get_param("secret") {
-                s3Builder = s3Builder.with_secret_access_key(secret)
+                s3_builder = s3_builder.with_secret_access_key(secret);
             };
-            let s3 = s3Builder
+            let s3 = s3_builder
                 .build()
                 .map_err(|e| super::Error::UnableToCreateDataConnector { source: e.into() })?;
 
-            Ok(Self {
-                path: "".to_string(),
-                auth_provider,
-                _s3: Arc::new(s3),
-            })
+            Ok(Self { _s3: Arc::new(s3) })
         })
     }
 
@@ -85,7 +78,7 @@ impl DataConnector for S3 {
 
     fn get_all_data(
         &self,
-        dataset: &Dataset,
+        _dataset: &Dataset,
     ) -> Pin<Box<dyn Future<Output = Vec<arrow::record_batch::RecordBatch>> + Send>> {
         todo!()
     }
@@ -100,14 +93,19 @@ impl DataConnector for S3 {
     ) -> std::result::Result<Arc<dyn datafusion::datasource::TableProvider>, super::Error> {
         let ctx = SessionContext::new();
 
-        let s3_url = Url::parse(&dataset.from).unwrap();
+        let s3_url =
+            Url::parse(&dataset.from).map_err(|_| super::Error::UnableToGetTableProvider {
+                source: "unable to parse `from` field in spicepod as an S3 path".into(),
+            })?;
+
         ctx.runtime_env()
             .register_object_store(&s3_url, self._s3.clone());
 
         let df = ctx
             .read_parquet(&dataset.from, ParquetReadOptions::default())
-            .await;
+            .await
+            .map_err(|e| super::Error::UnableToGetTableProvider { source: e.into() })?;
 
-        Ok(df.unwrap().into_view())
+        Ok(df.into_view())
     }
 }
