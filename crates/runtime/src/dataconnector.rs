@@ -17,11 +17,12 @@ use crate::auth::AuthProvider;
 use crate::datapublisher::DataPublisher;
 use crate::dataupdate::{DataUpdate, UpdateType};
 
+// pub mod aws;
 pub mod debug;
 pub mod dremio;
 pub mod flight;
+pub mod s3;
 pub mod spiceai;
-pub mod aws;
 
 #[derive(Debug, Snafu)]
 pub enum Error {

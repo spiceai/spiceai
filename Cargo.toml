@@ -27,7 +27,6 @@ repository = "https://github.com/spiceai/spiceai"
 exclude = [".github/"]
 
 [workspace.dependencies]
-spiced = { path = "bin/spiced" }
 clap = { version = "4.4.14", features = ["derive"] }
 serde = { version = "1.0.195", features = ["derive"] }
 serde_yaml = "0.9.30"

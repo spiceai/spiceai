@@ -3045,13 +3045,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2524735495ea1268be33d200e1ee97455096a0846295a21548cd2f3541de7050"
 dependencies = [
  "async-trait",
+ "base64",
  "bytes",
  "chrono",
  "futures",
  "humantime",
+ "hyper 0.14.28",
  "itertools 0.11.0",
  "parking_lot",
  "percent-encoding",
+ "quick-xml 0.31.0",
+ "rand",
+ "reqwest",
+ "ring",
+ "serde",
+ "serde_json",
  "snafu 0.7.5",
  "tokio",
  "tracing",
@@ -3822,6 +3830,7 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-streams",
  "web-sys",
+ "webpki-roots",
  "winreg",
 ]
 
@@ -3896,7 +3905,7 @@ dependencies = [
  "ndarray",
  "ndarray-npy",
  "notify",
- "object_store 0.9.0",
+ "object_store 0.8.0",
  "opentelemetry-proto",
  "quick-xml 0.23.1",
  "r2d2",
@@ -3915,6 +3924,7 @@ dependencies = [
  "tracing",
  "tract-core",
  "tract-onnx",
+ "url",
  "uuid",
 ]
 
@@ -4371,7 +4381,6 @@ name = "spiced"
 version = "0.7.0-alpha"
 dependencies = [
  "app",
- "aws-config",
  "clap",
  "flightrepl",
  "metrics",
@@ -5345,6 +5354,12 @@ dependencies = [
  "js-sys",
  "wasm-bindgen",
 ]
+
+[[package]]
+name = "webpki-roots"
+version = "0.25.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5f20c57d8d7db6d3b86154206ae5d8fba62dd39573114de97c2cb0578251f8e1"
 
 [[package]]
 name = "winapi"
