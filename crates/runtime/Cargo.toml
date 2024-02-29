@@ -48,6 +48,7 @@ notify = "6.1.1"
 arrow-json = "49.0.0"
 async-trait.workspace = true
 flight_datafusion = { path = "../flight_datafusion" }
+arrow_sql_gen = { path = "../arrow_sql_gen" }
 
 [features]
 default = ["duckdb"]
