@@ -30,7 +30,14 @@ pub struct SecretStores {
 #[allow(clippy::module_name_repetitions)]
 #[derive(Default, Deserialize, Clone)]
 pub struct Secret {
-    pub data: HashMap<String, String>,
+    data: HashMap<String, String>,
+}
+
+impl Secret {
+    #[must_use]
+    pub fn get_secret(&self, key: &str) -> Option<&str> {
+        self.data.get(&key.to_string()).map(String::as_str)
+    }
 }
 
 #[allow(clippy::module_name_repetitions)]

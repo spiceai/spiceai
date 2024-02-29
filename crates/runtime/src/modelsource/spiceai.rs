@@ -91,7 +91,7 @@ impl ModelSource for SpiceAI {
         let client = reqwest::Client::new();
         let data = client
             .get(url.clone())
-            .bearer_auth(auth_provider.get_param("token").unwrap_or_default())
+            .bearer_auth(auth_secret.get_secret("token").unwrap_or_default())
             .send()
             .await
             .context(super::UnableToFetchModelSnafu)?

@@ -17,7 +17,6 @@ use tokio::{signal, sync::RwLock};
 
 use crate::{dataconnector::DataConnector, datafusion::DataFusion};
 
-pub mod secretstore;
 pub mod config;
 pub mod databackend;
 pub mod dataconnector;
@@ -32,6 +31,7 @@ pub mod modelruntime;
 pub mod modelsource;
 mod opentelemetry;
 pub mod podswatcher;
+pub mod secretstore;
 pub(crate) mod tracers;
 
 #[derive(Debug, Snafu)]
@@ -92,7 +92,7 @@ pub struct Runtime {
     pub df: Arc<RwLock<DataFusion>>,
     pub models: Arc<RwLock<HashMap<String, Model>>>,
     pub pods_watcher: podswatcher::PodsWatcher,
-    pub auth: Arc<RwLock<secretstore::AuthProviders>>,
+    pub secrets: Arc<RwLock<HashMap<String, secretstore::SecretStore>>>,
 
     spaced_tracer: Arc<tracers::SpacedTracer>,
 }
@@ -104,7 +104,7 @@ impl Runtime {
         app: Arc<RwLock<Option<app::App>>>,
         df: Arc<RwLock<DataFusion>>,
         pods_watcher: podswatcher::PodsWatcher,
-        auth: Arc<RwLock<secretstore::AuthProviders>>,
+        secrets: Arc<RwLock<HashMap<String, secretstore::SecretStore>>>,
     ) -> Self {
         Runtime {
             app,
@@ -112,7 +112,7 @@ impl Runtime {
             df,
             models: Arc::new(RwLock::new(HashMap::new())),
             pods_watcher,
-            auth,
+            secrets,
             spaced_tracer: Arc::new(tracers::SpacedTracer::new(Duration::from_secs(15))),
         }
     }
@@ -129,7 +129,7 @@ impl Runtime {
     pub fn load_dataset(&self, ds: &Dataset) {
         let df = Arc::clone(&self.df);
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
-        let shared_auth = Arc::clone(&self.auth);
+        let shared_auth = Arc::clone(&self.secrets);
 
         let ds = ds.clone();
 
@@ -213,19 +213,19 @@ impl Runtime {
 
     async fn get_dataconnector_from_source(
         source: &str,
-        auth: &secretstore::AuthProviders,
+        secrets: &HashMap<String, secretstore::SecretStore>,
         params: Arc<Option<HashMap<String, String>>>,
     ) -> Result<Option<Box<dyn DataConnector + Send>>> {
         match source {
             "spiceai" => Ok(Some(Box::new(
-                dataconnector::spiceai::SpiceAI::new(auth.get(source), params)
+                dataconnector::spiceai::SpiceAI::new(secrets.get(source), params)
                     .await
                     .context(UnableToInitializeDataConnectorSnafu {
                         data_connector: source,
                     })?,
             ))),
             "dremio" => Ok(Some(Box::new(
-                dataconnector::dremio::Dremio::new(auth.get(source), params)
+                dataconnector::dremio::Dremio::new(secrets.get(source), params)
                     .await
                     .context(UnableToInitializeDataConnectorSnafu {
                         data_connector: source,
@@ -335,7 +335,7 @@ impl Runtime {
     pub async fn load_model(&self, m: &SpicepodModel) {
         tracing::info!("Loading model [{}] from {}...", m.name, m.from);
         let mut model_map = self.models.write().await;
-        let auth = self.auth.read().await;
+        let auth = self.secrets.read().await;
 
         match Model::load(m, auth.get(model::source(&m.from).as_str())).await {
             Ok(in_m) => {
@@ -408,7 +408,7 @@ impl Runtime {
                 tracing::debug!("Updated pods information: {:?}", new_app);
                 tracing::debug!("Previous pods information: {:?}", current_app);
 
-                *self.auth.write().await = initialize_secret_stores();
+                *self.secrets.write().await = initialize_secret_stores();
 
                 // check for new and updated datasets
                 for ds in &new_app.datasets {

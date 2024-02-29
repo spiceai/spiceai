@@ -34,8 +34,8 @@ impl DataConnector for Dremio {
                 })?;
             let flight_client = FlightClient::new(
                 endpoint.as_str(),
-                auth_provider.get_param("username").unwrap_or_default(),
-                auth_provider.get_param("password").unwrap_or_default(),
+                auth_secret.get_secret("username").unwrap_or_default(),
+                auth_secret.get_secret("password").unwrap_or_default(),
             )
             .await
             .map_err(|e| super::Error::UnableToCreateDataConnector { source: e.into() })?;
