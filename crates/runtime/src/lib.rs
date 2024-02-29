@@ -113,7 +113,7 @@ impl Runtime {
             df,
             models: Arc::new(RwLock::new(HashMap::new())),
             pods_watcher,
-            secrets,
+            secret_stores,
             spaced_tracer: Arc::new(tracers::SpacedTracer::new(Duration::from_secs(15))),
         }
     }
