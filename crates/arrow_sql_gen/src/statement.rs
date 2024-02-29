@@ -1,7 +1,15 @@
-use arrow::datatypes::{DataType, Schema};
-use sea_query::{
-    Alias, ColumnDef, ColumnType, Index, IntoIden, IntoIndexColumn, PostgresQueryBuilder, Table,
+use arrow::{
+    array::{array, Array, RecordBatch},
+    datatypes::{DataType, Schema},
 };
+use rust_decimal::Decimal;
+
+use sea_query::{
+    Alias, ColumnDef, ColumnType, Index, InsertStatement, IntoIden, IntoIndexColumn,
+    PostgresQueryBuilder, Query, SimpleExpr, Table, Value,
+};
+use std::str::FromStr;
+use std::sync::Arc;
 
 pub struct CreateTableBuilder {
     schema: Schema,
@@ -55,6 +63,157 @@ impl CreateTableBuilder {
     }
 }
 
+pub struct InsertTableBuilder {
+    table_name: String,
+    record_batches: Vec<RecordBatch>,
+}
+
+impl InsertTableBuilder {
+    #[must_use]
+    pub fn new(table_name: &str, record_batches: &Vec<RecordBatch>) -> Self {
+        Self {
+            table_name: table_name.to_string(),
+            record_batches: record_batches.clone(),
+        }
+    }
+
+    // Build the insert statement for each recordbatch
+    pub fn construct_insert_stmt(
+        &self,
+        insert_stmt: &mut InsertStatement,
+        record_batch: &RecordBatch,
+    ) {
+        let num = "2.02";
+        let val = Decimal::from_str(num).unwrap();
+        let v: Value = val.into();
+        let out: Decimal = v.unwrap();
+        assert_eq!(out.to_string(), num);
+        for row in 0..record_batch.num_rows() {
+            let mut row_values: Vec<SimpleExpr> = vec![];
+            for col in 0..record_batch.num_columns() {
+                let column = record_batch.column(col);
+                match column.data_type() {
+                    DataType::Int8 => {
+                        let array = column.as_any().downcast_ref::<array::Int8Array>();
+                        if let Some(valid_array) = array {
+                            row_values.push(valid_array.value(row).into());
+                        }
+                    }
+                    DataType::Int16 => {
+                        let array = column.as_any().downcast_ref::<array::Int16Array>();
+                        if let Some(valid_array) = array {
+                            row_values.push(valid_array.value(row).into());
+                        }
+                    }
+                    DataType::Int32 => {
+                        let array = column.as_any().downcast_ref::<array::Int32Array>();
+                        if let Some(valid_array) = array {
+                            row_values.push(valid_array.value(row).into());
+                        }
+                    }
+                    DataType::Int64 => {
+                        let array = column.as_any().downcast_ref::<array::Int64Array>();
+                        if let Some(valid_array) = array {
+                            row_values.push(valid_array.value(row).into());
+                        }
+                    }
+                    DataType::UInt8 => {
+                        let array = column.as_any().downcast_ref::<array::UInt8Array>();
+                        if let Some(valid_array) = array {
+                            row_values.push(valid_array.value(row).into());
+                        }
+                    }
+                    DataType::UInt16 => {
+                        let array = column.as_any().downcast_ref::<array::UInt16Array>();
+                        if let Some(valid_array) = array {
+                            row_values.push(valid_array.value(row).into());
+                        }
+                    }
+                    DataType::UInt32 => {
+                        let array = column.as_any().downcast_ref::<array::UInt32Array>();
+                        if let Some(valid_array) = array {
+                            row_values.push(valid_array.value(row).into());
+                        }
+                    }
+                    DataType::UInt64 => {
+                        let array = column.as_any().downcast_ref::<array::UInt64Array>();
+                        if let Some(valid_array) = array {
+                            row_values.push(valid_array.value(row).into());
+                        }
+                    }
+                    DataType::Float32 => {
+                        let array = column.as_any().downcast_ref::<array::Float32Array>();
+                        if let Some(valid_array) = array {
+                            row_values.push(valid_array.value(row).into());
+                        }
+                    }
+                    DataType::Float64 => {
+                        let array = column.as_any().downcast_ref::<array::Float64Array>();
+                        if let Some(valid_array) = array {
+                            row_values.push(valid_array.value(row).into());
+                        }
+                    }
+                    DataType::Utf8 => {
+                        let array = column.as_any().downcast_ref::<array::StringArray>();
+                        if let Some(valid_array) = array {
+                            row_values.push(valid_array.value(row).into());
+                        }
+                    }
+                    DataType::Boolean => {
+                        let array = column.as_any().downcast_ref::<array::BooleanArray>();
+                        if let Some(valid_array) = array {
+                            let value = valid_array.value(row);
+                            row_values.push(value.into());
+                        }
+                    }
+                    DataType::Decimal128(_, scale) => {
+                        let array = column.as_any().downcast_ref::<array::Decimal128Array>();
+                        if let Some(valid_array) = array {
+                            let value: i128 = valid_array.value(row);
+                            let decimal_value = Decimal::from_i128_with_scale(value, *scale as u32);
+                            row_values.push(decimal_value.into());
+                        }
+                    }
+                    DataType::Timestamp(_, _) => {
+                        let array = column
+                            .as_any()
+                            .downcast_ref::<array::TimestampMicrosecondArray>();
+                        if let Some(valid_array) = array {
+                            let value = valid_array.value(row);
+                            row_values.push(value.into());
+                        }
+                    }
+                    _ => unimplemented!(
+                        "Data type mapping not implemented for {:?}",
+                        column.data_type()
+                    ),
+                }
+            }
+            insert_stmt.values_panic(row_values);
+        }
+    }
+
+    #[must_use]
+    pub fn build(self) -> String {
+        let columns: Vec<Alias> = (&self.record_batches[0])
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| Alias::new(field.name()))
+            .collect();
+
+        let mut insert_stmt = Query::insert()
+            .into_table(Alias::new(&self.table_name))
+            .columns(columns)
+            .to_owned();
+
+        for record_batch in &self.record_batches {
+            self.construct_insert_stmt(&mut insert_stmt, &record_batch);
+        }
+        insert_stmt.to_string(PostgresQueryBuilder)
+    }
+}
+
 fn map_data_type_to_column_type(data_type: &DataType) -> ColumnType {
     match data_type {
         DataType::Int8 => ColumnType::TinyInteger,
@@ -93,6 +252,48 @@ mod tests {
         let sql = CreateTableBuilder::new(&schema, "users").build();
 
         assert_eq!(sql, "CREATE TABLE IF NOT EXISTS \"users\" ( \"id\" integer NOT NULL, \"name\" text NOT NULL, \"age\" integer )");
+    }
+
+    #[test]
+    fn test_table_insertion() {
+        let schema1 = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("age", DataType::Int32, true),
+        ]);
+        let id_array = array::Int32Array::from(vec![1, 2, 3]);
+        let name_array = array::StringArray::from(vec!["a", "b", "c"]);
+        let age_array = array::Int32Array::from(vec![10, 20, 30]);
+
+        let batch1 = RecordBatch::try_new(
+            Arc::new(schema1.clone()),
+            vec![
+                Arc::new(id_array.clone()),
+                Arc::new(name_array.clone()),
+                Arc::new(age_array.clone()),
+            ],
+        )
+        .unwrap();
+
+        let schema2 = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("blah", DataType::Int32, true),
+        ]);
+
+        let batch2 = RecordBatch::try_new(
+            Arc::new(schema2),
+            vec![
+                Arc::new(id_array),
+                Arc::new(name_array),
+                Arc::new(age_array),
+            ],
+        )
+        .unwrap();
+        let record_batches = vec![batch1, batch2];
+
+        let sql = InsertTableBuilder::new("users", &record_batches).build();
+        assert_eq!(sql, "INSERT INTO \"users\" (\"id\", \"name\", \"age\") VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', 30), (1, 'a', 10), (2, 'b', 20), (3, 'c', 30)");
     }
 
     #[test]
