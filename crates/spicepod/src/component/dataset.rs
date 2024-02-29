@@ -215,6 +215,7 @@ pub mod acceleration {
         Arrow,
         #[cfg(feature = "duckdb")]
         DuckDB,
+        Postgres,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

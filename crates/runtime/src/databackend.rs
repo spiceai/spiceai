@@ -9,6 +9,7 @@ use self::{duckdb::DuckDBBackend, memtable::MemTableBackend};
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
 pub mod memtable;
+pub mod postgres;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -117,6 +118,18 @@ impl DataBackendBuilder {
             #[cfg(feature = "duckdb")]
             Engine::DuckDB => Ok(Box::new(
                 DuckDBBackend::new(
+                    Arc::clone(&self.ctx),
+                    self.name.as_str(),
+                    mode.into(),
+                    self.params,
+                    self.primary_keys,
+                )
+                .await
+                .boxed()
+                .context(BackendCreationFailedSnafu)?,
+            )),
+            Engine::Postgres => Ok(Box::new(
+                postgres::PostgresBackend::new(
                     Arc::clone(&self.ctx),
                     self.name.as_str(),
                     mode.into(),

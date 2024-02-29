@@ -49,6 +49,8 @@ arrow-json = "49.0.0"
 async-trait.workspace = true
 flight_datafusion = { path = "../flight_datafusion" }
 arrow_sql_gen = { path = "../arrow_sql_gen" }
+bb8 = "0.7"
+bb8-postgres = "0.7"
 
 [features]
 default = ["duckdb"]

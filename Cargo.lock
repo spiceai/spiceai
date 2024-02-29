@@ -3613,6 +3613,8 @@ dependencies = [
  "async-stream",
  "async-trait",
  "axum 0.7.4",
+ "bb8",
+ "bb8-postgres",
  "clap",
  "datafusion",
  "dirs",
