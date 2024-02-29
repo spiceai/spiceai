@@ -68,7 +68,7 @@ pub struct Args {
 
 pub async fn run(args: Args) -> Result<()> {
     let current_dir = env::current_dir().unwrap_or(PathBuf::from("."));
-    let auth = Arc::new(RwLock::new(runtime::initialize_secret_stores()));
+    let secret_stores = Arc::new(RwLock::new(runtime::initialize_secret_stores()));
     let df = Arc::new(RwLock::new(runtime::datafusion::DataFusion::new()));
     let pods_watcher = PodsWatcher::new(current_dir.clone());
     let app: Arc<RwLock<Option<App>>> =
@@ -80,7 +80,7 @@ pub async fn run(args: Args) -> Result<()> {
             }
         };
 
-    let mut rt: Runtime = Runtime::new(args.runtime, app, df, pods_watcher, auth);
+    let mut rt: Runtime = Runtime::new(args.runtime, app, df, pods_watcher, secret_stores);
 
     rt.load_datasets().await;
 
