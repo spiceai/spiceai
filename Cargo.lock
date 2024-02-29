@@ -419,6 +419,7 @@ version = "0.7.0-alpha"
 dependencies = [
  "arrow",
  "postgres",
+ "rust_decimal",
  "sea-query",
  "snafu 0.8.0",
  "tracing",
@@ -3840,6 +3841,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4166a1e072292d46dc91f31617c2a1cdaf55a8be4b5c9f4bf2ba248e3ac4999b"
 dependencies = [
  "inherent",
+ "rust_decimal",
  "sea-query-derive",
 ]
 
