@@ -1,16 +1,15 @@
 use std::io::Read;
 use std::{collections::HashMap, fs::File};
 
-use app::Result;
 use dirs;
 use snafu::prelude::*;
 
 use super::{
-    Secret, UnableToFindHomeDirSnafu, UnableToOpenAuthFileSnafu, UnableToParseAuthFileSnafu,
+    Error, Secret, UnableToFindHomeDirSnafu, UnableToOpenAuthFileSnafu, UnableToParseAuthFileSnafu,
     UnableToReadAuthFileSnafu,
 };
 
-// pub type Result<T, E = dyn Error> = std::result::Result<T, E>;
+pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct FileSecretStore {
     secrets: HashMap<String, String>,
@@ -19,7 +18,7 @@ pub struct FileSecretStore {
 impl FileSecretStore {
     #[must_use]
     pub fn get_secret(&self, key: &str) -> Secret {
-        let auth = if let Some(auth) = self.auth_configs.get(key) {
+        let secret = if let Some(auth) = self.secrets.get(key) {
             tracing::trace!("Using file auth provider secret key: {}", key);
             auth
         } else {
@@ -27,7 +26,7 @@ impl FileSecretStore {
             return Secret::new();
         };
 
-        Secret::new(auth.clone())
+        Secret::new()
     }
 
     pub fn init(&mut self) -> Result<()> {
