@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use datafusion::execution::context::SessionContext;
 use deltalake::open_table_with_storage_options;
+use serde::Deserialize;
 use snafu::prelude::*;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -83,8 +84,9 @@ async fn get_table_provider(
     auth_provider: AuthProvider,
     dataset: &Dataset,
 ) -> std::result::Result<Arc<dyn datafusion::datasource::TableProvider>, super::Error> {
-    // TODO: Translate the databricks URI
-    let table_uri = "s3://databricks-workspace-stack-f0780-bucket/unity-catalog/686830279408652/__unitystorage/catalogs/1c3649de-309b-4c73-805e-8cf93aa4ee25/tables/c704d041-f240-43eb-b648-88efb26fdefc";
+    
+
+    let table_uri = resolve_table_uri(&dataset).await.context(super::UnableToGetTableProviderSnafu)?;
 
     let mut storage_options = HashMap::new();
     for (key, value) in auth_provider.iter() {
@@ -101,4 +103,42 @@ async fn get_table_provider(
             .context(super::UnableToGetTableProviderSnafu)?;
 
     Ok(Arc::new(delta_table))
+}
+
+#[derive(Deserialize)]
+struct DatabricksTablesApiResponse {
+    storage_location: String,
+}
+
+pub async fn resolve_table_uri(dataset: &Dataset) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let endpoint = match &dataset.params {
+        None => return Err("Dataset params not found".into()),
+        Some(params) => match params.get("endpoint") {
+            Some(val) => val,
+            None => return Err("Endpoint not specified in dataset params".into()),
+        },
+    };
+
+    let table_name = dataset.path();
+
+    let auth_provider = crate::load_auth_providers().get("databricks");
+
+    let token = auth_provider.get_param("token").ok_or("Token not found in auth provider")?;
+
+    let url = format!(
+        "{}/api/2.1/unity-catalog/tables/{}",
+        endpoint.trim_end_matches('/'),
+        table_name
+    );
+
+    let client = reqwest::Client::new();
+    let response = client.get(&url).bearer_auth(token).send().await?;
+
+    if response.status().is_success() {
+        let api_response: DatabricksTablesApiResponse = response.json().await?;
+        Ok(api_response.storage_location)
+    } else {
+        // Handle different status codes here if needed
+        Err(format!("Failed to retrieve databricks table URI. Status: {}", response.status()).into())
+    }
 }
