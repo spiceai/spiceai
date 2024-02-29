@@ -93,7 +93,7 @@ pub struct Runtime {
     pub df: Arc<RwLock<DataFusion>>,
     pub models: Arc<RwLock<HashMap<String, Model>>>,
     pub pods_watcher: podswatcher::PodsWatcher,
-    pub secrets: Arc<RwLock<SecretStores>>,
+    pub secret_stores: Arc<RwLock<SecretStores>>,
 
     spaced_tracer: Arc<tracers::SpacedTracer>,
 }
@@ -105,7 +105,7 @@ impl Runtime {
         app: Arc<RwLock<Option<app::App>>>,
         df: Arc<RwLock<DataFusion>>,
         pods_watcher: podswatcher::PodsWatcher,
-        secrets: Arc<RwLock<SecretStores>>,
+        secret_stores: Arc<RwLock<SecretStores>>,
     ) -> Self {
         Runtime {
             app,
@@ -130,7 +130,7 @@ impl Runtime {
     pub fn load_dataset(&self, ds: &Dataset) {
         let df = Arc::clone(&self.df);
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
-        let shared_secret_stores = Arc::clone(&self.secrets);
+        let shared_secret_stores = Arc::clone(&self.secret_stores);
 
         let ds = ds.clone();
 
@@ -350,7 +350,7 @@ impl Runtime {
         tracing::info!("Loading model [{}] from {}...", m.name, m.from);
         let mut model_map = self.models.write().await;
 
-        let secret_stores = self.secrets.read().await;
+        let secret_stores = self.secret_stores.read().await;
         let secret_store = match secret_stores.get_store("file") {
             Some(s) => s,
             None => {
@@ -434,7 +434,7 @@ impl Runtime {
                 tracing::debug!("Updated pods information: {:?}", new_app);
                 tracing::debug!("Previous pods information: {:?}", current_app);
 
-                *self.secrets.write().await = initialize_secret_stores();
+                *self.secret_stores.write().await = initialize_secret_stores();
 
                 // check for new and updated datasets
                 for ds in &new_app.datasets {
