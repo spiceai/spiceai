@@ -5,8 +5,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::{collections::HashMap, future::Future};
 
-use deltalake::aws::storage::s3_constants::{AWS_ACCESS_KEY_ID, AWS_REGION, AWS_SECRET_ACCESS_KEY};
-
 use spicepod::component::dataset::Dataset;
 
 use crate::auth::AuthProvider;
@@ -52,6 +50,28 @@ impl DataConnector for Databricks {
         &self,
         _dataset: &Dataset,
     ) -> std::result::Result<Arc<dyn datafusion::datasource::TableProvider>, super::Error> {
-        unimplemented!()
+        // TODO: Translate the databricks URI
+        let table_uri = "s3://databricks-workspace-stack-f0780-bucket/unity-catalog/686830279408652/__unitystorage/catalogs/1c3649de-309b-4c73-805e-8cf93aa4ee25/tables/c704d041-f240-43eb-b648-88efb26fdefc";
+
+        let mut storage_options = HashMap::new();
+        for (key, value) in self.auth_provider.iter() {
+            storage_options.insert(key.to_string(), value.to_string());
+        }
+        // TODO: Figure out a way to avoid this default hashmap
+        let default_hashmap = HashMap::new();
+        for (key, value) in self.params.as_ref().as_ref().unwrap_or(&default_hashmap) {
+            storage_options.insert(key.to_string(), value.to_string());
+        }
+        drop(default_hashmap);
+
+        let delta_table: deltalake::DeltaTable =
+            open_table_with_storage_options(table_uri, storage_options)
+                .await
+                .boxed()
+                .context(super::UnableToGetTableProviderSnafu)?;
+
+        Ok(Arc::new(delta_table))
+    }
+}
     }
 }

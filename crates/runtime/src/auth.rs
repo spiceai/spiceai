@@ -89,4 +89,8 @@ impl AuthProvider {
             .get(&param.to_string())
             .map(String::as_str)
     }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &String)> {
+        self.auth_config.params.iter()
+    }
 }
