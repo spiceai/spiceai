@@ -44,6 +44,7 @@ impl SecretStores {
     }
 
     #[must_use]
+    #[allow(clippy::borrowed_box)]
     pub fn get_store(&self, name: &str) -> Option<&Box<dyn SecretStore + Send + Sync>> {
         self.stores.get(&name.to_string())
     }
