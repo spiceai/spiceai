@@ -19,12 +19,14 @@ pub struct AuthConfig {
     pub params: HashMap<String, String>,
 }
 
+#[allow(clippy::module_name_repetitions)]
 #[derive(Default)]
 pub struct FileSecretStore {
     secrets: HashMap<String, HashMap<String, String>>,
 }
 
 impl FileSecretStore {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             secrets: HashMap::new(),
