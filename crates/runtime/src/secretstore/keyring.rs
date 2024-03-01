@@ -4,6 +4,7 @@ use keyring::Entry;
 
 use super::{Result, Secret, SecretStore};
 
+#[derive(Default)]
 pub struct KeyringSecretStore;
 
 impl KeyringSecretStore {
@@ -17,12 +18,12 @@ impl SecretStore for KeyringSecretStore {
     fn get_secret(&self, key: &str) -> Secret {
         let entry = match Entry::new(key, "spiced") {
             Ok(entry) => entry,
-            Err(e) => return Secret::new(HashMap::new()),
+            Err(_) => return Secret::new(HashMap::new()),
         };
 
         let secret = match entry.get_password() {
             Ok(secret) => secret,
-            Err(e) => {
+            Err(_) => {
                 return Secret::new(HashMap::new());
             }
         };

@@ -524,19 +524,20 @@ impl Runtime {
         let secret_stores = shared_secret_stores.read().await;
 
         for s in secrets {
-            let secret_store = match secret_stores.get_store(&s.store).ok_or_else(|| {
-                UnableToLoadSecretStoreSnafu {
-                    secret_store: &s.store,
-                }
-            }) {
-                Ok(s) => s,
-                Err(_) => {
-                    tracing::error!("Unable to load secret store: {:?}", &s.store);
-                    break;
-                }
-            };
+            let secret_store =
+                match secret_stores
+                    .get_store(&s.store)
+                    .ok_or(|| UnableToLoadSecretStoreSnafu {
+                        secret_store: &s.store,
+                    }) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        tracing::error!("Unable to load secret store: {:?}", &s.store);
+                        break;
+                    }
+                };
 
-            let secret = secret_store.get_secret(&s.store_key.as_str().clone());
+            let secret = secret_store.get_secret(s.store_key.as_str());
             let value = match secret.get_secret(&s.data_key) {
                 Some(v) => v,
                 None => {
@@ -560,9 +561,9 @@ fn has_table_provider(data_connector: &Option<Box<dyn DataConnector + Send>>) ->
 }
 
 pub fn initialize_secret_stores() -> secretstore::SecretStores {
-    let mut stores = secretstore::SecretStores::new();
+    let mut stores = secretstore::SecretStores::default();
 
-    let mut file_secret_store = FileSecretStore::new();
+    let mut file_secret_store = FileSecretStore::default();
     match file_secret_store.init() {
         Ok(()) => {}
         Err(err) => {

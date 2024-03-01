@@ -69,7 +69,7 @@ impl Secret {
     where
         Self: Sized,
     {
-        Self { data: data }
+        Self { data }
     }
 }
 

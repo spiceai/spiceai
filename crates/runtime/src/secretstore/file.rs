@@ -19,6 +19,7 @@ pub struct AuthConfig {
     pub params: HashMap<String, String>,
 }
 
+#[derive(Default)]
 pub struct FileSecretStore {
     secrets: HashMap<String, HashMap<String, String>>,
 }
