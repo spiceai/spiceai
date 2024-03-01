@@ -2,6 +2,7 @@ use std::{collections::HashMap, fs, time::Duration};
 
 use serde::{Deserialize, Serialize};
 
+use super::secret::{resolve_secrets, Secret, SecretWithValueFrom, WithGetSecrets};
 use super::WithDependsOn;
 use snafu::prelude::*;
 
@@ -54,6 +55,9 @@ pub struct Dataset {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(rename = "dependsOn", default)]
     pub depends_on: Vec<String>,
+
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secrets: Vec<Secret>,
 }
 
 impl Dataset {
@@ -69,6 +73,7 @@ impl Dataset {
             replication: None,
             acceleration: None,
             depends_on: Vec::default(),
+            secrets: Vec::default(),
         }
     }
 
@@ -186,6 +191,7 @@ impl WithDependsOn<Dataset> for Dataset {
             replication: self.replication.clone(),
             acceleration: self.acceleration.clone(),
             depends_on: depends_on.to_vec(),
+            secrets: self.secrets.clone(),
         }
     }
 }
@@ -267,5 +273,11 @@ pub mod replication {
     pub struct Replication {
         #[serde(default)]
         pub enabled: bool,
+    }
+}
+
+impl WithGetSecrets for Dataset {
+    fn get_secrets(&self, default_from: Option<String>) -> Vec<SecretWithValueFrom> {
+        resolve_secrets(&self.secrets, default_from)
     }
 }
