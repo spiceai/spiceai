@@ -384,15 +384,15 @@ impl Runtime {
 
         let source = model::source(&m.from);
         let secret_stores = self.secret_stores.read().await;
-        let secret_store =
-            match secret_stores
+        let Ok(secret_store) =
+            secret_stores
                 .get_store("files")
                 .ok_or_else(|| UnableToLoadSecretStoreSnafu {
                     secret_store: source.clone(),
-                }) {
-                Ok(s) => s,
-                Err(_) => return,
-            };
+                })
+        else {
+            return;
+        };
 
         match Model::load(m, secret_store.get_secret(source.as_str())).await {
             Ok(in_m) => {
@@ -524,26 +524,21 @@ impl Runtime {
         let secret_stores = shared_secret_stores.read().await;
 
         for s in secrets {
-            let secret_store =
-                match secret_stores
+            let Ok(secret_store) =
+                secret_stores
                     .get_store(&s.store)
                     .ok_or(|| UnableToLoadSecretStoreSnafu {
                         secret_store: &s.store,
-                    }) {
-                    Ok(s) => s,
-                    Err(_) => {
-                        tracing::error!("Unable to load secret store: {:?}", &s.store);
-                        break;
-                    }
-                };
+                    })
+            else {
+                tracing::error!("Unable to load secret store: {:?}", &s.store);
+                break;
+            };
 
             let secret = secret_store.get_secret(s.store_key.as_str());
-            let value = match secret.get_secret(&s.data_key) {
-                Some(v) => v,
-                None => {
-                    tracing::error!("Unable to load secret: {:?}", &s.key);
-                    break;
-                }
+            let Some(value) = secret.get_secret(&s.data_key) else {
+                tracing::error!("Unable to load secret: {:?}", &s.key);
+                break;
             };
 
             component_secrets.insert(s.key, value.to_string());

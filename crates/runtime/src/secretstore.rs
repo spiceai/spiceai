@@ -66,6 +66,7 @@ impl Secret {
         self.data.get(&key.to_string()).map(String::as_str)
     }
 
+    #[must_use]
     pub fn new(data: HashMap<String, String>) -> Self
     where
         Self: Sized,
