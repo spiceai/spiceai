@@ -85,19 +85,26 @@ pub(crate) mod datasets {
     }
 
     pub(crate) async fn get(
-        Extension(app): Extension<Arc<RwLock<App>>>,
+        Extension(app): Extension<Arc<RwLock<Option<App>>>>,
         Query(filter): Query<DatasetFilter>,
     ) -> Json<Vec<Dataset>> {
+        let app_lock = app.read().await;
+        let readable_app = match &*app_lock {
+            Some(app) => app,
+            None => {
+                tracing::debug!("App not found");
+                return Json(vec![]);
+            }
+        };
+
         let mut datasets: Vec<Dataset> = match filter.source {
-            Some(source) => app
-                .read()
-                .await
+            Some(source) => readable_app
                 .datasets
                 .iter()
                 .filter(|d| d.source() == source)
                 .cloned()
                 .collect(),
-            None => app.read().await.datasets.clone(),
+            None => readable_app.datasets.clone(),
         };
 
         if filter.remove_views {
@@ -185,7 +192,7 @@ pub(crate) mod inference {
     }
 
     pub(crate) async fn get(
-        Extension(app): Extension<Arc<RwLock<App>>>,
+        Extension(app): Extension<Arc<RwLock<Option<App>>>>,
         Extension(df): Extension<Arc<RwLock<DataFusion>>>,
         Path(model_name): Path<String>,
         Query(params): Query<PredictParams>,
@@ -210,7 +217,7 @@ pub(crate) mod inference {
     }
 
     pub(crate) async fn post(
-        Extension(app): Extension<Arc<RwLock<App>>>,
+        Extension(app): Extension<Arc<RwLock<Option<App>>>>,
         Extension(df): Extension<Arc<RwLock<DataFusion>>>,
         Extension(models): Extension<Arc<RwLock<HashMap<String, Model>>>>,
         Json(payload): Json<BatchPredictRequest>,
@@ -245,7 +252,7 @@ pub(crate) mod inference {
     }
 
     async fn run_inference(
-        app: Arc<RwLock<App>>,
+        app: Arc<RwLock<Option<App>>>,
         df: Arc<RwLock<DataFusion>>,
         models: Arc<RwLock<HashMap<String, Model>>>,
         model_name: String,
@@ -253,7 +260,23 @@ pub(crate) mod inference {
     ) -> PredictResponse {
         let start_time = Instant::now();
 
-        let readable_app = app.read().await;
+        let app_lock = app.read().await;
+        let readable_app = match &*app_lock {
+            Some(app) => app,
+            None => {
+                tracing::debug!("App not found");
+                return PredictResponse {
+                    status: PredictStatus::BadRequest,
+                    error_message: Some("App not found".to_string()),
+                    model_name,
+                    model_version: None,
+                    lookback,
+                    prediction: vec![],
+                    duration_ms: start_time.elapsed().as_millis(),
+                };
+            }
+        };
+
         let model = readable_app.models.iter().find(|m| m.name == model_name);
         let Some(model) = model else {
             tracing::debug!("Model {model_name} not found");
