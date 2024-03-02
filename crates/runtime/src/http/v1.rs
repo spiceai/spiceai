@@ -89,12 +89,9 @@ pub(crate) mod datasets {
         Query(filter): Query<DatasetFilter>,
     ) -> Json<Vec<Dataset>> {
         let app_lock = app.read().await;
-        let readable_app = match &*app_lock {
-            Some(app) => app,
-            None => {
-                tracing::debug!("App not found");
-                return Json(vec![]);
-            }
+        let Some(readable_app) = &*app_lock else {
+            tracing::debug!("App not found");
+            return Json(vec![]);
         };
 
         let mut datasets: Vec<Dataset> = match filter.source {
@@ -261,20 +258,17 @@ pub(crate) mod inference {
         let start_time = Instant::now();
 
         let app_lock = app.read().await;
-        let readable_app = match &*app_lock {
-            Some(app) => app,
-            None => {
-                tracing::debug!("App not found");
-                return PredictResponse {
-                    status: PredictStatus::BadRequest,
-                    error_message: Some("App not found".to_string()),
-                    model_name,
-                    model_version: None,
-                    lookback,
-                    prediction: vec![],
-                    duration_ms: start_time.elapsed().as_millis(),
-                };
-            }
+        let Some(readable_app) = &*app_lock else {
+            tracing::debug!("App not found");
+            return PredictResponse {
+                status: PredictStatus::BadRequest,
+                error_message: Some("App not found".to_string()),
+                model_name,
+                model_version: None,
+                lookback,
+                prediction: vec![],
+                duration_ms: start_time.elapsed().as_millis(),
+            };
         };
 
         let model = readable_app.models.iter().find(|m| m.name == model_name);
