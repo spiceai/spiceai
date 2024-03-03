@@ -90,7 +90,6 @@ pub(crate) mod datasets {
     ) -> Json<Vec<Dataset>> {
         let app_lock = app.read().await;
         let Some(readable_app) = &*app_lock else {
-            tracing::debug!("App not found");
             return Json(vec![]);
         };
 
