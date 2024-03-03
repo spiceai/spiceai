@@ -258,7 +258,6 @@ pub(crate) mod inference {
 
         let app_lock = app.read().await;
         let Some(readable_app) = &*app_lock else {
-            tracing::debug!("App not found");
             return PredictResponse {
                 status: PredictStatus::BadRequest,
                 error_message: Some("App not found".to_string()),
