@@ -29,7 +29,7 @@ spice dataset configure
 `,
 	Run: func(cmd *cobra.Command, args []string) {
 		if fi, err := os.Stat("spicepod.yaml"); os.IsNotExist(err) || fi.IsDir() {
-			cmd.Println(aurora.BrightRed("No spicepod.yml found. Run spice init <app> first."))
+			cmd.Println(aurora.BrightRed("No spicepod.yaml found. Run spice init <app> first."))
 			os.Exit(1)
 		}
 
