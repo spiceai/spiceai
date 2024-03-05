@@ -231,7 +231,7 @@ impl<'a> DuckDBUpdate<'a> {
         let sql = format!(
             r#"SELECT EXISTS (
               SELECT 1
-              FROM information_schema.tables 
+              FROM information_schema.tables
               WHERE table_name = '{name}'
             )"#,
             name = self.name

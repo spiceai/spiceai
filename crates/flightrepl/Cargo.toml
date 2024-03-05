@@ -19,6 +19,8 @@ tonic = { workspace = true, default-features = false, features = [
   "tls",
   "tls-roots",
 ] }
+regex = "1.10.3"
+snafu = "0.8.0"
 async-stream.workspace = true
 futures.workspace = true
 tracing.workspace = true
