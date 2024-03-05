@@ -13,6 +13,7 @@ const (
 type Dataset struct {
 	From         string            `json:"from,omitempty" csv:"from" yaml:"from,omitempty"`
 	Name         string            `json:"name,omitempty" csv:"name" yaml:"name,omitempty"`
+	Description  string            `json:"description,omitempty" csv:"description" yaml:"description,omitempty"`
 	Params       map[string]string `json:"params,omitempty" csv:"params" yaml:"params,omitempty"`
 	Acceleration *Acceleration     `json:"acceleration,omitempty" csv:"acceleration" yaml:"acceleration,omitempty"`
 }
