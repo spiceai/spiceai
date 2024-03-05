@@ -62,15 +62,15 @@ spice dataset configure
 		description = strings.TrimSuffix(description, "\n")
 
 		cmd.Print("from: ")
-		source, err := reader.ReadString('\n')
+		from, err := reader.ReadString('\n')
 		if err != nil {
 			cmd.Println(err.Error())
 			os.Exit(1)
 		}
-		source = strings.TrimSuffix(source, "\n")
+		from = strings.TrimSuffix(from, "\n")
 
 		params := map[string]string{}
-		if strings.Split(source, ":")[0] == api.DATA_SOURCE_DREMIO {
+		if strings.Split(from, ":")[0] == api.DATA_SOURCE_DREMIO {
 			cmd.Print("endpoint: ")
 			endpoint, err := reader.ReadString('\n')
 			if err != nil {
@@ -92,7 +92,7 @@ spice dataset configure
 		accelerateDataset := locallyAccelerateStr == "" || strings.ToLower(locallyAccelerateStr) == "y"
 
 		dataset := api.Dataset{
-			From:        source,
+			From:        from,
 			Name:        datasetName,
 			Description: description,
 			Params:      params,
