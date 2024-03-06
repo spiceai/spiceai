@@ -2,7 +2,11 @@ use arrow::{
     array::{array, Array, RecordBatch},
     datatypes::{DataType, SchemaRef},
 };
+
+use bigdecimal::BigDecimal;
 use rust_decimal::Decimal;
+
+use time::{OffsetDateTime, PrimitiveDateTime};
 
 use sea_query::{
     Alias, ColumnDef, ColumnType, Index, InsertStatement, IntoIden, IntoIndexColumn,
@@ -75,8 +79,7 @@ impl InsertTableBuilder {
         }
     }
 
-    // Build the insert statement for each recordbatch
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::missing_panics_doc)]
     pub fn construct_insert_stmt(
         &self,
         insert_stmt: &mut InsertStatement,
@@ -156,28 +159,54 @@ impl InsertTableBuilder {
                     DataType::Boolean => {
                         let array = column.as_any().downcast_ref::<array::BooleanArray>();
                         if let Some(valid_array) = array {
-                            let value = valid_array.value(row);
-                            row_values.push(value.into());
+                            row_values.push(valid_array.value(row).into());
                         }
                     }
                     DataType::Decimal128(_, scale) => {
                         let array = column.as_any().downcast_ref::<array::Decimal128Array>();
                         if let Some(valid_array) = array {
-                            let value: i128 = valid_array.value(row);
-                            #[allow(clippy::cast_sign_loss)]
-                            let decimal_value =
-                                Decimal::try_from_i128_with_scale(value, *scale as u32)
-                                    .unwrap_or(Decimal::new(0, 0));
-                            row_values.push(decimal_value.into());
+                            #[allow(clippy::cast_sign_loss, clippy::cast_lossless)]
+                            match Decimal::try_from_i128_with_scale(
+                                valid_array.value(row),
+                                *scale as u32,
+                            ) {
+                                Ok(decimal) => {
+                                    row_values.push(decimal.into());
+                                }
+                                Err(_) => {
+                                    row_values.push(
+                                        BigDecimal::new(
+                                            valid_array.value(row).into(),
+                                            *scale as i64,
+                                        )
+                                        .into(),
+                                    );
+                                }
+                            };
                         }
                     }
                     DataType::Timestamp(_, _) => {
                         let array = column
                             .as_any()
                             .downcast_ref::<array::TimestampMicrosecondArray>();
+                        #[allow(clippy::uninlined_format_args, clippy::unwrap_used)]
                         if let Some(valid_array) = array {
-                            let value = valid_array.value(row);
-                            row_values.push(value.into());
+                            match OffsetDateTime::from_unix_timestamp(
+                                valid_array.value(row) / 1_000_000,
+                            ) {
+                                Ok(offset_time) => {
+                                    row_values.push(
+                                        PrimitiveDateTime::new(
+                                            offset_time.date(),
+                                            offset_time.time(),
+                                        )
+                                        .into(),
+                                    );
+                                }
+                                Err(_) => {
+                                    return;
+                                }
+                            };
                         }
                     }
                     _ => unimplemented!(
@@ -191,7 +220,7 @@ impl InsertTableBuilder {
     }
 
     #[must_use]
-    pub fn build(self) -> String {
+    pub fn build(&self) -> String {
         let columns: Vec<Alias> = (self.record_batches[0])
             .schema()
             .fields()

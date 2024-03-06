@@ -418,10 +418,12 @@ name = "arrow_sql_gen"
 version = "0.7.0-alpha"
 dependencies = [
  "arrow",
+ "bigdecimal",
  "postgres",
  "rust_decimal",
  "sea-query",
  "snafu 0.8.0",
+ "time",
  "tracing",
 ]
 
@@ -639,6 +641,17 @@ dependencies = [
  "bb8",
  "tokio",
  "tokio-postgres",
+]
+
+[[package]]
+name = "bigdecimal"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a6773ddc0eafc0e509fb60e48dff7f450f8e674a0686ae8605e8d9901bd5eefa"
+dependencies = [
+ "num-bigint",
+ "num-integer",
+ "num-traits",
 ]
 
 [[package]]
@@ -3183,6 +3196,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8d2234cdee9408b523530a9b6d2d6b373d1db34f6a8e51dc03ded1828d7fb67c"
 dependencies = [
  "bytes",
+ "chrono",
  "fallible-iterator 0.2.0",
  "postgres-protocol",
 ]
@@ -3842,9 +3856,11 @@ version = "0.30.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4166a1e072292d46dc91f31617c2a1cdaf55a8be4b5c9f4bf2ba248e3ac4999b"
 dependencies = [
+ "bigdecimal",
  "inherent",
  "rust_decimal",
  "sea-query-derive",
+ "time",
 ]
 
 [[package]]
