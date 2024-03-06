@@ -24,4 +24,5 @@ impl Default for Secrets {
 #[serde(rename_all = "lowercase")]
 pub enum SpiceSecretStore {
     File,
+    Env,
 }
