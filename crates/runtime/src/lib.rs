@@ -74,7 +74,7 @@ pub enum Error {
     UnknownDataConnector { data_connector: String },
 
     #[snafu(display("Unable to load secrets for data connector: {data_connector}"))]
-    UnableToLoadDataConnectorSecret { data_connector: String },
+    UnableToLoadDataConnectorSecrets { data_connector: String },
 
     #[snafu(display("Unable to create view: {source}"))]
     InvalidSQLView {
