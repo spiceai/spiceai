@@ -15,10 +15,10 @@ use spicepod::component::dataset::Dataset;
 
 use flight_datafusion::FlightTable;
 
-use crate::auth::AuthProvider;
 use crate::datapublisher::{AddDataResult, DataPublisher};
 use crate::dataupdate::{DataUpdate, UpdateType};
 use crate::info_spaced;
+use crate::secrets::Secret;
 use crate::tracers::SpacedTracer;
 
 use super::{flight::Flight, DataConnector};
@@ -43,7 +43,7 @@ pub struct SpiceAI {
 #[async_trait]
 impl DataConnector for SpiceAI {
     fn new(
-        auth_provider: AuthProvider,
+        secret: Option<Secret>,
         params: Arc<Option<HashMap<String, String>>>,
     ) -> Pin<Box<dyn Future<Output = super::Result<Self>> + Send>>
     where
@@ -55,19 +55,20 @@ impl DataConnector for SpiceAI {
             "https://flight.spiceai.io".to_string()
         };
         Box::pin(async move {
+            let secret = secret.ok_or_else(|| super::Error::UnableToCreateDataConnector {
+                source: "Missing required secrets".into(),
+            })?;
+
             let url: String = params
                 .as_ref() // &Option<HashMap<String, String>>
                 .as_ref() // Option<&HashMap<String, String>>
                 .and_then(|params| params.get("endpoint").cloned())
                 .unwrap_or(default_flight_url);
             tracing::trace!("Connecting to SpiceAI with flight url: {url}");
-            let flight_client = FlightClient::new(
-                url.as_str(),
-                "",
-                auth_provider.get_param("key").unwrap_or_default(),
-            )
-            .await
-            .map_err(|e| super::Error::UnableToCreateDataConnector { source: e.into() })?;
+            let flight_client =
+                FlightClient::new(url.as_str(), "", secret.get("key").unwrap_or_default())
+                    .await
+                    .map_err(|e| super::Error::UnableToCreateDataConnector { source: e.into() })?;
             let flight = Flight::new(flight_client);
             Ok(Self {
                 flight,
