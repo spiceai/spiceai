@@ -1,4 +1,6 @@
+pub mod env;
 pub mod file;
+
 use std::collections::HashMap;
 
 use super::Result;
@@ -64,6 +66,13 @@ impl SecretsProvider {
                 }
 
                 self.secret_store = Some(Box::new(file_secret_store));
+            }
+            SpiceSecretStore::Env => {
+                let mut env_secret_store = env::EnvSecretStore::new();
+
+                env_secret_store.load_secrets();
+
+                self.secret_store = Some(Box::new(env_secret_store));
             }
         }
 
