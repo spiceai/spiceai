@@ -55,7 +55,6 @@ impl SecretsProvider {
     pub fn load_secrets(&mut self) -> Result<()> {
         match self.store {
             SpiceSecretStore::File => {
-                println!("Loading secrets from file");
                 let mut file_secret_store = FileSecretStore::new();
 
                 if file_secret_store.load_secrets().is_err() {
