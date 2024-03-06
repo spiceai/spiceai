@@ -1,5 +1,3 @@
-use crate::auth::AuthProvider;
-
 use std::collections::HashMap;
 use std::{future::Future, pin::Pin};
 use std::{sync::Arc, time::Duration};
@@ -19,7 +17,7 @@ pub struct DebugSource {}
 
 impl DataConnector for DebugSource {
     fn new(
-        _auth_provider: AuthProvider,
+        _secret: super::Secret,
         _params: Arc<Option<HashMap<String, String>>>,
     ) -> Pin<Box<dyn Future<Output = super::Result<Self>> + Send>> {
         Box::pin(async move { Ok(Self {}) })
