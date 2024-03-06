@@ -240,7 +240,7 @@ impl Runtime {
         params: Arc<Option<HashMap<String, String>>>,
     ) -> Result<Option<Box<dyn DataConnector + Send>>> {
         let Some(secret) = secrets_provider.get_secret(source) else {
-            return UnableToLoadDataConnectorSecretSnafu {
+            return UnableToLoadDataConnectorSecretsSnafu {
                 data_connector: source,
             }
             .fail()?;
