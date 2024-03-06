@@ -87,7 +87,7 @@ pub enum Error {
         data_connector: String,
     },
 
-    #[snafu(display("Unable to load secrets {store}"))]
+    #[snafu(display("Unable to load secrets for {store}"))]
     UnableToLoadSecrets { store: String },
 }
 
