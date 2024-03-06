@@ -3,8 +3,7 @@ use arrow::{
     datatypes::{DataType, SchemaRef},
 };
 
-use bigdecimal::BigDecimal;
-use rust_decimal::Decimal;
+use bigdecimal_0_3_0::BigDecimal;
 
 use time::{OffsetDateTime, PrimitiveDateTime};
 
@@ -165,25 +164,10 @@ impl InsertBuilder {
                     DataType::Decimal128(_, scale) => {
                         let array = column.as_any().downcast_ref::<array::Decimal128Array>();
                         if let Some(valid_array) = array {
-                            #[allow(clippy::cast_sign_loss)]
-                            // This is safe because scale will never be negative
-                            match Decimal::try_from_i128_with_scale(
-                                valid_array.value(row),
-                                *scale as u32,
-                            ) {
-                                Ok(decimal) => {
-                                    row_values.push(decimal.into());
-                                }
-                                Err(_) => {
-                                    row_values.push(
-                                        BigDecimal::new(
-                                            valid_array.value(row).into(),
-                                            i64::from(*scale),
-                                        )
-                                        .into(),
-                                    );
-                                }
-                            };
+                            row_values.push(
+                                BigDecimal::new(valid_array.value(row).into(), i64::from(*scale))
+                                    .into(),
+                            );
                         }
                     }
                     DataType::Timestamp(_, _) => {
