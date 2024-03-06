@@ -1,7 +1,7 @@
 use std::{collections::HashMap, mem, sync::Arc};
 
 use arrow::record_batch::RecordBatch;
-use arrow_sql_gen::statement::{CreateTableBuilder, InsertTableBuilder};
+use arrow_sql_gen::statement::{CreateTableBuilder, InsertBuilder};
 use bb8_postgres::{
     tokio_postgres::{types::ToSql, NoTls},
     PostgresConnectionManager,
@@ -178,7 +178,7 @@ impl<'a> PostgresUpdate<'a> {
     }
 
     fn insert_batch(&mut self, batch: RecordBatch) -> Result<()> {
-        let insert_table_builder = InsertTableBuilder::new(&self.name, vec![batch]);
+        let insert_table_builder = InsertBuilder::new(&self.name, vec![batch]);
         let sql = insert_table_builder.build();
 
         self.postgres_conn

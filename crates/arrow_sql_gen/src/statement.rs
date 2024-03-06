@@ -65,12 +65,12 @@ impl CreateTableBuilder {
     }
 }
 
-pub struct InsertTableBuilder {
+pub struct InsertBuilder {
     table_name: String,
     record_batches: Vec<RecordBatch>,
 }
 
-impl InsertTableBuilder {
+impl InsertBuilder {
     #[must_use]
     pub fn new(table_name: &str, record_batches: Vec<RecordBatch>) -> Self {
         Self {
@@ -321,7 +321,7 @@ mod tests {
         .unwrap();
         let record_batches = vec![batch1, batch2];
 
-        let sql = InsertTableBuilder::new("users", record_batches).build();
+        let sql = InsertBuilder::new("users", record_batches).build();
         assert_eq!(sql, "INSERT INTO \"users\" (\"id\", \"name\", \"age\") VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', 30), (1, 'a', 10), (2, 'b', 20), (3, 'c', 30)");
     }
 
