@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::{future::Future, pin::Pin};
 use std::{sync::Arc, time::Duration};
 
+use crate::secrets::Secret;
+
 use super::{DataConnector, DataUpdate, UpdateType};
 use arrow::{
     array::{Int32Array, StringArray},
