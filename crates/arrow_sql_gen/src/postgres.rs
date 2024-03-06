@@ -9,6 +9,7 @@ use arrow::datatypes::Field;
 use arrow::datatypes::Schema;
 use postgres::{types::Type, Row};
 use snafu::prelude::*;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -30,8 +31,7 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-#[allow(clippy::missing_errors_doc)]
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::missing_errors_doc, clippy::too_many_lines)]
 pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
     let mut arrow_fields: Vec<Field> = Vec::new();
     let mut arrow_columns_builders: Vec<Box<dyn ArrayBuilder>> = Vec::new();
@@ -74,6 +74,10 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                 }
                 Type::NUMERIC => {
                     arrow_columns_builders.push(Box::new(arrow::array::Decimal128Builder::new()));
+                }
+                Type::TIMESTAMP => {
+                    arrow_columns_builders
+                        .push(Box::new(arrow::array::TimestampMicrosecondBuilder::new()));
                 }
                 _ => UnsupportedTypeSnafu {
                     r#type: format!("{column_type}"),
@@ -197,6 +201,25 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                     //let v: f64 = row.get(i);
                     builder.append_value(0);
                 }
+                Type::TIMESTAMP => {
+                    // TODO: Figure out how to properly extract Timestamp TimeUnit from postgres, now we assume it's in microseconds
+                    let Some(builder) = builder
+                        .as_any_mut()
+                        .downcast_mut::<arrow::array::TimestampMicrosecondBuilder>(
+                    ) else {
+                        return FailedToDowncastBuilderSnafu {
+                            postgres_type: format!("{postgres_type}"),
+                        }
+                        .fail();
+                    };
+                    let v = row.get::<usize, SystemTime>(i);
+
+                    #[allow(clippy::cast_possible_wrap)]
+                    if let Ok(v) = v.duration_since(UNIX_EPOCH) {
+                        let timestamp = v.as_secs() as i64;
+                        builder.append_value(timestamp);
+                    }
+                }
                 _ => UnsupportedTypeIndexSnafu {
                     r#type: format!("{postgres_type}"),
                     index: i,
@@ -229,6 +252,10 @@ fn map_column_type_to_data_type(column_type: &Type, column_name: &str) -> Result
         Type::BOOL => Ok(DataType::Boolean),
         // TODO: Figure out how to handle decimal scale and precision, it isn't specified as a type in postgres types
         Type::NUMERIC => Ok(DataType::Decimal128(38, 10)),
+        Type::TIMESTAMP => Ok(DataType::Timestamp(
+            arrow::datatypes::TimeUnit::Microsecond,
+            None,
+        )),
         _ => UnsupportedTypeSnafu {
             r#type: format!("{column_type}"),
             col: column_name.to_string(),
