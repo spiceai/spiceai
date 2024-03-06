@@ -1,7 +1,7 @@
-use crate::auth::AuthProvider;
 use crate::modelruntime::ModelRuntime;
 use crate::modelruntime::Runnable;
 use crate::modelsource::create_source_from;
+use crate::secrets::Secret;
 use crate::DataFusion;
 use arrow::record_batch::RecordBatch;
 use snafu::prelude::*;
@@ -35,10 +35,7 @@ pub enum Error {
 }
 
 impl Model {
-    pub async fn load(
-        model: &spicepod::component::model::Model,
-        auth: AuthProvider,
-    ) -> Result<Self> {
+    pub async fn load(model: spicepod::component::model::Model, secret: Secret) -> Result<Self> {
         let source = source(&model.from);
         let source = source.as_str();
 
@@ -49,7 +46,7 @@ impl Model {
         let tract = crate::modelruntime::tract::Tract {
             path: create_source_from(source)
                 .context(UnknownModelSourceSnafu)?
-                .pull(auth, Arc::new(Option::from(params)))
+                .pull(secret, Arc::new(Option::from(params)))
                 .await
                 .context(UnableToLoadModelSnafu)?
                 .clone()

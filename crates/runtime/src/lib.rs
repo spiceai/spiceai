@@ -17,7 +17,6 @@ use tokio::{signal, sync::RwLock};
 
 use crate::{dataconnector::DataConnector, datafusion::DataFusion};
 
-pub mod auth;
 pub mod config;
 pub mod databackend;
 pub mod dataconnector;
@@ -99,7 +98,6 @@ pub struct Runtime {
     pub df: Arc<RwLock<DataFusion>>,
     pub models: Arc<RwLock<HashMap<String, Model>>>,
     pub pods_watcher: podswatcher::PodsWatcher,
-    pub auth: Arc<RwLock<auth::AuthProviders>>,
     pub secrets_provider: Arc<RwLock<secrets::SecretsProvider>>,
 
     spaced_tracer: Arc<tracers::SpacedTracer>,
@@ -112,7 +110,6 @@ impl Runtime {
         app: Arc<RwLock<Option<app::App>>>,
         df: Arc<RwLock<DataFusion>>,
         pods_watcher: podswatcher::PodsWatcher,
-        auth: Arc<RwLock<auth::AuthProviders>>,
     ) -> Self {
         Runtime {
             app,
@@ -120,7 +117,6 @@ impl Runtime {
             df,
             models: Arc::new(RwLock::new(HashMap::new())),
             pods_watcher,
-            auth,
             secrets_provider: Arc::new(RwLock::new(secrets::SecretsProvider::new())),
             spaced_tracer: Arc::new(tracers::SpacedTracer::new(Duration::from_secs(15))),
         }
@@ -365,9 +361,22 @@ impl Runtime {
     pub async fn load_model(&self, m: &SpicepodModel) {
         tracing::info!("Loading model [{}] from {}...", m.name, m.from);
         let mut model_map = self.models.write().await;
-        let auth = self.auth.read().await;
 
-        match Model::load(m, auth.get(model::source(&m.from).as_str())).await {
+        let model = m.clone();
+        let source = model::source(&model.from);
+
+        let shared_secrets_provider = Arc::clone(&self.secrets_provider);
+        let secrets_provider = shared_secrets_provider.read().await;
+        let Some(secret) = secrets_provider.get_secret(source.as_str()) else {
+            tracing::warn!(
+                "Unable to load model {}: unable to get secret for source {}",
+                m.name,
+                source
+            );
+            return;
+        };
+
+        match Model::load(m.clone(), secret).await {
             Ok(in_m) => {
                 model_map.insert(m.name.clone(), in_m);
                 tracing::info!("Model [{}] deployed, ready for inferencing", m.name);
@@ -438,8 +447,6 @@ impl Runtime {
                 tracing::debug!("Updated pods information: {:?}", new_app);
                 tracing::debug!("Previous pods information: {:?}", current_app);
 
-                *self.auth.write().await = load_auth_providers();
-
                 // check for new and updated datasets
                 for ds in &new_app.datasets {
                     if let Some(current_ds) =
@@ -495,17 +502,6 @@ fn has_table_provider(data_connector: &Option<Box<dyn DataConnector + Send>>) ->
         && data_connector
             .as_ref()
             .is_some_and(|dc| dc.has_table_provider())
-}
-
-pub fn load_auth_providers() -> auth::AuthProviders {
-    let mut auth = auth::AuthProviders::default();
-    if let Err(e) = auth.parse_from_config() {
-        tracing::warn!(
-            "Unable to parse auth from config, proceeding without auth: {}",
-            e
-        );
-    }
-    auth
 }
 
 async fn shutdown_signal() {
