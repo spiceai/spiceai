@@ -13,12 +13,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unsupported type {:?} for column {:?}", r#type, col))]
-    UnsupportedType { r#type: String, col: String },
-
-    #[snafu(display("Unsupported type {:?} for column index {index}", r#type))]
-    UnsupportedTypeIndex { r#type: String, index: usize },
-
     #[snafu(display("Failed to build record batch: {source}"))]
     FailedToBuildRecordBatch { source: arrow::error::ArrowError },
 
@@ -31,7 +25,12 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-#[allow(clippy::missing_errors_doc, clippy::too_many_lines)]
+/// Converts rows to an Arrow `RecordBatch`.
+///
+/// # Errors
+///
+/// Returns an error if there is a failure in converting the rows to a `RecordBatch`.
+#[allow(clippy::too_many_lines)]
 pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
     let mut arrow_fields: Vec<Field> = Vec::new();
     let mut arrow_columns_builders: Vec<Box<dyn ArrayBuilder>> = Vec::new();
@@ -45,7 +44,7 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
 
             arrow_fields.push(Field::new(
                 column_name,
-                map_column_type_to_data_type(column_type, column_name)?,
+                map_column_type_to_data_type(column_type),
                 true, // TODO: Set nullable properly based on postgres schema
             ));
             postgres_types.push(column_type.clone());
@@ -79,11 +78,10 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                     arrow_columns_builders
                         .push(Box::new(arrow::array::TimestampMicrosecondBuilder::new()));
                 }
-                _ => UnsupportedTypeSnafu {
-                    r#type: format!("{column_type}"),
-                    col: column_name.to_string(),
-                }
-                .fail()?,
+                _ => unimplemented!(
+                    "Unsupported type {:?} for column {column_name}",
+                    column_type
+                ),
             }
         }
     }
@@ -220,11 +218,7 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                         builder.append_value(timestamp);
                     }
                 }
-                _ => UnsupportedTypeIndexSnafu {
-                    r#type: format!("{postgres_type}"),
-                    index: i,
-                }
-                .fail()?,
+                _ => unimplemented!("Unsupported type {:?} for column index {i}", postgres_type,),
             }
         }
     }
@@ -241,25 +235,18 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
     }
 }
 
-fn map_column_type_to_data_type(column_type: &Type, column_name: &str) -> Result<DataType> {
+fn map_column_type_to_data_type(column_type: &Type) -> DataType {
     match *column_type {
-        Type::INT2 => Ok(DataType::Int16),
-        Type::INT4 => Ok(DataType::Int32),
-        Type::INT8 => Ok(DataType::Int64),
-        Type::FLOAT4 => Ok(DataType::Float32),
-        Type::FLOAT8 => Ok(DataType::Float64),
-        Type::TEXT => Ok(DataType::Utf8),
-        Type::BOOL => Ok(DataType::Boolean),
+        Type::INT2 => DataType::Int16,
+        Type::INT4 => DataType::Int32,
+        Type::INT8 => DataType::Int64,
+        Type::FLOAT4 => DataType::Float32,
+        Type::FLOAT8 => DataType::Float64,
+        Type::TEXT => DataType::Utf8,
+        Type::BOOL => DataType::Boolean,
         // TODO: Figure out how to handle decimal scale and precision, it isn't specified as a type in postgres types
-        Type::NUMERIC => Ok(DataType::Decimal128(38, 10)),
-        Type::TIMESTAMP => Ok(DataType::Timestamp(
-            arrow::datatypes::TimeUnit::Microsecond,
-            None,
-        )),
-        _ => UnsupportedTypeSnafu {
-            r#type: format!("{column_type}"),
-            col: column_name.to_string(),
-        }
-        .fail()?,
+        Type::NUMERIC => DataType::Decimal128(38, 10),
+        Type::TIMESTAMP => DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+        _ => unimplemented!("Unsupported column type {:?}", column_type),
     }
 }

@@ -79,7 +79,7 @@ impl InsertBuilder {
         }
     }
 
-    #[allow(clippy::too_many_lines, clippy::missing_panics_doc)]
+    #[allow(clippy::too_many_lines)]
     pub fn construct_insert_stmt(
         &self,
         insert_stmt: &mut InsertStatement,
