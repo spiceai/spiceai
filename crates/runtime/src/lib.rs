@@ -235,23 +235,16 @@ impl Runtime {
         secrets_provider: &secrets::SecretsProvider,
         params: Arc<Option<HashMap<String, String>>>,
     ) -> Result<Option<Box<dyn DataConnector + Send>>> {
-        let Some(secret) = secrets_provider.get_secret(source) else {
-            return UnableToLoadDataConnectorSecretsSnafu {
-                data_connector: source,
-            }
-            .fail()?;
-        };
-
         match source {
             "spiceai" => Ok(Some(Box::new(
-                dataconnector::spiceai::SpiceAI::new(secret, params)
+                dataconnector::spiceai::SpiceAI::new(secrets_provider.get_secret(source), params)
                     .await
                     .context(UnableToInitializeDataConnectorSnafu {
                         data_connector: source,
                     })?,
             ))),
             "dremio" => Ok(Some(Box::new(
-                dataconnector::dremio::Dremio::new(secret, params)
+                dataconnector::dremio::Dremio::new(secrets_provider.get_secret(source), params)
                     .await
                     .context(UnableToInitializeDataConnectorSnafu {
                         data_connector: source,
@@ -367,16 +360,8 @@ impl Runtime {
 
         let shared_secrets_provider = Arc::clone(&self.secrets_provider);
         let secrets_provider = shared_secrets_provider.read().await;
-        let Some(secret) = secrets_provider.get_secret(source.as_str()) else {
-            tracing::warn!(
-                "Unable to load model {}: unable to get secret for source {}",
-                m.name,
-                source
-            );
-            return;
-        };
 
-        match Model::load(m.clone(), secret).await {
+        match Model::load(m.clone(), secrets_provider.get_secret(source.as_str())).await {
             Ok(in_m) => {
                 model_map.insert(m.name.clone(), in_m);
                 tracing::info!("Model [{}] deployed, ready for inferencing", m.name);

@@ -32,12 +32,27 @@ pub enum Error {
 
     #[snafu(display("Unable to run model: {source}"))]
     UnableToRunModel { source: crate::modelruntime::Error },
+
+    #[snafu(display("Unable to load required secrets"))]
+    UnableToLoadRequiredSecrets {},
 }
 
 impl Model {
-    pub async fn load(model: spicepod::component::model::Model, secret: Secret) -> Result<Self> {
+    pub async fn load(
+        model: spicepod::component::model::Model,
+        secret: Option<Secret>,
+    ) -> Result<Self> {
         let source = source(&model.from);
         let source = source.as_str();
+
+        let Some(secret) = secret else {
+            tracing::warn!(
+                "Unable to load model {}: unable to get secret for source {}",
+                model.name,
+                source
+            );
+            return UnableToLoadRequiredSecretsSnafu {}.fail();
+        };
 
         let mut params = std::collections::HashMap::new();
         params.insert("name".to_string(), model.name.to_string());

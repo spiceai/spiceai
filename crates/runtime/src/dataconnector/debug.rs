@@ -19,7 +19,7 @@ pub struct DebugSource {}
 
 impl DataConnector for DebugSource {
     fn new(
-        _secret: Secret,
+        _secret: Option<Secret>,
         _params: Arc<Option<HashMap<String, String>>>,
     ) -> Pin<Box<dyn Future<Output = super::Result<Self>> + Send>> {
         Box::pin(async move { Ok(Self {}) })
