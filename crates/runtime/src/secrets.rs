@@ -70,11 +70,7 @@ impl SecretsProvider {
             SpiceSecretStore::Env => {
                 let mut env_secret_store = env::EnvSecretStore::new();
 
-                if env_secret_store.load_secrets().is_err() {
-                    return Err(Error::UnableToLoadSecrets {
-                        store: "env".to_string(),
-                    });
-                }
+                env_secret_store.load_secrets();
 
                 self.secret_store = Some(Box::new(env_secret_store));
             }

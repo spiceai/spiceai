@@ -2,10 +2,6 @@ use std::collections::HashMap;
 
 use super::{Secret, SecretStore};
 
-pub enum Error {}
-
-pub type Result<T, E = Error> = std::result::Result<T, E>;
-
 const ENV_SECRET_PREFIX: &str = "SPICED_SECRET_";
 
 #[allow(clippy::module_name_repetitions)]
@@ -59,7 +55,7 @@ impl EnvSecretStore {
     ///     }
     /// }
     /// ```
-    pub fn load_secrets(&mut self) -> Result<()> {
+    pub fn load_secrets(&mut self) {
         for (key, value) in std::env::vars() {
             if !key.starts_with(ENV_SECRET_PREFIX) {
                 continue;
@@ -81,8 +77,6 @@ impl EnvSecretStore {
                 value.as_str(),
             );
         }
-
-        Ok(())
     }
 }
 
