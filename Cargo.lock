@@ -423,6 +423,7 @@ dependencies = [
  "rust_decimal",
  "sea-query",
  "snafu 0.8.0",
+ "time",
  "tracing",
 ]
 
@@ -3858,6 +3859,7 @@ dependencies = [
  "inherent",
  "rust_decimal",
  "sea-query-derive",
+ "time",
 ]
 
 [[package]]

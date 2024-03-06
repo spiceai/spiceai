@@ -6,6 +6,8 @@ use arrow::{
 use bigdecimal::BigDecimal;
 use rust_decimal::Decimal;
 
+use time::{OffsetDateTime, PrimitiveDateTime};
+
 use sea_query::{
     Alias, ColumnDef, ColumnType, Index, InsertStatement, IntoIden, IntoIndexColumn,
     PostgresQueryBuilder, Query, SimpleExpr, Table,
@@ -77,7 +79,7 @@ impl InsertTableBuilder {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::missing_panics_doc)]
     pub fn construct_insert_stmt(
         &self,
         insert_stmt: &mut InsertStatement,
@@ -187,8 +189,24 @@ impl InsertTableBuilder {
                         let array = column
                             .as_any()
                             .downcast_ref::<array::TimestampMicrosecondArray>();
+                        #[allow(clippy::uninlined_format_args, clippy::unwrap_used)]
                         if let Some(valid_array) = array {
-                            row_values.push(valid_array.value(row).into());
+                            match OffsetDateTime::from_unix_timestamp(
+                                valid_array.value(row) / 1_000_000,
+                            ) {
+                                Ok(offset_time) => {
+                                    row_values.push(
+                                        PrimitiveDateTime::new(
+                                            offset_time.date(),
+                                            offset_time.time(),
+                                        )
+                                        .into(),
+                                    );
+                                }
+                                Err(_) => {
+                                    return;
+                                }
+                            };
                         }
                     }
                     _ => unimplemented!(
