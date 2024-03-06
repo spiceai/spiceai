@@ -155,13 +155,12 @@ struct PostgresUpdate<'a> {
 
 impl<'a> PostgresUpdate<'a> {
     async fn update(&mut self) -> Result<()> {
-        match self.update_type {
-            UpdateType::Overwrite => self.create_table(true).await?,
-            UpdateType::Append => {
-                if !self.table_exists().await {
-                    self.create_table(false).await?;
-                }
-            }
+        if !self.table_exists().await {
+            self.create_table()?;
+        } else if self.update_type == UpdateType::Overwrite {
+            self.postgres_conn
+                .execute(format!(r#"TRUNCATE TABLE "{}""#, self.name).as_str(), &[])
+                .context(DbConnectionSnafu)?;
         };
 
         let data = mem::take(&mut self.data);
@@ -188,20 +187,8 @@ impl<'a> PostgresUpdate<'a> {
         Ok(())
     }
 
-    async fn create_table(&mut self, drop_if_exists: bool) -> Result<()> {
+    fn create_table(&mut self) -> Result<()> {
         let _lock = self.create_mutex.lock();
-
-        if self.table_exists().await {
-            if drop_if_exists {
-                let sql = format!(r#"DROP TABLE "{}""#, self.name);
-                tracing::trace!("{sql}");
-                self.postgres_conn
-                    .execute(&sql, &[])
-                    .context(DbConnectionSnafu)?;
-            } else {
-                return Ok(());
-            }
-        }
 
         let Some(batch) = self.data.pop() else {
             return Ok(());
