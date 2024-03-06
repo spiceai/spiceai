@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_yaml::{self, Value};
 use std::{collections::HashMap, fmt::Debug};
 
+use crate::component::secrets::Secrets;
 use crate::component::{dataset::Dataset, model::Model, ComponentOrReference};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -17,6 +18,11 @@ pub struct SpicepodDefinition {
     pub version: SpicepodVersion,
 
     pub kind: SpicepodKind,
+
+    /// Optional spicepod secrets configuration
+    /// Default value is `store: file`
+    #[serde(default)]
+    pub secrets: Secrets,
 
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     #[serde(default)]
