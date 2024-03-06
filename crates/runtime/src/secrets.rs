@@ -65,8 +65,6 @@ impl SecretsProvider {
 
                 self.secret_store = Some(Box::new(file_secret_store));
             }
-            SpiceSecretStore::Keyring => {
-            }
         }
 
         Ok(())
