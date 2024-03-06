@@ -54,7 +54,7 @@ pub type AnyErrorResult = std::result::Result<(), Box<dyn std::error::Error>>;
 pub trait DataConnector: Send + Sync {
     /// Create a new `DataConnector` with the given `Secret`.
     fn new(
-        secret: Secret,
+        secret: Option<Secret>,
         params: Arc<Option<HashMap<String, String>>>,
     ) -> Pin<Box<dyn Future<Output = Result<Self>> + Send>>
     where

@@ -18,13 +18,17 @@ pub struct Dremio {
 #[async_trait]
 impl DataConnector for Dremio {
     fn new(
-        secret: Secret,
+        secret: Option<Secret>,
         params: Arc<Option<HashMap<String, String>>>,
     ) -> Pin<Box<dyn Future<Output = super::Result<Self>> + Send>>
     where
         Self: Sized,
     {
         Box::pin(async move {
+            let secret = secret.ok_or_else(|| super::Error::UnableToCreateDataConnector {
+                source: "Missing required secrets".into(),
+            })?;
+
             let endpoint: String = params
                 .as_ref() // &Option<HashMap<String, String>>
                 .as_ref() // Option<&HashMap<String, String>>
