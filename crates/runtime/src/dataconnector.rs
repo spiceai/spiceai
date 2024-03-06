@@ -52,7 +52,7 @@ pub type AnyErrorResult = std::result::Result<(), Box<dyn std::error::Error>>;
 /// ```
 #[async_trait]
 pub trait DataConnector: Send + Sync {
-    /// Create a new `DataConnector` with the given `AuthProvider`.
+    /// Create a new `DataConnector` with the given `Secret`.
     fn new(
         secret: Secret,
         params: Arc<Option<HashMap<String, String>>>,
