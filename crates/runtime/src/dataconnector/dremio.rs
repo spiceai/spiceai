@@ -7,7 +7,7 @@ use flight_client::FlightClient;
 use flight_datafusion::FlightTable;
 use spicepod::component::dataset::Dataset;
 
-use crate::auth::AuthProvider;
+use crate::secrets::Secret;
 
 use super::{flight::Flight, DataConnector};
 
@@ -18,7 +18,7 @@ pub struct Dremio {
 #[async_trait]
 impl DataConnector for Dremio {
     fn new(
-        auth_provider: AuthProvider,
+        secret: Secret,
         params: Arc<Option<HashMap<String, String>>>,
     ) -> Pin<Box<dyn Future<Output = super::Result<Self>> + Send>>
     where
@@ -34,8 +34,8 @@ impl DataConnector for Dremio {
                 })?;
             let flight_client = FlightClient::new(
                 endpoint.as_str(),
-                auth_provider.get_param("username").unwrap_or_default(),
-                auth_provider.get_param("password").unwrap_or_default(),
+                secret.get("username").unwrap_or_default(),
+                secret.get("password").unwrap_or_default(),
             )
             .await
             .map_err(|e| super::Error::UnableToCreateDataConnector { source: e.into() })?;

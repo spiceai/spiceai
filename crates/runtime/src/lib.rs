@@ -32,6 +32,7 @@ pub mod modelruntime;
 pub mod modelsource;
 mod opentelemetry;
 pub mod podswatcher;
+pub mod secrets;
 pub(crate) mod tracers;
 
 #[derive(Debug, Snafu)]
@@ -72,6 +73,9 @@ pub enum Error {
     #[snafu(display("Unknown data connector: {data_connector}"))]
     UnknownDataConnector { data_connector: String },
 
+    #[snafu(display("Unable to load secrets for data connector: {data_connector}"))]
+    UnableToLoadDataConnectorSecrets { data_connector: String },
+
     #[snafu(display("Unable to create view: {source}"))]
     InvalidSQLView {
         source: spicepod::component::dataset::Error,
@@ -82,6 +86,9 @@ pub enum Error {
         source: datafusion::Error,
         data_connector: String,
     },
+
+    #[snafu(display("Unable to load secrets for {store}"))]
+    UnableToLoadSecrets { store: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -93,6 +100,7 @@ pub struct Runtime {
     pub models: Arc<RwLock<HashMap<String, Model>>>,
     pub pods_watcher: podswatcher::PodsWatcher,
     pub auth: Arc<RwLock<auth::AuthProviders>>,
+    pub secrets_provider: Arc<RwLock<secrets::SecretsProvider>>,
 
     spaced_tracer: Arc<tracers::SpacedTracer>,
 }
@@ -113,7 +121,21 @@ impl Runtime {
             models: Arc::new(RwLock::new(HashMap::new())),
             pods_watcher,
             auth,
+            secrets_provider: Arc::new(RwLock::new(secrets::SecretsProvider::new())),
             spaced_tracer: Arc::new(tracers::SpacedTracer::new(Duration::from_secs(15))),
+        }
+    }
+
+    pub async fn load_secrets(&self) {
+        let mut secret_store = self.secrets_provider.write().await;
+
+        let app_lock = self.app.read().await;
+        if let Some(app) = app_lock.as_ref() {
+            secret_store.store = app.secrets.store.clone();
+        }
+
+        if let Err(e) = secret_store.load_secrets() {
+            tracing::warn!("Unable to load secrets: {}", e);
         }
     }
 
@@ -129,20 +151,21 @@ impl Runtime {
     pub fn load_dataset(&self, ds: &Dataset) {
         let df = Arc::clone(&self.df);
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
-        let shared_auth = Arc::clone(&self.auth);
+        let shared_secrets_provider = Arc::clone(&self.secrets_provider);
 
         let ds = ds.clone();
 
         tokio::spawn(async move {
             loop {
-                let auth = shared_auth.read().await;
+                let secrets_provider = shared_secrets_provider.read().await;
 
                 let source = ds.source();
+
                 let params = Arc::new(ds.params.clone());
                 let data_connector: Option<Box<dyn DataConnector + Send>> =
                     match Runtime::get_dataconnector_from_source(
                         &source,
-                        &auth,
+                        &secrets_provider,
                         Arc::clone(&params),
                     )
                     .await
@@ -213,19 +236,26 @@ impl Runtime {
 
     async fn get_dataconnector_from_source(
         source: &str,
-        auth: &auth::AuthProviders,
+        secrets_provider: &secrets::SecretsProvider,
         params: Arc<Option<HashMap<String, String>>>,
     ) -> Result<Option<Box<dyn DataConnector + Send>>> {
+        let Some(secret) = secrets_provider.get_secret(source) else {
+            return UnableToLoadDataConnectorSecretsSnafu {
+                data_connector: source,
+            }
+            .fail()?;
+        };
+
         match source {
             "spiceai" => Ok(Some(Box::new(
-                dataconnector::spiceai::SpiceAI::new(auth.get(source), params)
+                dataconnector::spiceai::SpiceAI::new(secret, params)
                     .await
                     .context(UnableToInitializeDataConnectorSnafu {
                         data_connector: source,
                     })?,
             ))),
             "dremio" => Ok(Some(Box::new(
-                dataconnector::dremio::Dremio::new(auth.get(source), params)
+                dataconnector::dremio::Dremio::new(secret, params)
                     .await
                     .context(UnableToInitializeDataConnectorSnafu {
                         data_connector: source,

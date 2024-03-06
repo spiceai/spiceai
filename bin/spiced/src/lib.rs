@@ -82,6 +82,8 @@ pub async fn run(args: Args) -> Result<()> {
 
     let mut rt: Runtime = Runtime::new(args.runtime, app, df, pods_watcher, auth);
 
+    rt.load_secrets().await;
+
     rt.load_datasets().await;
 
     rt.load_models().await;
