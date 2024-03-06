@@ -165,7 +165,8 @@ impl InsertBuilder {
                     DataType::Decimal128(_, scale) => {
                         let array = column.as_any().downcast_ref::<array::Decimal128Array>();
                         if let Some(valid_array) = array {
-                            #[allow(clippy::cast_sign_loss, clippy::cast_lossless)]
+                            #[allow(clippy::cast_sign_loss)]
+                            // This is safe because scale will never be negative
                             match Decimal::try_from_i128_with_scale(
                                 valid_array.value(row),
                                 *scale as u32,
@@ -177,7 +178,7 @@ impl InsertBuilder {
                                     row_values.push(
                                         BigDecimal::new(
                                             valid_array.value(row).into(),
-                                            *scale as i64,
+                                            i64::from(*scale),
                                         )
                                         .into(),
                                     );
@@ -189,7 +190,6 @@ impl InsertBuilder {
                         let array = column
                             .as_any()
                             .downcast_ref::<array::TimestampMicrosecondArray>();
-                        #[allow(clippy::uninlined_format_args, clippy::unwrap_used)]
                         if let Some(valid_array) = array {
                             match OffsetDateTime::from_unix_timestamp(
                                 valid_array.value(row) / 1_000_000,
@@ -254,7 +254,7 @@ fn map_data_type_to_column_type(data_type: &DataType) -> ColumnType {
         DataType::Float64 => ColumnType::Double,
         DataType::Utf8 => ColumnType::Text,
         DataType::Boolean => ColumnType::Boolean,
-        #[allow(clippy::cast_sign_loss)]
+        #[allow(clippy::cast_sign_loss)] // This is safe because scale will never be negative
         DataType::Decimal128(p, s) => ColumnType::Decimal(Some((u32::from(*p), *s as u32))),
         DataType::Timestamp(_unit, _time_zone) => ColumnType::Timestamp,
 
@@ -264,7 +264,6 @@ fn map_data_type_to_column_type(data_type: &DataType) -> ColumnType {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use std::sync::Arc;
 
@@ -302,7 +301,7 @@ mod tests {
                 Arc::new(age_array.clone()),
             ],
         )
-        .unwrap();
+        .expect("Unable to build record batch");
 
         let schema2 = Schema::new(vec![
             Field::new("id", DataType::Int32, false),
@@ -318,7 +317,7 @@ mod tests {
                 Arc::new(age_array),
             ],
         )
-        .unwrap();
+        .expect("Unable to build record batch");
         let record_batches = vec![batch1, batch2];
 
         let sql = InsertBuilder::new("users", record_batches).build();

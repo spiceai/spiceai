@@ -1,3 +1,4 @@
+use std::convert;
 use std::sync::Arc;
 
 use arrow::array::ArrayBuilder;
@@ -21,11 +22,16 @@ pub enum Error {
 
     #[snafu(display("Failed to downcast builder for {postgres_type}"))]
     FailedToDowncastBuilder { postgres_type: String },
+
+    #[snafu(display("Integer overflow when converting u64 to i64"))]
+    FailedToConvertU64toI64 {
+        source: <u64 as convert::TryInto<i64>>::Error,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// Converts rows to an Arrow `RecordBatch`.
+/// Converts Postgres `Row`s to an Arrow `RecordBatch`.
 ///
 /// # Errors
 ///
@@ -47,42 +53,8 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                 map_column_type_to_data_type(column_type),
                 true, // TODO: Set nullable properly based on postgres schema
             ));
+            arrow_columns_builders.push(map_column_type_to_array_builder(column_type));
             postgres_types.push(column_type.clone());
-
-            match *column_type {
-                Type::INT2 => {
-                    arrow_columns_builders.push(Box::new(arrow::array::Int16Builder::new()));
-                }
-                Type::INT4 => {
-                    arrow_columns_builders.push(Box::new(arrow::array::Int32Builder::new()));
-                }
-                Type::INT8 => {
-                    arrow_columns_builders.push(Box::new(arrow::array::Int64Builder::new()));
-                }
-                Type::FLOAT4 => {
-                    arrow_columns_builders.push(Box::new(arrow::array::Float32Builder::new()));
-                }
-                Type::FLOAT8 => {
-                    arrow_columns_builders.push(Box::new(arrow::array::Float64Builder::new()));
-                }
-                Type::TEXT => {
-                    arrow_columns_builders.push(Box::new(arrow::array::StringBuilder::new()));
-                }
-                Type::BOOL => {
-                    arrow_columns_builders.push(Box::new(arrow::array::BooleanBuilder::new()));
-                }
-                Type::NUMERIC => {
-                    arrow_columns_builders.push(Box::new(arrow::array::Decimal128Builder::new()));
-                }
-                Type::TIMESTAMP => {
-                    arrow_columns_builders
-                        .push(Box::new(arrow::array::TimestampMicrosecondBuilder::new()));
-                }
-                _ => unimplemented!(
-                    "Unsupported type {:?} for column {column_name}",
-                    column_type
-                ),
-            }
         }
     }
 
@@ -212,9 +184,11 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                     };
                     let v = row.get::<usize, SystemTime>(i);
 
-                    #[allow(clippy::cast_possible_wrap)]
                     if let Ok(v) = v.duration_since(UNIX_EPOCH) {
-                        let timestamp = v.as_secs() as i64;
+                        let timestamp: i64 = v
+                            .as_secs()
+                            .try_into()
+                            .context(FailedToConvertU64toI64Snafu)?;
                         builder.append_value(timestamp);
                     }
                 }
@@ -246,7 +220,23 @@ fn map_column_type_to_data_type(column_type: &Type) -> DataType {
         Type::BOOL => DataType::Boolean,
         // TODO: Figure out how to handle decimal scale and precision, it isn't specified as a type in postgres types
         Type::NUMERIC => DataType::Decimal128(38, 10),
+        // TODO: Figure out how to properly extract Timestamp TimeUnit from postgres, now we assume it's in microseconds
         Type::TIMESTAMP => DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+        _ => unimplemented!("Unsupported column type {:?}", column_type),
+    }
+}
+
+fn map_column_type_to_array_builder(column_type: &Type) -> Box<dyn ArrayBuilder> {
+    match *column_type {
+        Type::INT2 => Box::new(arrow::array::Int16Builder::new()),
+        Type::INT4 => Box::new(arrow::array::Int32Builder::new()),
+        Type::INT8 => Box::new(arrow::array::Int64Builder::new()),
+        Type::FLOAT4 => Box::new(arrow::array::Float32Builder::new()),
+        Type::FLOAT8 => Box::new(arrow::array::Float64Builder::new()),
+        Type::TEXT => Box::new(arrow::array::StringBuilder::new()),
+        Type::BOOL => Box::new(arrow::array::BooleanBuilder::new()),
+        Type::NUMERIC => Box::new(arrow::array::Decimal128Builder::new()),
+        Type::TIMESTAMP => Box::new(arrow::array::TimestampMicrosecondBuilder::new()),
         _ => unimplemented!("Unsupported column type {:?}", column_type),
     }
 }
