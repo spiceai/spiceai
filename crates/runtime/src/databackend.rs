@@ -9,6 +9,7 @@ use self::{duckdb::DuckDBBackend, memtable::MemTableBackend};
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
 pub mod memtable;
+#[cfg(feature = "postgres")]
 pub mod postgres;
 
 #[derive(Debug, Snafu)]
@@ -101,6 +102,8 @@ impl DataBackendBuilder {
             Some(Engine::Arrow) => self.validate_arrow(),
             #[cfg(feature = "duckdb")]
             Some(Engine::DuckDB) => Ok(()),
+            #[cfg(feature = "postgres")]
+            Some(Engine::Postgres) => Ok(()),
             _ => Ok(()),
         }
     }
@@ -128,6 +131,7 @@ impl DataBackendBuilder {
                 .boxed()
                 .context(BackendCreationFailedSnafu)?,
             )),
+            #[cfg(feature = "postgres")]
             Engine::Postgres => Ok(Box::new(
                 postgres::PostgresBackend::new(
                     Arc::clone(&self.ctx),
