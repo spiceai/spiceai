@@ -8,6 +8,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 const ENV_SECRET_PREFIX: &str = "SPICED_SECRET_";
 
+#[allow(clippy::module_name_repetitions)]
 pub struct EnvSecretStore {
     secrets: HashMap<String, Secret>,
 }
@@ -64,10 +65,10 @@ impl EnvSecretStore {
                 continue;
             }
 
-            let (secret_name, key) = match key.trim_start_matches(ENV_SECRET_PREFIX).split_once('_')
-            {
-                Some((secret_name, key)) => (secret_name, key),
-                None => continue,
+            let Some((secret_name, key)) =
+                key.trim_start_matches(ENV_SECRET_PREFIX).split_once('_')
+            else {
+                continue;
             };
 
             if secret_name.is_empty() || key.is_empty() {
