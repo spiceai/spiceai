@@ -4,10 +4,16 @@
 .PHONY: all
 all: build
 
-.PHONY: build
-build:
+.PHONY: build-cli
+build-cli:
 	make -C bin/spice
+
+.PHONY: build-runtime
+build-runtime:
 	make -C bin/spiced
+
+.PHONY: build
+build: build-cli build-runtime
 
 .PHONY: build-dev
 build-dev:
@@ -57,6 +63,16 @@ display-deps:
 install: build
 	mkdir -p ~/.spice/bin
 	install -m 755 target/release/spice ~/.spice/bin/spice
+	install -m 755 target/release/spiced ~/.spice/bin/spiced
+
+.PHONY: install-cli
+install-cli: build-cli
+	mkdir -p ~/.spice/bin
+	install -m 755 target/release/spice ~/.spice/bin/spice
+
+.PHONY: install-runtime
+install-runtime: build-runtime
+	mkdir -p ~/.spice/bin
 	install -m 755 target/release/spiced ~/.spice/bin/spiced
 
 ################################################################################
