@@ -27,3 +27,7 @@ tracing.workspace = true
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 datafusion.workspace = true
 rustyline = "13.0.0"
+candle-core = "0.4.1"
+candle-examples = "0.4.1"
+candle-transformers = "0.4.1"
+tokenizers = "0.15.2"
