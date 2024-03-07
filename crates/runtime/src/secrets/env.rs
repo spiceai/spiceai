@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use async_trait::async_trait;
+
 use super::{Secret, SecretStore};
 
 const ENV_SECRET_PREFIX: &str = "SPICED_SECRET_";
@@ -80,9 +82,10 @@ impl EnvSecretStore {
     }
 }
 
+#[async_trait]
 impl SecretStore for EnvSecretStore {
     #[must_use]
-    fn get_secret(&self, secret_name: &str) -> Option<Secret> {
+    async fn get_secret(&self, secret_name: &str) -> Option<Secret> {
         if let Some(secret) = self.secrets.get(secret_name) {
             return Some(secret.clone());
         }
