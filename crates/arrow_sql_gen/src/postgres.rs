@@ -33,8 +33,8 @@ pub enum Error {
         source: <u64 as convert::TryInto<i64>>::Error,
     },
 
-    #[snafu(display("Failed to parse Bytes as BigDecimal: {:?}", bytes))]
-    FailedToParseBigDecmial { bytes: Vec<u8> },
+    #[snafu(display("Failed to parse raw Postgres Bytes as BigDecimal: {:?}", bytes))]
+    FailedToParseBigDecmialFromPostgres { bytes: Vec<u8> },
 
     #[snafu(display("Cannot represent BigDecimal as i128: {big_decimal}"))]
     FailedToConvertBigDecmialToI128 { big_decimal: BigDecimal },
@@ -179,9 +179,11 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                     };
 
                     let v: BigDecimalFromSql = row.get(i);
-                    tracing::error!("v: {}", v.0);
-                    let Some(v_i128) = v.0.to_i128() else {
-                        return FailedToConvertBigDecmialToI128Snafu { big_decimal: v.0 }.fail();
+                    let Some(v_i128) = v.to_decimal_128() else {
+                        return FailedToConvertBigDecmialToI128Snafu {
+                            big_decimal: v.inner,
+                        }
+                        .fail();
                     };
                     builder.append_value(v_i128);
                 }
@@ -223,70 +225,6 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
     }
 }
 
-struct BigDecimalFromSql(BigDecimal);
-
-impl<'a> FromSql<'a> for BigDecimalFromSql {
-    fn from_sql(
-        _ty: &Type,
-        raw: &'a [u8],
-    ) -> std::prelude::v1::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
-        let raw_u16: Vec<u16> = raw
-            .chunks(2)
-            .map(|chunk| {
-                if chunk.len() == 2 {
-                    ((u16::from(chunk[0])) << 8) | (u16::from(chunk[1]))
-                } else {
-                    (u16::from(chunk[0])) << 8
-                }
-            })
-            .collect();
-
-        let digit_count = raw_u16[0];
-        let weight = raw_u16[1];
-        let sign = raw_u16[2];
-        let scale = raw_u16[3];
-
-        tracing::error!("raw: {:?}", raw);
-        tracing::error!("raw_u16: {:?}", raw_u16);
-        tracing::error!("digit_count: {}", digit_count);
-        tracing::error!("weight: {}", weight);
-        tracing::error!("sign: {}", sign);
-        tracing::error!("scale: {}", scale);
-
-        let mut digits = Vec::with_capacity(digit_count as usize);
-        for i in 4..4 + digit_count {
-            digits.push(raw_u16[i as usize]);
-        }
-
-        tracing::error!("digits: {:?}", digits);
-
-        let mut u8_digits = Vec::new();
-        for digit in digits {
-            let high_byte = (digit >> 8) as u8;
-            let low_byte = (digit & 0xFF) as u8;
-            u8_digits.push(high_byte);
-            u8_digits.push(low_byte);
-        }
-
-        let sign = match sign {
-            0x4000 => Sign::Minus,
-            0x0000 => Sign::Plus,
-            _ => {
-                return Err(Box::new(Error::FailedToParseBigDecmial {
-                    bytes: raw.to_vec(),
-                }))
-            }
-        };
-
-        let digits = BigInt::from_bytes_be(sign, u8_digits.as_slice());
-        Ok(BigDecimalFromSql(BigDecimal::new(digits, i64::from(scale))))
-    }
-
-    fn accepts(ty: &Type) -> bool {
-        matches!(*ty, Type::NUMERIC)
-    }
-}
-
 fn map_column_type_to_data_type(column_type: &Type) -> DataType {
     match *column_type {
         Type::INT2 => DataType::Int16,
@@ -321,5 +259,87 @@ fn map_column_type_to_array_builder(column_type: &Type) -> Box<dyn ArrayBuilder>
         ),
         Type::TIMESTAMP => Box::new(arrow::array::TimestampMicrosecondBuilder::new()),
         _ => unimplemented!("Unsupported column type {:?}", column_type),
+    }
+}
+
+struct BigDecimalFromSql {
+    inner: BigDecimal,
+    scale: u16,
+}
+
+impl BigDecimalFromSql {
+    fn to_decimal_128(&self) -> Option<i128> {
+        (&self.inner * 10i128.pow(u32::from(self.scale))).to_i128()
+    }
+}
+
+impl<'a> FromSql<'a> for BigDecimalFromSql {
+    fn from_sql(
+        _ty: &Type,
+        raw: &'a [u8],
+    ) -> std::prelude::v1::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        let raw_u16: Vec<u16> = raw
+            .chunks(2)
+            .map(|chunk| {
+                if chunk.len() == 2 {
+                    ((u16::from(chunk[0])) << 8) | (u16::from(chunk[1]))
+                } else {
+                    (u16::from(chunk[0])) << 8
+                }
+            })
+            .collect();
+
+        let base_10_000_digit_count = raw_u16[0];
+        let weight = raw_u16[1];
+        let sign = raw_u16[2];
+        let scale = raw_u16[3];
+
+        let mut base_10_000_digits = Vec::new();
+        for i in 4..4 + base_10_000_digit_count {
+            base_10_000_digits.push(raw_u16[i as usize]);
+        }
+
+        let mut u8_digits = Vec::new();
+        for &base_10_000_digit in base_10_000_digits.iter().rev() {
+            let mut base_10_000_digit = base_10_000_digit;
+            let mut temp_result = Vec::new();
+            while base_10_000_digit > 0 {
+                temp_result.push((base_10_000_digit % 10) as u8);
+                base_10_000_digit /= 10;
+            }
+            while temp_result.len() < 4 {
+                temp_result.push(0);
+            }
+            u8_digits.extend(temp_result);
+        }
+        u8_digits.reverse();
+
+        let base_10_000_digits_right_of_decimal = base_10_000_digit_count - weight - 1;
+        let implied_base_10_zeros = scale - (base_10_000_digits_right_of_decimal * 4);
+        u8_digits.resize(u8_digits.len() + implied_base_10_zeros as usize, 0);
+
+        let sign = match sign {
+            0x4000 => Sign::Minus,
+            0x0000 => Sign::Plus,
+            _ => {
+                return Err(Box::new(Error::FailedToParseBigDecmialFromPostgres {
+                    bytes: raw.to_vec(),
+                }))
+            }
+        };
+
+        let Some(digits) = BigInt::from_radix_be(sign, u8_digits.as_slice(), 10) else {
+            return Err(Box::new(Error::FailedToParseBigDecmialFromPostgres {
+                bytes: raw.to_vec(),
+            }));
+        };
+        Ok(BigDecimalFromSql {
+            inner: BigDecimal::new(digits, i64::from(scale)),
+            scale,
+        })
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        matches!(*ty, Type::NUMERIC)
     }
 }
