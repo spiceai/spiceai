@@ -293,6 +293,7 @@ impl Runtime {
             .read()
             .await
             .new_accelerated_backend(ds)
+            .await
             .context(UnableToCreateBackendSnafu)?;
         let data_backend = Arc::new(data_backend);
 
