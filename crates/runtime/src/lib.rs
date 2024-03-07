@@ -130,7 +130,7 @@ impl Runtime {
             secret_store.store = app.secrets.store.clone();
         }
 
-        if let Err(e) = secret_store.load_secrets().await {
+        if let Err(e) = secret_store.load_secrets() {
             tracing::warn!("Unable to load secrets: {}", e);
         }
     }
