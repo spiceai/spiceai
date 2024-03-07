@@ -1,4 +1,5 @@
 use std::convert;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use arrow::array::ArrayBuilder;
@@ -342,4 +343,30 @@ impl<'a> FromSql<'a> for BigDecimalFromSql {
     fn accepts(ty: &Type) -> bool {
         matches!(*ty, Type::NUMERIC)
     }
+}
+
+#[test]
+#[allow(clippy::cast_possible_truncation)]
+fn test_big_decimal_from_sql() {
+    let positive_u16: Vec<u16> = vec![5, 3, 0, 5, 9345, 1293, 2903, 1293, 932];
+    let positive_raw: Vec<u8> = positive_u16
+        .iter()
+        .flat_map(|&x| vec![(x >> 8) as u8, x as u8])
+        .collect();
+    let positive =
+        BigDecimal::from_str("9345129329031293.0932").expect("Failed to parse big decimal");
+    let positive_result = BigDecimalFromSql::from_sql(&Type::NUMERIC, positive_raw.as_slice())
+        .expect("Failed to run FromSql");
+    assert_eq!(positive_result.inner, positive);
+
+    let negative_u16: Vec<u16> = vec![5, 3, 0x4000, 5, 9345, 1293, 2903, 1293, 932];
+    let negative_raw: Vec<u8> = negative_u16
+        .iter()
+        .flat_map(|&x| vec![(x >> 8) as u8, x as u8])
+        .collect();
+    let negative =
+        BigDecimal::from_str("-9345129329031293.0932").expect("Failed to parse big decimal");
+    let negative_result = BigDecimalFromSql::from_sql(&Type::NUMERIC, negative_raw.as_slice())
+        .expect("Failed to run FromSql");
+    assert_eq!(negative_result.inner, negative);
 }
