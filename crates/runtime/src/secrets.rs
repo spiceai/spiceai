@@ -57,7 +57,7 @@ impl SecretsProvider {
         Self::default()
     }
 
-    pub async fn load_secrets(&mut self) -> Result<()> {
+    pub fn load_secrets(&mut self) -> Result<()> {
         match self.store {
             SpiceSecretStore::File => {
                 let mut file_secret_store = FileSecretStore::new();
