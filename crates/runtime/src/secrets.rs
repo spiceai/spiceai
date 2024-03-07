@@ -3,12 +3,15 @@ pub mod file;
 
 use std::collections::HashMap;
 
+use async_trait::async_trait;
+
 use super::Result;
 use crate::{secrets::file::FileSecretStore, Error};
 use spicepod::component::secrets::SpiceSecretStore;
 
+#[async_trait]
 pub trait SecretStore {
-    fn get_secret(&self, secret_name: &str) -> Option<Secret>;
+    async fn get_secret(&self, secret_name: &str) -> Option<Secret>;
 }
 
 #[derive(Debug, Clone)]
@@ -54,7 +57,7 @@ impl SecretsProvider {
         Self::default()
     }
 
-    pub fn load_secrets(&mut self) -> Result<()> {
+    pub async fn load_secrets(&mut self) -> Result<()> {
         match self.store {
             SpiceSecretStore::File => {
                 let mut file_secret_store = FileSecretStore::new();
@@ -80,9 +83,9 @@ impl SecretsProvider {
     }
 
     #[must_use]
-    pub fn get_secret(&self, secret_name: &str) -> Option<Secret> {
+    pub async fn get_secret(&self, secret_name: &str) -> Option<Secret> {
         if let Some(ref secret_store) = self.secret_store {
-            secret_store.get_secret(secret_name)
+            secret_store.get_secret(secret_name).await
         } else {
             None
         }
