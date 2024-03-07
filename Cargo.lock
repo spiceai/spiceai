@@ -424,6 +424,7 @@ dependencies = [
  "sea-query",
  "snafu 0.8.0",
  "time",
+ "tokio",
  "tracing",
 ]
 

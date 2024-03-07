@@ -19,3 +19,4 @@ postgres = {version = "0.19.7", features = ["with-chrono-0_4"]}
 bigdecimal_0_3_0 = { package = "bigdecimal", version = "0.3.0"}
 time = "0.3.34"
 bigdecimal = "0.4.3"
+tokio.workspace = true
