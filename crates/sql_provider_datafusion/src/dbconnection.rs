@@ -30,11 +30,13 @@ pub trait AsyncDbConnection<T, P>: DbConnection<T, P> + Sync {
 }
 
 pub trait DbConnection<T, P>: Send {
-    fn connection_type(&self) -> &str;
     fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
-}
 
-pub fn cast_to<T, P, X: DbConnection<T, P>>(x: &'static dyn DbConnection<T, P>) -> Option<&X> {
-    x.as_any().downcast_ref::<X>()
+    fn as_sync(&self) -> Option<&dyn SyncDbConnection<T, P>> {
+        None
+    }
+    fn as_async(&self) -> Option<&dyn AsyncDbConnection<T, P>> {
+        None
+    }
 }

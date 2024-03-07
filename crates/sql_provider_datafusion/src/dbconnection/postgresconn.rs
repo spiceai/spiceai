@@ -31,21 +31,28 @@ pub struct PostgresConnection {
     pub conn: bb8::PooledConnection<'static, PostgresConnectionManager<NoTls>>,
 }
 
-impl
+impl<'a>
     DbConnection<
         bb8::PooledConnection<'static, PostgresConnectionManager<NoTls>>,
-        &(dyn ToSql + Sync),
+        &'a (dyn ToSql + Sync),
     > for PostgresConnection
 {
-    fn connection_type(&self) -> &str {
-        "async"
-    }
     fn as_any(&self) -> &dyn Any {
         self
     }
 
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
+    }
+    fn as_async(
+        &self,
+    ) -> Option<
+        &dyn AsyncDbConnection<
+            bb8::PooledConnection<'static, PostgresConnectionManager<NoTls>>,
+            &'a (dyn ToSql + Sync),
+        >,
+    > {
+        Some(self)
     }
 }
 

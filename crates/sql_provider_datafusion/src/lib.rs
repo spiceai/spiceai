@@ -1,7 +1,6 @@
 #![allow(clippy::missing_errors_doc)]
 
 use async_trait::async_trait;
-use dbconnection::{AsyncDbConnection, SyncDbConnection};
 use dbconnectionpool::DbConnectionPool;
 use futures::TryStreamExt;
 use snafu::prelude::*;
@@ -58,46 +57,27 @@ impl<T, P> SqlTable<T, P> {
         table_reference: impl Into<OwnedTableReference>,
     ) -> Result<Self> {
         let table_reference = table_reference.into();
-        let mut conn = pool
+        let conn = pool
             .connect()
             .await
             .context(UnableToGetConnectionFromPoolSnafu)?;
 
-        match conn.connection_type() {
-            "sync" => {
-                let Some(conn) = conn
-                    .as_any_mut()
-                    .downcast_mut::<Box<dyn SyncDbConnection<T, P>>>()
-                else {
-                    return Err(Error::UnableToDowncastConnection);
-                };
+        let schema = if let Some(conn) = conn.as_sync() {
+            conn.get_schema(&table_reference)
+                .context(UnableToQueryDbConnectionSnafu)?
+        } else if let Some(conn) = conn.as_async() {
+            conn.get_schema(&table_reference)
+                .await
+                .context(UnableToQueryDbConnectionSnafu)?
+        } else {
+            return Err(Error::UnableToDowncastConnection);
+        };
 
-                Ok(Self {
-                    pool: Arc::clone(pool),
-                    schema: conn
-                        .get_schema(&table_reference)
-                        .context(UnableToQueryDbConnectionSnafu)?,
-                    table_reference,
-                })
-            }
-            "async" => {
-                let Some(conn) = conn
-                    .as_any()
-                    .downcast_ref::<Box<dyn AsyncDbConnection<T, P>>>()
-                else {
-                    return Err(Error::UnableToDowncastConnection);
-                };
-                Ok(Self {
-                    pool: Arc::clone(pool),
-                    schema: conn
-                        .get_schema(&table_reference)
-                        .await
-                        .context(UnableToQueryDbConnectionSnafu)?,
-                    table_reference,
-                })
-            }
-            _ => unreachable!(),
-        }
+        Ok(Self {
+            pool: Arc::clone(pool),
+            schema,
+            table_reference,
+        })
     }
 
     pub fn new_with_schema(
@@ -293,29 +273,16 @@ async fn get_stream<T: 'static, P: 'static>(
     pool: Arc<dyn DbConnectionPool<T, P> + Send + Sync>,
     sql: String,
 ) -> DataFusionResult<SendableRecordBatchStream> {
-    let mut conn = pool.connect().await.map_err(to_execution_error)?;
-    match conn.connection_type() {
-        "sync" => {
-            let Some(conn) = conn
-                .as_any()
-                .downcast_ref::<Box<dyn SyncDbConnection<T, P>>>()
-            else {
-                return Err(to_execution_error(Error::UnableToDowncastConnection));
-            };
-            conn.query_arrow(&sql, &[]).map_err(to_execution_error)
-        }
-        "async" => {
-            let Some(conn) = conn
-                .as_any()
-                .downcast_ref::<Box<dyn AsyncDbConnection<T, P>>>()
-            else {
-                return Err(to_execution_error(Error::UnableToDowncastConnection));
-            };
-            conn.query_arrow(&sql, &[])
-                .await
-                .map_err(to_execution_error)
-        }
-        _ => unreachable!(),
+    let conn = pool.connect().await.map_err(to_execution_error)?;
+
+    if let Some(conn) = conn.as_sync() {
+        conn.query_arrow(&sql, &[]).map_err(to_execution_error)
+    } else if let Some(conn) = conn.as_async() {
+        conn.query_arrow(&sql, &[])
+            .await
+            .map_err(to_execution_error)
+    } else {
+        Err(to_execution_error(Error::UnableToDowncastConnection))
     }
 }
 

@@ -23,18 +23,22 @@ pub struct DuckDbConnection {
     pub conn: r2d2::PooledConnection<DuckdbConnectionManager>,
 }
 
-impl DbConnection<r2d2::PooledConnection<DuckdbConnectionManager>, &dyn ToSql>
+impl<'a> DbConnection<r2d2::PooledConnection<DuckdbConnectionManager>, &'a dyn ToSql>
     for DuckDbConnection
 {
-    fn connection_type(&self) -> &str {
-        "sync"
-    }
     fn as_any(&self) -> &dyn Any {
         self
     }
 
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
+    }
+
+    fn as_sync(
+        &self,
+    ) -> Option<&dyn SyncDbConnection<r2d2::PooledConnection<DuckdbConnectionManager>, &'a dyn ToSql>>
+    {
+        Some(self)
     }
 }
 
