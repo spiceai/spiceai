@@ -221,7 +221,6 @@ impl<'a> PostgresUpdate<'a> {
             return false;
         };
 
-        let exists: bool = row.get(0);
-        exists
+        row.get(0)
     }
 }
