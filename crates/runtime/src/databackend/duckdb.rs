@@ -10,7 +10,7 @@ use duckdb::{vtab::arrow::arrow_recordbatch_to_query_params, DuckdbConnectionMan
 use snafu::{prelude::*, ResultExt};
 use spicepod::component::dataset::Dataset;
 use sql_provider_datafusion::{
-    dbconnection::{self, duckdbconn::DuckDbConnection, DbConnection},
+    dbconnection::{self, duckdbconn::DuckDbConnection, SyncDbConnection},
     dbconnectionpool::{duckdbpool::DuckDbConnectionPool, DbConnectionPool, Mode},
     SqlTable,
 };
