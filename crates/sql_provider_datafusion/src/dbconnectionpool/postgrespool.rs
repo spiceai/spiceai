@@ -10,6 +10,8 @@ use snafu::{prelude::*, ResultExt};
 use super::{DbConnectionPool, Mode, Result};
 use crate::dbconnection::{postgresconn::PostgresConnection, DbConnection};
 
+use crate::dbconnection::AsyncDbConnection;
+
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("DuckDBError: {source}"))]

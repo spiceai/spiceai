@@ -11,6 +11,7 @@ use snafu::{prelude::*, ResultExt};
 
 use super::DbConnection;
 use super::Result;
+use super::SyncDbConnection;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -23,6 +24,21 @@ pub struct DuckDbConnection {
 }
 
 impl DbConnection<r2d2::PooledConnection<DuckdbConnectionManager>, &dyn ToSql>
+    for DuckDbConnection
+{
+    fn connection_type(&self) -> &str {
+        "sync"
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
+impl SyncDbConnection<r2d2::PooledConnection<DuckdbConnectionManager>, &dyn ToSql>
     for DuckDbConnection
 {
     fn new(conn: r2d2::PooledConnection<DuckdbConnectionManager>) -> Self {
@@ -52,13 +68,5 @@ impl DbConnection<r2d2::PooledConnection<DuckdbConnectionManager>, &dyn ToSql>
     fn execute(&self, sql: &str, params: &[&dyn ToSql]) -> Result<u64> {
         let rows_modified = self.conn.execute(sql, params).context(DuckDBSnafu)?;
         Ok(rows_modified as u64)
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
     }
 }

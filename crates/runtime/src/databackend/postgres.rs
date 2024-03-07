@@ -10,7 +10,7 @@ use datafusion::{execution::context::SessionContext, sql::TableReference};
 use snafu::{prelude::*, ResultExt};
 use spicepod::component::dataset::Dataset;
 use sql_provider_datafusion::{
-    dbconnection::{self, postgresconn::PostgresConnection, DbConnection},
+    dbconnection::{self, postgresconn::PostgresConnection, AsyncDbConnection},
     dbconnectionpool::{postgrespool::PostgresConnectionPool, DbConnectionPool, Mode},
     SqlTable,
 };
@@ -72,8 +72,8 @@ impl DataPublisher for PostgresBackend {
         let pool = Arc::clone(&self.pool);
         let name = self.name.clone();
         Box::pin(async move {
-            let mut conn = pool.connect().await.context(DbConnectionPoolSnafu)?;
-            let Some(conn) = conn.as_any_mut().downcast_mut::<PostgresConnection>() else {
+            let conn = pool.connect().await.context(DbConnectionPoolSnafu)?;
+            let Some(conn) = conn.as_any().downcast_ref::<PostgresConnection>() else {
                 return Err(
                     Box::new(Error::UnableToDowncastDbConnection {}) as Box<dyn std::error::Error>
                 );
@@ -149,23 +149,24 @@ struct PostgresUpdate<'a> {
     name: String,
     data: Vec<RecordBatch>,
     update_type: UpdateType,
-    postgres_conn: &'a mut dbconnection::postgresconn::PostgresConnection,
+    postgres_conn: &'a dbconnection::postgresconn::PostgresConnection,
     create_mutex: &'a Mutex<()>,
 }
 
 impl<'a> PostgresUpdate<'a> {
     async fn update(&mut self) -> Result<()> {
         if !self.table_exists().await {
-            self.create_table()?;
+            self.create_table().await?;
         } else if self.update_type == UpdateType::Overwrite {
             self.postgres_conn
                 .execute(format!(r#"TRUNCATE TABLE "{}""#, self.name).as_str(), &[])
+                .await
                 .context(DbConnectionSnafu)?;
         };
 
         let data = mem::take(&mut self.data);
         for batch in data {
-            self.insert_batch(batch)?;
+            self.insert_batch(batch).await?;
         }
 
         tracing::trace!(
@@ -176,18 +177,19 @@ impl<'a> PostgresUpdate<'a> {
         Ok(())
     }
 
-    fn insert_batch(&mut self, batch: RecordBatch) -> Result<()> {
+    async fn insert_batch(&mut self, batch: RecordBatch) -> Result<()> {
         let insert_table_builder = InsertBuilder::new(&self.name, vec![batch]);
         let sql = insert_table_builder.build();
 
         self.postgres_conn
             .execute(&sql, &[])
+            .await
             .context(DbConnectionSnafu)?;
 
         Ok(())
     }
 
-    fn create_table(&mut self) -> Result<()> {
+    async fn create_table(&mut self) -> Result<()> {
         let _lock = self.create_mutex.lock();
 
         let Some(batch) = self.data.pop() else {
@@ -199,9 +201,10 @@ impl<'a> PostgresUpdate<'a> {
 
         self.postgres_conn
             .execute(&sql, &[])
+            .await
             .context(DbConnectionSnafu)?;
 
-        self.insert_batch(batch)?;
+        self.insert_batch(batch).await?;
 
         Ok(())
     }

@@ -1,6 +1,7 @@
 #![allow(clippy::missing_errors_doc)]
 
 use async_trait::async_trait;
+use dbconnection::{AsyncDbConnection, SyncDbConnection};
 use dbconnectionpool::DbConnectionPool;
 use futures::TryStreamExt;
 use snafu::prelude::*;
@@ -26,13 +27,21 @@ pub mod expr;
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Unable to get a DB connection from the pool: {source}"))]
-    UnableToGetConnectionFromPool { source: dbconnectionpool::Error },
+    UnableToGetConnectionFromPool {
+        source: dbconnectionpool::Error,
+    },
 
     #[snafu(display("Unable to query DB connection: {source}"))]
-    UnableToQueryDbConnection { source: dbconnection::Error },
+    UnableToQueryDbConnection {
+        source: dbconnection::Error,
+    },
 
     #[snafu(display("Unable to generate SQL: {source}"))]
-    UnableToGenerateSQL { source: expr::Error },
+    UnableToGenerateSQL {
+        source: expr::Error,
+    },
+
+    UnableToGetConnection,
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -53,14 +62,42 @@ impl<T, P> SqlTable<T, P> {
             .connect()
             .await
             .context(UnableToGetConnectionFromPoolSnafu)?;
-        let schema = conn
-            .get_schema(&table_reference)
-            .context(UnableToQueryDbConnectionSnafu)?;
-        Ok(Self {
-            pool: Arc::clone(pool),
-            schema,
-            table_reference,
-        })
+
+        match conn.connection_type() {
+            "sync" => {
+                let Some(conn) = conn
+                    .as_any()
+                    .downcast_ref::<Box<dyn SyncDbConnection<T, P>>>()
+                else {
+                    return Err(Error::UnableToGetConnection);
+                };
+
+                Ok(Self {
+                    pool: Arc::clone(pool),
+                    schema: conn
+                        .get_schema(&table_reference)
+                        .context(UnableToQueryDbConnectionSnafu)?,
+                    table_reference,
+                })
+            }
+            "async" => {
+                let Some(conn) = conn
+                    .as_any()
+                    .downcast_ref::<Box<dyn AsyncDbConnection<T, P>>>()
+                else {
+                    return Err(Error::UnableToGetConnection);
+                };
+                Ok(Self {
+                    pool: Arc::clone(pool),
+                    schema: conn
+                        .get_schema(&table_reference)
+                        .await
+                        .context(UnableToQueryDbConnectionSnafu)?,
+                    table_reference,
+                })
+            }
+            _ => unreachable!(),
+        }
     }
 
     pub fn new_with_schema(
@@ -252,12 +289,34 @@ impl<T: 'static, P: 'static> ExecutionPlan for SqlExec<T, P> {
     }
 }
 
-async fn get_stream<T, P: 'static>(
+async fn get_stream<T: 'static, P: 'static>(
     pool: Arc<dyn DbConnectionPool<T, P> + Send + Sync>,
     sql: String,
 ) -> DataFusionResult<SendableRecordBatchStream> {
     let conn = pool.connect().await.map_err(to_execution_error)?;
-    conn.query_arrow(&sql, &[]).map_err(to_execution_error)
+    match conn.connection_type() {
+        "sync" => {
+            let Some(conn) = conn
+                .as_any()
+                .downcast_ref::<Box<dyn SyncDbConnection<T, P>>>()
+            else {
+                return Err(to_execution_error(Error::UnableToGetConnection));
+            };
+            conn.query_arrow(&sql, &[]).map_err(to_execution_error)
+        }
+        "async" => {
+            let Some(conn) = conn
+                .as_any()
+                .downcast_ref::<Box<dyn AsyncDbConnection<T, P>>>()
+            else {
+                return Err(to_execution_error(Error::UnableToGetConnection));
+            };
+            conn.query_arrow(&sql, &[])
+                .await
+                .map_err(to_execution_error)
+        }
+        _ => unreachable!(),
+    }
 }
 
 #[allow(clippy::needless_pass_by_value)]
