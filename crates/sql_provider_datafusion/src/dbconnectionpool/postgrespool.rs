@@ -42,6 +42,7 @@ impl
         _mode: Mode,
         _params: Arc<Option<HashMap<String, String>>>,
     ) -> Result<Self> {
+        println!("{:?}", _params);
         let connection_string = "host=localhost user=postgres password=postgres dbname=postgres";
 
         let manager = PostgresConnectionManager::new_from_stringlike(connection_string, NoTls)

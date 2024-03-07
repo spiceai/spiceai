@@ -96,6 +96,7 @@ impl DataPublisher for PostgresBackend {
     }
 }
 
+#[allow(clippy::uninlined_format_args)]
 impl PostgresBackend {
     #[allow(clippy::needless_pass_by_value)]
     pub async fn new(
