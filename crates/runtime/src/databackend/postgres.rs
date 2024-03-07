@@ -3,14 +3,14 @@ use std::{collections::HashMap, mem, sync::Arc};
 use arrow::record_batch::RecordBatch;
 use arrow_sql_gen::statement::{CreateTableBuilder, InsertBuilder};
 use bb8_postgres::{
-    tokio_postgres::{types::ToSql, NoTls},
+    tokio_postgres::{types::ToSql, NoTls, Transaction},
     PostgresConnectionManager,
 };
 use datafusion::{execution::context::SessionContext, sql::TableReference};
 use snafu::{prelude::*, ResultExt};
 use spicepod::component::dataset::Dataset;
 use sql_provider_datafusion::{
-    dbconnection::{self, postgresconn::PostgresConnection, DbConnection},
+    dbconnection::postgresconn::PostgresConnection,
     dbconnectionpool::{postgrespool::PostgresConnectionPool, DbConnectionPool, Mode},
     SqlTable,
 };
@@ -31,6 +31,11 @@ pub enum Error {
     #[snafu(display("DbConnectionPoolError: {source}"))]
     DbConnectionPoolError {
         source: sql_provider_datafusion::dbconnectionpool::Error,
+    },
+
+    #[snafu(display("Error executing transaction: {source}"))]
+    TransactionError {
+        source: bb8_postgres::tokio_postgres::Error,
     },
 
     #[snafu(display("PostgresDataFusionError: {source}"))]
@@ -69,21 +74,13 @@ pub struct PostgresBackend {
 
 impl DataPublisher for PostgresBackend {
     fn add_data(&self, _dataset: Arc<Dataset>, data_update: DataUpdate) -> AddDataResult {
-        let pool = Arc::clone(&self.pool);
         let name = self.name.clone();
         Box::pin(async move {
-            let mut conn = pool.connect().await.context(DbConnectionPoolSnafu)?;
-            let Some(conn) = conn.as_any_mut().downcast_mut::<PostgresConnection>() else {
-                return Err(
-                    Box::new(Error::UnableToDowncastDbConnection {}) as Box<dyn std::error::Error>
-                );
-            };
-
             let mut postgres_update = PostgresUpdate {
                 name,
                 data: data_update.data,
                 update_type: data_update.update_type,
-                postgres_conn: conn,
+                pool: Arc::clone(&self.pool),
                 create_mutex: &self.create_mutex,
             };
 
@@ -149,24 +146,52 @@ struct PostgresUpdate<'a> {
     name: String,
     data: Vec<RecordBatch>,
     update_type: UpdateType,
-    postgres_conn: &'a mut dbconnection::postgresconn::PostgresConnection,
+    pool: Arc<
+        dyn DbConnectionPool<
+                bb8::PooledConnection<'static, PostgresConnectionManager<NoTls>>,
+                &'static (dyn ToSql + Sync),
+            > + Send
+            + Sync,
+    >,
     create_mutex: &'a Mutex<()>,
 }
 
 impl<'a> PostgresUpdate<'a> {
     async fn update(&mut self) -> Result<()> {
-        if !self.table_exists().await {
-            self.create_table()?;
+        let mut transaction_conn = self.pool.connect().await.context(DbConnectionPoolSnafu)?;
+        let Some(transaction_conn) = transaction_conn
+            .as_any_mut()
+            .downcast_mut::<PostgresConnection>()
+        else {
+            return UnableToDowncastDbConnectionSnafu {}.fail();
+        };
+
+        let transaction = transaction_conn
+            .conn
+            .transaction()
+            .await
+            .context(TransactionSnafu)?;
+
+        let conn = self.pool.connect().await.context(DbConnectionPoolSnafu)?;
+        let Some(conn) = conn.as_any().downcast_ref::<PostgresConnection>() else {
+            return UnableToDowncastDbConnectionSnafu {}.fail();
+        };
+
+        if !self.table_exists(conn).await {
+            self.create_table(&transaction).await?;
         } else if self.update_type == UpdateType::Overwrite {
-            self.postgres_conn
-                .execute(format!(r#"TRUNCATE TABLE "{}""#, self.name).as_str(), &[])
-                .context(DbConnectionSnafu)?;
+            transaction
+                .execute(format!(r#"DELETE FROM "{}""#, self.name).as_str(), &[])
+                .await
+                .context(TransactionSnafu)?;
         };
 
         let data = mem::take(&mut self.data);
         for batch in data {
-            self.insert_batch(batch)?;
+            self.insert_batch(&transaction, batch).await?;
         }
+
+        transaction.commit().await.context(TransactionSnafu)?;
 
         tracing::trace!(
             "Processed update to Postgres table {name}",
@@ -176,18 +201,23 @@ impl<'a> PostgresUpdate<'a> {
         Ok(())
     }
 
-    fn insert_batch(&mut self, batch: RecordBatch) -> Result<()> {
+    async fn insert_batch(
+        &mut self,
+        transaction: &Transaction<'_>,
+        batch: RecordBatch,
+    ) -> Result<()> {
         let insert_table_builder = InsertBuilder::new(&self.name, vec![batch]);
         let sql = insert_table_builder.build();
 
-        self.postgres_conn
+        transaction
             .execute(&sql, &[])
-            .context(DbConnectionSnafu)?;
+            .await
+            .context(TransactionSnafu)?;
 
         Ok(())
     }
 
-    fn create_table(&mut self) -> Result<()> {
+    async fn create_table(&mut self, transaction: &Transaction<'_>) -> Result<()> {
         let _lock = self.create_mutex.lock();
 
         let Some(batch) = self.data.pop() else {
@@ -197,16 +227,17 @@ impl<'a> PostgresUpdate<'a> {
         let create_table_statement = CreateTableBuilder::new(batch.schema(), &self.name);
         let sql = create_table_statement.build();
 
-        self.postgres_conn
+        transaction
             .execute(&sql, &[])
-            .context(DbConnectionSnafu)?;
+            .await
+            .context(TransactionSnafu)?;
 
-        self.insert_batch(batch)?;
+        self.insert_batch(transaction, batch).await?;
 
         Ok(())
     }
 
-    async fn table_exists(&self) -> bool {
+    async fn table_exists(&mut self, postgres_conn: &PostgresConnection) -> bool {
         let sql = format!(
             r#"SELECT EXISTS (
               SELECT 1
@@ -217,11 +248,10 @@ impl<'a> PostgresUpdate<'a> {
         );
         tracing::trace!("{sql}");
 
-        let Ok(row) = self.postgres_conn.conn.query_one(&sql, &[]).await else {
+        let Ok(row) = postgres_conn.conn.query_one(&sql, &[]).await else {
             return false;
         };
 
-        let exists: bool = row.get(0);
-        exists
+        row.get(0)
     }
 }
