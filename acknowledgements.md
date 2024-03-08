@@ -55,6 +55,11 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 | axum | 0.6.20 |  | https://github.com/tokio-rs/axum | MIT |  | Web framework that focuses on ergonomics and modularity |
 | axum | 0.7.4 |  | https://github.com/tokio-rs/axum | MIT |  | Web framework that focuses on ergonomics and modularity |
 | base64 | 0.21.7 | Alice Maz <alice@alicemaz.com>|Marshall Pierce <marshall@mpierce.org> | https://github.com/marshallpierce/rust-base64 | Apache-2.0 OR MIT |  | encodes and decodes base64 as bytes or utf8 |
+| base64 | 0.22.0 | Alice Maz <alice@alicemaz.com>|Marshall Pierce <marshall@mpierce.org> | https://github.com/marshallpierce/rust-base64 | Apache-2.0 OR MIT |  | encodes and decodes base64 as bytes or utf8 |
+| bb8 | 0.7.1 | Dirkjan Ochtman <dirkjan@ochtman.nl>|Kyle Huey <khuey@kylehuey.com> | https://github.com/djc/bb8 | MIT |  | Full-featured async (tokio-based) connection pool (like r2d2) |
+| bb8-postgres | 0.7.0 | Dirkjan Ochtman <dirkjan@ochtman.nl>|Kyle Huey <khuey@kylehuey.com> | https://github.com/khuey/bb8 | MIT |  | Full-featured async (tokio-based) postgres connection pool (like r2d2) |
+| bigdecimal | 0.3.1 | Andrew Kubera | https://github.com/akubera/bigdecimal-rs | Apache-2.0 OR MIT |  | Arbitrary precision decimal numbers |
+| bigdecimal | 0.4.3 | Andrew Kubera | https://github.com/akubera/bigdecimal-rs | Apache-2.0 OR MIT |  | Arbitrary precision decimal numbers |
 | bytes | 1.5.0 | Carl Lerche <me@carllerche.com>|Sean McArthur <sean@seanmonstar.com> | https://github.com/tokio-rs/bytes | MIT |  | Types and traits for working with bytes |
 | clap | 4.5.1 |  | https://github.com/clap-rs/clap | Apache-2.0 OR MIT |  | A simple to use, efficient, and full-featured Command Line Argument Parser |
 | datafusion | 34.0.0 | Apache Arrow <dev@arrow.apache.org> | https://github.com/apache/arrow-datafusion | Apache-2.0 |  | DataFusion is an in-memory query engine that uses Apache Arrow as the memory model |
@@ -72,11 +77,12 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 | indexmap | 2.2.3 |  | https://github.com/indexmap-rs/indexmap | Apache-2.0 OR MIT |  | A hash table with consistent order and fast iteration. |
 | metrics | 0.22.1 | Toby Lawrence <toby@nuclearfurnace.com> | https://github.com/metrics-rs/metrics | MIT |  | A lightweight metrics facade. |
 | metrics-exporter-prometheus | 0.13.1 | Toby Lawrence <toby@nuclearfurnace.com> | https://github.com/metrics-rs/metrics | MIT |  | A metrics-compatible exporter for sending metrics to Prometheus. |
-| ndarray | 0.15.6 | Ulrik Sverdrup bluss|Jim Turner | https://github.com/rust-ndarray/ndarray | Apache-2.0 OR MIT |  | An n-dimensional array for general elements and for numerics. Lightweight array views and slicing; views support chunking and splitting. |
+| ndarray | 0.15.6 | "Ulrik Sverdrup ""bluss""|Jim Turner" | https://github.com/rust-ndarray/ndarray | Apache-2.0 OR MIT |  | An n-dimensional array for general elements and for numerics. Lightweight array views and slicing; views support chunking and splitting. |
 | ndarray-npy | 0.8.1 | Jim Turner <ndarray-npy@turner.link> | https://github.com/jturner314/ndarray-npy | Apache-2.0 OR MIT |  | .npy and .npz file format support for ndarray |
 | notify | 6.1.1 | Félix Saparelli <me@passcod.name>|Daniel Faust <hessijames@gmail.com>|Aron Heinecke <Ox0p54r36@t-online.de> | https://github.com/notify-rs/notify.git | CC0-1.0 |  | Cross-platform filesystem notification library |
 | opentelemetry-proto | 0.4.0 |  | https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-proto | Apache-2.0 |  | Protobuf generated files and transformations. |
 | parquet | 49.0.0 | Apache Arrow <dev@arrow.apache.org> | https://github.com/apache/arrow-rs | Apache-2.0 |  | Apache Parquet implementation in Rust |
+| postgres | 0.19.7 | Steven Fackler <sfackler@gmail.com> | https://github.com/sfackler/rust-postgres | Apache-2.0 OR MIT |  | A native, synchronous PostgreSQL client |
 | r2d2 | 0.8.10 | Steven Fackler <sfackler@gmail.com> | https://github.com/sfackler/r2d2 | Apache-2.0 OR MIT |  | A generic connection pool |
 | regex | 1.10.3 | The Rust Project Developers|Andrew Gallant <jamslam@gmail.com> | https://github.com/rust-lang/regex | Apache-2.0 OR MIT |  | An implementation of regular expressions for Rust. This implementation uses finite automata and guarantees linear time matching on all inputs. |
 | reqwest | 0.11.24 | Sean McArthur <sean@seanmonstar.com> | https://github.com/seanmonstar/reqwest | Apache-2.0 OR MIT |  | higher level HTTP client library |
@@ -94,6 +100,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 | spiced | 0.7.0-alpha |  | https://github.com/spiceai/spiceai | Apache-2.0 |  | Spice OSS |
 | spicepod | 0.7.0-alpha |  | https://github.com/spiceai/spiceai | Apache-2.0 |  |  |
 | sql_provider_datafusion | 0.7.0-alpha |  | https://github.com/spiceai/spiceai | Apache-2.0 |  |  |
+| time | 0.3.34 | Jacob Pratt <open-source@jhpratt.dev>|Time contributors | https://github.com/time-rs/time | Apache-2.0 OR MIT |  | Date and time library. Fully interoperable with the standard library. Mostly compatible with #![no_std]. |
 | tokio | 1.36.0 | Tokio Contributors <team@tokio.rs> | https://github.com/tokio-rs/tokio | MIT |  | An event-driven, non-blocking I/O platform for writing asynchronous I/O backed applications. |
 | tokio-stream | 0.1.14 | Tokio Contributors <team@tokio.rs> | https://github.com/tokio-rs/tokio | MIT |  | Utilities to work with `Stream` and `tokio`. |
 | toml | 0.8.10 | Alex Crichton <alex@alexcrichton.com> | https://github.com/toml-rs/toml | Apache-2.0 OR MIT |  | A native Rust encoder and decoder of TOML-formatted files and streams. Provides implementations of the standard Serialize/Deserialize traits for TOML data to facilitate deserializing and serializing Rust structures. |
