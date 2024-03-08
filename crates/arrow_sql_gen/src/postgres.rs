@@ -12,10 +12,10 @@ use bigdecimal::num_bigint::BigInt;
 use bigdecimal::num_bigint::Sign;
 use bigdecimal::BigDecimal;
 use bigdecimal::ToPrimitive;
-use postgres::types::FromSql;
-use postgres::{types::Type, Row};
 use snafu::prelude::*;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio_postgres::types::FromSql;
+use tokio_postgres::{types::Type, Row};
 
 #[derive(Debug, Snafu)]
 pub enum Error {

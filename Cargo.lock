@@ -420,11 +420,11 @@ dependencies = [
  "arrow",
  "bigdecimal 0.3.1",
  "bigdecimal 0.4.3",
- "postgres",
  "sea-query",
  "snafu 0.8.0",
  "time",
  "tokio",
+ "tokio-postgres",
  "tracing",
 ]
 
@@ -3178,20 +3178,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7170ef9988bc169ba16dd36a7fa041e5c4cbeb6a35b76d4c03daded371eae7c0"
 
 [[package]]
-name = "postgres"
-version = "0.19.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7915b33ed60abc46040cbcaa25ffa1c7ec240668e0477c4f3070786f5916d451"
-dependencies = [
- "bytes",
- "fallible-iterator 0.2.0",
- "futures-util",
- "log",
- "tokio",
- "tokio-postgres",
-]
-
-[[package]]
 name = "postgres-protocol"
 version = "0.6.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3216,7 +3202,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8d2234cdee9408b523530a9b6d2d6b373d1db34f6a8e51dc03ded1828d7fb67c"
 dependencies = [
  "bytes",
- "chrono",
  "fallible-iterator 0.2.0",
  "postgres-protocol",
 ]
