@@ -8,6 +8,11 @@ use arrow::array::RecordBatchOptions;
 use arrow::datatypes::DataType;
 use arrow::datatypes::Field;
 use arrow::datatypes::Schema;
+use bigdecimal::num_bigint::BigInt;
+use bigdecimal::num_bigint::Sign;
+use bigdecimal::BigDecimal;
+use bigdecimal::ToPrimitive;
+use postgres::types::FromSql;
 use postgres::{types::Type, Row};
 use snafu::prelude::*;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -23,10 +28,16 @@ pub enum Error {
     #[snafu(display("Failed to downcast builder for {postgres_type}"))]
     FailedToDowncastBuilder { postgres_type: String },
 
-    #[snafu(display("Integer overflow when converting u64 to i64"))]
+    #[snafu(display("Integer overflow when converting u64 to i64: {source}"))]
     FailedToConvertU64toI64 {
         source: <u64 as convert::TryInto<i64>>::Error,
     },
+
+    #[snafu(display("Failed to parse raw Postgres Bytes as BigDecimal: {:?}", bytes))]
+    FailedToParseBigDecmialFromPostgres { bytes: Vec<u8> },
+
+    #[snafu(display("Cannot represent BigDecimal as i128: {big_decimal}"))]
+    FailedToConvertBigDecmialToI128 { big_decimal: BigDecimal },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -167,9 +178,14 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                         .fail();
                     };
 
-                    // TODO: Figure out how to properly extract Decimal128 from postgres
-                    //let v: f64 = row.get(i);
-                    builder.append_value(0);
+                    let v: BigDecimalFromSql = row.get(i);
+                    let Some(v_i128) = v.to_decimal_128() else {
+                        return FailedToConvertBigDecmialToI128Snafu {
+                            big_decimal: v.inner,
+                        }
+                        .fail();
+                    };
+                    builder.append_value(v_i128);
                 }
                 Type::TIMESTAMP => {
                     // TODO: Figure out how to properly extract Timestamp TimeUnit from postgres, now we assume it's in microseconds
@@ -219,7 +235,7 @@ fn map_column_type_to_data_type(column_type: &Type) -> DataType {
         Type::TEXT => DataType::Utf8,
         Type::BOOL => DataType::Boolean,
         // TODO: Figure out how to handle decimal scale and precision, it isn't specified as a type in postgres types
-        Type::NUMERIC => DataType::Decimal128(38, 10),
+        Type::NUMERIC => DataType::Decimal128(38, 9),
         // TODO: Figure out how to properly extract Timestamp TimeUnit from postgres, now we assume it's in microseconds
         Type::TIMESTAMP => DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
         _ => unimplemented!("Unsupported column type {:?}", column_type),
@@ -235,8 +251,127 @@ fn map_column_type_to_array_builder(column_type: &Type) -> Box<dyn ArrayBuilder>
         Type::FLOAT8 => Box::new(arrow::array::Float64Builder::new()),
         Type::TEXT => Box::new(arrow::array::StringBuilder::new()),
         Type::BOOL => Box::new(arrow::array::BooleanBuilder::new()),
-        Type::NUMERIC => Box::new(arrow::array::Decimal128Builder::new()),
+        // TODO: Figure out how to handle decimal scale and precision, it isn't specified as a type in postgres types
+        Type::NUMERIC => Box::new(
+            arrow::array::Decimal128Builder::new()
+                .with_precision_and_scale(38, 9)
+                .unwrap_or_default(),
+        ),
         Type::TIMESTAMP => Box::new(arrow::array::TimestampMicrosecondBuilder::new()),
         _ => unimplemented!("Unsupported column type {:?}", column_type),
+    }
+}
+
+struct BigDecimalFromSql {
+    inner: BigDecimal,
+    scale: u16,
+}
+
+impl BigDecimalFromSql {
+    fn to_decimal_128(&self) -> Option<i128> {
+        (&self.inner * 10i128.pow(u32::from(self.scale))).to_i128()
+    }
+}
+
+impl<'a> FromSql<'a> for BigDecimalFromSql {
+    fn from_sql(
+        _ty: &Type,
+        raw: &'a [u8],
+    ) -> std::prelude::v1::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        let raw_u16: Vec<u16> = raw
+            .chunks(2)
+            .map(|chunk| {
+                if chunk.len() == 2 {
+                    ((u16::from(chunk[0])) << 8) | (u16::from(chunk[1]))
+                } else {
+                    (u16::from(chunk[0])) << 8
+                }
+            })
+            .collect();
+
+        let base_10_000_digit_count = raw_u16[0];
+        let weight = raw_u16[1];
+        let sign = raw_u16[2];
+        let scale = raw_u16[3];
+
+        let mut base_10_000_digits = Vec::new();
+        for i in 4..4 + base_10_000_digit_count {
+            base_10_000_digits.push(raw_u16[i as usize]);
+        }
+
+        let mut u8_digits = Vec::new();
+        for &base_10_000_digit in base_10_000_digits.iter().rev() {
+            let mut base_10_000_digit = base_10_000_digit;
+            let mut temp_result = Vec::new();
+            while base_10_000_digit > 0 {
+                temp_result.push((base_10_000_digit % 10) as u8);
+                base_10_000_digit /= 10;
+            }
+            while temp_result.len() < 4 {
+                temp_result.push(0);
+            }
+            u8_digits.extend(temp_result);
+        }
+        u8_digits.reverse();
+
+        let base_10_000_digits_right_of_decimal = base_10_000_digit_count - weight - 1;
+        let implied_base_10_zeros = scale - (base_10_000_digits_right_of_decimal * 4);
+        u8_digits.resize(u8_digits.len() + implied_base_10_zeros as usize, 0);
+
+        let sign = match sign {
+            0x4000 => Sign::Minus,
+            0x0000 => Sign::Plus,
+            _ => {
+                return Err(Box::new(Error::FailedToParseBigDecmialFromPostgres {
+                    bytes: raw.to_vec(),
+                }))
+            }
+        };
+
+        let Some(digits) = BigInt::from_radix_be(sign, u8_digits.as_slice(), 10) else {
+            return Err(Box::new(Error::FailedToParseBigDecmialFromPostgres {
+                bytes: raw.to_vec(),
+            }));
+        };
+        Ok(BigDecimalFromSql {
+            inner: BigDecimal::new(digits, i64::from(scale)),
+            scale,
+        })
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        matches!(*ty, Type::NUMERIC)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[allow(clippy::cast_possible_truncation)]
+    #[tokio::test]
+    async fn test_big_decimal_from_sql() {
+        let positive_u16: Vec<u16> = vec![5, 3, 0, 5, 9345, 1293, 2903, 1293, 932];
+        let positive_raw: Vec<u8> = positive_u16
+            .iter()
+            .flat_map(|&x| vec![(x >> 8) as u8, x as u8])
+            .collect();
+        let positive =
+            BigDecimal::from_str("9345129329031293.0932").expect("Failed to parse big decimal");
+        let positive_result = BigDecimalFromSql::from_sql(&Type::NUMERIC, positive_raw.as_slice())
+            .expect("Failed to run FromSql");
+        assert_eq!(positive_result.inner, positive);
+
+        let negative_u16: Vec<u16> = vec![5, 3, 0x4000, 5, 9345, 1293, 2903, 1293, 932];
+        let negative_raw: Vec<u8> = negative_u16
+            .iter()
+            .flat_map(|&x| vec![(x >> 8) as u8, x as u8])
+            .collect();
+        let negative =
+            BigDecimal::from_str("-9345129329031293.0932").expect("Failed to parse big decimal");
+        let negative_result = BigDecimalFromSql::from_sql(&Type::NUMERIC, negative_raw.as_slice())
+            .expect("Failed to run FromSql");
+        assert_eq!(negative_result.inner, negative);
     }
 }

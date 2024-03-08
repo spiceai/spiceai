@@ -14,8 +14,9 @@ exclude.workspace = true
 tracing.workspace = true
 arrow.workspace = true
 sea-query = {version = "0.30.7" , features = ["with-rust_decimal", "with-bigdecimal", "with-time"]}
-rust_decimal = "1.34.3"
 snafu.workspace = true
 postgres = {version = "0.19.7", features = ["with-chrono-0_4"]}
-bigdecimal = "0.3.0"
+bigdecimal_0_3_0 = { package = "bigdecimal", version = "0.3.0"}
 time = "0.3.34"
+bigdecimal = "0.4.3"
+tokio.workspace = true
