@@ -42,7 +42,8 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// Converts Postgres `Row`s to an Arrow `RecordBatch`.
+/// Converts Postgres `Row`s to an Arrow `RecordBatch`. Assumes that all rows have the same schema and
+/// sets the schema based on the first row.
 ///
 /// # Errors
 ///
@@ -59,12 +60,13 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
             let column_name = column.name();
             let column_type = column.type_();
 
+            let data_type = map_column_type_to_data_type(column_type);
             arrow_fields.push(Field::new(
                 column_name,
-                map_column_type_to_data_type(column_type),
+                data_type,
                 true, // TODO: Set nullable properly based on postgres schema
             ));
-            arrow_columns_builders.push(map_column_type_to_array_builder(column_type));
+            arrow_columns_builders.push(map_data_type_to_array_builder(data_type));
             postgres_types.push(column_type.clone());
         }
     }
@@ -242,23 +244,35 @@ fn map_column_type_to_data_type(column_type: &Type) -> DataType {
     }
 }
 
-fn map_column_type_to_array_builder(column_type: &Type) -> Box<dyn ArrayBuilder> {
-    match *column_type {
-        Type::INT2 => Box::new(arrow::array::Int16Builder::new()),
-        Type::INT4 => Box::new(arrow::array::Int32Builder::new()),
-        Type::INT8 => Box::new(arrow::array::Int64Builder::new()),
-        Type::FLOAT4 => Box::new(arrow::array::Float32Builder::new()),
-        Type::FLOAT8 => Box::new(arrow::array::Float64Builder::new()),
-        Type::TEXT => Box::new(arrow::array::StringBuilder::new()),
-        Type::BOOL => Box::new(arrow::array::BooleanBuilder::new()),
-        // TODO: Figure out how to handle decimal scale and precision, it isn't specified as a type in postgres types
-        Type::NUMERIC => Box::new(
+fn map_data_type_to_array_builder(data_type: &DataType) -> Box<dyn ArrayBuilder> {
+    match *data_type {
+        DataType::Int16 => Box::new(arrow::array::Int16Builder::new()),
+        DataType::Int32 => Box::new(arrow::array::Int32Builder::new()),
+        DataType::Int64 => Box::new(arrow::array::Int64Builder::new()),
+        DataType::Float32 => Box::new(arrow::array::Float32Builder::new()),
+        DataType::Float64 => Box::new(arrow::array::Float64Builder::new()),
+        DataType::Utf8 => Box::new(arrow::array::StringBuilder::new()),
+        DataType::Boolean => Box::new(arrow::array::BooleanBuilder::new()),
+        DataType::Decimal128(precision, scale) => Box::new(
             arrow::array::Decimal128Builder::new()
-                .with_precision_and_scale(38, 9)
+                .with_precision_and_scale(precision, scale)
                 .unwrap_or_default(),
         ),
-        Type::TIMESTAMP => Box::new(arrow::array::TimestampMicrosecondBuilder::new()),
-        _ => unimplemented!("Unsupported column type {:?}", column_type),
+        DataType::Timestamp(time_unit, time_zone) => match time_unit {
+            arrow::datatypes::TimeUnit::Microsecond => Box::new(
+                arrow::array::TimestampMicrosecondBuilder::new().with_timezone_opt(time_zone),
+            ),
+            arrow::datatypes::TimeUnit::Second => {
+                Box::new(arrow::array::TimestampSecondBuilder::new().with_timezone_opt(time_zone))
+            }
+            arrow::datatypes::TimeUnit::Millisecond => Box::new(
+                arrow::array::TimestampMillisecondBuilder::new().with_timezone_opt(time_zone),
+            ),
+            arrow::datatypes::TimeUnit::Nanosecond => Box::new(
+                arrow::array::TimestampNanosecondBuilder::new().with_timezone_opt(time_zone),
+            ),
+        },
+        _ => unimplemented!("Unsupported data type {:?}", data_type),
     }
 }
 
