@@ -205,19 +205,25 @@ spice dataset configure
 You will be prompted to enter a name. Enter a name that represents the contents of the dataset
 
 ```bash
-What is the dataset name? eth_recent_blocks
+dataset name: (default) eth_recent_blocks
+```
+
+Enter the description of the dataset:
+
+```
+description: eth recent logs
 ```
 
 Enter the location of the dataset:
 
 ```bash
-Where is your dataset located? spice.ai/eth.recent_blocks
+from: spice.ai/eth.recent_blocks
 ```
 
 Select `y` when prompted whether to accelerate the data:
 
 ```bash
-Locally accelerate this dataset (y/n)? y
+Locally accelerate (y/n)? y
 ```
 
 You should see the following output from your runtime terminal:
@@ -286,19 +292,25 @@ spice dataset configure
 Enter the name of the dataset:
 
 ```bash
-What is the dataset name? my_dataset
+dataset name: (default)  my_dataset
+```
+
+Enter the description of the dataset:
+
+```
+description: my dataset in dremio
 ```
 
 Specify the location of the dataset:
 
 ```bash
-Where is your dataset located? dremio/datasets.my_dataset
+from: dremio/datasets.my_dataset
 ```
 
 Select "y" when prompted whether to locally accelerate the dataset:
 
 ```bash
-Locally accelerate this dataset (y/n)? y
+Locally accelerate (y/n)? y
 ```
 
 We should now see the following output:
