@@ -242,12 +242,16 @@ impl<'a> DuckDBUpdate<'a> {
         Ok(())
     }
 
+    const MAX_BATCH_SIZE: usize = 2048;
+
     fn split_batch(batch: &RecordBatch) -> Vec<RecordBatch> {
         let mut result = vec![];
-        for offset in (0..=batch.num_rows()).step_by(2048) {
-            let length = cmp::min(2048, batch.num_rows() - offset);
-            result.push(batch.slice(offset, length));
-        }
+        (0..=batch.num_rows())
+            .step_by(Self::MAX_BATCH_SIZE)
+            .for_each(|offset| {
+                let length = cmp::min(Self::MAX_BATCH_SIZE, batch.num_rows() - offset);
+                result.push(batch.slice(offset, length));
+            });
         result
     }
 
