@@ -1,4 +1,5 @@
 use std::{
+    cmp,
     collections::HashMap,
     fmt, mem,
     sync::{Arc, PoisonError},
@@ -165,7 +166,7 @@ impl<'a> DuckDBUpdate<'a> {
 
         let data = mem::take(&mut self.data);
         for batch in data {
-            self.insert_batch(batch)?;
+            self.insert_batch(&batch)?;
         }
 
         tracing::trace!("Processed update to DuckDB table {name}", name = self.name,);
@@ -173,20 +174,22 @@ impl<'a> DuckDBUpdate<'a> {
         Ok(())
     }
 
-    fn insert_batch(&mut self, batch: RecordBatch) -> Result<()> {
-        let params = arrow_recordbatch_to_query_params(batch);
+    fn insert_batch(&mut self, batch: &RecordBatch) -> Result<()> {
         let sql = format!(
             r#"INSERT INTO "{name}" SELECT * FROM arrow(?, ?)"#,
             name = self.name
         );
         tracing::trace!("{sql}");
 
-        self.duckdb_conn
-            .execute(
-                &sql,
-                &params.iter().map(|p| p as &dyn ToSql).collect::<Vec<_>>(),
-            )
-            .context(DbConnectionSnafu)?;
+        for sliced in Self::split_batch(batch) {
+            let params = arrow_recordbatch_to_query_params(sliced);
+            self.duckdb_conn
+                .execute(
+                    &sql,
+                    &params.iter().map(|p| p as &dyn ToSql).collect::<Vec<_>>(),
+                )
+                .context(DbConnectionSnafu)?;
+        }
 
         Ok(())
     }
@@ -210,6 +213,15 @@ impl<'a> DuckDBUpdate<'a> {
             return Ok(());
         };
 
+        let mut batches = Self::split_batch(&batch);
+        let Some(batch) = batches.pop() else {
+            return Ok(());
+        };
+
+        for b in batches {
+            self.data.push(b);
+        }
+
         let arrow_params = arrow_recordbatch_to_query_params(batch);
         let sql = format!(
             r#"CREATE TABLE "{name}" AS SELECT * FROM arrow(?, ?)"#,
@@ -228,6 +240,15 @@ impl<'a> DuckDBUpdate<'a> {
             .context(DbConnectionSnafu)?;
 
         Ok(())
+    }
+
+    fn split_batch(batch: &RecordBatch) -> Vec<RecordBatch> {
+        let mut result = vec![];
+        for offset in (0..=batch.num_rows()).step_by(2048) {
+            let length = cmp::min(2048, batch.num_rows() - offset);
+            result.push(batch.slice(offset, length));
+        }
+        result
     }
 
     fn table_exists(&self) -> bool {
@@ -280,8 +301,8 @@ mod tests {
         let data = if let Ok(batch) = RecordBatch::try_new(
             schema,
             vec![
-                Arc::new(StringArray::from(vec!["a", "b", "c", "d"])),
-                Arc::new(Int32Array::from(vec![1, 10, 10, 100])),
+                Arc::new(StringArray::from(vec!["a"; 1_000_000])),
+                Arc::new(Int32Array::from(vec![1; 1_000_000])),
             ],
         ) {
             vec![batch]
