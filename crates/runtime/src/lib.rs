@@ -31,7 +31,6 @@ pub mod modelruntime;
 pub mod modelsource;
 mod opentelemetry;
 pub mod podswatcher;
-mod schemastore;
 pub mod secrets;
 pub(crate) mod tracers;
 
