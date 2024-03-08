@@ -63,10 +63,10 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
             let data_type = map_column_type_to_data_type(column_type);
             arrow_fields.push(Field::new(
                 column_name,
-                data_type,
+                data_type.clone(),
                 true, // TODO: Set nullable properly based on postgres schema
             ));
-            arrow_columns_builders.push(map_data_type_to_array_builder(data_type));
+            arrow_columns_builders.push(map_data_type_to_array_builder(&data_type));
             postgres_types.push(column_type.clone());
         }
     }
@@ -245,7 +245,7 @@ fn map_column_type_to_data_type(column_type: &Type) -> DataType {
 }
 
 fn map_data_type_to_array_builder(data_type: &DataType) -> Box<dyn ArrayBuilder> {
-    match *data_type {
+    match data_type {
         DataType::Int16 => Box::new(arrow::array::Int16Builder::new()),
         DataType::Int32 => Box::new(arrow::array::Int32Builder::new()),
         DataType::Int64 => Box::new(arrow::array::Int64Builder::new()),
@@ -255,21 +255,24 @@ fn map_data_type_to_array_builder(data_type: &DataType) -> Box<dyn ArrayBuilder>
         DataType::Boolean => Box::new(arrow::array::BooleanBuilder::new()),
         DataType::Decimal128(precision, scale) => Box::new(
             arrow::array::Decimal128Builder::new()
-                .with_precision_and_scale(precision, scale)
+                .with_precision_and_scale(*precision, *scale)
                 .unwrap_or_default(),
         ),
         DataType::Timestamp(time_unit, time_zone) => match time_unit {
             arrow::datatypes::TimeUnit::Microsecond => Box::new(
-                arrow::array::TimestampMicrosecondBuilder::new().with_timezone_opt(time_zone),
+                arrow::array::TimestampMicrosecondBuilder::new()
+                    .with_timezone_opt(time_zone.clone()),
             ),
-            arrow::datatypes::TimeUnit::Second => {
-                Box::new(arrow::array::TimestampSecondBuilder::new().with_timezone_opt(time_zone))
-            }
+            arrow::datatypes::TimeUnit::Second => Box::new(
+                arrow::array::TimestampSecondBuilder::new().with_timezone_opt(time_zone.clone()),
+            ),
             arrow::datatypes::TimeUnit::Millisecond => Box::new(
-                arrow::array::TimestampMillisecondBuilder::new().with_timezone_opt(time_zone),
+                arrow::array::TimestampMillisecondBuilder::new()
+                    .with_timezone_opt(time_zone.clone()),
             ),
             arrow::datatypes::TimeUnit::Nanosecond => Box::new(
-                arrow::array::TimestampNanosecondBuilder::new().with_timezone_opt(time_zone),
+                arrow::array::TimestampNanosecondBuilder::new()
+                    .with_timezone_opt(time_zone.clone()),
             ),
         },
         _ => unimplemented!("Unsupported data type {:?}", data_type),
