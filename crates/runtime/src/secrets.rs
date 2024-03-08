@@ -1,14 +1,18 @@
 pub mod env;
 pub mod file;
+pub mod kubernetes;
 
 use std::collections::HashMap;
+
+use async_trait::async_trait;
 
 use super::Result;
 use crate::{secrets::file::FileSecretStore, Error};
 use spicepod::component::secrets::SpiceSecretStore;
 
+#[async_trait]
 pub trait SecretStore {
-    fn get_secret(&self, secret_name: &str) -> Option<Secret>;
+    async fn get_secret(&self, secret_name: &str) -> Option<Secret>;
 }
 
 #[derive(Debug, Clone)]
@@ -74,15 +78,26 @@ impl SecretsProvider {
 
                 self.secret_store = Some(Box::new(env_secret_store));
             }
+            SpiceSecretStore::Kubernetes => {
+                let mut kubernetes_secret_store = kubernetes::KubernetesSecretStore::new();
+
+                if kubernetes_secret_store.init().is_err() {
+                    return Err(Error::UnableToLoadSecrets {
+                        store: "kubernetes".to_string(),
+                    });
+                };
+
+                self.secret_store = Some(Box::new(kubernetes_secret_store));
+            }
         }
 
         Ok(())
     }
 
     #[must_use]
-    pub fn get_secret(&self, secret_name: &str) -> Option<Secret> {
+    pub async fn get_secret(&self, secret_name: &str) -> Option<Secret> {
         if let Some(ref secret_store) = self.secret_store {
-            secret_store.get_secret(secret_name)
+            secret_store.get_secret(secret_name).await
         } else {
             None
         }

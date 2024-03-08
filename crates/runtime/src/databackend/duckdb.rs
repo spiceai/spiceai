@@ -71,7 +71,7 @@ impl DataPublisher for DuckDBBackend {
         let pool = Arc::clone(&self.pool);
         let name = self.name.clone();
         Box::pin(async move {
-            let mut conn = pool.connect().context(DbConnectionPoolSnafu)?;
+            let mut conn = pool.connect().await.context(DbConnectionPoolSnafu)?;
             let Some(conn) = conn.as_any_mut().downcast_mut::<DuckDbConnection>() else {
                 return Err(
                     Box::new(Error::UnableToDowncastDbConnection {}) as Box<dyn std::error::Error>
@@ -88,7 +88,7 @@ impl DataPublisher for DuckDBBackend {
 
             duckdb_update.update()?;
 
-            self.initialize_datafusion()?;
+            self.initialize_datafusion().await?;
             Ok(())
         })
     }
@@ -100,14 +100,16 @@ impl DataPublisher for DuckDBBackend {
 
 impl DuckDBBackend {
     #[allow(clippy::needless_pass_by_value)]
-    pub fn new(
+    pub async fn new(
         ctx: Arc<SessionContext>,
         name: &str,
         mode: Mode,
         params: Arc<Option<HashMap<String, String>>>,
         primary_keys: Option<Vec<String>>,
     ) -> Result<Self> {
-        let pool = DuckDbConnectionPool::new(name, mode, params).context(DbConnectionPoolSnafu)?;
+        let pool = DuckDbConnectionPool::new(name, mode, params)
+            .await
+            .context(DbConnectionPoolSnafu)?;
         Ok(DuckDBBackend {
             ctx,
             name: name.to_string(),
@@ -117,7 +119,7 @@ impl DuckDBBackend {
         })
     }
 
-    fn initialize_datafusion(&self) -> Result<()> {
+    async fn initialize_datafusion(&self) -> Result<()> {
         let table_exists = self
             .ctx
             .table_exist(TableReference::bare(self.name.clone()))
@@ -127,6 +129,7 @@ impl DuckDBBackend {
         }
 
         let table = match SqlTable::new(&self.pool, TableReference::bare(self.name.clone()))
+            .await
             .context(DuckDBDataFusionSnafu)
         {
             Ok(table) => table,
@@ -267,6 +270,7 @@ mod tests {
         let name = "test_add_data";
         let backend =
             DuckDBBackend::new(Arc::clone(&ctx), name, Mode::Memory, Arc::new(None), None)
+                .await
                 .expect("Unable to create DuckDBBackend");
 
         let schema = Arc::new(Schema::new(vec![

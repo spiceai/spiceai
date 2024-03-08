@@ -1,6 +1,6 @@
 use arrow::record_batch::RecordBatch;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum UpdateType {
     Append,
     Overwrite,

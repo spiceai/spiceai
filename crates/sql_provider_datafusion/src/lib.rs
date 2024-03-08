@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use dbconnectionpool::DbConnectionPool;
+use futures::TryStreamExt;
 use snafu::prelude::*;
 use std::{any::Any, fmt, sync::Arc};
 
@@ -13,8 +14,8 @@ use datafusion::{
     execution::{context::SessionState, TaskContext},
     logical_expr::{Expr, TableProviderFilterPushDown, TableType},
     physical_plan::{
-        memory::MemoryStream, project_schema, DisplayAs, DisplayFormatType, ExecutionPlan,
-        SendableRecordBatchStream,
+        project_schema, stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType,
+        ExecutionPlan, SendableRecordBatchStream,
     },
 };
 
@@ -43,12 +44,15 @@ pub struct SqlTable<T: 'static, P: 'static> {
 }
 
 impl<T, P> SqlTable<T, P> {
-    pub fn new(
+    pub async fn new(
         pool: &Arc<dyn DbConnectionPool<T, P> + Send + Sync>,
         table_reference: impl Into<OwnedTableReference>,
     ) -> Result<Self> {
         let table_reference = table_reference.into();
-        let mut conn = pool.connect().context(UnableToGetConnectionFromPoolSnafu)?;
+        let conn = pool
+            .connect()
+            .await
+            .context(UnableToGetConnectionFromPoolSnafu)?;
         let schema = conn
             .get_schema(&table_reference)
             .context(UnableToQueryDbConnectionSnafu)?;
@@ -237,15 +241,23 @@ impl<T: 'static, P: 'static> ExecutionPlan for SqlExec<T, P> {
         _partition: usize,
         _context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-        let mut conn = self.pool.connect().map_err(to_execution_error)?;
-
         let sql = self.sql().map_err(to_execution_error)?;
         tracing::debug!("SqlExec sql: {sql}");
 
-        let recs = conn.query_arrow(&sql, &[]).map_err(to_execution_error)?;
+        let fut = get_stream(Arc::clone(&self.pool), sql);
 
-        Ok(Box::pin(MemoryStream::try_new(recs, self.schema(), None)?))
+        let stream = futures::stream::once(fut).try_flatten();
+        let schema = self.schema().clone();
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
+}
+
+async fn get_stream<T, P: 'static>(
+    pool: Arc<dyn DbConnectionPool<T, P> + Send + Sync>,
+    sql: String,
+) -> DataFusionResult<SendableRecordBatchStream> {
+    let conn = pool.connect().await.map_err(to_execution_error)?;
+    conn.query_arrow(&sql, &[]).map_err(to_execution_error)
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -284,12 +296,10 @@ mod tests {
             dyn DbConnectionPool<r2d2::PooledConnection<DuckdbConnectionManager>, &dyn ToSql>
                 + Send
                 + Sync,
-        > = Arc::new(DuckDbConnectionPool::new(
-            "test",
-            Mode::Memory,
-            Arc::new(Option::None),
-        )?);
-        let conn = pool.connect()?;
+        > = Arc::new(
+            DuckDbConnectionPool::new("test", Mode::Memory, Arc::new(Option::None)).await?,
+        );
+        let conn = pool.connect().await?;
         let db_conn = conn
             .as_any()
             .downcast_ref::<DuckDbConnection>()
@@ -297,7 +307,7 @@ mod tests {
         db_conn.conn.execute_batch(
             "CREATE TABLE test (a INTEGER, b VARCHAR); INSERT INTO test VALUES (3, 'bar');",
         )?;
-        let duckdb_table = SqlTable::new(&pool, "test")?;
+        let duckdb_table = SqlTable::new(&pool, "test").await?;
         ctx.register_table("test_datafusion", Arc::new(duckdb_table))?;
         let sql = "SELECT * FROM test_datafusion limit 1";
         let df = ctx.sql(sql).await?;
@@ -314,12 +324,10 @@ mod tests {
             dyn DbConnectionPool<r2d2::PooledConnection<DuckdbConnectionManager>, &dyn ToSql>
                 + Send
                 + Sync,
-        > = Arc::new(DuckDbConnectionPool::new(
-            "test",
-            Mode::Memory,
-            Arc::new(Option::None),
-        )?);
-        let conn = pool.connect()?;
+        > = Arc::new(
+            DuckDbConnectionPool::new("test", Mode::Memory, Arc::new(Option::None)).await?,
+        );
+        let conn = pool.connect().await?;
         let db_conn = conn
             .as_any()
             .downcast_ref::<DuckDbConnection>()
@@ -327,7 +335,7 @@ mod tests {
         db_conn.conn.execute_batch(
             "CREATE TABLE test (a INTEGER, b VARCHAR); INSERT INTO test VALUES (3, 'bar');",
         )?;
-        let duckdb_table = SqlTable::new(&pool, "test")?;
+        let duckdb_table = SqlTable::new(&pool, "test").await?;
         ctx.register_table("test_datafusion", Arc::new(duckdb_table))?;
         let sql = "SELECT * FROM test_datafusion where a > 1 and b = 'bar' limit 1";
         let df = ctx.sql(sql).await?;

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
 
+use async_trait::async_trait;
 use dirs;
 use serde::Deserialize;
 use snafu::prelude::*;
@@ -77,9 +78,10 @@ impl FileSecretStore {
     }
 }
 
+#[async_trait]
 impl SecretStore for FileSecretStore {
     #[must_use]
-    fn get_secret(&self, secret_name: &str) -> Option<Secret> {
+    async fn get_secret(&self, secret_name: &str) -> Option<Secret> {
         if let Some(secret) = self.secrets.get(secret_name) {
             return Some(secret.clone());
         }
