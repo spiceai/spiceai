@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::convert;
 use std::sync::Arc;
 
@@ -8,6 +9,7 @@ use arrow::array::RecordBatchOptions;
 use arrow::datatypes::DataType;
 use arrow::datatypes::Field;
 use arrow::datatypes::Schema;
+use arrow::datatypes::TimeUnit;
 use bigdecimal::num_bigint::BigInt;
 use bigdecimal::num_bigint::Sign;
 use bigdecimal::BigDecimal;
@@ -33,11 +35,25 @@ pub enum Error {
         source: <u64 as convert::TryInto<i64>>::Error,
     },
 
+    #[snafu(display("Integer overflow when converting u128 to i64: {source}"))]
+    FailedToConvertU128toI64 {
+        source: <u128 as convert::TryInto<i64>>::Error,
+    },
+
     #[snafu(display("Failed to parse raw Postgres Bytes as BigDecimal: {:?}", bytes))]
     FailedToParseBigDecmialFromPostgres { bytes: Vec<u8> },
 
     #[snafu(display("Cannot represent BigDecimal as i128: {big_decimal}"))]
     FailedToConvertBigDecmialToI128 { big_decimal: BigDecimal },
+
+    #[snafu(display("Failed to find field {column_name} in schema"))]
+    FailedToFindFieldInSchema { column_name: String },
+
+    #[snafu(display("No Arrow field found for index {index}"))]
+    NoArrowFieldForIndex { index: usize },
+
+    #[snafu(display("No column name for index: {index}"))]
+    NoColumnNameForIndex { index: usize },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -50,24 +66,26 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// Returns an error if there is a failure in converting the rows to a `RecordBatch`.
 #[allow(clippy::too_many_lines)]
 pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
-    let mut arrow_fields: Vec<Field> = Vec::new();
-    let mut arrow_columns_builders: Vec<Box<dyn ArrayBuilder>> = Vec::new();
+    let mut arrow_fields: Vec<Option<Field>> = Vec::new();
+    let mut arrow_columns_builders: Vec<Option<Box<dyn ArrayBuilder>>> = Vec::new();
     let mut postgres_types: Vec<Type> = Vec::new();
+    let mut column_names: Vec<String> = Vec::new();
 
     if !rows.is_empty() {
         let row = &rows[0];
         for column in row.columns() {
             let column_name = column.name();
             let column_type = column.type_();
-
             let data_type = map_column_type_to_data_type(column_type);
-            arrow_fields.push(Field::new(
-                column_name,
-                data_type.clone(),
-                true, // TODO: Set nullable properly based on postgres schema
-            ));
-            arrow_columns_builders.push(map_data_type_to_array_builder(&data_type));
+            match &data_type {
+                Some(data_type) => {
+                    arrow_fields.push(Some(Field::new(column_name, data_type.clone(), true)));
+                }
+                None => arrow_fields.push(None),
+            }
+            arrow_columns_builders.push(map_data_type_to_array_builder(data_type.as_ref()));
             postgres_types.push(column_type.clone());
+            column_names.push(column_name.to_string());
         }
     }
 
@@ -77,8 +95,15 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                 return NoBuilderForIndexSnafu { index: i }.fail();
             };
 
+            let Some(arrow_field) = arrow_fields.get_mut(i) else {
+                return NoArrowFieldForIndexSnafu { index: i }.fail();
+            };
+
             match *postgres_type {
                 Type::INT2 => {
+                    let Some(builder) = builder else {
+                        return NoBuilderForIndexSnafu { index: i }.fail();
+                    };
                     let Some(builder) = builder
                         .as_any_mut()
                         .downcast_mut::<arrow::array::Int16Builder>()
@@ -92,6 +117,9 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                     builder.append_value(v);
                 }
                 Type::INT4 => {
+                    let Some(builder) = builder else {
+                        return NoBuilderForIndexSnafu { index: i }.fail();
+                    };
                     let Some(builder) = builder
                         .as_any_mut()
                         .downcast_mut::<arrow::array::Int32Builder>()
@@ -105,6 +133,9 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                     builder.append_value(v);
                 }
                 Type::INT8 => {
+                    let Some(builder) = builder else {
+                        return NoBuilderForIndexSnafu { index: i }.fail();
+                    };
                     let Some(builder) = builder
                         .as_any_mut()
                         .downcast_mut::<arrow::array::Int64Builder>()
@@ -118,6 +149,9 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                     builder.append_value(v);
                 }
                 Type::FLOAT4 => {
+                    let Some(builder) = builder else {
+                        return NoBuilderForIndexSnafu { index: i }.fail();
+                    };
                     let Some(builder) = builder
                         .as_any_mut()
                         .downcast_mut::<arrow::array::Float32Builder>()
@@ -131,6 +165,9 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                     builder.append_value(v);
                 }
                 Type::FLOAT8 => {
+                    let Some(builder) = builder else {
+                        return NoBuilderForIndexSnafu { index: i }.fail();
+                    };
                     let Some(builder) = builder
                         .as_any_mut()
                         .downcast_mut::<arrow::array::Float64Builder>()
@@ -144,6 +181,9 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                     builder.append_value(v);
                 }
                 Type::TEXT => {
+                    let Some(builder) = builder else {
+                        return NoBuilderForIndexSnafu { index: i }.fail();
+                    };
                     let Some(builder) = builder
                         .as_any_mut()
                         .downcast_mut::<arrow::array::StringBuilder>()
@@ -157,6 +197,9 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                     builder.append_value(v);
                 }
                 Type::BOOL => {
+                    let Some(builder) = builder else {
+                        return NoBuilderForIndexSnafu { index: i }.fail();
+                    };
                     let Some(builder) = builder
                         .as_any_mut()
                         .downcast_mut::<arrow::array::BooleanBuilder>()
@@ -170,7 +213,18 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                     builder.append_value(v);
                 }
                 Type::NUMERIC => {
-                    let Some(builder) = builder
+                    let v: BigDecimalFromSql = row.get(i);
+                    let scale = v.scale();
+
+                    let dec_builder = builder.get_or_insert_with(|| {
+                        Box::new(
+                            arrow::array::Decimal128Builder::new()
+                                .with_precision_and_scale(38, scale.try_into().unwrap_or_default())
+                                .unwrap_or_default(),
+                        )
+                    });
+
+                    let Some(dec_builder) = dec_builder
                         .as_any_mut()
                         .downcast_mut::<arrow::array::Decimal128Builder>()
                     else {
@@ -180,20 +234,34 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                         .fail();
                     };
 
-                    let v: BigDecimalFromSql = row.get(i);
+                    if arrow_field.is_none() {
+                        let Some(field_name) = column_names.get(i) else {
+                            return NoColumnNameForIndexSnafu { index: i }.fail();
+                        };
+                        let new_arrow_field = Field::new(
+                            field_name,
+                            DataType::Decimal128(38, scale.try_into().unwrap_or_default()),
+                            true,
+                        );
+
+                        *arrow_field = Some(new_arrow_field);
+                    }
+
                     let Some(v_i128) = v.to_decimal_128() else {
                         return FailedToConvertBigDecmialToI128Snafu {
                             big_decimal: v.inner,
                         }
                         .fail();
                     };
-                    builder.append_value(v_i128);
+                    dec_builder.append_value(v_i128);
                 }
                 Type::TIMESTAMP => {
-                    // TODO: Figure out how to properly extract Timestamp TimeUnit from postgres, now we assume it's in microseconds
+                    let Some(builder) = builder else {
+                        return NoBuilderForIndexSnafu { index: i }.fail();
+                    };
                     let Some(builder) = builder
                         .as_any_mut()
-                        .downcast_mut::<arrow::array::TimestampMicrosecondBuilder>(
+                        .downcast_mut::<arrow::array::TimestampMillisecondBuilder>(
                     ) else {
                         return FailedToDowncastBuilderSnafu {
                             postgres_type: format!("{postgres_type}"),
@@ -204,9 +272,9 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
 
                     if let Ok(v) = v.duration_since(UNIX_EPOCH) {
                         let timestamp: i64 = v
-                            .as_secs()
+                            .as_millis()
                             .try_into()
-                            .context(FailedToConvertU64toI64Snafu)?;
+                            .context(FailedToConvertU128toI64Snafu)?;
                         builder.append_value(timestamp);
                     }
                 }
@@ -217,8 +285,9 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
 
     let columns = arrow_columns_builders
         .into_iter()
-        .map(|mut builder| builder.finish())
+        .filter_map(|builder| builder.map(|mut b| b.finish()))
         .collect::<Vec<ArrayRef>>();
+    let arrow_fields = arrow_fields.into_iter().flatten().collect::<Vec<Field>>();
 
     let options = &RecordBatchOptions::new().with_row_count(Some(rows.len()));
     match RecordBatch::try_new_with_options(Arc::new(Schema::new(arrow_fields)), columns, options) {
@@ -227,53 +296,53 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
     }
 }
 
-fn map_column_type_to_data_type(column_type: &Type) -> DataType {
+fn map_column_type_to_data_type(column_type: &Type) -> Option<DataType> {
     match *column_type {
-        Type::INT2 => DataType::Int16,
-        Type::INT4 => DataType::Int32,
-        Type::INT8 => DataType::Int64,
-        Type::FLOAT4 => DataType::Float32,
-        Type::FLOAT8 => DataType::Float64,
-        Type::TEXT => DataType::Utf8,
-        Type::BOOL => DataType::Boolean,
-        // TODO: Figure out how to handle decimal scale and precision, it isn't specified as a type in postgres types
-        Type::NUMERIC => DataType::Decimal128(38, 9),
-        // TODO: Figure out how to properly extract Timestamp TimeUnit from postgres, now we assume it's in microseconds
-        Type::TIMESTAMP => DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+        Type::INT2 => Some(DataType::Int16),
+        Type::INT4 => Some(DataType::Int32),
+        Type::INT8 => Some(DataType::Int64),
+        Type::FLOAT4 => Some(DataType::Float32),
+        Type::FLOAT8 => Some(DataType::Float64),
+        Type::TEXT => Some(DataType::Utf8),
+        Type::BOOL => Some(DataType::Boolean),
+        // Inspect the scale from the first row. Precision will always be 38 for Decimal128.
+        Type::NUMERIC => None,
+        // We get a SystemTime that we can always convert into milliseconds
+        Type::TIMESTAMP => Some(DataType::Timestamp(TimeUnit::Millisecond, None)),
         _ => unimplemented!("Unsupported column type {:?}", column_type),
     }
 }
 
-fn map_data_type_to_array_builder(data_type: &DataType) -> Box<dyn ArrayBuilder> {
-    match data_type {
-        DataType::Int16 => Box::new(arrow::array::Int16Builder::new()),
-        DataType::Int32 => Box::new(arrow::array::Int32Builder::new()),
-        DataType::Int64 => Box::new(arrow::array::Int64Builder::new()),
-        DataType::Float32 => Box::new(arrow::array::Float32Builder::new()),
-        DataType::Float64 => Box::new(arrow::array::Float64Builder::new()),
-        DataType::Utf8 => Box::new(arrow::array::StringBuilder::new()),
-        DataType::Boolean => Box::new(arrow::array::BooleanBuilder::new()),
-        DataType::Decimal128(precision, scale) => Box::new(
+fn map_data_type_to_array_builder(data_type: Option<&DataType>) -> Option<Box<dyn ArrayBuilder>> {
+    match data_type? {
+        DataType::Int16 => Some(Box::new(arrow::array::Int16Builder::new())),
+        DataType::Int32 => Some(Box::new(arrow::array::Int32Builder::new())),
+        DataType::Int64 => Some(Box::new(arrow::array::Int64Builder::new())),
+        DataType::Float32 => Some(Box::new(arrow::array::Float32Builder::new())),
+        DataType::Float64 => Some(Box::new(arrow::array::Float64Builder::new())),
+        DataType::Utf8 => Some(Box::new(arrow::array::StringBuilder::new())),
+        DataType::Boolean => Some(Box::new(arrow::array::BooleanBuilder::new())),
+        DataType::Decimal128(precision, scale) => Some(Box::new(
             arrow::array::Decimal128Builder::new()
                 .with_precision_and_scale(*precision, *scale)
                 .unwrap_or_default(),
-        ),
+        )),
         DataType::Timestamp(time_unit, time_zone) => match time_unit {
-            arrow::datatypes::TimeUnit::Microsecond => Box::new(
+            arrow::datatypes::TimeUnit::Microsecond => Some(Box::new(
                 arrow::array::TimestampMicrosecondBuilder::new()
                     .with_timezone_opt(time_zone.clone()),
-            ),
-            arrow::datatypes::TimeUnit::Second => Box::new(
+            )),
+            arrow::datatypes::TimeUnit::Second => Some(Box::new(
                 arrow::array::TimestampSecondBuilder::new().with_timezone_opt(time_zone.clone()),
-            ),
-            arrow::datatypes::TimeUnit::Millisecond => Box::new(
+            )),
+            arrow::datatypes::TimeUnit::Millisecond => Some(Box::new(
                 arrow::array::TimestampMillisecondBuilder::new()
                     .with_timezone_opt(time_zone.clone()),
-            ),
-            arrow::datatypes::TimeUnit::Nanosecond => Box::new(
+            )),
+            arrow::datatypes::TimeUnit::Nanosecond => Some(Box::new(
                 arrow::array::TimestampNanosecondBuilder::new()
                     .with_timezone_opt(time_zone.clone()),
-            ),
+            )),
         },
         _ => unimplemented!("Unsupported data type {:?}", data_type),
     }
@@ -287,6 +356,10 @@ struct BigDecimalFromSql {
 impl BigDecimalFromSql {
     fn to_decimal_128(&self) -> Option<i128> {
         (&self.inner * 10i128.pow(u32::from(self.scale))).to_i128()
+    }
+
+    fn scale(&self) -> u16 {
+        self.scale
     }
 }
 
