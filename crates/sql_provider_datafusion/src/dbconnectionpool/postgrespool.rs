@@ -43,7 +43,7 @@ impl
         _params: Arc<Option<HashMap<String, String>>>,
     ) -> Result<Self> {
         let mut host = "localhost";
-        let mut user = "postrgres";
+        let mut user = "postgres";
         let mut dbname = "postgres";
         let mut connection_string = String::new();
 
@@ -66,6 +66,7 @@ impl
         }
 
         connection_string.push_str(format!("host={host} user={user} dbname={dbname}").as_str());
+        println!("Connection string: {connection_string}");
 
         let manager = PostgresConnectionManager::new_from_stringlike(connection_string, NoTls)
             .context(ConnectionPoolSnafu)?;
