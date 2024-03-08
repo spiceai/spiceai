@@ -1,6 +1,7 @@
 #![allow(clippy::missing_errors_doc)]
 
 use async_trait::async_trait;
+use dbconnection::{get_schema, query_arrow};
 use dbconnectionpool::DbConnectionPool;
 use futures::TryStreamExt;
 use snafu::prelude::*;
@@ -35,6 +36,11 @@ pub enum Error {
         source: dbconnection::Error,
     },
 
+    #[snafu(display("Unable to get schema: {source}"))]
+    UnableToGetSchema {
+        source: dbconnection::Error,
+    },
+
     #[snafu(display("Unable to generate SQL: {source}"))]
     UnableToGenerateSQL {
         source: expr::Error,
@@ -62,16 +68,9 @@ impl<T, P> SqlTable<T, P> {
             .await
             .context(UnableToGetConnectionFromPoolSnafu)?;
 
-        let schema = if let Some(conn) = conn.as_sync() {
-            conn.get_schema(&table_reference)
-                .context(UnableToQueryDbConnectionSnafu)?
-        } else if let Some(conn) = conn.as_async() {
-            conn.get_schema(&table_reference)
-                .await
-                .context(UnableToQueryDbConnectionSnafu)?
-        } else {
-            return Err(Error::UnableToDowncastConnection);
-        };
+        let schema = get_schema(conn, &table_reference)
+            .await
+            .context(UnableToGetSchemaSnafu)?;
 
         Ok(Self {
             pool: Arc::clone(pool),
@@ -275,15 +274,7 @@ async fn get_stream<T: 'static, P: 'static>(
 ) -> DataFusionResult<SendableRecordBatchStream> {
     let conn = pool.connect().await.map_err(to_execution_error)?;
 
-    if let Some(conn) = conn.as_sync() {
-        conn.query_arrow(&sql, &[]).map_err(to_execution_error)
-    } else if let Some(conn) = conn.as_async() {
-        conn.query_arrow(&sql, &[])
-            .await
-            .map_err(to_execution_error)
-    } else {
-        Err(to_execution_error(Error::UnableToDowncastConnection))
-    }
+    query_arrow(conn, sql).await.map_err(to_execution_error)
 }
 
 #[allow(clippy::needless_pass_by_value)]

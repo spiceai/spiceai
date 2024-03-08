@@ -1,4 +1,4 @@
-use std::any::Any;
+use std::{any::Any, sync::Arc};
 
 use datafusion::{
     arrow::datatypes::SchemaRef, execution::SendableRecordBatchStream, sql::TableReference,
@@ -38,5 +38,32 @@ pub trait DbConnection<T, P>: Send {
     }
     fn as_async(&self) -> Option<&dyn AsyncDbConnection<T, P>> {
         None
+    }
+}
+
+pub async fn get_schema<T, P>(
+    conn: Box<dyn DbConnection<T, P>>,
+    table_reference: &datafusion::sql::TableReference<'_>,
+) -> Result<Arc<arrow::datatypes::Schema>, Error> {
+    let schema = if let Some(conn) = conn.as_sync() {
+        conn.get_schema(table_reference)?
+    } else if let Some(conn) = conn.as_async() {
+        conn.get_schema(table_reference).await?
+    } else {
+        return Err(Error::from("Unable to downcast connection"));
+    };
+    Ok(schema)
+}
+
+pub async fn query_arrow<T, P>(
+    conn: Box<dyn DbConnection<T, P>>,
+    sql: String,
+) -> Result<SendableRecordBatchStream> {
+    if let Some(conn) = conn.as_sync() {
+        conn.query_arrow(&sql, &[])
+    } else if let Some(conn) = conn.as_async() {
+        conn.query_arrow(&sql, &[]).await
+    } else {
+        Err(Error::from("Unable to downcast connection"))
     }
 }
