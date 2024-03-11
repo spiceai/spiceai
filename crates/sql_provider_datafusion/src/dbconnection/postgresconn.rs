@@ -44,6 +44,7 @@ impl<'a>
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
+
     fn as_async(
         &self,
     ) -> Option<
