@@ -16,7 +16,7 @@ use tokio::time::sleep;
 use tokio::{signal, sync::RwLock};
 
 use crate::{dataconnector::DataConnector, datafusion::DataFusion};
-
+pub mod timing;
 pub mod config;
 pub mod databackend;
 pub mod dataconnector;
@@ -145,6 +145,7 @@ impl Runtime {
     }
 
     pub fn load_dataset(&self, ds: &Dataset) {
+        timing::TimingGuard::new("load_dataset", vec![("dataset", ds.name.clone())]);
         let df = Arc::clone(&self.df);
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
         let shared_secrets_provider = Arc::clone(&self.secrets_provider);

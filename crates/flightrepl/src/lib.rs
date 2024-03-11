@@ -113,11 +113,11 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
             LogicalPlanBuilder::scan(UNNAMED_TABLE, provider_as_source(Arc::new(provider)), None)?
                 .build()?,
         );
-
+        
+        let elapsed = start_time.elapsed();
         if let Err(e) = df.show().await {
             println!("Error displaying results: {e}");
         };
-        let elapsed = start_time.elapsed();
         println!("\nQuery took: {} seconds", elapsed.as_secs_f64());
     }
 

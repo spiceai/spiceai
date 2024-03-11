@@ -50,6 +50,9 @@ pub enum Error {
 
     #[snafu(display("Unable to downcast DbConnection to DuckDbConnection"))]
     UnableToDowncastDbConnection {},
+
+    #[snafu(display("Unable to convert DuckDB VARCHAR bytes value: {varchar}"))]
+    UnableToConvertBytes{varchar: String},
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -168,6 +171,7 @@ impl<'a> DuckDBUpdate<'a> {
             self.insert_batch(batch)?;
         }
 
+        self.monitor_duckdb()?;
         tracing::trace!("Processed update to DuckDB table {name}", name = self.name,);
 
         Ok(())
@@ -246,6 +250,38 @@ impl<'a> DuckDBUpdate<'a> {
             .query_row(&sql, [], |row| row.get::<usize, bool>(0))
             .unwrap_or(false)
     }
+
+
+    fn monitor_duckdb(&self) -> Result<()> {
+        self.duckdb_conn.conn.query_row("select database_size, wal_size, memory_usage, memory_limit FROM pragma_database_size();", [], |row| {
+            
+            if let Ok(database_size) = row.get::<usize, String>(0) {
+                if let Ok(bytes) = pg_size_bytes(database_size.as_str()) {
+                    metrics::gauge!("database_size").set(bytes);
+                }
+            };
+
+            if let Ok(wal_size) = row.get::<usize, String>(1) {
+                if let Ok(bytes) = pg_size_bytes(wal_size.as_str()) {
+                    metrics::gauge!("wal_size").set(bytes);
+                }
+            };
+
+            if let Ok(memory_usage) = row.get::<usize, String>(2) {
+                if let Ok(bytes) = pg_size_bytes(memory_usage.as_str()) {
+                    metrics::gauge!("memory_usage").set(bytes);
+                }
+            };
+
+            if let Ok(memory_limit) = row.get::<usize, String>(3) {
+                if let Ok(bytes) = pg_size_bytes(memory_limit.as_str()) {
+                    metrics::gauge!("memory_limit").set(bytes);
+                }
+            };
+
+            Ok(())
+        }).context(DuckDBSnafu)
+    }
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -253,6 +289,36 @@ fn handle_poison<T: fmt::Debug>(e: PoisonError<T>) -> Error {
     Error::LockPoisoned {
         message: format!("{e:?}"),
     }
+}
+
+fn pg_size_bytes(size_str: &str) -> Result<f64> {
+    if size_str == "0 bytes" { // Edge case
+        return Ok(0.0)
+    }
+    let parts: Vec<&str> = size_str.split_whitespace().collect();
+    if parts.len() != 2 {
+        return Err(Error::UnableToConvertBytes{varchar: size_str.to_string()});
+    }
+
+    let number: f64 = match parts[0].parse() {
+        Ok(num) => num,
+        Err(_) => return Err(Error::UnableToConvertBytes{varchar: size_str.to_string()}),
+    };
+
+    let unit = parts[1];
+    let bytes = match unit.to_uppercase().as_str() {
+        "B" => number,
+        "KIB" => number * 1024.0_f64,
+        "MIB" => number * 1024.0_f64.powi(2),
+        "GIB" => number * 1024.0_f64.powi(3),
+        "TIB" => number * 1024.0_f64.powi(4),
+        "PIB" => number * 1024.0_f64.powi(5),
+        "EIB" => number * 1024.0_f64.powi(6),
+        "ZIB" => number * 1024.0_f64.powi(7),
+        "YIB" => number * 1024.0_f64.powi(8),
+        _ => return Err(Error::UnableToConvertBytes{varchar: size_str.to_string()}),
+    };
+    Ok(bytes)
 }
 
 #[cfg(test)]

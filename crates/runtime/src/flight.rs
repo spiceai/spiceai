@@ -1,5 +1,6 @@
 use crate::datafusion::DataFusion;
 use crate::dataupdate::{DataUpdate, UpdateType};
+use crate::timing;
 use arrow::ipc::writer::{DictionaryTracker, IpcDataGenerator};
 use arrow_flight::{FlightEndpoint, SchemaAsIpc};
 use arrow_ipc::convert::try_schema_from_flatbuffer_bytes;
@@ -19,7 +20,6 @@ use tonic::metadata::MetadataValue;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 use uuid::Uuid;
-
 use arrow_flight::{
     flight_service_server::FlightService, flight_service_server::FlightServiceServer, Action,
     ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightInfo, HandshakeRequest,
@@ -82,6 +82,7 @@ impl FlightService for Service {
         &self,
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
+        timing::TimingGuard::new("do_get", vec![]);
         let ticket = request.into_inner();
         match std::str::from_utf8(&ticket.ticket) {
             Ok(sql) => {
@@ -118,7 +119,7 @@ impl FlightService for Service {
             Err(e) => Err(Status::invalid_argument(format!("Invalid ticket: {e:?}"))),
         }
     }
-
+    
     async fn get_flight_info(
         &self,
         request: Request<FlightDescriptor>,
