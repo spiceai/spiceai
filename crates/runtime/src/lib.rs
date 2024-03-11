@@ -128,8 +128,7 @@ impl Runtime {
 
         let app_lock = self.app.read().await;
         if let Some(app) = app_lock.as_ref() {
-            let Some(secret_store_type) = spicepod_secret_store_type(app.secrets.store.clone())
-            else {
+            let Some(secret_store_type) = spicepod_secret_store_type(&app.secrets.store) else {
                 return;
             };
 

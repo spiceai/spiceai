@@ -57,7 +57,8 @@ pub enum SecretStoreType {
     Kubernetes,
 }
 
-pub fn spicepod_secret_store_type(store: SpiceSecretStore) -> Option<SecretStoreType> {
+#[must_use]
+pub fn spicepod_secret_store_type(store: &SpiceSecretStore) -> Option<SecretStoreType> {
     match store {
         SpiceSecretStore::File => Some(SecretStoreType::File),
         SpiceSecretStore::Env => Some(SecretStoreType::Env),
