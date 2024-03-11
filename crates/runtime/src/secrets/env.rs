@@ -27,7 +27,7 @@ impl EnvSecretStore {
 
     fn add_secret_value(&mut self, secret_name: &str, key: &str, value: &str) {
         if let Some(secret) = self.secrets.get_mut(secret_name) {
-            secret.data.insert(key.to_string(), value.to_string());
+            secret.add(key.to_string(), value.to_string());
         } else {
             self.secrets.insert(
                 secret_name.to_string(),
