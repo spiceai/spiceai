@@ -1,5 +1,6 @@
 pub mod env;
 pub mod file;
+pub mod keyring;
 pub mod kubernetes;
 
 use std::collections::HashMap;
@@ -77,6 +78,9 @@ impl SecretsProvider {
                 env_secret_store.load_secrets();
 
                 self.secret_store = Some(Box::new(env_secret_store));
+            }
+            SpiceSecretStore::Keyring => {
+                self.secret_store = Some(Box::new(keyring::KeyringSecretStore::new()));
             }
             SpiceSecretStore::Kubernetes => {
                 let mut kubernetes_secret_store = kubernetes::KubernetesSecretStore::new();
