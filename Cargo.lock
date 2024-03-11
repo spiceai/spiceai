@@ -4162,6 +4162,7 @@ dependencies = [
  "r2d2",
  "regex",
  "reqwest",
+ "secrecy",
  "serde",
  "serde_json",
  "snafu 0.8.0",
@@ -4411,6 +4412,16 @@ name = "seahash"
 version = "4.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c107b6f4780854c8b126e228ea8869f4d7b71260f962fefb57b996b8959ba6b"
+
+
+[[package]]
+name = "secrecy"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9bd1c54ea06cfd2f6b63219704de0b9b4f72dcc2b8fdef820be6cd799780e91e"
+dependencies = [
+ "zeroize",
+]
 
 [[package]]
 name = "secret-service"
@@ -6058,6 +6069,12 @@ dependencies = [
  "quote",
  "syn 2.0.49",
 ]
+
+[[package]]
+name = "zeroize"
+version = "1.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "525b4ec142c6b68a2d10f01f7bbf6755599ca3f81ea53b8431b7dd348f5fdb2d"
 
 [[package]]
 name = "zip"
