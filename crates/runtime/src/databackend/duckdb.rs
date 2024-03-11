@@ -25,7 +25,7 @@ use crate::{
 pub enum Error {
     #[snafu(display("DbConnectionError: {source}"))]
     DbConnectionError {
-        source: sql_provider_datafusion::dbconnection::Error,
+        source: sql_provider_datafusion::dbconnection::GenericError,
     },
 
     #[snafu(display("DbConnectionPoolError: {source}"))]

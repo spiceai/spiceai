@@ -27,26 +27,13 @@ pub mod expr;
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Unable to get a DB connection from the pool: {source}"))]
-    UnableToGetConnectionFromPool {
-        source: dbconnectionpool::Error,
-    },
-
-    #[snafu(display("Unable to query DB connection: {source}"))]
-    UnableToQueryDbConnection {
-        source: dbconnection::Error,
-    },
+    UnableToGetConnectionFromPool { source: dbconnectionpool::Error },
 
     #[snafu(display("Unable to get schema: {source}"))]
-    UnableToGetSchema {
-        source: dbconnection::Error,
-    },
+    UnableToGetSchema { source: dbconnection::Error },
 
     #[snafu(display("Unable to generate SQL: {source}"))]
-    UnableToGenerateSQL {
-        source: expr::Error,
-    },
-
-    UnableToDowncastConnection,
+    UnableToGenerateSQL { source: expr::Error },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;

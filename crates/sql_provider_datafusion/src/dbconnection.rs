@@ -3,12 +3,25 @@ use std::{any::Any, sync::Arc};
 use datafusion::{
     arrow::datatypes::SchemaRef, execution::SendableRecordBatchStream, sql::TableReference,
 };
+use snafu::prelude::*;
 
 pub mod duckdbconn;
 pub mod postgresconn;
 
-pub type Error = Box<dyn std::error::Error + Send + Sync>;
-type Result<T, E = Error> = std::result::Result<T, E>;
+pub type GenericError = Box<dyn std::error::Error + Send + Sync>;
+type Result<T, E = GenericError> = std::result::Result<T, E>;
+
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display("Unable to downcast connection"))]
+    UnableToDowncastConnection {},
+
+    #[snafu(display("Unable to get schema: {source}"))]
+    UnableToGetSchema { source: GenericError },
+
+    #[snafu(display("Unable to query arrow: {source}"))]
+    UnableToQueryArrow { source: GenericError },
+}
 
 pub trait SyncDbConnection<T, P>: DbConnection<T, P> {
     fn new(conn: T) -> Self
@@ -46,11 +59,14 @@ pub async fn get_schema<T, P>(
     table_reference: &datafusion::sql::TableReference<'_>,
 ) -> Result<Arc<arrow::datatypes::Schema>, Error> {
     let schema = if let Some(conn) = conn.as_sync() {
-        conn.get_schema(table_reference)?
+        conn.get_schema(table_reference)
+            .context(UnableToGetSchemaSnafu)?
     } else if let Some(conn) = conn.as_async() {
-        conn.get_schema(table_reference).await?
+        conn.get_schema(table_reference)
+            .await
+            .context(UnableToGetSchemaSnafu)?
     } else {
-        return Err(Error::from("Unable to downcast connection"));
+        return Err(Error::UnableToDowncastConnection {});
     };
     Ok(schema)
 }
@@ -58,12 +74,15 @@ pub async fn get_schema<T, P>(
 pub async fn query_arrow<T, P>(
     conn: Box<dyn DbConnection<T, P>>,
     sql: String,
-) -> Result<SendableRecordBatchStream> {
+) -> Result<SendableRecordBatchStream, Error> {
     if let Some(conn) = conn.as_sync() {
         conn.query_arrow(&sql, &[])
+            .context(UnableToQueryArrowSnafu {})
     } else if let Some(conn) = conn.as_async() {
-        conn.query_arrow(&sql, &[]).await
+        conn.query_arrow(&sql, &[])
+            .await
+            .context(UnableToQueryArrowSnafu {})
     } else {
-        Err(Error::from("Unable to downcast connection"))
+        return Err(Error::UnableToDowncastConnection {});
     }
 }
