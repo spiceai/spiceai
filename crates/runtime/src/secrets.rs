@@ -5,6 +5,7 @@ pub mod kubernetes;
 use std::collections::HashMap;
 
 use async_trait::async_trait;
+use secrecy::{ExposeSecret, SecretString};
 
 use super::Result;
 use crate::{secrets::file::FileSecretStore, Error};
@@ -17,22 +18,32 @@ pub trait SecretStore {
 
 #[derive(Debug, Clone)]
 pub struct Secret {
-    data: HashMap<String, String>,
+    data: HashMap<String, SecretString>,
 }
 
 impl Secret {
     #[must_use]
     pub fn new(data: HashMap<String, String>) -> Self {
+        let data = data
+            .into_iter()
+            .map(|(key, value)| (key, SecretString::from(value)))
+            .collect();
+
         Self { data }
     }
 
     #[must_use]
     pub fn get(&self, key: &str) -> Option<&str> {
-        if let Some(value) = self.data.get(key) {
-            Some(value.as_str())
-        } else {
-            None
-        }
+        let Some(secret_value): Option<&SecretString> = self.data.get(key) else {
+            return None;
+        };
+
+        let exposed_secret = secret_value.expose_secret();
+        Some(exposed_secret)
+    }
+
+    pub fn add(&mut self, key: String, value: String) {
+        self.data.insert(key, SecretString::from(value));
     }
 }
 

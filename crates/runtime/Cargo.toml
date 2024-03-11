@@ -52,6 +52,7 @@ arrow_sql_gen = { path = "../arrow_sql_gen", optional = true }
 bb8 = {workspace = true, optional = true}
 bb8-postgres = {workspace = true, optional = true}
 base64 = "0.22.0"
+secrecy = "0.8.0"
 
 [features]
 default = ["duckdb", "postgres"]
