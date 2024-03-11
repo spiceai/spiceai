@@ -42,8 +42,14 @@ pub enum Error {
     #[snafu(display("Unable to query: {source}"))]
     UnableToQuery { source: tonic::Status },
 
+    #[snafu(display("Unable to publish: {source}"))]
+    UnableToPublish { source: tonic::Status },
+
     #[snafu(display("Unauthorized"))]
     Unauthorized {},
+
+    #[snafu(display("Permission denied"))]
+    PermissionDenied {},
 
     #[snafu(display("No endpoints found"))]
     NoEndpointsFound,
@@ -240,12 +246,13 @@ impl FlightClient {
             .metadata_mut()
             .insert("authorization", auth_header_value);
 
-        let resp = self
-            .flight_client
-            .clone()
-            .do_put(publish_request)
-            .await
-            .context(UnableToQuerySnafu)?;
+        let resp = match self.flight_client.clone().do_put(publish_request).await {
+            Ok(resp) => resp,
+            Err(e) => match e.code() {
+                tonic::Code::PermissionDenied => PermissionDeniedSnafu.fail(),
+                _ => return Err(e).context(UnableToPublishSnafu),
+            }?,
+        };
 
         let resp = resp.into_inner();
 

@@ -155,7 +155,8 @@ impl MetricsService for Service {
                                             all_publishers_failed = false;
                                         }
                                         Err(e) => {
-                                            tracing::error!(
+                                            // Rely on the publisher to provide a useful error message to the user.
+                                            tracing::debug!(
                                                 "Failed to add OpenTelemetry data to backend: {e}"
                                             );
                                         }
