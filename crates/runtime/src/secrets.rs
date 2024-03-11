@@ -1,6 +1,6 @@
 pub mod env;
 pub mod file;
-#[cfg(feature = "keyring")]
+#[cfg(feature = "keyring-secret-store")]
 pub mod keyring;
 pub mod kubernetes;
 
@@ -52,7 +52,7 @@ impl Secret {
 pub enum SecretStoreType {
     File,
     Env,
-    #[cfg(feature = "keyring")]
+    #[cfg(feature = "keyring-secret-store")]
     Keyring,
     Kubernetes,
 }
@@ -62,10 +62,10 @@ pub fn spicepod_secret_store_type(store: &SpiceSecretStore) -> Option<SecretStor
     match store {
         SpiceSecretStore::File => Some(SecretStoreType::File),
         SpiceSecretStore::Env => Some(SecretStoreType::Env),
-        #[cfg(feature = "keyring")]
+        #[cfg(feature = "keyring-secret-store")]
         SpiceSecretStore::Keyring => Some(SecretStoreType::Keyring),
         SpiceSecretStore::Kubernetes => Some(SecretStoreType::Kubernetes),
-        #[cfg(not(feature = "keyring"))]
+        #[cfg(not(feature = "keyring-secret-store"))]
         _ => None,
     }
 }
@@ -112,7 +112,7 @@ impl SecretsProvider {
 
                 self.secret_store = Some(Box::new(env_secret_store));
             }
-            #[cfg(feature = "keyring")]
+            #[cfg(feature = "keyring-secret-store")]
             SecretStoreType::Keyring => {
                 self.secret_store = Some(Box::new(keyring::KeyringSecretStore::new()));
             }
