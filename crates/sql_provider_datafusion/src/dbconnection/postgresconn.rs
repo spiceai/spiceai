@@ -92,7 +92,6 @@ impl<'a>
     }
 
     async fn execute(&self, sql: &str, params: &[&'a (dyn ToSql + Sync)]) -> Result<u64> {
-        let result = self.conn.execute(sql, params).await;
-        Ok(result?)
+        self.conn.execute(sql, params).await?;
     }
 }
