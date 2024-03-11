@@ -66,7 +66,6 @@ impl
         }
 
         connection_string.push_str(format!("host={host} user={user} dbname={dbname}").as_str());
-        println!("Connection string: {connection_string}");
 
         let manager = PostgresConnectionManager::new_from_stringlike(connection_string, NoTls)
             .context(ConnectionPoolSnafu)?;
