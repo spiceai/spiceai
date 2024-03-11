@@ -9,8 +9,8 @@ use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::memory::MemoryStream;
 use datafusion::sql::TableReference;
 use snafu::prelude::*;
-use tokio::runtime::Handle;
 
+use super::AsyncDbConnection;
 use super::DbConnection;
 use super::Result;
 
@@ -31,57 +31,67 @@ pub struct PostgresConnection {
     pub conn: bb8::PooledConnection<'static, PostgresConnectionManager<NoTls>>,
 }
 
-impl
+impl<'a>
     DbConnection<
         bb8::PooledConnection<'static, PostgresConnectionManager<NoTls>>,
-        &(dyn ToSql + Sync),
+        &'a (dyn ToSql + Sync),
     > for PostgresConnection
 {
-    fn new(conn: bb8::PooledConnection<'static, PostgresConnectionManager<NoTls>>) -> Self {
-        PostgresConnection { conn }
-    }
-
-    fn get_schema(&self, table_reference: &TableReference) -> Result<SchemaRef> {
-        let rows = tokio::task::block_in_place(move || {
-            Handle::current().block_on(async {
-                self.conn
-                    .query(&format!("SELECT * FROM {table_reference} LIMIT 1"), &[])
-                    .await
-            })
-        })
-        .context(QuerySnafu)?;
-        let rec = rows_to_arrow(rows.as_slice()).context(ConversionSnafu)?;
-        let schema = rec.schema();
-        Ok(schema)
-    }
-
-    fn query_arrow(
-        &self,
-        sql: &str,
-        params: &[&(dyn ToSql + Sync)],
-    ) -> Result<SendableRecordBatchStream> {
-        let rows = tokio::task::block_in_place(move || {
-            Handle::current().block_on(async { self.conn.query(sql, params).await })
-        })
-        .context(QuerySnafu)?;
-        let rec = rows_to_arrow(rows.as_slice()).context(ConversionSnafu)?;
-        let schema = rec.schema();
-        let recs = vec![rec];
-        Ok(Box::pin(MemoryStream::try_new(recs, schema, None)?))
-    }
-
-    fn execute(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<u64> {
-        Ok(tokio::task::block_in_place(move || {
-            Handle::current().block_on(async { self.conn.execute(sql, params).await })
-        })
-        .context(QuerySnafu)?)
-    }
-
     fn as_any(&self) -> &dyn Any {
         self
     }
 
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
+    }
+
+    fn as_async(
+        &self,
+    ) -> Option<
+        &dyn AsyncDbConnection<
+            bb8::PooledConnection<'static, PostgresConnectionManager<NoTls>>,
+            &'a (dyn ToSql + Sync),
+        >,
+    > {
+        Some(self)
+    }
+}
+
+#[async_trait::async_trait]
+impl<'a>
+    AsyncDbConnection<
+        bb8::PooledConnection<'static, PostgresConnectionManager<NoTls>>,
+        &'a (dyn ToSql + Sync),
+    > for PostgresConnection
+{
+    fn new(conn: bb8::PooledConnection<'static, PostgresConnectionManager<NoTls>>) -> Self {
+        PostgresConnection { conn }
+    }
+
+    async fn get_schema(&self, table_reference: &TableReference) -> Result<SchemaRef> {
+        let rows = self
+            .conn
+            .query(&format!("SELECT * FROM {table_reference} LIMIT 1"), &[])
+            .await
+            .context(QuerySnafu)?;
+        let rec = rows_to_arrow(rows.as_slice()).context(ConversionSnafu)?;
+        let schema = rec.schema();
+        Ok(schema)
+    }
+
+    async fn query_arrow(
+        &self,
+        sql: &str,
+        params: &[&'a (dyn ToSql + Sync)],
+    ) -> Result<SendableRecordBatchStream> {
+        let rows = self.conn.query(sql, params).await.context(QuerySnafu)?;
+        let rec = rows_to_arrow(rows.as_slice()).context(ConversionSnafu)?;
+        let schema = rec.schema();
+        let recs = vec![rec];
+        Ok(Box::pin(MemoryStream::try_new(recs, schema, None)?))
+    }
+
+    async fn execute(&self, sql: &str, params: &[&'a (dyn ToSql + Sync)]) -> Result<u64> {
+        Ok(self.conn.execute(sql, params).await?)
     }
 }
