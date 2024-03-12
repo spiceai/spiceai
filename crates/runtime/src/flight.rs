@@ -1,12 +1,12 @@
 use crate::datafusion::DataFusion;
 use crate::dataupdate::{DataUpdate, UpdateType};
 use arrow::ipc::writer::{DictionaryTracker, IpcDataGenerator};
-use arrow_flight::{FlightEndpoint, SchemaAsIpc};
+use arrow_flight::{sql, Action};
 use arrow_ipc::convert::try_schema_from_flatbuffer_bytes;
 use arrow_ipc::writer;
 use datafusion::arrow::error::ArrowError;
-use datafusion::datasource::file_format::parquet::ParquetFormat;
-use datafusion::datasource::listing::{ListingOptions, ListingTableUrl};
+use datafusion::datasource::TableType;
+use datafusion::execution::SendableRecordBatchStream;
 use futures::stream::{self, BoxStream, StreamExt};
 use futures::Stream;
 use snafu::prelude::*;
@@ -21,9 +21,10 @@ use tonic::{Request, Response, Status, Streaming};
 use uuid::Uuid;
 
 use arrow_flight::{
-    flight_service_server::FlightService, flight_service_server::FlightServiceServer, Action,
-    ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightInfo, HandshakeRequest,
-    HandshakeResponse, PutResult, SchemaResult, Ticket,
+    flight_service_server::{FlightService, FlightServiceServer},
+    sql::server::FlightSqlService,
+    FlightData, FlightDescriptor, FlightEndpoint, FlightInfo, HandshakeRequest, HandshakeResponse,
+    PutResult, SchemaAsIpc, Ticket,
 };
 
 pub struct Service {
@@ -46,98 +47,74 @@ async fn get_sender_channel(
     }
 }
 
-#[tonic::async_trait]
-impl FlightService for Service {
-    type HandshakeStream = BoxStream<'static, Result<HandshakeResponse, Status>>;
-    type ListFlightsStream = BoxStream<'static, Result<FlightInfo, Status>>;
-    type DoGetStream = BoxStream<'static, Result<FlightData, Status>>;
-    type DoPutStream = BoxStream<'static, Result<PutResult, Status>>;
-    type DoActionStream = BoxStream<'static, Result<arrow_flight::Result, Status>>;
-    type ListActionsStream = BoxStream<'static, Result<ActionType, Status>>;
-    type DoExchangeStream = BoxStream<'static, Result<FlightData, Status>>;
-
-    async fn get_schema(
-        &self,
-        request: Request<FlightDescriptor>,
-    ) -> Result<Response<SchemaResult>, Status> {
-        let request = request.into_inner();
-
-        let listing_options = ListingOptions::new(Arc::new(ParquetFormat::default()));
-        let table_path = ListingTableUrl::parse(&request.path[0]).map_err(to_tonic_err)?;
-
-        let schema = listing_options
-            .infer_schema(&self.datafusion.read().await.ctx.state(), &table_path)
+impl Service {
+    async fn sql_to_flight_stream(
+        datafusion: Arc<RwLock<DataFusion>>,
+        sql: String,
+    ) -> Result<BoxStream<'static, Result<FlightData, Status>>, Status> {
+        let df = datafusion
+            .read()
+            .await
+            .ctx
+            .sql(&sql)
             .await
             .map_err(to_tonic_err)?;
+        let schema = df.schema().clone().into();
+        let options = datafusion::arrow::ipc::writer::IpcWriteOptions::default();
+        let schema_as_ipc = SchemaAsIpc::new(&schema, &options);
+        let schema_flight_data = FlightData::from(schema_as_ipc);
 
-        let options = arrow::ipc::writer::IpcWriteOptions::default();
-        let schema_result = SchemaAsIpc::new(&schema, &options)
-            .try_into()
-            .map_err(|e: ArrowError| Status::internal(e.to_string()))?;
+        let batches_stream: SendableRecordBatchStream =
+            df.execute_stream().await.map_err(to_tonic_err)?;
 
-        Ok(Response::new(schema_result))
-    }
+        let batches_stream = batches_stream
+            .then(move |batch_result| {
+                let options_clone = options.clone();
+                async move {
+                    let encoder = IpcDataGenerator::default();
+                    let mut tracker = DictionaryTracker::new(false);
 
-    async fn do_get(
-        &self,
-        request: Request<Ticket>,
-    ) -> Result<Response<Self::DoGetStream>, Status> {
-        let ticket = request.into_inner();
-        match std::str::from_utf8(&ticket.ticket) {
-            Ok(sql) => {
-                let df = self
-                    .datafusion
-                    .read()
-                    .await
-                    .ctx
-                    .sql(sql)
-                    .await
-                    .map_err(to_tonic_err)?;
-                let schema = df.schema().clone().into();
-                let results = df.collect().await.map_err(to_tonic_err)?;
-                let options = datafusion::arrow::ipc::writer::IpcWriteOptions::default();
-                let schema_flight_data = SchemaAsIpc::new(&schema, &options);
+                    match batch_result {
+                        Ok(batch) => {
+                            let (flight_dictionaries, flight_batch) = encoder
+                                .encoded_batch(&batch, &mut tracker, &options_clone)
+                                .map_err(|e| Status::internal(e.to_string()))?;
 
-                let mut flights = vec![FlightData::from(schema_flight_data)];
-
-                let encoder = IpcDataGenerator::default();
-                let mut tracker = DictionaryTracker::new(false);
-
-                for batch in &results {
-                    let (flight_dictionaries, flight_batch) = encoder
-                        .encoded_batch(batch, &mut tracker, &options)
-                        .map_err(|e: ArrowError| Status::internal(e.to_string()))?;
-
-                    flights.extend(flight_dictionaries.into_iter().map(Into::into));
-                    flights.push(flight_batch.into());
+                            let mut flights: Vec<FlightData> =
+                                flight_dictionaries.into_iter().map(Into::into).collect();
+                            flights.push(flight_batch.into());
+                            Ok(flights)
+                        }
+                        Err(e) => Err(Status::internal(e.to_string())),
+                    }
                 }
+            })
+            .map(|result| {
+                // Convert Result<Vec<FlightData>, Status> into Stream of Result<FlightData, Status>
+                match result {
+                    Ok(flights) => stream::iter(flights.into_iter().map(Ok)).left_stream(),
+                    Err(e) => stream::once(async { Err(e) }).right_stream(),
+                }
+            })
+            .flatten();
 
-                let output = futures::stream::iter(flights.into_iter().map(Ok));
-                Ok(Response::new(Box::pin(output) as Self::DoGetStream))
-            }
-            Err(e) => Err(Status::invalid_argument(format!("Invalid ticket: {e:?}"))),
-        }
+        let flights_stream = stream::once(async { Ok(schema_flight_data) }).chain(batches_stream);
+
+        Ok(flights_stream.boxed())
     }
+}
 
-    async fn get_flight_info(
-        &self,
-        request: Request<FlightDescriptor>,
-    ) -> Result<Response<FlightInfo>, Status> {
-        let fd = request.into_inner();
-        Ok(Response::new(FlightInfo {
-            flight_descriptor: Some(fd.clone()),
-            endpoint: vec![FlightEndpoint {
-                ticket: Some(Ticket { ticket: fd.cmd }),
-                ..Default::default()
-            }],
-            ..Default::default()
-        }))
-    }
+#[tonic::async_trait]
+impl FlightSqlService for Service {
+    type FlightService = Service;
 
-    async fn handshake(
+    async fn do_handshake(
         &self,
         _request: Request<Streaming<HandshakeRequest>>,
-    ) -> Result<Response<Self::HandshakeStream>, Status> {
+    ) -> Result<
+        Response<Pin<Box<dyn Stream<Item = Result<HandshakeResponse, Status>> + Send>>>,
+        Status,
+    > {
         // THIS IS PLACEHOLDER NO-OP AUTH THAT DOES NOT CHECK THE PROVIDED TOKEN AND SIMPLY RETURNS A UUID.
         // TODO: Implement proper auth.
         let token = Uuid::new_v4().to_string();
@@ -156,18 +133,216 @@ impl FlightService for Service {
         Ok(resp)
     }
 
-    async fn list_flights(
+    async fn do_get_catalogs(
         &self,
-        _request: Request<Criteria>,
-    ) -> Result<Response<Self::ListFlightsStream>, Status> {
-        Err(Status::unimplemented("Not yet implemented"))
+        query: sql::CommandGetCatalogs,
+        _request: Request<Ticket>,
+    ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+        let mut builder = query.into_builder();
+
+        let catalog_names = self.datafusion.read().await.ctx.catalog_names();
+
+        for catalog in catalog_names {
+            builder.append(catalog);
+        }
+
+        let record_batch = builder.build().map_err(to_tonic_err)?;
+
+        Ok(Response::new(
+            Box::pin(record_batches_to_flight_stream(vec![record_batch])?)
+                as <<Service as FlightSqlService>::FlightService as FlightService>::DoGetStream,
+        ))
     }
 
-    async fn do_put(
+    async fn do_get_schemas(
         &self,
-        request: Request<Streaming<FlightData>>,
-    ) -> Result<Response<Self::DoPutStream>, Status> {
-        let mut streaming_flight = request.into_inner();
+        query: sql::CommandGetDbSchemas,
+        _request: Request<Ticket>,
+    ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+        let catalog = &query.catalog;
+        let filtered_catalogs = match catalog {
+            Some(catalog) => vec![catalog.to_string()],
+            None => self.datafusion.read().await.ctx.catalog_names(),
+        };
+        let mut builder = query.into_builder();
+
+        for catalog in filtered_catalogs {
+            let catalog_provider = self
+                .datafusion
+                .read()
+                .await
+                .ctx
+                .catalog(&catalog)
+                .ok_or_else(|| {
+                    Status::internal(format!("unable to get catalog provider for {catalog}"))
+                })?;
+            for schema in catalog_provider.schema_names() {
+                builder.append(&catalog, schema);
+            }
+        }
+
+        let record_batch = builder.build().map_err(to_tonic_err)?;
+
+        Ok(Response::new(
+            Box::pin(record_batches_to_flight_stream(vec![record_batch])?)
+                as <<Service as FlightSqlService>::FlightService as FlightService>::DoGetStream,
+        ))
+    }
+
+    async fn do_get_tables(
+        &self,
+        query: sql::CommandGetTables,
+        _request: Request<Ticket>,
+    ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+        let catalog = &query.catalog;
+        let filtered_catalogs = match catalog {
+            Some(catalog) => vec![catalog.to_string()],
+            None => self.datafusion.read().await.ctx.catalog_names(),
+        };
+        let mut builder = query.into_builder();
+
+        for catalog_name in filtered_catalogs {
+            let catalog_provider = self
+                .datafusion
+                .read()
+                .await
+                .ctx
+                .catalog(&catalog_name)
+                .ok_or_else(|| {
+                    Status::internal(format!("unable to get catalog provider for {catalog_name}"))
+                })?;
+
+            for schema_name in catalog_provider.schema_names() {
+                let Some(schema_provider) = catalog_provider.schema(&schema_name) else {
+                    continue;
+                };
+
+                for table_name in schema_provider.table_names() {
+                    let Some(table_provider) = schema_provider.table(&table_name).await else {
+                        continue;
+                    };
+
+                    let table_type = table_type_name(table_provider.table_type());
+
+                    builder.append(
+                        &catalog_name,
+                        &schema_name,
+                        &table_name,
+                        table_type,
+                        table_provider.schema().as_ref(),
+                    )?;
+                }
+            }
+        }
+
+        let record_batch = builder.build().map_err(to_tonic_err)?;
+
+        Ok(Response::new(
+            Box::pin(record_batches_to_flight_stream(vec![record_batch])?)
+                as <<Service as FlightSqlService>::FlightService as FlightService>::DoGetStream,
+        ))
+    }
+
+    async fn do_get_statement(
+        &self,
+        ticket: sql::TicketStatementQuery,
+        _request: Request<Ticket>,
+    ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+        let datafusion = Arc::clone(&self.datafusion);
+        match std::str::from_utf8(&ticket.statement_handle) {
+            Ok(sql) => {
+                let output = Self::sql_to_flight_stream(datafusion, sql.to_owned()).await?;
+                Ok(Response::new(Box::pin(output) as <<Service as FlightSqlService>::FlightService as FlightService>::DoGetStream))
+            }
+            Err(e) => Err(Status::invalid_argument(format!("Invalid ticket: {e:?}"))),
+        }
+    }
+
+    // If the ticket isn't a FlightSQL command, then try interpreting the ticket as a raw SQL query.
+    async fn do_get_fallback(
+        &self,
+        request: Request<Ticket>,
+        _message: arrow_flight::sql::Any,
+    ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+        let datafusion = Arc::clone(&self.datafusion);
+        let ticket = request.into_inner();
+        match std::str::from_utf8(&ticket.ticket) {
+            Ok(sql) => {
+                let output = Self::sql_to_flight_stream(datafusion, sql.to_owned()).await?;
+                Ok(Response::new(Box::pin(output) as <<Service as FlightSqlService>::FlightService as FlightService>::DoGetStream))
+            }
+            Err(e) => Err(Status::invalid_argument(format!("Invalid ticket: {e:?}"))),
+        }
+    }
+
+    async fn get_flight_info_tables(
+        &self,
+        _query: sql::CommandGetTables,
+        request: Request<FlightDescriptor>,
+    ) -> Result<Response<FlightInfo>, Status> {
+        let fd = request.into_inner();
+        Ok(Response::new(FlightInfo {
+            flight_descriptor: Some(fd.clone()),
+            endpoint: vec![FlightEndpoint {
+                ticket: Some(Ticket { ticket: fd.cmd }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }))
+    }
+
+    async fn get_flight_info_prepared_statement(
+        &self,
+        handle: sql::CommandPreparedStatementQuery,
+        request: Request<FlightDescriptor>,
+    ) -> Result<Response<FlightInfo>, Status> {
+        let fd = request.into_inner();
+        Ok(Response::new(FlightInfo {
+            flight_descriptor: Some(fd.clone()),
+            endpoint: vec![FlightEndpoint {
+                ticket: Some(Ticket {
+                    ticket: handle.prepared_statement_handle,
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }))
+    }
+
+    async fn get_flight_info_fallback(
+        &self,
+        _cmd: sql::Command,
+        request: Request<FlightDescriptor>,
+    ) -> Result<Response<FlightInfo>, Status> {
+        let fd = request.into_inner();
+        Ok(Response::new(FlightInfo {
+            flight_descriptor: Some(fd.clone()),
+            endpoint: vec![FlightEndpoint {
+                ticket: Some(Ticket { ticket: fd.cmd }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }))
+    }
+
+    /// Create a prepared statement from given SQL statement.
+    async fn do_action_create_prepared_statement(
+        &self,
+        statement: sql::ActionCreatePreparedStatementRequest,
+        _request: Request<Action>,
+    ) -> Result<sql::ActionCreatePreparedStatementResult, Status> {
+        Ok(sql::ActionCreatePreparedStatementResult {
+            prepared_statement_handle: statement.query.into(),
+            ..Default::default()
+        })
+    }
+
+    async fn do_put_fallback(
+        &self,
+        request: Request<sql::server::PeekableFlightDataStream>,
+        _message: sql::Any,
+    ) -> Result<Response<<Self as FlightService>::DoPutStream>, Status> {
+        let mut streaming_flight = request.into_inner().into_inner();
 
         let Ok(Some(message)) = streaming_flight.message().await else {
             return Err(Status::invalid_argument("No flight data provided"));
@@ -272,25 +447,11 @@ impl FlightService for Service {
         Ok(Response::new(response_stream.boxed()))
     }
 
-    async fn do_action(
-        &self,
-        _request: Request<Action>,
-    ) -> Result<Response<Self::DoActionStream>, Status> {
-        Err(Status::unimplemented("Not yet implemented"))
-    }
-
-    async fn list_actions(
-        &self,
-        _request: Request<Empty>,
-    ) -> Result<Response<Self::ListActionsStream>, Status> {
-        Err(Status::unimplemented("Not yet implemented"))
-    }
-
     #[allow(clippy::too_many_lines)]
-    async fn do_exchange(
+    async fn do_exchange_fallback(
         &self,
         request: Request<Streaming<FlightData>>,
-    ) -> Result<Response<Self::DoExchangeStream>, Status> {
+    ) -> Result<Response<<Self as FlightService>::DoExchangeStream>, Status> {
         let mut streaming_request = request.into_inner();
         let req = streaming_request.next().await;
         let Some(subscription_request) = req else {
@@ -414,6 +575,41 @@ impl FlightService for Service {
 
         Ok(Response::new(response_stream.boxed()))
     }
+
+    async fn register_sql_info(&self, _id: i32, _result: &sql::SqlInfo) {}
+}
+
+fn table_type_name(table_type: TableType) -> &'static str {
+    match table_type {
+        // from https://github.com/apache/arrow-datafusion/blob/26b8377b0690916deacf401097d688699026b8fb/datafusion/core/src/catalog/information_schema.rs#L284-L288
+        TableType::Base => "BASE TABLE",
+        TableType::View => "VIEW",
+        TableType::Temporary => "LOCAL TEMPORARY",
+    }
+}
+
+fn record_batches_to_flight_stream(
+    record_batches: Vec<arrow::record_batch::RecordBatch>,
+) -> Result<impl Stream<Item = Result<FlightData, Status>>, Status> {
+    let options = datafusion::arrow::ipc::writer::IpcWriteOptions::default();
+    let mut flights: Vec<FlightData> = Vec::new();
+    let encoder = IpcDataGenerator::default();
+    let mut tracker = DictionaryTracker::new(false);
+
+    for record_batch in record_batches {
+        let schema = record_batch.schema();
+        let schema_flight_data = SchemaAsIpc::new(&schema, &options);
+        flights.push(FlightData::from(schema_flight_data));
+
+        let (flight_dictionaries, flight_batch) = encoder
+            .encoded_batch(&record_batch, &mut tracker, &options)
+            .map_err(|e: ArrowError| Status::internal(e.to_string()))?;
+
+        flights.extend(flight_dictionaries.into_iter().map(Into::into));
+        flights.push(flight_batch.into());
+    }
+
+    Ok(futures::stream::iter(flights.into_iter().map(Ok)))
 }
 
 #[allow(clippy::needless_pass_by_value)]
