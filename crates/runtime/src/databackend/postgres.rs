@@ -11,7 +11,7 @@ use snafu::{prelude::*, ResultExt};
 use spicepod::component::dataset::Dataset;
 use sql_provider_datafusion::{
     dbconnection::postgresconn::PostgresConnection,
-    dbconnectionpool::{postgrespool::PostgresConnectionPool, DbConnectionPool, Mode},
+    dbconnectionpool::{postgrespool::PostgresConnectionPool, DbConnectionPool},
     SqlTable,
 };
 use tokio::sync::Mutex;
@@ -101,11 +101,10 @@ impl PostgresBackend {
     pub async fn new(
         ctx: Arc<SessionContext>,
         name: &str,
-        mode: Mode,
         params: Arc<Option<HashMap<String, String>>>,
         primary_keys: Option<Vec<String>>,
     ) -> Result<Self> {
-        let pool = PostgresConnectionPool::new(name, mode, params)
+        let pool = PostgresConnectionPool::new(params)
             .await
             .context(DbConnectionPoolSnafu)?;
         Ok(PostgresBackend {

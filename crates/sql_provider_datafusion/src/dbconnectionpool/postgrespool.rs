@@ -30,18 +30,8 @@ pub struct PostgresConnectionPool {
     pool: Arc<bb8::Pool<PostgresConnectionManager<NoTls>>>,
 }
 
-#[async_trait]
-impl
-    DbConnectionPool<
-        bb8::PooledConnection<'static, PostgresConnectionManager<NoTls>>,
-        &'static (dyn ToSql + Sync),
-    > for PostgresConnectionPool
-{
-    async fn new(
-        _name: &str,
-        _mode: Mode,
-        _params: Arc<Option<HashMap<String, String>>>,
-    ) -> Result<Self> {
+impl PostgresConnectionPool {
+    pub async fn new(_params: Arc<Option<HashMap<String, String>>>) -> Result<Self> {
         let connection_string = "host=localhost user=postgres password=postgres dbname=postgres";
 
         let manager = PostgresConnectionManager::new_from_stringlike(connection_string, NoTls)
@@ -54,6 +44,22 @@ impl
         Ok(PostgresConnectionPool {
             pool: Arc::new(pool),
         })
+    }
+}
+
+#[async_trait]
+impl
+    DbConnectionPool<
+        bb8::PooledConnection<'static, PostgresConnectionManager<NoTls>>,
+        &'static (dyn ToSql + Sync),
+    > for PostgresConnectionPool
+{
+    async fn new(
+        _name: &str,
+        _mode: Mode,
+        params: Arc<Option<HashMap<String, String>>>,
+    ) -> Result<Self> {
+        PostgresConnectionPool::new(params).await
     }
 
     async fn connect(
