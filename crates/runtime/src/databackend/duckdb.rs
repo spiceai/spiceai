@@ -291,6 +291,47 @@ fn handle_poison<T: fmt::Debug>(e: PoisonError<T>) -> Error {
     }
 }
 
+/// Converts disk sizes from a string format to a floating-point number representing the size in bytes.
+///
+/// This function is designed to parse string representations of disk sizes (as often found in database formats like DuckDB)
+/// and convert them into a numeric format (`f64`) that represents the size in bytes. It supports conversions for a range of units
+/// from bytes (B) up to yobibytes (YiB), adhering to the binary (IEC) standard where 1 KiB = 1024 bytes.
+///
+/// # Arguments
+///
+/// * `size_str` - A string slice that holds the size to be converted. The expected format is "<number> <unit>",
+/// where <unit> can be B, KiB, MiB, GiB, TiB, PiB, EiB, ZiB, or YiB. Case-insensitive.
+///
+/// # Returns
+///
+/// This function returns a `Result<f64>`. On success, it provides the size in bytes as an `f64`. On failure,
+/// it returns an `Error::UnableToConvertBytes` variant, indicating either an unsupported format or a parsing error.
+///
+/// # Examples
+///
+/// Basic usage:
+///
+/// ```
+/// let size_in_bytes = pg_size_bytes("1 GiB").unwrap();
+/// assert_eq!(size_in_bytes, 1073741824.0);
+///
+/// let size_in_bytes = pg_size_bytes("1024 KiB").unwrap();
+/// assert_eq!(size_in_bytes, 1048576.0);
+///
+/// let error = pg_size_bytes("10 megabytes").unwrap_err();
+/// // This will return an error due to the unsupported unit "megabytes"
+/// ```
+///
+/// # Errors
+///
+/// This function will return an `Error::UnableToConvertBytes` if:
+///
+/// - The input string does not adhere to the expected format ("<number> <unit>").
+/// - The number cannot be parsed into a floating-point number.
+/// - The unit is not one of the supported IEC binary units (B, KiB, MiB, GiB, TiB, PiB, EiB, ZiB, YiB).
+///
+/// Note: The function handles the special case of "0 bytes" directly, returning `0.0` without error.
+///
 fn pg_size_bytes(size_str: &str) -> Result<f64> {
     if size_str == "0 bytes" { // Edge case
         return Ok(0.0)
