@@ -10,13 +10,13 @@ pub(crate) mod query {
     };
     use tokio::sync::RwLock;
 
-    use crate::{datafusion::DataFusion, timing};
+    use crate::{datafusion::DataFusion, measure_scope };
 
     pub(crate) async fn post(
         Extension(df): Extension<Arc<RwLock<DataFusion>>>,
         body: Bytes,
     ) -> Response {
-        timing::TimingGuard::new("/v1/sql", vec![]);
+        measure_scope!("/v1/sql");
         let query = match String::from_utf8(body.to_vec()) {
             Ok(query) => query,
             Err(e) => {

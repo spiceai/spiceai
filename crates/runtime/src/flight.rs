@@ -1,6 +1,6 @@
 use crate::datafusion::DataFusion;
 use crate::dataupdate::{DataUpdate, UpdateType};
-use crate::timing;
+use crate::measure_scope;
 use arrow::ipc::writer::{DictionaryTracker, IpcDataGenerator};
 use arrow_flight::{FlightEndpoint, SchemaAsIpc};
 use arrow_ipc::convert::try_schema_from_flatbuffer_bytes;
@@ -82,7 +82,7 @@ impl FlightService for Service {
         &self,
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
-        timing::TimingGuard::new("do_get", vec![]);
+        measure_scope!("do_get");
         let ticket = request.into_inner();
         match std::str::from_utf8(&ticket.ticket) {
             Ok(sql) => {
