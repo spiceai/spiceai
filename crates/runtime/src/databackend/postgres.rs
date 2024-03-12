@@ -96,16 +96,17 @@ impl DataPublisher for PostgresBackend {
     }
 }
 
+#[allow(clippy::no_effect_underscore_binding)]
 impl PostgresBackend {
     #[allow(clippy::needless_pass_by_value)]
     pub async fn new(
         ctx: Arc<SessionContext>,
         name: &str,
-        mode: Mode,
-        params: Arc<Option<HashMap<String, String>>>,
+        _mode: Mode,
+        _params: Arc<Option<HashMap<String, String>>>,
         primary_keys: Option<Vec<String>>,
     ) -> Result<Self> {
-        let pool = PostgresConnectionPool::new(name, mode, params)
+        let pool = PostgresConnectionPool::new()
             .await
             .context(DbConnectionPoolSnafu)?;
         Ok(PostgresBackend {
