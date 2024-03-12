@@ -22,6 +22,7 @@ use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tokio::{spawn, task};
 
+use crate::secrets::Secret;
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Snafu)]
@@ -122,6 +123,7 @@ impl DataFusion {
     pub async fn new_accelerated_backend(
         &self,
         dataset: impl Borrow<Dataset>,
+        secrets: Option<Secret>,
     ) -> Result<Box<dyn DataPublisher>> {
         let dataset = dataset.borrow();
         let table_name = dataset.name.to_string();
@@ -140,6 +142,7 @@ impl DataFusion {
                 .engine(acceleration.engine())
                 .mode(acceleration.mode())
                 .params(params)
+                .secrets(secrets)
                 .build()
                 .await
                 .context(DatasetConfigurationSnafu)?;

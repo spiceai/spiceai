@@ -1,5 +1,6 @@
 use std::{collections::HashMap, mem, sync::Arc};
 
+use crate::secrets::Secret;
 use arrow::record_batch::RecordBatch;
 use arrow_sql_gen::statement::{CreateTableBuilder, InsertBuilder};
 use bb8_postgres::{
@@ -104,8 +105,9 @@ impl PostgresBackend {
         mode: Mode,
         params: Arc<Option<HashMap<String, String>>>,
         primary_keys: Option<Vec<String>>,
+        secrets: Option<Secret>,
     ) -> Result<Self> {
-        let pool = PostgresConnectionPool::new(name, mode, params)
+        let pool = PostgresConnectionPool::new(name, mode, read_pg_config(params, secrets))
             .await
             .context(DbConnectionPoolSnafu)?;
         Ok(PostgresBackend {
@@ -140,6 +142,24 @@ impl PostgresBackend {
 
         Ok(())
     }
+}
+
+fn read_pg_config(
+    params: Arc<Option<HashMap<String, String>>>,
+    secrets: Option<Secret>,
+) -> Arc<Option<HashMap<String, String>>> {
+    if let Some(params_val) = params.as_ref() {
+        let mut new_params = params_val.clone();
+        if let Some(secrets) = secrets {
+            if let Some(pg_pass_val) = new_params.get("pg_pass") {
+                if let Some(pg_pass_secret) = secrets.get(pg_pass_val) {
+                    new_params.insert("pg_pass".to_string(), pg_pass_secret.to_string());
+                    return Arc::new(Some(new_params));
+                }
+            }
+        }
+    }
+    params
 }
 
 struct PostgresUpdate<'a> {

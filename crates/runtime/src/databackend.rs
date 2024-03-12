@@ -5,6 +5,7 @@ use spicepod::component::dataset::acceleration::{Engine, Mode};
 use std::{collections::HashMap, sync::Arc};
 
 use self::{duckdb::DuckDBBackend, memtable::MemTableBackend};
+use crate::secrets::Secret;
 
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
@@ -30,6 +31,7 @@ pub struct DataBackendBuilder {
     mode: Option<Mode>,
     params: Arc<Option<HashMap<String, String>>>,
     primary_keys: Option<Vec<String>>,
+    secrets: Option<Secret>,
 }
 
 impl DataBackendBuilder {
@@ -42,6 +44,7 @@ impl DataBackendBuilder {
             mode: None,
             params: Arc::new(None),
             primary_keys: None,
+            secrets: None,
         }
     }
 
@@ -66,6 +69,12 @@ impl DataBackendBuilder {
     #[must_use]
     pub fn primary_keys(mut self, primary_keys: Option<Vec<String>>) -> Self {
         self.primary_keys = primary_keys;
+        self
+    }
+
+    #[must_use]
+    pub fn secrets(mut self, secrets: Option<Secret>) -> Self {
+        self.secrets = secrets;
         self
     }
 
@@ -139,6 +148,7 @@ impl DataBackendBuilder {
                     mode.into(),
                     self.params,
                     self.primary_keys,
+                    self.secrets,
                 )
                 .await
                 .boxed()
