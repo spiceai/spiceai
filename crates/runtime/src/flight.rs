@@ -82,7 +82,7 @@ impl FlightService for Service {
         &self,
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
-        measure_scope!("do_get");
+        measure_scope!("flight", "operation" => "do_get");
         let ticket = request.into_inner();
         match std::str::from_utf8(&ticket.ticket) {
             Ok(sql) => {
@@ -168,6 +168,7 @@ impl FlightService for Service {
         &self,
         request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoPutStream>, Status> {
+        measure_scope!("flight", "operation" => "do_put");
         let mut streaming_flight = request.into_inner();
 
         let Ok(Some(message)) = streaming_flight.message().await else {

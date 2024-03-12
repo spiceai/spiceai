@@ -170,6 +170,7 @@ impl Runtime {
                     {
                         Ok(data_connector) => data_connector,
                         Err(err) => {
+                            metrics::counter!("datasets/load_error").increment(1);
                             warn_spaced!(
                                 spaced_tracer,
                                 "Unable to get data connector from source for dataset {}, retrying: {err:?}",
@@ -198,6 +199,7 @@ impl Runtime {
                 {
                     Ok(()) => (),
                     Err(err) => {
+                        metrics::counter!("datasets/load_error").increment(1);
                         warn_spaced!(
                             spaced_tracer,
                             "Unable to initialize data connector for dataset {}, retrying: {err:?}",
@@ -207,8 +209,14 @@ impl Runtime {
                         continue;
                     }
                 };
-
                 tracing::info!("Loaded dataset: {}", &ds.name);
+                let engine_str= ds.acceleration.clone().map(|acc| {
+                    if acc.enabled {
+                        acc.engine().clone().to_string()
+                    } else {
+                        "None".to_string()
+                    }});
+                metrics::gauge!("datasets/count", "engine" => engine_str.unwrap_or("None".to_string())).increment(1.0);
                 break;
             }
         });
@@ -225,6 +233,13 @@ impl Runtime {
         }
 
         tracing::info!("Unloaded dataset: {}", &ds.name);
+        let engine_str= ds.acceleration.clone().map(|acc| {
+            if acc.enabled {
+                acc.engine().clone().to_string()
+            } else {
+                "None".to_string()
+            }});
+        metrics::gauge!("datasets/count", "engine" => engine_str.unwrap_or("None".to_string())).decrement(1.0);
     }
 
     pub async fn update_dataset(&self, ds: &Dataset) {
@@ -355,7 +370,7 @@ impl Runtime {
     }
 
     pub async fn load_model(&self, m: &SpicepodModel) {
-        measure_scope!("load_model", "model" => m.from);
+        measure_scope!("load_model", "model" => m.name, "source" => model::source(&m.from));
         tracing::info!("Loading model [{}] from {}...", m.name, m.from);
         let mut model_map = self.models.write().await;
 
@@ -369,8 +384,10 @@ impl Runtime {
             Ok(in_m) => {
                 model_map.insert(m.name.clone(), in_m);
                 tracing::info!("Model [{}] deployed, ready for inferencing", m.name);
+                metrics::gauge!("models/count", "model" => m.name.clone(), "source" => model::source(&m.from)).increment(1.0);
             }
             Err(e) => {
+                metrics::counter!("models/load_error").increment(1);
                 tracing::warn!(
                     "Unable to load runnable model from spicepod {}, error: {}",
                     m.name,
@@ -391,6 +408,7 @@ impl Runtime {
         }
         model_map.remove(&m.name);
         tracing::info!("Model [{}] has been unloaded", m.name);
+        metrics::gauge!("models/count", "model" => m.name.clone(), "source" => model::source(&m.from)).decrement(1.0);
     }
 
     pub async fn update_model(&self, m: &SpicepodModel) {
