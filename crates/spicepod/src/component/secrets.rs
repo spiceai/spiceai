@@ -25,4 +25,6 @@ impl Default for Secrets {
 pub enum SpiceSecretStore {
     File,
     Env,
+    Kubernetes,
+    Keyring,
 }

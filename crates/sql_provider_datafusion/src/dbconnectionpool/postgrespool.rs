@@ -8,7 +8,7 @@ use bb8_postgres::{
 use snafu::{prelude::*, ResultExt};
 
 use super::{DbConnectionPool, Mode, Result};
-use crate::dbconnection::{postgresconn::PostgresConnection, DbConnection};
+use crate::dbconnection::{postgresconn::PostgresConnection, AsyncDbConnection, DbConnection};
 
 #[derive(Debug, Snafu)]
 pub enum Error {

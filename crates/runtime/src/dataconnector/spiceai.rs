@@ -38,6 +38,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub struct SpiceAI {
     flight: Flight,
     spaced_trace: Arc<SpacedTracer>,
+    api_key: String,
 }
 
 #[async_trait]
@@ -65,13 +66,14 @@ impl DataConnector for SpiceAI {
                 .and_then(|params| params.get("endpoint").cloned())
                 .unwrap_or(default_flight_url);
             tracing::trace!("Connecting to SpiceAI with flight url: {url}");
-            let flight_client =
-                FlightClient::new(url.as_str(), "", secret.get("key").unwrap_or_default())
-                    .await
-                    .map_err(|e| super::Error::UnableToCreateDataConnector { source: e.into() })?;
+            let api_key = secret.get("key").unwrap_or_default();
+            let flight_client = FlightClient::new(url.as_str(), "", api_key)
+                .await
+                .map_err(|e| super::Error::UnableToCreateDataConnector { source: e.into() })?;
             let flight = Flight::new(flight_client);
             Ok(Self {
                 flight,
+                api_key: api_key.to_string(),
                 spaced_trace: Arc::new(SpacedTracer::new(Duration::from_secs(15))),
             })
         })
@@ -159,13 +161,18 @@ impl DataPublisher for SpiceAI {
         let dataset_path = Self::spice_dataset_path(dataset);
         let mut client = self.flight.client.clone();
         let spaced_trace = Arc::clone(&self.spaced_trace);
+        let api_key = self.api_key.clone();
         Box::pin(async move {
             tracing::debug!("Adding data to {dataset_path}");
 
-            client
-                .publish(&dataset_path, data_update.data)
-                .await
-                .context(UnableToPublishDataSnafu)?;
+            if let Err(e) = client.publish(&dataset_path, data_update.data).await {
+                if let flight_client::Error::PermissionDenied {} = e {
+                    tracing::error!("Permission denied when publishing data to Spice AI at '{dataset_path}' - does the API Key ('{api_key}') match the app that owns the dataset?");
+                } else {
+                    tracing::error!("Error publishing data to Spice AI at '{dataset_path}': {e}");
+                    Err(e).context(UnableToPublishDataSnafu)?;
+                }
+            };
 
             info_spaced!(spaced_trace, "Data published to {}", &dataset_path);
 

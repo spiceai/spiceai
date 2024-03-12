@@ -7,6 +7,7 @@ use app::App;
 use config::Config;
 use model::Model;
 pub use notify::Error as NotifyError;
+use secrets::spicepod_secret_store_type;
 use snafu::prelude::*;
 use spicepod::component::dataset::Dataset;
 use spicepod::component::dataset::Mode;
@@ -128,7 +129,11 @@ impl Runtime {
 
         let app_lock = self.app.read().await;
         if let Some(app) = app_lock.as_ref() {
-            secret_store.store = app.secrets.store.clone();
+            let Some(secret_store_type) = spicepod_secret_store_type(&app.secrets.store) else {
+                return;
+            };
+
+            secret_store.store = secret_store_type;
         }
 
         if let Err(e) = secret_store.load_secrets() {
@@ -257,18 +262,24 @@ impl Runtime {
     ) -> Result<Option<Box<dyn DataConnector + Send>>> {
         match source {
             "spiceai" => Ok(Some(Box::new(
-                dataconnector::spiceai::SpiceAI::new(secrets_provider.get_secret(source), params)
-                    .await
-                    .context(UnableToInitializeDataConnectorSnafu {
-                        data_connector: source,
-                    })?,
+                dataconnector::spiceai::SpiceAI::new(
+                    secrets_provider.get_secret(source).await,
+                    params,
+                )
+                .await
+                .context(UnableToInitializeDataConnectorSnafu {
+                    data_connector: source,
+                })?,
             ))),
             "dremio" => Ok(Some(Box::new(
-                dataconnector::dremio::Dremio::new(secrets_provider.get_secret(source), params)
-                    .await
-                    .context(UnableToInitializeDataConnectorSnafu {
-                        data_connector: source,
-                    })?,
+                dataconnector::dremio::Dremio::new(
+                    secrets_provider.get_secret(source).await,
+                    params,
+                )
+                .await
+                .context(UnableToInitializeDataConnectorSnafu {
+                    data_connector: source,
+                })?,
             ))),
             "localhost" => Ok(None),
             "debug" => Ok(Some(Box::new(dataconnector::debug::DebugSource {}))),
@@ -383,7 +394,12 @@ impl Runtime {
         let shared_secrets_provider = Arc::clone(&self.secrets_provider);
         let secrets_provider = shared_secrets_provider.read().await;
 
-        match Model::load(m.clone(), secrets_provider.get_secret(source.as_str())).await {
+        match Model::load(
+            m.clone(),
+            secrets_provider.get_secret(source.as_str()).await,
+        )
+        .await
+        {
             Ok(in_m) => {
                 model_map.insert(m.name.clone(), in_m);
                 tracing::info!("Model [{}] deployed, ready for inferencing", m.name);

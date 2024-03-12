@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use async_trait::async_trait;
+
 use super::{Secret, SecretStore};
 
 const ENV_SECRET_PREFIX: &str = "SPICED_SECRET_";
@@ -25,7 +27,7 @@ impl EnvSecretStore {
 
     fn add_secret_value(&mut self, secret_name: &str, key: &str, value: &str) {
         if let Some(secret) = self.secrets.get_mut(secret_name) {
-            secret.data.insert(key.to_string(), value.to_string());
+            secret.add(key.to_string(), value.to_string());
         } else {
             self.secrets.insert(
                 secret_name.to_string(),
@@ -80,9 +82,10 @@ impl EnvSecretStore {
     }
 }
 
+#[async_trait]
 impl SecretStore for EnvSecretStore {
     #[must_use]
-    fn get_secret(&self, secret_name: &str) -> Option<Secret> {
+    async fn get_secret(&self, secret_name: &str) -> Option<Secret> {
         if let Some(secret) = self.secrets.get(secret_name) {
             return Some(secret.clone());
         }
