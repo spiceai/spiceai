@@ -1,9 +1,10 @@
 use crate::datafusion::DataFusion;
 use crate::dataupdate::{DataUpdate, UpdateType};
+use arrow::datatypes::{Schema, SchemaRef};
 use arrow::ipc::writer::{DictionaryTracker, IpcDataGenerator};
-use arrow_flight::{sql, Action};
+use arrow_flight::{sql, Action, IpcMessage};
 use arrow_ipc::convert::try_schema_from_flatbuffer_bytes;
-use arrow_ipc::writer;
+use arrow_ipc::writer::{self, IpcWriteOptions};
 use datafusion::arrow::error::ArrowError;
 use datafusion::datasource::TableType;
 use datafusion::execution::SendableRecordBatchStream;
@@ -331,8 +332,26 @@ impl FlightSqlService for Service {
         statement: sql::ActionCreatePreparedStatementRequest,
         _request: Request<Action>,
     ) -> Result<sql::ActionCreatePreparedStatementResult, Status> {
+        let dataframe = self
+            .datafusion
+            .read()
+            .await
+            .ctx
+            .sql(&statement.query)
+            .await
+            .map_err(to_tonic_err)?;
+
+        let schema = dataframe.schema();
+        let arrow_schema: Schema = schema.into();
+
+        let message = SchemaAsIpc::new(&arrow_schema, &IpcWriteOptions::default())
+            .try_into()
+            .map_err(to_tonic_err)?;
+        let IpcMessage(schema_bytes) = message;
+
         Ok(sql::ActionCreatePreparedStatementResult {
             prepared_statement_handle: statement.query.into(),
+            dataset_schema: schema_bytes,
             ..Default::default()
         })
     }
