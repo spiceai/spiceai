@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-/// `measure_scope!` measures the time for which the designated scope lives. 
+/// `measure_scope!` measures the time for which the designated scope lives.
 ///
 /// ## Usage
 ///   - Example, measure a function's whole duration:
@@ -20,13 +20,13 @@ use std::time::Instant;
 ///     {
 ///         // Some work we don't want to measure
 ///         let x = 1+2;
-/// 
+///
 ///         // Some work we want to measure
 ///         measure_scope!("process_data");
 ///         let y = 2*3;
 ///         sleep(Duration::from_secs(1))
 ///     } // 'process_data' duration ends here.
-///   } 
+///   }
 ///   ```
 ///   - **Example**: Add properties to the measurement (key `&str`, value `ToString`)
 ///   ```
@@ -55,7 +55,7 @@ macro_rules! measure_scope {
 pub struct TimingGuard {
     start: Instant,
     metric_name: &'static str,
-    labels: Vec<(&'static str, String)>
+    labels: Vec<(&'static str, String)>,
 }
 
 impl TimingGuard {
@@ -63,13 +63,14 @@ impl TimingGuard {
         Self {
             start: Instant::now(),
             metric_name,
-            labels
+            labels,
         }
     }
 }
 
 impl Drop for TimingGuard {
     fn drop(&mut self) {
-        metrics::histogram!(self.metric_name, &self.labels).record(self.start.elapsed().as_secs_f64()); // .as_millis() as f64
+        metrics::histogram!(self.metric_name, &self.labels)
+            .record(self.start.elapsed().as_secs_f64()); // .as_millis() as f64
     }
 }

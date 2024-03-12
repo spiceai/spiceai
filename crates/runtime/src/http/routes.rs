@@ -4,7 +4,13 @@ use crate::{datafusion::DataFusion, model::Model};
 use app::App;
 
 use axum::{
-    body::Body, extract::MatchedPath, http::Request, middleware::{self, Next}, response::IntoResponse, routing::{get, post, Router}, Extension
+    body::Body,
+    extract::MatchedPath,
+    http::Request,
+    middleware::{self, Next},
+    response::IntoResponse,
+    routing::{get, post, Router},
+    Extension,
 };
 use tokio::{sync::RwLock, time::Instant};
 

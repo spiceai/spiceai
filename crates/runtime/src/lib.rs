@@ -16,7 +16,6 @@ use tokio::time::sleep;
 use tokio::{signal, sync::RwLock};
 
 use crate::{dataconnector::DataConnector, datafusion::DataFusion};
-pub mod timing;
 pub mod config;
 pub mod databackend;
 pub mod dataconnector;
@@ -32,6 +31,7 @@ pub mod modelsource;
 mod opentelemetry;
 pub mod podswatcher;
 pub mod secrets;
+pub mod timing;
 pub(crate) mod tracers;
 
 #[derive(Debug, Snafu)]
@@ -210,12 +210,13 @@ impl Runtime {
                     }
                 };
                 tracing::info!("Loaded dataset: {}", &ds.name);
-                let engine_str= ds.acceleration.clone().map(|acc| {
+                let engine_str = ds.acceleration.clone().map(|acc| {
                     if acc.enabled {
                         acc.engine().clone().to_string()
                     } else {
                         "None".to_string()
-                    }});
+                    }
+                });
                 metrics::gauge!("datasets/count", "engine" => engine_str.unwrap_or("None".to_string())).increment(1.0);
                 break;
             }
@@ -233,13 +234,15 @@ impl Runtime {
         }
 
         tracing::info!("Unloaded dataset: {}", &ds.name);
-        let engine_str= ds.acceleration.clone().map(|acc| {
+        let engine_str = ds.acceleration.clone().map(|acc| {
             if acc.enabled {
                 acc.engine().clone().to_string()
             } else {
                 "None".to_string()
-            }});
-        metrics::gauge!("datasets/count", "engine" => engine_str.unwrap_or("None".to_string())).decrement(1.0);
+            }
+        });
+        metrics::gauge!("datasets/count", "engine" => engine_str.unwrap_or("None".to_string()))
+            .decrement(1.0);
     }
 
     pub async fn update_dataset(&self, ds: &Dataset) {

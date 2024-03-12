@@ -223,11 +223,15 @@ pub mod acceleration {
 
     impl fmt::Display for Engine {
         fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-            write!(f, "{}", match *self {
-                Engine::Arrow => "arrow",
-                Engine::DuckDB => "duckdb",
-                Engine::Postgres => "postgres"
-            })
+            write!(
+                f,
+                "{}",
+                match *self {
+                    Engine::Arrow => "arrow",
+                    Engine::DuckDB => "duckdb",
+                    Engine::Postgres => "postgres",
+                }
+            )
         }
     }
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
