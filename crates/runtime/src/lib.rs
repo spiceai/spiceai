@@ -124,7 +124,7 @@ impl Runtime {
     }
 
     pub async fn load_secrets(&self) {
-        measure_scope!("load_secrets");
+        measure_scope_ms!("load_secrets");
         let mut secret_store = self.secrets_provider.write().await;
 
         let app_lock = self.app.read().await;
@@ -151,7 +151,7 @@ impl Runtime {
     }
 
     pub fn load_dataset(&self, ds: &Dataset) {
-        measure_scope!("load_dataset", "dataset" => ds.name.clone());
+        measure_scope_ms!("load_dataset", "dataset" => ds.name.clone());
         let df = Arc::clone(&self.df);
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
         let shared_secrets_provider = Arc::clone(&self.secrets_provider);
@@ -215,14 +215,17 @@ impl Runtime {
                     }
                 };
                 tracing::info!("Loaded dataset: {}", &ds.name);
-                let engine_str = ds.acceleration.clone().map(|acc| {
-                    if acc.enabled {
-                        acc.engine().clone().to_string()
-                    } else {
-                        "None".to_string()
-                    }
-                });
-                metrics::gauge!("datasets/count", "engine" => engine_str.unwrap_or("None".to_string())).increment(1.0);
+                let engine = ds.acceleration.map_or_else(
+                    || "None".to_string(),
+                    |acc| {
+                        if acc.enabled {
+                            acc.engine().to_string()
+                        } else {
+                            "None".to_string()
+                        }
+                    },
+                );
+                metrics::gauge!("datasets/count", "engine" => engine).increment(1.0);
                 break;
             }
         });
@@ -239,15 +242,17 @@ impl Runtime {
         }
 
         tracing::info!("Unloaded dataset: {}", &ds.name);
-        let engine_str = ds.acceleration.clone().map(|acc| {
-            if acc.enabled {
-                acc.engine().clone().to_string()
-            } else {
-                "None".to_string()
-            }
-        });
-        metrics::gauge!("datasets/count", "engine" => engine_str.unwrap_or("None".to_string()))
-            .decrement(1.0);
+        let engine = ds.acceleration.as_ref().map_or_else(
+            || "None".to_string(),
+            |acc| {
+                if acc.enabled {
+                    acc.engine().to_string()
+                } else {
+                    "None".to_string()
+                }
+            },
+        );
+        metrics::gauge!("datasets/count", "engine" => engine).decrement(1.0);
     }
 
     pub async fn update_dataset(&self, ds: &Dataset) {
@@ -384,7 +389,7 @@ impl Runtime {
     }
 
     pub async fn load_model(&self, m: &SpicepodModel) {
-        measure_scope!("load_model", "model" => m.name, "source" => model::source(&m.from));
+        measure_scope_ms!("load_model", "model" => m.name, "source" => model::source(&m.from));
         tracing::info!("Loading model [{}] from {}...", m.name, m.from);
         let mut model_map = self.models.write().await;
 
