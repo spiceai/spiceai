@@ -132,6 +132,28 @@ impl Dataset {
     }
 
     #[must_use]
+    pub fn acceleration_params(&self) -> Option<HashMap<String, String>> {
+        if let Some(acceleration) = &self.acceleration {
+            if let Some(refresh_interval) = &acceleration.params {
+                return Some(refresh_interval.clone());
+            }
+        }
+
+        None
+    }
+
+    #[must_use]
+    pub fn engine_secret(&self) -> Option<String> {
+        if let Some(acceleration) = &self.acceleration {
+            if let Some(engine_secret) = &acceleration.engine_secret {
+                return Some(engine_secret.clone());
+            }
+        }
+
+        None
+    }
+
+    #[must_use]
     pub fn refresh_interval(&self) -> Option<Duration> {
         if let Some(acceleration) = &self.acceleration {
             if let Some(refresh_interval) = &acceleration.refresh_interval {
@@ -192,6 +214,7 @@ impl WithDependsOn<Dataset> for Dataset {
 
 pub mod acceleration {
     use serde::{Deserialize, Serialize};
+    use std::collections::HashMap;
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
     #[serde(rename_all = "lowercase")]
@@ -238,6 +261,12 @@ pub mod acceleration {
 
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub retention: Option<String>,
+
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub params: Option<HashMap<String, String>>,
+
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub engine_secret: Option<String>,
     }
 
     impl Acceleration {

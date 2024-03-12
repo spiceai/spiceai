@@ -31,7 +31,7 @@ pub struct DataBackendBuilder {
     mode: Option<Mode>,
     params: Arc<Option<HashMap<String, String>>>,
     primary_keys: Option<Vec<String>>,
-    secrets: Option<Secret>,
+    secret: Option<Secret>,
 }
 
 impl DataBackendBuilder {
@@ -44,7 +44,7 @@ impl DataBackendBuilder {
             mode: None,
             params: Arc::new(None),
             primary_keys: None,
-            secrets: None,
+            secret: None,
         }
     }
 
@@ -73,8 +73,8 @@ impl DataBackendBuilder {
     }
 
     #[must_use]
-    pub fn secrets(mut self, secrets: Option<Secret>) -> Self {
-        self.secrets = secrets;
+    pub fn secret(mut self, secret: Option<Secret>) -> Self {
+        self.secret = secret;
         self
     }
 
@@ -148,7 +148,7 @@ impl DataBackendBuilder {
                     mode.into(),
                     self.params,
                     self.primary_keys,
-                    self.secrets,
+                    self.secret,
                 )
                 .await
                 .boxed()

@@ -105,9 +105,9 @@ impl PostgresBackend {
         mode: Mode,
         params: Arc<Option<HashMap<String, String>>>,
         primary_keys: Option<Vec<String>>,
-        secrets: Option<Secret>,
+        secret: Option<Secret>,
     ) -> Result<Self> {
-        let pool = PostgresConnectionPool::new(name, mode, read_pg_config(params, secrets))
+        let pool = PostgresConnectionPool::new(name, mode, read_pg_config(params, secret))
             .await
             .context(DbConnectionPoolSnafu)?;
         Ok(PostgresBackend {
