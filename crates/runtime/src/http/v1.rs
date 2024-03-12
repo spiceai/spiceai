@@ -10,7 +10,7 @@ pub(crate) mod query {
     };
     use tokio::sync::RwLock;
 
-    use crate::{datafusion::DataFusion};
+    use crate::datafusion::DataFusion;
 
     pub(crate) async fn post(
         Extension(df): Extension<Arc<RwLock<DataFusion>>>,

@@ -4,9 +4,9 @@ use std::{
     sync::{Arc, PoisonError},
 };
 
-use arrow::{record_batch::RecordBatch};
+use arrow::record_batch::RecordBatch;
 use datafusion::{execution::context::SessionContext, sql::TableReference};
-use duckdb::{vtab::arrow::arrow_recordbatch_to_query_params, DuckdbConnectionManager, Row, ToSql};
+use duckdb::{vtab::arrow::arrow_recordbatch_to_query_params, DuckdbConnectionManager, ToSql};
 use snafu::{prelude::*, ResultExt};
 use spicepod::component::dataset::Dataset;
 use sql_provider_datafusion::{
@@ -50,9 +50,6 @@ pub enum Error {
 
     #[snafu(display("Unable to downcast DbConnection to DuckDbConnection"))]
     UnableToDowncastDbConnection {},
-
-    #[snafu(display("Unable to convert DuckDB VARCHAR bytes value: {varchar}"))]
-    UnableToConvertBytes{varchar: String},
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -171,7 +168,6 @@ impl<'a> DuckDBUpdate<'a> {
             self.insert_batch(batch)?;
         }
 
-        self.monitor_duckdb()?;
         tracing::trace!("Processed update to DuckDB table {name}", name = self.name,);
 
         Ok(())
@@ -250,33 +246,6 @@ impl<'a> DuckDBUpdate<'a> {
             .query_row(&sql, [], |row| row.get::<usize, bool>(0))
             .unwrap_or(false)
     }
-
-
-    fn monitor_duckdb(&self) -> Result<()> {
-        self.duckdb_conn.conn.query_row("select database_size, wal_size, memory_usage, memory_limit FROM pragma_database_size();", [], |row| {
-            log_bytes_measure_from_db_row(row, 0, "database_size");
-            log_bytes_measure_from_db_row(row, 1, "wal_size");
-            log_bytes_measure_from_db_row(row, 2, "memory_usage");
-            log_bytes_measure_from_db_row(row, 3, "memory_limit");
-            Ok(())
-        }).context(DuckDBSnafu)
-    }
-}
-
-fn log_bytes_measure_from_db_row(r: &Row, i: usize, key_name: &'static str) {
-    tracing::warn!("loading {} at i={}", key_name, i);
-    match r.get::<usize, String>(i) {
-        Ok(measure_bytes_str) => {
-            tracing::warn!("  Got {}", measure_bytes_str);
-            match pg_size_bytes(measure_bytes_str.as_str()) {
-                Ok(bytes) => metrics::gauge!(key_name).set(bytes),
-                Err(e) => tracing::warn!("couldn't parse DuckDB measures: {}", e)
-            }
-        },
-        Err(e) => {
-            tracing::warn!("failed to get {}", e)
-        }
-    };
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -284,88 +253,6 @@ fn handle_poison<T: fmt::Debug>(e: PoisonError<T>) -> Error {
     Error::LockPoisoned {
         message: format!("{e:?}"),
     }
-}
-
-/// Converts disk sizes from a string format to a floating-point number representing the size in bytes.
-///
-/// This function is designed to parse string representations of disk sizes (as often found in database formats like DuckDB)
-/// and convert them into a numeric format (`f64`) that represents the size in bytes. It supports conversions for a range of units
-/// from bytes (B) up to yobibytes (YiB), adhering to the binary (IEC) standard where 1 KiB = 1024 bytes.
-///
-/// # Arguments
-///
-/// * `size_str` - A string slice that holds the size to be converted. The expected format is "<number> <unit>",
-/// where <unit> can be KiB, MiB..., or KB, MB, ... (case insensitive).
-///
-/// # Returns
-///
-/// This function returns a `Result<f64>`. On success, it provides the size in bytes as an `f64`. On failure,
-/// it returns an `Error::UnableToConvertBytes` variant, indicating either an unsupported format or a parsing error.
-///
-/// # Examples
-///
-/// Basic usage:
-///
-/// ```
-/// let size_in_bytes = pg_size_bytes("1 GiB").unwrap();
-/// assert_eq!(size_in_bytes, 1073741824.0);
-///
-/// let size_in_bytes = pg_size_bytes("1024 KiB").unwrap();
-/// assert_eq!(size_in_bytes, 1048576.0);
-///
-/// let error = pg_size_bytes("10 megabytes").unwrap_err();
-/// // This will return an error due to the unsupported unit "megabytes"
-/// ```
-///
-/// # Errors
-///
-/// This function will return an `Error::UnableToConvertBytes` if:
-///
-/// - The input string does not adhere to the expected format ("<number> <unit>").
-/// - The number cannot be parsed into a floating-point number.
-/// - The unit is not one of the supported IEC binary units (B, KiB, MiB, GiB, TiB, PiB, EiB, ZiB, YiB).
-///
-/// Note: The function handles the special case of "0 bytes" directly, returning `0.0` without error.
-///
-fn pg_size_bytes(size_str: &str) -> Result<f64> {
-    if size_str == "0 bytes" { // Edge case
-        return Ok(0.0)
-    }
-    let mut chars = size_str.chars().peekable();
-    let mut number_str = String::new();
-    while let Some(&c) = chars.peek() {
-        if c.is_digit(10) || c == '.' {
-            number_str.push(chars.next().unwrap());
-        } else {
-            break;
-        }
-    }
-    let number: f64 = match number_str.parse() {
-        Ok(num) => num,
-        Err(_) => return Err(Error::UnableToConvertBytes{varchar: size_str.to_string()}),
-    };
-
-    let bytes = match chars.collect::<String>().to_uppercase().as_str() {
-        "B" => number,
-        "KB" => number * 1000.0,
-        "MB" => number * 1000.0_f64.powi(2),
-        "GB" => number * 1000.0_f64.powi(3),
-        "TB" => number * 1000.0_f64.powi(4),
-        "PB" => number * 1000.0_f64.powi(5),
-        "EB" => number * 1000.0_f64.powi(6),
-        "ZB" => number * 1000.0_f64.powi(7),
-        "YB" => number * 1000.0_f64.powi(8),
-        "KIB" => number * 1024.0,
-        "MIB" => number * 1024.0_f64.powi(2),
-        "GIB" => number * 1024.0_f64.powi(3),
-        "TIB" => number * 1024.0_f64.powi(4),
-        "PIB" => number * 1024.0_f64.powi(5),
-        "EIB" => number * 1024.0_f64.powi(6),
-        "ZIB" => number * 1024.0_f64.powi(7),
-        "YIB" => number * 1024.0_f64.powi(8),
-        _ => return Err(Error::UnableToConvertBytes{varchar: size_str.to_string()}),
-    };
-    Ok(bytes)
 }
 
 #[cfg(test)]
