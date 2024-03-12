@@ -107,6 +107,7 @@ generate-acknowledgements:
 .PHONY: generate-acknowledgements-go
 generate-acknowledgements-go:
 	echo "\n## Go Modules\n" >> $(ACKNOWLEDGEMENTS_PATH)
+	go get github.com/google/go-licenses
 	go install github.com/google/go-licenses
 	pushd bin/spice && go-licenses csv . 2>/dev/null >> ../../$(ACKNOWLEDGEMENTS_PATH) && popd
 
