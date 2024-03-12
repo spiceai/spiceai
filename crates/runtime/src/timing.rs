@@ -72,6 +72,6 @@ impl TimeMeasurement {
 impl Drop for TimeMeasurement {
     fn drop(&mut self) {
         metrics::histogram!(self.metric_name, &self.labels)
-            .record(10000_f64 * self.start.elapsed().as_secs_f64());
+            .record(1000_f64 * self.start.elapsed().as_secs_f64());
     }
 }
