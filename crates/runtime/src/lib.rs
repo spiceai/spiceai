@@ -123,6 +123,7 @@ impl Runtime {
     }
 
     pub async fn load_secrets(&self) {
+        measure_scope!("load_secrets");
         let mut secret_store = self.secrets_provider.write().await;
 
         let app_lock = self.app.read().await;
@@ -354,6 +355,7 @@ impl Runtime {
     }
 
     pub async fn load_model(&self, m: &SpicepodModel) {
+        measure_scope!("load_model", "model" => m.from);
         tracing::info!("Loading model [{}] from {}...", m.name, m.from);
         let mut model_map = self.models.write().await;
 

@@ -70,6 +70,6 @@ impl TimingGuard {
 
 impl Drop for TimingGuard {
     fn drop(&mut self) {
-        metrics::histogram!(self.metric_name, &self.labels).record(self.start.elapsed().as_millis() as f64);
+        metrics::histogram!(self.metric_name, &self.labels).record(self.start.elapsed().as_secs_f64()); // .as_millis() as f64
     }
 }
