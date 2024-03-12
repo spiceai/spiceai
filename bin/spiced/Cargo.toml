@@ -24,3 +24,4 @@ metrics-exporter-prometheus = "0.13.0"
 [features]
 release = []
 dev = ["runtime/dev"]
+keyring-secret-store = ["runtime/keyring-secret-store"]

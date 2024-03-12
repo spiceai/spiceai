@@ -7,6 +7,7 @@ use app::App;
 use config::Config;
 use model::Model;
 pub use notify::Error as NotifyError;
+use secrets::spicepod_secret_store_type;
 use snafu::prelude::*;
 use spicepod::component::dataset::Dataset;
 use spicepod::component::dataset::Mode;
@@ -127,7 +128,11 @@ impl Runtime {
 
         let app_lock = self.app.read().await;
         if let Some(app) = app_lock.as_ref() {
-            secret_store.store = app.secrets.store.clone();
+            let Some(secret_store_type) = spicepod_secret_store_type(&app.secrets.store) else {
+                return;
+            };
+
+            secret_store.store = secret_store_type;
         }
 
         if let Err(e) = secret_store.load_secrets() {
