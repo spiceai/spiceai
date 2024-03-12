@@ -1,4 +1,4 @@
-use std::{collections::HashMap, mem, sync::Arc};
+use std::{mem, sync::Arc};
 
 use arrow::record_batch::RecordBatch;
 use arrow_sql_gen::statement::{CreateTableBuilder, InsertBuilder};
@@ -11,7 +11,7 @@ use snafu::{prelude::*, ResultExt};
 use spicepod::component::dataset::Dataset;
 use sql_provider_datafusion::{
     dbconnection::postgresconn::PostgresConnection,
-    dbconnectionpool::{postgrespool::PostgresConnectionPool, DbConnectionPool, Mode},
+    dbconnectionpool::{postgrespool::PostgresConnectionPool, DbConnectionPool},
     SqlTable,
 };
 use tokio::sync::Mutex;
@@ -96,14 +96,11 @@ impl DataPublisher for PostgresBackend {
     }
 }
 
-#[allow(clippy::no_effect_underscore_binding)]
 impl PostgresBackend {
     #[allow(clippy::needless_pass_by_value)]
     pub async fn new(
         ctx: Arc<SessionContext>,
         name: &str,
-        _mode: Mode,
-        _params: Arc<Option<HashMap<String, String>>>,
         primary_keys: Option<Vec<String>>,
     ) -> Result<Self> {
         let pool = PostgresConnectionPool::new()
