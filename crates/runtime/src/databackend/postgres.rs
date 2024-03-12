@@ -12,7 +12,7 @@ use snafu::{prelude::*, ResultExt};
 use spicepod::component::dataset::Dataset;
 use sql_provider_datafusion::{
     dbconnection::postgresconn::PostgresConnection,
-    dbconnectionpool::{postgrespool::PostgresConnectionPool, DbConnectionPool, Mode},
+    dbconnectionpool::{postgrespool::PostgresConnectionPool, DbConnectionPool},
     SqlTable,
 };
 use tokio::sync::Mutex;
@@ -26,7 +26,7 @@ use crate::{
 pub enum Error {
     #[snafu(display("DbConnectionError: {source}"))]
     DbConnectionError {
-        source: sql_provider_datafusion::dbconnection::Error,
+        source: sql_provider_datafusion::dbconnection::GenericError,
     },
 
     #[snafu(display("DbConnectionPoolError: {source}"))]
@@ -102,12 +102,11 @@ impl PostgresBackend {
     pub async fn new(
         ctx: Arc<SessionContext>,
         name: &str,
-        mode: Mode,
         params: Arc<Option<HashMap<String, String>>>,
         primary_keys: Option<Vec<String>>,
         secret: Option<Secret>,
     ) -> Result<Self> {
-        let pool = PostgresConnectionPool::new(name, mode, read_pg_config(params, secret))
+        let pool = PostgresConnectionPool::new(params)
             .await
             .context(DbConnectionPoolSnafu)?;
         Ok(PostgresBackend {

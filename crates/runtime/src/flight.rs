@@ -1,6 +1,11 @@
 use crate::datafusion::DataFusion;
 use crate::dataupdate::{DataUpdate, UpdateType};
 use arrow::ipc::writer::{DictionaryTracker, IpcDataGenerator};
+use arrow_flight::{
+    flight_service_server::FlightService, flight_service_server::FlightServiceServer, Action,
+    ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightInfo, HandshakeRequest,
+    HandshakeResponse, PutResult, SchemaResult, Ticket,
+};
 use arrow_flight::{FlightEndpoint, SchemaAsIpc};
 use arrow_ipc::convert::try_schema_from_flatbuffer_bytes;
 use arrow_ipc::writer;
@@ -19,12 +24,6 @@ use tonic::metadata::MetadataValue;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 use uuid::Uuid;
-
-use arrow_flight::{
-    flight_service_server::FlightService, flight_service_server::FlightServiceServer, Action,
-    ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightInfo, HandshakeRequest,
-    HandshakeResponse, PutResult, SchemaResult, Ticket,
-};
 
 pub struct Service {
     datafusion: Arc<RwLock<DataFusion>>,

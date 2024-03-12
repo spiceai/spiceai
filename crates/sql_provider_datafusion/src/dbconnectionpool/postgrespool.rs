@@ -8,7 +8,7 @@ use bb8_postgres::{
 use snafu::{prelude::*, ResultExt};
 
 use super::{DbConnectionPool, Mode, Result};
-use crate::dbconnection::{postgresconn::PostgresConnection, DbConnection};
+use crate::dbconnection::{postgresconn::PostgresConnection, AsyncDbConnection, DbConnection};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -30,18 +30,9 @@ pub struct PostgresConnectionPool {
     pool: Arc<bb8::Pool<PostgresConnectionManager<NoTls>>>,
 }
 
-#[async_trait]
-impl
-    DbConnectionPool<
-        bb8::PooledConnection<'static, PostgresConnectionManager<NoTls>>,
-        &'static (dyn ToSql + Sync),
-    > for PostgresConnectionPool
-{
-    async fn new(
-        _name: &str,
-        _mode: Mode,
-        _params: Arc<Option<HashMap<String, String>>>,
-    ) -> Result<Self> {
+
+impl PostgresConnectionPool {
+    pub async fn new(_params: Arc<Option<HashMap<String, String>>>) -> Result<Self> {
         let mut host = "localhost";
         let mut user = "postgres";
         let mut dbname = "postgres";
@@ -77,6 +68,22 @@ impl
         Ok(PostgresConnectionPool {
             pool: Arc::new(pool),
         })
+    }
+}
+
+#[async_trait]
+impl
+    DbConnectionPool<
+        bb8::PooledConnection<'static, PostgresConnectionManager<NoTls>>,
+        &'static (dyn ToSql + Sync),
+    > for PostgresConnectionPool
+{
+    async fn new(
+        _name: &str,
+        _mode: Mode,
+        params: Arc<Option<HashMap<String, String>>>,
+    ) -> Result<Self> {
+        PostgresConnectionPool::new(params).await
     }
 
     async fn connect(

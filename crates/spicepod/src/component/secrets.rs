@@ -26,4 +26,5 @@ pub enum SpiceSecretStore {
     File,
     Env,
     Kubernetes,
+    Keyring,
 }

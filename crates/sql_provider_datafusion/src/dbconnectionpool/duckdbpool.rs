@@ -5,7 +5,7 @@ use duckdb::{vtab::arrow::ArrowVTab, DuckdbConnectionManager, ToSql};
 use snafu::{prelude::*, ResultExt};
 
 use super::{DbConnectionPool, Mode, Result};
-use crate::dbconnection::{duckdbconn::DuckDbConnection, DbConnection};
+use crate::dbconnection::{duckdbconn::DuckDbConnection, DbConnection, SyncDbConnection};
 
 #[derive(Debug, Snafu)]
 pub enum Error {

@@ -7,6 +7,7 @@ use app::App;
 use config::Config;
 use model::Model;
 pub use notify::Error as NotifyError;
+use secrets::spicepod_secret_store_type;
 use snafu::prelude::*;
 use spicepod::component::dataset::Dataset;
 use spicepod::component::dataset::Mode;
@@ -16,7 +17,6 @@ use tokio::time::sleep;
 use tokio::{signal, sync::RwLock};
 
 use crate::{dataconnector::DataConnector, datafusion::DataFusion};
-
 pub mod config;
 pub mod databackend;
 pub mod dataconnector;
@@ -32,6 +32,7 @@ pub mod modelsource;
 mod opentelemetry;
 pub mod podswatcher;
 pub mod secrets;
+pub mod timing;
 pub(crate) mod tracers;
 
 #[derive(Debug, Snafu)]
@@ -123,11 +124,16 @@ impl Runtime {
     }
 
     pub async fn load_secrets(&self) {
+        measure_scope_ms!("load_secrets");
         let mut secret_store = self.secrets_provider.write().await;
 
         let app_lock = self.app.read().await;
         if let Some(app) = app_lock.as_ref() {
-            secret_store.store = app.secrets.store.clone();
+            let Some(secret_store_type) = spicepod_secret_store_type(&app.secrets.store) else {
+                return;
+            };
+
+            secret_store.store = secret_store_type;
         }
 
         if let Err(e) = secret_store.load_secrets() {
@@ -145,6 +151,7 @@ impl Runtime {
     }
 
     pub fn load_dataset(&self, ds: &Dataset) {
+        measure_scope_ms!("load_dataset", "dataset" => ds.name.clone());
         let df = Arc::clone(&self.df);
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
         let shared_secrets_provider: Arc<RwLock<secrets::SecretsProvider>> =
@@ -169,6 +176,7 @@ impl Runtime {
                     {
                         Ok(data_connector) => data_connector,
                         Err(err) => {
+                            metrics::counter!("datasets/load_error").increment(1);
                             warn_spaced!(
                                 spaced_tracer,
                                 "Unable to get data connector from source for dataset {}, retrying: {err:?}",
@@ -198,6 +206,7 @@ impl Runtime {
                 {
                     Ok(()) => (),
                     Err(err) => {
+                        metrics::counter!("datasets/load_error").increment(1);
                         warn_spaced!(
                             spaced_tracer,
                             "Unable to initialize data connector for dataset {}, retrying: {err:?}",
@@ -207,8 +216,18 @@ impl Runtime {
                         continue;
                     }
                 };
-
                 tracing::info!("Loaded dataset: {}", &ds.name);
+                let engine = ds.acceleration.map_or_else(
+                    || "None".to_string(),
+                    |acc| {
+                        if acc.enabled {
+                            acc.engine().to_string()
+                        } else {
+                            "None".to_string()
+                        }
+                    },
+                );
+                metrics::gauge!("datasets/count", "engine" => engine).increment(1.0);
                 break;
             }
         });
@@ -225,6 +244,17 @@ impl Runtime {
         }
 
         tracing::info!("Unloaded dataset: {}", &ds.name);
+        let engine = ds.acceleration.as_ref().map_or_else(
+            || "None".to_string(),
+            |acc| {
+                if acc.enabled {
+                    acc.engine().to_string()
+                } else {
+                    "None".to_string()
+                }
+            },
+        );
+        metrics::gauge!("datasets/count", "engine" => engine).decrement(1.0);
     }
 
     pub async fn update_dataset(&self, ds: &Dataset) {
@@ -250,6 +280,16 @@ impl Runtime {
             ))),
             "dremio" => Ok(Some(Box::new(
                 dataconnector::dremio::Dremio::new(
+                    secrets_provider.get_secret(source).await,
+                    params,
+                )
+                .await
+                .context(UnableToInitializeDataConnectorSnafu {
+                    data_connector: source,
+                })?,
+            ))),
+            "postgres" => Ok(Some(Box::new(
+                dataconnector::postgres::Postgres::new(
                     secrets_provider.get_secret(source).await,
                     params,
                 )
@@ -362,6 +402,7 @@ impl Runtime {
     }
 
     pub async fn load_model(&self, m: &SpicepodModel) {
+        measure_scope_ms!("load_model", "model" => m.name, "source" => model::source(&m.from));
         tracing::info!("Loading model [{}] from {}...", m.name, m.from);
         let mut model_map = self.models.write().await;
 
@@ -380,8 +421,10 @@ impl Runtime {
             Ok(in_m) => {
                 model_map.insert(m.name.clone(), in_m);
                 tracing::info!("Model [{}] deployed, ready for inferencing", m.name);
+                metrics::gauge!("models/count", "model" => m.name.clone(), "source" => model::source(&m.from)).increment(1.0);
             }
             Err(e) => {
+                metrics::counter!("models/load_error").increment(1);
                 tracing::warn!(
                     "Unable to load runnable model from spicepod {}, error: {}",
                     m.name,
@@ -402,6 +445,7 @@ impl Runtime {
         }
         model_map.remove(&m.name);
         tracing::info!("Model [{}] has been unloaded", m.name);
+        metrics::gauge!("models/count", "model" => m.name.clone(), "source" => model::source(&m.from)).decrement(1.0);
     }
 
     pub async fn update_model(&self, m: &SpicepodModel) {
