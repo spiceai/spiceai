@@ -1,4 +1,4 @@
-use std::{mem, sync::Arc};
+use std::{collections::HashMap, mem, sync::Arc};
 
 use arrow::record_batch::RecordBatch;
 use arrow_sql_gen::statement::{CreateTableBuilder, InsertBuilder};
@@ -101,9 +101,10 @@ impl PostgresBackend {
     pub async fn new(
         ctx: Arc<SessionContext>,
         name: &str,
+        params: Arc<Option<HashMap<String, String>>>,
         primary_keys: Option<Vec<String>>,
     ) -> Result<Self> {
-        let pool = PostgresConnectionPool::new()
+        let pool = PostgresConnectionPool::new(params)
             .await
             .context(DbConnectionPoolSnafu)?;
         Ok(PostgresBackend {

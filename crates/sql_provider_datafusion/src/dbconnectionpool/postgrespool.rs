@@ -31,7 +31,7 @@ pub struct PostgresConnectionPool {
 }
 
 impl PostgresConnectionPool {
-    pub async fn new() -> Result<Self> {
+    pub async fn new(_params: Arc<Option<HashMap<String, String>>>) -> Result<Self> {
         let connection_string = "host=localhost user=postgres password=postgres dbname=postgres";
 
         let manager = PostgresConnectionManager::new_from_stringlike(connection_string, NoTls)
@@ -57,9 +57,9 @@ impl
     async fn new(
         _name: &str,
         _mode: Mode,
-        _params: Arc<Option<HashMap<String, String>>>,
+        params: Arc<Option<HashMap<String, String>>>,
     ) -> Result<Self> {
-        PostgresConnectionPool::new().await
+        PostgresConnectionPool::new(params).await
     }
 
     async fn connect(

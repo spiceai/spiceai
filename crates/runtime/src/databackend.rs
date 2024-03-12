@@ -136,6 +136,7 @@ impl DataBackendBuilder {
                 postgres::PostgresBackend::new(
                     Arc::clone(&self.ctx),
                     self.name.as_str(),
+                    self.params,
                     self.primary_keys,
                 )
                 .await
