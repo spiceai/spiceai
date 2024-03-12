@@ -4,9 +4,9 @@ use std::{
     sync::{Arc, PoisonError},
 };
 
-use arrow::record_batch::RecordBatch;
+use arrow::{record_batch::RecordBatch};
 use datafusion::{execution::context::SessionContext, sql::TableReference};
-use duckdb::{vtab::arrow::arrow_recordbatch_to_query_params, DuckdbConnectionManager, ToSql};
+use duckdb::{vtab::arrow::arrow_recordbatch_to_query_params, DuckdbConnectionManager, Row, ToSql};
 use snafu::{prelude::*, ResultExt};
 use spicepod::component::dataset::Dataset;
 use sql_provider_datafusion::{
@@ -254,34 +254,29 @@ impl<'a> DuckDBUpdate<'a> {
 
     fn monitor_duckdb(&self) -> Result<()> {
         self.duckdb_conn.conn.query_row("select database_size, wal_size, memory_usage, memory_limit FROM pragma_database_size();", [], |row| {
-            
-            if let Ok(database_size) = row.get::<usize, String>(0) {
-                if let Ok(bytes) = pg_size_bytes(database_size.as_str()) {
-                    metrics::gauge!("database_size").set(bytes);
-                }
-            };
-
-            if let Ok(wal_size) = row.get::<usize, String>(1) {
-                if let Ok(bytes) = pg_size_bytes(wal_size.as_str()) {
-                    metrics::gauge!("wal_size").set(bytes);
-                }
-            };
-
-            if let Ok(memory_usage) = row.get::<usize, String>(2) {
-                if let Ok(bytes) = pg_size_bytes(memory_usage.as_str()) {
-                    metrics::gauge!("memory_usage").set(bytes);
-                }
-            };
-
-            if let Ok(memory_limit) = row.get::<usize, String>(3) {
-                if let Ok(bytes) = pg_size_bytes(memory_limit.as_str()) {
-                    metrics::gauge!("memory_limit").set(bytes);
-                }
-            };
-
+            log_bytes_measure_from_db_row(row, 0, "database_size");
+            log_bytes_measure_from_db_row(row, 1, "wal_size");
+            log_bytes_measure_from_db_row(row, 2, "memory_usage");
+            log_bytes_measure_from_db_row(row, 3, "memory_limit");
             Ok(())
         }).context(DuckDBSnafu)
     }
+}
+
+fn log_bytes_measure_from_db_row(r: &Row, i: usize, key_name: &'static str) {
+    tracing::warn!("loading {} at i={}", key_name, i);
+    match r.get::<usize, String>(i) {
+        Ok(measure_bytes_str) => {
+            tracing::warn!("  Got {}", measure_bytes_str);
+            match pg_size_bytes(measure_bytes_str.as_str()) {
+                Ok(bytes) => metrics::gauge!(key_name).set(bytes),
+                Err(e) => tracing::warn!("couldn't parse DuckDB measures: {}", e)
+            }
+        },
+        Err(e) => {
+            tracing::warn!("failed to get {}", e)
+        }
+    };
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -300,7 +295,7 @@ fn handle_poison<T: fmt::Debug>(e: PoisonError<T>) -> Error {
 /// # Arguments
 ///
 /// * `size_str` - A string slice that holds the size to be converted. The expected format is "<number> <unit>",
-/// where <unit> can be B, KiB, MiB, GiB, TiB, PiB, EiB, ZiB, or YiB. Case-insensitive.
+/// where <unit> can be KiB, MiB..., or KB, MB, ... (case insensitive).
 ///
 /// # Returns
 ///
@@ -336,20 +331,31 @@ fn pg_size_bytes(size_str: &str) -> Result<f64> {
     if size_str == "0 bytes" { // Edge case
         return Ok(0.0)
     }
-    let parts: Vec<&str> = size_str.split_whitespace().collect();
-    if parts.len() != 2 {
-        return Err(Error::UnableToConvertBytes{varchar: size_str.to_string()});
+    let mut chars = size_str.chars().peekable();
+    let mut number_str = String::new();
+    while let Some(&c) = chars.peek() {
+        if c.is_digit(10) || c == '.' {
+            number_str.push(chars.next().unwrap());
+        } else {
+            break;
+        }
     }
-
-    let number: f64 = match parts[0].parse() {
+    let number: f64 = match number_str.parse() {
         Ok(num) => num,
         Err(_) => return Err(Error::UnableToConvertBytes{varchar: size_str.to_string()}),
     };
 
-    let unit = parts[1];
-    let bytes = match unit.to_uppercase().as_str() {
+    let bytes = match chars.collect::<String>().to_uppercase().as_str() {
         "B" => number,
-        "KIB" => number * 1024.0_f64,
+        "KB" => number * 1000.0,
+        "MB" => number * 1000.0_f64.powi(2),
+        "GB" => number * 1000.0_f64.powi(3),
+        "TB" => number * 1000.0_f64.powi(4),
+        "PB" => number * 1000.0_f64.powi(5),
+        "EB" => number * 1000.0_f64.powi(6),
+        "ZB" => number * 1000.0_f64.powi(7),
+        "YB" => number * 1000.0_f64.powi(8),
+        "KIB" => number * 1024.0,
         "MIB" => number * 1024.0_f64.powi(2),
         "GIB" => number * 1024.0_f64.powi(3),
         "TIB" => number * 1024.0_f64.powi(4),
