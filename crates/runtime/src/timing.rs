@@ -45,20 +45,21 @@ use std::time::Instant;
 macro_rules! measure_scope {
     ($name:expr, $($key:expr => $value:expr),+ $(,)?) => {
         let args = vec![$(($key, $value.to_string())),+];
-        $crate::timing::TimingGuard::new($name, args)
+        let _ = $crate::timing::TimeMeasurement::new($name, args);
     };
     ($name:expr) => {
-        $crate::timing::TimingGuard::new($name, vec![])
+        let _ = $crate::timing::TimeMeasurement::new($name, vec![]);
     };
 }
 
-pub struct TimingGuard {
+pub struct TimeMeasurement {
     start: Instant,
     metric_name: &'static str,
     labels: Vec<(&'static str, String)>,
 }
 
-impl TimingGuard {
+impl TimeMeasurement {
+    #[must_use]
     pub fn new(metric_name: &'static str, labels: Vec<(&'static str, String)>) -> Self {
         Self {
             start: Instant::now(),
@@ -68,9 +69,9 @@ impl TimingGuard {
     }
 }
 
-impl Drop for TimingGuard {
+impl Drop for TimeMeasurement {
     fn drop(&mut self) {
         metrics::histogram!(self.metric_name, &self.labels)
-            .record(self.start.elapsed().as_secs_f64()); // .as_millis() as f64
+            .record(self.start.elapsed().as_secs_f64());
     }
 }
