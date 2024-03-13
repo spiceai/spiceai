@@ -2,14 +2,13 @@ use async_trait::async_trait;
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::options::ParquetReadOptions;
 use object_store::aws::AmazonS3Builder;
+use secrets::Secret;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::{collections::HashMap, future::Future};
 use url::Url;
 
 use spicepod::component::dataset::Dataset;
-
-use crate::auth::AuthProvider;
 
 use super::DataConnector;
 use snafu::prelude::*;
@@ -27,7 +26,7 @@ pub enum Error {
 }
 
 pub struct S3 {
-    auth_provider: AuthProvider,
+    secret: Option<Secret>,
     params: HashMap<String, String>,
 }
 impl S3 {
@@ -46,7 +45,7 @@ impl S3 {
 #[async_trait]
 impl DataConnector for S3 {
     fn new(
-        auth_provider: AuthProvider,
+        secret: Option<Secret>,
         params: Arc<Option<HashMap<String, String>>>,
     ) -> Pin<Box<dyn Future<Output = super::Result<Self>> + Send>>
     where
@@ -54,7 +53,7 @@ impl DataConnector for S3 {
     {
         Box::pin(async move {
             Ok(Self {
-                auth_provider,
+                secret,
                 params: params.as_ref().clone().map_or_else(HashMap::new, |x| x),
             })
         })
@@ -93,11 +92,13 @@ impl DataConnector for S3 {
         if let Some(endpoint) = self.params.get("endpoint") {
             s3_builder = s3_builder.with_endpoint(endpoint);
         }
-        if let Some(key) = self.auth_provider.get_param("key") {
-            s3_builder = s3_builder.with_access_key_id(key);
-        };
-        if let Some(secret) = self.auth_provider.get_param("secret") {
-            s3_builder = s3_builder.with_secret_access_key(secret);
+        if let Some(secret) = &self.secret {
+            if let Some(key) = secret.get("key") {
+                s3_builder = s3_builder.with_access_key_id(key);
+            };
+            if let Some(secret) = secret.get("secret") {
+                s3_builder = s3_builder.with_secret_access_key(secret);
+            };
         };
 
         let s3 = s3_builder
