@@ -1,5 +1,5 @@
 [package]
-name = "sql_provider_datafusion"
+name = "db_connection_pool"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,8 +7,6 @@ license.workspace = true
 homepage.workspace = true
 repository.workspace = true
 exclude.workspace = true
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 duckdb = { workspace = true,  features = ["bundled", "r2d2", "vtab", "vtab-arrow"] }
@@ -23,7 +21,6 @@ bb8.workspace = true
 bb8-postgres.workspace = true
 async-stream.workspace = true
 arrow_sql_gen = { path = "../arrow_sql_gen" }
-db_connection_pool = { path = "../db_connection_pool" }
 arrow.workspace = true
 
 [dev-dependencies]

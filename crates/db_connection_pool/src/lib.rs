@@ -3,6 +3,7 @@ use std::{collections::HashMap, sync::Arc};
 use crate::dbconnection::DbConnection;
 use async_trait::async_trait;
 
+pub mod dbconnection;
 pub mod duckdbpool;
 pub mod postgrespool;
 
