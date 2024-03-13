@@ -11,6 +11,7 @@ use db_connection_pool::{
     dbconnection::postgresconn::PostgresConnection, postgrespool::PostgresConnectionPool,
     DbConnectionPool,
 };
+use secrets::Secret;
 use snafu::{prelude::*, ResultExt};
 use spicepod::component::dataset::Dataset;
 use sql_provider_datafusion::SqlTable;
@@ -101,8 +102,9 @@ impl PostgresBackend {
         name: &str,
         params: Arc<Option<HashMap<String, String>>>,
         primary_keys: Option<Vec<String>>,
+        secret: Option<Secret>,
     ) -> Result<Self> {
-        let pool = PostgresConnectionPool::new(params)
+        let pool = PostgresConnectionPool::new(params, secret)
             .await
             .context(DbConnectionPoolSnafu)?;
         Ok(PostgresBackend {

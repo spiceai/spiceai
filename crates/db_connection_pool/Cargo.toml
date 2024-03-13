@@ -20,6 +20,8 @@ bb8.workspace = true
 bb8-postgres.workspace = true
 arrow_sql_gen = { path = "../arrow_sql_gen" }
 arrow.workspace = true
+secrets = { path = "../secrets" }
+spicepod = { path = "../spicepod" }
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }

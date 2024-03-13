@@ -33,7 +33,7 @@ pub struct Postgres {
 #[async_trait]
 impl DataConnector for Postgres {
     fn new(
-        _secret: Option<Secret>,
+        secret: Option<Secret>,
         params: Arc<Option<HashMap<String, String>>>,
     ) -> Pin<Box<dyn Future<Output = Result<Self>> + Send>>
     where
@@ -47,7 +47,7 @@ impl DataConnector for Postgres {
                     > + Send
                     + Sync,
             > = Arc::new(
-                PostgresConnectionPool::new(params)
+                PostgresConnectionPool::new(params, secret)
                     .await
                     .context(UnableToGetTableProviderSnafu)?,
             );

@@ -150,7 +150,8 @@ impl Runtime {
         measure_scope_ms!("load_dataset", "dataset" => ds.name.clone());
         let df = Arc::clone(&self.df);
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
-        let shared_secrets_provider = Arc::clone(&self.secrets_provider);
+        let shared_secrets_provider: Arc<RwLock<secrets::SecretsProvider>> =
+            Arc::clone(&self.secrets_provider);
 
         let ds = ds.clone();
 
@@ -195,6 +196,7 @@ impl Runtime {
                     Arc::clone(&df),
                     &source,
                     &ds,
+                    Arc::clone(&shared_secrets_provider),
                 )
                 .await
                 {
@@ -306,6 +308,7 @@ impl Runtime {
         df: Arc<RwLock<DataFusion>>,
         source: &str,
         ds: impl Borrow<Dataset>,
+        secrets_provider: Arc<RwLock<secrets::SecretsProvider>>,
     ) -> Result<()> {
         let ds = ds.borrow();
         let view_sql = ds.view_sql().context(InvalidSQLViewSnafu)?;
@@ -334,7 +337,7 @@ impl Runtime {
         let data_backend = df
             .read()
             .await
-            .new_accelerated_backend(ds)
+            .new_accelerated_backend(ds, secrets_provider)
             .await
             .context(UnableToCreateBackendSnafu)?;
         let data_backend = Arc::new(data_backend);

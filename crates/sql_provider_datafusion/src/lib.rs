@@ -298,9 +298,11 @@ mod tests {
             dyn DbConnectionPool<r2d2::PooledConnection<DuckdbConnectionManager>, &dyn ToSql>
                 + Send
                 + Sync,
-        > = Arc::new(
-            DuckDbConnectionPool::new("test", Mode::Memory, Arc::new(Option::None)).await?,
-        );
+        > = Arc::new(DuckDbConnectionPool::new(
+            "test",
+            &Mode::Memory,
+            &Arc::new(Option::None),
+        )?);
         let conn = pool.connect().await?;
         let db_conn = conn
             .as_any()
@@ -326,9 +328,11 @@ mod tests {
             dyn DbConnectionPool<r2d2::PooledConnection<DuckdbConnectionManager>, &dyn ToSql>
                 + Send
                 + Sync,
-        > = Arc::new(
-            DuckDbConnectionPool::new("test", Mode::Memory, Arc::new(Option::None)).await?,
-        );
+        > = Arc::new(DuckDbConnectionPool::new(
+            "test",
+            &Mode::Memory,
+            &Arc::new(Option::None),
+        )?);
         let conn = pool.connect().await?;
         let db_conn = conn
             .as_any()
