@@ -106,7 +106,7 @@ impl PostgresBackend {
         primary_keys: Option<Vec<String>>,
         secret: Option<Secret>,
     ) -> Result<Self> {
-        let pool = PostgresConnectionPool::new(params)
+        let pool = PostgresConnectionPool::new(read_pg_config(params, secret))
             .await
             .context(DbConnectionPoolSnafu)?;
         Ok(PostgresBackend {
@@ -147,18 +147,21 @@ fn read_pg_config(
     params: Arc<Option<HashMap<String, String>>>,
     secrets: Option<Secret>,
 ) -> Arc<Option<HashMap<String, String>>> {
-    if let Some(params_val) = params.as_ref() {
-        let mut new_params = params_val.clone();
-        if let Some(secrets) = secrets {
-            if let Some(pg_pass_val) = new_params.get("pg_pass") {
-                if let Some(pg_pass_secret) = secrets.get(pg_pass_val) {
-                    new_params.insert("pg_pass".to_string(), pg_pass_secret.to_string());
-                    return Arc::new(Some(new_params));
-                }
-            }
-        }
-    }
-    params
+    let Some(params_val) = params.as_ref() else {
+        return params;
+    };
+    let mut new_params = params_val.clone();
+    let Some(secrets) = secrets else {
+        return params;
+    };
+    let Some(pg_pass_val) = new_params.get("pg_pass_key") else {
+        return params;
+    };
+    let Some(pg_pass_secret) = secrets.get(pg_pass_val) else {
+        return params;
+    };
+    new_params.insert("pg_pass".to_string(), pg_pass_secret.to_string());
+    Arc::new(Some(new_params))
 }
 
 struct PostgresUpdate<'a> {

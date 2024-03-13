@@ -30,15 +30,14 @@ pub struct PostgresConnectionPool {
     pool: Arc<bb8::Pool<PostgresConnectionManager<NoTls>>>,
 }
 
-
 impl PostgresConnectionPool {
-    pub async fn new(_params: Arc<Option<HashMap<String, String>>>) -> Result<Self> {
+    pub async fn new(params: Arc<Option<HashMap<String, String>>>) -> Result<Self> {
         let mut host = "localhost";
         let mut user = "postgres";
         let mut dbname = "postgres";
         let mut connection_string = String::new();
 
-        if let Some(params) = _params.as_ref() {
+        if let Some(params) = params.as_ref() {
             if let Some(pg_host) = params.get("pg_host") {
                 host = pg_host;
             }
