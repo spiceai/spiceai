@@ -150,16 +150,16 @@ fn read_pg_config(
     let Some(params_val) = params.as_ref() else {
         return params;
     };
-    let mut new_params = params_val.clone();
     let Some(secrets) = secrets else {
         return params;
     };
-    let Some(pg_pass_val) = new_params.get("pg_pass_key") else {
+    let Some(pg_pass_val) = params_val.get("pg_pass_key") else {
         return params;
     };
     let Some(pg_pass_secret) = secrets.get(pg_pass_val) else {
         return params;
     };
+    let mut new_params = params_val.clone();
     new_params.insert("pg_pass".to_string(), pg_pass_secret.to_string());
     Arc::new(Some(new_params))
 }
