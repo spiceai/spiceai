@@ -78,18 +78,8 @@ impl FileSecretStore {
     }
 }
 
-<<<<<<< HEAD:crates/runtime/src/auth.rs
-#[allow(clippy::module_name_repetitions)]
-#[derive(Clone)]
-pub struct AuthProvider {
-    pub auth_config: AuthConfig,
-}
-
-impl AuthProvider {
-=======
 #[async_trait]
 impl SecretStore for FileSecretStore {
->>>>>>> a219a58480356e5b0311ded3ebf1e654bc5f2b0a:crates/runtime/src/secrets/file.rs
     #[must_use]
     async fn get_secret(&self, secret_name: &str) -> Option<Secret> {
         if let Some(secret) = self.secrets.get(secret_name) {
@@ -97,9 +87,5 @@ impl SecretStore for FileSecretStore {
         }
 
         None
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = (&String, &String)> {
-        self.auth_config.params.iter()
     }
 }
