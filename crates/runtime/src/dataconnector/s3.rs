@@ -133,7 +133,15 @@ impl DataConnector for S3 {
                 .read_parquet(format!("s3:{path}"), ParquetReadOptions::default())
                 .await
             {
-                return df.collect().await.unwrap();
+                match df.collect().await {
+                    Ok(batches) => {
+                        return batches;
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to collect record batches from S3: {:?}", e);
+                        return vec![];
+                    }
+                }
             }
             vec![]
         })
