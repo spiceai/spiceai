@@ -13,7 +13,6 @@ serde_yaml.workspace = true
 snafu.workspace = true
 tracing.workspace = true
 fundu = "2.0.0"
-db_connection_pool = { path = "../db_connection_pool" }
 
 [features]
 default = ["duckdb", "postgres"]

@@ -18,7 +18,6 @@ use sql_provider_datafusion::SqlTable;
 use tokio::sync::Mutex;
 
 use crate::{
-    datafusion::read_pg_config,
     datapublisher::{AddDataResult, DataPublisher},
     dataupdate::{DataUpdate, UpdateType},
 };
@@ -105,7 +104,7 @@ impl PostgresBackend {
         primary_keys: Option<Vec<String>>,
         secret: Option<Secret>,
     ) -> Result<Self> {
-        let pool = PostgresConnectionPool::new(read_pg_config(params, secret))
+        let pool = PostgresConnectionPool::new(params, secret)
             .await
             .context(DbConnectionPoolSnafu)?;
         Ok(PostgresBackend {

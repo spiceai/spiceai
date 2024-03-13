@@ -5,9 +5,10 @@ use bb8_postgres::{
     tokio_postgres::{types::ToSql, NoTls},
     PostgresConnectionManager,
 };
+use secrets::Secret;
 use snafu::{prelude::*, ResultExt};
 
-use super::{DbConnectionPool, Mode, Result};
+use super::{DbConnectionPool, Result};
 use crate::dbconnection::{postgresconn::PostgresConnection, AsyncDbConnection, DbConnection};
 
 #[derive(Debug, Snafu)]
@@ -36,7 +37,10 @@ impl PostgresConnectionPool {
     /// # Errors
     ///
     /// Returns an error if there is a problem creating the connection pool.
-    pub async fn new(params: Arc<Option<HashMap<String, String>>>) -> Result<Self> {
+    pub async fn new(
+        params: Arc<Option<HashMap<String, String>>>,
+        secret: Option<Secret>,
+    ) -> Result<Self> {
         let mut host = "localhost";
         let mut user = "postgres";
         let mut dbname = "postgres";
@@ -52,7 +56,7 @@ impl PostgresConnectionPool {
             if let Some(pg_db) = params.get("pg_db") {
                 dbname = pg_db;
             }
-            if let Some(pg_pass) = params.get("pg_pass") {
+            if let Some(pg_pass) = get_pg_pass(params, secret) {
                 connection_string.push_str(format!("password={pg_pass} ").as_str());
             }
             if let Some(pg_port) = params.get("pg_port") {
@@ -75,6 +79,24 @@ impl PostgresConnectionPool {
     }
 }
 
+#[must_use]
+#[allow(clippy::implicit_hasher)]
+pub fn get_pg_pass(params: &HashMap<String, String>, secret: Option<Secret>) -> Option<String> {
+    if let Some(pg_pass_val) = params.get("pg_pass_key") {
+        if let Some(secrets) = secret {
+            if let Some(pg_pass_secret) = secrets.get(pg_pass_val) {
+                return Some(pg_pass_secret.to_string());
+            };
+        };
+    };
+
+    if let Some(pg_raw_pass) = params.get("pg_pass") {
+        return Some(pg_raw_pass.to_string());
+    };
+
+    None
+}
+
 #[async_trait]
 impl
     DbConnectionPool<
@@ -82,14 +104,6 @@ impl
         &'static (dyn ToSql + Sync),
     > for PostgresConnectionPool
 {
-    async fn new(
-        _name: &str,
-        _mode: Mode,
-        params: Arc<Option<HashMap<String, String>>>,
-    ) -> Result<Self> {
-        PostgresConnectionPool::new(params).await
-    }
-
     async fn connect(
         &self,
     ) -> Result<

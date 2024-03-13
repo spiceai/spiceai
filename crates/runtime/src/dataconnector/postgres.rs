@@ -16,8 +16,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::{collections::HashMap, future::Future};
 
-use crate::datafusion::read_pg_config;
-
 use super::DataConnector;
 use super::Result;
 use super::UnableToGetTableProviderSnafu;
@@ -49,7 +47,7 @@ impl DataConnector for Postgres {
                     > + Send
                     + Sync,
             > = Arc::new(
-                PostgresConnectionPool::new(read_pg_config(params, secret))
+                PostgresConnectionPool::new(params, secret)
                     .await
                     .context(UnableToGetTableProviderSnafu)?,
             );

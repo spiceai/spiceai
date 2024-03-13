@@ -414,28 +414,3 @@ impl Default for DataFusion {
         Self::new()
     }
 }
-
-// TODO: This is a temporary solution since we cannot import secret and define this function in connection pool due to cyclical dependency
-// Ideally we want separate crate for secret and define this function in connection pool
-#[must_use]
-#[allow(clippy::implicit_hasher)]
-pub fn read_pg_config(
-    params: Arc<Option<HashMap<String, String>>>,
-    secrets: Option<secrets::Secret>,
-) -> Arc<Option<HashMap<String, String>>> {
-    let Some(params_val) = params.as_ref() else {
-        return params;
-    };
-    let Some(secrets) = secrets else {
-        return params;
-    };
-    let Some(pg_pass_val) = params_val.get("pg_pass_key") else {
-        return params;
-    };
-    let Some(pg_pass_secret) = secrets.get(pg_pass_val) else {
-        return params;
-    };
-    let mut new_params = params_val.clone();
-    new_params.insert("pg_pass".to_string(), pg_pass_secret.to_string());
-    Arc::new(Some(new_params))
-}

@@ -1554,7 +1554,9 @@ dependencies = [
  "duckdb",
  "futures",
  "r2d2",
+ "secrets",
  "snafu 0.8.0",
+ "spicepod",
  "tracing",
  "tracing-subscriber",
 ]
@@ -4760,7 +4762,6 @@ dependencies = [
 name = "spicepod"
 version = "0.9.0-alpha"
 dependencies = [
- "db_connection_pool",
  "fundu",
  "serde",
  "serde_yaml",

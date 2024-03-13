@@ -100,16 +100,15 @@ impl DataPublisher for DuckDBBackend {
 
 impl DuckDBBackend {
     #[allow(clippy::needless_pass_by_value)]
-    pub async fn new(
+    pub fn new(
         ctx: Arc<SessionContext>,
         name: &str,
         mode: Mode,
         params: Arc<Option<HashMap<String, String>>>,
         primary_keys: Option<Vec<String>>,
     ) -> Result<Self> {
-        let pool = DuckDbConnectionPool::new(name, mode, params)
-            .await
-            .context(DbConnectionPoolSnafu)?;
+        let pool =
+            DuckDbConnectionPool::new(name, &mode, &params).context(DbConnectionPoolSnafu)?;
         Ok(DuckDBBackend {
             ctx,
             name: name.to_string(),
@@ -294,7 +293,6 @@ mod tests {
         let name = "test_add_data";
         let backend =
             DuckDBBackend::new(Arc::clone(&ctx), name, Mode::Memory, Arc::new(None), None)
-                .await
                 .expect("Unable to create DuckDBBackend");
 
         let schema = Arc::new(Schema::new(vec![

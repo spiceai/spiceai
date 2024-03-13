@@ -293,15 +293,6 @@ pub mod acceleration {
     }
 }
 
-impl From<acceleration::Mode> for db_connection_pool::Mode {
-    fn from(m: acceleration::Mode) -> Self {
-        match m {
-            acceleration::Mode::File => db_connection_pool::Mode::File,
-            acceleration::Mode::Memory => db_connection_pool::Mode::Memory,
-        }
-    }
-}
-
 pub mod replication {
     use serde::{Deserialize, Serialize};
 
