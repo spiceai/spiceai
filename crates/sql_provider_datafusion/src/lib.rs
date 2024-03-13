@@ -275,9 +275,7 @@ mod tests {
 
     use datafusion::execution::context::SessionContext;
     use db_connection_pool::dbconnection::duckdbconn::DuckDbConnection;
-    use db_connection_pool::{
-        duckdbpool::DuckDbConnectionPool, DbConnectionPool, Mode,
-    };
+    use db_connection_pool::{duckdbpool::DuckDbConnectionPool, DbConnectionPool, Mode};
     use duckdb::{DuckdbConnectionManager, ToSql};
     use tracing::{level_filters::LevelFilter, subscriber::DefaultGuard, Dispatch};
 
