@@ -4141,7 +4141,6 @@ dependencies = [
  "async-stream",
  "async-trait",
  "axum 0.7.4",
- "base64 0.22.0",
  "bb8",
  "bb8-postgres",
  "clap",
@@ -4153,7 +4152,6 @@ dependencies = [
  "futures",
  "futures-core",
  "indexmap 2.2.3",
- "keyring",
  "metrics",
  "ndarray",
  "ndarray-npy",
@@ -4162,7 +4160,7 @@ dependencies = [
  "r2d2",
  "regex",
  "reqwest",
- "secrecy",
+ "secrets",
  "serde",
  "serde_json",
  "snafu 0.8.0",
@@ -4439,6 +4437,24 @@ dependencies = [
  "serde",
  "sha2",
  "zbus",
+]
+
+[[package]]
+name = "secrets"
+version = "0.9.0-alpha"
+dependencies = [
+ "async-trait",
+ "base64 0.22.0",
+ "dirs",
+ "keyring",
+ "reqwest",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "snafu 0.8.0",
+ "spicepod",
+ "toml",
+ "tracing",
 ]
 
 [[package]]
