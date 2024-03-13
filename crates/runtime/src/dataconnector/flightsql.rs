@@ -45,16 +45,14 @@ impl DataConnector for FlightSQL {
 
             let mut client = FlightSqlServiceClient::new(flight_channel);
 
-            let secret = secret.ok_or_else(|| super::Error::UnableToCreateDataConnector {
-                source: "Missing required secrets".into(),
-            })?;
-
-            let _ = client
-                .handshake(
-                    secret.get("username").unwrap_or_default(),
-                    secret.get("password").unwrap_or_default(),
-                )
-                .await;
+            if let Some(s) = secret {
+                let _ = client
+                    .handshake(
+                        s.get("username").unwrap_or_default(),
+                        s.get("password").unwrap_or_default(),
+                    )
+                    .await;
+            };
 
             Ok(Self { client })
         })
