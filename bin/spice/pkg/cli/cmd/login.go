@@ -78,7 +78,7 @@ spice login
 		var appName string
 		spicepodBytes, err := os.ReadFile("spicepod.yaml")
 		if err == nil {
-			var spicePod api.Pod
+			var spicePod api.Spicepod
 			err = yaml.Unmarshal(spicepodBytes, &spicePod)
 			if err == nil {
 				if spicePod.Metadata != nil {
