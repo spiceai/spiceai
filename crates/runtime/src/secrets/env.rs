@@ -4,7 +4,7 @@ use async_trait::async_trait;
 
 use super::{Secret, SecretStore};
 
-const ENV_SECRET_PREFIX: &str = "SPICED_SECRET_";
+const ENV_SECRET_PREFIX: &str = "SPICE_SECRET_";
 
 #[allow(clippy::module_name_repetitions)]
 pub struct EnvSecretStore {
@@ -41,12 +41,12 @@ impl EnvSecretStore {
     }
 
     /// Load secrets from the environment.
-    /// It will search for environment variables formatted as `SPICED_SECRET_<SECRET-NAME>_<SECRET-KEY>` and add them to the secret store.
+    /// It will search for environment variables formatted as `SPICE_SECRET_<SECRET-NAME>_<SECRET-KEY>` and add them to the secret store.
     ///
     /// Example:
     /// ```shell
-    /// SPICED_SECRET_SPICEAI_MY_KEY_1=my_value_1
-    /// SPICED_SECRET_SPICEAI_MY_KEY_2=my_value_2
+    /// SPICE_SECRET_SPICEAI_MY_KEY_1=my_value_1
+    /// SPICE_SECRET_SPICEAI_MY_KEY_2=my_value_2
     /// ```
     /// will be compiled into
     /// ```json
