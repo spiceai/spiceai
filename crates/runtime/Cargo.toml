@@ -56,7 +56,7 @@ keyring = { version = "2.3.2", optional = true }
 secrecy = "0.8.0"
 
 [features]
-default = ["duckdb", "postgres"]
+default = ["duckdb", "postgres", "keyring-secret-store"]
 dev = []
 duckdb = ["dep:duckdb", "sql_provider_datafusion", "r2d2"]
 postgres = ["dep:bb8", "dep:bb8-postgres", "sql_provider_datafusion", "arrow_sql_gen"]
