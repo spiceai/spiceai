@@ -416,6 +416,8 @@ impl Default for DataFusion {
     }
 }
 
+// TODO: This is a temporary solution since we cannot import secret and define this function in connection pool due to cyclical dependency
+// Ideally we want separate crate for secret and define this function in connection pool
 #[must_use]
 #[allow(clippy::implicit_hasher)]
 pub fn read_pg_config(
