@@ -7,7 +7,7 @@ use flight_client::FlightClient;
 use flight_datafusion::FlightTable;
 use spicepod::component::dataset::Dataset;
 
-use crate::secrets::Secret;
+use secrets::Secret;
 
 use super::{flight::Flight, DataConnector};
 

@@ -11,11 +11,11 @@ use std::sync::Arc;
 use arrow::record_batch::RecordBatch;
 use async_stream::stream;
 use futures_core::stream::BoxStream;
+use secrets::Secret;
 use std::future::Future;
 
 use crate::datapublisher::DataPublisher;
 use crate::dataupdate::{DataUpdate, UpdateType};
-use crate::secrets::Secret;
 
 pub mod debug;
 pub mod dremio;

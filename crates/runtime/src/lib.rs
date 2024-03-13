@@ -31,7 +31,6 @@ pub mod modelruntime;
 pub mod modelsource;
 mod opentelemetry;
 pub mod podswatcher;
-pub mod secrets;
 pub mod timing;
 pub(crate) mod tracers;
 
@@ -86,9 +85,6 @@ pub enum Error {
         source: datafusion::Error,
         data_connector: String,
     },
-
-    #[snafu(display("Unable to load secrets for {store}"))]
-    UnableToLoadSecrets { store: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

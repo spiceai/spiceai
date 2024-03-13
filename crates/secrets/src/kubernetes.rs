@@ -137,6 +137,11 @@ impl KubernetesSecretStore {
         }
     }
 
+    /// Initializes the Kubernetes secret store.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if unable to read Kubernetes credentials.
     pub fn init(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         if let Err(_e) = self.kubernetes_client.init() {
             return Err(Box::new(Error::UnableToReadKubernetesCredentials {}));

@@ -1,3 +1,4 @@
+use arrow::array::RecordBatch;
 use async_trait::async_trait;
 use bb8_postgres::tokio_postgres::types::ToSql;
 use bb8_postgres::tokio_postgres::NoTls;
@@ -5,16 +6,15 @@ use bb8_postgres::PostgresConnectionManager;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
 use futures::TryStreamExt;
+use secrets::Secret;
 use snafu::prelude::*;
+use spicepod::component::dataset::Dataset;
 use sql_provider_datafusion::dbconnectionpool::postgrespool::PostgresConnectionPool;
 use sql_provider_datafusion::dbconnectionpool::DbConnectionPool;
 use sql_provider_datafusion::SqlTable;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::{collections::HashMap, future::Future};
-
-use arrow::array::RecordBatch;
-use spicepod::component::dataset::Dataset;
 
 use crate::datafusion::read_pg_config;
 use crate::secrets::Secret;

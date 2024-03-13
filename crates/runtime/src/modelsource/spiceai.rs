@@ -8,8 +8,8 @@ use std::io::Cursor;
 use std::string::ToString;
 use std::sync::Arc;
 
-use crate::secrets::Secret;
 use regex::Regex;
+use secrets::Secret;
 
 #[async_trait]
 impl ModelSource for SpiceAI {

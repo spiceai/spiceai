@@ -5,7 +5,7 @@ use keyring::Entry;
 
 use super::{Secret, SecretStore};
 
-const KEYRING_SECRET_PREFIX: &str = "spiced_secret_";
+const KEYRING_SECRET_PREFIX: &str = "spice_secret_";
 
 #[allow(clippy::module_name_repetitions)]
 pub struct KeyringSecretStore {}
