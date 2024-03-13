@@ -16,6 +16,7 @@ use std::{collections::HashMap, future::Future};
 use arrow::array::RecordBatch;
 use spicepod::component::dataset::Dataset;
 
+use crate::datafusion::read_pg_config;
 use crate::secrets::Secret;
 
 use super::DataConnector;
@@ -35,7 +36,7 @@ pub struct Postgres {
 #[async_trait]
 impl DataConnector for Postgres {
     fn new(
-        _secret: Option<Secret>,
+        secret: Option<Secret>,
         params: Arc<Option<HashMap<String, String>>>,
     ) -> Pin<Box<dyn Future<Output = Result<Self>> + Send>>
     where
@@ -49,7 +50,7 @@ impl DataConnector for Postgres {
                     > + Send
                     + Sync,
             > = Arc::new(
-                PostgresConnectionPool::new(params)
+                PostgresConnectionPool::new(read_pg_config(params, secret))
                     .await
                     .context(UnableToGetTableProviderSnafu)?,
             );

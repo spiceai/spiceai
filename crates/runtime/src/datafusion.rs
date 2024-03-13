@@ -145,8 +145,7 @@ impl DataFusion {
             DataBackendBuilder::new(Arc::clone(&self.ctx), table_name)
                 .engine(acceleration.engine())
                 .mode(acceleration.mode())
-                .params(params)
-                .secret(backend_secret)
+                .params(read_pg_config(params, backend_secret))
                 .build()
                 .await
                 .context(DatasetConfigurationSnafu)?;
@@ -414,4 +413,27 @@ impl Default for DataFusion {
     fn default() -> Self {
         Self::new()
     }
+}
+
+#[must_use]
+#[allow(clippy::implicit_hasher)]
+pub fn read_pg_config(
+    params: Arc<Option<HashMap<String, String>>>,
+    secrets: Option<secrets::Secret>,
+) -> Arc<Option<HashMap<String, String>>> {
+    let Some(params_val) = params.as_ref() else {
+        return params;
+    };
+    let Some(secrets) = secrets else {
+        return params;
+    };
+    let Some(pg_pass_val) = params_val.get("pg_pass_key") else {
+        return params;
+    };
+    let Some(pg_pass_secret) = secrets.get(pg_pass_val) else {
+        return params;
+    };
+    let mut new_params = params_val.clone();
+    new_params.insert("pg_pass".to_string(), pg_pass_secret.to_string());
+    Arc::new(Some(new_params))
 }
