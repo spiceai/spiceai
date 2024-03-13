@@ -1542,6 +1542,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "db_connection_pool"
+version = "0.9.0-alpha"
+dependencies = [
+ "arrow",
+ "arrow_sql_gen",
+ "async-trait",
+ "bb8",
+ "bb8-postgres",
+ "datafusion",
+ "duckdb",
+ "futures",
+ "r2d2",
+ "snafu 0.8.0",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "deranged"
 version = "0.3.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4145,6 +4163,7 @@ dependencies = [
  "bb8-postgres",
  "clap",
  "datafusion",
+ "db_connection_pool",
  "dirs",
  "duckdb",
  "flight_client",
@@ -4741,11 +4760,11 @@ dependencies = [
 name = "spicepod"
 version = "0.9.0-alpha"
 dependencies = [
+ "db_connection_pool",
  "fundu",
  "serde",
  "serde_yaml",
  "snafu 0.8.0",
- "sql_provider_datafusion",
  "tracing",
 ]
 
@@ -4759,13 +4778,9 @@ checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
 name = "sql_provider_datafusion"
 version = "0.9.0-alpha"
 dependencies = [
- "arrow",
- "arrow_sql_gen",
- "async-stream",
  "async-trait",
- "bb8",
- "bb8-postgres",
  "datafusion",
+ "db_connection_pool",
  "duckdb",
  "futures",
  "r2d2",

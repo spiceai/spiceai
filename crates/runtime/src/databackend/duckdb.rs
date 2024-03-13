@@ -7,14 +7,15 @@ use std::{
 
 use arrow::record_batch::RecordBatch;
 use datafusion::{execution::context::SessionContext, sql::TableReference};
+use db_connection_pool::{
+    dbconnection::{self, duckdbconn::DuckDbConnection, SyncDbConnection},
+    duckdbpool::DuckDbConnectionPool,
+    DbConnectionPool, Mode,
+};
 use duckdb::{vtab::arrow::arrow_recordbatch_to_query_params, DuckdbConnectionManager, ToSql};
 use snafu::{prelude::*, ResultExt};
 use spicepod::component::dataset::Dataset;
-use sql_provider_datafusion::{
-    dbconnection::{self, duckdbconn::DuckDbConnection, SyncDbConnection},
-    dbconnectionpool::{duckdbpool::DuckDbConnectionPool, DbConnectionPool, Mode},
-    SqlTable,
-};
+use sql_provider_datafusion::SqlTable;
 
 use crate::{
     datapublisher::{AddDataResult, DataPublisher},
@@ -25,13 +26,11 @@ use crate::{
 pub enum Error {
     #[snafu(display("DbConnectionError: {source}"))]
     DbConnectionError {
-        source: sql_provider_datafusion::dbconnection::GenericError,
+        source: db_connection_pool::dbconnection::GenericError,
     },
 
     #[snafu(display("DbConnectionPoolError: {source}"))]
-    DbConnectionPoolError {
-        source: sql_provider_datafusion::dbconnectionpool::Error,
-    },
+    DbConnectionPoolError { source: db_connection_pool::Error },
 
     #[snafu(display("DuckDBError: {source}"))]
     DuckDB { source: duckdb::Error },

@@ -1,5 +1,5 @@
 [package]
-name = "sql_provider_datafusion"
+name = "db_connection_pool"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,18 +8,18 @@ homepage.workspace = true
 repository.workspace = true
 exclude.workspace = true
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [dependencies]
 duckdb = { workspace = true,  features = ["bundled", "r2d2", "vtab", "vtab-arrow"] }
 datafusion.workspace = true
 async-trait.workspace = true
 r2d2.workspace = true
 snafu.workspace = true
-tokio.workspace = true
 tracing.workspace = true
 futures.workspace = true
-db_connection_pool = { path = "../db_connection_pool" }
+bb8.workspace = true
+bb8-postgres.workspace = true
+arrow_sql_gen = { path = "../arrow_sql_gen" }
+arrow.workspace = true
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }

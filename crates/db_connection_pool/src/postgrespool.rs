@@ -31,6 +31,11 @@ pub struct PostgresConnectionPool {
 }
 
 impl PostgresConnectionPool {
+    /// Creates a new instance of `PostgresConnectionPool`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if there is a problem creating the connection pool.
     pub async fn new(_params: Arc<Option<HashMap<String, String>>>) -> Result<Self> {
         let connection_string = "host=localhost user=postgres password=postgres dbname=postgres";
 

@@ -52,6 +52,7 @@ arrow_sql_gen = { path = "../arrow_sql_gen", optional = true }
 bb8 = {workspace = true, optional = true}
 bb8-postgres = {workspace = true, optional = true}
 secrets = { path = "../secrets" }
+db_connection_pool = { path = "../db_connection_pool" }
 
 [features]
 default = ["duckdb", "postgres", "keyring-secret-store"]

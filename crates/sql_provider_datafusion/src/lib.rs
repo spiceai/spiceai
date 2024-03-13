@@ -1,8 +1,8 @@
 #![allow(clippy::missing_errors_doc)]
 
 use async_trait::async_trait;
-use dbconnection::{get_schema, query_arrow};
-use dbconnectionpool::DbConnectionPool;
+use db_connection_pool::dbconnection::{get_schema, query_arrow};
+use db_connection_pool::DbConnectionPool;
 use futures::TryStreamExt;
 use snafu::prelude::*;
 use std::{any::Any, fmt, sync::Arc};
@@ -20,17 +20,17 @@ use datafusion::{
     },
 };
 
-pub mod dbconnection;
-pub mod dbconnectionpool;
 pub mod expr;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Unable to get a DB connection from the pool: {source}"))]
-    UnableToGetConnectionFromPool { source: dbconnectionpool::Error },
+    UnableToGetConnectionFromPool { source: db_connection_pool::Error },
 
     #[snafu(display("Unable to get schema: {source}"))]
-    UnableToGetSchema { source: dbconnection::Error },
+    UnableToGetSchema {
+        source: db_connection_pool::dbconnection::Error,
+    },
 
     #[snafu(display("Unable to generate SQL: {source}"))]
     UnableToGenerateSQL { source: expr::Error },
@@ -274,14 +274,12 @@ mod tests {
     use std::{error::Error, sync::Arc};
 
     use datafusion::execution::context::SessionContext;
+    use db_connection_pool::dbconnection::duckdbconn::DuckDbConnection;
+    use db_connection_pool::{duckdbpool::DuckDbConnectionPool, DbConnectionPool, Mode};
     use duckdb::{DuckdbConnectionManager, ToSql};
     use tracing::{level_filters::LevelFilter, subscriber::DefaultGuard, Dispatch};
 
-    use crate::{
-        dbconnection::duckdbconn::DuckDbConnection,
-        dbconnectionpool::{duckdbpool::DuckDbConnectionPool, DbConnectionPool, Mode},
-        SqlTable,
-    };
+    use crate::SqlTable;
 
     fn setup_tracing() -> DefaultGuard {
         let subscriber: tracing_subscriber::FmtSubscriber = tracing_subscriber::fmt()
