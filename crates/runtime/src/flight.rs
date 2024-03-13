@@ -1,6 +1,6 @@
 use crate::datafusion::DataFusion;
 use crate::dataupdate::{DataUpdate, UpdateType};
-use arrow::datatypes::{Schema, SchemaRef};
+use arrow::datatypes::Schema;
 use arrow::ipc::writer::{DictionaryTracker, IpcDataGenerator};
 use arrow_flight::{sql, Action, IpcMessage};
 use arrow_ipc::convert::try_schema_from_flatbuffer_bytes;
