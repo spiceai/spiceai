@@ -17,7 +17,6 @@ use std::sync::Arc;
 use std::{collections::HashMap, future::Future};
 
 use crate::datafusion::read_pg_config;
-use crate::secrets::Secret;
 
 use super::DataConnector;
 use super::Result;

@@ -1,11 +1,11 @@
 use crate::datapublisher::DataPublisher;
 use datafusion::execution::context::SessionContext;
+use secrets::Secret;
 use snafu::prelude::*;
 use spicepod::component::dataset::acceleration::{Engine, Mode};
 use std::{collections::HashMap, sync::Arc};
 
 use self::{duckdb::DuckDBBackend, memtable::MemTableBackend};
-use crate::secrets::Secret;
 
 #[cfg(feature = "duckdb")]
 pub mod duckdb;

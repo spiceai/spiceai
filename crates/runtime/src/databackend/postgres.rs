@@ -7,6 +7,7 @@ use bb8_postgres::{
     PostgresConnectionManager,
 };
 use datafusion::{execution::context::SessionContext, sql::TableReference};
+use secrets::Secret;
 use snafu::{prelude::*, ResultExt};
 use spicepod::component::dataset::Dataset;
 use sql_provider_datafusion::{
@@ -20,7 +21,6 @@ use crate::{
     datafusion::read_pg_config,
     datapublisher::{AddDataResult, DataPublisher},
     dataupdate::{DataUpdate, UpdateType},
-    secrets::Secret,
 };
 
 #[derive(Debug, Snafu)]
