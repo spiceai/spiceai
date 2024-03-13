@@ -1,7 +1,7 @@
-use crate::auth::AuthProvider;
 use crate::modelruntime::ModelRuntime;
 use crate::modelruntime::Runnable;
 use crate::modelsource::create_source_from;
+use crate::secrets::Secret;
 use crate::DataFusion;
 use arrow::record_batch::RecordBatch;
 use snafu::prelude::*;
@@ -32,15 +32,27 @@ pub enum Error {
 
     #[snafu(display("Unable to run model: {source}"))]
     UnableToRunModel { source: crate::modelruntime::Error },
+
+    #[snafu(display("Unable to load required secrets"))]
+    UnableToLoadRequiredSecrets {},
 }
 
 impl Model {
     pub async fn load(
-        model: &spicepod::component::model::Model,
-        auth: AuthProvider,
+        model: spicepod::component::model::Model,
+        secret: Option<Secret>,
     ) -> Result<Self> {
         let source = source(&model.from);
         let source = source.as_str();
+
+        let Some(secret) = secret else {
+            tracing::warn!(
+                "Unable to load model {}: unable to get secret for source {}",
+                model.name,
+                source
+            );
+            return UnableToLoadRequiredSecretsSnafu {}.fail();
+        };
 
         let mut params = std::collections::HashMap::new();
         params.insert("name".to_string(), model.name.to_string());
@@ -49,7 +61,7 @@ impl Model {
         let tract = crate::modelruntime::tract::Tract {
             path: create_source_from(source)
                 .context(UnknownModelSourceSnafu)?
-                .pull(auth, Arc::new(Option::from(params)))
+                .pull(secret, Arc::new(Option::from(params)))
                 .await
                 .context(UnableToLoadModelSnafu)?
                 .clone()

@@ -13,4 +13,10 @@ exclude.workspace = true
 [dependencies]
 tracing.workspace = true
 arrow.workspace = true
-sea-query = "0.30.7"
+sea-query = {version = "0.30.7" , features = ["with-rust_decimal", "with-bigdecimal", "with-time"]}
+snafu.workspace = true
+tokio-postgres = "0.7.10"
+bigdecimal_0_3_0 = { package = "bigdecimal", version = "0.3.0"}
+time = "0.3.34"
+bigdecimal = "0.4.3"
+tokio.workspace = true

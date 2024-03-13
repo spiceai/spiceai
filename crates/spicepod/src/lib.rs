@@ -6,6 +6,7 @@ use std::{fmt::Debug, path::PathBuf};
 
 use component::dataset::Dataset;
 use component::model::Model;
+use component::secrets::Secrets;
 use spec::SpicepodDefinition;
 
 pub mod component;
@@ -30,6 +31,8 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Debug, PartialEq)]
 pub struct Spicepod {
     pub name: String,
+
+    pub secrets: Secrets,
 
     pub datasets: Vec<Dataset>,
 
@@ -110,6 +113,7 @@ fn from_definition(
 ) -> Spicepod {
     Spicepod {
         name: spicepod_definition.name,
+        secrets: spicepod_definition.secrets,
         datasets,
         models,
         dependencies: spicepod_definition.dependencies,

@@ -1,4 +1,5 @@
 use std::{
+    cmp,
     collections::HashMap,
     fmt, mem,
     sync::{Arc, PoisonError},
@@ -10,7 +11,7 @@ use duckdb::{vtab::arrow::arrow_recordbatch_to_query_params, DuckdbConnectionMan
 use snafu::{prelude::*, ResultExt};
 use spicepod::component::dataset::Dataset;
 use sql_provider_datafusion::{
-    dbconnection::{self, duckdbconn::DuckDbConnection, DbConnection},
+    dbconnection::{self, duckdbconn::DuckDbConnection, SyncDbConnection},
     dbconnectionpool::{duckdbpool::DuckDbConnectionPool, DbConnectionPool, Mode},
     SqlTable,
 };
@@ -24,7 +25,7 @@ use crate::{
 pub enum Error {
     #[snafu(display("DbConnectionError: {source}"))]
     DbConnectionError {
-        source: sql_provider_datafusion::dbconnection::Error,
+        source: sql_provider_datafusion::dbconnection::GenericError,
     },
 
     #[snafu(display("DbConnectionPoolError: {source}"))]
@@ -71,7 +72,7 @@ impl DataPublisher for DuckDBBackend {
         let pool = Arc::clone(&self.pool);
         let name = self.name.clone();
         Box::pin(async move {
-            let mut conn = pool.connect().context(DbConnectionPoolSnafu)?;
+            let mut conn = pool.connect().await.context(DbConnectionPoolSnafu)?;
             let Some(conn) = conn.as_any_mut().downcast_mut::<DuckDbConnection>() else {
                 return Err(
                     Box::new(Error::UnableToDowncastDbConnection {}) as Box<dyn std::error::Error>
@@ -88,7 +89,7 @@ impl DataPublisher for DuckDBBackend {
 
             duckdb_update.update()?;
 
-            self.initialize_datafusion()?;
+            self.initialize_datafusion().await?;
             Ok(())
         })
     }
@@ -100,14 +101,16 @@ impl DataPublisher for DuckDBBackend {
 
 impl DuckDBBackend {
     #[allow(clippy::needless_pass_by_value)]
-    pub fn new(
+    pub async fn new(
         ctx: Arc<SessionContext>,
         name: &str,
         mode: Mode,
         params: Arc<Option<HashMap<String, String>>>,
         primary_keys: Option<Vec<String>>,
     ) -> Result<Self> {
-        let pool = DuckDbConnectionPool::new(name, mode, params).context(DbConnectionPoolSnafu)?;
+        let pool = DuckDbConnectionPool::new(name, mode, params)
+            .await
+            .context(DbConnectionPoolSnafu)?;
         Ok(DuckDBBackend {
             ctx,
             name: name.to_string(),
@@ -117,7 +120,7 @@ impl DuckDBBackend {
         })
     }
 
-    fn initialize_datafusion(&self) -> Result<()> {
+    async fn initialize_datafusion(&self) -> Result<()> {
         let table_exists = self
             .ctx
             .table_exist(TableReference::bare(self.name.clone()))
@@ -127,6 +130,7 @@ impl DuckDBBackend {
         }
 
         let table = match SqlTable::new(&self.pool, TableReference::bare(self.name.clone()))
+            .await
             .context(DuckDBDataFusionSnafu)
         {
             Ok(table) => table,
@@ -162,7 +166,7 @@ impl<'a> DuckDBUpdate<'a> {
 
         let data = mem::take(&mut self.data);
         for batch in data {
-            self.insert_batch(batch)?;
+            self.insert_batch(&batch)?;
         }
 
         tracing::trace!("Processed update to DuckDB table {name}", name = self.name,);
@@ -170,20 +174,22 @@ impl<'a> DuckDBUpdate<'a> {
         Ok(())
     }
 
-    fn insert_batch(&mut self, batch: RecordBatch) -> Result<()> {
-        let params = arrow_recordbatch_to_query_params(batch);
+    fn insert_batch(&mut self, batch: &RecordBatch) -> Result<()> {
         let sql = format!(
             r#"INSERT INTO "{name}" SELECT * FROM arrow(?, ?)"#,
             name = self.name
         );
         tracing::trace!("{sql}");
 
-        self.duckdb_conn
-            .execute(
-                &sql,
-                &params.iter().map(|p| p as &dyn ToSql).collect::<Vec<_>>(),
-            )
-            .context(DbConnectionSnafu)?;
+        for sliced in Self::split_batch(batch) {
+            let params = arrow_recordbatch_to_query_params(sliced);
+            self.duckdb_conn
+                .execute(
+                    &sql,
+                    &params.iter().map(|p| p as &dyn ToSql).collect::<Vec<_>>(),
+                )
+                .context(DbConnectionSnafu)?;
+        }
 
         Ok(())
     }
@@ -207,6 +213,15 @@ impl<'a> DuckDBUpdate<'a> {
             return Ok(());
         };
 
+        let mut batches = Self::split_batch(&batch);
+        let Some(batch) = batches.pop() else {
+            return Ok(());
+        };
+
+        for b in batches {
+            self.data.push(b);
+        }
+
         let arrow_params = arrow_recordbatch_to_query_params(batch);
         let sql = format!(
             r#"CREATE TABLE "{name}" AS SELECT * FROM arrow(?, ?)"#,
@@ -225,6 +240,19 @@ impl<'a> DuckDBUpdate<'a> {
             .context(DbConnectionSnafu)?;
 
         Ok(())
+    }
+
+    const MAX_BATCH_SIZE: usize = 2048;
+
+    fn split_batch(batch: &RecordBatch) -> Vec<RecordBatch> {
+        let mut result = vec![];
+        (0..=batch.num_rows())
+            .step_by(Self::MAX_BATCH_SIZE)
+            .for_each(|offset| {
+                let length = cmp::min(Self::MAX_BATCH_SIZE, batch.num_rows() - offset);
+                result.push(batch.slice(offset, length));
+            });
+        result
     }
 
     fn table_exists(&self) -> bool {
@@ -267,6 +295,7 @@ mod tests {
         let name = "test_add_data";
         let backend =
             DuckDBBackend::new(Arc::clone(&ctx), name, Mode::Memory, Arc::new(None), None)
+                .await
                 .expect("Unable to create DuckDBBackend");
 
         let schema = Arc::new(Schema::new(vec![
@@ -276,8 +305,8 @@ mod tests {
         let data = if let Ok(batch) = RecordBatch::try_new(
             schema,
             vec![
-                Arc::new(StringArray::from(vec!["a", "b", "c", "d"])),
-                Arc::new(Int32Array::from(vec![1, 10, 10, 100])),
+                Arc::new(StringArray::from(vec!["a"; 1_000_000])),
+                Arc::new(Int32Array::from(vec![1; 1_000_000])),
             ],
         ) {
             vec![batch]

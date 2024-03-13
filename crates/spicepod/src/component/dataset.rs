@@ -191,6 +191,8 @@ impl WithDependsOn<Dataset> for Dataset {
 }
 
 pub mod acceleration {
+    use std::fmt;
+
     use serde::{Deserialize, Serialize};
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -215,8 +217,23 @@ pub mod acceleration {
         Arrow,
         #[cfg(feature = "duckdb")]
         DuckDB,
+        #[cfg(feature = "postgres")]
+        Postgres,
     }
 
+    impl fmt::Display for Engine {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(
+                f,
+                "{}",
+                match *self {
+                    Engine::Arrow => "arrow",
+                    Engine::DuckDB => "duckdb",
+                    Engine::Postgres => "postgres",
+                }
+            )
+        }
+    }
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
     pub struct Acceleration {
         #[serde(default)]

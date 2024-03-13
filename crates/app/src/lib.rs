@@ -3,11 +3,16 @@
 use std::path::PathBuf;
 
 use snafu::prelude::*;
-use spicepod::{component::dataset::Dataset, component::model::Model, Spicepod};
+use spicepod::{
+    component::{dataset::Dataset, model::Model, secrets::Secrets},
+    Spicepod,
+};
 
 #[derive(Debug, PartialEq)]
 pub struct App {
     pub name: String,
+
+    pub secrets: Secrets,
 
     pub datasets: Vec<Dataset>,
 
@@ -33,6 +38,7 @@ impl App {
         let path = path.into();
         let spicepod_root =
             Spicepod::load(&path).context(UnableToLoadSpicepodSnafu { path: path.clone() })?;
+        let secrets = spicepod_root.secrets.clone();
         let mut datasets: Vec<Dataset> = vec![];
         let mut models: Vec<Model> = vec![];
         for dataset in &spicepod_root.datasets {
@@ -65,6 +71,7 @@ impl App {
 
         Ok(App {
             name: root_spicepod_name,
+            secrets,
             datasets,
             models,
             spicepods,

@@ -13,14 +13,15 @@ use async_stream::stream;
 use futures_core::stream::BoxStream;
 use std::future::Future;
 
-use crate::auth::AuthProvider;
 use crate::datapublisher::DataPublisher;
 use crate::dataupdate::{DataUpdate, UpdateType};
+use crate::secrets::Secret;
 
 pub mod databricks;
 pub mod debug;
 pub mod dremio;
 pub mod flight;
+pub mod postgres;
 pub mod spiceai;
 
 #[derive(Debug, Snafu)]
@@ -53,9 +54,9 @@ pub type AnyErrorResult = std::result::Result<(), Box<dyn std::error::Error>>;
 /// ```
 #[async_trait]
 pub trait DataConnector: Send + Sync {
-    /// Create a new `DataConnector` with the given `AuthProvider`.
+    /// Create a new `DataConnector` with the given `Secret`.
     fn new(
-        auth_provider: AuthProvider,
+        secret: Option<Secret>,
         params: Arc<Option<HashMap<String, String>>>,
     ) -> Pin<Box<dyn Future<Output = Result<Self>> + Send>>
     where

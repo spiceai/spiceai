@@ -86,9 +86,7 @@ impl DataFusion {
         let mut df_config = SessionConfig::new().with_information_schema(true);
         df_config.options_mut().sql_parser.dialect = "PostgreSQL".to_string();
         DataFusion {
-            ctx: Arc::new(SessionContext::new_with_config(
-                SessionConfig::new().with_information_schema(true),
-            )),
+            ctx: Arc::new(SessionContext::new_with_config(df_config)),
             connectors_tasks: HashMap::new(),
             data_publishers: HashMap::new(),
         }
@@ -121,7 +119,7 @@ impl DataFusion {
     }
 
     #[allow(clippy::needless_pass_by_value)]
-    pub fn new_accelerated_backend(
+    pub async fn new_accelerated_backend(
         &self,
         dataset: impl Borrow<Dataset>,
     ) -> Result<Box<dyn DataPublisher>> {
@@ -143,6 +141,7 @@ impl DataFusion {
                 .mode(acceleration.mode())
                 .params(params)
                 .build()
+                .await
                 .context(DatasetConfigurationSnafu)?;
 
         Ok(data_backend)

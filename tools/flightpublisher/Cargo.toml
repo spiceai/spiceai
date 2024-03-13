@@ -14,7 +14,7 @@ arrow-flight.workspace = true
 parquet = "50.0.0"
 clap = { workspace = true, features = ["derive"] }
 tokio.workspace = true
-tonic = { workspace = true, default-features = false, features = [
+tonic = { workspace = true, features = [
   "transport",
   "tls",
   "tls-roots",

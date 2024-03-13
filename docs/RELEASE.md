@@ -12,8 +12,16 @@
 Create an endgame issue with the following content:
 
 ```markdown
+
+Endgame DRI <username>
+QA DRI <username>
+Docs DRI <username>
+
+Release date <release date, US time>
+
 # Endgame for v{version}
 - [ ] Ensure `version.txt` is updated to the next planned version number.
+- [ ] Ensure [workspace.package] `version` in Cargo.toml is updated to the next planned version number.
 - [ ] Ensure all outstanding `spiceai` feature PRs are merged
 - [ ] Full test pass and update if necessary over README.md (please get screenshots!)
 - [ ] Full test pass and update if necessary over Docs (please get screenshots!)
@@ -26,6 +34,8 @@ Create an endgame issue with the following content:
 - [ ] Merge release notes
 - [ ] Update acknowledgements
 - [ ] Update version using documented process at [docs/RELEASE.md](https://github.com/spiceai/spiceai/blob/trunk/docs/RELEASE.md#version-update)
+- [ ] QA DRI sign-off
+- [ ] Docs DRI sign-off
 - [ ] Create a new branch `release-v[semver]` from the commit to release.
 - [ ] Release the new version by creating a draft release with the tag from the release branch.
 - [ ] Release any docs updates by creating a `v[semver]` tag.
@@ -33,6 +43,7 @@ Create an endgame issue with the following content:
 - [ ] Discord announcement to [#announcements](https://discord.gg/zv8ahzZVpf)
 - [ ] For major releases, [blog.spiceai.org](https://blog.spiceai.org) announcement
 - [ ] Update `version.txt` to the next release version.
+- [ ] Update [workspace.package] `version` to the next release version in Cargo.toml.
 
 ## PR reference:
 ```
