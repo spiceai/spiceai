@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 
 use super::ModelSource;
-use crate::auth::AuthProvider;
+use secrets::Secret;
 use std::collections::HashMap;
 use std::string::ToString;
 use std::sync::Arc;
@@ -11,7 +11,7 @@ pub struct Local {}
 impl ModelSource for Local {
     async fn pull(
         &self,
-        _: AuthProvider,
+        _: Secret,
         params: Arc<Option<HashMap<String, String>>>,
     ) -> super::Result<String> {
         let name = params

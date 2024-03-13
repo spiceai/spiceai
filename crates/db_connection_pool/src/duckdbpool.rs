@@ -1,10 +1,11 @@
 use std::{collections::HashMap, sync::Arc};
 
+use async_trait::async_trait;
 use duckdb::{vtab::arrow::ArrowVTab, DuckdbConnectionManager, ToSql};
 use snafu::{prelude::*, ResultExt};
 
 use super::{DbConnectionPool, Mode, Result};
-use crate::dbconnection::{duckdbconn::DuckDbConnection, DbConnection};
+use crate::dbconnection::{duckdbconn::DuckDbConnection, DbConnection, SyncDbConnection};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -19,14 +20,28 @@ pub struct DuckDbConnectionPool {
     pool: Arc<r2d2::Pool<DuckdbConnectionManager>>,
 }
 
-impl DbConnectionPool<r2d2::PooledConnection<DuckdbConnectionManager>, &'static dyn ToSql>
-    for DuckDbConnectionPool
-{
-    fn new(name: &str, mode: Mode, params: Arc<Option<HashMap<String, String>>>) -> Result<Self> {
+impl DuckDbConnectionPool {
+    /// Create a new `DuckDbConnectionPool`.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - The name of the `DuckDB` database.
+    /// * `mode` - The `Mode` that `DuckDB` should run in.
+    /// * `params` - Additional parameters for the connection pool.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if there is a problem creating the connection pool.
+    pub fn new(
+        name: &str,
+        mode: &Mode,
+        params: &Arc<Option<HashMap<String, String>>>,
+    ) -> Result<Self> {
         let manager = match mode {
             Mode::Memory => DuckdbConnectionManager::memory().context(DuckDBSnafu)?,
-            Mode::File => DuckdbConnectionManager::file(get_duckdb_file(name, &params))
-                .context(DuckDBSnafu)?,
+            Mode::File => {
+                DuckdbConnectionManager::file(get_duckdb_file(name, params)).context(DuckDBSnafu)?
+            }
         };
 
         let pool = Arc::new(r2d2::Pool::new(manager).context(ConnectionPoolSnafu)?);
@@ -37,8 +52,13 @@ impl DbConnectionPool<r2d2::PooledConnection<DuckdbConnectionManager>, &'static 
 
         Ok(DuckDbConnectionPool { pool })
     }
+}
 
-    fn connect(
+#[async_trait]
+impl DbConnectionPool<r2d2::PooledConnection<DuckdbConnectionManager>, &'static dyn ToSql>
+    for DuckDbConnectionPool
+{
+    async fn connect(
         &self,
     ) -> Result<
         Box<dyn DbConnection<r2d2::PooledConnection<DuckdbConnectionManager>, &'static dyn ToSql>>,

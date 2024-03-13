@@ -1,5 +1,5 @@
-use crate::auth::AuthProvider;
 use async_trait::async_trait;
+use secrets::Secret;
 use snafu::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -43,7 +43,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub trait ModelSource {
     async fn pull(
         &self,
-        auth_provider: AuthProvider,
+        secret: Secret,
         params: Arc<Option<HashMap<String, String>>>,
     ) -> Result<String>;
 }

@@ -2,9 +2,12 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
 
+use async_trait::async_trait;
 use dirs;
 use serde::Deserialize;
 use snafu::prelude::*;
+
+use super::{Secret, SecretStore};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -21,11 +24,7 @@ pub enum Error {
     UnableToParseAuthFile { source: toml::de::Error },
 }
 
-#[allow(clippy::module_name_repetitions)]
-#[derive(Default)]
-pub struct AuthProviders {
-    pub auth_configs: AuthConfigs,
-}
+pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[allow(clippy::module_name_repetitions)]
 pub type AuthConfigs = HashMap<String, AuthConfig>;
@@ -36,23 +35,33 @@ pub struct AuthConfig {
     pub params: HashMap<String, String>,
 }
 
-pub type Result<T, E = Error> = std::result::Result<T, E>;
+#[allow(clippy::module_name_repetitions)]
+pub struct FileSecretStore {
+    secrets: HashMap<String, Secret>,
+}
 
-impl AuthProviders {
+impl FileSecretStore {
     #[must_use]
-    pub fn get(&self, name: &str) -> AuthProvider {
-        let auth = if let Some(auth) = self.auth_configs.get(name) {
-            tracing::trace!("Using auth provider: {}", name);
-            auth
-        } else {
-            tracing::trace!("No auth provider found for {}", name);
-            return AuthProvider::new(AuthConfig::default());
-        };
-
-        AuthProvider::new(auth.clone())
+    pub fn new() -> Self {
+        Self {
+            secrets: HashMap::new(),
+        }
     }
+}
 
-    pub fn parse_from_config(&mut self) -> Result<()> {
+impl Default for FileSecretStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FileSecretStore {
+    /// Loads the secrets.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if there is a problem loading the secrets.
+    pub fn load_secrets(&mut self) -> Result<()> {
         let mut auth_path = dirs::home_dir().context(UnableToFindHomeDirSnafu)?;
         auth_path.push(".spice/auth");
 
@@ -62,31 +71,26 @@ impl AuthProviders {
             .read_to_string(&mut auth_contents)
             .context(UnableToReadAuthFileSnafu)?;
 
-        self.auth_configs =
+        let auth_configs =
             toml::from_str::<AuthConfigs>(&auth_contents).context(UnableToParseAuthFileSnafu)?;
+
+        self.secrets = auth_configs
+            .iter()
+            .map(|(k, v)| (k.clone(), Secret::new(v.params.clone())))
+            .collect();
+
         Ok(())
     }
 }
 
-#[allow(clippy::module_name_repetitions)]
-pub struct AuthProvider {
-    pub auth_config: AuthConfig,
-}
-
-impl AuthProvider {
+#[async_trait]
+impl SecretStore for FileSecretStore {
     #[must_use]
-    pub fn new(auth_config: AuthConfig) -> Self
-    where
-        Self: Sized,
-    {
-        AuthProvider { auth_config }
-    }
+    async fn get_secret(&self, secret_name: &str) -> Option<Secret> {
+        if let Some(secret) = self.secrets.get(secret_name) {
+            return Some(secret.clone());
+        }
 
-    #[must_use]
-    pub fn get_param(&self, param: &str) -> Option<&str> {
-        self.auth_config
-            .params
-            .get(&param.to_string())
-            .map(String::as_str)
+        None
     }
 }

@@ -25,3 +25,4 @@ object_store = { version = "0.9.0", features = ["aws"] }
 [features]
 release = []
 dev = ["runtime/dev"]
+keyring-secret-store = ["runtime/keyring-secret-store"]

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"path"
 	"strings"
 	"time"
 
@@ -27,28 +28,50 @@ spice dataset configure
 # See more at: https://docs.spiceai.org/
 `,
 	Run: func(cmd *cobra.Command, args []string) {
+		if fi, err := os.Stat("spicepod.yaml"); os.IsNotExist(err) || fi.IsDir() {
+			cmd.Println(aurora.BrightRed("No spicepod.yaml found. Run spice init <app> first."))
+			os.Exit(1)
+		}
+
 		reader := bufio.NewReader(os.Stdin)
 
-		cmd.Print("What is the dataset name? ")
+		cwd, err := os.Getwd()
+		if err != nil {
+			cmd.Println(err)
+			os.Exit(1)
+		}
+
+		defaultDatasetName := path.Base(cwd)
+		cmd.Printf("dataset name: (%s) ", defaultDatasetName)
 		datasetName, err := reader.ReadString('\n')
 		if err != nil {
 			cmd.Println(err.Error())
 			os.Exit(1)
 		}
 		datasetName = strings.TrimSuffix(datasetName, "\n")
+		if datasetName == "" {
+			datasetName = defaultDatasetName
+		}
 
-		cmd.Print("\nWhere is your dataset located? ")
-		datasetLocation, err := reader.ReadString('\n')
+		cmd.Print("description: ")
+		description, err := reader.ReadString('\n')
 		if err != nil {
 			cmd.Println(err.Error())
 			os.Exit(1)
 		}
-		datasetLocation = strings.TrimSuffix(datasetLocation, "\n")
+		description = strings.TrimSuffix(description, "\n")
+
+		cmd.Print("from: ")
+		from, err := reader.ReadString('\n')
+		if err != nil {
+			cmd.Println(err.Error())
+			os.Exit(1)
+		}
+		from = strings.TrimSuffix(from, "\n")
 
 		params := map[string]string{}
-		if strings.Split(datasetLocation, ":")[0] == api.DATA_SOURCE_DREMIO {
-
-			cmd.Print("\nWhat is your dremio endpoint? ")
+		if strings.Split(from, ":")[0] == api.DATA_SOURCE_DREMIO {
+			cmd.Print("endpoint: ")
 			endpoint, err := reader.ReadString('\n')
 			if err != nil {
 				cmd.Println(err.Error())
@@ -59,25 +82,28 @@ spice dataset configure
 			params["endpoint"] = endpoint
 		}
 
-		cmd.Print("\nLocally accelerate this dataset (y/n)? ")
-		accelerateDatasetString, err := reader.ReadString('\n')
+		cmd.Print("locally accelerate (y/n)? (y) ")
+		locallyAccelerateStr, err := reader.ReadString('\n')
 		if err != nil {
 			cmd.Println(err.Error())
 			os.Exit(1)
 		}
-
-		accelerateDatasetString = strings.TrimSuffix(accelerateDatasetString, "\n")
-		accelerateDataset := strings.ToLower(accelerateDatasetString) == "y"
+		locallyAccelerateStr = strings.TrimSuffix(locallyAccelerateStr, "\n")
+		accelerateDataset := locallyAccelerateStr == "" || strings.ToLower(locallyAccelerateStr) == "y"
 
 		dataset := api.Dataset{
-			From:   datasetLocation,
-			Name:   datasetName,
-			Params: params,
-			Acceleration: &api.Acceleration{
+			From:        from,
+			Name:        datasetName,
+			Description: description,
+			Params:      params,
+		}
+
+		if accelerateDataset {
+			dataset.Acceleration = &api.Acceleration{
 				Enabled:         accelerateDataset,
 				RefreshInterval: time.Second * 10,
 				RefreshMode:     api.REFRESH_MODE_FULL,
-			},
+			}
 		}
 
 		datasetBytes, err := yaml.Marshal(dataset)
@@ -106,7 +132,7 @@ spice dataset configure
 			os.Exit(1)
 		}
 
-		var spicePod api.Pod
+		var spicePod api.Spicepod
 		err = yaml.Unmarshal(spicepodBytes, &spicePod)
 		if err != nil {
 			cmd.Println(err)
@@ -138,7 +164,7 @@ spice dataset configure
 			}
 		}
 
-		cmd.Println(aurora.BrightGreen(fmt.Sprintf("Dataset settings written to `%s`!", filePath)))
+		cmd.Println(aurora.BrightGreen(fmt.Sprintf("Saved %s", filePath)))
 	},
 }
 

@@ -102,9 +102,7 @@ impl DataFusion {
         let mut df_config = SessionConfig::new().with_information_schema(true);
         df_config.options_mut().sql_parser.dialect = "PostgreSQL".to_string();
         DataFusion {
-            ctx: Arc::new(SessionContext::new_with_config(
-                SessionConfig::new().with_information_schema(true),
-            )),
+            ctx: Arc::new(SessionContext::new_with_config(df_config)),
             connectors_tasks: HashMap::new(),
             data_publishers: HashMap::new(),
         }
@@ -137,9 +135,10 @@ impl DataFusion {
     }
 
     #[allow(clippy::needless_pass_by_value)]
-    pub fn new_accelerated_backend(
+    pub async fn new_accelerated_backend(
         &self,
         dataset: impl Borrow<Dataset>,
+        secrets_provider: Arc<RwLock<secrets::SecretsProvider>>,
     ) -> Result<Box<dyn DataPublisher>> {
         let dataset = dataset.borrow();
         let table_name = dataset.name.to_string();
@@ -151,14 +150,20 @@ impl DataFusion {
                     msg: "No acceleration configuration found".to_string(),
                 })?;
 
-        let params: Arc<Option<HashMap<String, String>>> = Arc::new(dataset.params.clone());
+        let params: Arc<Option<HashMap<String, String>>> =
+            Arc::new(dataset.acceleration_params().clone());
+
+        let secret_key = dataset.engine_secret().unwrap_or_default();
+        let backend_secret = secrets_provider.read().await.get_secret(&secret_key).await;
 
         let data_backend: Box<dyn DataPublisher> =
             DataBackendBuilder::new(Arc::clone(&self.ctx), table_name)
                 .engine(acceleration.engine())
                 .mode(acceleration.mode())
                 .params(params)
+                .secret(backend_secret)
                 .build()
+                .await
                 .context(DatasetConfigurationSnafu)?;
 
         Ok(data_backend)
