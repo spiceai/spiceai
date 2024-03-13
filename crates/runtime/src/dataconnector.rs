@@ -23,8 +23,8 @@ use crate::dataupdate::{DataUpdate, UpdateType};
 pub mod debug;
 pub mod dremio;
 pub mod flight;
-pub mod s3;
 pub mod postgres;
+pub mod s3;
 pub mod spiceai;
 
 #[derive(Debug, Snafu)]
