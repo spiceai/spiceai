@@ -3,7 +3,7 @@ package api
 const (
 	AUTH_TYPE_SPICE_AI = "spiceai"
 	AUTH_TYPE_DREMIO   = "dremio"
-	AUTH_TYPE_MINIO    = "minio"
+	AUTH_TYPE_S3       = "s3"
 
 	AUTH_PARAM_KEY      = "key"
 	AUTH_PARAM_PASSWORD = "password"

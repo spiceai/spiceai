@@ -125,15 +125,15 @@ spice login dremio --username <username> --password <password>
 	}),
 }
 
-var minioCmd = &cobra.Command{
-	Use:   "minio",
-	Short: "Login to a minio storage",
+var s3Cmd = &cobra.Command{
+	Use:   "s3",
+	Short: "Login to a s3 storage",
 	Example: `
-spice login minio --access-key <key> --access-secret <secret>
+spice login s3 --access-key <key> --access-secret <secret>
 
 # See more at: https://docs.spiceai.org/
 `,
-	Run: CreateLoginRunFunc(api.AUTH_TYPE_MINIO, map[string]string{
+	Run: CreateLoginRunFunc(api.AUTH_TYPE_S3, map[string]string{
 		accessKeyFlag:    fmt.Sprintf("No access key provided, use --%s or -k to provide a key", accessKeyFlag),
 		accessSecretFlag: fmt.Sprintf("No access secret provided, use --%s or -s to provide a secret", accessSecretFlag),
 	}, map[string]string{
@@ -226,10 +226,10 @@ func init() {
 	dremioCmd.Flags().StringP(passwordFlag, "p", "", "Password")
 	loginCmd.AddCommand(dremioCmd)
 
-	minioCmd.Flags().BoolP("help", "h", false, "Print this help message")
-	minioCmd.Flags().StringP(accessKeyFlag, "k", "", "Access key")
-	minioCmd.Flags().StringP(accessSecretFlag, "s", "", "Access Secret")
-	loginCmd.AddCommand(minioCmd)
+	s3Cmd.Flags().BoolP("help", "h", false, "Print this help message")
+	s3Cmd.Flags().StringP(accessKeyFlag, "k", "", "Access key")
+	s3Cmd.Flags().StringP(accessSecretFlag, "s", "", "Access Secret")
+	loginCmd.AddCommand(s3Cmd)
 
 	loginCmd.Flags().BoolP("help", "h", false, "Print this help message")
 	loginCmd.Flags().StringP(apiKeyFlag, "k", "", "API key")
