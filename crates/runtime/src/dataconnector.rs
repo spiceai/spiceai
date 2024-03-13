@@ -20,6 +20,7 @@ use crate::secrets::Secret;
 pub mod debug;
 pub mod dremio;
 pub mod flight;
+pub mod flightsql;
 pub mod postgres;
 pub mod spiceai;
 

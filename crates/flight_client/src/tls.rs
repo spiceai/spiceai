@@ -16,6 +16,11 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// # Errors
+///
+/// Will return `Err` if:
+///     - `rustls_native_certs` could not load native certificates.
+///     - It couldn't convert the PEMs to a string.
 pub fn system_tls_certificate() -> Result<tonic::transport::Certificate> {
     // Load root certificates found in the platform’s native certificate store.
     let certs = rustls_native_certs::load_native_certs().context(FailedToLoadCertsSnafu)?;
@@ -33,6 +38,11 @@ pub fn system_tls_certificate() -> Result<tonic::transport::Certificate> {
     Ok(tonic::transport::Certificate::from_pem(concatenated_pems))
 }
 
+/// # Errors
+///
+/// Will return `Err` if:
+///    - It couldn't connect to the endpoint.
+///    - It couldn't load the system TLS certificate.
 pub async fn new_tls_flight_channel(endpoint_str: &str) -> Result<Channel> {
     let mut endpoint = Endpoint::from_str(endpoint_str).context(UnableToConnectToEndpointSnafu)?;
 

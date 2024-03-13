@@ -19,7 +19,7 @@ clap.workspace = true
 metrics.workspace = true
 datafusion.workspace = true
 arrow.workspace = true
-arrow-flight.workspace = true
+arrow-flight = { workspace = true, features = ["flight-sql-experimental"] }
 arrow-ipc = "49.0.0"
 tonic.workspace = true
 tonic_0_9_0 = { version = "0.9.0", package = "tonic", features = ["gzip"] }
