@@ -1,5 +1,5 @@
-use crate::secrets::Secret;
 use async_trait::async_trait;
+use secrets::Secret;
 use snafu::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;

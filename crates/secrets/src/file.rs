@@ -56,6 +56,11 @@ impl Default for FileSecretStore {
 }
 
 impl FileSecretStore {
+    /// Loads the secrets.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if there is a problem loading the secrets.
     pub fn load_secrets(&mut self) -> Result<()> {
         let mut auth_path = dirs::home_dir().context(UnableToFindHomeDirSnafu)?;
         auth_path.push(".spice/auth");

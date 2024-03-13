@@ -2,23 +2,21 @@ use arrow_flight::decode::DecodedPayload;
 use async_stream::stream;
 use async_trait::async_trait;
 use flight_client::FlightClient;
+use flight_datafusion::FlightTable;
 use futures::StreamExt;
 use futures_core::stream::BoxStream;
+use secrets::Secret;
 use snafu::prelude::*;
+use spicepod::component::dataset::Dataset;
 use std::borrow::Borrow;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use std::{collections::HashMap, future::Future};
 
-use spicepod::component::dataset::Dataset;
-
-use flight_datafusion::FlightTable;
-
 use crate::datapublisher::{AddDataResult, DataPublisher};
 use crate::dataupdate::{DataUpdate, UpdateType};
 use crate::info_spaced;
-use crate::secrets::Secret;
 use crate::tracers::SpacedTracer;
 
 use super::{flight::Flight, DataConnector};
