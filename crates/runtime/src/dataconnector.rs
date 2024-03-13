@@ -1,12 +1,14 @@
 use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
 use futures::stream;
+use object_store::ObjectStore;
 use snafu::prelude::*;
 use spicepod::component::dataset::acceleration::RefreshMode;
 use spicepod::component::dataset::Dataset;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
+use url::Url;
 
 use arrow::record_batch::RecordBatch;
 use async_stream::stream;
@@ -17,10 +19,12 @@ use std::future::Future;
 use crate::datapublisher::DataPublisher;
 use crate::dataupdate::{DataUpdate, UpdateType};
 
+// pub mod aws;
 pub mod debug;
 pub mod dremio;
 pub mod flight;
 pub mod postgres;
+pub mod s3;
 pub mod spiceai;
 
 #[derive(Debug, Snafu)]
@@ -83,6 +87,17 @@ pub trait DataConnector: Send + Sync {
 
     fn has_table_provider(&self) -> bool {
         false
+    }
+
+    fn has_object_store(&self) -> bool {
+        false
+    }
+
+    fn get_object_store(
+        &self,
+        dataset: &Dataset,
+    ) -> std::result::Result<(Url, Arc<dyn ObjectStore + 'static>), Error> {
+        panic!("get_object_store not implemented for {}", dataset.name)
     }
 
     async fn get_table_provider(
