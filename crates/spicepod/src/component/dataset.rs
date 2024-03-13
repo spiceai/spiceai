@@ -134,9 +134,7 @@ impl Dataset {
     #[must_use]
     pub fn acceleration_params(&self) -> Option<HashMap<String, String>> {
         if let Some(acceleration) = &self.acceleration {
-            if let Some(refresh_interval) = &acceleration.params {
-                return Some(refresh_interval.clone());
-            }
+            return acceleration.params.clone();
         }
 
         None
@@ -145,9 +143,7 @@ impl Dataset {
     #[must_use]
     pub fn engine_secret(&self) -> Option<String> {
         if let Some(acceleration) = &self.acceleration {
-            if let Some(engine_secret) = &acceleration.engine_secret {
-                return Some(engine_secret.clone());
-            }
+            return acceleration.engine_secret.clone();
         }
 
         None
