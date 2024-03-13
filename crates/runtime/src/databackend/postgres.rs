@@ -17,8 +17,10 @@ use sql_provider_datafusion::{
 use tokio::sync::Mutex;
 
 use crate::{
+    datafusion::read_pg_config,
     datapublisher::{AddDataResult, DataPublisher},
     dataupdate::{DataUpdate, UpdateType},
+    secrets::Secret,
 };
 
 #[derive(Debug, Snafu)]
@@ -103,8 +105,9 @@ impl PostgresBackend {
         name: &str,
         params: Arc<Option<HashMap<String, String>>>,
         primary_keys: Option<Vec<String>>,
+        secret: Option<Secret>,
     ) -> Result<Self> {
-        let pool = PostgresConnectionPool::new(params)
+        let pool = PostgresConnectionPool::new(read_pg_config(params, secret))
             .await
             .context(DbConnectionPoolSnafu)?;
         Ok(PostgresBackend {

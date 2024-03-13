@@ -145,7 +145,8 @@ impl DataFusion {
             DataBackendBuilder::new(Arc::clone(&self.ctx), table_name)
                 .engine(acceleration.engine())
                 .mode(acceleration.mode())
-                .params(read_pg_config(params, backend_secret))
+                .params(params)
+                .secret(backend_secret)
                 .build()
                 .await
                 .context(DatasetConfigurationSnafu)?;
