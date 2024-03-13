@@ -135,7 +135,8 @@ impl DataFusion {
                     msg: "No acceleration configuration found".to_string(),
                 })?;
 
-        let params: Arc<Option<HashMap<String, String>>> = Arc::new(dataset.params.clone());
+        let params: Arc<Option<HashMap<String, String>>> =
+            Arc::new(dataset.acceleration_params().clone());
 
         let secret_key = dataset.engine_secret().unwrap_or_default();
         let backend_secret = secrets_provider.read().await.get_secret(&secret_key).await;
