@@ -52,6 +52,10 @@ impl Secret {
         Some(exposed_secret)
     }
 
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &SecretString)> {
+        self.data.iter()
+    }
+
     pub fn add(&mut self, key: String, value: String) {
         self.data.insert(key, SecretString::from(value));
     }

@@ -52,7 +52,7 @@ deltalake = { version = "0.17.0", features = ["datafusion-ext", "s3", "azure"] }
 itertools = "0.12"
 aws-config = "1.1.7"
 aws-types = "1.1.7"
-object_store = { version="0.8.0", features = ["aws"] }
+object_store = { version="0.9.1", features = ["aws"] }
 quick-xml = { version = "0.23.0-alpha3" }
 url = "2.5.0"
 arrow_sql_gen = { path = "../arrow_sql_gen", optional = true }
@@ -60,6 +60,7 @@ bb8 = {workspace = true, optional = true}
 bb8-postgres = {workspace = true, optional = true}
 secrets = { path = "../secrets" }
 db_connection_pool = { path = "../db_connection_pool" }
+secrecy = "0.8.0"
 
 [features]
 default = ["duckdb", "postgres", "keyring-secret-store"]

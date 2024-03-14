@@ -289,11 +289,14 @@ impl Runtime {
                 })?,
             ))),
             "databricks" => Ok(Some(Box::new(
-                dataconnector::databricks::Databricks::new(auth.get(source), params)
+                dataconnector::databricks::Databricks::new(
+                    secrets_provider.get_secret(source).await,
+                    params,
+                )
                 .await
-                    .context(UnableToInitializeDataConnectorSnafu {
-                        data_connector: source,
-                    })?,
+                .context(UnableToInitializeDataConnectorSnafu {
+                    data_connector: source,
+                })?,
             ))),
             "s3" => Ok(Some(Box::new(
                 dataconnector::s3::S3::new(secrets_provider.get_secret(source).await, params)
