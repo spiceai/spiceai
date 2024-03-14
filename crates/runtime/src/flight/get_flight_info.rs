@@ -1,4 +1,3 @@
-use crate::flight::flightsql::statement_query;
 use arrow_flight::{
     sql::{Any, Command},
     FlightDescriptor, FlightInfo,
@@ -16,22 +15,22 @@ pub(crate) async fn handle(
 
     match Command::try_from(message).map_err(to_tonic_err)? {
         Command::CommandStatementQuery(token) => {
-            statement_query::get_flight_info(flight_svc, token, request).await
+            flightsql::statement_query::get_flight_info(flight_svc, token, request).await
         }
         Command::CommandPreparedStatementQuery(handle) => {
-            flight_svc
-                .get_flight_info_prepared_statement(handle, request)
-                .await
+            flightsql::prepared_statement_query::get_flight_info(flight_svc, handle, request).await
         }
         Command::CommandGetCatalogs(token) => {
-            flight_svc.get_flight_info_catalogs(token, request).await
+            Ok(flightsql::get_catalogs::get_flight_info(&token, request))
         }
         Command::CommandGetDbSchemas(token) => {
-            flight_svc.get_flight_info_schemas(token, request).await
+            Ok(flightsql::get_schemas::get_flight_info(&token, request))
         }
-        Command::CommandGetTables(token) => flight_svc.get_flight_info_tables(token, request).await,
+        Command::CommandGetTables(token) => {
+            Ok(flightsql::get_tables::get_flight_info(&token, request))
+        }
         Command::CommandGetSqlInfo(token) => {
-            flightsql::get_sql_info::get_flight_info(token, request)
+            flightsql::get_sql_info::get_flight_info(&token, request)
         }
         _ => Err(Status::unimplemented("Not yet implemented")),
     }

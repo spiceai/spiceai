@@ -3,15 +3,12 @@ use crate::dataupdate::DataUpdate;
 use arrow::datatypes::Schema;
 use arrow::ipc::writer::{DictionaryTracker, IpcDataGenerator};
 use arrow_flight::encode::FlightDataEncoderBuilder;
-use arrow_flight::sql::ProstMessageExt;
-use arrow_flight::{sql, Action, ActionType, Criteria, IpcMessage, SchemaResult};
+use arrow_flight::{Action, ActionType, Criteria, IpcMessage, SchemaResult};
 use arrow_ipc::writer::IpcWriteOptions;
 use bytes::Bytes;
-use datafusion::datasource::TableType;
 use datafusion::execution::SendableRecordBatchStream;
 use futures::stream::{self, BoxStream, StreamExt};
 use futures::{Stream, TryStreamExt};
-use prost::Message;
 use snafu::prelude::*;
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -32,8 +29,8 @@ mod handshake;
 
 use arrow_flight::{
     flight_service_server::{FlightService, FlightServiceServer},
-    FlightData, FlightDescriptor, FlightEndpoint, FlightInfo, HandshakeRequest, HandshakeResponse,
-    PutResult, SchemaAsIpc, Ticket,
+    FlightData, FlightDescriptor, FlightInfo, HandshakeRequest, HandshakeResponse, PutResult,
+    SchemaAsIpc, Ticket,
 };
 
 pub struct Service {
@@ -214,339 +211,55 @@ impl Service {
         Ok(flights_stream.boxed())
     }
 
-    /// Get a FlightInfo for listing catalogs.
-    #[allow(clippy::unused_async)]
-    async fn get_flight_info_catalogs(
-        &self,
-        query: sql::CommandGetCatalogs,
-        request: Request<FlightDescriptor>,
-    ) -> Result<Response<FlightInfo>, Status> {
-        tracing::trace!("get_flight_info_catalogs");
-        let fd = request.into_inner();
-
-        let endpoint = FlightEndpoint::new().with_ticket(Ticket {
-            ticket: query.as_any().encode_to_vec().into(),
-        });
-
-        let info = FlightInfo::new()
-            .with_endpoint(endpoint)
-            .with_descriptor(fd);
-
-        Ok(Response::new(info))
-    }
-
-    async fn do_get_catalogs(
-        &self,
-        query: sql::CommandGetCatalogs,
-        _request: Request<Ticket>,
-    ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
-        tracing::trace!("do_get_catalogs: {query:?}");
-        let mut builder = query.into_builder();
-
-        let catalog_names = self.datafusion.read().await.ctx.catalog_names();
-
-        for catalog in catalog_names {
-            builder.append(catalog);
-        }
-
-        let record_batch = builder.build().map_err(to_tonic_err)?;
-
-        Ok(Response::new(
-            Box::pin(record_batches_to_flight_stream(vec![record_batch])?)
-                as <Service as FlightService>::DoGetStream,
-        ))
-    }
-
-    /// Get a FlightInfo for listing schemas.
-    #[allow(clippy::unused_async)]
-    async fn get_flight_info_schemas(
-        &self,
-        query: sql::CommandGetDbSchemas,
-        request: Request<FlightDescriptor>,
-    ) -> Result<Response<FlightInfo>, Status> {
-        tracing::trace!("get_flight_info_schemas");
-        let fd = request.into_inner();
-
-        let endpoint = FlightEndpoint::new().with_ticket(Ticket {
-            ticket: query.as_any().encode_to_vec().into(),
-        });
-
-        let info = FlightInfo::new()
-            .with_endpoint(endpoint)
-            .with_descriptor(fd);
-
-        Ok(Response::new(info))
-    }
-
-    async fn do_get_schemas(
-        &self,
-        query: sql::CommandGetDbSchemas,
-        _request: Request<Ticket>,
-    ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
-        let catalog = &query.catalog;
-        tracing::trace!("do_get_schemas: {query:?}");
-        let filtered_catalogs = match catalog {
-            Some(catalog) => vec![catalog.to_string()],
-            None => self.datafusion.read().await.ctx.catalog_names(),
-        };
-        let mut builder = query.into_builder();
-
-        for catalog in filtered_catalogs {
-            let catalog_provider = self
-                .datafusion
-                .read()
-                .await
-                .ctx
-                .catalog(&catalog)
-                .ok_or_else(|| {
-                    Status::internal(format!("unable to get catalog provider for {catalog}"))
-                })?;
-            for schema in catalog_provider.schema_names() {
-                builder.append(&catalog, schema);
-            }
-        }
-
-        let record_batch = builder.build().map_err(to_tonic_err)?;
-
-        Ok(Response::new(
-            Box::pin(record_batches_to_flight_stream(vec![record_batch])?)
-                as <Service as FlightService>::DoGetStream,
-        ))
-    }
-
-    async fn do_get_tables(
-        &self,
-        query: sql::CommandGetTables,
-        _request: Request<Ticket>,
-    ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
-        let catalog = &query.catalog;
-        tracing::trace!("do_get_tables: {query:?}");
-        let filtered_catalogs = match catalog {
-            Some(catalog) => vec![catalog.to_string()],
-            None => self.datafusion.read().await.ctx.catalog_names(),
-        };
-        let mut builder = query.into_builder();
-
-        for catalog_name in filtered_catalogs {
-            let catalog_provider = self
-                .datafusion
-                .read()
-                .await
-                .ctx
-                .catalog(&catalog_name)
-                .ok_or_else(|| {
-                    Status::internal(format!("unable to get catalog provider for {catalog_name}"))
-                })?;
-
-            for schema_name in catalog_provider.schema_names() {
-                let Some(schema_provider) = catalog_provider.schema(&schema_name) else {
-                    continue;
-                };
-
-                for table_name in schema_provider.table_names() {
-                    let Some(table_provider) = schema_provider.table(&table_name).await else {
-                        continue;
-                    };
-
-                    let table_type = table_type_name(table_provider.table_type());
-
-                    builder.append(
-                        &catalog_name,
-                        &schema_name,
-                        &table_name,
-                        table_type,
-                        table_provider.schema().as_ref(),
-                    )?;
-                }
-            }
-        }
-
-        let record_batch = builder.build().map_err(to_tonic_err)?;
-
-        Ok(Response::new(
-            Box::pin(record_batches_to_flight_stream(vec![record_batch])?)
-                as <Service as FlightService>::DoGetStream,
-        ))
-    }
-
-    async fn do_get_statement(
-        &self,
-        ticket: sql::TicketStatementQuery,
-        _request: Request<Ticket>,
-    ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
-        let datafusion = Arc::clone(&self.datafusion);
-        tracing::trace!("do_get_statement: {ticket:?}");
-        match std::str::from_utf8(&ticket.statement_handle) {
-            Ok(sql) => {
-                let output = Self::sql_to_flight_stream(datafusion, sql.to_owned()).await?;
-                Ok(Response::new(
-                    Box::pin(output) as <Service as FlightService>::DoGetStream
-                ))
-            }
-            Err(e) => Err(Status::invalid_argument(format!("Invalid ticket: {e:?}"))),
-        }
-    }
-
-    async fn do_get_prepared_statement(
-        &self,
-        query: sql::CommandPreparedStatementQuery,
-        _request: Request<Ticket>,
-    ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
-        let datafusion = Arc::clone(&self.datafusion);
-        tracing::trace!("do_get_prepared_statement: {query:?}");
-        match std::str::from_utf8(&query.prepared_statement_handle) {
-            Ok(sql) => {
-                let output = Self::sql_to_flight_stream(datafusion, sql.to_owned()).await?;
-                Ok(Response::new(
-                    Box::pin(output) as <Service as FlightService>::DoGetStream
-                ))
-            }
-            Err(e) => Err(Status::invalid_argument(format!(
-                "Invalid prepared statement handle: {e:?}"
-            ))),
-        }
-    }
-
     // If the ticket isn't a sql command, then try interpreting the ticket as a raw SQL query.
-    async fn do_get_fallback(
-        &self,
-        request: Request<Ticket>,
-        _message: arrow_flight::sql::Any,
-    ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
-        let datafusion = Arc::clone(&self.datafusion);
-        let ticket = request.into_inner();
-        tracing::trace!("do_get_fallback: {ticket:?}");
-        match std::str::from_utf8(&ticket.ticket) {
-            Ok(sql) => {
-                let output = Self::sql_to_flight_stream(datafusion, sql.to_owned()).await?;
-                Ok(Response::new(
-                    Box::pin(output) as <Service as FlightService>::DoGetStream
-                ))
-            }
-            Err(e) => Err(Status::invalid_argument(format!("Invalid ticket: {e:?}"))),
-        }
-    }
+    // async fn do_get_fallback(
+    //     &self,
+    //     request: Request<Ticket>,
+    //     _message: arrow_flight::sql::Any,
+    // ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+    //     let datafusion = Arc::clone(&self.datafusion);
+    //     let ticket = request.into_inner();
+    //     tracing::trace!("do_get_fallback: {ticket:?}");
+    //     match std::str::from_utf8(&ticket.ticket) {
+    //         Ok(sql) => {
+    //             let output = Self::sql_to_flight_stream(datafusion, sql.to_owned()).await?;
+    //             Ok(Response::new(
+    //                 Box::pin(output) as <Service as FlightService>::DoGetStream
+    //             ))
+    //         }
+    //         Err(e) => Err(Status::invalid_argument(format!("Invalid ticket: {e:?}"))),
+    //     }
+    // }
 
-    #[allow(clippy::unused_async)]
-    async fn get_flight_info_tables(
-        &self,
-        query: sql::CommandGetTables,
-        request: Request<FlightDescriptor>,
-    ) -> Result<Response<FlightInfo>, Status> {
-        let fd = request.into_inner();
-        tracing::trace!("get_flight_info_tables: {query:?}");
-        Ok(Response::new(FlightInfo {
-            flight_descriptor: Some(fd.clone()),
-            endpoint: vec![FlightEndpoint {
-                ticket: Some(Ticket { ticket: fd.cmd }),
-                ..Default::default()
-            }],
-            ..Default::default()
-        }))
-    }
-
-    async fn get_flight_info_prepared_statement(
-        &self,
-        handle: sql::CommandPreparedStatementQuery,
-        request: Request<FlightDescriptor>,
-    ) -> Result<Response<FlightInfo>, Status> {
-        tracing::trace!("get_flight_info_prepared_statement: {handle:?}");
-
-        let sql = match std::str::from_utf8(&handle.prepared_statement_handle) {
-            Ok(sql) => sql.to_string(),
-            Err(e) => {
-                return Err(Status::invalid_argument(format!(
-                    "Invalid prepared statement handle: {e:?}"
-                )))
-            }
-        };
-
-        let (arrow_schema, num_rows) =
-            Self::get_arrow_schema_and_size_sql(Arc::clone(&self.datafusion), sql)
-                .await
-                .map_err(to_tonic_err)?;
-
-        tracing::trace!("get_flight_info_prepared_statement: arrow_schema={arrow_schema:?} num_rows={num_rows:?}");
-
-        let fd = request.into_inner();
-
-        let endpoint = FlightEndpoint::new().with_ticket(Ticket {
-            ticket: handle.as_any().encode_to_vec().into(),
-        });
-
-        let info = FlightInfo::new()
-            .with_endpoint(endpoint)
-            .try_with_schema(&arrow_schema)
-            .map_err(to_tonic_err)?
-            .with_descriptor(fd)
-            .with_total_records(num_rows.try_into().map_err(to_tonic_err)?);
-
-        Ok(Response::new(info))
-    }
-
-    #[allow(clippy::unused_async)]
-    async fn get_flight_info_fallback(
-        &self,
-        cmd: sql::Command,
-        request: Request<FlightDescriptor>,
-    ) -> Result<Response<FlightInfo>, Status> {
-        tracing::trace!("get_flight_info_fallback: {cmd:?}");
-        let fd = request.into_inner();
-        Ok(Response::new(FlightInfo {
-            flight_descriptor: Some(fd.clone()),
-            endpoint: vec![FlightEndpoint {
-                ticket: Some(Ticket { ticket: fd.cmd }),
-                ..Default::default()
-            }],
-            ..Default::default()
-        }))
-    }
-
-    /// Create a prepared statement from given SQL statement.
-    async fn do_action_create_prepared_statement(
-        &self,
-        statement: sql::ActionCreatePreparedStatementRequest,
-        _request: Request<Action>,
-    ) -> Result<sql::ActionCreatePreparedStatementResult, Status> {
-        tracing::trace!("do_action_create_prepared_statement: {statement:?}");
-        let (arrow_schema, _) = Self::get_arrow_schema_and_size_sql(
-            Arc::clone(&self.datafusion),
-            statement.query.clone(),
-        )
-        .await
-        .map_err(to_tonic_err)?;
-
-        let schema_bytes = Self::serialize_schema(&arrow_schema)?;
-
-        Ok(sql::ActionCreatePreparedStatementResult {
-            prepared_statement_handle: statement.query.into(),
-            dataset_schema: schema_bytes,
-            ..Default::default()
-        })
-    }
+    // #[allow(clippy::unused_async)]
+    // async fn get_flight_info_fallback(
+    //     &self,
+    //     cmd: sql::Command,
+    //     request: Request<FlightDescriptor>,
+    // ) -> Result<Response<FlightInfo>, Status> {
+    //     tracing::trace!("get_flight_info_fallback: {cmd:?}");
+    //     let fd = request.into_inner();
+    //     Ok(Response::new(FlightInfo {
+    //         flight_descriptor: Some(fd.clone()),
+    //         endpoint: vec![FlightEndpoint {
+    //             ticket: Some(Ticket { ticket: fd.cmd }),
+    //             ..Default::default()
+    //         }],
+    //         ..Default::default()
+    //     }))
+    // }
 }
 
-fn table_type_name(table_type: TableType) -> &'static str {
-    match table_type {
-        // from https://github.com/apache/arrow-datafusion/blob/26b8377b0690916deacf401097d688699026b8fb/datafusion/core/src/catalog/information_schema.rs#L284-L288
-        TableType::Base => "BASE TABLE",
-        TableType::View => "VIEW",
-        TableType::Temporary => "LOCAL TEMPORARY",
-    }
-}
-
-pub(crate) fn record_batches_to_flight_stream(
+fn record_batches_to_flight_stream(
     record_batches: Vec<arrow::record_batch::RecordBatch>,
-) -> Result<impl Stream<Item = Result<FlightData, Status>>, Status> {
-    let flight_stream = FlightDataEncoderBuilder::new()
+) -> impl Stream<Item = Result<FlightData, Status>> {
+    FlightDataEncoderBuilder::new()
         .build(stream::iter(record_batches.into_iter().map(Ok)))
-        .map_err(to_tonic_err);
-
-    Ok(flight_stream)
+        .map_err(to_tonic_err)
 }
 
 #[allow(clippy::needless_pass_by_value)]
-pub(crate) fn to_tonic_err<E>(e: E) -> Status
+fn to_tonic_err<E>(e: E) -> Status
 where
     E: std::fmt::Debug,
 {

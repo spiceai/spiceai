@@ -22,9 +22,9 @@ use tonic::{Request, Response, Status};
 
 use crate::flight::{to_tonic_err, Service};
 
-/// Get a FlightInfo for retrieving SqlInfo.
+/// Get a `FlightInfo` for retrieving `SqlInfo`.
 pub(crate) fn get_flight_info(
-    query: sql::CommandGetSqlInfo,
+    query: &sql::CommandGetSqlInfo,
     request: Request<FlightDescriptor>,
 ) -> Result<Response<FlightInfo>, Status> {
     tracing::trace!("get_flight_info_sql_info: query={query:?}");
@@ -48,10 +48,9 @@ pub(crate) fn get_flight_info(
     ))
 }
 
-/// Get a FlightDataStream containing the list of SqlInfo results.
+/// Get a `FlightDataStream` containing the list of `SqlInfo` results.
 pub(crate) fn do_get(
     query: sql::CommandGetSqlInfo,
-    _request: Request<Ticket>,
 ) -> Result<Response<<Service as FlightService>::DoGetStream>, Status> {
     tracing::trace!("do_get_sql_info: {query:?}");
     let builder = query.into_builder(get_sql_info_data());

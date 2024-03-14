@@ -16,15 +16,21 @@ pub(crate) async fn handle(
 
     match Command::try_from(msg).map_err(to_tonic_err)? {
         Command::TicketStatementQuery(command) => {
-            flight_svc.do_get_statement(command, request).await
+            flightsql::statement_query::do_get(flight_svc, command).await
         }
         Command::CommandPreparedStatementQuery(command) => {
-            flight_svc.do_get_prepared_statement(command, request).await
+            flightsql::prepared_statement_query::do_get(flight_svc, command).await
         }
-        Command::CommandGetCatalogs(command) => flight_svc.do_get_catalogs(command, request).await,
-        Command::CommandGetDbSchemas(command) => flight_svc.do_get_schemas(command, request).await,
-        Command::CommandGetTables(command) => flight_svc.do_get_tables(command, request).await,
-        Command::CommandGetSqlInfo(command) => flightsql::get_sql_info::do_get(command, request),
+        Command::CommandGetCatalogs(command) => {
+            flightsql::get_catalogs::do_get(flight_svc, command).await
+        }
+        Command::CommandGetDbSchemas(command) => {
+            flightsql::get_schemas::do_get(flight_svc, command).await
+        }
+        Command::CommandGetTables(command) => {
+            flightsql::get_tables::do_get(flight_svc, command).await
+        }
+        Command::CommandGetSqlInfo(command) => flightsql::get_sql_info::do_get(command),
         _ => Err(Status::unimplemented("Not yet implemented")),
     }
 }

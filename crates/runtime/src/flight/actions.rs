@@ -1,3 +1,5 @@
+use std::fmt::{self, Display, Formatter};
+
 use prost::Message;
 use tonic::{Request, Response, Status};
 
@@ -31,9 +33,11 @@ impl ActionType {
             ActionType::Unknown => "Unknown",
         }
     }
+}
 
-    fn to_string(&self) -> String {
-        self.as_str().to_string()
+impl Display for ActionType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
     }
 }
 
@@ -79,10 +83,9 @@ pub(crate) async fn do_action(
                         "Unable to unpack ActionCreatePreparedStatementRequest.",
                     )
                 })?;
-            let stmt = prepared_statement_query::do_action_create_prepared_statement(
-                flight_svc, cmd, request,
-            )
-            .await?;
+            let stmt =
+                prepared_statement_query::do_action_create_prepared_statement(flight_svc, cmd)
+                    .await?;
             let output = futures::stream::iter(vec![Ok(arrow_flight::Result {
                 body: stmt.as_any().encode_to_vec().into(),
             })]);
