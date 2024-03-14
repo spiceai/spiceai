@@ -11,7 +11,6 @@ use futures::stream::{self, BoxStream, StreamExt};
 use futures::{Stream, TryStreamExt};
 use snafu::prelude::*;
 use std::collections::HashMap;
-use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::broadcast::Sender;
 use tokio::sync::RwLock;
@@ -39,18 +38,13 @@ pub struct Service {
 
 #[tonic::async_trait]
 impl FlightService for Service {
-    type HandshakeStream =
-        Pin<Box<dyn Stream<Item = Result<HandshakeResponse, Status>> + Send + 'static>>;
-    type ListFlightsStream =
-        Pin<Box<dyn Stream<Item = Result<FlightInfo, Status>> + Send + 'static>>;
-    type DoGetStream = Pin<Box<dyn Stream<Item = Result<FlightData, Status>> + Send + 'static>>;
-    type DoPutStream = Pin<Box<dyn Stream<Item = Result<PutResult, Status>> + Send + 'static>>;
-    type DoActionStream =
-        Pin<Box<dyn Stream<Item = Result<arrow_flight::Result, Status>> + Send + 'static>>;
-    type ListActionsStream =
-        Pin<Box<dyn Stream<Item = Result<ActionType, Status>> + Send + 'static>>;
-    type DoExchangeStream =
-        Pin<Box<dyn Stream<Item = Result<FlightData, Status>> + Send + 'static>>;
+    type HandshakeStream = BoxStream<'static, Result<HandshakeResponse, Status>>;
+    type ListFlightsStream = BoxStream<'static, Result<FlightInfo, Status>>;
+    type DoGetStream = BoxStream<'static, Result<FlightData, Status>>;
+    type DoPutStream = BoxStream<'static, Result<PutResult, Status>>;
+    type DoActionStream = BoxStream<'static, Result<arrow_flight::Result, Status>>;
+    type ListActionsStream = BoxStream<'static, Result<ActionType, Status>>;
+    type DoExchangeStream = BoxStream<'static, Result<FlightData, Status>>;
 
     async fn handshake(
         &self,
