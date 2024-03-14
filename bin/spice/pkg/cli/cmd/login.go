@@ -16,14 +16,16 @@ import (
 )
 
 const (
-	apiKeyFlag     = "key"
-	usernameFlag   = "username"
-	passwordFlag   = "password"
-	token          = "token"
-	awsRegion      = "aws-region"
-	awsAccessKeyId = "aws-access-key-id"
-	awsSecret      = "aws-secret-access-key"
-	charset        = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	apiKeyFlag       = "key"
+	usernameFlag     = "username"
+	passwordFlag     = "password"
+	token            = "token"
+	accessKeyFlag    = "access-key"
+	accessSecretFlag = "access-scret"
+	awsRegion        = "aws-region"
+	awsAccessKeyId   = "aws-access-key-id"
+	awsSecret        = "aws-secret-access-key"
+	charset          = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 )
 
 var loginCmd = &cobra.Command{
@@ -301,7 +303,7 @@ func init() {
 	databricksCmd.Flags().String(awsAccessKeyId, "", "AWS Access Key ID")
 	databricksCmd.Flags().String(awsSecret, "", "AWS Secret Access Key")
 	loginCmd.AddCommand(databricksCmd)
-	
+
 	s3Cmd.Flags().BoolP("help", "h", false, "Print this help message")
 	s3Cmd.Flags().StringP(accessKeyFlag, "k", "", "Access key")
 	s3Cmd.Flags().StringP(accessSecretFlag, "s", "", "Access Secret")
