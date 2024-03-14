@@ -19,9 +19,9 @@ use std::future::Future;
 use crate::datapublisher::DataPublisher;
 use crate::dataupdate::{DataUpdate, UpdateType};
 
-// pub mod aws;
 pub mod debug;
 pub mod dremio;
+pub mod duckdb;
 pub mod flight;
 pub mod postgres;
 pub mod s3;

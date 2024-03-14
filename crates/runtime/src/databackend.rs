@@ -30,7 +30,6 @@ pub struct DataBackendBuilder {
     engine: Option<Engine>,
     mode: Option<Mode>,
     params: Arc<Option<HashMap<String, String>>>,
-    primary_keys: Option<Vec<String>>,
     secret: Option<Secret>,
 }
 
@@ -43,7 +42,6 @@ impl DataBackendBuilder {
             engine: None,
             mode: None,
             params: Arc::new(None),
-            primary_keys: None,
             secret: None,
         }
     }
@@ -63,12 +61,6 @@ impl DataBackendBuilder {
     #[must_use]
     pub fn params(mut self, params: Arc<Option<HashMap<String, String>>>) -> Self {
         self.params = params;
-        self
-    }
-
-    #[must_use]
-    pub fn primary_keys(mut self, primary_keys: Option<Vec<String>>) -> Self {
-        self.primary_keys = primary_keys;
         self
     }
 
@@ -95,11 +87,6 @@ impl DataBackendBuilder {
         if let Some(Mode::File) = self.mode {
             InvalidConfigurationSnafu {
                 msg: "File mode not supported for Arrow engine".to_string(),
-            }
-            .fail()?;
-        } else if self.primary_keys.is_some() {
-            InvalidConfigurationSnafu {
-                msg: "Primary keys not supported for Arrow engine".to_string(),
             }
             .fail()?;
         }
@@ -134,7 +121,6 @@ impl DataBackendBuilder {
                     self.name.as_str(),
                     mode.into(),
                     self.params,
-                    self.primary_keys,
                 )
                 .boxed()
                 .context(BackendCreationFailedSnafu)?,
@@ -145,7 +131,6 @@ impl DataBackendBuilder {
                     Arc::clone(&self.ctx),
                     self.name.as_str(),
                     self.params,
-                    self.primary_keys,
                     self.secret,
                 )
                 .await

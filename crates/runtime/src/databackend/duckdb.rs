@@ -63,7 +63,6 @@ pub struct DuckDBBackend {
             + Sync,
     >,
     create_mutex: std::sync::Mutex<()>,
-    _primary_keys: Option<Vec<String>>,
 }
 
 impl DataPublisher for DuckDBBackend {
@@ -105,7 +104,6 @@ impl DuckDBBackend {
         name: &str,
         mode: Mode,
         params: Arc<Option<HashMap<String, String>>>,
-        primary_keys: Option<Vec<String>>,
     ) -> Result<Self> {
         let pool =
             DuckDbConnectionPool::new(name, &mode, &params).context(DbConnectionPoolSnafu)?;
@@ -114,7 +112,6 @@ impl DuckDBBackend {
             name: name.to_string(),
             pool: Arc::new(pool),
             create_mutex: std::sync::Mutex::new(()),
-            _primary_keys: primary_keys,
         })
     }
 
@@ -291,9 +288,8 @@ mod tests {
     async fn test_add_data() {
         let ctx = Arc::new(SessionContext::new());
         let name = "test_add_data";
-        let backend =
-            DuckDBBackend::new(Arc::clone(&ctx), name, Mode::Memory, Arc::new(None), None)
-                .expect("Unable to create DuckDBBackend");
+        let backend = DuckDBBackend::new(Arc::clone(&ctx), name, Mode::Memory, Arc::new(None))
+            .expect("Unable to create DuckDBBackend");
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("a", DataType::Utf8, false),

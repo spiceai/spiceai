@@ -68,7 +68,6 @@ pub struct PostgresBackend {
             + Sync,
     >,
     create_mutex: Mutex<()>,
-    _primary_keys: Option<Vec<String>>,
 }
 
 impl DataPublisher for PostgresBackend {
@@ -101,7 +100,6 @@ impl PostgresBackend {
         ctx: Arc<SessionContext>,
         name: &str,
         params: Arc<Option<HashMap<String, String>>>,
-        primary_keys: Option<Vec<String>>,
         secret: Option<Secret>,
     ) -> Result<Self> {
         let pool = PostgresConnectionPool::new(params, secret)
@@ -112,7 +110,6 @@ impl PostgresBackend {
             name: name.to_string(),
             pool: Arc::new(pool),
             create_mutex: Mutex::new(()),
-            _primary_keys: primary_keys,
         })
     }
 

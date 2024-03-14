@@ -1,0 +1,102 @@
+use std::{collections::HashMap, pin::Pin, sync::Arc};
+
+use arrow::array::RecordBatch;
+use async_trait::async_trait;
+use db_connection_pool::{postgrespool::PostgresConnectionPool, DbConnectionPool};
+use duckdb::{DuckdbConnectionManager, ToSql};
+use futures::Future;
+use secrets::Secret;
+use spicepod::component::dataset::Dataset;
+
+use super::DataConnector;
+use super::UnableToGetTableProviderSnafu;
+
+struct DuckDB {
+    pool: Arc<
+        dyn DbConnectionPool<r2d2::PooledConnection<DuckdbConnectionManager>, &'static dyn ToSql>
+            + Send
+            + Sync,
+    >,
+}
+
+#[async_trait]
+impl DataConnector for DuckDB {
+    fn new(
+        secret: Option<Secret>,
+        params: Arc<Option<HashMap<String, String>>>,
+    ) -> Pin<Box<dyn Future<Output = Result<Self>> + Send>>
+    where
+        Self: Sized,
+    {
+        Box::pin(async move {
+            let pool = Arc::new(
+                PostgresConnectionPool::new(params, secret)
+                    .await
+                    .context(UnableToGetTableProviderSnafu)?,
+            );
+
+            Ok(Self { pool })
+        })
+    }
+
+    fn get_all_data(
+        &self,
+        dataset: &Dataset,
+    ) -> Pin<Box<dyn Future<Output = Vec<RecordBatch>> + Send>> {
+        let path = dataset.path().clone();
+        let pool = Arc::clone(&self.pool);
+        Box::pin(async move {
+            let conn = match pool.connect().await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    tracing::error!("Failed to connect to Postgres: {:?}", e);
+                    return vec![];
+                }
+            };
+
+            let Some(async_conn) = conn.as_async() else {
+                tracing::error!("Failed to convert postgres conn to async connection",);
+                return vec![];
+            };
+
+            let record_batch_stream = match async_conn
+                .query_arrow(format!("SELECT * FROM {path}").as_str(), &[])
+                .await
+            {
+                Ok(stream) => stream,
+                Err(e) => {
+                    tracing::error!("Failed to query Postgres: {:?}", e);
+                    return vec![];
+                }
+            };
+
+            let recs: Vec<RecordBatch> =
+                match record_batch_stream.try_collect::<Vec<RecordBatch>>().await {
+                    Ok(recs) => recs,
+                    Err(e) => {
+                        tracing::error!("Failed to collect record batches from Postgres: {:?}", e);
+                        return vec![];
+                    }
+                };
+
+            recs
+        })
+    }
+
+    fn has_table_provider(&self) -> bool {
+        true
+    }
+
+    async fn get_table_provider(
+        &self,
+        dataset: &Dataset,
+    ) -> Result<Arc<dyn TableProvider + 'static>> {
+        let pool = Arc::clone(&self.pool);
+        let table_provider = SqlTable::new(&pool, TableReference::bare(dataset.path()))
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+            .context(UnableToGetTableProviderSnafu)?;
+
+        Ok(Arc::new(table_provider))
+    }
+}
