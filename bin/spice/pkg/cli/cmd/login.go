@@ -171,7 +171,7 @@ spice login databricks --token <access-token> --aws-region <aws-region> --aws-ac
 		}
 
 		if token == "" {
-			cmd.Println("No Databricks Access Token provided, use --key")
+			cmd.Println("No Databricks Access Token provided, use --token")
 			os.Exit(1)
 		}
 
