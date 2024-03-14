@@ -1,5 +1,6 @@
 use crate::datafusion::DataFusion;
 use crate::dataupdate::DataUpdate;
+use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
 use arrow::ipc::writer::{DictionaryTracker, IpcDataGenerator};
 use arrow_flight::encode::FlightDataEncoderBuilder;
@@ -199,7 +200,7 @@ impl Service {
 }
 
 fn record_batches_to_flight_stream(
-    record_batches: Vec<arrow::record_batch::RecordBatch>,
+    record_batches: Vec<RecordBatch>,
 ) -> impl Stream<Item = Result<FlightData, Status>> {
     FlightDataEncoderBuilder::new()
         .build(stream::iter(record_batches.into_iter().map(Ok)))
