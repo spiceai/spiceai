@@ -2,14 +2,18 @@ use crate::datafusion::DataFusion;
 use crate::dataupdate::{DataUpdate, UpdateType};
 use arrow::datatypes::Schema;
 use arrow::ipc::writer::{DictionaryTracker, IpcDataGenerator};
-use arrow_flight::{sql, Action, IpcMessage};
+use arrow_flight::encode::FlightDataEncoderBuilder;
+use arrow_flight::sql::{Any, Command, ProstMessageExt};
+use arrow_flight::{sql, Action, ActionType, Criteria, IpcMessage, SchemaResult};
 use arrow_ipc::convert::try_schema_from_flatbuffer_bytes;
 use arrow_ipc::writer::{self, IpcWriteOptions};
+use bytes::Bytes;
 use datafusion::arrow::error::ArrowError;
 use datafusion::datasource::TableType;
 use datafusion::execution::SendableRecordBatchStream;
 use futures::stream::{self, BoxStream, StreamExt};
-use futures::Stream;
+use futures::{Stream, TryStreamExt};
+use prost::Message;
 use snafu::prelude::*;
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -21,12 +25,24 @@ use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 use uuid::Uuid;
 
+mod sql_info;
+
 use arrow_flight::{
     flight_service_server::{FlightService, FlightServiceServer},
-    sql::server::FlightSqlService,
     FlightData, FlightDescriptor, FlightEndpoint, FlightInfo, HandshakeRequest, HandshakeResponse,
     PutResult, SchemaAsIpc, Ticket,
 };
+
+use self::sql_info::get_sql_info_data;
+
+pub(crate) static CREATE_PREPARED_STATEMENT: &str = "CreatePreparedStatement";
+pub(crate) static CLOSE_PREPARED_STATEMENT: &str = "ClosePreparedStatement";
+pub(crate) static CREATE_PREPARED_SUBSTRAIT_PLAN: &str = "CreatePreparedSubstraitPlan";
+pub(crate) static BEGIN_TRANSACTION: &str = "BeginTransaction";
+pub(crate) static END_TRANSACTION: &str = "EndTransaction";
+pub(crate) static BEGIN_SAVEPOINT: &str = "BeginSavepoint";
+pub(crate) static END_SAVEPOINT: &str = "EndSavepoint";
+pub(crate) static CANCEL_QUERY: &str = "CancelQuery";
 
 pub struct Service {
     datafusion: Arc<RwLock<DataFusion>>,
@@ -48,7 +64,382 @@ async fn get_sender_channel(
     }
 }
 
+#[tonic::async_trait]
+impl FlightService for Service {
+    type HandshakeStream =
+        Pin<Box<dyn Stream<Item = Result<HandshakeResponse, Status>> + Send + 'static>>;
+    type ListFlightsStream =
+        Pin<Box<dyn Stream<Item = Result<FlightInfo, Status>> + Send + 'static>>;
+    type DoGetStream = Pin<Box<dyn Stream<Item = Result<FlightData, Status>> + Send + 'static>>;
+    type DoPutStream = Pin<Box<dyn Stream<Item = Result<PutResult, Status>> + Send + 'static>>;
+    type DoActionStream =
+        Pin<Box<dyn Stream<Item = Result<arrow_flight::Result, Status>> + Send + 'static>>;
+    type ListActionsStream =
+        Pin<Box<dyn Stream<Item = Result<ActionType, Status>> + Send + 'static>>;
+    type DoExchangeStream =
+        Pin<Box<dyn Stream<Item = Result<FlightData, Status>> + Send + 'static>>;
+
+    async fn handshake(
+        &self,
+        request: Request<Streaming<HandshakeRequest>>,
+    ) -> Result<Response<Self::HandshakeStream>, Status> {
+        tracing::trace!("handshake");
+        let res = self.do_handshake(request).await?;
+        Ok(res)
+    }
+
+    async fn list_flights(
+        &self,
+        request: Request<Criteria>,
+    ) -> Result<Response<Self::ListFlightsStream>, Status> {
+        tracing::trace!("list_flights");
+        Err(Status::unimplemented("Not yet implemented"))
+    }
+
+    async fn get_flight_info(
+        &self,
+        request: Request<FlightDescriptor>,
+    ) -> Result<Response<FlightInfo>, Status> {
+        tracing::trace!("get_flight_info");
+        let message = Any::decode(&*request.get_ref().cmd).map_err(to_tonic_err)?;
+
+        match Command::try_from(message).map_err(to_tonic_err)? {
+            Command::CommandStatementQuery(token) => {
+                //self.get_flight_info_statement(token, request).await
+                Err(Status::unimplemented("Not yet implemented"))
+            }
+            Command::CommandPreparedStatementQuery(handle) => {
+                self.get_flight_info_prepared_statement(handle, request)
+                    .await
+            }
+            Command::CommandStatementSubstraitPlan(handle) => {
+                //self.get_flight_info_substrait_plan(handle, request).await
+                Err(Status::unimplemented("Not yet implemented"))
+            }
+            Command::CommandGetCatalogs(token) => {
+                //self.get_flight_info_catalogs(token, request).await
+                Err(Status::unimplemented("Not yet implemented"))
+            }
+            Command::CommandGetDbSchemas(token) => {
+                //return self.get_flight_info_schemas(token, request).await
+                Err(Status::unimplemented("Not yet implemented"))
+            }
+            Command::CommandGetTables(token) => self.get_flight_info_tables(token, request).await,
+            Command::CommandGetTableTypes(token) => {
+                //self.get_flight_info_table_types(token, request).await
+                Err(Status::unimplemented("Not yet implemented"))
+            }
+            Command::CommandGetSqlInfo(token) => {
+                self.get_flight_info_sql_info(token, request).await
+            }
+            Command::CommandGetPrimaryKeys(token) => {
+                //self.get_flight_info_primary_keys(token, request).await
+                Err(Status::unimplemented("Not yet implemented"))
+            }
+            Command::CommandGetExportedKeys(token) => {
+                //self.get_flight_info_exported_keys(token, request).await
+                Err(Status::unimplemented("Not yet implemented"))
+            }
+            Command::CommandGetImportedKeys(token) => {
+                //self.get_flight_info_imported_keys(token, request).await
+                Err(Status::unimplemented("Not yet implemented"))
+            }
+            Command::CommandGetCrossReference(token) => {
+                //self.get_flight_info_cross_reference(token, request).await
+                Err(Status::unimplemented("Not yet implemented"))
+            }
+            Command::CommandGetXdbcTypeInfo(token) => {
+                //self.get_flight_info_xdbc_type_info(token, request).await
+                Err(Status::unimplemented("Not yet implemented"))
+            }
+            cmd => self.get_flight_info_fallback(cmd, request).await,
+        }
+    }
+
+    async fn get_schema(
+        &self,
+        request: Request<FlightDescriptor>,
+    ) -> Result<Response<SchemaResult>, Status> {
+        tracing::trace!("get_schema");
+        Err(Status::unimplemented("Not yet implemented"))
+    }
+
+    async fn do_get(
+        &self,
+        request: Request<Ticket>,
+    ) -> Result<Response<Self::DoGetStream>, Status> {
+        tracing::trace!("do_get");
+        let msg: Any = Message::decode(&*request.get_ref().ticket).map_err(to_tonic_err)?;
+
+        match Command::try_from(msg).map_err(to_tonic_err)? {
+            Command::TicketStatementQuery(command) => self.do_get_statement(command, request).await,
+            Command::CommandPreparedStatementQuery(command) => {
+                self.do_get_prepared_statement(command, request).await
+            }
+            Command::CommandGetCatalogs(command) => self.do_get_catalogs(command, request).await,
+            Command::CommandGetDbSchemas(command) => self.do_get_schemas(command, request).await,
+            Command::CommandGetTables(command) => self.do_get_tables(command, request).await,
+            Command::CommandGetTableTypes(command) => {
+                //self.do_get_table_types(command, request).await
+                Err(Status::unimplemented("Not yet implemented"))
+            }
+            Command::CommandGetSqlInfo(command) => self.do_get_sql_info(command, request).await,
+            Command::CommandGetPrimaryKeys(command) => {
+                //self.do_get_primary_keys(command, request).await
+                Err(Status::unimplemented("Not yet implemented"))
+            }
+            Command::CommandGetExportedKeys(command) => {
+                //self.do_get_exported_keys(command, request).await
+                Err(Status::unimplemented("Not yet implemented"))
+            }
+            Command::CommandGetImportedKeys(command) => {
+                //self.do_get_imported_keys(command, request).await
+                Err(Status::unimplemented("Not yet implemented"))
+            }
+            Command::CommandGetCrossReference(command) => {
+                //self.do_get_cross_reference(command, request).await
+                Err(Status::unimplemented("Not yet implemented"))
+            }
+            Command::CommandGetXdbcTypeInfo(command) => {
+                //self.do_get_xdbc_type_info(command, request).await
+                Err(Status::unimplemented("Not yet implemented"))
+            }
+            cmd => self.do_get_fallback(request, cmd.into_any()).await,
+        }
+    }
+
+    async fn do_put(
+        &self,
+        request: Request<Streaming<FlightData>>,
+    ) -> Result<Response<Self::DoPutStream>, Status> {
+        tracing::trace!("do_put");
+        let res = self.do_put_fallback(request).await?;
+        Ok(res)
+    }
+
+    async fn list_actions(
+        &self,
+        _request: Request<arrow_flight::Empty>,
+    ) -> Result<Response<Self::ListActionsStream>, Status> {
+        tracing::trace!("list_actions");
+        let create_prepared_statement_action_type = ActionType {
+            r#type: CREATE_PREPARED_STATEMENT.to_string(),
+            description: "Creates a reusable prepared statement resource on the server.\n
+                Request Message: ActionCreatePreparedStatementRequest\n
+                Response Message: ActionCreatePreparedStatementResult"
+                .into(),
+        };
+        let close_prepared_statement_action_type = ActionType {
+            r#type: CLOSE_PREPARED_STATEMENT.to_string(),
+            description: "Closes a reusable prepared statement resource on the server.\n
+                Request Message: ActionClosePreparedStatementRequest\n
+                Response Message: N/A"
+                .into(),
+        };
+        let create_prepared_substrait_plan_action_type = ActionType {
+            r#type: CREATE_PREPARED_SUBSTRAIT_PLAN.to_string(),
+            description: "Creates a reusable prepared substrait plan resource on the server.\n
+                Request Message: ActionCreatePreparedSubstraitPlanRequest\n
+                Response Message: ActionCreatePreparedStatementResult"
+                .into(),
+        };
+        let begin_transaction_action_type = ActionType {
+            r#type: BEGIN_TRANSACTION.to_string(),
+            description: "Begins a transaction.\n
+                Request Message: ActionBeginTransactionRequest\n
+                Response Message: ActionBeginTransactionResult"
+                .into(),
+        };
+        let end_transaction_action_type = ActionType {
+            r#type: END_TRANSACTION.to_string(),
+            description: "Ends a transaction\n
+                Request Message: ActionEndTransactionRequest\n
+                Response Message: N/A"
+                .into(),
+        };
+        let begin_savepoint_action_type = ActionType {
+            r#type: BEGIN_SAVEPOINT.to_string(),
+            description: "Begins a savepoint.\n
+                Request Message: ActionBeginSavepointRequest\n
+                Response Message: ActionBeginSavepointResult"
+                .into(),
+        };
+        let end_savepoint_action_type = ActionType {
+            r#type: END_SAVEPOINT.to_string(),
+            description: "Ends a savepoint\n
+                Request Message: ActionEndSavepointRequest\n
+                Response Message: N/A"
+                .into(),
+        };
+        let cancel_query_action_type = ActionType {
+            r#type: CANCEL_QUERY.to_string(),
+            description: "Cancels a query\n
+                Request Message: ActionCancelQueryRequest\n
+                Response Message: ActionCancelQueryResult"
+                .into(),
+        };
+        let mut actions: Vec<Result<ActionType, Status>> = vec![
+            Ok(create_prepared_statement_action_type),
+            Ok(close_prepared_statement_action_type),
+            Ok(create_prepared_substrait_plan_action_type),
+            Ok(begin_transaction_action_type),
+            Ok(end_transaction_action_type),
+            Ok(begin_savepoint_action_type),
+            Ok(end_savepoint_action_type),
+            Ok(cancel_query_action_type),
+        ];
+
+        // if let Some(mut custom_actions) = self.list_custom_actions().await {
+        //     actions.append(&mut custom_actions);
+        // }
+
+        let output = futures::stream::iter(actions);
+        Ok(Response::new(Box::pin(output) as Self::ListActionsStream))
+    }
+
+    async fn do_action(
+        &self,
+        request: Request<Action>,
+    ) -> Result<Response<Self::DoActionStream>, Status> {
+        tracing::trace!("do_action");
+        if request.get_ref().r#type == CREATE_PREPARED_STATEMENT {
+            let any = Any::decode(&*request.get_ref().body).map_err(to_tonic_err)?;
+
+            let cmd: sql::ActionCreatePreparedStatementRequest =
+                any.unpack().map_err(to_tonic_err)?.ok_or_else(|| {
+                    Status::invalid_argument(
+                        "Unable to unpack ActionCreatePreparedStatementRequest.",
+                    )
+                })?;
+            let stmt = self
+                .do_action_create_prepared_statement(cmd, request)
+                .await?;
+            let output = futures::stream::iter(vec![Ok(arrow_flight::Result {
+                body: stmt.as_any().encode_to_vec().into(),
+            })]);
+            return Ok(Response::new(Box::pin(output)));
+        } else if request.get_ref().r#type == CLOSE_PREPARED_STATEMENT {
+            let any = Any::decode(&*request.get_ref().body).map_err(to_tonic_err)?;
+
+            let cmd: sql::ActionClosePreparedStatementRequest =
+                any.unpack().map_err(to_tonic_err)?.ok_or_else(|| {
+                    Status::invalid_argument(
+                        "Unable to unpack ActionClosePreparedStatementRequest.",
+                    )
+                })?;
+            // self.do_action_close_prepared_statement(cmd, request)
+            //     .await?;
+            return Ok(Response::new(Box::pin(futures::stream::empty())));
+        } else if request.get_ref().r#type == CREATE_PREPARED_SUBSTRAIT_PLAN {
+            let any = Any::decode(&*request.get_ref().body).map_err(to_tonic_err)?;
+
+            let cmd: sql::ActionCreatePreparedSubstraitPlanRequest =
+                any.unpack().map_err(to_tonic_err)?.ok_or_else(|| {
+                    Status::invalid_argument(
+                        "Unable to unpack ActionCreatePreparedSubstraitPlanRequest.",
+                    )
+                })?;
+            // self.do_action_create_prepared_substrait_plan(cmd, request)
+            //     .await?;
+            return Ok(Response::new(Box::pin(futures::stream::empty())));
+        } else if request.get_ref().r#type == BEGIN_TRANSACTION {
+            let any = Any::decode(&*request.get_ref().body).map_err(to_tonic_err)?;
+
+            let cmd: sql::ActionBeginTransactionRequest =
+                any.unpack().map_err(to_tonic_err)?.ok_or_else(|| {
+                    Status::invalid_argument("Unable to unpack ActionBeginTransactionRequest.")
+                })?;
+            let stmt = self.do_action_begin_transaction(cmd, request).await?;
+            let output = futures::stream::iter(vec![Ok(arrow_flight::Result {
+                body: stmt.as_any().encode_to_vec().into(),
+            })]);
+            return Ok(Response::new(Box::pin(output)));
+        } else if request.get_ref().r#type == END_TRANSACTION {
+            let any = Any::decode(&*request.get_ref().body).map_err(to_tonic_err)?;
+
+            let cmd: sql::ActionEndTransactionRequest =
+                any.unpack().map_err(to_tonic_err)?.ok_or_else(|| {
+                    Status::invalid_argument("Unable to unpack ActionEndTransactionRequest.")
+                })?;
+            self.do_action_end_transaction(cmd, request).await?;
+            return Ok(Response::new(Box::pin(futures::stream::empty())));
+        } else if request.get_ref().r#type == BEGIN_SAVEPOINT {
+            let any = Any::decode(&*request.get_ref().body).map_err(to_tonic_err)?;
+
+            let cmd: sql::ActionBeginSavepointRequest =
+                any.unpack().map_err(to_tonic_err)?.ok_or_else(|| {
+                    Status::invalid_argument("Unable to unpack ActionBeginSavepointRequest.")
+                })?;
+            let stmt = self.do_action_begin_savepoint(cmd, request).await?;
+            let output = futures::stream::iter(vec![Ok(arrow_flight::Result {
+                body: stmt.as_any().encode_to_vec().into(),
+            })]);
+            return Ok(Response::new(Box::pin(output)));
+        } else if request.get_ref().r#type == END_SAVEPOINT {
+            let any = Any::decode(&*request.get_ref().body).map_err(to_tonic_err)?;
+
+            let cmd: sql::ActionEndSavepointRequest =
+                any.unpack().map_err(to_tonic_err)?.ok_or_else(|| {
+                    Status::invalid_argument("Unable to unpack ActionEndSavepointRequest.")
+                })?;
+            self.do_action_end_savepoint(cmd, request).await?;
+            return Ok(Response::new(Box::pin(futures::stream::empty())));
+        } else if request.get_ref().r#type == CANCEL_QUERY {
+            let any = Any::decode(&*request.get_ref().body).map_err(to_tonic_err)?;
+
+            let cmd: sql::ActionCancelQueryRequest =
+                any.unpack().map_err(to_tonic_err)?.ok_or_else(|| {
+                    Status::invalid_argument("Unable to unpack ActionCancelQueryRequest.")
+                })?;
+            let stmt = self.do_action_cancel_query(cmd, request).await?;
+            let output = futures::stream::iter(vec![Ok(arrow_flight::Result {
+                body: stmt.as_any().encode_to_vec().into(),
+            })]);
+            return Ok(Response::new(Box::pin(output)));
+        }
+
+        self.do_action_fallback(request).await
+    }
+
+    async fn do_exchange(
+        &self,
+        request: Request<Streaming<FlightData>>,
+    ) -> Result<Response<Self::DoExchangeStream>, Status> {
+        tracing::trace!("do_exchange");
+        self.do_exchange_fallback(request).await
+    }
+}
+
 impl Service {
+    async fn get_arrow_schema_and_size_sql(
+        datafusion: Arc<RwLock<DataFusion>>,
+        sql: String,
+    ) -> Result<(Schema, usize), Status> {
+        let df = datafusion
+            .read()
+            .await
+            .ctx
+            .sql(&sql)
+            .await
+            .map_err(to_tonic_err)?;
+
+        let schema = df.schema();
+        let arrow_schema: Schema = schema.into();
+
+        let size = df.count().await.map_err(to_tonic_err)?;
+
+        Ok((arrow_schema, size))
+    }
+
+    fn serialize_schema(schema: &Schema) -> Result<Bytes, Status> {
+        let message: IpcMessage = SchemaAsIpc::new(schema, &IpcWriteOptions::default())
+            .try_into()
+            .map_err(to_tonic_err)?;
+        let IpcMessage(schema_bytes) = message;
+
+        Ok(schema_bytes)
+    }
+
     async fn sql_to_flight_stream(
         datafusion: Arc<RwLock<DataFusion>>,
         sql: String,
@@ -103,12 +494,8 @@ impl Service {
 
         Ok(flights_stream.boxed())
     }
-}
 
-#[tonic::async_trait]
-impl FlightSqlService for Service {
-    type FlightService = Service;
-
+    #[allow(clippy::unused_async)]
     async fn do_handshake(
         &self,
         _request: Request<Streaming<HandshakeRequest>>,
@@ -139,6 +526,7 @@ impl FlightSqlService for Service {
         query: sql::CommandGetCatalogs,
         _request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+        tracing::trace!("do_get_catalogs: {query:?}");
         let mut builder = query.into_builder();
 
         let catalog_names = self.datafusion.read().await.ctx.catalog_names();
@@ -151,7 +539,7 @@ impl FlightSqlService for Service {
 
         Ok(Response::new(
             Box::pin(record_batches_to_flight_stream(vec![record_batch])?)
-                as <<Service as FlightSqlService>::FlightService as FlightService>::DoGetStream,
+                as <Service as FlightService>::DoGetStream,
         ))
     }
 
@@ -161,6 +549,7 @@ impl FlightSqlService for Service {
         _request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
         let catalog = &query.catalog;
+        tracing::trace!("do_get_schemas: {query:?}");
         let filtered_catalogs = match catalog {
             Some(catalog) => vec![catalog.to_string()],
             None => self.datafusion.read().await.ctx.catalog_names(),
@@ -186,7 +575,7 @@ impl FlightSqlService for Service {
 
         Ok(Response::new(
             Box::pin(record_batches_to_flight_stream(vec![record_batch])?)
-                as <<Service as FlightSqlService>::FlightService as FlightService>::DoGetStream,
+                as <Service as FlightService>::DoGetStream,
         ))
     }
 
@@ -196,6 +585,7 @@ impl FlightSqlService for Service {
         _request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
         let catalog = &query.catalog;
+        tracing::trace!("do_get_tables: {query:?}");
         let filtered_catalogs = match catalog {
             Some(catalog) => vec![catalog.to_string()],
             None => self.datafusion.read().await.ctx.catalog_names(),
@@ -240,7 +630,7 @@ impl FlightSqlService for Service {
 
         Ok(Response::new(
             Box::pin(record_batches_to_flight_stream(vec![record_batch])?)
-                as <<Service as FlightSqlService>::FlightService as FlightService>::DoGetStream,
+                as <Service as FlightService>::DoGetStream,
         ))
     }
 
@@ -250,12 +640,35 @@ impl FlightSqlService for Service {
         _request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
         let datafusion = Arc::clone(&self.datafusion);
+        tracing::trace!("do_get_statement: {ticket:?}");
         match std::str::from_utf8(&ticket.statement_handle) {
             Ok(sql) => {
                 let output = Self::sql_to_flight_stream(datafusion, sql.to_owned()).await?;
-                Ok(Response::new(Box::pin(output) as <<Service as FlightSqlService>::FlightService as FlightService>::DoGetStream))
+                Ok(Response::new(
+                    Box::pin(output) as <Service as FlightService>::DoGetStream
+                ))
             }
             Err(e) => Err(Status::invalid_argument(format!("Invalid ticket: {e:?}"))),
+        }
+    }
+
+    async fn do_get_prepared_statement(
+        &self,
+        query: sql::CommandPreparedStatementQuery,
+        _request: Request<Ticket>,
+    ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+        let datafusion = Arc::clone(&self.datafusion);
+        tracing::trace!("do_get_prepared_statement: {query:?}");
+        match std::str::from_utf8(&query.prepared_statement_handle) {
+            Ok(sql) => {
+                let output = Self::sql_to_flight_stream(datafusion, sql.to_owned()).await?;
+                Ok(Response::new(
+                    Box::pin(output) as <Service as FlightService>::DoGetStream
+                ))
+            }
+            Err(e) => Err(Status::invalid_argument(format!(
+                "Invalid prepared statement handle: {e:?}"
+            ))),
         }
     }
 
@@ -267,21 +680,26 @@ impl FlightSqlService for Service {
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
         let datafusion = Arc::clone(&self.datafusion);
         let ticket = request.into_inner();
+        tracing::trace!("do_get_fallback: {ticket:?}");
         match std::str::from_utf8(&ticket.ticket) {
             Ok(sql) => {
                 let output = Self::sql_to_flight_stream(datafusion, sql.to_owned()).await?;
-                Ok(Response::new(Box::pin(output) as <<Service as FlightSqlService>::FlightService as FlightService>::DoGetStream))
+                Ok(Response::new(
+                    Box::pin(output) as <Service as FlightService>::DoGetStream
+                ))
             }
             Err(e) => Err(Status::invalid_argument(format!("Invalid ticket: {e:?}"))),
         }
     }
 
+    #[allow(clippy::unused_async)]
     async fn get_flight_info_tables(
         &self,
-        _query: sql::CommandGetTables,
+        query: sql::CommandGetTables,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
         let fd = request.into_inner();
+        tracing::trace!("get_flight_info_tables: {query:?}");
         Ok(Response::new(FlightInfo {
             flight_descriptor: Some(fd.clone()),
             endpoint: vec![FlightEndpoint {
@@ -297,24 +715,47 @@ impl FlightSqlService for Service {
         handle: sql::CommandPreparedStatementQuery,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
+        tracing::trace!("get_flight_info_prepared_statement: {handle:?}");
+
+        let sql = match std::str::from_utf8(&handle.prepared_statement_handle) {
+            Ok(sql) => sql.to_string(),
+            Err(e) => {
+                return Err(Status::invalid_argument(format!(
+                    "Invalid prepared statement handle: {e:?}"
+                )))
+            }
+        };
+
+        let (arrow_schema, num_rows) =
+            Self::get_arrow_schema_and_size_sql(Arc::clone(&self.datafusion), sql)
+                .await
+                .map_err(to_tonic_err)?;
+
+        tracing::trace!("get_flight_info_prepared_statement: arrow_schema={arrow_schema:?} num_rows={num_rows:?}");
+
         let fd = request.into_inner();
-        Ok(Response::new(FlightInfo {
-            flight_descriptor: Some(fd.clone()),
-            endpoint: vec![FlightEndpoint {
-                ticket: Some(Ticket {
-                    ticket: handle.prepared_statement_handle,
-                }),
-                ..Default::default()
-            }],
-            ..Default::default()
-        }))
+
+        let endpoint = FlightEndpoint::new().with_ticket(Ticket {
+            ticket: handle.as_any().encode_to_vec().into(),
+        });
+
+        let info = FlightInfo::new()
+            .with_endpoint(endpoint)
+            .try_with_schema(&arrow_schema)
+            .map_err(to_tonic_err)?
+            .with_descriptor(fd)
+            .with_total_records(num_rows.try_into().map_err(to_tonic_err)?);
+
+        Ok(Response::new(info))
     }
 
+    #[allow(clippy::unused_async)]
     async fn get_flight_info_fallback(
         &self,
-        _cmd: sql::Command,
+        cmd: sql::Command,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
+        tracing::trace!("get_flight_info_fallback: {cmd:?}");
         let fd = request.into_inner();
         Ok(Response::new(FlightInfo {
             flight_descriptor: Some(fd.clone()),
@@ -332,22 +773,15 @@ impl FlightSqlService for Service {
         statement: sql::ActionCreatePreparedStatementRequest,
         _request: Request<Action>,
     ) -> Result<sql::ActionCreatePreparedStatementResult, Status> {
-        let dataframe = self
-            .datafusion
-            .read()
-            .await
-            .ctx
-            .sql(&statement.query)
-            .await
-            .map_err(to_tonic_err)?;
+        tracing::trace!("do_action_create_prepared_statement: {statement:?}");
+        let (arrow_schema, _) = Self::get_arrow_schema_and_size_sql(
+            Arc::clone(&self.datafusion),
+            statement.query.clone(),
+        )
+        .await
+        .map_err(to_tonic_err)?;
 
-        let schema = dataframe.schema();
-        let arrow_schema: Schema = schema.into();
-
-        let message = SchemaAsIpc::new(&arrow_schema, &IpcWriteOptions::default())
-            .try_into()
-            .map_err(to_tonic_err)?;
-        let IpcMessage(schema_bytes) = message;
+        let schema_bytes = Self::serialize_schema(&arrow_schema)?;
 
         Ok(sql::ActionCreatePreparedStatementResult {
             prepared_statement_handle: statement.query.into(),
@@ -358,10 +792,10 @@ impl FlightSqlService for Service {
 
     async fn do_put_fallback(
         &self,
-        request: Request<sql::server::PeekableFlightDataStream>,
-        _message: sql::Any,
+        request: Request<Streaming<FlightData>>,
     ) -> Result<Response<<Self as FlightService>::DoPutStream>, Status> {
-        let mut streaming_flight = request.into_inner().into_inner();
+        tracing::trace!("do_put_fallback");
+        let mut streaming_flight = request.into_inner();
 
         let Ok(Some(message)) = streaming_flight.message().await else {
             return Err(Status::invalid_argument("No flight data provided"));
@@ -471,6 +905,7 @@ impl FlightSqlService for Service {
         &self,
         request: Request<Streaming<FlightData>>,
     ) -> Result<Response<<Self as FlightService>::DoExchangeStream>, Status> {
+        tracing::trace!("do_exchange_fallback");
         let mut streaming_request = request.into_inner();
         let req = streaming_request.next().await;
         let Some(subscription_request) = req else {
@@ -595,7 +1030,124 @@ impl FlightSqlService for Service {
         Ok(Response::new(response_stream.boxed()))
     }
 
-    async fn register_sql_info(&self, _id: i32, _result: &sql::SqlInfo) {}
+    /// Begin a transaction
+    #[allow(clippy::unused_async)]
+    async fn do_action_begin_transaction(
+        &self,
+        _query: sql::ActionBeginTransactionRequest,
+        _request: Request<Action>,
+    ) -> Result<sql::ActionBeginTransactionResult, Status> {
+        Err(Status::unimplemented(
+            "do_action_begin_transaction has no default implementation",
+        ))
+    }
+
+    /// End a transaction
+    #[allow(clippy::unused_async)]
+    async fn do_action_end_transaction(
+        &self,
+        _query: sql::ActionEndTransactionRequest,
+        _request: Request<Action>,
+    ) -> Result<(), Status> {
+        Err(Status::unimplemented(
+            "do_action_end_transaction has no default implementation",
+        ))
+    }
+
+    /// Begin a savepoint
+    #[allow(clippy::unused_async)]
+    async fn do_action_begin_savepoint(
+        &self,
+        _query: sql::ActionBeginSavepointRequest,
+        _request: Request<Action>,
+    ) -> Result<sql::ActionBeginSavepointResult, Status> {
+        Err(Status::unimplemented(
+            "do_action_begin_savepoint has no default implementation",
+        ))
+    }
+
+    /// End a savepoint
+    #[allow(clippy::unused_async)]
+    async fn do_action_end_savepoint(
+        &self,
+        _query: sql::ActionEndSavepointRequest,
+        _request: Request<Action>,
+    ) -> Result<(), Status> {
+        Err(Status::unimplemented(
+            "do_action_end_savepoint has no default implementation",
+        ))
+    }
+
+    /// Cancel a query
+    #[allow(clippy::unused_async)]
+    async fn do_action_cancel_query(
+        &self,
+        _query: sql::ActionCancelQueryRequest,
+        _request: Request<Action>,
+    ) -> Result<sql::ActionCancelQueryResult, Status> {
+        Err(Status::unimplemented(
+            "do_action_cancel_query has no default implementation",
+        ))
+    }
+
+    #[allow(clippy::unused_async)]
+    async fn do_action_fallback(
+        &self,
+        request: Request<Action>,
+    ) -> Result<Response<<Self as FlightService>::DoActionStream>, Status> {
+        Err(Status::invalid_argument(format!(
+            "do_action: The defined request is invalid: {:?}",
+            request.get_ref().r#type
+        )))
+    }
+
+    /// Get a FlightInfo for retrieving other information (See SqlInfo).
+    #[allow(clippy::unused_async)]
+    async fn get_flight_info_sql_info(
+        &self,
+        query: sql::CommandGetSqlInfo,
+        request: Request<FlightDescriptor>,
+    ) -> Result<Response<FlightInfo>, Status> {
+        tracing::trace!("get_flight_info_sql_info: query={query:?}");
+        let builder = query.clone().into_builder(get_sql_info_data());
+        let record_batch = builder.build().map_err(to_tonic_err)?;
+
+        let fd = request.into_inner();
+
+        let ticket = Ticket {
+            ticket: query.as_any().encode_to_vec().into(),
+        };
+
+        let endpoint = FlightEndpoint::new().with_ticket(ticket);
+
+        Ok(Response::new(
+            FlightInfo::new()
+                .with_endpoint(endpoint)
+                .with_descriptor(fd)
+                .try_with_schema(&record_batch.schema())
+                .map_err(to_tonic_err)?,
+        ))
+    }
+
+    /// Get a FlightDataStream containing the list of SqlInfo results.
+    #[allow(clippy::unused_async)]
+    async fn do_get_sql_info(
+        &self,
+        query: sql::CommandGetSqlInfo,
+        _request: Request<Ticket>,
+    ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+        tracing::trace!("do_get_sql_info: {query:?}");
+        let builder = query.into_builder(get_sql_info_data());
+        let record_batch = builder.build().map_err(to_tonic_err)?;
+
+        let batches_stream = stream::iter(vec![Ok(record_batch)]);
+
+        let flight_data_stream = FlightDataEncoderBuilder::new().build(batches_stream);
+
+        Ok(Response::new(
+            flight_data_stream.map_err(to_tonic_err).boxed(),
+        ))
+    }
 }
 
 fn table_type_name(table_type: TableType) -> &'static str {
