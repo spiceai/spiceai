@@ -24,7 +24,6 @@ mod do_get;
 mod do_put;
 mod flightsql;
 mod get_flight_info;
-mod get_schema;
 mod handshake;
 
 use arrow_flight::{
