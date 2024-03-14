@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use arrow_flight::{
     flight_service_server::FlightService,
     sql::{Any, Command},
@@ -12,7 +14,10 @@ pub(crate) async fn handle(
     flight_svc: &Service,
     request: Request<Ticket>,
 ) -> Result<Response<<Service as FlightService>::DoGetStream>, Status> {
-    let msg: Any = Message::decode(&*request.get_ref().ticket).map_err(to_tonic_err)?;
+    let msg: Any = match Message::decode(&*request.get_ref().ticket) {
+        Ok(msg) => msg,
+        Err(_) => return do_get_simple(flight_svc, request).await,
+    };
 
     match Command::try_from(msg).map_err(to_tonic_err)? {
         Command::TicketStatementQuery(command) => {
@@ -32,5 +37,23 @@ pub(crate) async fn handle(
         }
         Command::CommandGetSqlInfo(command) => flightsql::get_sql_info::do_get(command),
         _ => Err(Status::unimplemented("Not yet implemented")),
+    }
+}
+
+async fn do_get_simple(
+    flight_svc: &Service,
+    request: Request<Ticket>,
+) -> Result<Response<<Service as FlightService>::DoGetStream>, Status> {
+    let datafusion = Arc::clone(&flight_svc.datafusion);
+    let ticket = request.into_inner();
+    tracing::trace!("do_get_simple: {ticket:?}");
+    match std::str::from_utf8(&ticket.ticket) {
+        Ok(sql) => {
+            let output = Service::sql_to_flight_stream(datafusion, sql.to_owned()).await?;
+            Ok(Response::new(
+                Box::pin(output) as <Service as FlightService>::DoGetStream
+            ))
+        }
+        Err(e) => Err(Status::invalid_argument(format!("Invalid ticket: {e:?}"))),
     }
 }

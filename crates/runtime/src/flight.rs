@@ -57,7 +57,6 @@ impl FlightService for Service {
         &self,
         _request: Request<Streaming<HandshakeRequest>>,
     ) -> Result<Response<Self::HandshakeStream>, Status> {
-        tracing::trace!("handshake");
         handshake::handle()
     }
 
@@ -65,7 +64,7 @@ impl FlightService for Service {
         &self,
         _request: Request<Criteria>,
     ) -> Result<Response<Self::ListFlightsStream>, Status> {
-        tracing::trace!("list_flights");
+        tracing::trace!("list_flights - unimplemented");
         Err(Status::unimplemented("Not yet implemented"))
     }
 
@@ -73,7 +72,6 @@ impl FlightService for Service {
         &self,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        tracing::trace!("get_flight_info");
         get_flight_info::handle(self, request).await
     }
 
@@ -81,7 +79,7 @@ impl FlightService for Service {
         &self,
         _request: Request<FlightDescriptor>,
     ) -> Result<Response<SchemaResult>, Status> {
-        tracing::trace!("get_schema");
+        tracing::trace!("get_schema - unimplemented");
         Err(Status::unimplemented("Not yet implemented"))
     }
 
@@ -89,7 +87,6 @@ impl FlightService for Service {
         &self,
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
-        tracing::trace!("do_get");
         do_get::handle(self, request).await
     }
 
@@ -97,7 +94,6 @@ impl FlightService for Service {
         &self,
         request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoPutStream>, Status> {
-        tracing::trace!("do_put");
         do_put::handle(self, request).await
     }
 
@@ -105,7 +101,6 @@ impl FlightService for Service {
         &self,
         request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoExchangeStream>, Status> {
-        tracing::trace!("do_exchange");
         do_exchange::handle(self, request).await
     }
 
@@ -113,7 +108,6 @@ impl FlightService for Service {
         &self,
         request: Request<Action>,
     ) -> Result<Response<Self::DoActionStream>, Status> {
-        tracing::trace!("do_action");
         actions::do_action(self, request).await
     }
 
@@ -121,7 +115,6 @@ impl FlightService for Service {
         &self,
         _request: Request<arrow_flight::Empty>,
     ) -> Result<Response<Self::ListActionsStream>, Status> {
-        tracing::trace!("list_actions");
         Ok(actions::list())
     }
 }
@@ -210,44 +203,6 @@ impl Service {
 
         Ok(flights_stream.boxed())
     }
-
-    // If the ticket isn't a sql command, then try interpreting the ticket as a raw SQL query.
-    // async fn do_get_fallback(
-    //     &self,
-    //     request: Request<Ticket>,
-    //     _message: arrow_flight::sql::Any,
-    // ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
-    //     let datafusion = Arc::clone(&self.datafusion);
-    //     let ticket = request.into_inner();
-    //     tracing::trace!("do_get_fallback: {ticket:?}");
-    //     match std::str::from_utf8(&ticket.ticket) {
-    //         Ok(sql) => {
-    //             let output = Self::sql_to_flight_stream(datafusion, sql.to_owned()).await?;
-    //             Ok(Response::new(
-    //                 Box::pin(output) as <Service as FlightService>::DoGetStream
-    //             ))
-    //         }
-    //         Err(e) => Err(Status::invalid_argument(format!("Invalid ticket: {e:?}"))),
-    //     }
-    // }
-
-    // #[allow(clippy::unused_async)]
-    // async fn get_flight_info_fallback(
-    //     &self,
-    //     cmd: sql::Command,
-    //     request: Request<FlightDescriptor>,
-    // ) -> Result<Response<FlightInfo>, Status> {
-    //     tracing::trace!("get_flight_info_fallback: {cmd:?}");
-    //     let fd = request.into_inner();
-    //     Ok(Response::new(FlightInfo {
-    //         flight_descriptor: Some(fd.clone()),
-    //         endpoint: vec![FlightEndpoint {
-    //             ticket: Some(Ticket { ticket: fd.cmd }),
-    //             ..Default::default()
-    //         }],
-    //         ..Default::default()
-    //     }))
-    // }
 }
 
 fn record_batches_to_flight_stream(

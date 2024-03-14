@@ -1,6 +1,6 @@
 use arrow_flight::{
     sql::{Any, Command},
-    FlightDescriptor, FlightInfo,
+    FlightDescriptor, FlightEndpoint, FlightInfo, Ticket,
 };
 use prost::Message;
 use tonic::{Request, Response, Status};
@@ -11,7 +11,9 @@ pub(crate) async fn handle(
     flight_svc: &Service,
     request: Request<FlightDescriptor>,
 ) -> Result<Response<FlightInfo>, Status> {
-    let message = Any::decode(&*request.get_ref().cmd).map_err(to_tonic_err)?;
+    let Ok(message) = Any::decode(&*request.get_ref().cmd) else {
+        return Ok(get_flight_info_simple(request));
+    };
 
     match Command::try_from(message).map_err(to_tonic_err)? {
         Command::CommandStatementQuery(token) => {
@@ -34,4 +36,17 @@ pub(crate) async fn handle(
         }
         _ => Err(Status::unimplemented("Not yet implemented")),
     }
+}
+
+fn get_flight_info_simple(request: Request<FlightDescriptor>) -> Response<FlightInfo> {
+    tracing::trace!("get_flight_info_simple: {request:?}");
+    let fd = request.into_inner();
+    Response::new(FlightInfo {
+        flight_descriptor: Some(fd.clone()),
+        endpoint: vec![FlightEndpoint {
+            ticket: Some(Ticket { ticket: fd.cmd }),
+            ..Default::default()
+        }],
+        ..Default::default()
+    })
 }
