@@ -4571,6 +4571,7 @@ dependencies = [
  "bb8",
  "bb8-postgres",
  "clap",
+ "csv",
  "datafusion",
  "db_connection_pool",
  "dirs",

@@ -77,23 +77,26 @@ pub(crate) mod datasets {
     use tokio::sync::RwLock;
 
     #[derive(Debug, Deserialize)]
-    pub(crate) struct DatasetFilter {
+    pub(crate) struct QueryParams {
         source: Option<String>,
 
         #[serde(default)]
         remove_views: bool,
+        // TODO: Implement status checking.
+        // #[serde(default)]
+        // status: bool,
     }
 
     pub(crate) async fn get(
         Extension(app): Extension<Arc<RwLock<Option<App>>>>,
-        Query(filter): Query<DatasetFilter>,
+        Query(params): Query<QueryParams>,
     ) -> Json<Vec<Dataset>> {
         let app_lock = app.read().await;
         let Some(readable_app) = &*app_lock else {
             return Json(vec![]);
         };
 
-        let mut datasets: Vec<Dataset> = match filter.source {
+        let mut datasets: Vec<Dataset> = match params.source {
             Some(source) => readable_app
                 .datasets
                 .iter()
@@ -103,11 +106,100 @@ pub(crate) mod datasets {
             None => readable_app.datasets.clone(),
         };
 
-        if filter.remove_views {
+        if params.remove_views {
             datasets.retain(|d| !d.is_view());
         }
 
         Json(datasets)
+    }
+}
+
+pub(crate) mod models {
+    use std::{collections::HashMap, sync::Arc};
+
+    use axum::{
+        extract::Query,
+        http::status,
+        response::{IntoResponse, Json, Response},
+        Extension,
+    };
+    use csv::Writer;
+    use serde::{Deserialize, Serialize};
+    use tokio::sync::RwLock;
+
+    use crate::model::Model;
+
+    #[derive(Debug, Deserialize)]
+    pub(crate) struct QueryParams {
+        // TODO: Implement status checking.
+        // #[serde(default)]
+        // _status: bool,
+        #[serde(default = "default_format")]
+        format: Format,
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    pub(crate) struct ModelResponse {
+        pub name: String,
+        pub from: String,
+        pub datasets: Option<Vec<String>>,
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    pub enum Format {
+        Json,
+        Csv,
+    }
+
+    fn default_format() -> Format {
+        Format::Json
+    }
+
+    pub(crate) async fn get(
+        Extension(model): Extension<Arc<RwLock<HashMap<String, Model>>>>,
+        Query(params): Query<QueryParams>,
+    ) -> Response {
+        let resp = model
+            .read()
+            .await
+            .values()
+            .map(|m| {
+                let datasets = if m.model.datasets.is_empty() {
+                    None
+                } else {
+                    Some(m.model.datasets.clone())
+                };
+                ModelResponse {
+                    name: m.model.name.clone(),
+                    from: m.model.from.clone(),
+                    datasets,
+                }
+            })
+            .collect::<Vec<ModelResponse>>();
+
+        match params.format {
+            Format::Json => (status::StatusCode::OK, Json(resp)).into_response(),
+            Format::Csv => match convert_details_to_csv(&resp) {
+                Ok(csv) => (status::StatusCode::OK, csv).into_response(),
+                Err(e) => {
+                    tracing::error!("Error converting to CSV: {e}");
+                    (status::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+                }
+            },
+        }
+    }
+
+    fn convert_details_to_csv(
+        models: &[ModelResponse],
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let mut w = Writer::from_writer(vec![]);
+        for d in models {
+            let _ = w.serialize(d);
+        }
+        w.flush()?;
+        Ok(String::from_utf8(w.into_inner()?)?)
     }
 }
 
