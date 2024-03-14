@@ -35,10 +35,10 @@ tokio = { version = "1.35.1", features = ["rt-multi-thread", "signal"] }
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 metrics = "0.22.0"
-datafusion = "34.0.0"
-arrow = "49.0.0"
-arrow-flight = "49.0.0"
-duckdb = { git = "https://github.com/spicehq/duckdb-rs.git", rev = "8b57b1496eed1009c45734df7790960313d31e3d" }
+datafusion = "35.0.0"
+arrow = "50.0.0"
+arrow-flight = "50.0.0"
+duckdb = { git = "https://github.com/spicehq/duckdb-rs.git", rev = "375d26e530272021ae56d11bbafa02c1fdc1004e" }
 tonic = "0.10.2"
 futures = "0.3.30"
 r2d2 = "0.8.10"
