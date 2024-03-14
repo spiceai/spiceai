@@ -14,7 +14,7 @@ use arrow_flight::{
 enum ActionType {
     CreatePreparedStatement,
     ClosePreparedStatement,
-    Unknown, // or any other actions you have
+    Unknown,
 }
 
 impl ActionType {
