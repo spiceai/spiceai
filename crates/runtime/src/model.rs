@@ -1,9 +1,9 @@
 use crate::modelruntime::ModelRuntime;
 use crate::modelruntime::Runnable;
 use crate::modelsource::create_source_from;
-use crate::secrets::Secret;
 use crate::DataFusion;
 use arrow::record_batch::RecordBatch;
+use secrets::Secret;
 use snafu::prelude::*;
 use std::sync::Arc;
 use tokio::sync::RwLock;

@@ -132,6 +132,24 @@ impl Dataset {
     }
 
     #[must_use]
+    pub fn acceleration_params(&self) -> Option<HashMap<String, String>> {
+        if let Some(acceleration) = &self.acceleration {
+            return acceleration.params.clone();
+        }
+
+        None
+    }
+
+    #[must_use]
+    pub fn engine_secret(&self) -> Option<String> {
+        if let Some(acceleration) = &self.acceleration {
+            return acceleration.engine_secret.clone();
+        }
+
+        None
+    }
+
+    #[must_use]
     pub fn refresh_interval(&self) -> Option<Duration> {
         if let Some(acceleration) = &self.acceleration {
             if let Some(refresh_interval) = &acceleration.refresh_interval {
@@ -194,6 +212,7 @@ pub mod acceleration {
     use std::fmt;
 
     use serde::{Deserialize, Serialize};
+    use std::collections::HashMap;
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
     #[serde(rename_all = "lowercase")]
@@ -253,6 +272,12 @@ pub mod acceleration {
 
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub retention: Option<String>,
+
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub params: Option<HashMap<String, String>>,
+
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub engine_secret: Option<String>,
     }
 
     impl Acceleration {
@@ -264,15 +289,6 @@ pub mod acceleration {
         #[must_use]
         pub fn engine(&self) -> Engine {
             self.engine.clone().unwrap_or_default()
-        }
-    }
-}
-
-impl From<acceleration::Mode> for sql_provider_datafusion::dbconnectionpool::Mode {
-    fn from(m: acceleration::Mode) -> Self {
-        match m {
-            acceleration::Mode::File => sql_provider_datafusion::dbconnectionpool::Mode::File,
-            acceleration::Mode::Memory => sql_provider_datafusion::dbconnectionpool::Mode::Memory,
         }
     }
 }

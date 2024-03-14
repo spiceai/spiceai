@@ -8,10 +8,18 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 use secrecy::{ExposeSecret, SecretString};
+use snafu::prelude::*;
 
-use super::Result;
-use crate::{secrets::file::FileSecretStore, Error};
+use crate::file::FileSecretStore;
 use spicepod::component::secrets::SpiceSecretStore;
+
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display("Unable to load secrets for {store}"))]
+    UnableToLoadSecrets { store: String },
+}
+
+pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[async_trait]
 pub trait SecretStore {
@@ -92,6 +100,11 @@ impl SecretsProvider {
         Self::default()
     }
 
+    /// Loads the secrets from the secret store.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the secrets cannot be loaded.
     pub fn load_secrets(&mut self) -> Result<()> {
         match self.store {
             SecretStoreType::File => {

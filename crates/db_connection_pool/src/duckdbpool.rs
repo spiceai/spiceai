@@ -20,19 +20,28 @@ pub struct DuckDbConnectionPool {
     pool: Arc<r2d2::Pool<DuckdbConnectionManager>>,
 }
 
-#[async_trait]
-impl DbConnectionPool<r2d2::PooledConnection<DuckdbConnectionManager>, &'static dyn ToSql>
-    for DuckDbConnectionPool
-{
-    async fn new(
+impl DuckDbConnectionPool {
+    /// Create a new `DuckDbConnectionPool`.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - The name of the `DuckDB` database.
+    /// * `mode` - The `Mode` that `DuckDB` should run in.
+    /// * `params` - Additional parameters for the connection pool.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if there is a problem creating the connection pool.
+    pub fn new(
         name: &str,
-        mode: Mode,
-        params: Arc<Option<HashMap<String, String>>>,
+        mode: &Mode,
+        params: &Arc<Option<HashMap<String, String>>>,
     ) -> Result<Self> {
         let manager = match mode {
             Mode::Memory => DuckdbConnectionManager::memory().context(DuckDBSnafu)?,
-            Mode::File => DuckdbConnectionManager::file(get_duckdb_file(name, &params))
-                .context(DuckDBSnafu)?,
+            Mode::File => {
+                DuckdbConnectionManager::file(get_duckdb_file(name, params)).context(DuckDBSnafu)?
+            }
         };
 
         let pool = Arc::new(r2d2::Pool::new(manager).context(ConnectionPoolSnafu)?);
@@ -43,7 +52,12 @@ impl DbConnectionPool<r2d2::PooledConnection<DuckdbConnectionManager>, &'static 
 
         Ok(DuckDbConnectionPool { pool })
     }
+}
 
+#[async_trait]
+impl DbConnectionPool<r2d2::PooledConnection<DuckdbConnectionManager>, &'static dyn ToSql>
+    for DuckDbConnectionPool
+{
     async fn connect(
         &self,
     ) -> Result<

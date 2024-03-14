@@ -48,16 +48,20 @@ notify = "6.1.1"
 arrow-json = "49.0.0"
 async-trait.workspace = true
 flight_datafusion = { path = "../flight_datafusion" }
+aws-config = "1.1.7"
+aws-types = "1.1.7"
+object_store = { version="0.8.0", features = ["aws"] }
+quick-xml = { version = "0.23.0-alpha3" }
+url = "2.5.0"
 arrow_sql_gen = { path = "../arrow_sql_gen", optional = true }
 bb8 = {workspace = true, optional = true}
 bb8-postgres = {workspace = true, optional = true}
-base64 = "0.22.0"
-keyring = { version = "2.3.2", optional = true }
-secrecy = "0.8.0"
+secrets = { path = "../secrets" }
+db_connection_pool = { path = "../db_connection_pool" }
 
 [features]
 default = ["duckdb", "postgres", "keyring-secret-store"]
 dev = []
 duckdb = ["dep:duckdb", "sql_provider_datafusion", "r2d2"]
 postgres = ["dep:bb8", "dep:bb8-postgres", "sql_provider_datafusion", "arrow_sql_gen"]
-keyring-secret-store = ["dep:keyring"]
+keyring-secret-store = ["secrets/keyring-secret-store"]
