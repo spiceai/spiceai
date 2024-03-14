@@ -133,7 +133,7 @@ spice dataset configure
 			os.Exit(1)
 		}
 
-		var spicePod api.Pod
+		var spicePod api.Spicepod
 		err = yaml.Unmarshal(spicepodBytes, &spicePod)
 		if err != nil {
 			cmd.Println(err)

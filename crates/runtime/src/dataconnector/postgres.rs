@@ -1,22 +1,20 @@
+use arrow::array::RecordBatch;
 use async_trait::async_trait;
 use bb8_postgres::tokio_postgres::types::ToSql;
 use bb8_postgres::tokio_postgres::NoTls;
 use bb8_postgres::PostgresConnectionManager;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
+use db_connection_pool::postgrespool::PostgresConnectionPool;
+use db_connection_pool::DbConnectionPool;
 use futures::TryStreamExt;
+use secrets::Secret;
 use snafu::prelude::*;
-use sql_provider_datafusion::dbconnectionpool::postgrespool::PostgresConnectionPool;
-use sql_provider_datafusion::dbconnectionpool::DbConnectionPool;
+use spicepod::component::dataset::Dataset;
 use sql_provider_datafusion::SqlTable;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::{collections::HashMap, future::Future};
-
-use arrow::array::RecordBatch;
-use spicepod::component::dataset::Dataset;
-
-use crate::secrets::Secret;
 
 use super::DataConnector;
 use super::Result;
@@ -35,7 +33,7 @@ pub struct Postgres {
 #[async_trait]
 impl DataConnector for Postgres {
     fn new(
-        _secret: Option<Secret>,
+        secret: Option<Secret>,
         params: Arc<Option<HashMap<String, String>>>,
     ) -> Pin<Box<dyn Future<Output = Result<Self>> + Send>>
     where
@@ -49,7 +47,7 @@ impl DataConnector for Postgres {
                     > + Send
                     + Sync,
             > = Arc::new(
-                PostgresConnectionPool::new(params)
+                PostgresConnectionPool::new(params, secret)
                     .await
                     .context(UnableToGetTableProviderSnafu)?,
             );

@@ -7,14 +7,15 @@ use std::{
 
 use arrow::record_batch::RecordBatch;
 use datafusion::{execution::context::SessionContext, sql::TableReference};
+use db_connection_pool::{
+    dbconnection::{self, duckdbconn::DuckDbConnection, SyncDbConnection},
+    duckdbpool::DuckDbConnectionPool,
+    DbConnectionPool, Mode,
+};
 use duckdb::{vtab::arrow::arrow_recordbatch_to_query_params, DuckdbConnectionManager, ToSql};
 use snafu::{prelude::*, ResultExt};
 use spicepod::component::dataset::Dataset;
-use sql_provider_datafusion::{
-    dbconnection::{self, duckdbconn::DuckDbConnection, SyncDbConnection},
-    dbconnectionpool::{duckdbpool::DuckDbConnectionPool, DbConnectionPool, Mode},
-    SqlTable,
-};
+use sql_provider_datafusion::SqlTable;
 
 use crate::{
     datapublisher::{AddDataResult, DataPublisher},
@@ -25,13 +26,11 @@ use crate::{
 pub enum Error {
     #[snafu(display("DbConnectionError: {source}"))]
     DbConnectionError {
-        source: sql_provider_datafusion::dbconnection::GenericError,
+        source: db_connection_pool::dbconnection::GenericError,
     },
 
     #[snafu(display("DbConnectionPoolError: {source}"))]
-    DbConnectionPoolError {
-        source: sql_provider_datafusion::dbconnectionpool::Error,
-    },
+    DbConnectionPoolError { source: db_connection_pool::Error },
 
     #[snafu(display("DuckDBError: {source}"))]
     DuckDB { source: duckdb::Error },
@@ -101,16 +100,15 @@ impl DataPublisher for DuckDBBackend {
 
 impl DuckDBBackend {
     #[allow(clippy::needless_pass_by_value)]
-    pub async fn new(
+    pub fn new(
         ctx: Arc<SessionContext>,
         name: &str,
         mode: Mode,
         params: Arc<Option<HashMap<String, String>>>,
         primary_keys: Option<Vec<String>>,
     ) -> Result<Self> {
-        let pool = DuckDbConnectionPool::new(name, mode, params)
-            .await
-            .context(DbConnectionPoolSnafu)?;
+        let pool =
+            DuckDbConnectionPool::new(name, &mode, &params).context(DbConnectionPoolSnafu)?;
         Ok(DuckDBBackend {
             ctx,
             name: name.to_string(),
@@ -295,7 +293,6 @@ mod tests {
         let name = "test_add_data";
         let backend =
             DuckDBBackend::new(Arc::clone(&ctx), name, Mode::Memory, Arc::new(None), None)
-                .await
                 .expect("Unable to create DuckDBBackend");
 
         let schema = Arc::new(Schema::new(vec![

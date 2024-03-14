@@ -1,6 +1,6 @@
 package api
 
-type Pod struct {
+type Spicepod struct {
 	Version      string            `json:"version,omitempty" csv:"version" yaml:"version,omitempty"`
 	Kind         string            `json:"kind,omitempty" csv:"kind" yaml:"kind,omitempty"`
 	Name         string            `json:"name,omitempty" csv:"name" yaml:"name,omitempty"`
