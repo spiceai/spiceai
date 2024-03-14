@@ -284,6 +284,16 @@ impl Runtime {
                     data_connector: source,
                 })?,
             ))),
+            "flightsql" => Ok(Some(Box::new(
+                dataconnector::flightsql::FlightSQL::new(
+                    secrets_provider.get_secret(source).await,
+                    params,
+                )
+                .await
+                .context(UnableToInitializeDataConnectorSnafu {
+                    data_connector: source,
+                })?,
+            ))),
             "postgres" => Ok(Some(Box::new(
                 dataconnector::postgres::Postgres::new(
                     secrets_provider.get_secret(source).await,
