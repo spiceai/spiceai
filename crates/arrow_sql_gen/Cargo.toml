@@ -20,3 +20,4 @@ bigdecimal_0_3_0 = { package = "bigdecimal", version = "0.3.0"}
 time = "0.3.34"
 bigdecimal = "0.4.3"
 tokio.workspace = true
+rusqlite = {version = "0.28.0", features = ["column_decltype"]}

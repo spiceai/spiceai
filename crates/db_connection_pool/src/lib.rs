@@ -5,6 +5,7 @@ use spicepod::component::dataset::acceleration;
 pub mod dbconnection;
 pub mod duckdbpool;
 pub mod postgrespool;
+pub mod sqlitepool;
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 type Result<T, E = Error> = std::result::Result<T, E>;

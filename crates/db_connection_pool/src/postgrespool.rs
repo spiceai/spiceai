@@ -13,9 +13,6 @@ use crate::dbconnection::{postgresconn::PostgresConnection, AsyncDbConnection, D
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("DuckDBError: {source}"))]
-    DuckDBError { source: duckdb::Error },
-
     #[snafu(display("ConnectionPoolError: {source}"))]
     ConnectionPoolError {
         source: bb8_postgres::tokio_postgres::Error,
