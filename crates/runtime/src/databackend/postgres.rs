@@ -7,13 +7,14 @@ use bb8_postgres::{
     PostgresConnectionManager,
 };
 use datafusion::{execution::context::SessionContext, sql::TableReference};
+use db_connection_pool::{
+    dbconnection::postgresconn::PostgresConnection, postgrespool::PostgresConnectionPool,
+    DbConnectionPool,
+};
+use secrets::Secret;
 use snafu::{prelude::*, ResultExt};
 use spicepod::component::dataset::Dataset;
-use sql_provider_datafusion::{
-    dbconnection::postgresconn::PostgresConnection,
-    dbconnectionpool::{postgrespool::PostgresConnectionPool, DbConnectionPool},
-    SqlTable,
-};
+use sql_provider_datafusion::SqlTable;
 use tokio::sync::Mutex;
 
 use crate::{
@@ -25,13 +26,11 @@ use crate::{
 pub enum Error {
     #[snafu(display("DbConnectionError: {source}"))]
     DbConnectionError {
-        source: sql_provider_datafusion::dbconnection::GenericError,
+        source: db_connection_pool::dbconnection::GenericError,
     },
 
     #[snafu(display("DbConnectionPoolError: {source}"))]
-    DbConnectionPoolError {
-        source: sql_provider_datafusion::dbconnectionpool::Error,
-    },
+    DbConnectionPoolError { source: db_connection_pool::Error },
 
     #[snafu(display("Error executing transaction: {source}"))]
     TransactionError {
@@ -103,8 +102,9 @@ impl PostgresBackend {
         name: &str,
         params: Arc<Option<HashMap<String, String>>>,
         primary_keys: Option<Vec<String>>,
+        secret: Option<Secret>,
     ) -> Result<Self> {
-        let pool = PostgresConnectionPool::new(params)
+        let pool = PostgresConnectionPool::new(params, secret)
             .await
             .context(DbConnectionPoolSnafu)?;
         Ok(PostgresBackend {

@@ -27,8 +27,40 @@ pub trait SyncDbConnection<T, P>: DbConnection<T, P> {
     fn new(conn: T) -> Self
     where
         Self: Sized;
+
+    /// Get the schema for a table reference.
+    ///
+    /// # Arguments
+    ///
+    /// * `table_reference` - The table reference.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the schema cannot be retrieved.
     fn get_schema(&self, table_reference: &TableReference) -> Result<SchemaRef>;
+
+    /// Query the database with the given SQL statement and parameters, returning a `Result` of `SendableRecordBatchStream`.
+    ///
+    /// # Arguments
+    ///
+    /// * `sql` - The SQL statement.
+    /// * `params` - The parameters for the SQL statement.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
     fn query_arrow(&self, sql: &str, params: &[P]) -> Result<SendableRecordBatchStream>;
+
+    /// Execute the given SQL statement with parameters, returning the number of affected rows.
+    ///
+    /// # Arguments
+    ///
+    /// * `sql` - The SQL statement.
+    /// * `params` - The parameters for the SQL statement.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the execution fails.
     fn execute(&self, sql: &str, params: &[P]) -> Result<u64>;
 }
 
@@ -54,6 +86,16 @@ pub trait DbConnection<T, P>: Send {
     }
 }
 
+/// Get the schema for a table reference.
+///
+/// # Arguments
+///
+/// * `conn` - The database connection.
+/// * `table_reference` - The table reference.
+///
+/// # Errors
+///
+/// Returns an error if the schema cannot be retrieved.
 pub async fn get_schema<T, P>(
     conn: Box<dyn DbConnection<T, P>>,
     table_reference: &datafusion::sql::TableReference<'_>,
@@ -71,6 +113,16 @@ pub async fn get_schema<T, P>(
     Ok(schema)
 }
 
+/// Query the database with the given SQL statement and parameters, returning a `Result` of `SendableRecordBatchStream`.
+///
+/// # Arguments
+///
+/// * `conn` - The database connection.
+/// * `sql` - The SQL statement.
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
 pub async fn query_arrow<T, P>(
     conn: Box<dyn DbConnection<T, P>>,
     sql: String,

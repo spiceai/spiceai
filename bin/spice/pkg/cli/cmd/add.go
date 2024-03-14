@@ -14,22 +14,22 @@ import (
 
 var addCmd = &cobra.Command{
 	Use:   "add",
-	Short: "Add Pod - adds a pod to the project",
+	Short: "Add Spicepod - adds a Spicepod to the project",
 	Args:  cobra.MinimumNArgs(1),
 	Example: `
-spice add samples/LogPruner
+spice add spiceai/quickstart
 `,
 	Run: func(cmd *cobra.Command, args []string) {
 		podPath := args[0]
 
-		cmd.Printf("Getting Pod %s ...\n", podPath)
+		cmd.Printf("Getting Spicepod %s ...\n", podPath)
 
 		r := registry.GetRegistry(podPath)
 		downloadPath, err := r.GetPod(podPath)
 		if err != nil {
 			var itemNotFound *registry.RegistryItemNotFound
 			if errors.As(err, &itemNotFound) {
-				cmd.Printf("No pod found with the name '%s'.\n", podPath)
+				cmd.Printf("No Spicepod found at '%s'.\n", podPath)
 			} else {
 				cmd.Println(err)
 			}
@@ -44,7 +44,7 @@ spice add samples/LogPruner
 			os.Exit(1)
 		}
 
-		var spicePod api.Pod
+		var spicePod api.Spicepod
 		err = yaml.Unmarshal(spicepodBytes, &spicePod)
 		if err != nil {
 			cmd.Println(err)

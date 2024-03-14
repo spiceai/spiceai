@@ -1,5 +1,6 @@
 use crate::datapublisher::DataPublisher;
 use datafusion::execution::context::SessionContext;
+use secrets::Secret;
 use snafu::prelude::*;
 use spicepod::component::dataset::acceleration::{Engine, Mode};
 use std::{collections::HashMap, sync::Arc};
@@ -30,6 +31,7 @@ pub struct DataBackendBuilder {
     mode: Option<Mode>,
     params: Arc<Option<HashMap<String, String>>>,
     primary_keys: Option<Vec<String>>,
+    secret: Option<Secret>,
 }
 
 impl DataBackendBuilder {
@@ -42,6 +44,7 @@ impl DataBackendBuilder {
             mode: None,
             params: Arc::new(None),
             primary_keys: None,
+            secret: None,
         }
     }
 
@@ -66,6 +69,12 @@ impl DataBackendBuilder {
     #[must_use]
     pub fn primary_keys(mut self, primary_keys: Option<Vec<String>>) -> Self {
         self.primary_keys = primary_keys;
+        self
+    }
+
+    #[must_use]
+    pub fn secret(mut self, secret: Option<Secret>) -> Self {
+        self.secret = secret;
         self
     }
 
@@ -127,7 +136,6 @@ impl DataBackendBuilder {
                     self.params,
                     self.primary_keys,
                 )
-                .await
                 .boxed()
                 .context(BackendCreationFailedSnafu)?,
             )),
@@ -138,6 +146,7 @@ impl DataBackendBuilder {
                     self.name.as_str(),
                     self.params,
                     self.primary_keys,
+                    self.secret,
                 )
                 .await
                 .boxed()

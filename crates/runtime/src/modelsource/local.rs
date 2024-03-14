@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 
 use super::ModelSource;
-use crate::secrets::Secret;
+use secrets::Secret;
 use std::collections::HashMap;
 use std::string::ToString;
 use std::sync::Arc;

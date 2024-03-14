@@ -18,9 +18,9 @@ func (r *LocalFileRegistry) GetPod(podPath string) (string, error) {
 	stat, err := os.Stat(podPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return "", fmt.Errorf("the pod directory '%s' does not exist", podPath)
+			return "", fmt.Errorf("the Spicepod directory '%s' does not exist", podPath)
 		}
-		return "", fmt.Errorf("pod not found at %s: %w", podPath, err)
+		return "", fmt.Errorf("spicepod.yaml not found at %s: %w", podPath, err)
 	}
 
 	if !stat.IsDir() {
@@ -30,7 +30,7 @@ func (r *LocalFileRegistry) GetPod(podPath string) (string, error) {
 	if !filepath.IsAbs(podPath) {
 		podPath, err = filepath.Abs(podPath)
 		if err != nil {
-			return "", fmt.Errorf("error fetching pod'%s': %w", podPath, err)
+			return "", fmt.Errorf("error fetching Spicepod '%s': %w", podPath, err)
 		}
 	}
 
@@ -42,20 +42,20 @@ func (r *LocalFileRegistry) GetPod(podPath string) (string, error) {
 
 	if _, err := os.Stat(filepath.Join(podPath, podManifestFileName)); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return "", fmt.Errorf("the directory '%s' does not contain a manifest. Is it a valid pod?", podPath)
+			return "", fmt.Errorf("the directory '%s' does not contain a spicepod.yaml. Is it a valid Spicepod?", podPath)
 		}
-		return "", fmt.Errorf("error fetching pod %s: %w", podPath, err)
+		return "", fmt.Errorf("error fetching Spicepod %s: %w", podPath, err)
 	}
 
 	// Prepare destination
 	podsDir := rtcontext.PodsDir()
 	if _, err = os.Stat(podsDir); err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
-			return "", fmt.Errorf("error fetching pod %s: %w", podPath, err)
+			return "", fmt.Errorf("error fetching Spicepod %s: %w", podPath, err)
 		}
 		_, err = util.MkDirAllInheritPerm(podsDir)
 		if err != nil {
-			return "", fmt.Errorf("error fetching pod %s: %w", podPath, err)
+			return "", fmt.Errorf("error fetching Spicepod %s: %w", podPath, err)
 		}
 	}
 
@@ -68,7 +68,7 @@ func (r *LocalFileRegistry) GetPod(podPath string) (string, error) {
 		return err
 	})
 	if err != nil {
-		return "", fmt.Errorf("error fetching pod %s: %w", podPath, err)
+		return "", fmt.Errorf("error fetching Spicepod %s: %w", podPath, err)
 	}
 
 	if len(fileList) == 0 {

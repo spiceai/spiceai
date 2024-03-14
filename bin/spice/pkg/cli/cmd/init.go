@@ -13,9 +13,9 @@ import (
 
 var initCmd = &cobra.Command{
 	Use:   "init",
-	Short: "Initialize Pod - initializes a new pod in the project",
+	Short: "Initialize Spice app - initializes a new Spice app",
 	Example: `
-spice init <pod name>
+spice init <spice app name>
 spice init my_app
 `,
 	Args: cobra.MinimumNArgs(1),
@@ -23,7 +23,7 @@ spice init my_app
 		podName := args[0]
 		podPath := "./spicepod.yaml"
 		if _, err := os.Stat(podPath); !os.IsNotExist(err) {
-			cmd.Println("Pod manifest already exists. Replace (y/n)?")
+			cmd.Println("spicepod.yaml already exists. Replace (y/n)?")
 			var confirm string
 			fmt.Scanf("%s", &confirm)
 			if strings.ToLower(strings.TrimSpace(confirm)) != "y" {
@@ -31,7 +31,7 @@ spice init my_app
 			}
 		}
 
-		skeletonPod := &api.Pod{
+		skeletonPod := &api.Spicepod{
 			Name:    podName,
 			Version: "v1beta1",
 			Kind:    "Spicepod",
@@ -49,7 +49,7 @@ spice init my_app
 			return
 		}
 
-		cmd.Println(aurora.BrightGreen("Spicepod manifest initialized!"))
+		cmd.Println(aurora.BrightGreen("spicepod.yaml initialized!"))
 	},
 }
 

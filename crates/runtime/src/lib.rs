@@ -31,7 +31,6 @@ pub mod modelruntime;
 pub mod modelsource;
 mod opentelemetry;
 pub mod podswatcher;
-pub mod secrets;
 pub mod timing;
 pub(crate) mod tracers;
 
@@ -86,9 +85,6 @@ pub enum Error {
         source: datafusion::Error,
         data_connector: String,
     },
-
-    #[snafu(display("Unable to load secrets for {store}"))]
-    UnableToLoadSecrets { store: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -154,7 +150,8 @@ impl Runtime {
         measure_scope_ms!("load_dataset", "dataset" => ds.name.clone());
         let df = Arc::clone(&self.df);
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
-        let shared_secrets_provider = Arc::clone(&self.secrets_provider);
+        let shared_secrets_provider: Arc<RwLock<secrets::SecretsProvider>> =
+            Arc::clone(&self.secrets_provider);
 
         let ds = ds.clone();
 
@@ -199,6 +196,7 @@ impl Runtime {
                     Arc::clone(&df),
                     &source,
                     &ds,
+                    Arc::clone(&shared_secrets_provider),
                 )
                 .await
                 {
@@ -296,6 +294,13 @@ impl Runtime {
                     data_connector: source,
                 })?,
             ))),
+            "s3" => Ok(Some(Box::new(
+                dataconnector::s3::S3::new(secrets_provider.get_secret(source).await, params)
+                    .await
+                    .context(UnableToInitializeDataConnectorSnafu {
+                        data_connector: source,
+                    })?,
+            ))),
             "localhost" => Ok(None),
             "debug" => Ok(Some(Box::new(dataconnector::debug::DebugSource {}))),
             _ => UnknownDataConnectorSnafu {
@@ -310,6 +315,7 @@ impl Runtime {
         df: Arc<RwLock<DataFusion>>,
         source: &str,
         ds: impl Borrow<Dataset>,
+        secrets_provider: Arc<RwLock<secrets::SecretsProvider>>,
     ) -> Result<()> {
         let ds = ds.borrow();
         let view_sql = ds.view_sql().context(InvalidSQLViewSnafu)?;
@@ -338,7 +344,7 @@ impl Runtime {
         let data_backend = df
             .read()
             .await
-            .new_accelerated_backend(ds)
+            .new_accelerated_backend(ds, secrets_provider)
             .await
             .context(UnableToCreateBackendSnafu)?;
         let data_backend = Arc::new(data_backend);
