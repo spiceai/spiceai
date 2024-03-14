@@ -1,16 +1,16 @@
-//! Represents the response to FlightSQL `GetSqlInfo` requests and
+//! Represents the response to `FlightSQL` `GetSqlInfo` requests and
 //! handles the conversion to/from the format specified in the
 //! [Arrow FlightSQL Specification].
 //!
 //! <
-//!   info_name: uint32 not null,
-//!   value: dense_union<
-//!               string_value: utf8,
-//!               bool_value: bool,
-//!               bigint_value: int64,
-//!               int32_bitmask: int32,
-//!               string_list: list<string_data: utf8>
-//!               int32_to_int32_list_map: map<key: int32, value: list<$data$: int32>>
+//!   `info_name`: uint32 not null,
+//!   value: `dense_union`<
+//!               `string_value`: utf8,
+//!               `bool_value`: bool,
+//!               `bigint_value`: int64,
+//!               `int32_bitmask`: int32,
+//!               `string_list`: list<`string_data`: utf8>
+//!               `int32_to_int32_list_map`: map<key: int32, value: list<$data$: int32>>
 //!  >
 //!
 //! where there is one row per requested piece of metadata information.
@@ -390,9 +390,9 @@ static SQL_DATA_TYPE_TO_ARROW_DATA_TYPE: Lazy<HashMap<SqlSupportsConvert, DataTy
 
 pub(crate) static SQL_INFO_SUPPORTS_CONVERT: Lazy<HashMap<i32, Vec<i32>>> = Lazy::new(|| {
     let mut convert: HashMap<i32, Vec<i32>> = HashMap::new();
-    for (from_type_sql, from_type_arrow) in SQL_DATA_TYPE_TO_ARROW_DATA_TYPE.clone().into_iter() {
+    for (from_type_sql, from_type_arrow) in SQL_DATA_TYPE_TO_ARROW_DATA_TYPE.clone() {
         let mut can_convert_to: Vec<i32> = vec![];
-        for (to_type_sql, to_type_arrow) in SQL_DATA_TYPE_TO_ARROW_DATA_TYPE.clone().into_iter() {
+        for (to_type_sql, to_type_arrow) in SQL_DATA_TYPE_TO_ARROW_DATA_TYPE.clone() {
             if can_cast_types(&from_type_arrow, &to_type_arrow) {
                 can_convert_to.push(to_type_sql as i32);
             }
@@ -412,8 +412,6 @@ static INSTANCE: Lazy<SqlInfoData> = Lazy::new(|| {
 
     let SqlInfoFlightSqlServerSql = 4;
     let SqlInfoFlightSqlServerSubstrait = 5;
-    //let SqlInfoFlightSqlServerSubstraitMinVersion = 6;
-    //let SqlInfoFlightSqlServerSubstraitMaxVersion = 7;
     let SqlInfoFlightSqlServerTransaction = 8;
     let SqlInfoFlightSqlServerCancel = 9;
     let SqlInfoFlightSqlServerStatementTimeout = 100;
@@ -425,7 +423,7 @@ static INSTANCE: Lazy<SqlInfoData> = Lazy::new(|| {
 
     // Server information
     builder.append(SqlInfo::FlightSqlServerName, "Spice.ai");
-    builder.append(SqlInfo::FlightSqlServerVersion, "2");
+    builder.append(SqlInfo::FlightSqlServerVersion, env!("CARGO_PKG_VERSION"));
     // 1.3 comes from https://github.com/apache/arrow/blob/f9324b79bf4fc1ec7e97b32e3cce16e75ef0f5e3/format/Schema.fbs#L24
     builder.append(SqlInfo::FlightSqlServerArrowVersion, "1.3");
     builder.append(SqlInfo::FlightSqlServerReadOnly, true);
@@ -435,7 +433,7 @@ static INSTANCE: Lazy<SqlInfoData> = Lazy::new(|| {
         SqlInfoFlightSqlServerTransaction,
         SqlSupportedTransactions::SqlTransactionUnspecified as i32,
     );
-    // don't yetsupport `CancelQuery` action
+    // don't yet support `CancelQuery` action
     builder.append(SqlInfoFlightSqlServerCancel, false);
     builder.append(SqlInfoFlightSqlServerStatementTimeout, 0i32);
     builder.append(SqlInfoFlightSqlServerTransactionTimeout, 0i32);
@@ -496,27 +494,27 @@ static INSTANCE: Lazy<SqlInfoData> = Lazy::new(|| {
     builder.append(SqlInfo::SqlSupportedSubqueries, 15i32);
     builder.append(SqlInfo::SqlCorrelatedSubqueriesSupported, true);
     builder.append(SqlInfo::SqlSupportedUnions, 3i32);
-    builder.append(SqlInfo::SqlMaxBinaryLiteralLength, i32::MAX as i64);
-    builder.append(SqlInfo::SqlMaxCharLiteralLength, i32::MAX as i64);
-    builder.append(SqlInfo::SqlMaxColumnNameLength, i32::MAX as i64);
-    builder.append(SqlInfo::SqlMaxColumnsInGroupBy, i32::MAX as i64);
-    builder.append(SqlInfo::SqlMaxColumnsInIndex, i32::MAX as i64);
-    builder.append(SqlInfo::SqlMaxColumnsInOrderBy, i32::MAX as i64);
-    builder.append(SqlInfo::SqlMaxColumnsInSelect, i32::MAX as i64);
-    builder.append(SqlInfo::SqlMaxColumnsInTable, i32::MAX as i64);
-    builder.append(SqlInfo::SqlMaxConnections, i32::MAX as i64);
-    builder.append(SqlInfo::SqlMaxCursorNameLength, i32::MAX as i64);
-    builder.append(SqlInfo::SqlMaxIndexLength, i32::MAX as i64);
-    builder.append(SqlInfo::SqlDbSchemaNameLength, i32::MAX as i64);
-    builder.append(SqlInfo::SqlMaxProcedureNameLength, i32::MAX as i64);
-    builder.append(SqlInfo::SqlMaxCatalogNameLength, i32::MAX as i64);
-    builder.append(SqlInfo::SqlMaxRowSize, i32::MAX as i64);
+    builder.append(SqlInfo::SqlMaxBinaryLiteralLength, i64::from(i32::MAX));
+    builder.append(SqlInfo::SqlMaxCharLiteralLength, i64::from(i32::MAX));
+    builder.append(SqlInfo::SqlMaxColumnNameLength, i64::from(i32::MAX));
+    builder.append(SqlInfo::SqlMaxColumnsInGroupBy, i64::from(i32::MAX));
+    builder.append(SqlInfo::SqlMaxColumnsInIndex, i64::from(i32::MAX));
+    builder.append(SqlInfo::SqlMaxColumnsInOrderBy, i64::from(i32::MAX));
+    builder.append(SqlInfo::SqlMaxColumnsInSelect, i64::from(i32::MAX));
+    builder.append(SqlInfo::SqlMaxColumnsInTable, i64::from(i32::MAX));
+    builder.append(SqlInfo::SqlMaxConnections, i64::from(i32::MAX));
+    builder.append(SqlInfo::SqlMaxCursorNameLength, i64::from(i32::MAX));
+    builder.append(SqlInfo::SqlMaxIndexLength, i64::from(i32::MAX));
+    builder.append(SqlInfo::SqlDbSchemaNameLength, i64::from(i32::MAX));
+    builder.append(SqlInfo::SqlMaxProcedureNameLength, i64::from(i32::MAX));
+    builder.append(SqlInfo::SqlMaxCatalogNameLength, i64::from(i32::MAX));
+    builder.append(SqlInfo::SqlMaxRowSize, i64::from(i32::MAX));
     builder.append(SqlInfo::SqlMaxRowSizeIncludesBlobs, true);
-    builder.append(SqlInfo::SqlMaxStatementLength, i32::MAX as i64);
-    builder.append(SqlInfo::SqlMaxStatements, i32::MAX as i64);
-    builder.append(SqlInfo::SqlMaxTableNameLength, i32::MAX as i64);
-    builder.append(SqlInfo::SqlMaxTablesInSelect, i32::MAX as i64);
-    builder.append(SqlInfo::SqlMaxUsernameLength, i32::MAX as i64);
+    builder.append(SqlInfo::SqlMaxStatementLength, i64::from(i32::MAX));
+    builder.append(SqlInfo::SqlMaxStatements, i64::from(i32::MAX));
+    builder.append(SqlInfo::SqlMaxTableNameLength, i64::from(i32::MAX));
+    builder.append(SqlInfo::SqlMaxTablesInSelect, i64::from(i32::MAX));
+    builder.append(SqlInfo::SqlMaxUsernameLength, i64::from(i32::MAX));
     builder.append(SqlInfo::SqlDefaultTransactionIsolation, 0i64);
     builder.append(SqlInfo::SqlTransactionsSupported, false);
     builder.append(SqlInfo::SqlSupportedTransactionsIsolationLevels, 0i32);
@@ -545,7 +543,10 @@ static INSTANCE: Lazy<SqlInfoData> = Lazy::new(|| {
     builder.append(SqlInfo::SqlLocatorsUpdateCopy, false);
     builder.append(SqlInfo::SqlStoredFunctionsUsingCallSyntaxSupported, false);
 
-    builder.build().expect("Successfully built metadata")
+    match builder.build() {
+        Ok(data) => data,
+        Err(e) => panic!("Error building SqlInfoData: {e:?}"),
+    }
 });
 
 /// Return a [`SqlInfoData`] that describes Spice's capablities

@@ -90,7 +90,7 @@ impl FlightService for Service {
 
     async fn list_flights(
         &self,
-        request: Request<Criteria>,
+        _request: Request<Criteria>,
     ) -> Result<Response<Self::ListFlightsStream>, Status> {
         tracing::trace!("list_flights");
         Err(Status::unimplemented("Not yet implemented"))
@@ -105,8 +105,7 @@ impl FlightService for Service {
 
         match Command::try_from(message).map_err(to_tonic_err)? {
             Command::CommandStatementQuery(token) => {
-                //self.get_flight_info_statement(token, request).await
-                Err(Status::unimplemented("Not yet implemented"))
+                self.get_flight_info_statement(token, request).await
             }
             Command::CommandPreparedStatementQuery(handle) => {
                 self.get_flight_info_prepared_statement(handle, request)
@@ -117,12 +116,10 @@ impl FlightService for Service {
                 Err(Status::unimplemented("Not yet implemented"))
             }
             Command::CommandGetCatalogs(token) => {
-                //self.get_flight_info_catalogs(token, request).await
-                Err(Status::unimplemented("Not yet implemented"))
+                self.get_flight_info_catalogs(token, request).await
             }
             Command::CommandGetDbSchemas(token) => {
-                //return self.get_flight_info_schemas(token, request).await
-                Err(Status::unimplemented("Not yet implemented"))
+                return self.get_flight_info_schemas(token, request).await
             }
             Command::CommandGetTables(token) => self.get_flight_info_tables(token, request).await,
             Command::CommandGetTableTypes(token) => {
@@ -521,6 +518,27 @@ impl Service {
         Ok(resp)
     }
 
+    /// Get a FlightInfo for listing catalogs.
+    #[allow(clippy::unused_async)]
+    async fn get_flight_info_catalogs(
+        &self,
+        query: sql::CommandGetCatalogs,
+        request: Request<FlightDescriptor>,
+    ) -> Result<Response<FlightInfo>, Status> {
+        tracing::trace!("get_flight_info_catalogs");
+        let fd = request.into_inner();
+
+        let endpoint = FlightEndpoint::new().with_ticket(Ticket {
+            ticket: query.as_any().encode_to_vec().into(),
+        });
+
+        let info = FlightInfo::new()
+            .with_endpoint(endpoint)
+            .with_descriptor(fd);
+
+        Ok(Response::new(info))
+    }
+
     async fn do_get_catalogs(
         &self,
         query: sql::CommandGetCatalogs,
@@ -541,6 +559,27 @@ impl Service {
             Box::pin(record_batches_to_flight_stream(vec![record_batch])?)
                 as <Service as FlightService>::DoGetStream,
         ))
+    }
+
+    /// Get a FlightInfo for listing schemas.
+    #[allow(clippy::unused_async)]
+    async fn get_flight_info_schemas(
+        &self,
+        query: sql::CommandGetDbSchemas,
+        request: Request<FlightDescriptor>,
+    ) -> Result<Response<FlightInfo>, Status> {
+        tracing::trace!("get_flight_info_schemas");
+        let fd = request.into_inner();
+
+        let endpoint = FlightEndpoint::new().with_ticket(Ticket {
+            ticket: query.as_any().encode_to_vec().into(),
+        });
+
+        let info = FlightInfo::new()
+            .with_endpoint(endpoint)
+            .with_descriptor(fd);
+
+        Ok(Response::new(info))
     }
 
     async fn do_get_schemas(
@@ -632,6 +671,41 @@ impl Service {
             Box::pin(record_batches_to_flight_stream(vec![record_batch])?)
                 as <Service as FlightService>::DoGetStream,
         ))
+    }
+
+    /// Get a FlightInfo for executing a SQL query.
+    async fn get_flight_info_statement(
+        &self,
+        query: sql::CommandStatementQuery,
+        request: Request<FlightDescriptor>,
+    ) -> Result<Response<FlightInfo>, Status> {
+        tracing::trace!("get_flight_info_statement: {query:?}");
+
+        let sql = query.query.as_str();
+
+        let (arrow_schema, num_rows) =
+            Self::get_arrow_schema_and_size_sql(Arc::clone(&self.datafusion), sql.to_string())
+                .await
+                .map_err(to_tonic_err)?;
+
+        tracing::trace!(
+            "get_flight_info_statement: arrow_schema={arrow_schema:?} num_rows={num_rows:?}"
+        );
+
+        let fd = request.into_inner();
+
+        let endpoint = FlightEndpoint::new().with_ticket(Ticket {
+            ticket: query.as_any().encode_to_vec().into(),
+        });
+
+        let info = FlightInfo::new()
+            .with_endpoint(endpoint)
+            .try_with_schema(&arrow_schema)
+            .map_err(to_tonic_err)?
+            .with_descriptor(fd)
+            .with_total_records(num_rows.try_into().map_err(to_tonic_err)?);
+
+        Ok(Response::new(info))
     }
 
     async fn do_get_statement(
