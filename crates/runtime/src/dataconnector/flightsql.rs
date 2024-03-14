@@ -8,9 +8,9 @@ use async_trait::async_trait;
 use spicepod::component::dataset::Dataset;
 use tonic::transport::Channel;
 
-use crate::secrets::Secret;
-
 use flight_client::tls::new_tls_flight_channel;
+use flightsql_datafusion::FlightSQLTable;
+use secrets::Secret;
 
 use super::DataConnector;
 use arrow::error::ArrowError;
@@ -19,6 +19,29 @@ use futures::stream::TryStreamExt;
 #[derive(Debug, Clone)]
 pub struct FlightSQL {
     pub client: FlightSqlServiceClient<Channel>,
+}
+
+impl FlightSQL {
+    async fn query(
+        client: FlightSqlServiceClient<Channel>,
+        query: String,
+    ) -> Result<Vec<arrow::record_batch::RecordBatch>, Box<dyn std::error::Error>> {
+        let mut batches = vec![];
+        if let Ok(flight_info) = client.clone().execute(query, None).await {
+            for ep in &flight_info.endpoint {
+                if let Some(tkt) = &ep.ticket {
+                    match batch_from_ticket(&mut client.clone(), tkt.to_owned()).await {
+                        Ok(flight_data) => batches.extend(flight_data),
+                        Err(err) => {
+                            tracing::error!("Failed to read batch from flight client: {:?}", err);
+                            break;
+                        }
+                    }
+                };
+            }
+        }
+        Ok(batches)
+    }
 }
 
 #[async_trait]
@@ -66,42 +89,30 @@ impl DataConnector for FlightSQL {
         let client = self.client.clone();
 
         Box::pin(async move {
-            let mut batches = vec![];
-            if let Ok(flight_info) = client
-                .clone()
-                .execute(format!("SELECT * FROM {dataset_path}"), None)
-                .await
-            {
-                for ep in &flight_info.endpoint {
-                    if let Some(tkt) = &ep.ticket {
-                        match batch_from_ticket(&mut client.clone(), tkt.to_owned()).await {
-                            Ok(flight_data) => batches.extend(flight_data),
-                            Err(err) => {
-                                tracing::error!(
-                                    "Failed to read batch from flight client: {:?}",
-                                    err
-                                );
-                                break;
-                            }
-                        }
-                    };
+            match Self::query(client.clone(), format!("SELECT * FROM {dataset_path}")).await {
+                Ok(batches) => batches,
+                Err(e) => {
+                    tracing::error!("Failed to get data from flight client: {:?}", e);
+                    Vec::new()
                 }
             }
-            batches
         })
     }
 
     fn has_table_provider(&self) -> bool {
-        false // TODO: Implement this.
+        true
     }
 
     async fn get_table_provider(
         &self,
-        _dataset: &Dataset,
+        dataset: &Dataset,
     ) -> std::result::Result<Arc<dyn datafusion::datasource::TableProvider>, super::Error> {
-        Err(super::Error::UnableToGetTableProvider {
-            source: "Not implemented".into(),
-        })
+        match FlightSQLTable::new(self.client.clone(), dataset.path()).await {
+            Ok(provider) => Ok(Arc::new(provider)),
+            Err(error) => Err(super::Error::UnableToGetTableProvider {
+                source: error.into(),
+            }),
+        }
     }
 }
 

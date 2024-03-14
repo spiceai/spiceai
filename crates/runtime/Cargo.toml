@@ -48,6 +48,7 @@ notify = "6.1.1"
 arrow-json = "49.0.0"
 async-trait.workspace = true
 flight_datafusion = { path = "../flight_datafusion" }
+flightsql_datafusion = { path = "../flightsql_datafusion" }
 aws-config = "1.1.7"
 aws-types = "1.1.7"
 object_store = { version="0.8.0", features = ["aws"] }
