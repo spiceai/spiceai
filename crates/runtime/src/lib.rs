@@ -1,6 +1,7 @@
 #![allow(clippy::missing_errors_doc)]
 
 use std::borrow::Borrow;
+use std::net::SocketAddr;
 use std::{collections::HashMap, sync::Arc};
 
 use app::App;
@@ -456,12 +457,14 @@ impl Runtime {
         self.load_model(m).await;
     }
 
-    pub async fn start_servers(&mut self) -> Result<()> {
+    pub async fn start_servers(&mut self, with_metrics: Option<SocketAddr>) -> Result<()> {
         let http_server_future = http::start(
             self.config.http_bind_address,
             self.app.clone(),
             self.df.clone(),
             self.models.clone(),
+            self.config.clone().into(),
+            with_metrics,
         );
 
         let flight_server_future = flight::start(self.config.flight_bind_address, self.df.clone());
