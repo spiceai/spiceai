@@ -1,35 +1,70 @@
-//! Represents the response to `FlightSQL` `GetSqlInfo` requests and
-//! handles the conversion to/from the format specified in the
-//! [Arrow FlightSQL Specification].
-//!
-//! <
-//!   `info_name`: uint32 not null,
-//!   value: `dense_union`<
-//!               `string_value`: utf8,
-//!               `bool_value`: bool,
-//!               `bigint_value`: int64,
-//!               `int32_bitmask`: int32,
-//!               `string_list`: list<`string_data`: utf8>
-//!               `int32_to_int32_list_map`: map<key: int32, value: list<$data$: int32>>
-//!  >
-//!
-//! where there is one row per requested piece of metadata information.
-//!
-//!
-//! [Arrow FlightSQL Specification]: https://github.com/apache/arrow/blob/4fe364efa4be98b35964509e0e3d57a421a48039/format/FlightSql.proto#L33-L42
-
 use std::collections::HashMap;
 
 use arrow::{
     compute::can_cast_types,
     datatypes::{DataType, IntervalUnit, TimeUnit},
 };
-use arrow_flight::sql::{
-    metadata::{SqlInfoData, SqlInfoDataBuilder},
-    SqlInfo, SqlNullOrdering, SqlSupportedCaseSensitivity, SqlSupportedTransactions,
-    SqlSupportsConvert, SupportedSqlGrammar,
+use arrow_flight::{
+    encode::FlightDataEncoderBuilder,
+    flight_service_server::FlightService,
+    sql::{
+        self,
+        metadata::{SqlInfoData, SqlInfoDataBuilder},
+        ProstMessageExt, SqlInfo, SqlNullOrdering, SqlSupportedCaseSensitivity,
+        SqlSupportedTransactions, SqlSupportsConvert, SupportedSqlGrammar,
+    },
+    FlightDescriptor, FlightEndpoint, FlightInfo, Ticket,
 };
+use futures::{stream, StreamExt, TryStreamExt};
 use once_cell::sync::Lazy;
+use prost::Message;
+use tonic::{Request, Response, Status};
+
+use crate::flight::{to_tonic_err, Service};
+
+/// Get a FlightInfo for retrieving SqlInfo.
+pub(crate) fn get_flight_info(
+    query: sql::CommandGetSqlInfo,
+    request: Request<FlightDescriptor>,
+) -> Result<Response<FlightInfo>, Status> {
+    tracing::trace!("get_flight_info_sql_info: query={query:?}");
+    let builder = query.clone().into_builder(get_sql_info_data());
+    let record_batch = builder.build().map_err(to_tonic_err)?;
+
+    let fd = request.into_inner();
+
+    let ticket = Ticket {
+        ticket: query.as_any().encode_to_vec().into(),
+    };
+
+    let endpoint = FlightEndpoint::new().with_ticket(ticket);
+
+    Ok(Response::new(
+        FlightInfo::new()
+            .with_endpoint(endpoint)
+            .with_descriptor(fd)
+            .try_with_schema(&record_batch.schema())
+            .map_err(to_tonic_err)?,
+    ))
+}
+
+/// Get a FlightDataStream containing the list of SqlInfo results.
+pub(crate) fn do_get(
+    query: sql::CommandGetSqlInfo,
+    _request: Request<Ticket>,
+) -> Result<Response<<Service as FlightService>::DoGetStream>, Status> {
+    tracing::trace!("do_get_sql_info: {query:?}");
+    let builder = query.into_builder(get_sql_info_data());
+    let record_batch = builder.build().map_err(to_tonic_err)?;
+
+    let batches_stream = stream::iter(vec![Ok(record_batch)]);
+
+    let flight_data_stream = FlightDataEncoderBuilder::new().build(batches_stream);
+
+    Ok(Response::new(
+        flight_data_stream.map_err(to_tonic_err).boxed(),
+    ))
+}
 
 const SQL_INFO_SQL_KEYWORDS: &[&str] = &[
     // SQL-92 Reserved Words
