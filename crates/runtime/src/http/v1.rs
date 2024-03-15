@@ -116,7 +116,7 @@ pub(crate) mod datasets {
     use super::{convert_entry_to_csv, Format};
 
     #[derive(Debug, Deserialize)]
-    pub(crate) struct DataFilter {
+    pub(crate) struct DatasetFilter {
         source: Option<String>,
 
         #[serde(default)]
@@ -148,7 +148,7 @@ pub(crate) mod datasets {
     pub(crate) async fn get(
         Extension(app): Extension<Arc<RwLock<Option<App>>>>,
         Extension(df): Extension<Arc<RwLock<DataFusion>>>,
-        Query(filter): Query<DataFilter>,
+        Query(filter): Query<DatasetFilter>,
         Query(params): Query<DatasetQueryParams>,
     ) -> Response {
         let app_lock = app.read().await;
