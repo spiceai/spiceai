@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fmt::Debug, sync::Arc};
+use std::{collections::HashMap, fmt::Debug, net::SocketAddr, sync::Arc};
 
 use app::App;
 use snafu::prelude::*;
@@ -7,7 +7,7 @@ use tokio::{
     sync::RwLock,
 };
 
-use crate::{datafusion::DataFusion, model::Model};
+use crate::{config, datafusion::DataFusion, model::Model};
 
 mod routes;
 mod v1;
@@ -28,11 +28,13 @@ pub(crate) async fn start<A>(
     app: Arc<RwLock<Option<App>>>,
     df: Arc<RwLock<DataFusion>>,
     models: Arc<RwLock<HashMap<String, Model>>>,
+    config: Arc<config::Config>,
+    with_metrics: Option<SocketAddr>,
 ) -> Result<()>
 where
     A: ToSocketAddrs + Debug,
 {
-    let routes = routes::routes(app, df, models);
+    let routes = routes::routes(app, df, models, config, with_metrics);
 
     let listener = TcpListener::bind(&bind_address)
         .await

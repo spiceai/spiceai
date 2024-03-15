@@ -23,7 +23,7 @@ mod tls;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to connect to server:m {source}"))]
+    #[snafu(display("Unable to connect to server: {source}"))]
     UnableToConnectToServer { source: tls::Error },
 
     #[snafu(display("Invalid metadata value: {source}"))]
