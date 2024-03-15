@@ -14,6 +14,7 @@ import (
 	"github.com/spiceai/spiceai/bin/spice/pkg/github"
 	"github.com/spiceai/spiceai/bin/spice/pkg/util"
 	"github.com/spiceai/spiceai/bin/spice/pkg/version"
+	"golang.org/x/mod/semver"
 )
 
 var versionCmd = &cobra.Command{
@@ -86,7 +87,10 @@ func checkLatestCliReleaseVersion() error {
 	}
 
 	cliVersion := version.Version()
-	if !strings.HasPrefix(cliVersion, "local") && cliVersion != latestReleaseVersion {
+
+	cliIsPreRelease := strings.HasPrefix(cliVersion, "local") || strings.Contains(cliVersion, "rc")
+
+	if !cliIsPreRelease && semver.Compare(cliVersion, latestReleaseVersion) < 0 {
 		fmt.Printf("\nCLI version %s is now available!\nTo upgrade, run \"spice upgrade\".\n", aurora.BrightGreen(latestReleaseVersion))
 	}
 

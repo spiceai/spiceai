@@ -14,13 +14,22 @@ fn main() {
     }
 
     if args.version {
-        let version = if cfg!(feature = "release") {
-            env!("CARGO_PKG_VERSION")
+        if cfg!(feature = "release") {
+            println!("v{}", env!("CARGO_PKG_VERSION"));
         } else {
-            "local"
+            print!(
+                "v{}-rc.{}",
+                env!("CARGO_PKG_VERSION"),
+                env!("GIT_COMMIT_HASH")
+            );
+
+            if cfg!(feature = "dev") {
+                print!("-dev");
+            }
+
+            println!();
         };
 
-        println!("{version}");
         return;
     }
 
@@ -78,7 +87,7 @@ fn init_metrics(socket_addr: SocketAddr) -> Result<(), Box<dyn std::error::Error
 
     // This needs to run inside a Tokio runtime.
     builder.install()?;
-    tracing::trace!("Prometheus metrics server started on {socket_addr:?}");
+    tracing::info!("Metrics listening on {socket_addr:?}");
 
     Ok(())
 }
