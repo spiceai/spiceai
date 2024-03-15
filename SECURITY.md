@@ -6,8 +6,8 @@ As Spice.ai is in active development alpha, only the latest version is supported
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 0.9.x   | :x:                |
-| < 0.9   | :white_check_mark: |
+| 0.9.x   | :white_check_mark: |
+| < 0.9   | :x:                |
 
 ## Reporting a Vulnerability
 
