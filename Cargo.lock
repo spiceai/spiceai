@@ -530,7 +530,6 @@ dependencies = [
  "time",
  "tokio",
  "tokio-postgres",
- "tokio-rusqlite",
  "tracing",
 ]
 

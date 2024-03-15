@@ -20,5 +20,4 @@ bigdecimal_0_3_0 = { package = "bigdecimal", version = "0.3.0"}
 time = "0.3.34"
 bigdecimal = "0.4.3"
 tokio.workspace = true
-rusqlite = "0.31.0"
-tokio-rusqlite = "0.5.1"
+rusqlite.workspace = true
