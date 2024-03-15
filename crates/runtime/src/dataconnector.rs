@@ -19,7 +19,7 @@ use std::future::Future;
 use crate::datapublisher::DataPublisher;
 use crate::dataupdate::{DataUpdate, UpdateType};
 
-// pub mod aws;
+pub mod databricks;
 pub mod debug;
 pub mod dremio;
 pub mod flight;
