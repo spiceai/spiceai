@@ -7,7 +7,7 @@
 
 ## What is Spice?
 
-**Spice** is a portable runtime that provides developers with a unified SQL query interface to locally accelerate and query data tables sourced from any database, data warehouse, or data lake.
+**Spice** is a small, portable runtime that provides developers with a unified SQL query interface to locally accelerate and query data tables sourced from any database, data warehouse, or data lake.
 
 Spice makes it easy to build data-driven and data-intensive applications by streamlining the use of data and machine learning (ML) in software.
 
@@ -27,11 +27,11 @@ Spice makes querying data by SQL across one or more data sources simple and fast
 
 ### Example Use-Cases
 
-**1. Faster frontends.** Accelerate and co-locate data views with your frontend application, to serve more concurrent users with faster page loads and data updates.
+**1. Faster applications and frontends.** Accelerate and co-locate datasets with applications and frontends, to serve more concurrent queries and users with faster page loads and data updates.
 
-**2. Faster analytics and BI.**
+**2. Faster analytics and BI.** Faster, more responsive dashboards without massive compute costs.
 
-**3. Faster machine learning training and inferencing.**
+**3. Faster data pipelines, machine learning training and inferencing.** Co-locate datasets in pipelines where the data is needed to minimize data-movement and improve query performance.
 
 ⚠️ **DEVELOPER PREVIEW** Spice is under active **alpha** stage development and is not intended to be used in production until its **1.0-stable** release.
 
@@ -162,13 +162,13 @@ Query took: 0.002458976 seconds
 
 ## Next Steps
 
-You can use any number of predefined datasets available from Spice.ai in the Spice Runtime.
+You can use any number of predefined datasets available from Spice.ai in the Spice runtime.
 
-A list of publically available datasets from Spice.ai can be found here: https://docs.spice.ai/building-blocks/datasets.
+A list of publically available datasets from Spice.ai can be found here: https://[docs.spice.ai/building-blocks/datasets](https://docs.spice.ai/building-blocks/datasets).
 
 In order to access public datasets from Spice, you will first need to create an account with Spice.ai by selecting the free tier membership.
 
-Navigate to https://spice.ai/ and create a new account by clicking on Try for Free.
+Navigate to [spice.ai](https://spice.ai/) and create a new account by clicking on Try for Free.
 
 <img width="500" alt="spiceai_try_for_free-1" src="https://github.com/spiceai/spiceai/assets/112157037/27fb47ed-4825-4fa8-94bd-48197406cfaa">
 
@@ -340,11 +340,11 @@ You can now now query `my_dataset` in the runtime.
 
 🚀 See the [Roadmap to v1.0-stable](https://github.com/spiceai/spiceai/blob/trunk/docs/ROADMAP.md) for upcoming features.
 
-### Connect with us!
+### Connect with us
 
 We greatly appreciate and value your support! You can help Spice in a number of ways:
 
-- Build an app with Spice.ai and send us feedback and suggestions at [hey@spice.ai](mailto:hey@spice.ai) or on [Discord](https://discord.gg/kZnTfneP5u), [X] (https://twitter.com/spice_ai), or [LinkedIn](https://www.linkedin.com/company/74148478).
+- Build an app with Spice.ai and send us feedback and suggestions at [hey@spice.ai](mailto:hey@spice.ai) or on [Discord](https://discord.gg/kZnTfneP5u), [X](https://twitter.com/spice_ai), or [LinkedIn](https://www.linkedin.com/company/74148478).
 - [File an issue](https://github.com/spiceai/spiceai/issues/new) if you see something not quite working correctly.
 - Join our team ([We’re hiring!](https://spice.ai/careers))
 - Contribute code or documentation to the project (see [CONTRIBUTING.md](CONTRIBUTING.md)).
