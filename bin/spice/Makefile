@@ -1,14 +1,17 @@
 BASE_PACKAGE_NAME := github.com/spiceai/spiceai
 
+GIT_SHA := $(shell git rev-parse --short HEAD)
+FILE_VERSION := $(shell cat ../../version.txt)
+
 ifdef REL_VERSION
 	SPICE_VERSION := $(REL_VERSION)
 	SPICED_FEATURES := --features release
 else
-	SPICE_VERSION := local
+	SPICE_VERSION := $(if $(FILE_VERSION),$(FILE_VERSION)-rc.$(GIT_SHA),local)
 endif
 
 ifdef DEV
-	SPICE_VERSION := local-dev
+	SPICE_VERSION := $(if $(FILE_VERSION),$(FILE_VERSION)-rc.$(GIT_SHA)-dev,local-dev)
 endif
 
 LDFLAGS:="-X $(BASE_PACKAGE_NAME)/bin/spice/pkg/version.version=$(SPICE_VERSION)"

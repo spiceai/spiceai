@@ -120,8 +120,7 @@ func (c *RuntimeContext) IsRuntimeUpgradeAvailable() (string, error) {
 		return "", err
 	}
 
-	if currentVersion == "local" {
-		fmt.Println("Using latest 'local' runtime version.")
+	if strings.HasPrefix(currentVersion, "local") || strings.Contains(currentVersion, "rc") {
 		return "", nil
 	}
 
@@ -147,7 +146,7 @@ func (c *RuntimeContext) GetSpiceAppRelativePath(absolutePath string) string {
 func (c *RuntimeContext) GetRunCmd() (*exec.Cmd, error) {
 	spiceCMD := c.binaryFilePath("spiced")
 
-	cmd := exec.Command(spiceCMD)
+	cmd := exec.Command(spiceCMD, "--metrics", "127.0.0.1:9091")
 
 	return cmd, nil
 }
