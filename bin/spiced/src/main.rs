@@ -17,11 +17,17 @@ fn main() {
         if cfg!(feature = "release") {
             println!("v{}", env!("CARGO_PKG_VERSION"));
         } else {
-            println!(
+            print!(
                 "v{}-rc.{}",
                 env!("CARGO_PKG_VERSION"),
                 env!("GIT_COMMIT_HASH")
             );
+
+            if cfg!(feature = "dev") {
+                print!("-dev");
+            }
+
+            println!();
         };
 
         return;
