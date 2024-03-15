@@ -87,7 +87,7 @@ pub async fn run(args: Args) -> Result<()> {
 
     rt.load_models().await;
 
-    rt.start_servers()
+    rt.start_servers(args.metrics)
         .await
         .context(UnableToStartServersSnafu)?;
 
