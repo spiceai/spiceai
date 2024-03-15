@@ -10,7 +10,6 @@ use arrow::datatypes::Field;
 use arrow::datatypes::Schema;
 use rusqlite::types::Type;
 use rusqlite::Rows;
-use rusqlite::Statement;
 use snafu::prelude::*;
 
 #[derive(Debug, Snafu)]
@@ -37,25 +36,22 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 ///
 /// Returns an error if there is a failure in converting the rows to a `RecordBatch`.
 #[allow(clippy::too_many_lines)]
-#[allow(clippy::needless_pass_by_value)]
-pub fn rows_to_arrow(mut rows: Rows, stmt: Statement) -> Result<RecordBatch> {
+pub fn rows_to_arrow(mut rows: Rows, num_cols: usize) -> Result<RecordBatch> {
     let mut arrow_fields: Vec<Field> = Vec::new();
     let mut arrow_columns_builders: Vec<Box<dyn ArrayBuilder>> = Vec::new();
     let mut sqlite_types: Vec<Type> = Vec::new();
 
-    let sqlite_columns = stmt.columns();
-    for column in sqlite_columns {
-        let column_name = column.name();
-        let Some(column_type_str) = column.decl_type() else {
-            unimplemented!("Unsupported column type: expression");
-        };
+    if let Ok(Some(row)) = rows.next() {
+        for i in 0..num_cols {
+            let column_type = row.get_ref(i).unwrap().data_type();
+            let column_name = row.as_ref().column_name(i).unwrap().to_string();
+            let data_type = map_column_type_to_data_type(&column_type);
 
-        let column_type = map_column_type_str_to_type(column_type_str);
-        let data_type = map_column_type_to_data_type(&column_type);
-        arrow_fields.push(Field::new(column_name, data_type.clone(), true));
-        arrow_columns_builders.push(map_data_type_to_array_builder(&data_type));
-        sqlite_types.push(column_type.clone());
-    }
+            arrow_fields.push(Field::new(column_name, data_type.clone(), true));
+            arrow_columns_builders.push(map_data_type_to_array_builder(&data_type));
+            sqlite_types.push(column_type.clone());
+        }
+    };
 
     let mut row_count = 0;
     while let Ok(Some(row)) = rows.next() {
@@ -144,17 +140,6 @@ pub fn rows_to_arrow(mut rows: Rows, stmt: Statement) -> Result<RecordBatch> {
     match RecordBatch::try_new_with_options(Arc::new(Schema::new(arrow_fields)), columns, options) {
         Ok(record_batch) => Ok(record_batch),
         Err(e) => Err(e).context(FailedToBuildRecordBatchSnafu),
-    }
-}
-
-fn map_column_type_str_to_type(column_type_str: &str) -> Type {
-    match column_type_str {
-        "Null" => Type::Null,
-        "Integer" => Type::Integer,
-        "Real" => Type::Real,
-        "Text" => Type::Text,
-        "Blob" => Type::Blob,
-        _ => unimplemented!("Unsupported column type {:?}", column_type_str),
     }
 }
 

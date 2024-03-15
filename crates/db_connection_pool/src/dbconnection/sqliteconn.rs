@@ -63,16 +63,18 @@ impl SyncDbConnection<bb8::PooledConnection<'static, RusqliteConnectionManager>,
             .conn
             .prepare(&format!("SELECT * FROM {table_reference} LIMIT 1"))
             .context(QuerySnafu)?;
+        let column_count = stmt.column_count();
         let rows = stmt.query([]).context(QuerySnafu)?;
-        let rec = rows_to_arrow(rows, stmt).context(ConversionSnafu)?;
+        let rec = rows_to_arrow(rows, column_count).context(ConversionSnafu)?;
         let schema = rec.schema();
         Ok(schema)
     }
 
     fn query_arrow(&self, sql: &str, params: &[&dyn ToSql]) -> Result<SendableRecordBatchStream> {
         let mut stmt = self.conn.prepare(sql).context(QuerySnafu)?;
+        let column_count = stmt.column_count();
         let rows = stmt.query(params).context(QuerySnafu)?;
-        let rec = rows_to_arrow(rows, stmt).context(ConversionSnafu)?;
+        let rec = rows_to_arrow(rows, column_count).context(ConversionSnafu)?;
         let schema = rec.schema();
         let recs = vec![rec];
         Ok(Box::pin(MemoryStream::try_new(recs, schema, None)?))
