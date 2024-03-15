@@ -25,6 +25,9 @@ pub enum Error {
 
     #[snafu(display("Failed to extract row value: {source}"))]
     FailedToExtractRowValue { source: rusqlite::Error },
+
+    #[snafu(display("Failed to extract column name: {source}"))]
+    FailedToExtractColumnName { source: rusqlite::Error },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -43,8 +46,15 @@ pub fn rows_to_arrow(mut rows: Rows, num_cols: usize) -> Result<RecordBatch> {
 
     if let Ok(Some(row)) = rows.next() {
         for i in 0..num_cols {
-            let column_type = row.get_ref(i).unwrap().data_type();
-            let column_name = row.as_ref().column_name(i).unwrap().to_string();
+            let column_type = row
+                .get_ref(i)
+                .context(FailedToExtractRowValueSnafu)?
+                .data_type();
+            let column_name = row
+                .as_ref()
+                .column_name(i)
+                .context(FailedToExtractColumnNameSnafu)?
+                .to_string();
             let data_type = map_column_type_to_data_type(&column_type);
 
             arrow_fields.push(Field::new(column_name, data_type.clone(), true));
