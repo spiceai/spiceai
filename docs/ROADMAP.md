@@ -17,7 +17,6 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 - PostgreSQL data connector (alpha)
 - Spice data connector (alpha)
 - Spice data backend (alpha)
-- Arrow Flight SQL data connector (alpha)
 - Arrow Flight SQL (JDBC/ODBC/ADBC) endpoint (alpha)
 - Databricks data connector (alpha)
 - `/models` API
@@ -31,6 +30,7 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 - E2E tests
 - Helm chart
 - Grafana dashboard
+- Arrow Flight SQL data connector (alpha)
 - SQLite data backend (alpha)
 - BigQuery data connector (alpha)
 - Snowflake data connector (alpha)

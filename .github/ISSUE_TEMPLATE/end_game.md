@@ -4,19 +4,36 @@ about: Ship a milestone!
 title: 'v0.x.x-alpha endgame'
 labels: 'endgame'
 assignees: ''
-
 ---
 
-- [ ] Ensure all outstanding `spiceai` feature PRs are merged
+## DRIs
+
+|         | DRI               |
+| ------- | ----------------- |
+| Endgame | <GitHub Username> |
+| QA      | <GitHub Username> |
+| Docs    | <GitHub Username> |
+
+## Milestone Release Timeline
+
+| Date         | Description |
+| ------------ | ----------- |
+| Planning     | Mon, Mar 11 |
+| Release      | Thu, Mar 14 |
+| Announcement | Thu, Mar 14 |
+
+## Checklist
+
+- [ ] All outstanding `spiceai` feature PRs are merged
 - [ ] Full test pass and update if necessary over README.md (please get screenshots!)
 - [ ] Full test pass and update if necessary over Docs (please get screenshots!)
 - [ ] Full test pass and update if necessary over existing and new Samples (please get screenshots/videos!)
 - [ ] Full test pass and update if necessary over existing and new Quickstarts (please get screenshots/videos!)
-- [ ] Merge Docs PRs
+- [ ] Merge [Docs PRs](https://github.com/spiceai/docs/pulls)
 - [ ] Merge Registry PRs
-- [ ] Merge Samples PRs
-- [ ] Merge Quickstarts PRs
-- [ ] Merge release notes
+- [ ] Merge [Samples PRs](https://github.com/spiceai/samples/pulls)
+- [ ] Merge [Quickstarts PRs](https://github.com/spiceai/samples/pulls)
+- [ ] Update release notes
 - [ ] Update acknowledgements
 - [ ] Update data-components-contrib repo with latest tag and reference it in spiceai. See [Components contrib version update](https://github.com/spiceai/spiceai/blob/trunk/docs/RELEASE.md#components-contrib-version-update)
 - [ ] Update version using documented process at [docs/RELEASE.md](https://github.com/spiceai/spiceai/blob/trunk/docs/RELEASE.md#version-update)
@@ -29,6 +46,8 @@ assignees: ''
 - [ ] For major releases, [blog.spiceai.org](https://blog.spiceai.org) announcement
 - [ ] Update `version.txt` to the next release version.
 
-## PR reference:
--
-- 
+## PR reference
+
+- PR 1.
+- PR 2.
+- etc.
