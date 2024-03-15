@@ -12,6 +12,7 @@ pub mod duckdb;
 pub mod memtable;
 #[cfg(feature = "postgres")]
 pub mod postgres;
+pub mod sqlite;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -147,6 +148,17 @@ impl DataBackendBuilder {
                     self.params,
                     self.primary_keys,
                     self.secret,
+                )
+                .await
+                .boxed()
+                .context(BackendCreationFailedSnafu)?,
+            )),
+            Engine::Sqlite => Ok(Box::new(
+                sqlite::SqliteBackend::new(
+                    Arc::clone(&self.ctx),
+                    self.name.as_str(),
+                    self.params,
+                    self.primary_keys,
                 )
                 .await
                 .boxed()
