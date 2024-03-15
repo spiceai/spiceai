@@ -7,9 +7,6 @@ on:
     tags:
       - v*
 
-  # REVERT
-  pull_request:
-
   workflow_dispatch:
 
 jobs:
