@@ -12,17 +12,43 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 
 - See [Bugs](https://github.com/spiceai/spiceai/labels/bug). Feel free to file a new Issue if you see a bug and let us know on Discord.
 
+## v0.9-alpha
+
+- PostgreSQL data connector (alpha)
+- Spice data connector (alpha)
+- Spice data backend (alpha)
+- Arrow Flight SQL (JDBC/ODBC/ADBC) endpoint (alpha)
+- Databricks data connector (alpha)
+- `/models` API
+- `/status` API
+- Secrets keyring store (alpha)
+- Secrets ENV store (alpha)
+- Improve metrics endpoint
+
+## v0.10-alpha
+
+- E2E tests
+- Helm chart
+- Grafana dashboard
+- Arrow Flight SQL data connector (alpha)
+- SQLite data backend (alpha)
+- BigQuery data connector (alpha)
+- Snowflake data connector (alpha)
+
+## v0.11-alpha
+
+- Stability, reliability, and performance
+
+## v0.12-alpha
+
+- Acceleration retention policies
+
 ## Features being considered for v1.0-stable
 
-- CI/CD on GitHub
-- Self-host on baremetal or VM
-- Pluggable environments
-- Search, index, publish and browse the Spice Rack registry
-- Distributed learning
-- Custom visualization hooks for Dataspaces
-- Parallel Actions (AI Engine)
-- A/B testing and flighting
-- Continuous Actions
+- CLI publish Spicepods to [spicerack.org](https://spicerack.org)
+- Kubernetes operator
+- MYSQL data connector
+- Iceberg data connector
 
 ## Beyond v1.0
 

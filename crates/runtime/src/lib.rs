@@ -52,12 +52,6 @@ pub enum Error {
     #[snafu(display("Unable to create data backend: {source}"))]
     UnableToCreateBackend { source: datafusion::Error },
 
-    #[snafu(display("Unable to attach data source {data_source}: {source}"))]
-    UnableToAttachDataSource {
-        source: datafusion::Error,
-        data_source: String,
-    },
-
     #[snafu(display("Unable to attach view: {source}"))]
     UnableToAttachView { source: datafusion::Error },
 
@@ -295,6 +289,16 @@ impl Runtime {
                     data_connector: source,
                 })?,
             ))),
+            "databricks" => Ok(Some(Box::new(
+                dataconnector::databricks::Databricks::new(
+                    secrets_provider.get_secret(source).await,
+                    params,
+                )
+                .await
+                .context(UnableToInitializeDataConnectorSnafu {
+                    data_connector: source,
+                })?,
+            ))),
             "s3" => Ok(Some(Box::new(
                 dataconnector::s3::S3::new(secrets_provider.get_secret(source).await, params)
                     .await
@@ -331,13 +335,15 @@ impl Runtime {
             return Ok(());
         }
 
-        if ds.acceleration.is_none() {
+        if ds.acceleration.is_none() || ds.acceleration.as_ref().map_or(false, |acc| !acc.enabled) {
             if let Some(data_connector) = data_connector {
                 df.read()
                     .await
                     .attach_mesh(ds, data_connector)
                     .await
-                    .context(UnableToAttachViewSnafu)?;
+                    .context(UnableToAttachDataConnectorSnafu {
+                        data_connector: source,
+                    })?;
                 return Ok(());
             }
         }

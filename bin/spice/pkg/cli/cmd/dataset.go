@@ -70,7 +70,8 @@ spice dataset configure
 		from = strings.TrimSuffix(from, "\n")
 
 		params := map[string]string{}
-		if strings.Split(from, ":")[0] == api.DATA_SOURCE_DREMIO {
+		datasetPrefix := strings.Split(from, ":")[0]
+		if datasetPrefix == api.DATA_SOURCE_DREMIO || datasetPrefix == api.DATA_SOURCE_DATABRICKS {
 			cmd.Print("endpoint: ")
 			endpoint, err := reader.ReadString('\n')
 			if err != nil {
