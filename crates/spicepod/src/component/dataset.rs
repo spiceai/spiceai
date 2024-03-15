@@ -238,6 +238,7 @@ pub mod acceleration {
         DuckDB,
         #[cfg(feature = "postgres")]
         Postgres,
+        #[cfg(feature = "sqlite")]
         Sqlite,
     }
 

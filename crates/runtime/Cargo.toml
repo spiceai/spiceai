@@ -78,11 +78,11 @@ keyring = { version = "2.3.2", optional = true }
 tonic-health = "0.11.0"
 db_connection_pool = { path = "../db_connection_pool" }
 secrecy = "0.8.0"
-rusqlite = "0.31.0"
-tokio-rusqlite = "0.5.1"
+rusqlite = { version = "0.31.0", optional = true }
+tokio-rusqlite = { version = "0.5.1", optional = true }
 
 [features]
-default = ["duckdb", "postgres", "keyring-secret-store"]
+default = ["duckdb", "postgres", "keyring-secret-store", "sqlite"]
 dev = []
 duckdb = ["dep:duckdb", "sql_provider_datafusion", "r2d2"]
 postgres = [
@@ -91,4 +91,5 @@ postgres = [
     "sql_provider_datafusion",
     "arrow_sql_gen",
 ]
+sqlite = ["dep:rusqlite", "tokio-rusqlite"]
 keyring-secret-store = ["secrets/keyring-secret-store"]

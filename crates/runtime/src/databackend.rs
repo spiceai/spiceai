@@ -12,6 +12,7 @@ pub mod duckdb;
 pub mod memtable;
 #[cfg(feature = "postgres")]
 pub mod postgres;
+#[cfg(feature = "sqlite")]
 pub mod sqlite;
 
 #[derive(Debug, Snafu)]
@@ -114,6 +115,8 @@ impl DataBackendBuilder {
             Some(Engine::DuckDB) => Ok(()),
             #[cfg(feature = "postgres")]
             Some(Engine::Postgres) => Ok(()),
+            #[cfg(feature = "sqlite")]
+            Some(Engine::Sqlite) => Ok(()),
             _ => Ok(()),
         }
     }
@@ -153,6 +156,7 @@ impl DataBackendBuilder {
                 .boxed()
                 .context(BackendCreationFailedSnafu)?,
             )),
+            #[cfg(feature = "sqlite")]
             Engine::Sqlite => Ok(Box::new(
                 sqlite::SqliteBackend::new(
                     Arc::clone(&self.ctx),

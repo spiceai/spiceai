@@ -14,5 +14,4 @@ endif
 
 .PHONY: all
 all:
-	sudo apt update && sudo apt install --yes libsqlite3-dev
 	cargo build --release $(SPICED_FEATURES) --target-dir $(TARGET_DIR)
