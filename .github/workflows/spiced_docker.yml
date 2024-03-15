@@ -11,16 +11,8 @@ on:
 
 jobs:
   build:
-    name: Build Spice ${{ matrix.target_os }}_${{ matrix.target_arch }} Docker image
+    name: Build Spice linux_amd64 Docker image
     runs-on: rust
-
-    strategy:
-      matrix:
-        os: [ubuntu-latest]
-        target_arch: [amd64]
-        include:
-          - os: ubuntu-latest
-            target_os: linux
 
     steps:
       - uses: actions/checkout@v4
@@ -55,15 +47,15 @@ jobs:
         with:
           context: .
           file: Dockerfile
-          platforms: ${{ matrix.target_os }}/${{ matrix.target_arch }}
+          platforms: linux/amd64
           push: ${{ startswith(github.ref, 'refs/tags/v') }}
           build-args: |
             REL_VERSION=${{ env.REL_VERSION }}
           tags: |
             ghcr.io/spiceai/spiceai:${{ env.REL_VERSION }}
-            ghcr.io/spiceai/spiceai:${{ env.REL_VERSION }}-${{ matrix.target_os }}-${{ matrix.target_arch }}
+            ghcr.io/spiceai/spiceai:${{ env.REL_VERSION }}-linux-amd64
             spiceai/spiceai:${{ env.REL_VERSION }}
-            spiceai/spiceai:${{ env.REL_VERSION }}-${{ matrix.target_os }}-${{ matrix.target_arch }}
+            spiceai/spiceai:${{ env.REL_VERSION }}-linux-amd64
             ${{ env.LATEST_GHCR_TAG }}
             ${{ env.LATEST_DOCKERHUB_TAG }}
 
