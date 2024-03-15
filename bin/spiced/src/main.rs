@@ -87,7 +87,7 @@ fn init_metrics(socket_addr: SocketAddr) -> Result<(), Box<dyn std::error::Error
 
     // This needs to run inside a Tokio runtime.
     builder.install()?;
-    tracing::trace!("Prometheus metrics server started on {socket_addr:?}");
+    tracing::info!("Metrics listening on {socket_addr:?}");
 
     Ok(())
 }
