@@ -99,6 +99,8 @@ pub(crate) async fn handle(
                         flights.push(flight_batch.into());
                     }
 
+                    metrics::counter!("flight_do_exchange_data_updates_sent")
+                        .increment(flights.len() as u64);
                     let output = futures::stream::iter(flights.into_iter().map(Ok));
 
                     Some((output, rx))

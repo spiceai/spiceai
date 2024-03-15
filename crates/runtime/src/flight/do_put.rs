@@ -2,11 +2,14 @@ use std::{collections::HashMap, sync::Arc};
 
 use arrow_flight::{flight_service_server::FlightService, FlightData, PutResult};
 use arrow_ipc::convert::try_schema_from_flatbuffer_bytes;
-use futures::{stream, StreamExt};
+use futures::stream;
 use tokio::sync::{broadcast::Sender, RwLock};
 use tonic::{Request, Response, Status, Streaming};
 
-use crate::dataupdate::{DataUpdate, UpdateType};
+use crate::{
+    dataupdate::{DataUpdate, UpdateType},
+    timing::{TimeMeasurement, TimedStream},
+};
 
 use super::Service;
 
@@ -29,6 +32,7 @@ pub(crate) async fn handle(
     flight_svc: &Service,
     request: Request<Streaming<FlightData>>,
 ) -> Result<Response<<Service as FlightService>::DoPutStream>, Status> {
+    let mut duration_metric = TimeMeasurement::new("flight_do_put_duration_ms", vec![]);
     let mut streaming_flight = request.into_inner();
 
     let Ok(Some(message)) = streaming_flight.message().await else {
@@ -42,6 +46,8 @@ pub(crate) async fn handle(
     };
 
     let path = fd.path.join(".");
+
+    duration_metric.with_labels(vec![("path", path.clone())]);
 
     let df = flight_svc.datafusion.read().await;
 
@@ -130,5 +136,7 @@ pub(crate) async fn handle(
         }
     });
 
-    Ok(Response::new(response_stream.boxed()))
+    let timed_stream = TimedStream::new(response_stream, move || duration_metric);
+
+    Ok(Response::new(Box::pin(timed_stream)))
 }
