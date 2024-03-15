@@ -1,3 +1,32 @@
+use csv::Writer;
+use serde::{Deserialize, Serialize};
+
+#[derive(Default, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Format {
+    #[default]
+    Json,
+    Csv,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Status {
+    Initializing,
+    Disabled,
+    Ready,
+    Error,
+}
+
+fn convert_entry_to_csv<T: Serialize>(entries: &[T]) -> Result<String, Box<dyn std::error::Error>> {
+    let mut w = Writer::from_writer(vec![]);
+    for e in entries {
+        w.serialize(e)?;
+    }
+    w.flush()?;
+    Ok(String::from_utf8(w.into_inner()?)?)
+}
+
 pub(crate) mod query {
     use std::sync::Arc;
 
@@ -71,10 +100,20 @@ pub(crate) mod datasets {
     use std::sync::Arc;
 
     use app::App;
-    use axum::{extract::Query, Extension, Json};
-    use serde::Deserialize;
+    use axum::{
+        extract::Query,
+        http::status,
+        response::{IntoResponse, Response},
+        Extension, Json,
+    };
+    use serde::{Deserialize, Serialize};
     use spicepod::component::dataset::Dataset;
     use tokio::sync::RwLock;
+    use tract_core::tract_data::itertools::Itertools;
+
+    use crate::datafusion::DataFusion;
+
+    use super::{convert_entry_to_csv, Format};
 
     #[derive(Debug, Deserialize)]
     pub(crate) struct DatasetFilter {
@@ -84,13 +123,41 @@ pub(crate) mod datasets {
         remove_views: bool,
     }
 
+    #[derive(Debug, Deserialize)]
+    pub(crate) struct DatasetQueryParams {
+        #[serde(default)]
+        status: bool,
+
+        #[serde(default)]
+        format: Format,
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    pub(crate) struct DatasetResponseItem {
+        pub from: String,
+        pub name: String,
+        pub replication_enabled: bool,
+        pub acceleration_enabled: bool,
+        pub depends_on: Option<String>,
+
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub status: Option<super::Status>,
+    }
+
     pub(crate) async fn get(
         Extension(app): Extension<Arc<RwLock<Option<App>>>>,
+        Extension(df): Extension<Arc<RwLock<DataFusion>>>,
         Query(filter): Query<DatasetFilter>,
-    ) -> Json<Vec<Dataset>> {
+        Query(params): Query<DatasetQueryParams>,
+    ) -> Response {
         let app_lock = app.read().await;
         let Some(readable_app) = &*app_lock else {
-            return Json(vec![]);
+            return (
+                status::StatusCode::INTERNAL_SERVER_ERROR,
+                Json::<Vec<DatasetResponseItem>>(vec![]),
+            )
+                .into_response();
         };
 
         let mut datasets: Vec<Dataset> = match filter.source {
@@ -107,7 +174,119 @@ pub(crate) mod datasets {
             datasets.retain(|d| !d.is_view());
         }
 
-        Json(datasets)
+        let df_read = df.read().await;
+
+        let resp = datasets
+            .iter()
+            .map(|d| DatasetResponseItem {
+                from: d.from.clone(),
+                name: d.name.clone(),
+                replication_enabled: d.replication.as_ref().is_some_and(|f| f.enabled),
+                acceleration_enabled: d.acceleration.as_ref().is_some_and(|f| f.enabled),
+                depends_on: if d.depends_on.is_empty() {
+                    None
+                } else {
+                    Some(d.depends_on.join(", "))
+                },
+                status: if params.status {
+                    if df_read.table_exists(d.name.as_str()) {
+                        Some(super::Status::Ready)
+                    } else {
+                        Some(super::Status::Error)
+                    }
+                } else {
+                    None
+                },
+            })
+            .collect_vec();
+
+        match params.format {
+            Format::Json => (status::StatusCode::OK, Json(resp)).into_response(),
+            Format::Csv => match convert_entry_to_csv(&resp) {
+                Ok(csv) => (status::StatusCode::OK, csv).into_response(),
+                Err(e) => {
+                    tracing::error!("Error converting to CSV: {e}");
+                    (status::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+                }
+            },
+        }
+    }
+}
+
+pub(crate) mod models {
+    use std::{collections::HashMap, sync::Arc};
+
+    use axum::{
+        extract::Query,
+        http::status,
+        response::{IntoResponse, Json, Response},
+        Extension,
+    };
+    use csv::Writer;
+    use serde::{Deserialize, Serialize};
+    use tokio::sync::RwLock;
+
+    use crate::model::Model;
+
+    use super::Format;
+
+    #[derive(Debug, Deserialize)]
+    pub(crate) struct ModelsQueryParams {
+        #[serde(default)]
+        format: Format,
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    pub(crate) struct ModelResponse {
+        pub name: String,
+        pub from: String,
+        pub datasets: Option<Vec<String>>,
+    }
+
+    pub(crate) async fn get(
+        Extension(model): Extension<Arc<RwLock<HashMap<String, Model>>>>,
+        Query(params): Query<ModelsQueryParams>,
+    ) -> Response {
+        let resp = model
+            .read()
+            .await
+            .values()
+            .map(|m| {
+                let datasets = if m.model.datasets.is_empty() {
+                    None
+                } else {
+                    Some(m.model.datasets.clone())
+                };
+                ModelResponse {
+                    name: m.model.name.clone(),
+                    from: m.model.from.clone(),
+                    datasets,
+                }
+            })
+            .collect::<Vec<ModelResponse>>();
+
+        match params.format {
+            Format::Json => (status::StatusCode::OK, Json(resp)).into_response(),
+            Format::Csv => match convert_details_to_csv(&resp) {
+                Ok(csv) => (status::StatusCode::OK, csv).into_response(),
+                Err(e) => {
+                    tracing::error!("Error converting to CSV: {e}");
+                    (status::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+                }
+            },
+        }
+    }
+
+    fn convert_details_to_csv(
+        models: &[ModelResponse],
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let mut w = Writer::from_writer(vec![]);
+        for d in models {
+            let _ = w.serialize(d);
+        }
+        w.flush()?;
+        Ok(String::from_utf8(w.into_inner()?)?)
     }
 }
 

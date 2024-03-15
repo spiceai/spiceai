@@ -4966,6 +4966,7 @@ dependencies = [
  "bb8-postgres",
  "bytes",
  "clap",
+ "csv",
  "datafusion",
  "db_connection_pool",
  "deltalake",
