@@ -32,7 +32,7 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// Converts Postgres `Row`s to an Arrow `RecordBatch`. Assumes that all rows have the same schema and
+/// Converts Sqlite `Row`s to an Arrow `RecordBatch`. Assumes that all rows have the same schema and
 /// sets the schema based on the first row.
 ///
 /// # Errors
@@ -43,8 +43,11 @@ pub fn rows_to_arrow(mut rows: Rows, num_cols: usize) -> Result<RecordBatch> {
     let mut arrow_fields: Vec<Field> = Vec::new();
     let mut arrow_columns_builders: Vec<Box<dyn ArrayBuilder>> = Vec::new();
     let mut sqlite_types: Vec<Type> = Vec::new();
+    let mut row_count = 0;
 
     if let Ok(Some(row)) = rows.next() {
+        row_count += 1;
+
         for i in 0..num_cols {
             let column_type = row
                 .get_ref(i)
@@ -63,7 +66,6 @@ pub fn rows_to_arrow(mut rows: Rows, num_cols: usize) -> Result<RecordBatch> {
         }
     };
 
-    let mut row_count = 0;
     while let Ok(Some(row)) = rows.next() {
         for (i, sqlite_type) in sqlite_types.iter().enumerate() {
             let Some(builder) = arrow_columns_builders.get_mut(i) else {
