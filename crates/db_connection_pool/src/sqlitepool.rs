@@ -20,21 +20,20 @@ pub enum Error {
 }
 
 pub struct SqliteConnectionPool {
-    file_name: String,
-    mode: Mode,
+    conn: Connection,
 }
 
 impl SqliteConnectionPool {
     /// Creates a new instance of `SqliteConnectionPool`.
     ///
     /// NOTE: The `SqliteConnectionPool` currently does no connection pooling, it simply creates a new connection
-    /// on each call to `connect()`.
+    /// and clones it on each call to `connect()`.
     ///
     /// # Errors
     ///
     /// Returns an error if there is a problem creating the connection pool.
     #[allow(clippy::needless_pass_by_value)]
-    pub fn new(
+    pub async fn new(
         name: &str,
         mode: Mode,
         params: Arc<Option<HashMap<String, String>>>,
@@ -46,7 +45,16 @@ impl SqliteConnectionPool {
             .unwrap_or(name.to_string());
         let file_name = format!("{file_name}_sqlite.db");
 
-        Ok(SqliteConnectionPool { file_name, mode })
+        let conn = match mode {
+            Mode::Memory => Connection::open_in_memory()
+                .await
+                .context(ConnectionPoolSnafu)?,
+            Mode::File => Connection::open(file_name)
+                .await
+                .context(ConnectionPoolSnafu)?,
+        };
+
+        Ok(SqliteConnectionPool { conn })
     }
 }
 
@@ -55,14 +63,6 @@ impl DbConnectionPool<Connection, &'static (dyn ToSql + Sync)> for SqliteConnect
     async fn connect(
         &self,
     ) -> Result<Box<dyn DbConnection<Connection, &'static (dyn ToSql + Sync)>>> {
-        let conn = match self.mode {
-            Mode::Memory => Connection::open_in_memory()
-                .await
-                .context(ConnectionPoolSnafu)?,
-            Mode::File => Connection::open(self.file_name.clone())
-                .await
-                .context(ConnectionPoolSnafu)?,
-        };
-        Ok(Box::new(SqliteConnection::new(conn)))
+        Ok(Box::new(SqliteConnection::new(self.conn.clone())))
     }
 }

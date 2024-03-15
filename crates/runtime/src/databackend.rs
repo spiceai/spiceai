@@ -161,6 +161,7 @@ impl DataBackendBuilder {
                     mode.into(),
                     self.primary_keys,
                 )
+                .await
                 .boxed()
                 .context(BackendCreationFailedSnafu)?,
             )),

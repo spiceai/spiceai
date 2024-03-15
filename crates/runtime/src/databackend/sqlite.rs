@@ -81,14 +81,16 @@ impl DataPublisher for SqliteBackend {
 
 impl SqliteBackend {
     #[allow(clippy::needless_pass_by_value)]
-    pub fn new(
+    pub async fn new(
         ctx: Arc<SessionContext>,
         name: &str,
         params: Arc<Option<HashMap<String, String>>>,
         mode: Mode,
         primary_keys: Option<Vec<String>>,
     ) -> Result<Self> {
-        let pool = SqliteConnectionPool::new(name, mode, params).context(DbConnectionPoolSnafu)?;
+        let pool = SqliteConnectionPool::new(name, mode, params)
+            .await
+            .context(DbConnectionPoolSnafu)?;
         Ok(SqliteBackend {
             ctx,
             name: name.to_string(),
