@@ -116,12 +116,15 @@ pub(crate) mod datasets {
     use super::{convert_entry_to_csv, Format};
 
     #[derive(Debug, Deserialize)]
-    pub(crate) struct QueryParams {
+    pub(crate) struct DataFilter {
         source: Option<String>,
 
         #[serde(default)]
         remove_views: bool,
-        // TODO: Implement status checking.
+    }
+
+    #[derive(Debug, Deserialize)]
+    pub(crate) struct DatasetQueryParams {
         #[serde(default)]
         status: bool,
 
@@ -145,7 +148,8 @@ pub(crate) mod datasets {
     pub(crate) async fn get(
         Extension(app): Extension<Arc<RwLock<Option<App>>>>,
         Extension(df): Extension<Arc<RwLock<DataFusion>>>,
-        Query(params): Query<QueryParams>,
+        Query(filter): Query<DataFilter>,
+        Query(params): Query<DatasetQueryParams>,
     ) -> Response {
         let app_lock = app.read().await;
         let Some(readable_app) = &*app_lock else {
@@ -156,7 +160,7 @@ pub(crate) mod datasets {
                 .into_response();
         };
 
-        let mut datasets: Vec<Dataset> = match params.source {
+        let mut datasets: Vec<Dataset> = match filter.source {
             Some(source) => readable_app
                 .datasets
                 .iter()
@@ -166,7 +170,7 @@ pub(crate) mod datasets {
             None => readable_app.datasets.clone(),
         };
 
-        if params.remove_views {
+        if filter.remove_views {
             datasets.retain(|d| !d.is_view());
         }
 
@@ -227,10 +231,7 @@ pub(crate) mod models {
     use super::Format;
 
     #[derive(Debug, Deserialize)]
-    pub(crate) struct QueryParams {
-        // TODO: Implement status checking.
-        // #[serde(default)]
-        // _status: bool,
+    pub(crate) struct ModelsQueryParams {
         #[serde(default)]
         format: Format,
     }
@@ -245,7 +246,7 @@ pub(crate) mod models {
 
     pub(crate) async fn get(
         Extension(model): Extension<Arc<RwLock<HashMap<String, Model>>>>,
-        Query(params): Query<QueryParams>,
+        Query(params): Query<ModelsQueryParams>,
     ) -> Response {
         let resp = model
             .read()
