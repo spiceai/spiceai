@@ -304,7 +304,7 @@ description: my dataset in dremio
 Specify the location of the dataset:
 
 ```bash
-from: dremio/datasets.my_dataset
+from: dremio:datasets.my_dataset
 ```
 
 Select "y" when prompted whether to locally accelerate the dataset:
