@@ -5,7 +5,6 @@ on:
   pull_request:
     branches:
       - trunk
-      - rust
       - release-*
 
   workflow_dispatch:
