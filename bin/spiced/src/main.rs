@@ -60,7 +60,7 @@ fn init_tracing() -> Result<(), Box<dyn std::error::Error>> {
         EnvFilter::new(env_log)
     } else {
         EnvFilter::new(
-            "spiced=INFO,runtime=INFO,flight_datafusion=INFO,sql_provider_datafusion=INFO",
+            "spiced=INFO,runtime=INFO,flightsql_datafusion=INFO,flight_datafusion=INFO,sql_provider_datafusion=INFO",
         )
     };
 
