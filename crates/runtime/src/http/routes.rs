@@ -1,7 +1,7 @@
-use std::{collections::HashMap, sync::Arc};
-
-use crate::{datafusion::DataFusion, model::Model};
+use crate::{config, datafusion::DataFusion, model::Model};
 use app::App;
+use std::net::SocketAddr;
+use std::{collections::HashMap, sync::Arc};
 
 use axum::{
     body::Body,
@@ -20,17 +20,23 @@ pub(crate) fn routes(
     app: Arc<RwLock<Option<App>>>,
     df: Arc<RwLock<DataFusion>>,
     models: Arc<RwLock<HashMap<String, Model>>>,
+    config: Arc<config::Config>,
+    with_metrics: Option<SocketAddr>,
 ) -> Router {
     Router::new()
         .route("/health", get(|| async { "ok\n" }))
         .route("/v1/sql", post(v1::query::post))
+        .route("/v1/status", get(v1::status::get))
         .route("/v1/datasets", get(v1::datasets::get))
+        .route("/v1/models", get(v1::models::get))
         .route("/v1/models/:name/predict", get(v1::inference::get))
         .route("/v1/predict", post(v1::inference::post))
         .route_layer(middleware::from_fn(track_metrics))
         .layer(Extension(app))
         .layer(Extension(df))
+        .layer(Extension(with_metrics))
         .layer(Extension(models))
+        .layer(Extension(config))
 }
 
 async fn track_metrics(req: Request<Body>, next: Next) -> impl IntoResponse {

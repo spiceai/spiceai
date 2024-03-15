@@ -4962,10 +4962,12 @@ dependencies = [
  "aws-config",
  "aws-types",
  "axum 0.7.4",
+ "base64 0.22.0",
  "bb8",
  "bb8-postgres",
  "bytes",
  "clap",
+ "csv",
  "datafusion",
  "db_connection_pool",
  "deltalake",
@@ -4977,6 +4979,7 @@ dependencies = [
  "futures-core",
  "indexmap 2.2.5",
  "itertools 0.12.1",
+ "keyring",
  "metrics",
  "ndarray",
  "ndarray-npy",
@@ -4993,6 +4996,7 @@ dependencies = [
  "secrets",
  "serde",
  "serde_json",
+ "serde_yaml",
  "snafu 0.8.2",
  "spicepod",
  "sql_provider_datafusion",
@@ -5001,6 +5005,7 @@ dependencies = [
  "toml",
  "tonic 0.10.2",
  "tonic 0.9.2",
+ "tonic-health",
  "tracing",
  "tract-core",
  "tract-onnx",
@@ -6271,6 +6276,40 @@ dependencies = [
  "tower-layer",
  "tower-service",
  "tracing",
+]
+
+[[package]]
+name = "tonic"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "76c4eb7a4e9ef9d4763600161f12f5070b92a578e1b634db88a6887844c91a13"
+dependencies = [
+ "async-trait",
+ "base64 0.21.7",
+ "bytes",
+ "http 0.2.12",
+ "http-body 0.4.6",
+ "percent-encoding",
+ "pin-project",
+ "prost 0.12.3",
+ "tokio",
+ "tokio-stream",
+ "tower-layer",
+ "tower-service",
+ "tracing",
+]
+
+[[package]]
+name = "tonic-health"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2cef6e24bc96871001a7e48e820ab240b3de2201e59b517cf52835df2f1d2350"
+dependencies = [
+ "async-stream",
+ "prost 0.12.3",
+ "tokio",
+ "tokio-stream",
+ "tonic 0.11.0",
 ]
 
 [[package]]

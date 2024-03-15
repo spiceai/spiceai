@@ -10,7 +10,7 @@ use tokio::sync::RwLock;
 
 pub struct Model {
     runnable: Box<dyn Runnable>,
-    model: spicepod::component::model::Model,
+    pub model: spicepod::component::model::Model,
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -57,6 +57,7 @@ impl Model {
         let mut params = std::collections::HashMap::new();
         params.insert("name".to_string(), model.name.to_string());
         params.insert("path".to_string(), path(&model.from));
+        params.insert("from".to_string(), path(&model.from));
 
         let tract = crate::modelruntime::tract::Tract {
             path: create_source_from(source)
