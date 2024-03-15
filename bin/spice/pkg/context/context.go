@@ -120,8 +120,7 @@ func (c *RuntimeContext) IsRuntimeUpgradeAvailable() (string, error) {
 		return "", err
 	}
 
-	if currentVersion == "local" {
-		fmt.Println("Using latest 'local' runtime version.")
+	if strings.HasPrefix(currentVersion, "local") || strings.Contains(currentVersion, "rc") {
 		return "", nil
 	}
 
