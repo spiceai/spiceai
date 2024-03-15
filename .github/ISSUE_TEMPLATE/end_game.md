@@ -35,8 +35,9 @@ assignees: ''
 - [ ] Merge [Quickstarts PRs](https://github.com/spiceai/samples/pulls)
 - [ ] Update release notes
 - [ ] Update acknowledgements
-- [ ] Update data-components-contrib repo with latest tag and reference it in spiceai. See [Components contrib version update](https://github.com/spiceai/spiceai/blob/trunk/docs/RELEASE.md#components-contrib-version-update)
-- [ ] Update version using documented process at [docs/RELEASE.md](https://github.com/spiceai/spiceai/blob/trunk/docs/RELEASE.md#version-update)
+- [ ] Verify `version.txt` and version in `Cargo.toml` is correct using [docs/RELEASE.md](https://github.com/spiceai/spiceai/blob/trunk/docs/RELEASE.md#version-update)
+- [ ] QA DRI sign-off
+- [ ] Docs DRI sign-off
 - [ ] Create a new branch `release-v[semver]` and merge all relevant changes into it.
 - [ ] Release the new version by creating a draft release with the tag from the release branch.
 - [ ] Release any docs updates by creating a `v[semver]` tag.
@@ -44,7 +45,7 @@ assignees: ''
 - [ ] Reddit announcement to [reddit.com/r/spiceai](https://reddit.com/r/spiceai)
 - [ ] Discord announcement to [#announcements](https://discord.gg/zv8ahzZVpf)
 - [ ] For major releases, [blog.spiceai.org](https://blog.spiceai.org) announcement
-- [ ] Update `version.txt` to the next release version.
+- [ ] Update `version.txt` and version in `Cargo.tom` to the next release version.
 
 ## PR reference
 
