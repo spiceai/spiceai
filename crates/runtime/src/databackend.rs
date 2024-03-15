@@ -160,7 +160,6 @@ impl DataBackendBuilder {
                     self.params,
                     self.primary_keys,
                 )
-                .await
                 .boxed()
                 .context(BackendCreationFailedSnafu)?,
             )),

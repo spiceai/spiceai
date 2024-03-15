@@ -22,8 +22,8 @@ arrow_sql_gen = { path = "../arrow_sql_gen" }
 arrow.workspace = true
 secrets = { path = "../secrets" }
 spicepod = { path = "../spicepod" }
-bb8-sqlite = "0.1.0"
-rusqlite = "0.28.0"
+rusqlite = "0.31.0"
+tokio-rusqlite = "0.5.1"
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }

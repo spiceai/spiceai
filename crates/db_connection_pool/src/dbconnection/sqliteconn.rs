@@ -2,19 +2,23 @@ use std::any::Any;
 
 use arrow::datatypes::SchemaRef;
 use arrow_sql_gen::sqlite::rows_to_arrow;
-use bb8_sqlite::RusqliteConnectionManager;
+use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::memory::MemoryStream;
 use datafusion::sql::TableReference;
 use rusqlite::ToSql;
 use snafu::prelude::*;
+use tokio_rusqlite::Connection;
 
+use super::AsyncDbConnection;
 use super::DbConnection;
 use super::Result;
-use super::SyncDbConnection;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
+    #[snafu(display("ConnectionError {source}"))]
+    ConnectionError { source: tokio_rusqlite::Error },
+
     #[snafu(display("Unable to query: {source}"))]
     QueryError { source: rusqlite::Error },
 
@@ -25,12 +29,10 @@ pub enum Error {
 }
 
 pub struct SqliteConnection {
-    pub conn: bb8::PooledConnection<'static, RusqliteConnectionManager>,
+    pub conn: Connection,
 }
 
-impl<'a> DbConnection<bb8::PooledConnection<'static, RusqliteConnectionManager>, &'a dyn ToSql>
-    for SqliteConnection
-{
+impl DbConnection<Connection, &'static (dyn ToSql + Sync)> for SqliteConnection {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -39,49 +41,93 @@ impl<'a> DbConnection<bb8::PooledConnection<'static, RusqliteConnectionManager>,
         self
     }
 
-    fn as_sync(
-        &self,
-    ) -> Option<
-        &dyn SyncDbConnection<
-            bb8::PooledConnection<'static, RusqliteConnectionManager>,
-            &'a dyn ToSql,
-        >,
-    > {
+    fn as_async(&self) -> Option<&dyn AsyncDbConnection<Connection, &'static (dyn ToSql + Sync)>> {
         Some(self)
     }
 }
 
-impl SyncDbConnection<bb8::PooledConnection<'static, RusqliteConnectionManager>, &dyn ToSql>
-    for SqliteConnection
-{
-    fn new(conn: bb8::PooledConnection<'static, RusqliteConnectionManager>) -> Self {
+#[async_trait]
+impl AsyncDbConnection<Connection, &'static (dyn ToSql + Sync)> for SqliteConnection {
+    fn new(conn: Connection) -> Self {
         SqliteConnection { conn }
     }
 
-    fn get_schema(&self, table_reference: &TableReference) -> Result<SchemaRef> {
-        let mut stmt = self
+    async fn get_schema(&self, table_reference: &TableReference) -> Result<SchemaRef> {
+        let table_reference = table_reference.to_string();
+        let schema = self
             .conn
-            .prepare(&format!("SELECT * FROM {table_reference} LIMIT 1"))
-            .context(QuerySnafu)?;
-        let column_count = stmt.column_count();
-        let rows = stmt.query([]).context(QuerySnafu)?;
-        let rec = rows_to_arrow(rows, column_count).context(ConversionSnafu)?;
-        let schema = rec.schema();
+            .call(move |conn| {
+                let mut stmt = conn.prepare(&format!("SELECT * FROM {table_reference} LIMIT 1"))?;
+                let column_count = stmt.column_count();
+                let rows = stmt.query([])?;
+                let rec = rows_to_arrow(rows, column_count)
+                    .context(ConversionSnafu)
+                    .map_err(to_tokio_rusqlite_error)?;
+                let schema = rec.schema();
+                Ok(schema)
+            })
+            .await
+            .context(ConnectionSnafu)?;
         Ok(schema)
     }
 
-    fn query_arrow(&self, sql: &str, params: &[&dyn ToSql]) -> Result<SendableRecordBatchStream> {
-        let mut stmt = self.conn.prepare(sql).context(QuerySnafu)?;
-        let column_count = stmt.column_count();
-        let rows = stmt.query(params).context(QuerySnafu)?;
-        let rec = rows_to_arrow(rows, column_count).context(ConversionSnafu)?;
+    async fn query_arrow(
+        &self,
+        sql: &str,
+        params: &[&'static (dyn ToSql + Sync)],
+    ) -> Result<SendableRecordBatchStream> {
+        let sql = sql.to_string();
+
+        let mut params_copy = Vec::new();
+        for param in params {
+            params_copy.push(*param);
+        }
+
+        let rec = self
+            .conn
+            .call(move |conn| {
+                let mut stmt = conn.prepare(sql.as_str())?;
+                for (i, param) in params_copy.iter().enumerate() {
+                    stmt.raw_bind_parameter(i + 1, param)?;
+                }
+                let column_count = stmt.column_count();
+                let rows = stmt.raw_query();
+                let rec = rows_to_arrow(rows, column_count)
+                    .context(ConversionSnafu)
+                    .map_err(to_tokio_rusqlite_error)?;
+                Ok(rec)
+            })
+            .await
+            .context(ConnectionSnafu)?;
+
         let schema = rec.schema();
         let recs = vec![rec];
         Ok(Box::pin(MemoryStream::try_new(recs, schema, None)?))
     }
 
-    fn execute(&self, sql: &str, params: &[&dyn ToSql]) -> Result<u64> {
-        let rows_modified = self.conn.execute(sql, params)?;
+    async fn execute(&self, sql: &str, params: &[&'static (dyn ToSql + Sync)]) -> Result<u64> {
+        let sql = sql.to_string();
+        let mut params_copy = Vec::new();
+        for param in params {
+            params_copy.push(*param);
+        }
+
+        let rows_modified = self
+            .conn
+            .call(move |conn| {
+                let mut stmt = conn.prepare(sql.as_str())?;
+                for (i, param) in params_copy.iter().enumerate() {
+                    stmt.raw_bind_parameter(i + 1, param)?;
+                }
+                let rows_modified = stmt.raw_execute()?;
+                Ok(rows_modified)
+            })
+            .await
+            .context(ConnectionSnafu)?;
         Ok(rows_modified as u64)
     }
+}
+
+fn to_tokio_rusqlite_error(e: impl Into<Error>) -> tokio_rusqlite::Error {
+    tokio_rusqlite::Error::Other(Box::new(e.into()))
 }

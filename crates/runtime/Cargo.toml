@@ -78,8 +78,8 @@ keyring = { version = "2.3.2", optional = true }
 tonic-health = "0.11.0"
 db_connection_pool = { path = "../db_connection_pool" }
 secrecy = "0.8.0"
-bb8-sqlite = "0.1.0"
-rusqlite = "0.28.0"
+rusqlite = "0.31.0"
+tokio-rusqlite = "0.5.1"
 
 [features]
 default = ["duckdb", "postgres", "keyring-secret-store"]

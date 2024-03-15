@@ -58,11 +58,11 @@ pub fn rows_to_arrow(mut rows: Rows, num_cols: usize) -> Result<RecordBatch> {
                 .column_name(i)
                 .context(FailedToExtractColumnNameSnafu)?
                 .to_string();
-            let data_type = map_column_type_to_data_type(&column_type);
+            let data_type = map_column_type_to_data_type(column_type);
 
             arrow_fields.push(Field::new(column_name, data_type.clone(), true));
             arrow_columns_builders.push(map_data_type_to_array_builder(&data_type));
-            sqlite_types.push(column_type.clone());
+            sqlite_types.push(column_type);
         }
     };
 
@@ -155,8 +155,8 @@ pub fn rows_to_arrow(mut rows: Rows, num_cols: usize) -> Result<RecordBatch> {
     }
 }
 
-fn map_column_type_to_data_type(column_type: &Type) -> DataType {
-    match *column_type {
+fn map_column_type_to_data_type(column_type: Type) -> DataType {
+    match column_type {
         Type::Null => DataType::Null,
         Type::Integer => DataType::Int64,
         Type::Real => DataType::Float64,

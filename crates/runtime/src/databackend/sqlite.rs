@@ -2,7 +2,6 @@ use std::{collections::HashMap, mem, sync::Arc};
 
 use arrow::record_batch::RecordBatch;
 use arrow_sql_gen::statement::{CreateTableBuilder, InsertBuilder};
-use bb8_sqlite::RusqliteConnectionManager;
 use datafusion::{execution::context::SessionContext, sql::TableReference};
 use db_connection_pool::{
     dbconnection::sqliteconn::SqliteConnection, sqlitepool::SqliteConnectionPool, DbConnectionPool,
@@ -11,7 +10,7 @@ use rusqlite::{ToSql, Transaction};
 use snafu::{prelude::*, ResultExt};
 use spicepod::component::dataset::Dataset;
 use sql_provider_datafusion::SqlTable;
-use tokio::sync::Mutex;
+use tokio_rusqlite::Connection;
 
 use crate::{
     datapublisher::{AddDataResult, DataPublisher},
@@ -28,8 +27,8 @@ pub enum Error {
     #[snafu(display("DbConnectionPoolError: {source}"))]
     DbConnectionPoolError { source: db_connection_pool::Error },
 
-    #[snafu(display("Error executing transaction: {source}"))]
-    TransactionError { source: rusqlite::Error },
+    #[snafu(display("Failed to update sqlite table: {source}"))]
+    UpdateError { source: tokio_rusqlite::Error },
 
     #[snafu(display("SqliteDataFusionError: {source}"))]
     SqliteDataFusion {
@@ -41,9 +40,6 @@ pub enum Error {
         source: datafusion::error::DataFusionError,
     },
 
-    #[snafu(display("Lock is poisoned: {message}"))]
-    LockPoisoned { message: String },
-
     #[snafu(display("Unable to downcast DbConnection to SqliteConnection"))]
     UnableToDowncastDbConnection {},
 }
@@ -54,14 +50,7 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 pub struct SqliteBackend {
     ctx: Arc<SessionContext>,
     name: String,
-    pool: Arc<
-        dyn DbConnectionPool<
-                bb8::PooledConnection<'static, RusqliteConnectionManager>,
-                &'static dyn ToSql,
-            > + Send
-            + Sync,
-    >,
-    create_mutex: Mutex<()>,
+    pool: Arc<dyn DbConnectionPool<Connection, &'static (dyn ToSql + Sync)> + Send + Sync>,
     _primary_keys: Option<Vec<String>>,
 }
 
@@ -70,12 +59,11 @@ impl DataPublisher for SqliteBackend {
         let pool = Arc::clone(&self.pool);
         let name = self.name.clone();
         Box::pin(async move {
-            let mut sqlite_update = SqliteUpdate {
+            let sqlite_update = SqliteUpdate {
                 name,
                 data: data_update.data,
                 update_type: data_update.update_type,
                 pool,
-                create_mutex: &self.create_mutex,
             };
 
             sqlite_update.update().await?;
@@ -92,20 +80,17 @@ impl DataPublisher for SqliteBackend {
 
 impl SqliteBackend {
     #[allow(clippy::needless_pass_by_value)]
-    pub async fn new(
+    pub fn new(
         ctx: Arc<SessionContext>,
         name: &str,
         params: Arc<Option<HashMap<String, String>>>,
         primary_keys: Option<Vec<String>>,
     ) -> Result<Self> {
-        let pool = SqliteConnectionPool::new(params)
-            .await
-            .context(DbConnectionPoolSnafu)?;
+        let pool = SqliteConnectionPool::new(params).context(DbConnectionPoolSnafu)?;
         Ok(SqliteBackend {
             ctx,
             name: name.to_string(),
             pool: Arc::new(pool),
-            create_mutex: Mutex::new(()),
             _primary_keys: primary_keys,
         })
     }
@@ -135,22 +120,15 @@ impl SqliteBackend {
     }
 }
 
-struct SqliteUpdate<'a> {
+struct SqliteUpdate {
     name: String,
     data: Vec<RecordBatch>,
     update_type: UpdateType,
-    pool: Arc<
-        dyn DbConnectionPool<
-                bb8::PooledConnection<'static, RusqliteConnectionManager>,
-                &'static dyn ToSql,
-            > + Send
-            + Sync,
-    >,
-    create_mutex: &'a Mutex<()>,
+    pool: Arc<dyn DbConnectionPool<Connection, &'static (dyn ToSql + Sync)> + Send + Sync>,
 }
 
-impl<'a> SqliteUpdate<'a> {
-    async fn update(&mut self) -> Result<()> {
+impl SqliteUpdate {
+    async fn update(mut self) -> Result<()> {
         let mut transaction_conn = self.pool.connect().await.context(DbConnectionPoolSnafu)?;
         let Some(transaction_conn) = transaction_conn
             .as_any_mut()
@@ -159,48 +137,53 @@ impl<'a> SqliteUpdate<'a> {
             return UnableToDowncastDbConnectionSnafu {}.fail();
         };
 
-        let transaction = transaction_conn
-            .conn
-            .transaction()
-            .context(TransactionSnafu)?;
-
         let conn = self.pool.connect().await.context(DbConnectionPoolSnafu)?;
         let Some(conn) = conn.as_any().downcast_ref::<SqliteConnection>() else {
             return UnableToDowncastDbConnectionSnafu {}.fail();
         };
 
-        if !self.table_exists(conn) {
-            self.create_table(&transaction)?;
-        } else if self.update_type == UpdateType::Overwrite {
-            transaction
-                .execute(format!(r#"DELETE FROM "{}""#, self.name).as_str(), [])
-                .context(TransactionSnafu)?;
-        };
+        let table_exists = self.table_exists(conn).await;
 
-        let data = mem::take(&mut self.data);
-        for batch in data {
-            self.insert_batch(&transaction, batch)?;
-        }
+        transaction_conn
+            .conn
+            .call(move |conn| {
+                let transaction = conn.transaction()?;
 
-        transaction.commit().context(TransactionSnafu)?;
+                if !table_exists {
+                    self.create_table(&transaction)?;
+                } else if self.update_type == UpdateType::Overwrite {
+                    transaction.execute(format!(r#"DELETE FROM "{}""#, self.name).as_str(), [])?;
+                };
 
-        tracing::trace!("Processed update to Sqlite table {name}", name = self.name,);
+                let data = mem::take(&mut self.data);
+                for batch in data {
+                    self.insert_batch(&transaction, batch)?;
+                }
 
-        Ok(())
+                transaction.commit()?;
+
+                tracing::trace!("Processed update to Sqlite table {name}", name = self.name,);
+
+                Ok(())
+            })
+            .await
+            .context(UpdateSnafu)
     }
 
-    fn insert_batch(&mut self, transaction: &Transaction<'_>, batch: RecordBatch) -> Result<()> {
+    fn insert_batch(
+        &mut self,
+        transaction: &Transaction<'_>,
+        batch: RecordBatch,
+    ) -> tokio_rusqlite::Result<()> {
         let insert_table_builder = InsertBuilder::new(&self.name, vec![batch]);
         let sql = insert_table_builder.build();
 
-        transaction.execute(&sql, []).context(TransactionSnafu)?;
+        transaction.execute(&sql, [])?;
 
         Ok(())
     }
 
-    fn create_table(&mut self, transaction: &Transaction<'_>) -> Result<()> {
-        let _lock = self.create_mutex.lock();
-
+    fn create_table(&mut self, transaction: &Transaction<'_>) -> tokio_rusqlite::Result<()> {
         let Some(batch) = self.data.pop() else {
             return Ok(());
         };
@@ -208,14 +191,14 @@ impl<'a> SqliteUpdate<'a> {
         let create_table_statement = CreateTableBuilder::new(batch.schema(), &self.name);
         let sql = create_table_statement.build();
 
-        transaction.execute(&sql, []).context(TransactionSnafu)?;
+        transaction.execute(&sql, [])?;
 
         self.insert_batch(transaction, batch)?;
 
         Ok(())
     }
 
-    fn table_exists(&mut self, sqlite_conn: &SqliteConnection) -> bool {
+    async fn table_exists(&mut self, sqlite_conn: &SqliteConnection) -> bool {
         let sql = format!(
             r#"SELECT EXISTS (
               SELECT 1
@@ -226,10 +209,14 @@ impl<'a> SqliteUpdate<'a> {
         );
         tracing::trace!("{sql}");
 
-        let Ok(exists) = sqlite_conn.conn.query_row(&sql, [], |row| row.get(0)) else {
-            return false;
-        };
-
-        exists
+        sqlite_conn
+            .conn
+            .call(move |conn| {
+                let mut stmt = conn.prepare(&sql)?;
+                let exists = stmt.query_row([], |row| row.get(0))?;
+                Ok(exists)
+            })
+            .await
+            .unwrap_or(false)
     }
 }
