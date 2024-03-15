@@ -62,7 +62,7 @@ jobs:
         with:
           os: 'linux'
 
-      - run: apt update && apt install --yes libsqlite3-dev
+      - run: sudo apt update && sudo apt install --yes libsqlite3-dev
       - run: make ci
 
   build-docker:
