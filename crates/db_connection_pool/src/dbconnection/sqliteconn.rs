@@ -77,17 +77,13 @@ impl AsyncDbConnection<Connection, &'static (dyn ToSql + Sync)> for SqliteConnec
         params: &[&'static (dyn ToSql + Sync)],
     ) -> Result<SendableRecordBatchStream> {
         let sql = sql.to_string();
-
-        let mut params_copy = Vec::new();
-        for param in params {
-            params_copy.push(*param);
-        }
+        let params = params.to_vec();
 
         let rec = self
             .conn
             .call(move |conn| {
                 let mut stmt = conn.prepare(sql.as_str())?;
-                for (i, param) in params_copy.iter().enumerate() {
+                for (i, param) in params.iter().enumerate() {
                     stmt.raw_bind_parameter(i + 1, param)?;
                 }
                 let column_count = stmt.column_count();
@@ -107,16 +103,13 @@ impl AsyncDbConnection<Connection, &'static (dyn ToSql + Sync)> for SqliteConnec
 
     async fn execute(&self, sql: &str, params: &[&'static (dyn ToSql + Sync)]) -> Result<u64> {
         let sql = sql.to_string();
-        let mut params_copy = Vec::new();
-        for param in params {
-            params_copy.push(*param);
-        }
+        let params = params.to_vec();
 
         let rows_modified = self
             .conn
             .call(move |conn| {
                 let mut stmt = conn.prepare(sql.as_str())?;
-                for (i, param) in params_copy.iter().enumerate() {
+                for (i, param) in params.iter().enumerate() {
                     stmt.raw_bind_parameter(i + 1, param)?;
                 }
                 let rows_modified = stmt.raw_execute()?;

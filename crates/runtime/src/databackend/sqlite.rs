@@ -5,6 +5,7 @@ use arrow_sql_gen::statement::{CreateTableBuilder, InsertBuilder};
 use datafusion::{execution::context::SessionContext, sql::TableReference};
 use db_connection_pool::{
     dbconnection::sqliteconn::SqliteConnection, sqlitepool::SqliteConnectionPool, DbConnectionPool,
+    Mode,
 };
 use rusqlite::{ToSql, Transaction};
 use snafu::{prelude::*, ResultExt};
@@ -84,9 +85,10 @@ impl SqliteBackend {
         ctx: Arc<SessionContext>,
         name: &str,
         params: Arc<Option<HashMap<String, String>>>,
+        mode: Mode,
         primary_keys: Option<Vec<String>>,
     ) -> Result<Self> {
-        let pool = SqliteConnectionPool::new(params).context(DbConnectionPoolSnafu)?;
+        let pool = SqliteConnectionPool::new(params, mode).context(DbConnectionPoolSnafu)?;
         Ok(SqliteBackend {
             ctx,
             name: name.to_string(),
@@ -202,8 +204,9 @@ impl SqliteUpdate {
         let sql = format!(
             r#"SELECT EXISTS (
               SELECT 1
-              FROM information_schema.tables 
-              WHERE table_name = '{name}'
+              FROM sqlite_master 
+              WHERE type='table' 
+              AND name = '{name}'
             )"#,
             name = self.name
         );

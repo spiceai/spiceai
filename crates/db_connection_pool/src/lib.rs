@@ -15,6 +15,7 @@ pub trait DbConnectionPool<T, P: 'static> {
     async fn connect(&self) -> Result<Box<dyn DbConnection<T, P>>>;
 }
 
+#[derive(PartialEq)]
 pub enum Mode {
     Memory,
     File,

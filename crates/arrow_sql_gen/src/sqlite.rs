@@ -9,6 +9,7 @@ use arrow::datatypes::DataType;
 use arrow::datatypes::Field;
 use arrow::datatypes::Schema;
 use rusqlite::types::Type;
+use rusqlite::Row;
 use rusqlite::Rows;
 use snafu::prelude::*;
 
@@ -38,7 +39,6 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// # Errors
 ///
 /// Returns an error if there is a failure in converting the rows to a `RecordBatch`.
-#[allow(clippy::too_many_lines)]
 pub fn rows_to_arrow(mut rows: Rows, num_cols: usize) -> Result<RecordBatch> {
     let mut arrow_fields: Vec<Field> = Vec::new();
     let mut arrow_columns_builders: Vec<Box<dyn ArrayBuilder>> = Vec::new();
@@ -46,8 +46,6 @@ pub fn rows_to_arrow(mut rows: Rows, num_cols: usize) -> Result<RecordBatch> {
     let mut row_count = 0;
 
     if let Ok(Some(row)) = rows.next() {
-        row_count += 1;
-
         for i in 0..num_cols {
             let column_type = row
                 .get_ref(i)
@@ -64,82 +62,13 @@ pub fn rows_to_arrow(mut rows: Rows, num_cols: usize) -> Result<RecordBatch> {
             arrow_columns_builders.push(map_data_type_to_array_builder(&data_type));
             sqlite_types.push(column_type);
         }
+
+        add_row_to_builders(row, &sqlite_types, &mut arrow_columns_builders)?;
+        row_count += 1;
     };
 
     while let Ok(Some(row)) = rows.next() {
-        for (i, sqlite_type) in sqlite_types.iter().enumerate() {
-            let Some(builder) = arrow_columns_builders.get_mut(i) else {
-                return NoBuilderForIndexSnafu { index: i }.fail();
-            };
-
-            match *sqlite_type {
-                Type::Null => {
-                    let Some(builder) = builder
-                        .as_any_mut()
-                        .downcast_mut::<arrow::array::NullBuilder>()
-                    else {
-                        return FailedToDowncastBuilderSnafu {
-                            sqlite_type: format!("{sqlite_type}"),
-                        }
-                        .fail();
-                    };
-                    builder.append_null();
-                }
-                Type::Integer => {
-                    let Some(builder) = builder
-                        .as_any_mut()
-                        .downcast_mut::<arrow::array::Int64Builder>()
-                    else {
-                        return FailedToDowncastBuilderSnafu {
-                            sqlite_type: format!("{sqlite_type}"),
-                        }
-                        .fail();
-                    };
-                    let v: i64 = row.get(i).context(FailedToExtractRowValueSnafu)?;
-                    builder.append_value(v);
-                }
-                Type::Real => {
-                    let Some(builder) = builder
-                        .as_any_mut()
-                        .downcast_mut::<arrow::array::Float64Builder>()
-                    else {
-                        return FailedToDowncastBuilderSnafu {
-                            sqlite_type: format!("{sqlite_type}"),
-                        }
-                        .fail();
-                    };
-                    let v: f64 = row.get(i).context(FailedToExtractRowValueSnafu)?;
-                    builder.append_value(v);
-                }
-                Type::Text => {
-                    let Some(builder) = builder
-                        .as_any_mut()
-                        .downcast_mut::<arrow::array::StringBuilder>()
-                    else {
-                        return FailedToDowncastBuilderSnafu {
-                            sqlite_type: format!("{sqlite_type}"),
-                        }
-                        .fail();
-                    };
-                    let v: String = row.get(i).context(FailedToExtractRowValueSnafu)?;
-                    builder.append_value(v);
-                }
-                Type::Blob => {
-                    let Some(builder) = builder
-                        .as_any_mut()
-                        .downcast_mut::<arrow::array::BinaryBuilder>()
-                    else {
-                        return FailedToDowncastBuilderSnafu {
-                            sqlite_type: format!("{sqlite_type}"),
-                        }
-                        .fail();
-                    };
-                    let v: Vec<u8> = row.get(i).context(FailedToExtractRowValueSnafu)?;
-                    builder.append_value(v);
-                }
-            }
-        }
-
+        add_row_to_builders(row, &sqlite_types, &mut arrow_columns_builders)?;
         row_count += 1;
     }
 
@@ -153,6 +82,86 @@ pub fn rows_to_arrow(mut rows: Rows, num_cols: usize) -> Result<RecordBatch> {
         Ok(record_batch) => Ok(record_batch),
         Err(e) => Err(e).context(FailedToBuildRecordBatchSnafu),
     }
+}
+
+fn add_row_to_builders(
+    row: &Row,
+    sqlite_types: &[Type],
+    arrow_columns_builders: &mut [Box<dyn ArrayBuilder>],
+) -> Result<()> {
+    for (i, sqlite_type) in sqlite_types.iter().enumerate() {
+        let Some(builder) = arrow_columns_builders.get_mut(i) else {
+            return NoBuilderForIndexSnafu { index: i }.fail();
+        };
+
+        match *sqlite_type {
+            Type::Null => {
+                let Some(builder) = builder
+                    .as_any_mut()
+                    .downcast_mut::<arrow::array::NullBuilder>()
+                else {
+                    return FailedToDowncastBuilderSnafu {
+                        sqlite_type: format!("{sqlite_type}"),
+                    }
+                    .fail();
+                };
+                builder.append_null();
+            }
+            Type::Integer => {
+                let Some(builder) = builder
+                    .as_any_mut()
+                    .downcast_mut::<arrow::array::Int64Builder>()
+                else {
+                    return FailedToDowncastBuilderSnafu {
+                        sqlite_type: format!("{sqlite_type}"),
+                    }
+                    .fail();
+                };
+                let v: i64 = row.get(i).context(FailedToExtractRowValueSnafu)?;
+                builder.append_value(v);
+            }
+            Type::Real => {
+                let Some(builder) = builder
+                    .as_any_mut()
+                    .downcast_mut::<arrow::array::Float64Builder>()
+                else {
+                    return FailedToDowncastBuilderSnafu {
+                        sqlite_type: format!("{sqlite_type}"),
+                    }
+                    .fail();
+                };
+                let v: f64 = row.get(i).context(FailedToExtractRowValueSnafu)?;
+                builder.append_value(v);
+            }
+            Type::Text => {
+                let Some(builder) = builder
+                    .as_any_mut()
+                    .downcast_mut::<arrow::array::StringBuilder>()
+                else {
+                    return FailedToDowncastBuilderSnafu {
+                        sqlite_type: format!("{sqlite_type}"),
+                    }
+                    .fail();
+                };
+                let v: String = row.get(i).context(FailedToExtractRowValueSnafu)?;
+                builder.append_value(v);
+            }
+            Type::Blob => {
+                let Some(builder) = builder
+                    .as_any_mut()
+                    .downcast_mut::<arrow::array::BinaryBuilder>()
+                else {
+                    return FailedToDowncastBuilderSnafu {
+                        sqlite_type: format!("{sqlite_type}"),
+                    }
+                    .fail();
+                };
+                let v: Vec<u8> = row.get(i).context(FailedToExtractRowValueSnafu)?;
+                builder.append_value(v);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn map_column_type_to_data_type(column_type: Type) -> DataType {

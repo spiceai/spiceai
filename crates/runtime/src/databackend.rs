@@ -158,6 +158,7 @@ impl DataBackendBuilder {
                     Arc::clone(&self.ctx),
                     self.name.as_str(),
                     self.params,
+                    mode.into(),
                     self.primary_keys,
                 )
                 .boxed()
