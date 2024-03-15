@@ -255,7 +255,7 @@ pub mod acceleration {
     }
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
     pub struct Acceleration {
-        #[serde(default)]
+        #[serde(default = "default_true")]
         pub enabled: bool,
 
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -278,6 +278,10 @@ pub mod acceleration {
 
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub engine_secret: Option<String>,
+    }
+
+    const fn default_true() -> bool {
+        true
     }
 
     impl Acceleration {
