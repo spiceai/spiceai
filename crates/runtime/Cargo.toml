@@ -75,7 +75,6 @@ once_cell = "1.19.0"
 secrets = { path = "../secrets" }
 base64 = "0.22.0"
 keyring = { version = "2.3.2", optional = true }
-secrecy = "0.8.0"
 tonic-health = "0.11.0"
 db_connection_pool = { path = "../db_connection_pool" }
 secrecy = "0.8.0"
