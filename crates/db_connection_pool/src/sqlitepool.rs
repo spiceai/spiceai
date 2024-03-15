@@ -20,7 +20,7 @@ pub enum Error {
 }
 
 pub struct SqliteConnectionPool {
-    path: String,
+    file_name: String,
     mode: Mode,
 }
 
@@ -34,15 +34,19 @@ impl SqliteConnectionPool {
     ///
     /// Returns an error if there is a problem creating the connection pool.
     #[allow(clippy::needless_pass_by_value)]
-    pub fn new(params: Arc<Option<HashMap<String, String>>>, mode: Mode) -> Result<Self> {
-        let mut path = String::default();
-        if let Some(params) = params.as_ref() {
-            if let Some(path_val) = params.get("path") {
-                path = path_val.to_string();
-            };
-        };
+    pub fn new(
+        name: &str,
+        mode: Mode,
+        params: Arc<Option<HashMap<String, String>>>,
+    ) -> Result<Self> {
+        let file_name = params
+            .as_ref()
+            .as_ref()
+            .and_then(|params| params.get("sqlite_file").cloned())
+            .unwrap_or(name.to_string());
+        let file_name = format!("{file_name}_sqlite.db");
 
-        Ok(SqliteConnectionPool { path, mode })
+        Ok(SqliteConnectionPool { file_name, mode })
     }
 }
 
@@ -55,7 +59,7 @@ impl DbConnectionPool<Connection, &'static (dyn ToSql + Sync)> for SqliteConnect
             Mode::Memory => Connection::open_in_memory()
                 .await
                 .context(ConnectionPoolSnafu)?,
-            Mode::File => Connection::open(self.path.clone())
+            Mode::File => Connection::open(self.file_name.clone())
                 .await
                 .context(ConnectionPoolSnafu)?,
         };

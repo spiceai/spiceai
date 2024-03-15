@@ -88,7 +88,7 @@ impl SqliteBackend {
         mode: Mode,
         primary_keys: Option<Vec<String>>,
     ) -> Result<Self> {
-        let pool = SqliteConnectionPool::new(params, mode).context(DbConnectionPoolSnafu)?;
+        let pool = SqliteConnectionPool::new(name, mode, params).context(DbConnectionPoolSnafu)?;
         Ok(SqliteBackend {
             ctx,
             name: name.to_string(),
