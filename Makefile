@@ -121,7 +121,7 @@ generate-acknowledgements-rust:
 	} \
 	{ \
 		printf("| %s | %s | %s | %s | %s | %s | %s |\n", $$1, $$2, $$3, $$4, $$5, $$6, $$7); \
-	}' >> "$(ACKNOWLEDGEMENTS_PATH)"
+	}' | grep -v "github.com/spiceai" >> "$(ACKNOWLEDGEMENTS_PATH)"
 
 
 .PHONY: generate-acknowledgements-formatting
