@@ -53,7 +53,10 @@ impl DataConnector for FlightSQL {
     where
         Self: Sized,
     {
-        tracing::error!("Creating FlightSQL data connector with params: {:?}", params);
+        tracing::error!(
+            "Creating FlightSQL data connector with params: {:?}",
+            params
+        );
         Box::pin(async move {
             let endpoint: String = params
                 .as_ref() // &Option<HashMap<String, String>>
@@ -62,7 +65,10 @@ impl DataConnector for FlightSQL {
                 .ok_or_else(|| super::Error::UnableToCreateDataConnector {
                     source: "Missing required parameter: endpoint".into(),
                 })?;
-            tracing::error!("Creating FlightSQL data connector with endpoint: {:?}", endpoint);
+            tracing::error!(
+                "Creating FlightSQL data connector with endpoint: {:?}",
+                endpoint
+            );
             let flight_channel = new_tls_flight_channel(&endpoint)
                 .await
                 .map_err(|e| super::Error::UnableToCreateDataConnector { source: e.into() })?;
@@ -115,8 +121,8 @@ impl DataConnector for FlightSQL {
                 tracing::error!("Failed to get table provider for FlightSQL: {:?}", error);
                 Err(super::Error::UnableToGetTableProvider {
                     source: error.into(),
-                }
-            )},
+                })
+            }
         }
     }
 }

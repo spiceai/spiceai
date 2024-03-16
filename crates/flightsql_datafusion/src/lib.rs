@@ -84,157 +84,117 @@ impl FlightSQLTable {
         Self::new(FlightSqlServiceClient::new(channel), table_reference.into()).await
     }
 
+    fn get_str_from_record_batch(b: &RecordBatch, row: usize, col_name: &str) -> Option<String> {
+        if let Some(col_array) = b.column_by_name(col_name) {
+            if let Some(y) = col_array.as_any().downcast_ref::<array::StringArray>() {
+                return Some(y.value(row).to_string());
+            }
+        }
+        None
+    }
+
     #[must_use]
     pub fn get_table_schema_if_present(
-        vec_b: Vec<RecordBatch>,
-        table_name: String,
+        batches: Vec<RecordBatch>,
+        table_reference: OwnedTableReference,
     ) -> Option<SchemaRef> {
-        tracing::error!("vecb: {:?}", vec_b.len());
-        let schema_bytz_opt = vec_b.iter().find_map(|b| {
-            tracing::error!("b: {:?}, {:?}, {:?}", b.clone().num_rows(), b.clone().schema(), b);
-            let table_schema = match b.column_by_name("table_schema") {
-                Some(ts_array) => match ts_array
-                    .as_any()
-                    .downcast_ref::<array::BinaryArray>()
-                {
-                    Some(ts) => ts,
-                    None => {
-                        // HERE::
-                        tracing::error!("table_schema is not a BinaryArray");
-                        return None
-                    },
-                },
-                None => {
-                    tracing::error!("no column table_schema");
-                    return None;
-                }, // If no table_schema, then early exit.
-            };
+        let schema_bytz_opt = batches.iter().find_map(|b| {
+            let table_schema = b
+                .column_by_name("table_schema")
+                .and_then(|ts_array| ts_array.as_any().downcast_ref::<array::BinaryArray>())
+                .or(None)?;
 
-            if let Some(table_names) = b.column_by_name("table_name") {
-                if let Some(table_name_bytz) = table_names
-                    .as_any()
-                    .downcast_ref::<array::StringArray>()
-                {
-                    for i in 0..table_name_bytz.len() {
-                        tracing::error!("table_name ii: {:?}", i);
-                        let table_str = table_name_bytz.value(i);
-                        tracing::error!("table_str: {:?}", table_str);
-                        if table_str == table_name {
-                            return Some(table_schema.value(i));
-                        }
+            for i in 0..b.num_rows() {
+                let table_name =
+                    Self::get_str_from_record_batch(b, i, "table_name").unwrap_or_default();
+                let catalog_name =
+                    Self::get_str_from_record_batch(b, i, "catalog_name").unwrap_or_default();
+                let db_schema_name =
+                    Self::get_str_from_record_batch(b, i, "db_schema_name").unwrap_or_default();
 
-                        // if let Ok(table_str) = std::str::from_utf8(table_name_bytz.value(i))
-                        //     .map_err(|_| FlightSQLError::NoSchema {})
-                        // {
-                        //     if table_str == table_name {
-                        //         return Some(table_schema.value(i));
-                        //     }
-                        //     return None; // No schema with table_name, return nothing.
-                        // } else {
-                        //     tracing::error!("cannot convert std::str::from_utf8");
-                        // }
-                    }
-                } else {
-                    tracing::error!("table_name is not a LargeBinaryArray");
+                // We got at least one None above, so we can't compare.
+                if table_name.is_empty() || catalog_name.is_empty() || db_schema_name.is_empty() {
+                    continue;
                 }
-            } else {
-                tracing::error!("no column table_name");
-            };
+
+                // Match even if catalog_name or db_schema_name from table_reference was None.
+                if table_reference.table() == table_name
+                    && table_reference.catalog().unwrap_or_default() == catalog_name
+                    && table_reference.schema().unwrap_or_default() == db_schema_name
+                {
+                    return Some(table_schema.value(i));
+                }
+            }
             None
         });
 
-        tracing::error!("schema_bytz_opt: {:?}", schema_bytz_opt);
-        if let Some(schema_bytz) = schema_bytz_opt {
-            let y = IpcMessage(tonic::codegen::Bytes::copy_from_slice(schema_bytz));
-            match Schema::try_from(y).map_err(|_| FlightSQLError::NoSchema {}) {
-                Ok(schema) => return Some(Arc::new(schema)),
-                Err(_) => return {
-                    tracing::error!("Unable to convert schema_bytz to Schema");
-                    None
-                },
+        match schema_bytz_opt {
+            Some(schema_bytz) => {
+                match Schema::try_from(IpcMessage(tonic::codegen::Bytes::copy_from_slice(
+                    schema_bytz,
+                )))
+                .map_err(|_| FlightSQLError::NoSchema {})
+                {
+                    Ok(schema) => Some(Arc::new(schema)),
+                    Err(e) => {
+                        tracing::error!("Error converting schema from 'table_schema' column: {e}");
+                        None
+                    }
+                }
             }
+            None => None,
         }
-
-        tracing::error!("the end");
-        None
     }
 
     pub async fn get_schema(
         mut client: FlightSqlServiceClient<Channel>,
         table_reference: OwnedTableReference,
     ) -> Result<SchemaRef> {
-        tracing::error!("getting a schema for table: {}", table_reference.to_string());
-        let table_name = table_reference.table();
-
-        let cmd = CommandGetTables {
-            catalog: table_reference
-                .catalog()
-                .map(std::string::ToString::to_string),
-            db_schema_filter_pattern: table_reference
-                .schema()
-                .map(std::string::ToString::to_string),
-            table_name_filter_pattern: Some(table_name.to_string()),
-            include_schema: true,
-            table_types: vec![
-                "TABLE".to_string(),
-                "VIEW".to_string(),
-                "SYSTEM TABLE".to_string(),
-            ],
-        };
-        tracing::error!("cmd: {:?}", cmd);
         let flight_info = client
             .get_tables(CommandGetTables {
-                catalog: None,
-                    // table_reference
-                    // .catalog()
-                    // .map(std::string::ToString::to_string),
-                db_schema_filter_pattern: None,
-                // table_reference
-                //     .schema()
-                //     .map(std::string::ToString::to_string),
-                table_name_filter_pattern: None, // Some(table_name.to_string()),
+                catalog: table_reference
+                    .catalog()
+                    .map(std::string::ToString::to_string),
+                db_schema_filter_pattern: table_reference
+                    .schema()
+                    .map(std::string::ToString::to_string),
+                table_name_filter_pattern: Some(table_reference.table().to_string()),
                 include_schema: true,
-                table_types: vec![
-                    "TABLE".to_string(),
-                    "BASE TABLE".to_string(),
-                    "VIEW".to_string(),
-                    "LOCAL TEMPORARY".to_string(),
-                    "SYSTEM TABLE".to_string(),
-                ],
+                table_types: [
+                    "TABLE",
+                    "BASE TABLE",
+                    "VIEW",
+                    "LOCAL TEMPORARY",
+                    "SYSTEM TABLE",
+                ]
+                .iter()
+                .map(|&s| s.into())
+                .collect(),
             })
             .await
-            .map_err(|e| {
-                tracing::error!("error getting tables flight info: {:?}", e);
-                FlightSQLError::ArrowFlight {
-                    source: arrow_flight::error::FlightError::Arrow(e),
-                }
+            .map_err(|e| FlightSQLError::ArrowFlight {
+                source: arrow_flight::error::FlightError::Arrow(e),
             })?;
 
-        for ep in &flight_info.endpoint {
-            if let Some(tkt) = &ep.ticket {
-                // Schema: https://github.com/apache/arrow/blob/44edc27e549d82db930421b0d4c76098941afd71/format/FlightSql.proto#L1182-L1190
-                let res = client
-                    .do_get(tkt.to_owned())
-                    .await
-                    .map_err(|e| {
-                        tracing::error!("error getting tables flight data for ticket {}: {:?}", tkt, e);
-                        FlightSQLError::ArrowFlight {
-                            source: arrow_flight::error::FlightError::Arrow(e),
-                        }
-                    })?
-                    .try_collect::<Vec<_>>()
-                    .await
-                    .map_err(|e| {
-                        tracing::error!("error collecting tables flight data for ticket {}: {:?}", tkt, e);
-                        FlightSQLError::ArrowFlight { source: e }
-                    })?;
-                if let Some(schema) = Self::get_table_schema_if_present(res, table_name.to_string())
-                {
-                    return Ok(schema);
-                } else {
-                    tracing::error!("no schema found for table: {}", table_name);
-                };
-            }
+        for tkt in flight_info
+            .endpoint
+            .iter()
+            .filter_map(|ep| ep.ticket.as_ref())
+        {
+            let stream = client
+                .do_get(tkt.clone())
+                .await
+                .map_err(|e| FlightSQLError::ArrowFlight { source: e.into() })?;
+            let batch = stream
+                .try_collect::<Vec<_>>()
+                .await
+                .map_err(|e| FlightSQLError::ArrowFlight { source: e })?;
+
+            // Schema: https://github.com/apache/arrow/blob/44edc27e549d82db930421b0d4c76098941afd71/format/FlightSql.proto#L1182-L1190
+            if let Some(schema) = Self::get_table_schema_if_present(batch, table_reference.clone())
+            {
+                return Ok(schema);
+            };
         }
         Err(FlightSQLError::NoSchema {})
     }
