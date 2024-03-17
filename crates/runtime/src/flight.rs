@@ -13,7 +13,7 @@ use futures::{Stream, TryStreamExt};
 use snafu::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::broadcast::Sender;
+use tokio::sync::broadcast::{error, Sender};
 use tokio::sync::RwLock;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
@@ -124,12 +124,19 @@ impl Service {
             .ctx
             .sql(&sql)
             .await
-            .map_err(to_tonic_err)?;
+            .map_err(|e| {
+                tracing::error!("Error datafusion_read: {e:?}");
+                to_tonic_err(e)
+            })?;
 
         let schema = df.schema();
         let arrow_schema: Schema = schema.into();
-
-        let size = df.count().await.map_err(to_tonic_err)?;
+        tracing::error!("Schema: {arrow_schema:?}");
+        tracing::error!("df: {df:?}");
+        let size = df.count().await.map_err(|e| {
+            tracing::error!("Error df_count: {e:?}");
+            to_tonic_err(e)
+        })?;
 
         Ok((arrow_schema, size))
     }

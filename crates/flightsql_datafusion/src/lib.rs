@@ -206,6 +206,7 @@ impl FlightSQLTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        tracing::error!("creating a physical plan for FlightSQLTable");
         Ok(Arc::new(FlightSqlExec::new(
             projections,
             schema,
@@ -253,6 +254,7 @@ impl TableProvider for FlightSQLTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        tracing::error!("scanning FlightSQLTable");
         return self.create_physical_plan(projection, &self.schema(), filters, limit);
     }
 }
@@ -275,6 +277,7 @@ impl FlightSqlExec {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Self> {
+        tracing::error!("creating a new FlightSqlExec");
         let projected_schema = project_schema(schema, projections)?;
         Ok(Self {
             projected_schema,
@@ -311,6 +314,10 @@ impl FlightSqlExec {
             format!("WHERE {}", filter_expr.join(" AND "))
         };
 
+        tracing::error!(
+            "SELECT {columns} FROM {table_reference} {where_expr} {limit_expr}",
+            table_reference = self.table_reference,
+        );
         Ok(format!(
             "SELECT {columns} FROM {table_reference} {where_expr} {limit_expr}",
             table_reference = self.table_reference,
@@ -385,6 +392,7 @@ fn to_stream(
 ) -> impl Stream<Item = Result<RecordBatch>> {
     let client = client.clone();
     let sql = sql.to_string();
+    tracing::error!("to_stream with client and sql {sql}");
     stream! {
     match query(client, sql).await {
         Ok(stream_opt) => {
@@ -450,6 +458,7 @@ async fn query(
     mut client: FlightSqlServiceClient<Channel>,
     query: String,
 ) -> Result<Option<FlightRecordBatchStream>, FlightSQLError> {
+    tracing::error!("query with client and query {query}");
     match client.clone().execute(query, None).await {
         Ok(flight_info) => match flight_info.endpoint.first() {
             Some(ep) => {
@@ -463,11 +472,18 @@ async fn query(
                         Err(err) => Err(err),
                     }
                 } else {
+                    tracing::error!("No ticket in endpoint: {ep}");
                     Ok(None)
                 }
             }
-            None => Ok(None),
+            None => {
+                tracing::error!("No endpoint in flight_info: {flight_info}");
+                Ok(None)
+            },
         },
-        Err(e) => Err(FlightSQLError::ArrowFlight { source: e.into() }),
+        Err(e) => {
+            tracing::error!("Failed to read batch from flight client: {e}");
+            Err(FlightSQLError::ArrowFlight { source: e.into() })
+        },
     }
 }
