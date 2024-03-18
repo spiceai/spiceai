@@ -4,7 +4,10 @@ use arrow_flight::{
 use datafusion::datasource::TableType;
 use tonic::{Request, Response, Status};
 
-use crate::flight::{record_batches_to_flight_stream, to_tonic_err, Service};
+use crate::{
+    flight::{record_batches_to_flight_stream, to_tonic_err, Service},
+    timing::{TimeMeasurement, TimedStream},
+};
 
 pub(crate) fn get_flight_info(
     query: &sql::CommandGetTables,
@@ -26,6 +29,7 @@ pub(crate) async fn do_get(
     flight_svc: &Service,
     query: sql::CommandGetTables,
 ) -> Result<Response<<Service as FlightService>::DoGetStream>, Status> {
+    let start = TimeMeasurement::new("flight_do_get_get_tables_duration_ms", vec![]);
     let catalog = &query.catalog;
     tracing::trace!("do_get_tables: {query:?}");
     let filtered_catalogs = match catalog {
@@ -70,10 +74,11 @@ pub(crate) async fn do_get(
 
     let record_batch = builder.build().map_err(to_tonic_err)?;
 
-    Ok(Response::new(
-        Box::pin(record_batches_to_flight_stream(vec![record_batch]))
-            as <Service as FlightService>::DoGetStream,
+    Ok(Response::new(Box::pin(TimedStream::new(
+        record_batches_to_flight_stream(vec![record_batch]),
+        move || start,
     ))
+        as <Service as FlightService>::DoGetStream))
 }
 
 fn table_type_name(table_type: TableType) -> &'static str {

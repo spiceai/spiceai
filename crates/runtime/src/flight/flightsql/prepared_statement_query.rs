@@ -8,7 +8,10 @@ use arrow_flight::{
 use prost::Message;
 use tonic::{Request, Response, Status};
 
-use crate::flight::{to_tonic_err, Service};
+use crate::{
+    flight::{to_tonic_err, Service},
+    timing::{TimeMeasurement, TimedStream},
+};
 
 /// Create a prepared statement from given SQL statement.
 pub(crate) async fn do_action_create_prepared_statement(
@@ -81,9 +84,12 @@ pub(crate) async fn do_get(
     tracing::trace!("do_get: {query:?}");
     match std::str::from_utf8(&query.prepared_statement_handle) {
         Ok(sql) => {
+            let start =
+                TimeMeasurement::new("flight_do_get_prepared_statement_query_duration_ms", vec![]);
             let output = Service::sql_to_flight_stream(datafusion, sql.to_owned()).await?;
+            let timed_output = TimedStream::new(output, move || start);
             Ok(Response::new(
-                Box::pin(output) as <Service as FlightService>::DoGetStream
+                Box::pin(timed_output) as <Service as FlightService>::DoGetStream
             ))
         }
         Err(e) => Err(Status::invalid_argument(format!(
