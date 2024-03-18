@@ -47,16 +47,16 @@ spice init my_app
 						cmd.PrintErrf("Error creating directory: %s\n", err.Error())
 						return
 					}
-				} else {
-					cmd.PrintErrf("Error checking if directory exists: %s\n", err.Error())
-					return
 				}
-			} else {
-				if !fs.IsDir() {
-					cmd.PrintErrf("Error: %s exists and is not a directory\n", spicepodName)
-					return
-				}
+				cmd.PrintErrf("Error checking if directory exists: %s\n", err.Error())
+				return
 			}
+
+			if !fs.IsDir() {
+				cmd.PrintErrf("Error: %s exists and is not a directory\n", spicepodName)
+				return
+			}
+
 			spicepodDir = spicepodName
 		}
 
