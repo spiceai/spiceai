@@ -139,26 +139,6 @@ impl Service {
         Ok(df.schema().into())
     }
 
-    async fn get_arrow_schema_and_size_sql(
-        datafusion: Arc<RwLock<DataFusion>>,
-        sql: String,
-    ) -> Result<(Schema, usize), Status> {
-        let df = datafusion
-            .read()
-            .await
-            .ctx
-            .sql(&sql)
-            .await
-            .map_err(to_tonic_err)?;
-
-        let schema = df.schema();
-        let arrow_schema: Schema = schema.into();
-
-        let size = df.count().await.map_err(to_tonic_err)?;
-
-        Ok((arrow_schema, size))
-    }
-
     fn serialize_schema(schema: &Schema) -> Result<Bytes, Status> {
         let message: IpcMessage = SchemaAsIpc::new(schema, &IpcWriteOptions::default())
             .try_into()

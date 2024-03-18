@@ -19,12 +19,10 @@ pub(crate) async fn do_action_create_prepared_statement(
     statement: sql::ActionCreatePreparedStatementRequest,
 ) -> Result<sql::ActionCreatePreparedStatementResult, Status> {
     tracing::trace!("do_action_create_prepared_statement: {statement:?}");
-    let (arrow_schema, _) = Service::get_arrow_schema_and_size_sql(
-        Arc::clone(&flight_svc.datafusion),
-        statement.query.clone(),
-    )
-    .await
-    .map_err(to_tonic_err)?;
+    let arrow_schema =
+        Service::get_arrow_schema(Arc::clone(&flight_svc.datafusion), statement.query.clone())
+            .await
+            .map_err(to_tonic_err)?;
 
     let schema_bytes = Service::serialize_schema(&arrow_schema)?;
 
@@ -51,14 +49,11 @@ pub(crate) async fn get_flight_info(
         }
     };
 
-    let (arrow_schema, num_rows) =
-        Service::get_arrow_schema_and_size_sql(Arc::clone(&flight_svc.datafusion), sql)
-            .await
-            .map_err(to_tonic_err)?;
+    let arrow_schema = Service::get_arrow_schema(Arc::clone(&flight_svc.datafusion), sql)
+        .await
+        .map_err(to_tonic_err)?;
 
-    tracing::trace!(
-        "get_flight_info_prepared_statement: arrow_schema={arrow_schema:?} num_rows={num_rows:?}"
-    );
+    tracing::trace!("get_flight_info_prepared_statement: arrow_schema={arrow_schema:?}");
 
     let fd = request.into_inner();
 
@@ -70,8 +65,7 @@ pub(crate) async fn get_flight_info(
         .with_endpoint(endpoint)
         .try_with_schema(&arrow_schema)
         .map_err(to_tonic_err)?
-        .with_descriptor(fd)
-        .with_total_records(num_rows.try_into().map_err(to_tonic_err)?);
+        .with_descriptor(fd);
 
     Ok(Response::new(info))
 }

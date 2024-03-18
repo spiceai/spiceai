@@ -31,7 +31,13 @@ impl FlightSQL {
         let mut batches = vec![];
         for ep in &flight_info.endpoint {
             if let Some(tkt) = &ep.ticket {
-                match batch_from_ticket(&mut client.clone(), tkt.to_owned()).await {
+                let mut do_get_client = if ep.location.is_empty() {
+                    client.clone() // expectation is that the ticket can only be redeemed on the current service
+                } else {
+                    let channel = new_tls_flight_channel(&ep.location[0].uri).await?;
+                    FlightSqlServiceClient::new(channel)
+                };
+                match batch_from_ticket(&mut do_get_client, tkt.to_owned()).await {
                     Ok(flight_data) => batches.extend(flight_data),
                     Err(err) => {
                         tracing::error!("Failed to read batch from flight client: {:?}", err);
