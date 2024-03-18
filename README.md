@@ -7,7 +7,7 @@
 
 ## What is Spice?
 
-**Spice** is a small, portable runtime that provides developers with a unified SQL query interface to locally accelerate and query data tables sourced from any database, data warehouse, or data lake.
+**Spice** is a small, portable runtime that provides developers with a unified SQL query interface to locally materialize, accelerate, and query data tables sourced from any database, data warehouse, or data lake.
 
 Spice makes it easy to build data-driven and data-intensive applications by streamlining the use of data and machine learning (ML) in software.
 
@@ -23,7 +23,7 @@ Spice makes querying data by SQL across one or more data sources simple and fast
 
 ### With Spice
 
-<img width="1024" alt="new" src="https://github.com/spiceai/spiceai/assets/80174/9bc84831-a75a-4fca-9643-ef7a86345ef0">
+<img width="1024" alt="new" src="https://github.com/spiceai/spiceai/assets/80174/05fa4ebb-48b1-436a-957c-38edc496985d">
 
 ### Example Use-Cases
 
@@ -32,6 +32,32 @@ Spice makes querying data by SQL across one or more data sources simple and fast
 **2. Faster analytics and BI.** Faster, more responsive dashboards without massive compute costs.
 
 **3. Faster data pipelines, machine learning training and inferencing.** Co-locate datasets in pipelines where the data is needed to minimize data-movement and improve query performance.
+
+### Supported Data Connectors
+
+Currently supported data connectors for upstream datasets. More coming soon.
+
+| Name         | Description | Status       | Protocol/Format  | Refresh Modes    |
+|--------------|-------------|--------------|------------------|------------------|
+| `databricks` | Databricks  | Alpha        | Delta Lake       | `full`           |
+| `postgres`   | PostgreSQL  | Alpha        |                  | `full`           |
+| `spiceai`    | Spice.ai    | Alpha        | Arrow Flight     | `append`, `full` |
+| `s3`         | S3          | Alpha        | Parquet          | `full`           |
+| `dremio`     | Dremio      | Alpha        | Arrow Flight SQL | `full`           |
+| `snowflake`  | Snowflake   | Coming soon! | Arrow Flight SQL | `full`           |
+| `bigquery`   | BigQuery    | Coming soon! | Arrow Flight SQL | `full`           |
+| `mysql`      | MySQL       | Coming soon! |                  | `full`           |
+
+### Supported Data Stores
+
+Currently supported data stores for local materialization/acceleration. More coming soon.
+
+| Name       | Description             | Status | Engine Modes     |
+|------------|-------------------------|--------|------------------|
+| `arrow`    | In-Memory Arrow Records | Alpha  | `memory`         |
+| `duckdb`   | Embedded DuckDB         | Alpha  | `memory`, `file` |
+| `sqlite`   | Embedded SQLite         | Alpha  | `memory`, `file` |
+| `postgres` | Attached PostgreSQL     | Alpha  |                  |
 
 ⚠️ **DEVELOPER PREVIEW** Spice is under active **alpha** stage development and is not intended to be used in production until its **1.0-stable** release.
 
@@ -48,10 +74,14 @@ curl https://install.spiceai.org | /bin/bash
 **Step 2.** Initialize a new Spice app with the `spice init` command:
 
 ```bash
-spice init spice_app
+spice init spice_qs
 ```
 
-A `Spicepod.yaml` file is created in the working directory.
+A `Spicepod.yaml` file is created in the `spice_qs` directory. Change to that directory:
+
+```bash
+cd spice_qs
+```
 
 **Step 3.** Connect to the sample Dremio instance to access the sample data:
 
@@ -178,19 +208,22 @@ After creating an account, you will need to create an app in order to create to 
 
 You will now be able to access datasets from Spice.ai. For this demonstration, we will be using the Spice.ai/eth.recent_blocks dataset.
 
-**Step 1.** In a new directory, log in and authenticate from the command line using the `spice login` command. A pop up browser window will prompt you to authenticate:
+**Step 1.** Log in and authenticate from the command line using the `spice login` command. A pop up browser window will prompt you to authenticate:
 
 ```bash
 spice login
 ```
 
-**Step 2.** Initialize a new project if you haven't already done so. Then, start the runtime:
+**Step 2.** Initialize a new project and start the runtime:
 
 ```bash
-spice init my_spiceai_project
-```
+# Initialize a new Spice app
+spice init spice_app
 
-```bash
+# Change to app directory
+cd spice_app
+
+# Start the runtime
 spice run
 ```
 

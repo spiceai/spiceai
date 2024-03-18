@@ -20,7 +20,10 @@ use once_cell::sync::Lazy;
 use prost::Message;
 use tonic::{Request, Response, Status};
 
-use crate::flight::{to_tonic_err, Service};
+use crate::{
+    flight::{to_tonic_err, Service},
+    timing::{TimeMeasurement, TimedStream},
+};
 
 /// Get a `FlightInfo` for retrieving `SqlInfo`.
 pub(crate) fn get_flight_info(
@@ -53,6 +56,7 @@ pub(crate) fn do_get(
     query: sql::CommandGetSqlInfo,
 ) -> Result<Response<<Service as FlightService>::DoGetStream>, Status> {
     tracing::trace!("do_get_sql_info: {query:?}");
+    let start = TimeMeasurement::new("flight_do_get_get_sql_info_duration_ms", vec![]);
     let builder = query.into_builder(get_sql_info_data());
     let record_batch = builder.build().map_err(to_tonic_err)?;
 
@@ -61,7 +65,7 @@ pub(crate) fn do_get(
     let flight_data_stream = FlightDataEncoderBuilder::new().build(batches_stream);
 
     Ok(Response::new(
-        flight_data_stream.map_err(to_tonic_err).boxed(),
+        TimedStream::new(flight_data_stream.map_err(to_tonic_err), move || start).boxed(),
     ))
 }
 
