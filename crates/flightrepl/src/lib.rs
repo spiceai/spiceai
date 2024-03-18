@@ -168,7 +168,7 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
 fn display_grpc_error(err: &Status) {
     let user_err_msg = match err.code() {
         Code::Ok => return,
-        Code::Unknown | Code::Internal | Code::Unauthenticated | Code::DataLoss | Code::OutOfRange | Code::FailedPrecondition => 
+        Code::Unknown | Code::Internal | Code::Unauthenticated | Code::DataLoss | Code::OutOfRange | Code::FailedPrecondition =>
             "An internal error occurred while processing the query. Show technical details with '.error'"
         ,
         Code::InvalidArgument | Code::AlreadyExists | Code::NotFound => err.message(),
