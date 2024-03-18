@@ -53,6 +53,10 @@ impl DataConnector for FlightSQL {
     where
         Self: Sized,
     {
+        tracing::error!(
+            "Creating FlightSQL data connector with params: {:?}",
+            params
+        );
         Box::pin(async move {
             let endpoint: String = params
                 .as_ref() // &Option<HashMap<String, String>>
@@ -61,13 +65,16 @@ impl DataConnector for FlightSQL {
                 .ok_or_else(|| super::Error::UnableToCreateDataConnector {
                     source: "Missing required parameter: endpoint".into(),
                 })?;
-
+            tracing::error!(
+                "Creating FlightSQL data connector with endpoint: {:?}",
+                endpoint
+            );
             let flight_channel = new_tls_flight_channel(&endpoint)
                 .await
                 .map_err(|e| super::Error::UnableToCreateDataConnector { source: e.into() })?;
 
             let mut client = FlightSqlServiceClient::new(flight_channel);
-
+            tracing::error!("Made the client FlightSqlServiceClient ");
             if let Some(s) = secret {
                 let _ = client
                     .handshake(
@@ -76,7 +83,7 @@ impl DataConnector for FlightSQL {
                     )
                     .await;
             };
-
+            tracing::error!("Secrets passed");
             Ok(Self { client })
         })
     }
@@ -107,11 +114,15 @@ impl DataConnector for FlightSQL {
         &self,
         dataset: &Dataset,
     ) -> std::result::Result<Arc<dyn datafusion::datasource::TableProvider>, super::Error> {
+        tracing::error!("Getting table provider fo FlightSQL");
         match FlightSQLTable::new(self.client.clone(), dataset.path()).await {
             Ok(provider) => Ok(Arc::new(provider)),
-            Err(error) => Err(super::Error::UnableToGetTableProvider {
-                source: error.into(),
-            }),
+            Err(error) => {
+                tracing::error!("Failed to get table provider for FlightSQL: {:?}", error);
+                Err(super::Error::UnableToGetTableProvider {
+                    source: error.into(),
+                })
+            }
         }
     }
 }

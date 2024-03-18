@@ -13,7 +13,7 @@ use futures::{Stream, TryStreamExt};
 use snafu::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::broadcast::Sender;
+use tokio::sync::broadcast::{error, Sender};
 use tokio::sync::RwLock;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
@@ -114,6 +114,20 @@ impl FlightService for Service {
 }
 
 impl Service {
+    async fn get_arrow_schema(
+        datafusion: Arc<RwLock<DataFusion>>,
+        sql: String,
+    ) -> Result<Schema, Status> {
+        let df = datafusion
+            .read()
+            .await
+            .ctx
+            .sql(&sql)
+            .await
+            .map_err(to_tonic_err)?;
+        Ok(df.schema().into())
+    }
+
     async fn get_arrow_schema_and_size_sql(
         datafusion: Arc<RwLock<DataFusion>>,
         sql: String,
@@ -128,7 +142,6 @@ impl Service {
 
         let schema = df.schema();
         let arrow_schema: Schema = schema.into();
-
         let size = df.count().await.map_err(to_tonic_err)?;
 
         Ok((arrow_schema, size))

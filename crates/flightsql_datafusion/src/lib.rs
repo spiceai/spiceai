@@ -82,60 +82,72 @@ impl FlightSQLTable {
         Self::new(FlightSqlServiceClient::new(channel), table_reference.into()).await
     }
 
+    fn get_str_from_record_batch(b: &RecordBatch, row: usize, col_name: &str) -> Option<String> {
+        if let Some(col_array) = b.column_by_name(col_name) {
+            if let Some(y) = col_array.as_any().downcast_ref::<array::StringArray>() {
+                return Some(y.value(row).to_string());
+            }
+        }
+        None
+    }
+
     #[must_use]
     pub fn get_table_schema_if_present(
-        vec_b: Vec<RecordBatch>,
-        table_name: String,
+        batches: Vec<RecordBatch>,
+        table_reference: OwnedTableReference,
     ) -> Option<SchemaRef> {
-        let schema_bytz_opt = vec_b.iter().find_map(|b| {
-            let table_schema = match b.column_by_name("table_schema") {
-                Some(table_schema) => match table_schema
-                    .as_any()
-                    .downcast_ref::<array::LargeBinaryArray>()
-                {
-                    Some(ts) => ts,
-                    None => return None,
-                },
-                None => return None, // If no table_schema, then early exit.
-            };
+        let schema_bytz_opt = batches.iter().find_map(|b| {
+            let table_schema = b
+                .column_by_name("table_schema")
+                .and_then(|ts_array| ts_array.as_any().downcast_ref::<array::BinaryArray>())
+                .or(None)?;
 
-            if let Some(table_names) = b.column_by_name("table_name") {
-                if let Some(table_name_bytz) = table_names
-                    .as_any()
-                    .downcast_ref::<array::LargeBinaryArray>()
-                {
-                    for i in 0..table_name_bytz.len() {
-                        if let Ok(table_str) = std::str::from_utf8(table_name_bytz.value(i))
-                            .map_err(|_| FlightSQLError::NoSchema {})
-                        {
-                            if table_str == table_name {
-                                return Some(table_schema.value(i));
-                            }
-                            return None; // No schema with table_name, return nothing.
-                        }
-                    }
+            for i in 0..b.num_rows() {
+                let table_name =
+                    Self::get_str_from_record_batch(b, i, "table_name").unwrap_or_default();
+                let catalog_name =
+                    Self::get_str_from_record_batch(b, i, "catalog_name").unwrap_or_default();
+                let db_schema_name =
+                    Self::get_str_from_record_batch(b, i, "db_schema_name").unwrap_or_default();
+
+                // We got at least one None above, so we can't compare.
+                if table_name.is_empty() || catalog_name.is_empty() || db_schema_name.is_empty() {
+                    continue;
                 }
-            };
+
+                // Match even if catalog_name or db_schema_name from table_reference was None.
+                if table_reference.table() == table_name
+                    && table_reference.catalog().unwrap_or_default() == catalog_name
+                    && table_reference.schema().unwrap_or_default() == db_schema_name
+                {
+                    return Some(table_schema.value(i));
+                }
+            }
             None
         });
 
-        if let Some(schema_bytz) = schema_bytz_opt {
-            let y = IpcMessage(tonic::codegen::Bytes::copy_from_slice(schema_bytz));
-            match Schema::try_from(y).map_err(|_| FlightSQLError::NoSchema {}) {
-                Ok(schema) => return Some(Arc::new(schema)),
-                Err(_) => return None,
+        match schema_bytz_opt {
+            Some(schema_bytz) => {
+                match Schema::try_from(IpcMessage(tonic::codegen::Bytes::copy_from_slice(
+                    schema_bytz,
+                )))
+                .map_err(|_| FlightSQLError::NoSchema {})
+                {
+                    Ok(schema) => Some(Arc::new(schema)),
+                    Err(e) => {
+                        tracing::error!("Error converting schema from 'table_schema' column: {e}");
+                        None
+                    }
+                }
             }
+            None => None,
         }
-
-        None
     }
 
     pub async fn get_schema(
         mut client: FlightSqlServiceClient<Channel>,
         table_reference: OwnedTableReference,
     ) -> Result<SchemaRef> {
-        let table_name = table_reference.table();
-
         let flight_info = client
             .get_tables(CommandGetTables {
                 catalog: table_reference
@@ -144,36 +156,43 @@ impl FlightSQLTable {
                 db_schema_filter_pattern: table_reference
                     .schema()
                     .map(std::string::ToString::to_string),
-                table_name_filter_pattern: Some(table_name.to_string()),
+                table_name_filter_pattern: Some(table_reference.table().to_string()),
                 include_schema: true,
-                table_types: vec![
-                    "TABLE".to_string(),
-                    "VIEW".to_string(),
-                    "SYSTEM TABLE".to_string(),
-                ],
+                table_types: [
+                    "TABLE",
+                    "BASE TABLE",
+                    "VIEW",
+                    "LOCAL TEMPORARY",
+                    "SYSTEM TABLE",
+                ]
+                .iter()
+                .map(|&s| s.into())
+                .collect(),
             })
             .await
             .map_err(|e| FlightSQLError::ArrowFlight {
                 source: arrow_flight::error::FlightError::Arrow(e),
             })?;
 
-        for ep in &flight_info.endpoint {
-            if let Some(tkt) = &ep.ticket {
-                // Schema: https://github.com/apache/arrow/blob/44edc27e549d82db930421b0d4c76098941afd71/format/FlightSql.proto#L1182-L1190
-                let res = client
-                    .do_get(tkt.to_owned())
-                    .await
-                    .map_err(|e| FlightSQLError::ArrowFlight {
-                        source: arrow_flight::error::FlightError::Arrow(e),
-                    })?
-                    .try_collect::<Vec<_>>()
-                    .await
-                    .map_err(|e| FlightSQLError::ArrowFlight { source: e })?;
-                if let Some(schema) = Self::get_table_schema_if_present(res, table_name.to_string())
-                {
-                    return Ok(schema);
-                };
-            }
+        for tkt in flight_info
+            .endpoint
+            .iter()
+            .filter_map(|ep| ep.ticket.as_ref())
+        {
+            let stream = client
+                .do_get(tkt.clone())
+                .await
+                .map_err(|e| FlightSQLError::ArrowFlight { source: e.into() })?;
+            let batch = stream
+                .try_collect::<Vec<_>>()
+                .await
+                .map_err(|e| FlightSQLError::ArrowFlight { source: e })?;
+
+            // Schema: https://github.com/apache/arrow/blob/44edc27e549d82db930421b0d4c76098941afd71/format/FlightSql.proto#L1182-L1190
+            if let Some(schema) = Self::get_table_schema_if_present(batch, table_reference.clone())
+            {
+                return Ok(schema);
+            };
         }
         Err(FlightSQLError::NoSchema {})
     }
@@ -185,6 +204,7 @@ impl FlightSQLTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        tracing::error!("creating a physical plan for FlightSQLTable");
         Ok(Arc::new(FlightSqlExec::new(
             projections,
             schema,
@@ -289,7 +309,6 @@ impl FlightSqlExec {
                 .context(UnableToGenerateSQLSnafu)?;
             format!("WHERE {}", filter_expr.join(" AND "))
         };
-
         Ok(format!(
             "SELECT {columns} FROM {table_reference} {where_expr} {limit_expr}",
             table_reference = self.table_reference,
@@ -371,9 +390,7 @@ fn to_stream(
                     while let Some(batch) = stream.next().await {
                         match batch {
                             Ok(batch) => yield Ok(batch),
-                            Err(error) => {
-                                yield Err(FlightSQLError::ArrowFlight { source: error });
-                            }
+                            Err(error) => yield Err(FlightSQLError::ArrowFlight { source: error })
                         }
                     }
                 }
@@ -429,24 +446,36 @@ async fn query(
     mut client: FlightSqlServiceClient<Channel>,
     query: String,
 ) -> Result<Option<FlightRecordBatchStream>, FlightSQLError> {
+    tracing::error!("query with client and query {query}");
     match client.clone().execute(query, None).await {
         Ok(flight_info) => match flight_info.endpoint.first() {
             Some(ep) => {
                 if let Some(tkt) = &ep.ticket {
+                    tracing::error!("query with tkt {tkt}");
                     match client
                         .do_get(tkt.to_owned())
                         .await
                         .map_err(|e| FlightSQLError::ArrowFlight { source: e.into() })
                     {
                         Ok(flight_data) => Ok(Some(flight_data)),
-                        Err(err) => Err(err),
+                        Err(err) => {
+                            tracing::error!("Error Ok(flight_data) for query flight data: {err}");
+                            Err(err)
+                        }
                     }
                 } else {
+                    tracing::error!("No ticket in endpoint: {ep}");
                     Ok(None)
                 }
             }
-            None => Ok(None),
+            None => {
+                tracing::error!("No endpoint in flight_info: {flight_info}");
+                Ok(None)
+            }
         },
-        Err(e) => Err(FlightSQLError::ArrowFlight { source: e.into() }),
+        Err(e) => {
+            tracing::error!("Failed to read batch from flight client: {e}");
+            Err(FlightSQLError::ArrowFlight { source: e.into() })
+        }
     }
 }
