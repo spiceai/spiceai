@@ -20,7 +20,6 @@ type RuntimeContext struct {
 	appDir          string
 	podsDir         string
 	httpEndpoint    string
-	metricsEndpoint string
 }
 
 func NewContext() *RuntimeContext {
