@@ -97,49 +97,58 @@ impl FlightSQLTable {
         batches: Vec<RecordBatch>,
         table_reference: OwnedTableReference,
     ) -> Option<SchemaRef> {
-        let schema_bytz_opt = batches.iter().find_map(|b| {
-            let table_schema = b
+        let mut possible_schema_bytz: Vec<Vec<u8>> = vec![];
+
+        for b in batches {
+            if let Some(table_schema) = b
                 .column_by_name("table_schema")
                 .and_then(|ts_array| ts_array.as_any().downcast_ref::<array::BinaryArray>())
-                .or(None)?;
+                .or(None)
+            {
+                possible_schema_bytz.extend((0..b.num_rows()).filter_map(|i| {
+                    let table_name =
+                        Self::get_str_from_record_batch(&b, i, "table_name").unwrap_or_default();
+                    let catalog_name =
+                        Self::get_str_from_record_batch(&b, i, "catalog_name").unwrap_or_default();
+                    let db_schema_name = Self::get_str_from_record_batch(&b, i, "db_schema_name")
+                        .unwrap_or_default();
 
-            for i in 0..b.num_rows() {
-                let table_name =
-                    Self::get_str_from_record_batch(b, i, "table_name").unwrap_or_default();
-                let catalog_name =
-                    Self::get_str_from_record_batch(b, i, "catalog_name").unwrap_or_default();
-                let db_schema_name =
-                    Self::get_str_from_record_batch(b, i, "db_schema_name").unwrap_or_default();
-
-                // We got at least one None above, so we can't compare.
-                if table_name.is_empty() || catalog_name.is_empty() || db_schema_name.is_empty() {
-                    continue;
-                }
-
-                // Match even if catalog_name or db_schema_name from table_reference was None.
-                if table_reference.table() == table_name
-                    && table_reference.catalog().unwrap_or_default() == catalog_name
-                    && table_reference.schema().unwrap_or_default() == db_schema_name
-                {
-                    return Some(table_schema.value(i));
-                }
-            }
-            None
-        });
-
-        match schema_bytz_opt {
-            Some(schema_bytz) => {
-                match Schema::try_from(IpcMessage(Bytes::copy_from_slice(schema_bytz)))
-                    .map_err(|_| FlightSQLError::NoSchema {})
-                {
-                    Ok(schema) => Some(Arc::new(schema)),
-                    Err(e) => {
-                        tracing::error!("Error converting schema from 'table_schema' column: {e}");
+                    // Only check fields in `table_reference` matches.
+                    if table_reference.resolved_eq(&OwnedTableReference::full(
+                        catalog_name,
+                        db_schema_name,
+                        table_name,
+                    )) {
+                        Some(table_schema.value(i).to_vec())
+                    } else {
                         None
                     }
-                }
+                }));
             }
-            None => None,
+        }
+        match possible_schema_bytz.len() {
+            1 => {
+                if let Some(bytz) = possible_schema_bytz.first() {
+                    match Schema::try_from(IpcMessage(Bytes::copy_from_slice(bytz)))
+                        .map_err(|_| FlightSQLError::NoSchema {})
+                    {
+                        Ok(schema) => Some(Arc::new(schema)),
+                        Err(e) => {
+                            tracing::error!(
+                                "Error converting schema from 'table_schema' column: {e}"
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    None
+                } // Not possible due to match 1.
+            }
+            0 => None,
+            _ => {
+                tracing::error!("Multiple schemas found for table_reference: {table_reference}");
+                None
+            }
         }
     }
 
