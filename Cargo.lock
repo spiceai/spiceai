@@ -5007,6 +5007,7 @@ dependencies = [
  "object_store",
  "once_cell",
  "opentelemetry-proto",
+ "pin-project",
  "prost 0.12.3",
  "quick-xml 0.23.1",
  "r2d2",

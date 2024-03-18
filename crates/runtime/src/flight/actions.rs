@@ -3,7 +3,10 @@ use std::fmt::{self, Display, Formatter};
 use prost::Message;
 use tonic::{Request, Response, Status};
 
-use crate::flight::{flightsql::prepared_statement_query, to_tonic_err, Service};
+use crate::{
+    flight::{flightsql::prepared_statement_query, to_tonic_err, Service},
+    timing::{TimeMeasurement, TimedStream},
+};
 
 use arrow_flight::{
     flight_service_server::FlightService,
@@ -62,7 +65,10 @@ pub(crate) fn list() -> Response<<Service as FlightService>::ListActionsStream> 
         Ok(close_prepared_statement_action_type),
     ];
 
-    let output = futures::stream::iter(actions);
+    let output = TimedStream::new(futures::stream::iter(actions), || {
+        TimeMeasurement::new("flight_list_actions_duration_ms", vec![])
+    });
+
     Response::new(Box::pin(output) as <Service as FlightService>::ListActionsStream)
 }
 
@@ -72,7 +78,13 @@ pub(crate) async fn do_action(
 ) -> Result<Response<<Service as FlightService>::DoActionStream>, Status> {
     let action_type = ActionType::from_str(request.get_ref().r#type.as_str());
 
-    match action_type {
+    let action_type_str = action_type.as_str().to_string();
+    let start = TimeMeasurement::new(
+        "flight_do_action_duration_ms",
+        vec![("action_type", action_type_str)],
+    );
+
+    let stream = match action_type {
         ActionType::CreatePreparedStatement => {
             tracing::trace!("do_action: CreatePreparedStatement");
             let any = Any::decode(&*request.get_ref().body).map_err(to_tonic_err)?;
@@ -86,15 +98,19 @@ pub(crate) async fn do_action(
             let stmt =
                 prepared_statement_query::do_action_create_prepared_statement(flight_svc, cmd)
                     .await?;
-            let output = futures::stream::iter(vec![Ok(arrow_flight::Result {
+            futures::stream::iter(vec![Ok(arrow_flight::Result {
                 body: stmt.as_any().encode_to_vec().into(),
-            })]);
-            Ok(Response::new(Box::pin(output)))
+            })])
         }
         ActionType::ClosePreparedStatement => {
             tracing::trace!("do_action: ClosePreparedStatement");
-            Ok(Response::new(Box::pin(futures::stream::empty())))
+            futures::stream::iter(vec![Ok(arrow_flight::Result::default())])
         }
-        ActionType::Unknown => Err(Status::invalid_argument("Unknown action type")),
-    }
+        ActionType::Unknown => return Err(Status::invalid_argument("Unknown action type")),
+    };
+
+    Ok(Response::new(Box::pin(TimedStream::new(
+        stream,
+        move || start,
+    ))))
 }
