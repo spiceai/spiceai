@@ -6,7 +6,10 @@ use arrow_flight::{
 use prost::Message;
 use tonic::{Request, Response, Status};
 
-use crate::flight::{record_batches_to_flight_stream, to_tonic_err, Service};
+use crate::{
+    flight::{record_batches_to_flight_stream, to_tonic_err, Service},
+    timing::{TimeMeasurement, TimedStream},
+};
 
 /// Get a `FlightInfo` for listing catalogs.
 pub(crate) fn get_flight_info(
@@ -31,6 +34,7 @@ pub(crate) async fn do_get(
     flight_svc: &Service,
     query: sql::CommandGetCatalogs,
 ) -> Result<Response<<Service as FlightService>::DoGetStream>, Status> {
+    let start = TimeMeasurement::new("flight_do_get_get_catalogs_duration_ms", vec![]);
     tracing::trace!("do_get_catalogs: {query:?}");
     let mut builder = query.into_builder();
 
@@ -42,8 +46,9 @@ pub(crate) async fn do_get(
 
     let record_batch = builder.build().map_err(to_tonic_err)?;
 
-    Ok(Response::new(
-        Box::pin(record_batches_to_flight_stream(vec![record_batch]))
-            as <Service as FlightService>::DoGetStream,
+    Ok(Response::new(Box::pin(TimedStream::new(
+        record_batches_to_flight_stream(vec![record_batch]),
+        move || start,
     ))
+        as <Service as FlightService>::DoGetStream))
 }
