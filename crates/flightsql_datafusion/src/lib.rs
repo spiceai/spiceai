@@ -6,16 +6,16 @@ use arrow::{
 };
 use async_stream::stream;
 use async_trait::async_trait;
+use flight_client::tls::new_tls_flight_channel;
 use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt};
 use snafu::prelude::*;
 use sql_provider_datafusion::expr;
 use std::{any::Any, fmt, pin::Pin, sync::Arc, task::Poll, vec};
 
 use arrow_flight::{
-    decode::FlightRecordBatchStream,
     error::FlightError,
     sql::{client::FlightSqlServiceClient, CommandGetTables},
-    IpcMessage,
+    FlightEndpoint, IpcMessage,
 };
 use datafusion::{
     arrow::datatypes::SchemaRef,
@@ -28,6 +28,7 @@ use datafusion::{
         project_schema, DisplayAs, DisplayFormatType, ExecutionPlan, SendableRecordBatchStream,
     },
 };
+use tonic::codegen::Bytes;
 use tonic::transport::{channel, Channel};
 
 #[derive(Debug, Snafu)]
@@ -128,10 +129,8 @@ impl FlightSQLTable {
 
         match schema_bytz_opt {
             Some(schema_bytz) => {
-                match Schema::try_from(IpcMessage(tonic::codegen::Bytes::copy_from_slice(
-                    schema_bytz,
-                )))
-                .map_err(|_| FlightSQLError::NoSchema {})
+                match Schema::try_from(IpcMessage(Bytes::copy_from_slice(schema_bytz)))
+                    .map_err(|_| FlightSQLError::NoSchema {})
                 {
                     Ok(schema) => Some(Arc::new(schema)),
                     Err(e) => {
@@ -150,12 +149,8 @@ impl FlightSQLTable {
     ) -> Result<SchemaRef> {
         let flight_info = client
             .get_tables(CommandGetTables {
-                catalog: table_reference
-                    .catalog()
-                    .map(std::string::ToString::to_string),
-                db_schema_filter_pattern: table_reference
-                    .schema()
-                    .map(std::string::ToString::to_string),
+                catalog: table_reference.catalog().map(ToString::to_string),
+                db_schema_filter_pattern: table_reference.schema().map(ToString::to_string),
                 table_name_filter_pattern: Some(table_reference.table().to_string()),
                 include_schema: true,
                 table_types: [
@@ -383,20 +378,31 @@ fn to_stream(
 ) -> impl Stream<Item = Result<RecordBatch>> {
     let client = client.clone();
     let sql = sql.to_string();
+
     stream! {
-    match query(client, sql).await {
-        Ok(stream_opt) => {
-            if let Some(mut stream) = stream_opt {
-                    while let Some(batch) = stream.next().await {
-                        match batch {
-                            Ok(batch) => yield Ok(batch),
-                            Err(error) => yield Err(FlightSQLError::ArrowFlight { source: error })
-                        }
-                    }
-                }
-            },
-            Err(error) => yield Err(error)
-        }
+        let flight_info = client
+            .clone()
+            .execute(sql.to_string(), None)
+            .await
+            .map_err(|e| FlightSQLError::ArrowFlight { source: e.into() })?;
+
+        for ep in flight_info.endpoint {
+            if let Some(tkt) = ep.to_owned().ticket {
+                match get_client_for_flight_endpoint(&client, ep).await
+                    .map_err(|_| FlightSQLError::UnableToConnectToServer{})?
+                    .do_get(tkt.to_owned()).await {
+                        Ok(mut flight_stream) => {
+                            while let Some(batch) = flight_stream.next().await {
+                                match batch {
+                                    Ok(batch) => yield Ok(batch),
+                                    Err(error) => yield Err(FlightSQLError::ArrowFlight { source: error })
+                                }
+                            }
+                        },
+                        Err(error) => yield Err(FlightSQLError::ArrowFlight { source: error.into()} )
+                };
+            }
+        };
     }
 }
 
@@ -442,24 +448,14 @@ fn to_execution_error(e: impl Into<Box<dyn std::error::Error>>) -> DataFusionErr
     DataFusionError::Execution(format!("{}", e.into()).to_string())
 }
 
-async fn query(
-    mut client: FlightSqlServiceClient<Channel>,
-    query: String,
-) -> Result<Option<FlightRecordBatchStream>, FlightSQLError> {
-    let flight_info = client
-        .clone()
-        .execute(query, None)
-        .await
-        .map_err(|e| FlightSQLError::ArrowFlight { source: e.into() })?;
-
-    if let Some(ep) = flight_info.endpoint.first() {
-        if let Some(tkt) = &ep.ticket {
-            return client
-                .do_get(tkt.to_owned())
-                .await
-                .map(Some)
-                .map_err(|e| FlightSQLError::ArrowFlight { source: e.into() });
-        }
-    };
-    Ok(None)
+pub async fn get_client_for_flight_endpoint(
+    client: &FlightSqlServiceClient<Channel>,
+    ep: FlightEndpoint,
+) -> Result<FlightSqlServiceClient<Channel>, Box<dyn std::error::Error>> {
+    if ep.location.is_empty() {
+        Ok(client.clone())
+    } else {
+        let channel = new_tls_flight_channel(&ep.location[0].uri).await?;
+        Ok(FlightSqlServiceClient::new(channel))
+    }
 }
