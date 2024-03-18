@@ -203,7 +203,7 @@ pub(crate) mod status {
     }
 
     async fn get_flight_status(flight_addr: &str) -> Status {
-        tracing::warn!("Checking flight status at {flight_addr}");
+        tracing::trace!("Checking flight status at {flight_addr}");
         match FlightClient::new(&format!("http://{flight_addr}"), "", "").await {
             Ok(_) => Status::Ready,
             Err(e) => {

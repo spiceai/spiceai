@@ -19,10 +19,15 @@ type RuntimeContext struct {
 	spiceBinDir     string
 	appDir          string
 	podsDir         string
+	httpEndpoint    string
+	metricsEndpoint string
 }
 
 func NewContext() *RuntimeContext {
-	rtcontext := &RuntimeContext{}
+	rtcontext := &RuntimeContext{
+		httpEndpoint: "http://127.0.0.1:3000",
+		metricsEndpoint: "127.0.0.1:9091,
+	}
 	err := rtcontext.Init()
 	if err != nil {
 		panic(err)
@@ -40,6 +45,10 @@ func (c *RuntimeContext) AppDir() string {
 
 func (c *RuntimeContext) PodsDir() string {
 	return c.podsDir
+}
+
+func (c *RuntimeContext) HttpEndpoint() string {
+	return c.httpEndpoint
 }
 
 func (c *RuntimeContext) Init() error {
