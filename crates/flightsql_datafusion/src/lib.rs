@@ -62,7 +62,6 @@ impl FlightSQLTable {
         client: FlightSqlServiceClient<Channel>,
         table_reference: impl Into<OwnedTableReference>,
     ) -> Result<Self> {
-        tracing::error!("creating a new FlightSQLTable with client and table_reference");
         let table_reference: OwnedTableReference = table_reference.into();
         let schema = Self::get_schema(client.clone(), table_reference.clone()).await?;
         Ok(Self {
@@ -76,7 +75,6 @@ impl FlightSQLTable {
         s: &'static str,
         table_reference: impl Into<OwnedTableReference>,
     ) -> Result<Self> {
-        tracing::error!("creating a static FlightSQLTable with client and table_reference");
         let channel = channel::Endpoint::from_static(s)
             .connect()
             .map_err(|_| FlightSQLError::UnableToConnectToServer)
@@ -254,7 +252,6 @@ impl TableProvider for FlightSQLTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        tracing::error!("scanning FlightSQLTable");
         return self.create_physical_plan(projection, &self.schema(), filters, limit);
     }
 }
@@ -277,7 +274,6 @@ impl FlightSqlExec {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Self> {
-        tracing::error!("creating a new FlightSqlExec");
         let projected_schema = project_schema(schema, projections)?;
         Ok(Self {
             projected_schema,
@@ -313,11 +309,6 @@ impl FlightSqlExec {
                 .context(UnableToGenerateSQLSnafu)?;
             format!("WHERE {}", filter_expr.join(" AND "))
         };
-
-        tracing::error!(
-            "SELECT {columns} FROM {table_reference} {where_expr} {limit_expr}",
-            table_reference = self.table_reference,
-        );
         Ok(format!(
             "SELECT {columns} FROM {table_reference} {where_expr} {limit_expr}",
             table_reference = self.table_reference,
@@ -392,7 +383,6 @@ fn to_stream(
 ) -> impl Stream<Item = Result<RecordBatch>> {
     let client = client.clone();
     let sql = sql.to_string();
-    tracing::error!("to_stream with client and sql {sql}");
     stream! {
     match query(client, sql).await {
         Ok(stream_opt) => {
@@ -400,19 +390,12 @@ fn to_stream(
                     while let Some(batch) = stream.next().await {
                         match batch {
                             Ok(batch) => yield Ok(batch),
-                            Err(error) => {
-                                tracing::error!("Error reading specific batch from FlightSQL: {error}");
-                                yield Err(FlightSQLError::ArrowFlight { source: error });
-                            }
+                            Err(error) => yield Err(FlightSQLError::ArrowFlight { source: error })
                         }
                     }
-                    tracing::error!("No more batches in FlightSQL stream");
                 }
             },
-            Err(error) => {
-                tracing::error!("Error querying in to_stream FlightSQL: {error}");
-                yield Err(error)
-            }
+            Err(error) => yield Err(error)
         }
     }
 }
@@ -478,7 +461,7 @@ async fn query(
                         Err(err) => {
                             tracing::error!("Error Ok(flight_data) for query flight data: {err}");
                             Err(err)
-                        },
+                        }
                     }
                 } else {
                     tracing::error!("No ticket in endpoint: {ep}");
@@ -488,11 +471,11 @@ async fn query(
             None => {
                 tracing::error!("No endpoint in flight_info: {flight_info}");
                 Ok(None)
-            },
+            }
         },
         Err(e) => {
             tracing::error!("Failed to read batch from flight client: {e}");
             Err(FlightSQLError::ArrowFlight { source: e.into() })
-        },
+        }
     }
 }

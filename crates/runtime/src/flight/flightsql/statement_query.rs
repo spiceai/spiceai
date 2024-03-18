@@ -6,7 +6,6 @@ use arrow_flight::{
     FlightDescriptor, FlightEndpoint, FlightInfo, Ticket,
 };
 use prost::Message;
-use tokio::sync::broadcast::error;
 use tonic::{Request, Response, Status};
 
 use crate::flight::{to_tonic_err, Service};
@@ -17,17 +16,12 @@ pub(crate) async fn get_flight_info(
     query: sql::CommandStatementQuery,
     request: Request<FlightDescriptor>,
 ) -> Result<Response<FlightInfo>, Status> {
-    tracing::error!("In Service: get_flight_info: {query:?}");
-
     let sql = query.query.as_str();
 
-    let (arrow_schema, _) =
-        Service::get_arrow_schema_and_size_sql(Arc::clone(&flight_svc.datafusion), sql.to_string())
+    let arrow_schema =
+        Service::get_arrow_schema(Arc::clone(&flight_svc.datafusion), sql.to_string())
             .await
-            .map_err(|e| {
-                tracing::error!("Error get_arrow_schema_and_size_sql: {e:?}");
-                to_tonic_err(e)
-            })?;
+            .map_err(to_tonic_err)?;
 
     let fd = request.into_inner();
 
@@ -38,13 +32,8 @@ pub(crate) async fn get_flight_info(
     let info = FlightInfo::new()
         .with_endpoint(endpoint)
         .try_with_schema(&arrow_schema)
-        .map_err(|e| {
-            tracing::error!("Error FlightInfo::new(): {e:?}");
-            to_tonic_err(e)
-        })?
-        // .map_err(to_tonic_err)?
+        .map_err(to_tonic_err)?
         .with_descriptor(fd);
-        // .with_total_records(num_rows.try_into().map_err(to_tonic_err)?);
 
     Ok(Response::new(info))
 }
@@ -53,7 +42,6 @@ pub(crate) async fn do_get(
     flight_svc: &Service,
     cmd: sql::CommandStatementQuery,
 ) -> Result<Response<<Service as FlightService>::DoGetStream>, Status> {
-    tracing::error!("do_get_statement CommandStatementQuery: {cmd:?}");
     let datafusion = Arc::clone(&flight_svc.datafusion);
     let output = Service::sql_to_flight_stream(datafusion, cmd.query).await?;
     Ok(Response::new(
