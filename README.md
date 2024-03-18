@@ -7,7 +7,7 @@
 
 ## What is Spice?
 
-**Spice** is a small, portable runtime that provides developers with a unified SQL query interface to locally accelerate and query data tables sourced from any database, data warehouse, or data lake.
+**Spice** is a small, portable runtime that provides developers with a unified SQL query interface to locally materialize, accelerate, and query data tables sourced from any database, data warehouse, or data lake.
 
 Spice makes it easy to build data-driven and data-intensive applications by streamlining the use of data and machine learning (ML) in software.
 
@@ -23,7 +23,7 @@ Spice makes querying data by SQL across one or more data sources simple and fast
 
 ### With Spice
 
-<img width="1024" alt="new" src="https://github.com/spiceai/spiceai/assets/80174/9bc84831-a75a-4fca-9643-ef7a86345ef0">
+<img width="1024" alt="new" src="https://github.com/spiceai/spiceai/assets/80174/05fa4ebb-48b1-436a-957c-38edc496985d">
 
 ### Example Use-Cases
 
