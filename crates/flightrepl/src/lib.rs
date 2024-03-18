@@ -1,6 +1,8 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use ansi_term::Colour;
+use arrow_flight::sql::{CommandStatementQuery, ProstMessageExt};
 use arrow_flight::{
     decode::FlightRecordBatchStream, error::FlightError,
     flight_service_client::FlightServiceClient, FlightDescriptor,
@@ -11,10 +13,11 @@ use datafusion::datasource::{provider_as_source, MemTable};
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::{LogicalPlanBuilder, UNNAMED_TABLE};
 use futures::{StreamExt, TryStreamExt};
+use prost::Message;
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 use tonic::transport::Channel;
-use tonic::IntoRequest;
+use tonic::{Code, IntoRequest, Status};
 
 #[derive(Parser)]
 #[clap(about = "Spice.ai Flight Query Utility")]
@@ -28,6 +31,7 @@ pub struct ReplConfig {
     pub repl_flight_endpoint: String,
 }
 
+#[allow(clippy::too_many_lines)]
 #[allow(clippy::missing_errors_doc)]
 pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Error>> {
     // Set up the Flight client
@@ -41,8 +45,12 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
     println!("Welcome to the interactive Spice.ai SQL Query Utility! Type 'help' for help.\n");
     println!("show tables; -- list available tables");
 
+    let mut last_error: Option<Status> = None;
+    let prompt_color = Colour::Fixed(8);
+    let prompt = prompt_color.paint("sql> ").to_string();
+
     loop {
-        let line_result = rl.readline("sql> ");
+        let line_result = rl.readline(&prompt);
         let line = match line_result {
             Ok(line) => line,
             Err(ReadlineError::Interrupted | ReadlineError::Eof) => {
@@ -60,10 +68,24 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
         }
         match line {
             ".exit" | "exit" | "quit" | "q" => break,
+            ".error" => {
+                match last_error {
+                    Some(ref err) => println!("{err:?}"),
+                    None => println!("No error to display"),
+                }
+                continue;
+            }
             "help" => {
                 println!("Available commands:\n");
-                println!(".exit, exit, quit, q: Exit the REPL");
-                println!("help: Show this help message");
+                println!(
+                    "{} Exit the REPL",
+                    prompt_color.paint(".exit, exit, quit, q:")
+                );
+                println!(
+                    "{} Show technical details from the last error",
+                    prompt_color.paint(".error:")
+                );
+                println!("{} Show this help message", prompt_color.paint("help:"));
                 println!("\nAny other line will be interpreted as a SQL query");
                 continue;
             }
@@ -72,16 +94,33 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
 
         let _ = rl.add_history_entry(line);
 
-        let request = FlightDescriptor::new_cmd(line.to_string());
+        let sql_command = CommandStatementQuery {
+            query: line.to_string(),
+            transaction_id: None,
+        };
+        let sql_command_bytes = sql_command.as_any().encode_to_vec();
+
+        let request = FlightDescriptor::new_cmd(sql_command_bytes);
 
         let start_time = Instant::now();
-        let mut flight_info = client.get_flight_info(request).await?.into_inner();
+        let mut flight_info = match client.get_flight_info(request).await {
+            Ok(flight_info) => flight_info.into_inner(),
+            Err(e) => {
+                display_grpc_error(&e);
+                last_error = Some(e);
+                continue;
+            }
+        };
         let Some(endpoint) = flight_info.endpoint.pop() else {
-            println!("No endpoint");
+            let internal_err = Status::internal("No endpoint");
+            display_grpc_error(&internal_err);
+            last_error = Some(internal_err);
             continue;
         };
         let Some(ticket) = endpoint.ticket else {
-            println!("No ticket");
+            let internal_err = Status::internal("No ticket");
+            display_grpc_error(&internal_err);
+            last_error = Some(internal_err);
             continue;
         };
         let request = ticket.into_request();
@@ -89,7 +128,8 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
         let stream = match client.do_get(request).await {
             Ok(stream) => stream.into_inner(),
             Err(e) => {
-                println!("{e}");
+                display_grpc_error(&e);
+                last_error = Some(e);
                 continue;
             }
         };
@@ -119,7 +159,27 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
         };
         let elapsed = start_time.elapsed();
         println!("\nQuery took: {} seconds", elapsed.as_secs_f64());
+        last_error = None;
     }
 
     Ok(())
+}
+
+fn display_grpc_error(err: &Status) {
+    let user_err_msg = match err.code() {
+        Code::Ok => return,
+        Code::Unknown | Code::Internal | Code::Unauthenticated | Code::DataLoss | Code::OutOfRange | Code::FailedPrecondition =>
+            "An internal error occurred while processing the query. Show technical details with '.error'"
+        ,
+        Code::InvalidArgument | Code::AlreadyExists | Code::NotFound => err.message(),
+        Code::Cancelled => "The query was cancelled before it could complete.",
+        Code::Aborted => "The query was aborted before it could complete.",
+        Code::DeadlineExceeded => "The query could not be completed because the deadline for the query was exceeded.",
+        Code::PermissionDenied => "The query could not be completed because the user does not have permission to access the requested data.",
+        Code::ResourceExhausted => "The query could not be completed because the server has run out of resources.",
+        Code::Unimplemented => "The query could not be completed because the server does not support the requested operation.",
+        Code::Unavailable => "The query could not be completed because the server is unavailable.",
+    };
+
+    println!("{} {user_err_msg}", Colour::Red.paint("Query Error"));
 }

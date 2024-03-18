@@ -25,8 +25,7 @@ pub(crate) async fn get_flight_info(
 
     let (arrow_schema, num_rows) =
         Service::get_arrow_schema_and_size_sql(Arc::clone(&flight_svc.datafusion), sql.to_string())
-            .await
-            .map_err(to_tonic_err)?;
+            .await?;
 
     let fd = request.into_inner();
 
