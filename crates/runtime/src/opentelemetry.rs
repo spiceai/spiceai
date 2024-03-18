@@ -34,6 +34,8 @@ use tonic_0_9_0::transport::Server;
 use tonic_0_9_0::Request;
 use tonic_0_9_0::Response;
 use tonic_0_9_0::Status;
+use tonic_health::pb::health_server::Health;
+use tonic_health::pb::health_server::HealthServer;
 
 use crate::datafusion::DataFusion;
 use crate::dataupdate::DataUpdate;
@@ -195,6 +197,14 @@ impl MetricsService for Service {
             partial_success,
         }))
     }
+}
+
+async fn create_health_service() -> HealthServer<impl Health> {
+    let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
+    health_reporter
+        .set_serving::<MetricsServiceServer<Service>>()
+        .await;
+    health_service
 }
 
 pub fn metric_data_to_record_batch(
@@ -584,6 +594,7 @@ pub async fn start(bind_address: SocketAddr, data_fusion: Arc<RwLock<DataFusion>
     tracing::info!("Spice Runtime OpenTelemetry listening on {bind_address}");
 
     Server::builder()
+        .add_service(create_health_service().await)
         .add_service(svc)
         .serve(bind_address)
         .await
