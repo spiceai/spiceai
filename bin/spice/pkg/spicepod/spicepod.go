@@ -42,7 +42,7 @@ func CreateManifest(name string, spicepodDir string) (string, error) {
 	}
 
 	spicepodPath := path.Join(spicepodDir, "spicepod.yaml")
-	err = os.WriteFile(spicepodPath, skeletonPodContentBytes, 0766)
+	err = os.WriteFile(spicepodPath, skeletonPodContentBytes, 0744)
 	if err != nil {
 		return "", fmt.Errorf("Error writing spicepod.yaml: %w", err)
 	}
