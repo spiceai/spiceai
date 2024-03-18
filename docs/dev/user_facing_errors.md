@@ -6,18 +6,21 @@
 1. **Internal/Unknown Errors**: If the error is internal to the application or unknown, the error message should be generic and not expose any internal details. The error message should indicate how to report the error to the developers.
   - We should strive to have as few of these as possible.
 
+## Rust Error Traits
 In Rust, the Error trait implements both the Debug and Display traits. All user-facing errors should use the Display trait, not the Debug trait.
 
 i.e.
 
-Good
+Good (uses Display trait)
 ```rust
-let err = io::Error::new(io::ErrorKind::NotFound, "File not found");
-println!("{}", err);
+if let Err(user_facing_err) = upload_data(datasource) {
+    tracing::error!("Unable to upload data to {datasource}: {user_facing_err}");
+}
 ```
 
-Bad
+Bad (uses Debug trait `:?`)
 ```rust
-let err = io::Error::new(io::ErrorKind::NotFound, "File not found");
-println!("{:?}", err);
+if let Err(user_facing_err) = upload_data(datasource) {
+    tracing::error!("Unable to upload data to {datasource}: {user_facing_err:?}");
+}
 ```
