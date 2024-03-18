@@ -21,7 +21,7 @@ pub(crate) async fn get_flight_info(
 
     let sql = query.query.as_str();
 
-    let (arrow_schema, num_rows) =
+    let (arrow_schema, _) =
         Service::get_arrow_schema_and_size_sql(Arc::clone(&flight_svc.datafusion), sql.to_string())
             .await
             .map_err(|e| {
@@ -43,8 +43,8 @@ pub(crate) async fn get_flight_info(
             to_tonic_err(e)
         })?
         // .map_err(to_tonic_err)?
-        .with_descriptor(fd)
-        .with_total_records(num_rows.try_into().map_err(to_tonic_err)?);
+        .with_descriptor(fd);
+        // .with_total_records(num_rows.try_into().map_err(to_tonic_err)?);
 
     Ok(Response::new(info))
 }
@@ -54,7 +54,7 @@ pub(crate) async fn do_get(
     ticket: sql::TicketStatementQuery,
 ) -> Result<Response<<Service as FlightService>::DoGetStream>, Status> {
     let datafusion = Arc::clone(&flight_svc.datafusion);
-    tracing::trace!("do_get_statement: {ticket:?}");
+    tracing::error!("do_get_statement: {ticket:?}");
     match std::str::from_utf8(&ticket.statement_handle) {
         Ok(sql) => {
             let output = Service::sql_to_flight_stream(datafusion, sql.to_owned()).await?;

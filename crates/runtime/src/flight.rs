@@ -133,12 +133,12 @@ impl Service {
         let arrow_schema: Schema = schema.into();
         tracing::error!("Schema: {arrow_schema:?}");
         tracing::error!("df: {df:?}");
-        let size = df.count().await.map_err(|e| {
-            tracing::error!("Error df_count: {e:?}");
-            to_tonic_err(e)
-        })?;
+        // let size = df.count().await.map_err(|e| {
+        //     tracing::error!("Error df_count: {e:?}");
+        //     to_tonic_err(e)
+        // })?;
 
-        Ok((arrow_schema, size))
+        Ok((arrow_schema, 0))
     }
 
     fn serialize_schema(schema: &Schema) -> Result<Bytes, Status> {

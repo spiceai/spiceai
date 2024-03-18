@@ -401,13 +401,18 @@ fn to_stream(
                         match batch {
                             Ok(batch) => yield Ok(batch),
                             Err(error) => {
+                                tracing::error!("Error reading specific batch from FlightSQL: {error}");
                                 yield Err(FlightSQLError::ArrowFlight { source: error });
                             }
                         }
                     }
+                    tracing::error!("No more batches in FlightSQL stream");
                 }
             },
-            Err(error) => yield Err(error)
+            Err(error) => {
+                tracing::error!("Error querying in to_stream FlightSQL: {error}");
+                yield Err(error)
+            }
         }
     }
 }
@@ -463,13 +468,17 @@ async fn query(
         Ok(flight_info) => match flight_info.endpoint.first() {
             Some(ep) => {
                 if let Some(tkt) = &ep.ticket {
+                    tracing::error!("query with tkt {tkt}");
                     match client
                         .do_get(tkt.to_owned())
                         .await
                         .map_err(|e| FlightSQLError::ArrowFlight { source: e.into() })
                     {
                         Ok(flight_data) => Ok(Some(flight_data)),
-                        Err(err) => Err(err),
+                        Err(err) => {
+                            tracing::error!("Error Ok(flight_data) for query flight data: {err}");
+                            Err(err)
+                        },
                     }
                 } else {
                     tracing::error!("No ticket in endpoint: {ep}");
