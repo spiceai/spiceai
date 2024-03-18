@@ -1,7 +1,7 @@
 package main
 
 import (
-	"github.com/spiceai/spiceai/bin/spice/pkg/cli/cmd"
+	"github.com/spiceai/spiceai/bin/spice/cmd"
 )
 
 func main() {
