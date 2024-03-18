@@ -5,6 +5,8 @@ use futures::Stream;
 use tonic::{metadata::MetadataValue, Response, Status};
 use uuid::Uuid;
 
+use crate::timing::{TimeMeasurement, TimedStream};
+
 type HandshakeResponseStream =
     Pin<Box<dyn Stream<Item = Result<HandshakeResponse, Status>> + Send>>;
 
@@ -17,7 +19,9 @@ pub(crate) fn handle() -> Result<Response<HandshakeResponseStream>, Status> {
         payload: token.as_bytes().to_vec().into(),
     };
     let result = Ok(result);
-    let output = futures::stream::iter(vec![result]);
+    let output = TimedStream::new(futures::stream::iter(vec![result]), || {
+        TimeMeasurement::new("flight_handshake_request_duration_ms", vec![])
+    });
     let str = format!("Bearer {token}");
     let mut resp: Response<HandshakeResponseStream> = Response::new(Box::pin(output));
     let md = MetadataValue::try_from(str)

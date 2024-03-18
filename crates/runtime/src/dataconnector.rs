@@ -18,6 +18,7 @@ use std::future::Future;
 
 use crate::datapublisher::DataPublisher;
 use crate::dataupdate::{DataUpdate, UpdateType};
+use crate::timing::TimeMeasurement;
 
 pub mod databricks;
 pub mod debug;
@@ -129,10 +130,12 @@ impl dyn DataConnector + '_ {
             return Box::pin(stream! {
                 loop {
                     tracing::info!("Refreshing data for {}", dataset.name);
+                    let timer = TimeMeasurement::new("load_dataset_duration_ms", vec![("dataset", dataset.name.clone())]);
                     yield DataUpdate {
                         data: self.get_all_data(dataset).await,
                         update_type: UpdateType::Overwrite,
                     };
+                    drop(timer);
                     tokio::time::sleep(refresh_interval).await;
                 }
             });
@@ -141,8 +144,15 @@ impl dyn DataConnector + '_ {
         tracing::trace!("stream::once");
         // Otherwise, just return the data once.
         Box::pin(stream::once(async move {
+            let timer = TimeMeasurement::new(
+                "load_dataset_duration_ms",
+                vec![("dataset", dataset.name.clone())],
+            );
+            let data = self.get_all_data(dataset).await;
+            drop(timer);
+
             DataUpdate {
-                data: self.get_all_data(dataset).await,
+                data,
                 update_type: UpdateType::Overwrite,
             }
         }))
