@@ -19,10 +19,13 @@ type RuntimeContext struct {
 	spiceBinDir     string
 	appDir          string
 	podsDir         string
+	httpEndpoint    string
 }
 
 func NewContext() *RuntimeContext {
-	rtcontext := &RuntimeContext{}
+	rtcontext := &RuntimeContext{
+		httpEndpoint: "http://127.0.0.1:3000",
+	}
 	err := rtcontext.Init()
 	if err != nil {
 		panic(err)
@@ -40,6 +43,10 @@ func (c *RuntimeContext) AppDir() string {
 
 func (c *RuntimeContext) PodsDir() string {
 	return c.podsDir
+}
+
+func (c *RuntimeContext) HttpEndpoint() string {
+	return c.httpEndpoint
 }
 
 func (c *RuntimeContext) Init() error {
@@ -70,6 +77,10 @@ func (c *RuntimeContext) Version() (string, error) {
 	}
 
 	return strings.TrimSpace(string(version)), nil
+}
+
+func (c *RuntimeContext) RuntimeUnavailableError() error {
+	return fmt.Errorf("The Spice runtime is unavailable at %s. Is it running?", c.httpEndpoint)
 }
 
 func (c *RuntimeContext) IsRuntimeInstallRequired() bool {
@@ -129,7 +140,7 @@ func (c *RuntimeContext) IsRuntimeUpgradeAvailable() (string, error) {
 		return "", err
 	}
 
-	if semver.Compare(currentVersion, release.TagName) == 0 {
+	if semver.Compare(currentVersion, release.TagName) >= 0 {
 		return "", nil
 	}
 

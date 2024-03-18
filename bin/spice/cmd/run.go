@@ -4,7 +4,7 @@ import (
 	"os"
 
 	"github.com/spf13/cobra"
-	"github.com/spiceai/spiceai/bin/spice/pkg/cli/runtime"
+	"github.com/spiceai/spiceai/bin/spice/pkg/runtime"
 	"github.com/spiceai/spiceai/bin/spice/pkg/util"
 )
 
