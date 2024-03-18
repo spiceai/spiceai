@@ -13,7 +13,7 @@ use futures::{Stream, TryStreamExt};
 use snafu::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::broadcast::{error, Sender};
+use tokio::sync::broadcast::Sender;
 use tokio::sync::RwLock;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
@@ -142,6 +142,7 @@ impl Service {
 
         let schema = df.schema();
         let arrow_schema: Schema = schema.into();
+
         let size = df.count().await.map_err(to_tonic_err)?;
 
         Ok((arrow_schema, size))

@@ -26,19 +26,19 @@ impl FlightSQL {
         client: FlightSqlServiceClient<Channel>,
         query: String,
     ) -> Result<Vec<arrow::record_batch::RecordBatch>, Box<dyn std::error::Error>> {
+        let flight_info = client.clone().execute(query, None).await?;
+
         let mut batches = vec![];
-        if let Ok(flight_info) = client.clone().execute(query, None).await {
-            for ep in &flight_info.endpoint {
-                if let Some(tkt) = &ep.ticket {
-                    match batch_from_ticket(&mut client.clone(), tkt.to_owned()).await {
-                        Ok(flight_data) => batches.extend(flight_data),
-                        Err(err) => {
-                            tracing::error!("Failed to read batch from flight client: {:?}", err);
-                            break;
-                        }
+        for ep in &flight_info.endpoint {
+            if let Some(tkt) = &ep.ticket {
+                match batch_from_ticket(&mut client.clone(), tkt.to_owned()).await {
+                    Ok(flight_data) => batches.extend(flight_data),
+                    Err(err) => {
+                        tracing::error!("Failed to read batch from flight client: {:?}", err);
+                        break;
                     }
-                };
-            }
+                }
+            };
         }
         Ok(batches)
     }
@@ -53,28 +53,19 @@ impl DataConnector for FlightSQL {
     where
         Self: Sized,
     {
-        tracing::error!(
-            "Creating FlightSQL data connector with params: {:?}",
-            params
-        );
         Box::pin(async move {
             let endpoint: String = params
                 .as_ref() // &Option<HashMap<String, String>>
                 .as_ref() // Option<&HashMap<String, String>>
                 .and_then(|params| params.get("endpoint").cloned())
-                .ok_or_else(|| super::Error::UnableToCreateDataConnector {
+                .ok_or(super::Error::UnableToCreateDataConnector {
                     source: "Missing required parameter: endpoint".into(),
                 })?;
-            tracing::error!(
-                "Creating FlightSQL data connector with endpoint: {:?}",
-                endpoint
-            );
             let flight_channel = new_tls_flight_channel(&endpoint)
                 .await
                 .map_err(|e| super::Error::UnableToCreateDataConnector { source: e.into() })?;
 
             let mut client = FlightSqlServiceClient::new(flight_channel);
-            tracing::error!("Made the client FlightSqlServiceClient ");
             if let Some(s) = secret {
                 let _ = client
                     .handshake(
@@ -83,7 +74,6 @@ impl DataConnector for FlightSQL {
                     )
                     .await;
             };
-            tracing::error!("Secrets passed");
             Ok(Self { client })
         })
     }
@@ -114,15 +104,11 @@ impl DataConnector for FlightSQL {
         &self,
         dataset: &Dataset,
     ) -> std::result::Result<Arc<dyn datafusion::datasource::TableProvider>, super::Error> {
-        tracing::error!("Getting table provider fo FlightSQL");
         match FlightSQLTable::new(self.client.clone(), dataset.path()).await {
             Ok(provider) => Ok(Arc::new(provider)),
-            Err(error) => {
-                tracing::error!("Failed to get table provider for FlightSQL: {:?}", error);
-                Err(super::Error::UnableToGetTableProvider {
-                    source: error.into(),
-                })
-            }
+            Err(error) => Err(super::Error::UnableToGetTableProvider {
+                source: error.into(),
+            }),
         }
     }
 }

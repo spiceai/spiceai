@@ -446,36 +446,20 @@ async fn query(
     mut client: FlightSqlServiceClient<Channel>,
     query: String,
 ) -> Result<Option<FlightRecordBatchStream>, FlightSQLError> {
-    tracing::error!("query with client and query {query}");
-    match client.clone().execute(query, None).await {
-        Ok(flight_info) => match flight_info.endpoint.first() {
-            Some(ep) => {
-                if let Some(tkt) = &ep.ticket {
-                    tracing::error!("query with tkt {tkt}");
-                    match client
-                        .do_get(tkt.to_owned())
-                        .await
-                        .map_err(|e| FlightSQLError::ArrowFlight { source: e.into() })
-                    {
-                        Ok(flight_data) => Ok(Some(flight_data)),
-                        Err(err) => {
-                            tracing::error!("Error Ok(flight_data) for query flight data: {err}");
-                            Err(err)
-                        }
-                    }
-                } else {
-                    tracing::error!("No ticket in endpoint: {ep}");
-                    Ok(None)
-                }
-            }
-            None => {
-                tracing::error!("No endpoint in flight_info: {flight_info}");
-                Ok(None)
-            }
-        },
-        Err(e) => {
-            tracing::error!("Failed to read batch from flight client: {e}");
-            Err(FlightSQLError::ArrowFlight { source: e.into() })
+    let flight_info = client
+        .clone()
+        .execute(query, None)
+        .await
+        .map_err(|e| FlightSQLError::ArrowFlight { source: e.into() })?;
+
+    if let Some(ep) = flight_info.endpoint.first() {
+        if let Some(tkt) = &ep.ticket {
+            return client
+                .do_get(tkt.to_owned())
+                .await
+                .map(Some)
+                .map_err(|e| FlightSQLError::ArrowFlight { source: e.into() });
         }
-    }
+    };
+    Ok(None)
 }

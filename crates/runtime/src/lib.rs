@@ -396,6 +396,7 @@ impl Runtime {
                     );
                 }
             }
+
             df.write()
                 .await
                 .attach_connector_to_publisher(

@@ -16,6 +16,8 @@ pub(crate) async fn get_flight_info(
     query: sql::CommandStatementQuery,
     request: Request<FlightDescriptor>,
 ) -> Result<Response<FlightInfo>, Status> {
+    tracing::trace!("get_flight_info: {query:?}");
+
     let sql = query.query.as_str();
 
     let arrow_schema =
