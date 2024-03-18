@@ -274,7 +274,7 @@ impl<'a> DuckDBUpdate<'a> {
 #[allow(clippy::needless_pass_by_value)]
 fn handle_poison<T: fmt::Debug>(e: PoisonError<T>) -> Error {
     Error::LockPoisoned {
-        message: format!("{e:?}"),
+        message: format!("{e}"),
     }
 }
 

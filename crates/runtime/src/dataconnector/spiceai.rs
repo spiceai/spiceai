@@ -90,7 +90,7 @@ impl DataConnector for SpiceAI {
           let mut stream = match flight.subscribe(&spice_dataset_path).await {
             Ok(stream) => stream,
             Err(error) => {
-              tracing::error!("Unable to subscribe to {spice_dataset_path}: {:?}", error);
+              tracing::error!("Unable to subscribe to {spice_dataset_path}: {error}");
               return;
             }
           };
@@ -108,7 +108,7 @@ impl DataConnector for SpiceAI {
                   }
                 }
               Some(Err(error)) => {
-                tracing::error!("Error in subscription to {spice_dataset_path}: {:?}", error);
+                tracing::error!("Error in subscription to {spice_dataset_path}: {error}");
                 continue;
               },
               None => {

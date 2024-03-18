@@ -9,7 +9,7 @@ fn main() {
     let args = spiced::Args::parse();
 
     if let Err(err) = init_tracing() {
-        eprintln!("Unable to initialize tracing: {err:?}");
+        eprintln!("Unable to initialize tracing: {err}");
         std::process::exit(1);
     }
 
@@ -36,7 +36,7 @@ fn main() {
     let tokio_runtime = match Runtime::new() {
         Ok(runtime) => runtime,
         Err(err) => {
-            tracing::error!("Unable to start Tokio runtime: {err:?}");
+            tracing::error!("Unable to start Tokio runtime: {err}");
             std::process::exit(1);
         }
     };
@@ -51,7 +51,7 @@ fn main() {
     tracing::trace!("Starting Spice Runtime!");
 
     if let Err(err) = tokio_runtime.block_on(start_runtime(args)) {
-        tracing::error!("Spice Runtime error: {err:?}");
+        tracing::error!("Spice Runtime error: {err}");
     }
 }
 
@@ -87,7 +87,7 @@ fn init_metrics(socket_addr: SocketAddr) -> Result<(), Box<dyn std::error::Error
 
     // This needs to run inside a Tokio runtime.
     builder.install()?;
-    tracing::info!("Metrics listening on {socket_addr:?}");
+    tracing::info!("Metrics listening on {socket_addr}");
 
     Ok(())
 }

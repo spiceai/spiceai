@@ -32,11 +32,11 @@ pub fn to_sql(expr: &Expr) -> Result<String> {
             ScalarValue::UInt32(Some(value)) => Ok(value.to_string()),
             ScalarValue::UInt64(Some(value)) => Ok(value.to_string()),
             _ => Err(Error::UnsupportedFilterExpr {
-                expr: format!("{expr:?}"),
+                expr: format!("{expr}"),
             }),
         },
         _ => Err(Error::UnsupportedFilterExpr {
-            expr: format!("{expr:?}"),
+            expr: format!("{expr}"),
         }),
     }
 }
