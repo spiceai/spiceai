@@ -25,3 +25,5 @@ tracing.workspace = true
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 datafusion.workspace = true
 rustyline = "13.0.0"
+prost = { version = "0.12.1", default-features = false, features = ["prost-derive"] }
+ansi_term = "0.12.1"
