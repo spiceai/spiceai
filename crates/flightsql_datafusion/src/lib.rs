@@ -387,10 +387,10 @@ fn to_stream(
             .map_err(|e| FlightSQLError::ArrowFlight { source: e.into() })?;
 
         for ep in flight_info.endpoint {
-            if let Some(tkt) = ep.to_owned().ticket {
+            if let Some(tkt) = ep.clone().ticket {
                 match get_client_for_flight_endpoint(&client, ep).await
                     .map_err(|_| FlightSQLError::UnableToConnectToServer{})?
-                    .do_get(tkt.to_owned()).await {
+                    .do_get(tkt.clone()).await {
                         Ok(mut flight_stream) => {
                             while let Some(batch) = flight_stream.next().await {
                                 match batch {
