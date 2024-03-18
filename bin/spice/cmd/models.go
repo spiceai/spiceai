@@ -6,15 +6,15 @@ import (
 	"github.com/spiceai/spiceai/bin/spice/pkg/context"
 )
 
-var statusCmd = &cobra.Command{
-	Use:   "status",
-	Short: "Spice runtime status",
+var modelsCmd = &cobra.Command{
+	Use:   "models",
+	Short: "Lists models loaded by the Spice runtime",
 	Example: `
-spice status
+spice models
 `,
 	Run: func(cmd *cobra.Command, args []string) {
 		rtcontext := context.NewContext()
-		err := api.WriteDataTable(rtcontext, "/v1/status", api.Service{})
+		err := api.WriteDataTable(rtcontext, "/v1/models", api.Model{})
 		if err != nil {
 			cmd.PrintErrln(err.Error())
 		}
@@ -22,5 +22,5 @@ spice status
 }
 
 func init() {
-	RootCmd.AddCommand(statusCmd)
+	RootCmd.AddCommand(modelsCmd)
 }
