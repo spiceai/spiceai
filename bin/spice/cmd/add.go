@@ -2,12 +2,16 @@ package cmd
 
 import (
 	"errors"
+	"fmt"
 	"os"
+	"path"
 
+	"github.com/logrusorgru/aurora"
 	"github.com/spf13/cobra"
 	"github.com/spiceai/spiceai/bin/spice/pkg/api"
 	"github.com/spiceai/spiceai/bin/spice/pkg/context"
 	"github.com/spiceai/spiceai/bin/spice/pkg/registry"
+	"github.com/spiceai/spiceai/bin/spice/pkg/spicepod"
 	"github.com/spiceai/spiceai/bin/spice/pkg/util"
 	"gopkg.in/yaml.v2"
 )
@@ -40,8 +44,28 @@ spice add spiceai/quickstart
 
 		spicepodBytes, err := os.ReadFile("spicepod.yaml")
 		if err != nil {
-			cmd.Println(err)
-			os.Exit(1)
+			if os.IsNotExist(err) {
+				wd, err := os.Getwd()
+				if err != nil {
+					cmd.PrintErrf("Error getting current working directory: %s\n", err.Error())
+					os.Exit(1)
+				}
+				name := path.Base(wd)
+				spicepodPath, err := spicepod.CreateManifest(name, ".")
+				if err != nil {
+					cmd.PrintErrf("Error creating spicepod.yaml: %s\n", err.Error())
+					os.Exit(1)
+				}
+				cmd.Println(aurora.BrightGreen(fmt.Sprintf("%s initialized!", spicepodPath)))
+				spicepodBytes, err = os.ReadFile("spicepod.yaml")
+				if err != nil {
+					cmd.PrintErrf("Error reading spicepod.yaml: %s\n", err.Error())
+					os.Exit(1)
+				}
+			} else {
+				cmd.Println(err)
+				os.Exit(1)
+			}
 		}
 
 		var spicePod api.Spicepod
