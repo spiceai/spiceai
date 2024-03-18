@@ -129,7 +129,7 @@ func (c *RuntimeContext) IsRuntimeUpgradeAvailable() (string, error) {
 		return "", err
 	}
 
-	if semver.Compare(currentVersion, release.TagName) == 0 {
+	if semver.Compare(currentVersion, release.TagName) >= 0 {
 		return "", nil
 	}
 
