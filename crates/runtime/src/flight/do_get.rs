@@ -22,7 +22,7 @@ pub(crate) async fn handle(
     };
 
     match Command::try_from(msg).map_err(to_tonic_err)? {
-        Command::TicketStatementQuery(command) => {
+        Command::CommandStatementQuery(command) => {
             flightsql::statement_query::do_get(flight_svc, command).await
         }
         Command::CommandPreparedStatementQuery(command) => {

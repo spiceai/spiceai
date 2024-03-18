@@ -46,19 +46,14 @@ pub(crate) async fn get_flight_info(
 
 pub(crate) async fn do_get(
     flight_svc: &Service,
-    ticket: sql::TicketStatementQuery,
+    cmd: sql::CommandStatementQuery,
 ) -> Result<Response<<Service as FlightService>::DoGetStream>, Status> {
     let datafusion = Arc::clone(&flight_svc.datafusion);
-    tracing::trace!("do_get_statement: {ticket:?}");
-    match std::str::from_utf8(&ticket.statement_handle) {
-        Ok(sql) => {
-            let start = TimeMeasurement::new("flight_do_get_statement_query_duration_ms", vec![]);
-            let output = Service::sql_to_flight_stream(datafusion, sql.to_owned()).await?;
-            let timed_output = TimedStream::new(output, move || start);
-            Ok(Response::new(
-                Box::pin(timed_output) as <Service as FlightService>::DoGetStream
-            ))
-        }
-        Err(e) => Err(Status::invalid_argument(format!("Invalid ticket: {e:?}"))),
-    }
+    tracing::trace!("do_get_statement: {cmd:?}");
+    let start = TimeMeasurement::new("flight_do_get_statement_query_duration_ms", vec![]);
+    let output = Service::sql_to_flight_stream(datafusion, cmd.query).await?;
+    let timed_output = TimedStream::new(output, move || start);
+    Ok(Response::new(
+        Box::pin(timed_output) as <Service as FlightService>::DoGetStream
+    ))
 }
