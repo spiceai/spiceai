@@ -33,6 +33,32 @@ Spice makes querying data by SQL across one or more data sources simple and fast
 
 **3. Faster data pipelines, machine learning training and inferencing.** Co-locate datasets in pipelines where the data is needed to minimize data-movement and improve query performance.
 
+### Supported Data Connectors
+
+Currently supported data connectors for upstream datasets. More coming soon.
+
+| Name         | Description | Status       | Protocol/Format  | Refresh Modes    |
+|--------------|-------------|--------------|------------------|------------------|
+| `databricks` | Databricks  | Alpha        | Delta Lake       | `full`           |
+| `postgres`   | PostgreSQL  | Alpha        |                  | `full`           |
+| `spiceai`    | Spice.ai    | Alpha        | Arrow Flight     | `append`, `full` |
+| `s3`         | S3          | Alpha        | Parquet          | `full`           |
+| `dremio`     | Dremio      | Coming soon! | Arrow Flight SQL | `full`           |
+| `snowflake`  | Snowflake   | Coming soon! | Arrow Flight SQL | `full`           |
+| `bigquery`   | BigQuery    | Coming soon! | Arrow Flight SQL | `full`           |
+| `mysql`      | MYSQL       | Coming soon! |                  | `full`           |
+
+### Supported Data Stores
+
+Currently supported data stores for local materialization/acceleration. More coming soon.
+
+| Name       | Description             | Status | Engine Modes     |
+|------------|-------------------------|--------|------------------|
+| `arrow`    | In-Memory Arrow Records | Alpha  | `memory`         |
+| `duckdb`   | Embedded DuckDB         | Alpha  | `memory`, `file` |
+| `sqlite`   | Embedded SQLite         | Alpha  | `memory`, `file` |
+| `postgres` | Attached PostgreSQL     | Alpha  |                  |
+
 ⚠️ **DEVELOPER PREVIEW** Spice is under active **alpha** stage development and is not intended to be used in production until its **1.0-stable** release.
 
 ## Quickstart
