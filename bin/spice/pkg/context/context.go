@@ -26,7 +26,6 @@ type RuntimeContext struct {
 func NewContext() *RuntimeContext {
 	rtcontext := &RuntimeContext{
 		httpEndpoint: "http://127.0.0.1:3000",
-		metricsEndpoint: "127.0.0.1:9091,
 	}
 	err := rtcontext.Init()
 	if err != nil {
@@ -79,6 +78,10 @@ func (c *RuntimeContext) Version() (string, error) {
 	}
 
 	return strings.TrimSpace(string(version)), nil
+}
+
+func (c *RuntimeContext) RuntimeUnavailableError() error {
+	return fmt.Errorf("The Spice runtime is unavailable at %s. Is it running?", c.httpEndpoint)
 }
 
 func (c *RuntimeContext) IsRuntimeInstallRequired() bool {

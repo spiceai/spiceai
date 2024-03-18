@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
+	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/spiceai/spiceai/bin/spice/pkg/api"
@@ -23,8 +25,12 @@ spice status
 		statusUrl := fmt.Sprintf("%s/v1/status", rtcontext.HttpEndpoint())
 		resp, err := http.Get(statusUrl)
 		if err != nil {
+			if strings.HasSuffix(err.Error(), "connection refused") {
+				cmd.PrintErrln(rtcontext.RuntimeUnavailableError().Error())
+				os.Exit(1)
+			}
 			cmd.PrintErrf("Error getting status: %s\n", err.Error())
-			return
+			os.Exit(1)
 		}
 		defer resp.Body.Close()
 
@@ -32,7 +38,7 @@ spice status
 		err = json.NewDecoder(resp.Body).Decode(&status)
 		if err != nil {
 			cmd.PrintErrf("Error decoding status: %s\n", err.Error())
-			return
+			os.Exit(1)
 		}
 
 		var statusTable []interface{}
