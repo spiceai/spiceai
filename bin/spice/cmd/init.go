@@ -8,8 +8,7 @@ import (
 
 	"github.com/logrusorgru/aurora"
 	"github.com/spf13/cobra"
-	"github.com/spiceai/spiceai/bin/spice/pkg/api"
-	"gopkg.in/yaml.v2"
+	"github.com/spiceai/spiceai/bin/spice/pkg/spicepod"
 )
 
 var initCmd = &cobra.Command{
@@ -38,26 +37,7 @@ spice init my_app
 				spicepodName = dirName
 			}
 		} else {
-			spicepodName = args[0]
-			fs, err := os.Stat(spicepodName)
-			if err != nil {
-				if os.IsNotExist(err) {
-					err = os.Mkdir(spicepodName, 0766)
-					if err != nil {
-						cmd.PrintErrf("Error creating directory: %s\n", err.Error())
-						return
-					}
-				}
-				cmd.PrintErrf("Error checking if directory exists: %s\n", err.Error())
-				return
-			}
-
-			if !fs.IsDir() {
-				cmd.PrintErrf("Error: %s exists and is not a directory\n", spicepodName)
-				return
-			}
-
-			spicepodDir = spicepodName
+			spicepodDir = args[0]
 		}
 
 		spicepodPath := path.Join(spicepodDir, "spicepod.yaml")
@@ -70,25 +50,13 @@ spice init my_app
 			}
 		}
 
-		skeletonPod := &api.Spicepod{
-			Name:    spicepodName,
-			Version: "v1beta1",
-			Kind:    "Spicepod",
-		}
-
-		skeletonPodContentBytes, err := yaml.Marshal(skeletonPod)
+		spicepodPath, err := spicepod.CreateManifest(spicepodName, spicepodDir)
 		if err != nil {
-			cmd.Println(err)
+			cmd.PrintErrf("Error creating spicepod.yaml: %s\n", err.Error())
 			return
 		}
 
-		err = os.WriteFile(spicepodPath, skeletonPodContentBytes, 0766)
-		if err != nil {
-			cmd.Println(err)
-			return
-		}
-
-		cmd.Println(aurora.BrightGreen("spicepod.yaml initialized!"))
+		cmd.Println(aurora.BrightGreen(fmt.Sprintf("%s initialized!", spicepodPath)))
 	},
 }
 
