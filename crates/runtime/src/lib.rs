@@ -169,7 +169,7 @@ impl Runtime {
                             metrics::counter!("datasets_load_error").increment(1);
                             warn_spaced!(
                                 spaced_tracer,
-                                "Unable to get data connector from source for dataset {}, retrying: {err}",
+                                "Failed to get data connector from source for dataset {}, retrying: {err}",
                                 &ds.name
                             );
                             sleep(Duration::from_secs(1)).await;
@@ -199,7 +199,7 @@ impl Runtime {
                         metrics::counter!("datasets_load_error").increment(1);
                         warn_spaced!(
                             spaced_tracer,
-                            "Unable to initialize data connector for dataset {}, retrying: {err}",
+                            "Failed to initialize data connector for dataset {}, retrying: {err}",
                             &ds.name
                         );
                         sleep(Duration::from_secs(1)).await;
@@ -563,7 +563,7 @@ async fn shutdown_signal() {
     let ctrl_c = async {
         let signal_result = signal::ctrl_c().await;
         if let Err(err) = signal_result {
-            tracing::error!("Unable to listen to shutdown signal: {err}");
+            tracing::error!("Failed to listen to shutdown signal: {err}");
         }
     };
 

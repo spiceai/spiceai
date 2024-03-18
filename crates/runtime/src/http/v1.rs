@@ -659,9 +659,9 @@ pub(crate) mod inference {
                         };
                     }
                     tracing::error!(
-                        "Unable to cast inference result for model {model_name} to Float32Array"
+                        "Failed to cast inference result for model {model_name} to Float32Array"
                     );
-                    tracing::debug!("Unable to cast inference result for model {model_name} to Float32Array: {column_data:?}");
+                    tracing::debug!("Failed to cast inference result for model {model_name} to Float32Array: {column_data:?}");
                     return PredictResponse {
                         status: PredictStatus::InternalError,
                         error_message: Some(

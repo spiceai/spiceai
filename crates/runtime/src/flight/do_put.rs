@@ -60,7 +60,7 @@ pub(crate) async fn handle(
     let data_publishers = Arc::clone(&publishers.1);
 
     let schema = try_schema_from_flatbuffer_bytes(&message.data_header)
-        .map_err(|e| Status::internal(format!("Unable to get schema from data header: {e}")))?;
+        .map_err(|e| Status::internal(format!("Failed to get schema from data header: {e}")))?;
     let schema = Arc::new(schema);
     let dictionaries_by_id = Arc::new(HashMap::new());
 
@@ -96,7 +96,7 @@ pub(crate) async fn handle(
                     ) {
                         Ok(batches) => batches,
                         Err(e) => {
-                            tracing::error!("Unable to convert flight data to batches: {e}");
+                            tracing::error!("Failed to convert flight data to batches: {e}");
                             return None;
                         }
                     };
@@ -116,7 +116,7 @@ pub(crate) async fn handle(
                         if let Err(err) = publisher
                             .add_data(Arc::clone(&dataset), data_update.clone())
                             .await
-                            .map_err(|e| Status::internal(format!("Unable to add data: {e}")))
+                            .map_err(|e| Status::internal(format!("Failed to add data: {e}")))
                         {
                             return Some((Err(err), flight));
                         };
