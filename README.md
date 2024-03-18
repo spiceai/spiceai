@@ -43,7 +43,7 @@ Currently supported data connectors for upstream datasets. More coming soon.
 | `postgres`   | PostgreSQL  | Alpha        |                  | `full`           |
 | `spiceai`    | Spice.ai    | Alpha        | Arrow Flight     | `append`, `full` |
 | `s3`         | S3          | Alpha        | Parquet          | `full`           |
-| `dremio`     | Dremio      | Coming soon! | Arrow Flight SQL | `full`           |
+| `dremio`     | Dremio      | Alpha        | Arrow Flight SQL | `full`           |
 | `snowflake`  | Snowflake   | Coming soon! | Arrow Flight SQL | `full`           |
 | `bigquery`   | BigQuery    | Coming soon! | Arrow Flight SQL | `full`           |
 | `mysql`      | MYSQL       | Coming soon! |                  | `full`           |
