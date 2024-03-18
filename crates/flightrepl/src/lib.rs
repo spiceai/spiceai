@@ -181,5 +181,5 @@ fn display_grpc_error(err: &Status) {
         Code::Unavailable => "The query could not be completed because the server is unavailable.",
     };
 
-    println!("{} {user_err_msg}", Colour::Red.paint("ERROR"));
+    println!("{} {user_err_msg}", Colour::Red.paint("Query Error"));
 }
