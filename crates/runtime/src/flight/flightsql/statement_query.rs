@@ -43,6 +43,7 @@ pub(crate) async fn do_get(
     cmd: sql::CommandStatementQuery,
 ) -> Result<Response<<Service as FlightService>::DoGetStream>, Status> {
     let datafusion = Arc::clone(&flight_svc.datafusion);
+    tracing::trace!("do_get_statement: {cmd:?}");
     let output = Service::sql_to_flight_stream(datafusion, cmd.query).await?;
     Ok(Response::new(
         Box::pin(output) as <Service as FlightService>::DoGetStream

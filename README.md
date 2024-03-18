@@ -48,10 +48,14 @@ curl https://install.spiceai.org | /bin/bash
 **Step 2.** Initialize a new Spice app with the `spice init` command:
 
 ```bash
-spice init spice_app
+spice init spice_qs
 ```
 
-A `Spicepod.yaml` file is created in the working directory.
+A `Spicepod.yaml` file is created in the `spice_qs` directory. Change to that directory:
+
+```bash
+cd spice_qs
+```
 
 **Step 3.** Connect to the sample Dremio instance to access the sample data:
 
@@ -178,19 +182,22 @@ After creating an account, you will need to create an app in order to create to 
 
 You will now be able to access datasets from Spice.ai. For this demonstration, we will be using the Spice.ai/eth.recent_blocks dataset.
 
-**Step 1.** In a new directory, log in and authenticate from the command line using the `spice login` command. A pop up browser window will prompt you to authenticate:
+**Step 1.** Log in and authenticate from the command line using the `spice login` command. A pop up browser window will prompt you to authenticate:
 
 ```bash
 spice login
 ```
 
-**Step 2.** Initialize a new project if you haven't already done so. Then, start the runtime:
+**Step 2.** Initialize a new project and start the runtime:
 
 ```bash
-spice init my_spiceai_project
-```
+# Initialize a new Spice app
+spice init spice_app
 
-```bash
+# Change to app directory
+cd spice_app
+
+# Start the runtime
 spice run
 ```
 
