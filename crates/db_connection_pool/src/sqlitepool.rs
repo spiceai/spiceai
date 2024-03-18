@@ -42,8 +42,7 @@ impl SqliteConnectionPool {
             .as_ref()
             .as_ref()
             .and_then(|params| params.get("sqlite_file").cloned())
-            .unwrap_or(name.to_string());
-        let file_name = format!("{file_name}_sqlite.db");
+            .unwrap_or(format!("{name}_sqlite.db"));
 
         let conn = match mode {
             Mode::Memory => Connection::open_in_memory()
