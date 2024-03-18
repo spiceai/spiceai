@@ -179,7 +179,7 @@ impl Drop for MemTableUpdate {
             TableReference::bare(MemTableUpdate::temp_table_name(self.name.as_str()));
         let deregister_result = self.ctx.deregister_table(temp_table_name);
         if let Err(e) = deregister_result {
-            tracing::error!("Error dropping temp table: {e:?}");
+            tracing::error!("Error dropping temp table: {e}");
         }
     }
 }

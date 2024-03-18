@@ -211,7 +211,7 @@ impl DataFusion {
                     Some(data_update) => {
                         match publisher.add_data(Arc::clone(&dataset), data_update).await {
                             Ok(()) => (),
-                            Err(e) => tracing::error!("Error adding data: {e:?}"),
+                            Err(e) => tracing::error!("Error adding data: {e}"),
                         }
                     }
                     None => break,
@@ -339,7 +339,7 @@ impl DataFusion {
             let plan = match ctx.state().statement_to_plan(statements[0].clone()).await {
                 Ok(plan) => plan,
                 Err(e) => {
-                    tracing::error!("Unable to create view: {e:?}");
+                    tracing::error!("Failed to create view: {e}");
                     return;
                 }
             };
@@ -347,12 +347,12 @@ impl DataFusion {
             let view = match ViewTable::try_new(plan, Some(sql.to_string())) {
                 Ok(view) => view,
                 Err(e) => {
-                    tracing::error!("Unable to create view: {e:?}");
+                    tracing::error!("Failed to create view: {e}");
                     return;
                 }
             };
             if let Err(e) = ctx.register_table(table_name.as_str(), Arc::new(view)) {
-                tracing::error!("Unable to create view: {e:?}");
+                tracing::error!("Failed to create view: {e}");
             };
 
             tracing::info!("Created view {table_name}");

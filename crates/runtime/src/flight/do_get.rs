@@ -60,6 +60,6 @@ async fn do_get_simple(
                 Box::pin(timed_output) as <Service as FlightService>::DoGetStream
             ))
         }
-        Err(e) => Err(Status::invalid_argument(format!("Invalid ticket: {e:?}"))),
+        Err(e) => Err(Status::invalid_argument(format!("Invalid ticket: {e}"))),
     }
 }

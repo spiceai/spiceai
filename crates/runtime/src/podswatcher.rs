@@ -62,7 +62,7 @@ impl PodsWatcher {
                             ),
                         }
                     }
-                    Err(e) => tracing::error!("Pods content watcher error: {:?}", e),
+                    Err(e) => tracing::error!("Pods content watcher error: {e}"),
                 }
             },
         )?;

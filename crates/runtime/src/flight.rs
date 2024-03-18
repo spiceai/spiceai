@@ -223,9 +223,9 @@ fn record_batches_to_flight_stream(
 #[allow(clippy::needless_pass_by_value)]
 fn to_tonic_err<E>(e: E) -> Status
 where
-    E: std::fmt::Debug,
+    E: std::fmt::Display,
 {
-    Status::internal(format!("{e:?}"))
+    Status::internal(format!("{e}"))
 }
 
 #[allow(clippy::needless_pass_by_value)]
