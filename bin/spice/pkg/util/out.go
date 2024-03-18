@@ -1,8 +1,10 @@
 package util
 
 import (
+	"fmt"
 	"os"
 	"reflect"
+	"strings"
 
 	"github.com/olekukonko/tablewriter"
 )
@@ -16,7 +18,7 @@ func WriteTable(items []interface{}) {
 
 	headers := make([]string, t.NumField())
 	for i := 0; i < t.NumField(); i++ {
-		headers[i] = t.Field(i).Name
+		headers[i] = strings.TrimSuffix(t.Field(i).Name, "Enabled")
 	}
 
 	table := tablewriter.NewWriter(os.Stdout)
@@ -36,7 +38,7 @@ func WriteTable(items []interface{}) {
 		v := reflect.ValueOf(item)
 		row := make([]string, v.NumField())
 		for i := 0; i < v.NumField(); i++ {
-			row[i] = v.Field(i).String()
+			row[i] = fmt.Sprintf("%v", v.Field(i))
 		}
 		table.Append(row)
 	}

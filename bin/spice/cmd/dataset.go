@@ -11,6 +11,7 @@ import (
 	"github.com/logrusorgru/aurora"
 	"github.com/spf13/cobra"
 	"github.com/spiceai/spiceai/bin/spice/pkg/api"
+	"github.com/spiceai/spiceai/bin/spice/pkg/spec"
 	"gopkg.in/yaml.v2"
 )
 
@@ -71,7 +72,7 @@ spice dataset configure
 
 		params := map[string]string{}
 		datasetPrefix := strings.Split(from, ":")[0]
-		if datasetPrefix == api.DATA_SOURCE_DREMIO || datasetPrefix == api.DATA_SOURCE_DATABRICKS {
+		if datasetPrefix == spec.DATA_SOURCE_DREMIO || datasetPrefix == spec.DATA_SOURCE_DATABRICKS {
 			cmd.Print("endpoint: ")
 			endpoint, err := reader.ReadString('\n')
 			if err != nil {
@@ -92,7 +93,7 @@ spice dataset configure
 		locallyAccelerateStr = strings.TrimSuffix(locallyAccelerateStr, "\n")
 		accelerateDataset := locallyAccelerateStr == "" || strings.ToLower(locallyAccelerateStr) == "y"
 
-		dataset := api.Dataset{
+		dataset := spec.DatasetSpec{
 			From:        from,
 			Name:        datasetName,
 			Description: description,
@@ -100,10 +101,10 @@ spice dataset configure
 		}
 
 		if accelerateDataset {
-			dataset.Acceleration = &api.Acceleration{
+			dataset.Acceleration = &spec.AccelerationSpec{
 				Enabled:         accelerateDataset,
 				RefreshInterval: time.Second * 10,
-				RefreshMode:     api.REFRESH_MODE_FULL,
+				RefreshMode:     spec.REFRESH_MODE_FULL,
 			}
 		}
 
