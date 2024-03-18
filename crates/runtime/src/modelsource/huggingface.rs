@@ -1,7 +1,7 @@
 use super::ModelSource;
-use crate::auth::AuthProvider;
 use async_trait::async_trait;
 use regex::Regex;
+use secrets::Secret;
 use snafu::prelude::*;
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -13,7 +13,7 @@ pub struct Huggingface {}
 impl ModelSource for Huggingface {
     async fn pull(
         &self,
-        _: AuthProvider,
+        _: Secret,
         params: Arc<Option<HashMap<String, String>>>,
     ) -> super::Result<String> {
         let name = params
@@ -86,6 +86,7 @@ impl ModelSource for Huggingface {
 
         // replace lfs reference with file downloaded from huggingface api
         let p = versioned_path.clone();
+
         for file in files {
             let file_name = format!("{p}/{file}");
 
@@ -103,6 +104,8 @@ impl ModelSource for Huggingface {
                 revision,
                 file,
             );
+
+            println!("Downloading {download_url}...");
 
             if file.ends_with(".onnx") {
                 onnx_file_name = file_name.clone();
