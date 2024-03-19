@@ -149,7 +149,7 @@ jobs:
         with:
           name: build_${{ matrix.target_os }}_${{ matrix.target_arch }}
 
-  test_qyuckstart_dremio:
+  test_quickstart_dremio:
     name: "E2E Test: Dremio quickstart, using ${{ matrix.target_os }}-${{ matrix.target_arch }}"
     runs-on: ${{ matrix.runner }}
     needs: build
