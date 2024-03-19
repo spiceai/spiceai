@@ -35,7 +35,7 @@ impl Flight {
             let mut flight_record_batch_stream = match flight_record_batch_stream_result {
                 Ok(stream) => stream,
                 Err(error) => {
-                    tracing::error!("Failed to query with flight client: {:?}", error);
+                    tracing::error!("Failed to query with flight client: {error}",);
                     return vec![];
                 }
             };
@@ -47,7 +47,7 @@ impl Flight {
                         result_data.push(batch);
                     }
                     Err(error) => {
-                        tracing::error!("Failed to read batch from flight client: {:?}", error);
+                        tracing::error!("Failed to read batch from flight client: {error}",);
                         return result_data;
                     }
                 };

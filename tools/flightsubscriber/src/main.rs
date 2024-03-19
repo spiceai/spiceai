@@ -61,7 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             },
             Some(Err(e)) => {
-                tracing::error!("Error receiving message: {e:?}");
+                tracing::error!("Error receiving message: {e}");
             }
             None => {
                 tracing::info!("No more messages.");
