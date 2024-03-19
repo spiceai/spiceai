@@ -186,21 +186,21 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
 }
 
 fn display_grpc_error(err: &Status) {
-    let user_err_msg = match err.code() {
+    let (error_type, user_err_msg) = match err.code() {
         Code::Ok => return,
-        Code::Unknown | Code::Internal | Code::Unauthenticated | Code::DataLoss | Code::FailedPrecondition =>
-            "An internal error occurred while processing the query. Show technical details with '.error'"
+        Code::Unknown | Code::Internal | Code::Unauthenticated | Code::DataLoss | Code::OutOfRange | Code::FailedPrecondition =>
+            ("Error", "An internal error occurred while processing the query. Show technical details with '.error'")
         ,
+        Code::InvalidArgument | Code::AlreadyExists | Code::NotFound => ("Query Error", err.message()),
+        Code::Cancelled => ("Error", "The query was cancelled before it could complete."),
+        Code::Aborted => ("Error", "The query was aborted before it could complete."),
+        Code::DeadlineExceeded => ("Error", "The query could not be completed because the deadline for the query was exceeded."),
+        Code::PermissionDenied => ("Error", "The query could not be completed because the user does not have permission to access the requested data."),
+        Code::ResourceExhausted => ("Error", "The query could not be completed because the server has run out of resources."),
+        Code::Unimplemented => ("Error", "The query could not be completed because the server does not support the requested operation."),
+        Code::Unavailable => ("Error", "The query could not be completed because the server is unavailable."),
         Code::OutOfRange => "The query could not be completed because the query result exceeds the configured maximum size. Retry with `limit` clause.",
-        Code::InvalidArgument | Code::AlreadyExists | Code::NotFound => err.message(),
-        Code::Cancelled => "The query was cancelled before it could complete.",
-        Code::Aborted => "The query was aborted before it could complete.",
-        Code::DeadlineExceeded => "The query could not be completed because the deadline for the query was exceeded.",
-        Code::PermissionDenied => "The query could not be completed because the user does not have permission to access the requested data.",
-        Code::ResourceExhausted => "The query could not be completed because the server has run out of resources.",
-        Code::Unimplemented => "The query could not be completed because the server does not support the requested operation.",
-        Code::Unavailable => "The query could not be completed because the server is unavailable.",
     };
 
-    println!("{} {user_err_msg}", Colour::Red.paint("Query Error"));
+    println!("{} {user_err_msg}", Colour::Red.paint(error_type));
 }

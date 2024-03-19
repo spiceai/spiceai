@@ -10,7 +10,6 @@ import (
 
 	"github.com/logrusorgru/aurora"
 	"github.com/spf13/cobra"
-	"github.com/spiceai/spiceai/bin/spice/pkg/api"
 	"github.com/spiceai/spiceai/bin/spice/pkg/spec"
 	"gopkg.in/yaml.v2"
 )
@@ -134,7 +133,7 @@ spice dataset configure
 			os.Exit(1)
 		}
 
-		var spicePod api.Spicepod
+		var spicePod spec.SpicepodSpec
 		err = yaml.Unmarshal(spicepodBytes, &spicePod)
 		if err != nil {
 			cmd.Println(err)
@@ -150,7 +149,7 @@ spice dataset configure
 		}
 
 		if !datasetReferenced {
-			spicePod.Datasets = append(spicePod.Datasets, &api.Reference{
+			spicePod.Datasets = append(spicePod.Datasets, &spec.Reference{
 				Ref: dirPath,
 			})
 			spicepodBytes, err = yaml.Marshal(spicePod)
