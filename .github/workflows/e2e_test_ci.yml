@@ -189,7 +189,7 @@ jobs:
         run: |
           chmod +x ./build/spice
           chmod +x ./build/spiced
-          echo "$HOME/build" >> $GITHUB_PATH
+          echo "${{ github.workspace }}/build" >> $GITHUB_PATH
           echo "$HOME"
           echo "$GITHUB_PATH"
 
