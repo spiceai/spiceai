@@ -9,7 +9,7 @@ import (
 	"github.com/olekukonko/tablewriter"
 )
 
-func WriteTable(items []interface{}) {
+func WriteTable(items []interface{}, mergecell_cols ...int) {
 	if len(items) == 0 {
 		return
 	}
@@ -33,6 +33,7 @@ func WriteTable(items []interface{}) {
 	table.SetHeaderLine(false)
 	table.SetTablePadding(" ")
 	table.SetNoWhiteSpace(true)
+	table.SetAutoMergeCellsByColumnIndex(mergecell_cols)
 
 	for _, item := range items {
 		v := reflect.ValueOf(item)
