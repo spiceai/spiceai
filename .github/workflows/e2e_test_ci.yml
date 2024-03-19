@@ -134,14 +134,14 @@ jobs:
         uses: actions/upload-artifact@v4
         if: matrix.target_os != 'windows'
         with:
-          name: spice
+          name: spice_${{ matrix.target_os }}_${{ matrix.target_arch }}
           path: spice
 
       - name: Save spiced artifact
         uses: actions/upload-artifact@v4
         if: matrix.target_os != 'windows'
         with:
-          name: spiced
+          name: spiced_${{ matrix.target_os }}_${{ matrix.target_arch }}
           path: spiced
 
       - name: Merge spice and spiced in single artifact
