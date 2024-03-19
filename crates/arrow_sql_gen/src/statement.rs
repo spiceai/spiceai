@@ -218,6 +218,7 @@ impl InsertBuilder {
                                         }
                                     }
                                     let expr: SimpleExpr = list_values.into();
+                                    // We must cast here in case the array is empty which SeaQuery does not handle.
                                     row_values.push(expr.cast_as(Alias::new("int2[]")));
                                 }
                                 DataType::Int16 => {
@@ -230,6 +231,7 @@ impl InsertBuilder {
                                         }
                                     }
                                     let expr: SimpleExpr = list_values.into();
+                                    // We must cast here in case the array is empty which SeaQuery does not handle.
                                     row_values.push(expr.cast_as(Alias::new("int2[]")));
                                 }
                                 DataType::Int32 => {
@@ -242,6 +244,7 @@ impl InsertBuilder {
                                         }
                                     }
                                     let expr: SimpleExpr = list_values.into();
+                                    // We must cast here in case the array is empty which SeaQuery does not handle.
                                     row_values.push(expr.cast_as(Alias::new("int4[]")));
                                 }
                                 DataType::Int64 => {
@@ -254,58 +257,8 @@ impl InsertBuilder {
                                         }
                                     }
                                     let expr: SimpleExpr = list_values.into();
+                                    // We must cast here in case the array is empty which SeaQuery does not handle.
                                     row_values.push(expr.cast_as(Alias::new("int8[]")));
-                                }
-                                DataType::UInt8 => {
-                                    let mut list_values: Vec<u8> = vec![];
-                                    for i in 0..list_array.len() {
-                                        let int_array =
-                                            list_array.as_any().downcast_ref::<array::UInt8Array>();
-                                        if let Some(valid_int_array) = int_array {
-                                            list_values.push(valid_int_array.value(i));
-                                        }
-                                    }
-                                    let expr: SimpleExpr = list_values.into();
-                                    row_values.push(expr.cast_as(Alias::new("uint2[]")));
-                                }
-                                DataType::UInt16 => {
-                                    let mut list_values: Vec<u16> = vec![];
-                                    for i in 0..list_array.len() {
-                                        let int_array = list_array
-                                            .as_any()
-                                            .downcast_ref::<array::UInt16Array>();
-                                        if let Some(valid_int_array) = int_array {
-                                            list_values.push(valid_int_array.value(i));
-                                        }
-                                    }
-                                    let expr: SimpleExpr = list_values.into();
-                                    row_values.push(expr.cast_as(Alias::new("uint2[]")));
-                                }
-                                DataType::UInt32 => {
-                                    let mut list_values: Vec<u32> = vec![];
-                                    for i in 0..list_array.len() {
-                                        let int_array = list_array
-                                            .as_any()
-                                            .downcast_ref::<array::UInt32Array>();
-                                        if let Some(valid_int_array) = int_array {
-                                            list_values.push(valid_int_array.value(i));
-                                        }
-                                    }
-                                    let expr: SimpleExpr = list_values.into();
-                                    row_values.push(expr.cast_as(Alias::new("uint4[]")));
-                                }
-                                DataType::UInt64 => {
-                                    let mut list_values: Vec<u64> = vec![];
-                                    for i in 0..list_array.len() {
-                                        let int_array = list_array
-                                            .as_any()
-                                            .downcast_ref::<array::UInt64Array>();
-                                        if let Some(valid_int_array) = int_array {
-                                            list_values.push(valid_int_array.value(i));
-                                        }
-                                    }
-                                    let expr: SimpleExpr = list_values.into();
-                                    row_values.push(expr.cast_as(Alias::new("uint8[]")));
                                 }
                                 DataType::Float32 => {
                                     let mut list_values: Vec<f32> = vec![];
@@ -318,6 +271,7 @@ impl InsertBuilder {
                                         }
                                     }
                                     let expr: SimpleExpr = list_values.into();
+                                    // We must cast here in case the array is empty which SeaQuery does not handle.
                                     row_values.push(expr.cast_as(Alias::new("float4[]")));
                                 }
                                 DataType::Float64 => {
@@ -331,6 +285,7 @@ impl InsertBuilder {
                                         }
                                     }
                                     let expr: SimpleExpr = list_values.into();
+                                    // We must cast here in case the array is empty which SeaQuery does not handle.
                                     row_values.push(expr.cast_as(Alias::new("float8[]")));
                                 }
                                 DataType::Utf8 => {
@@ -344,6 +299,7 @@ impl InsertBuilder {
                                         }
                                     }
                                     let expr: SimpleExpr = list_values.into();
+                                    // We must cast here in case the array is empty which SeaQuery does not handle.
                                     row_values.push(expr.cast_as(Alias::new("text[]")));
                                 }
                                 DataType::Boolean => {
@@ -357,6 +313,7 @@ impl InsertBuilder {
                                         }
                                     }
                                     let expr: SimpleExpr = list_values.into();
+                                    // We must cast here in case the array is empty which SeaQuery does not handle.
                                     row_values.push(expr.cast_as(Alias::new("boolean[]")));
                                 }
                                 _ => unimplemented!(
