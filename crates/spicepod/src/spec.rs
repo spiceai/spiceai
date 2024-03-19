@@ -1,14 +1,21 @@
 use serde::{Deserialize, Serialize};
 use serde_yaml::{self, Value};
+use std::fmt::{self, Display, Formatter};
 use std::{collections::HashMap, fmt::Debug};
 
 use crate::component::secrets::Secrets;
 use crate::component::{dataset::Dataset, model::Model, ComponentOrReference};
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SpicepodVersion {
     V1Beta1,
+}
+
+impl Display for SpicepodVersion {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        write!(f, "{self:?}")
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]

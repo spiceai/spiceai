@@ -419,6 +419,8 @@ pub(crate) mod spicepods {
     pub(crate) struct SpicepodCsvRow {
         pub name: String,
 
+        pub version: String,
+
         #[serde(default)]
         pub datasets_count: usize,
 
@@ -450,6 +452,7 @@ pub(crate) mod spicepods {
                     .spicepods
                     .iter()
                     .map(|spod| SpicepodCsvRow {
+                        version: spod.version.to_string(),
                         name: spod.name.clone(),
                         models_count: spod.models.len(),
                         datasets_count: spod.datasets.len(),
