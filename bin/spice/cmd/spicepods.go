@@ -9,7 +9,6 @@ import (
 	"github.com/spiceai/spiceai/bin/spice/pkg/util"
 )
 
-// pub dependencies: Vec<String>,
 
 type SpiceSecretStore string
 

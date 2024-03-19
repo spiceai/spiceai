@@ -420,13 +420,13 @@ pub(crate) mod spicepods {
         pub name: String,
 
         #[serde(default)]
-        pub number_of_datasets: usize,
+        pub datasets_count: usize,
 
         #[serde(default)]
-        pub number_of_models: usize,
+        pub models_count: usize,
 
         #[serde(default)]
-        pub number_of_dependencies: usize,
+        pub dependencies_count: usize,
     }
 
     pub(crate) async fn get(
@@ -451,9 +451,9 @@ pub(crate) mod spicepods {
                     .iter()
                     .map(|spod| SpicepodCsvRow {
                         name: spod.name.clone(),
-                        number_of_models: spod.models.len(),
-                        number_of_datasets: spod.datasets.len(),
-                        number_of_dependencies: spod.dependencies.len(),
+                        models_count: spod.models.len(),
+                        datasets_count: spod.datasets.len(),
+                        dependencies_count: spod.dependencies.len(),
                     })
                     .collect_vec();
                 match convert_entry_to_csv(&resp) {
