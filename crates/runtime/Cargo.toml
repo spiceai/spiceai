@@ -19,7 +19,7 @@ clap.workspace = true
 metrics.workspace = true
 datafusion.workspace = true
 arrow.workspace = true
-arrow-flight.workspace = true
+arrow-flight = { workspace = true, features = ["flight-sql-experimental"] }
 arrow-ipc = "50.0.0"
 tonic.workspace = true
 tonic_0_9_0 = { version = "0.9.0", package = "tonic", features = ["gzip"] }
@@ -59,6 +59,7 @@ reqwest = { version = "0.11.24", features = ["json"] }
 notify = "6.1.1"
 arrow-json = "50.0.0"
 async-trait.workspace = true
+flightsql_datafusion = { path = "../flightsql_datafusion" }
 flight_datafusion = { path = "../flight_datafusion" }
 deltalake = { version = "0.17.0", features = ["datafusion-ext", "s3", "azure"] }
 itertools = "0.12"

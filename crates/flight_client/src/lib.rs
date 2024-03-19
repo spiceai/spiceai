@@ -19,7 +19,7 @@ use tonic::transport::Channel;
 use tonic::IntoRequest;
 use tonic::IntoStreamingRequest;
 
-mod tls;
+pub mod tls;
 
 #[derive(Debug, Snafu)]
 pub enum Error {

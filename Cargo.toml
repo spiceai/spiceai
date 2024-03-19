@@ -5,6 +5,7 @@ members = [
     "crates/spicepod",
     "crates/app",
     "crates/flight_datafusion",
+    "crates/flightsql_datafusion",
     "crates/arrow_sql_gen",
     "crates/sql_provider_datafusion",
     "crates/flightrepl",
