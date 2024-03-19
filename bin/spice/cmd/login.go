@@ -37,6 +37,22 @@ spice login
 # See more at: https://docs.spiceai.org/
 `,
 	Run: func(cmd *cobra.Command, args []string) {
+
+		apiKey, errApiKeyValue := cmd.Flags().GetString(apiKeyFlag)
+		token, errTokenValue := cmd.Flags().GetString(token)
+
+		if (errApiKeyValue == nil && apiKey != "") && (errTokenValue == nil && token != "") {
+			mergeAuthConfig(cmd, api.AUTH_TYPE_SPICE_AI, &api.Auth{
+				Params: map[string]string{
+					api.AUTH_PARAM_TOKEN: token,
+					api.AUTH_PARAM_KEY:   apiKey,
+				},
+			})
+
+			cmd.Println(aurora.BrightGreen("Successfully added login information for Spice.ai"))
+			return
+		}
+
 		authCode := generateAuthCode()
 
 		cmd.Println("Opening browser to authenticate with Spice.ai")
@@ -311,6 +327,7 @@ func init() {
 
 	loginCmd.Flags().BoolP("help", "h", false, "Print this help message")
 	loginCmd.Flags().StringP(apiKeyFlag, "k", "", "API key")
+	loginCmd.Flags().StringP(token, "p", "", "Access Token")
 	RootCmd.AddCommand(loginCmd)
 }
 
