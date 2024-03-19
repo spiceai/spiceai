@@ -583,7 +583,7 @@ static INSTANCE: Lazy<SqlInfoData> = Lazy::new(|| {
 
     match builder.build() {
         Ok(data) => data,
-        Err(e) => panic!("Error building SqlInfoData: {e:?}"),
+        Err(e) => panic!("Error building SqlInfoData: {e}"),
     }
 });
 

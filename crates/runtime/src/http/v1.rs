@@ -100,6 +100,8 @@ pub(crate) mod status {
     use flight_client::FlightClient;
     use serde::{Deserialize, Serialize};
     use std::{net::SocketAddr, sync::Arc};
+    use tonic_0_9_0::transport::Channel;
+    use tonic_health::{pb::health_client::HealthClient, ServingStatus};
 
     use axum::{
         extract::Query,
@@ -177,6 +179,25 @@ pub(crate) mod status {
                     None => Status::Disabled,
                 },
             },
+            ConnectionDetails {
+                name: "opentelemetry",
+                status: match get_opentelemetry_status(
+                    cfg.open_telemetry_bind_address.to_string().as_str(),
+                )
+                .await
+                {
+                    Ok(status) => status,
+                    Err(e) => {
+                        tracing::error!(
+                            "Error getting opentelemetry status from {}: {}",
+                            cfg.open_telemetry_bind_address,
+                            e
+                        );
+                        Status::Error
+                    }
+                },
+                endpoint: cfg.open_telemetry_bind_address.to_string(),
+            },
         ];
 
         match params.format {
@@ -203,7 +224,7 @@ pub(crate) mod status {
     }
 
     async fn get_flight_status(flight_addr: &str) -> Status {
-        tracing::warn!("Checking flight status at {flight_addr}");
+        tracing::trace!("Checking flight status at {flight_addr}");
         match FlightClient::new(&format!("http://{flight_addr}"), "", "").await {
             Ok(_) => Status::Ready,
             Err(e) => {
@@ -216,6 +237,25 @@ pub(crate) mod status {
     async fn get_metrics_status(metrics_addr: &str) -> Result<Status, Box<dyn std::error::Error>> {
         let resp = reqwest::get(format!("http://{metrics_addr}/health")).await?;
         if resp.status().is_success() && resp.text().await? == "OK" {
+            Ok(Status::Ready)
+        } else {
+            Ok(Status::Error)
+        }
+    }
+    async fn get_opentelemetry_status(addr: &str) -> Result<Status, Box<dyn std::error::Error>> {
+        let channel = Channel::from_shared(format!("http://{addr}"))?
+            .connect()
+            .await?;
+
+        let mut client = HealthClient::new(channel);
+
+        let resp = client
+            .check(tonic_health::pb::HealthCheckRequest {
+                service: String::new(),
+            })
+            .await?;
+
+        if resp.into_inner().status == ServingStatus::Serving as i32 {
             Ok(Status::Ready)
         } else {
             Ok(Status::Error)
@@ -619,8 +659,9 @@ pub(crate) mod inference {
                         };
                     }
                     tracing::error!(
-                        "Unable to cast inference result for model {model_name} to Float32Array: {column_data:?}"
+                        "Failed to cast inference result for model {model_name} to Float32Array"
                     );
+                    tracing::debug!("Failed to cast inference result for model {model_name} to Float32Array: {column_data:?}");
                     return PredictResponse {
                         status: PredictStatus::InternalError,
                         error_message: Some(

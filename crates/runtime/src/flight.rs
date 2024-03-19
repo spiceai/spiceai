@@ -8,7 +8,9 @@ use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::{Action, ActionType, Criteria, IpcMessage, SchemaResult};
 use arrow_ipc::writer::IpcWriteOptions;
 use bytes::Bytes;
+use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
+use datafusion::sql::sqlparser::parser::ParserError;
 use futures::stream::{self, BoxStream, StreamExt};
 use futures::{Stream, TryStreamExt};
 use snafu::prelude::*;
@@ -158,7 +160,7 @@ impl Service {
             .ctx
             .sql(&sql)
             .await
-            .map_err(to_tonic_err)?;
+            .map_err(handle_datafusion_error)?;
         let schema = df.schema().clone().into();
         let options = datafusion::arrow::ipc::writer::IpcWriteOptions::default();
         let schema_as_ipc = SchemaAsIpc::new(&schema, &options);
@@ -215,9 +217,30 @@ fn record_batches_to_flight_stream(
 #[allow(clippy::needless_pass_by_value)]
 fn to_tonic_err<E>(e: E) -> Status
 where
-    E: std::fmt::Debug,
+    E: std::fmt::Display,
 {
-    Status::internal(format!("{e:?}"))
+    Status::internal(format!("{e}"))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn handle_datafusion_error(e: DataFusionError) -> Status {
+    match e {
+        DataFusionError::Plan(err_msg) | DataFusionError::Execution(err_msg) => {
+            Status::invalid_argument(err_msg)
+        }
+        DataFusionError::SQL(sql_err, _) => match sql_err {
+            ParserError::RecursionLimitExceeded => {
+                Status::invalid_argument("Recursion limit exceeded")
+            }
+            ParserError::ParserError(err_msg) | ParserError::TokenizerError(err_msg) => {
+                Status::invalid_argument(err_msg)
+            }
+        },
+        DataFusionError::SchemaError(schema_err, _) => {
+            Status::invalid_argument(format!("{schema_err}"))
+        }
+        _ => to_tonic_err(e),
+    }
 }
 
 #[derive(Debug, Snafu)]

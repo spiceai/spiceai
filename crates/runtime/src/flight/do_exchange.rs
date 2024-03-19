@@ -27,7 +27,7 @@ pub(crate) async fn handle(
         Ok(subscription_request) => subscription_request,
         Err(e) => {
             return Err(Status::invalid_argument(format!(
-                "Unable to read subscription request: {e:?}",
+                "Unable to read subscription request: {e}",
             )));
         }
     };

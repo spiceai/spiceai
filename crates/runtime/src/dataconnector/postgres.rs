@@ -66,7 +66,7 @@ impl DataConnector for Postgres {
             let conn = match pool.connect().await {
                 Ok(conn) => conn,
                 Err(e) => {
-                    tracing::error!("Failed to connect to Postgres: {:?}", e);
+                    tracing::error!("Failed to connect to Postgres: {e}");
                     return vec![];
                 }
             };
@@ -82,7 +82,7 @@ impl DataConnector for Postgres {
             {
                 Ok(stream) => stream,
                 Err(e) => {
-                    tracing::error!("Failed to query Postgres: {:?}", e);
+                    tracing::error!("Failed to query Postgres: {e}");
                     return vec![];
                 }
             };
@@ -91,7 +91,7 @@ impl DataConnector for Postgres {
                 match record_batch_stream.try_collect::<Vec<RecordBatch>>().await {
                     Ok(recs) => recs,
                     Err(e) => {
-                        tracing::error!("Failed to collect record batches from Postgres: {:?}", e);
+                        tracing::error!("Failed to collect record batches from Postgres: {e}");
                         return vec![];
                     }
                 };

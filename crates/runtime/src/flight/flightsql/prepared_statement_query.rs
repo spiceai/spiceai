@@ -44,7 +44,7 @@ pub(crate) async fn get_flight_info(
         Ok(sql) => sql.to_string(),
         Err(e) => {
             return Err(Status::invalid_argument(format!(
-                "Invalid prepared statement handle: {e:?}"
+                "Invalid prepared statement handle: {e}"
             )))
         }
     };
@@ -87,7 +87,7 @@ pub(crate) async fn do_get(
             ))
         }
         Err(e) => Err(Status::invalid_argument(format!(
-            "Invalid prepared statement handle: {e:?}"
+            "Invalid prepared statement handle: {e}"
         ))),
     }
 }

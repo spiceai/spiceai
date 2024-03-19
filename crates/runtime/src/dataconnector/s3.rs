@@ -138,7 +138,7 @@ impl DataConnector for S3 {
                         return batches;
                     }
                     Err(e) => {
-                        tracing::error!("Failed to collect record batches from S3: {:?}", e);
+                        tracing::error!("Failed to collect record batches from S3: {e}");
                         return vec![];
                     }
                 }
