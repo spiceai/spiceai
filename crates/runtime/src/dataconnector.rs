@@ -24,6 +24,7 @@ pub mod databricks;
 pub mod debug;
 pub mod dremio;
 pub mod flight;
+pub mod flightsql;
 pub mod postgres;
 pub mod s3;
 pub mod spiceai;

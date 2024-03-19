@@ -127,24 +127,18 @@ impl FlightService for Service {
 }
 
 impl Service {
-    async fn get_arrow_schema_and_size_sql(
+    async fn get_arrow_schema(
         datafusion: Arc<RwLock<DataFusion>>,
         sql: String,
-    ) -> Result<(Schema, usize), Status> {
+    ) -> Result<Schema, Status> {
         let df = datafusion
             .read()
             .await
             .ctx
             .sql(&sql)
             .await
-            .map_err(handle_datafusion_error)?;
-
-        let schema = df.schema();
-        let arrow_schema: Schema = schema.into();
-
-        let size = df.count().await.map_err(handle_datafusion_error)?;
-
-        Ok((arrow_schema, size))
+            .map_err(to_tonic_err)?;
+        Ok(df.schema().into())
     }
 
     fn serialize_schema(schema: &Schema) -> Result<Bytes, Status> {

@@ -23,9 +23,10 @@ pub(crate) async fn get_flight_info(
 
     let sql = query.query.as_str();
 
-    let (arrow_schema, num_rows) =
-        Service::get_arrow_schema_and_size_sql(Arc::clone(&flight_svc.datafusion), sql.to_string())
-            .await?;
+    let arrow_schema =
+        Service::get_arrow_schema(Arc::clone(&flight_svc.datafusion), sql.to_string())
+            .await
+            .map_err(to_tonic_err)?;
 
     let fd = request.into_inner();
 
@@ -37,8 +38,7 @@ pub(crate) async fn get_flight_info(
         .with_endpoint(endpoint)
         .try_with_schema(&arrow_schema)
         .map_err(to_tonic_err)?
-        .with_descriptor(fd)
-        .with_total_records(num_rows.try_into().map_err(to_tonic_err)?);
+        .with_descriptor(fd);
 
     Ok(Response::new(info))
 }
