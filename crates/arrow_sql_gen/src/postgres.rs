@@ -1,6 +1,7 @@
 use std::convert;
 use std::sync::Arc;
 
+use crate::arrow::map_data_type_to_array_builder_optional;
 use arrow::array::ArrayBuilder;
 use arrow::array::ArrayRef;
 use arrow::array::RecordBatch;
@@ -82,7 +83,8 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                 }
                 None => arrow_fields.push(None),
             }
-            arrow_columns_builders.push(map_data_type_to_array_builder(data_type.as_ref()));
+            arrow_columns_builders
+                .push(map_data_type_to_array_builder_optional(data_type.as_ref()));
             postgres_types.push(column_type.clone());
             column_names.push(column_name.to_string());
         }
@@ -309,41 +311,6 @@ fn map_column_type_to_data_type(column_type: &Type) -> Option<DataType> {
         // We get a SystemTime that we can always convert into milliseconds
         Type::TIMESTAMP => Some(DataType::Timestamp(TimeUnit::Millisecond, None)),
         _ => unimplemented!("Unsupported column type {:?}", column_type),
-    }
-}
-
-fn map_data_type_to_array_builder(data_type: Option<&DataType>) -> Option<Box<dyn ArrayBuilder>> {
-    match data_type? {
-        DataType::Int16 => Some(Box::new(arrow::array::Int16Builder::new())),
-        DataType::Int32 => Some(Box::new(arrow::array::Int32Builder::new())),
-        DataType::Int64 => Some(Box::new(arrow::array::Int64Builder::new())),
-        DataType::Float32 => Some(Box::new(arrow::array::Float32Builder::new())),
-        DataType::Float64 => Some(Box::new(arrow::array::Float64Builder::new())),
-        DataType::Utf8 => Some(Box::new(arrow::array::StringBuilder::new())),
-        DataType::Boolean => Some(Box::new(arrow::array::BooleanBuilder::new())),
-        DataType::Decimal128(precision, scale) => Some(Box::new(
-            arrow::array::Decimal128Builder::new()
-                .with_precision_and_scale(*precision, *scale)
-                .unwrap_or_default(),
-        )),
-        DataType::Timestamp(time_unit, time_zone) => match time_unit {
-            arrow::datatypes::TimeUnit::Microsecond => Some(Box::new(
-                arrow::array::TimestampMicrosecondBuilder::new()
-                    .with_timezone_opt(time_zone.clone()),
-            )),
-            arrow::datatypes::TimeUnit::Second => Some(Box::new(
-                arrow::array::TimestampSecondBuilder::new().with_timezone_opt(time_zone.clone()),
-            )),
-            arrow::datatypes::TimeUnit::Millisecond => Some(Box::new(
-                arrow::array::TimestampMillisecondBuilder::new()
-                    .with_timezone_opt(time_zone.clone()),
-            )),
-            arrow::datatypes::TimeUnit::Nanosecond => Some(Box::new(
-                arrow::array::TimestampNanosecondBuilder::new()
-                    .with_timezone_opt(time_zone.clone()),
-            )),
-        },
-        _ => unimplemented!("Unsupported data type {:?}", data_type),
     }
 }
 

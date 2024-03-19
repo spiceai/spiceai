@@ -7,6 +7,7 @@ use snafu::prelude::*;
 
 pub mod duckdbconn;
 pub mod postgresconn;
+pub mod sqliteconn;
 
 pub type GenericError = Box<dyn std::error::Error + Send + Sync>;
 type Result<T, E = GenericError> = std::result::Result<T, E>;

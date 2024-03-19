@@ -78,10 +78,13 @@ base64 = "0.22.0"
 keyring = { version = "2.3.2", optional = true }
 db_connection_pool = { path = "../db_connection_pool" }
 secrecy = "0.8.0"
+rusqlite = { workspace = true, optional = true }
+tokio-rusqlite = { workspace = true, optional = true }
 pin-project = "1.0"
 
+
 [features]
-default = ["duckdb", "postgres", "keyring-secret-store"]
+default = ["duckdb", "postgres", "keyring-secret-store", "sqlite"]
 dev = []
 duckdb = ["dep:duckdb", "sql_provider_datafusion", "r2d2"]
 postgres = [
@@ -90,4 +93,5 @@ postgres = [
     "sql_provider_datafusion",
     "arrow_sql_gen",
 ]
+sqlite = ["dep:rusqlite", "tokio-rusqlite"]
 keyring-secret-store = ["secrets/keyring-secret-store"]
