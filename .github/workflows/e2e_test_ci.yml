@@ -29,11 +29,11 @@ jobs:
             target_os: linux
             target_arch: x86_64
             target_arch_go: amd64
-          - name: macOS aarch64 (Apple Silicon)
-            runner: macos-14
-            target_os: darwin
-            target_arch: aarch64
-            target_arch_go: arm64
+          # - name: macOS aarch64 (Apple Silicon)
+          #   runner: macos-14
+          #   target_os: darwin
+          #   target_arch: aarch64
+          #   target_arch_go: arm64
           # - name: macOS x64 (Intel)
           #   runner: rust-osx-x64
           #   target_os: darwin
@@ -162,11 +162,11 @@ jobs:
             target_os: linux
             target_arch: x86_64
             target_arch_go: amd64
-          - name: macOS aarch64 (Apple Silicon)
-            runner: macos-14
-            target_os: darwin
-            target_arch: aarch64
-            target_arch_go: arm64
+          # - name: macOS aarch64 (Apple Silicon)
+          #   runner: macos-14
+          #   target_os: darwin
+          #   target_arch: aarch64
+          #   target_arch_go: arm64
           # - name: macOS x64 (Intel)
           #   runner: rust-osx-x64
           #   target_os: darwin
@@ -177,6 +177,7 @@ jobs:
           #   target_os: windows
           #   target_arch: x86_64
           #   target_arch_go: amd64
+
     steps:
       - name: download artifacts - build_${{ matrix.target_os }}_${{ matrix.target_arch }}
         uses: actions/download-artifact@v4
@@ -184,14 +185,11 @@ jobs:
           name: build_${{ matrix.target_os }}_${{ matrix.target_arch }}
           path: ./build
 
-      - name: Install spice (TEMP)
+      - name: Install spice
         run: |
-          ls -la
-          ls -la ./build
-          # curl https://install.spiceai.org | /bin/bash
-          # echo "$HOME/.spice/bin" >> $GITHUB_PATH
+          chmod +x ./build/spice
+          chmod +x ./build/spiced
           echo "./build" >> $GITHUB_PATH
-        shell: bash
 
       - name: Check spice version
         run: spice version
@@ -221,6 +219,102 @@ jobs:
         run: |
           spice add spiceai/quickstart
           cat spicepod.yaml
+
+      - name: Check datasets
+        working-directory: test_app
+        run: |
+          response=$(curl http://localhost:3000/v1/datasets)
+          length=$(echo $response | jq 'if type=="array" then length else empty end')
+          if [[ $length -ne 1 ]]; then
+            echo "Unexpected response: $response, expected 1 dataset"
+            exit 1
+          fi
+
+      - name: Check tables
+        working-directory: test_app
+        run: |
+          response=$(curl -X POST \
+            -H "Content-Type: text/plain" \
+            -d "show tables;" \
+            http://localhost:3000/v1/sql
+          )
+          tables=$(echo $response | jq 'if type=="array" then length else empty end')
+          if [[ $length -ne 5 ]]; then
+            echo "Unexpected response: $response, expected 5 tables"
+            exit 1
+          fi
+
+  test_quickstart_spiceai:
+    name: "E2E Test: SpiceAI quickstart, using ${{ matrix.target_os }}-${{ matrix.target_arch }}"
+    runs-on: ${{ matrix.runner }}
+    needs: build
+
+    strategy:
+      matrix:
+        include:
+          - name: Linux x64
+            runner: rust
+            target_os: linux
+            target_arch: x86_64
+            target_arch_go: amd64
+          # - name: macOS aarch64 (Apple Silicon)
+          #   runner: macos-14
+          #   target_os: darwin
+          #   target_arch: aarch64
+          #   target_arch_go: arm64
+          # - name: macOS x64 (Intel)
+          #   runner: rust-osx-x64
+          #   target_os: darwin
+          #   target_arch: x86_64
+          #   target_arch_go: amd64
+          # - name: Windows x64
+          #   runner: rust-windows-x64
+          #   target_os: windows
+          #   target_arch: x86_64
+          #   target_arch_go: amd64
+
+    steps:
+      - name: download artifacts - build_${{ matrix.target_os }}_${{ matrix.target_arch }}
+        uses: actions/download-artifact@v4
+        with:
+          name: build_${{ matrix.target_os }}_${{ matrix.target_arch }}
+          path: ./build
+
+      - name: Install spice
+        run: |
+          chmod +x ./build/spice
+          chmod +x ./build/spiced
+          echo "./build" >> $GITHUB_PATH
+
+      - name: Check spice version
+        run: spice version
+
+      - name: Init spice app
+        run: |
+          spice init test_app
+
+      - name: Configure spice app
+        working-directory: test_app
+        run: |
+          # equal to "spice dataset configure"
+          mkdir -p datasets/eth_recent_blocks
+          echo -e "from: spice.ai/eth.recent_blocks\nname: eth_recent_blocks\ndescription: eth recent logs\nacceleration:\n  enabled: true\n  refresh_interval: 10s\n  refresh_mode: full" >> datasets/eth_recent_blocks/dataset.yaml
+
+          # configure env secret store and add dataset
+          echo -e "secrets:\n  store: env\ndatasets:\n- ref: datasets/eth_recent_blocks" >> spicepod.yaml
+
+      - name: Start spice runtime
+        env:
+          SPICE_SECRET_SPICEAI_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_KEY }}
+        working-directory: test_app
+        run: |
+          spice run &
+
+      - name: Wait for Spice runtime healthy
+        working-directory: test_app
+        timeout-minutes: 1
+        run: |
+          while [[ "$(curl -s http://localhost:3000/health)" != "ok" ]]; do sleep 1; done
 
       - name: Check datasets
         working-directory: test_app
