@@ -21,7 +21,7 @@ spice init my_app
 `,
 	Run: func(cmd *cobra.Command, args []string) {
 		var spicepodName string
-		spicepodDir := "."
+		currentDir := "."
 
 		if len(args) < 1 {
 			wd, err := os.Getwd()
@@ -37,9 +37,10 @@ spice init my_app
 				spicepodName = dirName
 			}
 		} else {
-			spicepodDir = args[0]
+			spicepodName = args[0]
 		}
 
+		spicepodDir := path.Join(currentDir, spicepodName)
 		spicepodPath := path.Join(spicepodDir, "spicepod.yaml")
 		if _, err := os.Stat(spicepodPath); !os.IsNotExist(err) {
 			cmd.Println("spicepod.yaml already exists. Replace (y/n)?")
