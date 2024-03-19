@@ -38,7 +38,13 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
     let channel = Channel::from_shared(repl_config.repl_flight_endpoint)?
         .connect()
         .await?;
-    let mut client = FlightServiceClient::new(channel);
+
+    // The encoder/decoder size is limited to be 100MB by default.
+    // This may not be enough for large queries.
+    // In future, paging will be supported to handle the large query output.
+    let mut client = FlightServiceClient::new(channel)
+        .max_decoding_message_size(100 * 1024 * 1024)
+        .max_encoding_message_size(100 * 1024 * 1024);
 
     let mut rl = DefaultEditor::new()?;
 
@@ -137,9 +143,23 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
             FlightRecordBatchStream::new_from_flight_data(stream.map_err(FlightError::Tonic));
         let mut records = vec![];
         while let Some(data) = stream.next().await {
-            let data = data?;
-            records.push(data);
+            match data {
+                Ok(data) => {
+                    records.push(data);
+                }
+                Err(e) => {
+                    match e {
+                        FlightError::Tonic(e) => {
+                            display_grpc_error(&e);
+                            last_error = Some(e);
+                        }
+                        _ => println!("Error receiving data: {e}"),
+                    };
+                    break;
+                }
+            }
         }
+
         if records.is_empty() {
             println!("No data returned for query");
             continue;
@@ -168,9 +188,10 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
 fn display_grpc_error(err: &Status) {
     let user_err_msg = match err.code() {
         Code::Ok => return,
-        Code::Unknown | Code::Internal | Code::Unauthenticated | Code::DataLoss | Code::OutOfRange | Code::FailedPrecondition =>
+        Code::Unknown | Code::Internal | Code::Unauthenticated | Code::DataLoss | Code::FailedPrecondition =>
             "An internal error occurred while processing the query. Show technical details with '.error'"
         ,
+        Code::OutOfRange => "The query could not be completed because the query result exceeds the configured maximum size. Retry with `limit` clause.",
         Code::InvalidArgument | Code::AlreadyExists | Code::NotFound => err.message(),
         Code::Cancelled => "The query was cancelled before it could complete.",
         Code::Aborted => "The query was aborted before it could complete.",
