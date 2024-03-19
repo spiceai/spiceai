@@ -158,7 +158,7 @@ jobs:
       matrix:
         include:
           - name: Linux x64
-            runner: rust
+            runner: ubuntu-latest
             target_os: linux
             target_arch: x86_64
             target_arch_go: amd64
