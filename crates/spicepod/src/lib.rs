@@ -1,6 +1,7 @@
 #![allow(clippy::missing_errors_doc)]
 #![allow(clippy::module_name_repetitions)]
 
+use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use std::{fmt::Debug, path::PathBuf};
 
@@ -28,7 +29,7 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Spicepod {
     pub name: String,
 

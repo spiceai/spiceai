@@ -1,5 +1,8 @@
 use csv::Writer;
 use serde::{Deserialize, Serialize};
+use spicepod::component::dataset::Dataset;
+
+use crate::datafusion::DataFusion;
 
 #[derive(Default, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -25,6 +28,14 @@ fn convert_entry_to_csv<T: Serialize>(entries: &[T]) -> Result<String, Box<dyn s
     }
     w.flush()?;
     Ok(String::from_utf8(w.into_inner()?)?)
+}
+
+fn dataset_status(df: &DataFusion, ds: &Dataset) -> Status {
+    if df.table_exists(ds.name.as_str()) {
+        Status::Ready
+    } else {
+        Status::Error
+    }
 }
 
 pub(crate) mod query {
@@ -280,7 +291,7 @@ pub(crate) mod datasets {
 
     use crate::datafusion::DataFusion;
 
-    use super::{convert_entry_to_csv, Format};
+    use super::{convert_entry_to_csv, dataset_status, Format};
 
     #[derive(Debug, Deserialize)]
     pub(crate) struct DatasetFilter {
@@ -356,11 +367,7 @@ pub(crate) mod datasets {
                     Some(d.depends_on.join(", "))
                 },
                 status: if params.status {
-                    if df_read.table_exists(d.name.as_str()) {
-                        Some(super::Status::Ready)
-                    } else {
-                        Some(super::Status::Error)
-                    }
+                    Some(dataset_status(&df_read, d))
                 } else {
                     None
                 },
@@ -376,6 +383,87 @@ pub(crate) mod datasets {
                     (status::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
                 }
             },
+        }
+    }
+}
+
+pub(crate) mod spicepods {
+    use std::sync::Arc;
+
+    use app::App;
+    use axum::{
+        extract::Query,
+        http::status,
+        response::{IntoResponse, Response},
+        Extension, Json,
+    };
+    use itertools::Itertools;
+    use serde::{Deserialize, Serialize};
+    use spicepod::Spicepod;
+    use tokio::sync::RwLock;
+
+    use super::{convert_entry_to_csv, Format};
+
+    #[derive(Debug, Deserialize)]
+    pub(crate) struct SpicepodQueryParams {
+        #[allow(dead_code)]
+        #[serde(default)]
+        status: bool,
+
+        #[serde(default)]
+        format: Format,
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    pub(crate) struct SpicepodCsvRow {
+        pub name: String,
+
+        #[serde(default)]
+        pub number_of_datasets: usize,
+
+        #[serde(default)]
+        pub number_of_models: usize,
+
+        #[serde(default)]
+        pub number_of_dependencies: usize,
+    }
+
+    pub(crate) async fn get(
+        Extension(app): Extension<Arc<RwLock<Option<App>>>>,
+        Query(params): Query<SpicepodQueryParams>,
+    ) -> Response {
+        let Some(readable_app) = &*app.read().await else {
+            return (
+                status::StatusCode::INTERNAL_SERVER_ERROR,
+                Json::<Vec<Spicepod>>(vec![]),
+            )
+                .into_response();
+        };
+
+        match params.format {
+            Format::Json => {
+                (status::StatusCode::OK, Json(readable_app.spicepods.clone())).into_response()
+            }
+            Format::Csv => {
+                let resp: Vec<SpicepodCsvRow> = readable_app
+                    .spicepods
+                    .iter()
+                    .map(|spod| SpicepodCsvRow {
+                        name: spod.name.clone(),
+                        number_of_models: spod.models.len(),
+                        number_of_datasets: spod.datasets.len(),
+                        number_of_dependencies: spod.dependencies.len(),
+                    })
+                    .collect_vec();
+                match convert_entry_to_csv(&resp) {
+                    Ok(csv) => (status::StatusCode::OK, csv).into_response(),
+                    Err(e) => {
+                        tracing::error!("Error converting to CSV: {e}");
+                        (status::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+                    }
+                }
+            }
         }
     }
 }
