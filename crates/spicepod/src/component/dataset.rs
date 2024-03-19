@@ -238,6 +238,8 @@ pub mod acceleration {
         DuckDB,
         #[cfg(feature = "postgres")]
         Postgres,
+        #[cfg(feature = "sqlite")]
+        Sqlite,
     }
 
     impl fmt::Display for Engine {
@@ -249,6 +251,7 @@ pub mod acceleration {
                     Engine::Arrow => "arrow",
                     Engine::DuckDB => "duckdb",
                     Engine::Postgres => "postgres",
+                    Engine::Sqlite => "sqlite",
                 }
             )
         }
