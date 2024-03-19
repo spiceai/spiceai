@@ -1,0 +1,68 @@
+name: Test Installation
+
+on:
+  workflow_dispatch:
+    inputs:
+      os:
+        type: choice
+        description: 'Operating System'
+        required: true
+        options:
+          - ubuntu-latest
+          - macos-latest
+        default: 'ubuntu-latest'
+
+jobs:
+  test-install:
+    name: test installation (${{ github.event.inputs.os }})
+    runs-on: ${{ github.event.inputs.os }}
+
+    steps:
+    - name: checkout code
+      uses: actions/checkout@v2
+
+    - name: install Spice (https://install.spiceai.org)
+      run: |
+        curl https://install.spiceai.org | /bin/bash
+
+    - name: Add Spice bin to PATH
+      run: echo "/home/runner/.spice/bin" >> $GITHUB_PATH
+
+    - name: check installation
+      run: |
+        spice version
+  
+    - name: start Spice runtime
+      run: |
+        spice init app && spice run &
+
+
+    - name: wait for Spice runtime healthy
+      run: |
+        timeout 60 bash -c 'while [[ "$(curl -s http://localhost:3000/health)" != "ok" ]]; do sleep 1; done' || false
+
+    - name: check Spice CLI and runtime version
+      run: |
+        version=$(spice version 2>&1)
+        cli_version=$(echo "$version" | grep 'CLI version:' | cut -d':' -f2 | xargs)
+        runtime_version=$(echo "$version" | grep 'Runtime version:' | cut -d':' -f2 | xargs)
+
+        # normalize runtime version from "0.9.0-alpha" to "v0.9-alpha". Later versions have uniform format and don't require modifications
+        runtime_version=$(echo "$runtime_version" | sed -e 's/^0\.9\.0-alpha$/v0.9-alpha/')
+
+        release_version=$(curl -s "https://api.github.com/repos/spiceai/spiceai/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+        
+        echo "Release Version: $release_version"
+        echo "CLI Version: $cli_version"
+        echo "Runtime Version: $runtime_version"
+
+        if [ "$cli_version" != "$release_version" ]; then
+          echo "CLI version $cli_version does not match the release version $release_version."
+          exit 1
+        fi
+
+        if [ "$runtime_version" != "$release_version" ]; then
+          echo "Runtime version $runtime_version does not match the release version $release_version."
+          exit 1
+        fi
+
