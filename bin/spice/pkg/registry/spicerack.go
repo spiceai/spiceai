@@ -25,7 +25,7 @@ var (
 type SpiceRackRegistry struct{}
 
 func getSpiceRackBaseUrl() string {
-	if version.Version() == "local-dev" {
+	if strings.HasSuffix(version.Version(), "-dev") {
 		return "https://dev-data.spiceai.io/v0.1"
 	} else {
 		return "https://api.spicerack.org/v0.1"
