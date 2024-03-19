@@ -189,7 +189,7 @@ jobs:
         run: |
           chmod +x ./build/spice
           chmod +x ./build/spiced
-          echo "./build" >> $GITHUB_PATH
+          echo "$HOME/build" >> $GITHUB_PATH
 
       - name: Check spice version
         run: spice version
@@ -284,7 +284,7 @@ jobs:
         run: |
           chmod +x ./build/spice
           chmod +x ./build/spiced
-          echo "./build" >> $GITHUB_PATH
+          echo "$HOME/build" >> $GITHUB_PATH
 
       - name: Check spice version
         run: spice version
