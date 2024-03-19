@@ -188,7 +188,7 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
 fn display_grpc_error(err: &Status) {
     let (error_type, user_err_msg) = match err.code() {
         Code::Ok => return,
-        Code::Unknown | Code::Internal | Code::Unauthenticated | Code::DataLoss | Code::OutOfRange | Code::FailedPrecondition =>
+        Code::Unknown | Code::Internal | Code::Unauthenticated | Code::DataLoss | Code::FailedPrecondition =>
             ("Error", "An internal error occurred while processing the query. Show technical details with '.error'")
         ,
         Code::InvalidArgument | Code::AlreadyExists | Code::NotFound => ("Query Error", err.message()),
@@ -199,7 +199,7 @@ fn display_grpc_error(err: &Status) {
         Code::ResourceExhausted => ("Error", "The query could not be completed because the server has run out of resources."),
         Code::Unimplemented => ("Error", "The query could not be completed because the server does not support the requested operation."),
         Code::Unavailable => ("Error", "The query could not be completed because the server is unavailable."),
-        Code::OutOfRange => "The query could not be completed because the query result exceeds the configured maximum size. Retry with `limit` clause.",
+        Code::OutOfRange => ("Error", "The query could not be completed because the query result exceeds the configured maximum size. Retry with `limit` clause."),
     };
 
     println!("{} {user_err_msg}", Colour::Red.paint(error_type));
