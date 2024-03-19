@@ -198,8 +198,6 @@ jobs:
 
       - name: Init spice app
         run: |
-          # TODO
-          mkdir test_app && cd test_app
           spice init test_app
 
       - name: Connect Dremio
