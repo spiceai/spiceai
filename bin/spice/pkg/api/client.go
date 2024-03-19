@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 
 	"github.com/spiceai/spiceai/bin/spice/pkg/version"
 )
@@ -43,7 +44,7 @@ func NewSpiceApiClient() *SpiceApiClient {
 }
 
 func (s *SpiceApiClient) Init() error {
-	if version.Version() == "local-dev" {
+	if strings.HasSuffix(version.Version(), "-dev") {
 		s.baseUrl = "https://dev.spice.xyz"
 	} else {
 		s.baseUrl = "https://spice.ai"
