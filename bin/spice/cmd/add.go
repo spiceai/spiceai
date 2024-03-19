@@ -8,9 +8,9 @@ import (
 
 	"github.com/logrusorgru/aurora"
 	"github.com/spf13/cobra"
-	"github.com/spiceai/spiceai/bin/spice/pkg/api"
 	"github.com/spiceai/spiceai/bin/spice/pkg/context"
 	"github.com/spiceai/spiceai/bin/spice/pkg/registry"
+	"github.com/spiceai/spiceai/bin/spice/pkg/spec"
 	"github.com/spiceai/spiceai/bin/spice/pkg/spicepod"
 	"github.com/spiceai/spiceai/bin/spice/pkg/util"
 	"gopkg.in/yaml.v2"
@@ -68,7 +68,7 @@ spice add spiceai/quickstart
 			}
 		}
 
-		var spicePod api.Spicepod
+		var spicePod spec.SpicepodSpec
 		err = yaml.Unmarshal(spicepodBytes, &spicePod)
 		if err != nil {
 			cmd.Println(err)
