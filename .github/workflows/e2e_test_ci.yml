@@ -129,20 +129,10 @@ jobs:
         uses: actions/upload-artifact@v4
         if: matrix.target_os != 'windows'
         with:
-          name: spice_${{ matrix.target_os }}_${{ matrix.target_arch }}
-          path: spice
-
-      - name: Save spiced artifact
-        uses: actions/upload-artifact@v4
-        if: matrix.target_os != 'windows'
-        with:
-          name: spiced_${{ matrix.target_os }}_${{ matrix.target_arch }}
-          path: spiced
-
-      - name: Merge spice and spiced in single artifact
-        uses: actions/upload-artifact/merge@v4
-        with:
           name: build_${{ matrix.target_os }}_${{ matrix.target_arch }}
+          path: |
+            spice
+            spiced
 
   test_quickstart_dremio:
     name: "E2E Test: Dremio quickstart, using ${{ matrix.target_os }}-${{ matrix.target_arch }}"
