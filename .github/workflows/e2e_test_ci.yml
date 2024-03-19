@@ -24,11 +24,11 @@ jobs:
     strategy:
       matrix:
         include:
-          # - name: Linux x64
-          #   runner: rust
-          #   target_os: linux
-          #   target_arch: x86_64
-          #   target_arch_go: amd64
+          - name: Linux x64
+            runner: rust
+            target_os: linux
+            target_arch: x86_64
+            target_arch_go: amd64
           - name: macOS aarch64 (Apple Silicon)
             runner: macos-14
             target_os: darwin
@@ -157,11 +157,11 @@ jobs:
     strategy:
       matrix:
         include:
-          # - name: Linux x64
-          #   runner: rust
-          #   target_os: linux
-          #   target_arch: x86_64
-          #   target_arch_go: amd64
+          - name: Linux x64
+            runner: rust
+            target_os: linux
+            target_arch: x86_64
+            target_arch_go: amd64
           - name: macOS aarch64 (Apple Silicon)
             runner: macos-14
             target_os: darwin
