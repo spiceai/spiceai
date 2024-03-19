@@ -37,12 +37,13 @@ spice init my_app
 				spicepodName = dirName
 			}
 		} else {
-			spicepodDir = args[0]
+			spicepodName = args[0]
+			spicepodDir = path.Join(spicepodDir, spicepodName)
 		}
 
 		spicepodPath := path.Join(spicepodDir, "spicepod.yaml")
 		if _, err := os.Stat(spicepodPath); !os.IsNotExist(err) {
-			cmd.Println("spicepod.yaml already exists. Replace (y/n)?")
+			cmd.Print("spicepod.yaml already exists. Replace (y/n)? ")
 			var confirm string
 			fmt.Scanf("%s", &confirm)
 			if strings.ToLower(strings.TrimSpace(confirm)) != "y" {
