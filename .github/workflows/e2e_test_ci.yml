@@ -128,7 +128,7 @@ jobs:
         if: matrix.target_os != 'windows'
         run: |
           ./spice version
-          ./spiced version
+          ./spiced --version
 
       - name: Save spice artifact
         uses: actions/upload-artifact@v4
