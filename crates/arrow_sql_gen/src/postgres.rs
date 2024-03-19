@@ -279,6 +279,125 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                         builder.append_value(timestamp);
                     }
                 }
+                Type::INT2_ARRAY => {
+                    let Some(builder) = builder else {
+                        return NoBuilderForIndexSnafu { index: i }.fail();
+                    };
+                    let Some(builder) = builder
+                        .as_any_mut()
+                        .downcast_mut::<arrow::array::ListBuilder<arrow::array::Int16Builder>>()
+                    else {
+                        return FailedToDowncastBuilderSnafu {
+                            postgres_type: format!("{postgres_type}"),
+                        }
+                        .fail();
+                    };
+                    let v: Vec<i16> = row.get(i);
+                    let v = v.into_iter().map(Some);
+                    builder.append_value(v);
+                }
+                Type::INT4_ARRAY => {
+                    let Some(builder) = builder else {
+                        return NoBuilderForIndexSnafu { index: i }.fail();
+                    };
+                    let Some(builder) = builder
+                        .as_any_mut()
+                        .downcast_mut::<arrow::array::ListBuilder<arrow::array::Int32Builder>>()
+                    else {
+                        return FailedToDowncastBuilderSnafu {
+                            postgres_type: format!("{postgres_type}"),
+                        }
+                        .fail();
+                    };
+                    let v: Vec<i32> = row.get(i);
+                    let v = v.into_iter().map(Some);
+                    builder.append_value(v);
+                }
+                Type::INT8_ARRAY => {
+                    let Some(builder) = builder else {
+                        return NoBuilderForIndexSnafu { index: i }.fail();
+                    };
+                    let Some(builder) = builder
+                        .as_any_mut()
+                        .downcast_mut::<arrow::array::ListBuilder<arrow::array::Int64Builder>>()
+                    else {
+                        return FailedToDowncastBuilderSnafu {
+                            postgres_type: format!("{postgres_type}"),
+                        }
+                        .fail();
+                    };
+                    let v: Vec<i64> = row.get(i);
+                    let v = v.into_iter().map(Some);
+                    builder.append_value(v);
+                }
+                Type::FLOAT4_ARRAY => {
+                    let Some(builder) = builder else {
+                        return NoBuilderForIndexSnafu { index: i }.fail();
+                    };
+                    let Some(builder) = builder
+                        .as_any_mut()
+                        .downcast_mut::<arrow::array::ListBuilder<arrow::array::Float32Builder>>()
+                    else {
+                        return FailedToDowncastBuilderSnafu {
+                            postgres_type: format!("{postgres_type}"),
+                        }
+                        .fail();
+                    };
+                    let v: Vec<f32> = row.get(i);
+                    let v = v.into_iter().map(Some);
+                    builder.append_value(v);
+                }
+                Type::FLOAT8_ARRAY => {
+                    let Some(builder) = builder else {
+                        return NoBuilderForIndexSnafu { index: i }.fail();
+                    };
+                    let Some(builder) = builder
+                        .as_any_mut()
+                        .downcast_mut::<arrow::array::ListBuilder<arrow::array::Float64Builder>>()
+                    else {
+                        return FailedToDowncastBuilderSnafu {
+                            postgres_type: format!("{postgres_type}"),
+                        }
+                        .fail();
+                    };
+                    let v: Vec<f64> = row.get(i);
+                    let v = v.into_iter().map(Some);
+                    builder.append_value(v);
+                }
+                Type::TEXT_ARRAY => {
+                    let Some(builder) = builder else {
+                        return NoBuilderForIndexSnafu { index: i }.fail();
+                    };
+                    let Some(builder) = builder
+                        .as_any_mut()
+                        .downcast_mut::<arrow::array::ListBuilder<arrow::array::StringBuilder>>()
+                    else {
+                        return FailedToDowncastBuilderSnafu {
+                            postgres_type: format!("{postgres_type}"),
+                        }
+                        .fail();
+                    };
+                    let v: Vec<String> = row.get(i);
+                    let v = v.into_iter().map(Some);
+                    builder.append_value(v);
+                }
+                Type::BOOL_ARRAY => {
+                    let Some(builder) = builder else {
+                        return NoBuilderForIndexSnafu { index: i }.fail();
+                    };
+                    let Some(builder) = builder
+                        .as_any_mut()
+                        .downcast_mut::<arrow::array::ListBuilder<arrow::array::BooleanBuilder>>()
+                    else {
+                        return FailedToDowncastBuilderSnafu {
+                            postgres_type: format!("{postgres_type}"),
+                        }
+                        .fail();
+                    };
+                    let v: Vec<bool> = row.get(i);
+                    let v = v.into_iter().map(Some);
+                    builder.append_value(v);
+                }
                 _ => unimplemented!("Unsupported type {:?} for column index {i}", postgres_type,),
             }
         }
@@ -310,6 +429,41 @@ fn map_column_type_to_data_type(column_type: &Type) -> Option<DataType> {
         Type::NUMERIC => None,
         // We get a SystemTime that we can always convert into milliseconds
         Type::TIMESTAMP => Some(DataType::Timestamp(TimeUnit::Millisecond, None)),
+        Type::INT2_ARRAY => Some(DataType::List(Arc::new(Field::new(
+            "item",
+            DataType::Int16,
+            true,
+        )))),
+        Type::INT4_ARRAY => Some(DataType::List(Arc::new(Field::new(
+            "item",
+            DataType::Int32,
+            true,
+        )))),
+        Type::INT8_ARRAY => Some(DataType::List(Arc::new(Field::new(
+            "item",
+            DataType::Int64,
+            true,
+        )))),
+        Type::FLOAT4_ARRAY => Some(DataType::List(Arc::new(Field::new(
+            "item",
+            DataType::Float32,
+            true,
+        )))),
+        Type::FLOAT8_ARRAY => Some(DataType::List(Arc::new(Field::new(
+            "item",
+            DataType::Float64,
+            true,
+        )))),
+        Type::TEXT_ARRAY => Some(DataType::List(Arc::new(Field::new(
+            "item",
+            DataType::Utf8,
+            true,
+        )))),
+        Type::BOOL_ARRAY => Some(DataType::List(Arc::new(Field::new(
+            "item",
+            DataType::Boolean,
+            true,
+        )))),
         _ => unimplemented!("Unsupported column type {:?}", column_type),
     }
 }

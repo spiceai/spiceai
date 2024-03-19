@@ -8,8 +8,8 @@ use bigdecimal_0_3_0::BigDecimal;
 use time::{OffsetDateTime, PrimitiveDateTime};
 
 use sea_query::{
-    Alias, ColumnDef, ColumnType, Index, InsertStatement, IntoIden, IntoIndexColumn,
-    PostgresQueryBuilder, Query, SimpleExpr, Table,
+    Alias, ColumnDef, ColumnType, GenericBuilder, Index, InsertStatement, IntoIden,
+    IntoIndexColumn, PostgresQueryBuilder, Query, SimpleExpr, SqliteQueryBuilder, Table,
 };
 
 pub struct CreateTableBuilder {
@@ -35,7 +35,17 @@ impl CreateTableBuilder {
     }
 
     #[must_use]
-    pub fn build(self) -> String {
+    pub fn build_postgres(self) -> String {
+        self.build(PostgresQueryBuilder)
+    }
+
+    #[must_use]
+    pub fn build_sqlite(self) -> String {
+        self.build(SqliteQueryBuilder)
+    }
+
+    #[must_use]
+    pub fn build<T: GenericBuilder>(self, query_builder: T) -> String {
         let mut create_stmt = Table::create();
         create_stmt
             .table(Alias::new(self.table_name))
@@ -60,7 +70,7 @@ impl CreateTableBuilder {
             create_stmt.primary_key(&mut index);
         }
 
-        create_stmt.to_string(PostgresQueryBuilder)
+        create_stmt.to_string(query_builder)
     }
 }
 
@@ -193,8 +203,171 @@ impl InsertBuilder {
                             };
                         }
                     }
+                    DataType::List(list_type) => {
+                        let array = column.as_any().downcast_ref::<array::ListArray>();
+                        if let Some(valid_array) = array {
+                            let list_array = valid_array.value(row);
+                            match list_type.data_type() {
+                                DataType::Int8 => {
+                                    let mut list_values: Vec<i8> = vec![];
+                                    for i in 0..list_array.len() {
+                                        let int_array =
+                                            list_array.as_any().downcast_ref::<array::Int8Array>();
+                                        if let Some(valid_int_array) = int_array {
+                                            list_values.push(valid_int_array.value(i));
+                                        }
+                                    }
+                                    let expr: SimpleExpr = list_values.into();
+                                    row_values.push(expr.cast_as(Alias::new("int2[]")));
+                                }
+                                DataType::Int16 => {
+                                    let mut list_values: Vec<i16> = vec![];
+                                    for i in 0..list_array.len() {
+                                        let int_array =
+                                            list_array.as_any().downcast_ref::<array::Int16Array>();
+                                        if let Some(valid_int_array) = int_array {
+                                            list_values.push(valid_int_array.value(i));
+                                        }
+                                    }
+                                    let expr: SimpleExpr = list_values.into();
+                                    row_values.push(expr.cast_as(Alias::new("int2[]")));
+                                }
+                                DataType::Int32 => {
+                                    let mut list_values: Vec<i32> = vec![];
+                                    for i in 0..list_array.len() {
+                                        let int_array =
+                                            list_array.as_any().downcast_ref::<array::Int32Array>();
+                                        if let Some(valid_int_array) = int_array {
+                                            list_values.push(valid_int_array.value(i));
+                                        }
+                                    }
+                                    let expr: SimpleExpr = list_values.into();
+                                    row_values.push(expr.cast_as(Alias::new("int4[]")));
+                                }
+                                DataType::Int64 => {
+                                    let mut list_values: Vec<i64> = vec![];
+                                    for i in 0..list_array.len() {
+                                        let int_array =
+                                            list_array.as_any().downcast_ref::<array::Int64Array>();
+                                        if let Some(valid_int_array) = int_array {
+                                            list_values.push(valid_int_array.value(i));
+                                        }
+                                    }
+                                    let expr: SimpleExpr = list_values.into();
+                                    row_values.push(expr.cast_as(Alias::new("int8[]")));
+                                }
+                                DataType::UInt8 => {
+                                    let mut list_values: Vec<u8> = vec![];
+                                    for i in 0..list_array.len() {
+                                        let int_array =
+                                            list_array.as_any().downcast_ref::<array::UInt8Array>();
+                                        if let Some(valid_int_array) = int_array {
+                                            list_values.push(valid_int_array.value(i));
+                                        }
+                                    }
+                                    let expr: SimpleExpr = list_values.into();
+                                    row_values.push(expr.cast_as(Alias::new("uint2[]")));
+                                }
+                                DataType::UInt16 => {
+                                    let mut list_values: Vec<u16> = vec![];
+                                    for i in 0..list_array.len() {
+                                        let int_array = list_array
+                                            .as_any()
+                                            .downcast_ref::<array::UInt16Array>();
+                                        if let Some(valid_int_array) = int_array {
+                                            list_values.push(valid_int_array.value(i));
+                                        }
+                                    }
+                                    let expr: SimpleExpr = list_values.into();
+                                    row_values.push(expr.cast_as(Alias::new("uint2[]")));
+                                }
+                                DataType::UInt32 => {
+                                    let mut list_values: Vec<u32> = vec![];
+                                    for i in 0..list_array.len() {
+                                        let int_array = list_array
+                                            .as_any()
+                                            .downcast_ref::<array::UInt32Array>();
+                                        if let Some(valid_int_array) = int_array {
+                                            list_values.push(valid_int_array.value(i));
+                                        }
+                                    }
+                                    let expr: SimpleExpr = list_values.into();
+                                    row_values.push(expr.cast_as(Alias::new("uint4[]")));
+                                }
+                                DataType::UInt64 => {
+                                    let mut list_values: Vec<u64> = vec![];
+                                    for i in 0..list_array.len() {
+                                        let int_array = list_array
+                                            .as_any()
+                                            .downcast_ref::<array::UInt64Array>();
+                                        if let Some(valid_int_array) = int_array {
+                                            list_values.push(valid_int_array.value(i));
+                                        }
+                                    }
+                                    let expr: SimpleExpr = list_values.into();
+                                    row_values.push(expr.cast_as(Alias::new("uint8[]")));
+                                }
+                                DataType::Float32 => {
+                                    let mut list_values: Vec<f32> = vec![];
+                                    for i in 0..list_array.len() {
+                                        let int_array = list_array
+                                            .as_any()
+                                            .downcast_ref::<array::Float32Array>();
+                                        if let Some(valid_int_array) = int_array {
+                                            list_values.push(valid_int_array.value(i));
+                                        }
+                                    }
+                                    let expr: SimpleExpr = list_values.into();
+                                    row_values.push(expr.cast_as(Alias::new("float4[]")));
+                                }
+                                DataType::Float64 => {
+                                    let mut list_values: Vec<f64> = vec![];
+                                    for i in 0..list_array.len() {
+                                        let int_array = list_array
+                                            .as_any()
+                                            .downcast_ref::<array::Float64Array>();
+                                        if let Some(valid_int_array) = int_array {
+                                            list_values.push(valid_int_array.value(i));
+                                        }
+                                    }
+                                    let expr: SimpleExpr = list_values.into();
+                                    row_values.push(expr.cast_as(Alias::new("float8[]")));
+                                }
+                                DataType::Utf8 => {
+                                    let mut list_values: Vec<String> = vec![];
+                                    for i in 0..list_array.len() {
+                                        let int_array = list_array
+                                            .as_any()
+                                            .downcast_ref::<array::StringArray>();
+                                        if let Some(valid_int_array) = int_array {
+                                            list_values.push(valid_int_array.value(i).to_string());
+                                        }
+                                    }
+                                    let expr: SimpleExpr = list_values.into();
+                                    row_values.push(expr.cast_as(Alias::new("text[]")));
+                                }
+                                DataType::Boolean => {
+                                    let mut list_values: Vec<bool> = vec![];
+                                    for i in 0..list_array.len() {
+                                        let int_array = list_array
+                                            .as_any()
+                                            .downcast_ref::<array::BooleanArray>();
+                                        if let Some(valid_int_array) = int_array {
+                                            list_values.push(valid_int_array.value(i));
+                                        }
+                                    }
+                                    let expr: SimpleExpr = list_values.into();
+                                    row_values.push(expr.cast_as(Alias::new("boolean[]")));
+                                }
+                                _ => unimplemented!(
+                                    "Data type mapping not implemented for {}",
+                                    list_type.data_type()
+                                ),
+                            }
+                        }
+                    }
                     _ => unimplemented!(
-                        "Data type mapping not implemented for {:?}",
+                        "Data type mapping not implemented for {}",
                         column.data_type()
                     ),
                 }
@@ -204,7 +377,17 @@ impl InsertBuilder {
     }
 
     #[must_use]
-    pub fn build(&self) -> String {
+    pub fn build_postgres(self) -> String {
+        self.build(PostgresQueryBuilder)
+    }
+
+    #[must_use]
+    pub fn build_sqlite(self) -> String {
+        self.build(SqliteQueryBuilder)
+    }
+
+    #[must_use]
+    pub fn build<T: GenericBuilder>(&self, query_builder: T) -> String {
         let columns: Vec<Alias> = (self.record_batches[0])
             .schema()
             .fields()
@@ -220,7 +403,7 @@ impl InsertBuilder {
         for record_batch in &self.record_batches {
             self.construct_insert_stmt(&mut insert_stmt, record_batch);
         }
-        insert_stmt.to_string(PostgresQueryBuilder)
+        insert_stmt.to_string(query_builder)
     }
 }
 
@@ -241,6 +424,9 @@ fn map_data_type_to_column_type(data_type: &DataType) -> ColumnType {
         #[allow(clippy::cast_sign_loss)] // This is safe because scale will never be negative
         DataType::Decimal128(p, s) => ColumnType::Decimal(Some((u32::from(*p), *s as u32))),
         DataType::Timestamp(_unit, _time_zone) => ColumnType::Timestamp,
+        DataType::List(list_type) => {
+            ColumnType::Array(map_data_type_to_column_type(list_type.data_type()).into())
+        }
 
         // Add more mappings here as needed
         _ => unimplemented!("Data type mapping not implemented for {:?}", data_type),
@@ -252,7 +438,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::datatypes::{DataType, Field, Int32Type, Schema};
 
     #[test]
     fn test_basic_table_creation() {
@@ -261,7 +447,7 @@ mod tests {
             Field::new("name", DataType::Utf8, false),
             Field::new("age", DataType::Int32, true),
         ]);
-        let sql = CreateTableBuilder::new(SchemaRef::new(schema), "users").build();
+        let sql = CreateTableBuilder::new(SchemaRef::new(schema), "users").build_postgres();
 
         assert_eq!(sql, "CREATE TABLE IF NOT EXISTS \"users\" ( \"id\" integer NOT NULL, \"name\" text NOT NULL, \"age\" integer )");
     }
@@ -304,7 +490,7 @@ mod tests {
         .expect("Unable to build record batch");
         let record_batches = vec![batch1, batch2];
 
-        let sql = InsertBuilder::new("users", record_batches).build();
+        let sql = InsertBuilder::new("users", record_batches).build_postgres();
         assert_eq!(sql, "INSERT INTO \"users\" (\"id\", \"name\", \"age\") VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', 30), (1, 'a', 10), (2, 'b', 20), (3, 'c', 30)");
     }
 
@@ -318,8 +504,31 @@ mod tests {
         ]);
         let sql = CreateTableBuilder::new(SchemaRef::new(schema), "users")
             .primary_keys(vec!["id", "id2"])
-            .build();
+            .build_postgres();
 
         assert_eq!(sql, "CREATE TABLE IF NOT EXISTS \"users\" ( \"id\" integer NOT NULL, \"id2\" integer NOT NULL, \"name\" text NOT NULL, \"age\" integer, PRIMARY KEY (\"id\", \"id2\") )");
+    }
+
+    #[test]
+    fn test_table_insertion_with_list() {
+        let schema1 = Schema::new(vec![Field::new(
+            "list",
+            DataType::List(Field::new("item", DataType::Int32, true).into()),
+            true,
+        )]);
+        let list_array = array::ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+            Some(vec![Some(1), Some(2), Some(3)]),
+            Some(vec![Some(4), Some(5), Some(6)]),
+            Some(vec![Some(7), Some(8), Some(9)]),
+        ]);
+
+        let batch = RecordBatch::try_new(Arc::new(schema1.clone()), vec![Arc::new(list_array)])
+            .expect("Unable to build record batch");
+
+        let sql = InsertBuilder::new("arrays", vec![batch]).build_postgres();
+        assert_eq!(
+            sql,
+            "INSERT INTO \"arrays\" (\"list\") VALUES (ARRAY [1,2,3]), (ARRAY [4,5,6]), (ARRAY [7,8,9])"
+        );
     }
 }
