@@ -1,8 +1,9 @@
 use arrow::{
     array::{
         ArrayBuilder, BooleanBuilder, Decimal128Builder, Float32Builder, Float64Builder,
-        Int16Builder, Int32Builder, Int64Builder, StringBuilder, TimestampMicrosecondBuilder,
-        TimestampMillisecondBuilder, TimestampNanosecondBuilder, TimestampSecondBuilder,
+        Int16Builder, Int32Builder, Int64Builder, ListBuilder, StringBuilder,
+        TimestampMicrosecondBuilder, TimestampMillisecondBuilder, TimestampNanosecondBuilder,
+        TimestampSecondBuilder,
     },
     datatypes::{DataType, TimeUnit},
 };
@@ -47,27 +48,13 @@ pub fn map_data_type_to_array_builder(data_type: &DataType) -> Box<dyn ArrayBuil
         // We can't recursively call map_data_type_to_array_builder here because downcasting will not work if the
         // values_builder is boxed.
         DataType::List(values_field) => match values_field.data_type() {
-            DataType::Int16 => Box::new(arrow::array::ListBuilder::new(
-                arrow::array::Int16Builder::new(),
-            )),
-            DataType::Int32 => Box::new(arrow::array::ListBuilder::new(
-                arrow::array::Int32Builder::new(),
-            )),
-            DataType::Int64 => Box::new(arrow::array::ListBuilder::new(
-                arrow::array::Int64Builder::new(),
-            )),
-            DataType::Float32 => Box::new(arrow::array::ListBuilder::new(
-                arrow::array::Float32Builder::new(),
-            )),
-            DataType::Float64 => Box::new(arrow::array::ListBuilder::new(
-                arrow::array::Float64Builder::new(),
-            )),
-            DataType::Utf8 => Box::new(arrow::array::ListBuilder::new(
-                arrow::array::StringBuilder::new(),
-            )),
-            DataType::Boolean => Box::new(arrow::array::ListBuilder::new(
-                arrow::array::BooleanBuilder::new(),
-            )),
+            DataType::Int16 => Box::new(ListBuilder::new(Int16Builder::new())),
+            DataType::Int32 => Box::new(ListBuilder::new(Int32Builder::new())),
+            DataType::Int64 => Box::new(ListBuilder::new(Int64Builder::new())),
+            DataType::Float32 => Box::new(ListBuilder::new(Float32Builder::new())),
+            DataType::Float64 => Box::new(ListBuilder::new(Float64Builder::new())),
+            DataType::Utf8 => Box::new(ListBuilder::new(StringBuilder::new())),
+            DataType::Boolean => Box::new(ListBuilder::new(BooleanBuilder::new())),
             _ => unimplemented!("Unsupported list value data type {:?}", data_type),
         },
         _ => unimplemented!("Unsupported data type {:?}", data_type),
