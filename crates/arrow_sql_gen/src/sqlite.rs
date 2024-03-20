@@ -3,8 +3,13 @@ use std::sync::Arc;
 use crate::arrow::map_data_type_to_array_builder;
 use arrow::array::ArrayBuilder;
 use arrow::array::ArrayRef;
+use arrow::array::BinaryBuilder;
+use arrow::array::Float64Builder;
+use arrow::array::Int64Builder;
+use arrow::array::NullBuilder;
 use arrow::array::RecordBatch;
 use arrow::array::RecordBatchOptions;
+use arrow::array::StringBuilder;
 use arrow::datatypes::DataType;
 use arrow::datatypes::Field;
 use arrow::datatypes::Schema;
@@ -84,6 +89,19 @@ pub fn rows_to_arrow(mut rows: Rows, num_cols: usize) -> Result<RecordBatch> {
     }
 }
 
+macro_rules! append_value {
+    ($builder:expr, $row:expr, $index:expr, $type:ty, $builder_type:ty, $sqlite_type:expr) => {{
+        let Some(builder) = $builder.as_any_mut().downcast_mut::<$builder_type>() else {
+            FailedToDowncastBuilderSnafu {
+                sqlite_type: format!("{}", $sqlite_type),
+            }
+            .fail()?
+        };
+        let value: $type = $row.get($index).context(FailedToExtractRowValueSnafu)?;
+        builder.append_value(value);
+    }};
+}
+
 fn add_row_to_builders(
     row: &Row,
     sqlite_types: &[Type],
@@ -96,10 +114,7 @@ fn add_row_to_builders(
 
         match *sqlite_type {
             Type::Null => {
-                let Some(builder) = builder
-                    .as_any_mut()
-                    .downcast_mut::<arrow::array::NullBuilder>()
-                else {
+                let Some(builder) = builder.as_any_mut().downcast_mut::<NullBuilder>() else {
                     return FailedToDowncastBuilderSnafu {
                         sqlite_type: format!("{sqlite_type}"),
                     }
@@ -107,58 +122,10 @@ fn add_row_to_builders(
                 };
                 builder.append_null();
             }
-            Type::Integer => {
-                let Some(builder) = builder
-                    .as_any_mut()
-                    .downcast_mut::<arrow::array::Int64Builder>()
-                else {
-                    return FailedToDowncastBuilderSnafu {
-                        sqlite_type: format!("{sqlite_type}"),
-                    }
-                    .fail();
-                };
-                let v: i64 = row.get(i).context(FailedToExtractRowValueSnafu)?;
-                builder.append_value(v);
-            }
-            Type::Real => {
-                let Some(builder) = builder
-                    .as_any_mut()
-                    .downcast_mut::<arrow::array::Float64Builder>()
-                else {
-                    return FailedToDowncastBuilderSnafu {
-                        sqlite_type: format!("{sqlite_type}"),
-                    }
-                    .fail();
-                };
-                let v: f64 = row.get(i).context(FailedToExtractRowValueSnafu)?;
-                builder.append_value(v);
-            }
-            Type::Text => {
-                let Some(builder) = builder
-                    .as_any_mut()
-                    .downcast_mut::<arrow::array::StringBuilder>()
-                else {
-                    return FailedToDowncastBuilderSnafu {
-                        sqlite_type: format!("{sqlite_type}"),
-                    }
-                    .fail();
-                };
-                let v: String = row.get(i).context(FailedToExtractRowValueSnafu)?;
-                builder.append_value(v);
-            }
-            Type::Blob => {
-                let Some(builder) = builder
-                    .as_any_mut()
-                    .downcast_mut::<arrow::array::BinaryBuilder>()
-                else {
-                    return FailedToDowncastBuilderSnafu {
-                        sqlite_type: format!("{sqlite_type}"),
-                    }
-                    .fail();
-                };
-                let v: Vec<u8> = row.get(i).context(FailedToExtractRowValueSnafu)?;
-                builder.append_value(v);
-            }
+            Type::Integer => append_value!(builder, row, i, i64, Int64Builder, sqlite_type),
+            Type::Real => append_value!(builder, row, i, f64, Float64Builder, sqlite_type),
+            Type::Text => append_value!(builder, row, i, String, StringBuilder, sqlite_type),
+            Type::Blob => append_value!(builder, row, i, Vec<u8>, BinaryBuilder, sqlite_type),
         }
     }
     Ok(())
