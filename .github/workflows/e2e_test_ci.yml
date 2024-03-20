@@ -6,10 +6,6 @@ on:
       - trunk
       - release-*
 
-  pull_request:
-    branches:
-      - trunk
-
   workflow_dispatch:
 
 jobs:
