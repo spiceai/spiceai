@@ -199,7 +199,7 @@ fn display_grpc_error(err: &Status) {
         Code::ResourceExhausted => ("Error", "The query could not be completed because the server has run out of resources."),
         Code::Unimplemented => ("Error", "The query could not be completed because the server does not support the requested operation."),
         Code::Unavailable => ("Error", "The query could not be completed because the server is unavailable."),
-        Code::OutOfRange => ("Error", "The query could not be completed because the query result exceeds the configured maximum size. Retry with `limit` clause."),
+        Code::OutOfRange => ("Error", "The query could not be completed because the size limit of the query result was exceeded. Retry with `limit` clause."),
     };
 
     println!("{} {user_err_msg}", Colour::Red.paint(error_type));
