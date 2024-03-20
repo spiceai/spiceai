@@ -206,7 +206,7 @@ impl<'a> PostgresUpdate<'a> {
         batch: RecordBatch,
     ) -> Result<()> {
         let insert_table_builder = InsertBuilder::new(&self.name, vec![batch]);
-        let sql = insert_table_builder.build();
+        let sql = insert_table_builder.build_postgres();
 
         transaction
             .execute(&sql, &[])
@@ -224,7 +224,7 @@ impl<'a> PostgresUpdate<'a> {
         };
 
         let create_table_statement = CreateTableBuilder::new(batch.schema(), &self.name);
-        let sql = create_table_statement.build();
+        let sql = create_table_statement.build_postgres();
 
         transaction
             .execute(&sql, &[])
