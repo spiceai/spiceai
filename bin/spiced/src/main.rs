@@ -103,6 +103,7 @@ fn init_prometheus(
         .with_http_listener(socket_addr)
         .build()?;
 
-    std::mem::drop(Handle::try_current()?.spawn(prom_exporter)); // Manually run exporter Future in current runtime.
+    // Manually run exporter Future in current runtime.
+    std::mem::drop(Handle::try_current()?.spawn(prom_exporter));
     Ok(prom_recorder)
 }

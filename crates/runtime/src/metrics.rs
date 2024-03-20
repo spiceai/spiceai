@@ -176,35 +176,6 @@ impl CompositeCounter {
         self.counters.push(counter);
     }
 }
-
-struct CompositeGauge {
-    gauges: Vec<Gauge>,
-}
-impl CompositeGauge {
-    pub fn new() -> Self {
-        Self { gauges: Vec::new() }
-    }
-
-    pub fn add_gauge(&mut self, g: Gauge) {
-        self.gauges.push(g);
-    }
-}
-
-struct CompositeHistogram {
-    histograms: Vec<Histogram>,
-}
-impl CompositeHistogram {
-    pub fn new() -> Self {
-        Self {
-            histograms: Vec::new(),
-        }
-    }
-
-    pub fn add_histogram(&mut self, h: Histogram) {
-        self.histograms.push(h);
-    }
-}
-
 impl CounterFn for CompositeCounter {
     fn increment(&self, value: u64) {
         for counter in &self.counters {
@@ -216,6 +187,19 @@ impl CounterFn for CompositeCounter {
         for counter in &self.counters {
             counter.absolute(value);
         }
+    }
+}
+
+struct CompositeGauge {
+    gauges: Vec<Gauge>,
+}
+impl CompositeGauge {
+    pub fn new() -> Self {
+        Self { gauges: Vec::new() }
+    }
+
+    pub fn add_gauge(&mut self, g: Gauge) {
+        self.gauges.push(g);
     }
 }
 
@@ -239,6 +223,20 @@ impl GaugeFn for CompositeGauge {
     }
 }
 
+struct CompositeHistogram {
+    histograms: Vec<Histogram>,
+}
+impl CompositeHistogram {
+    pub fn new() -> Self {
+        Self {
+            histograms: Vec::new(),
+        }
+    }
+
+    pub fn add_histogram(&mut self, h: Histogram) {
+        self.histograms.push(h);
+    }
+}
 impl HistogramFn for CompositeHistogram {
     fn record(&self, value: f64) {
         for histogram in &self.histograms {
