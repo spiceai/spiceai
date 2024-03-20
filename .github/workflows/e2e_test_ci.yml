@@ -124,7 +124,6 @@ jobs:
           mv target/release/spice spice
           chmod +x spice
 
-
       - name: Save spice artifact
         uses: actions/upload-artifact@v4
         if: matrix.target_os != 'windows'
@@ -271,6 +270,8 @@ jobs:
         run: |
           chmod +x ./build/spice
           chmod +x ./build/spiced
+          ls -la $HOME
+          ls -la $HOME/build
           echo "$HOME/build" >> $GITHUB_PATH
 
       - name: Check spice version
