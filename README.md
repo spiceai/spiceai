@@ -65,6 +65,8 @@ Currently supported data stores for local materialization/acceleration. More com
 
 https://github.com/spiceai/spiceai/assets/112157037/c9cfdaeb-ac6a-484f-a382-4c2735833f71
 
+### macOS, Linux and WSL:
+
 **Step 1.** Install the Spice CLI:
 
 ```bash
