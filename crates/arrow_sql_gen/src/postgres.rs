@@ -4,8 +4,17 @@ use std::sync::Arc;
 use crate::arrow::map_data_type_to_array_builder_optional;
 use arrow::array::ArrayBuilder;
 use arrow::array::ArrayRef;
+use arrow::array::BooleanBuilder;
+use arrow::array::Decimal128Builder;
+use arrow::array::Float32Builder;
+use arrow::array::Float64Builder;
+use arrow::array::Int16Builder;
+use arrow::array::Int32Builder;
+use arrow::array::Int64Builder;
 use arrow::array::RecordBatch;
 use arrow::array::RecordBatchOptions;
+use arrow::array::StringBuilder;
+use arrow::array::TimestampMillisecondBuilder;
 use arrow::datatypes::DataType;
 use arrow::datatypes::Field;
 use arrow::datatypes::Schema;
@@ -105,10 +114,7 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                     let Some(builder) = builder else {
                         return NoBuilderForIndexSnafu { index: i }.fail();
                     };
-                    let Some(builder) = builder
-                        .as_any_mut()
-                        .downcast_mut::<arrow::array::Int16Builder>()
-                    else {
+                    let Some(builder) = builder.as_any_mut().downcast_mut::<Int16Builder>() else {
                         return FailedToDowncastBuilderSnafu {
                             postgres_type: format!("{postgres_type}"),
                         }
@@ -121,10 +127,7 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                     let Some(builder) = builder else {
                         return NoBuilderForIndexSnafu { index: i }.fail();
                     };
-                    let Some(builder) = builder
-                        .as_any_mut()
-                        .downcast_mut::<arrow::array::Int32Builder>()
-                    else {
+                    let Some(builder) = builder.as_any_mut().downcast_mut::<Int32Builder>() else {
                         return FailedToDowncastBuilderSnafu {
                             postgres_type: format!("{postgres_type}"),
                         }
@@ -137,10 +140,7 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                     let Some(builder) = builder else {
                         return NoBuilderForIndexSnafu { index: i }.fail();
                     };
-                    let Some(builder) = builder
-                        .as_any_mut()
-                        .downcast_mut::<arrow::array::Int64Builder>()
-                    else {
+                    let Some(builder) = builder.as_any_mut().downcast_mut::<Int64Builder>() else {
                         return FailedToDowncastBuilderSnafu {
                             postgres_type: format!("{postgres_type}"),
                         }
@@ -153,9 +153,7 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                     let Some(builder) = builder else {
                         return NoBuilderForIndexSnafu { index: i }.fail();
                     };
-                    let Some(builder) = builder
-                        .as_any_mut()
-                        .downcast_mut::<arrow::array::Float32Builder>()
+                    let Some(builder) = builder.as_any_mut().downcast_mut::<Float32Builder>()
                     else {
                         return FailedToDowncastBuilderSnafu {
                             postgres_type: format!("{postgres_type}"),
@@ -169,9 +167,7 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                     let Some(builder) = builder else {
                         return NoBuilderForIndexSnafu { index: i }.fail();
                     };
-                    let Some(builder) = builder
-                        .as_any_mut()
-                        .downcast_mut::<arrow::array::Float64Builder>()
+                    let Some(builder) = builder.as_any_mut().downcast_mut::<Float64Builder>()
                     else {
                         return FailedToDowncastBuilderSnafu {
                             postgres_type: format!("{postgres_type}"),
@@ -185,10 +181,7 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                     let Some(builder) = builder else {
                         return NoBuilderForIndexSnafu { index: i }.fail();
                     };
-                    let Some(builder) = builder
-                        .as_any_mut()
-                        .downcast_mut::<arrow::array::StringBuilder>()
-                    else {
+                    let Some(builder) = builder.as_any_mut().downcast_mut::<StringBuilder>() else {
                         return FailedToDowncastBuilderSnafu {
                             postgres_type: format!("{postgres_type}"),
                         }
@@ -201,9 +194,7 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                     let Some(builder) = builder else {
                         return NoBuilderForIndexSnafu { index: i }.fail();
                     };
-                    let Some(builder) = builder
-                        .as_any_mut()
-                        .downcast_mut::<arrow::array::BooleanBuilder>()
+                    let Some(builder) = builder.as_any_mut().downcast_mut::<BooleanBuilder>()
                     else {
                         return FailedToDowncastBuilderSnafu {
                             postgres_type: format!("{postgres_type}"),
@@ -219,15 +210,14 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
 
                     let dec_builder = builder.get_or_insert_with(|| {
                         Box::new(
-                            arrow::array::Decimal128Builder::new()
+                            Decimal128Builder::new()
                                 .with_precision_and_scale(38, scale.try_into().unwrap_or_default())
                                 .unwrap_or_default(),
                         )
                     });
 
-                    let Some(dec_builder) = dec_builder
-                        .as_any_mut()
-                        .downcast_mut::<arrow::array::Decimal128Builder>()
+                    let Some(dec_builder) =
+                        dec_builder.as_any_mut().downcast_mut::<Decimal128Builder>()
                     else {
                         return FailedToDowncastBuilderSnafu {
                             postgres_type: format!("{postgres_type}"),
@@ -262,8 +252,8 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                     };
                     let Some(builder) = builder
                         .as_any_mut()
-                        .downcast_mut::<arrow::array::TimestampMillisecondBuilder>(
-                    ) else {
+                        .downcast_mut::<TimestampMillisecondBuilder>()
+                    else {
                         return FailedToDowncastBuilderSnafu {
                             postgres_type: format!("{postgres_type}"),
                         }
