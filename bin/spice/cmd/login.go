@@ -12,6 +12,7 @@ import (
 	"github.com/pkg/browser"
 	"github.com/spf13/cobra"
 	"github.com/spiceai/spiceai/bin/spice/pkg/api"
+	"github.com/spiceai/spiceai/bin/spice/pkg/spec"
 	"gopkg.in/yaml.v2"
 )
 
@@ -100,7 +101,7 @@ spice login
 		var appName string
 		spicepodBytes, err := os.ReadFile("spicepod.yaml")
 		if err == nil {
-			var spicePod api.Spicepod
+			var spicePod spec.SpicepodSpec
 			err = yaml.Unmarshal(spicepodBytes, &spicePod)
 			if err == nil {
 				if spicePod.Metadata != nil {
