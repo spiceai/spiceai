@@ -5,7 +5,7 @@ import (
 	"os"
 	"path"
 
-	"github.com/spiceai/spiceai/bin/spice/pkg/api"
+	"github.com/spiceai/spiceai/bin/spice/pkg/spec"
 	"gopkg.in/yaml.v2"
 )
 
@@ -30,7 +30,7 @@ func CreateManifest(name string, spicepodDir string) (string, error) {
 		return "", fmt.Errorf("Error: %s exists and is not a directory", name)
 	}
 
-	skeletonPod := &api.Spicepod{
+	skeletonPod := &spec.SpicepodSpec{
 		Name:    name,
 		Version: "v1beta1",
 		Kind:    "Spicepod",

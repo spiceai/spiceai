@@ -1,13 +1,14 @@
 #![allow(clippy::missing_errors_doc)]
 #![allow(clippy::module_name_repetitions)]
 
+use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use std::{fmt::Debug, path::PathBuf};
 
 use component::dataset::Dataset;
 use component::model::Model;
 use component::secrets::Secrets;
-use spec::SpicepodDefinition;
+use spec::{SpicepodDefinition, SpicepodVersion};
 
 pub mod component;
 pub mod reader;
@@ -28,8 +29,10 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Spicepod {
+    pub version: SpicepodVersion,
+
     pub name: String,
 
     pub secrets: Secrets,
@@ -113,6 +116,7 @@ fn from_definition(
 ) -> Spicepod {
     Spicepod {
         name: spicepod_definition.name,
+        version: spicepod_definition.version,
         secrets: spicepod_definition.secrets,
         datasets,
         models,
