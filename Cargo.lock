@@ -2271,8 +2271,8 @@ checksum = "9ea835d29036a4087793836fa931b08837ad5e957da9e23886b29586fb9b6650"
 
 [[package]]
 name = "duckdb"
-version = "0.10.0"
-source = "git+https://github.com/spicehq/duckdb-rs.git?rev=375d26e530272021ae56d11bbafa02c1fdc1004e#375d26e530272021ae56d11bbafa02c1fdc1004e"
+version = "0.10.1"
+source = "git+https://github.com/spicehq/duckdb-rs.git?rev=4e1cf06070891088a78085bef0aaa57944c19c8d#4e1cf06070891088a78085bef0aaa57944c19c8d"
 dependencies = [
  "arrow",
  "cast",
@@ -3461,8 +3461,8 @@ checksum = "9c198f91728a82281a64e1f4f9eeb25d82cb32a5de251c6bd1b5154d63a8e7bd"
 
 [[package]]
 name = "libduckdb-sys"
-version = "0.10.0"
-source = "git+https://github.com/spicehq/duckdb-rs.git?rev=375d26e530272021ae56d11bbafa02c1fdc1004e#375d26e530272021ae56d11bbafa02c1fdc1004e"
+version = "0.10.1"
+source = "git+https://github.com/spicehq/duckdb-rs.git?rev=4e1cf06070891088a78085bef0aaa57944c19c8d#4e1cf06070891088a78085bef0aaa57944c19c8d"
 dependencies = [
  "autocfg",
  "cc",
