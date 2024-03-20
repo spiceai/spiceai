@@ -1,0 +1,327 @@
+name: E2E Test CI
+
+on:
+  push:
+    branches:
+      - trunk
+      - release-*
+
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }} binaries
+    runs-on: ${{ matrix.runner }}
+    env:
+      GOVER: 1.22
+      GOOS: ${{ matrix.target_os }}
+      GOARCH: ${{ matrix.target_arch_go }}
+
+    strategy:
+      matrix:
+        include:
+          - name: Linux x64
+            runner: rust
+            target_os: linux
+            target_arch: x86_64
+            target_arch_go: amd64
+          # - name: macOS aarch64 (Apple Silicon)
+          #   runner: macos-14
+          #   target_os: darwin
+          #   target_arch: aarch64
+          #   target_arch_go: arm64
+          # - name: macOS x64 (Intel)
+          #   runner: rust-osx-x64
+          #   target_os: darwin
+          #   target_arch: x86_64
+          #   target_arch_go: amd64
+          # - name: Windows x64
+          #   runner: rust-windows-x64
+          #   target_os: windows
+          #   target_arch: x86_64
+          #   target_arch_go: amd64
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set REL_VERSION from version.txt
+        run: python3 ./.github/scripts/get_release_version.py
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GOVER }}
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          os: ${{ matrix.target_os }}
+
+      - name: Restore build cache (macOS)
+        if: matrix.target_os == 'darwin'
+        run: |
+          mkdir -p target
+          if [ -d /Users/spiceai/build/target ]; then
+            rsync -av /Users/spiceai/build/target/ target/
+          fi
+
+      - name: Restore build cache (Linux)
+        if: matrix.target_os == 'linux'
+        run: |
+          mkdir -p target
+          if [ -d /home/spiceai/build/target ]; then
+            rsync -av /home/spiceai/build/target/ target/
+          fi
+
+      - name: Restore build cache (Windows)
+        if: matrix.target_os == 'windows'
+        run: |
+          mkdir -p target
+          if (Test-Path C:/spiceai/build/target) {
+            Copy-Item -Recurse -Force C:/spiceai/build/target/* target/
+          }
+
+      - name: Build spiced
+        run: make -C bin/spiced
+
+      - name: Update build cache (macOS)
+        if: matrix.target_os == 'darwin'
+        run: |
+          if [ -d /Users/spiceai/build/target ]; then
+            rsync -av target/ /Users/spiceai/build/target/
+          fi
+
+      - name: Update build cache (Linux)
+        if: matrix.target_os == 'linux'
+        run: |
+          if [ -d /home/spiceai/build/target ]; then
+            rsync -av target/ /home/spiceai/build/target/
+          fi
+
+      - name: Update build cache (Windows)
+        if: matrix.target_os == 'windows'
+        run: |
+          if (Test-Path C:/spiceai/build/target) {
+            Copy-Item -Recurse -Force target/* C:/spiceai/build/target
+          }
+
+      - name: Build spice
+        run: make -C bin/spice
+
+      - name: make spiced executable
+        if: matrix.target_os != 'windows'
+        run: |
+          mv target/release/spiced spiced
+          chmod +x spiced
+
+      - name: make spice executable
+        if: matrix.target_os != 'windows'
+        run: |
+          mv target/release/spice spice
+          chmod +x spice
+
+      - name: Save spice artifact
+        uses: actions/upload-artifact@v4
+        if: matrix.target_os != 'windows'
+        with:
+          name: build_${{ matrix.target_os }}_${{ matrix.target_arch }}
+          path: |
+            spice
+            spiced
+
+  test_quickstart_dremio:
+    name: "E2E Test: Dremio quickstart, using ${{ matrix.target_os }}-${{ matrix.target_arch }}"
+    runs-on: ${{ matrix.runner }}
+    needs: build
+
+    strategy:
+      matrix:
+        include:
+          - name: Linux x64
+            runner: ubuntu-latest
+            target_os: linux
+            target_arch: x86_64
+            target_arch_go: amd64
+          # - name: macOS aarch64 (Apple Silicon)
+          #   runner: macos-14
+          #   target_os: darwin
+          #   target_arch: aarch64
+          #   target_arch_go: arm64
+          # - name: macOS x64 (Intel)
+          #   runner: rust-osx-x64
+          #   target_os: darwin
+          #   target_arch: x86_64
+          #   target_arch_go: amd64
+          # - name: Windows x64
+          #   runner: rust-windows-x64
+          #   target_os: windows
+          #   target_arch: x86_64
+          #   target_arch_go: amd64
+
+    steps:
+      - name: download artifacts - build_${{ matrix.target_os }}_${{ matrix.target_arch }}
+        uses: actions/download-artifact@v4
+        with:
+          name: build_${{ matrix.target_os }}_${{ matrix.target_arch }}
+          path: ./build
+
+      - name: Install spice
+        run: |
+          chmod +x ./build/spice
+          chmod +x ./build/spiced
+          mkdir "$HOME/.spice/"
+          echo "$GITHUB_WORKSPACE/build" >> $GITHUB_PATH
+
+      - name: Check spice version
+        run: spice version
+
+      - name: Init spice app
+        run: |
+          spice init test_app
+
+      - name: Connect Dremio
+        working-directory: test_app
+        run: |
+          spice login dremio -u demo -p demo1234
+
+      - name: Start spice runtime
+        working-directory: test_app
+        run: |
+          spice run &
+
+      - name: Wait for Spice runtime healthy
+        working-directory: test_app
+        timeout-minutes: 1
+        run: |
+          while [[ "$(curl -s http://localhost:3000/health)" != "ok" ]]; do sleep 1; done
+
+      - name: Add spiceai/quickstart
+        working-directory: test_app
+        run: |
+          spice add spiceai/quickstart
+          cat spicepod.yaml
+
+      - name: Check datasets
+        working-directory: test_app
+        run: |
+          response=$(curl http://localhost:3000/v1/datasets)
+          echo $response | jq
+          length=$(echo $response | jq 'if type=="array" then length else empty end')
+          if [[ $length -ne 1 ]]; then
+            echo "Unexpected response: $response, expected 1 dataset but received $length"
+            exit 1
+          fi
+
+      # TODO fix this step
+      # - name: Check tables
+      #   working-directory: test_app
+      #   run: |
+      #     response=$(curl -X POST \
+      #       -H "Content-Type: text/plain" \
+      #       -d "show tables;" \
+      #       http://localhost:3000/v1/sql
+      #     )
+      #     echo $response | jq
+      #     length=$(echo $response | jq 'if type=="array" then length else empty end')
+      #     if [[ $length -ne 5 ]]; then
+      #       echo "Unexpected response: $response, expected 5 tables but received $length"
+      #       exit 1
+      #     fi
+
+  test_quickstart_spiceai:
+    name: "E2E Test: SpiceAI quickstart, using ${{ matrix.target_os }}-${{ matrix.target_arch }}"
+    runs-on: ${{ matrix.runner }}
+    needs: build
+
+    strategy:
+      matrix:
+        include:
+          - name: Linux x64
+            runner: ubuntu-latest
+            target_os: linux
+            target_arch: x86_64
+            target_arch_go: amd64
+          # - name: macOS aarch64 (Apple Silicon)
+          #   runner: macos-14
+          #   target_os: darwin
+          #   target_arch: aarch64
+          #   target_arch_go: arm64
+          # - name: macOS x64 (Intel)
+          #   runner: rust-osx-x64
+          #   target_os: darwin
+          #   target_arch: x86_64
+          #   target_arch_go: amd64
+          # - name: Windows x64
+          #   runner: rust-windows-x64
+          #   target_os: windows
+          #   target_arch: x86_64
+          #   target_arch_go: amd64
+
+    steps:
+      - name: download artifacts - build_${{ matrix.target_os }}_${{ matrix.target_arch }}
+        uses: actions/download-artifact@v4
+        with:
+          name: build_${{ matrix.target_os }}_${{ matrix.target_arch }}
+          path: ./build
+
+      - name: Install spice
+        run: |
+          chmod +x ./build/spice
+          chmod +x ./build/spiced
+          echo "$GITHUB_WORKSPACE/build" >> $GITHUB_PATH
+
+      - name: Check spice version
+        run: spice version
+
+      - name: Init spice app
+        run: |
+          spice init test_app
+
+      - name: Configure spice app
+        working-directory: test_app
+        run: |
+          # equal to "spice dataset configure"
+          mkdir -p datasets/eth_recent_blocks
+          echo -e "from: spice.ai/eth.recent_blocks\nname: eth_recent_blocks\ndescription: eth recent logs\nacceleration:\n  enabled: true\n  refresh_interval: 10s\n  refresh_mode: full" >> datasets/eth_recent_blocks/dataset.yaml
+
+          # configure env secret store and add dataset
+          echo -e "secrets:\n  store: env\ndatasets:\n- ref: datasets/eth_recent_blocks" >> spicepod.yaml
+
+      - name: Start spice runtime
+        env:
+          SPICE_SECRET_SPICEAI_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_KEY }}
+        working-directory: test_app
+        run: |
+          spice run &
+
+      - name: Wait for Spice runtime healthy
+        working-directory: test_app
+        timeout-minutes: 1
+        run: |
+          while [[ "$(curl -s http://localhost:3000/health)" != "ok" ]]; do sleep 1; done
+
+      - name: Check datasets
+        working-directory: test_app
+        run: |
+          response=$(curl http://localhost:3000/v1/datasets)
+          echo $response | jq
+          length=$(echo $response | jq 'if type=="array" then length else empty end')
+          if [[ $length -ne 1 ]]; then
+            echo "Unexpected response: $response, expected 1 dataset but received $length"
+            exit 1
+          fi
+
+      - name: Check tables
+        working-directory: test_app
+        run: |
+          response=$(curl -X POST \
+            -H "Content-Type: text/plain" \
+            -d "show tables;" \
+            http://localhost:3000/v1/sql
+          )
+          echo $response | jq
+          length=$(echo $response | jq 'if type=="array" then length else empty end')
+          if [[ $length -ne 5 ]]; then
+            echo "Unexpected response: $response, expected 5 tables but received $length"
+            exit 1
+          fi
