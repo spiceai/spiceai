@@ -223,7 +223,7 @@ jobs:
             -d "show tables;" \
             http://localhost:3000/v1/sql
           )
-          tables=$(echo $response | jq 'if type=="array" then length else empty end')
+          length=$(echo $response | jq 'if type=="array" then length else empty end')
           if [[ $length -ne 5 ]]; then
             echo "Unexpected response: $response, expected 5 tables but received $length"
             exit 1
@@ -319,7 +319,7 @@ jobs:
             -d "show tables;" \
             http://localhost:3000/v1/sql
           )
-          tables=$(echo $response | jq 'if type=="array" then length else empty end')
+          length=$(echo $response | jq 'if type=="array" then length else empty end')
           if [[ $length -ne 5 ]]; then
             echo "Unexpected response: $response, expected 5 tables but received $length"
             exit 1
