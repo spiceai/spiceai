@@ -307,7 +307,7 @@ jobs:
           response=$(curl http://localhost:3000/v1/datasets)
           length=$(echo $response | jq 'if type=="array" then length else empty end')
           if [[ $length -ne 1 ]]; then
-            echo "Unexpected response: $response, expected 1 dataset"
+            echo "Unexpected response: $response, expected 1 dataset but received $length"
             exit 1
           fi
 
@@ -321,6 +321,6 @@ jobs:
           )
           tables=$(echo $response | jq 'if type=="array" then length else empty end')
           if [[ $length -ne 5 ]]; then
-            echo "Unexpected response: $response, expected 5 tables"
+            echo "Unexpected response: $response, expected 5 tables but received $length"
             exit 1
           fi
