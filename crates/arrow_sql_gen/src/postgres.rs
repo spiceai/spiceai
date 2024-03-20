@@ -11,6 +11,7 @@ use arrow::array::Float64Builder;
 use arrow::array::Int16Builder;
 use arrow::array::Int32Builder;
 use arrow::array::Int64Builder;
+use arrow::array::ListBuilder;
 use arrow::array::RecordBatch;
 use arrow::array::RecordBatchOptions;
 use arrow::array::StringBuilder;
@@ -275,7 +276,7 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                     };
                     let Some(builder) = builder
                         .as_any_mut()
-                        .downcast_mut::<arrow::array::ListBuilder<arrow::array::Int16Builder>>()
+                        .downcast_mut::<ListBuilder<Int16Builder>>()
                     else {
                         return FailedToDowncastBuilderSnafu {
                             postgres_type: format!("{postgres_type}"),
@@ -292,7 +293,7 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                     };
                     let Some(builder) = builder
                         .as_any_mut()
-                        .downcast_mut::<arrow::array::ListBuilder<arrow::array::Int32Builder>>()
+                        .downcast_mut::<ListBuilder<Int32Builder>>()
                     else {
                         return FailedToDowncastBuilderSnafu {
                             postgres_type: format!("{postgres_type}"),
@@ -309,7 +310,7 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                     };
                     let Some(builder) = builder
                         .as_any_mut()
-                        .downcast_mut::<arrow::array::ListBuilder<arrow::array::Int64Builder>>()
+                        .downcast_mut::<ListBuilder<Int64Builder>>()
                     else {
                         return FailedToDowncastBuilderSnafu {
                             postgres_type: format!("{postgres_type}"),
@@ -326,7 +327,7 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                     };
                     let Some(builder) = builder
                         .as_any_mut()
-                        .downcast_mut::<arrow::array::ListBuilder<arrow::array::Float32Builder>>()
+                        .downcast_mut::<ListBuilder<Float32Builder>>()
                     else {
                         return FailedToDowncastBuilderSnafu {
                             postgres_type: format!("{postgres_type}"),
@@ -343,7 +344,7 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                     };
                     let Some(builder) = builder
                         .as_any_mut()
-                        .downcast_mut::<arrow::array::ListBuilder<arrow::array::Float64Builder>>()
+                        .downcast_mut::<ListBuilder<Float64Builder>>()
                     else {
                         return FailedToDowncastBuilderSnafu {
                             postgres_type: format!("{postgres_type}"),
@@ -360,7 +361,7 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                     };
                     let Some(builder) = builder
                         .as_any_mut()
-                        .downcast_mut::<arrow::array::ListBuilder<arrow::array::StringBuilder>>()
+                        .downcast_mut::<ListBuilder<StringBuilder>>()
                     else {
                         return FailedToDowncastBuilderSnafu {
                             postgres_type: format!("{postgres_type}"),
@@ -377,7 +378,7 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                     };
                     let Some(builder) = builder
                         .as_any_mut()
-                        .downcast_mut::<arrow::array::ListBuilder<arrow::array::BooleanBuilder>>()
+                        .downcast_mut::<ListBuilder<BooleanBuilder>>()
                     else {
                         return FailedToDowncastBuilderSnafu {
                             postgres_type: format!("{postgres_type}"),

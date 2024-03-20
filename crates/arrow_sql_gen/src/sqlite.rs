@@ -3,8 +3,13 @@ use std::sync::Arc;
 use crate::arrow::map_data_type_to_array_builder;
 use arrow::array::ArrayBuilder;
 use arrow::array::ArrayRef;
+use arrow::array::BinaryBuilder;
+use arrow::array::Float64Builder;
+use arrow::array::Int64Builder;
+use arrow::array::NullBuilder;
 use arrow::array::RecordBatch;
 use arrow::array::RecordBatchOptions;
+use arrow::array::StringBuilder;
 use arrow::datatypes::DataType;
 use arrow::datatypes::Field;
 use arrow::datatypes::Schema;
@@ -96,10 +101,7 @@ fn add_row_to_builders(
 
         match *sqlite_type {
             Type::Null => {
-                let Some(builder) = builder
-                    .as_any_mut()
-                    .downcast_mut::<arrow::array::NullBuilder>()
-                else {
+                let Some(builder) = builder.as_any_mut().downcast_mut::<NullBuilder>() else {
                     return FailedToDowncastBuilderSnafu {
                         sqlite_type: format!("{sqlite_type}"),
                     }
@@ -108,10 +110,7 @@ fn add_row_to_builders(
                 builder.append_null();
             }
             Type::Integer => {
-                let Some(builder) = builder
-                    .as_any_mut()
-                    .downcast_mut::<arrow::array::Int64Builder>()
-                else {
+                let Some(builder) = builder.as_any_mut().downcast_mut::<Int64Builder>() else {
                     return FailedToDowncastBuilderSnafu {
                         sqlite_type: format!("{sqlite_type}"),
                     }
@@ -121,10 +120,7 @@ fn add_row_to_builders(
                 builder.append_value(v);
             }
             Type::Real => {
-                let Some(builder) = builder
-                    .as_any_mut()
-                    .downcast_mut::<arrow::array::Float64Builder>()
-                else {
+                let Some(builder) = builder.as_any_mut().downcast_mut::<Float64Builder>() else {
                     return FailedToDowncastBuilderSnafu {
                         sqlite_type: format!("{sqlite_type}"),
                     }
@@ -134,10 +130,7 @@ fn add_row_to_builders(
                 builder.append_value(v);
             }
             Type::Text => {
-                let Some(builder) = builder
-                    .as_any_mut()
-                    .downcast_mut::<arrow::array::StringBuilder>()
-                else {
+                let Some(builder) = builder.as_any_mut().downcast_mut::<StringBuilder>() else {
                     return FailedToDowncastBuilderSnafu {
                         sqlite_type: format!("{sqlite_type}"),
                     }
@@ -147,10 +140,7 @@ fn add_row_to_builders(
                 builder.append_value(v);
             }
             Type::Blob => {
-                let Some(builder) = builder
-                    .as_any_mut()
-                    .downcast_mut::<arrow::array::BinaryBuilder>()
-                else {
+                let Some(builder) = builder.as_any_mut().downcast_mut::<BinaryBuilder>() else {
                     return FailedToDowncastBuilderSnafu {
                         sqlite_type: format!("{sqlite_type}"),
                     }
