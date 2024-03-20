@@ -173,20 +173,26 @@ jobs:
         run: |
           chmod +x ./build/spice
           chmod +x ./build/spiced
-          echo "${{ github.workspace }}/build" >> $GITHUB_PATH
-          echo "$HOME"
-          echo "$GITHUB_PATH"
+          ls -la $HOME
+          ls -la $HOME/build
+          echo "$HOME/build" >> $GITHUB_PATH
 
       - name: Check spice version
         run: spice version
 
       - name: Init spice app
         run: |
+          ls -la $HOME/build
+          echo $HOME
+          echo $GITHUB_PATH
           spice init test_app
 
       - name: Connect Dremio
         working-directory: test_app
         run: |
+          ls -la $HOME/build
+          echo $HOME
+          echo $GITHUB_PATH
           spice login dremio -u demo -p demo1234
 
       - name: Start spice runtime
@@ -239,7 +245,7 @@ jobs:
       matrix:
         include:
           - name: Linux x64
-            runner: rust
+            runner: ubuntu-latest
             target_os: linux
             target_arch: x86_64
             target_arch_go: amd64
