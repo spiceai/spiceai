@@ -29,16 +29,16 @@ jobs:
             target_os: linux
             target_arch: x86_64
             target_arch_go: amd64
-          # - name: macOS aarch64 (Apple Silicon)
-          #   runner: macos-14
-          #   target_os: darwin
-          #   target_arch: aarch64
-          #   target_arch_go: arm64
-          # - name: macOS x64 (Intel)
-          #   runner: rust-osx-x64
-          #   target_os: darwin
-          #   target_arch: x86_64
-          #   target_arch_go: amd64
+          - name: macOS aarch64 (Apple Silicon)
+            runner: macos-14
+            target_os: darwin
+            target_arch: aarch64
+            target_arch_go: arm64
+          - name: macOS x64 (Intel)
+            runner: rust-osx-x64
+            target_os: darwin
+            target_arch: x86_64
+            target_arch_go: amd64
           # - name: Windows x64
           #   runner: rust-windows-x64
           #   target_os: windows
@@ -139,6 +139,7 @@ jobs:
     needs: build
 
     strategy:
+      fail-fast: false
       matrix:
         include:
           - name: Linux x64
@@ -146,16 +147,16 @@ jobs:
             target_os: linux
             target_arch: x86_64
             target_arch_go: amd64
-          # - name: macOS aarch64 (Apple Silicon)
-          #   runner: macos-14
-          #   target_os: darwin
-          #   target_arch: aarch64
-          #   target_arch_go: arm64
-          # - name: macOS x64 (Intel)
-          #   runner: rust-osx-x64
-          #   target_os: darwin
-          #   target_arch: x86_64
-          #   target_arch_go: amd64
+          - name: macOS aarch64 (Apple Silicon)
+            runner: macos-14
+            target_os: darwin
+            target_arch: aarch64
+            target_arch_go: arm64
+          - name: macOS x64 (Intel)
+            runner: macos-12
+            target_os: darwin
+            target_arch: x86_64
+            target_arch_go: amd64
           # - name: Windows x64
           #   runner: rust-windows-x64
           #   target_os: windows
@@ -250,6 +251,7 @@ jobs:
     needs: build
 
     strategy:
+      fail-fast: false
       matrix:
         include:
           - name: Linux x64
@@ -257,16 +259,16 @@ jobs:
             target_os: linux
             target_arch: x86_64
             target_arch_go: amd64
-          # - name: macOS aarch64 (Apple Silicon)
-          #   runner: macos-14
-          #   target_os: darwin
-          #   target_arch: aarch64
-          #   target_arch_go: arm64
-          # - name: macOS x64 (Intel)
-          #   runner: rust-osx-x64
-          #   target_os: darwin
-          #   target_arch: x86_64
-          #   target_arch_go: amd64
+          - name: macOS aarch64 (Apple Silicon)
+            runner: macos-14
+            target_os: darwin
+            target_arch: aarch64
+            target_arch_go: arm64
+          - name: macOS x64 (Intel)
+            runner: macos-12
+            target_os: darwin
+            target_arch: x86_64
+            target_arch_go: amd64
           # - name: Windows x64
           #   runner: rust-windows-x64
           #   target_os: windows
