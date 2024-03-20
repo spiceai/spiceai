@@ -2,6 +2,9 @@ use std::net::SocketAddr;
 
 use clap::Parser;
 use metrics_exporter_prometheus::PrometheusBuilder;
+use metrics_exporter_prometheus::PrometheusRecorder;
+use runtime::metrics::{CompositeRecorder, LocalGaugeRecorder};
+use tokio::runtime::Handle;
 use tokio::runtime::Runtime;
 use tracing_subscriber::EnvFilter;
 
@@ -59,7 +62,7 @@ async fn start_runtime(args: spiced::Args) -> Result<(), Box<dyn std::error::Err
     if let Some(metrics_socket) = args.metrics {
         init_metrics(metrics_socket)?;
     }
-
+    metrics::gauge!("Hello").set(3.0);
     spiced::run(args).await?;
     Ok(())
 }
@@ -83,11 +86,23 @@ fn init_tracing() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn init_metrics(socket_addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
-    let builder = PrometheusBuilder::new().with_http_listener(socket_addr);
-
-    // This needs to run inside a Tokio runtime.
-    builder.install()?;
+    let mut recorder = CompositeRecorder::new();
+    recorder.add_recorder(LocalGaugeRecorder::with_prefix(None));
+    recorder.add_recorder(init_prometheus(socket_addr)?);
+    metrics::set_global_recorder(recorder)?;
     tracing::info!("Metrics listening on {socket_addr}");
 
     Ok(())
+}
+
+// This needs to run inside a Tokio runtime.
+fn init_prometheus(
+    socket_addr: SocketAddr,
+) -> Result<PrometheusRecorder, Box<dyn std::error::Error>> {
+    let (prom_recorder, prom_exporter) = PrometheusBuilder::new()
+        .with_http_listener(socket_addr)
+        .build()?;
+
+    std::mem::drop(Handle::try_current()?.spawn(prom_exporter)); // Manually run exporter Future in current runtime.
+    Ok(prom_recorder)
 }
