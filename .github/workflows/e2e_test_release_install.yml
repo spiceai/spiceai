@@ -2,22 +2,25 @@ name: E2E Test Release Installation
 
 on:
   workflow_dispatch:
-    inputs:
-      os:
-        type: choice
-        description: 'Operating System'
-        required: true
-        options:
-          - ubuntu-latest
-          - macos-latest
-        default: 'ubuntu-latest'
 
 jobs:
   test-install:
-    name: test installation (${{ github.event.inputs.os }})
-    runs-on: ${{ github.event.inputs.os }}
-
+    name: install on ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x64
+            runner: ubuntu-latest
+          - name: macOS aarch64 (Apple Silicon)
+            runner: macos-14
+          - name: macOS x64 (Intel)
+            runner: macos-12
     steps:
+    - name: system info
+      run: uname -m
+
     - name: checkout code
       uses: actions/checkout@v3
 
@@ -40,7 +43,8 @@ jobs:
 
     - name: wait for Spice runtime healthy
       run: |
-        timeout 60 bash -c 'while [[ "$(curl -s http://localhost:3000/health)" != "ok" ]]; do sleep 1; done' || false
+        bash -c 'while [[ "$(curl -s http://localhost:3000/health)" != "ok" ]]; do sleep 1; done' || false
+      timeout-minutes: 1
 
     - name: check Spice cli and runtime version
       run: |
