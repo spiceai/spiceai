@@ -74,6 +74,30 @@ impl CreateTableBuilder {
     }
 }
 
+macro_rules! push_value {
+    ($row_values:expr, $column:expr, $row:expr, $array_type:ident) => {{
+        let array = $column.as_any().downcast_ref::<array::$array_type>();
+        if let Some(valid_array) = array {
+            $row_values.push(valid_array.value($row).into());
+        }
+    }};
+}
+
+macro_rules! push_list_values {
+    ($data_type:expr, $list_array:expr, $row_values:expr, $array_type:ty, $vec_type:ty, $sql_type:expr) => {{
+        let mut list_values: Vec<$vec_type> = Vec::new();
+        for i in 0..$list_array.len() {
+            let temp_array = $list_array.as_any().downcast_ref::<$array_type>();
+            if let Some(valid_array) = temp_array {
+                list_values.push(valid_array.value(i));
+            }
+        }
+        let expr: SimpleExpr = list_values.into();
+        // We must cast here in case the array is empty which SeaQuery does not handle.
+        $row_values.push(expr.cast_as(Alias::new($sql_type)));
+    }};
+}
+
 pub struct InsertBuilder {
     table_name: String,
     record_batches: Vec<RecordBatch>,
@@ -99,78 +123,18 @@ impl InsertBuilder {
             for col in 0..record_batch.num_columns() {
                 let column = record_batch.column(col);
                 match column.data_type() {
-                    DataType::Int8 => {
-                        let array = column.as_any().downcast_ref::<array::Int8Array>();
-                        if let Some(valid_array) = array {
-                            row_values.push(valid_array.value(row).into());
-                        }
-                    }
-                    DataType::Int16 => {
-                        let array = column.as_any().downcast_ref::<array::Int16Array>();
-                        if let Some(valid_array) = array {
-                            row_values.push(valid_array.value(row).into());
-                        }
-                    }
-                    DataType::Int32 => {
-                        let array = column.as_any().downcast_ref::<array::Int32Array>();
-                        if let Some(valid_array) = array {
-                            row_values.push(valid_array.value(row).into());
-                        }
-                    }
-                    DataType::Int64 => {
-                        let array = column.as_any().downcast_ref::<array::Int64Array>();
-                        if let Some(valid_array) = array {
-                            row_values.push(valid_array.value(row).into());
-                        }
-                    }
-                    DataType::UInt8 => {
-                        let array = column.as_any().downcast_ref::<array::UInt8Array>();
-                        if let Some(valid_array) = array {
-                            row_values.push(valid_array.value(row).into());
-                        }
-                    }
-                    DataType::UInt16 => {
-                        let array = column.as_any().downcast_ref::<array::UInt16Array>();
-                        if let Some(valid_array) = array {
-                            row_values.push(valid_array.value(row).into());
-                        }
-                    }
-                    DataType::UInt32 => {
-                        let array = column.as_any().downcast_ref::<array::UInt32Array>();
-                        if let Some(valid_array) = array {
-                            row_values.push(valid_array.value(row).into());
-                        }
-                    }
-                    DataType::UInt64 => {
-                        let array = column.as_any().downcast_ref::<array::UInt64Array>();
-                        if let Some(valid_array) = array {
-                            row_values.push(valid_array.value(row).into());
-                        }
-                    }
-                    DataType::Float32 => {
-                        let array = column.as_any().downcast_ref::<array::Float32Array>();
-                        if let Some(valid_array) = array {
-                            row_values.push(valid_array.value(row).into());
-                        }
-                    }
-                    DataType::Float64 => {
-                        let array = column.as_any().downcast_ref::<array::Float64Array>();
-                        if let Some(valid_array) = array {
-                            row_values.push(valid_array.value(row).into());
-                        }
-                    }
-                    DataType::Utf8 => {
-                        let array = column.as_any().downcast_ref::<array::StringArray>();
-                        if let Some(valid_array) = array {
-                            row_values.push(valid_array.value(row).into());
-                        }
-                    }
-                    DataType::Boolean => {
-                        let array = column.as_any().downcast_ref::<array::BooleanArray>();
-                        if let Some(valid_array) = array {
-                            row_values.push(valid_array.value(row).into());
-                        }
-                    }
+                    DataType::Int8 => push_value!(row_values, column, row, Int8Array),
+                    DataType::Int16 => push_value!(row_values, column, row, Int16Array),
+                    DataType::Int32 => push_value!(row_values, column, row, Int32Array),
+                    DataType::Int64 => push_value!(row_values, column, row, Int64Array),
+                    DataType::UInt8 => push_value!(row_values, column, row, UInt8Array),
+                    DataType::UInt16 => push_value!(row_values, column, row, UInt16Array),
+                    DataType::UInt32 => push_value!(row_values, column, row, UInt32Array),
+                    DataType::UInt64 => push_value!(row_values, column, row, UInt64Array),
+                    DataType::Float32 => push_value!(row_values, column, row, Float32Array),
+                    DataType::Float64 => push_value!(row_values, column, row, Float64Array),
+                    DataType::Utf8 => push_value!(row_values, column, row, StringArray),
+                    DataType::Boolean => push_value!(row_values, column, row, BooleanArray),
                     DataType::Decimal128(_, scale) => {
                         let array = column.as_any().downcast_ref::<array::Decimal128Array>();
                         if let Some(valid_array) = array {
@@ -208,86 +172,54 @@ impl InsertBuilder {
                         if let Some(valid_array) = array {
                             let list_array = valid_array.value(row);
                             match list_type.data_type() {
-                                DataType::Int8 => {
-                                    let mut list_values: Vec<i8> = vec![];
-                                    for i in 0..list_array.len() {
-                                        let int_array =
-                                            list_array.as_any().downcast_ref::<array::Int8Array>();
-                                        if let Some(valid_int_array) = int_array {
-                                            list_values.push(valid_int_array.value(i));
-                                        }
-                                    }
-                                    let expr: SimpleExpr = list_values.into();
-                                    // We must cast here in case the array is empty which SeaQuery does not handle.
-                                    row_values.push(expr.cast_as(Alias::new("int2[]")));
-                                }
-                                DataType::Int16 => {
-                                    let mut list_values: Vec<i16> = vec![];
-                                    for i in 0..list_array.len() {
-                                        let int_array =
-                                            list_array.as_any().downcast_ref::<array::Int16Array>();
-                                        if let Some(valid_int_array) = int_array {
-                                            list_values.push(valid_int_array.value(i));
-                                        }
-                                    }
-                                    let expr: SimpleExpr = list_values.into();
-                                    // We must cast here in case the array is empty which SeaQuery does not handle.
-                                    row_values.push(expr.cast_as(Alias::new("int2[]")));
-                                }
-                                DataType::Int32 => {
-                                    let mut list_values: Vec<i32> = vec![];
-                                    for i in 0..list_array.len() {
-                                        let int_array =
-                                            list_array.as_any().downcast_ref::<array::Int32Array>();
-                                        if let Some(valid_int_array) = int_array {
-                                            list_values.push(valid_int_array.value(i));
-                                        }
-                                    }
-                                    let expr: SimpleExpr = list_values.into();
-                                    // We must cast here in case the array is empty which SeaQuery does not handle.
-                                    row_values.push(expr.cast_as(Alias::new("int4[]")));
-                                }
-                                DataType::Int64 => {
-                                    let mut list_values: Vec<i64> = vec![];
-                                    for i in 0..list_array.len() {
-                                        let int_array =
-                                            list_array.as_any().downcast_ref::<array::Int64Array>();
-                                        if let Some(valid_int_array) = int_array {
-                                            list_values.push(valid_int_array.value(i));
-                                        }
-                                    }
-                                    let expr: SimpleExpr = list_values.into();
-                                    // We must cast here in case the array is empty which SeaQuery does not handle.
-                                    row_values.push(expr.cast_as(Alias::new("int8[]")));
-                                }
-                                DataType::Float32 => {
-                                    let mut list_values: Vec<f32> = vec![];
-                                    for i in 0..list_array.len() {
-                                        let int_array = list_array
-                                            .as_any()
-                                            .downcast_ref::<array::Float32Array>();
-                                        if let Some(valid_int_array) = int_array {
-                                            list_values.push(valid_int_array.value(i));
-                                        }
-                                    }
-                                    let expr: SimpleExpr = list_values.into();
-                                    // We must cast here in case the array is empty which SeaQuery does not handle.
-                                    row_values.push(expr.cast_as(Alias::new("float4[]")));
-                                }
-                                DataType::Float64 => {
-                                    let mut list_values: Vec<f64> = vec![];
-                                    for i in 0..list_array.len() {
-                                        let int_array = list_array
-                                            .as_any()
-                                            .downcast_ref::<array::Float64Array>();
-                                        if let Some(valid_int_array) = int_array {
-                                            list_values.push(valid_int_array.value(i));
-                                        }
-                                    }
-                                    let expr: SimpleExpr = list_values.into();
-                                    // We must cast here in case the array is empty which SeaQuery does not handle.
-                                    row_values.push(expr.cast_as(Alias::new("float8[]")));
-                                }
+                                DataType::Int8 => push_list_values!(
+                                    list_type.data_type(),
+                                    list_array,
+                                    row_values,
+                                    array::Int8Array,
+                                    i8,
+                                    "int2[]"
+                                ),
+                                DataType::Int16 => push_list_values!(
+                                    list_type.data_type(),
+                                    list_array,
+                                    row_values,
+                                    array::Int16Array,
+                                    i16,
+                                    "int2[]"
+                                ),
+                                DataType::Int32 => push_list_values!(
+                                    list_type.data_type(),
+                                    list_array,
+                                    row_values,
+                                    array::Int32Array,
+                                    i32,
+                                    "int4[]"
+                                ),
+                                DataType::Int64 => push_list_values!(
+                                    list_type.data_type(),
+                                    list_array,
+                                    row_values,
+                                    array::Int64Array,
+                                    i64,
+                                    "int8[]"
+                                ),
+                                DataType::Float32 => push_list_values!(
+                                    list_type.data_type(),
+                                    list_array,
+                                    row_values,
+                                    array::Float32Array,
+                                    f32,
+                                    "float4[]"
+                                ),
+                                DataType::Float64 => push_list_values!(
+                                    list_type.data_type(),
+                                    list_array,
+                                    row_values,
+                                    array::Float64Array,
+                                    f64,
+                                    "float8[]"
+                                ),
                                 DataType::Utf8 => {
                                     let mut list_values: Vec<String> = vec![];
                                     for i in 0..list_array.len() {
@@ -302,20 +234,14 @@ impl InsertBuilder {
                                     // We must cast here in case the array is empty which SeaQuery does not handle.
                                     row_values.push(expr.cast_as(Alias::new("text[]")));
                                 }
-                                DataType::Boolean => {
-                                    let mut list_values: Vec<bool> = vec![];
-                                    for i in 0..list_array.len() {
-                                        let int_array = list_array
-                                            .as_any()
-                                            .downcast_ref::<array::BooleanArray>();
-                                        if let Some(valid_int_array) = int_array {
-                                            list_values.push(valid_int_array.value(i));
-                                        }
-                                    }
-                                    let expr: SimpleExpr = list_values.into();
-                                    // We must cast here in case the array is empty which SeaQuery does not handle.
-                                    row_values.push(expr.cast_as(Alias::new("boolean[]")));
-                                }
+                                DataType::Boolean => push_list_values!(
+                                    list_type.data_type(),
+                                    list_array,
+                                    row_values,
+                                    array::BooleanArray,
+                                    bool,
+                                    "boolean[]"
+                                ),
                                 _ => unimplemented!(
                                     "Data type mapping not implemented for {}",
                                     list_type.data_type()
