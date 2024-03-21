@@ -19,6 +19,7 @@ use crate::dataupdate::{DataUpdate, UpdateType};
 use crate::info_spaced;
 use crate::tracers::SpacedTracer;
 
+use super::DataConnectorFactory;
 use super::{flight::Flight, DataConnector};
 
 #[derive(Debug, Snafu)]
@@ -39,15 +40,11 @@ pub struct SpiceAI {
     api_key: String,
 }
 
-#[async_trait]
-impl DataConnector for SpiceAI {
-    fn new(
+impl DataConnectorFactory for SpiceAI {
+    fn create(
         secret: Option<Secret>,
         params: Arc<Option<HashMap<String, String>>>,
-    ) -> Pin<Box<dyn Future<Output = super::Result<Self>> + Send>>
-    where
-        Self: Sized,
-    {
+    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         let default_flight_url = if cfg!(feature = "dev") {
             "https://dev-flight.spiceai.io".to_string()
         } else {
@@ -69,14 +66,18 @@ impl DataConnector for SpiceAI {
                 .await
                 .map_err(|e| super::Error::UnableToCreateDataConnector { source: e.into() })?;
             let flight = Flight::new(flight_client);
-            Ok(Self {
+            let spiceai = Self {
                 flight,
                 api_key: api_key.to_string(),
                 spaced_trace: Arc::new(SpacedTracer::new(Duration::from_secs(15))),
-            })
+            };
+            Ok(Box::new(spiceai) as Box<dyn DataConnector>)
         })
     }
+}
 
+#[async_trait]
+impl DataConnector for SpiceAI {
     fn supports_data_streaming(&self, _dataset: &Dataset) -> bool {
         true
     }

@@ -16,9 +16,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::{collections::HashMap, future::Future};
 
-use super::DataConnector;
 use super::Result;
 use super::UnableToGetTableProviderSnafu;
+use super::{DataConnector, DataConnectorFactory};
 
 pub struct Postgres {
     pool: Arc<
@@ -30,15 +30,11 @@ pub struct Postgres {
     >,
 }
 
-#[async_trait]
-impl DataConnector for Postgres {
-    fn new(
+impl DataConnectorFactory for Postgres {
+    fn create(
         secret: Option<Secret>,
         params: Arc<Option<HashMap<String, String>>>,
-    ) -> Pin<Box<dyn Future<Output = Result<Self>> + Send>>
-    where
-        Self: Sized,
-    {
+    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let pool: Arc<
                 dyn DbConnectionPool<
@@ -52,10 +48,13 @@ impl DataConnector for Postgres {
                     .context(UnableToGetTableProviderSnafu)?,
             );
 
-            Ok(Self { pool })
+            Ok(Box::new(Self { pool }) as Box<dyn DataConnector>)
         })
     }
+}
 
+#[async_trait]
+impl DataConnector for Postgres {
     fn get_all_data(
         &self,
         dataset: &Dataset,
