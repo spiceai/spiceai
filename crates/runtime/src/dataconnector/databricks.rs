@@ -16,32 +16,32 @@ use spicepod::component::dataset::Dataset;
 use crate::datapublisher::{AddDataResult, DataPublisher};
 use crate::dataupdate::DataUpdate;
 
-use super::DataConnector;
+use super::{DataConnector, DataConnectorFactory};
 
 #[derive(Clone)]
 pub struct Databricks {
     secret: Arc<Option<Secret>>,
 }
 
-#[async_trait]
-impl DataConnector for Databricks {
-    fn new(
+impl DataConnectorFactory for Databricks {
+    fn create(
         secret: Option<Secret>,
         _params: Arc<Option<HashMap<String, String>>>,
-    ) -> Pin<Box<dyn Future<Output = super::Result<Self>> + Send>>
-    where
-        Self: Sized,
-    {
+    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         // Needed to be able to load the s3:// scheme
         deltalake::aws::register_handlers(None);
         deltalake::azure::register_handlers(None);
-        Box::pin(async move {
-            Ok(Self {
-                secret: Arc::new(secret),
-            })
-        })
-    }
 
+        let databricks = Self {
+            secret: Arc::new(secret),
+        };
+
+        Box::pin(async move { Ok(Box::new(databricks) as Box<dyn DataConnector>) })
+    }
+}
+
+#[async_trait]
+impl DataConnector for Databricks {
     fn get_all_data(
         &self,
         dataset: &Dataset,

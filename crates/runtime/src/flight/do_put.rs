@@ -19,9 +19,7 @@ async fn get_sender_channel(
 ) -> Option<Arc<Sender<DataUpdate>>> {
     let channel_map_read = channel_map.read().await;
     if channel_map_read.contains_key(&path) {
-        let Some(channel) = channel_map_read.get(&path) else {
-            return None;
-        };
+        let channel = channel_map_read.get(&path)?;
         Some(Arc::clone(channel))
     } else {
         None
