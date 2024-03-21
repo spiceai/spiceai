@@ -14,9 +14,6 @@ on:
 
 jobs:
   build:
-    # WIP
-    if: false
-
     name: Build ${{ matrix.name }} binaries
     runs-on: ${{ matrix.runner }}
     env:
@@ -32,17 +29,16 @@ jobs:
             target_os: linux
             target_arch: x86_64
             target_arch_go: amd64
-          # WIP
-          # - name: macOS aarch64 (Apple Silicon)
-          #   runner: macos-14
-          #   target_os: darwin
-          #   target_arch: aarch64
-          #   target_arch_go: arm64
-          # - name: macOS x64 (Intel)
-          #   runner: macos-12
-          #   target_os: darwin
-          #   target_arch: x86_64
-          #   target_arch_go: amd64
+          - name: macOS aarch64 (Apple Silicon)
+            runner: macos-14
+            target_os: darwin
+            target_arch: aarch64
+            target_arch_go: arm64
+          - name: macOS x64 (Intel)
+            runner: macos-12
+            target_os: darwin
+            target_arch: x86_64
+            target_arch_go: amd64
           # - name: Windows x64
           #   runner: rust-windows-x64
           #   target_os: windows
@@ -141,9 +137,6 @@ jobs:
     name: "E2E Test: Dremio quickstart, using ${{ matrix.target_os }}-${{ matrix.target_arch }}"
     runs-on: ${{ matrix.runner }}
     needs: build
-
-    # WIP
-    if: false
 
     strategy:
       fail-fast: false
@@ -256,9 +249,6 @@ jobs:
     runs-on: ${{ matrix.runner }}
     needs: build
 
-    # WIP
-    if: false
-
     strategy:
       fail-fast: false
       matrix:
@@ -349,7 +339,7 @@ jobs:
           echo $response | jq
           table_exists=$(echo $response | jq '[.[] | select(.table_name == "eth_recent_blocks")]' | jq 'length')
           if [[ $table_exists -eq 0 ]]; then
-            echo "Unexpected response: table 'taxi_trips' does not exist."
+            echo "Unexpected response: table 'eth_recent_blocks' does not exist."
             exit 1
           fi
 
@@ -366,32 +356,22 @@ jobs:
   test_quickstart_data_postgres:
     name: "E2E Test: SpiceAI quickstart, using ${{ matrix.target_os }}-${{ matrix.target_arch }}"
     runs-on: ${{ matrix.runner }}
-    # needs: build
-
-    # services:
-    #   postgres:
-    #     image: postgres:16
-    #     env:
-    #       POSTGRES_USER: postgres
-    #       POSTGRES_PASSWORD: postgres
-    #       POSTGRES_DB: testdb
-    #     ports:
-    #       - 5432:5432
+    needs: build
 
     strategy:
       fail-fast: false
       matrix:
         include:
-          # - name: Linux x64
-          #   runner: ubuntu-latest
-          #   target_os: linux
-          #   target_arch: x86_64
-          #   target_arch_go: amd64
-          # - name: macOS aarch64 (Apple Silicon)
-          #   runner: macos-14
-          #   target_os: darwin
-          #   target_arch: aarch64
-          #   target_arch_go: arm64
+          - name: Linux x64
+            runner: ubuntu-latest
+            target_os: linux
+            target_arch: x86_64
+            target_arch_go: amd64
+          - name: macOS aarch64 (Apple Silicon)
+            runner: macos-14
+            target_os: darwin
+            target_arch: aarch64
+            target_arch_go: arm64
           - name: macOS x64 (Intel)
             runner: macos-12
             target_os: darwin
@@ -443,26 +423,17 @@ jobs:
           psql -h localhost -U postgres -d testdb -c "INSERT INTO eth_recent_blocks (block_number, block_hash, block_timestamp) VALUES (3, '0x9abc', '2022-01-01 00:00:00');"
           psql -h localhost -U postgres -d testdb -c 'SELECT * FROM eth_recent_blocks;'
 
-        ###
+      - name: download artifacts - build_${{ matrix.target_os }}_${{ matrix.target_arch }}
+        uses: actions/download-artifact@v4
+        with:
+          name: build_${{ matrix.target_os }}_${{ matrix.target_arch }}
+          path: ./build
 
-      - name: install Spice (https://install.spiceai.org)
+      - name: Install spice
         run: |
-          curl https://install.spiceai.org | /bin/bash
-
-      - name: add Spice bin to PATH
-        run: echo "$HOME/.spice/bin" >> $GITHUB_PATH
-
-      # - name: download artifacts - build_${{ matrix.target_os }}_${{ matrix.target_arch }}
-      #   uses: actions/download-artifact@v4
-      #   with:
-      #     name: build_${{ matrix.target_os }}_${{ matrix.target_arch }}
-      #     path: ./build
-
-      # - name: Install spice
-      #   run: |
-      #     chmod +x ./build/spice
-      #     chmod +x ./build/spiced
-      #     echo "$GITHUB_WORKSPACE/build" >> $GITHUB_PATH
+          chmod +x ./build/spice
+          chmod +x ./build/spiced
+          echo "$GITHUB_WORKSPACE/build" >> $GITHUB_PATH
 
       - name: Check spice version
         run: spice version
