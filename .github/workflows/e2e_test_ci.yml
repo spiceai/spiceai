@@ -514,6 +514,7 @@ jobs:
   test_local_acceleration:
     name: "E2E Test: acceleration on ${{ matrix.name }} using ${{ matrix.acceleration.engine }}"
     runs-on: ${{ matrix.runner }}
+    needs: build
 
 
     strategy:
