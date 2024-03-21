@@ -411,6 +411,7 @@ jobs:
           sudo apt-get install -y postgresql
           sudo service postgresql start
           sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='postgres'" | grep -q 1 || sudo -u postgres createuser -s postgres
+          sudo -u postgres psql -c "ALTER USER postgres PASSWORD 'postgres';"
           sudo -u postgres createdb testdb
 
       - name: Install PostgreSQL (MacOS)
@@ -419,6 +420,7 @@ jobs:
           brew install postgresql
           brew services start postgresql
           createuser -s postgres
+          sudo -u postgres psql -c "ALTER USER postgres PASSWORD 'postgres';"
           createdb testdb
 
       - name: Wait for PostgreSQL to start
