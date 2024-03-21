@@ -10,7 +10,7 @@ use url::Url;
 
 use spicepod::component::dataset::Dataset;
 
-use super::DataConnector;
+use super::{DataConnector, DataConnectorFactory};
 use snafu::prelude::*;
 
 #[derive(Debug, Snafu)]
@@ -42,23 +42,23 @@ impl S3 {
     }
 }
 
-#[async_trait]
-impl DataConnector for S3 {
-    fn new(
+impl DataConnectorFactory for S3 {
+    fn create(
         secret: Option<Secret>,
         params: Arc<Option<HashMap<String, String>>>,
-    ) -> Pin<Box<dyn Future<Output = super::Result<Self>> + Send>>
-    where
-        Self: Sized,
-    {
+    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            Ok(Self {
+            let s3 = Self {
                 secret,
                 params: params.as_ref().clone().map_or_else(HashMap::new, |x| x),
-            })
+            };
+            Ok(Box::new(s3) as Box<dyn DataConnector>)
         })
     }
+}
 
+#[async_trait]
+impl DataConnector for S3 {
     fn has_object_store(&self) -> bool {
         true
     }
