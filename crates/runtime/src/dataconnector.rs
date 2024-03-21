@@ -94,7 +94,7 @@ pub async fn create_new_connector(
     }
 }
 
-pub async fn init() {
+pub async fn register_connectors() {
     register_connector("databricks", databricks::Databricks::create).await;
     register_connector("dremio", dremio::Dremio::create).await;
     register_connector("flightsql", flightsql::FlightSQL::create).await;
