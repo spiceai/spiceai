@@ -7,24 +7,6 @@ use std::sync::RwLock;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::mpsc;
 
-// A [`metrics`][metrics]-compatible exporter that keeps track of gauge metrics in memory. It
-// explicitly discards both ['Counter'][Counters] and [`Histogram`][Histograms]. This is useful
-// to track and query the status of components within the runtime (e.g. spicepods, datasets, etc).
-// [`LocalGaugeRecorder`] supports tracking metrics given a fixed or regex prefix.
-
-#[derive(Clone)]
-pub struct LocalGaugeRecorder {
-    operations_sender: mpsc::Sender<GaugeOperation>,
-
-    #[allow(dead_code)]
-    gauges: Arc<RwLock<HashMap<Key, f64>>>,
-}
-impl Default for LocalGaugeRecorder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 enum GaugeOperation {
     Increment(Key, f64),
     Decrement(Key, f64),
@@ -44,6 +26,23 @@ impl Display for GaugeOperation {
                 write!(f, "Set({key}, {value})")
             }
         }
+    }
+}
+
+// A [`metrics`][metrics]-compatible exporter that keeps track of gauge metrics in memory. It
+// explicitly discards both ['Counter'][Counters] and [`Histogram`][Histograms]. This is useful
+// to track and query the status of components within the runtime (e.g. spicepods, datasets, etc).
+// [`LocalGaugeRecorder`] supports tracking metrics given a fixed or regex prefix.
+#[derive(Clone)]
+pub struct LocalGaugeRecorder {
+    operations_sender: mpsc::Sender<GaugeOperation>,
+
+    #[allow(dead_code)]
+    gauges: Arc<RwLock<HashMap<Key, f64>>>,
+}
+impl Default for LocalGaugeRecorder {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -160,7 +159,6 @@ pub struct CompositeRecorder {
 }
 
 impl CompositeRecorder {
-    // Constructor to create a new CompositeRecorder
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -175,7 +173,6 @@ impl CompositeRecorder {
         s
     }
 
-    // Method to add a recorder
     pub fn add_recorder<R: Recorder + 'static>(&mut self, recorder: R) {
         self.recorders.push(Box::new(recorder));
     }

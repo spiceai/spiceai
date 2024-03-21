@@ -62,7 +62,6 @@ async fn start_runtime(args: spiced::Args) -> Result<(), Box<dyn std::error::Err
     if let Some(metrics_socket) = args.metrics {
         init_metrics(metrics_socket)?;
     }
-    metrics::gauge!("Hello").set(3.0);
     spiced::run(args).await?;
     Ok(())
 }
