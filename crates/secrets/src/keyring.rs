@@ -42,9 +42,7 @@ impl SecretStore for KeyringSecretStore {
             return None;
         };
 
-        let Some(object) = parsed.as_object() else {
-            return None;
-        };
+        let object = parsed.as_object()?;
 
         let mut data = HashMap::new();
 
