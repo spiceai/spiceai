@@ -44,10 +44,7 @@ impl Secret {
 
     #[must_use]
     pub fn get(&self, key: &str) -> Option<&str> {
-        let Some(secret_value): Option<&SecretString> = self.data.get(key) else {
-            return None;
-        };
-
+        let secret_value = self.data.get(key)?;
         let exposed_secret = secret_value.expose_secret();
         Some(exposed_secret)
     }
