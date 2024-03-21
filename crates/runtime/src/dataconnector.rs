@@ -55,22 +55,22 @@ type NewDataConnectorFn = dyn Fn(
     + Send;
 
 lazy_static! {
-    static ref CONNECTOR_FACTORY: Mutex<HashMap<String, Box<NewDataConnectorFn>>> =
+    static ref DATA_CONNECTOR_FACTORY_REGISTRY: Mutex<HashMap<String, Box<NewDataConnectorFn>>> =
         Mutex::new(HashMap::new());
 }
 
-pub async fn register_connector(
+pub async fn register_connector_factory(
     name: &str,
-    constructor: impl Fn(
+    connector_factory: impl Fn(
             Option<Secret>,
             Arc<Option<HashMap<String, String>>>,
         ) -> Pin<Box<dyn Future<Output = Result<Box<dyn DataConnector>>> + Send>>
         + Send
         + 'static,
 ) {
-    let mut factory_map = CONNECTOR_FACTORY.lock().await;
+    let mut registry = DATA_CONNECTOR_FACTORY_REGISTRY.lock().await;
 
-    factory_map.insert(name.to_string(), Box::new(constructor));
+    registry.insert(name.to_string(), Box::new(connector_factory));
 }
 
 /// Create a new `DataConnector` by name.
@@ -84,24 +84,24 @@ pub async fn create_new_connector(
     secret: Option<Secret>,
     params: Arc<Option<HashMap<String, String>>>,
 ) -> Option<Result<Box<dyn DataConnector>>> {
-    let guard = CONNECTOR_FACTORY.lock().await;
+    let guard = DATA_CONNECTOR_FACTORY_REGISTRY.lock().await;
 
-    let data_connector_factory = guard.get(name);
+    let connector_factory = guard.get(name);
 
-    match data_connector_factory {
+    match connector_factory {
         Some(factory) => Some(factory(secret, params).await),
         None => None,
     }
 }
 
-pub async fn register_connectors() {
+pub async fn register_all() {
     tokio::join!(
-        register_connector("databricks", databricks::Databricks::create),
-        register_connector("dremio", dremio::Dremio::create),
-        register_connector("flightsql", flightsql::FlightSQL::create),
-        register_connector("postgres", postgres::Postgres::create),
-        register_connector("s3", s3::S3::create),
-        register_connector("spiceai", spiceai::SpiceAI::create),
+        register_connector_factory("databricks", databricks::Databricks::create),
+        register_connector_factory("dremio", dremio::Dremio::create),
+        register_connector_factory("flightsql", flightsql::FlightSQL::create),
+        register_connector_factory("postgres", postgres::Postgres::create),
+        register_connector_factory("s3", s3::S3::create),
+        register_connector_factory("spiceai", spiceai::SpiceAI::create),
     );
 }
 

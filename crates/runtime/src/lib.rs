@@ -103,7 +103,7 @@ impl Runtime {
         df: Arc<RwLock<DataFusion>>,
         pods_watcher: podswatcher::PodsWatcher,
     ) -> Self {
-        dataconnector::register_connectors().await;
+        dataconnector::register_all().await;
         Runtime {
             app,
             config,
