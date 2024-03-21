@@ -97,12 +97,13 @@ pub struct Runtime {
 
 impl Runtime {
     #[must_use]
-    pub fn new(
+    pub async fn new(
         config: Config,
         app: Arc<RwLock<Option<app::App>>>,
         df: Arc<RwLock<DataFusion>>,
         pods_watcher: podswatcher::PodsWatcher,
     ) -> Self {
+        dataconnector::register_all().await;
         Runtime {
             app,
             config,
@@ -156,7 +157,7 @@ impl Runtime {
                 let source = ds.source();
 
                 let params = Arc::new(ds.params.clone());
-                let data_connector: Option<Box<dyn DataConnector + Send>> =
+                let data_connector: Option<Box<dyn DataConnector>> =
                     match Runtime::get_dataconnector_from_source(
                         &source,
                         &secrets_provider,
@@ -256,76 +257,25 @@ impl Runtime {
         source: &str,
         secrets_provider: &secrets::SecretsProvider,
         params: Arc<Option<HashMap<String, String>>>,
-    ) -> Result<Option<Box<dyn DataConnector + Send>>> {
+    ) -> Result<Option<Box<dyn DataConnector>>> {
+        let secret = secrets_provider.get_secret(source).await;
+
         match source {
-            "spiceai" => Ok(Some(Box::new(
-                dataconnector::spiceai::SpiceAI::new(
-                    secrets_provider.get_secret(source).await,
-                    params,
-                )
-                .await
-                .context(UnableToInitializeDataConnectorSnafu {
-                    data_connector: source,
-                })?,
-            ))),
-            "dremio" => Ok(Some(Box::new(
-                dataconnector::dremio::Dremio::new(
-                    secrets_provider.get_secret(source).await,
-                    params,
-                )
-                .await
-                .context(UnableToInitializeDataConnectorSnafu {
-                    data_connector: source,
-                })?,
-            ))),
-            "flightsql" => Ok(Some(Box::new(
-                dataconnector::flightsql::FlightSQL::new(
-                    secrets_provider.get_secret(source).await,
-                    params,
-                )
-                .await
-                .context(UnableToInitializeDataConnectorSnafu {
-                    data_connector: source,
-                })?,
-            ))),
-            "postgres" => Ok(Some(Box::new(
-                dataconnector::postgres::Postgres::new(
-                    secrets_provider.get_secret(source).await,
-                    params,
-                )
-                .await
-                .context(UnableToInitializeDataConnectorSnafu {
-                    data_connector: source,
-                })?,
-            ))),
-            "databricks" => Ok(Some(Box::new(
-                dataconnector::databricks::Databricks::new(
-                    secrets_provider.get_secret(source).await,
-                    params,
-                )
-                .await
-                .context(UnableToInitializeDataConnectorSnafu {
-                    data_connector: source,
-                })?,
-            ))),
-            "s3" => Ok(Some(Box::new(
-                dataconnector::s3::S3::new(secrets_provider.get_secret(source).await, params)
-                    .await
-                    .context(UnableToInitializeDataConnectorSnafu {
-                        data_connector: source,
-                    })?,
-            ))),
             "localhost" => Ok(None),
-            "debug" => Ok(Some(Box::new(dataconnector::debug::DebugSource {}))),
-            _ => UnknownDataConnectorSnafu {
-                data_connector: source,
-            }
-            .fail()?,
+            _ => match dataconnector::create_new_connector(source, secret, params).await {
+                Some(dc) => dc.map(Some).context(UnableToInitializeDataConnectorSnafu {
+                    data_connector: source,
+                }),
+                None => UnknownDataConnectorSnafu {
+                    data_connector: source,
+                }
+                .fail(),
+            },
         }
     }
 
     async fn initialize_dataconnector(
-        data_connector: Option<Box<dyn DataConnector + Send>>,
+        data_connector: Option<Box<dyn DataConnector>>,
         df: Arc<RwLock<DataFusion>>,
         source: &str,
         ds: impl Borrow<Dataset>,
@@ -562,7 +512,7 @@ impl Runtime {
     }
 }
 
-fn has_table_provider(data_connector: &Option<Box<dyn DataConnector + Send>>) -> bool {
+fn has_table_provider(data_connector: &Option<Box<dyn DataConnector>>) -> bool {
     data_connector.is_some()
         && data_connector
             .as_ref()

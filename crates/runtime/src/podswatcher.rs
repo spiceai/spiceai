@@ -27,7 +27,7 @@ impl PodsWatcher {
 
         let (tx, rx) = channel(100);
 
-        let root_spicepod_path = vec![
+        let root_spicepod_path = [
             root_path.join("spicepod.yaml"),
             root_path.join("spicepod.yml"),
         ];
