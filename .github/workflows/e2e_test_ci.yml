@@ -6,9 +6,9 @@ on:
       - trunk
       - release-*
   
-  pull_request:
-    branches:
-      - trunk
+  # pull_request:
+  #   branches:
+  #     - trunk
 
   workflow_dispatch:
 
