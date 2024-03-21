@@ -21,12 +21,12 @@ func GetData[T interface{}](rtcontext *context.RuntimeContext, path string) ([]T
 	}
 	defer resp.Body.Close()
 
-	var datasets []T
-	err = json.NewDecoder(resp.Body).Decode(&datasets)
+	var components []T
+	err = json.NewDecoder(resp.Body).Decode(&components)
 	if err != nil {
 		return nil, fmt.Errorf("error decoding items: %w", err)
 	}
-	return datasets, nil
+	return components, nil
 }
 
 func WriteDataTable[T interface{}](rtcontext *context.RuntimeContext, path string, t T) error {

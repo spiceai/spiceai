@@ -15,7 +15,7 @@ spice models
 `,
 	Run: func(cmd *cobra.Command, args []string) {
 		rtcontext := context.NewContext()
-		model_statues, _, err := api.GetComponentStatuses(PROM_ENDPOINT)
+		model_statuses, _, err := api.GetComponentStatuses(PROM_ENDPOINT)
 		if err != nil {
 			cmd.PrintErrln(err.Error())
 		}
@@ -27,7 +27,7 @@ spice models
 
 		table := make([]interface{}, len(models))
 		for i, model := range models {
-			statusEnum, exists := model_statues[model.Name]
+			statusEnum, exists := model_statuses[model.Name]
 			if exists {
 				model.Status = statusEnum.String()
 			}
