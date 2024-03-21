@@ -2,58 +2,95 @@ use metrics::{
     Counter, CounterFn, Gauge, GaugeFn, Histogram, HistogramFn, Key, KeyName, Metadata, Recorder,
     SharedString, Unit,
 };
+use std::fmt::{self, Display, Formatter};
 use std::sync::RwLock;
 use std::{collections::HashMap, sync::Arc};
+use tokio::sync::mpsc;
 
 // A [`metrics`][metrics]-compatible exporter that keeps track of gauge metrics in memory. It
 // explicitly discards both ['Counter'][Counters] and [`Histogram`][Histograms]. This is useful
 // to track and query the status of components within the runtime (e.g. spicepods, datasets, etc).
 // [`LocalGaugeRecorder`] supports tracking metrics given a fixed or regex prefix.
 
-#[derive(Default)]
+#[derive(Clone)]
 pub struct LocalGaugeRecorder {
-    gauges: RwLock<HashMap<Key, LocalGauge>>,
-    prefix: Option<String>,
+    operations_sender: mpsc::Sender<GaugeOperation>,
+
+    #[allow(dead_code)]
+    gauges: Arc<RwLock<HashMap<Key, f64>>>,
+}
+impl Default for LocalGaugeRecorder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+enum GaugeOperation {
+    Increment(Key, f64),
+    Decrement(Key, f64),
+    Set(Key, f64),
+}
+
+impl Display for GaugeOperation {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            GaugeOperation::Increment(key, value) => {
+                write!(f, "Increment({key}, {value})")
+            }
+            GaugeOperation::Decrement(key, value) => {
+                write!(f, "Decrement({key}, {value})")
+            }
+            GaugeOperation::Set(key, value) => {
+                write!(f, "Set({key}, {value})")
+            }
+        }
+    }
 }
 
 impl LocalGaugeRecorder {
     #[must_use]
     pub fn new() -> Self {
-        Self::with_prefix(None)
-    }
+        let (operations_sender, mut operations_receiver) = mpsc::channel(100);
+        let gauges: Arc<RwLock<HashMap<Key, f64>>> = Arc::new(RwLock::new(HashMap::new()));
 
-    #[must_use]
-    pub fn with_prefix(p: Option<String>) -> Self {
+        let recv_gauges: Arc<RwLock<HashMap<Key, f64>>> = gauges.clone();
+        tokio::spawn(async move {
+            while let Some(operation) = operations_receiver.recv().await {
+                println!("Received operation: {operation}. Gauges: {recv_gauges:#?}");
+                match recv_gauges.write() {
+                    Ok(mut writable_gauges) => match operation {
+                        GaugeOperation::Increment(key, value) => {
+                            if let Some(gauge) = writable_gauges.get_mut(&key) {
+                                *gauge += value;
+                            } else {
+                                writable_gauges.insert(key, value);
+                            }
+                        }
+                        GaugeOperation::Decrement(key, value) => {
+                            if let Some(gauge) = writable_gauges.get_mut(&key) {
+                                *gauge -= value;
+                            } else {
+                                writable_gauges.insert(key, -value);
+                            }
+                        }
+                        GaugeOperation::Set(key, value) => {
+                            if let Some(gauge) = writable_gauges.get_mut(&key) {
+                                *gauge = value;
+                            } else {
+                                writable_gauges.insert(key, value);
+                            }
+                        }
+                    },
+                    Err(e) => {
+                        println!("Error writing gauges: {e:#?}");
+                    }
+                };
+            }
+        });
         LocalGaugeRecorder {
-            prefix: p,
-            gauges: RwLock::new(HashMap::new()),
+            operations_sender,
+            gauges: gauges.clone(),
         }
-    }
-}
-
-#[derive(Default)]
-pub struct LocalGauge {
-    #[allow(dead_code)]
-    value: f64,
-}
-impl LocalGauge {
-    #[must_use]
-    pub fn new() -> Self {
-        LocalGauge { value: 0.0 }
-    }
-}
-
-impl GaugeFn for LocalGauge {
-    fn increment(&self, v: f64) {
-        println!("increment: {v}");
-    }
-
-    fn decrement(&self, value: f64) {
-        println!("decrement: {value}");
-    }
-
-    fn set(&self, value: f64) {
-        println!("set: {value}");
     }
 }
 
@@ -63,22 +100,10 @@ impl Recorder for LocalGaugeRecorder {
     }
 
     fn register_gauge(&self, key: &Key, _metadata: &Metadata<'_>) -> Gauge {
-        if let Some(prefix) = &self.prefix {
-            key.name().starts_with(&prefix.clone());
-            return Gauge::noop();
-        }
-
-        let arc_gauge = Arc::new(LocalGauge::new());
-        match self.gauges.write() {
-            Ok(mut writable_map) => {
-                writable_map.insert(key.clone(), LocalGauge::new());
-            }
-            Err(e) => {
-                tracing::error!("could acquired write lock {e}");
-            }
-        }
-
-        Gauge::from_arc(arc_gauge)
+        Gauge::from_arc(Arc::new(LocalGauge::new(
+            key.clone(),
+            Arc::new(self.operations_sender.clone()),
+        )))
     }
 
     fn describe_counter(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
@@ -88,6 +113,44 @@ impl Recorder for LocalGaugeRecorder {
     }
     fn register_histogram(&self, _key: &Key, _metadata: &Metadata<'_>) -> Histogram {
         Histogram::noop()
+    }
+}
+
+struct LocalGauge {
+    key: Key,
+    state: Arc<mpsc::Sender<GaugeOperation>>,
+}
+
+impl LocalGauge {
+    #[must_use]
+    pub fn new(key: Key, state: Arc<mpsc::Sender<GaugeOperation>>) -> Self {
+        LocalGauge { key, state }
+    }
+}
+
+impl GaugeFn for LocalGauge {
+    fn increment(&self, value: f64) {
+        println!("increment: {value}");
+        std::mem::drop(
+            self.state
+                .send(GaugeOperation::Increment(self.key.clone(), value)),
+        );
+    }
+
+    fn decrement(&self, value: f64) {
+        println!("decrement: {value}");
+        std::mem::drop(
+            self.state
+                .send(GaugeOperation::Decrement(self.key.clone(), value)),
+        );
+    }
+
+    fn set(&self, value: f64) {
+        println!("set: {value}");
+        std::mem::drop(
+            self.state
+                .send(GaugeOperation::Set(self.key.clone(), value)),
+        );
     }
 }
 
@@ -166,6 +229,7 @@ struct CompositeCounter {
     counters: Vec<Counter>,
 }
 impl CompositeCounter {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             counters: Vec::new(),

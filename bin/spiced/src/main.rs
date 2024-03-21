@@ -87,7 +87,7 @@ fn init_tracing() -> Result<(), Box<dyn std::error::Error>> {
 
 fn init_metrics(socket_addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
     let mut recorder = CompositeRecorder::new();
-    recorder.add_recorder(LocalGaugeRecorder::with_prefix(None));
+    recorder.add_recorder(LocalGaugeRecorder::new());
     recorder.add_recorder(init_prometheus(socket_addr)?);
     metrics::set_global_recorder(recorder)?;
     tracing::info!("Metrics listening on {socket_addr}");
