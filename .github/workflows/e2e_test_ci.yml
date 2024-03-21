@@ -353,7 +353,6 @@ jobs:
             echo "Unexpected response from spice sql, failed to perform test query: $sql_output"
             exit 1
           fi
-
   test_local_acceleration:
     name: "E2E Test: acceleration on ${{ matrix.name }} using ${{ matrix.acceleration.engine }}"
     runs-on: ${{ matrix.runner }}
@@ -363,9 +362,11 @@ jobs:
       fail-fast: false
       matrix:
         acceleration: [
-          { engine: duckdb, mode: file},
+          { engine: arrow, mode: memory},
           { engine: duckdb, mode: memory},
-          { engine: sqlite},
+          { engine: duckdb, mode: file},
+          { engine: sqlite, mode: memory},
+          { engine: sqlite, mode: file},
           { engine: postgres},
         ]
         include:
