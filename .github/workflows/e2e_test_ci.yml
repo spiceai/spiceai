@@ -422,7 +422,7 @@ jobs:
           brew services start postgresql
           sleep 5
           createuser -s postgres
-          sudo -u postgres psql -c "ALTER USER postgres PASSWORD 'postgres';"
+          psql -c "ALTER USER postgres PASSWORD 'postgres';"
           createdb testdb
 
       - name: Wait for PostgreSQL to start
