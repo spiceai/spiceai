@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
     use chrono::{Duration, Utc};
-    use spice_rs::*;
+    use spiceai::*;
     use std::env;
     use std::ops::Sub;
     use std::path::Path;

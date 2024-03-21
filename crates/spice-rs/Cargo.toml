@@ -1,6 +1,6 @@
 [package]
-name = "spice-rs"
-version = "0.1.0"
+name = "spiceai"
+version = "1.0.3"
 edition = "2021"
 
 [dependencies]

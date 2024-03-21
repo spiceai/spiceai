@@ -40,9 +40,10 @@ impl SpiceClientConfig {
     }
 }
 
-/// The SpiceClient is the main entry point for interacting with the Spice API.
+/// The `SpiceClient` is the main entry point for interacting with the Spice API.
 /// It provides methods for querying the Spice Flight and Firecache endpoints,
 /// as well as the Spice Prices endpoint.
+#[allow(clippy::module_name_repetitions)]
 pub struct SpiceClient {
     flight: SqlFlightClient,
     firecache: SqlFlightClient,
@@ -50,9 +51,9 @@ pub struct SpiceClient {
 }
 
 impl SpiceClient {
-    /// Creates a new SpiceClient with the given API key.
+    /// Creates a new `SpiceClient` with the given API key.
     /// ```
-    /// use spice_rs::Client;
+    /// use spiceai::Client;
     ///
     /// #[tokio::main]
     /// async fn main() {
@@ -71,7 +72,7 @@ impl SpiceClient {
 
     /// Queries the Spice Flight endpoint with the given SQL query.
     /// ```
-    /// # use spice_rs::Client;
+    /// # use spiceai::Client;
     /// #
     /// # #[tokio::main]
     /// # async fn main() {
@@ -85,7 +86,7 @@ impl SpiceClient {
 
     /// Queries the Spice Firecache endpoint with the given SQL query.
     /// ```
-    /// # use spice_rs::Client;
+    /// # use spiceai::Client;
     /// #
     /// #  #[tokio::main]
     /// # async fn main() {
@@ -102,7 +103,7 @@ impl SpiceClient {
 
     /// Get the supported pairs:
     /// ```rust
-    /// # use spice_rs::Client;
+    /// # use spiceai::Client;
     /// #
     /// # #[tokio::main]
     /// # async fn main() {
@@ -116,7 +117,7 @@ impl SpiceClient {
 
     /// Get the latest price for a token pair:
     /// ```rust
-    /// # use spice_rs::Client;
+    /// # use spiceai::Client;
     /// #
     /// # #[tokio::main]
     /// # async fn main() {
@@ -130,7 +131,7 @@ impl SpiceClient {
 
     /// Get historical data:
     /// ```rust
-    /// # use spice_rs::Client;
+    /// # use spiceai::Client;
     /// # use chrono::Utc;
     /// # use chrono::Duration;
     /// # use std::ops::Sub;

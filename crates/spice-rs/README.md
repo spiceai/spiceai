@@ -12,21 +12,26 @@ spice-rs = { git = "https://github.com/spiceai/spice-rs", tag = "v1.0.2" }
 ```
 
 ## Usage
+
 <!-- NOTE: If you're changing the code examples below, make sure you update `tests/readme_test.rs`. -->
+
 ### New client
+
 ```rust
-use spice_rs::Client;
+use spiceai::Client;
 
 #[tokio::main]
 async fn main() {
   let mut client = Client::new("API_KEY").await.unwrap();
 }
 ```
+
 ### Arrow Query
+
 SQL Query
 
 ```rust
-use spice_rs::Client;
+use spiceai::Client;
 
 #[tokio::main]
 async fn main() {
@@ -35,11 +40,13 @@ async fn main() {
 }
 
 ```
+
 ### Firecache Query
+
 Firecache SQL Query
 
 ```rust
-use spice_rs::Client;
+use spiceai::Client;
 
 #[tokio::main]
 async fn main() {
@@ -48,13 +55,15 @@ async fn main() {
 }
 
 ```
+
 ### HTTP API
+
 #### Prices
 
 Get the supported pairs:
 
 ```rust
-use spice_rs::Client;
+use spiceai::Client;
 
 #[tokio::main]
 async fn main() {
@@ -66,7 +75,7 @@ async fn main() {
 Get the latest price for a token pair:
 
 ```rust
-use spice_rs::Client;
+use spiceai::Client;
 
 #[tokio::main]
 async fn main() {
@@ -78,7 +87,7 @@ async fn main() {
 Get historical data:
 
 ```rust
-use spice_rs::Client;
+use spiceai::Client;
 use chrono::Utc;
 use chrono::Duration;
 use std::ops::Sub;
@@ -96,4 +105,5 @@ async fn main() {
 ```
 
 ## Documentation
+
 Check out our [Documentation](https://docs.spice.ai/sdks/rust-sdk) to learn more about how to use the Rust SDK.

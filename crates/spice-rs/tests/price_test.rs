@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
     use chrono::{TimeZone, Utc};
-    use spice_rs::Client;
+    use spiceai::Client;
     use std::env;
     use std::path::Path;
 
