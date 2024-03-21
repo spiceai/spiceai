@@ -412,6 +412,24 @@ jobs:
           PGPASSWORD: postgres
         run: psql -h localhost -U postgres -c 'SELECT version();'
 
+      - name: Prepare PostgreSQL dataset
+        env:
+          PGPASSWORD: postgres
+        run: |
+          psql -h localhost -U postgres -c 'CREATE TABLE eth_recent_blocks (id SERIAL PRIMARY KEY, block_number INTEGER, block_hash TEXT, block_timestamp TIMESTAMP);'
+          psql -h localhost -U postgres -c "INSERT INTO eth_recent_blocks (block_number, block_hash, block_timestamp) VALUES (1, '0x1234', '2022-01-01 00:00:00');"
+          psql -h localhost -U postgres -c "INSERT INTO eth_recent_blocks (block_number, block_hash, block_timestamp) VALUES (2, '0x5678', '2022-01-01 00:00:00');"
+          psql -h localhost -U postgres -c "INSERT INTO eth_recent_blocks (block_number, block_hash, block_timestamp) VALUES (3, '0x9abc', '2022-01-01 00:00:00');"
+
+        ###
+
+      - name: install Spice (https://install.spiceai.org)
+        run: |
+          curl https://install.spiceai.org | /bin/bash
+
+      - name: add Spice bin to PATH
+        run: echo "$HOME/.spice/bin" >> $GITHUB_PATH
+
       # - name: download artifacts - build_${{ matrix.target_os }}_${{ matrix.target_arch }}
       #   uses: actions/download-artifact@v4
       #   with:
@@ -424,12 +442,12 @@ jobs:
       #     chmod +x ./build/spiced
       #     echo "$GITHUB_WORKSPACE/build" >> $GITHUB_PATH
 
-      # - name: Check spice version
-      #   run: spice version
+      - name: Check spice version
+        run: spice version
 
-      # - name: Init spice app
-      #   run: |
-      #     spice init test_app
+      - name: Init spice app
+        run: |
+          spice init test_app
 
       # - name: Spice dataset configure
       #   working-directory: test_app
