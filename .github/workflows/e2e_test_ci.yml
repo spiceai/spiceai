@@ -454,7 +454,7 @@ jobs:
         run: |
           echo -e "eth_recent_blocks\neth recent blocks\npostgres:eth_recent_blocks\ny" | spice dataset configure
           # configure pg credentials
-          echo -e "params:\n  pg_host: localhost\n  pg_port: 5432\n  pg_db: testdb\n  pg_user: postgres\n  pg_pass_key: password" >> datasets/eth_recent_blocks/dataset.yaml
+          echo -e "params:\n  pg_host: localhost\n  pg_port: 5432\n  pg_db: testdb\n  pg_user: postgres\n  pg_pass_key: password" >> ./datasets/eth_recent_blocks/dataset.yaml
           # configure env secret store
           echo -e "secrets:\n  store: env\n" >> spicepod.yaml
           cat spicepod.yaml
