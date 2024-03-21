@@ -488,27 +488,27 @@ jobs:
             exit 1
           fi
 
-      # - name: Check eth_recent_blocks table exists
-      #   working-directory: test_app
-      #   run: |
-      #     response=$(curl -X POST \
-      #       -H "Content-Type: text/plain" \
-      #       -d "show tables;" \
-      #       http://localhost:3000/v1/sql
-      #     )
-      #     echo $response | jq
-      #     table_exists=$(echo $response | jq '[.[] | select(.table_name == "eth_recent_blocks")]' | jq 'length')
-      #     if [[ $table_exists -eq 0 ]]; then
-      #       echo "Unexpected response: table 'taxi_trips' does not exist."
-      #       exit 1
-      #     fi
+      - name: Check eth_recent_blocks table exists
+        working-directory: test_app
+        run: |
+          response=$(curl -X POST \
+            -H "Content-Type: text/plain" \
+            -d "show tables;" \
+            http://localhost:3000/v1/sql
+          )
+          echo $response | jq
+          table_exists=$(echo $response | jq '[.[] | select(.table_name == "eth_recent_blocks")]' | jq 'length')
+          if [[ $table_exists -eq 0 ]]; then
+            echo "Unexpected response: table 'eth_recent_blocks' does not exist."
+            exit 1
+          fi
 
-      # - name: Run Flight SQL query
-      #   working-directory: test_app
-      #   run: |
-      #     sql_output=$(echo "select * from eth_recent_blocks limit 10;" | spice sql)
-      #     echo "$sql_output"
-      #     if [[ $sql_output == *"error"* ]] || [[ $sql_output == *"not found"* ]]; then
-      #       echo "Unexpected response from spice sql, failed to perform test query: $sql_output"
-      #       exit 1
-      #     fi
+      - name: Run Flight SQL query
+        working-directory: test_app
+        run: |
+          sql_output=$(echo "select * from eth_recent_blocks limit 10;" | spice sql)
+          echo "$sql_output"
+          if [[ $sql_output == *"error"* ]] || [[ $sql_output == *"not found"* ]]; then
+            echo "Unexpected response from spice sql, failed to perform test query: $sql_output"
+            exit 1
+          fi
