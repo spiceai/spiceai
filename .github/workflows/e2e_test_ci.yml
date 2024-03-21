@@ -359,7 +359,7 @@ jobs:
           fi
 
   test_quickstart_data_postgres:
-    name: "E2E Test: SpiceAI quickstart, using ${{ matrix.target_os }}-${{ matrix.target_arch }}"
+    name: "E2E Test: SpiceAI Postgres quickstart, using ${{ matrix.target_os }}-${{ matrix.target_arch }}"
     runs-on: ${{ matrix.runner }}
     needs: build
 
