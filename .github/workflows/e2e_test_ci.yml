@@ -6,6 +6,10 @@ on:
       - trunk
       - release-*
 
+  # pull_request:
+  #   branches:
+  #     - trunk
+
   workflow_dispatch:
 
 jobs:
@@ -25,16 +29,16 @@ jobs:
             target_os: linux
             target_arch: x86_64
             target_arch_go: amd64
-          # - name: macOS aarch64 (Apple Silicon)
-          #   runner: macos-14
-          #   target_os: darwin
-          #   target_arch: aarch64
-          #   target_arch_go: arm64
-          # - name: macOS x64 (Intel)
-          #   runner: rust-osx-x64
-          #   target_os: darwin
-          #   target_arch: x86_64
-          #   target_arch_go: amd64
+          - name: macOS aarch64 (Apple Silicon)
+            runner: macos-14
+            target_os: darwin
+            target_arch: aarch64
+            target_arch_go: arm64
+          - name: macOS x64 (Intel)
+            runner: macos-12
+            target_os: darwin
+            target_arch: x86_64
+            target_arch_go: amd64
           # - name: Windows x64
           #   runner: rust-windows-x64
           #   target_os: windows
@@ -135,6 +139,7 @@ jobs:
     needs: build
 
     strategy:
+      fail-fast: false
       matrix:
         include:
           - name: Linux x64
@@ -142,16 +147,16 @@ jobs:
             target_os: linux
             target_arch: x86_64
             target_arch_go: amd64
-          # - name: macOS aarch64 (Apple Silicon)
-          #   runner: macos-14
-          #   target_os: darwin
-          #   target_arch: aarch64
-          #   target_arch_go: arm64
-          # - name: macOS x64 (Intel)
-          #   runner: rust-osx-x64
-          #   target_os: darwin
-          #   target_arch: x86_64
-          #   target_arch_go: amd64
+          - name: macOS aarch64 (Apple Silicon)
+            runner: macos-14
+            target_os: darwin
+            target_arch: aarch64
+            target_arch_go: arm64
+          - name: macOS x64 (Intel)
+            runner: macos-12
+            target_os: darwin
+            target_arch: x86_64
+            target_arch_go: amd64
           # - name: Windows x64
           #   runner: rust-windows-x64
           #   target_os: windows
@@ -169,8 +174,10 @@ jobs:
         run: |
           chmod +x ./build/spice
           chmod +x ./build/spiced
-          mkdir "$HOME/.spice/"
-          echo "$GITHUB_WORKSPACE/build" >> $GITHUB_PATH
+          mkdir -p "$HOME/.spice/bin"
+          mv ./build/spice "$HOME/.spice/bin"
+          mv ./build/spiced "$HOME/.spice/bin"
+          echo "$HOME/.spice/bin" >> $GITHUB_PATH
 
       - name: Check spice version
         run: spice version
@@ -200,6 +207,8 @@ jobs:
         run: |
           spice add spiceai/quickstart
           cat spicepod.yaml
+          # time to initialize added dataset
+          sleep 5
 
       - name: Check datasets
         working-directory: test_app
@@ -212,21 +221,30 @@ jobs:
             exit 1
           fi
 
-      # TODO fix this step
-      # - name: Check tables
-      #   working-directory: test_app
-      #   run: |
-      #     response=$(curl -X POST \
-      #       -H "Content-Type: text/plain" \
-      #       -d "show tables;" \
-      #       http://localhost:3000/v1/sql
-      #     )
-      #     echo $response | jq
-      #     length=$(echo $response | jq 'if type=="array" then length else empty end')
-      #     if [[ $length -ne 5 ]]; then
-      #       echo "Unexpected response: $response, expected 5 tables but received $length"
-      #       exit 1
-      #     fi
+      - name: Check taxi_trips table exists
+        working-directory: test_app
+        run: |
+          response=$(curl -X POST \
+            -H "Content-Type: text/plain" \
+            -d "show tables;" \
+            http://localhost:3000/v1/sql
+          )
+          echo $response | jq
+          table_exists=$(echo $response | jq '[.[] | select(.table_name == "taxi_trips")]' | jq 'length')
+          if [[ $table_exists -eq 0 ]]; then
+            echo "Unexpected response: table 'taxi_trips' does not exist."
+            exit 1
+          fi
+
+      - name: Run Flight SQL query
+        working-directory: test_app
+        run: |
+          sql_output=$(echo "select * from taxi_trips limit 10;" | spice sql)
+          echo "$sql_output"
+          if [[ $sql_output == *"error"* ]] || [[ $sql_output == *"not found"* ]]; then
+            echo "Unexpected response from spice sql, failed to perform test query: $sql_output"
+            exit 1
+          fi
 
   test_quickstart_spiceai:
     name: "E2E Test: SpiceAI quickstart, using ${{ matrix.target_os }}-${{ matrix.target_arch }}"
@@ -234,6 +252,7 @@ jobs:
     needs: build
 
     strategy:
+      fail-fast: false
       matrix:
         include:
           - name: Linux x64
@@ -241,16 +260,16 @@ jobs:
             target_os: linux
             target_arch: x86_64
             target_arch_go: amd64
-          # - name: macOS aarch64 (Apple Silicon)
-          #   runner: macos-14
-          #   target_os: darwin
-          #   target_arch: aarch64
-          #   target_arch_go: arm64
-          # - name: macOS x64 (Intel)
-          #   runner: rust-osx-x64
-          #   target_os: darwin
-          #   target_arch: x86_64
-          #   target_arch_go: amd64
+          - name: macOS aarch64 (Apple Silicon)
+            runner: macos-14
+            target_os: darwin
+            target_arch: aarch64
+            target_arch_go: arm64
+          - name: macOS x64 (Intel)
+            runner: macos-12
+            target_os: darwin
+            target_arch: x86_64
+            target_arch_go: amd64
           # - name: Windows x64
           #   runner: rust-windows-x64
           #   target_os: windows
@@ -268,7 +287,10 @@ jobs:
         run: |
           chmod +x ./build/spice
           chmod +x ./build/spiced
-          echo "$GITHUB_WORKSPACE/build" >> $GITHUB_PATH
+          mkdir -p "$HOME/.spice/bin"
+          mv ./build/spice "$HOME/.spice/bin"
+          mv ./build/spiced "$HOME/.spice/bin"
+          echo "$HOME/.spice/bin" >> $GITHUB_PATH
 
       - name: Check spice version
         run: spice version
@@ -277,15 +299,13 @@ jobs:
         run: |
           spice init test_app
 
-      - name: Configure spice app
+      - name: Spice dataset configure
         working-directory: test_app
         run: |
-          # equal to "spice dataset configure"
-          mkdir -p datasets/eth_recent_blocks
-          echo -e "from: spice.ai/eth.recent_blocks\nname: eth_recent_blocks\ndescription: eth recent logs\nacceleration:\n  enabled: true\n  refresh_interval: 10s\n  refresh_mode: full" >> datasets/eth_recent_blocks/dataset.yaml
-
-          # configure env secret store and add dataset
-          echo -e "secrets:\n  store: env\ndatasets:\n- ref: datasets/eth_recent_blocks" >> spicepod.yaml
+          echo -e "eth_recent_blocks\neth recent logs\nspice.ai/eth.recent_blocks\ny" | spice dataset configure
+          # configure env secret store
+          echo -e "secrets:\n  store: env\n" >> spicepod.yaml
+          cat spicepod.yaml
 
       - name: Start spice runtime
         env:
@@ -293,6 +313,8 @@ jobs:
         working-directory: test_app
         run: |
           spice run &
+           # time to initialize added dataset
+          sleep 5
 
       - name: Wait for Spice runtime healthy
         working-directory: test_app
@@ -311,7 +333,7 @@ jobs:
             exit 1
           fi
 
-      - name: Check tables
+      - name: Check eth_recent_blocks table exists
         working-directory: test_app
         run: |
           response=$(curl -X POST \
@@ -320,8 +342,299 @@ jobs:
             http://localhost:3000/v1/sql
           )
           echo $response | jq
+          table_exists=$(echo $response | jq '[.[] | select(.table_name == "eth_recent_blocks")]' | jq 'length')
+          if [[ $table_exists -eq 0 ]]; then
+            echo "Unexpected response: table 'eth_recent_blocks' does not exist."
+            exit 1
+          fi
+
+      - name: Run Flight SQL query
+        working-directory: test_app
+        run: |
+          sql_output=$(echo "select * from eth_recent_blocks limit 10;" | spice sql)
+          echo "$sql_output"
+          if [[ $sql_output == *"error"* ]] || [[ $sql_output == *"not found"* ]]; then
+            echo "Unexpected response from spice sql, failed to perform test query: $sql_output"
+            exit 1
+          fi
+
+  test_quickstart_data_postgres:
+    name: "E2E Test: SpiceAI Postgres quickstart, using ${{ matrix.target_os }}-${{ matrix.target_arch }}"
+    runs-on: ${{ matrix.runner }}
+    needs: build
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x64
+            runner: ubuntu-latest
+            target_os: linux
+            target_arch: x86_64
+            target_arch_go: amd64
+          - name: macOS aarch64 (Apple Silicon)
+            runner: macos-14
+            target_os: darwin
+            target_arch: aarch64
+            target_arch_go: arm64
+          - name: macOS x64 (Intel)
+            runner: macos-12
+            target_os: darwin
+            target_arch: x86_64
+            target_arch_go: amd64
+          # - name: Windows x64
+          #   runner: rust-windows-x64
+          #   target_os: windows
+          #   target_arch: x86_64
+          #   target_arch_go: amd64
+
+    steps:
+      - name: Install PostgreSQL (Linux)
+        if: matrix.target_os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql
+          sudo service postgresql start
+          sleep 5
+          sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='postgres'" | grep -q 1 || sudo -u postgres createuser -s postgres
+          sudo -u postgres psql -c "ALTER USER postgres PASSWORD 'postgres';"
+          sudo -u postgres createdb testdb
+
+      - name: Install PostgreSQL (MacOS)
+        if: matrix.target_os == 'darwin'
+        run: |
+          brew install postgresql
+          brew services start postgresql
+          sleep 5
+          createuser -s postgres
+          psql -d postgres -c "ALTER USER postgres PASSWORD 'postgres';"
+          createdb testdb
+
+      - name: Wait for PostgreSQL to start
+        run: sleep 10
+
+      - name: Check PostgreSQL
+        env:
+          PGPASSWORD: postgres
+        run: psql -h localhost -U postgres -c 'SELECT version();'
+
+      - name: Prepare PostgreSQL dataset
+        env:
+          PGPASSWORD: postgres
+        run: |
+          psql -h localhost -U postgres -d testdb -c 'CREATE TABLE eth_recent_blocks (id SERIAL PRIMARY KEY, block_number INTEGER, block_hash TEXT, block_timestamp TIMESTAMP);'
+          psql -h localhost -U postgres -d testdb -c "INSERT INTO eth_recent_blocks (block_number, block_hash, block_timestamp) VALUES (1, '0x1234', '2022-01-01 00:00:00');"
+          psql -h localhost -U postgres -d testdb -c "INSERT INTO eth_recent_blocks (block_number, block_hash, block_timestamp) VALUES (2, '0x5678', '2022-01-01 00:00:00');"
+          psql -h localhost -U postgres -d testdb -c "INSERT INTO eth_recent_blocks (block_number, block_hash, block_timestamp) VALUES (3, '0x9abc', '2022-01-01 00:00:00');"
+          psql -h localhost -U postgres -d testdb -c 'SELECT * FROM eth_recent_blocks;'
+
+      - name: download artifacts - build_${{ matrix.target_os }}_${{ matrix.target_arch }}
+        uses: actions/download-artifact@v4
+        with:
+          name: build_${{ matrix.target_os }}_${{ matrix.target_arch }}
+          path: ./build
+
+      - name: Install spice
+        run: |
+          chmod +x ./build/spice
+          chmod +x ./build/spiced
+          mkdir -p "$HOME/.spice/bin"
+          mv ./build/spice "$HOME/.spice/bin"
+          mv ./build/spiced "$HOME/.spice/bin"
+          echo "$HOME/.spice/bin" >> $GITHUB_PATH
+
+      - name: Check spice version
+        run: spice version
+
+      - name: Init spice app
+        run: |
+          spice init test_app
+
+      - name: Spice dataset configure
+        working-directory: test_app
+        run: |
+          echo -e "eth_recent_blocks\neth recent blocks\npostgres:eth_recent_blocks\ny" | spice dataset configure
+          # configure pg credentials
+          echo -e "params:\n  pg_host: localhost\n  pg_port: 5432\n  pg_db: testdb\n  pg_user: postgres\n  pg_pass_key: password" >> ./datasets/eth_recent_blocks/dataset.yaml
+          # configure env secret store
+          echo -e "secrets:\n  store: env\n" >> spicepod.yaml
+          cat spicepod.yaml
+
+      - name: Start spice runtime
+        env:
+          SPICE_SECRET_POSTGRES_PASSWORD: postgres
+        working-directory: test_app
+        run: |
+          spice run &
+            # time to initialize added dataset
+          sleep 5
+
+      - name: Wait for Spice runtime healthy
+        working-directory: test_app
+        timeout-minutes: 1
+        run: |
+          while [[ "$(curl -s http://localhost:3000/health)" != "ok" ]]; do sleep 1; done
+
+      - name: Check datasets
+        working-directory: test_app
+        run: |
+          response=$(curl http://localhost:3000/v1/datasets)
+          echo $response | jq
           length=$(echo $response | jq 'if type=="array" then length else empty end')
-          if [[ $length -ne 5 ]]; then
-            echo "Unexpected response: $response, expected 5 tables but received $length"
+          if [[ $length -ne 1 ]]; then
+            echo "Unexpected response: $response, expected 1 dataset but received $length"
+            exit 1
+          fi
+
+      - name: Check eth_recent_blocks table exists
+        working-directory: test_app
+        run: |
+          response=$(curl -X POST \
+            -H "Content-Type: text/plain" \
+            -d "show tables;" \
+            http://localhost:3000/v1/sql
+          )
+          echo $response | jq
+          table_exists=$(echo $response | jq '[.[] | select(.table_name == "eth_recent_blocks")]' | jq 'length')
+          if [[ $table_exists -eq 0 ]]; then
+            echo "Unexpected response: table 'eth_recent_blocks' does not exist."
+            exit 1
+          fi
+
+      - name: Run Flight SQL query
+        working-directory: test_app
+        run: |
+          sql_output=$(echo "select * from eth_recent_blocks limit 10;" | spice sql)
+          echo "$sql_output"
+          if [[ $sql_output == *"error"* ]] || [[ $sql_output == *"not found"* ]]; then
+            echo "Unexpected response from spice sql, failed to perform test query: $sql_output"
+            exit 1
+          fi
+
+  test_local_acceleration:
+    name: "E2E Test: acceleration on ${{ matrix.name }} using ${{ matrix.acceleration.engine }}"
+    runs-on: ${{ matrix.runner }}
+    needs: build
+
+
+    strategy:
+      fail-fast: false
+      matrix:
+        acceleration: [
+          { engine: arrow, mode: memory},
+          { engine: duckdb, mode: memory},
+          { engine: duckdb, mode: file},
+          { engine: sqlite, mode: memory},
+          { engine: sqlite, mode: file},
+          { engine: postgres},
+        ]
+        include:
+          - name: Linux x64
+            runner: ubuntu-latest
+            target_os: linux
+            target_arch: x86_64
+            target_arch_go: amd64
+          - name: macOS aarch64 (Apple Silicon)
+            runner: macos-14
+            target_os: darwin
+            target_arch: aarch64
+            target_arch_go: arm64
+          - name: macOS x64 (Intel)
+            runner: macos-12
+            target_os: darwin
+            target_arch: x86_64
+            target_arch_go: amd64
+          # - name: Windows x64
+          #   runner: rust-windows-x64
+          #   target_os: windows
+          #   target_arch: x86_64
+          #   target_arch_go: amd64
+
+    steps:
+      - name: download artifacts - build_${{ matrix.target_os }}_${{ matrix.target_arch }}
+        uses: actions/download-artifact@v4
+        with:
+          name: build_${{ matrix.target_os }}_${{ matrix.target_arch }}
+          path: ./build
+
+      - name: Install spice
+        run: |
+          chmod +x ./build/spice
+          chmod +x ./build/spiced
+          mkdir -p "$HOME/.spice/bin"
+          mv ./build/spice "$HOME/.spice/bin"
+          mv ./build/spiced "$HOME/.spice/bin"
+          echo "$HOME/.spice/bin" >> $GITHUB_PATH
+
+      - name: Check spice version
+        run: spice version
+
+      - name: Spice dataset configure
+        working-directory: test_app
+        run: |
+          ENGINE=$(echo '${{ matrix.acceleration.engine }}')
+          MODE=$(echo '${{ matrix.acceleration.mode }}')
+
+          
+          echo "datasets:" >> spicepod.yaml
+          echo "  - name: eth_recent_blocks" >> spicepod.yaml
+          echo "    from: spice.ai/eth.recent_blocks" >> spicepod.yaml
+          echo "    acceleration:" >> spicepod.yaml
+          echo "      enabled: true" >> spicepod.yaml
+          echo "      engine: $ENGINE" >> spicepod.yaml
+          if [[ -n "$MODE" ]]; then
+            echo "      mode: $MODE" >> spicepod.yaml
+          fi
+          # configure env secret store
+          echo -e "secrets:\n  store: env\n" >> spicepod.yaml
+          cat spicepod.yaml
+
+      - name: Start spice runtime
+        env:
+          SPICE_SECRET_SPICEAI_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_KEY }}
+        working-directory: test_app
+        run: |
+          spice run &
+          sleep 5
+
+      - name: Wait for Spice runtime healthy
+        working-directory: test_app
+        timeout-minutes: 1
+        run: |
+          while [[ "$(curl -s http://localhost:3000/health)" != "ok" ]]; do sleep 1; done
+
+      - name: Check datasets
+        working-directory: test_app
+        run: |
+          response=$(curl http://localhost:3000/v1/datasets)
+          echo $response | jq
+          length=$(echo $response | jq 'if type=="array" then length else empty end')
+          if [[ $length -ne 1 ]]; then
+            echo "Unexpected response: $response, expected 1 dataset but received $length"
+            exit 1
+          fi
+
+      - name: Check eth_recent_blocks table exists
+        working-directory: test_app
+        run: |
+          response=$(curl -X POST \
+            -H "Content-Type: text/plain" \
+            -d "show tables;" \
+            http://localhost:3000/v1/sql
+          )
+          echo $response | jq
+          table_exists=$(echo $response | jq '[.[] | select(.table_name == "eth_recent_blocks")]' | jq 'length')
+          if [[ $table_exists -eq 0 ]]; then
+            echo "Unexpected response: table 'taxi_trips' does not exist."
+            exit 1
+          fi
+    
+      - name: Check Flight SQL query
+        working-directory: test_app
+        run: |
+          sql_output=$(echo "select * from eth_recent_blocks limit 10;" | spice sql)
+          echo "$sql_output"
+          if [[ $sql_output == *"error"* ]] || [[ $sql_output == *"not found"* ]]; then
+            echo "Unexpected response from spice sql, failed to perform test query: $sql_output"
             exit 1
           fi

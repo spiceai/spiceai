@@ -9,21 +9,18 @@ use spicepod::component::dataset::Dataset;
 
 use secrets::Secret;
 
+use super::DataConnectorFactory;
 use super::{flight::Flight, DataConnector};
 
 pub struct Dremio {
     flight: Flight,
 }
 
-#[async_trait]
-impl DataConnector for Dremio {
-    fn new(
+impl DataConnectorFactory for Dremio {
+    fn create(
         secret: Option<Secret>,
         params: Arc<Option<HashMap<String, String>>>,
-    ) -> Pin<Box<dyn Future<Output = super::Result<Self>> + Send>>
-    where
-        Self: Sized,
-    {
+    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let secret = secret.ok_or_else(|| super::Error::UnableToCreateDataConnector {
                 source: "Missing required secrets".into(),
@@ -44,10 +41,13 @@ impl DataConnector for Dremio {
             .await
             .map_err(|e| super::Error::UnableToCreateDataConnector { source: e.into() })?;
             let flight = Flight::new(flight_client);
-            Ok(Self { flight })
+            Ok(Box::new(Self { flight }) as Box<dyn DataConnector>)
         })
     }
+}
 
+#[async_trait]
+impl DataConnector for Dremio {
     fn get_all_data(
         &self,
         dataset: &Dataset,
