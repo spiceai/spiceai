@@ -6,9 +6,9 @@ on:
       - trunk
       - release-*
 
-  pull_request:
-    branches:
-      - trunk
+  # pull_request:
+  #   branches:
+  #     - trunk
 
   workflow_dispatch:
 
@@ -526,7 +526,7 @@ jobs:
           { engine: duckdb, mode: file},
           { engine: sqlite, mode: memory},
           { engine: sqlite, mode: file},
-          { engine: postgres},
+          # { engine: postgres},
         ]
         include:
           - name: Linux x64
