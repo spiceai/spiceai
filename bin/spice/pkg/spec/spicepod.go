@@ -10,9 +10,14 @@ type SpicepodSpec struct {
 	Functions    []*Reference      `json:"functions,omitempty" csv:"functions" yaml:"functions,omitempty"`
 	Models       []*Reference      `json:"models,omitempty" csv:"models" yaml:"models,omitempty"`
 	Dependencies []string          `json:"dependencies,omitempty" csv:"dependencies" yaml:"dependencies,omitempty"`
+	Secrets      Secrets           `json:"secrets,omitempty" csv:"secrets" yaml:"secrets,omitempty"`
 }
 
 type Reference struct {
 	Ref       string `json:"ref,omitempty" csv:"ref" yaml:"ref,omitempty"`
 	DependsOn string `json:"depends_on,omitempty" csv:"depends_on" yaml:"dependsOn,omitempty"`
+}
+
+type Secrets struct {
+	Store string `json:"store,omitempty" csv:"store" yaml:"store,omitempty"`
 }
