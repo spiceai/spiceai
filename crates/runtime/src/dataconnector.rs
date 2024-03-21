@@ -95,12 +95,14 @@ pub async fn create_new_connector(
 }
 
 pub async fn register_connectors() {
-    register_connector("databricks", databricks::Databricks::create).await;
-    register_connector("dremio", dremio::Dremio::create).await;
-    register_connector("flightsql", flightsql::FlightSQL::create).await;
-    register_connector("postgres", postgres::Postgres::create).await;
-    register_connector("s3", s3::S3::create).await;
-    register_connector("spiceai", spiceai::SpiceAI::create).await;
+    tokio::join!(
+        register_connector("databricks", databricks::Databricks::create),
+        register_connector("dremio", dremio::Dremio::create),
+        register_connector("flightsql", flightsql::FlightSQL::create),
+        register_connector("postgres", postgres::Postgres::create),
+        register_connector("s3", s3::S3::create),
+        register_connector("spiceai", spiceai::SpiceAI::create),
+    );
 }
 
 pub trait DataConnectorFactory {
