@@ -5,6 +5,10 @@ on:
     branches:
       - trunk
       - release-*
+  
+  # pull_request:
+  #   branches:
+  #     - trunk
 
   workflow_dispatch:
 
@@ -25,16 +29,16 @@ jobs:
             target_os: linux
             target_arch: x86_64
             target_arch_go: amd64
-          # - name: macOS aarch64 (Apple Silicon)
-          #   runner: macos-14
-          #   target_os: darwin
-          #   target_arch: aarch64
-          #   target_arch_go: arm64
-          # - name: macOS x64 (Intel)
-          #   runner: rust-osx-x64
-          #   target_os: darwin
-          #   target_arch: x86_64
-          #   target_arch_go: amd64
+          - name: macOS aarch64 (Apple Silicon)
+            runner: macos-14
+            target_os: darwin
+            target_arch: aarch64
+            target_arch_go: arm64
+          - name: macOS x64 (Intel)
+            runner: macos-12
+            target_os: darwin
+            target_arch: x86_64
+            target_arch_go: amd64
           # - name: Windows x64
           #   runner: rust-windows-x64
           #   target_os: windows
@@ -135,6 +139,7 @@ jobs:
     needs: build
 
     strategy:
+      fail-fast: false
       matrix:
         include:
           - name: Linux x64
@@ -142,16 +147,16 @@ jobs:
             target_os: linux
             target_arch: x86_64
             target_arch_go: amd64
-          # - name: macOS aarch64 (Apple Silicon)
-          #   runner: macos-14
-          #   target_os: darwin
-          #   target_arch: aarch64
-          #   target_arch_go: arm64
-          # - name: macOS x64 (Intel)
-          #   runner: rust-osx-x64
-          #   target_os: darwin
-          #   target_arch: x86_64
-          #   target_arch_go: amd64
+          - name: macOS aarch64 (Apple Silicon)
+            runner: macos-14
+            target_os: darwin
+            target_arch: aarch64
+            target_arch_go: arm64
+          - name: macOS x64 (Intel)
+            runner: macos-12
+            target_os: darwin
+            target_arch: x86_64
+            target_arch_go: amd64
           # - name: Windows x64
           #   runner: rust-windows-x64
           #   target_os: windows
@@ -200,6 +205,8 @@ jobs:
         run: |
           spice add spiceai/quickstart
           cat spicepod.yaml
+          # time to initialize added dataset
+          sleep 5
 
       - name: Check datasets
         working-directory: test_app
@@ -211,29 +218,40 @@ jobs:
             echo "Unexpected response: $response, expected 1 dataset but received $length"
             exit 1
           fi
+          
 
-      # TODO fix this step
-      # - name: Check tables
-      #   working-directory: test_app
-      #   run: |
-      #     response=$(curl -X POST \
-      #       -H "Content-Type: text/plain" \
-      #       -d "show tables;" \
-      #       http://localhost:3000/v1/sql
-      #     )
-      #     echo $response | jq
-      #     length=$(echo $response | jq 'if type=="array" then length else empty end')
-      #     if [[ $length -ne 5 ]]; then
-      #       echo "Unexpected response: $response, expected 5 tables but received $length"
-      #       exit 1
-      #     fi
-
+      - name: Check taxi_trips table exists
+        working-directory: test_app
+        run: |
+          response=$(curl -X POST \
+            -H "Content-Type: text/plain" \
+            -d "show tables;" \
+            http://localhost:3000/v1/sql
+          )
+          echo $response | jq
+          table_exists=$(echo $response | jq '[.[] | select(.table_name == "taxi_trips")]' | jq 'length')
+          if [[ $table_exists -eq 0 ]]; then
+            echo "Unexpected response: table 'taxi_trips' does not exist."
+            exit 1
+          fi
+    
+      - name: Run Flight SQL query
+        working-directory: test_app
+        run: |
+          sql_output=$(echo "select * from taxi_trips limit 10;" | spice sql)
+          echo "$sql_output"
+          if [[ $sql_output == *"error"* ]] || [[ $sql_output == *"not found"* ]]; then
+            echo "Unexpected response from spice sql, failed to perform test query: $sql_output"
+            exit 1
+          fi
+        
   test_quickstart_spiceai:
     name: "E2E Test: SpiceAI quickstart, using ${{ matrix.target_os }}-${{ matrix.target_arch }}"
     runs-on: ${{ matrix.runner }}
     needs: build
 
     strategy:
+      fail-fast: false
       matrix:
         include:
           - name: Linux x64
@@ -241,16 +259,16 @@ jobs:
             target_os: linux
             target_arch: x86_64
             target_arch_go: amd64
-          # - name: macOS aarch64 (Apple Silicon)
-          #   runner: macos-14
-          #   target_os: darwin
-          #   target_arch: aarch64
-          #   target_arch_go: arm64
-          # - name: macOS x64 (Intel)
-          #   runner: rust-osx-x64
-          #   target_os: darwin
-          #   target_arch: x86_64
-          #   target_arch_go: amd64
+          - name: macOS aarch64 (Apple Silicon)
+            runner: macos-14
+            target_os: darwin
+            target_arch: aarch64
+            target_arch_go: arm64
+          - name: macOS x64 (Intel)
+            runner: macos-12
+            target_os: darwin
+            target_arch: x86_64
+            target_arch_go: amd64
           # - name: Windows x64
           #   runner: rust-windows-x64
           #   target_os: windows
@@ -277,15 +295,13 @@ jobs:
         run: |
           spice init test_app
 
-      - name: Configure spice app
+      - name: Spice dataset configure
         working-directory: test_app
         run: |
-          # equal to "spice dataset configure"
-          mkdir -p datasets/eth_recent_blocks
-          echo -e "from: spice.ai/eth.recent_blocks\nname: eth_recent_blocks\ndescription: eth recent logs\nacceleration:\n  enabled: true\n  refresh_interval: 10s\n  refresh_mode: full" >> datasets/eth_recent_blocks/dataset.yaml
-
-          # configure env secret store and add dataset
-          echo -e "secrets:\n  store: env\ndatasets:\n- ref: datasets/eth_recent_blocks" >> spicepod.yaml
+          echo -e "eth_recent_blocks\neth recent logs\nspice.ai/eth.recent_blocks\ny" | spice dataset configure
+          # configure env secret store
+          echo -e "secrets:\n  store: env\n" >> spicepod.yaml
+          cat spicepod.yaml
 
       - name: Start spice runtime
         env:
@@ -293,6 +309,8 @@ jobs:
         working-directory: test_app
         run: |
           spice run &
+           # time to initialize added dataset
+          sleep 5
 
       - name: Wait for Spice runtime healthy
         working-directory: test_app
@@ -311,7 +329,7 @@ jobs:
             exit 1
           fi
 
-      - name: Check tables
+      - name: Check eth_recent_blocks table exists
         working-directory: test_app
         run: |
           response=$(curl -X POST \
@@ -320,8 +338,18 @@ jobs:
             http://localhost:3000/v1/sql
           )
           echo $response | jq
-          length=$(echo $response | jq 'if type=="array" then length else empty end')
-          if [[ $length -ne 5 ]]; then
-            echo "Unexpected response: $response, expected 5 tables but received $length"
+          table_exists=$(echo $response | jq '[.[] | select(.table_name == "eth_recent_blocks")]' | jq 'length')
+          if [[ $table_exists -eq 0 ]]; then
+            echo "Unexpected response: table 'taxi_trips' does not exist."
+            exit 1
+          fi
+    
+      - name: Run Flight SQL query
+        working-directory: test_app
+        run: |
+          sql_output=$(echo "select * from eth_recent_blocks limit 10;" | spice sql)
+          echo "$sql_output"
+          if [[ $sql_output == *"error"* ]] || [[ $sql_output == *"not found"* ]]; then
+            echo "Unexpected response from spice sql, failed to perform test query: $sql_output"
             exit 1
           fi
