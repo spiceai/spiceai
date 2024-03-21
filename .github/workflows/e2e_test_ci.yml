@@ -402,7 +402,10 @@ jobs:
         run: |
           chmod +x ./build/spice
           chmod +x ./build/spiced
-          echo "$GITHUB_WORKSPACE/build" >> $GITHUB_PATH
+          mkdir -p "$HOME/.spice/bin"
+          mv ./build/spice "$HOME/.spice/bin"
+          mv ./build/spiced "$HOME/.spice/bin"
+          echo "$HOME/.spice/bin" >> $GITHUB_PATH
 
       - name: Check spice version
         run: spice version
