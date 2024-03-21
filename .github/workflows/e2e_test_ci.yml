@@ -363,7 +363,7 @@ jobs:
             exit 1
           fi
 
-  test_quickstart_data_posstgres:
+  test_quickstart_data_postgres:
     name: "E2E Test: SpiceAI quickstart, using ${{ matrix.target_os }}-${{ matrix.target_arch }}"
     runs-on: ${{ matrix.runner }}
     # needs: build
@@ -449,13 +449,13 @@ jobs:
         run: |
           spice init test_app
 
-      # - name: Spice dataset configure
-      #   working-directory: test_app
-      #   run: |
-      #     echo -e "eth_recent_blocks\neth recent logs\nspice.ai/eth.recent_blocks\ny" | spice dataset configure
-      #     # configure env secret store
-      #     echo -e "secrets:\n  store: env\n" >> spicepod.yaml
-      #     cat spicepod.yaml
+      - name: Spice dataset configure
+        working-directory: test_app
+        run: |
+          echo -e "eth_recent_blocks\neth recent logs\nspice.ai/eth.recent_blocks\ny" | spice dataset configure
+          # configure env secret store
+          echo -e "secrets:\n  store: env\n" >> spicepod.yaml
+          cat spicepod.yaml
 
       # - name: Start spice runtime
       #   env:
