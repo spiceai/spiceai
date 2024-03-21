@@ -2,6 +2,8 @@
 name = "spiceai"
 version = "1.0.3"
 edition = "2021"
+description = "SDK for Spice.ai, an open-source runtime and platform for building AI-driven software."
+license = "Apache-2.0"
 
 [dependencies]
 arrow-flight = { version = "49.0.0", features = ["flight-sql-experimental"] }
