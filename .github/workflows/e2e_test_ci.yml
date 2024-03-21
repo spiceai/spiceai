@@ -408,6 +408,8 @@ jobs:
         run: sleep 10
 
       - name: Check PostgreSQL
+        env:
+          PGPASSWORD: postgres
         run: psql -h localhost -U postgres -c 'SELECT version();'
 
       # - name: download artifacts - build_${{ matrix.target_os }}_${{ matrix.target_arch }}
