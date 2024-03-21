@@ -12,7 +12,7 @@ use flight_client::tls::new_tls_flight_channel;
 use flightsql_datafusion::FlightSQLTable;
 use secrets::Secret;
 
-use super::DataConnector;
+use super::{DataConnector, DataConnectorFactory};
 use arrow::error::ArrowError;
 use futures::stream::TryStreamExt;
 
@@ -50,15 +50,11 @@ impl FlightSQL {
     }
 }
 
-#[async_trait]
-impl DataConnector for FlightSQL {
-    fn new(
+impl DataConnectorFactory for FlightSQL {
+    fn create(
         secret: Option<Secret>,
         params: Arc<Option<HashMap<String, String>>>,
-    ) -> Pin<Box<dyn Future<Output = super::Result<Self>> + Send>>
-    where
-        Self: Sized,
-    {
+    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let endpoint: String = params
                 .as_ref() // &Option<HashMap<String, String>>
@@ -80,10 +76,13 @@ impl DataConnector for FlightSQL {
                     )
                     .await;
             };
-            Ok(Self { client })
+            Ok(Box::new(Self { client }) as Box<dyn DataConnector>)
         })
     }
+}
 
+#[async_trait]
+impl DataConnector for FlightSQL {
     fn get_all_data(
         &self,
         dataset: &Dataset,
