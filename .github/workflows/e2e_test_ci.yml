@@ -410,8 +410,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y postgresql
           sudo service postgresql start
-          createuser -s postgres
-          sudo -u postgres psql -c "ALTER USER postgres
+          sudo service postgresql start
+          sudo -u postgres createuser -s postgres
+          sudo -u postgres createdb testdb
 
       - name: Install PostgreSQL (MacOS)
         if: matrix.target_os == 'darwin'
@@ -419,6 +420,7 @@ jobs:
           brew install postgresql
           brew services start postgresql
           createuser -s postgres
+          createdb testdb
 
       - name: Wait for PostgreSQL to start
         run: sleep 10
