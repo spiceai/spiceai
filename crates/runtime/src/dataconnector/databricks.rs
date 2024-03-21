@@ -17,11 +17,7 @@ use crate::datapublisher::{AddDataResult, DataPublisher};
 use crate::dataupdate::DataUpdate;
 
 use super::{DataConnector, DataConnectorFactory};
-
-#[derive(Clone)]
-pub struct Databricks {
-    secret: Arc<Option<Secret>>,
-}
+use data_components::databricks::Databricks;
 
 impl DataConnectorFactory for Databricks {
     fn create(
@@ -32,11 +28,7 @@ impl DataConnectorFactory for Databricks {
         deltalake::aws::register_handlers(None);
         deltalake::azure::register_handlers(None);
 
-        let databricks = Self {
-            secret: Arc::new(secret),
-        };
-
-        Box::pin(async move { Ok(Box::new(databricks) as Box<dyn DataConnector>) })
+        Box::pin(async move { Ok(Box::new(Databricks::new(secret)) as Box<dyn DataConnector>) })
     }
 }
 

@@ -1,0 +1,29 @@
+[package]
+name = "data_components"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+exclude.workspace = true
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+arrow.workspace = true
+arrow-flight.workspace = true
+async-stream.workspace = true
+datafusion.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+r2d2.workspace = true
+snafu.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+flight_client = { path = "../flight_client" }
+sql_provider_datafusion = { path = "../sql_provider_datafusion" }
+secrets = { path = "../secrets" }
+deltalake = { version = "0.17.0", features = ["datafusion-ext", "s3", "azure"] }
+serde.workspace = true
+reqwest = { version = "0.11.24", features = ["json"] }

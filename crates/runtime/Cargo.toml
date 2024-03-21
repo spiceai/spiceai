@@ -83,6 +83,7 @@ rusqlite = { workspace = true, optional = true }
 tokio-rusqlite = { workspace = true, optional = true }
 pin-project = "1.0"
 lazy_static = "1.4.0"
+data_components = { path = "../data_components" }
 
 [features]
 default = ["duckdb", "postgres", "keyring-secret-store", "sqlite"]

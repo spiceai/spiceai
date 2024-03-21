@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "bin/spiced/",
+    "crates/data_components",
     "crates/flight_client",
     "crates/spicepod",
     "crates/app",

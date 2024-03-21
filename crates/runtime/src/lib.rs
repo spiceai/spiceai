@@ -18,8 +18,8 @@ use tokio::time::sleep;
 use tokio::{signal, sync::RwLock};
 
 use crate::{dataconnector::DataConnector, datafusion::DataFusion};
+pub mod accelerator_engines;
 pub mod config;
-pub mod databackend;
 pub mod dataconnector;
 pub mod datafusion;
 pub mod datapublisher;

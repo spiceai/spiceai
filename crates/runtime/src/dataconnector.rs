@@ -21,6 +21,7 @@ use std::future::Future;
 use crate::datapublisher::DataPublisher;
 use crate::dataupdate::{DataUpdate, UpdateType};
 use crate::timing::TimeMeasurement;
+use data_components::databricks::Databricks;
 
 pub mod databricks;
 pub mod dremio;
@@ -96,7 +97,7 @@ pub async fn create_new_connector(
 
 pub async fn register_all() {
     tokio::join!(
-        register_connector_factory("databricks", databricks::Databricks::create),
+        register_connector_factory("databricks", Databricks::create),
         register_connector_factory("dremio", dremio::Dremio::create),
         register_connector_factory("flightsql", flightsql::FlightSQL::create),
         register_connector_factory("postgres", postgres::Postgres::create),

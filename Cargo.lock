@@ -1809,6 +1809,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "data_components"
+version = "0.9.1-alpha"
+dependencies = [
+ "arrow",
+ "arrow-flight",
+ "async-stream",
+ "async-trait",
+ "datafusion",
+ "deltalake",
+ "flight_client",
+ "futures",
+ "r2d2",
+ "reqwest",
+ "secrets",
+ "serde",
+ "snafu 0.8.2",
+ "sql_provider_datafusion",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "datafusion"
 version = "35.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4986,6 +5008,7 @@ dependencies = [
  "bytes",
  "clap",
  "csv",
+ "data_components",
  "datafusion",
  "db_connection_pool",
  "deltalake",

@@ -26,7 +26,7 @@ pub enum Error {
     },
 }
 
-pub struct DataBackendBuilder {
+pub struct AcceleratorBuilder {
     ctx: Arc<SessionContext>,
     name: String,
     engine: Option<Engine>,
@@ -36,7 +36,7 @@ pub struct DataBackendBuilder {
     secret: Option<Secret>,
 }
 
-impl DataBackendBuilder {
+impl AcceleratorBuilder {
     #[must_use]
     pub fn new(ctx: Arc<SessionContext>, name: String) -> Self {
         Self {

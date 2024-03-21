@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::databackend::{self, DataBackendBuilder};
+use crate::accelerator_engines::{self, AcceleratorBuilder};
 use crate::dataconnector::DataConnector;
 use crate::datapublisher::DataPublisher;
 use datafusion::datasource::ViewTable;
@@ -37,7 +37,7 @@ pub enum Error {
 
     #[snafu(display("Unable to get table: {source}"))]
     DatasetConfigurationError {
-        source: databackend::Error,
+        source: accelerator_engines::Error,
     },
 
     #[snafu(display("Invalid configuration: {msg}"))]
@@ -47,7 +47,7 @@ pub enum Error {
 
     #[snafu(display("Unable to create dataset acceleration: {source}"))]
     UnableToCreateBackend {
-        source: databackend::Error,
+        source: accelerator_engines::Error,
     },
 
     #[snafu(display("Unable to create view: {reason}"))]
@@ -157,7 +157,7 @@ impl DataFusion {
         let backend_secret = secrets_provider.read().await.get_secret(&secret_key).await;
 
         let data_backend: Box<dyn DataPublisher> =
-            DataBackendBuilder::new(Arc::clone(&self.ctx), table_name)
+            AcceleratorBuilder::new(Arc::clone(&self.ctx), table_name)
                 .engine(acceleration.engine())
                 .mode(acceleration.mode())
                 .params(params)
