@@ -368,15 +368,15 @@ jobs:
     runs-on: ${{ matrix.runner }}
     # needs: build
 
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: testdb
-        ports:
-          - 5432:5432
+    # services:
+    #   postgres:
+    #     image: postgres:16
+    #     env:
+    #       POSTGRES_USER: postgres
+    #       POSTGRES_PASSWORD: postgres
+    #       POSTGRES_DB: testdb
+    #     ports:
+    #       - 5432:5432
 
     strategy:
       fail-fast: false
@@ -404,6 +404,20 @@ jobs:
           #   target_arch_go: amd64
 
     steps:
+      - name: Install PostgreSQL (Linux)
+        if: matrix.target_os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql
+          sudo service postgresql start
+          sudo -u postgres psql -c "ALTER USER postgres
+
+      - name: Install PostgreSQL (MacOS)
+        if: matrix.target_os == 'darwin'
+        run: |
+          brew install postgresql
+          brew services start postgresql
+
       - name: Wait for PostgreSQL to start
         run: sleep 10
 
