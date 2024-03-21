@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
 use futures::stream;
+use lazy_static::lazy_static;
 use object_store::ObjectStore;
 use snafu::prelude::*;
 use spicepod::component::dataset::acceleration::RefreshMode;
@@ -8,6 +9,7 @@ use spicepod::component::dataset::Dataset;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
+use tokio::sync::Mutex;
 use url::Url;
 
 use arrow::record_batch::RecordBatch;
@@ -21,7 +23,6 @@ use crate::dataupdate::{DataUpdate, UpdateType};
 use crate::timing::TimeMeasurement;
 
 pub mod databricks;
-pub mod debug;
 pub mod dremio;
 pub mod flight;
 pub mod flightsql;
@@ -45,6 +46,70 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub type AnyErrorResult = std::result::Result<(), Box<dyn std::error::Error>>;
 
+type NewDataConnectorResult = Result<Box<dyn DataConnector>>;
+
+type NewDataConnectorFn = dyn Fn(
+        Option<Secret>,
+        Arc<Option<HashMap<String, String>>>,
+    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>>
+    + Send;
+
+lazy_static! {
+    static ref CONNECTOR_FACTORY: Mutex<HashMap<String, Box<NewDataConnectorFn>>> =
+        Mutex::new(HashMap::new());
+}
+
+pub async fn register_connector(
+    name: &str,
+    constructor: impl Fn(
+            Option<Secret>,
+            Arc<Option<HashMap<String, String>>>,
+        ) -> Pin<Box<dyn Future<Output = Result<Box<dyn DataConnector>>> + Send>>
+        + Send
+        + 'static,
+) {
+    let mut factory_map = CONNECTOR_FACTORY.lock().await;
+
+    factory_map.insert(name.to_string(), Box::new(constructor));
+}
+
+/// Create a new `DataConnector` by name.
+///
+/// # Returns
+///
+/// `None` if the connector for `name` is not registered, otherwise a `Result` containing the result of calling the constructor to create a `DataConnector`.
+#[allow(clippy::implicit_hasher)]
+pub async fn create_new_connector(
+    name: &str,
+    secret: Option<Secret>,
+    params: Arc<Option<HashMap<String, String>>>,
+) -> Option<Result<Box<dyn DataConnector>>> {
+    let guard = CONNECTOR_FACTORY.lock().await;
+
+    let data_connector_factory = guard.get(name);
+
+    match data_connector_factory {
+        Some(factory) => Some(factory(secret, params).await),
+        None => None,
+    }
+}
+
+pub async fn init() {
+    register_connector("databricks", databricks::Databricks::create).await;
+    register_connector("dremio", dremio::Dremio::create).await;
+    register_connector("flightsql", flightsql::FlightSQL::create).await;
+    register_connector("postgres", postgres::Postgres::create).await;
+    register_connector("s3", s3::S3::create).await;
+    register_connector("spiceai", spiceai::SpiceAI::create).await;
+}
+
+pub trait DataConnectorFactory {
+    fn create(
+        secret: Option<Secret>,
+        params: Arc<Option<HashMap<String, String>>>,
+    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>>;
+}
+
 /// A `DataConnector` knows how to retrieve and modify data for a given dataset.
 ///
 /// Implementing `get_all_data` is required, but `stream_data_updates` & `supports_data_streaming` is optional.
@@ -59,14 +124,6 @@ pub type AnyErrorResult = std::result::Result<(), Box<dyn std::error::Error>>;
 /// ```
 #[async_trait]
 pub trait DataConnector: Send + Sync {
-    /// Create a new `DataConnector` with the given `Secret`.
-    fn new(
-        secret: Option<Secret>,
-        params: Arc<Option<HashMap<String, String>>>,
-    ) -> Pin<Box<dyn Future<Output = Result<Self>> + Send>>
-    where
-        Self: Sized;
-
     /// Returns true if the given dataset supports streaming by this `DataConnector`.
     fn supports_data_streaming(&self, _dataset: &Dataset) -> bool {
         false

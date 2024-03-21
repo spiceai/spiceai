@@ -79,7 +79,7 @@ pub async fn run(args: Args) -> Result<()> {
             }
         };
 
-    let mut rt: Runtime = Runtime::new(args.runtime, app, df, pods_watcher);
+    let mut rt: Runtime = Runtime::new(args.runtime, app, df, pods_watcher).await;
 
     rt.load_secrets().await;
 
