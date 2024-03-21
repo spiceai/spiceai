@@ -452,36 +452,38 @@ jobs:
       - name: Spice dataset configure
         working-directory: test_app
         run: |
-          echo -e "eth_recent_blocks\neth recent logs\nspice.ai/eth.recent_blocks\ny" | spice dataset configure
+          echo -e "eth_recent_blocks\neth recent blocks\npostgres:eth_recent_blocks\ny" | spice dataset configure
+          # configure pg credentials
+          echo -e "params:\n  pg_host: localhost\n  pg_port: 5432\n  pg_db: testdb\n  pg_user: postgres\n  pg_pass_key: password" >> datasets/eth_recent_blocks/dataset.yaml
           # configure env secret store
           echo -e "secrets:\n  store: env\n" >> spicepod.yaml
           cat spicepod.yaml
 
-      # - name: Start spice runtime
-      #   env:
-      #     SPICE_SECRET_SPICEAI_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_KEY }}
-      #   working-directory: test_app
-      #   run: |
-      #     spice run &
-      #       # time to initialize added dataset
-      #     sleep 5
+      - name: Start spice runtime
+        env:
+          SPICE_SECRET_POSTGRES_PASSWORD: postgres
+        working-directory: test_app
+        run: |
+          spice run &
+            # time to initialize added dataset
+          sleep 5
 
-      # - name: Wait for Spice runtime healthy
-      #   working-directory: test_app
-      #   timeout-minutes: 1
-      #   run: |
-      #     while [[ "$(curl -s http://localhost:3000/health)" != "ok" ]]; do sleep 1; done
+      - name: Wait for Spice runtime healthy
+        working-directory: test_app
+        timeout-minutes: 1
+        run: |
+          while [[ "$(curl -s http://localhost:3000/health)" != "ok" ]]; do sleep 1; done
 
-      # - name: Check datasets
-      #   working-directory: test_app
-      #   run: |
-      #     response=$(curl http://localhost:3000/v1/datasets)
-      #     echo $response | jq
-      #     length=$(echo $response | jq 'if type=="array" then length else empty end')
-      #     if [[ $length -ne 1 ]]; then
-      #       echo "Unexpected response: $response, expected 1 dataset but received $length"
-      #       exit 1
-      #     fi
+      - name: Check datasets
+        working-directory: test_app
+        run: |
+          response=$(curl http://localhost:3000/v1/datasets)
+          echo $response | jq
+          length=$(echo $response | jq 'if type=="array" then length else empty end')
+          if [[ $length -ne 1 ]]; then
+            echo "Unexpected response: $response, expected 1 dataset but received $length"
+            exit 1
+          fi
 
       # - name: Check eth_recent_blocks table exists
       #   working-directory: test_app
