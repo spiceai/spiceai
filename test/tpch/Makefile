@@ -1,9 +1,8 @@
 # Makefile
 
 .PHONY: all
-all: tpch-get
 
-.PHONY: tpch-get tpch-gen
+all: tpch-gen pg-load
 
 tpch-init:
 	@if [ ! -d "tpch-kit" ]; then \
@@ -31,7 +30,10 @@ tpch-gen: tpch-init
 
 	@# skip query 20.sql temporarily as it is unable to run
 	@for i in tpch-kit/dbgen/queries/*.sql; do \
-		if [ `basename $$i` = "20.sql" ]; then continue; fi; \
+		if [ `basename $$i` = "20.sql" ]; then \
+			touch ./tmp/queries/`basename $$i`; \
+			continue; \
+		fi; \
 		tail -r $$i | sed '2s/;//' | tail -r > ./tmp/queries/`basename $$i`; \
 	done
 
@@ -46,7 +48,7 @@ pg-init:
 	(createdb tpch && echo "Database 'tpch' created successfully.")
 	
 	@psql tpch -c "DROP TABLE IF EXISTS nation, region, part, supplier, partsupp, customer, orders, lineitem;"
-	@psql tpch -f ./tpch-kit/dbgen/
+	@psql tpch -f ./tpch-kit/dbgen/dss.ddl
 
 	@echo "Database 'tpch' has been successfuly created or updated."
 
