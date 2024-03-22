@@ -208,7 +208,6 @@ impl FlightSQLTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        tracing::error!("creating a physical plan for FlightSQLTable");
         Ok(Arc::new(FlightSqlExec::new(
             projections,
             schema,
