@@ -80,7 +80,7 @@ impl ModelSource for Huggingface {
 
         let versioned_path = format!("{local_path}/{revision}");
 
-        let mut onnx_file_name = "".to_string();
+        let mut onnx_file_name = String::new();
 
         std::fs::create_dir_all(versioned_path.clone())
             .context(super::UnableToCreateModelPathSnafu {})?;
@@ -106,7 +106,7 @@ impl ModelSource for Huggingface {
 
             tracing::info!("Downloading model: {}", download_url);
 
-            if file.ends_with(".onnx") {
+            if file.to_lowercase().ends_with(".onnx") {
                 onnx_file_name = file_name.clone();
             }
 
