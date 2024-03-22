@@ -1,3 +1,4 @@
+use super::Error;
 use super::ModelSource;
 use async_trait::async_trait;
 use regex::Regex;
@@ -13,7 +14,7 @@ pub struct Huggingface {}
 impl ModelSource for Huggingface {
     async fn pull(
         &self,
-        _: Secret,
+        secret: Secret,
         params: Arc<Option<HashMap<String, String>>>,
     ) -> super::Result<String> {
         let name = params
@@ -84,18 +85,16 @@ impl ModelSource for Huggingface {
         std::fs::create_dir_all(versioned_path.clone())
             .context(super::UnableToCreateModelPathSnafu {})?;
 
-        // replace lfs reference with file downloaded from huggingface api
         let p = versioned_path.clone();
 
         for file in files {
             let file_name = format!("{p}/{file}");
 
             if std::fs::metadata(file_name.clone()).is_ok() {
-                println!("File already exists: {file_name}, skipping download");
+                tracing::info!("File already exists: {}, skipping download", file_name);
+
                 continue;
             }
-
-            println!("Downloading {file_name}...");
 
             let download_url = format!(
                 "https://huggingface.co/{}/{}/resolve/{}/{}",
@@ -105,7 +104,7 @@ impl ModelSource for Huggingface {
                 file,
             );
 
-            println!("Downloading {download_url}...");
+            tracing::info!("Downloading model: {}", download_url);
 
             if file.ends_with(".onnx") {
                 onnx_file_name = file_name.clone();
@@ -114,9 +113,14 @@ impl ModelSource for Huggingface {
             let client = reqwest::Client::new();
             let response = client
                 .get(download_url)
+                .bearer_auth(secret.get("token").unwrap_or_default())
                 .send()
                 .await
                 .context(super::UnableToFetchModelSnafu {})?;
+
+            if !response.status().is_success() {
+                return Err(Error::UnableToDownloadModelFile {});
+            }
 
             let mut file = std::fs::File::create(file_name.clone())
                 .context(super::UnableToCreateModelPathSnafu {})?;
@@ -124,7 +128,7 @@ impl ModelSource for Huggingface {
             std::io::copy(&mut content, &mut file)
                 .context(super::UnableToCreateModelPathSnafu {})?;
 
-            println!("Downloaded {file_name}");
+            tracing::info!("Downloaded: {}", file_name);
         }
 
         Ok(onnx_file_name)

@@ -17,6 +17,9 @@ pub enum Error {
     #[snafu(display("Unable to load the model: {source}"))]
     UnableToFetchModel { source: reqwest::Error },
 
+    #[snafu(display("Unable to download model file"))]
+    UnableToDownloadModelFile {},
+
     #[snafu(display("Unable to parse metadata"))]
     UnableToParseMetadata {},
 

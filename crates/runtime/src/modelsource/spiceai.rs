@@ -119,6 +119,11 @@ impl ModelSource for SpiceAI {
         let versioned_path = format!("{local_path}/{version}");
         let file_name = format!("{versioned_path}/model.onnx");
 
+        if std::fs::metadata(file_name.clone()).is_ok() {
+            println!("File already exists: {file_name}, skipping download");
+            return Ok(file_name);
+        }
+
         let response = client
             .get(download_url)
             .send()
