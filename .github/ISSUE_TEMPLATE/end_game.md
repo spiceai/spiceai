@@ -36,12 +36,14 @@ assignees: ''
 - [ ] Update release notes
 - [ ] Update acknowledgements
 - [ ] Verify `version.txt` and version in `Cargo.toml` is correct using [docs/RELEASE.md](https://github.com/spiceai/spiceai/blob/trunk/docs/RELEASE.md#version-update)
+- [ ] Ensure [E2E Test CI](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_ci.yml) runs are green on trunk branch
 - [ ] QA DRI sign-off
 - [ ] Docs DRI sign-off
 - [ ] Create a new branch `release-v[semver]` and merge all relevant changes into it.
 - [ ] Release the new version by creating a draft release with the tag from the release branch.
 - [ ] Release any docs updates by creating a `v[semver]` tag.
 - [ ] Final test pass on released binaries
+- [ ] Run [E2E Test Release Installation](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_release_install.yml)
 - [ ] Reddit announcement to [reddit.com/r/spiceai](https://reddit.com/r/spiceai)
 - [ ] Discord announcement to [#announcements](https://discord.gg/zv8ahzZVpf)
 - [ ] For major releases, [blog.spiceai.org](https://blog.spiceai.org) announcement
