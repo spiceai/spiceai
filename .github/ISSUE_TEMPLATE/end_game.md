@@ -36,7 +36,7 @@ assignees: ''
 - [ ] Update release notes
 - [ ] Update acknowledgements
 - [ ] Verify `version.txt` and version in `Cargo.toml` is correct using [docs/RELEASE.md](https://github.com/spiceai/spiceai/blob/trunk/docs/RELEASE.md#version-update)
-- [ ] Ensure [E2E Test CI](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_ci.yml) runs are green on trunk branch
+- [ ] Ensure [E2E Test CI](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_ci.yml) is green on trunk branch
 - [ ] QA DRI sign-off
 - [ ] Docs DRI sign-off
 - [ ] Create a new branch `release-v[semver]` and merge all relevant changes into it.
