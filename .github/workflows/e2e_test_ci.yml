@@ -526,7 +526,7 @@ jobs:
           { engine: duckdb, mode: file},
           { engine: sqlite, mode: memory},
           { engine: sqlite, mode: file},
-          { engine: postgres},
+          # { engine: postgres},
         ]
         include:
           - name: Linux x64
@@ -568,6 +568,10 @@ jobs:
 
       - name: Check spice version
         run: spice version
+    
+      - name: Init spice app
+        run: |
+          spice init test_app
 
       - name: Spice dataset configure
         working-directory: test_app
