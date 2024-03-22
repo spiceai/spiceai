@@ -73,6 +73,12 @@ https://github.com/spiceai/spiceai/assets/112157037/c9cfdaeb-ac6a-484f-a382-4c27
 curl https://install.spiceai.org | /bin/bash
 ```
 
+Or using `brew`:
+
+```bash
+brew install spiceai/spiceai/spice
+```
+
 **Step 2.** Initialize a new Spice app with the `spice init` command:
 
 ```bash

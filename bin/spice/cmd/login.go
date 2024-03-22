@@ -22,7 +22,7 @@ const (
 	passwordFlag     = "password"
 	token            = "token"
 	accessKeyFlag    = "access-key"
-	accessSecretFlag = "access-scret"
+	accessSecretFlag = "access-secret"
 	awsRegion        = "aws-region"
 	awsAccessKeyId   = "aws-access-key-id"
 	awsSecret        = "aws-secret-access-key"
