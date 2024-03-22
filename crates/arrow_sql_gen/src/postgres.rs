@@ -159,7 +159,7 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                 Type::FLOAT8 => {
                     handle_primitive_type!(builder, Type::FLOAT8, Float64Builder, f64, row, i);
                 }
-                Type::TEXT => {
+                Type::TEXT | Type::VARCHAR | Type::BPCHAR => {
                     handle_primitive_type!(builder, Type::TEXT, StringBuilder, &str, row, i);
                 }
                 Type::BOOL => {
@@ -311,7 +311,7 @@ fn map_column_type_to_data_type(column_type: &Type) -> Option<DataType> {
         Type::INT8 => Some(DataType::Int64),
         Type::FLOAT4 => Some(DataType::Float32),
         Type::FLOAT8 => Some(DataType::Float64),
-        Type::TEXT => Some(DataType::Utf8),
+        Type::TEXT | Type::VARCHAR | Type::BPCHAR => Some(DataType::Utf8),
         Type::BOOL => Some(DataType::Boolean),
         // Inspect the scale from the first row. Precision will always be 38 for Decimal128.
         Type::NUMERIC => None,
