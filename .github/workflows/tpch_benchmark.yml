@@ -1,4 +1,4 @@
-name: TPC-H Benchmark Test
+name: TPC-H Benchmark
 
 on:
   # push:
@@ -135,13 +135,14 @@ jobs:
             spiced
 
   tpc_h_benchmark:
-    name: "Run TPC-H Benchmark Test ${{ matrix.target_os }}-${{ matrix.target_arch }}"
+    name: "Run TPC-H Benchmark on ${{ matrix.target_os }}-${{ matrix.target_arch }}"
     runs-on: ${{ matrix.runner }}
     #needs: build
 
     strategy:
       fail-fast: false
       matrix:
+        scale-factor: [0.1]
         include:
           - name: Linux x64
             runner: ubuntu-latest
@@ -201,7 +202,7 @@ jobs:
           git clone https://github.com/gregrahn/tpch-kit.git
           cd tpch-kit/dbgen
           make MACHINE=LINUX DATABASE=POSTGRESQL
-          ./dbgen -vf -s 0.1
+          ./dbgen -vf -s ${{ matrix.scale-factor }}
 
       - name: Load TPC-H Benchmark data to PostgreSQL
         working-directory: tpch-kit/dbgen
