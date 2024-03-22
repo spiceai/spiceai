@@ -1,0 +1,308 @@
+name: TPC-H Benchmark Test
+
+on:
+  # push:
+  #   branches:
+  #     - trunk
+  #     - release-*
+
+  pull_request:
+    branches:
+      - trunk
+
+  workflow_dispatch:
+
+jobs:
+  build:
+    if: false
+    name: Build ${{ matrix.name }} binaries
+    runs-on: ${{ matrix.runner }}
+    env:
+      GOVER: 1.22
+      GOOS: ${{ matrix.target_os }}
+      GOARCH: ${{ matrix.target_arch_go }}
+
+    strategy:
+      matrix:
+        include:
+          - name: Linux x64
+            runner: rust
+            target_os: linux
+            target_arch: x86_64
+            target_arch_go: amd64
+          # - name: macOS aarch64 (Apple Silicon)
+          #   runner: macos-14
+          #   target_os: darwin
+          #   target_arch: aarch64
+          #   target_arch_go: arm64
+          # - name: macOS x64 (Intel)
+          #   runner: macos-12
+          #   target_os: darwin
+          #   target_arch: x86_64
+          #   target_arch_go: amd64
+          # - name: Windows x64
+          #   runner: rust-windows-x64
+          #   target_os: windows
+          #   target_arch: x86_64
+          #   target_arch_go: amd64
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set REL_VERSION from version.txt
+        run: python3 ./.github/scripts/get_release_version.py
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GOVER }}
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          os: ${{ matrix.target_os }}
+
+      - name: Restore build cache (macOS)
+        if: matrix.target_os == 'darwin'
+        run: |
+          mkdir -p target
+          if [ -d /Users/spiceai/build/target ]; then
+            rsync -av /Users/spiceai/build/target/ target/
+          fi
+
+      - name: Restore build cache (Linux)
+        if: matrix.target_os == 'linux'
+        run: |
+          mkdir -p target
+          if [ -d /home/spiceai/build/target ]; then
+            rsync -av /home/spiceai/build/target/ target/
+          fi
+
+      - name: Restore build cache (Windows)
+        if: matrix.target_os == 'windows'
+        run: |
+          mkdir -p target
+          if (Test-Path C:/spiceai/build/target) {
+            Copy-Item -Recurse -Force C:/spiceai/build/target/* target/
+          }
+
+      - name: Build spiced
+        run: make -C bin/spiced
+
+      - name: Update build cache (macOS)
+        if: matrix.target_os == 'darwin'
+        run: |
+          if [ -d /Users/spiceai/build/target ]; then
+            rsync -av target/ /Users/spiceai/build/target/
+          fi
+
+      - name: Update build cache (Linux)
+        if: matrix.target_os == 'linux'
+        run: |
+          if [ -d /home/spiceai/build/target ]; then
+            rsync -av target/ /home/spiceai/build/target/
+          fi
+
+      - name: Update build cache (Windows)
+        if: matrix.target_os == 'windows'
+        run: |
+          if (Test-Path C:/spiceai/build/target) {
+            Copy-Item -Recurse -Force target/* C:/spiceai/build/target
+          }
+
+      - name: Build spice
+        run: make -C bin/spice
+
+      - name: make spiced executable
+        if: matrix.target_os != 'windows'
+        run: |
+          mv target/release/spiced spiced
+          chmod +x spiced
+
+      - name: make spice executable
+        if: matrix.target_os != 'windows'
+        run: |
+          mv target/release/spice spice
+          chmod +x spice
+
+      - name: Save spice artifact
+        uses: actions/upload-artifact@v4
+        if: matrix.target_os != 'windows'
+        with:
+          name: build_${{ matrix.target_os }}_${{ matrix.target_arch }}
+          path: |
+            spice
+            spiced
+
+  tpc_h_benchmark:
+    name: "Run TPC-H Benchmark Test ${{ matrix.target_os }}-${{ matrix.target_arch }}"
+    runs-on: ${{ matrix.runner }}
+    #needs: build
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x64
+            runner: ubuntu-latest
+            target_os: linux
+            target_arch: x86_64
+            target_arch_go: amd64
+          # - name: macOS aarch64 (Apple Silicon)
+          #   runner: macos-14
+          #   target_os: darwin
+          #   target_arch: aarch64
+          #   target_arch_go: arm64
+          # - name: macOS x64 (Intel)
+          #   runner: macos-12
+          #   target_os: darwin
+          #   target_arch: x86_64
+          #   target_arch_go: amd64
+          # - name: Windows x64
+          #   runner: rust-windows-x64
+          #   target_os: windows
+          #   target_arch: x86_64
+          #   target_arch_go: amd64
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Install PostgreSQL (Linux)
+        if: matrix.target_os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql
+          sudo service postgresql start
+          sleep 5
+          sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='postgres'" | grep -q 1 || sudo -u postgres createuser -s postgres
+          sudo -u postgres psql -c "ALTER USER postgres PASSWORD 'postgres';"
+          sudo -u postgres createdb tpch
+
+      - name: Install PostgreSQL (MacOS)
+        if: matrix.target_os == 'darwin'
+        run: |
+          brew install postgresql
+          brew services start postgresql
+          sleep 5
+          createuser -s postgres
+          psql -d postgres -c "ALTER USER postgres PASSWORD 'postgres';"
+          createdb tpch
+
+      - name: Wait for PostgreSQL to start
+        run: sleep 10
+
+      - name: Check PostgreSQL
+        env:
+          PGPASSWORD: postgres
+        run: psql -h localhost -U postgres -c 'SELECT version();'
+
+      - name: Generate TPC-H Benchmark data
+        run: |
+          git clone https://github.com/gregrahn/tpch-kit.git
+          cd tpch-kit/dbgen
+          make MACHINE=LINUX DATABASE=POSTGRESQL
+          ./dbgen -vf -s 0.1
+
+      - name: Load TPC-H Benchmark data to PostgreSQL
+        working-directory: tpch-kit/dbgen
+        env:
+          PGPASSWORD: postgres
+        run: |
+          psql -h localhost -U postgres tpch -f dss.ddl
+          for i in `ls *.tbl`; do
+            table=${i/.tbl/}
+            echo "Loading $table..."
+            sed 's/|$//' $i > /tmp/$i
+            psql -h localhost -U postgres tpch -q -c "TRUNCATE $table"
+            psql -h localhost -U postgres tpch -c "\\copy $table FROM '/tmp/$i' CSV DELIMITER '|'"
+          done
+
+      - name: Run TPC-H Benchmark queries
+        working-directory: ./
+        env:
+          PGPASSWORD: postgres
+        run: |
+          psql -h localhost -U postgres tpch < ./test/tpch/tpch_queries.sql
+
+      # - name: download artifacts - build_${{ matrix.target_os }}_${{ matrix.target_arch }}
+      #   uses: actions/download-artifact@v4
+      #   with:
+      #     name: build_${{ matrix.target_os }}_${{ matrix.target_arch }}
+      #     path: ./build
+
+      # - name: Install spice
+      #   run: |
+      #     chmod +x ./build/spice
+      #     chmod +x ./build/spiced
+      #     mkdir -p "$HOME/.spice/bin"
+      #     mv ./build/spice "$HOME/.spice/bin"
+      #     mv ./build/spiced "$HOME/.spice/bin"
+      #     echo "$HOME/.spice/bin" >> $GITHUB_PATH
+
+      # - name: Check spice version
+      #   run: spice version
+
+      # - name: Init spice app
+      #   run: |
+      #     spice init test_app
+
+      # - name: Spice dataset configure
+      #   working-directory: test_app
+      #   run: |
+      #     echo -e "eth_recent_blocks\neth recent blocks\npostgres:eth_recent_blocks\ny" | spice dataset configure
+      #     # configure pg credentials
+      #     echo -e "params:\n  pg_host: localhost\n  pg_port: 5432\n  pg_db: testdb\n  pg_user: postgres\n  pg_pass_key: password" >> ./datasets/eth_recent_blocks/dataset.yaml
+      #     # configure env secret store
+      #     echo -e "secrets:\n  store: env\n" >> spicepod.yaml
+      #     cat spicepod.yaml
+
+      # - name: Start spice runtime
+      #   env:
+      #     SPICE_SECRET_POSTGRES_PASSWORD: postgres
+      #   working-directory: test_app
+      #   run: |
+      #     spice run &
+      #       # time to initialize added dataset
+      #     sleep 5
+
+      # - name: Wait for Spice runtime healthy
+      #   working-directory: test_app
+      #   timeout-minutes: 1
+      #   run: |
+      #     while [[ "$(curl -s http://localhost:3000/health)" != "ok" ]]; do sleep 1; done
+
+      # - name: Check datasets
+      #   working-directory: test_app
+      #   run: |
+      #     response=$(curl http://localhost:3000/v1/datasets)
+      #     echo $response | jq
+      #     length=$(echo $response | jq 'if type=="array" then length else empty end')
+      #     if [[ $length -ne 1 ]]; then
+      #       echo "Unexpected response: $response, expected 1 dataset but received $length"
+      #       exit 1
+      #     fi
+
+      # - name: Check eth_recent_blocks table exists
+      #   working-directory: test_app
+      #   run: |
+      #     response=$(curl -X POST \
+      #       -H "Content-Type: text/plain" \
+      #       -d "show tables;" \
+      #       http://localhost:3000/v1/sql
+      #     )
+      #     echo $response | jq
+      #     table_exists=$(echo $response | jq '[.[] | select(.table_name == "eth_recent_blocks")]' | jq 'length')
+      #     if [[ $table_exists -eq 0 ]]; then
+      #       echo "Unexpected response: table 'eth_recent_blocks' does not exist."
+      #       exit 1
+      #     fi
+
+      # - name: Run Flight SQL query
+      #   working-directory: test_app
+      #   run: |
+      #     sql_output=$(echo "select * from eth_recent_blocks limit 10;" | spice sql)
+      #     echo "$sql_output"
+      #     if [[ $sql_output == *"error"* ]] || [[ $sql_output == *"not found"* ]]; then
+      #       echo "Unexpected response from spice sql, failed to perform test query: $sql_output"
+      #       exit 1
+      #     fi
