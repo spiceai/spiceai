@@ -2,7 +2,7 @@ use csv::Writer;
 use serde::{Deserialize, Serialize};
 use spicepod::component::dataset::Dataset;
 
-use crate::datafusion::DataFusion;
+use crate::{datafusion::DataFusion, status::ComponentStatus};
 
 #[derive(Default, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -10,15 +10,6 @@ pub enum Format {
     #[default]
     Json,
     Csv,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Status {
-    Initializing,
-    Disabled,
-    Ready,
-    Error,
 }
 
 fn convert_entry_to_csv<T: Serialize>(entries: &[T]) -> Result<String, Box<dyn std::error::Error>> {
@@ -30,11 +21,11 @@ fn convert_entry_to_csv<T: Serialize>(entries: &[T]) -> Result<String, Box<dyn s
     Ok(String::from_utf8(w.into_inner()?)?)
 }
 
-fn dataset_status(df: &DataFusion, ds: &Dataset) -> Status {
+fn dataset_status(df: &DataFusion, ds: &Dataset) -> ComponentStatus {
     if df.table_exists(ds.name.as_str()) {
-        Status::Ready
+        ComponentStatus::Ready
     } else {
-        Status::Error
+        ComponentStatus::Error
     }
 }
 
@@ -121,7 +112,7 @@ pub(crate) mod status {
         Extension, Json,
     };
 
-    use crate::config;
+    use crate::{config, status::ComponentStatus};
 
     #[derive(Debug, Serialize, Deserialize)]
     #[serde(rename_all = "lowercase")]
@@ -137,20 +128,11 @@ pub(crate) mod status {
         Csv,
     }
 
-    #[derive(Debug, Serialize, Deserialize)]
-    #[serde(rename_all = "lowercase")]
-    enum Status {
-        Initializing,
-        Disabled,
-        Ready,
-        Error,
-    }
-
     #[derive(Deserialize, Serialize)]
     pub struct ConnectionDetails {
         name: &'static str,
         endpoint: String,
-        status: Status,
+        status: ComponentStatus,
     }
 
     fn default_format() -> Format {
@@ -169,7 +151,7 @@ pub(crate) mod status {
             ConnectionDetails {
                 name: "http",
                 endpoint: cfg.http_bind_address.to_string(),
-                status: Status::Ready,
+                status: ComponentStatus::Ready,
             },
             ConnectionDetails {
                 name: "flight",
@@ -184,10 +166,10 @@ pub(crate) mod status {
                         Ok(status) => status,
                         Err(e) => {
                             tracing::error!("Error getting metrics status from {metrics_url}: {e}");
-                            Status::Error
+                            ComponentStatus::Error
                         }
                     },
-                    None => Status::Disabled,
+                    None => ComponentStatus::Disabled,
                 },
             },
             ConnectionDetails {
@@ -204,7 +186,7 @@ pub(crate) mod status {
                             cfg.open_telemetry_bind_address,
                             e
                         );
-                        Status::Error
+                        ComponentStatus::Error
                     }
                 },
                 endpoint: cfg.open_telemetry_bind_address.to_string(),
@@ -234,26 +216,30 @@ pub(crate) mod status {
         Ok(String::from_utf8(w.into_inner()?)?)
     }
 
-    async fn get_flight_status(flight_addr: &str) -> Status {
+    async fn get_flight_status(flight_addr: &str) -> ComponentStatus {
         tracing::trace!("Checking flight status at {flight_addr}");
         match FlightClient::new(&format!("http://{flight_addr}"), "", "").await {
-            Ok(_) => Status::Ready,
+            Ok(_) => ComponentStatus::Ready,
             Err(e) => {
                 tracing::error!("Error connecting to flight when checking status: {e}");
-                Status::Error
+                ComponentStatus::Error
             }
         }
     }
 
-    async fn get_metrics_status(metrics_addr: &str) -> Result<Status, Box<dyn std::error::Error>> {
+    async fn get_metrics_status(
+        metrics_addr: &str,
+    ) -> Result<ComponentStatus, Box<dyn std::error::Error>> {
         let resp = reqwest::get(format!("http://{metrics_addr}/health")).await?;
         if resp.status().is_success() && resp.text().await? == "OK" {
-            Ok(Status::Ready)
+            Ok(ComponentStatus::Ready)
         } else {
-            Ok(Status::Error)
+            Ok(ComponentStatus::Error)
         }
     }
-    async fn get_opentelemetry_status(addr: &str) -> Result<Status, Box<dyn std::error::Error>> {
+    async fn get_opentelemetry_status(
+        addr: &str,
+    ) -> Result<ComponentStatus, Box<dyn std::error::Error>> {
         let channel = Channel::from_shared(format!("http://{addr}"))?
             .connect()
             .await?;
@@ -267,9 +253,9 @@ pub(crate) mod status {
             .await?;
 
         if resp.into_inner().status == ServingStatus::Serving as i32 {
-            Ok(Status::Ready)
+            Ok(ComponentStatus::Ready)
         } else {
-            Ok(Status::Error)
+            Ok(ComponentStatus::Error)
         }
     }
 }
@@ -289,7 +275,7 @@ pub(crate) mod datasets {
     use tokio::sync::RwLock;
     use tract_core::tract_data::itertools::Itertools;
 
-    use crate::datafusion::DataFusion;
+    use crate::{datafusion::DataFusion, status::ComponentStatus};
 
     use super::{convert_entry_to_csv, dataset_status, Format};
 
@@ -320,7 +306,7 @@ pub(crate) mod datasets {
         pub depends_on: Option<String>,
 
         #[serde(skip_serializing_if = "Option::is_none")]
-        pub status: Option<super::Status>,
+        pub status: Option<ComponentStatus>,
     }
 
     pub(crate) async fn get(
