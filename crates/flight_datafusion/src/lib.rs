@@ -7,7 +7,7 @@ use flight_client::FlightClient;
 use futures::{Stream, StreamExt};
 use snafu::prelude::*;
 use sql_provider_datafusion::expr;
-use std::{any::Any, fmt, pin::Pin, sync::Arc, task::Poll};
+use std::{any::Any, fmt, sync::Arc};
 
 use arrow_flight::error::FlightError;
 use datafusion::{
@@ -15,10 +15,11 @@ use datafusion::{
     common::OwnedTableReference,
     datasource::TableProvider,
     error::{DataFusionError, Result as DataFusionResult},
-    execution::{context::SessionState, RecordBatchStream, TaskContext},
+    execution::{context::SessionState, TaskContext},
     logical_expr::{Expr, TableProviderFilterPushDown, TableType},
     physical_plan::{
-        project_schema, DisplayAs, DisplayFormatType, ExecutionPlan, SendableRecordBatchStream,
+        project_schema, stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType,
+        ExecutionPlan, SendableRecordBatchStream,
     },
     sql::TableReference,
 };
@@ -254,16 +255,20 @@ impl ExecutionPlan for FlightExec {
             Err(error) => return Err(error),
         };
 
-        Ok(Box::pin(StreamConverter::new(
-            self.client.clone(),
-            sql.as_str(),
+        let stream_adapter = RecordBatchStreamAdapter::new(
             self.schema(),
-        )))
+            query_to_stream(self.client.clone(), sql.as_str()),
+        );
+
+        Ok(Box::pin(stream_adapter))
     }
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn to_stream(client: FlightClient, sql: &str) -> impl Stream<Item = Result<RecordBatch>> {
+fn query_to_stream(
+    client: FlightClient,
+    sql: &str,
+) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
     let mut client = client.clone();
     let sql = sql.to_string();
     stream! {
@@ -273,49 +278,12 @@ fn to_stream(client: FlightClient, sql: &str) -> impl Stream<Item = Result<Recor
                     match batch {
                         Ok(batch) => yield Ok(batch),
                         Err(error) => {
-                            yield Err(Error::ArrowFlight { source: error });
+                            yield Err(to_execution_error(Error::ArrowFlight { source: error }));
                         }
                     }
                 }
             }
-            Err(error) => yield Err(Error::Flight{ source: error})
-        }
-    }
-}
-
-struct StreamConverter {
-    stream: Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>>,
-    schema: SchemaRef,
-}
-
-impl StreamConverter {
-    fn new(client: FlightClient, sql: &str, schema: SchemaRef) -> Self {
-        let stream = to_stream(client, sql);
-        Self {
-            stream: Box::pin(stream),
-            schema,
-        }
-    }
-}
-
-impl RecordBatchStream for StreamConverter {
-    fn schema(&self) -> SchemaRef {
-        self.schema.clone()
-    }
-}
-
-impl Stream for StreamConverter {
-    type Item = datafusion::common::Result<RecordBatch>;
-
-    fn poll_next(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> Poll<Option<Self::Item>> {
-        match self.stream.poll_next_unpin(cx) {
-            Poll::Ready(Some(Ok(record_batch))) => Poll::Ready(Some(Ok(record_batch))),
-            Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(to_execution_error(error)))),
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
+            Err(error) => yield Err(to_execution_error(Error::Flight{ source: error}))
         }
     }
 }

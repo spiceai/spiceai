@@ -6,7 +6,9 @@ use secrets::{ExposeSecret, Secret};
 use serde::Deserialize;
 use std::{collections::HashMap, error::Error, sync::Arc};
 
-use crate::Read;
+use crate::{Read, Write};
+
+use self::write::DeltaTableWriter;
 
 mod write;
 
@@ -38,6 +40,23 @@ impl Read for Databricks {
             self.params.clone(),
         )
         .await
+    }
+}
+
+#[async_trait]
+impl Write for Databricks {
+    async fn table_provider(
+        &self,
+        table_reference: OwnedTableReference,
+    ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn Error + Send + Sync>> {
+        let delta_table = get_delta_table(
+            Arc::clone(&self.secret),
+            table_reference,
+            self.params.clone(),
+        )
+        .await?;
+
+        DeltaTableWriter::create(delta_table).map_err(Into::into)
     }
 }
 

@@ -19,7 +19,7 @@ pub trait Write {
     async fn table_provider(
         &self,
         table_reference: OwnedTableReference,
-    ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn Error>>;
+    ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn Error + Send + Sync>>;
 }
 
 #[async_trait]
@@ -27,5 +27,5 @@ pub trait Stream {
     async fn table_provider(
         &self,
         table_reference: OwnedTableReference,
-    ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn Error>>;
+    ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn Error + Send + Sync>>;
 }

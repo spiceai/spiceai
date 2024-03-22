@@ -1,28 +1,63 @@
 use std::{any::Any, fmt, sync::Arc};
 
 use arrow::datatypes::SchemaRef;
-use arrow_flight::sql::client::FlightSqlServiceClient;
 use async_trait::async_trait;
 use datafusion::{
-    common::OwnedTableReference,
     datasource::{TableProvider, TableType},
     execution::{context::SessionState, SendableRecordBatchStream, TaskContext},
     logical_expr::Expr,
-    physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan},
+    physical_plan::{
+        insert::{DataSink, FileSinkExec},
+        metrics::MetricsSet,
+        DisplayAs, DisplayFormatType, ExecutionPlan,
+    },
 };
+use deltalake::{protocol::SaveMode, DeltaOps, DeltaTable, DeltaTableError};
+use futures::StreamExt;
+use snafu::prelude::*;
 
-struct DatabricksWriter {
-    schema: SchemaRef,
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display("Failed to get Delta Lake table state"))]
+    FailedToGetDeltaLakeState {},
+
+    #[snafu(display("Failed to get the schema for the Delta Lake table"))]
+    FailedToGetDeltaLakeSchema { source: DeltaTableError },
+
+    #[snafu(display("The provided TableProvider is not a DeltaTable"))]
+    NotADeltaTable {},
 }
 
-impl DatabricksWriter {
-    fn new(schema: SchemaRef) -> Self {
-        Self { schema }
+type Result<T, E = Error> = std::result::Result<T, E>;
+
+pub struct DeltaTableWriter {
+    schema: SchemaRef,
+    delta_table: DeltaTable,
+}
+
+impl DeltaTableWriter {
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn create(delta_table: Arc<dyn TableProvider>) -> Result<Arc<dyn TableProvider>> {
+        let delta_table = delta_table
+            .as_any()
+            .downcast_ref::<DeltaTable>()
+            .ok_or(Error::NotADeltaTable {})?;
+
+        let schema = delta_table
+            .state
+            .as_ref()
+            .ok_or(Error::FailedToGetDeltaLakeState {})?
+            .arrow_schema()
+            .context(FailedToGetDeltaLakeSchemaSnafu {})?;
+        Ok(Arc::new(Self {
+            schema,
+            delta_table: delta_table.clone(),
+        }) as _)
     }
 }
 
 #[async_trait]
-impl TableProvider for DatabricksWriter {
+impl TableProvider for DeltaTableWriter {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -38,11 +73,11 @@ impl TableProvider for DatabricksWriter {
     async fn scan(
         &self,
         _state: &SessionState,
-        projection: Option<&Vec<usize>>,
-        filters: &[Expr],
-        limit: Option<usize>,
+        _projection: Option<&Vec<usize>>,
+        _filters: &[Expr],
+        _limit: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        unimplemented!("DatabricksWriter does not support scan")
+        unimplemented!("DeltaTableWriter does not support scan")
     }
 
     async fn insert_into(
@@ -51,87 +86,71 @@ impl TableProvider for DatabricksWriter {
         input: Arc<dyn ExecutionPlan>,
         overwrite: bool,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(FileSinkExec::new(
+            input,
+            Arc::new(DeltaTableDataSink::new(self.delta_table.clone(), overwrite)),
+            Arc::clone(&self.schema),
+            None,
+        )) as _)
     }
 }
 
 #[derive(Clone)]
-struct DatabricksWriterExec {
-    table_reference: OwnedTableReference,
-    input: Arc<dyn ExecutionPlan>,
+struct DeltaTableDataSink {
+    delta_table: DeltaTable,
+    save_mode: SaveMode,
 }
 
-impl DatabricksWriterExec {
-    fn new(table_reference: &OwnedTableReference, input: Arc<dyn ExecutionPlan>) -> Self {
-        Self {
-            table_reference: table_reference.clone(),
-            input,
-        }
-    }
-}
-
-impl std::fmt::Debug for DatabricksWriterExec {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(
-            f,
-            "DatabricksWriterExec table_reference={}",
-            self.table_reference
-        )
-    }
-}
-
-impl DisplayAs for DatabricksWriterExec {
-    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> std::fmt::Result {
-        let sql = self.sql().unwrap_or_default();
-        write!(
-            f,
-            "DatabricksWriterExec table_reference={}",
-            self.table_reference
-        )
-    }
-}
-
-impl ExecutionPlan for DatabricksWriterExec {
+#[async_trait]
+impl DataSink for DeltaTableDataSink {
     fn as_any(&self) -> &dyn Any {
         self
     }
 
-    fn schema(&self) -> SchemaRef {
-        self.projected_schema.clone()
-    }
-
-    fn output_partitioning(&self) -> datafusion::physical_plan::Partitioning {
-        datafusion::physical_plan::Partitioning::UnknownPartitioning(1)
-    }
-
-    fn output_ordering(&self) -> Option<&[datafusion::physical_expr::PhysicalSortExpr]> {
+    fn metrics(&self) -> Option<MetricsSet> {
         None
     }
 
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
-        vec![]
-    }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        _children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        Ok(self)
-    }
-
-    fn execute(
+    async fn write_all(
         &self,
-        _partition: usize,
-        _context: Arc<TaskContext>,
-    ) -> datafusion::error::Result<SendableRecordBatchStream> {
-        let sql = match self.sql().map_err(to_execution_error) {
-            Ok(sql) => sql,
-            Err(error) => return Err(error),
-        };
+        mut data: SendableRecordBatchStream,
+        _context: &Arc<TaskContext>,
+    ) -> datafusion::common::Result<u64> {
+        let mut num_rows = 0;
+        while let Some(batch) = data.next().await {
+            let batch = batch?;
+            num_rows += batch.num_rows() as u64;
+            let _ = DeltaOps(self.delta_table.clone())
+                .write([batch])
+                .with_save_mode(self.save_mode.clone())
+                .await?;
+        }
 
-        Ok(Box::pin(StreamConverter::new(
-            self.client.clone(),
-            sql.as_str(),
-            self.schema(),
-        )))
+        Ok(num_rows)
+    }
+}
+
+impl DeltaTableDataSink {
+    fn new(delta_table: DeltaTable, overwrite: bool) -> Self {
+        Self {
+            delta_table,
+            save_mode: if overwrite {
+                SaveMode::Overwrite
+            } else {
+                SaveMode::Append
+            },
+        }
+    }
+}
+
+impl std::fmt::Debug for DeltaTableDataSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "DeltaTableDataSink save_mode={:?}", self.save_mode)
+    }
+}
+
+impl DisplayAs for DeltaTableDataSink {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> std::fmt::Result {
+        write!(f, "DeltaTableDataSink save_mode={:?}", self.save_mode)
     }
 }
