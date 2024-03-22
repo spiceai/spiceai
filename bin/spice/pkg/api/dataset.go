@@ -6,4 +6,5 @@ type Dataset struct {
 	ReplicationEnabled  bool   `json:"replication_enabled,omitempty" csv:"replication_enabled" yaml:"replication_enabled,omitempty"`
 	AccelerationEnabled bool   `json:"acceleration_enabled,omitempty" csv:"acceleration_enabled" yaml:"acceleration_enabled,omitempty"`
 	DependsOn           string `json:"depends_on,omitempty" csv:"depends_on" yaml:"depends_on,omitempty"`
+	Status              string `json:"status,omitempty" csv:"status,omitempty" yaml:"status,omitempty"`
 }

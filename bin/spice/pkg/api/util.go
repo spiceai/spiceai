@@ -10,6 +10,25 @@ import (
 	"github.com/spiceai/spiceai/bin/spice/pkg/util"
 )
 
+func GetData[T interface{}](rtcontext *context.RuntimeContext, path string) ([]T, error) {
+	url := fmt.Sprintf("%s%s", rtcontext.HttpEndpoint(), path)
+	resp, err := http.Get(url)
+	if err != nil {
+		if strings.HasSuffix(err.Error(), "connection refused") {
+			return nil, rtcontext.RuntimeUnavailableError()
+		}
+		return nil, fmt.Errorf("error fetching %s: %w", url, err)
+	}
+	defer resp.Body.Close()
+
+	var components []T
+	err = json.NewDecoder(resp.Body).Decode(&components)
+	if err != nil {
+		return nil, fmt.Errorf("error decoding items: %w", err)
+	}
+	return components, nil
+}
+
 func WriteDataTable[T interface{}](rtcontext *context.RuntimeContext, path string, t T) error {
 	url := fmt.Sprintf("%s%s", rtcontext.HttpEndpoint(), path)
 	resp, err := http.Get(url)
