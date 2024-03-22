@@ -58,6 +58,7 @@ impl Model {
         params.insert("name".to_string(), model.name.to_string());
         params.insert("path".to_string(), path(&model.from));
         params.insert("from".to_string(), path(&model.from));
+        params.insert("files".to_string(), model.files.join(",").to_string());
 
         let tract = crate::modelruntime::tract::Tract {
             path: create_source_from(source)
@@ -111,6 +112,7 @@ impl Model {
 pub(crate) fn source(from: &str) -> String {
     match from {
         s if s.starts_with("spiceai:") => "spiceai".to_string(),
+        s if s.starts_with("huggingface:") => "huggingface".to_string(),
         s if s.starts_with("file:/") => "localhost".to_string(),
         _ => "spiceai".to_string(),
     }
