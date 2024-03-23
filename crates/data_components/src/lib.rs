@@ -15,7 +15,7 @@ pub trait Read {
 }
 
 #[async_trait]
-pub trait Write {
+pub trait Write: Send + Sync {
     async fn table_provider(
         &self,
         table_reference: OwnedTableReference,

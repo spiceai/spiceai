@@ -7,7 +7,6 @@ use futures::{stream, StreamExt};
 use lazy_static::lazy_static;
 use object_store::ObjectStore;
 use snafu::prelude::*;
-use spicepod::component::dataset::acceleration::RefreshMode;
 use spicepod::component::dataset::Dataset;
 use std::any::Any;
 use std::collections::HashMap;

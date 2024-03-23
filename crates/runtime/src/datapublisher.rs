@@ -1,16 +1,35 @@
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 
+use async_trait::async_trait;
+use data_components::Write;
+use datafusion::common::OwnedTableReference;
+use datafusion::execution::context::SessionContext;
 use spicepod::component::dataset::Dataset;
 
 use crate::dataupdate::DataUpdate;
 
-pub type AddDataResult<'a> =
-    Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error>>> + Send + 'a>>;
-
+#[async_trait]
 pub trait DataPublisher: Send + Sync {
-    fn add_data(&self, dataset: Arc<Dataset>, data_update: DataUpdate) -> AddDataResult;
+    async fn add_data(
+        &self,
+        dataset: Arc<Dataset>,
+        data_update: DataUpdate,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+}
 
-    fn name(&self) -> &str;
+#[async_trait]
+impl DataPublisher for dyn Write + '_ {
+    async fn add_data(
+        &self,
+        dataset: Arc<Dataset>,
+        data_update: DataUpdate,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let write_table_provider = self
+            .table_provider(OwnedTableReference::from(dataset.name.clone()))
+            .await?;
+
+        let ctx = SessionContext::new();
+
+        Ok(())
+    }
 }

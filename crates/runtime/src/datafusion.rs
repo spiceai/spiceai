@@ -15,7 +15,6 @@ use datafusion::sql::parser::DFParser;
 use datafusion::sql::sqlparser;
 use datafusion::sql::sqlparser::ast::{self, SetExpr, TableFactor};
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
-use futures::StreamExt;
 use snafu::prelude::*;
 use spicepod::component::dataset::Dataset;
 use tokio::sync::RwLock;
