@@ -1,24 +1,26 @@
 use async_trait::async_trait;
+use data_components::{Read, Stream, Write};
+use datafusion::common::OwnedTableReference;
 use datafusion::datasource::TableProvider;
-use futures::stream;
+use datafusion::execution::context::SessionContext;
+use futures::{stream, StreamExt};
 use lazy_static::lazy_static;
 use object_store::ObjectStore;
 use snafu::prelude::*;
 use spicepod::component::dataset::acceleration::RefreshMode;
 use spicepod::component::dataset::Dataset;
+use std::any::Any;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use url::Url;
 
-use arrow::record_batch::RecordBatch;
 use async_stream::stream;
 use futures_core::stream::BoxStream;
 use secrets::Secret;
 use std::future::Future;
 
-use crate::datapublisher::DataPublisher;
 use crate::dataupdate::{DataUpdate, UpdateType};
 use crate::timing::TimeMeasurement;
 use data_components::databricks::Databricks;
@@ -41,6 +43,11 @@ pub enum Error {
     #[snafu(display("Unable to get table provider: {source}"))]
     UnableToGetTableProvider {
         source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("Unable to scan table provider: {source}"))]
+    UnableToScanTableProvider {
+        source: datafusion::error::DataFusionError,
     },
 }
 
@@ -127,63 +134,81 @@ pub trait DataConnectorFactory {
 /// ```
 #[async_trait]
 pub trait DataConnector: Send + Sync {
-    /// Returns true if the given dataset supports streaming by this `DataConnector`.
-    fn supports_data_streaming(&self, _dataset: &Dataset) -> bool {
-        false
-    }
+    fn as_any(&self) -> &dyn Any;
 
-    /// Returns a stream of `DataUpdates` for the given dataset.
-    fn stream_data_updates<'a>(&self, dataset: &Dataset) -> BoxStream<'a, DataUpdate> {
-        panic!("stream_data_updates not implemented for {}", dataset.name)
-    }
+    fn read_provider(&self) -> &dyn Read;
 
-    /// Returns all data for the given dataset.
-    fn get_all_data(
-        &self,
-        dataset: &Dataset,
-    ) -> Pin<Box<dyn Future<Output = Vec<RecordBatch>> + Send>>;
-
-    fn get_data_publisher(&self) -> Option<Box<dyn DataPublisher>> {
+    fn write_provider(&self) -> Option<&dyn Write> {
         None
     }
 
-    fn has_table_provider(&self) -> bool {
-        false
+    fn stream_provider(&self) -> Option<&dyn Stream> {
+        None
     }
 
     fn has_object_store(&self) -> bool {
         false
     }
 
-    fn get_object_store(
-        &self,
-        dataset: &Dataset,
-    ) -> std::result::Result<(Url, Arc<dyn ObjectStore + 'static>), Error> {
+    fn get_object_store(&self, dataset: &Dataset) -> Result<(Url, Arc<dyn ObjectStore + 'static>)> {
         panic!("get_object_store not implemented for {}", dataset.name)
-    }
-
-    async fn get_table_provider(
-        &self,
-        dataset: &Dataset,
-    ) -> Result<Arc<dyn TableProvider + 'static>> {
-        panic!("get_table_provider not implemented for {}", dataset.name)
     }
 }
 
-impl dyn DataConnector + '_ {
-    pub fn get_data<'a>(&'a self, dataset: &'a Dataset) -> BoxStream<'_, DataUpdate> {
-        let refresh_mode = dataset
-            .acceleration
-            .as_ref()
-            .map_or(RefreshMode::Full, |acc| {
-                acc.refresh_mode
-                    .as_ref()
-                    .map_or(RefreshMode::Full, Clone::clone)
-            });
+// Gets all data from a table provider and returns it as a vector of RecordBatches.
+pub async fn get_all_data(
+    table_provider: &dyn TableProvider,
+) -> Result<Vec<arrow::record_batch::RecordBatch>> {
+    let ctx = SessionContext::new();
+    let plan = table_provider
+        .scan(&ctx.state(), None, &[], None)
+        .await
+        .context(UnableToScanTableProviderSnafu {})?;
 
-        if refresh_mode == RefreshMode::Append && self.supports_data_streaming(dataset) {
-            return self.stream_data_updates(dataset);
+    let mut batches = vec![];
+    for i in 0..plan.output_partitioning().partition_count() {
+        let mut partition = plan
+            .execute(i, ctx.task_ctx())
+            .context(UnableToScanTableProviderSnafu {})?;
+        while let Some(batch) = partition.next().await {
+            batches.push(batch.context(UnableToScanTableProviderSnafu {})?);
         }
+    }
+
+    Ok(batches)
+}
+
+impl dyn DataConnector + '_ {
+    pub async fn get_data<'a>(&'a self, dataset: &'a Dataset) -> BoxStream<'_, Result<DataUpdate>> {
+        // let refresh_mode = dataset
+        //     .acceleration
+        //     .as_ref()
+        //     .map_or(RefreshMode::Full, |acc| {
+        //         acc.refresh_mode
+        //             .as_ref()
+        //             .map_or(RefreshMode::Full, Clone::clone)
+        //     });
+
+        // TODOREARCH
+        // if refresh_mode == RefreshMode::Append {
+        //     if let Some(stream_provider) = self.stream_provider() {
+        //         return self.stream_data_updates(dataset);
+        //     }
+        // }
+
+        let read_provider = self.read_provider();
+
+        let table_provider = match read_provider
+            .table_provider(OwnedTableReference::from(dataset.name.clone()))
+            .await
+        {
+            Ok(provider) => provider,
+            Err(e) => {
+                tracing::error!("Unable to get read data for for {}", dataset.name);
+                tracing::debug!("Error getting table provider for {}: {e:?}", dataset.name);
+                return Box::pin(stream::empty());
+            }
+        };
 
         // If a refresh_interval is defined, refresh the data on that interval.
         if let Some(refresh_interval) = dataset.refresh_interval() {
@@ -192,10 +217,18 @@ impl dyn DataConnector + '_ {
                 loop {
                     tracing::info!("Refreshing data for {}", dataset.name);
                     let timer = TimeMeasurement::new("load_dataset_duration_ms", vec![("dataset", dataset.name.clone())]);
-                    yield DataUpdate {
-                        data: self.get_all_data(dataset).await,
-                        update_type: UpdateType::Overwrite,
+                    let all_data = match get_all_data(table_provider.as_ref()).await {
+                        Ok(data) => data,
+                        Err(e) => {
+                            tracing::error!("Error refreshing data for {}: {e}", dataset.name);
+                            yield Err(e);
+                            continue;
+                        }
                     };
+                    yield Ok(DataUpdate {
+                        data: all_data,
+                        update_type: UpdateType::Overwrite,
+                    });
                     drop(timer);
                     tokio::time::sleep(refresh_interval).await;
                 }
@@ -209,13 +242,19 @@ impl dyn DataConnector + '_ {
                 "load_dataset_duration_ms",
                 vec![("dataset", dataset.name.clone())],
             );
-            let data = self.get_all_data(dataset).await;
+            let all_data = match get_all_data(table_provider.as_ref()).await {
+                Ok(data) => data,
+                Err(e) => {
+                    tracing::error!("Error refreshing data for {}: {e}", dataset.name);
+                    return Err(e);
+                }
+            };
             drop(timer);
 
-            DataUpdate {
-                data,
+            Ok(DataUpdate {
+                data: all_data,
                 update_type: UpdateType::Overwrite,
-            }
+            })
         }))
     }
 }

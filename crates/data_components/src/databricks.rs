@@ -15,16 +15,13 @@ mod write;
 #[derive(Clone)]
 pub struct Databricks {
     pub secret: Arc<Option<Secret>>,
-    pub params: Option<HashMap<String, String>>,
+    pub params: Arc<Option<HashMap<String, String>>>,
 }
 
 impl Databricks {
     #[must_use]
-    pub fn new(secret: Option<Secret>, params: Option<HashMap<String, String>>) -> Self {
-        Self {
-            secret: Arc::new(secret),
-            params,
-        }
+    pub fn new(secret: Arc<Option<Secret>>, params: Arc<Option<HashMap<String, String>>>) -> Self {
+        Self { secret, params }
     }
 }
 
@@ -63,8 +60,11 @@ impl Write for Databricks {
 async fn get_delta_table(
     secret: Arc<Option<Secret>>,
     table_reference: OwnedTableReference,
-    params: Option<HashMap<String, String>>,
+    params: Arc<Option<HashMap<String, String>>>,
 ) -> Result<Arc<dyn TableProvider>, Box<dyn Error + Send + Sync>> {
+    // Needed to be able to load the s3:// scheme
+    deltalake::aws::register_handlers(None);
+    deltalake::azure::register_handlers(None);
     let table_uri = resolve_table_uri(table_reference, &secret, params).await?;
 
     let mut storage_options = HashMap::new();
@@ -92,9 +92,9 @@ struct DatabricksTablesApiResponse {
 pub async fn resolve_table_uri(
     table_reference: OwnedTableReference,
     secret: &Arc<Option<Secret>>,
-    params: Option<HashMap<String, String>>,
+    params: Arc<Option<HashMap<String, String>>>,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let params = match params {
+    let params = match params.as_ref() {
         None => return Err("Dataset params not found".into()),
         Some(params) => params,
     };
