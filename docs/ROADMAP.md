@@ -12,23 +12,28 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 
 - See [Bugs](https://github.com/spiceai/spiceai/labels/bug). Feel free to file a new Issue if you see a bug and let us know on Discord.
 
-## v0.10-alpha
+## v0.9.1-alpha (Mar 2024)
 
 - E2E tests
+- SQLite data backend (alpha)
+- Arrow Flight SQL data connector (alpha)
+
+## v0.10-alpha (Mar 2024)
+
 - Helm chart
 - Grafana dashboard
-- Arrow Flight SQL data connector (alpha)
-- SQLite data backend (alpha)
 - BigQuery data connector (alpha)
 - Snowflake data connector (alpha)
 
-## v0.11-alpha
+## v0.11-alpha (Apr 2024)
 
 - Stability, reliability, and performance
 
 ## v0.12-alpha
 
 - Acceleration retention policies
+- K/V support
+- RocksDB data connector (alpha)
 
 ## Features being considered for v1.0-stable
 

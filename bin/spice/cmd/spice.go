@@ -8,6 +8,8 @@ import (
 	"github.com/spf13/viper"
 )
 
+const PROM_ENDPOINT = "http://localhost:9091"
+
 var RootCmd = &cobra.Command{
 	Use:   "spice",
 	Short: "Spice.ai CLI",
