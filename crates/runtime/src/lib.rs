@@ -32,6 +32,7 @@ pub mod modelruntime;
 pub mod modelsource;
 mod opentelemetry;
 pub mod podswatcher;
+pub mod status;
 pub mod timing;
 pub(crate) mod tracers;
 
@@ -137,11 +138,13 @@ impl Runtime {
         let app_lock = self.app.read().await;
         if let Some(app) = app_lock.as_ref() {
             for ds in &app.datasets {
+                status::update_dataset(ds.name.clone(), status::ComponentStatus::Initializing);
                 self.load_dataset(ds);
             }
         }
     }
 
+    // Caller must set `status::update_dataset(...` before calling `load_dataset`. This function will set error/ready statues appropriately.`
     pub fn load_dataset(&self, ds: &Dataset) {
         let df = Arc::clone(&self.df);
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
@@ -167,6 +170,7 @@ impl Runtime {
                     {
                         Ok(data_connector) => data_connector,
                         Err(err) => {
+                            status::update_dataset(ds.name.clone(), status::ComponentStatus::Error);
                             metrics::counter!("datasets_load_error").increment(1);
                             warn_spaced!(
                                 spaced_tracer,
@@ -197,6 +201,7 @@ impl Runtime {
                 {
                     Ok(()) => (),
                     Err(err) => {
+                        status::update_dataset(ds.name.clone(), status::ComponentStatus::Error);
                         metrics::counter!("datasets_load_error").increment(1);
                         warn_spaced!(
                             spaced_tracer,
@@ -219,6 +224,7 @@ impl Runtime {
                     },
                 );
                 metrics::gauge!("datasets_count", "engine" => engine).increment(1.0);
+                status::update_dataset(ds.name.clone(), status::ComponentStatus::Ready);
                 break;
             }
         });
@@ -249,6 +255,7 @@ impl Runtime {
     }
 
     pub async fn update_dataset(&self, ds: &Dataset) {
+        status::update_dataset(ds.name.clone(), status::ComponentStatus::Refreshing);
         self.remove_dataset(ds).await;
         self.load_dataset(ds);
     }
@@ -365,11 +372,13 @@ impl Runtime {
         let app_lock = self.app.read().await;
         if let Some(app) = app_lock.as_ref() {
             for model in &app.models {
+                status::update_model(model.name.clone(), status::ComponentStatus::Initializing);
                 self.load_model(model).await;
             }
         }
     }
 
+    // Caller must set `status::update_model(...` before calling `load_model`. This function will set error/ready statues appropriately.`
     pub async fn load_model(&self, m: &SpicepodModel) {
         measure_scope_ms!("load_model", "model" => m.name, "source" => model::source(&m.from));
         tracing::info!("Loading model [{}] from {}...", m.name, m.from);
@@ -391,9 +400,11 @@ impl Runtime {
                 model_map.insert(m.name.clone(), in_m);
                 tracing::info!("Model [{}] deployed, ready for inferencing", m.name);
                 metrics::gauge!("models_count", "model" => m.name.clone(), "source" => model::source(&m.from)).increment(1.0);
+                status::update_model(model.name.clone(), status::ComponentStatus::Ready);
             }
             Err(e) => {
                 metrics::counter!("models_load_error").increment(1);
+                status::update_model(model.name.clone(), status::ComponentStatus::Error);
                 tracing::warn!(
                     "Unable to load runnable model from spicepod {}, error: {}",
                     m.name,
@@ -418,6 +429,7 @@ impl Runtime {
     }
 
     pub async fn update_model(&self, m: &SpicepodModel) {
+        status::update_model(m.name.clone(), status::ComponentStatus::Refreshing);
         self.remove_model(m).await;
         self.load_model(m).await;
     }
@@ -471,6 +483,10 @@ impl Runtime {
                             self.update_dataset(ds).await;
                         }
                     } else {
+                        status::update_dataset(
+                            ds.name.clone(),
+                            status::ComponentStatus::Initializing,
+                        );
                         self.load_dataset(ds);
                     }
                 }
@@ -484,6 +500,10 @@ impl Runtime {
                             self.update_model(model).await;
                         }
                     } else {
+                        status::update_model(
+                            model.name.clone(),
+                            status::ComponentStatus::Initializing,
+                        );
                         self.load_model(model).await;
                     }
                 }
@@ -491,6 +511,7 @@ impl Runtime {
                 // Remove models that are no longer in the app
                 for model in &current_app.models {
                     if !new_app.models.iter().any(|m| m.name == model.name) {
+                        status::update_model(model.name.clone(), status::ComponentStatus::Disabled);
                         self.remove_model(model).await;
                     }
                 }
@@ -498,6 +519,7 @@ impl Runtime {
                 // Remove datasets that are no longer in the app
                 for ds in &current_app.datasets {
                     if !new_app.datasets.iter().any(|d| d.name == ds.name) {
+                        status::update_dataset(ds.name.clone(), status::ComponentStatus::Disabled);
                         self.remove_dataset(ds).await;
                     }
                 }
