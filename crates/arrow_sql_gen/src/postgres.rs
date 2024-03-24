@@ -5,6 +5,7 @@ use crate::arrow::map_data_type_to_array_builder_optional;
 use arrow::array::ArrayBuilder;
 use arrow::array::ArrayRef;
 use arrow::array::BooleanBuilder;
+use arrow::array::Date32Builder;
 use arrow::array::Decimal128Builder;
 use arrow::array::Float32Builder;
 use arrow::array::Float64Builder;
@@ -17,6 +18,7 @@ use arrow::array::RecordBatchOptions;
 use arrow::array::StringBuilder;
 use arrow::array::TimestampMillisecondBuilder;
 use arrow::datatypes::DataType;
+use arrow::datatypes::Date32Type;
 use arrow::datatypes::Field;
 use arrow::datatypes::Schema;
 use arrow::datatypes::TimeUnit;
@@ -230,6 +232,19 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                         builder.append_value(timestamp);
                     }
                 }
+                Type::DATE => {
+                    let Some(builder) = builder else {
+                        return NoBuilderForIndexSnafu { index: i }.fail();
+                    };
+                    let Some(builder) = builder.as_any_mut().downcast_mut::<Date32Builder>() else {
+                        return FailedToDowncastBuilderSnafu {
+                            postgres_type: format!("{postgres_type}"),
+                        }
+                        .fail();
+                    };
+                    let v = row.get::<usize, chrono::NaiveDate>(i);
+                    builder.append_value(Date32Type::from_naive_date(v));
+                }
                 Type::INT2_ARRAY => handle_primitive_array_type!(
                     Type::INT2_ARRAY,
                     builder,
@@ -317,6 +332,7 @@ fn map_column_type_to_data_type(column_type: &Type) -> Option<DataType> {
         Type::NUMERIC => None,
         // We get a SystemTime that we can always convert into milliseconds
         Type::TIMESTAMP => Some(DataType::Timestamp(TimeUnit::Millisecond, None)),
+        Type::DATE => Some(DataType::Date32),
         Type::INT2_ARRAY => Some(DataType::List(Arc::new(Field::new(
             "item",
             DataType::Int16,
