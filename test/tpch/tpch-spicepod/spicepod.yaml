@@ -1,0 +1,12 @@
+version: v1beta1
+kind: Spicepod
+name: tpch-spicepod
+datasets:
+ - ref: datasets/customer 
+ - ref: datasets/lineitem
+ - ref: datasets/nation
+ - ref: datasets/orders
+ - ref: datasets/part
+ - ref: datasets/partsupp
+ - ref: datasets/region
+ - ref: datasets/supplier
