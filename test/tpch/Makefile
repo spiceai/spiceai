@@ -24,17 +24,19 @@ tpch-init:
 	@echo "Initialized successfully."
 
 tpch-gen: tpch-init
-	@(cd tpch-kit/dbgen && ./dbgen -vf -s 0.1)
+	@# Check if DBGEN_SCALE is set, else default to 0.1
+	$(eval DBGEN_SCALE ?= 0.1)
+	(cd tpch-kit/dbgen && ./dbgen -vf -s $(DBGEN_SCALE))
 
 	@mkdir -p ./tmp/queries
 
-	@# skip query 20.sql temporarily as it is unable to run
+	@# temporarily skip 13.sql, 15.sql, 20.sql as they are unable to run (use `create view`)
 	@for i in tpch-kit/dbgen/queries/*.sql; do \
-		if [ `basename $$i` = "20.sql" ]; then \
+		if [ `basename $$i` = "13.sql" ] || [ `basename $$i` = "15.sql" ] || [ `basename $$i` = "20.sql" ]; then \
 			touch ./tmp/queries/`basename $$i`; \
 			continue; \
 		fi; \
-		tail -r $$i | sed '2s/;//' | tail -r > ./tmp/queries/`basename $$i`; \
+		sed 's/;//g' $$i > ./tmp/queries/`basename $$i`; \
 	done
 
 	@(cd tpch-kit/dbgen && DSS_QUERY=../../tmp/queries ./qgen | sed 's/limit -1//' | sed 's/day (3)/day/' > ../../tpch_queries.sql)
