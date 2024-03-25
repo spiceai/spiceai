@@ -387,6 +387,9 @@ impl BigDecimalFromSql {
     }
 }
 
+#[allow(clippy::cast_sign_loss)]
+#[allow(clippy::cast_possible_wrap)]
+#[allow(clippy::cast_possible_truncation)]
 impl<'a> FromSql<'a> for BigDecimalFromSql {
     fn from_sql(
         _ty: &Type,
@@ -396,15 +399,15 @@ impl<'a> FromSql<'a> for BigDecimalFromSql {
             .chunks(2)
             .map(|chunk| {
                 if chunk.len() == 2 {
-                    ((u16::from(chunk[0])) << 8) | (u16::from(chunk[1]))
+                    u16::from_be_bytes([chunk[0], chunk[1]])
                 } else {
-                    (u16::from(chunk[0])) << 8
+                    u16::from_be_bytes([chunk[0], 0])
                 }
             })
             .collect();
 
         let base_10_000_digit_count = raw_u16[0];
-        let weight = raw_u16[1];
+        let weight = raw_u16[1] as i16;
         let sign = raw_u16[2];
         let scale = raw_u16[3];
 
@@ -428,9 +431,9 @@ impl<'a> FromSql<'a> for BigDecimalFromSql {
         }
         u8_digits.reverse();
 
-        let base_10_000_digits_right_of_decimal = base_10_000_digit_count - weight - 1;
-        let implied_base_10_zeros = scale - (base_10_000_digits_right_of_decimal * 4);
-        u8_digits.resize(u8_digits.len() + implied_base_10_zeros as usize, 0);
+        let value_scale = 4 * (i64::from(base_10_000_digit_count) - i64::from(weight) - 1);
+        let size = i64::try_from(u8_digits.len())? + i64::from(scale) - value_scale;
+        u8_digits.resize(size as usize, 0);
 
         let sign = match sign {
             0x4000 => Sign::Minus,

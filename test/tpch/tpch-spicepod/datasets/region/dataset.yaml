@@ -1,0 +1,12 @@
+from: postgres:region
+name: region
+acceleration:
+  enabled: true
+  refresh_interval: 60m
+  refresh_mode: full
+params:
+  pg_host: localhost
+  pg_port: 5432
+  pg_db: tpch
+  pg_user: postgres
+  pg_pass_key: password
