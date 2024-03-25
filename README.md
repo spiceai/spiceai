@@ -85,7 +85,7 @@ brew install spiceai/spiceai/spice
 spice init spice_qs
 ```
 
-A `Spicepod.yaml` file is created in the `spice_qs` directory. Change to that directory:
+A `spicepod.yaml` file is created in the `spice_qs` directory. Change to that directory:
 
 ```bash
 cd spice_qs
@@ -121,7 +121,7 @@ The runtime is now started and ready for queries.
 spice add spiceai/quickstart
 ```
 
-The `Spicepod.yaml` file will be updated with the `spiceai/quickstart` dependency.
+The `spicepod.yaml` file will be updated with the `spiceai/quickstart` dependency.
 
 ```yaml
 version: v1beta1
@@ -246,7 +246,7 @@ spice dataset configure
 You will be prompted to enter a name. Enter a name that represents the contents of the dataset
 
 ```bash
-dataset name: (default) eth_recent_blocks
+dataset name: (spice_app) eth_recent_blocks
 ```
 
 Enter the description of the dataset:
@@ -333,7 +333,7 @@ spice dataset configure
 Enter the name of the dataset:
 
 ```bash
-dataset name: (default)  my_dataset
+dataset name: (dremio-demo-project)  my_dataset
 ```
 
 Enter the description of the dataset:
