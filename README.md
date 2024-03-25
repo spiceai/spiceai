@@ -246,7 +246,7 @@ spice dataset configure
 You will be prompted to enter a name. Enter a name that represents the contents of the dataset
 
 ```bash
-dataset name: (default) eth_recent_blocks
+dataset name: (spice_app) eth_recent_blocks
 ```
 
 Enter the description of the dataset:
@@ -333,7 +333,7 @@ spice dataset configure
 Enter the name of the dataset:
 
 ```bash
-dataset name: (default)  my_dataset
+dataset name: (dremio-demo-project)  my_dataset
 ```
 
 Enter the description of the dataset:
