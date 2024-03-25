@@ -226,14 +226,14 @@ jobs:
           make pg-init
           make pg-load
 
-      - name: Run TPC-H queries (PostgreSQL)
-        working-directory: ./test/tpch
-        env:
-          PGPASSWORD: postgres
-          PGHOST: localhost
-          PGUSER: postgres
-        run: |
-          make tpch-run-pq
+      # - name: Run TPC-H queries (PostgreSQL)
+      #   working-directory: ./test/tpch
+      #   env:
+      #     PGPASSWORD: postgres
+      #     PGHOST: localhost
+      #     PGUSER: postgres
+      #   run: |
+      #     make tpch-run-pq
 
 
       - name: Start spice runtime
@@ -241,12 +241,18 @@ jobs:
         run: |
           spice run &
             # time to initialize added datasets
-          sleep 5
+          sleep 10
 
       - name: Wait for Spice runtime healthy
         timeout-minutes: 1
         run: |
           while [[ "$(curl -s http://localhost:3000/health)" != "ok" ]]; do sleep 1; done
+
+      - name: Show loaded datasets
+        working-directory: test_app
+        run: |
+          response=$(curl http://localhost:3000/v1/datasets)
+          echo $response | jq
 
       - name: Run TPC-H queries (Spice)
         run: |
