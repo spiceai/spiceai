@@ -10,3 +10,6 @@ datasets:
  - ref: datasets/partsupp
  - ref: datasets/region
  - ref: datasets/supplier
+
+secrets:
+  store: env

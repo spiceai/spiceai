@@ -237,6 +237,8 @@ jobs:
 
 
       - name: Start spice runtime
+        env:
+          SPICE_SECRET_POSTGRES_PASSWORD: postgres
         working-directory: ./test/tpch/tpch-spicepod
         run: |
           spice run &
@@ -249,7 +251,6 @@ jobs:
           while [[ "$(curl -s http://localhost:3000/health)" != "ok" ]]; do sleep 1; done
 
       - name: Show loaded datasets
-        working-directory: test_app
         run: |
           response=$(curl http://localhost:3000/v1/datasets)
           echo $response | jq

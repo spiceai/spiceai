@@ -9,4 +9,4 @@ params:
   pg_port: 5432
   pg_db: tpch
   pg_user: postgres
-  pg_pass_key: postgres
+  pg_pass_key: password
