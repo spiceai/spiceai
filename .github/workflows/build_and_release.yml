@@ -81,6 +81,13 @@ jobs:
             rsync -av /home/spiceai/build/target/ target/
           fi
 
+      # The aarch64 runner does not have any tools pre-installed
+      - name: Install missing tools
+        if: matrix.target_os == 'linux' && matrix.target_arch == 'aarch64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install build-essential -y
+
       - name: Restore build cache (Windows)
         if: matrix.target_os == 'windows'
         run: |
