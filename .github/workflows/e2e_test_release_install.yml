@@ -3,6 +3,10 @@ name: E2E Test Release Installation
 on:
   workflow_dispatch:
 
+  pull_request:
+    branches:
+      - trunk
+
 jobs:
   test-install:
     name: install on ${{ matrix.name }}
@@ -13,6 +17,8 @@ jobs:
         include:
           - name: Linux x64
             runner: ubuntu-latest
+          - name: Linux aarch64
+            runner: hosted-linux-arm-runner
           - name: macOS aarch64 (Apple Silicon)
             runner: macos-14
           - name: macOS x64 (Intel)
