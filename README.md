@@ -85,7 +85,7 @@ brew install spiceai/spiceai/spice
 spice init spice_qs
 ```
 
-A `Spicepod.yaml` file is created in the `spice_qs` directory. Change to that directory:
+A `spicepod.yaml` file is created in the `spice_qs` directory. Change to that directory:
 
 ```bash
 cd spice_qs
@@ -121,7 +121,7 @@ The runtime is now started and ready for queries.
 spice add spiceai/quickstart
 ```
 
-The `Spicepod.yaml` file will be updated with the `spiceai/quickstart` dependency.
+The `spicepod.yaml` file will be updated with the `spiceai/quickstart` dependency.
 
 ```yaml
 version: v1beta1
