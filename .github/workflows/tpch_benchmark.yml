@@ -198,32 +198,29 @@ jobs:
         run: psql -h localhost -U postgres -c 'SELECT version();'
 
       - name: Generate TPC-H Benchmark data
+        working-directory: ./test/tpch
         run: |
-          git clone https://github.com/gregrahn/tpch-kit.git
-          cd tpch-kit/dbgen
-          make MACHINE=LINUX DATABASE=POSTGRESQL
-          ./dbgen -vf -s ${{ matrix.scale-factor }}
+          make tpch-init
+          DBGEN_SCALE=${{ matrix.scale-factor }} make tpch-gen
 
       - name: Load TPC-H Benchmark data to PostgreSQL
-        working-directory: tpch-kit/dbgen
+        working-directory: ./test/tpch
         env:
           PGPASSWORD: postgres
+          PGHOST: localhost
+          PGUSER: postgres
         run: |
-          psql -h localhost -U postgres tpch -f dss.ddl
-          for i in `ls *.tbl`; do
-            table=${i/.tbl/}
-            echo "Loading $table..."
-            sed 's/|$//' $i > /tmp/$i
-            psql -h localhost -U postgres tpch -q -c "TRUNCATE $table"
-            psql -h localhost -U postgres tpch -c "\\copy $table FROM '/tmp/$i' CSV DELIMITER '|'"
-          done
+          make pg-init
+          make pg-load
 
-      - name: Run TPC-H Benchmark queries
-        working-directory: ./
+      - name: Run TPC-H queries (PostgreSQL)
+        working-directory: ./test/tpch
         env:
           PGPASSWORD: postgres
+          PGHOST: localhost
+          PGUSER: postgres
         run: |
-          psql -h localhost -U postgres tpch < ./test/tpch/tpch_queries.sql
+          make tpch-run-pq
 
       # - name: download artifacts - build_${{ matrix.target_os }}_${{ matrix.target_arch }}
       #   uses: actions/download-artifact@v4
