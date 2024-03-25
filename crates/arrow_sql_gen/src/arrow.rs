@@ -1,7 +1,7 @@
 use arrow::{
     array::{
-        ArrayBuilder, BooleanBuilder, Decimal128Builder, Float32Builder, Float64Builder,
-        Int16Builder, Int32Builder, Int64Builder, ListBuilder, StringBuilder,
+        ArrayBuilder, BooleanBuilder, Date32Builder, Decimal128Builder, Float32Builder,
+        Float64Builder, Int16Builder, Int32Builder, Int64Builder, ListBuilder, StringBuilder,
         TimestampMicrosecondBuilder, TimestampMillisecondBuilder, TimestampNanosecondBuilder,
         TimestampSecondBuilder,
     },
@@ -45,6 +45,7 @@ pub fn map_data_type_to_array_builder(data_type: &DataType) -> Box<dyn ArrayBuil
                 Box::new(TimestampNanosecondBuilder::new().with_timezone_opt(time_zone.clone()))
             }
         },
+        DataType::Date32 => Box::new(Date32Builder::new()),
         // We can't recursively call map_data_type_to_array_builder here because downcasting will not work if the
         // values_builder is boxed.
         DataType::List(values_field) => match values_field.data_type() {
