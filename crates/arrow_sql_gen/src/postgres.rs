@@ -244,14 +244,23 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                         }
                         .fail();
                     };
-                    let v = row.get::<usize, SystemTime>(i);
+                    let v = row.try_get::<usize, Option<SystemTime>>(i).context(
+                        FailedToGetRowValueSnafu {
+                            pg_type: Type::TIMESTAMP,
+                        },
+                    )?;
 
-                    if let Ok(v) = v.duration_since(UNIX_EPOCH) {
-                        let timestamp: i64 = v
-                            .as_millis()
-                            .try_into()
-                            .context(FailedToConvertU128toI64Snafu)?;
-                        builder.append_value(timestamp);
+                    match v {
+                        Some(v) => {
+                            if let Ok(v) = v.duration_since(UNIX_EPOCH) {
+                                let timestamp: i64 = v
+                                    .as_millis()
+                                    .try_into()
+                                    .context(FailedToConvertU128toI64Snafu)?;
+                                builder.append_value(timestamp);
+                            }
+                        }
+                        None => builder.append_null(),
                     }
                 }
                 Type::DATE => {
@@ -264,8 +273,16 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                         }
                         .fail();
                     };
-                    let v = row.get::<usize, chrono::NaiveDate>(i);
-                    builder.append_value(Date32Type::from_naive_date(v));
+                    let v = row.try_get::<usize, Option<chrono::NaiveDate>>(i).context(
+                        FailedToGetRowValueSnafu {
+                            pg_type: Type::DATE,
+                        },
+                    )?;
+
+                    match v {
+                        Some(v) => builder.append_value(Date32Type::from_naive_date(v)),
+                        None => builder.append_null(),
+                    }
                 }
                 Type::INT2_ARRAY => handle_primitive_array_type!(
                     Type::INT2_ARRAY,
