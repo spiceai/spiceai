@@ -52,6 +52,12 @@ pub enum Error {
         source: <u128 as convert::TryInto<i64>>::Error,
     },
 
+    #[snafu(display("Failed to get a row value for {pg_type}: {source}"))]
+    FailedToGetRowValue {
+        pg_type: Type,
+        source: tokio_postgres::Error,
+    },
+
     #[snafu(display("Failed to parse raw Postgres Bytes as BigDecimal: {:?}", bytes))]
     FailedToParseBigDecmialFromPostgres { bytes: Vec<u8> },
 
@@ -81,8 +87,14 @@ macro_rules! handle_primitive_type {
             }
             .fail();
         };
-        let v: $value_ty = $row.get($index);
-        builder.append_value(v);
+        let v: Option<$value_ty> = $row
+            .try_get($index)
+            .context(FailedToGetRowValueSnafu { pg_type: $type })?;
+
+        match v {
+            Some(v) => builder.append_value(v),
+            None => builder.append_null(),
+        }
     }};
 }
 
@@ -97,9 +109,16 @@ macro_rules! handle_primitive_array_type {
             }
             .fail();
         };
-        let v: Vec<$value_type> = $row.get($i);
-        let v = v.into_iter().map(Some);
-        builder.append_value(v);
+        let v: Option<Vec<$value_type>> = $row
+            .try_get($i)
+            .context(FailedToGetRowValueSnafu { pg_type: $type })?;
+        match v {
+            Some(v) => {
+                let v = v.into_iter().map(Some);
+                builder.append_value(v);
+            }
+            None => builder.append_null(),
+        }
     }};
 }
 
@@ -168,7 +187,10 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                     handle_primitive_type!(builder, Type::BOOL, BooleanBuilder, bool, row, i);
                 }
                 Type::NUMERIC => {
-                    let v: BigDecimalFromSql = row.get(i);
+                    let v: BigDecimalFromSql =
+                        row.try_get(i).context(FailedToGetRowValueSnafu {
+                            pg_type: Type::NUMERIC,
+                        })?;
                     let scale = v.scale();
 
                     let dec_builder = builder.get_or_insert_with(|| {
