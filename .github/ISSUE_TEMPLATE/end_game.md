@@ -16,13 +16,17 @@ assignees: ''
 
 ## Milestone Release Timeline
 
-| Date         | Description |
-| ------------ | ----------- |
-| Planning     | Mon, Mar 11 |
-| Release      | Thu, Mar 14 |
-| Announcement | Thu, Mar 14 |
+| Date         | Description            |
+| ------------ | ---------------------- |
+| Planning     | TBD (E.g. Mon, Mar 11) |
+| Release      | TBD (E.g. Mon, Mar 11) |
+| Announcement | TBD (E.g. Mon, Mar 11) |
 
-## Checklist
+## Planning Checklist
+
+- [ ] Review the specific [GitHub Milestone](https://github.com/spiceai/spiceai/milestones)
+
+## Release Checklist
 
 - [ ] All outstanding `spiceai` feature PRs are merged
 - [ ] Full test pass and update if necessary over README.md (please get screenshots!)
@@ -44,11 +48,16 @@ assignees: ''
 - [ ] Release any docs updates by creating a `v[semver]` tag.
 - [ ] Final test pass on released binaries
 - [ ] Run [E2E Test Release Installation](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_release_install.yml)
-- [ ] Reddit announcement to [reddit.com/r/spiceai](https://reddit.com/r/spiceai)
-- [ ] Discord announcement to [#announcements](https://discord.gg/zv8ahzZVpf)
-- [ ] For major releases, [blog.spiceai.org](https://blog.spiceai.org) announcement
 - [ ] Update `version.txt` and version in `Cargo.toml` to the next release version.
 - [ ] Update versions in [brew taps](https://github.com/spiceai/homebrew-spiceai)
+
+## Announcement Checklist
+
+- [ ] X: [@spice_ai](https://twitter.com/spice_ai)
+- [ ] Reddit: [reddit.com/r/spiceai](https://reddit.com/r/spiceai)
+- [ ] Discord: [#announcements](https://discord.gg/zv8ahzZVpf)
+- [ ] Telegram: [spiceai](https://t.me/spiceai)
+- [ ] For major releases, [blog.spiceai.org](https://blog.spiceai.org) announcement
 
 ## PR reference
 
