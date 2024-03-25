@@ -250,9 +250,24 @@ jobs:
 
       - name: Run TPC-H queries (Spice)
         run: |
-          sql_output=$(echo "select * from customer limit 10;" | spice sql)
-          echo "$sql_output"
-          if [[ $sql_output == *"error"* ]] || [[ $sql_output == *"not found"* ]]; then
-            echo "Unexpected response from spice sql, failed to perform test query: $sql_output"
-            exit 1
-          fi
+          # show tables
+          # Run 'show tables;' command and check for errors
+          show_tables_output=$(echo "show tables;" | spice sql)
+          echo "$show_tables_output"
+          # Read the tpch_queries.sql file and split on ';' to execute each query separately
+          while IFS= read -r query; do
+            # Trim leading and trailing whitespace
+            trimmed_query=$(echo "$query" | xargs)
+            # Skip empty queries that may result from splitting
+            if [[ -z "$trimmed_query" ]]; then
+              continue
+            fi
+            echo "Executing query: $trimmed_query"
+            sql_output=$(echo "$trimmed_query" | spice sql)
+            echo "$sql_output"
+            # Check for errors in the output
+            if [[ $sql_output == *"error"* ]] || [[ $sql_output == *"not found"* ]]; then
+              echo "Unexpected response from spice sql, failed to perform query: $sql_output"
+              exit 1
+            fi
+          done < <(cat test/tpch/tpch_queries.sql | tr ';' '\n')
