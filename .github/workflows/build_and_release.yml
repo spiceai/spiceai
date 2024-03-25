@@ -28,6 +28,11 @@ jobs:
             target_os: linux
             target_arch: x86_64
             target_arch_go: amd64
+          - name: Linux aarch64
+            runner: hosted-linux-arm-runner
+            target_os: linux
+            target_arch: aarch64
+            target_arch_go: arm64
           - name: macOS aarch64 (Apple Silicon)
             runner: macos-14
             target_os: darwin
@@ -179,6 +184,8 @@ jobs:
         include:
           - target_os: linux
             target_arch: x86_64
+          - target_os: linux
+            target_arch: aarch64
           - target_os: darwin
             target_arch: aarch64
           - target_os: darwin
