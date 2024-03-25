@@ -5,6 +5,7 @@ use crate::arrow::map_data_type_to_array_builder_optional;
 use arrow::array::ArrayBuilder;
 use arrow::array::ArrayRef;
 use arrow::array::BooleanBuilder;
+use arrow::array::Date32Builder;
 use arrow::array::Decimal128Builder;
 use arrow::array::Float32Builder;
 use arrow::array::Float64Builder;
@@ -17,6 +18,7 @@ use arrow::array::RecordBatchOptions;
 use arrow::array::StringBuilder;
 use arrow::array::TimestampMillisecondBuilder;
 use arrow::datatypes::DataType;
+use arrow::datatypes::Date32Type;
 use arrow::datatypes::Field;
 use arrow::datatypes::Schema;
 use arrow::datatypes::TimeUnit;
@@ -159,7 +161,7 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                 Type::FLOAT8 => {
                     handle_primitive_type!(builder, Type::FLOAT8, Float64Builder, f64, row, i);
                 }
-                Type::TEXT => {
+                Type::TEXT | Type::VARCHAR | Type::BPCHAR => {
                     handle_primitive_type!(builder, Type::TEXT, StringBuilder, &str, row, i);
                 }
                 Type::BOOL => {
@@ -229,6 +231,19 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                             .context(FailedToConvertU128toI64Snafu)?;
                         builder.append_value(timestamp);
                     }
+                }
+                Type::DATE => {
+                    let Some(builder) = builder else {
+                        return NoBuilderForIndexSnafu { index: i }.fail();
+                    };
+                    let Some(builder) = builder.as_any_mut().downcast_mut::<Date32Builder>() else {
+                        return FailedToDowncastBuilderSnafu {
+                            postgres_type: format!("{postgres_type}"),
+                        }
+                        .fail();
+                    };
+                    let v = row.get::<usize, chrono::NaiveDate>(i);
+                    builder.append_value(Date32Type::from_naive_date(v));
                 }
                 Type::INT2_ARRAY => handle_primitive_array_type!(
                     Type::INT2_ARRAY,
@@ -311,12 +326,13 @@ fn map_column_type_to_data_type(column_type: &Type) -> Option<DataType> {
         Type::INT8 => Some(DataType::Int64),
         Type::FLOAT4 => Some(DataType::Float32),
         Type::FLOAT8 => Some(DataType::Float64),
-        Type::TEXT => Some(DataType::Utf8),
+        Type::TEXT | Type::VARCHAR | Type::BPCHAR => Some(DataType::Utf8),
         Type::BOOL => Some(DataType::Boolean),
         // Inspect the scale from the first row. Precision will always be 38 for Decimal128.
         Type::NUMERIC => None,
         // We get a SystemTime that we can always convert into milliseconds
         Type::TIMESTAMP => Some(DataType::Timestamp(TimeUnit::Millisecond, None)),
+        Type::DATE => Some(DataType::Date32),
         Type::INT2_ARRAY => Some(DataType::List(Arc::new(Field::new(
             "item",
             DataType::Int16,
