@@ -14,6 +14,15 @@
       "preLaunchTask": "rust: cargo build",
     },
     {
+      "type": "lldb",
+      "request": "launch",
+      "name": "[Rust] Debug spice sql",
+      "program": "${workspaceFolder}/target/debug/spiced",
+      "args": ["--repl"],
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "rust: cargo build",
+    },
+    {
       "name": "spice version",
       "type": "go",
       "request": "launch",

@@ -185,21 +185,38 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
+const KNOWN_USER_FRIENDLY_MESSAGES: [&str; 1] = ["Schema error: "];
+
+fn get_user_friendly_message(err_msg: &str) -> String {
+    // err_msg format: "status: Internal, message: "Schema error: ...", details: [], metadata: MetadataMap { headers: {} }"
+    let parts: Vec<&str> = err_msg.split('"').collect();
+    if parts.len() > 1 {
+        let message = parts[1];
+        for &user_friendly_message in &KNOWN_USER_FRIENDLY_MESSAGES {
+            if message.starts_with(user_friendly_message) {
+                return message.to_string();
+            }
+        }
+    }
+    "An internal error occurred while processing the query. Show technical details with '.error'"
+        .to_string()
+}
+
 fn display_grpc_error(err: &Status) {
     let (error_type, user_err_msg) = match err.code() {
         Code::Ok => return,
-        Code::Unknown | Code::Internal | Code::Unauthenticated | Code::DataLoss | Code::FailedPrecondition =>
-            ("Error", "An internal error occurred while processing the query. Show technical details with '.error'")
-        ,
-        Code::InvalidArgument | Code::AlreadyExists | Code::NotFound => ("Query Error", err.message()),
-        Code::Cancelled => ("Error", "The query was cancelled before it could complete."),
-        Code::Aborted => ("Error", "The query was aborted before it could complete."),
-        Code::DeadlineExceeded => ("Error", "The query could not be completed because the deadline for the query was exceeded."),
-        Code::PermissionDenied => ("Error", "The query could not be completed because the user does not have permission to access the requested data."),
-        Code::ResourceExhausted => ("Error", "The query could not be completed because the server has run out of resources."),
-        Code::Unimplemented => ("Error", "The query could not be completed because the server does not support the requested operation."),
-        Code::Unavailable => ("Error", "The query could not be completed because the server is unavailable."),
-        Code::OutOfRange => ("Error", "The query could not be completed because the size limit of the query result was exceeded. Retry with `limit` clause."),
+        Code::Unknown | Code::Internal | Code::Unauthenticated | Code::DataLoss | Code::FailedPrecondition =>{
+            ("Error", get_user_friendly_message(err.message()))
+        },
+        Code::InvalidArgument | Code::AlreadyExists | Code::NotFound => ("Query Error", err.message().to_string()),
+        Code::Cancelled => ("Error", "The query was cancelled before it could complete.".to_string()),
+        Code::Aborted => ("Error", "The query was aborted before it could complete.".to_string()),
+        Code::DeadlineExceeded => ("Error", "The query could not be completed because the deadline for the query was exceeded.".to_string()),
+        Code::PermissionDenied => ("Error", "The query could not be completed because the user does not have permission to access the requested data.".to_string()),
+        Code::ResourceExhausted => ("Error", "The query could not be completed because the server has run out of resources.".to_string()),
+        Code::Unimplemented => ("Error", "The query could not be completed because the server does not support the requested operation.".to_string()),
+        Code::Unavailable => ("Error", "The query could not be completed because the server is unavailable.".to_string()),
+        Code::OutOfRange => ("Error", "The query could not be completed because the size limit of the query result was exceeded. Retry with `limit` clause.".to_string()),
     };
 
     println!("{} {user_err_msg}", Colour::Red.paint(error_type));

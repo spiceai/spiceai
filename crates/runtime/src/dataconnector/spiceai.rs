@@ -16,8 +16,8 @@ use std::{collections::HashMap, future::Future};
 
 use crate::datapublisher::{AddDataResult, DataPublisher};
 use crate::dataupdate::{DataUpdate, UpdateType};
-use crate::info_spaced;
 use crate::tracers::SpacedTracer;
+use crate::{info_spaced, status};
 
 use super::DataConnectorFactory;
 use super::{flight::Flight, DataConnector};
@@ -87,32 +87,37 @@ impl DataConnector for SpiceAI {
         let flight = &self.flight.client;
         let mut flight = flight.clone();
         let spice_dataset_path = Self::spice_dataset_path(dataset);
+        let spice_dataset_name = dataset.name.clone();
         Box::pin(stream! {
           let mut stream = match flight.subscribe(&spice_dataset_path).await {
             Ok(stream) => stream,
             Err(error) => {
+              status::update_dataset(spice_dataset_name.clone(), status::ComponentStatus::Error);
               tracing::error!("Unable to subscribe to {spice_dataset_path}: {error}");
               return;
             }
           };
           loop {
-            match stream.next().await {
-              Some(Ok(decoded_data)) => match decoded_data.payload {
-                  DecodedPayload::RecordBatch(batch) => {
-                      yield DataUpdate {
+            let result = stream.next().await;
+            status::update_dataset(spice_dataset_name.clone(), status::ComponentStatus::Refreshing);
+            match result {
+              Some(Ok(decoded_data)) => if let DecodedPayload::RecordBatch(batch) = decoded_data.payload {
+                    status::update_dataset(spice_dataset_name.clone(), status::ComponentStatus::Ready);
+                    yield DataUpdate {
                         data: vec![batch],
                         update_type: UpdateType::Append,
-                      };
-                  }
-                  _ => {
-                      continue;
-                  }
-                }
+                    };
+                } else {
+                    status::update_dataset(spice_dataset_name.clone(), status::ComponentStatus::Ready);
+                    continue;
+                },
               Some(Err(error)) => {
+                status::update_dataset(spice_dataset_name.clone(), status::ComponentStatus::Error);
                 tracing::error!("Error in subscription to {spice_dataset_path}: {error}");
                 continue;
               },
               None => {
+                status::update_dataset(spice_dataset_name.clone(), status::ComponentStatus::Ready);
                 tracing::error!("Flight stream ended for {spice_dataset_path}");
                 break;
               }
