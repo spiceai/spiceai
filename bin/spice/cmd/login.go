@@ -147,6 +147,36 @@ spice login s3 --access-key <key> --access-secret <secret>
 	}),
 }
 
+var postgresCmd = &cobra.Command{
+	Use:   "postgres",
+	Short: "Login to a Postgres instance",
+	Example: `
+spice login postgres --password <password>
+
+# See more at: https://docs.spiceai.org/
+`,
+	Run: CreateLoginRunFunc(api.AUTH_TYPE_POSTGRES, map[string]string{
+		passwordFlag: fmt.Sprintf("No password provided, use --%s or -p to provide a password", passwordFlag),
+	}, map[string]string{
+		passwordFlag: api.AUTH_PARAM_PG_PASSWORD,
+	}),
+}
+
+var postgresEngineCmd = &cobra.Command{
+	Use:   "engine",
+	Short: "Login to a Postgres instance as an engine",
+	Example: `
+spice login postgres engine --password <password>
+
+# See more at: https://docs.spiceai.org/
+`,
+	Run: CreateLoginRunFunc(api.AUTH_TYPE_POSTGRES, map[string]string{
+		passwordFlag: fmt.Sprintf("No password provided, use --%s or -p to provide a password", passwordFlag),
+	}, map[string]string{
+		passwordFlag: api.AUTH_PARAM_PG_PASSWORD,
+	}),
+}
+
 func CreateLoginRunFunc(authName string, requiredFlags map[string]string, flagToTomlKeys map[string]string) func(cmd *cobra.Command, args []string) {
 	return func(cmd *cobra.Command, args []string) {
 
@@ -309,6 +339,14 @@ func init() {
 	s3Cmd.Flags().StringP(accessKeyFlag, "k", "", "Access key")
 	s3Cmd.Flags().StringP(accessSecretFlag, "s", "", "Access Secret")
 	loginCmd.AddCommand(s3Cmd)
+
+	postgresCmd.Flags().BoolP("help", "h", false, "Print this help message")
+	postgresCmd.Flags().StringP(passwordFlag, "p", "", "Password")
+	loginCmd.AddCommand(postgresCmd)
+
+	postgresEngineCmd.Flags().BoolP("help", "h", false, "Print this help message")
+	postgresEngineCmd.Flags().StringP(passwordFlag, "p", "", "Password")
+	postgresCmd.AddCommand(postgresEngineCmd)
 
 	loginCmd.Flags().BoolP("help", "h", false, "Print this help message")
 	loginCmd.Flags().StringP(apiKeyFlag, "k", "", "API key")
