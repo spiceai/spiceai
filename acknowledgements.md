@@ -1,4 +1,6 @@
-# Open Source Acknowledgements\n\nSpice.ai acknowledges the following open source projects for making this project possible:\n\n
+# Open Source Acknowledgements\n\nSpice.ai acknowledges the following open source projects for making this project possible:
+
+
 
 ## Go Modules
 
