@@ -89,10 +89,10 @@ impl PostgresConnectionPool {
 pub fn get_secret_or_param(
     params: &HashMap<String, String>,
     secret: &Option<Secret>,
-    secret_key: &str,
+    secret_param_key: &str,
     param_key: &str,
 ) -> Option<String> {
-    if let Some(pg_secret_param_val) = params.get(secret_key) {
+    if let Some(pg_secret_param_val) = params.get(secret_param_key) {
         if let Some(secrets) = secret {
             if let Some(pg_secret_val) = secrets.get(pg_secret_param_val) {
                 return Some(pg_secret_val.to_string());
