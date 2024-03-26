@@ -111,9 +111,8 @@ jobs:
       - run: rustup toolchain install stable --profile minimal
 
       - uses: Swatinem/rust-cache@v2
-        # test run
-        # with:
-        #   save-if: ${{ github.ref == 'refs/heads/trunk' }}
+        with:
+          save-if: ${{ github.ref == 'refs/heads/trunk' }}
 
       # - name: Set up Rust
       #   uses: ./.github/actions/setup-rust
