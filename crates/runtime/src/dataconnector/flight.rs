@@ -2,6 +2,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use arrow::record_batch::RecordBatch;
+use arrow_flight::error::FlightError;
 use flight_client::FlightClient;
 use futures::StreamExt;
 
@@ -47,7 +48,7 @@ impl Flight {
                         result_data.push(batch);
                     }
                     Err(error) => {
-                        tracing::error!("Failed to read batch from flight client: {error}",);
+                        render_flight_error(error, "Failed to read batch from flight client");
                         return result_data;
                     }
                 };
@@ -55,5 +56,32 @@ impl Flight {
 
             result_data
         })
+    }
+}
+
+// Render a user-friendly message for when a FlightError occurs.
+pub fn render_flight_error(error: FlightError, ctx: &str) -> String {
+    match error {
+        FlightError::Arrow(arrow_error) => format!("{ctx}: Arrow error occurred: {arrow_error}",),
+        FlightError::NotYetImplemented(message) => {
+            format!("{ctx}: Not yet implemented: {message}",)
+        }
+        FlightError::Tonic(status) => {
+            format!(
+                "{ctx}: Tonic error occurred. code: {}, message: {}. Full: {}",
+                status.code(),
+                status.message(),
+                status
+            )
+        }
+        FlightError::ProtocolError(message) => {
+            format!("{ctx}: Protocol error occurred: {message}",)
+        }
+        FlightError::DecodeError(message) => {
+            format!("{ctx}: Decode error occurred: {message}")
+        }
+        FlightError::ExternalError(error) => {
+            format!("{ctx}: External error occurred: {error}")
+        }
     }
 }

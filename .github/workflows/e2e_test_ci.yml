@@ -6,44 +6,66 @@ on:
       - trunk
       - release-*
 
-  # pull_request:
-  #   branches:
-  #     - trunk
+  pull_request:
+    branches:
+      - trunk
 
   workflow_dispatch:
 
+concurrency:
+  # Allow only one workflow per any non-trunk branch.
+  group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
+  cancel-in-progress: true
+
 jobs:
+  setup-matrix:
+    name: Setup strategy matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.setup-matrix.outputs.result }}
+
+    steps:
+      - name: Set up matrix
+        uses: actions/github-script@v7
+        id: setup-matrix
+        with:
+          script: |
+            const matrix = [
+              {
+                name: "Linux x64",
+                runner: "ubuntu-latest",
+                target_os: "linux",
+                target_arch: "x86_64",
+                target_arch_go: "amd64"
+              }, {
+                name: "macOS aarch64 (Apple Silicon)",
+                runner: "macos-14",
+                target_os: "darwin",
+                target_arch: "aarch64",
+                target_arch_go: "arm64"
+              }, {
+                name: "macOS x64 (Intel)",
+                runner: "macos-12",
+                target_os: "darwin",
+                target_arch: "x86_64",
+                target_arch_go: "amd64"
+              }
+            ];
+
+            return context.eventName === 'pull_request' ? matrix.slice(0, 1) : matrix;
+
   build:
-    name: Build ${{ matrix.name }} binaries
-    runs-on: ${{ matrix.runner }}
+    name: Build ${{ matrix.target.name }} binaries
+    runs-on: ${{ matrix.target.runner }}
+    needs: setup-matrix
     env:
       GOVER: 1.22
-      GOOS: ${{ matrix.target_os }}
-      GOARCH: ${{ matrix.target_arch_go }}
+      GOOS: ${{ matrix.target.target_os }}
+      GOARCH: ${{ matrix.target.target_arch_go }}
 
     strategy:
       matrix:
-        include:
-          - name: Linux x64
-            runner: rust
-            target_os: linux
-            target_arch: x86_64
-            target_arch_go: amd64
-          - name: macOS aarch64 (Apple Silicon)
-            runner: macos-14
-            target_os: darwin
-            target_arch: aarch64
-            target_arch_go: arm64
-          - name: macOS x64 (Intel)
-            runner: macos-12
-            target_os: darwin
-            target_arch: x86_64
-            target_arch_go: amd64
-          # - name: Windows x64
-          #   runner: rust-windows-x64
-          #   target_os: windows
-          #   target_arch: x86_64
-          #   target_arch_go: amd64
+        target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
       - uses: actions/checkout@v3
@@ -56,54 +78,31 @@ jobs:
         with:
           go-version: ${{ env.GOVER }}
 
-      - name: Set up Rust
-        uses: ./.github/actions/setup-rust
+      - run: rustup toolchain install stable --profile minimal
+
+      - uses: Swatinem/rust-cache@v2
         with:
-          os: ${{ matrix.target_os }}
-
-      - name: Restore build cache (macOS)
-        if: matrix.target_os == 'darwin'
-        run: |
-          mkdir -p target
-          if [ -d /Users/spiceai/build/target ]; then
-            rsync -av /Users/spiceai/build/target/ target/
-          fi
-
-      - name: Restore build cache (Linux)
-        if: matrix.target_os == 'linux'
-        run: |
-          mkdir -p target
-          if [ -d /home/spiceai/build/target ]; then
-            rsync -av /home/spiceai/build/target/ target/
-          fi
-
-      - name: Restore build cache (Windows)
-        if: matrix.target_os == 'windows'
-        run: |
-          mkdir -p target
-          if (Test-Path C:/spiceai/build/target) {
-            Copy-Item -Recurse -Force C:/spiceai/build/target/* target/
-          }
+          save-if: ${{ github.ref == 'refs/heads/trunk' }}
 
       - name: Build spiced
         run: make -C bin/spiced
 
       - name: Update build cache (macOS)
-        if: matrix.target_os == 'darwin'
+        if: matrix.target.target_os == 'darwin'
         run: |
           if [ -d /Users/spiceai/build/target ]; then
             rsync -av target/ /Users/spiceai/build/target/
           fi
 
       - name: Update build cache (Linux)
-        if: matrix.target_os == 'linux'
+        if: matrix.target.target_os == 'linux'
         run: |
           if [ -d /home/spiceai/build/target ]; then
             rsync -av target/ /home/spiceai/build/target/
           fi
 
       - name: Update build cache (Windows)
-        if: matrix.target_os == 'windows'
+        if: matrix.target.target_os == 'windows'
         run: |
           if (Test-Path C:/spiceai/build/target) {
             Copy-Item -Recurse -Force target/* C:/spiceai/build/target
@@ -113,61 +112,42 @@ jobs:
         run: make -C bin/spice
 
       - name: make spiced executable
-        if: matrix.target_os != 'windows'
+        if: matrix.target.target_os != 'windows'
         run: |
           mv target/release/spiced spiced
           chmod +x spiced
 
       - name: make spice executable
-        if: matrix.target_os != 'windows'
+        if: matrix.target.target_os != 'windows'
         run: |
           mv target/release/spice spice
           chmod +x spice
 
       - name: Save spice artifact
         uses: actions/upload-artifact@v4
-        if: matrix.target_os != 'windows'
+        if: matrix.target.target_os != 'windows'
         with:
-          name: build_${{ matrix.target_os }}_${{ matrix.target_arch }}
+          name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: |
             spice
             spiced
 
   test_quickstart_dremio:
-    name: "E2E Test: Dremio quickstart, using ${{ matrix.target_os }}-${{ matrix.target_arch }}"
-    runs-on: ${{ matrix.runner }}
-    needs: build
+    name: "E2E Test: Dremio quickstart, using ${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}"
+    runs-on: ${{ matrix.target.runner }}
+    needs:
+      - build
+      - setup-matrix
 
     strategy:
-      fail-fast: false
       matrix:
-        include:
-          - name: Linux x64
-            runner: ubuntu-latest
-            target_os: linux
-            target_arch: x86_64
-            target_arch_go: amd64
-          - name: macOS aarch64 (Apple Silicon)
-            runner: macos-14
-            target_os: darwin
-            target_arch: aarch64
-            target_arch_go: arm64
-          - name: macOS x64 (Intel)
-            runner: macos-12
-            target_os: darwin
-            target_arch: x86_64
-            target_arch_go: amd64
-          # - name: Windows x64
-          #   runner: rust-windows-x64
-          #   target_os: windows
-          #   target_arch: x86_64
-          #   target_arch_go: amd64
+        target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - name: download artifacts - build_${{ matrix.target_os }}_${{ matrix.target_arch }}
+      - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         uses: actions/download-artifact@v4
         with:
-          name: build_${{ matrix.target_os }}_${{ matrix.target_arch }}
+          name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
 
       - name: Install spice
@@ -247,40 +227,21 @@ jobs:
           fi
 
   test_quickstart_spiceai:
-    name: "E2E Test: SpiceAI quickstart, using ${{ matrix.target_os }}-${{ matrix.target_arch }}"
-    runs-on: ${{ matrix.runner }}
-    needs: build
+    name: "E2E Test: SpiceAI quickstart, using ${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}"
+    runs-on: ${{ matrix.target.runner }}
+    needs:
+      - build
+      - setup-matrix
 
     strategy:
-      fail-fast: false
       matrix:
-        include:
-          - name: Linux x64
-            runner: ubuntu-latest
-            target_os: linux
-            target_arch: x86_64
-            target_arch_go: amd64
-          - name: macOS aarch64 (Apple Silicon)
-            runner: macos-14
-            target_os: darwin
-            target_arch: aarch64
-            target_arch_go: arm64
-          - name: macOS x64 (Intel)
-            runner: macos-12
-            target_os: darwin
-            target_arch: x86_64
-            target_arch_go: amd64
-          # - name: Windows x64
-          #   runner: rust-windows-x64
-          #   target_os: windows
-          #   target_arch: x86_64
-          #   target_arch_go: amd64
+        target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - name: download artifacts - build_${{ matrix.target_os }}_${{ matrix.target_arch }}
+      - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         uses: actions/download-artifact@v4
         with:
-          name: build_${{ matrix.target_os }}_${{ matrix.target_arch }}
+          name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
 
       - name: Install spice
@@ -359,38 +320,19 @@ jobs:
           fi
 
   test_quickstart_data_postgres:
-    name: "E2E Test: SpiceAI Postgres quickstart, using ${{ matrix.target_os }}-${{ matrix.target_arch }}"
-    runs-on: ${{ matrix.runner }}
-    needs: build
+    name: "E2E Test: SpiceAI Postgres quickstart, using ${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}"
+    runs-on: ${{ matrix.target.runner }}
+    needs:
+      - build
+      - setup-matrix
 
     strategy:
-      fail-fast: false
       matrix:
-        include:
-          - name: Linux x64
-            runner: ubuntu-latest
-            target_os: linux
-            target_arch: x86_64
-            target_arch_go: amd64
-          - name: macOS aarch64 (Apple Silicon)
-            runner: macos-14
-            target_os: darwin
-            target_arch: aarch64
-            target_arch_go: arm64
-          - name: macOS x64 (Intel)
-            runner: macos-12
-            target_os: darwin
-            target_arch: x86_64
-            target_arch_go: amd64
-          # - name: Windows x64
-          #   runner: rust-windows-x64
-          #   target_os: windows
-          #   target_arch: x86_64
-          #   target_arch_go: amd64
+        target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
       - name: Install PostgreSQL (Linux)
-        if: matrix.target_os == 'linux'
+        if: matrix.target.target_os == 'linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y postgresql
@@ -401,7 +343,7 @@ jobs:
           sudo -u postgres createdb testdb
 
       - name: Install PostgreSQL (MacOS)
-        if: matrix.target_os == 'darwin'
+        if: matrix.target.target_os == 'darwin'
         run: |
           brew install postgresql
           brew services start postgresql
@@ -428,10 +370,10 @@ jobs:
           psql -h localhost -U postgres -d testdb -c "INSERT INTO eth_recent_blocks (block_number, block_hash, block_timestamp) VALUES (3, '0x9abc', '2022-01-01 00:00:00');"
           psql -h localhost -U postgres -d testdb -c 'SELECT * FROM eth_recent_blocks;'
 
-      - name: download artifacts - build_${{ matrix.target_os }}_${{ matrix.target_arch }}
+      - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         uses: actions/download-artifact@v4
         with:
-          name: build_${{ matrix.target_os }}_${{ matrix.target_arch }}
+          name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
 
       - name: Install spice
@@ -512,49 +454,30 @@ jobs:
           fi
 
   test_local_acceleration:
-    name: "E2E Test: acceleration on ${{ matrix.name }} using ${{ matrix.acceleration.engine }}"
-    runs-on: ${{ matrix.runner }}
-    needs: build
-
+    name: "E2E Test: acceleration on ${{ matrix.target.name }} using ${{ matrix.acceleration.engine }}"
+    runs-on: ${{ matrix.target.runner }}
+    needs:
+      - build
+      - setup-matrix
 
     strategy:
       fail-fast: false
       matrix:
         acceleration: [
-          { engine: arrow, mode: memory},
-          { engine: duckdb, mode: memory},
-          { engine: duckdb, mode: file},
-          { engine: sqlite, mode: memory},
-          { engine: sqlite, mode: file},
-          # { engine: postgres},
-        ]
-        include:
-          - name: Linux x64
-            runner: ubuntu-latest
-            target_os: linux
-            target_arch: x86_64
-            target_arch_go: amd64
-          - name: macOS aarch64 (Apple Silicon)
-            runner: macos-14
-            target_os: darwin
-            target_arch: aarch64
-            target_arch_go: arm64
-          - name: macOS x64 (Intel)
-            runner: macos-12
-            target_os: darwin
-            target_arch: x86_64
-            target_arch_go: amd64
-          # - name: Windows x64
-          #   runner: rust-windows-x64
-          #   target_os: windows
-          #   target_arch: x86_64
-          #   target_arch_go: amd64
+            { engine: arrow, mode: memory },
+            { engine: duckdb, mode: memory },
+            { engine: duckdb, mode: file },
+            { engine: sqlite, mode: memory },
+            { engine: sqlite, mode: file },
+            # { engine: postgres},
+          ]
+        target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - name: download artifacts - build_${{ matrix.target_os }}_${{ matrix.target_arch }}
+      - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         uses: actions/download-artifact@v4
         with:
-          name: build_${{ matrix.target_os }}_${{ matrix.target_arch }}
+          name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: ./build
 
       - name: Install spice
@@ -568,7 +491,7 @@ jobs:
 
       - name: Check spice version
         run: spice version
-    
+
       - name: Init spice app
         run: |
           spice init test_app
@@ -579,7 +502,6 @@ jobs:
           ENGINE=$(echo '${{ matrix.acceleration.engine }}')
           MODE=$(echo '${{ matrix.acceleration.mode }}')
 
-          
           echo "datasets:" >> spicepod.yaml
           echo "  - name: eth_recent_blocks" >> spicepod.yaml
           echo "    from: spice.ai/eth.recent_blocks" >> spicepod.yaml
@@ -632,7 +554,7 @@ jobs:
             echo "Unexpected response: table 'taxi_trips' does not exist."
             exit 1
           fi
-    
+
       - name: Check Flight SQL query
         working-directory: test_app
         run: |
