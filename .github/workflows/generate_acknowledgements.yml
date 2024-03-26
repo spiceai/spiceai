@@ -9,6 +9,7 @@ on:
 
 jobs:
   generate:
+    name: Generate Acknowledgements
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
