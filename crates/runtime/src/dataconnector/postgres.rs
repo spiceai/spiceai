@@ -81,7 +81,7 @@ impl DataConnector for Postgres {
             {
                 Ok(stream) => stream,
                 Err(e) => {
-                    tracing::error!("Failed to query Postgres: {e}");
+                    tracing::error!("{e}");
                     return vec![];
                 }
             };

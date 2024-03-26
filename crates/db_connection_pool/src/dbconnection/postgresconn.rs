@@ -16,7 +16,7 @@ use super::Result;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to query: {source}"))]
+    #[snafu(display("{source}"))]
     QueryError {
         source: bb8_postgres::tokio_postgres::Error,
     },
