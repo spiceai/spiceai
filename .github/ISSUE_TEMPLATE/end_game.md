@@ -39,7 +39,7 @@ assignees: ''
 - [ ] Merge [Samples PRs](https://github.com/spiceai/samples/pulls)
 - [ ] Merge [Quickstarts PRs](https://github.com/spiceai/samples/pulls)
 - [ ] Update release notes
-- [ ] Update acknowledgements
+- [ ] Update acknowledgements by triggering [Generate Acknowledgements](https://github.com/spiceai/spiceai/actions/workflows/generate_acknowledgements.yml) workflow
 - [ ] Verify `version.txt` and version in `Cargo.toml` is correct using [docs/RELEASE.md](https://github.com/spiceai/spiceai/blob/trunk/docs/RELEASE.md#version-update)
 - [ ] Ensure [E2E Test CI](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_ci.yml) is green on trunk branch
 - [ ] QA DRI sign-off
