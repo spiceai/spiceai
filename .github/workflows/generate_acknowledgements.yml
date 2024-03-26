@@ -17,6 +17,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v3
+        with:
+          ref: trunk
 
       - uses: actions/setup-go@v5
 
@@ -29,13 +31,16 @@ jobs:
 
       - name: Create PR
         run: |
-          git config --global user.name 'Evgenii Khramkov'
-          git config --global user.email 'evgenii@spice.ai'
+          git config --global user.name 'Spice Acknowledgements Bot'
+          git config --global user.email 'acknowledgements-bot@spice.ai'
           git checkout -b acknowledgements/${GITHUB_RUN_ID}
-          cat acknowledgements.md
           git add acknowledgements.md
-          git commit -m "Update acknowledgements"
-          git push origin acknowledgements/${GITHUB_RUN_ID}
-          gh pr create --title "Update acknowledgements" --body "This PR updates the acknowledgements" --base trunk --head acknowledgements/${GITHUB_RUN_ID}
+          if [[ $(git status --porcelain) ]]; then
+            git commit -m "Update acknowledgements"
+            git push origin acknowledgements/${GITHUB_RUN_ID}
+            gh pr create --title "Update acknowledgements" --body "This PR updates the acknowledgements" --base trunk --head acknowledgements/${GITHUB_RUN_ID}
+          else
+            echo "No changes detected"
+          fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
