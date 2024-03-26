@@ -14,7 +14,7 @@ on:
 
 concurrency:
   # Allow only one workflow per any non-trunk branch.
-  group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha }}
+  group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
   cancel-in-progress: true
 
 jobs:
