@@ -181,6 +181,13 @@ jobs:
           #   target_arch_go: amd64
 
     steps:
+      # The aarch64 runner does not have any tools pre-installed
+      - name: Install missing tools
+        if: matrix.target_os == 'linux' && matrix.target_arch == 'aarch64'
+        run: |
+          sudo apt-get update
+          sudo apt install jq -y
+  
       - name: download artifacts - build_${{ matrix.target_os }}_${{ matrix.target_arch }}
         uses: actions/download-artifact@v4
         with:
@@ -299,6 +306,13 @@ jobs:
           #   target_arch_go: amd64
 
     steps:
+      # The aarch64 runner does not have any tools pre-installed
+      - name: Install missing tools
+        if: matrix.target_os == 'linux' && matrix.target_arch == 'aarch64'
+        run: |
+          sudo apt-get update
+          sudo apt install jq -y
+
       - name: download artifacts - build_${{ matrix.target_os }}_${{ matrix.target_arch }}
         uses: actions/download-artifact@v4
         with:
@@ -416,6 +430,13 @@ jobs:
           #   target_arch_go: amd64
 
     steps:
+        # The aarch64 runner does not have any tools pre-installed
+      - name: Install missing tools
+        if: matrix.target_os == 'linux' && matrix.target_arch == 'aarch64'
+        run: |
+          sudo apt-get update
+          sudo apt install jq -y
+
       - name: Install PostgreSQL (Linux)
         if: matrix.target_os == 'linux'
         run: |
@@ -543,7 +564,6 @@ jobs:
     runs-on: ${{ matrix.runner }}
     needs: build
 
-
     strategy:
       fail-fast: false
       matrix:
@@ -583,6 +603,13 @@ jobs:
           #   target_arch_go: amd64
 
     steps:
+      # The aarch64 runner does not have any tools pre-installed
+      - name: Install missing tools
+        if: matrix.target_os == 'linux' && matrix.target_arch == 'aarch64'
+        run: |
+          sudo apt-get update
+          sudo apt install jq -y
+
       - name: download artifacts - build_${{ matrix.target_os }}_${{ matrix.target_arch }}
         uses: actions/download-artifact@v4
         with:
