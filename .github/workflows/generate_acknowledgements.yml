@@ -24,4 +24,9 @@ jobs:
           make generate-acknowledgements
 
       - run: |
+          git config --global user.name 'Spice Acknowledgements Bot'
+          git config --global user.email 'acknowledgements-bot@spice.ai'
+          git checkout -b acknowledgements/${GITHUB_JOB}
           cat acknowledgements.md
+          git add acknowledgements.md
+          git commit -m "Update acknowledgements"
