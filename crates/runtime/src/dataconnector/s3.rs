@@ -100,7 +100,7 @@ impl DataConnector for S3 {
                 s3_builder = s3_builder.with_secret_access_key(secret);
             };
         } else {
-            s3_builder = s3_builder.with_skip_signature(true)
+            s3_builder = s3_builder.with_skip_signature(true);
         };
 
         let s3 = s3_builder
