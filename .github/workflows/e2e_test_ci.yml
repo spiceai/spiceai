@@ -48,7 +48,7 @@ jobs:
               }
             ];
       - name: Get result
-        run: echo "${{ steps.setup-build-matrix.outputs.result }}"
+        run: echo '${{ steps.setup-build-matrix.outputs.result }}'
 
       - name: Set up test matrix
         uses: actions/github-script@v7
