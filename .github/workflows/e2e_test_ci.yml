@@ -22,42 +22,12 @@ jobs:
     name: Setup strategy matrix
     runs-on: ubuntu-latest
     outputs:
-      matrix_build: ${{ steps.setup-build-matrix.outputs.result }}
-      matrix_test: ${{ steps.setup-test-matrix.outputs.result }}
+      matrix: ${{ steps.setup-matrix.outputs.result }}
 
     steps:
-      - name: Set up build matrix
+      - name: Set up matrix
         uses: actions/github-script@v7
-        id: setup-build-matrix
-        with:
-          script: |
-            const matrix = [
-              {
-                name: "Linux x64",
-                runner: "ubuntu-latest",
-                target_os: "linux",
-                target_arch: "x86_64",
-                target_arch_go: "amd64"
-              }, {
-                name: "macOS aarch64 (Apple Silicon)",
-                runner: "macos-14",
-                target_os: "darwin",
-                target_arch: "aarch64",
-                target_arch_go: "arm64"
-              }, {
-                name: "macOS x64 (Intel)",
-                runner: "macos-12",
-                target_os: "darwin",
-                target_arch: "x86_64",
-                target_arch_go: "amd64"
-              }
-            ];
-
-            return context.eventName === 'pull_request' ? matrix.slice(0, 1) : matrix;
-
-      - name: Set up test matrix
-        uses: actions/github-script@v7
-        id: setup-test-matrix
+        id: setup-matrix
         with:
           script: |
             const matrix = [
@@ -95,7 +65,7 @@ jobs:
 
     strategy:
       matrix:
-        target: ${{ fromJson(needs.setup-matrix.outputs.matrix_build) }}
+        target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
       - uses: actions/checkout@v3
@@ -113,35 +83,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/trunk' }}
-
-      # - name: Set up Rust
-      #   uses: ./.github/actions/setup-rust
-      #   with:
-      #     os: ${{ matrix.target.target_os }}
-
-      # - name: Restore build cache (macOS)
-      #   if: matrix.target.target_os == 'darwin'
-      #   run: |
-      #     mkdir -p target
-      #     if [ -d /Users/spiceai/build/target ]; then
-      #       rsync -av /Users/spiceai/build/target/ target/
-      #     fi
-
-      # - name: Restore build cache (Linux)
-      #   if: matrix.target.target_os == 'linux'
-      #   run: |
-      #     mkdir -p target
-      #     if [ -d /home/spiceai/build/target ]; then
-      #       rsync -av /home/spiceai/build/target/ target/
-      #     fi
-
-      # - name: Restore build cache (Windows)
-      #   if: matrix.target.target_os == 'windows'
-      #   run: |
-      #     mkdir -p target
-      #     if (Test-Path C:/spiceai/build/target) {
-      #       Copy-Item -Recurse -Force C:/spiceai/build/target/* target/
-      #     }
 
       - name: Build spiced
         run: make -C bin/spiced
@@ -200,7 +141,7 @@ jobs:
 
     strategy:
       matrix:
-        target: ${{ fromJson(needs.setup-matrix.outputs.matrix_test) }}
+        target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
@@ -294,7 +235,7 @@ jobs:
 
     strategy:
       matrix:
-        target: ${{ fromJson(needs.setup-matrix.outputs.matrix_test) }}
+        target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
@@ -387,7 +328,7 @@ jobs:
 
     strategy:
       matrix:
-        target: ${{ fromJson(needs.setup-matrix.outputs.matrix_test) }}
+        target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
       - name: Install PostgreSQL (Linux)
@@ -530,7 +471,7 @@ jobs:
             { engine: sqlite, mode: file },
             # { engine: postgres},
           ]
-        target: ${{ fromJson(needs.setup-matrix.outputs.matrix_test) }}
+        target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
