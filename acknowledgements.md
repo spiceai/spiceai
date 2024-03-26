@@ -47,6 +47,9 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 
 ## Rust Crates
 
+- name version, license license_file
+  <br/>repository
+
 - ansi_term 0.12.1, MIT 
   <br/>https://github.com/ogham/rust-ansi-term
 
@@ -326,4 +329,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 
 - uuid 1.7.0, Apache-2.0 OR MIT 
   <br/>https://github.com/uuid-rs/uuid
+
+- make[2]: Leaving directory '/home/runner/work/spiceai/spiceai' ,  
+  <br/>
 
