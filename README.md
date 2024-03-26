@@ -171,29 +171,29 @@ sql> show tables;
 Query took: 0.004728897 seconds
 ```
 
-Enter a query to display the most expensive tax trips:
+Enter a query to display the longest taxi trips:
 
 ```
-sql> SELECT trip_distance_mi, fare_amount FROM taxi_trips ORDER BY fare_amount LIMIT 10;
+sql> SELECT trip_distance_mi, total_amount FROM taxi_trips ORDER BY trip_distance_mi DESC LIMIT 10;
 ```
 
 Output:
 
 ```
-+------------------+-------------+
-| trip_distance_mi | fare_amount |
-+------------------+-------------+
-| 1.1              | 7.5         |
-| 6.1              | 23.0        |
-| 0.6              | 4.5         |
-| 16.7             | 52.0        |
-| 11.3             | 37.5        |
-| 1.1              | 6.0         |
-| 5.3              | 18.5        |
-| 1.3              | 7.0         |
-| 1.0              | 7.0         |
-| 3.5              | 17.5        |
-+------------------+-------------+
++------------------+--------------+
+| trip_distance_mi | total_amount |
++------------------+--------------+
+| 191.9            | 3.0          |
+| 189.2            | 63.0         |
+| 163.8            | 93.64        |
+| 122.4            | 160.0        |
+| 104.0            | 3.0          |
+| 69.7             | 213.58       |
+| 64.8             | 280.83       |
+| 60.0             | 350.12       |
+| 53.9             | 0.0          |
+| 53.3             | 5.33         |
++------------------+--------------+
 
 Query took: 0.002458976 seconds
 ```
