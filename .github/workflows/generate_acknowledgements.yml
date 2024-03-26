@@ -1,0 +1,45 @@
+name: Generate Acknowledgements
+
+on:
+  workflow_dispatch:
+
+jobs:
+  generate:
+    name: Generate Acknowledgements
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - uses: actions/setup-go@v5
+
+      - run: rustup toolchain install stable --profile minimal
+
+      - name: Generate Acknowledgements
+        shell: bash
+        run: |
+          echo -e "# Open Source Acknowledgements\n\nSpice.ai acknowledges the following open source projects for making this project possible:\n\n" > acknowledgements.md
+          make -s generate-acknowledgements-go
+          make -s generate-acknowledgements-rust
+          sed -i 's/\"//g' acknowledgements.md
+          sed -i 's/,/, /g' acknowledgements.md
+          sed -i 's/,  /, /g' acknowledgements.md
+
+      - name: Create PR
+        run: |
+          git config --global user.name 'Spice Acknowledgements Bot'
+          git config --global user.email 'acknowledgements-bot@spice.ai'
+          git checkout -b acknowledgements/${GITHUB_RUN_ID}
+          git add acknowledgements.md
+          if [[ $(git status --porcelain) ]]; then
+            git commit -m "Update acknowledgements"
+            git push origin acknowledgements/${GITHUB_RUN_ID}
+            gh pr create --title "Update acknowledgements" --body "Updated OSS acknowledgements" --base trunk --head acknowledgements/${GITHUB_RUN_ID}
+          else
+            echo "No changes detected"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
