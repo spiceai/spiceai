@@ -92,10 +92,10 @@ pub fn get_secret_or_param(
     secret_key: &str,
     param_key: &str,
 ) -> Option<String> {
-    if let Some(pg_pass_val) = params.get(secret_key) {
+    if let Some(pg_param_val) = params.get(secret_key) {
         if let Some(secrets) = secret {
-            if let Some(pg_pass_secret) = secrets.get(pg_pass_val) {
-                return Some(pg_pass_secret.to_string());
+            if let Some(pg_secret) = secrets.get(pg_param_val) {
+                return Some(pg_secret.to_string());
             };
         };
     };
