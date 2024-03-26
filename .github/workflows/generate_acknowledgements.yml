@@ -3,6 +3,10 @@ name: Generate Acknowledgements
 on:
   workflow_dispatch:
 
+  pull_request:
+    branches:
+      - trunk
+
 jobs:
   generate:
     name: Generate Acknowledgements
@@ -21,7 +25,7 @@ jobs:
       - name: Generate Acknowledgements
         shell: bash
         run: |
-          make generate-acknowledgements
+          bash -c "make generate-acknowledgements"
 
       - name: Create PR
         run: |
