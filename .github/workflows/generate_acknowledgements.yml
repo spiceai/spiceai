@@ -1,0 +1,41 @@
+name: Generate Acknowledgements
+
+on:
+  workflow_dispatch:
+
+  pull_request:
+    branches:
+      - trunk
+
+jobs:
+  generate:
+    name: Generate Acknowledgements
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - uses: actions/setup-go@v5
+
+      - run: rustup toolchain install stable --profile minimal
+
+      - name: Generate Acknowledgements
+        shell: bash
+        run: |
+          make generate-acknowledgements
+
+      - name: Create PR
+        run: |
+          git config --global user.name 'Evgenii Khramkov'
+          git config --global user.email 'evgenii@spice.ai'
+          git checkout -b acknowledgements/${GITHUB_RUN_ID}
+          cat acknowledgements.md
+          git add acknowledgements.md
+          git commit -m "Update acknowledgements"
+          git push origin acknowledgements/${GITHUB_RUN_ID}
+          gh pr create --title "Update acknowledgements" --body "This PR updates the acknowledgements" --base trunk --head acknowledgements/${GITHUB_RUN_ID}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
