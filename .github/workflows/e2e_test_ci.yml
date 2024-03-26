@@ -34,7 +34,7 @@ jobs:
             const matrix = [
               {
                 name: "Linux x64",
-                runner: "rust",
+                runner: "ubuntu-latest",
                 target_os: "linux",
                 target_arch: "x86_64",
                 target_arch_go: "amd64"
@@ -108,34 +108,40 @@ jobs:
         with:
           go-version: ${{ env.GOVER }}
 
-      - name: Set up Rust
-        uses: ./.github/actions/setup-rust
+      - run: rustup toolchain install stable --profile minimal
+
+      - uses: Swatinem/rust-cache@v2
         with:
-          os: ${{ matrix.target.target_os }}
+          save-if: ${{ github.ref == 'refs/heads/trunk' }}
 
-      - name: Restore build cache (macOS)
-        if: matrix.target.target_os == 'darwin'
-        run: |
-          mkdir -p target
-          if [ -d /Users/spiceai/build/target ]; then
-            rsync -av /Users/spiceai/build/target/ target/
-          fi
+      # - name: Set up Rust
+      #   uses: ./.github/actions/setup-rust
+      #   with:
+      #     os: ${{ matrix.target.target_os }}
 
-      - name: Restore build cache (Linux)
-        if: matrix.target.target_os == 'linux'
-        run: |
-          mkdir -p target
-          if [ -d /home/spiceai/build/target ]; then
-            rsync -av /home/spiceai/build/target/ target/
-          fi
+      # - name: Restore build cache (macOS)
+      #   if: matrix.target.target_os == 'darwin'
+      #   run: |
+      #     mkdir -p target
+      #     if [ -d /Users/spiceai/build/target ]; then
+      #       rsync -av /Users/spiceai/build/target/ target/
+      #     fi
 
-      - name: Restore build cache (Windows)
-        if: matrix.target.target_os == 'windows'
-        run: |
-          mkdir -p target
-          if (Test-Path C:/spiceai/build/target) {
-            Copy-Item -Recurse -Force C:/spiceai/build/target/* target/
-          }
+      # - name: Restore build cache (Linux)
+      #   if: matrix.target.target_os == 'linux'
+      #   run: |
+      #     mkdir -p target
+      #     if [ -d /home/spiceai/build/target ]; then
+      #       rsync -av /home/spiceai/build/target/ target/
+      #     fi
+
+      # - name: Restore build cache (Windows)
+      #   if: matrix.target.target_os == 'windows'
+      #   run: |
+      #     mkdir -p target
+      #     if (Test-Path C:/spiceai/build/target) {
+      #       Copy-Item -Recurse -Force C:/spiceai/build/target/* target/
+      #     }
 
       - name: Build spiced
         run: make -C bin/spiced
