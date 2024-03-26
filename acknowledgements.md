@@ -1,8 +1,4 @@
-# Open Source Acknowledgements
-
-Spice.ai acknowledges the following open source projects for making this project possible:
-
-
+# Open Source Acknowledgements\n\nSpice.ai acknowledges the following open source projects for making this project possible:\n\n
 
 ## Go Modules
 
@@ -47,90 +43,289 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 
 ## Rust Crates
 
-| name | version | authors | repository | license | license_file | description |
-|------|---------|---------|------------|---------|--------------|-------------|
-| name | version | authors | repository | license | license_file | description |
-| ansi_term | 0.12.1 | ogham@bsago.me|Ryan Scheel (Havvy) <ryan.havvy@gmail.com>|Josh Triplett <josh@joshtriplett.org> | https://github.com/ogham/rust-ansi-term | MIT |  | Library for ANSI terminal colours and styles (bold, underline) |
-| arrow | 50.0.0 | Apache Arrow <dev@arrow.apache.org> | https://github.com/apache/arrow-rs | Apache-2.0 |  | Rust implementation of Apache Arrow |
-| arrow-flight | 50.0.0 | Apache Arrow <dev@arrow.apache.org> | https://github.com/apache/arrow-rs | Apache-2.0 |  | Apache Arrow Flight |
-| arrow-ipc | 49.0.0 | Apache Arrow <dev@arrow.apache.org> | https://github.com/apache/arrow-rs | Apache-2.0 |  | Support for the Arrow IPC format |
-| arrow-ipc | 50.0.0 | Apache Arrow <dev@arrow.apache.org> | https://github.com/apache/arrow-rs | Apache-2.0 |  | Support for the Arrow IPC format |
-| arrow-json | 50.0.0 | Apache Arrow <dev@arrow.apache.org> | https://github.com/apache/arrow-rs | Apache-2.0 |  | Support for parsing JSON format to and from the Arrow format |
-| async-stream | 0.3.5 | Carl Lerche <me@carllerche.com> | https://github.com/tokio-rs/async-stream | MIT |  | Asynchronous streams using async & await notation |
-| async-trait | 0.1.77 | David Tolnay <dtolnay@gmail.com> | https://github.com/dtolnay/async-trait | Apache-2.0 OR MIT |  | Type erasure for async trait methods |
-| aws-config | 1.1.8 | AWS Rust SDK Team <aws-sdk-rust@amazon.com>|Russell Cohen <rcoh@amazon.com> | https://github.com/smithy-lang/smithy-rs | Apache-2.0 |  | AWS SDK config and credential provider implementations. |
-| aws-types | 1.1.8 | AWS Rust SDK Team <aws-sdk-rust@amazon.com>|Russell Cohen <rcoh@amazon.com> | https://github.com/smithy-lang/smithy-rs | Apache-2.0 |  | Cross-service types for the AWS SDK. |
-| axum | 0.6.20 |  | https://github.com/tokio-rs/axum | MIT |  | Web framework that focuses on ergonomics and modularity |
-| axum | 0.7.4 |  | https://github.com/tokio-rs/axum | MIT |  | Web framework that focuses on ergonomics and modularity |
-| base64 | 0.13.1 | Alice Maz <alice@alicemaz.com>|Marshall Pierce <marshall@mpierce.org> | https://github.com/marshallpierce/rust-base64 | Apache-2.0 OR MIT |  | encodes and decodes base64 as bytes or utf8 |
-| base64 | 0.21.7 | Alice Maz <alice@alicemaz.com>|Marshall Pierce <marshall@mpierce.org> | https://github.com/marshallpierce/rust-base64 | Apache-2.0 OR MIT |  | encodes and decodes base64 as bytes or utf8 |
-| base64 | 0.22.0 | Alice Maz <alice@alicemaz.com>|Marshall Pierce <marshall@mpierce.org> | https://github.com/marshallpierce/rust-base64 | Apache-2.0 OR MIT |  | encodes and decodes base64 as bytes or utf8 |
-| bb8 | 0.8.3 |  | https://github.com/djc/bb8 | MIT |  | Full-featured async (tokio-based) connection pool (like r2d2) |
-| bb8-postgres | 0.8.1 |  | https://github.com/djc/bb8 | MIT |  | Full-featured async (tokio-based) postgres connection pool (like r2d2) |
-| bigdecimal | 0.3.1 | Andrew Kubera | https://github.com/akubera/bigdecimal-rs | Apache-2.0 OR MIT |  | Arbitrary precision decimal numbers |
-| bigdecimal | 0.4.3 | Andrew Kubera | https://github.com/akubera/bigdecimal-rs | Apache-2.0 OR MIT |  | Arbitrary precision decimal numbers |
-| bytes | 1.5.0 | Carl Lerche <me@carllerche.com>|Sean McArthur <sean@seanmonstar.com> | https://github.com/tokio-rs/bytes | MIT |  | Types and traits for working with bytes |
-| chrono | 0.4.35 |  | https://github.com/chronotope/chrono | Apache-2.0 OR MIT |  | Date and time library for Rust |
-| clap | 4.5.2 |  | https://github.com/clap-rs/clap | Apache-2.0 OR MIT |  | A simple to use, efficient, and full-featured Command Line Argument Parser |
-| csv | 1.3.0 | Andrew Gallant <jamslam@gmail.com> | https://github.com/BurntSushi/rust-csv | MIT OR Unlicense |  | Fast CSV parsing with support for serde. |
-| datafusion | 35.0.0 | Apache Arrow <dev@arrow.apache.org> | https://github.com/apache/arrow-datafusion | Apache-2.0 |  | DataFusion is an in-memory query engine that uses Apache Arrow as the memory model |
-| deltalake | 0.17.0 | Qingping Hou <dave2008713@gmail.com> | https://github.com/delta-io/delta.rs | Apache-2.0 |  | Native Delta Lake implementation in Rust |
-| dirs | 5.0.1 | Simon Ochsenreither <simon@ochsenreither.de> | https://github.com/soc/dirs-rs | Apache-2.0 OR MIT |  | A tiny low-level library that provides platform-specific standard locations of directories for config, cache and other data on Linux, Windows, macOS and Redox by leveraging the mechanisms defined by the XDG base/user directory specifications on Linux, the Known Folder API on Windows, and the Standard Directory guidelines on macOS. |
-| duckdb | 0.10.1 | wangfenjin <wangfenj@gmail.com> | https://github.com/wangfenjin/duckdb-rs | MIT |  | Ergonomic wrapper for DuckDB |
-| fundu | 2.0.0 | Joining7943 <joining@posteo.de> | https://github.com/fundu-rs/fundu | MIT |  | Configurable, precise and fast rust string parser to a Duration |
-| futures | 0.3.30 |  | https://github.com/rust-lang/futures-rs | Apache-2.0 OR MIT |  | An implementation of futures and streams featuring zero allocations, composability, and iterator-like interfaces. |
-| futures-core | 0.3.30 |  | https://github.com/rust-lang/futures-rs | Apache-2.0 OR MIT |  | The core traits and types in for the `futures` library. |
-| indexmap | 1.9.3 |  | https://github.com/bluss/indexmap | Apache-2.0 OR MIT |  | A hash table with consistent order and fast iteration. |
-| indexmap | 2.2.5 |  | https://github.com/indexmap-rs/indexmap | Apache-2.0 OR MIT |  | A hash table with consistent order and fast iteration. |
-| itertools | 0.10.5 | bluss | https://github.com/rust-itertools/itertools | Apache-2.0 OR MIT |  | Extra iterator adaptors, iterator methods, free functions, and macros. |
-| itertools | 0.11.0 | bluss | https://github.com/rust-itertools/itertools | Apache-2.0 OR MIT |  | Extra iterator adaptors, iterator methods, free functions, and macros. |
-| itertools | 0.12.1 | bluss | https://github.com/rust-itertools/itertools | Apache-2.0 OR MIT |  | Extra iterator adaptors, iterator methods, free functions, and macros. |
-| keyring | 2.3.2 | Walther Chen <walther.chen@gmail.com>|Daniel Brotsky <dev@brotsky.com> | https://github.com/hwchen/keyring-rs.git | Apache-2.0 OR MIT |  | Cross-platform library for managing passwords/credentials |
-| lazy_static | 1.4.0 | Marvin Löbel <loebel.marvin@gmail.com> | https://github.com/rust-lang-nursery/lazy-static.rs | Apache-2.0 OR MIT |  | A macro for declaring lazily evaluated statics in Rust. |
-| metrics | 0.22.1 | Toby Lawrence <toby@nuclearfurnace.com> | https://github.com/metrics-rs/metrics | MIT |  | A lightweight metrics facade. |
-| metrics-exporter-prometheus | 0.13.1 | Toby Lawrence <toby@nuclearfurnace.com> | https://github.com/metrics-rs/metrics | MIT |  | A metrics-compatible exporter for sending metrics to Prometheus. |
-| ndarray | 0.15.6 | Ulrik Sverdrup bluss|Jim Turner | https://github.com/rust-ndarray/ndarray | Apache-2.0 OR MIT |  | An n-dimensional array for general elements and for numerics. Lightweight array views and slicing; views support chunking and splitting. |
-| ndarray-npy | 0.8.1 | Jim Turner <ndarray-npy@turner.link> | https://github.com/jturner314/ndarray-npy | Apache-2.0 OR MIT |  | .npy and .npz file format support for ndarray |
-| notify | 6.1.1 | Félix Saparelli <me@passcod.name>|Daniel Faust <hessijames@gmail.com>|Aron Heinecke <Ox0p54r36@t-online.de> | https://github.com/notify-rs/notify.git | CC0-1.0 |  | Cross-platform filesystem notification library |
-| object_store | 0.9.1 |  | https://github.com/apache/arrow-rs/tree/master/object_store | Apache-2.0 OR MIT |  | A generic object store interface for uniformly interacting with AWS S3, Google Cloud Storage, Azure Blob Storage and local files. |
-| once_cell | 1.19.0 | Aleksey Kladov <aleksey.kladov@gmail.com> | https://github.com/matklad/once_cell | Apache-2.0 OR MIT |  | Single assignment cells and lazy values. |
-| opentelemetry-proto | 0.4.0 |  | https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-proto | Apache-2.0 |  | Protobuf generated files and transformations. |
-| parquet | 49.0.0 | Apache Arrow <dev@arrow.apache.org> | https://github.com/apache/arrow-rs | Apache-2.0 |  | Apache Parquet implementation in Rust |
-| parquet | 50.0.0 | Apache Arrow <dev@arrow.apache.org> | https://github.com/apache/arrow-rs | Apache-2.0 |  | Apache Parquet implementation in Rust |
-| pin-project | 1.1.5 |  | https://github.com/taiki-e/pin-project | Apache-2.0 OR MIT |  | A crate for safe and ergonomic pin-projection. |
-| prost | 0.11.9 | Dan Burkert <dan@danburkert.com>|Lucio Franco <luciofranco14@gmail.com|Tokio Contributors <team@tokio.rs> | https://github.com/tokio-rs/prost | Apache-2.0 |  | A Protocol Buffers implementation for the Rust Language. |
-| prost | 0.12.3 | Dan Burkert <dan@danburkert.com>|Lucio Franco <luciofranco14@gmail.com|Tokio Contributors <team@tokio.rs> | https://github.com/tokio-rs/prost | Apache-2.0 |  | A Protocol Buffers implementation for the Rust Language. |
-| quick-xml | 0.23.1 |  | https://github.com/tafia/quick-xml | MIT |  | High performance xml reader and writer |
-| quick-xml | 0.31.0 |  | https://github.com/tafia/quick-xml | MIT |  | High performance xml reader and writer |
-| r2d2 | 0.8.10 | Steven Fackler <sfackler@gmail.com> | https://github.com/sfackler/r2d2 | Apache-2.0 OR MIT |  | A generic connection pool |
-| regex | 1.10.3 | The Rust Project Developers|Andrew Gallant <jamslam@gmail.com> | https://github.com/rust-lang/regex | Apache-2.0 OR MIT |  | An implementation of regular expressions for Rust. This implementation uses finite automata and guarantees linear time matching on all inputs. |
-| reqwest | 0.11.26 | Sean McArthur <sean@seanmonstar.com> | https://github.com/seanmonstar/reqwest | Apache-2.0 OR MIT |  | higher level HTTP client library |
-| rusqlite | 0.31.0 | The rusqlite developers | https://github.com/rusqlite/rusqlite | MIT |  | Ergonomic wrapper for SQLite |
-| rustls | 0.19.1 | Joseph Birr-Pixton <jpixton@gmail.com> | https://github.com/ctz/rustls | Apache-2.0 OR ISC OR MIT |  | Rustls is a modern TLS library written in Rust. |
-| rustls | 0.21.10 |  | https://github.com/rustls/rustls | Apache-2.0 OR ISC OR MIT |  | Rustls is a modern TLS library written in Rust. |
-| rustls-native-certs | 0.5.0 | Joseph Birr-Pixton <jpixton@gmail.com> | https://github.com/ctz/rustls-native-certs | Apache-2.0 OR ISC OR MIT |  | rustls-native-certs allows rustls to use the platform native certificate store |
-| rustls-native-certs | 0.6.3 |  | https://github.com/ctz/rustls-native-certs | Apache-2.0 OR ISC OR MIT |  | rustls-native-certs allows rustls to use the platform native certificate store |
-| rustls-pemfile | 1.0.4 |  | https://github.com/rustls/pemfile | Apache-2.0 OR ISC OR MIT |  | Basic .pem file parser for keys and certificates |
-| rustyline | 13.0.0 | Katsu Kawakami <kkawa1570@gmail.com> | https://github.com/kkawakam/rustyline | MIT |  | Rustyline, a readline implementation based on Antirez's Linenoise |
-| sea-query | 0.30.7 | Chris Tsang <chris.2y3@outlook.com>|Billy Chan <ccw.billy.123@gmail.com>|Ivan Krivosheev <py.krivosheev@gmail.com> | https://github.com/SeaQL/sea-query | Apache-2.0 OR MIT |  | 🔱 A dynamic query builder for MySQL, Postgres and SQLite |
-| secrecy | 0.8.0 | Tony Arcieri <tony@iqlusion.io> | https://github.com/iqlusioninc/crates/tree/main/secrecy | Apache-2.0 OR MIT |  | Wrapper types and traits for secret management which help ensure they aren't accidentally copied, logged, or otherwise exposed (as much as possible), and also ensure secrets are securely wiped from memory when dropped. |
-| serde | 1.0.197 | Erick Tryzelaar <erick.tryzelaar@gmail.com>|David Tolnay <dtolnay@gmail.com> | https://github.com/serde-rs/serde | Apache-2.0 OR MIT |  | A generic serialization/deserialization framework |
-| serde_json | 1.0.114 | Erick Tryzelaar <erick.tryzelaar@gmail.com>|David Tolnay <dtolnay@gmail.com> | https://github.com/serde-rs/json | Apache-2.0 OR MIT |  | A JSON serialization file format |
-| serde_yaml | 0.9.32 | David Tolnay <dtolnay@gmail.com> | https://github.com/dtolnay/serde-yaml | Apache-2.0 OR MIT |  | YAML data format for Serde |
-| snafu | 0.7.5 | Jake Goulding <jake.goulding@gmail.com> | https://github.com/shepmaster/snafu | Apache-2.0 OR MIT |  | An ergonomic error handling library |
-| snafu | 0.8.2 | Jake Goulding <jake.goulding@gmail.com> | https://github.com/shepmaster/snafu | Apache-2.0 OR MIT |  | An ergonomic error handling library |
-| time | 0.3.34 | Jacob Pratt <open-source@jhpratt.dev>|Time contributors | https://github.com/time-rs/time | Apache-2.0 OR MIT |  | Date and time library. Fully interoperable with the standard library. Mostly compatible with #![no_std]. |
-| tokio | 1.36.0 | Tokio Contributors <team@tokio.rs> | https://github.com/tokio-rs/tokio | MIT |  | An event-driven, non-blocking I/O platform for writing asynchronous I/O backed applications. |
-| tokio-postgres | 0.7.10 | Steven Fackler <sfackler@gmail.com> | https://github.com/sfackler/rust-postgres | Apache-2.0 OR MIT |  | A native, asynchronous PostgreSQL client |
-| tokio-rusqlite | 0.5.1 | Programatik <programatik29@gmail.com>|Adi Salimgereev <adisalimgereev@gmail.com> | https://github.com/programatik29/tokio-rusqlite | MIT |  | Asynchronous handle for rusqlite library. |
-| tokio-stream | 0.1.15 | Tokio Contributors <team@tokio.rs> | https://github.com/tokio-rs/tokio | MIT |  | Utilities to work with `Stream` and `tokio`. |
-| toml | 0.8.11 | Alex Crichton <alex@alexcrichton.com> | https://github.com/toml-rs/toml | Apache-2.0 OR MIT |  | A native Rust encoder and decoder of TOML-formatted files and streams. Provides implementations of the standard Serialize/Deserialize traits for TOML data to facilitate deserializing and serializing Rust structures. |
-| tonic | 0.9.2 | Lucio Franco <luciofranco14@gmail.com> | https://github.com/hyperium/tonic | MIT |  | A gRPC over HTTP/2 implementation focused on high performance, interoperability, and flexibility. |
-| tonic | 0.10.2 | Lucio Franco <luciofranco14@gmail.com> | https://github.com/hyperium/tonic | MIT |  | A gRPC over HTTP/2 implementation focused on high performance, interoperability, and flexibility. |
-| tonic-health | 0.9.2 | James Nugent <james@jen20.com> | https://github.com/hyperium/tonic | MIT |  | Health Checking module of `tonic` gRPC implementation. |
-| tracing | 0.1.40 | Eliza Weisman <eliza@buoyant.io>|Tokio Contributors <team@tokio.rs> | https://github.com/tokio-rs/tracing | MIT |  | Application-level tracing for Rust. |
-| tracing-subscriber | 0.3.18 | Eliza Weisman <eliza@buoyant.io>|David Barsky <me@davidbarsky.com>|Tokio Contributors <team@tokio.rs> | https://github.com/tokio-rs/tracing | MIT |  | Utilities for implementing and composing `tracing` subscribers. |
-| tract-core | 0.21.1 | Mathieu Poumeyrol <kali@zoy.org> | https://github.com/snipsco/tract | Apache-2.0 OR MIT |  | Tiny, no-nonsense, self contained, TensorFlow and ONNX inference |
-| tract-onnx | 0.21.1 | Mathieu Poumeyrol <kali@zoy.org> | https://github.com/snipsco/tract | Apache-2.0 OR MIT |  | Tiny, no-nonsense, self contained, TensorFlow and ONNX inference |
-| url | 2.5.0 | The rust-url developers | https://github.com/servo/rust-url | Apache-2.0 OR MIT |  | URL library for Rust, based on the WHATWG URL Standard |
-| uuid | 1.7.0 | Ashley Mannix<ashleymannix@live.com.au>|Christopher Armstrong|Dylan DPC<dylan.dpc@gmail.com>|Hunar Roop Kahlon<hunar.roop@gmail.com> | https://github.com/uuid-rs/uuid | Apache-2.0 OR MIT |  | A library to generate and parse UUIDs. |
+- name version, license license_file
+  <br/>repository
+
+- ansi_term 0.12.1, MIT 
+  <br/>https://github.com/ogham/rust-ansi-term
+
+- app 0.10.0-alpha, Apache-2.0 
+
+- arrow 50.0.0, Apache-2.0 
+  <br/>https://github.com/apache/arrow-rs
+
+- arrow-flight 50.0.0, Apache-2.0 
+  <br/>https://github.com/apache/arrow-rs
+
+- arrow-ipc 49.0.0, Apache-2.0 
+  <br/>https://github.com/apache/arrow-rs
+
+- arrow-ipc 50.0.0, Apache-2.0 
+  <br/>https://github.com/apache/arrow-rs
+
+- arrow-json 50.0.0, Apache-2.0 
+  <br/>https://github.com/apache/arrow-rs
+
+- arrow_sql_gen 0.10.0-alpha, Apache-2.0 
+
+- async-stream 0.3.5, MIT 
+  <br/>https://github.com/tokio-rs/async-stream
+
+- async-trait 0.1.77, Apache-2.0 OR MIT 
+  <br/>https://github.com/dtolnay/async-trait
+
+- aws-config 1.1.8, Apache-2.0 
+  <br/>https://github.com/smithy-lang/smithy-rs
+
+- aws-types 1.1.8, Apache-2.0 
+  <br/>https://github.com/smithy-lang/smithy-rs
+
+- axum 0.6.20, MIT 
+  <br/>https://github.com/tokio-rs/axum
+
+- axum 0.7.4, MIT 
+  <br/>https://github.com/tokio-rs/axum
+
+- base64 0.13.1, Apache-2.0 OR MIT 
+  <br/>https://github.com/marshallpierce/rust-base64
+
+- base64 0.21.7, Apache-2.0 OR MIT 
+  <br/>https://github.com/marshallpierce/rust-base64
+
+- base64 0.22.0, Apache-2.0 OR MIT 
+  <br/>https://github.com/marshallpierce/rust-base64
+
+- bb8 0.8.3, MIT 
+  <br/>https://github.com/djc/bb8
+
+- bb8-postgres 0.8.1, MIT 
+  <br/>https://github.com/djc/bb8
+
+- bigdecimal 0.3.1, Apache-2.0 OR MIT 
+  <br/>https://github.com/akubera/bigdecimal-rs
+
+- bigdecimal 0.4.3, Apache-2.0 OR MIT 
+  <br/>https://github.com/akubera/bigdecimal-rs
+
+- bytes 1.5.0, MIT 
+  <br/>https://github.com/tokio-rs/bytes
+
+- chrono 0.4.35, Apache-2.0 OR MIT 
+  <br/>https://github.com/chronotope/chrono
+
+- clap 4.5.2, Apache-2.0 OR MIT 
+  <br/>https://github.com/clap-rs/clap
+
+- csv 1.3.0, MIT OR Unlicense 
+  <br/>https://github.com/BurntSushi/rust-csv
+
+- datafusion 35.0.0, Apache-2.0 
+  <br/>https://github.com/apache/arrow-datafusion
+
+- db_connection_pool 0.10.0-alpha, Apache-2.0 
+
+- deltalake 0.17.0, Apache-2.0 
+  <br/>https://github.com/delta-io/delta.rs
+
+- dirs 5.0.1, Apache-2.0 OR MIT 
+  <br/>https://github.com/soc/dirs-rs
+
+- duckdb 0.10.1, MIT 
+  <br/>https://github.com/wangfenjin/duckdb-rs
+
+- flight_client 0.10.0-alpha, Apache-2.0 
+
+- flight_datafusion 0.10.0-alpha, Apache-2.0 
+
+- flightpublisher 0.10.0-alpha, Apache-2.0 
+
+- flightrepl 0.10.0-alpha, Apache-2.0 
+
+- flightsql_datafusion 0.10.0-alpha, Apache-2.0 
+
+- flightsubscriber 0.10.0-alpha, Apache-2.0 
+
+- fundu 2.0.0, MIT 
+  <br/>https://github.com/fundu-rs/fundu
+
+- futures 0.3.30, Apache-2.0 OR MIT 
+  <br/>https://github.com/rust-lang/futures-rs
+
+- futures-core 0.3.30, Apache-2.0 OR MIT 
+  <br/>https://github.com/rust-lang/futures-rs
+
+- indexmap 1.9.3, Apache-2.0 OR MIT 
+  <br/>https://github.com/bluss/indexmap
+
+- indexmap 2.2.5, Apache-2.0 OR MIT 
+  <br/>https://github.com/indexmap-rs/indexmap
+
+- itertools 0.10.5, Apache-2.0 OR MIT 
+  <br/>https://github.com/rust-itertools/itertools
+
+- itertools 0.11.0, Apache-2.0 OR MIT 
+  <br/>https://github.com/rust-itertools/itertools
+
+- itertools 0.12.1, Apache-2.0 OR MIT 
+  <br/>https://github.com/rust-itertools/itertools
+
+- keyring 2.3.2, Apache-2.0 OR MIT 
+  <br/>https://github.com/hwchen/keyring-rs.git
+
+- lazy_static 1.4.0, Apache-2.0 OR MIT 
+  <br/>https://github.com/rust-lang-nursery/lazy-static.rs
+
+- metrics 0.22.1, MIT 
+  <br/>https://github.com/metrics-rs/metrics
+
+- metrics-exporter-prometheus 0.13.1, MIT 
+  <br/>https://github.com/metrics-rs/metrics
+
+- ndarray 0.15.6, Apache-2.0 OR MIT 
+  <br/>https://github.com/rust-ndarray/ndarray
+
+- ndarray-npy 0.8.1, Apache-2.0 OR MIT 
+  <br/>https://github.com/jturner314/ndarray-npy
+
+- notify 6.1.1, CC0-1.0 
+  <br/>https://github.com/notify-rs/notify.git
+
+- object_store 0.9.1, Apache-2.0 OR MIT 
+  <br/>https://github.com/apache/arrow-rs/tree/master/object_store
+
+- once_cell 1.19.0, Apache-2.0 OR MIT 
+  <br/>https://github.com/matklad/once_cell
+
+- opentelemetry-proto 0.4.0, Apache-2.0 
+  <br/>https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-proto
+
+- parquet 49.0.0, Apache-2.0 
+  <br/>https://github.com/apache/arrow-rs
+
+- parquet 50.0.0, Apache-2.0 
+  <br/>https://github.com/apache/arrow-rs
+
+- pin-project 1.1.5, Apache-2.0 OR MIT 
+  <br/>https://github.com/taiki-e/pin-project
+
+- prost 0.11.9, Apache-2.0 
+  <br/>https://github.com/tokio-rs/prost
+
+- prost 0.12.3, Apache-2.0 
+  <br/>https://github.com/tokio-rs/prost
+
+- quick-xml 0.23.1, MIT 
+  <br/>https://github.com/tafia/quick-xml
+
+- quick-xml 0.31.0, MIT 
+  <br/>https://github.com/tafia/quick-xml
+
+- r2d2 0.8.10, Apache-2.0 OR MIT 
+  <br/>https://github.com/sfackler/r2d2
+
+- regex 1.10.3, Apache-2.0 OR MIT 
+  <br/>https://github.com/rust-lang/regex
+
+- reqwest 0.11.26, Apache-2.0 OR MIT 
+  <br/>https://github.com/seanmonstar/reqwest
+
+- runtime 0.10.0-alpha, Apache-2.0 
+
+- rusqlite 0.31.0, MIT 
+  <br/>https://github.com/rusqlite/rusqlite
+
+- rustls 0.19.1, Apache-2.0 OR ISC OR MIT 
+  <br/>https://github.com/ctz/rustls
+
+- rustls 0.21.10, Apache-2.0 OR ISC OR MIT 
+  <br/>https://github.com/rustls/rustls
+
+- rustls-native-certs 0.5.0, Apache-2.0 OR ISC OR MIT 
+  <br/>https://github.com/ctz/rustls-native-certs
+
+- rustls-native-certs 0.6.3, Apache-2.0 OR ISC OR MIT 
+  <br/>https://github.com/ctz/rustls-native-certs
+
+- rustls-pemfile 1.0.4, Apache-2.0 OR ISC OR MIT 
+  <br/>https://github.com/rustls/pemfile
+
+- rustyline 13.0.0, MIT 
+  <br/>https://github.com/kkawakam/rustyline
+
+- sea-query 0.30.7, Apache-2.0 OR MIT 
+  <br/>https://github.com/SeaQL/sea-query
+
+- secrecy 0.8.0, Apache-2.0 OR MIT 
+  <br/>https://github.com/iqlusioninc/crates/tree/main/secrecy
+
+- secrets 0.10.0-alpha, Apache-2.0 
+
+- serde 1.0.197, Apache-2.0 OR MIT 
+  <br/>https://github.com/serde-rs/serde
+
+- serde_json 1.0.114, Apache-2.0 OR MIT 
+  <br/>https://github.com/serde-rs/json
+
+- serde_yaml 0.9.32, Apache-2.0 OR MIT 
+  <br/>https://github.com/dtolnay/serde-yaml
+
+- snafu 0.7.5, Apache-2.0 OR MIT 
+  <br/>https://github.com/shepmaster/snafu
+
+- snafu 0.8.2, Apache-2.0 OR MIT 
+  <br/>https://github.com/shepmaster/snafu
+
+- spiced 0.10.0-alpha, Apache-2.0 
+
+- spicepod 0.10.0-alpha, Apache-2.0 
+
+- sql_provider_datafusion 0.10.0-alpha, Apache-2.0 
+
+- time 0.3.34, Apache-2.0 OR MIT 
+  <br/>https://github.com/time-rs/time
+
+- tokio 1.36.0, MIT 
+  <br/>https://github.com/tokio-rs/tokio
+
+- tokio-postgres 0.7.10, Apache-2.0 OR MIT 
+  <br/>https://github.com/sfackler/rust-postgres
+
+- tokio-rusqlite 0.5.1, MIT 
+  <br/>https://github.com/programatik29/tokio-rusqlite
+
+- tokio-stream 0.1.15, MIT 
+  <br/>https://github.com/tokio-rs/tokio
+
+- toml 0.8.11, Apache-2.0 OR MIT 
+  <br/>https://github.com/toml-rs/toml
+
+- tonic 0.9.2, MIT 
+  <br/>https://github.com/hyperium/tonic
+
+- tonic 0.10.2, MIT 
+  <br/>https://github.com/hyperium/tonic
+
+- tonic-health 0.9.2, MIT 
+  <br/>https://github.com/hyperium/tonic
+
+- tracing 0.1.40, MIT 
+  <br/>https://github.com/tokio-rs/tracing
+
+- tracing-subscriber 0.3.18, MIT 
+  <br/>https://github.com/tokio-rs/tracing
+
+- tract-core 0.21.1, Apache-2.0 OR MIT 
+  <br/>https://github.com/snipsco/tract
+
+- tract-onnx 0.21.1, Apache-2.0 OR MIT 
+  <br/>https://github.com/snipsco/tract
+
+- url 2.5.0, Apache-2.0 OR MIT 
+  <br/>https://github.com/servo/rust-url
+
+- uuid 1.7.0, Apache-2.0 OR MIT 
+  <br/>https://github.com/uuid-rs/uuid
+
+- make[1]: Leaving directory '/home/runner/work/spiceai/spiceai' ,  
+  <br/>
+
