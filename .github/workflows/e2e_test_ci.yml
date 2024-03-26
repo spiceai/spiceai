@@ -88,13 +88,13 @@ jobs:
         #   }) }}"
 
   build:
-    name: Build ${{ matrix.name }} binaries
-    runs-on: ${{ matrix.runner }}
+    name: Build ${{ matrix.object.name }} binaries
+    runs-on: ${{ matrix.object.runner }}
     needs: setup-matrix
     env:
       GOVER: 1.22
-      GOOS: ${{ matrix.target_os }}
-      GOARCH: ${{ matrix.target_arch_go }}
+      GOOS: ${{ matrix.object.target_os }}
+      GOARCH: ${{ matrix.object.target_arch_go }}
 
     strategy:
       matrix:
@@ -210,14 +210,16 @@ jobs:
             spiced
 
   test_quickstart_dremio:
-    name: "E2E Test: Dremio quickstart, using ${{ matrix.target_os }}-${{ matrix.target_arch }}"
-    runs-on: ${{ matrix.runner }}
-    needs: build
+    name: "E2E Test: Dremio quickstart, using ${{ matrix.object.target_os }}-${{ matrix.object.target_arch }}"
+    runs-on: ${{ matrix.object.runner }}
+    needs:
+      - build
+      - setup-matrix
 
     strategy:
       fail-fast: false
       matrix:
-        object: ${{ fromJson(needs.setup-matrix.outputs.matrix_build) }}
+        object: ${{ fromJson(needs.setup-matrix.outputs.matrix_test) }}
 
         # include:
         #   - name: Linux x64
