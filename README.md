@@ -315,10 +315,11 @@ spice init s3-demo-project
 ```
 
 ```bash
+cd s3-demo-project
 spice run
 ```
 
-**Step 3.** We now configure the dataset from S3:
+**Step 2.** We now configure the dataset from S3:
 
 ```bash
 spice dataset configure
@@ -361,7 +362,7 @@ If the login credentials were entered correctly, your dataset will have loaded i
 2024-02-14T18:34:15.175189Z  INFO runtime::datasource: Refreshing data for taxi_trips
 ```
 
-**Step 4.** Run queries against the dataset using the Spice SQL REPL.
+**Step 3.** Run queries against the dataset using the Spice SQL REPL.
 
 In a new terminal, start the Spice SQL REPL
 
