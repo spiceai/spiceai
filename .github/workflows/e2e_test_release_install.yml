@@ -3,10 +3,6 @@ name: E2E Test Release Installation
 on:
   workflow_dispatch:
 
-  # pull_request:
-  #   branches:
-  #     - trunk
-
 jobs:
   test-install:
     name: install on ${{ matrix.name }}
