@@ -28,8 +28,8 @@ jobs:
 
       - name: Create PR
         run: |
-          git config --global user.name 'Spice Acknowledgements Bot'
-          git config --global user.email 'acknowledgements-bot@spice.ai'
+          git config --global user.name 'Evgenii Khramkov'
+          git config --global user.email 'evgenii@spice.ai'
           git checkout -b acknowledgements/${GITHUB_JOB}
           cat acknowledgements.md
           git add acknowledgements.md
