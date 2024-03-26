@@ -170,7 +170,7 @@ spice login postgres engine --password <password>
 
 # See more at: https://docs.spiceai.org/
 `,
-	Run: CreateLoginRunFunc(api.AUTH_TYPE_POSTGRES, map[string]string{
+	Run: CreateLoginRunFunc(api.AUTH_TYPE_POSTGRES_ENGINE, map[string]string{
 		passwordFlag: fmt.Sprintf("No password provided, use --%s or -p to provide a password", passwordFlag),
 	}, map[string]string{
 		passwordFlag: api.AUTH_PARAM_PG_PASSWORD,
