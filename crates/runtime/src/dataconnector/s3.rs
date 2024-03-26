@@ -99,6 +99,8 @@ impl DataConnector for S3 {
             if let Some(secret) = secret.get("secret") {
                 s3_builder = s3_builder.with_secret_access_key(secret);
             };
+        } else {
+            s3_builder = s3_builder.with_skip_signature(true)
         };
 
         let s3 = s3_builder

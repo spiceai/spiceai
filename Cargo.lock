@@ -170,7 +170,7 @@ checksum = "d301b3b94cb4b2f23d7917810addbbaff90738e0ca2be692bd027e70d7e0330c"
 
 [[package]]
 name = "app"
-version = "0.9.1-alpha"
+version = "0.10.0-alpha"
 dependencies = [
  "snafu 0.8.2",
  "spicepod",
@@ -528,7 +528,7 @@ dependencies = [
 
 [[package]]
 name = "arrow_sql_gen"
-version = "0.9.1-alpha"
+version = "0.10.0-alpha"
 dependencies = [
  "arrow",
  "bigdecimal 0.3.1",
@@ -2030,7 +2030,7 @@ dependencies = [
 
 [[package]]
 name = "db_connection_pool"
-version = "0.9.1-alpha"
+version = "0.10.0-alpha"
 dependencies = [
  "arrow",
  "arrow_sql_gen",
@@ -2530,7 +2530,7 @@ dependencies = [
 
 [[package]]
 name = "flight_client"
-version = "0.9.1-alpha"
+version = "0.10.0-alpha"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -2547,7 +2547,7 @@ dependencies = [
 
 [[package]]
 name = "flight_datafusion"
-version = "0.9.1-alpha"
+version = "0.10.0-alpha"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -2565,7 +2565,7 @@ dependencies = [
 
 [[package]]
 name = "flightpublisher"
-version = "0.9.1-alpha"
+version = "0.10.0-alpha"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -2579,7 +2579,7 @@ dependencies = [
 
 [[package]]
 name = "flightrepl"
-version = "0.9.1-alpha"
+version = "0.10.0-alpha"
 dependencies = [
  "ansi_term",
  "arrow",
@@ -2599,7 +2599,7 @@ dependencies = [
 
 [[package]]
 name = "flightsql_datafusion"
-version = "0.9.1-alpha"
+version = "0.10.0-alpha"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -2618,7 +2618,7 @@ dependencies = [
 
 [[package]]
 name = "flightsubscriber"
-version = "0.9.1-alpha"
+version = "0.10.0-alpha"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -4972,7 +4972,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "0.9.1-alpha"
+version = "0.10.0-alpha"
 dependencies = [
  "app",
  "arrow",
@@ -5452,7 +5452,7 @@ dependencies = [
 
 [[package]]
 name = "secrets"
-version = "0.9.1-alpha"
+version = "0.10.0-alpha"
 dependencies = [
  "async-trait",
  "base64 0.22.0",
@@ -5752,7 +5752,7 @@ dependencies = [
 
 [[package]]
 name = "spiced"
-version = "0.9.1-alpha"
+version = "0.10.0-alpha"
 dependencies = [
  "app",
  "clap",
@@ -5770,7 +5770,7 @@ dependencies = [
 
 [[package]]
 name = "spicepod"
-version = "0.9.1-alpha"
+version = "0.10.0-alpha"
 dependencies = [
  "fundu",
  "serde",
@@ -5793,7 +5793,7 @@ checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
 
 [[package]]
 name = "sql_provider_datafusion"
-version = "0.9.1-alpha"
+version = "0.10.0-alpha"
 dependencies = [
  "async-trait",
  "datafusion",
