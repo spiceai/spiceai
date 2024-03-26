@@ -192,10 +192,10 @@ jobs:
         object: ${{ fromJson(needs.setup-matrix.outputs.matrix_test) }}
 
     steps:
-      - name: download artifacts - build_${{ matrix.target_os }}_${{ matrix.target_arch }}
+      - name: download artifacts - build_${{ matrix.object.target_os }}_${{ matrix.object.target_arch }}
         uses: actions/download-artifact@v4
         with:
-          name: build_${{ matrix.target_os }}_${{ matrix.target_arch }}
+          name: build_${{ matrix.object.target_os }}_${{ matrix.object.target_arch }}
           path: ./build
 
       - name: Install spice
