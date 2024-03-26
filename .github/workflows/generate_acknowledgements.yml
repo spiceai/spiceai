@@ -30,3 +30,5 @@ jobs:
           cat acknowledgements.md
           git add acknowledgements.md
           git commit -m "Update acknowledgements"
+          git push origin acknowledgements/${GITHUB_JOB}
+          gh pr create --title "Update acknowledgements" --body "This PR updates the acknowledgements" --base trunk --head acknowledgements/${GITHUB_JOB}
