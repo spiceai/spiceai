@@ -11,6 +11,9 @@ jobs:
   generate:
     name: Generate Acknowledgements
     runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+
     steps:
       - uses: actions/checkout@v3
 
@@ -23,7 +26,8 @@ jobs:
         run: |
           make generate-acknowledgements
 
-      - run: |
+      - name: Create PR
+        run: |
           git config --global user.name 'Spice Acknowledgements Bot'
           git config --global user.email 'acknowledgements-bot@spice.ai'
           git checkout -b acknowledgements/${GITHUB_JOB}
@@ -32,3 +36,5 @@ jobs:
           git commit -m "Update acknowledgements"
           git push origin acknowledgements/${GITHUB_JOB}
           gh pr create --title "Update acknowledgements" --body "This PR updates the acknowledgements" --base trunk --head acknowledgements/${GITHUB_JOB}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
