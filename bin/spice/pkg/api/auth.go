@@ -1,10 +1,13 @@
 package api
 
 const (
-	AUTH_TYPE_SPICE_AI = "spiceai"
-	AUTH_TYPE_DREMIO   = "dremio"
-	AUTH_TYPE_S3       = "s3"
-	AUTH_TYPE_DATABRICKS = "databricks"
+	AUTH_TYPE_SPICE_AI        = "spiceai"
+	AUTH_TYPE_DREMIO          = "dremio"
+	AUTH_TYPE_S3              = "s3"
+	AUTH_TYPE_DATABRICKS      = "databricks"
+	AUTH_TYPE_POSTGRES        = "postgres"
+	AUTH_TYPE_POSTGRES_ENGINE = "postgres_engine"
+	AUTH_PARAM_PG_PASSWORD    = "pg_pass"
 
 	AUTH_PARAM_KEY      = "key"
 	AUTH_PARAM_PASSWORD = "password"
@@ -14,7 +17,7 @@ const (
 	AUTH_PARAM_AWS_DEFAULT_REGION    = "AWS_DEFAULT_REGION"
 	AUTH_PARAM_AWS_ACCESS_KEY_ID     = "AWS_ACCESS_KEY_ID"
 	AUTH_PARAM_AWS_SECRET_ACCESS_KEY = "AWS_SECRET_ACCESS_KEY"
-	AUTH_PARAM_SECRET   = "secret"
+	AUTH_PARAM_SECRET                = "secret"
 )
 
 type Auth struct {

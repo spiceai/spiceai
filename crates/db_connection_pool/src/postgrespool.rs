@@ -38,30 +38,38 @@ impl PostgresConnectionPool {
         params: Arc<Option<HashMap<String, String>>>,
         secret: Option<Secret>,
     ) -> Result<Self> {
-        let mut host = "localhost";
-        let mut user = "postgres";
-        let mut dbname = "postgres";
-        let mut connection_string = String::new();
+        let mut connection_string = "host=localhost user=postgres dbname=postgres".to_string();
 
         if let Some(params) = params.as_ref() {
-            if let Some(pg_host) = params.get("pg_host") {
-                host = pg_host;
-            }
-            if let Some(pg_user) = params.get("pg_user") {
-                user = pg_user;
-            }
-            if let Some(pg_db) = params.get("pg_db") {
-                dbname = pg_db;
-            }
-            if let Some(pg_pass) = get_pg_pass(params, secret) {
-                connection_string.push_str(format!("password={pg_pass} ").as_str());
-            }
-            if let Some(pg_port) = params.get("pg_port") {
-                connection_string.push_str(format!("port={pg_port} ").as_str());
+            connection_string = String::new();
+
+            if let Some(pg_connection_string) = get_secret_or_param(
+                params,
+                &secret,
+                "pg_connection_string_key",
+                "pg_connection_string",
+            ) {
+                connection_string.push_str(pg_connection_string.as_str());
+            } else {
+                if let Some(pg_host) = params.get("pg_host") {
+                    connection_string.push_str(format!("host={pg_host} ").as_str());
+                }
+                if let Some(pg_user) = params.get("pg_user") {
+                    connection_string.push_str(format!("user={pg_user} ").as_str());
+                }
+                if let Some(pg_db) = params.get("pg_db") {
+                    connection_string.push_str(format!("dbname={pg_db} ").as_str());
+                }
+                if let Some(pg_pass) =
+                    get_secret_or_param(params, &secret, "pg_pass_key", "pg_pass")
+                {
+                    connection_string.push_str(format!("password={pg_pass} ").as_str());
+                }
+                if let Some(pg_port) = params.get("pg_port") {
+                    connection_string.push_str(format!("port={pg_port} ").as_str());
+                }
             }
         }
-
-        connection_string.push_str(format!("host={host} user={user} dbname={dbname}").as_str());
 
         let manager = PostgresConnectionManager::new_from_stringlike(connection_string, NoTls)
             .context(ConnectionPoolSnafu)?;
@@ -78,17 +86,25 @@ impl PostgresConnectionPool {
 
 #[must_use]
 #[allow(clippy::implicit_hasher)]
-pub fn get_pg_pass(params: &HashMap<String, String>, secret: Option<Secret>) -> Option<String> {
-    if let Some(pg_pass_val) = params.get("pg_pass_key") {
-        if let Some(secrets) = secret {
-            if let Some(pg_pass_secret) = secrets.get(pg_pass_val) {
-                return Some(pg_pass_secret.to_string());
-            };
+pub fn get_secret_or_param(
+    params: &HashMap<String, String>,
+    secret: &Option<Secret>,
+    secret_param_key: &str,
+    param_key: &str,
+) -> Option<String> {
+    let pg_secret_param_val = match params.get(secret_param_key) {
+        Some(val) => val,
+        None => param_key,
+    };
+
+    if let Some(secrets) = secret {
+        if let Some(pg_secret_val) = secrets.get(pg_secret_param_val) {
+            return Some(pg_secret_val.to_string());
         };
     };
 
-    if let Some(pg_raw_pass) = params.get("pg_pass") {
-        return Some(pg_raw_pass.to_string());
+    if let Some(pg_param_val) = params.get(param_key) {
+        return Some(pg_param_val.to_string());
     };
 
     None

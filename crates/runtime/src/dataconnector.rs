@@ -20,6 +20,7 @@ use std::future::Future;
 
 use crate::datapublisher::DataPublisher;
 use crate::dataupdate::{DataUpdate, UpdateType};
+use crate::status;
 use crate::timing::TimeMeasurement;
 
 pub mod databricks;
@@ -190,9 +191,12 @@ impl dyn DataConnector + '_ {
             return Box::pin(stream! {
                 loop {
                     tracing::info!("Refreshing data for {}", dataset.name);
+                    status::update_dataset(dataset.name.clone(), status::ComponentStatus::Refreshing);
                     let timer = TimeMeasurement::new("load_dataset_duration_ms", vec![("dataset", dataset.name.clone())]);
+                    let new_data = self.get_all_data(dataset).await;
+                    status::update_dataset(dataset.name.clone(), status::ComponentStatus::Ready);
                     yield DataUpdate {
-                        data: self.get_all_data(dataset).await,
+                        data: new_data,
                         update_type: UpdateType::Overwrite,
                     };
                     drop(timer);
@@ -208,7 +212,9 @@ impl dyn DataConnector + '_ {
                 "load_dataset_duration_ms",
                 vec![("dataset", dataset.name.clone())],
             );
+            status::update_dataset(dataset.name.clone(), status::ComponentStatus::Refreshing);
             let data = self.get_all_data(dataset).await;
+            status::update_dataset(dataset.name.clone(), status::ComponentStatus::Ready);
             drop(timer);
 
             DataUpdate {

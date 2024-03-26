@@ -13,16 +13,33 @@ jobs:
         include:
           - name: Linux x64
             runner: ubuntu-latest
+            target_os: linux
+            target_arch: x86_64
+          - name: Linux aarch64
+            runner: hosted-linux-arm-runner
+            target_os: linux
+            target_arch: aarch64
           - name: macOS aarch64 (Apple Silicon)
             runner: macos-14
+            target_os: darwin
+            target_arch: aarch64
           - name: macOS x64 (Intel)
             runner: macos-12
+            target_os: darwin
+            target_arch: x86_64
     steps:
     - name: system info
       run: uname -m
 
     - name: checkout code
       uses: actions/checkout@v3
+
+    # The aarch64 runner does not have any tools pre-installed
+    - name: Install missing tools
+      if: matrix.target_os == 'linux' && matrix.target_arch == 'aarch64'
+      run: |
+        sudo apt-get update
+        sudo apt install jq -y
 
     - name: install Spice (https://install.spiceai.org)
       run: |
