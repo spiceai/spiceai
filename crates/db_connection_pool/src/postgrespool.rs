@@ -5,7 +5,7 @@ use bb8_postgres::{
     tokio_postgres::{config::Host, types::ToSql, Config, NoTls},
     PostgresConnectionManager,
 };
-use ns_lookup::test_ns_lookup_and_tcp_connect;
+use ns_lookup::verify_ns_lookup_and_tcp_connect;
 use secrets::Secret;
 use snafu::{prelude::*, ResultExt};
 
@@ -80,7 +80,7 @@ impl PostgresConnectionPool {
         for host in config.get_hosts() {
             for port in config.get_ports() {
                 if let Host::Tcp(host) = host {
-                    if let Err(e) = test_ns_lookup_and_tcp_connect(host, *port).await {
+                    if let Err(e) = verify_ns_lookup_and_tcp_connect(host, *port).await {
                         tracing::error!("{e}");
                     }
                 }

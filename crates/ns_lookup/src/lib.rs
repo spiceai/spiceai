@@ -14,7 +14,7 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// Test NS lookup and TCP connect of the provided `host` and `port`.
+/// Verify NS lookup and TCP connect of the provided `host` and `port`.
 ///
 /// # Arguments
 ///
@@ -24,7 +24,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// # Errors
 ///
 /// Returns an `Error` if the NS lookup or TCP connect fails.
-pub async fn test_ns_lookup_and_tcp_connect(host: &str, port: u16) -> Result<()> {
+pub async fn verify_ns_lookup_and_tcp_connect(host: &str, port: u16) -> Result<()> {
     let resolver = AsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default());
     match resolver.lookup_ip(host).await {
         Ok(ips) => {
