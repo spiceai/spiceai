@@ -31,11 +31,11 @@ jobs:
         run: |
           git config --global user.name 'Evgenii Khramkov'
           git config --global user.email 'evgenii@spice.ai'
-          git checkout -b acknowledgements/${GITHUB_JOB}
+          git checkout -b acknowledgements/${GITHUB_RUN_ID}
           cat acknowledgements.md
           git add acknowledgements.md
           git commit -m "Update acknowledgements"
-          git push origin acknowledgements/${GITHUB_JOB}
-          gh pr create --title "Update acknowledgements" --body "This PR updates the acknowledgements" --base trunk --head acknowledgements/${GITHUB_JOB}
+          git push origin acknowledgements/${GITHUB_RUN_ID}
+          gh pr create --title "Update acknowledgements" --body "This PR updates the acknowledgements" --base trunk --head acknowledgements/${GITHUB_RUN_ID}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
