@@ -48,7 +48,7 @@ spice dataset configure
 			cmd.Println(err.Error())
 			os.Exit(1)
 		}
-		datasetName = strings.TrimSuffix(datasetName, "\n")
+		datasetName = strings.TrimSpace(strings.TrimSuffix(datasetName, "\n"))
 		if datasetName == "" {
 			datasetName = defaultDatasetName
 		}
@@ -67,7 +67,7 @@ spice dataset configure
 			cmd.Println(err.Error())
 			os.Exit(1)
 		}
-		from = strings.TrimSuffix(from, "\n")
+		from = strings.TrimSpace(strings.TrimSuffix(from, "\n"))
 
 		params := map[string]string{}
 		datasetPrefix := strings.Split(from, ":")[0]

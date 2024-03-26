@@ -153,7 +153,9 @@ impl DataFusion {
         let params: Arc<Option<HashMap<String, String>>> =
             Arc::new(dataset.acceleration_params().clone());
 
-        let secret_key = dataset.engine_secret().unwrap_or_default();
+        let secret_key = dataset
+            .engine_secret()
+            .unwrap_or(format!("{:?}_engine", acceleration.engine()).to_lowercase());
         let backend_secret = secrets_provider.read().await.get_secret(&secret_key).await;
 
         let data_backend: Box<dyn DataPublisher> =
