@@ -306,25 +306,20 @@ Query took: 0.004057791 seconds
 
 You can experiment with the time it takes to generate queries when using non-accelerated datasets. You can change the acceleration setting from `true` to `false` in the datasets.yaml file.
 
-## Importing dataset from Dremio
+## Importing dataset from S3
 
-**Step 1.** If you have a dataset hosted in Dremio, you can load it into the Spice Runtime as follows:
-
-```bash
-spice login dremio -u <USERNAME> -p <PASSWORD>
-```
-
-**Step 2.** If you haven't already initialized a new project, you need to do so. Then, start the Spice Runtime.
+**Step 1.** If you haven't already initialized a new project, you need to do so. Then, start the Spice Runtime.
 
 ```bash
-spice init dremio-demo-project
+spice init s3-demo-project
 ```
 
 ```bash
+cd s3-demo-project
 spice run
 ```
 
-**Step 3.** We now configure the dataset from Dremio:
+**Step 2.** We now configure the dataset from S3:
 
 ```bash
 spice dataset configure
@@ -333,19 +328,19 @@ spice dataset configure
 Enter the name of the dataset:
 
 ```bash
-dataset name: (dremio-demo-project)  my_dataset
+dataset name: (s3-demo-project)  taxi_trips
 ```
 
 Enter the description of the dataset:
 
 ```
-description: my dataset in dremio
+description: taxi trips in s3
 ```
 
 Specify the location of the dataset:
 
 ```bash
-from: dremio:datasets.my_dataset
+from: s3://spiceai-demo-datasets/taxi_trips/2024/
 ```
 
 Select "y" when prompted whether to locally accelerate the dataset:
@@ -357,17 +352,17 @@ Locally accelerate (y/n)? y
 We should now see the following output:
 
 ```
-Dataset settings written to `datasets/my_dataset/dataset.yaml`!
+Dataset settings written to `datasets/taxi_trips/dataset.yaml`!
 ```
 
 If the login credentials were entered correctly, your dataset will have loaded into the runtime. You should see the following in the Spice runtime terminal :
 
 ```
-2024-02-14T18:34:15.174564Z  INFO spiced: Loaded dataset: my_dataset
-2024-02-14T18:34:15.175189Z  INFO runtime::datasource: Refreshing data for my_dataset
+2024-02-14T18:34:15.174564Z  INFO spiced: Loaded dataset: taxi_trips
+2024-02-14T18:34:15.175189Z  INFO runtime::datasource: Refreshing data for taxi_trips
 ```
 
-**Step 4.** Run queries against the dataset using the Spice SQL REPL.
+**Step 3.** Run queries against the dataset using the Spice SQL REPL.
 
 In a new terminal, start the Spice SQL REPL
 
@@ -375,7 +370,7 @@ In a new terminal, start the Spice SQL REPL
 spice sql
 ```
 
-You can now now query `my_dataset` in the runtime.
+You can now now query `taxi_trips` in the runtime.
 
 ### Upcoming Features
 
