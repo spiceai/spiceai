@@ -65,12 +65,11 @@ pub fn render_flight_error(error: FlightError, ctx: &str) -> String {
     match error {
         FlightError::Arrow(arrow_error) => {
             let error_msg = arrow_error.to_string();
-            // Remove internal Arrow message by splitting on the first colon
+            // `ArrowError`s are formatted as `<error type>: <internal details (optional)>`.
             let public_message = if let Some(index) = error_msg.find(':') {
                 let (user_msg, _internal_desc) = error_msg.split_at(index + 1);
                 user_msg
             } else {
-                // Some Arrow errors have no description, use in full.
                 &error_msg
             };
             format!("{ctx}: Arrow error occurred: {public_message}")
