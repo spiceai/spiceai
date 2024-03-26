@@ -21,7 +21,7 @@ jobs:
       - name: Generate Acknowledgements
         shell: bash
         run: |
-          echo "# Open Source Acknowledgements\n\nSpice.ai acknowledges the following open source projects for making this project possible:\n\n" > acknowledgements.md
+          echo -e "# Open Source Acknowledgements\n\nSpice.ai acknowledges the following open source projects for making this project possible:\n\n" > acknowledgements.md
           make -s generate-acknowledgements-go
           make -s generate-acknowledgements-rust
           sed -i 's/\"//g' acknowledgements.md
