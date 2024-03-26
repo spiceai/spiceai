@@ -32,7 +32,7 @@ jobs:
           if [[ $(git status --porcelain) ]]; then
             git commit -m "Update acknowledgements"
             git push origin acknowledgements/${GITHUB_RUN_ID}
-            gh pr create --title "Update acknowledgements" --base trunk --head acknowledgements/${GITHUB_RUN_ID}
+            gh pr create --title "Update acknowledgements" --body "Updated OSS acknowledgements" --base trunk --head acknowledgements/${GITHUB_RUN_ID}
           else
             echo "No changes detected"
           fi
