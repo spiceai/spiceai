@@ -1,10 +1,11 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, str::FromStr, sync::Arc};
 
 use async_trait::async_trait;
 use bb8_postgres::{
-    tokio_postgres::{types::ToSql, NoTls},
+    tokio_postgres::{config::Host, types::ToSql, Config, NoTls},
     PostgresConnectionManager,
 };
+use ns_lookup::verify_ns_lookup_and_tcp_connect;
 use secrets::Secret;
 use snafu::{prelude::*, ResultExt};
 
@@ -22,6 +23,9 @@ pub enum Error {
     ConnectionPoolRunError {
         source: bb8::RunError<bb8_postgres::tokio_postgres::Error>,
     },
+
+    #[snafu(display("Invalid port: {port}"))]
+    InvalidPortError { port: String },
 }
 
 pub struct PostgresConnectionPool {
@@ -71,13 +75,25 @@ impl PostgresConnectionPool {
             }
         }
 
-        let manager = PostgresConnectionManager::new_from_stringlike(connection_string, NoTls)
-            .context(ConnectionPoolSnafu)?;
+        let config = Config::from_str(connection_string.as_str()).context(ConnectionPoolSnafu)?;
+
+        for host in config.get_hosts() {
+            for port in config.get_ports() {
+                if let Host::Tcp(host) = host {
+                    if let Err(e) = verify_ns_lookup_and_tcp_connect(host, *port).await {
+                        tracing::error!("{e}");
+                    }
+                }
+            }
+        }
+
+        let manager = PostgresConnectionManager::new(config, NoTls);
 
         let pool = bb8::Pool::builder()
             .build(manager)
             .await
             .context(ConnectionPoolSnafu)?;
+
         Ok(PostgresConnectionPool {
             pool: Arc::new(pool),
         })
