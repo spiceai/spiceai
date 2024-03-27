@@ -18,10 +18,12 @@ use std::{collections::HashMap, str::FromStr, sync::Arc};
 
 use async_trait::async_trait;
 use bb8_postgres::{
-    tokio_postgres::{config::Host, types::ToSql, Config, NoTls},
+    tokio_postgres::{config::Host, types::ToSql, Config},
     PostgresConnectionManager,
 };
+use native_tls::TlsConnector;
 use ns_lookup::verify_ns_lookup_and_tcp_connect;
+use postgres_native_tls::MakeTlsConnector;
 use secrets::Secret;
 use snafu::{prelude::*, ResultExt};
 
@@ -45,7 +47,7 @@ pub enum Error {
 }
 
 pub struct PostgresConnectionPool {
-    pool: Arc<bb8::Pool<PostgresConnectionManager<NoTls>>>,
+    pool: Arc<bb8::Pool<PostgresConnectionManager<MakeTlsConnector>>>,
 }
 
 impl PostgresConnectionPool {
@@ -88,6 +90,9 @@ impl PostgresConnectionPool {
                 if let Some(pg_port) = params.get("pg_port") {
                     connection_string.push_str(format!("port={pg_port} ").as_str());
                 }
+                if let Some(pg_sslmode) = params.get("pg_sslmode") {
+                    connection_string.push_str(format!("sslmode={pg_sslmode} ").as_str());
+                }
             }
         }
 
@@ -103,7 +108,9 @@ impl PostgresConnectionPool {
             }
         }
 
-        let manager = PostgresConnectionManager::new(config, NoTls);
+        let builder = TlsConnector::builder();
+        let connector = MakeTlsConnector::new(builder.build()?);
+        let manager = PostgresConnectionManager::new(config, connector);
 
         let pool = bb8::Pool::builder()
             .build(manager)
@@ -145,7 +152,7 @@ pub fn get_secret_or_param(
 #[async_trait]
 impl
     DbConnectionPool<
-        bb8::PooledConnection<'static, PostgresConnectionManager<NoTls>>,
+        bb8::PooledConnection<'static, PostgresConnectionManager<MakeTlsConnector>>,
         &'static (dyn ToSql + Sync),
     > for PostgresConnectionPool
 {
@@ -154,7 +161,7 @@ impl
     ) -> Result<
         Box<
             dyn DbConnection<
-                bb8::PooledConnection<'static, PostgresConnectionManager<NoTls>>,
+                bb8::PooledConnection<'static, PostgresConnectionManager<MakeTlsConnector>>,
                 &'static (dyn ToSql + Sync),
             >,
         >,

@@ -25,6 +25,8 @@ spicepod = { path = "../spicepod" }
 rusqlite.workspace = true
 tokio-rusqlite.workspace = true
 ns_lookup = { path = "../ns_lookup" }
+native-tls = "0.2.11"
+postgres-native-tls = "0.5.0"
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
