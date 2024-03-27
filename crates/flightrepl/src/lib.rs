@@ -88,7 +88,7 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
         if line.is_empty() {
             continue;
         }
-        match line {
+        let line = match line {
             ".exit" | "exit" | "quit" | "q" => break,
             ".error" => {
                 match last_error {
@@ -111,8 +111,11 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
                 println!("\nAny other line will be interpreted as a SQL query");
                 continue;
             }
-            _ => {}
-        }
+            "show tables" => {
+                "select table_name from information_schema.tables where table_schema = 'public'"
+            }
+            _ => line,
+        };
 
         let _ = rl.add_history_entry(line);
 
@@ -187,6 +190,7 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
         let df = DataFrame::new(
             ctx.state(),
             LogicalPlanBuilder::scan(UNNAMED_TABLE, provider_as_source(Arc::new(provider)), None)?
+                .limit(0, Some(500))?
                 .build()?,
         );
 
