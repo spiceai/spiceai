@@ -13,7 +13,7 @@ Spice makes it easy to build data-driven and data-intensive applications by stre
 
 The Spice runtime is written in Rust and leverages industry leading technologies like Apache DataFusion, Apache Arrow, Apache Arrow Flight, and DuckDB.
 
-![OGP](https://github.com/spiceai/spiceai/assets/80174/18d0894b-c95d-4d2a-86cb-d9ebcb3217f9)
+<img width="750" alt="Spice.ai" src="https://github.com/spiceai/spiceai/assets/80174/18d0894b-c95d-4d2a-86cb-d9ebcb3217f9" />
 
 ## Why Spice?
 
