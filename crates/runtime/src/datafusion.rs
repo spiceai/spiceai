@@ -35,7 +35,7 @@ use futures::StreamExt;
 use snafu::prelude::*;
 use spicepod::component::dataset::Dataset;
 use tokio::sync::RwLock;
-use tokio::time::sleep;
+use tokio::time::{sleep, Instant};
 use tokio::{spawn, task};
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -338,11 +338,24 @@ impl DataFusion {
             // Tables are currently lazily created (i.e. not created until first data is received) so that we know the table schema.
             // This means that we can't create a view on top of a table until the first data is received for all dependent tables and therefore
             // the tables are created. To handle this, wait until all tables are created.
+
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let mut unresolved_dependent_table: Option<String> = None;
             let dependent_table_names = DataFusion::get_dependent_table_names(&statements[0]);
             for dependent_table_name in dependent_table_names {
                 let mut attempts = 0;
+
+                if unresolved_dependent_table.is_some() {
+                    break;
+                }
+
                 loop {
                     if !ctx.table_exist(&dependent_table_name).unwrap_or(false) {
+                        if Instant::now() >= deadline {
+                            unresolved_dependent_table = Some(dependent_table_name.clone());
+                            break;
+                        }
+
                         if attempts % 10 == 0 {
                             tracing::warn!("Dependent table {dependent_table_name} for view {table_name} does not exist, retrying...");
                         }
@@ -352,6 +365,11 @@ impl DataFusion {
                     }
                     break;
                 }
+            }
+
+            if let Some(missing_table) = unresolved_dependent_table {
+                tracing::error!("Failed to create view {table_name}. Dependent table {missing_table} does not exist.");
+                return;
             }
 
             let plan = match ctx.state().statement_to_plan(statements[0].clone()).await {
