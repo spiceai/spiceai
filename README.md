@@ -1,4 +1,4 @@
-# Spice
+# Spice.ai OSS
 
 [![CodeQL](https://github.com/spiceai/spiceai/actions/workflows/codeql-analysis.yml/badge.svg?branch=trunk&event=push)](https://github.com/spiceai/spiceai/actions/workflows/codeql-analysis.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
@@ -15,7 +15,7 @@ The Spice runtime is written in Rust and leverages industry leading technologies
 
 ## Why Spice?
 
-Spice makes querying data by SQL across one or more data sources simple and fast. Easily co-locate a managed working set of your data with your application or ML, locally accelerated in-memory, with DuckDB, or with an attached database like PostgreSQL for high-performance, low-latency queries.
+Spice makes querying data by SQL across one or more data sources simple and fast. Easily co-locate a managed working set of your data with your application or ML, locally accelerated in-memory with Arrow, with SQLite/DuckDB, or with an attached database like PostgreSQL for high-performance, low-latency queries.
 
 ### Before Spice
 
@@ -29,16 +29,18 @@ Spice makes querying data by SQL across one or more data sources simple and fast
 
 **1. Faster applications and frontends.** Accelerate and co-locate datasets with applications and frontends, to serve more concurrent queries and users with faster page loads and data updates.
 
-**2. Faster analytics and BI.** Faster, more responsive dashboards without massive compute costs.
+**2. Faster dashboards, analytics, and BI.** Faster, more responsive dashboards without massive compute costs.
 
 **3. Faster data pipelines, machine learning training and inferencing.** Co-locate datasets in pipelines where the data is needed to minimize data-movement and improve query performance.
+
+**4. Easily query many data sources.** Federated SQL query across databases, data warehouses, and data lakes using [Data Connectors](/data-connectors/index.md).
 
 ### Supported Data Connectors
 
 Currently supported data connectors for upstream datasets. More coming soon.
 
 | Name         | Description | Status       | Protocol/Format  | Refresh Modes    |
-|--------------|-------------|--------------|------------------|------------------|
+| ------------ | ----------- | ------------ | ---------------- | ---------------- |
 | `databricks` | Databricks  | Alpha        | Delta Lake       | `full`           |
 | `postgres`   | PostgreSQL  | Alpha        |                  | `full`           |
 | `spiceai`    | Spice.ai    | Alpha        | Arrow Flight     | `append`, `full` |
@@ -53,19 +55,23 @@ Currently supported data connectors for upstream datasets. More coming soon.
 Currently supported data stores for local materialization/acceleration. More coming soon.
 
 | Name       | Description             | Status | Engine Modes     |
-|------------|-------------------------|--------|------------------|
+| ---------- | ----------------------- | ------ | ---------------- |
 | `arrow`    | In-Memory Arrow Records | Alpha  | `memory`         |
 | `duckdb`   | Embedded DuckDB         | Alpha  | `memory`, `file` |
 | `sqlite`   | Embedded SQLite         | Alpha  | `memory`, `file` |
 | `postgres` | Attached PostgreSQL     | Alpha  |                  |
 
-⚠️ **DEVELOPER PREVIEW** Spice is under active **alpha** stage development and is not intended to be used in production until its **1.0-stable** release.
+### Intelligent Applications
+
+Spice enables developers to build both data _and_ AI-driven applications by co-locating data _and_ ML models with applications. Read more about the vision to enable the development of [intelligent AI-driven applications](https://docs.spiceai.org/intelligent-applications).
+
+⚠️ **DEVELOPER PREVIEW** Spice is under active **alpha** stage development and is not intended to be used in production until its **1.0-stable** release. If you are interested in running Spice in production, please get in touch so we can support you (See Connect with us below).
 
 ## Quickstart
 
 https://github.com/spiceai/spiceai/assets/112157037/c9cfdaeb-ac6a-484f-a382-4c2735833f71
 
-### macOS, Linux and WSL:
+### macOS, Linux and WSL
 
 **Step 1.** Install the Spice CLI:
 
