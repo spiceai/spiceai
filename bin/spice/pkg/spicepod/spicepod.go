@@ -28,7 +28,7 @@ import (
 func CreateManifest(name string, spicepodDir string) (string, error) {
 	fs, err := os.Stat(name)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if os.IsNotExist(err) && spicepodDir != "." {
 			err = os.Mkdir(name, 0766)
 			if err != nil {
 				return "", fmt.Errorf("Error creating directory: %w", err)
@@ -37,8 +37,13 @@ func CreateManifest(name string, spicepodDir string) (string, error) {
 			if err != nil {
 				return "", fmt.Errorf("Error checking if directory exists: %w", err)
 			}
-		} else {
+		} else if spicepodDir != "." {
 			return "", fmt.Errorf("Error checking if directory exists: %w", err)
+		} else {
+			fs, err = os.Stat(spicepodDir)
+			if err != nil {
+				return "", fmt.Errorf("Error checking if directory exists: %w", err)
+			}
 		}
 	}
 
