@@ -164,19 +164,14 @@ sql>
 Enter `show tables;` to display the available tables for query:
 
 ```
-sql> show tables;
+sql> show tables
++------------+
+| table_name |
++------------+
+| taxi_trips |
++------------+
 
-+---------------+--------------------+-------------+------------+
-| table_catalog | table_schema       | table_name  | table_type |
-+---------------+--------------------+-------------+------------+
-| datafusion    | public             | taxi_trips  | BASE TABLE |
-| datafusion    | information_schema | tables      | VIEW       |
-| datafusion    | information_schema | views       | VIEW       |
-| datafusion    | information_schema | columns     | VIEW       |
-| datafusion    | information_schema | df_settings | VIEW       |
-+---------------+--------------------+-------------+------------+
-
-Query took: 0.004728897 seconds
+Query took: 0.007505084 seconds. 1/1 rows displayed.
 ```
 
 Enter a query to display the longest taxi trips:
@@ -287,7 +282,7 @@ You should see the following output from your runtime terminal:
 spice sql
 ```
 
-```bash
+```sql
 SELECT number, size, gas_used from eth_recent_blocks LIMIT 10;
 ```
 
@@ -363,7 +358,7 @@ We should now see the following output:
 Dataset settings written to `datasets/taxi_trips/dataset.yaml`!
 ```
 
-If the login credentials were entered correctly, your dataset will have loaded into the runtime. You should see the following in the Spice runtime terminal :
+You will see the following in the Spice runtime terminal :
 
 ```
 2024-02-14T18:34:15.174564Z  INFO spiced: Loaded dataset: taxi_trips
