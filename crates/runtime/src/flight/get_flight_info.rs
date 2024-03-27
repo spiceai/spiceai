@@ -50,6 +50,9 @@ pub(crate) async fn handle(
         Command::CommandGetSqlInfo(token) => {
             flightsql::get_sql_info::get_flight_info(&token, request)
         }
+        Command::CommandGetTableTypes(token) => {
+            Ok(flightsql::get_table_types::get_flight_info(&token, request))
+        }
         _ => Err(Status::unimplemented("Not yet implemented")),
     }
 }
