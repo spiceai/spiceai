@@ -1,5 +1,5 @@
 /*
-Copyright 2024 Spice AI, Inc.
+Copyright 2021-2024 The Spice Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -93,6 +93,18 @@ impl DataPublisher for DuckDBBackend {
                     Box::new(Error::UnableToDowncastDbConnection {}) as Box<dyn std::error::Error>
                 );
             };
+
+            if let Some(batch) = data_update.data.first() {
+                for field in batch.schema().fields() {
+                    if field.data_type().is_nested() {
+                        let field_name = name + "." + field.name();
+                        tracing::error!("Unable to append {field_name}: nested types are not currently supported for local acceleration by DuckDB");
+                        return Err(Box::new(Error::DuckDB {
+                            source: duckdb::Error::AppendError,
+                        }) as Box<dyn std::error::Error>);
+                    }
+                }
+            }
 
             let mut duckdb_update = DuckDBUpdate {
                 name,

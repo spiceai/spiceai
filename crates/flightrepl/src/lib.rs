@@ -1,5 +1,5 @@
 /*
-Copyright 2024 Spice AI, Inc.
+Copyright 2021-2024 The Spice Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -210,16 +210,19 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
-const KNOWN_USER_FRIENDLY_MESSAGES: [&str; 1] = ["Schema error: "];
+const KNOWN_USER_FRIENDLY_MESSAGES_PREFIX: [&str; 2] =
+    ["Schema error: ", "Error during planning: "];
 
 fn get_user_friendly_message(err_msg: &str) -> String {
     // err_msg format: "status: Internal, message: "Schema error: ...", details: [], metadata: MetadataMap { headers: {} }"
     let parts: Vec<&str> = err_msg.split('"').collect();
     if parts.len() > 1 {
         let message = parts[1];
-        for &user_friendly_message in &KNOWN_USER_FRIENDLY_MESSAGES {
-            if message.starts_with(user_friendly_message) {
-                return message.to_string();
+        for &user_friendly_message_prefix in &KNOWN_USER_FRIENDLY_MESSAGES_PREFIX {
+            if message.starts_with(user_friendly_message_prefix) {
+                return message
+                    .replace(user_friendly_message_prefix, "")
+                    .to_string();
             }
         }
     }
