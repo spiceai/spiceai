@@ -9,6 +9,7 @@ members = [
     "crates/arrow_sql_gen",
     "crates/sql_provider_datafusion",
     "crates/flightrepl",
+    "crates/ns_lookup",
     "tools/flightpublisher/",
     "tools/flightsubscriber/",
 ]
