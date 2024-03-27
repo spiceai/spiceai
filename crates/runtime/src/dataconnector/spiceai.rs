@@ -109,6 +109,7 @@ impl DataConnector for SpiceAI {
             loop {
                 // On connection reset, clear the data by sending an empty overwrite update and re-subscribe.
                 if !initial_connect {
+                    tracing::info!("Reconnecting to {spice_dataset_path}");
                     yield DataUpdate {
                         data: vec![],
                         update_type: UpdateType::Overwrite,
@@ -139,7 +140,8 @@ impl DataConnector for SpiceAI {
                         },
                     Some(Err(error)) => {
                         status::update_dataset(spice_dataset_name.clone(), status::ComponentStatus::Error);
-                        tracing::error!("Error in subscription to {spice_dataset_path}: {error}");
+                        tracing::debug!("Error in subscription to {spice_dataset_path}: {error}");
+                        tracing::error!("Error in subscription to {spice_dataset_path}");
                         continue;
                     },
                     None => {
