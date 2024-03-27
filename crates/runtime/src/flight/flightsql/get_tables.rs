@@ -81,7 +81,7 @@ pub(crate) async fn do_get(
         as <Service as FlightService>::DoGetStream))
 }
 
-fn table_type_name(table_type: TableType) -> &'static str {
+pub(crate) fn table_type_name(table_type: TableType) -> &'static str {
     match table_type {
         // from https://github.com/apache/arrow-datafusion/blob/26b8377b0690916deacf401097d688699026b8fb/datafusion/core/src/catalog/information_schema.rs#L284-L288
         TableType::Base => "BASE TABLE",
