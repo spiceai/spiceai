@@ -367,7 +367,7 @@ jobs:
           createdb testdb
 
       - name: Wait for PostgreSQL to start
-        run: sleep 10
+        run: sleep 35
 
       - name: Check PostgreSQL
         env:
