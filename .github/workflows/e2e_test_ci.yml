@@ -174,7 +174,7 @@ jobs:
       - name: Start spice runtime
         working-directory: test_app
         run: |
-          spice run &
+          spice run &> spice.log &
 
       - name: Wait for Spice runtime healthy
         working-directory: test_app
@@ -226,6 +226,13 @@ jobs:
             exit 1
           fi
 
+      - name: Stop spice and check logs
+        working-directory: test_app
+        if: always()
+        run: |
+          killall spice
+          cat spice.log
+
   test_quickstart_spiceai:
     name: "E2E Test: SpiceAI quickstart, using ${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}"
     runs-on: ${{ matrix.target.runner }}
@@ -273,7 +280,7 @@ jobs:
           SPICE_SECRET_SPICEAI_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_KEY }}
         working-directory: test_app
         run: |
-          spice run &
+          spice run &> spice.log &
           # time to initialize added dataset
           sleep 10
 
@@ -318,6 +325,13 @@ jobs:
             echo "Unexpected response from spice sql, failed to perform test query: $sql_output"
             exit 1
           fi
+
+      - name: Stop spice and check logs
+        working-directory: test_app
+        if: always()
+        run: |
+          killall spice
+          cat spice.log
 
   test_quickstart_data_postgres:
     name: "E2E Test: SpiceAI Postgres quickstart, using ${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}"
@@ -407,7 +421,7 @@ jobs:
           SPICE_SECRET_POSTGRES_PASSWORD: postgres
         working-directory: test_app
         run: |
-          spice run &
+          spice run &> spice.log &
           # time to initialize added dataset
           sleep 10
 
@@ -452,6 +466,13 @@ jobs:
             echo "Unexpected response from spice sql, failed to perform test query: $sql_output"
             exit 1
           fi
+
+      - name: Stop spice and check logs
+        working-directory: test_app
+        if: always()
+        run: |
+          killall spice
+          cat spice.log
 
   test_local_acceleration:
     name: "E2E Test: acceleration on ${{ matrix.target.name }} using ${{ matrix.acceleration.engine }}"
@@ -520,7 +541,7 @@ jobs:
           SPICE_SECRET_SPICEAI_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_KEY }}
         working-directory: test_app
         run: |
-          spice run &
+          spice run &> spice.log &
           sleep 5
 
       - name: Wait for Spice runtime healthy
@@ -564,3 +585,10 @@ jobs:
             echo "Unexpected response from spice sql, failed to perform test query: $sql_output"
             exit 1
           fi
+
+      - name: Stop spice and check logs
+        working-directory: test_app
+        if: always()
+        run: |
+          killall spice
+          cat spice.log
