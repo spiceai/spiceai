@@ -131,21 +131,22 @@ impl DataConnector for S3 {
         }
 
         Box::pin(async move {
-            if let Ok(df) = ctx
+            match ctx
                 .read_parquet(format!("s3:{path}"), ParquetReadOptions::default())
                 .await
             {
-                match df.collect().await {
-                    Ok(batches) => {
-                        return batches;
-                    }
+                Ok(df) => match df.collect().await {
+                    Ok(batches) => batches,
                     Err(e) => {
                         tracing::error!("Failed to collect record batches from S3: {e}");
-                        return vec![];
+                        vec![]
                     }
+                },
+                Err(e) => {
+                    tracing::error!("Failed to read parquet from S3: {path}: {e}");
+                    vec![]
                 }
             }
-            vec![]
         })
     }
 
