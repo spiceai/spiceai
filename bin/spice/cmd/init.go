@@ -39,7 +39,7 @@ spice init my_app
 		var spicepodName string
 		spicepodDir := "."
 
-		if len(args) < 1 {
+		if len(args) < 1 || args[0] == "." {
 			wd, err := os.Getwd()
 			if err != nil {
 				cmd.PrintErrf("Error getting current working directory: %s\n", err.Error())
