@@ -55,12 +55,10 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
         .connect()
         .await?;
 
-    // The encoder/decoder size is limited to be 100MB by default.
-    // This may not be enough for large queries.
-    // In future, paging will be supported to handle the large query output.
+    // The encoder/decoder size is limited to 500MB.
     let mut client = FlightServiceClient::new(channel)
-        .max_decoding_message_size(100 * 1024 * 1024)
-        .max_encoding_message_size(100 * 1024 * 1024);
+        .max_decoding_message_size(500 * 1024 * 1024)
+        .max_encoding_message_size(500 * 1024 * 1024);
 
     let mut rl = DefaultEditor::new()?;
 
@@ -161,9 +159,11 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
         let mut stream =
             FlightRecordBatchStream::new_from_flight_data(stream.map_err(FlightError::Tonic));
         let mut records = vec![];
+        let mut total_rows = 0;
         while let Some(data) = stream.next().await {
             match data {
                 Ok(data) => {
+                    total_rows += data.num_rows();
                     records.push(data);
                 }
                 Err(e) => {
@@ -194,11 +194,16 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
                 .build()?,
         );
 
+        let num_rows = df.clone().count().await?;
+
         if let Err(e) = df.show().await {
             println!("Error displaying results: {e}");
         };
         let elapsed = start_time.elapsed();
-        println!("\nQuery took: {} seconds", elapsed.as_secs_f64());
+        println!(
+            "\nQuery took: {} seconds. {num_rows}/{total_rows} rows displayed.",
+            elapsed.as_secs_f64()
+        );
         last_error = None;
     }
 
