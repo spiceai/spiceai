@@ -274,8 +274,8 @@ jobs:
         working-directory: test_app
         run: |
           spice run &
-           # time to initialize added dataset
-          sleep 5
+          # time to initialize added dataset
+          sleep 10
 
       - name: Wait for Spice runtime healthy
         working-directory: test_app
@@ -408,8 +408,8 @@ jobs:
         working-directory: test_app
         run: |
           spice run &
-            # time to initialize added dataset
-          sleep 5
+          # time to initialize added dataset
+          sleep 10
 
       - name: Wait for Spice runtime healthy
         working-directory: test_app
