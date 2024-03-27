@@ -61,27 +61,36 @@ impl Flight {
 
 // Render a user-friendly message for when a FlightError occurs.
 pub fn render_flight_error(error: FlightError, ctx: &str) -> String {
+    tracing::trace!("{ctx}: {error}");
     match error {
-        FlightError::Arrow(arrow_error) => format!("{ctx}: Arrow error occurred: {arrow_error}",),
-        FlightError::NotYetImplemented(message) => {
-            format!("{ctx}: Not yet implemented: {message}",)
+        FlightError::Arrow(arrow_error) => {
+            let error_msg = arrow_error.to_string();
+            // `ArrowError`s are formatted as `<error type>: <internal details (optional)>`.
+            let public_message = if let Some(index) = error_msg.find(':') {
+                let (user_msg, _internal_desc) = error_msg.split_at(index + 1);
+                user_msg
+            } else {
+                &error_msg
+            };
+            format!("{ctx}: Arrow error occurred: {public_message}")
+        }
+        FlightError::NotYetImplemented(_message) => {
+            format!("{ctx}: Not yet implemented")
         }
         FlightError::Tonic(status) => {
             format!(
-                "{ctx}: Tonic error occurred. code: {}, message: {}. Full: {}",
+                "{ctx}: Tonic error occurred with status code: {}",
                 status.code(),
-                status.message(),
-                status
             )
         }
-        FlightError::ProtocolError(message) => {
-            format!("{ctx}: Protocol error occurred: {message}",)
+        FlightError::ProtocolError(_message) => {
+            format!("{ctx}: Protocol error occurred")
         }
-        FlightError::DecodeError(message) => {
-            format!("{ctx}: Decode error occurred: {message}")
+        FlightError::DecodeError(_message) => {
+            format!("{ctx}: Failed to decode flight data")
         }
-        FlightError::ExternalError(error) => {
-            format!("{ctx}: External error occurred: {error}")
+        FlightError::ExternalError(_error) => {
+            format!("{ctx}: External error occurred")
         }
     }
 }
