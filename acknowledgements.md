@@ -191,6 +191,8 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - notify 6.1.1, CC0-1.0 
   <br/>https://github.com/notify-rs/notify.git
 
+- ns_lookup 0.10.0-alpha, Apache-2.0 
+
 - object_store 0.9.1, Apache-2.0 OR MIT 
   <br/>https://github.com/apache/arrow-rs/tree/master/object_store
 
@@ -320,6 +322,9 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 
 - tract-onnx 0.21.1, Apache-2.0 OR MIT 
   <br/>https://github.com/snipsco/tract
+
+- trust-dns-resolver 0.23.2, Apache-2.0 OR MIT 
+  <br/>https://github.com/bluejekyll/trust-dns
 
 - url 2.5.0, Apache-2.0 OR MIT 
   <br/>https://github.com/servo/rust-url
