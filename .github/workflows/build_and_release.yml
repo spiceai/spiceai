@@ -4,8 +4,6 @@ on:
   push:
     branches:
       - trunk
-      - rust
-      - release-*
     tags:
       - v*
 
