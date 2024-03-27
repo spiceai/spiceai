@@ -188,7 +188,7 @@ jobs:
           spice add spiceai/quickstart
           cat spicepod.yaml
           # time to initialize added dataset
-          sleep 5
+          sleep 10
 
       - name: Check datasets
         working-directory: test_app
