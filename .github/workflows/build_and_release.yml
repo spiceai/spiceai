@@ -4,8 +4,6 @@ on:
   push:
     branches:
       - trunk
-      - rust
-      - release-*
     tags:
       - v*
 
@@ -39,7 +37,7 @@ jobs:
             target_arch: aarch64
             target_arch_go: arm64
           - name: macOS x64 (Intel)
-            runner: rust-osx-x64
+            runner: macos-13
             target_os: darwin
             target_arch: x86_64
             target_arch_go: amd64
