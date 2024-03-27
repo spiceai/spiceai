@@ -367,7 +367,7 @@ jobs:
           createdb testdb
 
       - name: Wait for PostgreSQL to start
-        run: sleep 35
+        run: sleep 10
 
       - name: Check PostgreSQL
         env:
@@ -423,7 +423,7 @@ jobs:
         run: |
           spice run &> spice.log &
           # time to initialize added dataset
-          sleep 10
+          sleep 35
 
       - name: Wait for Spice runtime healthy
         working-directory: test_app
