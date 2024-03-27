@@ -105,40 +105,55 @@ impl DataConnector for SpiceAI {
         let spice_dataset_path = Self::spice_dataset_path(dataset);
         let spice_dataset_name = dataset.name.clone();
         Box::pin(stream! {
-          let mut stream = match flight.subscribe(&spice_dataset_path).await {
-            Ok(stream) => stream,
-            Err(error) => {
-              status::update_dataset(spice_dataset_name.clone(), status::ComponentStatus::Error);
-              tracing::error!("Unable to subscribe to {spice_dataset_path}: {error}");
-              return;
-            }
-          };
-          loop {
-            let result = stream.next().await;
-            status::update_dataset(spice_dataset_name.clone(), status::ComponentStatus::Refreshing);
-            match result {
-              Some(Ok(decoded_data)) => if let DecodedPayload::RecordBatch(batch) = decoded_data.payload {
-                    status::update_dataset(spice_dataset_name.clone(), status::ComponentStatus::Ready);
+            let mut initial_connect = true;
+            loop {
+                // On connection reset, clear the data by sending an empty overwrite update and re-subscribe.
+                if !initial_connect {
+                    tracing::info!("Reconnecting to {spice_dataset_path}");
                     yield DataUpdate {
-                        data: vec![batch],
-                        update_type: UpdateType::Append,
+                        data: vec![],
+                        update_type: UpdateType::Overwrite,
                     };
-                } else {
-                    status::update_dataset(spice_dataset_name.clone(), status::ComponentStatus::Ready);
-                    continue;
-                },
-              Some(Err(error)) => {
-                status::update_dataset(spice_dataset_name.clone(), status::ComponentStatus::Error);
-                tracing::error!("Error in subscription to {spice_dataset_path}: {error}");
-                continue;
-              },
-              None => {
-                status::update_dataset(spice_dataset_name.clone(), status::ComponentStatus::Ready);
-                tracing::error!("Flight stream ended for {spice_dataset_path}");
-                break;
-              }
-            };
-          }
+                }
+
+                let mut stream = match flight.subscribe(&spice_dataset_path).await {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                    status::update_dataset(spice_dataset_name.clone(), status::ComponentStatus::Error);
+                    tracing::error!("Unable to subscribe to {spice_dataset_path}: {error}");
+                    return;
+                    }
+                };
+                loop {
+                    let result = stream.next().await;
+                    status::update_dataset(spice_dataset_name.clone(), status::ComponentStatus::Refreshing);
+                    match result {
+                    Some(Ok(decoded_data)) => if let DecodedPayload::RecordBatch(batch) = decoded_data.payload {
+                            status::update_dataset(spice_dataset_name.clone(), status::ComponentStatus::Ready);
+                            yield DataUpdate {
+                                data: vec![batch],
+                                update_type: UpdateType::Append,
+                            };
+                        } else {
+                            status::update_dataset(spice_dataset_name.clone(), status::ComponentStatus::Ready);
+                            continue;
+                        },
+                    Some(Err(error)) => {
+                        status::update_dataset(spice_dataset_name.clone(), status::ComponentStatus::Error);
+                        tracing::debug!("Error in subscription to {spice_dataset_path}: {error}");
+                        tracing::error!("Error in subscription to {spice_dataset_path}");
+                        continue;
+                    },
+                    None => {
+                        status::update_dataset(spice_dataset_name.clone(), status::ComponentStatus::Ready);
+                        tracing::error!("Flight stream ended for {spice_dataset_path}");
+                        break;
+                    }
+                    };
+                }
+
+                initial_connect = false;
+            }
         })
     }
 
