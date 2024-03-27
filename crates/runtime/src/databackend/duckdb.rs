@@ -94,6 +94,18 @@ impl DataPublisher for DuckDBBackend {
                 );
             };
 
+            if let Some(batch) = data_update.data.first() {
+                for field in batch.schema().fields() {
+                    if field.data_type().is_nested() {
+                        let field_name = name + "." + field.name();
+                        tracing::error!("Unable to append {field_name}: nested types are not currently supported for local acceleration by DuckDB");
+                        return Err(Box::new(Error::DuckDB {
+                            source: duckdb::Error::AppendError,
+                        }) as Box<dyn std::error::Error>);
+                    }
+                }
+            }
+
             let mut duckdb_update = DuckDBUpdate {
                 name,
                 data: data_update.data,
