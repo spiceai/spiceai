@@ -138,7 +138,7 @@ impl DataConnector for S3 {
                 Ok(df) => match df.collect().await {
                     Ok(batches) => batches,
                     Err(e) => {
-                        tracing::error!("Failed to collect record batches from S3: {e}");
+                        tracing::error!("Failed to retrieve data from S3: {e}");
                         vec![]
                     }
                 },
