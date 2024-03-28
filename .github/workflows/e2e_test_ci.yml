@@ -174,7 +174,7 @@ jobs:
       - name: Start spice runtime
         working-directory: test_app
         run: |
-          spice run &> spice.log &
+          spice run &
 
       - name: Wait for Spice runtime healthy
         working-directory: test_app
@@ -226,13 +226,6 @@ jobs:
             exit 1
           fi
 
-      - name: Stop spice and check logs
-        working-directory: test_app
-        if: always()
-        run: |
-          killall spice
-          cat spice.log
-
   test_quickstart_spiceai:
     name: "E2E Test: SpiceAI quickstart, using ${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}"
     runs-on: ${{ matrix.target.runner }}
@@ -280,9 +273,9 @@ jobs:
           SPICE_SECRET_SPICEAI_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_KEY }}
         working-directory: test_app
         run: |
-          spice run &> spice.log &
-          # time to initialize added dataset
-          sleep 10
+          spice run &
+           # time to initialize added dataset
+          sleep 5
 
       - name: Wait for Spice runtime healthy
         working-directory: test_app
@@ -326,154 +319,139 @@ jobs:
             exit 1
           fi
 
-      - name: Stop spice and check logs
-        working-directory: test_app
-        if: always()
+  test_quickstart_data_postgres:
+    name: "E2E Test: SpiceAI Postgres quickstart, using ${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}"
+    runs-on: ${{ matrix.target.runner }}
+    needs:
+      - build
+      - setup-matrix
+
+    strategy:
+      matrix:
+        target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
+
+    steps:
+      - name: Install PostgreSQL (Linux)
+        if: matrix.target.target_os == 'linux'
         run: |
-          killall spice
-          cat spice.log
+          sudo apt-get update
+          sudo apt-get install -y postgresql
+          sudo service postgresql start
+          sleep 5
+          sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='postgres'" | grep -q 1 || sudo -u postgres createuser -s postgres
+          sudo -u postgres psql -c "ALTER USER postgres PASSWORD 'postgres';"
+          sudo -u postgres createdb testdb
 
-  # TODO: test is broken, need to check postgres connection
-  # test_quickstart_data_postgres:
-  #   name: "E2E Test: SpiceAI Postgres quickstart, using ${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}"
-  #   runs-on: ${{ matrix.target.runner }}
-  #   needs:
-  #     - build
-  #     - setup-matrix
+      - name: Install PostgreSQL (MacOS)
+        if: matrix.target.target_os == 'darwin'
+        run: |
+          brew install postgresql
+          brew services start postgresql
+          sleep 5
+          createuser -s postgres
+          psql -d postgres -c "ALTER USER postgres PASSWORD 'postgres';"
+          createdb testdb
 
-  #   strategy:
-  #     matrix:
-  #       target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
+      - name: Wait for PostgreSQL to start
+        run: sleep 10
 
-  #   steps:
-  #     - name: Install PostgreSQL (Linux)
-  #       if: matrix.target.target_os == 'linux'
-  #       run: |
-  #         sudo apt-get update
-  #         sudo apt-get install -y postgresql
-  #         sudo service postgresql start
-  #         sleep 5
-  #         sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='postgres'" | grep -q 1 || sudo -u postgres createuser -s postgres
-  #         sudo -u postgres psql -c "ALTER USER postgres PASSWORD 'postgres';"
-  #         sudo -u postgres createdb testdb
+      - name: Check PostgreSQL
+        env:
+          PGPASSWORD: postgres
+        run: psql -h localhost -U postgres -c 'SELECT version();'
 
-  #     - name: Install PostgreSQL (MacOS)
-  #       if: matrix.target.target_os == 'darwin'
-  #       run: |
-  #         brew install postgresql
-  #         brew services start postgresql
-  #         sleep 5
-  #         createuser -s postgres
-  #         psql -d postgres -c "ALTER USER postgres PASSWORD 'postgres';"
-  #         createdb testdb
+      - name: Prepare PostgreSQL dataset
+        env:
+          PGPASSWORD: postgres
+        run: |
+          psql -h localhost -U postgres -d testdb -c 'CREATE TABLE eth_recent_blocks (id SERIAL PRIMARY KEY, block_number INTEGER, block_hash TEXT, block_timestamp TIMESTAMP);'
+          psql -h localhost -U postgres -d testdb -c "INSERT INTO eth_recent_blocks (block_number, block_hash, block_timestamp) VALUES (1, '0x1234', '2022-01-01 00:00:00');"
+          psql -h localhost -U postgres -d testdb -c "INSERT INTO eth_recent_blocks (block_number, block_hash, block_timestamp) VALUES (2, '0x5678', '2022-01-01 00:00:00');"
+          psql -h localhost -U postgres -d testdb -c "INSERT INTO eth_recent_blocks (block_number, block_hash, block_timestamp) VALUES (3, '0x9abc', '2022-01-01 00:00:00');"
+          psql -h localhost -U postgres -d testdb -c 'SELECT * FROM eth_recent_blocks;'
 
-  #     - name: Wait for PostgreSQL to start
-  #       run: sleep 10
+      - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+        uses: actions/download-artifact@v4
+        with:
+          name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+          path: ./build
 
-  #     - name: Check PostgreSQL
-  #       env:
-  #         PGPASSWORD: postgres
-  #       run: psql -h localhost -U postgres -c 'SELECT version();'
+      - name: Install spice
+        run: |
+          chmod +x ./build/spice
+          chmod +x ./build/spiced
+          mkdir -p "$HOME/.spice/bin"
+          mv ./build/spice "$HOME/.spice/bin"
+          mv ./build/spiced "$HOME/.spice/bin"
+          echo "$HOME/.spice/bin" >> $GITHUB_PATH
 
-  #     - name: Prepare PostgreSQL dataset
-  #       env:
-  #         PGPASSWORD: postgres
-  #       run: |
-  #         psql -h localhost -U postgres -d testdb -c 'CREATE TABLE eth_recent_blocks (id SERIAL PRIMARY KEY, block_number INTEGER, block_hash TEXT, block_timestamp TIMESTAMP);'
-  #         psql -h localhost -U postgres -d testdb -c "INSERT INTO eth_recent_blocks (block_number, block_hash, block_timestamp) VALUES (1, '0x1234', '2022-01-01 00:00:00');"
-  #         psql -h localhost -U postgres -d testdb -c "INSERT INTO eth_recent_blocks (block_number, block_hash, block_timestamp) VALUES (2, '0x5678', '2022-01-01 00:00:00');"
-  #         psql -h localhost -U postgres -d testdb -c "INSERT INTO eth_recent_blocks (block_number, block_hash, block_timestamp) VALUES (3, '0x9abc', '2022-01-01 00:00:00');"
-  #         psql -h localhost -U postgres -d testdb -c 'SELECT * FROM eth_recent_blocks;'
+      - name: Check spice version
+        run: spice version
 
-  #     - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-  #       uses: actions/download-artifact@v4
-  #       with:
-  #         name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-  #         path: ./build
+      - name: Init spice app
+        run: |
+          spice init test_app
 
-  #     - name: Install spice
-  #       run: |
-  #         chmod +x ./build/spice
-  #         chmod +x ./build/spiced
-  #         mkdir -p "$HOME/.spice/bin"
-  #         mv ./build/spice "$HOME/.spice/bin"
-  #         mv ./build/spiced "$HOME/.spice/bin"
-  #         echo "$HOME/.spice/bin" >> $GITHUB_PATH
+      - name: Spice dataset configure
+        working-directory: test_app
+        run: |
+          echo -e "eth_recent_blocks\neth recent blocks\npostgres:eth_recent_blocks\ny" | spice dataset configure
+          # configure pg credentials
+          echo -e "params:\n  pg_host: localhost\n  pg_port: 5432\n  pg_db: testdb\n  pg_user: postgres\n  pg_pass_key: password" >> ./datasets/eth_recent_blocks/dataset.yaml
+          # configure env secret store
+          echo -e "secrets:\n  store: env\n" >> spicepod.yaml
+          cat spicepod.yaml
 
-  #     - name: Check spice version
-  #       run: spice version
+      - name: Start spice runtime
+        env:
+          SPICE_SECRET_POSTGRES_PASSWORD: postgres
+        working-directory: test_app
+        run: |
+          spice run &
+            # time to initialize added dataset
+          sleep 5
 
-  #     - name: Init spice app
-  #       run: |
-  #         spice init test_app
+      - name: Wait for Spice runtime healthy
+        working-directory: test_app
+        timeout-minutes: 1
+        run: |
+          while [[ "$(curl -s http://localhost:3000/health)" != "ok" ]]; do sleep 1; done
 
-  #     - name: Spice dataset configure
-  #       working-directory: test_app
-  #       run: |
-  #         echo -e "eth_recent_blocks\neth recent blocks\npostgres:eth_recent_blocks\ny" | spice dataset configure
-  #         # configure pg credentials
-  #         echo -e "params:\n  pg_host: localhost\n  pg_port: 5432\n  pg_db: testdb\n  pg_user: postgres\n  pg_pass_key: password" >> ./datasets/eth_recent_blocks/dataset.yaml
-  #         # configure env secret store
-  #         echo -e "secrets:\n  store: env\n" >> spicepod.yaml
-  #         cat spicepod.yaml
+      - name: Check datasets
+        working-directory: test_app
+        run: |
+          response=$(curl http://localhost:3000/v1/datasets)
+          echo $response | jq
+          length=$(echo $response | jq 'if type=="array" then length else empty end')
+          if [[ $length -ne 1 ]]; then
+            echo "Unexpected response: $response, expected 1 dataset but received $length"
+            exit 1
+          fi
 
-  #     - name: Start spice runtime
-  #       env:
-  #         SPICE_SECRET_POSTGRES_PASSWORD: postgres
-  #       working-directory: test_app
-  #       run: |
-  #         spice run &> spice.log &
-  #         # time to initialize added dataset
-  #         sleep 35
+      - name: Check eth_recent_blocks table exists
+        working-directory: test_app
+        run: |
+          response=$(curl -X POST \
+            -H "Content-Type: text/plain" \
+            -d "show tables;" \
+            http://localhost:3000/v1/sql
+          )
+          echo $response | jq
+          table_exists=$(echo $response | jq '[.[] | select(.table_name == "eth_recent_blocks")]' | jq 'length')
+          if [[ $table_exists -eq 0 ]]; then
+            echo "Unexpected response: table 'eth_recent_blocks' does not exist."
+            exit 1
+          fi
 
-  #     - name: Wait for Spice runtime healthy
-  #       working-directory: test_app
-  #       timeout-minutes: 1
-  #       run: |
-  #         while [[ "$(curl -s http://localhost:3000/health)" != "ok" ]]; do sleep 1; done
-
-  #     - name: Check datasets
-  #       working-directory: test_app
-  #       run: |
-  #         response=$(curl http://localhost:3000/v1/datasets)
-  #         echo $response | jq
-  #         length=$(echo $response | jq 'if type=="array" then length else empty end')
-  #         if [[ $length -ne 1 ]]; then
-  #           echo "Unexpected response: $response, expected 1 dataset but received $length"
-  #           exit 1
-  #         fi
-
-  #     - name: Check eth_recent_blocks table exists
-  #       working-directory: test_app
-  #       run: |
-  #         response=$(curl -X POST \
-  #           -H "Content-Type: text/plain" \
-  #           -d "show tables;" \
-  #           http://localhost:3000/v1/sql
-  #         )
-  #         echo $response | jq
-  #         table_exists=$(echo $response | jq '[.[] | select(.table_name == "eth_recent_blocks")]' | jq 'length')
-  #         if [[ $table_exists -eq 0 ]]; then
-  #           echo "Unexpected response: table 'eth_recent_blocks' does not exist."
-  #           exit 1
-  #         fi
-
-  #     - name: Run Flight SQL query
-  #       working-directory: test_app
-  #       run: |
-  #         sql_output=$(echo "select * from eth_recent_blocks limit 10;" | spice sql)
-  #         echo "$sql_output"
-  #         if [[ $sql_output == *"error"* ]] || [[ $sql_output == *"not found"* ]]; then
-  #           echo "Unexpected response from spice sql, failed to perform test query: $sql_output"
-  #           exit 1
-  #         fi
-
-  #     - name: Stop spice and check logs
-  #       working-directory: test_app
-  #       if: always()
-  #       run: |
-  #         killall spice
-  #         cat spice.log
+      - name: Run Flight SQL query
+        working-directory: test_app
+        run: |
+          sql_output=$(echo "select * from eth_recent_blocks limit 10;" | spice sql)
+          echo "$sql_output"
+          if [[ $sql_output == *"error"* ]] || [[ $sql_output == *"not found"* ]]; then
+            echo "Unexpected response from spice sql, failed to perform test query: $sql_output"
+            exit 1
+          fi
 
   test_local_acceleration:
     name: "E2E Test: acceleration on ${{ matrix.target.name }} using ${{ matrix.acceleration.engine }}"
@@ -542,7 +520,7 @@ jobs:
           SPICE_SECRET_SPICEAI_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_KEY }}
         working-directory: test_app
         run: |
-          spice run &> spice.log &
+          spice run &
           sleep 5
 
       - name: Wait for Spice runtime healthy
@@ -586,10 +564,3 @@ jobs:
             echo "Unexpected response from spice sql, failed to perform test query: $sql_output"
             exit 1
           fi
-
-      - name: Stop spice and check logs
-        working-directory: test_app
-        if: always()
-        run: |
-          killall spice
-          cat spice.log
