@@ -45,10 +45,10 @@ pub enum Error {
     DbConnectionPoolError { source: db_connection_pool::Error },
 
     #[snafu(display("Failed to update sqlite table: {source}"))]
-    UpdateError { source: tokio_rusqlite::Error},
+    UpdateError { source: tokio_rusqlite::Error },
 
     #[snafu(display("Unsupported data type"))]
-    UnsupportedDataType{},
+    UnsupportedDataType {},
 
     #[snafu(display("SqliteDataFusionError: {source}"))]
     SqliteDataFusion {
@@ -73,11 +73,6 @@ pub struct SqliteBackend {
     pool: Arc<dyn DbConnectionPool<Connection, &'static (dyn ToSql + Sync)> + Send + Sync>,
     _primary_keys: Option<Vec<String>>,
 }
-
-pub fn to_tokio_rusqlite_error(e: impl Into<Error>) -> tokio_rusqlite::Error {
-    tokio_rusqlite::Error::Other(Box::new(e.into()))
-}
-
 
 impl DataPublisher for SqliteBackend {
     fn add_data(&self, _dataset: Arc<Dataset>, data_update: DataUpdate) -> AddDataResult {
