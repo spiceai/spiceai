@@ -17,6 +17,7 @@ limitations under the License.
 use std::{collections::HashMap, str::FromStr, sync::Arc};
 
 use async_trait::async_trait;
+use bb8::ErrorSink;
 use bb8_postgres::{
     tokio_postgres::{config::Host, types::ToSql, Config},
     PostgresConnectionManager,
@@ -111,8 +112,10 @@ impl PostgresConnectionPool {
         let builder = TlsConnector::builder();
         let connector = MakeTlsConnector::new(builder.build()?);
         let manager = PostgresConnectionManager::new(config, connector);
+        let error_sink = PostgresErrorSink::new();
 
         let pool = bb8::Pool::builder()
+            .error_sink(Box::new(error_sink))
             .build(manager)
             .await
             .context(ConnectionPoolSnafu)?;
@@ -120,6 +123,30 @@ impl PostgresConnectionPool {
         Ok(PostgresConnectionPool {
             pool: Arc::new(pool),
         })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PostgresErrorSink {}
+
+impl PostgresErrorSink {
+    pub fn new() -> Self {
+        PostgresErrorSink {}
+    }
+}
+
+impl<E> ErrorSink<E> for PostgresErrorSink
+where
+    E: std::fmt::Debug,
+    E: std::fmt::Display,
+{
+    fn sink(&self, error: E) {
+        tracing::error!("Postgres Connection Error: {}", error);
+        println!("Postgres Connection Error: {}", error);
+    }
+
+    fn boxed_clone(&self) -> Box<dyn ErrorSink<E>> {
+        Box::new(*self)
     }
 }
 
