@@ -19,11 +19,11 @@ use std::any::Any;
 use arrow::datatypes::SchemaRef;
 use arrow_sql_gen::postgres::rows_to_arrow;
 use bb8_postgres::tokio_postgres::types::ToSql;
-use bb8_postgres::tokio_postgres::NoTls;
 use bb8_postgres::PostgresConnectionManager;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::memory::MemoryStream;
 use datafusion::sql::TableReference;
+use postgres_native_tls::MakeTlsConnector;
 use snafu::prelude::*;
 
 use super::AsyncDbConnection;
@@ -44,12 +44,12 @@ pub enum Error {
 }
 
 pub struct PostgresConnection {
-    pub conn: bb8::PooledConnection<'static, PostgresConnectionManager<NoTls>>,
+    pub conn: bb8::PooledConnection<'static, PostgresConnectionManager<MakeTlsConnector>>,
 }
 
 impl<'a>
     DbConnection<
-        bb8::PooledConnection<'static, PostgresConnectionManager<NoTls>>,
+        bb8::PooledConnection<'static, PostgresConnectionManager<MakeTlsConnector>>,
         &'a (dyn ToSql + Sync),
     > for PostgresConnection
 {
@@ -65,7 +65,7 @@ impl<'a>
         &self,
     ) -> Option<
         &dyn AsyncDbConnection<
-            bb8::PooledConnection<'static, PostgresConnectionManager<NoTls>>,
+            bb8::PooledConnection<'static, PostgresConnectionManager<MakeTlsConnector>>,
             &'a (dyn ToSql + Sync),
         >,
     > {
@@ -76,11 +76,13 @@ impl<'a>
 #[async_trait::async_trait]
 impl<'a>
     AsyncDbConnection<
-        bb8::PooledConnection<'static, PostgresConnectionManager<NoTls>>,
+        bb8::PooledConnection<'static, PostgresConnectionManager<MakeTlsConnector>>,
         &'a (dyn ToSql + Sync),
     > for PostgresConnection
 {
-    fn new(conn: bb8::PooledConnection<'static, PostgresConnectionManager<NoTls>>) -> Self {
+    fn new(
+        conn: bb8::PooledConnection<'static, PostgresConnectionManager<MakeTlsConnector>>,
+    ) -> Self {
         PostgresConnection { conn }
     }
 

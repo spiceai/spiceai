@@ -17,13 +17,13 @@ limitations under the License.
 use arrow::array::RecordBatch;
 use async_trait::async_trait;
 use bb8_postgres::tokio_postgres::types::ToSql;
-use bb8_postgres::tokio_postgres::NoTls;
 use bb8_postgres::PostgresConnectionManager;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
 use db_connection_pool::postgrespool::PostgresConnectionPool;
 use db_connection_pool::DbConnectionPool;
 use futures::TryStreamExt;
+use postgres_native_tls::MakeTlsConnector;
 use secrets::Secret;
 use snafu::prelude::*;
 use spicepod::component::dataset::Dataset;
@@ -39,7 +39,7 @@ use super::{DataConnector, DataConnectorFactory};
 pub struct Postgres {
     pool: Arc<
         dyn DbConnectionPool<
-                bb8::PooledConnection<'static, PostgresConnectionManager<NoTls>>,
+                bb8::PooledConnection<'static, PostgresConnectionManager<MakeTlsConnector>>,
                 &'static (dyn ToSql + Sync),
             > + Send
             + Sync,
@@ -54,7 +54,7 @@ impl DataConnectorFactory for Postgres {
         Box::pin(async move {
             let pool: Arc<
                 dyn DbConnectionPool<
-                        bb8::PooledConnection<'static, PostgresConnectionManager<NoTls>>,
+                        bb8::PooledConnection<'static, PostgresConnectionManager<MakeTlsConnector>>,
                         &'static (dyn ToSql + Sync),
                     > + Send
                     + Sync,
