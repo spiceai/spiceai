@@ -4,11 +4,10 @@ Rust SDK for Spice.ai
 
 ## Installation
 
-Add the following to your `Cargo.toml`:
+Add Spice SDK
 
-```toml
-[dependencies]
-spice-rs = { git = "https://github.com/spiceai/spice-rs", tag = "v1.0.2" }
+```bash
+cargo add spiceai
 ```
 
 ## Usage
