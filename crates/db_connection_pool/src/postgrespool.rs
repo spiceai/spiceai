@@ -62,6 +62,7 @@ impl PostgresConnectionPool {
         secret: Option<Secret>,
     ) -> Result<Self> {
         let mut connection_string = "host=localhost user=postgres dbname=postgres".to_string();
+        let mut accept_invalid_certs = false;
 
         if let Some(params) = params.as_ref() {
             connection_string = String::new();
@@ -94,6 +95,9 @@ impl PostgresConnectionPool {
                 if let Some(pg_sslmode) = params.get("pg_sslmode") {
                     connection_string.push_str(format!("sslmode={pg_sslmode} ").as_str());
                 }
+                if let Some(pg_insecure) = params.get("pg_insecure") {
+                    accept_invalid_certs = pg_insecure == "true";
+                }
             }
         }
 
@@ -109,8 +113,11 @@ impl PostgresConnectionPool {
             }
         }
 
-        let builder = TlsConnector::builder();
-        let connector = MakeTlsConnector::new(builder.build()?);
+        let connector = TlsConnector::builder()
+            .danger_accept_invalid_certs(accept_invalid_certs)
+            .build()?;
+        let connector = MakeTlsConnector::new(connector);
+
         let manager = PostgresConnectionManager::new(config, connector);
         let error_sink = PostgresErrorSink::new();
 
@@ -141,7 +148,6 @@ where
     E: std::fmt::Display,
 {
     fn sink(&self, error: E) {
-        println!("Postgres Connection Error: {:?}", error);
         tracing::error!("Postgres Connection Error: {:?}", error);
     }
 
