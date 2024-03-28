@@ -108,13 +108,7 @@ A `spicepod.yaml` file is created in the `spice_qs` directory. Change to that di
 cd spice_qs
 ```
 
-**Step 3.** Connect to the sample Dremio instance to access the sample data:
-
-```bash
-spice login dremio -u demo -p demo1234
-```
-
-**Step 4.** Start the Spice runtime:
+**Step 3.** Start the Spice runtime:
 
 ```bash
 spice run
@@ -132,7 +126,7 @@ Using latest 'local' runtime version.
 
 The runtime is now started and ready for queries.
 
-**Step 5.** In a new terminal window, add the `spiceai/quickstart` Spicepod. A Spicepod is a package of configuration defining datasets and ML models.
+**Step 4.** In a new terminal window, add the `spiceai/quickstart` Spicepod. A Spicepod is a package of configuration defining datasets and ML models.
 
 ```bash
 spice add spiceai/quickstart
@@ -155,7 +149,7 @@ The `spiceai/quickstart` Spicepod will add a `taxi_trips` data table to the runt
 2024-02-22T05:53:48.223101Z  INFO runtime::dataconnector: Refreshing data for taxi_trips
 ```
 
-**Step 6.** Start the Spice SQL REPL:
+**Step 5.** Start the Spice SQL REPL:
 
 ```bash
 spice sql
@@ -317,72 +311,6 @@ Query took: 0.004057791 seconds
 ```
 
 You can experiment with the time it takes to generate queries when using non-accelerated datasets. You can change the acceleration setting from `true` to `false` in the datasets.yaml file.
-
-## Importing dataset from S3
-
-**Step 1.** If you haven't already initialized a new project, you need to do so. Then, start the Spice Runtime.
-
-```bash
-spice init s3-demo-project
-```
-
-```bash
-cd s3-demo-project
-spice run
-```
-
-**Step 2.** We now configure the dataset from S3:
-
-```bash
-spice dataset configure
-```
-
-Enter the name of the dataset:
-
-```bash
-dataset name: (s3-demo-project)  taxi_trips
-```
-
-Enter the description of the dataset:
-
-```
-description: taxi trips in s3
-```
-
-Specify the location of the dataset:
-
-```bash
-from: s3://spiceai-demo-datasets/taxi_trips/2024/
-```
-
-Select "y" when prompted whether to locally accelerate the dataset:
-
-```bash
-Locally accelerate (y/n)? y
-```
-
-We should now see the following output:
-
-```
-Dataset settings written to `datasets/taxi_trips/dataset.yaml`!
-```
-
-You will see the following in the Spice runtime terminal :
-
-```
-2024-02-14T18:34:15.174564Z  INFO spiced: Loaded dataset: taxi_trips
-2024-02-14T18:34:15.175189Z  INFO runtime::datasource: Refreshing data for taxi_trips
-```
-
-**Step 3.** Run queries against the dataset using the Spice SQL REPL.
-
-In a new terminal, start the Spice SQL REPL
-
-```bash
-spice sql
-```
-
-You can now now query `taxi_trips` in the runtime.
 
 ### Upcoming Features
 
