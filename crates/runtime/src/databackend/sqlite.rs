@@ -83,7 +83,7 @@ impl DataPublisher for SqliteBackend {
             if let Some(batch) = data_update.data.first() {
                 for field in batch.schema().fields() {
                     if field.data_type().is_nested() {
-                        let field_name = self.name.clone() + "." + field.name();
+                        let field_name = format!("{}.{}", name, field.name());
                         tracing::error!("Unable to append {field_name}: nested types are not currently supported for local acceleration by sqlite");
                         return Err(
                             Box::new(Error::UnsupportedDataType {}) as Box<dyn std::error::Error>
