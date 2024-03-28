@@ -80,7 +80,7 @@ Spice enables developers to build both data _and_ AI-driven applications by co-l
 
 ## Quickstart
 
-https://github.com/spiceai/spiceai/assets/112157037/c9cfdaeb-ac6a-484f-a382-4c2735833f71
+https://blog.spiceai.org/posts/2024/03/28/adding-spice-the-next-generation-of-spice.ai-oss/
 
 ### macOS, Linux and WSL
 
