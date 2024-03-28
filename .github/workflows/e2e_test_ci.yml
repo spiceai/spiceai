@@ -85,7 +85,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/trunk' }}
 
       - name: Build spiced
-        run: make -C bin/spiced DEV=1
+        run: make -C bin/spiced
 
       - name: Update build cache (macOS)
         if: matrix.target.target_os == 'darwin'
