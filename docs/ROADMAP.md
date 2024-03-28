@@ -12,16 +12,12 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 
 - See [Bugs](https://github.com/spiceai/spiceai/labels/bug). Feel free to file a new Issue if you see a bug and let us know on Discord.
 
-## v0.10-alpha (Mar 2024)
-
-- Helm chart
-- Grafana dashboard
-- BigQuery data connector (alpha)
-- Snowflake data connector (alpha)
-
 ## v0.11-alpha (Apr 2024)
 
+- Helm chart
 - Stability, reliability, and performance
+- BigQuery data connector (alpha)
+- Snowflake data connector (alpha)
 
 ## v0.12-alpha
 
