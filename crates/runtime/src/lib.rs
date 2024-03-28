@@ -155,13 +155,13 @@ impl Runtime {
         if let Some(app) = app_lock.as_ref() {
             for ds in &app.datasets {
                 status::update_dataset(ds.name.clone(), status::ComponentStatus::Initializing);
-                self.load_dataset(ds);
+                self.load_dataset(ds, &app.datasets);
             }
         }
     }
 
     // Caller must set `status::update_dataset(...` before calling `load_dataset`. This function will set error/ready statues appropriately.`
-    pub fn load_dataset(&self, ds: &Dataset) {
+    pub fn load_dataset(&self, ds: &Dataset, all_datasets: &[Dataset]) {
         let df = Arc::clone(&self.df);
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
         let shared_secrets_provider: Arc<RwLock<secrets::SecretsProvider>> =
@@ -169,9 +169,20 @@ impl Runtime {
 
         let ds = ds.clone();
 
+        let existing_tables = all_datasets
+            .iter()
+            .map(|d| d.name.clone())
+            .collect::<Vec<String>>();
+
         tokio::spawn(async move {
             loop {
                 let secrets_provider = shared_secrets_provider.read().await;
+
+                if !verify_dependent_tables(&ds, &existing_tables, df.clone()).await {
+                    status::update_dataset(ds.name.clone(), status::ComponentStatus::Error);
+                    metrics::counter!("datasets_load_error").increment(1);
+                    return;
+                }
 
                 let source = ds.source();
 
@@ -270,10 +281,10 @@ impl Runtime {
         metrics::gauge!("datasets_count", "engine" => engine).decrement(1.0);
     }
 
-    pub async fn update_dataset(&self, ds: &Dataset) {
+    pub async fn update_dataset(&self, ds: &Dataset, all_datasets: &[Dataset]) {
         status::update_dataset(ds.name.clone(), status::ComponentStatus::Refreshing);
         self.remove_dataset(ds).await;
-        self.load_dataset(ds);
+        self.load_dataset(ds, all_datasets);
     }
 
     async fn get_dataconnector_from_source(
@@ -496,14 +507,14 @@ impl Runtime {
                         current_app.datasets.iter().find(|d| d.name == ds.name)
                     {
                         if current_ds != ds {
-                            self.update_dataset(ds).await;
+                            self.update_dataset(ds, &new_app.datasets).await;
                         }
                     } else {
                         status::update_dataset(
                             ds.name.clone(),
                             status::ComponentStatus::Initializing,
                         );
-                        self.load_dataset(ds);
+                        self.load_dataset(ds, &new_app.datasets);
                     }
                 }
 
@@ -548,6 +559,41 @@ impl Runtime {
 
         Ok(())
     }
+}
+
+async fn verify_dependent_tables(
+    ds: &Dataset,
+    existing_tables: &[String],
+    df: Arc<RwLock<DataFusion>>,
+) -> bool {
+    if !ds.is_view() {
+        return true;
+    }
+
+    let dependent_tables = match df.read().await.get_view_dependent_tables(ds) {
+        Ok(tables) => tables,
+        Err(err) => {
+            tracing::error!(
+                "Failed to get dependent tables for view {}: {}",
+                &ds.name,
+                err
+            );
+            return false;
+        }
+    };
+
+    for tbl in &dependent_tables {
+        if !existing_tables.contains(tbl) {
+            tracing::error!(
+                "Failed to load {}. Dependent table {} not found",
+                &ds.name,
+                &tbl
+            );
+            return false;
+        }
+    }
+
+    return true;
 }
 
 fn has_table_provider(data_connector: &Option<Box<dyn DataConnector>>) -> bool {
