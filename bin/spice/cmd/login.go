@@ -70,7 +70,7 @@ spice login
 		cmd.Println("\nIf the browser does not open, please visit the following URL manually:")
 		cmd.Printf("\n%s\n\n", spiceAuthUrl)
 
-		browser.OpenURL(spiceApiClient.GetAuthUrl(authCode))
+		_ = browser.OpenURL(spiceApiClient.GetAuthUrl(authCode))
 
 		var accessToken string
 
