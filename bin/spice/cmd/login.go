@@ -56,9 +56,6 @@ spice login
 	Run: func(cmd *cobra.Command, args []string) {
 		authCode := generateAuthCode()
 
-		cmd.Println("Opening browser to authenticate with Spice.ai")
-		cmd.Printf("Auth Code: %s-%s\n", authCode[:4], authCode[4:])
-
 		spiceApiClient := api.NewSpiceApiClient()
 		err := spiceApiClient.Init()
 		if err != nil {
@@ -66,11 +63,14 @@ spice login
 			os.Exit(1)
 		}
 
-		err = browser.OpenURL(spiceApiClient.GetAuthUrl(authCode))
-		if err != nil {
-			cmd.Println(err.Error())
-			os.Exit(1)
-		}
+		spiceAuthUrl := spiceApiClient.GetAuthUrl(authCode)
+
+		cmd.Println("Attempting to open Spice.ai authorization page in your default browser")
+		cmd.Printf("\nYour auth code:\n\n%s-%s\n", authCode[:4], authCode[4:])
+		cmd.Println("\nIf the browser does not open, please visit the following URL manually:")
+		cmd.Printf("\n%s\n\n", spiceAuthUrl)
+
+		_ = browser.OpenURL(spiceApiClient.GetAuthUrl(authCode))
 
 		var accessToken string
 
