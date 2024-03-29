@@ -14,6 +14,7 @@ datasets:
       pg_db: tpch
       pg_user: postgres
       pg_pass: postgres
+      pg_insecure: "true"
 
   - from: postgres:lineitem
     name: lineitem
@@ -26,6 +27,7 @@ datasets:
       pg_db: tpch
       pg_user: postgres
       pg_pass: postgres
+      pg_insecure: "true"
 
   - from: postgres:nation
     name: nation
@@ -38,6 +40,7 @@ datasets:
       pg_db: tpch
       pg_user: postgres
       pg_pass: postgres
+      pg_insecure: "true"
 
   - from: postgres:orders
     name: orders
@@ -50,6 +53,7 @@ datasets:
       pg_db: tpch
       pg_user: postgres
       pg_pass: postgres
+      pg_insecure: "true"
 
   - from: postgres:part
     name: part
@@ -62,6 +66,7 @@ datasets:
       pg_db: tpch
       pg_user: postgres
       pg_pass: postgres
+      pg_insecure: "true"
 
   - from: postgres:partsupp
     name: partsupp
@@ -74,6 +79,7 @@ datasets:
       pg_db: tpch
       pg_user: postgres
       pg_pass: postgres
+      pg_insecure: "true"
 
   - from: postgres:region
     name: region
@@ -86,6 +92,7 @@ datasets:
       pg_db: tpch
       pg_user: postgres
       pg_pass: postgres
+      pg_insecure: "true"
   
   - from: postgres:supplier
     name: supplier
@@ -98,6 +105,7 @@ datasets:
       pg_db: tpch
       pg_user: postgres
       pg_pass: postgres
+      pg_insecure: "true"
 
 secrets:
   store: env
