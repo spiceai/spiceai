@@ -196,8 +196,30 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                 Type::FLOAT8 => {
                     handle_primitive_type!(builder, Type::FLOAT8, Float64Builder, f64, row, i);
                 }
-                Type::TEXT | Type::VARCHAR | Type::BPCHAR => {
+                Type::TEXT => {
                     handle_primitive_type!(builder, Type::TEXT, StringBuilder, &str, row, i);
+                }
+                Type::VARCHAR => {
+                    handle_primitive_type!(builder, Type::VARCHAR, StringBuilder, &str, row, i);
+                }
+                Type::BPCHAR => {
+                    let Some(builder) = builder else {
+                        return NoBuilderForIndexSnafu { index: i }.fail();
+                    };
+                    let Some(builder) = builder.as_any_mut().downcast_mut::<StringBuilder>() else {
+                        return FailedToDowncastBuilderSnafu {
+                            postgres_type: format!("{postgres_type}"),
+                        }
+                        .fail();
+                    };
+                    let v: Option<&str> = row.try_get(i).context(FailedToGetRowValueSnafu {
+                        pg_type: Type::BPCHAR,
+                    })?;
+
+                    match v {
+                        Some(v) => builder.append_value(v.trim_end()),
+                        None => builder.append_null(),
+                    }
                 }
                 Type::BOOL => {
                     handle_primitive_type!(builder, Type::BOOL, BooleanBuilder, bool, row, i);
