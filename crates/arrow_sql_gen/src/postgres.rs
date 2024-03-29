@@ -196,8 +196,14 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                 Type::FLOAT8 => {
                     handle_primitive_type!(builder, Type::FLOAT8, Float64Builder, f64, row, i);
                 }
-                Type::TEXT | Type::VARCHAR | Type::BPCHAR => {
+                Type::TEXT => {
                     handle_primitive_type!(builder, Type::TEXT, StringBuilder, &str, row, i);
+                }
+                Type::VARCHAR => {
+                    handle_primitive_type!(builder, Type::VARCHAR, StringBuilder, &str, row, i);
+                }
+                Type::BPCHAR => {
+                    handle_primitive_type!(builder, Type::BPCHAR, StringBuilder, &str, row, i);
                 }
                 Type::BOOL => {
                     handle_primitive_type!(builder, Type::BOOL, BooleanBuilder, bool, row, i);
