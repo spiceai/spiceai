@@ -178,7 +178,7 @@ impl Runtime {
             loop {
                 let secrets_provider = shared_secrets_provider.read().await;
 
-                if !verify_dependent_tables(&ds, &existing_tables, df.clone()).await {
+                if !verify_dependent_tables(&ds, &existing_tables, Arc::clone(&df)).await {
                     status::update_dataset(ds.name.clone(), status::ComponentStatus::Error);
                     metrics::counter!("datasets_load_error").increment(1);
                     return;
