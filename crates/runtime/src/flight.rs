@@ -153,7 +153,7 @@ impl Service {
             .ctx
             .sql(&sql)
             .await
-            .map_err(to_tonic_err)?;
+            .map_err(handle_datafusion_error)?;
         Ok(df.schema().into())
     }
 
@@ -233,9 +233,13 @@ fn record_batches_to_flight_stream(
 #[allow(clippy::needless_pass_by_value)]
 fn to_tonic_err<E>(e: E) -> Status
 where
-    E: std::fmt::Display,
+    E: std::fmt::Display + 'static,
 {
-    Status::internal(format!("{e}"))
+    if let Some(status) = (&e as &dyn std::any::Any).downcast_ref::<Status>() {
+        status.clone()
+    } else {
+        Status::internal(format!("{e}"))
+    }
 }
 
 #[allow(clippy::needless_pass_by_value)]
