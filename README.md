@@ -9,6 +9,8 @@
 
 **Spice** is a small, portable runtime that provides developers with a unified SQL query interface to locally materialize, accelerate, and query data tables sourced from any database, data warehouse, or data lake.
 
+📣 Read the [Spice.ai OSS announcement blog post](https://blog.spiceai.org/posts/2024/03/28/adding-spice-the-next-generation-of-spice.ai-oss/).
+
 Spice makes it easy to build data-driven and data-intensive applications by streamlining the use of data and machine learning (ML) in software.
 
 The Spice runtime is written in Rust and leverages industry leading technologies like Apache DataFusion, Apache Arrow, Apache Arrow Flight, and DuckDB.

@@ -309,6 +309,30 @@ impl DataFusion {
         }
     }
 
+    pub fn get_view_dependent_tables(&self, dataset: impl Borrow<Dataset>) -> Result<Vec<String>> {
+        let ds = dataset.borrow();
+
+        let Some(sql) = ds.view_sql().context(InvalidSQLViewSnafu)? else {
+            return ExpectedSqlViewSnafu.fail();
+        };
+
+        let statements = DFParser::parse_sql_with_dialect(sql.as_str(), &PostgreSqlDialect {})
+            .context(UnableToParseSqlSnafu)?;
+
+        if statements.len() != 1 {
+            return UnableToCreateViewSnafu {
+                reason: format!(
+                    "Expected 1 statement to create view from, received {}",
+                    statements.len()
+                )
+                .to_string(),
+            }
+            .fail();
+        }
+
+        Ok(DataFusion::get_dependent_table_names(&statements[0]))
+    }
+
     pub fn attach_view(&self, dataset: impl Borrow<Dataset>) -> Result<()> {
         let dataset = dataset.borrow();
         let table_exists = self.ctx.table_exist(dataset.name.as_str()).unwrap_or(false);
