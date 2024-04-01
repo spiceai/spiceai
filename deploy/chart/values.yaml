@@ -1,0 +1,19 @@
+image:
+  repository: spiceai/spiceai
+  # Replace this with a specific version, i.e. 0.10.0-alpha
+  tag: latest
+replicaCount: 1
+spicepod:
+  name: app
+  version: v1beta1
+  kind: Spicepod
+
+  datasets:
+    - from: s3://spiceai-demo-datasets/taxi_trips/2024/
+      name: taxi_trips
+      description: Demo taxi trips in s3
+      acceleration:
+        enabled: true
+        # Uncomment to refresh the acceleration on a schedule
+        # refresh_interval: 1h
+        # refresh_mode: full
