@@ -1,16 +1,32 @@
-use crate::auth::AuthProvider;
+/*
+Copyright 2024 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 use crate::modelruntime::ModelRuntime;
 use crate::modelruntime::Runnable;
 use crate::modelsource::create_source_from;
 use crate::DataFusion;
 use arrow::record_batch::RecordBatch;
+use secrets::Secret;
 use snafu::prelude::*;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
 pub struct Model {
     runnable: Box<dyn Runnable>,
-    model: spicepod::component::model::Model,
+    pub model: spicepod::component::model::Model,
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -32,24 +48,38 @@ pub enum Error {
 
     #[snafu(display("Unable to run model: {source}"))]
     UnableToRunModel { source: crate::modelruntime::Error },
+
+    #[snafu(display("Unable to load required secrets"))]
+    UnableToLoadRequiredSecrets {},
 }
 
 impl Model {
     pub async fn load(
-        model: &spicepod::component::model::Model,
-        auth: AuthProvider,
+        model: spicepod::component::model::Model,
+        secret: Option<Secret>,
     ) -> Result<Self> {
         let source = source(&model.from);
         let source = source.as_str();
 
+        let Some(secret) = secret else {
+            tracing::warn!(
+                "Unable to load model {}: unable to get secret for source {}",
+                model.name,
+                source
+            );
+            return UnableToLoadRequiredSecretsSnafu {}.fail();
+        };
+
         let mut params = std::collections::HashMap::new();
         params.insert("name".to_string(), model.name.to_string());
         params.insert("path".to_string(), path(&model.from));
+        params.insert("from".to_string(), path(&model.from));
+        params.insert("files".to_string(), model.files.join(",").to_string());
 
         let tract = crate::modelruntime::tract::Tract {
             path: create_source_from(source)
                 .context(UnknownModelSourceSnafu)?
-                .pull(auth, Arc::new(Option::from(params)))
+                .pull(secret, Arc::new(Option::from(params)))
                 .await
                 .context(UnableToLoadModelSnafu)?
                 .clone()
@@ -98,6 +128,7 @@ impl Model {
 pub(crate) fn source(from: &str) -> String {
     match from {
         s if s.starts_with("spiceai:") => "spiceai".to_string(),
+        s if s.starts_with("huggingface:") => "huggingface".to_string(),
         s if s.starts_with("file:/") => "localhost".to_string(),
         _ => "spiceai".to_string(),
     }

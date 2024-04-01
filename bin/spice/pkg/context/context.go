@@ -1,3 +1,19 @@
+/*
+Copyright 2024 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package context
 
 import (
@@ -19,10 +35,13 @@ type RuntimeContext struct {
 	spiceBinDir     string
 	appDir          string
 	podsDir         string
+	httpEndpoint    string
 }
 
 func NewContext() *RuntimeContext {
-	rtcontext := &RuntimeContext{}
+	rtcontext := &RuntimeContext{
+		httpEndpoint: "http://127.0.0.1:3000",
+	}
 	err := rtcontext.Init()
 	if err != nil {
 		panic(err)
@@ -40,6 +59,10 @@ func (c *RuntimeContext) AppDir() string {
 
 func (c *RuntimeContext) PodsDir() string {
 	return c.podsDir
+}
+
+func (c *RuntimeContext) HttpEndpoint() string {
+	return c.httpEndpoint
 }
 
 func (c *RuntimeContext) Init() error {
@@ -70,6 +93,10 @@ func (c *RuntimeContext) Version() (string, error) {
 	}
 
 	return strings.TrimSpace(string(version)), nil
+}
+
+func (c *RuntimeContext) RuntimeUnavailableError() error {
+	return fmt.Errorf("The Spice runtime is unavailable at %s. Is it running?", c.httpEndpoint)
 }
 
 func (c *RuntimeContext) IsRuntimeInstallRequired() bool {
@@ -120,8 +147,7 @@ func (c *RuntimeContext) IsRuntimeUpgradeAvailable() (string, error) {
 		return "", err
 	}
 
-	if currentVersion == "local" {
-		fmt.Println("Using latest 'local' runtime version.")
+	if strings.HasPrefix(currentVersion, "local") || strings.Contains(currentVersion, "rc") {
 		return "", nil
 	}
 
@@ -130,7 +156,7 @@ func (c *RuntimeContext) IsRuntimeUpgradeAvailable() (string, error) {
 		return "", err
 	}
 
-	if semver.Compare(currentVersion, release.TagName) == 0 {
+	if semver.Compare(currentVersion, release.TagName) >= 0 {
 		return "", nil
 	}
 
@@ -147,7 +173,7 @@ func (c *RuntimeContext) GetSpiceAppRelativePath(absolutePath string) string {
 func (c *RuntimeContext) GetRunCmd() (*exec.Cmd, error) {
 	spiceCMD := c.binaryFilePath("spiced")
 
-	cmd := exec.Command(spiceCMD)
+	cmd := exec.Command(spiceCMD, "--metrics", "127.0.0.1:9091")
 
 	return cmd, nil
 }

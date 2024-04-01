@@ -12,17 +12,18 @@ description = "The spiced runtime"
 snafu.workspace = true
 spicepod = { path = "../spicepod" }
 app = { path = "../app" }
-axum = { version = "0.7.4", features = ["macros"]}
+axum = { version = "0.7.4", features = ["macros"] }
 tokio.workspace = true
 tracing.workspace = true
 clap.workspace = true
 metrics.workspace = true
 datafusion.workspace = true
 arrow.workspace = true
-arrow-flight.workspace = true
-arrow-ipc = "49.0.0"
+arrow-flight = { workspace = true, features = ["flight-sql-experimental"] }
+arrow-ipc = "50.0.0"
 tonic.workspace = true
 tonic_0_9_0 = { version = "0.9.0", package = "tonic", features = ["gzip"] }
+tonic-health = "0.9.0"
 futures.workspace = true
 uuid = "1.6.1"
 tokio-stream = "0.1"
@@ -32,24 +33,71 @@ dirs = "5.0.1"
 toml = "0.8.8"
 serde.workspace = true
 serde_json = "1.0.1"
+serde_yaml = "0.9.30"
+csv = "1.3.0"
 flight_client = { path = "../flight_client" }
 tract-core = "0.21.0"
 tract-onnx = "0.21.0"
 ndarray = "0.15.3"
-ndarray-npy = { version = "0.8.0", features = [ "compressed_npz" ] }
-duckdb = { workspace = true,  features = ["bundled", "r2d2", "vtab", "vtab-arrow"], optional = true }
+ndarray-npy = { version = "0.8.0", features = ["compressed_npz"] }
+duckdb = { workspace = true, features = [
+    "bundled",
+    "r2d2",
+    "vtab",
+    "vtab-arrow",
+], optional = true }
 sql_provider_datafusion = { path = "../sql_provider_datafusion", optional = true }
 r2d2 = { workspace = true, optional = true }
-opentelemetry-proto = { version = "0.4.0", features = ["gen-tonic-messages", "gen-tonic", "metrics"] }
+opentelemetry-proto = { version = "0.4.0", features = [
+    "gen-tonic-messages",
+    "gen-tonic",
+    "metrics",
+] }
 indexmap = "2.2.2"
 regex = "1.10.3"
 reqwest = { version = "0.11.24", features = ["json"] }
 notify = "6.1.1"
-arrow-json = "49.0.0"
+arrow-json = "50.0.0"
 async-trait.workspace = true
+flightsql_datafusion = { path = "../flightsql_datafusion" }
 flight_datafusion = { path = "../flight_datafusion" }
+deltalake = { version = "0.17.0", features = ["datafusion-ext", "s3", "azure"] }
+itertools = "0.12"
+aws-config = "1.1.7"
+aws-types = "1.1.7"
+object_store = { version="0.9.1", features = ["aws"] }
+quick-xml = { version = "0.23.0-alpha3" }
+url = "2.5.0"
+arrow_sql_gen = { path = "../arrow_sql_gen", optional = true }
+bb8 = {workspace = true, optional = true}
+bb8-postgres = {workspace = true, optional = true}
+bytes = { version = "1", default-features = false }
+prost = { version = "0.12.1", default-features = false, features = ["prost-derive"] }
+once_cell = "1.19.0"
+secrets = { path = "../secrets" }
+base64 = "0.22.0"
+keyring = { version = "2.3.2", optional = true }
+db_connection_pool = { path = "../db_connection_pool" }
+secrecy = "0.8.0"
+rusqlite = { workspace = true, optional = true }
+tokio-rusqlite = { workspace = true, optional = true }
+pin-project = "1.0"
+lazy_static = "1.4.0"
+
+candle-core = "0.4.1"
+candle-examples = "0.4.1"
+candle-transformers = "0.4.1"
+tokenizers = "0.15.2"
 
 [features]
-default = ["duckdb"]
+default = ["duckdb", "postgres", "keyring-secret-store", "sqlite"]
 dev = []
 duckdb = ["dep:duckdb", "sql_provider_datafusion", "r2d2"]
+postgres = [
+    "dep:bb8",
+    "dep:bb8-postgres",
+    "sql_provider_datafusion",
+    "arrow_sql_gen",
+]
+sqlite = ["dep:rusqlite", "tokio-rusqlite"]
+keyring-secret-store = ["secrets/keyring-secret-store"]

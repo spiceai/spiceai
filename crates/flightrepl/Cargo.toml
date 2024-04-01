@@ -14,7 +14,7 @@ arrow-flight.workspace = true
 parquet = "49.0.0"
 clap.workspace = true
 tokio.workspace = true
-tonic = { workspace = true, default-features = false, features = [
+tonic = { workspace = true, features = [
   "transport",
   "tls",
   "tls-roots",
@@ -27,7 +27,6 @@ tracing.workspace = true
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 datafusion.workspace = true
 rustyline = "13.0.0"
-candle-core = "0.4.1"
-candle-examples = "0.4.1"
-candle-transformers = "0.4.1"
-tokenizers = "0.15.2"
+
+prost = { version = "0.12.1", default-features = false, features = ["prost-derive"] }
+ansi_term = "0.12.1"

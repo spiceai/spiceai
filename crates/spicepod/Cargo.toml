@@ -13,8 +13,9 @@ serde_yaml.workspace = true
 snafu.workspace = true
 tracing.workspace = true
 fundu = "2.0.0"
-sql_provider_datafusion = { path = "../sql_provider_datafusion" }
 
 [features]
-default = ["duckdb"]
+default = ["duckdb", "postgres", "sqlite"]
 duckdb = []
+postgres = []
+sqlite = []

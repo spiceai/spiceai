@@ -43,7 +43,7 @@ getSystemInfo() {
 }
 
 verifySupported() {
-    local supported=(linux-x86_64 darwin-aarch64)
+    local supported=(linux-x86_64 linux-aarch64 darwin-aarch64 darwin-x86_64)
     local current_osarch="${OS}-${ARCH}"
 
     for osarch in "${supported[@]}"; do
@@ -76,7 +76,7 @@ checkHttpRequestCLI() {
         echo
         echo "To install curl (OSX): 'brew install curl'"
         echo "To install curl (Ubuntu): 'apt install curl'"
-        echo 
+        echo
         exit 1
     fi
 }
@@ -161,7 +161,7 @@ installFile() {
 
     if [ -f "$SPICE_CLI_FILE" ]; then
         echo "$SPICE_CLI_FILENAME installed into $SPICE_CLI_INSTALL_DIR successfully."
-    else 
+    else
         echo "Failed to install $SPICE_CLI_FILENAME"
         exit 1
     fi
@@ -192,7 +192,7 @@ checkShell() {
     if [[ "$OS" == "linux" ]]; then
       MODIFIED_TIME=`date +%s -r "$SHELL"`
     elif [[ "$OS" == "darwin" ]]; then
-      MODIFIED_TIME=`stat -f%c "$SHELL"`
+      MODIFIED_TIME=`/usr/bin/stat -f%c "$SHELL"`
     fi
 
     if (( $MODIFIED_TIME > $MOST_RECENT_MODIFIED )); then

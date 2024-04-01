@@ -1,4 +1,20 @@
-use std::{collections::HashMap, fmt::Debug, sync::Arc};
+/*
+Copyright 2024 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+use std::{collections::HashMap, fmt::Debug, net::SocketAddr, sync::Arc};
 
 use app::App;
 use snafu::prelude::*;
@@ -7,7 +23,7 @@ use tokio::{
     sync::RwLock,
 };
 
-use crate::{datafusion::DataFusion, model::Model};
+use crate::{config, datafusion::DataFusion, model::Model};
 
 mod routes;
 mod v1;
@@ -28,11 +44,13 @@ pub(crate) async fn start<A>(
     app: Arc<RwLock<Option<App>>>,
     df: Arc<RwLock<DataFusion>>,
     models: Arc<RwLock<HashMap<String, Model>>>,
+    config: Arc<config::Config>,
+    with_metrics: Option<SocketAddr>,
 ) -> Result<()>
 where
     A: ToSocketAddrs + Debug,
 {
-    let routes = routes::routes(app, df, models);
+    let routes = routes::routes(app, df, models, config, with_metrics);
 
     let listener = TcpListener::bind(&bind_address)
         .await

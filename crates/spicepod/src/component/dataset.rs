@@ -1,3 +1,19 @@
+/*
+Copyright 2024 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 use std::{collections::HashMap, fs, time::Duration};
 
 use serde::{Deserialize, Serialize};
@@ -132,6 +148,24 @@ impl Dataset {
     }
 
     #[must_use]
+    pub fn acceleration_params(&self) -> Option<HashMap<String, String>> {
+        if let Some(acceleration) = &self.acceleration {
+            return acceleration.params.clone();
+        }
+
+        None
+    }
+
+    #[must_use]
+    pub fn engine_secret(&self) -> Option<String> {
+        if let Some(acceleration) = &self.acceleration {
+            return acceleration.engine_secret.clone();
+        }
+
+        None
+    }
+
+    #[must_use]
     pub fn refresh_interval(&self) -> Option<Duration> {
         if let Some(acceleration) = &self.acceleration {
             if let Some(refresh_interval) = &acceleration.refresh_interval {
@@ -191,7 +225,10 @@ impl WithDependsOn<Dataset> for Dataset {
 }
 
 pub mod acceleration {
+    use std::fmt;
+
     use serde::{Deserialize, Serialize};
+    use std::collections::HashMap;
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
     #[serde(rename_all = "lowercase")]
@@ -215,11 +252,29 @@ pub mod acceleration {
         Arrow,
         #[cfg(feature = "duckdb")]
         DuckDB,
+        #[cfg(feature = "postgres")]
+        Postgres,
+        #[cfg(feature = "sqlite")]
+        Sqlite,
     }
 
+    impl fmt::Display for Engine {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(
+                f,
+                "{}",
+                match *self {
+                    Engine::Arrow => "arrow",
+                    Engine::DuckDB => "duckdb",
+                    Engine::Postgres => "postgres",
+                    Engine::Sqlite => "sqlite",
+                }
+            )
+        }
+    }
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
     pub struct Acceleration {
-        #[serde(default)]
+        #[serde(default = "default_true")]
         pub enabled: bool,
 
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -236,6 +291,16 @@ pub mod acceleration {
 
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub retention: Option<String>,
+
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub params: Option<HashMap<String, String>>,
+
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub engine_secret: Option<String>,
+    }
+
+    const fn default_true() -> bool {
+        true
     }
 
     impl Acceleration {
@@ -247,15 +312,6 @@ pub mod acceleration {
         #[must_use]
         pub fn engine(&self) -> Engine {
             self.engine.clone().unwrap_or_default()
-        }
-    }
-}
-
-impl From<acceleration::Mode> for sql_provider_datafusion::dbconnectionpool::Mode {
-    fn from(m: acceleration::Mode) -> Self {
-        match m {
-            acceleration::Mode::File => sql_provider_datafusion::dbconnectionpool::Mode::File,
-            acceleration::Mode::Memory => sql_provider_datafusion::dbconnectionpool::Mode::Memory,
         }
     }
 }

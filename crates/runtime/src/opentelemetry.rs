@@ -1,3 +1,19 @@
+/*
+Copyright 2024 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 use std::i64::MAX;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -34,6 +50,8 @@ use tonic_0_9_0::transport::Server;
 use tonic_0_9_0::Request;
 use tonic_0_9_0::Response;
 use tonic_0_9_0::Status;
+use tonic_health::pb::health_server::Health;
+use tonic_health::pb::health_server::HealthServer;
 
 use crate::datafusion::DataFusion;
 use crate::dataupdate::DataUpdate;
@@ -155,7 +173,8 @@ impl MetricsService for Service {
                                             all_publishers_failed = false;
                                         }
                                         Err(e) => {
-                                            tracing::error!(
+                                            // Rely on the publisher to provide a useful error message to the user.
+                                            tracing::debug!(
                                                 "Failed to add OpenTelemetry data to backend: {e}"
                                             );
                                         }
@@ -194,6 +213,14 @@ impl MetricsService for Service {
             partial_success,
         }))
     }
+}
+
+async fn create_health_service() -> HealthServer<impl Health> {
+    let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
+    health_reporter
+        .set_serving::<MetricsServiceServer<Service>>()
+        .await;
+    health_service
 }
 
 pub fn metric_data_to_record_batch(
@@ -583,6 +610,7 @@ pub async fn start(bind_address: SocketAddr, data_fusion: Arc<RwLock<DataFusion>
     tracing::info!("Spice Runtime OpenTelemetry listening on {bind_address}");
 
     Server::builder()
+        .add_service(create_health_service().await)
         .add_service(svc)
         .serve(bind_address)
         .await

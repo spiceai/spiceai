@@ -1,25 +1,50 @@
+/*
+Copyright 2024 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
 use futures::stream;
+use lazy_static::lazy_static;
+use object_store::ObjectStore;
 use snafu::prelude::*;
 use spicepod::component::dataset::acceleration::RefreshMode;
 use spicepod::component::dataset::Dataset;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
+use tokio::sync::Mutex;
+use url::Url;
 
 use arrow::record_batch::RecordBatch;
 use async_stream::stream;
 use futures_core::stream::BoxStream;
+use secrets::Secret;
 use std::future::Future;
 
-use crate::auth::AuthProvider;
 use crate::datapublisher::DataPublisher;
 use crate::dataupdate::{DataUpdate, UpdateType};
+use crate::status;
+use crate::timing::TimeMeasurement;
 
-pub mod debug;
+pub mod databricks;
 pub mod dremio;
 pub mod flight;
+pub mod flightsql;
+pub mod postgres;
+pub mod s3;
 pub mod spiceai;
 
 #[derive(Debug, Snafu)]
@@ -38,6 +63,72 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub type AnyErrorResult = std::result::Result<(), Box<dyn std::error::Error>>;
 
+type NewDataConnectorResult = Result<Box<dyn DataConnector>>;
+
+type NewDataConnectorFn = dyn Fn(
+        Option<Secret>,
+        Arc<Option<HashMap<String, String>>>,
+    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>>
+    + Send;
+
+lazy_static! {
+    static ref DATA_CONNECTOR_FACTORY_REGISTRY: Mutex<HashMap<String, Box<NewDataConnectorFn>>> =
+        Mutex::new(HashMap::new());
+}
+
+pub async fn register_connector_factory(
+    name: &str,
+    connector_factory: impl Fn(
+            Option<Secret>,
+            Arc<Option<HashMap<String, String>>>,
+        ) -> Pin<Box<dyn Future<Output = Result<Box<dyn DataConnector>>> + Send>>
+        + Send
+        + 'static,
+) {
+    let mut registry = DATA_CONNECTOR_FACTORY_REGISTRY.lock().await;
+
+    registry.insert(name.to_string(), Box::new(connector_factory));
+}
+
+/// Create a new `DataConnector` by name.
+///
+/// # Returns
+///
+/// `None` if the connector for `name` is not registered, otherwise a `Result` containing the result of calling the constructor to create a `DataConnector`.
+#[allow(clippy::implicit_hasher)]
+pub async fn create_new_connector(
+    name: &str,
+    secret: Option<Secret>,
+    params: Arc<Option<HashMap<String, String>>>,
+) -> Option<Result<Box<dyn DataConnector>>> {
+    let guard = DATA_CONNECTOR_FACTORY_REGISTRY.lock().await;
+
+    let connector_factory = guard.get(name);
+
+    match connector_factory {
+        Some(factory) => Some(factory(secret, params).await),
+        None => None,
+    }
+}
+
+pub async fn register_all() {
+    tokio::join!(
+        register_connector_factory("databricks", databricks::Databricks::create),
+        register_connector_factory("dremio", dremio::Dremio::create),
+        register_connector_factory("flightsql", flightsql::FlightSQL::create),
+        register_connector_factory("postgres", postgres::Postgres::create),
+        register_connector_factory("s3", s3::S3::create),
+        register_connector_factory("spiceai", spiceai::SpiceAI::create),
+    );
+}
+
+pub trait DataConnectorFactory {
+    fn create(
+        secret: Option<Secret>,
+        params: Arc<Option<HashMap<String, String>>>,
+    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>>;
+}
+
 /// A `DataConnector` knows how to retrieve and modify data for a given dataset.
 ///
 /// Implementing `get_all_data` is required, but `stream_data_updates` & `supports_data_streaming` is optional.
@@ -52,14 +143,6 @@ pub type AnyErrorResult = std::result::Result<(), Box<dyn std::error::Error>>;
 /// ```
 #[async_trait]
 pub trait DataConnector: Send + Sync {
-    /// Create a new `DataConnector` with the given `AuthProvider`.
-    fn new(
-        auth_provider: AuthProvider,
-        params: Arc<Option<HashMap<String, String>>>,
-    ) -> Pin<Box<dyn Future<Output = Result<Self>> + Send>>
-    where
-        Self: Sized;
-
     /// Returns true if the given dataset supports streaming by this `DataConnector`.
     fn supports_data_streaming(&self, _dataset: &Dataset) -> bool {
         false
@@ -82,6 +165,17 @@ pub trait DataConnector: Send + Sync {
 
     fn has_table_provider(&self) -> bool {
         false
+    }
+
+    fn has_object_store(&self) -> bool {
+        false
+    }
+
+    fn get_object_store(
+        &self,
+        dataset: &Dataset,
+    ) -> std::result::Result<(Url, Arc<dyn ObjectStore + 'static>), Error> {
+        panic!("get_object_store not implemented for {}", dataset.name)
     }
 
     async fn get_table_provider(
@@ -113,10 +207,15 @@ impl dyn DataConnector + '_ {
             return Box::pin(stream! {
                 loop {
                     tracing::info!("Refreshing data for {}", dataset.name);
+                    status::update_dataset(dataset.name.clone(), status::ComponentStatus::Refreshing);
+                    let timer = TimeMeasurement::new("load_dataset_duration_ms", vec![("dataset", dataset.name.clone())]);
+                    let new_data = self.get_all_data(dataset).await;
+                    status::update_dataset(dataset.name.clone(), status::ComponentStatus::Ready);
                     yield DataUpdate {
-                        data: self.get_all_data(dataset).await,
+                        data: new_data,
                         update_type: UpdateType::Overwrite,
                     };
+                    drop(timer);
                     tokio::time::sleep(refresh_interval).await;
                 }
             });
@@ -125,8 +224,17 @@ impl dyn DataConnector + '_ {
         tracing::trace!("stream::once");
         // Otherwise, just return the data once.
         Box::pin(stream::once(async move {
+            let timer = TimeMeasurement::new(
+                "load_dataset_duration_ms",
+                vec![("dataset", dataset.name.clone())],
+            );
+            status::update_dataset(dataset.name.clone(), status::ComponentStatus::Refreshing);
+            let data = self.get_all_data(dataset).await;
+            status::update_dataset(dataset.name.clone(), status::ComponentStatus::Ready);
+            drop(timer);
+
             DataUpdate {
-                data: self.get_all_data(dataset).await,
+                data,
                 update_type: UpdateType::Overwrite,
             }
         }))

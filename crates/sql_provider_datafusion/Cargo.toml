@@ -18,6 +18,8 @@ r2d2.workspace = true
 snafu.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+futures.workspace = true
+db_connection_pool = { path = "../db_connection_pool" }
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }

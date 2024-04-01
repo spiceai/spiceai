@@ -1,3 +1,19 @@
+/*
+Copyright 2024 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -19,7 +35,7 @@ use futures::StreamExt;
 use snafu::prelude::*;
 use spicepod::component::dataset::Dataset;
 use tokio::sync::RwLock;
-use tokio::time::sleep;
+use tokio::time::{sleep, Instant};
 use tokio::{spawn, task};
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -36,19 +52,29 @@ pub enum Error {
     TableAlreadyExists {},
 
     #[snafu(display("Unable to get table: {source}"))]
-    DatasetConfigurationError { source: databackend::Error },
+    DatasetConfigurationError {
+        source: databackend::Error,
+    },
 
     #[snafu(display("Invalid configuration: {msg}"))]
-    InvalidConfiguration { msg: String },
+    InvalidConfiguration {
+        msg: String,
+    },
 
     #[snafu(display("Unable to create dataset acceleration: {source}"))]
-    UnableToCreateBackend { source: databackend::Error },
+    UnableToCreateBackend {
+        source: databackend::Error,
+    },
 
     #[snafu(display("Unable to create view: {reason}"))]
-    UnableToCreateView { reason: String },
+    UnableToCreateView {
+        reason: String,
+    },
 
     #[snafu(display("Unable to delete table: {reason}"))]
-    UnableToDeleteTable { reason: String },
+    UnableToDeleteTable {
+        reason: String,
+    },
 
     #[snafu(display("Unable to parse SQL: {source}"))]
     UnableToParseSql {
@@ -56,10 +82,14 @@ pub enum Error {
     },
 
     #[snafu(display("Unable to get table: {source}"))]
-    UnableToGetTable { source: DataFusionError },
+    UnableToGetTable {
+        source: DataFusionError,
+    },
 
     #[snafu(display("Unable to register table: {source}"))]
-    UnableToRegisterTable { source: crate::dataconnector::Error },
+    UnableToRegisterTable {
+        source: crate::dataconnector::Error,
+    },
 
     #[snafu(display("Unable to create view: {source}"))]
     InvalidSQLView {
@@ -68,6 +98,8 @@ pub enum Error {
 
     #[snafu(display("Expected a SQL view statement, received nothing."))]
     ExpectedSqlView,
+
+    InvalidObjectStore,
 }
 
 type PublisherList = Arc<RwLock<Vec<Arc<Box<dyn DataPublisher>>>>>;
@@ -86,9 +118,7 @@ impl DataFusion {
         let mut df_config = SessionConfig::new().with_information_schema(true);
         df_config.options_mut().sql_parser.dialect = "PostgreSQL".to_string();
         DataFusion {
-            ctx: Arc::new(SessionContext::new_with_config(
-                SessionConfig::new().with_information_schema(true),
-            )),
+            ctx: Arc::new(SessionContext::new_with_config(df_config)),
             connectors_tasks: HashMap::new(),
             data_publishers: HashMap::new(),
         }
@@ -121,9 +151,10 @@ impl DataFusion {
     }
 
     #[allow(clippy::needless_pass_by_value)]
-    pub fn new_accelerated_backend(
+    pub async fn new_accelerated_backend(
         &self,
         dataset: impl Borrow<Dataset>,
+        secrets_provider: Arc<RwLock<secrets::SecretsProvider>>,
     ) -> Result<Box<dyn DataPublisher>> {
         let dataset = dataset.borrow();
         let table_name = dataset.name.to_string();
@@ -135,14 +166,22 @@ impl DataFusion {
                     msg: "No acceleration configuration found".to_string(),
                 })?;
 
-        let params: Arc<Option<HashMap<String, String>>> = Arc::new(dataset.params.clone());
+        let params: Arc<Option<HashMap<String, String>>> =
+            Arc::new(dataset.acceleration_params().clone());
+
+        let secret_key = dataset
+            .engine_secret()
+            .unwrap_or(format!("{:?}_engine", acceleration.engine()).to_lowercase());
+        let backend_secret = secrets_provider.read().await.get_secret(&secret_key).await;
 
         let data_backend: Box<dyn DataPublisher> =
             DataBackendBuilder::new(Arc::clone(&self.ctx), table_name)
                 .engine(acceleration.engine())
                 .mode(acceleration.mode())
                 .params(params)
+                .secret(backend_secret)
                 .build()
+                .await
                 .context(DatasetConfigurationSnafu)?;
 
         Ok(data_backend)
@@ -190,7 +229,7 @@ impl DataFusion {
                     Some(data_update) => {
                         match publisher.add_data(Arc::clone(&dataset), data_update).await {
                             Ok(()) => (),
-                            Err(e) => tracing::error!("Error adding data: {e:?}"),
+                            Err(e) => tracing::error!("Error adding data: {e}"),
                         }
                     }
                     None => break,
@@ -240,6 +279,18 @@ impl DataFusion {
         data_connector: Box<dyn DataConnector>,
     ) -> Result<()> {
         let dataset = dataset.borrow();
+
+        if data_connector.has_object_store() {
+            let Ok((key, store)) = data_connector.get_object_store(dataset) else {
+                return Err(Error::InvalidObjectStore);
+            };
+
+            let _ = self
+                .ctx
+                .runtime_env()
+                .register_object_store(&key, Arc::clone(&store));
+        }
+
         let table_exists = self.ctx.table_exist(dataset.name.as_str()).unwrap_or(false);
         if table_exists {
             return TableAlreadyExistsSnafu.fail();
@@ -287,11 +338,24 @@ impl DataFusion {
             // Tables are currently lazily created (i.e. not created until first data is received) so that we know the table schema.
             // This means that we can't create a view on top of a table until the first data is received for all dependent tables and therefore
             // the tables are created. To handle this, wait until all tables are created.
+
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let mut unresolved_dependent_table: Option<String> = None;
             let dependent_table_names = DataFusion::get_dependent_table_names(&statements[0]);
             for dependent_table_name in dependent_table_names {
                 let mut attempts = 0;
+
+                if unresolved_dependent_table.is_some() {
+                    break;
+                }
+
                 loop {
                     if !ctx.table_exist(&dependent_table_name).unwrap_or(false) {
+                        if Instant::now() >= deadline {
+                            unresolved_dependent_table = Some(dependent_table_name.clone());
+                            break;
+                        }
+
                         if attempts % 10 == 0 {
                             tracing::warn!("Dependent table {dependent_table_name} for view {table_name} does not exist, retrying...");
                         }
@@ -303,10 +367,15 @@ impl DataFusion {
                 }
             }
 
+            if let Some(missing_table) = unresolved_dependent_table {
+                tracing::error!("Failed to create view {table_name}. Dependent table {missing_table} does not exist.");
+                return;
+            }
+
             let plan = match ctx.state().statement_to_plan(statements[0].clone()).await {
                 Ok(plan) => plan,
                 Err(e) => {
-                    tracing::error!("Unable to create view: {e:?}");
+                    tracing::error!("Failed to create view: {e}");
                     return;
                 }
             };
@@ -314,12 +383,12 @@ impl DataFusion {
             let view = match ViewTable::try_new(plan, Some(sql.to_string())) {
                 Ok(view) => view,
                 Err(e) => {
-                    tracing::error!("Unable to create view: {e:?}");
+                    tracing::error!("Failed to create view: {e}");
                     return;
                 }
             };
             if let Err(e) = ctx.register_table(table_name.as_str(), Arc::new(view)) {
-                tracing::error!("Unable to create view: {e:?}");
+                tracing::error!("Failed to create view: {e}");
             };
 
             tracing::info!("Created view {table_name}");

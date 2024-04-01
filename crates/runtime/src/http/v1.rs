@@ -1,6 +1,162 @@
-pub(crate) mod query {
-    use std::sync::Arc;
+/*
+Copyright 2024 The Spice.ai OSS Authors
 
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+use arrow::array::RecordBatch;
+use axum::{http::StatusCode, response::{IntoResponse, Response}};
+use csv::Writer;
+use datafusion::dataframe::DataFrame;
+use serde::{Deserialize, Serialize};
+use spicepod::component::dataset::Dataset;
+
+use crate::{datafusion::DataFusion, status::ComponentStatus};
+
+#[derive(Default, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Format {
+    #[default]
+    Json,
+    Csv,
+}
+
+fn convert_entry_to_csv<T: Serialize>(entries: &[T]) -> Result<String, Box<dyn std::error::Error>> {
+    let mut w = Writer::from_writer(vec![]);
+    for e in entries {
+        w.serialize(e)?;
+    }
+    w.flush()?;
+    Ok(String::from_utf8(w.into_inner()?)?)
+}
+
+fn dataset_status(df: &DataFusion, ds: &Dataset) -> ComponentStatus {
+    if df.table_exists(ds.name.as_str()) {
+        ComponentStatus::Ready
+    } else {
+        ComponentStatus::Error
+    }
+}
+
+async fn dataframe_to_response(data_frame: DataFrame) -> Response {
+
+    let results = match data_frame.collect().await {
+        Ok(results) => results,
+        Err(e) => {
+            tracing::debug!("Error collecting results: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
+    };
+
+    let buf = Vec::new();
+    let mut writer = arrow_json::ArrayWriter::new(buf);
+
+    if let Err(e) =
+        writer.write_batches(results.iter().collect::<Vec<&RecordBatch>>().as_slice())
+    {
+        tracing::debug!("Error converting results to JSON: {e}");
+        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+    }
+    if let Err(e) = writer.finish() {
+        tracing::debug!("Error finishing JSON conversion: {e}");
+        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+    }
+
+    let buf = writer.into_inner();
+    let res = match String::from_utf8(buf) {
+        Ok(res) => res,
+        Err(e) => {
+            tracing::debug!("Error converting JSON buffer to string: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
+    };
+
+    (StatusCode::OK, res).into_response()
+}
+
+
+pub(crate) mod nsql {
+    use arrow::datatypes::Schema;
+    use axum::{
+        http::StatusCode, response::{IntoResponse, Response}, Extension, Json
+    };
+    use futures::{future::join_all, FutureExt, TryFutureExt};
+    use serde::{Deserialize, Serialize};
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+    use crate::ducknsql::run_model;
+    
+    use crate::{datafusion::DataFusion, http::v1::dataframe_to_response};
+
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    pub struct NsqlRequest {
+        pub query: String,
+
+        // If present, only include these tables in the NSQL query
+        // pub included_tables: Option<Vec<String>>,
+    }
+
+    pub fn schema_to_create_table(table_name: &str, schema: Schema) -> String {
+        return "".to_string();
+    }
+
+    pub(crate) async fn post(
+        Extension(df): Extension<Arc<RwLock<DataFusion>>>,
+        Json(payload): Json<NsqlRequest>,
+    ) -> Response {
+
+        let readable_df = df.read().await;
+        
+        // Get all tables in Datafusion
+        let tables = match readable_df.ctx.tables() {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::trace!("Error getting tables: {e}");
+                return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+            }
+        };
+        
+        match join_all(tables.iter().map(|t| {
+            readable_df.get_arrow_schema(t).map_ok(|s| {
+                schema_to_create_table(t, s)
+            }
+        )})).await.into_iter().collect::<Result<Vec<String>, _>>() {
+            Ok(queries) => {
+                let query = queries.join(" ");
+                let user_query = payload.query;
+                let nsql_query = format!("{query} -- Using valid ANSI SQL, answer the following questions for the tables provided above. -- {user_query}");
+                tracing::error!("Running query: {nsql_query}");
+
+                let result = readable_df.ctx.sql(&user_query).await;
+
+                match result {
+                    Ok(d) => dataframe_to_response(d).await,
+                    Err(e) => {
+                        tracing::trace!("Error running query: {e}");
+                        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+                    }
+                }
+            },
+            Err(e) => {
+                tracing::trace!("Error creating table queries: {e}");
+                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+            }
+        }
+    }
+}
+
+pub(crate) mod query {
     use arrow::record_batch::RecordBatch;
     use axum::{
         body::Bytes,
@@ -8,6 +164,7 @@ pub(crate) mod query {
         response::{IntoResponse, Response},
         Extension,
     };
+    use std::sync::Arc;
     use tokio::sync::RwLock;
 
     use crate::datafusion::DataFusion;
@@ -67,14 +224,187 @@ pub(crate) mod query {
     }
 }
 
+pub(crate) mod status {
+    use csv::Writer;
+    use flight_client::FlightClient;
+    use serde::{Deserialize, Serialize};
+    use std::{net::SocketAddr, sync::Arc};
+    use tonic_0_9_0::transport::Channel;
+    use tonic_health::{pb::health_client::HealthClient, ServingStatus};
+
+    use axum::{
+        extract::Query,
+        http::status,
+        response::{IntoResponse, Response},
+        Extension, Json,
+    };
+
+    use crate::{config, status::ComponentStatus};
+
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    pub struct QueryParams {
+        #[serde(default = "default_format")]
+        format: Format,
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    pub enum Format {
+        Json,
+        Csv,
+    }
+
+    #[derive(Deserialize, Serialize)]
+    pub struct ConnectionDetails {
+        name: &'static str,
+        endpoint: String,
+        status: ComponentStatus,
+    }
+
+    fn default_format() -> Format {
+        Format::Json
+    }
+
+    pub(crate) async fn get(
+        Extension(cfg): Extension<Arc<config::Config>>,
+        Extension(with_metrics): Extension<Option<SocketAddr>>,
+        Query(params): Query<QueryParams>,
+    ) -> Response {
+        let cfg = cfg.as_ref();
+        let flight_url = cfg.flight_bind_address.to_string();
+
+        let details = vec![
+            ConnectionDetails {
+                name: "http",
+                endpoint: cfg.http_bind_address.to_string(),
+                status: ComponentStatus::Ready,
+            },
+            ConnectionDetails {
+                name: "flight",
+                status: get_flight_status(&flight_url).await,
+                endpoint: flight_url,
+            },
+            ConnectionDetails {
+                name: "metrics",
+                endpoint: with_metrics.map_or("N/A".to_string(), |addr| addr.to_string()),
+                status: match with_metrics {
+                    Some(metrics_url) => match get_metrics_status(&metrics_url.to_string()).await {
+                        Ok(status) => status,
+                        Err(e) => {
+                            tracing::error!("Error getting metrics status from {metrics_url}: {e}");
+                            ComponentStatus::Error
+                        }
+                    },
+                    None => ComponentStatus::Disabled,
+                },
+            },
+            ConnectionDetails {
+                name: "opentelemetry",
+                status: match get_opentelemetry_status(
+                    cfg.open_telemetry_bind_address.to_string().as_str(),
+                )
+                .await
+                {
+                    Ok(status) => status,
+                    Err(e) => {
+                        tracing::error!(
+                            "Error getting opentelemetry status from {}: {}",
+                            cfg.open_telemetry_bind_address,
+                            e
+                        );
+                        ComponentStatus::Error
+                    }
+                },
+                endpoint: cfg.open_telemetry_bind_address.to_string(),
+            },
+        ];
+
+        match params.format {
+            Format::Json => (status::StatusCode::OK, Json(details)).into_response(),
+            Format::Csv => match convert_details_to_csv(&details) {
+                Ok(csv) => (status::StatusCode::OK, csv).into_response(),
+                Err(e) => {
+                    tracing::error!("Error converting to CSV: {e}");
+                    (status::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+                }
+            },
+        }
+    }
+
+    fn convert_details_to_csv(
+        details: &[ConnectionDetails],
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let mut w = Writer::from_writer(vec![]);
+        for d in details {
+            let _ = w.serialize(d);
+        }
+        w.flush()?;
+        Ok(String::from_utf8(w.into_inner()?)?)
+    }
+
+    async fn get_flight_status(flight_addr: &str) -> ComponentStatus {
+        tracing::trace!("Checking flight status at {flight_addr}");
+        match FlightClient::new(&format!("http://{flight_addr}"), "", "").await {
+            Ok(_) => ComponentStatus::Ready,
+            Err(e) => {
+                tracing::error!("Error connecting to flight when checking status: {e}");
+                ComponentStatus::Error
+            }
+        }
+    }
+
+    async fn get_metrics_status(
+        metrics_addr: &str,
+    ) -> Result<ComponentStatus, Box<dyn std::error::Error>> {
+        let resp = reqwest::get(format!("http://{metrics_addr}/health")).await?;
+        if resp.status().is_success() && resp.text().await? == "OK" {
+            Ok(ComponentStatus::Ready)
+        } else {
+            Ok(ComponentStatus::Error)
+        }
+    }
+    async fn get_opentelemetry_status(
+        addr: &str,
+    ) -> Result<ComponentStatus, Box<dyn std::error::Error>> {
+        let channel = Channel::from_shared(format!("http://{addr}"))?
+            .connect()
+            .await?;
+
+        let mut client = HealthClient::new(channel);
+
+        let resp = client
+            .check(tonic_health::pb::HealthCheckRequest {
+                service: String::new(),
+            })
+            .await?;
+
+        if resp.into_inner().status == ServingStatus::Serving as i32 {
+            Ok(ComponentStatus::Ready)
+        } else {
+            Ok(ComponentStatus::Error)
+        }
+    }
+}
+
 pub(crate) mod datasets {
     use std::sync::Arc;
 
     use app::App;
-    use axum::{extract::Query, Extension, Json};
-    use serde::Deserialize;
+    use axum::{
+        extract::Query,
+        http::status,
+        response::{IntoResponse, Response},
+        Extension, Json,
+    };
+    use serde::{Deserialize, Serialize};
     use spicepod::component::dataset::Dataset;
     use tokio::sync::RwLock;
+    use tract_core::tract_data::itertools::Itertools;
+
+    use crate::{datafusion::DataFusion, status::ComponentStatus};
+
+    use super::{convert_entry_to_csv, dataset_status, Format};
 
     #[derive(Debug, Deserialize)]
     pub(crate) struct DatasetFilter {
@@ -84,27 +414,250 @@ pub(crate) mod datasets {
         remove_views: bool,
     }
 
+    #[derive(Debug, Deserialize)]
+    pub(crate) struct DatasetQueryParams {
+        #[serde(default)]
+        status: bool,
+
+        #[serde(default)]
+        format: Format,
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    pub(crate) struct DatasetResponseItem {
+        pub from: String,
+        pub name: String,
+        pub replication_enabled: bool,
+        pub acceleration_enabled: bool,
+        pub depends_on: Option<String>,
+
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub status: Option<ComponentStatus>,
+    }
+
     pub(crate) async fn get(
-        Extension(app): Extension<Arc<RwLock<App>>>,
+        Extension(app): Extension<Arc<RwLock<Option<App>>>>,
+        Extension(df): Extension<Arc<RwLock<DataFusion>>>,
         Query(filter): Query<DatasetFilter>,
-    ) -> Json<Vec<Dataset>> {
+        Query(params): Query<DatasetQueryParams>,
+    ) -> Response {
+        let app_lock = app.read().await;
+        let Some(readable_app) = &*app_lock else {
+            return (
+                status::StatusCode::INTERNAL_SERVER_ERROR,
+                Json::<Vec<DatasetResponseItem>>(vec![]),
+            )
+                .into_response();
+        };
+
         let mut datasets: Vec<Dataset> = match filter.source {
-            Some(source) => app
-                .read()
-                .await
+            Some(source) => readable_app
                 .datasets
                 .iter()
                 .filter(|d| d.source() == source)
                 .cloned()
                 .collect(),
-            None => app.read().await.datasets.clone(),
+            None => readable_app.datasets.clone(),
         };
 
         if filter.remove_views {
             datasets.retain(|d| !d.is_view());
         }
 
-        Json(datasets)
+        let df_read = df.read().await;
+
+        let resp = datasets
+            .iter()
+            .map(|d| DatasetResponseItem {
+                from: d.from.clone(),
+                name: d.name.clone(),
+                replication_enabled: d.replication.as_ref().is_some_and(|f| f.enabled),
+                acceleration_enabled: d.acceleration.as_ref().is_some_and(|f| f.enabled),
+                depends_on: if d.depends_on.is_empty() {
+                    None
+                } else {
+                    Some(d.depends_on.join(", "))
+                },
+                status: if params.status {
+                    Some(dataset_status(&df_read, d))
+                } else {
+                    None
+                },
+            })
+            .collect_vec();
+
+        match params.format {
+            Format::Json => (status::StatusCode::OK, Json(resp)).into_response(),
+            Format::Csv => match convert_entry_to_csv(&resp) {
+                Ok(csv) => (status::StatusCode::OK, csv).into_response(),
+                Err(e) => {
+                    tracing::error!("Error converting to CSV: {e}");
+                    (status::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+                }
+            },
+        }
+    }
+}
+
+pub(crate) mod spicepods {
+    use std::sync::Arc;
+
+    use app::App;
+    use axum::{
+        extract::Query,
+        http::status,
+        response::{IntoResponse, Response},
+        Extension, Json,
+    };
+    use itertools::Itertools;
+    use serde::{Deserialize, Serialize};
+    use spicepod::Spicepod;
+    use tokio::sync::RwLock;
+
+    use super::{convert_entry_to_csv, Format};
+
+    #[derive(Debug, Deserialize)]
+    pub(crate) struct SpicepodQueryParams {
+        #[allow(dead_code)]
+        #[serde(default)]
+        status: bool,
+
+        #[serde(default)]
+        format: Format,
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    pub(crate) struct SpicepodCsvRow {
+        pub name: String,
+
+        pub version: String,
+
+        #[serde(default)]
+        pub datasets_count: usize,
+
+        #[serde(default)]
+        pub models_count: usize,
+
+        #[serde(default)]
+        pub dependencies_count: usize,
+    }
+
+    pub(crate) async fn get(
+        Extension(app): Extension<Arc<RwLock<Option<App>>>>,
+        Query(params): Query<SpicepodQueryParams>,
+    ) -> Response {
+        let Some(readable_app) = &*app.read().await else {
+            return (
+                status::StatusCode::INTERNAL_SERVER_ERROR,
+                Json::<Vec<Spicepod>>(vec![]),
+            )
+                .into_response();
+        };
+
+        match params.format {
+            Format::Json => {
+                (status::StatusCode::OK, Json(readable_app.spicepods.clone())).into_response()
+            }
+            Format::Csv => {
+                let resp: Vec<SpicepodCsvRow> = readable_app
+                    .spicepods
+                    .iter()
+                    .map(|spod| SpicepodCsvRow {
+                        version: spod.version.to_string(),
+                        name: spod.name.clone(),
+                        models_count: spod.models.len(),
+                        datasets_count: spod.datasets.len(),
+                        dependencies_count: spod.dependencies.len(),
+                    })
+                    .collect_vec();
+                match convert_entry_to_csv(&resp) {
+                    Ok(csv) => (status::StatusCode::OK, csv).into_response(),
+                    Err(e) => {
+                        tracing::error!("Error converting to CSV: {e}");
+                        (status::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub(crate) mod models {
+    use std::{collections::HashMap, sync::Arc};
+
+    use axum::{
+        extract::Query,
+        http::status,
+        response::{IntoResponse, Json, Response},
+        Extension,
+    };
+    use csv::Writer;
+    use serde::{Deserialize, Serialize};
+    use tokio::sync::RwLock;
+
+    use crate::model::Model;
+
+    use super::Format;
+
+    #[derive(Debug, Deserialize)]
+    pub(crate) struct ModelsQueryParams {
+        #[serde(default)]
+        format: Format,
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    pub(crate) struct ModelResponse {
+        pub name: String,
+        pub from: String,
+        pub datasets: Option<Vec<String>>,
+    }
+
+    pub(crate) async fn get(
+        Extension(model): Extension<Arc<RwLock<HashMap<String, Model>>>>,
+        Query(params): Query<ModelsQueryParams>,
+    ) -> Response {
+        let resp = model
+            .read()
+            .await
+            .values()
+            .map(|m| {
+                let datasets = if m.model.datasets.is_empty() {
+                    None
+                } else {
+                    Some(m.model.datasets.clone())
+                };
+                ModelResponse {
+                    name: m.model.name.clone(),
+                    from: m.model.from.clone(),
+                    datasets,
+                }
+            })
+            .collect::<Vec<ModelResponse>>();
+
+        match params.format {
+            Format::Json => (status::StatusCode::OK, Json(resp)).into_response(),
+            Format::Csv => match convert_details_to_csv(&resp) {
+                Ok(csv) => (status::StatusCode::OK, csv).into_response(),
+                Err(e) => {
+                    tracing::error!("Error converting to CSV: {e}");
+                    (status::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+                }
+            },
+        }
+    }
+
+    fn convert_details_to_csv(
+        models: &[ModelResponse],
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let mut w = Writer::from_writer(vec![]);
+        for d in models {
+            let _ = w.serialize(d);
+        }
+        w.flush()?;
+        Ok(String::from_utf8(w.into_inner()?)?)
     }
 }
 
@@ -185,7 +738,7 @@ pub(crate) mod inference {
     }
 
     pub(crate) async fn get(
-        Extension(app): Extension<Arc<RwLock<App>>>,
+        Extension(app): Extension<Arc<RwLock<Option<App>>>>,
         Extension(df): Extension<Arc<RwLock<DataFusion>>>,
         Path(model_name): Path<String>,
         Query(params): Query<PredictParams>,
@@ -210,7 +763,7 @@ pub(crate) mod inference {
     }
 
     pub(crate) async fn post(
-        Extension(app): Extension<Arc<RwLock<App>>>,
+        Extension(app): Extension<Arc<RwLock<Option<App>>>>,
         Extension(df): Extension<Arc<RwLock<DataFusion>>>,
         Extension(models): Extension<Arc<RwLock<HashMap<String, Model>>>>,
         Json(payload): Json<BatchPredictRequest>,
@@ -245,7 +798,7 @@ pub(crate) mod inference {
     }
 
     async fn run_inference(
-        app: Arc<RwLock<App>>,
+        app: Arc<RwLock<Option<App>>>,
         df: Arc<RwLock<DataFusion>>,
         models: Arc<RwLock<HashMap<String, Model>>>,
         model_name: String,
@@ -253,7 +806,19 @@ pub(crate) mod inference {
     ) -> PredictResponse {
         let start_time = Instant::now();
 
-        let readable_app = app.read().await;
+        let app_lock = app.read().await;
+        let Some(readable_app) = &*app_lock else {
+            return PredictResponse {
+                status: PredictStatus::BadRequest,
+                error_message: Some("App not found".to_string()),
+                model_name,
+                model_version: None,
+                lookback,
+                prediction: vec![],
+                duration_ms: start_time.elapsed().as_millis(),
+            };
+        };
+
         let model = readable_app.models.iter().find(|m| m.name == model_name);
         let Some(model) = model else {
             tracing::debug!("Model {model_name} not found");
@@ -298,8 +863,9 @@ pub(crate) mod inference {
                         };
                     }
                     tracing::error!(
-                        "Unable to cast inference result for model {model_name} to Float32Array: {column_data:?}"
+                        "Failed to cast inference result for model {model_name} to Float32Array"
                     );
+                    tracing::debug!("Failed to cast inference result for model {model_name} to Float32Array: {column_data:?}");
                     return PredictResponse {
                         status: PredictStatus::InternalError,
                         error_message: Some(

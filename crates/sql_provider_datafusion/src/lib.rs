@@ -1,7 +1,25 @@
+/*
+Copyright 2024 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 #![allow(clippy::missing_errors_doc)]
 
 use async_trait::async_trait;
-use dbconnectionpool::DbConnectionPool;
+use db_connection_pool::dbconnection::{get_schema, query_arrow};
+use db_connection_pool::DbConnectionPool;
+use futures::TryStreamExt;
 use snafu::prelude::*;
 use std::{any::Any, fmt, sync::Arc};
 
@@ -13,22 +31,22 @@ use datafusion::{
     execution::{context::SessionState, TaskContext},
     logical_expr::{Expr, TableProviderFilterPushDown, TableType},
     physical_plan::{
-        memory::MemoryStream, project_schema, DisplayAs, DisplayFormatType, ExecutionPlan,
-        SendableRecordBatchStream,
+        project_schema, stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType,
+        ExecutionPlan, SendableRecordBatchStream,
     },
 };
 
-pub mod dbconnection;
-pub mod dbconnectionpool;
 pub mod expr;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Unable to get a DB connection from the pool: {source}"))]
-    UnableToGetConnectionFromPool { source: dbconnectionpool::Error },
+    UnableToGetConnectionFromPool { source: db_connection_pool::Error },
 
-    #[snafu(display("Unable to query DB connection: {source}"))]
-    UnableToQueryDbConnection { source: dbconnection::Error },
+    #[snafu(display("Unable to get schema: {source}"))]
+    UnableToGetSchema {
+        source: db_connection_pool::dbconnection::Error,
+    },
 
     #[snafu(display("Unable to generate SQL: {source}"))]
     UnableToGenerateSQL { source: expr::Error },
@@ -43,15 +61,20 @@ pub struct SqlTable<T: 'static, P: 'static> {
 }
 
 impl<T, P> SqlTable<T, P> {
-    pub fn new(
+    pub async fn new(
         pool: &Arc<dyn DbConnectionPool<T, P> + Send + Sync>,
         table_reference: impl Into<OwnedTableReference>,
     ) -> Result<Self> {
         let table_reference = table_reference.into();
-        let mut conn = pool.connect().context(UnableToGetConnectionFromPoolSnafu)?;
-        let schema = conn
-            .get_schema(&table_reference)
-            .context(UnableToQueryDbConnectionSnafu)?;
+        let conn = pool
+            .connect()
+            .await
+            .context(UnableToGetConnectionFromPoolSnafu)?;
+
+        let schema = get_schema(conn, &table_reference)
+            .await
+            .context(UnableToGetSchemaSnafu)?;
+
         Ok(Self {
             pool: Arc::clone(pool),
             schema,
@@ -237,15 +260,24 @@ impl<T: 'static, P: 'static> ExecutionPlan for SqlExec<T, P> {
         _partition: usize,
         _context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-        let mut conn = self.pool.connect().map_err(to_execution_error)?;
-
         let sql = self.sql().map_err(to_execution_error)?;
         tracing::debug!("SqlExec sql: {sql}");
 
-        let recs = conn.query_arrow(&sql, &[]).map_err(to_execution_error)?;
+        let fut = get_stream(Arc::clone(&self.pool), sql);
 
-        Ok(Box::pin(MemoryStream::try_new(recs, self.schema(), None)?))
+        let stream = futures::stream::once(fut).try_flatten();
+        let schema = self.schema().clone();
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
+}
+
+async fn get_stream<T: 'static, P: 'static>(
+    pool: Arc<dyn DbConnectionPool<T, P> + Send + Sync>,
+    sql: String,
+) -> DataFusionResult<SendableRecordBatchStream> {
+    let conn = pool.connect().await.map_err(to_execution_error)?;
+
+    query_arrow(conn, sql).await.map_err(to_execution_error)
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -258,14 +290,12 @@ mod tests {
     use std::{error::Error, sync::Arc};
 
     use datafusion::execution::context::SessionContext;
+    use db_connection_pool::dbconnection::duckdbconn::DuckDbConnection;
+    use db_connection_pool::{duckdbpool::DuckDbConnectionPool, DbConnectionPool, Mode};
     use duckdb::{DuckdbConnectionManager, ToSql};
     use tracing::{level_filters::LevelFilter, subscriber::DefaultGuard, Dispatch};
 
-    use crate::{
-        dbconnection::duckdbconn::DuckDbConnection,
-        dbconnectionpool::{duckdbpool::DuckDbConnectionPool, DbConnectionPool, Mode},
-        SqlTable,
-    };
+    use crate::SqlTable;
 
     fn setup_tracing() -> DefaultGuard {
         let subscriber: tracing_subscriber::FmtSubscriber = tracing_subscriber::fmt()
@@ -286,10 +316,10 @@ mod tests {
                 + Sync,
         > = Arc::new(DuckDbConnectionPool::new(
             "test",
-            Mode::Memory,
-            Arc::new(Option::None),
+            &Mode::Memory,
+            &Arc::new(Option::None),
         )?);
-        let conn = pool.connect()?;
+        let conn = pool.connect().await?;
         let db_conn = conn
             .as_any()
             .downcast_ref::<DuckDbConnection>()
@@ -297,7 +327,7 @@ mod tests {
         db_conn.conn.execute_batch(
             "CREATE TABLE test (a INTEGER, b VARCHAR); INSERT INTO test VALUES (3, 'bar');",
         )?;
-        let duckdb_table = SqlTable::new(&pool, "test")?;
+        let duckdb_table = SqlTable::new(&pool, "test").await?;
         ctx.register_table("test_datafusion", Arc::new(duckdb_table))?;
         let sql = "SELECT * FROM test_datafusion limit 1";
         let df = ctx.sql(sql).await?;
@@ -316,10 +346,10 @@ mod tests {
                 + Sync,
         > = Arc::new(DuckDbConnectionPool::new(
             "test",
-            Mode::Memory,
-            Arc::new(Option::None),
+            &Mode::Memory,
+            &Arc::new(Option::None),
         )?);
-        let conn = pool.connect()?;
+        let conn = pool.connect().await?;
         let db_conn = conn
             .as_any()
             .downcast_ref::<DuckDbConnection>()
@@ -327,7 +357,7 @@ mod tests {
         db_conn.conn.execute_batch(
             "CREATE TABLE test (a INTEGER, b VARCHAR); INSERT INTO test VALUES (3, 'bar');",
         )?;
-        let duckdb_table = SqlTable::new(&pool, "test")?;
+        let duckdb_table = SqlTable::new(&pool, "test").await?;
         ctx.register_table("test_datafusion", Arc::new(duckdb_table))?;
         let sql = "SELECT * FROM test_datafusion where a > 1 and b = 'bar' limit 1";
         let df = ctx.sql(sql).await?;

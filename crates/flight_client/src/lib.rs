@@ -1,3 +1,19 @@
+/*
+Copyright 2024 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 use std::task::Poll;
 
 use arrow::record_batch::RecordBatch;
@@ -19,11 +35,11 @@ use tonic::transport::Channel;
 use tonic::IntoRequest;
 use tonic::IntoStreamingRequest;
 
-mod tls;
+pub mod tls;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to connect to server:m {source}"))]
+    #[snafu(display("Unable to connect to server: {source}"))]
     UnableToConnectToServer { source: tls::Error },
 
     #[snafu(display("Invalid metadata value: {source}"))]
@@ -42,8 +58,14 @@ pub enum Error {
     #[snafu(display("Unable to query: {source}"))]
     UnableToQuery { source: tonic::Status },
 
+    #[snafu(display("Unable to publish: {source}"))]
+    UnableToPublish { source: tonic::Status },
+
     #[snafu(display("Unauthorized"))]
     Unauthorized {},
+
+    #[snafu(display("Permission denied"))]
+    PermissionDenied {},
 
     #[snafu(display("No endpoints found"))]
     NoEndpointsFound,
@@ -240,12 +262,13 @@ impl FlightClient {
             .metadata_mut()
             .insert("authorization", auth_header_value);
 
-        let resp = self
-            .flight_client
-            .clone()
-            .do_put(publish_request)
-            .await
-            .context(UnableToQuerySnafu)?;
+        let resp = match self.flight_client.clone().do_put(publish_request).await {
+            Ok(resp) => resp,
+            Err(e) => match e.code() {
+                tonic::Code::PermissionDenied => PermissionDeniedSnafu.fail(),
+                _ => return Err(e).context(UnableToPublishSnafu),
+            }?,
+        };
 
         let resp = resp.into_inner();
 

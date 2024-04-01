@@ -1,3 +1,19 @@
+/*
+Copyright 2024 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 pub struct SpiceAI {}
 
 use super::ModelSource;
@@ -8,14 +24,14 @@ use std::io::Cursor;
 use std::string::ToString;
 use std::sync::Arc;
 
-use crate::auth::AuthProvider;
 use regex::Regex;
+use secrets::Secret;
 
 #[async_trait]
 impl ModelSource for SpiceAI {
     async fn pull(
         &self,
-        auth_provider: AuthProvider,
+        secret: Secret,
         params: Arc<Option<HashMap<String, String>>>,
     ) -> super::Result<String> {
         let name = params
@@ -91,7 +107,7 @@ impl ModelSource for SpiceAI {
         let client = reqwest::Client::new();
         let data = client
             .get(url.clone())
-            .bearer_auth(auth_provider.get_param("token").unwrap_or_default())
+            .bearer_auth(secret.get("token").unwrap_or_default())
             .send()
             .await
             .context(super::UnableToFetchModelSnafu)?
@@ -118,6 +134,11 @@ impl ModelSource for SpiceAI {
 
         let versioned_path = format!("{local_path}/{version}");
         let file_name = format!("{versioned_path}/model.onnx");
+
+        if std::fs::metadata(file_name.clone()).is_ok() {
+            tracing::debug!("File already exists: {file_name}, skipping download");
+            return Ok(file_name);
+        }
 
         let response = client
             .get(download_url)

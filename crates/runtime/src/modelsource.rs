@@ -1,9 +1,26 @@
-use crate::auth::AuthProvider;
+/*
+Copyright 2024 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 use async_trait::async_trait;
+use secrets::Secret;
 use snafu::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+pub mod huggingface;
 pub mod local;
 pub mod spiceai;
 
@@ -15,6 +32,9 @@ pub enum Error {
 
     #[snafu(display("Unable to load the model: {source}"))]
     UnableToFetchModel { source: reqwest::Error },
+
+    #[snafu(display("Unable to download model file"))]
+    UnableToDownloadModelFile {},
 
     #[snafu(display("Unable to parse metadata"))]
     UnableToParseMetadata {},
@@ -43,7 +63,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub trait ModelSource {
     async fn pull(
         &self,
-        auth_provider: AuthProvider,
+        secret: Secret,
         params: Arc<Option<HashMap<String, String>>>,
     ) -> Result<String>;
 }
@@ -70,6 +90,7 @@ pub fn create_source_from(source: &str) -> Result<Box<dyn ModelSource>> {
     match source {
         "localhost" => Ok(Box::new(local::Local {})),
         "spiceai" => Ok(Box::new(spiceai::SpiceAI {})),
+        "huggingface" => Ok(Box::new(huggingface::Huggingface {})),
         _ => UnknownModelSourceSnafu {
             model_source: source,
         }

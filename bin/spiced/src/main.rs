@@ -1,3 +1,19 @@
+/*
+Copyright 2024 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 use std::net::SocketAddr;
 
 use clap::Parser;
@@ -9,25 +25,34 @@ fn main() {
     let args = spiced::Args::parse();
 
     if let Err(err) = init_tracing() {
-        eprintln!("Unable to initialize tracing: {err:?}");
+        eprintln!("Unable to initialize tracing: {err}");
         std::process::exit(1);
     }
 
     if args.version {
-        let version = if cfg!(feature = "release") {
-            env!("CARGO_PKG_VERSION")
+        if cfg!(feature = "release") {
+            println!("v{}", env!("CARGO_PKG_VERSION"));
         } else {
-            "local"
+            print!(
+                "v{}-rc.{}",
+                env!("CARGO_PKG_VERSION"),
+                env!("GIT_COMMIT_HASH")
+            );
+
+            if cfg!(feature = "dev") {
+                print!("-dev");
+            }
+
+            println!();
         };
 
-        println!("{version}");
         return;
     }
 
     let tokio_runtime = match Runtime::new() {
         Ok(runtime) => runtime,
         Err(err) => {
-            tracing::error!("Unable to start Tokio runtime: {err:?}");
+            tracing::error!("Unable to start Tokio runtime: {err}");
             std::process::exit(1);
         }
     };
@@ -42,7 +67,7 @@ fn main() {
     tracing::trace!("Starting Spice Runtime!");
 
     if let Err(err) = tokio_runtime.block_on(start_runtime(args)) {
-        tracing::error!("Spice Runtime error: {err:?}");
+        tracing::error!("Spice Runtime error: {err}");
     }
 }
 
@@ -59,7 +84,9 @@ fn init_tracing() -> Result<(), Box<dyn std::error::Error>> {
     let filter = if let Ok(env_log) = std::env::var("SPICED_LOG") {
         EnvFilter::new(env_log)
     } else {
-        EnvFilter::new("spiced=INFO,runtime=INFO,flight_datafusion=INFO")
+        EnvFilter::new(
+            "spiced=INFO,runtime=INFO,flightsql_datafusion=INFO,flight_datafusion=INFO,sql_provider_datafusion=INFO",
+        )
     };
 
     let subscriber = tracing_subscriber::FmtSubscriber::builder()
@@ -76,7 +103,7 @@ fn init_metrics(socket_addr: SocketAddr) -> Result<(), Box<dyn std::error::Error
 
     // This needs to run inside a Tokio runtime.
     builder.install()?;
-    tracing::trace!("Prometheus metrics server started on {socket_addr:?}");
+    tracing::info!("Metrics listening on {socket_addr}");
 
     Ok(())
 }

@@ -1,0 +1,89 @@
+name: E2E Test Release Installation
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-install:
+    name: install on ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x64
+            runner: ubuntu-latest
+            target_os: linux
+            target_arch: x86_64
+          - name: Linux aarch64
+            runner: hosted-linux-arm-runner
+            target_os: linux
+            target_arch: aarch64
+          - name: macOS aarch64 (Apple Silicon)
+            runner: macos-14
+            target_os: darwin
+            target_arch: aarch64
+          - name: macOS x64 (Intel)
+            runner: macos-12
+            target_os: darwin
+            target_arch: x86_64
+    steps:
+    - name: system info
+      run: uname -m
+
+    - name: checkout code
+      uses: actions/checkout@v3
+
+    # The aarch64 runner does not have any tools pre-installed
+    - name: Install missing tools
+      if: matrix.target_os == 'linux' && matrix.target_arch == 'aarch64'
+      run: |
+        sudo apt-get update
+        sudo apt install jq -y
+
+    - name: install Spice (https://install.spiceai.org)
+      run: |
+        curl https://install.spiceai.org | /bin/bash
+
+    - name: add Spice bin to PATH
+      run: echo "$HOME/.spice/bin" >> $GITHUB_PATH
+
+    - name: check installation
+      run: |
+        spice version
+  
+    - name: start Spice runtime
+      run: |
+        spice init app
+        [ -d app ] && cd app
+        spice run &
+
+    - name: wait for Spice runtime healthy
+      run: |
+        bash -c 'while [[ "$(curl -s http://localhost:3000/health)" != "ok" ]]; do sleep 1; done' || false
+      timeout-minutes: 1
+
+    - name: check Spice cli and runtime version
+      run: |
+        version=$(spice version 2>&1)
+        cli_version=$(echo "$version" | grep 'CLI version:' | cut -d':' -f2 | xargs)
+        runtime_version=$(echo "$version" | grep 'Runtime version:' | cut -d':' -f2 | xargs)
+
+        # normalize runtime version from "0.9.0-alpha" to "v0.9-alpha". Later versions have uniform format and don't require modifications
+        runtime_version=$(echo "$runtime_version" | sed -e 's/^0\.9\.0-alpha$/v0.9-alpha/')
+
+        release_version=$(curl -s "https://api.github.com/repos/spiceai/spiceai/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+        
+        echo "Release Version: $release_version"
+        echo "CLI Version: $cli_version"
+        echo "Runtime Version: $runtime_version"
+
+        if [ "$cli_version" != "$release_version" ]; then
+          echo "CLI version $cli_version does not match the release version $release_version."
+          exit 1
+        fi
+
+        if [ "$runtime_version" != "$release_version" ]; then
+          echo "Runtime version $runtime_version does not match the release version $release_version."
+          exit 1
+        fi

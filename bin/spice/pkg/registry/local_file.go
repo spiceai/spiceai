@@ -1,3 +1,19 @@
+/*
+Copyright 2024 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package registry
 
 import (
@@ -18,9 +34,9 @@ func (r *LocalFileRegistry) GetPod(podPath string) (string, error) {
 	stat, err := os.Stat(podPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return "", fmt.Errorf("the pod directory '%s' does not exist", podPath)
+			return "", fmt.Errorf("the Spicepod directory '%s' does not exist", podPath)
 		}
-		return "", fmt.Errorf("pod not found at %s: %w", podPath, err)
+		return "", fmt.Errorf("spicepod.yaml not found at %s: %w", podPath, err)
 	}
 
 	if !stat.IsDir() {
@@ -30,7 +46,7 @@ func (r *LocalFileRegistry) GetPod(podPath string) (string, error) {
 	if !filepath.IsAbs(podPath) {
 		podPath, err = filepath.Abs(podPath)
 		if err != nil {
-			return "", fmt.Errorf("error fetching pod'%s': %w", podPath, err)
+			return "", fmt.Errorf("error fetching Spicepod '%s': %w", podPath, err)
 		}
 	}
 
@@ -42,20 +58,20 @@ func (r *LocalFileRegistry) GetPod(podPath string) (string, error) {
 
 	if _, err := os.Stat(filepath.Join(podPath, podManifestFileName)); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return "", fmt.Errorf("the directory '%s' does not contain a manifest. Is it a valid pod?", podPath)
+			return "", fmt.Errorf("the directory '%s' does not contain a spicepod.yaml. Is it a valid Spicepod?", podPath)
 		}
-		return "", fmt.Errorf("error fetching pod %s: %w", podPath, err)
+		return "", fmt.Errorf("error fetching Spicepod %s: %w", podPath, err)
 	}
 
 	// Prepare destination
 	podsDir := rtcontext.PodsDir()
 	if _, err = os.Stat(podsDir); err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
-			return "", fmt.Errorf("error fetching pod %s: %w", podPath, err)
+			return "", fmt.Errorf("error fetching Spicepod %s: %w", podPath, err)
 		}
 		_, err = util.MkDirAllInheritPerm(podsDir)
 		if err != nil {
-			return "", fmt.Errorf("error fetching pod %s: %w", podPath, err)
+			return "", fmt.Errorf("error fetching Spicepod %s: %w", podPath, err)
 		}
 	}
 
@@ -68,7 +84,7 @@ func (r *LocalFileRegistry) GetPod(podPath string) (string, error) {
 		return err
 	})
 	if err != nil {
-		return "", fmt.Errorf("error fetching pod %s: %w", podPath, err)
+		return "", fmt.Errorf("error fetching Spicepod %s: %w", podPath, err)
 	}
 
 	if len(fileList) == 0 {

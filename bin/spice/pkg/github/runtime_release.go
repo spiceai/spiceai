@@ -1,3 +1,19 @@
+/*
+Copyright 2024 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package github
 
 import (
@@ -8,8 +24,7 @@ import (
 )
 
 var (
-	assetNameMemo string
-	githubClient  = NewGitHubClient(runtimeOwner, runtimeRepo)
+	githubClient = NewGitHubClient(runtimeOwner, runtimeRepo)
 )
 
 const (
@@ -39,6 +54,7 @@ func GetLatestCliRelease() (*RepoRelease, error) {
 
 func DownloadRuntimeAsset(release *RepoRelease, downloadPath string) error {
 	assetName := GetRuntimeAssetName()
+	fmt.Println("Downloading the Spice runtime...", assetName)
 	return DownloadReleaseAsset(githubClient, release, assetName, downloadPath)
 }
 
@@ -47,24 +63,14 @@ func DownloadAsset(release *RepoRelease, downloadPath string, assetName string) 
 }
 
 func GetRuntimeAssetName() string {
-	if assetNameMemo != "" {
-		return assetNameMemo
-	}
-
 	assetName := fmt.Sprintf("%s_%s_%s.tar.gz", constants.SpiceRuntimeFilename, runtime.GOOS, getRustArch())
 
-	assetNameMemo = assetName
 	return assetName
 }
 
 func GetAssetName(assetFileName string) string {
-	if assetNameMemo != "" {
-		return assetNameMemo
-	}
-
 	assetName := fmt.Sprintf("%s_%s_%s.tar.gz", assetFileName, runtime.GOOS, getRustArch())
 
-	assetNameMemo = assetName
 	return assetName
 }
 

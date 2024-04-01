@@ -1,3 +1,19 @@
+/*
+Copyright 2024 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 use async_trait::async_trait;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -7,24 +23,25 @@ use flight_client::FlightClient;
 use flight_datafusion::FlightTable;
 use spicepod::component::dataset::Dataset;
 
-use crate::auth::AuthProvider;
+use secrets::Secret;
 
+use super::DataConnectorFactory;
 use super::{flight::Flight, DataConnector};
 
 pub struct Dremio {
     flight: Flight,
 }
 
-#[async_trait]
-impl DataConnector for Dremio {
-    fn new(
-        auth_provider: AuthProvider,
+impl DataConnectorFactory for Dremio {
+    fn create(
+        secret: Option<Secret>,
         params: Arc<Option<HashMap<String, String>>>,
-    ) -> Pin<Box<dyn Future<Output = super::Result<Self>> + Send>>
-    where
-        Self: Sized,
-    {
+    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
+            let secret = secret.ok_or_else(|| super::Error::UnableToCreateDataConnector {
+                source: "Missing required secrets".into(),
+            })?;
+
             let endpoint: String = params
                 .as_ref() // &Option<HashMap<String, String>>
                 .as_ref() // Option<&HashMap<String, String>>
@@ -34,16 +51,19 @@ impl DataConnector for Dremio {
                 })?;
             let flight_client = FlightClient::new(
                 endpoint.as_str(),
-                auth_provider.get_param("username").unwrap_or_default(),
-                auth_provider.get_param("password").unwrap_or_default(),
+                secret.get("username").unwrap_or_default(),
+                secret.get("password").unwrap_or_default(),
             )
             .await
             .map_err(|e| super::Error::UnableToCreateDataConnector { source: e.into() })?;
             let flight = Flight::new(flight_client);
-            Ok(Self { flight })
+            Ok(Box::new(Self { flight }) as Box<dyn DataConnector>)
         })
     }
+}
 
+#[async_trait]
+impl DataConnector for Dremio {
     fn get_all_data(
         &self,
         dataset: &Dataset,
