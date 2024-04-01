@@ -182,26 +182,26 @@ Query took: 0.007505084 seconds. 1/1 rows displayed.
 Enter a query to display the longest taxi trips:
 
 ```
-sql> SELECT trip_distance_mi, total_amount FROM taxi_trips ORDER BY trip_distance_mi DESC LIMIT 10;
+sql> SELECT trip_distance, total_amount FROM taxi_trips ORDER BY trip_distance DESC LIMIT 10;
 ```
 
 Output:
 
 ```
-+------------------+--------------+
-| trip_distance_mi | total_amount |
-+------------------+--------------+
-| 191.9            | 3.0          |
-| 189.2            | 63.0         |
-| 163.8            | 93.64        |
-| 122.4            | 160.0        |
-| 104.0            | 3.0          |
-| 69.7             | 213.58       |
-| 64.8             | 280.83       |
-| 60.0             | 350.12       |
-| 53.9             | 0.0          |
-| 53.3             | 5.33         |
-+------------------+--------------+
++---------------+--------------+
+| trip_distance | total_amount |
++---------------+--------------+
+| 312722.3      | 22.15        |
+| 97793.92      | 36.31        |
+| 82015.45      | 21.56        |
+| 72975.97      | 20.04        |
+| 71752.26      | 49.57        |
+| 59282.45      | 33.52        |
+| 59076.43      | 23.17        |
+| 58298.51      | 18.63        |
+| 51619.36      | 24.2         |
+| 44018.64      | 52.43        |
++---------------+--------------+
 
 Query took: 0.002458976 seconds
 ```
