@@ -222,6 +222,12 @@ from spiceai/spiceai:latest
 
 Using Helm:
 
+```bash
+git clone https://github.com/spiceai/spiceai.git
+cd spiceai
+helm upgrade --install spiceai ./deploy/chart
+```
+
 ## 🏎️ Next Steps
 
 You can use any number of predefined datasets available from Spice.ai in the Spice runtime.
