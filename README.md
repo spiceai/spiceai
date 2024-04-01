@@ -223,9 +223,8 @@ from spiceai/spiceai:latest
 Using Helm:
 
 ```bash
-git clone https://github.com/spiceai/spiceai.git
-cd spiceai
-helm upgrade --install spiceai ./deploy/chart
+helm repo add spiceai https://helm.spiceai.org
+helm install spiceai spiceai/spiceai
 ```
 
 ## 🏎️ Next Steps
