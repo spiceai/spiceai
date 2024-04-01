@@ -43,6 +43,7 @@ pub mod databricks;
 pub mod dremio;
 pub mod flight;
 pub mod flightsql;
+pub mod mysql;
 pub mod postgres;
 pub mod s3;
 pub mod spiceai;
@@ -117,6 +118,7 @@ pub async fn register_all() {
         register_connector_factory("dremio", dremio::Dremio::create),
         register_connector_factory("flightsql", flightsql::FlightSQL::create),
         register_connector_factory("postgres", postgres::Postgres::create),
+        register_connector_factory("mysql", mysql::MySQL::create),
         register_connector_factory("s3", s3::S3::create),
         register_connector_factory("spiceai", spiceai::SpiceAI::create),
     );

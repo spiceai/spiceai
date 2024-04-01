@@ -22,6 +22,7 @@ use datafusion::{
 use snafu::prelude::*;
 
 pub mod duckdbconn;
+pub mod mysqlconn;
 pub mod postgresconn;
 pub mod sqliteconn;
 

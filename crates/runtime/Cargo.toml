@@ -83,9 +83,11 @@ rusqlite = { workspace = true, optional = true }
 tokio-rusqlite = { workspace = true, optional = true }
 pin-project = "1.0"
 lazy_static = "1.4.0"
+mysql_async = { workspace = true, optional = true }
+mysql_common = { workspace = true, optional = true }
 
 [features]
-default = ["duckdb", "postgres", "keyring-secret-store", "sqlite"]
+default = ["duckdb", "postgres", "keyring-secret-store", "sqlite", "mysql"]
 dev = []
 duckdb = ["dep:duckdb", "sql_provider_datafusion", "r2d2"]
 postgres = [
@@ -95,4 +97,5 @@ postgres = [
     "arrow_sql_gen",
 ]
 sqlite = ["dep:rusqlite", "tokio-rusqlite"]
+mysql = ["dep:mysql_async", "dep:mysql_common"]
 keyring-secret-store = ["secrets/keyring-secret-store"]

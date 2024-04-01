@@ -26,6 +26,8 @@ use self::{duckdb::DuckDBBackend, memtable::MemTableBackend};
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
 pub mod memtable;
+#[cfg(feature = "mysql")]
+pub mod mysql;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 #[cfg(feature = "sqlite")]
@@ -133,6 +135,8 @@ impl DataBackendBuilder {
             Some(Engine::Postgres) => Ok(()),
             #[cfg(feature = "sqlite")]
             Some(Engine::Sqlite) => Ok(()),
+            #[cfg(feature = "mysql")]
+            Some(Engine::MySQL) => Ok(()),
             _ => Ok(()),
         }
     }
@@ -180,6 +184,19 @@ impl DataBackendBuilder {
                     self.params,
                     mode.into(),
                     self.primary_keys,
+                )
+                .await
+                .boxed()
+                .context(BackendCreationFailedSnafu)?,
+            )),
+            #[cfg(feature = "mysql")]
+            Engine::MySQL => Ok(Box::new(
+                mysql::MySQLBackend::new(
+                    Arc::clone(&self.ctx),
+                    self.name.as_str(),
+                    self.params,
+                    self.primary_keys,
+                    self.secret,
                 )
                 .await
                 .boxed()

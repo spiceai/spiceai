@@ -15,7 +15,8 @@ tracing.workspace = true
 fundu = "2.0.0"
 
 [features]
-default = ["duckdb", "postgres", "sqlite"]
+default = ["duckdb", "postgres", "sqlite", "mysql"]
 duckdb = []
 postgres = []
 sqlite = []
+mysql = []

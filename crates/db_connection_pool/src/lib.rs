@@ -20,6 +20,7 @@ use spicepod::component::dataset::acceleration;
 
 pub mod dbconnection;
 pub mod duckdbpool;
+pub mod mysqlpool;
 pub mod postgrespool;
 pub mod sqlitepool;
 
