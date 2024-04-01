@@ -15,7 +15,7 @@ spec:
       labels:
         app: {{ .Release.Name }}
       annotations:
-        checksum/config: {{ toYaml .Values.spicepod | sha256sum }}
+        checksum/spicepod: {{ toYaml .Values.spicepod | sha256sum }}
     spec:
       {{- if .Values.imagePullSecrets }}
       imagePullSecrets: {{ toYaml .Values.imagePullSecrets | nindent 8 }}
