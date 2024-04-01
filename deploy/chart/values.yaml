@@ -14,5 +14,6 @@ spicepod:
       description: Demo taxi trips in s3
       acceleration:
         enabled: true
-        refresh_interval: 1h
-        refresh_mode: full
+        # Uncomment to refresh the acceleration on a schedule
+        # refresh_interval: 1h
+        # refresh_mode: full
