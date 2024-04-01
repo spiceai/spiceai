@@ -50,7 +50,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - ansi_term 0.12.1, MIT 
   <br/>https://github.com/ogham/rust-ansi-term
 
-- app 0.11.0-alpha, Apache-2.0 
+- app 0.10.1-alpha, Apache-2.0 
 
 - arrow 50.0.0, Apache-2.0 
   <br/>https://github.com/apache/arrow-rs
@@ -67,7 +67,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - arrow-json 50.0.0, Apache-2.0 
   <br/>https://github.com/apache/arrow-rs
 
-- arrow_sql_gen 0.11.0-alpha, Apache-2.0 
+- arrow_sql_gen 0.10.1-alpha, Apache-2.0 
 
 - async-stream 0.3.5, MIT 
   <br/>https://github.com/tokio-rs/async-stream
@@ -123,7 +123,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - datafusion 35.0.0, Apache-2.0 
   <br/>https://github.com/apache/arrow-datafusion
 
-- db_connection_pool 0.11.0-alpha, Apache-2.0 
+- db_connection_pool 0.10.1-alpha, Apache-2.0 
 
 - deltalake 0.17.0, Apache-2.0 
   <br/>https://github.com/delta-io/delta.rs
@@ -134,17 +134,17 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - duckdb 0.10.1, MIT 
   <br/>https://github.com/wangfenjin/duckdb-rs
 
-- flight_client 0.11.0-alpha, Apache-2.0 
+- flight_client 0.10.1-alpha, Apache-2.0 
 
-- flight_datafusion 0.11.0-alpha, Apache-2.0 
+- flight_datafusion 0.10.1-alpha, Apache-2.0 
 
-- flightpublisher 0.11.0-alpha, Apache-2.0 
+- flightpublisher 0.10.1-alpha, Apache-2.0 
 
-- flightrepl 0.11.0-alpha, Apache-2.0 
+- flightrepl 0.10.1-alpha, Apache-2.0 
 
-- flightsql_datafusion 0.11.0-alpha, Apache-2.0 
+- flightsql_datafusion 0.10.1-alpha, Apache-2.0 
 
-- flightsubscriber 0.11.0-alpha, Apache-2.0 
+- flightsubscriber 0.10.1-alpha, Apache-2.0 
 
 - fundu 2.0.0, MIT 
   <br/>https://github.com/fundu-rs/fundu
@@ -194,7 +194,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - notify 6.1.1, CC0-1.0 
   <br/>https://github.com/notify-rs/notify.git
 
-- ns_lookup 0.11.0-alpha, Apache-2.0 
+- ns_lookup 0.10.1-alpha, Apache-2.0 
 
 - object_store 0.9.1, Apache-2.0 OR MIT 
   <br/>https://github.com/apache/arrow-rs/tree/master/object_store
@@ -238,7 +238,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - reqwest 0.11.26, Apache-2.0 OR MIT 
   <br/>https://github.com/seanmonstar/reqwest
 
-- runtime 0.11.0-alpha, Apache-2.0 
+- runtime 0.10.1-alpha, Apache-2.0 
 
 - rusqlite 0.31.0, MIT 
   <br/>https://github.com/rusqlite/rusqlite
@@ -267,7 +267,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - secrecy 0.8.0, Apache-2.0 OR MIT 
   <br/>https://github.com/iqlusioninc/crates/tree/main/secrecy
 
-- secrets 0.11.0-alpha, Apache-2.0 
+- secrets 0.10.1-alpha, Apache-2.0 
 
 - serde 1.0.197, Apache-2.0 OR MIT 
   <br/>https://github.com/serde-rs/serde
@@ -284,11 +284,11 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - snafu 0.8.2, Apache-2.0 OR MIT 
   <br/>https://github.com/shepmaster/snafu
 
-- spiced 0.11.0-alpha, Apache-2.0 
+- spiced 0.10.1-alpha, Apache-2.0 
 
-- spicepod 0.11.0-alpha, Apache-2.0 
+- spicepod 0.10.1-alpha, Apache-2.0 
 
-- sql_provider_datafusion 0.11.0-alpha, Apache-2.0 
+- sql_provider_datafusion 0.10.1-alpha, Apache-2.0 
 
 - time 0.3.34, Apache-2.0 OR MIT 
   <br/>https://github.com/time-rs/time
