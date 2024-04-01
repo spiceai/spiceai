@@ -31,7 +31,7 @@ spice datasets
 `,
 	Run: func(cmd *cobra.Command, args []string) {
 		rtcontext := context.NewContext()
-		_, dataset_statues, err := api.GetComponentStatuses(PROM_ENDPOINT)
+		_, dataset_statuses, err := api.GetComponentStatuses(PROM_ENDPOINT)
 		if err != nil {
 			cmd.PrintErrln(err.Error())
 		}
@@ -42,7 +42,7 @@ spice datasets
 		}
 		table := make([]interface{}, len(datasets))
 		for i, dataset := range datasets {
-			statusEnum, exists := dataset_statues[dataset.Name]
+			statusEnum, exists := dataset_statuses[dataset.Name]
 			if exists {
 				dataset.Status = statusEnum.String()
 			}

@@ -19,7 +19,7 @@ use std::{collections::HashMap, mem, sync::Arc};
 use arrow::record_batch::RecordBatch;
 use arrow_sql_gen::statement::{CreateTableBuilder, InsertBuilder};
 use bb8_postgres::{
-    tokio_postgres::{types::ToSql, NoTls, Transaction},
+    tokio_postgres::{types::ToSql, Transaction},
     PostgresConnectionManager,
 };
 use datafusion::{execution::context::SessionContext, sql::TableReference};
@@ -27,6 +27,7 @@ use db_connection_pool::{
     dbconnection::postgresconn::PostgresConnection, postgrespool::PostgresConnectionPool,
     DbConnectionPool,
 };
+use postgres_native_tls::MakeTlsConnector;
 use secrets::Secret;
 use snafu::{prelude::*, ResultExt};
 use spicepod::component::dataset::Dataset;
@@ -78,7 +79,7 @@ pub struct PostgresBackend {
     name: String,
     pool: Arc<
         dyn DbConnectionPool<
-                bb8::PooledConnection<'static, PostgresConnectionManager<NoTls>>,
+                bb8::PooledConnection<'static, PostgresConnectionManager<MakeTlsConnector>>,
                 &'static (dyn ToSql + Sync),
             > + Send
             + Sync,
@@ -163,7 +164,7 @@ struct PostgresUpdate<'a> {
     update_type: UpdateType,
     pool: Arc<
         dyn DbConnectionPool<
-                bb8::PooledConnection<'static, PostgresConnectionManager<NoTls>>,
+                bb8::PooledConnection<'static, PostgresConnectionManager<MakeTlsConnector>>,
                 &'static (dyn ToSql + Sync),
             > + Send
             + Sync,

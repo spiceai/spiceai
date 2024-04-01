@@ -174,7 +174,9 @@ jobs:
       - name: Start spice runtime
         working-directory: test_app
         run: |
-          spice run &
+          spice run &> spice.log &
+          # time to initialize added dataset
+          sleep 10
 
       - name: Wait for Spice runtime healthy
         working-directory: test_app
@@ -226,6 +228,13 @@ jobs:
             exit 1
           fi
 
+      - name: Stop spice and check logs
+        working-directory: test_app
+        if: always()
+        run: |
+          killall spice
+          cat spice.log
+
   test_quickstart_spiceai:
     name: "E2E Test: SpiceAI quickstart, using ${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}"
     runs-on: ${{ matrix.target.runner }}
@@ -273,9 +282,9 @@ jobs:
           SPICE_SECRET_SPICEAI_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_KEY }}
         working-directory: test_app
         run: |
-          spice run &
-           # time to initialize added dataset
-          sleep 5
+          spice run &> spice.log &
+          # time to initialize added dataset
+          sleep 10
 
       - name: Wait for Spice runtime healthy
         working-directory: test_app
@@ -318,6 +327,13 @@ jobs:
             echo "Unexpected response from spice sql, failed to perform test query: $sql_output"
             exit 1
           fi
+
+      - name: Stop spice and check logs
+        working-directory: test_app
+        if: always()
+        run: |
+          killall spice
+          cat spice.log
 
   test_quickstart_data_postgres:
     name: "E2E Test: SpiceAI Postgres quickstart, using ${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}"
@@ -397,7 +413,7 @@ jobs:
         run: |
           echo -e "eth_recent_blocks\neth recent blocks\npostgres:eth_recent_blocks\ny" | spice dataset configure
           # configure pg credentials
-          echo -e "params:\n  pg_host: localhost\n  pg_port: 5432\n  pg_db: testdb\n  pg_user: postgres\n  pg_pass_key: password" >> ./datasets/eth_recent_blocks/dataset.yaml
+          echo -e "params:\n  pg_host: localhost\n  pg_port: 5432\n  pg_db: testdb\n  pg_user: postgres\n  pg_pass_key: password\n  pg_sslmode: disable" >> ./datasets/eth_recent_blocks/dataset.yaml
           # configure env secret store
           echo -e "secrets:\n  store: env\n" >> spicepod.yaml
           cat spicepod.yaml
@@ -407,9 +423,9 @@ jobs:
           SPICE_SECRET_POSTGRES_PASSWORD: postgres
         working-directory: test_app
         run: |
-          spice run &
-            # time to initialize added dataset
-          sleep 5
+          spice run &> spice.log &
+          # time to initialize added dataset
+          sleep 10
 
       - name: Wait for Spice runtime healthy
         working-directory: test_app
@@ -452,6 +468,13 @@ jobs:
             echo "Unexpected response from spice sql, failed to perform test query: $sql_output"
             exit 1
           fi
+
+      - name: Stop spice and check logs
+        working-directory: test_app
+        if: always()
+        run: |
+          killall spice
+          cat spice.log
 
   test_local_acceleration:
     name: "E2E Test: acceleration on ${{ matrix.target.name }} using ${{ matrix.acceleration.engine }}"
@@ -520,8 +543,9 @@ jobs:
           SPICE_SECRET_SPICEAI_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_KEY }}
         working-directory: test_app
         run: |
-          spice run &
-          sleep 5
+          spice run &> spice.log &
+          # time to initialize added dataset
+          sleep 10
 
       - name: Wait for Spice runtime healthy
         working-directory: test_app
@@ -564,3 +588,10 @@ jobs:
             echo "Unexpected response from spice sql, failed to perform test query: $sql_output"
             exit 1
           fi
+
+      - name: Stop spice and check logs
+        working-directory: test_app
+        if: always()
+        run: |
+          killall spice
+          cat spice.log

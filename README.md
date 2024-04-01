@@ -3,29 +3,40 @@
 [![CodeQL](https://github.com/spiceai/spiceai/actions/workflows/codeql-analysis.yml/badge.svg?branch=trunk&event=push)](https://github.com/spiceai/spiceai/actions/workflows/codeql-analysis.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Discord](https://img.shields.io/discord/803820740868571196)](https://discord.gg/kZnTfneP5u)
-[![Follow on Twitter](https://img.shields.io/twitter/follow/spice_ai.svg?style=social&logo=twitter)](https://twitter.com/intent/follow?screen_name=spice_ai)
+[![Follow on X](https://img.shields.io/twitter/follow/spice_ai.svg?style=social&logo=x)](https://twitter.com/intent/follow?screen_name=spice_ai)
 
 ## What is Spice?
 
-**Spice** is a small, portable runtime that provides developers with a unified SQL query interface to locally materialize, accelerate, and query data tables sourced from any database, data warehouse, or data lake.
+**Spice** is a small, portable runtime that provides developers with a unified SQL query interface to locally materialize, accelerate, and query datasets sourced from any database, data warehouse, or data lake.
+
+📣 Read the [Spice.ai OSS announcement blog post](https://blog.spiceai.org/posts/2024/03/28/adding-spice-the-next-generation-of-spice.ai-oss/).
 
 Spice makes it easy to build data-driven and data-intensive applications by streamlining the use of data and machine learning (ML) in software.
 
 The Spice runtime is written in Rust and leverages industry leading technologies like Apache DataFusion, Apache Arrow, Apache Arrow Flight, and DuckDB.
 
-<img width="900" alt="Spice.ai" src="https://github.com/spiceai/spiceai/assets/80174/f71f227d-d7cd-418c-85b9-5c663a728491" />
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://github.com/spiceai/spiceai/assets/80174/96b5fcef-a550-4ce8-a74a-83931275e83e">  
+  <img width="900" alt="Spice.ai" src="https://github.com/spiceai/spiceai/assets/80174/f71f227d-d7cd-418c-85b9-5c663a728491" />
+</picture>
 
 ## Why Spice?
 
-Spice makes querying data by SQL across one or more data sources simple and fast. Easily co-locate a managed working set of your data with your application or ML, locally accelerated in-memory with Arrow, with SQLite/DuckDB, or with an attached database like PostgreSQL for high-performance, low-latency queries.
+Spice makes querying data by SQL across one or more data sources simple and fast. Easily co-locate a managed working set of data with your application or ML, locally accelerated in-memory with Arrow, with SQLite/DuckDB, or with an attached database like PostgreSQL for high-performance, low-latency queries. Accelerated engines run in your infrastructure giving you flexibility and control over price and performance.
 
 ### Before Spice
 
-<img width="750" alt="Before Spice" src="https://github.com/spiceai/spiceai/assets/80174/0550d682-cf3b-4b1b-a3bd-d8b3ad7d8caf" />
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://github.com/spiceai/spiceai/assets/80174/64a3216e-0bbb-48b0-bf98-72e656d690af">
+  <img width="750" alt="Before Spice" src="https://github.com/spiceai/spiceai/assets/80174/0550d682-cf3b-4b1b-a3bd-d8b3ad7d8caf" />
+</picture>
 
 ### With Spice
 
-<img width="900" alt="With Spice" src="https://github.com/spiceai/spiceai/assets/80174/b57514fe-d53d-42de-b8f0-97ae313c5708" />
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://github.com/spiceai/spiceai/assets/80174/02dbedb4-b209-4d08-bf83-4785a1bf886f">
+  <img width="900" alt="With Spice" src="https://github.com/spiceai/spiceai/assets/80174/b57514fe-d53d-42de-b8f0-97ae313c5708" />
+</picture>
 
 ### Example Use-Cases
 
@@ -35,33 +46,33 @@ Spice makes querying data by SQL across one or more data sources simple and fast
 
 **3. Faster data pipelines, machine learning training and inferencing.** Co-locate datasets in pipelines where the data is needed to minimize data-movement and improve query performance.
 
-**4. Easily query many data sources.** Federated SQL query across databases, data warehouses, and data lakes using [Data Connectors](/data-connectors/index.md).
+**4. Easily query many data sources.** Federated SQL query across databases, data warehouses, and data lakes using [Data Connectors](https://docs.spiceai.org/data-connectors).
 
 ### Supported Data Connectors
 
 Currently supported data connectors for upstream datasets. More coming soon.
 
-| Name         | Description | Status       | Protocol/Format  | Refresh Modes    |
-| ------------ | ----------- | ------------ | ---------------- | ---------------- |
-| `databricks` | Databricks  | Alpha        | Delta Lake       | `full`           |
-| `postgres`   | PostgreSQL  | Alpha        |                  | `full`           |
-| `spiceai`    | Spice.ai    | Alpha        | Arrow Flight     | `append`, `full` |
-| `s3`         | S3          | Alpha        | Parquet          | `full`           |
-| `dremio`     | Dremio      | Alpha        | Arrow Flight SQL | `full`           |
-| `snowflake`  | Snowflake   | Coming soon! | Arrow Flight SQL | `full`           |
-| `bigquery`   | BigQuery    | Coming soon! | Arrow Flight SQL | `full`           |
-| `mysql`      | MySQL       | Coming soon! |                  | `full`           |
+| Name         | Description | Status            | Protocol/Format  | Refresh Modes    |
+| ------------ | ----------- | ----------------- | ---------------- | ---------------- |
+| `databricks` | Databricks  | Alpha             | Delta Lake       | `full`           |
+| `postgres`   | PostgreSQL  | Alpha             |                  | `full`           |
+| `spiceai`    | Spice.ai    | Alpha             | Arrow Flight     | `append`, `full` |
+| `s3`         | S3          | Alpha             | Parquet          | `full`           |
+| `dremio`     | Dremio      | Alpha             | Arrow Flight SQL | `full`           |
+| `mysql`      | MySQL       | Planned for v0.11 |                  | `full`           |
+| `snowflake`  | Snowflake   | Coming soon!      | Arrow Flight SQL | `full`           |
+| `bigquery`   | BigQuery    | Coming soon!      | Arrow Flight SQL | `full`           |
 
-### Supported Data Stores
+### Supported Data Stores/Accelerators
 
 Currently supported data stores for local materialization/acceleration. More coming soon.
 
-| Name       | Description             | Status | Engine Modes     |
-| ---------- | ----------------------- | ------ | ---------------- |
-| `arrow`    | In-Memory Arrow Records | Alpha  | `memory`         |
-| `duckdb`   | Embedded DuckDB         | Alpha  | `memory`, `file` |
-| `sqlite`   | Embedded SQLite         | Alpha  | `memory`, `file` |
-| `postgres` | Attached PostgreSQL     | Alpha  |                  |
+| Name       | Description             | Status | Engine Modes     | Refresh Modes    |
+| ---------- | ----------------------- | ------ | ---------------- | ---------------- |
+| `arrow`    | In-Memory Arrow Records | Alpha  | `memory`         | `append`, `full` |
+| `duckdb`   | Embedded DuckDB         | Alpha  | `memory`, `file` | `append`, `full` |
+| `sqlite`   | Embedded SQLite         | Alpha  | `memory`, `file` | `append`, `full` |
+| `postgres` | Attached PostgreSQL     | Alpha  |                  | `append`, `full` |
 
 ### Intelligent Applications
 
@@ -69,11 +80,11 @@ Spice enables developers to build both data _and_ AI-driven applications by co-l
 
 ⚠️ **DEVELOPER PREVIEW** Spice is under active **alpha** stage development and is not intended to be used in production until its **1.0-stable** release. If you are interested in running Spice in production, please get in touch so we can support you (See Connect with us below).
 
-## Quickstart
+## ⚡️ Quickstart (Local Machine)
 
-https://github.com/spiceai/spiceai/assets/112157037/c9cfdaeb-ac6a-484f-a382-4c2735833f71
+https://github.com/spiceai/spiceai/assets/88671039/85cf9a69-46e7-412e-8b68-22617dcbd4e0
 
-### macOS, Linux and WSL
+### macOS, Linux, and WSL
 
 **Step 1.** Install the Spice CLI:
 
@@ -99,13 +110,7 @@ A `spicepod.yaml` file is created in the `spice_qs` directory. Change to that di
 cd spice_qs
 ```
 
-**Step 3.** Connect to the sample Dremio instance to access the sample data:
-
-```bash
-spice login dremio -u demo -p demo1234
-```
-
-**Step 4.** Start the Spice runtime:
+**Step 3.** Start the Spice runtime:
 
 ```bash
 spice run
@@ -123,7 +128,7 @@ Using latest 'local' runtime version.
 
 The runtime is now started and ready for queries.
 
-**Step 5.** In a new terminal window, add the `spiceai/quickstart` Spicepod. A Spicepod is a package of configuration defining datasets and ML models.
+**Step 4.** In a new terminal window, add the `spiceai/quickstart` Spicepod. A Spicepod is a package of configuration defining datasets and ML models.
 
 ```bash
 spice add spiceai/quickstart
@@ -146,7 +151,7 @@ The `spiceai/quickstart` Spicepod will add a `taxi_trips` data table to the runt
 2024-02-22T05:53:48.223101Z  INFO runtime::dataconnector: Refreshing data for taxi_trips
 ```
 
-**Step 6.** Start the Spice SQL REPL:
+**Step 5.** Start the Spice SQL REPL:
 
 ```bash
 spice sql
@@ -201,7 +206,29 @@ Output:
 Query took: 0.002458976 seconds
 ```
 
-## Next Steps
+## ⚙️ Runtime Container Deployment
+
+Using the [Docker image](https://hub.docker.com/r/spiceai/spiceai) locally:
+
+```bash
+docker pull spiceai/spiceai
+```
+
+In a Dockerfile:
+
+```dockerfile
+from spiceai/spiceai:latest
+```
+
+Using Helm:
+
+```bash
+git clone https://github.com/spiceai/spiceai.git
+cd spiceai
+helm upgrade --install spiceai ./deploy/chart
+```
+
+## 🏎️ Next Steps
 
 You can use any number of predefined datasets available from Spice.ai in the Spice runtime.
 
@@ -309,77 +336,15 @@ Query took: 0.004057791 seconds
 
 You can experiment with the time it takes to generate queries when using non-accelerated datasets. You can change the acceleration setting from `true` to `false` in the datasets.yaml file.
 
-## Importing dataset from S3
+### 📄 Documentation
 
-**Step 1.** If you haven't already initialized a new project, you need to do so. Then, start the Spice Runtime.
+Comprehensive documentation is available at [docs.spiceai.org](https://docs.spiceai.org/).
 
-```bash
-spice init s3-demo-project
-```
-
-```bash
-cd s3-demo-project
-spice run
-```
-
-**Step 2.** We now configure the dataset from S3:
-
-```bash
-spice dataset configure
-```
-
-Enter the name of the dataset:
-
-```bash
-dataset name: (s3-demo-project)  taxi_trips
-```
-
-Enter the description of the dataset:
-
-```
-description: taxi trips in s3
-```
-
-Specify the location of the dataset:
-
-```bash
-from: s3://spiceai-demo-datasets/taxi_trips/2024/
-```
-
-Select "y" when prompted whether to locally accelerate the dataset:
-
-```bash
-Locally accelerate (y/n)? y
-```
-
-We should now see the following output:
-
-```
-Dataset settings written to `datasets/taxi_trips/dataset.yaml`!
-```
-
-You will see the following in the Spice runtime terminal :
-
-```
-2024-02-14T18:34:15.174564Z  INFO spiced: Loaded dataset: taxi_trips
-2024-02-14T18:34:15.175189Z  INFO runtime::datasource: Refreshing data for taxi_trips
-```
-
-**Step 3.** Run queries against the dataset using the Spice SQL REPL.
-
-In a new terminal, start the Spice SQL REPL
-
-```bash
-spice sql
-```
-
-You can now now query `taxi_trips` in the runtime.
-
-### Upcoming Features
+### 🔨 Upcoming Features
 
 🚀 See the [Roadmap to v1.0-stable](https://github.com/spiceai/spiceai/blob/trunk/docs/ROADMAP.md) for upcoming features.
 
-### Connect with us
+### 🤝 Connect with us
 
 We greatly appreciate and value your support! You can help Spice in a number of ways:
 
@@ -387,7 +352,6 @@ We greatly appreciate and value your support! You can help Spice in a number of 
 - [File an issue](https://github.com/spiceai/spiceai/issues/new) if you see something not quite working correctly.
 - Join our team ([We’re hiring!](https://spice.ai/careers))
 - Contribute code or documentation to the project (see [CONTRIBUTING.md](CONTRIBUTING.md)).
+- Follow our blog at [blog.spiceai.org](https://blog.spiceai.org)
 
 ⭐️ star this repo! Thank you for your support! 🙏
-
-For a more comprehensive guide, see the full [online documentation](https://docs.spiceai.org/).

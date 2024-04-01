@@ -20,6 +20,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/spiceai/spiceai/bin/spice/pkg/api"
 	"github.com/spiceai/spiceai/bin/spice/pkg/context"
+	"github.com/spiceai/spiceai/bin/spice/pkg/util"
 )
 
 var podsCmd = &cobra.Command{
@@ -30,10 +31,23 @@ spice pods
 `,
 	Run: func(cmd *cobra.Command, args []string) {
 		rtcontext := context.NewContext()
-		err := api.WriteDataTable(rtcontext, "/v1/spicepods", api.Spicepod{})
+
+		spicepods, err := api.GetData[api.Spicepod](rtcontext, "/v1/spicepods")
 		if err != nil {
 			cmd.PrintErrln(err.Error())
 		}
+		table := make([]interface{}, len(spicepods))
+		for i, spicepod := range spicepods {
+			spicepodStatus := api.SpicepodStatus{
+				Version:           spicepod.Version,
+				Name:              spicepod.Name,
+				DatasetsCount:     len(spicepod.Datasets),
+				ModelsCount:       len(spicepod.Models),
+				DependenciesCount: len(spicepod.Dependencies),
+			}
+			table[i] = spicepodStatus
+		}
+		util.WriteTable(table)
 	},
 }
 

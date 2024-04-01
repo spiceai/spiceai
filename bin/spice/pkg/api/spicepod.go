@@ -17,6 +17,14 @@ limitations under the License.
 package api
 
 type Spicepod struct {
+	Version      string    `json:"version,omitempty" csv:"version" yaml:"version,omitempty"`
+	Name         string    `json:"name,omitempty" csv:"name" yaml:"name,omitempty"`
+	Datasets     []Dataset `json:"datasets,omitempty" csv:"datasets" yaml:"datasets,omitempty"`
+	Models       []Model   `json:"models,omitempty" csv:"models" yaml:"models,omitempty"`
+	Dependencies []string  `json:"dependencies,omitempty" csv:"depdencies" yaml:"dependencies,omitempty"`
+}
+
+type SpicepodStatus struct {
 	Version           string `json:"version,omitempty" csv:"version" yaml:"version,omitempty"`
 	Name              string `json:"name,omitempty" csv:"name" yaml:"name,omitempty"`
 	DatasetsCount     int    `json:"datasets_count,omitempty" csv:"datasets_count" yaml:"datasets_count,omitempty"`

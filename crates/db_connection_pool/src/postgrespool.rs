@@ -17,11 +17,14 @@ limitations under the License.
 use std::{collections::HashMap, str::FromStr, sync::Arc};
 
 use async_trait::async_trait;
+use bb8::ErrorSink;
 use bb8_postgres::{
-    tokio_postgres::{config::Host, types::ToSql, Config, NoTls},
+    tokio_postgres::{config::Host, types::ToSql, Config},
     PostgresConnectionManager,
 };
+use native_tls::TlsConnector;
 use ns_lookup::verify_ns_lookup_and_tcp_connect;
+use postgres_native_tls::MakeTlsConnector;
 use secrets::Secret;
 use snafu::{prelude::*, ResultExt};
 
@@ -45,7 +48,7 @@ pub enum Error {
 }
 
 pub struct PostgresConnectionPool {
-    pool: Arc<bb8::Pool<PostgresConnectionManager<NoTls>>>,
+    pool: Arc<bb8::Pool<PostgresConnectionManager<MakeTlsConnector>>>,
 }
 
 impl PostgresConnectionPool {
@@ -59,6 +62,7 @@ impl PostgresConnectionPool {
         secret: Option<Secret>,
     ) -> Result<Self> {
         let mut connection_string = "host=localhost user=postgres dbname=postgres".to_string();
+        let mut accept_invalid_certs = false;
 
         if let Some(params) = params.as_ref() {
             connection_string = String::new();
@@ -88,6 +92,12 @@ impl PostgresConnectionPool {
                 if let Some(pg_port) = params.get("pg_port") {
                     connection_string.push_str(format!("port={pg_port} ").as_str());
                 }
+                if let Some(pg_sslmode) = params.get("pg_sslmode") {
+                    connection_string.push_str(format!("sslmode={pg_sslmode} ").as_str());
+                }
+                if let Some(pg_insecure) = params.get("pg_insecure") {
+                    accept_invalid_certs = pg_insecure == "true";
+                }
             }
         }
 
@@ -103,9 +113,16 @@ impl PostgresConnectionPool {
             }
         }
 
-        let manager = PostgresConnectionManager::new(config, NoTls);
+        let connector = TlsConnector::builder()
+            .danger_accept_invalid_certs(accept_invalid_certs)
+            .build()?;
+        let connector = MakeTlsConnector::new(connector);
+
+        let manager = PostgresConnectionManager::new(config, connector);
+        let error_sink = PostgresErrorSink::new();
 
         let pool = bb8::Pool::builder()
+            .error_sink(Box::new(error_sink))
             .build(manager)
             .await
             .context(ConnectionPoolSnafu)?;
@@ -113,6 +130,29 @@ impl PostgresConnectionPool {
         Ok(PostgresConnectionPool {
             pool: Arc::new(pool),
         })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PostgresErrorSink {}
+
+impl PostgresErrorSink {
+    pub fn new() -> Self {
+        PostgresErrorSink {}
+    }
+}
+
+impl<E> ErrorSink<E> for PostgresErrorSink
+where
+    E: std::fmt::Debug,
+    E: std::fmt::Display,
+{
+    fn sink(&self, error: E) {
+        tracing::error!("Postgres Connection Error: {:?}", error);
+    }
+
+    fn boxed_clone(&self) -> Box<dyn ErrorSink<E>> {
+        Box::new(*self)
     }
 }
 
@@ -145,7 +185,7 @@ pub fn get_secret_or_param(
 #[async_trait]
 impl
     DbConnectionPool<
-        bb8::PooledConnection<'static, PostgresConnectionManager<NoTls>>,
+        bb8::PooledConnection<'static, PostgresConnectionManager<MakeTlsConnector>>,
         &'static (dyn ToSql + Sync),
     > for PostgresConnectionPool
 {
@@ -154,7 +194,7 @@ impl
     ) -> Result<
         Box<
             dyn DbConnection<
-                bb8::PooledConnection<'static, PostgresConnectionManager<NoTls>>,
+                bb8::PooledConnection<'static, PostgresConnectionManager<MakeTlsConnector>>,
                 &'static (dyn ToSql + Sync),
             >,
         >,

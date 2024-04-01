@@ -170,7 +170,7 @@ checksum = "d301b3b94cb4b2f23d7917810addbbaff90738e0ca2be692bd027e70d7e0330c"
 
 [[package]]
 name = "app"
-version = "0.11.0-alpha"
+version = "0.10.1-alpha"
 dependencies = [
  "snafu 0.8.2",
  "spicepod",
@@ -528,7 +528,7 @@ dependencies = [
 
 [[package]]
 name = "arrow_sql_gen"
-version = "0.11.0-alpha"
+version = "0.10.1-alpha"
 dependencies = [
  "arrow",
  "bigdecimal 0.3.1",
@@ -1850,9 +1850,9 @@ dependencies = [
 
 [[package]]
 name = "crypto-mac"
-version = "0.11.1"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1d1a86f49236c215f271d40892d5fc950490551400b02ef360692c29815c714"
+checksum = "25fab6889090c8133f3deb8f73ba3c65a7f456f66436fc012a1b1e272b1e103e"
 dependencies = [
  "generic-array",
  "subtle",
@@ -2161,7 +2161,7 @@ dependencies = [
 
 [[package]]
 name = "db_connection_pool"
-version = "0.11.0-alpha"
+version = "0.10.1-alpha"
 dependencies = [
  "arrow",
  "arrow_sql_gen",
@@ -2173,7 +2173,9 @@ dependencies = [
  "futures",
  "mysql_async",
  "mysql_common",
+ "native-tls",
  "ns_lookup",
+ "postgres-native-tls",
  "r2d2",
  "rusqlite",
  "secrets",
@@ -2677,7 +2679,7 @@ dependencies = [
 
 [[package]]
 name = "flight_client"
-version = "0.11.0-alpha"
+version = "0.10.1-alpha"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -2694,7 +2696,7 @@ dependencies = [
 
 [[package]]
 name = "flight_datafusion"
-version = "0.11.0-alpha"
+version = "0.10.1-alpha"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -2712,7 +2714,7 @@ dependencies = [
 
 [[package]]
 name = "flightpublisher"
-version = "0.11.0-alpha"
+version = "0.10.1-alpha"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -2726,7 +2728,7 @@ dependencies = [
 
 [[package]]
 name = "flightrepl"
-version = "0.11.0-alpha"
+version = "0.10.1-alpha"
 dependencies = [
  "ansi_term",
  "arrow",
@@ -2746,7 +2748,7 @@ dependencies = [
 
 [[package]]
 name = "flightsql_datafusion"
-version = "0.11.0-alpha"
+version = "0.10.1-alpha"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -2765,7 +2767,7 @@ dependencies = [
 
 [[package]]
 name = "flightsubscriber"
-version = "0.11.0-alpha"
+version = "0.10.1-alpha"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -4285,7 +4287,7 @@ dependencies = [
 
 [[package]]
 name = "ns_lookup"
-version = "0.11.0-alpha"
+version = "0.10.1-alpha"
 dependencies = [
  "snafu 0.8.2",
  "tracing",
@@ -4885,6 +4887,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7170ef9988bc169ba16dd36a7fa041e5c4cbeb6a35b76d4c03daded371eae7c0"
 
 [[package]]
+name = "postgres-native-tls"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d442770e2b1e244bb5eb03b31c79b65bb2568f413b899eaba850fa945a65954"
+dependencies = [
+ "futures",
+ "native-tls",
+ "tokio",
+ "tokio-native-tls",
+ "tokio-postgres",
+]
+
+[[package]]
 name = "postgres-protocol"
 version = "0.6.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5403,7 +5418,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "0.11.0-alpha"
+version = "0.10.1-alpha"
 dependencies = [
  "app",
  "arrow",
@@ -5446,6 +5461,7 @@ dependencies = [
  "once_cell",
  "opentelemetry-proto",
  "pin-project",
+ "postgres-native-tls",
  "prost 0.12.3",
  "quick-xml 0.23.1",
  "r2d2",
@@ -5897,7 +5913,7 @@ dependencies = [
 
 [[package]]
 name = "secrets"
-version = "0.11.0-alpha"
+version = "0.10.1-alpha"
 dependencies = [
  "async-trait",
  "base64 0.22.0",
@@ -6197,7 +6213,7 @@ dependencies = [
 
 [[package]]
 name = "spiced"
-version = "0.11.0-alpha"
+version = "0.10.1-alpha"
 dependencies = [
  "app",
  "clap",
@@ -6215,7 +6231,7 @@ dependencies = [
 
 [[package]]
 name = "spicepod"
-version = "0.11.0-alpha"
+version = "0.10.1-alpha"
 dependencies = [
  "fundu",
  "serde",
@@ -6238,7 +6254,7 @@ checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
 
 [[package]]
 name = "sql_provider_datafusion"
-version = "0.11.0-alpha"
+version = "0.10.1-alpha"
 dependencies = [
  "async-trait",
  "datafusion",
@@ -6353,9 +6369,9 @@ dependencies = [
 
 [[package]]
 name = "subtle"
-version = "2.4.1"
+version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6bdef32e8150c2a081110b42772ffe7d7c9032b606bc226c8260fd97e0976601"
+checksum = "81cdd64d312baedb58e21336b31bc043b77e01cc99033ce76ef539f78e965ebc"
 
 [[package]]
 name = "syn"

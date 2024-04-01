@@ -47,6 +47,9 @@ pub enum Error {
     #[snafu(display("Failed to update sqlite table: {source}"))]
     UpdateError { source: tokio_rusqlite::Error },
 
+    #[snafu(display("Unsupported data type"))]
+    UnsupportedDataType {},
+
     #[snafu(display("SqliteDataFusionError: {source}"))]
     SqliteDataFusion {
         source: sql_provider_datafusion::Error,
@@ -75,7 +78,20 @@ impl DataPublisher for SqliteBackend {
     fn add_data(&self, _dataset: Arc<Dataset>, data_update: DataUpdate) -> AddDataResult {
         let pool = Arc::clone(&self.pool);
         let name = self.name.clone();
+
         Box::pin(async move {
+            if let Some(batch) = data_update.data.first() {
+                for field in batch.schema().fields() {
+                    if field.data_type().is_nested() {
+                        let field_full_name = format!("{}.{}", name, field.name());
+                        tracing::error!("Unable to append {field_full_name}: nested types are not currently supported for local acceleration by sqlite");
+                        return Err(
+                            Box::new(Error::UnsupportedDataType {}) as Box<dyn std::error::Error>
+                        );
+                    }
+                }
+            }
+
             let sqlite_update = SqliteUpdate {
                 name,
                 data: data_update.data,
