@@ -1,0 +1,4 @@
+apiVersion: v2
+name: Spice.ai OSS
+description: Spice.ai OSS
+version: 0.1.0
