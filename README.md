@@ -224,8 +224,7 @@ Using Helm:
 
 ```bash
 helm repo add spiceai https://helm.spiceai.org
-helm repo update
-helm upgrade --install spiceai spiceai/spiceai
+helm install spiceai spiceai/spiceai
 ```
 
 ## 🏎️ Next Steps
