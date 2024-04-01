@@ -40,18 +40,19 @@ assignees: ''
 - [ ] Merge [Quickstarts PRs](https://github.com/spiceai/samples/pulls)
 - [ ] Update release notes
 - [ ] Update acknowledgements by triggering [Generate Acknowledgements](https://github.com/spiceai/spiceai/actions/workflows/generate_acknowledgements.yml) workflow
-- [ ] Verify `version.txt` and version in `Cargo.toml` is correct using [docs/RELEASE.md](https://github.com/spiceai/spiceai/blob/trunk/docs/RELEASE.md#version-update)
+- [ ] Verify `version.txt` and version in `Cargo.toml` are correct using [docs/RELEASE.md](https://github.com/spiceai/spiceai/blob/trunk/docs/RELEASE.md#version-update)
 - [ ] Ensure [E2E Test CI](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_ci.yml) is green on trunk branch
 - [ ] QA DRI sign-off
 - [ ] Docs DRI sign-off
 - [ ] Create a new branch `release-v[semver]` and merge all relevant changes into it. E.g. `release-v0.9.1-alpha`
 - [ ] Release the new version by creating a `pre-release` [GitHub Release](https://github.com/spiceai/spiceai/releases/new) with the tag from the release branch. E.g. `v0.9.1-alpha`
 - [ ] Release any docs updates by creating a `v[semver]` tag.
+- [ ] If there were any changes to the [Helm chart](https://github.com/spiceai/spiceai/blob/trunk/deploy/chart), update the Helm chart version and trigger the [Release Chart](https://github.com/spiceai/helm-charts/actions/workflows/release.yml) workflow.
 - [ ] Final test pass on released binaries
 - [ ] Run [E2E Test Release Installation](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_release_install.yml)
 - [ ] Update `version.txt` and version in `Cargo.toml` to the next release version.
 - [ ] Update versions in [brew taps](https://github.com/spiceai/homebrew-spiceai)
-- [ ] Remove the released version from the [ROADMAP](docs/ROADMAP.md)
+- [ ] Remove the released version from the [ROADMAP](https://github.com/spiceai/spiceai/blob/trunk/docs/ROADMAP.md)
 
 ## Announcement Checklist
 
