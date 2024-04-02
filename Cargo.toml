@@ -40,7 +40,7 @@ metrics = "0.22.0"
 datafusion = "35.0.0"
 arrow = "50.0.0"
 arrow-flight = "50.0.0"
-duckdb = { git = "https://github.com/spicehq/duckdb-rs.git", rev = "4e1cf06070891088a78085bef0aaa57944c19c8d" }
+duckdb = { git = "https://github.com/duckdb/duckdb-rs.git", rev = "b82db396d116fc2dd9311802544610c0f2d06c34" }
 tonic = "0.10.2"
 futures = "0.3.30"
 r2d2 = "0.8.10"
