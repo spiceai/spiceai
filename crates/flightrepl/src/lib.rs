@@ -109,7 +109,7 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
                 println!("\nAny other line will be interpreted as a SQL query");
                 continue;
             }
-            "show tables" => {
+            "show tables" | "show tables;" => {
                 "select table_name from information_schema.tables where table_schema = 'public'"
             }
             _ => line,
