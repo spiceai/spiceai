@@ -557,7 +557,7 @@ pub(crate) mod inference {
     use app::App;
     use arrow::array::Float32Array;
     use axum::{
-        extract::{Path, Query},
+        extract::Path,
         http::StatusCode,
         response::{IntoResponse, Response},
         Extension, Json,
@@ -577,20 +577,6 @@ pub(crate) mod inference {
     #[derive(Deserialize)]
     pub struct PredictRequest {
         pub model_name: String,
-
-        #[serde(default = "default_lookback")]
-        pub lookback: usize,
-    }
-
-    #[derive(Deserialize)]
-    pub struct PredictParams {
-        #[serde(default = "default_lookback")]
-        pub lookback: usize,
-    }
-
-    // TODO(jeadie): This needs to come from the training_run postgres table in cloud, for the specific training run that made the model.
-    fn default_lookback() -> usize {
-        4
     }
 
     #[derive(Serialize)]
@@ -611,8 +597,6 @@ pub(crate) mod inference {
         #[serde(skip_serializing_if = "Option::is_none")]
         pub model_version: Option<String>,
 
-        pub lookback: usize,
-
         #[serde(skip_serializing_if = "Vec::is_empty")]
         pub prediction: Vec<f32>,
 
@@ -630,11 +614,9 @@ pub(crate) mod inference {
         Extension(app): Extension<Arc<RwLock<Option<App>>>>,
         Extension(df): Extension<Arc<RwLock<DataFusion>>>,
         Path(model_name): Path<String>,
-        Query(params): Query<PredictParams>,
         Extension(models): Extension<Arc<RwLock<HashMap<String, Model>>>>,
     ) -> Response {
-        let model_predict_response =
-            run_inference(app, df, models, model_name, params.lookback).await;
+        let model_predict_response = run_inference(app, df, models, model_name).await;
 
         match model_predict_response.status {
             PredictStatus::Success => {
@@ -667,7 +649,6 @@ pub(crate) mod inference {
                 df.clone(),
                 models.clone(),
                 model_predict_request.model_name,
-                model_predict_request.lookback,
             );
             model_prediction_futures.push(prediction_future);
         }
@@ -691,7 +672,6 @@ pub(crate) mod inference {
         df: Arc<RwLock<DataFusion>>,
         models: Arc<RwLock<HashMap<String, Model>>>,
         model_name: String,
-        lookback: usize,
     ) -> PredictResponse {
         let start_time = Instant::now();
 
@@ -702,7 +682,6 @@ pub(crate) mod inference {
                 error_message: Some("App not found".to_string()),
                 model_name,
                 model_version: None,
-                lookback,
                 prediction: vec![],
                 duration_ms: start_time.elapsed().as_millis(),
             };
@@ -716,7 +695,6 @@ pub(crate) mod inference {
                 error_message: Some(format!("Model {model_name} not found")),
                 model_name,
                 model_version: None,
-                lookback,
                 prediction: vec![],
                 duration_ms: start_time.elapsed().as_millis(),
             };
@@ -730,13 +708,12 @@ pub(crate) mod inference {
                 error_message: Some(format!("Model {model_name} not found")),
                 model_name,
                 model_version: Some(model_version(&model.from)),
-                lookback,
                 prediction: vec![],
                 duration_ms: start_time.elapsed().as_millis(),
             };
         };
 
-        match runnable.run(df.clone(), lookback).await {
+        match runnable.run(df.clone()).await {
             Ok(inference_result) => {
                 if let Some(column_data) = inference_result.column_by_name("y") {
                     if let Some(array) = column_data.as_any().downcast_ref::<Float32Array>() {
@@ -746,7 +723,6 @@ pub(crate) mod inference {
                             error_message: None,
                             model_name,
                             model_version: Some(model_version(&model.from)),
-                            lookback,
                             prediction: result,
                             duration_ms: start_time.elapsed().as_millis(),
                         };
@@ -762,7 +738,6 @@ pub(crate) mod inference {
                         ),
                         model_name,
                         model_version: Some(model_version(&model.from)),
-                        lookback,
                         prediction: vec![],
                         duration_ms: start_time.elapsed().as_millis(),
                     };
@@ -777,7 +752,6 @@ pub(crate) mod inference {
                     ),
                     model_name,
                     model_version: Some(model_version(&model.from)),
-                    lookback,
                     prediction: vec![],
                     duration_ms: start_time.elapsed().as_millis(),
                 }
@@ -789,7 +763,6 @@ pub(crate) mod inference {
                     error_message: Some(e.to_string()),
                     model_name,
                     model_version: Some(model_version(&model.from)),
-                    lookback,
                     prediction: vec![],
                     duration_ms: start_time.elapsed().as_millis(),
                 }

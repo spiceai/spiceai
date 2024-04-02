@@ -50,6 +50,26 @@ type Plan = SimplePlan<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn Typ
 pub struct Model {
     model: Plan,
 }
+impl Model {
+    // Attempts to get the shape of the input tensor expected by the Tract model. Parses the first
+    // `input_fact`. Input shape of the form: [1, lookback_size, num_variates].
+    fn try_get_input_shape(&self) -> Result<[usize; 3]> {
+        let fact = self.model.model().input_fact(0).context(TractSnafu)?;
+        let shape = fact
+            .shape
+            .iter()
+            .filter_map(|dim| dim.as_i64().and_then(|dim| usize::try_from(dim).ok()))
+            .collect::<Vec<usize>>();
+
+        if shape.len() != 3 {
+            return Err(Error::ShapeError {
+                source: ndarray::ShapeError::from_kind(ndarray::ErrorKind::IncompatibleShape),
+            });
+        }
+
+        Ok([shape[0], shape[1], shape[2]])
+    }
+}
 
 impl ModelRuntime for Tract {
     fn load(&self) -> std::result::Result<Box<dyn Runnable>, super::Error> {
@@ -66,11 +86,7 @@ fn load_tract_model(path: &str) -> TractResult<Plan> {
 }
 
 impl Runnable for Model {
-    fn run(
-        &self,
-        input: Vec<RecordBatch>,
-        lookback_size: usize,
-    ) -> std::result::Result<RecordBatch, super::Error> {
+    fn run(&self, input: Vec<RecordBatch>) -> std::result::Result<RecordBatch, super::Error> {
         {
             let this = &self;
             let reader: &[RecordBatch] = &input;
@@ -83,6 +99,8 @@ impl Runnable for Model {
             let schema = first_record.schema();
             let fields = schema.fields();
             let mut data: Vec<Vec<f64>> = fields.iter().map(|_| Vec::new()).collect_vec();
+
+            let [_, lookback_size, num_variates] = this.try_get_input_shape()?;
 
             for batch in reader {
                 batch
@@ -116,10 +134,18 @@ impl Runnable for Model {
                 .map(|(_, x)| x.clone())
                 .collect_vec();
 
-            let n_cols = inp.len();
+            if inp.len() != num_variates {
+                return Err(Box::new(Error::TractError {
+                    source: tract_core::anyhow::Error::msg(format!(
+                        "Number of variates {} does not match expected ({})from model",
+                        inp.len(),
+                        num_variates
+                    )),
+                }));
+            }
 
             let small_vec: Tensor = tract_ndarray::Array3::from_shape_vec(
-                (1, lookback_size, n_cols),
+                (1, lookback_size, num_variates),
                 inp.into_iter().concat(),
             )
             .context(ShapeSnafu)?
