@@ -3970,6 +3970,7 @@ dependencies = [
  "snafu 0.8.2",
  "tracing",
  "trust-dns-resolver",
+ "url",
 ]
 
 [[package]]
@@ -5122,6 +5123,7 @@ dependencies = [
  "ndarray",
  "ndarray-npy",
  "notify",
+ "ns_lookup",
  "object_store",
  "once_cell",
  "opentelemetry-proto",
