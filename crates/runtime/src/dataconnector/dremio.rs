@@ -21,6 +21,7 @@ use std::{collections::HashMap, future::Future};
 
 use flight_client::FlightClient;
 use flight_datafusion::FlightTable;
+use ns_lookup::verify_endpoint_connection;
 use spicepod::component::dataset::Dataset;
 
 use secrets::Secret;
@@ -49,6 +50,11 @@ impl DataConnectorFactory for Dremio {
                 .ok_or_else(|| super::Error::UnableToCreateDataConnector {
                     source: "Missing required parameter: endpoint".into(),
                 })?;
+
+            verify_endpoint_connection(&endpoint)
+                .await
+                .map_err(|e| super::Error::UnableToCreateDataConnector { source: e.into() })?;
+
             let flight_client = FlightClient::new(
                 endpoint.as_str(),
                 secret.get("username").unwrap_or_default(),
