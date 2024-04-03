@@ -18,7 +18,7 @@
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
-  "id": 4,
+  "id": 28,
   "links": [],
   "liveNow": false,
   "panels": [
@@ -38,7 +38,148 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "PBFA97CFB590B2093"
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "fillOpacity": 80,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineWidth": 1,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [
+            {
+              "options": {
+                "Value": {
+                  "index": 0,
+                  "text": "Health"
+                }
+              },
+              "type": "value"
+            }
+          ],
+          "max": 100,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "#EAB839",
+                "value": 50
+              },
+              {
+                "color": "green",
+                "value": 90
+              }
+            ]
+          },
+          "unit": "percent"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 1
+      },
+      "id": 21,
+      "options": {
+        "barRadius": 0,
+        "barWidth": 0.93,
+        "colorByField": "Value",
+        "fullHighlight": false,
+        "groupWidth": 0.7,
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": false
+        },
+        "orientation": "horizontal",
+        "showValue": "never",
+        "stacking": "normal",
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        },
+        "xField": "pod",
+        "xTickLabelRotation": 0,
+        "xTickLabelSpacing": 0
+      },
+      "pluginVersion": "10.4.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "disableTextWrap": false,
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "(sum by(pod) (count_over_time(spiced_runtime_flight_server_start[$__range])) * 10000) / $__range_ms * 100",
+          "fullMetaSearch": false,
+          "includeNullMetadata": true,
+          "instant": true,
+          "legendFormat": "__auto",
+          "range": false,
+          "refId": "A",
+          "useBackend": false
+        }
+      ],
+      "title": "Spice Health",
+      "transformations": [
+        {
+          "id": "labelsToFields",
+          "options": {
+            "mode": "columns"
+          }
+        },
+        {
+          "id": "merge",
+          "options": {}
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {},
+            "includeByName": {},
+            "indexByName": {},
+            "renameByName": {
+              "Value": "Uptime"
+            }
+          }
+        }
+      ],
+      "type": "barchart"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -64,11 +205,11 @@
       },
       "gridPos": {
         "h": 7,
-        "w": 3,
+        "w": 24,
         "x": 0,
-        "y": 1
+        "y": 9
       },
-      "id": 4,
+      "id": 5,
       "options": {
         "colorMode": "value",
         "graphMode": "area",
@@ -93,103 +234,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "exemplar": false,
-          "expr": "sum(spiced_runtime_flight_server_start)",
-          "instant": true,
-          "legendFormat": "__auto",
-          "range": false,
-          "refId": "A"
-        }
-      ],
-      "title": "Active Spiced",
-      "type": "stat"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "PBFA97CFB590B2093"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "drawStyle": "line",
-            "fillOpacity": 0,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "auto",
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "red",
-                "value": 80
-              }
-            ]
-          }
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 7,
-        "w": 10,
-        "x": 4,
-        "y": 1
-      },
-      "id": 5,
-      "options": {
-        "legend": {
-          "calcs": [],
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "mode": "single",
-          "sort": "none"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "editorMode": "code",
-          "expr": "sum by (job) (datasets_count{job=~\"$pods\"})",
+          "expr": "sum by (pod) (datasets_count)",
           "instant": false,
           "legendFormat": "__auto",
           "range": true,
@@ -197,102 +242,7 @@
         }
       ],
       "title": "Number of Datasets",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "PBFA97CFB590B2093"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "drawStyle": "line",
-            "fillOpacity": 0,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "auto",
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "red",
-                "value": 80
-              }
-            ]
-          }
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 7,
-        "w": 10,
-        "x": 14,
-        "y": 1
-      },
-      "id": 6,
-      "options": {
-        "legend": {
-          "calcs": [],
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "mode": "single",
-          "sort": "none"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "editorMode": "code",
-          "expr": "sum by (job) (models_count{job=~\"${pods}\"})",
-          "instant": false,
-          "legendFormat": "{{job}}",
-          "range": true,
-          "refId": "A"
-        }
-      ],
-      "title": "Number of Models",
-      "type": "timeseries"
+      "type": "stat"
     },
     {
       "collapsed": false,
@@ -300,7 +250,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 8
+        "y": 16
       },
       "id": 2,
       "panels": [],
@@ -310,7 +260,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "PBFA97CFB590B2093"
+        "uid": "prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -371,7 +321,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 9
+        "y": 17
       },
       "id": 7,
       "options": {
@@ -393,20 +343,21 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (method, path, status, quantile) (1000*http_requests_duration_seconds{quantile=~\"${quantile}\",job=~\"${pods}\"} > 0)",
+          "expr": "sum by (pod, method, path, status) (http_requests_duration_seconds{quantile=\"0.95\"} > 0)",
+          "hide": false,
           "instant": false,
-          "legendFormat": "{{method}} {{path}} (P{{quantile}})",
+          "legendFormat": "__auto",
           "range": true,
-          "refId": "A"
+          "refId": "B"
         }
       ],
-      "title": "HTTP Latency",
+      "title": "HTTP Latency (p95)",
       "type": "timeseries"
     },
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "PBFA97CFB590B2093"
+        "uid": "prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -466,7 +417,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 9
+        "y": 17
       },
       "id": 8,
       "options": {
@@ -488,7 +439,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (path, method) (\n  increase(http_requests_duration_seconds_count{job=~\"${pods}\"}[$__rate_interval])\n)",
+          "expr": "sum by (pod, path, method) (\n  increase(http_requests_duration_seconds_count[$__rate_interval])\n)",
           "instant": false,
           "legendFormat": "{{method}} {{path}}",
           "range": true,
@@ -499,305 +450,235 @@
       "type": "timeseries"
     },
     {
-      "collapsed": true,
+      "collapsed": false,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 17
+        "y": 25
       },
       "id": 3,
-      "panels": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "PBFA97CFB590B2093"
-          },
-          "fieldConfig": {
-            "defaults": {
-              "color": {
-                "mode": "palette-classic"
-              },
-              "custom": {
-                "axisBorderShow": false,
-                "axisCenteredZero": false,
-                "axisColorMode": "text",
-                "axisLabel": "",
-                "axisPlacement": "auto",
-                "barAlignment": 0,
-                "drawStyle": "points",
-                "fillOpacity": 0,
-                "gradientMode": "none",
-                "hideFrom": {
-                  "legend": false,
-                  "tooltip": false,
-                  "viz": false
-                },
-                "insertNulls": false,
-                "lineInterpolation": "linear",
-                "lineWidth": 1,
-                "pointSize": 5,
-                "scaleDistribution": {
-                  "type": "linear"
-                },
-                "showPoints": "auto",
-                "spanNulls": false,
-                "stacking": {
-                  "group": "A",
-                  "mode": "none"
-                },
-                "thresholdsStyle": {
-                  "mode": "off"
-                }
-              },
-              "mappings": [],
-              "thresholds": {
-                "mode": "absolute",
-                "steps": [
-                  {
-                    "color": "green",
-                    "value": null
-                  },
-                  {
-                    "color": "red",
-                    "value": 80
-                  }
-                ]
-              },
-              "unit": "ms"
-            },
-            "overrides": []
-          },
-          "gridPos": {
-            "h": 8,
-            "w": 8,
-            "x": 0,
-            "y": 18
-          },
-          "id": 9,
-          "options": {
-            "legend": {
-              "calcs": [],
-              "displayMode": "list",
-              "placement": "bottom",
-              "showLegend": true
-            },
-            "tooltip": {
-              "mode": "single",
-              "sort": "none"
-            }
-          },
-          "targets": [
-            {
-              "datasource": {
-                "type": "prometheus",
-                "uid": "prometheus"
-              },
-              "editorMode": "code",
-              "expr": "load_dataset_duration_ms{quantile=~\"${quantile}\", job=~\"${pods}\"} unless load_dataset_duration_ms == 0",
-              "instant": false,
-              "legendFormat": "{{dataset}} (P{{quantile}})",
-              "range": true,
-              "refId": "A"
-            }
-          ],
-          "title": "Load Dataset Duration",
-          "type": "timeseries"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "PBFA97CFB590B2093"
-          },
-          "fieldConfig": {
-            "defaults": {
-              "color": {
-                "mode": "palette-classic"
-              },
-              "custom": {
-                "axisBorderShow": false,
-                "axisCenteredZero": false,
-                "axisColorMode": "text",
-                "axisLabel": "",
-                "axisPlacement": "auto",
-                "barAlignment": 0,
-                "drawStyle": "points",
-                "fillOpacity": 0,
-                "gradientMode": "none",
-                "hideFrom": {
-                  "legend": false,
-                  "tooltip": false,
-                  "viz": false
-                },
-                "insertNulls": false,
-                "lineInterpolation": "linear",
-                "lineWidth": 1,
-                "pointSize": 5,
-                "scaleDistribution": {
-                  "type": "linear"
-                },
-                "showPoints": "auto",
-                "spanNulls": false,
-                "stacking": {
-                  "group": "A",
-                  "mode": "none"
-                },
-                "thresholdsStyle": {
-                  "mode": "off"
-                }
-              },
-              "mappings": [],
-              "thresholds": {
-                "mode": "absolute",
-                "steps": [
-                  {
-                    "color": "green",
-                    "value": null
-                  },
-                  {
-                    "color": "red",
-                    "value": 80
-                  }
-                ]
-              }
-            },
-            "overrides": []
-          },
-          "gridPos": {
-            "h": 8,
-            "w": 8,
-            "x": 8,
-            "y": 18
-          },
-          "id": 10,
-          "options": {
-            "legend": {
-              "calcs": [],
-              "displayMode": "list",
-              "placement": "bottom",
-              "showLegend": true
-            },
-            "tooltip": {
-              "mode": "single",
-              "sort": "none"
-            }
-          },
-          "targets": [
-            {
-              "datasource": {
-                "type": "prometheus",
-                "uid": "prometheus"
-              },
-              "editorMode": "code",
-              "expr": "1000*load_model{quantile=~\"${quantile}\", job=~\"${pods}\"} unless load_model == 0",
-              "instant": false,
-              "legendFormat": "{{model}} (P{{quantile}})",
-              "range": true,
-              "refId": "A"
-            }
-          ],
-          "title": "Load Model Duration",
-          "type": "timeseries"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "PBFA97CFB590B2093"
-          },
-          "fieldConfig": {
-            "defaults": {
-              "color": {
-                "mode": "palette-classic"
-              },
-              "custom": {
-                "axisBorderShow": false,
-                "axisCenteredZero": false,
-                "axisColorMode": "text",
-                "axisLabel": "",
-                "axisPlacement": "auto",
-                "barAlignment": 0,
-                "drawStyle": "points",
-                "fillOpacity": 0,
-                "gradientMode": "none",
-                "hideFrom": {
-                  "legend": false,
-                  "tooltip": false,
-                  "viz": false
-                },
-                "insertNulls": false,
-                "lineInterpolation": "linear",
-                "lineWidth": 1,
-                "pointSize": 5,
-                "scaleDistribution": {
-                  "type": "linear"
-                },
-                "showPoints": "auto",
-                "spanNulls": false,
-                "stacking": {
-                  "group": "A",
-                  "mode": "none"
-                },
-                "thresholdsStyle": {
-                  "mode": "off"
-                }
-              },
-              "mappings": [],
-              "thresholds": {
-                "mode": "absolute",
-                "steps": [
-                  {
-                    "color": "green",
-                    "value": null
-                  },
-                  {
-                    "color": "red",
-                    "value": 80
-                  }
-                ]
-              },
-              "unit": "ms"
-            },
-            "overrides": []
-          },
-          "gridPos": {
-            "h": 8,
-            "w": 8,
-            "x": 16,
-            "y": 18
-          },
-          "id": 11,
-          "options": {
-            "legend": {
-              "calcs": [],
-              "displayMode": "list",
-              "placement": "bottom",
-              "showLegend": true
-            },
-            "tooltip": {
-              "mode": "single",
-              "sort": "none"
-            }
-          },
-          "targets": [
-            {
-              "datasource": {
-                "type": "prometheus",
-                "uid": "prometheus"
-              },
-              "editorMode": "code",
-              "expr": "load_secrets{quantile=~\"${quantile}\", job=~\"${pods}\"} unless load_secrets == 0",
-              "instant": false,
-              "legendFormat": "{{job}}",
-              "range": true,
-              "refId": "A"
-            }
-          ],
-          "title": "Load Secrets (ns)",
-          "type": "timeseries"
-        }
-      ],
+      "panels": [],
       "title": "Load Performance",
       "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "points",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "ms"
+        },
+        "overrides": [
+          {
+            "__systemRef": "hideSeriesFrom",
+            "matcher": {
+              "id": "byNames",
+              "options": {
+                "mode": "exclude",
+                "names": [
+                  "{dataset=\"taxi_trips\", pod=\"spiceai2-6496869766-r2l2q\"}"
+                ],
+                "prefix": "All except:",
+                "readOnly": true
+              }
+            },
+            "properties": [
+              {
+                "id": "custom.hideFrom",
+                "value": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": true
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 26
+      },
+      "id": 9,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "sum by (dataset, pod) (load_dataset_duration_ms unless load_dataset_duration_ms == 0)",
+          "instant": false,
+          "legendFormat": "__auto",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Load Dataset Duration",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "points",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 26
+      },
+      "id": 11,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "load_secrets unless load_secrets == 0",
+          "instant": false,
+          "legendFormat": "{{job}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Load Secrets Duration",
+      "type": "timeseries"
     },
     {
       "collapsed": false,
@@ -805,7 +686,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 18
+        "y": 34
       },
       "id": 12,
       "panels": [],
@@ -815,7 +696,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "PBFA97CFB590B2093"
+        "uid": "prometheus"
       },
       "description": "",
       "fieldConfig": {
@@ -877,7 +758,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 19
+        "y": 35
       },
       "id": 15,
       "options": {
@@ -899,9 +780,9 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (job) (flight_do_get_get_tables_duration_ms{quantile=~\"${quantile}\", job=~\"${pods}\"})",
+          "expr": "max by (pod) (flight_do_get_get_tables_duration_ms{quantile=\"0.95\"}) > 0",
           "instant": false,
-          "legendFormat": "CommandGetTables {{job}}",
+          "legendFormat": "__auto",
           "range": true,
           "refId": "A"
         },
@@ -911,21 +792,21 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (job) (flight_do_get_statement_query_duration_ms{quantile=~\"${quantile}\", job=~\"${pods}\"})",
+          "expr": "max by (pod) (flight_do_get_statement_query_duration_ms{quantile=\"0.95\"}) > 0",
           "hide": false,
           "instant": false,
-          "legendFormat": "CommandStatementQuery {{job}}",
+          "legendFormat": "__auto",
           "range": true,
           "refId": "B"
         }
       ],
-      "title": "do_get Flight Duration",
+      "title": "do_get Flight Duration (p95)",
       "type": "timeseries"
     },
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "PBFA97CFB590B2093"
+        "uid": "prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -986,7 +867,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 19
+        "y": 35
       },
       "id": 17,
       "options": {
@@ -1008,9 +889,9 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "increase(flight_do_get_get_tables_duration_ms_count{job=~\"${pods}\"}[$__rate_interval])",
+          "expr": "increase(flight_do_get_get_tables_duration_ms_count[$__rate_interval]) > 0",
           "instant": false,
-          "legendFormat": "CommandGetTables {{job}}",
+          "legendFormat": "__auto",
           "range": true,
           "refId": "A"
         },
@@ -1020,10 +901,10 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "increase(flight_do_get_statement_query_duration_ms_count{job=~\"${pods}\"}[$__rate_interval])",
+          "expr": "increase(flight_do_get_statement_query_duration_ms_count[$__rate_interval]) > 0",
           "hide": false,
           "instant": false,
-          "legendFormat": "CommandStatementQuery {{job}}",
+          "legendFormat": "__auto",
           "range": true,
           "refId": "B"
         }
@@ -1034,7 +915,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "PBFA97CFB590B2093"
+        "uid": "prometheus"
       },
       "description": "",
       "fieldConfig": {
@@ -1096,7 +977,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 27
+        "y": 43
       },
       "id": 14,
       "options": {
@@ -1118,20 +999,20 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "flight_get_flight_info_request_duration_ms{quantile=~\"${quantile}\",job=~\"${pods}\"} unless flight_get_flight_info_request_duration_ms == 0",
+          "expr": "max by (pod) (flight_get_flight_info_request_duration_ms{quantile=\"0.95\"}) > 0",
           "instant": false,
-          "legendFormat": "{{job}}",
+          "legendFormat": "__auto",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "get_flight_info Flight Duration",
+      "title": "get_flight_info Flight Duration (p95)",
       "type": "timeseries"
     },
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "PBFA97CFB590B2093"
+        "uid": "prometheus"
       },
       "description": "",
       "fieldConfig": {
@@ -1193,7 +1074,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 27
+        "y": 43
       },
       "id": 18,
       "options": {
@@ -1215,9 +1096,9 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "increase(flight_get_flight_info_request_duration_ms_count{job=~\"${pods}\"}[$__rate_interval])\n",
+          "expr": "max by (pod) (increase(flight_get_flight_info_request_duration_ms_count[$__rate_interval])) > 0",
           "instant": false,
-          "legendFormat": "{{job}}",
+          "legendFormat": "__auto",
           "range": true,
           "refId": "A"
         }
@@ -1228,208 +1109,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "PBFA97CFB590B2093"
-      },
-      "description": "",
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "drawStyle": "line",
-            "fillOpacity": 0,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "auto",
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "red",
-                "value": 80
-              }
-            ]
-          },
-          "unit": "none"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 35
-      },
-      "id": 19,
-      "options": {
-        "legend": {
-          "calcs": [],
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "mode": "single",
-          "sort": "none"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "editorMode": "code",
-          "expr": "sum(increase(flight_handshake_requests[$__rate_interval]))",
-          "instant": false,
-          "legendFormat": "Handshake",
-          "range": true,
-          "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "editorMode": "code",
-          "expr": "sum(increase(flight_list_flights_requests[$__rate_interval]))",
-          "hide": false,
-          "instant": false,
-          "legendFormat": "List Flights",
-          "range": true,
-          "refId": "B"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "editorMode": "code",
-          "expr": "sum (increase(flight_get_flight_info_requests[$__rate_interval]))",
-          "hide": false,
-          "instant": false,
-          "legendFormat": "Get Flight Info",
-          "range": true,
-          "refId": "C"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "editorMode": "code",
-          "expr": "sum(increase(flight_get_schema_requests[$__rate_interval]))",
-          "hide": false,
-          "instant": false,
-          "legendFormat": "Get Schema",
-          "range": true,
-          "refId": "D"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "editorMode": "code",
-          "expr": "sum (increase(flight_do_get_requests[$__rate_interval]))",
-          "hide": false,
-          "instant": false,
-          "legendFormat": "Do Get",
-          "range": true,
-          "refId": "E"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "editorMode": "code",
-          "expr": "sum(increase(flight_do_put_requests[$__rate_interval]))",
-          "hide": false,
-          "instant": false,
-          "legendFormat": "Do Put",
-          "range": true,
-          "refId": "F"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "editorMode": "code",
-          "expr": "sum(increase(flight_do_exchange_requests[$__rate_interval]))",
-          "hide": false,
-          "instant": false,
-          "legendFormat": "Do Exchange",
-          "range": true,
-          "refId": "G"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "editorMode": "code",
-          "expr": "sum(increase(flight_do_action_requests[$__rate_interval]))",
-          "hide": false,
-          "instant": false,
-          "legendFormat": "Do Action",
-          "range": true,
-          "refId": "H"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "editorMode": "code",
-          "expr": "sum(increase(flight_list_actions_requests[$__rate_interval]))",
-          "hide": false,
-          "instant": false,
-          "legendFormat": "List Actions",
-          "range": true,
-          "refId": "I"
-        }
-      ],
-      "title": "FlightSQL Operations",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "PBFA97CFB590B2093"
+        "uid": "prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -1489,7 +1169,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 43
+        "y": 51
       },
       "id": 16,
       "options": {
@@ -1511,9 +1191,9 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "(flight_do_put_duration_ms_count{job=~\"${pods}\"} - (flight_do_put_duration_ms_count{job=~\"${pods}\"} offset $__rate_interval)) > 0",
+          "expr": "sum by (pod, path) (flight_do_put_duration_ms_count - (flight_do_put_duration_ms_count offset $__rate_interval)) > 0",
           "instant": false,
-          "legendFormat": "{{path}}",
+          "legendFormat": "__auto",
           "range": true,
           "refId": "A"
         }
@@ -1524,7 +1204,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "PBFA97CFB590B2093"
+        "uid": "prometheus"
       },
       "description": "",
       "fieldConfig": {
@@ -1585,7 +1265,7 @@
       "gridPos": {
         "h": 8,
         "w": 12,
-        "x": 0,
+        "x": 12,
         "y": 51
       },
       "id": 13,
@@ -1608,14 +1288,215 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "flight_do_put_duration_ms{quantile=~\"${quantile}\", job=~\"${pods}\"}",
+          "expr": "sum by (pod, path) (flight_do_put_duration_ms{quantile=\"0.95\"}) > 0",
           "instant": false,
           "legendFormat": "{{path}}",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "do_put Flight Duration (by dataset)",
+      "title": "do_put Flight p95 Duration (by dataset)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 59
+      },
+      "id": 19,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (pod) (increase(flight_handshake_requests[$__rate_interval])) > 0",
+          "instant": false,
+          "legendFormat": "Handshake {{pod}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (pod) (increase(flight_list_flights_requests[$__rate_interval])) > 0",
+          "hide": false,
+          "instant": false,
+          "legendFormat": "ListFlights {{pod}}",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (pod) (increase(flight_get_flight_info_requests[$__rate_interval])) > 0",
+          "hide": false,
+          "instant": false,
+          "legendFormat": "GetFlightInfo {{pod}}",
+          "range": true,
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (pod) (increase(flight_get_schema_requests[$__rate_interval])) > 0",
+          "hide": false,
+          "instant": false,
+          "legendFormat": "GetSchema {{pod}}",
+          "range": true,
+          "refId": "D"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (pod) (increase(flight_do_get_requests[$__rate_interval])) > 0",
+          "hide": false,
+          "instant": false,
+          "legendFormat": "DoGet {{pod}}",
+          "range": true,
+          "refId": "E"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (pod) (increase(flight_do_put_requests[$__rate_interval])) > 0",
+          "hide": false,
+          "instant": false,
+          "legendFormat": "DoPut {{pod}}",
+          "range": true,
+          "refId": "F"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (pod) (increase(flight_do_exchange_requests[$__rate_interval])) > 0",
+          "hide": false,
+          "instant": false,
+          "legendFormat": "DoExchange {{pod}}",
+          "range": true,
+          "refId": "G"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (pod) (increase(flight_do_action_requests[$__rate_interval])) > 0",
+          "hide": false,
+          "instant": false,
+          "legendFormat": "DoAction {{pod}}",
+          "range": true,
+          "refId": "H"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (pod) (increase(flight_list_actions_requests[$__rate_interval])) > 0",
+          "hide": false,
+          "instant": false,
+          "legendFormat": "ListActions {{pod}}",
+          "range": true,
+          "refId": "I"
+        }
+      ],
+      "title": "FlightSQL Operations",
       "type": "timeseries"
     }
   ],
@@ -1623,113 +1504,16 @@
   "schemaVersion": 39,
   "tags": [],
   "templating": {
-    "list": [
-      {
-        "current": {
-          "selected": true,
-          "text": [
-            "spiced-main",
-            "spiced-edge"
-          ],
-          "value": [
-            "spiced-main",
-            "spiced-edge"
-          ]
-        },
-        "datasource": {
-          "type": "prometheus",
-          "uid": "PBFA97CFB590B2093"
-        },
-        "definition": "label_values(spiced_runtime_flight_server_start,job)",
-        "hide": 0,
-        "includeAll": true,
-        "label": "Pods",
-        "multi": true,
-        "name": "pods",
-        "options": [],
-        "query": {
-          "qryType": 1,
-          "query": "label_values(spiced_runtime_flight_server_start,job)",
-          "refId": "PrometheusVariableQueryEditor-VariableQuery"
-        },
-        "refresh": 1,
-        "regex": "",
-        "skipUrlSync": false,
-        "sort": 0,
-        "type": "query"
-      },
-      {
-        "current": {
-          "selected": true,
-          "text": [
-            "0.9"
-          ],
-          "value": [
-            "0.9"
-          ]
-        },
-        "hide": 0,
-        "includeAll": true,
-        "label": "Quantile",
-        "multi": true,
-        "name": "quantile",
-        "options": [
-          {
-            "selected": false,
-            "text": "All",
-            "value": "$__all"
-          },
-          {
-            "selected": false,
-            "text": "0",
-            "value": "0"
-          },
-          {
-            "selected": false,
-            "text": "0.5",
-            "value": "0.5"
-          },
-          {
-            "selected": true,
-            "text": "0.9",
-            "value": "0.9"
-          },
-          {
-            "selected": false,
-            "text": "0.95",
-            "value": "0.95"
-          },
-          {
-            "selected": false,
-            "text": "0.99",
-            "value": "0.99"
-          },
-          {
-            "selected": false,
-            "text": "0.999",
-            "value": "0.999"
-          },
-          {
-            "selected": false,
-            "text": "1",
-            "value": "1"
-          }
-        ],
-        "query": "0, 0.5, 0.9, 0.95, 0.99, 0.999, 1",
-        "queryValue": "",
-        "skipUrlSync": false,
-        "type": "custom"
-      }
-    ]
+    "list": []
   },
   "time": {
-    "from": "now-1h",
+    "from": "now-30m",
     "to": "now"
   },
   "timepicker": {},
   "timezone": "",
-  "title": "Spice Dashboard",
+  "title": "Spice.ai Dashboard",
   "uid": "ddgw8xtn75ybkb",
-  "version": 1,
+  "version": 24,
   "weekStart": ""
 }
