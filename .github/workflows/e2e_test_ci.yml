@@ -17,10 +17,6 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
   cancel-in-progress: true
 
-env:
-  # shared spice.ai api_key for test app
-  SPICE_SECRET_SPICEAI_KEY: "31303937|ade78ae18f26498e9a79fca73c41670d"
-
 jobs:
   setup-matrix:
     name: Setup strategy matrix
@@ -139,6 +135,8 @@ jobs:
   test_quickstart_dremio:
     name: "E2E Test: Dremio quickstart, using ${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}"
     runs-on: ${{ matrix.target.runner }}
+    # run quickstart with external service dependency only on manual trigger
+    if: github.event_name == 'workflow_dispatch'
     needs:
       - build
       - setup-matrix
@@ -242,6 +240,8 @@ jobs:
   test_quickstart_spiceai:
     name: "E2E Test: SpiceAI quickstart, using ${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}"
     runs-on: ${{ matrix.target.runner }}
+    # run quickstart with external service dependency only on manual trigger
+    if: github.event_name == 'workflow_dispatch'
     needs:
       - build
       - setup-matrix
@@ -282,6 +282,8 @@ jobs:
           cat spicepod.yaml
 
       - name: Start spice runtime
+        env:
+          SPICE_SECRET_SPICEAI_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_KEY }}
         working-directory: test_app
         run: |
           spice run &> spice.log &
@@ -541,6 +543,8 @@ jobs:
           cat spicepod.yaml
 
       - name: Start spice runtime
+        env:
+          SPICE_SECRET_SPICEAI_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_KEY }}
         working-directory: test_app
         run: |
           spice run &> spice.log &
