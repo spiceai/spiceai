@@ -19,6 +19,7 @@ use datafusion::execution::context::SessionContext;
 use deltalake::aws::storage::s3_constants::AWS_S3_ALLOW_UNSAFE_RENAME;
 use deltalake::protocol::SaveMode;
 use deltalake::{open_table_with_storage_options, DeltaOps};
+use ns_lookup::verify_endpoint_connection;
 use secrecy::ExposeSecret;
 use secrets::Secret;
 use serde::Deserialize;
@@ -42,7 +43,7 @@ pub struct Databricks {
 impl DataConnectorFactory for Databricks {
     fn create(
         secret: Option<Secret>,
-        _params: Arc<Option<HashMap<String, String>>>,
+        params: Arc<Option<HashMap<String, String>>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         // Needed to be able to load the s3:// scheme
         deltalake::aws::register_handlers(None);
@@ -52,7 +53,21 @@ impl DataConnectorFactory for Databricks {
             secret: Arc::new(secret),
         };
 
-        Box::pin(async move { Ok(Box::new(databricks) as Box<dyn DataConnector>) })
+        Box::pin(async move {
+            let url: String = params
+                .as_ref() // &Option<HashMap<String, String>>
+                .as_ref() // Option<&HashMap<String, String>>
+                .and_then(|params| params.get("endpoint").cloned())
+                .ok_or_else(|| super::Error::UnableToCreateDataConnector {
+                    source: "Missing required parameter: endpoint".into(),
+                })?;
+
+            verify_endpoint_connection(&url)
+                .await
+                .map_err(|e| super::Error::UnableToCreateDataConnector { source: e.into() })?;
+
+            Ok(Box::new(databricks) as Box<dyn DataConnector>)
+        })
     }
 }
 
