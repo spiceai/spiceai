@@ -135,7 +135,7 @@ pub trait DataConnectorFactory {
 /// If `stream_data_updates` is not supported for a dataset, the runtime will fall back to polling `get_all_data` and returning a
 /// `DataUpdate` that is constructed like:
 ///
-/// ```rust
+/// ```rust,ignore
 /// DataUpdate {
 ///    data: get_all_data(dataset),
 ///    update_type: UpdateType::Overwrite,
