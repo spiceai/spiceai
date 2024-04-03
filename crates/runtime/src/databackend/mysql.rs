@@ -14,20 +14,28 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, mem, ops::DerefMut, sync::Arc};
 
+use arrow::array::RecordBatch;
+use arrow_sql_gen::statement::{CreateTableBuilder, InsertBuilder};
 use datafusion::{execution::context::SessionContext, sql::TableReference};
-use db_connection_pool::{mysqlpool::MySQLConnectionPool, DbConnectionPool};
+use db_connection_pool::{
+    dbconnection::mysqlconn::MySQLConnection, mysqlpool::MySQLConnectionPool, DbConnectionPool,
+};
 use futures::lock::Mutex;
-use mysql_common::value::convert::ToValue;
+use mysql_async::{
+    prelude::{Queryable, ToValue},
+    Params, Row, Transaction,
+};
 use secrets::Secret;
 use snafu::{prelude::*, ResultExt};
 use spicepod::component::dataset::Dataset;
 use sql_provider_datafusion::SqlTable;
+use tract_core::downcast_rs::Downcast;
 
 use crate::{
     datapublisher::{AddDataResult, DataPublisher},
-    dataupdate::DataUpdate,
+    dataupdate::{DataUpdate, UpdateType},
 };
 
 #[derive(Debug, Snafu)]
@@ -41,9 +49,7 @@ pub enum Error {
     DbConnectionPoolError { source: db_connection_pool::Error },
 
     #[snafu(display("Error executing transaction: {source}"))]
-    TransactionError {
-        source: bb8_postgres::tokio_postgres::Error,
-    },
+    TransactionError { source: mysql_async::Error },
 
     #[snafu(display("MySQLDataFusionError: {source}"))]
     MySQLDataFusion {
@@ -58,7 +64,7 @@ pub enum Error {
     #[snafu(display("Lock is poisoned: {message}"))]
     LockPoisoned { message: String },
 
-    #[snafu(display("Unable to downcast DbConnection to PostgresConnection"))]
+    #[snafu(display("Unable to downcast DbConnection to MySQLConnection"))]
     UnableToDowncastDbConnection {},
 }
 
@@ -122,10 +128,138 @@ impl MySQLBackend {
 
 impl DataPublisher for MySQLBackend {
     fn add_data(&self, _dataset: Arc<Dataset>, data_update: DataUpdate) -> AddDataResult {
-        unimplemented!()
+        let pool = Arc::clone(&self.pool);
+        let name = self.name.clone();
+
+        Box::pin(async move {
+            let mut mysql_update = MySQLUpdate {
+                name,
+                data: data_update.data,
+                update_type: data_update.update_type,
+                pool,
+                create_mutex: &self.create_mutex,
+            };
+            mysql_update.update().await?;
+
+            self.initialize_datafusion().await?;
+            Ok(())
+        })
     }
 
     fn name(&self) -> &str {
         "MySQL"
+    }
+}
+
+struct MySQLUpdate<'a> {
+    name: String,
+    data: Vec<RecordBatch>,
+    update_type: UpdateType,
+    pool: Arc<dyn DbConnectionPool<mysql_async::Conn, &'static (dyn ToValue + Sync)> + Sync + Send>,
+    create_mutex: &'a Mutex<()>,
+}
+
+impl<'a> MySQLUpdate<'a> {
+    async fn update(&mut self) -> Result<()> {
+        let mut transaction_conn = self.pool.connect().await.context(DbConnectionPoolSnafu)?;
+        let Some(transaction_conn) = transaction_conn
+            .as_any_mut()
+            .downcast_mut::<MySQLConnection>()
+        else {
+            return UnableToDowncastDbConnectionSnafu {}.fail();
+        };
+
+        let mut transaction_conn = transaction_conn.conn.lock().await;
+        let transaction_conn = transaction_conn.deref_mut();
+
+        let mut transaction = transaction_conn
+            .start_transaction(Default::default())
+            .await
+            .context(TransactionSnafu)?;
+
+        let conn = self.pool.connect().await.context(DbConnectionPoolSnafu)?;
+        let Some(conn) = conn.as_any().downcast_ref::<MySQLConnection>() else {
+            return UnableToDowncastDbConnectionSnafu {}.fail();
+        };
+
+        if !self.table_exists(conn).await {
+            self.create_table(&mut transaction).await?;
+        } else if self.update_type == UpdateType::Overwrite {
+            transaction
+                .exec_drop(
+                    format!(r#"DELETE FROM "{}""#, self.name).as_str(),
+                    Params::Empty,
+                )
+                .await
+                .context(TransactionSnafu)?;
+        };
+
+        let data = mem::take(&mut self.data);
+        for batch in data {
+            self.insert_batch(&mut transaction, batch).await?;
+        }
+
+        transaction.commit().await.context(TransactionSnafu)?;
+
+        tracing::trace!("Processed update to MySQL table {name}", name = self.name,);
+
+        Ok(())
+    }
+
+    async fn insert_batch(
+        &mut self,
+        transaction: &mut Transaction<'_>,
+        batch: RecordBatch,
+    ) -> Result<()> {
+        let insert_table_builder = InsertBuilder::new(&self.name, vec![batch]);
+        let sql = insert_table_builder.build_mysql();
+
+        transaction
+            .exec_drop(&sql, Params::Empty)
+            .await
+            .context(TransactionSnafu)?;
+
+        Ok(())
+    }
+
+    async fn create_table(&mut self, transaction: &mut Transaction<'_>) -> Result<()> {
+        let _lock = self.create_mutex.lock();
+
+        let Some(batch) = self.data.pop() else {
+            return Ok(());
+        };
+
+        let create_table_statement = CreateTableBuilder::new(batch.schema(), &self.name);
+        let sql = create_table_statement.build_mysql();
+
+        transaction
+            .exec_drop(sql, Params::Empty)
+            .await
+            .context(TransactionSnafu)?;
+
+        self.insert_batch(transaction, batch).await?;
+
+        Ok(())
+    }
+
+    async fn table_exists(&mut self, mysql_conn: &MySQLConnection) -> bool {
+        let sql = format!(
+            r#"SELECT EXISTS (
+              SELECT 1
+              FROM information_schema.tables
+              WHERE table_name = '{name}'
+            )"#,
+            name = self.name
+        );
+        tracing::trace!("{sql}");
+        let mut conn = mysql_conn.conn.lock().await;
+        let conn = conn.deref_mut();
+
+        let Ok(row) = conn.exec(&sql, Params::Empty).await else {
+            return false;
+        };
+        let row: Vec<Row> = row;
+
+        row.get(0).is_some()
     }
 }

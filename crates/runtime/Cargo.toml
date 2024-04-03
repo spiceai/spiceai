@@ -84,7 +84,6 @@ tokio-rusqlite = { workspace = true, optional = true }
 pin-project = "1.0"
 lazy_static = "1.4.0"
 mysql_async = { workspace = true, optional = true }
-mysql_common = { workspace = true, optional = true }
 postgres-native-tls = "0.5.0"
 
 [features]
@@ -98,5 +97,5 @@ postgres = [
     "arrow_sql_gen",
 ]
 sqlite = ["dep:rusqlite", "tokio-rusqlite"]
-mysql = ["dep:mysql_async", "dep:mysql_common"]
+mysql = ["dep:mysql_async"]
 keyring-secret-store = ["secrets/keyring-secret-store"]

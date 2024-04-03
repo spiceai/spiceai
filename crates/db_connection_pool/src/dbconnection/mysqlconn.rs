@@ -14,22 +14,29 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{any::Any, ops::DerefMut, sync::Arc};
+use std::ops::DerefMut;
+use std::{any::Any, sync::Arc};
 
 use arrow::datatypes::SchemaRef;
+use arrow_sql_gen::mysql::rows_to_arrow;
 use datafusion::execution::SendableRecordBatchStream;
+use datafusion::physical_plan::memory::MemoryStream;
 use datafusion::sql::TableReference;
 use futures::lock::Mutex;
-use mysql_async::{prelude::Queryable, Conn, Params};
-use mysql_common::value::convert::ToValue;
+use mysql_async::prelude::Queryable;
+use mysql_async::{prelude::ToValue, Conn, Params, Row};
 use snafu::prelude::*;
 
-use super::{AsyncDbConnection, DbConnection, Result};
+use super::Result;
+use super::{AsyncDbConnection, DbConnection};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("{source}"))]
     QueryError { source: mysql_async::Error },
+
+    #[snafu(display("Failed to convert query result to Arrow: {source}"))]
+    ConversionError { source: arrow_sql_gen::mysql::Error },
 }
 
 pub struct MySQLConnection {
@@ -59,11 +66,17 @@ impl<'a> AsyncDbConnection<Conn, &'a (dyn ToValue + Sync)> for MySQLConnection {
     }
 
     async fn get_schema(&self, table_reference: &TableReference) -> Result<SchemaRef> {
-        // let conn = self.conn.lock().await.deref_mut();
-        // let rec: Vec<Row> = conn
-        //     .query(&format!("SELECT * FROM {table_reference} LIMIT 1"))
-        //     .await?;
-        unimplemented!()
+        let mut conn = self.conn.lock().await;
+        let conn = conn.deref_mut();
+        let rows: Vec<Row> = conn
+            .exec(
+                &format!("SELECT * FROM {table_reference} LIMIT 1"),
+                Params::Empty,
+            )
+            .await
+            .context(QuerySnafu)?;
+        let rec = rows_to_arrow(&rows).context(ConversionSnafu)?;
+        Ok(rec.schema())
     }
 
     async fn query_arrow(
@@ -71,14 +84,24 @@ impl<'a> AsyncDbConnection<Conn, &'a (dyn ToValue + Sync)> for MySQLConnection {
         sql: &str,
         params: &[&'a (dyn ToValue + Sync)],
     ) -> Result<SendableRecordBatchStream> {
-        unimplemented!()
+        let mut conn = self.conn.lock().await;
+        let conn = conn.deref_mut();
+        let params_vec: Vec<_> = params.iter().map(|&p| p.to_value()).collect();
+        let rows: Vec<Row> = conn
+            .exec(sql, Params::from(params_vec))
+            .await
+            .context(QuerySnafu)?;
+        let rec = rows_to_arrow(&rows).context(ConversionSnafu)?;
+        let schema = rec.schema();
+        let recs = vec![rec];
+        Ok(Box::pin(MemoryStream::try_new(recs, schema, None)?))
     }
 
     async fn execute(&self, query: &str, params: &[&'a (dyn ToValue + Sync)]) -> Result<u64> {
         let mut conn = self.conn.lock().await;
         let conn = conn.deref_mut();
         let params_vec: Vec<_> = params.iter().map(|&p| p.to_value()).collect();
-        let _: Vec<mysql_async::Row> = conn
+        let _: Vec<Row> = conn
             .exec(query, Params::from(params_vec))
             .await
             .context(QuerySnafu)?;

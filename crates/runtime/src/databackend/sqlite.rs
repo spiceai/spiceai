@@ -238,8 +238,8 @@ impl SqliteUpdate {
         let sql = format!(
             r#"SELECT EXISTS (
               SELECT 1
-              FROM sqlite_master 
-              WHERE type='table' 
+              FROM sqlite_master
+              WHERE type='table'
               AND name = '{name}'
             )"#,
             name = self.name

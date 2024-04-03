@@ -21,7 +21,7 @@ use datafusion::sql::TableReference;
 use db_connection_pool::mysqlpool::MySQLConnectionPool;
 use db_connection_pool::DbConnectionPool;
 use futures::TryStreamExt;
-use mysql_common::value::convert::ToValue;
+use mysql_async::prelude::ToValue;
 use secrets::Secret;
 use snafu::prelude::*;
 use spicepod::component::dataset::Dataset;

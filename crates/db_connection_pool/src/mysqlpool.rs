@@ -17,7 +17,7 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
-use mysql_common::value::convert::ToValue;
+use mysql_async::prelude::ToValue;
 use secrets::Secret;
 use snafu::{ResultExt, Snafu};
 
