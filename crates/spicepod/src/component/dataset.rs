@@ -265,8 +265,11 @@ pub mod acceleration {
                 "{}",
                 match *self {
                     Engine::Arrow => "arrow",
+                    #[cfg(feature = "duckdb")]
                     Engine::DuckDB => "duckdb",
+                    #[cfg(feature = "postgres")]
                     Engine::Postgres => "postgres",
+                    #[cfg(feature = "sqlite")]
                     Engine::Sqlite => "sqlite",
                 }
             )

@@ -40,19 +40,10 @@ tract-core = "0.21.0"
 tract-onnx = "0.21.0"
 ndarray = "0.15.3"
 ndarray-npy = { version = "0.8.0", features = ["compressed_npz"] }
-duckdb = { workspace = true, features = [
-    "bundled",
-    "r2d2",
-    "vtab",
-    "vtab-arrow",
-], optional = true }
+duckdb = { workspace = true, features = ["bundled", "r2d2", "vtab", "vtab-arrow"], optional = true }
 sql_provider_datafusion = { path = "../sql_provider_datafusion", optional = true }
 r2d2 = { workspace = true, optional = true }
-opentelemetry-proto = { version = "0.4.0", features = [
-    "gen-tonic-messages",
-    "gen-tonic",
-    "metrics",
-] }
+opentelemetry-proto = { version = "0.4.0", features = ["gen-tonic-messages", "gen-tonic", "metrics"] }
 indexmap = "2.2.2"
 regex = "1.10.3"
 reqwest = { version = "0.11.24", features = ["json"] }
@@ -65,12 +56,12 @@ deltalake = { version = "0.17.0", features = ["datafusion-ext", "s3", "azure"] }
 itertools = "0.12"
 aws-config = "1.1.7"
 aws-types = "1.1.7"
-object_store = { version="0.9.1", features = ["aws"] }
+object_store = { version = "0.9.1", features = ["aws"] }
 quick-xml = { version = "0.23.0-alpha3" }
 url = "2.5.0"
 arrow_sql_gen = { path = "../arrow_sql_gen", optional = true }
-bb8 = {workspace = true, optional = true}
-bb8-postgres = {workspace = true, optional = true}
+bb8 = { workspace = true, optional = true }
+bb8-postgres = { workspace = true, optional = true }
 bytes = { version = "1", default-features = false }
 prost = { version = "0.12.1", default-features = false, features = ["prost-derive"] }
 once_cell = "1.19.0"
@@ -87,14 +78,21 @@ postgres-native-tls = "0.5.0"
 ns_lookup = { path = "../ns_lookup" }
 
 [features]
-default = ["duckdb", "postgres", "keyring-secret-store", "sqlite"]
+default = ["keyring-secret-store"]
 dev = []
-duckdb = ["dep:duckdb", "sql_provider_datafusion", "r2d2"]
+duckdb = ["dep:duckdb", "sql_provider_datafusion/duckdb", "r2d2", "db_connection_pool/duckdb", "spicepod/duckdb"]
 postgres = [
     "dep:bb8",
     "dep:bb8-postgres",
-    "sql_provider_datafusion",
-    "arrow_sql_gen",
+    "db_connection_pool/postgres",
+    "sql_provider_datafusion/postgres",
+    "arrow_sql_gen/postgres",
 ]
-sqlite = ["dep:rusqlite", "tokio-rusqlite"]
+sqlite = [
+    "dep:rusqlite",
+    "dep:tokio-rusqlite",
+    "db_connection_pool/sqlite",
+    "sql_provider_datafusion/sqlite",
+    "arrow_sql_gen/sqlite",
+]
 keyring-secret-store = ["secrets/keyring-secret-store"]

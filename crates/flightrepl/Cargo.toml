@@ -10,15 +10,11 @@ description = "Spice OSS Flight Query Repl"
 
 [dependencies]
 arrow.workspace = true
-arrow-flight.workspace = true
+arrow-flight = { workspace = true, features = ["flight-sql-experimental"] }
 parquet = "49.0.0"
 clap.workspace = true
 tokio.workspace = true
-tonic = { workspace = true, features = [
-  "transport",
-  "tls",
-  "tls-roots",
-] }
+tonic = { workspace = true, features = ["transport", "tls", "tls-roots"] }
 async-stream.workspace = true
 futures.workspace = true
 tracing.workspace = true
