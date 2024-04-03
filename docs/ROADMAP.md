@@ -1,36 +1,35 @@
-# Spice.ai Roadmap
+# Spice.ai OSS Roadmap
 
-This describes the current Spice.ai roadmap.
-
-This is a living doc that will be updated based on community and customer feedback.
+A living doc that describes the Spice.ai roadmap, updated based on community and customer feedback.
 
 If you have a feature request or suggestion, please [get in touch](https://github.com/spiceai/spiceai#community)!
 
-## Current Limitations
-
-### Known bugs
+## Known bugs
 
 - See [Bugs](https://github.com/spiceai/spiceai/labels/bug). Feel free to file a new Issue if you see a bug and let us know on Discord.
 
-## v0.11-alpha (Apr 2024)
+## [v0.11-alpha (Apr 2024)](https://github.com/spiceai/spiceai/milestone/16)
 
-- Helm chart
-- Stability, reliability, and performance
+- [MySQL data connector (alpha)](https://github.com/spiceai/spiceai/pull/1004)
+- AWS Secrets Manager (alpha)
+
+## [v0.12-alpha (Apr 2024)](https://github.com/spiceai/spiceai/milestone/17)
+
+- Acceleration retention policies
+- FTP data connector (alpha)
 - BigQuery data connector (alpha)
 - Snowflake data connector (alpha)
 
-## v0.12-alpha
+## v0.13-alpha (May 2024)
 
-- Acceleration retention policies
+- Iceberg data connector
+- RocksDB data accelerator (alpha)
 - K/V support
-- RocksDB data connector (alpha)
 
 ## Features being considered for v1.0-stable
 
 - CLI publish Spicepods to [spicerack.org](https://spicerack.org)
 - Kubernetes operator
-- MYSQL data connector
-- Iceberg data connector
 
 ## Beyond v1.0
 

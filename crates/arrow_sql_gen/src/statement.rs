@@ -427,7 +427,7 @@ mod tests {
         let sql = InsertBuilder::new("arrays", vec![batch]).build_postgres();
         assert_eq!(
             sql,
-            "INSERT INTO \"arrays\" (\"list\") VALUES (ARRAY [1,2,3]), (ARRAY [4,5,6]), (ARRAY [7,8,9])"
+            "INSERT INTO \"arrays\" (\"list\") VALUES (CAST(ARRAY [1,2,3] AS int4[])), (CAST(ARRAY [4,5,6] AS int4[])), (CAST(ARRAY [7,8,9] AS int4[]))"
         );
     }
 }

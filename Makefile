@@ -25,6 +25,10 @@ ci:
 	make -C bin/spice
 	export SPICED_TARGET_DIR=/workspace/spiceai/target; make -C bin/spiced
 
+.PHONY: test
+test: 
+	@cargo test --all
+
 .PHONY: lint
 lint:
 	go vet ./...

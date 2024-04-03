@@ -12,3 +12,4 @@ exclude.workspace = true
 trust-dns-resolver = "0.23.2"
 tracing.workspace = true
 snafu.workspace = true
+url = "2.5.0"
