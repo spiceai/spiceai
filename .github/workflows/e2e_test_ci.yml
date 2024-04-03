@@ -136,7 +136,7 @@ jobs:
     name: "E2E Test: Dremio quickstart, using ${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}"
     runs-on: ${{ matrix.target.runner }}
     # run quickstart with external service dependency only on manual trigger
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'push'
     needs:
       - build
       - setup-matrix
@@ -241,7 +241,7 @@ jobs:
     name: "E2E Test: SpiceAI quickstart, using ${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}"
     runs-on: ${{ matrix.target.runner }}
     # run quickstart with external service dependency only on manual trigger
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'push'
     needs:
       - build
       - setup-matrix
