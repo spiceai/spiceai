@@ -21,6 +21,7 @@ use flight_client::FlightClient;
 use flight_datafusion::FlightTable;
 use futures::StreamExt;
 use futures_core::stream::BoxStream;
+use ns_lookup::verify_endpoint_connection;
 use secrets::Secret;
 use snafu::prelude::*;
 use spicepod::component::dataset::Dataset;
@@ -77,6 +78,11 @@ impl DataConnectorFactory for SpiceAI {
                 .and_then(|params| params.get("endpoint").cloned())
                 .unwrap_or(default_flight_url);
             tracing::trace!("Connecting to SpiceAI with flight url: {url}");
+
+            verify_endpoint_connection(&url)
+                .await
+                .map_err(|e| super::Error::UnableToCreateDataConnector { source: e.into() })?;
+
             let api_key = secret.get("key").unwrap_or_default();
             let flight_client = FlightClient::new(url.as_str(), "", api_key)
                 .await
