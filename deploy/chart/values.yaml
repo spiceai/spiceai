@@ -1,8 +1,10 @@
 image:
   repository: spiceai/spiceai
-  # Replace this with a specific version, i.e. 0.10.0-alpha
-  tag: latest
+  tag: 0.10.1-alpha
 replicaCount: 1
+monitoring:
+  podMonitor:
+    enabled: false
 spicepod:
   name: app
   version: v1beta1
