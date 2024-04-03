@@ -481,6 +481,8 @@ jobs:
           cat spice.log
 
   test_local_acceleration:
+    # run quickstart with external service dependency only on manual trigger
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'push'
     name: "E2E Test: acceleration on ${{ matrix.target.name }} using ${{ matrix.acceleration.engine }}"
     runs-on: ${{ matrix.target.runner }}
     needs:
