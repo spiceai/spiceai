@@ -568,8 +568,6 @@ jobs:
           ENGINE=$(echo '${{ matrix.acceleration.engine }}')
           MODE=$(echo '${{ matrix.acceleration.mode }}')
 
-          echo "secrets:" >> spicepod.yaml
-          echo "  store: env" >> spicepod.yaml
           echo "datasets:" >> spicepod.yaml
           echo "  - name: eth_recent_blocks" >> spicepod.yaml
           echo "    from: postgres:eth_recent_blocks" >> spicepod.yaml
