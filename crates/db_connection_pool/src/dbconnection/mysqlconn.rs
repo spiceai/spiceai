@@ -86,9 +86,10 @@ impl<'a> AsyncDbConnection<Conn, &'a (dyn ToValue + Sync)> for MySQLConnection {
     ) -> Result<SendableRecordBatchStream> {
         let mut conn = self.conn.lock().await;
         let conn = conn.deref_mut();
+
         let params_vec: Vec<_> = params.iter().map(|&p| p.to_value()).collect();
         let rows: Vec<Row> = conn
-            .exec(sql, Params::from(params_vec))
+            .exec(sql.replace(r#"""#, ""), Params::from(params_vec))
             .await
             .context(QuerySnafu)?;
         let rec = rows_to_arrow(&rows).context(ConversionSnafu)?;
