@@ -597,8 +597,8 @@ pub(crate) mod inference {
         #[serde(skip_serializing_if = "Option::is_none")]
         pub model_version: Option<String>,
 
-        #[serde(skip_serializing_if = "Vec::is_empty")]
-        pub prediction: Vec<f32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub prediction: Option<Vec<f32>>,
 
         pub duration_ms: u128,
     }
@@ -682,7 +682,7 @@ pub(crate) mod inference {
                 error_message: Some("App not found".to_string()),
                 model_name,
                 model_version: None,
-                prediction: vec![],
+                prediction: None,
                 duration_ms: start_time.elapsed().as_millis(),
             };
         };
@@ -695,7 +695,7 @@ pub(crate) mod inference {
                 error_message: Some(format!("Model {model_name} not found")),
                 model_name,
                 model_version: None,
-                prediction: vec![],
+                prediction: None,
                 duration_ms: start_time.elapsed().as_millis(),
             };
         };
@@ -708,7 +708,7 @@ pub(crate) mod inference {
                 error_message: Some(format!("Model {model_name} not found")),
                 model_name,
                 model_version: Some(model_version(&model.from)),
-                prediction: vec![],
+                prediction: None,
                 duration_ms: start_time.elapsed().as_millis(),
             };
         };
@@ -723,7 +723,7 @@ pub(crate) mod inference {
                             error_message: None,
                             model_name,
                             model_version: Some(model_version(&model.from)),
-                            prediction: result,
+                            prediction: Some(result),
                             duration_ms: start_time.elapsed().as_millis(),
                         };
                     }
@@ -738,7 +738,7 @@ pub(crate) mod inference {
                         ),
                         model_name,
                         model_version: Some(model_version(&model.from)),
-                        prediction: vec![],
+                        prediction: None,
                         duration_ms: start_time.elapsed().as_millis(),
                     };
                 }
@@ -752,7 +752,7 @@ pub(crate) mod inference {
                     ),
                     model_name,
                     model_version: Some(model_version(&model.from)),
-                    prediction: vec![],
+                    prediction: None,
                     duration_ms: start_time.elapsed().as_millis(),
                 }
             }
@@ -763,7 +763,7 @@ pub(crate) mod inference {
                     error_message: Some(e.to_string()),
                     model_name,
                     model_version: Some(model_version(&model.from)),
-                    prediction: vec![],
+                    prediction: None,
                     duration_ms: start_time.elapsed().as_millis(),
                 }
             }

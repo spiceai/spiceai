@@ -137,7 +137,7 @@ impl Runnable for Model {
             if inp.len() != num_variates {
                 return Err(Box::new(Error::TractError {
                     source: tract_core::anyhow::Error::msg(format!(
-                        "Number of variates {} does not match expected ({})from model",
+                        "Number of variates {} does not match expected ({}) from model",
                         inp.len(),
                         num_variates
                     )),
