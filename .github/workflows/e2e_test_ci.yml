@@ -136,7 +136,7 @@ jobs:
     name: "E2E Test: Dremio quickstart, using ${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}"
     runs-on: ${{ matrix.target.runner }}
     # run quickstart with external service dependency only on manual trigger
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'push'
     needs:
       - build
       - setup-matrix
@@ -241,7 +241,7 @@ jobs:
     name: "E2E Test: SpiceAI quickstart, using ${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}"
     runs-on: ${{ matrix.target.runner }}
     # run quickstart with external service dependency only on manual trigger
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'push'
     needs:
       - build
       - setup-matrix
@@ -501,6 +501,45 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
+      - name: Install PostgreSQL (Linux)
+        if: matrix.target.target_os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql
+          sudo service postgresql start
+          sleep 5
+          sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='postgres'" | grep -q 1 || sudo -u postgres createuser -s postgres
+          sudo -u postgres psql -c "ALTER USER postgres PASSWORD 'postgres';"
+          sudo -u postgres createdb testdb
+
+      - name: Install PostgreSQL (MacOS)
+        if: matrix.target.target_os == 'darwin'
+        run: |
+          brew install postgresql
+          brew services start postgresql
+          sleep 5
+          createuser -s postgres
+          psql -d postgres -c "ALTER USER postgres PASSWORD 'postgres';"
+          createdb testdb
+
+      - name: Wait for PostgreSQL to start
+        run: sleep 10
+
+      - name: Check PostgreSQL
+        env:
+          PGPASSWORD: postgres
+        run: psql -h localhost -U postgres -c 'SELECT version();'
+
+      - name: Prepare PostgreSQL dataset
+        env:
+          PGPASSWORD: postgres
+        run: |
+          psql -h localhost -U postgres -d testdb -c 'CREATE TABLE eth_recent_blocks (id SERIAL PRIMARY KEY, block_number INTEGER, block_hash TEXT);'
+          psql -h localhost -U postgres -d testdb -c "INSERT INTO eth_recent_blocks (block_number, block_hash) VALUES (1, '0x1234');"
+          psql -h localhost -U postgres -d testdb -c "INSERT INTO eth_recent_blocks (block_number, block_hash) VALUES (2, '0x5678');"
+          psql -h localhost -U postgres -d testdb -c "INSERT INTO eth_recent_blocks (block_number, block_hash) VALUES (3, '0x9abc');"
+          psql -h localhost -U postgres -d testdb -c 'SELECT * FROM eth_recent_blocks;'
+
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         uses: actions/download-artifact@v4
         with:
@@ -531,10 +570,17 @@ jobs:
 
           echo "datasets:" >> spicepod.yaml
           echo "  - name: eth_recent_blocks" >> spicepod.yaml
-          echo "    from: spice.ai/eth.recent_blocks" >> spicepod.yaml
+          echo "    from: postgres:eth_recent_blocks" >> spicepod.yaml
           echo "    acceleration:" >> spicepod.yaml
           echo "      enabled: true" >> spicepod.yaml
           echo "      engine: $ENGINE" >> spicepod.yaml
+          echo "    params:" >> spicepod.yaml
+          echo "      pg_host: localhost" >> spicepod.yaml
+          echo "      pg_port: '5432'" >> spicepod.yaml
+          echo "      pg_db: testdb" >> spicepod.yaml
+          echo "      pg_user: postgres" >> spicepod.yaml
+          echo "      pg_pass_key: password" >> spicepod.yaml
+          echo "      pg_sslmode: disable" >> spicepod.yaml
           if [[ -n "$MODE" ]]; then
             echo "      mode: $MODE" >> spicepod.yaml
           fi
@@ -544,7 +590,7 @@ jobs:
 
       - name: Start spice runtime
         env:
-          SPICE_SECRET_SPICEAI_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_KEY }}
+          SPICE_SECRET_POSTGRES_PASSWORD: postgres
         working-directory: test_app
         run: |
           spice run &> spice.log &

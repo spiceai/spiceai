@@ -1,0 +1,15 @@
+{{ if .Values.monitoring.podMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: {{ .Release.Name }}-podmonitor
+spec:
+  podMetricsEndpoints:
+  - interval: 10s
+    path: /metrics
+    scheme: http
+    targetPort: 9000
+  selector:
+    matchLabels:
+      app: {{ .Release.Name }}
+{{ end }}

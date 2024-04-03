@@ -19,8 +19,11 @@ use async_trait::async_trait;
 use spicepod::component::dataset::acceleration;
 
 pub mod dbconnection;
+#[cfg(feature = "duckdb")]
 pub mod duckdbpool;
+#[cfg(feature = "postgres")]
 pub mod postgrespool;
+#[cfg(feature = "sqlite")]
 pub mod sqlitepool;
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;

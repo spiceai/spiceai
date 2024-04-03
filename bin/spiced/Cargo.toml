@@ -23,6 +23,10 @@ metrics-exporter-prometheus = "0.13.0"
 object_store = { version = "0.9.0", features = ["aws"] }
 
 [features]
+default = ["duckdb", "postgres", "sqlite"]
+duckdb = ["runtime/duckdb", "spicepod/duckdb", "app/duckdb"]
+postgres = ["runtime/postgres", "spicepod/postgres", "app/postgres"]
+sqlite = ["runtime/sqlite", "spicepod/sqlite", "app/sqlite"]
 release = []
 dev = ["runtime/dev"]
 keyring-secret-store = ["runtime/keyring-secret-store"]
