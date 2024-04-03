@@ -20,9 +20,5 @@ snafu.workspace = true
 rustls = "0.21.7"
 rustls-native-certs = "0.6.3"
 rustls-pemfile = "1.0.3"
-tonic = { workspace = true, features = [
-  "transport",
-  "tls",
-  "tls-roots",
-] }
+tonic = { workspace = true, features = ["transport", "tls", "tls-roots"] }
 tracing.workspace = true

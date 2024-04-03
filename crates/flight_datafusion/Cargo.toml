@@ -22,4 +22,4 @@ snafu.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 flight_client = { path = "../flight_client" }
-sql_provider_datafusion = { path = "../sql_provider_datafusion" }
+sql_provider_datafusion = { path = "../sql_provider_datafusion", default-features = false }

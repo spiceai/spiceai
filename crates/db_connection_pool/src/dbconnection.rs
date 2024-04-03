@@ -21,8 +21,11 @@ use datafusion::{
 };
 use snafu::prelude::*;
 
+#[cfg(feature = "duckdb")]
 pub mod duckdbconn;
+#[cfg(feature = "postgres")]
 pub mod postgresconn;
+#[cfg(feature = "sqlite")]
 pub mod sqliteconn;
 
 pub type GenericError = Box<dyn std::error::Error + Send + Sync>;

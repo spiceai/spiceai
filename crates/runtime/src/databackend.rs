@@ -21,7 +21,9 @@ use snafu::prelude::*;
 use spicepod::component::dataset::acceleration::{Engine, Mode};
 use std::{collections::HashMap, sync::Arc};
 
-use self::{duckdb::DuckDBBackend, memtable::MemTableBackend};
+#[cfg(feature = "duckdb")]
+use self::duckdb::DuckDBBackend;
+use self::memtable::MemTableBackend;
 
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
