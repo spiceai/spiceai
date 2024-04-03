@@ -25,6 +25,10 @@ ci:
 	make -C bin/spice
 	export SPICED_TARGET_DIR=/workspace/spiceai/target; make -C bin/spiced
 
+.PHONY: test
+test: 
+	@cargo test --all
+
 .PHONY: lint
 lint:
 	go vet ./...
@@ -109,7 +113,7 @@ generate-acknowledgements-go:
 	echo "\n## Go Modules\n" >> $(ACKNOWLEDGEMENTS_PATH)
 	go get github.com/google/go-licenses
 	go install github.com/google/go-licenses
-	cd bin/spice && go-licenses csv . 2>/dev/null >> ../../$(ACKNOWLEDGEMENTS_PATH) && cd ../../
+	cd bin/spice && go-licenses report --ignore github.com/spiceai/spiceai . 2>/dev/null >> ../../$(ACKNOWLEDGEMENTS_PATH) && cd ../../
 
 .PHONY: generate-acknowledgements-rust
 generate-acknowledgements-rust:

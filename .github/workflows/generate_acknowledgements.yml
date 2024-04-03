@@ -27,8 +27,10 @@ jobs:
           sed -i 's/\"//g' acknowledgements.md
           sed -i 's/,/, /g' acknowledgements.md
           sed -i 's/,  /, /g' acknowledgements.md
+          cat acknowledgements.md
 
       - name: Create PR
+        if: github.event_name == 'workflow_dispatch'
         run: |
           git config --global user.name 'Spice Acknowledgements Bot'
           git config --global user.email 'acknowledgements-bot@spice.ai'

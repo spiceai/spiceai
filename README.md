@@ -40,11 +40,11 @@ Spice makes querying data by SQL across one or more data sources simple and fast
 
 ### Example Use-Cases
 
-**1. Faster applications and frontends.** Accelerate and co-locate datasets with applications and frontends, to serve more concurrent queries and users with faster page loads and data updates.
+**1. Faster applications and frontends.** Accelerate and co-locate datasets with applications and frontends, to serve more concurrent queries and users with faster page loads and data updates. [Try the CQRS sample app](https://github.com/spiceai/samples/tree/trunk/acceleration#local-materialization-and-acceleration-cqrs-sample)
 
-**2. Faster dashboards, analytics, and BI.** Faster, more responsive dashboards without massive compute costs.
+**2. Faster dashboards, analytics, and BI.** Faster, more responsive dashboards without massive compute costs. [Watch the Apache Superset demo](https://github.com/spiceai/samples/blob/trunk/sales-bi/README.md)
 
-**3. Faster data pipelines, machine learning training and inferencing.** Co-locate datasets in pipelines where the data is needed to minimize data-movement and improve query performance.
+**3. Faster data pipelines, machine learning training and inferencing.** Co-locate datasets in pipelines where the data is needed to minimize data-movement and improve query performance. [Predict hard drive failure with the SMART data demo](https://github.com/spiceai/demos/tree/trunk/smart-demo#spiceai-smart-demo)
 
 **4. Easily query many data sources.** Federated SQL query across databases, data warehouses, and data lakes using [Data Connectors](https://docs.spiceai.org/data-connectors).
 
@@ -52,27 +52,27 @@ Spice makes querying data by SQL across one or more data sources simple and fast
 
 Currently supported data connectors for upstream datasets. More coming soon.
 
-| Name         | Description | Status            | Protocol/Format  | Refresh Modes    |
-| ------------ | ----------- | ----------------- | ---------------- | ---------------- |
-| `databricks` | Databricks  | Alpha             | Delta Lake       | `full`           |
-| `postgres`   | PostgreSQL  | Alpha             |                  | `full`           |
-| `spiceai`    | Spice.ai    | Alpha             | Arrow Flight     | `append`, `full` |
-| `s3`         | S3          | Alpha             | Parquet          | `full`           |
-| `dremio`     | Dremio      | Alpha             | Arrow Flight SQL | `full`           |
-| `mysql`      | MySQL       | Planned for v0.11 |                  | `full`           |
-| `snowflake`  | Snowflake   | Coming soon!      | Arrow Flight SQL | `full`           |
-| `bigquery`   | BigQuery    | Coming soon!      | Arrow Flight SQL | `full`           |
+| Name         | Description                                                                                    | Status            | Protocol/Format  | Refresh Modes    |
+| ------------ | ---------------------------------------------------------------------------------------------- | ----------------- | ---------------- | ---------------- |
+| `databricks` | [Databricks](https://github.com/spiceai/quickstarts/tree/trunk/databricks#spice-on-databricks) | Alpha             | Delta Lake       | `full`           |
+| `postgres`   | PostgreSQL                                                                                     | Alpha             |                  | `full`           |
+| `spiceai`    | [Spice.ai](https://github.com/spiceai/quickstarts/tree/trunk/spiceai#readme)                   | Alpha             | Arrow Flight     | `append`, `full` |
+| `s3`         | [S3](https://github.com/spiceai/quickstarts/tree/trunk/s3#readme)                              | Alpha             | Parquet          | `full`           |
+| `dremio`     | [Dremio](https://github.com/spiceai/quickstarts/tree/trunk/dremio#readme)                      | Alpha             | Arrow Flight SQL | `full`           |
+| `mysql`      | MySQL                                                                                          | Planned for v0.11 |                  | `full`           |
+| `snowflake`  | Snowflake                                                                                      | Coming soon!      | Arrow Flight SQL | `full`           |
+| `bigquery`   | BigQuery                                                                                       | Coming soon!      | Arrow Flight SQL | `full`           |
 
 ### Supported Data Stores/Accelerators
 
 Currently supported data stores for local materialization/acceleration. More coming soon.
 
-| Name       | Description             | Status | Engine Modes     | Refresh Modes    |
-| ---------- | ----------------------- | ------ | ---------------- | ---------------- |
-| `arrow`    | In-Memory Arrow Records | Alpha  | `memory`         | `append`, `full` |
-| `duckdb`   | Embedded DuckDB         | Alpha  | `memory`, `file` | `append`, `full` |
-| `sqlite`   | Embedded SQLite         | Alpha  | `memory`, `file` | `append`, `full` |
-| `postgres` | Attached PostgreSQL     | Alpha  |                  | `append`, `full` |
+| Name       | Description                                                                                                   | Status | Engine Modes     | Refresh Modes    |
+| ---------- | ------------------------------------------------------------------------------------------------------------- | ------ | ---------------- | ---------------- |
+| `arrow`    | In-Memory Arrow Records                                                                                       | Alpha  | `memory`         | `append`, `full` |
+| `duckdb`   | Embedded [DuckDB](https://docs.spiceai.org/data-accelerators/duckdb)                                          | Alpha  | `memory`, `file` | `append`, `full` |
+| `sqlite`   | Embedded [SQLite](https://docs.spiceai.org/data-accelerators/sqlite)                                          | Alpha  | `memory`, `file` | `append`, `full` |
+| `postgres` | Attached [PostgreSQL](https://github.com/spiceai/quickstarts/tree/trunk/postgres#postgresql-data-accelerator) | Alpha  |                  | `append`, `full` |
 
 ### Intelligent Applications
 
@@ -182,26 +182,26 @@ Query took: 0.007505084 seconds. 1/1 rows displayed.
 Enter a query to display the longest taxi trips:
 
 ```
-sql> SELECT trip_distance_mi, total_amount FROM taxi_trips ORDER BY trip_distance_mi DESC LIMIT 10;
+sql> SELECT trip_distance, total_amount FROM taxi_trips ORDER BY trip_distance DESC LIMIT 10;
 ```
 
 Output:
 
 ```
-+------------------+--------------+
-| trip_distance_mi | total_amount |
-+------------------+--------------+
-| 191.9            | 3.0          |
-| 189.2            | 63.0         |
-| 163.8            | 93.64        |
-| 122.4            | 160.0        |
-| 104.0            | 3.0          |
-| 69.7             | 213.58       |
-| 64.8             | 280.83       |
-| 60.0             | 350.12       |
-| 53.9             | 0.0          |
-| 53.3             | 5.33         |
-+------------------+--------------+
++---------------+--------------+
+| trip_distance | total_amount |
++---------------+--------------+
+| 312722.3      | 22.15        |
+| 97793.92      | 36.31        |
+| 82015.45      | 21.56        |
+| 72975.97      | 20.04        |
+| 71752.26      | 49.57        |
+| 59282.45      | 33.52        |
+| 59076.43      | 23.17        |
+| 58298.51      | 18.63        |
+| 51619.36      | 24.2         |
+| 44018.64      | 52.43        |
++---------------+--------------+
 
 Query took: 0.002458976 seconds
 ```
@@ -223,9 +223,8 @@ from spiceai/spiceai:latest
 Using Helm:
 
 ```bash
-git clone https://github.com/spiceai/spiceai.git
-cd spiceai
-helm upgrade --install spiceai ./deploy/chart
+helm repo add spiceai https://helm.spiceai.org
+helm install spiceai spiceai/spiceai
 ```
 
 ## 🏎️ Next Steps

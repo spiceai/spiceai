@@ -170,7 +170,7 @@ checksum = "d301b3b94cb4b2f23d7917810addbbaff90738e0ca2be692bd027e70d7e0330c"
 
 [[package]]
 name = "app"
-version = "0.10.1-alpha"
+version = "0.11.0-alpha"
 dependencies = [
  "snafu 0.8.2",
  "spicepod",
@@ -528,7 +528,7 @@ dependencies = [
 
 [[package]]
 name = "arrow_sql_gen"
-version = "0.10.1-alpha"
+version = "0.11.0-alpha"
 dependencies = [
  "arrow",
  "bigdecimal 0.3.1",
@@ -2162,7 +2162,7 @@ dependencies = [
 
 [[package]]
 name = "db_connection_pool"
-version = "0.10.1-alpha"
+version = "0.11.0-alpha"
 dependencies = [
  "arrow",
  "arrow_sql_gen",
@@ -2411,7 +2411,7 @@ checksum = "9ea835d29036a4087793836fa931b08837ad5e957da9e23886b29586fb9b6650"
 [[package]]
 name = "duckdb"
 version = "0.10.1"
-source = "git+https://github.com/spicehq/duckdb-rs.git?rev=4e1cf06070891088a78085bef0aaa57944c19c8d#4e1cf06070891088a78085bef0aaa57944c19c8d"
+source = "git+https://github.com/duckdb/duckdb-rs.git?rev=b82db396d116fc2dd9311802544610c0f2d06c34#b82db396d116fc2dd9311802544610c0f2d06c34"
 dependencies = [
  "arrow",
  "cast",
@@ -2679,7 +2679,7 @@ dependencies = [
 
 [[package]]
 name = "flight_client"
-version = "0.10.1-alpha"
+version = "0.11.0-alpha"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -2696,7 +2696,7 @@ dependencies = [
 
 [[package]]
 name = "flight_datafusion"
-version = "0.10.1-alpha"
+version = "0.11.0-alpha"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -2714,7 +2714,7 @@ dependencies = [
 
 [[package]]
 name = "flightpublisher"
-version = "0.10.1-alpha"
+version = "0.11.0-alpha"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -2728,7 +2728,7 @@ dependencies = [
 
 [[package]]
 name = "flightrepl"
-version = "0.10.1-alpha"
+version = "0.11.0-alpha"
 dependencies = [
  "ansi_term",
  "arrow",
@@ -2748,7 +2748,7 @@ dependencies = [
 
 [[package]]
 name = "flightsql_datafusion"
-version = "0.10.1-alpha"
+version = "0.11.0-alpha"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -2767,7 +2767,7 @@ dependencies = [
 
 [[package]]
 name = "flightsubscriber"
-version = "0.10.1-alpha"
+version = "0.11.0-alpha"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -3720,7 +3720,7 @@ checksum = "9c198f91728a82281a64e1f4f9eeb25d82cb32a5de251c6bd1b5154d63a8e7bd"
 [[package]]
 name = "libduckdb-sys"
 version = "0.10.1"
-source = "git+https://github.com/spicehq/duckdb-rs.git?rev=4e1cf06070891088a78085bef0aaa57944c19c8d#4e1cf06070891088a78085bef0aaa57944c19c8d"
+source = "git+https://github.com/duckdb/duckdb-rs.git?rev=b82db396d116fc2dd9311802544610c0f2d06c34#b82db396d116fc2dd9311802544610c0f2d06c34"
 dependencies = [
  "autocfg",
  "cc",
@@ -4287,11 +4287,12 @@ dependencies = [
 
 [[package]]
 name = "ns_lookup"
-version = "0.10.1-alpha"
+version = "0.11.0-alpha"
 dependencies = [
  "snafu 0.8.2",
  "tracing",
  "trust-dns-resolver",
+ "url",
 ]
 
 [[package]]
@@ -5418,7 +5419,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "0.10.1-alpha"
+version = "0.11.0-alpha"
 dependencies = [
  "app",
  "arrow",
@@ -5456,6 +5457,7 @@ dependencies = [
  "ndarray",
  "ndarray-npy",
  "notify",
+ "ns_lookup",
  "object_store",
  "once_cell",
  "opentelemetry-proto",
@@ -5912,7 +5914,7 @@ dependencies = [
 
 [[package]]
 name = "secrets"
-version = "0.10.1-alpha"
+version = "0.11.0-alpha"
 dependencies = [
  "async-trait",
  "base64 0.22.0",
@@ -6212,7 +6214,7 @@ dependencies = [
 
 [[package]]
 name = "spiced"
-version = "0.10.1-alpha"
+version = "0.11.0-alpha"
 dependencies = [
  "app",
  "clap",
@@ -6230,7 +6232,7 @@ dependencies = [
 
 [[package]]
 name = "spicepod"
-version = "0.10.1-alpha"
+version = "0.11.0-alpha"
 dependencies = [
  "fundu",
  "serde",
@@ -6253,7 +6255,7 @@ checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
 
 [[package]]
 name = "sql_provider_datafusion"
-version = "0.10.1-alpha"
+version = "0.11.0-alpha"
 dependencies = [
  "async-trait",
  "datafusion",

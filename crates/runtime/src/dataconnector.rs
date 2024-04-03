@@ -43,7 +43,9 @@ pub mod databricks;
 pub mod dremio;
 pub mod flight;
 pub mod flightsql;
+#[cfg(feature = "mysql")]
 pub mod mysql;
+#[cfg(feature = "postgres")]
 pub mod postgres;
 pub mod s3;
 pub mod spiceai;
@@ -113,15 +115,17 @@ pub async fn create_new_connector(
 }
 
 pub async fn register_all() {
-    tokio::join!(
-        register_connector_factory("databricks", databricks::Databricks::create),
-        register_connector_factory("dremio", dremio::Dremio::create),
-        register_connector_factory("flightsql", flightsql::FlightSQL::create),
-        register_connector_factory("postgres", postgres::Postgres::create),
-        register_connector_factory("mysql", mysql::MySQL::create),
-        register_connector_factory("s3", s3::S3::create),
-        register_connector_factory("spiceai", spiceai::SpiceAI::create),
-    );
+    // tokio:join! macro cannot deal with features conditional #cfg
+    // registering takes a global lock anyway, thus register sequentially
+    register_connector_factory("databricks", databricks::Databricks::create).await;
+    register_connector_factory("dremio", dremio::Dremio::create).await;
+    register_connector_factory("flightsql", flightsql::FlightSQL::create).await;
+    register_connector_factory("s3", s3::S3::create).await;
+    register_connector_factory("spiceai", spiceai::SpiceAI::create).await;
+    #[cfg(feature = "mysql")]
+    register_connector_factory("mysql", mysql::MySQL::create).await;
+    #[cfg(feature = "postgres")]
+    register_connector_factory("postgres", postgres::Postgres::create).await;
 }
 
 pub trait DataConnectorFactory {
@@ -137,7 +141,7 @@ pub trait DataConnectorFactory {
 /// If `stream_data_updates` is not supported for a dataset, the runtime will fall back to polling `get_all_data` and returning a
 /// `DataUpdate` that is constructed like:
 ///
-/// ```rust
+/// ```rust,ignore
 /// DataUpdate {
 ///    data: get_all_data(dataset),
 ///    update_type: UpdateType::Overwrite,
