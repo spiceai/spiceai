@@ -27,3 +27,4 @@ tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 [features]
 postgres = ["db_connection_pool/postgres"]
 sqlite = ["db_connection_pool/sqlite"]
+mysql = ["db_connection_pool/mysql"]

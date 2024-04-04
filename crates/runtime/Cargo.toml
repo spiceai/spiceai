@@ -74,6 +74,7 @@ rusqlite = { workspace = true, optional = true }
 tokio-rusqlite = { workspace = true, optional = true }
 pin-project = "1.0"
 lazy_static = "1.4.0"
+mysql_async = { workspace = true, optional = true }
 postgres-native-tls = "0.5.0"
 ns_lookup = { path = "../ns_lookup" }
 
@@ -95,4 +96,5 @@ sqlite = [
     "sql_provider_datafusion/sqlite",
     "arrow_sql_gen/sqlite",
 ]
+mysql = ["dep:mysql_async", "db_connection_pool/mysql", "arrow_sql_gen/mysql"]
 keyring-secret-store = ["secrets/keyring-secret-store"]

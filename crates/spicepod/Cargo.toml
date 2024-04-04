@@ -18,3 +18,4 @@ fundu = "2.0.0"
 duckdb = []
 postgres = []
 sqlite = []
+mysql = []

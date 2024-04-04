@@ -256,6 +256,8 @@ pub mod acceleration {
         Postgres,
         #[cfg(feature = "sqlite")]
         Sqlite,
+        #[cfg(feature = "mysql")]
+        MySQL,
     }
 
     impl fmt::Display for Engine {
@@ -271,6 +273,8 @@ pub mod acceleration {
                     Engine::Postgres => "postgres",
                     #[cfg(feature = "sqlite")]
                     Engine::Sqlite => "sqlite",
+                    #[cfg(feature = "mysql")]
+                    Engine::MySQL => "mysql",
                 }
             )
         }

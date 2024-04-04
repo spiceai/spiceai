@@ -17,3 +17,4 @@ tracing.workspace = true
 duckdb = ["spicepod/duckdb"]
 postgres = ["spicepod/postgres"]
 sqlite = ["spicepod/sqlite"]
+mysql = ["spicepod/mysql"]

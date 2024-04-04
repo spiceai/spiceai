@@ -50,3 +50,4 @@ bb8 = "0.8"
 bb8-postgres = "0.8"
 rusqlite = { version = "0.31.0", features = ["bundled"] }
 tokio-rusqlite = "0.5.1"
+mysql_async = "0.34.1"

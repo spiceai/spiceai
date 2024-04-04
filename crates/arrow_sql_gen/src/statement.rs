@@ -25,7 +25,8 @@ use time::{OffsetDateTime, PrimitiveDateTime};
 
 use sea_query::{
     Alias, ColumnDef, ColumnType, GenericBuilder, Index, InsertStatement, IntoIden,
-    IntoIndexColumn, PostgresQueryBuilder, Query, SimpleExpr, SqliteQueryBuilder, Table,
+    IntoIndexColumn, MysqlQueryBuilder, PostgresQueryBuilder, Query, SimpleExpr,
+    SqliteQueryBuilder, Table,
 };
 
 pub struct CreateTableBuilder {
@@ -58,6 +59,11 @@ impl CreateTableBuilder {
     #[must_use]
     pub fn build_sqlite(self) -> String {
         self.build(SqliteQueryBuilder)
+    }
+
+    #[must_use]
+    pub fn build_mysql(self) -> String {
+        self.build(MysqlQueryBuilder)
     }
 
     #[must_use]
@@ -283,6 +289,11 @@ impl InsertBuilder {
     #[must_use]
     pub fn build_sqlite(self) -> String {
         self.build(SqliteQueryBuilder)
+    }
+
+    #[must_use]
+    pub fn build_mysql(self) -> String {
+        self.build(MysqlQueryBuilder)
     }
 
     #[must_use]

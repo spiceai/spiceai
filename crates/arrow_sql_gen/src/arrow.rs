@@ -19,7 +19,7 @@ use arrow::{
         ArrayBuilder, BooleanBuilder, Date32Builder, Decimal128Builder, Float32Builder,
         Float64Builder, Int16Builder, Int32Builder, Int64Builder, ListBuilder, StringBuilder,
         TimestampMicrosecondBuilder, TimestampMillisecondBuilder, TimestampNanosecondBuilder,
-        TimestampSecondBuilder,
+        TimestampSecondBuilder, UInt64Builder,
     },
     datatypes::{DataType, TimeUnit},
 };
@@ -38,6 +38,7 @@ pub fn map_data_type_to_array_builder(data_type: &DataType) -> Box<dyn ArrayBuil
         DataType::Int16 => Box::new(Int16Builder::new()),
         DataType::Int32 => Box::new(Int32Builder::new()),
         DataType::Int64 => Box::new(Int64Builder::new()),
+        DataType::UInt64 => Box::new(UInt64Builder::new()),
         DataType::Float32 => Box::new(Float32Builder::new()),
         DataType::Float64 => Box::new(Float64Builder::new()),
         DataType::Utf8 => Box::new(StringBuilder::new()),
