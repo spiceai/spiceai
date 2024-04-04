@@ -4,8 +4,6 @@ on:
   push:
     branches:
       - trunk
-      - rust
-      - release-*
     tags:
       - v*
 
@@ -28,13 +26,18 @@ jobs:
             target_os: linux
             target_arch: x86_64
             target_arch_go: amd64
+          - name: Linux aarch64
+            runner: hosted-linux-arm-runner
+            target_os: linux
+            target_arch: aarch64
+            target_arch_go: arm64
           - name: macOS aarch64 (Apple Silicon)
             runner: macos-14
             target_os: darwin
             target_arch: aarch64
             target_arch_go: arm64
           - name: macOS x64 (Intel)
-            runner: rust-osx-x64
+            runner: macos-13
             target_os: darwin
             target_arch: x86_64
             target_arch_go: amd64
@@ -75,6 +78,13 @@ jobs:
           if [ -d /home/spiceai/build/target ]; then
             rsync -av /home/spiceai/build/target/ target/
           fi
+
+      # The aarch64 runner does not have any tools pre-installed
+      - name: Install missing tools
+        if: matrix.target_os == 'linux' && matrix.target_arch == 'aarch64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install build-essential libssl-dev pkg-config -y
 
       - name: Restore build cache (Windows)
         if: matrix.target_os == 'windows'
@@ -179,6 +189,8 @@ jobs:
         include:
           - target_os: linux
             target_arch: x86_64
+          - target_os: linux
+            target_arch: aarch64
           - target_os: darwin
             target_arch: aarch64
           - target_os: darwin

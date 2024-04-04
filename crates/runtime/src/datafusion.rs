@@ -1,3 +1,19 @@
+/*
+Copyright 2024 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -18,7 +34,7 @@ use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use snafu::prelude::*;
 use spicepod::component::dataset::Dataset;
 use tokio::sync::RwLock;
-use tokio::time::sleep;
+use tokio::time::{sleep, Instant};
 use tokio::{spawn, task};
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -152,7 +168,9 @@ impl DataFusion {
         let params: Arc<Option<HashMap<String, String>>> =
             Arc::new(dataset.acceleration_params().clone());
 
-        let secret_key = dataset.engine_secret().unwrap_or_default();
+        let secret_key = dataset
+            .engine_secret()
+            .unwrap_or(format!("{:?}_engine", acceleration.engine()).to_lowercase());
         let backend_secret = secrets_provider.read().await.get_secret(&secret_key).await;
 
         let data_backend: Box<dyn DataPublisher> =
@@ -290,6 +308,30 @@ impl DataFusion {
         }
     }
 
+    pub fn get_view_dependent_tables(&self, dataset: impl Borrow<Dataset>) -> Result<Vec<String>> {
+        let ds = dataset.borrow();
+
+        let Some(sql) = ds.view_sql().context(InvalidSQLViewSnafu)? else {
+            return ExpectedSqlViewSnafu.fail();
+        };
+
+        let statements = DFParser::parse_sql_with_dialect(sql.as_str(), &PostgreSqlDialect {})
+            .context(UnableToParseSqlSnafu)?;
+
+        if statements.len() != 1 {
+            return UnableToCreateViewSnafu {
+                reason: format!(
+                    "Expected 1 statement to create view from, received {}",
+                    statements.len()
+                )
+                .to_string(),
+            }
+            .fail();
+        }
+
+        Ok(DataFusion::get_dependent_table_names(&statements[0]))
+    }
+
     pub fn attach_view(&self, dataset: impl Borrow<Dataset>) -> Result<()> {
         let dataset = dataset.borrow();
         let table_exists = self.ctx.table_exist(dataset.name.as_str()).unwrap_or(false);
@@ -319,11 +361,24 @@ impl DataFusion {
             // Tables are currently lazily created (i.e. not created until first data is received) so that we know the table schema.
             // This means that we can't create a view on top of a table until the first data is received for all dependent tables and therefore
             // the tables are created. To handle this, wait until all tables are created.
+
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let mut unresolved_dependent_table: Option<String> = None;
             let dependent_table_names = DataFusion::get_dependent_table_names(&statements[0]);
             for dependent_table_name in dependent_table_names {
                 let mut attempts = 0;
+
+                if unresolved_dependent_table.is_some() {
+                    break;
+                }
+
                 loop {
                     if !ctx.table_exist(&dependent_table_name).unwrap_or(false) {
+                        if Instant::now() >= deadline {
+                            unresolved_dependent_table = Some(dependent_table_name.clone());
+                            break;
+                        }
+
                         if attempts % 10 == 0 {
                             tracing::warn!("Dependent table {dependent_table_name} for view {table_name} does not exist, retrying...");
                         }
@@ -333,6 +388,11 @@ impl DataFusion {
                     }
                     break;
                 }
+            }
+
+            if let Some(missing_table) = unresolved_dependent_table {
+                tracing::error!("Failed to create view {table_name}. Dependent table {missing_table} does not exist.");
+                return;
             }
 
             let plan = match ctx.state().statement_to_plan(statements[0].clone()).await {

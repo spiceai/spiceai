@@ -25,6 +25,10 @@ ci:
 	make -C bin/spice
 	export SPICED_TARGET_DIR=/workspace/spiceai/target; make -C bin/spiced
 
+.PHONY: test
+test: 
+	@cargo test --all
+
 .PHONY: lint
 lint:
 	go vet ./...
@@ -109,19 +113,12 @@ generate-acknowledgements-go:
 	echo "\n## Go Modules\n" >> $(ACKNOWLEDGEMENTS_PATH)
 	go get github.com/google/go-licenses
 	go install github.com/google/go-licenses
-	pushd bin/spice && go-licenses csv . 2>/dev/null >> ../../$(ACKNOWLEDGEMENTS_PATH) && popd
+	cd bin/spice && go-licenses report --ignore github.com/spiceai/spiceai . 2>/dev/null >> ../../$(ACKNOWLEDGEMENTS_PATH) && cd ../../
 
 .PHONY: generate-acknowledgements-rust
 generate-acknowledgements-rust:
 	@echo "\n## Rust Crates\n" >> "$(ACKNOWLEDGEMENTS_PATH)"
-	@make display-deps 2>/dev/null | awk 'BEGIN { \
-		FS="\t"; \
-		print "| name | version | authors | repository | license | license_file | description |"; \
-		print "|------|---------|---------|------------|---------|--------------|-------------|"; \
-	} \
-	{ \
-		printf("| %s | %s | %s | %s | %s | %s | %s |\n", $$1, $$2, $$3, $$4, $$5, $$6, $$7); \
-	}' | grep -v "github.com/spiceai" >> "$(ACKNOWLEDGEMENTS_PATH)"
+	@make display-deps 2>/dev/null | awk -F'\t' 'NR>1 {printf "- %s %s, %s %s\n  <br/>%s\n\n", $$1, $$2, $$5, $$6, $$4}' | grep -v "github.com/spiceai" >> "$(ACKNOWLEDGEMENTS_PATH)"
 
 
 .PHONY: generate-acknowledgements-formatting

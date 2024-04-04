@@ -1,3 +1,19 @@
+/*
+Copyright 2024 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 use arrow_flight::decode::DecodedPayload;
 use async_stream::stream;
 use async_trait::async_trait;
@@ -5,6 +21,7 @@ use flight_client::FlightClient;
 use flight_datafusion::FlightTable;
 use futures::StreamExt;
 use futures_core::stream::BoxStream;
+use ns_lookup::verify_endpoint_connection;
 use secrets::Secret;
 use snafu::prelude::*;
 use spicepod::component::dataset::Dataset;
@@ -16,8 +33,8 @@ use std::{collections::HashMap, future::Future};
 
 use crate::datapublisher::{AddDataResult, DataPublisher};
 use crate::dataupdate::{DataUpdate, UpdateType};
-use crate::info_spaced;
 use crate::tracers::SpacedTracer;
+use crate::{info_spaced, status};
 
 use super::DataConnectorFactory;
 use super::{flight::Flight, DataConnector};
@@ -61,6 +78,11 @@ impl DataConnectorFactory for SpiceAI {
                 .and_then(|params| params.get("endpoint").cloned())
                 .unwrap_or(default_flight_url);
             tracing::trace!("Connecting to SpiceAI with flight url: {url}");
+
+            verify_endpoint_connection(&url)
+                .await
+                .map_err(|e| super::Error::UnableToCreateDataConnector { source: e.into() })?;
+
             let api_key = secret.get("key").unwrap_or_default();
             let flight_client = FlightClient::new(url.as_str(), "", api_key)
                 .await
@@ -87,37 +109,57 @@ impl DataConnector for SpiceAI {
         let flight = &self.flight.client;
         let mut flight = flight.clone();
         let spice_dataset_path = Self::spice_dataset_path(dataset);
+        let spice_dataset_name = dataset.name.clone();
         Box::pin(stream! {
-          let mut stream = match flight.subscribe(&spice_dataset_path).await {
-            Ok(stream) => stream,
-            Err(error) => {
-              tracing::error!("Unable to subscribe to {spice_dataset_path}: {error}");
-              return;
-            }
-          };
-          loop {
-            match stream.next().await {
-              Some(Ok(decoded_data)) => match decoded_data.payload {
-                  DecodedPayload::RecordBatch(batch) => {
-                      yield DataUpdate {
-                        data: vec![batch],
-                        update_type: UpdateType::Append,
-                      };
-                  }
-                  _ => {
-                      continue;
-                  }
+            let mut initial_connect = true;
+            loop {
+                // On connection reset, clear the data by sending an empty overwrite update and re-subscribe.
+                if !initial_connect {
+                    tracing::info!("Reconnecting to {spice_dataset_path}");
+                    yield DataUpdate {
+                        data: vec![],
+                        update_type: UpdateType::Overwrite,
+                    };
                 }
-              Some(Err(error)) => {
-                tracing::error!("Error in subscription to {spice_dataset_path}: {error}");
-                continue;
-              },
-              None => {
-                tracing::error!("Flight stream ended for {spice_dataset_path}");
-                break;
-              }
-            };
-          }
+
+                let mut stream = match flight.subscribe(&spice_dataset_path).await {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                    status::update_dataset(spice_dataset_name.clone(), status::ComponentStatus::Error);
+                    tracing::error!("Unable to subscribe to {spice_dataset_path}: {error}");
+                    return;
+                    }
+                };
+                loop {
+                    let result = stream.next().await;
+                    status::update_dataset(spice_dataset_name.clone(), status::ComponentStatus::Refreshing);
+                    match result {
+                    Some(Ok(decoded_data)) => if let DecodedPayload::RecordBatch(batch) = decoded_data.payload {
+                            status::update_dataset(spice_dataset_name.clone(), status::ComponentStatus::Ready);
+                            yield DataUpdate {
+                                data: vec![batch],
+                                update_type: UpdateType::Append,
+                            };
+                        } else {
+                            status::update_dataset(spice_dataset_name.clone(), status::ComponentStatus::Ready);
+                            continue;
+                        },
+                    Some(Err(error)) => {
+                        status::update_dataset(spice_dataset_name.clone(), status::ComponentStatus::Error);
+                        tracing::debug!("Error in subscription to {spice_dataset_path}: {error}");
+                        tracing::error!("Error in subscription to {spice_dataset_path}");
+                        continue;
+                    },
+                    None => {
+                        status::update_dataset(spice_dataset_name.clone(), status::ComponentStatus::Ready);
+                        tracing::error!("Flight stream ended for {spice_dataset_path}");
+                        break;
+                    }
+                    };
+                }
+
+                initial_connect = false;
+            }
         })
     }
 

@@ -2,8 +2,6 @@ name: spiced_docker
 
 on:
   push:
-    branches:
-      - trunk
     tags:
       - v*
 
@@ -11,8 +9,8 @@ on:
 
 jobs:
   build:
-    name: Build Spice linux_amd64 Docker image
-    runs-on: rust
+    name: Build Spice linux_amd64/linux_arm64 Docker image
+    runs-on: ubuntu-latest-16-cores
 
     steps:
       - uses: actions/checkout@v4
@@ -47,15 +45,13 @@ jobs:
         with:
           context: .
           file: Dockerfile
-          platforms: linux/amd64
+          platforms: linux/amd64,linux/arm64
           push: ${{ startswith(github.ref, 'refs/tags/v') }}
           build-args: |
             REL_VERSION=${{ env.REL_VERSION }}
           tags: |
             ghcr.io/spiceai/spiceai:${{ env.REL_VERSION }}
-            ghcr.io/spiceai/spiceai:${{ env.REL_VERSION }}-linux-amd64
             spiceai/spiceai:${{ env.REL_VERSION }}
-            spiceai/spiceai:${{ env.REL_VERSION }}-linux-amd64
             ${{ env.LATEST_GHCR_TAG }}
             ${{ env.LATEST_DOCKERHUB_TAG }}
 

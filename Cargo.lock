@@ -170,7 +170,7 @@ checksum = "d301b3b94cb4b2f23d7917810addbbaff90738e0ca2be692bd027e70d7e0330c"
 
 [[package]]
 name = "app"
-version = "0.9.1-alpha"
+version = "0.11.0-alpha"
 dependencies = [
  "snafu 0.8.2",
  "spicepod",
@@ -528,11 +528,12 @@ dependencies = [
 
 [[package]]
 name = "arrow_sql_gen"
-version = "0.9.1-alpha"
+version = "0.11.0-alpha"
 dependencies = [
  "arrow",
  "bigdecimal 0.3.1",
  "bigdecimal 0.4.3",
+ "chrono",
  "rusqlite",
  "sea-query",
  "snafu 0.8.2",
@@ -1544,8 +1545,10 @@ checksum = "8eaf5903dcbc0a39312feb77df2ff4c76387d591b9fc7b04a238dcf8bb62639a"
 dependencies = [
  "android-tzdata",
  "iana-time-zone",
+ "js-sys",
  "num-traits",
  "serde",
+ "wasm-bindgen",
  "windows-targets 0.52.4",
 ]
 
@@ -1757,9 +1760,9 @@ dependencies = [
 
 [[package]]
 name = "crypto-mac"
-version = "0.11.1"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1d1a86f49236c215f271d40892d5fc950490551400b02ef360692c29815c714"
+checksum = "25fab6889090c8133f3deb8f73ba3c65a7f456f66436fc012a1b1e272b1e103e"
 dependencies = [
  "generic-array",
  "subtle",
@@ -1809,8 +1812,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "data-encoding"
+version = "2.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e962a19be5cfc3f3bf6dd8f61eb50107f356ad6270fbb3ed41476571db78be5"
+
+[[package]]
 name = "data_components"
-version = "0.9.1-alpha"
+version = "0.11.0-alpha"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -2049,7 +2058,7 @@ dependencies = [
 
 [[package]]
 name = "db_connection_pool"
-version = "0.9.1-alpha"
+version = "0.11.0-alpha"
 dependencies = [
  "arrow",
  "arrow_sql_gen",
@@ -2059,6 +2068,9 @@ dependencies = [
  "datafusion",
  "duckdb",
  "futures",
+ "native-tls",
+ "ns_lookup",
+ "postgres-native-tls",
  "r2d2",
  "rusqlite",
  "secrets",
@@ -2294,7 +2306,7 @@ checksum = "9ea835d29036a4087793836fa931b08837ad5e957da9e23886b29586fb9b6650"
 [[package]]
 name = "duckdb"
 version = "0.10.1"
-source = "git+https://github.com/spicehq/duckdb-rs.git?rev=4e1cf06070891088a78085bef0aaa57944c19c8d#4e1cf06070891088a78085bef0aaa57944c19c8d"
+source = "git+https://github.com/duckdb/duckdb-rs.git?rev=b82db396d116fc2dd9311802544610c0f2d06c34#b82db396d116fc2dd9311802544610c0f2d06c34"
 dependencies = [
  "arrow",
  "cast",
@@ -2336,6 +2348,18 @@ name = "endian-type"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c34f04666d835ff5d62e058c3995147c06f42fe86ff053337632bca83e42702d"
+
+[[package]]
+name = "enum-as-inner"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5ffccbb6966c05b32ef8fbac435df276c4ae4d3dc55a8cd0eb9745e6c12f546a"
+dependencies = [
+ "heck",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.52",
+]
 
 [[package]]
 name = "enumflags2"
@@ -2549,7 +2573,7 @@ dependencies = [
 
 [[package]]
 name = "flight_client"
-version = "0.9.1-alpha"
+version = "0.11.0-alpha"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -2566,7 +2590,7 @@ dependencies = [
 
 [[package]]
 name = "flight_datafusion"
-version = "0.9.1-alpha"
+version = "0.11.0-alpha"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -2584,7 +2608,7 @@ dependencies = [
 
 [[package]]
 name = "flightpublisher"
-version = "0.9.1-alpha"
+version = "0.11.0-alpha"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -2598,7 +2622,7 @@ dependencies = [
 
 [[package]]
 name = "flightrepl"
-version = "0.9.1-alpha"
+version = "0.11.0-alpha"
 dependencies = [
  "ansi_term",
  "arrow",
@@ -2618,7 +2642,7 @@ dependencies = [
 
 [[package]]
 name = "flightsql_datafusion"
-version = "0.9.1-alpha"
+version = "0.11.0-alpha"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -2637,7 +2661,7 @@ dependencies = [
 
 [[package]]
 name = "flightsubscriber"
-version = "0.9.1-alpha"
+version = "0.11.0-alpha"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -3003,6 +3027,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "hostname"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c731c3e10504cc8ed35cfe2f1db4c9274c3d35fa486e3b31df46f068ef3e867"
+dependencies = [
+ "libc",
+ "match_cfg",
+ "winapi",
+]
+
+[[package]]
 name = "http"
 version = "0.2.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3219,6 +3254,16 @@ dependencies = [
 
 [[package]]
 name = "idna"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d20d6b07bfbc108882d88ed8e37d39636dcc260e15e30c45e6ba089610b917c"
+dependencies = [
+ "unicode-bidi",
+ "unicode-normalization",
+]
+
+[[package]]
+name = "idna"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "634d9b1461af396cad843f47fdba5597a4f9e6ddd4bfb6ff5d85028c25cb12f6"
@@ -3302,6 +3347,18 @@ dependencies = [
  "hermit-abi",
  "libc",
  "windows-sys 0.48.0",
+]
+
+[[package]]
+name = "ipconfig"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b58db92f96b720de98181bbbe63c831e87005ab460c1bf306eb2622b4707997f"
+dependencies = [
+ "socket2 0.5.6",
+ "widestring",
+ "windows-sys 0.48.0",
+ "winreg",
 ]
 
 [[package]]
@@ -3484,7 +3541,7 @@ checksum = "9c198f91728a82281a64e1f4f9eeb25d82cb32a5de251c6bd1b5154d63a8e7bd"
 [[package]]
 name = "libduckdb-sys"
 version = "0.10.1"
-source = "git+https://github.com/spicehq/duckdb-rs.git?rev=4e1cf06070891088a78085bef0aaa57944c19c8d#4e1cf06070891088a78085bef0aaa57944c19c8d"
+source = "git+https://github.com/duckdb/duckdb-rs.git?rev=b82db396d116fc2dd9311802544610c0f2d06c34#b82db396d116fc2dd9311802544610c0f2d06c34"
 dependencies = [
  "autocfg",
  "cc",
@@ -3519,9 +3576,16 @@ version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c10584274047cb335c23d3e61bcef8e323adae7c5c8c760540f73610177fc3f"
 dependencies = [
+ "cc",
  "pkg-config",
  "vcpkg",
 ]
+
+[[package]]
+name = "linked-hash-map"
+version = "0.5.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0717cef1bc8b636c6e1c1bbdefc09e6322da8a9321966e8928ef80d20f7f770f"
 
 [[package]]
 name = "linux-keyutils"
@@ -3619,6 +3683,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "90ed8c1e510134f979dbc4f070f87d4313098b704861a105fe34231c70a3901c"
 
 [[package]]
+name = "lru-cache"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "31e24f1ad8321ca0e8a1e0ac13f23cb668e6f5466c2c57319f6a5cf1cc8e3b1c"
+dependencies = [
+ "linked-hash-map",
+]
+
+[[package]]
 name = "lz4_flex"
 version = "0.11.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3643,6 +3716,12 @@ name = "maplit"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3e2e65a1a2e43cfcb47a895c4c8b10d1f4a61097f9f254f183aee60cad9c651d"
+
+[[package]]
+name = "match_cfg"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ffbee8634e0d45d258acb448e7eaab3fce7a0a467395d4d9f228e3c1f01fb2e4"
 
 [[package]]
 name = "matchers"
@@ -3904,6 +3983,16 @@ dependencies = [
  "mio",
  "walkdir",
  "windows-sys 0.48.0",
+]
+
+[[package]]
+name = "ns_lookup"
+version = "0.11.0-alpha"
+dependencies = [
+ "snafu 0.8.2",
+ "tracing",
+ "trust-dns-resolver",
+ "url",
 ]
 
 [[package]]
@@ -4489,6 +4578,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7170ef9988bc169ba16dd36a7fa041e5c4cbeb6a35b76d4c03daded371eae7c0"
 
 [[package]]
+name = "postgres-native-tls"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d442770e2b1e244bb5eb03b31c79b65bb2568f413b899eaba850fa945a65954"
+dependencies = [
+ "futures",
+ "native-tls",
+ "tokio",
+ "tokio-native-tls",
+ "tokio-postgres",
+]
+
+[[package]]
 name = "postgres-protocol"
 version = "0.6.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4513,6 +4615,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8d2234cdee9408b523530a9b6d2d6b373d1db34f6a8e51dc03ded1828d7fb67c"
 dependencies = [
  "bytes",
+ "chrono",
  "fallible-iterator 0.2.0",
  "postgres-protocol",
 ]
@@ -4682,6 +4785,12 @@ dependencies = [
  "web-sys",
  "winapi",
 ]
+
+[[package]]
+name = "quick-error"
+version = "1.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a1d01941d82fa2ab50be1e79e6714289dd7cde78eba4c074bc5a4374f650dfe0"
 
 [[package]]
 name = "quick-xml"
@@ -4919,6 +5028,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "resolv-conf"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52e44394d2086d010551b14b53b1f24e31647570cd1deb0379e2c21b329aba00"
+dependencies = [
+ "hostname",
+ "quick-error",
+]
+
+[[package]]
 name = "ring"
 version = "0.16.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4989,7 +5108,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "0.9.1-alpha"
+version = "0.11.0-alpha"
 dependencies = [
  "app",
  "arrow",
@@ -5027,10 +5146,12 @@ dependencies = [
  "ndarray",
  "ndarray-npy",
  "notify",
+ "ns_lookup",
  "object_store",
  "once_cell",
  "opentelemetry-proto",
  "pin-project",
+ "postgres-native-tls",
  "prost 0.12.3",
  "quick-xml 0.23.1",
  "r2d2",
@@ -5470,7 +5591,7 @@ dependencies = [
 
 [[package]]
 name = "secrets"
-version = "0.9.1-alpha"
+version = "0.11.0-alpha"
 dependencies = [
  "async-trait",
  "base64 0.22.0",
@@ -5770,7 +5891,7 @@ dependencies = [
 
 [[package]]
 name = "spiced"
-version = "0.9.1-alpha"
+version = "0.11.0-alpha"
 dependencies = [
  "app",
  "clap",
@@ -5788,7 +5909,7 @@ dependencies = [
 
 [[package]]
 name = "spicepod"
-version = "0.9.1-alpha"
+version = "0.11.0-alpha"
 dependencies = [
  "fundu",
  "serde",
@@ -5811,7 +5932,7 @@ checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
 
 [[package]]
 name = "sql_provider_datafusion"
-version = "0.9.1-alpha"
+version = "0.11.0-alpha"
 dependencies = [
  "async-trait",
  "datafusion",
@@ -5910,9 +6031,9 @@ dependencies = [
 
 [[package]]
 name = "subtle"
-version = "2.4.1"
+version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6bdef32e8150c2a081110b42772ffe7d7c9032b606bc226c8260fd97e0976601"
+checksum = "81cdd64d312baedb58e21336b31bc043b77e01cc99033ce76ef539f78e965ebc"
 
 [[package]]
 name = "syn"
@@ -6595,6 +6716,52 @@ dependencies = [
 ]
 
 [[package]]
+name = "trust-dns-proto"
+version = "0.23.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3119112651c157f4488931a01e586aa459736e9d6046d3bd9105ffb69352d374"
+dependencies = [
+ "async-trait",
+ "cfg-if",
+ "data-encoding",
+ "enum-as-inner",
+ "futures-channel",
+ "futures-io",
+ "futures-util",
+ "idna 0.4.0",
+ "ipnet",
+ "once_cell",
+ "rand",
+ "smallvec",
+ "thiserror",
+ "tinyvec",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
+name = "trust-dns-resolver"
+version = "0.23.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10a3e6c3aff1718b3c73e395d1f35202ba2ffa847c6a62eea0db8fb4cfe30be6"
+dependencies = [
+ "cfg-if",
+ "futures-util",
+ "ipconfig",
+ "lru-cache",
+ "once_cell",
+ "parking_lot",
+ "rand",
+ "resolv-conf",
+ "smallvec",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "trust-dns-proto",
+]
+
+[[package]]
 name = "try-lock"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6691,7 +6858,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "31e6302e3bb753d46e83516cae55ae196fc0c309407cf11ab35cc51a4c2a4633"
 dependencies = [
  "form_urlencoded",
- "idna",
+ "idna 0.5.0",
  "percent-encoding",
 ]
 
@@ -6887,6 +7054,12 @@ dependencies = [
  "wasite",
  "web-sys",
 ]
+
+[[package]]
+name = "widestring"
+version = "1.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "653f141f39ec16bba3c5abe400a0c60da7468261cc2cbf36805022876bc721a8"
 
 [[package]]
 name = "winapi"

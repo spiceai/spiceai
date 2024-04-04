@@ -32,13 +32,9 @@ jobs:
           fi
 
       - name: Set up Rust
-        run: |
-          echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> $GITHUB_PATH
-          source $HOME/.cargo/env || true
-          if ! command -v rustup &> /dev/null ; then
-            curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused -fsSL "https://sh.rustup.rs" | sh -s -- --default-toolchain none -y  
-          fi
-          rustup toolchain install stable
+        uses: ./.github/actions/setup-rust
+        with:
+          os: 'linux'
 
       - run: make lint
 
@@ -62,8 +58,7 @@ jobs:
         with:
           os: 'linux'
 
-      - run: sudo apt update && sudo apt install --yes libsqlite3-dev
-      - run: make ci
+      - run: make test ci
 
   build-docker:
     name: Build Docker Image

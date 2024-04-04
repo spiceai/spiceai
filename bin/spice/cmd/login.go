@@ -1,3 +1,19 @@
+/*
+Copyright 2024 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package cmd
 
 import (
@@ -22,7 +38,7 @@ const (
 	passwordFlag     = "password"
 	token            = "token"
 	accessKeyFlag    = "access-key"
-	accessSecretFlag = "access-scret"
+	accessSecretFlag = "access-secret"
 	awsRegion        = "aws-region"
 	awsAccessKeyId   = "aws-access-key-id"
 	awsSecret        = "aws-secret-access-key"
@@ -40,9 +56,6 @@ spice login
 	Run: func(cmd *cobra.Command, args []string) {
 		authCode := generateAuthCode()
 
-		cmd.Println("Opening browser to authenticate with Spice.ai")
-		cmd.Printf("Auth Code: %s-%s\n", authCode[:4], authCode[4:])
-
 		spiceApiClient := api.NewSpiceApiClient()
 		err := spiceApiClient.Init()
 		if err != nil {
@@ -50,11 +63,14 @@ spice login
 			os.Exit(1)
 		}
 
-		err = browser.OpenURL(spiceApiClient.GetAuthUrl(authCode))
-		if err != nil {
-			cmd.Println(err.Error())
-			os.Exit(1)
-		}
+		spiceAuthUrl := spiceApiClient.GetAuthUrl(authCode)
+
+		cmd.Println("Attempting to open Spice.ai authorization page in your default browser")
+		cmd.Printf("\nYour auth code:\n\n%s-%s\n", authCode[:4], authCode[4:])
+		cmd.Println("\nIf the browser does not open, please visit the following URL manually:")
+		cmd.Printf("\n%s\n\n", spiceAuthUrl)
+
+		_ = browser.OpenURL(spiceApiClient.GetAuthUrl(authCode))
 
 		var accessToken string
 
@@ -144,6 +160,36 @@ spice login s3 --access-key <key> --access-secret <secret>
 	}, map[string]string{
 		accessKeyFlag:    api.AUTH_PARAM_KEY,
 		accessSecretFlag: api.AUTH_PARAM_SECRET,
+	}),
+}
+
+var postgresCmd = &cobra.Command{
+	Use:   "postgres",
+	Short: "Login to a Postgres instance",
+	Example: `
+spice login postgres --password <password>
+
+# See more at: https://docs.spiceai.org/
+`,
+	Run: CreateLoginRunFunc(api.AUTH_TYPE_POSTGRES, map[string]string{
+		passwordFlag: fmt.Sprintf("No password provided, use --%s or -p to provide a password", passwordFlag),
+	}, map[string]string{
+		passwordFlag: api.AUTH_PARAM_PG_PASSWORD,
+	}),
+}
+
+var postgresEngineCmd = &cobra.Command{
+	Use:   "engine",
+	Short: "Login to a Postgres instance as an engine",
+	Example: `
+spice login postgres engine --password <password>
+
+# See more at: https://docs.spiceai.org/
+`,
+	Run: CreateLoginRunFunc(api.AUTH_TYPE_POSTGRES_ENGINE, map[string]string{
+		passwordFlag: fmt.Sprintf("No password provided, use --%s or -p to provide a password", passwordFlag),
+	}, map[string]string{
+		passwordFlag: api.AUTH_PARAM_PG_PASSWORD,
 	}),
 }
 
@@ -309,6 +355,14 @@ func init() {
 	s3Cmd.Flags().StringP(accessKeyFlag, "k", "", "Access key")
 	s3Cmd.Flags().StringP(accessSecretFlag, "s", "", "Access Secret")
 	loginCmd.AddCommand(s3Cmd)
+
+	postgresCmd.Flags().BoolP("help", "h", false, "Print this help message")
+	postgresCmd.Flags().StringP(passwordFlag, "p", "", "Password")
+	loginCmd.AddCommand(postgresCmd)
+
+	postgresEngineCmd.Flags().BoolP("help", "h", false, "Print this help message")
+	postgresEngineCmd.Flags().StringP(passwordFlag, "p", "", "Password")
+	postgresCmd.AddCommand(postgresEngineCmd)
 
 	loginCmd.Flags().BoolP("help", "h", false, "Print this help message")
 	loginCmd.Flags().StringP(apiKeyFlag, "k", "", "API key")

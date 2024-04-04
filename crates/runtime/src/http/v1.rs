@@ -1,8 +1,24 @@
+/*
+Copyright 2024 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 use csv::Writer;
 use serde::{Deserialize, Serialize};
 use spicepod::component::dataset::Dataset;
 
-use crate::datafusion::DataFusion;
+use crate::{datafusion::DataFusion, status::ComponentStatus};
 
 #[derive(Default, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -10,15 +26,6 @@ pub enum Format {
     #[default]
     Json,
     Csv,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Status {
-    Initializing,
-    Disabled,
-    Ready,
-    Error,
 }
 
 fn convert_entry_to_csv<T: Serialize>(entries: &[T]) -> Result<String, Box<dyn std::error::Error>> {
@@ -30,11 +37,11 @@ fn convert_entry_to_csv<T: Serialize>(entries: &[T]) -> Result<String, Box<dyn s
     Ok(String::from_utf8(w.into_inner()?)?)
 }
 
-fn dataset_status(df: &DataFusion, ds: &Dataset) -> Status {
+fn dataset_status(df: &DataFusion, ds: &Dataset) -> ComponentStatus {
     if df.table_exists(ds.name.as_str()) {
-        Status::Ready
+        ComponentStatus::Ready
     } else {
-        Status::Error
+        ComponentStatus::Error
     }
 }
 
@@ -121,7 +128,7 @@ pub(crate) mod status {
         Extension, Json,
     };
 
-    use crate::config;
+    use crate::{config, status::ComponentStatus};
 
     #[derive(Debug, Serialize, Deserialize)]
     #[serde(rename_all = "lowercase")]
@@ -137,20 +144,11 @@ pub(crate) mod status {
         Csv,
     }
 
-    #[derive(Debug, Serialize, Deserialize)]
-    #[serde(rename_all = "lowercase")]
-    enum Status {
-        Initializing,
-        Disabled,
-        Ready,
-        Error,
-    }
-
     #[derive(Deserialize, Serialize)]
     pub struct ConnectionDetails {
         name: &'static str,
         endpoint: String,
-        status: Status,
+        status: ComponentStatus,
     }
 
     fn default_format() -> Format {
@@ -169,7 +167,7 @@ pub(crate) mod status {
             ConnectionDetails {
                 name: "http",
                 endpoint: cfg.http_bind_address.to_string(),
-                status: Status::Ready,
+                status: ComponentStatus::Ready,
             },
             ConnectionDetails {
                 name: "flight",
@@ -184,10 +182,10 @@ pub(crate) mod status {
                         Ok(status) => status,
                         Err(e) => {
                             tracing::error!("Error getting metrics status from {metrics_url}: {e}");
-                            Status::Error
+                            ComponentStatus::Error
                         }
                     },
-                    None => Status::Disabled,
+                    None => ComponentStatus::Disabled,
                 },
             },
             ConnectionDetails {
@@ -204,7 +202,7 @@ pub(crate) mod status {
                             cfg.open_telemetry_bind_address,
                             e
                         );
-                        Status::Error
+                        ComponentStatus::Error
                     }
                 },
                 endpoint: cfg.open_telemetry_bind_address.to_string(),
@@ -234,26 +232,30 @@ pub(crate) mod status {
         Ok(String::from_utf8(w.into_inner()?)?)
     }
 
-    async fn get_flight_status(flight_addr: &str) -> Status {
+    async fn get_flight_status(flight_addr: &str) -> ComponentStatus {
         tracing::trace!("Checking flight status at {flight_addr}");
         match FlightClient::new(&format!("http://{flight_addr}"), "", "").await {
-            Ok(_) => Status::Ready,
+            Ok(_) => ComponentStatus::Ready,
             Err(e) => {
                 tracing::error!("Error connecting to flight when checking status: {e}");
-                Status::Error
+                ComponentStatus::Error
             }
         }
     }
 
-    async fn get_metrics_status(metrics_addr: &str) -> Result<Status, Box<dyn std::error::Error>> {
+    async fn get_metrics_status(
+        metrics_addr: &str,
+    ) -> Result<ComponentStatus, Box<dyn std::error::Error>> {
         let resp = reqwest::get(format!("http://{metrics_addr}/health")).await?;
         if resp.status().is_success() && resp.text().await? == "OK" {
-            Ok(Status::Ready)
+            Ok(ComponentStatus::Ready)
         } else {
-            Ok(Status::Error)
+            Ok(ComponentStatus::Error)
         }
     }
-    async fn get_opentelemetry_status(addr: &str) -> Result<Status, Box<dyn std::error::Error>> {
+    async fn get_opentelemetry_status(
+        addr: &str,
+    ) -> Result<ComponentStatus, Box<dyn std::error::Error>> {
         let channel = Channel::from_shared(format!("http://{addr}"))?
             .connect()
             .await?;
@@ -267,9 +269,9 @@ pub(crate) mod status {
             .await?;
 
         if resp.into_inner().status == ServingStatus::Serving as i32 {
-            Ok(Status::Ready)
+            Ok(ComponentStatus::Ready)
         } else {
-            Ok(Status::Error)
+            Ok(ComponentStatus::Error)
         }
     }
 }
@@ -289,7 +291,7 @@ pub(crate) mod datasets {
     use tokio::sync::RwLock;
     use tract_core::tract_data::itertools::Itertools;
 
-    use crate::datafusion::DataFusion;
+    use crate::{datafusion::DataFusion, status::ComponentStatus};
 
     use super::{convert_entry_to_csv, dataset_status, Format};
 
@@ -320,7 +322,7 @@ pub(crate) mod datasets {
         pub depends_on: Option<String>,
 
         #[serde(skip_serializing_if = "Option::is_none")]
-        pub status: Option<super::Status>,
+        pub status: Option<ComponentStatus>,
     }
 
     pub(crate) async fn get(
@@ -555,7 +557,7 @@ pub(crate) mod inference {
     use app::App;
     use arrow::array::Float32Array;
     use axum::{
-        extract::{Path, Query},
+        extract::Path,
         http::StatusCode,
         response::{IntoResponse, Response},
         Extension, Json,
@@ -575,20 +577,6 @@ pub(crate) mod inference {
     #[derive(Deserialize)]
     pub struct PredictRequest {
         pub model_name: String,
-
-        #[serde(default = "default_lookback")]
-        pub lookback: usize,
-    }
-
-    #[derive(Deserialize)]
-    pub struct PredictParams {
-        #[serde(default = "default_lookback")]
-        pub lookback: usize,
-    }
-
-    // TODO(jeadie): This needs to come from the training_run postgres table in cloud, for the specific training run that made the model.
-    fn default_lookback() -> usize {
-        4
     }
 
     #[derive(Serialize)]
@@ -609,10 +597,8 @@ pub(crate) mod inference {
         #[serde(skip_serializing_if = "Option::is_none")]
         pub model_version: Option<String>,
 
-        pub lookback: usize,
-
-        #[serde(skip_serializing_if = "Vec::is_empty")]
-        pub prediction: Vec<f32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub prediction: Option<Vec<f32>>,
 
         pub duration_ms: u128,
     }
@@ -628,11 +614,9 @@ pub(crate) mod inference {
         Extension(app): Extension<Arc<RwLock<Option<App>>>>,
         Extension(df): Extension<Arc<RwLock<DataFusion>>>,
         Path(model_name): Path<String>,
-        Query(params): Query<PredictParams>,
         Extension(models): Extension<Arc<RwLock<HashMap<String, Model>>>>,
     ) -> Response {
-        let model_predict_response =
-            run_inference(app, df, models, model_name, params.lookback).await;
+        let model_predict_response = run_inference(app, df, models, model_name).await;
 
         match model_predict_response.status {
             PredictStatus::Success => {
@@ -665,7 +649,6 @@ pub(crate) mod inference {
                 df.clone(),
                 models.clone(),
                 model_predict_request.model_name,
-                model_predict_request.lookback,
             );
             model_prediction_futures.push(prediction_future);
         }
@@ -689,7 +672,6 @@ pub(crate) mod inference {
         df: Arc<RwLock<DataFusion>>,
         models: Arc<RwLock<HashMap<String, Model>>>,
         model_name: String,
-        lookback: usize,
     ) -> PredictResponse {
         let start_time = Instant::now();
 
@@ -700,8 +682,7 @@ pub(crate) mod inference {
                 error_message: Some("App not found".to_string()),
                 model_name,
                 model_version: None,
-                lookback,
-                prediction: vec![],
+                prediction: None,
                 duration_ms: start_time.elapsed().as_millis(),
             };
         };
@@ -714,8 +695,7 @@ pub(crate) mod inference {
                 error_message: Some(format!("Model {model_name} not found")),
                 model_name,
                 model_version: None,
-                lookback,
-                prediction: vec![],
+                prediction: None,
                 duration_ms: start_time.elapsed().as_millis(),
             };
         };
@@ -728,13 +708,12 @@ pub(crate) mod inference {
                 error_message: Some(format!("Model {model_name} not found")),
                 model_name,
                 model_version: Some(model_version(&model.from)),
-                lookback,
-                prediction: vec![],
+                prediction: None,
                 duration_ms: start_time.elapsed().as_millis(),
             };
         };
 
-        match runnable.run(df.clone(), lookback).await {
+        match runnable.run(df.clone()).await {
             Ok(inference_result) => {
                 if let Some(column_data) = inference_result.column_by_name("y") {
                     if let Some(array) = column_data.as_any().downcast_ref::<Float32Array>() {
@@ -744,8 +723,7 @@ pub(crate) mod inference {
                             error_message: None,
                             model_name,
                             model_version: Some(model_version(&model.from)),
-                            lookback,
-                            prediction: result,
+                            prediction: Some(result),
                             duration_ms: start_time.elapsed().as_millis(),
                         };
                     }
@@ -760,8 +738,7 @@ pub(crate) mod inference {
                         ),
                         model_name,
                         model_version: Some(model_version(&model.from)),
-                        lookback,
-                        prediction: vec![],
+                        prediction: None,
                         duration_ms: start_time.elapsed().as_millis(),
                     };
                 }
@@ -775,8 +752,7 @@ pub(crate) mod inference {
                     ),
                     model_name,
                     model_version: Some(model_version(&model.from)),
-                    lookback,
-                    prediction: vec![],
+                    prediction: None,
                     duration_ms: start_time.elapsed().as_millis(),
                 }
             }
@@ -787,8 +763,7 @@ pub(crate) mod inference {
                     error_message: Some(e.to_string()),
                     model_name,
                     model_version: Some(model_version(&model.from)),
-                    lookback,
-                    prediction: vec![],
+                    prediction: None,
                     duration_ms: start_time.elapsed().as_millis(),
                 }
             }

@@ -1,13 +1,29 @@
+/*
+Copyright 2024 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 use std::any::Any;
 
 use arrow::datatypes::SchemaRef;
 use arrow_sql_gen::postgres::rows_to_arrow;
 use bb8_postgres::tokio_postgres::types::ToSql;
-use bb8_postgres::tokio_postgres::NoTls;
 use bb8_postgres::PostgresConnectionManager;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::memory::MemoryStream;
 use datafusion::sql::TableReference;
+use postgres_native_tls::MakeTlsConnector;
 use snafu::prelude::*;
 
 use super::AsyncDbConnection;
@@ -16,7 +32,7 @@ use super::Result;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to query: {source}"))]
+    #[snafu(display("{source}"))]
     QueryError {
         source: bb8_postgres::tokio_postgres::Error,
     },
@@ -28,12 +44,12 @@ pub enum Error {
 }
 
 pub struct PostgresConnection {
-    pub conn: bb8::PooledConnection<'static, PostgresConnectionManager<NoTls>>,
+    pub conn: bb8::PooledConnection<'static, PostgresConnectionManager<MakeTlsConnector>>,
 }
 
 impl<'a>
     DbConnection<
-        bb8::PooledConnection<'static, PostgresConnectionManager<NoTls>>,
+        bb8::PooledConnection<'static, PostgresConnectionManager<MakeTlsConnector>>,
         &'a (dyn ToSql + Sync),
     > for PostgresConnection
 {
@@ -49,7 +65,7 @@ impl<'a>
         &self,
     ) -> Option<
         &dyn AsyncDbConnection<
-            bb8::PooledConnection<'static, PostgresConnectionManager<NoTls>>,
+            bb8::PooledConnection<'static, PostgresConnectionManager<MakeTlsConnector>>,
             &'a (dyn ToSql + Sync),
         >,
     > {
@@ -60,11 +76,13 @@ impl<'a>
 #[async_trait::async_trait]
 impl<'a>
     AsyncDbConnection<
-        bb8::PooledConnection<'static, PostgresConnectionManager<NoTls>>,
+        bb8::PooledConnection<'static, PostgresConnectionManager<MakeTlsConnector>>,
         &'a (dyn ToSql + Sync),
     > for PostgresConnection
 {
-    fn new(conn: bb8::PooledConnection<'static, PostgresConnectionManager<NoTls>>) -> Self {
+    fn new(
+        conn: bb8::PooledConnection<'static, PostgresConnectionManager<MakeTlsConnector>>,
+    ) -> Self {
         PostgresConnection { conn }
     }
 

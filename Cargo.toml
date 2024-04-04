@@ -10,6 +10,7 @@ members = [
     "crates/arrow_sql_gen",
     "crates/sql_provider_datafusion",
     "crates/flightrepl",
+    "crates/ns_lookup",
     "tools/flightpublisher/",
     "tools/flightsubscriber/",
 ]
@@ -20,7 +21,7 @@ default-members = ["bin/spiced"]
 resolver = "2"
 
 [workspace.package]
-version = "0.9.1-alpha"
+version = "0.11.0-alpha"
 edition = "2021"
 rust-version = "1.75"
 license = "Apache-2.0"
@@ -40,7 +41,7 @@ metrics = "0.22.0"
 datafusion = "35.0.0"
 arrow = "50.0.0"
 arrow-flight = "50.0.0"
-duckdb = { git = "https://github.com/spicehq/duckdb-rs.git", rev = "4e1cf06070891088a78085bef0aaa57944c19c8d" }
+duckdb = { git = "https://github.com/duckdb/duckdb-rs.git", rev = "b82db396d116fc2dd9311802544610c0f2d06c34" }
 tonic = "0.10.2"
 futures = "0.3.30"
 r2d2 = "0.8.10"
@@ -48,5 +49,5 @@ async-stream = "0.3.5"
 async-trait = "0.1.77"
 bb8 = "0.8"
 bb8-postgres = "0.8"
-rusqlite = "0.31.0"
+rusqlite = { version = "0.31.0", features = ["bundled"] }
 tokio-rusqlite = "0.5.1"

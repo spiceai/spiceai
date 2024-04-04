@@ -1,3 +1,19 @@
+/*
+Copyright 2024 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 use std::convert;
 use std::sync::Arc;
 
@@ -5,6 +21,7 @@ use crate::arrow::map_data_type_to_array_builder_optional;
 use arrow::array::ArrayBuilder;
 use arrow::array::ArrayRef;
 use arrow::array::BooleanBuilder;
+use arrow::array::Date32Builder;
 use arrow::array::Decimal128Builder;
 use arrow::array::Float32Builder;
 use arrow::array::Float64Builder;
@@ -17,6 +34,7 @@ use arrow::array::RecordBatchOptions;
 use arrow::array::StringBuilder;
 use arrow::array::TimestampMillisecondBuilder;
 use arrow::datatypes::DataType;
+use arrow::datatypes::Date32Type;
 use arrow::datatypes::Field;
 use arrow::datatypes::Schema;
 use arrow::datatypes::TimeUnit;
@@ -50,6 +68,12 @@ pub enum Error {
         source: <u128 as convert::TryInto<i64>>::Error,
     },
 
+    #[snafu(display("Failed to get a row value for {pg_type}: {source}"))]
+    FailedToGetRowValue {
+        pg_type: Type,
+        source: tokio_postgres::Error,
+    },
+
     #[snafu(display("Failed to parse raw Postgres Bytes as BigDecimal: {:?}", bytes))]
     FailedToParseBigDecmialFromPostgres { bytes: Vec<u8> },
 
@@ -79,8 +103,14 @@ macro_rules! handle_primitive_type {
             }
             .fail();
         };
-        let v: $value_ty = $row.get($index);
-        builder.append_value(v);
+        let v: Option<$value_ty> = $row
+            .try_get($index)
+            .context(FailedToGetRowValueSnafu { pg_type: $type })?;
+
+        match v {
+            Some(v) => builder.append_value(v),
+            None => builder.append_null(),
+        }
     }};
 }
 
@@ -95,9 +125,16 @@ macro_rules! handle_primitive_array_type {
             }
             .fail();
         };
-        let v: Vec<$value_type> = $row.get($i);
-        let v = v.into_iter().map(Some);
-        builder.append_value(v);
+        let v: Option<Vec<$value_type>> = $row
+            .try_get($i)
+            .context(FailedToGetRowValueSnafu { pg_type: $type })?;
+        match v {
+            Some(v) => {
+                let v = v.into_iter().map(Some);
+                builder.append_value(v);
+            }
+            None => builder.append_null(),
+        }
     }};
 }
 
@@ -162,11 +199,36 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                 Type::TEXT => {
                     handle_primitive_type!(builder, Type::TEXT, StringBuilder, &str, row, i);
                 }
+                Type::VARCHAR => {
+                    handle_primitive_type!(builder, Type::VARCHAR, StringBuilder, &str, row, i);
+                }
+                Type::BPCHAR => {
+                    let Some(builder) = builder else {
+                        return NoBuilderForIndexSnafu { index: i }.fail();
+                    };
+                    let Some(builder) = builder.as_any_mut().downcast_mut::<StringBuilder>() else {
+                        return FailedToDowncastBuilderSnafu {
+                            postgres_type: format!("{postgres_type}"),
+                        }
+                        .fail();
+                    };
+                    let v: Option<&str> = row.try_get(i).context(FailedToGetRowValueSnafu {
+                        pg_type: Type::BPCHAR,
+                    })?;
+
+                    match v {
+                        Some(v) => builder.append_value(v.trim_end()),
+                        None => builder.append_null(),
+                    }
+                }
                 Type::BOOL => {
                     handle_primitive_type!(builder, Type::BOOL, BooleanBuilder, bool, row, i);
                 }
                 Type::NUMERIC => {
-                    let v: BigDecimalFromSql = row.get(i);
+                    let v: BigDecimalFromSql =
+                        row.try_get(i).context(FailedToGetRowValueSnafu {
+                            pg_type: Type::NUMERIC,
+                        })?;
                     let scale = v.scale();
 
                     let dec_builder = builder.get_or_insert_with(|| {
@@ -220,14 +282,44 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                         }
                         .fail();
                     };
-                    let v = row.get::<usize, SystemTime>(i);
+                    let v = row.try_get::<usize, Option<SystemTime>>(i).context(
+                        FailedToGetRowValueSnafu {
+                            pg_type: Type::TIMESTAMP,
+                        },
+                    )?;
 
-                    if let Ok(v) = v.duration_since(UNIX_EPOCH) {
-                        let timestamp: i64 = v
-                            .as_millis()
-                            .try_into()
-                            .context(FailedToConvertU128toI64Snafu)?;
-                        builder.append_value(timestamp);
+                    match v {
+                        Some(v) => {
+                            if let Ok(v) = v.duration_since(UNIX_EPOCH) {
+                                let timestamp: i64 = v
+                                    .as_millis()
+                                    .try_into()
+                                    .context(FailedToConvertU128toI64Snafu)?;
+                                builder.append_value(timestamp);
+                            }
+                        }
+                        None => builder.append_null(),
+                    }
+                }
+                Type::DATE => {
+                    let Some(builder) = builder else {
+                        return NoBuilderForIndexSnafu { index: i }.fail();
+                    };
+                    let Some(builder) = builder.as_any_mut().downcast_mut::<Date32Builder>() else {
+                        return FailedToDowncastBuilderSnafu {
+                            postgres_type: format!("{postgres_type}"),
+                        }
+                        .fail();
+                    };
+                    let v = row.try_get::<usize, Option<chrono::NaiveDate>>(i).context(
+                        FailedToGetRowValueSnafu {
+                            pg_type: Type::DATE,
+                        },
+                    )?;
+
+                    match v {
+                        Some(v) => builder.append_value(Date32Type::from_naive_date(v)),
+                        None => builder.append_null(),
                     }
                 }
                 Type::INT2_ARRAY => handle_primitive_array_type!(
@@ -311,12 +403,13 @@ fn map_column_type_to_data_type(column_type: &Type) -> Option<DataType> {
         Type::INT8 => Some(DataType::Int64),
         Type::FLOAT4 => Some(DataType::Float32),
         Type::FLOAT8 => Some(DataType::Float64),
-        Type::TEXT => Some(DataType::Utf8),
+        Type::TEXT | Type::VARCHAR | Type::BPCHAR => Some(DataType::Utf8),
         Type::BOOL => Some(DataType::Boolean),
         // Inspect the scale from the first row. Precision will always be 38 for Decimal128.
         Type::NUMERIC => None,
         // We get a SystemTime that we can always convert into milliseconds
         Type::TIMESTAMP => Some(DataType::Timestamp(TimeUnit::Millisecond, None)),
+        Type::DATE => Some(DataType::Date32),
         Type::INT2_ARRAY => Some(DataType::List(Arc::new(Field::new(
             "item",
             DataType::Int16,
@@ -371,6 +464,9 @@ impl BigDecimalFromSql {
     }
 }
 
+#[allow(clippy::cast_sign_loss)]
+#[allow(clippy::cast_possible_wrap)]
+#[allow(clippy::cast_possible_truncation)]
 impl<'a> FromSql<'a> for BigDecimalFromSql {
     fn from_sql(
         _ty: &Type,
@@ -380,15 +476,15 @@ impl<'a> FromSql<'a> for BigDecimalFromSql {
             .chunks(2)
             .map(|chunk| {
                 if chunk.len() == 2 {
-                    ((u16::from(chunk[0])) << 8) | (u16::from(chunk[1]))
+                    u16::from_be_bytes([chunk[0], chunk[1]])
                 } else {
-                    (u16::from(chunk[0])) << 8
+                    u16::from_be_bytes([chunk[0], 0])
                 }
             })
             .collect();
 
         let base_10_000_digit_count = raw_u16[0];
-        let weight = raw_u16[1];
+        let weight = raw_u16[1] as i16;
         let sign = raw_u16[2];
         let scale = raw_u16[3];
 
@@ -412,9 +508,9 @@ impl<'a> FromSql<'a> for BigDecimalFromSql {
         }
         u8_digits.reverse();
 
-        let base_10_000_digits_right_of_decimal = base_10_000_digit_count - weight - 1;
-        let implied_base_10_zeros = scale - (base_10_000_digits_right_of_decimal * 4);
-        u8_digits.resize(u8_digits.len() + implied_base_10_zeros as usize, 0);
+        let value_scale = 4 * (i64::from(base_10_000_digit_count) - i64::from(weight) - 1);
+        let size = i64::try_from(u8_digits.len())? + i64::from(scale) - value_scale;
+        u8_digits.resize(size as usize, 0);
 
         let sign = match sign {
             0x4000 => Sign::Minus,

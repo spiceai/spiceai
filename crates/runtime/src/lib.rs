@@ -1,3 +1,19 @@
+/*
+Copyright 2024 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 #![allow(clippy::missing_errors_doc)]
 
 use std::borrow::Borrow;
@@ -32,6 +48,7 @@ pub mod modelruntime;
 pub mod modelsource;
 mod opentelemetry;
 pub mod podswatcher;
+pub mod status;
 pub mod timing;
 pub(crate) mod tracers;
 
@@ -137,12 +154,14 @@ impl Runtime {
         let app_lock = self.app.read().await;
         if let Some(app) = app_lock.as_ref() {
             for ds in &app.datasets {
-                self.load_dataset(ds);
+                status::update_dataset(ds.name.clone(), status::ComponentStatus::Initializing);
+                self.load_dataset(ds, &app.datasets);
             }
         }
     }
 
-    pub fn load_dataset(&self, ds: &Dataset) {
+    // Caller must set `status::update_dataset(...` before calling `load_dataset`. This function will set error/ready statues appropriately.`
+    pub fn load_dataset(&self, ds: &Dataset, all_datasets: &[Dataset]) {
         let df = Arc::clone(&self.df);
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
         let shared_secrets_provider: Arc<RwLock<secrets::SecretsProvider>> =
@@ -150,9 +169,20 @@ impl Runtime {
 
         let ds = ds.clone();
 
+        let existing_tables = all_datasets
+            .iter()
+            .map(|d| d.name.clone())
+            .collect::<Vec<String>>();
+
         tokio::spawn(async move {
             loop {
                 let secrets_provider = shared_secrets_provider.read().await;
+
+                if !verify_dependent_tables(&ds, &existing_tables, Arc::clone(&df)).await {
+                    status::update_dataset(ds.name.clone(), status::ComponentStatus::Error);
+                    metrics::counter!("datasets_load_error").increment(1);
+                    return;
+                }
 
                 let source = ds.source();
 
@@ -167,6 +197,7 @@ impl Runtime {
                     {
                         Ok(data_connector) => data_connector,
                         Err(err) => {
+                            status::update_dataset(ds.name.clone(), status::ComponentStatus::Error);
                             metrics::counter!("datasets_load_error").increment(1);
                             warn_spaced!(
                                 spaced_tracer,
@@ -197,6 +228,7 @@ impl Runtime {
                 {
                     Ok(()) => (),
                     Err(err) => {
+                        status::update_dataset(ds.name.clone(), status::ComponentStatus::Error);
                         metrics::counter!("datasets_load_error").increment(1);
                         warn_spaced!(
                             spaced_tracer,
@@ -219,6 +251,7 @@ impl Runtime {
                     },
                 );
                 metrics::gauge!("datasets_count", "engine" => engine).increment(1.0);
+                status::update_dataset(ds.name.clone(), status::ComponentStatus::Ready);
                 break;
             }
         });
@@ -248,9 +281,10 @@ impl Runtime {
         metrics::gauge!("datasets_count", "engine" => engine).decrement(1.0);
     }
 
-    pub async fn update_dataset(&self, ds: &Dataset) {
+    pub async fn update_dataset(&self, ds: &Dataset, all_datasets: &[Dataset]) {
+        status::update_dataset(ds.name.clone(), status::ComponentStatus::Refreshing);
         self.remove_dataset(ds).await;
-        self.load_dataset(ds);
+        self.load_dataset(ds, all_datasets);
     }
 
     async fn get_dataconnector_from_source(
@@ -365,11 +399,13 @@ impl Runtime {
         let app_lock = self.app.read().await;
         if let Some(app) = app_lock.as_ref() {
             for model in &app.models {
+                status::update_model(model.name.clone(), status::ComponentStatus::Initializing);
                 self.load_model(model).await;
             }
         }
     }
 
+    // Caller must set `status::update_model(...` before calling `load_model`. This function will set error/ready statues appropriately.`
     pub async fn load_model(&self, m: &SpicepodModel) {
         measure_scope_ms!("load_model", "model" => m.name, "source" => model::source(&m.from));
         tracing::info!("Loading model [{}] from {}...", m.name, m.from);
@@ -391,9 +427,11 @@ impl Runtime {
                 model_map.insert(m.name.clone(), in_m);
                 tracing::info!("Model [{}] deployed, ready for inferencing", m.name);
                 metrics::gauge!("models_count", "model" => m.name.clone(), "source" => model::source(&m.from)).increment(1.0);
+                status::update_model(model.name.clone(), status::ComponentStatus::Ready);
             }
             Err(e) => {
                 metrics::counter!("models_load_error").increment(1);
+                status::update_model(model.name.clone(), status::ComponentStatus::Error);
                 tracing::warn!(
                     "Unable to load runnable model from spicepod {}, error: {}",
                     m.name,
@@ -418,6 +456,7 @@ impl Runtime {
     }
 
     pub async fn update_model(&self, m: &SpicepodModel) {
+        status::update_model(m.name.clone(), status::ComponentStatus::Refreshing);
         self.remove_model(m).await;
         self.load_model(m).await;
     }
@@ -468,10 +507,14 @@ impl Runtime {
                         current_app.datasets.iter().find(|d| d.name == ds.name)
                     {
                         if current_ds != ds {
-                            self.update_dataset(ds).await;
+                            self.update_dataset(ds, &new_app.datasets).await;
                         }
                     } else {
-                        self.load_dataset(ds);
+                        status::update_dataset(
+                            ds.name.clone(),
+                            status::ComponentStatus::Initializing,
+                        );
+                        self.load_dataset(ds, &new_app.datasets);
                     }
                 }
 
@@ -484,6 +527,10 @@ impl Runtime {
                             self.update_model(model).await;
                         }
                     } else {
+                        status::update_model(
+                            model.name.clone(),
+                            status::ComponentStatus::Initializing,
+                        );
                         self.load_model(model).await;
                     }
                 }
@@ -491,6 +538,7 @@ impl Runtime {
                 // Remove models that are no longer in the app
                 for model in &current_app.models {
                     if !new_app.models.iter().any(|m| m.name == model.name) {
+                        status::update_model(model.name.clone(), status::ComponentStatus::Disabled);
                         self.remove_model(model).await;
                     }
                 }
@@ -498,6 +546,7 @@ impl Runtime {
                 // Remove datasets that are no longer in the app
                 for ds in &current_app.datasets {
                     if !new_app.datasets.iter().any(|d| d.name == ds.name) {
+                        status::update_dataset(ds.name.clone(), status::ComponentStatus::Disabled);
                         self.remove_dataset(ds).await;
                     }
                 }
@@ -510,6 +559,41 @@ impl Runtime {
 
         Ok(())
     }
+}
+
+async fn verify_dependent_tables(
+    ds: &Dataset,
+    existing_tables: &[String],
+    df: Arc<RwLock<DataFusion>>,
+) -> bool {
+    if !ds.is_view() {
+        return true;
+    }
+
+    let dependent_tables = match df.read().await.get_view_dependent_tables(ds) {
+        Ok(tables) => tables,
+        Err(err) => {
+            tracing::error!(
+                "Failed to get dependent tables for view {}: {}",
+                &ds.name,
+                err
+            );
+            return false;
+        }
+    };
+
+    for tbl in &dependent_tables {
+        if !existing_tables.contains(tbl) {
+            tracing::error!(
+                "Failed to load {}. Dependent table {} not found",
+                &ds.name,
+                &tbl
+            );
+            return false;
+        }
+    }
+
+    true
 }
 
 fn has_table_provider(data_connector: &Option<Box<dyn DataConnector>>) -> bool {

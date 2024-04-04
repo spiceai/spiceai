@@ -1,3 +1,19 @@
+/*
+Copyright 2024 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -38,7 +54,11 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
     let channel = Channel::from_shared(repl_config.repl_flight_endpoint)?
         .connect()
         .await?;
-    let mut client = FlightServiceClient::new(channel);
+
+    // The encoder/decoder size is limited to 500MB.
+    let mut client = FlightServiceClient::new(channel)
+        .max_decoding_message_size(500 * 1024 * 1024)
+        .max_encoding_message_size(500 * 1024 * 1024);
 
     let mut rl = DefaultEditor::new()?;
 
@@ -66,7 +86,7 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
         if line.is_empty() {
             continue;
         }
-        match line {
+        let line = match line {
             ".exit" | "exit" | "quit" | "q" => break,
             ".error" => {
                 match last_error {
@@ -89,8 +109,11 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
                 println!("\nAny other line will be interpreted as a SQL query");
                 continue;
             }
-            _ => {}
-        }
+            "show tables" | "show tables;" => {
+                "select table_name from information_schema.tables where table_schema = 'public'"
+            }
+            _ => line,
+        };
 
         let _ = rl.add_history_entry(line);
 
@@ -136,10 +159,26 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
         let mut stream =
             FlightRecordBatchStream::new_from_flight_data(stream.map_err(FlightError::Tonic));
         let mut records = vec![];
+        let mut total_rows = 0;
         while let Some(data) = stream.next().await {
-            let data = data?;
-            records.push(data);
+            match data {
+                Ok(data) => {
+                    total_rows += data.num_rows();
+                    records.push(data);
+                }
+                Err(e) => {
+                    match e {
+                        FlightError::Tonic(e) => {
+                            display_grpc_error(&e);
+                            last_error = Some(e);
+                        }
+                        _ => println!("Error receiving data: {e}"),
+                    };
+                    break;
+                }
+            }
         }
+
         if records.is_empty() {
             println!("No data returned for query");
             continue;
@@ -151,14 +190,20 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
         let df = DataFrame::new(
             ctx.state(),
             LogicalPlanBuilder::scan(UNNAMED_TABLE, provider_as_source(Arc::new(provider)), None)?
+                .limit(0, Some(500))?
                 .build()?,
         );
+
+        let num_rows = df.clone().count().await?;
 
         if let Err(e) = df.show().await {
             println!("Error displaying results: {e}");
         };
         let elapsed = start_time.elapsed();
-        println!("\nQuery took: {} seconds", elapsed.as_secs_f64());
+        println!(
+            "\nQuery took: {} seconds. {num_rows}/{total_rows} rows displayed.",
+            elapsed.as_secs_f64()
+        );
         last_error = None;
     }
 
@@ -168,9 +213,9 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
 fn display_grpc_error(err: &Status) {
     let (error_type, user_err_msg) = match err.code() {
         Code::Ok => return,
-        Code::Unknown | Code::Internal | Code::Unauthenticated | Code::DataLoss | Code::OutOfRange | Code::FailedPrecondition =>
+        Code::Unknown | Code::Internal | Code::Unauthenticated | Code::DataLoss | Code::FailedPrecondition =>{
             ("Error", "An internal error occurred while processing the query. Show technical details with '.error'")
-        ,
+        },
         Code::InvalidArgument | Code::AlreadyExists | Code::NotFound => ("Query Error", err.message()),
         Code::Cancelled => ("Error", "The query was cancelled before it could complete."),
         Code::Aborted => ("Error", "The query was aborted before it could complete."),
@@ -179,6 +224,7 @@ fn display_grpc_error(err: &Status) {
         Code::ResourceExhausted => ("Error", "The query could not be completed because the server has run out of resources."),
         Code::Unimplemented => ("Error", "The query could not be completed because the server does not support the requested operation."),
         Code::Unavailable => ("Error", "The query could not be completed because the server is unavailable."),
+        Code::OutOfRange => ("Error", "The query could not be completed because the size limit of the query result was exceeded. Retry with `limit` clause."),
     };
 
     println!("{} {user_err_msg}", Colour::Red.paint(error_type));

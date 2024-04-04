@@ -1,3 +1,19 @@
+/*
+Copyright 2024 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 use async_trait::async_trait;
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::options::ParquetReadOptions;
@@ -99,6 +115,8 @@ impl DataConnector for S3 {
             if let Some(secret) = secret.get("secret") {
                 s3_builder = s3_builder.with_secret_access_key(secret);
             };
+        } else {
+            s3_builder = s3_builder.with_skip_signature(true);
         };
 
         let s3 = s3_builder
@@ -129,21 +147,22 @@ impl DataConnector for S3 {
         }
 
         Box::pin(async move {
-            if let Ok(df) = ctx
+            match ctx
                 .read_parquet(format!("s3:{path}"), ParquetReadOptions::default())
                 .await
             {
-                match df.collect().await {
-                    Ok(batches) => {
-                        return batches;
-                    }
+                Ok(df) => match df.collect().await {
+                    Ok(batches) => batches,
                     Err(e) => {
-                        tracing::error!("Failed to collect record batches from S3: {e}");
-                        return vec![];
+                        tracing::error!("Failed to retrieve data from S3: {e}");
+                        vec![]
                     }
+                },
+                Err(e) => {
+                    tracing::error!("Failed to read parquet from S3: {path}: {e}");
+                    vec![]
                 }
             }
-            vec![]
         })
     }
 

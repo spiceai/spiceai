@@ -14,6 +14,7 @@ spicepods
 
 *.parquet
 spicepod.yaml
+!test/tpch/tpch-spicepod/spicepod.yaml
 
 target/
 
@@ -41,3 +42,7 @@ venv_acknowledgements
 __pycache__
 venv
 .venv
+
+/test/tpch/tmp/
+/test/tpch/tpch-kit
+/test/tpch/tpch_queries.sql

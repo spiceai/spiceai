@@ -1,3 +1,19 @@
+/*
+Copyright 2024 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 use async_trait::async_trait;
 use data_components::{Read, Stream, Write};
 use datafusion::common::OwnedTableReference;
@@ -21,6 +37,7 @@ use secrets::Secret;
 use std::future::Future;
 
 use crate::dataupdate::{DataUpdate, UpdateType};
+use crate::status;
 use crate::timing::TimeMeasurement;
 use data_components::databricks::Databricks;
 
@@ -28,6 +45,7 @@ pub mod databricks;
 pub mod dremio;
 pub mod flight;
 pub mod flightsql;
+#[cfg(feature = "postgres")]
 pub mod postgres;
 pub mod s3;
 pub mod spiceai;
@@ -102,14 +120,13 @@ pub async fn create_new_connector(
 }
 
 pub async fn register_all() {
-    tokio::join!(
-        register_connector_factory("databricks", Databricks::create),
-        register_connector_factory("dremio", dremio::Dremio::create),
-        register_connector_factory("flightsql", flightsql::FlightSQL::create),
-        register_connector_factory("postgres", postgres::Postgres::create),
-        register_connector_factory("s3", s3::S3::create),
-        register_connector_factory("spiceai", spiceai::SpiceAI::create),
-    );
+    register_connector_factory("databricks", Databricks::create).await;
+    register_connector_factory("dremio", Dremio::create).await;
+    register_connector_factory("flightsql", flightsql::FlightSQL::create).await;
+    register_connector_factory("s3", s3::S3::create).await;
+    register_connector_factory("spiceai", spiceai::SpiceAI::create).await;
+    #[cfg(feature = "postgres")]
+    register_connector_factory("postgres", postgres::Postgres::create).await;
 }
 
 pub trait DataConnectorFactory {
@@ -125,7 +142,7 @@ pub trait DataConnectorFactory {
 /// If `stream_data_updates` is not supported for a dataset, the runtime will fall back to polling `get_all_data` and returning a
 /// `DataUpdate` that is constructed like:
 ///
-/// ```rust
+/// ```rust,ignore
 /// DataUpdate {
 ///    data: get_all_data(dataset),
 ///    update_type: UpdateType::Overwrite,
@@ -215,6 +232,7 @@ impl dyn DataConnector + '_ {
             return Box::pin(stream! {
                 loop {
                     tracing::info!("Refreshing data for {}", dataset.name);
+                    status::update_dataset(dataset.name.clone(), status::ComponentStatus::Refreshing);
                     let timer = TimeMeasurement::new("load_dataset_duration_ms", vec![("dataset", dataset.name.clone())]);
                     let all_data = match get_all_data(table_provider.as_ref()).await {
                         Ok(data) => data,
@@ -241,6 +259,7 @@ impl dyn DataConnector + '_ {
                 "load_dataset_duration_ms",
                 vec![("dataset", dataset.name.clone())],
             );
+            status::update_dataset(dataset.name.clone(), status::ComponentStatus::Refreshing);
             let all_data = match get_all_data(table_provider.as_ref()).await {
                 Ok(data) => data,
                 Err(e) => {
@@ -248,6 +267,7 @@ impl dyn DataConnector + '_ {
                     return Err(e);
                 }
             };
+            status::update_dataset(dataset.name.clone(), status::ComponentStatus::Ready);
             drop(timer);
 
             Ok(DataUpdate {

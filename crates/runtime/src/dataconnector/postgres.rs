@@ -1,13 +1,29 @@
+/*
+Copyright 2024 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 use arrow::array::RecordBatch;
 use async_trait::async_trait;
 use bb8_postgres::tokio_postgres::types::ToSql;
-use bb8_postgres::tokio_postgres::NoTls;
 use bb8_postgres::PostgresConnectionManager;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
 use db_connection_pool::postgrespool::PostgresConnectionPool;
 use db_connection_pool::DbConnectionPool;
 use futures::TryStreamExt;
+use postgres_native_tls::MakeTlsConnector;
 use secrets::Secret;
 use snafu::prelude::*;
 use spicepod::component::dataset::Dataset;
@@ -23,7 +39,7 @@ use super::{DataConnector, DataConnectorFactory};
 pub struct Postgres {
     pool: Arc<
         dyn DbConnectionPool<
-                bb8::PooledConnection<'static, PostgresConnectionManager<NoTls>>,
+                bb8::PooledConnection<'static, PostgresConnectionManager<MakeTlsConnector>>,
                 &'static (dyn ToSql + Sync),
             > + Send
             + Sync,
@@ -38,7 +54,7 @@ impl DataConnectorFactory for Postgres {
         Box::pin(async move {
             let pool: Arc<
                 dyn DbConnectionPool<
-                        bb8::PooledConnection<'static, PostgresConnectionManager<NoTls>>,
+                        bb8::PooledConnection<'static, PostgresConnectionManager<MakeTlsConnector>>,
                         &'static (dyn ToSql + Sync),
                     > + Send
                     + Sync,
@@ -81,7 +97,7 @@ impl DataConnector for Postgres {
             {
                 Ok(stream) => stream,
                 Err(e) => {
-                    tracing::error!("Failed to query Postgres: {e}");
+                    tracing::error!("{e}");
                     return vec![];
                 }
             };

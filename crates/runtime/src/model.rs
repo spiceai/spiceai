@@ -1,3 +1,19 @@
+/*
+Copyright 2024 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 use crate::modelruntime::ModelRuntime;
 use crate::modelruntime::Runnable;
 use crate::modelsource::create_source_from;
@@ -58,6 +74,7 @@ impl Model {
         params.insert("name".to_string(), model.name.to_string());
         params.insert("path".to_string(), path(&model.from));
         params.insert("from".to_string(), path(&model.from));
+        params.insert("files".to_string(), model.files.join(",").to_string());
 
         let tract = crate::modelruntime::tract::Tract {
             path: create_source_from(source)
@@ -77,11 +94,7 @@ impl Model {
         })
     }
 
-    pub async fn run(
-        &self,
-        df: Arc<RwLock<DataFusion>>,
-        lookback_size: usize,
-    ) -> Result<RecordBatch> {
+    pub async fn run(&self, df: Arc<RwLock<DataFusion>>) -> Result<RecordBatch> {
         let data = df
             .read()
             .await
@@ -98,10 +111,7 @@ impl Model {
             .await
             .context(UnableToQuerySnafu {})?;
 
-        let result = self
-            .runnable
-            .run(data, lookback_size)
-            .context(UnableToRunModelSnafu {})?;
+        let result = self.runnable.run(data).context(UnableToRunModelSnafu {})?;
 
         Ok(result)
     }
@@ -111,6 +121,7 @@ impl Model {
 pub(crate) fn source(from: &str) -> String {
     match from {
         s if s.starts_with("spiceai:") => "spiceai".to_string(),
+        s if s.starts_with("huggingface:") => "huggingface".to_string(),
         s if s.starts_with("file:/") => "localhost".to_string(),
         _ => "spiceai".to_string(),
     }

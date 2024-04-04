@@ -1,10 +1,30 @@
-use std::{collections::HashMap, sync::Arc};
+/*
+Copyright 2024 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+use std::{collections::HashMap, str::FromStr, sync::Arc};
 
 use async_trait::async_trait;
+use bb8::ErrorSink;
 use bb8_postgres::{
-    tokio_postgres::{types::ToSql, NoTls},
+    tokio_postgres::{config::Host, types::ToSql, Config},
     PostgresConnectionManager,
 };
+use native_tls::TlsConnector;
+use ns_lookup::verify_ns_lookup_and_tcp_connect;
+use postgres_native_tls::MakeTlsConnector;
 use secrets::Secret;
 use snafu::{prelude::*, ResultExt};
 
@@ -22,10 +42,13 @@ pub enum Error {
     ConnectionPoolRunError {
         source: bb8::RunError<bb8_postgres::tokio_postgres::Error>,
     },
+
+    #[snafu(display("Invalid port: {port}"))]
+    InvalidPortError { port: String },
 }
 
 pub struct PostgresConnectionPool {
-    pool: Arc<bb8::Pool<PostgresConnectionManager<NoTls>>>,
+    pool: Arc<bb8::Pool<PostgresConnectionManager<MakeTlsConnector>>>,
 }
 
 impl PostgresConnectionPool {
@@ -38,57 +61,122 @@ impl PostgresConnectionPool {
         params: Arc<Option<HashMap<String, String>>>,
         secret: Option<Secret>,
     ) -> Result<Self> {
-        let mut host = "localhost";
-        let mut user = "postgres";
-        let mut dbname = "postgres";
-        let mut connection_string = String::new();
+        let mut connection_string = "host=localhost user=postgres dbname=postgres".to_string();
+        let mut accept_invalid_certs = false;
 
         if let Some(params) = params.as_ref() {
-            if let Some(pg_host) = params.get("pg_host") {
-                host = pg_host;
-            }
-            if let Some(pg_user) = params.get("pg_user") {
-                user = pg_user;
-            }
-            if let Some(pg_db) = params.get("pg_db") {
-                dbname = pg_db;
-            }
-            if let Some(pg_pass) = get_pg_pass(params, secret) {
-                connection_string.push_str(format!("password={pg_pass} ").as_str());
-            }
-            if let Some(pg_port) = params.get("pg_port") {
-                connection_string.push_str(format!("port={pg_port} ").as_str());
+            connection_string = String::new();
+
+            if let Some(pg_connection_string) = get_secret_or_param(
+                params,
+                &secret,
+                "pg_connection_string_key",
+                "pg_connection_string",
+            ) {
+                connection_string.push_str(pg_connection_string.as_str());
+            } else {
+                if let Some(pg_host) = params.get("pg_host") {
+                    connection_string.push_str(format!("host={pg_host} ").as_str());
+                }
+                if let Some(pg_user) = params.get("pg_user") {
+                    connection_string.push_str(format!("user={pg_user} ").as_str());
+                }
+                if let Some(pg_db) = params.get("pg_db") {
+                    connection_string.push_str(format!("dbname={pg_db} ").as_str());
+                }
+                if let Some(pg_pass) =
+                    get_secret_or_param(params, &secret, "pg_pass_key", "pg_pass")
+                {
+                    connection_string.push_str(format!("password={pg_pass} ").as_str());
+                }
+                if let Some(pg_port) = params.get("pg_port") {
+                    connection_string.push_str(format!("port={pg_port} ").as_str());
+                }
+                if let Some(pg_sslmode) = params.get("pg_sslmode") {
+                    connection_string.push_str(format!("sslmode={pg_sslmode} ").as_str());
+                }
+                if let Some(pg_insecure) = params.get("pg_insecure") {
+                    accept_invalid_certs = pg_insecure == "true";
+                }
             }
         }
 
-        connection_string.push_str(format!("host={host} user={user} dbname={dbname}").as_str());
+        let config = Config::from_str(connection_string.as_str()).context(ConnectionPoolSnafu)?;
 
-        let manager = PostgresConnectionManager::new_from_stringlike(connection_string, NoTls)
-            .context(ConnectionPoolSnafu)?;
+        for host in config.get_hosts() {
+            for port in config.get_ports() {
+                if let Host::Tcp(host) = host {
+                    if let Err(e) = verify_ns_lookup_and_tcp_connect(host, *port).await {
+                        tracing::error!("{e}");
+                    }
+                }
+            }
+        }
+
+        let connector = TlsConnector::builder()
+            .danger_accept_invalid_certs(accept_invalid_certs)
+            .build()?;
+        let connector = MakeTlsConnector::new(connector);
+
+        let manager = PostgresConnectionManager::new(config, connector);
+        let error_sink = PostgresErrorSink::new();
 
         let pool = bb8::Pool::builder()
+            .error_sink(Box::new(error_sink))
             .build(manager)
             .await
             .context(ConnectionPoolSnafu)?;
+
         Ok(PostgresConnectionPool {
             pool: Arc::new(pool),
         })
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PostgresErrorSink {}
+
+impl PostgresErrorSink {
+    pub fn new() -> Self {
+        PostgresErrorSink {}
+    }
+}
+
+impl<E> ErrorSink<E> for PostgresErrorSink
+where
+    E: std::fmt::Debug,
+    E: std::fmt::Display,
+{
+    fn sink(&self, error: E) {
+        tracing::error!("Postgres Connection Error: {:?}", error);
+    }
+
+    fn boxed_clone(&self) -> Box<dyn ErrorSink<E>> {
+        Box::new(*self)
+    }
+}
+
 #[must_use]
 #[allow(clippy::implicit_hasher)]
-pub fn get_pg_pass(params: &HashMap<String, String>, secret: Option<Secret>) -> Option<String> {
-    if let Some(pg_pass_val) = params.get("pg_pass_key") {
-        if let Some(secrets) = secret {
-            if let Some(pg_pass_secret) = secrets.get(pg_pass_val) {
-                return Some(pg_pass_secret.to_string());
-            };
+pub fn get_secret_or_param(
+    params: &HashMap<String, String>,
+    secret: &Option<Secret>,
+    secret_param_key: &str,
+    param_key: &str,
+) -> Option<String> {
+    let pg_secret_param_val = match params.get(secret_param_key) {
+        Some(val) => val,
+        None => param_key,
+    };
+
+    if let Some(secrets) = secret {
+        if let Some(pg_secret_val) = secrets.get(pg_secret_param_val) {
+            return Some(pg_secret_val.to_string());
         };
     };
 
-    if let Some(pg_raw_pass) = params.get("pg_pass") {
-        return Some(pg_raw_pass.to_string());
+    if let Some(pg_param_val) = params.get(param_key) {
+        return Some(pg_param_val.to_string());
     };
 
     None
@@ -97,7 +185,7 @@ pub fn get_pg_pass(params: &HashMap<String, String>, secret: Option<Secret>) -> 
 #[async_trait]
 impl
     DbConnectionPool<
-        bb8::PooledConnection<'static, PostgresConnectionManager<NoTls>>,
+        bb8::PooledConnection<'static, PostgresConnectionManager<MakeTlsConnector>>,
         &'static (dyn ToSql + Sync),
     > for PostgresConnectionPool
 {
@@ -106,7 +194,7 @@ impl
     ) -> Result<
         Box<
             dyn DbConnection<
-                bb8::PooledConnection<'static, PostgresConnectionManager<NoTls>>,
+                bb8::PooledConnection<'static, PostgresConnectionManager<MakeTlsConnector>>,
                 &'static (dyn ToSql + Sync),
             >,
         >,

@@ -1,9 +1,25 @@
+/*
+Copyright 2024 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 use std::{collections::HashMap, mem, sync::Arc};
 
 use arrow::record_batch::RecordBatch;
 use arrow_sql_gen::statement::{CreateTableBuilder, InsertBuilder};
 use bb8_postgres::{
-    tokio_postgres::{types::ToSql, NoTls, Transaction},
+    tokio_postgres::{types::ToSql, Transaction},
     PostgresConnectionManager,
 };
 use datafusion::{execution::context::SessionContext, sql::TableReference};
@@ -11,6 +27,7 @@ use db_connection_pool::{
     dbconnection::postgresconn::PostgresConnection, postgrespool::PostgresConnectionPool,
     DbConnectionPool,
 };
+use postgres_native_tls::MakeTlsConnector;
 use secrets::Secret;
 use snafu::{prelude::*, ResultExt};
 use spicepod::component::dataset::Dataset;
@@ -62,7 +79,7 @@ pub struct PostgresBackend {
     name: String,
     pool: Arc<
         dyn DbConnectionPool<
-                bb8::PooledConnection<'static, PostgresConnectionManager<NoTls>>,
+                bb8::PooledConnection<'static, PostgresConnectionManager<MakeTlsConnector>>,
                 &'static (dyn ToSql + Sync),
             > + Send
             + Sync,
@@ -147,7 +164,7 @@ struct PostgresUpdate<'a> {
     update_type: UpdateType,
     pool: Arc<
         dyn DbConnectionPool<
-                bb8::PooledConnection<'static, PostgresConnectionManager<NoTls>>,
+                bb8::PooledConnection<'static, PostgresConnectionManager<MakeTlsConnector>>,
                 &'static (dyn ToSql + Sync),
             > + Send
             + Sync,

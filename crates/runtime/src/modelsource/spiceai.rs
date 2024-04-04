@@ -1,7 +1,25 @@
+/*
+Copyright 2024 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 pub struct SpiceAI {}
 
 use super::ModelSource;
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use snafu::prelude::*;
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -89,13 +107,13 @@ impl ModelSource for SpiceAI {
         }
 
         let client = reqwest::Client::new();
-        let data = client
-            .get(url.clone())
+        let data: ModelRoot = client
+            .get(url)
             .bearer_auth(secret.get("token").unwrap_or_default())
             .send()
             .await
             .context(super::UnableToFetchModelSnafu)?
-            .json::<HashMap<String, serde_json::value::Value>>()
+            .json()
             .await
             .context(super::UnableToFetchModelSnafu)?;
 
@@ -103,21 +121,20 @@ impl ModelSource for SpiceAI {
         // export url for now.
         // In future, we can use a proper static model response format to parse the body
         let download_url = data
-            .get("artifacts")
-            .ok_or(super::UnableToParseMetadataSnafu {}.build())?
-            .as_array()
-            .ok_or(super::UnableToParseMetadataSnafu {}.build())?
+            .artifacts
             .first()
-            .ok_or(super::UnableToParseMetadataSnafu {}.build())?
-            .as_object()
-            .ok_or(super::UnableToParseMetadataSnafu {}.build())?
-            .get("export_url")
-            .ok_or(super::UnableToParseMetadataSnafu {}.build())?
-            .as_str()
-            .ok_or(super::UnableToParseMetadataSnafu {}.build())?;
+            .context(super::UnableToParseMetadataSnafu)?
+            .export_url
+            .clone()
+            .context(super::UnableToParseMetadataSnafu {})?;
 
         let versioned_path = format!("{local_path}/{version}");
         let file_name = format!("{versioned_path}/model.onnx");
+
+        if std::fs::metadata(file_name.clone()).is_ok() {
+            tracing::debug!("File already exists: {file_name}, skipping download");
+            return Ok(file_name);
+        }
 
         let response = client
             .get(download_url)
@@ -133,4 +150,31 @@ impl ModelSource for SpiceAI {
 
         Ok(file_name)
     }
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+struct Artifact {
+    cid: String,
+    created_at: String,
+    r#type: String,
+    model_training_run_id: String,
+    export_url: Option<String>,
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+struct ModelRoot {
+    sha: String,
+    family: String,
+    name: String,
+    model_type: String,
+    epochs: u64,
+    training_entry_point: Option<String>,
+    training_query: String,
+    handler: Option<String>,
+    inference_entry_point: Option<String>,
+    inference_query: String,
+    lookback_size: u64,
+    forecast_size: u64,
+    metadata: serde_json::Map<String, Value>,
+    artifacts: Vec<Artifact>,
 }
