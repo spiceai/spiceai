@@ -18,15 +18,15 @@ use std::{convert, sync::Arc};
 
 use arrow::{
     array::{
-        ArrayBuilder, ArrayRef, BooleanBuilder, Float32Builder, Float64Builder, Int16Builder,
-        Int32Builder, Int64Builder, Int8Builder, NullBuilder, RecordBatch, RecordBatchOptions,
-        StringBuilder,
+        ArrayBuilder, ArrayRef, Float32Builder, Float64Builder, Int16Builder, Int32Builder,
+        Int64Builder, Int8Builder, NullBuilder, RecordBatch, RecordBatchOptions, StringBuilder,
+        UInt64Builder,
     },
     datatypes::{DataType, Field, Schema, TimeUnit},
 };
 use bigdecimal::BigDecimal;
-use mysql_async::{consts::ColumnType, Row};
-use snafu::Snafu;
+use mysql_async::{consts::ColumnType, Row, Value};
+use snafu::{ResultExt, Snafu};
 
 use crate::arrow::map_data_type_to_array_builder_optional;
 
@@ -54,7 +54,7 @@ pub enum Error {
     #[snafu(display("Failed to get a row value for {:?}: {}", mysql_type, source))]
     FailedToGetRowValue {
         mysql_type: ColumnType,
-        source: mysql_async::Error,
+        source: mysql_async::FromValueError,
     },
 
     #[snafu(display("Failed to parse raw Postgres Bytes as BigDecimal: {:?}", bytes))]
@@ -86,7 +86,10 @@ macro_rules! handle_primitive_type {
             }
             .fail();
         };
-        let v: Option<$value_ty> = $row.get($index);
+        let v = $row
+            .get_opt::<$value_ty, usize>($index)
+            .transpose()
+            .context(FailedToGetRowValueSnafu { mysql_type: $type })?;
 
         match v {
             Some(v) => builder.append_value(v),
@@ -125,7 +128,6 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
             let Some(builder) = arrow_columns_builders.get_mut(i) else {
                 return NoBuilderForIndexSnafu { index: i }.fail();
             };
-
             match *mysql_type {
                 ColumnType::MYSQL_TYPE_NULL => {
                     let Some(builder) = builder else {
@@ -140,14 +142,32 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                     builder.append_null();
                 }
                 ColumnType::MYSQL_TYPE_BIT => {
-                    handle_primitive_type!(
-                        builder,
-                        ColumnType::MYSQL_TYPE_BIT,
-                        BooleanBuilder,
-                        bool,
-                        row,
-                        i
-                    )
+                    let Some(builder) = builder else {
+                        return NoBuilderForIndexSnafu { index: i }.fail();
+                    };
+                    let Some(builder) = builder.as_any_mut().downcast_mut::<UInt64Builder>() else {
+                        return FailedToDowncastBuilderSnafu {
+                            mysql_type: format!("{:?}", mysql_type),
+                        }
+                        .fail();
+                    };
+                    let value = row.get_opt::<Value, usize>(i).transpose().context(
+                        FailedToGetRowValueSnafu {
+                            mysql_type: ColumnType::MYSQL_TYPE_BIT,
+                        },
+                    )?;
+                    match value {
+                        Some(Value::NULL) => builder.append_null(),
+                        Some(Value::Bytes(mut bytes)) => {
+                            while bytes.len() < 8 {
+                                bytes.insert(0, 0);
+                            }
+                            let mut array = [0u8; 8];
+                            array.copy_from_slice(&bytes);
+                            builder.append_value(u64::from_be_bytes(array));
+                        }
+                        _ => builder.append_null(),
+                    }
                 }
                 ColumnType::MYSQL_TYPE_TINY => {
                     handle_primitive_type!(
@@ -247,7 +267,7 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
 fn map_column_to_data_type(column_type: &ColumnType) -> Option<DataType> {
     match *column_type {
         ColumnType::MYSQL_TYPE_NULL => Some(DataType::Null),
-        ColumnType::MYSQL_TYPE_BIT => Some(DataType::Boolean),
+        ColumnType::MYSQL_TYPE_BIT => Some(DataType::UInt64),
         ColumnType::MYSQL_TYPE_TINY => Some(DataType::Int8),
         ColumnType::MYSQL_TYPE_SHORT => Some(DataType::Int16),
         ColumnType::MYSQL_TYPE_LONG => Some(DataType::Int32),
