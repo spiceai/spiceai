@@ -39,6 +39,12 @@ pub struct MySQLConnectionPool {
 }
 
 impl MySQLConnectionPool {
+    // Creates a new instance of `MySQLConnectionPool`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if there is a problem creating the connection pool.
+    #[allow(clippy::unused_async)]
     pub async fn new(
         params: Arc<Option<HashMap<String, String>>>,
         secret: Option<Secret>,

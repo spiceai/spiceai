@@ -98,6 +98,12 @@ macro_rules! handle_primitive_type {
     }};
 }
 
+/// Converts `MySQL` `Row`s to an Arrow `RecordBatch`. Assumes that all rows have the same schema and
+/// sets the schema based on the first row.
+///
+/// # Errors
+///
+/// Returns an error if there is a failure in converting the rows to a `RecordBatch`.
 #[allow(clippy::too_many_lines)]
 pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
     let mut arrow_fields: Vec<Option<Field>> = Vec::new();
@@ -106,11 +112,11 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
     let mut column_names: Vec<String> = Vec::new();
 
     if !rows.is_empty() {
-        let row = rows.first().unwrap();
-        for column in row.columns().into_iter() {
+        let row = &rows[0];
+        for column in row.columns().iter() {
             let column_name = column.name_str();
             let column_type = column.column_type();
-            let data_type = map_column_to_data_type(&column_type);
+            let data_type = map_column_to_data_type(column_type);
             arrow_fields.push(
                 data_type
                     .clone()
@@ -118,7 +124,7 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
             );
             arrow_columns_builders
                 .push(map_data_type_to_array_builder_optional(data_type.as_ref()));
-            mysql_types.push(column_type.clone());
+            mysql_types.push(column_type);
             column_names.push(column_name.to_string());
         }
     }
@@ -135,7 +141,7 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                     };
                     let Some(builder) = builder.as_any_mut().downcast_mut::<NullBuilder>() else {
                         return FailedToDowncastBuilderSnafu {
-                            mysql_type: format!("{:?}", mysql_type),
+                            mysql_type: format!("{mysql_type:?}"),
                         }
                         .fail();
                     };
@@ -147,7 +153,7 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                     };
                     let Some(builder) = builder.as_any_mut().downcast_mut::<UInt64Builder>() else {
                         return FailedToDowncastBuilderSnafu {
-                            mysql_type: format!("{:?}", mysql_type),
+                            mysql_type: format!("{mysql_type:?}"),
                         }
                         .fail();
                     };
@@ -157,7 +163,6 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                         },
                     )?;
                     match value {
-                        Some(Value::NULL) => builder.append_null(),
                         Some(Value::Bytes(mut bytes)) => {
                             while bytes.len() < 8 {
                                 bytes.insert(0, 0);
@@ -177,7 +182,7 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                         i8,
                         row,
                         i
-                    )
+                    );
                 }
                 ColumnType::MYSQL_TYPE_SHORT => {
                     handle_primitive_type!(
@@ -187,7 +192,7 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                         i16,
                         row,
                         i
-                    )
+                    );
                 }
                 ColumnType::MYSQL_TYPE_LONG => {
                     handle_primitive_type!(
@@ -197,7 +202,7 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                         i32,
                         row,
                         i
-                    )
+                    );
                 }
                 ColumnType::MYSQL_TYPE_LONGLONG => {
                     handle_primitive_type!(
@@ -207,7 +212,7 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                         i64,
                         row,
                         i
-                    )
+                    );
                 }
                 ColumnType::MYSQL_TYPE_FLOAT => {
                     handle_primitive_type!(
@@ -217,7 +222,7 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                         f32,
                         row,
                         i
-                    )
+                    );
                 }
                 ColumnType::MYSQL_TYPE_DOUBLE => {
                     handle_primitive_type!(
@@ -227,7 +232,7 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                         f64,
                         row,
                         i
-                    )
+                    );
                 }
                 ColumnType::MYSQL_TYPE_VARCHAR => {
                     handle_primitive_type!(
@@ -237,7 +242,7 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                         String,
                         row,
                         i
-                    )
+                    );
                 }
                 ColumnType::MYSQL_TYPE_VAR_STRING => {
                     handle_primitive_type!(
@@ -247,7 +252,7 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                         String,
                         row,
                         i
-                    )
+                    );
                 }
                 _ => unimplemented!("Unsupported column type {:?}", mysql_type),
             }
@@ -264,8 +269,9 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
         .map_err(|err| Error::FailedToBuildRecordBatch { source: err })
 }
 
-fn map_column_to_data_type(column_type: &ColumnType) -> Option<DataType> {
-    match *column_type {
+#[allow(clippy::unnecessary_wraps)]
+fn map_column_to_data_type(column_type: ColumnType) -> Option<DataType> {
+    match column_type {
         ColumnType::MYSQL_TYPE_NULL => Some(DataType::Null),
         ColumnType::MYSQL_TYPE_BIT => Some(DataType::UInt64),
         ColumnType::MYSQL_TYPE_TINY => Some(DataType::Int8),

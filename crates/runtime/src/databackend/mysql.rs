@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, mem, ops::DerefMut, sync::Arc};
+use std::{collections::HashMap, mem, sync::Arc};
 
 use arrow::array::RecordBatch;
 use arrow_sql_gen::statement::{CreateTableBuilder, InsertBuilder};
@@ -25,7 +25,7 @@ use db_connection_pool::{
 use futures::lock::Mutex;
 use mysql_async::{
     prelude::{Queryable, ToValue},
-    Params, Row, Transaction,
+    Params, Row, Transaction, TxOpts,
 };
 use secrets::Secret;
 use snafu::{prelude::*, ResultExt};
@@ -170,10 +170,10 @@ impl<'a> MySQLUpdate<'a> {
         };
 
         let mut transaction_conn = transaction_conn.conn.lock().await;
-        let transaction_conn = transaction_conn.deref_mut();
+        let transaction_conn = &mut *transaction_conn;
 
         let mut transaction = transaction_conn
-            .start_transaction(Default::default())
+            .start_transaction(TxOpts::default())
             .await
             .context(TransactionSnafu)?;
 
@@ -253,13 +253,13 @@ impl<'a> MySQLUpdate<'a> {
         );
         tracing::trace!("{sql}");
         let mut conn = mysql_conn.conn.lock().await;
-        let conn = conn.deref_mut();
+        let conn = &mut *conn;
 
         let Ok(row) = conn.exec(&sql, Params::Empty).await else {
             return false;
         };
         let row: Vec<Row> = row;
 
-        row.get(0).is_some()
+        row.first().is_some()
     }
 }

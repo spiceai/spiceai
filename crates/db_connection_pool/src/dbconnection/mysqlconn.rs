@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::ops::DerefMut;
 use std::{any::Any, sync::Arc};
 
 use arrow::datatypes::SchemaRef;
@@ -67,7 +66,7 @@ impl<'a> AsyncDbConnection<Conn, &'a (dyn ToValue + Sync)> for MySQLConnection {
 
     async fn get_schema(&self, table_reference: &TableReference) -> Result<SchemaRef> {
         let mut conn = self.conn.lock().await;
-        let conn = conn.deref_mut();
+        let conn = &mut *conn;
         let rows: Vec<Row> = conn
             .exec(
                 &format!("SELECT * FROM {table_reference} LIMIT 1"),
@@ -85,11 +84,11 @@ impl<'a> AsyncDbConnection<Conn, &'a (dyn ToValue + Sync)> for MySQLConnection {
         params: &[&'a (dyn ToValue + Sync)],
     ) -> Result<SendableRecordBatchStream> {
         let mut conn = self.conn.lock().await;
-        let conn = conn.deref_mut();
+        let conn = &mut *conn;
 
         let params_vec: Vec<_> = params.iter().map(|&p| p.to_value()).collect();
         let rows: Vec<Row> = conn
-            .exec(sql.replace(r#"""#, ""), Params::from(params_vec))
+            .exec(sql.replace('"', ""), Params::from(params_vec))
             .await
             .context(QuerySnafu)?;
         let rec = rows_to_arrow(&rows).context(ConversionSnafu)?;
@@ -100,7 +99,7 @@ impl<'a> AsyncDbConnection<Conn, &'a (dyn ToValue + Sync)> for MySQLConnection {
 
     async fn execute(&self, query: &str, params: &[&'a (dyn ToValue + Sync)]) -> Result<u64> {
         let mut conn = self.conn.lock().await;
-        let conn = conn.deref_mut();
+        let conn = &mut *conn;
         let params_vec: Vec<_> = params.iter().map(|&p| p.to_value()).collect();
         let _: Vec<Row> = conn
             .exec(query, Params::from(params_vec))
