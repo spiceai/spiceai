@@ -94,11 +94,7 @@ impl Model {
         })
     }
 
-    pub async fn run(
-        &self,
-        df: Arc<RwLock<DataFusion>>,
-        lookback_size: usize,
-    ) -> Result<RecordBatch> {
+    pub async fn run(&self, df: Arc<RwLock<DataFusion>>) -> Result<RecordBatch> {
         let data = df
             .read()
             .await
@@ -115,10 +111,7 @@ impl Model {
             .await
             .context(UnableToQuerySnafu {})?;
 
-        let result = self
-            .runnable
-            .run(data, lookback_size)
-            .context(UnableToRunModelSnafu {})?;
+        let result = self.runnable.run(data).context(UnableToRunModelSnafu {})?;
 
         Ok(result)
     }
