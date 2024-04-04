@@ -26,7 +26,7 @@ pub type Error = Box<dyn std::error::Error + Send + Sync>;
 /// Implementing `run` is required. It takes a `Vec<RecordBatch>` and returns a arrow `RecordBatch`
 pub trait Runnable: Send + Sync {
     // Run inference with the input and loaded model
-    fn run(&self, input: Vec<RecordBatch>, loopback_size: usize) -> Result<RecordBatch, Error>;
+    fn run(&self, input: Vec<RecordBatch>) -> Result<RecordBatch, Error>;
 }
 
 /// A `ModelRuntime` loads a model into it supported `ModelFormat`.
