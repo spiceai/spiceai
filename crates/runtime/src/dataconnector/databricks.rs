@@ -157,6 +157,8 @@ async fn get_table_provider(
     Ok(Arc::new(delta_table))
 }
 
+const DEFAULT_TIMEOUT: &str = "300s";
+
 async fn get_delta_table(
     secret: &Arc<Option<Secret>>,
     params: &Arc<Option<HashMap<String, String>>>,
@@ -184,6 +186,8 @@ async fn get_delta_table(
 
     if let Some(timeout) = timeout {
         storage_options.insert("timeout".to_string(), timeout);
+    } else {
+        storage_options.insert("timeout".to_string(), DEFAULT_TIMEOUT.to_string());
     }
 
     let delta_table = open_table_with_storage_options(table_uri, storage_options)
