@@ -38,6 +38,7 @@ use super::{DataConnector, DataConnectorFactory};
 #[derive(Clone)]
 pub struct Databricks {
     secret: Arc<Option<Secret>>,
+    params: Arc<Option<HashMap<String, String>>>,
 }
 
 impl DataConnectorFactory for Databricks {
@@ -51,6 +52,7 @@ impl DataConnectorFactory for Databricks {
 
         let databricks = Self {
             secret: Arc::new(secret),
+            params: params.clone(),
         };
 
         Box::pin(async move {
@@ -79,10 +81,11 @@ impl DataConnector for Databricks {
     ) -> Pin<Box<dyn Future<Output = Vec<arrow::record_batch::RecordBatch>> + Send>> {
         let dataset = dataset.clone();
         let secret = Arc::clone(&self.secret);
+        let params = Arc::clone(&self.params);
         Box::pin(async move {
             let ctx = SessionContext::new();
 
-            let table_provider = match get_table_provider(&secret, &dataset).await {
+            let table_provider = match get_table_provider(&secret, &params, &dataset).await {
                 Ok(provider) => provider,
                 Err(e) => {
                     tracing::error!("Failed to get table provider: {}", e);
@@ -117,7 +120,7 @@ impl DataConnector for Databricks {
         &self,
         dataset: &Dataset,
     ) -> std::result::Result<Arc<dyn datafusion::datasource::TableProvider>, super::Error> {
-        get_table_provider(&self.secret, dataset).await
+        get_table_provider(&self.secret, &self.params, dataset).await
     }
 
     fn get_data_publisher(&self) -> Option<Box<dyn DataPublisher>> {
@@ -128,7 +131,7 @@ impl DataConnector for Databricks {
 impl DataPublisher for Databricks {
     fn add_data(&self, dataset: Arc<Dataset>, data_update: DataUpdate) -> AddDataResult {
         Box::pin(async move {
-            let delta_table = get_delta_table(&self.secret, &dataset).await?;
+            let delta_table = get_delta_table(&self.secret, &self.params, &dataset).await?;
 
             let _ = DeltaOps(delta_table)
                 .write(data_update.data)
@@ -146,15 +149,17 @@ impl DataPublisher for Databricks {
 
 async fn get_table_provider(
     secret: &Arc<Option<Secret>>,
+    params: &Arc<Option<HashMap<String, String>>>,
     dataset: &Dataset,
 ) -> std::result::Result<Arc<dyn datafusion::datasource::TableProvider>, super::Error> {
-    let delta_table: deltalake::DeltaTable = get_delta_table(secret, dataset).await?;
+    let delta_table: deltalake::DeltaTable = get_delta_table(secret, params, dataset).await?;
 
     Ok(Arc::new(delta_table))
 }
 
 async fn get_delta_table(
     secret: &Arc<Option<Secret>>,
+    params: &Arc<Option<HashMap<String, String>>>,
     dataset: &Dataset,
 ) -> std::result::Result<deltalake::DeltaTable, super::Error> {
     let table_uri = resolve_table_uri(dataset, secret)
@@ -171,6 +176,15 @@ async fn get_delta_table(
         }
     };
     storage_options.insert(AWS_S3_ALLOW_UNSAFE_RENAME.to_string(), "true".to_string());
+
+    let timeout: Option<String> = params
+        .as_ref() // &Option<HashMap<String, String>>
+        .as_ref() // Option<&HashMap<String, String>>
+        .and_then(|params| params.get("timeout").cloned());
+
+    if let Some(timeout) = timeout {
+        storage_options.insert("timeout".to_string(), timeout);
+    }
 
     let delta_table = open_table_with_storage_options(table_uri, storage_options)
         .await
