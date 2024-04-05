@@ -159,9 +159,8 @@ impl MetricsService for Service {
                                 let data_publishers = data_publishers.read().await;
                                 for publisher in data_publishers.iter() {
                                     tracing::trace!(
-                                        "Adding OpenTelemetry data for {} to publisher {}",
-                                        metric.name.as_str(),
-                                        publisher.name()
+                                        "Adding OpenTelemetry data for {}",
+                                        metric.name.as_str()
                                     );
                                     // We need to await the Future here in case it adds new columns to the schema and later metrics will need
                                     // to respect that schema.

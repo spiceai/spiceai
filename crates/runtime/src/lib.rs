@@ -209,14 +209,6 @@ impl Runtime {
                         }
                     };
 
-                if ds.acceleration.is_none()
-                    && !ds.is_view()
-                    && !has_table_provider(&data_connector)
-                {
-                    tracing::warn!("No acceleration specified for dataset: {}", ds.name);
-                    break;
-                };
-
                 match Runtime::initialize_dataconnector(
                     data_connector,
                     Arc::clone(&df),
@@ -332,7 +324,7 @@ impl Runtime {
             if let Some(data_connector) = data_connector {
                 df.read()
                     .await
-                    .attach_mesh(ds, data_connector)
+                    .attach_federated_table(ds, data_connector)
                     .await
                     .context(UnableToAttachDataConnectorSnafu {
                         data_connector: source,
@@ -364,7 +356,7 @@ impl Runtime {
 
             // Attach data publisher only if replicate is true and mode is ReadWrite
             if replicate && ds.mode() == Mode::ReadWrite {
-                if let Some(data_publisher) = data_connector.get_data_publisher() {
+                if let Some(write_provider) = data_connector.write_provider() {
                     df.write()
                         .await
                         .attach_publisher(&ds.name.clone(), ds.clone(), Arc::new(data_publisher))
@@ -594,13 +586,6 @@ async fn verify_dependent_tables(
     }
 
     true
-}
-
-fn has_table_provider(data_connector: &Option<Box<dyn DataConnector>>) -> bool {
-    data_connector.is_some()
-        && data_connector
-            .as_ref()
-            .is_some_and(|dc| dc.has_table_provider())
 }
 
 async fn shutdown_signal() {

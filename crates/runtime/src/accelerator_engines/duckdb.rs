@@ -155,13 +155,9 @@ impl DuckDBBackend {
             return Ok(());
         }
 
-        let table = match SqlTable::new(&self.pool, TableReference::bare(self.name.clone()))
+        let table = SqlTable::new(&self.pool, TableReference::bare(self.name.clone()))
             .await
-            .context(DuckDBDataFusionSnafu)
-        {
-            Ok(table) => table,
-            Err(e) => return Err(e),
-        };
+            .context(DuckDBDataFusionSnafu)?;
 
         self.ctx
             .register_table(&self.name, Arc::new(table))

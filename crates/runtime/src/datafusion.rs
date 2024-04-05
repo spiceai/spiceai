@@ -24,8 +24,7 @@ use crate::dataconnector::DataConnector;
 use crate::datapublisher::DataPublisher;
 use datafusion::datasource::ViewTable;
 use datafusion::error::DataFusionError;
-use datafusion::execution::context::SessionConfig;
-use datafusion::execution::{context::SessionContext, options::ParquetReadOptions};
+use datafusion::execution::context::{SessionConfig, SessionContext};
 use datafusion::sql::parser;
 use datafusion::sql::parser::DFParser;
 use datafusion::sql::sqlparser;
@@ -105,6 +104,11 @@ type PublisherList = Arc<RwLock<Vec<Arc<Box<dyn DataPublisher>>>>>;
 
 type DatasetAndPublishers = (Arc<Dataset>, PublisherList);
 
+pub(crate) enum Table {
+    Accelerated(Arc<Box<dyn DataPublisher>>),
+    Federated(Arc<dyn DataConnector>),
+}
+
 pub struct DataFusion {
     pub ctx: Arc<SessionContext>,
     connectors_tasks: HashMap<String, task::JoinHandle<()>>,
@@ -121,13 +125,6 @@ impl DataFusion {
             connectors_tasks: HashMap::new(),
             data_publishers: HashMap::new(),
         }
-    }
-
-    pub async fn register_parquet(&self, table_name: &str, path: &str) -> Result<()> {
-        self.ctx
-            .register_parquet(table_name, path, ParquetReadOptions::default())
-            .await
-            .context(RegisterParquetSnafu { file: path })
     }
 
     pub async fn attach_publisher(
@@ -271,8 +268,9 @@ impl DataFusion {
         Ok(())
     }
 
+    /// Federated tables are attached directly as tables visible in the public DataFusion context.
     #[allow(clippy::needless_pass_by_value)]
-    pub async fn attach_mesh(
+    pub async fn attach_federated_table(
         &self,
         dataset: impl Borrow<Dataset>,
         data_connector: Box<dyn DataConnector>,
@@ -295,7 +293,10 @@ impl DataFusion {
             return TableAlreadyExistsSnafu.fail();
         }
 
-        let provider = data_connector.get_table_provider(dataset).await;
+        let provider = data_connector
+            .read_provider()
+            .table_provider(dataset.name.into())
+            .await;
 
         match provider {
             Ok(provider) => {
@@ -304,7 +305,9 @@ impl DataFusion {
                     .register_table(dataset.name.as_str(), Arc::clone(&provider));
                 Ok(())
             }
-            Err(error) => Err(Error::UnableToRegisterTable { source: error }),
+            Err(error) => Err(Error::UnableToRegisterTable {
+                source: error.into(),
+            }),
         }
     }
 
