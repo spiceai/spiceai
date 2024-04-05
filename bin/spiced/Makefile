@@ -12,6 +12,10 @@ else
 	TARGET_DIR := ../../target
 endif
 
+ifdef SPICED_CUSTOM_FEATURES
+	CUSTOM_FEATURES := --no-default-features --features "$(SPICED_CUSTOM_FEATURES)"
+endif
+
 .PHONY: all
 all:
-	cargo build --release $(SPICED_FEATURES) --target-dir $(TARGET_DIR)
+	cargo build --release $(SPICED_FEATURES) --target-dir $(TARGET_DIR) $(CUSTOM_FEATURES)
