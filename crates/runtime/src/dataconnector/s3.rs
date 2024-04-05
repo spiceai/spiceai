@@ -18,7 +18,6 @@ use async_trait::async_trait;
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::options::ParquetReadOptions;
 use object_store::aws::AmazonS3Builder;
-use object_store::ClientOptions;
 use secrets::Secret;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -108,13 +107,6 @@ impl DataConnector for S3 {
         }
         if let Some(endpoint) = self.params.get("endpoint") {
             s3_builder = s3_builder.with_endpoint(endpoint);
-        }
-        if let Some(timeout) = self.params.get("timeout") {
-            if let Ok(parse) = timeout.parse() {
-                s3_builder = s3_builder.with_client_options(
-                    ClientOptions::default().with_timeout(std::time::Duration::from_secs(parse)),
-                );
-            }
         }
         if let Some(secret) = &self.secret {
             if let Some(key) = secret.get("key") {
