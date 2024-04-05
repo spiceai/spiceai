@@ -29,7 +29,9 @@ bigdecimal = "0.4.3"
 tokio.workspace = true
 rusqlite = { workspace = true, optional = true }
 chrono = "0.4.35"
+mysql_async = { workspace = true, optional = true }
 
 [features]
 sqlite = ["dep:rusqlite"]
 postgres = ["dep:tokio-postgres"]
+mysql = ["dep:mysql_async"]

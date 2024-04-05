@@ -21,6 +21,8 @@ use spicepod::component::dataset::acceleration;
 pub mod dbconnection;
 #[cfg(feature = "duckdb")]
 pub mod duckdbpool;
+#[cfg(feature = "mysql")]
+pub mod mysqlpool;
 #[cfg(feature = "postgres")]
 pub mod postgrespool;
 #[cfg(feature = "sqlite")]
