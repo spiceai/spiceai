@@ -31,26 +31,22 @@ pub enum Error {
 type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct DeltaTableWriter {
-    schema: SchemaRef,
+    read_provider: Arc<dyn TableProvider>,
     delta_table: DeltaTable,
 }
 
 impl DeltaTableWriter {
     #[allow(clippy::needless_pass_by_value)]
-    pub fn create(delta_table: Arc<dyn TableProvider>) -> Result<Arc<dyn TableProvider>> {
-        let delta_table = delta_table
+    pub fn create(
+        delta_table_read_provider: Arc<dyn TableProvider>,
+    ) -> Result<Arc<dyn TableProvider>> {
+        let delta_table = delta_table_read_provider
             .as_any()
             .downcast_ref::<DeltaTable>()
             .ok_or(Error::NotADeltaTable {})?;
 
-        let schema = delta_table
-            .state
-            .as_ref()
-            .ok_or(Error::FailedToGetDeltaLakeState {})?
-            .arrow_schema()
-            .context(FailedToGetDeltaLakeSchemaSnafu {})?;
         Ok(Arc::new(Self {
-            schema,
+            read_provider: Arc::clone(&delta_table_read_provider),
             delta_table: delta_table.clone(),
         }) as _)
     }
@@ -63,7 +59,7 @@ impl TableProvider for DeltaTableWriter {
     }
 
     fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.schema)
+        self.read_provider.schema()
     }
 
     fn table_type(&self) -> TableType {
@@ -72,12 +68,14 @@ impl TableProvider for DeltaTableWriter {
 
     async fn scan(
         &self,
-        _state: &SessionState,
-        _projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
-        _limit: Option<usize>,
+        state: &SessionState,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        unimplemented!("DeltaTableWriter does not support scan")
+        self.read_provider
+            .scan(state, projection, filters, limit)
+            .await
     }
 
     async fn insert_into(
@@ -89,7 +87,7 @@ impl TableProvider for DeltaTableWriter {
         Ok(Arc::new(FileSinkExec::new(
             input,
             Arc::new(DeltaTableDataSink::new(self.delta_table.clone(), overwrite)),
-            Arc::clone(&self.schema),
+            self.schema(),
             None,
         )) as _)
     }

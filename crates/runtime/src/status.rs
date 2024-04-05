@@ -41,10 +41,10 @@ impl Display for ComponentStatus {
     }
 }
 
-pub fn update_dataset(ds_name: String, status: ComponentStatus) {
+pub fn update_dataset(ds_name: &str, status: ComponentStatus) {
     gauge!("dataset/status", "dataset" => ds_name).set(f64::from(status as u32));
 }
 
-pub fn update_model(model_name: String, status: ComponentStatus) {
+pub fn update_model(model_name: &str, status: ComponentStatus) {
     gauge!("model/status", "model" => model_name).set(f64::from(status as u32));
 }

@@ -4,6 +4,7 @@ use std::{error::Error, sync::Arc};
 use async_trait::async_trait;
 use datafusion::{common::OwnedTableReference, datasource::TableProvider};
 
+pub mod arrow;
 pub mod databricks;
 
 #[async_trait]
@@ -15,7 +16,7 @@ pub trait Read {
 }
 
 #[async_trait]
-pub trait Write: Send + Sync {
+pub trait ReadWrite: Send + Sync {
     async fn table_provider(
         &self,
         table_reference: OwnedTableReference,

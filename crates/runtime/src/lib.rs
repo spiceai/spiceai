@@ -34,8 +34,9 @@ use tokio::time::sleep;
 use tokio::{signal, sync::RwLock};
 
 use crate::{dataconnector::DataConnector, datafusion::DataFusion};
-pub mod accelerator_engines;
+mod accelerated_table;
 pub mod config;
+pub mod dataaccelerator;
 pub mod dataconnector;
 pub mod datafusion;
 pub mod datapublisher;
@@ -160,7 +161,7 @@ impl Runtime {
         }
     }
 
-    // Caller must set `status::update_dataset(...` before calling `load_dataset`. This function will set error/ready statues appropriately.`
+    // Caller must set `status::update_dataset(...` before calling `load_dataset`. This function will set error/ready statuses appropriately.`
     pub fn load_dataset(&self, ds: &Dataset, all_datasets: &[Dataset]) {
         let df = Arc::clone(&self.df);
         let spaced_tracer = Arc::clone(&self.spaced_tracer);

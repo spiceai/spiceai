@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
-use data_components::{Read, Write};
+use data_components::{Read, ReadWrite};
 use ns_lookup::verify_endpoint_connection;
 use secrets::Secret;
 use std::any::Any;
@@ -62,7 +62,7 @@ impl DataConnector for Databricks {
         self
     }
 
-    fn write_provider(&self) -> Option<&dyn Write> {
+    fn write_provider(&self) -> Option<&dyn ReadWrite> {
         Some(self)
     }
 }

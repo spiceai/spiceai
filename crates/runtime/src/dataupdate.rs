@@ -14,7 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use arrow::record_batch::RecordBatch;
+use std::{any::Any, fmt, sync::Arc};
+
+use arrow::{datatypes::SchemaRef, record_batch::RecordBatch};
+use datafusion::error::Result as DataFusionResult;
+use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan};
+use futures::stream;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum UpdateType {
@@ -24,9 +31,74 @@ pub enum UpdateType {
 
 #[derive(Debug, Clone)]
 pub struct DataUpdate {
+    pub schema: SchemaRef,
     pub data: Vec<RecordBatch>,
     /// The type of update to perform.
     /// If UpdateType::Append, the runtime will append the data to the existing dataset.
     /// If UpdateType::Overwrite, the runtime will overwrite the existing data with the new data.
     pub update_type: UpdateType,
+}
+
+pub struct DataUpdateExecutionPlan {
+    pub data_update: DataUpdate,
+}
+
+impl DataUpdateExecutionPlan {
+    pub fn new(data_update: DataUpdate) -> Self {
+        Self { data_update }
+    }
+}
+
+impl std::fmt::Debug for DataUpdateExecutionPlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "DataUpdateExecutionPlan")
+    }
+}
+
+impl DisplayAs for DataUpdateExecutionPlan {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> std::fmt::Result {
+        write!(f, "DataUpdateExecutionPlan")
+    }
+}
+
+impl ExecutionPlan for DataUpdateExecutionPlan {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        self.data_update.schema
+    }
+
+    fn output_partitioning(&self) -> datafusion::physical_plan::Partitioning {
+        datafusion::physical_plan::Partitioning::UnknownPartitioning(1)
+    }
+
+    fn output_ordering(&self) -> Option<&[datafusion::physical_expr::PhysicalSortExpr]> {
+        None
+    }
+
+    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        Ok(self)
+    }
+
+    fn execute(
+        &self,
+        _partition: usize,
+        _context: Arc<TaskContext>,
+    ) -> DataFusionResult<SendableRecordBatchStream> {
+        let stream_adapter = RecordBatchStreamAdapter::new(
+            self.schema(),
+            stream::iter(self.data_update.data.into_iter().map(Ok)),
+        );
+
+        Ok(Box::pin(stream_adapter))
+    }
 }

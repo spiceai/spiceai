@@ -6,7 +6,7 @@ use secrets::{ExposeSecret, Secret};
 use serde::Deserialize;
 use std::{collections::HashMap, error::Error, sync::Arc};
 
-use crate::{Read, Write};
+use crate::{Read, ReadWrite};
 
 use self::write::DeltaTableWriter;
 
@@ -41,7 +41,7 @@ impl Read for Databricks {
 }
 
 #[async_trait]
-impl Write for Databricks {
+impl ReadWrite for Databricks {
     async fn table_provider(
         &self,
         table_reference: OwnedTableReference,
