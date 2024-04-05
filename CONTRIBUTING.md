@@ -62,9 +62,15 @@ Spice.ai takes security and our users' trust very seriously. If you believe you 
 
 - Third-party code must include licenses.
 
-## Setting up your development environment
+## Building
 
-### MacOS
+`spiceai` consists of two main binaries. `spiced` is the runtime daemon written in Rust.
+`spice` is the command line interface for end users written in go. All targets can
+be built from Makefiles.
+
+### Setting up your development environment
+
+#### MacOS
 
 ```bash
 # Install Xcode Command Line Tools
@@ -99,7 +105,7 @@ spice init test-app
 spice run
 ```
 
-### VSCode Configuration
+#### VSCode Configuration
 
 To configure VSCode to automatically apply the rustfmt style on save and to use the same Clippy rules we enforce in our CI as the default, add the following in your User Settings JSON file:
 
@@ -120,5 +126,47 @@ By default, `rust-analyzer` will attempt to rebuild all dependencies when a chan
 ```
 
 To see all valid values use `rustc --print target-list`.
+
+### Build Options
+
+`spiced` is the default-member of the [Cargo workspace crate](https://doc.rust-lang.org/cargo/reference/workspaces.html).
+Its manifests should allow custom builds where heavy dependencies are optional.
+
+Other workspace crates shouldn't include large features by default. This makes excluding features less error prone.
+Alternatively, crates that depend on those workspace crates need to set `default-features = false`.
+
+For example, to support a newly popular database called `newdb`, add it by default to `bin/Cargo.toml`:
+
+```diff
+ [features]
+-default = ["duckdb", "postgres", "sqlite", "mysql"]
++default = ["duckdb", "postgres", "sqlite", "mysql", "newdb"]
+```
+
+Next, create the same feature in crates that implement a `newdb` connector or dataset:
+
+```toml
+newdb = ["runtime/newdb", "spicepod/newdb", "app/newdb"]
+````
+
+Include external dependencies optionally and with `dep:` prefix in `features`:
+
+```toml
+newdb = [
+    "dep:newdb-tokio",
+    "db_connection_pool/newdb",
+    ...
+]
+```
+
+Finally, tag code and module imports with `#[cfg(feature = "newdb")]`.
+To build `spiced` with only `newdb` and some other desired features:
+
+```
+SPICED_CUSTOM_FEATURES="newdb postgres" make build-runtime
+```
+
+Ideally none or few unused code warnings should be emitted. If not, consider refactorings.
+
 
 **Thank You!** - Your contributions to open source, large or small, make projects like this possible. Thank you for taking the time to contribute.
