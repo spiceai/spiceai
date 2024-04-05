@@ -64,7 +64,7 @@ Spice.ai takes security and our users' trust very seriously. If you believe you 
 
 ## Building
 
-`spiceai` consists of two main binaries. `spiced` is the runtime deamon written in Rust.
+`spiceai` consists of two main binaries. `spiced` is the runtime daemon written in Rust.
 `spice` is the command line interface for end users written in go. All targets can
 be built from Makefiles.
 
