@@ -17,7 +17,7 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
-use mysql_async::prelude::ToValue;
+use mysql_async::{prelude::ToValue, SslOpts};
 use secrets::Secret;
 use snafu::{ResultExt, Snafu};
 
@@ -32,6 +32,9 @@ pub enum Error {
 
     #[snafu(display("ConnectionPoolRunError: {source}"))]
     ConnectionPoolRunError { source: mysql_async::Error },
+
+    #[snafu(display("Invalid parameter: {parameter_name}"))]
+    InvalidParameterError { parameter_name: String },
 }
 
 pub struct MySQLConnectionPool {
@@ -50,6 +53,7 @@ impl MySQLConnectionPool {
         secret: Option<Secret>,
     ) -> Result<Self> {
         let mut connection_string = mysql_async::OptsBuilder::default();
+        let mut ssl_mode = "prefer";
 
         if let Some(params) = params.as_ref() {
             if let Some(mysql_connection_string) = get_secret_or_param(
@@ -80,9 +84,31 @@ impl MySQLConnectionPool {
                     connection_string =
                         connection_string.tcp_port(mysql_port.parse::<u16>().unwrap_or(3306));
                 }
+                if let Some(mysql_sslmode) = params.get("mysql_sslmode") {
+                    match mysql_sslmode.as_str() {
+                        "disable" | "require" | "prefer" => {
+                            ssl_mode = mysql_sslmode.as_str();
+                        }
+                        _ => {
+                            InvalidParameterSnafu {
+                                parameter_name: "mysql_sslmode".to_string(),
+                            }
+                            .fail()?;
+                        }
+                    }
+                }
             }
         }
 
+        let default_ssl_opts = SslOpts::default().with_danger_accept_invalid_certs(true);
+        let ssl_opts = match ssl_mode {
+            "disable" => None,
+            "require" => Some(SslOpts::default()),
+            "prefer" => Some(default_ssl_opts),
+            _ => Some(default_ssl_opts),
+        };
+
+        connection_string = connection_string.ssl_opts(ssl_opts);
         let opts = mysql_async::Opts::from(connection_string);
 
         let pool = mysql_async::Pool::new(opts);
