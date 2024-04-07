@@ -14,9 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::ducknsql::{CandleLlama, Nsql};
+use crate::ducknsql::{Nsqmodel, CandleLlama, Nsql};
 use crate::{config, datafusion::DataFusion, model::Model};
 use app::App;
+use axum::handler::Handler;
 use std::net::SocketAddr;
 use std::{collections::HashMap, sync::Arc};
 
@@ -33,11 +34,13 @@ use tokio::{sync::RwLock, time::Instant};
 
 use super::v1;
 
+pub trait MyTrait: Nsql + 'static + Send + Sync + Clone { }
+
 pub(crate) fn routes(
     app: Arc<RwLock<Option<App>>>,
     df: Arc<RwLock<DataFusion>>,
     models: Arc<RwLock<HashMap<String, Model>>>,
-    nsql: Arc<Box<dyn Nsql>>,
+    nsql: Arc<Box<Nsqmodel>>,
     config: Arc<config::Config>,
     with_metrics: Option<SocketAddr>,
 ) -> Router {

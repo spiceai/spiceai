@@ -95,7 +95,7 @@ pub(crate) mod nsql {
     use serde::{Deserialize, Serialize};
     use std::sync::Arc;
     use tokio::sync::RwLock;
-    use crate::{ducknsql::{CandleLlama, Nsql}, http::v1::nsql};
+    use crate::ducknsql::{CandleLlama, Nsql, NsqlConfig};
     
     use crate::{datafusion::DataFusion, http::v1::dataframe_to_response};
 
@@ -111,12 +111,24 @@ pub(crate) mod nsql {
     pub fn schema_to_create_table_stmt(table_name: &str, schema: Schema) -> String {
         return "".to_string();
     }
-
+    
+    // Extension(nsql_model): Extension<Arc<Box<dyn Nsql>>>,
     pub(crate) async fn post(
         Extension(df): Extension<Arc<RwLock<DataFusion>>>,
-        Extension(nsql_model): Extension<Arc<Box<dyn Nsql>>>,
         Json(payload): Json<NsqlRequest>,
     ) -> Response {
+        
+        // let nsql_model = match CandleLlama::try_new(NsqlConfig {
+        //     model_weights: "/Users/jeadie/.spice/DuckDB-NSQL-7B-v0.1-q8_0.gguf".to_string(),
+        //     tokenizer: Some("/Users/jeadie/Github/nsql/llama2.tokenizer.json".to_string()),
+        // }) {
+        //     Ok(m) => m,
+        //     Err(e) => {
+        //         tracing::trace!("Error creating NSQL model: {e}");
+        //         return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        //     }
+        // };
+
         let readable_df = df.read().await;
         
         // Get all tables in Datafusion
@@ -140,25 +152,26 @@ pub(crate) mod nsql {
                     query=create_tbl_stmts.join(" ")
                 );
                 tracing::error!("Running query: {nsql_query}");
-                    match nsql_model.run(nsql_query) {
-                        Ok(Some(model_sql_query)) => {
-                            match readable_df.ctx.sql(&model_sql_query).await {
-                                Ok(result) => dataframe_to_response(result).await,
-                                Err(e) => {
-                                    tracing::trace!("Error running query: {e}");
-                                    return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-                                }
-                            }
-                        },
-                        Ok(None) => {
-                            tracing::trace!("No query produced from NSQL model");
-                            (StatusCode::INTERNAL_SERVER_ERROR, "No query produced from NSQL model".to_string()).into_response()
-                        },
-                        Err(e) => {
-                            tracing::trace!("Error running NSQL model: {e}");
-                            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-                        }
-                    }
+                    // match nsql_model.run(nsql_query) {
+                    //     Ok(Some(model_sql_query)) => {
+                    //         match readable_df.ctx.sql(&model_sql_query).await {
+                    //             Ok(result) => dataframe_to_response(result).await,
+                    //             Err(e) => {
+                    //                 tracing::trace!("Error running query: {e}");
+                    //                 return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+                    //             }
+                    //         }
+                    //     },
+                    //     Ok(None) => {
+                    //         tracing::trace!("No query produced from NSQL model");
+                    //         (StatusCode::INTERNAL_SERVER_ERROR, "No query produced from NSQL model".to_string()).into_response()
+                    //     },
+                    //     Err(e) => {
+                    //         tracing::trace!("Error running NSQL model: {e}");
+                    //         return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+                    //     }
+                    // }
+                    return (StatusCode::INTERNAL_SERVER_ERROR, "e.to_string()").into_response();
             },
             Err(e) => {
                 tracing::trace!("Error creating table queries: {e}");

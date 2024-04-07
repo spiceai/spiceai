@@ -23,7 +23,7 @@ use tokio::{
     sync::RwLock,
 };
 
-use crate::{config, datafusion::DataFusion, ducknsql::CandleLlama, model::Model};
+use crate::{config, datafusion::DataFusion, ducknsql::{CandleLlama, Nsql, Nsqmodel}, model::Model};
 
 mod routes;
 mod v1;
@@ -44,7 +44,7 @@ pub(crate) async fn start<A>(
     app: Arc<RwLock<Option<App>>>,
     df: Arc<RwLock<DataFusion>>,
     models: Arc<RwLock<HashMap<String, Model>>>,
-    nsql: Arc<CandleLlama>,
+    nsql: Arc<Box<Nsqmodel>>,
     config: Arc<config::Config>,
     with_metrics: Option<SocketAddr>,
 ) -> Result<()>

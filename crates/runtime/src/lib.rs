@@ -22,7 +22,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use app::App;
 use config::Config;
-use ducknsql::{Empty, CandleLlama, Nsql, NsqlConfig};
+use ducknsql::{CandleLlama, Empty, Nsql, NsqlConfig, Nsqmodel};
 use model::Model;
 pub use notify::Error as NotifyError;
 use secrets::spicepod_secret_store_type;
@@ -107,7 +107,7 @@ pub struct Runtime {
     pub config: config::Config,
     pub df: Arc<RwLock<DataFusion>>,
     pub models: Arc<RwLock<HashMap<String, Model>>>,
-    pub nsql: Arc<Box<dyn Nsql>>,
+    pub nsql: Arc<Box<Nsqmodel>>,
     pub pods_watcher: podswatcher::PodsWatcher,
     pub secrets_provider: Arc<RwLock<secrets::SecretsProvider>>,
 
@@ -124,16 +124,17 @@ impl Runtime {
     ) -> Self {
         dataconnector::register_all().await;
 
-        let nsqlz = if let Ok(nsql_model) = ducknsql::CandleLlama::try_new(NsqlConfig{
-            tokenizer: Some("JEADIE".to_string()),
-            model_weights: "model_weights".to_string()
-        }) {
-            Box::new(nsql_model) as Box<dyn Nsql>
-        } else {
-            tracing::warn!("Unable to initialize NSQL: {}", e);
-            Box::new(ducknsql::Empty{}) as Box<dyn Nsql>
-        };
+        // let nsqlz = if let Ok(nsql_model) = ducknsql::CandleLlama::try_new(NsqlConfig{
+        //     model_weights: "/Users/jeadie/.spice/DuckDB-NSQL-7B-v0.1-q8_0.gguf".to_string(),
+        //     tokenizer: Some("/Users/jeadie/Github/nsql/llama2.tokenizer.json".to_string()),
+        // }) {
+        //     Box::new(nsql_model) as Box<dyn Nsql>
+        // } else {
+        //     tracing::warn!("Unable to initialize NSQL: {}", e);
+        //     Box::new(ducknsql::Empty{}) as Box<dyn Nsql>
+        // };
 
+        let nsqlz = Box::new(Nsqmodel::Empty(ducknsql::Empty{}));
         Runtime {
             app,
             config,

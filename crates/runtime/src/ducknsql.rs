@@ -60,13 +60,21 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-pub trait Nsql {
-    fn try_new(cfg: NsqlConfig) -> Result<Self>
-    where
-        Self: Sized + Send + Sync;
+pub trait Nsql: 'static + Send + Sync + Clone
+where
+    Self: Sized,
+{
+    fn try_new(cfg: NsqlConfig) -> Result<Self>;
     fn run(&self, prompt: String) -> Result<Option<String>>;
 }
 
+pub enum Nsqmodel {
+    Empty(Empty),
+    CandleLlama(CandleLlama),
+}
+
+
+#[derive(Clone)]
 pub struct Empty {
 
 }
@@ -83,12 +91,13 @@ impl Nsql for Empty {
 
 
 
+#[derive(Clone)]
 pub struct CandleLlama {
     tknzr: Tokenizer,
     mdl: ModelWeights
 }
 impl Nsql for CandleLlama {
-    fn try_new(cfg: NsqlConfig) -> Result<Self> where Self: Sized {
+    fn try_new(cfg: NsqlConfig) -> Result<Self>  {
         if let Some(tokenizer) = cfg.tokenizer {
             let tknzr = {
                 Tokenizer::from_file(tokenizer)
