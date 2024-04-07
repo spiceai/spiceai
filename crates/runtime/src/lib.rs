@@ -22,6 +22,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use app::App;
 use config::Config;
+use ducknsql::{Empty, CandleLlama, Nsql, NsqlConfig};
 use model::Model;
 pub use notify::Error as NotifyError;
 use secrets::spicepod_secret_store_type;
@@ -106,6 +107,7 @@ pub struct Runtime {
     pub config: config::Config,
     pub df: Arc<RwLock<DataFusion>>,
     pub models: Arc<RwLock<HashMap<String, Model>>>,
+    pub nsql: Arc<Box<dyn Nsql>>,
     pub pods_watcher: podswatcher::PodsWatcher,
     pub secrets_provider: Arc<RwLock<secrets::SecretsProvider>>,
 
@@ -114,17 +116,29 @@ pub struct Runtime {
 
 impl Runtime {
     #[must_use]
-    pub async fn new(
+    pub async fn try_new(
         config: Config,
         app: Arc<RwLock<Option<app::App>>>,
         df: Arc<RwLock<DataFusion>>,
         pods_watcher: podswatcher::PodsWatcher,
     ) -> Self {
         dataconnector::register_all().await;
+
+        let nsqlz = if let Ok(nsql_model) = ducknsql::CandleLlama::try_new(NsqlConfig{
+            tokenizer: Some("JEADIE".to_string()),
+            model_weights: "model_weights".to_string()
+        }) {
+            Box::new(nsql_model) as Box<dyn Nsql>
+        } else {
+            tracing::warn!("Unable to initialize NSQL: {}", e);
+            Box::new(ducknsql::Empty{}) as Box<dyn Nsql>
+        };
+
         Runtime {
             app,
             config,
             df,
+            nsql: Arc::new(nsqlz),
             models: Arc::new(RwLock::new(HashMap::new())),
             pods_watcher,
             secrets_provider: Arc::new(RwLock::new(secrets::SecretsProvider::new())),
@@ -456,6 +470,7 @@ impl Runtime {
             self.app.clone(),
             self.df.clone(),
             self.models.clone(),
+            self.nsql.clone(),
             self.config.clone().into(),
             with_metrics,
         );

@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::ducknsql::{CandleLlama, Nsql};
 use crate::{config, datafusion::DataFusion, model::Model};
 use app::App;
 use std::net::SocketAddr;
@@ -36,6 +37,7 @@ pub(crate) fn routes(
     app: Arc<RwLock<Option<App>>>,
     df: Arc<RwLock<DataFusion>>,
     models: Arc<RwLock<HashMap<String, Model>>>,
+    nsql: Arc<Box<dyn Nsql>>,
     config: Arc<config::Config>,
     with_metrics: Option<SocketAddr>,
 ) -> Router {
@@ -52,6 +54,7 @@ pub(crate) fn routes(
         .route_layer(middleware::from_fn(track_metrics))
         .layer(Extension(app))
         .layer(Extension(df))
+        .layer(Extension(nsql))
         .layer(Extension(with_metrics))
         .layer(Extension(models))
         .layer(Extension(config))

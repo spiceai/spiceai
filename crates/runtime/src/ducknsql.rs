@@ -15,11 +15,30 @@ limitations under the License.
 */
 
 use candle_examples::token_output_stream::TokenOutputStream;
-use candle_transformers::{generation::LogitsProcessor, models::quantized_llama::ModelWeights};
-use snafu::prelude::*;
+use candle_transformers::{
+    generation::LogitsProcessor,
+    models::quantized_llama::ModelWeights,
+};
+
+use snafu::Snafu;
 use tokenizers::Tokenizer;
 
-use candle_core::{quantized::ggml_file, Tensor};
+use candle_core::{quantized::gguf_file, Tensor};
+
+
+#[derive(Debug, Clone)]
+pub struct DuckNsql {
+    pub tokenizer: Option<String>,
+    pub model_weights: String,
+}
+
+
+#[derive(Debug, Clone)]
+pub struct NsqlConfig {
+    pub tokenizer: Option<String>,
+    pub model_weights: String,
+}
+
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -34,88 +53,176 @@ pub enum Error {
 
     #[snafu(display("Failed to load model tokenizer"))]
     FailedToLoadTokenizer { e: Box<dyn std::error::Error> },
+
+    #[snafu(display("Failed to tokenize"))]
+    FailedToTokenize { e: Box<dyn std::error::Error> },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-pub fn run_model(prompt: String) -> Result<Option<String>> {
-    let model_path = "/Users/jeadie/.spice/DuckDB-NSQL-7B-v0.1-q8_0.gguf";
-    let mut file = std::fs::File::open(model_path).map_err(|_| Error::LocalModelNotFound {})?;
-    println!("GMMGL");
-    let model_content = ggml_file::Content::read(&mut file, &candle_core::Device::Cpu)
-        .map_err(|e| e.with_path(model_path))
-        .map_err(|e| Error::FailedToLoadModel { e })?;
-    let model =
-        ModelWeights::from_ggml(model_content, 1).map_err(|e| Error::FailedToLoadModel { e })?;
-
-    let oken = Tokenizer::from_file("/Users/jeadie/.spice/llama2_tokenizer.json")
-        .map_err(|e| Error::FailedToLoadTokenizer { e })?;
-    let tos = TokenOutputStream::new(oken);
-    _run_model(prompt.to_string(), tos, model).map_err(|e| Error::FailedToRunModel { e })
+pub trait Nsql {
+    fn try_new(cfg: NsqlConfig) -> Result<Self>
+    where
+        Self: Sized + Send + Sync;
+    fn run(&self, prompt: String) -> Result<Option<String>>;
 }
 
-pub fn _run_model(
+pub struct Empty {
+
+}
+
+impl Nsql for Empty {
+    fn try_new(_cfg: NsqlConfig) -> Result<Self> {
+        Ok(Self {})
+    }
+
+    fn run(&self, _prompt: String) -> Result<Option<String>> {
+        Ok(None)
+    }
+}
+
+
+
+pub struct CandleLlama {
+    tknzr: Tokenizer,
+    mdl: ModelWeights
+}
+impl Nsql for CandleLlama {
+    fn try_new(cfg: NsqlConfig) -> Result<Self> where Self: Sized {
+        if let Some(tokenizer) = cfg.tokenizer {
+            let tknzr = {
+                Tokenizer::from_file(tokenizer)
+                    .map_err(|e| Error::FailedToLoadTokenizer { e })?
+            };
+            let mdl = load_gguf_model_weights(cfg.model_weights)?;
+            Ok(Self { tknzr, mdl })
+        } else {
+            Err(Error::FailedToLoadTokenizer { e: "Tokenizer not provided".into() })
+        }
+    }
+
+    fn run(&self, prompt: String) -> Result<Option<String>> {
+        // tknzr.clone() is bad
+        let stream = TokenOutputStream::new(self.tknzr.clone());
+        match perform_inference(prompt, stream, &mut self.mdl.clone()) {
+            Ok(opt_output) => Ok(opt_output),
+            Err(e) => Err(Error::FailedToRunModel { e }),
+        }
+    }
+}
+
+fn load_gguf_model_weights(model_weights_path: String) -> Result<ModelWeights> {
+    let mut file =
+        std::fs::File::open(model_weights_path.clone()).map_err(|_| Error::LocalModelNotFound {})?;
+    let model_content = gguf_file::Content::read(&mut file) //Content::read(&mut file, &candle_core::Device::Cpu)
+        .map_err(|e| e.with_path(model_weights_path))
+        .map_err(|e| Error::FailedToLoadModel { e })?;
+
+    Ok(
+        ModelWeights::from_gguf(model_content, &mut file, &candle_core::Device::Cpu)
+            .map_err(|e| Error::FailedToLoadModel { e })?,
+    )
+}
+
+#[derive()]
+struct InferenceHyperparams {
+    pub to_sample: usize,
+    pub max_seq_len: usize,
+    pub repeat_last_n: usize,
+    pub repeat_penalty: f32,
+    pub device: candle_core::Device,
+    pub seed: u64,
+    pub temperature: f64,
+    pub split_prompt: bool,
+}
+
+impl Default for InferenceHyperparams {
+    fn default() -> Self {
+        Self {
+            to_sample: 300,
+            max_seq_len: 4096,
+            repeat_last_n: 64,
+            repeat_penalty: 1.1,
+            device: candle_core::Device::Cpu,
+            seed: 299792458,
+            temperature: 0.8,
+            split_prompt: true,
+        }
+    }
+}
+
+pub fn perform_inference(
     prompt_str: String,
     mut tos: TokenOutputStream,
-    mut model: ModelWeights,
+    model: &mut ModelWeights,
 ) -> std::result::Result<Option<String>, Box<dyn std::error::Error>> {
-    let tokens = tos.tokenizer().encode(prompt_str, true).unwrap(); // TODO: help
-
-    let prompt_tokens = [tokens.get_ids()].concat();
-    let to_sample = 1000; // args.sample_len.saturating_sub(1);
-    let max_seq_len = 4096;
-    let repeat_last_n = 64;
-    let repeat_penalty = 1.1;
-    let device = candle_core::Device::Cpu;
-    let seed = 299792458;
-    let temperature = 0.8;
-    let prompt_tokens = if prompt_tokens.len() + to_sample > max_seq_len - 10 {
-        let to_remove = prompt_tokens.len() + to_sample + 10 - max_seq_len;
-        prompt_tokens[prompt_tokens.len().saturating_sub(to_remove)..].to_vec()
-    } else {
-        prompt_tokens
+    let hyper = InferenceHyperparams::default();
+    
+    let prompt_tokens = match tos.tokenizer().encode(prompt_str, true) {
+        Ok(tokens) => {
+            let token_ids = [tokens.get_ids()].concat();
+            if token_ids.len() + hyper.to_sample > hyper.max_seq_len - 10 {
+                let to_remove = token_ids.len() + hyper.to_sample + 10 - hyper.max_seq_len;
+                token_ids[token_ids.len().saturating_sub(to_remove)..].to_vec()
+            } else {
+                token_ids
+            }
+        },
+        Err(err) => {
+            return Err(err);
+        }
     };
-    let mut all_tokens = vec![];
-    let mut logits_processor = LogitsProcessor::new(seed, Some(temperature), None);
 
-    let mut next_token = {
+
+    let mut all_tokens = vec![];
+    let mut logits_processor = LogitsProcessor::new(hyper.seed, Some(hyper.temperature), None);
+    
+    let mut next_token = if !hyper.split_prompt {
+        let input = Tensor::new(prompt_tokens.as_slice(), &hyper.device)?.unsqueeze(0)?;
+        let logits = model.forward(&input, 0)?;
+        let logits = logits.squeeze(0)?;
+        logits_processor.sample(&logits)?
+    } else {
         let mut next_token = 0;
         for (pos, token) in prompt_tokens.iter().enumerate() {
-            let input = Tensor::new(&[*token], &device)?.unsqueeze(0)?;
+            let input = Tensor::new(&[*token], &hyper.device)?.unsqueeze(0)?;
             let logits = model.forward(&input, pos)?;
             let logits = logits.squeeze(0)?;
-            next_token = logits_processor.sample(&logits)?
+            next_token = logits_processor.sample(&logits)?;
         }
         next_token
     };
     all_tokens.push(next_token);
-    if let Some(t) = tos.next_token(next_token)? {
-        print!("{t}");
-    }
 
-    let eos_token = "</s>";
-    let eos_token = *tos.tokenizer().get_vocab(true).get(eos_token).unwrap();
-    let mut sampled = 0;
-    for index in 0..to_sample {
-        let input = Tensor::new(&[next_token], &device)?.unsqueeze(0)?;
-        let logits = model.forward(&input, prompt_tokens.len() + index)?;
-        let logits = logits.squeeze(0)?;
-        let logits = if repeat_penalty == 1. {
-            logits
-        } else {
-            let start_at = all_tokens.len().saturating_sub(repeat_last_n);
-            candle_transformers::utils::apply_repeat_penalty(
-                &logits,
-                repeat_penalty,
-                &all_tokens[start_at..],
-            )?
+
+    let eos_token = match tos.tokenizer().get_vocab(true).get("</s>") {
+        Some(token) => *token,
+        None => {
+            return Err(Error::FailedToTokenize { e: "Failed to get eos_token".into() }.into());
+        }
+    };
+
+    for index in 0..hyper.to_sample {
+        let input = Tensor::new(&[next_token], &hyper.device)?.unsqueeze(0)?;
+        let logits = {
+            let logits = model.forward(&input, prompt_tokens.len() + index)?;
+            let logits = logits.squeeze(0)?;
+            if hyper.repeat_penalty == 1. {
+                logits
+            } else {
+                let start_at = all_tokens.len().saturating_sub(hyper.repeat_last_n);
+                candle_transformers::utils::apply_repeat_penalty(
+                    &logits,
+                    hyper.repeat_penalty,
+                    &all_tokens[start_at..],
+                )?
+            }
         };
         next_token = logits_processor.sample(&logits)?;
         all_tokens.push(next_token);
         if let Some(t) = tos.next_token(next_token)? {
             print!("{t}");
         }
-        sampled += 1;
         if next_token == eos_token {
             break;
         };

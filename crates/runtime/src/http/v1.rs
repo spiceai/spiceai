@@ -48,6 +48,7 @@ fn dataset_status(df: &DataFusion, ds: &Dataset) -> ComponentStatus {
     }
 }
 
+// Prepare a dataframe for Response (as JSON). 
 async fn dataframe_to_response(data_frame: DataFrame) -> Response {
 
     let results = match data_frame.collect().await {
@@ -90,11 +91,11 @@ pub(crate) mod nsql {
     use axum::{
         http::StatusCode, response::{IntoResponse, Response}, Extension, Json
     };
-    use futures::{future::join_all, FutureExt, TryFutureExt};
+    use futures::{future::join_all, TryFutureExt};
     use serde::{Deserialize, Serialize};
     use std::sync::Arc;
     use tokio::sync::RwLock;
-    use crate::ducknsql::run_model;
+    use crate::{ducknsql::{CandleLlama, Nsql}, http::v1::nsql};
     
     use crate::{datafusion::DataFusion, http::v1::dataframe_to_response};
 
@@ -107,15 +108,15 @@ pub(crate) mod nsql {
         // pub included_tables: Option<Vec<String>>,
     }
 
-    pub fn schema_to_create_table(table_name: &str, schema: Schema) -> String {
+    pub fn schema_to_create_table_stmt(table_name: &str, schema: Schema) -> String {
         return "".to_string();
     }
 
     pub(crate) async fn post(
         Extension(df): Extension<Arc<RwLock<DataFusion>>>,
+        Extension(nsql_model): Extension<Arc<Box<dyn Nsql>>>,
         Json(payload): Json<NsqlRequest>,
     ) -> Response {
-
         let readable_df = df.read().await;
         
         // Get all tables in Datafusion
@@ -129,24 +130,35 @@ pub(crate) mod nsql {
         
         match join_all(tables.iter().map(|t| {
             readable_df.get_arrow_schema(t).map_ok(|s| {
-                schema_to_create_table(t, s)
+                schema_to_create_table_stmt(t, s)
             }
         )})).await.into_iter().collect::<Result<Vec<String>, _>>() {
-            Ok(queries) => {
-                let query = queries.join(" ");
-                let user_query = payload.query;
-                let nsql_query = format!("{query} -- Using valid ANSI SQL, answer the following questions for the tables provided above. -- {user_query}");
+            Ok(create_tbl_stmts) => {
+                let nsql_query = format!(
+                    "{query} -- Using valid ANSI SQL, answer the following questions for the tables provided above. -- {user_query}",
+                    user_query=payload.query,
+                    query=create_tbl_stmts.join(" ")
+                );
                 tracing::error!("Running query: {nsql_query}");
-
-                let result = readable_df.ctx.sql(&user_query).await;
-
-                match result {
-                    Ok(d) => dataframe_to_response(d).await,
-                    Err(e) => {
-                        tracing::trace!("Error running query: {e}");
-                        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+                    match nsql_model.run(nsql_query) {
+                        Ok(Some(model_sql_query)) => {
+                            match readable_df.ctx.sql(&model_sql_query).await {
+                                Ok(result) => dataframe_to_response(result).await,
+                                Err(e) => {
+                                    tracing::trace!("Error running query: {e}");
+                                    return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+                                }
+                            }
+                        },
+                        Ok(None) => {
+                            tracing::trace!("No query produced from NSQL model");
+                            (StatusCode::INTERNAL_SERVER_ERROR, "No query produced from NSQL model".to_string()).into_response()
+                        },
+                        Err(e) => {
+                            tracing::trace!("Error running NSQL model: {e}");
+                            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+                        }
                     }
-                }
             },
             Err(e) => {
                 tracing::trace!("Error creating table queries: {e}");
