@@ -16,10 +16,10 @@ limitations under the License.
 
 use arrow::{
     array::{
-        ArrayBuilder, BooleanBuilder, Date32Builder, Decimal128Builder, Float32Builder,
-        Float64Builder, Int16Builder, Int32Builder, Int64Builder, ListBuilder, StringBuilder,
-        TimestampMicrosecondBuilder, TimestampMillisecondBuilder, TimestampNanosecondBuilder,
-        TimestampSecondBuilder, UInt64Builder,
+        ArrayBuilder, BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder,
+        Float32Builder, Float64Builder, Int16Builder, Int32Builder, Int64Builder, ListBuilder,
+        StringBuilder, TimestampMicrosecondBuilder, TimestampMillisecondBuilder,
+        TimestampNanosecondBuilder, TimestampSecondBuilder, UInt64Builder,
     },
     datatypes::{DataType, TimeUnit},
 };
@@ -43,6 +43,7 @@ pub fn map_data_type_to_array_builder(data_type: &DataType) -> Box<dyn ArrayBuil
         DataType::Float64 => Box::new(Float64Builder::new()),
         DataType::Utf8 => Box::new(StringBuilder::new()),
         DataType::Boolean => Box::new(BooleanBuilder::new()),
+        DataType::Binary => Box::new(BinaryBuilder::new()),
         DataType::Decimal128(precision, scale) => Box::new(
             Decimal128Builder::new()
                 .with_precision_and_scale(*precision, *scale)
