@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::sync::RwLock;
 use std::{any::Any, fmt, sync::Arc};
 
 use arrow::{datatypes::SchemaRef, record_batch::RecordBatch};
@@ -40,12 +41,17 @@ pub struct DataUpdate {
 }
 
 pub struct DataUpdateExecutionPlan {
-    pub data_update: DataUpdate,
+    pub data_update: RwLock<DataUpdate>,
+    schema: SchemaRef,
 }
 
 impl DataUpdateExecutionPlan {
     pub fn new(data_update: DataUpdate) -> Self {
-        Self { data_update }
+        let schema = Arc::clone(&data_update.schema);
+        Self {
+            data_update: RwLock::new(data_update),
+            schema,
+        }
     }
 }
 
@@ -67,7 +73,7 @@ impl ExecutionPlan for DataUpdateExecutionPlan {
     }
 
     fn schema(&self) -> SchemaRef {
-        self.data_update.schema
+        Arc::clone(&self.schema)
     }
 
     fn output_partitioning(&self) -> datafusion::physical_plan::Partitioning {
@@ -94,10 +100,13 @@ impl ExecutionPlan for DataUpdateExecutionPlan {
         _partition: usize,
         _context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-        let stream_adapter = RecordBatchStreamAdapter::new(
-            self.schema(),
-            stream::iter(self.data_update.data.into_iter().map(Ok)),
-        );
+        let mut data_update_guard = match self.data_update.write() {
+            Ok(guard) => guard,
+            Err(e) => e.into_inner(),
+        };
+        let data = std::mem::take(&mut data_update_guard.data);
+        let stream_adapter =
+            RecordBatchStreamAdapter::new(self.schema(), stream::iter(data.into_iter().map(Ok)));
 
         Ok(Box::pin(stream_adapter))
     }

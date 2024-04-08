@@ -146,9 +146,10 @@ impl MetricsService for Service {
                                     continue;
                                 };
 
+                                let schema = record_batch.schema();
                                 let data_update = DataUpdate {
                                     data: vec![record_batch],
-                                    schema: record_batch.schema(),
+                                    schema,
                                     update_type: UpdateType::Append,
                                 };
 

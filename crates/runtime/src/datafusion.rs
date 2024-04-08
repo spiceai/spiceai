@@ -101,7 +101,7 @@ pub enum Error {
     },
 }
 
-pub(crate) enum Table {
+pub enum Table {
     Accelerated {
         source: Arc<dyn DataConnector>,
         acceleration_secret: Option<Secret>,
@@ -138,7 +138,7 @@ impl DataFusion {
                 acceleration_secret,
             } => {
                 self.register_accelerated_table(dataset, source, acceleration_secret)
-                    .await?
+                    .await?;
             }
             Table::Federated(source) => self.register_federated_table(dataset, source).await?,
             Table::View(sql) => self.register_view(&dataset.name, sql)?,
@@ -157,7 +157,7 @@ impl DataFusion {
             TableNotWritableSnafu {
                 table_name: table_name.to_string(),
             }
-            .fail()?
+            .fail()?;
         }
 
         let table_provider = self
@@ -276,7 +276,7 @@ impl DataFusion {
         Ok(())
     }
 
-    /// Federated tables are attached directly as tables visible in the public DataFusion context.
+    /// Federated tables are attached directly as tables visible in the public `DataFusion` context.
     async fn register_federated_table(
         &self,
         dataset: &Dataset,
@@ -338,7 +338,8 @@ impl DataFusion {
             .fail();
         }
 
-        let ctx = self.ctx.clone();
+        let ctx = Arc::clone(&self.ctx);
+        let table_name = table_name.to_string();
         spawn(async move {
             // Tables are currently lazily created (i.e. not created until first data is received) so that we know the table schema.
             // This means that we can't create a view on top of a table until the first data is received for all dependent tables and therefore
@@ -392,7 +393,10 @@ impl DataFusion {
                     return;
                 }
             };
-            if let Err(e) = ctx.register_table(table_name, Arc::new(view_table)) {
+            if let Err(e) = ctx.register_table(
+                OwnedTableReference::bare(table_name.clone()),
+                Arc::new(view_table),
+            ) {
                 tracing::error!("Failed to create view: {e}");
             };
 

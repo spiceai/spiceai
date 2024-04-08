@@ -32,8 +32,8 @@ pub struct LocalhostConnector {}
 
 impl DataConnectorFactory for LocalhostConnector {
     fn create(
-        secret: Option<Secret>,
-        params: Arc<Option<HashMap<String, String>>>,
+        _secret: Option<Secret>,
+        _params: Arc<Option<HashMap<String, String>>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move { Ok(Arc::new(LocalhostConnector {}) as Arc<dyn DataConnector>) })
     }
@@ -47,7 +47,7 @@ impl DataConnector for LocalhostConnector {
 
     async fn read_provider(
         &self,
-        dataset: &Dataset,
+        _dataset: &Dataset,
     ) -> super::AnyErrorResult<Arc<dyn TableProvider>> {
         unimplemented!("read_provider not yet implemented for locahost provider");
     }

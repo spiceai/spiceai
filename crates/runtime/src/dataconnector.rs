@@ -135,21 +135,21 @@ pub trait DataConnector: Send + Sync {
 
     async fn read_write_provider(
         &self,
-        dataset: &Dataset,
+        _dataset: &Dataset,
     ) -> Option<AnyErrorResult<Arc<dyn TableProvider>>> {
         None
     }
 
     async fn stream_provider(
         &self,
-        dataset: &Dataset,
+        _dataset: &Dataset,
     ) -> Option<AnyErrorResult<Arc<dyn TableProvider>>> {
         None
     }
 
     fn get_object_store(
         &self,
-        dataset: &Dataset,
+        _dataset: &Dataset,
     ) -> Option<AnyErrorResult<(Url, Arc<dyn ObjectStore + 'static>)>> {
         None
     }
