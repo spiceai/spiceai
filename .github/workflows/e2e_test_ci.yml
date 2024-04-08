@@ -561,7 +561,7 @@ jobs:
 
       - name: Start spice runtime
         env:
-          SPICE_SECRET_MYSQL_PASSWORD: test_user
+          SPICE_SECRET_MYSQL_PASSWORD: password
         working-directory: test_app
         run: |
           spice run &> spice.log &
