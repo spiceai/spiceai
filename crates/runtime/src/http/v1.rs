@@ -89,7 +89,7 @@ async fn dataframe_to_response(data_frame: DataFrame) -> Response {
 pub(crate) mod nsql {
     use arrow::datatypes::Schema;
     use axum::{
-        http::StatusCode, response::{IntoResponse, Response}, Extension, Json
+        debug_handler, http::StatusCode, response::{IntoResponse, Response}, Extension, Json
     };
     use futures::{future::join_all, TryFutureExt};
     use serde::{Deserialize, Serialize};
@@ -113,21 +113,22 @@ pub(crate) mod nsql {
     }
     
     // Extension(nsql_model): Extension<Arc<Box<dyn Nsql>>>,
+    #[debug_handler]
     pub(crate) async fn post(
         Extension(df): Extension<Arc<RwLock<DataFusion>>>,
         Json(payload): Json<NsqlRequest>,
     ) -> Response {
         
-        // let nsql_model = match CandleLlama::try_new(NsqlConfig {
-        //     model_weights: "/Users/jeadie/.spice/DuckDB-NSQL-7B-v0.1-q8_0.gguf".to_string(),
-        //     tokenizer: Some("/Users/jeadie/Github/nsql/llama2.tokenizer.json".to_string()),
-        // }) {
-        //     Ok(m) => m,
-        //     Err(e) => {
-        //         tracing::trace!("Error creating NSQL model: {e}");
-        //         return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-        //     }
-        // };
+        let nsql_model = match CandleLlama::try_new(NsqlConfig {
+            model_weights: "/Users/jeadie/.spice/DuckDB-NSQL-7B-v0.1-q8_0.gguf".to_string(),
+            tokenizer: Some("/Users/jeadie/Github/nsql/llama2.tokenizer.json".to_string()),
+        }) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::trace!("Error creating NSQL model: {e}");
+                return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+            }
+        };
 
         let readable_df = df.read().await;
         
@@ -152,26 +153,25 @@ pub(crate) mod nsql {
                     query=create_tbl_stmts.join(" ")
                 );
                 tracing::error!("Running query: {nsql_query}");
-                    // match nsql_model.run(nsql_query) {
-                    //     Ok(Some(model_sql_query)) => {
-                    //         match readable_df.ctx.sql(&model_sql_query).await {
-                    //             Ok(result) => dataframe_to_response(result).await,
-                    //             Err(e) => {
-                    //                 tracing::trace!("Error running query: {e}");
-                    //                 return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-                    //             }
-                    //         }
-                    //     },
-                    //     Ok(None) => {
-                    //         tracing::trace!("No query produced from NSQL model");
-                    //         (StatusCode::INTERNAL_SERVER_ERROR, "No query produced from NSQL model".to_string()).into_response()
-                    //     },
-                    //     Err(e) => {
-                    //         tracing::trace!("Error running NSQL model: {e}");
-                    //         return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-                    //     }
-                    // }
-                    return (StatusCode::INTERNAL_SERVER_ERROR, "e.to_string()").into_response();
+                match nsql_model.run(nsql_query) {
+                    Ok(Some(model_sql_query)) => {
+                        match readable_df.ctx.sql(&model_sql_query).await {
+                            Ok(result) => dataframe_to_response(result).await,
+                            Err(e) => {
+                                tracing::trace!("Error running query: {e}");
+                                return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+                            }
+                        }
+                    },
+                    Ok(None) => {
+                        tracing::trace!("No query produced from NSQL model");
+                        (StatusCode::INTERNAL_SERVER_ERROR, "No query produced from NSQL model".to_string()).into_response()
+                    },
+                    Err(e) => {
+                        tracing::trace!("Error running NSQL model: {e}");
+                        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+                    }
+                }
             },
             Err(e) => {
                 tracing::trace!("Error creating table queries: {e}");
