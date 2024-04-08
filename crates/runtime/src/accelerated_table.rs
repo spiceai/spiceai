@@ -40,7 +40,7 @@ enum Error {
 
 type Result<T> = std::result::Result<T, Error>;
 
-// An accelerated table consists of a source table and a local accelerator.
+// An accelerated table consists of a federated table and a local accelerator.
 //
 // The accelerator must support inserts.
 pub(crate) struct AcceleratedTable {
