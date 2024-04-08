@@ -58,7 +58,7 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub type AnyErrorResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-type NewDataConnectorResult = AnyErrorResult<Box<dyn DataConnector>>;
+type NewDataConnectorResult = AnyErrorResult<Arc<dyn DataConnector>>;
 
 type NewDataConnectorFn = dyn Fn(
         Option<Secret>,
@@ -76,13 +76,13 @@ pub async fn register_connector_factory(
     connector_factory: impl Fn(
             Option<Secret>,
             Arc<Option<HashMap<String, String>>>,
-        ) -> Pin<Box<dyn Future<Output = Result<Arc<dyn DataConnector>>> + Send>>
+        ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>>
         + Send
         + 'static,
 ) {
     let mut registry = DATA_CONNECTOR_FACTORY_REGISTRY.lock().await;
 
-    registry.insert(name.to_string(), Arc::new(connector_factory));
+    registry.insert(name.to_string(), Box::new(connector_factory));
 }
 
 /// Create a new `DataConnector` by name.

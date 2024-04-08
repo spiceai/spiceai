@@ -231,7 +231,7 @@ impl WithDependsOn<Dataset> for Dataset {
 
 pub mod acceleration {
     use serde::{Deserialize, Serialize};
-    use std::collections::HashMap;
+    use std::{collections::HashMap, fmt::Display};
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
     #[serde(rename_all = "lowercase")]
@@ -247,6 +247,12 @@ pub mod acceleration {
         #[default]
         Memory,
         File,
+    }
+
+    impl Display for Mode {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{self:?}")
+        }
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

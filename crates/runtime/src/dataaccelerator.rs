@@ -17,7 +17,7 @@ limitations under the License.
 use ::arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
-    common::{parsers::CompressionTypeVariant, Constraints, DFSchema, OwnedTableReference},
+    common::{parsers::CompressionTypeVariant, Constraints, OwnedTableReference, ToDFSchema},
     datasource::TableProvider,
     logical_expr::CreateExternalTable,
 };
@@ -147,21 +147,21 @@ impl AcceleratorBuilder {
         self
     }
 
-    /// Build the data backend, panicking if it fails
+    /// Build the data accelerator, panicking if it fails
     ///
     /// # Panics
     ///
-    /// Panics if the backend fails to build
+    /// Panics if the accelerator fails to build
     #[must_use]
-    pub async fn must_build(self) -> Box<dyn DataAccelerator> {
+    pub async fn must_build(self) -> Arc<dyn DataAccelerator> {
         match self.build().await {
-            Ok(backend) => backend,
+            Ok(accelerator) => accelerator,
             Err(e) => panic!("Failed to build backend: {e}"),
         }
     }
 
     fn validate_arrow(&self) -> Result<(), Error> {
-        if let Some(Mode::File) = self.mode {
+        if Mode::File == self.mode {
             InvalidConfigurationSnafu {
                 msg: "File mode not supported for Arrow engine".to_string(),
             }
@@ -177,7 +177,7 @@ impl AcceleratorBuilder {
         }
     }
 
-    pub async fn build(self) -> std::result::Result<Box<dyn DataAccelerator>, Error> {
+    pub async fn build(self) -> std::result::Result<Arc<dyn DataAccelerator>, Error> {
         self.validate()?;
         let engine = self.engine;
         let mode = self.mode;
@@ -189,36 +189,15 @@ impl AcceleratorBuilder {
 
         params.insert("mode".to_string(), mode.to_string());
 
-        let cmd = CreateExternalTable {
-            schema: Arc::new(DFSchema::try_from(self.schema).map_err(|e| {
-                InvalidConfigurationSnafu {
-                    msg: format!("Failed to convert schema: {e}"),
-                }
-                .build()
-            })?),
-            name: self.table_name,
-            location: String::new(),
-            file_type: String::new(),
-            has_header: false,
-            delimiter: ',',
-            table_partition_cols: vec![],
-            if_not_exists: false,
-            definition: None,
-            file_compression_type: CompressionTypeVariant::UNCOMPRESSED,
-            order_exprs: vec![],
-            unbounded: false,
-            options: Default::default(),
-            constraints: Constraints::empty(),
-            column_defaults: Default::default(),
-        };
+        let accelerator_guard = DATA_ACCELERATOR_ENGINES.lock().await;
+        let accelerator =
+            accelerator_guard
+                .get(&engine)
+                .ok_or_else(|| Error::InvalidConfiguration {
+                    msg: format!("Unknown engine: {engine}"),
+                })?;
 
-        let accelerator = DATA_ACCELERATOR_ENGINES
-            .lock()
-            .await
-            .get(&engine)
-            .ok_or_else(|| Error::InvalidConfiguration {
-                msg: format!("Unknown engine: {engine}"),
-            })?;
+        Ok(Arc::clone(accelerator))
     }
 }
 
@@ -231,24 +210,29 @@ pub async fn create_accelerator_table(
     let params: Arc<Option<HashMap<String, String>>> =
         Arc::new(acceleration_settings.params.clone());
 
-    let data_accelerator: Arc<dyn DataAccelerator> = AcceleratorBuilder::new(table_name, schema)
-        .engine(acceleration_settings.engine())
-        .mode(acceleration_settings.mode())
-        .params(params)
-        .secret(acceleration_secret)
-        .build()
-        .await
-        .context(AccelerationCreationFailedSnafu)?;
+    let table_name = table_name.to_string();
 
+    let data_accelerator: Arc<dyn DataAccelerator> = AcceleratorBuilder::new(
+        OwnedTableReference::bare(table_name.clone()),
+        Arc::clone(&schema),
+    )
+    .engine(acceleration_settings.engine())
+    .mode(acceleration_settings.mode())
+    .params(params)
+    .secret(acceleration_secret)
+    .build()
+    .await?;
+
+    let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema));
     let table_provider = data_accelerator
         .create_external_table(&CreateExternalTable {
-            schema: Arc::new(DFSchema::try_from(schema).map_err(|e| {
+            schema: df_schema.map_err(|e| {
                 InvalidConfigurationSnafu {
                     msg: format!("Failed to convert schema: {e}"),
                 }
                 .build()
-            })?),
-            name: OwnedTableReference::new(table_name),
+            })?,
+            name: OwnedTableReference::bare(table_name.clone()),
             location: String::new(),
             file_type: String::new(),
             has_header: false,
