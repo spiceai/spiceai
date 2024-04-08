@@ -24,6 +24,14 @@ The Spice runtime is written in Rust and leverages industry leading technologies
 
 Spice makes querying data by SQL across one or more data sources simple and fast. Easily co-locate a managed working set of data with your application or ML, locally accelerated in-memory with Arrow, with SQLite/DuckDB, or with an attached database like PostgreSQL for high-performance, low-latency queries. Accelerated engines run in your infrastructure giving you flexibility and control over price and performance.
 
+### How is Spice different?
+
+1. Local Acceleration with **both OLAP (Arrow/DuckDB) and OLTP (SQLite/PostgreSQL)** databases at dataset granularity compared to other OLAP only or OLTP only systems.
+
+2. **Separation of materialization and storage/compute** compared with monolith data systems and data lakes. Keep compute colocated with source data while bringing a materialized working set next to your application, dashboard, or data/ML pipeline.
+
+3. **Edge to cloud native**. Chainable and designed to be deployed standalone, as a container sidecar, as a microservice, in a cluster across laptops, the Edge, On-Prem, to a POP, and to all public clouds.
+
 ### Before Spice
 
 <picture>
@@ -52,16 +60,16 @@ Spice makes querying data by SQL across one or more data sources simple and fast
 
 Currently supported data connectors for upstream datasets. More coming soon.
 
-| Name         | Description                                                                                    | Status            | Protocol/Format  | Refresh Modes    |
-| ------------ | ---------------------------------------------------------------------------------------------- | ----------------- | ---------------- | ---------------- |
-| `databricks` | [Databricks](https://github.com/spiceai/quickstarts/tree/trunk/databricks#spice-on-databricks) | Alpha             | Delta Lake       | `full`           |
-| `postgres`   | PostgreSQL                                                                                     | Alpha             |                  | `full`           |
-| `spiceai`    | [Spice.ai](https://github.com/spiceai/quickstarts/tree/trunk/spiceai#readme)                   | Alpha             | Arrow Flight     | `append`, `full` |
-| `s3`         | [S3](https://github.com/spiceai/quickstarts/tree/trunk/s3#readme)                              | Alpha             | Parquet          | `full`           |
-| `dremio`     | [Dremio](https://github.com/spiceai/quickstarts/tree/trunk/dremio#readme)                      | Alpha             | Arrow Flight SQL | `full`           |
-| `mysql`      | MySQL                                                                                          | Planned for v0.11 |                  | `full`           |
-| `snowflake`  | Snowflake                                                                                      | Coming soon!      | Arrow Flight SQL | `full`           |
-| `bigquery`   | BigQuery                                                                                       | Coming soon!      | Arrow Flight SQL | `full`           |
+| Name         | Description                                                                                    | Status       | Protocol/Format  | Refresh Modes    |
+| ------------ | ---------------------------------------------------------------------------------------------- | ------------ | ---------------- | ---------------- |
+| `databricks` | [Databricks](https://github.com/spiceai/quickstarts/tree/trunk/databricks#spice-on-databricks) | Alpha        | Delta Lake       | `full`           |
+| `postgres`   | PostgreSQL                                                                                     | Alpha        |                  | `full`           |
+| `spiceai`    | [Spice.ai](https://github.com/spiceai/quickstarts/tree/trunk/spiceai#readme)                   | Alpha        | Arrow Flight     | `append`, `full` |
+| `s3`         | [S3](https://github.com/spiceai/quickstarts/tree/trunk/s3#readme)                              | Alpha        | Parquet          | `full`           |
+| `dremio`     | [Dremio](https://github.com/spiceai/quickstarts/tree/trunk/dremio#readme)                      | Alpha        | Arrow Flight SQL | `full`           |
+| `mysql`      | MySQL                                                                                          | Alpha        |                  | `full`           |
+| `snowflake`  | Snowflake                                                                                      | Coming soon! | Arrow Flight SQL | `full`           |
+| `bigquery`   | BigQuery                                                                                       | Coming soon! | Arrow Flight SQL | `full`           |
 
 ### Supported Data Stores/Accelerators
 
