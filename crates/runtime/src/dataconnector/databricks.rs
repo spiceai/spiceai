@@ -16,8 +16,10 @@ limitations under the License.
 
 use async_trait::async_trait;
 use data_components::{Read, ReadWrite};
+use datafusion::datasource::TableProvider;
 use ns_lookup::verify_endpoint_connection;
 use secrets::Secret;
+use spicepod::component::dataset::Dataset;
 use std::any::Any;
 use std::error::Error;
 use std::pin::Pin;
@@ -58,11 +60,17 @@ impl DataConnector for Databricks {
         self
     }
 
-    fn read_provider(&self) -> &dyn Read {
-        self
+    async fn read_provider(
+        &self,
+        dataset: &Dataset,
+    ) -> super::AnyErrorResult<Arc<dyn TableProvider>> {
+        Read::table_provider(&self, dataset.path())
     }
 
-    fn write_provider(&self) -> Option<&dyn ReadWrite> {
-        Some(self)
+    fn read_write_provider(
+        &self,
+        dataset: &Dataset,
+    ) -> Option<super::AnyErrorResult<Arc<dyn TableProvider>>> {
+        Some(ReadWrite::table_provider(&self, dataset.path()))
     }
 }

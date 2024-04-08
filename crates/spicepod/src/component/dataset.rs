@@ -32,12 +32,12 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Mode {
+    #[default]
     Read,
     ReadWrite,
-    Append,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -47,8 +47,8 @@ pub struct Dataset {
 
     pub name: String,
 
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    mode: Option<Mode>,
+    #[serde(default)]
+    mode: Mode,
 
     /// Inline SQL that describes a view.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -78,7 +78,7 @@ impl Dataset {
         Dataset {
             from,
             name,
-            mode: None,
+            mode: Mode::default(),
             sql: None,
             sql_ref: None,
             params: Option::default(),
@@ -188,23 +188,28 @@ impl Dataset {
         self.sql.is_some() || self.sql_ref.is_some()
     }
 
-    pub fn view_sql(&self) -> Result<Option<String>> {
+    #[must_use]
+    pub fn view_sql(&self) -> Option<Result<String>> {
         if let Some(sql) = &self.sql {
-            return Ok(Some(sql.clone()));
+            return Some(Ok(sql.clone()));
         }
 
         if let Some(sql_ref) = &self.sql_ref {
-            let sql =
-                fs::read_to_string(sql_ref).context(UnableToLoadSqlFileSnafu { file: sql_ref })?;
-            return Ok(Some(sql));
+            return Some(Self::load_sql_ref(sql_ref));
         }
 
-        Ok(None)
+        None
+    }
+
+    fn load_sql_ref(sql_ref: &str) -> Result<String> {
+        let sql =
+            fs::read_to_string(sql_ref).context(UnableToLoadSqlFileSnafu { file: sql_ref })?;
+        Ok(sql)
     }
 
     #[must_use]
     pub fn mode(&self) -> Mode {
-        self.mode.clone().unwrap_or(Mode::Read)
+        self.mode.clone()
     }
 }
 
@@ -225,14 +230,13 @@ impl WithDependsOn<Dataset> for Dataset {
 }
 
 pub mod acceleration {
-    use std::fmt;
-
     use serde::{Deserialize, Serialize};
     use std::collections::HashMap;
 
-    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
     #[serde(rename_all = "lowercase")]
     pub enum RefreshMode {
+        #[default]
         Full,
         Append,
     }
@@ -245,56 +249,22 @@ pub mod acceleration {
         File,
     }
 
-    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-    #[serde(rename_all = "lowercase")]
-    pub enum Engine {
-        #[default]
-        Arrow,
-        #[cfg(feature = "duckdb")]
-        DuckDB,
-        #[cfg(feature = "postgres")]
-        Postgres,
-        #[cfg(feature = "sqlite")]
-        Sqlite,
-        #[cfg(feature = "mysql")]
-        MySQL,
-    }
-
-    impl fmt::Display for Engine {
-        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-            write!(
-                f,
-                "{}",
-                match *self {
-                    Engine::Arrow => "arrow",
-                    #[cfg(feature = "duckdb")]
-                    Engine::DuckDB => "duckdb",
-                    #[cfg(feature = "postgres")]
-                    Engine::Postgres => "postgres",
-                    #[cfg(feature = "sqlite")]
-                    Engine::Sqlite => "sqlite",
-                    #[cfg(feature = "mysql")]
-                    Engine::MySQL => "mysql",
-                }
-            )
-        }
-    }
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
     pub struct Acceleration {
         #[serde(default = "default_true")]
         pub enabled: bool,
 
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub mode: Option<Mode>,
+        #[serde(default)]
+        pub mode: Mode,
 
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub engine: Option<Engine>,
+        pub engine: Option<String>,
 
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub refresh_interval: Option<String>,
 
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub refresh_mode: Option<RefreshMode>,
+        #[serde(default)]
+        pub refresh_mode: RefreshMode,
 
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub retention: Option<String>,
@@ -313,12 +283,12 @@ pub mod acceleration {
     impl Acceleration {
         #[must_use]
         pub fn mode(&self) -> Mode {
-            self.mode.clone().unwrap_or_default()
+            self.mode.clone()
         }
 
         #[must_use]
-        pub fn engine(&self) -> Engine {
-            self.engine.clone().unwrap_or_default()
+        pub fn engine(&self) -> String {
+            self.engine.clone().unwrap_or("arrow".to_string())
         }
     }
 }

@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::datapublisher::DataPublisher;
 use ::arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
@@ -25,34 +24,36 @@ use datafusion::{
 use lazy_static::lazy_static;
 use secrets::Secret;
 use snafu::prelude::*;
-use spicepod::component::dataset::acceleration::{Engine, Mode};
+use spicepod::component::dataset::acceleration::{self, Mode};
 use std::{any::Any, collections::HashMap, sync::Arc};
 use tokio::sync::Mutex;
 
 use self::arrow::ArrowAccelerator;
-#[cfg(feature = "duckdb")]
-use self::duckdb::DuckDBBackend;
+// #[cfg(feature = "duckdb")]
+// use self::duckdb::DuckDBBackend;
 
 pub mod arrow;
-#[cfg(feature = "duckdb")]
-pub mod duckdb;
-#[cfg(feature = "mysql")]
-pub mod mysql;
-#[cfg(feature = "postgres")]
-pub mod postgres;
-#[cfg(feature = "sqlite")]
-pub mod sqlite;
+// #[cfg(feature = "duckdb")]
+// pub mod duckdb;
+// #[cfg(feature = "mysql")]
+// pub mod mysql;
+// #[cfg(feature = "postgres")]
+// pub mod postgres;
+// #[cfg(feature = "sqlite")]
+// pub mod sqlite;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Invalid configuration: {msg}"))]
     InvalidConfiguration { msg: String },
 
-    #[snafu(display("Backend creation failed: {source}"))]
-    BackendCreationFailed {
+    #[snafu(display("Acceleration creation failed: {source}"))]
+    AccelerationCreationFailed {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 }
+
+pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 lazy_static! {
     static ref DATA_ACCELERATOR_ENGINES: Mutex<HashMap<String, Arc<dyn DataAccelerator>>> =
@@ -66,7 +67,7 @@ pub async fn register_accelerator_engine(name: &str, accelerator_engine: Arc<dyn
 }
 
 pub async fn register_all() {
-    register_accelerator_engine("arrow", ArrowAccelerator::default()).await;
+    register_accelerator_engine("arrow", ArrowAccelerator::new()).await;
     //register_connector_factory("dremio", Dremio::create).await;
     // register_connector_factory("flightsql", flightsql::FlightSQL::create).await;
     // register_connector_factory("s3", s3::S3::create).await;
@@ -75,6 +76,17 @@ pub async fn register_all() {
     // register_connector_factory("mysql", mysql::MySQL::create).await;
     // #[cfg(feature = "postgres")]
     // register_connector_factory("postgres", postgres::Postgres::create).await;
+}
+
+pub async fn get_accelerator_engine(engine_name: &str) -> Option<Arc<dyn DataAccelerator>> {
+    let guard = DATA_ACCELERATOR_ENGINES.lock().await;
+
+    let engine = guard.get(engine_name);
+
+    match engine {
+        Some(engine_ref) => Some(Arc::clone(engine_ref)),
+        None => None,
+    }
 }
 
 /// A `DataAccelerator` knows how to read, write and create new tables.
@@ -141,7 +153,7 @@ impl AcceleratorBuilder {
     ///
     /// Panics if the backend fails to build
     #[must_use]
-    pub async fn must_build(self) -> Box<dyn DataPublisher> {
+    pub async fn must_build(self) -> Box<dyn DataAccelerator> {
         match self.build().await {
             Ok(backend) => backend,
             Err(e) => panic!("Failed to build backend: {e}"),
@@ -165,7 +177,7 @@ impl AcceleratorBuilder {
         }
     }
 
-    pub async fn build(self) -> std::result::Result<Box<dyn DataPublisher>, Error> {
+    pub async fn build(self) -> std::result::Result<Box<dyn DataAccelerator>, Error> {
         self.validate()?;
         let engine = self.engine;
         let mode = self.mode;
@@ -208,4 +220,51 @@ impl AcceleratorBuilder {
                 msg: format!("Unknown engine: {engine}"),
             })?;
     }
+}
+
+pub async fn create_accelerator_table(
+    table_name: &str,
+    schema: SchemaRef,
+    acceleration_settings: acceleration::Acceleration,
+    acceleration_secret: Option<Secret>,
+) -> Result<Arc<dyn TableProvider>> {
+    let params: Arc<Option<HashMap<String, String>>> =
+        Arc::new(acceleration_settings.params.clone());
+
+    let data_accelerator: Arc<dyn DataAccelerator> = AcceleratorBuilder::new(table_name, schema)
+        .engine(acceleration_settings.engine())
+        .mode(acceleration_settings.mode())
+        .params(params)
+        .secret(acceleration_secret)
+        .build()
+        .await
+        .context(AccelerationCreationFailedSnafu)?;
+
+    let table_provider = data_accelerator
+        .create_external_table(&CreateExternalTable {
+            schema: Arc::new(DFSchema::try_from(schema).map_err(|e| {
+                InvalidConfigurationSnafu {
+                    msg: format!("Failed to convert schema: {e}"),
+                }
+                .build()
+            })?),
+            name: OwnedTableReference::new(table_name),
+            location: String::new(),
+            file_type: String::new(),
+            has_header: false,
+            delimiter: ',',
+            table_partition_cols: vec![],
+            if_not_exists: false,
+            definition: None,
+            file_compression_type: CompressionTypeVariant::UNCOMPRESSED,
+            order_exprs: vec![],
+            unbounded: false,
+            options: Default::default(),
+            constraints: Constraints::empty(),
+            column_defaults: Default::default(),
+        })
+        .await
+        .context(AccelerationCreationFailedSnafu)?;
+
+    Ok(table_provider)
 }

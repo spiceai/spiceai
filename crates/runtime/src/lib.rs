@@ -17,9 +17,14 @@ limitations under the License.
 #![allow(clippy::missing_errors_doc)]
 
 use std::borrow::Borrow;
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::{collections::HashMap, sync::Arc};
 
+use ::datafusion::sql::parser::{self, DFParser};
+use ::datafusion::sql::sqlparser::ast::{SetExpr, TableFactor};
+use ::datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
+use ::datafusion::sql::sqlparser::{self, ast};
 use app::App;
 use config::Config;
 use model::Model;
@@ -39,7 +44,6 @@ pub mod config;
 pub mod dataaccelerator;
 pub mod dataconnector;
 pub mod datafusion;
-pub mod datapublisher;
 pub mod dataupdate;
 mod flight;
 mod http;
@@ -98,6 +102,31 @@ pub enum Error {
         source: datafusion::Error,
         data_connector: String,
     },
+
+    #[snafu(display("Expected a SQL view statement, received nothing."))]
+    ExpectedSqlView,
+
+    #[snafu(display("Unable to parse SQL: {source}"))]
+    UnableToParseSql {
+        source: sqlparser::parser::ParserError,
+    },
+
+    #[snafu(display("Unable to create view: {reason}"))]
+    UnableToCreateView { reason: String },
+
+    #[snafu(display(
+        "A federated table was configured as read_write without setting replication.enabled = true"
+    ))]
+    FederatedReadWriteTableWithoutReplication,
+
+    #[snafu(display("An accelerated table was configured as read_write without setting replication.enabled = true"))]
+    AcceleratedReadWriteTableWithoutReplication,
+
+    #[snafu(display("Expected acceleration settings for {name}, found None"))]
+    ExpectedAccelerationSettings { name: String },
+
+    #[snafu(display("The accelerator engine {name} is not available"))]
+    AcceleratorEngineNotAvailable { name: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -155,7 +184,7 @@ impl Runtime {
         let app_lock = self.app.read().await;
         if let Some(app) = app_lock.as_ref() {
             for ds in &app.datasets {
-                status::update_dataset(ds.name.clone(), status::ComponentStatus::Initializing);
+                status::update_dataset(&ds.name, status::ComponentStatus::Initializing);
                 self.load_dataset(ds, &app.datasets);
             }
         }
@@ -179,8 +208,8 @@ impl Runtime {
             loop {
                 let secrets_provider = shared_secrets_provider.read().await;
 
-                if !verify_dependent_tables(&ds, &existing_tables, Arc::clone(&df)).await {
-                    status::update_dataset(ds.name.clone(), status::ComponentStatus::Error);
+                if !verify_dependent_tables(&ds, &existing_tables).await {
+                    status::update_dataset(&ds.name, status::ComponentStatus::Error);
                     metrics::counter!("datasets_load_error").increment(1);
                     return;
                 }
@@ -188,7 +217,7 @@ impl Runtime {
                 let source = ds.source();
 
                 let params = Arc::new(ds.params.clone());
-                let data_connector: Option<Box<dyn DataConnector>> =
+                let data_connector: Box<dyn DataConnector> =
                     match Runtime::get_dataconnector_from_source(
                         &source,
                         &secrets_provider,
@@ -198,7 +227,7 @@ impl Runtime {
                     {
                         Ok(data_connector) => data_connector,
                         Err(err) => {
-                            status::update_dataset(ds.name.clone(), status::ComponentStatus::Error);
+                            status::update_dataset(&ds.name, status::ComponentStatus::Error);
                             metrics::counter!("datasets_load_error").increment(1);
                             warn_spaced!(
                                 spaced_tracer,
@@ -210,18 +239,18 @@ impl Runtime {
                         }
                     };
 
-                match Runtime::initialize_dataconnector(
+                match Runtime::register_dataset(
+                    &ds,
                     data_connector,
                     Arc::clone(&df),
                     &source,
-                    &ds,
                     Arc::clone(&shared_secrets_provider),
                 )
                 .await
                 {
                     Ok(()) => (),
                     Err(err) => {
-                        status::update_dataset(ds.name.clone(), status::ComponentStatus::Error);
+                        status::update_dataset(&ds.name, status::ComponentStatus::Error);
                         metrics::counter!("datasets_load_error").increment(1);
                         warn_spaced!(
                             spaced_tracer,
@@ -244,7 +273,7 @@ impl Runtime {
                     },
                 );
                 metrics::gauge!("datasets_count", "engine" => engine).increment(1.0);
-                status::update_dataset(ds.name.clone(), status::ComponentStatus::Ready);
+                status::update_dataset(&ds.name, status::ComponentStatus::Ready);
                 break;
             }
         });
@@ -275,7 +304,7 @@ impl Runtime {
     }
 
     pub async fn update_dataset(&self, ds: &Dataset, all_datasets: &[Dataset]) {
-        status::update_dataset(ds.name.clone(), status::ComponentStatus::Refreshing);
+        status::update_dataset(&ds.name, status::ComponentStatus::Refreshing);
         self.remove_dataset(ds).await;
         self.load_dataset(ds, all_datasets);
     }
@@ -284,11 +313,10 @@ impl Runtime {
         source: &str,
         secrets_provider: &secrets::SecretsProvider,
         params: Arc<Option<HashMap<String, String>>>,
-    ) -> Result<Option<Box<dyn DataConnector>>> {
+    ) -> Result<Box<dyn DataConnector>> {
         let secret = secrets_provider.get_secret(source).await;
 
         match source {
-            "localhost" => Ok(None),
             _ => match dataconnector::create_new_connector(source, secret, params).await {
                 Some(dc) => dc.map(Some).context(UnableToInitializeDataConnectorSnafu {
                     data_connector: source,
@@ -301,89 +329,94 @@ impl Runtime {
         }
     }
 
-    async fn initialize_dataconnector(
-        data_connector: Option<Box<dyn DataConnector>>,
+    async fn register_dataset(
+        ds: impl Borrow<Dataset>,
+        data_connector: Arc<dyn DataConnector>,
         df: Arc<RwLock<DataFusion>>,
         source: &str,
-        ds: impl Borrow<Dataset>,
         secrets_provider: Arc<RwLock<secrets::SecretsProvider>>,
     ) -> Result<()> {
         let ds = ds.borrow();
-        let view_sql = ds.view_sql().context(InvalidSQLViewSnafu)?;
-        let data_backend_publishing_enabled =
-            ds.mode() == Mode::ReadWrite || data_connector.is_none();
 
-        if view_sql.is_some() {
-            df.read()
+        // VIEW
+        if let Some(view_sql) = ds.view_sql() {
+            let view_sql = view_sql.context(InvalidSQLViewSnafu)?;
+            df.write()
                 .await
-                .attach_view(ds)
+                .register_table(ds, datafusion::Table::View(view_sql))
                 .context(UnableToAttachViewSnafu)?;
             return Ok(());
         }
 
+        let secrets_provider_read_guard = secrets_provider.read().await;
+        let source_secret = secrets_provider_read_guard.get_secret(&ds.source());
+        drop(secrets_provider_read_guard);
+
+        let replicate = ds.replication.as_ref().map_or(false, |r| r.enabled);
+
+        // FEDERATED TABLE
         if ds.acceleration.is_none() || ds.acceleration.as_ref().map_or(false, |acc| !acc.enabled) {
-            if let Some(data_connector) = data_connector {
-                df.read()
-                    .await
-                    .attach_federated_table(ds, data_connector)
-                    .await
-                    .context(UnableToAttachDataConnectorSnafu {
-                        data_connector: source,
-                    })?;
-                return Ok(());
-            }
-        }
-
-        let data_backend = df
-            .read()
-            .await
-            .new_accelerated_backend(ds, secrets_provider)
-            .await
-            .context(UnableToCreateBackendSnafu)?;
-        let data_backend = Arc::new(data_backend);
-
-        if data_backend_publishing_enabled {
-            df.write()
-                .await
-                .attach_publisher(&ds.name.clone(), ds.clone(), Arc::clone(&data_backend))
-                .await
-                .context(UnableToAttachDataConnectorSnafu {
-                    data_connector: source,
-                })?;
-        }
-
-        if let Some(data_connector) = data_connector {
-            let replicate = ds.replication.as_ref().map_or(false, |r| r.enabled);
-
-            // Attach data publisher only if replicate is true and mode is ReadWrite
-            if replicate && ds.mode() == Mode::ReadWrite {
-                if let Some(write_provider) = data_connector.write_provider() {
-                    df.write()
-                        .await
-                        .attach_publisher(&ds.name.clone(), ds.clone(), Arc::new(data_publisher))
-                        .await
-                        .context(UnableToAttachDataConnectorSnafu {
-                            data_connector: source,
-                        })?;
-                } else {
-                    tracing::warn!(
-                        "Data connector {source} does not support writes, but dataset {ds_name} is configured to replicate",
-                        ds_name = ds.name
-                    );
-                }
+            if ds.mode() == Mode::ReadWrite && !replicate {
+                // A federated dataset was configured as ReadWrite, but the replication setting wasn't set - error out.
+                FederatedReadWriteTableWithoutReplicationSnafu.fail()?;
             }
 
             df.write()
                 .await
-                .attach_connector_to_publisher(
-                    ds.clone(),
-                    data_connector,
-                    Arc::clone(&data_backend),
+                .register_table(
+                    ds,
+                    datafusion::Table::Federated {
+                        source: data_connector,
+                        source_secret,
+                    },
                 )
+                .await
                 .context(UnableToAttachDataConnectorSnafu {
                     data_connector: source,
                 })?;
+            return Ok(());
         }
+
+        // ACCELERATED TABLE
+        let acceleration_settings =
+            ds.acceleration
+                .ok_or_else(|| Error::ExpectedAccelerationSettings {
+                    name: ds.name.to_string(),
+                })?;
+
+        if ds.mode() == Mode::ReadWrite && !replicate {
+            AcceleratedReadWriteTableWithoutReplicationSnafu.fail()?;
+        }
+
+        let accelerator_engine = acceleration_settings.engine();
+        let secret_key = acceleration_settings
+            .engine_secret
+            .unwrap_or(format!("{:?}_engine", accelerator_engine).to_lowercase());
+
+        let secrets_provider_read_guard = secrets_provider.read().await;
+        let acceleration_secret = secrets_provider_read_guard.get_secret(&secret_key);
+        drop(secrets_provider_read_guard);
+
+        let Some(accelerator) = dataaccelerator::get_accelerator_engine(&accelerator_engine) else {
+            return Err(Error::AcceleratorEngineNotAvailable {
+                name: accelerator_engine,
+            });
+        };
+
+        df.write()
+            .await
+            .register_table(
+                ds,
+                datafusion::Table::Accelerated {
+                    source: data_connector,
+                    source_secret,
+                    accelerator,
+                    acceleration_secret,
+                },
+            )
+            .context(UnableToAttachDataConnectorSnafu {
+                data_connector: source,
+            })?;
 
         Ok(())
     }
@@ -392,7 +425,7 @@ impl Runtime {
         let app_lock = self.app.read().await;
         if let Some(app) = app_lock.as_ref() {
             for model in &app.models {
-                status::update_model(model.name.clone(), status::ComponentStatus::Initializing);
+                status::update_model(&model.name, status::ComponentStatus::Initializing);
                 self.load_model(model).await;
             }
         }
@@ -420,11 +453,11 @@ impl Runtime {
                 model_map.insert(m.name.clone(), in_m);
                 tracing::info!("Model [{}] deployed, ready for inferencing", m.name);
                 metrics::gauge!("models_count", "model" => m.name.clone(), "source" => model::source(&m.from)).increment(1.0);
-                status::update_model(model.name.clone(), status::ComponentStatus::Ready);
+                status::update_model(&model.name, status::ComponentStatus::Ready);
             }
             Err(e) => {
                 metrics::counter!("models_load_error").increment(1);
-                status::update_model(model.name.clone(), status::ComponentStatus::Error);
+                status::update_model(&model.name, status::ComponentStatus::Error);
                 tracing::warn!(
                     "Unable to load runnable model from spicepod {}, error: {}",
                     m.name,
@@ -449,7 +482,7 @@ impl Runtime {
     }
 
     pub async fn update_model(&self, m: &SpicepodModel) {
-        status::update_model(m.name.clone(), status::ComponentStatus::Refreshing);
+        status::update_model(&m.name, status::ComponentStatus::Refreshing);
         self.remove_model(m).await;
         self.load_model(m).await;
     }
@@ -503,10 +536,7 @@ impl Runtime {
                             self.update_dataset(ds, &new_app.datasets).await;
                         }
                     } else {
-                        status::update_dataset(
-                            ds.name.clone(),
-                            status::ComponentStatus::Initializing,
-                        );
+                        status::update_dataset(&ds.name, status::ComponentStatus::Initializing);
                         self.load_dataset(ds, &new_app.datasets);
                     }
                 }
@@ -520,10 +550,7 @@ impl Runtime {
                             self.update_model(model).await;
                         }
                     } else {
-                        status::update_model(
-                            model.name.clone(),
-                            status::ComponentStatus::Initializing,
-                        );
+                        status::update_model(&model.name, status::ComponentStatus::Initializing);
                         self.load_model(model).await;
                     }
                 }
@@ -531,7 +558,7 @@ impl Runtime {
                 // Remove models that are no longer in the app
                 for model in &current_app.models {
                     if !new_app.models.iter().any(|m| m.name == model.name) {
-                        status::update_model(model.name.clone(), status::ComponentStatus::Disabled);
+                        status::update_model(&model.name, status::ComponentStatus::Disabled);
                         self.remove_model(model).await;
                     }
                 }
@@ -539,7 +566,7 @@ impl Runtime {
                 // Remove datasets that are no longer in the app
                 for ds in &current_app.datasets {
                     if !new_app.datasets.iter().any(|d| d.name == ds.name) {
-                        status::update_dataset(ds.name.clone(), status::ComponentStatus::Disabled);
+                        status::update_dataset(&ds.name, status::ComponentStatus::Disabled);
                         self.remove_dataset(ds).await;
                     }
                 }
@@ -554,16 +581,12 @@ impl Runtime {
     }
 }
 
-async fn verify_dependent_tables(
-    ds: &Dataset,
-    existing_tables: &[String],
-    df: Arc<RwLock<DataFusion>>,
-) -> bool {
+async fn verify_dependent_tables(ds: &Dataset, existing_tables: &[String]) -> bool {
     if !ds.is_view() {
         return true;
     }
 
-    let dependent_tables = match df.read().await.get_view_dependent_tables(ds) {
+    let dependent_tables = match get_view_dependent_tables(ds) {
         Ok(tables) => tables,
         Err(err) => {
             tracing::error!(
@@ -587,6 +610,94 @@ async fn verify_dependent_tables(
     }
 
     true
+}
+
+fn get_view_dependent_tables(dataset: impl Borrow<Dataset>) -> Result<Vec<String>> {
+    let ds = dataset.borrow();
+
+    let Some(sql) = ds.view_sql().context(InvalidSQLViewSnafu)? else {
+        return ExpectedSqlViewSnafu.fail();
+    };
+
+    let statements = DFParser::parse_sql_with_dialect(sql.as_str(), &PostgreSqlDialect {})
+        .context(UnableToParseSqlSnafu)?;
+
+    if statements.len() != 1 {
+        return UnableToCreateViewSnafu {
+            reason: format!(
+                "Expected 1 statement to create view from, received {}",
+                statements.len()
+            )
+            .to_string(),
+        }
+        .fail();
+    }
+
+    Ok(get_dependent_table_names(&statements[0]))
+}
+
+fn get_dependent_table_names(statement: &parser::Statement) -> Vec<String> {
+    let mut table_names = Vec::new();
+    let mut cte_names = HashSet::new();
+
+    if let parser::Statement::Statement(statement) = statement.clone() {
+        if let ast::Statement::Query(statement) = *statement {
+            // Collect names of CTEs
+            if let Some(with) = statement.with {
+                for table in with.cte_tables {
+                    cte_names.insert(table.alias.name.to_string());
+                    let cte_table_names = DataFusion::get_dependent_table_names(
+                        &parser::Statement::Statement(Box::new(ast::Statement::Query(table.query))),
+                    );
+                    // Extend table_names with names found in CTEs if they reference actual tables
+                    table_names.extend(cte_table_names);
+                }
+            }
+            // Process the main query body
+            if let SetExpr::Select(select_statement) = *statement.body {
+                for from in select_statement.from {
+                    let mut relations = vec![];
+                    relations.push(from.relation.clone());
+                    for join in from.joins {
+                        relations.push(join.relation.clone());
+                    }
+
+                    for relation in relations {
+                        match relation {
+                            TableFactor::Table {
+                                name,
+                                alias: _,
+                                args: _,
+                                with_hints: _,
+                                version: _,
+                                partitions: _,
+                            } => {
+                                table_names.push(name.to_string());
+                            }
+                            TableFactor::Derived {
+                                lateral: _,
+                                subquery,
+                                alias: _,
+                            } => {
+                                table_names.extend(DataFusion::get_dependent_table_names(
+                                    &parser::Statement::Statement(Box::new(ast::Statement::Query(
+                                        subquery,
+                                    ))),
+                                ));
+                            }
+                            _ => (),
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Filter out CTEs and temporary views (aliases of subqueries)
+    table_names
+        .into_iter()
+        .filter(|name| !cte_names.contains(name))
+        .collect()
 }
 
 async fn shutdown_signal() {

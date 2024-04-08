@@ -16,7 +16,6 @@ limitations under the License.
 
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
-use data_components::{Read, ReadWrite, Stream};
 use datafusion::datasource::TableProvider;
 use datafusion::execution::context::SessionContext;
 use futures::StreamExt;
@@ -37,28 +36,19 @@ use std::future::Future;
 use data_components::databricks::Databricks;
 
 pub mod databricks;
-pub mod dremio;
-pub mod flight;
-pub mod flightsql;
-#[cfg(feature = "mysql")]
-pub mod mysql;
-#[cfg(feature = "postgres")]
-pub mod postgres;
-pub mod s3;
-pub mod spiceai;
+// pub mod dremio;
+// pub mod flight;
+// pub mod flightsql;
+pub mod localhost;
+// #[cfg(feature = "mysql")]
+// pub mod mysql;
+// #[cfg(feature = "postgres")]
+// pub mod postgres;
+// pub mod s3;
+// pub mod spiceai;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to create data connector: {source}"))]
-    UnableToCreateDataConnector {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    #[snafu(display("Unable to get table provider: {source}"))]
-    UnableToGetTableProvider {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
     #[snafu(display("Unable to scan table provider: {source}"))]
     UnableToScanTableProvider {
         source: datafusion::error::DataFusionError,
@@ -66,7 +56,7 @@ pub enum Error {
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
-pub type AnyErrorResult = std::result::Result<(), Box<dyn std::error::Error>>;
+pub type AnyErrorResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 type NewDataConnectorResult = Result<Box<dyn DataConnector>>;
 
@@ -117,15 +107,16 @@ pub async fn create_new_connector(
 }
 
 pub async fn register_all() {
+    register_connector_factory("localhost", localhost::LocalhostConnector::create).await;
     register_connector_factory("databricks", Databricks::create).await;
     //register_connector_factory("dremio", Dremio::create).await;
-    register_connector_factory("flightsql", flightsql::FlightSQL::create).await;
-    register_connector_factory("s3", s3::S3::create).await;
-    register_connector_factory("spiceai", spiceai::SpiceAI::create).await;
-    #[cfg(feature = "mysql")]
-    register_connector_factory("mysql", mysql::MySQL::create).await;
-    #[cfg(feature = "postgres")]
-    register_connector_factory("postgres", postgres::Postgres::create).await;
+    // register_connector_factory("flightsql", flightsql::FlightSQL::create).await;
+    // register_connector_factory("s3", s3::S3::create).await;
+    // register_connector_factory("spiceai", spiceai::SpiceAI::create).await;
+    // #[cfg(feature = "mysql")]
+    // register_connector_factory("mysql", mysql::MySQL::create).await;
+    // #[cfg(feature = "postgres")]
+    // register_connector_factory("postgres", postgres::Postgres::create).await;
 }
 
 pub trait DataConnectorFactory {
@@ -140,22 +131,27 @@ pub trait DataConnectorFactory {
 pub trait DataConnector: Send + Sync {
     fn as_any(&self) -> &dyn Any;
 
-    fn read_provider(&self) -> &dyn Read;
+    async fn read_provider(&self, dataset: &Dataset) -> AnyErrorResult<Arc<dyn TableProvider>>;
 
-    fn write_provider(&self) -> Option<&dyn ReadWrite> {
+    async fn read_write_provider(
+        &self,
+        dataset: &Dataset,
+    ) -> Option<AnyErrorResult<Arc<dyn TableProvider>>> {
         None
     }
 
-    fn stream_provider(&self) -> Option<&dyn Stream> {
+    async fn stream_provider(
+        &self,
+        dataset: &Dataset,
+    ) -> Option<AnyErrorResult<Arc<dyn TableProvider>>> {
         None
     }
 
-    fn has_object_store(&self) -> bool {
-        false
-    }
-
-    fn get_object_store(&self, dataset: &Dataset) -> Result<(Url, Arc<dyn ObjectStore + 'static>)> {
-        panic!("get_object_store not implemented for {}", dataset.name)
+    fn get_object_store(
+        &self,
+        dataset: &Dataset,
+    ) -> Option<AnyErrorResult<(Url, Arc<dyn ObjectStore + 'static>)>> {
+        None
     }
 }
 
