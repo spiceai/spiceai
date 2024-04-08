@@ -25,6 +25,7 @@ use arrow::{
     datatypes::{DataType, Field, Schema, TimeUnit},
 };
 use bigdecimal::BigDecimal;
+use chrono::Timelike;
 use mysql_async::{consts::ColumnType, Row, Value};
 use snafu::{ResultExt, Snafu};
 
@@ -263,6 +264,67 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                         row,
                         i
                     );
+                }
+                ColumnType::MYSQL_TYPE_TIMESTAMP => {
+                    let Some(builder) = builder else {
+                        return NoBuilderForIndexSnafu { index: i }.fail();
+                    };
+                    let Some(builder) = builder.as_any_mut().downcast_mut::<Int64Builder>() else {
+                        return FailedToDowncastBuilderSnafu {
+                            mysql_type: format!("{mysql_type:?}"),
+                        }
+                        .fail();
+                    };
+                    let v = row.get_opt::<Value, usize>(i).transpose().context(
+                        FailedToGetRowValueSnafu {
+                            mysql_type: ColumnType::MYSQL_TYPE_TIMESTAMP,
+                        },
+                    )?;
+                    match v {
+                        Some(v) => {
+                            let timestamp = match v {
+                                Value::Date(year, month, day, hour, minute, second, micros) => {
+                                    let timestamp = chrono::NaiveDate::from_ymd_opt(
+                                        year as i32,
+                                        month as u32,
+                                        day as u32,
+                                    )
+                                    .unwrap_or_default()
+                                    .and_hms_micro_opt(
+                                        hour as u32,
+                                        minute as u32,
+                                        second as u32,
+                                        micros as u32,
+                                    )
+                                    .unwrap_or_default()
+                                    .and_utc();
+                                    timestamp.timestamp()
+                                }
+                                Value::Time(is_neg, days, hours, minutes, seconds, micros) => {
+                                    let naivetime = chrono::NaiveTime::from_hms_micro_opt(
+                                        hours as u32,
+                                        minutes as u32,
+                                        seconds as u32,
+                                        micros as u32,
+                                    )
+                                    .unwrap_or_default();
+
+                                    let time: i64 = naivetime.num_seconds_from_midnight().into();
+
+                                    let timestamp = days as i64 * 24 * 60 * 60 + time;
+
+                                    if is_neg {
+                                        -timestamp
+                                    } else {
+                                        timestamp
+                                    }
+                                }
+                                _ => 0,
+                            };
+                            builder.append_value(timestamp);
+                        }
+                        None => builder.append_null(),
+                    }
                 }
                 _ => unimplemented!("Unsupported column type {:?}", mysql_type),
             }
