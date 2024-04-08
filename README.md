@@ -13,7 +13,7 @@
 
 Spice makes it easy to build data-driven and data-intensive applications by streamlining the use of data and machine learning (ML) in software.
 
-The Spice runtime is written in Rust and leverages industry leading technologies like Apache DataFusion, Apache Arrow, Apache Arrow Flight SQL, and DuckDB.
+The Spice runtime is written in Rust and leverages industry leading technologies like Apache DataFusion, Apache Arrow, Apache Arrow Flight, and DuckDB.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://github.com/spiceai/spiceai/assets/80174/96b5fcef-a550-4ce8-a74a-83931275e83e">  
@@ -66,7 +66,7 @@ Currently supported data connectors for upstream datasets. More coming soon.
 | `postgres`   | PostgreSQL                                                                                     | Alpha        |                  | `full`           |
 | `spiceai`    | [Spice.ai](https://github.com/spiceai/quickstarts/tree/trunk/spiceai#readme)                   | Alpha        | Arrow Flight     | `append`, `full` |
 | `s3`         | [S3](https://github.com/spiceai/quickstarts/tree/trunk/s3#readme)                              | Alpha        | Parquet          | `full`           |
-| `dremio`     | [Dremio](https://github.com/spiceai/quickstarts/tree/trunk/dremio#readme)                      | Alpha        | Arrow Flight SQL | `full`           |
+| `dremio`     | [Dremio](https://github.com/spiceai/quickstarts/tree/trunk/dremio#readme)                      | Alpha        | Arrow Flight     | `full`           |
 | `mysql`      | MySQL                                                                                          | Alpha        |                  | `full`           |
 | `snowflake`  | Snowflake                                                                                      | Coming soon! | Arrow Flight SQL | `full`           |
 | `bigquery`   | BigQuery                                                                                       | Coming soon! | Arrow Flight SQL | `full`           |
