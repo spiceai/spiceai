@@ -18,9 +18,9 @@ use std::{convert, sync::Arc};
 
 use arrow::{
     array::{
-        ArrayBuilder, ArrayRef, Float32Builder, Float64Builder, Int16Builder, Int32Builder,
-        Int64Builder, Int8Builder, NullBuilder, RecordBatch, RecordBatchOptions, StringBuilder,
-        UInt64Builder,
+        ArrayBuilder, ArrayRef, BinaryBuilder, Float32Builder, Float64Builder, Int16Builder,
+        Int32Builder, Int64Builder, Int8Builder, NullBuilder, RecordBatch, RecordBatchOptions,
+        StringBuilder, UInt64Builder,
     },
     datatypes::{DataType, Field, Schema, TimeUnit},
 };
@@ -250,6 +250,16 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                         ColumnType::MYSQL_TYPE_VAR_STRING,
                         StringBuilder,
                         String,
+                        row,
+                        i
+                    );
+                }
+                ColumnType::MYSQL_TYPE_BLOB => {
+                    handle_primitive_type!(
+                        builder,
+                        ColumnType::MYSQL_TYPE_BLOB,
+                        BinaryBuilder,
+                        Vec<u8>,
                         row,
                         i
                     );
