@@ -237,11 +237,11 @@ helm install spiceai spiceai/spiceai
 
 ## 🏎️ Next Steps
 
-You can use any number of predefined datasets available from Spice.ai in the Spice runtime.
+You can use any number of predefined datasets available from the Spice.ai Cloud Platform in the Spice runtime.
 
-A list of publically available datasets from Spice.ai can be found here: https://[docs.spice.ai/building-blocks/datasets](https://docs.spice.ai/building-blocks/datasets).
+A list of publicly available datasets from Spice.ai can be found here: [https://docs.spice.ai/building-blocks/datasets](https://docs.spice.ai/building-blocks/datasets).
 
-In order to access public datasets from Spice, you will first need to create an account with Spice.ai by selecting the free tier membership.
+In order to access public datasets from Spice.ai, you will first need to create an account with Spice.ai by selecting the free tier membership.
 
 Navigate to [spice.ai](https://spice.ai/) and create a new account by clicking on Try for Free.
 
@@ -251,7 +251,7 @@ After creating an account, you will need to create an app in order to create to 
 
 ![create_app-1](https://github.com/spiceai/spiceai/assets/112157037/d2446406-1f06-40fb-8373-1b6d692cb5f7)
 
-You will now be able to access datasets from Spice.ai. For this demonstration, we will be using the Spice.ai/eth.recent_blocks dataset.
+You will now be able to access datasets from Spice.ai. For this demonstration, we will be using the `spice.ai/eth.recent_blocks` dataset.
 
 **Step 1.** Log in and authenticate from the command line using the `spice login` command. A pop up browser window will prompt you to authenticate:
 
