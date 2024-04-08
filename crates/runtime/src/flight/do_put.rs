@@ -31,11 +31,11 @@ use super::Service;
 
 async fn get_sender_channel(
     channel_map: Arc<RwLock<HashMap<String, Arc<Sender<DataUpdate>>>>>,
-    path: String,
+    path: &str,
 ) -> Option<Arc<Sender<DataUpdate>>> {
     let channel_map_read = channel_map.read().await;
-    if channel_map_read.contains_key(&path) {
-        let channel = channel_map_read.get(&path)?;
+    if channel_map_read.contains_key(path) {
+        let channel = channel_map_read.get(path)?;
         Some(Arc::clone(channel))
     } else {
         None
@@ -65,13 +65,12 @@ pub(crate) async fn handle(
 
     let df = flight_svc.datafusion.read().await;
 
-    let Some(publishers) = df.get_publishers(&path) else {
+    if !df.is_writable(&path) {
         return Err(Status::invalid_argument(format!(
-            "No publishers registered for path: {path}",
+            "Path doesn't exist or is not writable: {path}",
         )));
     };
-    let dataset = Arc::clone(&publishers.0);
-    let data_publishers = Arc::clone(&publishers.1);
+    drop(df);
 
     let schema = try_schema_from_flatbuffer_bytes(&message.data_header)
         .map_err(|e| Status::internal(format!("Failed to get schema from data header: {e}")))?;
@@ -92,12 +91,12 @@ pub(crate) async fn handle(
     }
 
     let channel_map = Arc::clone(&flight_svc.channel_map);
+    let df = Arc::clone(&flight_svc.datafusion);
 
     let response_stream = stream::unfold(streaming_flight, move |mut flight| {
         let schema = Arc::clone(&schema);
+        let df = Arc::clone(&df);
         let dictionaries_by_id = Arc::clone(&dictionaries_by_id);
-        let dataset = Arc::clone(&dataset);
-        let data_publishers = Arc::clone(&data_publishers);
         let path = path.clone();
         let channel_map = Arc::clone(&channel_map);
         async move {
@@ -122,20 +121,17 @@ pub(crate) async fn handle(
                         update_type: UpdateType::Append,
                     };
 
-                    if let Some(channel) = get_sender_channel(channel_map, path).await {
+                    if let Some(channel) = get_sender_channel(channel_map, &path).await {
                         let _ = channel.send(data_update.clone());
                     };
 
-                    let data_publishers = data_publishers.read().await;
-                    for publisher in data_publishers.iter() {
-                        if let Err(err) = publisher
-                            .add_data(Arc::clone(&dataset), data_update.clone())
-                            .await
-                            .map_err(|e| Status::internal(format!("Failed to add data: {e}")))
-                        {
-                            return Some((Err(err), flight));
-                        };
-                    }
+                    let df_guard = df.read().await;
+                    if let Err(e) = df_guard.write_data(&path, data_update).await {
+                        return Some((
+                            Err(Status::internal(format!("Error writing data: {e}"))),
+                            flight,
+                        ));
+                    };
 
                     Some((Ok(PutResult::default()), flight))
                 }

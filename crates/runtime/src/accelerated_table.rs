@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use datafusion::error::Result as DataFusionResult;
 use datafusion::execution::context::SessionState;
 use datafusion::logical_expr::TableProviderFilterPushDown;
-use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::{collect, ExecutionPlan};
 use datafusion::{
     datasource::{TableProvider, TableType},
     execution::context::SessionContext,
@@ -96,8 +96,9 @@ impl AcceleratedTable {
                     };
                     let ctx = SessionContext::new();
                     let state = ctx.state();
+
                     let overwrite = data_update.update_type == UpdateType::Overwrite;
-                    if let Err(e) = accelerator
+                    match accelerator
                         .insert_into(
                             &state,
                             Arc::new(DataUpdateExecutionPlan::new(data_update)),
@@ -105,8 +106,15 @@ impl AcceleratedTable {
                         )
                         .await
                     {
-                        tracing::error!("Error adding data for {dataset_name}: {e}");
-                    };
+                        Ok(plan) => {
+                            if let Err(e) = collect(plan, ctx.task_ctx()).await {
+                                tracing::error!("Error adding data for {dataset_name}: {e}");
+                            };
+                        }
+                        Err(e) => {
+                            tracing::error!("Error adding data for {dataset_name}: {e}");
+                        }
+                    }
                 }
                 None => break,
             };

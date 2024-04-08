@@ -22,11 +22,14 @@ use std::time::Duration;
 use crate::accelerated_table::AcceleratedTable;
 use crate::dataaccelerator::{self, create_accelerator_table};
 use crate::dataconnector::DataConnector;
+use crate::dataupdate::{DataUpdate, DataUpdateExecutionPlan, UpdateType};
 use crate::get_dependent_table_names;
 use arrow::datatypes::Schema;
+use datafusion::common::OwnedTableReference;
 use datafusion::datasource::ViewTable;
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::{SessionConfig, SessionContext};
+use datafusion::physical_plan::collect;
 use datafusion::sql::parser::DFParser;
 use datafusion::sql::sqlparser;
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
@@ -81,6 +84,21 @@ pub enum Error {
     InvalidObjectStore {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[snafu(display("The table {table_name} is not writable"))]
+    TableNotWritable { table_name: String },
+
+    #[snafu(display("Unable to plan the table insert for {table_name}: {source}"))]
+    UnableToPlanTableInsert {
+        table_name: String,
+        source: DataFusionError,
+    },
+
+    #[snafu(display("Unable to execute the table insert for {table_name}: {source}"))]
+    UnableToExecuteTableInsert {
+        table_name: String,
+        source: DataFusionError,
+    },
 }
 
 pub(crate) enum Table {
@@ -130,8 +148,43 @@ impl DataFusion {
     }
 
     #[must_use]
-    pub fn is_writable(&self, dataset: &str) -> bool {
-        self.data_writers.iter().any(|s| s.as_str() == dataset)
+    pub fn is_writable(&self, table_name: &str) -> bool {
+        self.data_writers.iter().any(|s| s.as_str() == table_name)
+    }
+
+    pub async fn write_data(&self, table_name: &str, data_update: DataUpdate) -> Result<()> {
+        if !self.is_writable(table_name) {
+            TableNotWritableSnafu {
+                table_name: table_name.to_string(),
+            }
+            .fail()?
+        }
+
+        let table_provider = self
+            .ctx
+            .table_provider(OwnedTableReference::bare(table_name.to_string()))
+            .await
+            .context(UnableToGetTableSnafu)?;
+
+        let overwrite = data_update.update_type == UpdateType::Overwrite;
+        let insert_plan = table_provider
+            .insert_into(
+                &self.ctx.state(),
+                Arc::new(DataUpdateExecutionPlan::new(data_update)),
+                overwrite,
+            )
+            .await
+            .context(UnableToPlanTableInsertSnafu {
+                table_name: table_name.to_string(),
+            })?;
+
+        let _ = collect(insert_plan, self.ctx.task_ctx()).await.context(
+            UnableToExecuteTableInsertSnafu {
+                table_name: table_name.to_string(),
+            },
+        )?;
+
+        Ok(())
     }
 
     pub async fn get_arrow_schema(&self, dataset: &str) -> Result<Schema> {
