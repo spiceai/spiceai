@@ -15,15 +15,16 @@ limitations under the License.
 */
 
 use std::borrow::Borrow;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::accelerated_table::AcceleratedTable;
-use crate::dataaccelerator::{self, create_accelerator_table, DataAccelerator};
+use crate::dataaccelerator::{self, create_accelerator_table};
 use crate::dataconnector::DataConnector;
 use crate::get_dependent_table_names;
 use arrow::datatypes::Schema;
-use datafusion::datasource::{TableProvider, ViewTable};
+use datafusion::datasource::ViewTable;
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::{SessionConfig, SessionContext};
 use datafusion::sql::parser::DFParser;
@@ -85,20 +86,15 @@ pub enum Error {
 pub(crate) enum Table {
     Accelerated {
         source: Arc<dyn DataConnector>,
-        source_secret: Option<Secret>,
-        accelerator: Arc<dyn DataAccelerator>,
         acceleration_secret: Option<Secret>,
     },
-    Federated {
-        source: Arc<dyn DataConnector>,
-        source_secret: Option<Secret>,
-    },
+    Federated(Arc<dyn DataConnector>),
     View(String),
 }
 
 pub struct DataFusion {
     pub ctx: Arc<SessionContext>,
-    data_writers: Vec<String>,
+    data_writers: HashSet<String>,
 }
 
 impl DataFusion {
@@ -108,7 +104,7 @@ impl DataFusion {
         df_config.options_mut().sql_parser.dialect = "PostgreSQL".to_string();
         DataFusion {
             ctx: Arc::new(SessionContext::new_with_config(df_config)),
-            data_writers: Vec::new(),
+            data_writers: HashSet::new(),
         }
     }
 
@@ -118,30 +114,15 @@ impl DataFusion {
         table: Table,
     ) -> Result<()> {
         let dataset = dataset.borrow();
-        let mode = dataset.mode();
         match table {
             Table::Accelerated {
                 source,
-                source_secret,
-                accelerator,
                 acceleration_secret,
             } => {
-                self.register_accelerated_table(
-                    dataset,
-                    source,
-                    source_secret,
-                    accelerator,
-                    acceleration_secret,
-                )
-                .await
+                self.register_accelerated_table(dataset, source, acceleration_secret)
+                    .await?
             }
-            Table::Federated {
-                source,
-                source_secret,
-            } => {
-                self.register_federated_table(dataset, source, source_secret)
-                    .await
-            }
+            Table::Federated(source) => self.register_federated_table(dataset, source).await?,
             Table::View(sql) => self.register_view(&dataset.name, sql)?,
         }
 
@@ -150,7 +131,7 @@ impl DataFusion {
 
     #[must_use]
     pub fn is_writable(&self, dataset: &str) -> bool {
-        self.data_writers.contains(dataset)
+        self.data_writers.iter().any(|s| s.as_str() == dataset)
     }
 
     pub async fn get_arrow_schema(&self, dataset: &str) -> Result<Schema> {
@@ -179,7 +160,7 @@ impl DataFusion {
             .fail();
         }
 
-        if self.data_writers.contains(dataset_name) {
+        if self.is_writable(dataset_name) {
             self.data_writers.remove(dataset_name);
         }
 
@@ -190,8 +171,6 @@ impl DataFusion {
         &mut self,
         dataset: &Dataset,
         source: Arc<dyn DataConnector>,
-        source_secret: Option<Secret>,
-        accelerator: Arc<dyn DataAccelerator>,
         acceleration_secret: Option<Secret>,
     ) -> Result<()> {
         let source_table_provider = match dataset.mode() {
@@ -201,13 +180,13 @@ impl DataFusion {
                 .context(UnableToResolveTableProviderSnafu)?,
             Mode::ReadWrite => source
                 .read_write_provider(dataset)
+                .await
                 .ok_or_else(|| {
                     WriteProviderNotImplementedSnafu {
                         table_name: dataset.name.to_string(),
                     }
                     .build()
                 })?
-                .await
                 .context(UnableToResolveTableProviderSnafu)?,
         };
 
@@ -215,6 +194,7 @@ impl DataFusion {
         let acceleration_settings =
             dataset
                 .acceleration
+                .clone()
                 .ok_or_else(|| Error::ExpectedAccelerationSettings {
                     name: dataset.name.to_string(),
                 })?;
@@ -222,7 +202,7 @@ impl DataFusion {
         let accelerated_table_provider = create_accelerator_table(
             &dataset.name,
             source_schema,
-            acceleration_settings,
+            &acceleration_settings,
             acceleration_secret,
         )
         .await
@@ -232,13 +212,15 @@ impl DataFusion {
             dataset.name.to_string(),
             source_table_provider,
             accelerated_table_provider,
-            acceleration_settings.refresh_mode,
-            acceleration_settings.refresh_interval,
+            acceleration_settings.refresh_mode.clone(),
+            dataset.refresh_interval(),
         );
 
         self.ctx
-            .register_table(&dataset.name, accelerated_table)
+            .register_table(&dataset.name, Arc::new(accelerated_table))
             .context(UnableToRegisterTableToDataFusionSnafu)?;
+
+        Ok(())
     }
 
     /// Federated tables are attached directly as tables visible in the public DataFusion context.
@@ -246,7 +228,6 @@ impl DataFusion {
         &self,
         dataset: &Dataset,
         source: Arc<dyn DataConnector>,
-        source_secret: Option<Secret>,
     ) -> Result<()> {
         if let Some(obj_store_result) = source.get_object_store(dataset) {
             let (key, store) = obj_store_result.context(InvalidObjectStoreSnafu)?;

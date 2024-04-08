@@ -349,10 +349,6 @@ impl Runtime {
             return Ok(());
         }
 
-        let secrets_provider_read_guard = secrets_provider.read().await;
-        let source_secret = secrets_provider_read_guard.get_secret(&ds.source()).await;
-        drop(secrets_provider_read_guard);
-
         let replicate = ds.replication.as_ref().map_or(false, |r| r.enabled);
 
         // FEDERATED TABLE
@@ -364,13 +360,7 @@ impl Runtime {
 
             df.write()
                 .await
-                .register_table(
-                    ds,
-                    datafusion::Table::Federated {
-                        source: data_connector,
-                        source_secret,
-                    },
-                )
+                .register_table(ds, datafusion::Table::Federated(data_connector))
                 .await
                 .context(UnableToAttachDataConnectorSnafu {
                     data_connector: source,
@@ -400,8 +390,7 @@ impl Runtime {
         let acceleration_secret = secrets_provider_read_guard.get_secret(&secret_key).await;
         drop(secrets_provider_read_guard);
 
-        let Some(accelerator) = dataaccelerator::get_accelerator_engine(&accelerator_engine).await
-        else {
+        if let None = dataaccelerator::get_accelerator_engine(&accelerator_engine).await {
             return Err(Error::AcceleratorEngineNotAvailable {
                 name: accelerator_engine,
             });
@@ -413,8 +402,6 @@ impl Runtime {
                 ds,
                 datafusion::Table::Accelerated {
                     source: data_connector,
-                    source_secret,
-                    accelerator,
                     acceleration_secret,
                 },
             )

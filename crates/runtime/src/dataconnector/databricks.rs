@@ -67,7 +67,7 @@ impl DataConnectorFactory for Databricks {
                 .await
                 .context(InvalidEndpointSnafu { endpoint })?;
 
-            Ok(Box::new(Databricks::new(Arc::new(secret), params)) as Box<dyn DataConnector>)
+            Ok(Arc::new(Databricks::new(Arc::new(secret), params)) as Arc<dyn DataConnector>)
         })
     }
 }

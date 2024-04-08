@@ -204,7 +204,7 @@ impl AcceleratorBuilder {
 pub async fn create_accelerator_table(
     table_name: &str,
     schema: SchemaRef,
-    acceleration_settings: acceleration::Acceleration,
+    acceleration_settings: &acceleration::Acceleration,
     acceleration_secret: Option<Secret>,
 ) -> Result<Arc<dyn TableProvider>> {
     let params: Arc<Option<HashMap<String, String>>> =

@@ -35,7 +35,7 @@ impl DataConnectorFactory for LocalhostConnector {
         secret: Option<Secret>,
         params: Arc<Option<HashMap<String, String>>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
-        Box::pin(async move { Ok(Box::new(LocalhostConnector {}) as Box<dyn DataConnector>) })
+        Box::pin(async move { Ok(Arc::new(LocalhostConnector {}) as Arc<dyn DataConnector>) })
     }
 }
 
