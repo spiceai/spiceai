@@ -45,6 +45,7 @@ pub mod dataaccelerator;
 pub mod dataconnector;
 pub mod datafusion;
 pub mod dataupdate;
+pub mod execution_plan;
 mod flight;
 mod http;
 pub mod model;

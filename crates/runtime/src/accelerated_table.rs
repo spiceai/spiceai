@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use datafusion::error::Result as DataFusionResult;
 use datafusion::execution::context::SessionState;
 use datafusion::logical_expr::TableProviderFilterPushDown;
+use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{collect, ExecutionPlan};
 use datafusion::{
     datasource::{TableProvider, TableType},
@@ -17,6 +18,8 @@ use snafu::prelude::*;
 use spicepod::component::dataset::acceleration::RefreshMode;
 use tokio::task::JoinHandle;
 
+use crate::execution_plan::slice::SliceExec;
+use crate::execution_plan::tee::TeeExec;
 use crate::{
     dataconnector::{self, get_all_data},
     dataupdate::{DataUpdate, DataUpdateExecutionPlan, UpdateType},
@@ -42,20 +45,21 @@ type Result<T> = std::result::Result<T, Error>;
 // The accelerator must support inserts.
 pub(crate) struct AcceleratedTable {
     accelerator: Arc<dyn TableProvider>,
+    federated: Arc<dyn TableProvider>,
     refresh_handle: JoinHandle<()>,
 }
 
 impl AcceleratedTable {
     pub fn new(
         dataset_name: String,
-        source: Arc<dyn TableProvider>,
+        federated: Arc<dyn TableProvider>,
         accelerator: Arc<dyn TableProvider>,
         refresh_mode: RefreshMode,
         refresh_interval: Option<Duration>,
     ) -> Self {
         let refresh_handle = tokio::spawn(Self::start_refresh(
             dataset_name,
-            source,
+            Arc::clone(&federated),
             refresh_mode,
             refresh_interval,
             Arc::clone(&accelerator),
@@ -63,19 +67,24 @@ impl AcceleratedTable {
 
         Self {
             accelerator,
+            federated,
             refresh_handle,
         }
     }
 
     async fn start_refresh(
         dataset_name: String,
-        source: Arc<dyn TableProvider>,
+        federated: Arc<dyn TableProvider>,
         refresh_mode: RefreshMode,
         refresh_interval: Option<Duration>,
         accelerator: Arc<dyn TableProvider>,
     ) {
-        let mut stream =
-            Self::stream_updates(dataset_name.clone(), source, refresh_mode, refresh_interval);
+        let mut stream = Self::stream_updates(
+            dataset_name.clone(),
+            federated,
+            refresh_mode,
+            refresh_interval,
+        );
         loop {
             let future_result = stream.next().await;
             match future_result {
@@ -116,7 +125,7 @@ impl AcceleratedTable {
 
     fn stream_updates<'a>(
         dataset_name: String,
-        source: Arc<dyn TableProvider>,
+        federated: Arc<dyn TableProvider>,
         refresh_mode: RefreshMode,
         refresh_interval: Option<Duration>,
     ) -> BoxStream<'a, Result<DataUpdate>> {
@@ -124,14 +133,14 @@ impl AcceleratedTable {
             match refresh_mode {
                 RefreshMode::Append => {
                     let ctx = SessionContext::new();
-                    let plan = source.scan(&ctx.state(), None, &[], None).await.context(UnableToScanTableProviderSnafu {})?;
+                    let plan = federated.scan(&ctx.state(), None, &[], None).await.context(UnableToScanTableProviderSnafu {})?;
 
                     if plan.output_partitioning().partition_count() > 1 {
                         tracing::error!("Append is not supported for tables with multiple partitions: {dataset_name}");
                         return;
                     }
 
-                    let schema = source.schema();
+                    let schema = federated.schema();
 
                     let mut stream = plan.execute(0, ctx.task_ctx()).context(UnableToScanTableProviderSnafu {})?;
                     loop {
@@ -155,7 +164,7 @@ impl AcceleratedTable {
                   tracing::info!("Refreshing data for {dataset_name}");
                   status::update_dataset(&dataset_name, status::ComponentStatus::Refreshing);
                   let timer = TimeMeasurement::new("load_dataset_duration_ms", vec![("dataset", dataset_name.clone())]);
-                  let all_data = match get_all_data(source.as_ref()).await {
+                  let all_data = match get_all_data(federated.as_ref()).await {
                       Ok(data) => data,
                       Err(e) => {
                           tracing::error!("Error refreshing data for {dataset_name}: {e}");
@@ -216,5 +225,36 @@ impl TableProvider for AcceleratedTable {
         self.accelerator
             .scan(state, projection, filters, limit)
             .await
+    }
+
+    async fn insert_into(
+        &self,
+        state: &SessionState,
+        input: Arc<dyn ExecutionPlan>,
+        overwrite: bool,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        // Duplicate the input into two streams
+        let tee_input: Arc<dyn ExecutionPlan> = Arc::new(TeeExec::new(input, 2));
+
+        // Slice the duplicated stream by partition to get separate streams for the accelerated & federated inserts.
+        let accelerated_input = Arc::new(SliceExec::new(Arc::clone(&tee_input), 0));
+        let accelerated_insert_plan = self
+            .accelerator
+            .insert_into(state, accelerated_input, overwrite)
+            .await?;
+
+        let federated_input = Arc::new(SliceExec::new(tee_input, 1));
+        let federated_insert_plan = self
+            .federated
+            .insert_into(state, federated_input, overwrite)
+            .await?;
+
+        // Return the equivalent of a UNION ALL that inserts both into the acceleration and federated source tables.
+        let union_plan = Arc::new(UnionExec::new(vec![
+            accelerated_insert_plan,
+            federated_insert_plan,
+        ]));
+
+        Ok(union_plan)
     }
 }
