@@ -59,7 +59,7 @@ jobs:
     runs-on: ${{ matrix.target.runner }}
     needs: setup-matrix
     env:
-      GOVER: 1.22
+      GOVER: 1.22.0
       GOOS: ${{ matrix.target.target_os }}
       GOARCH: ${{ matrix.target.target_arch_go }}
 
@@ -133,7 +133,7 @@ jobs:
             spiced
 
   test_quickstart_dremio:
-    name: "E2E Test: Dremio quickstart, using ${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}"
+    name: 'E2E Test: Dremio quickstart, using ${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}'
     runs-on: ${{ matrix.target.runner }}
     # run quickstart with external service dependency only on manual trigger
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'push'
@@ -238,7 +238,7 @@ jobs:
           cat spice.log
 
   test_quickstart_spiceai:
-    name: "E2E Test: SpiceAI quickstart, using ${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}"
+    name: 'E2E Test: SpiceAI quickstart, using ${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}'
     runs-on: ${{ matrix.target.runner }}
     # run quickstart with external service dependency only on manual trigger
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'push'
@@ -340,7 +340,7 @@ jobs:
           cat spice.log
 
   test_quickstart_data_postgres:
-    name: "E2E Test: SpiceAI Postgres quickstart, using ${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}"
+    name: 'E2E Test: SpiceAI Postgres quickstart, using ${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}'
     runs-on: ${{ matrix.target.runner }}
     needs:
       - build
@@ -481,7 +481,7 @@ jobs:
           cat spice.log
 
   test_quickstart_data_mysql:
-    name: "E2E Test: SpiceAI MySQL quickstart, using ${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}"
+    name: 'E2E Test: SpiceAI MySQL quickstart, using ${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}'
     runs-on: ${{ matrix.target.runner }}
     needs:
       - build
@@ -618,7 +618,7 @@ jobs:
           cat spice.log
 
   test_local_acceleration:
-    name: "E2E Test: acceleration on ${{ matrix.target.name }} using ${{ matrix.acceleration.engine }}"
+    name: 'E2E Test: acceleration on ${{ matrix.target.name }} using ${{ matrix.acceleration.engine }}'
     runs-on: ${{ matrix.target.runner }}
     needs:
       - build

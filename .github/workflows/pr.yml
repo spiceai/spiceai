@@ -14,7 +14,7 @@ jobs:
     name: Run Go & Rust Linters
     runs-on: rust
     env:
-      GOVER: 1.22
+      GOVER: 1.22.0
 
     steps:
       - uses: actions/checkout@v4
@@ -24,7 +24,7 @@ jobs:
         with:
           go-version: ${{ env.GOVER }}
           cache: false
-      
+
       - name: Install golangci-lint
         run: |
           if ! command -v golangci-lint &> /dev/null ; then
@@ -42,7 +42,7 @@ jobs:
     name: Build Go & Rust
     runs-on: rust
     env:
-      GOVER: 1.22
+      GOVER: 1.22.0
 
     steps:
       - uses: actions/checkout@v4
@@ -63,7 +63,7 @@ jobs:
   build-docker:
     name: Build Docker Image
     runs-on: rust
-    
+
     steps:
       - uses: actions/checkout@v4
 
