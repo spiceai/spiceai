@@ -231,7 +231,7 @@ impl WithDependsOn<Dataset> for Dataset {
 
 pub mod acceleration {
     use serde::{Deserialize, Serialize};
-    use std::{collections::HashMap, fmt::Display};
+    use std::{collections::HashMap, fmt::Display, sync::Arc};
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
     #[serde(rename_all = "lowercase")]
@@ -293,8 +293,11 @@ pub mod acceleration {
         }
 
         #[must_use]
-        pub fn engine(&self) -> String {
-            self.engine.clone().unwrap_or("arrow".to_string())
+        pub fn engine(&self) -> Arc<str> {
+            self.engine
+                .as_ref()
+                .map_or_else(|| "arrow", String::as_str)
+                .into()
         }
     }
 }

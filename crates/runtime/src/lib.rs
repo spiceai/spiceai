@@ -127,7 +127,7 @@ pub enum Error {
     ExpectedAccelerationSettings { name: String },
 
     #[snafu(display("The accelerator engine {name} is not available"))]
-    AcceleratorEngineNotAvailable { name: String },
+    AcceleratorEngineNotAvailable { name: Arc<str> },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

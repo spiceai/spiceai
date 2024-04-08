@@ -22,6 +22,7 @@ use datafusion::{
     logical_expr::CreateExternalTable,
 };
 use lazy_static::lazy_static;
+use secrets::ExposeSecret;
 use secrets::Secret;
 use snafu::prelude::*;
 use spicepod::component::dataset::acceleration::{self, Mode};
@@ -47,6 +48,9 @@ pub enum Error {
     #[snafu(display("Invalid configuration: {msg}"))]
     InvalidConfiguration { msg: String },
 
+    #[snafu(display("Unknown engine: {engine}"))]
+    UnknownEngine { engine: Arc<str> },
+
     #[snafu(display("Acceleration creation failed: {source}"))]
     AccelerationCreationFailed {
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -56,14 +60,14 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 lazy_static! {
-    static ref DATA_ACCELERATOR_ENGINES: Mutex<HashMap<String, Arc<dyn DataAccelerator>>> =
+    static ref DATA_ACCELERATOR_ENGINES: Mutex<HashMap<Arc<str>, Arc<dyn DataAccelerator>>> =
         Mutex::new(HashMap::new());
 }
 
 pub async fn register_accelerator_engine(name: &str, accelerator_engine: Arc<dyn DataAccelerator>) {
     let mut registry = DATA_ACCELERATOR_ENGINES.lock().await;
 
-    registry.insert(name.to_string(), accelerator_engine);
+    registry.insert(name.into(), accelerator_engine);
 }
 
 pub async fn register_all() {
@@ -101,28 +105,26 @@ pub trait DataAccelerator: Send + Sync {
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>>;
 }
 
-pub struct AcceleratorBuilder {
-    engine: String,
+pub struct AcceleratorExternalTableBuilder {
+    table_name: String,
+    schema: SchemaRef,
+    engine: Arc<str>,
     mode: Mode,
     params: Arc<Option<HashMap<String, String>>>,
     secret: Option<Secret>,
 }
 
-impl AcceleratorBuilder {
+impl AcceleratorExternalTableBuilder {
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(table_name: String, schema: SchemaRef, engine: impl Into<Arc<str>>) -> Self {
         Self {
-            engine: "arrow".to_string(),
+            table_name,
+            schema,
+            engine: engine.into(),
             mode: Mode::Memory,
             params: Arc::new(None),
             secret: None,
         }
-    }
-
-    #[must_use]
-    pub fn engine(mut self, engine: String) -> Self {
-        self.engine = engine;
-        self
     }
 
     #[must_use]
@@ -143,19 +145,6 @@ impl AcceleratorBuilder {
         self
     }
 
-    /// Build the data accelerator, panicking if it fails
-    ///
-    /// # Panics
-    ///
-    /// Panics if the accelerator fails to build
-    #[must_use]
-    pub async fn must_build(self) -> Arc<dyn DataAccelerator> {
-        match self.build().await {
-            Ok(accelerator) => accelerator,
-            Err(e) => panic!("Failed to build backend: {e}"),
-        }
-    }
-
     fn validate_arrow(&self) -> Result<(), Error> {
         if Mode::File == self.mode {
             InvalidConfigurationSnafu {
@@ -173,33 +162,49 @@ impl AcceleratorBuilder {
         }
     }
 
-    pub async fn build(self) -> std::result::Result<Arc<dyn DataAccelerator>, Error> {
+    pub fn build(self) -> Result<CreateExternalTable> {
         self.validate()?;
-        let engine = self.engine;
-        let mode = self.mode;
 
         let mut params = HashMap::new();
         if let Some(p) = self.params.as_ref() {
             params = p.clone();
         }
 
+        let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&self.schema));
+
+        let mode = self.mode;
         params.insert("mode".to_string(), mode.to_string());
 
-        let accelerator_guard = DATA_ACCELERATOR_ENGINES.lock().await;
-        let accelerator =
-            accelerator_guard
-                .get(&engine)
-                .ok_or_else(|| Error::InvalidConfiguration {
-                    msg: format!("Unknown engine: {engine}"),
-                })?;
+        if let Some(secret) = self.secret {
+            for (k, v) in secret.iter() {
+                params.insert(k.to_string(), v.expose_secret().to_string());
+            }
+        }
 
-        Ok(Arc::clone(accelerator))
-    }
-}
+        let external_table = CreateExternalTable {
+            schema: df_schema.map_err(|e| {
+                InvalidConfigurationSnafu {
+                    msg: format!("Failed to convert schema: {e}"),
+                }
+                .build()
+            })?,
+            name: OwnedTableReference::bare(self.table_name.clone()),
+            location: String::new(),
+            file_type: String::new(),
+            has_header: false,
+            delimiter: ',',
+            table_partition_cols: vec![],
+            if_not_exists: true,
+            definition: None,
+            file_compression_type: CompressionTypeVariant::UNCOMPRESSED,
+            order_exprs: vec![],
+            unbounded: false,
+            options: params,
+            constraints: Constraints::empty(),
+            column_defaults: HashMap::default(),
+        };
 
-impl Default for AcceleratorBuilder {
-    fn default() -> Self {
-        Self::new()
+        Ok(external_table)
     }
 }
 
@@ -214,38 +219,24 @@ pub async fn create_accelerator_table(
 
     let table_name = table_name.to_string();
 
-    let data_accelerator: Arc<dyn DataAccelerator> = AcceleratorBuilder::new()
-        .engine(acceleration_settings.engine())
+    let engine = acceleration_settings.engine();
+
+    let accelerator_guard = DATA_ACCELERATOR_ENGINES.lock().await;
+    let accelerator =
+        accelerator_guard
+            .get(&engine)
+            .ok_or_else(|| Error::InvalidConfiguration {
+                msg: format!("Unknown engine: {engine}"),
+            })?;
+
+    let external_table = AcceleratorExternalTableBuilder::new(table_name, schema, engine)
         .mode(acceleration_settings.mode())
         .params(params)
         .secret(acceleration_secret)
-        .build()
-        .await?;
+        .build()?;
 
-    let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema));
-    let table_provider = data_accelerator
-        .create_external_table(&CreateExternalTable {
-            schema: df_schema.map_err(|e| {
-                InvalidConfigurationSnafu {
-                    msg: format!("Failed to convert schema: {e}"),
-                }
-                .build()
-            })?,
-            name: OwnedTableReference::bare(table_name.clone()),
-            location: String::new(),
-            file_type: String::new(),
-            has_header: false,
-            delimiter: ',',
-            table_partition_cols: vec![],
-            if_not_exists: false,
-            definition: None,
-            file_compression_type: CompressionTypeVariant::UNCOMPRESSED,
-            order_exprs: vec![],
-            unbounded: false,
-            options: HashMap::default(),
-            constraints: Constraints::empty(),
-            column_defaults: HashMap::default(),
-        })
+    let table_provider = accelerator
+        .create_external_table(&external_table)
         .await
         .context(AccelerationCreationFailedSnafu)?;
 
