@@ -34,8 +34,8 @@ use self::arrow::ArrowAccelerator;
 // use self::duckdb::DuckDBBackend;
 
 pub mod arrow;
-// #[cfg(feature = "duckdb")]
-// pub mod duckdb;
+#[cfg(feature = "duckdb")]
+pub mod duckdb;
 // #[cfg(feature = "mysql")]
 // pub mod mysql;
 // #[cfg(feature = "postgres")]

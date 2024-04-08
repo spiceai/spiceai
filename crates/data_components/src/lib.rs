@@ -22,6 +22,7 @@ use datafusion::{common::OwnedTableReference, datasource::TableProvider};
 
 pub mod arrow;
 pub mod databricks;
+pub mod duckdb;
 
 #[async_trait]
 pub trait Read {

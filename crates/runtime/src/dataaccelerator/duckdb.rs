@@ -33,10 +33,7 @@ use snafu::{prelude::*, ResultExt};
 use spicepod::component::dataset::Dataset;
 use sql_provider_datafusion::SqlTable;
 
-use crate::{
-    datapublisher::{AddDataResult, DataPublisher},
-    dataupdate::{DataUpdate, UpdateType},
-};
+use crate::dataupdate::{DataUpdate, UpdateType};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -70,79 +67,72 @@ pub enum Error {
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
-pub struct DuckDBBackend {
-    ctx: Arc<SessionContext>,
+pub struct DuckDBAccelerator {
     name: String,
     pool: Arc<
         dyn DbConnectionPool<r2d2::PooledConnection<DuckdbConnectionManager>, &'static dyn ToSql>
             + Send
             + Sync,
     >,
-    create_mutex: std::sync::Mutex<()>,
-    _primary_keys: Option<Vec<String>>,
 }
 
-impl DataPublisher for DuckDBBackend {
-    fn add_data(&self, _dataset: Arc<Dataset>, data_update: DataUpdate) -> AddDataResult {
-        let pool = Arc::clone(&self.pool);
-        let name = self.name.clone();
-        Box::pin(async move {
-            let mut conn = pool.connect().await.context(DbConnectionPoolSnafu)?;
-            let Some(conn) = conn.as_any_mut().downcast_mut::<DuckDbConnection>() else {
-                return Err(
-                    Box::new(Error::UnableToDowncastDbConnection {}) as Box<dyn std::error::Error>
-                );
-            };
+// impl DataPublisher for DuckDBAccelerator {
+//     fn add_data(&self, _dataset: Arc<Dataset>, data_update: DataUpdate) -> AddDataResult {
+//         let pool = Arc::clone(&self.pool);
+//         let name = self.name.clone();
+//         Box::pin(async move {
+//             let mut conn = pool.connect().await.context(DbConnectionPoolSnafu)?;
+//             let Some(conn) = conn.as_any_mut().downcast_mut::<DuckDbConnection>() else {
+//                 return Err(
+//                     Box::new(Error::UnableToDowncastDbConnection {}) as Box<dyn std::error::Error>
+//                 );
+//             };
 
-            if let Some(batch) = data_update.data.first() {
-                for field in batch.schema().fields() {
-                    if field.data_type().is_nested() {
-                        let field_name = name + "." + field.name();
-                        tracing::error!("Unable to append {field_name}: nested types are not currently supported for local acceleration by DuckDB");
-                        return Err(Box::new(Error::DuckDB {
-                            source: duckdb::Error::AppendError,
-                        }) as Box<dyn std::error::Error>);
-                    }
-                }
-            }
+//             if let Some(batch) = data_update.data.first() {
+//                 for field in batch.schema().fields() {
+//                     if field.data_type().is_nested() {
+//                         let field_name = name + "." + field.name();
+//                         tracing::error!("Unable to append {field_name}: nested types are not currently supported for local acceleration by DuckDB");
+//                         return Err(Box::new(Error::DuckDB {
+//                             source: duckdb::Error::AppendError,
+//                         }) as Box<dyn std::error::Error>);
+//                     }
+//                 }
+//             }
 
-            let mut duckdb_update = DuckDBUpdate {
-                name,
-                data: data_update.data,
-                update_type: data_update.update_type,
-                duckdb_conn: conn,
-                create_mutex: &self.create_mutex,
-            };
+//             let mut duckdb_update = DuckDBUpdate {
+//                 name,
+//                 data: data_update.data,
+//                 update_type: data_update.update_type,
+//                 duckdb_conn: conn,
+//                 create_mutex: &self.create_mutex,
+//             };
 
-            duckdb_update.update()?;
+//             duckdb_update.update()?;
 
-            self.initialize_datafusion().await?;
-            Ok(())
-        })
-    }
+//             self.initialize_datafusion().await?;
+//             Ok(())
+//         })
+//     }
 
-    fn name(&self) -> &str {
-        "DuckDB"
-    }
-}
+//     fn name(&self) -> &str {
+//         "DuckDB"
+//     }
+// }
 
-impl DuckDBBackend {
+#[async_trait]
+impl DataAccelerator for DuckDBAccelerator {
     #[allow(clippy::needless_pass_by_value)]
     pub fn new(
-        ctx: Arc<SessionContext>,
         name: &str,
         mode: Mode,
         params: Arc<Option<HashMap<String, String>>>,
-        primary_keys: Option<Vec<String>>,
     ) -> Result<Self> {
         let pool =
             DuckDbConnectionPool::new(name, &mode, &params).context(DbConnectionPoolSnafu)?;
-        Ok(DuckDBBackend {
-            ctx,
+        Ok(DuckDBAccelerator {
             name: name.to_string(),
             pool: Arc::new(pool),
-            create_mutex: std::sync::Mutex::new(()),
-            _primary_keys: primary_keys,
         })
     }
 

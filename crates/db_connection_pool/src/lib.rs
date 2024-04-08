@@ -36,9 +36,21 @@ pub trait DbConnectionPool<T, P: 'static> {
     async fn connect(&self) -> Result<Box<dyn DbConnection<T, P>>>;
 }
 
+#[derive(Default)]
 pub enum Mode {
+    #[default]
     Memory,
     File,
+}
+
+impl From<&str> for Mode {
+    fn from(m: &str) -> Self {
+        match m {
+            "file" => Mode::File,
+            "memory" => Mode::Memory,
+            _ => Mode::default(),
+        }
+    }
 }
 
 impl From<acceleration::Mode> for Mode {
