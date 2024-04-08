@@ -57,7 +57,7 @@ dep-licenses:
 .PHONY: display-deps
 display-deps:
 	@cargo install cargo-license --quiet
-	@cargo license -d  --tsv --direct-deps-only
+	@cargo license -d  --tsv --direct-deps-only | grep -v "github.com/spiceai"
 
 
 ################################################################################
@@ -118,7 +118,7 @@ generate-acknowledgements-go:
 .PHONY: generate-acknowledgements-rust
 generate-acknowledgements-rust:
 	@echo "\n## Rust Crates\n" >> "$(ACKNOWLEDGEMENTS_PATH)"
-	@make display-deps 2>/dev/null | awk -F'\t' 'NR>1 {printf "- %s %s, %s %s\n  <br/>%s\n\n", $$1, $$2, $$5, $$6, $$4}' | grep -v "github.com/spiceai" >> "$(ACKNOWLEDGEMENTS_PATH)"
+	@make display-deps 2>/dev/null | awk -F'\t' 'NR>1 {printf "- %s %s, %s %s\n  <br/>%s\n\n", $$1, $$2, $$5, $$6, $$4}' >> "$(ACKNOWLEDGEMENTS_PATH)"
 
 
 .PHONY: generate-acknowledgements-formatting
