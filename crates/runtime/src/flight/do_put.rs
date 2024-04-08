@@ -105,7 +105,7 @@ pub(crate) async fn handle(
                 Ok(Some(message)) => {
                     let new_batch = match arrow_flight::utils::flight_data_to_arrow_batch(
                         &message,
-                        schema.clone(),
+                        Arc::clone(&schema),
                         &dictionaries_by_id,
                     ) {
                         Ok(batches) => batches,
@@ -118,6 +118,7 @@ pub(crate) async fn handle(
 
                     let data_update = DataUpdate {
                         data: vec![new_batch],
+                        schema: Arc::clone(&schema),
                         update_type: UpdateType::Append,
                     };
 

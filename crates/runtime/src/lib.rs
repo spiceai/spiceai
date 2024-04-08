@@ -82,7 +82,7 @@ pub enum Error {
 
     #[snafu(display("Unable to initialize data connector {data_connector}: {source}"))]
     UnableToInitializeDataConnector {
-        source: dataconnector::Error,
+        source: Box<dyn std::error::Error + Send + Sync>,
         data_connector: String,
     },
 
@@ -217,7 +217,7 @@ impl Runtime {
                 let source = ds.source();
 
                 let params = Arc::new(ds.params.clone());
-                let data_connector: Box<dyn DataConnector> =
+                let data_connector: Arc<dyn DataConnector> =
                     match Runtime::get_dataconnector_from_source(
                         &source,
                         &secrets_provider,
@@ -313,12 +313,12 @@ impl Runtime {
         source: &str,
         secrets_provider: &secrets::SecretsProvider,
         params: Arc<Option<HashMap<String, String>>>,
-    ) -> Result<Box<dyn DataConnector>> {
+    ) -> Result<Arc<dyn DataConnector>> {
         let secret = secrets_provider.get_secret(source).await;
 
         match source {
             _ => match dataconnector::create_new_connector(source, secret, params).await {
-                Some(dc) => dc.map(Some).context(UnableToInitializeDataConnectorSnafu {
+                Some(dc) => dc.context(UnableToInitializeDataConnectorSnafu {
                     data_connector: source,
                 }),
                 None => UnknownDataConnectorSnafu {
@@ -344,12 +344,13 @@ impl Runtime {
             df.write()
                 .await
                 .register_table(ds, datafusion::Table::View(view_sql))
+                .await
                 .context(UnableToAttachViewSnafu)?;
             return Ok(());
         }
 
         let secrets_provider_read_guard = secrets_provider.read().await;
-        let source_secret = secrets_provider_read_guard.get_secret(&ds.source());
+        let source_secret = secrets_provider_read_guard.get_secret(&ds.source()).await;
         drop(secrets_provider_read_guard);
 
         let replicate = ds.replication.as_ref().map_or(false, |r| r.enabled);
@@ -380,6 +381,7 @@ impl Runtime {
         // ACCELERATED TABLE
         let acceleration_settings =
             ds.acceleration
+                .as_ref()
                 .ok_or_else(|| Error::ExpectedAccelerationSettings {
                     name: ds.name.to_string(),
                 })?;
@@ -391,13 +393,15 @@ impl Runtime {
         let accelerator_engine = acceleration_settings.engine();
         let secret_key = acceleration_settings
             .engine_secret
+            .clone()
             .unwrap_or(format!("{:?}_engine", accelerator_engine).to_lowercase());
 
         let secrets_provider_read_guard = secrets_provider.read().await;
-        let acceleration_secret = secrets_provider_read_guard.get_secret(&secret_key);
+        let acceleration_secret = secrets_provider_read_guard.get_secret(&secret_key).await;
         drop(secrets_provider_read_guard);
 
-        let Some(accelerator) = dataaccelerator::get_accelerator_engine(&accelerator_engine) else {
+        let Some(accelerator) = dataaccelerator::get_accelerator_engine(&accelerator_engine).await
+        else {
             return Err(Error::AcceleratorEngineNotAvailable {
                 name: accelerator_engine,
             });
@@ -414,6 +418,7 @@ impl Runtime {
                     acceleration_secret,
                 },
             )
+            .await
             .context(UnableToAttachDataConnectorSnafu {
                 data_connector: source,
             })?;
@@ -615,9 +620,11 @@ async fn verify_dependent_tables(ds: &Dataset, existing_tables: &[String]) -> bo
 fn get_view_dependent_tables(dataset: impl Borrow<Dataset>) -> Result<Vec<String>> {
     let ds = dataset.borrow();
 
-    let Some(sql) = ds.view_sql().context(InvalidSQLViewSnafu)? else {
+    let Some(sql) = ds.view_sql() else {
         return ExpectedSqlViewSnafu.fail();
     };
+
+    let sql = sql.context(InvalidSQLViewSnafu)?;
 
     let statements = DFParser::parse_sql_with_dialect(sql.as_str(), &PostgreSqlDialect {})
         .context(UnableToParseSqlSnafu)?;
@@ -646,9 +653,9 @@ fn get_dependent_table_names(statement: &parser::Statement) -> Vec<String> {
             if let Some(with) = statement.with {
                 for table in with.cte_tables {
                     cte_names.insert(table.alias.name.to_string());
-                    let cte_table_names = DataFusion::get_dependent_table_names(
-                        &parser::Statement::Statement(Box::new(ast::Statement::Query(table.query))),
-                    );
+                    let cte_table_names = get_dependent_table_names(&parser::Statement::Statement(
+                        Box::new(ast::Statement::Query(table.query)),
+                    ));
                     // Extend table_names with names found in CTEs if they reference actual tables
                     table_names.extend(cte_table_names);
                 }
@@ -679,7 +686,7 @@ fn get_dependent_table_names(statement: &parser::Statement) -> Vec<String> {
                                 subquery,
                                 alias: _,
                             } => {
-                                table_names.extend(DataFusion::get_dependent_table_names(
+                                table_names.extend(get_dependent_table_names(
                                     &parser::Statement::Statement(Box::new(ast::Statement::Query(
                                         subquery,
                                     ))),

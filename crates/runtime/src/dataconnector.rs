@@ -58,7 +58,7 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub type AnyErrorResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-type NewDataConnectorResult = Result<Box<dyn DataConnector>>;
+type NewDataConnectorResult = AnyErrorResult<Box<dyn DataConnector>>;
 
 type NewDataConnectorFn = dyn Fn(
         Option<Secret>,
@@ -95,7 +95,7 @@ pub async fn create_new_connector(
     name: &str,
     secret: Option<Secret>,
     params: Arc<Option<HashMap<String, String>>>,
-) -> Option<Result<Arc<dyn DataConnector>>> {
+) -> Option<AnyErrorResult<Arc<dyn DataConnector>>> {
     let guard = DATA_CONNECTOR_FACTORY_REGISTRY.lock().await;
 
     let connector_factory = guard.get(name);

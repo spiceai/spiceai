@@ -19,9 +19,9 @@ use data_components::{Read, ReadWrite};
 use datafusion::datasource::TableProvider;
 use ns_lookup::verify_endpoint_connection;
 use secrets::Secret;
+use snafu::prelude::*;
 use spicepod::component::dataset::Dataset;
 use std::any::Any;
-use std::error::Error;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::{collections::HashMap, future::Future};
@@ -29,30 +29,48 @@ use std::{collections::HashMap, future::Future};
 use super::{DataConnector, DataConnectorFactory};
 use data_components::databricks::Databricks;
 
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display("Missing required parameter: endpoint"))]
+    MissingEndpoint,
+
+    #[snafu(display("Endpoint {endpoint} is invalid: {source}"))]
+    InvalidEndpoint {
+        endpoint: String,
+        source: ns_lookup::Error,
+    },
+
+    UnableToGetReadProvider {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    UnableToGetReadWriteProvider {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+}
+
+pub type Result<T, E = Error> = std::result::Result<T, E>;
+
 impl DataConnectorFactory for Databricks {
     fn create(
         secret: Option<Secret>,
         params: Arc<Option<HashMap<String, String>>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let url: String = params
+            let endpoint: String = params
                 .as_ref() // &Option<HashMap<String, String>>
                 .as_ref() // Option<&HashMap<String, String>>
                 .and_then(|params| params.get("endpoint").cloned())
-                .ok_or_else(|| super::Error::UnableToCreateDataConnector {
-                    source: "Missing required parameter: endpoint".into(),
-                })?;
+                .ok_or_else(|| Error::MissingEndpoint)?;
 
-            verify_endpoint_connection(&url)
+            verify_endpoint_connection(&endpoint)
                 .await
-                .map_err(|e| super::Error::UnableToCreateDataConnector { source: e.into() })?;
+                .context(InvalidEndpointSnafu { endpoint })?;
 
             Ok(Box::new(Databricks::new(Arc::new(secret), params)) as Box<dyn DataConnector>)
         })
     }
 }
-
-pub type Result<T, E = Box<dyn Error + Send + Sync>> = std::result::Result<T, E>;
 
 #[async_trait]
 impl DataConnector for Databricks {
@@ -64,13 +82,22 @@ impl DataConnector for Databricks {
         &self,
         dataset: &Dataset,
     ) -> super::AnyErrorResult<Arc<dyn TableProvider>> {
-        Read::table_provider(&self, dataset.path())
+        Ok(Read::table_provider(self, dataset.path().into())
+            .await
+            .context(UnableToGetReadProviderSnafu)?)
     }
 
-    fn read_write_provider(
+    async fn read_write_provider(
         &self,
         dataset: &Dataset,
     ) -> Option<super::AnyErrorResult<Arc<dyn TableProvider>>> {
-        Some(ReadWrite::table_provider(&self, dataset.path()))
+        let read_write_result = ReadWrite::table_provider(self, dataset.path().into())
+            .await
+            .context(UnableToGetReadWriteProviderSnafu)
+            .boxed();
+        match read_write_result {
+            Ok(provider) => Some(Ok(provider)),
+            Err(e) => Some(Err(e)),
+        }
     }
 }

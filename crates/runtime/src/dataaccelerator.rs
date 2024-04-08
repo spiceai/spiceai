@@ -67,7 +67,7 @@ pub async fn register_accelerator_engine(name: &str, accelerator_engine: Arc<dyn
 }
 
 pub async fn register_all() {
-    register_accelerator_engine("arrow", ArrowAccelerator::new()).await;
+    register_accelerator_engine("arrow", Arc::new(ArrowAccelerator::new())).await;
     //register_connector_factory("dremio", Dremio::create).await;
     // register_connector_factory("flightsql", flightsql::FlightSQL::create).await;
     // register_connector_factory("s3", s3::S3::create).await;
