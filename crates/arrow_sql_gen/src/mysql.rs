@@ -18,13 +18,14 @@ use std::{convert, sync::Arc};
 
 use arrow::{
     array::{
-        ArrayBuilder, ArrayRef, Float32Builder, Float64Builder, Int16Builder, Int32Builder,
-        Int64Builder, Int8Builder, NullBuilder, RecordBatch, RecordBatchOptions, StringBuilder,
-        UInt64Builder,
+        ArrayBuilder, ArrayRef, BinaryBuilder, Float32Builder, Float64Builder, Int16Builder,
+        Int32Builder, Int64Builder, Int8Builder, NullBuilder, RecordBatch, RecordBatchOptions,
+        StringBuilder, TimestampMillisecondBuilder, UInt64Builder,
     },
     datatypes::{DataType, Field, Schema, TimeUnit},
 };
 use bigdecimal::BigDecimal;
+use chrono::Timelike;
 use mysql_async::{consts::ColumnType, Row, Value};
 use snafu::{ResultExt, Snafu};
 
@@ -254,6 +255,81 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                         i
                     );
                 }
+                ColumnType::MYSQL_TYPE_BLOB => {
+                    handle_primitive_type!(
+                        builder,
+                        ColumnType::MYSQL_TYPE_BLOB,
+                        BinaryBuilder,
+                        Vec<u8>,
+                        row,
+                        i
+                    );
+                }
+                ColumnType::MYSQL_TYPE_TIMESTAMP => {
+                    let Some(builder) = builder else {
+                        return NoBuilderForIndexSnafu { index: i }.fail();
+                    };
+                    let Some(builder) = builder
+                        .as_any_mut()
+                        .downcast_mut::<TimestampMillisecondBuilder>()
+                    else {
+                        return FailedToDowncastBuilderSnafu {
+                            mysql_type: format!("{mysql_type:?}"),
+                        }
+                        .fail();
+                    };
+                    let v = row.get_opt::<Value, usize>(i).transpose().context(
+                        FailedToGetRowValueSnafu {
+                            mysql_type: ColumnType::MYSQL_TYPE_TIMESTAMP,
+                        },
+                    )?;
+
+                    match v {
+                        Some(v) => {
+                            let timestamp = match v {
+                                Value::Date(year, month, day, hour, minute, second, micros) => {
+                                    let timestamp = chrono::NaiveDate::from_ymd_opt(
+                                        i32::from(year),
+                                        u32::from(month),
+                                        u32::from(day),
+                                    )
+                                    .unwrap_or_default()
+                                    .and_hms_micro_opt(
+                                        u32::from(hour),
+                                        u32::from(minute),
+                                        u32::from(second),
+                                        micros,
+                                    )
+                                    .unwrap_or_default()
+                                    .and_utc();
+                                    timestamp.timestamp() * 1000
+                                }
+                                Value::Time(is_neg, days, hours, minutes, seconds, micros) => {
+                                    let naivetime = chrono::NaiveTime::from_hms_micro_opt(
+                                        u32::from(hours),
+                                        u32::from(minutes),
+                                        u32::from(seconds),
+                                        micros,
+                                    )
+                                    .unwrap_or_default();
+
+                                    let time: i64 = naivetime.num_seconds_from_midnight().into();
+
+                                    let timestamp = i64::from(days) * 24 * 60 * 60 + time;
+
+                                    if is_neg {
+                                        -timestamp
+                                    } else {
+                                        timestamp
+                                    }
+                                }
+                                _ => 0,
+                            };
+                            builder.append_value(timestamp);
+                        }
+                        None => builder.append_null(),
+                    }
+                }
                 _ => unimplemented!("Unsupported column type {:?}", mysql_type),
             }
         }
@@ -280,7 +356,7 @@ fn map_column_to_data_type(column_type: ColumnType) -> Option<DataType> {
         ColumnType::MYSQL_TYPE_LONGLONG => Some(DataType::Int64),
         ColumnType::MYSQL_TYPE_FLOAT => Some(DataType::Float32),
         ColumnType::MYSQL_TYPE_DOUBLE => Some(DataType::Float64),
-        ColumnType::MYSQL_TYPE_TIMESTAMP => Some(DataType::Timestamp(TimeUnit::Second, None)),
+        ColumnType::MYSQL_TYPE_TIMESTAMP => Some(DataType::Timestamp(TimeUnit::Millisecond, None)),
         ColumnType::MYSQL_TYPE_DATE => Some(DataType::Date32),
         ColumnType::MYSQL_TYPE_VARCHAR
         | ColumnType::MYSQL_TYPE_STRING
