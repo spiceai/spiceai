@@ -20,7 +20,7 @@ use arrow::{
     array::{
         ArrayBuilder, ArrayRef, BinaryBuilder, Float32Builder, Float64Builder, Int16Builder,
         Int32Builder, Int64Builder, Int8Builder, NullBuilder, RecordBatch, RecordBatchOptions,
-        StringBuilder, TimestampMicrosecondBuilder, TimestampMillisecondBuilder, UInt64Builder,
+        StringBuilder, TimestampMicrosecondBuilder, UInt64Builder,
     },
     datatypes::{DataType, Field, Schema, TimeUnit},
 };
@@ -289,16 +289,16 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                             let timestamp = match v {
                                 Value::Date(year, month, day, hour, minute, second, micros) => {
                                     let timestamp = chrono::NaiveDate::from_ymd_opt(
-                                        year as i32,
-                                        month as u32,
-                                        day as u32,
+                                        i32::from(year),
+                                        u32::from(month),
+                                        u32::from(day),
                                     )
                                     .unwrap_or_default()
                                     .and_hms_micro_opt(
-                                        hour as u32,
-                                        minute as u32,
-                                        second as u32,
-                                        micros as u32,
+                                        u32::from(hour),
+                                        u32::from(minute),
+                                        u32::from(second),
+                                        micros,
                                     )
                                     .unwrap_or_default()
                                     .and_utc();
@@ -306,16 +306,16 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                                 }
                                 Value::Time(is_neg, days, hours, minutes, seconds, micros) => {
                                     let naivetime = chrono::NaiveTime::from_hms_micro_opt(
-                                        hours as u32,
-                                        minutes as u32,
-                                        seconds as u32,
-                                        micros as u32,
+                                        u32::from(hours),
+                                        u32::from(minutes),
+                                        u32::from(seconds),
+                                        micros,
                                     )
                                     .unwrap_or_default();
 
                                     let time: i64 = naivetime.num_seconds_from_midnight().into();
 
-                                    let timestamp = days as i64 * 24 * 60 * 60 + time;
+                                    let timestamp = i64::from(days) * 24 * 60 * 60 + time;
 
                                     if is_neg {
                                         -timestamp
