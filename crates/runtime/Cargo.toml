@@ -75,7 +75,7 @@ tokio-rusqlite = { workspace = true, optional = true }
 pin-project = "1.0"
 lazy_static = "1.4.0"
 mysql_async = { workspace = true, optional = true }
-postgres-native-tls = "0.5.0"
+postgres-native-tls = { version = "0.5.0", optional = true }
 ns_lookup = { path = "../ns_lookup" }
 
 [features]
@@ -85,6 +85,7 @@ duckdb = ["dep:duckdb", "sql_provider_datafusion/duckdb", "r2d2", "db_connection
 postgres = [
     "dep:bb8",
     "dep:bb8-postgres",
+    "dep:postgres-native-tls",
     "db_connection_pool/postgres",
     "sql_provider_datafusion/postgres",
     "arrow_sql_gen/postgres",
