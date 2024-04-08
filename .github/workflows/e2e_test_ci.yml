@@ -554,7 +554,7 @@ jobs:
         run: |
           echo -e "eth_recent_blocks\neth recent blocks\nmysql:eth_recent_blocks\ny" | spice dataset configure
           # configure mysql credentials
-          echo -e "params:\n  mysql_host: localhost\n  mysql_port: 3306\n  mysql_db: testdb\n  mysql_user: root\n  mysql_pass_key: password\n  mysql_sslmode: disabled" >> ./datasets/eth_recent_blocks/dataset.yaml
+          echo -e "params:\n  mysql_host: localhost\n  mysql_port: 3306\n  mysql_db: testdb\n  mysql_user: test_user\n  mysql_pass_key: password\n  mysql_sslmode: disabled" >> ./datasets/eth_recent_blocks/dataset.yaml
           # configure env secret store
           echo -e "secrets:\n  store: env\n" >> spicepod.yaml
           cat spicepod.yaml
