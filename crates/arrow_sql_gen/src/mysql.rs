@@ -20,7 +20,7 @@ use arrow::{
     array::{
         ArrayBuilder, ArrayRef, BinaryBuilder, Float32Builder, Float64Builder, Int16Builder,
         Int32Builder, Int64Builder, Int8Builder, NullBuilder, RecordBatch, RecordBatchOptions,
-        StringBuilder, TimestampMicrosecondBuilder, UInt64Builder,
+        StringBuilder, TimestampMillisecondBuilder, UInt64Builder,
     },
     datatypes::{DataType, Field, Schema, TimeUnit},
 };
@@ -271,7 +271,7 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                     };
                     let Some(builder) = builder
                         .as_any_mut()
-                        .downcast_mut::<TimestampMicrosecondBuilder>()
+                        .downcast_mut::<TimestampMillisecondBuilder>()
                     else {
                         return FailedToDowncastBuilderSnafu {
                             mysql_type: format!("{mysql_type:?}"),
@@ -302,7 +302,7 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                                     )
                                     .unwrap_or_default()
                                     .and_utc();
-                                    timestamp.timestamp()
+                                    timestamp.timestamp() * 1000
                                 }
                                 Value::Time(is_neg, days, hours, minutes, seconds, micros) => {
                                     let naivetime = chrono::NaiveTime::from_hms_micro_opt(
@@ -356,7 +356,7 @@ fn map_column_to_data_type(column_type: ColumnType) -> Option<DataType> {
         ColumnType::MYSQL_TYPE_LONGLONG => Some(DataType::Int64),
         ColumnType::MYSQL_TYPE_FLOAT => Some(DataType::Float32),
         ColumnType::MYSQL_TYPE_DOUBLE => Some(DataType::Float64),
-        ColumnType::MYSQL_TYPE_TIMESTAMP => Some(DataType::Timestamp(TimeUnit::Microsecond, None)),
+        ColumnType::MYSQL_TYPE_TIMESTAMP => Some(DataType::Timestamp(TimeUnit::Millisecond, None)),
         ColumnType::MYSQL_TYPE_DATE => Some(DataType::Date32),
         ColumnType::MYSQL_TYPE_VARCHAR
         | ColumnType::MYSQL_TYPE_STRING
