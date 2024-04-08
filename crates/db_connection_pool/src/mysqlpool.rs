@@ -53,7 +53,7 @@ impl MySQLConnectionPool {
         secret: Option<Secret>,
     ) -> Result<Self> {
         let mut connection_string = mysql_async::OptsBuilder::default();
-        let mut ssl_mode = "require";
+        let mut ssl_mode = "required";
 
         if let Some(params) = params.as_ref() {
             if let Some(mysql_connection_string) = get_secret_or_param(
@@ -85,8 +85,8 @@ impl MySQLConnectionPool {
                         connection_string.tcp_port(mysql_port.parse::<u16>().unwrap_or(3306));
                 }
                 if let Some(mysql_sslmode) = params.get("mysql_sslmode") {
-                    match mysql_sslmode.as_str() {
-                        "disable" | "require" | "prefer" => {
+                    match mysql_sslmode.to_lowercase().as_str() {
+                        "disabled" | "required" | "preferred" => {
                             ssl_mode = mysql_sslmode.as_str();
                         }
                         _ => {
@@ -101,8 +101,8 @@ impl MySQLConnectionPool {
         }
 
         let ssl_opts = match ssl_mode {
-            "disable" => None,
-            "prefer" => Some(SslOpts::default().with_danger_accept_invalid_certs(true)),
+            "disabled" => None,
+            "preferred" => Some(SslOpts::default().with_danger_accept_invalid_certs(true)),
             _ => Some(SslOpts::default()),
         };
 
