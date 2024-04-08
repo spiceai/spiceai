@@ -20,7 +20,7 @@ use arrow::{
     array::{
         ArrayBuilder, ArrayRef, BinaryBuilder, Float32Builder, Float64Builder, Int16Builder,
         Int32Builder, Int64Builder, Int8Builder, NullBuilder, RecordBatch, RecordBatchOptions,
-        StringBuilder, UInt64Builder,
+        StringBuilder, TimestampMillisecondBuilder, UInt64Builder,
     },
     datatypes::{DataType, Field, Schema, TimeUnit},
 };
@@ -269,7 +269,10 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                     let Some(builder) = builder else {
                         return NoBuilderForIndexSnafu { index: i }.fail();
                     };
-                    let Some(builder) = builder.as_any_mut().downcast_mut::<Int64Builder>() else {
+                    let Some(builder) = builder
+                        .as_any_mut()
+                        .downcast_mut::<TimestampMillisecondBuilder>()
+                    else {
                         return FailedToDowncastBuilderSnafu {
                             mysql_type: format!("{mysql_type:?}"),
                         }
@@ -280,6 +283,7 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                             mysql_type: ColumnType::MYSQL_TYPE_TIMESTAMP,
                         },
                     )?;
+
                     match v {
                         Some(v) => {
                             let timestamp = match v {
