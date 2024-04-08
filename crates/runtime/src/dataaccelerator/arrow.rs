@@ -24,9 +24,11 @@ use std::{any::Any, sync::Arc};
 
 use super::DataAccelerator;
 
+#[allow(clippy::module_name_repetitions)]
 pub struct ArrowAccelerator {}
 
 impl ArrowAccelerator {
+    #[must_use]
     pub fn new() -> Self {
         Self {}
     }
@@ -51,8 +53,7 @@ impl DataAccelerator for ArrowAccelerator {
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         let arrow_schema = Schema::from(cmd.schema.as_ref());
 
-        let mem_table =
-            MemTable::try_new(Arc::new(arrow_schema), vec![]).map_err(|e| Box::new(e))?;
+        let mem_table = MemTable::try_new(Arc::new(arrow_schema), vec![]).map_err(Box::new)?;
 
         let table_provider = Arc::new(mem_table) as Arc<dyn TableProvider>;
         Ok(table_provider)

@@ -28,6 +28,7 @@ use super::{DataConnector, DataConnectorFactory};
 /// A no-op connector that allows for Spice to act as a "sink" for data.
 ///
 /// Configure an accelerator to store data - the localhost connector itself does nothing.
+#[allow(clippy::module_name_repetitions)]
 pub struct LocalhostConnector {}
 
 impl DataConnectorFactory for LocalhostConnector {

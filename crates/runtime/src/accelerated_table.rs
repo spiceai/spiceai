@@ -26,13 +26,8 @@ use crate::{
 
 #[derive(Debug, Snafu)]
 enum Error {
-    AddDataError {
-        e: String,
-    },
-
-    DataConnectorError {
-        source: dataconnector::Error,
-    },
+    #[snafu(display("Unable to get data from connector: {source}"))]
+    UnableToGetDataFromConnector { source: dataconnector::Error },
 
     #[snafu(display("Unable to scan table provider: {source}"))]
     UnableToScanTableProvider {
@@ -46,7 +41,6 @@ type Result<T> = std::result::Result<T, Error>;
 //
 // The accelerator must support inserts.
 pub(crate) struct AcceleratedTable {
-    dataset_name: String,
     accelerator: Arc<dyn TableProvider>,
     refresh_handle: JoinHandle<()>,
 }
@@ -60,7 +54,7 @@ impl AcceleratedTable {
         refresh_interval: Option<Duration>,
     ) -> Self {
         let refresh_handle = tokio::spawn(Self::start_refresh(
-            dataset_name.clone(),
+            dataset_name,
             source,
             refresh_mode,
             refresh_interval,
@@ -68,7 +62,6 @@ impl AcceleratedTable {
         ));
 
         Self {
-            dataset_name,
             accelerator,
             refresh_handle,
         }
@@ -127,7 +120,7 @@ impl AcceleratedTable {
         refresh_mode: RefreshMode,
         refresh_interval: Option<Duration>,
     ) -> BoxStream<'a, Result<DataUpdate>> {
-        return Box::pin(stream! {
+        Box::pin(stream! {
             match refresh_mode {
                 RefreshMode::Append => {
                     let ctx = SessionContext::new();
@@ -166,7 +159,7 @@ impl AcceleratedTable {
                       Ok(data) => data,
                       Err(e) => {
                           tracing::error!("Error refreshing data for {dataset_name}: {e}");
-                          yield Err(Error::DataConnectorError { source: e });
+                          yield Err(Error::UnableToGetDataFromConnector { source: e });
                           continue;
                       }
                   };
@@ -182,7 +175,7 @@ impl AcceleratedTable {
                   };
               },
             }
-        });
+        })
     }
 }
 

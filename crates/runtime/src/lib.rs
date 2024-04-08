@@ -208,7 +208,7 @@ impl Runtime {
             loop {
                 let secrets_provider = shared_secrets_provider.read().await;
 
-                if !verify_dependent_tables(&ds, &existing_tables).await {
+                if !verify_dependent_tables(&ds, &existing_tables) {
                     status::update_dataset(&ds.name, status::ComponentStatus::Error);
                     metrics::counter!("datasets_load_error").increment(1);
                     return;
@@ -316,16 +316,14 @@ impl Runtime {
     ) -> Result<Arc<dyn DataConnector>> {
         let secret = secrets_provider.get_secret(source).await;
 
-        match source {
-            _ => match dataconnector::create_new_connector(source, secret, params).await {
-                Some(dc) => dc.context(UnableToInitializeDataConnectorSnafu {
-                    data_connector: source,
-                }),
-                None => UnknownDataConnectorSnafu {
-                    data_connector: source,
-                }
-                .fail(),
-            },
+        match dataconnector::create_new_connector(source, secret, params).await {
+            Some(dc) => dc.context(UnableToInitializeDataConnectorSnafu {
+                data_connector: source,
+            }),
+            None => UnknownDataConnectorSnafu {
+                data_connector: source,
+            }
+            .fail(),
         }
     }
 
@@ -384,13 +382,16 @@ impl Runtime {
         let secret_key = acceleration_settings
             .engine_secret
             .clone()
-            .unwrap_or(format!("{:?}_engine", accelerator_engine).to_lowercase());
+            .unwrap_or(format!("{accelerator_engine}_engine").to_lowercase());
 
         let secrets_provider_read_guard = secrets_provider.read().await;
         let acceleration_secret = secrets_provider_read_guard.get_secret(&secret_key).await;
         drop(secrets_provider_read_guard);
 
-        if let None = dataaccelerator::get_accelerator_engine(&accelerator_engine).await {
+        if dataaccelerator::get_accelerator_engine(&accelerator_engine)
+            .await
+            .is_none()
+        {
             return Err(Error::AcceleratorEngineNotAvailable {
                 name: accelerator_engine,
             });
@@ -573,7 +574,7 @@ impl Runtime {
     }
 }
 
-async fn verify_dependent_tables(ds: &Dataset, existing_tables: &[String]) -> bool {
+fn verify_dependent_tables(ds: &Dataset, existing_tables: &[String]) -> bool {
     if !ds.is_view() {
         return true;
     }

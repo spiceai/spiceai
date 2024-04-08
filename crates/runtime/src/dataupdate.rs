@@ -46,6 +46,7 @@ pub struct DataUpdateExecutionPlan {
 }
 
 impl DataUpdateExecutionPlan {
+    #[must_use]
     pub fn new(data_update: DataUpdate) -> Self {
         let schema = Arc::clone(&data_update.schema);
         Self {

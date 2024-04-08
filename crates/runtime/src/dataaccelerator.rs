@@ -102,8 +102,6 @@ pub trait DataAccelerator: Send + Sync {
 }
 
 pub struct AcceleratorBuilder {
-    table_name: OwnedTableReference,
-    schema: SchemaRef,
     engine: String,
     mode: Mode,
     params: Arc<Option<HashMap<String, String>>>,
@@ -112,10 +110,8 @@ pub struct AcceleratorBuilder {
 
 impl AcceleratorBuilder {
     #[must_use]
-    pub fn new(table_name: OwnedTableReference, schema: SchemaRef) -> Self {
+    pub fn new() -> Self {
         Self {
-            table_name,
-            schema,
             engine: "arrow".to_string(),
             mode: Mode::Memory,
             params: Arc::new(None),
@@ -201,6 +197,12 @@ impl AcceleratorBuilder {
     }
 }
 
+impl Default for AcceleratorBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub async fn create_accelerator_table(
     table_name: &str,
     schema: SchemaRef,
@@ -212,16 +214,13 @@ pub async fn create_accelerator_table(
 
     let table_name = table_name.to_string();
 
-    let data_accelerator: Arc<dyn DataAccelerator> = AcceleratorBuilder::new(
-        OwnedTableReference::bare(table_name.clone()),
-        Arc::clone(&schema),
-    )
-    .engine(acceleration_settings.engine())
-    .mode(acceleration_settings.mode())
-    .params(params)
-    .secret(acceleration_secret)
-    .build()
-    .await?;
+    let data_accelerator: Arc<dyn DataAccelerator> = AcceleratorBuilder::new()
+        .engine(acceleration_settings.engine())
+        .mode(acceleration_settings.mode())
+        .params(params)
+        .secret(acceleration_secret)
+        .build()
+        .await?;
 
     let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema));
     let table_provider = data_accelerator
@@ -243,9 +242,9 @@ pub async fn create_accelerator_table(
             file_compression_type: CompressionTypeVariant::UNCOMPRESSED,
             order_exprs: vec![],
             unbounded: false,
-            options: Default::default(),
+            options: HashMap::default(),
             constraints: Constraints::empty(),
-            column_defaults: Default::default(),
+            column_defaults: HashMap::default(),
         })
         .await
         .context(AccelerationCreationFailedSnafu)?;
