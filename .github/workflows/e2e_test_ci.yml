@@ -480,6 +480,139 @@ jobs:
           killall spice
           cat spice.log
 
+  test_quickstart_data_mysql:
+    name: "E2E Test: SpiceAI MySQL quickstart, using ${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}"
+    runs-on: ${{ matrix.target.runner }}
+    needs:
+      - build
+      - setup-matrix
+
+    strategy:
+      matrix:
+        target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
+
+    steps:
+      - name: Install MySQL (Linux)
+        if: matrix.target.target_os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mysql-server
+          sudo systemctl start mysql.service
+          sleep 5
+          mysql -e "CREATE DATABASE IF NOT EXISTS testdb;" -uroot -proot
+
+      - name: Install MysqlSQL (MacOS)
+        if: matrix.target.target_os == 'darwin'
+        run: |
+          brew install mysql
+          brew services start mysql
+          sleep 5
+          mysql -e "CREATE DATABASE IF NOT EXISTS testdb;" -uroot -proot
+
+      - name: Wait for MySQL to start
+        run: sleep 10
+
+      - name: Check MySQL
+        run: echo 'SELECT VERSION();' | mysql -h localhost -uroot -proot
+
+      - name: Prepare MysqlSQL dataset
+        run: |
+          mysql -h localhost -uroot -proot testdb -e "CREATE TABLE eth_recent_blocks (id SERIAL PRIMARY KEY, block_number INTEGER, block_hash TEXT, block_timestamp TIMESTAMP);"
+          mysql -h localhost -uroot -proot testdb -e "INSERT INTO eth_recent_blocks (block_number, block_hash, block_timestamp) VALUES (1, '0x1234', '2022-01-01 00:00:00');"
+          mysql -h localhost -uroot -proot testdb -e "INSERT INTO eth_recent_blocks (block_number, block_hash, block_timestamp) VALUES (2, '0x5678', '2022-01-01 00:00:00');"
+          mysql -h localhost -uroot -proot testdb -e "INSERT INTO eth_recent_blocks (block_number, block_hash, block_timestamp) VALUES (3, '0x9abc', '2022-01-01 00:00:00');"
+          mysql -h localhost -uroot -proot testdb -e "SELECT * FROM eth_recent_blocks;"
+
+      - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+        uses: actions/download-artifact@v4
+        with:
+          name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+          path: ./build
+
+      - name: Install spice
+        run: |
+          chmod +x ./build/spice
+          chmod +x ./build/spiced
+          mkdir -p "$HOME/.spice/bin"
+          mv ./build/spice "$HOME/.spice/bin"
+          mv ./build/spiced "$HOME/.spice/bin"
+          echo "$HOME/.spice/bin" >> $GITHUB_PATH
+
+      - name: Check spice version
+        run: spice version
+
+      - name: Init spice app
+        run: |
+          spice init test_app
+
+      - name: Spice dataset configure
+        working-directory: test_app
+        run: |
+          echo -e "eth_recent_blocks\neth recent blocks\nmysql:eth_recent_blocks\ny" | spice dataset configure
+          # configure mysql credentials
+          echo -e "params:\n  mysql_host: localhost\n  mysql_port: 3306\n  mysql_db: testdb\n  mysql_user: root\n  mysql_pass_key: password" >> ./datasets/eth_recent_blocks/dataset.yaml
+          # configure env secret store
+          echo -e "secrets:\n  store: env\n" >> spicepod.yaml
+          cat spicepod.yaml
+
+      - name: Start spice runtime
+        env:
+          SPICE_SECRET_MYSQL_PASSWORD: root
+        working-directory: test_app
+        run: |
+          spice run &> spice.log &
+          # time to initialize added dataset
+          sleep 10
+
+      - name: Wait for Spice runtime healthy
+        working-directory: test_app
+        timeout-minutes: 1
+        run: |
+          while [[ "$(curl -s http://localhost:3000/health)" != "ok" ]]; do sleep 1; done
+
+      - name: Check datasets
+        working-directory: test_app
+        run: |
+          response=$(curl http://localhost:3000/v1/datasets)
+          echo $response | jq
+          length=$(echo $response | jq 'if type=="array" then length else empty end')
+          if [[ $length -ne 1 ]]; then
+            echo "Unexpected response: $response, expected 1 dataset but received $length"
+            exit 1
+          fi
+
+      - name: Check eth_recent_blocks table exists
+        working-directory: test_app
+        run: |
+          response=$(curl -X POST \
+            -H "Content-Type: text/plain" \
+            -d "show tables;" \
+            http://localhost:3000/v1/sql
+          )
+          echo $response | jq
+          table_exists=$(echo $response | jq '[.[] | select(.table_name == "eth_recent_blocks")]' | jq 'length')
+          if [[ $table_exists -eq 0 ]]; then
+            echo "Unexpected response: table 'eth_recent_blocks' does not exist."
+            exit 1
+          fi
+
+      - name: Run Flight SQL query
+        working-directory: test_app
+        run: |
+          sql_output=$(echo "select * from eth_recent_blocks limit 10;" | spice sql)
+          echo "$sql_output"
+          if [[ $sql_output == *"error"* ]] || [[ $sql_output == *"not found"* ]]; then
+            echo "Unexpected response from spice sql, failed to perform test query: $sql_output"
+            exit 1
+          fi
+
+      - name: Stop spice and check logs
+        working-directory: test_app
+        if: always()
+        run: |
+          killall spice
+          cat spice.log
+
   test_local_acceleration:
     name: "E2E Test: acceleration on ${{ matrix.target.name }} using ${{ matrix.acceleration.engine }}"
     runs-on: ${{ matrix.target.runner }}
