@@ -499,7 +499,9 @@ jobs:
           sudo apt-get install -y mysql-server
           sudo systemctl start mysql.service
           sleep 5
-          mysql -e "CREATE DATABASE IF NOT EXISTS testdb;" -uroot -proot
+          mysql -e "CREATE USER test_user@localhost IDENTIFIED BY 'password';"
+          mysql -e "GRANT ALL PRIVILEGES ON testdb.* TO 'test_user'@'localhost'; FLUSH PRIVILEGES;"
+          mysql -e "CREATE DATABASE IF NOT EXISTS testdb;" -utest_user -ppassword
 
       - name: Install MysqlSQL (MacOS)
         if: matrix.target.target_os == 'darwin'
@@ -507,21 +509,23 @@ jobs:
           brew install mysql
           brew services start mysql
           sleep 5
-          mysql -e "CREATE DATABASE IF NOT EXISTS testdb;" -uroot -proot
+          mysql -e "CREATE USER test_user@localhost IDENTIFIED BY 'password';"
+          mysql -e "GRANT ALL PRIVILEGES ON testdb.* TO 'test_user'@'localhost'; FLUSH PRIVILEGES;"
+          mysql -e "CREATE DATABASE IF NOT EXISTS testdb;" -utest_user -ppassword
 
       - name: Wait for MySQL to start
         run: sleep 10
 
       - name: Check MySQL
-        run: echo 'SELECT VERSION();' | mysql -h localhost -uroot -proot
+        run: echo 'SELECT VERSION();' | mysql -h localhost -utest_user -ppassword
 
       - name: Prepare MysqlSQL dataset
         run: |
-          mysql -h localhost -uroot -proot testdb -e "CREATE TABLE eth_recent_blocks (id SERIAL PRIMARY KEY, block_number INTEGER, block_hash TEXT, block_timestamp TIMESTAMP);"
-          mysql -h localhost -uroot -proot testdb -e "INSERT INTO eth_recent_blocks (block_number, block_hash, block_timestamp) VALUES (1, '0x1234', '2022-01-01 00:00:00');"
-          mysql -h localhost -uroot -proot testdb -e "INSERT INTO eth_recent_blocks (block_number, block_hash, block_timestamp) VALUES (2, '0x5678', '2022-01-01 00:00:00');"
-          mysql -h localhost -uroot -proot testdb -e "INSERT INTO eth_recent_blocks (block_number, block_hash, block_timestamp) VALUES (3, '0x9abc', '2022-01-01 00:00:00');"
-          mysql -h localhost -uroot -proot testdb -e "SELECT * FROM eth_recent_blocks;"
+          mysql -h localhost -utest_user -ppassword testdb -e "CREATE TABLE eth_recent_blocks (id SERIAL PRIMARY KEY, block_number INTEGER, block_hash TEXT, block_timestamp TIMESTAMP);"
+          mysql -h localhost -utest_user -ppassword testdb -e "INSERT INTO eth_recent_blocks (block_number, block_hash, block_timestamp) VALUES (1, '0x1234', '2022-01-01 00:00:00');"
+          mysql -h localhost -utest_user -ppassword testdb -e "INSERT INTO eth_recent_blocks (block_number, block_hash, block_timestamp) VALUES (2, '0x5678', '2022-01-01 00:00:00');"
+          mysql -h localhost -utest_user -ppassword testdb -e "INSERT INTO eth_recent_blocks (block_number, block_hash, block_timestamp) VALUES (3, '0x9abc', '2022-01-01 00:00:00');"
+          mysql -h localhost -utest_user -ppassword testdb -e "SELECT * FROM eth_recent_blocks;"
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         uses: actions/download-artifact@v4
@@ -557,7 +561,7 @@ jobs:
 
       - name: Start spice runtime
         env:
-          SPICE_SECRET_MYSQL_PASSWORD: root
+          SPICE_SECRET_MYSQL_PASSWORD: test_user
         working-directory: test_app
         run: |
           spice run &> spice.log &
