@@ -285,7 +285,7 @@ fn map_column_to_data_type(column_type: ColumnType) -> Option<DataType> {
         ColumnType::MYSQL_TYPE_VARCHAR
         | ColumnType::MYSQL_TYPE_STRING
         | ColumnType::MYSQL_TYPE_VAR_STRING => Some(DataType::Utf8),
-        // ColumnType::MYSQL_TYPE_BLOB => Some(DataType::Binary),
+        ColumnType::MYSQL_TYPE_BLOB => Some(DataType::Binary),
         _ => unimplemented!("Unsupported column type {:?}", column_type),
     }
 }
