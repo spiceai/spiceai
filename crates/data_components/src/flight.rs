@@ -39,6 +39,7 @@ use std::{any::Any, fmt, sync::Arc};
 
 use self::write::FlightTableWriter;
 
+pub mod stream;
 pub mod write;
 
 #[derive(Debug, Snafu)]

@@ -73,14 +73,6 @@ pub async fn register_accelerator_engine(name: &str, accelerator_engine: Arc<dyn
 pub async fn register_all() {
     register_accelerator_engine("arrow", Arc::new(ArrowAccelerator::new())).await;
     register_accelerator_engine("duckdb", Arc::new(DuckDBAccelerator::new())).await;
-    //register_connector_factory("dremio", Dremio::create).await;
-    // register_connector_factory("flightsql", flightsql::FlightSQL::create).await;
-    // register_connector_factory("s3", s3::S3::create).await;
-    // register_connector_factory("spiceai", spiceai::SpiceAI::create).await;
-    // #[cfg(feature = "mysql")]
-    // register_connector_factory("mysql", mysql::MySQL::create).await;
-    // #[cfg(feature = "postgres")]
-    // register_connector_factory("postgres", postgres::Postgres::create).await;
 }
 
 pub async fn get_accelerator_engine(engine_name: &str) -> Option<Arc<dyn DataAccelerator>> {
