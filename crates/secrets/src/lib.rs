@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#[cfg(feature = "aws-secret-store")]
+pub mod aws;
 pub mod env;
 pub mod file;
 #[cfg(feature = "keyring-secret-store")]
@@ -80,9 +82,12 @@ pub enum SecretStoreType {
     #[cfg(feature = "keyring-secret-store")]
     Keyring,
     Kubernetes,
+    #[cfg(feature = "aws-secret-store")]
+    AwsSecretStore,
 }
 
 #[must_use]
+#[allow(unreachable_patterns)]
 pub fn spicepod_secret_store_type(store: &SpiceSecretStore) -> Option<SecretStoreType> {
     match store {
         SpiceSecretStore::File => Some(SecretStoreType::File),
@@ -90,7 +95,8 @@ pub fn spicepod_secret_store_type(store: &SpiceSecretStore) -> Option<SecretStor
         #[cfg(feature = "keyring-secret-store")]
         SpiceSecretStore::Keyring => Some(SecretStoreType::Keyring),
         SpiceSecretStore::Kubernetes => Some(SecretStoreType::Kubernetes),
-        #[cfg(not(feature = "keyring-secret-store"))]
+        #[cfg(feature = "aws-secret-store")]
+        SpiceSecretStore::Aws => Some(SecretStoreType::AwsSecretStore),
         _ => None,
     }
 }
@@ -156,6 +162,10 @@ impl SecretsProvider {
                 };
 
                 self.secret_store = Some(Box::new(kubernetes_secret_store));
+            }
+            #[cfg(feature = "aws-secret-store")]
+            SecretStoreType::AwsSecretStore => {
+                self.secret_store = Some(Box::new(aws::AwsSecretStore::new()));
             }
         }
 
