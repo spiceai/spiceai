@@ -282,10 +282,9 @@ impl ExecutionPlan for FlightExec {
 
 #[allow(clippy::needless_pass_by_value)]
 fn query_to_stream(
-    client: FlightClient,
+    mut client: FlightClient,
     sql: &str,
 ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
-    let mut client = client.clone();
     let sql = sql.to_string();
     stream! {
         match client.query(sql.as_str()).await {
