@@ -82,7 +82,7 @@ ns_lookup = { path = "../ns_lookup" }
 [features]
 default = ["keyring-secret-store"]
 dev = []
-duckdb = ["dep:duckdb", "sql_provider_datafusion/duckdb", "r2d2", "db_connection_pool/duckdb", "spicepod/duckdb"]
+duckdb = ["dep:duckdb", "sql_provider_datafusion/duckdb", "r2d2", "db_connection_pool/duckdb", "spicepod/duckdb", "data_components/duckdb"]
 postgres = [
     "dep:bb8",
     "dep:bb8-postgres",
