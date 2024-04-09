@@ -29,7 +29,7 @@ use spicepod::component::dataset::acceleration::{self, Mode};
 use std::{any::Any, collections::HashMap, sync::Arc};
 use tokio::sync::Mutex;
 
-use self::arrow::ArrowAccelerator;
+use self::{arrow::ArrowAccelerator, duckdb::DuckDBAccelerator};
 // #[cfg(feature = "duckdb")]
 // use self::duckdb::DuckDBBackend;
 
@@ -72,6 +72,7 @@ pub async fn register_accelerator_engine(name: &str, accelerator_engine: Arc<dyn
 
 pub async fn register_all() {
     register_accelerator_engine("arrow", Arc::new(ArrowAccelerator::new())).await;
+    register_accelerator_engine("duckdb", Arc::new(DuckDBAccelerator::new())).await;
     //register_connector_factory("dremio", Dremio::create).await;
     // register_connector_factory("flightsql", flightsql::FlightSQL::create).await;
     // register_connector_factory("s3", s3::S3::create).await;

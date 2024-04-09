@@ -25,13 +25,13 @@ use std::{error::Error, sync::Arc};
 use crate::{Read, ReadWrite};
 
 pub struct Arrow {
-    memtable: Arc<dyn TableProvider>,
+    arrow_provider: Arc<dyn TableProvider>,
 }
 
 impl Arrow {
     pub fn try_new(schema: SchemaRef) -> Result<Self, Box<dyn Error>> {
         Ok(Self {
-            memtable: Arc::new(MemTable::try_new(schema, vec![])?),
+            arrow_provider: Arc::new(MemTable::try_new(schema, vec![])?),
         })
     }
 }
@@ -42,7 +42,7 @@ impl Read for Arrow {
         &self,
         _table_reference: OwnedTableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn Error + Send + Sync>> {
-        Ok(Arc::clone(&self.memtable))
+        Ok(Arc::clone(&self.arrow_provider))
     }
 }
 
@@ -52,6 +52,6 @@ impl ReadWrite for Arrow {
         &self,
         _table_reference: OwnedTableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn Error + Send + Sync>> {
-        Ok(Arc::clone(&self.memtable))
+        Ok(Arc::clone(&self.arrow_provider))
     }
 }
