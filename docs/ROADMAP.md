@@ -10,19 +10,23 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 
 ## [v0.11-alpha (Apr 2024)](https://github.com/spiceai/spiceai/milestone/16)
 
-- [MySQL data connector (alpha)](https://github.com/spiceai/spiceai/pull/1004)
+- Internal component re-architecture
 - AWS Secrets Manager (alpha)
+- Databricks data connector improvements
+- Custom refresh SQL for accelerators
+- Manual refresh trigger API
+- DuckDB/MotherDuck data connector
 
 ## [v0.12-alpha (Apr 2024)](https://github.com/spiceai/spiceai/milestone/17)
 
-- Acceleration retention policies
+- Acceleration retention policies for time-series data
 - FTP data connector (alpha)
+- Iceberg data connector
 - BigQuery data connector (alpha)
 - Snowflake data connector (alpha)
 
 ## v0.13-alpha (May 2024)
 
-- Iceberg data connector
 - RocksDB data accelerator (alpha)
 - K/V support
 

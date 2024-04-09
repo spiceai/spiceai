@@ -1,6 +1,6 @@
 module github.com/spiceai/spiceai
 
-go 1.21
+go 1.22.0
 
 require (
 	github.com/bradleyjkemp/cupaloy v2.3.0+incompatible
