@@ -20,9 +20,9 @@ use std::{error::Error, sync::Arc};
 use async_trait::async_trait;
 use datafusion::{common::OwnedTableReference, datasource::TableProvider};
 
-pub mod arrow;
 pub mod databricks;
 pub mod duckdb;
+pub mod flight;
 
 #[async_trait]
 pub trait Read {

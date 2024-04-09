@@ -27,7 +27,7 @@ use std::sync::Arc;
 use std::{collections::HashMap, future::Future};
 
 use super::{DataConnector, DataConnectorFactory};
-use data_components::databricks::Databricks;
+pub use data_components::databricks::Databricks;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
