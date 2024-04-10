@@ -15,14 +15,10 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
-use bb8_postgres::tokio_postgres::types::ToSql;
-use bb8_postgres::PostgresConnectionManager;
 use data_components::postgres::PostgresTableFactory;
 use data_components::Read;
 use datafusion::datasource::TableProvider;
 use db_connection_pool::postgrespool::PostgresConnectionPool;
-use db_connection_pool::DbConnectionPool;
-use postgres_native_tls::MakeTlsConnector;
 use secrets::Secret;
 use snafu::prelude::*;
 use spicepod::component::dataset::Dataset;
@@ -59,13 +55,7 @@ impl DataConnectorFactory for Postgres {
         params: Arc<Option<HashMap<String, String>>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let pool: Arc<
-                dyn DbConnectionPool<
-                        bb8::PooledConnection<'static, PostgresConnectionManager<MakeTlsConnector>>,
-                        &'static (dyn ToSql + Sync),
-                    > + Send
-                    + Sync,
-            > = Arc::new(
+            let pool = Arc::new(
                 PostgresConnectionPool::new(params, secret)
                     .await
                     .context(UnableToCreatePostgresConnectionPoolSnafu)?,

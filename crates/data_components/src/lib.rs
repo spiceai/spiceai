@@ -27,6 +27,8 @@ pub mod duckdb;
 pub mod flight;
 #[cfg(feature = "flightsql")]
 pub mod flightsql;
+#[cfg(feature = "mysql")]
+pub mod mysql;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 

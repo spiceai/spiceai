@@ -1959,6 +1959,7 @@ dependencies = [
  "duckdb",
  "flight_client",
  "futures",
+ "mysql_async",
  "postgres-native-tls",
  "r2d2",
  "reqwest",
