@@ -18,15 +18,15 @@ use std::{convert, sync::Arc};
 
 use arrow::{
     array::{
-        ArrayBuilder, ArrayRef, Decimal128Builder, Float32Builder, Float64Builder, Int16Builder,
-        Int32Builder, Int64Builder, Int8Builder, NullBuilder, RecordBatch, RecordBatchOptions,
-        StringBuilder, TimestampMillisecondBuilder, UInt64Builder,
+        ArrayBuilder, ArrayRef, Date32Builder, Decimal128Builder, Float32Builder, Float64Builder,
+        Int16Builder, Int32Builder, Int64Builder, Int8Builder, NullBuilder, RecordBatch,
+        RecordBatchOptions, StringBuilder, TimestampMillisecondBuilder, UInt64Builder,
     },
-    datatypes::{DataType, Field, Schema, TimeUnit},
+    datatypes::{DataType, Date32Type, Field, Schema, TimeUnit},
 };
 use bigdecimal::BigDecimal;
 use bigdecimal::ToPrimitive;
-use chrono::Timelike;
+use chrono::{NaiveDate, Timelike};
 use mysql_async::{consts::ColumnType, FromValueError, Row, Value};
 use snafu::{ResultExt, Snafu};
 
@@ -317,6 +317,29 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                         row,
                         i
                     );
+                }
+                ColumnType::MYSQL_TYPE_DATE => {
+                    let Some(builder) = builder else {
+                        return NoBuilderForIndexSnafu { index: i }.fail();
+                    };
+                    let Some(builder) = builder.as_any_mut().downcast_mut::<Date32Builder>() else {
+                        return FailedToDowncastBuilderSnafu {
+                            mysql_type: format!("{mysql_type:?}"),
+                        }
+                        .fail();
+                    };
+                    let v = row.get_opt::<NaiveDate, usize>(i).transpose().context(
+                        FailedToGetRowValueSnafu {
+                            mysql_type: ColumnType::MYSQL_TYPE_DATE,
+                        },
+                    )?;
+
+                    match v {
+                        Some(v) => {
+                            builder.append_value(Date32Type::from_naive_date(v));
+                        }
+                        None => builder.append_null(),
+                    }
                 }
                 ColumnType::MYSQL_TYPE_TIMESTAMP => {
                     let Some(builder) = builder else {
