@@ -281,25 +281,24 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                         },
                     )?;
 
-                    match v.clone() {
-                        Some(v) => {
-                            let date = match v {
-                                Value::Date(year, month, day, _, _, _, _) => {
-                                    chrono::NaiveDate::from_ymd_opt(
-                                        i32::from(year),
-                                        u32::from(month),
-                                        u32::from(day),
-                                    )
-                                    .unwrap_or_default()
-                                }
-                                _ => {
-                                    chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap_or_default()
-                                }
-                            };
+                    if let Some(v) = v.clone() {
+                        if let Value::Date(year, month, day, _, _, _, _) = v {
+                            let date = chrono::NaiveDate::from_ymd_opt(
+                                i32::from(year),
+                                u32::from(month),
+                                u32::from(day),
+                            );
 
-                            builder.append_value(Date32Type::from_naive_date(date));
+                            if let Some(date) = date {
+                                builder.append_value(Date32Type::from_naive_date(date));
+                            } else {
+                                builder.append_null();
+                            }
+                        } else {
+                            builder.append_null();
                         }
-                        None => builder.append_null(),
+                    } else {
+                        builder.append_null();
                     }
                 }
                 ColumnType::MYSQL_TYPE_TIMESTAMP => {
