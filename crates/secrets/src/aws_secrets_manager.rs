@@ -25,15 +25,21 @@ use aws_sdk_secretsmanager::error::SdkError;
 use aws_config::{self, BehaviorVersion};
 use aws_sdk_secretsmanager::{self};
 
-use snafu::Snafu;
+use snafu::{ResultExt, Snafu};
 
 const SPICE_SECRET_PREFIX: &str = "spice_secret_";
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("AWS identify verification failed, check configuration with `aws configure list` and `aws sts get-caller-identity`."))]
-    InvalidAwsCredentials {},
+    #[snafu(display("AWS identity verification failed, check configuration with `aws configure list` and `aws sts get-caller-identity`."))]
+    UnableToVerifyAwsIdentity {},
+    #[snafu(display("Unable to parse as JSON: {}", source))]
+    UnableToParseJson { source: serde_json::Error },
+    #[snafu(display("Invalid JSON format: JSON object is expected"))]
+    InvalidJsonFormat {},
 }
+
+pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[allow(clippy::module_name_repetitions)]
 #[derive(Copy, Clone)]
@@ -58,7 +64,7 @@ impl AwsSecretsManager {
     /// This function will return an error:
     /// - If the AWS configuration cannot be loaded.
     /// - If the call to STS `get_caller_identity` fails, which might be due to invalid or expired AWS credentials.
-    pub async fn init(self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn init(self) -> Result<()> {
         let config = aws_config::defaults(BehaviorVersion::v2023_11_09())
             .load()
             .await;
@@ -66,7 +72,7 @@ impl AwsSecretsManager {
         let sts_client = aws_sdk_sts::Client::new(&config);
 
         if sts_client.get_caller_identity().send().await.is_err() {
-            return Err(Box::new(Error::InvalidAwsCredentials {}));
+            return UnableToVerifyAwsIdentitySnafu {}.fail();
         }
 
         Ok(())
@@ -129,16 +135,16 @@ impl SecretStore for AwsSecretsManager {
 /// # Errors
 ///
 /// This function will return an error if:
-/// - The input string cannot be parsed as a valid JSON.
-/// - The parsed JSON is not an object. This function expects the top-level JSON structure to be a JSON object (`{}`).
-pub fn parse_json_to_hashmap(
-    json_str: &str,
-) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
-    let parsed: serde_json::Value = serde_json::from_str(json_str)?;
-    let object = parsed.as_object().ok_or("String is not a JSON object")?;
+/// - The input string cannot be parsed as a valid JSON object.
+pub fn parse_json_to_hashmap(json_str: &str) -> Result<HashMap<String, String>> {
+    let parsed: serde_json::Value =
+        serde_json::from_str(json_str).context(UnableToParseJsonSnafu)?;
+    let root = parsed
+        .as_object()
+        .ok_or_else(|| Error::InvalidJsonFormat {})?;
 
     let mut data = HashMap::new();
-    for (key, value) in object {
+    for (key, value) in root {
         if let Some(value_str) = value.as_str() {
             data.insert(key.clone(), value_str.to_string());
         }

@@ -35,8 +35,10 @@ use spicepod::component::secrets::SpiceSecretStore;
 pub enum Error {
     #[snafu(display("Unable to load secrets for {store}"))]
     UnableToLoadSecrets { store: String },
-    #[snafu(display("Unable to load secrets for {store}: {error}"))]
-    UnableToLoadSecretsWithError { store: String, error: String },
+    #[snafu(display("Unable to initialize AWS Secrets Manager: {source}"))]
+    UnableToInitializeAwsSecretsManager {
+        source: crate::aws_secrets_manager::Error,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -169,12 +171,10 @@ impl SecretsProvider {
             SecretStoreType::AwsSecretsManager => {
                 let secret_store = aws_secrets_manager::AwsSecretsManager::new();
 
-                if let Err(err) = secret_store.init().await {
-                    return Err(Error::UnableToLoadSecretsWithError {
-                        store: "aws_secrets_manager".to_string(),
-                        error: err.to_string(),
-                    });
-                };
+                secret_store
+                    .init()
+                    .await
+                    .context(UnableToInitializeAwsSecretsManagerSnafu)?;
 
                 self.secret_store = Some(Box::new(secret_store));
             }
