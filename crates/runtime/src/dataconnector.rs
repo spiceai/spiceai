@@ -36,6 +36,7 @@ use std::future::Future;
 pub mod databricks;
 pub mod dremio;
 // pub mod flight;
+#[cfg(feature = "flightsql")]
 pub mod flightsql;
 pub mod localhost;
 // #[cfg(feature = "mysql")]
@@ -108,6 +109,7 @@ pub async fn register_all() {
     register_connector_factory("localhost", localhost::LocalhostConnector::create).await;
     register_connector_factory("databricks", databricks::Databricks::create).await;
     register_connector_factory("dremio", dremio::Dremio::create).await;
+    #[cfg(feature = "flightsql")]
     register_connector_factory("flightsql", flightsql::FlightSQL::create).await;
     register_connector_factory("s3", s3::S3::create).await;
     register_connector_factory("spiceai", spiceai::SpiceAI::create).await;
