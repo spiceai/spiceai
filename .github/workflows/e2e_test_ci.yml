@@ -133,7 +133,7 @@ jobs:
             spiced
 
   test_quickstart_dremio:
-    name: 'E2E Test: Dremio quickstart, using ${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}'
+    name: "E2E Test: Dremio quickstart, using ${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}"
     runs-on: ${{ matrix.target.runner }}
     # run quickstart with external service dependency only on manual trigger
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'push'
@@ -238,7 +238,7 @@ jobs:
           cat spice.log
 
   test_quickstart_spiceai:
-    name: 'E2E Test: SpiceAI quickstart, using ${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}'
+    name: "E2E Test: SpiceAI quickstart, using ${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}"
     runs-on: ${{ matrix.target.runner }}
     # run quickstart with external service dependency only on manual trigger
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'push'
@@ -340,7 +340,7 @@ jobs:
           cat spice.log
 
   test_quickstart_data_postgres:
-    name: 'E2E Test: SpiceAI Postgres quickstart, using ${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}'
+    name: "E2E Test: SpiceAI Postgres quickstart, using ${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}"
     runs-on: ${{ matrix.target.runner }}
     needs:
       - build
@@ -481,7 +481,7 @@ jobs:
           cat spice.log
 
   test_quickstart_data_mysql:
-    name: 'E2E Test: SpiceAI MySQL quickstart, using ${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}'
+    name: "E2E Test: SpiceAI MySQL quickstart, using ${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}"
     runs-on: ${{ matrix.target.runner }}
     needs:
       - build
@@ -492,6 +492,8 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
+      - uses: actions/checkout@v4
+
       - name: Install MySQL (Linux)
         if: matrix.target.target_os == 'linux'
         run: |
@@ -521,11 +523,9 @@ jobs:
 
       - name: Prepare MysqlSQL dataset
         run: |
-          mysql -h localhost -utest_user -ppassword testdb -e "CREATE TABLE eth_recent_blocks (id SERIAL PRIMARY KEY, block_number INTEGER, block_hash TEXT, block_timestamp TIMESTAMP);"
-          mysql -h localhost -utest_user -ppassword testdb -e "INSERT INTO eth_recent_blocks (block_number, block_hash, block_timestamp) VALUES (1, '0x1234', '2022-01-01 00:00:00');"
-          mysql -h localhost -utest_user -ppassword testdb -e "INSERT INTO eth_recent_blocks (block_number, block_hash, block_timestamp) VALUES (2, '0x5678', '2022-01-01 00:00:00');"
-          mysql -h localhost -utest_user -ppassword testdb -e "INSERT INTO eth_recent_blocks (block_number, block_hash, block_timestamp) VALUES (3, '0x9abc', '2022-01-01 00:00:00');"
-          mysql -h localhost -utest_user -ppassword testdb -e "SELECT * FROM eth_recent_blocks;"
+
+          mysql -h localhost -utest_user -ppassword testdb < test/scripts/setup-data-mysql.sql
+          mysql -h localhost -utest_user -ppassword testdb -e "SELECT * FROM test_mysql_table;"
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         uses: actions/download-artifact@v4
@@ -552,9 +552,9 @@ jobs:
       - name: Spice dataset configure
         working-directory: test_app
         run: |
-          echo -e "eth_recent_blocks\neth recent blocks\nmysql:eth_recent_blocks\ny" | spice dataset configure
+          echo -e "test_mysql_table\neth recent blocks\nmysql:test_mysql_table\ny" | spice dataset configure
           # configure mysql credentials
-          echo -e "params:\n  mysql_host: localhost\n  mysql_port: 3306\n  mysql_db: testdb\n  mysql_user: test_user\n  mysql_pass_key: password\n  mysql_sslmode: disabled" >> ./datasets/eth_recent_blocks/dataset.yaml
+          echo -e "params:\n  mysql_host: localhost\n  mysql_port: 3306\n  mysql_db: testdb\n  mysql_user: test_user\n  mysql_pass_key: password\n  mysql_sslmode: disabled" >> ./datasets/test_mysql_table/dataset.yaml
           # configure env secret store
           echo -e "secrets:\n  store: env\n" >> spicepod.yaml
           cat spicepod.yaml
@@ -585,7 +585,7 @@ jobs:
             exit 1
           fi
 
-      - name: Check eth_recent_blocks table exists
+      - name: Check test_mysql_table table exists
         working-directory: test_app
         run: |
           response=$(curl -X POST \
@@ -594,16 +594,16 @@ jobs:
             http://localhost:3000/v1/sql
           )
           echo $response | jq
-          table_exists=$(echo $response | jq '[.[] | select(.table_name == "eth_recent_blocks")]' | jq 'length')
+          table_exists=$(echo $response | jq '[.[] | select(.table_name == "test_mysql_table")]' | jq 'length')
           if [[ $table_exists -eq 0 ]]; then
-            echo "Unexpected response: table 'eth_recent_blocks' does not exist."
+            echo "Unexpected response: table 'test_mysql_table' does not exist."
             exit 1
           fi
 
       - name: Run Flight SQL query
         working-directory: test_app
         run: |
-          sql_output=$(echo "select * from eth_recent_blocks limit 10;" | spice sql)
+          sql_output=$(echo "select * from test_mysql_table limit 10;" | spice sql)
           echo "$sql_output"
           if [[ $sql_output == *"error"* ]] || [[ $sql_output == *"not found"* ]]; then
             echo "Unexpected response from spice sql, failed to perform test query: $sql_output"
@@ -618,7 +618,7 @@ jobs:
           cat spice.log
 
   test_local_acceleration:
-    name: 'E2E Test: acceleration on ${{ matrix.target.name }} using ${{ matrix.acceleration.engine }}'
+    name: "E2E Test: acceleration on ${{ matrix.target.name }} using ${{ matrix.acceleration.engine }}"
     runs-on: ${{ matrix.target.runner }}
     needs:
       - build
