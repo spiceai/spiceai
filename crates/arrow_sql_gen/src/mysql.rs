@@ -18,13 +18,14 @@ use std::{convert, sync::Arc};
 
 use arrow::{
     array::{
-        ArrayBuilder, ArrayRef, BinaryBuilder, Float32Builder, Float64Builder, Int16Builder,
+        ArrayBuilder, ArrayRef, Decimal128Builder, Float32Builder, Float64Builder, Int16Builder,
         Int32Builder, Int64Builder, Int8Builder, NullBuilder, RecordBatch, RecordBatchOptions,
         StringBuilder, TimestampMillisecondBuilder, UInt64Builder,
     },
     datatypes::{DataType, Field, Schema, TimeUnit},
 };
 use bigdecimal::BigDecimal;
+use bigdecimal::ToPrimitive;
 use chrono::Timelike;
 use mysql_async::{consts::ColumnType, Row, Value};
 use snafu::{ResultExt, Snafu};
@@ -135,6 +136,11 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
             let Some(builder) = arrow_columns_builders.get_mut(i) else {
                 return NoBuilderForIndexSnafu { index: i }.fail();
             };
+
+            let Some(arrow_field) = arrow_fields.get_mut(i) else {
+                return NoArrowFieldForIndexSnafu { index: i }.fail();
+            };
+
             match *mysql_type {
                 ColumnType::MYSQL_TYPE_NULL => {
                     let Some(builder) = builder else {
@@ -235,6 +241,56 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                         i
                     );
                 }
+                ColumnType::MYSQL_TYPE_DECIMAL | ColumnType::MYSQL_TYPE_NEWDECIMAL => {
+                    let val = row.get_opt::<BigDecimal, usize>(i).transpose().context(
+                        FailedToGetRowValueSnafu {
+                            mysql_type: ColumnType::MYSQL_TYPE_DECIMAL,
+                        },
+                    )?;
+
+                    let scale = match &val {
+                        None => 0,
+                        Some(val) => get_scale(&val),
+                    };
+
+                    let dec_builder = builder.get_or_insert_with(|| {
+                        Box::new(
+                            Decimal128Builder::new()
+                                .with_precision_and_scale(38, scale.try_into().unwrap_or_default())
+                                .unwrap_or_default(),
+                        )
+                    });
+                    let Some(dec_builder) =
+                        dec_builder.as_any_mut().downcast_mut::<Decimal128Builder>()
+                    else {
+                        return FailedToDowncastBuilderSnafu {
+                            mysql_type: format!("{mysql_type:?}"),
+                        }
+                        .fail();
+                    };
+                    let Some(val) = val else {
+                        dec_builder.append_null();
+                        continue;
+                    };
+
+                    if arrow_field.is_none() {
+                        let Some(field_name) = column_names.get(i) else {
+                            return NoColumnNameForIndexSnafu { index: i }.fail();
+                        };
+                        let new_arrow_field = Field::new(
+                            field_name,
+                            DataType::Decimal128(38, scale.try_into().unwrap_or_default()),
+                            true,
+                        );
+
+                        *arrow_field = Some(new_arrow_field);
+                    }
+
+                    let Some(val) = to_decimal_128(&val, scale) else {
+                        return FailedToConvertBigDecmialToI128Snafu { big_decimal: val }.fail();
+                    };
+                    dec_builder.append_value(val);
+                }
                 ColumnType::MYSQL_TYPE_VARCHAR => {
                     handle_primitive_type!(
                         builder,
@@ -259,8 +315,8 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                     handle_primitive_type!(
                         builder,
                         ColumnType::MYSQL_TYPE_BLOB,
-                        BinaryBuilder,
-                        Vec<u8>,
+                        StringBuilder,
+                        String,
                         row,
                         i
                     );
@@ -356,12 +412,29 @@ fn map_column_to_data_type(column_type: ColumnType) -> Option<DataType> {
         ColumnType::MYSQL_TYPE_LONGLONG => Some(DataType::Int64),
         ColumnType::MYSQL_TYPE_FLOAT => Some(DataType::Float32),
         ColumnType::MYSQL_TYPE_DOUBLE => Some(DataType::Float64),
+        ColumnType::MYSQL_TYPE_DECIMAL | ColumnType::MYSQL_TYPE_NEWDECIMAL => None,
         ColumnType::MYSQL_TYPE_TIMESTAMP => Some(DataType::Timestamp(TimeUnit::Millisecond, None)),
         ColumnType::MYSQL_TYPE_DATE => Some(DataType::Date32),
         ColumnType::MYSQL_TYPE_VARCHAR
         | ColumnType::MYSQL_TYPE_STRING
-        | ColumnType::MYSQL_TYPE_VAR_STRING => Some(DataType::Utf8),
-        ColumnType::MYSQL_TYPE_BLOB => Some(DataType::Binary),
+        | ColumnType::MYSQL_TYPE_VAR_STRING
+        | ColumnType::MYSQL_TYPE_BLOB => Some(DataType::Utf8),
         _ => unimplemented!("Unsupported column type {:?}", column_type),
     }
+}
+
+fn get_scale(decimal: &BigDecimal) -> u32 {
+    let decimal_string = decimal.to_string();
+    let idx = decimal_string.find('.');
+    match idx {
+        Some(idx) => {
+            let scale = decimal_string.len() - idx - 1;
+            scale as u32
+        }
+        None => 0,
+    }
+}
+
+fn to_decimal_128(decimal: &BigDecimal, scale: u32) -> Option<i128> {
+    (decimal * 10i128.pow(u32::from(scale))).to_i128()
 }
