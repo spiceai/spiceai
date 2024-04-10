@@ -99,3 +99,4 @@ sqlite = [
 ]
 mysql = ["dep:mysql_async", "db_connection_pool/mysql", "arrow_sql_gen/mysql"]
 keyring-secret-store = ["secrets/keyring-secret-store"]
+flightsql = ["data_components/flightsql"]

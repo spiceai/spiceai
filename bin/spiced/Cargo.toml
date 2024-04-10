@@ -23,7 +23,7 @@ metrics-exporter-prometheus = "0.13.0"
 object_store = { version = "0.9.0", features = ["aws"] }
 
 [features]
-default = ["duckdb", "postgres", "sqlite", "mysql"]
+default = ["duckdb", "postgres", "sqlite", "mysql", "flightsql"]
 duckdb = ["runtime/duckdb", "spicepod/duckdb", "app/duckdb"]
 postgres = ["runtime/postgres", "spicepod/postgres", "app/postgres"]
 sqlite = ["runtime/sqlite", "spicepod/sqlite", "app/sqlite"]
@@ -31,3 +31,4 @@ mysql = ["runtime/mysql", "spicepod/mysql", "app/mysql"]
 release = []
 dev = ["runtime/dev"]
 keyring-secret-store = ["runtime/keyring-secret-store"]
+flightsql = ["runtime/flightsql"]

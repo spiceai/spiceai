@@ -1964,6 +1964,7 @@ dependencies = [
  "snafu 0.8.2",
  "sql_provider_datafusion",
  "tokio",
+ "tonic 0.10.2",
  "tracing",
 ]
 

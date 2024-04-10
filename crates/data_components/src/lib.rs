@@ -24,6 +24,8 @@ pub mod databricks;
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
 pub mod flight;
+#[cfg(feature = "flightsql")]
+pub mod flightsql;
 
 #[async_trait]
 pub trait Read {
