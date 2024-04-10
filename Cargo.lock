@@ -170,7 +170,7 @@ checksum = "d301b3b94cb4b2f23d7917810addbbaff90738e0ca2be692bd027e70d7e0330c"
 
 [[package]]
 name = "app"
-version = "0.11.0-alpha"
+version = "0.10.2-alpha"
 dependencies = [
  "snafu 0.8.2",
  "spicepod",
@@ -528,7 +528,7 @@ dependencies = [
 
 [[package]]
 name = "arrow_sql_gen"
-version = "0.11.0-alpha"
+version = "0.10.2-alpha"
 dependencies = [
  "arrow",
  "bigdecimal 0.3.1",
@@ -811,9 +811,9 @@ dependencies = [
 
 [[package]]
 name = "aws-runtime"
-version = "1.1.8"
+version = "1.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b13dc54b4b49f8288532334bba8f87386a40571c47c37b1304979b556dc613c8"
+checksum = "c4ee6903f9d0197510eb6b44c4d86b493011d08b4992938f7b9be0333b6685aa"
 dependencies = [
  "aws-credential-types",
  "aws-sigv4",
@@ -830,6 +830,29 @@ dependencies = [
  "pin-project-lite",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "aws-sdk-secretsmanager"
+version = "1.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7cbcd1d9166efe93df83f0e49f59125ad696b4fdadb899a02cfd7c0b10ae0cbe"
+dependencies = [
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand 2.0.1",
+ "http 0.2.12",
+ "once_cell",
+ "regex-lite",
+ "tracing",
 ]
 
 [[package]]
@@ -924,9 +947,9 @@ dependencies = [
 
 [[package]]
 name = "aws-smithy-async"
-version = "1.1.8"
+version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d26ea8fa03025b2face2b3038a63525a10891e3d8829901d502e5384a0d8cd46"
+checksum = "62220bc6e97f946ddd51b5f1361f78996e704677afc518a4ff66b7a72ea1378c"
 dependencies = [
  "futures-util",
  "pin-project-lite",
@@ -974,9 +997,9 @@ dependencies = [
 
 [[package]]
 name = "aws-smithy-runtime"
-version = "1.1.8"
+version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec81002d883e5a7fd2bb063d6fb51c4999eb55d404f4fff3dd878bf4733b9f01"
+checksum = "c53572b4cd934ee5e8461ad53caa36e9d246aaef42166e3ac539e206a925d330"
 dependencies = [
  "aws-smithy-async",
  "aws-smithy-http",
@@ -987,6 +1010,7 @@ dependencies = [
  "h2 0.3.26",
  "http 0.2.12",
  "http-body 0.4.6",
+ "http-body 1.0.0",
  "hyper 0.14.28",
  "hyper-rustls 0.24.2",
  "once_cell",
@@ -999,9 +1023,9 @@ dependencies = [
 
 [[package]]
 name = "aws-smithy-runtime-api"
-version = "1.2.0"
+version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9acb931e0adaf5132de878f1398d83f8677f90ba70f01f65ff87f6d7244be1c5"
+checksum = "ccb2b3a7030dc9a3c9a08ce0b25decea5130e9db19619d4dffbbff34f75fe850"
 dependencies = [
  "aws-smithy-async",
  "aws-smithy-types",
@@ -1023,8 +1047,12 @@ dependencies = [
  "base64-simd",
  "bytes",
  "bytes-utils",
+ "futures-core",
  "http 0.2.12",
+ "http 1.1.0",
  "http-body 0.4.6",
+ "http-body 1.0.0",
+ "http-body-util",
  "itoa",
  "num-integer",
  "pin-project-lite",
@@ -1032,6 +1060,8 @@ dependencies = [
  "ryu",
  "serde",
  "time",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -1045,9 +1075,9 @@ dependencies = [
 
 [[package]]
 name = "aws-types"
-version = "1.1.8"
+version = "1.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0dbf2f3da841a8930f159163175cf6a3d16ddde517c1b0fba7aa776822800f40"
+checksum = "afb278e322f16f59630a83b6b2dc992a0b48aa74ed47b4130f193fae0053d713"
 dependencies = [
  "aws-credential-types",
  "aws-smithy-async",
@@ -2162,7 +2192,7 @@ dependencies = [
 
 [[package]]
 name = "db_connection_pool"
-version = "0.11.0-alpha"
+version = "0.10.2-alpha"
 dependencies = [
  "arrow",
  "arrow_sql_gen",
@@ -2679,7 +2709,7 @@ dependencies = [
 
 [[package]]
 name = "flight_client"
-version = "0.11.0-alpha"
+version = "0.10.2-alpha"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -2696,7 +2726,7 @@ dependencies = [
 
 [[package]]
 name = "flight_datafusion"
-version = "0.11.0-alpha"
+version = "0.10.2-alpha"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -2714,7 +2744,7 @@ dependencies = [
 
 [[package]]
 name = "flightpublisher"
-version = "0.11.0-alpha"
+version = "0.10.2-alpha"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -2728,7 +2758,7 @@ dependencies = [
 
 [[package]]
 name = "flightrepl"
-version = "0.11.0-alpha"
+version = "0.10.2-alpha"
 dependencies = [
  "ansi_term",
  "arrow",
@@ -2748,7 +2778,7 @@ dependencies = [
 
 [[package]]
 name = "flightsql_datafusion"
-version = "0.11.0-alpha"
+version = "0.10.2-alpha"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -2767,7 +2797,7 @@ dependencies = [
 
 [[package]]
 name = "flightsubscriber"
-version = "0.11.0-alpha"
+version = "0.10.2-alpha"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -3286,7 +3316,7 @@ dependencies = [
  "httpdate",
  "itoa",
  "pin-project-lite",
- "socket2 0.4.10",
+ "socket2 0.5.6",
  "tokio",
  "tower-service",
  "tracing",
@@ -4287,7 +4317,7 @@ dependencies = [
 
 [[package]]
 name = "ns_lookup"
-version = "0.11.0-alpha"
+version = "0.10.2-alpha"
 dependencies = [
  "snafu 0.8.2",
  "tracing",
@@ -5419,7 +5449,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "0.11.0-alpha"
+version = "0.10.2-alpha"
 dependencies = [
  "app",
  "arrow",
@@ -5914,9 +5944,10 @@ dependencies = [
 
 [[package]]
 name = "secrets"
-version = "0.11.0-alpha"
+version = "0.10.2-alpha"
 dependencies = [
  "async-trait",
+ "aws-sdk-secretsmanager",
  "base64 0.22.0",
  "dirs",
  "keyring",
@@ -6214,7 +6245,7 @@ dependencies = [
 
 [[package]]
 name = "spiced"
-version = "0.11.0-alpha"
+version = "0.10.2-alpha"
 dependencies = [
  "app",
  "clap",
@@ -6232,7 +6263,7 @@ dependencies = [
 
 [[package]]
 name = "spicepod"
-version = "0.11.0-alpha"
+version = "0.10.2-alpha"
 dependencies = [
  "fundu",
  "serde",
@@ -6255,7 +6286,7 @@ checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
 
 [[package]]
 name = "sql_provider_datafusion"
-version = "0.11.0-alpha"
+version = "0.10.2-alpha"
 dependencies = [
  "async-trait",
  "datafusion",
