@@ -51,7 +51,6 @@ notify = "6.1.1"
 arrow-json = "50.0.0"
 async-trait.workspace = true
 flightsql_datafusion = { path = "../flightsql_datafusion" }
-flight_datafusion = { path = "../flight_datafusion" }
 deltalake = { version = "0.17.0", features = ["datafusion-ext", "s3", "azure"] }
 itertools = "0.12"
 aws-config = "1.1.7"
