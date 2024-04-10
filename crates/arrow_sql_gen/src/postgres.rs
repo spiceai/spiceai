@@ -225,11 +225,17 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                     handle_primitive_type!(builder, Type::BOOL, BooleanBuilder, bool, row, i);
                 }
                 Type::NUMERIC => {
-                    let v: BigDecimalFromSql =
+                    let v: Option<BigDecimalFromSql> =
                         row.try_get(i).context(FailedToGetRowValueSnafu {
                             pg_type: Type::NUMERIC,
                         })?;
-                    let scale = v.scale();
+                    let scale = {
+                        if let Some(v) = &v {
+                            v.scale()
+                        } else {
+                            0
+                        }
+                    };
 
                     let dec_builder = builder.get_or_insert_with(|| {
                         Box::new(
@@ -260,6 +266,11 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
 
                         *arrow_field = Some(new_arrow_field);
                     }
+
+                    let Some(v) = v else {
+                        dec_builder.append_null();
+                        continue;
+                    };
 
                     let Some(v_i128) = v.to_decimal_128() else {
                         return FailedToConvertBigDecmialToI128Snafu {
