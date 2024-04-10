@@ -145,7 +145,7 @@ impl Runtime {
             secret_store.store = secret_store_type;
         }
 
-        if let Err(e) = secret_store.load_secrets() {
+        if let Err(e) = secret_store.load_secrets().await {
             tracing::warn!("Unable to load secrets: {}", e);
         }
     }
