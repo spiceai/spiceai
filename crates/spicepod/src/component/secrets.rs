@@ -43,5 +43,6 @@ pub enum SpiceSecretStore {
     Env,
     Kubernetes,
     Keyring,
-    Aws,
+    #[serde(rename = "aws_secrets_manager")]
+    AwsSecretsManager,
 }

@@ -14,8 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-#[cfg(feature = "aws-secret-store")]
-pub mod aws;
+#[cfg(feature = "aws-secrets-manager")]
+pub mod aws_secrets_manager;
 pub mod env;
 pub mod file;
 #[cfg(feature = "keyring-secret-store")]
@@ -82,12 +82,11 @@ pub enum SecretStoreType {
     #[cfg(feature = "keyring-secret-store")]
     Keyring,
     Kubernetes,
-    #[cfg(feature = "aws-secret-store")]
-    AwsSecretStore,
+    #[cfg(feature = "aws-secrets-manager")]
+    AwsSecretsManager,
 }
 
 #[must_use]
-#[allow(unreachable_patterns)]
 pub fn spicepod_secret_store_type(store: &SpiceSecretStore) -> Option<SecretStoreType> {
     match store {
         SpiceSecretStore::File => Some(SecretStoreType::File),
@@ -95,8 +94,9 @@ pub fn spicepod_secret_store_type(store: &SpiceSecretStore) -> Option<SecretStor
         #[cfg(feature = "keyring-secret-store")]
         SpiceSecretStore::Keyring => Some(SecretStoreType::Keyring),
         SpiceSecretStore::Kubernetes => Some(SecretStoreType::Kubernetes),
-        #[cfg(feature = "aws-secret-store")]
-        SpiceSecretStore::Aws => Some(SecretStoreType::AwsSecretStore),
+        #[cfg(feature = "aws-secrets-manager")]
+        SpiceSecretStore::AwsSecretsManager => Some(SecretStoreType::AwsSecretsManager),
+        #[cfg(not(all(feature = "keyring-secret-store", feature = "aws-secrets-manager")))]
         _ => None,
     }
 }
@@ -163,9 +163,9 @@ impl SecretsProvider {
 
                 self.secret_store = Some(Box::new(kubernetes_secret_store));
             }
-            #[cfg(feature = "aws-secret-store")]
-            SecretStoreType::AwsSecretStore => {
-                self.secret_store = Some(Box::new(aws::AwsSecretStore::new()));
+            #[cfg(feature = "aws-secrets-manager")]
+            SecretStoreType::AwsSecretsManager => {
+                self.secret_store = Some(Box::new(aws_secrets_manager::AwsSecretsManager::new()));
             }
         }
 

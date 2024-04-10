@@ -19,15 +19,15 @@ use async_trait::async_trait;
 use super::{Secret, SecretStore};
 
 #[allow(clippy::module_name_repetitions)]
-pub struct AwsSecretStore {}
+pub struct AwsSecretsManager {}
 
-impl Default for AwsSecretStore {
+impl Default for AwsSecretsManager {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl AwsSecretStore {
+impl AwsSecretsManager {
     #[must_use]
     pub fn new() -> Self {
         Self {}
@@ -35,7 +35,7 @@ impl AwsSecretStore {
 }
 
 #[async_trait]
-impl SecretStore for AwsSecretStore {
+impl SecretStore for AwsSecretsManager {
     #[must_use]
     async fn get_secret(&self, _secret_name: &str) -> Option<Secret> {
         None
