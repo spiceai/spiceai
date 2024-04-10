@@ -36,8 +36,8 @@ pub mod arrow;
 pub mod duckdb;
 // #[cfg(feature = "mysql")]
 // pub mod mysql;
-// #[cfg(feature = "postgres")]
-// pub mod postgres;
+#[cfg(feature = "postgres")]
+pub mod postgres;
 // #[cfg(feature = "sqlite")]
 // pub mod sqlite;
 
@@ -71,6 +71,7 @@ pub async fn register_accelerator_engine(name: &str, accelerator_engine: Arc<dyn
 pub async fn register_all() {
     register_accelerator_engine("arrow", Arc::new(ArrowAccelerator::new())).await;
     register_accelerator_engine("duckdb", Arc::new(DuckDBAccelerator::new())).await;
+    register_accelerator_engine("postgres", Arc::new(PostgresAccelerator::new())).await;
 }
 
 pub async fn get_accelerator_engine(engine_name: &str) -> Option<Arc<dyn DataAccelerator>> {

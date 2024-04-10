@@ -28,32 +28,10 @@ use super::DataAccelerator;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("DbConnectionError: {source}"))]
-    DbConnectionError {
-        source: db_connection_pool::dbconnection::GenericError,
-    },
-
-    #[snafu(display("DbConnectionPoolError: {source}"))]
-    DbConnectionPoolError { source: db_connection_pool::Error },
-
-    #[snafu(display("DuckDBError: {source}"))]
-    DuckDB { source: duckdb::Error },
-
-    #[snafu(display("DuckDBDataFusionError: {source}"))]
-    DuckDBDataFusion {
-        source: sql_provider_datafusion::Error,
-    },
-
-    #[snafu(display("DataFusionError: {source}"))]
-    DataFusion {
+    #[snafu(display("Unable to create table: {source}"))]
+    UnableToCreateTable {
         source: datafusion::error::DataFusionError,
     },
-
-    #[snafu(display("Lock is poisoned: {message}"))]
-    LockPoisoned { message: String },
-
-    #[snafu(display("Unable to downcast DbConnection to DuckDbConnection"))]
-    UnableToDowncastDbConnection {},
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -91,6 +69,7 @@ impl DataAccelerator for DuckDBAccelerator {
         let ctx = SessionContext::new();
         TableProviderFactory::create(&self.duckdb_factory, &ctx.state(), cmd)
             .await
+            .context(UnableToCreateTableSnafu)
             .boxed()
     }
 }

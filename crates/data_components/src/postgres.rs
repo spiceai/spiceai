@@ -15,10 +15,21 @@ limitations under the License.
 */
 
 #![allow(clippy::module_name_repetitions)]
+use arrow::datatypes::{Schema, SchemaRef};
 use async_trait::async_trait;
 use bb8_postgres::{tokio_postgres::types::ToSql, PostgresConnectionManager};
-use datafusion::{common::OwnedTableReference, datasource::TableProvider};
-use db_connection_pool::DbConnectionPool;
+use datafusion::{
+    common::OwnedTableReference,
+    datasource::{provider::TableProviderFactory, TableProvider},
+    error::{DataFusionError, Result as DataFusionResult},
+    execution::context::SessionState,
+    logical_expr::CreateExternalTable,
+};
+use db_connection_pool::{
+    dbconnection::{postgresconn::PostgresConnection, DbConnection},
+    postgrespool::PostgresConnectionPool,
+    DbConnectionPool,
+};
 use postgres_native_tls::MakeTlsConnector;
 use snafu::prelude::*;
 use sql_provider_datafusion::SqlTable;
@@ -30,11 +41,15 @@ use crate::Read;
 
 pub mod write;
 
-pub type PostgresConnectionPool = dyn DbConnectionPool<
+pub type DynPostgresConnectionPool = dyn DbConnectionPool<
         bb8::PooledConnection<'static, PostgresConnectionManager<MakeTlsConnector>>,
         &'static (dyn ToSql + Sync),
     > + Send
     + Sync;
+pub type DynPostgresConnection = dyn DbConnection<
+    bb8::PooledConnection<'static, PostgresConnectionManager<MakeTlsConnector>>,
+    &'static (dyn ToSql + Sync),
+>;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -43,8 +58,8 @@ pub enum Error {
         source: db_connection_pool::dbconnection::GenericError,
     },
 
-    #[snafu(display("DbConnectionPoolError: {source}"))]
-    DbConnectionPoolError {
+    #[snafu(display("Unable to create Postgres connection pool: {source}"))]
+    UnableToCreatePostgresConnectionPool {
         source: db_connection_pool::Error,
     },
 
@@ -67,12 +82,12 @@ pub enum Error {
 type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct PostgresTableFactory {
-    pool: Arc<PostgresConnectionPool>,
+    pool: Arc<DynPostgresConnectionPool>,
 }
 
 impl PostgresTableFactory {
     #[must_use]
-    pub fn new(pool: Arc<PostgresConnectionPool>) -> Self {
+    pub fn new(pool: Arc<DynPostgresConnectionPool>) -> Self {
         Self { pool }
     }
 }
@@ -92,83 +107,104 @@ impl Read for PostgresTableFactory {
     }
 }
 
-// #[async_trait]
-// impl TableProviderFactory for PostgresTableFactory {
-//     async fn create(
-//         &self,
-//         _state: &SessionState,
-//         cmd: &CreateExternalTable,
-//     ) -> DataFusionResult<Arc<dyn TableProvider>> {
-//         let name = cmd.name.to_string();
-//         let mut options = cmd.options.clone();
-//         let schema: Schema = cmd.schema.as_ref().into();
+pub struct PostgresTableProviderFactory {}
 
-//         let params = Arc::new(Some(options));
+#[async_trait]
+impl TableProviderFactory for PostgresTableProviderFactory {
+    async fn create(
+        &self,
+        _state: &SessionState,
+        cmd: &CreateExternalTable,
+    ) -> DataFusionResult<Arc<dyn TableProvider>> {
+        let name = cmd.name.to_string();
+        let mut options = cmd.options.clone();
+        let schema: Schema = cmd.schema.as_ref().into();
 
-//         let pool: Arc<DuckDbConnectionPool> = Arc::new(
-//             DuckDbConnectionPool::new(&name, &mode, &params)
-//                 .context(DbConnectionPoolSnafu)
-//                 .map_err(to_datafusion_error)?,
-//         );
+        let params = Arc::new(Some(options));
 
-//         let duckdb = DuckDB::new(name.clone(), Arc::new(schema), Arc::clone(&pool));
+        let pool = Arc::new(
+            PostgresConnectionPool::new(params, None)
+                .await
+                .context(UnableToCreatePostgresConnectionPoolSnafu)
+                .map_err(to_datafusion_error)?,
+        );
 
-//         let mut db_conn = duckdb.connect().await.map_err(to_datafusion_error)?;
-//         let duckdb_conn = DuckDB::duckdb_conn(&mut db_conn).map_err(to_datafusion_error)?;
-//         duckdb
-//             .create_table(duckdb_conn, false)
-//             .map_err(to_datafusion_error)?;
+        let postgres = Postgres::new(name.clone(), Arc::new(schema), Arc::clone(&pool));
 
-//         let dyn_pool: Arc<DynDuckDbConnectionPool> = pool;
+        let mut db_conn = postgres.connect().await.map_err(to_datafusion_error)?;
+        let duckdb_conn = DuckDB::duckdb_conn(&mut db_conn).map_err(to_datafusion_error)?;
+        duckdb
+            .create_table(duckdb_conn, false)
+            .map_err(to_datafusion_error)?;
 
-//         let read_provider = Arc::new(
-//             SqlTable::new(&dyn_pool, OwnedTableReference::bare(name.clone()))
-//                 .await
-//                 .context(DuckDBDataFusionSnafu)
-//                 .map_err(to_datafusion_error)?,
-//         );
+        let dyn_pool: Arc<DynDuckDbConnectionPool> = pool;
 
-//         let read_write_provider: Arc<dyn TableProvider> =
-//             DuckDBTableWriter::create(read_provider, duckdb);
+        let read_provider = Arc::new(
+            SqlTable::new(&dyn_pool, OwnedTableReference::bare(name.clone()))
+                .await
+                .context(DuckDBDataFusionSnafu)
+                .map_err(to_datafusion_error)?,
+        );
 
-//         Ok(read_write_provider)
-//     }
-// }
+        let read_write_provider: Arc<dyn TableProvider> =
+            DuckDBTableWriter::create(read_provider, duckdb);
 
-// fn to_datafusion_error(error: Error) -> DataFusionError {
-//     DataFusionError::External(Box::new(error))
-// }
+        Ok(read_write_provider)
+    }
+}
 
-// #[derive(Clone)]
-// pub struct Postgres {
-//     table_name: String,
-//     schema: SchemaRef,
-//     pool: Arc<PostgresConnectionPool>,
-// }
+fn to_datafusion_error(error: Error) -> DataFusionError {
+    DataFusionError::External(Box::new(error))
+}
 
-// impl Postgres {
-//     #[must_use]
-//     pub fn new(table_name: String, schema: SchemaRef, pool: Arc<PostgresConnectionPool>) -> Self {
-//         Self {
-//             table_name,
-//             schema,
-//             pool,
-//         }
-//     }
+#[derive(Clone)]
+pub struct Postgres {
+    table_name: String,
+    schema: SchemaRef,
+    pool: Arc<PostgresConnectionPool>,
+}
 
-//     // async fn connect(
-//     //     &self,
-//     // ) -> Result<
-//     //     Box<
-//     //         dyn DbConnection<
-//     //             bb8::PooledConnection<'static, PostgresConnectionManager<MakeTlsConnector>>,
-//     //             &'static dyn ToSql,
-//     //         >,
-//     //     >,
-//     // > {
-//     //     self.pool.connect().await.context(DbConnectionSnafu)
-//     // }
-// }
+impl Postgres {
+    #[must_use]
+    pub fn new(table_name: String, schema: SchemaRef, pool: Arc<PostgresConnectionPool>) -> Self {
+        Self {
+            table_name,
+            schema,
+            pool,
+        }
+    }
+
+    async fn connect(&self) -> Result<Box<DynPostgresConnection>> {
+        self.pool.connect().await.context(DbConnectionSnafu)
+    }
+
+    fn postgres_conn<'a>(
+        db_connection: &'a mut Box<DynPostgresConnection>,
+    ) -> Result<&'a mut PostgresConnection> {
+        db_connection
+            .as_any_mut()
+            .downcast_mut::<PostgresConnection>()
+            .ok_or_else(|| UnableToDowncastDbConnectionSnafu {}.build())
+    }
+
+    async fn table_exists(&mut self, postgres_conn: &PostgresConnection) -> bool {
+        let sql = format!(
+            r#"SELECT EXISTS (
+            SELECT 1
+            FROM information_schema.tables
+            WHERE table_name = '{name}'
+          )"#,
+            name = self.table_name
+        );
+        tracing::trace!("{sql}");
+
+        let Ok(row) = postgres_conn.conn.query_one(&sql, &[]).await else {
+            return false;
+        };
+
+        row.get(0)
+    }
+}
 
 // #[async_trait]
 // impl ReadWrite for DuckDBTableFactory {
