@@ -297,7 +297,7 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                                 }
                             };
 
-                            builder.append_value(Date32Type::from_naive_date(date))
+                            builder.append_value(Date32Type::from_naive_date(date));
                         }
                         None => builder.append_null(),
                     }
