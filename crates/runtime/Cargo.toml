@@ -88,6 +88,7 @@ postgres = [
     "db_connection_pool/postgres",
     "sql_provider_datafusion/postgres",
     "arrow_sql_gen/postgres",
+    "data_components/postgres",
 ]
 sqlite = [
     "dep:rusqlite",

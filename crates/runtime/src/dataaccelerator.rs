@@ -30,8 +30,6 @@ use std::{any::Any, collections::HashMap, sync::Arc};
 use tokio::sync::Mutex;
 
 use self::{arrow::ArrowAccelerator, duckdb::DuckDBAccelerator};
-// #[cfg(feature = "duckdb")]
-// use self::duckdb::DuckDBBackend;
 
 pub mod arrow;
 #[cfg(feature = "duckdb")]

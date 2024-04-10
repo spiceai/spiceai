@@ -27,6 +27,8 @@ pub mod duckdb;
 pub mod flight;
 #[cfg(feature = "flightsql")]
 pub mod flightsql;
+#[cfg(feature = "postgres")]
+pub mod postgres;
 
 #[async_trait]
 pub trait Read {

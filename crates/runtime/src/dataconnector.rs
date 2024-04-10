@@ -41,8 +41,8 @@ pub mod flightsql;
 pub mod localhost;
 // #[cfg(feature = "mysql")]
 // pub mod mysql;
-// #[cfg(feature = "postgres")]
-// pub mod postgres;
+#[cfg(feature = "postgres")]
+pub mod postgres;
 pub mod s3;
 pub mod spiceai;
 
@@ -115,8 +115,8 @@ pub async fn register_all() {
     register_connector_factory("spiceai", spiceai::SpiceAI::create).await;
     // #[cfg(feature = "mysql")]
     // register_connector_factory("mysql", mysql::MySQL::create).await;
-    // #[cfg(feature = "postgres")]
-    // register_connector_factory("postgres", postgres::Postgres::create).await;
+    #[cfg(feature = "postgres")]
+    register_connector_factory("postgres", postgres::Postgres::create).await;
 }
 
 pub trait DataConnectorFactory {

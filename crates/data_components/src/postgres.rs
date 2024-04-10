@@ -19,6 +19,7 @@ use arrow::{
     datatypes::{Schema, SchemaRef},
 };
 use async_trait::async_trait;
+use bb8_postgres::PostgresConnectionManager;
 use datafusion::{
     common::OwnedTableReference,
     datasource::{provider::TableProviderFactory, TableProvider},
@@ -29,16 +30,25 @@ use datafusion::{
 use db_connection_pool::{
     dbconnection::{duckdbconn::DuckDbConnection, DbConnection},
     duckdbpool::DuckDbConnectionPool,
-    DbConnectionPool, Mode,
+    DbConnectionPool,
 };
 use duckdb::{vtab::arrow::arrow_recordbatch_to_query_params, DuckdbConnectionManager, ToSql};
+use postgres_native_tls::MakeTlsConnector;
 use snafu::prelude::*;
 use sql_provider_datafusion::SqlTable;
 use std::{cmp, sync::Arc};
 
-use self::write::DuckDBTableWriter;
+use crate::Read;
+
+// use self::write::PostgresTableWriter;
 
 pub mod write;
+
+pub type PostgresConnectionPool = dyn DbConnectionPool<
+        bb8::PooledConnection<'static, PostgresConnectionManager<MakeTlsConnector>>,
+        &'static (dyn ToSql + Sync),
+    > + Send
+    + Sync;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -48,49 +58,56 @@ pub enum Error {
     },
 
     #[snafu(display("DbConnectionPoolError: {source}"))]
-    DbConnectionPoolError { source: db_connection_pool::Error },
-
-    #[snafu(display("DuckDBDataFusionError: {source}"))]
-    DuckDBDataFusion {
-        source: sql_provider_datafusion::Error,
+    DbConnectionPoolError {
+        source: db_connection_pool::Error,
     },
 
-    #[snafu(display("Unable to downcast DbConnection to DuckDbConnection"))]
+    #[snafu(display("Unable to downcast DbConnection to PostgresConnection"))]
     UnableToDowncastDbConnection {},
 
-    #[snafu(display("Unable to drop duckdb table: {source}"))]
-    UnableToDropDuckDBTable { source: duckdb::Error },
+    UnableToDropDuckDBTable {
+        source: duckdb::Error,
+    },
 
-    #[snafu(display("Unable to create duckdb table: {source}"))]
-    UnableToCreateDuckDBTable { source: duckdb::Error },
+    UnableToCreateDuckDBTable {
+        source: duckdb::Error,
+    },
 
-    #[snafu(display("Unable to insert into duckdb table: {source}"))]
-    UnableToInsertToDuckDBTable { source: duckdb::Error },
+    UnableToInsertToDuckDBTable {
+        source: duckdb::Error,
+    },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
-pub struct DuckDBTableFactory {}
+pub struct PostgresTableFactory {
+    pool: Arc<PostgresConnectionPool>,
+}
 
-impl DuckDBTableFactory {
+impl PostgresTableFactory {
     #[must_use]
-    pub fn new() -> Self {
-        Self {}
+    pub fn new(pool: Arc<PostgresConnectionPool>) -> Self {
+        Self { pool }
     }
 }
-
-impl Default for DuckDBTableFactory {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-type DynDuckDbConnectionPool = dyn DbConnectionPool<r2d2::PooledConnection<DuckdbConnectionManager>, &'static dyn ToSql>
-    + Send
-    + Sync;
 
 #[async_trait]
-impl TableProviderFactory for DuckDBTableFactory {
+impl Read for PostgresTableFactory {
+    async fn table_provider(
+        &self,
+        table_reference: OwnedTableReference,
+    ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
+        let pool = Arc::clone(&self.pool);
+        let table_provider = SqlTable::new(&pool, table_reference)
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+        Ok(Arc::new(table_provider))
+    }
+}
+
+#[async_trait]
+impl TableProviderFactory for PostgresTableFactory {
     async fn create(
         &self,
         _state: &SessionState,
@@ -98,8 +115,7 @@ impl TableProviderFactory for DuckDBTableFactory {
     ) -> DataFusionResult<Arc<dyn TableProvider>> {
         let name = cmd.name.to_string();
         let mut options = cmd.options.clone();
-        let mode = options.remove("mode").unwrap_or_default();
-        let mode: Mode = mode.as_str().into();
+        let schema: Schema = cmd.schema.as_ref().into();
 
         let params = Arc::new(Some(options));
 
@@ -109,7 +125,6 @@ impl TableProviderFactory for DuckDBTableFactory {
                 .map_err(to_datafusion_error)?,
         );
 
-        let schema: Schema = cmd.schema.as_ref().into();
         let duckdb = DuckDB::new(name.clone(), Arc::new(schema), Arc::clone(&pool));
 
         let mut db_conn = duckdb.connect().await.map_err(to_datafusion_error)?;
@@ -139,13 +154,13 @@ fn to_datafusion_error(error: Error) -> DataFusionError {
 }
 
 #[derive(Clone)]
-pub struct DuckDB {
+pub struct PostgresTable {
     table_name: String,
     schema: SchemaRef,
     pool: Arc<DuckDbConnectionPool>,
 }
 
-impl DuckDB {
+impl PostgresTable {
     #[must_use]
     pub fn new(table_name: String, schema: SchemaRef, pool: Arc<DuckDbConnectionPool>) -> Self {
         Self {
@@ -177,10 +192,10 @@ impl DuckDB {
     fn table_exists(&self, duckdb_conn: &mut DuckDbConnection) -> bool {
         let sql = format!(
             r#"SELECT EXISTS (
-            SELECT 1
-            FROM information_schema.tables 
-            WHERE table_name = '{name}'
-          )"#,
+          SELECT 1
+          FROM information_schema.tables 
+          WHERE table_name = '{name}'
+        )"#,
             name = self.table_name
         );
         tracing::trace!("{sql}");
@@ -263,18 +278,6 @@ impl DuckDB {
         Ok(())
     }
 }
-
-// TODO: DuckDB DataConnector
-//
-// #[async_trait]
-// impl Read for DuckDBTableFactory {
-//     async fn table_provider(
-//         &self,
-//         _table_reference: OwnedTableReference,
-//     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
-//         todo!()
-//     }
-// }
 
 // #[async_trait]
 // impl ReadWrite for DuckDBTableFactory {

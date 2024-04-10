@@ -32,9 +32,23 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::{collections::HashMap, future::Future};
 
-use super::Result;
-use super::UnableToGetTableProviderSnafu;
 use super::{DataConnector, DataConnectorFactory};
+
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display("Unable to create Postgres connection pool: {source}"))]
+    UnableToCreatePostgresConnectionPool { source: db_connection_pool::Error },
+
+    UnableToGetReadProvider {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    UnableToGetReadWriteProvider {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+}
+
+pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct Postgres {
     pool: Arc<
@@ -61,10 +75,10 @@ impl DataConnectorFactory for Postgres {
             > = Arc::new(
                 PostgresConnectionPool::new(params, secret)
                     .await
-                    .context(UnableToGetTableProviderSnafu)?,
+                    .context(UnableToCreatePostgresConnectionPoolSnafu)?,
             );
 
-            Ok(Box::new(Self { pool }) as Box<dyn DataConnector>)
+            Ok(Arc::new(Self { pool }) as Arc<dyn DataConnector>)
         })
     }
 }
@@ -132,3 +146,47 @@ impl DataConnector for Postgres {
         Ok(Arc::new(table_provider))
     }
 }
+
+// fn get_all_data(
+//     &self,
+//     dataset: &Dataset,
+// ) -> Pin<Box<dyn Future<Output = Vec<RecordBatch>> + Send>> {
+//     let path = dataset.path().clone();
+//     let pool = Arc::clone(&self.pool);
+//     Box::pin(async move {
+//         let conn = match pool.connect().await {
+//             Ok(conn) => conn,
+//             Err(e) => {
+//                 tracing::error!("Failed to connect to Postgres: {e}");
+//                 return vec![];
+//             }
+//         };
+
+//         let Some(async_conn) = conn.as_async() else {
+//             tracing::error!("Failed to convert postgres conn to async connection",);
+//             return vec![];
+//         };
+
+//         let record_batch_stream = match async_conn
+//             .query_arrow(format!("SELECT * FROM {path}").as_str(), &[])
+//             .await
+//         {
+//             Ok(stream) => stream,
+//             Err(e) => {
+//                 tracing::error!("{e}");
+//                 return vec![];
+//             }
+//         };
+
+//         let recs: Vec<RecordBatch> =
+//             match record_batch_stream.try_collect::<Vec<RecordBatch>>().await {
+//                 Ok(recs) => recs,
+//                 Err(e) => {
+//                     tracing::error!("Failed to collect record batches from Postgres: {e}");
+//                     return vec![];
+//                 }
+//             };
+
+//         recs
+//     })
+// }
