@@ -2754,25 +2754,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "flightsql_datafusion"
-version = "0.10.2-alpha"
-dependencies = [
- "arrow",
- "arrow-flight",
- "async-stream",
- "async-trait",
- "datafusion",
- "flight_client",
- "futures",
- "r2d2",
- "snafu 0.8.2",
- "sql_provider_datafusion",
- "tokio",
- "tonic 0.10.2",
- "tracing",
-]
-
-[[package]]
 name = "flightsubscriber"
 version = "0.10.2-alpha"
 dependencies = [
@@ -5452,7 +5433,6 @@ dependencies = [
  "dirs",
  "duckdb",
  "flight_client",
- "flightsql_datafusion",
  "futures",
  "futures-core",
  "indexmap 2.2.5",
