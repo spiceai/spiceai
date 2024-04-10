@@ -14,35 +14,30 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use serde::{Deserialize, Serialize};
+use async_trait::async_trait;
 
-/// The secrets configuration for a Spicepod.
-///
-/// Example:
-/// ```yaml
-/// secrets:
-///   store: file
-/// ```
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct Secrets {
-    pub store: SpiceSecretStore,
-}
+use super::{Secret, SecretStore};
 
-impl Default for Secrets {
+#[allow(clippy::module_name_repetitions)]
+pub struct AwsSecretsManager {}
+
+impl Default for AwsSecretsManager {
     fn default() -> Self {
-        Self {
-            store: SpiceSecretStore::File,
-        }
+        Self::new()
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub enum SpiceSecretStore {
-    File,
-    Env,
-    Kubernetes,
-    Keyring,
-    #[serde(rename = "aws_secrets_manager")]
-    AwsSecretsManager,
+impl AwsSecretsManager {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
+#[async_trait]
+impl SecretStore for AwsSecretsManager {
+    #[must_use]
+    async fn get_secret(&self, _secret_name: &str) -> Option<Secret> {
+        None
+    }
 }
