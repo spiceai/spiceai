@@ -14,56 +14,39 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use super::{DataConnector, DataConnectorFactory};
+use arrow_flight::sql::client::FlightSqlServiceClient;
+use async_trait::async_trait;
+use data_components::flightsql::FlightSQLFactory;
+use data_components::Read;
+use datafusion::datasource::TableProvider;
+use flight_client::tls::new_tls_flight_channel;
+use secrets::Secret;
+use snafu::prelude::*;
+use spicepod::component::dataset::Dataset;
+use std::any::Any;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::{future::Future, sync::Arc};
 
-use arrow_flight::sql::client::FlightSqlServiceClient;
-use arrow_flight::Ticket;
-use async_trait::async_trait;
-use spicepod::component::dataset::Dataset;
-use tonic::transport::Channel;
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display("Missing required parameter: endpoint"))]
+    MissingEndpointParameter,
 
-use flight_client::tls::new_tls_flight_channel;
-use flightsql_datafusion::FlightSQLTable;
-use secrets::Secret;
+    #[snafu(display("Unable to construct TLS flight client: {source}"))]
+    UnableToConstructTlsChannel { source: flight_client::tls::Error },
 
-use super::{DataConnector, DataConnectorFactory};
-use arrow::error::ArrowError;
-use futures::stream::TryStreamExt;
+    UnableToGetReadProvider {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+}
+
+pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Clone)]
 pub struct FlightSQL {
-    pub client: FlightSqlServiceClient<Channel>,
-}
-
-impl FlightSQL {
-    async fn query(
-        client: FlightSqlServiceClient<Channel>,
-        query: String,
-    ) -> Result<Vec<arrow::record_batch::RecordBatch>, Box<dyn std::error::Error>> {
-        let flight_info = client.clone().execute(query, None).await?;
-
-        let mut batches = vec![];
-        for ep in &flight_info.endpoint {
-            if let Some(tkt) = &ep.ticket {
-                let mut do_get_client = if ep.location.is_empty() {
-                    client.clone() // expectation is that the ticket can only be redeemed on the current service
-                } else {
-                    let channel = new_tls_flight_channel(&ep.location[0].uri).await?;
-                    FlightSqlServiceClient::new(channel)
-                };
-                match batch_from_ticket(&mut do_get_client, tkt.to_owned()).await {
-                    Ok(flight_data) => batches.extend(flight_data),
-                    Err(err) => {
-                        tracing::error!("Failed to read batch from flight client: {:?}", err);
-                        break;
-                    }
-                }
-            };
-        }
-        Ok(batches)
-    }
+    pub flightsql_factory: FlightSQLFactory,
 }
 
 impl DataConnectorFactory for FlightSQL {
@@ -76,12 +59,10 @@ impl DataConnectorFactory for FlightSQL {
                 .as_ref() // &Option<HashMap<String, String>>
                 .as_ref() // Option<&HashMap<String, String>>
                 .and_then(|params| params.get("endpoint").cloned())
-                .ok_or(super::Error::UnableToCreateDataConnector {
-                    source: "Missing required parameter: endpoint".into(),
-                })?;
+                .context(MissingEndpointParameterSnafu)?;
             let flight_channel = new_tls_flight_channel(&endpoint)
                 .await
-                .map_err(|e| super::Error::UnableToCreateDataConnector { source: e.into() })?;
+                .context(UnableToConstructTlsChannelSnafu)?;
 
             let mut client = FlightSqlServiceClient::new(flight_channel);
             if let Some(s) = secret {
@@ -92,57 +73,26 @@ impl DataConnectorFactory for FlightSQL {
                     )
                     .await;
             };
-            Ok(Box::new(Self { client }) as Box<dyn DataConnector>)
+            let flightsql_factory = FlightSQLFactory::new(client);
+            Ok(Arc::new(Self { flightsql_factory }) as Arc<dyn DataConnector>)
         })
     }
 }
 
 #[async_trait]
 impl DataConnector for FlightSQL {
-    fn get_all_data(
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    async fn read_provider(
         &self,
         dataset: &Dataset,
-    ) -> Pin<Box<dyn Future<Output = Vec<arrow::record_batch::RecordBatch>> + Send>> {
-        let dataset_path = dataset.path().clone();
-        let client = self.client.clone();
-
-        Box::pin(async move {
-            match Self::query(client.clone(), format!("SELECT * FROM {dataset_path}")).await {
-                Ok(batches) => batches,
-                Err(e) => {
-                    tracing::error!("Failed to get data from flight client: {:?}", e);
-                    Vec::new()
-                }
-            }
-        })
+    ) -> super::AnyErrorResult<Arc<dyn TableProvider>> {
+        Ok(
+            Read::table_provider(&self.flightsql_factory, dataset.path().into())
+                .await
+                .context(UnableToGetReadProviderSnafu)?,
+        )
     }
-
-    fn has_table_provider(&self) -> bool {
-        true
-    }
-
-    async fn get_table_provider(
-        &self,
-        dataset: &Dataset,
-    ) -> std::result::Result<Arc<dyn datafusion::datasource::TableProvider>, super::Error> {
-        match FlightSQLTable::new(self.client.clone(), dataset.path()).await {
-            Ok(provider) => Ok(Arc::new(provider)),
-            Err(error) => Err(super::Error::UnableToGetTableProvider {
-                source: error.into(),
-            }),
-        }
-    }
-}
-
-async fn batch_from_ticket(
-    client: &mut FlightSqlServiceClient<Channel>,
-    ticket: Ticket,
-) -> Result<Vec<arrow::record_batch::RecordBatch>, ArrowError> {
-    let flight_data = client
-        .do_get(ticket)
-        .await?
-        .try_collect::<Vec<_>>()
-        .await
-        .map_err(|err| ArrowError::CastError(format!("Cannot collect flight data: {err:#?}")))?;
-    Ok(flight_data)
 }

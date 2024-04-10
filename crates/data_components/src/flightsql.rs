@@ -23,10 +23,10 @@ use arrow::{
 use async_stream::stream;
 use async_trait::async_trait;
 use flight_client::tls::new_tls_flight_channel;
-use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt};
+use futures::{Stream, StreamExt, TryStreamExt};
 use snafu::prelude::*;
 use sql_provider_datafusion::expr;
-use std::{any::Any, fmt, pin::Pin, sync::Arc, task::Poll, vec};
+use std::{any::Any, fmt, sync::Arc, vec};
 
 use arrow_flight::{
     error::FlightError,
@@ -38,14 +38,17 @@ use datafusion::{
     common::OwnedTableReference,
     datasource::TableProvider,
     error::{DataFusionError, Result as DataFusionResult},
-    execution::{context::SessionState, RecordBatchStream, TaskContext},
+    execution::{context::SessionState, TaskContext},
     logical_expr::{Expr, TableProviderFilterPushDown, TableType},
     physical_plan::{
-        project_schema, DisplayAs, DisplayFormatType, ExecutionPlan, SendableRecordBatchStream,
+        project_schema, stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType,
+        ExecutionPlan, SendableRecordBatchStream,
     },
 };
 use tonic::codegen::Bytes;
 use tonic::transport::{channel, Channel};
+
+use crate::Read;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -61,11 +64,42 @@ pub enum Error {
     #[snafu(display("Unable to query FlightSQL: {source}"))]
     ArrowFlight { source: FlightError },
 
+    #[snafu(display("Unable to retrieve schema: {source}"))]
+    UnableToRetrieveSchemaArrow { source: arrow::error::ArrowError },
+
+    #[snafu(display("Unable to retrieve schema: {source}"))]
+    UnableToRetrieveSchemaFlight { source: FlightError },
+
     #[snafu(display("Unable to retrieve schema"))]
-    UnableToRetrieveSchema { source: arrow::error::ArrowError },
+    UnableToRetrieveSchema,
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
+
+#[derive(Debug, Clone)]
+pub struct FlightSQLFactory {
+    client: FlightSqlServiceClient<Channel>,
+}
+
+impl FlightSQLFactory {
+    #[must_use]
+    pub fn new(client: FlightSqlServiceClient<Channel>) -> Self {
+        Self { client }
+    }
+}
+
+#[async_trait]
+impl Read for FlightSQLFactory {
+    async fn table_provider(
+        &self,
+        table_reference: OwnedTableReference,
+    ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
+        FlightSQLTable::create(self.client.clone(), table_reference)
+            .await
+            .map(|f| Arc::new(f) as Arc<dyn TableProvider + 'static>)
+            .boxed()
+    }
+}
 
 pub struct FlightSQLTable {
     client: FlightSqlServiceClient<Channel>,
@@ -75,7 +109,7 @@ pub struct FlightSQLTable {
 
 #[allow(clippy::needless_pass_by_value)]
 impl FlightSQLTable {
-    pub async fn new(
+    pub async fn create(
         client: FlightSqlServiceClient<Channel>,
         table_reference: impl Into<OwnedTableReference>,
     ) -> Result<Self> {
@@ -96,7 +130,7 @@ impl FlightSQLTable {
             .connect()
             .await
             .context(UnableToConnectToServerSnafu)?;
-        Self::new(FlightSqlServiceClient::new(channel), table_reference.into()).await
+        Self::create(FlightSqlServiceClient::new(channel), table_reference.into()).await
     }
 
     fn get_str_from_record_batch(b: &RecordBatch, row: usize, col_name: &str) -> Option<String> {
@@ -146,7 +180,7 @@ impl FlightSQLTable {
             1 => {
                 if let Some(bytz) = possible_schema_bytz.first() {
                     match Schema::try_from(IpcMessage(Bytes::copy_from_slice(bytz)))
-                        .context(UnableToRetrieveSchemaSnafu)
+                        .context(UnableToRetrieveSchemaArrowSnafu)
                     {
                         Ok(schema) => Some(Arc::new(schema)),
                         Err(e) => {
@@ -190,9 +224,7 @@ impl FlightSQLTable {
                 .collect(),
             })
             .await
-            .map_err(|e| FlightSQLError::ArrowFlight {
-                source: arrow_flight::error::FlightError::Arrow(e),
-            })?;
+            .context(UnableToRetrieveSchemaArrowSnafu)?;
 
         for tkt in flight_info
             .endpoint
@@ -202,11 +234,11 @@ impl FlightSQLTable {
             let stream = client
                 .do_get(tkt.clone())
                 .await
-                .map_err(|e| FlightSQLError::ArrowFlight { source: e.into() })?;
+                .context(UnableToRetrieveSchemaArrowSnafu)?;
             let batch = stream
                 .try_collect::<Vec<_>>()
                 .await
-                .map_err(|e| FlightSQLError::ArrowFlight { source: e })?;
+                .context(UnableToRetrieveSchemaFlightSnafu)?;
 
             // Schema: https://github.com/apache/arrow/blob/44edc27e549d82db930421b0d4c76098941afd71/format/FlightSql.proto#L1182-L1190
             if let Some(schema) = Self::get_table_schema_if_present(batch, table_reference.clone())
@@ -214,7 +246,8 @@ impl FlightSQLTable {
                 return Ok(schema);
             };
         }
-        Err(FlightSQLError::NoSchema {})
+
+        UnableToRetrieveSchemaSnafu.fail()
     }
 
     fn create_physical_plan(
@@ -387,83 +420,45 @@ impl ExecutionPlan for FlightSqlExec {
             Err(error) => return Err(error),
         };
 
-        Ok(Box::pin(StreamConverter::new(
-            self.client.clone(),
-            sql.as_str(),
+        let stream_adapter = RecordBatchStreamAdapter::new(
             self.schema(),
-        )))
+            query_to_stream(self.client.clone(), sql.as_str()),
+        );
+
+        Ok(Box::pin(stream_adapter))
     }
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn to_stream(
-    client: FlightSqlServiceClient<Channel>,
+fn query_to_stream(
+    mut client: FlightSqlServiceClient<Channel>,
     sql: &str,
-) -> impl Stream<Item = Result<RecordBatch>> {
-    let client = client.clone();
+) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
     let sql = sql.to_string();
 
     stream! {
         let flight_info = client
-            .clone()
             .execute(sql.to_string(), None)
             .await
-            .map_err(|e| FlightSQLError::ArrowFlight { source: e.into() })?;
+            .map_err(to_execution_error)?;
 
         for ep in flight_info.endpoint {
             if let Some(tkt) = ep.clone().ticket {
                 match get_client_for_flight_endpoint(&client, ep).await
-                    .map_err(|_| FlightSQLError::UnableToConnectToServer{})?
+                    .map_err(to_execution_error)?
                     .do_get(tkt.clone()).await {
                         Ok(mut flight_stream) => {
                             while let Some(batch) = flight_stream.next().await {
                                 match batch {
                                     Ok(batch) => yield Ok(batch),
-                                    Err(error) => yield Err(FlightSQLError::ArrowFlight { source: error })
+                                    Err(error) => yield Err(to_execution_error(Error::ArrowFlight { source: error }))
                                 }
                             }
                         },
-                        Err(error) => yield Err(FlightSQLError::ArrowFlight { source: error.into()} )
+                        Err(error) => yield Err(to_execution_error(Error::ArrowFlight { source: error.into()} ))
                 };
             }
         };
-    }
-}
-
-struct StreamConverter {
-    stream: Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>>,
-    schema: SchemaRef,
-}
-
-impl StreamConverter {
-    fn new(client: FlightSqlServiceClient<Channel>, sql: &str, schema: SchemaRef) -> Self {
-        let stream = to_stream(client, sql);
-        Self {
-            stream: Box::pin(stream),
-            schema,
-        }
-    }
-}
-
-impl RecordBatchStream for StreamConverter {
-    fn schema(&self) -> SchemaRef {
-        self.schema.clone()
-    }
-}
-
-impl Stream for StreamConverter {
-    type Item = datafusion::common::Result<RecordBatch>;
-
-    fn poll_next(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> Poll<Option<Self::Item>> {
-        match self.stream.poll_next_unpin(cx) {
-            Poll::Ready(Some(Ok(record_batch))) => Poll::Ready(Some(Ok(record_batch))),
-            Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(to_execution_error(error)))),
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
-        }
     }
 }
 

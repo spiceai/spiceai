@@ -77,7 +77,7 @@ impl Read for FlightFactory {
         &self,
         table_reference: OwnedTableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
-        FlightTable::new(self.client.clone(), table_reference)
+        FlightTable::create(self.client.clone(), table_reference)
             .await
             .map(|f| Arc::new(f) as Arc<dyn TableProvider + 'static>)
             .boxed()
@@ -108,7 +108,7 @@ pub struct FlightTable {
 
 #[allow(clippy::needless_pass_by_value)]
 impl FlightTable {
-    pub async fn new(
+    pub async fn create(
         client: FlightClient,
         table_reference: impl Into<OwnedTableReference>,
     ) -> Result<Self> {
