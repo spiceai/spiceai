@@ -152,6 +152,7 @@ impl Runtime {
         pods_watcher: podswatcher::PodsWatcher,
     ) -> Self {
         dataconnector::register_all().await;
+        dataaccelerator::register_all().await;
         Runtime {
             app,
             config,
@@ -389,14 +390,11 @@ impl Runtime {
         let acceleration_secret = secrets_provider_read_guard.get_secret(&secret_key).await;
         drop(secrets_provider_read_guard);
 
-        if dataaccelerator::get_accelerator_engine(&accelerator_engine)
+        dataaccelerator::get_accelerator_engine(&accelerator_engine)
             .await
-            .is_none()
-        {
-            return Err(Error::AcceleratorEngineNotAvailable {
+            .context(AcceleratorEngineNotAvailableSnafu {
                 name: accelerator_engine,
-            });
-        };
+            })?;
 
         df.write()
             .await
