@@ -273,6 +273,7 @@ impl DataFusion {
             accelerated_table_provider,
             acceleration_settings.refresh_mode.clone(),
             dataset.refresh_interval(),
+            dataset.refresh_sql(),
             obj_store,
         );
 

@@ -58,6 +58,7 @@ impl AcceleratedTable {
         accelerator: Arc<dyn TableProvider>,
         refresh_mode: RefreshMode,
         refresh_interval: Option<Duration>,
+        refresh_sql: Option<String>,
         object_store: Option<(Url, Arc<dyn ObjectStore + 'static>)>,
     ) -> Self {
         let refresh_handle = tokio::spawn(Self::start_refresh(
@@ -65,6 +66,7 @@ impl AcceleratedTable {
             Arc::clone(&federated),
             refresh_mode,
             refresh_interval,
+            refresh_sql,
             Arc::clone(&accelerator),
             object_store,
         ));
@@ -81,6 +83,7 @@ impl AcceleratedTable {
         federated: Arc<dyn TableProvider>,
         refresh_mode: RefreshMode,
         refresh_interval: Option<Duration>,
+        refresh_sql: Option<String>,
         accelerator: Arc<dyn TableProvider>,
         object_store: Option<(Url, Arc<dyn ObjectStore + 'static>)>,
     ) {
@@ -89,6 +92,7 @@ impl AcceleratedTable {
             federated,
             refresh_mode,
             refresh_interval,
+            refresh_sql,
             object_store,
         );
 
@@ -132,6 +136,7 @@ impl AcceleratedTable {
         federated: Arc<dyn TableProvider>,
         refresh_mode: RefreshMode,
         refresh_interval: Option<Duration>,
+        refresh_sql: Option<String>,
         object_store: Option<(Url, Arc<dyn ObjectStore + 'static>)>,
     ) -> BoxStream<'a, Result<DataUpdate>> {
         let ctx = SessionContext::new();
@@ -174,7 +179,8 @@ impl AcceleratedTable {
                   tracing::info!("Refreshing data for {dataset_name}");
                   status::update_dataset(&dataset_name, status::ComponentStatus::Refreshing);
                   let timer = TimeMeasurement::new("load_dataset_duration_ms", vec![("dataset", dataset_name.clone())]);
-                  let all_data = match get_all_data(&ctx, federated.as_ref()).await {
+
+                  let all_data = match get_all_data(&ctx, federated.as_ref(), refresh_sql).await {
                       Ok(data) => data,
                       Err(e) => {
                           tracing::error!("Error refreshing data for {dataset_name}: {e}");

@@ -158,11 +158,25 @@ pub trait DataConnector: Send + Sync {
 pub async fn get_all_data(
     ctx: &SessionContext,
     table_provider: &dyn TableProvider,
+    sql: Option<String>,
 ) -> Result<(SchemaRef, Vec<arrow::record_batch::RecordBatch>)> {
-    let plan = table_provider
-        .scan(&ctx.state(), None, &[], None)
-        .await
-        .context(UnableToScanTableProviderSnafu {})?;
+    let ctx_state = &ctx.state();
+    let plan = if let Some(sql) = sql {
+        let df_ctx = ctx_state.execution_context.clone();
+        let df_parser = df_ctx.sql_parser();
+        let df_planner = df_ctx.planner();
+
+        let logical_plan = df_parser.parse(sql)?;
+        let optimized_plan = df_planner.optimize(&logical_plan)?;
+        let plan = df_planner.create_physical_plan(&optimized_plan)?;
+
+        plan
+    } else {
+        table_provider
+            .scan(ctx_state, None, &[], None)
+            .await
+            .context(UnableToScanTableProviderSnafu {})?
+    };
 
     let mut batches = vec![];
     for i in 0..plan.output_partitioning().partition_count() {
