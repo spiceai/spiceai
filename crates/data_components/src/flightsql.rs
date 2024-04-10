@@ -14,8 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-#![allow(clippy::missing_errors_doc)]
-
 use arrow::{
     array::{array, Array, RecordBatch},
     datatypes::Schema,
