@@ -43,7 +43,7 @@ A target date for done-done completion of the entire enhancement.
 
 - [ ] [First Principles Driven](https://github.com/spiceai/spiceai/blob/trunk/docs/PRINCIPLES.md)
 - [ ] The Algorithm
-- [ ] PM Review
+- [ ] PM/Design Review
 - [ ] UX Review
 - [ ] Threat Model / Security Review
 - [ ] Tests
