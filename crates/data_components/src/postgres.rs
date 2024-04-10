@@ -16,8 +16,12 @@ limitations under the License.
 
 #![allow(clippy::module_name_repetitions)]
 use arrow::datatypes::{Schema, SchemaRef};
+use arrow_sql_gen::statement::CreateTableBuilder;
 use async_trait::async_trait;
-use bb8_postgres::{tokio_postgres::types::ToSql, PostgresConnectionManager};
+use bb8_postgres::{
+    tokio_postgres::{types::ToSql, Transaction},
+    PostgresConnectionManager,
+};
 use datafusion::{
     common::OwnedTableReference,
     datasource::{provider::TableProviderFactory, TableProvider},
@@ -59,23 +63,31 @@ pub enum Error {
     },
 
     #[snafu(display("Unable to create Postgres connection pool: {source}"))]
-    UnableToCreatePostgresConnectionPool {
-        source: db_connection_pool::Error,
-    },
+    UnableToCreatePostgresConnectionPool { source: db_connection_pool::Error },
 
     #[snafu(display("Unable to downcast DbConnection to PostgresConnection"))]
     UnableToDowncastDbConnection {},
 
-    UnableToDropDuckDBTable {
-        source: duckdb::Error,
+    #[snafu(display("Unable to begin Postgres transaction: {source}"))]
+    UnableToBeginTransaction {
+        source: tokio_postgres::error::Error,
     },
 
-    UnableToCreateDuckDBTable {
-        source: duckdb::Error,
+    #[snafu(display("Unable to create the Postgres table: {source}"))]
+    UnableToCreatePostgresTable {
+        source: tokio_postgres::error::Error,
     },
 
-    UnableToInsertToDuckDBTable {
-        source: duckdb::Error,
+    #[snafu(display("Unable to commit the Postgres transaction: {source}"))]
+    UnableToCommitPostgresTransaction {
+        source: tokio_postgres::error::Error,
+    },
+
+    #[snafu(display(
+        "Unable to construct the DataFusion SQL Table Provider for Postgres: {source}"
+    ))]
+    UnableToConstructSqlTable {
+        source: sql_provider_datafusion::Error,
     },
 }
 
@@ -117,7 +129,7 @@ impl TableProviderFactory for PostgresTableProviderFactory {
         cmd: &CreateExternalTable,
     ) -> DataFusionResult<Arc<dyn TableProvider>> {
         let name = cmd.name.to_string();
-        let mut options = cmd.options.clone();
+        let options = cmd.options.clone();
         let schema: Schema = cmd.schema.as_ref().into();
 
         let params = Arc::new(Some(options));
@@ -129,27 +141,41 @@ impl TableProviderFactory for PostgresTableProviderFactory {
                 .map_err(to_datafusion_error)?,
         );
 
-        let postgres = Postgres::new(name.clone(), Arc::new(schema), Arc::clone(&pool));
+        let mut postgres = Postgres::new(name.clone(), Arc::new(schema), Arc::clone(&pool));
 
         let mut db_conn = postgres.connect().await.map_err(to_datafusion_error)?;
-        let duckdb_conn = DuckDB::duckdb_conn(&mut db_conn).map_err(to_datafusion_error)?;
-        duckdb
-            .create_table(duckdb_conn, false)
+        let postgres_conn = Postgres::postgres_conn(&mut db_conn).map_err(to_datafusion_error)?;
+
+        let tx = postgres_conn
+            .conn
+            .transaction()
+            .await
+            .context(UnableToBeginTransactionSnafu)
             .map_err(to_datafusion_error)?;
 
-        let dyn_pool: Arc<DynDuckDbConnectionPool> = pool;
+        postgres
+            .create_table(&tx)
+            .await
+            .map_err(to_datafusion_error)?;
+
+        tx.commit()
+            .await
+            .context(UnableToCommitPostgresTransactionSnafu)
+            .map_err(to_datafusion_error)?;
+
+        let dyn_pool: Arc<DynPostgresConnectionPool> = pool;
 
         let read_provider = Arc::new(
             SqlTable::new(&dyn_pool, OwnedTableReference::bare(name.clone()))
                 .await
-                .context(DuckDBDataFusionSnafu)
+                .context(UnableToConstructSqlTableSnafu)
                 .map_err(to_datafusion_error)?,
         );
 
-        let read_write_provider: Arc<dyn TableProvider> =
-            DuckDBTableWriter::create(read_provider, duckdb);
+        // let read_write_provider: Arc<dyn TableProvider> =
+        //     DuckDBTableWriter::create(read_provider, duckdb);
 
-        Ok(read_write_provider)
+        Ok(read_provider)
     }
 }
 
@@ -178,15 +204,16 @@ impl Postgres {
         self.pool.connect().await.context(DbConnectionSnafu)
     }
 
-    fn postgres_conn<'a>(
-        db_connection: &'a mut Box<DynPostgresConnection>,
-    ) -> Result<&'a mut PostgresConnection> {
+    fn postgres_conn(
+        db_connection: &mut Box<DynPostgresConnection>,
+    ) -> Result<&mut PostgresConnection> {
         db_connection
             .as_any_mut()
             .downcast_mut::<PostgresConnection>()
-            .ok_or_else(|| UnableToDowncastDbConnectionSnafu {}.build())
+            .context(UnableToDowncastDbConnectionSnafu)
     }
 
+    #[allow(dead_code)]
     async fn table_exists(&mut self, postgres_conn: &PostgresConnection) -> bool {
         let sql = format!(
             r#"SELECT EXISTS (
@@ -203,6 +230,19 @@ impl Postgres {
         };
 
         row.get(0)
+    }
+
+    async fn create_table(&mut self, transaction: &Transaction<'_>) -> Result<()> {
+        let create_table_statement =
+            CreateTableBuilder::new(Arc::clone(&self.schema), &self.table_name);
+        let sql = create_table_statement.build_postgres();
+
+        transaction
+            .execute(&sql, &[])
+            .await
+            .context(UnableToCreatePostgresTableSnafu)?;
+
+        Ok(())
     }
 }
 

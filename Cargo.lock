@@ -1949,6 +1949,7 @@ version = "0.10.2-alpha"
 dependencies = [
  "arrow",
  "arrow-flight",
+ "arrow_sql_gen",
  "async-stream",
  "async-trait",
  "bb8",
@@ -1968,6 +1969,7 @@ dependencies = [
  "snafu 0.8.2",
  "sql_provider_datafusion",
  "tokio",
+ "tokio-postgres",
  "tonic 0.10.2",
  "tracing",
 ]
