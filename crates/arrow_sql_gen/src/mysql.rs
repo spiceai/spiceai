@@ -25,7 +25,7 @@ use arrow::{
     datatypes::{DataType, Date32Type, Field, Schema, TimeUnit},
 };
 use bigdecimal::BigDecimal;
-use chrono::Timelike;
+use chrono::{NaiveDate, Timelike};
 use mysql_async::{consts::ColumnType, Row, Value};
 use snafu::{ResultExt, Snafu};
 
@@ -275,30 +275,17 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                         }
                         .fail();
                     };
-                    let v = row.get_opt::<Value, usize>(i).transpose().context(
+                    let v = row.get_opt::<NaiveDate, usize>(i).transpose().context(
                         FailedToGetRowValueSnafu {
                             mysql_type: ColumnType::MYSQL_TYPE_DATE,
                         },
                     )?;
 
-                    if let Some(v) = v.clone() {
-                        if let Value::Date(year, month, day, _, _, _, _) = v {
-                            let date = chrono::NaiveDate::from_ymd_opt(
-                                i32::from(year),
-                                u32::from(month),
-                                u32::from(day),
-                            );
-
-                            if let Some(date) = date {
-                                builder.append_value(Date32Type::from_naive_date(date));
-                            } else {
-                                builder.append_null();
-                            }
-                        } else {
-                            builder.append_null();
+                    match v {
+                        Some(v) => {
+                            builder.append_value(Date32Type::from_naive_date(v));
                         }
-                    } else {
-                        builder.append_null();
+                        None => builder.append_null(),
                     }
                 }
                 ColumnType::MYSQL_TYPE_TIMESTAMP => {
