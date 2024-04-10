@@ -14,52 +14,44 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use arrow::datatypes::Schema;
 use async_trait::async_trait;
-use data_components::arrow::ArrowFactory;
 use datafusion::{
     datasource::{provider::TableProviderFactory, TableProvider},
-    execution::context::SessionContext,
+    error::Result as DataFusionResult,
+    execution::context::SessionState,
     logical_expr::CreateExternalTable,
 };
-use snafu::prelude::*;
-use std::{any::Any, sync::Arc};
+use std::sync::Arc;
 
-use super::DataAccelerator;
+use self::write::MemTable;
+
+pub mod write;
 
 #[allow(clippy::module_name_repetitions)]
-pub struct ArrowAccelerator {
-    arrow_factory: ArrowFactory,
-}
+pub struct ArrowFactory {}
 
-impl ArrowAccelerator {
+impl ArrowFactory {
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            arrow_factory: ArrowFactory::new(),
-        }
+        Self {}
     }
 }
 
-impl Default for ArrowAccelerator {
+impl Default for ArrowFactory {
     fn default() -> Self {
         Self::new()
     }
 }
 
 #[async_trait]
-impl DataAccelerator for ArrowAccelerator {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    /// Creates a new table in the accelerator engine, returning a `TableProvider` that supports reading and writing.
-    async fn create_external_table(
+impl TableProviderFactory for ArrowFactory {
+    async fn create(
         &self,
+        _state: &SessionState,
         cmd: &CreateExternalTable,
-    ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
-        let ctx = SessionContext::new();
-        TableProviderFactory::create(&self.arrow_factory, &ctx.state(), cmd)
-            .await
-            .boxed()
+    ) -> DataFusionResult<Arc<dyn TableProvider>> {
+        let schema: Schema = cmd.schema.as_ref().into();
+        Ok(Arc::new(MemTable::try_new(Arc::new(schema), vec![])?))
     }
 }

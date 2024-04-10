@@ -226,6 +226,12 @@ impl DataFusion {
         source: Arc<dyn DataConnector>,
         acceleration_secret: Option<Secret>,
     ) -> Result<()> {
+        tracing::debug!("Registering accelerated table {dataset:?}");
+        let obj_store = source
+            .get_object_store(dataset)
+            .transpose()
+            .context(InvalidObjectStoreSnafu)?;
+
         let source_table_provider = match dataset.mode() {
             Mode::Read => source
                 .read_provider(dataset)
@@ -267,6 +273,7 @@ impl DataFusion {
             accelerated_table_provider,
             acceleration_settings.refresh_mode.clone(),
             dataset.refresh_interval(),
+            obj_store,
         );
 
         self.ctx
@@ -282,9 +289,11 @@ impl DataFusion {
         dataset: &Dataset,
         source: Arc<dyn DataConnector>,
     ) -> Result<()> {
+        tracing::debug!("Registering federated table {dataset:?}");
         if let Some(obj_store_result) = source.get_object_store(dataset) {
             let (key, store) = obj_store_result.context(InvalidObjectStoreSnafu)?;
 
+            tracing::debug!("Registered object_store for {key}");
             self.ctx
                 .runtime_env()
                 .register_object_store(&key, Arc::clone(&store));

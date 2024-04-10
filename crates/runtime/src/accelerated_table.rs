@@ -14,9 +14,11 @@ use datafusion::{
     logical_expr::Expr,
 };
 use futures::{stream::BoxStream, StreamExt};
+use object_store::ObjectStore;
 use snafu::prelude::*;
 use spicepod::component::dataset::acceleration::RefreshMode;
 use tokio::task::JoinHandle;
+use url::Url;
 
 use crate::execution_plan::slice::SliceExec;
 use crate::execution_plan::tee::TeeExec;
@@ -56,6 +58,7 @@ impl AcceleratedTable {
         accelerator: Arc<dyn TableProvider>,
         refresh_mode: RefreshMode,
         refresh_interval: Option<Duration>,
+        object_store: Option<(Url, Arc<dyn ObjectStore + 'static>)>,
     ) -> Self {
         let refresh_handle = tokio::spawn(Self::start_refresh(
             dataset_name,
@@ -63,6 +66,7 @@ impl AcceleratedTable {
             refresh_mode,
             refresh_interval,
             Arc::clone(&accelerator),
+            object_store,
         ));
 
         Self {
@@ -78,25 +82,24 @@ impl AcceleratedTable {
         refresh_mode: RefreshMode,
         refresh_interval: Option<Duration>,
         accelerator: Arc<dyn TableProvider>,
+        object_store: Option<(Url, Arc<dyn ObjectStore + 'static>)>,
     ) {
         let mut stream = Self::stream_updates(
             dataset_name.clone(),
             federated,
             refresh_mode,
             refresh_interval,
+            object_store,
         );
+
+        let ctx = SessionContext::new();
         loop {
             let future_result = stream.next().await;
             match future_result {
                 Some(data_update) => {
-                    let data_update = match data_update {
-                        Ok(data_update) => data_update,
-                        Err(e) => {
-                            tracing::debug!("Error streaming data for {dataset_name}: {e}");
-                            break;
-                        }
+                    let Ok(data_update) = data_update else {
+                        continue;
                     };
-                    let ctx = SessionContext::new();
                     let state = ctx.state();
 
                     let overwrite = data_update.update_type == UpdateType::Overwrite;
@@ -123,16 +126,23 @@ impl AcceleratedTable {
         }
     }
 
+    #[allow(clippy::needless_pass_by_value)]
     fn stream_updates<'a>(
         dataset_name: String,
         federated: Arc<dyn TableProvider>,
         refresh_mode: RefreshMode,
         refresh_interval: Option<Duration>,
+        object_store: Option<(Url, Arc<dyn ObjectStore + 'static>)>,
     ) -> BoxStream<'a, Result<DataUpdate>> {
+        let ctx = SessionContext::new();
+        if let Some((ref url, ref object_store)) = object_store {
+            ctx.runtime_env()
+                .register_object_store(url, Arc::clone(object_store));
+        }
+
         Box::pin(stream! {
             match refresh_mode {
                 RefreshMode::Append => {
-                    let ctx = SessionContext::new();
                     let plan = federated.scan(&ctx.state(), None, &[], None).await.context(UnableToScanTableProviderSnafu {})?;
 
                     if plan.output_partitioning().partition_count() > 1 {
@@ -164,7 +174,7 @@ impl AcceleratedTable {
                   tracing::info!("Refreshing data for {dataset_name}");
                   status::update_dataset(&dataset_name, status::ComponentStatus::Refreshing);
                   let timer = TimeMeasurement::new("load_dataset_duration_ms", vec![("dataset", dataset_name.clone())]);
-                  let all_data = match get_all_data(federated.as_ref()).await {
+                  let all_data = match get_all_data(&ctx, federated.as_ref()).await {
                       Ok(data) => data,
                       Err(e) => {
                           tracing::error!("Error refreshing data for {dataset_name}: {e}");

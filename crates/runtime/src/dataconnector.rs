@@ -157,9 +157,9 @@ pub trait DataConnector: Send + Sync {
 
 // Gets all data from a table provider and returns it as a vector of RecordBatches.
 pub async fn get_all_data(
+    ctx: &SessionContext,
     table_provider: &dyn TableProvider,
 ) -> Result<(SchemaRef, Vec<arrow::record_batch::RecordBatch>)> {
-    let ctx = SessionContext::new();
     let plan = table_provider
         .scan(&ctx.state(), None, &[], None)
         .await

@@ -20,6 +20,7 @@ use std::{error::Error, sync::Arc};
 use async_trait::async_trait;
 use datafusion::{common::OwnedTableReference, datasource::TableProvider};
 
+pub mod arrow;
 pub mod databricks;
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
