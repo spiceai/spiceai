@@ -27,7 +27,7 @@ use arrow::{
 use bigdecimal::BigDecimal;
 use bigdecimal::ToPrimitive;
 use chrono::Timelike;
-use mysql_async::{consts::ColumnType, Row, Value};
+use mysql_async::{consts::ColumnType, FromValueError, Row, Value};
 use snafu::{ResultExt, Snafu};
 
 use crate::arrow::map_data_type_to_array_builder_optional;
@@ -88,9 +88,7 @@ macro_rules! handle_primitive_type {
             }
             .fail();
         };
-        let v = $row
-            .get_opt::<$value_ty, usize>($index)
-            .transpose()
+        let v = handle_null_error($row.get_opt::<$value_ty, usize>($index).transpose())
             .context(FailedToGetRowValueSnafu { mysql_type: $type })?;
 
         match v {
@@ -242,11 +240,10 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                     );
                 }
                 ColumnType::MYSQL_TYPE_DECIMAL | ColumnType::MYSQL_TYPE_NEWDECIMAL => {
-                    let val = row.get_opt::<BigDecimal, usize>(i).transpose().context(
-                        FailedToGetRowValueSnafu {
+                    let val = handle_null_error(row.get_opt::<BigDecimal, usize>(i).transpose())
+                        .context(FailedToGetRowValueSnafu {
                             mysql_type: ColumnType::MYSQL_TYPE_DECIMAL,
-                        },
-                    )?;
+                        })?;
 
                     let scale = match &val {
                         None => 0,
@@ -334,7 +331,7 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                         }
                         .fail();
                     };
-                    let v = row.get_opt::<Value, usize>(i).transpose().context(
+                    let v = handle_null_error(row.get_opt::<Value, usize>(i).transpose()).context(
                         FailedToGetRowValueSnafu {
                             mysql_type: ColumnType::MYSQL_TYPE_TIMESTAMP,
                         },
@@ -437,4 +434,14 @@ fn get_scale(decimal: &BigDecimal) -> u32 {
 
 fn to_decimal_128(decimal: &BigDecimal, scale: u32) -> Option<i128> {
     (decimal * 10i128.pow(u32::from(scale))).to_i128()
+}
+
+fn handle_null_error<T>(
+    result: Result<Option<T>, FromValueError>,
+) -> Result<Option<T>, FromValueError> {
+    match result {
+        Ok(val) => Ok(val),
+        Err(FromValueError(Value::NULL)) => Ok(None),
+        err => err,
+    }
 }
