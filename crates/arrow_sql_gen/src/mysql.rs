@@ -328,11 +328,10 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                         }
                         .fail();
                     };
-                    let v = row.get_opt::<NaiveDate, usize>(i).transpose().context(
-                        FailedToGetRowValueSnafu {
+                    let v = handle_null_error(row.get_opt::<NaiveDate, usize>(i).transpose())
+                        .context(FailedToGetRowValueSnafu {
                             mysql_type: ColumnType::MYSQL_TYPE_DATE,
-                        },
-                    )?;
+                        })?;
 
                     match v {
                         Some(v) => {
