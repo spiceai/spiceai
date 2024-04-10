@@ -43,7 +43,7 @@ pub mod localhost;
 // #[cfg(feature = "postgres")]
 // pub mod postgres;
 pub mod s3;
-// pub mod spiceai;
+pub mod spiceai;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -110,7 +110,7 @@ pub async fn register_all() {
     register_connector_factory("dremio", dremio::Dremio::create).await;
     // register_connector_factory("flightsql", flightsql::FlightSQL::create).await;
     register_connector_factory("s3", s3::S3::create).await;
-    // register_connector_factory("spiceai", spiceai::SpiceAI::create).await;
+    register_connector_factory("spiceai", spiceai::SpiceAI::create).await;
     // #[cfg(feature = "mysql")]
     // register_connector_factory("mysql", mysql::MySQL::create).await;
     // #[cfg(feature = "postgres")]

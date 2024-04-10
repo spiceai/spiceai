@@ -50,6 +50,6 @@ impl DataConnector for LocalhostConnector {
         &self,
         _dataset: &Dataset,
     ) -> super::AnyErrorResult<Arc<dyn TableProvider>> {
-        unimplemented!("read_provider not yet implemented for locahost provider");
+        unimplemented!("read_provider not yet implemented for localhost provider");
     }
 }
