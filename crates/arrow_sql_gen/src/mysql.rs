@@ -247,7 +247,7 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
 
                     let scale = match &val {
                         None => 0,
-                        Some(val) => get_scale(&val),
+                        Some(val) => get_scale(val),
                     };
 
                     let dec_builder = builder.get_or_insert_with(|| {
@@ -448,14 +448,14 @@ fn get_scale(decimal: &BigDecimal) -> u32 {
     match idx {
         Some(idx) => {
             let scale = decimal_string.len() - idx - 1;
-            scale as u32
+            u32::try_from(scale).unwrap_or_default()
         }
         None => 0,
     }
 }
 
 fn to_decimal_128(decimal: &BigDecimal, scale: u32) -> Option<i128> {
-    (decimal * 10i128.pow(u32::from(scale))).to_i128()
+    (decimal * 10i128.pow(scale)).to_i128()
 }
 
 fn handle_null_error<T>(
