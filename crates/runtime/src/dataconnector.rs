@@ -183,7 +183,6 @@ pub async fn get_all_data(
     table_provider: Arc<dyn TableProvider>,
     sql: Option<String>,
 ) -> Result<(SchemaRef, Vec<arrow::record_batch::RecordBatch>)> {
-    let mut existing_provider: Option<Arc<dyn TableProvider>> = None;
     let df = match sql {
         None => {
             let table_source = Arc::new(DefaultTableSource::new(Arc::clone(&table_provider)));
@@ -194,23 +193,13 @@ pub async fn get_all_data(
 
             DataFrame::new(ctx.state(), logical_plan)
         }
-        Some(sql) => {
-            existing_provider = ctx
-                .register_table(table_name.clone(), Arc::clone(&table_provider))
-                .context(UnableToRegisterTableProviderSnafu {})?;
-
-            ctx.sql(&sql)
-                .await
-                .context(UnableToCreateDataFrameSnafu {})?
-        }
+        Some(sql) => ctx
+            .sql(&sql)
+            .await
+            .context(UnableToCreateDataFrameSnafu {})?,
     };
 
     let batches = df.collect().await.context(UnableToScanTableProviderSnafu)?;
-
-    if let Some(existing_provider) = existing_provider {
-        ctx.register_table(table_name, existing_provider)
-            .context(UnableToRegisterTableProviderSnafu {})?;
-    }
 
     Ok((table_provider.schema(), batches))
 }

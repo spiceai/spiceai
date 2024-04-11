@@ -3,6 +3,7 @@ use std::{any::Any, sync::Arc, time::Duration};
 use arrow::datatypes::SchemaRef;
 use async_stream::stream;
 use async_trait::async_trait;
+use datafusion::common::OwnedTableReference;
 use datafusion::error::Result as DataFusionResult;
 use datafusion::execution::context::SessionState;
 use datafusion::logical_expr::TableProviderFilterPushDown;
@@ -30,12 +31,18 @@ use crate::{
 };
 
 #[derive(Debug, Snafu)]
+#[allow(clippy::enum_variant_names)]
 enum Error {
     #[snafu(display("Unable to get data from connector: {source}"))]
     UnableToGetDataFromConnector { source: dataconnector::Error },
 
     #[snafu(display("Unable to scan table provider: {source}"))]
     UnableToScanTableProvider {
+        source: datafusion::error::DataFusionError,
+    },
+
+    #[snafu(display("Unable to register table provider: {source}"))]
+    UnableToRegisterTableProvider {
         source: datafusion::error::DataFusionError,
     },
 }
@@ -143,6 +150,12 @@ impl AcceleratedTable {
         if let Some((ref url, ref object_store)) = object_store {
             ctx.runtime_env()
                 .register_object_store(url, Arc::clone(object_store));
+        }
+        if let Err(e) = ctx.register_table(
+            OwnedTableReference::bare(dataset_name.clone()),
+            Arc::clone(&federated),
+        ) {
+            tracing::error!("Unable to register federated table: {e}");
         }
 
         Box::pin(stream! {
