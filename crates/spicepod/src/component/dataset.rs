@@ -187,12 +187,7 @@ impl Dataset {
     pub fn refresh_sql(&self) -> Option<String> {
         if let Some(acceleration) = &self.acceleration {
             if let Some(refresh_sql) = &acceleration.refresh_sql {
-                return Some(refresh_sql);
-                tracing::warn!(
-                    "Unable to parse refresh SQL for dataset {}: {}",
-                    self.name,
-                    refresh_sql
-                );
+                return Some(refresh_sql.to_string());
             }
         }
 
