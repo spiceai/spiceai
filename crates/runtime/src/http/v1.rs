@@ -411,7 +411,7 @@ pub(crate) mod datasets {
             .find(|d| d.name == dataset_name)
         else {
             return (
-                status::StatusCode::BAD_REQUEST,
+                status::StatusCode::NOT_FOUND,
                 Json(DatasetRefreshResponse {
                     message: format!("Dataset {dataset_name} not found"),
                 }),
