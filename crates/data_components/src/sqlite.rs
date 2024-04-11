@@ -14,10 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use arrow::{
-    array::RecordBatch,
-    datatypes::{Schema, SchemaRef},
-};
+use arrow::{array::RecordBatch, datatypes::SchemaRef};
 use arrow_sql_gen::statement::{CreateTableBuilder, InsertBuilder};
 use async_trait::async_trait;
 use datafusion::{
@@ -118,10 +115,10 @@ impl TableProviderFactory for SqliteTableFactory {
                 .map_err(to_datafusion_error)?,
         );
 
-        let schema: Schema = cmd.schema.as_ref().into();
+        let schema: SchemaRef = Arc::new(cmd.schema.as_ref().into());
         let sqlite = Arc::new(Sqlite::new(
             name.clone(),
-            Arc::new(schema),
+            Arc::clone(&schema),
             Arc::clone(&pool),
         ));
 
@@ -146,12 +143,11 @@ impl TableProviderFactory for SqliteTableFactory {
 
         let dyn_pool: Arc<DynSqliteConnectionPool> = pool;
 
-        let read_provider = Arc::new(
-            SqlTable::new(&dyn_pool, OwnedTableReference::bare(name.clone()))
-                .await
-                .context(UnableToConstuctSqlTableProviderSnafu)
-                .map_err(to_datafusion_error)?,
-        );
+        let read_provider = Arc::new(SqlTable::new_with_schema(
+            &dyn_pool,
+            Arc::clone(&schema),
+            OwnedTableReference::bare(name.clone()),
+        ));
 
         let sqlite = Arc::into_inner(sqlite)
             .context(DanglingReferenceToSqliteSnafu)

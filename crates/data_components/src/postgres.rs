@@ -204,7 +204,7 @@ impl TableProviderFactory for PostgresTableProviderFactory {
             .map_err(to_datafusion_error)?;
 
         postgres
-            .create_table(schema, &tx)
+            .create_table(Arc::clone(&schema), &tx)
             .await
             .map_err(to_datafusion_error)?;
 
@@ -215,12 +215,11 @@ impl TableProviderFactory for PostgresTableProviderFactory {
 
         let dyn_pool: Arc<DynPostgresConnectionPool> = pool;
 
-        let read_provider = Arc::new(
-            SqlTable::new(&dyn_pool, OwnedTableReference::bare(name.clone()))
-                .await
-                .context(UnableToConstructSqlTableSnafu)
-                .map_err(to_datafusion_error)?,
-        );
+        let read_provider = Arc::new(SqlTable::new_with_schema(
+            &dyn_pool,
+            Arc::clone(&schema),
+            OwnedTableReference::bare(name.clone()),
+        ));
 
         Ok(PostgresTableWriter::create(read_provider, postgres))
     }
