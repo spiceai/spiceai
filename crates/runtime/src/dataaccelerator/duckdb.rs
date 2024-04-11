@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
-use data_components::duckdb::DuckDBTableFactory;
+use data_components::duckdb::DuckDBTableProviderFactory;
 use datafusion::{
     datasource::{provider::TableProviderFactory, TableProvider},
     execution::context::SessionContext,
@@ -37,14 +37,14 @@ pub enum Error {
 type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct DuckDBAccelerator {
-    duckdb_factory: DuckDBTableFactory,
+    duckdb_factory: DuckDBTableProviderFactory,
 }
 
 impl DuckDBAccelerator {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            duckdb_factory: DuckDBTableFactory::new(),
+            duckdb_factory: DuckDBTableProviderFactory::new(),
         }
     }
 }
