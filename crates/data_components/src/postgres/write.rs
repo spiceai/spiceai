@@ -31,7 +31,7 @@ use datafusion::{
 use futures::StreamExt;
 use snafu::prelude::*;
 
-use super::{to_datafusion_error, Error, Postgres};
+use super::{to_datafusion_error, Postgres};
 
 pub struct PostgresTableWriter {
     read_provider: Arc<dyn TableProvider>,
@@ -124,14 +124,10 @@ impl DataSink for PostgresDataSink {
             .context(super::UnableToBeginTransactionSnafu)
             .map_err(to_datafusion_error)?;
 
-        self.postgres
-            .create_table(&tx)
-            .await
-            .map_err(to_datafusion_error)?;
-
         if self.overwrite {
             self.postgres
-                .create_table(duckdb_conn, true)
+                .delete_all_table_data(&tx)
+                .await
                 .map_err(to_datafusion_error)?;
         }
 
@@ -139,14 +135,15 @@ impl DataSink for PostgresDataSink {
             let batch = batch?;
             num_rows += batch.num_rows() as u64;
 
-            self.duckdb
-                .insert_batch(duckdb_conn, &batch)
+            self.postgres
+                .insert_batch(&tx, batch)
+                .await
                 .map_err(to_datafusion_error)?;
         }
 
         tx.commit()
             .await
-            .context(UnableToCommitPostgresTransactionSnafu)
+            .context(super::UnableToCommitPostgresTransactionSnafu)
             .map_err(to_datafusion_error)?;
 
         Ok(num_rows)
@@ -172,8 +169,4 @@ impl DisplayAs for PostgresDataSink {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> std::fmt::Result {
         write!(f, "PostgresDataSink")
     }
-}
-
-fn to_datafusion_error(error: Error) -> DataFusionError {
-    DataFusionError::External(Box::new(error))
 }

@@ -15,8 +15,11 @@ limitations under the License.
 */
 
 #![allow(clippy::module_name_repetitions)]
-use arrow::datatypes::{Schema, SchemaRef};
-use arrow_sql_gen::statement::CreateTableBuilder;
+use arrow::{
+    array::RecordBatch,
+    datatypes::{Schema, SchemaRef},
+};
+use arrow_sql_gen::statement::{CreateTableBuilder, InsertBuilder};
 use async_trait::async_trait;
 use bb8_postgres::{
     tokio_postgres::{types::ToSql, Transaction},
@@ -39,7 +42,9 @@ use snafu::prelude::*;
 use sql_provider_datafusion::SqlTable;
 use std::sync::Arc;
 
-use crate::Read;
+use crate::{Read, ReadWrite};
+
+use self::write::PostgresTableWriter;
 
 // use self::write::PostgresTableWriter;
 
@@ -89,17 +94,30 @@ pub enum Error {
     UnableToConstructSqlTable {
         source: sql_provider_datafusion::Error,
     },
+
+    #[snafu(display("Unable to delete all data from the Postgres table: {source}"))]
+    UnableToDeleteAllTableData {
+        source: tokio_postgres::error::Error,
+    },
+
+    #[snafu(display("Unable to insert Arrow batch to Postgres table: {source}"))]
+    UnableToInsertArrowBatch {
+        source: tokio_postgres::error::Error,
+    },
+
+    #[snafu(display("The table '{table_name}' doesn't exist in the Postgres server"))]
+    TableDoesntExist { table_name: String },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct PostgresTableFactory {
-    pool: Arc<DynPostgresConnectionPool>,
+    pool: Arc<PostgresConnectionPool>,
 }
 
 impl PostgresTableFactory {
     #[must_use]
-    pub fn new(pool: Arc<DynPostgresConnectionPool>) -> Self {
+    pub fn new(pool: Arc<PostgresConnectionPool>) -> Self {
         Self { pool }
     }
 }
@@ -111,11 +129,27 @@ impl Read for PostgresTableFactory {
         table_reference: OwnedTableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         let pool = Arc::clone(&self.pool);
-        let table_provider = SqlTable::new(&pool, table_reference)
+        let dyn_pool: Arc<DynPostgresConnectionPool> = pool;
+        let table_provider = SqlTable::new(&dyn_pool, table_reference)
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
         Ok(Arc::new(table_provider))
+    }
+}
+
+#[async_trait]
+impl ReadWrite for PostgresTableFactory {
+    async fn table_provider(
+        &self,
+        table_reference: OwnedTableReference,
+    ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
+        let read_provider = Read::table_provider(self, table_reference.clone()).await?;
+
+        let table_name = table_reference.to_string();
+        let postgres = Postgres::new(table_name, Arc::clone(&self.pool));
+
+        Ok(PostgresTableWriter::create(read_provider, postgres))
     }
 }
 
@@ -141,9 +175,14 @@ impl TableProviderFactory for PostgresTableProviderFactory {
                 .map_err(to_datafusion_error)?,
         );
 
-        let mut postgres = Postgres::new(name.clone(), Arc::new(schema), Arc::clone(&pool));
+        let schema = Arc::new(schema);
+        let postgres = Postgres::new(name.clone(), Arc::clone(&pool));
 
-        let mut db_conn = postgres.connect().await.map_err(to_datafusion_error)?;
+        let mut db_conn = pool
+            .connect()
+            .await
+            .context(DbConnectionSnafu)
+            .map_err(to_datafusion_error)?;
         let postgres_conn = Postgres::postgres_conn(&mut db_conn).map_err(to_datafusion_error)?;
 
         let tx = postgres_conn
@@ -154,7 +193,7 @@ impl TableProviderFactory for PostgresTableProviderFactory {
             .map_err(to_datafusion_error)?;
 
         postgres
-            .create_table(&tx)
+            .create_table(schema, &tx)
             .await
             .map_err(to_datafusion_error)?;
 
@@ -172,10 +211,7 @@ impl TableProviderFactory for PostgresTableProviderFactory {
                 .map_err(to_datafusion_error)?,
         );
 
-        // let read_write_provider: Arc<dyn TableProvider> =
-        //     DuckDBTableWriter::create(read_provider, duckdb);
-
-        Ok(read_provider)
+        Ok(PostgresTableWriter::create(read_provider, postgres))
     }
 }
 
@@ -186,22 +222,28 @@ fn to_datafusion_error(error: Error) -> DataFusionError {
 #[derive(Clone)]
 pub struct Postgres {
     table_name: String,
-    schema: SchemaRef,
     pool: Arc<PostgresConnectionPool>,
 }
 
 impl Postgres {
     #[must_use]
-    pub fn new(table_name: String, schema: SchemaRef, pool: Arc<PostgresConnectionPool>) -> Self {
-        Self {
-            table_name,
-            schema,
-            pool,
-        }
+    pub fn new(table_name: String, pool: Arc<PostgresConnectionPool>) -> Self {
+        Self { table_name, pool }
     }
 
     async fn connect(&self) -> Result<Box<DynPostgresConnection>> {
-        self.pool.connect().await.context(DbConnectionSnafu)
+        let mut conn = self.pool.connect().await.context(DbConnectionSnafu)?;
+
+        let pg_conn = Self::postgres_conn(&mut conn)?;
+
+        if !self.table_exists(pg_conn).await {
+            TableDoesntExistSnafu {
+                table_name: self.table_name.clone(),
+            }
+            .fail()?;
+        }
+
+        Ok(conn)
     }
 
     fn postgres_conn(
@@ -213,8 +255,7 @@ impl Postgres {
             .context(UnableToDowncastDbConnectionSnafu)
     }
 
-    #[allow(dead_code)]
-    async fn table_exists(&mut self, postgres_conn: &PostgresConnection) -> bool {
+    async fn table_exists(&self, postgres_conn: &PostgresConnection) -> bool {
         let sql = format!(
             r#"SELECT EXISTS (
             SELECT 1
@@ -232,9 +273,32 @@ impl Postgres {
         row.get(0)
     }
 
-    async fn create_table(&mut self, transaction: &Transaction<'_>) -> Result<()> {
-        let create_table_statement =
-            CreateTableBuilder::new(Arc::clone(&self.schema), &self.table_name);
+    async fn insert_batch(&self, transaction: &Transaction<'_>, batch: RecordBatch) -> Result<()> {
+        let insert_table_builder = InsertBuilder::new(&self.table_name, vec![batch]);
+        let sql = insert_table_builder.build_postgres();
+
+        transaction
+            .execute(&sql, &[])
+            .await
+            .context(UnableToInsertArrowBatchSnafu)?;
+
+        Ok(())
+    }
+
+    async fn delete_all_table_data(&self, transaction: &Transaction<'_>) -> Result<()> {
+        transaction
+            .execute(
+                format!(r#"DELETE FROM "{}""#, self.table_name).as_str(),
+                &[],
+            )
+            .await
+            .context(UnableToDeleteAllTableDataSnafu)?;
+
+        Ok(())
+    }
+
+    async fn create_table(&self, schema: SchemaRef, transaction: &Transaction<'_>) -> Result<()> {
+        let create_table_statement = CreateTableBuilder::new(schema, &self.table_name);
         let sql = create_table_statement.build_postgres();
 
         transaction
@@ -245,13 +309,3 @@ impl Postgres {
         Ok(())
     }
 }
-
-// #[async_trait]
-// impl ReadWrite for DuckDBTableFactory {
-//     async fn table_provider(
-//         &self,
-//         _table_reference: OwnedTableReference,
-//     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
-//         todo!()
-//     }
-// }
