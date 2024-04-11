@@ -29,7 +29,12 @@ use spicepod::component::dataset::acceleration::{self, Mode};
 use std::{any::Any, collections::HashMap, sync::Arc};
 use tokio::sync::Mutex;
 
-use self::{arrow::ArrowAccelerator, duckdb::DuckDBAccelerator};
+use self::arrow::ArrowAccelerator;
+
+#[cfg(feature = "duckdb")]
+use self::duckdb::DuckDBAccelerator;
+#[cfg(feature = "postgres")]
+use self::postgres::PostgresAccelerator;
 
 pub mod arrow;
 #[cfg(feature = "duckdb")]
@@ -70,7 +75,9 @@ pub async fn register_accelerator_engine(name: &str, accelerator_engine: Arc<dyn
 
 pub async fn register_all() {
     register_accelerator_engine("arrow", Arc::new(ArrowAccelerator::new())).await;
+    #[cfg(feature = "duckdb")]
     register_accelerator_engine("duckdb", Arc::new(DuckDBAccelerator::new())).await;
+    #[cfg(feature = "postgres")]
     register_accelerator_engine("postgres", Arc::new(PostgresAccelerator::new())).await;
 }
 
