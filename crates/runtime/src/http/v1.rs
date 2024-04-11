@@ -408,7 +408,7 @@ pub(crate) mod datasets {
         let Some(dataset) = readable_app
             .datasets
             .iter()
-            .find(|d| d.name == dataset_name)
+            .find(|d| d.name.to_lowercase() == dataset_name.to_lowercase())
         else {
             return (
                 status::StatusCode::NOT_FOUND,
