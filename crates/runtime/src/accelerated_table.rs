@@ -120,7 +120,6 @@ impl AcceleratedTable {
             refresh_trigger_receiver,
         );
 
-        // If a refresh_interval is specified, start a background task to send refresh signals periodically.
         if let Some(refresh_interval) = refresh_interval {
             let mut interval_timer = interval(refresh_interval);
             let sender_clone = refresh_trigger.clone();
