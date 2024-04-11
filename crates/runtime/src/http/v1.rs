@@ -281,6 +281,7 @@ pub(crate) mod datasets {
 
     use app::App;
     use axum::{
+        extract::Path,
         extract::Query,
         http::status,
         response::{IntoResponse, Response},
@@ -386,6 +387,51 @@ pub(crate) mod datasets {
                 }
             },
         }
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    pub(crate) struct DatasetRefreshResponse {
+        pub message: String,
+    }
+
+    pub(crate) async fn refresh(
+        Extension(app): Extension<Arc<RwLock<Option<App>>>>,
+        Extension(_df): Extension<Arc<RwLock<DataFusion>>>,
+        Path(dataset_name): Path<String>,
+    ) -> Response {
+        let app_lock = app.read().await;
+        let Some(readable_app) = &*app_lock else {
+            return (status::StatusCode::INTERNAL_SERVER_ERROR).into_response();
+        };
+
+        let Some(dataset) = readable_app
+            .datasets
+            .iter()
+            .find(|d| d.name.to_lowercase() == dataset_name.to_lowercase())
+        else {
+            return (
+                status::StatusCode::NOT_FOUND,
+                Json(DatasetRefreshResponse {
+                    message: format!("Dataset {dataset_name} not found"),
+                }),
+            )
+                .into_response();
+        };
+
+        let acceleration_enabled = dataset.acceleration.as_ref().is_some_and(|f| f.enabled);
+
+        if !acceleration_enabled {
+            return (
+                status::StatusCode::BAD_REQUEST,
+                Json(DatasetRefreshResponse {
+                    message: format!("Dataset {dataset_name} does not have acceleration enabled"),
+                }),
+            )
+                .into_response();
+        };
+
+        (status::StatusCode::NOT_IMPLEMENTED).into_response()
     }
 }
 
