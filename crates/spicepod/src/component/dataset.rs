@@ -186,9 +186,7 @@ impl Dataset {
     #[must_use]
     pub fn refresh_sql(&self) -> Option<String> {
         if let Some(acceleration) = &self.acceleration {
-            if let Some(refresh_sql) = &acceleration.refresh_sql {
-                return Some(refresh_sql.to_string());
-            }
+            return acceleration.refresh_sql.clone();
         }
 
         None

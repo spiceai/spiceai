@@ -139,7 +139,7 @@ impl AcceleratedTable {
         refresh_sql: Option<String>,
         object_store: Option<(Url, Arc<dyn ObjectStore + 'static>)>,
     ) -> BoxStream<'a, Result<DataUpdate>> {
-        let ctx = SessionContext::new();
+        let mut ctx = SessionContext::new();
         if let Some((ref url, ref object_store)) = object_store {
             ctx.runtime_env()
                 .register_object_store(url, Arc::clone(object_store));
@@ -180,7 +180,7 @@ impl AcceleratedTable {
                   status::update_dataset(&dataset_name, status::ComponentStatus::Refreshing);
                   let timer = TimeMeasurement::new("load_dataset_duration_ms", vec![("dataset", dataset_name.clone())]);
 
-                  let all_data = match get_all_data(&ctx, federated.as_ref(), refresh_sql).await {
+                  let all_data = match get_all_data(&mut ctx, dataset_name.clone().into(), Arc::clone(&federated), refresh_sql.clone()).await {
                       Ok(data) => data,
                       Err(e) => {
                           tracing::error!("Error refreshing data for {dataset_name}: {e}");

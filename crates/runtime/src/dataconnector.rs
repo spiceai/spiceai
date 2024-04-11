@@ -16,9 +16,11 @@ limitations under the License.
 
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
-use datafusion::datasource::TableProvider;
+use datafusion::common::OwnedTableReference;
+use datafusion::dataframe::DataFrame;
+use datafusion::datasource::{DefaultTableSource, TableProvider};
 use datafusion::execution::context::SessionContext;
-use futures::StreamExt;
+use datafusion::logical_expr::LogicalPlanBuilder;
 use lazy_static::lazy_static;
 use object_store::ObjectStore;
 use snafu::prelude::*;
@@ -49,6 +51,26 @@ pub mod spiceai;
 pub enum Error {
     #[snafu(display("Unable to scan table provider: {source}"))]
     UnableToScanTableProvider {
+        source: datafusion::error::DataFusionError,
+    },
+
+    #[snafu(display("Unable to construct logical plan builder: {source}"))]
+    UnableToConstructLogicalPlanBuilder {
+        source: datafusion::error::DataFusionError,
+    },
+
+    #[snafu(display("Unable to build logical plan: {source}"))]
+    UnableToBuildLogicalPlan {
+        source: datafusion::error::DataFusionError,
+    },
+
+    #[snafu(display("Unable to register table provider: {source}"))]
+    UnableToRegisterTableProvider {
+        source: datafusion::error::DataFusionError,
+    },
+
+    #[snafu(display("Unable to create data frame: {source}"))]
+    UnableToCreateDataFrame {
         source: datafusion::error::DataFusionError,
     },
 }
@@ -156,36 +178,38 @@ pub trait DataConnector: Send + Sync {
 
 // Gets all data from a table provider and returns it as a vector of RecordBatches.
 pub async fn get_all_data(
-    ctx: &SessionContext,
-    table_provider: &dyn TableProvider,
+    ctx: &mut SessionContext,
+    table_name: OwnedTableReference,
+    table_provider: Arc<dyn TableProvider>,
     sql: Option<String>,
 ) -> Result<(SchemaRef, Vec<arrow::record_batch::RecordBatch>)> {
-    let ctx_state = &ctx.state();
-    let plan = if let Some(sql) = sql {
-        let df_ctx = ctx_state.execution_context.clone();
-        let df_parser = df_ctx.sql_parser();
-        let df_planner = df_ctx.planner();
+    let mut existing_provider: Option<Arc<dyn TableProvider>> = None;
+    let df = match sql {
+        None => {
+            let table_source = Arc::new(DefaultTableSource::new(Arc::clone(&table_provider)));
+            let logical_plan = LogicalPlanBuilder::scan(table_name.clone(), table_source, None)
+                .context(UnableToConstructLogicalPlanBuilderSnafu {})?
+                .build()
+                .context(UnableToBuildLogicalPlanSnafu {})?;
 
-        let logical_plan = df_parser.parse(sql)?;
-        let optimized_plan = df_planner.optimize(&logical_plan)?;
-        let plan = df_planner.create_physical_plan(&optimized_plan)?;
+            DataFrame::new(ctx.state(), logical_plan)
+        }
+        Some(sql) => {
+            existing_provider = ctx
+                .register_table(table_name.clone(), Arc::clone(&table_provider))
+                .context(UnableToRegisterTableProviderSnafu {})?;
 
-        plan
-    } else {
-        table_provider
-            .scan(ctx_state, None, &[], None)
-            .await
-            .context(UnableToScanTableProviderSnafu {})?
+            ctx.sql(&sql)
+                .await
+                .context(UnableToCreateDataFrameSnafu {})?
+        }
     };
 
-    let mut batches = vec![];
-    for i in 0..plan.output_partitioning().partition_count() {
-        let mut partition = plan
-            .execute(i, ctx.task_ctx())
-            .context(UnableToScanTableProviderSnafu {})?;
-        while let Some(batch) = partition.next().await {
-            batches.push(batch.context(UnableToScanTableProviderSnafu {})?);
-        }
+    let batches = df.collect().await.context(UnableToScanTableProviderSnafu)?;
+
+    if let Some(existing_provider) = existing_provider {
+        ctx.register_table(table_name, existing_provider)
+            .context(UnableToRegisterTableProviderSnafu {})?;
     }
 
     Ok((table_provider.schema(), batches))
