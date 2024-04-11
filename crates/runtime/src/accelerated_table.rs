@@ -110,7 +110,6 @@ impl AcceleratedTable {
         }
     }
 
-    #[allow(dead_code)]
     pub async fn trigger_refresh(&self) -> Result<()> {
         if self.refresh_mode == RefreshMode::Append {
             ManualRefreshIsNotSupportedForAppendSnafu.fail()?;

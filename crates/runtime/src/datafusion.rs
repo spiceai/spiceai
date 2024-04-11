@@ -99,6 +99,12 @@ pub enum Error {
         table_name: String,
         source: DataFusionError,
     },
+
+    #[snafu(display("Unable to trigger refresh for {table_name}: {source}"))]
+    UnableToTriggerRefresh {
+        table_name: String,
+        source: crate::accelerated_table::Error,
+    },
 }
 
 pub enum Table {
@@ -280,6 +286,25 @@ impl DataFusion {
         self.ctx
             .register_table(&dataset.name, Arc::new(accelerated_table))
             .context(UnableToRegisterTableToDataFusionSnafu)?;
+
+        Ok(())
+    }
+
+    pub async fn trigger_table_refresh(&self, dataset_name: &str) -> Result<()> {
+        let table = self
+            .ctx
+            .table_provider(OwnedTableReference::bare(dataset_name.to_string()))
+            .await
+            .context(UnableToGetTableSnafu)?;
+
+        if let Some(accelerated_table) = table.as_any().downcast_ref::<AcceleratedTable>() {
+            accelerated_table
+                .trigger_refresh()
+                .await
+                .context(UnableToTriggerRefreshSnafu {
+                    table_name: dataset_name.to_string(),
+                })?;
+        }
 
         Ok(())
     }
