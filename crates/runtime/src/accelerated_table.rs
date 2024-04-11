@@ -79,13 +79,14 @@ impl AcceleratedTable {
         refresh_interval: Option<Duration>,
         object_store: Option<(Url, Arc<dyn ObjectStore + 'static>)>,
     ) -> Self {
-        let refresh_trigger = None;
+        let mut refresh_trigger = None;
         let mut refresh_trigger_receiver = None;
         let mut scheduled_refreshes_handle: Option<JoinHandle<()>> = None;
 
         if refresh_mode == RefreshMode::Full {
             let (trigger, receiver) = mpsc::channel::<()>(1);
             refresh_trigger_receiver = Some(receiver);
+            refresh_trigger = Some(trigger.clone());
             scheduled_refreshes_handle =
                 Self::schedule_regular_refreshes(refresh_interval, trigger).await;
         };
