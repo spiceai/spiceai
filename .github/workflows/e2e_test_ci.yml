@@ -384,11 +384,8 @@ jobs:
         env:
           PGPASSWORD: postgres
         run: |
-          psql -h localhost -U postgres -d testdb -c 'CREATE TABLE eth_recent_blocks (id SERIAL PRIMARY KEY, block_number INTEGER, block_hash TEXT, block_timestamp TIMESTAMP);'
-          psql -h localhost -U postgres -d testdb -c "INSERT INTO eth_recent_blocks (block_number, block_hash, block_timestamp) VALUES (1, '0x1234', '2022-01-01 00:00:00');"
-          psql -h localhost -U postgres -d testdb -c "INSERT INTO eth_recent_blocks (block_number, block_hash, block_timestamp) VALUES (2, '0x5678', '2022-01-01 00:00:00');"
-          psql -h localhost -U postgres -d testdb -c "INSERT INTO eth_recent_blocks (block_number, block_hash, block_timestamp) VALUES (3, '0x9abc', '2022-01-01 00:00:00');"
-          psql -h localhost -U postgres -d testdb -c 'SELECT * FROM eth_recent_blocks;'
+          psql -h localhost -U postgres -d testdb < test/scripts/setup-data-postgresql.sql
+          psql -h localhost -U postgres -d testdb -c 'SELECT * FROM test_postgresql_table;'
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         uses: actions/download-artifact@v4
@@ -415,9 +412,9 @@ jobs:
       - name: Spice dataset configure
         working-directory: test_app
         run: |
-          echo -e "eth_recent_blocks\neth recent blocks\npostgres:eth_recent_blocks\ny" | spice dataset configure
+          echo -e "test_postgresql_table\neth recent blocks\npostgres:test_postgresql_table\ny" | spice dataset configure
           # configure pg credentials
-          echo -e "params:\n  pg_host: localhost\n  pg_port: 5432\n  pg_db: testdb\n  pg_user: postgres\n  pg_pass_key: password\n  pg_sslmode: disable" >> ./datasets/eth_recent_blocks/dataset.yaml
+          echo -e "params:\n  pg_host: localhost\n  pg_port: 5432\n  pg_db: testdb\n  pg_user: postgres\n  pg_pass_key: password\n  pg_sslmode: disable" >> ./datasets/test_postgresql_table/dataset.yaml
           # configure env secret store
           echo -e "secrets:\n  store: env\n" >> spicepod.yaml
           cat spicepod.yaml
@@ -448,7 +445,7 @@ jobs:
             exit 1
           fi
 
-      - name: Check eth_recent_blocks table exists
+      - name: Check test_postgresql_table table exists
         working-directory: test_app
         run: |
           response=$(curl -X POST \
@@ -457,16 +454,16 @@ jobs:
             http://localhost:3000/v1/sql
           )
           echo $response | jq
-          table_exists=$(echo $response | jq '[.[] | select(.table_name == "eth_recent_blocks")]' | jq 'length')
+          table_exists=$(echo $response | jq '[.[] | select(.table_name == "test_postgresql_table")]' | jq 'length')
           if [[ $table_exists -eq 0 ]]; then
-            echo "Unexpected response: table 'eth_recent_blocks' does not exist."
+            echo "Unexpected response: table 'test_postgresql_table' does not exist."
             exit 1
           fi
 
       - name: Run Flight SQL query
         working-directory: test_app
         run: |
-          sql_output=$(echo "select * from eth_recent_blocks limit 10;" | spice sql)
+          sql_output=$(echo "select * from test_postgresql_table limit 10;" | spice sql)
           echo "$sql_output"
           if [[ $sql_output == *"error"* ]] || [[ $sql_output == *"not found"* ]]; then
             echo "Unexpected response from spice sql, failed to perform test query: $sql_output"
