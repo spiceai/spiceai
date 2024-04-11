@@ -70,6 +70,11 @@ pub(crate) struct AcceleratedTable {
     _scheduled_refreshes_handle: Option<JoinHandle<()>>,
 }
 
+enum AccelerationRefreshMode {
+    Full(Receiver<()>),
+    Append,
+}
+
 impl AcceleratedTable {
     pub async fn new(
         dataset_name: String,
@@ -80,24 +85,25 @@ impl AcceleratedTable {
         object_store: Option<(Url, Arc<dyn ObjectStore + 'static>)>,
     ) -> Self {
         let mut refresh_trigger = None;
-        let mut refresh_trigger_receiver = None;
         let mut scheduled_refreshes_handle: Option<JoinHandle<()>> = None;
 
-        if refresh_mode == RefreshMode::Full {
-            let (trigger, receiver) = mpsc::channel::<()>(1);
-            refresh_trigger_receiver = Some(receiver);
-            refresh_trigger = Some(trigger.clone());
-            scheduled_refreshes_handle =
-                Self::schedule_regular_refreshes(refresh_interval, trigger).await;
+        let acceleration_refresh_mode: AccelerationRefreshMode = match refresh_mode {
+            RefreshMode::Append => AccelerationRefreshMode::Append,
+            RefreshMode::Full => {
+                let (trigger, receiver) = mpsc::channel::<()>(1);
+                refresh_trigger = Some(trigger.clone());
+                scheduled_refreshes_handle =
+                    Self::schedule_regular_refreshes(refresh_interval, trigger).await;
+                AccelerationRefreshMode::Full(receiver)
+            }
         };
 
         let refresh_handle = tokio::spawn(Self::start_refresh(
             dataset_name,
             Arc::clone(&federated),
-            refresh_mode.clone(),
+            acceleration_refresh_mode,
             Arc::clone(&accelerator),
             object_store,
-            refresh_trigger_receiver,
         ));
 
         Self {
@@ -159,17 +165,15 @@ impl AcceleratedTable {
     async fn start_refresh(
         dataset_name: String,
         federated: Arc<dyn TableProvider>,
-        refresh_mode: RefreshMode,
+        acceleration_refresh_mode: AccelerationRefreshMode,
         accelerator: Arc<dyn TableProvider>,
         object_store: Option<(Url, Arc<dyn ObjectStore + 'static>)>,
-        refresh_trigger_receiver: Option<Receiver<()>>,
     ) {
         let mut stream = Self::stream_updates(
             dataset_name.clone(),
             federated,
-            refresh_mode,
+            acceleration_refresh_mode,
             object_store,
-            refresh_trigger_receiver,
         );
 
         let ctx = SessionContext::new();
@@ -210,9 +214,8 @@ impl AcceleratedTable {
     fn stream_updates<'a>(
         dataset_name: String,
         federated: Arc<dyn TableProvider>,
-        refresh_mode: RefreshMode,
+        acceleration_refresh_mode: AccelerationRefreshMode,
         object_store: Option<(Url, Arc<dyn ObjectStore + 'static>)>,
-        refresh_trigger_receiver: Option<Receiver<()>>,
     ) -> BoxStream<'a, Result<DataUpdate>> {
         let ctx = SessionContext::new();
         if let Some((ref url, ref object_store)) = object_store {
@@ -221,8 +224,8 @@ impl AcceleratedTable {
         }
 
         Box::pin(stream! {
-            match refresh_mode {
-                RefreshMode::Append => {
+            match acceleration_refresh_mode {
+                AccelerationRefreshMode::Append => {
                     let plan = federated.scan(&ctx.state(), None, &[], None).await.context(UnableToScanTableProviderSnafu {})?;
 
                     if plan.output_partitioning().partition_count() > 1 {
@@ -250,12 +253,7 @@ impl AcceleratedTable {
                         }
                     }
                 }
-                RefreshMode::Full => {
-
-                    let Some(receiver) = refresh_trigger_receiver else {
-                        tracing::warn!("Refresh trigger receiver is not available for {dataset_name}");
-                        return;
-                    };
+                AccelerationRefreshMode::Full(receiver) => {
 
                     let mut refresh_stream = ReceiverStream::new(receiver);
 
