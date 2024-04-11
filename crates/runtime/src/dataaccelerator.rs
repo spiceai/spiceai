@@ -29,7 +29,12 @@ use spicepod::component::dataset::acceleration::{self, Mode};
 use std::{any::Any, collections::HashMap, sync::Arc};
 use tokio::sync::Mutex;
 
-use self::{arrow::ArrowAccelerator, duckdb::DuckDBAccelerator};
+use self::{arrow::ArrowAccelerator, sqlite::SqliteAccelerator};
+
+#[cfg(feature = "duckdb")]
+use self::duckdb::DuckDBAccelerator;
+#[cfg(feature = "postgres")]
+use self::postgres::PostgresAccelerator;
 
 pub mod arrow;
 #[cfg(feature = "duckdb")]
@@ -38,8 +43,8 @@ pub mod duckdb;
 // pub mod mysql;
 #[cfg(feature = "postgres")]
 pub mod postgres;
-// #[cfg(feature = "sqlite")]
-// pub mod sqlite;
+#[cfg(feature = "sqlite")]
+pub mod sqlite;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -70,8 +75,12 @@ pub async fn register_accelerator_engine(name: &str, accelerator_engine: Arc<dyn
 
 pub async fn register_all() {
     register_accelerator_engine("arrow", Arc::new(ArrowAccelerator::new())).await;
+    #[cfg(feature = "duckdb")]
     register_accelerator_engine("duckdb", Arc::new(DuckDBAccelerator::new())).await;
+    #[cfg(feature = "postgres")]
     register_accelerator_engine("postgres", Arc::new(PostgresAccelerator::new())).await;
+    #[cfg(feature = "sqlite")]
+    register_accelerator_engine("sqlite", Arc::new(SqliteAccelerator::new())).await;
 }
 
 pub async fn get_accelerator_engine(engine_name: &str) -> Option<Arc<dyn DataAccelerator>> {

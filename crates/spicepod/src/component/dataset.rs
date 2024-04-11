@@ -81,7 +81,7 @@ impl Dataset {
             mode: Mode::default(),
             sql: None,
             sql_ref: None,
-            params: Option::default(),
+            params: None,
             replication: None,
             acceleration: None,
             depends_on: Vec::default(),

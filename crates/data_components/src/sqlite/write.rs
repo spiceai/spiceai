@@ -16,10 +16,11 @@ limitations under the License.
 
 use std::{any::Any, fmt, sync::Arc};
 
-use arrow::datatypes::SchemaRef;
+use arrow::{array::RecordBatch, datatypes::SchemaRef};
 use async_trait::async_trait;
 use datafusion::{
     datasource::{TableProvider, TableType},
+    error::DataFusionError,
     execution::{context::SessionState, SendableRecordBatchStream, TaskContext},
     logical_expr::Expr,
     physical_plan::{
@@ -31,27 +32,24 @@ use datafusion::{
 use futures::StreamExt;
 use snafu::prelude::*;
 
-use super::{to_datafusion_error, Postgres};
+use super::{to_datafusion_error, Sqlite};
 
-pub struct PostgresTableWriter {
+pub struct SqliteTableWriter {
     read_provider: Arc<dyn TableProvider>,
-    postgres: Arc<Postgres>,
+    sqlite: Arc<Sqlite>,
 }
 
-impl PostgresTableWriter {
-    pub fn create(
-        read_provider: Arc<dyn TableProvider>,
-        postgres: Postgres,
-    ) -> Arc<dyn TableProvider> {
+impl SqliteTableWriter {
+    pub fn create(read_provider: Arc<dyn TableProvider>, sqlite: Sqlite) -> Arc<dyn TableProvider> {
         Arc::new(Self {
             read_provider,
-            postgres: Arc::new(postgres),
+            sqlite: Arc::new(sqlite),
         }) as _
     }
 }
 
 #[async_trait]
-impl TableProvider for PostgresTableWriter {
+impl TableProvider for SqliteTableWriter {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -84,7 +82,7 @@ impl TableProvider for PostgresTableWriter {
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(FileSinkExec::new(
             input,
-            Arc::new(PostgresDataSink::new(Arc::clone(&self.postgres), overwrite)),
+            Arc::new(SqliteDataSink::new(Arc::clone(&self.sqlite), overwrite)),
             self.schema(),
             None,
         )) as _)
@@ -92,13 +90,13 @@ impl TableProvider for PostgresTableWriter {
 }
 
 #[derive(Clone)]
-struct PostgresDataSink {
-    postgres: Arc<Postgres>,
+struct SqliteDataSink {
+    sqlite: Arc<Sqlite>,
     overwrite: bool,
 }
 
 #[async_trait]
-impl DataSink for PostgresDataSink {
+impl DataSink for SqliteDataSink {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -109,64 +107,69 @@ impl DataSink for PostgresDataSink {
 
     async fn write_all(
         &self,
-        mut data: SendableRecordBatchStream,
+        data: SendableRecordBatchStream,
         _context: &Arc<TaskContext>,
     ) -> datafusion::common::Result<u64> {
-        let mut num_rows = 0;
+        let mut num_rows: u64 = 0;
 
-        let mut db_conn = self.postgres.connect().await.map_err(to_datafusion_error)?;
-        let postgres_conn = Postgres::postgres_conn(&mut db_conn).map_err(to_datafusion_error)?;
+        let mut db_conn = self.sqlite.connect().await.map_err(to_datafusion_error)?;
+        let sqlite_conn = Sqlite::sqlite_conn(&mut db_conn).map_err(to_datafusion_error)?;
 
-        let tx = postgres_conn
+        let data_batches_result = data
+            .collect::<Vec<datafusion::common::Result<RecordBatch>>>()
+            .await;
+
+        let data_batches: Vec<RecordBatch> = data_batches_result
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?;
+
+        for data_batch in &data_batches {
+            num_rows += u64::try_from(data_batch.num_rows()).map_err(|e| {
+                DataFusionError::Execution(format!("Unable to convert num_rows() to u64: {e}"))
+            })?;
+        }
+
+        let overwrite = self.overwrite;
+        let sqlite = Arc::clone(&self.sqlite);
+        sqlite_conn
             .conn
-            .transaction()
+            .call(move |conn| {
+                let transaction = conn.transaction()?;
+
+                if overwrite {
+                    sqlite.delete_all_table_data(&transaction)?;
+                }
+
+                for batch in data_batches {
+                    sqlite.insert_batch(&transaction, batch)?;
+                }
+
+                transaction.commit()?;
+
+                Ok(())
+            })
             .await
-            .context(super::UnableToBeginTransactionSnafu)
-            .map_err(to_datafusion_error)?;
-
-        if self.overwrite {
-            self.postgres
-                .delete_all_table_data(&tx)
-                .await
-                .map_err(to_datafusion_error)?;
-        }
-
-        while let Some(batch) = data.next().await {
-            let batch = batch?;
-            num_rows += batch.num_rows() as u64;
-
-            self.postgres
-                .insert_batch(&tx, batch)
-                .await
-                .map_err(to_datafusion_error)?;
-        }
-
-        tx.commit()
-            .await
-            .context(super::UnableToCommitPostgresTransactionSnafu)
+            .context(super::UnableToInsertIntoTableAsyncSnafu)
             .map_err(to_datafusion_error)?;
 
         Ok(num_rows)
     }
 }
 
-impl PostgresDataSink {
-    fn new(postgres: Arc<Postgres>, overwrite: bool) -> Self {
-        Self {
-            postgres,
-            overwrite,
-        }
+impl SqliteDataSink {
+    fn new(sqlite: Arc<Sqlite>, overwrite: bool) -> Self {
+        Self { sqlite, overwrite }
     }
 }
 
-impl std::fmt::Debug for PostgresDataSink {
+impl std::fmt::Debug for SqliteDataSink {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "PostgresDataSink")
+        write!(f, "SqliteDataSink")
     }
 }
 
-impl DisplayAs for PostgresDataSink {
+impl DisplayAs for SqliteDataSink {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> std::fmt::Result {
-        write!(f, "PostgresDataSink")
+        write!(f, "SqliteDataSink")
     }
 }

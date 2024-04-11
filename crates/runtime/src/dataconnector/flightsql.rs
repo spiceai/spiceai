@@ -37,6 +37,7 @@ pub enum Error {
     #[snafu(display("Unable to construct TLS flight client: {source}"))]
     UnableToConstructTlsChannel { source: flight_client::tls::Error },
 
+    #[snafu(display("{source}"))]
     UnableToGetReadProvider {
         source: Box<dyn std::error::Error + Send + Sync>,
     },

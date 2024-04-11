@@ -17,8 +17,8 @@ limitations under the License.
 use arrow::{
     array::{
         ArrayBuilder, BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder,
-        Float32Builder, Float64Builder, Int16Builder, Int32Builder, Int64Builder, ListBuilder,
-        StringBuilder, TimestampMicrosecondBuilder, TimestampMillisecondBuilder,
+        Float32Builder, Float64Builder, Int16Builder, Int32Builder, Int64Builder, Int8Builder,
+        ListBuilder, StringBuilder, TimestampMicrosecondBuilder, TimestampMillisecondBuilder,
         TimestampNanosecondBuilder, TimestampSecondBuilder, UInt64Builder,
     },
     datatypes::{DataType, TimeUnit},
@@ -35,6 +35,7 @@ pub fn map_data_type_to_array_builder_optional(
 
 pub fn map_data_type_to_array_builder(data_type: &DataType) -> Box<dyn ArrayBuilder> {
     match data_type {
+        DataType::Int8 => Box::new(Int8Builder::new()),
         DataType::Int16 => Box::new(Int16Builder::new()),
         DataType::Int32 => Box::new(Int32Builder::new()),
         DataType::Int64 => Box::new(Int64Builder::new()),
@@ -67,6 +68,7 @@ pub fn map_data_type_to_array_builder(data_type: &DataType) -> Box<dyn ArrayBuil
         // We can't recursively call map_data_type_to_array_builder here because downcasting will not work if the
         // values_builder is boxed.
         DataType::List(values_field) => match values_field.data_type() {
+            DataType::Int8 => Box::new(ListBuilder::new(Int8Builder::new())),
             DataType::Int16 => Box::new(ListBuilder::new(Int16Builder::new())),
             DataType::Int32 => Box::new(ListBuilder::new(Int32Builder::new())),
             DataType::Int64 => Box::new(ListBuilder::new(Int64Builder::new())),

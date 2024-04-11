@@ -78,7 +78,7 @@ postgres-native-tls = { version = "0.5.0", optional = true }
 ns_lookup = { path = "../ns_lookup" }
 
 [features]
-default = ["keyring-secret-store"]
+default = ["keyring-secret-store", "aws-secrets-manager"]
 dev = []
 duckdb = ["dep:duckdb", "sql_provider_datafusion/duckdb", "r2d2", "db_connection_pool/duckdb", "spicepod/duckdb", "data_components/duckdb"]
 postgres = [
@@ -96,7 +96,9 @@ sqlite = [
     "db_connection_pool/sqlite",
     "sql_provider_datafusion/sqlite",
     "arrow_sql_gen/sqlite",
+    "data_components/sqlite",
 ]
 mysql = ["dep:mysql_async", "db_connection_pool/mysql", "arrow_sql_gen/mysql", "data_components/mysql"]
 keyring-secret-store = ["secrets/keyring-secret-store"]
 flightsql = ["data_components/flightsql"]
+aws-secrets-manager= ["secrets/aws-secrets-manager"]

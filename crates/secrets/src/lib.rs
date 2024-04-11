@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#[cfg(feature = "aws-secrets-manager")]
+pub mod aws_secrets_manager;
 pub mod env;
 pub mod file;
 #[cfg(feature = "keyring-secret-store")]
@@ -35,6 +37,10 @@ pub use secrecy::ExposeSecret;
 pub enum Error {
     #[snafu(display("Unable to load secrets for {store}"))]
     UnableToLoadSecrets { store: String },
+    #[snafu(display("Unable to initialize AWS Secrets Manager: {source}"))]
+    UnableToInitializeAwsSecretsManager {
+        source: crate::aws_secrets_manager::Error,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -82,6 +88,8 @@ pub enum SecretStoreType {
     #[cfg(feature = "keyring-secret-store")]
     Keyring,
     Kubernetes,
+    #[cfg(feature = "aws-secrets-manager")]
+    AwsSecretsManager,
 }
 
 #[must_use]
@@ -92,7 +100,9 @@ pub fn spicepod_secret_store_type(store: &SpiceSecretStore) -> Option<SecretStor
         #[cfg(feature = "keyring-secret-store")]
         SpiceSecretStore::Keyring => Some(SecretStoreType::Keyring),
         SpiceSecretStore::Kubernetes => Some(SecretStoreType::Kubernetes),
-        #[cfg(not(feature = "keyring-secret-store"))]
+        #[cfg(feature = "aws-secrets-manager")]
+        SpiceSecretStore::AwsSecretsManager => Some(SecretStoreType::AwsSecretsManager),
+        #[cfg(not(all(feature = "keyring-secret-store", feature = "aws-secrets-manager")))]
         _ => None,
     }
 }
@@ -124,7 +134,7 @@ impl SecretsProvider {
     /// # Errors
     ///
     /// Returns an error if the secrets cannot be loaded.
-    pub fn load_secrets(&mut self) -> Result<()> {
+    pub async fn load_secrets(&mut self) -> Result<()> {
         match self.store {
             SecretStoreType::File => {
                 let mut file_secret_store = FileSecretStore::new();
@@ -158,6 +168,17 @@ impl SecretsProvider {
                 };
 
                 self.secret_store = Some(Box::new(kubernetes_secret_store));
+            }
+            #[cfg(feature = "aws-secrets-manager")]
+            SecretStoreType::AwsSecretsManager => {
+                let secret_store = aws_secrets_manager::AwsSecretsManager::new();
+
+                secret_store
+                    .init()
+                    .await
+                    .context(UnableToInitializeAwsSecretsManagerSnafu)?;
+
+                self.secret_store = Some(Box::new(secret_store));
             }
         }
 
