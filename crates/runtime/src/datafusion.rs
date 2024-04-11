@@ -39,6 +39,8 @@ use spicepod::component::dataset::{Dataset, Mode};
 use tokio::spawn;
 use tokio::time::{sleep, Instant};
 
+pub mod refresh_sql;
+
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Snafu)]
@@ -59,6 +61,9 @@ pub enum Error {
     UnableToParseSql {
         source: sqlparser::parser::ParserError,
     },
+
+    #[snafu(display("{source}"))]
+    RefreshSql { source: refresh_sql::Error },
 
     #[snafu(display("Unable to get table: {source}"))]
     UnableToGetTable { source: DataFusionError },
@@ -266,6 +271,11 @@ impl DataFusion {
         )
         .await
         .context(UnableToCreateDataAcceleratorSnafu)?;
+
+        let refresh_sql = dataset.refresh_sql();
+        if let Some(refresh_sql) = &refresh_sql {
+            refresh_sql::validate_refresh_sql(refresh_sql.as_str()).context(RefreshSqlSnafu)?;
+        }
 
         let accelerated_table = AcceleratedTable::new(
             dataset.name.to_string(),
