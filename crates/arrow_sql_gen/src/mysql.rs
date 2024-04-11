@@ -246,8 +246,8 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                         })?;
 
                     let scale = match &val {
+                        Some(val) => val.fractional_digit_count(),
                         None => 0,
-                        Some(val) => get_scale(val),
                     };
 
                     let dec_builder = builder.get_or_insert_with(|| {
@@ -442,20 +442,8 @@ fn map_column_to_data_type(column_type: ColumnType) -> Option<DataType> {
     }
 }
 
-fn get_scale(decimal: &BigDecimal) -> u32 {
-    let decimal_string = decimal.to_string();
-    let idx = decimal_string.find('.');
-    match idx {
-        Some(idx) => {
-            let scale = decimal_string.len() - idx - 1;
-            u32::try_from(scale).unwrap_or_default()
-        }
-        None => 0,
-    }
-}
-
-fn to_decimal_128(decimal: &BigDecimal, scale: u32) -> Option<i128> {
-    (decimal * 10i128.pow(scale)).to_i128()
+fn to_decimal_128(decimal: &BigDecimal, scale: i64) -> Option<i128> {
+    (decimal * 10i128.pow(scale.try_into().unwrap_or_default())).to_i128()
 }
 
 fn handle_null_error<T>(
