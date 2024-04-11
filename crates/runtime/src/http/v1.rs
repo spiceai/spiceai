@@ -425,9 +425,7 @@ pub(crate) mod datasets {
             return (
                 status::StatusCode::BAD_REQUEST,
                 Json(DatasetRefreshResponse {
-                    message: format!(
-                        "Dataset {dataset_name} does not have acceleration enabled"
-                    ),
+                    message: format!("Dataset {dataset_name} does not have acceleration enabled"),
                 }),
             )
                 .into_response();
