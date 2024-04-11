@@ -170,6 +170,7 @@ impl<T, P> SqlExec<T, P> {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Self> {
+        tracing::trace!("original schema {:?}", schema);
         let projected_schema = project_schema(schema, projections)?;
         Ok(Self {
             projected_schema,
@@ -188,6 +189,9 @@ impl<T, P> SqlExec<T, P> {
             .map(|f| format!("\"{}\"", f.name()))
             .collect::<Vec<_>>()
             .join(", ");
+
+        tracing::trace!("projected_schema {:?}", self.projected_schema);
+        tracing::trace!("sql columns {columns}");
 
         let limit_expr = match self.limit {
             Some(limit) => format!("LIMIT {limit}"),
