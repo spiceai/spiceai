@@ -14,23 +14,55 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use super::DataConnector;
+use super::DataConnectorFactory;
 use async_trait::async_trait;
+use data_components::flight::FlightFactory;
+use data_components::Read;
+use data_components::ReadWrite;
+use datafusion::datasource::TableProvider;
+use flight_client::FlightClient;
+use ns_lookup::verify_endpoint_connection;
+use secrets::Secret;
+use snafu::prelude::*;
+use spicepod::component::dataset::Dataset;
+use std::any::Any;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::{collections::HashMap, future::Future};
 
-use flight_client::FlightClient;
-use flight_datafusion::FlightTable;
-use ns_lookup::verify_endpoint_connection;
-use spicepod::component::dataset::Dataset;
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display("Missing required parameter: endpoint"))]
+    MissingEndpointParameter,
 
-use secrets::Secret;
+    #[snafu(display("Missing required secrets"))]
+    MissingSecrets,
 
-use super::DataConnectorFactory;
-use super::{flight::Flight, DataConnector};
+    #[snafu(display(r#"Unable to connect to endpoint "{endpoint}": {source}"#))]
+    UnableToVerifyEndpointConnection {
+        source: ns_lookup::Error,
+        endpoint: String,
+    },
+
+    #[snafu(display("Unable to create flight client: {source}"))]
+    UnableToCreateFlightClient { source: flight_client::Error },
+
+    #[snafu(display("{source}"))]
+    UnableToGetReadProvider {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("{source}"))]
+    UnableToGetReadWriteProvider {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+}
+
+pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct Dremio {
-    flight: Flight,
+    flight_factory: FlightFactory,
 }
 
 impl DataConnectorFactory for Dremio {
@@ -39,21 +71,19 @@ impl DataConnectorFactory for Dremio {
         params: Arc<Option<HashMap<String, String>>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let secret = secret.ok_or_else(|| super::Error::UnableToCreateDataConnector {
-                source: "Missing required secrets".into(),
-            })?;
+            let secret = secret.context(MissingSecretsSnafu)?;
 
             let endpoint: String = params
                 .as_ref() // &Option<HashMap<String, String>>
                 .as_ref() // Option<&HashMap<String, String>>
                 .and_then(|params| params.get("endpoint").cloned())
-                .ok_or_else(|| super::Error::UnableToCreateDataConnector {
-                    source: "Missing required parameter: endpoint".into(),
-                })?;
+                .context(MissingEndpointParameterSnafu)?;
 
             verify_endpoint_connection(&endpoint)
                 .await
-                .map_err(|e| super::Error::UnableToCreateDataConnector { source: e.into() })?;
+                .with_context(|_| UnableToVerifyEndpointConnectionSnafu {
+                    endpoint: endpoint.clone(),
+                })?;
 
             let flight_client = FlightClient::new(
                 endpoint.as_str(),
@@ -61,41 +91,42 @@ impl DataConnectorFactory for Dremio {
                 secret.get("password").unwrap_or_default(),
             )
             .await
-            .map_err(|e| super::Error::UnableToCreateDataConnector { source: e.into() })?;
-            let flight = Flight::new(flight_client);
-            Ok(Box::new(Self { flight }) as Box<dyn DataConnector>)
+            .context(UnableToCreateFlightClientSnafu)?;
+            let flight_factory = FlightFactory::new(flight_client);
+            Ok(Arc::new(Self { flight_factory }) as Arc<dyn DataConnector>)
         })
     }
 }
 
 #[async_trait]
 impl DataConnector for Dremio {
-    fn get_all_data(
-        &self,
-        dataset: &Dataset,
-    ) -> Pin<Box<dyn Future<Output = Vec<arrow::record_batch::RecordBatch>> + Send>> {
-        let dremio_path = dataset.path();
-
-        self.flight.get_all_data(&dremio_path)
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 
-    fn has_table_provider(&self) -> bool {
-        true
-    }
-
-    async fn get_table_provider(
+    async fn read_provider(
         &self,
         dataset: &Dataset,
-    ) -> std::result::Result<Arc<dyn datafusion::datasource::TableProvider>, super::Error> {
-        let dremio_path = dataset.path();
+    ) -> super::AnyErrorResult<Arc<dyn TableProvider>> {
+        Ok(
+            Read::table_provider(&self.flight_factory, dataset.path().into())
+                .await
+                .context(UnableToGetReadProviderSnafu)?,
+        )
+    }
 
-        let provider = FlightTable::new(self.flight.client.clone(), dremio_path).await;
-
-        match provider {
-            Ok(provider) => Ok(Arc::new(provider)),
-            Err(error) => Err(super::Error::UnableToGetTableProvider {
-                source: error.into(),
-            }),
+    async fn read_write_provider(
+        &self,
+        dataset: &Dataset,
+    ) -> Option<super::AnyErrorResult<Arc<dyn TableProvider>>> {
+        let read_write_result =
+            ReadWrite::table_provider(&self.flight_factory, dataset.path().into())
+                .await
+                .context(UnableToGetReadWriteProviderSnafu)
+                .boxed();
+        match read_write_result {
+            Ok(provider) => Some(Ok(provider)),
+            Err(e) => Some(Err(e)),
         }
     }
 }
