@@ -135,8 +135,8 @@ fn get_ssl_opts(ssl_mode: &str, rootcert_path: Option<PathBuf>) -> Option<SslOpt
 
     let mut opts = SslOpts::default();
 
-    if rootcert_path.is_some() {
-        let path = rootcert_path.unwrap();
+    if let Some(rootcert_path) = rootcert_path {
+        let path = rootcert_path;
         opts = opts.with_root_certs(vec![path.into()]);
     }
 
@@ -148,7 +148,7 @@ fn get_ssl_opts(ssl_mode: &str, rootcert_path: Option<PathBuf>) -> Option<SslOpt
             .with_danger_skip_domain_validation(true);
     }
 
-    return Some(opts);
+    Some(opts)
 }
 
 #[must_use]
