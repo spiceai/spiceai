@@ -155,6 +155,19 @@ impl ReadWrite for PostgresTableFactory {
 
 pub struct PostgresTableProviderFactory {}
 
+impl PostgresTableProviderFactory {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
+impl Default for PostgresTableProviderFactory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[async_trait]
 impl TableProviderFactory for PostgresTableProviderFactory {
     async fn create(
