@@ -37,6 +37,10 @@ pub use secrecy::ExposeSecret;
 pub enum Error {
     #[snafu(display("Unable to load secrets for {store}"))]
     UnableToLoadSecrets { store: String },
+    #[snafu(display("Unable to initialize AWS Secrets Manager: {source}"))]
+    UnableToInitializeAwsSecretsManager {
+        source: crate::aws_secrets_manager::Error,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -130,7 +134,7 @@ impl SecretsProvider {
     /// # Errors
     ///
     /// Returns an error if the secrets cannot be loaded.
-    pub fn load_secrets(&mut self) -> Result<()> {
+    pub async fn load_secrets(&mut self) -> Result<()> {
         match self.store {
             SecretStoreType::File => {
                 let mut file_secret_store = FileSecretStore::new();
@@ -167,7 +171,14 @@ impl SecretsProvider {
             }
             #[cfg(feature = "aws-secrets-manager")]
             SecretStoreType::AwsSecretsManager => {
-                self.secret_store = Some(Box::new(aws_secrets_manager::AwsSecretsManager::new()));
+                let secret_store = aws_secrets_manager::AwsSecretsManager::new();
+
+                secret_store
+                    .init()
+                    .await
+                    .context(UnableToInitializeAwsSecretsManagerSnafu)?;
+
+                self.secret_store = Some(Box::new(secret_store));
             }
         }
 
