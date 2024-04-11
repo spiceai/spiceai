@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
 use mysql_async::{prelude::ToValue, SslOpts};
@@ -35,6 +35,9 @@ pub enum Error {
 
     #[snafu(display("Invalid parameter: {parameter_name}"))]
     InvalidParameterError { parameter_name: String },
+
+    #[snafu(display("Invalid root cert path: {path}"))]
+    InvalidRootCertPathError { path: String },
 }
 
 pub struct MySQLConnectionPool {
@@ -54,6 +57,7 @@ impl MySQLConnectionPool {
     ) -> Result<Self> {
         let mut connection_string = mysql_async::OptsBuilder::default();
         let mut ssl_mode = "required";
+        let mut ssl_rootcert_path: Option<PathBuf> = None;
 
         if let Some(params) = params.as_ref() {
             if let Some(mysql_connection_string) = get_secret_or_param(
@@ -97,16 +101,23 @@ impl MySQLConnectionPool {
                         }
                     }
                 }
+                if let Some(mysql_sslrootcert) = params.get("mysql_sslrootcert") {
+                    if !std::path::Path::new(mysql_sslrootcert).exists() {
+                        InvalidRootCertPathSnafu {
+                            path: mysql_sslrootcert,
+                        }
+                        .fail()?;
+                    }
+
+                    ssl_rootcert_path = Some(PathBuf::from(mysql_sslrootcert));
+                }
             }
         }
 
-        let ssl_opts = match ssl_mode {
-            "disabled" => None,
-            "preferred" => Some(SslOpts::default().with_danger_accept_invalid_certs(true)),
-            _ => Some(SslOpts::default()),
-        };
+        let ssl_opts = get_ssl_opts(ssl_mode, ssl_rootcert_path);
 
         connection_string = connection_string.ssl_opts(ssl_opts);
+
         let opts = mysql_async::Opts::from(connection_string);
 
         let pool = mysql_async::Pool::new(opts);
@@ -115,6 +126,29 @@ impl MySQLConnectionPool {
             pool: Arc::new(pool),
         })
     }
+}
+
+fn get_ssl_opts(ssl_mode: &str, rootcert_path: Option<PathBuf>) -> Option<SslOpts> {
+    if ssl_mode == "disabled" {
+        return None;
+    }
+
+    let mut opts = SslOpts::default();
+
+    if rootcert_path.is_some() {
+        let path = rootcert_path.unwrap();
+        opts = opts.with_root_certs(vec![path.into()]);
+    }
+
+    // If ssl_mode is "preferred", we will accept invalid certs and skip domain validation
+    // mysql_async does not have a "ssl_mode" https://github.com/blackbeam/mysql_async/issues/225#issuecomment-1409922237
+    if ssl_mode == "preferred" {
+        opts = opts
+            .with_danger_accept_invalid_certs(true)
+            .with_danger_skip_domain_validation(true);
+    }
+
+    return Some(opts);
 }
 
 #[must_use]
