@@ -43,6 +43,9 @@ pub enum Error {
         source: bb8::RunError<bb8_postgres::tokio_postgres::Error>,
     },
 
+    #[snafu(display("Invalid parameter: {parameter_name}"))]
+    InvalidParameterError { parameter_name: String },
+
     #[snafu(display("Invalid port: {port}"))]
     InvalidPortError { port: String },
 }
@@ -63,6 +66,7 @@ impl PostgresConnectionPool {
     ) -> Result<Self> {
         let mut connection_string = "host=localhost user=postgres dbname=postgres".to_string();
         let mut accept_invalid_certs = false;
+        let mut ssl_mode = "require";
 
         if let Some(params) = params.as_ref() {
             connection_string = String::new();
@@ -93,7 +97,17 @@ impl PostgresConnectionPool {
                     connection_string.push_str(format!("port={pg_port} ").as_str());
                 }
                 if let Some(pg_sslmode) = params.get("pg_sslmode") {
-                    connection_string.push_str(format!("sslmode={pg_sslmode} ").as_str());
+                    match pg_sslmode.to_lowercase().as_str() {
+                        "disable" | "require" | "prefer" => {
+                            ssl_mode = pg_sslmode.as_str();
+                        }
+                        _ => {
+                            InvalidParameterSnafu {
+                                parameter_name: "pg_sslmode".to_string(),
+                            }
+                            .fail()?;
+                        }
+                    }
                 }
                 if let Some(pg_insecure) = params.get("pg_insecure") {
                     accept_invalid_certs = pg_insecure == "true";
@@ -101,6 +115,7 @@ impl PostgresConnectionPool {
             }
         }
 
+        connection_string.push_str(format!("sslmode={ssl_mode} ").as_str());
         let config = Config::from_str(connection_string.as_str()).context(ConnectionPoolSnafu)?;
 
         for host in config.get_hosts() {
