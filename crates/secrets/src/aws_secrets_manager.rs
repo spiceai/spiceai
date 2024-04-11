@@ -17,6 +17,7 @@ limitations under the License.
 use std::collections::HashMap;
 
 use async_trait::async_trait;
+use aws_sdk_sts::operation::get_caller_identity::GetCallerIdentityError;
 
 use super::{Secret, SecretStore};
 
@@ -25,14 +26,16 @@ use aws_sdk_secretsmanager::error::SdkError;
 use aws_config::{self, BehaviorVersion};
 use aws_sdk_secretsmanager::{self};
 
-use snafu::{ResultExt, Snafu};
+use snafu::{OptionExt, ResultExt, Snafu};
 
 const SPICE_SECRET_PREFIX: &str = "spice_secret_";
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("AWS identity verification failed, check configuration with `aws configure list` and `aws sts get-caller-identity`."))]
-    UnableToVerifyAwsIdentity {},
+    #[snafu(display("AWS identity verification failed, check configuration with `aws configure list` and `aws sts get-caller-identity`: {}", source))]
+    UnableToVerifyAwsIdentity {
+        source: SdkError<GetCallerIdentityError>,
+    },
     #[snafu(display("Unable to parse as JSON: {}", source))]
     UnableToParseJson { source: serde_json::Error },
     #[snafu(display("Invalid JSON format: JSON object is expected"))]
@@ -71,9 +74,11 @@ impl AwsSecretsManager {
 
         let sts_client = aws_sdk_sts::Client::new(&config);
 
-        if sts_client.get_caller_identity().send().await.is_err() {
-            return UnableToVerifyAwsIdentitySnafu {}.fail();
-        }
+        sts_client
+            .get_caller_identity()
+            .send()
+            .await
+            .context(UnableToVerifyAwsIdentitySnafu)?;
 
         Ok(())
     }
@@ -139,9 +144,7 @@ impl SecretStore for AwsSecretsManager {
 pub fn parse_json_to_hashmap(json_str: &str) -> Result<HashMap<String, String>> {
     let parsed: serde_json::Value =
         serde_json::from_str(json_str).context(UnableToParseJsonSnafu)?;
-    let root = parsed
-        .as_object()
-        .ok_or_else(|| Error::InvalidJsonFormat {})?;
+    let root = parsed.as_object().context(InvalidJsonFormatSnafu)?;
 
     let mut data = HashMap::new();
     for (key, value) in root {
