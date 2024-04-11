@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, str::FromStr, sync::Arc};
+use std::{collections::HashMap, path::PathBuf, str::FromStr, sync::Arc};
 
 use async_trait::async_trait;
 use bb8::ErrorSink;
@@ -22,7 +22,7 @@ use bb8_postgres::{
     tokio_postgres::{config::Host, types::ToSql, Config},
     PostgresConnectionManager,
 };
-use native_tls::TlsConnector;
+use native_tls::{Certificate, TlsConnector};
 use ns_lookup::verify_ns_lookup_and_tcp_connect;
 use postgres_native_tls::MakeTlsConnector;
 use secrets::Secret;
@@ -48,6 +48,18 @@ pub enum Error {
 
     #[snafu(display("Invalid port: {port}"))]
     InvalidPortError { port: String },
+
+    #[snafu(display("Invalid root cert path: {path}"))]
+    InvalidRootCertPathError { path: String },
+
+    #[snafu(display("Failed to read cert : {source}"))]
+    FailedToReadCertError { source: std::io::Error },
+
+    #[snafu(display("Failed to parse cert : {source}"))]
+    FailedToParseCertError { source: pem::PemError },
+
+    #[snafu(display("Failed to load cert : {source}"))]
+    FailedToLoadCertError { source: native_tls::Error },
 }
 
 pub struct PostgresConnectionPool {
@@ -67,6 +79,7 @@ impl PostgresConnectionPool {
         let mut connection_string = "host=localhost user=postgres dbname=postgres".to_string();
         let mut accept_invalid_certs = false;
         let mut ssl_mode = "require";
+        let mut ssl_rootcert_path: Option<PathBuf> = None;
 
         if let Some(params) = params.as_ref() {
             connection_string = String::new();
@@ -112,6 +125,16 @@ impl PostgresConnectionPool {
                 if let Some(pg_insecure) = params.get("pg_insecure") {
                     accept_invalid_certs = pg_insecure == "true";
                 }
+                if let Some(pg_sslrootcert) = params.get("pg_sslrootcert") {
+                    if !std::path::Path::new(pg_sslrootcert).exists() {
+                        InvalidRootCertPathSnafu {
+                            path: pg_sslrootcert,
+                        }
+                        .fail()?;
+                    }
+
+                    ssl_rootcert_path = Some(PathBuf::from(pg_sslrootcert));
+                }
             }
         }
 
@@ -128,11 +151,19 @@ impl PostgresConnectionPool {
             }
         }
 
-        let connector = TlsConnector::builder()
-            .danger_accept_invalid_certs(accept_invalid_certs)
-            .build()?;
-        let connector = MakeTlsConnector::new(connector);
+        let mut cert: Option<Certificate> = None;
 
+        if let Some(path) = ssl_rootcert_path {
+            let buf = tokio::fs::read(path).await.context(FailedToReadCertSnafu)?;
+            let pem = pem::parse(buf).context(FailedToParseCertSnafu)?;
+            cert = Some(
+                Certificate::from_pem(pem::encode(&pem).as_bytes())
+                    .context(FailedToLoadCertSnafu)?,
+            );
+        }
+
+        let tls_connector = get_tls_connector(ssl_mode, accept_invalid_certs, cert)?;
+        let connector = MakeTlsConnector::new(tls_connector);
         let manager = PostgresConnectionManager::new(config, connector);
         let error_sink = PostgresErrorSink::new();
 
@@ -146,6 +177,27 @@ impl PostgresConnectionPool {
             pool: Arc::new(pool),
         })
     }
+}
+
+fn get_tls_connector(
+    ssl_mode: &str,
+    allow_insecure: bool,
+    rootcert: Option<Certificate>,
+) -> native_tls::Result<TlsConnector> {
+    if ssl_mode == "disable" {
+        return TlsConnector::builder().build();
+    }
+
+    if let Some(cert) = rootcert {
+        return TlsConnector::builder()
+            .danger_accept_invalid_certs(allow_insecure)
+            .add_root_certificate(cert)
+            .build();
+    }
+
+    TlsConnector::builder()
+        .danger_accept_invalid_certs(allow_insecure)
+        .build()
 }
 
 #[derive(Debug, Clone, Copy)]
