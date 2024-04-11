@@ -12,7 +12,8 @@ CREATE TABLE test_mysql_table (
   col_blob BLOB,
   col_varchar VARCHAR(255),
   col_string TEXT,
-  col_var_string VARCHAR(255)
+  col_var_string VARCHAR(255),
+  col_decimal DECIMAL(10, 2)
 );
 
 INSERT INTO test_mysql_table (
@@ -28,7 +29,8 @@ INSERT INTO test_mysql_table (
   col_blob,
   col_varchar,
   col_string,
-  col_var_string
+  col_var_string,
+  col_decimal
 ) VALUES (
   1,
   1,
@@ -42,22 +44,38 @@ INSERT INTO test_mysql_table (
   'blob',
   'varchar',
   'string',
-  'var_string'
+  'var_string',
+  1.11
 );
 
--- null not supported yet
--- , (
---   NULL,
---   NULL,
---   NULL,
---   NULL,
---   NULL,
---   NULL,
---   NULL,
---   NULL,
---   NULL,
---   NULL,
---   NULL,
---   NULL,
---   NULL
--- );
+INSERT INTO test_mysql_table (
+  col_bit,
+  col_tiny,
+  col_short,
+  col_long,
+  col_longlong,
+  col_float,
+  col_double,
+  col_timestamp,
+  col_date,
+  col_blob,
+  col_varchar,
+  col_string,
+  col_var_string,
+  col_decimal
+) VALUES (
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL
+);
