@@ -36,6 +36,7 @@ pub enum Error {
     #[snafu(display("Unable to create MySQL connection pool: {source}"))]
     UnableToCreateMySQLConnectionPool { source: db_connection_pool::Error },
 
+    #[snafu(display("{source}"))]
     UnableToGetReadProvider {
         source: Box<dyn std::error::Error + Send + Sync>,
     },

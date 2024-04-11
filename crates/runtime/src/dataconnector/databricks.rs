@@ -40,10 +40,12 @@ pub enum Error {
         source: ns_lookup::Error,
     },
 
+    #[snafu(display("{source}"))]
     UnableToGetReadProvider {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    #[snafu(display("{source}"))]
     UnableToGetReadWriteProvider {
         source: Box<dyn std::error::Error + Send + Sync>,
     },

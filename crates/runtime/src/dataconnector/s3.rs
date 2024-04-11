@@ -45,14 +45,17 @@ pub enum Error {
         source: url::ParseError,
     },
 
+    #[snafu(display("{source}"))]
     UnableToGetReadProvider {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    #[snafu(display("{source}"))]
     UnableToGetReadWriteProvider {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    #[snafu(display("{source}"))]
     UnableToBuildObjectStore {
         source: object_store::Error,
     },
@@ -64,6 +67,7 @@ pub enum Error {
 
     ObjectStoreNotImplemented,
 
+    #[snafu(display("{source}"))]
     UnableToBuildLogicalPlan {
         source: DataFusionError,
     },
