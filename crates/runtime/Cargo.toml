@@ -96,6 +96,7 @@ sqlite = [
     "db_connection_pool/sqlite",
     "sql_provider_datafusion/sqlite",
     "arrow_sql_gen/sqlite",
+    "data_components/sqlite",
 ]
 mysql = ["dep:mysql_async", "db_connection_pool/mysql", "arrow_sql_gen/mysql", "data_components/mysql"]
 keyring-secret-store = ["secrets/keyring-secret-store"]

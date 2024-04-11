@@ -46,8 +46,6 @@ use crate::{Read, ReadWrite};
 
 use self::write::PostgresTableWriter;
 
-// use self::write::PostgresTableWriter;
-
 pub mod write;
 
 pub type DynPostgresConnectionPool = dyn DbConnectionPool<
