@@ -48,6 +48,12 @@ pub enum Error {
     FailedToTriggerRefresh {
         source: tokio::sync::mpsc::error::SendError<()>,
     },
+
+    #[snafu(display("Manual refresh is not supported for `append` acceleration mode"))]
+    ManualRefreshIsNotSupportedForAppend {},
+
+    #[snafu(display("Failed to trigger table refresh: invalid state"))]
+    RefreshTriggerIsUnavailable {},
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -59,11 +65,13 @@ pub(crate) struct AcceleratedTable {
     accelerator: Arc<dyn TableProvider>,
     federated: Arc<dyn TableProvider>,
     refresh_handle: JoinHandle<()>,
-    refresh_trigger: mpsc::Sender<()>,
+    refresh_mode: RefreshMode,
+    refresh_trigger: Option<mpsc::Sender<()>>,
+    _scheduled_refreshes_handle: Option<JoinHandle<()>>,
 }
 
 impl AcceleratedTable {
-    pub fn new(
+    pub async fn new(
         dataset_name: String,
         federated: Arc<dyn TableProvider>,
         accelerator: Arc<dyn TableProvider>,
@@ -71,16 +79,23 @@ impl AcceleratedTable {
         refresh_interval: Option<Duration>,
         object_store: Option<(Url, Arc<dyn ObjectStore + 'static>)>,
     ) -> Self {
-        let (refresh_trigger, refresh_trigger_receiver) = mpsc::channel::<()>(1);
+        let refresh_trigger = None;
+        let mut refresh_trigger_receiver = None;
+        let mut scheduled_refreshes_handle: Option<JoinHandle<()>> = None;
+
+        if refresh_mode == RefreshMode::Full {
+            let (trigger, receiver) = mpsc::channel::<()>(1);
+            refresh_trigger_receiver = Some(receiver);
+            scheduled_refreshes_handle =
+                Self::schedule_regular_refreshes(refresh_interval, trigger).await;
+        };
 
         let refresh_handle = tokio::spawn(Self::start_refresh(
             dataset_name,
             Arc::clone(&federated),
-            refresh_mode,
-            refresh_interval,
+            refresh_mode.clone(),
             Arc::clone(&accelerator),
             object_store,
-            refresh_trigger.clone(),
             refresh_trigger_receiver,
         ));
 
@@ -88,29 +103,65 @@ impl AcceleratedTable {
             accelerator,
             federated,
             refresh_handle,
+            refresh_mode,
             refresh_trigger,
+            _scheduled_refreshes_handle: scheduled_refreshes_handle,
         }
     }
 
     #[allow(dead_code)]
     pub async fn trigger_refresh(&self) -> Result<()> {
-        self.refresh_trigger
-            .send(())
-            .await
-            .context(FailedToTriggerRefreshSnafu)?;
+        if self.refresh_mode == RefreshMode::Append {
+            ManualRefreshIsNotSupportedForAppendSnafu.fail()?;
+        }
+
+        match &self.refresh_trigger {
+            Some(refresh_trigger) => {
+                refresh_trigger
+                    .send(())
+                    .await
+                    .context(FailedToTriggerRefreshSnafu)?;
+            }
+            None => {
+                RefreshTriggerIsUnavailableSnafu.fail()?;
+            }
+        }
+
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
+    async fn schedule_regular_refreshes(
+        refresh_interval: Option<Duration>,
+        refresh_trigger: mpsc::Sender<()>,
+    ) -> Option<JoinHandle<()>> {
+        if let Some(refresh_interval) = refresh_interval {
+            let mut interval_timer = interval(refresh_interval);
+            let trigger = refresh_trigger.clone();
+            let handle = tokio::spawn(async move {
+                loop {
+                    interval_timer.tick().await;
+                    // If sending fails, it means the receiver is dropped, and we should stop the task.
+                    if trigger.send(()).await.is_err() {
+                        break;
+                    }
+                }
+            });
+
+            return Some(handle);
+        } else if let Err(err) = refresh_trigger.send(()).await {
+            tracing::error!("Failed to trigger refresh: {err}");
+        }
+
+        None
+    }
+
     async fn start_refresh(
         dataset_name: String,
         federated: Arc<dyn TableProvider>,
         refresh_mode: RefreshMode,
-        refresh_interval: Option<Duration>,
         accelerator: Arc<dyn TableProvider>,
         object_store: Option<(Url, Arc<dyn ObjectStore + 'static>)>,
-        refresh_trigger: mpsc::Sender<()>,
-        refresh_trigger_receiver: Receiver<()>,
+        refresh_trigger_receiver: Option<Receiver<()>>,
     ) {
         let mut stream = Self::stream_updates(
             dataset_name.clone(),
@@ -119,22 +170,6 @@ impl AcceleratedTable {
             object_store,
             refresh_trigger_receiver,
         );
-
-        if let Some(refresh_interval) = refresh_interval {
-            let mut interval_timer = interval(refresh_interval);
-            let sender_clone = refresh_trigger.clone();
-            tokio::spawn(async move {
-                loop {
-                    interval_timer.tick().await;
-                    // If sending fails, it means the receiver is dropped, and we should stop the task.
-                    if sender_clone.send(()).await.is_err() {
-                        break;
-                    }
-                }
-            });
-        } else if let Err(err) = refresh_trigger.send(()).await {
-            tracing::error!("Failed to trigger refresh for {dataset_name}: {err}");
-        }
 
         let ctx = SessionContext::new();
         loop {
@@ -176,7 +211,7 @@ impl AcceleratedTable {
         federated: Arc<dyn TableProvider>,
         refresh_mode: RefreshMode,
         object_store: Option<(Url, Arc<dyn ObjectStore + 'static>)>,
-        refresh_trigger: Receiver<()>,
+        refresh_trigger_receiver: Option<Receiver<()>>,
     ) -> BoxStream<'a, Result<DataUpdate>> {
         let ctx = SessionContext::new();
         if let Some((ref url, ref object_store)) = object_store {
@@ -215,7 +250,14 @@ impl AcceleratedTable {
                     }
                 }
                 RefreshMode::Full => {
-                    let mut refresh_stream = ReceiverStream::new(refresh_trigger);
+
+                    let Some(receiver) = refresh_trigger_receiver else {
+                        tracing::warn!("Refresh trigger receiver is not available for {dataset_name}");
+                        return;
+                    };
+
+                    let mut refresh_stream = ReceiverStream::new(receiver);
+
                     while refresh_stream.next().await.is_some() {
                         tracing::info!("Refreshing data for {dataset_name}");
                         status::update_dataset(&dataset_name, status::ComponentStatus::Refreshing);
