@@ -426,7 +426,7 @@ pub(crate) mod datasets {
                 status::StatusCode::BAD_REQUEST,
                 Json(DatasetRefreshResponse {
                     message: format!(
-                        "Dataset {dataset_name} does not have local acceleration enabled"
+                        "Dataset {dataset_name} does not have acceleration enabled"
                     ),
                 }),
             )
