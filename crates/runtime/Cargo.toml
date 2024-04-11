@@ -50,8 +50,6 @@ reqwest = { version = "0.11.24", features = ["json"] }
 notify = "6.1.1"
 arrow-json = "50.0.0"
 async-trait.workspace = true
-flightsql_datafusion = { path = "../flightsql_datafusion" }
-flight_datafusion = { path = "../flight_datafusion" }
 deltalake = { version = "0.17.0", features = ["datafusion-ext", "s3", "azure"] }
 itertools = "0.12"
 aws-config = "1.1.7"
@@ -74,6 +72,7 @@ rusqlite = { workspace = true, optional = true }
 tokio-rusqlite = { workspace = true, optional = true }
 pin-project = "1.0"
 lazy_static = "1.4.0"
+data_components = { path = "../data_components" }
 mysql_async = { workspace = true, optional = true }
 postgres-native-tls = { version = "0.5.0", optional = true }
 ns_lookup = { path = "../ns_lookup" }
@@ -81,7 +80,7 @@ ns_lookup = { path = "../ns_lookup" }
 [features]
 default = ["keyring-secret-store", "aws-secrets-manager"]
 dev = []
-duckdb = ["dep:duckdb", "sql_provider_datafusion/duckdb", "r2d2", "db_connection_pool/duckdb", "spicepod/duckdb"]
+duckdb = ["dep:duckdb", "sql_provider_datafusion/duckdb", "r2d2", "db_connection_pool/duckdb", "spicepod/duckdb", "data_components/duckdb"]
 postgres = [
     "dep:bb8",
     "dep:bb8-postgres",
@@ -89,6 +88,7 @@ postgres = [
     "db_connection_pool/postgres",
     "sql_provider_datafusion/postgres",
     "arrow_sql_gen/postgres",
+    "data_components/postgres",
 ]
 sqlite = [
     "dep:rusqlite",
@@ -96,7 +96,9 @@ sqlite = [
     "db_connection_pool/sqlite",
     "sql_provider_datafusion/sqlite",
     "arrow_sql_gen/sqlite",
+    "data_components/sqlite",
 ]
-mysql = ["dep:mysql_async", "db_connection_pool/mysql", "arrow_sql_gen/mysql"]
+mysql = ["dep:mysql_async", "db_connection_pool/mysql", "arrow_sql_gen/mysql", "data_components/mysql"]
 keyring-secret-store = ["secrets/keyring-secret-store"]
+flightsql = ["data_components/flightsql"]
 aws-secrets-manager= ["secrets/aws-secrets-manager"]

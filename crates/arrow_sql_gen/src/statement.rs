@@ -156,6 +156,7 @@ impl InsertBuilder {
                     DataType::Float32 => push_value!(row_values, column, row, Float32Array),
                     DataType::Float64 => push_value!(row_values, column, row, Float64Array),
                     DataType::Utf8 => push_value!(row_values, column, row, StringArray),
+                    DataType::LargeUtf8 => push_value!(row_values, column, row, LargeStringArray),
                     DataType::Boolean => push_value!(row_values, column, row, BooleanArray),
                     DataType::Decimal128(_, scale) => {
                         let array = column.as_any().downcast_ref::<array::Decimal128Array>();
@@ -256,6 +257,20 @@ impl InsertBuilder {
                                     // We must cast here in case the array is empty which SeaQuery does not handle.
                                     row_values.push(expr.cast_as(Alias::new("text[]")));
                                 }
+                                DataType::LargeUtf8 => {
+                                    let mut list_values: Vec<String> = vec![];
+                                    for i in 0..list_array.len() {
+                                        let int_array = list_array
+                                            .as_any()
+                                            .downcast_ref::<array::LargeStringArray>();
+                                        if let Some(valid_int_array) = int_array {
+                                            list_values.push(valid_int_array.value(i).to_string());
+                                        }
+                                    }
+                                    let expr: SimpleExpr = list_values.into();
+                                    // We must cast here in case the array is empty which SeaQuery does not handle.
+                                    row_values.push(expr.cast_as(Alias::new("text[]")));
+                                }
                                 DataType::Boolean => push_list_values!(
                                     list_type.data_type(),
                                     list_array,
@@ -329,7 +344,7 @@ fn map_data_type_to_column_type(data_type: &DataType) -> ColumnType {
         DataType::UInt64 => ColumnType::BigUnsigned,
         DataType::Float32 => ColumnType::Float,
         DataType::Float64 => ColumnType::Double,
-        DataType::Utf8 => ColumnType::Text,
+        DataType::Utf8 | DataType::LargeUtf8 => ColumnType::Text,
         DataType::Boolean => ColumnType::Boolean,
         #[allow(clippy::cast_sign_loss)] // This is safe because scale will never be negative
         DataType::Decimal128(p, s) => ColumnType::Decimal(Some((u32::from(*p), *s as u32))),

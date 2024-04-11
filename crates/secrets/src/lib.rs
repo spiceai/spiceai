@@ -25,11 +25,13 @@ pub mod kubernetes;
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use secrecy::{ExposeSecret, SecretString};
+use secrecy::SecretString;
 use snafu::prelude::*;
 
 use crate::file::FileSecretStore;
 use spicepod::component::secrets::SpiceSecretStore;
+
+pub use secrecy::ExposeSecret;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
