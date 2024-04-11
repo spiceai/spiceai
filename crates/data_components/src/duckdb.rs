@@ -14,10 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use arrow::{
-    array::RecordBatch,
-    datatypes::{Schema, SchemaRef},
-};
+use arrow::{array::RecordBatch, datatypes::SchemaRef};
 use async_trait::async_trait;
 use datafusion::{
     common::OwnedTableReference,
@@ -109,8 +106,8 @@ impl TableProviderFactory for DuckDBTableFactory {
                 .map_err(to_datafusion_error)?,
         );
 
-        let schema: Schema = cmd.schema.as_ref().into();
-        let duckdb = DuckDB::new(name.clone(), Arc::new(schema), Arc::clone(&pool));
+        let schema: SchemaRef = Arc::new(cmd.schema.as_ref().into());
+        let duckdb = DuckDB::new(name.clone(), Arc::clone(&schema), Arc::clone(&pool));
 
         let mut db_conn = duckdb.connect().await.map_err(to_datafusion_error)?;
         let duckdb_conn = DuckDB::duckdb_conn(&mut db_conn).map_err(to_datafusion_error)?;
@@ -120,12 +117,11 @@ impl TableProviderFactory for DuckDBTableFactory {
 
         let dyn_pool: Arc<DynDuckDbConnectionPool> = pool;
 
-        let read_provider = Arc::new(
-            SqlTable::new(&dyn_pool, OwnedTableReference::bare(name.clone()))
-                .await
-                .context(DuckDBDataFusionSnafu)
-                .map_err(to_datafusion_error)?,
-        );
+        let read_provider = Arc::new(SqlTable::new_with_schema(
+            &dyn_pool,
+            Arc::clone(&schema),
+            OwnedTableReference::bare(name.clone()),
+        ));
 
         let read_write_provider: Arc<dyn TableProvider> =
             DuckDBTableWriter::create(read_provider, duckdb);
