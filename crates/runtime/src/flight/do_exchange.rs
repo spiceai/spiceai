@@ -63,12 +63,7 @@ pub(crate) async fn handle(
 
     let data_path = flight_descriptor.path.join(".");
 
-    if !flight_svc
-        .datafusion
-        .read()
-        .await
-        .has_publishers(&data_path)
-    {
+    if !flight_svc.datafusion.read().await.is_writable(&data_path) {
         return Err(Status::invalid_argument(format!(
             r#"Unknown dataset: "{data_path}""#,
         )));
@@ -149,8 +144,10 @@ pub(crate) async fn handle(
         }
 
         for batch in &results {
+            let schema = batch.schema();
             let data_update = DataUpdate {
                 data: vec![batch.clone()],
+                schema,
                 update_type: UpdateType::Append,
             };
             let _ = tx.send(data_update);

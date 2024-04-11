@@ -1975,6 +1975,39 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7e962a19be5cfc3f3bf6dd8f61eb50107f356ad6270fbb3ed41476571db78be5"
 
 [[package]]
+name = "data_components"
+version = "0.11.0-alpha"
+dependencies = [
+ "arrow",
+ "arrow-flight",
+ "arrow_sql_gen",
+ "async-stream",
+ "async-trait",
+ "bb8",
+ "bb8-postgres",
+ "datafusion",
+ "db_connection_pool",
+ "deltalake",
+ "duckdb",
+ "flight_client",
+ "futures",
+ "mysql_async",
+ "postgres-native-tls",
+ "r2d2",
+ "reqwest",
+ "rusqlite",
+ "secrets",
+ "serde",
+ "snafu 0.8.2",
+ "sql_provider_datafusion",
+ "tokio",
+ "tokio-postgres",
+ "tokio-rusqlite",
+ "tonic 0.10.2",
+ "tracing",
+]
+
+[[package]]
 name = "datafusion"
 version = "35.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2726,24 +2759,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "flight_datafusion"
-version = "0.11.0-alpha"
-dependencies = [
- "arrow",
- "arrow-flight",
- "async-stream",
- "async-trait",
- "datafusion",
- "flight_client",
- "futures",
- "r2d2",
- "snafu 0.8.2",
- "sql_provider_datafusion",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "flightpublisher"
 version = "0.11.0-alpha"
 dependencies = [
@@ -2775,25 +2790,6 @@ dependencies = [
  "tonic 0.10.2",
  "tracing",
  "tracing-subscriber",
-]
-
-[[package]]
-name = "flightsql_datafusion"
-version = "0.11.0-alpha"
-dependencies = [
- "arrow",
- "arrow-flight",
- "async-stream",
- "async-trait",
- "datafusion",
- "flight_client",
- "futures",
- "r2d2",
- "snafu 0.8.2",
- "sql_provider_datafusion",
- "tokio",
- "tonic 0.10.2",
- "tracing",
 ]
 
 [[package]]
@@ -5470,14 +5466,13 @@ dependencies = [
  "bytes",
  "clap",
  "csv",
+ "data_components",
  "datafusion",
  "db_connection_pool",
  "deltalake",
  "dirs",
  "duckdb",
  "flight_client",
- "flight_datafusion",
- "flightsql_datafusion",
  "futures",
  "futures-core",
  "indexmap 2.2.5",

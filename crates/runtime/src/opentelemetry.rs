@@ -136,52 +136,32 @@ impl MetricsService for Service {
                             Ok(record_batch) => {
                                 let df = self.data_fusion.read().await;
 
-                                let Some(publishers) = df.get_publishers(metric.name.as_str())
-                                else {
+                                if !df.is_writable(metric.name.as_str()) {
                                     warn_once!(
                                         self.once_tracer,
-                                        "No dataset defined for metric {}, skipping",
+                                        "No writable dataset defined for metric {}, skipping",
                                         metric.name
                                     );
                                     rejected_data_points += data_points_count;
                                     continue;
                                 };
 
-                                let dataset = Arc::clone(&publishers.0);
-                                let data_publishers = Arc::clone(&publishers.1);
-
+                                let schema = record_batch.schema();
                                 let data_update = DataUpdate {
                                     data: vec![record_batch],
+                                    schema,
                                     update_type: UpdateType::Append,
                                 };
 
-                                let mut all_publishers_failed = true;
-                                let data_publishers = data_publishers.read().await;
-                                for publisher in data_publishers.iter() {
-                                    tracing::trace!(
-                                        "Adding OpenTelemetry data for {} to publisher {}",
-                                        metric.name.as_str(),
-                                        publisher.name()
-                                    );
-                                    // We need to await the Future here in case it adds new columns to the schema and later metrics will need
-                                    // to respect that schema.
-                                    match publisher
-                                        .add_data(Arc::clone(&dataset), data_update.clone())
-                                        .await
-                                    {
-                                        Ok(()) => {
-                                            all_publishers_failed = false;
-                                        }
-                                        Err(e) => {
-                                            // Rely on the publisher to provide a useful error message to the user.
-                                            tracing::debug!(
-                                                "Failed to add OpenTelemetry data to backend: {e}"
-                                            );
-                                        }
-                                    }
-                                }
+                                let mut write_failed = false;
+                                if let Err(e) =
+                                    df.write_data(metric.name.as_str(), data_update).await
+                                {
+                                    write_failed = true;
+                                    tracing::debug!("Failed to add OpenTelemetry data: {e}");
+                                };
 
-                                if all_publishers_failed {
+                                if write_failed {
                                     rejected_data_points += data_points_count;
                                 }
                             }

@@ -15,66 +15,45 @@ limitations under the License.
 */
 
 use std::borrow::Borrow;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::databackend::{self, DataBackendBuilder};
+use crate::accelerated_table::AcceleratedTable;
+use crate::dataaccelerator::{self, create_accelerator_table};
 use crate::dataconnector::DataConnector;
-use crate::datapublisher::DataPublisher;
+use crate::dataupdate::{DataUpdate, DataUpdateExecutionPlan, UpdateType};
+use crate::get_dependent_table_names;
+use arrow::datatypes::Schema;
+use datafusion::common::OwnedTableReference;
 use datafusion::datasource::ViewTable;
 use datafusion::error::DataFusionError;
-use datafusion::execution::context::SessionConfig;
-use datafusion::execution::{context::SessionContext, options::ParquetReadOptions};
-use datafusion::sql::parser;
+use datafusion::execution::context::{SessionConfig, SessionContext};
+use datafusion::physical_plan::collect;
 use datafusion::sql::parser::DFParser;
 use datafusion::sql::sqlparser;
-use datafusion::sql::sqlparser::ast::{self, SetExpr, TableFactor};
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
-use futures::StreamExt;
+use secrets::Secret;
 use snafu::prelude::*;
-use spicepod::component::dataset::Dataset;
-use tokio::sync::RwLock;
+use spicepod::component::dataset::{Dataset, Mode};
+use tokio::spawn;
 use tokio::time::{sleep, Instant};
-use tokio::{spawn, task};
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to register parquet file {file}: {source}"))]
-    RegisterParquet {
-        source: DataFusionError,
-        file: String,
-    },
-
     #[snafu(display("Table already exists"))]
     TableAlreadyExists {},
 
-    #[snafu(display("Unable to get table: {source}"))]
-    DatasetConfigurationError {
-        source: databackend::Error,
-    },
-
-    #[snafu(display("Invalid configuration: {msg}"))]
-    InvalidConfiguration {
-        msg: String,
-    },
-
     #[snafu(display("Unable to create dataset acceleration: {source}"))]
-    UnableToCreateBackend {
-        source: databackend::Error,
-    },
+    UnableToCreateDataAccelerator { source: dataaccelerator::Error },
 
     #[snafu(display("Unable to create view: {reason}"))]
-    UnableToCreateView {
-        reason: String,
-    },
+    UnableToCreateView { reason: String },
 
     #[snafu(display("Unable to delete table: {reason}"))]
-    UnableToDeleteTable {
-        reason: String,
-    },
+    UnableToDeleteTable { reason: String },
 
     #[snafu(display("Unable to parse SQL: {source}"))]
     UnableToParseSql {
@@ -82,34 +61,58 @@ pub enum Error {
     },
 
     #[snafu(display("Unable to get table: {source}"))]
-    UnableToGetTable {
+    UnableToGetTable { source: DataFusionError },
+
+    #[snafu(display("Unable to resolve table provider: {source}"))]
+    UnableToResolveTableProvider {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("Table {table_name} was marked as read_write, but the underlying provider only supports reads."))]
+    WriteProviderNotImplemented { table_name: String },
+
+    #[snafu(display("Unable to register table: {source}"))]
+    UnableToRegisterTable { source: crate::dataconnector::Error },
+
+    #[snafu(display("Unable to register table in DataFusion: {source}"))]
+    UnableToRegisterTableToDataFusion { source: DataFusionError },
+
+    #[snafu(display("Expected acceleration settings for {name}, found None"))]
+    ExpectedAccelerationSettings { name: String },
+
+    #[snafu(display("Unable to get object store configuration: {source}"))]
+    InvalidObjectStore {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("The table {table_name} is not writable"))]
+    TableNotWritable { table_name: String },
+
+    #[snafu(display("Unable to plan the table insert for {table_name}: {source}"))]
+    UnableToPlanTableInsert {
+        table_name: String,
         source: DataFusionError,
     },
 
-    #[snafu(display("Unable to register table: {source}"))]
-    UnableToRegisterTable {
-        source: crate::dataconnector::Error,
+    #[snafu(display("Unable to execute the table insert for {table_name}: {source}"))]
+    UnableToExecuteTableInsert {
+        table_name: String,
+        source: DataFusionError,
     },
-
-    #[snafu(display("Unable to create view: {source}"))]
-    InvalidSQLView {
-        source: spicepod::component::dataset::Error,
-    },
-
-    #[snafu(display("Expected a SQL view statement, received nothing."))]
-    ExpectedSqlView,
-
-    InvalidObjectStore,
 }
 
-type PublisherList = Arc<RwLock<Vec<Arc<Box<dyn DataPublisher>>>>>;
-
-type DatasetAndPublishers = (Arc<Dataset>, PublisherList);
+pub enum Table {
+    Accelerated {
+        source: Arc<dyn DataConnector>,
+        acceleration_secret: Option<Secret>,
+    },
+    Federated(Arc<dyn DataConnector>),
+    View(String),
+}
 
 pub struct DataFusion {
     pub ctx: Arc<SessionContext>,
-    connectors_tasks: HashMap<String, task::JoinHandle<()>>,
-    data_publishers: HashMap<String, DatasetAndPublishers>,
+    data_writers: HashSet<String>,
 }
 
 impl DataFusion {
@@ -119,127 +122,78 @@ impl DataFusion {
         df_config.options_mut().sql_parser.dialect = "PostgreSQL".to_string();
         DataFusion {
             ctx: Arc::new(SessionContext::new_with_config(df_config)),
-            connectors_tasks: HashMap::new(),
-            data_publishers: HashMap::new(),
+            data_writers: HashSet::new(),
         }
     }
 
-    pub async fn register_parquet(&self, table_name: &str, path: &str) -> Result<()> {
-        self.ctx
-            .register_parquet(table_name, path, ParquetReadOptions::default())
-            .await
-            .context(RegisterParquetSnafu { file: path })
-    }
-
-    pub async fn attach_publisher(
+    pub async fn register_table(
         &mut self,
-        table_name: &str,
-        dataset: Dataset,
-        publisher: Arc<Box<dyn DataPublisher>>,
+        dataset: impl Borrow<Dataset>,
+        table: Table,
     ) -> Result<()> {
-        let entry = self
-            .data_publishers
-            .entry(table_name.to_string())
-            .or_insert_with(|| {
-                // If it does not exist, initialize it with the dataset and a new Vec for publishers
-                (Arc::new(dataset), Arc::new(RwLock::new(Vec::new())))
-            });
-
-        entry.1.write().await.push(publisher);
+        let dataset = dataset.borrow();
+        match table {
+            Table::Accelerated {
+                source,
+                acceleration_secret,
+            } => {
+                self.register_accelerated_table(dataset, source, acceleration_secret)
+                    .await?;
+            }
+            Table::Federated(source) => self.register_federated_table(dataset, source).await?,
+            Table::View(sql) => self.register_view(&dataset.name, sql)?,
+        }
 
         Ok(())
     }
 
-    #[allow(clippy::needless_pass_by_value)]
-    pub async fn new_accelerated_backend(
-        &self,
-        dataset: impl Borrow<Dataset>,
-        secrets_provider: Arc<RwLock<secrets::SecretsProvider>>,
-    ) -> Result<Box<dyn DataPublisher>> {
-        let dataset = dataset.borrow();
-        let table_name = dataset.name.to_string();
-        let acceleration =
-            dataset
-                .acceleration
-                .as_ref()
-                .ok_or_else(|| Error::InvalidConfiguration {
-                    msg: "No acceleration configuration found".to_string(),
-                })?;
-
-        let params: Arc<Option<HashMap<String, String>>> =
-            Arc::new(dataset.acceleration_params().clone());
-
-        let secret_key = dataset
-            .engine_secret()
-            .unwrap_or(format!("{:?}_engine", acceleration.engine()).to_lowercase());
-        let backend_secret = secrets_provider.read().await.get_secret(&secret_key).await;
-
-        let data_backend: Box<dyn DataPublisher> =
-            DataBackendBuilder::new(Arc::clone(&self.ctx), table_name)
-                .engine(acceleration.engine())
-                .mode(acceleration.mode())
-                .params(params)
-                .secret(backend_secret)
-                .build()
-                .await
-                .context(DatasetConfigurationSnafu)?;
-
-        Ok(data_backend)
-    }
-
     #[must_use]
-    #[allow(clippy::borrowed_box)]
-    pub fn get_publishers(&self, dataset: &str) -> Option<&DatasetAndPublishers> {
-        self.data_publishers.get(dataset)
+    pub fn is_writable(&self, table_name: &str) -> bool {
+        self.data_writers.iter().any(|s| s.as_str() == table_name)
     }
 
-    #[must_use]
-    pub fn has_publishers(&self, dataset: &str) -> bool {
-        self.data_publishers.contains_key(dataset)
+    pub async fn write_data(&self, table_name: &str, data_update: DataUpdate) -> Result<()> {
+        if !self.is_writable(table_name) {
+            TableNotWritableSnafu {
+                table_name: table_name.to_string(),
+            }
+            .fail()?;
+        }
+
+        let table_provider = self
+            .ctx
+            .table_provider(OwnedTableReference::bare(table_name.to_string()))
+            .await
+            .context(UnableToGetTableSnafu)?;
+
+        let overwrite = data_update.update_type == UpdateType::Overwrite;
+        let insert_plan = table_provider
+            .insert_into(
+                &self.ctx.state(),
+                Arc::new(DataUpdateExecutionPlan::new(data_update)),
+                overwrite,
+            )
+            .await
+            .context(UnableToPlanTableInsertSnafu {
+                table_name: table_name.to_string(),
+            })?;
+
+        let _ = collect(insert_plan, self.ctx.task_ctx()).await.context(
+            UnableToExecuteTableInsertSnafu {
+                table_name: table_name.to_string(),
+            },
+        )?;
+
+        Ok(())
     }
 
-    pub async fn get_arrow_schema(&self, dataset: &str) -> Result<arrow::datatypes::Schema> {
+    pub async fn get_arrow_schema(&self, dataset: &str) -> Result<Schema> {
         let data_frame = self
             .ctx
             .table(dataset)
             .await
             .context(UnableToGetTableSnafu)?;
-        Ok(arrow::datatypes::Schema::from(data_frame.schema()))
-    }
-
-    #[allow(clippy::needless_pass_by_value)]
-    pub fn attach_connector_to_publisher(
-        &mut self,
-        dataset: Dataset,
-        data_connector: Box<dyn DataConnector>,
-        publisher: Arc<Box<dyn DataPublisher>>,
-    ) -> Result<()> {
-        let table_name = dataset.name.clone();
-        let table_exists = self.ctx.table_exist(table_name.as_str()).unwrap_or(false);
-        if table_exists {
-            return TableAlreadyExistsSnafu.fail();
-        }
-
-        let task_handle = task::spawn(async move {
-            let dataset = Arc::new(dataset);
-            let mut stream = data_connector.get_data(&dataset);
-            loop {
-                let future_result = stream.next().await;
-                match future_result {
-                    Some(data_update) => {
-                        match publisher.add_data(Arc::clone(&dataset), data_update).await {
-                            Ok(()) => (),
-                            Err(e) => tracing::error!("Error adding data: {e}"),
-                        }
-                    }
-                    None => break,
-                };
-            }
-        });
-
-        self.connectors_tasks.insert(table_name, task_handle);
-
-        Ok(())
+        Ok(Schema::from(data_frame.schema()))
     }
 
     #[must_use]
@@ -259,91 +213,128 @@ impl DataFusion {
             .fail();
         }
 
-        if self.connectors_tasks.contains_key(dataset_name) {
-            if let Some(data_connector_stream) = self.connectors_tasks.remove(dataset_name) {
-                data_connector_stream.abort();
-            }
-        }
-
-        if self.data_publishers.contains_key(dataset_name) {
-            self.data_publishers.remove(dataset_name);
+        if self.is_writable(dataset_name) {
+            self.data_writers.remove(dataset_name);
         }
 
         Ok(())
     }
 
-    #[allow(clippy::needless_pass_by_value)]
-    pub async fn attach_mesh(
-        &self,
-        dataset: impl Borrow<Dataset>,
-        data_connector: Box<dyn DataConnector>,
+    async fn register_accelerated_table(
+        &mut self,
+        dataset: &Dataset,
+        source: Arc<dyn DataConnector>,
+        acceleration_secret: Option<Secret>,
     ) -> Result<()> {
-        let dataset = dataset.borrow();
+        tracing::debug!("Registering accelerated table {dataset:?}");
+        let obj_store = source
+            .get_object_store(dataset)
+            .transpose()
+            .context(InvalidObjectStoreSnafu)?;
 
-        if data_connector.has_object_store() {
-            let Ok((key, store)) = data_connector.get_object_store(dataset) else {
-                return Err(Error::InvalidObjectStore);
-            };
+        let source_table_provider = match dataset.mode() {
+            Mode::Read => source
+                .read_provider(dataset)
+                .await
+                .context(UnableToResolveTableProviderSnafu)?,
+            Mode::ReadWrite => source
+                .read_write_provider(dataset)
+                .await
+                .ok_or_else(|| {
+                    WriteProviderNotImplementedSnafu {
+                        table_name: dataset.name.to_string(),
+                    }
+                    .build()
+                })?
+                .context(UnableToResolveTableProviderSnafu)?,
+        };
 
-            let _ = self
-                .ctx
+        let source_schema = source_table_provider.schema();
+        let acceleration_settings =
+            dataset
+                .acceleration
+                .clone()
+                .ok_or_else(|| Error::ExpectedAccelerationSettings {
+                    name: dataset.name.to_string(),
+                })?;
+
+        let accelerated_table_provider = create_accelerator_table(
+            &dataset.name,
+            source_schema,
+            &acceleration_settings,
+            acceleration_secret,
+        )
+        .await
+        .context(UnableToCreateDataAcceleratorSnafu)?;
+
+        let accelerated_table = AcceleratedTable::new(
+            dataset.name.to_string(),
+            source_table_provider,
+            accelerated_table_provider,
+            acceleration_settings.refresh_mode.clone(),
+            dataset.refresh_interval(),
+            obj_store,
+        );
+
+        self.ctx
+            .register_table(&dataset.name, Arc::new(accelerated_table))
+            .context(UnableToRegisterTableToDataFusionSnafu)?;
+
+        Ok(())
+    }
+
+    /// Federated tables are attached directly as tables visible in the public `DataFusion` context.
+    async fn register_federated_table(
+        &self,
+        dataset: &Dataset,
+        source: Arc<dyn DataConnector>,
+    ) -> Result<()> {
+        tracing::debug!("Registering federated table {dataset:?}");
+        if let Some(obj_store_result) = source.get_object_store(dataset) {
+            let (key, store) = obj_store_result.context(InvalidObjectStoreSnafu)?;
+
+            tracing::debug!("Registered object_store for {key}");
+            self.ctx
                 .runtime_env()
                 .register_object_store(&key, Arc::clone(&store));
         }
 
-        let table_exists = self.ctx.table_exist(dataset.name.as_str()).unwrap_or(false);
+        let table_exists = self.ctx.table_exist(&dataset.name).unwrap_or(false);
         if table_exists {
             return TableAlreadyExistsSnafu.fail();
         }
 
-        let provider = data_connector.get_table_provider(dataset).await;
-
-        match provider {
-            Ok(provider) => {
-                let _ = self
-                    .ctx
-                    .register_table(dataset.name.as_str(), Arc::clone(&provider));
-                Ok(())
-            }
-            Err(error) => Err(Error::UnableToRegisterTable { source: error }),
-        }
-    }
-
-    pub fn get_view_dependent_tables(&self, dataset: impl Borrow<Dataset>) -> Result<Vec<String>> {
-        let ds = dataset.borrow();
-
-        let Some(sql) = ds.view_sql().context(InvalidSQLViewSnafu)? else {
-            return ExpectedSqlViewSnafu.fail();
+        let source_table_provider = match dataset.mode() {
+            Mode::Read => source
+                .read_provider(dataset)
+                .await
+                .context(UnableToResolveTableProviderSnafu)?,
+            Mode::ReadWrite => source
+                .read_write_provider(dataset)
+                .await
+                .ok_or_else(|| {
+                    WriteProviderNotImplementedSnafu {
+                        table_name: dataset.name.to_string(),
+                    }
+                    .build()
+                })?
+                .context(UnableToResolveTableProviderSnafu)?,
         };
 
-        let statements = DFParser::parse_sql_with_dialect(sql.as_str(), &PostgreSqlDialect {})
-            .context(UnableToParseSqlSnafu)?;
+        self.ctx
+            .register_table(&dataset.name, source_table_provider)
+            .context(UnableToRegisterTableToDataFusionSnafu)?;
 
-        if statements.len() != 1 {
-            return UnableToCreateViewSnafu {
-                reason: format!(
-                    "Expected 1 statement to create view from, received {}",
-                    statements.len()
-                )
-                .to_string(),
-            }
-            .fail();
-        }
-
-        Ok(DataFusion::get_dependent_table_names(&statements[0]))
+        Ok(())
     }
 
-    pub fn attach_view(&self, dataset: impl Borrow<Dataset>) -> Result<()> {
-        let dataset = dataset.borrow();
-        let table_exists = self.ctx.table_exist(dataset.name.as_str()).unwrap_or(false);
+    fn register_view(&self, table_name: &str, view: String) -> Result<()> {
+        let table_exists = self.ctx.table_exist(table_name).unwrap_or(false);
         if table_exists {
             return TableAlreadyExistsSnafu.fail();
         }
 
-        let Some(sql) = dataset.view_sql().context(InvalidSQLViewSnafu)? else {
-            return ExpectedSqlViewSnafu.fail();
-        };
-        let statements = DFParser::parse_sql_with_dialect(sql.as_str(), &PostgreSqlDialect {})
+        let statements = DFParser::parse_sql_with_dialect(view.as_str(), &PostgreSqlDialect {})
             .context(UnableToParseSqlSnafu)?;
         if statements.len() != 1 {
             return UnableToCreateViewSnafu {
@@ -356,8 +347,8 @@ impl DataFusion {
             .fail();
         }
 
-        let ctx = self.ctx.clone();
-        let table_name = dataset.name.clone();
+        let ctx = Arc::clone(&self.ctx);
+        let table_name = table_name.to_string();
         spawn(async move {
             // Tables are currently lazily created (i.e. not created until first data is received) so that we know the table schema.
             // This means that we can't create a view on top of a table until the first data is received for all dependent tables and therefore
@@ -365,7 +356,7 @@ impl DataFusion {
 
             let deadline = Instant::now() + Duration::from_secs(60);
             let mut unresolved_dependent_table: Option<String> = None;
-            let dependent_table_names = DataFusion::get_dependent_table_names(&statements[0]);
+            let dependent_table_names = get_dependent_table_names(&statements[0]);
             for dependent_table_name in dependent_table_names {
                 let mut attempts = 0;
 
@@ -404,14 +395,17 @@ impl DataFusion {
                 }
             };
 
-            let view = match ViewTable::try_new(plan, Some(sql.to_string())) {
-                Ok(view) => view,
+            let view_table = match ViewTable::try_new(plan, Some(view)) {
+                Ok(view_table) => view_table,
                 Err(e) => {
                     tracing::error!("Failed to create view: {e}");
                     return;
                 }
             };
-            if let Err(e) = ctx.register_table(table_name.as_str(), Arc::new(view)) {
+            if let Err(e) = ctx.register_table(
+                OwnedTableReference::bare(table_name.clone()),
+                Arc::new(view_table),
+            ) {
                 tracing::error!("Failed to create view: {e}");
             };
 
@@ -419,81 +413,6 @@ impl DataFusion {
         });
 
         Ok(())
-    }
-
-    fn get_dependent_table_names(statement: &parser::Statement) -> Vec<String> {
-        let mut table_names = Vec::new();
-        let mut cte_names = HashSet::new();
-
-        if let parser::Statement::Statement(statement) = statement.clone() {
-            if let ast::Statement::Query(statement) = *statement {
-                // Collect names of CTEs
-                if let Some(with) = statement.with {
-                    for table in with.cte_tables {
-                        cte_names.insert(table.alias.name.to_string());
-                        let cte_table_names =
-                            DataFusion::get_dependent_table_names(&parser::Statement::Statement(
-                                Box::new(ast::Statement::Query(table.query)),
-                            ));
-                        // Extend table_names with names found in CTEs if they reference actual tables
-                        table_names.extend(cte_table_names);
-                    }
-                }
-                // Process the main query body
-                if let SetExpr::Select(select_statement) = *statement.body {
-                    for from in select_statement.from {
-                        let mut relations = vec![];
-                        relations.push(from.relation.clone());
-                        for join in from.joins {
-                            relations.push(join.relation.clone());
-                        }
-
-                        for relation in relations {
-                            match relation {
-                                TableFactor::Table {
-                                    name,
-                                    alias: _,
-                                    args: _,
-                                    with_hints: _,
-                                    version: _,
-                                    partitions: _,
-                                } => {
-                                    table_names.push(name.to_string());
-                                }
-                                TableFactor::Derived {
-                                    lateral: _,
-                                    subquery,
-                                    alias: _,
-                                } => {
-                                    table_names.extend(DataFusion::get_dependent_table_names(
-                                        &parser::Statement::Statement(Box::new(
-                                            ast::Statement::Query(subquery),
-                                        )),
-                                    ));
-                                }
-                                _ => (),
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Filter out CTEs and temporary views (aliases of subqueries)
-        table_names
-            .into_iter()
-            .filter(|name| !cte_names.contains(name))
-            .collect()
-    }
-}
-
-impl Drop for DataFusion {
-    fn drop(&mut self) {
-        for task in self.connectors_tasks.values() {
-            task.abort();
-        }
-
-        self.connectors_tasks.clear();
     }
 }
 
