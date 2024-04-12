@@ -38,6 +38,7 @@ use std::future::Future;
 #[cfg(feature = "databricks")]
 pub mod databricks;
 pub mod dremio;
+pub mod duckdb;
 #[cfg(feature = "flightsql")]
 pub mod flightsql;
 pub mod localhost;
@@ -139,6 +140,7 @@ pub async fn register_all() {
     register_connector_factory("mysql", mysql::MySQL::create).await;
     #[cfg(feature = "postgres")]
     register_connector_factory("postgres", postgres::Postgres::create).await;
+    register_connector_factory("duckdb", duckdb::DuckDB::create).await;
 }
 
 pub trait DataConnectorFactory {

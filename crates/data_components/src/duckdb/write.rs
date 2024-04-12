@@ -116,7 +116,7 @@ impl DataSink for DuckDBDataSink {
 
         if self.overwrite {
             self.duckdb
-                .create_table(duckdb_conn, true)
+                .delete_all_table_data(duckdb_conn, true)
                 .map_err(to_datafusion_error)?;
         }
 
