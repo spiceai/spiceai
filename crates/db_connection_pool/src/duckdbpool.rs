@@ -85,7 +85,7 @@ impl DuckDbConnectionPool {
         let path = params
             .as_ref()
             .as_ref()
-            .and_then(|params| params.get("duckdb_file").cloned())
+            .and_then(|params| params.get("open").cloned())
             .ok_or(Error::MissingDuckDBFile {})?;
 
         let manager = DuckdbConnectionManager::file(path).context(DuckDBSnafu)?;
