@@ -34,6 +34,7 @@ pub enum Error {
     #[snafu(display("Unable to create DuckDB connection pool: {source}"))]
     UnableToCreateDuckDBConnectionPool { source: db_connection_pool::Error },
 
+    #[snafu(display("{source}"))]
     UnableToGetReadProvider {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
