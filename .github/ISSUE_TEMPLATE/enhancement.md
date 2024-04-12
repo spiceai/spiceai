@@ -10,7 +10,7 @@ REMEMBER, BE **SMART**!
 
 S: Specific
 M: Measurable
-A: Achiveable
+A: Achievable
 R: Relevant
 T: Time-Bound
 
