@@ -34,15 +34,18 @@ pub(crate) async fn handle(
 ) -> Result<Response<<Service as FlightService>::DoGetStream>, Status> {
     let msg: Any = match Message::decode(&*request.get_ref().ticket) {
         Ok(msg) => msg,
-        Err(_) => return do_get_simple(flight_svc, request).await,
+        Err(_) => return Box::pin(do_get_simple(flight_svc, request)).await,
     };
 
     match Command::try_from(msg).map_err(to_tonic_err)? {
         Command::CommandStatementQuery(command) => {
-            flightsql::statement_query::do_get(flight_svc, command).await
+            Box::pin(flightsql::statement_query::do_get(flight_svc, command)).await
         }
         Command::CommandPreparedStatementQuery(command) => {
-            flightsql::prepared_statement_query::do_get(flight_svc, command).await
+            Box::pin(flightsql::prepared_statement_query::do_get(
+                flight_svc, command,
+            ))
+            .await
         }
         Command::CommandGetCatalogs(command) => {
             flightsql::get_catalogs::do_get(flight_svc, command).await
@@ -69,7 +72,8 @@ async fn do_get_simple(
     match std::str::from_utf8(&ticket.ticket) {
         Ok(sql) => {
             let start = TimeMeasurement::new("flight_do_get_simple_duration_ms", vec![]);
-            let output = Service::sql_to_flight_stream(datafusion, sql.to_owned()).await?;
+            let output =
+                Box::pin(Service::sql_to_flight_stream(datafusion, sql.to_owned())).await?;
 
             let timed_output = TimedStream::new(output, move || start);
 

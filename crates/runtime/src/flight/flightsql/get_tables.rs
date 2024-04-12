@@ -71,7 +71,11 @@ pub(crate) async fn do_get(
             };
 
             for table_name in schema_provider.table_names() {
-                let Some(table_provider) = schema_provider.table(&table_name).await else {
+                let Some(table_provider) = schema_provider
+                    .table(&table_name)
+                    .await
+                    .map_err(to_tonic_err)?
+                else {
                     continue;
                 };
 

@@ -2,9 +2,10 @@ use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::physical_expr::PhysicalSortExpr;
-use datafusion::physical_plan::Partitioning::UnknownPartitioning;
-use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning};
+use datafusion::physical_plan::{
+    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, Partitioning,
+    PlanProperties,
+};
 use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
@@ -16,12 +17,23 @@ pub struct SliceExec {
     input: Arc<dyn ExecutionPlan>,
     /// The partition of the execution plan to return.
     partition: usize,
+    properties: PlanProperties,
 }
 
 impl SliceExec {
     /// Create a new `SliceExec`.
     pub fn new(input: Arc<dyn ExecutionPlan>, partition: usize) -> Self {
-        Self { input, partition }
+        let eq_properties = input.equivalence_properties().clone();
+        let execution_mode = input.execution_mode();
+        Self {
+            input,
+            partition,
+            properties: PlanProperties::new(
+                eq_properties,
+                Partitioning::UnknownPartitioning(1),
+                execution_mode,
+            ),
+        }
     }
 }
 
@@ -39,10 +51,9 @@ impl DisplayAs for SliceExec {
 
 #[async_trait]
 impl ExecutionPlan for SliceExec {
-    // Uncomment after upgrading to DataFusion 37
-    // fn name(&self) -> &'static str {
-    //     "SliceExec"
-    // }
+    fn name(&self) -> &'static str {
+        "SliceExec"
+    }
 
     fn as_any(&self) -> &dyn Any {
         self
@@ -52,12 +63,8 @@ impl ExecutionPlan for SliceExec {
         self.input.schema()
     }
 
-    fn output_partitioning(&self) -> Partitioning {
-        UnknownPartitioning(1)
-    }
-
-    fn output_ordering(&self) -> Option<&[PhysicalSortExpr]> {
-        None
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
     }
 
     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {

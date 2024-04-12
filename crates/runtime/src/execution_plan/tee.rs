@@ -2,10 +2,11 @@ use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::physical_expr::PhysicalSortExpr;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
-use datafusion::physical_plan::Partitioning::UnknownPartitioning;
-use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning};
+use datafusion::physical_plan::{
+    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, Partitioning,
+    PlanProperties,
+};
 use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
@@ -17,12 +18,23 @@ pub struct TeeExec {
     input: Arc<dyn ExecutionPlan>,
     /// The number of times to duplicate the output.
     n: usize,
+    properties: PlanProperties,
 }
 
 impl TeeExec {
     /// Create a new `TeeExec`.
     pub fn new(input: Arc<dyn ExecutionPlan>, n: usize) -> Self {
-        Self { input, n }
+        let eq_properties = input.equivalence_properties().clone();
+        let execution_mode = input.execution_mode();
+        Self {
+            input,
+            n,
+            properties: PlanProperties::new(
+                eq_properties,
+                Partitioning::UnknownPartitioning(n),
+                execution_mode,
+            ),
+        }
     }
 }
 
@@ -40,10 +52,9 @@ impl DisplayAs for TeeExec {
 
 #[async_trait]
 impl ExecutionPlan for TeeExec {
-    // Uncomment after upgrading to DataFusion 37
-    // fn name(&self) -> &'static str {
-    //     "TeeExec"
-    // }
+    fn name(&self) -> &'static str {
+        "TeeExec"
+    }
 
     fn as_any(&self) -> &dyn Any {
         self
@@ -53,12 +64,8 @@ impl ExecutionPlan for TeeExec {
         self.input.schema()
     }
 
-    fn output_partitioning(&self) -> Partitioning {
-        UnknownPartitioning(self.n)
-    }
-
-    fn output_ordering(&self) -> Option<&[PhysicalSortExpr]> {
-        None
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
     }
 
     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {

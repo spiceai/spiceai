@@ -17,6 +17,8 @@ limitations under the License.
 #![allow(clippy::missing_errors_doc)]
 
 use async_trait::async_trait;
+use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_plan::{ExecutionMode, Partitioning, PlanProperties};
 use db_connection_pool::dbconnection::{get_schema, query_arrow};
 use db_connection_pool::DbConnectionPool;
 use futures::TryStreamExt;
@@ -159,6 +161,7 @@ struct SqlExec<T, P> {
     pool: Arc<dyn DbConnectionPool<T, P> + Send + Sync>,
     filters: Vec<Expr>,
     limit: Option<usize>,
+    properties: PlanProperties,
 }
 
 impl<T, P> SqlExec<T, P> {
@@ -170,14 +173,18 @@ impl<T, P> SqlExec<T, P> {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Self> {
-        tracing::trace!("original schema {:?}", schema);
         let projected_schema = project_schema(schema, projections)?;
         Ok(Self {
-            projected_schema,
+            projected_schema: Arc::clone(&projected_schema),
             table_reference: table_reference.clone(),
             pool,
             filters: filters.to_vec(),
             limit,
+            properties: PlanProperties::new(
+                EquivalenceProperties::new(projected_schema),
+                Partitioning::UnknownPartitioning(1),
+                ExecutionMode::Bounded,
+            ),
         })
     }
 
@@ -189,9 +196,6 @@ impl<T, P> SqlExec<T, P> {
             .map(|f| format!("\"{}\"", f.name()))
             .collect::<Vec<_>>()
             .join(", ");
-
-        tracing::trace!("projected_schema {:?}", self.projected_schema);
-        tracing::trace!("sql columns {columns}");
 
         let limit_expr = match self.limit {
             Some(limit) => format!("LIMIT {limit}"),
@@ -232,6 +236,10 @@ impl<T, P> DisplayAs for SqlExec<T, P> {
 }
 
 impl<T: 'static, P: 'static> ExecutionPlan for SqlExec<T, P> {
+    fn name(&self) -> &'static str {
+        "SqlExec"
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -240,12 +248,8 @@ impl<T: 'static, P: 'static> ExecutionPlan for SqlExec<T, P> {
         self.projected_schema.clone()
     }
 
-    fn output_partitioning(&self) -> datafusion::physical_plan::Partitioning {
-        datafusion::physical_plan::Partitioning::UnknownPartitioning(1)
-    }
-
-    fn output_ordering(&self) -> Option<&[datafusion::physical_expr::PhysicalSortExpr]> {
-        None
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
     }
 
     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {

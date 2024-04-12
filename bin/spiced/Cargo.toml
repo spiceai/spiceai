@@ -20,10 +20,9 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus = "0.13.0"
-object_store = { version = "0.9.0", features = ["aws"] }
 
 [features]
-default = ["duckdb", "postgres", "sqlite", "mysql", "flightsql"]
+default = ["duckdb", "postgres", "sqlite", "mysql", "flightsql", "databricks"]
 duckdb = ["runtime/duckdb", "spicepod/duckdb", "app/duckdb"]
 postgres = ["runtime/postgres", "spicepod/postgres", "app/postgres"]
 sqlite = ["runtime/sqlite", "spicepod/sqlite", "app/sqlite"]
@@ -33,3 +32,4 @@ dev = ["runtime/dev"]
 keyring-secret-store = ["runtime/keyring-secret-store"]
 flightsql = ["runtime/flightsql"]
 aws-secrets-manager = ["runtime/aws-secrets-manager"]
+databricks = ["runtime/databricks"]

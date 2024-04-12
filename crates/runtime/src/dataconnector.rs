@@ -35,6 +35,7 @@ use url::Url;
 use secrets::Secret;
 use std::future::Future;
 
+#[cfg(feature = "databricks")]
 pub mod databricks;
 pub mod dremio;
 #[cfg(feature = "flightsql")]
