@@ -55,9 +55,6 @@ pub enum Error {
     #[snafu(display("Failed to read cert : {source}"))]
     FailedToReadCertError { source: std::io::Error },
 
-    #[snafu(display("Failed to parse cert : {source}"))]
-    FailedToParseCertError { source: pem::PemError },
-
     #[snafu(display("Failed to load cert : {source}"))]
     FailedToLoadCertError { source: native_tls::Error },
 }
@@ -122,12 +119,12 @@ impl PostgresConnectionPool {
                     }
                 }
                 if let Some(pg_sslrootcert) = params.get("pg_sslrootcert") {
-                    if !std::path::Path::new(pg_sslrootcert).exists() {
+                    ensure!(
+                        std::path::Path::new(pg_sslrootcert).exists(),
                         InvalidRootCertPathSnafu {
                             path: pg_sslrootcert,
                         }
-                        .fail()?;
-                    }
+                    );
 
                     ssl_rootcert_path = Some(PathBuf::from(pg_sslrootcert));
                 }
