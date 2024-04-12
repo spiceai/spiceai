@@ -257,7 +257,6 @@ impl AcceleratedTable {
                     }
                 }
                 AccelerationRefreshMode::Full(receiver) => {
-
                     let mut refresh_stream = ReceiverStream::new(receiver);
 
                     while refresh_stream.next().await.is_some() {
