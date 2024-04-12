@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, str::FromStr, sync::Arc};
+use std::{collections::HashMap, path::PathBuf, str::FromStr, sync::Arc};
 
 use async_trait::async_trait;
 use bb8::ErrorSink;
@@ -22,7 +22,7 @@ use bb8_postgres::{
     tokio_postgres::{config::Host, types::ToSql, Config},
     PostgresConnectionManager,
 };
-use native_tls::TlsConnector;
+use native_tls::{Certificate, TlsConnector};
 use ns_lookup::verify_ns_lookup_and_tcp_connect;
 use postgres_native_tls::MakeTlsConnector;
 use secrets::Secret;
@@ -43,8 +43,20 @@ pub enum Error {
         source: bb8::RunError<bb8_postgres::tokio_postgres::Error>,
     },
 
+    #[snafu(display("Invalid parameter: {parameter_name}"))]
+    InvalidParameterError { parameter_name: String },
+
     #[snafu(display("Invalid port: {port}"))]
     InvalidPortError { port: String },
+
+    #[snafu(display("Invalid root cert path: {path}"))]
+    InvalidRootCertPathError { path: String },
+
+    #[snafu(display("Failed to read cert : {source}"))]
+    FailedToReadCertError { source: std::io::Error },
+
+    #[snafu(display("Failed to load cert : {source}"))]
+    FailedToLoadCertError { source: native_tls::Error },
 }
 
 pub struct PostgresConnectionPool {
@@ -62,7 +74,8 @@ impl PostgresConnectionPool {
         secret: Option<Secret>,
     ) -> Result<Self> {
         let mut connection_string = "host=localhost user=postgres dbname=postgres".to_string();
-        let mut accept_invalid_certs = false;
+        let mut ssl_mode = "verify-full";
+        let mut ssl_rootcert_path: Option<PathBuf> = None;
 
         if let Some(params) = params.as_ref() {
             connection_string = String::new();
@@ -93,14 +106,39 @@ impl PostgresConnectionPool {
                     connection_string.push_str(format!("port={pg_port} ").as_str());
                 }
                 if let Some(pg_sslmode) = params.get("pg_sslmode") {
-                    connection_string.push_str(format!("sslmode={pg_sslmode} ").as_str());
+                    match pg_sslmode.to_lowercase().as_str() {
+                        "disable" | "require" | "prefer" | "verify-ca" | "verify-full" => {
+                            ssl_mode = pg_sslmode.as_str();
+                        }
+                        _ => {
+                            InvalidParameterSnafu {
+                                parameter_name: "pg_sslmode".to_string(),
+                            }
+                            .fail()?;
+                        }
+                    }
                 }
-                if let Some(pg_insecure) = params.get("pg_insecure") {
-                    accept_invalid_certs = pg_insecure == "true";
+                if let Some(pg_sslrootcert) = params.get("pg_sslrootcert") {
+                    ensure!(
+                        std::path::Path::new(pg_sslrootcert).exists(),
+                        InvalidRootCertPathSnafu {
+                            path: pg_sslrootcert,
+                        }
+                    );
+
+                    ssl_rootcert_path = Some(PathBuf::from(pg_sslrootcert));
                 }
             }
         }
 
+        let mode = match ssl_mode {
+            "disable" => "disable",
+            "prefer" => "prefer",
+            // tokio_postgres supports only disable, require and prefer
+            _ => "require",
+        };
+
+        connection_string.push_str(format!("sslmode={mode} ").as_str());
         let config = Config::from_str(connection_string.as_str()).context(ConnectionPoolSnafu)?;
 
         for host in config.get_hosts() {
@@ -113,11 +151,15 @@ impl PostgresConnectionPool {
             }
         }
 
-        let connector = TlsConnector::builder()
-            .danger_accept_invalid_certs(accept_invalid_certs)
-            .build()?;
-        let connector = MakeTlsConnector::new(connector);
+        let mut certs: Option<Vec<Certificate>> = None;
 
+        if let Some(path) = ssl_rootcert_path {
+            let buf = tokio::fs::read(path).await.context(FailedToReadCertSnafu)?;
+            certs = Some(parse_certs(&buf)?);
+        }
+
+        let tls_connector = get_tls_connector(ssl_mode, certs)?;
+        let connector = MakeTlsConnector::new(tls_connector);
         let manager = PostgresConnectionManager::new(config, connector);
         let error_sink = PostgresErrorSink::new();
 
@@ -131,6 +173,42 @@ impl PostgresConnectionPool {
             pool: Arc::new(pool),
         })
     }
+}
+
+fn get_tls_connector(
+    ssl_mode: &str,
+    rootcerts: Option<Vec<Certificate>>,
+) -> native_tls::Result<TlsConnector> {
+    let mut builder = TlsConnector::builder();
+
+    if ssl_mode == "disable" {
+        return builder.build();
+    }
+
+    if let Some(certs) = rootcerts {
+        for cert in certs {
+            builder.add_root_certificate(cert);
+        }
+    }
+
+    builder
+        .danger_accept_invalid_hostnames(ssl_mode != "verify-full")
+        .danger_accept_invalid_certs(ssl_mode != "verify-full" && ssl_mode != "verify-ca")
+        .build()
+}
+
+fn parse_certs(buf: &[u8]) -> Result<Vec<Certificate>> {
+    Ok(Certificate::from_der(buf)
+        .map(|x| vec![x])
+        .or_else(|_| {
+            pem::parse_many(buf)
+                .unwrap_or_default()
+                .iter()
+                .map(pem::encode)
+                .map(|s| Certificate::from_pem(s.as_bytes()))
+                .collect()
+        })
+        .context(FailedToLoadCertSnafu)?)
 }
 
 #[derive(Debug, Clone, Copy)]
