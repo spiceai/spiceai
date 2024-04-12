@@ -3,6 +3,7 @@ use std::{any::Any, sync::Arc, time::Duration};
 use arrow::datatypes::SchemaRef;
 use async_stream::stream;
 use async_trait::async_trait;
+use datafusion::common::OwnedTableReference;
 use datafusion::error::Result as DataFusionResult;
 use datafusion::execution::context::SessionState;
 use datafusion::logical_expr::TableProviderFilterPushDown;
@@ -78,6 +79,7 @@ impl AcceleratedTable {
         accelerator: Arc<dyn TableProvider>,
         refresh_mode: RefreshMode,
         refresh_interval: Option<Duration>,
+        refresh_sql: Option<String>,
         object_store: Option<(Url, Arc<dyn ObjectStore + 'static>)>,
     ) -> Self {
         let mut refresh_trigger = None;
@@ -98,6 +100,7 @@ impl AcceleratedTable {
             dataset_name,
             Arc::clone(&federated),
             acceleration_refresh_mode,
+            refresh_sql,
             Arc::clone(&accelerator),
             object_store,
         ));
@@ -156,6 +159,7 @@ impl AcceleratedTable {
         dataset_name: String,
         federated: Arc<dyn TableProvider>,
         acceleration_refresh_mode: AccelerationRefreshMode,
+        refresh_sql: Option<String>,
         accelerator: Arc<dyn TableProvider>,
         object_store: Option<(Url, Arc<dyn ObjectStore + 'static>)>,
     ) {
@@ -163,6 +167,7 @@ impl AcceleratedTable {
             dataset_name.clone(),
             federated,
             acceleration_refresh_mode,
+            refresh_sql,
             object_store,
         );
 
@@ -205,12 +210,19 @@ impl AcceleratedTable {
         dataset_name: String,
         federated: Arc<dyn TableProvider>,
         acceleration_refresh_mode: AccelerationRefreshMode,
+        refresh_sql: Option<String>,
         object_store: Option<(Url, Arc<dyn ObjectStore + 'static>)>,
     ) -> BoxStream<'a, Result<DataUpdate>> {
-        let ctx = SessionContext::new();
+        let mut ctx = SessionContext::new();
         if let Some((ref url, ref object_store)) = object_store {
             ctx.runtime_env()
                 .register_object_store(url, Arc::clone(object_store));
+        }
+        if let Err(e) = ctx.register_table(
+            OwnedTableReference::bare(dataset_name.clone()),
+            Arc::clone(&federated),
+        ) {
+            tracing::error!("Unable to register federated table: {e}");
         }
 
         Box::pin(stream! {
@@ -244,14 +256,13 @@ impl AcceleratedTable {
                     }
                 }
                 AccelerationRefreshMode::Full(receiver) => {
-
                     let mut refresh_stream = ReceiverStream::new(receiver);
 
                     while refresh_stream.next().await.is_some() {
                         tracing::info!("Refreshing data for {dataset_name}");
                         status::update_dataset(&dataset_name, status::ComponentStatus::Refreshing);
                         let timer = TimeMeasurement::new("load_dataset_duration_ms", vec![("dataset", dataset_name.clone())]);
-                        let all_data = match get_all_data(&ctx, federated.as_ref()).await {
+                        let all_data = match get_all_data(&mut ctx, OwnedTableReference::bare(dataset_name.clone()), Arc::clone(&federated), refresh_sql.clone()).await {
                             Ok(data) => data,
                             Err(e) => {
                                 tracing::error!("Error refreshing data for {dataset_name}: {e}");
