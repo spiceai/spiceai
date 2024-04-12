@@ -96,7 +96,8 @@ pub(crate) async fn do_get(
         Ok(sql) => {
             let start =
                 TimeMeasurement::new("flight_do_get_prepared_statement_query_duration_ms", vec![]);
-            let output = Service::sql_to_flight_stream(datafusion, sql.to_owned()).await?;
+            let output =
+                Box::pin(Service::sql_to_flight_stream(datafusion, sql.to_owned())).await?;
             let timed_output = TimedStream::new(output, move || start);
             Ok(Response::new(
                 Box::pin(timed_output) as <Service as FlightService>::DoGetStream

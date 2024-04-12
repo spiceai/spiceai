@@ -21,7 +21,7 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
 use arrow::ipc::writer::{DictionaryTracker, IpcDataGenerator};
 use arrow_flight::encode::FlightDataEncoderBuilder;
-use arrow_flight::{Action, ActionType, Criteria, IpcMessage, SchemaResult};
+use arrow_flight::{Action, ActionType, Criteria, IpcMessage, PollInfo, SchemaResult};
 use arrow_ipc::writer::IpcWriteOptions;
 use bytes::Bytes;
 use datafusion::error::DataFusionError;
@@ -89,7 +89,14 @@ impl FlightService for Service {
     ) -> Result<Response<FlightInfo>, Status> {
         measure_scope_ms!("flight_get_flight_info_request_duration_ms");
         metrics::counter!("flight_get_flight_info_requests").increment(1);
-        get_flight_info::handle(self, request).await
+        Box::pin(get_flight_info::handle(self, request)).await
+    }
+
+    async fn poll_flight_info(
+        &self,
+        _request: Request<FlightDescriptor>,
+    ) -> Result<Response<PollInfo>, Status> {
+        Err(Status::unimplemented("Not yet implemented"))
     }
 
     async fn get_schema(
@@ -106,7 +113,7 @@ impl FlightService for Service {
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
         metrics::counter!("flight_do_get_requests").increment(1);
-        do_get::handle(self, request).await
+        Box::pin(do_get::handle(self, request)).await
     }
 
     async fn do_put(
@@ -130,7 +137,7 @@ impl FlightService for Service {
         request: Request<Action>,
     ) -> Result<Response<Self::DoActionStream>, Status> {
         metrics::counter!("flight_do_action_requests").increment(1);
-        actions::do_action(self, request).await
+        Box::pin(actions::do_action(self, request)).await
     }
 
     async fn list_actions(

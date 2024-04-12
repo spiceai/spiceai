@@ -14,7 +14,7 @@ datasets:
       pg_db: tpch
       pg_user: postgres
       pg_pass: postgres
-      pg_insecure: "true"
+      pg_sslmode: prefer
 
   - from: postgres:lineitem
     name: lineitem
@@ -27,7 +27,7 @@ datasets:
       pg_db: tpch
       pg_user: postgres
       pg_pass: postgres
-      pg_insecure: "true"
+      pg_sslmode: prefer
 
   - from: postgres:nation
     name: nation
@@ -40,7 +40,7 @@ datasets:
       pg_db: tpch
       pg_user: postgres
       pg_pass: postgres
-      pg_insecure: "true"
+      pg_sslmode: prefer
 
   - from: postgres:orders
     name: orders
@@ -53,7 +53,7 @@ datasets:
       pg_db: tpch
       pg_user: postgres
       pg_pass: postgres
-      pg_insecure: "true"
+      pg_sslmode: prefer
 
   - from: postgres:part
     name: part
@@ -66,7 +66,7 @@ datasets:
       pg_db: tpch
       pg_user: postgres
       pg_pass: postgres
-      pg_insecure: "true"
+      pg_sslmode: prefer
 
   - from: postgres:partsupp
     name: partsupp
@@ -79,7 +79,7 @@ datasets:
       pg_db: tpch
       pg_user: postgres
       pg_pass: postgres
-      pg_insecure: "true"
+      pg_sslmode: prefer
 
   - from: postgres:region
     name: region
@@ -92,7 +92,7 @@ datasets:
       pg_db: tpch
       pg_user: postgres
       pg_pass: postgres
-      pg_insecure: "true"
+      pg_sslmode: prefer
   
   - from: postgres:supplier
     name: supplier
@@ -105,7 +105,7 @@ datasets:
       pg_db: tpch
       pg_user: postgres
       pg_pass: postgres
-      pg_insecure: "true"
+      pg_sslmode: prefer
 
 secrets:
   store: env

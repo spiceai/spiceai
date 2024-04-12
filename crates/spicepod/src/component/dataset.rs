@@ -14,11 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, fs, time::Duration};
+use std::{fs, time::Duration};
 
 use serde::{Deserialize, Serialize};
 
-use super::WithDependsOn;
+use super::{params::Params, WithDependsOn};
 use snafu::prelude::*;
 
 #[derive(Debug, Snafu)]
@@ -59,7 +59,7 @@ pub struct Dataset {
     sql_ref: Option<String>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub params: Option<HashMap<String, String>>,
+    pub params: Option<Params>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replication: Option<replication::Replication>,
@@ -148,7 +148,7 @@ impl Dataset {
     }
 
     #[must_use]
-    pub fn acceleration_params(&self) -> Option<HashMap<String, String>> {
+    pub fn acceleration_params(&self) -> Option<Params> {
         if let Some(acceleration) = &self.acceleration {
             return acceleration.params.clone();
         }
@@ -240,7 +240,9 @@ impl WithDependsOn<Dataset> for Dataset {
 
 pub mod acceleration {
     use serde::{Deserialize, Serialize};
-    use std::{collections::HashMap, fmt::Display, sync::Arc};
+    use std::{fmt::Display, sync::Arc};
+
+    use crate::component::params::Params;
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
     #[serde(rename_all = "lowercase")]
@@ -256,6 +258,15 @@ pub mod acceleration {
         #[default]
         Memory,
         File,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+    #[serde(rename_all = "snake_case")]
+    pub enum TimeFormat {
+        #[default]
+        UnixSeconds,
+        UnixMillis,
+        Iso8601,
     }
 
     impl Display for Mode {
@@ -288,10 +299,25 @@ pub mod acceleration {
         pub retention: Option<String>,
 
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub params: Option<HashMap<String, String>>,
+        pub params: Option<Params>,
 
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub engine_secret: Option<String>,
+
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub time_column: Option<String>,
+
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub time_format: Option<TimeFormat>,
+
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub retention_period: Option<String>,
+
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub retention_check_interval: Option<String>,
+
+        #[serde(default)]
+        pub retention_enabled: bool,
     }
 
     const fn default_true() -> bool {

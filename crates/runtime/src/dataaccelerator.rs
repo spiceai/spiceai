@@ -215,8 +215,12 @@ pub async fn create_accelerator_table(
     acceleration_settings: &acceleration::Acceleration,
     acceleration_secret: Option<Secret>,
 ) -> Result<Arc<dyn TableProvider>> {
-    let params: Arc<Option<HashMap<String, String>>> =
-        Arc::new(acceleration_settings.params.clone());
+    let params = Arc::new(
+        acceleration_settings
+            .params
+            .clone()
+            .map(|params| params.as_string_map()),
+    );
 
     let table_name = table_name.to_string();
 
