@@ -254,6 +254,14 @@ impl Runtime {
                     Err(err) => {
                         status::update_dataset(&ds.name, status::ComponentStatus::Error);
                         metrics::counter!("datasets_load_error").increment(1);
+                        if let Error::UnableToAttachDataConnector {
+                            source: datafusion::Error::RefreshSql { source },
+                            data_connector: _,
+                        } = &err
+                        {
+                            tracing::error!("{source}");
+                            return;
+                        }
                         warn_spaced!(
                             spaced_tracer,
                             "Failed to initialize data connector for dataset {}, retrying: {err}",
