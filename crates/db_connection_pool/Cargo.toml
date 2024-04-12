@@ -20,9 +20,11 @@ bb8 = { workspace = true, optional = true }
 bb8-postgres = { workspace = true, optional = true }
 arrow_sql_gen = { path = "../arrow_sql_gen", optional = true }
 arrow.workspace = true
+pem = { workspace = true, optional = true }
 secrets = { path = "../secrets" }
 spicepod = { path = "../spicepod" }
 rusqlite = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
 tokio-rusqlite = { workspace = true, optional = true }
 mysql_async = { workspace = true, optional = true }
 ns_lookup = { path = "../ns_lookup" }
@@ -39,6 +41,8 @@ postgres = [
     "dep:bb8-postgres",
     "dep:postgres-native-tls",
     "dep:native-tls",
+    "dep:pem",
+    "dep:tokio",
     "arrow_sql_gen/postgres",
     "spicepod/postgres",
 ]

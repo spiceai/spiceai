@@ -136,7 +136,7 @@ impl DataSink for DeltaTableDataSink {
             num_rows += batch.num_rows() as u64;
             let _ = DeltaOps(self.delta_table.clone())
                 .write([batch])
-                .with_save_mode(self.save_mode.clone())
+                .with_save_mode(self.save_mode)
                 .await?;
         }
 
