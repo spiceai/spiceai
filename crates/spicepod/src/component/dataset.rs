@@ -260,7 +260,7 @@ pub mod acceleration {
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
     #[serde(rename_all = "snake_case")]
-    pub enum TimeUnit {
+    pub enum TimeFormat {
         #[default]
         UnixSeconds,
         UnixMillis,
@@ -306,7 +306,7 @@ pub mod acceleration {
         pub time_column: Option<String>,
 
         #[serde(default)]
-        pub time_format: TimeUnit,
+        pub time_format: TimeFormat,
 
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub retention_period: Option<String>,
