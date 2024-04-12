@@ -35,15 +35,15 @@ pub enum Error {
     ))]
     ExpectedSingleSqlStatement { num_statements: usize },
 
-    #[snafu(display("The refresh SQL query is invalid: {message}"))]
-    InvalidSqlStatement { message: String },
+    #[snafu(display("Expected a SQL query starting with SELECT * FROM {expected_table}"))]
+    InvalidSqlStatement { expected_table: String },
 
     #[snafu(display("Missing expected SQL statement - this is a bug in Spice.ai"))]
     MissingStatement,
 }
 
 #[allow(clippy::module_name_repetitions)]
-pub fn validate_refresh_sql(refresh_sql: &str) -> Result<()> {
+pub fn validate_refresh_sql(expected_table: &str, refresh_sql: &str) -> Result<()> {
     let mut statements = DFParser::parse_sql_with_dialect(refresh_sql, &PostgreSqlDialect {})
         .context(UnableToParseSqlSnafu)?;
     if statements.len() != 1 {
@@ -52,40 +52,57 @@ pub fn validate_refresh_sql(refresh_sql: &str) -> Result<()> {
         }
         .fail()?;
     }
+
     let statement = statements.pop_front().context(MissingStatementSnafu)?;
     match statement {
         Statement::Statement(statement) => match statement.as_ref() {
             SQLStatement::Query(query) => match query.body.as_ref() {
                 SetExpr::Select(select) => {
-                    if select.projection.len() != 1 {
-                        InvalidSqlStatementSnafu {
-                            message: "Expected a SQL query starting with SELECT *".to_string(),
+                    ensure!(
+                        select.projection.len() == 1,
+                        InvalidSqlStatementSnafu { expected_table }
+                    );
+                    ensure!(
+                        matches!(
+                            select.projection[0],
+                            sqlparser::ast::SelectItem::Wildcard(_)
+                        ),
+                        InvalidSqlStatementSnafu { expected_table }
+                    );
+                    ensure!(
+                        select.from.len() == 1,
+                        InvalidSqlStatementSnafu { expected_table }
+                    );
+
+                    match &select.from[0].relation {
+                        sqlparser::ast::TableFactor::Table {
+                            name,
+                            alias: _,
+                            args: _,
+                            with_hints: _,
+                            version: _,
+                            partitions: _,
+                        } => {
+                            ensure!(
+                                name.0.len() == 1,
+                                InvalidSqlStatementSnafu { expected_table }
+                            );
+                            ensure!(
+                                name.0[0].value.as_str() == expected_table,
+                                InvalidSqlStatementSnafu { expected_table }
+                            );
                         }
-                        .fail()?;
+                        _ => {
+                            InvalidSqlStatementSnafu { expected_table }.fail()?;
+                        }
                     }
 
-                    #[allow(clippy::match_on_vec_items)]
-                    match select.projection[0] {
-                        sqlparser::ast::SelectItem::Wildcard(_) => Ok(()),
-                        _ => InvalidSqlStatementSnafu {
-                            message: "Expected a SQL query starting with SELECT *".to_string(),
-                        }
-                        .fail()?,
-                    }
+                    Ok(())
                 }
-                _ => InvalidSqlStatementSnafu {
-                    message: "Expected a SQL query starting with SELECT *".to_string(),
-                }
-                .fail()?,
+                _ => InvalidSqlStatementSnafu { expected_table }.fail()?,
             },
-            _ => InvalidSqlStatementSnafu {
-                message: "Expected a SQL query starting with SELECT *".to_string(),
-            }
-            .fail()?,
+            _ => InvalidSqlStatementSnafu { expected_table }.fail()?,
         },
-        _ => InvalidSqlStatementSnafu {
-            message: "Expected a SQL query starting with SELECT *".to_string(),
-        }
-        .fail()?,
+        _ => InvalidSqlStatementSnafu { expected_table }.fail()?,
     }
 }

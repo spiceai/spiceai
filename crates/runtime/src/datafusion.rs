@@ -274,7 +274,8 @@ impl DataFusion {
 
         let refresh_sql = dataset.refresh_sql();
         if let Some(refresh_sql) = &refresh_sql {
-            refresh_sql::validate_refresh_sql(refresh_sql.as_str()).context(RefreshSqlSnafu)?;
+            refresh_sql::validate_refresh_sql(&dataset.name, refresh_sql.as_str())
+                .context(RefreshSqlSnafu)?;
         }
 
         let accelerated_table = AcceleratedTable::new(
