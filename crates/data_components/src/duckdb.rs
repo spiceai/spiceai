@@ -108,12 +108,12 @@ impl TableProviderFactory for DuckDBTableProviderFactory {
         );
 
         let schema: SchemaRef = Arc::new(cmd.schema.as_ref().into());
-        let duckdb = DuckDB::new(name.clone(), Arc::clone(&pool));
+        let duckdb = DuckDB::new(name.clone(), Arc::clone(&schema), Arc::clone(&pool));
 
         let mut db_conn = duckdb.connect().await.map_err(to_datafusion_error)?;
         let duckdb_conn = DuckDB::duckdb_conn(&mut db_conn).map_err(to_datafusion_error)?;
         duckdb
-            .create_table(duckdb_conn, schema.clone(), false)
+            .create_table(duckdb_conn, false)
             .map_err(to_datafusion_error)?;
 
         let dyn_pool: Arc<DynDuckDbConnectionPool> = pool;
@@ -138,13 +138,18 @@ fn to_datafusion_error(error: Error) -> DataFusionError {
 #[derive(Clone)]
 pub struct DuckDB {
     table_name: String,
+    schema: SchemaRef,
     pool: Arc<DuckDbConnectionPool>,
 }
 
 impl DuckDB {
     #[must_use]
-    pub fn new(table_name: String, pool: Arc<DuckDbConnectionPool>) -> Self {
-        Self { table_name, pool }
+    pub fn new(table_name: String, schema: SchemaRef, pool: Arc<DuckDbConnectionPool>) -> Self {
+        Self {
+            table_name,
+            schema,
+            pool,
+        }
     }
 
     async fn connect(
@@ -239,12 +244,7 @@ impl DuckDB {
         Ok(())
     }
 
-    fn create_table(
-        &self,
-        duckdb_conn: &mut DuckDbConnection,
-        schema: SchemaRef,
-        drop_if_exists: bool,
-    ) -> Result<()> {
+    fn create_table(&self, duckdb_conn: &mut DuckDbConnection, drop_if_exists: bool) -> Result<()> {
         if self.table_exists(duckdb_conn) {
             if drop_if_exists {
                 let sql = format!(r#"DROP TABLE "{}""#, self.table_name);
@@ -258,7 +258,7 @@ impl DuckDB {
             }
         }
 
-        let empty_record = RecordBatch::new_empty(schema);
+        let empty_record = RecordBatch::new_empty(Arc::clone(&self.schema));
 
         let arrow_params = arrow_recordbatch_to_query_params(empty_record);
         let arrow_params_vec: Vec<&dyn ToSql> = arrow_params
@@ -317,7 +317,11 @@ impl ReadWrite for DuckDBTableFactory {
         let read_provider = Read::table_provider(self, table_reference.clone()).await?;
 
         let table_name = table_reference.to_string();
-        let duckdb = DuckDB::new(table_name, Arc::clone(&self.pool));
+        let duckdb = DuckDB::new(
+            table_name,
+            Arc::clone(&read_provider).schema(),
+            Arc::clone(&self.pool),
+        );
 
         Ok(DuckDBTableWriter::create(read_provider, duckdb))
     }
