@@ -77,7 +77,6 @@ impl PostgresConnectionPool {
         secret: Option<Secret>,
     ) -> Result<Self> {
         let mut connection_string = "host=localhost user=postgres dbname=postgres".to_string();
-        let mut accept_invalid_certs = false;
         let mut ssl_mode = "require";
         let mut ssl_rootcert_path: Option<PathBuf> = None;
 
@@ -122,9 +121,6 @@ impl PostgresConnectionPool {
                         }
                     }
                 }
-                if let Some(pg_insecure) = params.get("pg_insecure") {
-                    accept_invalid_certs = pg_insecure == "true";
-                }
                 if let Some(pg_sslrootcert) = params.get("pg_sslrootcert") {
                     if !std::path::Path::new(pg_sslrootcert).exists() {
                         InvalidRootCertPathSnafu {
@@ -151,18 +147,14 @@ impl PostgresConnectionPool {
             }
         }
 
-        let mut cert: Option<Certificate> = None;
+        let mut certs: Option<Vec<Certificate>> = None;
 
         if let Some(path) = ssl_rootcert_path {
             let buf = tokio::fs::read(path).await.context(FailedToReadCertSnafu)?;
-            let pem = pem::parse(buf).context(FailedToParseCertSnafu)?;
-            cert = Some(
-                Certificate::from_pem(pem::encode(&pem).as_bytes())
-                    .context(FailedToLoadCertSnafu)?,
-            );
+            certs = Some(parse_certs(&buf)?);
         }
 
-        let tls_connector = get_tls_connector(ssl_mode, accept_invalid_certs, cert)?;
+        let tls_connector = get_tls_connector(ssl_mode, certs)?;
         let connector = MakeTlsConnector::new(tls_connector);
         let manager = PostgresConnectionManager::new(config, connector);
         let error_sink = PostgresErrorSink::new();
@@ -181,23 +173,38 @@ impl PostgresConnectionPool {
 
 fn get_tls_connector(
     ssl_mode: &str,
-    allow_insecure: bool,
-    rootcert: Option<Certificate>,
+    rootcerts: Option<Vec<Certificate>>,
 ) -> native_tls::Result<TlsConnector> {
+    let mut builder = TlsConnector::builder();
+
     if ssl_mode == "disable" {
-        return TlsConnector::builder().build();
+        return builder.build();
     }
 
-    if let Some(cert) = rootcert {
-        return TlsConnector::builder()
-            .danger_accept_invalid_certs(allow_insecure)
-            .add_root_certificate(cert)
-            .build();
+    if let Some(certs) = rootcerts {
+        for cert in certs {
+            builder.add_root_certificate(cert);
+        }
     }
 
-    TlsConnector::builder()
-        .danger_accept_invalid_certs(allow_insecure)
+    builder
+        .danger_accept_invalid_hostnames(ssl_mode == "prefer")
+        .danger_accept_invalid_certs(ssl_mode == "prefer")
         .build()
+}
+
+fn parse_certs(buf: &[u8]) -> Result<Vec<Certificate>> {
+    Ok(Certificate::from_der(buf)
+        .map(|x| vec![x])
+        .or_else(|_| {
+            pem::parse_many(buf)
+                .unwrap_or_default()
+                .iter()
+                .map(pem::encode)
+                .map(|s| Certificate::from_pem(s.as_bytes()))
+                .collect()
+        })
+        .context(FailedToLoadCertSnafu)?)
 }
 
 #[derive(Debug, Clone, Copy)]
