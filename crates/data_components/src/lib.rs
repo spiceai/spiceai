@@ -18,7 +18,7 @@ limitations under the License.
 use std::{error::Error, sync::Arc};
 
 use async_trait::async_trait;
-use datafusion::{common::OwnedTableReference, datasource::TableProvider};
+use datafusion::{common::OwnedTableReference, datasource::TableProvider, execution::context::SessionState, logical_expr::Expr, physical_plan::ExecutionPlan};
 
 pub mod arrow;
 pub mod databricks;
@@ -57,4 +57,13 @@ pub trait Stream {
         &self,
         table_reference: OwnedTableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn Error + Send + Sync>>;
+}
+
+#[async_trait]
+pub trait DeleteTableProvider{
+    async fn delete(
+        &self,
+        state: &SessionState,
+        filters: &[Expr],
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>>;
 }

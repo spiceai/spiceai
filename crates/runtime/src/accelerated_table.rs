@@ -3,6 +3,7 @@ use std::{any::Any, sync::Arc, time::Duration};
 use arrow::datatypes::SchemaRef;
 use async_stream::stream;
 use async_trait::async_trait;
+use data_components::DeleteTableProvider;
 use datafusion::common::OwnedTableReference;
 use datafusion::error::Result as DataFusionResult;
 use datafusion::execution::context::SessionState;
@@ -23,7 +24,6 @@ use url::Url;
 
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::Receiver;
-use tokio::time::interval;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::execution_plan::slice::SliceExec;
@@ -62,9 +62,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub(crate) struct AcceleratedTable {
     accelerator: Arc<dyn TableProvider>,
     federated: Arc<dyn TableProvider>,
-    refresh_handle: JoinHandle<()>,
     refresh_trigger: Option<mpsc::Sender<()>>,
-    scheduled_refreshes_handle: Option<JoinHandle<()>>,
+    handlers: Vec<JoinHandle<()>>,
 }
 
 enum AccelerationRefreshMode {
@@ -72,6 +71,7 @@ enum AccelerationRefreshMode {
     Append,
 }
 
+#[allow(clippy::too_many_arguments)]
 impl AcceleratedTable {
     pub async fn new(
         dataset_name: String,
@@ -80,6 +80,11 @@ impl AcceleratedTable {
         refresh_mode: RefreshMode,
         refresh_interval: Option<Duration>,
         refresh_sql: Option<String>,
+        time_column: Option<String>,
+        time_format: Option<String>,
+        retention_check_interval: Option<Duration>,
+        retention_period: Option<Duration>,
+        retention_enabled: bool,
         object_store: Option<(Url, Arc<dyn ObjectStore + 'static>)>,
     ) -> Self {
         let mut refresh_trigger = None;
@@ -90,8 +95,7 @@ impl AcceleratedTable {
             RefreshMode::Full => {
                 let (trigger, receiver) = mpsc::channel::<()>(1);
                 refresh_trigger = Some(trigger.clone());
-                scheduled_refreshes_handle =
-                    Self::schedule_regular_refreshes(refresh_interval, trigger).await;
+                scheduled_refreshes_handle = Self::tick(refresh_interval, trigger).await;
                 AccelerationRefreshMode::Full(receiver)
             }
         };
@@ -105,12 +109,41 @@ impl AcceleratedTable {
             object_store,
         ));
 
+        let mut handlers = vec![];
+        handlers.push(refresh_handle);
+
+        if let Some(scheduled_refreshes_handle) = scheduled_refreshes_handle {
+            handlers.push(scheduled_refreshes_handle);
+        }
+
+        if retention_enabled {
+            if let (
+                Some(time_column),
+                Some(time_format),
+                Some(retention_period),
+                Some(retention_check_interval),
+            ) = (
+                time_column,
+                time_format,
+                retention_period,
+                retention_check_interval,
+            ) {
+                let retention_check_handle = tokio::spawn(Self::start_retention_check(
+                    Arc::clone(&accelerator),
+                    retention_check_interval,
+                    time_column,
+                    time_format,
+                    retention_period,
+                ));
+                handlers.push(retention_check_handle);
+            }
+        }
+
         Self {
             accelerator,
             federated,
-            refresh_handle,
             refresh_trigger,
-            scheduled_refreshes_handle,
+            handlers,
         }
     }
 
@@ -130,13 +163,10 @@ impl AcceleratedTable {
         Ok(())
     }
 
-    async fn schedule_regular_refreshes(
-        refresh_interval: Option<Duration>,
-        refresh_trigger: mpsc::Sender<()>,
-    ) -> Option<JoinHandle<()>> {
-        if let Some(refresh_interval) = refresh_interval {
-            let mut interval_timer = interval(refresh_interval);
-            let trigger = refresh_trigger.clone();
+    async fn tick(interval: Option<Duration>, trigger: mpsc::Sender<()>) -> Option<JoinHandle<()>> {
+        if let Some(refresh_interval) = interval {
+            let mut interval_timer = tokio::time::interval(refresh_interval);
+            let trigger = trigger.clone();
             let handle = tokio::spawn(async move {
                 loop {
                     interval_timer.tick().await;
@@ -148,11 +178,41 @@ impl AcceleratedTable {
             });
 
             return Some(handle);
-        } else if let Err(err) = refresh_trigger.send(()).await {
-            tracing::error!("Failed to trigger refresh: {err}");
+        } else if let Err(err) = trigger.send(()).await {
+            tracing::error!("Failed to trigger: {err}");
         }
 
         None
+    }
+
+    async fn start_retention_check(
+        accelerator: Arc<dyn TableProvider>,
+        interval: Duration,
+        time_column: String,
+        time_format: String,
+        retention_period: Duration,
+    ) {
+        let mut interval_timer = tokio::time::interval(interval);
+        loop {
+            interval_timer.tick().await;
+
+            let deleted_table_provider = accelerator
+                .as_any()
+                .downcast_ref::<&dyn DeleteTableProvider>();
+
+            if let Some(deleted_table_provider) = deleted_table_provider {
+                let ctx = SessionContext::new();
+
+                let plan = deleted_table_provider.delete(&ctx.state(), &[]).await;
+                if let Ok(plan) = plan {
+                    if let Err(e) = collect(plan, ctx.task_ctx()).await {
+                        tracing::error!("Error running retention check: {e}");
+                    };
+                }
+            } else {
+                tracing::error!("Accelerated table does not support delete");
+            }
+        }
     }
 
     async fn start_refresh(
@@ -286,9 +346,8 @@ impl AcceleratedTable {
 
 impl Drop for AcceleratedTable {
     fn drop(&mut self) {
-        self.refresh_handle.abort();
-        if let Some(handle) = &self.scheduled_refreshes_handle {
-            handle.abort();
+        for handler in self.handlers.drain(..) {
+            handler.abort();
         }
     }
 }

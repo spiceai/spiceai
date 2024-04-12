@@ -40,6 +40,8 @@ use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan};
 use futures::StreamExt;
 use tokio::sync::RwLock;
 
+use crate::DeleteTableProvider;
+
 /// Type alias for partition data
 pub type PartitionData = Arc<RwLock<Vec<RecordBatch>>>;
 
@@ -183,6 +185,17 @@ impl TableProvider for MemTable {
 
     fn get_column_default(&self, column: &str) -> Option<&Expr> {
         self.column_defaults.get(column)
+    }
+}
+
+#[async_trait]
+impl DeleteTableProvider for MemTable {
+    async fn delete(
+        &self,
+        _state: &SessionState,
+        _filters: &[Expr],
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        Err(DataFusionError::Plan("Not implemented".to_string()))
     }
 }
 

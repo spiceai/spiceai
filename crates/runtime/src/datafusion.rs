@@ -294,6 +294,11 @@ impl DataFusion {
             acceleration_settings.refresh_mode.clone(),
             dataset.refresh_interval(),
             dataset.refresh_sql(),
+            None,
+            None,
+            None,
+            None,
+            false,
             obj_store,
         )
         .await;
