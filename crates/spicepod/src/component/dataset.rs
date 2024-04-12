@@ -314,15 +314,11 @@ pub mod acceleration {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub retention_check_interval: Option<String>,
 
-        #[serde(default = "default_false")]
+        #[serde(default)]
         pub retention_enabled: bool,
     }
 
     const fn default_true() -> bool {
-        true
-    }
-
-    const fn default_false() -> bool {
         true
     }
 
