@@ -20,6 +20,11 @@ use spicepod::component::dataset::acceleration::RefreshMode;
 use tokio::task::JoinHandle;
 use url::Url;
 
+use tokio::sync::mpsc;
+use tokio::sync::mpsc::Receiver;
+use tokio::time::interval;
+use tokio_stream::wrappers::ReceiverStream;
+
 use crate::execution_plan::slice::SliceExec;
 use crate::execution_plan::tee::TeeExec;
 use crate::{
@@ -30,7 +35,7 @@ use crate::{
 };
 
 #[derive(Debug, Snafu)]
-enum Error {
+pub enum Error {
     #[snafu(display("Unable to get data from connector: {source}"))]
     UnableToGetDataFromConnector { source: dataconnector::Error },
 
@@ -38,9 +43,17 @@ enum Error {
     UnableToScanTableProvider {
         source: datafusion::error::DataFusionError,
     },
+
+    #[snafu(display("Failed to trigger table refresh: {source}"))]
+    FailedToTriggerRefresh {
+        source: tokio::sync::mpsc::error::SendError<()>,
+    },
+
+    #[snafu(display("Manual refresh is not supported for `append` mode"))]
+    ManualRefreshIsNotSupported {},
 }
 
-type Result<T> = std::result::Result<T, Error>;
+pub type Result<T> = std::result::Result<T, Error>;
 
 // An accelerated table consists of a federated table and a local accelerator.
 //
@@ -49,10 +62,17 @@ pub(crate) struct AcceleratedTable {
     accelerator: Arc<dyn TableProvider>,
     federated: Arc<dyn TableProvider>,
     refresh_handle: JoinHandle<()>,
+    refresh_trigger: Option<mpsc::Sender<()>>,
+    scheduled_refreshes_handle: Option<JoinHandle<()>>,
+}
+
+enum AccelerationRefreshMode {
+    Full(Receiver<()>),
+    Append,
 }
 
 impl AcceleratedTable {
-    pub fn new(
+    pub async fn new(
         dataset_name: String,
         federated: Arc<dyn TableProvider>,
         accelerator: Arc<dyn TableProvider>,
@@ -60,11 +80,24 @@ impl AcceleratedTable {
         refresh_interval: Option<Duration>,
         object_store: Option<(Url, Arc<dyn ObjectStore + 'static>)>,
     ) -> Self {
+        let mut refresh_trigger = None;
+        let mut scheduled_refreshes_handle: Option<JoinHandle<()>> = None;
+
+        let acceleration_refresh_mode: AccelerationRefreshMode = match refresh_mode {
+            RefreshMode::Append => AccelerationRefreshMode::Append,
+            RefreshMode::Full => {
+                let (trigger, receiver) = mpsc::channel::<()>(1);
+                refresh_trigger = Some(trigger.clone());
+                scheduled_refreshes_handle =
+                    Self::schedule_regular_refreshes(refresh_interval, trigger).await;
+                AccelerationRefreshMode::Full(receiver)
+            }
+        };
+
         let refresh_handle = tokio::spawn(Self::start_refresh(
             dataset_name,
             Arc::clone(&federated),
-            refresh_mode,
-            refresh_interval,
+            acceleration_refresh_mode,
             Arc::clone(&accelerator),
             object_store,
         ));
@@ -73,22 +106,64 @@ impl AcceleratedTable {
             accelerator,
             federated,
             refresh_handle,
+            refresh_trigger,
+            scheduled_refreshes_handle,
         }
+    }
+
+    #[allow(dead_code)]
+    pub async fn trigger_refresh(&self) -> Result<()> {
+        match &self.refresh_trigger {
+            Some(refresh_trigger) => {
+                refresh_trigger
+                    .send(())
+                    .await
+                    .context(FailedToTriggerRefreshSnafu)?;
+            }
+            None => {
+                ManualRefreshIsNotSupportedSnafu.fail()?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn schedule_regular_refreshes(
+        refresh_interval: Option<Duration>,
+        refresh_trigger: mpsc::Sender<()>,
+    ) -> Option<JoinHandle<()>> {
+        if let Some(refresh_interval) = refresh_interval {
+            let mut interval_timer = interval(refresh_interval);
+            let trigger = refresh_trigger.clone();
+            let handle = tokio::spawn(async move {
+                loop {
+                    interval_timer.tick().await;
+                    // If sending fails, it means the receiver is dropped, and we should stop the task.
+                    if trigger.send(()).await.is_err() {
+                        break;
+                    }
+                }
+            });
+
+            return Some(handle);
+        } else if let Err(err) = refresh_trigger.send(()).await {
+            tracing::error!("Failed to trigger refresh: {err}");
+        }
+
+        None
     }
 
     async fn start_refresh(
         dataset_name: String,
         federated: Arc<dyn TableProvider>,
-        refresh_mode: RefreshMode,
-        refresh_interval: Option<Duration>,
+        acceleration_refresh_mode: AccelerationRefreshMode,
         accelerator: Arc<dyn TableProvider>,
         object_store: Option<(Url, Arc<dyn ObjectStore + 'static>)>,
     ) {
         let mut stream = Self::stream_updates(
             dataset_name.clone(),
             federated,
-            refresh_mode,
-            refresh_interval,
+            acceleration_refresh_mode,
             object_store,
         );
 
@@ -130,8 +205,7 @@ impl AcceleratedTable {
     fn stream_updates<'a>(
         dataset_name: String,
         federated: Arc<dyn TableProvider>,
-        refresh_mode: RefreshMode,
-        refresh_interval: Option<Duration>,
+        acceleration_refresh_mode: AccelerationRefreshMode,
         object_store: Option<(Url, Arc<dyn ObjectStore + 'static>)>,
     ) -> BoxStream<'a, Result<DataUpdate>> {
         let ctx = SessionContext::new();
@@ -141,8 +215,8 @@ impl AcceleratedTable {
         }
 
         Box::pin(stream! {
-            match refresh_mode {
-                RefreshMode::Append => {
+            match acceleration_refresh_mode {
+                AccelerationRefreshMode::Append => {
                     let plan = federated.scan(&ctx.state(), None, &[], None).await.context(UnableToScanTableProviderSnafu {})?;
 
                     if plan.output_partitioning().partition_count() > 1 {
@@ -170,29 +244,31 @@ impl AcceleratedTable {
                         }
                     }
                 }
-                RefreshMode::Full => loop {
-                  tracing::info!("Refreshing data for {dataset_name}");
-                  status::update_dataset(&dataset_name, status::ComponentStatus::Refreshing);
-                  let timer = TimeMeasurement::new("load_dataset_duration_ms", vec![("dataset", dataset_name.clone())]);
-                  let all_data = match get_all_data(&ctx, federated.as_ref()).await {
-                      Ok(data) => data,
-                      Err(e) => {
-                          tracing::error!("Error refreshing data for {dataset_name}: {e}");
-                          yield Err(Error::UnableToGetDataFromConnector { source: e });
-                          continue;
-                      }
-                  };
-                  yield Ok(DataUpdate {
-                      schema: all_data.0,
-                      data: all_data.1,
-                      update_type: UpdateType::Overwrite,
-                  });
-                  drop(timer);
-                  match refresh_interval {
-                      Some(interval) => tokio::time::sleep(interval).await,
-                      None => break,
-                  };
-              },
+                AccelerationRefreshMode::Full(receiver) => {
+
+                    let mut refresh_stream = ReceiverStream::new(receiver);
+
+                    while refresh_stream.next().await.is_some() {
+                        tracing::info!("Refreshing data for {dataset_name}");
+                        status::update_dataset(&dataset_name, status::ComponentStatus::Refreshing);
+                        let timer = TimeMeasurement::new("load_dataset_duration_ms", vec![("dataset", dataset_name.clone())]);
+                        let all_data = match get_all_data(&ctx, federated.as_ref()).await {
+                            Ok(data) => data,
+                            Err(e) => {
+                                tracing::error!("Error refreshing data for {dataset_name}: {e}");
+                                yield Err(Error::UnableToGetDataFromConnector { source: e });
+                                continue;
+                            }
+                        };
+                        yield Ok(DataUpdate {
+                            schema: all_data.0,
+                            data: all_data.1,
+                            update_type: UpdateType::Overwrite,
+                        });
+
+                        drop(timer);
+                    }
+                }
             }
         })
     }
@@ -201,6 +277,9 @@ impl AcceleratedTable {
 impl Drop for AcceleratedTable {
     fn drop(&mut self) {
         self.refresh_handle.abort();
+        if let Some(handle) = &self.scheduled_refreshes_handle {
+            handle.abort();
+        }
     }
 }
 

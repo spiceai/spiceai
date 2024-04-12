@@ -274,7 +274,8 @@ impl DataFusion {
             acceleration_settings.refresh_mode.clone(),
             dataset.refresh_interval(),
             obj_store,
-        );
+        )
+        .await;
 
         self.ctx
             .register_table(&dataset.name, Arc::new(accelerated_table))
