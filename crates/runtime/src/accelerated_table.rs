@@ -49,11 +49,8 @@ pub enum Error {
         source: tokio::sync::mpsc::error::SendError<()>,
     },
 
-    #[snafu(display("Manual refresh is not supported for `append` acceleration mode"))]
-    ManualRefreshIsNotSupportedForAppend {},
-
-    #[snafu(display("Failed to trigger table refresh: invalid state"))]
-    RefreshTriggerIsUnavailable {},
+    #[snafu(display("Manual refresh is not supported for `append` mode"))]
+    ManualRefreshIsNotSupported {},
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -65,9 +62,8 @@ pub(crate) struct AcceleratedTable {
     accelerator: Arc<dyn TableProvider>,
     federated: Arc<dyn TableProvider>,
     refresh_handle: JoinHandle<()>,
-    refresh_mode: RefreshMode,
     refresh_trigger: Option<mpsc::Sender<()>>,
-    _scheduled_refreshes_handle: Option<JoinHandle<()>>,
+    scheduled_refreshes_handle: Option<JoinHandle<()>>,
 }
 
 enum AccelerationRefreshMode {
@@ -110,18 +106,13 @@ impl AcceleratedTable {
             accelerator,
             federated,
             refresh_handle,
-            refresh_mode,
             refresh_trigger,
-            _scheduled_refreshes_handle: scheduled_refreshes_handle,
+            scheduled_refreshes_handle,
         }
     }
 
     #[allow(dead_code)]
     pub async fn trigger_refresh(&self) -> Result<()> {
-        if self.refresh_mode == RefreshMode::Append {
-            ManualRefreshIsNotSupportedForAppendSnafu.fail()?;
-        }
-
         match &self.refresh_trigger {
             Some(refresh_trigger) => {
                 refresh_trigger
@@ -130,7 +121,7 @@ impl AcceleratedTable {
                     .context(FailedToTriggerRefreshSnafu)?;
             }
             None => {
-                RefreshTriggerIsUnavailableSnafu.fail()?;
+                ManualRefreshIsNotSupportedSnafu.fail()?;
             }
         }
 
@@ -286,6 +277,9 @@ impl AcceleratedTable {
 impl Drop for AcceleratedTable {
     fn drop(&mut self) {
         self.refresh_handle.abort();
+        if let Some(handle) = &self.scheduled_refreshes_handle {
+            handle.abort();
+        }
     }
 }
 
