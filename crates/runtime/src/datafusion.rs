@@ -105,6 +105,9 @@ pub enum Error {
         table_name: String,
         source: crate::accelerated_table::Error,
     },
+
+    #[snafu(display("Table {table_name} is not accelerated"))]
+    NotAcceleratedTable { table_name: String },
 }
 
 pub enum Table {
@@ -304,6 +307,11 @@ impl DataFusion {
                 .context(UnableToTriggerRefreshSnafu {
                     table_name: dataset_name.to_string(),
                 })?;
+        } else {
+            NotAcceleratedTableSnafu {
+                table_name: dataset_name.to_string(),
+            }
+            .fail()?;
         }
 
         Ok(())
