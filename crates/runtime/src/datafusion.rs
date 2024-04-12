@@ -293,7 +293,7 @@ impl DataFusion {
         Ok(())
     }
 
-    pub async fn trigger_table_refresh(&self, dataset_name: &str) -> Result<()> {
+    pub async fn refresh_table(&self, dataset_name: &str) -> Result<()> {
         let table = self
             .ctx
             .table_provider(OwnedTableReference::bare(dataset_name.to_string()))

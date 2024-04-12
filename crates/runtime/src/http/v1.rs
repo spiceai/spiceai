@@ -433,7 +433,7 @@ pub(crate) mod datasets {
 
         let df_read = df.read().await;
 
-        match df_read.trigger_table_refresh(&dataset.name).await {
+        match df_read.refresh_table(&dataset.name).await {
             Ok(()) => (
                 status::StatusCode::CREATED,
                 Json(DatasetRefreshResponse {
