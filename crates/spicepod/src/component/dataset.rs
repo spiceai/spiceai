@@ -184,6 +184,15 @@ impl Dataset {
     }
 
     #[must_use]
+    pub fn refresh_sql(&self) -> Option<String> {
+        if let Some(acceleration) = &self.acceleration {
+            return acceleration.refresh_sql.clone();
+        }
+
+        None
+    }
+
+    #[must_use]
     pub fn is_view(&self) -> bool {
         self.sql.is_some() || self.sql_ref.is_some()
     }
@@ -266,11 +275,14 @@ pub mod acceleration {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub engine: Option<String>,
 
+        #[serde(default)]
+        pub refresh_mode: RefreshMode,
+
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub refresh_interval: Option<String>,
 
-        #[serde(default)]
-        pub refresh_mode: RefreshMode,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub refresh_sql: Option<String>,
 
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub retention: Option<String>,
