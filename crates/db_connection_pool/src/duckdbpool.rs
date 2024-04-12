@@ -31,7 +31,7 @@ pub enum Error {
     #[snafu(display("ConnectionPoolError: {source}"))]
     ConnectionPoolError { source: r2d2::Error },
 
-    #[snafu(display("Missing open in data connector parameters"))]
+    #[snafu(display("Missing required parameter: open"))]
     MissingDuckDBFile {},
 }
 
