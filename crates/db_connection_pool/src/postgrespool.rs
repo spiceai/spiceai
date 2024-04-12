@@ -74,7 +74,7 @@ impl PostgresConnectionPool {
         secret: Option<Secret>,
     ) -> Result<Self> {
         let mut connection_string = "host=localhost user=postgres dbname=postgres".to_string();
-        let mut ssl_mode = "require";
+        let mut ssl_mode = "verify-full";
         let mut ssl_rootcert_path: Option<PathBuf> = None;
 
         if let Some(params) = params.as_ref() {
@@ -107,7 +107,7 @@ impl PostgresConnectionPool {
                 }
                 if let Some(pg_sslmode) = params.get("pg_sslmode") {
                     match pg_sslmode.to_lowercase().as_str() {
-                        "disable" | "require" | "prefer" => {
+                        "disable" | "require" | "prefer" | "verify-ca" | "verify-full" => {
                             ssl_mode = pg_sslmode.as_str();
                         }
                         _ => {
@@ -131,7 +131,14 @@ impl PostgresConnectionPool {
             }
         }
 
-        connection_string.push_str(format!("sslmode={ssl_mode} ").as_str());
+        let mode = match ssl_mode {
+            "disable" => "disable",
+            "prefer" => "prefer",
+            // tokio_postgres supports only disable, require and prefer
+            _ => "require",
+        };
+
+        connection_string.push_str(format!("sslmode={mode} ").as_str());
         let config = Config::from_str(connection_string.as_str()).context(ConnectionPoolSnafu)?;
 
         for host in config.get_hosts() {
@@ -185,8 +192,8 @@ fn get_tls_connector(
     }
 
     builder
-        .danger_accept_invalid_hostnames(ssl_mode == "prefer")
-        .danger_accept_invalid_certs(ssl_mode == "prefer")
+        .danger_accept_invalid_hostnames(ssl_mode != "verify-full")
+        .danger_accept_invalid_certs(ssl_mode != "verify-full" && ssl_mode != "verify-ca")
         .build()
 }
 
