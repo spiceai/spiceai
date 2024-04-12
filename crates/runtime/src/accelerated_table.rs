@@ -20,6 +20,7 @@ use object_store::ObjectStore;
 use snafu::prelude::*;
 use spicepod::component::dataset::acceleration::RefreshMode;
 use tokio::task::JoinHandle;
+use tokio::time::interval;
 use url::Url;
 
 use tokio::sync::mpsc;
@@ -95,7 +96,8 @@ impl AcceleratedTable {
             RefreshMode::Full => {
                 let (trigger, receiver) = mpsc::channel::<()>(1);
                 refresh_trigger = Some(trigger.clone());
-                scheduled_refreshes_handle = Self::tick(refresh_interval, trigger).await;
+                scheduled_refreshes_handle =
+                    Self::schedule_regular_refreshes(refresh_interval, trigger).await;
                 AccelerationRefreshMode::Full(receiver)
             }
         };
@@ -163,10 +165,13 @@ impl AcceleratedTable {
         Ok(())
     }
 
-    async fn tick(interval: Option<Duration>, trigger: mpsc::Sender<()>) -> Option<JoinHandle<()>> {
-        if let Some(refresh_interval) = interval {
-            let mut interval_timer = tokio::time::interval(refresh_interval);
-            let trigger = trigger.clone();
+    async fn schedule_regular_refreshes(
+        refresh_interval: Option<Duration>,
+        refresh_trigger: mpsc::Sender<()>,
+    ) -> Option<JoinHandle<()>> {
+        if let Some(refresh_interval) = refresh_interval {
+            let mut interval_timer = interval(refresh_interval);
+            let trigger = refresh_trigger.clone();
             let handle = tokio::spawn(async move {
                 loop {
                     interval_timer.tick().await;
@@ -178,8 +183,8 @@ impl AcceleratedTable {
             });
 
             return Some(handle);
-        } else if let Err(err) = trigger.send(()).await {
-            tracing::error!("Failed to trigger: {err}");
+        } else if let Err(err) = refresh_trigger.send(()).await {
+            tracing::error!("Failed to trigger refresh: {err}");
         }
 
         None
