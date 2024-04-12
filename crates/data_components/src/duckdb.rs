@@ -95,14 +95,11 @@ impl TableProviderFactory for DuckDBTableProviderFactory {
         cmd: &CreateExternalTable,
     ) -> DataFusionResult<Arc<dyn TableProvider>> {
         let name = cmd.name.to_string();
-        println!("{:?}", name);
         let mut options = cmd.options.clone();
         let mode = options.remove("mode").unwrap_or_default();
-        println!("{:?}", mode);
         let mode: Mode = mode.as_str().into();
 
         let params = Arc::new(Some(options));
-        println!("{:?}", params);
 
         let pool: Arc<DuckDbConnectionPool> = Arc::new(
             DuckDbConnectionPool::new(&name, &mode, &params)

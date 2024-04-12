@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use data_components::duckdb::DuckDBTableFactory;
 use data_components::Read;
 use datafusion::datasource::TableProvider;
-use db_connection_pool::{duckdbpool::DuckDbConnectionPool, Mode};
+use db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use secrets::Secret;
 use snafu::prelude::*;
 use spicepod::component::dataset::Dataset;
@@ -52,19 +52,12 @@ pub struct DuckDB {
 
 impl DataConnectorFactory for DuckDB {
     fn create(
-        secret: Option<Secret>,
+        _secret: Option<Secret>,
         params: Arc<Option<HashMap<String, String>>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            println!("{:?}", params);
-            let name = params
-                .as_ref()
-                .as_ref()
-                .and_then(|params| params.get("name").cloned())
-                .unwrap_or_default();
-
             let pool = Arc::new(
-                DuckDbConnectionPool::new(&name, &Mode::File, &params)
+                DuckDbConnectionPool::new_with_file_mode(&params)
                     .context(UnableToCreateDuckDBConnectionPoolSnafu)?,
             );
 
