@@ -305,8 +305,8 @@ pub mod acceleration {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub time_column: Option<String>,
 
-        #[serde(default)]
-        pub time_format: TimeFormat,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub time_format: Option<TimeFormat>,
 
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub retention_period: Option<String>,
