@@ -217,8 +217,7 @@ impl Runtime {
                 }
 
                 let source = ds.source();
-
-                let params = Arc::new(ds.params.clone());
+                let params = Arc::new(ds.params.clone().map(|params| params.as_string_map()));
                 let data_connector: Arc<dyn DataConnector> =
                     match Runtime::get_dataconnector_from_source(
                         &source,
