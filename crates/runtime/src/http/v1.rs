@@ -434,24 +434,20 @@ pub(crate) mod datasets {
         let df_read = df.read().await;
 
         match df_read.trigger_table_refresh(&dataset.name).await {
-            Ok(_) => {
-                return (
-                    status::StatusCode::CREATED,
-                    Json(DatasetRefreshResponse {
-                        message: format!("Dataset refresh triggered for {dataset_name}."),
-                    }),
-                )
-                    .into_response();
-            }
-            Err(err) => {
-                return (
-                    status::StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(DatasetRefreshResponse {
-                        message: format!("Failed to trigger refresh for {dataset_name}: {}.", err),
-                    }),
-                )
-                    .into_response();
-            }
+            Ok(()) => (
+                status::StatusCode::CREATED,
+                Json(DatasetRefreshResponse {
+                    message: format!("Dataset refresh triggered for {dataset_name}."),
+                }),
+            )
+                .into_response(),
+            Err(err) => (
+                status::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(DatasetRefreshResponse {
+                    message: format!("Failed to trigger refresh for {dataset_name}: {err}."),
+                }),
+            )
+                .into_response(),
         }
     }
 }
