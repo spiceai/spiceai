@@ -114,7 +114,6 @@ impl AcceleratedTable {
         }
     }
 
-    #[allow(dead_code)]
     pub async fn trigger_refresh(&self) -> Result<()> {
         match &self.refresh_trigger {
             Some(refresh_trigger) => {

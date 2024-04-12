@@ -397,7 +397,7 @@ pub(crate) mod datasets {
 
     pub(crate) async fn refresh(
         Extension(app): Extension<Arc<RwLock<Option<App>>>>,
-        Extension(_df): Extension<Arc<RwLock<DataFusion>>>,
+        Extension(df): Extension<Arc<RwLock<DataFusion>>>,
         Path(dataset_name): Path<String>,
     ) -> Response {
         let app_lock = app.read().await;
@@ -431,7 +431,24 @@ pub(crate) mod datasets {
                 .into_response();
         };
 
-        (status::StatusCode::NOT_IMPLEMENTED).into_response()
+        let df_read = df.read().await;
+
+        match df_read.refresh_table(&dataset.name).await {
+            Ok(()) => (
+                status::StatusCode::CREATED,
+                Json(DatasetRefreshResponse {
+                    message: format!("Dataset refresh triggered for {dataset_name}."),
+                }),
+            )
+                .into_response(),
+            Err(err) => (
+                status::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(DatasetRefreshResponse {
+                    message: format!("Failed to trigger refresh for {dataset_name}: {err}."),
+                }),
+            )
+                .into_response(),
+        }
     }
 }
 
