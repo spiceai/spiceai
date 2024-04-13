@@ -77,11 +77,11 @@ impl Read for LegacyDuckDBTableFactory {
     }
 }
 
-pub struct Motherduck {
+pub struct MotherDuck {
     duckdb_factory: LegacyDuckDBTableFactory,
 }
 
-impl DataConnectorFactory for Motherduck {
+impl DataConnectorFactory for MotherDuck {
     fn create(
         _secret: Option<Secret>,
         params: Arc<Option<HashMap<String, String>>>,
@@ -100,7 +100,7 @@ impl DataConnectorFactory for Motherduck {
 }
 
 #[async_trait]
-impl DataConnector for Motherduck {
+impl DataConnector for MotherDuck {
     fn as_any(&self) -> &dyn Any {
         self
     }
