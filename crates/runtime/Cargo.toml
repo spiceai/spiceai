@@ -41,6 +41,7 @@ tract-onnx = "0.21.0"
 ndarray = "0.15.3"
 ndarray-npy = { version = "0.8.0", features = ["compressed_npz"] }
 duckdb = { workspace = true, features = ["bundled", "r2d2", "vtab", "vtab-arrow"], optional = true }
+duckdb_0_9_2 = { version = "0.9.2", package = "duckdb", features = ["bundled", "r2d2", "vtab", "vtab-arrow"], optional = true  }
 sql_provider_datafusion = { path = "../sql_provider_datafusion", optional = true }
 r2d2 = { workspace = true, optional = true }
 opentelemetry-proto = { version = "0.4.0", features = ["gen-tonic-messages", "gen-tonic", "metrics"] }
@@ -80,7 +81,7 @@ ns_lookup = { path = "../ns_lookup" }
 [features]
 default = ["keyring-secret-store", "aws-secrets-manager"]
 dev = []
-duckdb = ["dep:duckdb", "sql_provider_datafusion/duckdb", "r2d2", "db_connection_pool/duckdb", "spicepod/duckdb", "data_components/duckdb"]
+duckdb = ["dep:duckdb", "dep:duckdb_0_9_2", "sql_provider_datafusion/duckdb", "r2d2", "db_connection_pool/duckdb", "spicepod/duckdb", "data_components/duckdb"]
 postgres = [
     "dep:bb8",
     "dep:bb8-postgres",

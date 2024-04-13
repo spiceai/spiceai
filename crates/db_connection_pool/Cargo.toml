@@ -10,6 +10,8 @@ exclude.workspace = true
 
 [dependencies]
 duckdb = { workspace = true, features = ["bundled", "r2d2", "vtab", "vtab-arrow"], optional = true }
+duckdb_0_9_2 = { version = "0.9.2", package = "duckdb", features = ["bundled", "r2d2", "vtab", "vtab-arrow"], optional = true  }
+arrow_49_0_0 = { version = "49.0.0", package = "arrow", features = [], optional = true }
 datafusion.workspace = true
 async-trait.workspace = true
 r2d2 = { workspace = true, optional = true }
@@ -35,7 +37,7 @@ postgres-native-tls = { version = "0.5.0", optional = true }
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 
 [features]
-duckdb = ["dep:duckdb", "dep:r2d2", "spicepod/duckdb"]
+duckdb = ["dep:duckdb", "dep:duckdb_0_9_2", "dep:arrow_49_0_0", "dep:r2d2", "spicepod/duckdb"]
 postgres = [
     "dep:bb8",
     "dep:bb8-postgres",

@@ -20,6 +20,8 @@ use spicepod::component::dataset::acceleration;
 
 pub mod dbconnection;
 #[cfg(feature = "duckdb")]
+pub mod duckdb_legacy_pool;
+#[cfg(feature = "duckdb")]
 pub mod duckdbpool;
 #[cfg(feature = "mysql")]
 pub mod mysqlpool;

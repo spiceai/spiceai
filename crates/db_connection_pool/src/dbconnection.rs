@@ -22,6 +22,8 @@ use datafusion::{
 use snafu::prelude::*;
 
 #[cfg(feature = "duckdb")]
+pub mod duckdb_legacy_conn;
+#[cfg(feature = "duckdb")]
 pub mod duckdbconn;
 #[cfg(feature = "mysql")]
 pub mod mysqlconn;
