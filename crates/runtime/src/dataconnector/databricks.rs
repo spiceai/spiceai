@@ -59,17 +59,18 @@ impl DataConnectorFactory for Databricks {
         params: Arc<Option<HashMap<String, String>>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let endpoint: String = params
-                .as_ref() // &Option<HashMap<String, String>>
-                .as_ref() // Option<&HashMap<String, String>>
-                .and_then(|params| params.get("endpoint").cloned())
-                .ok_or_else(|| Error::MissingEndpoint)?;
+            // What's the point of validating here and in the new as well? 
+            // let endpoint: String = params
+            //     .as_ref() // &Option<HashMap<String, String>>
+            //     .as_ref() // Option<&HashMap<String, String>>
+            //     .and_then(|params| params.get("endpoint").cloned())
+            //     .ok_or_else(|| Error::MissingEndpoint)?;
 
-            verify_endpoint_connection(&endpoint)
-                .await
-                .context(InvalidEndpointSnafu { endpoint })?;
-
-            Ok(Arc::new(Databricks::new(Arc::new(secret), params)) as Arc<dyn DataConnector>)
+            // verify_endpoint_connection(&endpoint)
+            //     .await
+            //     .context(InvalidEndpointSnafu { endpoint })?;
+            let databricks = Databricks::new(Arc::new(secret), params).await?;
+            Ok(Arc::new(databricks) as Arc<dyn DataConnector>)
         })
     }
 }
