@@ -1,9 +1,16 @@
 use std::f64::consts::E;
+use std::fmt;
 use std::sync::Arc;
 
+use async_stream::stream;
+use arrow::array::RecordBatch;
 use arrow::datatypes::Field;
 use arrow::datatypes::{self, Schema, SchemaRef, TimeUnit};
+use datafusion::common::project_schema;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
+use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::{DisplayAs, DisplayFormatType};
 use datafusion::{
     common::OwnedTableReference,
     datasource::{TableProvider, TableType},
@@ -12,16 +19,18 @@ use datafusion::{
     logical_expr::Expr,
     physical_plan::ExecutionPlan,
 };
+use futures::{stream, Stream};
 use spark_connect_rs::{
     spark::{data_type, DataType},
     DataFrame, SparkSession,
 };
 use tonic::async_trait;
 
-use std::{collections::HashMap, error::Error};
+use std::{error::Error};
+
 
 pub async fn get_table_provider(
-    spark_session: SparkSession,
+    spark_session: Arc<SparkSession>,
     table_reference: OwnedTableReference,
 ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn Error + Send + Sync>> {
     let dataframe = spark_session.table(table_reference.table())?;
@@ -152,6 +161,121 @@ impl TableProvider for SparkConnectTablePovider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        todo!();
+        Ok(Arc::new(SparkConnectExecutionPlan::new(self.dataframe.clone(), self.schema.clone(), projection, self.table_reference.clone(), filters, limit)?))
+    }
+}
+
+
+#[derive(Debug)]
+struct SparkConnectExecutionPlan {
+    dataframe: DataFrame,
+    projected_schema: SchemaRef,
+    table_reference: OwnedTableReference,
+    filters: Vec<Expr>,
+    limit: Option<i32>,
+}
+
+impl SparkConnectExecutionPlan { 
+    pub fn new(
+        dataframe: DataFrame,
+        schema: SchemaRef,
+        projections: Option<&Vec<usize>>,
+        table_reference: OwnedTableReference,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> DataFusionResult<Self> {
+        let projected_schema = project_schema(&schema, projections)?;
+        let limit = limit.map(|u| {
+            if u as u32 <= i32::MAX as u32 {
+                Ok(u as i32)
+            } else {
+                Err(DataFusionError::Execution("Value is too large to fit in an i32".to_string()))
+            }
+        }).transpose()?;
+        Ok(Self {
+            dataframe,
+            projected_schema,
+            table_reference: table_reference.clone(),
+            filters: filters.to_vec(),
+            limit,
+        })
+    }
+
+}
+
+impl DisplayAs for SparkConnectExecutionPlan {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> std::fmt::Result {
+        // let sql = self.sql().unwrap_or_default();
+        // write!(f, "FlightSqlExec sql={sql}")
+        write!(f, "foobar")
+    }
+}
+
+
+impl ExecutionPlan for SparkConnectExecutionPlan {
+
+    fn schema(&self) -> SchemaRef {
+        self.projected_schema.clone()
+    }
+
+    fn execute(
+        &self,
+        _partition: usize,
+        _context: Arc<TaskContext>,
+    ) -> DataFusionResult<SendableRecordBatchStream> {
+        let columns = self.projected_schema
+        .fields()
+        .iter()
+        .map(|f| format!("\"{}\"", f.name()))
+        .collect::<Vec<_>>();
+        tracing::trace!("projected_schema {:#?}", self.projected_schema);
+        tracing::trace!("sql columns {:#?}", columns);
+        tracing::trace!("filters {:#?}", self.filters);
+        let df = self.filters.iter().fold(self.dataframe.clone(), |df, filter| df.filter(filter.to_string().as_str()));
+        let df = match self.limit  {
+            Some(limit) => df.limit(limit),
+            None => df,
+        };
+        let stream_adapter = RecordBatchStreamAdapter::new(
+            self.schema(),
+            dataframe_to_stream(df),
+        );
+        Ok(Box::pin(stream_adapter))        
+    }
+    
+
+    fn output_ordering(&self) -> Option<&[datafusion::physical_expr::PhysicalSortExpr]> {
+        None
+    }
+
+    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        Ok(self)
+    }
+    
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    
+    fn output_partitioning(&self) -> datafusion::physical_plan::Partitioning {
+        datafusion::physical_plan::Partitioning::UnknownPartitioning(1)
+    }
+    
+    
+}
+
+
+fn dataframe_to_stream(
+    dataframe: DataFrame,
+) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
+    stream!{
+        let data = dataframe.collect().await.map_err(|e| DataFusionError::Execution(e.to_string()))?;
+        yield(Ok(data))
     }
 }
