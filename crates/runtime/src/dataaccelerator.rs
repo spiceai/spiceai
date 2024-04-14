@@ -29,12 +29,14 @@ use spicepod::component::dataset::acceleration::{self, Mode};
 use std::{any::Any, collections::HashMap, sync::Arc};
 use tokio::sync::Mutex;
 
-use self::{arrow::ArrowAccelerator, sqlite::SqliteAccelerator};
+use self::arrow::ArrowAccelerator;
 
 #[cfg(feature = "duckdb")]
 use self::duckdb::DuckDBAccelerator;
 #[cfg(feature = "postgres")]
 use self::postgres::PostgresAccelerator;
+#[cfg(feature = "sqlite")]
+use self::sqlite::SqliteAccelerator;
 
 pub mod arrow;
 #[cfg(feature = "duckdb")]
