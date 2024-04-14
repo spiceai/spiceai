@@ -37,6 +37,7 @@ use std::future::Future;
 
 #[cfg(feature = "databricks")]
 pub mod databricks;
+#[cfg(feature = "dremio")]
 pub mod dremio;
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
@@ -133,6 +134,7 @@ pub async fn register_all() {
     register_connector_factory("localhost", localhost::LocalhostConnector::create).await;
     #[cfg(feature = "databricks")]
     register_connector_factory("databricks", databricks::Databricks::create).await;
+    #[cfg(feature = "dremio")]
     register_connector_factory("dremio", dremio::Dremio::create).await;
     #[cfg(feature = "flightsql")]
     register_connector_factory("flightsql", flightsql::FlightSQL::create).await;

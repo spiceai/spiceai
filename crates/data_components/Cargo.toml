@@ -24,7 +24,11 @@ tracing.workspace = true
 flight_client = { path = "../flight_client" }
 sql_provider_datafusion = { path = "../sql_provider_datafusion" }
 secrets = { path = "../secrets" }
-deltalake = { git = "https://github.com/spiceai/delta-rs.git", rev = "30c52fe9408de8d96b4618c336c2202e896a967b", features = ["datafusion-ext", "s3", "azure"], optional = true }
+deltalake = { git = "https://github.com/spiceai/delta-rs.git", rev = "30c52fe9408de8d96b4618c336c2202e896a967b", features = [
+    "datafusion-ext",
+    "s3",
+    "azure",
+], optional = true }
 serde.workspace = true
 reqwest = { version = "0.11.24", features = ["json"] }
 db_connection_pool = { path = "../db_connection_pool" }
@@ -44,5 +48,5 @@ duckdb = ["dep:duckdb", "dep:r2d2"]
 flightsql = ["dep:tonic", "dep:r2d2"]
 postgres = ["dep:bb8", "dep:bb8-postgres", "dep:postgres-native-tls", "arrow_sql_gen/postgres", "dep:tokio-postgres"]
 mysql = ["dep:mysql_async", "arrow_sql_gen/mysql"]
-sqlite = ["dep:rusqlite", "dep:tokio-rusqlite"]
+sqlite = ["dep:rusqlite", "dep:tokio-rusqlite", "arrow_sql_gen/sqlite"]
 databricks = ["dep:deltalake"]

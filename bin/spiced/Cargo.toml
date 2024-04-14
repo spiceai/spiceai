@@ -22,7 +22,7 @@ metrics.workspace = true
 metrics-exporter-prometheus = "0.13.0"
 
 [features]
-default = ["duckdb", "postgres", "sqlite", "mysql", "flightsql", "databricks"]
+default = ["duckdb", "postgres", "sqlite", "mysql", "flightsql", "databricks", "dremio"]
 duckdb = ["runtime/duckdb", "spicepod/duckdb", "app/duckdb"]
 postgres = ["runtime/postgres", "spicepod/postgres", "app/postgres"]
 sqlite = ["runtime/sqlite", "spicepod/sqlite", "app/sqlite"]
@@ -33,3 +33,4 @@ keyring-secret-store = ["runtime/keyring-secret-store"]
 flightsql = ["runtime/flightsql"]
 aws-secrets-manager = ["runtime/aws-secrets-manager"]
 databricks = ["runtime/databricks"]
+dremio = ["runtime/dremio"]
