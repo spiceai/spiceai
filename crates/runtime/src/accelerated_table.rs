@@ -9,7 +9,7 @@ use datafusion::error::Result as DataFusionResult;
 use datafusion::execution::context::SessionState;
 use datafusion::logical_expr::TableProviderFilterPushDown;
 use datafusion::physical_plan::union::UnionExec;
-use datafusion::physical_plan::{collect, ExecutionPlan};
+use datafusion::physical_plan::{collect, ExecutionPlan, ExecutionPlanProperties};
 use datafusion::{
     datasource::{TableProvider, TableType},
     execution::context::SessionContext,

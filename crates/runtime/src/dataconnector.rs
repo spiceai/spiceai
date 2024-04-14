@@ -35,8 +35,12 @@ use url::Url;
 use secrets::Secret;
 use std::future::Future;
 
+#[cfg(feature = "databricks")]
 pub mod databricks;
+#[cfg(feature = "dremio")]
 pub mod dremio;
+#[cfg(feature = "duckdb")]
+pub mod duckdb;
 #[cfg(feature = "flightsql")]
 pub mod flightsql;
 pub mod localhost;
@@ -128,7 +132,9 @@ pub async fn create_new_connector(
 
 pub async fn register_all() {
     register_connector_factory("localhost", localhost::LocalhostConnector::create).await;
+    #[cfg(feature = "databricks")]
     register_connector_factory("databricks", databricks::Databricks::create).await;
+    #[cfg(feature = "dremio")]
     register_connector_factory("dremio", dremio::Dremio::create).await;
     #[cfg(feature = "flightsql")]
     register_connector_factory("flightsql", flightsql::FlightSQL::create).await;
@@ -138,6 +144,8 @@ pub async fn register_all() {
     register_connector_factory("mysql", mysql::MySQL::create).await;
     #[cfg(feature = "postgres")]
     register_connector_factory("postgres", postgres::Postgres::create).await;
+    #[cfg(feature = "duckdb")]
+    register_connector_factory("duckdb", duckdb::DuckDB::create).await;
 }
 
 pub trait DataConnectorFactory {

@@ -24,8 +24,10 @@ use datafusion::{
     error::{DataFusionError, Result as DataFusionResult},
     execution::{context::SessionState, SendableRecordBatchStream, TaskContext},
     logical_expr::Expr,
+    physical_expr::EquivalenceProperties,
     physical_plan::{
-        stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionPlan,
+        stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionMode,
+        ExecutionPlan, Partitioning, PlanProperties,
     },
 };
 use flight_client::FlightClient;
@@ -36,19 +38,18 @@ use std::{any::Any, fmt, sync::Arc};
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Unable to subscribe to data from the Flight endpoint: {source}"))]
-    UnableToSubscribeData {
-        source: flight_client::Error,
-    },
+    UnableToSubscribeData { source: flight_client::Error },
 
+    #[snafu(display("Unable to retrieve schema from Flight DoExchange."))]
     UnableToRetrieveSchema,
 
+    #[snafu(display("{source}"))]
     UnableToDecodeFlightData {
         source: arrow_flight::error::FlightError,
     },
 
-    StreamInterrupted {
-        source: flight_client::Error,
-    },
+    #[snafu(display("{source}"))]
+    StreamInterrupted { source: flight_client::Error },
 
     #[snafu(display("Projection (column filtering) is not supported for Flight Streams."))]
     ProjectionNotSupported,
@@ -106,7 +107,7 @@ impl TableProvider for FlightTableStreamer {
     }
 
     fn schema(&self) -> SchemaRef {
-        unimplemented!()
+        Arc::clone(&self.schema)
     }
 
     fn table_type(&self) -> TableType {
@@ -137,6 +138,7 @@ struct FlightStreamExec {
     table_reference: OwnedTableReference,
     client: FlightClient,
     schema: SchemaRef,
+    properties: PlanProperties,
 }
 
 impl FlightStreamExec {
@@ -149,6 +151,11 @@ impl FlightStreamExec {
             table_reference: table_reference.clone(),
             client,
             schema: Arc::clone(schema),
+            properties: PlanProperties::new(
+                EquivalenceProperties::new(Arc::clone(schema)),
+                Partitioning::UnknownPartitioning(1),
+                ExecutionMode::Unbounded,
+            ),
         }
     }
 }
@@ -166,6 +173,10 @@ impl DisplayAs for FlightStreamExec {
 }
 
 impl ExecutionPlan for FlightStreamExec {
+    fn name(&self) -> &'static str {
+        "FlightStreamExec"
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -174,12 +185,8 @@ impl ExecutionPlan for FlightStreamExec {
         Arc::clone(&self.schema)
     }
 
-    fn output_partitioning(&self) -> datafusion::physical_plan::Partitioning {
-        datafusion::physical_plan::Partitioning::UnknownPartitioning(1)
-    }
-
-    fn output_ordering(&self) -> Option<&[datafusion::physical_expr::PhysicalSortExpr]> {
-        None
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
     }
 
     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {

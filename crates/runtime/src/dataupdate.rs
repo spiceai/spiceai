@@ -20,8 +20,11 @@ use std::{any::Any, fmt, sync::Arc};
 use arrow::{datatypes::SchemaRef, record_batch::RecordBatch};
 use datafusion::error::Result as DataFusionResult;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan};
+use datafusion::physical_plan::{
+    DisplayAs, DisplayFormatType, ExecutionMode, ExecutionPlan, Partitioning, PlanProperties,
+};
 use futures::stream;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -43,6 +46,7 @@ pub struct DataUpdate {
 pub struct DataUpdateExecutionPlan {
     pub data_update: RwLock<DataUpdate>,
     schema: SchemaRef,
+    properties: PlanProperties,
 }
 
 impl DataUpdateExecutionPlan {
@@ -51,7 +55,12 @@ impl DataUpdateExecutionPlan {
         let schema = Arc::clone(&data_update.schema);
         Self {
             data_update: RwLock::new(data_update),
-            schema,
+            schema: Arc::clone(&schema),
+            properties: PlanProperties::new(
+                EquivalenceProperties::new(schema),
+                Partitioning::UnknownPartitioning(1),
+                ExecutionMode::Bounded,
+            ),
         }
     }
 }
@@ -69,6 +78,10 @@ impl DisplayAs for DataUpdateExecutionPlan {
 }
 
 impl ExecutionPlan for DataUpdateExecutionPlan {
+    fn name(&self) -> &'static str {
+        "DataUpdateExecutionPlan"
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -77,12 +90,8 @@ impl ExecutionPlan for DataUpdateExecutionPlan {
         Arc::clone(&self.schema)
     }
 
-    fn output_partitioning(&self) -> datafusion::physical_plan::Partitioning {
-        datafusion::physical_plan::Partitioning::UnknownPartitioning(1)
-    }
-
-    fn output_ordering(&self) -> Option<&[datafusion::physical_expr::PhysicalSortExpr]> {
-        None
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
     }
 
     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {

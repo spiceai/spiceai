@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::{Read, ReadWrite};
 use arrow::{array::RecordBatch, datatypes::SchemaRef};
 use async_trait::async_trait;
 use datafusion::{
@@ -67,16 +68,16 @@ pub enum Error {
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
-pub struct DuckDBTableFactory {}
+pub struct DuckDBTableProviderFactory {}
 
-impl DuckDBTableFactory {
+impl DuckDBTableProviderFactory {
     #[must_use]
     pub fn new() -> Self {
         Self {}
     }
 }
 
-impl Default for DuckDBTableFactory {
+impl Default for DuckDBTableProviderFactory {
     fn default() -> Self {
         Self::new()
     }
@@ -87,7 +88,7 @@ type DynDuckDbConnectionPool = dyn DbConnectionPool<r2d2::PooledConnection<Duckd
     + Sync;
 
 #[async_trait]
-impl TableProviderFactory for DuckDBTableFactory {
+impl TableProviderFactory for DuckDBTableProviderFactory {
     async fn create(
         &self,
         _state: &SessionState,
@@ -223,6 +224,26 @@ impl DuckDB {
         Ok(())
     }
 
+    fn delete_all_table_data(
+        &self,
+        duckdb_conn: &mut DuckDbConnection,
+        overwrite_exists: bool,
+    ) -> Result<()> {
+        if self.table_exists(duckdb_conn) {
+            if overwrite_exists {
+                let sql = format!(r#"DELETE FROM "{}""#, self.table_name);
+                tracing::trace!("{sql}");
+                duckdb_conn
+                    .conn
+                    .execute(&sql, [])
+                    .context(UnableToDropDuckDBTableSnafu)?;
+            } else {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
     fn create_table(&self, duckdb_conn: &mut DuckDbConnection, drop_if_exists: bool) -> Result<()> {
         if self.table_exists(duckdb_conn) {
             if drop_if_exists {
@@ -260,24 +281,48 @@ impl DuckDB {
     }
 }
 
-// TODO: DuckDB DataConnector
-//
-// #[async_trait]
-// impl Read for DuckDBTableFactory {
-//     async fn table_provider(
-//         &self,
-//         _table_reference: OwnedTableReference,
-//     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
-//         todo!()
-//     }
-// }
+pub struct DuckDBTableFactory {
+    pool: Arc<DuckDbConnectionPool>,
+}
 
-// #[async_trait]
-// impl ReadWrite for DuckDBTableFactory {
-//     async fn table_provider(
-//         &self,
-//         _table_reference: OwnedTableReference,
-//     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
-//         todo!()
-//     }
-// }
+impl DuckDBTableFactory {
+    #[must_use]
+    pub fn new(pool: Arc<DuckDbConnectionPool>) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl Read for DuckDBTableFactory {
+    async fn table_provider(
+        &self,
+        table_reference: OwnedTableReference,
+    ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
+        let pool = Arc::clone(&self.pool);
+        let dyn_pool: Arc<DynDuckDbConnectionPool> = pool;
+        let table_provider = SqlTable::new(&dyn_pool, table_reference)
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+        Ok(Arc::new(table_provider))
+    }
+}
+
+#[async_trait]
+impl ReadWrite for DuckDBTableFactory {
+    async fn table_provider(
+        &self,
+        table_reference: OwnedTableReference,
+    ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
+        let read_provider = Read::table_provider(self, table_reference.clone()).await?;
+
+        let table_name = table_reference.to_string();
+        let duckdb = DuckDB::new(
+            table_name,
+            Arc::clone(&read_provider).schema(),
+            Arc::clone(&self.pool),
+        );
+
+        Ok(DuckDBTableWriter::create(read_provider, duckdb))
+    }
+}

@@ -29,12 +29,14 @@ use spicepod::component::dataset::acceleration::{self, Mode};
 use std::{any::Any, collections::HashMap, sync::Arc};
 use tokio::sync::Mutex;
 
-use self::{arrow::ArrowAccelerator, sqlite::SqliteAccelerator};
+use self::arrow::ArrowAccelerator;
 
 #[cfg(feature = "duckdb")]
 use self::duckdb::DuckDBAccelerator;
 #[cfg(feature = "postgres")]
 use self::postgres::PostgresAccelerator;
+#[cfg(feature = "sqlite")]
+use self::sqlite::SqliteAccelerator;
 
 pub mod arrow;
 #[cfg(feature = "duckdb")]
@@ -215,8 +217,12 @@ pub async fn create_accelerator_table(
     acceleration_settings: &acceleration::Acceleration,
     acceleration_secret: Option<Secret>,
 ) -> Result<Arc<dyn TableProvider>> {
-    let params: Arc<Option<HashMap<String, String>>> =
-        Arc::new(acceleration_settings.params.clone());
+    let params = Arc::new(
+        acceleration_settings
+            .params
+            .clone()
+            .map(|params| params.as_string_map()),
+    );
 
     let table_name = table_name.to_string();
 

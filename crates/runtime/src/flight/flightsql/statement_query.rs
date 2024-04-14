@@ -66,7 +66,7 @@ pub(crate) async fn do_get(
     let datafusion = Arc::clone(&flight_svc.datafusion);
     tracing::trace!("do_get_statement: {cmd:?}");
     let start = TimeMeasurement::new("flight_do_get_statement_query_duration_ms", vec![]);
-    let output = Service::sql_to_flight_stream(datafusion, cmd.query).await?;
+    let output = Box::pin(Service::sql_to_flight_stream(datafusion, cmd.query)).await?;
     let timed_output = TimedStream::new(output, move || start);
     Ok(Response::new(
         Box::pin(timed_output) as <Service as FlightService>::DoGetStream

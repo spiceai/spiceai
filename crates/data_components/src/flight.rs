@@ -26,8 +26,10 @@ use datafusion::{
     error::{DataFusionError, Result as DataFusionResult},
     execution::{context::SessionState, SendableRecordBatchStream, TaskContext},
     logical_expr::{Expr, TableProviderFilterPushDown},
+    physical_expr::EquivalenceProperties,
     physical_plan::{
-        stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionPlan,
+        stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionMode,
+        ExecutionPlan, Partitioning, PlanProperties,
     },
     sql::TableReference,
 };
@@ -208,6 +210,7 @@ struct FlightExec {
     client: FlightClient,
     filters: Vec<Expr>,
     limit: Option<usize>,
+    properties: PlanProperties,
 }
 
 impl FlightExec {
@@ -221,11 +224,16 @@ impl FlightExec {
     ) -> DataFusionResult<Self> {
         let projected_schema = project_schema(schema, projections)?;
         Ok(Self {
-            projected_schema,
+            projected_schema: Arc::clone(&projected_schema),
             table_reference: table_reference.clone(),
             client,
             filters: filters.to_vec(),
             limit,
+            properties: PlanProperties::new(
+                EquivalenceProperties::new(projected_schema),
+                Partitioning::UnknownPartitioning(1),
+                ExecutionMode::Bounded,
+            ),
         })
     }
 
@@ -277,6 +285,10 @@ impl DisplayAs for FlightExec {
 }
 
 impl ExecutionPlan for FlightExec {
+    fn name(&self) -> &'static str {
+        "FlightExec"
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -285,12 +297,8 @@ impl ExecutionPlan for FlightExec {
         self.projected_schema.clone()
     }
 
-    fn output_partitioning(&self) -> datafusion::physical_plan::Partitioning {
-        datafusion::physical_plan::Partitioning::UnknownPartitioning(1)
-    }
-
-    fn output_ordering(&self) -> Option<&[datafusion::physical_expr::PhysicalSortExpr]> {
-        None
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
     }
 
     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {

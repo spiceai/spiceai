@@ -30,6 +30,9 @@ pub enum Error {
 
     #[snafu(display("ConnectionPoolError: {source}"))]
     ConnectionPoolError { source: r2d2::Error },
+
+    #[snafu(display("Missing required parameter: open"))]
+    MissingDuckDBFile {},
 }
 
 pub struct DuckDbConnectionPool {
@@ -60,6 +63,32 @@ impl DuckDbConnectionPool {
             }
         };
 
+        let pool = Arc::new(r2d2::Pool::new(manager).context(ConnectionPoolSnafu)?);
+
+        let conn = pool.get().context(ConnectionPoolSnafu)?;
+        conn.register_table_function::<ArrowVTab>("arrow")
+            .context(DuckDBSnafu)?;
+
+        Ok(DuckDbConnectionPool { pool })
+    }
+
+    /// Create a new `DuckDbConnectionPool` from data connector params.
+    ///
+    /// # Arguments
+    ///
+    /// * `params` - Data connector parameters for the connection pool.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if there is a problem creating the connection pool.
+    pub fn new_with_file_mode(params: &Arc<Option<HashMap<String, String>>>) -> Result<Self> {
+        let path = params
+            .as_ref()
+            .as_ref()
+            .and_then(|params| params.get("open").cloned())
+            .ok_or(Error::MissingDuckDBFile {})?;
+
+        let manager = DuckdbConnectionManager::file(path).context(DuckDBSnafu)?;
         let pool = Arc::new(r2d2::Pool::new(manager).context(ConnectionPoolSnafu)?);
 
         let conn = pool.get().context(ConnectionPoolSnafu)?;

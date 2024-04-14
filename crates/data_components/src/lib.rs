@@ -21,6 +21,7 @@ use async_trait::async_trait;
 use datafusion::{common::OwnedTableReference, datasource::TableProvider, execution::context::SessionState, logical_expr::Expr, physical_plan::ExecutionPlan};
 
 pub mod arrow;
+#[cfg(feature = "databricks")]
 pub mod databricks;
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
