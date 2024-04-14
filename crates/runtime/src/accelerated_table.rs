@@ -197,6 +197,9 @@ impl AcceleratedTable {
         time_format: String,
         retention_period: Duration,
     ) {
+        let _ = retention_period;
+        let _ = time_format;
+        let _ = time_column;
         let mut interval_timer = tokio::time::interval(interval);
         loop {
             interval_timer.tick().await;
