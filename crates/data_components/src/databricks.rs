@@ -29,7 +29,7 @@ pub struct Databricks {
     session: Arc<SparkSession>,
 }
 impl Databricks {
-    #[must_use]
+    
     pub async fn new(
         secret: Arc<Option<Secret>>,
         params: Arc<Option<HashMap<String, String>>>,

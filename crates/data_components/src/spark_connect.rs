@@ -36,7 +36,7 @@ pub async fn get_table_provider(
     let schema = dataframe.clone().schema().await?;
     let arrow_schema = datatype_as_arrow_schema(schema)?;
     Ok(Arc::new(SparkConnectTablePovider {
-        dataframe: dataframe,
+        dataframe,
         schema: arrow_schema,
     }))
 }
@@ -124,9 +124,9 @@ fn datatype_as_arrow_schema(data_type: DataType) -> Result<SchemaRef, DataFusion
             .collect::<Result<Vec<_>, DataFusionError>>()?;
         return Ok(Arc::new(Schema::new(fields)));
     }
-    return Err(DataFusionError::Execution(
+    Err(DataFusionError::Execution(
         "Unsupported data type".to_string(),
-    ));
+    ))
 }
 
 struct SparkConnectTablePovider {
@@ -141,7 +141,7 @@ impl TableProvider for SparkConnectTablePovider {
     }
 
     fn schema(&self) -> SchemaRef {
-        return self.schema.clone();
+        self.schema.clone()
     }
 
     fn table_type(&self) -> TableType {
