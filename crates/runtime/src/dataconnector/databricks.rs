@@ -16,7 +16,7 @@ limitations under the License.
 
 use async_trait::async_trait;
 use data_components::databricks_delta::DatabricksDelta;
-use data_components::databricks_spark::DatabricksSpark;
+use data_components::databricks_spark::DatabricksSparkConnect;
 use data_components::{Read, ReadWrite};
 use datafusion::datasource::TableProvider;
 use secrets::Secret;
@@ -81,7 +81,7 @@ impl Databricks {
                 read_write_provider: Arc::new(databricks_delta),
             })
         } else {
-            let databricks_spark = DatabricksSpark::new(secret, params)
+            let databricks_spark = DatabricksSparkConnect::new(secret, params)
                 .await
                 .context(UnableToConstructDatabricksSparkSnafu)?;
             Ok(Self {

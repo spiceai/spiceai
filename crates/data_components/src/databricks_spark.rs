@@ -23,12 +23,13 @@ use std::{collections::HashMap, error::Error, sync::Arc};
 use crate::{spark_connect, Read, ReadWrite};
 
 #[derive(Clone)]
-pub struct DatabricksSpark {
+#[allow(clippy::module_name_repetitions)]
+pub struct DatabricksSparkConnect {
     pub secret: Arc<Option<Secret>>,
     pub params: Arc<Option<HashMap<String, String>>>,
     session: Arc<SparkSession>,
 }
-impl DatabricksSpark {
+impl DatabricksSparkConnect {
     pub async fn new(
         secret: Arc<Option<Secret>>,
         params: Arc<Option<HashMap<String, String>>>,
@@ -71,7 +72,7 @@ impl DatabricksSpark {
 }
 
 #[async_trait]
-impl ReadWrite for DatabricksSpark {
+impl ReadWrite for DatabricksSparkConnect {
     async fn table_provider(
         &self,
         table_reference: OwnedTableReference,
@@ -83,7 +84,7 @@ impl ReadWrite for DatabricksSpark {
 }
 
 #[async_trait]
-impl Read for DatabricksSpark {
+impl Read for DatabricksSparkConnect {
     async fn table_provider(
         &self,
         table_reference: OwnedTableReference,
