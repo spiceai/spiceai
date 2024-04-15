@@ -18,7 +18,7 @@ use datafusion::{
 use futures::{stream::BoxStream, StreamExt};
 use object_store::ObjectStore;
 use snafu::prelude::*;
-use spicepod::component::dataset::acceleration::RefreshMode;
+use spicepod::component::dataset::acceleration::{RefreshMode, TimeFormat};
 use tokio::task::JoinHandle;
 use tokio::time::interval;
 use url::Url;
@@ -82,7 +82,7 @@ impl AcceleratedTable {
         refresh_interval: Option<Duration>,
         refresh_sql: Option<String>,
         time_column: Option<String>,
-        time_format: Option<String>,
+        time_format: Option<TimeFormat>,
         retention_check_interval: Option<Duration>,
         retention_period: Option<Duration>,
         retention_enabled: bool,
@@ -119,17 +119,9 @@ impl AcceleratedTable {
         }
 
         if retention_enabled {
-            if let (
-                Some(time_column),
-                Some(time_format),
-                Some(retention_period),
-                Some(retention_check_interval),
-            ) = (
-                time_column,
-                time_format,
-                retention_period,
-                retention_check_interval,
-            ) {
+            if let (Some(time_column), Some(retention_period), Some(retention_check_interval)) =
+                (time_column, retention_period, retention_check_interval)
+            {
                 let retention_check_handle = tokio::spawn(Self::start_retention_check(
                     Arc::clone(&accelerator),
                     retention_check_interval,
@@ -194,7 +186,7 @@ impl AcceleratedTable {
         accelerator: Arc<dyn TableProvider>,
         interval: Duration,
         time_column: String,
-        time_format: String,
+        time_format: Option<TimeFormat>,
         retention_period: Duration,
     ) {
         let _ = retention_period;

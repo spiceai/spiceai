@@ -183,6 +183,40 @@ impl Dataset {
         None
     }
 
+    pub fn retention_check_interval(&self) -> Option<Duration> {
+        if let Some(acceleration) = &self.acceleration {
+            if let Some(retention_check_interval) = &acceleration.retention_check_interval {
+                if let Ok(duration) = fundu::parse_duration(retention_check_interval) {
+                    return Some(duration);
+                }
+                tracing::warn!(
+                    "Unable to parse retention check interval for dataset {}: {}",
+                    self.name,
+                    retention_check_interval
+                );
+            }
+        }
+
+        None
+    }
+
+    pub fn retention_period(&self) -> Option<Duration> {
+        if let Some(acceleration) = &self.acceleration {
+            if let Some(retention_period) = &acceleration.retention_period {
+                if let Ok(duration) = fundu::parse_duration(retention_period) {
+                    return Some(duration);
+                }
+                tracing::warn!(
+                    "Unable to parse retention period for dataset {}: {}",
+                    self.name,
+                    retention_period
+                );
+            }
+        }
+
+        None
+    }
+
     #[must_use]
     pub fn refresh_sql(&self) -> Option<String> {
         if let Some(acceleration) = &self.acceleration {
@@ -260,6 +294,12 @@ pub mod acceleration {
         File,
     }
 
+    impl Display for Mode {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{self:?}")
+        }
+    }
+
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
     #[serde(rename_all = "snake_case")]
     pub enum TimeFormat {
@@ -269,7 +309,7 @@ pub mod acceleration {
         Iso8601,
     }
 
-    impl Display for Mode {
+    impl Display for TimeFormat {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             write!(f, "{self:?}")
         }
