@@ -80,11 +80,13 @@ xcode-select --install
 # Note: Be sure to follow the steps in the Homebrew installation output to add Homebrew to your PATH.
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
 
-# Install Rust
+# Install dependencies
 brew install rust
-
-# Install Go
 brew install go
+
+# Cmake/Protobuf are only required for building the databricks connector
+brew install cmake
+brew install protobuf
 
 # Clone SpiceAI OSS Repo
 git clone https://github.com/spiceai/spiceai.git
