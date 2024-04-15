@@ -26,44 +26,62 @@ import (
 	"github.com/spiceai/spiceai/bin/spice/pkg/util"
 )
 
-func GetData[T interface{}](rtcontext *context.RuntimeContext, path string) ([]T, error) {
+const (
+	GET  = "GET"
+	POST = "POST"
+)
+
+func doRuntimeApiRequest[T interface{}](rtcontext *context.RuntimeContext, method, path string) (T, error) {
 	url := fmt.Sprintf("%s%s", rtcontext.HttpEndpoint(), path)
-	resp, err := http.Get(url)
+	var resp *http.Response
+	var err error
+
+	switch method {
+	case GET:
+		resp, err = http.Get(url)
+	case POST:
+		resp, err = http.Post(url, "application/json", nil)
+	default:
+		return *new(T), fmt.Errorf("Unsupported method: %s", method)
+	}
+
 	if err != nil {
 		if strings.HasSuffix(err.Error(), "connection refused") {
-			return nil, rtcontext.RuntimeUnavailableError()
+			return *new(T), rtcontext.RuntimeUnavailableError()
 		}
-		return nil, fmt.Errorf("error fetching %s: %w", url, err)
+		return *new(T), fmt.Errorf("Error performing request to %s: %w", url, err)
 	}
 	defer resp.Body.Close()
 
-	var components []T
-	err = json.NewDecoder(resp.Body).Decode(&components)
-	if err != nil {
-		return nil, fmt.Errorf("error decoding items: %w", err)
+	var result T
+	if err = json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return *new(T), fmt.Errorf("Error decoding response: %w", err)
 	}
-	return components, nil
+	return result, nil
+}
+
+func GetData[T interface{}](rtcontext *context.RuntimeContext, path string) ([]T, error) {
+	result, err := doRuntimeApiRequest[[]T](rtcontext, GET, path)
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func PostRuntime[T interface{}](rtcontext *context.RuntimeContext, path string) (T, error) {
+	return doRuntimeApiRequest[T](rtcontext, POST, path)
 }
 
 func WriteDataTable[T interface{}](rtcontext *context.RuntimeContext, path string, t T) error {
-	url := fmt.Sprintf("%s%s", rtcontext.HttpEndpoint(), path)
-	resp, err := http.Get(url)
-	if err != nil {
-		if strings.HasSuffix(err.Error(), "connection refused") {
-			return rtcontext.RuntimeUnavailableError()
-		}
-		return fmt.Errorf("Error fetching %s: %w", url, err)
-	}
-	defer resp.Body.Close()
 
-	var datasets []T
-	err = json.NewDecoder(resp.Body).Decode(&datasets)
+	items, err := doRuntimeApiRequest[[]T](rtcontext, GET, path)
+
 	if err != nil {
-		return fmt.Errorf("Error decoding items: %w", err)
+		return fmt.Errorf("Error fetching runtime information: %w", err)
 	}
 
 	var table []interface{}
-	for _, s := range datasets {
+	for _, s := range items {
 		table = append(table, s)
 	}
 

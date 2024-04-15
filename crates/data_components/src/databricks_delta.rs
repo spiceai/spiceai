@@ -24,17 +24,15 @@ use std::{collections::HashMap, error::Error, sync::Arc};
 
 use crate::{Read, ReadWrite};
 
-use self::write::DeltaTableWriter;
-
-mod write;
+use crate::deltatable::write::DeltaTableWriter;
 
 #[derive(Clone)]
-pub struct Databricks {
+pub struct DatabricksDelta {
     pub secret: Arc<Option<Secret>>,
     pub params: Arc<Option<HashMap<String, String>>>,
 }
 
-impl Databricks {
+impl DatabricksDelta {
     #[must_use]
     pub fn new(secret: Arc<Option<Secret>>, params: Arc<Option<HashMap<String, String>>>) -> Self {
         Self { secret, params }
@@ -42,7 +40,7 @@ impl Databricks {
 }
 
 #[async_trait]
-impl Read for Databricks {
+impl Read for DatabricksDelta {
     async fn table_provider(
         &self,
         table_reference: OwnedTableReference,
@@ -57,7 +55,7 @@ impl Read for Databricks {
 }
 
 #[async_trait]
-impl ReadWrite for Databricks {
+impl ReadWrite for DatabricksDelta {
     async fn table_provider(
         &self,
         table_reference: OwnedTableReference,

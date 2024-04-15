@@ -84,9 +84,9 @@ impl MySQLConnectionPool {
                 {
                     connection_string = connection_string.pass(Some(mysql_pass));
                 }
-                if let Some(mysql_port) = params.get("mysql_port") {
+                if let Some(mysql_tcp_port) = params.get("mysql_tcp_port") {
                     connection_string =
-                        connection_string.tcp_port(mysql_port.parse::<u16>().unwrap_or(3306));
+                        connection_string.tcp_port(mysql_tcp_port.parse::<u16>().unwrap_or(3306));
                 }
                 if let Some(mysql_sslmode) = params.get("mysql_sslmode") {
                     match mysql_sslmode.to_lowercase().as_str() {

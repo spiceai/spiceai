@@ -84,7 +84,7 @@ jobs:
         if: matrix.target_os == 'linux' && matrix.target_arch == 'aarch64'
         run: |
           sudo apt-get update
-          sudo apt-get install build-essential libssl-dev pkg-config -y
+          sudo apt-get install build-essential libssl-dev pkg-config cmake -y
 
       - name: Restore build cache (Windows)
         if: matrix.target_os == 'windows'
