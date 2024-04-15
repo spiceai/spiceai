@@ -3,6 +3,7 @@ use std::{any::Any, sync::Arc, time::Duration};
 use arrow::datatypes::SchemaRef;
 use async_stream::stream;
 use async_trait::async_trait;
+use data_components::arrow::write::MemTable;
 use data_components::DeleteTableProvider;
 use datafusion::common::OwnedTableReference;
 use datafusion::error::Result as DataFusionResult;
@@ -196,18 +197,21 @@ impl AcceleratedTable {
         loop {
             interval_timer.tick().await;
 
-            let deleted_table_provider = accelerator
-                .as_any()
-                .downcast_ref::<&dyn DeleteTableProvider>();
+            let deleted_table_provider = accelerator.as_any().downcast_ref::<MemTable>();
 
             if let Some(deleted_table_provider) = deleted_table_provider {
                 let ctx = SessionContext::new();
 
                 let plan = deleted_table_provider.delete(&ctx.state(), &[]).await;
-                if let Ok(plan) = plan {
-                    if let Err(e) = collect(plan, ctx.task_ctx()).await {
+                match plan {
+                    Ok(plan) => {
+                        if let Err(e) = collect(plan, ctx.task_ctx()).await {
+                            tracing::error!("Error running retention check: {e}");
+                        };
+                    }
+                    Err(e) => {
                         tracing::error!("Error running retention check: {e}");
-                    };
+                    }
                 }
             } else {
                 tracing::error!("Accelerated table does not support delete");

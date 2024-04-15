@@ -19,8 +19,7 @@ use std::{error::Error, sync::Arc};
 
 use async_trait::async_trait;
 use datafusion::{
-    common::OwnedTableReference, datasource::TableProvider, execution::context::SessionState,
-    logical_expr::Expr, physical_plan::ExecutionPlan,
+    common::OwnedTableReference, datasource::TableProvider, error::DataFusionError, execution::context::SessionState, logical_expr::Expr, physical_plan::ExecutionPlan
 };
 
 pub mod arrow;
@@ -64,10 +63,12 @@ pub trait Stream {
 }
 
 #[async_trait]
-pub trait DeleteTableProvider {
+pub trait DeleteTableProvider: TableProvider {
     async fn delete(
         &self,
-        state: &SessionState,
-        filters: &[Expr],
-    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>>;
+        _state: &SessionState,
+        _filters: &[Expr],
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        Err(DataFusionError::Plan("Not implemented".to_string()))
+    }
 }

@@ -18,7 +18,6 @@
 //! [`MemTable`] for querying `Vec<RecordBatch>` by `DataFusion`.
 
 // This is modified from the DataFusion `MemTable` to support overwrites. This file can be removed once that change is upstreamed.
-
 use std::any::Any;
 use std::collections::HashMap;
 use std::fmt::{self, Debug};
@@ -195,7 +194,7 @@ impl DeleteTableProvider for MemTable {
         _state: &SessionState,
         _filters: &[Expr],
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        Err(DataFusionError::Plan("Not implemented".to_string()))
+        todo!()
     }
 }
 
