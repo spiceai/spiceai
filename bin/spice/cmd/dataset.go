@@ -208,7 +208,7 @@ spice dataset refresh taxi_trips
 		rtcontext := context.NewContext()
 
 		url := fmt.Sprintf("/v1/datasets/%s/refresh", dataset)
-		res, err := api.DoRuntimePost[DatasetRefreshApiResponse](rtcontext, url)
+		res, err := api.DoRuntimePostRequest[DatasetRefreshApiResponse](rtcontext, url)
 		if err != nil {
 			cmd.PrintErrln(err.Error())
 			return
