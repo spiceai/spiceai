@@ -231,7 +231,11 @@ var databricksCmd = &cobra.Command{
 	Use:   "databricks",
 	Short: "Login to a Databricks instance",
 	Example: `
+# Using Spark Connect
 spice login databricks --token <access-token>
+
+# Using Delta Lake directly
+spice login databricks --token <access-token> --aws-region <aws-region> --aws-access-key-id <aws-access-key-id> --aws-secret-access-key <aws-secret-access-key>
 
 # See more at: https://docs.spiceai.org/
 `,
@@ -247,9 +251,30 @@ spice login databricks --token <access-token>
 			os.Exit(1)
 		}
 
+		awsRegion, err := cmd.Flags().GetString(awsRegion)
+		if err != nil {
+			cmd.Println(err.Error())
+			os.Exit(1)
+		}
+
+		awsAccessKeyId, err := cmd.Flags().GetString(awsAccessKeyId)
+		if err != nil {
+			cmd.Println(err.Error())
+			os.Exit(1)
+		}
+
+		awsSecret, err := cmd.Flags().GetString(awsSecret)
+		if err != nil {
+			cmd.Println(err.Error())
+			os.Exit(1)
+		}
+
 		mergeAuthConfig(cmd, api.AUTH_TYPE_DATABRICKS, &api.Auth{
 			Params: map[string]string{
-				api.AUTH_PARAM_TOKEN: token,
+				api.AUTH_PARAM_TOKEN:                 token,
+				api.AUTH_PARAM_AWS_DEFAULT_REGION:    awsRegion,
+				api.AUTH_PARAM_AWS_ACCESS_KEY_ID:     awsAccessKeyId,
+				api.AUTH_PARAM_AWS_SECRET_ACCESS_KEY: awsSecret,
 			},
 		},
 		)
