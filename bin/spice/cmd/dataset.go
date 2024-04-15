@@ -26,6 +26,8 @@ import (
 
 	"github.com/logrusorgru/aurora"
 	"github.com/spf13/cobra"
+	"github.com/spiceai/spiceai/bin/spice/pkg/api"
+	"github.com/spiceai/spiceai/bin/spice/pkg/context"
 	"github.com/spiceai/spiceai/bin/spice/pkg/spec"
 	"gopkg.in/yaml.v2"
 )
@@ -185,9 +187,43 @@ spice dataset configure
 	},
 }
 
+type DatasetRefreshApiResponse struct {
+	Message string `json:"message,omitempty"`
+}
+
+var refreshCmd = &cobra.Command{
+	Use:   "refresh",
+	Short: "Refresh a dataset",
+	Args:  cobra.MinimumNArgs(1),
+	Example: `
+spice dataset refresh taxi_trips
+
+# See more at: https://docs.spiceai.org/
+`,
+	Run: func(cmd *cobra.Command, args []string) {
+		dataset := args[0]
+
+		cmd.Printf("Initiating refresh for dataset %s ...\n", dataset)
+
+		rtcontext := context.NewContext()
+
+		url := fmt.Sprintf("/v1/datasets/%s/refresh", dataset)
+		res, err := api.DoRuntimePost[DatasetRefreshApiResponse](rtcontext, url)
+		if err != nil {
+			cmd.PrintErrln(err.Error())
+			return
+		}
+
+		cmd.Println(res.Message)
+	},
+}
+
 func init() {
 	configureCmd.Flags().BoolP("help", "h", false, "Print this help message")
 	datasetCmd.AddCommand(configureCmd)
+
+	refreshCmd.Flags().BoolP("help", "h", false, "Print this help message")
+	datasetCmd.AddCommand(refreshCmd)
 
 	datasetCmd.Flags().BoolP("help", "h", false, "Print this help message")
 	RootCmd.AddCommand(datasetCmd)

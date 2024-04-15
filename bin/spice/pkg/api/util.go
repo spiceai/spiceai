@@ -45,6 +45,25 @@ func GetData[T interface{}](rtcontext *context.RuntimeContext, path string) ([]T
 	return components, nil
 }
 
+func DoRuntimePost[T interface{}](rtcontext *context.RuntimeContext, path string) (T, error) {
+	url := fmt.Sprintf("%s%s", rtcontext.HttpEndpoint(), path)
+	resp, err := http.Post(url, "application/json", nil)
+	if err != nil {
+		if strings.HasSuffix(err.Error(), "connection refused") {
+			return *new(T), rtcontext.RuntimeUnavailableError()
+		}
+		return *new(T), fmt.Errorf("error fetching %s: %w", url, err)
+	}
+	defer resp.Body.Close()
+
+	var res T
+	err = json.NewDecoder(resp.Body).Decode(&res)
+	if err != nil {
+		return *new(T), fmt.Errorf("error decoding reponse: %w", err)
+	}
+	return res, nil
+}
+
 func WriteDataTable[T interface{}](rtcontext *context.RuntimeContext, path string, t T) error {
 	url := fmt.Sprintf("%s%s", rtcontext.HttpEndpoint(), path)
 	resp, err := http.Get(url)
