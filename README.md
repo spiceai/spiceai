@@ -62,7 +62,7 @@ Currently supported data connectors for upstream datasets. More coming soon.
 
 | Name         | Description                                                                                    | Status       | Protocol/Format  | Refresh Modes    |
 | ------------ | ---------------------------------------------------------------------------------------------- | ------------ | ---------------- | ---------------- |
-| `databricks` | [Databricks](https://github.com/spiceai/quickstarts/tree/trunk/databricks#spice-on-databricks) | Alpha        | Spark Connect<br>S3/Delta Lake       | `full`           |
+| `databricks` | [Databricks](https://github.com/spiceai/quickstarts/tree/trunk/databricks#spice-on-databricks) | Alpha        | [Spark Connect](https://spark.apache.org/docs/latest/spark-connect-overview.html)<br>S3/Delta Lake       | `full`           |
 | `postgres`   | PostgreSQL                                                                                     | Alpha        |                  | `full`           |
 | `spiceai`    | [Spice.ai](https://github.com/spiceai/quickstarts/tree/trunk/spiceai#readme)                   | Alpha        | Arrow Flight     | `append`, `full` |
 | `s3`         | [S3](https://github.com/spiceai/quickstarts/tree/trunk/s3#readme)                              | Alpha        | Parquet          | `full`           |
