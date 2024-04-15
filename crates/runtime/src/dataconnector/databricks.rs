@@ -40,6 +40,11 @@ pub enum Error {
         source: ns_lookup::Error,
     },
 
+    #[snafu(display(
+        "Invalid format '{format}' for mode '{mode}'. Valid combinations: s3/deltalake"
+    ))]
+    InvalidFormat { mode: String, format: String },
+
     #[snafu(display("{source}"))]
     UnableToConstructDatabricksSpark {
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -68,18 +73,24 @@ impl Databricks {
         secret: Arc<Option<Secret>>,
         params: Arc<Option<HashMap<String, String>>>,
     ) -> Result<Self> {
-        let mode = params
-            .as_ref()
-            .as_ref()
+        let ref_params = params.as_ref().as_ref();
+        let mode = ref_params
             .and_then(|params: &HashMap<String, String>| params.get("mode").cloned())
             .unwrap_or_default();
+        let format = ref_params
+            .and_then(|params: &HashMap<String, String>| params.get("format").cloned())
+            .unwrap_or_default();
 
-        if mode.as_str() == "delta" {
-            let databricks_delta = DatabricksDelta::new(secret, params);
-            Ok(Self {
-                read_provider: Arc::new(databricks_delta.clone()),
-                read_write_provider: Arc::new(databricks_delta),
-            })
+        if mode.as_str() == "s3" {
+            if format == "deltalake" {
+                let databricks_delta = DatabricksDelta::new(secret, params);
+                Ok(Self {
+                    read_provider: Arc::new(databricks_delta.clone()),
+                    read_write_provider: Arc::new(databricks_delta),
+                })
+            } else {
+                InvalidFormatSnafu { mode, format }.fail()
+            }
         } else {
             let databricks_spark = DatabricksSparkConnect::new(secret, params)
                 .await
