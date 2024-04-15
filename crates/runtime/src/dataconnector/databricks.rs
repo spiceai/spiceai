@@ -68,13 +68,13 @@ impl Databricks {
         secret: Arc<Option<Secret>>,
         params: Arc<Option<HashMap<String, String>>>,
     ) -> Result<Self> {
-        let format = params
+        let mode = params
             .as_ref()
             .as_ref()
-            .and_then(|params: &HashMap<String, String>| params.get("format").cloned())
+            .and_then(|params: &HashMap<String, String>| params.get("mode").cloned())
             .unwrap_or_default();
 
-        if format.as_str() == "delta" {
+        if mode.as_str() == "delta" {
             let databricks_delta = DatabricksDelta::new(secret, params);
             Ok(Self {
                 read_provider: Arc::new(databricks_delta.clone()),
