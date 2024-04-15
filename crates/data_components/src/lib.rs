@@ -23,8 +23,6 @@ use datafusion::{common::OwnedTableReference, datasource::TableProvider};
 pub mod arrow;
 #[cfg(feature = "databricks")]
 pub mod databricks;
-#[cfg(feature = "databricks")]
-pub mod spark_connect;
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
 pub mod flight;
@@ -34,6 +32,8 @@ pub mod flightsql;
 pub mod mysql;
 #[cfg(feature = "postgres")]
 pub mod postgres;
+#[cfg(feature = "databricks")]
+pub mod spark_connect;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 

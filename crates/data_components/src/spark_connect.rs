@@ -204,8 +204,17 @@ impl SparkConnectExecutionPlan {
 
 impl DisplayAs for SparkConnectExecutionPlan {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> std::fmt::Result {
-        let filters:Vec<String> = self.filters.iter().map(|f| f.to_string()).collect::<Vec<_>>();
-        write!(f, "SparkConnectExecutionPlan projected_schema={} filters={}", self.projected_schema, filters.join(","))
+        let filters: Vec<String> = self
+            .filters
+            .iter()
+            .map(|f| f.to_string())
+            .collect::<Vec<_>>();
+        write!(
+            f,
+            "SparkConnectExecutionPlan projected_schema={} filters={}",
+            self.projected_schema,
+            filters.join(",")
+        )
     }
 }
 
@@ -260,7 +269,6 @@ impl ExecutionPlan for SparkConnectExecutionPlan {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
-
 }
 
 fn dataframe_to_stream(dataframe: DataFrame) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
