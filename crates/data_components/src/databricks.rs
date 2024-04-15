@@ -16,18 +16,14 @@ limitations under the License.
 
 use async_trait::async_trait;
 use datafusion::{common::OwnedTableReference, datasource::TableProvider};
-use deltalake::aws::storage::s3_constants::AWS_S3_ALLOW_UNSAFE_RENAME;
-use deltalake::open_table_with_storage_options;
-use secrets::{ExposeSecret, Secret};
-use serde::Deserialize;
-use std::{collections::HashMap, error::Error, fmt, sync::Arc};
+use secrets::Secret;
+use std::{collections::HashMap, error::Error, sync::Arc};
 use spark_connect_rs::{SparkSession, SparkSessionBuilder};
 
 use crate::{spark_connect, Read, ReadWrite};
 
-use self::write::DeltaTableWriter;
 
-mod write;
+
 
 #[derive(Clone)]
 pub struct Databricks {
@@ -82,7 +78,6 @@ impl ReadWrite for Databricks {
         )
         .await?;
         Ok(provider)
-        // DeltaTableWriter::create(delta_table).map_err(Into::into)
     }
 }
 
@@ -99,84 +94,5 @@ impl Read for Databricks {
         )
         .await?;
         Ok(provider)
-        // DeltaTableWriter::create(delta_table).map_err(Into::into)
     }
 }
-
-
-
-// async fn get_delta_table(
-//     secret: Arc<Option<Secret>>,
-//     table_reference: OwnedTableReference,
-//     params: Arc<Option<HashMap<String, String>>>,
-// ) -> Result<Arc<dyn TableProvider>, Box<dyn Error + Send + Sync>> {
-//     // Needed to be able to load the s3:// scheme
-//     deltalake::aws::register_handlers(None);
-//     deltalake::azure::register_handlers(None);
-//     let table_uri = resolve_table_uri(table_reference, &secret, params).await?;
-
-//     let mut storage_options = HashMap::new();
-//     if let Some(secret) = secret.as_ref() {
-//         for (key, value) in secret.iter() {
-//             if key == "token" {
-//                 continue;
-//             }
-//             storage_options.insert(key.to_string(), value.expose_secret().clone());
-//         }
-//     };
-//     storage_options.insert(AWS_S3_ALLOW_UNSAFE_RENAME.to_string(), "true".to_string());
-
-//     let delta_table = open_table_with_storage_options(table_uri, storage_options).await?;
-
-//     Ok(Arc::new(delta_table) as Arc<dyn TableProvider>)
-// }
-
-// #[derive(Deserialize)]
-// struct DatabricksTablesApiResponse {
-//     storage_location: String,
-// }
-
-// #[allow(clippy::implicit_hasher)]
-// pub async fn resolve_table_uri(
-//     table_reference: OwnedTableReference,
-//     secret: &Arc<Option<Secret>>,
-//     params: Arc<Option<HashMap<String, String>>>,
-// ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-//     let params = match params.as_ref() {
-//         None => return Err("Dataset params not found".into()),
-//         Some(params) => params,
-//     };
-
-//     let Some(endpoint) = params.get("endpoint") else {
-//         return Err("Endpoint not found in dataset params".into());
-//     };
-
-//     let table_name = table_reference.table();
-
-//     let mut token = "Token not found in auth provider";
-//     if let Some(secret) = secret.as_ref() {
-//         if let Some(token_secret_val) = secret.get("token") {
-//             token = token_secret_val;
-//         };
-//     };
-
-//     let url = format!(
-//         "{}/api/2.1/unity-catalog/tables/{}",
-//         endpoint.trim_end_matches('/'),
-//         table_name
-//     );
-
-//     let client = reqwest::Client::new();
-//     let response = client.get(&url).bearer_auth(token).send().await?;
-
-//     if response.status().is_success() {
-//         let api_response: DatabricksTablesApiResponse = response.json().await?;
-//         Ok(api_response.storage_location)
-//     } else {
-//         Err(format!(
-//             "Failed to retrieve databricks table URI. Status: {}",
-//             response.status()
-//         )
-//         .into())
-//     }
-// }

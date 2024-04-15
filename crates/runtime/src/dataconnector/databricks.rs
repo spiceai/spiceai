@@ -17,7 +17,6 @@ limitations under the License.
 use async_trait::async_trait;
 use data_components::{Read, ReadWrite};
 use datafusion::datasource::TableProvider;
-use ns_lookup::verify_endpoint_connection;
 use secrets::Secret;
 use snafu::prelude::*;
 use spicepod::component::dataset::Dataset;
@@ -59,16 +58,6 @@ impl DataConnectorFactory for Databricks {
         params: Arc<Option<HashMap<String, String>>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            // What's the point of validating here and in the new as well? 
-            // let endpoint: String = params
-            //     .as_ref() // &Option<HashMap<String, String>>
-            //     .as_ref() // Option<&HashMap<String, String>>
-            //     .and_then(|params| params.get("endpoint").cloned())
-            //     .ok_or_else(|| Error::MissingEndpoint)?;
-
-            // verify_endpoint_connection(&endpoint)
-            //     .await
-            //     .context(InvalidEndpointSnafu { endpoint })?;
             let databricks = Databricks::new(Arc::new(secret), params).await?;
             Ok(Arc::new(databricks) as Arc<dyn DataConnector>)
         })

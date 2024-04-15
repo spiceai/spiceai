@@ -23,6 +23,7 @@ use datafusion::{common::OwnedTableReference, datasource::TableProvider};
 pub mod arrow;
 #[cfg(feature = "databricks")]
 pub mod databricks;
+#[cfg(feature = "databricks")]
 pub mod spark_connect;
 #[cfg(feature = "duckdb")]
 pub mod duckdb;

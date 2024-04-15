@@ -1,15 +1,15 @@
-use std::f64::consts::E;
 use std::fmt;
 use std::sync::Arc;
 
-use async_stream::stream;
 use arrow::array::RecordBatch;
 use arrow::datatypes::Field;
 use arrow::datatypes::{self, Schema, SchemaRef, TimeUnit};
+use async_stream::stream;
 use datafusion::common::project_schema;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::PlanProperties;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType};
 use datafusion::{
     common::OwnedTableReference,
@@ -19,15 +19,14 @@ use datafusion::{
     logical_expr::Expr,
     physical_plan::ExecutionPlan,
 };
-use futures::{stream, Stream};
+use futures::Stream;
 use spark_connect_rs::{
     spark::{data_type, DataType},
     DataFrame, SparkSession,
 };
 use tonic::async_trait;
 
-use std::{error::Error};
-
+use std::error::Error;
 
 pub async fn get_table_provider(
     spark_session: Arc<SparkSession>,
@@ -36,11 +35,9 @@ pub async fn get_table_provider(
     let dataframe = spark_session.table(table_reference.table())?;
     let schema = dataframe.clone().schema().await?;
     let arrow_schema = datatype_as_arrow_schema(schema)?;
-    Ok(Arc::new(
-        SparkConnectTablePovider{
+    Ok(Arc::new(SparkConnectTablePovider {
         dataframe: dataframe,
         schema: arrow_schema,
-        table_reference,
     }))
 }
 
@@ -67,33 +64,30 @@ fn arrow_field_datatype_from_spark_connect_field_datatype(
                 Some(data_type) => {
                     let arrow_inner_type =
                         arrow_field_datatype_from_spark_connect_field_datatype(Some(*data_type))?;
-                        // Very smelly
-                    let field = Field::new("",arrow_inner_type, false); 
+                    // Very smelly
+                    let field = Field::new("", arrow_inner_type, false);
                     Ok(datatypes::DataType::List(Arc::new(field)))
-                }, 
+                }
                 None => Err(DataFusionError::Execution(
                     "Unsupported data type".to_string(),
                 )),
             }
-
         }
-        Some(data_type::Kind::Map(boxed_map)) => {
-            match (boxed_map.key_type, boxed_map.value_type) {
-                (Some(key_type), Some(value_type)) => {
-                    let arrow_key_type =
-                        arrow_field_datatype_from_spark_connect_field_datatype(Some(*key_type))?;
-                    let arrow_value_type =
-                        arrow_field_datatype_from_spark_connect_field_datatype(Some(*value_type))?;
-                    Ok(datatypes::DataType::Dictionary(
-                        Box::new(arrow_key_type),
-                        Box::new(arrow_value_type),
-                    ))
-                },
-                _  => Err(DataFusionError::Execution(
-                    "Unsupported data type".to_string(),
-                )),
+        Some(data_type::Kind::Map(boxed_map)) => match (boxed_map.key_type, boxed_map.value_type) {
+            (Some(key_type), Some(value_type)) => {
+                let arrow_key_type =
+                    arrow_field_datatype_from_spark_connect_field_datatype(Some(*key_type))?;
+                let arrow_value_type =
+                    arrow_field_datatype_from_spark_connect_field_datatype(Some(*value_type))?;
+                Ok(datatypes::DataType::Dictionary(
+                    Box::new(arrow_key_type),
+                    Box::new(arrow_value_type),
+                ))
             }
-        }
+            _ => Err(DataFusionError::Execution(
+                "Unsupported data type".to_string(),
+            )),
+        },
         Some(data_type::Kind::Struct(struct_type)) => {
             let fields = struct_type
                 .fields
@@ -121,8 +115,9 @@ fn datatype_as_arrow_schema(data_type: DataType) -> Result<SchemaRef, DataFusion
             .fields
             .iter()
             .map(|field| {
-                let field_datatype =
-                    arrow_field_datatype_from_spark_connect_field_datatype(field.data_type.clone())?;
+                let field_datatype = arrow_field_datatype_from_spark_connect_field_datatype(
+                    field.data_type.clone(),
+                )?;
                 let arrow_field = Field::new(field.name.clone(), field_datatype, field.nullable);
                 Ok(arrow_field)
             })
@@ -137,7 +132,6 @@ fn datatype_as_arrow_schema(data_type: DataType) -> Result<SchemaRef, DataFusion
 struct SparkConnectTablePovider {
     dataframe: DataFrame,
     schema: SchemaRef,
-    table_reference: OwnedTableReference,
 }
 
 #[async_trait]
@@ -161,58 +155,64 @@ impl TableProvider for SparkConnectTablePovider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(SparkConnectExecutionPlan::new(self.dataframe.clone(), self.schema.clone(), projection, self.table_reference.clone(), filters, limit)?))
+        Ok(Arc::new(SparkConnectExecutionPlan::new(
+            self.dataframe.clone(),
+            self.schema.clone(),
+            projection,
+            filters,
+            limit,
+        )?))
     }
 }
-
 
 #[derive(Debug)]
 struct SparkConnectExecutionPlan {
     dataframe: DataFrame,
     projected_schema: SchemaRef,
-    table_reference: OwnedTableReference,
     filters: Vec<Expr>,
     limit: Option<i32>,
 }
 
-impl SparkConnectExecutionPlan { 
+impl SparkConnectExecutionPlan {
     pub fn new(
         dataframe: DataFrame,
         schema: SchemaRef,
         projections: Option<&Vec<usize>>,
-        table_reference: OwnedTableReference,
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Self> {
         let projected_schema = project_schema(&schema, projections)?;
-        let limit = limit.map(|u| {
-            if u as u32 <= i32::MAX as u32 {
-                Ok(u as i32)
-            } else {
-                Err(DataFusionError::Execution("Value is too large to fit in an i32".to_string()))
-            }
-        }).transpose()?;
+        let limit = limit
+            .map(|u| {
+                if u as u32 <= i32::MAX as u32 {
+                    Ok(u as i32)
+                } else {
+                    Err(DataFusionError::Execution(
+                        "Value is too large to fit in an i32".to_string(),
+                    ))
+                }
+            })
+            .transpose()?;
         Ok(Self {
             dataframe,
             projected_schema,
-            table_reference: table_reference.clone(),
             filters: filters.to_vec(),
             limit,
         })
     }
-
 }
 
 impl DisplayAs for SparkConnectExecutionPlan {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> std::fmt::Result {
-        // let sql = self.sql().unwrap_or_default();
-        // write!(f, "FlightSqlExec sql={sql}")
-        write!(f, "foobar")
+        let filters:Vec<String> = self.filters.iter().map(|f| f.to_string()).collect::<Vec<_>>();
+        write!(f, "SparkConnectExecutionPlan projected_schema={} filters={}", self.projected_schema, filters.join(","))
     }
 }
 
-
 impl ExecutionPlan for SparkConnectExecutionPlan {
+    fn properties(&self) -> &PlanProperties {
+        todo!()
+    }
 
     fn schema(&self) -> SchemaRef {
         self.projected_schema.clone()
@@ -223,29 +223,27 @@ impl ExecutionPlan for SparkConnectExecutionPlan {
         _partition: usize,
         _context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-        let columns = self.projected_schema
-        .fields()
-        .iter()
-        .map(|f| format!("\"{}\"", f.name()))
-        .collect::<Vec<_>>();
+        let columns = self
+            .projected_schema
+            .fields()
+            .iter()
+            .map(|f| format!("\"{}\"", f.name()))
+            .collect::<Vec<_>>();
         tracing::trace!("projected_schema {:#?}", self.projected_schema);
         tracing::trace!("sql columns {:#?}", columns);
         tracing::trace!("filters {:#?}", self.filters);
-        let df = self.filters.iter().fold(self.dataframe.clone(), |df, filter| df.filter(filter.to_string().as_str()));
-        let df = match self.limit  {
+        let df = self
+            .filters
+            .iter()
+            .fold(self.dataframe.clone(), |df, filter| {
+                df.filter(filter.to_string().as_str())
+            });
+        let df = match self.limit {
             Some(limit) => df.limit(limit),
             None => df,
         };
-        let stream_adapter = RecordBatchStreamAdapter::new(
-            self.schema(),
-            dataframe_to_stream(df),
-        );
-        Ok(Box::pin(stream_adapter))        
-    }
-    
-
-    fn output_ordering(&self) -> Option<&[datafusion::physical_expr::PhysicalSortExpr]> {
-        None
+        let stream_adapter = RecordBatchStreamAdapter::new(self.schema(), dataframe_to_stream(df));
+        Ok(Box::pin(stream_adapter))
     }
 
     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
@@ -258,23 +256,15 @@ impl ExecutionPlan for SparkConnectExecutionPlan {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         Ok(self)
     }
-    
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
-    
-    fn output_partitioning(&self) -> datafusion::physical_plan::Partitioning {
-        datafusion::physical_plan::Partitioning::UnknownPartitioning(1)
-    }
-    
-    
+
 }
 
-
-fn dataframe_to_stream(
-    dataframe: DataFrame,
-) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
-    stream!{
+fn dataframe_to_stream(dataframe: DataFrame) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
+    stream! {
         let data = dataframe.collect().await.map_err(|e| DataFusionError::Execution(e.to_string()))?;
         yield(Ok(data))
     }
