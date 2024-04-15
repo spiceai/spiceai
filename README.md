@@ -60,16 +60,17 @@ Spice makes querying data by SQL across one or more data sources simple and fast
 
 Currently supported data connectors for upstream datasets. More coming soon.
 
-| Name         | Description                                                                                    | Status       | Protocol/Format  | Refresh Modes    |
-| ------------ | ---------------------------------------------------------------------------------------------- | ------------ | ---------------- | ---------------- |
-| `databricks` | [Databricks](https://github.com/spiceai/quickstarts/tree/trunk/databricks#spice-on-databricks) | Alpha        | Delta Lake       | `full`           |
-| `postgres`   | PostgreSQL                                                                                     | Alpha        |                  | `full`           |
-| `spiceai`    | [Spice.ai](https://github.com/spiceai/quickstarts/tree/trunk/spiceai#readme)                   | Alpha        | Arrow Flight     | `append`, `full` |
-| `s3`         | [S3](https://github.com/spiceai/quickstarts/tree/trunk/s3#readme)                              | Alpha        | Parquet          | `full`           |
-| `dremio`     | [Dremio](https://github.com/spiceai/quickstarts/tree/trunk/dremio#readme)                      | Alpha        | Arrow Flight     | `full`           |
-| `mysql`      | MySQL                                                                                          | Alpha        |                  | `full`           |
-| `snowflake`  | Snowflake                                                                                      | Coming soon! | Arrow Flight SQL | `full`           |
-| `bigquery`   | BigQuery                                                                                       | Coming soon! | Arrow Flight SQL | `full`           |
+| Name         | Description                                                                                    | Status       | Protocol/Format                                                                                    | Refresh Modes    |
+| ------------ | ---------------------------------------------------------------------------------------------- | ------------ | -------------------------------------------------------------------------------------------------- | ---------------- |
+| `databricks` | [Databricks](https://github.com/spiceai/quickstarts/tree/trunk/databricks#spice-on-databricks) | Alpha        | [Spark Connect](https://spark.apache.org/docs/latest/spark-connect-overview.html)<br>S3/Delta Lake | `full`           |
+| `postgres`   | PostgreSQL                                                                                     | Alpha        |                                                                                                    | `full`           |
+| `spiceai`    | [Spice.ai](https://github.com/spiceai/quickstarts/tree/trunk/spiceai#readme)                   | Alpha        | Arrow Flight                                                                                       | `append`, `full` |
+| `s3`         | [S3](https://github.com/spiceai/quickstarts/tree/trunk/s3#readme)                              | Alpha        | Parquet                                                                                            | `full`           |
+| `dremio`     | [Dremio](https://github.com/spiceai/quickstarts/tree/trunk/dremio#readme)                      | Alpha        | Arrow Flight                                                                                       | `full`           |
+| `mysql`      | MySQL                                                                                          | Alpha        |                                                                                                    | `full`           |
+| `duckdb`     | DuckDB                                                                                         | Alpha        |                                                                                                    | `full`           |
+| `snowflake`  | Snowflake                                                                                      | Coming soon! | Arrow Flight SQL                                                                                   | `full`           |
+| `bigquery`   | BigQuery                                                                                       | Coming soon! | Arrow Flight SQL                                                                                   | `full`           |
 
 ### Supported Data Stores/Accelerators
 

@@ -15,9 +15,10 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
+use data_components::databricks_delta::DatabricksDelta;
+use data_components::databricks_spark::DatabricksSparkConnect;
 use data_components::{Read, ReadWrite};
 use datafusion::datasource::TableProvider;
-use ns_lookup::verify_endpoint_connection;
 use secrets::Secret;
 use snafu::prelude::*;
 use spicepod::component::dataset::Dataset;
@@ -27,7 +28,6 @@ use std::sync::Arc;
 use std::{collections::HashMap, future::Future};
 
 use super::{DataConnector, DataConnectorFactory};
-pub use data_components::databricks::Databricks;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -38,6 +38,16 @@ pub enum Error {
     InvalidEndpoint {
         endpoint: String,
         source: ns_lookup::Error,
+    },
+
+    #[snafu(display(
+        "Invalid format '{format}' for mode '{mode}'. Valid combinations: s3/deltalake"
+    ))]
+    InvalidFormat { mode: String, format: String },
+
+    #[snafu(display("{source}"))]
+    UnableToConstructDatabricksSpark {
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     #[snafu(display("{source}"))]
@@ -53,23 +63,54 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+pub struct Databricks {
+    read_provider: Arc<dyn Read>,
+    read_write_provider: Arc<dyn ReadWrite>,
+}
+
+impl Databricks {
+    pub async fn new(
+        secret: Arc<Option<Secret>>,
+        params: Arc<Option<HashMap<String, String>>>,
+    ) -> Result<Self> {
+        let ref_params = params.as_ref().as_ref();
+        let mode = ref_params
+            .and_then(|params: &HashMap<String, String>| params.get("mode").cloned())
+            .unwrap_or_default();
+        let format = ref_params
+            .and_then(|params: &HashMap<String, String>| params.get("format").cloned())
+            .unwrap_or_default();
+
+        if mode.as_str() == "s3" {
+            if format == "deltalake" {
+                let databricks_delta = DatabricksDelta::new(secret, params);
+                Ok(Self {
+                    read_provider: Arc::new(databricks_delta.clone()),
+                    read_write_provider: Arc::new(databricks_delta),
+                })
+            } else {
+                InvalidFormatSnafu { mode, format }.fail()
+            }
+        } else {
+            let databricks_spark = DatabricksSparkConnect::new(secret, params)
+                .await
+                .context(UnableToConstructDatabricksSparkSnafu)?;
+            Ok(Self {
+                read_provider: Arc::new(databricks_spark.clone()),
+                read_write_provider: Arc::new(databricks_spark),
+            })
+        }
+    }
+}
+
 impl DataConnectorFactory for Databricks {
     fn create(
         secret: Option<Secret>,
         params: Arc<Option<HashMap<String, String>>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let endpoint: String = params
-                .as_ref() // &Option<HashMap<String, String>>
-                .as_ref() // Option<&HashMap<String, String>>
-                .and_then(|params| params.get("endpoint").cloned())
-                .ok_or_else(|| Error::MissingEndpoint)?;
-
-            verify_endpoint_connection(&endpoint)
-                .await
-                .context(InvalidEndpointSnafu { endpoint })?;
-
-            Ok(Arc::new(Databricks::new(Arc::new(secret), params)) as Arc<dyn DataConnector>)
+            let databricks = Databricks::new(Arc::new(secret), params).await?;
+            Ok(Arc::new(databricks) as Arc<dyn DataConnector>)
         })
     }
 }
@@ -84,7 +125,9 @@ impl DataConnector for Databricks {
         &self,
         dataset: &Dataset,
     ) -> super::AnyErrorResult<Arc<dyn TableProvider>> {
-        Ok(Read::table_provider(self, dataset.path().into())
+        Ok(self
+            .read_provider
+            .table_provider(dataset.path().into())
             .await
             .context(UnableToGetReadProviderSnafu)?)
     }
@@ -93,7 +136,9 @@ impl DataConnector for Databricks {
         &self,
         dataset: &Dataset,
     ) -> Option<super::AnyErrorResult<Arc<dyn TableProvider>>> {
-        let read_write_result = ReadWrite::table_provider(self, dataset.path().into())
+        let read_write_result = self
+            .read_write_provider
+            .table_provider(dataset.path().into())
             .await
             .context(UnableToGetReadWriteProviderSnafu)
             .boxed();

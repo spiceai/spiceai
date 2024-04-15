@@ -231,12 +231,15 @@ var databricksCmd = &cobra.Command{
 	Use:   "databricks",
 	Short: "Login to a Databricks instance",
 	Example: `
+# Using Spark Connect
+spice login databricks --token <access-token>
+
+# Using Delta Lake directly
 spice login databricks --token <access-token> --aws-region <aws-region> --aws-access-key-id <aws-access-key-id> --aws-secret-access-key <aws-secret-access-key>
 
 # See more at: https://docs.spiceai.org/
 `,
 	Run: func(cmd *cobra.Command, args []string) {
-
 		token, err := cmd.Flags().GetString(token)
 		if err != nil {
 			cmd.Println(err.Error())
@@ -254,30 +257,15 @@ spice login databricks --token <access-token> --aws-region <aws-region> --aws-ac
 			os.Exit(1)
 		}
 
-		if awsRegion == "" {
-			cmd.Println("No AWS Region provided, use --aws-region")
-			os.Exit(1)
-		}
-
 		awsAccessKeyId, err := cmd.Flags().GetString(awsAccessKeyId)
 		if err != nil {
 			cmd.Println(err.Error())
 			os.Exit(1)
 		}
 
-		if awsAccessKeyId == "" {
-			cmd.Println("No AWS Access Key ID provided, use --aws-access-key-id")
-			os.Exit(1)
-		}
-
 		awsSecret, err := cmd.Flags().GetString(awsSecret)
 		if err != nil {
 			cmd.Println(err.Error())
-			os.Exit(1)
-		}
-
-		if awsSecret == "" {
-			cmd.Println("No AWS Secret Access Key provided, use --aws-secret-access-key")
 			os.Exit(1)
 		}
 

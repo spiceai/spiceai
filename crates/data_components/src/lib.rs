@@ -27,7 +27,12 @@ use crate::arrow::write::MemTable;
 
 pub mod arrow;
 #[cfg(feature = "databricks")]
-pub mod databricks;
+pub mod databricks_delta;
+#[cfg(feature = "databricks")]
+pub mod databricks_spark;
+
+#[cfg(feature = "databricks")]
+pub mod deltatable;
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
 pub mod flight;
@@ -37,11 +42,13 @@ pub mod flightsql;
 pub mod mysql;
 #[cfg(feature = "postgres")]
 pub mod postgres;
+#[cfg(feature = "databricks")]
+pub mod spark_connect;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 
 #[async_trait]
-pub trait Read {
+pub trait Read: Send + Sync {
     async fn table_provider(
         &self,
         table_reference: OwnedTableReference,
@@ -58,7 +65,7 @@ pub trait ReadWrite: Send + Sync {
 
 /// Similar to the `Read` trait above, but the `TableProvider.scan()` method returns ExecutionPlans that are unbounded (i.e. streaming).
 #[async_trait]
-pub trait Stream {
+pub trait Stream: Send + Sync {
     async fn table_provider(
         &self,
         table_reference: OwnedTableReference,
