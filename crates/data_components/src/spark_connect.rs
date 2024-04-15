@@ -174,6 +174,7 @@ struct SparkConnectExecutionPlan {
 }
 
 impl SparkConnectExecutionPlan {
+    #[allow(clippy::needless_pass_by_value)]
     pub fn new(
         dataframe: DataFrame,
         schema: SchemaRef,
@@ -184,8 +185,13 @@ impl SparkConnectExecutionPlan {
         let projected_schema = project_schema(&schema, projections)?;
         let limit = limit
             .map(|u| {
-                if u as u32 <= i32::MAX as u32 {
-                    Ok(u as i32)
+                let Ok(u) = u32::try_from(u) else {
+                    return Err(DataFusionError::Execution(
+                        "Value is too large to fit in a u32".to_string(),
+                    ));
+                };
+                if let Ok(u) = i32::try_from(u) {
+                    Ok(u)
                 } else {
                     Err(DataFusionError::Execution(
                         "Value is too large to fit in an i32".to_string(),
@@ -207,7 +213,7 @@ impl DisplayAs for SparkConnectExecutionPlan {
         let filters: Vec<String> = self
             .filters
             .iter()
-            .map(|f| f.to_string())
+            .map(ToString::to_string)
             .collect::<Vec<_>>();
         write!(
             f,
