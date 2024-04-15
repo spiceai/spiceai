@@ -118,7 +118,7 @@ impl AcceleratedTable {
             handlers.push(scheduled_refreshes_handle);
         }
 
-        if retention_enabled {
+        if retention_enabled && refresh_mode == RefreshMode::Append {
             if let (Some(time_column), Some(retention_period), Some(retention_check_interval)) =
                 (time_column, retention_period, retention_check_interval)
             {
