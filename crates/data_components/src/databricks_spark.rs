@@ -23,12 +23,13 @@ use std::{collections::HashMap, error::Error, sync::Arc};
 use crate::{spark_connect, Read, ReadWrite};
 
 #[derive(Clone)]
-pub struct Databricks {
+#[allow(clippy::module_name_repetitions)]
+pub struct DatabricksSparkConnect {
     pub secret: Arc<Option<Secret>>,
     pub params: Arc<Option<HashMap<String, String>>>,
     session: Arc<SparkSession>,
 }
-impl Databricks {
+impl DatabricksSparkConnect {
     pub async fn new(
         secret: Arc<Option<Secret>>,
         params: Arc<Option<HashMap<String, String>>>,
@@ -56,7 +57,7 @@ impl Databricks {
         if let Some(user_val) = param_deref.get("endpoint") {
             user = user_val.as_str();
         };
-        let connection =format!("sc://{endpoint}:443/;user_id={user};session_id=0d2af2a9-cc3c-4d4b-bf27-e2fefeaca233;token={token};x-databricks-cluster-id={cluster_id}");
+        let connection = format!("sc://{endpoint}:443/;user_id={user};session_id=0d2af2a9-cc3c-4d4b-bf27-e2fefeaca233;token={token};x-databricks-cluster-id={cluster_id}");
         let session = Arc::new(
             SparkSessionBuilder::remote(connection.as_str())
                 .build()
@@ -71,7 +72,7 @@ impl Databricks {
 }
 
 #[async_trait]
-impl ReadWrite for Databricks {
+impl ReadWrite for DatabricksSparkConnect {
     async fn table_provider(
         &self,
         table_reference: OwnedTableReference,
@@ -83,7 +84,7 @@ impl ReadWrite for Databricks {
 }
 
 #[async_trait]
-impl Read for Databricks {
+impl Read for DatabricksSparkConnect {
     async fn table_provider(
         &self,
         table_reference: OwnedTableReference,
