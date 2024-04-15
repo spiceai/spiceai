@@ -19,8 +19,11 @@ use std::{error::Error, sync::Arc};
 
 use async_trait::async_trait;
 use datafusion::{
-    common::OwnedTableReference, datasource::TableProvider, error::DataFusionError, execution::context::SessionState, logical_expr::Expr, physical_plan::ExecutionPlan
+    common::OwnedTableReference, datasource::TableProvider, error::DataFusionError,
+    execution::context::SessionState, logical_expr::Expr, physical_plan::ExecutionPlan,
 };
+
+use crate::arrow::write::MemTable;
 
 pub mod arrow;
 #[cfg(feature = "databricks")]
@@ -71,4 +74,15 @@ pub trait DeleteTableProvider: TableProvider {
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         Err(DataFusionError::Plan("Not implemented".to_string()))
     }
+}
+
+// There is no good way to allow inter trait casting yet as TableProvider is not controlled
+pub fn cast_to_deleteable<'a>(
+    from: &'a dyn TableProvider,
+) -> Option<&'a (dyn DeleteTableProvider + 'a)> {
+    if let Some(p) = from.as_any().downcast_ref::<MemTable>() {
+        return Some(p);
+    }
+
+    None
 }

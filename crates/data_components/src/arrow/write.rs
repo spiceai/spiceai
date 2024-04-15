@@ -35,7 +35,7 @@ use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::insert::{DataSink, FileSinkExec};
 use datafusion::physical_plan::memory::MemoryExec;
 use datafusion::physical_plan::metrics::MetricsSet;
-use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan};
+use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::StreamExt;
 use tokio::sync::RwLock;
 
@@ -194,6 +194,69 @@ impl DeleteTableProvider for MemTable {
         _state: &SessionState,
         _filters: &[Expr],
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(MemDeletionExec::new(self.batches.clone())))
+    }
+}
+
+struct MemDeletionExec {
+    batches: Vec<PartitionData>,
+}
+
+impl MemDeletionExec {
+    fn new(batches: Vec<PartitionData>) -> Self {
+        Self { batches }
+    }
+}
+
+impl std::fmt::Debug for MemDeletionExec {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "DataUpdateExecutionPlan")
+    }
+}
+
+impl DisplayAs for MemDeletionExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> std::fmt::Result {
+        write!(f, "DataUpdateExecutionPlan")
+    }
+}
+
+impl ExecutionPlan for MemDeletionExec {
+    fn name(&self) -> &'static str {
+        "MemDeletionExec"
+    }
+
+    /// Return a reference to Any that can be used for downcasting
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    /// Execute the plan and return a stream of `RecordBatch`es for
+    /// the specified partition.
+    fn execute(
+        &self,
+        _partition: usize,
+        _context: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
+        let _ = self.batches;
+        tracing::error!("Not implemented for in-mem yet");
+        todo!()
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        tracing::error!("Not implemented for in-mem yet properties");
+        todo!()
+    }
+
+    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
+        tracing::error!("Not implemented for in-mem yet children");
+        todo!()
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        tracing::error!("Not implemented for in-mem yet with_new_children");
         todo!()
     }
 }

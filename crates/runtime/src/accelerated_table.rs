@@ -3,8 +3,7 @@ use std::{any::Any, sync::Arc, time::Duration};
 use arrow::datatypes::SchemaRef;
 use async_stream::stream;
 use async_trait::async_trait;
-use data_components::arrow::write::MemTable;
-use data_components::DeleteTableProvider;
+use data_components::cast_to_deleteable;
 use datafusion::common::OwnedTableReference;
 use datafusion::error::Result as DataFusionResult;
 use datafusion::execution::context::SessionState;
@@ -197,7 +196,7 @@ impl AcceleratedTable {
         loop {
             interval_timer.tick().await;
 
-            let deleted_table_provider = accelerator.as_any().downcast_ref::<MemTable>();
+            let deleted_table_provider = cast_to_deleteable(accelerator.as_ref());
 
             if let Some(deleted_table_provider) = deleted_table_provider {
                 let ctx = SessionContext::new();
