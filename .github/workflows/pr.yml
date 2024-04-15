@@ -35,6 +35,9 @@ jobs:
         uses: ./.github/actions/setup-rust
         with:
           os: 'linux'
+      
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v3
 
       - run: make lint
 
