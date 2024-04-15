@@ -68,7 +68,7 @@ func GetData[T interface{}](rtcontext *context.RuntimeContext, path string) ([]T
 	return result, nil
 }
 
-func DoRuntimePostRequest[T interface{}](rtcontext *context.RuntimeContext, path string) (T, error) {
+func PostRuntime[T interface{}](rtcontext *context.RuntimeContext, path string) (T, error) {
 	return doRuntimeApiRequest[T](rtcontext, POST, path)
 }
 

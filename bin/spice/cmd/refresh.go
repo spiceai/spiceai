@@ -40,12 +40,12 @@ spice refresh taxi_trips
 	Run: func(cmd *cobra.Command, args []string) {
 		dataset := args[0]
 
-		cmd.Printf("Initiating refresh for dataset %s ...\n", dataset)
+		cmd.Printf("Refreshing dataset %s ...\n", dataset)
 
 		rtcontext := context.NewContext()
 
 		url := fmt.Sprintf("/v1/datasets/%s/refresh", dataset)
-		res, err := api.DoRuntimePostRequest[DatasetRefreshApiResponse](rtcontext, url)
+		res, err := api.PostRuntime[DatasetRefreshApiResponse](rtcontext, url)
 		if err != nil {
 			cmd.PrintErrln(err.Error())
 			return
