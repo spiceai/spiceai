@@ -713,6 +713,10 @@ jobs:
           echo "    acceleration:" >> spicepod.yaml
           echo "      enabled: true" >> spicepod.yaml
           echo "      engine: $ENGINE" >> spicepod.yaml
+          if [[ -n "$MODE" ]]; then
+            echo "      mode: $MODE" >> spicepod.yaml
+          fi
+          echo "      refresh_sql: SELECT * FROM eth_recent_blocks LIMIT 1" >> spicepod.yaml
           echo "    params:" >> spicepod.yaml
           echo "      pg_host: localhost" >> spicepod.yaml
           echo "      pg_port: '5432'" >> spicepod.yaml
@@ -720,9 +724,6 @@ jobs:
           echo "      pg_user: postgres" >> spicepod.yaml
           echo "      pg_pass_key: password" >> spicepod.yaml
           echo "      pg_sslmode: disable" >> spicepod.yaml
-          if [[ -n "$MODE" ]]; then
-            echo "      mode: $MODE" >> spicepod.yaml
-          fi
           # configure env secret store
           echo -e "secrets:\n  store: env\n" >> spicepod.yaml
           cat spicepod.yaml
@@ -752,6 +753,18 @@ jobs:
             echo "Unexpected response: $response, expected 1 dataset but received $length"
             exit 1
           fi
+      - name: Manually refresh dataset
+        working-directory: test_app
+        run: |
+          output=$(spice refresh eth_recent_blocks 2>&1)
+          echo "$output"
+          if [[ $output == *"Dataset refresh triggered"* ]]; then
+            # time to refresh dataset
+            sleep 5
+          else
+            echo "Failed to trigger dataset refresh."
+            exit 1
+          fi
 
       - name: Check eth_recent_blocks table exists
         working-directory: test_app
@@ -775,6 +788,10 @@ jobs:
           echo "$sql_output"
           if [[ $sql_output == *"error"* ]] || [[ $sql_output == *"not found"* ]]; then
             echo "Unexpected response from spice sql, failed to perform test query: $sql_output"
+            exit 1
+          fi
+          if ![[ $sql_output == *"1/1 rows displayed"* ]]; then
+            echo "Query did not return the expected number of rows defined by `refresh_sql` statement."
             exit 1
           fi
 
