@@ -189,7 +189,7 @@ impl TableProvider for MemTable {
 
 #[async_trait]
 impl DeleteTableProvider for MemTable {
-    async fn delete(
+    async fn delete_from(
         &self,
         _state: &SessionState,
         _filters: &[Expr],

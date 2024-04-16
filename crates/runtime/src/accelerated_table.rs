@@ -201,7 +201,7 @@ impl AcceleratedTable {
             if let Some(deleted_table_provider) = deleted_table_provider {
                 let ctx = SessionContext::new();
 
-                let plan = deleted_table_provider.delete(&ctx.state(), &[]).await;
+                let plan = deleted_table_provider.delete_from(&ctx.state(), &[]).await;
                 match plan {
                     Ok(plan) => {
                         if let Err(e) = collect(plan, ctx.task_ctx()).await {

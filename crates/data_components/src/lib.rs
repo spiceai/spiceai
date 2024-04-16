@@ -74,7 +74,7 @@ pub trait Stream: Send + Sync {
 
 #[async_trait]
 pub trait DeleteTableProvider: TableProvider {
-    async fn delete(
+    async fn delete_from(
         &self,
         _state: &SessionState,
         _filters: &[Expr],
