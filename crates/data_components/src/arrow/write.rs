@@ -28,6 +28,7 @@ use arrow::datatypes::{DataType, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use datafusion::common::{Constraints, SchemaExt};
+use datafusion::dataframe::DataFrame;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::SessionState;
@@ -197,11 +198,12 @@ impl DeleteTableProvider for MemTable {
     async fn delete_from(
         &self,
         _state: &SessionState,
-        _filters: &[Expr],
+        filters: &'static [Expr],
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(MemDeletionExec::new(
             self.batches.clone(),
             self.schema.clone(),
+            filters,
         )))
     }
 }
@@ -209,11 +211,12 @@ impl DeleteTableProvider for MemTable {
 struct MemDeletionExec {
     batches: Vec<PartitionData>,
     schema: SchemaRef,
+    filters: &'static [Expr],
     properties: PlanProperties,
 }
 
 impl MemDeletionExec {
-    fn new(batches: Vec<PartitionData>, schema: SchemaRef) -> Self {
+    fn new(batches: Vec<PartitionData>, schema: SchemaRef, filters: &'static [Expr]) -> Self {
         let properties = PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
             Partitioning::UnknownPartitioning(1),
@@ -222,6 +225,7 @@ impl MemDeletionExec {
         Self {
             batches,
             schema,
+            filters,
             properties,
         }
     }
@@ -274,10 +278,47 @@ impl ExecutionPlan for MemDeletionExec {
         _partition: usize,
         _context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        let stream = futures::stream::once(async move {
-            let array = Arc::new(UInt64Array::from(vec![1])) as ArrayRef;
+        let batches = self.batches.clone();
 
-            Ok(RecordBatch::try_from_iter_with_nullable(vec![("count", array, false)]).unwrap())
+        if self.filters.len() > 1 {
+            return Err(DataFusionError::Execution(format!(
+                "only 1 filter is supported in {}",
+                self.name()
+            )));
+        }
+
+        if let Some(Expr::BinaryExpr(binary_expr)) = self.filters.first() {
+            if let Expr::Column(column) = &*binary_expr.left {
+                if self.schema().index_of(&column.name).is_err() {
+                    return Err(DataFusionError::Execution(format!(
+                        "column {} does not exist in schema",
+                        self.name()
+                    )));
+                }
+            }
+        }
+
+        let stream = futures::stream::once(async move {
+            let mut count: u64 = 0;
+            for partition in batches {
+                let mut partition_vec = partition.write().await;
+                for record_batch in &*partition_vec {
+                    count += record_batch.num_rows() as u64;
+                }
+                partition_vec.clear();
+                drop(partition_vec);
+            }
+            let array = Arc::new(UInt64Array::from(vec![count])) as ArrayRef;
+
+            if let Ok(batch) =
+                RecordBatch::try_from_iter_with_nullable(vec![("count", array, false)])
+            {
+                Ok(batch)
+            } else {
+                Err(DataFusionError::Execution(
+                    "failed to create record batch".to_string(),
+                ))
+            }
         })
         .boxed();
 

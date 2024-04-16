@@ -1,5 +1,6 @@
 use std::{any::Any, sync::Arc, time::Duration};
 
+use arrow::array::UInt64Array;
 use arrow::datatypes::SchemaRef;
 use async_stream::stream;
 use async_trait::async_trait;
@@ -103,7 +104,7 @@ impl AcceleratedTable {
         };
 
         let refresh_handle = tokio::spawn(Self::start_refresh(
-            dataset_name,
+            dataset_name.clone(),
             Arc::clone(&federated),
             acceleration_refresh_mode,
             refresh_sql,
@@ -124,6 +125,7 @@ impl AcceleratedTable {
                 (time_column, retention_period, retention_check_interval)
             {
                 let retention_check_handle = tokio::spawn(Self::start_retention_check(
+                    dataset_name,
                     Arc::clone(&accelerator),
                     retention_check_interval,
                     time_column,
@@ -184,6 +186,7 @@ impl AcceleratedTable {
     }
 
     async fn start_retention_check(
+        dataset_name: String,
         accelerator: Arc<dyn TableProvider>,
         interval: Duration,
         time_column: String,
@@ -194,27 +197,42 @@ impl AcceleratedTable {
         let _ = time_format;
         let _ = time_column;
         let mut interval_timer = tokio::time::interval(interval);
+
         loop {
             interval_timer.tick().await;
 
-            let deleted_table_provider = cast_to_deleteable(accelerator.as_ref());
+            tracing::info!("[retention] Running retention check for {dataset_name}...");
 
-            if let Some(deleted_table_provider) = deleted_table_provider {
+            if let Some(deleted_table_provider) = cast_to_deleteable(accelerator.as_ref()) {
                 let ctx = SessionContext::new();
 
                 let plan = deleted_table_provider.delete_from(&ctx.state(), &[]).await;
                 match plan {
                     Ok(plan) => {
-                        if let Err(e) = collect(plan, ctx.task_ctx()).await {
-                            tracing::error!("Error running retention check: {e}");
+                        match collect(plan, ctx.task_ctx()).await {
+                            Err(e) => {
+                                tracing::error!("[retention] Error running retention check: {e}");
+                            }
+                            Ok(deleted) => {
+                                let result = deleted.first().map_or(0, |f| {
+                                    f.column(0)
+                                        .as_any()
+                                        .downcast_ref::<UInt64Array>()
+                                        .map_or(0, |v| v.values().first().map_or(0, |f| *f))
+                                });
+
+                                tracing::info!(
+                                    "[retention] Evicted {result} records for {dataset_name}",
+                                );
+                            }
                         };
                     }
                     Err(e) => {
-                        tracing::error!("Error running retention check: {e}");
+                        tracing::error!("[retention] Error running retention check: {e}");
                     }
                 }
             } else {
-                tracing::error!("Accelerated table does not support delete");
+                tracing::error!("[retention] Accelerated table does not support delete");
             }
         }
     }
