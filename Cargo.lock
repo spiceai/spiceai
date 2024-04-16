@@ -170,7 +170,7 @@ checksum = "d301b3b94cb4b2f23d7917810addbbaff90738e0ca2be692bd027e70d7e0330c"
 
 [[package]]
 name = "app"
-version = "0.11.0-alpha"
+version = "0.11.1-alpha"
 dependencies = [
  "snafu 0.8.2",
  "spicepod",
@@ -659,7 +659,7 @@ dependencies = [
 
 [[package]]
 name = "arrow_sql_gen"
-version = "0.11.0-alpha"
+version = "0.11.1-alpha"
 dependencies = [
  "arrow 51.0.0",
  "bigdecimal 0.3.1",
@@ -2168,7 +2168,7 @@ checksum = "7e962a19be5cfc3f3bf6dd8f61eb50107f356ad6270fbb3ed41476571db78be5"
 
 [[package]]
 name = "data_components"
-version = "0.11.0-alpha"
+version = "0.11.1-alpha"
 dependencies = [
  "arrow 51.0.0",
  "arrow-flight",
@@ -2698,7 +2698,7 @@ dependencies = [
 
 [[package]]
 name = "db_connection_pool"
-version = "0.11.0-alpha"
+version = "0.11.1-alpha"
 dependencies = [
  "arrow 51.0.0",
  "arrow_sql_gen",
@@ -3339,7 +3339,7 @@ dependencies = [
 
 [[package]]
 name = "flight_client"
-version = "0.11.0-alpha"
+version = "0.11.1-alpha"
 dependencies = [
  "arrow 51.0.0",
  "arrow-flight",
@@ -3356,7 +3356,7 @@ dependencies = [
 
 [[package]]
 name = "flightpublisher"
-version = "0.11.0-alpha"
+version = "0.11.1-alpha"
 dependencies = [
  "arrow 51.0.0",
  "arrow-flight",
@@ -3370,7 +3370,7 @@ dependencies = [
 
 [[package]]
 name = "flightrepl"
-version = "0.11.0-alpha"
+version = "0.11.1-alpha"
 dependencies = [
  "ansi_term",
  "arrow 51.0.0",
@@ -3389,7 +3389,7 @@ dependencies = [
 
 [[package]]
 name = "flightsubscriber"
-version = "0.11.0-alpha"
+version = "0.11.1-alpha"
 dependencies = [
  "arrow 51.0.0",
  "arrow-flight",
@@ -4906,7 +4906,7 @@ dependencies = [
 
 [[package]]
 name = "ns_lookup"
-version = "0.11.0-alpha"
+version = "0.11.1-alpha"
 dependencies = [
  "snafu 0.8.2",
  "tracing",
@@ -6083,7 +6083,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "0.11.0-alpha"
+version = "0.11.1-alpha"
 dependencies = [
  "app",
  "arrow 51.0.0",
@@ -6647,7 +6647,7 @@ dependencies = [
 
 [[package]]
 name = "secrets"
-version = "0.11.0-alpha"
+version = "0.11.1-alpha"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -6971,7 +6971,7 @@ dependencies = [
 
 [[package]]
 name = "spiced"
-version = "0.11.0-alpha"
+version = "0.11.1-alpha"
 dependencies = [
  "app",
  "clap",
@@ -6988,7 +6988,7 @@ dependencies = [
 
 [[package]]
 name = "spicepod"
-version = "0.11.0-alpha"
+version = "0.11.1-alpha"
 dependencies = [
  "fundu",
  "serde",
@@ -7011,7 +7011,7 @@ checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
 
 [[package]]
 name = "sql_provider_datafusion"
-version = "0.11.0-alpha"
+version = "0.11.1-alpha"
 dependencies = [
  "async-trait",
  "datafusion 37.0.0",
