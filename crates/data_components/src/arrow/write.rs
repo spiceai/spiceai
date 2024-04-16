@@ -23,7 +23,8 @@ use std::collections::HashMap;
 use std::fmt::{self, Debug};
 use std::sync::{Arc, Mutex};
 
-use arrow::datatypes::SchemaRef;
+use arrow::array::{ArrayRef, UInt64Array};
+use arrow::datatypes::{DataType, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use datafusion::common::{Constraints, SchemaExt};
@@ -32,10 +33,14 @@ use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::SessionState;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::Expr;
+use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::insert::{DataSink, FileSinkExec};
 use datafusion::physical_plan::memory::MemoryExec;
 use datafusion::physical_plan::metrics::MetricsSet;
-use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::{
+    DisplayAs, DisplayFormatType, ExecutionMode, ExecutionPlan, Partitioning, PlanProperties,
+};
 use futures::StreamExt;
 use tokio::sync::RwLock;
 
@@ -194,17 +199,31 @@ impl DeleteTableProvider for MemTable {
         _state: &SessionState,
         _filters: &[Expr],
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(MemDeletionExec::new(self.batches.clone())))
+        Ok(Arc::new(MemDeletionExec::new(
+            self.batches.clone(),
+            self.schema.clone(),
+        )))
     }
 }
 
 struct MemDeletionExec {
     batches: Vec<PartitionData>,
+    schema: SchemaRef,
+    properties: PlanProperties,
 }
 
 impl MemDeletionExec {
-    fn new(batches: Vec<PartitionData>) -> Self {
-        Self { batches }
+    fn new(batches: Vec<PartitionData>, schema: SchemaRef) -> Self {
+        let properties = PlanProperties::new(
+            EquivalenceProperties::new(schema.clone()),
+            Partitioning::UnknownPartitioning(1),
+            ExecutionMode::Bounded,
+        );
+        Self {
+            batches,
+            schema,
+            properties,
+        }
     }
 }
 
@@ -230,6 +249,24 @@ impl ExecutionPlan for MemDeletionExec {
         self
     }
 
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        Ok(self)
+    }
     /// Execute the plan and return a stream of `RecordBatch`es for
     /// the specified partition.
     fn execute(
@@ -237,27 +274,23 @@ impl ExecutionPlan for MemDeletionExec {
         _partition: usize,
         _context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        let _ = self.batches;
-        tracing::error!("Not implemented for in-mem yet");
-        todo!()
-    }
+        let stream = futures::stream::once(async move {
+            let array = Arc::new(UInt64Array::from(vec![1])) as ArrayRef;
 
-    fn properties(&self) -> &PlanProperties {
-        tracing::error!("Not implemented for in-mem yet properties");
-        todo!()
-    }
+            Ok(RecordBatch::try_from_iter_with_nullable(vec![("count", array, false)]).unwrap())
+        })
+        .boxed();
 
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
-        tracing::error!("Not implemented for in-mem yet children");
-        todo!()
-    }
+        let count_schema = Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
+            "count",
+            DataType::UInt64,
+            false,
+        )]));
 
-    fn with_new_children(
-        self: Arc<Self>,
-        _children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        tracing::error!("Not implemented for in-mem yet with_new_children");
-        todo!()
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            count_schema,
+            stream,
+        )))
     }
 }
 
