@@ -134,14 +134,19 @@ jobs:
           chmod +x spiced
           tar cf spiced_${{ matrix.target_os }}_${{ matrix.target_arch }}.tar.gz spiced
 
-      - name: copy binary
+      - name: tar binary (Windows)
         if: matrix.target_os == 'windows'
         run: |
           mv target/release/spiced.exe spiced.exe
+          tar cf spiced.exe_${{ matrix.target_os }}_${{ matrix.target_arch }}.tar.gz spiced.exe
 
       - name: Print version
         if: matrix.target_os != 'windows'
         run: ./spiced --version
+      
+      - name: Print version (Windows)
+        if: matrix.target_os == 'windows'
+        run: ./spiced.exe --version
 
       - uses: actions/upload-artifact@v4
         if: matrix.target_os != 'windows'
@@ -152,8 +157,8 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: matrix.target_os == 'windows'
         with:
-          name: spiced_${{ matrix.target_os }}_${{ matrix.target_arch }}
-          path: spiced.exe
+          name: spiced.exe_${{ matrix.target_os }}_${{ matrix.target_arch }}
+          path: spiced.exe_${{ matrix.target_os }}_${{ matrix.target_arch }}.tar.gz
 
       - name: tar binary
         if: matrix.target_os != 'windows'
@@ -162,14 +167,19 @@ jobs:
           chmod +x spice
           tar cf spice_${{ matrix.target_os }}_${{ matrix.target_arch }}.tar.gz spice
 
-      - name: copy binary
+      - name: tar binary (Windows)
         if: matrix.target_os == 'windows'
         run: |
           mv target/release/spice.exe spice.exe
+          tar cf spice.exe_${{ matrix.target_os }}_${{ matrix.target_arch }}.tar.gz spice.exe
 
       - name: Print version
         if: matrix.target_os != 'windows'
         run: ./spice version
+      
+      - name: Print version (Windows)
+        if: matrix.target_os == 'windows'
+        run: ./spice.exe version
 
       - uses: actions/upload-artifact@v4
         if: matrix.target_os != 'windows'
@@ -180,8 +190,8 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: matrix.target_os == 'windows'
         with:
-          name: spice_${{ matrix.target_os }}_${{ matrix.target_arch }}
-          path: spice.exe
+          name: spice.exe_${{ matrix.target_os }}_${{ matrix.target_arch }}
+          path: spice.exe_${{ matrix.target_os }}_${{ matrix.target_arch }}.tar.gz
 
   publish:
     name: Publish ${{ matrix.target_os }}-${{ matrix.target_arch }} binaries
@@ -212,15 +222,31 @@ jobs:
         run: python3 ./.github/scripts/get_release_version.py
 
       - name: download artifacts - spice_${{ matrix.target_os }}_${{ matrix.target_arch }}
+        if: matrix.target_os != 'windows'
         uses: actions/download-artifact@v4
         with:
           name: spice_${{ matrix.target_os }}_${{ matrix.target_arch }}
           path: ${{ env.ARTIFACT_DIR }}
+      
+      - name: download artifacts - spice_${{ matrix.target_os }}_${{ matrix.target_arch }}
+        if: matrix.target_os == 'windows'
+        uses: actions/download-artifact@v4
+        with:
+          name: spice.exe_${{ matrix.target_os }}_${{ matrix.target_arch }}
+          path: ${{ env.ARTIFACT_DIR }}
 
       - name: download artifacts - spiced_${{ matrix.target_os }}_${{ matrix.target_arch }}
+        if: matrix.target_os != 'windows'
         uses: actions/download-artifact@v4
         with:
           name: spiced_${{ matrix.target_os }}_${{ matrix.target_arch }}
+          path: ${{ env.ARTIFACT_DIR }}
+
+      - name: download artifacts - spiced_${{ matrix.target_os }}_${{ matrix.target_arch }}
+        if: matrix.target_os == 'windows'
+        uses: actions/download-artifact@v4
+        with:
+          name: spiced.exe_${{ matrix.target_os }}_${{ matrix.target_arch }}
           path: ${{ env.ARTIFACT_DIR }}
 
       - name: lists artifacts
