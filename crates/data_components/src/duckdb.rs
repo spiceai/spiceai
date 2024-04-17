@@ -183,18 +183,7 @@ impl DuckDB {
     ) -> Result<
         Box<dyn DbConnection<r2d2::PooledConnection<DuckdbConnectionManager>, &'static dyn ToSql>>,
     > {
-        let mut conn = self.pool.connect().await.context(DbConnectionSnafu)?;
-
-        let duckdb_conn = Self::duckdb_conn(&mut conn)?;
-
-        if !self.table_exists(duckdb_conn) {
-            TableDoesntExistSnafu {
-                table_name: self.table_name.clone(),
-            }
-            .fail()?;
-        }
-
-        Ok(conn)
+        self.pool.connect().await.context(DbConnectionSnafu)
     }
 
     fn duckdb_conn<'a>(
@@ -206,23 +195,6 @@ impl DuckDB {
             .as_any_mut()
             .downcast_mut::<DuckDbConnection>()
             .context(UnableToDowncastDbConnectionSnafu)
-    }
-
-    fn table_exists(&self, duckdb_conn: &mut DuckDbConnection) -> bool {
-        let sql = format!(
-            r#"SELECT EXISTS (
-            SELECT 1
-            FROM information_schema.tables 
-            WHERE table_name = '{name}'
-          )"#,
-            name = self.table_name
-        );
-        tracing::trace!("{sql}");
-
-        duckdb_conn
-            .conn
-            .query_row(&sql, [], |row| row.get::<usize, bool>(0))
-            .unwrap_or(false)
     }
 
     const MAX_BATCH_SIZE: usize = 2048;
