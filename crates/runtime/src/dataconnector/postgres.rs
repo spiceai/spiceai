@@ -31,7 +31,7 @@ use super::{DataConnector, DataConnectorFactory};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to create Postgres connection pool: {source}"))]
+    #[snafu(display("{source}"))]
     UnableToCreatePostgresConnectionPool { source: db_connection_pool::Error },
 
     #[snafu(display("{source}"))]
