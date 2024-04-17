@@ -23,7 +23,6 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::fmt::{self, Debug};
 
-use std::ops::DerefMut;
 use std::sync::{Arc, Mutex};
 
 use arrow::array::{ArrayRef, UInt64Array};
@@ -44,7 +43,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionMode, ExecutionPlan, Partitioning, PlanProperties,
 };
-use futures::{Stream, StreamExt};
+use futures::StreamExt;
 use tokio::sync::RwLock;
 
 use crate::DeleteTableProvider;
@@ -289,14 +288,14 @@ impl ExecutionPlan for MemDeletionExec {
         Ok(Box::pin(RecordBatchStreamAdapter::new(count_schema, {
             let batches = self.batches.clone();
             let schema = self.schema();
-            let _filters = self.filters.to_vec();
+            let filters = self.filters.clone();
             futures::stream::once(async move {
                 let ctx = SessionContext::new();
                 let mut tmp_batches = vec![vec![]; batches.len()];
 
                 for (i, partition) in batches.iter().enumerate() {
                     let mut partition_vec = partition.write().await;
-                    tmp_batches[i].append(partition_vec.deref_mut());
+                    tmp_batches[i].append(&mut *partition_vec);
                 }
 
                 let provider = MemTable::try_new(schema, tmp_batches)?;
@@ -313,7 +312,7 @@ impl ExecutionPlan for MemDeletionExec {
 
                 let mut count = df.clone().count().await?;
 
-                for filter in _filters {
+                for filter in filters {
                     df = df.filter(filter)?;
                 }
 

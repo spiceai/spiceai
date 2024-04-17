@@ -1,4 +1,4 @@
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, SystemTimeError, UNIX_EPOCH};
 use std::{any::Any, sync::Arc, time::Duration};
 
 use arrow::array::UInt64Array;
@@ -6,10 +6,10 @@ use arrow::datatypes::SchemaRef;
 use async_stream::stream;
 use async_trait::async_trait;
 use data_components::cast_to_deleteable;
-use datafusion::common::{Column, OwnedTableReference};
+use datafusion::common::OwnedTableReference;
 use datafusion::error::Result as DataFusionResult;
 use datafusion::execution::context::SessionState;
-use datafusion::logical_expr::{col, lit, lit_timestamp_nano, BinaryExpr, Operator, TableProviderFilterPushDown};
+use datafusion::logical_expr::{col, TableProviderFilterPushDown};
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{collect, ExecutionPlan, ExecutionPlanProperties};
 use datafusion::scalar::ScalarValue;
@@ -42,7 +42,9 @@ use crate::{
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Unable to get data from connector: {source}"))]
-    UnableToGetDataFromConnector { source: dataconnector::Error },
+    UnableToGetDataFromConnector {
+        source: dataconnector::Error,
+    },
 
     #[snafu(display("Unable to scan table provider: {source}"))]
     UnableToScanTableProvider {
@@ -56,6 +58,10 @@ pub enum Error {
 
     #[snafu(display("Manual refresh is not supported for `append` mode"))]
     ManualRefreshIsNotSupported {},
+
+    UnableToGetUnixTimestamp {
+        source: SystemTimeError,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -187,6 +193,7 @@ impl AcceleratedTable {
         None
     }
 
+    #[allow(clippy::cast_possible_wrap)]
     async fn start_retention_check(
         dataset_name: String,
         accelerator: Arc<dyn TableProvider>,
@@ -209,13 +216,23 @@ impl AcceleratedTable {
                 let ctx = SessionContext::new();
 
                 let start = SystemTime::now();
-                let since_the_epoch = (start - retention_period)
-                    .duration_since(UNIX_EPOCH)
-                    .expect("Time went backwards").as_secs();
-                let expr = col(time_column.clone())
-                    .gt(Expr::Literal(ScalarValue::TimestampSecond(Some(since_the_epoch as i64), None)));
+                let since_the_epoch = (start - retention_period).duration_since(UNIX_EPOCH);
 
-                tracing::info!("[retention] Evicting data for {dataset_name} {:?} {:?}...", expr, retention_period);
+                if since_the_epoch.clone().is_err() {
+                    tracing::error!("[retention] Failed to get the unix timestamp");
+                }
+
+                let since_the_epoch = since_the_epoch.map_or(0, |f| f.as_secs());
+
+                let expr = col(time_column.clone()).gt(Expr::Literal(
+                    ScalarValue::TimestampSecond(Some(since_the_epoch as i64), None),
+                ));
+
+                tracing::info!(
+                    "[retention] Evicting data for {dataset_name} {:?} {:?}...",
+                    expr,
+                    retention_period
+                );
 
                 let plan = deleted_table_provider
                     .delete_from(&ctx.state(), &vec![expr])
