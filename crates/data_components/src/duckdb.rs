@@ -79,7 +79,7 @@ pub enum Error {
     #[snafu(display("Unable to insert data into the Sqlite table: {source}"))]
     UnableToInsertIntoTableAsync { source: duckdb::Error },
 
-    #[snafu(display("The table '{table_name}' doesn't exist in the Postgres server"))]
+    #[snafu(display("The table '{table_name}' doesn't exist in the DuckDB server"))]
     TableDoesntExist { table_name: String },
 }
 
