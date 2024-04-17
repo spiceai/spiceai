@@ -89,7 +89,13 @@ impl<'a>
     async fn get_schema(&self, table_reference: &TableReference) -> Result<SchemaRef> {
         let rows = self
             .conn
-            .query(&format!("SELECT * FROM {table_reference} LIMIT 1"), &[])
+            .query(
+                &format!(
+                    "SELECT * FROM {} LIMIT 1",
+                    table_reference.to_quoted_string()
+                ),
+                &[],
+            )
             .await
             .context(QuerySnafu)?;
         let rec = rows_to_arrow(rows.as_slice()).context(ConversionSnafu)?;

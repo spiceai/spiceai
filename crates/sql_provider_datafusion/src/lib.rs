@@ -216,7 +216,7 @@ impl<T, P> SqlExec<T, P> {
 
         Ok(format!(
             "SELECT {columns} FROM {table_reference} {where_expr} {limit_expr}",
-            table_reference = self.table_reference,
+            table_reference = self.table_reference.to_quoted_string(),
         ))
     }
 }
@@ -298,6 +298,7 @@ mod tests {
     use std::{error::Error, sync::Arc};
 
     use datafusion::execution::context::SessionContext;
+    use datafusion::sql::TableReference;
     use db_connection_pool::dbconnection::duckdbconn::DuckDbConnection;
     use db_connection_pool::{duckdbpool::DuckDbConnectionPool, DbConnectionPool, Mode};
     use duckdb::{DuckdbConnectionManager, ToSql};
@@ -312,6 +313,12 @@ mod tests {
 
         let dispatch = Dispatch::new(subscriber);
         tracing::dispatcher::set_default(&dispatch)
+    }
+
+    #[test]
+    fn test_references() {
+        let table_ref = TableReference::bare("test");
+        assert_eq!(format!("{table_ref}"), "test");
     }
 
     #[tokio::test]

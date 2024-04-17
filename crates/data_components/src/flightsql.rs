@@ -368,7 +368,7 @@ impl FlightSqlExec {
         };
         Ok(format!(
             "SELECT {columns} FROM {table_reference} {where_expr} {limit_expr}",
-            table_reference = self.table_reference,
+            table_reference = self.table_reference.to_quoted_string(),
         ))
     }
 }

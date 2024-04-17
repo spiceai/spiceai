@@ -69,7 +69,7 @@ impl AsyncDbConnection<Connection, &'static (dyn ToSql + Sync)> for SqliteConnec
     }
 
     async fn get_schema(&self, table_reference: &TableReference) -> Result<SchemaRef> {
-        let table_reference = table_reference.to_string();
+        let table_reference = table_reference.to_quoted_string();
         let schema = self
             .conn
             .call(move |conn| {

@@ -16,9 +16,24 @@ limitations under the License.
 
 package constants
 
+import "runtime"
+
 const (
 	DotSpice               = ".spice"
 	SpicePodsDirectoryName = "spicepods"
-	SpiceRuntimeFilename   = "spiced"
-	SpiceCliFilename       = "spice"
 )
+
+var (
+	SpiceRuntimeFilename string
+	SpiceCliFilename     string
+)
+
+func init() {
+	if runtime.GOOS == "windows" {
+		SpiceRuntimeFilename = "spiced.exe"
+		SpiceCliFilename = "spice.exe"
+	} else {
+		SpiceRuntimeFilename = "spiced"
+		SpiceCliFilename = "spice"
+	}
+}

@@ -82,7 +82,6 @@ default = ["keyring-secret-store", "aws-secrets-manager"]
 dev = []
 duckdb = [
     "dep:duckdb",
-    "sql_provider_datafusion/duckdb",
     "r2d2",
     "db_connection_pool/duckdb",
     "spicepod/duckdb",
