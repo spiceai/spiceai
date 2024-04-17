@@ -40,7 +40,7 @@ function Download-And-Install-Spice {
     Write-Host "Downloading Spice Runtime from $runtimeDownloadUrl..."
     Invoke-WebRequest -Uri $runtimeDownloadUrl -OutFile $runtimeInstallPath
 
-    Temporary workaround for spice CLI to work on Windows (expect runtime binary as spiced instead of spiced.exe).
+    # Temporary workaround for spice CLI to work on Windows (expect runtime binary as spiced instead of spiced.exe).
     $emptySpicedPath = Join-Path $spiceCliInstallDir "spiced"
     $latestReleaseTag  | Out-File -FilePath $emptySpicedPath
 
