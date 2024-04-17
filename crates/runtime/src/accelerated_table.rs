@@ -2,14 +2,14 @@ use std::time::{SystemTime, SystemTimeError, UNIX_EPOCH};
 use std::{any::Any, sync::Arc, time::Duration};
 
 use arrow::array::UInt64Array;
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{DataType, SchemaRef};
 use async_stream::stream;
 use async_trait::async_trait;
 use data_components::cast_to_deleteable;
 use datafusion::common::OwnedTableReference;
 use datafusion::error::Result as DataFusionResult;
 use datafusion::execution::context::SessionState;
-use datafusion::logical_expr::{col, TableProviderFilterPushDown};
+use datafusion::logical_expr::{col, lit, TableProviderFilterPushDown};
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{collect, ExecutionPlan, ExecutionPlanProperties};
 use datafusion::scalar::ScalarValue;
@@ -79,6 +79,18 @@ pub(crate) struct AcceleratedTable {
 enum AccelerationRefreshMode {
     Full(Receiver<()>),
     Append,
+}
+
+#[derive(Debug, Clone)]
+enum ExprTimeFormat {
+    ISO8601,
+    UnixTimestamp(ExprUnixTimestamp),
+    Timestamp,
+}
+
+#[derive(Debug, Clone)]
+struct ExprUnixTimestamp {
+    scale: u64,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -193,7 +205,6 @@ impl AcceleratedTable {
         None
     }
 
-    #[allow(clippy::cast_possible_wrap)]
     async fn start_retention_check(
         dataset_name: String,
         accelerator: Arc<dyn TableProvider>,
@@ -207,6 +218,15 @@ impl AcceleratedTable {
         let _ = time_column;
         let mut interval_timer = tokio::time::interval(interval);
 
+        let schema = accelerator.schema();
+
+        let field = schema.column_with_name(time_column.as_str());
+
+        let Some(expr_time_format) = get_expr_time_format(field, &time_format) else {
+            tracing::error!("[retention] Failed to get the expression time format for {time_column}, check schema and time format");
+            return;
+        };
+
         loop {
             interval_timer.tick().await;
 
@@ -215,18 +235,10 @@ impl AcceleratedTable {
             if let Some(deleted_table_provider) = cast_to_deleteable(accelerator.as_ref()) {
                 let ctx = SessionContext::new();
 
-                let start = SystemTime::now();
-                let since_the_epoch = (start - retention_period).duration_since(UNIX_EPOCH);
-
-                if since_the_epoch.clone().is_err() {
-                    tracing::error!("[retention] Failed to get the unix timestamp");
-                }
-
-                let since_the_epoch = since_the_epoch.map_or(0, |f| f.as_secs());
-
-                let expr = col(time_column.clone()).gt(Expr::Literal(
-                    ScalarValue::TimestampSecond(Some(since_the_epoch as i64), None),
-                ));
+                let Some(expr) = get_expr(retention_period, &time_column, expr_time_format.clone())
+                else {
+                    continue;
+                };
 
                 tracing::info!(
                     "[retention] Evicting data for {dataset_name} {:?} {:?}...",
@@ -393,6 +405,72 @@ impl AcceleratedTable {
                 }
             }
         })
+    }
+}
+
+fn get_expr_time_format(
+    field: Option<(usize, &arrow::datatypes::Field)>,
+    time_format: &Option<TimeFormat>,
+) -> Option<ExprTimeFormat> {
+    let expr_time_format = match field {
+        Some(field) => match field.1.data_type() {
+            DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float16
+            | DataType::Float32
+            | DataType::Float64 => {
+                let mut scale = 1;
+                if let Some(time_format) = time_format.clone() {
+                    if time_format == TimeFormat::UnixMillis {
+                        scale = 1000;
+                    }
+                }
+                ExprTimeFormat::UnixTimestamp(ExprUnixTimestamp { scale })
+            }
+            DataType::Timestamp(_, _)
+            | DataType::Date32
+            | DataType::Date64
+            | DataType::Time32(_)
+            | DataType::Time64(_) => ExprTimeFormat::Timestamp,
+            DataType::Utf8 => ExprTimeFormat::ISO8601,
+            _ => {
+                return None;
+            }
+        },
+        None => {
+            return None;
+        }
+    };
+    Some(expr_time_format)
+}
+
+#[allow(clippy::cast_possible_wrap)]
+fn get_expr(
+    retention_period: Duration,
+    time_column: &str,
+    expr_time_format: ExprTimeFormat,
+) -> Option<Expr> {
+    let start = SystemTime::now();
+    let timestamp = (start - retention_period).duration_since(UNIX_EPOCH);
+    if timestamp.clone().is_err() {
+        tracing::error!("[retention] Failed to get the unix timestamp");
+    }
+    let timestamp = timestamp.map_or(0, |f| f.as_secs());
+
+    match expr_time_format {
+        ExprTimeFormat::ISO8601 => todo!(),
+        ExprTimeFormat::UnixTimestamp(format) => {
+            Some(col(time_column).gt(lit(timestamp * format.scale)))
+        }
+        ExprTimeFormat::Timestamp => Some(col(time_column).gt(Expr::Literal(
+            ScalarValue::TimestampMillisecond(Some((timestamp * 1000) as i64), None),
+        ))),
     }
 }
 
