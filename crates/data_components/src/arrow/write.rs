@@ -17,25 +17,25 @@
 
 //! [`MemTable`] for querying `Vec<RecordBatch>` by `DataFusion`.
 
-use arrow::compute::filter_record_batch;
 // This is modified from the DataFusion `MemTable` to support overwrites. This file can be removed once that change is upstreamed.
-use arrow_ord::cmp::gt;
+use datafusion::dataframe::DataFrame;
 use std::any::Any;
 use std::collections::HashMap;
 use std::fmt::{self, Debug};
 
+use std::ops::DerefMut;
 use std::sync::{Arc, Mutex};
 
-use arrow::array::{ArrayRef, Int64Array, Int8Array, UInt64Array};
+use arrow::array::{ArrayRef, UInt64Array};
 use arrow::datatypes::{DataType, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use datafusion::common::{Constraints, SchemaExt};
-use datafusion::datasource::{TableProvider, TableType};
+use datafusion::datasource::{provider_as_source, TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result};
-use datafusion::execution::context::SessionState;
+use datafusion::execution::context::{SessionContext, SessionState};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::logical_expr::Expr;
+use datafusion::logical_expr::{Expr, LogicalPlanBuilder};
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::insert::{DataSink, FileSinkExec};
 use datafusion::physical_plan::memory::MemoryExec;
@@ -280,96 +280,73 @@ impl ExecutionPlan for MemDeletionExec {
         _partition: usize,
         _context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        if self.filters.len() > 1 {
-            return Err(DataFusionError::Execution(format!(
-                "only 1 filter is supported in {}",
-                self.name()
-            )));
-        }
-
         let count_schema = Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
             "count",
             DataType::UInt64,
             false,
         )]));
 
-        if let Some(Expr::BinaryExpr(binary_expr)) = self.filters.first() {
-            if let (Expr::Column(column), Expr::Literal(_)) =
-                (&*binary_expr.left, &*binary_expr.right)
-            {
-                let column_index = self.schema().index_of(&column.name)? as i32;
-                return Ok(Box::pin(RecordBatchStreamAdapter::new(
-                    count_schema,
-                    do_delete(self.batches.clone(), column_index),
-                )));
-            }
-        };
+        Ok(Box::pin(RecordBatchStreamAdapter::new(count_schema, {
+            let batches = self.batches.clone();
+            let schema = self.schema();
+            let _filters = self.filters.to_vec();
+            futures::stream::once(async move {
+                let ctx = SessionContext::new();
+                let mut tmp_batches = vec![vec![]; batches.len()];
 
-        Err(DataFusionError::Execution(format!(
-            "filters {:?} are not supported in {}",
-            self.filters,
-            self.name()
-        )))
+                for (i, partition) in batches.iter().enumerate() {
+                    let mut partition_vec = partition.write().await;
+                    tmp_batches[i].append(partition_vec.deref_mut());
+                }
+
+                let provider = MemTable::try_new(schema, tmp_batches)?;
+
+                let mut df = DataFrame::new(
+                    ctx.state(),
+                    LogicalPlanBuilder::scan(
+                        "?table?",
+                        provider_as_source(Arc::new(provider)),
+                        None,
+                    )?
+                    .build()?,
+                );
+
+                let mut count = df.clone().count().await?;
+
+                for filter in _filters {
+                    df = df.filter(filter)?;
+                }
+
+                count -= df.clone().count().await?;
+                let mut new_batches = vec![vec![]; batches.len()];
+                let mut i = 0;
+                for vec in df.collect_partitioned().await? {
+                    for batch in vec {
+                        new_batches[i].push(batch);
+                    }
+
+                    i = (i + 1) % batches.len();
+                }
+
+                for (target, mut batches) in batches.iter().zip(new_batches.into_iter()) {
+                    target.write().await.append(&mut batches);
+                }
+
+                let array = Arc::new(UInt64Array::from(vec![count as u64])) as ArrayRef;
+
+                if let Ok(batch) =
+                    RecordBatch::try_from_iter_with_nullable(vec![("count", array, false)])
+                {
+                    Ok(batch)
+                } else {
+                    Err(DataFusionError::Execution(
+                        "failed to create record batch".to_string(),
+                    ))
+                }
+            })
+            .boxed()
+        })))
     }
-}
-
-fn do_delete(
-    batches: Vec<PartitionData>,
-    column_index: i32,
-) -> std::pin::Pin<Box<dyn Stream<Item = Result<RecordBatch, DataFusionError>> + Send>> {
-    futures::stream::once(async move {
-        let mut count: u64 = 0;
-        let num_partitions = batches.len();
-
-        let mut new_batches = vec![vec![]; num_partitions];
-        let mut i = 0;
-
-        for partition in batches.clone() {
-            let mut partition_vec = partition.write().await;
-
-            for record_batch in &*partition_vec {
-                let column = record_batch.column(column_index as usize);
-
-                let filter = match column.data_type() {
-                    DataType::Int64 => {
-                        let compared_array = vec![1; column.len()];
-                        let cmp = Int64Array::new(compared_array.into(), None);
-                        let array = column.as_any().downcast_ref::<Int64Array>().unwrap();
-                        gt(array, &cmp)?
-                    }
-                    _ => {
-                        return Err(DataFusionError::Execution(format!(
-                            "data type {} is supported yet",
-                            column.data_type()
-                        )));
-                    }
-                };
-                let batch = filter_record_batch(record_batch, &filter)?;
-                count += (record_batch.num_rows() - batch.num_rows()) as u64;
-                new_batches[i].push(batch);
-            }
-
-            partition_vec.clear();
-            drop(partition_vec);
-
-            i = (i + 1) % num_partitions;
-        }
-
-        for (target, mut batches) in batches.iter().zip(new_batches.into_iter()) {
-            target.write().await.append(&mut batches);
-        }
-
-        let array = Arc::new(UInt64Array::from(vec![count])) as ArrayRef;
-
-        if let Ok(batch) = RecordBatch::try_from_iter_with_nullable(vec![("count", array, false)]) {
-            Ok(batch)
-        } else {
-            Err(DataFusionError::Execution(
-                "failed to create record batch".to_string(),
-            ))
-        }
-    })
-    .boxed()
 }
 
 /// Implements for writing to a [`MemTable`]
