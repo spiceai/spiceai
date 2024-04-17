@@ -29,7 +29,9 @@ use db_connection_pool::{
     duckdbpool::DuckDbConnectionPool,
     DbConnectionPool, Mode,
 };
-use duckdb::{vtab::arrow::arrow_recordbatch_to_query_params, DuckdbConnectionManager, ToSql};
+use duckdb::{
+    vtab::arrow::arrow_recordbatch_to_query_params, DuckdbConnectionManager, ToSql, Transaction,
+};
 use snafu::prelude::*;
 use sql_provider_datafusion::SqlTable;
 use std::{cmp, sync::Arc};
@@ -64,6 +66,21 @@ pub enum Error {
 
     #[snafu(display("Unable to insert into duckdb table: {source}"))]
     UnableToInsertToDuckDBTable { source: duckdb::Error },
+
+    #[snafu(display("Unable to begin duckdb transaction: {source}"))]
+    UnableToBeginTransaction { source: duckdb::Error },
+
+    #[snafu(display("Unable to commit the Postgres transaction: {source}"))]
+    UnableToCommitDuckDBTransaction { source: duckdb::Error },
+
+    #[snafu(display("Unable to delete all data from the Postgres table: {source}"))]
+    UnableToDeleteAllTableData { source: duckdb::Error },
+
+    #[snafu(display("Unable to insert data into the Sqlite table: {source}"))]
+    UnableToInsertIntoTableAsync { source: duckdb::Error },
+
+    #[snafu(display("The table '{table_name}' doesn't exist in the Postgres server"))]
+    TableDoesntExist { table_name: String },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -112,8 +129,17 @@ impl TableProviderFactory for DuckDBTableProviderFactory {
 
         let mut db_conn = duckdb.connect().await.map_err(to_datafusion_error)?;
         let duckdb_conn = DuckDB::duckdb_conn(&mut db_conn).map_err(to_datafusion_error)?;
-        duckdb
-            .create_table(duckdb_conn, false)
+
+        let tx = duckdb_conn
+            .conn
+            .transaction()
+            .context(UnableToBeginTransactionSnafu)
+            .map_err(to_datafusion_error)?;
+
+        duckdb.create_table(&tx).map_err(to_datafusion_error)?;
+
+        tx.commit()
+            .context(UnableToCommitDuckDBTransactionSnafu)
             .map_err(to_datafusion_error)?;
 
         let dyn_pool: Arc<DynDuckDbConnectionPool> = pool;
@@ -157,7 +183,18 @@ impl DuckDB {
     ) -> Result<
         Box<dyn DbConnection<r2d2::PooledConnection<DuckdbConnectionManager>, &'static dyn ToSql>>,
     > {
-        self.pool.connect().await.context(DbConnectionSnafu)
+        let mut conn = self.pool.connect().await.context(DbConnectionSnafu)?;
+
+        let duckdb_conn = Self::duckdb_conn(&mut conn)?;
+
+        if !self.table_exists(duckdb_conn) {
+            TableDoesntExistSnafu {
+                table_name: self.table_name.clone(),
+            }
+            .fail()?;
+        }
+
+        Ok(conn)
     }
 
     fn duckdb_conn<'a>(
@@ -168,7 +205,7 @@ impl DuckDB {
         db_connection
             .as_any_mut()
             .downcast_mut::<DuckDbConnection>()
-            .ok_or_else(|| UnableToDowncastDbConnectionSnafu {}.build())
+            .context(UnableToDowncastDbConnectionSnafu)
     }
 
     fn table_exists(&self, duckdb_conn: &mut DuckDbConnection) -> bool {
@@ -201,7 +238,7 @@ impl DuckDB {
         result
     }
 
-    fn insert_batch(&self, duckdb_conn: &mut DuckDbConnection, batch: &RecordBatch) -> Result<()> {
+    fn insert_batch(&self, transaction: &Transaction<'_>, batch: &RecordBatch) -> Result<()> {
         let sql = format!(
             r#"INSERT INTO "{name}" SELECT * FROM arrow(?, ?)"#,
             name = self.table_name
@@ -215,8 +252,7 @@ impl DuckDB {
                 .map(|p| p as &dyn ToSql)
                 .collect::<Vec<_>>();
             let arrow_params_ref: &[&dyn ToSql] = &arrow_params_vec;
-            duckdb_conn
-                .conn
+            transaction
                 .execute(&sql, arrow_params_ref)
                 .context(UnableToInsertToDuckDBTableSnafu)?;
         }
@@ -224,40 +260,15 @@ impl DuckDB {
         Ok(())
     }
 
-    fn delete_all_table_data(
-        &self,
-        duckdb_conn: &mut DuckDbConnection,
-        overwrite_exists: bool,
-    ) -> Result<()> {
-        if self.table_exists(duckdb_conn) {
-            if overwrite_exists {
-                let sql = format!(r#"DELETE FROM "{}""#, self.table_name);
-                tracing::trace!("{sql}");
-                duckdb_conn
-                    .conn
-                    .execute(&sql, [])
-                    .context(UnableToDropDuckDBTableSnafu)?;
-            } else {
-                return Ok(());
-            }
-        }
+    fn delete_all_table_data(&self, transaction: &Transaction<'_>) -> Result<()> {
+        transaction
+            .execute(format!(r#"DELETE FROM "{}""#, self.table_name).as_str(), [])
+            .context(UnableToDeleteAllTableDataSnafu)?;
+
         Ok(())
     }
 
-    fn create_table(&self, duckdb_conn: &mut DuckDbConnection, drop_if_exists: bool) -> Result<()> {
-        if self.table_exists(duckdb_conn) {
-            if drop_if_exists {
-                let sql = format!(r#"DROP TABLE "{}""#, self.table_name);
-                tracing::trace!("{sql}");
-                duckdb_conn
-                    .conn
-                    .execute(&sql, [])
-                    .context(UnableToDropDuckDBTableSnafu)?;
-            } else {
-                return Ok(());
-            }
-        }
-
+    fn create_table(&self, transaction: &Transaction<'_>) -> Result<()> {
         let empty_record = RecordBatch::new_empty(Arc::clone(&self.schema));
 
         let arrow_params = arrow_recordbatch_to_query_params(empty_record);
@@ -272,8 +283,7 @@ impl DuckDB {
         );
         tracing::trace!("{sql}");
 
-        duckdb_conn
-            .conn
+        transaction
             .execute(&sql, arrow_params_ref)
             .context(UnableToCreateDuckDBTableSnafu)?;
 
