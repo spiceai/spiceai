@@ -467,12 +467,13 @@ fn get_expr(
     let timestamp = timestamp.map_or(0, |f| f.as_secs());
 
     match expr_time_format {
-        ExprTimeFormat::ISO8601 => {
-            Some(Expr::ScalarFunction(ScalarFunction::new_udf(
+        ExprTimeFormat::ISO8601 => Some(
+            Expr::ScalarFunction(ScalarFunction::new_udf(
                 to_timestamp_millis(),
                 vec![col(time_column)],
-            )).lt(lit(timestamp * 1000)))
-        }
+            ))
+            .lt(lit(timestamp * 1000)),
+        ),
         ExprTimeFormat::UnixTimestamp(format) => {
             Some(col(time_column).lt(lit(timestamp * format.scale)))
         }
