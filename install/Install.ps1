@@ -18,7 +18,7 @@ function Get-LatestRelease {
 
 # Function to download and install Spice CLIv
 function Download-And-Install-Spice {
-    Write-Host "Checking the the latest Spice version..."
+    Write-Host "Checking the latest Spice version..."
 
     $latestReleaseTag = Get-LatestRelease
 
