@@ -36,7 +36,7 @@ pub enum Error {
     #[snafu(display("Unable to construct spice app: {source}"))]
     UnableToConstructSpiceApp { source: app::Error },
 
-    #[snafu(display("Unable to start Spice Runtime servers"))]
+    #[snafu(display("Unable to start Spice Runtime servers: {source}"))]
     UnableToStartServers { source: runtime::Error },
 
     #[snafu(display("Failed to load dataset: {source}"))]
@@ -50,7 +50,7 @@ pub enum Error {
         data_connector: String,
     },
 
-    #[snafu(display("Unable to create data backend"))]
+    #[snafu(display("Unable to create data backend: {source}"))]
     UnableToCreateBackend { source: runtime::datafusion::Error },
 
     #[snafu(display("Failed to start pods watcher: {source}"))]
