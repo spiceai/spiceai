@@ -9,6 +9,8 @@ use data_components::cast_to_deleteable;
 use datafusion::common::OwnedTableReference;
 use datafusion::error::Result as DataFusionResult;
 use datafusion::execution::context::SessionState;
+use datafusion::functions::datetime::to_timestamp_millis;
+use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::{col, lit, TableProviderFilterPushDown};
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{collect, ExecutionPlan, ExecutionPlanProperties};
@@ -460,15 +462,21 @@ fn get_expr(
     let timestamp = (start - retention_period).duration_since(UNIX_EPOCH);
     if timestamp.clone().is_err() {
         tracing::error!("[retention] Failed to get the unix timestamp");
+        return None;
     }
     let timestamp = timestamp.map_or(0, |f| f.as_secs());
 
     match expr_time_format {
-        ExprTimeFormat::ISO8601 => todo!(),
-        ExprTimeFormat::UnixTimestamp(format) => {
-            Some(col(time_column).gt(lit(timestamp * format.scale)))
+        ExprTimeFormat::ISO8601 => {
+            Some(Expr::ScalarFunction(ScalarFunction::new_udf(
+                to_timestamp_millis(),
+                vec![col(time_column)],
+            )).lt(lit(timestamp * 1000)))
         }
-        ExprTimeFormat::Timestamp => Some(col(time_column).gt(Expr::Literal(
+        ExprTimeFormat::UnixTimestamp(format) => {
+            Some(col(time_column).lt(lit(timestamp * format.scale)))
+        }
+        ExprTimeFormat::Timestamp => Some(col(time_column).lt(Expr::Literal(
             ScalarValue::TimestampMillisecond(Some((timestamp * 1000) as i64), None),
         ))),
     }

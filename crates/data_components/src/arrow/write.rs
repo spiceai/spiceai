@@ -34,7 +34,7 @@ use datafusion::datasource::{provider_as_source, TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::{SessionContext, SessionState};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::logical_expr::{Expr, LogicalPlanBuilder};
+use datafusion::logical_expr::{is_not_true, Expr, LogicalPlanBuilder};
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::insert::{DataSink, FileSinkExec};
 use datafusion::physical_plan::memory::MemoryExec;
@@ -312,8 +312,9 @@ impl ExecutionPlan for MemDeletionExec {
 
                 let mut count = df.clone().count().await?;
 
+                // TODO: check this either AND or OR makes more sense
                 for filter in filters {
-                    df = df.filter(filter)?;
+                    df = df.filter(is_not_true(filter))?;
                 }
 
                 count -= df.clone().count().await?;
