@@ -69,7 +69,10 @@ impl<'a> AsyncDbConnection<Conn, &'a (dyn ToValue + Sync)> for MySQLConnection {
         let conn = &mut *conn;
         let rows: Vec<Row> = conn
             .exec(
-                &format!("SELECT * FROM {table_reference} LIMIT 1"),
+                &format!(
+                    "SELECT * FROM {} LIMIT 1",
+                    table_reference.to_quoted_string()
+                ),
                 Params::Empty,
             )
             .await
