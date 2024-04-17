@@ -77,7 +77,7 @@ pub trait DeleteTableProvider: TableProvider {
     async fn delete_from(
         &self,
         _state: &SessionState,
-        _filters: &'static [Expr],
+        _filters: &[Expr],
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         Err(DataFusionError::Plan("Not implemented".to_string()))
     }

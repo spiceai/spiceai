@@ -2172,6 +2172,7 @@ version = "0.11.1-alpha"
 dependencies = [
  "arrow 51.0.0",
  "arrow-flight",
+ "arrow-ord 51.0.0",
  "arrow_sql_gen",
  "async-stream",
  "async-trait",

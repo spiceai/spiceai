@@ -5,12 +5,13 @@ use arrow::datatypes::SchemaRef;
 use async_stream::stream;
 use async_trait::async_trait;
 use data_components::cast_to_deleteable;
-use datafusion::common::OwnedTableReference;
+use datafusion::common::{Column, OwnedTableReference};
 use datafusion::error::Result as DataFusionResult;
 use datafusion::execution::context::SessionState;
-use datafusion::logical_expr::TableProviderFilterPushDown;
+use datafusion::logical_expr::{BinaryExpr, Operator, TableProviderFilterPushDown};
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{collect, ExecutionPlan, ExecutionPlanProperties};
+use datafusion::scalar::ScalarValue;
 use datafusion::{
     datasource::{TableProvider, TableType},
     execution::context::SessionContext,
@@ -206,7 +207,15 @@ impl AcceleratedTable {
             if let Some(deleted_table_provider) = cast_to_deleteable(accelerator.as_ref()) {
                 let ctx = SessionContext::new();
 
-                let plan = deleted_table_provider.delete_from(&ctx.state(), &[]).await;
+                let expr = Expr::BinaryExpr(BinaryExpr::new(
+                    Box::new(Expr::Column(Column::from_name("passenger_count"))),
+                    Operator::GtEq,
+                    Box::new(Expr::Literal(ScalarValue::UInt64(Some(1)))),
+                ));
+
+                let plan = deleted_table_provider
+                    .delete_from(&ctx.state(), &vec![expr])
+                    .await;
                 match plan {
                     Ok(plan) => {
                         match collect(plan, ctx.task_ctx()).await {
