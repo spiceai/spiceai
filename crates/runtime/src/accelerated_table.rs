@@ -9,9 +9,7 @@ use data_components::cast_to_deleteable;
 use datafusion::common::OwnedTableReference;
 use datafusion::error::Result as DataFusionResult;
 use datafusion::execution::context::SessionState;
-use datafusion::functions::datetime::to_timestamp_millis;
-use datafusion::logical_expr::expr::ScalarFunction;
-use datafusion::logical_expr::{col, lit, TableProviderFilterPushDown};
+use datafusion::logical_expr::{cast, col, lit, TableProviderFilterPushDown};
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{collect, ExecutionPlan, ExecutionPlanProperties};
 use datafusion::scalar::ScalarValue;
@@ -468,10 +466,10 @@ fn get_expr(
 
     match expr_time_format {
         ExprTimeFormat::ISO8601 => Some(
-            Expr::ScalarFunction(ScalarFunction::new_udf(
-                to_timestamp_millis(),
-                vec![col(time_column)],
-            ))
+            cast(
+                col(time_column),
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+            )
             .lt(Expr::Literal(ScalarValue::TimestampMillisecond(
                 Some((timestamp * 1000) as i64),
                 None,
