@@ -7,7 +7,7 @@ $spiceOrgName = "spiceai"
 $spiceCliFileName = "spice.exe"
 $spiceCliFullPath= Join-Path $spiceCliInstallDir $spiceCliFileName
 
-# Ensure the installation directory and auth file exist
+# Ensure the installation directory exists
 New-Item -Path $spiceCliInstallDir -ItemType Directory -Force > $null
 
 function Get-LatestRelease {
