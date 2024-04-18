@@ -39,7 +39,7 @@ use db_connection_pool::{
 };
 use postgres_native_tls::MakeTlsConnector;
 use snafu::prelude::*;
-use sql_provider_datafusion::SqlTable;
+use sql_provider_datafusion::{expr, SqlTable};
 use std::sync::Arc;
 
 use crate::{Read, ReadWrite};
@@ -93,6 +93,9 @@ pub enum Error {
         source: sql_provider_datafusion::Error,
     },
 
+    #[snafu(display("Unable to generate SQL: {source}"))]
+    UnableToGenerateSQL { source: expr::Error },
+
     #[snafu(display("Unable to delete all data from the Postgres table: {source}"))]
     UnableToDeleteAllTableData {
         source: tokio_postgres::error::Error,
@@ -102,6 +105,7 @@ pub enum Error {
     UnableToDeleteData {
         source: tokio_postgres::error::Error,
     },
+
 
     #[snafu(display("Unable to insert Arrow batch to Postgres table: {source}"))]
     UnableToInsertArrowBatch {
