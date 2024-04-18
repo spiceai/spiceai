@@ -182,11 +182,6 @@ pub trait DataConnector: Send + Sync {
     ) -> Option<AnyErrorResult<(Url, Arc<dyn ObjectStore + 'static>)>> {
         None
     }
-
-    async fn test_connection(&self) -> AnyErrorResult<()> {
-        tracing::debug!("test_connection stub, needs to be implemented in the data connector");
-        Ok(())
-    }
 }
 
 // Gets all data from a table provider and returns it as a vector of RecordBatches.

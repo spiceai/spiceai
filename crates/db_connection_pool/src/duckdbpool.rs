@@ -69,6 +69,11 @@ impl DuckDbConnectionPool {
         conn.register_table_function::<ArrowVTab>("arrow")
             .context(DuckDBSnafu)?;
 
+        // Test the connection
+        let _result = conn
+            .execute("SELECT 1", [])
+            .map_err(|_| ConnectionPoolSnafu);
+
         Ok(DuckDbConnectionPool { pool })
     }
 
@@ -112,15 +117,6 @@ impl DbConnectionPool<r2d2::PooledConnection<DuckdbConnectionManager>, &'static 
         let conn: r2d2::PooledConnection<DuckdbConnectionManager> =
             pool.get().context(ConnectionPoolSnafu)?;
         Ok(Box::new(DuckDbConnection::new(conn)))
-    }
-
-    async fn test_connection(&self) -> Result<()> {
-        let pool = Arc::clone(&self.pool);
-        let conn = pool.get().context(ConnectionPoolSnafu)?;
-        let _result = conn
-            .execute("SELECT 1", [])
-            .map_err(|_| ConnectionPoolSnafu);
-        Ok(())
     }
 }
 

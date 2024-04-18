@@ -69,6 +69,14 @@ impl SqliteConnectionPool {
                 .context(ConnectionPoolSnafu)?,
         };
 
+        // Test the connection
+        conn.call(move |conn| {
+            conn.execute("SELECT 1", [])?;
+            Ok(())
+        })
+        .await
+        .context(ConnectionPoolSnafu)?;
+
         Ok(SqliteConnectionPool { conn })
     }
 }
@@ -79,16 +87,5 @@ impl DbConnectionPool<Connection, &'static (dyn ToSql + Sync)> for SqliteConnect
         &self,
     ) -> Result<Box<dyn DbConnection<Connection, &'static (dyn ToSql + Sync)>>> {
         Ok(Box::new(SqliteConnection::new(self.conn.clone())))
-    }
-
-    async fn test_connection(&self) -> Result<()> {
-        self.conn
-            .call(move |conn| {
-                conn.execute("SELECT 1", [])?;
-                Ok(())
-            })
-            .await
-            .context(ConnectionPoolSnafu)?;
-        Ok(())
     }
 }

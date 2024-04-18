@@ -19,7 +19,6 @@ use data_components::postgres::PostgresTableFactory;
 use data_components::Read;
 use datafusion::datasource::TableProvider;
 use db_connection_pool::postgrespool::PostgresConnectionPool;
-use db_connection_pool::DbConnectionPool;
 use secrets::Secret;
 use snafu::prelude::*;
 use spicepod::component::dataset::Dataset;
@@ -86,9 +85,5 @@ impl DataConnector for Postgres {
                 .await
                 .context(UnableToGetReadProviderSnafu)?,
         )
-    }
-
-    async fn test_connection(&self) -> super::AnyErrorResult<()> {
-        self.postgres_factory.pool.test_connection().await
     }
 }

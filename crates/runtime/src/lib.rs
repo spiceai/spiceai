@@ -215,14 +215,6 @@ impl Runtime {
                 }
             };
 
-            if let Ok(()) = connector.test_connection().await {
-                tracing::info!("Connection verified for dataset: {}", &ds.name);
-            } else {
-                tracing::error!("Unable to verify connection for dataset: {}", &ds.name);
-                status::update_dataset(&ds.name, status::ComponentStatus::Error);
-                return;
-            }
-
             if let Ok(()) = self.register_loaded_dataset(ds, connector).await {
             } else {
                 sleep(Duration::from_secs(1)).await;
@@ -377,14 +369,6 @@ impl Runtime {
         tracing::info!("Updating dataset: {}...", &ds.name);
         status::update_dataset(&ds.name, status::ComponentStatus::Refreshing);
         if let Ok(connector) = self.load_dataset_connector(ds, all_datasets).await {
-            if let Ok(()) = connector.test_connection().await {
-                tracing::info!("Connection verified for dataset: {}", &ds.name);
-            } else {
-                tracing::error!("Failed to verify connection for dataset: {}", &ds.name);
-                status::update_dataset(&ds.name, status::ComponentStatus::Error);
-                return;
-            }
-
             self.remove_dataset(ds).await;
             if let Ok(()) = self.register_loaded_dataset(ds, connector).await {
                 status::update_dataset(&ds.name, status::ComponentStatus::Ready);

@@ -19,7 +19,6 @@ use data_components::duckdb::DuckDBTableFactory;
 use data_components::Read;
 use datafusion::datasource::TableProvider;
 use db_connection_pool::duckdbpool::DuckDbConnectionPool;
-use db_connection_pool::DbConnectionPool;
 use secrets::Secret;
 use snafu::prelude::*;
 use spicepod::component::dataset::Dataset;
@@ -85,9 +84,5 @@ impl DataConnector for DuckDB {
                 .await
                 .context(UnableToGetReadProviderSnafu)?,
         )
-    }
-
-    async fn test_connection(&self) -> super::AnyErrorResult<()> {
-        self.duckdb_factory.pool.test_connection().await
     }
 }
