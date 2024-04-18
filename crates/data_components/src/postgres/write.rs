@@ -31,6 +31,8 @@ use datafusion::{
 use futures::StreamExt;
 use snafu::prelude::*;
 
+use crate::delete::{DeletionExec, DeletionSink, DeletionTableProvider};
+
 use super::{to_datafusion_error, Postgres};
 
 pub struct PostgresTableWriter {
@@ -88,6 +90,56 @@ impl TableProvider for PostgresTableWriter {
             self.schema(),
             None,
         )) as _)
+    }
+}
+
+#[async_trait]
+impl DeletionTableProvider for PostgresTableWriter {
+    async fn delete_from(
+        &self,
+        _state: &SessionState,
+        filters: &[Expr],
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(DeletionExec::new(
+            Arc::new(PostgresDeletionSink::new(self.postgres.clone(), filters)),
+            &self.schema(),
+        )))
+    }
+}
+
+struct PostgresDeletionSink {
+    postgres: Arc<Postgres>,
+    filters: Vec<Expr>,
+}
+
+impl PostgresDeletionSink {
+    fn new(postgres: Arc<Postgres>, filters: &[Expr]) -> Self {
+        Self {
+            postgres,
+            filters: filters.to_vec(),
+        }
+    }
+}
+
+#[async_trait]
+impl DeletionSink for PostgresDeletionSink {
+    async fn delete_from(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        let mut db_conn = self.postgres.connect().await?;
+        let postgres_conn = Postgres::postgres_conn(&mut db_conn)?;
+        let tx = postgres_conn
+            .conn
+            .transaction()
+            .await
+            .context(super::UnableToBeginTransactionSnafu)?;
+        let count = self
+            .postgres
+            .delete_from(&tx, &crate::util::filters_to_sql(&self.filters)?)
+            .await?;
+        tx.commit()
+            .await
+            .context(super::UnableToCommitPostgresTransactionSnafu)?;
+
+        Ok(count)
     }
 }
 

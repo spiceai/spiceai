@@ -32,6 +32,8 @@ use datafusion::{
 use futures::StreamExt;
 use snafu::prelude::*;
 
+use crate::delete::{DeletionExec, DeletionSink, DeletionTableProvider};
+
 use super::{to_datafusion_error, Sqlite};
 
 pub struct SqliteTableWriter {
@@ -171,5 +173,57 @@ impl std::fmt::Debug for SqliteDataSink {
 impl DisplayAs for SqliteDataSink {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> std::fmt::Result {
         write!(f, "SqliteDataSink")
+    }
+}
+
+#[async_trait]
+impl DeletionTableProvider for SqliteTableWriter {
+    async fn delete_from(
+        &self,
+        _state: &SessionState,
+        filters: &[Expr],
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(DeletionExec::new(
+            Arc::new(SqliteDeletionSink::new(self.sqlite.clone(), filters)),
+            &self.schema(),
+        )))
+    }
+}
+
+struct SqliteDeletionSink {
+    sqlite: Arc<Sqlite>,
+    filters: Vec<Expr>,
+}
+
+impl SqliteDeletionSink {
+    fn new(sqlite: Arc<Sqlite>, filters: &[Expr]) -> Self {
+        Self {
+            sqlite,
+            filters: filters.to_vec(),
+        }
+    }
+}
+
+#[async_trait]
+impl DeletionSink for SqliteDeletionSink {
+    async fn delete_from(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        let mut db_conn = self.sqlite.connect().await?;
+        let sqlite_conn = Sqlite::sqlite_conn(&mut db_conn)?;
+        let sqlite = Arc::clone(&self.sqlite);
+        let sql = crate::util::filters_to_sql(&self.filters)?;
+        let count: u64 = sqlite_conn
+            .conn
+            .call(move |conn| {
+                let tx = conn.transaction()?;
+
+                let count = sqlite.delete_from(&tx, &sql)?;
+
+                tx.commit()?;
+
+                Ok(count)
+            })
+            .await?;
+
+        Ok(count)
     }
 }

@@ -238,6 +238,24 @@ impl Sqlite {
         Ok(())
     }
 
+    fn delete_from(
+        &self,
+        transaction: &Transaction<'_>,
+        where_clause: &str,
+    ) -> rusqlite::Result<u64> {
+        transaction.execute(
+            format!(
+                r#"DELETE FROM "{}" WHERE {}"#,
+                self.table_name, where_clause
+            )
+            .as_str(),
+            [],
+        )?;
+        let count: u64 = transaction.query_row("SELECT changes()", [], |row| row.get(0))?;
+
+        Ok(count)
+    }
+
     fn create_table(&self, transaction: &Transaction<'_>) -> rusqlite::Result<()> {
         let create_table_statement =
             CreateTableBuilder::new(Arc::clone(&self.schema), &self.table_name);

@@ -297,7 +297,7 @@ impl DataFusion {
             acceleration_settings.time_column.clone(),
             acceleration_settings.time_format.clone(),
             dataset.retention_check_interval(),
-            dataset.refresh_interval(),
+            dataset.retention_period(),
             acceleration_settings.retention_enabled,
             obj_store,
         )

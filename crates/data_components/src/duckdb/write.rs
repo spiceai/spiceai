@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::{any::Any, fmt, sync::Arc};
 
+use crate::delete::{DeletionExec, DeletionSink, DeletionTableProvider};
 use crate::duckdb::DuckDB;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
@@ -148,5 +149,46 @@ impl std::fmt::Debug for DuckDBDataSink {
 impl DisplayAs for DuckDBDataSink {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> std::fmt::Result {
         write!(f, "DuckDBDataSink")
+    }
+}
+
+#[async_trait]
+impl DeletionTableProvider for DuckDBTableWriter {
+    async fn delete_from(
+        &self,
+        _state: &SessionState,
+        filters: &[Expr],
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(DeletionExec::new(
+            Arc::new(DuckDBDeletionSink::new(self.duckdb.clone(), filters)),
+            &self.schema(),
+        )))
+    }
+}
+
+struct DuckDBDeletionSink {
+    duckdb: Arc<DuckDB>,
+    filters: Vec<Expr>,
+}
+
+impl DuckDBDeletionSink {
+    fn new(duckdb: Arc<DuckDB>, filters: &[Expr]) -> Self {
+        Self {
+            duckdb,
+            filters: filters.to_vec(),
+        }
+    }
+}
+
+#[async_trait]
+impl DeletionSink for DuckDBDeletionSink {
+    async fn delete_from(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        let mut db_conn = self.duckdb.connect().await?;
+        let duckdb_conn = DuckDB::duckdb_conn(&mut db_conn)?;
+        let count = self
+            .duckdb
+            .delete_from(duckdb_conn, &crate::util::filters_to_sql(&self.filters)?)?;
+
+        Ok(count)
     }
 }

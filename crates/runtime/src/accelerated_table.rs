@@ -1,15 +1,18 @@
+use std::time::{SystemTime, SystemTimeError, UNIX_EPOCH};
 use std::{any::Any, sync::Arc, time::Duration};
 
-use arrow::datatypes::SchemaRef;
+use arrow::array::UInt64Array;
+use arrow::datatypes::{DataType, SchemaRef};
 use async_stream::stream;
 use async_trait::async_trait;
-use data_components::cast_to_deleteable;
+use data_components::delete::cast_to_deleteable;
 use datafusion::common::OwnedTableReference;
 use datafusion::error::Result as DataFusionResult;
 use datafusion::execution::context::SessionState;
-use datafusion::logical_expr::TableProviderFilterPushDown;
+use datafusion::logical_expr::{cast, col, lit, TableProviderFilterPushDown};
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{collect, ExecutionPlan, ExecutionPlanProperties};
+use datafusion::scalar::ScalarValue;
 use datafusion::{
     datasource::{TableProvider, TableType},
     execution::context::SessionContext,
@@ -39,7 +42,9 @@ use crate::{
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Unable to get data from connector: {source}"))]
-    UnableToGetDataFromConnector { source: dataconnector::Error },
+    UnableToGetDataFromConnector {
+        source: dataconnector::Error,
+    },
 
     #[snafu(display("Unable to scan table provider: {source}"))]
     UnableToScanTableProvider {
@@ -53,6 +58,10 @@ pub enum Error {
 
     #[snafu(display("Manual refresh is not supported for `append` mode"))]
     ManualRefreshIsNotSupported {},
+
+    UnableToGetUnixTimestamp {
+        source: SystemTimeError,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -70,6 +79,18 @@ pub(crate) struct AcceleratedTable {
 enum AccelerationRefreshMode {
     Full(Receiver<()>),
     Append,
+}
+
+#[derive(Debug, Clone)]
+enum ExprTimeFormat {
+    ISO8601,
+    UnixTimestamp(ExprUnixTimestamp),
+    Timestamp,
+}
+
+#[derive(Debug, Clone)]
+struct ExprUnixTimestamp {
+    scale: u64,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -103,7 +124,7 @@ impl AcceleratedTable {
         };
 
         let refresh_handle = tokio::spawn(Self::start_refresh(
-            dataset_name,
+            dataset_name.clone(),
             Arc::clone(&federated),
             acceleration_refresh_mode,
             refresh_sql,
@@ -118,11 +139,12 @@ impl AcceleratedTable {
             handlers.push(scheduled_refreshes_handle);
         }
 
-        if retention_enabled && refresh_mode == RefreshMode::Append {
+        if retention_enabled {
             if let (Some(time_column), Some(retention_period), Some(retention_check_interval)) =
                 (time_column, retention_period, retention_check_interval)
             {
                 let retention_check_handle = tokio::spawn(Self::start_retention_check(
+                    dataset_name,
                     Arc::clone(&accelerator),
                     retention_check_interval,
                     time_column,
@@ -183,37 +205,72 @@ impl AcceleratedTable {
     }
 
     async fn start_retention_check(
+        dataset_name: String,
         accelerator: Arc<dyn TableProvider>,
         interval: Duration,
         time_column: String,
         time_format: Option<TimeFormat>,
         retention_period: Duration,
     ) {
-        let _ = retention_period;
-        let _ = time_format;
-        let _ = time_column;
         let mut interval_timer = tokio::time::interval(interval);
+
+        let schema = accelerator.schema();
+
+        let field = schema.column_with_name(time_column.as_str());
+
+        let Some(expr_time_format) = get_expr_time_format(field, &time_format) else {
+            tracing::error!("[retention] Failed to get the expression time format for {time_column}, check schema and time format");
+            return;
+        };
+
         loop {
             interval_timer.tick().await;
 
-            let deleted_table_provider = cast_to_deleteable(accelerator.as_ref());
+            tracing::info!("[retention] Running retention check for {dataset_name}...");
 
-            if let Some(deleted_table_provider) = deleted_table_provider {
+            if let Some(deleted_table_provider) = cast_to_deleteable(accelerator.as_ref()) {
                 let ctx = SessionContext::new();
 
-                let plan = deleted_table_provider.delete_from(&ctx.state(), &[]).await;
+                let Some(expr) = get_expr(retention_period, &time_column, expr_time_format.clone())
+                else {
+                    continue;
+                };
+
+                tracing::debug!(
+                    "[retention] Evicting data for {dataset_name} {:?} {:?}...",
+                    expr,
+                    retention_period
+                );
+
+                let plan = deleted_table_provider
+                    .delete_from(&ctx.state(), &vec![expr])
+                    .await;
                 match plan {
                     Ok(plan) => {
-                        if let Err(e) = collect(plan, ctx.task_ctx()).await {
-                            tracing::error!("Error running retention check: {e}");
+                        match collect(plan, ctx.task_ctx()).await {
+                            Err(e) => {
+                                tracing::error!("[retention] Error running retention check: {e}");
+                            }
+                            Ok(deleted) => {
+                                let result = deleted.first().map_or(0, |f| {
+                                    f.column(0)
+                                        .as_any()
+                                        .downcast_ref::<UInt64Array>()
+                                        .map_or(0, |v| v.values().first().map_or(0, |f| *f))
+                                });
+
+                                tracing::info!(
+                                    "[retention] Evicted {result} records for {dataset_name}",
+                                );
+                            }
                         };
                     }
                     Err(e) => {
-                        tracing::error!("Error running retention check: {e}");
+                        tracing::error!("[retention] Error running retention check: {e}");
                     }
                 }
             } else {
-                tracing::error!("Accelerated table does not support delete");
+                tracing::error!("[retention] Accelerated table does not support delete");
             }
         }
     }
@@ -344,6 +401,83 @@ impl AcceleratedTable {
                 }
             }
         })
+    }
+}
+
+fn get_expr_time_format(
+    field: Option<(usize, &arrow::datatypes::Field)>,
+    time_format: &Option<TimeFormat>,
+) -> Option<ExprTimeFormat> {
+    let expr_time_format = match field {
+        Some(field) => match field.1.data_type() {
+            DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float16
+            | DataType::Float32
+            | DataType::Float64 => {
+                let mut scale = 1;
+                if let Some(time_format) = time_format.clone() {
+                    if time_format == TimeFormat::UnixMillis {
+                        scale = 1000;
+                    }
+                }
+                ExprTimeFormat::UnixTimestamp(ExprUnixTimestamp { scale })
+            }
+            DataType::Timestamp(_, _)
+            | DataType::Date32
+            | DataType::Date64
+            | DataType::Time32(_)
+            | DataType::Time64(_) => ExprTimeFormat::Timestamp,
+            DataType::Utf8 | DataType::LargeUtf8 => ExprTimeFormat::ISO8601,
+            _ => {
+                tracing::warn!("date type is not handled yet: {}", field.1.data_type());
+                return None;
+            }
+        },
+        None => {
+            return None;
+        }
+    };
+    Some(expr_time_format)
+}
+
+#[allow(clippy::cast_possible_wrap)]
+fn get_expr(
+    retention_period: Duration,
+    time_column: &str,
+    expr_time_format: ExprTimeFormat,
+) -> Option<Expr> {
+    let start = SystemTime::now();
+    let timestamp = (start - retention_period).duration_since(UNIX_EPOCH);
+    if timestamp.clone().is_err() {
+        tracing::error!("[retention] Failed to get the unix timestamp");
+        return None;
+    }
+    let timestamp = timestamp.map_or(0, |f| f.as_secs());
+
+    match expr_time_format {
+        ExprTimeFormat::ISO8601 => Some(
+            cast(
+                col(time_column),
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+            )
+            .lt(Expr::Literal(ScalarValue::TimestampMillisecond(
+                Some((timestamp * 1000) as i64),
+                None,
+            ))),
+        ),
+        ExprTimeFormat::UnixTimestamp(format) => {
+            Some(col(time_column).lt(lit(timestamp * format.scale)))
+        }
+        ExprTimeFormat::Timestamp => Some(col(time_column).lt(Expr::Literal(
+            ScalarValue::TimestampMillisecond(Some((timestamp * 1000) as i64), None),
+        ))),
     }
 }
 
