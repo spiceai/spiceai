@@ -221,6 +221,7 @@ impl Dataset {
         self.mode.clone()
     }
 
+    #[must_use]
     pub fn is_accelerated(&self) -> bool {
         if let Some(acceleration) = &self.acceleration {
             return acceleration.enabled;
