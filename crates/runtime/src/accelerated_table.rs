@@ -213,9 +213,6 @@ impl AcceleratedTable {
         time_format: Option<TimeFormat>,
         retention_period: Duration,
     ) {
-        let _ = retention_period;
-        let _ = time_format;
-        let _ = time_column;
         let mut interval_timer = tokio::time::interval(interval);
 
         let schema = accelerator.schema();
@@ -438,8 +435,9 @@ fn get_expr_time_format(
             | DataType::Date64
             | DataType::Time32(_)
             | DataType::Time64(_) => ExprTimeFormat::Timestamp,
-            DataType::Utf8 => ExprTimeFormat::ISO8601,
+            DataType::Utf8 | DataType::LargeUtf8 => ExprTimeFormat::ISO8601,
             _ => {
+                tracing::warn!("date type is not handled yet: {}", field.1.data_type());
                 return None;
             }
         },
