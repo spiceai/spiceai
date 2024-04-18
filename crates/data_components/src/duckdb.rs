@@ -139,7 +139,7 @@ fn to_datafusion_error(error: Error) -> DataFusionError {
 pub struct DuckDB {
     table_name: String,
     schema: SchemaRef,
-    pub pool: Arc<DuckDbConnectionPool>,
+    pool: Arc<DuckDbConnectionPool>,
 }
 
 impl DuckDB {
@@ -282,7 +282,7 @@ impl DuckDB {
 }
 
 pub struct DuckDBTableFactory {
-    pub pool: Arc<DuckDbConnectionPool>,
+    pool: Arc<DuckDbConnectionPool>,
 }
 
 impl DuckDBTableFactory {
