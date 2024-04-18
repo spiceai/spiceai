@@ -43,7 +43,7 @@ pub enum Error {
 type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct MySQLTableFactory {
-    pool: Arc<MySQLConnectionPool>,
+    pub pool: Arc<MySQLConnectionPool>,
 }
 
 impl MySQLTableFactory {

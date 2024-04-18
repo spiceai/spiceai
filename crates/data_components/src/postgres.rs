@@ -110,7 +110,7 @@ pub enum Error {
 type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct PostgresTableFactory {
-    pool: Arc<PostgresConnectionPool>,
+    pub pool: Arc<PostgresConnectionPool>,
 }
 
 impl PostgresTableFactory {
