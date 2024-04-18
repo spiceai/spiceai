@@ -49,6 +49,7 @@ pub mod spark_connect;
 pub mod sqlite;
 
 pub mod delete;
+pub mod util;
 
 #[async_trait]
 pub trait Read: Send + Sync {

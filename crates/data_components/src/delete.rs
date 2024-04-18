@@ -17,17 +17,17 @@ use datafusion::{
 };
 
 #[async_trait]
-pub trait DeletionSink: Send + Sync {
+pub trait Sink: Send + Sync {
     async fn delete_from(&self) -> Result<u64, Box<dyn Error + Send + Sync>>;
 }
 
 pub struct Exec {
-    deletion_sink: Arc<dyn DeletionSink + 'static>,
+    deletion_sink: Arc<dyn Sink + 'static>,
     properties: PlanProperties,
 }
 
 impl Exec {
-    pub fn new(deletion_sink: Arc<dyn DeletionSink>, schema: &SchemaRef) -> Self {
+    pub fn new(deletion_sink: Arc<dyn Sink>, schema: &SchemaRef) -> Self {
         let properties = PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
             Partitioning::UnknownPartitioning(1),

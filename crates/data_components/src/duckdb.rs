@@ -64,6 +64,9 @@ pub enum Error {
 
     #[snafu(display("Unable to insert into duckdb table: {source}"))]
     UnableToInsertToDuckDBTable { source: duckdb::Error },
+
+    #[snafu(display("Unable to delete data from the duckdb table: {source}"))]
+    UnableToDeleteDuckdbData { source: duckdb::Error },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -242,6 +245,21 @@ impl DuckDB {
             }
         }
         Ok(())
+    }
+
+    fn delete_from(&self, duckdb_conn: &mut DuckDbConnection, where_clause: &str) -> Result<u64> {
+        if self.table_exists(duckdb_conn) {
+            let sql = format!(
+                r#"WITH deleted AS (DELETE FROM "{}" WHERE {} RETURNING *) SELECT COUNT(*) FROM deleted"#,
+                self.table_name, where_clause
+            );
+            let count: u64 = duckdb_conn
+                .conn
+                .query_row(&sql, [], |row| row.get::<usize, u64>(0))
+                .context(UnableToDeleteDuckdbDataSnafu)?;
+            return Ok(count);
+        }
+        Ok(0)
     }
 
     fn create_table(&self, duckdb_conn: &mut DuckDbConnection, drop_if_exists: bool) -> Result<()> {
