@@ -24,6 +24,7 @@ use datafusion::{
 };
 use duckdb::write::DuckDBTableWriter;
 use postgres::write::PostgresTableWriter;
+use sqlite::write::SqliteTableWriter;
 
 use crate::arrow::write::MemTable;
 
@@ -101,6 +102,10 @@ pub fn cast_to_deleteable<'a>(
     }
 
     if let Some(p) = from.as_any().downcast_ref::<DuckDBTableWriter>() {
+        return Some(p);
+    }
+
+    if let Some(p) = from.as_any().downcast_ref::<SqliteTableWriter>() {
         return Some(p);
     }
 

@@ -184,10 +184,10 @@ impl DuckDBDeletionSink {
 impl Sink for DuckDBDeletionSink {
     async fn delete_from(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         let mut db_conn = self.duckdb.connect().await?;
-        let postgres_conn = DuckDB::duckdb_conn(&mut db_conn)?;
+        let duckdb_conn = DuckDB::duckdb_conn(&mut db_conn)?;
         let count = self
             .duckdb
-            .delete_from(postgres_conn, &crate::util::filters_to_sql(&self.filters)?)?;
+            .delete_from(duckdb_conn, &crate::util::filters_to_sql(&self.filters)?)?;
 
         Ok(count)
     }
