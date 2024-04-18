@@ -438,8 +438,7 @@ mod tests {
     };
     use datafusion::{
         execution::context::SessionContext,
-        functions::datetime::to_timestamp_millis,
-        logical_expr::{col, expr::ScalarFunction, lit, Expr},
+        logical_expr::{cast, col, lit},
         physical_plan::collect,
         scalar::ScalarValue,
     };
@@ -466,10 +465,10 @@ mod tests {
 
         let ctx = SessionContext::new();
 
-        let filter = Expr::ScalarFunction(ScalarFunction::new_udf(
-            to_timestamp_millis(),
-            vec![col("time_in_string")],
-        ))
+        let filter = cast(
+            col("time_in_string"),
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+        )
         .lt(lit(ScalarValue::TimestampMillisecond(Some(1), None)));
 
         let plan = table
