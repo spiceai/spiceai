@@ -237,7 +237,7 @@ impl AcceleratedTable {
                     continue;
                 };
 
-                tracing::info!(
+                tracing::debug!(
                     "[retention] Evicting data for {dataset_name} {:?} {:?}...",
                     expr,
                     retention_period

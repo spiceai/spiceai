@@ -67,6 +67,15 @@ pub enum Error {
 
     #[snafu(display("Unable to delete data from the duckdb table: {source}"))]
     UnableToDeleteDuckdbData { source: duckdb::Error },
+
+    #[snafu(display("Unable to begin transaction: {source}"))]
+    UnableToBeginTransaction { source: duckdb::Error },
+
+    #[snafu(display("Unable to query data from the duckdb table: {source}"))]
+    UnableToQueryData { source: duckdb::Error },
+
+    #[snafu(display("Unable to commit transaction: {source}"))]
+    UnableToCommitTransaction { source: duckdb::Error },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -249,14 +258,32 @@ impl DuckDB {
 
     fn delete_from(&self, duckdb_conn: &mut DuckDbConnection, where_clause: &str) -> Result<u64> {
         if self.table_exists(duckdb_conn) {
-            let sql = format!(
-                r#"WITH deleted AS (DELETE FROM "{}" WHERE {} RETURNING *) SELECT COUNT(*) FROM deleted"#,
+            let tx = duckdb_conn
+                .conn
+                .transaction()
+                .context(UnableToBeginTransactionSnafu)?;
+
+            let count_sql = format!(
+                r#"SELECT COUNT(*) FROM "{}" WHERE {}"#,
                 self.table_name, where_clause
             );
-            let count: u64 = duckdb_conn
-                .conn
-                .query_row(&sql, [], |row| row.get::<usize, u64>(0))
+
+            let mut count: u64 = tx
+                .query_row(&count_sql, [], |row| row.get::<usize, u64>(0))
+                .context(UnableToQueryDataSnafu)?;
+
+            let sql = format!(
+                r#"DELETE FROM "{}" WHERE {}"#,
+                self.table_name, where_clause
+            );
+            tx.execute(&sql, [])
                 .context(UnableToDeleteDuckdbDataSnafu)?;
+
+            count -= tx
+                .query_row(&count_sql, [], |row| row.get::<usize, u64>(0))
+                .context(UnableToQueryDataSnafu)?;
+
+            tx.commit().context(UnableToCommitTransactionSnafu)?;
             return Ok(count);
         }
         Ok(0)
