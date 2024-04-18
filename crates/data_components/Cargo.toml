@@ -43,7 +43,6 @@ arrow_sql_gen = { path = "../arrow_sql_gen", optional = true }
 rusqlite = { workspace = true, optional = true }
 tokio-rusqlite = { workspace = true, optional = true }
 spark-connect-rs =  {git = "https://github.com/edmondop/spark-connect-rs.git", rev = "cff3e9b", features = ["tls"], optional = true}
-arrow-ord = "51.0.0"
 
 [features]
 duckdb = ["dep:duckdb", "dep:r2d2"]
