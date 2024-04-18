@@ -32,7 +32,7 @@ use futures::StreamExt;
 use snafu::prelude::*;
 use sql_provider_datafusion::expr::{self};
 
-use crate::{delete::DeleteExec, delete::DeletionSink, DeleteTableProvider};
+use crate::{delete::DeletionSink, delete::Exec, DeleteTableProvider};
 
 use super::{to_datafusion_error, Postgres};
 
@@ -101,7 +101,7 @@ impl DeleteTableProvider for PostgresTableWriter {
         _state: &SessionState,
         filters: &[Expr],
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(DeleteExec::new(
+        Ok(Arc::new(Exec::new(
             Arc::new(PostgresDeletionSink::new(self.postgres.clone(), filters)),
             &self.schema(),
         )))

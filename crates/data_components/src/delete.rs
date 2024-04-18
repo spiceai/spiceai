@@ -21,13 +21,13 @@ pub trait DeletionSink: Send + Sync {
     async fn delete_from(&self) -> Result<u64, Box<dyn Error + Send + Sync>>;
 }
 
-pub struct DeleteExec {
-    properties: PlanProperties,
+pub struct Exec {
     deletion_sink: Arc<dyn DeletionSink + 'static>,
+    properties: PlanProperties,
 }
 
-impl DeleteExec {
-    fn new(deletion_sink: Arc<dyn DeletionSink>, schema: &SchemaRef) -> Self {
+impl Exec {
+    pub fn new(deletion_sink: Arc<dyn DeletionSink>, schema: &SchemaRef) -> Self {
         let properties = PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
             Partitioning::UnknownPartitioning(1),
@@ -41,13 +41,13 @@ impl DeleteExec {
 }
 
 #[allow(clippy::missing_fields_in_debug)]
-impl std::fmt::Debug for DeleteExec {
+impl std::fmt::Debug for Exec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DeleteExec").finish()
     }
 }
 
-impl DisplayAs for DeleteExec {
+impl DisplayAs for Exec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
@@ -57,7 +57,7 @@ impl DisplayAs for DeleteExec {
     }
 }
 
-impl ExecutionPlan for DeleteExec {
+impl ExecutionPlan for Exec {
     fn as_any(&self) -> &dyn Any {
         self
     }
