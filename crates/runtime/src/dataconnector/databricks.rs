@@ -127,14 +127,6 @@ impl DataConnector for Databricks {
         dataset: &Dataset,
     ) -> super::AnyErrorResult<Arc<dyn TableProvider>> {
         let table_reference = OwnedTableReference::from(dataset.path());
-        tracing::info!(
-            "read_provider: table_reference: {}, dataset: {}, catalog: {:?}, schema: {:?}, table: {}",
-            table_reference.to_quoted_string(),
-            dataset.path(),
-            table_reference.catalog(),
-            table_reference.schema(),
-            table_reference.table(),
-        );
         Ok(self
             .read_provider
             .table_provider(table_reference)
@@ -147,14 +139,6 @@ impl DataConnector for Databricks {
         dataset: &Dataset,
     ) -> Option<super::AnyErrorResult<Arc<dyn TableProvider>>> {
         let table_reference = OwnedTableReference::from(dataset.path());
-        tracing::info!(
-            "read_provider: table_reference: {}, dataset: {}, catalog: {:?}, schema: {:?}, table: {}",
-            table_reference.to_quoted_string(),
-            dataset.path(),
-            table_reference.catalog(),
-            table_reference.schema(),
-            table_reference.table(),
-        );
         let read_write_result = self
             .read_write_provider
             .table_provider(table_reference)

@@ -33,10 +33,6 @@ pub async fn get_table_provider(
     spark_session: Arc<SparkSession>,
     table_reference: OwnedTableReference,
 ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn Error + Send + Sync>> {
-    tracing::info!(
-        "get_table_provider table_reference={}",
-        table_reference.to_quoted_string()
-    );
     if let Some(catalog_name) = table_reference.catalog() {
         let spark_session = Arc::clone(&spark_session);
         spark_session.setCatalog(catalog_name);
