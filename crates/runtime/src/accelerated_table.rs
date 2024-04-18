@@ -472,7 +472,10 @@ fn get_expr(
                 to_timestamp_millis(),
                 vec![col(time_column)],
             ))
-            .lt(lit(timestamp * 1000)),
+            .lt(Expr::Literal(ScalarValue::TimestampMillisecond(
+                Some((timestamp * 1000) as i64),
+                None,
+            ))),
         ),
         ExprTimeFormat::UnixTimestamp(format) => {
             Some(col(time_column).lt(lit(timestamp * format.scale)))

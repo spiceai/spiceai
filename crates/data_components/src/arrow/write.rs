@@ -427,3 +427,66 @@ impl DataSink for MemSink {
         Ok(row_count as u64)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow::{
+        array::{RecordBatch, StringArray, UInt64Array},
+        datatypes::{DataType, Schema},
+    };
+    use datafusion::{
+        execution::context::SessionContext,
+        functions::datetime::to_timestamp_millis,
+        logical_expr::{col, expr::ScalarFunction, lit, Expr},
+        physical_plan::collect,
+        scalar::ScalarValue,
+    };
+
+    use crate::{arrow::write::MemTable, DeleteTableProvider};
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn test_delete_from() {
+        let schema = Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
+            "time_in_string",
+            DataType::Utf8,
+            false,
+        )]));
+        let arr = StringArray::from(vec![
+            "1970-01-01",
+            "2012-12-01T11:11:11Z",
+            "2012-12-01T11:11:12Z",
+        ]);
+
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(arr)]).unwrap();
+
+        let table = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+
+        let ctx = SessionContext::new();
+
+        let filter = Expr::ScalarFunction(ScalarFunction::new_udf(
+            to_timestamp_millis(),
+            vec![col("time_in_string")],
+        ))
+        .lt(lit(ScalarValue::TimestampMillisecond(Some(1), None)));
+
+        let plan = table
+            .delete_from(&ctx.state(), &vec![filter])
+            .await
+            .unwrap();
+
+        let result = collect(plan, ctx.task_ctx()).await.unwrap();
+
+        let actual = result
+            .first()
+            .unwrap()
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        let expected = UInt64Array::from(vec![1]);
+        assert_eq!(actual, &expected);
+    }
+}
