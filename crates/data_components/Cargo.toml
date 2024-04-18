@@ -42,7 +42,7 @@ mysql_async = { workspace = true, optional = true }
 arrow_sql_gen = { path = "../arrow_sql_gen", optional = true }
 rusqlite = { workspace = true, optional = true }
 tokio-rusqlite = { workspace = true, optional = true }
-spark-connect-rs =  { path = "/Users/phillip/code/spark-connect-rs", features = ["tls"], optional = true }
+spark-connect-rs =  { git = "https://github.com/phillipleblanc/spark-connect-rs.git", rev = "ed5c679570d86d5625ebe0b26dde78ea060e5f41", features = ["tls"], optional = true }
 
 [features]
 duckdb = ["dep:duckdb", "dep:r2d2"]
