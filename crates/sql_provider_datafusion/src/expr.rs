@@ -47,6 +47,12 @@ pub fn to_sql(expr: &Expr) -> Result<String> {
             ScalarValue::UInt16(Some(value)) => Ok(value.to_string()),
             ScalarValue::UInt32(Some(value)) => Ok(value.to_string()),
             ScalarValue::UInt64(Some(value)) => Ok(value.to_string()),
+            ScalarValue::TimestampMillisecond(Some(value), None | Some(_)) => Ok(format!(
+                "'{}'",
+                chrono::DateTime::from_timestamp_millis(*value)
+                    .unwrap_or_default()
+                    .to_rfc3339()
+            )),
             _ => Err(Error::UnsupportedFilterExpr {
                 expr: format!("{expr}"),
             }),

@@ -16,20 +16,29 @@ limitations under the License.
 
 use std::{any::Any, fmt, sync::Arc};
 
-use arrow::datatypes::SchemaRef;
+use arrow::{
+    array::{ArrayRef, RecordBatch, UInt64Array},
+    datatypes::{DataType, Schema, SchemaRef},
+};
 use async_trait::async_trait;
 use datafusion::{
     datasource::{TableProvider, TableType},
+    error::DataFusionError,
     execution::{context::SessionState, SendableRecordBatchStream, TaskContext},
     logical_expr::Expr,
+    physical_expr::EquivalenceProperties,
     physical_plan::{
         insert::{DataSink, FileSinkExec},
         metrics::MetricsSet,
-        DisplayAs, DisplayFormatType, ExecutionPlan,
+        stream::RecordBatchStreamAdapter,
+        DisplayAs, DisplayFormatType, ExecutionMode, ExecutionPlan, Partitioning, PlanProperties,
     },
 };
 use futures::StreamExt;
 use snafu::prelude::*;
+use sql_provider_datafusion::expr::to_sql;
+
+use crate::DeleteTableProvider;
 
 use super::{to_datafusion_error, Postgres};
 
@@ -88,6 +97,147 @@ impl TableProvider for PostgresTableWriter {
             self.schema(),
             None,
         )) as _)
+    }
+}
+
+#[async_trait]
+impl DeleteTableProvider for PostgresTableWriter {
+    async fn delete_from(
+        &self,
+        _state: &SessionState,
+        filters: &[Expr],
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(PostgresDeleteExec::new(
+            self.postgres.clone(),
+            &self.schema(),
+            filters,
+        )))
+    }
+}
+
+struct PostgresDeleteExec {
+    postgres: Arc<Postgres>,
+    properties: PlanProperties,
+    filters: Vec<Expr>,
+}
+
+impl PostgresDeleteExec {
+    fn new(postgres: Arc<Postgres>, schema: &SchemaRef, filters: &[Expr]) -> Self {
+        let properties = PlanProperties::new(
+            EquivalenceProperties::new(schema.clone()),
+            Partitioning::UnknownPartitioning(1),
+            ExecutionMode::Bounded,
+        );
+        Self {
+            postgres,
+            properties,
+            filters: filters.to_vec(),
+        }
+    }
+}
+
+#[allow(clippy::missing_fields_in_debug)]
+impl std::fmt::Debug for PostgresDeleteExec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PostgresDeleteExec").finish()
+    }
+}
+
+impl DisplayAs for PostgresDeleteExec {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                write!(f, "PostgresDeleteExec")
+            }
+        }
+    }
+}
+
+impl ExecutionPlan for PostgresDeleteExec {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn properties(&self) -> &datafusion::physical_plan::PlanProperties {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        Ok(self)
+    }
+
+    fn execute(
+        &self,
+        _partition: usize,
+        _context: Arc<TaskContext>,
+    ) -> datafusion::error::Result<SendableRecordBatchStream> {
+        let count_schema = Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
+            "count",
+            DataType::UInt64,
+            false,
+        )]));
+
+        let _filters = self.filters.clone();
+
+        let mut sqls = vec![];
+        for sql in self.filters.clone().into_iter().map(|expr| to_sql(&expr)) {
+            if let Ok(sql) = sql {
+                sqls.push(sql);
+            } else {
+                return Err(DataFusionError::SQL(
+                    datafusion::sql::sqlparser::parser::ParserError::ParserError(
+                        "cant parse sql".to_string(),
+                    ),
+                    None,
+                ));
+            }
+        }
+
+        let postgres = self.postgres.clone();
+
+        Ok(Box::pin(RecordBatchStreamAdapter::new(count_schema, {
+            futures::stream::once(async move {
+                let mut db_conn = postgres.connect().await.map_err(to_datafusion_error)?;
+                let postgres_conn =
+                    Postgres::postgres_conn(&mut db_conn).map_err(to_datafusion_error)?;
+
+                let tx = postgres_conn
+                    .conn
+                    .transaction()
+                    .await
+                    .context(super::UnableToBeginTransactionSnafu)
+                    .map_err(to_datafusion_error)?;
+
+                let count = postgres
+                    .delete_from(&tx, &sqls.join(" AND "))
+                    .await
+                    .map_err(to_datafusion_error)?;
+
+                tx.commit()
+                    .await
+                    .context(super::UnableToCommitPostgresTransactionSnafu)
+                    .map_err(to_datafusion_error)?;
+
+                let array = Arc::new(UInt64Array::from(vec![count])) as ArrayRef;
+
+                if let Ok(batch) =
+                    RecordBatch::try_from_iter_with_nullable(vec![("count", array, false)])
+                {
+                    Ok(batch)
+                } else {
+                    Err(DataFusionError::Execution(
+                        "failed to create record batch".to_string(),
+                    ))
+                }
+            })
+        })))
     }
 }
 

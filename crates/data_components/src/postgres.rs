@@ -98,6 +98,11 @@ pub enum Error {
         source: tokio_postgres::error::Error,
     },
 
+    #[snafu(display("Unable to delete data from the Postgres table: {source}"))]
+    UnableToDeleteData {
+        source: tokio_postgres::error::Error,
+    },
+
     #[snafu(display("Unable to insert Arrow batch to Postgres table: {source}"))]
     UnableToInsertArrowBatch {
         source: tokio_postgres::error::Error,
@@ -305,6 +310,25 @@ impl Postgres {
             .context(UnableToDeleteAllTableDataSnafu)?;
 
         Ok(())
+    }
+
+    #[allow(clippy::cast_sign_loss)]
+    async fn delete_from(&self, transaction: &Transaction<'_>, where_clause: &str) -> Result<u64> {
+        let row = transaction
+            .query_one(
+                format!(
+                    r#"WITH deleted AS (DELETE FROM "{}" WHERE {} RETURNING *) SELECT COUNT(*) FROM deleted"#,
+                    self.table_name, where_clause
+                )
+                .as_str(),
+                &[],
+            )
+            .await
+            .context(UnableToDeleteDataSnafu)?;
+
+        let deleted: i64 = row.get(0);
+
+        Ok(deleted as u64)
     }
 
     async fn create_table(&self, schema: SchemaRef, transaction: &Transaction<'_>) -> Result<()> {

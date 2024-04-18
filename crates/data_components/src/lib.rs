@@ -22,6 +22,7 @@ use datafusion::{
     common::OwnedTableReference, datasource::TableProvider, error::DataFusionError,
     execution::context::SessionState, logical_expr::Expr, physical_plan::ExecutionPlan,
 };
+use postgres::write::PostgresTableWriter;
 
 use crate::arrow::write::MemTable;
 
@@ -88,6 +89,10 @@ pub fn cast_to_deleteable<'a>(
     from: &'a dyn TableProvider,
 ) -> Option<&'a (dyn DeleteTableProvider + 'a)> {
     if let Some(p) = from.as_any().downcast_ref::<MemTable>() {
+        return Some(p);
+    }
+
+    if let Some(p) = from.as_any().downcast_ref::<PostgresTableWriter>() {
         return Some(p);
     }
 
