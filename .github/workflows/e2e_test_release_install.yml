@@ -66,7 +66,7 @@ jobs:
     - name: add Spice bin to PATH (Windows)
       if : matrix.target_os == 'windows'
       run: |
-        "$env:HOMEPATH/.spice/bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+        Add-Content $env:GITHUB_PATH (Join-Path $HOME ".spice\bin")
       shell: pwsh
 
     - name: check installation
