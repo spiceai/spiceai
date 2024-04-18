@@ -14,10 +14,12 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 - MotherDuck data connector (alpha)
 - Acceleration retention policies for time-series data
 - RocksDB data accelerator (alpha)
+- DynamoDB data connector (alpha)
 - Key/Value API
 
 ## [v0.13-alpha (May 2024)](https://github.com/spiceai/spiceai/milestone/21)
 
+- Clickhouse data connector (alpha)
 - S3 data connector Iceberg support
 - Snowflake data connector (alpha)
 - Data retention improvements
