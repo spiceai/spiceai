@@ -69,6 +69,11 @@ spice dataset configure
 			datasetName = defaultDatasetName
 		}
 
+		if strings.Contains(datasetName, ".") {
+			cmd.Println(aurora.BrightRed("Dataset name cannot contain '.'"))
+			os.Exit(1)
+		}
+
 		cmd.Print("description: ")
 		description, err := reader.ReadString('\n')
 		if err != nil {
