@@ -13,6 +13,7 @@ exclude.workspace = true
 [dependencies]
 datafusion.workspace = true
 async-trait.workspace = true
+arrow.workspace = true
 r2d2.workspace = true
 snafu.workspace = true
 tokio.workspace = true

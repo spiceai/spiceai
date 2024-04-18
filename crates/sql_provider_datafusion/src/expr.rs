@@ -23,14 +23,51 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-pub fn to_sql(expr: &Expr) -> Result<String> {
+pub enum Engine {
+    SQLite,
+    General,
+}
+
+#[allow(clippy::needless_pass_by_value)]
+pub fn to_sql_with_engine(expr: &Expr, engine: Option<Engine>) -> Result<String> {
     match expr {
         Expr::BinaryExpr(binary_expr) => {
-            let left = to_sql(&binary_expr.left)?;
-            let right = to_sql(&binary_expr.right)?;
+            let left = to_sql_with_engine(&binary_expr.left, None)?;
+            let right = to_sql_with_engine(&binary_expr.right, None)?;
             Ok(format!("{} {} {}", left, binary_expr.op, right))
         }
         Expr::Column(name) => Ok(format!("\"{name}\"")),
+        Expr::Cast(cast) => match engine {
+            None | Some(Engine::General) => {
+                let data_type = match cast.data_type {
+                    arrow::datatypes::DataType::Timestamp(_, Some(_) | None) => "TIMESTAMP",
+                    _ => {
+                        return Err(Error::UnsupportedFilterExpr {
+                            expr: format!("{expr}"),
+                        });
+                    }
+                };
+                Ok(format!(
+                    "CAST({} AS {})",
+                    to_sql_with_engine(&cast.expr, None)?,
+                    data_type
+                ))
+            }
+            Some(Engine::SQLite) => {
+                match cast.data_type {
+                    arrow::datatypes::DataType::Timestamp(_, Some(_) | None) => {}
+                    _ => {
+                        return Err(Error::UnsupportedFilterExpr {
+                            expr: format!("{expr}"),
+                        });
+                    }
+                };
+                Ok(format!(
+                    "datetime({}, 'subsec')",
+                    to_sql_with_engine(&cast.expr, None)?,
+                ))
+            }
+        },
         Expr::Literal(value) => match value {
             ScalarValue::Null => Ok(value.to_string()),
             ScalarValue::Int16(Some(value)) => Ok(value.to_string()),
@@ -61,4 +98,8 @@ pub fn to_sql(expr: &Expr) -> Result<String> {
             expr: format!("{expr}"),
         }),
     }
+}
+
+pub fn to_sql(expr: &Expr) -> Result<String> {
+    to_sql_with_engine(expr, None)
 }
