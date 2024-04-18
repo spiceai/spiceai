@@ -69,14 +69,6 @@ impl SqliteConnectionPool {
                 .context(ConnectionPoolSnafu)?,
         };
 
-        // Test the connection
-        conn.call(move |conn| {
-            conn.execute("SELECT 1", [])?;
-            Ok(())
-        })
-        .await
-        .context(ConnectionPoolSnafu)?;
-
         Ok(SqliteConnectionPool { conn })
     }
 }
