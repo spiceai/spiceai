@@ -421,7 +421,7 @@ impl Runtime {
         let replicate = ds.replication.as_ref().map_or(false, |r| r.enabled);
 
         // FEDERATED TABLE
-        if ds.acceleration.is_none() || ds.acceleration.as_ref().map_or(false, |acc| !acc.enabled) {
+        if !ds.is_accelerated() {
             if ds.mode() == Mode::ReadWrite && !replicate {
                 // A federated dataset was configured as ReadWrite, but the replication setting wasn't set - error out.
                 FederatedReadWriteTableWithoutReplicationSnafu.fail()?;

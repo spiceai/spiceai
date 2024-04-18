@@ -220,6 +220,14 @@ impl Dataset {
     pub fn mode(&self) -> Mode {
         self.mode.clone()
     }
+
+    pub fn is_accelerated(&self) -> bool {
+        if let Some(acceleration) = &self.acceleration {
+            return acceleration.enabled;
+        }
+
+        false
+    }
 }
 
 impl WithDependsOn<Dataset> for Dataset {
