@@ -8,23 +8,35 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 
 - See [Bugs](https://github.com/spiceai/spiceai/labels/bug). Feel free to file a new Issue if you see a bug and let us know on Discord.
 
-## [v0.12-alpha (Apr 2024)](https://github.com/spiceai/spiceai/milestone/17)
+## [v0.12-alpha (Apr 2024)](https://github.com/spiceai/spiceai/milestone/20)
 
+- Spark data connector (alpha)
+- MotherDuck data connector (alpha)
 - Acceleration retention policies for time-series data
-- FTP data connector (alpha)
-- Iceberg data connector
-- BigQuery data connector (alpha)
-- Snowflake data connector (alpha)
-
-## v0.13-alpha (May 2024)
-
 - RocksDB data accelerator (alpha)
-- K/V support
+- DynamoDB data connector (alpha)
+- Key/Value API
 
-## Features being considered for v1.0-stable
+## [v0.13-alpha (May 2024)](https://github.com/spiceai/spiceai/milestone/21)
+
+- Clickhouse data connector (alpha)
+- S3 data connector Iceberg support
+- Snowflake data connector (alpha)
+- Data retention improvements
+
+## v0.14-alpha (May 2024)
+
+- SFTP/FTP data connector (alpha)
+- BigQuery data connector (alpha)
+
+## Features being considered for beta (Jul 2024)
+
+- GraphQL data connector
+- CDC replication mode
+
+## Features being considered for v1.0-stable (Sep 2024)
 
 - CLI publish Spicepods to [spicerack.org](https://spicerack.org)
-- Kubernetes operator
 
 ## Beyond v1.0
 
