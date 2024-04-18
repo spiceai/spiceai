@@ -93,9 +93,9 @@ Spice enables developers to build both data _and_ AI-driven applications by co-l
 
 https://github.com/spiceai/spiceai/assets/88671039/85cf9a69-46e7-412e-8b68-22617dcbd4e0
 
-### macOS, Linux, and WSL
-
 **Step 1.** Install the Spice CLI:
+
+On **macOS, Linux, and WSL**:
 
 ```bash
 curl https://install.spiceai.org | /bin/bash
@@ -105,6 +105,12 @@ Or using `brew`:
 
 ```bash
 brew install spiceai/spiceai/spice
+```
+
+On **Windows**:
+
+```bash
+curl -L "https://raw.githubusercontent.com/spiceai/spiceai/trunk/install/Install.ps1" -o Install.ps1 && PowerShell -ExecutionPolicy Bypass -File ./Install.ps1
 ```
 
 **Step 2.** Initialize a new Spice app with the `spice init` command:

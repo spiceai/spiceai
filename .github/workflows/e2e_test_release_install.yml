@@ -27,8 +27,15 @@ jobs:
             runner: macos-12
             target_os: darwin
             target_arch: x86_64
+          - name: Windows x64
+            runner: rust-windows-x64
+            target_os: windows
+            target_arch: x86_64
+            target_arch_go: amd64
+            
     steps:
     - name: system info
+      if : matrix.target_os != 'windows'
       run: uname -m
 
     - name: checkout code
@@ -42,35 +49,75 @@ jobs:
         sudo apt install jq -y
 
     - name: install Spice (https://install.spiceai.org)
+      if : matrix.target_os != 'windows'
       run: |
         curl https://install.spiceai.org | /bin/bash
+    
+    - name: install Spice (Windows)
+      if : matrix.target_os == 'windows'
+      run: |
+        curl -L "https://raw.githubusercontent.com/spiceai/spiceai/trunk/install/Install.ps1" -o Install.ps1 && PowerShell -ExecutionPolicy Bypass -File ./Install.ps1
 
     - name: add Spice bin to PATH
-      run: echo "$HOME/.spice/bin" >> $GITHUB_PATH
+      if : matrix.target_os != 'windows'
+      run: |
+        echo "$HOME/.spice/bin" >> $GITHUB_PATH
+
+    - name: add Spice bin to PATH (Windows)
+      if : matrix.target_os == 'windows'
+      run: |
+        "$env:HOMEPATH/.spice/bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+      shell: pwsh
 
     - name: check installation
       run: |
         spice version
-  
+
     - name: start Spice runtime
+      if: matrix.target_os != 'windows'
       run: |
         spice init app
-        [ -d app ] && cd app
+        cd app
         spice run &
+  
+    - name: start Spice runtime (Windows)
+      if: matrix.target_os == 'windows'
+      run: |
+        spice init app
+        cd app
+        Start-Process -FilePath spice run
+      shell: pwsh
 
     - name: wait for Spice runtime healthy
+      if: matrix.target_os != 'windows'
       run: |
         bash -c 'while [[ "$(curl -s http://localhost:3000/health)" != "ok" ]]; do sleep 1; done' || false
       timeout-minutes: 1
 
+    - name: wait for Spice runtime healthy
+      if: matrix.target_os == 'windows'
+      run: |
+        do {
+          try {
+            Start-Sleep -Seconds 1
+            $response = Invoke-WebRequest -Uri "http://127.0.0.1:3000/health" -UseBasicParsing
+            $res = $response.Content.Trim()
+
+            Write-Host "Status: $($response.StatusCode)"
+            Write-Host "Reponse: $res"
+          } catch {
+            Write-Host "Failed to reach /health endpoint. Error: $($_.Exception.Message)"
+          }
+        } while ($res -ne "ok")
+      timeout-minutes: 1
+      shell: pwsh
+
     - name: check Spice cli and runtime version
+      if: matrix.target_os != 'windows'
       run: |
         version=$(spice version 2>&1)
         cli_version=$(echo "$version" | grep 'CLI version:' | cut -d':' -f2 | xargs)
         runtime_version=$(echo "$version" | grep 'Runtime version:' | cut -d':' -f2 | xargs)
-
-        # normalize runtime version from "0.9.0-alpha" to "v0.9-alpha". Later versions have uniform format and don't require modifications
-        runtime_version=$(echo "$runtime_version" | sed -e 's/^0\.9\.0-alpha$/v0.9-alpha/')
 
         release_version=$(curl -s "https://api.github.com/repos/spiceai/spiceai/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
         
@@ -79,11 +126,40 @@ jobs:
         echo "Runtime Version: $runtime_version"
 
         if [ "$cli_version" != "$release_version" ]; then
-          echo "CLI version $cli_version does not match the release version $release_version."
+          echo "CLI version $cli_version does not match the latest release version $release_version."
           exit 1
         fi
 
         if [ "$runtime_version" != "$release_version" ]; then
-          echo "Runtime version $runtime_version does not match the release version $release_version."
+          echo "Runtime version $runtime_version does not match the latest release version $release_version."
           exit 1
         fi
+      
+    - name: check Spice cli and runtime version (Windows)
+      if: matrix.target_os == 'windows'
+      run: |
+        $version = spice version 2>&1
+        Write-Host "Raw version string: $version"
+
+        $cliVersion = ($version -split "`n")[0].Trim()
+        $cliVersion = ($cliVersion -split "\s+")[-1].Trim()
+        Write-Host "CLI Version: $cliVersion"
+
+        $runtimeVersion = ($version -split "`n")[1].Trim()
+        $runtimeVersion = ($runtimeVersion -split "\s+")[-1].Trim()
+        Write-Host "Runtime Version: $runtimeVersion"
+
+        $response = Invoke-WebRequest -Uri "https://api.github.com/repos/spiceai/spiceai/releases/latest" -UseBasicParsing
+        $releaseVersion = ($response.Content | ConvertFrom-Json).tag_name
+        Write-Host "Release Version: $releaseVersion"
+
+        if ($cliVersion -ne $releaseVersion) {
+          Write-Host "CLI version $cliVersion does not match the latest release version $releaseVersion."
+          exit 1
+        }
+
+        if ($runtimeVersion -ne $releaseVersion) {
+          Write-Host "Runtime version $runtimeVersion does not match the latest release version $releaseVersion."
+          exit 1
+        }  
+      shell: pwsh

@@ -8,7 +8,7 @@ $spiceCliFileName = "spice.exe"
 $spiceCliFullPath= Join-Path $spiceCliInstallDir $spiceCliFileName
 
 # Ensure the installation directory and auth file exist
-New-Item -Path $spiceCliInstallDir -ItemType Directory -Force
+New-Item -Path $spiceCliInstallDir -ItemType Directory -Force > $null
 
 function Get-LatestRelease {
     $url = "https://api.github.com/repos/$spiceOrgName/$spiceRepoName/releases/latest"
