@@ -46,7 +46,7 @@ use datafusion::physical_plan::{
 use futures::StreamExt;
 use tokio::sync::RwLock;
 
-use crate::DeleteTableProvider;
+use crate::delete::DeleteTableProvider;
 
 /// Type alias for partition data
 pub type PartitionData = Arc<RwLock<Vec<RecordBatch>>>;
@@ -443,7 +443,7 @@ mod tests {
         scalar::ScalarValue,
     };
 
-    use crate::{arrow::write::MemTable, DeleteTableProvider};
+    use crate::{arrow::write::MemTable, delete::DeleteTableProvider};
 
     #[tokio::test]
     #[allow(clippy::unwrap_used)]

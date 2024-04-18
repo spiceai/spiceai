@@ -19,14 +19,8 @@ use std::{error::Error, sync::Arc};
 
 use async_trait::async_trait;
 use datafusion::{
-    common::OwnedTableReference, datasource::TableProvider, error::DataFusionError,
-    execution::context::SessionState, logical_expr::Expr, physical_plan::ExecutionPlan,
+    common::OwnedTableReference, datasource::TableProvider,
 };
-use duckdb::write::DuckDBTableWriter;
-use postgres::write::PostgresTableWriter;
-use sqlite::write::SqliteTableWriter;
-
-use crate::arrow::write::MemTable;
 
 pub mod arrow;
 #[cfg(feature = "databricks")]
@@ -76,38 +70,4 @@ pub trait Stream: Send + Sync {
         &self,
         table_reference: OwnedTableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn Error + Send + Sync>>;
-}
-
-#[async_trait]
-pub trait DeleteTableProvider: TableProvider {
-    async fn delete_from(
-        &self,
-        _state: &SessionState,
-        _filters: &[Expr],
-    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        Err(DataFusionError::Plan("Not implemented".to_string()))
-    }
-}
-
-// There is no good way to allow inter trait casting yet as TableProvider is not controlled
-pub fn cast_to_deleteable<'a>(
-    from: &'a dyn TableProvider,
-) -> Option<&'a (dyn DeleteTableProvider + 'a)> {
-    if let Some(p) = from.as_any().downcast_ref::<MemTable>() {
-        return Some(p);
-    }
-
-    if let Some(p) = from.as_any().downcast_ref::<PostgresTableWriter>() {
-        return Some(p);
-    }
-
-    if let Some(p) = from.as_any().downcast_ref::<DuckDBTableWriter>() {
-        return Some(p);
-    }
-
-    if let Some(p) = from.as_any().downcast_ref::<SqliteTableWriter>() {
-        return Some(p);
-    }
-
-    None
 }

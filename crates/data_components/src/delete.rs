@@ -1,20 +1,42 @@
 #![allow(clippy::missing_errors_doc)]
 use std::{any::Any, error::Error, sync::Arc};
 
+#[cfg(feature = "duckdb")]
+use crate::duckdb::write::DuckDBTableWriter;
+#[cfg(feature = "postgres")]
+use crate::postgres::write::PostgresTableWriter;
+#[cfg(feature = "sqlite")]
+use crate::sqlite::write::SqliteTableWriter;
+
+use crate::arrow::write::MemTable;
+
 use ::arrow::{
     array::{ArrayRef, RecordBatch, UInt64Array},
     datatypes::{DataType, Field, Schema, SchemaRef},
 };
 use async_trait::async_trait;
 use datafusion::{
+    datasource::TableProvider,
     error::DataFusionError,
-    execution::{SendableRecordBatchStream, TaskContext},
+    execution::{context::SessionState, SendableRecordBatchStream, TaskContext},
+    logical_expr::Expr,
     physical_expr::EquivalenceProperties,
     physical_plan::{
         stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionMode,
         ExecutionPlan, Partitioning, PlanProperties,
     },
 };
+
+#[async_trait]
+pub trait DeleteTableProvider: TableProvider {
+    async fn delete_from(
+        &self,
+        _state: &SessionState,
+        _filters: &[Expr],
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        Err(DataFusionError::Plan("Not implemented".to_string()))
+    }
+}
 
 #[async_trait]
 pub trait Sink: Send + Sync {
@@ -108,4 +130,30 @@ impl ExecutionPlan for Exec {
             })
         })))
     }
+}
+
+// There is no good way to allow inter trait casting yet as TableProvider is not controlled
+pub fn cast_to_deleteable<'a>(
+    from: &'a dyn TableProvider,
+) -> Option<&'a (dyn DeleteTableProvider + 'a)> {
+    if let Some(p) = from.as_any().downcast_ref::<MemTable>() {
+        return Some(p);
+    }
+
+    #[cfg(feature = "postgres")]
+    if let Some(p) = from.as_any().downcast_ref::<PostgresTableWriter>() {
+        return Some(p);
+    }
+
+    #[cfg(feature = "duckdb")]
+    if let Some(p) = from.as_any().downcast_ref::<DuckDBTableWriter>() {
+        return Some(p);
+    }
+
+    #[cfg(feature = "sqlite")]
+    if let Some(p) = from.as_any().downcast_ref::<SqliteTableWriter>() {
+        return Some(p);
+    }
+
+    None
 }
