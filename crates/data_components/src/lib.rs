@@ -19,14 +19,8 @@ use std::{error::Error, sync::Arc};
 
 use async_trait::async_trait;
 use datafusion::{
-    common::OwnedTableReference,
-    datasource::TableProvider,
-    error::DataFusionError,
-    execution::context::SessionState,
-    logical_expr::Expr,
-    physical_plan::
-        ExecutionPlan
-    ,
+    common::OwnedTableReference, datasource::TableProvider, error::DataFusionError,
+    execution::context::SessionState, logical_expr::Expr, physical_plan::ExecutionPlan,
 };
 use postgres::write::PostgresTableWriter;
 

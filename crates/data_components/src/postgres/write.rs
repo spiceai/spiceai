@@ -32,7 +32,7 @@ use futures::StreamExt;
 use snafu::prelude::*;
 use sql_provider_datafusion::expr::{self};
 
-use crate::{delete::DeleteExec, DeleteTableProvider, delete::DeletionSink};
+use crate::{delete::DeleteExec, delete::DeletionSink, DeleteTableProvider};
 
 use super::{to_datafusion_error, Postgres};
 

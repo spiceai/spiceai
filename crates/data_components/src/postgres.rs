@@ -106,7 +106,6 @@ pub enum Error {
         source: tokio_postgres::error::Error,
     },
 
-
     #[snafu(display("Unable to insert Arrow batch to Postgres table: {source}"))]
     UnableToInsertArrowBatch {
         source: tokio_postgres::error::Error,
