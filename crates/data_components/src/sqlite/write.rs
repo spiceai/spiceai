@@ -32,10 +32,7 @@ use datafusion::{
 use futures::StreamExt;
 use snafu::prelude::*;
 
-use crate::{
-    delete::{Exec, Sink},
-    DeleteTableProvider,
-};
+use crate::delete::{DeletionExec, DeletionSink, DeletionTableProvider};
 
 use super::{to_datafusion_error, Sqlite};
 
@@ -180,13 +177,13 @@ impl DisplayAs for SqliteDataSink {
 }
 
 #[async_trait]
-impl DeleteTableProvider for SqliteTableWriter {
+impl DeletionTableProvider for SqliteTableWriter {
     async fn delete_from(
         &self,
         _state: &SessionState,
         filters: &[Expr],
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(Exec::new(
+        Ok(Arc::new(DeletionExec::new(
             Arc::new(SqliteDeletionSink::new(self.sqlite.clone(), filters)),
             &self.schema(),
         )))
@@ -208,7 +205,7 @@ impl SqliteDeletionSink {
 }
 
 #[async_trait]
-impl Sink for SqliteDeletionSink {
+impl DeletionSink for SqliteDeletionSink {
     async fn delete_from(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         let mut db_conn = self.sqlite.connect().await?;
         let sqlite_conn = Sqlite::sqlite_conn(&mut db_conn)?;

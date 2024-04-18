@@ -25,9 +25,7 @@ use std::fmt::{self, Debug};
 
 use std::sync::{Arc, Mutex};
 
-use arrow::array::{ArrayRef, UInt64Array};
-use arrow::datatypes::{DataType, Schema, SchemaRef};
-use arrow::record_batch::RecordBatch;
+use arrow::{datatypes::SchemaRef, record_batch::RecordBatch};
 use async_trait::async_trait;
 use datafusion::common::{Constraints, SchemaExt};
 use datafusion::datasource::{provider_as_source, TableProvider, TableType};
@@ -35,18 +33,14 @@ use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::{SessionContext, SessionState};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::{is_not_true, Expr, LogicalPlanBuilder};
-use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::insert::{DataSink, FileSinkExec};
 use datafusion::physical_plan::memory::MemoryExec;
 use datafusion::physical_plan::metrics::MetricsSet;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionMode, ExecutionPlan, Partitioning, PlanProperties,
-};
+use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan};
 use futures::StreamExt;
 use tokio::sync::RwLock;
 
-use crate::delete::DeleteTableProvider;
+use crate::delete::{DeletionExec, DeletionSink, DeletionTableProvider};
 
 /// Type alias for partition data
 pub type PartitionData = Arc<RwLock<Vec<RecordBatch>>>;
@@ -194,161 +188,6 @@ impl TableProvider for MemTable {
     }
 }
 
-#[async_trait]
-impl DeleteTableProvider for MemTable {
-    async fn delete_from(
-        &self,
-        _state: &SessionState,
-        filters: &[Expr],
-    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(MemDeletionExec::new(
-            self.batches.clone(),
-            self.schema.clone(),
-            filters,
-        )))
-    }
-}
-
-struct MemDeletionExec {
-    batches: Vec<PartitionData>,
-    schema: SchemaRef,
-    filters: Vec<Expr>,
-    properties: PlanProperties,
-}
-
-impl MemDeletionExec {
-    fn new(batches: Vec<PartitionData>, schema: SchemaRef, filters: &[Expr]) -> Self {
-        let properties = PlanProperties::new(
-            EquivalenceProperties::new(schema.clone()),
-            Partitioning::UnknownPartitioning(1),
-            ExecutionMode::Bounded,
-        );
-        Self {
-            batches,
-            schema,
-            filters: filters.to_vec(),
-            properties,
-        }
-    }
-}
-
-impl std::fmt::Debug for MemDeletionExec {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "DataUpdateExecutionPlan")
-    }
-}
-
-impl DisplayAs for MemDeletionExec {
-    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> std::fmt::Result {
-        write!(f, "DataUpdateExecutionPlan")
-    }
-}
-
-impl ExecutionPlan for MemDeletionExec {
-    fn name(&self) -> &'static str {
-        "MemDeletionExec"
-    }
-
-    /// Return a reference to Any that can be used for downcasting
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn schema(&self) -> SchemaRef {
-        self.schema.clone()
-    }
-
-    fn properties(&self) -> &PlanProperties {
-        &self.properties
-    }
-
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
-        vec![]
-    }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        _children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        Ok(self)
-    }
-    /// Execute the plan and return a stream of `RecordBatch`es for
-    /// the specified partition.
-    fn execute(
-        &self,
-        _partition: usize,
-        _context: Arc<TaskContext>,
-    ) -> Result<SendableRecordBatchStream> {
-        let count_schema = Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
-            "count",
-            DataType::UInt64,
-            false,
-        )]));
-
-        Ok(Box::pin(RecordBatchStreamAdapter::new(count_schema, {
-            let batches = self.batches.clone();
-            let schema = self.schema();
-            let filters = self.filters.clone();
-            futures::stream::once(async move {
-                let ctx = SessionContext::new();
-                let mut tmp_batches = vec![vec![]; batches.len()];
-
-                for (i, partition) in batches.iter().enumerate() {
-                    let mut partition_vec = partition.write().await;
-                    tmp_batches[i].append(&mut *partition_vec);
-                }
-
-                let provider = MemTable::try_new(schema, tmp_batches)?;
-
-                let mut df = DataFrame::new(
-                    ctx.state(),
-                    LogicalPlanBuilder::scan(
-                        "?table?",
-                        provider_as_source(Arc::new(provider)),
-                        None,
-                    )?
-                    .build()?,
-                );
-
-                let mut count = df.clone().count().await?;
-
-                // TODO: check this either AND or OR makes more sense
-                for filter in filters {
-                    df = df.filter(is_not_true(filter))?;
-                }
-
-                count -= df.clone().count().await?;
-                let mut new_batches = vec![vec![]; batches.len()];
-                let mut i = 0;
-                for vec in df.collect_partitioned().await? {
-                    for batch in vec {
-                        new_batches[i].push(batch);
-                    }
-
-                    i = (i + 1) % batches.len();
-                }
-
-                for (target, mut batches) in batches.iter().zip(new_batches.into_iter()) {
-                    target.write().await.append(&mut batches);
-                }
-
-                let array = Arc::new(UInt64Array::from(vec![count as u64])) as ArrayRef;
-
-                if let Ok(batch) =
-                    RecordBatch::try_from_iter_with_nullable(vec![("count", array, false)])
-                {
-                    Ok(batch)
-                } else {
-                    Err(DataFusionError::Execution(
-                        "failed to create record batch".to_string(),
-                    ))
-                }
-            })
-            .boxed()
-        })))
-    }
-}
-
 /// Implements for writing to a [`MemTable`]
 struct MemSink {
     /// Target locations for writing data
@@ -428,6 +267,87 @@ impl DataSink for MemSink {
     }
 }
 
+#[async_trait]
+impl DeletionTableProvider for MemTable {
+    async fn delete_from(
+        &self,
+        _state: &SessionState,
+        filters: &[Expr],
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(DeletionExec::new(
+            Arc::new(MemDeletionSink::new(
+                self.batches.clone(),
+                self.schema(),
+                filters,
+            )),
+            &self.schema(),
+        )))
+    }
+}
+
+struct MemDeletionSink {
+    batches: Vec<PartitionData>,
+    schema: SchemaRef,
+    filters: Vec<Expr>,
+}
+
+impl MemDeletionSink {
+    fn new(batches: Vec<PartitionData>, schema: SchemaRef, filters: &[Expr]) -> Self {
+        Self {
+            batches,
+            schema,
+            filters: filters.to_vec(),
+        }
+    }
+}
+
+#[async_trait]
+impl DeletionSink for MemDeletionSink {
+    async fn delete_from(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        let batches = self.batches.clone();
+
+        let ctx = SessionContext::new();
+        let mut tmp_batches = vec![vec![]; batches.len()];
+
+        for (i, partition) in batches.iter().enumerate() {
+            let mut partition_vec = partition.write().await;
+            tmp_batches[i].append(&mut *partition_vec);
+        }
+
+        let provider = MemTable::try_new(self.schema.clone(), tmp_batches)?;
+
+        let mut df = DataFrame::new(
+            ctx.state(),
+            LogicalPlanBuilder::scan("?table?", provider_as_source(Arc::new(provider)), None)?
+                .build()?,
+        );
+
+        let mut count = df.clone().count().await?;
+
+        // TODO: check this either AND or OR makes more sense
+        for filter in self.filters.clone() {
+            df = df.filter(is_not_true(filter))?;
+        }
+
+        count -= df.clone().count().await?;
+        let mut new_batches = vec![vec![]; batches.len()];
+        let mut i = 0;
+        for vec in df.collect_partitioned().await? {
+            for batch in vec {
+                new_batches[i].push(batch);
+            }
+
+            i = (i + 1) % batches.len();
+        }
+
+        for (target, mut batches) in batches.iter().zip(new_batches.into_iter()) {
+            target.write().await.append(&mut batches);
+        }
+
+        Ok(count as u64)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -443,7 +363,7 @@ mod tests {
         scalar::ScalarValue,
     };
 
-    use crate::{arrow::write::MemTable, delete::DeleteTableProvider};
+    use crate::{arrow::write::MemTable, delete::DeletionTableProvider};
 
     #[tokio::test]
     #[allow(clippy::unwrap_used)]

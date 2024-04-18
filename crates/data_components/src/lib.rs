@@ -18,9 +18,7 @@ limitations under the License.
 use std::{error::Error, sync::Arc};
 
 use async_trait::async_trait;
-use datafusion::{
-    common::OwnedTableReference, datasource::TableProvider,
-};
+use datafusion::{common::OwnedTableReference, datasource::TableProvider};
 
 pub mod arrow;
 #[cfg(feature = "databricks")]

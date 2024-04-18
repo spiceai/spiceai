@@ -31,7 +31,7 @@ use datafusion::{
 use futures::StreamExt;
 use snafu::prelude::*;
 
-use crate::{delete::Exec, delete::Sink, DeleteTableProvider};
+use crate::delete::{DeletionExec, DeletionSink, DeletionTableProvider};
 
 use super::{to_datafusion_error, Postgres};
 
@@ -94,13 +94,13 @@ impl TableProvider for PostgresTableWriter {
 }
 
 #[async_trait]
-impl DeleteTableProvider for PostgresTableWriter {
+impl DeletionTableProvider for PostgresTableWriter {
     async fn delete_from(
         &self,
         _state: &SessionState,
         filters: &[Expr],
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(Exec::new(
+        Ok(Arc::new(DeletionExec::new(
             Arc::new(PostgresDeletionSink::new(self.postgres.clone(), filters)),
             &self.schema(),
         )))
@@ -122,7 +122,7 @@ impl PostgresDeletionSink {
 }
 
 #[async_trait]
-impl Sink for PostgresDeletionSink {
+impl DeletionSink for PostgresDeletionSink {
     async fn delete_from(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         let mut db_conn = self.postgres.connect().await?;
         let postgres_conn = Postgres::postgres_conn(&mut db_conn)?;

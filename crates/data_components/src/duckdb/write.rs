@@ -16,8 +16,8 @@ limitations under the License.
 
 use std::{any::Any, fmt, sync::Arc};
 
+use crate::delete::{DeletionExec, DeletionSink, DeletionTableProvider};
 use crate::duckdb::DuckDB;
-use crate::{delete::Exec, delete::Sink, DeleteTableProvider};
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
@@ -153,13 +153,13 @@ impl DisplayAs for DuckDBDataSink {
 }
 
 #[async_trait]
-impl DeleteTableProvider for DuckDBTableWriter {
+impl DeletionTableProvider for DuckDBTableWriter {
     async fn delete_from(
         &self,
         _state: &SessionState,
         filters: &[Expr],
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(Exec::new(
+        Ok(Arc::new(DeletionExec::new(
             Arc::new(DuckDBDeletionSink::new(self.duckdb.clone(), filters)),
             &self.schema(),
         )))
@@ -181,7 +181,7 @@ impl DuckDBDeletionSink {
 }
 
 #[async_trait]
-impl Sink for DuckDBDeletionSink {
+impl DeletionSink for DuckDBDeletionSink {
     async fn delete_from(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         let mut db_conn = self.duckdb.connect().await?;
         let duckdb_conn = DuckDB::duckdb_conn(&mut db_conn)?;

@@ -28,7 +28,7 @@ use datafusion::{
 };
 
 #[async_trait]
-pub trait DeleteTableProvider: TableProvider {
+pub trait DeletionTableProvider: TableProvider {
     async fn delete_from(
         &self,
         _state: &SessionState,
@@ -39,17 +39,17 @@ pub trait DeleteTableProvider: TableProvider {
 }
 
 #[async_trait]
-pub trait Sink: Send + Sync {
+pub trait DeletionSink: Send + Sync {
     async fn delete_from(&self) -> Result<u64, Box<dyn Error + Send + Sync>>;
 }
 
-pub struct Exec {
-    deletion_sink: Arc<dyn Sink + 'static>,
+pub struct DeletionExec {
+    deletion_sink: Arc<dyn DeletionSink + 'static>,
     properties: PlanProperties,
 }
 
-impl Exec {
-    pub fn new(deletion_sink: Arc<dyn Sink>, schema: &SchemaRef) -> Self {
+impl DeletionExec {
+    pub fn new(deletion_sink: Arc<dyn DeletionSink>, schema: &SchemaRef) -> Self {
         let properties = PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
             Partitioning::UnknownPartitioning(1),
@@ -63,13 +63,13 @@ impl Exec {
 }
 
 #[allow(clippy::missing_fields_in_debug)]
-impl std::fmt::Debug for Exec {
+impl std::fmt::Debug for DeletionExec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DeleteExec").finish()
     }
 }
 
-impl DisplayAs for Exec {
+impl DisplayAs for DeletionExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
@@ -79,7 +79,7 @@ impl DisplayAs for Exec {
     }
 }
 
-impl ExecutionPlan for Exec {
+impl ExecutionPlan for DeletionExec {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -135,7 +135,7 @@ impl ExecutionPlan for Exec {
 // There is no good way to allow inter trait casting yet as TableProvider is not controlled
 pub fn cast_to_deleteable<'a>(
     from: &'a dyn TableProvider,
-) -> Option<&'a (dyn DeleteTableProvider + 'a)> {
+) -> Option<&'a (dyn DeletionTableProvider + 'a)> {
     if let Some(p) = from.as_any().downcast_ref::<MemTable>() {
         return Some(p);
     }

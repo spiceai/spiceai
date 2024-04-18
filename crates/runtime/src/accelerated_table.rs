@@ -5,7 +5,7 @@ use arrow::array::UInt64Array;
 use arrow::datatypes::{DataType, SchemaRef};
 use async_stream::stream;
 use async_trait::async_trait;
-use data_components::cast_to_deleteable;
+use data_components::delete::cast_to_deleteable;
 use datafusion::common::OwnedTableReference;
 use datafusion::error::Result as DataFusionResult;
 use datafusion::execution::context::SessionState;
