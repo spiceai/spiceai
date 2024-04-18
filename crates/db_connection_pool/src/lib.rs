@@ -34,6 +34,8 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 #[async_trait]
 pub trait DbConnectionPool<T, P: 'static> {
     async fn connect(&self) -> Result<Box<dyn DbConnection<T, P>>>;
+
+    async fn test_connection(&self) -> Result<()>;
 }
 
 #[derive(Default)]

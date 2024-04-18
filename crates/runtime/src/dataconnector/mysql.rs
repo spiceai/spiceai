@@ -87,4 +87,8 @@ impl DataConnector for MySQL {
                 .context(UnableToGetReadProviderSnafu)?,
         )
     }
+
+    async fn test_connection(&self) -> super::AnyErrorResult<()> {
+        self.mysql_factory.pool.test_connection().await
+    }
 }

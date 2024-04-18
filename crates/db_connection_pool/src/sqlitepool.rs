@@ -80,4 +80,15 @@ impl DbConnectionPool<Connection, &'static (dyn ToSql + Sync)> for SqliteConnect
     ) -> Result<Box<dyn DbConnection<Connection, &'static (dyn ToSql + Sync)>>> {
         Ok(Box::new(SqliteConnection::new(self.conn.clone())))
     }
+
+    async fn test_connection(&self) -> Result<()> {
+        self.conn
+            .call(move |conn| {
+                conn.execute("SELECT 1", [])?;
+                Ok(())
+            })
+            .await
+            .context(ConnectionPoolSnafu)?;
+        Ok(())
+    }
 }

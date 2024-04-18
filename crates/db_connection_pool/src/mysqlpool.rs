@@ -17,7 +17,10 @@ limitations under the License.
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
-use mysql_async::{prelude::ToValue, SslOpts};
+use mysql_async::{
+    prelude::{Queryable, ToValue},
+    Params, Row, SslOpts,
+};
 use secrets::Secret;
 use snafu::{ResultExt, Snafu};
 
@@ -185,5 +188,15 @@ impl DbConnectionPool<mysql_async::Conn, &'static (dyn ToValue + Sync)> for MySQ
         let pool = Arc::clone(&self.pool);
         let conn = pool.get_conn().await.context(ConnectionPoolRunSnafu)?;
         Ok(Box::new(MySQLConnection::new(conn)))
+    }
+
+    async fn test_connection(&self) -> Result<()> {
+        let pool = Arc::clone(&self.pool);
+        let mut conn = pool.get_conn().await.context(ConnectionPoolRunSnafu)?;
+        let _rows: Vec<Row> = conn
+            .exec("SELECT 1", Params::Empty)
+            .await
+            .context(ConnectionPoolRunSnafu)?;
+        Ok(())
     }
 }
