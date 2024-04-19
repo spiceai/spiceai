@@ -228,7 +228,7 @@ impl AcceleratedTable {
 
             tracing::info!("[retention] Running retention check for {dataset_name}...");
 
-            if let Some(deleted_table_provider) = get_deletion_provider(accelerator.as_ref()) {
+            if let Some(deleted_table_provider) = get_deletion_provider(Arc::clone(&accelerator)) {
                 let ctx = SessionContext::new();
 
                 let Some(expr) = get_expr(retention_period, &time_column, expr_time_format.clone())

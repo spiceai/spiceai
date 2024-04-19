@@ -41,14 +41,11 @@ pub struct PostgresTableWriter {
 }
 
 impl PostgresTableWriter {
-    pub fn create(
-        read_provider: Arc<dyn TableProvider>,
-        postgres: Postgres,
-    ) -> Arc<dyn TableProvider> {
+    pub fn create(read_provider: Arc<dyn TableProvider>, postgres: Postgres) -> Arc<Self> {
         Arc::new(Self {
             read_provider,
             postgres: Arc::new(postgres),
-        }) as _
+        })
     }
 }
 
