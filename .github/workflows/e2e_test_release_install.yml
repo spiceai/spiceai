@@ -56,7 +56,7 @@ jobs:
     - name: install Spice (Windows)
       if : matrix.target_os == 'windows'
       run: |
-        curl -L "https://raw.githubusercontent.com/spiceai/spiceai/trunk/install/Install.ps1" -o Install.ps1 && PowerShell -ExecutionPolicy Bypass -File ./Install.ps1
+        curl -L "https://install.spiceai.org/Install.ps1" -o Install.ps1 && PowerShell -ExecutionPolicy Bypass -File ./Install.ps1
 
     - name: add Spice bin to PATH
       if : matrix.target_os != 'windows'

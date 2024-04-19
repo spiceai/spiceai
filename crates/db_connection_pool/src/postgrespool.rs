@@ -169,8 +169,14 @@ impl PostgresConnectionPool {
             .await
             .context(ConnectionPoolSnafu)?;
 
+        // Test the connection
+        let conn = pool.get().await.context(ConnectionPoolRunSnafu)?;
+        conn.execute("SELECT 1", &[])
+            .await
+            .context(ConnectionPoolSnafu)?;
+
         Ok(PostgresConnectionPool {
-            pool: Arc::new(pool),
+            pool: Arc::new(pool.clone()),
         })
     }
 }

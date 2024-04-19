@@ -6047,7 +6047,7 @@ dependencies = [
 [[package]]
 name = "spark-connect-rs"
 version = "0.0.1-beta.3"
-source = "git+https://github.com/edmondop/spark-connect-rs.git?rev=cff3e9b#cff3e9bfcec878d42553c949f7d8317ced1cbcdd"
+source = "git+https://github.com/edmondop/spark-connect-rs.git?rev=24b8a437af41989bf7594e1606c37f30c134bba2#24b8a437af41989bf7594e1606c37f30c134bba2"
 dependencies = [
  "arrow",
  "arrow-ipc",

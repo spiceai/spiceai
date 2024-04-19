@@ -8,9 +8,10 @@ use async_stream::stream;
 use datafusion::common::project_schema;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::physical_plan::PlanProperties;
-use datafusion::physical_plan::{DisplayAs, DisplayFormatType};
+use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionMode};
+use datafusion::physical_plan::{Partitioning, PlanProperties};
 use datafusion::{
     common::OwnedTableReference,
     datasource::{TableProvider, TableType},
@@ -32,6 +33,14 @@ pub async fn get_table_provider(
     spark_session: Arc<SparkSession>,
     table_reference: OwnedTableReference,
 ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn Error + Send + Sync>> {
+    if let Some(catalog_name) = table_reference.catalog() {
+        let spark_session = Arc::clone(&spark_session);
+        spark_session.setCatalog(catalog_name).collect().await?;
+    }
+    if let Some(database) = table_reference.schema() {
+        let spark_session = Arc::clone(&spark_session);
+        spark_session.setDatabase(database).collect().await?;
+    }
     let dataframe = spark_session.table(table_reference.table())?;
     let schema = dataframe.clone().schema().await?;
     let arrow_schema = datatype_as_arrow_schema(schema)?;
@@ -171,6 +180,7 @@ struct SparkConnectExecutionPlan {
     projected_schema: SchemaRef,
     filters: Vec<Expr>,
     limit: Option<i32>,
+    properties: PlanProperties,
 }
 
 impl SparkConnectExecutionPlan {
@@ -201,9 +211,14 @@ impl SparkConnectExecutionPlan {
             .transpose()?;
         Ok(Self {
             dataframe,
-            projected_schema,
+            projected_schema: Arc::clone(&projected_schema),
             filters: filters.to_vec(),
             limit,
+            properties: PlanProperties::new(
+                EquivalenceProperties::new(projected_schema),
+                Partitioning::UnknownPartitioning(1),
+                ExecutionMode::Bounded,
+            ),
         })
     }
 }
@@ -226,7 +241,7 @@ impl DisplayAs for SparkConnectExecutionPlan {
 
 impl ExecutionPlan for SparkConnectExecutionPlan {
     fn properties(&self) -> &PlanProperties {
-        todo!()
+        &self.properties
     }
 
     fn schema(&self) -> SchemaRef {

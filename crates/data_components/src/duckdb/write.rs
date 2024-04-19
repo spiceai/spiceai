@@ -18,10 +18,11 @@ use std::{any::Any, fmt, sync::Arc};
 
 use crate::delete::{DeletionExec, DeletionSink, DeletionTableProvider};
 use crate::duckdb::DuckDB;
-use arrow::datatypes::SchemaRef;
+use arrow::{array::RecordBatch, datatypes::SchemaRef};
 use async_trait::async_trait;
 use datafusion::{
     datasource::{TableProvider, TableType},
+    error::DataFusionError,
     execution::{context::SessionState, SendableRecordBatchStream, TaskContext},
     logical_expr::Expr,
     physical_plan::{
@@ -31,6 +32,7 @@ use datafusion::{
     },
 };
 use futures::StreamExt;
+use snafu::prelude::*;
 use sql_provider_datafusion::expr::Engine;
 
 use super::to_datafusion_error;
@@ -108,7 +110,7 @@ impl DataSink for DuckDBDataSink {
 
     async fn write_all(
         &self,
-        mut data: SendableRecordBatchStream,
+        data: SendableRecordBatchStream,
         _context: &Arc<TaskContext>,
     ) -> datafusion::common::Result<u64> {
         let mut num_rows = 0;
@@ -116,20 +118,41 @@ impl DataSink for DuckDBDataSink {
         let mut db_conn = self.duckdb.connect().await.map_err(to_datafusion_error)?;
         let duckdb_conn = DuckDB::duckdb_conn(&mut db_conn).map_err(to_datafusion_error)?;
 
+        let data_batches_result = data
+            .collect::<Vec<datafusion::common::Result<RecordBatch>>>()
+            .await;
+
+        let data_batches: Vec<RecordBatch> = data_batches_result
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?;
+
+        for data_batch in &data_batches {
+            num_rows += u64::try_from(data_batch.num_rows()).map_err(|e| {
+                DataFusionError::Execution(format!("Unable to convert num_rows() to u64: {e}"))
+            })?;
+        }
+
+        let tx = duckdb_conn
+            .conn
+            .transaction()
+            .context(super::UnableToBeginTransactionSnafu)
+            .map_err(to_datafusion_error)?;
+
         if self.overwrite {
             self.duckdb
-                .delete_all_table_data(duckdb_conn, true)
+                .delete_all_table_data(&tx)
                 .map_err(to_datafusion_error)?;
         }
 
-        while let Some(batch) = data.next().await {
-            let batch = batch?;
-            num_rows += batch.num_rows() as u64;
-
+        for batch in data_batches {
             self.duckdb
-                .insert_batch(duckdb_conn, &batch)
+                .insert_batch(&tx, &batch)
                 .map_err(to_datafusion_error)?;
         }
+
+        tx.commit()
+            .context(super::UnableToCommitDuckDBTransactionSnafu)
+            .map_err(to_datafusion_error)?;
 
         Ok(num_rows)
     }
