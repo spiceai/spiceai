@@ -150,7 +150,7 @@ impl TableProvider for SparkConnectTablePovider {
     }
 
     fn schema(&self) -> SchemaRef {
-        self.schema.clone()
+        Arc::clone(&self.schema)
     }
 
     fn table_type(&self) -> TableType {
@@ -166,7 +166,7 @@ impl TableProvider for SparkConnectTablePovider {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(SparkConnectExecutionPlan::new(
             self.dataframe.clone(),
-            self.schema.clone(),
+            Arc::clone(&self.schema),
             projection,
             filters,
             limit,
@@ -245,7 +245,7 @@ impl ExecutionPlan for SparkConnectExecutionPlan {
     }
 
     fn schema(&self) -> SchemaRef {
-        self.projected_schema.clone()
+        Arc::clone(&self.projected_schema)
     }
 
     fn execute(

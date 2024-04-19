@@ -530,7 +530,7 @@ fn initialize_attribute_schema(
                 continue;
             }
 
-            fields.insert(field.name().clone(), field.clone());
+            fields.insert(field.name().clone(), Arc::clone(field));
             match field.data_type() {
                 DataType::Utf8 => {
                     columns.insert(field.name().clone(), Box::new(StringBuilder::new()));

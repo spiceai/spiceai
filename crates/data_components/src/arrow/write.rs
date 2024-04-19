@@ -113,7 +113,7 @@ impl TableProvider for MemTable {
     }
 
     fn schema(&self) -> SchemaRef {
-        self.schema.clone()
+        Arc::clone(&self.schema)
     }
 
     fn constraints(&self) -> Option<&Constraints> {
@@ -176,7 +176,7 @@ impl TableProvider for MemTable {
         Ok(Arc::new(FileSinkExec::new(
             input,
             sink,
-            self.schema.clone(),
+            Arc::clone(&self.schema),
             None,
         )))
     }
