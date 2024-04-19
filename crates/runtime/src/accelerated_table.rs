@@ -5,7 +5,7 @@ use arrow::array::UInt64Array;
 use arrow::datatypes::{DataType, SchemaRef};
 use async_stream::stream;
 use async_trait::async_trait;
-use data_components::delete::cast_to_deleteable;
+use data_components::delete::get_deletion_provider;
 use datafusion::common::OwnedTableReference;
 use datafusion::error::Result as DataFusionResult;
 use datafusion::execution::context::SessionState;
@@ -228,7 +228,7 @@ impl AcceleratedTable {
 
             tracing::info!("[retention] Running retention check for {dataset_name}...");
 
-            if let Some(deleted_table_provider) = cast_to_deleteable(accelerator.as_ref()) {
+            if let Some(deleted_table_provider) = get_deletion_provider(accelerator.as_ref()) {
                 let ctx = SessionContext::new();
 
                 let Some(expr) = get_expr(retention_period, &time_column, expr_time_format.clone())

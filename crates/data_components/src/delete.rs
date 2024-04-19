@@ -133,7 +133,7 @@ impl ExecutionPlan for DeletionExec {
 }
 
 // There is no good way to allow inter trait casting yet as TableProvider is not controlled
-pub fn cast_to_deleteable<'a>(
+pub fn get_deletion_provider<'a>(
     from: &'a dyn TableProvider,
 ) -> Option<&'a (dyn DeletionTableProvider + 'a)> {
     if let Some(p) = from.as_any().downcast_ref::<MemTable>() {
