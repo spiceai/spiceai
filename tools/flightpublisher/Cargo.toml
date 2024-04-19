@@ -19,5 +19,4 @@ tonic = { workspace = true, features = [
   "tls",
   "tls-roots",
 ] }
-async-stream.workspace = true
 futures.workspace = true
