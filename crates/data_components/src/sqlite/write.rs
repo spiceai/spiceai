@@ -42,11 +42,11 @@ pub struct SqliteTableWriter {
 }
 
 impl SqliteTableWriter {
-    pub fn create(read_provider: Arc<dyn TableProvider>, sqlite: Sqlite) -> Arc<dyn TableProvider> {
+    pub fn create(read_provider: Arc<dyn TableProvider>, sqlite: Sqlite) -> Arc<Self> {
         Arc::new(Self {
             read_provider,
             sqlite: Arc::new(sqlite),
-        }) as _
+        })
     }
 }
 

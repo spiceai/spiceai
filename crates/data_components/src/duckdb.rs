@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::{Read, ReadWrite};
+use crate::{delete::DeletionTableProviderAdapter, Read, ReadWrite};
 use arrow::{array::RecordBatch, datatypes::SchemaRef};
 use async_trait::async_trait;
 use datafusion::{
@@ -136,10 +136,11 @@ impl TableProviderFactory for DuckDBTableProviderFactory {
             OwnedTableReference::bare(name.clone()),
         ));
 
-        let read_write_provider: Arc<dyn TableProvider> =
-            DuckDBTableWriter::create(read_provider, duckdb);
+        let read_write_provider = DuckDBTableWriter::create(read_provider, duckdb);
 
-        Ok(read_write_provider)
+        let deleted_table_provider = DeletionTableProviderAdapter::new(read_write_provider);
+
+        Ok(Arc::new(deleted_table_provider))
     }
 }
 

@@ -42,7 +42,7 @@ use snafu::prelude::*;
 use sql_provider_datafusion::{expr, SqlTable};
 use std::sync::Arc;
 
-use crate::{Read, ReadWrite};
+use crate::{delete::DeletionTableProviderAdapter, Read, ReadWrite};
 
 use self::write::PostgresTableWriter;
 
@@ -229,7 +229,9 @@ impl TableProviderFactory for PostgresTableProviderFactory {
             OwnedTableReference::bare(name.clone()),
         ));
 
-        Ok(PostgresTableWriter::create(read_provider, postgres))
+        let delete_adapter =
+            DeletionTableProviderAdapter::new(PostgresTableWriter::create(read_provider, postgres));
+        Ok(Arc::new(delete_adapter))
     }
 }
 

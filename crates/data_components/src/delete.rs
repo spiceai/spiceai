@@ -1,25 +1,17 @@
 #![allow(clippy::missing_errors_doc)]
 use std::{any::Any, error::Error, sync::Arc};
 
-#[cfg(feature = "duckdb")]
-use crate::duckdb::write::DuckDBTableWriter;
-#[cfg(feature = "postgres")]
-use crate::postgres::write::PostgresTableWriter;
-#[cfg(feature = "sqlite")]
-use crate::sqlite::write::SqliteTableWriter;
-
-use crate::arrow::write::MemTable;
-
 use ::arrow::{
     array::{ArrayRef, RecordBatch, UInt64Array},
     datatypes::{DataType, Field, Schema, SchemaRef},
 };
 use async_trait::async_trait;
 use datafusion::{
-    datasource::TableProvider,
-    error::DataFusionError,
+    common::Constraints,
+    datasource::{TableProvider, TableType},
+    error::{DataFusionError, Result as DataFusionResult},
     execution::{context::SessionState, SendableRecordBatchStream, TaskContext},
-    logical_expr::Expr,
+    logical_expr::{Expr, LogicalPlan},
     physical_expr::EquivalenceProperties,
     physical_plan::{
         stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionMode,
@@ -132,28 +124,64 @@ impl ExecutionPlan for DeletionExec {
     }
 }
 
-// There is no good way to allow inter trait casting yet as TableProvider is not controlled
-pub fn get_deletion_provider<'a>(
-    from: &'a dyn TableProvider,
-) -> Option<&'a (dyn DeletionTableProvider + 'a)> {
-    if let Some(p) = from.as_any().downcast_ref::<MemTable>() {
-        return Some(p);
-    }
+pub struct DeletionTableProviderAdapter {
+    source: Arc<dyn DeletionTableProvider>,
+}
 
-    #[cfg(feature = "postgres")]
-    if let Some(p) = from.as_any().downcast_ref::<PostgresTableWriter>() {
-        return Some(p);
+impl DeletionTableProviderAdapter {
+    pub fn new(source: Arc<dyn DeletionTableProvider>) -> Self {
+        Self { source }
     }
+}
 
-    #[cfg(feature = "duckdb")]
-    if let Some(p) = from.as_any().downcast_ref::<DuckDBTableWriter>() {
-        return Some(p);
-    }
-
-    #[cfg(feature = "sqlite")]
-    if let Some(p) = from.as_any().downcast_ref::<SqliteTableWriter>() {
-        return Some(p);
+#[allow(clippy::needless_pass_by_value)]
+pub fn get_deletion_provider(
+    from: Arc<dyn TableProvider>,
+) -> Option<Arc<dyn DeletionTableProvider>> {
+    if let Some(p) = from.as_any().downcast_ref::<DeletionTableProviderAdapter>() {
+        return Some(Arc::clone(&p.source));
     }
 
     None
+}
+
+#[async_trait]
+impl TableProvider for DeletionTableProviderAdapter {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn schema(&self) -> SchemaRef {
+        self.source.schema()
+    }
+    fn constraints(&self) -> Option<&Constraints> {
+        self.source.constraints()
+    }
+    fn table_type(&self) -> TableType {
+        self.source.table_type()
+    }
+    fn get_logical_plan(&self) -> Option<&LogicalPlan> {
+        self.source.get_logical_plan()
+    }
+    fn get_column_default(&self, column: &str) -> Option<&Expr> {
+        self.source.get_column_default(column)
+    }
+
+    async fn scan(
+        &self,
+        state: &SessionState,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        self.source.scan(state, projection, filters, limit).await
+    }
+
+    async fn insert_into(
+        &self,
+        state: &SessionState,
+        input: Arc<dyn ExecutionPlan>,
+        overwrite: bool,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        self.source.insert_into(state, input, overwrite).await
+    }
 }
