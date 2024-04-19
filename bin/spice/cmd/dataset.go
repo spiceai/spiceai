@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"regexp"
 	"strings"
 	"time"
 
@@ -69,8 +70,14 @@ spice dataset configure
 			datasetName = defaultDatasetName
 		}
 
-		if strings.Contains(datasetName, ".") {
-			cmd.Println(aurora.BrightRed("Dataset name cannot contain '.'"))
+		match, err := regexp.MatchString("^[a-zA-Z0-9_-]+$", datasetName)
+		if err != nil {
+			cmd.Println(err.Error())
+			os.Exit(1)
+		}
+
+		if !match {
+			cmd.Println(aurora.BrightRed("Dataset name can only contain letters, numbers, underscores, and hyphens"))
 			os.Exit(1)
 		}
 
