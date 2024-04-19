@@ -186,9 +186,8 @@ impl DeletionSink for DuckDBDeletionSink {
     async fn delete_from(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         let mut db_conn = self.duckdb.connect().await?;
         let duckdb_conn = DuckDB::duckdb_conn(&mut db_conn)?;
-        let filters_to_sql = crate::util::filters_to_sql(&self.filters, Some(Engine::DuckDB))?;
-        print!("{filters_to_sql}");
-        let count = self.duckdb.delete_from(duckdb_conn, &filters_to_sql)?;
+        let sql = crate::util::filters_to_sql(&self.filters, Some(Engine::DuckDB))?;
+        let count = self.duckdb.delete_from(duckdb_conn, &sql)?;
 
         Ok(count)
     }

@@ -21,7 +21,8 @@ use datafusion::{
 use futures::{stream::BoxStream, StreamExt};
 use object_store::ObjectStore;
 use snafu::prelude::*;
-use spicepod::component::dataset::acceleration::{RefreshMode, TimeFormat};
+use spicepod::component::dataset::acceleration::RefreshMode;
+use spicepod::component::dataset::TimeFormat;
 use tokio::task::JoinHandle;
 use tokio::time::interval;
 use url::Url;
@@ -30,6 +31,7 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::Receiver;
 use tokio_stream::wrappers::ReceiverStream;
 
+use crate::datafusion::Retention;
 use crate::execution_plan::slice::SliceExec;
 use crate::execution_plan::tee::TeeExec;
 use crate::{
@@ -102,11 +104,7 @@ impl AcceleratedTable {
         refresh_mode: RefreshMode,
         refresh_interval: Option<Duration>,
         refresh_sql: Option<String>,
-        time_column: Option<String>,
-        time_format: Option<TimeFormat>,
-        retention_check_interval: Option<Duration>,
-        retention_period: Option<Duration>,
-        retention_enabled: bool,
+        retention: Option<Retention>,
         object_store: Option<(Url, Arc<dyn ObjectStore + 'static>)>,
     ) -> Self {
         let mut refresh_trigger = None;
@@ -139,20 +137,13 @@ impl AcceleratedTable {
             handlers.push(scheduled_refreshes_handle);
         }
 
-        if retention_enabled {
-            if let (Some(time_column), Some(retention_period), Some(retention_check_interval)) =
-                (time_column, retention_period, retention_check_interval)
-            {
-                let retention_check_handle = tokio::spawn(Self::start_retention_check(
-                    dataset_name,
-                    Arc::clone(&accelerator),
-                    retention_check_interval,
-                    time_column,
-                    time_format,
-                    retention_period,
-                ));
-                handlers.push(retention_check_handle);
-            }
+        if let Some(retention) = retention {
+            let retention_check_handle = tokio::spawn(Self::start_retention_check(
+                dataset_name,
+                Arc::clone(&accelerator),
+                retention,
+            ));
+            handlers.push(retention_check_handle);
         }
 
         Self {
@@ -207,18 +198,16 @@ impl AcceleratedTable {
     async fn start_retention_check(
         dataset_name: String,
         accelerator: Arc<dyn TableProvider>,
-        interval: Duration,
-        time_column: String,
-        time_format: Option<TimeFormat>,
-        retention_period: Duration,
+        retention: Retention,
     ) {
-        let mut interval_timer = tokio::time::interval(interval);
-
+        let time_column = retention.time_column;
+        let retention_period = retention.period;
         let schema = accelerator.schema();
-
         let field = schema.column_with_name(time_column.as_str());
 
-        let Some(expr_time_format) = get_expr_time_format(field, &time_format) else {
+        let mut interval_timer = tokio::time::interval(retention.check_interval);
+
+        let Some(expr_time_format) = get_expr_time_format(field, &retention.time_format) else {
             tracing::error!("[retention] Failed to get the expression time format for {time_column}, check schema and time format");
             return;
         };
