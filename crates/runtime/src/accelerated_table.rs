@@ -195,6 +195,7 @@ impl AcceleratedTable {
         None
     }
 
+    #[allow(clippy::cast_possible_wrap)]
     async fn start_retention_check(
         dataset_name: String,
         accelerator: Arc<dyn TableProvider>,
@@ -215,21 +216,27 @@ impl AcceleratedTable {
         loop {
             interval_timer.tick().await;
 
-            tracing::info!("[retention] Running retention check for {dataset_name}...");
-
             if let Some(deleted_table_provider) = get_deletion_provider(Arc::clone(&accelerator)) {
                 let ctx = SessionContext::new();
 
-                let Some(expr) = get_expr(retention_period, &time_column, expr_time_format.clone())
-                else {
+                let start = SystemTime::now() - retention_period;
+
+                let Ok(timestamp) = get_timestamp(start) else {
+                    tracing::error!("[retention] failed to get timestamp");
                     continue;
                 };
-
-                tracing::debug!(
-                    "[retention] Evicting data for {dataset_name} {:?} {:?}...",
-                    expr,
-                    retention_period
+                let expr = get_expr(&time_column, timestamp, expr_time_format.clone());
+                tracing::info!(
+                    "[retention] Evicting data for {dataset_name} where {time_column} < {}...",
+                    if let Some(value) = chrono::DateTime::from_timestamp(timestamp as i64, 0) {
+                        value.to_rfc3339()
+                    } else {
+                        tracing::warn!("[retention] unable to convert timestamp");
+                        continue;
+                    }
                 );
+
+                tracing::debug!("[retention] Expr {expr:?}");
 
                 let plan = deleted_table_provider
                     .delete_from(&ctx.state(), &vec![expr])
@@ -437,37 +444,28 @@ fn get_expr_time_format(
 }
 
 #[allow(clippy::cast_possible_wrap)]
-fn get_expr(
-    retention_period: Duration,
-    time_column: &str,
-    expr_time_format: ExprTimeFormat,
-) -> Option<Expr> {
-    let start = SystemTime::now();
-    let timestamp = (start - retention_period).duration_since(UNIX_EPOCH);
-    if timestamp.clone().is_err() {
-        tracing::error!("[retention] Failed to get the unix timestamp");
-        return None;
-    }
-    let timestamp = timestamp.map_or(0, |f| f.as_secs());
-
+fn get_expr(time_column: &str, timestamp: u64, expr_time_format: ExprTimeFormat) -> Expr {
     match expr_time_format {
-        ExprTimeFormat::ISO8601 => Some(
-            cast(
-                col(time_column),
-                DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
-            )
-            .lt(Expr::Literal(ScalarValue::TimestampMillisecond(
-                Some((timestamp * 1000) as i64),
-                None,
-            ))),
-        ),
-        ExprTimeFormat::UnixTimestamp(format) => {
-            Some(col(time_column).lt(lit(timestamp * format.scale)))
-        }
-        ExprTimeFormat::Timestamp => Some(col(time_column).lt(Expr::Literal(
-            ScalarValue::TimestampMillisecond(Some((timestamp * 1000) as i64), None),
+        ExprTimeFormat::ISO8601 => cast(
+            col(time_column),
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+        )
+        .lt(Expr::Literal(ScalarValue::TimestampMillisecond(
+            Some((timestamp * 1000) as i64),
+            None,
         ))),
+        ExprTimeFormat::UnixTimestamp(format) => col(time_column).lt(lit(timestamp * format.scale)),
+        ExprTimeFormat::Timestamp => col(time_column).lt(Expr::Literal(
+            ScalarValue::TimestampMillisecond(Some((timestamp * 1000) as i64), None),
+        )),
     }
+}
+
+fn get_timestamp(time: SystemTime) -> Result<u64> {
+    let timestamp = time
+        .duration_since(UNIX_EPOCH)
+        .context(UnableToGetUnixTimestampSnafu)?;
+    Ok(timestamp.as_secs())
 }
 
 impl Drop for AcceleratedTable {

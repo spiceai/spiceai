@@ -5349,6 +5349,7 @@ dependencies = [
  "bb8",
  "bb8-postgres",
  "bytes",
+ "chrono",
  "clap",
  "csv",
  "data_components",
@@ -6103,7 +6104,6 @@ version = "0.11.1-alpha"
 dependencies = [
  "arrow",
  "async-trait",
- "chrono",
  "datafusion",
  "db_connection_pool",
  "duckdb",
