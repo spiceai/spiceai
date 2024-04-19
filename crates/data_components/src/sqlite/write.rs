@@ -213,8 +213,6 @@ impl DeletionSink for SqliteDeletionSink {
         let sqlite = Arc::clone(&self.sqlite);
         let sql = crate::util::filters_to_sql(&self.filters, Some(Engine::SQLite))?;
 
-        print!("{sql}");
-
         let count: u64 = sqlite_conn
             .conn
             .call(move |conn| {
