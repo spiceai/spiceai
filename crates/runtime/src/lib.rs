@@ -128,6 +128,9 @@ pub enum Error {
 
     #[snafu(display("The accelerator engine {name} is not available"))]
     AcceleratorEngineNotAvailable { name: Arc<str> },
+
+    #[snafu(display("Unable to load dataset connector: {dataset}"))]
+    UnableToLoadDatasetConnector { dataset: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -187,14 +190,47 @@ impl Runtime {
         if let Some(app) = app_lock.as_ref() {
             for ds in &app.datasets {
                 status::update_dataset(&ds.name, status::ComponentStatus::Initializing);
-                self.load_dataset(ds, &app.datasets);
+                self.load_dataset(ds, &app.datasets).await;
             }
         }
     }
 
     // Caller must set `status::update_dataset(...` before calling `load_dataset`. This function will set error/ready statuses appropriately.`
-    pub fn load_dataset(&self, ds: &Dataset, all_datasets: &[Dataset]) {
-        let df = Arc::clone(&self.df);
+    pub async fn load_dataset(&self, ds: &Dataset, all_datasets: &[Dataset]) {
+        let spaced_tracer = Arc::clone(&self.spaced_tracer);
+
+        loop {
+            let connector = match self.load_dataset_connector(ds, all_datasets).await {
+                Ok(connector) => connector,
+                Err(err) => {
+                    status::update_dataset(&ds.name, status::ComponentStatus::Error);
+                    metrics::counter!("datasets_load_error").increment(1);
+                    warn_spaced!(
+                        spaced_tracer,
+                        "Failed to get data connector from source for dataset {}, retrying: {err}",
+                        &ds.name
+                    );
+                    sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+            };
+
+            if let Ok(()) = self.register_loaded_dataset(ds, connector).await {
+            } else {
+                sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+
+            status::update_dataset(&ds.name, status::ComponentStatus::Ready);
+            break;
+        }
+    }
+
+    pub async fn load_dataset_connector(
+        &self,
+        ds: &Dataset,
+        all_datasets: &[Dataset],
+    ) -> Result<Arc<dyn DataConnector>> {
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
         let shared_secrets_provider: Arc<RwLock<secrets::SecretsProvider>> =
             Arc::clone(&self.secrets_provider);
@@ -206,70 +242,68 @@ impl Runtime {
             .map(|d| d.name.clone())
             .collect::<Vec<String>>();
 
-        tokio::spawn(async move {
-            loop {
-                let secrets_provider = shared_secrets_provider.read().await;
+        let secrets_provider = shared_secrets_provider.read().await;
 
-                if !verify_dependent_tables(&ds, &existing_tables) {
-                    status::update_dataset(&ds.name, status::ComponentStatus::Error);
-                    metrics::counter!("datasets_load_error").increment(1);
-                    return;
+        if !verify_dependent_tables(&ds, &existing_tables) {
+            status::update_dataset(&ds.name, status::ComponentStatus::Error);
+            metrics::counter!("datasets_load_error").increment(1);
+            return UnableToLoadDatasetConnectorSnafu {
+                dataset: ds.name.clone(),
+            }
+            .fail();
+        }
+
+        let source = ds.source();
+        let params = Arc::new(ds.params.clone().map(|params| params.as_string_map()));
+        let data_connector: Arc<dyn DataConnector> = match Runtime::get_dataconnector_from_source(
+            &source,
+            &secrets_provider,
+            Arc::clone(&params),
+        )
+        .await
+        {
+            Ok(data_connector) => data_connector,
+            Err(err) => {
+                status::update_dataset(&ds.name, status::ComponentStatus::Error);
+                metrics::counter!("datasets_load_error").increment(1);
+                warn_spaced!(
+                    spaced_tracer,
+                    "Failed to get data connector from source for dataset {}: {err}",
+                    &ds.name
+                );
+                return UnableToLoadDatasetConnectorSnafu {
+                    dataset: ds.name.clone(),
                 }
+                .fail();
+            }
+        };
 
-                let source = ds.source();
-                let params = Arc::new(ds.params.clone().map(|params| params.as_string_map()));
-                let data_connector: Arc<dyn DataConnector> =
-                    match Runtime::get_dataconnector_from_source(
-                        &source,
-                        &secrets_provider,
-                        Arc::clone(&params),
-                    )
-                    .await
-                    {
-                        Ok(data_connector) => data_connector,
-                        Err(err) => {
-                            status::update_dataset(&ds.name, status::ComponentStatus::Error);
-                            metrics::counter!("datasets_load_error").increment(1);
-                            warn_spaced!(
-                                spaced_tracer,
-                                "Failed to get data connector from source for dataset {}, retrying: {err}",
-                                &ds.name
-                            );
-                            sleep(Duration::from_secs(1)).await;
-                            continue;
-                        }
-                    };
+        Ok(data_connector)
+    }
 
-                match Runtime::register_dataset(
-                    &ds,
-                    data_connector,
-                    Arc::clone(&df),
-                    &source,
-                    Arc::clone(&shared_secrets_provider),
-                )
-                .await
-                {
-                    Ok(()) => (),
-                    Err(err) => {
-                        status::update_dataset(&ds.name, status::ComponentStatus::Error);
-                        metrics::counter!("datasets_load_error").increment(1);
-                        if let Error::UnableToAttachDataConnector {
-                            source: datafusion::Error::RefreshSql { source },
-                            data_connector: _,
-                        } = &err
-                        {
-                            tracing::error!("{source}");
-                            return;
-                        }
-                        warn_spaced!(
-                            spaced_tracer,
-                            "Failed to initialize data connector for dataset {}, retrying: {err}",
-                            &ds.name
-                        );
-                        sleep(Duration::from_secs(1)).await;
-                        continue;
-                    }
-                };
+    pub async fn register_loaded_dataset(
+        &self,
+        ds: &Dataset,
+        data_connector: Arc<dyn DataConnector>,
+    ) -> Result<()> {
+        let df = Arc::clone(&self.df);
+        let ds = ds.clone();
+        let source = ds.source();
+        let spaced_tracer = Arc::clone(&self.spaced_tracer);
+        let shared_secrets_provider: Arc<RwLock<secrets::SecretsProvider>> =
+            Arc::clone(&self.secrets_provider);
+
+        let data_connector = Arc::clone(&data_connector);
+        match Runtime::register_dataset(
+            &ds,
+            data_connector,
+            Arc::clone(&df),
+            &source,
+            Arc::clone(&shared_secrets_provider),
+        )
+        .await
+        {
+            Ok(()) => {
                 tracing::info!("Loaded dataset: {}", &ds.name);
                 let engine = ds.acceleration.map_or_else(
                     || "None".to_string(),
@@ -283,9 +317,28 @@ impl Runtime {
                 );
                 metrics::gauge!("datasets_count", "engine" => engine).increment(1.0);
                 status::update_dataset(&ds.name, status::ComponentStatus::Ready);
-                break;
+
+                Ok(())
             }
-        });
+            Err(err) => {
+                status::update_dataset(&ds.name, status::ComponentStatus::Error);
+                metrics::counter!("datasets_load_error").increment(1);
+                if let Error::UnableToAttachDataConnector {
+                    source: datafusion::Error::RefreshSql { source },
+                    data_connector: _,
+                } = &err
+                {
+                    tracing::error!("{source}");
+                }
+                warn_spaced!(
+                    spaced_tracer,
+                    "Failed to initialize data connector for dataset {}: {err}",
+                    &ds.name
+                );
+
+                Err(err)
+            }
+        }
     }
 
     pub async fn remove_dataset(&self, ds: &Dataset) {
@@ -313,9 +366,18 @@ impl Runtime {
     }
 
     pub async fn update_dataset(&self, ds: &Dataset, all_datasets: &[Dataset]) {
+        tracing::info!("Updating dataset: {}...", &ds.name);
         status::update_dataset(&ds.name, status::ComponentStatus::Refreshing);
-        self.remove_dataset(ds).await;
-        self.load_dataset(ds, all_datasets);
+        if let Ok(connector) = self.load_dataset_connector(ds, all_datasets).await {
+            self.remove_dataset(ds).await;
+            if let Ok(()) = self.register_loaded_dataset(ds, connector).await {
+                status::update_dataset(&ds.name, status::ComponentStatus::Ready);
+            } else {
+                status::update_dataset(&ds.name, status::ComponentStatus::Error);
+            }
+        } else {
+            status::update_dataset(&ds.name, status::ComponentStatus::Error);
+        }
     }
 
     async fn get_dataconnector_from_source(
@@ -359,7 +421,7 @@ impl Runtime {
         let replicate = ds.replication.as_ref().map_or(false, |r| r.enabled);
 
         // FEDERATED TABLE
-        if ds.acceleration.is_none() || ds.acceleration.as_ref().map_or(false, |acc| !acc.enabled) {
+        if !ds.is_accelerated() {
             if ds.mode() == Mode::ReadWrite && !replicate {
                 // A federated dataset was configured as ReadWrite, but the replication setting wasn't set - error out.
                 FederatedReadWriteTableWithoutReplicationSnafu.fail()?;
@@ -536,7 +598,7 @@ impl Runtime {
                         }
                     } else {
                         status::update_dataset(&ds.name, status::ComponentStatus::Initializing);
-                        self.load_dataset(ds, &new_app.datasets);
+                        self.load_dataset(ds, &new_app.datasets).await;
                     }
                 }
 
