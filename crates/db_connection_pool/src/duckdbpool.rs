@@ -69,6 +69,11 @@ impl DuckDbConnectionPool {
         conn.register_table_function::<ArrowVTab>("arrow")
             .context(DuckDBSnafu)?;
 
+        // Test the connection
+        let _result = conn
+            .execute("SELECT 1", [])
+            .map_err(|_| ConnectionPoolSnafu);
+
         Ok(DuckDbConnectionPool { pool })
     }
 
