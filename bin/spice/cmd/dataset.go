@@ -81,6 +81,11 @@ spice dataset configure
 			os.Exit(1)
 		}
 
+		if strings.Contains(datasetName, "-") {
+			// warn that dataset name with hyphen should be quoted in queries
+			cmd.Println(aurora.BrightYellow(fmt.Sprintf("Dataset names with hyphens should be quoted in queries:\nSELECT * FROM \"%s\"", datasetName)))
+		}
+
 		cmd.Print("description: ")
 		description, err := reader.ReadString('\n')
 		if err != nil {
