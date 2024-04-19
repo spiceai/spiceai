@@ -389,7 +389,10 @@ mod tests {
             col("time_in_string"),
             DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
         )
-        .lt(lit(ScalarValue::TimestampMillisecond(Some(1354360272000), None)));
+        .lt(lit(ScalarValue::TimestampMillisecond(
+            Some(1354360272000),
+            None,
+        )));
 
         let plan = table
             .delete_from(&ctx.state(), &vec![filter])

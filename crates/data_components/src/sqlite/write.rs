@@ -234,7 +234,7 @@ impl DeletionSink for SqliteDeletionSink {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, ops::Deref, sync::Arc};
+    use std::{collections::HashMap, sync::Arc};
 
     use arrow::{
         array::{Int64Array, RecordBatch, StringArray, UInt64Array},
@@ -252,14 +252,12 @@ mod tests {
     use crate::{delete::get_deletion_provider, sqlite::SqliteTableFactory};
 
     #[tokio::test]
-    #[allow(clippy::unwrap_used)]
     async fn test_round_trip_sqlite() {
         let schema = Arc::new(Schema::new(vec![
             arrow::datatypes::Field::new("time_in_string", DataType::Utf8, false),
-            arrow::datatypes::Field::new("time", DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None), false),
             arrow::datatypes::Field::new("time_int", DataType::Int64, false),
         ]));
-        let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema)).unwrap();
+        let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema)).expect("df schema");
         let external_table = CreateExternalTable {
             schema: df_schema,
             name: OwnedTableReference::bare("test_table"),
@@ -281,35 +279,30 @@ mod tests {
         let table = SqliteTableFactory::default()
             .create(&ctx.state(), &external_table)
             .await
-            .unwrap();
+            .expect("table should be created");
 
         let arr1 = StringArray::from(vec![
             "1970-01-01",
             "2012-12-01T11:11:11Z",
             "2012-12-01T11:11:12Z",
         ]);
-        let arr2 = StringArray::from(vec![
-            "1970-01-01",
-            "2012-12-01T11:11:11Z",
-            "2012-12-01T11:11:12Z",
-        ]);
-        let arr3 = Int64Array::from(vec![
-            0,
-            1354360271,
-            1354360272,
-        ]);
-        let data = RecordBatch::try_new(schema.clone(), vec![Arc::new(arr1)]).unwrap();
+        let arr3 = Int64Array::from(vec![0, 1354360271, 1354360272]);
+        let data = RecordBatch::try_new(schema.clone(), vec![Arc::new(arr1), Arc::new(arr3)])
+            .expect("data should be created");
 
         let exec = MockExec::new(vec![Ok(data)], schema);
 
         let insertion = table
             .insert_into(&ctx.state(), Arc::new(exec), false)
             .await
-            .unwrap();
+            .expect("insertion should be successful");
 
-        collect(insertion, ctx.task_ctx()).await.unwrap();
+        collect(insertion, ctx.task_ctx())
+            .await
+            .expect("insert successful");
 
-        let table = get_deletion_provider(table.deref()).unwrap();
+        let table =
+            get_deletion_provider(table).expect("table should be returned as deletetion provider");
 
         let filter = cast(
             col("time_in_string"),
@@ -322,17 +315,38 @@ mod tests {
         let plan = table
             .delete_from(&ctx.state(), &vec![filter])
             .await
-            .unwrap();
+            .expect("deletion should be successful");
 
-        let result = collect(plan, ctx.task_ctx()).await.unwrap();
+        let result = collect(plan, ctx.task_ctx())
+            .await
+            .expect("deletion successful");
         let actual = result
             .first()
-            .unwrap()
+            .expect("result should have at least one batch")
             .column(0)
             .as_any()
             .downcast_ref::<UInt64Array>()
-            .unwrap();
+            .expect("result should be UInt64Array");
         let expected = UInt64Array::from(vec![2]);
+        assert_eq!(actual, &expected);
+
+        let filter = col("time_int").lt(lit(1354360273));
+        let plan = table
+            .delete_from(&ctx.state(), &vec![filter])
+            .await
+            .expect("deletion should be successful");
+
+        let result = collect(plan, ctx.task_ctx())
+            .await
+            .expect("deletion successful");
+        let actual = result
+            .first()
+            .expect("result should have at least one batch")
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .expect("result should be UInt64Array");
+        let expected = UInt64Array::from(vec![1]);
         assert_eq!(actual, &expected);
     }
 }

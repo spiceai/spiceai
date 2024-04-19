@@ -55,8 +55,7 @@ impl TableProviderFactory for ArrowFactory {
     ) -> DataFusionResult<Arc<dyn TableProvider>> {
         let schema: Schema = cmd.schema.as_ref().into();
         let mem_table = MemTable::try_new(Arc::new(schema), vec![])?;
-        let delete_adapter =
-            DeletionTableProviderAdapter::new(Arc::new(mem_table));
+        let delete_adapter = DeletionTableProviderAdapter::new(Arc::new(mem_table));
         Ok(Arc::new(delete_adapter))
     }
 }

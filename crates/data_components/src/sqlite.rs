@@ -155,11 +155,9 @@ impl TableProviderFactory for SqliteTableFactory {
             .context(DanglingReferenceToSqliteSnafu)
             .map_err(to_datafusion_error)?;
 
-        let read_write_provider =
-            SqliteTableWriter::create(read_provider, sqlite);
+        let read_write_provider = SqliteTableWriter::create(read_provider, sqlite);
 
-        let delete_adapter =
-            DeletionTableProviderAdapter::new(read_write_provider);
+        let delete_adapter = DeletionTableProviderAdapter::new(read_write_provider);
         Ok(Arc::new(delete_adapter))
     }
 }
