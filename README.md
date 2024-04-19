@@ -110,7 +110,7 @@ brew install spiceai/spiceai/spice
 On **Windows**:
 
 ```bash
-curl -L "https://raw.githubusercontent.com/spiceai/spiceai/trunk/install/Install.ps1" -o Install.ps1 && PowerShell -ExecutionPolicy Bypass -File ./Install.ps1
+curl -L "https://install.spiceai.org/Install.ps1" -o Install.ps1 && PowerShell -ExecutionPolicy Bypass -File ./Install.ps1
 ```
 
 **Step 2.** Initialize a new Spice app with the `spice init` command:
