@@ -245,7 +245,7 @@ impl<T: 'static, P: 'static> ExecutionPlan for SqlExec<T, P> {
     }
 
     fn schema(&self) -> SchemaRef {
-        self.projected_schema.clone()
+        Arc::clone(&self.projected_schema)
     }
 
     fn properties(&self) -> &PlanProperties {
@@ -274,7 +274,7 @@ impl<T: 'static, P: 'static> ExecutionPlan for SqlExec<T, P> {
         let fut = get_stream(Arc::clone(&self.pool), sql);
 
         let stream = futures::stream::once(fut).try_flatten();
-        let schema = self.schema().clone();
+        let schema = Arc::clone(&self.schema());
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
 }

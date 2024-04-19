@@ -80,7 +80,7 @@ pub(crate) async fn handle(
     // Sometimes the first message only contains the schema and no data
     let first_batch = arrow_flight::utils::flight_data_to_arrow_batch(
         &message,
-        schema.clone(),
+        Arc::clone(&schema),
         &dictionaries_by_id,
     )
     .ok();

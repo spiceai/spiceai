@@ -42,7 +42,8 @@ lint:
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
-		-Dclippy::expect_used
+		-Dclippy::expect_used \
+		-Dclippy::clone_on_ref_ptr
 
 .PHONY: run
 run:
