@@ -40,11 +40,11 @@ pub struct DuckDBTableWriter {
 }
 
 impl DuckDBTableWriter {
-    pub fn create(read_provider: Arc<dyn TableProvider>, duckdb: DuckDB) -> Arc<dyn TableProvider> {
+    pub fn create(read_provider: Arc<dyn TableProvider>, duckdb: DuckDB) -> Arc<Self> {
         Arc::new(Self {
             read_provider,
             duckdb: Arc::new(duckdb),
-        }) as _
+        })
     }
 }
 

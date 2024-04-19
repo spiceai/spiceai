@@ -35,6 +35,8 @@ use sql_provider_datafusion::SqlTable;
 use std::sync::Arc;
 use tokio_rusqlite::Connection;
 
+use crate::delete::DeletionTableProviderAdapter;
+
 use self::write::SqliteTableWriter;
 
 pub mod write;
@@ -153,10 +155,12 @@ impl TableProviderFactory for SqliteTableFactory {
             .context(DanglingReferenceToSqliteSnafu)
             .map_err(to_datafusion_error)?;
 
-        let read_write_provider: Arc<dyn TableProvider> =
+        let read_write_provider =
             SqliteTableWriter::create(read_provider, sqlite);
 
-        Ok(read_write_provider)
+        let delete_adapter =
+            DeletionTableProviderAdapter::new(read_write_provider);
+        Ok(Arc::new(delete_adapter))
     }
 }
 

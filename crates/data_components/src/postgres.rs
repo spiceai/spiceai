@@ -155,10 +155,7 @@ impl ReadWrite for PostgresTableFactory {
         let table_name = table_reference.to_string();
         let postgres = Postgres::new(table_name, Arc::clone(&self.pool));
 
-        let delete_adapter =
-            DeletionTableProviderAdapter::new(PostgresTableWriter::create(read_provider, postgres));
-
-        Ok(Arc::new(delete_adapter))
+        Ok(PostgresTableWriter::create(read_provider, postgres))
     }
 }
 
@@ -232,7 +229,9 @@ impl TableProviderFactory for PostgresTableProviderFactory {
             OwnedTableReference::bare(name.clone()),
         ));
 
-        Ok(PostgresTableWriter::create(read_provider, postgres))
+        let delete_adapter =
+            DeletionTableProviderAdapter::new(PostgresTableWriter::create(read_provider, postgres));
+        Ok(Arc::new(delete_adapter))
     }
 }
 
