@@ -187,7 +187,7 @@ impl DeletionSink for DuckDBDeletionSink {
         let duckdb_conn = DuckDB::duckdb_conn(&mut db_conn)?;
         let count = self
             .duckdb
-            .delete_from(duckdb_conn, &crate::util::filters_to_sql(&self.filters)?)?;
+            .delete_from(duckdb_conn, &crate::util::filters_to_sql(&self.filters, None)?)?;
 
         Ok(count)
     }

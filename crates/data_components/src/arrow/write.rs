@@ -389,7 +389,7 @@ mod tests {
             col("time_in_string"),
             DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
         )
-        .lt(lit(ScalarValue::TimestampMillisecond(Some(1), None)));
+        .lt(lit(ScalarValue::TimestampMillisecond(Some(1354360272000), None)));
 
         let plan = table
             .delete_from(&ctx.state(), &vec![filter])
@@ -405,7 +405,7 @@ mod tests {
             .as_any()
             .downcast_ref::<UInt64Array>()
             .unwrap();
-        let expected = UInt64Array::from(vec![1]);
+        let expected = UInt64Array::from(vec![2]);
         assert_eq!(actual, &expected);
     }
 }

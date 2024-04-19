@@ -31,6 +31,7 @@ use datafusion::{
 };
 use futures::StreamExt;
 use snafu::prelude::*;
+use sql_provider_datafusion::expr::Engine;
 
 use crate::delete::{DeletionExec, DeletionSink, DeletionTableProvider};
 
@@ -210,7 +211,10 @@ impl DeletionSink for SqliteDeletionSink {
         let mut db_conn = self.sqlite.connect().await?;
         let sqlite_conn = Sqlite::sqlite_conn(&mut db_conn)?;
         let sqlite = Arc::clone(&self.sqlite);
-        let sql = crate::util::filters_to_sql(&self.filters)?;
+        let sql = crate::util::filters_to_sql(&self.filters, Some(Engine::SQLite))?;
+
+        print!("{sql}");
+
         let count: u64 = sqlite_conn
             .conn
             .call(move |conn| {
@@ -225,5 +229,110 @@ impl DeletionSink for SqliteDeletionSink {
             .await?;
 
         Ok(count)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::HashMap, ops::Deref, sync::Arc};
+
+    use arrow::{
+        array::{Int64Array, RecordBatch, StringArray, UInt64Array},
+        datatypes::{DataType, Schema},
+    };
+    use datafusion::{
+        common::{parsers::CompressionTypeVariant, Constraints, OwnedTableReference, ToDFSchema},
+        datasource::provider::TableProviderFactory,
+        execution::context::SessionContext,
+        logical_expr::{cast, col, lit, CreateExternalTable},
+        physical_plan::{collect, test::exec::MockExec},
+        scalar::ScalarValue,
+    };
+
+    use crate::{delete::get_deletion_provider, sqlite::SqliteTableFactory};
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn test_round_trip_sqlite() {
+        let schema = Arc::new(Schema::new(vec![
+            arrow::datatypes::Field::new("time_in_string", DataType::Utf8, false),
+            arrow::datatypes::Field::new("time", DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None), false),
+            arrow::datatypes::Field::new("time_int", DataType::Int64, false),
+        ]));
+        let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema)).unwrap();
+        let external_table = CreateExternalTable {
+            schema: df_schema,
+            name: OwnedTableReference::bare("test_table"),
+            location: String::new(),
+            file_type: String::new(),
+            has_header: false,
+            delimiter: ',',
+            table_partition_cols: vec![],
+            if_not_exists: true,
+            definition: None,
+            file_compression_type: CompressionTypeVariant::UNCOMPRESSED,
+            order_exprs: vec![],
+            unbounded: false,
+            options: HashMap::new(),
+            constraints: Constraints::empty(),
+            column_defaults: HashMap::default(),
+        };
+        let ctx = SessionContext::new();
+        let table = SqliteTableFactory::default()
+            .create(&ctx.state(), &external_table)
+            .await
+            .unwrap();
+
+        let arr1 = StringArray::from(vec![
+            "1970-01-01",
+            "2012-12-01T11:11:11Z",
+            "2012-12-01T11:11:12Z",
+        ]);
+        let arr2 = StringArray::from(vec![
+            "1970-01-01",
+            "2012-12-01T11:11:11Z",
+            "2012-12-01T11:11:12Z",
+        ]);
+        let arr3 = Int64Array::from(vec![
+            0,
+            1354360271,
+            1354360272,
+        ]);
+        let data = RecordBatch::try_new(schema.clone(), vec![Arc::new(arr1)]).unwrap();
+
+        let exec = MockExec::new(vec![Ok(data)], schema);
+
+        let insertion = table
+            .insert_into(&ctx.state(), Arc::new(exec), false)
+            .await
+            .unwrap();
+
+        collect(insertion, ctx.task_ctx()).await.unwrap();
+
+        let table = get_deletion_provider(table.deref()).unwrap();
+
+        let filter = cast(
+            col("time_in_string"),
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+        )
+        .lt(lit(ScalarValue::TimestampMillisecond(
+            Some(1354360272000),
+            None,
+        )));
+        let plan = table
+            .delete_from(&ctx.state(), &vec![filter])
+            .await
+            .unwrap();
+
+        let result = collect(plan, ctx.task_ctx()).await.unwrap();
+        let actual = result
+            .first()
+            .unwrap()
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        let expected = UInt64Array::from(vec![2]);
+        assert_eq!(actual, &expected);
     }
 }

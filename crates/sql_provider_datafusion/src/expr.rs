@@ -23,6 +23,7 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+#[derive(Clone, Copy, Debug)]
 pub enum Engine {
     SQLite,
     General,
@@ -32,8 +33,8 @@ pub enum Engine {
 pub fn to_sql_with_engine(expr: &Expr, engine: Option<Engine>) -> Result<String> {
     match expr {
         Expr::BinaryExpr(binary_expr) => {
-            let left = to_sql_with_engine(&binary_expr.left, None)?;
-            let right = to_sql_with_engine(&binary_expr.right, None)?;
+            let left = to_sql_with_engine(&binary_expr.left, engine)?;
+            let right = to_sql_with_engine(&binary_expr.right, engine)?;
             Ok(format!("{} {} {}", left, binary_expr.op, right))
         }
         Expr::Column(name) => Ok(format!("\"{name}\"")),
@@ -49,7 +50,7 @@ pub fn to_sql_with_engine(expr: &Expr, engine: Option<Engine>) -> Result<String>
                 };
                 Ok(format!(
                     "CAST({} AS {})",
-                    to_sql_with_engine(&cast.expr, None)?,
+                    to_sql_with_engine(&cast.expr, engine)?,
                     data_type
                 ))
             }
@@ -63,8 +64,8 @@ pub fn to_sql_with_engine(expr: &Expr, engine: Option<Engine>) -> Result<String>
                     }
                 };
                 Ok(format!(
-                    "datetime({}, 'subsec')",
-                    to_sql_with_engine(&cast.expr, None)?,
+                    "datetime({}, 'subsec', 'utc')",
+                    to_sql_with_engine(&cast.expr, engine)?,
                 ))
             }
         },
@@ -84,12 +85,17 @@ pub fn to_sql_with_engine(expr: &Expr, engine: Option<Engine>) -> Result<String>
             ScalarValue::UInt16(Some(value)) => Ok(value.to_string()),
             ScalarValue::UInt32(Some(value)) => Ok(value.to_string()),
             ScalarValue::UInt64(Some(value)) => Ok(value.to_string()),
-            ScalarValue::TimestampMillisecond(Some(value), None | Some(_)) => Ok(format!(
-                "'{}'",
-                chrono::DateTime::from_timestamp_millis(*value)
+            ScalarValue::TimestampMillisecond(Some(value), None | Some(_)) => {
+                let time_str = chrono::DateTime::from_timestamp_millis(*value)
                     .unwrap_or_default()
-                    .to_rfc3339()
-            )),
+                    .to_rfc3339();
+
+                if let Some(Engine::SQLite) = engine {
+                    return Ok(format!("datetime('{}', 'subsec', 'utc')", time_str))
+                }
+
+                Ok(format!("'{time_str}'",))
+            }
             _ => Err(Error::UnsupportedFilterExpr {
                 expr: format!("{expr}"),
             }),

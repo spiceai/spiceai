@@ -130,7 +130,7 @@ impl DeletionSink for PostgresDeletionSink {
             .context(super::UnableToBeginTransactionSnafu)?;
         let count = self
             .postgres
-            .delete_from(&tx, &crate::util::filters_to_sql(&self.filters)?)
+            .delete_from(&tx, &crate::util::filters_to_sql(&self.filters, None)?)
             .await?;
         tx.commit()
             .await
