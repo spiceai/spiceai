@@ -330,8 +330,8 @@ impl DataFusion {
             Retention::new(
                 dataset.time_column.clone(),
                 dataset.time_format.clone(),
-                dataset.retention_check_interval(),
                 dataset.retention_period(),
+                dataset.retention_check_interval(),
                 acceleration_settings.retention_enabled,
             ),
             obj_store,
