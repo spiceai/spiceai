@@ -78,7 +78,7 @@ impl ReadWrite for DatabricksSparkConnect {
         table_reference: OwnedTableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn Error + Send + Sync>> {
         let provider =
-            spark_connect::get_table_provider(self.session.clone(), table_reference).await?;
+            spark_connect::get_table_provider(Arc::clone(&self.session), table_reference).await?;
         Ok(provider)
     }
 }
@@ -90,7 +90,7 @@ impl Read for DatabricksSparkConnect {
         table_reference: OwnedTableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn Error + Send + Sync>> {
         let provider =
-            spark_connect::get_table_provider(self.session.clone(), table_reference).await?;
+            spark_connect::get_table_provider(Arc::clone(&self.session), table_reference).await?;
         Ok(provider)
     }
 }

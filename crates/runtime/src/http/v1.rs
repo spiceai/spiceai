@@ -708,9 +708,9 @@ pub(crate) mod inference {
 
         for model_predict_request in payload.predictions {
             let prediction_future = run_inference(
-                app.clone(),
-                df.clone(),
-                models.clone(),
+                Arc::clone(&app),
+                Arc::clone(&df),
+                Arc::clone(&models),
                 model_predict_request.model_name,
             );
             model_prediction_futures.push(prediction_future);
@@ -776,7 +776,7 @@ pub(crate) mod inference {
             };
         };
 
-        match runnable.run(df.clone()).await {
+        match runnable.run(Arc::clone(&df)).await {
             Ok(inference_result) => {
                 if let Some(column_data) = inference_result.column_by_name("y") {
                     if let Some(array) = column_data.as_any().downcast_ref::<Float32Array>() {

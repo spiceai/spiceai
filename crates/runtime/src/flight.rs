@@ -288,7 +288,7 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub async fn start(bind_address: std::net::SocketAddr, df: Arc<RwLock<DataFusion>>) -> Result<()> {
     let service = Service {
-        datafusion: df.clone(),
+        datafusion: Arc::clone(&df),
         channel_map: Arc::new(RwLock::new(HashMap::new())),
     };
     let svc = FlightServiceServer::new(service);

@@ -68,7 +68,7 @@ impl ExecutionPlan for SliceExec {
     }
 
     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
-        vec![self.input.clone()]
+        vec![Arc::clone(&self.input)]
     }
 
     fn with_new_children(
@@ -77,7 +77,7 @@ impl ExecutionPlan for SliceExec {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         if children.len() == 1 {
             Ok(Arc::new(SliceExec::new(
-                children[0].clone(),
+                Arc::clone(&children[0]),
                 self.partition,
             )))
         } else {
