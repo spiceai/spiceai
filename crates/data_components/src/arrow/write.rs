@@ -366,7 +366,7 @@ mod tests {
     use crate::{arrow::write::MemTable, delete::DeletionTableProvider};
 
     #[tokio::test]
-    #[allow(clippy::unwrap_used)]
+    #[allow(clippy::unreadable_literal)]
     async fn test_delete_from() {
         let schema = Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
             "time_in_string",
@@ -379,9 +379,11 @@ mod tests {
             "2012-12-01T11:11:12Z",
         ]);
 
-        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(arr)]).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(arr)])
+            .expect("data should be created");
 
-        let table = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+        let table =
+            MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created");
 
         let ctx = SessionContext::new();
 
@@ -397,17 +399,19 @@ mod tests {
         let plan = table
             .delete_from(&ctx.state(), &vec![filter])
             .await
-            .unwrap();
+            .expect("deletion should be successful");
 
-        let result = collect(plan, ctx.task_ctx()).await.unwrap();
+        let result = collect(plan, ctx.task_ctx())
+            .await
+            .expect("deletion successful");
 
         let actual = result
             .first()
-            .unwrap()
+            .expect("result should have at least one batch")
             .column(0)
             .as_any()
             .downcast_ref::<UInt64Array>()
-            .unwrap();
+            .expect("result should be UInt64Array");
         let expected = UInt64Array::from(vec![2]);
         assert_eq!(actual, &expected);
     }

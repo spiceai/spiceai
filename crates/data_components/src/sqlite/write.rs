@@ -252,6 +252,7 @@ mod tests {
     use crate::{delete::get_deletion_provider, sqlite::SqliteTableFactory};
 
     #[tokio::test]
+    #[allow(clippy::unreadable_literal)]
     async fn test_round_trip_sqlite() {
         let schema = Arc::new(Schema::new(vec![
             arrow::datatypes::Field::new("time_in_string", DataType::Utf8, false),
