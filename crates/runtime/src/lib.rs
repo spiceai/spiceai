@@ -390,6 +390,8 @@ impl Runtime {
                 None
             };
 
+            // TODO: wait until accelerated table loaded
+
             self.remove_dataset(ds).await;
 
             if let Ok(()) = self
