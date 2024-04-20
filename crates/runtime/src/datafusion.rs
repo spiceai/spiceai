@@ -283,8 +283,7 @@ impl DataFusion {
         let source_schema = source_table_provider.schema();
 
         let accelerated_table_provider = create_accelerator_table(
-            "__test_table__",
-            // &ds.name,
+            &dataset.name,
             source_schema,
             &acceleration_settings,
             acceleration_secret,
