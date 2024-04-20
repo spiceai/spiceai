@@ -246,33 +246,34 @@ impl DataFusion {
 
     pub async fn get_accelerated_table(
         &self,
-        ds: &Dataset,
+        dataset: &Dataset,
         source: &Arc<dyn DataConnector>,
         acceleration_secret: Option<Secret>,
     ) -> Result<AcceleratedTable> {
         let obj_store = source
-            .get_object_store(ds)
+            .get_object_store(dataset)
             .transpose()
             .context(InvalidObjectStoreSnafu)?;
 
         let acceleration_settings =
-            ds.acceleration
+            dataset
+                .acceleration
                 .clone()
                 .ok_or_else(|| Error::ExpectedAccelerationSettings {
-                    name: ds.name.to_string(),
+                    name: dataset.name.to_string(),
                 })?;
 
-        let source_table_provider = match ds.mode() {
+        let source_table_provider = match dataset.mode() {
             Mode::Read => source
-                .read_provider(ds)
+                .read_provider(dataset)
                 .await
                 .context(UnableToResolveTableProviderSnafu)?,
             Mode::ReadWrite => source
-                .read_write_provider(ds)
+                .read_write_provider(dataset)
                 .await
                 .ok_or_else(|| {
                     WriteProviderNotImplementedSnafu {
-                        table_name: ds.name.to_string(),
+                        table_name: dataset.name.to_string(),
                     }
                     .build()
                 })?
@@ -291,19 +292,19 @@ impl DataFusion {
         .await
         .context(UnableToCreateDataAcceleratorSnafu)?;
 
-        let refresh_sql = ds.refresh_sql();
+        let refresh_sql = dataset.refresh_sql();
         if let Some(refresh_sql) = &refresh_sql {
-            refresh_sql::validate_refresh_sql(&ds.name, refresh_sql.as_str())
+            refresh_sql::validate_refresh_sql(&dataset.name, refresh_sql.as_str())
                 .context(RefreshSqlSnafu)?;
         }
 
         let accelerated_table = AcceleratedTable::new(
-            ds.name.clone(),
+            dataset.name.clone(),
             source_table_provider,
             accelerated_table_provider,
             acceleration_settings.refresh_mode.clone(),
-            ds.refresh_interval(),
-            ds.refresh_sql(),
+            dataset.refresh_interval(),
+            dataset.refresh_sql(),
             obj_store,
         )
         .await;
