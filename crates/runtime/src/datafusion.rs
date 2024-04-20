@@ -309,8 +309,6 @@ impl DataFusion {
         )
         .await;
 
-        let _ = accelerated_table.trigger_refresh().await;
-
         Ok(accelerated_table)
     }
 
