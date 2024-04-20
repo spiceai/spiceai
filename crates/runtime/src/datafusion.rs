@@ -250,6 +250,7 @@ impl DataFusion {
         source: &Arc<dyn DataConnector>,
         acceleration_secret: Option<Secret>,
     ) -> Result<AcceleratedTable> {
+        tracing::debug!("Creating accelerated table {dataset:?}");
         let obj_store = source
             .get_object_store(dataset)
             .transpose()
