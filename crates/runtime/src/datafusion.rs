@@ -299,7 +299,7 @@ impl DataFusion {
         }
 
         let accelerated_table = AcceleratedTable::new(
-            dataset.name.clone(),
+            dataset.name.to_string(),
             source_table_provider,
             accelerated_table_provider,
             acceleration_settings.refresh_mode.clone(),
