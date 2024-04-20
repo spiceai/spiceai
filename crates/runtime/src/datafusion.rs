@@ -255,14 +255,6 @@ impl DataFusion {
             .transpose()
             .context(InvalidObjectStoreSnafu)?;
 
-        let acceleration_settings =
-            dataset
-                .acceleration
-                .clone()
-                .ok_or_else(|| Error::ExpectedAccelerationSettings {
-                    name: dataset.name.to_string(),
-                })?;
-
         let source_table_provider = match dataset.mode() {
             Mode::Read => source
                 .read_provider(dataset)
@@ -281,6 +273,13 @@ impl DataFusion {
         };
 
         let source_schema = source_table_provider.schema();
+        let acceleration_settings =
+            dataset
+                .acceleration
+                .clone()
+                .ok_or_else(|| Error::ExpectedAccelerationSettings {
+                    name: dataset.name.to_string(),
+                })?;
 
         let accelerated_table_provider = create_accelerator_table(
             &dataset.name,
