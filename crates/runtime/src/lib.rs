@@ -25,6 +25,7 @@ use ::datafusion::sql::parser::{self, DFParser};
 use ::datafusion::sql::sqlparser::ast::{SetExpr, TableFactor};
 use ::datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use ::datafusion::sql::sqlparser::{self, ast};
+use accelerated_table::AcceleratedTable;
 use app::App;
 use config::Config;
 use model::Model;
@@ -131,6 +132,9 @@ pub enum Error {
 
     #[snafu(display("Unable to load dataset connector: {dataset}"))]
     UnableToLoadDatasetConnector { dataset: String },
+
+    #[snafu(display("Unable to create accelerated table: {source}"))]
+    UnableToCreateAcceleratedTable { source: datafusion::Error },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -215,7 +219,16 @@ impl Runtime {
                 }
             };
 
-            if let Ok(()) = self.register_loaded_dataset(ds, connector).await {
+            let accelerated_table: Option<AcceleratedTable> = if ds.is_accelerated() {
+                self.get_accelerated_table(ds, &connector).await.ok()
+            } else {
+                None
+            };
+
+            if let Ok(()) = self
+                .register_loaded_dataset(ds, connector, accelerated_table)
+                .await
+            {
             } else {
                 sleep(Duration::from_secs(1)).await;
                 continue;
@@ -285,6 +298,7 @@ impl Runtime {
         &self,
         ds: &Dataset,
         data_connector: Arc<dyn DataConnector>,
+        accelerated_table: Option<AcceleratedTable>,
     ) -> Result<()> {
         let df = Arc::clone(&self.df);
         let ds = ds.clone();
@@ -300,6 +314,7 @@ impl Runtime {
             Arc::clone(&df),
             &source,
             Arc::clone(&shared_secrets_provider),
+            accelerated_table,
         )
         .await
         {
@@ -369,8 +384,18 @@ impl Runtime {
         tracing::info!("Updating dataset: {}...", &ds.name);
         status::update_dataset(&ds.name, status::ComponentStatus::Refreshing);
         if let Ok(connector) = self.load_dataset_connector(ds, all_datasets).await {
+            let accelerated_table: Option<AcceleratedTable> = if ds.is_accelerated() {
+                self.get_accelerated_table(ds, &connector).await.ok()
+            } else {
+                None
+            };
+
             self.remove_dataset(ds).await;
-            if let Ok(()) = self.register_loaded_dataset(ds, connector).await {
+
+            if let Ok(()) = self
+                .register_loaded_dataset(ds, connector, accelerated_table)
+                .await
+            {
                 status::update_dataset(&ds.name, status::ComponentStatus::Ready);
             } else {
                 status::update_dataset(&ds.name, status::ComponentStatus::Error);
@@ -398,12 +423,50 @@ impl Runtime {
         }
     }
 
+    async fn get_accelerated_table(
+        &self,
+        ds: &Dataset,
+        data_connector: &Arc<dyn DataConnector>,
+    ) -> Result<AcceleratedTable> {
+        let secrets_provider: Arc<RwLock<secrets::SecretsProvider>> =
+            Arc::clone(&self.secrets_provider);
+
+        let acceleration_settings =
+            ds.acceleration
+                .clone()
+                .ok_or_else(|| Error::ExpectedAccelerationSettings {
+                    name: ds.name.to_string(),
+                })?;
+        let accelerator_engine = acceleration_settings.engine();
+        let secret_key = acceleration_settings
+            .engine_secret
+            .clone()
+            .unwrap_or(format!("{accelerator_engine}_engine").to_lowercase());
+
+        let secrets_provider_read_guard = secrets_provider.read().await;
+        let acceleration_secret = secrets_provider_read_guard.get_secret(&secret_key).await;
+        drop(secrets_provider_read_guard);
+
+        let accelerated_table = self
+            .df
+            .read()
+            .await
+            .get_accelerated_table(ds, data_connector, acceleration_secret)
+            .await
+            .context(UnableToCreateAcceleratedTableSnafu)?;
+
+        let _ = accelerated_table.trigger_refresh().await;
+
+        Ok(accelerated_table)
+    }
+
     async fn register_dataset(
         ds: impl Borrow<Dataset>,
         data_connector: Arc<dyn DataConnector>,
         df: Arc<RwLock<DataFusion>>,
         source: &str,
         secrets_provider: Arc<RwLock<secrets::SecretsProvider>>,
+        accelerated_table: Option<AcceleratedTable>,
     ) -> Result<()> {
         let ds = ds.borrow();
 
@@ -412,7 +475,7 @@ impl Runtime {
             let view_sql = view_sql.context(InvalidSQLViewSnafu)?;
             df.write()
                 .await
-                .register_table(ds, datafusion::Table::View(view_sql))
+                .register_table(ds, datafusion::Table::View(view_sql), accelerated_table)
                 .await
                 .context(UnableToAttachViewSnafu)?;
             return Ok(());
@@ -429,7 +492,7 @@ impl Runtime {
 
             df.write()
                 .await
-                .register_table(ds, datafusion::Table::Federated(data_connector))
+                .register_table(ds, datafusion::Table::Federated(data_connector), None)
                 .await
                 .context(UnableToAttachDataConnectorSnafu {
                     data_connector: source,
@@ -473,6 +536,7 @@ impl Runtime {
                     source: data_connector,
                     acceleration_secret,
                 },
+                accelerated_table,
             )
             .await
             .context(UnableToAttachDataConnectorSnafu {

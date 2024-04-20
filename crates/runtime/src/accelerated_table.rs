@@ -59,7 +59,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 // An accelerated table consists of a federated table and a local accelerator.
 //
 // The accelerator must support inserts.
-pub(crate) struct AcceleratedTable {
+pub struct AcceleratedTable {
     accelerator: Arc<dyn TableProvider>,
     federated: Arc<dyn TableProvider>,
     refresh_handle: JoinHandle<()>,

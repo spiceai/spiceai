@@ -144,8 +144,18 @@ impl DataFusion {
         &mut self,
         dataset: impl Borrow<Dataset>,
         table: Table,
+        accelerated_table: Option<AcceleratedTable>,
     ) -> Result<()> {
         let dataset = dataset.borrow();
+
+        if let Some(accelerated_table) = accelerated_table {
+            self.ctx
+                .register_table(&dataset.name, Arc::new(accelerated_table))
+                .context(UnableToRegisterTableToDataFusionSnafu)?;
+
+            return Ok(());
+        }
+
         match table {
             Table::Accelerated {
                 source,
@@ -234,29 +244,35 @@ impl DataFusion {
         Ok(())
     }
 
-    async fn register_accelerated_table(
-        &mut self,
-        dataset: &Dataset,
-        source: Arc<dyn DataConnector>,
+    pub async fn get_accelerated_table(
+        &self,
+        ds: &Dataset,
+        source: &Arc<dyn DataConnector>,
         acceleration_secret: Option<Secret>,
-    ) -> Result<()> {
-        tracing::debug!("Registering accelerated table {dataset:?}");
+    ) -> Result<AcceleratedTable> {
         let obj_store = source
-            .get_object_store(dataset)
+            .get_object_store(ds)
             .transpose()
             .context(InvalidObjectStoreSnafu)?;
 
-        let source_table_provider = match dataset.mode() {
+        let acceleration_settings =
+            ds.acceleration
+                .clone()
+                .ok_or_else(|| Error::ExpectedAccelerationSettings {
+                    name: ds.name.to_string(),
+                })?;
+
+        let source_table_provider = match ds.mode() {
             Mode::Read => source
-                .read_provider(dataset)
+                .read_provider(ds)
                 .await
                 .context(UnableToResolveTableProviderSnafu)?,
             Mode::ReadWrite => source
-                .read_write_provider(dataset)
+                .read_write_provider(ds)
                 .await
                 .ok_or_else(|| {
                     WriteProviderNotImplementedSnafu {
-                        table_name: dataset.name.to_string(),
+                        table_name: ds.name.to_string(),
                     }
                     .build()
                 })?
@@ -264,16 +280,10 @@ impl DataFusion {
         };
 
         let source_schema = source_table_provider.schema();
-        let acceleration_settings =
-            dataset
-                .acceleration
-                .clone()
-                .ok_or_else(|| Error::ExpectedAccelerationSettings {
-                    name: dataset.name.to_string(),
-                })?;
 
         let accelerated_table_provider = create_accelerator_table(
-            &dataset.name,
+            "__test_table__",
+            // &ds.name,
             source_schema,
             &acceleration_settings,
             acceleration_secret,
@@ -281,22 +291,39 @@ impl DataFusion {
         .await
         .context(UnableToCreateDataAcceleratorSnafu)?;
 
-        let refresh_sql = dataset.refresh_sql();
+        let refresh_sql = ds.refresh_sql();
         if let Some(refresh_sql) = &refresh_sql {
-            refresh_sql::validate_refresh_sql(&dataset.name, refresh_sql.as_str())
+            refresh_sql::validate_refresh_sql(&ds.name, refresh_sql.as_str())
                 .context(RefreshSqlSnafu)?;
         }
 
         let accelerated_table = AcceleratedTable::new(
-            dataset.name.to_string(),
+            ds.name.clone(),
             source_table_provider,
             accelerated_table_provider,
             acceleration_settings.refresh_mode.clone(),
-            dataset.refresh_interval(),
-            dataset.refresh_sql(),
+            ds.refresh_interval(),
+            ds.refresh_sql(),
             obj_store,
         )
         .await;
+
+        let _ = accelerated_table.trigger_refresh().await;
+
+        Ok(accelerated_table)
+    }
+
+    async fn register_accelerated_table(
+        &mut self,
+        dataset: &Dataset,
+        source: Arc<dyn DataConnector>,
+        acceleration_secret: Option<Secret>,
+    ) -> Result<()> {
+        tracing::debug!("Registering accelerated table {dataset:?}");
+
+        let accelerated_table = self
+            .get_accelerated_table(dataset, &source, acceleration_secret)
+            .await?;
 
         self.ctx
             .register_table(&dataset.name, Arc::new(accelerated_table))
