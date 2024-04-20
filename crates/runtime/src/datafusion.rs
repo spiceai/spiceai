@@ -332,7 +332,7 @@ impl DataFusion {
             .context(UnableToRegisterTableToDataFusionSnafu)?;
 
         tracing::info!("Waiting accelerated table {} to be ready...", dataset.name);
-        let result = timeout(Duration::from_secs(15), async {
+        let result = timeout(Duration::from_secs(30), async {
             loop {
                 let data_frame = self
                     .ctx
