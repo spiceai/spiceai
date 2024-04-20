@@ -182,6 +182,7 @@ impl PostgresConnectionPool {
 
         let pool = bb8::Pool::builder()
             .error_sink(Box::new(error_sink))
+            .test_on_check_out(false)
             .build(manager)
             .await
             .context(ConnectionPoolSnafu)?;
