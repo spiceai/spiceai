@@ -21,6 +21,7 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::{collections::HashMap, sync::Arc};
 
+use ::datafusion::datasource::TableProvider;
 use ::datafusion::sql::parser::{self, DFParser};
 use ::datafusion::sql::sqlparser::ast::{SetExpr, TableFactor};
 use ::datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
@@ -390,8 +391,6 @@ impl Runtime {
                 None
             };
 
-            // TODO: wait until accelerated table loaded
-
             self.remove_dataset(ds).await;
 
             if let Ok(()) = self
@@ -458,6 +457,8 @@ impl Runtime {
             .context(UnableToCreateAcceleratedTableSnafu)?;
 
         let _ = accelerated_table.trigger_refresh().await;
+
+        // TODO: check that accelerated table is loaded
 
         Ok(accelerated_table)
     }
