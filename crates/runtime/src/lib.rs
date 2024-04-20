@@ -21,7 +21,6 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::{collections::HashMap, sync::Arc};
 
-use ::datafusion::datasource::TableProvider;
 use ::datafusion::sql::parser::{self, DFParser};
 use ::datafusion::sql::sqlparser::ast::{SetExpr, TableFactor};
 use ::datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
@@ -220,7 +219,7 @@ impl Runtime {
                 }
             };
 
-            let accelerated_table: Option<AcceleratedTable> = if ds.is_accelerated() {
+            let accelerated_table: Option<Arc<AcceleratedTable>> = if ds.is_accelerated() {
                 self.get_accelerated_table(ds, &connector).await.ok()
             } else {
                 None
@@ -299,7 +298,7 @@ impl Runtime {
         &self,
         ds: &Dataset,
         data_connector: Arc<dyn DataConnector>,
-        accelerated_table: Option<AcceleratedTable>,
+        accelerated_table: Option<Arc<AcceleratedTable>>,
     ) -> Result<()> {
         let df = Arc::clone(&self.df);
         let ds = ds.clone();
@@ -385,7 +384,7 @@ impl Runtime {
         tracing::info!("Updating dataset: {}...", &ds.name);
         status::update_dataset(&ds.name, status::ComponentStatus::Refreshing);
         if let Ok(connector) = self.load_dataset_connector(ds, all_datasets).await {
-            let accelerated_table: Option<AcceleratedTable> = if ds.is_accelerated() {
+            let accelerated_table: Option<Arc<AcceleratedTable>> = if ds.is_accelerated() {
                 self.get_accelerated_table(ds, &connector).await.ok()
             } else {
                 None
@@ -428,7 +427,7 @@ impl Runtime {
         &self,
         ds: &Dataset,
         data_connector: &Arc<dyn DataConnector>,
-    ) -> Result<AcceleratedTable> {
+    ) -> Result<Arc<AcceleratedTable>> {
         let secrets_provider: Arc<RwLock<secrets::SecretsProvider>> =
             Arc::clone(&self.secrets_provider);
 
@@ -448,17 +447,28 @@ impl Runtime {
         let acceleration_secret = secrets_provider_read_guard.get_secret(&secret_key).await;
         drop(secrets_provider_read_guard);
 
-        let accelerated_table = self
+        let accelerated_table = Arc::new(
+            self.df
+                .read()
+                .await
+                .get_accelerated_table(ds, data_connector, acceleration_secret)
+                .await
+                .context(UnableToCreateAcceleratedTableSnafu)?,
+        );
+
+        // wait for accelerated table source to be loaded
+        let _ = self
             .df
             .read()
             .await
-            .get_accelerated_table(ds, data_connector, acceleration_secret)
+            .verify_accelerated_table_loaded(
+                ds,
+                Arc::<accelerated_table::AcceleratedTable>::clone(&accelerated_table),
+            )
             .await
-            .context(UnableToCreateAcceleratedTableSnafu)?;
-
-        let _ = accelerated_table.trigger_refresh().await;
-
-        // TODO: check that accelerated table is loaded
+            .context(UnableToAttachDataConnectorSnafu {
+                data_connector: ds.source(),
+            });
 
         Ok(accelerated_table)
     }
@@ -469,7 +479,7 @@ impl Runtime {
         df: Arc<RwLock<DataFusion>>,
         source: &str,
         secrets_provider: Arc<RwLock<secrets::SecretsProvider>>,
-        accelerated_table: Option<AcceleratedTable>,
+        accelerated_table: Option<Arc<AcceleratedTable>>,
     ) -> Result<()> {
         let ds = ds.borrow();
 

@@ -24,6 +24,7 @@ use crate::dataaccelerator::{self, create_accelerator_table};
 use crate::dataconnector::DataConnector;
 use crate::dataupdate::{DataUpdate, DataUpdateExecutionPlan, UpdateType};
 use crate::get_dependent_table_names;
+use arrow::array::Array;
 use arrow::datatypes::Schema;
 use datafusion::common::OwnedTableReference;
 use datafusion::datasource::ViewTable;
@@ -37,7 +38,7 @@ use secrets::Secret;
 use snafu::prelude::*;
 use spicepod::component::dataset::{Dataset, Mode};
 use tokio::spawn;
-use tokio::time::{sleep, Instant};
+use tokio::time::{sleep, timeout, Instant};
 
 pub mod refresh_sql;
 
@@ -105,6 +106,12 @@ pub enum Error {
         source: DataFusionError,
     },
 
+    #[snafu(display("Unable to execute sql query for {table_name}: {source}"))]
+    UnableToExecuteSqlQuery {
+        table_name: String,
+        source: DataFusionError,
+    },
+
     #[snafu(display("Unable to trigger refresh for {table_name}: {source}"))]
     UnableToTriggerRefresh {
         table_name: String,
@@ -144,13 +151,13 @@ impl DataFusion {
         &mut self,
         dataset: impl Borrow<Dataset>,
         table: Table,
-        accelerated_table: Option<AcceleratedTable>,
+        accelerated_table: Option<Arc<AcceleratedTable>>,
     ) -> Result<()> {
         let dataset = dataset.borrow();
 
         if let Some(accelerated_table) = accelerated_table {
             self.ctx
-                .register_table(&dataset.name, Arc::new(accelerated_table))
+                .register_table(&dataset.name, accelerated_table)
                 .context(UnableToRegisterTableToDataFusionSnafu)?;
 
             return Ok(());
@@ -309,6 +316,81 @@ impl DataFusion {
         .await;
 
         Ok(accelerated_table)
+    }
+
+    pub async fn verify_accelerated_table_loaded(
+        &self,
+        dataset: &Dataset,
+        accelerated_table: Arc<AcceleratedTable>,
+    ) -> Result<()> {
+        tracing::debug!("Registering temp accelerated table {dataset:?}");
+
+        let temp_table_name = format!("temp_{}", &dataset.name);
+
+        self.ctx
+            .register_table(&temp_table_name, accelerated_table)
+            .context(UnableToRegisterTableToDataFusionSnafu)?;
+
+        tracing::info!("Waiting accelerated table {} to be ready...", dataset.name);
+        let result = timeout(Duration::from_secs(15), async {
+            loop {
+                let data_frame = self
+                    .ctx
+                    .sql(format!("SELECT COUNT(*) FROM {temp_table_name}").as_str())
+                    .await
+                    .context(UnableToExecuteSqlQuerySnafu {
+                        table_name: temp_table_name.to_string(),
+                    })?;
+
+                let results = data_frame
+                    .collect()
+                    .await
+                    .context(UnableToExecuteSqlQuerySnafu {
+                        table_name: temp_table_name.to_string(),
+                    })?;
+
+                if let Some(row) = results.first() {
+                    if let Some(array) = row
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<arrow::array::Int64Array>()
+                    {
+                        let count = array.value(0);
+                        if count > 0 {
+                            tracing::info!(
+                                "Accelerated table {} is ready, {count} rows loaded",
+                                dataset.name
+                            );
+
+                            if let Err(e) = self.ctx.deregister_table(&temp_table_name) {
+                                return UnableToDeleteTableSnafu {
+                                    reason: e.to_string(),
+                                }
+                                .fail();
+                            }
+
+                            break;
+                        }
+                    }
+                }
+
+                sleep(Duration::from_secs(1)).await;
+            }
+            Ok(())
+        })
+        .await;
+
+        match result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(e),
+            Err(_) => {
+                tracing::warn!(
+                    "Timeout waiting for accelerated table {} to be ready",
+                    dataset.name
+                );
+                Ok(())
+            }
+        }
     }
 
     async fn register_accelerated_table(
