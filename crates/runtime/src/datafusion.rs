@@ -325,7 +325,8 @@ impl DataFusion {
     ) -> Result<()> {
         tracing::debug!("Registering temp accelerated table {dataset:?}");
 
-        let temp_table_name = format!("temp_{}", &dataset.name);
+        let id = uuid::Uuid::new_v4().to_string();
+        let temp_table_name = format!("__{}__{}", &dataset.name, &id[..8]);
 
         self.ctx
             .register_table(&temp_table_name, accelerated_table)
