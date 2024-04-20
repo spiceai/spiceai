@@ -220,7 +220,9 @@ impl Runtime {
             };
 
             let accelerated_table: Option<Arc<AcceleratedTable>> = if ds.is_accelerated() {
-                self.get_accelerated_table(ds, &connector).await.ok()
+                Box::pin(self.get_accelerated_table(ds, &connector))
+                    .await
+                    .ok()
             } else {
                 None
             };
@@ -385,7 +387,9 @@ impl Runtime {
         status::update_dataset(&ds.name, status::ComponentStatus::Refreshing);
         if let Ok(connector) = self.load_dataset_connector(ds, all_datasets).await {
             let accelerated_table: Option<Arc<AcceleratedTable>> = if ds.is_accelerated() {
-                self.get_accelerated_table(ds, &connector).await.ok()
+                Box::pin(self.get_accelerated_table(ds, &connector))
+                    .await
+                    .ok()
             } else {
                 None
             };
@@ -674,11 +678,11 @@ impl Runtime {
                         current_app.datasets.iter().find(|d| d.name == ds.name)
                     {
                         if current_ds != ds {
-                            self.update_dataset(ds, &new_app.datasets).await;
+                            Box::pin(self.update_dataset(ds, &new_app.datasets)).await;
                         }
                     } else {
                         status::update_dataset(&ds.name, status::ComponentStatus::Initializing);
-                        self.load_dataset(ds, &new_app.datasets).await;
+                        Box::pin(self.load_dataset(ds, &new_app.datasets)).await;
                     }
                 }
 
