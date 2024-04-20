@@ -22,7 +22,7 @@ sea-query = { version = "0.30.7", features = [
     "with-time",
 ] }
 snafu.workspace = true
-tokio-postgres = { workspace = true, features = ["with-chrono-0_4"], optional = true }
+tokio-postgres = { workspace = true, features = ["with-chrono-0_4", "with-uuid-1"], optional = true }
 bigdecimal_0_3_0 = { package = "bigdecimal", version = "0.3.0" }
 time = "0.3.34"
 bigdecimal = "0.4.3"
@@ -37,6 +37,6 @@ uuid = { workspace = true, optional = true }
 
 [features]
 sqlite = ["dep:rusqlite"]
-postgres = ["dep:tokio-postgres"]
+postgres = ["dep:tokio-postgres", "dep:uuid"]
 mysql = ["dep:mysql_async"]
 clickhouse = ["dep:clickhouse-rs", "dep:uuid"]

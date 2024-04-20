@@ -23,6 +23,7 @@ use arrow::array::ArrayRef;
 use arrow::array::BooleanBuilder;
 use arrow::array::Date32Builder;
 use arrow::array::Decimal128Builder;
+use arrow::array::FixedSizeBinaryBuilder;
 use arrow::array::Float32Builder;
 use arrow::array::Float64Builder;
 use arrow::array::Int16Builder;
@@ -67,6 +68,9 @@ pub enum Error {
     FailedToConvertU128toI64 {
         source: <u128 as convert::TryInto<i64>>::Error,
     },
+
+    #[snafu(display("Error building fixed size binary field: {source}"))]
+    FailedToBuildFixedSizeBinary { source: arrow::error::ArrowError },
 
     #[snafu(display("Failed to get a row value for {pg_type}: {source}"))]
     FailedToGetRowValue {
@@ -333,6 +337,32 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                         None => builder.append_null(),
                     }
                 }
+                Type::UUID => {
+                    let Some(builder) = builder else {
+                        return NoBuilderForIndexSnafu { index: i }.fail();
+                    };
+                    let Some(builder) = builder
+                        .as_any_mut()
+                        .downcast_mut::<FixedSizeBinaryBuilder>()
+                    else {
+                        return FailedToDowncastBuilderSnafu {
+                            postgres_type: format!("{postgres_type}"),
+                        }
+                        .fail();
+                    };
+                    let v = row.try_get::<usize, Option<uuid::Uuid>>(i).context(
+                        FailedToGetRowValueSnafu {
+                            pg_type: Type::UUID,
+                        },
+                    )?;
+
+                    match v {
+                        Some(v) => builder
+                            .append_value(v)
+                            .context(FailedToBuildFixedSizeBinarySnafu)?,
+                        None => builder.append_null(),
+                    }
+                }
                 Type::INT2_ARRAY => handle_primitive_array_type!(
                     Type::INT2_ARRAY,
                     builder,
@@ -421,6 +451,7 @@ fn map_column_type_to_data_type(column_type: &Type) -> Option<DataType> {
         // We get a SystemTime that we can always convert into milliseconds
         Type::TIMESTAMP => Some(DataType::Timestamp(TimeUnit::Millisecond, None)),
         Type::DATE => Some(DataType::Date32),
+        Type::UUID => Some(DataType::FixedSizeBinary(16)),
         Type::INT2_ARRAY => Some(DataType::List(Arc::new(Field::new(
             "item",
             DataType::Int16,

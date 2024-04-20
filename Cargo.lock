@@ -5233,6 +5233,7 @@ dependencies = [
  "chrono",
  "fallible-iterator 0.2.0",
  "postgres-protocol",
+ "uuid",
 ]
 
 [[package]]
