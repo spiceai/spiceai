@@ -551,16 +551,19 @@ impl Runtime {
     pub async fn start_servers(&mut self, with_metrics: Option<SocketAddr>) -> Result<()> {
         let http_server_future = http::start(
             self.config.http_bind_address,
-            self.app.clone(),
-            self.df.clone(),
-            self.models.clone(),
+            Arc::clone(&self.app),
+            Arc::clone(&self.df),
+            Arc::clone(&self.models),
             self.config.clone().into(),
             with_metrics,
         );
 
-        let flight_server_future = flight::start(self.config.flight_bind_address, self.df.clone());
-        let open_telemetry_server_future =
-            opentelemetry::start(self.config.open_telemetry_bind_address, self.df.clone());
+        let flight_server_future =
+            flight::start(self.config.flight_bind_address, Arc::clone(&self.df));
+        let open_telemetry_server_future = opentelemetry::start(
+            self.config.open_telemetry_bind_address,
+            Arc::clone(&self.df),
+        );
         let pods_watcher_future = self.start_pods_watcher();
 
         tokio::select! {

@@ -294,7 +294,7 @@ impl ExecutionPlan for FlightExec {
     }
 
     fn schema(&self) -> SchemaRef {
-        self.projected_schema.clone()
+        Arc::clone(&self.projected_schema)
     }
 
     fn properties(&self) -> &PlanProperties {
