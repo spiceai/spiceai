@@ -185,7 +185,7 @@ impl DeletionTableProvider for SqliteTableWriter {
         filters: &[Expr],
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(DeletionExec::new(
-            Arc::new(SqliteDeletionSink::new(self.sqlite.clone(), filters)),
+            Arc::new(SqliteDeletionSink::new(Arc::clone(&self.sqlite), filters)),
             &self.schema(),
         )))
     }
@@ -301,7 +301,7 @@ mod tests {
             .expect("insert successful");
 
         let table =
-            get_deletion_provider(table).expect("table should be returned as deletetion provider");
+            get_deletion_provider(table).expect("table should be returned as deletion provider");
 
         let filter = cast(
             col("time_in_string"),

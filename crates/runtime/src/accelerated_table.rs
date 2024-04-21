@@ -222,7 +222,7 @@ impl AcceleratedTable {
                 let start = SystemTime::now() - retention_period;
 
                 let Ok(timestamp) = get_timestamp(start) else {
-                    tracing::error!("[retention] failed to get timestamp");
+                    tracing::error!("[retention] Failed to get timestamp");
                     continue;
                 };
                 let expr = get_expr(&time_column, timestamp, expr_time_format.clone());
@@ -231,7 +231,7 @@ impl AcceleratedTable {
                     if let Some(value) = chrono::DateTime::from_timestamp(timestamp as i64, 0) {
                         value.to_rfc3339()
                     } else {
-                        tracing::warn!("[retention] unable to convert timestamp");
+                        tracing::warn!("[retention] Unable to convert timestamp");
                         continue;
                     }
                 );
@@ -432,7 +432,7 @@ fn get_expr_time_format(
             | DataType::Time64(_) => ExprTimeFormat::Timestamp,
             DataType::Utf8 | DataType::LargeUtf8 => ExprTimeFormat::ISO8601,
             _ => {
-                tracing::warn!("date type is not handled yet: {}", field.1.data_type());
+                tracing::warn!("Date type is not handled yet: {}", field.1.data_type());
                 return None;
             }
         },
