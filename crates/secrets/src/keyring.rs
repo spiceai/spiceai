@@ -44,18 +44,42 @@ impl SecretStore for KeyringSecretStore {
     #[must_use]
     async fn get_secret(&self, secret_name: &str) -> Option<Secret> {
         let entry_key = format!("{KEYRING_SECRET_PREFIX}{secret_name}");
-        let Ok(entry) = Entry::new(entry_key.as_str(), "spiced") else {
-            return None;
+
+        let entry = match Entry::new(entry_key.as_str(), "spiced") {
+            Ok(entry) => entry,
+            Err(err) => {
+                tracing::warn!(
+                    "Failed to get secret entry {} from keyring store, {}",
+                    entry_key,
+                    err
+                );
+                return None;
+            }
         };
 
-        let Ok(secret) = entry.get_password() else {
-            return None;
+        let secret = match entry.get_password() {
+            Ok(secret) => secret,
+            Err(err) => {
+                tracing::warn!(
+                    "Failed to get secret value for secret entry {} from keyring store, {}",
+                    entry_key,
+                    err
+                );
+                return None;
+            }
         };
 
-        let Ok(parsed): serde_json::Result<serde_json::Value> =
-            serde_json::from_str(secret.as_str())
-        else {
-            return None;
+        let parsed: serde_json::Result<serde_json::Value> = serde_json::from_str(secret.as_str());
+        let parsed = match parsed {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                tracing::warn!(
+                    "Failed to parse secret value for secret entry {} from keyring store, {}",
+                    entry_key,
+                    err
+                );
+                return None;
+            }
         };
 
         let object = parsed.as_object()?;
