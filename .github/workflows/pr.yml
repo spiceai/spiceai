@@ -63,6 +63,9 @@ jobs:
 
       - run: make test ci
 
+      # This might be tempting to put into a GitHub Actions matrix to run in parallel - but 
+      # putting it into a matrix will run a separate job per matrix item, whereas in theory 
+      # this can re-use the existing build cache to go faster.
       - name: Build without default features
         run: cargo check --no-default-features
 
