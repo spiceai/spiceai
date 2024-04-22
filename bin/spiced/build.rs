@@ -26,4 +26,7 @@ fn main() {
         );
 
     println!("cargo:rustc-env=GIT_COMMIT_HASH={git_hash}");
+
+    #[cfg(all(windows, feature = "windows-static"))]
+    static_vcruntime::metabuild();
 }

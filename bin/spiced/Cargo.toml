@@ -33,3 +33,7 @@ flightsql = ["runtime/flightsql"]
 aws-secrets-manager = ["runtime/aws-secrets-manager"]
 databricks = ["runtime/databricks"]
 dremio = ["runtime/dremio"]
+windows-static = ["dep:static_vcruntime"]
+
+[target.'cfg(windows)'.build-dependencies]
+static_vcruntime = { version = "2", optional = true }
