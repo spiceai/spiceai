@@ -46,7 +46,8 @@ pub enum TimeFormat {
     #[default]
     UnixSeconds,
     UnixMillis,
-    Iso8601,
+    #[serde(rename = "ISO8601")]
+    ISO8601,
 }
 
 impl std::fmt::Display for TimeFormat {
