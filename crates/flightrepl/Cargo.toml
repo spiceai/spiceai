@@ -9,15 +9,11 @@ repository.workspace = true
 description = "Spice OSS Flight Query Repl"
 
 [dependencies]
-arrow.workspace = true
 arrow-flight = { workspace = true, features = ["flight-sql-experimental"] }
 clap.workspace = true
-tokio.workspace = true
 tonic = { workspace = true, features = ["transport", "tls", "tls-roots"] }
-async-stream.workspace = true
 futures.workspace = true
 tracing.workspace = true
-tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 datafusion.workspace = true
 rustyline = "13.0.0"
 prost = { version = "0.12.1", default-features = false, features = ["prost-derive"] }
