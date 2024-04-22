@@ -64,10 +64,6 @@ impl SecretStore for KeyringSecretStore {
         let entry = match Entry::new(entry_key.as_str(), "spiced") {
             Ok(entry) => entry,
             Err(keyring::Error::NoEntry) => {
-                tracing::warn!(
-                    "Failed to get secret entry {} from keyring store, no entry found",
-                    entry_key,
-                );
                 return Ok(None);
             }
             Err(err) => {
