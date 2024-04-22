@@ -372,7 +372,7 @@ impl DataFusion {
             .register_table(&temp_table_name, accelerated_table)
             .context(UnableToRegisterTableToDataFusionSnafu)?;
 
-        tracing::info!("Waiting accelerated table {} to be ready...", dataset.name);
+        tracing::info!("Verifying accelerated dataset {} readiness...", dataset.name);
         let result = timeout(Duration::from_secs(30), async {
             loop {
                 let data_frame = self
