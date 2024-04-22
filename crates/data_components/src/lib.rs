@@ -42,6 +42,9 @@ pub mod spark_connect;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 
+pub mod delete;
+pub mod util;
+
 #[async_trait]
 pub trait Read: Send + Sync {
     async fn table_provider(
