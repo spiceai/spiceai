@@ -35,8 +35,9 @@ pub use secrecy::ExposeSecret;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to load secrets for {store}"))]
-    UnableToLoadSecrets { store: String },
+    #[snafu(display("Unable to load secrets: {source}"))]
+    UnableToLoadSecrets { source: Box<dyn std::error::Error> },
+
     #[snafu(display("Unable to initialize AWS Secrets Manager: {source}"))]
     UnableToInitializeAwsSecretsManager {
         source: crate::aws_secrets_manager::Error,
@@ -46,10 +47,11 @@ pub enum Error {
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+pub type AnyErrorResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 #[async_trait]
 pub trait SecretStore {
-    async fn get_secret(&self, secret_name: &str) -> Result<Option<Secret>>;
+    async fn get_secret(&self, secret_name: &str) -> AnyErrorResult<Option<Secret>>;
 }
 
 #[derive(Debug, Clone)]
@@ -141,11 +143,9 @@ impl SecretsProvider {
             SecretStoreType::File => {
                 let mut file_secret_store = FileSecretStore::new();
 
-                if file_secret_store.load_secrets().is_err() {
-                    return Err(Error::UnableToLoadSecrets {
-                        store: "file".to_string(),
-                    });
-                }
+                file_secret_store
+                    .load_secrets()
+                    .context(UnableToLoadSecretsSnafu)?;
 
                 self.secret_store = Some(Box::new(file_secret_store));
             }
@@ -163,11 +163,9 @@ impl SecretsProvider {
             SecretStoreType::Kubernetes => {
                 let mut kubernetes_secret_store = kubernetes::KubernetesSecretStore::new();
 
-                if kubernetes_secret_store.init().is_err() {
-                    return Err(Error::UnableToLoadSecrets {
-                        store: "kubernetes".to_string(),
-                    });
-                };
+                kubernetes_secret_store
+                    .init()
+                    .context(UnableToLoadSecretsSnafu)?;
 
                 self.secret_store = Some(Box::new(kubernetes_secret_store));
             }
@@ -190,7 +188,7 @@ impl SecretsProvider {
     /// # Errors
     ///
     /// Will return `None` if the secret store is not initialized or pass error from the secret store.
-    pub async fn get_secret(&self, secret_name: &str) -> Result<Option<Secret>> {
+    pub async fn get_secret(&self, secret_name: &str) -> AnyErrorResult<Option<Secret>> {
         if let Some(ref secret_store) = self.secret_store {
             secret_store.get_secret(secret_name).await
         } else {

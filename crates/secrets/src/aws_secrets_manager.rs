@@ -21,7 +21,7 @@ use aws_sdk_sts::operation::get_caller_identity::GetCallerIdentityError;
 
 use super::{Secret, SecretStore};
 
-use aws_sdk_secretsmanager::error::SdkError;
+use aws_sdk_secretsmanager::{error::SdkError, operation::get_secret_value::GetSecretValueError};
 
 use aws_config::{self, BehaviorVersion};
 use aws_sdk_secretsmanager::{self};
@@ -36,10 +36,17 @@ pub enum Error {
     UnableToVerifyAwsIdentity {
         source: SdkError<GetCallerIdentityError>,
     },
+
     #[snafu(display("Unable to parse as JSON: {}", source))]
     UnableToParseJson { source: serde_json::Error },
+
     #[snafu(display("Invalid JSON format: JSON object is expected"))]
     InvalidJsonFormat {},
+
+    #[snafu(display("Unable to get secret: {}", source))]
+    UnableToGetSecret {
+        source: SdkError<GetSecretValueError>,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -87,7 +94,7 @@ impl AwsSecretsManager {
 #[async_trait]
 impl SecretStore for AwsSecretsManager {
     #[must_use]
-    async fn get_secret(&self, secret_name: &str) -> super::Result<Option<Secret>> {
+    async fn get_secret(&self, secret_name: &str) -> super::AnyErrorResult<Option<Secret>> {
         let secret_name = format!("{SPICE_SECRET_PREFIX}{secret_name}");
 
         tracing::trace!("Getting secret {} from AWS Secrets Manager", secret_name);
@@ -118,18 +125,13 @@ impl SecretStore for AwsSecretsManager {
                     secret_name,
                     err
                 );
-                return Ok(None);
+                return Err(Box::new(Error::UnableToGetSecret { source: err }));
             }
         };
 
         if let Some(secret_str) = secret_value.secret_string() {
-            match parse_json_to_hashmap(secret_str) {
-                Ok(data) => return Ok(Some(Secret::new(data))),
-                Err(err) => {
-                    tracing::warn!("Failed to parse secret {} content: {}", secret_name, err);
-                    return Ok(None);
-                }
-            }
+            let data = parse_json_to_hashmap(secret_str)?;
+            return Ok(Some(Secret::new(data)));
         }
 
         Ok(None)

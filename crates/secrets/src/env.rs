@@ -101,7 +101,7 @@ impl EnvSecretStore {
 #[async_trait]
 impl SecretStore for EnvSecretStore {
     #[must_use]
-    async fn get_secret(&self, secret_name: &str) -> super::Result<Option<Secret>> {
+    async fn get_secret(&self, secret_name: &str) -> super::AnyErrorResult<Option<Secret>> {
         if let Some(secret) = self.secrets.get(secret_name) {
             return Ok(Some(secret.clone()));
         }

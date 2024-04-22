@@ -18,10 +18,26 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 use keyring::Entry;
+use snafu::Snafu;
 
 use super::{Secret, SecretStore};
 
 const KEYRING_SECRET_PREFIX: &str = "spice_secret_";
+
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display("Unable to get secret: {source}"))]
+    UnableToGetSecret { source: keyring::Error },
+
+    #[snafu(display("Unable to get secret value: {source}"))]
+    UnableToGetSecretValue { source: keyring::Error },
+
+    #[snafu(display("Unable to parse secret value: {source}"))]
+    UnableToParseSecretValue { source: serde_json::Error },
+
+    #[snafu(display("Invalid JSON format: JSON object is expected"))]
+    InvalidJsonFormat {},
+}
 
 #[allow(clippy::module_name_repetitions)]
 pub struct KeyringSecretStore {}
@@ -42,18 +58,25 @@ impl KeyringSecretStore {
 #[async_trait]
 impl SecretStore for KeyringSecretStore {
     #[must_use]
-    async fn get_secret(&self, secret_name: &str) -> super::Result<Option<Secret>> {
+    async fn get_secret(&self, secret_name: &str) -> super::AnyErrorResult<Option<Secret>> {
         let entry_key = format!("{KEYRING_SECRET_PREFIX}{secret_name}");
 
         let entry = match Entry::new(entry_key.as_str(), "spiced") {
             Ok(entry) => entry,
+            Err(keyring::Error::NoEntry) => {
+                tracing::warn!(
+                    "Failed to get secret entry {} from keyring store, no entry found",
+                    entry_key,
+                );
+                return Ok(None);
+            }
             Err(err) => {
                 tracing::warn!(
                     "Failed to get secret entry {} from keyring store, {}",
                     entry_key,
                     err
                 );
-                return Ok(None);
+                return Err(Box::new(Error::UnableToGetSecret { source: err }));
             }
         };
 
@@ -65,7 +88,7 @@ impl SecretStore for KeyringSecretStore {
                     entry_key,
                     err
                 );
-                return Ok(None);
+                return Err(Box::new(Error::UnableToGetSecretValue { source: err }));
             }
         };
 
@@ -78,7 +101,7 @@ impl SecretStore for KeyringSecretStore {
                     entry_key,
                     err
                 );
-                return Ok(None);
+                return Err(Box::new(Error::UnableToParseSecretValue { source: err }));
             }
         };
 
@@ -88,7 +111,7 @@ impl SecretStore for KeyringSecretStore {
                 entry_key,
                 "value is not an object"
             );
-            return Ok(None);
+            return Err(Box::new(Error::InvalidJsonFormat {}));
         };
 
         let mut data = HashMap::new();
