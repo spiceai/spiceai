@@ -101,7 +101,12 @@ jobs:
           }
 
       - name: Build spiced
+        if: matrix.target_os != 'windows'
         run: make -C bin/spiced
+      
+      - name: Build spiced (Windows)
+        if: matrix.target_os == 'windows'
+        run: make -C bin/spiced SPICED_WINDOWS_STATIC=true
 
       - name: Update build cache (macOS)
         if: matrix.target_os == 'darwin'

@@ -16,6 +16,10 @@ ifdef SPICED_CUSTOM_FEATURES
 	CUSTOM_FEATURES := --no-default-features --features "$(SPICED_CUSTOM_FEATURES)"
 endif
 
+ifdef SPICED_WINDOWS_STATIC
+	CUSTOM_FEATURES := --features "windows-static"
+endif
+
 .PHONY: all
 all:
 	cargo build --release $(SPICED_FEATURES) --target-dir $(TARGET_DIR) $(CUSTOM_FEATURES)
