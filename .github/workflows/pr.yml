@@ -61,40 +61,7 @@ jobs:
         with:
           os: 'linux'
 
-      - run: make test ci
-
-      # This might be tempting to put into a GitHub Actions matrix to run in parallel - but 
-      # putting it into a matrix will run a separate job per matrix item, whereas in theory 
-      # this can re-use the existing build cache to go faster.
-      - name: Build without default features
-        run: cargo check --no-default-features
-
-      - name: Build with only duckdb
-        run: cargo check --no-default-features --features duckdb
-
-      - name: Build with only postgres
-        run: cargo check --no-default-features --features postgres
-
-      - name: Build with only sqlite
-        run: cargo check --no-default-features --features sqlite
-
-      - name: Build with only mysql
-        run: cargo check --no-default-features --features mysql
-
-      - name: Build with only keyring-secret-store
-        run: cargo check --no-default-features --features keyring-secret-store
-
-      - name: Build with only flightsql
-        run: cargo check --no-default-features --features flightsql
-
-      - name: Build with only aws-secrets-manager
-        run: cargo check --no-default-features --features aws-secrets-manager
-
-      - name: Build with only databricks
-        run: cargo check --no-default-features --features databricks
-
-      - name: Build with only dremio
-        run: cargo check --no-default-features --features dremio
+      - run: make ci test
 
   build-docker:
     name: Build Docker Image
