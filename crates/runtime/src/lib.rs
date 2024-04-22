@@ -93,7 +93,7 @@ pub enum Error {
     #[snafu(display("Unable to load secrets for data connector: {data_connector}"))]
     UnableToLoadDataConnectorSecrets { data_connector: String },
 
-    #[snafu(display("Unable to get secret for data connector: {source}"))]
+    #[snafu(display("Unable to get secret for data connector {data_connector}: {source}"))]
     UnableToGetSecretForDataConnector {
         source: Box<dyn std::error::Error + Send + Sync>,
         data_connector: String,
