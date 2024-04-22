@@ -164,6 +164,23 @@ struct SqlExec<T, P> {
     properties: PlanProperties,
 }
 
+pub fn project_schema_safe(
+    schema: &SchemaRef,
+    projection: Option<&Vec<usize>>,
+) -> DataFusionResult<SchemaRef> {
+    let schema = match projection {
+        Some(columns) => {
+            if columns.is_empty() {
+                Arc::clone(schema)
+            } else {
+                Arc::new(schema.project(columns)?)
+            }
+        }
+        None => Arc::clone(schema),
+    };
+    Ok(schema)
+}
+
 impl<T, P> SqlExec<T, P> {
     fn new(
         projections: Option<&Vec<usize>>,
@@ -173,7 +190,8 @@ impl<T, P> SqlExec<T, P> {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Self> {
-        let projected_schema = project_schema(schema, projections)?;
+        let projected_schema = project_schema_safe(schema, projections)?;
+
         Ok(Self {
             projected_schema: Arc::clone(&projected_schema),
             table_reference: table_reference.clone(),
