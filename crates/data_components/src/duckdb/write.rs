@@ -354,7 +354,7 @@ mod tests {
             .expect("insert successful");
 
         let delete_table = get_deletion_provider(Arc::clone(&table))
-            .expect("table should be returned as deletetion provider");
+            .expect("table should be returned as deletion provider");
 
         let filter = col("time").lt(lit(ScalarValue::TimestampMillisecond(
             Some(1354360272000),
