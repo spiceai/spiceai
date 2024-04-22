@@ -43,7 +43,7 @@ pub enum Error {
     #[snafu(display("Invalid AWS secret value: JSON object is expected"))]
     InvalidJsonFormat {},
 
-    #[snafu(display("Unable to get AWS secret: {}", source))]
+    #[snafu(display("Unable to get AWS secret: {source}"))]
     UnableToGetSecret {
         source: SdkError<GetSecretValueError>,
     },
