@@ -368,7 +368,7 @@ pub mod acceleration {
         pub retention_check_interval: Option<String>,
 
         #[serde(default)]
-        pub retention_enabled: bool,
+        pub retention_check_enabled: bool,
     }
 
     const fn default_true() -> bool {
