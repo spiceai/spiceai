@@ -198,14 +198,7 @@ impl SecretStore for KubernetesSecretStore {
     async fn get_secret(&self, secret_name: &str) -> super::AnyErrorResult<Option<Secret>> {
         match self.kubernetes_client.get_secret(secret_name).await {
             Ok(secret) => Ok(Some(Secret::new(secret.clone()))),
-            Err(err) => {
-                tracing::warn!(
-                    "Failed to get secret {} from kubernetes store, {}",
-                    secret_name,
-                    err
-                );
-                return Err(Box::new(StoreError::UnableToGetSecret { source: err }));
-            }
+            Err(err) => Err(Box::new(StoreError::UnableToGetSecret { source: err })),
         }
     }
 }

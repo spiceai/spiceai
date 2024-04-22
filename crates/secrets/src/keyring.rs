@@ -67,11 +67,6 @@ impl SecretStore for KeyringSecretStore {
                 return Ok(None);
             }
             Err(err) => {
-                tracing::warn!(
-                    "Failed to get secret entry {} from keyring store, {}",
-                    entry_key,
-                    err
-                );
                 return Err(Box::new(Error::UnableToGetSecret { source: err }));
             }
         };
@@ -82,11 +77,6 @@ impl SecretStore for KeyringSecretStore {
                 return Ok(None);
             }
             Err(err) => {
-                tracing::warn!(
-                    "Failed to get secret value for secret entry {} from keyring store, {}",
-                    entry_key,
-                    err
-                );
                 return Err(Box::new(Error::UnableToGetSecretValue { source: err }));
             }
         };
@@ -95,21 +85,11 @@ impl SecretStore for KeyringSecretStore {
         let parsed = match parsed {
             Ok(parsed) => parsed,
             Err(err) => {
-                tracing::warn!(
-                    "Failed to parse secret value for secret entry {} from keyring store, {}",
-                    entry_key,
-                    err
-                );
                 return Err(Box::new(Error::UnableToParseSecretValue { source: err }));
             }
         };
 
         let Some(object) = parsed.as_object() else {
-            tracing::warn!(
-                "Failed to parse secret value for secret entry {} from keyring store, {}",
-                entry_key,
-                "value is not an object"
-            );
             return Err(Box::new(Error::InvalidJsonFormat {}));
         };
 
