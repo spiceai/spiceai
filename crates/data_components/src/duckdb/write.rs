@@ -297,7 +297,7 @@ mod tests {
             .expect("insert successful");
 
         let delete_table = get_deletion_provider(Arc::clone(&table))
-            .expect("table should be returned as deletetion provider");
+            .expect("table should be returned as deletion provider");
 
         let filter = cast(
             col("time_in_string"),

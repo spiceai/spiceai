@@ -324,7 +324,6 @@ impl DeletionSink for MemDeletionSink {
 
         let mut count = df.clone().count().await?;
 
-        // TODO: check this either AND or OR makes more sense
         for filter in self.filters.clone() {
             df = df.filter(is_not_true(filter))?;
         }

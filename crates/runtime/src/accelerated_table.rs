@@ -44,9 +44,7 @@ use crate::{
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Unable to get data from connector: {source}"))]
-    UnableToGetDataFromConnector {
-        source: dataconnector::Error,
-    },
+    UnableToGetDataFromConnector { source: dataconnector::Error },
 
     #[snafu(display("Unable to scan table provider: {source}"))]
     UnableToScanTableProvider {
@@ -61,9 +59,8 @@ pub enum Error {
     #[snafu(display("Manual refresh is not supported for `append` mode"))]
     ManualRefreshIsNotSupported {},
 
-    UnableToGetUnixTimestamp {
-        source: SystemTimeError,
-    },
+    #[snafu(display("Unable to get unix timestamp: {source}"))]
+    UnableToGetUnixTimestamp { source: SystemTimeError },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
