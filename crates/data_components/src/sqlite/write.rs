@@ -286,7 +286,7 @@ mod tests {
             "2012-12-01T11:11:12Z",
         ]);
         let arr3 = Int64Array::from(vec![0, 1354360271, 1354360272]);
-        let data = RecordBatch::try_new(schema.clone(), vec![Arc::new(arr1), Arc::new(arr3)])
+        let data = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(arr1), Arc::new(arr3)])
             .expect("data should be created");
 
         let exec = MockExec::new(vec![Ok(data)], schema);

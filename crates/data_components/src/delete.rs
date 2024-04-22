@@ -43,7 +43,7 @@ pub struct DeletionExec {
 impl DeletionExec {
     pub fn new(deletion_sink: Arc<dyn DeletionSink>, schema: &SchemaRef) -> Self {
         let properties = PlanProperties::new(
-            EquivalenceProperties::new(schema.clone()),
+            EquivalenceProperties::new(Arc::clone(schema)),
             Partitioning::UnknownPartitioning(1),
             ExecutionMode::Bounded,
         );
@@ -102,7 +102,7 @@ impl ExecutionPlan for DeletionExec {
             false,
         )]));
 
-        let deletion_sink = self.deletion_sink.clone();
+        let deletion_sink = Arc::clone(&self.deletion_sink);
         Ok(Box::pin(RecordBatchStreamAdapter::new(count_schema, {
             futures::stream::once(async move {
                 let count = deletion_sink

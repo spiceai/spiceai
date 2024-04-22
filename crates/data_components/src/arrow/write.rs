@@ -314,7 +314,7 @@ impl DeletionSink for MemDeletionSink {
             tmp_batches[i].append(&mut *partition_vec);
         }
 
-        let provider = MemTable::try_new(self.schema.clone(), tmp_batches)?;
+        let provider = MemTable::try_new(Arc::clone(&self.schema), tmp_batches)?;
 
         let mut df = DataFrame::new(
             ctx.state(),
@@ -379,7 +379,7 @@ mod tests {
             "2012-12-01T11:11:12Z",
         ]);
 
-        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(arr)])
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(arr)])
             .expect("data should be created");
 
         let table =

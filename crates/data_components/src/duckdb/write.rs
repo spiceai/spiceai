@@ -184,7 +184,7 @@ impl DeletionTableProvider for DuckDBTableWriter {
         filters: &[Expr],
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(DeletionExec::new(
-            Arc::new(DuckDBDeletionSink::new(self.duckdb.clone(), filters)),
+            Arc::new(DuckDBDeletionSink::new(Arc::clone(&self.duckdb), filters)),
             &self.schema(),
         )))
     }
@@ -280,7 +280,7 @@ mod tests {
         let arr2 = TimestampSecondArray::from(vec![0, 1354360271, 1354360272]);
         let arr3 = Int64Array::from(vec![0, 1354360271, 1354360272]);
         let data = RecordBatch::try_new(
-            schema.clone(),
+            Arc::clone(&schema),
             vec![Arc::new(arr1), Arc::new(arr2), Arc::new(arr3)],
         )
         .expect("data should be created");
@@ -288,7 +288,7 @@ mod tests {
         let exec = Arc::new(MockExec::new(vec![Ok(data)], schema));
 
         let insertion = table
-            .insert_into(&ctx.state(), exec.clone(), false)
+            .insert_into(&ctx.state(), Arc::<MockExec>::clone(&exec), false)
             .await
             .expect("insertion should be successful");
 
@@ -296,7 +296,7 @@ mod tests {
             .await
             .expect("insert successful");
 
-        let delete_table = get_deletion_provider(table.clone())
+        let delete_table = get_deletion_provider(Arc::clone(&table))
             .expect("table should be returned as deletetion provider");
 
         let filter = cast(
@@ -353,7 +353,7 @@ mod tests {
             .await
             .expect("insert successful");
 
-        let delete_table = get_deletion_provider(table.clone())
+        let delete_table = get_deletion_provider(Arc::clone(&table))
             .expect("table should be returned as deletetion provider");
 
         let filter = col("time").lt(lit(ScalarValue::TimestampMillisecond(

@@ -98,7 +98,10 @@ impl DeletionTableProvider for PostgresTableWriter {
         filters: &[Expr],
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(DeletionExec::new(
-            Arc::new(PostgresDeletionSink::new(self.postgres.clone(), filters)),
+            Arc::new(PostgresDeletionSink::new(
+                Arc::clone(&self.postgres),
+                filters,
+            )),
             &self.schema(),
         )))
     }
