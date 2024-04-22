@@ -6874,6 +6874,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "slq"
+version = "0.11.1-alpha"
+dependencies = [
+ "arrow 51.0.0",
+ "arrow_sql_gen",
+ "half",
+ "rusqlite",
+]
+
+[[package]]
 name = "smallvec"
 version = "1.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

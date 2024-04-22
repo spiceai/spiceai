@@ -10,7 +10,7 @@ members = [
     "crates/flightrepl",
     "crates/ns_lookup",
     "tools/flightpublisher/",
-    "tools/flightsubscriber/",
+    "tools/flightsubscriber/", "bin",
 ]
 default-members = ["bin/spiced"]
 

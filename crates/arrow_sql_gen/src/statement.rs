@@ -144,6 +144,7 @@ impl InsertBuilder {
             let mut row_values: Vec<SimpleExpr> = vec![];
             for col in 0..record_batch.num_columns() {
                 let column = record_batch.column(col);
+                println!("Field: {}", record_batch.schema().field(col).name());
                 match column.data_type() {
                     DataType::Int8 => push_value!(row_values, column, row, Int8Array),
                     DataType::Int16 => push_value!(row_values, column, row, Int16Array),
@@ -184,7 +185,7 @@ impl InsertBuilder {
                                         .into(),
                                     );
                                 }
-                                Err(_) => {
+                                Err(e) => {
                                     return;
                                 }
                             };
@@ -292,6 +293,7 @@ impl InsertBuilder {
                     ),
                 }
             }
+            println!("{:#?}", row_values);
             insert_stmt.values_panic(row_values);
         }
     }
