@@ -63,6 +63,36 @@ jobs:
 
       - run: make test ci
 
+      - name: Build without default features
+        run: cargo check --no-default-features
+
+      - name: Build with only duckdb
+        run: cargo check --no-default-features --features duckdb
+
+      - name: Build with only postgres
+        run: cargo check --no-default-features --features postgres
+
+      - name: Build with only sqlite
+        run: cargo check --no-default-features --features sqlite
+
+      - name: Build with only mysql
+        run: cargo check --no-default-features --features mysql
+
+      - name: Build with only keyring-secret-store
+        run: cargo check --no-default-features --features keyring-secret-store
+
+      - name: Build with only flightsql
+        run: cargo check --no-default-features --features flightsql
+
+      - name: Build with only aws-secrets-manager
+        run: cargo check --no-default-features --features aws-secrets-manager
+
+      - name: Build with only databricks
+        run: cargo check --no-default-features --features databricks
+
+      - name: Build with only dremio
+        run: cargo check --no-default-features --features dremio
+
   build-docker:
     name: Build Docker Image
     runs-on: rust
