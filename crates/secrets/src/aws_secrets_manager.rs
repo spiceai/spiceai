@@ -109,13 +109,16 @@ impl SecretStore for AwsSecretsManager {
             Ok(secret) => secret,
             Err(SdkError::ServiceError(e)) => {
                 // It is expected that not all parameters are present in secrets.
-                // Warn only if it is a different error
+                // Pass through only if it is a different error
                 if !e.err().is_resource_not_found_exception() {
                     tracing::warn!(
                         "Failed to get secret {} from AWS Secrets Manager: {}",
                         secret_name,
                         e.err()
                     );
+                    return Err(Box::new(Error::UnableToGetSecret {
+                        source: SdkError::ServiceError(e),
+                    }));
                 }
                 return Ok(None);
             }
