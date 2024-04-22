@@ -142,9 +142,9 @@ impl Retention {
         time_format: Option<TimeFormat>,
         retention_period: Option<Duration>,
         retention_check_interval: Option<Duration>,
-        retention_enabled: bool,
+        retention_check_enabled: bool,
     ) -> Option<Self> {
-        if !retention_enabled {
+        if !retention_check_enabled {
             return None;
         }
         if let (Some(time_column), Some(period), Some(check_interval)) =
@@ -332,7 +332,7 @@ impl DataFusion {
                 dataset.time_format.clone(),
                 dataset.retention_period(),
                 dataset.retention_check_interval(),
-                acceleration_settings.retention_enabled,
+                acceleration_settings.retention_check_enabled,
             ),
             obj_store,
         )
