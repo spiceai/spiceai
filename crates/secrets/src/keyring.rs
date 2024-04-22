@@ -78,6 +78,9 @@ impl SecretStore for KeyringSecretStore {
 
         let secret = match entry.get_password() {
             Ok(secret) => secret,
+            Err(keyring::Error::NoEntry) => {
+                return Ok(None);
+            }
             Err(err) => {
                 tracing::warn!(
                     "Failed to get secret value for secret entry {} from keyring store, {}",
