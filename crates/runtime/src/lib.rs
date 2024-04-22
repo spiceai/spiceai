@@ -93,6 +93,12 @@ pub enum Error {
     #[snafu(display("Unable to load secrets for data connector: {data_connector}"))]
     UnableToLoadDataConnectorSecrets { data_connector: String },
 
+    #[snafu(display("Unable to get secret for data connector: {source}"))]
+    UnableToGetSecretForDataConnector {
+        source: Box<dyn std::error::Error + Send + Sync>,
+        data_connector: String,
+    },
+
     #[snafu(display("Unable to create view: {source}"))]
     InvalidSQLView {
         source: spicepod::component::dataset::Error,
@@ -385,9 +391,11 @@ impl Runtime {
         secrets_provider: &secrets::SecretsProvider,
         params: Arc<Option<HashMap<String, String>>>,
     ) -> Result<Arc<dyn DataConnector>> {
-        // secret in general case is optional, so we don't fail if we can't get it
-        // Each data connector is responsible for checking the required secrets.
-        let secret = secrets_provider.get_secret(source).await.unwrap_or(None);
+        let secret = secrets_provider.get_secret(source).await.context(
+            UnableToGetSecretForDataConnectorSnafu {
+                data_connector: source,
+            },
+        )?;
 
         match dataconnector::create_new_connector(source, secret, params).await {
             Some(dc) => dc.context(UnableToInitializeDataConnectorSnafu {
@@ -461,7 +469,10 @@ impl Runtime {
         let acceleration_secret = secrets_provider_read_guard
             .get_secret(&secret_key)
             .await
-            .unwrap_or(None);
+            .context(UnableToGetSecretForDataConnectorSnafu {
+                data_connector: source,
+            })?;
+
         drop(secrets_provider_read_guard);
 
         dataaccelerator::get_accelerator_engine(&accelerator_engine)
@@ -509,12 +520,19 @@ impl Runtime {
         let shared_secrets_provider = Arc::clone(&self.secrets_provider);
         let secrets_provider = shared_secrets_provider.read().await;
 
-        // secret in general case is optional, so we don't fail if we can't get it
-        // each model is responsible for checking the required secrets.
-        let secret = secrets_provider
-            .get_secret(source.as_str())
-            .await
-            .unwrap_or(None);
+        let secret = match secrets_provider.get_secret(source.as_str()).await {
+            Ok(s) => s,
+            Err(e) => {
+                metrics::counter!("models_load_error").increment(1);
+                status::update_model(&model.name, status::ComponentStatus::Error);
+                tracing::warn!(
+                    "Unable to load runnable model from spicepod {}, error: {}",
+                    m.name,
+                    e,
+                );
+                return;
+            }
+        };
 
         match Model::load(m.clone(), secret).await {
             Ok(in_m) => {
