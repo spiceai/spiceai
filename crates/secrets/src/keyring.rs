@@ -26,16 +26,16 @@ const KEYRING_SECRET_PREFIX: &str = "spice_secret_";
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to get secret: {source}"))]
+    #[snafu(display("Unable to get secret from keyring: {source}"))]
     UnableToGetSecret { source: keyring::Error },
 
-    #[snafu(display("Unable to get secret value: {source}"))]
+    #[snafu(display("Unable to get keyring secret value: {source}"))]
     UnableToGetSecretValue { source: keyring::Error },
 
-    #[snafu(display("Unable to parse secret value: {source}"))]
+    #[snafu(display("Unable to parse keyring secret value: {source}"))]
     UnableToParseSecretValue { source: serde_json::Error },
 
-    #[snafu(display("Invalid JSON format: JSON object is expected"))]
+    #[snafu(display("Invalid keyring secret value: JSON object is expected"))]
     InvalidJsonFormat {},
 }
 

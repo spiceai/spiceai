@@ -37,13 +37,13 @@ pub enum Error {
         source: SdkError<GetCallerIdentityError>,
     },
 
-    #[snafu(display("Unable to parse as JSON: {}", source))]
+    #[snafu(display("Unable to parse AWS secret as JSON: {}", source))]
     UnableToParseJson { source: serde_json::Error },
 
-    #[snafu(display("Invalid JSON format: JSON object is expected"))]
+    #[snafu(display("Invalid AWS secret value: JSON object is expected"))]
     InvalidJsonFormat {},
 
-    #[snafu(display("Unable to get secret: {}", source))]
+    #[snafu(display("Unable to get AWS secret: {}", source))]
     UnableToGetSecret {
         source: SdkError<GetSecretValueError>,
     },

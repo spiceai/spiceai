@@ -31,10 +31,10 @@ pub enum Error {
     #[snafu(display("Unable to read K8S namespace: {source}"))]
     UnableToReadK8SNamespace { source: std::io::Error },
 
-    #[snafu(display("Unable to read CA certificate: {source}"))]
+    #[snafu(display("Unable to read K8S CA certificate: {source}"))]
     UnableToReadCACertificate { source: std::io::Error },
 
-    #[snafu(display("Unable to read kubernetes credentials"))]
+    #[snafu(display("Unable to read K8S credentials"))]
     UnableToReadKubernetesCredentials {},
 
     #[snafu(display("Unable to create K8S http client: {source}"))]
