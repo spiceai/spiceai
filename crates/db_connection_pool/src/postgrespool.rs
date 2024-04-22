@@ -38,7 +38,7 @@ pub enum Error {
         source: bb8_postgres::tokio_postgres::Error,
     },
 
-    #[snafu(display("ConnectionPoolRunError: {source}"))]
+    #[snafu(display("{source}"))]
     ConnectionPoolRunError {
         source: bb8::RunError<bb8_postgres::tokio_postgres::Error>,
     },

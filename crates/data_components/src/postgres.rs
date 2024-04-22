@@ -65,7 +65,7 @@ pub enum Error {
         source: db_connection_pool::dbconnection::GenericError,
     },
 
-    #[snafu(display("Unable to create Postgres connection pool: {source}"))]
+    #[snafu(display("{source}"))]
     UnableToCreatePostgresConnectionPool { source: db_connection_pool::Error },
 
     #[snafu(display("Unable to downcast DbConnection to PostgresConnection"))]
