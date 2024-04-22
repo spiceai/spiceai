@@ -30,6 +30,10 @@ mysql_async = { workspace = true, optional = true }
 ns_lookup = { path = "../ns_lookup" }
 native-tls = { version = "0.2.11", optional = true }
 postgres-native-tls = { version = "0.5.0", optional = true }
+odbc-api = { version = "7.0.0", optional = true }
+arrow-odbc = { version = "8.3.0", optional = true }
+itertools = "0.12.1"
+lazy_static = "1.4.0"
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
@@ -48,3 +52,4 @@ postgres = [
 ]
 sqlite = ["dep:rusqlite", "dep:tokio-rusqlite", "arrow_sql_gen/sqlite", "spicepod/sqlite"]
 mysql = ["dep:mysql_async", "arrow_sql_gen/mysql", "spicepod/mysql"]
+odbc = ["dep:odbc-api", "dep:arrow-odbc"]

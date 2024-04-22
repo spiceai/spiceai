@@ -29,6 +29,9 @@ pub mod mysqlconn;
 pub mod postgresconn;
 #[cfg(feature = "sqlite")]
 pub mod sqliteconn;
+#[cfg(feature = "odbc")]
+pub mod odbcconn;
+
 
 pub type GenericError = Box<dyn std::error::Error + Send + Sync>;
 type Result<T, E = GenericError> = std::result::Result<T, E>;
