@@ -49,22 +49,13 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - ansi_term 0.12.1, MIT 
   <br/>https://github.com/ogham/rust-ansi-term
 
-- arrow 50.0.0, Apache-2.0 
-  <br/>https://github.com/apache/arrow-rs
-
 - arrow 51.0.0, Apache-2.0 
   <br/>https://github.com/apache/arrow-rs
 
 - arrow-flight 51.0.0, Apache-2.0 
   <br/>https://github.com/apache/arrow-rs
 
-- arrow-ipc 50.0.0, Apache-2.0 
-  <br/>https://github.com/apache/arrow-rs
-
 - arrow-ipc 51.0.0, Apache-2.0 
-  <br/>https://github.com/apache/arrow-rs
-
-- arrow-json 50.0.0, Apache-2.0 
   <br/>https://github.com/apache/arrow-rs
 
 - arrow-json 51.0.0, Apache-2.0 
@@ -85,17 +76,11 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - aws-sdk-sts 1.19.0, Apache-2.0 
   <br/>https://github.com/awslabs/aws-sdk-rust
 
-- aws-types 1.1.9, Apache-2.0 
-  <br/>https://github.com/smithy-lang/smithy-rs
-
 - axum 0.6.20, MIT 
   <br/>https://github.com/tokio-rs/axum
 
 - axum 0.7.5, MIT 
   <br/>https://github.com/tokio-rs/axum
-
-- base64 0.13.1, Apache-2.0 OR MIT 
-  <br/>https://github.com/marshallpierce/rust-base64
 
 - base64 0.21.7, Apache-2.0 OR MIT 
   <br/>https://github.com/marshallpierce/rust-base64
@@ -118,7 +103,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - bytes 1.6.0, MIT 
   <br/>https://github.com/tokio-rs/bytes
 
-- chrono 0.4.37, Apache-2.0 OR MIT 
+- chrono 0.4.38, Apache-2.0 OR MIT 
   <br/>https://github.com/chronotope/chrono
 
 - clap 4.5.4, Apache-2.0 OR MIT 
@@ -127,14 +112,8 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - csv 1.3.0, MIT OR Unlicense 
   <br/>https://github.com/BurntSushi/rust-csv
 
-- datafusion 35.0.0, Apache-2.0 
-  <br/>https://github.com/apache/arrow-datafusion
-
 - datafusion 37.0.0, Apache-2.0 
   <br/>https://github.com/apache/arrow-datafusion
-
-- deltalake 0.17.0, Apache-2.0 
-  <br/>https://github.com/delta-io/delta.rs
 
 - deltalake 0.17.1, Apache-2.0 
   <br/>https://github.com/delta-io/delta.rs
@@ -149,9 +128,6 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
   <br/>https://github.com/fundu-rs/fundu
 
 - futures 0.3.30, Apache-2.0 OR MIT 
-  <br/>https://github.com/rust-lang/futures-rs
-
-- futures-core 0.3.30, Apache-2.0 OR MIT 
   <br/>https://github.com/rust-lang/futures-rs
 
 - indexmap 1.9.3, Apache-2.0 OR MIT 
@@ -187,9 +163,6 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - ndarray 0.15.6, Apache-2.0 OR MIT 
   <br/>https://github.com/rust-ndarray/ndarray
 
-- ndarray-npy 0.8.1, Apache-2.0 OR MIT 
-  <br/>https://github.com/jturner314/ndarray-npy
-
 - notify 6.1.1, CC0-1.0 
   <br/>https://github.com/notify-rs/notify.git
 
@@ -201,9 +174,6 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 
 - opentelemetry-proto 0.4.0, Apache-2.0 
   <br/>https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-proto
-
-- parquet 50.0.0, Apache-2.0 
-  <br/>https://github.com/apache/arrow-rs
 
 - parquet 51.0.0, Apache-2.0 
   <br/>https://github.com/apache/arrow-rs
@@ -223,12 +193,6 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - prost 0.12.4, Apache-2.0 
   <br/>https://github.com/tokio-rs/prost
 
-- quick-xml 0.23.1, MIT 
-  <br/>https://github.com/tafia/quick-xml
-
-- quick-xml 0.31.0, MIT 
-  <br/>https://github.com/tafia/quick-xml
-
 - r2d2 0.8.10, Apache-2.0 OR MIT 
   <br/>https://github.com/sfackler/r2d2
 
@@ -240,21 +204,6 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 
 - rusqlite 0.31.0, MIT 
   <br/>https://github.com/rusqlite/rusqlite
-
-- rustls 0.19.1, Apache-2.0 OR ISC OR MIT 
-  <br/>https://github.com/ctz/rustls
-
-- rustls 0.21.10, Apache-2.0 OR ISC OR MIT 
-  <br/>https://github.com/rustls/rustls
-
-- rustls 0.22.3, Apache-2.0 OR ISC OR MIT 
-  <br/>https://github.com/rustls/rustls
-
-- rustls 0.23.4, Apache-2.0 OR ISC OR MIT 
-  <br/>https://github.com/rustls/rustls
-
-- rustls-native-certs 0.5.0, Apache-2.0 OR ISC OR MIT 
-  <br/>https://github.com/ctz/rustls-native-certs
 
 - rustls-native-certs 0.6.3, Apache-2.0 OR ISC OR MIT 
   <br/>https://github.com/ctz/rustls-native-certs
