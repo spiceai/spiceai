@@ -170,16 +170,16 @@ impl KubernetesSecretStore {
 #[async_trait]
 impl SecretStore for KubernetesSecretStore {
     #[must_use]
-    async fn get_secret(&self, secret_name: &str) -> Option<Secret> {
+    async fn get_secret(&self, secret_name: &str) -> super::Result<Option<Secret>> {
         match self.kubernetes_client.get_secret(secret_name).await {
-            Ok(secret) => Some(Secret::new(secret.clone())),
+            Ok(secret) => Ok(Some(Secret::new(secret.clone()))),
             Err(err) => {
                 tracing::warn!(
                     "Failed to get secret {} from kubernetes store, {}",
                     secret_name,
                     err
                 );
-                None
+                Ok(None)
             }
         }
     }

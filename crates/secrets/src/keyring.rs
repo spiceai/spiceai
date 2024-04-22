@@ -42,7 +42,7 @@ impl KeyringSecretStore {
 #[async_trait]
 impl SecretStore for KeyringSecretStore {
     #[must_use]
-    async fn get_secret(&self, secret_name: &str) -> Option<Secret> {
+    async fn get_secret(&self, secret_name: &str) -> super::Result<Option<Secret>> {
         let entry_key = format!("{KEYRING_SECRET_PREFIX}{secret_name}");
 
         let entry = match Entry::new(entry_key.as_str(), "spiced") {
@@ -53,7 +53,7 @@ impl SecretStore for KeyringSecretStore {
                     entry_key,
                     err
                 );
-                return None;
+                return Ok(None);
             }
         };
 
@@ -65,7 +65,7 @@ impl SecretStore for KeyringSecretStore {
                     entry_key,
                     err
                 );
-                return None;
+                return Ok(None);
             }
         };
 
@@ -78,11 +78,18 @@ impl SecretStore for KeyringSecretStore {
                     entry_key,
                     err
                 );
-                return None;
+                return Ok(None);
             }
         };
 
-        let object = parsed.as_object()?;
+        let Some(object) = parsed.as_object() else {
+            tracing::warn!(
+                "Failed to parse secret value for secret entry {} from keyring store, {}",
+                entry_key,
+                "value is not an object"
+            );
+            return Ok(None);
+        };
 
         let mut data = HashMap::new();
 
@@ -94,6 +101,6 @@ impl SecretStore for KeyringSecretStore {
             data.insert(key.clone(), value.to_string());
         });
 
-        Some(Secret::new(data))
+        Ok(Some(Secret::new(data)))
     }
 }

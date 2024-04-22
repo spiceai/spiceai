@@ -41,13 +41,15 @@ pub enum Error {
     UnableToInitializeAwsSecretsManager {
         source: crate::aws_secrets_manager::Error,
     },
+    #[snafu(display("Unable to parse secret value"))]
+    UnableToParseSecretValue {},
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[async_trait]
 pub trait SecretStore {
-    async fn get_secret(&self, secret_name: &str) -> Option<Secret>;
+    async fn get_secret(&self, secret_name: &str) -> Result<Option<Secret>>;
 }
 
 #[derive(Debug, Clone)]
@@ -185,12 +187,14 @@ impl SecretsProvider {
         Ok(())
     }
 
-    #[must_use]
-    pub async fn get_secret(&self, secret_name: &str) -> Option<Secret> {
+    /// # Errors
+    ///
+    /// Will return `None` if the secret store is not initialized or pass error from the secret store.
+    pub async fn get_secret(&self, secret_name: &str) -> Result<Option<Secret>> {
         if let Some(ref secret_store) = self.secret_store {
             secret_store.get_secret(secret_name).await
         } else {
-            None
+            Ok(None)
         }
     }
 }

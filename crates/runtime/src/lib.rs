@@ -385,7 +385,9 @@ impl Runtime {
         secrets_provider: &secrets::SecretsProvider,
         params: Arc<Option<HashMap<String, String>>>,
     ) -> Result<Arc<dyn DataConnector>> {
-        let secret = secrets_provider.get_secret(source).await;
+        // secret in general case is optional, so we don't fail if we can't get it
+        // Each data connector is responsible for checking the required secrets.
+        let secret = secrets_provider.get_secret(source).await.unwrap_or(None);
 
         match dataconnector::create_new_connector(source, secret, params).await {
             Some(dc) => dc.context(UnableToInitializeDataConnectorSnafu {
@@ -456,7 +458,10 @@ impl Runtime {
             .unwrap_or(format!("{accelerator_engine}_engine").to_lowercase());
 
         let secrets_provider_read_guard = secrets_provider.read().await;
-        let acceleration_secret = secrets_provider_read_guard.get_secret(&secret_key).await;
+        let acceleration_secret = secrets_provider_read_guard
+            .get_secret(&secret_key)
+            .await
+            .unwrap_or(None);
         drop(secrets_provider_read_guard);
 
         dataaccelerator::get_accelerator_engine(&accelerator_engine)
@@ -504,12 +509,14 @@ impl Runtime {
         let shared_secrets_provider = Arc::clone(&self.secrets_provider);
         let secrets_provider = shared_secrets_provider.read().await;
 
-        match Model::load(
-            m.clone(),
-            secrets_provider.get_secret(source.as_str()).await,
-        )
-        .await
-        {
+        // secret in general case is optional, so we don't fail if we can't get it
+        // each model is responsible for checking the required secrets.
+        let secret = secrets_provider
+            .get_secret(source.as_str())
+            .await
+            .unwrap_or(None);
+
+        match Model::load(m.clone(), secret).await {
             Ok(in_m) => {
                 model_map.insert(m.name.clone(), in_m);
                 tracing::info!("Model [{}] deployed, ready for inferencing", m.name);

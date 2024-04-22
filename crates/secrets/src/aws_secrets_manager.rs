@@ -87,7 +87,7 @@ impl AwsSecretsManager {
 #[async_trait]
 impl SecretStore for AwsSecretsManager {
     #[must_use]
-    async fn get_secret(&self, secret_name: &str) -> Option<Secret> {
+    async fn get_secret(&self, secret_name: &str) -> super::Result<Option<Secret>> {
         let secret_name = format!("{SPICE_SECRET_PREFIX}{secret_name}");
 
         tracing::trace!("Getting secret {} from AWS Secrets Manager", secret_name);
@@ -110,7 +110,7 @@ impl SecretStore for AwsSecretsManager {
                         e.err()
                     );
                 }
-                return None;
+                return Ok(None);
             }
             Err(err) => {
                 tracing::warn!(
@@ -118,21 +118,21 @@ impl SecretStore for AwsSecretsManager {
                     secret_name,
                     err
                 );
-                return None;
+                return Ok(None);
             }
         };
 
         if let Some(secret_str) = secret_value.secret_string() {
             match parse_json_to_hashmap(secret_str) {
-                Ok(data) => return Some(Secret::new(data)),
+                Ok(data) => return Ok(Some(Secret::new(data))),
                 Err(err) => {
                     tracing::warn!("Failed to parse secret {} content: {}", secret_name, err);
-                    return None;
+                    return Ok(None);
                 }
             }
         }
 
-        None
+        Ok(None)
     }
 }
 /// Parses a JSON string into a `HashMap<String, String>`.

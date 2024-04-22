@@ -102,11 +102,11 @@ impl FileSecretStore {
 #[async_trait]
 impl SecretStore for FileSecretStore {
     #[must_use]
-    async fn get_secret(&self, secret_name: &str) -> Option<Secret> {
+    async fn get_secret(&self, secret_name: &str) -> super::Result<Option<Secret>> {
         if let Some(secret) = self.secrets.get(secret_name) {
-            return Some(secret.clone());
+            return Ok(Some(secret.clone()));
         }
 
-        None
+        Ok(None)
     }
 }
