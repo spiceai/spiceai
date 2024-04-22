@@ -23,14 +23,55 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-pub fn to_sql(expr: &Expr) -> Result<String> {
+#[derive(Clone, Copy, Debug)]
+pub enum Engine {
+    SQLite,
+    DuckDB,
+}
+
+#[allow(clippy::needless_pass_by_value)]
+pub fn to_sql_with_engine(expr: &Expr, engine: Option<Engine>) -> Result<String> {
     match expr {
         Expr::BinaryExpr(binary_expr) => {
-            let left = to_sql(&binary_expr.left)?;
-            let right = to_sql(&binary_expr.right)?;
+            let left = to_sql_with_engine(&binary_expr.left, engine)?;
+            let right = to_sql_with_engine(&binary_expr.right, engine)?;
+
+            if let Some(Engine::DuckDB) = engine {
+                // DuckDB doesn't support compare timestamp with timestamptz in 0.10.1 yet. Revisit
+                // in 0.10.2
+                if right.starts_with("TO_TIMESTAMP") && !left.starts_with("TO_TIMESTAMP") {
+                    return Ok(format!(
+                        "TO_TIMESTAMP(EPOCH({})) {} {}",
+                        left, binary_expr.op, right
+                    ));
+                }
+            }
+
             Ok(format!("{} {} {}", left, binary_expr.op, right))
         }
         Expr::Column(name) => Ok(format!("\"{name}\"")),
+        Expr::Cast(cast) => {
+            match cast.data_type {
+                arrow::datatypes::DataType::Timestamp(_, Some(_) | None) => match engine {
+                    None => Ok(format!(
+                        "CAST({} AS TIMESTAMPTZ)",
+                        to_sql_with_engine(&cast.expr, engine)?,
+                    )),
+                    // This needs to match the timestamp conversion below
+                    Some(Engine::DuckDB) => Ok(format!(
+                        "TO_TIMESTAMP(EPOCH(CAST({} AS TIMESTAMP)))",
+                        to_sql_with_engine(&cast.expr, engine)?,
+                    )),
+                    Some(Engine::SQLite) => Ok(format!(
+                        "datetime({}, 'subsec', 'utc')",
+                        to_sql_with_engine(&cast.expr, engine)?,
+                    )),
+                },
+                _ => Err(Error::UnsupportedFilterExpr {
+                    expr: format!("{expr}"),
+                }),
+            }
+        }
         Expr::Literal(value) => match value {
             ScalarValue::Null => Ok(value.to_string()),
             ScalarValue::Int16(Some(value)) => Ok(value.to_string()),
@@ -47,6 +88,14 @@ pub fn to_sql(expr: &Expr) -> Result<String> {
             ScalarValue::UInt16(Some(value)) => Ok(value.to_string()),
             ScalarValue::UInt32(Some(value)) => Ok(value.to_string()),
             ScalarValue::UInt64(Some(value)) => Ok(value.to_string()),
+            ScalarValue::TimestampMillisecond(Some(value), None | Some(_)) => match engine {
+                Some(Engine::SQLite) => Ok(format!("datetime({}, 'unixepoch')", value / 1000)),
+                _ => Ok(format!("TO_TIMESTAMP({})", value / 1000)),
+            },
+            ScalarValue::TimestampSecond(Some(value), None | Some(_)) => match engine {
+                Some(Engine::SQLite) => Ok(format!("datetime({value}, 'unixepoch')")),
+                _ => Ok(format!("TO_TIMESTAMP({value})")),
+            },
             _ => Err(Error::UnsupportedFilterExpr {
                 expr: format!("{expr}"),
             }),
@@ -55,4 +104,8 @@ pub fn to_sql(expr: &Expr) -> Result<String> {
             expr: format!("{expr}"),
         }),
     }
+}
+
+pub fn to_sql(expr: &Expr) -> Result<String> {
+    to_sql_with_engine(expr, None)
 }

@@ -39,10 +39,10 @@ use db_connection_pool::{
 };
 use postgres_native_tls::MakeTlsConnector;
 use snafu::prelude::*;
-use sql_provider_datafusion::SqlTable;
+use sql_provider_datafusion::{expr, SqlTable};
 use std::sync::Arc;
 
-use crate::{Read, ReadWrite};
+use crate::{delete::DeletionTableProviderAdapter, Read, ReadWrite};
 
 use self::write::PostgresTableWriter;
 
@@ -93,8 +93,16 @@ pub enum Error {
         source: sql_provider_datafusion::Error,
     },
 
+    #[snafu(display("Unable to generate SQL: {source}"))]
+    UnableToGenerateSQL { source: expr::Error },
+
     #[snafu(display("Unable to delete all data from the Postgres table: {source}"))]
     UnableToDeleteAllTableData {
+        source: tokio_postgres::error::Error,
+    },
+
+    #[snafu(display("Unable to delete data from the Postgres table: {source}"))]
+    UnableToDeleteData {
         source: tokio_postgres::error::Error,
     },
 
@@ -221,7 +229,9 @@ impl TableProviderFactory for PostgresTableProviderFactory {
             OwnedTableReference::bare(name.clone()),
         ));
 
-        Ok(PostgresTableWriter::create(read_provider, postgres))
+        let delete_adapter =
+            DeletionTableProviderAdapter::new(PostgresTableWriter::create(read_provider, postgres));
+        Ok(Arc::new(delete_adapter))
     }
 }
 
@@ -305,6 +315,25 @@ impl Postgres {
             .context(UnableToDeleteAllTableDataSnafu)?;
 
         Ok(())
+    }
+
+    #[allow(clippy::cast_sign_loss)]
+    async fn delete_from(&self, transaction: &Transaction<'_>, where_clause: &str) -> Result<u64> {
+        let row = transaction
+            .query_one(
+                format!(
+                    r#"WITH deleted AS (DELETE FROM "{}" WHERE {} RETURNING *) SELECT COUNT(*) FROM deleted"#,
+                    self.table_name, where_clause
+                )
+                .as_str(),
+                &[],
+            )
+            .await
+            .context(UnableToDeleteDataSnafu)?;
+
+        let deleted: i64 = row.get(0);
+
+        Ok(deleted as u64)
     }
 
     async fn create_table(&self, schema: SchemaRef, transaction: &Transaction<'_>) -> Result<()> {

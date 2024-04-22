@@ -26,8 +26,12 @@ ci:
 	export SPICED_TARGET_DIR=/workspace/spiceai/target; make -C bin/spiced
 
 .PHONY: test
-test: 
+test:
 	@cargo test --all
+
+.PHONY: test
+nextest:
+	@cargo nextest run --all
 
 .PHONY: lint
 lint:
@@ -40,6 +44,10 @@ lint:
 		-Dclippy::unwrap_used \
 		-Dclippy::expect_used \
 		-Dclippy::clone_on_ref_ptr
+
+.PHONY: run
+run:
+	~/.spice/bin/spiced
 
 .PHONY: docker
 docker:
@@ -95,6 +103,8 @@ install-dev: build-dev
 .PHONY: modtidy
 modtidy:
 	go mod tidy
+
+
 
 
 ################################################################################

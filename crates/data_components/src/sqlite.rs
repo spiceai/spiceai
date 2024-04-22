@@ -35,6 +35,8 @@ use sql_provider_datafusion::SqlTable;
 use std::sync::Arc;
 use tokio_rusqlite::Connection;
 
+use crate::delete::DeletionTableProviderAdapter;
+
 use self::write::SqliteTableWriter;
 
 pub mod write;
@@ -153,10 +155,10 @@ impl TableProviderFactory for SqliteTableFactory {
             .context(DanglingReferenceToSqliteSnafu)
             .map_err(to_datafusion_error)?;
 
-        let read_write_provider: Arc<dyn TableProvider> =
-            SqliteTableWriter::create(read_provider, sqlite);
+        let read_write_provider = SqliteTableWriter::create(read_provider, sqlite);
 
-        Ok(read_write_provider)
+        let delete_adapter = DeletionTableProviderAdapter::new(read_write_provider);
+        Ok(Arc::new(delete_adapter))
     }
 }
 
@@ -236,6 +238,24 @@ impl Sqlite {
         transaction.execute(format!(r#"DELETE FROM "{}""#, self.table_name).as_str(), [])?;
 
         Ok(())
+    }
+
+    fn delete_from(
+        &self,
+        transaction: &Transaction<'_>,
+        where_clause: &str,
+    ) -> rusqlite::Result<u64> {
+        transaction.execute(
+            format!(
+                r#"DELETE FROM "{}" WHERE {}"#,
+                self.table_name, where_clause
+            )
+            .as_str(),
+            [],
+        )?;
+        let count: u64 = transaction.query_row("SELECT changes()", [], |row| row.get(0))?;
+
+        Ok(count)
     }
 
     fn create_table(&self, transaction: &Transaction<'_>) -> rusqlite::Result<()> {

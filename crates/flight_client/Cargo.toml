@@ -17,7 +17,6 @@ base64 = "0.21.7"
 bytes = "1.5.0"
 futures.workspace = true
 snafu.workspace = true
-rustls = "0.21.7"
 rustls-native-certs = "0.6.3"
 rustls-pemfile = "1.0.3"
 tonic = { workspace = true, features = ["transport", "tls", "tls-roots"] }
