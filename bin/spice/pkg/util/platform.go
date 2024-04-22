@@ -14,28 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package constants
+package util
 
-import (
-	"github.com/spiceai/spiceai/bin/spice/pkg/util"
-)
+import "runtime"
 
-const (
-	DotSpice               = ".spice"
-	SpicePodsDirectoryName = "spicepods"
-)
-
-var (
-	SpiceRuntimeFilename string
-	SpiceCliFilename     string
-)
-
-func init() {
-	if util.IsWindows() {
-		SpiceRuntimeFilename = "spiced.exe"
-		SpiceCliFilename = "spice.exe"
-	} else {
-		SpiceRuntimeFilename = "spiced"
-		SpiceCliFilename = "spice"
-	}
+func IsWindows() bool {
+	return runtime.GOOS == "windows"
 }
