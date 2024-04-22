@@ -144,7 +144,6 @@ impl InsertBuilder {
             let mut row_values: Vec<SimpleExpr> = vec![];
             for col in 0..record_batch.num_columns() {
                 let column = record_batch.column(col);
-                println!("Field: {}", record_batch.schema().field(col).name());
                 match column.data_type() {
                     DataType::Int8 => push_value!(row_values, column, row, Int8Array),
                     DataType::Int16 => push_value!(row_values, column, row, Int16Array),
@@ -168,6 +167,8 @@ impl InsertBuilder {
                             );
                         }
                     }
+                    DataType::Date32 => push_value!(row_values, column, row, Date32Array),
+                    DataType::Date64 => push_value!(row_values, column, row, Date64Array),
                     DataType::Timestamp(_, _) => {
                         let array = column
                             .as_any()
@@ -293,7 +294,6 @@ impl InsertBuilder {
                     ),
                 }
             }
-            println!("{:#?}", row_values);
             insert_stmt.values_panic(row_values);
         }
     }
@@ -346,6 +346,8 @@ fn map_data_type_to_column_type(data_type: &DataType) -> ColumnType {
         DataType::UInt64 => ColumnType::BigUnsigned,
         DataType::Float32 => ColumnType::Float,
         DataType::Float64 => ColumnType::Double,
+        DataType::Date32 => ColumnType::Date,
+        DataType::Date64 => ColumnType::Date,
         DataType::Utf8 | DataType::LargeUtf8 => ColumnType::Text,
         DataType::Boolean => ColumnType::Boolean,
         #[allow(clippy::cast_sign_loss)] // This is safe because scale will never be negative
@@ -384,11 +386,11 @@ mod tests {
         let schema1 = Schema::new(vec![
             Field::new("id", DataType::Int32, false),
             Field::new("name", DataType::Utf8, false),
-            Field::new("age", DataType::Int32, true),
+            Field::new("age", DataType::Date32, true),
         ]);
         let id_array = array::Int32Array::from(vec![1, 2, 3]);
         let name_array = array::StringArray::from(vec!["a", "b", "c"]);
-        let age_array = array::Int32Array::from(vec![10, 20, 30]);
+        let age_array = array::Date32Array::from(vec![10, 20, 30]);
 
         let batch1 = RecordBatch::try_new(
             Arc::new(schema1.clone()),
@@ -403,7 +405,7 @@ mod tests {
         let schema2 = Schema::new(vec![
             Field::new("id", DataType::Int32, false),
             Field::new("name", DataType::Utf8, false),
-            Field::new("blah", DataType::Int32, true),
+            Field::new("blah", DataType::Date32, true),
         ]);
 
         let batch2 = RecordBatch::try_new(
