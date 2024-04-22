@@ -1,14 +1,11 @@
 use crate::{
     config::{FIRECACHE_ADDR, FLIGHT_ADDR, HTTPS_ADDR},
     flight::SqlFlightClient,
-    prices::PricesClient,
     tls::new_tls_flight_channel,
-    HistoricalPriceData, LatestPricesResponse,
 };
 use arrow_flight::decode::FlightRecordBatchStream;
-use chrono::{DateTime, Utc};
 use futures::try_join;
-use std::{collections::HashMap, error::Error};
+use std::error::Error;
 use tonic::transport::Channel;
 
 struct SpiceClientConfig {
@@ -41,13 +38,11 @@ impl SpiceClientConfig {
 }
 
 /// The `SpiceClient` is the main entry point for interacting with the Spice API.
-/// It provides methods for querying the Spice Flight and Firecache endpoints,
-/// as well as the Spice Prices endpoint.
+/// It provides methods for querying the Spice Flight and Firecache endpoints.
 #[allow(clippy::module_name_repetitions)]
 pub struct SpiceClient {
     flight: SqlFlightClient,
     firecache: SqlFlightClient,
-    prices: PricesClient,
 }
 
 impl SpiceClient {
@@ -66,7 +61,6 @@ impl SpiceClient {
         Ok(Self {
             flight: SqlFlightClient::new(config.flight_channel, api_key.to_string()),
             firecache: SqlFlightClient::new(config.firecache_channel, api_key.to_string()),
-            prices: PricesClient::new(Some(config.https_addr), api_key.to_string()),
         })
     }
 
@@ -99,61 +93,5 @@ impl SpiceClient {
         query: &str,
     ) -> Result<FlightRecordBatchStream, Box<dyn Error>> {
         self.firecache.query(query).await
-    }
-
-    /// Get the supported pairs:
-    /// ```rust
-    /// # use spiceai::Client;
-    /// #
-    /// # #[tokio::main]
-    /// # async fn main() {
-    /// #  let mut client = Client::new("API_KEY").await.unwrap();
-    /// let supported_pairs = client.get_supported_pairs().await;
-    /// # }
-    /// ```
-    pub async fn get_supported_pairs(&self) -> Result<Vec<String>, Box<dyn Error>> {
-        self.prices.get_supported_pairs().await
-    }
-
-    /// Get the latest price for a token pair:
-    /// ```rust
-    /// # use spiceai::Client;
-    /// #
-    /// # #[tokio::main]
-    /// # async fn main() {
-    /// #  let mut client = Client::new("API_KEY").await.unwrap();
-    /// let price_data = client.get_prices(&["BTC-USDC"]).await;
-    /// # }
-    /// ```
-    pub async fn get_prices(&self, pairs: &[&str]) -> Result<LatestPricesResponse, Box<dyn Error>> {
-        self.prices.get_prices(pairs).await
-    }
-
-    /// Get historical data:
-    /// ```rust
-    /// # use spiceai::Client;
-    /// # use chrono::Utc;
-    /// # use chrono::Duration;
-    /// # use std::ops::Sub;
-    /// #
-    /// # #[tokio::main]
-    /// # async fn main() {
-    /// #  let mut client = Client::new("API_KEY").await.unwrap();
-    /// #  let now = Utc::now();
-    /// #  let start = now.sub(Duration::seconds(3600));
-    /// let historical_price_data = client
-    ///     .get_historical_prices(&["BTC-USDC"], Some(start), Some(now), Option::None).await;
-    /// # }
-    /// ```
-    pub async fn get_historical_prices(
-        &self,
-        pairs: &[&str],
-        start: Option<DateTime<Utc>>,
-        end: Option<DateTime<Utc>>,
-        granularity: Option<&str>,
-    ) -> Result<HashMap<String, Vec<HistoricalPriceData>>, Box<dyn Error>> {
-        self.prices
-            .get_historical_prices(pairs, start, end, granularity)
-            .await
     }
 }
