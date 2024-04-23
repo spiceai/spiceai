@@ -47,7 +47,7 @@ pub enum Error {
     #[snafu(display("Failed to downcast builder for {clickhouse_type}"))]
     FailedToDowncastBuilder { clickhouse_type: String },
 
-    #[snafu(display("Failed to get a row value for {}: {}", clickhouse_type, source))]
+    #[snafu(display("Failed to get a row value for {clickhouse_type}: {source}"))]
     FailedToGetRowValue {
         clickhouse_type: SqlType,
         source: clickhouse_rs::errors::Error,
