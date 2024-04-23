@@ -96,7 +96,7 @@ sqlite = [
     "data_components/sqlite",
 ]
 mysql = ["dep:mysql_async", "db_connection_pool/mysql", "arrow_sql_gen/mysql", "data_components/mysql"]
-clickhouse = ["dep:clickhouse-rs", "db_connection_pool/clickhouse", "arrow_sql_gen/clickhouse"]
+clickhouse = ["dep:clickhouse-rs", "db_connection_pool/clickhouse", "arrow_sql_gen/clickhouse", "data_components/clickhouse"]
 keyring-secret-store = ["secrets/keyring-secret-store"]
 flightsql = ["data_components/flightsql"]
 aws-secrets-manager = ["secrets/aws-secrets-manager"]

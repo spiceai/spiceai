@@ -26,6 +26,8 @@ pub mod databricks_delta;
 #[cfg(feature = "databricks")]
 pub mod databricks_spark;
 
+#[cfg(feature = "clickhouse")]
+pub mod clickhouse;
 #[cfg(feature = "databricks")]
 pub mod deltatable;
 #[cfg(feature = "duckdb")]
