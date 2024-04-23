@@ -169,6 +169,9 @@ pub fn block_to_arrow(block: &Block<Complex>) -> Result<RecordBatch> {
                 SqlType::String => {
                     handle_primitive_type!(builder, SqlType::String, StringBuilder, String, row, i);
                 }
+                SqlType::FixedString(size) => {
+                    handle_primitive_type!(builder, SqlType::FixedString(size), StringBuilder, String, row, i);
+                }
                 SqlType::Date => {
                     let Some(builder) = builder else {
                         return NoBuilderForIndexSnafu { index: i }.fail();
@@ -233,7 +236,7 @@ fn map_column_to_data_type(column_type: &SqlType) -> Option<DataType> {
         SqlType::UInt64 => Some(DataType::UInt64),
         SqlType::Float32 => Some(DataType::Float32),
         SqlType::Float64 => Some(DataType::Float64),
-        SqlType::String => Some(DataType::Utf8),
+        SqlType::String | SqlType::FixedString(_) => Some(DataType::Utf8),
         SqlType::Date => Some(DataType::Date32),
         SqlType::DateTime(_) => Some(DataType::Timestamp(TimeUnit::Second, None)),
         _ => unimplemented!("Unsupported column type {:?}", column_type),
