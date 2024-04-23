@@ -15,3 +15,5 @@ Cargo.lock
 
 # Store local variables for test
 .env.local
+
+*.DS_Store
