@@ -89,6 +89,17 @@ spice upgrade
 
 		releaseFilePath := filepath.Join(spiceBinDir, constants.SpiceCliFilename)
 
+		// On Windows, it is not possible to overwrite a binary while it's running.
+		// However, it can be moved/renamed making it possible to save new release with the original name.
+		if util.IsWindows() {
+			runningCliTempLocation := filepath.Join(spiceBinDir, constants.SpiceCliFilename+".bak")
+			err = os.Rename(releaseFilePath, runningCliTempLocation)
+			if err != nil {
+				cmd.PrintErrln("Error upgrading the spice binary:", err)
+				return
+			}
+		}
+
 		err = os.Rename(tempFilePath, releaseFilePath)
 		if err != nil {
 			cmd.PrintErrln("Error upgrading the spice binary:", err)

@@ -35,8 +35,9 @@ jobs:
           git config --global user.name 'Spice Acknowledgements Bot'
           git config --global user.email 'acknowledgements-bot@spice.ai'
           git checkout -b acknowledgements/${GITHUB_RUN_ID}
-          git add acknowledgements.md
-          if [[ $(git status --porcelain) ]]; then
+          git diff acknowledgements.md
+          if [[ $(git diff --exit-code acknowledgements.md) ]]; then
+            git add acknowledgements.md
             git commit -m "Update acknowledgements"
             git push origin acknowledgements/${GITHUB_RUN_ID}
             gh pr create --title "Update acknowledgements" --body "Updated OSS acknowledgements" --base trunk --head acknowledgements/${GITHUB_RUN_ID}

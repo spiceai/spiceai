@@ -170,7 +170,7 @@ checksum = "d301b3b94cb4b2f23d7917810addbbaff90738e0ca2be692bd027e70d7e0330c"
 
 [[package]]
 name = "app"
-version = "0.11.1-alpha"
+version = "0.12.0-alpha"
 dependencies = [
  "snafu 0.8.2",
  "spicepod",
@@ -441,7 +441,7 @@ dependencies = [
 
 [[package]]
 name = "arrow_sql_gen"
-version = "0.11.1-alpha"
+version = "0.12.0-alpha"
 dependencies = [
  "arrow",
  "bigdecimal 0.3.1",
@@ -988,7 +988,7 @@ dependencies = [
  "once_cell",
  "pin-project-lite",
  "pin-utils",
- "rustls 0.21.10",
+ "rustls 0.21.11",
  "tokio",
  "tracing",
 ]
@@ -1916,7 +1916,7 @@ checksum = "7e962a19be5cfc3f3bf6dd8f61eb50107f356ad6270fbb3ed41476571db78be5"
 
 [[package]]
 name = "data_components"
-version = "0.11.1-alpha"
+version = "0.12.0-alpha"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -2229,7 +2229,7 @@ dependencies = [
 
 [[package]]
 name = "db_connection_pool"
-version = "0.11.1-alpha"
+version = "0.12.0-alpha"
 dependencies = [
  "arrow",
  "arrow_sql_gen",
@@ -2723,7 +2723,7 @@ dependencies = [
 
 [[package]]
 name = "flight_client"
-version = "0.11.1-alpha"
+version = "0.12.0-alpha"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -2739,7 +2739,7 @@ dependencies = [
 
 [[package]]
 name = "flightpublisher"
-version = "0.11.1-alpha"
+version = "0.12.0-alpha"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -2752,7 +2752,7 @@ dependencies = [
 
 [[package]]
 name = "flightrepl"
-version = "0.11.1-alpha"
+version = "0.12.0-alpha"
 dependencies = [
  "ansi_term",
  "arrow-flight",
@@ -2767,7 +2767,7 @@ dependencies = [
 
 [[package]]
 name = "flightsubscriber"
-version = "0.11.1-alpha"
+version = "0.12.0-alpha"
 dependencies = [
  "arrow-flight",
  "clap",
@@ -3302,7 +3302,7 @@ dependencies = [
  "http 0.2.12",
  "hyper 0.14.28",
  "log",
- "rustls 0.21.10",
+ "rustls 0.21.11",
  "rustls-native-certs 0.6.3",
  "tokio",
  "tokio-rustls 0.24.1",
@@ -4230,7 +4230,7 @@ dependencies = [
 
 [[package]]
 name = "ns_lookup"
-version = "0.11.1-alpha"
+version = "0.12.0-alpha"
 dependencies = [
  "snafu 0.8.2",
  "tracing",
@@ -5248,7 +5248,7 @@ dependencies = [
  "once_cell",
  "percent-encoding",
  "pin-project-lite",
- "rustls 0.21.10",
+ "rustls 0.21.11",
  "rustls-native-certs 0.6.3",
  "rustls-pemfile 1.0.4",
  "serde",
@@ -5335,7 +5335,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "0.11.1-alpha"
+version = "0.12.0-alpha"
 dependencies = [
  "app",
  "arrow",
@@ -5491,9 +5491,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.21.10"
+version = "0.21.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f9d5a6813c0759e4609cd494e8e725babae6a2ca7b62a5536a13daaec6fcb7ba"
+checksum = "7fecbfb7b1444f477b345853b1fce097a2c6fb637b2bfb87e6bc5db0f043fae4"
 dependencies = [
  "log",
  "ring",
@@ -5756,7 +5756,7 @@ dependencies = [
 
 [[package]]
 name = "secrets"
-version = "0.11.1-alpha"
+version = "0.12.0-alpha"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -6067,7 +6067,7 @@ dependencies = [
 
 [[package]]
 name = "spiced"
-version = "0.11.1-alpha"
+version = "0.12.0-alpha"
 dependencies = [
  "app",
  "clap",
@@ -6083,7 +6083,7 @@ dependencies = [
 
 [[package]]
 name = "spicepod"
-version = "0.11.1-alpha"
+version = "0.12.0-alpha"
 dependencies = [
  "fundu",
  "serde",
@@ -6100,7 +6100,7 @@ checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
 
 [[package]]
 name = "sql_provider_datafusion"
-version = "0.11.1-alpha"
+version = "0.12.0-alpha"
 dependencies = [
  "arrow",
  "async-trait",
@@ -6536,7 +6536,7 @@ version = "0.24.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c28327cf380ac148141087fbfb9de9d7bd4e84ab5d2c28fbc911d753de8a7081"
 dependencies = [
- "rustls 0.21.10",
+ "rustls 0.21.11",
  "tokio",
 ]
 

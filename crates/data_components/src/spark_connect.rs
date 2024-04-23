@@ -5,6 +5,7 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::Field;
 use arrow::datatypes::{self, Schema, SchemaRef, TimeUnit};
 use async_stream::stream;
+use async_trait::async_trait;
 use datafusion::common::project_schema;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
@@ -25,7 +26,6 @@ use spark_connect_rs::{
     spark::{data_type, DataType},
     DataFrame, SparkSession,
 };
-use tonic::async_trait;
 
 use std::error::Error;
 

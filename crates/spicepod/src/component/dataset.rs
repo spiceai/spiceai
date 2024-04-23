@@ -46,7 +46,8 @@ pub enum TimeFormat {
     #[default]
     UnixSeconds,
     UnixMillis,
-    Iso8601,
+    #[serde(rename = "ISO8601")]
+    ISO8601,
 }
 
 impl std::fmt::Display for TimeFormat {
@@ -367,7 +368,7 @@ pub mod acceleration {
         pub retention_check_interval: Option<String>,
 
         #[serde(default)]
-        pub retention_enabled: bool,
+        pub retention_check_enabled: bool,
     }
 
     const fn default_true() -> bool {
