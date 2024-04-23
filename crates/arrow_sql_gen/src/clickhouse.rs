@@ -34,7 +34,7 @@ use clickhouse_rs::{
 };
 use snafu::{ResultExt, Snafu};
 
-use crate::arrow::map_data_type_to_array_builder_optional;
+use crate::arrow::map_data_type_to_array_builder;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -141,13 +141,8 @@ pub fn block_to_arrow(block: &Block<Complex>) -> Result<RecordBatch> {
             let column_name = column.name();
             let column_type = column.sql_type();
             let data_type = map_column_to_data_type(&column_type);
-            arrow_fields.push(
-                data_type
-                    .clone()
-                    .map(|data_type| Field::new(column_name, data_type.clone(), true)),
-            );
-            arrow_columns_builders
-                .push(map_data_type_to_array_builder_optional(data_type.as_ref()));
+            arrow_fields.push(Some(Field::new(column_name, data_type.clone(), true)));
+            arrow_columns_builders.push(Some(map_data_type_to_array_builder(&data_type)));
             clickhouse_types.push(column_type);
             column_names.push(column_name.to_string());
         }
@@ -514,28 +509,26 @@ pub fn block_to_arrow(block: &Block<Complex>) -> Result<RecordBatch> {
         .map_err(|err| Error::FailedToBuildRecordBatch { source: err })
 }
 
-#[allow(clippy::unnecessary_wraps)]
-fn map_column_to_data_type(column_type: &SqlType) -> Option<DataType> {
+fn map_column_to_data_type(column_type: &SqlType) -> DataType {
     match column_type {
-        SqlType::Uuid => Some(DataType::FixedSizeBinary(16)),
-        SqlType::Bool => Some(DataType::Boolean),
-        SqlType::Int8 => Some(DataType::Int8),
-        SqlType::Int16 => Some(DataType::Int16),
-        SqlType::Int32 => Some(DataType::Int32),
-        SqlType::Int64 => Some(DataType::Int64),
-        SqlType::UInt8 => Some(DataType::UInt8),
-        SqlType::UInt16 => Some(DataType::UInt16),
-        SqlType::UInt32 => Some(DataType::UInt32),
-        SqlType::UInt64 => Some(DataType::UInt64),
-        SqlType::Float32 => Some(DataType::Float32),
-        SqlType::Float64 => Some(DataType::Float64),
-        SqlType::String | SqlType::FixedString(_) => Some(DataType::Utf8),
-        SqlType::Date => Some(DataType::Date32),
-        SqlType::DateTime(_) => Some(DataType::Timestamp(TimeUnit::Second, None)),
-        SqlType::Decimal(size, align) => Some(DataType::Decimal128(
-            *size,
-            (*align).try_into().unwrap_or_default(),
-        )),
+        SqlType::Uuid => DataType::FixedSizeBinary(16),
+        SqlType::Bool => DataType::Boolean,
+        SqlType::Int8 => DataType::Int8,
+        SqlType::Int16 => DataType::Int16,
+        SqlType::Int32 => DataType::Int32,
+        SqlType::Int64 => DataType::Int64,
+        SqlType::UInt8 => DataType::UInt8,
+        SqlType::UInt16 => DataType::UInt16,
+        SqlType::UInt32 => DataType::UInt32,
+        SqlType::UInt64 => DataType::UInt64,
+        SqlType::Float32 => DataType::Float32,
+        SqlType::Float64 => DataType::Float64,
+        SqlType::String | SqlType::FixedString(_) => DataType::Utf8,
+        SqlType::Date => DataType::Date32,
+        SqlType::DateTime(_) => DataType::Timestamp(TimeUnit::Second, None),
+        SqlType::Decimal(size, align) => {
+            DataType::Decimal128(*size, (*align).try_into().unwrap_or_default())
+        }
         SqlType::Nullable(inner) => map_column_to_data_type(inner),
         _ => unimplemented!("Unsupported column type {:?}", column_type),
     }
