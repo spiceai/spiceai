@@ -81,7 +81,7 @@ impl<'a> AsyncDbConnection<ClientHandle, &'a (dyn Sync)> for ClickhouseConnectio
             .fetch_all()
             .await
             .context(QuerySnafu)?;
-        let rec = block_to_arrow(block).context(ConversionSnafu)?;
+        let rec = block_to_arrow(&block).context(ConversionSnafu)?;
         Ok(rec.schema())
     }
 
@@ -93,7 +93,7 @@ impl<'a> AsyncDbConnection<ClientHandle, &'a (dyn Sync)> for ClickhouseConnectio
         let mut conn = self.conn.lock().await;
         let conn = &mut *conn;
         let block = conn.query(sql).fetch_all().await.context(QuerySnafu)?;
-        let rec = block_to_arrow(block).context(ConversionSnafu)?;
+        let rec = block_to_arrow(&block).context(ConversionSnafu)?;
         let schema = rec.schema();
         let recs = vec![rec];
 

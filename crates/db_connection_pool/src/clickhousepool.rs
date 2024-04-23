@@ -51,6 +51,11 @@ pub struct ClickhouseConnectionPool {
 }
 
 impl ClickhouseConnectionPool {
+    // Creates a new instance of `ClickhouseConnectionPool`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if there is a problem creating the connection pool.
     #[allow(clippy::unused_async)]
     pub async fn new(
         params: Arc<Option<HashMap<String, String>>>,
