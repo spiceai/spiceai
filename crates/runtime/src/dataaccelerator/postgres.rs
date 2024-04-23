@@ -28,7 +28,7 @@ use super::DataAccelerator;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to create table: {source}"))]
+    #[snafu(display("{source}"))]
     UnableToCreateTable {
         source: datafusion::error::DataFusionError,
     },

@@ -38,7 +38,7 @@ pub enum Error {
         source: bb8_postgres::tokio_postgres::Error,
     },
 
-    #[snafu(display("ConnectionPoolRunError: {source}"))]
+    #[snafu(display("ConnectionPoolRunError, possible invalid Postgres parameters: {source}"))]
     ConnectionPoolRunError {
         source: bb8::RunError<bb8_postgres::tokio_postgres::Error>,
     },
@@ -139,7 +139,7 @@ impl PostgresConnectionPool {
         };
 
         connection_string.push_str(format!("sslmode={mode} ").as_str());
-        let config = Config::from_str(connection_string.as_str())?;
+        let config = Config::from_str(connection_string.as_str()).context(ConnectionPoolSnafu)?;
 
         for host in config.get_hosts() {
             for port in config.get_ports() {
@@ -166,10 +166,11 @@ impl PostgresConnectionPool {
         let pool = bb8::Pool::builder()
             .error_sink(Box::new(error_sink))
             .build(manager)
-            .await?;
+            .await
+            .context(ConnectionPoolSnafu)?;
 
         // Test the connection
-        let conn = pool.get().await?;
+        let conn = pool.get().await.context(ConnectionPoolRunSnafu)?;
         conn.execute("SELECT 1", &[]).await?;
 
         Ok(PostgresConnectionPool {
