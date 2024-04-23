@@ -601,9 +601,10 @@ fn map_column_to_data_type(column_type: &SqlType) -> Option<DataType> {
         SqlType::String | SqlType::FixedString(_) => Some(DataType::Utf8),
         SqlType::Date => Some(DataType::Date32),
         SqlType::DateTime(_) => Some(DataType::Timestamp(TimeUnit::Second, None)),
-        SqlType::Decimal(size, align) => {
-            Some(DataType::Decimal128(*size, (*align).try_into().unwrap()))
-        }
+        SqlType::Decimal(size, align) => Some(DataType::Decimal128(
+            *size,
+            (*align).try_into().unwrap_or_default(),
+        )),
         SqlType::Nullable(inner) => map_column_to_data_type(inner),
         _ => unimplemented!("Unsupported column type {:?}", column_type),
     }
