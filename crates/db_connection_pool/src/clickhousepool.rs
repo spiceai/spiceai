@@ -46,11 +46,11 @@ pub enum Error {
     InvalidParameterError { parameter_name: String },
 }
 
-pub struct ClickhousePool {
+pub struct ClickhouseConnectionPool {
     pool: Arc<Pool>,
 }
 
-impl ClickhousePool {
+impl ClickhouseConnectionPool {
     #[allow(clippy::unused_async)]
     pub async fn new(
         params: Arc<Option<HashMap<String, String>>>,
@@ -114,7 +114,7 @@ pub fn get_secret_or_param(
 }
 
 #[async_trait]
-impl DbConnectionPool<ClientHandle, &'static (dyn Sync)> for ClickhousePool {
+impl DbConnectionPool<ClientHandle, &'static (dyn Sync)> for ClickhouseConnectionPool {
     async fn connect(&self) -> Result<Box<dyn DbConnection<ClientHandle, &'static (dyn Sync)>>> {
         let pool = Arc::clone(&self.pool);
         let conn = pool.get_handle().await.context(ConnectionPoolRunSnafu)?;
