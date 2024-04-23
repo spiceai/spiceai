@@ -18,7 +18,7 @@ use std::borrow::Borrow;
 
 use arrow::{
     array::{
-        ArrayBuilder, BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder, FixedSizeBinaryBuilder, Float32Builder, Float64Builder, Int16Builder, Int32Builder, Int64Builder, Int8Builder, ListBuilder, StringBuilder, TimestampMicrosecondBuilder, TimestampMillisecondBuilder, TimestampNanosecondBuilder, TimestampSecondBuilder, UInt64Builder
+        ArrayBuilder, BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder, FixedSizeBinaryBuilder, Float32Builder, Float64Builder, Int16Builder, Int32Builder, Int64Builder, Int8Builder, ListBuilder, StringBuilder, TimestampMicrosecondBuilder, TimestampMillisecondBuilder, TimestampNanosecondBuilder, TimestampSecondBuilder, UInt16Builder, UInt32Builder, UInt64Builder, UInt8Builder
     },
     datatypes::{DataType, TimeUnit},
 };
@@ -38,6 +38,9 @@ pub fn map_data_type_to_array_builder(data_type: &DataType) -> Box<dyn ArrayBuil
         DataType::Int16 => Box::new(Int16Builder::new()),
         DataType::Int32 => Box::new(Int32Builder::new()),
         DataType::Int64 => Box::new(Int64Builder::new()),
+        DataType::UInt8 => Box::new(UInt8Builder::new()),
+        DataType::UInt16 => Box::new(UInt16Builder::new()),
+        DataType::UInt32 => Box::new(UInt32Builder::new()),
         DataType::UInt64 => Box::new(UInt64Builder::new()),
         DataType::Float32 => Box::new(Float32Builder::new()),
         DataType::Float64 => Box::new(Float64Builder::new()),

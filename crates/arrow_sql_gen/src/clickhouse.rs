@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use arrow::{
     array::{
-        ArrayBuilder, ArrayRef, BooleanBuilder, Date32Builder, FixedSizeBinaryBuilder, Float32Builder, Float64Builder, Int16Builder, Int32Builder, Int64Builder, Int8Builder, RecordBatch, RecordBatchOptions, StringBuilder, UInt8Builder
+        ArrayBuilder, ArrayRef, BooleanBuilder, Date32Builder, FixedSizeBinaryBuilder, Float32Builder, Float64Builder, Int16Builder, Int32Builder, Int64Builder, Int8Builder, RecordBatch, RecordBatchOptions, StringBuilder, UInt16Builder, UInt32Builder, UInt64Builder, UInt8Builder
     },
     datatypes::{DataType, Date32Type, Field, Schema},
 };
@@ -150,6 +150,15 @@ pub fn block_to_arrow(block: &Block<Complex>) -> Result<RecordBatch> {
                 SqlType::UInt8 => {
                     handle_primitive_type!(builder, SqlType::UInt8, UInt8Builder, u8, row, i);
                 }
+                SqlType::UInt16 => {
+                    handle_primitive_type!(builder, SqlType::UInt16, UInt16Builder, u16, row, i);
+                }
+                SqlType::UInt32 => {
+                    handle_primitive_type!(builder, SqlType::UInt32, UInt32Builder, u32, row, i);
+                }
+                SqlType::UInt64 => {
+                    handle_primitive_type!(builder, SqlType::UInt64, UInt64Builder, u64, row, i);
+                }
                 SqlType::Float32 => {
                     handle_primitive_type!(builder, SqlType::Float32, Float32Builder, f32, row, i);
                 }
@@ -201,6 +210,9 @@ fn map_column_to_data_type(column_type: &SqlType) -> Option<DataType> {
         SqlType::Int32 => Some(DataType::Int32),
         SqlType::Int64 => Some(DataType::Int64),
         SqlType::UInt8 => Some(DataType::UInt8),
+        SqlType::UInt16 => Some(DataType::UInt16),
+        SqlType::UInt32 => Some(DataType::UInt32),
+        SqlType::UInt64 => Some(DataType::UInt64),
         SqlType::Float32 => Some(DataType::Float32),
         SqlType::Float64 => Some(DataType::Float64),
         SqlType::String => Some(DataType::Utf8),
