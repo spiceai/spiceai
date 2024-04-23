@@ -31,7 +31,7 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::Receiver;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::datafusion::Retention;
+use crate::datafusion::{Refresh, Retention};
 use crate::execution_plan::slice::SliceExec;
 use crate::execution_plan::tee::TeeExec;
 use crate::{
@@ -98,22 +98,20 @@ impl AcceleratedTable {
         dataset_name: String,
         federated: Arc<dyn TableProvider>,
         accelerator: Arc<dyn TableProvider>,
-        refresh_mode: RefreshMode,
-        refresh_interval: Option<Duration>,
-        refresh_sql: Option<String>,
+        refresh: Refresh,
         retention: Option<Retention>,
         object_store: Option<(Url, Arc<dyn ObjectStore + 'static>)>,
     ) -> Self {
         let mut refresh_trigger = None;
         let mut scheduled_refreshes_handle: Option<JoinHandle<()>> = None;
 
-        let acceleration_refresh_mode: AccelerationRefreshMode = match refresh_mode {
+        let acceleration_refresh_mode: AccelerationRefreshMode = match refresh.mode {
             RefreshMode::Append => AccelerationRefreshMode::Append,
             RefreshMode::Full => {
                 let (trigger, receiver) = mpsc::channel::<()>(1);
                 refresh_trigger = Some(trigger.clone());
                 scheduled_refreshes_handle =
-                    Self::schedule_regular_refreshes(refresh_interval, trigger).await;
+                    Self::schedule_regular_refreshes(refresh.check_interval, trigger).await;
                 AccelerationRefreshMode::Full(receiver)
             }
         };
@@ -122,7 +120,8 @@ impl AcceleratedTable {
             dataset_name.clone(),
             Arc::clone(&federated),
             acceleration_refresh_mode,
-            refresh_sql,
+            refresh.sql,
+            refresh.period,
             Arc::clone(&accelerator),
             object_store,
         ));
@@ -273,9 +272,13 @@ impl AcceleratedTable {
         federated: Arc<dyn TableProvider>,
         acceleration_refresh_mode: AccelerationRefreshMode,
         refresh_sql: Option<String>,
+        refresh_period: Option<Duration>,
         accelerator: Arc<dyn TableProvider>,
         object_store: Option<(Url, Arc<dyn ObjectStore + 'static>)>,
     ) {
+        // TODO: handle this in following PR
+        _ = refresh_period;
+
         let mut stream = Self::stream_updates(
             dataset_name.clone(),
             federated,

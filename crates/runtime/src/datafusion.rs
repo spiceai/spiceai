@@ -35,6 +35,7 @@ use datafusion::sql::sqlparser;
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use secrets::Secret;
 use snafu::prelude::*;
+use spicepod::component::dataset::acceleration::RefreshMode;
 use spicepod::component::dataset::{Dataset, Mode, TimeFormat};
 use tokio::spawn;
 use tokio::time::{sleep, Instant};
@@ -158,6 +159,31 @@ impl Retention {
             })
         } else {
             None
+        }
+    }
+}
+
+pub(crate) struct Refresh {
+    pub(crate) check_interval: Option<Duration>,
+    pub(crate) sql: Option<String>,
+    pub(crate) mode: RefreshMode,
+    pub(crate) period: Option<Duration>,
+}
+
+impl Refresh {
+    #[allow(clippy::needless_pass_by_value)]
+    #[must_use]
+    pub(crate) fn new(
+        check_interval: Option<Duration>,
+        sql: Option<String>,
+        mode: RefreshMode,
+        period: Option<Duration>,
+    ) -> Self {
+        Self {
+            check_interval,
+            sql,
+            mode,
+            period,
         }
     }
 }
@@ -324,9 +350,12 @@ impl DataFusion {
             dataset.name.to_string(),
             source_table_provider,
             accelerated_table_provider,
-            acceleration_settings.refresh_mode.clone(),
-            dataset.refresh_interval(),
-            dataset.refresh_sql(),
+            Refresh::new(
+                dataset.refresh_interval(),
+                refresh_sql.clone(),
+                acceleration_settings.refresh_mode.clone(),
+                dataset.refresh_period(),
+            ),
             Retention::new(
                 dataset.time_column.clone(),
                 dataset.time_format.clone(),

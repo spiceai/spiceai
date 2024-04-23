@@ -251,6 +251,24 @@ impl Dataset {
     }
 
     #[must_use]
+    pub fn refresh_period(&self) -> Option<Duration> {
+        if let Some(acceleration) = &self.acceleration {
+            if let Some(refresh_period) = &acceleration.refresh_period {
+                if let Ok(duration) = fundu::parse_duration(refresh_period) {
+                    return Some(duration);
+                }
+                tracing::warn!(
+                    "Unable to parse refresh period for dataset {}: {}",
+                    self.name,
+                    refresh_period
+                );
+            }
+        }
+
+        None
+    }
+
+    #[must_use]
     pub fn is_view(&self) -> bool {
         self.sql.is_some() || self.sql_ref.is_some()
     }
@@ -354,6 +372,9 @@ pub mod acceleration {
 
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub refresh_sql: Option<String>,
+
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub refresh_period: Option<String>,
 
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub params: Option<Params>,
