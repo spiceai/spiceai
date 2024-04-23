@@ -23,12 +23,12 @@ pub mod dbconnection;
 pub mod duckdbpool;
 #[cfg(feature = "mysql")]
 pub mod mysqlpool;
+#[cfg(feature = "odbc")]
+pub mod odbcpool;
 #[cfg(feature = "postgres")]
 pub mod postgrespool;
 #[cfg(feature = "sqlite")]
 pub mod sqlitepool;
-#[cfg(feature = "odbc")]
-pub mod odbcpool;
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 type Result<T, E = Error> = std::result::Result<T, E>;

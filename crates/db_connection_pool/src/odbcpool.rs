@@ -14,16 +14,19 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::dbconnection::odbcconn::ODBCParameter;
+use crate::dbconnection::AsyncDbConnection;
+use crate::dbconnection::{odbcconn::ODBCConnection, DbConnection};
+use async_trait::async_trait;
+use odbc_api::{
+    buffers::Item, sys::AttrConnectionPooling, Connection, ConnectionOptions, Environment,
+    IntoParameter,
+};
+use secrets::Secret;
+use snafu::{ensure, ResultExt, Snafu};
 use std::borrow::Borrow;
 use std::sync::Mutex;
 use std::{any::Any, collections::HashMap, path::PathBuf, sync::Arc};
-use async_trait::async_trait;
-use odbc_api::{buffers::Item, sys::AttrConnectionPooling, Connection, ConnectionOptions, Environment, IntoParameter};
-use secrets::Secret;
-use snafu::{ensure, ResultExt, Snafu};
-use crate::dbconnection::AsyncDbConnection;
-use crate::dbconnection::{odbcconn::ODBCConnection, DbConnection};
-use crate::dbconnection::odbcconn::ODBCParameter;
 
 use super::{DbConnectionPool, Result};
 use lazy_static::lazy_static;
@@ -46,30 +49,36 @@ pub enum Error {
 }
 
 pub struct ODBCPool {
-  pool: &'static Environment,
-  params: Arc<Option<HashMap<String, String>>>,
+    pool: &'static Environment,
+    params: Arc<Option<HashMap<String, String>>>,
 }
 
 impl ODBCPool {
-  pub async fn new(
-    params: Arc<Option<HashMap<String, String>>>,
-    secret: Option<Secret>,
-  ) -> Result<Self> {
-    Ok(Self { params, pool: &ENV })
-  }
+    pub async fn new(
+        params: Arc<Option<HashMap<String, String>>>,
+        secret: Option<Secret>,
+    ) -> Result<Self> {
+        Ok(Self { params, pool: &ENV })
+    }
 }
 
 #[async_trait]
-impl<'a> DbConnectionPool<Connection<'a>, &'a ODBCParameter> for ODBCPool where 'a: 'static {
-    async fn connect(
-        &self,
-    ) -> Result<Box<dyn DbConnection<Connection<'a>, &'a ODBCParameter>>> {
-      if let Some(params) = self.params.as_ref() {
-        let url = params.get("url").expect("Must provide URL");
-        let cxn = self.pool.connect_with_connection_string(url.as_str(), ConnectionOptions::default())?;
-        Ok(Box::new(ODBCConnection::new(cxn)))
-      } else {
-        InvalidParameterSnafu { parameter_name: "url".to_string() }.fail()?
-      }
+impl<'a> DbConnectionPool<Connection<'a>, &'a ODBCParameter> for ODBCPool
+where
+    'a: 'static,
+{
+    async fn connect(&self) -> Result<Box<dyn DbConnection<Connection<'a>, &'a ODBCParameter>>> {
+        if let Some(params) = self.params.as_ref() {
+            let url = params.get("url").expect("Must provide URL");
+            let cxn = self
+                .pool
+                .connect_with_connection_string(url.as_str(), ConnectionOptions::default())?;
+            Ok(Box::new(ODBCConnection::new(cxn)))
+        } else {
+            InvalidParameterSnafu {
+                parameter_name: "url".to_string(),
+            }
+            .fail()?
+        }
     }
 }
