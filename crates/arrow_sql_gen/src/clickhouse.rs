@@ -141,8 +141,7 @@ pub fn block_to_arrow(block: Block<Complex>) -> Result<RecordBatch> {
         .filter_map(|builder| builder.map(|mut b| b.finish()))
         .collect::<Vec<ArrayRef>>();
     let arrow_fields = arrow_fields.into_iter().flatten().collect::<Vec<Field>>();
-    // TODO assign correct size
-    let options = &RecordBatchOptions::new().with_row_count(Some(0));
+    let options = &RecordBatchOptions::new().with_row_count(Some(block.row_count()));
     RecordBatch::try_new_with_options(Arc::new(Schema::new(arrow_fields)), columns, options)
         .map_err(|err| Error::FailedToBuildRecordBatch { source: err })
 }
