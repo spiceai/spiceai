@@ -28,6 +28,8 @@ use datafusion::sql::TableReference;
 use rusqlite::ToSql;
 use snafu::whatever;
 
+use crate::DbConnectionPool;
+
 use super::AsyncDbConnection;
 use super::DbConnection;
 use super::Result;
@@ -38,6 +40,9 @@ use odbc_api::{
 };
 
 pub type ODBCParameter = (dyn IntoParameter<Parameter = dyn Any> + Sync);
+pub type ODBCDbConnection<'a> = (dyn DbConnection<Connection<'a>, ODBCParameter>);
+pub type ODBCDbConnectionPool<'a> =
+    dyn DbConnectionPool<Connection<'a>, &'a ODBCParameter> + Send + Sync;
 
 pub struct ODBCConnection<'a> {
     pub conn: Arc<Mutex<Connection<'a>>>,

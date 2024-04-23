@@ -2291,6 +2291,7 @@ version = "0.11.1-alpha"
 dependencies = [
  "arrow 51.0.0",
  "arrow-flight",
+ "arrow-odbc",
  "arrow_sql_gen",
  "async-stream",
  "async-trait",
@@ -2303,6 +2304,7 @@ dependencies = [
  "flight_client",
  "futures",
  "mysql_async",
+ "odbc-api",
  "postgres-native-tls",
  "r2d2",
  "reqwest",
