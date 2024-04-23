@@ -110,6 +110,9 @@ pub fn block_to_arrow(block: &Block<Complex>) -> Result<RecordBatch> {
             };
 
             match *clickhouse_type {
+                SqlType::Uuid => {
+                    handle_primitive_type!(builder, SqlType::Uuid, StringBuilder, String, row, i);
+                }
                 SqlType::Bool => {
                     handle_primitive_type!(builder, SqlType::Bool, BooleanBuilder, bool, row, i);
                 }
@@ -152,6 +155,7 @@ pub fn block_to_arrow(block: &Block<Complex>) -> Result<RecordBatch> {
 #[allow(clippy::unnecessary_wraps)]
 fn map_column_to_data_type(column_type: &SqlType) -> Option<DataType> {
     match column_type {
+        SqlType::Uuid => Some(DataType::Utf8),
         SqlType::Bool => Some(DataType::Boolean),
         SqlType::Int8 => Some(DataType::Int8),
         SqlType::Int16 => Some(DataType::Int16),
