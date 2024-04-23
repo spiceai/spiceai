@@ -57,6 +57,11 @@ impl ClickhouseConnectionPool {
         secret: Option<Secret>,
     ) -> Result<Self> {
         let mut options = Options::default();
+        let mut host: &str = "localhost";
+        let mut user: &str = "default";
+        let mut db: &str = "default";
+        let mut pass: String = "password".to_string();
+        let mut tcp_port: &str = "9000";
 
         if let Some(params) = params.as_ref() {
             if let Some(clickhouse_connection_string) = get_secret_or_param(
@@ -68,19 +73,31 @@ impl ClickhouseConnectionPool {
                 options = Options::from_str(&clickhouse_connection_string)
                     .context(InvalidConnectionStringSnafu)?;
             } else {
-                if let Some(clickhouse_host) = params.get("clickhouse_host") {}
-                if let Some(clickhouse_user) = params.get("clickhouse_user") {}
-                if let Some(clickhouse_db) = params.get("clickhouse_db") {}
+                if let Some(clickhouse_host) = params.get("clickhouse_host") {
+                    host = clickhouse_host;
+                }
+                if let Some(clickhouse_user) = params.get("clickhouse_user") {
+                    user = clickhouse_user;
+                }
+                if let Some(clickhouse_db) = params.get("clickhouse_db") {
+                    db = clickhouse_db;
+                }
                 if let Some(clickhouse_pass) =
                     get_secret_or_param(params, &secret, "clickhouse_pass_key", "clickhouse_pass")
                 {
+                    pass = clickhouse_pass;
                 }
-                if let Some(clickhouse_tcp_port) = params.get("clickhouse_tcp_port") {}
-                if let Some(clickhouse_sslmode) = params.get("clickhouse_ssl_secure") {}
+                if let Some(clickhouse_tcp_port) = params.get("clickhouse_tcp_port") {
+                    tcp_port = clickhouse_tcp_port;
+                }
+                let connection_string = format!("tcp://{user}:{pass}@{host}:{tcp_port}/{db}");
+                options =
+                    Options::from_str(&connection_string).context(InvalidConnectionStringSnafu)?;
             }
         }
 
         let pool = Pool::new(options);
+
         Ok(Self {
             pool: Arc::new(pool),
         })

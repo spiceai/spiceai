@@ -63,15 +63,12 @@ macro_rules! handle_primitive_type {
             .fail();
         };
         let v = $row
-            .get::<Option<$value_ty>, usize>($index)
+            .get::<$value_ty, usize>($index)
             .context(FailedToGetRowValueSnafu {
                 clickhouse_type: $type,
             })?;
 
-        match v {
-            Some(v) => builder.append_value(v),
-            None => builder.append_null(),
-        }
+        builder.append_value(v)
     }};
 }
 
