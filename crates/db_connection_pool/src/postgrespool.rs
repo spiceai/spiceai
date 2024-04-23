@@ -282,7 +282,7 @@ impl
         >,
     > {
         let pool = Arc::clone(&self.pool);
-        let conn = pool.get_owned().await?;
+        let conn = pool.get_owned().await.context(ConnectionPoolRunSnafu)?;
         Ok(Box::new(PostgresConnection::new(conn)))
     }
 }
