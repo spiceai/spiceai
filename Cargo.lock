@@ -447,6 +447,7 @@ dependencies = [
  "bigdecimal 0.3.1",
  "bigdecimal 0.4.3",
  "chrono",
+ "chrono-tz",
  "clickhouse-rs",
  "mysql_async",
  "rusqlite",

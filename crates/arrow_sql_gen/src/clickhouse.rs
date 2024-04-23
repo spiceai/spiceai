@@ -18,11 +18,12 @@ use std::sync::Arc;
 
 use arrow::{
     array::{
-        ArrayBuilder, ArrayRef, BooleanBuilder, Date32Builder, FixedSizeBinaryBuilder, Float32Builder, Float64Builder, Int16Builder, Int32Builder, Int64Builder, Int8Builder, RecordBatch, RecordBatchOptions, StringBuilder, UInt16Builder, UInt32Builder, UInt64Builder, UInt8Builder
+    ArrayBuilder, ArrayRef, BooleanBuilder, Date32Builder, FixedSizeBinaryBuilder, Float32Builder, Float64Builder, Int16Builder, Int32Builder, Int64Builder, Int8Builder, RecordBatch, RecordBatchOptions, StringBuilder, TimestampSecondBuilder, UInt16Builder, UInt32Builder, UInt64Builder, UInt8Builder
     },
-    datatypes::{DataType, Date32Type, Field, Schema},
+    datatypes::{DataType, Date32Type, Field, Schema, TimeUnit},
 };
 use chrono::NaiveDate;
+use chrono_tz::Tz;
 use clickhouse_rs::{
     types::{Complex, SqlType},
     Block,
@@ -185,6 +186,23 @@ pub fn block_to_arrow(block: &Block<Complex>) -> Result<RecordBatch> {
                         })?;
                     builder.append_value(Date32Type::from_naive_date(v));
                 }
+                SqlType::DateTime(date_type) => {
+                    let Some(builder) = builder else {
+                        return NoBuilderForIndexSnafu { index: i }.fail();
+                    };
+                    let Some(builder) = builder.as_any_mut().downcast_mut::<TimestampSecondBuilder>() else {
+                        return FailedToDowncastBuilderSnafu {
+                            clickhouse_type: format!("{:?}", SqlType::DateTime(date_type)),
+                        }
+                        .fail();
+                    };
+                    let v = row
+                                .get::<chrono::DateTime<Tz>, usize>(i)
+                                .context(FailedToGetRowValueSnafu {
+                                    clickhouse_type: SqlType::DateTime(date_type),
+                                })?;
+                    builder.append_value(v.timestamp());
+                }
                 _ => unimplemented!(),
             }
         }
@@ -217,6 +235,7 @@ fn map_column_to_data_type(column_type: &SqlType) -> Option<DataType> {
         SqlType::Float64 => Some(DataType::Float64),
         SqlType::String => Some(DataType::Utf8),
         SqlType::Date => Some(DataType::Date32),
+        SqlType::DateTime(_) => Some(DataType::Timestamp(TimeUnit::Second, None)),
         _ => unimplemented!("Unsupported column type {:?}", column_type),
     }
 }
