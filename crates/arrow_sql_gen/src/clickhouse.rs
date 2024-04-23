@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use arrow::{
     array::{
-        ArrayBuilder, ArrayRef, BooleanBuilder, Date32Builder, Float32Builder, Float64Builder, Int16Builder, Int32Builder, Int64Builder, Int8Builder, RecordBatch, RecordBatchOptions, StringBuilder
+        ArrayBuilder, ArrayRef, BooleanBuilder, Date32Builder, FixedSizeBinaryBuilder, Float32Builder, Float64Builder, Int16Builder, Int32Builder, Int64Builder, Int8Builder, RecordBatch, RecordBatchOptions, StringBuilder, UInt8Builder
     },
     datatypes::{DataType, Date32Type, Field, Schema},
 };
@@ -47,6 +47,9 @@ pub enum Error {
         clickhouse_type: SqlType,
         source: clickhouse_rs::errors::Error,
     },
+
+    #[snafu(display("Failed to append a row value for {}: {}", clickhouse_type, source))]
+    FailedToAppendRowValue { clickhouse_type: SqlType, source: arrow::error::ArrowError },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -111,7 +114,23 @@ pub fn block_to_arrow(block: &Block<Complex>) -> Result<RecordBatch> {
 
             match *clickhouse_type {
                 SqlType::Uuid => {
-                    handle_primitive_type!(builder, SqlType::Uuid, StringBuilder, String, row, i);
+                    let Some(builder) = builder else {
+                        return NoBuilderForIndexSnafu { index: i }.fail();
+                    };
+                    let Some(builder) = builder.as_any_mut().downcast_mut::<FixedSizeBinaryBuilder>() else {
+                        return FailedToDowncastBuilderSnafu {
+                            clickhouse_type: format!("{:?}", SqlType::Uuid),
+                        }
+                        .fail();
+                    };
+                    let v = row
+                        .get::<uuid::Uuid, usize>(i)
+                        .context(FailedToGetRowValueSnafu {
+                            clickhouse_type: SqlType::Uuid,
+                        })?;
+                    let _ = builder.append_value(v.as_bytes()).context(FailedToAppendRowValueSnafu {
+                        clickhouse_type: SqlType::Uuid,
+                    });
                 }
                 SqlType::Bool => {
                     handle_primitive_type!(builder, SqlType::Bool, BooleanBuilder, bool, row, i);
@@ -127,6 +146,9 @@ pub fn block_to_arrow(block: &Block<Complex>) -> Result<RecordBatch> {
                 }
                 SqlType::Int64 => {
                     handle_primitive_type!(builder, SqlType::Int64, Int64Builder, i64, row, i);
+                }
+                SqlType::UInt8 => {
+                    handle_primitive_type!(builder, SqlType::UInt8, UInt8Builder, u8, row, i);
                 }
                 SqlType::Float32 => {
                     handle_primitive_type!(builder, SqlType::Float32, Float32Builder, f32, row, i);
@@ -172,12 +194,13 @@ pub fn block_to_arrow(block: &Block<Complex>) -> Result<RecordBatch> {
 #[allow(clippy::unnecessary_wraps)]
 fn map_column_to_data_type(column_type: &SqlType) -> Option<DataType> {
     match column_type {
-        SqlType::Uuid => Some(DataType::Utf8),
+        SqlType::Uuid => Some(DataType::FixedSizeBinary(16)),
         SqlType::Bool => Some(DataType::Boolean),
         SqlType::Int8 => Some(DataType::Int8),
         SqlType::Int16 => Some(DataType::Int16),
         SqlType::Int32 => Some(DataType::Int32),
         SqlType::Int64 => Some(DataType::Int64),
+        SqlType::UInt8 => Some(DataType::UInt8),
         SqlType::Float32 => Some(DataType::Float32),
         SqlType::Float64 => Some(DataType::Float64),
         SqlType::String => Some(DataType::Utf8),

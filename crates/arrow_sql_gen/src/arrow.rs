@@ -14,12 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::borrow::Borrow;
+
 use arrow::{
     array::{
-        ArrayBuilder, BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder,
-        Float32Builder, Float64Builder, Int16Builder, Int32Builder, Int64Builder, Int8Builder,
-        ListBuilder, StringBuilder, TimestampMicrosecondBuilder, TimestampMillisecondBuilder,
-        TimestampNanosecondBuilder, TimestampSecondBuilder, UInt64Builder,
+        ArrayBuilder, BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder, FixedSizeBinaryBuilder, Float32Builder, Float64Builder, Int16Builder, Int32Builder, Int64Builder, Int8Builder, ListBuilder, StringBuilder, TimestampMicrosecondBuilder, TimestampMillisecondBuilder, TimestampNanosecondBuilder, TimestampSecondBuilder, UInt64Builder
     },
     datatypes::{DataType, TimeUnit},
 };
@@ -78,6 +77,7 @@ pub fn map_data_type_to_array_builder(data_type: &DataType) -> Box<dyn ArrayBuil
             DataType::Boolean => Box::new(ListBuilder::new(BooleanBuilder::new())),
             _ => unimplemented!("Unsupported list value data type {:?}", data_type),
         },
+        DataType::FixedSizeBinary(size) => Box::new(FixedSizeBinaryBuilder::new(*size)),
         _ => unimplemented!("Unsupported data type {:?}", data_type),
     }
 }
