@@ -98,6 +98,30 @@ macro_rules! handle_primitive_type {
     }};
 }
 
+macro_rules! handle_primitive_nullable_type {
+    ($builder:expr, $type:expr, $builder_ty:ty, $value_ty:ty, $row:expr, $index:expr) => {{
+        let Some(builder) = $builder else {
+            return NoBuilderForIndexSnafu { index: $index }.fail();
+        };
+        let Some(builder) = builder.as_any_mut().downcast_mut::<$builder_ty>() else {
+            return FailedToDowncastBuilderSnafu {
+                clickhouse_type: format!("{:?}", $type),
+            }
+            .fail();
+        };
+        let v = $row
+            .get::<Option<$value_ty>, usize>($index)
+            .context(FailedToGetRowValueSnafu {
+                clickhouse_type: $type,
+            })?;
+
+        match v {
+            Some(v) => builder.append_value(v),
+            None => builder.append_null(),
+        }
+    }};
+}
+
 /// Converts `Clickhouse` `Block` to an Arrow `RecordBatch`. Assumes that all rows have the same schema and
 /// sets the schema based on the `sql_type` returned for column.
 ///
@@ -165,46 +189,205 @@ pub fn block_to_arrow(block: &Block<Complex>) -> Result<RecordBatch> {
                                 clickhouse_type: SqlType::Uuid,
                             });
                 }
+                SqlType::Nullable(SqlType::Uuid) => {
+                    let Some(builder) = builder else {
+                        return NoBuilderForIndexSnafu { index: i }.fail();
+                    };
+                    let Some(builder) = builder
+                        .as_any_mut()
+                        .downcast_mut::<FixedSizeBinaryBuilder>()
+                    else {
+                        return FailedToDowncastBuilderSnafu {
+                            clickhouse_type: format!("{:?}", SqlType::Uuid),
+                        }
+                        .fail();
+                    };
+                    let v = row.get::<Option<uuid::Uuid>, usize>(i).context(
+                        FailedToGetRowValueSnafu {
+                            clickhouse_type: SqlType::Uuid,
+                        },
+                    )?;
+                    match v {
+                        Some(v) => {
+                            let _ = builder.append_value(v.as_bytes()).context(
+                                FailedToAppendRowValueSnafu {
+                                    clickhouse_type: SqlType::Uuid,
+                                },
+                            );
+                        }
+                        None => builder.append_null(),
+                    }
+                }
                 SqlType::Bool => {
                     handle_primitive_type!(builder, SqlType::Bool, BooleanBuilder, bool, row, i);
+                }
+                SqlType::Nullable(SqlType::Bool) => {
+                    handle_primitive_nullable_type!(
+                        builder,
+                        SqlType::Bool,
+                        BooleanBuilder,
+                        bool,
+                        row,
+                        i
+                    );
                 }
                 SqlType::Int8 => {
                     handle_primitive_type!(builder, SqlType::Int8, Int8Builder, i8, row, i);
                 }
+                SqlType::Nullable(SqlType::Int8) => {
+                    handle_primitive_nullable_type!(
+                        builder,
+                        SqlType::Int8,
+                        Int8Builder,
+                        i8,
+                        row,
+                        i
+                    );
+                }
                 SqlType::Int16 => {
                     handle_primitive_type!(builder, SqlType::Int16, Int16Builder, i16, row, i);
+                }
+                SqlType::Nullable(SqlType::Int16) => {
+                    handle_primitive_nullable_type!(
+                        builder,
+                        SqlType::Int16,
+                        Int16Builder,
+                        i16,
+                        row,
+                        i
+                    );
                 }
                 SqlType::Int32 => {
                     handle_primitive_type!(builder, SqlType::Int32, Int32Builder, i32, row, i);
                 }
+                SqlType::Nullable(SqlType::Int32) => {
+                    handle_primitive_nullable_type!(
+                        builder,
+                        SqlType::Int32,
+                        Int32Builder,
+                        i32,
+                        row,
+                        i
+                    );
+                }
                 SqlType::Int64 => {
                     handle_primitive_type!(builder, SqlType::Int64, Int64Builder, i64, row, i);
+                }
+                SqlType::Nullable(SqlType::Int64) => {
+                    handle_primitive_nullable_type!(
+                        builder,
+                        SqlType::Int64,
+                        Int64Builder,
+                        i64,
+                        row,
+                        i
+                    );
                 }
                 SqlType::UInt8 => {
                     handle_primitive_type!(builder, SqlType::UInt8, UInt8Builder, u8, row, i);
                 }
+                SqlType::Nullable(SqlType::UInt8) => {
+                    handle_primitive_nullable_type!(
+                        builder,
+                        SqlType::UInt8,
+                        UInt8Builder,
+                        u8,
+                        row,
+                        i
+                    );
+                }
                 SqlType::UInt16 => {
                     handle_primitive_type!(builder, SqlType::UInt16, UInt16Builder, u16, row, i);
+                }
+                SqlType::Nullable(SqlType::UInt16) => {
+                    handle_primitive_nullable_type!(
+                        builder,
+                        SqlType::UInt16,
+                        UInt16Builder,
+                        u16,
+                        row,
+                        i
+                    );
                 }
                 SqlType::UInt32 => {
                     handle_primitive_type!(builder, SqlType::UInt32, UInt32Builder, u32, row, i);
                 }
+                SqlType::Nullable(SqlType::UInt32) => {
+                    handle_primitive_nullable_type!(
+                        builder,
+                        SqlType::UInt32,
+                        UInt32Builder,
+                        u32,
+                        row,
+                        i
+                    );
+                }
                 SqlType::UInt64 => {
                     handle_primitive_type!(builder, SqlType::UInt64, UInt64Builder, u64, row, i);
+                }
+                SqlType::Nullable(SqlType::UInt64) => {
+                    handle_primitive_nullable_type!(
+                        builder,
+                        SqlType::UInt64,
+                        UInt64Builder,
+                        u64,
+                        row,
+                        i
+                    );
                 }
                 SqlType::Float32 => {
                     handle_primitive_type!(builder, SqlType::Float32, Float32Builder, f32, row, i);
                 }
+                SqlType::Nullable(SqlType::Float32) => {
+                    handle_primitive_nullable_type!(
+                        builder,
+                        SqlType::Float32,
+                        Float32Builder,
+                        f32,
+                        row,
+                        i
+                    );
+                }
                 SqlType::Float64 => {
                     handle_primitive_type!(builder, SqlType::Float64, Float64Builder, f64, row, i);
                 }
+                SqlType::Nullable(SqlType::Float64) => {
+                    handle_primitive_nullable_type!(
+                        builder,
+                        SqlType::Float64,
+                        Float64Builder,
+                        f64,
+                        row,
+                        i
+                    );
+                }
                 SqlType::String => {
                     handle_primitive_type!(builder, SqlType::String, StringBuilder, String, row, i);
+                }
+                SqlType::Nullable(SqlType::String) => {
+                    handle_primitive_nullable_type!(
+                        builder,
+                        SqlType::String,
+                        StringBuilder,
+                        String,
+                        row,
+                        i
+                    );
                 }
                 SqlType::FixedString(size) => {
                     handle_primitive_type!(
                         builder,
                         SqlType::FixedString(size),
+                        StringBuilder,
+                        String,
+                        row,
+                        i
+                    );
+                }
+                SqlType::Nullable(SqlType::FixedString(size)) => {
+                    handle_primitive_nullable_type!(
+                        builder,
+                        SqlType::FixedString(*size),
                         StringBuilder,
                         String,
                         row,
@@ -228,6 +411,26 @@ pub fn block_to_arrow(block: &Block<Complex>) -> Result<RecordBatch> {
                         })?;
                     builder.append_value(Date32Type::from_naive_date(v));
                 }
+                SqlType::Nullable(SqlType::Date) => {
+                    let Some(builder) = builder else {
+                        return NoBuilderForIndexSnafu { index: i }.fail();
+                    };
+                    let Some(builder) = builder.as_any_mut().downcast_mut::<Date32Builder>() else {
+                        return FailedToDowncastBuilderSnafu {
+                            clickhouse_type: format!("{:?}", SqlType::Date),
+                        }
+                        .fail();
+                    };
+                    let v = row.get::<Option<NaiveDate>, usize>(i).context(
+                        FailedToGetRowValueSnafu {
+                            clickhouse_type: SqlType::Date,
+                        },
+                    )?;
+                    match v {
+                        Some(v) => builder.append_value(Date32Type::from_naive_date(v)),
+                        None => builder.append_null(),
+                    }
+                }
                 SqlType::DateTime(date_type) => {
                     let Some(builder) = builder else {
                         return NoBuilderForIndexSnafu { index: i }.fail();
@@ -247,6 +450,29 @@ pub fn block_to_arrow(block: &Block<Complex>) -> Result<RecordBatch> {
                         },
                     )?;
                     builder.append_value(v.timestamp());
+                }
+                SqlType::Nullable(SqlType::DateTime(date_type)) => {
+                    let Some(builder) = builder else {
+                        return NoBuilderForIndexSnafu { index: i }.fail();
+                    };
+                    let Some(builder) = builder
+                        .as_any_mut()
+                        .downcast_mut::<TimestampSecondBuilder>()
+                    else {
+                        return FailedToDowncastBuilderSnafu {
+                            clickhouse_type: format!("{:?}", SqlType::DateTime(*date_type)),
+                        }
+                        .fail();
+                    };
+                    let v = row.get::<Option<chrono::DateTime<Tz>>, usize>(i).context(
+                        FailedToGetRowValueSnafu {
+                            clickhouse_type: SqlType::DateTime(*date_type),
+                        },
+                    )?;
+                    match v {
+                        Some(v) => builder.append_value(v.timestamp()),
+                        None => builder.append_null(),
+                    }
                 }
                 SqlType::Decimal(size, align) => {
                     let scale = align.try_into().unwrap_or_default();
@@ -291,6 +517,57 @@ pub fn block_to_arrow(block: &Block<Complex>) -> Result<RecordBatch> {
                     };
                     dec_builder.append_value(v);
                 }
+                SqlType::Nullable(SqlType::Decimal(size, align)) => {
+                    let size = *size;
+                    let align = *align;
+                    let scale = align.try_into().unwrap_or_default();
+                    let dec_builder = builder.get_or_insert_with(|| {
+                        Box::new(
+                            Decimal128Builder::new()
+                                .with_precision_and_scale(size, scale)
+                                .unwrap_or_default(),
+                        )
+                    });
+                    let Some(dec_builder) =
+                        dec_builder.as_any_mut().downcast_mut::<Decimal128Builder>()
+                    else {
+                        return FailedToDowncastBuilderSnafu {
+                            clickhouse_type: format!("{clickhouse_type}"),
+                        }
+                        .fail();
+                    };
+
+                    if arrow_field.is_none() {
+                        let Some(field_name) = column_names.get(i) else {
+                            return NoColumnNameForIndexSnafu { index: i }.fail();
+                        };
+                        let new_arrow_field =
+                            Field::new(field_name, DataType::Decimal128(size, scale), true);
+
+                        *arrow_field = Some(new_arrow_field);
+                    }
+
+                    let v =
+                        row.get::<Option<Decimal>, usize>(i)
+                            .context(FailedToGetRowValueSnafu {
+                                clickhouse_type: SqlType::Decimal(size, align),
+                            })?;
+                    match v {
+                        Some(v) => {
+                            let v = BigDecimal::from_str(v.to_string().as_str()).context(
+                                FailedToParseBigDecimalFromClickhouseSnafu {
+                                    value: v.to_string(),
+                                },
+                            )?;
+                            let Some(v) = to_decimal_128(&v, scale) else {
+                                return FailedToConvertBigDecimalToI128Snafu { big_decimal: v }
+                                    .fail();
+                            };
+                            dec_builder.append_value(v);
+                        }
+                        None => dec_builder.append_null(),
+                    }
+                }
                 _ => unimplemented!(),
             }
         }
@@ -327,6 +604,7 @@ fn map_column_to_data_type(column_type: &SqlType) -> Option<DataType> {
         SqlType::Decimal(size, align) => {
             Some(DataType::Decimal128(*size, (*align).try_into().unwrap()))
         }
+        SqlType::Nullable(inner) => map_column_to_data_type(inner),
         _ => unimplemented!("Unsupported column type {:?}", column_type),
     }
 }
