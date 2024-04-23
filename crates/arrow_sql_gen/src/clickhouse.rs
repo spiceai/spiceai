@@ -18,11 +18,11 @@ use std::sync::Arc;
 
 use arrow::{
     array::{
-        ArrayBuilder, ArrayRef, BooleanBuilder, Float32Builder, Float64Builder, Int16Builder,
-        Int32Builder, Int64Builder, Int8Builder, RecordBatch, RecordBatchOptions, StringBuilder,
+        ArrayBuilder, ArrayRef, BooleanBuilder, Date32Builder, Float32Builder, Float64Builder, Int16Builder, Int32Builder, Int64Builder, Int8Builder, RecordBatch, RecordBatchOptions, StringBuilder
     },
-    datatypes::{DataType, Field, Schema},
+    datatypes::{DataType, Date32Type, Field, Schema},
 };
+use chrono::NaiveDate;
 use clickhouse_rs::{
     types::{Complex, SqlType},
     Block,
@@ -137,6 +137,23 @@ pub fn block_to_arrow(block: &Block<Complex>) -> Result<RecordBatch> {
                 SqlType::String => {
                     handle_primitive_type!(builder, SqlType::String, StringBuilder, String, row, i);
                 }
+                SqlType::Date => {
+                    let Some(builder) = builder else {
+                        return NoBuilderForIndexSnafu { index: i }.fail();
+                    };
+                    let Some(builder) = builder.as_any_mut().downcast_mut::<Date32Builder>() else {
+                        return FailedToDowncastBuilderSnafu {
+                            clickhouse_type: format!("{:?}", SqlType::Date),
+                        }
+                        .fail();
+                    };
+                    let v = row
+                        .get::<NaiveDate, usize>(i)
+                        .context(FailedToGetRowValueSnafu {
+                            clickhouse_type: SqlType::Date,
+                        })?;
+                    builder.append_value(Date32Type::from_naive_date(v));
+                }
                 _ => unimplemented!(),
             }
         }
@@ -164,6 +181,7 @@ fn map_column_to_data_type(column_type: &SqlType) -> Option<DataType> {
         SqlType::Float32 => Some(DataType::Float32),
         SqlType::Float64 => Some(DataType::Float64),
         SqlType::String => Some(DataType::Utf8),
+        SqlType::Date => Some(DataType::Date32),
         _ => unimplemented!("Unsupported column type {:?}", column_type),
     }
 }
