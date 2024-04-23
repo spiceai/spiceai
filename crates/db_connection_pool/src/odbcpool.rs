@@ -14,10 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::dbconnection::odbcconn::ODBCParameter;
+use crate::dbconnection::odbcconn::{ODBCDbConnection, ODBCParameter};
 use crate::dbconnection::AsyncDbConnection;
 use crate::dbconnection::{odbcconn::ODBCConnection, DbConnection};
 use async_trait::async_trait;
+use odbc_api::parameter::InputParameter;
 use odbc_api::{
     buffers::Item, sys::AttrConnectionPooling, Connection, ConnectionOptions, Environment,
     IntoParameter,
@@ -56,7 +57,7 @@ pub struct ODBCPool {
 impl ODBCPool {
     pub async fn new(
         params: Arc<Option<HashMap<String, String>>>,
-        secret: Option<Secret>,
+        _secret: Option<Secret>,
     ) -> Result<Self> {
         Ok(Self { params, pool: &ENV })
     }
@@ -67,13 +68,18 @@ impl<'a> DbConnectionPool<Connection<'a>, &'a ODBCParameter> for ODBCPool
 where
     'a: 'static,
 {
-    async fn connect(&self) -> Result<Box<dyn DbConnection<Connection<'a>, &'a ODBCParameter>>> {
+    async fn connect(&self) -> Result<Box<ODBCDbConnection<'a>>> {
         if let Some(params) = self.params.as_ref() {
             let url = params.get("url").expect("Must provide URL");
             let cxn = self
                 .pool
                 .connect_with_connection_string(url.as_str(), ConnectionOptions::default())?;
-            Ok(Box::new(ODBCConnection::new(cxn)))
+
+            let odbc_cxn = ODBCConnection {
+                conn: Arc::new(cxn.into()),
+            };
+
+            Ok(Box::new(odbc_cxn))
         } else {
             InvalidParameterSnafu {
                 parameter_name: "url".to_string(),

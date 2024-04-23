@@ -32,6 +32,7 @@ use db_connection_pool::{
     dbconnection::odbcconn::{ODBCConnection, ODBCDbConnection, ODBCDbConnectionPool},
     odbcpool::ODBCPool,
 };
+use odbc_api::parameter::InputParameter;
 use snafu::prelude::*;
 use sql_provider_datafusion::SqlTable;
 use std::sync::Arc;
@@ -74,7 +75,7 @@ where
         table_reference: OwnedTableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         let pool = Arc::clone(&self.pool);
-        let dyn_pool: Arc<ODBCDbConnectionPool> = pool;
+        let dyn_pool: Arc<ODBCDbConnectionPool<'a>> = pool;
         let table_provider: SqlTable<_, _> = SqlTable::new(&dyn_pool, table_reference)
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;

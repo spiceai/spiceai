@@ -22,6 +22,8 @@ use db_connection_pool::dbconnection::odbcconn::ODBCDbConnectionPool;
 use db_connection_pool::odbcpool::ODBCPool;
 use db_connection_pool::DbConnectionPool;
 use mysql_async::prelude::ToValue;
+use odbc_api::parameter::InputParameter;
+use odbc_api::{Connection, IntoParameter};
 use secrets::Secret;
 use snafu::prelude::*;
 use spicepod::component::dataset::Dataset;
@@ -45,7 +47,10 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-pub struct ODBC<'a> {
+pub struct ODBC<'a>
+where
+    'a: 'static,
+{
     odbc_factory: ODBCTableFactory<'a>,
 }
 
@@ -58,7 +63,7 @@ where
         params: Arc<Option<HashMap<String, String>>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let pool: Arc<ODBCDbConnectionPool> = Arc::new(
+            let pool: Arc<ODBCDbConnectionPool<'a>> = Arc::new(
                 ODBCPool::new(params, secret)
                     .await
                     .context(UnableToCreateODBCConnectionPoolSnafu)?,

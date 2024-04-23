@@ -6450,6 +6450,7 @@ dependencies = [
  "notify",
  "ns_lookup",
  "object_store",
+ "odbc-api",
  "once_cell",
  "opentelemetry-proto",
  "pin-project",
