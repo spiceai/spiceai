@@ -49,4 +49,4 @@ postgres = [
 ]
 sqlite = ["dep:rusqlite", "dep:tokio-rusqlite", "arrow_sql_gen/sqlite", "spicepod/sqlite"]
 mysql = ["dep:mysql_async", "arrow_sql_gen/mysql", "spicepod/mysql"]
-clickhouse = ["dep:clickhouse-rs", "arrow_sql_gen/clickhouse", "spicepod/clickhouse"]
+clickhouse = ["dep:clickhouse-rs", "arrow_sql_gen/clickhouse"]
