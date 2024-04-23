@@ -45,7 +45,7 @@ pub enum Error {
     NoBuilderForIndex { index: usize },
 
     #[snafu(display("Failed to downcast builder for {clickhouse_type}"))]
-    FailedToDowncastBuilder { clickhouse_type: String },
+    FailedToDowncastBuilder { clickhouse_type: SqlType },
 
     #[snafu(display("Failed to get a row value for {clickhouse_type}: {source}"))]
     FailedToGetRowValue {
@@ -84,7 +84,7 @@ macro_rules! handle_primitive_type {
         };
         let Some(builder) = builder.as_any_mut().downcast_mut::<$builder_ty>() else {
             return FailedToDowncastBuilderSnafu {
-                clickhouse_type: format!("{:?}", $type),
+                clickhouse_type: $type,
             }
             .fail();
         };
@@ -105,7 +105,7 @@ macro_rules! handle_primitive_nullable_type {
         };
         let Some(builder) = builder.as_any_mut().downcast_mut::<$builder_ty>() else {
             return FailedToDowncastBuilderSnafu {
-                clickhouse_type: format!("{:?}", $type),
+                clickhouse_type: $type,
             }
             .fail();
         };
@@ -168,7 +168,7 @@ pub fn block_to_arrow(block: &Block<Complex>) -> Result<RecordBatch> {
                         .downcast_mut::<FixedSizeBinaryBuilder>()
                     else {
                         return FailedToDowncastBuilderSnafu {
-                            clickhouse_type: format!("{:?}", SqlType::Uuid),
+                            clickhouse_type: SqlType::Uuid,
                         }
                         .fail();
                     };
@@ -377,7 +377,7 @@ pub fn block_to_arrow(block: &Block<Complex>) -> Result<RecordBatch> {
                     };
                     let Some(builder) = builder.as_any_mut().downcast_mut::<Date32Builder>() else {
                         return FailedToDowncastBuilderSnafu {
-                            clickhouse_type: format!("{:?}", SqlType::Date),
+                            clickhouse_type: SqlType::Date,
                         }
                         .fail();
                     };
@@ -409,7 +409,7 @@ pub fn block_to_arrow(block: &Block<Complex>) -> Result<RecordBatch> {
                         .downcast_mut::<TimestampSecondBuilder>()
                     else {
                         return FailedToDowncastBuilderSnafu {
-                            clickhouse_type: format!("{:?}", SqlType::DateTime(*date_type)),
+                            clickhouse_type: SqlType::DateTime(*date_type),
                         }
                         .fail();
                     };
@@ -450,7 +450,7 @@ pub fn block_to_arrow(block: &Block<Complex>) -> Result<RecordBatch> {
                         dec_builder.as_any_mut().downcast_mut::<Decimal128Builder>()
                     else {
                         return FailedToDowncastBuilderSnafu {
-                            clickhouse_type: format!("{clickhouse_type}"),
+                            clickhouse_type: SqlType::Decimal(size, align),
                         }
                         .fail();
                     };
