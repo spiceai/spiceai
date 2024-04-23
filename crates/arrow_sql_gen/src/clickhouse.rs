@@ -44,7 +44,7 @@ pub enum Error {
     #[snafu(display("No builder found for index {index}"))]
     NoBuilderForIndex { index: usize },
 
-    #[snafu(display("Failed to downcast builder for {:?}", clickhouse_type))]
+    #[snafu(display("Failed to downcast builder for {clickhouse_type}"))]
     FailedToDowncastBuilder { clickhouse_type: String },
 
     #[snafu(display("Failed to get a row value for {}: {}", clickhouse_type, source))]
