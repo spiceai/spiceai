@@ -68,7 +68,7 @@ pub enum Error {
     #[snafu(display("Cannot represent BigDecimal as i128: {big_decimal}"))]
     FailedToConvertBigDecimalToI128 { big_decimal: BigDecimal },
 
-    #[snafu(display("Failed to parse decimal string as BigInterger {}: {}", value, source))]
+    #[snafu(display("Failed to parse decimal string as BigInterger {value}: {source}"))]
     FailedToParseBigDecimalFromClickhouse {
         value: String,
         source: bigdecimal::ParseBigDecimalError,
