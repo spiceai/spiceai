@@ -32,12 +32,12 @@ use super::Result;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("{source}"))]
+    #[snafu(transparent)]
     QueryError {
         source: bb8_postgres::tokio_postgres::Error,
     },
 
-    #[snafu(display("Failed to convert query result to Arrow: {source}"))]
+    #[snafu(transparent)]
     ConversionError {
         source: arrow_sql_gen::postgres::Error,
     },
@@ -96,9 +96,8 @@ impl<'a>
                 ),
                 &[],
             )
-            .await
-            .context(QuerySnafu)?;
-        let rec = rows_to_arrow(rows.as_slice()).context(ConversionSnafu)?;
+            .await?;
+        let rec = rows_to_arrow(rows.as_slice())?;
         let schema = rec.schema();
         Ok(schema)
     }
@@ -108,8 +107,8 @@ impl<'a>
         sql: &str,
         params: &[&'a (dyn ToSql + Sync)],
     ) -> Result<SendableRecordBatchStream> {
-        let rows = self.conn.query(sql, params).await.context(QuerySnafu)?;
-        let rec = rows_to_arrow(rows.as_slice()).context(ConversionSnafu)?;
+        let rows = self.conn.query(sql, params).await?;
+        let rec = rows_to_arrow(rows.as_slice())?;
         let schema = rec.schema();
         let recs = vec![rec];
         Ok(Box::pin(MemoryStream::try_new(recs, schema, None)?))

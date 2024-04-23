@@ -60,7 +60,7 @@ pub type DynPostgresConnection = dyn DbConnection<
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("DbConnectionError: {source}"))]
+    #[snafu(display("{source}"))]
     DbConnectionError {
         source: db_connection_pool::dbconnection::GenericError,
     },
@@ -84,13 +84,6 @@ pub enum Error {
     #[snafu(display("Unable to commit the Postgres transaction: {source}"))]
     UnableToCommitPostgresTransaction {
         source: tokio_postgres::error::Error,
-    },
-
-    #[snafu(display(
-        "Unable to construct the DataFusion SQL Table Provider for Postgres: {source}"
-    ))]
-    UnableToConstructSqlTable {
-        source: sql_provider_datafusion::Error,
     },
 
     #[snafu(display("Unable to generate SQL: {source}"))]

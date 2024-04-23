@@ -42,15 +42,15 @@ pub mod expr;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to get a DB connection from the pool: {source}"))]
+    #[snafu(display("{source}"))]
     UnableToGetConnectionFromPool { source: db_connection_pool::Error },
 
-    #[snafu(display("Unable to get schema: {source}"))]
+    #[snafu(display("{source}"))]
     UnableToGetSchema {
         source: db_connection_pool::dbconnection::Error,
     },
 
-    #[snafu(display("Unable to generate SQL: {source}"))]
+    #[snafu(display("{source}"))]
     UnableToGenerateSQL { source: expr::Error },
 }
 

@@ -38,7 +38,7 @@ pub enum Error {
         source: bb8_postgres::tokio_postgres::Error,
     },
 
-    #[snafu(display("{source}"))]
+    #[snafu(display("ConnectionPoolRunError: {source}"))]
     ConnectionPoolRunError {
         source: bb8::RunError<bb8_postgres::tokio_postgres::Error>,
     },
@@ -139,7 +139,7 @@ impl PostgresConnectionPool {
         };
 
         connection_string.push_str(format!("sslmode={mode} ").as_str());
-        let config = Config::from_str(connection_string.as_str()).context(ConnectionPoolSnafu)?;
+        let config = Config::from_str(connection_string.as_str())?;
 
         for host in config.get_hosts() {
             for port in config.get_ports() {
@@ -166,14 +166,11 @@ impl PostgresConnectionPool {
         let pool = bb8::Pool::builder()
             .error_sink(Box::new(error_sink))
             .build(manager)
-            .await
-            .context(ConnectionPoolSnafu)?;
+            .await?;
 
         // Test the connection
-        let conn = pool.get().await.context(ConnectionPoolRunSnafu)?;
-        conn.execute("SELECT 1", &[])
-            .await
-            .context(ConnectionPoolSnafu)?;
+        let conn = pool.get().await?;
+        conn.execute("SELECT 1", &[]).await?;
 
         Ok(PostgresConnectionPool {
             pool: Arc::new(pool.clone()),
@@ -284,7 +281,7 @@ impl
         >,
     > {
         let pool = Arc::clone(&self.pool);
-        let conn = pool.get_owned().await.context(ConnectionPoolRunSnafu)?;
+        let conn = pool.get_owned().await?;
         Ok(Box::new(PostgresConnection::new(conn)))
     }
 }

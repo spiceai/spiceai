@@ -38,10 +38,10 @@ pub enum Error {
     #[snafu(display("Unable to downcast connection"))]
     UnableToDowncastConnection {},
 
-    #[snafu(display("Unable to get schema: {source}"))]
+    #[snafu(display("{source}"))]
     UnableToGetSchema { source: GenericError },
 
-    #[snafu(display("Unable to query arrow: {source}"))]
+    #[snafu(display("{source}"))]
     UnableToQueryArrow { source: GenericError },
 }
 

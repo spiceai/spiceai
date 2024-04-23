@@ -49,7 +49,7 @@ pub enum Error {
     #[snafu(display("Table already exists"))]
     TableAlreadyExists {},
 
-    #[snafu(display("{source}"))]
+    #[snafu(display("Unable to create dataset acceleration: {source}"))]
     UnableToCreateDataAccelerator { source: dataaccelerator::Error },
 
     #[snafu(display("Unable to create view: {reason}"))]

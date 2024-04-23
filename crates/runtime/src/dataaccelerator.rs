@@ -56,7 +56,7 @@ pub enum Error {
     #[snafu(display("Unknown engine: {engine}"))]
     UnknownEngine { engine: Arc<str> },
 
-    #[snafu(display("{source}"))]
+    #[snafu(display("Acceleration creation failed: {source}"))]
     AccelerationCreationFailed {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
