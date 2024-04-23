@@ -77,7 +77,7 @@ impl FileSecretStore {
     /// # Errors
     ///
     /// Returns an error if there is a problem loading the secrets.
-    pub fn load_secrets(&mut self) -> Result<()> {
+    pub fn load_secrets(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let mut auth_path = dirs::home_dir().context(UnableToFindHomeDirSnafu)?;
         auth_path.push(".spice/auth");
 
@@ -102,11 +102,11 @@ impl FileSecretStore {
 #[async_trait]
 impl SecretStore for FileSecretStore {
     #[must_use]
-    async fn get_secret(&self, secret_name: &str) -> Option<Secret> {
+    async fn get_secret(&self, secret_name: &str) -> super::AnyErrorResult<Option<Secret>> {
         if let Some(secret) = self.secrets.get(secret_name) {
-            return Some(secret.clone());
+            return Ok(Some(secret.clone()));
         }
 
-        None
+        Ok(None)
     }
 }

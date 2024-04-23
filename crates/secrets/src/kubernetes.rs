@@ -19,14 +19,38 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use base64::{engine::general_purpose, Engine};
 use reqwest;
-use snafu::Snafu;
+use snafu::{ResultExt, Snafu};
 
 use super::{Secret, SecretStore};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to read kubernetes credentials"))]
+    #[snafu(display("Unable to read K8S token: {source}"))]
+    UnableToReadK8SToken { source: std::io::Error },
+
+    #[snafu(display("Unable to read K8S namespace: {source}"))]
+    UnableToReadK8SNamespace { source: std::io::Error },
+
+    #[snafu(display("Unable to read K8S CA certificate: {source}"))]
+    UnableToReadCACertificate { source: std::io::Error },
+
+    #[snafu(display("Unable to read K8S credentials"))]
     UnableToReadKubernetesCredentials {},
+
+    #[snafu(display("Unable to create K8S http client: {source}"))]
+    UnableToCreateK8SClient { source: reqwest::Error },
+
+    #[snafu(display("Unable to get secret from K8S: {source}"))]
+    UnableToGetK8SSecret { source: reqwest::Error },
+}
+
+#[derive(Debug, Snafu)]
+pub enum StoreError {
+    #[snafu(display("Unable to init kubernetes store: {source}"))]
+    UnableToInitKubernetesClient { source: Error },
+
+    #[snafu(display("Unable to get secret from: {source}"))]
+    UnableToGetSecret { source: Error },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -49,60 +73,59 @@ impl KubernetesClient {
         }
     }
 
-    fn init(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        self.token = Some(std::fs::read_to_string(format!(
-            "{KUBERNETES_ACCOUNT_PATH}/token"
-        ))?);
+    fn init(&mut self) -> Result<(), Error> {
+        self.token = Some(
+            std::fs::read_to_string(format!("{KUBERNETES_ACCOUNT_PATH}/token"))
+                .context(UnableToReadK8STokenSnafu)?,
+        );
 
-        self.namespace = Some(std::fs::read_to_string(format!(
-            "{KUBERNETES_ACCOUNT_PATH}/namespace"
-        ))?);
+        self.namespace = Some(
+            std::fs::read_to_string(format!("{KUBERNETES_ACCOUNT_PATH}/namespace"))
+                .context(UnableToReadK8SNamespaceSnafu)?,
+        );
 
-        let ca_cert = std::fs::read_to_string(format!("{KUBERNETES_ACCOUNT_PATH}/ca.crt"))?;
+        let ca_cert = std::fs::read_to_string(format!("{KUBERNETES_ACCOUNT_PATH}/ca.crt"))
+            .context(UnableToReadCACertificateSnafu)?;
 
         let Ok(certificate) = reqwest::Certificate::from_pem(ca_cert.as_bytes()) else {
-            return Err(Box::new(Error::UnableToReadKubernetesCredentials {}));
+            return Err(Error::UnableToReadKubernetesCredentials {});
         };
 
         self.client = Some(
             reqwest::Client::builder()
                 .add_root_certificate(certificate)
-                .build()?,
+                .build()
+                .context(UnableToCreateK8SClientSnafu)?,
         );
 
         Ok(())
     }
 
-    async fn get_secret(
-        &self,
-        secret_name: &str,
-    ) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
+    async fn get_secret(&self, secret_name: &str) -> Result<HashMap<String, String>, Error> {
         let Some(client) = &self.client else {
-            return Err(Box::new(Error::UnableToReadKubernetesCredentials {}));
+            return Err(Error::UnableToReadKubernetesCredentials {});
         };
 
         let Some(token) = &self.token else {
-            return Err(Box::new(Error::UnableToReadKubernetesCredentials {}));
+            return Err(Error::UnableToReadKubernetesCredentials {});
         };
 
         let Some(namespace) = &self.namespace else {
-            return Err(Box::new(Error::UnableToReadKubernetesCredentials {}));
+            return Err(Error::UnableToReadKubernetesCredentials {});
         };
 
         let url =
             format!("{KUBERNETES_API_SERVER}/api/v1/namespaces/{namespace}/secrets/{secret_name}");
 
-        let kubernetes_secret = match client
+        let kubernetes_secret = client
             .get(url.clone())
             .bearer_auth(token.clone())
             .send()
-            .await?
+            .await
+            .context(UnableToGetK8SSecretSnafu)?
             .json::<HashMap<String, serde_json::value::Value>>()
             .await
-        {
-            Ok(response) => response,
-            Err(e) => return Err(Box::new(e)),
-        };
+            .context(UnableToGetK8SSecretSnafu)?;
 
         let mut secret: HashMap<String, String> = HashMap::new();
 
@@ -159,8 +182,10 @@ impl KubernetesSecretStore {
     ///
     /// Returns an error if unable to read Kubernetes credentials.
     pub fn init(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        if let Err(_e) = self.kubernetes_client.init() {
-            return Err(Box::new(Error::UnableToReadKubernetesCredentials {}));
+        if let Err(err) = self.kubernetes_client.init() {
+            return Err(Box::new(StoreError::UnableToInitKubernetesClient {
+                source: err,
+            }));
         }
 
         Ok(())
@@ -170,11 +195,10 @@ impl KubernetesSecretStore {
 #[async_trait]
 impl SecretStore for KubernetesSecretStore {
     #[must_use]
-    async fn get_secret(&self, secret_name: &str) -> Option<Secret> {
-        if let Ok(secret) = self.kubernetes_client.get_secret(secret_name).await {
-            return Some(Secret::new(secret.clone()));
+    async fn get_secret(&self, secret_name: &str) -> super::AnyErrorResult<Option<Secret>> {
+        match self.kubernetes_client.get_secret(secret_name).await {
+            Ok(secret) => Ok(Some(Secret::new(secret.clone()))),
+            Err(err) => Err(Box::new(StoreError::UnableToGetSecret { source: err })),
         }
-
-        None
     }
 }
