@@ -15,7 +15,11 @@ limitations under the License.
 */
 use arrow::{
     array::{
-        ArrayBuilder, BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder, FixedSizeBinaryBuilder, Float32Builder, Float64Builder, Int16Builder, Int32Builder, Int64Builder, Int8Builder, ListBuilder, StringBuilder, TimestampMicrosecondBuilder, TimestampMillisecondBuilder, TimestampNanosecondBuilder, TimestampSecondBuilder, UInt16Builder, UInt32Builder, UInt64Builder, UInt8Builder
+        ArrayBuilder, BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder,
+        FixedSizeBinaryBuilder, Float32Builder, Float64Builder, Int16Builder, Int32Builder,
+        Int64Builder, Int8Builder, ListBuilder, StringBuilder, TimestampMicrosecondBuilder,
+        TimestampMillisecondBuilder, TimestampNanosecondBuilder, TimestampSecondBuilder,
+        UInt16Builder, UInt32Builder, UInt64Builder, UInt8Builder,
     },
     datatypes::{DataType, TimeUnit},
 };
