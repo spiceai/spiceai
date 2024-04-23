@@ -73,6 +73,9 @@ pub enum Error {
         value: String,
         source: bigdecimal::ParseBigDecimalError,
     },
+
+    #[snafu(display("Unsupported column type: {:?}", column_type))]
+    UnsupportedColumnType { column_type: SqlType },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -494,7 +497,10 @@ pub fn block_to_arrow(block: &Block<Complex>) -> Result<RecordBatch> {
                         None => dec_builder.append_null(),
                     }
                 }
-                _ => unimplemented!(),
+                _ => UnsupportedColumnTypeSnafu {
+                    column_type: clickhouse_type.clone(),
+                }
+                .fail()?,
             }
         }
     }
