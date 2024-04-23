@@ -164,7 +164,7 @@ pub fn block_to_arrow(block: &Block<Complex>) -> Result<RecordBatch> {
             };
 
             match *clickhouse_type {
-                SqlType::Uuid => {
+                SqlType::Uuid | SqlType::Nullable(SqlType::Uuid) => {
                     let Some(builder) = builder else {
                         return NoBuilderForIndexSnafu { index: i }.fail();
                     };
@@ -177,44 +177,26 @@ pub fn block_to_arrow(block: &Block<Complex>) -> Result<RecordBatch> {
                         }
                         .fail();
                     };
-                    let v = row
-                        .get::<uuid::Uuid, usize>(i)
-                        .context(FailedToGetRowValueSnafu {
-                            clickhouse_type: SqlType::Uuid,
-                        })?;
-                    let _ =
-                        builder
-                            .append_value(v.as_bytes())
-                            .context(FailedToAppendRowValueSnafu {
+                    let v = match *clickhouse_type {
+                        SqlType::Uuid => Some(row.get::<uuid::Uuid, usize>(i).context(
+                            FailedToGetRowValueSnafu {
                                 clickhouse_type: SqlType::Uuid,
-                            });
-                }
-                SqlType::Nullable(SqlType::Uuid) => {
-                    let Some(builder) = builder else {
-                        return NoBuilderForIndexSnafu { index: i }.fail();
+                            },
+                        )?),
+                        SqlType::Nullable(SqlType::Uuid) => row
+                            .get::<Option<uuid::Uuid>, usize>(i)
+                            .context(FailedToGetRowValueSnafu {
+                                clickhouse_type: SqlType::Uuid,
+                            })?,
+                        _ => unreachable!(),
                     };
-                    let Some(builder) = builder
-                        .as_any_mut()
-                        .downcast_mut::<FixedSizeBinaryBuilder>()
-                    else {
-                        return FailedToDowncastBuilderSnafu {
-                            clickhouse_type: format!("{:?}", SqlType::Uuid),
-                        }
-                        .fail();
-                    };
-                    let v = row.get::<Option<uuid::Uuid>, usize>(i).context(
-                        FailedToGetRowValueSnafu {
-                            clickhouse_type: SqlType::Uuid,
-                        },
-                    )?;
+
                     match v {
-                        Some(v) => {
-                            let _ = builder.append_value(v.as_bytes()).context(
-                                FailedToAppendRowValueSnafu {
-                                    clickhouse_type: SqlType::Uuid,
-                                },
-                            );
-                        }
+                        Some(v) => builder.append_value(v.as_bytes()).context(
+                            FailedToAppendRowValueSnafu {
+                                clickhouse_type: SqlType::Uuid,
+                            },
+                        )?,
                         None => builder.append_null(),
                     }
                 }
@@ -394,7 +376,7 @@ pub fn block_to_arrow(block: &Block<Complex>) -> Result<RecordBatch> {
                         i
                     );
                 }
-                SqlType::Date => {
+                SqlType::Date | SqlType::Nullable(SqlType::Date) => {
                     let Some(builder) = builder else {
                         return NoBuilderForIndexSnafu { index: i }.fail();
                     };
@@ -404,54 +386,26 @@ pub fn block_to_arrow(block: &Block<Complex>) -> Result<RecordBatch> {
                         }
                         .fail();
                     };
-                    let v = row
-                        .get::<NaiveDate, usize>(i)
-                        .context(FailedToGetRowValueSnafu {
-                            clickhouse_type: SqlType::Date,
-                        })?;
-                    builder.append_value(Date32Type::from_naive_date(v));
-                }
-                SqlType::Nullable(SqlType::Date) => {
-                    let Some(builder) = builder else {
-                        return NoBuilderForIndexSnafu { index: i }.fail();
+                    let v = match *clickhouse_type {
+                        SqlType::Date => Some(row.get::<NaiveDate, usize>(i).context(
+                            FailedToGetRowValueSnafu {
+                                clickhouse_type: SqlType::Date,
+                            },
+                        )?),
+                        SqlType::Nullable(SqlType::Date) => row
+                            .get::<Option<NaiveDate>, usize>(i)
+                            .context(FailedToGetRowValueSnafu {
+                                clickhouse_type: SqlType::Date,
+                            })?,
+                        _ => unreachable!(),
                     };
-                    let Some(builder) = builder.as_any_mut().downcast_mut::<Date32Builder>() else {
-                        return FailedToDowncastBuilderSnafu {
-                            clickhouse_type: format!("{:?}", SqlType::Date),
-                        }
-                        .fail();
-                    };
-                    let v = row.get::<Option<NaiveDate>, usize>(i).context(
-                        FailedToGetRowValueSnafu {
-                            clickhouse_type: SqlType::Date,
-                        },
-                    )?;
                     match v {
                         Some(v) => builder.append_value(Date32Type::from_naive_date(v)),
                         None => builder.append_null(),
                     }
                 }
-                SqlType::DateTime(date_type) => {
-                    let Some(builder) = builder else {
-                        return NoBuilderForIndexSnafu { index: i }.fail();
-                    };
-                    let Some(builder) = builder
-                        .as_any_mut()
-                        .downcast_mut::<TimestampSecondBuilder>()
-                    else {
-                        return FailedToDowncastBuilderSnafu {
-                            clickhouse_type: format!("{:?}", SqlType::DateTime(date_type)),
-                        }
-                        .fail();
-                    };
-                    let v = row.get::<chrono::DateTime<Tz>, usize>(i).context(
-                        FailedToGetRowValueSnafu {
-                            clickhouse_type: SqlType::DateTime(date_type),
-                        },
-                    )?;
-                    builder.append_value(v.timestamp());
-                }
-                SqlType::Nullable(SqlType::DateTime(date_type)) => {
+                SqlType::DateTime(ref date_type)
+                | SqlType::Nullable(SqlType::DateTime(ref date_type)) => {
                     let Some(builder) = builder else {
                         return NoBuilderForIndexSnafu { index: i }.fail();
                     };
@@ -464,60 +418,29 @@ pub fn block_to_arrow(block: &Block<Complex>) -> Result<RecordBatch> {
                         }
                         .fail();
                     };
-                    let v = row.get::<Option<chrono::DateTime<Tz>>, usize>(i).context(
-                        FailedToGetRowValueSnafu {
-                            clickhouse_type: SqlType::DateTime(*date_type),
-                        },
-                    )?;
+                    let v = match *clickhouse_type {
+                        SqlType::DateTime(_) => {
+                            Some(row.get::<chrono::DateTime<Tz>, usize>(i).context(
+                                FailedToGetRowValueSnafu {
+                                    clickhouse_type: SqlType::DateTime(*date_type),
+                                },
+                            )?)
+                        }
+                        SqlType::Nullable(SqlType::DateTime(_)) => row
+                            .get::<Option<chrono::DateTime<Tz>>, usize>(i)
+                            .context(FailedToGetRowValueSnafu {
+                                clickhouse_type: SqlType::DateTime(*date_type),
+                            })?,
+                        _ => unreachable!(),
+                    };
                     match v {
                         Some(v) => builder.append_value(v.timestamp()),
                         None => builder.append_null(),
                     }
                 }
-                SqlType::Decimal(size, align) => {
-                    let scale = align.try_into().unwrap_or_default();
-                    let dec_builder = builder.get_or_insert_with(|| {
-                        Box::new(
-                            Decimal128Builder::new()
-                                .with_precision_and_scale(size, scale)
-                                .unwrap_or_default(),
-                        )
-                    });
-                    let Some(dec_builder) =
-                        dec_builder.as_any_mut().downcast_mut::<Decimal128Builder>()
-                    else {
-                        return FailedToDowncastBuilderSnafu {
-                            clickhouse_type: format!("{clickhouse_type}"),
-                        }
-                        .fail();
-                    };
 
-                    if arrow_field.is_none() {
-                        let Some(field_name) = column_names.get(i) else {
-                            return NoColumnNameForIndexSnafu { index: i }.fail();
-                        };
-                        let new_arrow_field =
-                            Field::new(field_name, DataType::Decimal128(size, scale), true);
-
-                        *arrow_field = Some(new_arrow_field);
-                    }
-
-                    let v = row
-                        .get::<Decimal, usize>(i)
-                        .context(FailedToGetRowValueSnafu {
-                            clickhouse_type: SqlType::Decimal(size, align),
-                        })?;
-                    let v = BigDecimal::from_str(v.to_string().as_str()).context(
-                        FailedToParseBigDecimalFromClickhouseSnafu {
-                            value: v.to_string(),
-                        },
-                    )?;
-                    let Some(v) = to_decimal_128(&v, scale) else {
-                        return FailedToConvertBigDecimalToI128Snafu { big_decimal: v }.fail();
-                    };
-                    dec_builder.append_value(v);
-                }
-                SqlType::Nullable(SqlType::Decimal(size, align)) => {
+                SqlType::Decimal(ref size, ref align)
+                | SqlType::Nullable(SqlType::Decimal(ref size, ref align)) => {
                     let size = *size;
                     let align = *align;
                     let scale = align.try_into().unwrap_or_default();
@@ -547,11 +470,19 @@ pub fn block_to_arrow(block: &Block<Complex>) -> Result<RecordBatch> {
                         *arrow_field = Some(new_arrow_field);
                     }
 
-                    let v =
-                        row.get::<Option<Decimal>, usize>(i)
+                    let v = match *clickhouse_type {
+                        SqlType::Decimal(_, _) => Some(row.get::<Decimal, usize>(i).context(
+                            FailedToGetRowValueSnafu {
+                                clickhouse_type: SqlType::Decimal(size, align),
+                            },
+                        )?),
+                        SqlType::Nullable(SqlType::Decimal(_, _)) => row
+                            .get::<Option<Decimal>, usize>(i)
                             .context(FailedToGetRowValueSnafu {
                                 clickhouse_type: SqlType::Decimal(size, align),
-                            })?;
+                            })?,
+                        _ => unreachable!(),
+                    };
                     match v {
                         Some(v) => {
                             let v = BigDecimal::from_str(v.to_string().as_str()).context(
