@@ -14,18 +14,22 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
+use std::{str::FromStr, sync::Arc};
 
 use arrow::{
     array::{
-    ArrayBuilder, ArrayRef, BooleanBuilder, Date32Builder, FixedSizeBinaryBuilder, Float32Builder, Float64Builder, Int16Builder, Int32Builder, Int64Builder, Int8Builder, RecordBatch, RecordBatchOptions, StringBuilder, TimestampSecondBuilder, UInt16Builder, UInt32Builder, UInt64Builder, UInt8Builder
+        ArrayBuilder, ArrayRef, BooleanBuilder, Date32Builder, Decimal128Builder,
+        FixedSizeBinaryBuilder, Float32Builder, Float64Builder, Int16Builder, Int32Builder,
+        Int64Builder, Int8Builder, RecordBatch, RecordBatchOptions, StringBuilder,
+        TimestampSecondBuilder, UInt16Builder, UInt32Builder, UInt64Builder, UInt8Builder,
     },
     datatypes::{DataType, Date32Type, Field, Schema, TimeUnit},
 };
+use bigdecimal::{BigDecimal, ToPrimitive};
 use chrono::NaiveDate;
 use chrono_tz::Tz;
 use clickhouse_rs::{
-    types::{Complex, SqlType},
+    types::{Complex, Decimal, SqlType},
     Block,
 };
 use snafu::{ResultExt, Snafu};
@@ -50,7 +54,25 @@ pub enum Error {
     },
 
     #[snafu(display("Failed to append a row value for {}: {}", clickhouse_type, source))]
-    FailedToAppendRowValue { clickhouse_type: SqlType, source: arrow::error::ArrowError },
+    FailedToAppendRowValue {
+        clickhouse_type: SqlType,
+        source: arrow::error::ArrowError,
+    },
+
+    #[snafu(display("No Arrow field found for index {index}"))]
+    NoArrowFieldForIndex { index: usize },
+
+    #[snafu(display("No column name for index: {index}"))]
+    NoColumnNameForIndex { index: usize },
+
+    #[snafu(display("Cannot represent BigDecimal as i128: {big_decimal}"))]
+    FailedToConvertBigDecimalToI128 { big_decimal: BigDecimal },
+
+    #[snafu(display("Failed to parse decimal string as BigInterger {}: {}", value, source))]
+    FailedToParseBigDecimalFromClickhouse {
+        value: String,
+        source: bigdecimal::ParseBigDecimalError,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -113,12 +135,19 @@ pub fn block_to_arrow(block: &Block<Complex>) -> Result<RecordBatch> {
                 return NoBuilderForIndexSnafu { index: i }.fail();
             };
 
+            let Some(arrow_field) = arrow_fields.get_mut(i) else {
+                return NoArrowFieldForIndexSnafu { index: i }.fail();
+            };
+
             match *clickhouse_type {
                 SqlType::Uuid => {
                     let Some(builder) = builder else {
                         return NoBuilderForIndexSnafu { index: i }.fail();
                     };
-                    let Some(builder) = builder.as_any_mut().downcast_mut::<FixedSizeBinaryBuilder>() else {
+                    let Some(builder) = builder
+                        .as_any_mut()
+                        .downcast_mut::<FixedSizeBinaryBuilder>()
+                    else {
                         return FailedToDowncastBuilderSnafu {
                             clickhouse_type: format!("{:?}", SqlType::Uuid),
                         }
@@ -129,9 +158,12 @@ pub fn block_to_arrow(block: &Block<Complex>) -> Result<RecordBatch> {
                         .context(FailedToGetRowValueSnafu {
                             clickhouse_type: SqlType::Uuid,
                         })?;
-                    let _ = builder.append_value(v.as_bytes()).context(FailedToAppendRowValueSnafu {
-                        clickhouse_type: SqlType::Uuid,
-                    });
+                    let _ =
+                        builder
+                            .append_value(v.as_bytes())
+                            .context(FailedToAppendRowValueSnafu {
+                                clickhouse_type: SqlType::Uuid,
+                            });
                 }
                 SqlType::Bool => {
                     handle_primitive_type!(builder, SqlType::Bool, BooleanBuilder, bool, row, i);
@@ -170,7 +202,14 @@ pub fn block_to_arrow(block: &Block<Complex>) -> Result<RecordBatch> {
                     handle_primitive_type!(builder, SqlType::String, StringBuilder, String, row, i);
                 }
                 SqlType::FixedString(size) => {
-                    handle_primitive_type!(builder, SqlType::FixedString(size), StringBuilder, String, row, i);
+                    handle_primitive_type!(
+                        builder,
+                        SqlType::FixedString(size),
+                        StringBuilder,
+                        String,
+                        row,
+                        i
+                    );
                 }
                 SqlType::Date => {
                     let Some(builder) = builder else {
@@ -193,18 +232,64 @@ pub fn block_to_arrow(block: &Block<Complex>) -> Result<RecordBatch> {
                     let Some(builder) = builder else {
                         return NoBuilderForIndexSnafu { index: i }.fail();
                     };
-                    let Some(builder) = builder.as_any_mut().downcast_mut::<TimestampSecondBuilder>() else {
+                    let Some(builder) = builder
+                        .as_any_mut()
+                        .downcast_mut::<TimestampSecondBuilder>()
+                    else {
                         return FailedToDowncastBuilderSnafu {
                             clickhouse_type: format!("{:?}", SqlType::DateTime(date_type)),
                         }
                         .fail();
                     };
-                    let v = row
-                                .get::<chrono::DateTime<Tz>, usize>(i)
-                                .context(FailedToGetRowValueSnafu {
-                                    clickhouse_type: SqlType::DateTime(date_type),
-                                })?;
+                    let v = row.get::<chrono::DateTime<Tz>, usize>(i).context(
+                        FailedToGetRowValueSnafu {
+                            clickhouse_type: SqlType::DateTime(date_type),
+                        },
+                    )?;
                     builder.append_value(v.timestamp());
+                }
+                SqlType::Decimal(size, align) => {
+                    let scale = align.try_into().unwrap_or_default();
+                    let dec_builder = builder.get_or_insert_with(|| {
+                        Box::new(
+                            Decimal128Builder::new()
+                                .with_precision_and_scale(size, scale)
+                                .unwrap_or_default(),
+                        )
+                    });
+                    let Some(dec_builder) =
+                        dec_builder.as_any_mut().downcast_mut::<Decimal128Builder>()
+                    else {
+                        return FailedToDowncastBuilderSnafu {
+                            clickhouse_type: format!("{clickhouse_type}"),
+                        }
+                        .fail();
+                    };
+
+                    if arrow_field.is_none() {
+                        let Some(field_name) = column_names.get(i) else {
+                            return NoColumnNameForIndexSnafu { index: i }.fail();
+                        };
+                        let new_arrow_field =
+                            Field::new(field_name, DataType::Decimal128(size, scale), true);
+
+                        *arrow_field = Some(new_arrow_field);
+                    }
+
+                    let v = row
+                        .get::<Decimal, usize>(i)
+                        .context(FailedToGetRowValueSnafu {
+                            clickhouse_type: SqlType::Decimal(size, align),
+                        })?;
+                    let v = BigDecimal::from_str(v.to_string().as_str()).context(
+                        FailedToParseBigDecimalFromClickhouseSnafu {
+                            value: v.to_string(),
+                        },
+                    )?;
+                    let Some(v) = to_decimal_128(&v, scale) else {
+                        return FailedToConvertBigDecimalToI128Snafu { big_decimal: v }.fail();
+                    };
+                    dec_builder.append_value(v);
                 }
                 _ => unimplemented!(),
             }
@@ -239,6 +324,13 @@ fn map_column_to_data_type(column_type: &SqlType) -> Option<DataType> {
         SqlType::String | SqlType::FixedString(_) => Some(DataType::Utf8),
         SqlType::Date => Some(DataType::Date32),
         SqlType::DateTime(_) => Some(DataType::Timestamp(TimeUnit::Second, None)),
+        SqlType::Decimal(size, align) => {
+            Some(DataType::Decimal128(*size, (*align).try_into().unwrap()))
+        }
         _ => unimplemented!("Unsupported column type {:?}", column_type),
     }
+}
+
+fn to_decimal_128(decimal: &BigDecimal, scale: i8) -> Option<i128> {
+    (decimal * 10i128.pow(scale.try_into().unwrap_or_default())).to_i128()
 }
