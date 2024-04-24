@@ -119,9 +119,8 @@ impl AcceleratedTable {
         let refresh_handle = tokio::spawn(Self::start_refresh(
             dataset_name.clone(),
             Arc::clone(&federated),
+            refresh,
             acceleration_refresh_mode,
-            refresh.sql,
-            refresh.period,
             Arc::clone(&accelerator),
             object_store,
         ));
@@ -204,7 +203,10 @@ impl AcceleratedTable {
 
         let mut interval_timer = tokio::time::interval(retention.check_interval);
 
-        let Some(expr_time_format) = get_expr_time_format(field, &retention.time_format) else {
+        let var_name = Some(time_column.clone());
+        let Some(timestamp_filter_converter) =
+            TimestampFilterConvert::create(field, retention.time_format, var_name)
+        else {
             tracing::error!("[retention] Failed to get the expression time format for {time_column}, check schema and time format");
             return;
         };
@@ -221,7 +223,7 @@ impl AcceleratedTable {
                     tracing::error!("[retention] Failed to get timestamp");
                     continue;
                 };
-                let expr = get_expr(&time_column, timestamp, expr_time_format.clone());
+                let expr = timestamp_filter_converter.convert(timestamp);
                 tracing::info!(
                     "[retention] Evicting data for {dataset_name} where {time_column} < {}...",
                     if let Some(value) = chrono::DateTime::from_timestamp(timestamp as i64, 0) {
@@ -270,20 +272,16 @@ impl AcceleratedTable {
     async fn start_refresh(
         dataset_name: String,
         federated: Arc<dyn TableProvider>,
+        refresh: Refresh,
         acceleration_refresh_mode: AccelerationRefreshMode,
-        refresh_sql: Option<String>,
-        refresh_period: Option<Duration>,
         accelerator: Arc<dyn TableProvider>,
         object_store: Option<(Url, Arc<dyn ObjectStore + 'static>)>,
     ) {
-        // TODO: handle this in following PR
-        _ = refresh_period;
-
         let mut stream = Self::stream_updates(
             dataset_name.clone(),
             federated,
+            refresh,
             acceleration_refresh_mode,
-            refresh_sql,
             object_store,
         );
 
@@ -325,8 +323,8 @@ impl AcceleratedTable {
     fn stream_updates<'a>(
         dataset_name: String,
         federated: Arc<dyn TableProvider>,
+        refresh: Refresh,
         acceleration_refresh_mode: AccelerationRefreshMode,
-        refresh_sql: Option<String>,
         object_store: Option<(Url, Arc<dyn ObjectStore + 'static>)>,
     ) -> BoxStream<'a, Result<DataUpdate>> {
         let mut ctx = SessionContext::new();
@@ -372,13 +370,41 @@ impl AcceleratedTable {
                     }
                 }
                 AccelerationRefreshMode::Full(receiver) => {
+                    let filter_converter = match (refresh.period, refresh.time_column) {
+                        (None, Some(_) | None) => {
+                            None
+                        },
+                        (Some(_), None) => {
+                            tracing::warn!("[retention] No time_column is provided, refresh_period will be ignored");
+                            None
+                        }
+                        (Some(_), Some(column)) => {
+                            let schema = federated.schema();
+                            let field = schema.column_with_name(column.as_str());
+                            TimestampFilterConvert::create(field, refresh.time_format, Some(column))
+                        }
+                    };
+
                     let mut refresh_stream = ReceiverStream::new(receiver);
 
                     while refresh_stream.next().await.is_some() {
                         tracing::info!("Refreshing data for {dataset_name}");
                         status::update_dataset(&dataset_name, status::ComponentStatus::Refreshing);
                         let timer = TimeMeasurement::new("load_dataset_duration_ms", vec![("dataset", dataset_name.clone())]);
-                        let all_data = match get_all_data(&mut ctx, OwnedTableReference::bare(dataset_name.clone()), Arc::clone(&federated), refresh_sql.clone()).await {
+                        let  filters = match (refresh.period, filter_converter.clone()){
+                            (Some(period), Some(converter)) => {
+                                let start = SystemTime::now() - period;
+
+                                let Ok(timestamp) = get_timestamp(start) else {
+                                    tracing::error!("[retention] Failed to get timestamp");
+                                    continue;
+                                };
+                                vec![converter.convert(timestamp)]
+                            },
+                            _ => vec![],
+                        };
+
+                        let all_data = match get_all_data(&mut ctx, OwnedTableReference::bare(dataset_name.clone()), Arc::clone(&federated), refresh.sql.clone(), filters).await {
                             Ok(data) => data,
                             Err(e) => {
                                 tracing::error!("Error refreshing data for {dataset_name}: {e}");
@@ -400,64 +426,83 @@ impl AcceleratedTable {
     }
 }
 
-fn get_expr_time_format(
-    field: Option<(usize, &arrow::datatypes::Field)>,
-    time_format: &Option<TimeFormat>,
-) -> Option<ExprTimeFormat> {
-    let expr_time_format = match field {
-        Some(field) => match field.1.data_type() {
-            DataType::Int8
-            | DataType::Int16
-            | DataType::Int32
-            | DataType::Int64
-            | DataType::UInt8
-            | DataType::UInt16
-            | DataType::UInt32
-            | DataType::UInt64
-            | DataType::Float16
-            | DataType::Float32
-            | DataType::Float64 => {
-                let mut scale = 1;
-                if let Some(time_format) = time_format.clone() {
-                    if time_format == TimeFormat::UnixMillis {
-                        scale = 1000;
-                    }
-                }
-                ExprTimeFormat::UnixTimestamp(ExprUnixTimestamp { scale })
-            }
-            DataType::Timestamp(_, _)
-            | DataType::Date32
-            | DataType::Date64
-            | DataType::Time32(_)
-            | DataType::Time64(_) => ExprTimeFormat::Timestamp,
-            DataType::Utf8 | DataType::LargeUtf8 => ExprTimeFormat::ISO8601,
-            _ => {
-                tracing::warn!("Date type is not handled yet: {}", field.1.data_type());
-                return None;
-            }
-        },
-        None => {
-            return None;
-        }
-    };
-    Some(expr_time_format)
+#[derive(Clone, Debug)]
+struct TimestampFilterConvert {
+    time_format: ExprTimeFormat,
+    time_column: String,
 }
 
-#[allow(clippy::cast_possible_wrap)]
-fn get_expr(time_column: &str, timestamp: u64, expr_time_format: ExprTimeFormat) -> Expr {
-    match expr_time_format {
-        ExprTimeFormat::ISO8601 => cast(
-            col(time_column),
-            DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
-        )
-        .lt(Expr::Literal(ScalarValue::TimestampMillisecond(
-            Some((timestamp * 1000) as i64),
-            None,
-        ))),
-        ExprTimeFormat::UnixTimestamp(format) => col(time_column).lt(lit(timestamp * format.scale)),
-        ExprTimeFormat::Timestamp => col(time_column).lt(Expr::Literal(
-            ScalarValue::TimestampMillisecond(Some((timestamp * 1000) as i64), None),
-        )),
+#[allow(clippy::needless_pass_by_value)]
+impl TimestampFilterConvert {
+    fn create(
+        field: Option<(usize, &arrow::datatypes::Field)>,
+        time_format: Option<TimeFormat>,
+        time_column: Option<String>,
+    ) -> Option<Self> {
+        let time_column = time_column?;
+
+        let time_format = match field {
+            Some(field) => match field.1.data_type() {
+                DataType::Int8
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::UInt8
+                | DataType::UInt16
+                | DataType::UInt32
+                | DataType::UInt64
+                | DataType::Float16
+                | DataType::Float32
+                | DataType::Float64 => {
+                    let mut scale = 1;
+                    if let Some(time_format) = time_format.clone() {
+                        if time_format == TimeFormat::UnixMillis {
+                            scale = 1000;
+                        }
+                    }
+                    ExprTimeFormat::UnixTimestamp(ExprUnixTimestamp { scale })
+                }
+                DataType::Timestamp(_, _)
+                | DataType::Date32
+                | DataType::Date64
+                | DataType::Time32(_)
+                | DataType::Time64(_) => ExprTimeFormat::Timestamp,
+                DataType::Utf8 | DataType::LargeUtf8 => ExprTimeFormat::ISO8601,
+                _ => {
+                    tracing::warn!("Date type is not handled yet: {}", field.1.data_type());
+                    return None;
+                }
+            },
+            None => return None,
+        };
+
+        Some(Self {
+            time_format,
+            time_column,
+        })
+    }
+
+    #[allow(clippy::cast_possible_wrap)]
+    fn convert(&self, timestamp: u64) -> Expr {
+        let format = self.time_format.clone();
+        let time_column: &str = &self.time_column.clone();
+        let expr_time_format = format.clone();
+        match expr_time_format {
+            ExprTimeFormat::ISO8601 => cast(
+                col(time_column),
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+            )
+            .lt(Expr::Literal(ScalarValue::TimestampMillisecond(
+                Some((timestamp * 1000) as i64),
+                None,
+            ))),
+            ExprTimeFormat::UnixTimestamp(format) => {
+                col(time_column).lt(lit(timestamp * format.scale))
+            }
+            ExprTimeFormat::Timestamp => col(time_column).lt(Expr::Literal(
+                ScalarValue::TimestampMillisecond(Some((timestamp * 1000) as i64), None),
+            )),
+        }
     }
 }
 

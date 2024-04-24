@@ -20,7 +20,7 @@ use datafusion::common::OwnedTableReference;
 use datafusion::dataframe::DataFrame;
 use datafusion::datasource::{DefaultTableSource, TableProvider};
 use datafusion::execution::context::SessionContext;
-use datafusion::logical_expr::LogicalPlanBuilder;
+use datafusion::logical_expr::{Expr, LogicalPlanBuilder};
 use lazy_static::lazy_static;
 use object_store::ObjectStore;
 use snafu::prelude::*;
@@ -190,7 +190,10 @@ pub async fn get_all_data(
     table_name: OwnedTableReference,
     table_provider: Arc<dyn TableProvider>,
     sql: Option<String>,
+    filters: Vec<Expr>,
 ) -> Result<(SchemaRef, Vec<arrow::record_batch::RecordBatch>)> {
+    _ = filters;
+
     let df = match sql {
         None => {
             let table_source = Arc::new(DefaultTableSource::new(Arc::clone(&table_provider)));

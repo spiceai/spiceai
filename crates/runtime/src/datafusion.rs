@@ -164,6 +164,8 @@ impl Retention {
 }
 
 pub(crate) struct Refresh {
+    pub(crate) time_column: Option<String>,
+    pub(crate) time_format: Option<TimeFormat>,
     pub(crate) check_interval: Option<Duration>,
     pub(crate) sql: Option<String>,
     pub(crate) mode: RefreshMode,
@@ -174,12 +176,16 @@ impl Refresh {
     #[allow(clippy::needless_pass_by_value)]
     #[must_use]
     pub(crate) fn new(
+        time_column: Option<String>,
+        time_format: Option<TimeFormat>,
         check_interval: Option<Duration>,
         sql: Option<String>,
         mode: RefreshMode,
         period: Option<Duration>,
     ) -> Self {
         Self {
+            time_column,
+            time_format,
             check_interval,
             sql,
             mode,
@@ -351,6 +357,8 @@ impl DataFusion {
             source_table_provider,
             accelerated_table_provider,
             Refresh::new(
+                dataset.time_column.clone(),
+                dataset.time_format.clone(),
                 dataset.refresh_interval(),
                 refresh_sql.clone(),
                 acceleration_settings.refresh_mode.clone(),
