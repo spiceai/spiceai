@@ -38,6 +38,7 @@ use snafu::prelude::*;
 use spicepod::component::dataset::acceleration::RefreshMode;
 use spicepod::component::dataset::{Dataset, Mode, TimeFormat};
 use tokio::spawn;
+use tokio::sync::oneshot;
 use tokio::time::{sleep, Instant};
 
 pub mod refresh_sql;
@@ -130,7 +131,7 @@ pub struct DataFusion {
     data_writers: HashSet<String>,
 }
 
-pub(crate) struct Retention {
+pub struct Retention {
     pub(crate) time_column: String,
     pub(crate) time_format: Option<TimeFormat>,
     pub(crate) period: Duration,
@@ -163,7 +164,7 @@ impl Retention {
     }
 }
 
-pub(crate) struct Refresh {
+pub struct Refresh {
     pub(crate) check_interval: Option<Duration>,
     pub(crate) sql: Option<String>,
     pub(crate) mode: RefreshMode,
@@ -203,8 +204,18 @@ impl DataFusion {
         &mut self,
         dataset: impl Borrow<Dataset>,
         table: Table,
+        accelerated_table: Option<AcceleratedTable>,
     ) -> Result<()> {
         let dataset = dataset.borrow();
+
+        if let Some(accelerated_table) = accelerated_table {
+            self.ctx
+                .register_table(&dataset.name, Arc::new(accelerated_table))
+                .context(UnableToRegisterTableToDataFusionSnafu)?;
+
+            return Ok(());
+        }
+
         match table {
             Table::Accelerated {
                 source,
@@ -293,13 +304,13 @@ impl DataFusion {
         Ok(())
     }
 
-    async fn register_accelerated_table(
-        &mut self,
+    pub async fn create_accelerated_table(
+        &self,
         dataset: &Dataset,
         source: Arc<dyn DataConnector>,
         acceleration_secret: Option<Secret>,
-    ) -> Result<()> {
-        tracing::debug!("Registering accelerated table {dataset:?}");
+    ) -> Result<(AcceleratedTable, oneshot::Receiver<()>)> {
+        tracing::debug!("Creating accelerated table {dataset:?}");
         let obj_store = source
             .get_object_store(dataset)
             .transpose()
@@ -346,7 +357,7 @@ impl DataFusion {
                 .context(RefreshSqlSnafu)?;
         }
 
-        let accelerated_table = AcceleratedTable::new(
+        Ok(AcceleratedTable::new(
             dataset.name.to_string(),
             source_table_provider,
             accelerated_table_provider,
@@ -365,7 +376,18 @@ impl DataFusion {
             ),
             obj_store,
         )
-        .await;
+        .await)
+    }
+
+    async fn register_accelerated_table(
+        &mut self,
+        dataset: &Dataset,
+        source: Arc<dyn DataConnector>,
+        acceleration_secret: Option<Secret>,
+    ) -> Result<()> {
+        let (accelerated_table, _) = self
+            .create_accelerated_table(dataset, source, acceleration_secret)
+            .await?;
 
         self.ctx
             .register_table(&dataset.name, Arc::new(accelerated_table))
