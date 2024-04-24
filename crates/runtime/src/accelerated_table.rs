@@ -9,7 +9,9 @@ use data_components::delete::get_deletion_provider;
 use datafusion::common::OwnedTableReference;
 use datafusion::error::Result as DataFusionResult;
 use datafusion::execution::context::SessionState;
-use datafusion::logical_expr::{cast, col, lit, TableProviderFilterPushDown};
+use datafusion::logical_expr::{
+    binary_expr, cast, col, lit, Operator, TableProviderFilterPushDown,
+};
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{collect, ExecutionPlan, ExecutionPlanProperties};
 use datafusion::scalar::ScalarValue;
@@ -222,7 +224,7 @@ impl AcceleratedTable {
                     tracing::error!("[retention] Failed to get timestamp");
                     continue;
                 };
-                let expr = timestamp_filter_converter.convert(timestamp);
+                let expr = timestamp_filter_converter.convert(timestamp, Operator::Lt);
                 tracing::info!(
                     "[retention] Evicting data for {dataset_name} where {time_column} < {}...",
                     if let Some(value) = chrono::DateTime::from_timestamp(timestamp as i64, 0) {
@@ -398,7 +400,7 @@ impl AcceleratedTable {
                                     tracing::error!("[refresh] Failed to get timestamp");
                                     continue;
                                 };
-                                vec![converter.convert(timestamp)]
+                                vec![converter.convert(timestamp, Operator::Gt)]
                             },
                             _ => vec![],
                         };
@@ -482,25 +484,33 @@ impl TimestampFilterConvert {
     }
 
     #[allow(clippy::cast_possible_wrap)]
-    fn convert(&self, timestamp: u64) -> Expr {
+    fn convert(&self, timestamp: u64, op: Operator) -> Expr {
         let format = self.time_format.clone();
         let time_column: &str = &self.time_column.clone();
         let expr_time_format = format.clone();
         match expr_time_format {
-            ExprTimeFormat::ISO8601 => cast(
-                col(time_column),
-                DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
-            )
-            .lt(Expr::Literal(ScalarValue::TimestampMillisecond(
-                Some((timestamp * 1000) as i64),
-                None,
-            ))),
+            ExprTimeFormat::ISO8601 => binary_expr(
+                cast(
+                    col(time_column),
+                    DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+                ),
+                op,
+                Expr::Literal(ScalarValue::TimestampMillisecond(
+                    Some((timestamp * 1000) as i64),
+                    None,
+                )),
+            ),
             ExprTimeFormat::UnixTimestamp(format) => {
-                col(time_column).lt(lit(timestamp * format.scale))
+                binary_expr(col(time_column), op, lit(timestamp * format.scale))
             }
-            ExprTimeFormat::Timestamp => col(time_column).lt(Expr::Literal(
-                ScalarValue::TimestampMillisecond(Some((timestamp * 1000) as i64), None),
-            )),
+            ExprTimeFormat::Timestamp => binary_expr(
+                col(time_column),
+                op,
+                Expr::Literal(ScalarValue::TimestampMillisecond(
+                    Some((timestamp * 1000) as i64),
+                    None,
+                )),
+            ),
         }
     }
 }
