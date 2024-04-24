@@ -377,7 +377,7 @@ impl AcceleratedTable {
                         tracing::info!("[refresh] Refreshing data for {dataset_name}");
                         status::update_dataset(&dataset_name, status::ComponentStatus::Refreshing);
                         let timer = TimeMeasurement::new("load_dataset_duration_ms", vec![("dataset", dataset_name.clone())]);
-                        let  filters = match (refresh.period, filter_converter.clone()){
+                        let filters = match (refresh.period, filter_converter.clone()){
                             (Some(period), Some(converter)) => {
                                 let start = SystemTime::now() - period;
 
