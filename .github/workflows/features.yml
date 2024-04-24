@@ -54,3 +54,6 @@
   
         - name: Build with only dremio
           run: cargo check --no-default-features --features dremio
+
+        - name: Build with only clickhouse
+          run: cargo check --no-default-features --features clickhouse
