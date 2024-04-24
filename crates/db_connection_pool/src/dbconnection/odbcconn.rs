@@ -15,25 +15,19 @@ limitations under the License.
 */
 
 use std::any::Any;
-use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::PoisonError;
 
-use arrow::datatypes::Schema;
 use arrow::datatypes::SchemaRef;
 use arrow_odbc::arrow_schema_from;
 use arrow_odbc::OdbcReaderBuilder;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::memory::MemoryStream;
 use datafusion::sql::TableReference;
-use odbc_api::handles::HasDataType;
 use odbc_api::handles::Statement;
 use odbc_api::handles::StatementImpl;
-use odbc_api::parameter::CElement;
 use odbc_api::parameter::InputParameter;
 use odbc_api::CursorImpl;
-use odbc_api::ParameterCollection;
 use snafu::prelude::*;
 use snafu::Snafu;
 
@@ -43,7 +37,7 @@ use super::AsyncDbConnection;
 use super::DbConnection;
 use super::Result;
 use itertools::Itertools;
-use odbc_api::{Connection, IntoParameter};
+use odbc_api::Connection;
 
 pub type ODBCParameter = dyn InputParameter + Sync;
 pub type ODBCDbConnection<'a> = (dyn DbConnection<Connection<'a>, &'a ODBCParameter>);
@@ -154,7 +148,10 @@ where
             statement.row_count()
         };
 
-        Ok(row_count.unwrap().try_into().expect("Must obtain row count"))
+        Ok(row_count
+            .unwrap()
+            .try_into()
+            .expect("Must obtain row count"))
     }
 }
 

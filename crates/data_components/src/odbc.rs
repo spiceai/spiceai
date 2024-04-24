@@ -15,17 +15,14 @@ limitations under the License.
 */
 
 #![allow(clippy::module_name_repetitions)]
-use arrow::{
-    array::RecordBatch,
-    datatypes::{Schema, SchemaRef},
-};
+use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
     common::{project_schema, OwnedTableReference},
-    datasource::{provider::TableProviderFactory, TableProvider, TableType},
+    datasource::{TableProvider, TableType},
     error::{DataFusionError, Result as DataFusionResult},
     execution::{context::SessionState, SendableRecordBatchStream, TaskContext},
-    logical_expr::{CreateExternalTable, Expr, TableProviderFilterPushDown},
+    logical_expr::{Expr, TableProviderFilterPushDown},
     physical_expr::EquivalenceProperties,
     physical_plan::{
         stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionMode,
@@ -33,18 +30,14 @@ use datafusion::{
     },
     scalar::ScalarValue,
 };
+use db_connection_pool::dbconnection::odbcconn::ODBCDbConnectionPool;
 use db_connection_pool::{
-    dbconnection::odbcconn::{ODBCConnection, ODBCDbConnection, ODBCDbConnectionPool},
-    odbcpool::ODBCPool,
-};
-use db_connection_pool::{
-    dbconnection::{get_schema, odbcconn::ODBCParameter, query_arrow},
+    dbconnection::{get_schema, query_arrow},
     DbConnectionPool,
 };
 use futures::TryStreamExt;
-use odbc_api::{parameter::InputParameter, Connection};
 use snafu::prelude::*;
-use sql_provider_datafusion::{expr, SqlTable};
+use sql_provider_datafusion::expr;
 use std::{any::Any, fmt, sync::Arc};
 
 use crate::Read;

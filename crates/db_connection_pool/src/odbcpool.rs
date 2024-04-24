@@ -14,20 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::dbconnection::odbcconn::ODBCConnection;
 use crate::dbconnection::odbcconn::{ODBCDbConnection, ODBCParameter};
-use crate::dbconnection::AsyncDbConnection;
-use crate::dbconnection::{odbcconn::ODBCConnection, DbConnection};
 use async_trait::async_trait;
-use odbc_api::parameter::InputParameter;
-use odbc_api::{
-    buffers::Item, sys::AttrConnectionPooling, Connection, ConnectionOptions, Environment,
-    IntoParameter,
-};
+use odbc_api::{sys::AttrConnectionPooling, Connection, ConnectionOptions, Environment};
 use secrets::Secret;
-use snafu::{ensure, ResultExt, Snafu};
-use std::borrow::Borrow;
-use std::sync::Mutex;
-use std::{any::Any, collections::HashMap, path::PathBuf, sync::Arc};
+use snafu::Snafu;
+use std::{collections::HashMap, sync::Arc};
 
 use super::{DbConnectionPool, Result};
 use lazy_static::lazy_static;

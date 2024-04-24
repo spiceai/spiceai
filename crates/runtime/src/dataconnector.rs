@@ -27,7 +27,6 @@ use snafu::prelude::*;
 use spicepod::component::dataset::Dataset;
 use std::any::Any;
 use std::collections::HashMap;
-use std::ffi::CStr;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::Mutex;
