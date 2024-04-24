@@ -364,7 +364,6 @@ impl DataFusion {
                 acceleration_settings.retention_check_enabled,
             ),
             obj_store,
-            true,
         )
         .await;
 
