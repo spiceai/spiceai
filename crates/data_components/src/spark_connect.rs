@@ -154,7 +154,7 @@ fn datatype_as_arrow_schema(data_type: DataType) -> Result<SchemaRef, DataFusion
         return Ok(Arc::new(Schema::new(fields)));
     }
     Err(DataFusionError::Execution(format!(
-        "datatype_as_arrow_schema: Unsupported data type: {data_type:?}"
+        "Unsupported data type: {data_type:?}"
     )))
 }
 
