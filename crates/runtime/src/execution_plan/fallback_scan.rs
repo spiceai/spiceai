@@ -139,6 +139,7 @@ impl ExecutionPlan for FallbackScanExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
+        tracing::trace!("Executing FallbackScanExec: partition={}", partition);
         if partition > 0 {
             return Err(DataFusionError::Execution(format!(
                 "FallbackScanExec only supports 1 partitions, but partition {partition} was requested",
@@ -155,12 +156,25 @@ impl ExecutionPlan for FallbackScanExec {
             let schema = input_stream.schema();
             // If the input_stream returns a value - then we don't need to fallback. Piece back together the input_stream.
             if let Some(input) = input_stream.next().await {
+                tracing::trace!("FallbackScanExec input_stream.next() returned Some()");
+                match &input {
+                    Ok(batch) => {
+                        tracing::trace!(
+                            "FallbackScanExec input_stream.next() is Ok(): num_rows: {}",
+                            batch.num_rows()
+                        );
+                    }
+                    Err(e) => {
+                        tracing::trace!("FallbackScanExec input_stream.next() is Err(): {e}");
+                    }
+                }
                 // Add this input back to the stream
                 let input_once = stream::once(async move { input });
                 let stream_adapter =
                     RecordBatchStreamAdapter::new(schema, input_once.chain(input_stream));
                 Box::pin(stream_adapter) as SendableRecordBatchStream
             } else {
+                tracing::trace!("FallbackScanExec input_stream.next() returned None");
                 let fallback_plan = match fallback_provider
                     .scan(
                         &scan_params.state,
