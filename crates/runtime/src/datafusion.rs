@@ -351,7 +351,7 @@ impl DataFusion {
             source_table_provider,
             accelerated_table_provider,
             Refresh::new(
-                dataset.refresh_interval(),
+                dataset.refresh_check_interval(),
                 refresh_sql.clone(),
                 acceleration_settings.refresh_mode.clone(),
                 dataset.refresh_period(),
