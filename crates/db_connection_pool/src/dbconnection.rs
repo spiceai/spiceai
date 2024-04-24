@@ -21,6 +21,8 @@ use datafusion::{
 };
 use snafu::prelude::*;
 
+#[cfg(feature = "clickhouse")]
+pub mod clickhouseconn;
 #[cfg(feature = "duckdb")]
 pub mod duckdbconn;
 #[cfg(feature = "mysql")]
