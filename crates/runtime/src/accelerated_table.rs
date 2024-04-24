@@ -204,7 +204,7 @@ impl AcceleratedTable {
         let mut interval_timer = tokio::time::interval(retention.check_interval);
 
         let Some(timestamp_filter_converter) =
-            TimestampFilterConvert::create(field, retention.time_format, Some(time_column.clone()))
+            TimestampFilterConvert::create(field, Some(time_column.clone()), retention.time_format)
         else {
             tracing::error!("[retention] Failed to get the expression time format for {time_column}, check schema and time format");
             return;
@@ -380,7 +380,7 @@ impl AcceleratedTable {
                         (Some(_), Some(column)) => {
                             let schema = federated.schema();
                             let field = schema.column_with_name(column.as_str());
-                            TimestampFilterConvert::create(field, refresh.time_format, Some(column))
+                            TimestampFilterConvert::create(field, Some(column), refresh.time_format)
                         }
                     };
 
@@ -427,16 +427,16 @@ impl AcceleratedTable {
 
 #[derive(Clone, Debug)]
 struct TimestampFilterConvert {
-    time_format: ExprTimeFormat,
     time_column: String,
+    time_format: ExprTimeFormat,
 }
 
 #[allow(clippy::needless_pass_by_value)]
 impl TimestampFilterConvert {
     fn create(
         field: Option<(usize, &arrow::datatypes::Field)>,
-        time_format: Option<TimeFormat>,
         time_column: Option<String>,
+        time_format: Option<TimeFormat>,
     ) -> Option<Self> {
         let time_column = time_column?;
 
@@ -476,8 +476,8 @@ impl TimestampFilterConvert {
         };
 
         Some(Self {
-            time_format,
             time_column,
+            time_format,
         })
     }
 
