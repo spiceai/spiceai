@@ -641,9 +641,9 @@ jobs:
           sudo ./clickhouse install
           sudo clickhouse server --daemon -- --tcp_port=9001
           sleep 5
-          clickhouse client -udefault --query="CREATE USER test_user IDENTIFIED BY 'password';"
-          clickhouse client -udefault --query="GRANT ALL PRIVILEGES ON testdb.* TO 'test_user';"
-          clickhouse client -utest_user --password password --query="CREATE DATABASE IF NOT EXISTS testdb;"
+          clickhouse client --port 9001 -udefault --query="CREATE USER test_user IDENTIFIED BY 'password';"
+          clickhouse client --port 9001 -udefault --query="GRANT ALL PRIVILEGES ON testdb.* TO 'test_user';"
+          clickhouse client --port 9001 -utest_user --password password --query="CREATE DATABASE IF NOT EXISTS testdb;"
 
       - name: Wait for Clickhouse to start
         run: sleep 10
@@ -653,8 +653,8 @@ jobs:
 
       - name: Prepare Clickhouse dataset
         run: |
-          clickhouse client -m -n -utest_user --password password --database=testdb < test/scripts/setup-data-clickhouse.sql
-          clickhouse client -utest_user --password password --database=testdb --query="SELECT * FROM test_clickhouse_table;"
+          clickhouse client --port 9001 -m -n -utest_user --password password --database=testdb < test/scripts/setup-data-clickhouse.sql
+          clickhouse client --port 9001 -utest_user --password password --database=testdb --query="SELECT * FROM test_clickhouse_table;"
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         uses: actions/download-artifact@v4
