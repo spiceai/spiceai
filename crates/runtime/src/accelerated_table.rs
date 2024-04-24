@@ -374,7 +374,7 @@ impl AcceleratedTable {
                             None
                         },
                         (Some(_), None) => {
-                            tracing::warn!("[retention] No time_column is provided, refresh_period will be ignored");
+                            tracing::warn!("[refresh] No time_column is provided, refresh_period will be ignored");
                             None
                         }
                         (Some(_), Some(column)) => {
@@ -387,7 +387,7 @@ impl AcceleratedTable {
                     let mut refresh_stream = ReceiverStream::new(receiver);
 
                     while refresh_stream.next().await.is_some() {
-                        tracing::info!("Refreshing data for {dataset_name}");
+                        tracing::info!("[refresh] Refreshing data for {dataset_name}");
                         status::update_dataset(&dataset_name, status::ComponentStatus::Refreshing);
                         let timer = TimeMeasurement::new("load_dataset_duration_ms", vec![("dataset", dataset_name.clone())]);
                         let  filters = match (refresh.period, filter_converter.clone()){
@@ -395,7 +395,7 @@ impl AcceleratedTable {
                                 let start = SystemTime::now() - period;
 
                                 let Ok(timestamp) = get_timestamp(start) else {
-                                    tracing::error!("[retention] Failed to get timestamp");
+                                    tracing::error!("[refresh] Failed to get timestamp");
                                     continue;
                                 };
                                 vec![converter.convert(timestamp)]
@@ -406,7 +406,7 @@ impl AcceleratedTable {
                         let all_data = match get_all_data(&mut ctx, OwnedTableReference::bare(dataset_name.clone()), Arc::clone(&federated), refresh.sql.clone(), filters).await {
                             Ok(data) => data,
                             Err(e) => {
-                                tracing::error!("Error refreshing data for {dataset_name}: {e}");
+                                tracing::error!("[refresh] Error refreshing data for {dataset_name}: {e}");
                                 yield Err(Error::UnableToGetDataFromConnector { source: e });
                                 continue;
                             }
