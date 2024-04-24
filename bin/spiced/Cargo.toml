@@ -18,15 +18,15 @@ flightrepl = { path = "../../crates/flightrepl" }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-metrics.workspace = true
 metrics-exporter-prometheus = "0.13.0"
 
 [features]
-default = ["duckdb", "postgres", "sqlite", "mysql", "flightsql", "databricks", "dremio", "odbc"]
+default = ["duckdb", "postgres", "sqlite", "mysql", "flightsql", "databricks", "dremio", "clickhouse", "odbc"]
 duckdb = ["runtime/duckdb", "spicepod/duckdb", "app/duckdb"]
 postgres = ["runtime/postgres", "spicepod/postgres", "app/postgres"]
 sqlite = ["runtime/sqlite", "spicepod/sqlite", "app/sqlite"]
 mysql = ["runtime/mysql", "spicepod/mysql", "app/mysql"]
+clickhouse = ["runtime/clickhouse"]
 release = []
 dev = ["runtime/dev"]
 keyring-secret-store = ["runtime/keyring-secret-store"]

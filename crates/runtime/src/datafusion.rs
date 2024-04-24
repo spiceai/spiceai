@@ -35,7 +35,8 @@ use datafusion::sql::sqlparser;
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use secrets::Secret;
 use snafu::prelude::*;
-use spicepod::component::dataset::{Dataset, Mode};
+use spicepod::component::dataset::acceleration::RefreshMode;
+use spicepod::component::dataset::{Dataset, Mode, TimeFormat};
 use tokio::spawn;
 use tokio::time::{sleep, Instant};
 
@@ -127,6 +128,64 @@ pub enum Table {
 pub struct DataFusion {
     pub ctx: Arc<SessionContext>,
     data_writers: HashSet<String>,
+}
+
+pub(crate) struct Retention {
+    pub(crate) time_column: String,
+    pub(crate) time_format: Option<TimeFormat>,
+    pub(crate) period: Duration,
+    pub(crate) check_interval: Duration,
+}
+
+impl Retention {
+    pub(crate) fn new(
+        time_column: Option<String>,
+        time_format: Option<TimeFormat>,
+        retention_period: Option<Duration>,
+        retention_check_interval: Option<Duration>,
+        retention_check_enabled: bool,
+    ) -> Option<Self> {
+        if !retention_check_enabled {
+            return None;
+        }
+        if let (Some(time_column), Some(period), Some(check_interval)) =
+            (time_column, retention_period, retention_check_interval)
+        {
+            Some(Self {
+                time_column,
+                time_format,
+                period,
+                check_interval,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+pub(crate) struct Refresh {
+    pub(crate) check_interval: Option<Duration>,
+    pub(crate) sql: Option<String>,
+    pub(crate) mode: RefreshMode,
+    pub(crate) period: Option<Duration>,
+}
+
+impl Refresh {
+    #[allow(clippy::needless_pass_by_value)]
+    #[must_use]
+    pub(crate) fn new(
+        check_interval: Option<Duration>,
+        sql: Option<String>,
+        mode: RefreshMode,
+        period: Option<Duration>,
+    ) -> Self {
+        Self {
+            check_interval,
+            sql,
+            mode,
+            period,
+        }
+    }
 }
 
 impl DataFusion {
@@ -291,9 +350,19 @@ impl DataFusion {
             dataset.name.to_string(),
             source_table_provider,
             accelerated_table_provider,
-            acceleration_settings.refresh_mode.clone(),
-            dataset.refresh_interval(),
-            dataset.refresh_sql(),
+            Refresh::new(
+                dataset.refresh_check_interval(),
+                refresh_sql.clone(),
+                acceleration_settings.refresh_mode.clone(),
+                dataset.refresh_period(),
+            ),
+            Retention::new(
+                dataset.time_column.clone(),
+                dataset.time_format.clone(),
+                dataset.retention_period(),
+                dataset.retention_check_interval(),
+                acceleration_settings.retention_check_enabled,
+            ),
             obj_store,
         )
         .await;

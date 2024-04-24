@@ -69,7 +69,7 @@ impl ExecutionPlan for TeeExec {
     }
 
     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
-        vec![self.input.clone()]
+        vec![Arc::clone(&self.input)]
     }
 
     fn with_new_children(
@@ -77,7 +77,7 @@ impl ExecutionPlan for TeeExec {
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         if children.len() == 1 {
-            Ok(Arc::new(TeeExec::new(children[0].clone(), self.n)))
+            Ok(Arc::new(TeeExec::new(Arc::clone(&children[0]), self.n)))
         } else {
             Err(DataFusionError::Execution(
                 "TeeExec expects exactly one input".to_string(),
@@ -98,7 +98,7 @@ impl ExecutionPlan for TeeExec {
         }
 
         // Coalesce the input into a single partition
-        let coalesce_plan = CoalescePartitionsExec::new(self.input.clone());
+        let coalesce_plan = CoalescePartitionsExec::new(Arc::clone(&self.input));
         let single_partition = coalesce_plan.execute(0, context)?;
 
         Ok(single_partition)

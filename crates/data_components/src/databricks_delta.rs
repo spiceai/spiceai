@@ -48,7 +48,7 @@ impl Read for DatabricksDelta {
         get_delta_table(
             Arc::clone(&self.secret),
             table_reference,
-            self.params.clone(),
+            Arc::clone(&self.params),
         )
         .await
     }
@@ -63,7 +63,7 @@ impl ReadWrite for DatabricksDelta {
         let delta_table = get_delta_table(
             Arc::clone(&self.secret),
             table_reference,
-            self.params.clone(),
+            Arc::clone(&self.params),
         )
         .await?;
 

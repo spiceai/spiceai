@@ -40,6 +40,22 @@ pub enum Mode {
     ReadWrite,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TimeFormat {
+    #[default]
+    UnixSeconds,
+    UnixMillis,
+    #[serde(rename = "ISO8601")]
+    ISO8601,
+}
+
+impl std::fmt::Display for TimeFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Dataset {
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -65,6 +81,12 @@ pub struct Dataset {
     pub replication: Option<replication::Replication>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_column: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_format: Option<TimeFormat>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acceleration: Option<acceleration::Acceleration>,
 
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -83,6 +105,8 @@ impl Dataset {
             sql_ref: None,
             params: None,
             replication: None,
+            time_column: None,
+            time_format: None,
             acceleration: None,
             depends_on: Vec::default(),
         }
@@ -166,16 +190,50 @@ impl Dataset {
     }
 
     #[must_use]
-    pub fn refresh_interval(&self) -> Option<Duration> {
+    pub fn refresh_check_interval(&self) -> Option<Duration> {
         if let Some(acceleration) = &self.acceleration {
-            if let Some(refresh_interval) = &acceleration.refresh_interval {
-                if let Ok(duration) = fundu::parse_duration(refresh_interval) {
+            if let Some(refresh_check_interval) = &acceleration.refresh_check_interval {
+                if let Ok(duration) = fundu::parse_duration(refresh_check_interval) {
                     return Some(duration);
                 }
                 tracing::warn!(
                     "Unable to parse refresh interval for dataset {}: {}",
                     self.name,
-                    refresh_interval
+                    refresh_check_interval
+                );
+            }
+        }
+
+        None
+    }
+
+    pub fn retention_check_interval(&self) -> Option<Duration> {
+        if let Some(acceleration) = &self.acceleration {
+            if let Some(retention_check_interval) = &acceleration.retention_check_interval {
+                if let Ok(duration) = fundu::parse_duration(retention_check_interval) {
+                    return Some(duration);
+                }
+                tracing::warn!(
+                    "Unable to parse retention check interval for dataset {}: {}",
+                    self.name,
+                    retention_check_interval
+                );
+            }
+        }
+
+        None
+    }
+
+    pub fn retention_period(&self) -> Option<Duration> {
+        if let Some(acceleration) = &self.acceleration {
+            if let Some(retention_period) = &acceleration.retention_period {
+                if let Ok(duration) = fundu::parse_duration(retention_period) {
+                    return Some(duration);
+                }
+                tracing::warn!(
+                    "Unable to parse retention period for dataset {}: {}",
+                    self.name,
+                    retention_period
                 );
             }
         }
@@ -187,6 +245,24 @@ impl Dataset {
     pub fn refresh_sql(&self) -> Option<String> {
         if let Some(acceleration) = &self.acceleration {
             return acceleration.refresh_sql.clone();
+        }
+
+        None
+    }
+
+    #[must_use]
+    pub fn refresh_period(&self) -> Option<Duration> {
+        if let Some(acceleration) = &self.acceleration {
+            if let Some(refresh_period) = &acceleration.refresh_period {
+                if let Ok(duration) = fundu::parse_duration(refresh_period) {
+                    return Some(duration);
+                }
+                tracing::warn!(
+                    "Unable to parse refresh period for dataset {}: {}",
+                    self.name,
+                    refresh_period
+                );
+            }
         }
 
         None
@@ -241,6 +317,8 @@ impl WithDependsOn<Dataset> for Dataset {
             sql_ref: self.sql_ref.clone(),
             params: self.params.clone(),
             replication: self.replication.clone(),
+            time_column: self.time_column.clone(),
+            time_format: self.time_format.clone(),
             acceleration: self.acceleration.clone(),
             depends_on: depends_on.to_vec(),
         }
@@ -269,15 +347,6 @@ pub mod acceleration {
         File,
     }
 
-    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-    #[serde(rename_all = "snake_case")]
-    pub enum TimeFormat {
-        #[default]
-        UnixSeconds,
-        UnixMillis,
-        Iso8601,
-    }
-
     impl Display for Mode {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             write!(f, "{self:?}")
@@ -299,13 +368,13 @@ pub mod acceleration {
         pub refresh_mode: RefreshMode,
 
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub refresh_interval: Option<String>,
+        pub refresh_check_interval: Option<String>,
 
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub refresh_sql: Option<String>,
 
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub retention: Option<String>,
+        pub refresh_period: Option<String>,
 
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub params: Option<Params>,
@@ -314,19 +383,13 @@ pub mod acceleration {
         pub engine_secret: Option<String>,
 
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub time_column: Option<String>,
-
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub time_format: Option<TimeFormat>,
-
-        #[serde(default, skip_serializing_if = "Option::is_none")]
         pub retention_period: Option<String>,
 
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub retention_check_interval: Option<String>,
 
         #[serde(default)]
-        pub retention_enabled: bool,
+        pub retention_check_enabled: bool,
     }
 
     const fn default_true() -> bool {

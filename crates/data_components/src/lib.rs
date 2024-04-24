@@ -26,6 +26,8 @@ pub mod databricks_delta;
 #[cfg(feature = "databricks")]
 pub mod databricks_spark;
 
+#[cfg(feature = "clickhouse")]
+pub mod clickhouse;
 #[cfg(feature = "databricks")]
 pub mod deltatable;
 #[cfg(feature = "duckdb")]
@@ -43,6 +45,9 @@ pub mod postgres;
 pub mod spark_connect;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
+
+pub mod delete;
+pub mod util;
 
 #[async_trait]
 pub trait Read: Send + Sync {

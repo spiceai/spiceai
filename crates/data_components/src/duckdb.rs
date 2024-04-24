@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::{Read, ReadWrite};
+use crate::{delete::DeletionTableProviderAdapter, Read, ReadWrite};
 use arrow::{array::RecordBatch, datatypes::SchemaRef};
 use async_trait::async_trait;
 use datafusion::{
@@ -66,6 +66,15 @@ pub enum Error {
 
     #[snafu(display("Unable to insert into duckdb table: {source}"))]
     UnableToInsertToDuckDBTable { source: duckdb::Error },
+
+    #[snafu(display("Unable to delete data from the duckdb table: {source}"))]
+    UnableToDeleteDuckdbData { source: duckdb::Error },
+
+    #[snafu(display("Unable to query data from the duckdb table: {source}"))]
+    UnableToQueryData { source: duckdb::Error },
+
+    #[snafu(display("Unable to commit transaction: {source}"))]
+    UnableToCommitTransaction { source: duckdb::Error },
 
     #[snafu(display("Unable to begin duckdb transaction: {source}"))]
     UnableToBeginTransaction { source: duckdb::Error },
@@ -150,10 +159,11 @@ impl TableProviderFactory for DuckDBTableProviderFactory {
             OwnedTableReference::bare(name.clone()),
         ));
 
-        let read_write_provider: Arc<dyn TableProvider> =
-            DuckDBTableWriter::create(read_provider, duckdb);
+        let read_write_provider = DuckDBTableWriter::create(read_provider, duckdb);
 
-        Ok(read_write_provider)
+        let deleted_table_provider = DeletionTableProviderAdapter::new(read_write_provider);
+
+        Ok(Arc::new(deleted_table_provider))
     }
 }
 
@@ -238,6 +248,36 @@ impl DuckDB {
             .context(UnableToDeleteAllTableDataSnafu)?;
 
         Ok(())
+    }
+
+    fn delete_from(&self, duckdb_conn: &mut DuckDbConnection, where_clause: &str) -> Result<u64> {
+        let tx = duckdb_conn
+            .conn
+            .transaction()
+            .context(UnableToBeginTransactionSnafu)?;
+
+        let count_sql = format!(
+            r#"SELECT COUNT(*) FROM "{}" WHERE {}"#,
+            self.table_name, where_clause
+        );
+
+        let mut count: u64 = tx
+            .query_row(&count_sql, [], |row| row.get::<usize, u64>(0))
+            .context(UnableToQueryDataSnafu)?;
+
+        let sql = format!(
+            r#"DELETE FROM "{}" WHERE {}"#,
+            self.table_name, where_clause
+        );
+        tx.execute(&sql, [])
+            .context(UnableToDeleteDuckdbDataSnafu)?;
+
+        count -= tx
+            .query_row(&count_sql, [], |row| row.get::<usize, u64>(0))
+            .context(UnableToQueryDataSnafu)?;
+
+        tx.commit().context(UnableToCommitTransactionSnafu)?;
+        Ok(count)
     }
 
     fn create_table(&self, transaction: &Transaction<'_>) -> Result<()> {

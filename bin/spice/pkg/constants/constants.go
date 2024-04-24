@@ -16,7 +16,9 @@ limitations under the License.
 
 package constants
 
-import "runtime"
+import (
+	"github.com/spiceai/spiceai/bin/spice/pkg/util"
+)
 
 const (
 	DotSpice               = ".spice"
@@ -29,7 +31,7 @@ var (
 )
 
 func init() {
-	if runtime.GOOS == "windows" {
+	if util.IsWindows() {
 		SpiceRuntimeFilename = "spiced.exe"
 		SpiceCliFilename = "spice.exe"
 	} else {

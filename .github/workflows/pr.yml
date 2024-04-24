@@ -38,6 +38,8 @@ jobs:
       
       - name: Install Protoc
         uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - run: make lint
 
@@ -61,7 +63,7 @@ jobs:
         with:
           os: 'linux'
 
-      - run: make test ci
+      - run: make ci test
 
   build-docker:
     name: Build Docker Image

@@ -5,9 +5,11 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::Field;
 use arrow::datatypes::{self, Schema, SchemaRef, TimeUnit};
 use async_stream::stream;
+use async_trait::async_trait;
 use datafusion::common::project_schema;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::logical_expr::TableProviderFilterPushDown;
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionMode};
@@ -25,7 +27,7 @@ use spark_connect_rs::{
     spark::{data_type, DataType},
     DataFrame, SparkSession,
 };
-use tonic::async_trait;
+use sql_provider_datafusion::expr::{self, Engine};
 
 use std::error::Error;
 
@@ -62,12 +64,27 @@ fn arrow_field_datatype_from_spark_connect_field_datatype(
         Some(data_type::Kind::Long(_)) => Ok(datatypes::DataType::Int64),
         Some(data_type::Kind::Float(_)) => Ok(datatypes::DataType::Float32),
         Some(data_type::Kind::Double(_)) => Ok(datatypes::DataType::Float64),
+        Some(data_type::Kind::Decimal(d)) => {
+            let precision: u8 = d.precision().try_into().map_err(|_| {
+                DataFusionError::Execution(
+                    "Precision value is too large to fit in a u8".to_string(),
+                )
+            })?;
+            let scale: i8 = d.scale().try_into().map_err(|_| {
+                DataFusionError::Execution("Scale value is too large to fit in a i8".to_string())
+            })?;
+            if precision > 38 {
+                return Ok(datatypes::DataType::Decimal256(precision, scale));
+            }
+            Ok(datatypes::DataType::Decimal128(precision, scale))
+        }
         Some(data_type::Kind::String(_)) => Ok(datatypes::DataType::Utf8),
         Some(data_type::Kind::Binary(_)) => Ok(datatypes::DataType::Binary),
         Some(data_type::Kind::Date(_)) => Ok(datatypes::DataType::Date32),
-        Some(data_type::Kind::Timestamp(_)) => {
-            Ok(datatypes::DataType::Timestamp(TimeUnit::Millisecond, None))
-        }
+        Some(data_type::Kind::Timestamp(_)) => Ok(datatypes::DataType::Timestamp(
+            TimeUnit::Microsecond,
+            Some(Arc::from("Etc/UTC")),
+        )),
         Some(data_type::Kind::Array(boxed_array)) => {
             match boxed_array.element_type {
                 Some(data_type) => {
@@ -77,9 +94,9 @@ fn arrow_field_datatype_from_spark_connect_field_datatype(
                     let field = Field::new("", arrow_inner_type, false);
                     Ok(datatypes::DataType::List(Arc::new(field)))
                 }
-                None => Err(DataFusionError::Execution(
-                    "Unsupported data type".to_string(),
-                )),
+                None => Err(DataFusionError::Execution(format!(
+                    "Unsupported array data type: {boxed_array:?}"
+                ))),
             }
         }
         Some(data_type::Kind::Map(boxed_map)) => match (boxed_map.key_type, boxed_map.value_type) {
@@ -94,7 +111,7 @@ fn arrow_field_datatype_from_spark_connect_field_datatype(
                 ))
             }
             _ => Err(DataFusionError::Execution(
-                "Unsupported data type".to_string(),
+                "Unsupported map data type".to_string(),
             )),
         },
         Some(data_type::Kind::Struct(struct_type)) => {
@@ -112,8 +129,11 @@ fn arrow_field_datatype_from_spark_connect_field_datatype(
                 .collect::<Result<Vec<_>, DataFusionError>>()?;
             Ok(datatypes::DataType::Struct(fields.into()))
         }
-        _ => Err(DataFusionError::Execution(
-            "Unsupported data type".to_string(),
+        Some(data_type) => Err(DataFusionError::Execution(format!(
+            "Unsupported data type: {data_type:?}"
+        ))),
+        None => Err(DataFusionError::Execution(
+            "No data type specified".to_string(),
         )),
     }
 }
@@ -133,9 +153,9 @@ fn datatype_as_arrow_schema(data_type: DataType) -> Result<SchemaRef, DataFusion
             .collect::<Result<Vec<_>, DataFusionError>>()?;
         return Ok(Arc::new(Schema::new(fields)));
     }
-    Err(DataFusionError::Execution(
-        "Unsupported data type".to_string(),
-    ))
+    Err(DataFusionError::Execution(format!(
+        "Unsupported data type: {data_type:?}"
+    )))
 }
 
 struct SparkConnectTablePovider {
@@ -150,11 +170,26 @@ impl TableProvider for SparkConnectTablePovider {
     }
 
     fn schema(&self) -> SchemaRef {
-        self.schema.clone()
+        Arc::clone(&self.schema)
     }
 
     fn table_type(&self) -> TableType {
         TableType::Base
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
+        let mut filter_push_down = vec![];
+        for filter in filters {
+            match expr::to_sql(filter) {
+                Ok(_) => filter_push_down.push(TableProviderFilterPushDown::Exact),
+                Err(_) => filter_push_down.push(TableProviderFilterPushDown::Unsupported),
+            }
+        }
+
+        Ok(filter_push_down)
     }
 
     async fn scan(
@@ -166,7 +201,7 @@ impl TableProvider for SparkConnectTablePovider {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(SparkConnectExecutionPlan::new(
             self.dataframe.clone(),
-            self.schema.clone(),
+            Arc::clone(&self.schema),
             projection,
             filters,
             limit,
@@ -178,7 +213,7 @@ impl TableProvider for SparkConnectTablePovider {
 struct SparkConnectExecutionPlan {
     dataframe: DataFrame,
     projected_schema: SchemaRef,
-    filters: Vec<Expr>,
+    filters: Vec<String>,
     limit: Option<i32>,
     properties: PlanProperties,
 }
@@ -212,7 +247,11 @@ impl SparkConnectExecutionPlan {
         Ok(Self {
             dataframe,
             projected_schema: Arc::clone(&projected_schema),
-            filters: filters.to_vec(),
+            filters: filters
+                .iter()
+                .map(|f| expr::to_sql_with_engine(f, Some(Engine::Spark)))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| DataFusionError::Execution(e.to_string()))?,
             limit,
             properties: PlanProperties::new(
                 EquivalenceProperties::new(projected_schema),
@@ -225,16 +264,22 @@ impl SparkConnectExecutionPlan {
 
 impl DisplayAs for SparkConnectExecutionPlan {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> std::fmt::Result {
-        let filters: Vec<String> = self
+        let columns = self
+            .projected_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect::<Vec<_>>();
+        let filters = self
             .filters
             .iter()
             .map(ToString::to_string)
             .collect::<Vec<_>>();
         write!(
             f,
-            "SparkConnectExecutionPlan projected_schema={} filters={}",
-            self.projected_schema,
-            filters.join(",")
+            "SparkConnectExecutionPlan projection=[{}] filters=[{}]",
+            columns.join(", "),
+            filters.join(", "),
         )
     }
 }
@@ -245,7 +290,7 @@ impl ExecutionPlan for SparkConnectExecutionPlan {
     }
 
     fn schema(&self) -> SchemaRef {
-        self.projected_schema.clone()
+        Arc::clone(&self.projected_schema)
     }
 
     fn execute(
@@ -266,7 +311,7 @@ impl ExecutionPlan for SparkConnectExecutionPlan {
             .filters
             .iter()
             .fold(self.dataframe.clone(), |df, filter| {
-                df.filter(filter.to_string().as_str())
+                df.filter(filter.as_str())
             });
         let df = match self.limit {
             Some(limit) => df.limit(limit),

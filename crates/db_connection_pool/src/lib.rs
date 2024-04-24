@@ -18,6 +18,8 @@ use crate::dbconnection::DbConnection;
 use async_trait::async_trait;
 use spicepod::component::dataset::acceleration;
 
+#[cfg(feature = "clickhouse")]
+pub mod clickhousepool;
 pub mod dbconnection;
 #[cfg(feature = "duckdb")]
 pub mod duckdbpool;

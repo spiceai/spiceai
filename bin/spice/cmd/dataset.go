@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"regexp"
 	"strings"
 	"time"
 
@@ -67,6 +68,22 @@ spice dataset configure
 		datasetName = strings.TrimSpace(strings.TrimSuffix(datasetName, "\n"))
 		if datasetName == "" {
 			datasetName = defaultDatasetName
+		}
+
+		match, err := regexp.MatchString("^[a-zA-Z0-9_-]+$", datasetName)
+		if err != nil {
+			cmd.Println(err.Error())
+			os.Exit(1)
+		}
+
+		if !match {
+			cmd.Println(aurora.BrightRed("Dataset name can only contain letters, numbers, underscores, and hyphens"))
+			os.Exit(1)
+		}
+
+		if strings.Contains(datasetName, "-") {
+			// warn that dataset name with hyphen should be quoted in queries
+			cmd.Println(aurora.BrightYellow(fmt.Sprintf("Dataset names with hyphens should be quoted in queries:\ni.e. SELECT * FROM \"%s\"", datasetName)))
 		}
 
 		cmd.Print("description: ")
@@ -117,9 +134,9 @@ spice dataset configure
 
 		if accelerateDataset {
 			dataset.Acceleration = &spec.AccelerationSpec{
-				Enabled:         accelerateDataset,
-				RefreshInterval: time.Second * 10,
-				RefreshMode:     spec.REFRESH_MODE_FULL,
+				Enabled:                   accelerateDataset,
+				RefreshCheckInterval: time.Second * 10,
+				RefreshMode:               spec.REFRESH_MODE_FULL,
 			}
 		}
 

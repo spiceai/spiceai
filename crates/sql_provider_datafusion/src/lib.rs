@@ -33,8 +33,8 @@ use datafusion::{
     execution::{context::SessionState, TaskContext},
     logical_expr::{Expr, TableProviderFilterPushDown, TableType},
     physical_plan::{
-        project_schema, stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType,
-        ExecutionPlan, SendableRecordBatchStream,
+        stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionPlan,
+        SendableRecordBatchStream,
     },
 };
 
@@ -164,6 +164,23 @@ struct SqlExec<T, P> {
     properties: PlanProperties,
 }
 
+pub fn project_schema_safe(
+    schema: &SchemaRef,
+    projection: Option<&Vec<usize>>,
+) -> DataFusionResult<SchemaRef> {
+    let schema = match projection {
+        Some(columns) => {
+            if columns.is_empty() {
+                Arc::clone(schema)
+            } else {
+                Arc::new(schema.project(columns)?)
+            }
+        }
+        None => Arc::clone(schema),
+    };
+    Ok(schema)
+}
+
 impl<T, P> SqlExec<T, P> {
     fn new(
         projections: Option<&Vec<usize>>,
@@ -173,7 +190,8 @@ impl<T, P> SqlExec<T, P> {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Self> {
-        let projected_schema = project_schema(schema, projections)?;
+        let projected_schema = project_schema_safe(schema, projections)?;
+
         Ok(Self {
             projected_schema: Arc::clone(&projected_schema),
             table_reference: table_reference.clone(),
@@ -245,7 +263,7 @@ impl<T: 'static, P: 'static> ExecutionPlan for SqlExec<T, P> {
     }
 
     fn schema(&self) -> SchemaRef {
-        self.projected_schema.clone()
+        Arc::clone(&self.projected_schema)
     }
 
     fn properties(&self) -> &PlanProperties {
@@ -274,7 +292,7 @@ impl<T: 'static, P: 'static> ExecutionPlan for SqlExec<T, P> {
         let fut = get_stream(Arc::clone(&self.pool), sql);
 
         let stream = futures::stream::once(fut).try_flatten();
-        let schema = self.schema().clone();
+        let schema = Arc::clone(&self.schema());
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
 }

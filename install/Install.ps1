@@ -51,19 +51,6 @@ function Download-And-Install-Spice {
 
     Move-Item -Path (Join-Path $tempPath $spiceCliFilename) -Destination $spiceCliFullPath -Force
 
-    # Download the Spice runtime
-    $runtimeInstallPath = Join-Path $spiceCliInstallDir "spiced.exe"
-    $runtimeDownloadUrl = "https://github.com/$spiceOrgName/$spiceRepoName/releases/download/$latestReleaseTag/spiced.exe_windows_$arch.tar.gz"
-    $tempFile = Join-Path $tempPath "spiced.exe_windows_$arch.tar.gz"
-    Write-Host "Downloading Spice Runtime from $runtimeDownloadUrl..."
-    Invoke-WebRequest -Uri $runtimeDownloadUrl -OutFile $tempFile
-    tar -xf $tempFile -C $tempPath
-
-    Move-Item -Path (Join-Path $tempPath "spiced.exe") -Destination $runtimeInstallPath -Force
-
-    # Temporary workaround for spice CLI to work on Windows (expect runtime binary as spiced instead of spiced.exe).
-    $latestReleaseTag  | Out-File -FilePath (Join-Path $spiceCliInstallDir "spiced")
-
     if (Test-Path $spiceCliFullPath) {
         Write-Host "Spice CLI installed into $spiceCliInstallDir successfully."
     } else {
