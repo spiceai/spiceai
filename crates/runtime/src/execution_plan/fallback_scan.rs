@@ -1,7 +1,10 @@
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
+use datafusion::datasource::TableProvider;
 use datafusion::error::{DataFusionError, Result};
+use datafusion::execution::context::SessionState;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
@@ -11,28 +14,52 @@ use datafusion::physical_plan::{
 use futures::{stream, StreamExt};
 use std::any::Any;
 use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-pub type GetFallbackPlanFn = Box<dyn FnOnce() -> Arc<dyn ExecutionPlan> + Send + Sync>;
+#[derive(Clone)]
+pub struct FallbackScanParams {
+    state: SessionState,
+    projection: Option<Vec<usize>>,
+    filters: Vec<Expr>,
+    limit: Option<usize>,
+}
 
-/// `FallbackExec` takes an input `ExecutionPlan` and a fallback `ExecutionPlan`.
-/// If the input `ExecutionPlan` returns 0 rows, the fallback `ExecutionPlan` is executed.
+impl FallbackScanParams {
+    pub fn new(
+        state: &SessionState,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> Self {
+        Self {
+            state: state.clone(),
+            projection: projection.cloned(),
+            filters: filters.to_vec(),
+            limit,
+        }
+    }
+}
+
+/// `FallbackScanExec` takes an input `ExecutionPlan` and a fallback `TableProvider`.
+/// If the input `ExecutionPlan` returns 0 rows, the fallback `TableProvider.scan()` is executed.
 ///
 /// The input and fallback `ExecutionPlan` must have the same schema, execution modes and equivalence properties.
 #[allow(clippy::module_name_repetitions)]
-pub struct FallbackExec {
+pub struct FallbackScanExec {
     /// The input execution plan.
     input: Arc<dyn ExecutionPlan>,
     /// A closure to get the fallback execution plan if needed.
-    fallback: Mutex<Option<GetFallbackPlanFn>>,
+    fallback_table_provider: Arc<dyn TableProvider>,
+    fallback_scan_params: FallbackScanParams,
     properties: PlanProperties,
 }
 
-impl FallbackExec {
-    /// Create a new `FallbackExec`.
+impl FallbackScanExec {
+    /// Create a new `FallbackScanExec`.
     pub fn new(
         mut input: Arc<dyn ExecutionPlan>,
-        fallback: Mutex<Option<GetFallbackPlanFn>>,
+        fallback_table_provider: Arc<dyn TableProvider>,
+        fallback_scan_params: FallbackScanParams,
     ) -> Self {
         let eq_properties = input.equivalence_properties().clone();
         let execution_mode = input.execution_mode();
@@ -43,7 +70,8 @@ impl FallbackExec {
         }
         Self {
             input,
-            fallback,
+            fallback_table_provider,
+            fallback_scan_params,
             properties: PlanProperties::new(
                 eq_properties,
                 Partitioning::UnknownPartitioning(1),
@@ -51,39 +79,24 @@ impl FallbackExec {
             ),
         }
     }
-
-    fn fallback_plan_fn(&self) -> Result<GetFallbackPlanFn> {
-        let backup_plan_opt_fn = match self.fallback.lock() {
-            Ok(mut fallback) => fallback.take(),
-            Err(poisoned) => poisoned.into_inner().take(),
-        };
-
-        let Some(backup_plan_fn) = backup_plan_opt_fn else {
-            return Err(DataFusionError::Execution(
-                "No backup plan provided for FallbackExec, or already consumed".to_string(),
-            ));
-        };
-
-        Ok(backup_plan_fn)
-    }
 }
 
-impl fmt::Debug for FallbackExec {
+impl fmt::Debug for FallbackScanExec {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "FallbackExec")
+        write!(f, "FallbackScanExec")
     }
 }
 
-impl DisplayAs for FallbackExec {
+impl DisplayAs for FallbackScanExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> std::fmt::Result {
-        write!(f, "FallbackExec")
+        write!(f, "FallbackScanExec")
     }
 }
 
 #[async_trait]
-impl ExecutionPlan for FallbackExec {
+impl ExecutionPlan for FallbackScanExec {
     fn name(&self) -> &'static str {
-        "FallbackExec"
+        "FallbackScanExec"
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -107,14 +120,14 @@ impl ExecutionPlan for FallbackExec {
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         if children.len() == 1 {
-            let fallback_plan_fn = self.fallback_plan_fn()?;
-            Ok(Arc::new(FallbackExec::new(
+            Ok(Arc::new(FallbackScanExec::new(
                 Arc::clone(&children[0]),
-                Mutex::new(Some(fallback_plan_fn)),
+                Arc::clone(&self.fallback_table_provider),
+                self.fallback_scan_params.clone(),
             )))
         } else {
             Err(DataFusionError::Execution(
-                "FallbackExec expects exactly one input".to_string(),
+                "FallbackScanExec expects exactly one input".to_string(),
             ))
         }
     }
@@ -126,27 +139,44 @@ impl ExecutionPlan for FallbackExec {
     ) -> Result<SendableRecordBatchStream> {
         if partition > 0 {
             return Err(DataFusionError::Execution(format!(
-                "FallbackExec only supports 1 partitions, but partition {partition} was requested",
+                "FallbackScanExec only supports 1 partitions, but partition {partition} was requested",
             )));
         }
-
-        let fallback_plan_fn = self.fallback_plan_fn()?;
 
         let mut input_stream = self.input.execute(0, Arc::clone(&context))?;
         let schema = input_stream.schema();
 
         let potentially_fallback_stream = stream::once(async move {
             let context = Arc::clone(&context);
+            let schema = input_stream.schema();
+            let scan_params = self.fallback_scan_params.clone();
+            let fallback_provider = Arc::clone(&self.fallback_table_provider);
             // If the input_stream returns a value - then we don't need to fallback. Piece back together the input_stream.
             if let Some(input) = input_stream.next().await {
                 // Add this input back to the stream
                 let input_once = stream::once(async move { input });
-                let schema = input_stream.schema();
                 let stream_adapter =
                     RecordBatchStreamAdapter::new(schema, input_once.chain(input_stream));
                 Box::pin(stream_adapter) as SendableRecordBatchStream
             } else {
-                let fallback_plan = fallback_plan_fn();
+                let fallback_plan = match fallback_provider
+                    .scan(
+                        &scan_params.state,
+                        scan_params.projection.as_ref(),
+                        &scan_params.filters,
+                        scan_params.limit,
+                    )
+                    .await
+                {
+                    Ok(plan) => plan,
+                    Err(e) => {
+                        let error_stream = RecordBatchStreamAdapter::new(
+                            schema,
+                            stream::once(async move { Err(e) }),
+                        );
+                        return Box::pin(error_stream) as SendableRecordBatchStream;
+                    }
+                };
                 match fallback_plan.execute(0, context) {
                     Ok(stream) => stream,
                     Err(e) => {
@@ -156,7 +186,6 @@ impl ExecutionPlan for FallbackExec {
                                 "Error executing fallback plan: {e}"
                             )))
                         });
-                        let schema = input_stream.schema();
                         let stream_adapter = RecordBatchStreamAdapter::new(schema, error_stream);
                         Box::pin(stream_adapter) as SendableRecordBatchStream
                     }

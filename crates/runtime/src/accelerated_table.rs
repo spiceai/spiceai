@@ -32,6 +32,7 @@ use tokio::sync::mpsc::Receiver;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::datafusion::{Refresh, Retention};
+use crate::execution_plan::fallback_scan::{FallbackScanExec, FallbackScanParams};
 use crate::execution_plan::slice::SliceExec;
 use crate::execution_plan::tee::TeeExec;
 use crate::{
@@ -73,6 +74,7 @@ pub(crate) struct AcceleratedTable {
     federated: Arc<dyn TableProvider>,
     refresh_trigger: Option<mpsc::Sender<()>>,
     handlers: Vec<JoinHandle<()>>,
+    fallback_on_zero_results: bool,
 }
 
 enum AccelerationRefreshMode {
@@ -92,7 +94,6 @@ struct ExprUnixTimestamp {
     scale: u64,
 }
 
-#[allow(clippy::too_many_arguments)]
 impl AcceleratedTable {
     pub async fn new(
         dataset_name: String,
@@ -101,6 +102,7 @@ impl AcceleratedTable {
         refresh: Refresh,
         retention: Option<Retention>,
         object_store: Option<(Url, Arc<dyn ObjectStore + 'static>)>,
+        fallback_on_zero_results: bool,
     ) -> Self {
         let mut refresh_trigger = None;
         let mut scheduled_refreshes_handle: Option<JoinHandle<()>> = None;
@@ -147,6 +149,7 @@ impl AcceleratedTable {
             federated,
             refresh_trigger,
             handlers,
+            fallback_on_zero_results,
         }
     }
 
@@ -504,9 +507,20 @@ impl TableProvider for AcceleratedTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        self.accelerator
+        let accelerated_input = self
+            .accelerator
             .scan(state, projection, filters, limit)
-            .await
+            .await?;
+
+        if self.fallback_on_zero_results {
+            Ok(Arc::new(FallbackScanExec::new(
+                accelerated_input,
+                Arc::clone(&self.federated),
+                FallbackScanParams::new(state, projection, filters, limit),
+            )))
+        } else {
+            Ok(accelerated_input)
+        }
     }
 
     async fn insert_into(
