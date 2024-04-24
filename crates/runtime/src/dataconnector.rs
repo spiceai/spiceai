@@ -35,6 +35,8 @@ use url::Url;
 use secrets::Secret;
 use std::future::Future;
 
+#[cfg(feature = "clickhouse")]
+pub mod clickhouse;
 #[cfg(feature = "databricks")]
 pub mod databricks;
 #[cfg(feature = "dremio")]
@@ -151,6 +153,8 @@ pub async fn register_all() {
     register_connector_factory("postgres", postgres::Postgres::create).await;
     #[cfg(feature = "duckdb")]
     register_connector_factory("duckdb", duckdb::DuckDB::create).await;
+    #[cfg(feature = "clickhouse")]
+    register_connector_factory("clickhouse", clickhouse::Clickhouse::create).await;
 }
 
 pub trait DataConnectorFactory {

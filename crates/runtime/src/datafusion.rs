@@ -360,7 +360,7 @@ impl DataFusion {
             Refresh::new(
                 dataset.time_column.clone(),
                 dataset.time_format.clone(),
-                dataset.refresh_interval(),
+                dataset.refresh_check_interval(),
                 refresh_sql.clone(),
                 acceleration_settings.refresh_mode.clone(),
                 dataset.refresh_period(),

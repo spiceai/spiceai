@@ -153,11 +153,11 @@ impl AcceleratedTable {
     }
 
     async fn schedule_regular_refreshes(
-        refresh_interval: Option<Duration>,
+        refresh_check_interval: Option<Duration>,
         refresh_trigger: mpsc::Sender<()>,
     ) -> Option<JoinHandle<()>> {
-        if let Some(refresh_interval) = refresh_interval {
-            let mut interval_timer = interval(refresh_interval);
+        if let Some(refresh_check_interval) = refresh_check_interval {
+            let mut interval_timer = interval(refresh_check_interval);
             let trigger = refresh_trigger.clone();
             let handle = tokio::spawn(async move {
                 loop {

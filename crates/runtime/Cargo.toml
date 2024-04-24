@@ -25,7 +25,7 @@ tonic.workspace = true
 tonic_0_9_0 = { version = "0.9.0", package = "tonic", features = ["gzip"] }
 tonic-health = "0.9.0"
 futures.workspace = true
-uuid = "1.6.1"
+uuid.workspace = true
 tokio-stream = "0.1"
 async-stream.workspace = true
 dirs = "5.0.1"
@@ -66,6 +66,7 @@ mysql_async = { workspace = true, optional = true }
 postgres-native-tls = { version = "0.5.0", optional = true }
 ns_lookup = { path = "../ns_lookup" }
 chrono = { version = "0.4.38" }
+clickhouse-rs = { workspace = true, optional = true }
 
 [features]
 default = ["keyring-secret-store", "aws-secrets-manager"]
@@ -95,6 +96,7 @@ sqlite = [
     "data_components/sqlite",
 ]
 mysql = ["dep:mysql_async", "db_connection_pool/mysql", "arrow_sql_gen/mysql", "data_components/mysql"]
+clickhouse = ["dep:clickhouse-rs", "db_connection_pool/clickhouse", "arrow_sql_gen/clickhouse", "data_components/clickhouse"]
 keyring-secret-store = ["secrets/keyring-secret-store"]
 flightsql = ["data_components/flightsql"]
 aws-secrets-manager = ["secrets/aws-secrets-manager"]

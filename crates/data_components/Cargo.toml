@@ -43,6 +43,7 @@ arrow_sql_gen = { path = "../arrow_sql_gen", optional = true }
 rusqlite = { workspace = true, optional = true }
 tokio-rusqlite = { workspace = true, optional = true }
 spark-connect-rs =  { git = "https://github.com/edmondop/spark-connect-rs.git", rev = "24b8a437af41989bf7594e1606c37f30c134bba2", features = ["tls"], optional = true }
+clickhouse-rs = { workspace = true, optional = true }
 
 [features]
 duckdb = ["dep:duckdb", "dep:r2d2"]
@@ -50,4 +51,5 @@ flightsql = ["dep:tonic", "dep:r2d2"]
 postgres = ["dep:bb8", "dep:bb8-postgres", "dep:postgres-native-tls", "arrow_sql_gen/postgres", "dep:tokio-postgres"]
 mysql = ["dep:mysql_async", "arrow_sql_gen/mysql"]
 sqlite = ["dep:rusqlite", "dep:tokio-rusqlite", "arrow_sql_gen/sqlite"]
+clickhouse = ["dep:clickhouse-rs", "arrow_sql_gen/clickhouse"]
 databricks = ["dep:spark-connect-rs", "dep:deltalake"]
