@@ -22,12 +22,14 @@ use std::sync::PoisonError;
 
 use arrow::datatypes::Schema;
 use arrow::datatypes::SchemaRef;
+use arrow_odbc::arrow_schema_from;
 use arrow_odbc::OdbcReaderBuilder;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::memory::MemoryStream;
 use datafusion::sql::TableReference;
 use odbc_api::handles::HasDataType;
 use odbc_api::handles::Statement;
+use odbc_api::handles::StatementImpl;
 use odbc_api::parameter::CElement;
 use odbc_api::parameter::InputParameter;
 use odbc_api::CursorImpl;
@@ -80,8 +82,7 @@ impl<'a> AsyncDbConnection<Connection<'a>, &'a ODBCParameter> for ODBCConnection
 where
     'a: 'static,
 {
-    fn new(conn: Connection<'a>) -> Self
-where {
+    fn new(conn: Connection<'a>) -> Self {
         ODBCConnection {
             conn: Arc::new(conn.into()),
         }
@@ -90,7 +91,7 @@ where {
     #[must_use]
     #[allow(clippy::type_complexity, clippy::type_repetition_in_bounds)]
     async fn get_schema(&self, table_reference: &TableReference) -> Result<SchemaRef> {
-        let cxn = self.conn.lock().expect("Must obtain mutex");
+        let cxn = self.conn.lock().expect("Must lock");
 
         let cursor = cxn
             .execute(
@@ -119,45 +120,50 @@ where {
         sql: &str,
         params: &[&'a ODBCParameter],
     ) -> Result<SendableRecordBatchStream> {
-        let cxn = self.conn.lock().expect("Must obtain mutex");
-        let prepared = cxn.prepare(sql)?;
+        let cxn = self.conn.lock().expect("Must lock");
+        let mut prepared = cxn.prepare(sql)?;
+        let schema = Arc::new(arrow_schema_from(&mut prepared)?);
         let mut statement = prepared.into_statement();
 
-        for (i, param) in params.iter().enumerate() {
-            unsafe {
-                statement
-                    .bind_input_parameter((i + 1).try_into().unwrap(), *param)
-                    .unwrap();
-            }
-        }
+        bind_parameters(&mut statement, params);
 
         let cursor = unsafe {
             statement.execute().unwrap();
-            CursorImpl::new(statement)
+            CursorImpl::new(statement.as_stmt_ref())
         };
 
         let reader = OdbcReaderBuilder::new()
+            .with_schema(schema.clone())
             .build(cursor)
             .context(ArrowODBCSnafu)?;
 
-        let results =
-            reader.collect::<Vec<Result<arrow::array::RecordBatch, arrow::error::ArrowError>>>();
+        let results = reader.map(|b| b.unwrap()).collect_vec();
 
-        let schema: Arc<Schema> = results.first().unwrap().as_ref().unwrap().schema();
-        Ok(Box::pin(MemoryStream::try_new(
-            results
-                .iter()
-                .map(|r| r.as_ref().clone().unwrap().clone())
-                .collect_vec(),
-            schema,
-            None,
-        )?))
+        Ok(Box::pin(MemoryStream::try_new(results, schema, None)?))
     }
 
     async fn execute(&self, query: &str, params: &[&'a ODBCParameter]) -> Result<u64> {
-        let cxn = self.conn.lock().expect("Must get mutex");
-        let mut prepared = cxn.prepare(query)?;
-        prepared.execute(())?;
-        Ok(prepared.row_count()?.unwrap().try_into().unwrap())
+        let cxn = self.conn.lock().expect("Must lock");
+        let prepared = cxn.prepare(query)?;
+        let mut statement = prepared.into_statement();
+
+        bind_parameters(&mut statement, params);
+
+        let row_count = unsafe {
+            statement.execute().unwrap();
+            statement.row_count()
+        };
+
+        Ok(row_count.unwrap().try_into().expect("Must obtain row count"))
+    }
+}
+
+fn bind_parameters(statement: &mut StatementImpl, params: &[&'_ ODBCParameter]) -> () {
+    for (i, param) in params.iter().enumerate() {
+        unsafe {
+            statement
+                .bind_input_parameter((i + 1).try_into().unwrap(), *param)
+                .unwrap();
+        }
     }
 }

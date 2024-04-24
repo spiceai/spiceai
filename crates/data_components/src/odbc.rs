@@ -21,21 +21,31 @@ use arrow::{
 };
 use async_trait::async_trait;
 use datafusion::{
-    common::OwnedTableReference,
-    datasource::{provider::TableProviderFactory, TableProvider},
+    common::{project_schema, OwnedTableReference},
+    datasource::{provider::TableProviderFactory, TableProvider, TableType},
     error::{DataFusionError, Result as DataFusionResult},
-    execution::context::SessionState,
-    logical_expr::CreateExternalTable,
+    execution::{context::SessionState, SendableRecordBatchStream, TaskContext},
+    logical_expr::{CreateExternalTable, Expr, TableProviderFilterPushDown},
+    physical_expr::EquivalenceProperties,
+    physical_plan::{
+        stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionMode,
+        ExecutionPlan, Partitioning, PlanProperties,
+    },
+    scalar::ScalarValue,
 };
-use db_connection_pool::DbConnectionPool;
 use db_connection_pool::{
     dbconnection::odbcconn::{ODBCConnection, ODBCDbConnection, ODBCDbConnectionPool},
     odbcpool::ODBCPool,
 };
-use odbc_api::parameter::InputParameter;
+use db_connection_pool::{
+    dbconnection::{get_schema, odbcconn::ODBCParameter, query_arrow},
+    DbConnectionPool,
+};
+use futures::TryStreamExt;
+use odbc_api::{parameter::InputParameter, Connection};
 use snafu::prelude::*;
-use sql_provider_datafusion::SqlTable;
-use std::sync::Arc;
+use sql_provider_datafusion::{expr, SqlTable};
+use std::{any::Any, fmt, sync::Arc};
 
 use crate::Read;
 
@@ -47,6 +57,17 @@ pub enum Error {
     },
     #[snafu(display("The table '{table_name}' doesn't exist in the Postgres server"))]
     TableDoesntExist { table_name: String },
+
+    #[snafu(display("Unable to get a DB connection from the pool: {source}"))]
+    UnableToGetConnectionFromPool { source: db_connection_pool::Error },
+
+    #[snafu(display("Unable to get schema: {source}"))]
+    UnableToGetSchema {
+        source: db_connection_pool::dbconnection::Error,
+    },
+
+    #[snafu(display("Unable to generate SQL: {source}"))]
+    UnableToGenerateSQL { source: expr::Error },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -76,10 +97,303 @@ where
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         let pool = Arc::clone(&self.pool);
         let dyn_pool: Arc<ODBCDbConnectionPool<'a>> = pool;
-        let table_provider: SqlTable<_, _> = SqlTable::new(&dyn_pool, table_reference)
+        let table_provider = ODBCSqlTable::new(&dyn_pool, table_reference)
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
         Ok(Arc::new(table_provider))
+    }
+}
+
+/*
+    TODO: atm this exists to customize quoting behavior that otherwise
+    breaks odbc queries with the default datafusion provider
+*/
+
+pub struct ODBCSqlTable<'a> {
+    pool: Arc<ODBCDbConnectionPool<'a>>,
+    schema: SchemaRef,
+    table_reference: OwnedTableReference,
+}
+
+impl<'a> ODBCSqlTable<'a>
+where
+    'a: 'static,
+{
+    pub async fn new(
+        pool: &Arc<ODBCDbConnectionPool<'a>>,
+        table_reference: impl Into<OwnedTableReference>,
+    ) -> Result<Self> {
+        let table_reference = table_reference.into();
+        let conn = pool
+            .connect()
+            .await
+            .context(UnableToGetConnectionFromPoolSnafu)?;
+
+        let schema = get_schema(conn, &table_reference)
+            .await
+            .context(UnableToGetSchemaSnafu)?;
+
+        Ok(Self {
+            pool: Arc::clone(pool),
+            schema,
+            table_reference,
+        })
+    }
+
+    pub fn new_with_schema(
+        pool: &Arc<ODBCDbConnectionPool<'a>>,
+        schema: impl Into<SchemaRef>,
+        table_reference: impl Into<OwnedTableReference>,
+    ) -> Self {
+        Self {
+            pool: Arc::clone(pool),
+            schema: schema.into(),
+            table_reference: table_reference.into(),
+        }
+    }
+
+    fn create_physical_plan(
+        &self,
+        projections: Option<&Vec<usize>>,
+        schema: &SchemaRef,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(ODBCSqlExec::new(
+            projections,
+            schema,
+            &self.table_reference,
+            Arc::clone(&self.pool),
+            filters,
+            limit,
+        )?))
+    }
+}
+
+#[async_trait]
+impl<'a> TableProvider for ODBCSqlTable<'a>
+where
+    'a: 'static,
+{
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
+        let mut filter_push_down = vec![];
+        for filter in filters {
+            match odbc_to_sql(filter) {
+                Ok(_) => filter_push_down.push(TableProviderFilterPushDown::Exact),
+                Err(_) => filter_push_down.push(TableProviderFilterPushDown::Unsupported),
+            }
+        }
+
+        Ok(filter_push_down)
+    }
+
+    async fn scan(
+        &self,
+        _state: &SessionState,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        return self.create_physical_plan(projection, &self.schema(), filters, limit);
+    }
+}
+
+struct ODBCSqlExec<'a> {
+    projected_schema: SchemaRef,
+    table_reference: OwnedTableReference,
+    pool: Arc<ODBCDbConnectionPool<'a>>,
+    filters: Vec<Expr>,
+    limit: Option<usize>,
+    properties: PlanProperties,
+}
+
+impl<'a> ODBCSqlExec<'a>
+where
+    'a: 'static,
+{
+    fn new(
+        projections: Option<&Vec<usize>>,
+        schema: &SchemaRef,
+        table_reference: &OwnedTableReference,
+        pool: Arc<ODBCDbConnectionPool<'a>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> DataFusionResult<Self> {
+        let projected_schema = project_schema(schema, projections)?;
+        Ok(Self {
+            projected_schema: Arc::clone(&projected_schema),
+            table_reference: table_reference.clone(),
+            pool,
+            filters: filters.to_vec(),
+            limit,
+            properties: PlanProperties::new(
+                EquivalenceProperties::new(projected_schema),
+                Partitioning::UnknownPartitioning(1),
+                ExecutionMode::Bounded,
+            ),
+        })
+    }
+
+    fn sql(&self) -> Result<String> {
+        let columns = self
+            .projected_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let limit_expr = match self.limit {
+            Some(limit) => format!("LIMIT {limit}"),
+            None => String::new(),
+        };
+
+        let where_expr = if self.filters.is_empty() {
+            String::new()
+        } else {
+            let filter_expr = self
+                .filters
+                .iter()
+                .map(odbc_to_sql)
+                .collect::<expr::Result<Vec<_>>>()
+                .context(UnableToGenerateSQLSnafu)?;
+            format!("WHERE {}", filter_expr.join(" AND "))
+        };
+
+        Ok(format!(
+            "SELECT {columns} FROM {table_reference} {where_expr} {limit_expr}",
+            table_reference = self.table_reference.to_quoted_string(),
+        ))
+    }
+}
+
+impl<'a> std::fmt::Debug for ODBCSqlExec<'a>
+where
+    'a: 'static,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let sql = self.sql().unwrap_or_default();
+        write!(f, "ODBCSqlExec sql={sql}")
+    }
+}
+
+impl<'a> DisplayAs for ODBCSqlExec<'a>
+where
+    'a: 'static,
+{
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> std::fmt::Result {
+        let sql = self.sql().unwrap_or_default();
+        write!(f, "ODBCSqlExec sql={sql}")
+    }
+}
+
+impl<'a> ExecutionPlan for ODBCSqlExec<'a>
+where
+    'a: 'static,
+{
+    fn name(&self) -> &'static str {
+        "ODBCSqlExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        self.projected_schema.clone()
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        Ok(self)
+    }
+
+    fn execute(
+        &self,
+        _partition: usize,
+        _context: Arc<TaskContext>,
+    ) -> DataFusionResult<SendableRecordBatchStream> {
+        let sql = self.sql().map_err(to_execution_error)?;
+        tracing::debug!("SqlExec sql: {sql}");
+
+        let fut = get_stream(Arc::clone(&self.pool), sql);
+
+        let stream = futures::stream::once(fut).try_flatten();
+        let schema = self.schema().clone();
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+    }
+}
+
+async fn get_stream<T: 'static, P: 'static>(
+    pool: Arc<dyn DbConnectionPool<T, P> + Send + Sync>,
+    sql: String,
+) -> DataFusionResult<SendableRecordBatchStream> {
+    let conn = pool.connect().await.map_err(to_execution_error)?;
+
+    query_arrow(conn, sql).await.map_err(to_execution_error)
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn to_execution_error(e: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> DataFusionError {
+    DataFusionError::Execution(format!("{}", e.into()).to_string())
+}
+
+fn odbc_to_sql(expr: &Expr) -> expr::Result<String> {
+    match expr {
+        Expr::BinaryExpr(binary_expr) => {
+            let left = odbc_to_sql(&binary_expr.left)?;
+            let right = odbc_to_sql(&binary_expr.right)?;
+            Ok(format!("{} {} {}", left, binary_expr.op, right))
+        }
+        Expr::Column(name) => Ok(name.to_string()),
+        Expr::Literal(value) => match value {
+            ScalarValue::Null => Ok(value.to_string()),
+            ScalarValue::Int16(Some(value)) => Ok(value.to_string()),
+            ScalarValue::Int32(Some(value)) => Ok(value.to_string()),
+            ScalarValue::Int64(Some(value)) => Ok(value.to_string()),
+            ScalarValue::Boolean(Some(value)) => Ok(value.to_string()),
+            ScalarValue::Utf8(Some(value)) | ScalarValue::LargeUtf8(Some(value)) => {
+                Ok(format!("'{value}'"))
+            }
+            ScalarValue::Float32(Some(value)) => Ok(value.to_string()),
+            ScalarValue::Float64(Some(value)) => Ok(value.to_string()),
+            ScalarValue::Int8(Some(value)) => Ok(value.to_string()),
+            ScalarValue::UInt8(Some(value)) => Ok(value.to_string()),
+            ScalarValue::UInt16(Some(value)) => Ok(value.to_string()),
+            ScalarValue::UInt32(Some(value)) => Ok(value.to_string()),
+            ScalarValue::UInt64(Some(value)) => Ok(value.to_string()),
+            _ => Err(expr::Error::UnsupportedFilterExpr {
+                expr: format!("{expr}"),
+            }),
+        },
+        _ => Err(expr::Error::UnsupportedFilterExpr {
+            expr: format!("{expr}"),
+        }),
     }
 }
