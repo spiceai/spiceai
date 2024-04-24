@@ -88,40 +88,37 @@ fn get_config_from_params(
     let options: Option<Options>;
     if let Some(clickhouse_connection_string) = get_secret_or_param(
         params,
-        &secret,
+        secret,
         "clickhouse_connection_string_key",
         "clickhouse_connection_string",
     ) {
         let mut new_options = Options::from_str(&clickhouse_connection_string)
             .context(InvalidConnectionStringSnafu)?;
-        if clickhouse_connection_string
-            .find("connection_timeout")
-            .is_none()
-        {
+        if !clickhouse_connection_string.contains("connection_timeout") {
             // Default timeouf of 500ms is not enough in some cases.
             new_options = new_options.connection_timeout(Duration::from_secs(5));
         }
         options = Some(new_options);
     } else {
         let mut connection_opts: Vec<String> = vec![];
-        let keys = vec![
+        let keys = [
             "clickhouse_user",
             "clickhouse_host",
             "clickhouse_tcp_port",
             "clickhouse_db",
         ];
-        for key in keys.iter() {
+        for key in &keys {
             let value = params.get(*key);
             match value {
                 Some(value) => connection_opts.push(value.clone()),
                 None => NotEnoughParametersForConnectionSnafu {
-                    parameter_name: key.to_string(),
+                    parameter_name: (*key).to_string(),
                 }
                 .fail()?,
             }
         }
         let password =
-            get_secret_or_param(params, &secret, "clickhouse_pass_key", "clickhouse_pass");
+            get_secret_or_param(params, secret, "clickhouse_pass_key", "clickhouse_pass");
         match password {
             Some(password) => connection_opts.insert(1, password),
             None => NotEnoughParametersForConnectionSnafu {
