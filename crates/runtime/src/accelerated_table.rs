@@ -79,6 +79,12 @@ enum AccelerationRefreshMode {
     Append,
 }
 
+fn validate_refresh_period(refresh: &Refresh, dataset: &str) {
+    if refresh.period.is_some() && refresh.time_column.is_none() {
+        tracing::warn!("No time_column is provided, refresh_period will be ignored for {dataset}");
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 impl AcceleratedTable {
     pub async fn new(
@@ -103,6 +109,7 @@ impl AcceleratedTable {
             }
         };
 
+        validate_refresh_period(&refresh, &dataset_name);
         let refresh_handle = tokio::spawn(Self::start_refresh(
             dataset_name.clone(),
             Arc::clone(&federated),
@@ -356,20 +363,10 @@ impl AcceleratedTable {
                     }
                 }
                 AccelerationRefreshMode::Full(receiver) => {
-                    let filter_converter = match (refresh.period, refresh.time_column) {
-                        (None, Some(_) | None) => {
-                            None
-                        },
-                        (Some(_), None) => {
-                            tracing::warn!("[refresh] No time_column is provided, refresh_period will be ignored");
-                            None
-                        }
-                        (Some(_), Some(column)) => {
-                            let schema = federated.schema();
-                            let field = schema.column_with_name(column.as_str());
-                            TimestampFilterConvert::create(field, Some(column), refresh.time_format)
-                        }
-                    };
+                    let schema = federated.schema();
+                    let column = refresh.time_column.clone().unwrap_or_default();
+                    let field = schema.column_with_name(column.as_str());
+                    let filter_converter = TimestampFilterConvert::create(field, refresh.time_column, refresh.time_format);
 
                     let mut refresh_stream = ReceiverStream::new(receiver);
 

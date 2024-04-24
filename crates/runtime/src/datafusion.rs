@@ -164,6 +164,7 @@ impl Retention {
     }
 }
 
+#[derive(Clone, Debug)]
 pub(crate) struct Refresh {
     pub(crate) time_column: Option<String>,
     pub(crate) time_format: Option<TimeFormat>,
