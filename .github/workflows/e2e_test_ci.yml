@@ -639,7 +639,7 @@ jobs:
         run: |
           curl https://clickhouse.com/ | sh
           sudo ./clickhouse install
-          clickhouse server --daemon -- --tcp_port=9001
+          sudo -u clickhouse /usr/bin/clickhouse-server --config=/etc/clickhouse-server/config.xml --daemon  -- --tcp_port=9001
           sleep 5
           clickhouse client --port 9001 -udefault --query="CREATE USER test_user IDENTIFIED BY 'password';"
           clickhouse client --port 9001 -udefault --query="GRANT ALL PRIVILEGES ON testdb.* TO 'test_user';"
