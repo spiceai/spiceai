@@ -621,6 +621,26 @@ jobs:
           killall spice
           cat spice.log
 
+  test_quickstart_clickhouse:
+    name: 'Test Clickhouse quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
+    runs-on: ${{ matrix.target.runner }}
+    needs:
+      - build
+      - setup-matrix
+
+    strategy:
+      matrix:
+        target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Clickhouse
+        run: |
+          curl https://clickhouse.com/ | sh
+          sudo ./clickhouse install
+          sudo clickhouse start
+
   test_local_acceleration:
     name: 'Test acceleration on ${{ matrix.target.name }} using ${{ matrix.acceleration.engine }}'
     runs-on: ${{ matrix.target.runner }}
