@@ -214,7 +214,7 @@ pub async fn get_all_data(
     };
 
     for filter in filters {
-        df = df.filter(filter).context(UnableToCreateDataFrameSnafu)?;
+        df = df.filter(filter).context(UnableToFilterDataFrameSnafu {})?;
     }
 
     let batches = df.collect().await.context(UnableToScanTableProviderSnafu)?;
