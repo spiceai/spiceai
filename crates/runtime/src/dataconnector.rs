@@ -192,6 +192,7 @@ pub async fn get_all_data(
     sql: Option<String>,
     filters: Vec<Expr>,
 ) -> Result<(SchemaRef, Vec<arrow::record_batch::RecordBatch>)> {
+    // TODO: handle filters in following PR
     _ = filters;
 
     let df = match sql {
