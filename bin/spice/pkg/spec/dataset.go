@@ -36,13 +36,13 @@ type DatasetSpec struct {
 }
 
 type AccelerationSpec struct {
-	Enabled         bool              `json:"enabled,omitempty" csv:"enabled" yaml:"enabled,omitempty"`
-	Mode            string            `json:"mode,omitempty" csv:"mode" yaml:"mode,omitempty"`
-	Engine          string            `json:"engine,omitempty" csv:"engine" yaml:"engine,omitempty"`
-	RefreshMode     string            `json:"refresh_mode,omitempty" csv:"refresh_mode" yaml:"refresh_mode,omitempty"`
-	RefreshInterval time.Duration     `json:"refresh_check_interval,omitempty" csv:"refresh_check_interval" yaml:"refresh_check_interval,omitempty"`
-	RefreshSql      string            `json:"refresh_sql,omitempty" csv:"refresh_sql" yaml:"refresh_sql,omitempty"`
-	Retention       time.Duration     `json:"retention,omitempty" csv:"retention" yaml:"retention,omitempty"`
-	Params          map[string]string `json:"params,omitempty" csv:"params" yaml:"params,omitempty"`
-	EngineSecret    string            `json:"engine_secret,omitempty" csv:"engine_secret" yaml:"engine_secret,omitempty"`
+	Enabled              bool              `json:"enabled,omitempty" csv:"enabled" yaml:"enabled,omitempty"`
+	Mode                 string            `json:"mode,omitempty" csv:"mode" yaml:"mode,omitempty"`
+	Engine               string            `json:"engine,omitempty" csv:"engine" yaml:"engine,omitempty"`
+	RefreshMode          string            `json:"refresh_mode,omitempty" csv:"refresh_mode" yaml:"refresh_mode,omitempty"`
+	RefreshCheckInterval time.Duration     `json:"refresh_check_interval,omitempty" csv:"refresh_check_interval" yaml:"refresh_check_interval,omitempty"`
+	RefreshSql           string            `json:"refresh_sql,omitempty" csv:"refresh_sql" yaml:"refresh_sql,omitempty"`
+	Retention            time.Duration     `json:"retention,omitempty" csv:"retention" yaml:"retention,omitempty"`
+	Params               map[string]string `json:"params,omitempty" csv:"params" yaml:"params,omitempty"`
+	EngineSecret         string            `json:"engine_secret,omitempty" csv:"engine_secret" yaml:"engine_secret,omitempty"`
 }
