@@ -17,6 +17,7 @@ use std::fmt;
 use std::sync::Arc;
 
 #[derive(Clone)]
+#[allow(clippy::module_name_repetitions)]
 pub struct FallbackScanParams {
     state: SessionState,
     projection: Option<Vec<usize>>,
@@ -25,6 +26,7 @@ pub struct FallbackScanParams {
 }
 
 impl FallbackScanParams {
+    #[must_use]
     pub fn new(
         state: &SessionState,
         projection: Option<&Vec<usize>>,
@@ -145,12 +147,12 @@ impl ExecutionPlan for FallbackScanExec {
 
         let mut input_stream = self.input.execute(0, Arc::clone(&context))?;
         let schema = input_stream.schema();
+        let scan_params = self.fallback_scan_params.clone();
+        let fallback_provider = Arc::clone(&self.fallback_table_provider);
 
         let potentially_fallback_stream = stream::once(async move {
             let context = Arc::clone(&context);
             let schema = input_stream.schema();
-            let scan_params = self.fallback_scan_params.clone();
-            let fallback_provider = Arc::clone(&self.fallback_table_provider);
             // If the input_stream returns a value - then we don't need to fallback. Piece back together the input_stream.
             if let Some(input) = input_stream.next().await {
                 // Add this input back to the stream
@@ -196,6 +198,6 @@ impl ExecutionPlan for FallbackScanExec {
 
         let stream_adapter = RecordBatchStreamAdapter::new(schema, potentially_fallback_stream);
 
-        Ok(Box::pin(stream_adapter) as SendableRecordBatchStream)
+        Ok(Box::pin(stream_adapter))
     }
 }

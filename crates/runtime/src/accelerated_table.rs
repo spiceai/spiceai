@@ -74,7 +74,7 @@ pub(crate) struct AcceleratedTable {
     federated: Arc<dyn TableProvider>,
     refresh_trigger: Option<mpsc::Sender<()>>,
     handlers: Vec<JoinHandle<()>>,
-    fallback_on_zero_results: bool,
+    query_source_if_zero_accelerated_results: bool,
 }
 
 enum AccelerationRefreshMode {
@@ -102,7 +102,7 @@ impl AcceleratedTable {
         refresh: Refresh,
         retention: Option<Retention>,
         object_store: Option<(Url, Arc<dyn ObjectStore + 'static>)>,
-        fallback_on_zero_results: bool,
+        query_source_if_zero_accelerated_results: bool,
     ) -> Self {
         let mut refresh_trigger = None;
         let mut scheduled_refreshes_handle: Option<JoinHandle<()>> = None;
@@ -149,7 +149,7 @@ impl AcceleratedTable {
             federated,
             refresh_trigger,
             handlers,
-            fallback_on_zero_results,
+            query_source_if_zero_accelerated_results,
         }
     }
 
@@ -512,7 +512,7 @@ impl TableProvider for AcceleratedTable {
             .scan(state, projection, filters, limit)
             .await?;
 
-        if self.fallback_on_zero_results {
+        if self.query_source_if_zero_accelerated_results {
             Ok(Arc::new(FallbackScanExec::new(
                 accelerated_input,
                 Arc::clone(&self.federated),
