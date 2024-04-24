@@ -655,11 +655,12 @@ jobs:
         run: |
           clickhouse client -m -n -utest_user --password password --database=testdb < test/scripts/setup-data-clickhouse.sql
           clickhouse client -utest_user --password password --database=testdb --query="SELECT * FROM test_clickhouse_table;"
-          - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-          uses: actions/download-artifact@v4
-          with:
-            name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-            path: ./build
+
+      - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+        uses: actions/download-artifact@v4
+        with:
+          name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+          path: ./build
 
       - name: Install spice
         run: |
