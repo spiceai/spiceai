@@ -323,7 +323,7 @@ impl Runtime {
         .await
         {
             Ok(()) => {
-                tracing::info!("Loaded dataset: {}", &ds.name);
+                tracing::info!("Loaded dataset: {} {}", &ds.name, ds.is_accelerated());
                 let engine = ds.acceleration.map_or_else(
                     || "None".to_string(),
                     |acc| {
@@ -385,12 +385,13 @@ impl Runtime {
     }
 
     pub async fn update_dataset(&self, ds: &Dataset, all_datasets: &[Dataset]) {
-        tracing::info!("Updating dataset: {}...", &ds.name);
         status::update_dataset(&ds.name, status::ComponentStatus::Refreshing);
         if let Ok(connector) = self.load_dataset_connector(ds, all_datasets).await {
             if ds.is_file_accelerated() {
                 tracing::warn!("File accelerated datasets doesn't support hot reload, falling back to full dataset reload");
             } else if ds.is_accelerated() {
+                tracing::info!("Hot reloading accelerated dataset: {}...", &ds.name);
+
                 if let Ok(()) = &self
                     .reload_accelerated_dataset(ds, Arc::clone(&connector))
                     .await
@@ -400,6 +401,8 @@ impl Runtime {
                 }
                 tracing::error!("Failed to create accelerated table for dataset {}, falling back to full dataset reload", ds.name);
             }
+
+            tracing::info!("Updating dataset: {}...", &ds.name);
 
             self.remove_dataset(ds).await;
 
@@ -421,8 +424,6 @@ impl Runtime {
         ds: &Dataset,
         connector: Arc<dyn DataConnector>,
     ) -> Result<()> {
-        tracing::info!("Performing accelerated dataset hot reload");
-
         let acceleration_secret =
             Runtime::get_acceleration_secret(ds, Arc::clone(&self.secrets_provider)).await?;
 

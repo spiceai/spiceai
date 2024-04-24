@@ -209,6 +209,7 @@ impl DataFusion {
         let dataset = dataset.borrow();
 
         if let Some(accelerated_table) = accelerated_table {
+            tracing::debug!("Registering dataset {dataset:?} with preloaded accelerated table");
             self.ctx
                 .register_table(&dataset.name, Arc::new(accelerated_table))
                 .context(UnableToRegisterTableToDataFusionSnafu)?;
