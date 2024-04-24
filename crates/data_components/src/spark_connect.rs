@@ -81,7 +81,7 @@ fn arrow_field_datatype_from_spark_connect_field_datatype(
         Some(data_type::Kind::Binary(_)) => Ok(datatypes::DataType::Binary),
         Some(data_type::Kind::Date(_)) => Ok(datatypes::DataType::Date32),
         Some(data_type::Kind::Timestamp(_)) => {
-            Ok(datatypes::DataType::Timestamp(TimeUnit::Millisecond, None))
+            Ok(datatypes::DataType::Timestamp(TimeUnit::Microsecond, Some(Arc::from("Etc/UTC"))))
         }
         Some(data_type::Kind::Array(boxed_array)) => {
             match boxed_array.element_type {
