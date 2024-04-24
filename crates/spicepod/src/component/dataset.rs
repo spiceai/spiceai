@@ -190,16 +190,16 @@ impl Dataset {
     }
 
     #[must_use]
-    pub fn refresh_interval(&self) -> Option<Duration> {
+    pub fn refresh_check_interval(&self) -> Option<Duration> {
         if let Some(acceleration) = &self.acceleration {
-            if let Some(refresh_interval) = &acceleration.refresh_interval {
-                if let Ok(duration) = fundu::parse_duration(refresh_interval) {
+            if let Some(refresh_check_interval) = &acceleration.refresh_check_interval {
+                if let Ok(duration) = fundu::parse_duration(refresh_check_interval) {
                     return Some(duration);
                 }
                 tracing::warn!(
                     "Unable to parse refresh interval for dataset {}: {}",
                     self.name,
-                    refresh_interval
+                    refresh_check_interval
                 );
             }
         }
@@ -368,7 +368,7 @@ pub mod acceleration {
         pub refresh_mode: RefreshMode,
 
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub refresh_interval: Option<String>,
+        pub refresh_check_interval: Option<String>,
 
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub refresh_sql: Option<String>,
