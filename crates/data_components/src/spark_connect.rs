@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use datafusion::common::project_schema;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::logical_expr::TableProviderFilterPushDown;
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionMode};
@@ -26,6 +27,7 @@ use spark_connect_rs::{
     spark::{data_type, DataType},
     DataFrame, SparkSession,
 };
+use sql_provider_datafusion::expr::{self, Engine};
 
 use std::error::Error;
 
@@ -157,6 +159,21 @@ impl TableProvider for SparkConnectTablePovider {
         TableType::Base
     }
 
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
+        let mut filter_push_down = vec![];
+        for filter in filters {
+            match expr::to_sql(filter) {
+                Ok(_) => filter_push_down.push(TableProviderFilterPushDown::Exact),
+                Err(_) => filter_push_down.push(TableProviderFilterPushDown::Unsupported),
+            }
+        }
+
+        Ok(filter_push_down)
+    }
+
     async fn scan(
         &self,
         _state: &SessionState,
@@ -178,7 +195,7 @@ impl TableProvider for SparkConnectTablePovider {
 struct SparkConnectExecutionPlan {
     dataframe: DataFrame,
     projected_schema: SchemaRef,
-    filters: Vec<Expr>,
+    filters: Vec<String>,
     limit: Option<i32>,
     properties: PlanProperties,
 }
@@ -212,7 +229,11 @@ impl SparkConnectExecutionPlan {
         Ok(Self {
             dataframe,
             projected_schema: Arc::clone(&projected_schema),
-            filters: filters.to_vec(),
+            filters: filters
+                .iter()
+                .map(|f| expr::to_sql_with_engine(f, Some(Engine::Spark)))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| DataFusionError::Execution(e.to_string()))?,
             limit,
             properties: PlanProperties::new(
                 EquivalenceProperties::new(projected_schema),
@@ -225,16 +246,22 @@ impl SparkConnectExecutionPlan {
 
 impl DisplayAs for SparkConnectExecutionPlan {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> std::fmt::Result {
-        let filters: Vec<String> = self
+        let columns = self
+            .projected_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect::<Vec<_>>();
+        let filters = self
             .filters
             .iter()
             .map(ToString::to_string)
             .collect::<Vec<_>>();
         write!(
             f,
-            "SparkConnectExecutionPlan projected_schema={} filters={}",
-            self.projected_schema,
-            filters.join(",")
+            "SparkConnectExecutionPlan projection=[{}] filters=[{}]",
+            columns.join(", "),
+            filters.join(", "),
         )
     }
 }
@@ -266,7 +293,7 @@ impl ExecutionPlan for SparkConnectExecutionPlan {
             .filters
             .iter()
             .fold(self.dataframe.clone(), |df, filter| {
-                df.filter(filter.to_string().as_str())
+                df.filter(filter.as_str())
             });
         let df = match self.limit {
             Some(limit) => df.limit(limit),

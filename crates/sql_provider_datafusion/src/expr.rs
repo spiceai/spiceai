@@ -18,13 +18,18 @@ use datafusion::{logical_expr::Expr, scalar::ScalarValue};
 
 #[derive(Debug, snafu::Snafu)]
 pub enum Error {
+    #[snafu(display("Expression not supported {expr}"))]
     UnsupportedFilterExpr { expr: String },
+
+    #[snafu(display("Engine {engine} not supported for expression {expr}"))]
+    EngineNotSupportedForExpression { engine: String, expr: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Clone, Copy, Debug)]
 pub enum Engine {
+    Spark,
     SQLite,
     DuckDB,
 }
@@ -49,7 +54,10 @@ pub fn to_sql_with_engine(expr: &Expr, engine: Option<Engine>) -> Result<String>
 
             Ok(format!("{} {} {}", left, binary_expr.op, right))
         }
-        Expr::Column(name) => Ok(format!("\"{name}\"")),
+        Expr::Column(name) => match engine {
+            Some(Engine::Spark) => Ok(format!("{name}")),
+            _ => Ok(format!("\"{name}\"")),
+        },
         Expr::Cast(cast) => {
             match cast.data_type {
                 arrow::datatypes::DataType::Timestamp(_, Some(_) | None) => match engine {
@@ -66,6 +74,11 @@ pub fn to_sql_with_engine(expr: &Expr, engine: Option<Engine>) -> Result<String>
                         "datetime({}, 'subsec', 'utc')",
                         to_sql_with_engine(&cast.expr, engine)?,
                     )),
+                    Some(Engine::Spark) => EngineNotSupportedForExpressionSnafu {
+                        engine: "Spark".to_string(),
+                        expr: format!("{expr}"),
+                    }
+                    .fail()?,
                 },
                 _ => Err(Error::UnsupportedFilterExpr {
                     expr: format!("{expr}"),
