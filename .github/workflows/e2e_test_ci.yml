@@ -639,7 +639,7 @@ jobs:
         run: |
           curl https://clickhouse.com/ | sh
           sudo ./clickhouse install
-          sudo clickhouse start
+          sudo clickhouse server --daemon -- --tcp_port=9001
           sleep 5
           clickhouse client -udefault --query="CREATE USER test_user IDENTIFIED BY 'password';"
           clickhouse client -udefault --query="GRANT ALL PRIVILEGES ON testdb.* TO 'test_user';"
@@ -683,7 +683,7 @@ jobs:
         run: |
           echo -e "test_clickhouse_table\neth recent blocks\nclickhouse:test_clickhouse_table\ny" | spice dataset configure
           # configure clickhouse credentials
-          echo -e "params:\n  clickhouse_host: localhost\n  clickhouse_tcp_port: 9000\n  clickhouse_db: testdb\n  clickhouse_user: test_user\n  clickhouse_pass_key: password\n" >> ./datasets/test_clickhouse_table/dataset.yaml
+          echo -e "params:\n  clickhouse_host: localhost\n  clickhouse_tcp_port: 9001\n  clickhouse_db: testdb\n  clickhouse_user: test_user\n  clickhouse_pass_key: password\n" >> ./datasets/test_clickhouse_table/dataset.yaml
           # configure env secret store
           echo -e "secrets:\n  store: env\n" >> spicepod.yaml
           cat spicepod.yaml
@@ -693,8 +693,9 @@ jobs:
           SPICE_SECRET_CLICKHOUSE_PASSWORD: password
         working-directory: test_app
         run: |
-          spice run
+          spice run &> spice.log &
           # time to initialize added dataset
+          sleep 10
 
       - name: Wait for Spice runtime healthy
         working-directory: test_app
