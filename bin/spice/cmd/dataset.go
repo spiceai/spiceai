@@ -134,9 +134,9 @@ spice dataset configure
 
 		if accelerateDataset {
 			dataset.Acceleration = &spec.AccelerationSpec{
-				Enabled:         accelerateDataset,
-				RefreshInterval: time.Second * 10,
-				RefreshMode:     spec.REFRESH_MODE_FULL,
+				Enabled:                   accelerateDataset,
+				RefreshCheckInterval: time.Second * 10,
+				RefreshMode:               spec.REFRESH_MODE_FULL,
 			}
 		}
 
