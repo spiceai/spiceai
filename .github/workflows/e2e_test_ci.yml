@@ -649,7 +649,7 @@ jobs:
         run: sleep 10
 
       - name: Check Clickhouse
-        run: clickhouse client -utest_user --password password --query="SELECT version();"
+        run: clickhouse client --port 9001 -utest_user --password password --query="SELECT version();"
 
       - name: Prepare Clickhouse dataset
         run: |
