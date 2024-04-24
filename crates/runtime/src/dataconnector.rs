@@ -77,6 +77,11 @@ pub enum Error {
     UnableToCreateDataFrame {
         source: datafusion::error::DataFusionError,
     },
+
+    #[snafu(display("Unable to filter data frame: {source}"))]
+    UnableToFilterDataFrame {
+        source: datafusion::error::DataFusionError,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -192,10 +197,7 @@ pub async fn get_all_data(
     sql: Option<String>,
     filters: Vec<Expr>,
 ) -> Result<(SchemaRef, Vec<arrow::record_batch::RecordBatch>)> {
-    // TODO: handle filters in following PR
-    _ = filters;
-
-    let df = match sql {
+    let mut df = match sql {
         None => {
             let table_source = Arc::new(DefaultTableSource::new(Arc::clone(&table_provider)));
             let logical_plan = LogicalPlanBuilder::scan(table_name.clone(), table_source, None)
@@ -210,6 +212,10 @@ pub async fn get_all_data(
             .await
             .context(UnableToCreateDataFrameSnafu {})?,
     };
+
+    for filter in filters {
+        df = df.filter(filter).context(UnableToCreateDataFrameSnafu)?;
+    }
 
     let batches = df.collect().await.context(UnableToScanTableProviderSnafu)?;
 
