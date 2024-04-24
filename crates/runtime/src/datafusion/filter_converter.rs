@@ -75,10 +75,8 @@ impl TimestampFilterConvert {
 
     #[allow(clippy::cast_possible_wrap)]
     pub(crate) fn convert(&self, timestamp: u64, op: Operator) -> Expr {
-        let format = self.time_format.clone();
         let time_column: &str = &self.time_column.clone();
-        let expr_time_format = format.clone();
-        match expr_time_format {
+        match self.time_format.clone() {
             ExprTimeFormat::ISO8601 => binary_expr(
                 cast(
                     col(time_column),
