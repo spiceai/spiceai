@@ -693,9 +693,9 @@ jobs:
           SPICE_SECRET_CLICKHOUSE_PASSWORD: password
         working-directory: test_app
         run: |
-          spice run &> spice.log &
+          spice run
           # time to initialize added dataset
-          sleep 10
+
       - name: Wait for Spice runtime healthy
         working-directory: test_app
         timeout-minutes: 1
