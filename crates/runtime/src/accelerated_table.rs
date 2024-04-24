@@ -203,9 +203,8 @@ impl AcceleratedTable {
 
         let mut interval_timer = tokio::time::interval(retention.check_interval);
 
-        let var_name = Some(time_column.clone());
         let Some(timestamp_filter_converter) =
-            TimestampFilterConvert::create(field, retention.time_format, var_name)
+            TimestampFilterConvert::create(field, retention.time_format, Some(time_column.clone()))
         else {
             tracing::error!("[retention] Failed to get the expression time format for {time_column}, check schema and time format");
             return;
