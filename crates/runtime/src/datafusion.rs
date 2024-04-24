@@ -40,6 +40,7 @@ use spicepod::component::dataset::{Dataset, Mode, TimeFormat};
 use tokio::spawn;
 use tokio::time::{sleep, Instant};
 
+pub mod filter_converter;
 pub mod refresh_sql;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

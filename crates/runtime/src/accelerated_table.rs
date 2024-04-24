@@ -2,19 +2,16 @@ use std::time::{SystemTime, SystemTimeError, UNIX_EPOCH};
 use std::{any::Any, sync::Arc, time::Duration};
 
 use arrow::array::UInt64Array;
-use arrow::datatypes::{DataType, SchemaRef};
+use arrow::datatypes::SchemaRef;
 use async_stream::stream;
 use async_trait::async_trait;
 use data_components::delete::get_deletion_provider;
 use datafusion::common::OwnedTableReference;
 use datafusion::error::Result as DataFusionResult;
 use datafusion::execution::context::SessionState;
-use datafusion::logical_expr::{
-    binary_expr, cast, col, lit, Operator, TableProviderFilterPushDown,
-};
+use datafusion::logical_expr::{Operator, TableProviderFilterPushDown};
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{collect, ExecutionPlan, ExecutionPlanProperties};
-use datafusion::scalar::ScalarValue;
 use datafusion::{
     datasource::{TableProvider, TableType},
     execution::context::SessionContext,
@@ -24,7 +21,6 @@ use futures::{stream::BoxStream, StreamExt};
 use object_store::ObjectStore;
 use snafu::prelude::*;
 use spicepod::component::dataset::acceleration::RefreshMode;
-use spicepod::component::dataset::TimeFormat;
 use tokio::task::JoinHandle;
 use tokio::time::interval;
 use url::Url;
@@ -33,11 +29,12 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::Receiver;
 use tokio_stream::wrappers::ReceiverStream;
 
+use crate::datafusion::filter_converter::TimestampFilterConvert;
 use crate::datafusion::{Refresh, Retention};
 use crate::execution_plan::slice::SliceExec;
 use crate::execution_plan::tee::TeeExec;
 use crate::{
-    dataconnector::{self, get_all_data},
+    dataconnector::{self, get_data},
     dataupdate::{DataUpdate, DataUpdateExecutionPlan, UpdateType},
     status,
     timing::TimeMeasurement,
@@ -80,18 +77,6 @@ pub(crate) struct AcceleratedTable {
 enum AccelerationRefreshMode {
     Full(Receiver<()>),
     Append,
-}
-
-#[derive(Debug, Clone)]
-enum ExprTimeFormat {
-    ISO8601,
-    UnixTimestamp(ExprUnixTimestamp),
-    Timestamp,
-}
-
-#[derive(Debug, Clone)]
-struct ExprUnixTimestamp {
-    scale: u64,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -405,7 +390,7 @@ impl AcceleratedTable {
                             _ => vec![],
                         };
 
-                        let all_data = match get_all_data(&mut ctx, OwnedTableReference::bare(dataset_name.clone()), Arc::clone(&federated), refresh.sql.clone(), filters).await {
+                        let data = match get_data(&mut ctx, OwnedTableReference::bare(dataset_name.clone()), Arc::clone(&federated), refresh.sql.clone(), filters).await {
                             Ok(data) => data,
                             Err(e) => {
                                 tracing::error!("[refresh] Error refreshing data for {dataset_name}: {e}");
@@ -414,8 +399,8 @@ impl AcceleratedTable {
                             }
                         };
                         yield Ok(DataUpdate {
-                            schema: all_data.0,
-                            data: all_data.1,
+                            schema: data.0,
+                            data: data.1,
                             update_type: UpdateType::Overwrite,
                         });
 
@@ -424,94 +409,6 @@ impl AcceleratedTable {
                 }
             }
         })
-    }
-}
-
-#[derive(Clone, Debug)]
-struct TimestampFilterConvert {
-    time_column: String,
-    time_format: ExprTimeFormat,
-}
-
-#[allow(clippy::needless_pass_by_value)]
-impl TimestampFilterConvert {
-    fn create(
-        field: Option<(usize, &arrow::datatypes::Field)>,
-        time_column: Option<String>,
-        time_format: Option<TimeFormat>,
-    ) -> Option<Self> {
-        let time_column = time_column?;
-
-        let time_format = match field {
-            Some(field) => match field.1.data_type() {
-                DataType::Int8
-                | DataType::Int16
-                | DataType::Int32
-                | DataType::Int64
-                | DataType::UInt8
-                | DataType::UInt16
-                | DataType::UInt32
-                | DataType::UInt64
-                | DataType::Float16
-                | DataType::Float32
-                | DataType::Float64 => {
-                    let mut scale = 1;
-                    if let Some(time_format) = time_format.clone() {
-                        if time_format == TimeFormat::UnixMillis {
-                            scale = 1000;
-                        }
-                    }
-                    ExprTimeFormat::UnixTimestamp(ExprUnixTimestamp { scale })
-                }
-                DataType::Timestamp(_, _)
-                | DataType::Date32
-                | DataType::Date64
-                | DataType::Time32(_)
-                | DataType::Time64(_) => ExprTimeFormat::Timestamp,
-                DataType::Utf8 | DataType::LargeUtf8 => ExprTimeFormat::ISO8601,
-                _ => {
-                    tracing::warn!("Date type is not handled yet: {}", field.1.data_type());
-                    return None;
-                }
-            },
-            None => return None,
-        };
-
-        Some(Self {
-            time_column,
-            time_format,
-        })
-    }
-
-    #[allow(clippy::cast_possible_wrap)]
-    fn convert(&self, timestamp: u64, op: Operator) -> Expr {
-        let format = self.time_format.clone();
-        let time_column: &str = &self.time_column.clone();
-        let expr_time_format = format.clone();
-        match expr_time_format {
-            ExprTimeFormat::ISO8601 => binary_expr(
-                cast(
-                    col(time_column),
-                    DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
-                ),
-                op,
-                Expr::Literal(ScalarValue::TimestampMillisecond(
-                    Some((timestamp * 1000) as i64),
-                    None,
-                )),
-            ),
-            ExprTimeFormat::UnixTimestamp(format) => {
-                binary_expr(col(time_column), op, lit(timestamp * format.scale))
-            }
-            ExprTimeFormat::Timestamp => binary_expr(
-                col(time_column),
-                op,
-                Expr::Literal(ScalarValue::TimestampMillisecond(
-                    Some((timestamp * 1000) as i64),
-                    None,
-                )),
-            ),
-        }
     }
 }
 

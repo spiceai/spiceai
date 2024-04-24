@@ -189,8 +189,8 @@ pub trait DataConnector: Send + Sync {
     }
 }
 
-// Gets all data from a table provider and returns it as a vector of RecordBatches.
-pub async fn get_all_data(
+// Gets data from a table provider and returns it as a vector of RecordBatches.
+pub async fn get_data(
     ctx: &mut SessionContext,
     table_name: OwnedTableReference,
     table_provider: Arc<dyn TableProvider>,
