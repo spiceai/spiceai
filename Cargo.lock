@@ -2286,6 +2286,7 @@ version = "0.11.2-alpha"
 dependencies = [
  "arrow",
  "arrow_sql_gen",
+ "async-stream",
  "async-trait",
  "bb8",
  "bb8-postgres",

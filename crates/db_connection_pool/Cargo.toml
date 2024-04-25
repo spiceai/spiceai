@@ -31,6 +31,8 @@ ns_lookup = { path = "../ns_lookup" }
 native-tls = { version = "0.2.11", optional = true }
 postgres-native-tls = { version = "0.5.0", optional = true }
 clickhouse-rs = { workspace = true, optional = true }
+async-stream = { workspace = true, optional = true }
+
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
@@ -49,4 +51,4 @@ postgres = [
 ]
 sqlite = ["dep:rusqlite", "dep:tokio-rusqlite", "arrow_sql_gen/sqlite", "spicepod/sqlite"]
 mysql = ["dep:mysql_async", "arrow_sql_gen/mysql", "spicepod/mysql"]
-clickhouse = ["dep:clickhouse-rs", "arrow_sql_gen/clickhouse"]
+clickhouse = ["dep:clickhouse-rs", "arrow_sql_gen/clickhouse", "dep:async-stream"]
