@@ -26,8 +26,8 @@ use tokio::task::JoinHandle;
 use tokio::time::interval;
 use url::Url;
 
-use tokio::sync::mpsc;
 use tokio::sync::mpsc::Receiver;
+use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::datafusion::filter_converter::TimestampFilterConvert;
@@ -67,7 +67,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 // An accelerated table consists of a federated table and a local accelerator.
 //
 // The accelerator must support inserts.
-pub(crate) struct AcceleratedTable {
+// AcceleratedTable::new returns an instance of the table and a oneshot receiver that will be triggered when the table is ready, right after the initial data refresh finishes.
+pub struct AcceleratedTable {
     accelerator: Arc<dyn TableProvider>,
     federated: Arc<dyn TableProvider>,
     refresh_trigger: Option<mpsc::Sender<()>>,
@@ -94,9 +95,10 @@ impl AcceleratedTable {
         refresh: Refresh,
         retention: Option<Retention>,
         object_store: Option<(Url, Arc<dyn ObjectStore + 'static>)>,
-    ) -> Self {
+    ) -> (Self, oneshot::Receiver<()>) {
         let mut refresh_trigger = None;
         let mut scheduled_refreshes_handle: Option<JoinHandle<()>> = None;
+        let (ready_sender, is_ready) = oneshot::channel::<()>();
 
         let acceleration_refresh_mode: AccelerationRefreshMode = match refresh.mode {
             RefreshMode::Append => AccelerationRefreshMode::Append,
@@ -117,6 +119,7 @@ impl AcceleratedTable {
             acceleration_refresh_mode,
             Arc::clone(&accelerator),
             object_store,
+            ready_sender,
         ));
 
         let mut handlers = vec![];
@@ -128,19 +131,22 @@ impl AcceleratedTable {
 
         if let Some(retention) = retention {
             let retention_check_handle = tokio::spawn(Self::start_retention_check(
-                dataset_name,
+                dataset_name.clone(),
                 Arc::clone(&accelerator),
                 retention,
             ));
             handlers.push(retention_check_handle);
         }
 
-        Self {
-            accelerator,
-            federated,
-            refresh_trigger,
-            handlers,
-        }
+        (
+            Self {
+                accelerator,
+                federated,
+                refresh_trigger,
+                handlers,
+            },
+            is_ready,
+        )
     }
 
     pub async fn trigger_refresh(&self) -> Result<()> {
@@ -271,6 +277,7 @@ impl AcceleratedTable {
         acceleration_refresh_mode: AccelerationRefreshMode,
         accelerator: Arc<dyn TableProvider>,
         object_store: Option<(Url, Arc<dyn ObjectStore + 'static>)>,
+        ready_sender: oneshot::Sender<()>,
     ) {
         let mut stream = Self::stream_updates(
             dataset_name.clone(),
@@ -281,8 +288,12 @@ impl AcceleratedTable {
         );
 
         let ctx = SessionContext::new();
+
+        let mut ready_sender = Some(ready_sender);
+
         loop {
             let future_result = stream.next().await;
+
             match future_result {
                 Some(data_update) => {
                     let Ok(data_update) = data_update else {
@@ -302,6 +313,8 @@ impl AcceleratedTable {
                         Ok(plan) => {
                             if let Err(e) = collect(plan, ctx.task_ctx()).await {
                                 tracing::error!("Error adding data for {dataset_name}: {e}");
+                            } else if let Some(sender) = ready_sender.take() {
+                                sender.send(()).ok();
                             };
                         }
                         Err(e) => {
@@ -491,7 +504,7 @@ impl TableProvider for AcceleratedTable {
     }
 }
 
-pub(crate) struct Retention {
+pub struct Retention {
     pub(crate) time_column: String,
     pub(crate) time_format: Option<TimeFormat>,
     pub(crate) period: Duration,
@@ -525,7 +538,7 @@ impl Retention {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct Refresh {
+pub struct Refresh {
     pub(crate) time_column: Option<String>,
     pub(crate) time_format: Option<TimeFormat>,
     pub(crate) check_interval: Option<Duration>,
