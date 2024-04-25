@@ -28,7 +28,7 @@ impl TimestampFilterConvert {
     pub(crate) fn create(
         field: Option<&arrow::datatypes::Field>,
         time_column: Option<String>,
-        time_format: Option<TimeFormat>,
+        mut time_format: Option<TimeFormat>,
     ) -> Option<Self> {
         let field = field?;
         let time_column = time_column?;
@@ -46,7 +46,7 @@ impl TimestampFilterConvert {
             | DataType::Float32
             | DataType::Float64 => {
                 let mut scale = 1;
-                if let Some(time_format) = time_format.clone() {
+                if let Some(time_format) = time_format.take() {
                     if time_format == TimeFormat::UnixMillis {
                         scale = 1000;
                     }
