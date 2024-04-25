@@ -20,7 +20,7 @@ use datafusion::common::OwnedTableReference;
 use datafusion::dataframe::DataFrame;
 use datafusion::datasource::{DefaultTableSource, TableProvider};
 use datafusion::execution::context::SessionContext;
-use datafusion::logical_expr::LogicalPlanBuilder;
+use datafusion::logical_expr::{Expr, LogicalPlanBuilder};
 use lazy_static::lazy_static;
 use object_store::ObjectStore;
 use snafu::prelude::*;
@@ -77,6 +77,11 @@ pub enum Error {
 
     #[snafu(display("Unable to create data frame: {source}"))]
     UnableToCreateDataFrame {
+        source: datafusion::error::DataFusionError,
+    },
+
+    #[snafu(display("Unable to filter data frame: {source}"))]
+    UnableToFilterDataFrame {
         source: datafusion::error::DataFusionError,
     },
 }
@@ -188,14 +193,15 @@ pub trait DataConnector: Send + Sync {
     }
 }
 
-// Gets all data from a table provider and returns it as a vector of RecordBatches.
-pub async fn get_all_data(
+// Gets data from a table provider and returns it as a vector of RecordBatches.
+pub async fn get_data(
     ctx: &mut SessionContext,
     table_name: OwnedTableReference,
     table_provider: Arc<dyn TableProvider>,
     sql: Option<String>,
+    filters: Vec<Expr>,
 ) -> Result<(SchemaRef, Vec<arrow::record_batch::RecordBatch>)> {
-    let df = match sql {
+    let mut df = match sql {
         None => {
             let table_source = Arc::new(DefaultTableSource::new(Arc::clone(&table_provider)));
             let logical_plan = LogicalPlanBuilder::scan(table_name.clone(), table_source, None)
@@ -210,6 +216,10 @@ pub async fn get_all_data(
             .await
             .context(UnableToCreateDataFrameSnafu {})?,
     };
+
+    for filter in filters {
+        df = df.filter(filter).context(UnableToFilterDataFrameSnafu {})?;
+    }
 
     let batches = df.collect().await.context(UnableToScanTableProviderSnafu)?;
 

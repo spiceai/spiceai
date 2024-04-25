@@ -305,6 +305,15 @@ impl Dataset {
 
         false
     }
+
+    #[must_use]
+    pub fn is_file_accelerated(&self) -> bool {
+        if let Some(acceleration) = &self.acceleration {
+            return acceleration.enabled && acceleration.mode == acceleration::Mode::File;
+        }
+
+        false
+    }
 }
 
 impl WithDependsOn<Dataset> for Dataset {
