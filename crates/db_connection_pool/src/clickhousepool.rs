@@ -53,9 +53,6 @@ pub enum Error {
     #[snafu(display("Missing required parameter: {parameter_name}"))]
     MissingRequiredParameterForConnection { parameter_name: String },
 
-    #[snafu(display("Invalid root cert path: {path}"))]
-    InvalidRootCertPathError { path: String },
-
     #[snafu(display("Invalid secure parameter value {parameter_name}"))]
     InvalidSecureParameterValueError {
         parameter_name: String,
@@ -161,15 +158,6 @@ fn get_config_from_params(
             parameter_name: "clickhouse_secure".to_string(),
         })?;
     options = options.secure(secure.unwrap_or(true));
-
-    if let Some(clickhouse_sslrootcert) = params.get("clickhouse_sslrootcert") {
-        if !std::path::Path::new(clickhouse_sslrootcert).exists() {
-            InvalidRootCertPathSnafu {
-                path: clickhouse_sslrootcert,
-            }
-            .fail()?;
-        }
-    }
 
     Ok(options)
 }
