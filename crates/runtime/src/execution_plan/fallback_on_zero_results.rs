@@ -1,11 +1,29 @@
+/*
+Copyright 2024 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
+use datafusion::common::ToDFSchema;
 use datafusion::datasource::TableProvider;
 use datafusion::error::{DataFusionError, Result};
-use datafusion::execution::context::SessionState;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::logical_expr::Expr;
+use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
+use datafusion::physical_expr::create_physical_expr;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, Partitioning,
@@ -16,52 +34,28 @@ use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
-#[derive(Clone)]
-#[allow(clippy::module_name_repetitions)]
-pub struct FallbackScanParams {
-    state: SessionState,
-    projection: Option<Vec<usize>>,
-    filters: Vec<Expr>,
-    limit: Option<usize>,
-}
+use super::TableScanParams;
 
-impl FallbackScanParams {
-    #[must_use]
-    pub fn new(
-        state: &SessionState,
-        projection: Option<&Vec<usize>>,
-        filters: &[Expr],
-        limit: Option<usize>,
-    ) -> Self {
-        Self {
-            state: state.clone(),
-            projection: projection.cloned(),
-            filters: filters.to_vec(),
-            limit,
-        }
-    }
-}
-
-/// `FallbackScanExec` takes an input `ExecutionPlan` and a fallback `TableProvider`.
+/// `FallbackOnZeroResultsScanExec` takes an input `ExecutionPlan` and a fallback `TableProvider`.
 /// If the input `ExecutionPlan` returns 0 rows, the fallback `TableProvider.scan()` is executed.
 ///
 /// The input and fallback `ExecutionPlan` must have the same schema, execution modes and equivalence properties.
 #[allow(clippy::module_name_repetitions)]
-pub struct FallbackScanExec {
+pub struct FallbackOnZeroResultsScanExec {
     /// The input execution plan.
     input: Arc<dyn ExecutionPlan>,
     /// A closure to get the fallback execution plan if needed.
     fallback_table_provider: Arc<dyn TableProvider>,
-    fallback_scan_params: FallbackScanParams,
+    fallback_scan_params: TableScanParams,
     properties: PlanProperties,
 }
 
-impl FallbackScanExec {
-    /// Create a new `FallbackScanExec`.
+impl FallbackOnZeroResultsScanExec {
+    /// Create a new `FallbackOnZeroResultsScanExec`.
     pub fn new(
         mut input: Arc<dyn ExecutionPlan>,
         fallback_table_provider: Arc<dyn TableProvider>,
-        fallback_scan_params: FallbackScanParams,
+        fallback_scan_params: TableScanParams,
     ) -> Self {
         let eq_properties = input.equivalence_properties().clone();
         let execution_mode = input.execution_mode();
@@ -83,22 +77,22 @@ impl FallbackScanExec {
     }
 }
 
-impl fmt::Debug for FallbackScanExec {
+impl fmt::Debug for FallbackOnZeroResultsScanExec {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "FallbackScanExec")
+        write!(f, "FallbackOnZeroResultsScanExec")
     }
 }
 
-impl DisplayAs for FallbackScanExec {
+impl DisplayAs for FallbackOnZeroResultsScanExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> std::fmt::Result {
-        write!(f, "FallbackScanExec")
+        write!(f, "FallbackOnZeroResultsScanExec")
     }
 }
 
 #[async_trait]
-impl ExecutionPlan for FallbackScanExec {
+impl ExecutionPlan for FallbackOnZeroResultsScanExec {
     fn name(&self) -> &'static str {
-        "FallbackScanExec"
+        "FallbackOnZeroResultsScanExec"
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -122,31 +116,38 @@ impl ExecutionPlan for FallbackScanExec {
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         if children.len() == 1 {
-            Ok(Arc::new(FallbackScanExec::new(
+            Ok(Arc::new(FallbackOnZeroResultsScanExec::new(
                 Arc::clone(&children[0]),
                 Arc::clone(&self.fallback_table_provider),
                 self.fallback_scan_params.clone(),
             )))
         } else {
             Err(DataFusionError::Execution(
-                "FallbackScanExec expects exactly one input".to_string(),
+                "FallbackOnZeroResultsScanExec expects exactly one input".to_string(),
             ))
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn execute(
         &self,
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        tracing::trace!("Executing FallbackScanExec: partition={}", partition);
+        tracing::trace!(
+            "Executing FallbackOnZeroResultsScanExec: partition={}",
+            partition
+        );
         if partition > 0 {
             return Err(DataFusionError::Execution(format!(
-                "FallbackScanExec only supports 1 partitions, but partition {partition} was requested",
+                "FallbackOnZeroResultsScanExec only supports 1 partitions, but partition {partition} was requested",
             )));
         }
 
-        let mut input_stream = self.input.execute(0, Arc::clone(&context))?;
+        // The input execution plan may not support all of the push down filters, so wrap it with a `FilterExec`.
+        let filtered_input = filter_plan(Arc::clone(&self.input), &self.fallback_scan_params)?;
+
+        let mut input_stream = filtered_input.execute(0, Arc::clone(&context))?;
         let schema = input_stream.schema();
         let scan_params = self.fallback_scan_params.clone();
         let fallback_provider = Arc::clone(&self.fallback_table_provider);
@@ -156,16 +157,16 @@ impl ExecutionPlan for FallbackScanExec {
             let schema = input_stream.schema();
             // If the input_stream returns a value - then we don't need to fallback. Piece back together the input_stream.
             if let Some(input) = input_stream.next().await {
-                tracing::trace!("FallbackScanExec input_stream.next() returned Some()");
+                tracing::trace!("FallbackOnZeroResultsScanExec input_stream.next() returned Some()");
                 match &input {
                     Ok(batch) => {
                         tracing::trace!(
-                            "FallbackScanExec input_stream.next() is Ok(): num_rows: {}",
+                            "FallbackOnZeroResultsScanExec input_stream.next() is Ok(): num_rows: {}",
                             batch.num_rows()
                         );
                     }
                     Err(e) => {
-                        tracing::trace!("FallbackScanExec input_stream.next() is Err(): {e}");
+                        tracing::trace!("FallbackOnZeroResultsScanExec input_stream.next() is Err(): {e}");
                     }
                 }
                 // Add this input back to the stream
@@ -174,7 +175,7 @@ impl ExecutionPlan for FallbackScanExec {
                     RecordBatchStreamAdapter::new(schema, input_once.chain(input_stream));
                 Box::pin(stream_adapter) as SendableRecordBatchStream
             } else {
-                tracing::trace!("FallbackScanExec input_stream.next() returned None");
+                tracing::trace!("FallbackOnZeroResultsScanExec input_stream.next() returned None");
                 let fallback_plan = match fallback_provider
                     .scan(
                         &scan_params.state,
@@ -193,6 +194,7 @@ impl ExecutionPlan for FallbackScanExec {
                         return Box::pin(error_stream) as SendableRecordBatchStream;
                     }
                 };
+
                 match fallback_plan.execute(0, context) {
                     Ok(stream) => stream,
                     Err(e) => {
@@ -214,4 +216,34 @@ impl ExecutionPlan for FallbackScanExec {
 
         Ok(Box::pin(stream_adapter))
     }
+}
+
+fn filter_plan(
+    input: Arc<dyn ExecutionPlan>,
+    scan_params: &TableScanParams,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let Some(joined_filters) = scan_params.filters.iter().cloned().reduce(|left, right| {
+        Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(left),
+            Operator::And,
+            Box::new(right),
+        ))
+    }) else {
+        tracing::trace!("No filters to apply to input plan");
+        return Ok(input);
+    };
+    let input_schema = input.schema();
+    let input_dfschema = Arc::clone(&input_schema).to_dfschema()?;
+
+    tracing::trace!("Creating physical expression for filter: {joined_filters}");
+
+    let physical_expr = create_physical_expr(
+        &joined_filters,
+        &input_dfschema,
+        scan_params.state.execution_props(),
+    )?;
+
+    let filtered_input = FilterExec::try_new(physical_expr, input)?;
+
+    Ok(Arc::new(filtered_input))
 }

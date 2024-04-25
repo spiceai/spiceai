@@ -31,8 +31,10 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::datafusion::filter_converter::TimestampFilterConvert;
+use crate::execution_plan::fallback_on_zero_results::FallbackOnZeroResultsScanExec;
 use crate::execution_plan::slice::SliceExec;
 use crate::execution_plan::tee::TeeExec;
+use crate::execution_plan::TableScanParams;
 use crate::{
     dataconnector::{self, get_data},
     dataupdate::{DataUpdate, DataUpdateExecutionPlan, UpdateType},
@@ -457,7 +459,7 @@ impl TableProvider for AcceleratedTable {
         &self,
         filters: &[&Expr],
     ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
-        self.accelerator.supports_filters_pushdown(filters)
+        Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
     }
 
     async fn scan(
@@ -467,9 +469,16 @@ impl TableProvider for AcceleratedTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        self.accelerator
+        let input = self
+            .accelerator
             .scan(state, projection, filters, limit)
-            .await
+            .await?;
+
+        Ok(Arc::new(FallbackOnZeroResultsScanExec::new(
+            input,
+            Arc::clone(&self.federated),
+            TableScanParams::new(state, projection, filters, limit),
+        )))
     }
 
     async fn insert_into(
