@@ -95,7 +95,7 @@ fn get_config_from_params(
         let mut new_options = Options::from_str(&clickhouse_connection_string)
             .context(InvalidConnectionStringSnafu)?;
         if !clickhouse_connection_string.contains("connection_timeout") {
-            // Default timeouf of 500ms is not enough in some cases.
+            // Default timeout of 500ms is not enough in some cases.
             new_options = new_options.connection_timeout(Duration::from_secs(5));
         }
         options = Some(new_options);
