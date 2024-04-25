@@ -445,8 +445,6 @@ impl Runtime {
 
         tracing::info!("Accelerated table for dataset {} is ready", ds.name);
 
-        // swap old dataset with new one, using preloaded accelerated table
-        self.remove_dataset(ds).await;
         self.register_loaded_dataset(ds, Arc::clone(&connector), Some(accelerated_table))
             .await?;
 
@@ -709,6 +707,9 @@ impl Runtime {
                     if let Some(current_ds) =
                         current_app.datasets.iter().find(|d| d.name == ds.name)
                     {
+                        tracing::info!("Checking dataset: {}", ds.name);
+                        tracing::info!("Current dataset: {:?}", current_ds);
+                        tracing::info!("New dataset: {:?}", ds);
                         if current_ds != ds {
                             self.update_dataset(ds, &new_app.datasets).await;
                         }
