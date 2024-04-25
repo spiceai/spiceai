@@ -214,3 +214,158 @@ impl ExecutionPlan for FallbackOnZeroResultsScanExec {
         Ok(Box::pin(stream_adapter))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use data_components::arrow::write::MemTable;
+    use datafusion::execution::context::SessionContext;
+    use datafusion::physical_plan::memory::MemoryExec;
+    use std::sync::Arc;
+
+    fn schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Utf8, false),
+        ]))
+    }
+
+    mod empty_fallback {
+        use super::*;
+
+        fn batch() -> RecordBatch {
+            RecordBatch::try_new(
+                schema(),
+                vec![
+                    Arc::new(Int64Array::from(vec![1, 2, 3])),
+                    Arc::new(StringArray::from(vec!["foo", "bar", "baz"])),
+                ],
+            )
+            .expect("record batch should not panic")
+        }
+
+        fn empty_memory_exec() -> Arc<dyn ExecutionPlan> {
+            Arc::new(
+                MemoryExec::try_new(&[vec![]], schema(), None)
+                    .expect("memory exec should not panic"),
+            )
+        }
+
+        fn memory_table_provider() -> Arc<dyn TableProvider> {
+            Arc::new(
+                MemTable::try_new(schema(), vec![vec![batch()]])
+                    .expect("memtable should not panic"),
+            )
+        }
+
+        #[tokio::test]
+        async fn test_fallback_on_empty_input() {
+            let ctx = SessionContext::new();
+
+            let exec = FallbackOnZeroResultsScanExec::new(
+                empty_memory_exec(),
+                memory_table_provider(),
+                TableScanParams {
+                    state: ctx.state(),
+                    projection: None,
+                    filters: vec![],
+                    limit: None,
+                },
+            );
+
+            let result_stream = exec
+                .execute(0, ctx.task_ctx())
+                .expect("should create stream successfully");
+            let collected_result = datafusion::physical_plan::common::collect(result_stream)
+                .await
+                .expect("should be able to collect results");
+
+            assert_eq!(collected_result.len(), 1);
+            assert_eq!(batch().num_rows(), collected_result[0].num_rows());
+        }
+    }
+
+    mod non_empty_filtered_fallback {
+        use datafusion::{
+            logical_expr::{col, BinaryExpr, Expr, Operator},
+            scalar::ScalarValue,
+        };
+
+        use super::*;
+
+        fn batch_input() -> RecordBatch {
+            RecordBatch::try_new(
+                schema(),
+                vec![
+                    Arc::new(Int64Array::from(vec![1, 2, 3])),
+                    Arc::new(StringArray::from(vec!["foo", "bar", "baz"])),
+                ],
+            )
+            .expect("record batch should not panic")
+        }
+
+        fn batch_fallback() -> RecordBatch {
+            RecordBatch::try_new(
+                schema(),
+                vec![
+                    Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5, 6])),
+                    Arc::new(StringArray::from(vec![
+                        "foo", "bar", "baz", "four", "five", "six",
+                    ])),
+                ],
+            )
+            .expect("record batch should not panic")
+        }
+
+        fn memory_exec() -> Arc<dyn ExecutionPlan> {
+            Arc::new(
+                MemoryExec::try_new(&[vec![batch_input()]], schema(), None)
+                    .expect("memory exec should not panic"),
+            )
+        }
+
+        fn memory_table_provider() -> Arc<dyn TableProvider> {
+            Arc::new(
+                MemTable::try_new(schema(), vec![vec![batch_fallback()]])
+                    .expect("memtable should not panic"),
+            )
+        }
+
+        #[tokio::test]
+        async fn test_fallback_on_non_empty_input() {
+            let ctx = SessionContext::new();
+
+            let input_plan = memory_exec();
+            let fallback_provider = memory_table_provider();
+            let fallback_scan_params = TableScanParams {
+                state: ctx.state(),
+                projection: None,
+                filters: vec![Expr::BinaryExpr(BinaryExpr::new(
+                    Box::new(col("a")),
+                    Operator::Gt,
+                    Box::new(Expr::Literal(ScalarValue::Int64(Some(3)))),
+                ))],
+                limit: None,
+            };
+
+            let exec = FallbackOnZeroResultsScanExec::new(
+                input_plan,
+                fallback_provider,
+                fallback_scan_params,
+            );
+
+            let result_stream = exec
+                .execute(0, ctx.task_ctx())
+                .expect("should create stream successfully");
+            let collected_result = datafusion::physical_plan::common::collect(result_stream)
+                .await
+                .expect("should be able to collect results");
+
+            assert_eq!(collected_result.len(), 1);
+            assert_eq!(batch_fallback().num_rows(), collected_result[0].num_rows());
+        }
+    }
+}
