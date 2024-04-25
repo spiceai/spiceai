@@ -366,8 +366,8 @@ impl AcceleratedTable {
                 }
                 AccelerationRefreshMode::Full(receiver) => {
                     let schema = federated.schema();
-                    let column = refresh.time_column.clone().unwrap_or_default();
-                    let field = schema.column_with_name(column.as_str()).map(|(_, f)| f);
+                    let column = refresh.time_column.as_deref().unwrap_or_default();
+                    let field = schema.column_with_name(column).map(|(_, f)| f);
                     let filter_converter = TimestampFilterConvert::create(field, refresh.time_column, refresh.time_format);
 
                     let mut refresh_stream = ReceiverStream::new(receiver);
@@ -376,7 +376,7 @@ impl AcceleratedTable {
                         tracing::info!("[refresh] Refreshing data for {dataset_name}");
                         status::update_dataset(&dataset_name, status::ComponentStatus::Refreshing);
                         let timer = TimeMeasurement::new("load_dataset_duration_ms", vec![("dataset", dataset_name.clone())]);
-                        let filters = match (refresh.period, filter_converter.clone()){
+                        let filters = match (refresh.period, filter_converter.as_ref()){
                             (Some(period), Some(converter)) => {
                                 let start = SystemTime::now() - period;
 
