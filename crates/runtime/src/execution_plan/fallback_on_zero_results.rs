@@ -38,6 +38,7 @@ use super::TableScanParams;
 /// The input and fallback `ExecutionPlan` must have the same schema, execution modes and equivalence properties.
 #[allow(clippy::module_name_repetitions)]
 pub struct FallbackOnZeroResultsScanExec {
+    table_name: String,
     /// The input execution plan.
     input: Arc<dyn ExecutionPlan>,
     /// A closure to get the fallback execution plan if needed.
@@ -49,6 +50,7 @@ pub struct FallbackOnZeroResultsScanExec {
 impl FallbackOnZeroResultsScanExec {
     /// Create a new `FallbackOnZeroResultsScanExec`.
     pub fn new(
+        table_name: String,
         mut input: Arc<dyn ExecutionPlan>,
         fallback_table_provider: Arc<dyn TableProvider>,
         fallback_scan_params: TableScanParams,
@@ -61,6 +63,7 @@ impl FallbackOnZeroResultsScanExec {
             input = Arc::new(CoalescePartitionsExec::new(input));
         }
         Self {
+            table_name,
             input,
             fallback_table_provider,
             fallback_scan_params,
@@ -113,6 +116,7 @@ impl ExecutionPlan for FallbackOnZeroResultsScanExec {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         if children.len() == 1 {
             Ok(Arc::new(FallbackOnZeroResultsScanExec::new(
+                self.table_name.clone(),
                 Arc::clone(&children[0]),
                 Arc::clone(&self.fallback_table_provider),
                 self.fallback_scan_params.clone(),
@@ -148,6 +152,16 @@ impl ExecutionPlan for FallbackOnZeroResultsScanExec {
         let schema = input_stream.schema();
         let scan_params = self.fallback_scan_params.clone();
         let fallback_provider = Arc::clone(&self.fallback_table_provider);
+        let fallback_msg = format!(
+            r#"Accelerated table "{}" returned 0 results for query with filter [{}], sending query to federated table..."#,
+            self.table_name,
+            self.fallback_scan_params
+                .filters
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<String>>()
+                .join(", ")
+        );
 
         let potentially_fallback_stream = stream::once(async move {
             let context = Arc::clone(&context);
@@ -173,6 +187,7 @@ impl ExecutionPlan for FallbackOnZeroResultsScanExec {
                 Box::pin(stream_adapter) as SendableRecordBatchStream
             } else {
                 tracing::trace!("FallbackOnZeroResultsScanExec input_stream.next() returned None");
+                tracing::info!("{fallback_msg}");
                 let fallback_plan = match fallback_provider
                     .scan(
                         &scan_params.state,
@@ -266,6 +281,7 @@ mod tests {
             let ctx = SessionContext::new();
 
             let exec = FallbackOnZeroResultsScanExec::new(
+                "test".to_string(),
                 empty_memory_exec(),
                 memory_table_provider(),
                 TableScanParams {
@@ -352,6 +368,7 @@ mod tests {
             };
 
             let exec = FallbackOnZeroResultsScanExec::new(
+                "test".to_string(),
                 input_plan,
                 fallback_provider,
                 fallback_scan_params,

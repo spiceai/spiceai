@@ -71,6 +71,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 // The accelerator must support inserts.
 // AcceleratedTable::new returns an instance of the table and a oneshot receiver that will be triggered when the table is ready, right after the initial data refresh finishes.
 pub struct AcceleratedTable {
+    dataset_name: String,
     accelerator: Arc<dyn TableProvider>,
     federated: Arc<dyn TableProvider>,
     refresh_trigger: Option<mpsc::Sender<()>>,
@@ -142,6 +143,7 @@ impl AcceleratedTable {
 
         (
             Self {
+                dataset_name,
                 accelerator,
                 federated,
                 refresh_trigger,
@@ -475,6 +477,7 @@ impl TableProvider for AcceleratedTable {
             .await?;
 
         Ok(Arc::new(FallbackOnZeroResultsScanExec::new(
+            self.dataset_name.clone(),
             input,
             Arc::clone(&self.federated),
             TableScanParams::new(state, projection, filters, limit),
