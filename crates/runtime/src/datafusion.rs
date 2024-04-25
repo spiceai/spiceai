@@ -19,7 +19,9 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::accelerated_table::{AcceleratedTable, Refresh, Retention};
+use crate::accelerated_table::{
+    AcceleratedTable, Options as AcceleratedTableOptions, Refresh, Retention,
+};
 use crate::dataaccelerator::{self, create_accelerator_table};
 use crate::dataconnector::DataConnector;
 use crate::dataupdate::{DataUpdate, DataUpdateExecutionPlan, UpdateType};
@@ -330,6 +332,19 @@ impl DataFusion {
                 .context(RefreshSqlSnafu)?;
         }
 
+        let mut acc_options = AcceleratedTableOptions::new();
+        acc_options.object_store(obj_store);
+        acc_options.retention(Retention::new(
+            dataset.time_column.clone(),
+            dataset.time_format.clone(),
+            dataset.retention_period(),
+            dataset.retention_check_interval(),
+            acceleration_settings.retention_check_enabled,
+        ));
+        acc_options.query_source_if_zero_accelerated_results(
+            acceleration_settings.query_source_if_zero_accelerated_results,
+        );
+
         Ok(AcceleratedTable::new(
             dataset.name.to_string(),
             source_table_provider,
@@ -342,14 +357,7 @@ impl DataFusion {
                 acceleration_settings.refresh_mode.clone(),
                 dataset.refresh_period(),
             ),
-            Retention::new(
-                dataset.time_column.clone(),
-                dataset.time_format.clone(),
-                dataset.retention_period(),
-                dataset.retention_check_interval(),
-                acceleration_settings.retention_check_enabled,
-            ),
-            obj_store,
+            acc_options,
         )
         .await)
     }

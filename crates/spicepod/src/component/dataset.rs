@@ -397,8 +397,16 @@ pub mod acceleration {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub retention_check_interval: Option<String>,
 
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "is_false")]
         pub retention_check_enabled: bool,
+
+        #[serde(default, skip_serializing_if = "is_false")]
+        pub query_source_if_zero_accelerated_results: bool,
+    }
+
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    fn is_false(b: &bool) -> bool {
+        !b
     }
 
     const fn default_true() -> bool {

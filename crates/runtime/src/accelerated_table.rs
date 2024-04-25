@@ -76,6 +76,7 @@ pub struct AcceleratedTable {
     federated: Arc<dyn TableProvider>,
     refresh_trigger: Option<mpsc::Sender<()>>,
     handlers: Vec<JoinHandle<()>>,
+    query_source_if_zero_accelerated_results: bool,
 }
 
 enum AccelerationRefreshMode {
@@ -89,15 +90,56 @@ fn validate_refresh_period(refresh: &Refresh, dataset: &str) {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+pub struct Options {
+    retention: Option<Retention>,
+    object_store: Option<(Url, Arc<dyn ObjectStore + 'static>)>,
+    query_source_if_zero_accelerated_results: bool,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Options {
+    pub fn new() -> Self {
+        Self {
+            retention: None,
+            object_store: None,
+            query_source_if_zero_accelerated_results: false,
+        }
+    }
+
+    pub fn retention(&mut self, retention: Option<Retention>) -> &mut Self {
+        self.retention = retention;
+        self
+    }
+
+    pub fn object_store(
+        &mut self,
+        object_store: Option<(Url, Arc<dyn ObjectStore + 'static>)>,
+    ) -> &mut Self {
+        self.object_store = object_store;
+        self
+    }
+
+    pub fn query_source_if_zero_accelerated_results(
+        &mut self,
+        query_source_if_zero_accelerated_results: bool,
+    ) -> &mut Self {
+        self.query_source_if_zero_accelerated_results = query_source_if_zero_accelerated_results;
+        self
+    }
+}
+
 impl AcceleratedTable {
     pub async fn new(
         dataset_name: String,
         federated: Arc<dyn TableProvider>,
         accelerator: Arc<dyn TableProvider>,
         refresh: Refresh,
-        retention: Option<Retention>,
-        object_store: Option<(Url, Arc<dyn ObjectStore + 'static>)>,
+        options: Options,
     ) -> (Self, oneshot::Receiver<()>) {
         let mut refresh_trigger = None;
         let mut scheduled_refreshes_handle: Option<JoinHandle<()>> = None;
@@ -121,7 +163,7 @@ impl AcceleratedTable {
             refresh,
             acceleration_refresh_mode,
             Arc::clone(&accelerator),
-            object_store,
+            options.object_store,
             ready_sender,
         ));
 
@@ -132,7 +174,7 @@ impl AcceleratedTable {
             handlers.push(scheduled_refreshes_handle);
         }
 
-        if let Some(retention) = retention {
+        if let Some(retention) = options.retention {
             let retention_check_handle = tokio::spawn(Self::start_retention_check(
                 dataset_name.clone(),
                 Arc::clone(&accelerator),
@@ -148,6 +190,8 @@ impl AcceleratedTable {
                 federated,
                 refresh_trigger,
                 handlers,
+                query_source_if_zero_accelerated_results: options
+                    .query_source_if_zero_accelerated_results,
             },
             is_ready,
         )
@@ -476,12 +520,16 @@ impl TableProvider for AcceleratedTable {
             .scan(state, projection, filters, limit)
             .await?;
 
-        Ok(Arc::new(FallbackOnZeroResultsScanExec::new(
-            self.dataset_name.clone(),
-            input,
-            Arc::clone(&self.federated),
-            TableScanParams::new(state, projection, filters, limit),
-        )))
+        if self.query_source_if_zero_accelerated_results {
+            Ok(Arc::new(FallbackOnZeroResultsScanExec::new(
+                self.dataset_name.clone(),
+                input,
+                Arc::clone(&self.federated),
+                TableScanParams::new(state, projection, filters, limit),
+            )))
+        } else {
+            Ok(input)
+        }
     }
 
     async fn insert_into(
