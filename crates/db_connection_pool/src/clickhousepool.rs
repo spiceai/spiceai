@@ -134,7 +134,7 @@ fn get_config_from_params(
             connection_opts[3],
             connection_opts[4]
         );
-        // Default timeouf of 500ms is not enough
+        // Default timeout of 500ms is not enough
         let new_options = Options::from_str(&connection_string)
             .context(InvalidConnectionStringSnafu)?
             .connection_timeout(Duration::from_secs(5));
