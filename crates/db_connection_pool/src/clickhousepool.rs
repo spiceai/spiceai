@@ -58,6 +58,9 @@ pub enum Error {
         parameter_name: String,
         source: ParseBoolError,
     },
+
+    #[snafu(display("Invalid clickhouse_connection_timeout value: {source}"))]
+    InvalidConnectionTimeoutValue { source: std::num::ParseIntError },
 }
 
 pub struct ClickhouseConnectionPool {
@@ -147,9 +150,18 @@ fn get_config_from_params(
             .connection_timeout(DEFAULT_CONNECTION_TIMEOUT);
         options = Some(new_options);
     }
+
     let mut options = options.ok_or(Error::MissingRequiredParameterForConnection {
         parameter_name: "clickhouse_connection_string".to_string(),
     })?;
+
+    if let Some(connection_timeout) = params.get("clickhouse_connection_timeout") {
+        let connection_timeout = connection_timeout
+            .parse::<u64>()
+            .context(InvalidConnectionTimeoutValueSnafu)?;
+        options = options.connection_timeout(Duration::from_millis(connection_timeout));
+    }
+
     let secure = params
         .get("clickhouse_secure")
         .map(|s| s.parse::<bool>())
