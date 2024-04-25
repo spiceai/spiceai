@@ -21,6 +21,7 @@ use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::{ExecutionMode, Partitioning, PlanProperties};
 use db_connection_pool::dbconnection::{get_schema, query_arrow};
 use db_connection_pool::DbConnectionPool;
+use expr::Engine;
 use futures::TryStreamExt;
 use snafu::prelude::*;
 use std::{any::Any, fmt, sync::Arc};
@@ -60,12 +61,14 @@ pub struct SqlTable<T: 'static, P: 'static> {
     pool: Arc<dyn DbConnectionPool<T, P> + Send + Sync>,
     schema: SchemaRef,
     table_reference: OwnedTableReference,
+    engine: Option<Engine>,
 }
 
 impl<T, P> SqlTable<T, P> {
     pub async fn new(
         pool: &Arc<dyn DbConnectionPool<T, P> + Send + Sync>,
         table_reference: impl Into<OwnedTableReference>,
+        engine: Option<expr::Engine>,
     ) -> Result<Self> {
         let table_reference = table_reference.into();
         let conn = pool
@@ -81,6 +84,7 @@ impl<T, P> SqlTable<T, P> {
             pool: Arc::clone(pool),
             schema,
             table_reference,
+            engine,
         })
     }
 
@@ -93,6 +97,7 @@ impl<T, P> SqlTable<T, P> {
             pool: Arc::clone(pool),
             schema: schema.into(),
             table_reference: table_reference.into(),
+            engine: None,
         }
     }
 
@@ -110,6 +115,7 @@ impl<T, P> SqlTable<T, P> {
             Arc::clone(&self.pool),
             filters,
             limit,
+            self.engine,
         )?))
     }
 }
@@ -132,13 +138,13 @@ impl<T, P> TableProvider for SqlTable<T, P> {
         &self,
         filters: &[&Expr],
     ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
-        let mut filter_push_down = vec![];
-        for filter in filters {
-            match expr::to_sql(filter) {
-                Ok(_) => filter_push_down.push(TableProviderFilterPushDown::Exact),
-                Err(_) => filter_push_down.push(TableProviderFilterPushDown::Unsupported),
-            }
-        }
+        let filter_push_down: Vec<TableProviderFilterPushDown> = filters
+            .iter()
+            .map(|f| match expr::to_sql_with_engine(f, Some(Engine::ODBC)) {
+                Ok(_) => TableProviderFilterPushDown::Exact,
+                Err(_) => TableProviderFilterPushDown::Unsupported,
+            })
+            .collect();
 
         Ok(filter_push_down)
     }
@@ -162,6 +168,7 @@ struct SqlExec<T, P> {
     filters: Vec<Expr>,
     limit: Option<usize>,
     properties: PlanProperties,
+    engine: Option<Engine>,
 }
 
 pub fn project_schema_safe(
@@ -189,6 +196,7 @@ impl<T, P> SqlExec<T, P> {
         pool: Arc<dyn DbConnectionPool<T, P> + Send + Sync>,
         filters: &[Expr],
         limit: Option<usize>,
+        engine: Option<Engine>,
     ) -> DataFusionResult<Self> {
         let projected_schema = project_schema_safe(schema, projections)?;
 
@@ -203,6 +211,7 @@ impl<T, P> SqlExec<T, P> {
                 Partitioning::UnknownPartitioning(1),
                 ExecutionMode::Bounded,
             ),
+            engine,
         })
     }
 
@@ -211,7 +220,10 @@ impl<T, P> SqlExec<T, P> {
             .projected_schema
             .fields()
             .iter()
-            .map(|f| format!("\"{}\"", f.name()))
+            .map(|f| match self.engine {
+                Some(Engine::ODBC) => f.name().to_owned(),
+                _ => format!("\"{}\"", f.name()),
+            })
             .collect::<Vec<_>>()
             .join(", ");
 
@@ -226,7 +238,7 @@ impl<T, P> SqlExec<T, P> {
             let filter_expr = self
                 .filters
                 .iter()
-                .map(expr::to_sql)
+                .map(|f| expr::to_sql_with_engine(f, self.engine))
                 .collect::<expr::Result<Vec<_>>>()
                 .context(UnableToGenerateSQLSnafu)?;
             format!("WHERE {}", filter_expr.join(" AND "))
@@ -360,7 +372,7 @@ mod tests {
         db_conn.conn.execute_batch(
             "CREATE TABLE test (a INTEGER, b VARCHAR); INSERT INTO test VALUES (3, 'bar');",
         )?;
-        let duckdb_table = SqlTable::new(&pool, "test").await?;
+        let duckdb_table = SqlTable::new(&pool, "test", None).await?;
         ctx.register_table("test_datafusion", Arc::new(duckdb_table))?;
         let sql = "SELECT * FROM test_datafusion limit 1";
         let df = ctx.sql(sql).await?;
@@ -390,7 +402,7 @@ mod tests {
         db_conn.conn.execute_batch(
             "CREATE TABLE test (a INTEGER, b VARCHAR); INSERT INTO test VALUES (3, 'bar');",
         )?;
-        let duckdb_table = SqlTable::new(&pool, "test").await?;
+        let duckdb_table = SqlTable::new(&pool, "test", None).await?;
         ctx.register_table("test_datafusion", Arc::new(duckdb_table))?;
         let sql = "SELECT * FROM test_datafusion where a > 1 and b = 'bar' limit 1";
         let df = ctx.sql(sql).await?;

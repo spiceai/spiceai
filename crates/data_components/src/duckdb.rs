@@ -33,7 +33,7 @@ use duckdb::{
     vtab::arrow::arrow_recordbatch_to_query_params, DuckdbConnectionManager, ToSql, Transaction,
 };
 use snafu::prelude::*;
-use sql_provider_datafusion::SqlTable;
+use sql_provider_datafusion::{expr::Engine, SqlTable};
 use std::{cmp, sync::Arc};
 
 use self::write::DuckDBTableWriter;
@@ -322,7 +322,7 @@ impl Read for DuckDBTableFactory {
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         let pool = Arc::clone(&self.pool);
         let dyn_pool: Arc<DynDuckDbConnectionPool> = pool;
-        let table_provider = SqlTable::new(&dyn_pool, table_reference)
+        let table_provider = SqlTable::new(&dyn_pool, table_reference, None)
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
