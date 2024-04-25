@@ -50,8 +50,8 @@ pub enum Error {
     #[snafu(display("ParametersEmptyError"))]
     ParametersEmptyError {},
 
-    #[snafu(display("Required parameter was not provided: {parameter_name}"))]
-    NotEnoughParametersForConnection { parameter_name: String },
+    #[snafu(display("Missing required parameter: {parameter_name}"))]
+    MissingRequiredParameterForConnection { parameter_name: String },
 
     #[snafu(display("Invalid root cert path: {path}"))]
     InvalidRootCertPathError { path: String },
@@ -113,47 +113,44 @@ fn get_config_from_params(
         }
         options = Some(new_options);
     } else {
-        let mut connection_opts: Vec<String> = vec![];
-        let keys = [
-            "clickhouse_user",
-            "clickhouse_host",
-            "clickhouse_tcp_port",
-            "clickhouse_db",
-        ];
-        for key in &keys {
-            let value = params.get(*key);
-            match value {
-                Some(value) => connection_opts.push(value.clone()),
-                None => NotEnoughParametersForConnectionSnafu {
-                    parameter_name: (*key).to_string(),
-                }
-                .fail()?,
-            }
-        }
+        let user =
+            params
+                .get("clickhouse_user")
+                .ok_or(Error::MissingRequiredParameterForConnection {
+                    parameter_name: "clickhouse_user".to_string(),
+                })?;
         let password =
-            get_secret_or_param(params, secret, "clickhouse_pass_key", "clickhouse_pass");
-        match password {
-            Some(password) => connection_opts.insert(1, password),
-            None => NotEnoughParametersForConnectionSnafu {
-                parameter_name: "clickhouse_pass".to_string(),
-            }
-            .fail()?,
-        }
-        let connection_string = format!(
-            "tcp://{}:{}@{}:{}/{}",
-            connection_opts[0],
-            connection_opts[1],
-            connection_opts[2],
-            connection_opts[3],
-            connection_opts[4]
-        );
+            get_secret_or_param(params, secret, "clickhouse_pass_key", "clickhouse_pass").ok_or(
+                Error::MissingRequiredParameterForConnection {
+                    parameter_name: "clickhouse_pass".to_string(),
+                },
+            )?;
+        let host =
+            params
+                .get("clickhouse_host")
+                .ok_or(Error::MissingRequiredParameterForConnection {
+                    parameter_name: "clickhouse_tcp_host".to_string(),
+                })?;
+        let port = params.get("clickhouse_tcp_port").ok_or(
+            Error::MissingRequiredParameterForConnection {
+                parameter_name: "clickhouse_port".to_string(),
+            },
+        )?;
+        let db =
+            params
+                .get("clickhouse_db")
+                .ok_or(Error::MissingRequiredParameterForConnection {
+                    parameter_name: "clickhouse_db".to_string(),
+                })?;
+
+        let connection_string = format!("tcp://{user}:{password}@{host}:{port}/{db}",);
         // Default timeout of 500ms is not enough
         let new_options = Options::from_str(&connection_string)
             .context(InvalidConnectionStringSnafu)?
             .connection_timeout(DEFAULT_CONNECTION_TIMEOUT);
         options = Some(new_options);
     }
-    let mut options = options.ok_or(Error::NotEnoughParametersForConnection {
+    let mut options = options.ok_or(Error::MissingRequiredParameterForConnection {
         parameter_name: "clickhouse_connection_string".to_string(),
     })?;
     let secure = params
