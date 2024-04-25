@@ -68,6 +68,7 @@ ns_lookup = { path = "../ns_lookup" }
 odbc-api = { version = "7.0.0", optional = true }
 chrono = { version = "0.4.38" }
 clickhouse-rs = { workspace = true, optional = true }
+dashmap = "5.5.3"
 
 [features]
 default = ["keyring-secret-store", "aws-secrets-manager"]

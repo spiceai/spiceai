@@ -197,7 +197,7 @@ checksum = "d301b3b94cb4b2f23d7917810addbbaff90738e0ca2be692bd027e70d7e0330c"
 
 [[package]]
 name = "app"
-version = "0.12.0-alpha"
+version = "0.11.2-alpha"
 dependencies = [
  "snafu 0.8.2",
  "spicepod",
@@ -481,7 +481,7 @@ dependencies = [
 
 [[package]]
 name = "arrow_sql_gen"
-version = "0.12.0-alpha"
+version = "0.11.2-alpha"
 dependencies = [
  "arrow",
  "bigdecimal 0.3.1",
@@ -2078,7 +2078,7 @@ checksum = "7e962a19be5cfc3f3bf6dd8f61eb50107f356ad6270fbb3ed41476571db78be5"
 
 [[package]]
 name = "data_components"
-version = "0.12.0-alpha"
+version = "0.11.2-alpha"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -2394,7 +2394,7 @@ dependencies = [
 
 [[package]]
 name = "db_connection_pool"
-version = "0.12.0-alpha"
+version = "0.11.2-alpha"
 dependencies = [
  "arrow",
  "arrow-odbc",
@@ -2632,8 +2632,9 @@ checksum = "75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2"
 
 [[package]]
 name = "duckdb"
-version = "0.10.1"
-source = "git+https://github.com/spiceai/duckdb-rs.git?rev=a0ae8ed71bef6dff779f5ce0a37038b0b916e0ca#a0ae8ed71bef6dff779f5ce0a37038b0b916e0ca"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "424ede399a5d1084e65c0888fda71e407e5809400c92ff2cf510bfd1697b9c76"
 dependencies = [
  "arrow",
  "cast",
@@ -2907,7 +2908,7 @@ dependencies = [
 
 [[package]]
 name = "flight_client"
-version = "0.12.0-alpha"
+version = "0.11.2-alpha"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -2923,7 +2924,7 @@ dependencies = [
 
 [[package]]
 name = "flightpublisher"
-version = "0.12.0-alpha"
+version = "0.11.2-alpha"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -2936,7 +2937,7 @@ dependencies = [
 
 [[package]]
 name = "flightrepl"
-version = "0.12.0-alpha"
+version = "0.11.2-alpha"
 dependencies = [
  "ansi_term",
  "arrow-flight",
@@ -2951,7 +2952,7 @@ dependencies = [
 
 [[package]]
 name = "flightsubscriber"
-version = "0.12.0-alpha"
+version = "0.11.2-alpha"
 dependencies = [
  "arrow-flight",
  "clap",
@@ -3919,8 +3920,9 @@ checksum = "9c198f91728a82281a64e1f4f9eeb25d82cb32a5de251c6bd1b5154d63a8e7bd"
 
 [[package]]
 name = "libduckdb-sys"
-version = "0.10.1"
-source = "git+https://github.com/spiceai/duckdb-rs.git?rev=a0ae8ed71bef6dff779f5ce0a37038b0b916e0ca#a0ae8ed71bef6dff779f5ce0a37038b0b916e0ca"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "51b3f02cecc430f61561bde538d42af4be2d9d5a8b058f74883e460bc1055461"
 dependencies = [
  "autocfg",
  "cc",
@@ -4538,7 +4540,7 @@ dependencies = [
 
 [[package]]
 name = "ns_lookup"
-version = "0.12.0-alpha"
+version = "0.11.2-alpha"
 dependencies = [
  "snafu 0.8.2",
  "tracing",
@@ -5730,7 +5732,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "0.12.0-alpha"
+version = "0.11.2-alpha"
 dependencies = [
  "app",
  "arrow",
@@ -5748,6 +5750,7 @@ dependencies = [
  "clap",
  "clickhouse-rs",
  "csv",
+ "dashmap",
  "data_components",
  "datafusion",
  "db_connection_pool",
@@ -6153,7 +6156,7 @@ dependencies = [
 
 [[package]]
 name = "secrets"
-version = "0.12.0-alpha"
+version = "0.11.2-alpha"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -6473,7 +6476,7 @@ dependencies = [
 
 [[package]]
 name = "spiced"
-version = "0.12.0-alpha"
+version = "0.11.2-alpha"
 dependencies = [
  "app",
  "clap",
@@ -6489,7 +6492,7 @@ dependencies = [
 
 [[package]]
 name = "spicepod"
-version = "0.12.0-alpha"
+version = "0.11.2-alpha"
 dependencies = [
  "fundu",
  "serde",
@@ -6506,7 +6509,7 @@ checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
 
 [[package]]
 name = "sql_provider_datafusion"
-version = "0.12.0-alpha"
+version = "0.11.2-alpha"
 dependencies = [
  "arrow",
  "async-trait",
