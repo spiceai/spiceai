@@ -290,7 +290,7 @@ mod tests {
 
     mod non_empty_filtered_fallback {
         use datafusion::{
-            logical_expr::{col, BinaryExpr, Expr, Operator},
+            logical_expr::{binary_expr, col, Expr, Operator},
             scalar::ScalarValue,
         };
 
@@ -343,11 +343,11 @@ mod tests {
             let fallback_scan_params = TableScanParams {
                 state: ctx.state(),
                 projection: None,
-                filters: vec![Expr::BinaryExpr(BinaryExpr::new(
-                    Box::new(col("a")),
+                filters: vec![binary_expr(
+                    col("a"),
                     Operator::Gt,
-                    Box::new(Expr::Literal(ScalarValue::Int64(Some(3)))),
-                ))],
+                    Expr::Literal(ScalarValue::Int64(Some(3))),
+                )],
                 limit: None,
             };
 
