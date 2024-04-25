@@ -503,7 +503,7 @@ impl TableProvider for AcceleratedTable {
     }
 }
 
-pub(crate) struct Retention {
+pub struct Retention {
     pub(crate) time_column: String,
     pub(crate) time_format: Option<TimeFormat>,
     pub(crate) period: Duration,
@@ -537,7 +537,7 @@ impl Retention {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct Refresh {
+pub struct Refresh {
     pub(crate) time_column: Option<String>,
     pub(crate) time_format: Option<TimeFormat>,
     pub(crate) check_interval: Option<Duration>,

@@ -126,6 +126,7 @@ pub enum Table {
     Accelerated {
         source: Arc<dyn DataConnector>,
         acceleration_secret: Option<Secret>,
+        accelerated_table: Option<AcceleratedTable>,
     },
     Federated(Arc<dyn DataConnector>),
     View(String),
@@ -174,24 +175,25 @@ impl DataFusion {
         &mut self,
         dataset: impl Borrow<Dataset>,
         table: Table,
-        accelerated_table: Option<AcceleratedTable>,
     ) -> Result<()> {
         let dataset = dataset.borrow();
-
-        if let Some(accelerated_table) = accelerated_table {
-            tracing::debug!("Registering dataset {dataset:?} with preloaded accelerated table");
-            self.ctx
-                .register_table(&dataset.name, Arc::new(accelerated_table))
-                .context(UnableToRegisterTableToDataFusionSnafu)?;
-
-            return Ok(());
-        }
 
         match table {
             Table::Accelerated {
                 source,
                 acceleration_secret,
+                accelerated_table,
             } => {
+                if let Some(accelerated_table) = accelerated_table {
+                    tracing::debug!(
+                        "Registering dataset {dataset:?} with preloaded accelerated table"
+                    );
+                    self.ctx
+                        .register_table(&dataset.name, Arc::new(accelerated_table))
+                        .context(UnableToRegisterTableToDataFusionSnafu)?;
+
+                    return Ok(());
+                }
                 self.register_accelerated_table(dataset, source, acceleration_secret)
                     .await?;
             }

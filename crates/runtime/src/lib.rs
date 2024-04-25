@@ -525,7 +525,7 @@ impl Runtime {
             let view_sql = view_sql.context(InvalidSQLViewSnafu)?;
             df.write()
                 .await
-                .register_table(ds, datafusion::Table::View(view_sql), accelerated_table)
+                .register_table(ds, datafusion::Table::View(view_sql))
                 .await
                 .context(UnableToAttachViewSnafu)?;
             return Ok(());
@@ -542,7 +542,7 @@ impl Runtime {
 
             df.write()
                 .await
-                .register_table(ds, datafusion::Table::Federated(data_connector), None)
+                .register_table(ds, datafusion::Table::Federated(data_connector))
                 .await
                 .context(UnableToAttachDataConnectorSnafu {
                     data_connector: source,
@@ -573,8 +573,8 @@ impl Runtime {
                 datafusion::Table::Accelerated {
                     source: data_connector,
                     acceleration_secret,
+                    accelerated_table,
                 },
-                accelerated_table,
             )
             .await
             .context(UnableToAttachDataConnectorSnafu {
