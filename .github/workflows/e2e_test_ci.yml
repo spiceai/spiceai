@@ -151,6 +151,8 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
+      - uses: actions/checkout@v4
+
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         uses: actions/download-artifact@v4
         with:
@@ -159,15 +161,7 @@ jobs:
 
       - name: Install spice
         run: |
-          chmod +x ./build/spice
-          chmod +x ./build/spiced
-          mkdir -p "$HOME/.spice/bin"
-          mv ./build/spice "$HOME/.spice/bin"
-          mv ./build/spiced "$HOME/.spice/bin"
-          echo "$HOME/.spice/bin" >> $GITHUB_PATH
-
-      - name: Check spice version
-        run: spice version
+          export SPICE_BUILD_ARTIFACTS_DIR=$PWD/build && ./test/scripts/install_spice.sh
 
       - name: Init spice app
         run: |
@@ -255,7 +249,10 @@ jobs:
       matrix:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
+    
     steps:
+      - uses: actions/checkout@v4
+
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         uses: actions/download-artifact@v4
         with:
@@ -264,15 +261,7 @@ jobs:
 
       - name: Install spice
         run: |
-          chmod +x ./build/spice
-          chmod +x ./build/spiced
-          mkdir -p "$HOME/.spice/bin"
-          mv ./build/spice "$HOME/.spice/bin"
-          mv ./build/spiced "$HOME/.spice/bin"
-          echo "$HOME/.spice/bin" >> $GITHUB_PATH
-
-      - name: Check spice version
-        run: spice version
+          export SPICE_BUILD_ARTIFACTS_DIR=$PWD/build && ./test/scripts/install_spice.sh
 
       - name: Init spice app
         run: |
@@ -402,15 +391,7 @@ jobs:
 
       - name: Install spice
         run: |
-          chmod +x ./build/spice
-          chmod +x ./build/spiced
-          mkdir -p "$HOME/.spice/bin"
-          mv ./build/spice "$HOME/.spice/bin"
-          mv ./build/spiced "$HOME/.spice/bin"
-          echo "$HOME/.spice/bin" >> $GITHUB_PATH
-
-      - name: Check spice version
-        run: spice version
+          export SPICE_BUILD_ARTIFACTS_DIR=$PWD/build && ./test/scripts/install_spice.sh
 
       - name: Init spice app
         run: |
@@ -539,15 +520,7 @@ jobs:
 
       - name: Install spice
         run: |
-          chmod +x ./build/spice
-          chmod +x ./build/spiced
-          mkdir -p "$HOME/.spice/bin"
-          mv ./build/spice "$HOME/.spice/bin"
-          mv ./build/spiced "$HOME/.spice/bin"
-          echo "$HOME/.spice/bin" >> $GITHUB_PATH
-
-      - name: Check spice version
-        run: spice version
+          export SPICE_BUILD_ARTIFACTS_DIR=$PWD/build && ./test/scripts/install_spice.sh
 
       - name: Init spice app
         run: |
@@ -676,15 +649,7 @@ jobs:
 
       - name: Install spice
         run: |
-          chmod +x ./build/spice
-          chmod +x ./build/spiced
-          mkdir -p "$HOME/.spice/bin"
-          mv ./build/spice "$HOME/.spice/bin"
-          mv ./build/spiced "$HOME/.spice/bin"
-          echo "$HOME/.spice/bin" >> $GITHUB_PATH
-
-      - name: Check spice version
-        run: spice version
+          export SPICE_BUILD_ARTIFACTS_DIR=$PWD/build && ./test/scripts/install_spice.sh
 
       - name: Init spice app
         run: |
@@ -779,6 +744,8 @@ jobs:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
+      - uses: actions/checkout@v4
+      
       - name: Install PostgreSQL (Linux)
         if: matrix.target.target_os == 'linux'
         run: |
@@ -826,15 +793,7 @@ jobs:
 
       - name: Install spice
         run: |
-          chmod +x ./build/spice
-          chmod +x ./build/spiced
-          mkdir -p "$HOME/.spice/bin"
-          mv ./build/spice "$HOME/.spice/bin"
-          mv ./build/spiced "$HOME/.spice/bin"
-          echo "$HOME/.spice/bin" >> $GITHUB_PATH
-
-      - name: Check spice version
-        run: spice version
+          export SPICE_BUILD_ARTIFACTS_DIR=$PWD/build && ./test/scripts/install_spice.sh
 
       - name: Init spice app
         run: |
