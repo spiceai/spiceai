@@ -27,6 +27,7 @@ use crate::get_dependent_table_names;
 use arrow::datatypes::Schema;
 use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider};
 use datafusion::common::OwnedTableReference;
+use datafusion::config::CatalogOptions;
 use datafusion::datasource::ViewTable;
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::{SessionConfig, SessionContext};
@@ -196,6 +197,8 @@ impl Refresh {
 impl DataFusion {
     #[must_use]
     pub fn new() -> Self {
+        let catalog_options = CatalogOptions::default();
+
         let mut df_config = SessionConfig::new()
             .with_information_schema(true)
             .with_create_default_catalog_and_schema(false);
@@ -206,8 +209,13 @@ impl DataFusion {
         let catalog = MemoryCatalogProvider::new();
         let schema = SpiceSchemaProvider::new();
 
-        catalog.register_schema("public", Arc::new(schema)).unwrap();
-        ctx.register_catalog("datafusion", Arc::new(catalog));
+        match catalog.register_schema(&catalog_options.default_schema, Arc::new(schema)) {
+            Ok(_) => {}
+            Err(e) => {
+                panic!("Unable to register default schema: {e}");
+            }
+        }
+        ctx.register_catalog(&catalog_options.default_catalog, Arc::new(catalog));
 
         DataFusion {
             ctx: Arc::new(ctx),
