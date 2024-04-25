@@ -1,0 +1,29 @@
+name: Tests
+
+on:
+  push:
+    branches:
+      - trunk
+      - release-*
+
+  pull_request:
+    branches:
+      - trunk
+
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Test all crates
+    runs-on: rust
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          os: 'linux'
+
+      - name: Tests all crates
+        run: make test
