@@ -25,6 +25,7 @@ use crate::dataconnector::DataConnector;
 use crate::dataupdate::{DataUpdate, DataUpdateExecutionPlan, UpdateType};
 use crate::get_dependent_table_names;
 use arrow::datatypes::Schema;
+use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider};
 use datafusion::common::OwnedTableReference;
 use datafusion::datasource::ViewTable;
 use datafusion::error::DataFusionError;
@@ -42,6 +43,9 @@ use tokio::sync::oneshot;
 use tokio::time::{sleep, Instant};
 
 pub mod refresh_sql;
+pub mod schema;
+
+use self::schema::SpiceSchemaProvider;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -192,10 +196,21 @@ impl Refresh {
 impl DataFusion {
     #[must_use]
     pub fn new() -> Self {
-        let mut df_config = SessionConfig::new().with_information_schema(true);
+        let mut df_config = SessionConfig::new()
+            .with_information_schema(true)
+            .with_create_default_catalog_and_schema(false);
         df_config.options_mut().sql_parser.dialect = "PostgreSQL".to_string();
+
+        let ctx = SessionContext::new_with_config(df_config);
+
+        let catalog = MemoryCatalogProvider::new();
+        let schema = SpiceSchemaProvider::new();
+
+        catalog.register_schema("public", Arc::new(schema)).unwrap();
+        ctx.register_catalog("datafusion", Arc::new(catalog));
+
         DataFusion {
-            ctx: Arc::new(SessionContext::new_with_config(df_config)),
+            ctx: Arc::new(ctx),
             data_writers: HashSet::new(),
         }
     }
