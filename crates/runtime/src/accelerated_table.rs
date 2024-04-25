@@ -193,7 +193,9 @@ impl AcceleratedTable {
         let time_column = retention.time_column;
         let retention_period = retention.period;
         let schema = accelerator.schema();
-        let field = schema.column_with_name(time_column.as_str());
+        let field = schema
+            .column_with_name(time_column.as_str())
+            .map(|(_, f)| f);
 
         let mut interval_timer = tokio::time::interval(retention.check_interval);
 
@@ -365,7 +367,7 @@ impl AcceleratedTable {
                 AccelerationRefreshMode::Full(receiver) => {
                     let schema = federated.schema();
                     let column = refresh.time_column.clone().unwrap_or_default();
-                    let field = schema.column_with_name(column.as_str());
+                    let field = schema.column_with_name(column.as_str()).map(|(_, f)| f);
                     let filter_converter = TimestampFilterConvert::create(field, refresh.time_column, refresh.time_format);
 
                     let mut refresh_stream = ReceiverStream::new(receiver);

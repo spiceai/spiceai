@@ -26,45 +26,43 @@ pub(crate) struct TimestampFilterConvert {
 #[allow(clippy::needless_pass_by_value)]
 impl TimestampFilterConvert {
     pub(crate) fn create(
-        field: Option<(usize, &arrow::datatypes::Field)>,
+        field: Option<&arrow::datatypes::Field>,
         time_column: Option<String>,
         time_format: Option<TimeFormat>,
     ) -> Option<Self> {
+        let field = field?;
         let time_column = time_column?;
 
-        let time_format = match field {
-            Some(field) => match field.1.data_type() {
-                DataType::Int8
-                | DataType::Int16
-                | DataType::Int32
-                | DataType::Int64
-                | DataType::UInt8
-                | DataType::UInt16
-                | DataType::UInt32
-                | DataType::UInt64
-                | DataType::Float16
-                | DataType::Float32
-                | DataType::Float64 => {
-                    let mut scale = 1;
-                    if let Some(time_format) = time_format.clone() {
-                        if time_format == TimeFormat::UnixMillis {
-                            scale = 1000;
-                        }
+        let time_format = match field.data_type() {
+            DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float16
+            | DataType::Float32
+            | DataType::Float64 => {
+                let mut scale = 1;
+                if let Some(time_format) = time_format.clone() {
+                    if time_format == TimeFormat::UnixMillis {
+                        scale = 1000;
                     }
-                    ExprTimeFormat::UnixTimestamp(ExprUnixTimestamp { scale })
                 }
-                DataType::Timestamp(_, _)
-                | DataType::Date32
-                | DataType::Date64
-                | DataType::Time32(_)
-                | DataType::Time64(_) => ExprTimeFormat::Timestamp,
-                DataType::Utf8 | DataType::LargeUtf8 => ExprTimeFormat::ISO8601,
-                _ => {
-                    tracing::warn!("Date type is not handled yet: {}", field.1.data_type());
-                    return None;
-                }
-            },
-            None => return None,
+                ExprTimeFormat::UnixTimestamp(ExprUnixTimestamp { scale })
+            }
+            DataType::Timestamp(_, _)
+            | DataType::Date32
+            | DataType::Date64
+            | DataType::Time32(_)
+            | DataType::Time64(_) => ExprTimeFormat::Timestamp,
+            DataType::Utf8 | DataType::LargeUtf8 => ExprTimeFormat::ISO8601,
+            _ => {
+                tracing::warn!("Date type is not handled yet: {}", field.data_type());
+                return None;
+            }
         };
 
         Some(Self {
@@ -75,8 +73,8 @@ impl TimestampFilterConvert {
 
     #[allow(clippy::cast_possible_wrap)]
     pub(crate) fn convert(&self, timestamp: u64, op: Operator) -> Expr {
-        let time_column: &str = &self.time_column.clone();
-        match self.time_format.clone() {
+        let time_column: &str = self.time_column.as_ref();
+        match &self.time_format {
             ExprTimeFormat::ISO8601 => binary_expr(
                 cast(
                     col(time_column),
