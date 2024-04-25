@@ -16,14 +16,10 @@ limitations under the License.
 
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
-use datafusion::common::ToDFSchema;
 use datafusion::datasource::TableProvider;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
-use datafusion::physical_expr::create_physical_expr;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
-use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, Partitioning,
@@ -145,7 +141,8 @@ impl ExecutionPlan for FallbackOnZeroResultsScanExec {
         }
 
         // The input execution plan may not support all of the push down filters, so wrap it with a `FilterExec`.
-        let filtered_input = filter_plan(Arc::clone(&self.input), &self.fallback_scan_params)?;
+        let filtered_input =
+            super::filter_plan(Arc::clone(&self.input), &self.fallback_scan_params)?;
 
         let mut input_stream = filtered_input.execute(0, Arc::clone(&context))?;
         let schema = input_stream.schema();
@@ -216,34 +213,4 @@ impl ExecutionPlan for FallbackOnZeroResultsScanExec {
 
         Ok(Box::pin(stream_adapter))
     }
-}
-
-fn filter_plan(
-    input: Arc<dyn ExecutionPlan>,
-    scan_params: &TableScanParams,
-) -> Result<Arc<dyn ExecutionPlan>> {
-    let Some(joined_filters) = scan_params.filters.iter().cloned().reduce(|left, right| {
-        Expr::BinaryExpr(BinaryExpr::new(
-            Box::new(left),
-            Operator::And,
-            Box::new(right),
-        ))
-    }) else {
-        tracing::trace!("No filters to apply to input plan");
-        return Ok(input);
-    };
-    let input_schema = input.schema();
-    let input_dfschema = Arc::clone(&input_schema).to_dfschema()?;
-
-    tracing::trace!("Creating physical expression for filter: {joined_filters}");
-
-    let physical_expr = create_physical_expr(
-        &joined_filters,
-        &input_dfschema,
-        scan_params.state.execution_props(),
-    )?;
-
-    let filtered_input = FilterExec::try_new(physical_expr, input)?;
-
-    Ok(Arc::new(filtered_input))
 }

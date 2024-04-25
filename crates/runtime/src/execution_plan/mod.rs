@@ -14,7 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use datafusion::{execution::context::SessionState, logical_expr::Expr};
+use datafusion::common::ToDFSchema;
+use datafusion::error::Result;
+use datafusion::execution::context::SessionState;
+use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
+use datafusion::physical_expr::create_physical_expr;
+use datafusion::physical_plan::filter::FilterExec;
+use datafusion::physical_plan::ExecutionPlan;
+use std::sync::Arc;
 
 pub mod fallback_on_zero_results;
 pub mod slice;
@@ -44,4 +51,35 @@ impl TableScanParams {
             limit,
         }
     }
+}
+
+/// Filters an input `ExecutionPlan` using the filters in `TableScanParams`.
+pub(crate) fn filter_plan(
+    input: Arc<dyn ExecutionPlan>,
+    scan_params: &TableScanParams,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let Some(joined_filters) = scan_params.filters.iter().cloned().reduce(|left, right| {
+        Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(left),
+            Operator::And,
+            Box::new(right),
+        ))
+    }) else {
+        tracing::trace!("No filters to apply to input plan");
+        return Ok(input);
+    };
+    let input_schema = input.schema();
+    let input_dfschema = Arc::clone(&input_schema).to_dfschema()?;
+
+    tracing::trace!("Creating physical expression for filter: {joined_filters}");
+
+    let physical_expr = create_physical_expr(
+        &joined_filters,
+        &input_dfschema,
+        scan_params.state.execution_props(),
+    )?;
+
+    let filtered_input = FilterExec::try_new(physical_expr, input)?;
+
+    Ok(Arc::new(filtered_input))
 }
