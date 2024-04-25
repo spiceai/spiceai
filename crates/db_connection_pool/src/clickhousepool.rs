@@ -14,7 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    str::{FromStr, ParseBoolError},
+    sync::Arc,
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use clickhouse_rs::{ClientHandle, Options, Pool};
@@ -50,6 +55,12 @@ pub enum Error {
 
     #[snafu(display("Invalid root cert path: {path}"))]
     InvalidRootCertPathError { path: String },
+
+    #[snafu(display("Invalid secure parameter value {parameter_name}"))]
+    InvalidSecureParameterValueError {
+        parameter_name: String,
+        source: ParseBoolError,
+    },
 }
 
 pub struct ClickhouseConnectionPool {
@@ -81,6 +92,8 @@ impl ClickhouseConnectionPool {
     }
 }
 
+const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
+
 fn get_config_from_params(
     params: &HashMap<String, String>,
     secret: &Option<Secret>,
@@ -96,7 +109,7 @@ fn get_config_from_params(
             .context(InvalidConnectionStringSnafu)?;
         if !clickhouse_connection_string.contains("connection_timeout") {
             // Default timeout of 500ms is not enough in some cases.
-            new_options = new_options.connection_timeout(Duration::from_secs(5));
+            new_options = new_options.connection_timeout(DEFAULT_CONNECTION_TIMEOUT);
         }
         options = Some(new_options);
     } else {
@@ -137,15 +150,20 @@ fn get_config_from_params(
         // Default timeout of 500ms is not enough
         let new_options = Options::from_str(&connection_string)
             .context(InvalidConnectionStringSnafu)?
-            .connection_timeout(Duration::from_secs(5));
+            .connection_timeout(DEFAULT_CONNECTION_TIMEOUT);
         options = Some(new_options);
     }
     let mut options = options.ok_or(Error::NotEnoughParametersForConnection {
         parameter_name: "clickhouse_connection_string".to_string(),
     })?;
-    if let Some(clickhouse_secure) = params.get("clickhouse_secure") {
-        options = options.secure(clickhouse_secure.parse().unwrap_or(false));
-    }
+    let secure = params
+        .get("clickhouse_secure")
+        .map(|s| s.parse::<bool>())
+        .transpose()
+        .context(InvalidSecureParameterValueSnafu {
+            parameter_name: "clickhouse_secure".to_string(),
+        })?;
+    options = options.secure(secure.unwrap_or(true));
 
     if let Some(clickhouse_sslrootcert) = params.get("clickhouse_sslrootcert") {
         if !std::path::Path::new(clickhouse_sslrootcert).exists() {
