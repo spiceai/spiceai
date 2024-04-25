@@ -137,6 +137,11 @@ pub struct DataFusion {
 }
 
 impl DataFusion {
+    /// Create a new `DataFusion` instance.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the default schema cannot be registered.
     #[must_use]
     pub fn new() -> Self {
         let catalog_options = CatalogOptions::default();
