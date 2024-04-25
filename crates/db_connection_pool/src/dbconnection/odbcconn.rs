@@ -16,7 +16,6 @@ limitations under the License.
 
 use std::any::Any;
 use std::sync::Arc;
-use std::sync::Mutex;
 
 use arrow::datatypes::SchemaRef;
 use arrow_odbc::arrow_schema_from;
@@ -24,6 +23,7 @@ use arrow_odbc::OdbcReaderBuilder;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::memory::MemoryStream;
 use datafusion::sql::TableReference;
+use futures::lock::Mutex;
 use odbc_api::handles::Statement;
 use odbc_api::handles::StatementImpl;
 use odbc_api::parameter::InputParameter;
@@ -83,30 +83,16 @@ where
     }
 
     #[must_use]
-    #[allow(clippy::type_complexity, clippy::type_repetition_in_bounds)]
     async fn get_schema(&self, table_reference: &TableReference) -> Result<SchemaRef> {
-        let cxn = self.conn.lock().expect("Must lock");
+        let cxn = self.conn.lock().await;
 
-        let cursor = cxn
-            .execute(
-                &format!(
-                    "SELECT * FROM {} LIMIT 1",
-                    table_reference.to_quoted_string()
-                ),
-                (),
-            )
-            .context(ODBCAPISnafu)?
-            .expect("Must produce cursor for schema reflection");
+        let mut prepared = cxn.prepare(&format!(
+            "SELECT * FROM {} LIMIT 1",
+            table_reference.to_quoted_string()
+        ))?;
+        let schema = Arc::new(arrow_schema_from(&mut prepared)?);
 
-        let mut reader = OdbcReaderBuilder::new()
-            .build(cursor)
-            .context(ArrowODBCSnafu)?;
-
-        let record_batch = reader
-            .next()
-            .expect("Must produce a result batch for schema reflection")?;
-
-        Ok(record_batch.schema())
+        Ok(schema)
     }
 
     async fn query_arrow(
@@ -114,7 +100,7 @@ where
         sql: &str,
         params: &[&'a ODBCParameter],
     ) -> Result<SendableRecordBatchStream> {
-        let cxn = self.conn.lock().expect("Must lock");
+        let cxn = self.conn.lock().await;
         let mut prepared = cxn.prepare(sql)?;
         let schema = Arc::new(arrow_schema_from(&mut prepared)?);
         let mut statement = prepared.into_statement();
@@ -137,7 +123,7 @@ where
     }
 
     async fn execute(&self, query: &str, params: &[&'a ODBCParameter]) -> Result<u64> {
-        let cxn = self.conn.lock().expect("Must lock");
+        let cxn = self.conn.lock().await;
         let prepared = cxn.prepare(query)?;
         let mut statement = prepared.into_statement();
 
@@ -155,7 +141,7 @@ where
     }
 }
 
-fn bind_parameters(statement: &mut StatementImpl, params: &[&'_ ODBCParameter]) -> () {
+fn bind_parameters(statement: &mut StatementImpl, params: &[&'_ ODBCParameter]) {
     for (i, param) in params.iter().enumerate() {
         unsafe {
             statement

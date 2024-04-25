@@ -33,7 +33,7 @@ use duckdb::{
     vtab::arrow::arrow_recordbatch_to_query_params, DuckdbConnectionManager, ToSql, Transaction,
 };
 use snafu::prelude::*;
-use sql_provider_datafusion::{expr::Engine, SqlTable};
+use sql_provider_datafusion::SqlTable;
 use std::{cmp, sync::Arc};
 
 use self::write::DuckDBTableWriter;
