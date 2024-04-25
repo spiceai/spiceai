@@ -19,13 +19,15 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::accelerated_table::AcceleratedTable;
+use crate::accelerated_table::{AcceleratedTable, Refresh, Retention};
 use crate::dataaccelerator::{self, create_accelerator_table};
 use crate::dataconnector::DataConnector;
 use crate::dataupdate::{DataUpdate, DataUpdateExecutionPlan, UpdateType};
 use crate::get_dependent_table_names;
 use arrow::datatypes::Schema;
+use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider};
 use datafusion::common::OwnedTableReference;
+use datafusion::config::CatalogOptions;
 use datafusion::datasource::ViewTable;
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::{SessionConfig, SessionContext};
@@ -35,12 +37,16 @@ use datafusion::sql::sqlparser;
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use secrets::Secret;
 use snafu::prelude::*;
-use spicepod::component::dataset::acceleration::RefreshMode;
-use spicepod::component::dataset::{Dataset, Mode, TimeFormat};
+use spicepod::component::dataset::{Dataset, Mode};
 use tokio::spawn;
+use tokio::sync::oneshot;
 use tokio::time::{sleep, Instant};
 
+pub mod filter_converter;
 pub mod refresh_sql;
+pub mod schema;
+
+use self::schema::SpiceSchemaProvider;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -120,6 +126,7 @@ pub enum Table {
     Accelerated {
         source: Arc<dyn DataConnector>,
         acceleration_secret: Option<Secret>,
+        accelerated_table: Option<AcceleratedTable>,
     },
     Federated(Arc<dyn DataConnector>),
     View(String),
@@ -130,71 +137,36 @@ pub struct DataFusion {
     data_writers: HashSet<String>,
 }
 
-pub(crate) struct Retention {
-    pub(crate) time_column: String,
-    pub(crate) time_format: Option<TimeFormat>,
-    pub(crate) period: Duration,
-    pub(crate) check_interval: Duration,
-}
-
-impl Retention {
-    pub(crate) fn new(
-        time_column: Option<String>,
-        time_format: Option<TimeFormat>,
-        retention_period: Option<Duration>,
-        retention_check_interval: Option<Duration>,
-        retention_check_enabled: bool,
-    ) -> Option<Self> {
-        if !retention_check_enabled {
-            return None;
-        }
-        if let (Some(time_column), Some(period), Some(check_interval)) =
-            (time_column, retention_period, retention_check_interval)
-        {
-            Some(Self {
-                time_column,
-                time_format,
-                period,
-                check_interval,
-            })
-        } else {
-            None
-        }
-    }
-}
-
-pub(crate) struct Refresh {
-    pub(crate) check_interval: Option<Duration>,
-    pub(crate) sql: Option<String>,
-    pub(crate) mode: RefreshMode,
-    pub(crate) period: Option<Duration>,
-}
-
-impl Refresh {
-    #[allow(clippy::needless_pass_by_value)]
-    #[must_use]
-    pub(crate) fn new(
-        check_interval: Option<Duration>,
-        sql: Option<String>,
-        mode: RefreshMode,
-        period: Option<Duration>,
-    ) -> Self {
-        Self {
-            check_interval,
-            sql,
-            mode,
-            period,
-        }
-    }
-}
-
 impl DataFusion {
+    /// Create a new `DataFusion` instance.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the default schema cannot be registered.
     #[must_use]
     pub fn new() -> Self {
-        let mut df_config = SessionConfig::new().with_information_schema(true);
+        let catalog_options = CatalogOptions::default();
+
+        let mut df_config = SessionConfig::new()
+            .with_information_schema(true)
+            .with_create_default_catalog_and_schema(false);
         df_config.options_mut().sql_parser.dialect = "PostgreSQL".to_string();
+
+        let ctx = SessionContext::new_with_config(df_config);
+
+        let catalog = MemoryCatalogProvider::new();
+        let schema = SpiceSchemaProvider::new();
+
+        match catalog.register_schema(&catalog_options.default_schema, Arc::new(schema)) {
+            Ok(_) => {}
+            Err(e) => {
+                panic!("Unable to register default schema: {e}");
+            }
+        }
+        ctx.register_catalog(&catalog_options.default_catalog, Arc::new(catalog));
+
         DataFusion {
-            ctx: Arc::new(SessionContext::new_with_config(df_config)),
+            ctx: Arc::new(ctx),
             data_writers: HashSet::new(),
         }
     }
@@ -205,11 +177,23 @@ impl DataFusion {
         table: Table,
     ) -> Result<()> {
         let dataset = dataset.borrow();
+
         match table {
             Table::Accelerated {
                 source,
                 acceleration_secret,
+                accelerated_table,
             } => {
+                if let Some(accelerated_table) = accelerated_table {
+                    tracing::debug!(
+                        "Registering dataset {dataset:?} with preloaded accelerated table"
+                    );
+                    self.ctx
+                        .register_table(&dataset.name, Arc::new(accelerated_table))
+                        .context(UnableToRegisterTableToDataFusionSnafu)?;
+
+                    return Ok(());
+                }
                 self.register_accelerated_table(dataset, source, acceleration_secret)
                     .await?;
             }
@@ -293,13 +277,13 @@ impl DataFusion {
         Ok(())
     }
 
-    async fn register_accelerated_table(
-        &mut self,
+    pub async fn create_accelerated_table(
+        &self,
         dataset: &Dataset,
         source: Arc<dyn DataConnector>,
         acceleration_secret: Option<Secret>,
-    ) -> Result<()> {
-        tracing::debug!("Registering accelerated table {dataset:?}");
+    ) -> Result<(AcceleratedTable, oneshot::Receiver<()>)> {
+        tracing::debug!("Creating accelerated table {dataset:?}");
         let obj_store = source
             .get_object_store(dataset)
             .transpose()
@@ -346,11 +330,13 @@ impl DataFusion {
                 .context(RefreshSqlSnafu)?;
         }
 
-        let accelerated_table = AcceleratedTable::new(
+        Ok(AcceleratedTable::new(
             dataset.name.to_string(),
             source_table_provider,
             accelerated_table_provider,
             Refresh::new(
+                dataset.time_column.clone(),
+                dataset.time_format.clone(),
                 dataset.refresh_check_interval(),
                 refresh_sql.clone(),
                 acceleration_settings.refresh_mode.clone(),
@@ -365,7 +351,18 @@ impl DataFusion {
             ),
             obj_store,
         )
-        .await;
+        .await)
+    }
+
+    async fn register_accelerated_table(
+        &mut self,
+        dataset: &Dataset,
+        source: Arc<dyn DataConnector>,
+        acceleration_secret: Option<Secret>,
+    ) -> Result<()> {
+        let (accelerated_table, _) = self
+            .create_accelerated_table(dataset, source, acceleration_secret)
+            .await?;
 
         self.ctx
             .register_table(&dataset.name, Arc::new(accelerated_table))
