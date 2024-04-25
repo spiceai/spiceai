@@ -636,10 +636,22 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Clickhouse
+        if: matrix.target.target_os == 'linux'
         run: |
           curl https://clickhouse.com/ | sh
           sudo ./clickhouse install
           sudo -u clickhouse /usr/bin/clickhouse-server --config=/etc/clickhouse-server/config.xml --daemon  -- --tcp_port=9001
+          sleep 5
+          clickhouse client --port 9001 -udefault --query="CREATE USER test_user IDENTIFIED BY 'password';"
+          clickhouse client --port 9001 -udefault --query="GRANT ALL PRIVILEGES ON testdb.* TO 'test_user';"
+          clickhouse client --port 9001 -utest_user --password password --query="CREATE DATABASE IF NOT EXISTS testdb;"
+
+      - name: Install Clickhouse
+        if: matrix.target.target_os == 'darwin'
+        run: |
+          curl https://clickhouse.com/ | sh
+          sudo ./clickhouse install
+          sudo clickhouse server --config=/etc/clickhouse-server/config.xml --daemon  -- --tcp_port=9001
           sleep 5
           clickhouse client --port 9001 -udefault --query="CREATE USER test_user IDENTIFIED BY 'password';"
           clickhouse client --port 9001 -udefault --query="GRANT ALL PRIVILEGES ON testdb.* TO 'test_user';"
