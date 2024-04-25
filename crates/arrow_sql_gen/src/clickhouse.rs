@@ -29,7 +29,7 @@ use bigdecimal::{BigDecimal, ToPrimitive};
 use chrono::NaiveDate;
 use chrono_tz::Tz;
 use clickhouse_rs::{
-    types::{Complex, Decimal, SqlType},
+    types::{ColumnType, Decimal, SqlType},
     Block,
 };
 use snafu::{ResultExt, Snafu};
@@ -132,7 +132,7 @@ macro_rules! handle_primitive_nullable_type {
 ///
 /// Returns an error if there is a failure in converting the rows to a `RecordBatch`.
 #[allow(clippy::too_many_lines)]
-pub fn block_to_arrow(block: &Block<Complex>) -> Result<RecordBatch> {
+pub fn block_to_arrow<T: ColumnType>(block: &Block<T>) -> Result<RecordBatch> {
     let mut arrow_fields: Vec<Option<Field>> = Vec::new();
     let mut arrow_columns_builders: Vec<Option<Box<dyn ArrayBuilder>>> = Vec::new();
     let mut clickhouse_types: Vec<SqlType> = Vec::new();
