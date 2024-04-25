@@ -53,5 +53,5 @@ postgres = [
 ]
 sqlite = ["dep:rusqlite", "dep:tokio-rusqlite", "arrow_sql_gen/sqlite", "spicepod/sqlite"]
 mysql = ["dep:mysql_async", "arrow_sql_gen/mysql", "spicepod/mysql"]
-odbc = ["dep:odbc-api", "dep:arrow-odbc"]
+odbc = ["dep:odbc-api", "dep:arrow-odbc", "dep:tokio"]
 clickhouse = ["dep:clickhouse-rs", "arrow_sql_gen/clickhouse"]

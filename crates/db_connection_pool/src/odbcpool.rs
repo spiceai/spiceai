@@ -54,10 +54,14 @@ impl ODBCPool {
     ) -> Result<Self> {
         Ok(Self { params, pool: &ENV })
     }
+
+    pub unsafe fn odbc_environment(&self) -> &'static Environment {
+        self.pool
+    }
 }
 
 #[async_trait]
-impl<'a> DbConnectionPool<Connection<'a>, &'a ODBCParameter> for ODBCPool
+impl<'a> DbConnectionPool<Connection<'a>, ODBCParameter> for ODBCPool
 where
     'a: 'static,
 {
