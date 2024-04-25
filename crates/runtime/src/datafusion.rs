@@ -19,7 +19,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::accelerated_table::AcceleratedTable;
+use crate::accelerated_table::{AcceleratedTable, Refresh, Retention};
 use crate::dataaccelerator::{self, create_accelerator_table};
 use crate::dataconnector::DataConnector;
 use crate::dataupdate::{DataUpdate, DataUpdateExecutionPlan, UpdateType};
@@ -35,8 +35,7 @@ use datafusion::sql::sqlparser;
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use secrets::Secret;
 use snafu::prelude::*;
-use spicepod::component::dataset::acceleration::RefreshMode;
-use spicepod::component::dataset::{Dataset, Mode, TimeFormat};
+use spicepod::component::dataset::{Dataset, Mode};
 use tokio::spawn;
 use tokio::time::{sleep, Instant};
 
@@ -129,71 +128,6 @@ pub enum Table {
 pub struct DataFusion {
     pub ctx: Arc<SessionContext>,
     data_writers: HashSet<String>,
-}
-
-pub(crate) struct Retention {
-    pub(crate) time_column: String,
-    pub(crate) time_format: Option<TimeFormat>,
-    pub(crate) period: Duration,
-    pub(crate) check_interval: Duration,
-}
-
-impl Retention {
-    pub(crate) fn new(
-        time_column: Option<String>,
-        time_format: Option<TimeFormat>,
-        retention_period: Option<Duration>,
-        retention_check_interval: Option<Duration>,
-        retention_check_enabled: bool,
-    ) -> Option<Self> {
-        if !retention_check_enabled {
-            return None;
-        }
-        if let (Some(time_column), Some(period), Some(check_interval)) =
-            (time_column, retention_period, retention_check_interval)
-        {
-            Some(Self {
-                time_column,
-                time_format,
-                period,
-                check_interval,
-            })
-        } else {
-            None
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct Refresh {
-    pub(crate) time_column: Option<String>,
-    pub(crate) time_format: Option<TimeFormat>,
-    pub(crate) check_interval: Option<Duration>,
-    pub(crate) sql: Option<String>,
-    pub(crate) mode: RefreshMode,
-    pub(crate) period: Option<Duration>,
-}
-
-impl Refresh {
-    #[allow(clippy::needless_pass_by_value)]
-    #[must_use]
-    pub(crate) fn new(
-        time_column: Option<String>,
-        time_format: Option<TimeFormat>,
-        check_interval: Option<Duration>,
-        sql: Option<String>,
-        mode: RefreshMode,
-        period: Option<Duration>,
-    ) -> Self {
-        Self {
-            time_column,
-            time_format,
-            check_interval,
-            sql,
-            mode,
-            period,
-        }
-    }
 }
 
 impl DataFusion {

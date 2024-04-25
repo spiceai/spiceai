@@ -21,6 +21,7 @@ use futures::{stream::BoxStream, StreamExt};
 use object_store::ObjectStore;
 use snafu::prelude::*;
 use spicepod::component::dataset::acceleration::RefreshMode;
+use spicepod::component::dataset::TimeFormat;
 use tokio::task::JoinHandle;
 use tokio::time::interval;
 use url::Url;
@@ -30,7 +31,6 @@ use tokio::sync::mpsc::Receiver;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::datafusion::filter_converter::TimestampFilterConvert;
-use crate::datafusion::{Refresh, Retention};
 use crate::execution_plan::slice::SliceExec;
 use crate::execution_plan::tee::TeeExec;
 use crate::{
@@ -488,5 +488,70 @@ impl TableProvider for AcceleratedTable {
         ]));
 
         Ok(union_plan)
+    }
+}
+
+pub(crate) struct Retention {
+    pub(crate) time_column: String,
+    pub(crate) time_format: Option<TimeFormat>,
+    pub(crate) period: Duration,
+    pub(crate) check_interval: Duration,
+}
+
+impl Retention {
+    pub(crate) fn new(
+        time_column: Option<String>,
+        time_format: Option<TimeFormat>,
+        retention_period: Option<Duration>,
+        retention_check_interval: Option<Duration>,
+        retention_check_enabled: bool,
+    ) -> Option<Self> {
+        if !retention_check_enabled {
+            return None;
+        }
+        if let (Some(time_column), Some(period), Some(check_interval)) =
+            (time_column, retention_period, retention_check_interval)
+        {
+            Some(Self {
+                time_column,
+                time_format,
+                period,
+                check_interval,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct Refresh {
+    pub(crate) time_column: Option<String>,
+    pub(crate) time_format: Option<TimeFormat>,
+    pub(crate) check_interval: Option<Duration>,
+    pub(crate) sql: Option<String>,
+    pub(crate) mode: RefreshMode,
+    pub(crate) period: Option<Duration>,
+}
+
+impl Refresh {
+    #[allow(clippy::needless_pass_by_value)]
+    #[must_use]
+    pub(crate) fn new(
+        time_column: Option<String>,
+        time_format: Option<TimeFormat>,
+        check_interval: Option<Duration>,
+        sql: Option<String>,
+        mode: RefreshMode,
+        period: Option<Duration>,
+    ) -> Self {
+        Self {
+            time_column,
+            time_format,
+            check_interval,
+            sql,
+            mode,
+            period,
+        }
     }
 }
