@@ -388,7 +388,7 @@ impl Runtime {
         status::update_dataset(&ds.name, status::ComponentStatus::Refreshing);
         if let Ok(connector) = self.load_dataset_connector(ds, all_datasets).await {
             if ds.is_file_accelerated() {
-                tracing::warn!("File accelerated datasets doesn't support hot reload, falling back to full dataset reload");
+                tracing::warn!("File accelerated datasets currently don't support hot reload, falling back to full dataset reload");
             } else if ds.is_accelerated() {
                 tracing::info!("Hot reloading accelerated dataset: {}...", &ds.name);
 
