@@ -18,6 +18,7 @@ use std::any::Any;
 use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
+use arrow::record_batch::RecordBatch;
 use arrow_odbc::arrow_schema_from;
 use arrow_odbc::OdbcReaderBuilder;
 use datafusion::execution::SendableRecordBatchStream;
@@ -36,7 +37,6 @@ use crate::DbConnectionPool;
 use super::AsyncDbConnection;
 use super::DbConnection;
 use super::Result;
-use itertools::Itertools;
 use odbc_api::Connection;
 
 pub trait ODBCSyncParameter: InputParameter + Sync {
@@ -127,7 +127,7 @@ where
             .build(cursor)
             .context(ArrowODBCSnafu)?;
 
-        let results = reader.map(|b| b.unwrap()).collect_vec();
+        let results: Vec<RecordBatch> = reader.map(|b| b.unwrap()).collect();
 
         Ok(Box::pin(MemoryStream::try_new(results, schema, None)?))
     }

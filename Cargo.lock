@@ -2406,7 +2406,6 @@ dependencies = [
  "datafusion",
  "duckdb",
  "futures",
- "itertools 0.12.1",
  "lazy_static",
  "mysql_async",
  "native-tls",
