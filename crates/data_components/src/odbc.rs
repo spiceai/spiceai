@@ -28,7 +28,6 @@ use datafusion::{
         stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionMode,
         ExecutionPlan, Partitioning, PlanProperties,
     },
-    scalar::ScalarValue,
 };
 use db_connection_pool::dbconnection::odbcconn::ODBCDbConnectionPool;
 use db_connection_pool::{
@@ -37,7 +36,7 @@ use db_connection_pool::{
 };
 use futures::TryStreamExt;
 use snafu::prelude::*;
-use sql_provider_datafusion::expr;
+use sql_provider_datafusion::expr::{self, to_sql_with_engine, Engine};
 use std::{any::Any, fmt, sync::Arc};
 
 use crate::Read;
@@ -185,13 +184,13 @@ where
         &self,
         filters: &[&Expr],
     ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
-        let mut filter_push_down = vec![];
-        for filter in filters {
-            match odbc_to_sql(filter) {
-                Ok(_) => filter_push_down.push(TableProviderFilterPushDown::Exact),
-                Err(_) => filter_push_down.push(TableProviderFilterPushDown::Unsupported),
-            }
-        }
+        let filter_push_down: Vec<TableProviderFilterPushDown> = filters
+            .iter()
+            .map(|f| match to_sql_with_engine(f, Some(Engine::ODBC)) {
+                Ok(_) => TableProviderFilterPushDown::Exact,
+                Err(_) => TableProviderFilterPushDown::Unsupported,
+            })
+            .collect();
 
         Ok(filter_push_down)
     }
@@ -263,7 +262,7 @@ where
             let filter_expr = self
                 .filters
                 .iter()
-                .map(odbc_to_sql)
+                .map(|f| to_sql_with_engine(f, Some(Engine::ODBC)))
                 .collect::<expr::Result<Vec<_>>>()
                 .context(UnableToGenerateSQLSnafu)?;
             format!("WHERE {}", filter_expr.join(" AND "))
@@ -333,7 +332,7 @@ where
         _context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
         let sql = self.sql().map_err(to_execution_error)?;
-        tracing::debug!("SqlExec sql: {sql}");
+        tracing::debug!("ODBCSqlExec sql: {sql}");
 
         let fut = get_stream(Arc::clone(&self.pool), sql);
 
@@ -355,38 +354,4 @@ async fn get_stream<T: 'static, P: 'static>(
 #[allow(clippy::needless_pass_by_value)]
 fn to_execution_error(e: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> DataFusionError {
     DataFusionError::Execution(format!("{}", e.into()).to_string())
-}
-
-fn odbc_to_sql(expr: &Expr) -> expr::Result<String> {
-    match expr {
-        Expr::BinaryExpr(binary_expr) => {
-            let left = odbc_to_sql(&binary_expr.left)?;
-            let right = odbc_to_sql(&binary_expr.right)?;
-            Ok(format!("{} {} {}", left, binary_expr.op, right))
-        }
-        Expr::Column(name) => Ok(name.to_string()),
-        Expr::Literal(value) => match value {
-            ScalarValue::Null => Ok(value.to_string()),
-            ScalarValue::Int16(Some(value)) => Ok(value.to_string()),
-            ScalarValue::Int32(Some(value)) => Ok(value.to_string()),
-            ScalarValue::Int64(Some(value)) => Ok(value.to_string()),
-            ScalarValue::Boolean(Some(value)) => Ok(value.to_string()),
-            ScalarValue::Utf8(Some(value)) | ScalarValue::LargeUtf8(Some(value)) => {
-                Ok(format!("'{value}'"))
-            }
-            ScalarValue::Float32(Some(value)) => Ok(value.to_string()),
-            ScalarValue::Float64(Some(value)) => Ok(value.to_string()),
-            ScalarValue::Int8(Some(value)) => Ok(value.to_string()),
-            ScalarValue::UInt8(Some(value)) => Ok(value.to_string()),
-            ScalarValue::UInt16(Some(value)) => Ok(value.to_string()),
-            ScalarValue::UInt32(Some(value)) => Ok(value.to_string()),
-            ScalarValue::UInt64(Some(value)) => Ok(value.to_string()),
-            _ => Err(expr::Error::UnsupportedFilterExpr {
-                expr: format!("{expr}"),
-            }),
-        },
-        _ => Err(expr::Error::UnsupportedFilterExpr {
-            expr: format!("{expr}"),
-        }),
-    }
 }
