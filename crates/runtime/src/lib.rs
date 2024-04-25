@@ -707,9 +707,6 @@ impl Runtime {
                     if let Some(current_ds) =
                         current_app.datasets.iter().find(|d| d.name == ds.name)
                     {
-                        tracing::info!("Checking dataset: {}", ds.name);
-                        tracing::info!("Current dataset: {:?}", current_ds);
-                        tracing::info!("New dataset: {:?}", ds);
                         if current_ds != ds {
                             self.update_dataset(ds, &new_app.datasets).await;
                         }
