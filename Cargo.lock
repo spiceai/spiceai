@@ -170,7 +170,7 @@ checksum = "d301b3b94cb4b2f23d7917810addbbaff90738e0ca2be692bd027e70d7e0330c"
 
 [[package]]
 name = "app"
-version = "0.12.0-alpha"
+version = "0.11.2-alpha"
 dependencies = [
  "snafu 0.8.2",
  "spicepod",
@@ -441,7 +441,7 @@ dependencies = [
 
 [[package]]
 name = "arrow_sql_gen"
-version = "0.12.0-alpha"
+version = "0.11.2-alpha"
 dependencies = [
  "arrow",
  "bigdecimal 0.3.1",
@@ -1968,7 +1968,7 @@ checksum = "7e962a19be5cfc3f3bf6dd8f61eb50107f356ad6270fbb3ed41476571db78be5"
 
 [[package]]
 name = "data_components"
-version = "0.12.0-alpha"
+version = "0.11.2-alpha"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -2003,9 +2003,9 @@ dependencies = [
 
 [[package]]
 name = "datafusion"
-version = "37.0.0"
+version = "37.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "812a53e154009ee2bd6b2f8a9ab8f30cbf2c693cb860e60f0aa3315ba3486e39"
+checksum = "85069782056753459dc47e386219aa1fdac5b731f26c28abb8c0ffd4b7c5ab11"
 dependencies = [
  "ahash 0.8.11",
  "arrow",
@@ -2054,9 +2054,9 @@ dependencies = [
 
 [[package]]
 name = "datafusion-common"
-version = "37.0.0"
+version = "37.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b99d4d7ccdad4dffa8ff4569f45792d0678a0c7ee08e3fdf1b0a52ebb9cf201e"
+checksum = "309d9040751f6dc9e33c85dce6abb55a46ef7ea3644577dd014611c379447ef3"
 dependencies = [
  "ahash 0.8.11",
  "arrow",
@@ -2075,18 +2075,18 @@ dependencies = [
 
 [[package]]
 name = "datafusion-common-runtime"
-version = "37.0.0"
+version = "37.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a5cf713ae1f5423b5625aeb3ddfb0d5c29e880cf6a0d2059d0724219c873a76c"
+checksum = "a3e4a44d8ef1b1e85d32234e6012364c411c3787859bb3bba893b0332cb03dfd"
 dependencies = [
  "tokio",
 ]
 
 [[package]]
 name = "datafusion-execution"
-version = "37.0.0"
+version = "37.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0f69d00325b77c3886b7080d96e3aa8e9a5ef16fe368a434c14b2f1b63b68803"
+checksum = "06a3a29ae36bcde07d179cc33b45656a8e7e4d023623e320e48dcf1200eeee95"
 dependencies = [
  "arrow",
  "chrono",
@@ -2105,9 +2105,9 @@ dependencies = [
 
 [[package]]
 name = "datafusion-expr"
-version = "37.0.0"
+version = "37.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6fbe71343a95c2079fa443aa840dfdbd2034532cfc00449a57204c8a6fdcf928"
+checksum = "2a3542aa322029c2121a671ce08000d4b274171070df13f697b14169ccf4f628"
 dependencies = [
  "ahash 0.8.11",
  "arrow",
@@ -2122,9 +2122,9 @@ dependencies = [
 
 [[package]]
 name = "datafusion-functions"
-version = "37.0.0"
+version = "37.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c046800d26d2267fab3bd5fc0b9bc0a7b1ae47e688b01c674ed39daa84cd3cc5"
+checksum = "dd221792c666eac174ecc09e606312844772acc12cbec61a420c2fca1ee70959"
 dependencies = [
  "arrow",
  "base64 0.22.0",
@@ -2147,9 +2147,9 @@ dependencies = [
 
 [[package]]
 name = "datafusion-functions-array"
-version = "37.0.0"
+version = "37.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a29e4e01539ab3a0068ed6224d42cf5664049a0fcef06fe293c1e76c4435d056"
+checksum = "e501801e84d9c6ef54caaebcda1b18a6196a24176c12fb70e969bc0572e03c55"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -2167,9 +2167,9 @@ dependencies = [
 
 [[package]]
 name = "datafusion-optimizer"
-version = "37.0.0"
+version = "37.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e3d48972fffe5a4ee2af2b8b72a3db5cdbc800d5dd5af54f8df0ab508bb5545c"
+checksum = "76bd7f5087817deb961764e8c973d243b54f8572db414a8f0a8f33a48f991e0a"
 dependencies = [
  "arrow",
  "async-trait",
@@ -2185,9 +2185,9 @@ dependencies = [
 
 [[package]]
 name = "datafusion-physical-expr"
-version = "37.0.0"
+version = "37.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8e001baf1aaa95a418ee9fcb979f5fc18f16b81a8a5f6a260b05df9494344adb"
+checksum = "5cabc0d9aaa0f5eb1b472112f16223c9ffd2fb04e58cbf65c0a331ee6e993f96"
 dependencies = [
  "ahash 0.8.11",
  "arrow",
@@ -2220,9 +2220,9 @@ dependencies = [
 
 [[package]]
 name = "datafusion-physical-plan"
-version = "37.0.0"
+version = "37.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3e5421ed2c5789bafc6d48231627d17c6836549a26c8162569354589202212ef"
+checksum = "17c0523e9c8880f2492a88bbd857dde02bed1ed23f3e9211a89d3d7ec3b44af9"
 dependencies = [
  "ahash 0.8.11",
  "arrow",
@@ -2266,9 +2266,9 @@ dependencies = [
 
 [[package]]
 name = "datafusion-sql"
-version = "37.0.0"
+version = "37.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f70d881337f733b7d0548e468073c0ae8b256557c33b299fd6afea0ea5d5162"
+checksum = "49eb54b42227136f6287573f2434b1de249fe1b8e6cd6cc73a634e4a3ec29356"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -2282,7 +2282,7 @@ dependencies = [
 
 [[package]]
 name = "db_connection_pool"
-version = "0.12.0-alpha"
+version = "0.11.2-alpha"
 dependencies = [
  "arrow",
  "arrow_sql_gen",
@@ -2502,8 +2502,9 @@ checksum = "75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2"
 
 [[package]]
 name = "duckdb"
-version = "0.10.1"
-source = "git+https://github.com/spiceai/duckdb-rs.git?rev=a0ae8ed71bef6dff779f5ce0a37038b0b916e0ca#a0ae8ed71bef6dff779f5ce0a37038b0b916e0ca"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "424ede399a5d1084e65c0888fda71e407e5809400c92ff2cf510bfd1697b9c76"
 dependencies = [
  "arrow",
  "cast",
@@ -2777,7 +2778,7 @@ dependencies = [
 
 [[package]]
 name = "flight_client"
-version = "0.12.0-alpha"
+version = "0.11.2-alpha"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -2793,7 +2794,7 @@ dependencies = [
 
 [[package]]
 name = "flightpublisher"
-version = "0.12.0-alpha"
+version = "0.11.2-alpha"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -2806,7 +2807,7 @@ dependencies = [
 
 [[package]]
 name = "flightrepl"
-version = "0.12.0-alpha"
+version = "0.11.2-alpha"
 dependencies = [
  "ansi_term",
  "arrow-flight",
@@ -2821,7 +2822,7 @@ dependencies = [
 
 [[package]]
 name = "flightsubscriber"
-version = "0.12.0-alpha"
+version = "0.11.2-alpha"
 dependencies = [
  "arrow-flight",
  "clap",
@@ -3729,8 +3730,9 @@ checksum = "9c198f91728a82281a64e1f4f9eeb25d82cb32a5de251c6bd1b5154d63a8e7bd"
 
 [[package]]
 name = "libduckdb-sys"
-version = "0.10.1"
-source = "git+https://github.com/spiceai/duckdb-rs.git?rev=a0ae8ed71bef6dff779f5ce0a37038b0b916e0ca#a0ae8ed71bef6dff779f5ce0a37038b0b916e0ca"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "51b3f02cecc430f61561bde538d42af4be2d9d5a8b058f74883e460bc1055461"
 dependencies = [
  "autocfg",
  "cc",
@@ -4307,7 +4309,7 @@ dependencies = [
 
 [[package]]
 name = "ns_lookup"
-version = "0.12.0-alpha"
+version = "0.11.2-alpha"
 dependencies = [
  "snafu 0.8.2",
  "tracing",
@@ -5412,7 +5414,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "0.12.0-alpha"
+version = "0.11.2-alpha"
 dependencies = [
  "app",
  "arrow",
@@ -5430,6 +5432,7 @@ dependencies = [
  "clap",
  "clickhouse-rs",
  "csv",
+ "dashmap",
  "data_components",
  "datafusion",
  "db_connection_pool",
@@ -5834,7 +5837,7 @@ dependencies = [
 
 [[package]]
 name = "secrets"
-version = "0.12.0-alpha"
+version = "0.11.2-alpha"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -6145,7 +6148,7 @@ dependencies = [
 
 [[package]]
 name = "spiced"
-version = "0.12.0-alpha"
+version = "0.11.2-alpha"
 dependencies = [
  "app",
  "clap",
@@ -6161,7 +6164,7 @@ dependencies = [
 
 [[package]]
 name = "spicepod"
-version = "0.12.0-alpha"
+version = "0.11.2-alpha"
 dependencies = [
  "fundu",
  "serde",
@@ -6178,7 +6181,7 @@ checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
 
 [[package]]
 name = "sql_provider_datafusion"
-version = "0.12.0-alpha"
+version = "0.11.2-alpha"
 dependencies = [
  "arrow",
  "async-trait",

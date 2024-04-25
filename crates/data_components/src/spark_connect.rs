@@ -64,12 +64,27 @@ fn arrow_field_datatype_from_spark_connect_field_datatype(
         Some(data_type::Kind::Long(_)) => Ok(datatypes::DataType::Int64),
         Some(data_type::Kind::Float(_)) => Ok(datatypes::DataType::Float32),
         Some(data_type::Kind::Double(_)) => Ok(datatypes::DataType::Float64),
+        Some(data_type::Kind::Decimal(d)) => {
+            let precision: u8 = d.precision().try_into().map_err(|_| {
+                DataFusionError::Execution(
+                    "Precision value is too large to fit in a u8".to_string(),
+                )
+            })?;
+            let scale: i8 = d.scale().try_into().map_err(|_| {
+                DataFusionError::Execution("Scale value is too large to fit in a i8".to_string())
+            })?;
+            if precision > 38 {
+                return Ok(datatypes::DataType::Decimal256(precision, scale));
+            }
+            Ok(datatypes::DataType::Decimal128(precision, scale))
+        }
         Some(data_type::Kind::String(_)) => Ok(datatypes::DataType::Utf8),
         Some(data_type::Kind::Binary(_)) => Ok(datatypes::DataType::Binary),
         Some(data_type::Kind::Date(_)) => Ok(datatypes::DataType::Date32),
-        Some(data_type::Kind::Timestamp(_)) => {
-            Ok(datatypes::DataType::Timestamp(TimeUnit::Millisecond, None))
-        }
+        Some(data_type::Kind::Timestamp(_)) => Ok(datatypes::DataType::Timestamp(
+            TimeUnit::Microsecond,
+            Some(Arc::from("Etc/UTC")),
+        )),
         Some(data_type::Kind::Array(boxed_array)) => {
             match boxed_array.element_type {
                 Some(data_type) => {
@@ -79,9 +94,9 @@ fn arrow_field_datatype_from_spark_connect_field_datatype(
                     let field = Field::new("", arrow_inner_type, false);
                     Ok(datatypes::DataType::List(Arc::new(field)))
                 }
-                None => Err(DataFusionError::Execution(
-                    "Unsupported data type".to_string(),
-                )),
+                None => Err(DataFusionError::Execution(format!(
+                    "Unsupported array data type: {boxed_array:?}"
+                ))),
             }
         }
         Some(data_type::Kind::Map(boxed_map)) => match (boxed_map.key_type, boxed_map.value_type) {
@@ -96,7 +111,7 @@ fn arrow_field_datatype_from_spark_connect_field_datatype(
                 ))
             }
             _ => Err(DataFusionError::Execution(
-                "Unsupported data type".to_string(),
+                "Unsupported map data type".to_string(),
             )),
         },
         Some(data_type::Kind::Struct(struct_type)) => {
@@ -114,8 +129,11 @@ fn arrow_field_datatype_from_spark_connect_field_datatype(
                 .collect::<Result<Vec<_>, DataFusionError>>()?;
             Ok(datatypes::DataType::Struct(fields.into()))
         }
-        _ => Err(DataFusionError::Execution(
-            "Unsupported data type".to_string(),
+        Some(data_type) => Err(DataFusionError::Execution(format!(
+            "Unsupported data type: {data_type:?}"
+        ))),
+        None => Err(DataFusionError::Execution(
+            "No data type specified".to_string(),
         )),
     }
 }
@@ -135,9 +153,9 @@ fn datatype_as_arrow_schema(data_type: DataType) -> Result<SchemaRef, DataFusion
             .collect::<Result<Vec<_>, DataFusionError>>()?;
         return Ok(Arc::new(Schema::new(fields)));
     }
-    Err(DataFusionError::Execution(
-        "Unsupported data type".to_string(),
-    ))
+    Err(DataFusionError::Execution(format!(
+        "Unsupported data type: {data_type:?}"
+    )))
 }
 
 struct SparkConnectTablePovider {
