@@ -31,6 +31,7 @@ pub struct SpiceSchemaProvider {
 }
 
 impl SpiceSchemaProvider {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             tables: DashMap::new(),
@@ -58,7 +59,7 @@ impl SchemaProvider for SpiceSchemaProvider {
     }
 
     async fn table(&self, name: &str) -> Result<Option<Arc<dyn TableProvider>>, DataFusionError> {
-        Ok(self.tables.get(name).map(|table| table.value().clone()))
+        Ok(self.tables.get(name).map(|table| Arc::clone(table.value())))
     }
 
     fn register_table(
