@@ -367,7 +367,7 @@ pub mod acceleration {
 
     /// Behavior when a query on an accelerated table returns zero results.
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-    #[serde(rename_all = "lowercase")]
+    #[serde(rename_all = "snake_case")]
     pub enum ZeroResultsAction {
         /// Return an empty result set. This is the default.
         #[default]
