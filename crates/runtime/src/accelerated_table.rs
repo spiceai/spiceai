@@ -80,9 +80,19 @@ enum AccelerationRefreshMode {
     Append,
 }
 
-fn validate_refresh_period(refresh: &Refresh, dataset: &str) {
-    if refresh.period.is_some() && refresh.time_column.is_none() {
-        tracing::warn!("No time_column is provided, refresh_period will be ignored for {dataset}");
+fn validate_refresh_period(refresh: &Refresh, dataset: &str, schema: &SchemaRef) {
+    if refresh.period.is_some() {
+        if let Some(time_column) = &refresh.time_column {
+            if schema.column_with_name(time_column).is_none() {
+                tracing::warn!(
+                    "No matching column found for {time_column} in the source table, refresh_period will be ignored for {dataset}"
+                );
+            }
+        } else {
+            tracing::warn!(
+                "No time_column is provided, refresh_period will be ignored for {dataset}"
+            );
+        }
     }
 }
 
@@ -111,7 +121,7 @@ impl AcceleratedTable {
             }
         };
 
-        validate_refresh_period(&refresh, &dataset_name);
+        validate_refresh_period(&refresh, &dataset_name, &federated.schema());
         let refresh_handle = tokio::spawn(Self::start_refresh(
             dataset_name.clone(),
             Arc::clone(&federated),
