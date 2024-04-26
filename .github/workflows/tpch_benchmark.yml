@@ -170,8 +170,9 @@ jobs:
           path: ./build
 
       - name: Install spice
-        run: |
-          export SPICE_BUILD_ARTIFACTS_DIR=$PWD/build && ./test/scripts/install_spice.sh
+        uses: ./.github/actions/install-spice
+        with:
+          build-dir: './build'
 
       - name: Install PostgreSQL (Linux)
         if: matrix.target_os == 'linux'
