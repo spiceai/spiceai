@@ -1,5 +1,5 @@
 name: Install PostgreSQL
-description: 'composite action'
+description: 'Performs PostgreSQL installation and setup on the target operating system'
 inputs:
   os:
     description: 'Operating system to install PostgreSQL'
