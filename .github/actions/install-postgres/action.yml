@@ -1,0 +1,45 @@
+name: Install PostgreSQL
+description: 'Performs PostgreSQL installation and setup on the target operating system'
+inputs:
+  os:
+    description: 'Operating system to install PostgreSQL'
+    default: 'linux' # 'linux', 'darwin', 'windows'
+  pg-db:
+    description: 'Name of the database to create'
+    default: 'postgres'
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install PostgreSQL (Linux)
+      if: inputs.os == 'linux'
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y postgresql
+        sudo service postgresql start
+        sleep 5
+        sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='postgres'" | grep -q 1 || sudo -u postgres createuser -s postgres
+        sudo -u postgres psql -c "ALTER USER postgres PASSWORD 'postgres';"
+        sudo -u postgres createdb ${{ inputs.pg-db }}
+
+    - name: Install PostgreSQL (macOS)
+      if: inputs.os == 'darwin'
+      shell: bash
+      run: |
+        brew install postgresql
+        brew services start postgresql
+        sleep 5
+        createuser -s postgres
+        psql -d postgres -c "ALTER USER postgres PASSWORD 'postgres';"
+        createdb ${{ inputs.pg-db }}
+    
+    - name: Wait for PostgreSQL to start
+      shell: bash
+      run: sleep 10
+
+    - name: Check PostgreSQL
+      shell: bash
+      env:
+        PGPASSWORD: postgres
+      run: psql -h localhost -U postgres -c 'SELECT version();'
