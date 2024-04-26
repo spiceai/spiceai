@@ -21,7 +21,7 @@ pub struct SqlFlightClient {
     token: Option<String>,
     headers: HashMap<String, String>,
     client: FlightServiceClient<Channel>,
-    api_key: String,
+    api_key: Option<String>,
 }
 
 fn status_to_arrow_error(status: tonic::Status) -> ArrowError {
@@ -29,7 +29,7 @@ fn status_to_arrow_error(status: tonic::Status) -> ArrowError {
 }
 
 impl SqlFlightClient {
-    pub fn new(chan: Channel, api_key: String) -> Self {
+    pub fn new(chan: Channel, api_key: Option<String>) -> Self {
         SqlFlightClient {
             api_key,
             client: FlightServiceClient::new(chan),
@@ -81,11 +81,11 @@ impl SqlFlightClient {
         Ok(resp)
     }
 
-    async fn authenticate(&mut self) -> std::result::Result<(), Box<dyn Error>> {
-        if self.api_key.split('|').collect::<String>().len() < 2 {
+    async fn authenticate(&mut self, api_key: &str) -> std::result::Result<(), Box<dyn Error>> {
+        if api_key.split('|').collect::<String>().len() < 2 {
             return Err("Invalid API key format".into());
         }
-        self.handshake("", &self.api_key.to_string()).await?;
+        self.handshake("", api_key).await?;
         Ok(())
     }
 
@@ -115,7 +115,10 @@ impl SqlFlightClient {
         &mut self,
         query: &str,
     ) -> std::result::Result<FlightRecordBatchStream, Box<dyn Error>> {
-        self.authenticate().await?;
+        let api_key = self.api_key.clone();
+        if let Some(api_key) = api_key {
+            self.authenticate(&api_key).await?;
+        }
 
         let descriptor = FlightDescriptor::new_cmd(query.to_string());
         let req = self.set_request_headers(descriptor.into_request())?;

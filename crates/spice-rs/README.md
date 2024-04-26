@@ -14,14 +14,38 @@ cargo add spiceai
 
 <!-- NOTE: If you're changing the code examples below, make sure you update `tests/readme_test.rs`. -->
 
-### New client
+### Usage with locally running [spice runtime](https://github.com/spiceai/spiceai)
+
+Follow the [quiqstart guide](https://github.com/spiceai/spiceai?tab=readme-ov-file#%EF%B8%8F-quickstart-local-machine) to install and run spice locally
 
 ```rust
-use spiceai::Client;
+use spiceai::ClientBuilder;
 
 #[tokio::main]
 async fn main() {
-  let mut client = Client::new("API_KEY").await.unwrap();
+  let mut client = ClientBuilder::new()
+    .flight_url("http://localhost:50051")
+    .build()
+    .await
+    .unwrap();
+
+  let data = client.query("SELECT trip_distance, total_amount FROM taxi_trips ORDER BY trip_distance DESC LIMIT 10;").await;
+}
+```
+
+### New client with https://spice.ai cloud
+
+```rust
+use spiceai::ClientBuilder;
+
+#[tokio::main]
+async fn main() {
+  let mut client = ClientBuilder::new()
+    .api_key("API_KEY")
+    .use_spiceai_cloud()
+    .build()
+    .await
+    .unwrap();
 }
 ```
 
@@ -30,11 +54,17 @@ async fn main() {
 SQL Query
 
 ```rust
-use spiceai::Client;
+use spiceai::ClientBuilder;
 
 #[tokio::main]
 async fn main() {
-  let mut client = Client::new("API_KEY").await.unwrap();
+  let mut client = ClientBuilder::new()
+    .api_key("API_KEY")
+    .use_spiceai_cloud()
+    .build()
+    .await
+    .unwrap();
+
   let data = client.query("SELECT * FROM eth.recent_blocks LIMIT 10;").await;
 }
 
@@ -45,11 +75,17 @@ async fn main() {
 Firecache SQL Query
 
 ```rust
-use spiceai::Client;
+use spiceai::ClientBuilder;
 
 #[tokio::main]
 async fn main() {
-  let mut client = Client::new("API_KEY").await.unwrap();
+  let mut client = ClientBuilder::new()
+    .api_key("API_KEY")
+    .use_spiceai_cloud()
+    .build()
+    .await
+    .unwrap();
+
   let data = client.fire_query("SELECT * FROM eth.recent_blocks LIMIT 10;").await;
 }
 

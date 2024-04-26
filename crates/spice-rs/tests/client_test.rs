@@ -1,20 +1,28 @@
 #[cfg(test)]
 mod tests {
     use futures::stream::StreamExt;
-    use spiceai::Client;
+    use spiceai::{Client, ClientBuilder};
     use std::env;
     use std::path::Path;
 
     async fn new_client() -> Client {
         dotenv::from_path(Path::new(".env.local")).ok();
         let api_key = env::var("API_KEY").expect("API_KEY not found");
-        Client::new(&api_key)
+        ClientBuilder::new()
+            .api_key(&api_key)
+            .use_spiceai_cloud()
+            .build()
             .await
             .expect("Failed to create client")
     }
 
     #[tokio::test]
     async fn test_new_client() {
+        new_client().await;
+    }
+
+    #[tokio::test]
+    async fn test_new_client_builder() {
         new_client().await;
     }
 
