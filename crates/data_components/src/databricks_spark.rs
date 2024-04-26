@@ -19,6 +19,7 @@ use datafusion::{common::OwnedTableReference, datasource::TableProvider};
 use secrets::Secret;
 use spark_connect_rs::{SparkSession, SparkSessionBuilder};
 use std::{collections::HashMap, error::Error, sync::Arc};
+use uuid::Uuid;
 
 use crate::{spark_connect, Read, ReadWrite};
 
@@ -57,7 +58,8 @@ impl DatabricksSparkConnect {
         if let Some(user_val) = param_deref.get("endpoint") {
             user = user_val.as_str();
         };
-        let connection = format!("sc://{endpoint}:443/;user_id={user};session_id=0d2af2a9-cc3c-4d4b-bf27-e2fefeaca233;token={token};x-databricks-cluster-id={cluster_id}");
+        let session_id = Uuid::new_v4();
+        let connection = format!("sc://{endpoint}:443/;user_id={user};session_id={session_id};token={token};x-databricks-cluster-id={cluster_id}");
         let session = Arc::new(
             SparkSessionBuilder::remote(connection.as_str())
                 .build()
