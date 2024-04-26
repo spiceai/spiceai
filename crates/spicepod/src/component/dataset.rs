@@ -251,16 +251,16 @@ impl Dataset {
     }
 
     #[must_use]
-    pub fn refresh_period(&self) -> Option<Duration> {
+    pub fn refresh_data_period(&self) -> Option<Duration> {
         if let Some(acceleration) = &self.acceleration {
-            if let Some(refresh_period) = &acceleration.refresh_period {
-                if let Ok(duration) = fundu::parse_duration(refresh_period) {
+            if let Some(refresh_data_period) = &acceleration.refresh_data_period {
+                if let Ok(duration) = fundu::parse_duration(refresh_data_period) {
                     return Some(duration);
                 }
                 tracing::warn!(
                     "Unable to parse refresh period for dataset {}: {}",
                     self.name,
-                    refresh_period
+                    refresh_data_period
                 );
             }
         }
@@ -406,7 +406,7 @@ pub mod acceleration {
         pub refresh_sql: Option<String>,
 
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub refresh_period: Option<String>,
+        pub refresh_data_period: Option<String>,
 
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub params: Option<Params>,
