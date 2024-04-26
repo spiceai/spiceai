@@ -1,4 +1,4 @@
-name: Install PostreSQL
+name: Install PostgreSQL
 description: 'composite action'
 inputs:
   os:
