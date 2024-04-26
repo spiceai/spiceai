@@ -172,7 +172,7 @@ jobs:
       - name: Install spice
         uses: ./.github/actions/install-spice
         with:
-          build-dir: './build'
+          build-path: ./build
 
       - name: Install PostgreSQL (Linux)
         if: matrix.target_os == 'linux'
