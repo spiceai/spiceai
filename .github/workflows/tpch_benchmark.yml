@@ -170,16 +170,9 @@ jobs:
           path: ./build
 
       - name: Install spice
-        run: |
-          chmod +x ./build/spice
-          chmod +x ./build/spiced
-          mkdir -p "$HOME/.spice/bin"
-          mv ./build/spice "$HOME/.spice/bin"
-          mv ./build/spiced "$HOME/.spice/bin"
-          echo "$HOME/.spice/bin" >> $GITHUB_PATH
-
-      - name: Check spice version
-        run: spice version
+        uses: ./.github/actions/install-spice
+        with:
+          build-dir: './build'
 
       - name: Install PostgreSQL (Linux)
         if: matrix.target_os == 'linux'
