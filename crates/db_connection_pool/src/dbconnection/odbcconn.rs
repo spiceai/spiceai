@@ -56,8 +56,16 @@ pub type ODBCDbConnectionPool<'a> =
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    ArrowODBCError { source: arrow_odbc::Error },
-    ODBCAPIError { source: odbc_api::Error },
+    #[snafu(display("Failed to convert query result to Arrow: {source}"))]
+    ArrowError {
+        source: arrow::error::ArrowError,
+    },
+    ArrowODBCError {
+        source: arrow_odbc::Error,
+    },
+    ODBCAPIError {
+        source: odbc_api::Error,
+    },
 }
 
 pub struct ODBCConnection<'a> {
@@ -127,7 +135,7 @@ where
             .build(cursor)
             .context(ArrowODBCSnafu)?;
 
-        let results: Vec<RecordBatch> = reader.map(|b| b.unwrap()).collect();
+        let results: Vec<RecordBatch> = reader.map(|b| b.context(ArrowSnafu).unwrap()).collect();
 
         Ok(Box::pin(MemoryStream::try_new(results, schema, None)?))
     }
