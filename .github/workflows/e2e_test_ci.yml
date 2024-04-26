@@ -289,6 +289,7 @@ jobs:
       - name: Install PostgreSQL
         uses: ./.github/actions/install-postgres
         with:
+          os: ${{ matrix.target.target_os }}
           pg-db: testdb
 
       - name: Prepare PostgreSQL dataset
@@ -574,6 +575,7 @@ jobs:
       - name: Install PostgreSQL
         uses: ./.github/actions/install-postgres
         with:
+          os: ${{ matrix.target.target_os }}
           pg-db: testdb
 
       - name: Check PostgreSQL
