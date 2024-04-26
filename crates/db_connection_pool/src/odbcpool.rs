@@ -67,10 +67,10 @@ where
 {
     async fn connect(&self) -> Result<Box<ODBCDbConnection<'a>>> {
         if let Some(params) = self.params.as_ref() {
-            let url = params.get("url").expect("Must provide URL");
+            let odbc_url = params.get("odbc_url").expect("Must provide URL");
             let cxn = self
                 .pool
-                .connect_with_connection_string(url.as_str(), ConnectionOptions::default())?;
+                .connect_with_connection_string(odbc_url.as_str(), ConnectionOptions::default())?;
 
             let odbc_cxn = ODBCConnection {
                 conn: Arc::new(cxn.into()),
@@ -79,7 +79,7 @@ where
             Ok(Box::new(odbc_cxn))
         } else {
             InvalidParameterSnafu {
-                parameter_name: "url".to_string(),
+                parameter_name: "odbc_url".to_string(),
             }
             .fail()?
         }
