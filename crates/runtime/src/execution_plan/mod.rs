@@ -28,7 +28,6 @@ pub mod slice;
 pub mod tee;
 
 #[derive(Clone)]
-#[allow(clippy::module_name_repetitions)]
 pub struct TableScanParams {
     state: SessionState,
     projection: Option<Vec<usize>>,
