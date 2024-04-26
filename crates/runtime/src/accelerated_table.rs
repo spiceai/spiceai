@@ -85,7 +85,7 @@ fn validate_refresh_period(refresh: &Refresh, dataset: &str, schema: &SchemaRef)
         if let Some(time_column) = &refresh.time_column {
             if schema.column_with_name(time_column).is_none() {
                 tracing::warn!(
-                    "No matching column found for {time_column}, refresh_period will be ignored for {dataset}"
+                    "No matching column found for {time_column} in the source table, refresh_period will be ignored for {dataset}"
                 );
             }
         } else {
