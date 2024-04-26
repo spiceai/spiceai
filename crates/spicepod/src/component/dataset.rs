@@ -358,7 +358,30 @@ pub mod acceleration {
 
     impl Display for Mode {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "{self:?}")
+            match self {
+                Mode::Memory => write!(f, "memory"),
+                Mode::File => write!(f, "file"),
+            }
+        }
+    }
+
+    /// Behavior when a query on an accelerated table returns zero results.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+    #[serde(rename_all = "lowercase")]
+    pub enum ZeroResultsAction {
+        /// Return an empty result set. This is the default.
+        #[default]
+        ReturnEmpty,
+        /// Fallback to querying the source table.
+        UseSource,
+    }
+
+    impl Display for ZeroResultsAction {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                ZeroResultsAction::ReturnEmpty => write!(f, "return_empty"),
+                ZeroResultsAction::UseSource => write!(f, "use_source"),
+            }
         }
     }
 
@@ -400,8 +423,8 @@ pub mod acceleration {
         #[serde(default, skip_serializing_if = "is_false")]
         pub retention_check_enabled: bool,
 
-        #[serde(default, skip_serializing_if = "is_false")]
-        pub query_source_if_zero_accelerated_results: bool,
+        #[serde(default)]
+        pub on_zero_results: ZeroResultsAction,
     }
 
     #[allow(clippy::trivially_copy_pass_by_ref)]

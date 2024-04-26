@@ -20,7 +20,7 @@ use datafusion::{
 use futures::{stream::BoxStream, StreamExt};
 use object_store::ObjectStore;
 use snafu::prelude::*;
-use spicepod::component::dataset::acceleration::RefreshMode;
+use spicepod::component::dataset::acceleration::{RefreshMode, ZeroResultsAction};
 use spicepod::component::dataset::TimeFormat;
 use tokio::task::JoinHandle;
 use tokio::time::interval;
@@ -76,7 +76,7 @@ pub struct AcceleratedTable {
     federated: Arc<dyn TableProvider>,
     refresh_trigger: Option<mpsc::Sender<()>>,
     handlers: Vec<JoinHandle<()>>,
-    query_source_if_zero_accelerated_results: bool,
+    zero_results_action: ZeroResultsAction,
 }
 
 enum AccelerationRefreshMode {
@@ -93,7 +93,7 @@ fn validate_refresh_period(refresh: &Refresh, dataset: &str) {
 pub struct Options {
     retention: Option<Retention>,
     object_store: Option<(Url, Arc<dyn ObjectStore + 'static>)>,
-    query_source_if_zero_accelerated_results: bool,
+    zero_results_action: ZeroResultsAction,
 }
 
 impl Default for Options {
@@ -107,7 +107,7 @@ impl Options {
         Self {
             retention: None,
             object_store: None,
-            query_source_if_zero_accelerated_results: false,
+            zero_results_action: ZeroResultsAction::default(),
         }
     }
 
@@ -124,11 +124,8 @@ impl Options {
         self
     }
 
-    pub fn query_source_if_zero_accelerated_results(
-        &mut self,
-        query_source_if_zero_accelerated_results: bool,
-    ) -> &mut Self {
-        self.query_source_if_zero_accelerated_results = query_source_if_zero_accelerated_results;
+    pub fn zero_results_action(&mut self, zero_results_action: ZeroResultsAction) -> &mut Self {
+        self.zero_results_action = zero_results_action;
         self
     }
 }
@@ -190,8 +187,7 @@ impl AcceleratedTable {
                 federated,
                 refresh_trigger,
                 handlers,
-                query_source_if_zero_accelerated_results: options
-                    .query_source_if_zero_accelerated_results,
+                zero_results_action: options.zero_results_action,
             },
             is_ready,
         )
@@ -520,15 +516,14 @@ impl TableProvider for AcceleratedTable {
             .scan(state, projection, filters, limit)
             .await?;
 
-        if self.query_source_if_zero_accelerated_results {
-            Ok(Arc::new(FallbackOnZeroResultsScanExec::new(
+        match self.zero_results_action {
+            ZeroResultsAction::ReturnEmpty => Ok(input),
+            ZeroResultsAction::UseSource => Ok(Arc::new(FallbackOnZeroResultsScanExec::new(
                 self.dataset_name.clone(),
                 input,
                 Arc::clone(&self.federated),
                 TableScanParams::new(state, projection, filters, limit),
-            )))
-        } else {
-            Ok(input)
+            ))),
         }
     }
 

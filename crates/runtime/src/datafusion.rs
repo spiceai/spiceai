@@ -341,9 +341,7 @@ impl DataFusion {
             dataset.retention_check_interval(),
             acceleration_settings.retention_check_enabled,
         ));
-        acc_options.query_source_if_zero_accelerated_results(
-            acceleration_settings.query_source_if_zero_accelerated_results,
-        );
+        acc_options.zero_results_action(acceleration_settings.on_zero_results);
 
         Ok(AcceleratedTable::new(
             dataset.name.to_string(),
