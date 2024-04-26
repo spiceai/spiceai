@@ -110,7 +110,7 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
                 continue;
             }
             "show tables" | "show tables;" => {
-                "select table_name from information_schema.tables where table_schema = 'public'"
+                "select table_name, table_type from information_schema.tables where table_schema = 'public'"
             }
             _ => line,
         };
