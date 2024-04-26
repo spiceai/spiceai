@@ -140,7 +140,7 @@ impl<T, P> TableProvider for SqlTable<T, P> {
     ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
         let filter_push_down: Vec<TableProviderFilterPushDown> = filters
             .iter()
-            .map(|f| match expr::to_sql_with_engine(f, Some(Engine::ODBC)) {
+            .map(|f| match expr::to_sql_with_engine(f, self.engine) {
                 Ok(_) => TableProviderFilterPushDown::Exact,
                 Err(_) => TableProviderFilterPushDown::Unsupported,
             })
