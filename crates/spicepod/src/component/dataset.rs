@@ -358,7 +358,30 @@ pub mod acceleration {
 
     impl Display for Mode {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "{self:?}")
+            match self {
+                Mode::Memory => write!(f, "memory"),
+                Mode::File => write!(f, "file"),
+            }
+        }
+    }
+
+    /// Behavior when a query on an accelerated table returns zero results.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+    #[serde(rename_all = "snake_case")]
+    pub enum ZeroResultsAction {
+        /// Return an empty result set. This is the default.
+        #[default]
+        ReturnEmpty,
+        /// Fallback to querying the source table.
+        UseSource,
+    }
+
+    impl Display for ZeroResultsAction {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                ZeroResultsAction::ReturnEmpty => write!(f, "return_empty"),
+                ZeroResultsAction::UseSource => write!(f, "use_source"),
+            }
         }
     }
 
@@ -397,8 +420,16 @@ pub mod acceleration {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub retention_check_interval: Option<String>,
 
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "is_false")]
         pub retention_check_enabled: bool,
+
+        #[serde(default)]
+        pub on_zero_results: ZeroResultsAction,
+    }
+
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    fn is_false(b: &bool) -> bool {
+        !b
     }
 
     const fn default_true() -> bool {
