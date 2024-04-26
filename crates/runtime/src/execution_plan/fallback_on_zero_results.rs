@@ -128,7 +128,6 @@ impl ExecutionPlan for FallbackOnZeroResultsScanExec {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
     fn execute(
         &self,
         partition: usize,
@@ -152,6 +151,7 @@ impl ExecutionPlan for FallbackOnZeroResultsScanExec {
         let schema = input_stream.schema();
         let scan_params = self.fallback_scan_params.clone();
         let fallback_provider = Arc::clone(&self.fallback_table_provider);
+        let table_name = self.table_name.clone();
         let fallback_msg = format!(
             r#"Accelerated table "{}" returned 0 results for query with filter [{}], sending query to federated table..."#,
             self.table_name,
@@ -188,6 +188,7 @@ impl ExecutionPlan for FallbackOnZeroResultsScanExec {
             } else {
                 tracing::trace!("FallbackOnZeroResultsScanExec input_stream.next() returned None");
                 tracing::info!("{fallback_msg}");
+                metrics::counter!("accelerated_zero_results_federated_fallback", "dataset_name" => table_name).increment(1);
                 let fallback_plan = match fallback_provider
                     .scan(
                         &scan_params.state,
