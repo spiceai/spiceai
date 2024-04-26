@@ -20,7 +20,7 @@ use datafusion::{
 use futures::{stream::BoxStream, StreamExt};
 use object_store::ObjectStore;
 use snafu::prelude::*;
-use spicepod::component::dataset::acceleration::RefreshMode;
+use spicepod::component::dataset::acceleration::{RefreshMode, ZeroResultsAction};
 use spicepod::component::dataset::TimeFormat;
 use tokio::task::JoinHandle;
 use tokio::time::interval;
@@ -31,8 +31,10 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::datafusion::filter_converter::TimestampFilterConvert;
+use crate::execution_plan::fallback_on_zero_results::FallbackOnZeroResultsScanExec;
 use crate::execution_plan::slice::SliceExec;
 use crate::execution_plan::tee::TeeExec;
+use crate::execution_plan::TableScanParams;
 use crate::{
     dataconnector::{self, get_data},
     dataupdate::{DataUpdate, DataUpdateExecutionPlan, UpdateType},
@@ -69,10 +71,12 @@ pub type Result<T> = std::result::Result<T, Error>;
 // The accelerator must support inserts.
 // AcceleratedTable::new returns an instance of the table and a oneshot receiver that will be triggered when the table is ready, right after the initial data refresh finishes.
 pub struct AcceleratedTable {
+    dataset_name: String,
     accelerator: Arc<dyn TableProvider>,
     federated: Arc<dyn TableProvider>,
     refresh_trigger: Option<mpsc::Sender<()>>,
     handlers: Vec<JoinHandle<()>>,
+    zero_results_action: ZeroResultsAction,
 }
 
 enum AccelerationRefreshMode {
@@ -96,39 +100,79 @@ fn validate_refresh_period(refresh: &Refresh, dataset: &str, schema: &SchemaRef)
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-impl AcceleratedTable {
-    pub async fn new(
+pub struct Builder {
+    dataset_name: String,
+    federated: Arc<dyn TableProvider>,
+    accelerator: Arc<dyn TableProvider>,
+    refresh: Refresh,
+    retention: Option<Retention>,
+    object_store: Option<(Url, Arc<dyn ObjectStore + 'static>)>,
+    zero_results_action: ZeroResultsAction,
+}
+
+impl Builder {
+    pub fn new(
         dataset_name: String,
         federated: Arc<dyn TableProvider>,
         accelerator: Arc<dyn TableProvider>,
         refresh: Refresh,
-        retention: Option<Retention>,
+    ) -> Self {
+        Self {
+            dataset_name,
+            federated,
+            accelerator,
+            refresh,
+            retention: None,
+            object_store: None,
+            zero_results_action: ZeroResultsAction::default(),
+        }
+    }
+
+    pub fn retention(&mut self, retention: Option<Retention>) -> &mut Self {
+        self.retention = retention;
+        self
+    }
+
+    pub fn object_store(
+        &mut self,
         object_store: Option<(Url, Arc<dyn ObjectStore + 'static>)>,
-    ) -> (Self, oneshot::Receiver<()>) {
+    ) -> &mut Self {
+        self.object_store = object_store;
+        self
+    }
+
+    pub fn zero_results_action(&mut self, zero_results_action: ZeroResultsAction) -> &mut Self {
+        self.zero_results_action = zero_results_action;
+        self
+    }
+
+    pub async fn build(self) -> (AcceleratedTable, oneshot::Receiver<()>) {
         let mut refresh_trigger = None;
         let mut scheduled_refreshes_handle: Option<JoinHandle<()>> = None;
         let (ready_sender, is_ready) = oneshot::channel::<()>();
 
-        let acceleration_refresh_mode: AccelerationRefreshMode = match refresh.mode {
+        let acceleration_refresh_mode: AccelerationRefreshMode = match self.refresh.mode {
             RefreshMode::Append => AccelerationRefreshMode::Append,
             RefreshMode::Full => {
                 let (trigger, receiver) = mpsc::channel::<()>(1);
                 refresh_trigger = Some(trigger.clone());
-                scheduled_refreshes_handle =
-                    Self::schedule_regular_refreshes(refresh.check_interval, trigger).await;
+                scheduled_refreshes_handle = AcceleratedTable::schedule_regular_refreshes(
+                    self.refresh.check_interval,
+                    trigger,
+                )
+                .await;
                 AccelerationRefreshMode::Full(receiver)
             }
         };
 
-        validate_refresh_period(&refresh, &dataset_name, &federated.schema());
-        let refresh_handle = tokio::spawn(Self::start_refresh(
-            dataset_name.clone(),
-            Arc::clone(&federated),
-            refresh,
+        validate_refresh_period(&self.refresh, &self.dataset_name, &self.federated.schema());
+        let refresh_handle = tokio::spawn(AcceleratedTable::start_refresh(
+            self.dataset_name.clone(),
+            Arc::clone(&self.federated),
+            self.refresh,
             acceleration_refresh_mode,
-            Arc::clone(&accelerator),
-            object_store,
+            Arc::clone(&self.accelerator),
+            self.object_store,
             ready_sender,
         ));
 
@@ -139,24 +183,37 @@ impl AcceleratedTable {
             handlers.push(scheduled_refreshes_handle);
         }
 
-        if let Some(retention) = retention {
-            let retention_check_handle = tokio::spawn(Self::start_retention_check(
-                dataset_name.clone(),
-                Arc::clone(&accelerator),
+        if let Some(retention) = self.retention {
+            let retention_check_handle = tokio::spawn(AcceleratedTable::start_retention_check(
+                self.dataset_name.clone(),
+                Arc::clone(&self.accelerator),
                 retention,
             ));
             handlers.push(retention_check_handle);
         }
 
         (
-            Self {
-                accelerator,
-                federated,
+            AcceleratedTable {
+                dataset_name: self.dataset_name,
+                accelerator: self.accelerator,
+                federated: self.federated,
                 refresh_trigger,
                 handlers,
+                zero_results_action: self.zero_results_action,
             },
             is_ready,
         )
+    }
+}
+
+impl AcceleratedTable {
+    pub fn builder(
+        dataset_name: String,
+        federated: Arc<dyn TableProvider>,
+        accelerator: Arc<dyn TableProvider>,
+        refresh: Refresh,
+    ) -> Builder {
+        Builder::new(dataset_name, federated, accelerator, refresh)
     }
 
     pub async fn trigger_refresh(&self) -> Result<()> {
@@ -467,7 +524,7 @@ impl TableProvider for AcceleratedTable {
         &self,
         filters: &[&Expr],
     ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
-        self.accelerator.supports_filters_pushdown(filters)
+        Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
     }
 
     async fn scan(
@@ -477,9 +534,20 @@ impl TableProvider for AcceleratedTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        self.accelerator
+        let input = self
+            .accelerator
             .scan(state, projection, filters, limit)
-            .await
+            .await?;
+
+        match self.zero_results_action {
+            ZeroResultsAction::ReturnEmpty => Ok(input),
+            ZeroResultsAction::UseSource => Ok(Arc::new(FallbackOnZeroResultsScanExec::new(
+                self.dataset_name.clone(),
+                input,
+                Arc::clone(&self.federated),
+                TableScanParams::new(state, projection, filters, limit),
+            ))),
+        }
     }
 
     async fn insert_into(
