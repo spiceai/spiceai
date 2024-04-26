@@ -47,7 +47,7 @@ pub enum Error {
         source: clickhouse_rs::errors::Error,
     },
 
-    #[snafu(display("ParametersEmptyError"))]
+    #[snafu(display("No parameters specified"))]
     ParametersEmptyError {},
 
     #[snafu(display("Missing required parameter: {parameter_name}"))]
