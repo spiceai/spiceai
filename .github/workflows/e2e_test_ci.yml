@@ -37,6 +37,18 @@ jobs:
                 target_os: "linux",
                 target_arch: "x86_64",
                 target_arch_go: "amd64"
+              }, {
+                name: "macOS aarch64 (Apple Silicon)",
+                runner: "macos-14",
+                target_os: "darwin",
+                target_arch: "aarch64",
+                target_arch_go: "arm64"
+              }, {
+                name: "macOS x64 (Intel)",
+                runner: "macos-12",
+                target_os: "darwin",
+                target_arch: "x86_64",
+                target_arch_go: "amd64"
               }
             ];
 
