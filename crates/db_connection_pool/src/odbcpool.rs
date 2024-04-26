@@ -74,6 +74,7 @@ where
 
             let odbc_cxn = ODBCConnection {
                 conn: Arc::new(cxn.into()),
+                params: Some(params.clone()),
             };
 
             Ok(Box::new(odbc_cxn))

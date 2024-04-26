@@ -15,19 +15,24 @@ limitations under the License.
 */
 
 use std::any::Any;
+use std::collections::HashMap;
 use std::sync::Arc;
 
+use arrow::datatypes::Schema;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use arrow_odbc::arrow_schema_from;
+use arrow_odbc::OdbcReader;
 use arrow_odbc::OdbcReaderBuilder;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::memory::MemoryStream;
 use datafusion::sql::TableReference;
 use futures::lock::Mutex;
+use odbc_api::handles::AsStatementRef;
 use odbc_api::handles::Statement;
 use odbc_api::handles::StatementImpl;
 use odbc_api::parameter::InputParameter;
+use odbc_api::Cursor;
 use odbc_api::CursorImpl;
 use snafu::prelude::*;
 use snafu::Snafu;
@@ -57,19 +62,16 @@ pub type ODBCDbConnectionPool<'a> =
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Failed to convert query result to Arrow: {source}"))]
-    ArrowError {
-        source: arrow::error::ArrowError,
-    },
-    ArrowODBCError {
-        source: arrow_odbc::Error,
-    },
-    ODBCAPIError {
-        source: odbc_api::Error,
-    },
+    ArrowError { source: arrow::error::ArrowError },
+    #[snafu(display("arrow_odbc error: {source}"))]
+    ArrowODBCError { source: arrow_odbc::Error },
+    #[snafu(display("odbc_api Error: {source}"))]
+    ODBCAPIError { source: odbc_api::Error },
 }
 
 pub struct ODBCConnection<'a> {
     pub conn: Arc<Mutex<Connection<'a>>>,
+    pub params: Option<HashMap<String, String>>,
 }
 
 impl<'a> DbConnection<Connection<'a>, ODBCParameter> for ODBCConnection<'a>
@@ -97,6 +99,7 @@ where
     fn new(conn: Connection<'a>) -> Self {
         ODBCConnection {
             conn: Arc::new(conn.into()),
+            params: None.into(),
         }
     }
 
@@ -130,11 +133,7 @@ where
             CursorImpl::new(statement.as_stmt_ref())
         };
 
-        let reader = OdbcReaderBuilder::new()
-            .with_schema(schema.clone())
-            .build(cursor)
-            .context(ArrowODBCSnafu)?;
-
+        let reader = build_odbc_reader(cursor, &schema, self.params.clone())?;
         let results: Vec<RecordBatch> = reader.map(|b| b.context(ArrowSnafu).unwrap()).collect();
 
         Ok(Box::pin(MemoryStream::try_new(results, schema, None)?))
@@ -157,6 +156,39 @@ where
             .try_into()
             .expect("Must obtain row count"))
     }
+}
+
+fn build_odbc_reader<C: Cursor>(
+    cursor: C,
+    schema: &Arc<Schema>,
+    params: Option<HashMap<String, String>>,
+) -> Result<OdbcReader<C>> {
+    let mut builder = OdbcReaderBuilder::new();
+    builder.with_schema(schema.clone());
+
+    let bind_as_usize = |k: &str, f: &mut dyn FnMut(usize) -> ()| {
+        params
+            .as_ref()
+            .and_then(|p| p.get(k).cloned())
+            .and_then(|s| s.parse::<usize>().ok())
+            .into_iter()
+            .for_each(|sz| f(sz));
+    };
+
+    bind_as_usize("max_binary_size", &mut |s| {
+        builder.with_max_binary_size(s);
+    });
+    bind_as_usize("max_text_size", &mut |s| {
+        builder.with_max_text_size(s);
+    });
+    bind_as_usize("max_bytes_per_batch", &mut |s| {
+        builder.with_max_bytes_per_batch(s);
+    });
+    bind_as_usize("max_num_rows_per_batch", &mut |s| {
+        builder.with_max_num_rows_per_batch(s);
+    });
+
+    Ok(builder.build(cursor).context(ArrowODBCSnafu)?)
 }
 
 fn bind_parameters(statement: &mut StatementImpl, params: &[ODBCParameter]) {

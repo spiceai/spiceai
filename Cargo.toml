@@ -55,4 +55,4 @@ clickhouse-rs = {version = "1.1.0-alpha.1", features = ["tokio_io", "tls"]}
 uuid = "1.6.1"
 pem = "3.0.4"
 odbc-api = { version = "7.0.0" }
-arrow-odbc = { version = "8.3.0" }
+arrow-odbc = { git = "https://github.com/mach-kernel/arrow-odbc.git", branch = "042624/bin-text-buf-choose-larger" }
