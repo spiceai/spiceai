@@ -162,7 +162,7 @@ jobs:
       - name: Install spice
         uses: ./.github/actions/install-spice
         with:
-          build-dir: './build'
+          build-path: ./build
 
       - name: Init spice app
         run: |
@@ -194,41 +194,10 @@ jobs:
           # time to initialize added dataset
           sleep 10
 
-      - name: Check datasets
-        working-directory: test_app
-        run: |
-          response=$(curl http://localhost:3000/v1/datasets)
-          echo $response | jq
-          length=$(echo $response | jq 'if type=="array" then length else empty end')
-          if [[ $length -ne 1 ]]; then
-            echo "Unexpected response: $response, expected 1 dataset but received $length"
-            exit 1
-          fi
-
-      - name: Check taxi_trips table exists
-        working-directory: test_app
-        run: |
-          response=$(curl -X POST \
-            -H "Content-Type: text/plain" \
-            -d "show tables;" \
-            http://localhost:3000/v1/sql
-          )
-          echo $response | jq
-          table_exists=$(echo $response | jq '[.[] | select(.table_name == "taxi_trips")]' | jq 'length')
-          if [[ $table_exists -eq 0 ]]; then
-            echo "Unexpected response: table 'taxi_trips' does not exist."
-            exit 1
-          fi
-
-      - name: Run Flight SQL query
-        working-directory: test_app
-        run: |
-          sql_output=$(echo "select * from taxi_trips limit 10;" | spice sql)
-          echo "$sql_output"
-          if [[ $sql_output == *"error"* ]] || [[ $sql_output == *"not found"* ]]; then
-            echo "Unexpected response from spice sql, failed to perform test query: $sql_output"
-            exit 1
-          fi
+      - name: Verify dataset
+        uses: ./.github/actions/verify-dataset
+        with:
+          name: taxi_trips
 
       - name: Stop spice and check logs
         working-directory: test_app
@@ -250,7 +219,6 @@ jobs:
       matrix:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
-    
     steps:
       - uses: actions/checkout@v4
 
@@ -263,7 +231,7 @@ jobs:
       - name: Install spice
         uses: ./.github/actions/install-spice
         with:
-          build-dir: './build'
+          build-path: ./build
 
       - name: Init spice app
         run: |
@@ -292,41 +260,10 @@ jobs:
         run: |
           while [[ "$(curl -s http://localhost:3000/health)" != "ok" ]]; do sleep 1; done
 
-      - name: Check datasets
-        working-directory: test_app
-        run: |
-          response=$(curl http://localhost:3000/v1/datasets)
-          echo $response | jq
-          length=$(echo $response | jq 'if type=="array" then length else empty end')
-          if [[ $length -ne 1 ]]; then
-            echo "Unexpected response: $response, expected 1 dataset but received $length"
-            exit 1
-          fi
-
-      - name: Check eth_recent_blocks table exists
-        working-directory: test_app
-        run: |
-          response=$(curl -X POST \
-            -H "Content-Type: text/plain" \
-            -d "show tables;" \
-            http://localhost:3000/v1/sql
-          )
-          echo $response | jq
-          table_exists=$(echo $response | jq '[.[] | select(.table_name == "eth_recent_blocks")]' | jq 'length')
-          if [[ $table_exists -eq 0 ]]; then
-            echo "Unexpected response: table 'eth_recent_blocks' does not exist."
-            exit 1
-          fi
-
-      - name: Run Flight SQL query
-        working-directory: test_app
-        run: |
-          sql_output=$(echo "select * from eth_recent_blocks limit 10;" | spice sql)
-          echo "$sql_output"
-          if [[ $sql_output == *"error"* ]] || [[ $sql_output == *"not found"* ]]; then
-            echo "Unexpected response from spice sql, failed to perform test query: $sql_output"
-            exit 1
-          fi
+      - name: Verify dataset
+        uses: ./.github/actions/verify-dataset
+        with:
+          name: eth_recent_blocks
 
       - name: Stop spice and check logs
         working-directory: test_app
@@ -349,34 +286,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install PostgreSQL (Linux)
-        if: matrix.target.target_os == 'linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y postgresql
-          sudo service postgresql start
-          sleep 5
-          sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='postgres'" | grep -q 1 || sudo -u postgres createuser -s postgres
-          sudo -u postgres psql -c "ALTER USER postgres PASSWORD 'postgres';"
-          sudo -u postgres createdb testdb
-
-      - name: Install PostgreSQL (MacOS)
-        if: matrix.target.target_os == 'darwin'
-        run: |
-          brew install postgresql
-          brew services start postgresql
-          sleep 5
-          createuser -s postgres
-          psql -d postgres -c "ALTER USER postgres PASSWORD 'postgres';"
-          createdb testdb
-
-      - name: Wait for PostgreSQL to start
-        run: sleep 10
-
-      - name: Check PostgreSQL
-        env:
-          PGPASSWORD: postgres
-        run: psql -h localhost -U postgres -c 'SELECT version();'
+      - name: Install PostgreSQL
+        uses: ./.github/actions/install-postgres
+        with:
+          os: ${{ matrix.target.target_os }}
+          pg-db: testdb
 
       - name: Prepare PostgreSQL dataset
         env:
@@ -394,7 +308,7 @@ jobs:
       - name: Install spice
         uses: ./.github/actions/install-spice
         with:
-          build-dir: './build'
+          build-path: ./build
 
       - name: Init spice app
         run: |
@@ -425,41 +339,10 @@ jobs:
         run: |
           while [[ "$(curl -s http://localhost:3000/health)" != "ok" ]]; do sleep 1; done
 
-      - name: Check datasets
-        working-directory: test_app
-        run: |
-          response=$(curl http://localhost:3000/v1/datasets)
-          echo $response | jq
-          length=$(echo $response | jq 'if type=="array" then length else empty end')
-          if [[ $length -ne 1 ]]; then
-            echo "Unexpected response: $response, expected 1 dataset but received $length"
-            exit 1
-          fi
-
-      - name: Check test_postgresql_table table exists
-        working-directory: test_app
-        run: |
-          response=$(curl -X POST \
-            -H "Content-Type: text/plain" \
-            -d "show tables;" \
-            http://localhost:3000/v1/sql
-          )
-          echo $response | jq
-          table_exists=$(echo $response | jq '[.[] | select(.table_name == "test_postgresql_table")]' | jq 'length')
-          if [[ $table_exists -eq 0 ]]; then
-            echo "Unexpected response: table 'test_postgresql_table' does not exist."
-            exit 1
-          fi
-
-      - name: Run Flight SQL query
-        working-directory: test_app
-        run: |
-          sql_output=$(echo "select * from test_postgresql_table limit 10;" | spice sql)
-          echo "$sql_output"
-          if [[ $sql_output == *"error"* ]] || [[ $sql_output == *"not found"* ]]; then
-            echo "Unexpected response from spice sql, failed to perform test query: $sql_output"
-            exit 1
-          fi
+      - name: Verify dataset
+        uses: ./.github/actions/verify-dataset
+        with:
+          name: test_postgresql_table
 
       - name: Stop spice and check logs
         working-directory: test_app
@@ -524,7 +407,7 @@ jobs:
       - name: Install spice
         uses: ./.github/actions/install-spice
         with:
-          build-dir: './build'
+          build-path: ./build
 
       - name: Init spice app
         run: |
@@ -555,41 +438,10 @@ jobs:
         run: |
           while [[ "$(curl -s http://localhost:3000/health)" != "ok" ]]; do sleep 1; done
 
-      - name: Check datasets
-        working-directory: test_app
-        run: |
-          response=$(curl http://localhost:3000/v1/datasets)
-          echo $response | jq
-          length=$(echo $response | jq 'if type=="array" then length else empty end')
-          if [[ $length -ne 1 ]]; then
-            echo "Unexpected response: $response, expected 1 dataset but received $length"
-            exit 1
-          fi
-
-      - name: Check test_mysql_table table exists
-        working-directory: test_app
-        run: |
-          response=$(curl -X POST \
-            -H "Content-Type: text/plain" \
-            -d "show tables;" \
-            http://localhost:3000/v1/sql
-          )
-          echo $response | jq
-          table_exists=$(echo $response | jq '[.[] | select(.table_name == "test_mysql_table")]' | jq 'length')
-          if [[ $table_exists -eq 0 ]]; then
-            echo "Unexpected response: table 'test_mysql_table' does not exist."
-            exit 1
-          fi
-
-      - name: Run Flight SQL query
-        working-directory: test_app
-        run: |
-          sql_output=$(echo "select * from test_mysql_table limit 10;" | spice sql)
-          echo "$sql_output"
-          if [[ $sql_output == *"error"* ]] || [[ $sql_output == *"not found"* ]]; then
-            echo "Unexpected response from spice sql, failed to perform test query: $sql_output"
-            exit 1
-          fi
+      - name: Verify dataset
+        uses: ./.github/actions/verify-dataset
+        with:
+          name: test_mysql_table
 
       - name: Stop spice and check logs
         working-directory: test_app
@@ -654,7 +506,7 @@ jobs:
       - name: Install spice
         uses: ./.github/actions/install-spice
         with:
-          build-dir: './build'
+          build-path: ./build
 
       - name: Init spice app
         run: |
@@ -685,41 +537,10 @@ jobs:
         run: |
           while [[ "$(curl -s http://localhost:3000/health)" != "ok" ]]; do sleep 1; done
 
-      - name: Check datasets
-        working-directory: test_app
-        run: |
-          response=$(curl http://localhost:3000/v1/datasets)
-          echo $response | jq
-          length=$(echo $response | jq 'if type=="array" then length else empty end')
-          if [[ $length -ne 1 ]]; then
-            echo "Unexpected response: $response, expected 1 dataset but received $length"
-            exit 1
-          fi
-
-      - name: Check test_clickhouse_table table exists
-        working-directory: test_app
-        run: |
-          response=$(curl -X POST \
-            -H "Content-Type: text/plain" \
-            -d "show tables;" \
-            http://localhost:3000/v1/sql
-          )
-          echo $response | jq
-          table_exists=$(echo $response | jq '[.[] | select(.table_name == "test_clickhouse_table")]' | jq 'length')
-          if [[ $table_exists -eq 0 ]]; then
-            echo "Unexpected response: table 'test_clickhouse_table' does not exist."
-            exit 1
-          fi
-
-      - name: Run Flight SQL query
-        working-directory: test_app
-        run: |
-          sql_output=$(echo "select * from test_clickhouse_table limit 10;" | spice sql)
-          echo "$sql_output"
-          if [[ $sql_output == *"error"* ]] || [[ $sql_output == *"not found"* ]]; then
-            echo "Unexpected response from spice sql, failed to perform test query: $sql_output"
-            exit 1
-          fi
+      - name: Verify dataset
+        uses: ./.github/actions/verify-dataset
+        with:
+          name: test_clickhouse_table
 
       - name: Stop spice and check logs
         working-directory: test_app
@@ -751,29 +572,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
-      - name: Install PostgreSQL (Linux)
-        if: matrix.target.target_os == 'linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y postgresql
-          sudo service postgresql start
-          sleep 5
-          sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='postgres'" | grep -q 1 || sudo -u postgres createuser -s postgres
-          sudo -u postgres psql -c "ALTER USER postgres PASSWORD 'postgres';"
-          sudo -u postgres createdb testdb
-
-      - name: Install PostgreSQL (MacOS)
-        if: matrix.target.target_os == 'darwin'
-        run: |
-          brew install postgresql
-          brew services start postgresql
-          sleep 5
-          createuser -s postgres
-          psql -d postgres -c "ALTER USER postgres PASSWORD 'postgres';"
-          createdb testdb
-
-      - name: Wait for PostgreSQL to start
-        run: sleep 10
+      - name: Install PostgreSQL
+        uses: ./.github/actions/install-postgres
+        with:
+          os: ${{ matrix.target.target_os }}
+          pg-db: testdb
 
       - name: Check PostgreSQL
         env:
@@ -799,7 +602,7 @@ jobs:
       - name: Install spice
         uses: ./.github/actions/install-spice
         with:
-          build-dir: './build'
+          build-path: ./build
 
       - name: Init spice app
         run: |
@@ -847,16 +650,6 @@ jobs:
         run: |
           while [[ "$(curl -s http://localhost:3000/health)" != "ok" ]]; do sleep 1; done
 
-      - name: Check datasets
-        working-directory: test_app
-        run: |
-          response=$(curl http://localhost:3000/v1/datasets)
-          echo $response | jq
-          length=$(echo $response | jq 'if type=="array" then length else empty end')
-          if [[ $length -ne 1 ]]; then
-            echo "Unexpected response: $response, expected 1 dataset but received $length"
-            exit 1
-          fi
       - name: Manually refresh dataset
         working-directory: test_app
         run: |
@@ -870,34 +663,11 @@ jobs:
             exit 1
           fi
 
-      - name: Check eth_recent_blocks table exists
-        working-directory: test_app
-        run: |
-          response=$(curl -X POST \
-            -H "Content-Type: text/plain" \
-            -d "show tables;" \
-            http://localhost:3000/v1/sql
-          )
-          echo $response | jq
-          table_exists=$(echo $response | jq '[.[] | select(.table_name == "eth_recent_blocks")]' | jq 'length')
-          if [[ $table_exists -eq 0 ]]; then
-            echo "Unexpected response: table 'taxi_trips' does not exist."
-            exit 1
-          fi
-
-      - name: Check Flight SQL query
-        working-directory: test_app
-        run: |
-          sql_output=$(echo "select * from eth_recent_blocks limit 10;" | spice sql)
-          echo "$sql_output"
-          if [[ $sql_output == *"error"* ]] || [[ $sql_output == *"not found"* ]]; then
-            echo "Unexpected response from spice sql, failed to perform test query: $sql_output"
-            exit 1
-          fi
-          if ![[ $sql_output == *"1/1 rows displayed"* ]]; then
-            echo "Query did not return the expected number of rows defined by `refresh_sql` statement."
-            exit 1
-          fi
+      - name: Verify dataset
+        uses: ./.github/actions/verify-dataset
+        with:
+          name: eth_recent_blocks
+          expected-rows-count: 1
 
       - name: Stop spice and check logs
         working-directory: test_app

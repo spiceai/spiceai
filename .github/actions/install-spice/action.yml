@@ -1,7 +1,7 @@
 name: 'Install Spice'
 description: 'Installs Spice locally from build artifacts directory'
 inputs:
-  build-dir:
+  build-path:
     description: 'Directory containing Spice binaries'
     required: true
 
@@ -11,15 +11,15 @@ runs:
     - name: Install Spice binaries
       shell: bash
       run: |
-        echo "Installing Spice from local folder: ${{ inputs.build-dir }}"
+        echo "Installing Spice from local folder: ${{ inputs.build-path }}"
 
-        chmod +x "${{ inputs.build-dir }}/spice"
-        chmod +x "${{ inputs.build-dir }}/spiced"
+        chmod +x "${{ inputs.build-path }}/spice"
+        chmod +x "${{ inputs.build-path }}/spiced"
 
         mkdir -p "$HOME/.spice/bin"
 
-        mv "${{ inputs.build-dir }}/spice" "$HOME/.spice/bin"
-        mv "${{ inputs.build-dir }}/spiced" "$HOME/.spice/bin"
+        mv "${{ inputs.build-path }}/spice" "$HOME/.spice/bin"
+        mv "${{ inputs.build-path }}/spiced" "$HOME/.spice/bin"
 
         echo "$HOME/.spice/bin" >> $GITHUB_PATH
 
