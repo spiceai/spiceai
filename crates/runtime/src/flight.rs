@@ -195,12 +195,16 @@ impl Service {
         let batches_stream = batches_stream
             .then(move |batch_result| {
                 let options_clone = options.clone();
+                let schema_clone = schema.clone();
                 async move {
                     let encoder = IpcDataGenerator::default();
                     let mut tracker = DictionaryTracker::new(false);
 
                     match batch_result {
                         Ok(batch) => {
+                            verify_schema(schema_clone.fields(), batch.schema().fields())
+                                .map_err(to_tonic_err)?;
+
                             let (flight_dictionaries, flight_batch) = encoder
                                 .encoded_batch(&batch, &mut tracker, &options_clone)
                                 .map_err(|e| Status::internal(e.to_string()))?;
@@ -227,6 +231,38 @@ impl Service {
 
         Ok(flights_stream.boxed())
     }
+}
+
+fn verify_schema(
+    expected: &arrow::datatypes::Fields,
+    actual: &arrow::datatypes::Fields,
+) -> Result<()> {
+    if expected.len() != actual.len() {
+        return SchemaMismatchNumFieldsSnafu {
+            expected: expected.len(),
+            actual: actual.len(),
+        }
+        .fail();
+    }
+
+    for idx in 0..expected.len() {
+        let a = expected.get(idx).context(UnableToGetFieldDataTypeSnafu)?;
+        let b = actual.get(idx).context(UnableToGetFieldDataTypeSnafu)?;
+
+        let a_data_type = a.data_type();
+        let b_data_type = b.data_type();
+
+        if a_data_type != b_data_type {
+            return SchemaMismatchDataTypeSnafu {
+                name: a.name(),
+                expected: format!("{a_data_type})"),
+                actual: format!("{b_data_type}"),
+            }
+            .fail();
+        }
+    }
+
+    Ok(())
 }
 
 fn record_batches_to_flight_stream(
@@ -282,6 +318,19 @@ pub enum Error {
 
     #[snafu(display("Unable to start Flight server: {source}"))]
     UnableToStartFlightServer { source: tonic::transport::Error },
+
+    #[snafu(display("Expected and actual number of fields in the query result don't match: expected {expected}, received {actual}"))]
+    SchemaMismatchNumFields { expected: usize, actual: usize },
+
+    #[snafu(display("Query returned an unexpected data type for column {name}: expected {expected}, received {actual}. Is the column data type supported by the used data accelerator (https://docs.spiceai.org/reference/datatypes)?"))]
+    SchemaMismatchDataType {
+        name: String,
+        expected: String,
+        actual: String,
+    },
+
+    #[snafu(display("Failed to get field data type"))]
+    UnableToGetFieldDataType {},
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
