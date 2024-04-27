@@ -39,11 +39,18 @@ runs:
     - name: Check Flight SQL query
       shell: bash
       run: |
-        sql_output=$(echo "select * from ${{ inputs.name }} limit 10;" | spice sql)
+        query="select * from ${{ inputs.name }} limit 10;"
+        echo "Executing query: $query"
+        sql_output=$(spice sql <<EOF
+        $query
+        .error
+        EOF
+        )
+
         echo "$sql_output"
         
-        if [[ $sql_output == *"error"* ]] || [[ $sql_output == *"not found"* ]]; then
-          echo "Unexpected response from spice sql, failed to perform test query: $sql_output"
+        if [[ $sql_output != *"No error to display"* ]]; then
+          echo "Unexpected response from spice sql, failed to perform test query:"
           exit 1
         fi
 

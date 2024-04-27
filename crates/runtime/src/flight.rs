@@ -255,7 +255,7 @@ fn verify_schema(
         if a_data_type != b_data_type {
             return SchemaMismatchDataTypeSnafu {
                 name: a.name(),
-                expected: format!("{a_data_type})"),
+                expected: format!("{a_data_type}"),
                 actual: format!("{b_data_type}"),
             }
             .fail();
