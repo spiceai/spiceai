@@ -1,0 +1,113 @@
+name: Data types test
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  # Allow only one workflow per any non-trunk branch.
+  group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
+  cancel-in-progress: true
+
+jobs:
+  setup-matrix:
+    name: Setup strategy matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.setup-matrix.outputs.result }}
+
+    steps:
+      - name: Set up matrix
+        uses: actions/github-script@v7
+        id: setup-matrix
+        with:
+          script: |
+            const matrix = [
+              {
+                name: "Linux x64",
+                runner: "ubuntu-latest",
+                target_os: "linux",
+                target_arch: "x86_64",
+                target_arch_go: "amd64"
+              }
+            ];
+
+            return context.eventName === 'pull_request' ? matrix.slice(0, 1) : matrix;
+
+  test_data_acceleration:
+    name: 'Data acceleration(${{ matrix.acceleration.engine }}) on ${{ matrix.target.name }}'
+    runs-on: ${{ matrix.target.runner }}
+    needs:
+      - setup-matrix
+
+    strategy:
+      fail-fast: false
+      matrix:
+        acceleration: [
+            { engine: arrow, mode: memory },
+            # { engine: duckdb, mode: memory },
+            # { engine: sqlite, mode: memory },
+            # { engine: postgres},
+          ]
+        target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+
+      - name: Generate test data
+        run: |
+          python test/arrow-types/create_arrow_types_test_data.py
+          ls -l test/arrow-types/
+
+      - name: Install Spice
+        run: |
+          curl https://install.spiceai.org | /bin/bash
+
+      - name: Init spice app
+        run: |
+          spice init test_app
+
+      # - name: Spice dataset configure
+      #   working-directory: test_app
+      #   run: |
+      #     ENGINE=$(echo '${{ matrix.acceleration.engine }}')
+      #     MODE=$(echo '${{ matrix.acceleration.mode }}')
+
+      #     echo "datasets:" >> spicepod.yaml
+      #     echo "  - name: eth_recent_blocks" >> spicepod.yaml
+      #     echo "    from: postgres:eth_recent_blocks" >> spicepod.yaml
+      #     echo "    acceleration:" >> spicepod.yaml
+      #     echo "      enabled: true" >> spicepod.yaml
+      #     echo "      engine: $ENGINE" >> spicepod.yaml
+      #     if [[ -n "$MODE" ]]; then
+      #       echo "      mode: $MODE" >> spicepod.yaml
+      #     fi
+      #     echo "      refresh_sql: SELECT * FROM eth_recent_blocks LIMIT 1" >> spicepod.yaml
+      #     echo "    params:" >> spicepod.yaml
+      #     echo "      pg_host: localhost" >> spicepod.yaml
+      #     echo "      pg_port: '5432'" >> spicepod.yaml
+      #     echo "      pg_db: testdb" >> spicepod.yaml
+      #     echo "      pg_user: postgres" >> spicepod.yaml
+      #     echo "      pg_pass_key: password" >> spicepod.yaml
+      #     echo "      pg_sslmode: disable" >> spicepod.yaml
+      #     # configure env secret store
+      #     echo -e "secrets:\n  store: env\n" >> spicepod.yaml
+      #     cat spicepod.yaml
+
+      - name: Start spice runtime
+        env:
+          SPICE_SECRET_POSTGRES_PASSWORD: postgres
+        working-directory: test_app
+        run: |
+          spice run &> spice.log &
+          # time to initialize added dataset
+          sleep 10
+
+      - name: Stop spice and check logs
+        working-directory: test_app
+        if: always()
+        run: |
+          killall spice
+          cat spice.log
