@@ -102,7 +102,7 @@ impl Databricks {
             let Some(endpoint) = ref_params.and_then(|p| p.get("endpoint")) else {
                 return MissingEndpointSnafu.fail();
             };
-            let user = ref_params.and_then(|p| p.get("user").map(|u| u.to_owned()));
+            let user = ref_params.and_then(|p| p.get("user").map(std::borrow::ToOwned::to_owned));
             let Some(cluster_id) = ref_params.and_then(|p| p.get("databricks-cluster-id")) else {
                 return MissingDatabricksClusterIdSnafu.fail();
             };
