@@ -158,7 +158,11 @@ pub async fn register_all() {
     #[cfg(feature = "clickhouse")]
     register_connector_factory("clickhouse", clickhouse::Clickhouse::create).await;
     #[cfg(feature = "spark_connect")]
-    register_connector_factory("spark_connect", spark_connect::SparkConnectConnector::create).await;
+    register_connector_factory(
+        "spark_connect",
+        spark_connect::SparkConnectConnector::create,
+    )
+    .await;
 }
 
 pub trait DataConnectorFactory {

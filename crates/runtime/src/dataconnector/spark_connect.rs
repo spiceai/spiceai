@@ -74,14 +74,8 @@ impl SparkConnectConnector {
         secret: Arc<Option<Secret>>,
         params: Arc<Option<HashMap<String, String>>>,
     ) -> Result<Self> {
-        let plain_text_connection = params
-            .as_ref()
-            .as_ref()
-            .and_then(|x| x.get("connection"));
-        let secret_connection = secret
-            .as_ref()
-            .as_ref()
-            .and_then(|x| x.get("connection"));
+        let plain_text_connection = params.as_ref().as_ref().and_then(|x| x.get("connection"));
+        let secret_connection = secret.as_ref().as_ref().and_then(|x| x.get("connection"));
         let conn = match (plain_text_connection, secret_connection) {
             (Some(_), Some(_)) => DuplicatedSparkRemoteSnafu.fail(),
             (_, Some(conn)) => Ok(conn),

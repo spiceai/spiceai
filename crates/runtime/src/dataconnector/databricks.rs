@@ -103,8 +103,7 @@ impl Databricks {
                 return MissingEndpointSnafu.fail();
             };
             let user = ref_params.and_then(|p| p.get("user").map(|u| u.to_owned()));
-            let Some(cluster_id) = ref_params.and_then(|p| p.get("databricks-cluster-id"))
-            else {
+            let Some(cluster_id) = ref_params.and_then(|p| p.get("databricks-cluster-id")) else {
                 return MissingDatabricksClusterIdSnafu.fail();
             };
             let Some(secrets) = secret.as_ref() else {
