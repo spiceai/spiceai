@@ -1,6 +1,7 @@
 use std::fmt;
 use std::sync::Arc;
 
+use crate::{Read, ReadWrite};
 use arrow::array::RecordBatch;
 use arrow::datatypes::Field;
 use arrow::datatypes::{self, Schema, SchemaRef, TimeUnit};
@@ -25,13 +26,48 @@ use datafusion::{
 use futures::Stream;
 use spark_connect_rs::{
     spark::{data_type, DataType},
-    DataFrame, SparkSession,
+    DataFrame, SparkSession, SparkSessionBuilder,
 };
 use sql_provider_datafusion::expr::{self, Engine};
 
 use std::error::Error;
 
-pub async fn get_table_provider(
+#[derive(Clone)]
+#[allow(clippy::module_name_repetitions)]
+pub struct SparkConnect {
+    session: Arc<SparkSession>,
+}
+
+impl SparkConnect {
+    pub async fn from_connection(connection: &str) -> Result<Self, Box<dyn Error + Send + Sync>> {
+        let session = Arc::new(SparkSessionBuilder::remote(connection).build().await?);
+        Ok(Self { session })
+    }
+}
+
+#[async_trait]
+impl ReadWrite for SparkConnect {
+    async fn table_provider(
+        &self,
+        table_reference: OwnedTableReference,
+    ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn Error + Send + Sync>> {
+        let provider = get_table_provider(Arc::clone(&self.session), table_reference).await?;
+        Ok(provider)
+    }
+}
+
+#[async_trait]
+impl Read for SparkConnect {
+    async fn table_provider(
+        &self,
+        table_reference: OwnedTableReference,
+    ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn Error + Send + Sync>> {
+        let provider = get_table_provider(Arc::clone(&self.session), table_reference).await?;
+        Ok(provider)
+    }
+}
+
+async fn get_table_provider(
     spark_session: Arc<SparkSession>,
     table_reference: OwnedTableReference,
 ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn Error + Send + Sync>> {

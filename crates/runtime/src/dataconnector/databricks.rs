@@ -35,6 +35,12 @@ pub enum Error {
     #[snafu(display("Missing required parameter: endpoint"))]
     MissingEndpoint,
 
+    #[snafu(display("Missing required parameter: databricks-cluster-id"))]
+    MissingDatabricksClusterId,
+
+    #[snafu(display("Missing required token. {message}"))]
+    MissingDatabricksToken { message: String },
+
     #[snafu(display("Endpoint {endpoint} is invalid: {source}"))]
     InvalidEndpoint {
         endpoint: String,
@@ -93,9 +99,34 @@ impl Databricks {
                 InvalidFormatSnafu { mode, format }.fail()
             }
         } else {
-            let databricks_spark = DatabricksSparkConnect::new(secret, params)
-                .await
-                .context(UnableToConstructDatabricksSparkSnafu)?;
+            let Some(endpoint) = ref_params.and_then(|p| p.get("endpoint")) else {
+                return MissingEndpointSnafu.fail();
+            };
+            let user = ref_params.and_then(|p| p.get("user").map(|u| u.to_owned()));
+            let Some(cluster_id) = ref_params.and_then(|p| p.get("databricks-cluster-id"))
+            else {
+                return MissingDatabricksClusterIdSnafu.fail();
+            };
+            let Some(secrets) = secret.as_ref() else {
+                return MissingDatabricksTokenSnafu {
+                    message: "Secrets not available".to_string(),
+                }
+                .fail();
+            };
+            let Some(token) = secrets.get("token") else {
+                return MissingDatabricksTokenSnafu {
+                    message: "DATABRICKS TOKEN not set".to_string(),
+                }
+                .fail();
+            };
+            let databricks_spark = DatabricksSparkConnect::new(
+                endpoint.to_string(),
+                user,
+                cluster_id.to_string(),
+                token.to_string(),
+            )
+            .await
+            .context(UnableToConstructDatabricksSparkSnafu)?;
             Ok(Self {
                 read_provider: Arc::new(databricks_spark.clone()),
                 read_write_provider: Arc::new(databricks_spark),
