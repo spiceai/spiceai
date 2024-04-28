@@ -36,7 +36,7 @@ use tonic::transport::Channel;
 use tonic::{Code, IntoRequest, Status};
 
 #[derive(Parser)]
-#[clap(about = "Spice.ai Flight Query Utility")]
+#[clap(about = "Spice.ai SQL REPL")]
 pub struct ReplConfig {
     #[arg(
         long,
@@ -62,7 +62,7 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
 
     let mut rl = DefaultEditor::new()?;
 
-    println!("Welcome to the interactive Spice.ai SQL Query Utility! Type 'help' for help.\n");
+    println!("Welcome to the Spice.ai SQL REPL! Type 'help' for help.\n");
     println!("show tables; -- list available tables");
 
     let mut last_error: Option<Status> = None;
@@ -102,11 +102,11 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
                     prompt_color.paint(".exit, exit, quit, q:")
                 );
                 println!(
-                    "{} Show technical details from the last error",
+                    "{} Show details of the last error",
                     prompt_color.paint(".error:")
                 );
                 println!("{} Show this help message", prompt_color.paint("help:"));
-                println!("\nAny other line will be interpreted as a SQL query");
+                println!("\nOther lines will be interpreted as SQL");
                 continue;
             }
             "show tables" | "show tables;" => {
@@ -180,7 +180,7 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
         }
 
         if records.is_empty() {
-            println!("No data returned for query");
+            println!("No results.");
             continue;
         }
         let schema = records[0].schema();
@@ -200,10 +200,17 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
             println!("Error displaying results: {e}");
         };
         let elapsed = start_time.elapsed();
-        println!(
-            "\nQuery took: {} seconds. {num_rows}/{total_rows} rows displayed.",
-            elapsed.as_secs_f64()
-        );
+        if num_rows == total_rows {
+            println!(
+                "\nTime: {} seconds. {num_rows} rows.",
+                elapsed.as_secs_f64()
+            );
+        } else {
+            println!(
+                "\nTime: {} seconds. {num_rows}/{total_rows} rows displayed.",
+                elapsed.as_secs_f64()
+            );
+        }
         last_error = None;
     }
 
@@ -214,7 +221,7 @@ fn display_grpc_error(err: &Status) {
     let (error_type, user_err_msg) = match err.code() {
         Code::Ok => return,
         Code::Unknown | Code::Internal | Code::Unauthenticated | Code::DataLoss | Code::FailedPrecondition =>{
-            ("Error", "An internal error occurred while processing the query. Show technical details with '.error'")
+            ("Error", "An internal error occurred. Execute '.error' to show details.")
         },
         Code::InvalidArgument | Code::AlreadyExists | Code::NotFound => ("Query Error", err.message()),
         Code::Cancelled => ("Error", "The query was cancelled before it could complete."),
