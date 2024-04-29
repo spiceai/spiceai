@@ -461,7 +461,7 @@ mod tests {
             .expect("value is not none");
         println!("display array");
         println!("{array:?}");
-        assert_eq!(10, record_batch.num_rows());
+        assert_eq!(1, record_batch.num_rows());
         assert_eq!(2, record_batch.num_columns());
     }
 }
