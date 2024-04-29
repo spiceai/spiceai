@@ -64,18 +64,18 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-pub struct SparkConnectConnector {
+pub struct Spark {
     read_provider: Arc<dyn Read>,
     read_write_provider: Arc<dyn ReadWrite>,
 }
 
-impl SparkConnectConnector {
+impl Spark {
     async fn new(
         secret: Arc<Option<Secret>>,
         params: Arc<Option<HashMap<String, String>>>,
     ) -> Result<Self> {
-        let plain_text_connection = params.as_ref().as_ref().and_then(|x| x.get("connection"));
-        let secret_connection = secret.as_ref().as_ref().and_then(|x| x.get("connection"));
+        let plain_text_connection = params.as_ref().as_ref().and_then(|x| x.get("spark_remote"));
+        let secret_connection = secret.as_ref().as_ref().and_then(|x| x.get("spark_remote"));
         let conn = match (plain_text_connection, secret_connection) {
             (Some(_), Some(_)) => DuplicatedSparkRemoteSnafu.fail(),
             (_, Some(conn)) => Ok(conn),
@@ -92,21 +92,20 @@ impl SparkConnectConnector {
     }
 }
 
-impl DataConnectorFactory for SparkConnectConnector {
+impl DataConnectorFactory for Spark {
     fn create(
         secret: Option<Secret>,
         params: Arc<Option<HashMap<String, String>>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let spark_connect_connector =
-                SparkConnectConnector::new(Arc::new(secret), params).await?;
-            Ok(Arc::new(spark_connect_connector) as Arc<dyn DataConnector>)
+            let spark_connector = Spark::new(Arc::new(secret), params).await?;
+            Ok(Arc::new(spark_connector) as Arc<dyn DataConnector>)
         })
     }
 }
 
 #[async_trait]
-impl DataConnector for SparkConnectConnector {
+impl DataConnector for Spark {
     fn as_any(&self) -> &dyn Any {
         self
     }
