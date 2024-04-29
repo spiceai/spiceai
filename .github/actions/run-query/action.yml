@@ -1,5 +1,5 @@
-name: 'Execute Spice REPl query'
-description: 'Executes a query using Spice REPl and returns query result via GH Action output parameter'
+name: 'Execute Spice SQL REPL query'
+description: 'Executes a query using Spice SQL REPL and returns query result via GH Action output parameter'
 inputs:
   query:
     description: 'Query to execute'
@@ -51,7 +51,7 @@ runs:
 
         echo "query-output=$(echo "$sql_output" | base64 -w 0)" >> "$GITHUB_OUTPUT"
 
-        extracted_result=$(echo "$sql_output" | sed -n '/show tables;/,/Query took/p' | sed '1d;$d')
+        extracted_result=$(echo "$sql_output" | sed -n '/show tables;/,/Time: /p' | sed '1d;$d')
         if [[ -z "$extracted_result" ]]; then
           extracted_result="$sql_output"
         fi
