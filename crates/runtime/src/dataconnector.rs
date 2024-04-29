@@ -48,6 +48,8 @@ pub mod flightsql;
 pub mod localhost;
 #[cfg(feature = "mysql")]
 pub mod mysql;
+#[cfg(feature = "odbc")]
+pub mod odbc;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 pub mod s3;
@@ -157,6 +159,8 @@ pub async fn register_all() {
     register_connector_factory("duckdb", duckdb::DuckDB::create).await;
     #[cfg(feature = "clickhouse")]
     register_connector_factory("clickhouse", clickhouse::Clickhouse::create).await;
+    #[cfg(feature = "odbc")]
+    register_connector_factory("odbc", odbc::ODBC::create).await;
     #[cfg(feature = "spark")]
     register_connector_factory("spark", spark::Spark::create).await;
 }

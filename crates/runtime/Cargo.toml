@@ -65,6 +65,7 @@ data_components = { path = "../data_components" }
 mysql_async = { workspace = true, optional = true }
 postgres-native-tls = { version = "0.5.0", optional = true }
 ns_lookup = { path = "../ns_lookup" }
+odbc-api = { version = "7.0.0", optional = true }
 chrono = { version = "0.4.38" }
 clickhouse-rs = { workspace = true, optional = true }
 dashmap = "5.5.3"
@@ -104,3 +105,4 @@ aws-secrets-manager = ["secrets/aws-secrets-manager"]
 databricks = ["data_components/databricks"]
 spark = ["data_components/spark_connect"]
 dremio = []
+odbc = ["db_connection_pool/odbc", "data_components/odbc", "dep:odbc-api"]
