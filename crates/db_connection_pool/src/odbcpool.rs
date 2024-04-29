@@ -18,8 +18,7 @@ use crate::dbconnection::odbcconn::ODBCConnection;
 use crate::dbconnection::odbcconn::{ODBCDbConnection, ODBCParameter};
 use async_trait::async_trait;
 use odbc_api::{sys::AttrConnectionPooling, Connection, ConnectionOptions, Environment};
-use secrets::Secret;
-use snafu::Snafu;
+use snafu::prelude::*;
 use std::{collections::HashMap, sync::Arc};
 
 use super::{DbConnectionPool, Result};
@@ -38,6 +37,9 @@ lazy_static! {
 
 #[derive(Debug, Snafu)]
 pub enum Error {
+    #[snafu(display("Missing ODBC connection string parameter: odbc_connection_string"))]
+    MissingConnectionString {},
+
     #[snafu(display("Invalid parameter: {parameter_name}"))]
     InvalidParameterError { parameter_name: String },
 
@@ -51,14 +53,18 @@ pub struct ODBCPool {
 }
 
 impl ODBCPool {
-    pub async fn new(
-        params: Arc<Option<HashMap<String, String>>>,
-        _secret: Option<Secret>,
-    ) -> Result<Self> {
-        Ok(Self { params, pool: &ENV })
+    // Creates a new instance of `ODBCPool`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if there is a problem creating the connection pool.
+    #[must_use]
+    pub fn new(params: Arc<Option<HashMap<String, String>>>) -> Self {
+        Self { params, pool: &ENV }
     }
 
-    pub unsafe fn odbc_environment(&self) -> &'static Environment {
+    #[must_use]
+    pub fn odbc_environment(&self) -> &'static Environment {
         self.pool
     }
 }
@@ -70,14 +76,13 @@ where
 {
     async fn connect(&self) -> Result<Box<ODBCDbConnection<'a>>> {
         if let Some(params) = self.params.as_ref() {
-            let odbc_url = params
-                .get("odbc_url")
-                .ok_or(Error::MissingRequiredParameter {
-                    parameter_name: "odbc_url".to_string(),
-                })?;
-            let cxn = self
-                .pool
-                .connect_with_connection_string(odbc_url.as_str(), ConnectionOptions::default())?;
+            let odbc_connection_string = params
+                .get("odbc_connection_string")
+                .context(MissingConnectionStringSnafu {})?;
+            let cxn = self.pool.connect_with_connection_string(
+                odbc_connection_string.as_str(),
+                ConnectionOptions::default(),
+            )?;
 
             let odbc_cxn = ODBCConnection {
                 conn: Arc::new(cxn.into()),
@@ -87,7 +92,7 @@ where
             Ok(Box::new(odbc_cxn))
         } else {
             InvalidParameterSnafu {
-                parameter_name: "odbc_url".to_string(),
+                parameter_name: "odbc_connection_string".to_string(),
             }
             .fail()?
         }

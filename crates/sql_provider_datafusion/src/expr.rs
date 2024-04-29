@@ -56,7 +56,7 @@ pub fn to_sql_with_engine(expr: &Expr, engine: Option<Engine>) -> Result<String>
             Ok(format!("{} {} {}", left, binary_expr.op, right))
         }
         Expr::Column(name) => match engine {
-            Some(Engine::Spark) | Some(Engine::ODBC) => Ok(format!("{name}")),
+            Some(Engine::Spark | Engine::ODBC) => Ok(format!("{name}")),
             _ => Ok(format!("\"{name}\"")),
         },
         Expr::Cast(cast) => {
@@ -108,9 +108,9 @@ pub fn to_sql_with_engine(expr: &Expr, engine: Option<Engine>) -> Result<String>
             ScalarValue::UInt64(Some(value)) => Ok(value.to_string()),
             ScalarValue::TimestampNanosecond(Some(value), None | Some(_)) => match engine {
                 Some(Engine::SQLite) => {
-                    Ok(format!("datetime({}, 'unixepoch')", value / 1000000000))
+                    Ok(format!("datetime({}, 'unixepoch')", value / 1_000_000_000))
                 }
-                _ => Ok(format!("TO_TIMESTAMP({})", value / 1000000000)),
+                _ => Ok(format!("TO_TIMESTAMP({})", value / 1_000_000_000)),
             },
             ScalarValue::TimestampMillisecond(Some(value), None | Some(_)) => match engine {
                 Some(Engine::SQLite) => Ok(format!("datetime({}, 'unixepoch')", value / 1000)),

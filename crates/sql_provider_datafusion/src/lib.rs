@@ -220,9 +220,12 @@ impl<T, P> SqlExec<T, P> {
             .projected_schema
             .fields()
             .iter()
-            .map(|f| match self.engine {
-                Some(Engine::ODBC) => f.name().to_owned(),
-                _ => format!("\"{}\"", f.name()),
+            .map(|f| {
+                if let Some(Engine::ODBC) = self.engine {
+                    f.name().to_owned()
+                } else {
+                    format!("\"{}\"", f.name())
+                }
             })
             .collect::<Vec<_>>()
             .join(", ");

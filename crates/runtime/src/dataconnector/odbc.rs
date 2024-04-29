@@ -55,15 +55,11 @@ where
     'a: 'static,
 {
     fn create(
-        secret: Option<Secret>,
+        _secret: Option<Secret>,
         params: Arc<Option<HashMap<String, String>>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let pool: Arc<ODBCDbConnectionPool<'a>> = Arc::new(
-                ODBCPool::new(params, secret)
-                    .await
-                    .context(UnableToCreateODBCConnectionPoolSnafu)?,
-            );
+            let pool: Arc<ODBCDbConnectionPool<'a>> = Arc::new(ODBCPool::new(params));
 
             let odbc_factory = ODBCTableFactory::new(pool);
 

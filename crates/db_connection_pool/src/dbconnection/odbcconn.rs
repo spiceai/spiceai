@@ -25,11 +25,11 @@ use arrow_odbc::arrow_schema_from;
 use arrow_odbc::OdbcReader;
 use arrow_odbc::OdbcReaderBuilder;
 use arrow_odbc::Quirks;
+use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::memory::MemoryStream;
 use datafusion::sql::TableReference;
 use futures::lock::Mutex;
-use odbc_api::handles::AsStatementRef;
 use odbc_api::handles::Statement;
 use odbc_api::handles::StatementImpl;
 use odbc_api::parameter::InputParameter;
@@ -92,7 +92,7 @@ where
     }
 }
 
-#[async_trait::async_trait]
+#[async_trait]
 impl<'a> AsyncDbConnection<Connection<'a>, ODBCParameter> for ODBCConnection<'a>
 where
     'a: 'static,
@@ -100,7 +100,7 @@ where
     fn new(conn: Connection<'a>) -> Self {
         ODBCConnection {
             conn: Arc::new(conn.into()),
-            params: None.into(),
+            params: None,
         }
     }
 
@@ -135,7 +135,7 @@ where
             CursorImpl::new(statement.as_stmt_ref())
         };
 
-        let reader = build_odbc_reader(cursor, &schema, self.params.clone())?;
+        let reader = build_odbc_reader(cursor, &schema, &self.params)?;
         let results: Vec<RecordBatch> = reader.map(|b| b.context(ArrowSnafu).unwrap()).collect();
 
         Ok(Box::pin(MemoryStream::try_new(results, schema, None)?))
@@ -163,12 +163,12 @@ where
 fn build_odbc_reader<C: Cursor>(
     cursor: C,
     schema: &Arc<Schema>,
-    params: Option<HashMap<String, String>>,
+    params: &Option<HashMap<String, String>>,
 ) -> Result<OdbcReader<C>> {
     let mut builder = OdbcReaderBuilder::new();
-    builder.with_schema(schema.clone());
+    builder.with_schema(Arc::clone(schema));
 
-    let bind_as_usize = |k: &str, f: &mut dyn FnMut(usize) -> ()| {
+    let bind_as_usize = |k: &str, f: &mut dyn FnMut(usize)| {
         params
             .as_ref()
             .and_then(|p| p.get(k).cloned())
@@ -236,10 +236,8 @@ mod tests {
         use odbc_api::Cursor;
 
         // It is possible to connect to the SQLite driver without an underlying file
-        let pool = ODBCPool::new(Arc::new(None), None)
-            .await
-            .expect("Must make pool");
-        let env = unsafe { pool.odbc_environment() };
+        let pool = ODBCPool::new(Arc::new(None));
+        let env = pool.odbc_environment();
         let driver_cxn = env
             .driver_connect(
                 "Driver={SQLite}",
@@ -258,7 +256,7 @@ mod tests {
 
         let params: Vec<Box<dyn ODBCSyncParameter>> = vec![
             Box::new("hopper".into_parameter()),
-            Box::new((100 as i32).into_parameter()),
+            Box::new((100_i32).into_parameter()),
         ];
 
         bind_parameters(&mut statement, params.as_slice());
@@ -276,11 +274,11 @@ mod tests {
         let mut name_vec = vec![];
         let mut age_vec = vec![];
 
-        first.get_text(1, &mut name_vec).unwrap();
-        first.get_text(2, &mut age_vec).unwrap();
+        first.get_text(1, &mut name_vec).expect("Must get name");
+        first.get_text(2, &mut age_vec).expect("Must get age");
 
-        assert_eq!(str::from_utf8(&name_vec).unwrap(), "hopper");
-        assert_eq!(str::from_utf8(&age_vec).unwrap(), "100");
+        assert_eq!(str::from_utf8(&name_vec).expect("valid utf-8"), "hopper");
+        assert_eq!(str::from_utf8(&age_vec).expect("valid utf-8"), "100");
 
         Ok(())
     }
