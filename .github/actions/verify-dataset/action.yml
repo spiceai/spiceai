@@ -8,7 +8,7 @@ inputs:
     description: 'Expected number of rows in the dataset'
     required: false
 runs:
-  using: "composite"
+  using: 'composite'
   steps:
     - name: Ensure datasets loaded
       shell: bash
@@ -36,21 +36,22 @@ runs:
           exit 1
         fi
 
-    - name: Check Flight SQL query
+    - name: Verify SQL REPL result count for table ${{ inputs.name }}
       shell: bash
       run: |
         sql_output=$(echo "select * from ${{ inputs.name }} limit 10;" | spice sql)
         echo "$sql_output"
-        
+
         if [[ $sql_output == *"error"* ]] || [[ $sql_output == *"not found"* ]]; then
           echo "Unexpected response from spice sql, failed to perform test query: $sql_output"
           exit 1
         fi
 
         if [[ -n "${{ inputs.expected-rows-count }}" ]]; then
+          expected_rows="${{ inputs.expected-rows-count }} rows"
           expected_rows_displayed="${{ inputs.expected-rows-count }}/${{ inputs.expected-rows-count }} rows displayed"
-          if [[ $sql_output != *"$expected_rows_displayed"* ]]; then
-            echo "Query did not return the expected number of rows: ${{ inputs.expected-rows-count }}"
+          if [[ $sql_output != *"$expected_rows"* ]] && [[ $sql_output != *"$expected_rows_displayed"* ]]; then
+            echo "Unexpected row count: ${{ inputs.expected-rows-count }}"
             exit 1
           fi
         fi
