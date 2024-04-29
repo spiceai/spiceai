@@ -68,6 +68,10 @@ pub enum Error {
     ArrowODBCError { source: arrow_odbc::Error },
     #[snafu(display("odbc_api Error: {source}"))]
     ODBCAPIError { source: odbc_api::Error },
+    #[snafu(display("Failed to convert query result to Arrow: {source}"))]
+    TryFromError { source: std::num::TryFromIntError },
+    #[snafu(display("Unable to bind integer parameter: {source}"))]
+    UnableToBindIntParameter { source: std::num::TryFromIntError },
 }
 
 pub struct ODBCConnection<'a> {
@@ -127,7 +131,7 @@ where
         let schema = Arc::new(arrow_schema_from(&mut prepared)?);
         let mut statement = prepared.into_statement();
 
-        bind_parameters(&mut statement, params);
+        bind_parameters(&mut statement, params)?;
 
         // StatementImpl<'_>::execute is unsafe, CursorImpl<_>::new is unsafe
         let cursor = unsafe {
@@ -136,7 +140,10 @@ where
         };
 
         let reader = build_odbc_reader(cursor, &schema, &self.params)?;
-        let results: Vec<RecordBatch> = reader.map(|b| b.context(ArrowSnafu).unwrap()).collect();
+        let mut results: Vec<RecordBatch> = vec![];
+        for batch in reader {
+            results.push(batch.context(ArrowSnafu)?);
+        }
 
         Ok(Box::pin(MemoryStream::try_new(results, schema, None)?))
     }
@@ -146,17 +153,14 @@ where
         let prepared = cxn.prepare(query)?;
         let mut statement = prepared.into_statement();
 
-        bind_parameters(&mut statement, params);
+        bind_parameters(&mut statement, params)?;
 
         let row_count = unsafe {
             statement.execute().unwrap();
             statement.row_count()
         };
 
-        Ok(row_count
-            .unwrap()
-            .try_into()
-            .expect("Must obtain row count"))
+        Ok(row_count.unwrap().try_into().context(TryFromSnafu)?)
     }
 }
 
@@ -206,15 +210,20 @@ fn build_odbc_reader<C: Cursor>(
 
 /// Binds parameter to an ODBC statement.
 ///
-/// StatementImpl<'_>::bind_input_parameter is unsafe.
-fn bind_parameters(statement: &mut StatementImpl, params: &[ODBCParameter]) {
+/// `StatementImpl<'_>::bind_input_parameter` is unsafe.
+fn bind_parameters(statement: &mut StatementImpl, params: &[ODBCParameter]) -> Result<()> {
     for (i, param) in params.iter().enumerate() {
         unsafe {
             statement
-                .bind_input_parameter((i + 1).try_into().unwrap(), param.as_input_parameter())
+                .bind_input_parameter(
+                    (i + 1).try_into().context(UnableToBindIntParameterSnafu)?,
+                    param.as_input_parameter(),
+                )
                 .unwrap();
         }
     }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -259,7 +268,7 @@ mod tests {
             Box::new((100_i32).into_parameter()),
         ];
 
-        bind_parameters(&mut statement, params.as_slice());
+        bind_parameters(&mut statement, params.as_slice()).expect("Must bind parameters");
 
         let mut cursor = unsafe {
             statement.execute().unwrap();

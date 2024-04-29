@@ -30,8 +30,15 @@ lazy_static! {
       // are similar enough to change the attributes of a pooled one, to fit the requested
       // connection, or if it is cheaper to create a new Connection from scratch.
       // See <https://docs.microsoft.com/en-us/sql/odbc/reference/develop-app/driver-aware-connection-pooling>
-      Environment::set_connection_pooling(AttrConnectionPooling::DriverAware).unwrap();
-      Environment::new().unwrap()
+      if let Err(e) = Environment::set_connection_pooling(AttrConnectionPooling::DriverAware) {
+          tracing::error!("Failed to set ODBC connection pooling: {e}");
+      };
+      match Environment::new() {
+          Ok(env) => env,
+          Err(e) => {
+            panic!("Failed to create ODBC environment: {e}");
+          }
+      }
   };
 }
 
@@ -42,9 +49,6 @@ pub enum Error {
 
     #[snafu(display("Invalid parameter: {parameter_name}"))]
     InvalidParameterError { parameter_name: String },
-
-    #[snafu(display("Missing required parameter: {parameter_name}"))]
-    MissingRequiredParameter { parameter_name: String },
 }
 
 pub struct ODBCPool {
