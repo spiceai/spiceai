@@ -174,8 +174,7 @@ impl InsertBuilder {
                                 match OffsetDateTime::from_unix_timestamp(valid_array.value(row) as i64 * 86_400) {
                                     Ok(offset_time) => offset_time.date().into(),
                                     Err(_) => return,
-                                }
-                                    
+                                }   
                             );
                         }
                     }
@@ -186,8 +185,7 @@ impl InsertBuilder {
                                 match OffsetDateTime::from_unix_timestamp(valid_array.value(row) as i64 * 86_400) {
                                     Ok(offset_time) => offset_time.date().into(),
                                     Err(_) => return,
-                                }
-                                    
+                                } 
                             );
                         }
                     }
