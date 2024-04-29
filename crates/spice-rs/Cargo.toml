@@ -1,29 +1,29 @@
 [package]
 name = "spiceai"
-version = "1.0.3"
+version = "2.0.0"
 edition = "2021"
 description = "SDK for Spice.ai, an open-source runtime and platform for building AI-driven software."
 license = "Apache-2.0"
 
 [dependencies]
 arrow-flight = { version = "49.0.0", features = ["flight-sql-experimental"] }
-bytes = "1.5.0"
-prost = "0.12.1"
-prost-types = "0.12.1"
-rustls = "0.21.7"
-tokio = "1.32.0"
+bytes = "1.6.0"
+prost = "0.12.4"
+prost-types = "0.12.4"
+rustls = "0.23.5"
+tokio = "1.37.0"
 rustls-native-certs = "0.6.3"
 tonic = { version = "0.10.0", default-features = false, features = [
   "transport",
   "tls",
   "tls-roots",
 ] }
-rustls-pemfile = "1.0.3"
-reqwest = { version = "0.11.21", features = ["json"] }
+rustls-pemfile = "1.0.4"
+reqwest = { version = "0.12.4", features = ["json"] }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0.107"
-chrono = { version = "0.4.31", features = ["serde"] }
+serde_json = "1.0.116"
+chrono = { version = "0.4.38", features = ["serde"] }
 dotenv = "0.15.0"
 arrow = "49.0.0"
-futures = "0.3.28"
-base64 = "0.21.5"
+futures = "0.3.30"
+base64 = "0.22.0"
