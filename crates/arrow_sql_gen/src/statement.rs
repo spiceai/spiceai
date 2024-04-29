@@ -13,9 +13,6 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-
-use std::fmt;
-
 use arrow::{
     array::{array, Array, RecordBatch},
     datatypes::{DataType, SchemaRef},
@@ -148,6 +145,11 @@ impl InsertBuilder {
         }
     }
 
+    /// Create an Insert statement from a `RecordBatch`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a column's data type is not supported, or its conversion failed.
     #[allow(clippy::too_many_lines)]
     pub fn construct_insert_stmt(
         &self,
@@ -185,10 +187,16 @@ impl InsertBuilder {
                         let array = column.as_any().downcast_ref::<array::Date32Array>();
                         if let Some(valid_array) = array {
                             row_values.push(
-                                match OffsetDateTime::from_unix_timestamp(valid_array.value(row) as i64 * 86_400) {
+                                match OffsetDateTime::from_unix_timestamp(
+                                    i64::from(valid_array.value(row)) * 86_400,
+                                ) {
                                     Ok(offset_time) => offset_time.date().into(),
-                                    Err(e) => return Result::Err(Error::FailedToCreateInsertStatement { source: Box::new(e) }),
-                                }   
+                                    Err(e) => {
+                                        return Result::Err(Error::FailedToCreateInsertStatement {
+                                            source: Box::new(e),
+                                        })
+                                    }
+                                },
                             );
                         }
                     }
@@ -196,10 +204,16 @@ impl InsertBuilder {
                         let array = column.as_any().downcast_ref::<array::Date64Array>();
                         if let Some(valid_array) = array {
                             row_values.push(
-                                match OffsetDateTime::from_unix_timestamp(valid_array.value(row) as i64 * 86_400) {
+                                match OffsetDateTime::from_unix_timestamp(
+                                    valid_array.value(row) * 86_400,
+                                ) {
                                     Ok(offset_time) => offset_time.date().into(),
-                                    Err(e) => return Result::Err(Error::FailedToCreateInsertStatement { source: Box::new(e) }),
-                                } 
+                                    Err(e) => {
+                                        return Result::Err(Error::FailedToCreateInsertStatement {
+                                            source: Box::new(e),
+                                        })
+                                    }
+                                },
                             );
                         }
                     }
@@ -220,7 +234,11 @@ impl InsertBuilder {
                                         .into(),
                                     );
                                 }
-                                Err(e) => return Result::Err(Error::FailedToCreateInsertStatement { source: Box::new(e) }),
+                                Err(e) => {
+                                    return Result::Err(Error::FailedToCreateInsertStatement {
+                                        source: Box::new(e),
+                                    })
+                                }
                             };
                         }
                     }
@@ -320,13 +338,20 @@ impl InsertBuilder {
                             }
                         }
                     }
-                    unimplemented_type => return Result::Err(Error::UnimplementedDataTypeInInsertStatement { data_type: unimplemented_type.clone()}) 
+                    unimplemented_type => {
+                        return Result::Err(Error::UnimplementedDataTypeInInsertStatement {
+                            data_type: unimplemented_type.clone(),
+                        })
+                    }
                 }
             }
             match insert_stmt.values(row_values) {
                 Ok(_) => (),
-                Err(e) => return Result::Err(Error::FailedToCreateInsertStatement { source: Box::new(e) }),
-            
+                Err(e) => {
+                    return Result::Err(Error::FailedToCreateInsertStatement {
+                        source: Box::new(e),
+                    })
+                }
             }
         }
         Ok(())
@@ -365,7 +390,10 @@ impl InsertBuilder {
         }
     }
 
-    #[must_use]
+    /// # Errors
+    ///
+    /// Returns an error if any `RecordBatch` fails to convert into a valid insert statement. Upon
+    /// error, no further `RecordBatch` is processed.
     pub fn build<T: GenericBuilder>(&self, query_builder: T) -> Result<String> {
         let columns: Vec<Alias> = (self.record_batches[0])
             .schema()
@@ -380,7 +408,7 @@ impl InsertBuilder {
             .to_owned();
 
         for record_batch in &self.record_batches {
-            self.construct_insert_stmt(&mut insert_stmt, record_batch)?
+            self.construct_insert_stmt(&mut insert_stmt, record_batch)?;
         }
         Ok(insert_stmt.to_string(query_builder))
     }
