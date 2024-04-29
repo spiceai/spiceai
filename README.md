@@ -56,6 +56,10 @@ Spice makes querying data by SQL across one or more data sources simple and fast
 
 **4. Easily query many data sources.** Federated SQL query across databases, data warehouses, and data lakes using [Data Connectors](https://docs.spiceai.org/data-connectors).
 
+### Watch a 30-sec BI dashboard acceleration demo
+
+https://github.com/spiceai/spiceai/assets/80174/7735ee94-3f4a-4983-a98e-fe766e79e03a
+
 ### Supported Data Connectors
 
 Currently supported data connectors for upstream datasets. More coming soon.
