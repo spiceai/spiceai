@@ -29,7 +29,7 @@ var sqlCmd = &cobra.Command{
 	Short: "Start an interactive SQL query session against the Spice.ai runtime",
 	Example: `
 $ spice sql
-Welcome to the interactive Spice.ai SQL Query Utility! Type 'help' for help.
+Welcome to the Spice.ai SQL REPL! Type 'help' for help.
 
 show tables;  -- list available tables
 sql> show tables
