@@ -24,6 +24,7 @@ use arrow::record_batch::RecordBatch;
 use arrow_odbc::arrow_schema_from;
 use arrow_odbc::OdbcReader;
 use arrow_odbc::OdbcReaderBuilder;
+use arrow_odbc::Quirks;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::memory::MemoryStream;
 use datafusion::sql::TableReference;
@@ -172,7 +173,7 @@ fn build_odbc_reader<C: Cursor>(
             .and_then(|p| p.get(k).cloned())
             .and_then(|s| s.parse::<usize>().ok())
             .into_iter()
-            .for_each(|sz| f(sz));
+            .for_each(f);
     };
 
     bind_as_usize("max_binary_size", &mut |s| {
@@ -187,6 +188,17 @@ fn build_odbc_reader<C: Cursor>(
     bind_as_usize("max_num_rows_per_batch", &mut |s| {
         builder.with_max_num_rows_per_batch(s);
     });
+
+    params
+        .as_ref()
+        .and_then(|p| p.get("enable_db2_length_quirk"))
+        .and_then(|q| q.parse::<bool>().ok())
+        .into_iter()
+        .for_each(|b| {
+            builder.with_shims(Quirks {
+                indicators_returned_from_bulk_fetch_are_memory_garbage: b
+            });
+        });
 
     Ok(builder.build(cursor).context(ArrowODBCSnafu)?)
 }

@@ -398,7 +398,8 @@ dependencies = [
 [[package]]
 name = "arrow-odbc"
 version = "9.0.0"
-source = "git+https://github.com/mach-kernel/arrow-odbc.git?branch=042624/bin-text-buf-choose-larger#ba9d6259685b39ea5c9b21a344557c2327daef54"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "44c0f42b7fff9cdd6fcc1ba5a955b5e233ef645d5fe4b636b372e9bb4d36214a"
 dependencies = [
  "arrow",
  "chrono",
