@@ -315,11 +315,16 @@ fn to_execution_error(e: impl Into<Box<dyn std::error::Error + Send + Sync>>) ->
 mod tests {
     use std::{error::Error, sync::Arc};
 
+    use arrow::array::{StringArray, TimestampMicrosecondArray, TimestampSecondArray};
+    use arrow::datatypes::{DataType, Schema};
     use datafusion::execution::context::SessionContext;
     use datafusion::sql::TableReference;
     use db_connection_pool::dbconnection::duckdbconn::DuckDbConnection;
+    use db_connection_pool::dbconnection::sqliteconn::SqliteConnection;
+    use db_connection_pool::sqlitepool::SqliteConnectionPool;
     use db_connection_pool::{duckdbpool::DuckDbConnectionPool, DbConnectionPool, Mode};
     use duckdb::{DuckdbConnectionManager, ToSql};
+
     use tracing::{level_filters::LevelFilter, subscriber::DefaultGuard, Dispatch};
 
     use crate::SqlTable;
@@ -397,5 +402,66 @@ mod tests {
         df.show().await?;
         drop(t);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_table_data_conversion() {
+        let ctx = SessionContext::new();
+        let pool: Arc<dyn DbConnectionPool<_, _> + Send + Sync> = Arc::new(
+            SqliteConnectionPool::new("test", Mode::Memory, Arc::new(Option::None))
+                .await
+                .expect("Sqlite connection pool created"),
+        );
+        let conn = pool.connect().await.expect("Pool connected");
+        let db_conn = conn
+            .as_any()
+            .downcast_ref::<SqliteConnection>()
+            .expect("Unable to downcast to DuckDbConnection");
+        db_conn
+            .conn
+            .call(move |conn| {
+                let transaction = conn.transaction()?;
+                transaction.execute("CREATE TABLE test (a INTEGER, b TEXT);", {})?;
+                transaction.execute(
+                    " INSERT INTO test values (3, '2024-01-13 03:18:09.000000');",
+                    {},
+                )?;
+
+                transaction.commit()?;
+
+                Ok(())
+            })
+            .await
+            .expect("SQLite operation successful");
+
+        let schema = Arc::new(Schema::new(vec![
+            arrow::datatypes::Field::new("a", DataType::Int64, false),
+            arrow::datatypes::Field::new(
+                "b",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+                false,
+            ),
+        ]));
+        let sqlite_table = SqlTable::new_with_schema(&pool, schema, "test");
+        ctx.register_table("test_datafusion", Arc::new(sqlite_table))
+            .expect("Table registered successfully");
+        let sql = "SELECT * FROM test_datafusion";
+        let df = ctx.sql(sql).await.expect("Dataframe created successfully");
+        let result = df
+            .collect()
+            .await
+            .expect("DF return record batch successfully");
+
+        let record_batch = result.first().expect("At least 1 record batch is returned");
+        println!("{:?}", record_batch.schema());
+        let array = record_batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<TimestampSecondArray>()
+            .expect("value is not none");
+        println!("display array");
+        println!("{array:?}");
+        assert_eq!(10, record_batch.num_rows());
+        assert_eq!(2, record_batch.num_columns());
     }
 }

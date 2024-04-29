@@ -6193,6 +6193,7 @@ dependencies = [
  "r2d2",
  "snafu 0.8.2",
  "tokio",
+ "tokio-rusqlite",
  "tracing",
  "tracing-subscriber",
 ]

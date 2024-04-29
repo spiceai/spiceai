@@ -24,7 +24,8 @@ db_connection_pool = { path = "../db_connection_pool" }
 [dev-dependencies]
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 duckdb = { workspace = true, features = ["bundled", "r2d2", "vtab", "vtab-arrow"] }
-db_connection_pool = { path = "../db_connection_pool", features = ["duckdb"] }
+tokio-rusqlite.workspace = true
+db_connection_pool = { path = "../db_connection_pool", features = ["duckdb", "sqlite"] }
 
 [features]
 postgres = ["db_connection_pool/postgres"]
