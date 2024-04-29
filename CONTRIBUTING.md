@@ -92,8 +92,14 @@ brew install protobuf
 git clone https://github.com/spiceai/spiceai.git
 cd spiceai
 
-# Build and install OSS project
+# Build and install OSS project in release mode
 make install
+
+# Build and install OSS project in dev mode
+make install-dev
+
+# Also you can specify specific features
+SPICED_CUSTOM_FEATURES="postgres sqlite" make install
 
 # Run the following to temporarily add spice to your PATH.
 # Add it to the end of your .bashrc or .zshrc to permanently add spice to your PATH.
