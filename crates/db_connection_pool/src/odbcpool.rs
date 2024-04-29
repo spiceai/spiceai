@@ -70,7 +70,11 @@ where
 {
     async fn connect(&self) -> Result<Box<ODBCDbConnection<'a>>> {
         if let Some(params) = self.params.as_ref() {
-            let odbc_url = params.get("odbc_url").expect("Must provide URL");
+            let odbc_url = params
+                .get("odbc_url")
+                .ok_or(Error::MissingRequiredParameter {
+                    parameter_name: "odbc_url".to_string(),
+                })?;
             let cxn = self
                 .pool
                 .connect_with_connection_string(odbc_url.as_str(), ConnectionOptions::default())?;
