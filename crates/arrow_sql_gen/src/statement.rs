@@ -331,17 +331,35 @@ impl InsertBuilder {
 
     #[must_use]
     pub fn build_postgres(self) -> String {
-        self.build(PostgresQueryBuilder).unwrap_or_default()
+        match self.build(PostgresQueryBuilder) {
+            Ok(sql) => sql,
+            Err(e) => {
+                tracing::error!("Failed to build PostgreSQL insert statement: {}", e);
+                String::default()
+            }
+        }
     }
 
     #[must_use]
     pub fn build_sqlite(self) -> String {
-        self.build(SqliteQueryBuilder).unwrap_or_default()
+        match self.build(SqliteQueryBuilder) {
+            Ok(sql) => sql,
+            Err(e) => {
+                tracing::error!("Failed to build SQLite insert statement: {}", e);
+                String::default()
+            }
+        }
     }
 
     #[must_use]
     pub fn build_mysql(self) -> String {
-        self.build(MysqlQueryBuilder).unwrap_or_default()
+        match self.build(MysqlQueryBuilder) {
+            Ok(sql) => sql,
+            Err(e) => {
+                tracing::error!("Failed to build MySQL insert statement: {}", e);
+                String::default()
+            }
+        }
     }
 
     #[must_use]
