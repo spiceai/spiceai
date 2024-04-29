@@ -41,16 +41,6 @@ pub fn to_sql_with_engine(expr: &Expr, engine: Option<Engine>) -> Result<String>
         Expr::BinaryExpr(binary_expr) => {
             let left = to_sql_with_engine(&binary_expr.left, engine)?;
             let right = to_sql_with_engine(&binary_expr.right, engine)?;
-
-            if let Some(Engine::DuckDB) = engine {
-                if right.starts_with("TO_TIMESTAMP") && !left.starts_with("TO_TIMESTAMP") {
-                    return Ok(format!(
-                        "TO_TIMESTAMP(EPOCH({})) {} {}",
-                        left, binary_expr.op, right
-                    ));
-                }
-            }
-
             Ok(format!("{} {} {}", left, binary_expr.op, right))
         }
         Expr::Column(name) => match engine {
