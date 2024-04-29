@@ -27,6 +27,8 @@ pub mod clickhouseconn;
 pub mod duckdbconn;
 #[cfg(feature = "mysql")]
 pub mod mysqlconn;
+#[cfg(feature = "odbc")]
+pub mod odbcconn;
 #[cfg(feature = "postgres")]
 pub mod postgresconn;
 #[cfg(feature = "sqlite")]
