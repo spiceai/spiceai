@@ -61,7 +61,7 @@ docker-run:
 .PHONY: deps-licenses
 dep-licenses:
 	@cargo install cargo-license --quiet
-	@cargo license -d 
+	@cargo license -d
 
 .PHONY: display-deps
 display-deps:
@@ -95,7 +95,7 @@ install-runtime: build-runtime
 install-dev: build-dev
 	mkdir -p ~/.spice/bin
 	install -m 755 target/release/spice ~/.spice/bin/spice
-	install -m 755 target/release/spiced ~/.spice/bin/spiced
+	install -m 755 target/debug/spiced ~/.spice/bin/spiced
 
 ################################################################################
 # Target: modtidy                                                              #

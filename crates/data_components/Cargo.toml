@@ -53,4 +53,6 @@ postgres = ["dep:bb8", "dep:bb8-postgres", "dep:postgres-native-tls", "arrow_sql
 mysql = ["dep:mysql_async", "arrow_sql_gen/mysql"]
 sqlite = ["dep:rusqlite", "dep:tokio-rusqlite", "arrow_sql_gen/sqlite"]
 clickhouse = ["dep:clickhouse-rs", "arrow_sql_gen/clickhouse"]
-databricks = ["dep:spark-connect-rs", "dep:deltalake"]
+spark_connect = ["dep:spark-connect-rs"]
+databricks = ["dep:deltalake", "spark_connect"]
+
