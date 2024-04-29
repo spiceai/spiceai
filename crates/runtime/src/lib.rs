@@ -323,7 +323,7 @@ impl Runtime {
         .await
         {
             Ok(()) => {
-                tracing::info!("Loaded dataset: {}", &ds.name);
+                tracing::info!("Loaded dataset {}", &ds.name);
                 let engine = ds.acceleration.map_or_else(
                     || "None".to_string(),
                     |acc| {
@@ -370,7 +370,7 @@ impl Runtime {
             }
         }
 
-        tracing::info!("Unloaded dataset: {}", &ds.name);
+        tracing::info!("Unloaded dataset {}", &ds.name);
         let engine = ds.acceleration.as_ref().map_or_else(
             || "None".to_string(),
             |acc| {
@@ -387,11 +387,10 @@ impl Runtime {
     pub async fn update_dataset(&self, ds: &Dataset, all_datasets: &[Dataset]) {
         status::update_dataset(&ds.name, status::ComponentStatus::Refreshing);
         if let Ok(connector) = self.load_dataset_connector(ds, all_datasets).await {
-            if ds.is_file_accelerated() {
-                tracing::warn!("File accelerated datasets currently don't support hot reload, falling back to full dataset reload");
-            } else if ds.is_accelerated() {
-                tracing::info!("Hot reloading accelerated dataset: {}...", &ds.name);
+            tracing::info!("Updating accelerated dataset {}...", &ds.name);
 
+            // File accelerated datasets don't support hot reload.
+            if ds.is_accelerated() {
                 if let Ok(()) = &self
                     .reload_accelerated_dataset(ds, Arc::clone(&connector))
                     .await
@@ -399,10 +398,8 @@ impl Runtime {
                     status::update_dataset(&ds.name, status::ComponentStatus::Ready);
                     return;
                 }
-                tracing::error!("Failed to create accelerated table for dataset {}, falling back to full dataset reload", ds.name);
+                tracing::debug!("Failed to create accelerated table for dataset {}, falling back to full dataset reload", ds.name);
             }
-
-            tracing::info!("Updating dataset: {}...", &ds.name);
 
             self.remove_dataset(ds).await;
 
@@ -443,7 +440,7 @@ impl Runtime {
             .await
             .context(UnableToReceiveAcceleratedTableStatusSnafu)?;
 
-        tracing::info!("Accelerated table for dataset {} is ready", ds.name);
+        tracing::debug!("Accelerated table for dataset {} is ready", ds.name);
 
         self.register_loaded_dataset(ds, Arc::clone(&connector), Some(accelerated_table))
             .await?;

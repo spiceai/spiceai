@@ -41,7 +41,7 @@ pub mod mysql;
 pub mod odbc;
 #[cfg(feature = "postgres")]
 pub mod postgres;
-#[cfg(feature = "databricks")]
+#[cfg(feature = "spark_connect")]
 pub mod spark_connect;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
