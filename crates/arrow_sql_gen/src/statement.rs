@@ -167,6 +167,18 @@ impl InsertBuilder {
                             );
                         }
                     }
+                    DataType::Date32 => {
+                        let array = column.as_any().downcast_ref::<array::Date32Array>();
+                        if let Some(valid_array) = array {
+                            row_values.push(
+                                match OffsetDateTime::from_unix_timestamp(valid_array.value(row) as i64 * 86_400) {
+                                    Ok(offset_time) => offset_time.date().into(),
+                                    Err(_) => return,
+                                }
+                                    
+                            );
+                        }
+                    }
                     DataType::Timestamp(_, _) => {
                         let array = column
                             .as_any()
@@ -349,6 +361,7 @@ fn map_data_type_to_column_type(data_type: &DataType) -> ColumnType {
         #[allow(clippy::cast_sign_loss)] // This is safe because scale will never be negative
         DataType::Decimal128(p, s) => ColumnType::Decimal(Some((u32::from(*p), *s as u32))),
         DataType::Timestamp(_unit, _time_zone) => ColumnType::Timestamp,
+        DataType::Date32 | DataType::Date64 => ColumnType::Date,
         DataType::List(list_type) => {
             ColumnType::Array(map_data_type_to_column_type(list_type.data_type()).into())
         }
