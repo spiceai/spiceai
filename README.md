@@ -166,7 +166,7 @@ dependencies:
 The `spiceai/quickstart` Spicepod will add a `taxi_trips` data table to the runtime which is now available to query by SQL.
 
 ```bash
-2024-02-22T05:53:48.222952Z  INFO runtime: Loaded dataset: taxi_trips
+2024-02-22T05:53:48.222952Z  INFO runtime: Loaded dataset taxi_trips
 2024-02-22T05:53:48.223101Z  INFO runtime::dataconnector: Refreshing data for taxi_trips
 ```
 
@@ -195,7 +195,7 @@ sql> show tables
 | taxi_trips |
 +------------+
 
-Query took: 0.007505084 seconds. 1/1 rows displayed.
+Time: 0.007505084 seconds. 1/1 rows displayed.
 ```
 
 Enter a query to display the longest taxi trips:
@@ -222,7 +222,7 @@ Output:
 | 44018.64      | 52.43        |
 +---------------+--------------+
 
-Query took: 0.002458976 seconds
+Time: 0.002458976 seconds
 ```
 
 ## ⚙️ Runtime Container Deployment
@@ -318,7 +318,7 @@ Locally accelerate (y/n)? y
 You should see the following output from your runtime terminal:
 
 ```bash
-2024-02-21T22:49:10.038461Z  INFO runtime: Loaded dataset: eth_recent_blocks
+2024-02-21T22:49:10.038461Z  INFO runtime: Loaded dataset eth_recent_blocks
 ```
 
 **Step 4.** In a new terminal window, use the Spice SQL REPL to query the dataset
@@ -349,7 +349,7 @@ The output displays the results of the query along with the query execution time
 | 19281336 | 150137 | 13418403 |
 +----------+--------+----------+
 
-Query took: 0.004057791 seconds
+Time: 0.004057791 seconds
 ```
 
 You can experiment with the time it takes to generate queries when using non-accelerated datasets. You can change the acceleration setting from `true` to `false` in the datasets.yaml file.
