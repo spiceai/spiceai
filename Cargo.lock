@@ -2252,9 +2252,9 @@ dependencies = [
 
 [[package]]
 name = "datafusion-proto"
-version = "37.0.0"
+version = "37.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "36f381c59c265e3aa615c8f67bf4412f02b694f13499e46dad75dc35e6c32324"
+checksum = "db73393e42f35e165d31399192fbf41691967d428ebed47875ad34239fbcfc16"
 dependencies = [
  "arrow",
  "chrono",
@@ -2313,7 +2313,7 @@ dependencies = [
 [[package]]
 name = "deltalake"
 version = "0.17.1"
-source = "git+https://github.com/spiceai/delta-rs.git?rev=30c52fe9408de8d96b4618c336c2202e896a967b#30c52fe9408de8d96b4618c336c2202e896a967b"
+source = "git+https://github.com/delta-io/delta-rs.git?rev=9d3ecbeb628db3d046d86429315aaf4765f6a41b#9d3ecbeb628db3d046d86429315aaf4765f6a41b"
 dependencies = [
  "deltalake-aws",
  "deltalake-azure",
@@ -2323,7 +2323,7 @@ dependencies = [
 [[package]]
 name = "deltalake-aws"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/delta-rs.git?rev=30c52fe9408de8d96b4618c336c2202e896a967b#30c52fe9408de8d96b4618c336c2202e896a967b"
+source = "git+https://github.com/delta-io/delta-rs.git?rev=9d3ecbeb628db3d046d86429315aaf4765f6a41b#9d3ecbeb628db3d046d86429315aaf4765f6a41b"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -2349,7 +2349,7 @@ dependencies = [
 [[package]]
 name = "deltalake-azure"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/delta-rs.git?rev=30c52fe9408de8d96b4618c336c2202e896a967b#30c52fe9408de8d96b4618c336c2202e896a967b"
+source = "git+https://github.com/delta-io/delta-rs.git?rev=9d3ecbeb628db3d046d86429315aaf4765f6a41b#9d3ecbeb628db3d046d86429315aaf4765f6a41b"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2367,7 +2367,7 @@ dependencies = [
 [[package]]
 name = "deltalake-core"
 version = "0.17.1"
-source = "git+https://github.com/spiceai/delta-rs.git?rev=30c52fe9408de8d96b4618c336c2202e896a967b#30c52fe9408de8d96b4618c336c2202e896a967b"
+source = "git+https://github.com/delta-io/delta-rs.git?rev=9d3ecbeb628db3d046d86429315aaf4765f6a41b#9d3ecbeb628db3d046d86429315aaf4765f6a41b"
 dependencies = [
  "arrow",
  "arrow-arith",
