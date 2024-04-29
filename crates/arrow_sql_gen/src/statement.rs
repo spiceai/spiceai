@@ -179,6 +179,18 @@ impl InsertBuilder {
                             );
                         }
                     }
+                    DataType::Date64 => {
+                        let array = column.as_any().downcast_ref::<array::Date64Array>();
+                        if let Some(valid_array) = array {
+                            row_values.push(
+                                match OffsetDateTime::from_unix_timestamp(valid_array.value(row) as i64 * 86_400) {
+                                    Ok(offset_time) => offset_time.date().into(),
+                                    Err(_) => return,
+                                }
+                                    
+                            );
+                        }
+                    }
                     DataType::Timestamp(_, _) => {
                         let array = column
                             .as_any()
