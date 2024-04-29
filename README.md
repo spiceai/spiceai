@@ -73,6 +73,7 @@ Currently supported data connectors for upstream datasets. More coming soon.
 | `dremio`     | [Dremio](https://github.com/spiceai/quickstarts/tree/trunk/dremio#readme)                      | Alpha        | Arrow Flight                                                                                       | `full`           |
 | `mysql`      | MySQL                                                                                          | Alpha        |                                                                                                    | `full`           |
 | `duckdb`     | DuckDB                                                                                         | Alpha        |                                                                                                    | `full`           |
+| `clickhouse` | Clickhouse                                                                                     | Alpha        |                                                                                                    | `full`           |
 | `snowflake`  | Snowflake                                                                                      | Coming soon! | Arrow Flight SQL                                                                                   | `full`           |
 | `bigquery`   | BigQuery                                                                                       | Coming soon! | Arrow Flight SQL                                                                                   | `full`           |
 
