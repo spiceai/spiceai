@@ -340,7 +340,7 @@ impl DataFusion {
                 dataset.refresh_check_interval(),
                 refresh_sql.clone(),
                 acceleration_settings.refresh_mode.clone(),
-                dataset.refresh_data_period(),
+                dataset.refresh_lookback_window(),
             ),
         );
         accelerated_table_builder.object_store(obj_store);
