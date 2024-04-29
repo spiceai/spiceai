@@ -36,6 +36,9 @@ use sea_query::{
 pub enum Error {
     #[snafu(display("Failed to build insert statement: {source}"))]
     FailedToCreateInsertStatement { source: Box<dyn std::error::Error> },
+
+    #[snafu(display("Unimplemented data type in insert statement: {data_type:?}"))]
+    UnimplementedDataTypeInInsertStatement { data_type: DataType },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -317,7 +320,7 @@ impl InsertBuilder {
                             }
                         }
                     }
-                    _ => return Result::Err(Error::FailedToCreateInsertStatement { source: format!("Data type mapping not implemented for {}", column.data_type()).into() }) 
+                    unimplemented_type => return Result::Err(Error::UnimplementedDataTypeInInsertStatement { data_type: unimplemented_type.clone()}) 
                 }
             }
             match insert_stmt.values(row_values) {
@@ -377,10 +380,7 @@ impl InsertBuilder {
             .to_owned();
 
         for record_batch in &self.record_batches {
-            match self.construct_insert_stmt(&mut insert_stmt, record_batch) {
-                Ok(_) => (),
-                Err(e) => return Err(e),
-            }
+            self.construct_insert_stmt(&mut insert_stmt, record_batch)?
         }
         Ok(insert_stmt.to_string(query_builder))
     }
