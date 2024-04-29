@@ -40,7 +40,7 @@ data = [
     [1705352433999, 1609459201999, None],  # f_date64
     [1705352433000, 1609459200001, None],  # f_timestamp_ms
     # [8639, 0, None],  # f_time32_ms
-    # [86399999999, 0, None],  # f_time64_us
+    [86399999999, 0, None],  # f_time64_us
     ['hello', 'world', None],  # f_string
     [b'abc', b'def', None],  # f_binary
     [Decimal('99999.99'), Decimal('-99999.99'), None],  # f_decimal128
@@ -55,6 +55,7 @@ pq.write_table(table, 'arrow_types.parquet')
 
 print("Successfully generated 'arrow_types.parquet'")
 
+print("Exporting generated data to DuckDB database..")
 if os.path.exists('arrow_types.db'):
     os.remove('arrow_types.db')
 
