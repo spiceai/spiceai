@@ -32,6 +32,7 @@ pub enum Engine {
     Spark,
     SQLite,
     DuckDB,
+    ODBC,
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -55,7 +56,7 @@ pub fn to_sql_with_engine(expr: &Expr, engine: Option<Engine>) -> Result<String>
             Ok(format!("{} {} {}", left, binary_expr.op, right))
         }
         Expr::Column(name) => match engine {
-            Some(Engine::Spark) => Ok(format!("{name}")),
+            Some(Engine::Spark | Engine::ODBC) => Ok(format!("{name}")),
             _ => Ok(format!("\"{name}\"")),
         },
         Expr::Cast(cast) => {
@@ -63,6 +64,10 @@ pub fn to_sql_with_engine(expr: &Expr, engine: Option<Engine>) -> Result<String>
                 arrow::datatypes::DataType::Timestamp(_, Some(_) | None) => match engine {
                     None => Ok(format!(
                         "CAST({} AS TIMESTAMPTZ)",
+                        to_sql_with_engine(&cast.expr, engine)?,
+                    )),
+                    Some(Engine::ODBC) => Ok(format!(
+                        "CAST({} AS TIMESTAMP)",
                         to_sql_with_engine(&cast.expr, engine)?,
                     )),
                     // This needs to match the timestamp conversion below
@@ -101,6 +106,12 @@ pub fn to_sql_with_engine(expr: &Expr, engine: Option<Engine>) -> Result<String>
             ScalarValue::UInt16(Some(value)) => Ok(value.to_string()),
             ScalarValue::UInt32(Some(value)) => Ok(value.to_string()),
             ScalarValue::UInt64(Some(value)) => Ok(value.to_string()),
+            ScalarValue::TimestampNanosecond(Some(value), None | Some(_)) => match engine {
+                Some(Engine::SQLite) => {
+                    Ok(format!("datetime({}, 'unixepoch')", value / 1_000_000_000))
+                }
+                _ => Ok(format!("TO_TIMESTAMP({})", value / 1_000_000_000)),
+            },
             ScalarValue::TimestampMillisecond(Some(value), None | Some(_)) => match engine {
                 Some(Engine::SQLite) => Ok(format!("datetime({}, 'unixepoch')", value / 1000)),
                 _ => Ok(format!("TO_TIMESTAMP({})", value / 1000)),

@@ -26,7 +26,10 @@ use clickhouse_rs::{ClientHandle, Options, Pool};
 use secrets::Secret;
 use snafu::{ResultExt, Snafu};
 
-use crate::dbconnection::{clickhouseconn::ClickhouseConnection, AsyncDbConnection, DbConnection};
+use crate::{
+    dbconnection::{clickhouseconn::ClickhouseConnection, AsyncDbConnection, DbConnection},
+    get_secret_or_param,
+};
 
 use super::{DbConnectionPool, Result};
 
@@ -100,7 +103,7 @@ fn get_config_from_params(
 ) -> Result<Options> {
     let options: Option<Options>;
     if let Some(clickhouse_connection_string) = get_secret_or_param(
-        params,
+        Some(params),
         secret,
         "clickhouse_connection_string_key",
         "clickhouse_connection_string",
@@ -119,12 +122,15 @@ fn get_config_from_params(
                 .ok_or(Error::MissingRequiredParameterForConnection {
                     parameter_name: "clickhouse_user".to_string(),
                 })?;
-        let password =
-            get_secret_or_param(params, secret, "clickhouse_pass_key", "clickhouse_pass").ok_or(
-                Error::MissingRequiredParameterForConnection {
-                    parameter_name: "clickhouse_pass".to_string(),
-                },
-            )?;
+        let password = get_secret_or_param(
+            Some(params),
+            secret,
+            "clickhouse_pass_key",
+            "clickhouse_pass",
+        )
+        .ok_or(Error::MissingRequiredParameterForConnection {
+            parameter_name: "clickhouse_pass".to_string(),
+        })?;
         let host =
             params
                 .get("clickhouse_host")
@@ -172,32 +178,6 @@ fn get_config_from_params(
     options = options.secure(secure.unwrap_or(true));
 
     Ok(options)
-}
-
-#[must_use]
-#[allow(clippy::implicit_hasher)]
-pub fn get_secret_or_param(
-    params: &HashMap<String, String>,
-    secret: &Option<Secret>,
-    secret_param_key: &str,
-    param_key: &str,
-) -> Option<String> {
-    let clickhouse_secret_param_val = match params.get(secret_param_key) {
-        Some(val) => val,
-        None => param_key,
-    };
-
-    if let Some(secrets) = secret {
-        if let Some(clickhouse_secret_val) = secrets.get(clickhouse_secret_param_val) {
-            return Some(clickhouse_secret_val.to_string());
-        };
-    };
-
-    if let Some(clickhouse_secret_val) = params.get(param_key) {
-        return Some(clickhouse_secret_val.to_string());
-    };
-
-    None
 }
 
 #[async_trait]
