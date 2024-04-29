@@ -51,6 +51,8 @@ pub mod mysql;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 pub mod s3;
+#[cfg(feature = "spark")]
+pub mod spark;
 pub mod spiceai;
 
 #[derive(Debug, Snafu)]
@@ -155,6 +157,8 @@ pub async fn register_all() {
     register_connector_factory("duckdb", duckdb::DuckDB::create).await;
     #[cfg(feature = "clickhouse")]
     register_connector_factory("clickhouse", clickhouse::Clickhouse::create).await;
+    #[cfg(feature = "spark")]
+    register_connector_factory("spark", spark::Spark::create).await;
 }
 
 pub trait DataConnectorFactory {
