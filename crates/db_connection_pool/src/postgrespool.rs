@@ -29,7 +29,10 @@ use secrets::Secret;
 use snafu::{prelude::*, ResultExt};
 
 use super::{DbConnectionPool, Result};
-use crate::dbconnection::{postgresconn::PostgresConnection, AsyncDbConnection, DbConnection};
+use crate::{
+    dbconnection::{postgresconn::PostgresConnection, AsyncDbConnection, DbConnection},
+    get_secret_or_param,
+};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -81,7 +84,7 @@ impl PostgresConnectionPool {
             connection_string = String::new();
 
             if let Some(pg_connection_string) = get_secret_or_param(
-                params,
+                Some(params),
                 &secret,
                 "pg_connection_string_key",
                 "pg_connection_string",
@@ -98,7 +101,7 @@ impl PostgresConnectionPool {
                     connection_string.push_str(format!("dbname={pg_db} ").as_str());
                 }
                 if let Some(pg_pass) =
-                    get_secret_or_param(params, &secret, "pg_pass_key", "pg_pass")
+                    get_secret_or_param(Some(params), &secret, "pg_pass_key", "pg_pass")
                 {
                     connection_string.push_str(format!("password={pg_pass} ").as_str());
                 }
@@ -238,32 +241,6 @@ where
     fn boxed_clone(&self) -> Box<dyn ErrorSink<E>> {
         Box::new(*self)
     }
-}
-
-#[must_use]
-#[allow(clippy::implicit_hasher)]
-pub fn get_secret_or_param(
-    params: &HashMap<String, String>,
-    secret: &Option<Secret>,
-    secret_param_key: &str,
-    param_key: &str,
-) -> Option<String> {
-    let pg_secret_param_val = match params.get(secret_param_key) {
-        Some(val) => val,
-        None => param_key,
-    };
-
-    if let Some(secrets) = secret {
-        if let Some(pg_secret_val) = secrets.get(pg_secret_param_val) {
-            return Some(pg_secret_val.to_string());
-        };
-    };
-
-    if let Some(pg_param_val) = params.get(param_key) {
-        return Some(pg_param_val.to_string());
-    };
-
-    None
 }
 
 #[async_trait]

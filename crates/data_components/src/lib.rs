@@ -37,9 +37,11 @@ pub mod flight;
 pub mod flightsql;
 #[cfg(feature = "mysql")]
 pub mod mysql;
+#[cfg(feature = "odbc")]
+pub mod odbc;
 #[cfg(feature = "postgres")]
 pub mod postgres;
-#[cfg(feature = "databricks")]
+#[cfg(feature = "spark_connect")]
 pub mod spark_connect;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
