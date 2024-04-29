@@ -420,7 +420,7 @@ impl AcceleratedTable {
                     let plan = federated.scan(&ctx.state(), None, &[], None).await.context(UnableToScanTableProviderSnafu {})?;
 
                     if plan.output_partitioning().partition_count() > 1 {
-                        tracing::error!("Append is not supported for tables with multiple partitions: {dataset_name}");
+                        tracing::error!("Append mode is not supported for datasets with multiple partitions: {dataset_name}");
                         return;
                     }
 
@@ -437,7 +437,7 @@ impl AcceleratedTable {
                                 });
                             }
                             Some(Err(e)) => {
-                                tracing::error!("Error reading data for {dataset_name}: {e}");
+                                tracing::error!("Error reading data for dataset {dataset_name}: {e}");
                                 yield Err(Error::UnableToScanTableProvider { source: e });
                             }
                             None => break,
@@ -453,7 +453,7 @@ impl AcceleratedTable {
                     let mut refresh_stream = ReceiverStream::new(receiver);
 
                     while refresh_stream.next().await.is_some() {
-                        tracing::info!("[refresh] Refreshing data for {dataset_name}");
+                        tracing::info!("[refresh] Loading data for dataset {dataset_name}");
                         status::update_dataset(&dataset_name, status::ComponentStatus::Refreshing);
                         let timer = TimeMeasurement::new("load_dataset_duration_ms", vec![("dataset", dataset_name.clone())]);
                         let filters = match (refresh.period, filter_converter.as_ref()){
@@ -461,7 +461,7 @@ impl AcceleratedTable {
                                 let start = SystemTime::now() - period;
 
                                 let Ok(timestamp) = get_timestamp(start) else {
-                                    tracing::error!("[refresh] Failed to get timestamp");
+                                    tracing::error!("[refresh] Failed to calculate timestamp of refresh period start");
                                     continue;
                                 };
                                 vec![converter.convert(timestamp, Operator::Gt)]
@@ -472,7 +472,7 @@ impl AcceleratedTable {
                         let data = match get_data(&mut ctx, OwnedTableReference::bare(dataset_name.clone()), Arc::clone(&federated), refresh.sql.clone(), filters).await {
                             Ok(data) => data,
                             Err(e) => {
-                                tracing::error!("[refresh] Error refreshing data for {dataset_name}: {e}");
+                                tracing::error!("[refresh] Failed to load data for dataset {dataset_name}: {e}");
                                 yield Err(Error::UnableToGetDataFromConnector { source: e });
                                 continue;
                             }
