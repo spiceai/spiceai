@@ -129,6 +129,7 @@ where
 
         bind_parameters(&mut statement, params);
 
+        // StatementImpl<'_>::execute is unsafe, CursorImpl<_>::new is unsafe
         let cursor = unsafe {
             statement.execute().unwrap();
             CursorImpl::new(statement.as_stmt_ref())
@@ -196,13 +197,16 @@ fn build_odbc_reader<C: Cursor>(
         .into_iter()
         .for_each(|b| {
             builder.with_shims(Quirks {
-                indicators_returned_from_bulk_fetch_are_memory_garbage: b
+                indicators_returned_from_bulk_fetch_are_memory_garbage: b,
             });
         });
 
     Ok(builder.build(cursor).context(ArrowODBCSnafu)?)
 }
 
+/// Binds parameter to an ODBC statement.
+///
+/// StatementImpl<'_>::bind_input_parameter is unsafe.
 fn bind_parameters(statement: &mut StatementImpl, params: &[ODBCParameter]) {
     for (i, param) in params.iter().enumerate() {
         unsafe {

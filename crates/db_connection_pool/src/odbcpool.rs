@@ -40,7 +40,7 @@ lazy_static! {
 pub enum Error {
     #[snafu(display("Invalid parameter: {parameter_name}"))]
     InvalidParameterError { parameter_name: String },
-    
+
     #[snafu(display("Missing required parameter: {parameter_name}"))]
     MissingRequiredParameter { parameter_name: String },
 }
