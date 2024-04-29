@@ -16,8 +16,10 @@ limitations under the License.
 
 use crate::dbconnection::odbcconn::ODBCConnection;
 use crate::dbconnection::odbcconn::{ODBCDbConnection, ODBCParameter};
+use crate::get_secret_or_param;
 use async_trait::async_trait;
 use odbc_api::{sys::AttrConnectionPooling, Connection, ConnectionOptions, Environment};
+use secrets::Secret;
 use snafu::prelude::*;
 use std::{collections::HashMap, sync::Arc};
 
@@ -53,7 +55,8 @@ pub enum Error {
 
 pub struct ODBCPool {
     pool: &'static Environment,
-    params: Arc<Option<HashMap<String, String>>>,
+    params: Option<HashMap<String, String>>,
+    connection_string: String,
 }
 
 impl ODBCPool {
@@ -62,9 +65,22 @@ impl ODBCPool {
     /// # Errors
     ///
     /// Returns an error if there is a problem creating the connection pool.
-    #[must_use]
-    pub fn new(params: Arc<Option<HashMap<String, String>>>) -> Self {
-        Self { params, pool: &ENV }
+    pub fn new(
+        params: &Arc<Option<HashMap<String, String>>>,
+        secret: &Option<Secret>,
+    ) -> Result<Self> {
+        let connection_string = get_secret_or_param(
+            params.as_ref().as_ref(),
+            secret,
+            "odbc_connection_string_key",
+            "odbc_connection_string",
+        )
+        .context(MissingConnectionStringSnafu)?;
+        Ok(Self {
+            params: params.as_ref().clone(),
+            connection_string,
+            pool: &ENV,
+        })
     }
 
     #[must_use]
@@ -79,26 +95,16 @@ where
     'a: 'static,
 {
     async fn connect(&self) -> Result<Box<ODBCDbConnection<'a>>> {
-        if let Some(params) = self.params.as_ref() {
-            let odbc_connection_string = params
-                .get("odbc_connection_string")
-                .context(MissingConnectionStringSnafu {})?;
-            let cxn = self.pool.connect_with_connection_string(
-                odbc_connection_string.as_str(),
-                ConnectionOptions::default(),
-            )?;
+        let cxn = self.pool.connect_with_connection_string(
+            &self.connection_string,
+            ConnectionOptions::default(),
+        )?;
 
-            let odbc_cxn = ODBCConnection {
-                conn: Arc::new(cxn.into()),
-                params: Some(params.clone()),
-            };
+        let odbc_cxn = ODBCConnection {
+            conn: Arc::new(cxn.into()),
+            params: self.params.clone(),
+        };
 
-            Ok(Box::new(odbc_cxn))
-        } else {
-            InvalidParameterSnafu {
-                parameter_name: "odbc_connection_string".to_string(),
-            }
-            .fail()?
-        }
+        Ok(Box::new(odbc_cxn))
     }
 }

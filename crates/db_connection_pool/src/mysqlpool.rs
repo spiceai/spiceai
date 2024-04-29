@@ -24,7 +24,10 @@ use mysql_async::{
 use secrets::Secret;
 use snafu::{ResultExt, Snafu};
 
-use crate::dbconnection::{mysqlconn::MySQLConnection, AsyncDbConnection, DbConnection};
+use crate::{
+    dbconnection::{mysqlconn::MySQLConnection, AsyncDbConnection, DbConnection},
+    get_secret_or_param,
+};
 
 use super::{DbConnectionPool, Result};
 
@@ -64,7 +67,7 @@ impl MySQLConnectionPool {
 
         if let Some(params) = params.as_ref() {
             if let Some(mysql_connection_string) = get_secret_or_param(
-                params,
+                Some(params),
                 &secret,
                 "mysql_connection_string_key",
                 "mysql_connection_string",
@@ -83,7 +86,7 @@ impl MySQLConnectionPool {
                     connection_string = connection_string.db_name(Some(mysql_db));
                 }
                 if let Some(mysql_pass) =
-                    get_secret_or_param(params, &secret, "mysql_pass_key", "mysql_pass")
+                    get_secret_or_param(Some(params), &secret, "mysql_pass_key", "mysql_pass")
                 {
                     connection_string = connection_string.pass(Some(mysql_pass));
                 }
@@ -159,32 +162,6 @@ fn get_ssl_opts(ssl_mode: &str, rootcert_path: Option<PathBuf>) -> Option<SslOpt
     }
 
     Some(opts)
-}
-
-#[must_use]
-#[allow(clippy::implicit_hasher)]
-pub fn get_secret_or_param(
-    params: &HashMap<String, String>,
-    secret: &Option<Secret>,
-    secret_param_key: &str,
-    param_key: &str,
-) -> Option<String> {
-    let mysql_secret_param_val = match params.get(secret_param_key) {
-        Some(val) => val,
-        None => param_key,
-    };
-
-    if let Some(secrets) = secret {
-        if let Some(mysql_secret_val) = secrets.get(mysql_secret_param_val) {
-            return Some(mysql_secret_val.to_string());
-        };
-    };
-
-    if let Some(mysql_secret_val) = params.get(param_key) {
-        return Some(mysql_secret_val.to_string());
-    };
-
-    None
 }
 
 #[async_trait]
