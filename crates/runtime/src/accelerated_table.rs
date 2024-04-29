@@ -89,12 +89,12 @@ fn validate_refresh_data_window(refresh: &Refresh, dataset: &str, schema: &Schem
         if let Some(time_column) = &refresh.time_column {
             if schema.column_with_name(time_column).is_none() {
                 tracing::warn!(
-                    "No matching column found for {time_column} in the source table, refresh_data_window will be ignored for {dataset}"
+                    "No matching column {time_column} found in the source table, refresh_data_window will be ignored for dataset {dataset}"
                 );
             }
         } else {
             tracing::warn!(
-                "No time_column is provided, refresh_data_window will be ignored for {dataset}"
+                "No time_column was provided, refresh_data_window will be ignored for {dataset}"
             );
         }
     }
