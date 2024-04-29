@@ -79,7 +79,12 @@ impl SyncDbConnection<r2d2::PooledConnection<DuckdbConnectionManager>, &dyn ToSq
         Ok(result.get_schema())
     }
 
-    fn query_arrow(&self, sql: &str, params: &[&dyn ToSql]) -> Result<SendableRecordBatchStream> {
+    fn query_arrow(
+        &self,
+        sql: &str,
+        params: &[&dyn ToSql],
+        _schema: SchemaRef,
+    ) -> Result<SendableRecordBatchStream> {
         let mut stmt = self.conn.prepare(sql).context(DuckDBSnafu)?;
 
         let result: duckdb::Arrow<'_> = stmt.query_arrow(params).context(DuckDBSnafu)?;

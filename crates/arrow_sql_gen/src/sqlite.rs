@@ -21,14 +21,22 @@ use arrow::array::ArrayBuilder;
 use arrow::array::ArrayRef;
 use arrow::array::BinaryBuilder;
 use arrow::array::Float64Builder;
+use arrow::array::Int32Builder;
 use arrow::array::Int64Builder;
+use arrow::array::LargeStringBuilder;
 use arrow::array::NullBuilder;
+
 use arrow::array::RecordBatch;
 use arrow::array::RecordBatchOptions;
 use arrow::array::StringBuilder;
+use arrow::array::TimestampMicrosecondBuilder;
+
 use arrow::datatypes::DataType;
 use arrow::datatypes::Field;
 use arrow::datatypes::Schema;
+use arrow::datatypes::SchemaRef;
+
+use chrono::NaiveDateTime;
 use rusqlite::types::Type;
 use rusqlite::Row;
 use rusqlite::Rows;
@@ -50,6 +58,9 @@ pub enum Error {
 
     #[snafu(display("Failed to extract column name: {source}"))]
     FailedToExtractColumnName { source: rusqlite::Error },
+
+    #[snafu(display("Failed to parse timestamp: {source}"))]
+    FailedToParseTimestamp { source: chrono::ParseError },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -60,7 +71,11 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// # Errors
 ///
 /// Returns an error if there is a failure in converting the rows to a `RecordBatch`.
-pub fn rows_to_arrow(mut rows: Rows, num_cols: usize) -> Result<RecordBatch> {
+pub fn rows_to_arrow(
+    mut rows: Rows,
+    num_cols: usize,
+    to_schema: Option<&SchemaRef>,
+) -> Result<RecordBatch> {
     let mut arrow_fields: Vec<Field> = Vec::new();
     let mut arrow_columns_builders: Vec<Box<dyn ArrayBuilder>> = Vec::new();
     let mut sqlite_types: Vec<Type> = Vec::new();
@@ -77,7 +92,13 @@ pub fn rows_to_arrow(mut rows: Rows, num_cols: usize) -> Result<RecordBatch> {
                 .column_name(i)
                 .context(FailedToExtractColumnNameSnafu)?
                 .to_string();
-            let data_type = map_column_type_to_data_type(column_type);
+            let data_type = match to_schema {
+                None => map_column_type_to_data_type(column_type),
+                Some(to_schema) => match to_schema.column_with_name(&column_name) {
+                    Some((_, field)) => field.data_type().clone(),
+                    None => map_column_type_to_data_type(column_type),
+                },
+            };
 
             arrow_fields.push(Field::new(column_name, data_type.clone(), true));
             arrow_columns_builders.push(map_data_type_to_array_builder(&data_type));
@@ -105,18 +126,18 @@ pub fn rows_to_arrow(mut rows: Rows, num_cols: usize) -> Result<RecordBatch> {
     }
 }
 
-macro_rules! append_value {
-    ($builder:expr, $row:expr, $index:expr, $type:ty, $builder_type:ty, $sqlite_type:expr) => {{
-        let Some(builder) = $builder.as_any_mut().downcast_mut::<$builder_type>() else {
-            FailedToDowncastBuilderSnafu {
-                sqlite_type: format!("{}", $sqlite_type),
-            }
-            .fail()?
-        };
-        let value: $type = $row.get($index).context(FailedToExtractRowValueSnafu)?;
-        builder.append_value(value);
-    }};
-}
+// macro_rules! append_value {
+//     ($builder:expr, $row:expr, $index:expr, $type:ty, $builder_type:ty, $sqlite_type:expr, $field:expr) => {{
+//         let Some(builder) = $builder.as_any_mut().downcast_mut::<$builder_type>() else {
+//             FailedToDowncastBuilderSnafu {
+//                 sqlite_type: format!("{}", $sqlite_type),
+//             }
+//             .fail()?
+//         };
+//         let value: $type = $row.get($index).context(FailedToExtractRowValueSnafu)?;
+//         builder.append_value(value);
+//     }};
+// }
 
 fn add_row_to_builders(
     row: &Row,
@@ -138,10 +159,68 @@ fn add_row_to_builders(
                 };
                 builder.append_null();
             }
-            Type::Integer => append_value!(builder, row, i, i64, Int64Builder, sqlite_type),
-            Type::Real => append_value!(builder, row, i, f64, Float64Builder, sqlite_type),
-            Type::Text => append_value!(builder, row, i, String, StringBuilder, sqlite_type),
-            Type::Blob => append_value!(builder, row, i, Vec<u8>, BinaryBuilder, sqlite_type),
+            Type::Integer => {
+                if let Some(builder) = builder.as_any_mut().downcast_mut::<Int64Builder>() {
+                    let value: i64 = row.get(i).context(FailedToExtractRowValueSnafu)?;
+                    builder.append_value(value);
+                } else if let Some(builder) = builder.as_any_mut().downcast_mut::<Int32Builder>() {
+                    let value: i32 = row.get(i).context(FailedToExtractRowValueSnafu)?;
+                    builder.append_value(value);
+                } else {
+                    FailedToDowncastBuilderSnafu {
+                        sqlite_type: format!("{sqlite_type}"),
+                    }
+                    .fail()?;
+                };
+            }
+            Type::Real => {
+                let Some(builder) = builder.as_any_mut().downcast_mut::<Float64Builder>() else {
+                    FailedToDowncastBuilderSnafu {
+                        sqlite_type: format!("{sqlite_type}"),
+                    }
+                    .fail()?
+                };
+                let value: f64 = row.get(i).context(FailedToExtractRowValueSnafu)?;
+                builder.append_value(value);
+            }
+            Type::Text => {
+                if let Some(builder) = builder.as_any_mut().downcast_mut::<StringBuilder>() {
+                    let value: String = row.get(i).context(FailedToExtractRowValueSnafu)?;
+                    builder.append_value(value);
+                } else if let Some(builder) =
+                    builder.as_any_mut().downcast_mut::<LargeStringBuilder>()
+                {
+                    let value: String = row.get(i).context(FailedToExtractRowValueSnafu)?;
+                    builder.append_value(value);
+                } else if let Some(builder) = builder
+                    .as_any_mut()
+                    .downcast_mut::<TimestampMicrosecondBuilder>()
+                {
+                    let value: String = row.get(i).context(FailedToExtractRowValueSnafu)?;
+                    let time = NaiveDateTime::parse_from_str(&value, "%Y-%m-%d %H:%M:%S%.6f")
+                        .context(FailedToParseTimestampSnafu)?
+                        .and_utc()
+                        .timestamp_micros();
+                    builder.append_value(time);
+                } else {
+                    FailedToDowncastBuilderSnafu {
+                        sqlite_type: format!("{sqlite_type}"),
+                    }
+                    .fail()?;
+                }
+            }
+            Type::Blob => {
+                {
+                    let Some(builder) = builder.as_any_mut().downcast_mut::<BinaryBuilder>() else {
+                        FailedToDowncastBuilderSnafu {
+                            sqlite_type: format!("{sqlite_type}"),
+                        }
+                        .fail()?
+                    };
+                    let value: Vec<u8> = row.get(i).context(FailedToExtractRowValueSnafu)?;
+                    builder.append_value(value);
+                };
+            }
         }
     }
     Ok(())

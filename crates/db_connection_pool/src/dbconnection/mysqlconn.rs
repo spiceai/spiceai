@@ -85,6 +85,7 @@ impl<'a> AsyncDbConnection<Conn, &'a (dyn ToValue + Sync)> for MySQLConnection {
         &self,
         sql: &str,
         params: &[&'a (dyn ToValue + Sync)],
+        _schema: SchemaRef,
     ) -> Result<SendableRecordBatchStream> {
         let mut conn = self.conn.lock().await;
         let conn = &mut *conn;

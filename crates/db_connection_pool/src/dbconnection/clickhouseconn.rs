@@ -89,6 +89,7 @@ impl<'a> AsyncDbConnection<ClientHandle, &'a (dyn Sync)> for ClickhouseConnectio
         &self,
         sql: &str,
         _: &[&'a (dyn Sync)],
+        _schema: SchemaRef,
     ) -> Result<SendableRecordBatchStream> {
         let mut conn = self.conn.lock().await;
         let conn = &mut *conn;

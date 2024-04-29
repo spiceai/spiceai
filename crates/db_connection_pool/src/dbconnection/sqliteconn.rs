@@ -76,7 +76,7 @@ impl AsyncDbConnection<Connection, &'static (dyn ToSql + Sync)> for SqliteConnec
                 let mut stmt = conn.prepare(&format!("SELECT * FROM {table_reference} LIMIT 1"))?;
                 let column_count = stmt.column_count();
                 let rows = stmt.query([])?;
-                let rec = rows_to_arrow(rows, column_count)
+                let rec = rows_to_arrow(rows, column_count, None)
                     .context(ConversionSnafu)
                     .map_err(to_tokio_rusqlite_error)?;
                 let schema = rec.schema();
@@ -91,6 +91,7 @@ impl AsyncDbConnection<Connection, &'static (dyn ToSql + Sync)> for SqliteConnec
         &self,
         sql: &str,
         params: &[&'static (dyn ToSql + Sync)],
+        to_schema: SchemaRef,
     ) -> Result<SendableRecordBatchStream> {
         let sql = sql.to_string();
         let params = params.to_vec();
@@ -104,7 +105,7 @@ impl AsyncDbConnection<Connection, &'static (dyn ToSql + Sync)> for SqliteConnec
                 }
                 let column_count = stmt.column_count();
                 let rows = stmt.raw_query();
-                let rec = rows_to_arrow(rows, column_count)
+                let rec = rows_to_arrow(rows, column_count, Some(&to_schema))
                     .context(ConversionSnafu)
                     .map_err(to_tokio_rusqlite_error)?;
                 Ok(rec)

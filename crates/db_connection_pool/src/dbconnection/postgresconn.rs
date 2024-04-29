@@ -107,6 +107,7 @@ impl<'a>
         &self,
         sql: &str,
         params: &[&'a (dyn ToSql + Sync)],
+        _schema: SchemaRef,
     ) -> Result<SendableRecordBatchStream> {
         let rows = self.conn.query(sql, params).await.context(QuerySnafu)?;
         let rec = rows_to_arrow(rows.as_slice()).context(ConversionSnafu)?;
