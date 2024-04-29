@@ -73,6 +73,9 @@ Currently supported data connectors for upstream datasets. More coming soon.
 | `dremio`     | [Dremio](https://github.com/spiceai/quickstarts/tree/trunk/dremio#readme)                      | Alpha        | Arrow Flight                                                                                       | `full`           |
 | `mysql`      | MySQL                                                                                          | Alpha        |                                                                                                    | `full`           |
 | `duckdb`     | DuckDB                                                                                         | Alpha        |                                                                                                    | `full`           |
+| `clickhouse` | Clickhouse                                                                                     | Alpha        |                                                                                                    | `full`           |
+| `odbc`       | ODBC                                                                                           | Alpha        |  ODBC                                                                                              | `full`           |
+| `spark`      | Spark                                                                                          | Alpha        | [Spark Connect](https://spark.apache.org/docs/latest/spark-connect-overview.html)                  | `full`           |
 | `snowflake`  | Snowflake                                                                                      | Coming soon! | Arrow Flight SQL                                                                                   | `full`           |
 | `bigquery`   | BigQuery                                                                                       | Coming soon! | Arrow Flight SQL                                                                                   | `full`           |
 
@@ -179,7 +182,7 @@ spice sql
 The SQL REPL inferface will be shown:
 
 ```
-Welcome to the interactive Spice.ai SQL Query Utility! Type 'help' for help.
+Welcome to the Spice.ai SQL REPL! Type 'help' for help.
 
 show tables; -- list available tables
 sql>
@@ -195,7 +198,7 @@ sql> show tables
 | taxi_trips |
 +------------+
 
-Time: 0.007505084 seconds. 1/1 rows displayed.
+Time: 0.007505084 seconds. 1 rows.
 ```
 
 Enter a query to display the longest taxi trips:
