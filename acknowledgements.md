@@ -67,13 +67,13 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - async-trait 0.1.80, Apache-2.0 OR MIT 
   <br/>https://github.com/dtolnay/async-trait
 
-- aws-config 1.1.10, Apache-2.0 
+- aws-config 1.2.1, Apache-2.0 
   <br/>https://github.com/smithy-lang/smithy-rs
 
-- aws-sdk-secretsmanager 1.21.0, Apache-2.0 
+- aws-sdk-secretsmanager 1.23.0, Apache-2.0 
   <br/>https://github.com/awslabs/aws-sdk-rust
 
-- aws-sdk-sts 1.19.0, Apache-2.0 
+- aws-sdk-sts 1.21.0, Apache-2.0 
   <br/>https://github.com/awslabs/aws-sdk-rust
 
 - axum 0.6.20, MIT 
@@ -106,13 +106,22 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - chrono 0.4.38, Apache-2.0 OR MIT 
   <br/>https://github.com/chronotope/chrono
 
+- chrono-tz 0.8.6, Apache-2.0 OR MIT 
+  <br/>https://github.com/chronotope/chrono-tz
+
 - clap 4.5.4, Apache-2.0 OR MIT 
   <br/>https://github.com/clap-rs/clap
+
+- clickhouse-rs 1.1.0-alpha.1, MIT 
+  <br/>https://github.com/suharev7/clickhouse-rs
 
 - csv 1.3.0, MIT OR Unlicense 
   <br/>https://github.com/BurntSushi/rust-csv
 
-- datafusion 37.0.0, Apache-2.0 
+- dashmap 5.5.3, MIT 
+  <br/>https://github.com/xacrimon/dashmap
+
+- datafusion 37.1.0, Apache-2.0 
   <br/>https://github.com/apache/arrow-datafusion
 
 - deltalake 0.17.1, Apache-2.0 
@@ -121,7 +130,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - dirs 5.0.1, Apache-2.0 OR MIT 
   <br/>https://github.com/soc/dirs-rs
 
-- duckdb 0.10.1, MIT 
+- duckdb 0.10.2, MIT 
   <br/>https://github.com/wangfenjin/duckdb-rs
 
 - fundu 2.0.0, MIT 
@@ -226,10 +235,10 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - secrecy 0.8.0, Apache-2.0 OR MIT 
   <br/>https://github.com/iqlusioninc/crates/tree/main/secrecy
 
-- serde 1.0.197, Apache-2.0 OR MIT 
+- serde 1.0.198, Apache-2.0 OR MIT 
   <br/>https://github.com/serde-rs/serde
 
-- serde_json 1.0.115, Apache-2.0 OR MIT 
+- serde_json 1.0.116, Apache-2.0 OR MIT 
   <br/>https://github.com/serde-rs/json
 
 - serde_yaml 0.9.34+deprecated, Apache-2.0 OR MIT 
@@ -277,10 +286,10 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - tracing-subscriber 0.3.18, MIT 
   <br/>https://github.com/tokio-rs/tracing
 
-- tract-core 0.21.3, Apache-2.0 OR MIT 
+- tract-core 0.21.4, Apache-2.0 OR MIT 
   <br/>https://github.com/snipsco/tract
 
-- tract-onnx 0.21.3, Apache-2.0 OR MIT 
+- tract-onnx 0.21.4, Apache-2.0 OR MIT 
   <br/>https://github.com/snipsco/tract
 
 - trust-dns-resolver 0.23.2, Apache-2.0 OR MIT 
