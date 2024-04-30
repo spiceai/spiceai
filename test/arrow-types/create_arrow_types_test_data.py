@@ -79,27 +79,27 @@ for field in fields:
     conn.execute(f"CREATE TABLE arrow_types.{table_name} AS SELECT {field.name} FROM read_parquet('arrow_types.parquet');")
     print(conn.execute(f"DESCRIBE arrow_types.{table_name};").fetchall())
 
-# Generate the spicepod.yml
-# config_content = """version: v1beta1
-# kind: Spicepod
-# name: arrow-data-types
-# datasets:
-# """
+# Generate the spicepod.yml that could be used to load the data
+config_content = """version: v1beta1
+kind: Spicepod
+name: arrow-data-types
+datasets:
+"""
 
-# for field in fields:
-#     table_name = field.name
-#     config_content += f"""
-# - from: duckdb:arrow_types.{table_name}
-#   name: {table_name}
-#   params:
-#       open: arrow_types.db
-#   acceleration:
-#     enabled: true
-#     #engine: engine_name
-# """
+for field in fields:
+    table_name = field.name
+    config_content += f"""
+- from: duckdb:arrow_types.{table_name}
+  name: {table_name}
+  params:
+      open: arrow_types.db
+  acceleration:
+    enabled: true
+    #engine: engine_name
+"""
 
-# # Write the configuration to a YAML file
-# with open("spicepod.yaml", "w") as f:
-#     f.write(config_content)
+# Write the configuration to a YAML file
+with open("spicepod.yaml", "w") as f:
+    f.write(config_content)
 
-# print("Successfully generated 'spicepod.yaml'")
+print("Successfully generated test 'spicepod.yaml'")
