@@ -8,11 +8,6 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 
 - See [Bugs](https://github.com/spiceai/spiceai/labels/bug). Feel free to file a new Issue if you see a bug and let us know on Discord.
 
-## [v0.12.1-alpha (May 2024)](https://github.com/spiceai/spiceai/milestone/20)
-
-- Better Error messages
-- Bugfixes and stability improvements
-
 ## [v0.13-alpha (May 2024)](https://github.com/spiceai/spiceai/milestone/21)
 
 - MotherDuck data connector (alpha)
