@@ -1,0 +1,77 @@
+name: 'Verify Accelerated Query'
+description: 'Verifies that an accelerated query returns the same results as a non-accelerated query'
+inputs:
+  dataset-source:
+    description: 'Definition of source dataset'
+    required: true
+  table-name:
+    description: 'Table to verify accelerated schema'
+    required: true
+  engine:
+    description: 'Acceleration engine for verification'
+    required: true
+outputs:
+  query-result:
+    description: "Query result encoded as base64 string"
+    value: ${{ steps.query.outputs.query-result }}
+  accelerated-query-result:
+    description: "Accelerated query result encoded as base64 string"
+    value: ${{ steps.query-accelerated.outputs.query-result }}
+runs:
+  using: "composite"
+  steps:
+    - name: Create spicepod
+      shell: bash
+      run: |
+        killall spice || true
+        [ -f spice.log ] && rm spice.log
+        spice init app_${{ inputs.table-name }}
+        # copy local databases (if any) to create spicepod folder
+        cp *.db app_${{ inputs.table-name }}
+
+    - name: Create non-accelerated dataset
+      shell: bash
+      working-directory: app_${{ inputs.table-name }}
+      run: |
+        echo "Creating non-accelerated dataset"
+        echo "datasets:" >> spicepod.yaml
+        echo "${{ inputs.dataset-source }}" >> spicepod.yaml
+        cat spicepod.yaml
+    
+    - name: Run test query
+      id: query
+      uses: ./.github/actions/run-query
+      with:
+        working-directory: app_${{ inputs.table-name }}
+        query: "select * from ${{ inputs.table-name }} limit 10;"
+        start-runtime: true
+        
+    - name: Create accelerated dataset
+      shell: bash
+      working-directory: app_${{ inputs.table-name }}
+      run: |
+        echo "Creating accelerated dataset"
+        echo "  acceleration:" >> spicepod.yaml
+        echo "    enabled: true" >> spicepod.yaml
+        echo "    engine: ${{ inputs.engine }} " >> spicepod.yaml
+        cat spicepod.yaml
+  
+    - name: Run test query (accelerated)
+      id: query-accelerated
+      uses: ./.github/actions/run-query
+      with:
+        working-directory: app_${{ inputs.table-name }}
+        query: "select * from ${{ inputs.table-name }} limit 10;"
+        start-runtime: true
+
+    - name: Verify query results ${{ inputs.table-name }}
+      shell: bash
+      run: |
+        expected=$(echo '${{ steps.query.outputs.query-result }}' | base64 --decode | sed 's/|/\\|/g' | sed ':a;N;$!ba;s/\n/<br\/>/g')
+        actual=$(echo '${{ steps.query-accelerated.outputs.query-result }}' | base64 --decode | sed 's/|/\\|/g' | sed ':a;N;$!ba;s/\n/<br\/>/g')
+
+        if [[ -n "$expected" && "$expected" == "$actual" ]]; then
+          echo "${{ inputs.table-name }}: non-accelerated and accelerated queries match"
+        else
+          echo "::error::${{ inputs.table-name }}: non-accelerated and accelerated queries do not match"
+        fi

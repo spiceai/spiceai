@@ -1,0 +1,479 @@
+name: Test types support
+
+on:
+  workflow_dispatch:
+
+jobs:
+
+  build:
+    name: Build ${{ matrix.name }} binaries
+    runs-on: ${{ matrix.runner }}
+    env:
+      GOVER: 1.22.0
+      GOOS: ${{ matrix.target_os }}
+      GOARCH: ${{ matrix.target_arch_go }}
+
+    strategy:
+      matrix:
+        include:
+          - name: "Linux x64"
+            runner: "ubuntu-latest"
+            target_os: "linux"
+            target_arch: "x86_64"
+            target_arch_go: "amd64"
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set REL_VERSION from version.txt
+        run: python3 ./.github/scripts/get_release_version.py
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GOVER }}
+
+      - run: rustup toolchain install stable --profile minimal
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/trunk' }}
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build spiced
+        run: make -C bin/spiced
+
+      - name: Update build cache (macOS)
+        if: matrix.target_os == 'darwin'
+        run: |
+          if [ -d /Users/spiceai/build/target ]; then
+            rsync -av target/ /Users/spiceai/build/target/
+          fi
+
+      - name: Update build cache (Linux)
+        if: matrix.target_os == 'linux'
+        run: |
+          if [ -d /home/spiceai/build/target ]; then
+            rsync -av target/ /home/spiceai/build/target/
+          fi
+
+      - name: Update build cache (Windows)
+        if: matrix.target_os == 'windows'
+        run: |
+          if (Test-Path C:/spiceai/build/target) {
+            Copy-Item -Recurse -Force target/* C:/spiceai/build/target
+          }
+
+      - name: Build spice
+        run: make -C bin/spice
+
+      - name: make spiced executable
+        if: matrix.target_os != 'windows'
+        run: |
+          mv target/release/spiced spiced
+          chmod +x spiced
+
+      - name: make spice executable
+        if: matrix.target_os != 'windows'
+        run: |
+          mv target/release/spice spice
+          chmod +x spice
+
+      - name: Save spice artifact
+        uses: actions/upload-artifact@v4
+        if: matrix.target_os != 'windows'
+        with:
+          name: build_${{ matrix.target_os }}_${{ matrix.target_arch }}
+          path: |
+            spice
+            spiced
+
+  test_acceleration:
+    name: 'Arrow types using ${{ matrix.acceleration.engine }} on ${{ matrix.target.name }}'
+    runs-on: ${{ matrix.target.runner }}
+    needs:
+      - build
+
+    strategy:
+      fail-fast: false
+      matrix:
+        acceleration: [
+            { engine: arrow, mode: memory },
+            { engine: duckdb, mode: memory },
+            { engine: sqlite, mode: memory },
+            # { engine: postgres},
+          ]
+        target:
+          - name: "Linux x64"
+            runner: "ubuntu-latest"
+            target_os: "linux"
+            target_arch: "x86_64"
+            target_arch_go: "amd64"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: 3.x
+
+      - name: Generate test data
+        run: |
+          pip install pyarrow duckdb
+          python test/arrow-types/create_arrow_types_test_data.py
+          ls -l test/arrow-types/
+
+      - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+        uses: actions/download-artifact@v4
+        with:
+          name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+          path: ./build
+
+      - name: Install spice
+        uses: ./.github/actions/install-spice
+        with:
+          build-path: ./build
+
+      - name: Test boolean
+        id: test-boolean
+        continue-on-error: true
+        uses: ./.github/actions/verify-accelerated-query
+        with:
+          dataset-source: |
+            - from: duckdb:arrow_types.t_boolean
+              name: t_boolean
+              params:
+                  open: arrow_types.db
+          table-name: t_boolean
+          engine: ${{ matrix.acceleration.engine }}
+
+      - name: Test int8
+        continue-on-error: true
+        id: test-int8
+        uses: ./.github/actions/verify-accelerated-query
+        with:
+          dataset-source: |
+            - from: duckdb:arrow_types.t_int8
+              name: t_int8
+              params:
+                  open: arrow_types.db
+          table-name: t_int8
+          engine: ${{ matrix.acceleration.engine }}
+
+      - name: Test int16
+        continue-on-error: true
+        id: test-int16
+        uses: ./.github/actions/verify-accelerated-query
+        with:
+          dataset-source: |
+            - from: duckdb:arrow_types.t_int16
+              name: t_int16
+              params:
+                  open: arrow_types.db
+          table-name: t_int16
+          engine: ${{ matrix.acceleration.engine }}
+      
+      - name: Test int32
+        continue-on-error: true
+        id: test-int32
+        uses: ./.github/actions/verify-accelerated-query
+        with:
+          dataset-source: |
+            - from: duckdb:arrow_types.t_int32
+              name: t_int32
+              params:
+                  open: arrow_types.db
+          table-name: t_int32
+          engine: ${{ matrix.acceleration.engine }}
+      
+      - name: Test int64
+        continue-on-error: true
+        id: test-int64
+        uses: ./.github/actions/verify-accelerated-query
+        with:
+          dataset-source: |
+            - from: duckdb:arrow_types.t_int64
+              name: t_int64
+              params:
+                  open: arrow_types.db
+          table-name: t_int64
+          engine: ${{ matrix.acceleration.engine }}
+      
+      - name: Test float32
+        continue-on-error: true
+        id: test-float32
+        uses: ./.github/actions/verify-accelerated-query
+        with:
+          dataset-source: |
+            - from: duckdb:arrow_types.t_float32
+              name: t_float32
+              params:
+                  open: arrow_types.db
+          table-name: t_float32
+          engine: ${{ matrix.acceleration.engine }}
+      
+      - name: Test float64
+        continue-on-error: true
+        id: test-float64
+        uses: ./.github/actions/verify-accelerated-query
+        with:
+          dataset-source: |
+            - from: duckdb:arrow_types.t_float64
+              name: t_float64
+              params:
+                  open: arrow_types.db
+          table-name: t_float64
+          engine: ${{ matrix.acceleration.engine }}
+
+      - name: Test date32
+        continue-on-error: true
+        id: test-date32
+        uses: ./.github/actions/verify-accelerated-query
+        with:
+          dataset-source: |
+            - from: duckdb:arrow_types.t_date32
+              name: t_date32
+              params:
+                  open: arrow_types.db
+          table-name: t_date32
+          engine: ${{ matrix.acceleration.engine }}
+      
+      - name: Test date64
+        continue-on-error: true
+        id: test-date64
+        uses: ./.github/actions/verify-accelerated-query
+        with:
+          dataset-source: |
+            - from: duckdb:arrow_types.t_date64
+              name: t_date64
+              params:
+                  open: arrow_types.db
+          table-name: t_date64
+          engine: ${{ matrix.acceleration.engine }}
+
+      
+      - name: Test timestamp_ms
+        continue-on-error: true
+        id: test-timestamp_ms
+        uses: ./.github/actions/verify-accelerated-query
+        with:
+          dataset-source: |
+            - from: duckdb:arrow_types.t_timestamp_ms
+              name: t_timestamp_ms
+              params:
+                  open: arrow_types.db
+          table-name: t_timestamp_ms
+          engine: ${{ matrix.acceleration.engine }}
+
+      - name: Test time64_us
+        continue-on-error: true
+        id: test-time64_us
+        uses: ./.github/actions/verify-accelerated-query
+        with:
+          dataset-source: |
+            - from: duckdb:arrow_types.t_time64_us
+              name: t_time64_us
+              params:
+                  open: arrow_types.db
+          table-name: t_time64_us
+          engine: ${{ matrix.acceleration.engine }}
+      
+      - name: Test string
+        continue-on-error: true
+        id: test-string
+        uses: ./.github/actions/verify-accelerated-query
+        with:
+          dataset-source: |
+            - from: duckdb:arrow_types.t_string
+              name: t_string
+              params:
+                  open: arrow_types.db
+          table-name: t_string
+          engine: ${{ matrix.acceleration.engine }}
+
+      - name: Test binary
+        continue-on-error: true
+        id: test-binary
+        uses: ./.github/actions/verify-accelerated-query
+        with:
+          dataset-source: |
+            - from: duckdb:arrow_types.t_binary
+              name: t_binary
+              params:
+                  open: arrow_types.db
+          table-name: t_binary
+          engine: ${{ matrix.acceleration.engine }}
+
+      - name: Test decimal128
+        continue-on-error: true
+        id: test-decimal128
+        uses: ./.github/actions/verify-accelerated-query
+        with:
+          dataset-source: |
+            - from: duckdb:arrow_types.t_decimal128
+              name: t_decimal128
+              params:
+                  open: arrow_types.db
+          table-name: t_decimal128
+          engine: ${{ matrix.acceleration.engine }}
+      
+      - name: Test decimal256
+        continue-on-error: true
+        id: test-decimal256
+        uses: ./.github/actions/verify-accelerated-query
+        with:
+          dataset-source: |
+            - from: duckdb:arrow_types.t_decimal256
+              name: t_decimal256
+              params:
+                  open: arrow_types.db
+          table-name: t_decimal256
+          engine: ${{ matrix.acceleration.engine }}
+    
+      - name: Test list_int
+        continue-on-error: true
+        id: test-list_int
+        uses: ./.github/actions/verify-accelerated-query
+        with:
+          dataset-source: |
+            - from: duckdb:arrow_types.t_list_int
+              name: t_list_int
+              params:
+                  open: arrow_types.db
+          table-name: t_list_int
+          engine: ${{ matrix.acceleration.engine }}
+
+      - name: Test list_string
+        continue-on-error: true
+        id: test-list_string
+        uses: ./.github/actions/verify-accelerated-query
+        with:
+          dataset-source: |
+            - from: duckdb:arrow_types.t_list_string
+              name: t_list_string
+              params:
+                  open: arrow_types.db
+          table-name: t_list_string
+          engine: ${{ matrix.acceleration.engine }}
+      
+      - name: Test duration_ms
+        continue-on-error: true
+        id: test-duration_ms
+        uses: ./.github/actions/verify-accelerated-query
+        with:
+          dataset-source: |
+            - from: duckdb:arrow_types.t_duration_ms
+              name: t_duration_ms
+              params:
+                  open: arrow_types.db
+          table-name: t_duration_ms
+          engine: ${{ matrix.acceleration.engine }}
+
+      - name: Aggregate test results
+        run: |
+          results_json=$(jq -n \
+            '{
+              "boolean": { 
+                "normal": "${{ steps.test-boolean.outputs.query-result }}", 
+                "accelerated": "${{ steps.test-boolean.outputs.accelerated-query-result }}"
+              }, 
+              "int8": { 
+                "normal": "${{ steps.test-int8.outputs.query-result }}", 
+                "accelerated": "${{ steps.test-int8.outputs.accelerated-query-result }}"
+              },
+              "int16": { 
+                "normal": "${{ steps.test-int16.outputs.query-result }}", 
+                "accelerated": "${{ steps.test-int16.outputs.accelerated-query-result }}"
+              },
+              "int32": { 
+                "normal": "${{ steps.test-int32.outputs.query-result }}", 
+                "accelerated": "${{ steps.test-int32.outputs.accelerated-query-result }}"
+              },
+              "int64": { 
+                "normal": "${{ steps.test-int64.outputs.query-result }}", 
+                "accelerated": "${{ steps.test-int64.outputs.accelerated-query-result }}"
+              },
+              "float32": { 
+                "normal": "${{ steps.test-float32.outputs.query-result }}", 
+                "accelerated": "${{ steps.test-float32.outputs.accelerated-query-result }}"
+              },
+              "float64": { 
+                "normal": "${{ steps.test-float64.outputs.query-result }}", 
+                "accelerated": "${{ steps.test-float64.outputs.accelerated-query-result }}"
+              },
+              "date32": { 
+                "normal": "${{ steps.test-date32.outputs.query-result }}", 
+                "accelerated": "${{ steps.test-date32.outputs.accelerated-query-result }}"
+              },
+              "date64": { 
+                "normal": "${{ steps.test-date64.outputs.query-result }}", 
+                "accelerated": "${{ steps.test-date64.outputs.accelerated-query-result }}"
+              },
+              "timestamp_ms": { 
+                "normal": "${{ steps.test-timestamp_ms.outputs.query-result }}", 
+                "accelerated": "${{ steps.test-timestamp_ms.outputs.accelerated-query-result }}"
+              },
+              "time64_us": { 
+                "normal": "${{ steps.test-time64_us.outputs.query-result }}", 
+                "accelerated": "${{ steps.test-time64_us.outputs.accelerated-query-result }}"
+              },
+              "string": { 
+                "normal": "${{ steps.test-string.outputs.query-result }}", 
+                "accelerated": "${{ steps.test-string.outputs.accelerated-query-result }}"
+              },
+              "binary": { 
+                "normal": "${{ steps.test-binary.outputs.query-result }}", 
+                "accelerated": "${{ steps.test-binary.outputs.accelerated-query-result }}"
+              },
+              "decimal128": { 
+                "normal": "${{ steps.test-decimal128.outputs.query-result }}", 
+                "accelerated": "${{ steps.test-decimal128.outputs.accelerated-query-result }}"
+              },
+              "decimal256": { 
+                "normal": "${{ steps.test-decimal256.outputs.query-result }}", 
+                "accelerated": "${{ steps.test-decimal256.outputs.accelerated-query-result }}"
+              },
+              "list_int": { 
+                "normal": "${{ steps.test-list_int.outputs.query-result }}", 
+                "accelerated": "${{ steps.test-list_int.outputs.accelerated-query-result }}"
+              },
+              "list_string": { 
+                "normal": "${{ steps.test-list_string.outputs.query-result }}", 
+                "accelerated": "${{ steps.test-list_string.outputs.accelerated-query-result }}"
+              },
+              "duration_ms": { 
+                "normal": "${{ steps.test-duration_ms.outputs.query-result }}", 
+                "accelerated": "${{ steps.test-duration_ms.outputs.accelerated-query-result }}"
+              }
+            }')
+
+          echo "Prepared results JSON: $results_json"
+          
+          declare -a types=("boolean" "int8" "int16" "int32" "int64" "float32" "float64" "date32" "date64" "timestamp_ms" "time64_us" "string" "binary" "decimal128" "decimal256" "list_int" "list_string" "duration_ms")
+
+          echo "| Arrow Type | Match | Non-accelerated | Accelerated |" >> $GITHUB_STEP_SUMMARY
+          echo "| --- | --- | --- | --- |" >> $GITHUB_STEP_SUMMARY
+
+          for type in "${types[@]}"
+          do
+            # Extract results using jq directly from the JSON prepared above
+            expected=$(echo "$results_json" | jq -r ."$type".normal)
+            actual=$(echo "$results_json" | jq -r ."$type".accelerated)
+
+            # Process and format results
+            expected=$(echo "$expected" | base64 --decode | sed 's/|/\\|/g' | sed ':a;N;$!ba;s/\n/<br\/>/g')
+            actual=$(echo "$actual" | base64 --decode | sed 's/|/\\|/g' | sed ':a;N;$!ba;s/\n/<br\/>/g')
+            #"$expected shopuld not be empty"
+            if [[ -n "$expected" ]]  &&  [[ "$expected" == "$actual" ]]; then
+              match="✅ Yes"
+            else
+              match="❌ No"
+            fi
+
+            # Add the row to the table
+            echo "| $type | $match | $expected | $actual |" >> $GITHUB_STEP_SUMMARY
+          done
