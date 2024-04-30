@@ -26,6 +26,7 @@ use std::sync::Arc;
 pub mod fallback_on_zero_results;
 pub mod slice;
 pub mod tee;
+pub mod schema_cast;
 
 #[derive(Clone)]
 pub struct TableScanParams {
