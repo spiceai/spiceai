@@ -895,8 +895,5 @@ pub fn get_source_error(error: &impl std::error::Error) -> &dyn snafu::Error {
     for e in iter::successors(error.source(), |&e| e.source()) {
         last_error = Some(e);
     }
-    if let Some(e) = last_error {
-        return e;
-    }
-    error
+    last_error.unwrap_or(error)
 }
