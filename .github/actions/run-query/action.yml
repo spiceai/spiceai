@@ -45,13 +45,14 @@ runs:
 
         echo "$sql_output"
 
-        if [[ $sql_output != *"No error to display"* ]]; then
-          echo "Query failed to execute."
-        fi
-
         echo "query-output=$(echo "$sql_output" | base64 -w 0)" >> "$GITHUB_OUTPUT"
 
-        extracted_result=$(echo "$sql_output" | sed -n '/show tables;/,/Time: /p' | sed '1d;$d')
+        if [[ $sql_output != *"No error to display"* ]]; then
+          echo "Query failed to execute."
+        else
+          extracted_result=$(echo "$sql_output" | sed -n '/show tables;/,/Time: /p' | sed '1d;$d')
+        fi
+        
         if [[ -z "$extracted_result" ]]; then
           extracted_result="$sql_output"
         fi
