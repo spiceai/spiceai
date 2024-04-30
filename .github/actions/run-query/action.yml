@@ -1,0 +1,70 @@
+name: 'Execute Spice SQL REPL query'
+description: 'Executes a query using Spice SQL REPL and returns query result via GH Action output parameter'
+inputs:
+  query:
+    description: 'Query to execute'
+    required: true
+  start-runtime: 
+    description: 'Whether to start Spice runtime before executing the query'
+    required: false
+    default: 'true'
+  working-directory:
+    description: 'Directory to start Spice runtime'
+    required: false
+outputs:
+  query-result:
+    description: "Query result encoded as base64 string"
+    value: ${{ steps.query.outputs.query-result }}
+  runtime-trace:
+    description: "Spice runtime execution log"
+    value: ${{ steps.stop-runtime.outputs.runtime-traces }}
+runs:
+  using: "composite"
+  steps:
+    - name: Start Spice runtime
+      id: start-runtime
+      shell: bash
+      if: inputs.start-runtime == 'true'
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        spice run &> spice.log &
+        sleep 3
+        echo "Spice runtime started"
+    
+    - name: Run query
+      shell: bash
+      id: query
+      run: |
+        query="${{ inputs.query }}"
+        echo "Executing query: $query"
+        sql_output=$(spice sql <<EOF
+        $query
+        .error
+        EOF
+        )
+
+        echo "$sql_output"
+
+        echo "query-output=$(echo "$sql_output" | base64 -w 0)" >> "$GITHUB_OUTPUT"
+
+        if [[ $sql_output != *"No error to display"* ]]; then
+          echo "Query failed to execute."
+        else
+          extracted_result=$(echo "$sql_output" | sed -n '/show tables;/,/Time: /p' | sed '1d;$d')
+        fi
+        
+        if [[ -z "$extracted_result" ]]; then
+          extracted_result="$sql_output"
+        fi
+        echo "query-result=$(echo "$extracted_result" | base64 -w 0)" >> "$GITHUB_OUTPUT"
+     
+    - name: Stop Spice runtime
+      id: stop-runtime
+      shell: bash
+      if: ${{ inputs.start-runtime == 'true' && always() }}
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        killall spice || true
+        spice_log=$(cat spice.log)
+        echo "$spice_log"
+        echo "runtime-traces=$(echo "$spice_log" | base64 -w 0)" >> "$GITHUB_OUTPUT"
