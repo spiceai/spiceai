@@ -27,6 +27,7 @@ use ns_lookup::verify_ns_lookup_and_tcp_connect;
 use postgres_native_tls::MakeTlsConnector;
 use secrets::Secret;
 use snafu::{prelude::*, ResultExt};
+use tokio_postgres;
 
 use super::{DbConnectionPool, Result};
 use crate::{
@@ -63,6 +64,9 @@ pub enum Error {
 
     #[snafu(display("Failed to load cert : {source}"))]
     FailedToLoadCertError { source: native_tls::Error },
+
+    #[snafu(display("Postgres connection error: {source}"))]
+    PostgresConnectionError { source: tokio_postgres::Error },
 }
 
 pub struct PostgresConnectionPool {
@@ -160,7 +164,11 @@ impl PostgresConnectionPool {
         let tls_connector = get_tls_connector(ssl_mode, certs)?;
         let connector = MakeTlsConnector::new(tls_connector);
 
-        // TODO: Connection test with Postgres
+        // Test the connection using tokio-postgres before initialize bb8 connection pool
+        let (_, _) = tokio_postgres::connect(connection_string.as_str(), connector.clone())
+            .await
+            .context(PostgresConnectionSnafu)?;
+
         let manager = PostgresConnectionManager::new(config, connector);
         let error_sink = PostgresErrorSink::new();
 
