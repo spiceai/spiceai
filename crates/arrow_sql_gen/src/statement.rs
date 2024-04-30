@@ -13,7 +13,6 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-
 use arrow::{
     array::{array, Array, RecordBatch},
     datatypes::{DataType, SchemaRef},
@@ -21,6 +20,7 @@ use arrow::{
 
 use bigdecimal_0_3_0::BigDecimal;
 
+use snafu::Snafu;
 use time::{OffsetDateTime, PrimitiveDateTime};
 
 use sea_query::{
@@ -28,6 +28,19 @@ use sea_query::{
     IntoIndexColumn, MysqlQueryBuilder, PostgresQueryBuilder, Query, SimpleExpr,
     SqliteQueryBuilder, Table,
 };
+
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display("Failed to build insert statement: {source}"))]
+    FailedToCreateInsertStatement {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("Unimplemented data type in insert statement: {data_type:?}"))]
+    UnimplementedDataTypeInInsertStatement { data_type: DataType },
+}
+
+pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct CreateTableBuilder {
     schema: SchemaRef,
@@ -134,12 +147,17 @@ impl InsertBuilder {
         }
     }
 
+    /// Create an Insert statement from a `RecordBatch`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a column's data type is not supported, or its conversion failed.
     #[allow(clippy::too_many_lines)]
     pub fn construct_insert_stmt(
         &self,
         insert_stmt: &mut InsertStatement,
         record_batch: &RecordBatch,
-    ) {
+    ) -> Result<()> {
         for row in 0..record_batch.num_rows() {
             let mut row_values: Vec<SimpleExpr> = vec![];
             for col in 0..record_batch.num_columns() {
@@ -167,6 +185,40 @@ impl InsertBuilder {
                             );
                         }
                     }
+                    DataType::Date32 => {
+                        let array = column.as_any().downcast_ref::<array::Date32Array>();
+                        if let Some(valid_array) = array {
+                            row_values.push(
+                                match OffsetDateTime::from_unix_timestamp(
+                                    i64::from(valid_array.value(row)) * 86_400,
+                                ) {
+                                    Ok(offset_time) => offset_time.date().into(),
+                                    Err(e) => {
+                                        return Result::Err(Error::FailedToCreateInsertStatement {
+                                            source: Box::new(e),
+                                        })
+                                    }
+                                },
+                            );
+                        }
+                    }
+                    DataType::Date64 => {
+                        let array = column.as_any().downcast_ref::<array::Date64Array>();
+                        if let Some(valid_array) = array {
+                            row_values.push(
+                                match OffsetDateTime::from_unix_timestamp(
+                                    valid_array.value(row) * 86_400,
+                                ) {
+                                    Ok(offset_time) => offset_time.date().into(),
+                                    Err(e) => {
+                                        return Result::Err(Error::FailedToCreateInsertStatement {
+                                            source: Box::new(e),
+                                        })
+                                    }
+                                },
+                            );
+                        }
+                    }
                     DataType::Timestamp(_, _) => {
                         let array = column
                             .as_any()
@@ -184,8 +236,10 @@ impl InsertBuilder {
                                         .into(),
                                     );
                                 }
-                                Err(_) => {
-                                    return;
+                                Err(e) => {
+                                    return Result::Err(Error::FailedToCreateInsertStatement {
+                                        source: Box::new(e),
+                                    })
                                 }
                             };
                         }
@@ -286,33 +340,54 @@ impl InsertBuilder {
                             }
                         }
                     }
-                    _ => unimplemented!(
-                        "Data type mapping not implemented for {}",
-                        column.data_type()
-                    ),
+                    unimplemented_type => {
+                        return Result::Err(Error::UnimplementedDataTypeInInsertStatement {
+                            data_type: unimplemented_type.clone(),
+                        })
+                    }
                 }
             }
-            insert_stmt.values_panic(row_values);
+            match insert_stmt.values(row_values) {
+                Ok(_) => (),
+                Err(e) => {
+                    return Result::Err(Error::FailedToCreateInsertStatement {
+                        source: Box::new(e),
+                    })
+                }
+            }
         }
+        Ok(())
     }
 
-    #[must_use]
-    pub fn build_postgres(self) -> String {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any `RecordBatch` fails to convert into a valid postgres insert statement.
+    pub fn build_postgres(self) -> Result<String> {
         self.build(PostgresQueryBuilder)
     }
 
-    #[must_use]
-    pub fn build_sqlite(self) -> String {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any `RecordBatch` fails to convert into a valid sqlite insert statement.
+    pub fn build_sqlite(self) -> Result<String> {
         self.build(SqliteQueryBuilder)
     }
 
-    #[must_use]
-    pub fn build_mysql(self) -> String {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any `RecordBatch` fails to convert into a valid `MySQL` insert statement.
+    pub fn build_mysql(self) -> Result<String> {
         self.build(MysqlQueryBuilder)
     }
 
-    #[must_use]
-    pub fn build<T: GenericBuilder>(&self, query_builder: T) -> String {
+    /// # Errors
+    ///
+    /// Returns an error if any `RecordBatch` fails to convert into a valid insert statement. Upon
+    /// error, no further `RecordBatch` is processed.
+    pub fn build<T: GenericBuilder>(&self, query_builder: T) -> Result<String> {
         let columns: Vec<Alias> = (self.record_batches[0])
             .schema()
             .fields()
@@ -326,9 +401,9 @@ impl InsertBuilder {
             .to_owned();
 
         for record_batch in &self.record_batches {
-            self.construct_insert_stmt(&mut insert_stmt, record_batch);
+            self.construct_insert_stmt(&mut insert_stmt, record_batch)?;
         }
-        insert_stmt.to_string(query_builder)
+        Ok(insert_stmt.to_string(query_builder))
     }
 }
 
@@ -349,6 +424,7 @@ fn map_data_type_to_column_type(data_type: &DataType) -> ColumnType {
         #[allow(clippy::cast_sign_loss)] // This is safe because scale will never be negative
         DataType::Decimal128(p, s) => ColumnType::Decimal(Some((u32::from(*p), *s as u32))),
         DataType::Timestamp(_unit, _time_zone) => ColumnType::Timestamp,
+        DataType::Date32 | DataType::Date64 => ColumnType::Date,
         DataType::List(list_type) => {
             ColumnType::Array(map_data_type_to_column_type(list_type.data_type()).into())
         }
@@ -415,7 +491,9 @@ mod tests {
         .expect("Unable to build record batch");
         let record_batches = vec![batch1, batch2];
 
-        let sql = InsertBuilder::new("users", record_batches).build_postgres();
+        let sql = InsertBuilder::new("users", record_batches)
+            .build_postgres()
+            .expect("Failed to build insert statement");
         assert_eq!(sql, "INSERT INTO \"users\" (\"id\", \"name\", \"age\") VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', 30), (1, 'a', 10), (2, 'b', 20), (3, 'c', 30)");
     }
 
@@ -450,7 +528,9 @@ mod tests {
         let batch = RecordBatch::try_new(Arc::new(schema1.clone()), vec![Arc::new(list_array)])
             .expect("Unable to build record batch");
 
-        let sql = InsertBuilder::new("arrays", vec![batch]).build_postgres();
+        let sql = InsertBuilder::new("arrays", vec![batch])
+            .build_postgres()
+            .expect("Failed to build insert statement");
         assert_eq!(
             sql,
             "INSERT INTO \"arrays\" (\"list\") VALUES (CAST(ARRAY [1,2,3] AS int4[])), (CAST(ARRAY [4,5,6] AS int4[])), (CAST(ARRAY [7,8,9] AS int4[]))"

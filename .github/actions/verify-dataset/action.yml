@@ -1,0 +1,64 @@
+name: 'Verify Dataset'
+description: 'Verifies that a dataset is available in Spice runtime'
+inputs:
+  name:
+    description: 'Name of the dataset to verify'
+    required: true
+  expected-rows-count:
+    description: 'Expected number of rows in the dataset'
+    required: false
+runs:
+  using: 'composite'
+  steps:
+    - name: Ensure datasets loaded
+      shell: bash
+      run: |
+        response=$(curl http://localhost:3000/v1/datasets)
+        echo $response | jq
+        length=$(echo $response | jq 'if type=="array" then length else empty end')
+        if [[ $length -ne 1 ]]; then
+          echo "Unexpected response: $response, expected 1 dataset but received $length"
+          exit 1
+        fi
+
+    - name: Verify table ${{ inputs.name }} exists
+      shell: bash
+      run: |
+        response=$(curl -X POST \
+          -H "Content-Type: text/plain" \
+          -d "show tables;" \
+          http://localhost:3000/v1/sql
+        )
+        echo $response | jq
+        table_exists=$(echo $response | jq '[.[] | select(.table_name == "${{ inputs.name }}")]' | jq 'length')
+        if [[ $table_exists -eq 0 ]]; then
+          echo "Unexpected response: table '${{ inputs.name }}' does not exist."
+          exit 1
+        fi
+
+    - name: Verify SQL REPL result count for table ${{ inputs.name }}
+      shell: bash
+      run: |
+        query="select * from ${{ inputs.name }} limit 10;"
+        echo "Executing query: $query"
+        sql_output=$(spice sql <<EOF
+        $query
+        .error
+        EOF
+        )
+
+        echo "$sql_output"
+        
+        if [[ $sql_output != *"No error to display"* ]]; then
+          echo "Unexpected response from spice sql, failed to perform test query"
+          exit 1
+        fi
+
+        if [[ -n "${{ inputs.expected-rows-count }}" ]]; then
+          expected_rows="${{ inputs.expected-rows-count }} rows"
+          expected_rows_displayed="${{ inputs.expected-rows-count }}/${{ inputs.expected-rows-count }} rows displayed"
+          if [[ $sql_output != *"$expected_rows"* ]] && [[ $sql_output != *"$expected_rows_displayed"* ]]; then
+            echo "Unexpected row count: ${{ inputs.expected-rows-count }}"
+            exit 1
+          fi
+        fi

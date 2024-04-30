@@ -56,6 +56,10 @@ Spice makes querying data by SQL across one or more data sources simple and fast
 
 **4. Easily query many data sources.** Federated SQL query across databases, data warehouses, and data lakes using [Data Connectors](https://docs.spiceai.org/data-connectors).
 
+### Watch a 30-sec BI dashboard acceleration demo
+
+https://github.com/spiceai/spiceai/assets/80174/7735ee94-3f4a-4983-a98e-fe766e79e03a
+
 ### Supported Data Connectors
 
 Currently supported data connectors for upstream datasets. More coming soon.
@@ -69,6 +73,9 @@ Currently supported data connectors for upstream datasets. More coming soon.
 | `dremio`     | [Dremio](https://github.com/spiceai/quickstarts/tree/trunk/dremio#readme)                      | Alpha        | Arrow Flight                                                                                       | `full`           |
 | `mysql`      | MySQL                                                                                          | Alpha        |                                                                                                    | `full`           |
 | `duckdb`     | DuckDB                                                                                         | Alpha        |                                                                                                    | `full`           |
+| `clickhouse` | Clickhouse                                                                                     | Alpha        |                                                                                                    | `full`           |
+| `odbc`       | ODBC                                                                                           | Alpha        |  ODBC                                                                                              | `full`           |
+| `spark`      | Spark                                                                                          | Alpha        | [Spark Connect](https://spark.apache.org/docs/latest/spark-connect-overview.html)                  | `full`           |
 | `snowflake`  | Snowflake                                                                                      | Coming soon! | Arrow Flight SQL                                                                                   | `full`           |
 | `bigquery`   | BigQuery                                                                                       | Coming soon! | Arrow Flight SQL                                                                                   | `full`           |
 
@@ -162,7 +169,7 @@ dependencies:
 The `spiceai/quickstart` Spicepod will add a `taxi_trips` data table to the runtime which is now available to query by SQL.
 
 ```bash
-2024-02-22T05:53:48.222952Z  INFO runtime: Loaded dataset: taxi_trips
+2024-02-22T05:53:48.222952Z  INFO runtime: Loaded dataset taxi_trips
 2024-02-22T05:53:48.223101Z  INFO runtime::dataconnector: Refreshing data for taxi_trips
 ```
 
@@ -175,7 +182,7 @@ spice sql
 The SQL REPL inferface will be shown:
 
 ```
-Welcome to the interactive Spice.ai SQL Query Utility! Type 'help' for help.
+Welcome to the Spice.ai SQL REPL! Type 'help' for help.
 
 show tables; -- list available tables
 sql>
@@ -191,7 +198,7 @@ sql> show tables
 | taxi_trips |
 +------------+
 
-Query took: 0.007505084 seconds. 1/1 rows displayed.
+Time: 0.007505084 seconds. 1 rows.
 ```
 
 Enter a query to display the longest taxi trips:
@@ -218,7 +225,7 @@ Output:
 | 44018.64      | 52.43        |
 +---------------+--------------+
 
-Query took: 0.002458976 seconds
+Time: 0.002458976 seconds
 ```
 
 ## ⚙️ Runtime Container Deployment
@@ -314,7 +321,7 @@ Locally accelerate (y/n)? y
 You should see the following output from your runtime terminal:
 
 ```bash
-2024-02-21T22:49:10.038461Z  INFO runtime: Loaded dataset: eth_recent_blocks
+2024-02-21T22:49:10.038461Z  INFO runtime: Loaded dataset eth_recent_blocks
 ```
 
 **Step 4.** In a new terminal window, use the Spice SQL REPL to query the dataset
@@ -345,7 +352,7 @@ The output displays the results of the query along with the query execution time
 | 19281336 | 150137 | 13418403 |
 +----------+--------+----------+
 
-Query took: 0.004057791 seconds
+Time: 0.004057791 seconds
 ```
 
 You can experiment with the time it takes to generate queries when using non-accelerated datasets. You can change the acceleration setting from `true` to `false` in the datasets.yaml file.

@@ -227,7 +227,9 @@ impl Sqlite {
         batch: RecordBatch,
     ) -> rusqlite::Result<()> {
         let insert_table_builder = InsertBuilder::new(&self.table_name, vec![batch]);
-        let sql = insert_table_builder.build_sqlite();
+        let sql = insert_table_builder
+            .build_sqlite()
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
 
         transaction.execute(&sql, [])?;
 

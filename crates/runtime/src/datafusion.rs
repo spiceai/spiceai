@@ -330,7 +330,7 @@ impl DataFusion {
                 .context(RefreshSqlSnafu)?;
         }
 
-        Ok(AcceleratedTable::new(
+        let mut accelerated_table_builder = AcceleratedTable::builder(
             dataset.name.to_string(),
             source_table_provider,
             accelerated_table_provider,
@@ -340,18 +340,20 @@ impl DataFusion {
                 dataset.refresh_check_interval(),
                 refresh_sql.clone(),
                 acceleration_settings.refresh_mode.clone(),
-                dataset.refresh_period(),
+                dataset.refresh_data_window(),
             ),
-            Retention::new(
-                dataset.time_column.clone(),
-                dataset.time_format.clone(),
-                dataset.retention_period(),
-                dataset.retention_check_interval(),
-                acceleration_settings.retention_check_enabled,
-            ),
-            obj_store,
-        )
-        .await)
+        );
+        accelerated_table_builder.object_store(obj_store);
+        accelerated_table_builder.retention(Retention::new(
+            dataset.time_column.clone(),
+            dataset.time_format.clone(),
+            dataset.retention_period(),
+            dataset.retention_check_interval(),
+            acceleration_settings.retention_check_enabled,
+        ));
+        accelerated_table_builder.zero_results_action(acceleration_settings.on_zero_results);
+
+        Ok(accelerated_table_builder.build().await)
     }
 
     async fn register_accelerated_table(

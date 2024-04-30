@@ -16,57 +16,28 @@ limitations under the License.
 
 use async_trait::async_trait;
 use datafusion::{common::OwnedTableReference, datasource::TableProvider};
-use secrets::Secret;
-use spark_connect_rs::{SparkSession, SparkSessionBuilder};
-use std::{collections::HashMap, error::Error, sync::Arc};
+use std::{error::Error, sync::Arc};
+use uuid::Uuid;
 
-use crate::{spark_connect, Read, ReadWrite};
+use crate::{spark_connect::SparkConnect, Read, ReadWrite};
 
 #[derive(Clone)]
 #[allow(clippy::module_name_repetitions)]
 pub struct DatabricksSparkConnect {
-    pub secret: Arc<Option<Secret>>,
-    pub params: Arc<Option<HashMap<String, String>>>,
-    session: Arc<SparkSession>,
+    spark_connect: SparkConnect,
 }
 impl DatabricksSparkConnect {
     pub async fn new(
-        secret: Arc<Option<Secret>>,
-        params: Arc<Option<HashMap<String, String>>>,
+        endpoint: String,
+        user: Option<String>,
+        cluster_id: String,
+        token: String,
     ) -> Result<Self, Box<dyn Error + Send + Sync>> {
-        let param_deref = match params.as_ref() {
-            None => return Err("Dataset params not found".into()),
-            Some(params) => params,
-        };
-
-        let Some(endpoint) = param_deref.get("endpoint") else {
-            return Err("Databricks Workspace not found in dataset params".into());
-        };
-        let Some(cluster_id) = param_deref.get("databricks-cluster-id") else {
-            return Err(
-                "Databricks Cluster ID (databricks-cluster-id) not found in dataset params".into(),
-            );
-        };
-        let Some(secrets) = secret.as_ref() else {
-            return Err("No secret found, DATABRICKS TOKEN not available".into());
-        };
-        let Some(token) = secrets.get("token") else {
-            return Err("Secrets found, but DATABRICKS TOKEN not available".into());
-        };
-        let mut user = "spice.ai";
-        if let Some(user_val) = param_deref.get("endpoint") {
-            user = user_val.as_str();
-        };
-        let connection = format!("sc://{endpoint}:443/;user_id={user};session_id=0d2af2a9-cc3c-4d4b-bf27-e2fefeaca233;token={token};x-databricks-cluster-id={cluster_id}");
-        let session = Arc::new(
-            SparkSessionBuilder::remote(connection.as_str())
-                .build()
-                .await?,
-        );
+        let user = user.unwrap_or("spice.ai".to_string());
+        let session_id = Uuid::new_v4();
+        let connection = format!("sc://{endpoint}:443/;user_id={user};session_id={session_id};token={token};x-databricks-cluster-id={cluster_id}");
         Ok(Self {
-            secret,
-            params,
-            session,
+            spark_connect: SparkConnect::from_connection(connection.as_str()).await?,
         })
     }
 }
@@ -77,9 +48,7 @@ impl ReadWrite for DatabricksSparkConnect {
         &self,
         table_reference: OwnedTableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn Error + Send + Sync>> {
-        let provider =
-            spark_connect::get_table_provider(Arc::clone(&self.session), table_reference).await?;
-        Ok(provider)
+        Ok(ReadWrite::table_provider(&self.spark_connect, table_reference).await?)
     }
 }
 
@@ -89,8 +58,6 @@ impl Read for DatabricksSparkConnect {
         &self,
         table_reference: OwnedTableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn Error + Send + Sync>> {
-        let provider =
-            spark_connect::get_table_provider(Arc::clone(&self.session), table_reference).await?;
-        Ok(provider)
+        Ok(Read::table_provider(&self.spark_connect, table_reference).await?)
     }
 }
