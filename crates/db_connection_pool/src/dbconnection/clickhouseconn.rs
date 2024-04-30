@@ -15,15 +15,20 @@ limitations under the License.
 */
 
 use std::any::Any;
+use std::pin::Pin;
 use std::sync::Arc;
 
-use arrow::datatypes::SchemaRef;
+use arrow::array::RecordBatch;
+use arrow::datatypes::{Schema, SchemaRef};
 use arrow_sql_gen::clickhouse::block_to_arrow;
-use clickhouse_rs::ClientHandle;
+use async_stream::stream;
+use clickhouse_rs::{Block, ClientHandle, Pool};
+use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
-use datafusion::physical_plan::memory::MemoryStream;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::sql::TableReference;
 use futures::lock::Mutex;
+use futures::{stream, Stream, StreamExt};
 use snafu::prelude::*;
 
 use super::Result;
@@ -31,6 +36,10 @@ use super::{AsyncDbConnection, DbConnection};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
+    #[snafu(display("ConnectionPoolError: {source}"))]
+    ConnectionPoolError {
+        source: clickhouse_rs::errors::Error,
+    },
     #[snafu(display("{source}"))]
     QueryError {
         source: clickhouse_rs::errors::Error,
@@ -43,6 +52,18 @@ pub enum Error {
 
 pub struct ClickhouseConnection {
     pub conn: Arc<Mutex<ClientHandle>>,
+    pool: Arc<Pool>,
+}
+
+impl ClickhouseConnection {
+    // We need to pass the pool to the connection so that we can get a new connection handle
+    // This needs to be done because the query_owned consumes the connection handle
+    pub fn new(conn: ClientHandle, pool: Arc<Pool>) -> Self {
+        Self {
+            conn: Arc::new(Mutex::new(conn)),
+            pool,
+        }
+    }
 }
 
 impl<'a> DbConnection<ClientHandle, &'a (dyn Sync)> for ClickhouseConnection {
@@ -64,10 +85,9 @@ impl<'a> DbConnection<ClientHandle, &'a (dyn Sync)> for ClickhouseConnection {
 // But keep it in mind.
 #[async_trait::async_trait]
 impl<'a> AsyncDbConnection<ClientHandle, &'a (dyn Sync)> for ClickhouseConnection {
-    fn new(conn: ClientHandle) -> Self {
-        ClickhouseConnection {
-            conn: Arc::new(Mutex::new(conn)),
-        }
+    // Required by trait, but not used.
+    fn new(_: ClientHandle) -> Self {
+        unreachable!()
     }
 
     async fn get_schema(&self, table_reference: &TableReference) -> Result<SchemaRef> {
@@ -90,14 +110,25 @@ impl<'a> AsyncDbConnection<ClientHandle, &'a (dyn Sync)> for ClickhouseConnectio
         sql: &str,
         _: &[&'a (dyn Sync)],
     ) -> Result<SendableRecordBatchStream> {
-        let mut conn = self.conn.lock().await;
-        let conn = &mut *conn;
-        let block = conn.query(sql).fetch_all().await.context(QuerySnafu)?;
-        let rec = block_to_arrow(&block).context(ConversionSnafu)?;
+        let conn = self.pool.get_handle().await.context(ConnectionPoolSnafu)?;
+        let mut block_stream = conn.query_owned(sql).stream_blocks();
+        let first_block = block_stream.next().await;
+        if first_block.is_none() {
+            return Ok(Box::pin(RecordBatchStreamAdapter::new(
+                Arc::new(Schema::empty()),
+                stream::empty(),
+            )));
+        }
+        let first_block = first_block
+            .unwrap_or(Ok(Block::new()))
+            .context(QuerySnafu)?;
+        let rec = block_to_arrow(&first_block).context(ConversionSnafu)?;
         let schema = rec.schema();
-        let recs = vec![rec];
 
-        Ok(Box::pin(MemoryStream::try_new(recs, schema, None)?))
+        let stream_adapter =
+            RecordBatchStreamAdapter::new(schema, query_to_stream(rec, block_stream));
+
+        Ok(Box::pin(stream_adapter))
     }
 
     async fn execute(&self, query: &str, _: &[&'a (dyn Sync)]) -> Result<u64> {
@@ -107,5 +138,34 @@ impl<'a> AsyncDbConnection<ClientHandle, &'a (dyn Sync)> for ClickhouseConnectio
         // Clickhouse driver doesn't return number of rows affected.
         // Shouldn't be an issue for now since we don't have a data accelerator for now.
         Ok(0)
+    }
+}
+
+fn query_to_stream(
+    first_batch: RecordBatch,
+    mut block_stream: Pin<
+        Box<dyn Stream<Item = Result<Block, clickhouse_rs::errors::Error>> + Send>,
+    >,
+) -> impl Stream<Item = datafusion::common::Result<RecordBatch>> {
+    stream! {
+       yield Ok(first_batch);
+       while let Some(block) = block_stream.next().await {
+            match block {
+                Ok(block) => {
+                    let rec = block_to_arrow(&block);
+                    match rec {
+                        Ok(rec) => {
+                            yield Ok(rec);
+                        }
+                        Err(e) => {
+                            yield Err(DataFusionError::Execution(format!("Failed to convert query result to Arrow: {e}")));
+                        }
+                    }
+                }
+                Err(e) => {
+                    yield Err(DataFusionError::Execution(format!("Failed to fetch block: {e}")));
+                }
+            }
+       }
     }
 }

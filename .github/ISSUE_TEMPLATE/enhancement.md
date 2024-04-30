@@ -49,6 +49,7 @@ A target date for done-done completion of the entire enhancement.
 - [ ] Tests
 - [ ] Documentation
 - [ ] Samples/Quickstarts/Tutorials
+- [ ] Release Notes
 
 ## The Algorithm
 
