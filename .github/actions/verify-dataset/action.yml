@@ -39,11 +39,18 @@ runs:
     - name: Verify SQL REPL result count for table ${{ inputs.name }}
       shell: bash
       run: |
-        sql_output=$(echo "select * from ${{ inputs.name }} limit 10;" | spice sql)
-        echo "$sql_output"
+        query="select * from ${{ inputs.name }} limit 10;"
+        echo "Executing query: $query"
+        sql_output=$(spice sql <<EOF
+        $query
+        .error
+        EOF
+        )
 
-        if [[ $sql_output == *"error"* ]] || [[ $sql_output == *"not found"* ]]; then
-          echo "Unexpected response from spice sql, failed to perform test query: $sql_output"
+        echo "$sql_output"
+        
+        if [[ $sql_output != *"No error to display"* ]]; then
+          echo "Unexpected response from spice sql, failed to perform test query"
           exit 1
         fi
 
