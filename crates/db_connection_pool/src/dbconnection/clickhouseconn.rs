@@ -22,7 +22,7 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow_sql_gen::clickhouse::block_to_arrow;
 use async_stream::stream;
-use clickhouse_rs::{Block, ClientHandle};
+use clickhouse_rs::{Block, ClientHandle, Pool};
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -36,6 +36,10 @@ use super::{AsyncDbConnection, DbConnection};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
+    #[snafu(display("ConnectionPoolError: {source}"))]
+    ConnectionPoolError {
+        source: clickhouse_rs::errors::Error,
+    },
     #[snafu(display("{source}"))]
     QueryError {
         source: clickhouse_rs::errors::Error,
@@ -48,6 +52,18 @@ pub enum Error {
 
 pub struct ClickhouseConnection {
     pub conn: Arc<Mutex<ClientHandle>>,
+    pool: Arc<Pool>,
+}
+
+impl ClickhouseConnection {
+    // We need to pass the pool to the connection so that we can get a new connection handle
+    // This needs to be done because the query_owned consumes the connection handle
+    pub fn new(conn: ClientHandle, pool: Arc<Pool>) -> Self {
+        Self {
+            conn: Arc::new(Mutex::new(conn)),
+            pool,
+        }
+    }
 }
 
 impl<'a> DbConnection<ClientHandle, &'a (dyn Sync)> for ClickhouseConnection {
@@ -69,10 +85,9 @@ impl<'a> DbConnection<ClientHandle, &'a (dyn Sync)> for ClickhouseConnection {
 // But keep it in mind.
 #[async_trait::async_trait]
 impl<'a> AsyncDbConnection<ClientHandle, &'a (dyn Sync)> for ClickhouseConnection {
-    fn new(conn: ClientHandle) -> Self {
-        ClickhouseConnection {
-            conn: Arc::new(Mutex::new(conn)),
-        }
+    // Required by trait, but not used.
+    fn new(_: ClientHandle) -> Self {
+        unreachable!()
     }
 
     async fn get_schema(&self, table_reference: &TableReference) -> Result<SchemaRef> {
@@ -95,9 +110,8 @@ impl<'a> AsyncDbConnection<ClientHandle, &'a (dyn Sync)> for ClickhouseConnectio
         sql: &str,
         _: &[&'a (dyn Sync)],
     ) -> Result<SendableRecordBatchStream> {
-        let mut conn = self.conn.lock().await;
-        let conn = &mut *conn;
-        let mut block_stream = conn.query(sql).stream_blocks();
+        let conn = self.pool.get_handle().await.context(ConnectionPoolSnafu)?;
+        let mut block_stream = conn.query_owned(sql).stream_blocks();
         let first_block = block_stream.next().await;
         if first_block.is_none() {
             return Ok(Box::pin(RecordBatchStreamAdapter::new(
@@ -105,7 +119,9 @@ impl<'a> AsyncDbConnection<ClientHandle, &'a (dyn Sync)> for ClickhouseConnectio
                 stream::empty(),
             )));
         }
-        let first_block = first_block.unwrap().context(QuerySnafu)?;
+        let first_block = first_block
+            .unwrap_or(Ok(Block::new()))
+            .context(QuerySnafu)?;
         let rec = block_to_arrow(&first_block).context(ConversionSnafu)?;
         let schema = rec.schema();
 
@@ -133,7 +149,7 @@ fn query_to_stream(
 ) -> impl Stream<Item = datafusion::common::Result<RecordBatch>> {
     stream! {
        yield Ok(first_batch);
-        for block in block_stream.next().await {
+       while let Some(block) = block_stream.next().await {
             match block {
                 Ok(block) => {
                     let rec = block_to_arrow(&block);
@@ -142,15 +158,14 @@ fn query_to_stream(
                             yield Ok(rec);
                         }
                         Err(e) => {
-                            yield Err(DataFusionError::Execution(format!("Failed to convert query result to Arrow: {}", e)).into());
+                            yield Err(DataFusionError::Execution(format!("Failed to convert query result to Arrow: {e}")));
                         }
                     }
                 }
                 Err(e) => {
-                    yield Err(DataFusionError::Execution(format!("Failed to fetch block: {}", e)).into());
+                    yield Err(DataFusionError::Execution(format!("Failed to fetch block: {e}")));
                 }
             }
-        }
-        yield Err(DataFusionError::Execution("Not implemented".to_string()));
+       }
     }
 }

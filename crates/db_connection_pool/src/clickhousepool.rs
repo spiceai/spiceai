@@ -27,7 +27,7 @@ use secrets::Secret;
 use snafu::{ResultExt, Snafu};
 
 use crate::{
-    dbconnection::{clickhouseconn::ClickhouseConnection, AsyncDbConnection, DbConnection},
+    dbconnection::{clickhouseconn::ClickhouseConnection, DbConnection},
     get_secret_or_param,
 };
 
@@ -185,6 +185,9 @@ impl DbConnectionPool<ClientHandle, &'static (dyn Sync)> for ClickhouseConnectio
     async fn connect(&self) -> Result<Box<dyn DbConnection<ClientHandle, &'static (dyn Sync)>>> {
         let pool = Arc::clone(&self.pool);
         let conn = pool.get_handle().await.context(ConnectionPoolRunSnafu)?;
-        Ok(Box::new(ClickhouseConnection::new(conn)))
+        Ok(Box::new(ClickhouseConnection::new(
+            conn,
+            Arc::clone(&self.pool),
+        )))
     }
 }
