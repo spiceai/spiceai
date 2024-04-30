@@ -18,6 +18,7 @@ limitations under the License.
 
 use std::borrow::Borrow;
 use std::collections::HashSet;
+use std::iter;
 use std::net::SocketAddr;
 use std::{collections::HashMap, sync::Arc};
 
@@ -281,11 +282,12 @@ impl Runtime {
         {
             Ok(data_connector) => data_connector,
             Err(err) => {
+                let processed_err = get_source_error(&err);
                 status::update_dataset(&ds.name, status::ComponentStatus::Error);
                 metrics::counter!("datasets_load_error").increment(1);
                 warn_spaced!(
                     spaced_tracer,
-                    "Failed to get data connector from source for dataset {}: {err}",
+                    "Failed to get data connector from source for dataset {}: {processed_err}",
                     &ds.name
                 );
                 return UnableToLoadDatasetConnectorSnafu {
@@ -885,4 +887,16 @@ async fn shutdown_signal() {
     tokio::select! {
         () = ctrl_c => {},
     }
+}
+
+// TODO: Distinguish between Spice error and Error from external crate
+pub fn get_source_error(error: &impl std::error::Error) -> &dyn snafu::Error {
+    let mut last_error = None;
+    for e in iter::successors(error.source(), |&e| e.source()) {
+        last_error = Some(e);
+    }
+    if let Some(e) = last_error {
+        return e;
+    }
+    error
 }
