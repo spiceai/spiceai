@@ -176,27 +176,28 @@ fn try_cast_array_from_string_to_timestamp(
             let converted: Vec<Option<i64>> = array
                 .into_iter()
                 .map(|f| -> Result<Option<i64>> {
-                    if let Some(f) = f {
-                        let value =
-                            chrono::NaiveDateTime::parse_from_str(f, "%Y-%m-%d %H:%M:%S%.6f")
-                                .context(ParseTimestampFromStringSnafu)?
-                                .and_utc()
-                                .timestamp_micros()
-                                / (match unit {
-                                    TimeUnit::Second => 1_000_000,
-                                    TimeUnit::Millisecond => 1_000,
-                                    TimeUnit::Microsecond => 1,
-                                    TimeUnit::Nanosecond => ConvertArrowArraySnafu {
-                                        from: DataType::Timestamp(unit.clone(), None),
-                                        to: data_type.clone(),
-                                        name: field.name(),
-                                    }
-                                    .fail()?,
-                                });
-                        Ok(Some(value))
-                    } else {
-                        Ok(None)
-                    }
+                    f.map_or_else(
+                        || Ok(None),
+                        |f| {
+                            let value =
+                                chrono::NaiveDateTime::parse_from_str(f, "%Y-%m-%d %H:%M:%S%.6f")
+                                    .context(ParseTimestampFromStringSnafu)?
+                                    .and_utc()
+                                    .timestamp_micros()
+                                    / (match unit {
+                                        TimeUnit::Second => 1_000_000,
+                                        TimeUnit::Millisecond => 1_000,
+                                        TimeUnit::Microsecond => 1,
+                                        TimeUnit::Nanosecond => ConvertArrowArraySnafu {
+                                            from: DataType::Timestamp(unit.clone(), None),
+                                            to: data_type.clone(),
+                                            name: field.name(),
+                                        }
+                                        .fail()?,
+                                    });
+                            Ok(Some(value))
+                        },
+                    )
                 })
                 .collect::<Result<_, _>>()?;
             match unit.clone() {
