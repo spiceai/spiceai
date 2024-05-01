@@ -25,6 +25,7 @@ use datafusion::physical_plan::{
 };
 use futures::StreamExt;
 use std::any::Any;
+use std::clone::Clone;
 use std::fmt;
 use std::ops::Deref;
 use std::sync::Arc;
@@ -79,15 +80,19 @@ impl ExecutionPlan for SchemaCastScanExec {
     }
 
     fn schema(&self) -> SchemaRef {
-        let mut fields: Vec<Field> = vec![];
-        for field in self.input.schema().fields() {
-            match self.schema.field_with_name(field.name()) {
-                Ok(f) => fields.push(f.clone()),
-                Err(_) => fields.push(field.deref().clone()),
-            }
-        }
-
-        Arc::new(Schema::new(fields))
+        Arc::new(Schema::new(
+            self.input
+                .schema()
+                .fields()
+                .into_iter()
+                .map(|field| {
+                    self.schema
+                        .field_with_name(field.name())
+                        .ok()
+                        .map_or(field.deref().clone(), Clone::clone)
+                })
+                .collect::<Vec<Field>>(),
+        ))
     }
 
     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
