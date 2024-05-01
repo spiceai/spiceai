@@ -5750,6 +5750,7 @@ dependencies = [
  "arrow-ipc",
  "arrow-json",
  "arrow_sql_gen",
+ "arrow_tools",
  "async-stream",
  "async-trait",
  "axum 0.7.5",
