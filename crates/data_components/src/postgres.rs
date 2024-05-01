@@ -19,7 +19,7 @@ use arrow::{
     array::RecordBatch,
     datatypes::{Schema, SchemaRef},
 };
-use arrow_sql_gen::statement::{CreateTableBuilder, InsertBuilder};
+use arrow_sql_gen::statement::{CreateTableBuilder, Error as SqlGenError, InsertBuilder};
 use async_trait::async_trait;
 use bb8_postgres::{
     tokio_postgres::{types::ToSql, Transaction},
@@ -110,6 +110,9 @@ pub enum Error {
     UnableToInsertArrowBatch {
         source: tokio_postgres::error::Error,
     },
+
+    #[snafu(display("Unable to create insertion statement for Postgres table: {source}"))]
+    UnableToCreateInsertStatement { source: SqlGenError },
 
     #[snafu(display("The table '{table_name}' doesn't exist in the Postgres server"))]
     TableDoesntExist { table_name: String },
@@ -295,7 +298,9 @@ impl Postgres {
 
     async fn insert_batch(&self, transaction: &Transaction<'_>, batch: RecordBatch) -> Result<()> {
         let insert_table_builder = InsertBuilder::new(&self.table_name, vec![batch]);
-        let sql = insert_table_builder.build_postgres();
+        let sql = insert_table_builder
+            .build_postgres()
+            .context(UnableToCreateInsertStatementSnafu)?;
 
         transaction
             .execute(&sql, &[])

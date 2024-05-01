@@ -32,7 +32,9 @@ use sea_query::{
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Failed to build insert statement: {source}"))]
-    FailedToCreateInsertStatement { source: Box<dyn std::error::Error> },
+    FailedToCreateInsertStatement {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 
     #[snafu(display("Unimplemented data type in insert statement: {data_type:?}"))]
     UnimplementedDataTypeInInsertStatement { data_type: DataType },
@@ -357,37 +359,28 @@ impl InsertBuilder {
         Ok(())
     }
 
-    #[must_use]
-    pub fn build_postgres(self) -> String {
-        match self.build(PostgresQueryBuilder) {
-            Ok(sql) => sql,
-            Err(e) => {
-                tracing::error!("Failed to build PostgreSQL insert statement: {}", e);
-                String::default()
-            }
-        }
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any `RecordBatch` fails to convert into a valid postgres insert statement.
+    pub fn build_postgres(self) -> Result<String> {
+        self.build(PostgresQueryBuilder)
     }
 
-    #[must_use]
-    pub fn build_sqlite(self) -> String {
-        match self.build(SqliteQueryBuilder) {
-            Ok(sql) => sql,
-            Err(e) => {
-                tracing::error!("Failed to build SQLite insert statement: {}", e);
-                String::default()
-            }
-        }
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any `RecordBatch` fails to convert into a valid sqlite insert statement.
+    pub fn build_sqlite(self) -> Result<String> {
+        self.build(SqliteQueryBuilder)
     }
 
-    #[must_use]
-    pub fn build_mysql(self) -> String {
-        match self.build(MysqlQueryBuilder) {
-            Ok(sql) => sql,
-            Err(e) => {
-                tracing::error!("Failed to build MySQL insert statement: {}", e);
-                String::default()
-            }
-        }
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any `RecordBatch` fails to convert into a valid `MySQL` insert statement.
+    pub fn build_mysql(self) -> Result<String> {
+        self.build(MysqlQueryBuilder)
     }
 
     /// # Errors
@@ -498,7 +491,9 @@ mod tests {
         .expect("Unable to build record batch");
         let record_batches = vec![batch1, batch2];
 
-        let sql = InsertBuilder::new("users", record_batches).build_postgres();
+        let sql = InsertBuilder::new("users", record_batches)
+            .build_postgres()
+            .expect("Failed to build insert statement");
         assert_eq!(sql, "INSERT INTO \"users\" (\"id\", \"name\", \"age\") VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', 30), (1, 'a', 10), (2, 'b', 20), (3, 'c', 30)");
     }
 
@@ -533,7 +528,9 @@ mod tests {
         let batch = RecordBatch::try_new(Arc::new(schema1.clone()), vec![Arc::new(list_array)])
             .expect("Unable to build record batch");
 
-        let sql = InsertBuilder::new("arrays", vec![batch]).build_postgres();
+        let sql = InsertBuilder::new("arrays", vec![batch])
+            .build_postgres()
+            .expect("Failed to build insert statement");
         assert_eq!(
             sql,
             "INSERT INTO \"arrays\" (\"list\") VALUES (CAST(ARRAY [1,2,3] AS int4[])), (CAST(ARRAY [4,5,6] AS int4[])), (CAST(ARRAY [7,8,9] AS int4[]))"

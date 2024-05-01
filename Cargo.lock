@@ -1758,10 +1758,10 @@ checksum = "98cc8fbded0c607b7ba9dd60cd98df59af97e84d24e49c8557331cfc26d301ce"
 [[package]]
 name = "clickhouse-rs"
 version = "1.1.0-alpha.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "802fe62a5480415bcdbb5217b3ea029d748c9a3ce3b884767cf58888e33e7f65"
+source = "git+https://github.com/spiceai/clickhouse-rs.git?branch=async-await#36a87884321fbf296876ab0b63d611f19f5f0e02"
 dependencies = [
  "byteorder",
+ "cfg-if",
  "chrono",
  "chrono-tz",
  "clickhouse-rs-cityhash-sys",
@@ -1788,8 +1788,7 @@ dependencies = [
 [[package]]
 name = "clickhouse-rs-cityhash-sys"
 version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4baf9d4700a28d6cb600e17ed6ae2b43298a5245f1f76b4eab63027ebfd592b9"
+source = "git+https://github.com/spiceai/clickhouse-rs.git?branch=async-await#36a87884321fbf296876ab0b63d611f19f5f0e02"
 dependencies = [
  "cc",
 ]
@@ -2409,6 +2408,7 @@ dependencies = [
  "arrow",
  "arrow-odbc",
  "arrow_sql_gen",
+ "async-stream",
  "async-trait",
  "bb8",
  "bb8-postgres",
