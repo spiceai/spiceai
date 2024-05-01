@@ -123,18 +123,8 @@ impl ExecutionPlan for SchemaCastScanExec {
             {
                 stream! {
                     while let Some(batch) = stream.next().await {
-                        let batch = match batch {
-                            Ok(batch) => {
-                                let batch = arrow_tools::record_batch::cast_to(batch, Arc::clone(&schema));
-                                match batch {
-                                    Ok(batch) => Ok(batch),
-                                    Err(e) => Err(DataFusionError::External(Box::new(e))),
-                                }
-                            },
-                            Err(e) => Err(e),
-                        };
-
-                        yield batch;
+                        let batch = arrow_tools::record_batch::cast_to(batch?, Arc::clone(&schema));
+                        yield batch.map_err(|e| { DataFusionError::External(Box::new(e)) });
                     }
                 }
             },
