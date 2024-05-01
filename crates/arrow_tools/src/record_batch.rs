@@ -16,8 +16,8 @@ limitations under the License.
 
 use arrow::{
     array::{
-        new_null_array, Array, ArrayRef, Int32Array, Int64Array, LargeStringArray, RecordBatch,
-        StringArray, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampSecondArray,
+        new_null_array, Array, Int32Array, Int64Array, LargeStringArray, RecordBatch, StringArray,
+        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampSecondArray,
     },
     datatypes::{DataType, Field, SchemaRef, TimeUnit},
 };
@@ -43,6 +43,12 @@ pub enum Error {
 
     #[snafu(display("Unable to try from int: {}", source))]
     ConvertInt { source: TryFromIntError },
+
+    #[snafu(display("Unable to use null for field {field}"))]
+    UnableToUseNullForField { field: String },
+
+    #[snafu(display("Unable to downcast array {field} to {downcast_to}"))]
+    UnableToDowncast { field: String, downcast_to: String },
 }
 
 /// Cast a given record batch into a new record batch with the given schema.
@@ -60,25 +66,29 @@ pub fn try_cast_to(record_batch: RecordBatch, schema: SchemaRef) -> Result<Recor
             .context(ConvertRecordBatchSnafu);
     }
 
-    let num_rows = record_batch.num_rows();
-    let mut cols = vec![];
-
-    for field in schema.fields() {
-        let mut array: ArrayRef = new_null_array(field.data_type(), num_rows);
-
-        if let (Ok(existing_field), Some(column)) = (
-            record_batch.schema().field_with_name(field.name()),
-            record_batch.column_by_name(field.name()),
-        ) {
-            if field.contains(existing_field) {
-                array = Arc::clone(column);
+    let cols = schema
+        .fields()
+        .into_iter()
+        .map(|field| {
+            if let (Ok(existing_field), Some(column)) = (
+                record_batch.schema().field_with_name(field.name()),
+                record_batch.column_by_name(field.name()),
+            ) {
+                if field.contains(existing_field) {
+                    Ok(Arc::clone(column))
+                } else {
+                    try_cast_array(Arc::clone(column), existing_field, field)
+                }
+            } else if field.is_nullable() {
+                Ok(new_null_array(field.data_type(), record_batch.num_rows()))
             } else {
-                array = try_cast_array(Arc::clone(column), existing_field, field)?;
+                UnableToUseNullForFieldSnafu {
+                    field: field.name(),
+                }
+                .fail()
             }
-        }
-
-        cols.push(array);
-    }
+        })
+        .collect::<Result<Vec<Arc<dyn Array>>>>()?;
 
     RecordBatch::try_new(schema, cols).context(ConvertRecordBatchSnafu)
 }
@@ -99,7 +109,11 @@ fn try_cast_array(
                         .collect::<Vec<Option<i64>>>(),
                 ))
             } else {
-                Arc::new(new_null_array(field.data_type(), array.len()))
+                UnableToDowncastSnafu {
+                    field: field.name(),
+                    downcast_to: "Int32Array".to_string(),
+                }
+                .fail()?
             }
         }
         (DataType::Int64, DataType::Int32) => {
@@ -116,7 +130,11 @@ fn try_cast_array(
                         .collect::<Result<Vec<Option<i32>>, _>>()?,
                 ))
             } else {
-                Arc::new(new_null_array(field.data_type(), array.len()))
+                UnableToDowncastSnafu {
+                    field: field.name(),
+                    downcast_to: "Int64Array".to_string(),
+                }
+                .fail()?
             }
         }
         (DataType::Utf8, DataType::LargeUtf8) => {
@@ -125,7 +143,11 @@ fn try_cast_array(
                     array.into_iter().collect::<Vec<Option<&str>>>(),
                 ))
             } else {
-                Arc::new(new_null_array(field.data_type(), array.len()))
+                UnableToDowncastSnafu {
+                    field: field.name(),
+                    downcast_to: "StringArray".to_string(),
+                }
+                .fail()?
             }
         }
         (DataType::Utf8, DataType::Timestamp(unit, _)) => {
@@ -189,7 +211,11 @@ fn try_cast_array_from_string_to_timestamp(
                 .fail()?,
             }
         } else {
-            Arc::new(new_null_array(field.data_type(), array.len()))
+            UnableToDowncastSnafu {
+                field: field.name(),
+                downcast_to: "StringArray".to_string(),
+            }
+            .fail()?
         },
     )
 }
