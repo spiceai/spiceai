@@ -51,6 +51,7 @@ postgres = [
     "dep:tokio",
     "arrow_sql_gen/postgres",
     "spicepod/postgres",
+    "dep:tokio-postgres",
 ]
 sqlite = ["dep:rusqlite", "dep:tokio-rusqlite", "arrow_sql_gen/sqlite", "spicepod/sqlite"]
 mysql = ["dep:mysql_async", "arrow_sql_gen/mysql", "spicepod/mysql"]
