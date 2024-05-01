@@ -23,6 +23,7 @@ const (
 	AUTH_TYPE_DATABRICKS      = "databricks"
 	AUTH_TYPE_POSTGRES        = "postgres"
 	AUTH_TYPE_POSTGRES_ENGINE = "postgres_engine"
+	AUTH_TYPE_SNOWFLAKE       = "snowflake"
 	AUTH_PARAM_PG_PASSWORD    = "pg_pass"
 
 	AUTH_PARAM_KEY      = "key"
