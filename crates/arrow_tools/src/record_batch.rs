@@ -51,7 +51,7 @@ pub enum Error {
 ///
 /// This function will return an error if the record batch cannot be casted.
 #[allow(clippy::needless_pass_by_value)]
-pub fn cast_to(record_batch: RecordBatch, schema: SchemaRef) -> Result<RecordBatch> {
+pub fn try_cast_to(record_batch: RecordBatch, schema: SchemaRef) -> Result<RecordBatch> {
     let existing_schema = record_batch.schema();
 
     if schema.contains(&existing_schema) {
@@ -73,7 +73,7 @@ pub fn cast_to(record_batch: RecordBatch, schema: SchemaRef) -> Result<RecordBat
             if field.contains(existing_field) {
                 array = Arc::clone(column);
             } else {
-                array = cast_array(Arc::clone(column), existing_field, field)?;
+                array = try_cast_array(Arc::clone(column), existing_field, field)?;
             }
         }
 
@@ -84,7 +84,7 @@ pub fn cast_to(record_batch: RecordBatch, schema: SchemaRef) -> Result<RecordBat
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn cast_array(
+fn try_cast_array(
     array: Arc<dyn Array>,
     existing_field: &Field,
     field: &Field,
@@ -129,7 +129,7 @@ fn cast_array(
             }
         }
         (DataType::Utf8, DataType::Timestamp(unit, _)) => {
-            cast_array_from_string_to_timestamp(array, unit, field)?
+            try_cast_array_from_string_to_timestamp(array, unit, field)?
         }
         (_, _) => ConvertArrowArraySnafu {
             from: existing_field.data_type().clone(),
@@ -143,7 +143,7 @@ fn cast_array(
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn cast_array_from_string_to_timestamp(
+fn try_cast_array_from_string_to_timestamp(
     array: Arc<dyn Array>,
     unit: &TimeUnit,
     field: &Field,
@@ -234,7 +234,7 @@ mod test {
 
     #[test]
     fn test_string_to_timestamp_conversion() {
-        let result = cast_to(batch_input(), to_schema()).expect("converted");
+        let result = try_cast_to(batch_input(), to_schema()).expect("converted");
         assert_eq!(3, result.num_rows());
     }
 }

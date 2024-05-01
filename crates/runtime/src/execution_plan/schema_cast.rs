@@ -128,7 +128,7 @@ impl ExecutionPlan for SchemaCastScanExec {
             {
                 stream! {
                     while let Some(batch) = stream.next().await {
-                        let batch = arrow_tools::record_batch::cast_to(batch?, Arc::clone(&schema));
+                        let batch = arrow_tools::record_batch::try_cast_to(batch?, Arc::clone(&schema));
                         yield batch.map_err(|e| { DataFusionError::External(Box::new(e)) });
                     }
                 }
