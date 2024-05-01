@@ -49,7 +49,7 @@ pub enum Error {
 ///
 /// # Errors
 ///
-/// This function will return an error if the record batch cannot be cast.
+/// This function will return an error if the record batch cannot be casted.
 #[allow(clippy::needless_pass_by_value)]
 pub fn cast_to(record_batch: RecordBatch, schema: SchemaRef) -> Result<RecordBatch> {
     let existing_schema = record_batch.schema();
@@ -107,11 +107,11 @@ fn cast_array(
                 Arc::new(Int32Array::from(
                     array
                         .into_iter()
-                        .map(|f| -> Result<Option<i32>> {
-                            match f {
-                                Some(f) => Ok(Some(i32::try_from(f).context(ConvertIntSnafu)?)),
-                                None => Ok(None),
-                            }
+                        .map(|f| {
+                            f.map_or_else(
+                                || Ok(None),
+                                |f| Ok(Some(i32::try_from(f).context(ConvertIntSnafu)?)),
+                            )
                         })
                         .collect::<Result<Vec<Option<i32>>, _>>()?,
                 ))
@@ -147,7 +147,7 @@ fn cast_array_from_string_to_timestamp(
     array: Arc<dyn Array>,
     unit: &TimeUnit,
     field: &Field,
-) -> Result<Arc<dyn Array>, Error> {
+) -> Result<Arc<dyn Array>> {
     let data_type = field.data_type().clone();
     Ok(
         if let Some(array) = array.as_any().downcast_ref::<StringArray>() {
