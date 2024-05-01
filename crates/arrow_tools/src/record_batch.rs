@@ -14,8 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{num::TryFromIntError, sync::Arc};
-
 use arrow::{
     array::{
         new_null_array, Array, ArrayRef, Int32Array, Int64Array, LargeStringArray, RecordBatch,
@@ -24,6 +22,7 @@ use arrow::{
     datatypes::{DataType, Field, SchemaRef, TimeUnit},
 };
 use snafu::prelude::*;
+use std::{num::TryFromIntError, sync::Arc};
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -46,11 +45,11 @@ pub enum Error {
     ConvertInt { source: TryFromIntError },
 }
 
-/// Convert a given record batch into a new record batch with the given schema.
+/// Cast a given record batch into a new record batch with the given schema.
 ///
 /// # Errors
 ///
-/// This function will return an error if the record batch cannot be converted.
+/// This function will return an error if the record batch cannot be cast.
 #[allow(clippy::needless_pass_by_value)]
 pub fn cast_to(record_batch: RecordBatch, schema: SchemaRef) -> Result<RecordBatch> {
     let existing_schema = record_batch.schema();
@@ -74,7 +73,7 @@ pub fn cast_to(record_batch: RecordBatch, schema: SchemaRef) -> Result<RecordBat
             if field.contains(existing_field) {
                 array = Arc::clone(column);
             } else {
-                array = convert_column(Arc::clone(column), existing_field, field)?;
+                array = cast_array(Arc::clone(column), existing_field, field)?;
             }
         }
 
@@ -85,47 +84,52 @@ pub fn cast_to(record_batch: RecordBatch, schema: SchemaRef) -> Result<RecordBat
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn convert_column(
-    column: Arc<dyn Array>,
+fn cast_array(
+    array: Arc<dyn Array>,
     existing_field: &Field,
     field: &Field,
 ) -> Result<Arc<dyn Array>> {
     let result: Arc<dyn Array> = match (existing_field.data_type(), field.data_type()) {
         (DataType::Int32, DataType::Int64) => {
-            if let Some(array) = column.as_any().downcast_ref::<Int32Array>() {
-                let converted: Vec<Option<i64>> =
-                    array.into_iter().map(|f| f.map(i64::from)).collect();
-                Arc::new(Int64Array::from(converted))
+            if let Some(array) = array.as_any().downcast_ref::<Int32Array>() {
+                Arc::new(Int64Array::from(
+                    array
+                        .into_iter()
+                        .map(|f| f.map(i64::from))
+                        .collect::<Vec<Option<i64>>>(),
+                ))
             } else {
-                Arc::new(new_null_array(field.data_type(), column.len()))
+                Arc::new(new_null_array(field.data_type(), array.len()))
             }
         }
         (DataType::Int64, DataType::Int32) => {
-            if let Some(array) = column.as_any().downcast_ref::<Int64Array>() {
-                let converted: Vec<Option<i32>> = array
-                    .into_iter()
-                    .map(|f| -> Result<Option<i32>> {
-                        match f {
-                            Some(f) => Ok(Some(i32::try_from(f).context(ConvertIntSnafu)?)),
-                            None => Ok(None),
-                        }
-                    })
-                    .collect::<Result<_, _>>()?;
-                Arc::new(Int32Array::from(converted))
+            if let Some(array) = array.as_any().downcast_ref::<Int64Array>() {
+                Arc::new(Int32Array::from(
+                    array
+                        .into_iter()
+                        .map(|f| -> Result<Option<i32>> {
+                            match f {
+                                Some(f) => Ok(Some(i32::try_from(f).context(ConvertIntSnafu)?)),
+                                None => Ok(None),
+                            }
+                        })
+                        .collect::<Result<Vec<Option<i32>>, _>>()?,
+                ))
             } else {
-                Arc::new(new_null_array(field.data_type(), column.len()))
+                Arc::new(new_null_array(field.data_type(), array.len()))
             }
         }
         (DataType::Utf8, DataType::LargeUtf8) => {
-            if let Some(array) = column.as_any().downcast_ref::<StringArray>() {
-                let converted: Vec<Option<&str>> = array.into_iter().collect();
-                Arc::new(LargeStringArray::from(converted))
+            if let Some(array) = array.as_any().downcast_ref::<StringArray>() {
+                Arc::new(LargeStringArray::from(
+                    array.into_iter().collect::<Vec<Option<&str>>>(),
+                ))
             } else {
-                Arc::new(new_null_array(field.data_type(), column.len()))
+                Arc::new(new_null_array(field.data_type(), array.len()))
             }
         }
         (DataType::Utf8, DataType::Timestamp(unit, _)) => {
-            convert_timestamp_column(column, unit, field)?
+            cast_array_from_string_to_timestamp(array, unit, field)?
         }
         (_, _) => ConvertArrowArraySnafu {
             from: existing_field.data_type().clone(),
@@ -139,14 +143,14 @@ fn convert_column(
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn convert_timestamp_column(
-    column: Arc<dyn Array>,
+fn cast_array_from_string_to_timestamp(
+    array: Arc<dyn Array>,
     unit: &TimeUnit,
     field: &Field,
 ) -> Result<Arc<dyn Array>, Error> {
     let data_type = field.data_type().clone();
     Ok(
-        if let Some(array) = column.as_any().downcast_ref::<StringArray>() {
+        if let Some(array) = array.as_any().downcast_ref::<StringArray>() {
             let converted: Vec<Option<i64>> = array
                 .into_iter()
                 .map(|f| -> Result<Option<i64>> {
@@ -185,7 +189,7 @@ fn convert_timestamp_column(
                 .fail()?,
             }
         } else {
-            Arc::new(new_null_array(field.data_type(), column.len()))
+            Arc::new(new_null_array(field.data_type(), array.len()))
         },
     )
 }
