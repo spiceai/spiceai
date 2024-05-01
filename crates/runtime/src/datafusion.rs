@@ -20,6 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::accelerated_table::{AcceleratedTable, Refresh, Retention};
+use crate::arrow::verify_schema;
 use crate::dataaccelerator::{self, create_accelerator_table};
 use crate::dataconnector::DataConnector;
 use crate::dataupdate::{DataUpdate, DataUpdateExecutionPlan, UpdateType};
@@ -120,6 +121,9 @@ pub enum Error {
 
     #[snafu(display("Table {table_name} is not accelerated"))]
     NotAcceleratedTable { table_name: String },
+
+    #[snafu(display("Schema mismatch: {source}"))]
+    SchemaMismatch { source: crate::arrow::Error },
 }
 
 pub enum Table {
@@ -201,6 +205,10 @@ impl DataFusion {
             Table::View(sql) => self.register_view(&dataset.name, sql)?,
         }
 
+        if matches!(dataset.mode(), Mode::ReadWrite) {
+            self.data_writers.insert(dataset.name.clone());
+        }
+
         Ok(())
     }
 
@@ -222,6 +230,12 @@ impl DataFusion {
             .table_provider(OwnedTableReference::bare(table_name.to_string()))
             .await
             .context(UnableToGetTableSnafu)?;
+
+        verify_schema(
+            table_provider.schema().fields(),
+            data_update.schema.fields(),
+        )
+        .context(SchemaMismatchSnafu)?;
 
         let overwrite = data_update.update_type == UpdateType::Overwrite;
         let insert_plan = table_provider
