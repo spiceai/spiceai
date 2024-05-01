@@ -20,8 +20,7 @@ use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, Partitioning,
-    PlanProperties,
+    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
 };
 use futures::StreamExt;
 use std::any::Any;
@@ -43,7 +42,7 @@ impl SchemaCastScanExec {
         let execution_mode = input.execution_mode();
         let properties = PlanProperties::new(
             eq_properties,
-            Partitioning::UnknownPartitioning(1),
+            input.output_partitioning().clone(),
             execution_mode,
         );
         Self {
