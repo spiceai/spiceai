@@ -42,6 +42,7 @@ use tokio::{signal, sync::RwLock};
 
 use crate::{dataconnector::DataConnector, datafusion::DataFusion};
 mod accelerated_table;
+pub mod arrow;
 pub mod config;
 pub mod dataaccelerator;
 pub mod dataconnector;
