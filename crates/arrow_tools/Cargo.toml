@@ -11,4 +11,3 @@ exclude.workspace = true
 [dependencies]
 arrow.workspace = true
 snafu.workspace = true
-chrono = { version = "0.4.38" }

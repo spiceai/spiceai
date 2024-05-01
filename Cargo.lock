@@ -505,7 +505,6 @@ name = "arrow_tools"
 version = "0.12.1-alpha"
 dependencies = [
  "arrow",
- "chrono",
  "snafu 0.8.2",
 ]
 
