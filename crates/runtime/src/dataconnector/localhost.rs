@@ -14,29 +14,104 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use arrow::datatypes::{DataType, SchemaRef};
 use async_trait::async_trait;
 
-use std::{any::Any, collections::HashMap, pin::Pin, sync::Arc};
+use std::{any::Any, collections::HashMap, fmt, pin::Pin, sync::Arc};
 
-use datafusion::datasource::TableProvider;
+use datafusion::{
+    config::ConfigOptions,
+    datasource::{TableProvider, TableType},
+    error::{DataFusionError, Result as DataFusionResult},
+    execution::{context::SessionState, SendableRecordBatchStream, TaskContext},
+    logical_expr::{AggregateUDF, Expr, ScalarUDF, TableSource, WindowUDF},
+    physical_plan::{
+        empty::EmptyExec,
+        insert::{DataSink, FileSinkExec},
+        metrics::MetricsSet,
+        DisplayAs, DisplayFormatType, ExecutionPlan,
+    },
+    sql::{
+        planner::{ContextProvider, SqlToRel},
+        sqlparser::{self, ast::Statement, dialect::PostgreSqlDialect, parser::Parser},
+        TableReference,
+    },
+};
 use futures::Future;
 use secrets::Secret;
+use snafu::prelude::*;
 use spicepod::component::dataset::Dataset;
 
 use super::{DataConnector, DataConnectorFactory};
+
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display(r#"Missing required parameter "schema": The localhost connector requires specifying the schema up-front as a SQL CREATE TABLE statement."#))]
+    MissingSchemaParameter,
+
+    #[snafu(display(
+        "Unable to parse schema as a valid SQL statement: {source}\nSchema:\n{schema}"
+    ))]
+    UnableToParseSchema {
+        schema: String,
+        source: sqlparser::parser::ParserError,
+    },
+
+    #[snafu(display("Schema must be a single SQL statement"))]
+    OneStatementExpected,
+
+    #[snafu(display("Schema must be specified as a CREATE TABLE statement"))]
+    CreateTableStatementExpected,
+
+    #[snafu(display("Unable to parse schema from column definitions: {source}"))]
+    UnableToParseSchemaFromColumnDefinitions { source: DataFusionError },
+}
+
+pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// A no-op connector that allows for Spice to act as a "sink" for data.
 ///
 /// Configure an accelerator to store data - the localhost connector itself does nothing.
 #[allow(clippy::module_name_repetitions)]
-pub struct LocalhostConnector {}
+#[derive(Debug, Clone)]
+pub struct LocalhostConnector {
+    schema: SchemaRef,
+}
 
 impl DataConnectorFactory for LocalhostConnector {
     fn create(
         _secret: Option<Secret>,
-        _params: Arc<Option<HashMap<String, String>>>,
+        params: Arc<Option<HashMap<String, String>>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
-        Box::pin(async move { Ok(Arc::new(LocalhostConnector {}) as Arc<dyn DataConnector>) })
+        Box::pin(async move {
+            let Some(params) = params.as_ref() else {
+                return Err(Error::MissingSchemaParameter.into());
+            };
+
+            let schema = params.get("schema").ok_or(Error::MissingSchemaParameter)?;
+
+            let statements = Parser::parse_sql(&PostgreSqlDialect {}, schema).context(
+                UnableToParseSchemaSnafu {
+                    schema: schema.clone(),
+                },
+            )?;
+            ensure!(statements.len() == 1, OneStatementExpectedSnafu);
+
+            let statement = statements[0].clone();
+
+            let columns = match statement {
+                Statement::CreateTable { columns, .. } => columns,
+                _ => CreateTableStatementExpectedSnafu.fail()?,
+            };
+
+            let schema = SqlToRel::new(&LocalhostContextProvider::new())
+                .build_schema(columns)
+                .context(UnableToParseSchemaFromColumnDefinitionsSnafu)?;
+
+            Ok(Arc::new(LocalhostConnector {
+                schema: Arc::new(schema),
+            }) as Arc<dyn DataConnector>)
+        })
     }
 }
 
@@ -50,6 +125,138 @@ impl DataConnector for LocalhostConnector {
         &self,
         _dataset: &Dataset,
     ) -> super::AnyErrorResult<Arc<dyn TableProvider>> {
-        unimplemented!("read_provider not yet implemented for localhost provider");
+        Ok(Arc::new(self.clone()))
+    }
+
+    async fn read_write_provider(
+        &self,
+        _dataset: &Dataset,
+    ) -> Option<super::AnyErrorResult<Arc<dyn TableProvider>>> {
+        Some(Ok(Arc::new(self.clone())))
+    }
+}
+
+struct LocalhostContextProvider {
+    options: ConfigOptions,
+}
+
+impl LocalhostContextProvider {
+    pub fn new() -> Self {
+        Self {
+            options: ConfigOptions::default(),
+        }
+    }
+}
+
+impl ContextProvider for LocalhostContextProvider {
+    fn get_table_source(&self, _name: TableReference) -> DataFusionResult<Arc<dyn TableSource>> {
+        Err(DataFusionError::NotImplemented(
+            "LocalhostContextProvider::get_table_source".to_string(),
+        ))
+    }
+
+    fn get_function_meta(&self, _name: &str) -> Option<Arc<ScalarUDF>> {
+        None
+    }
+
+    fn get_aggregate_meta(&self, _name: &str) -> Option<Arc<AggregateUDF>> {
+        None
+    }
+
+    fn get_variable_type(&self, _variable_names: &[String]) -> Option<DataType> {
+        None
+    }
+
+    fn options(&self) -> &ConfigOptions {
+        &self.options
+    }
+
+    fn get_window_meta(&self, _name: &str) -> Option<Arc<WindowUDF>> {
+        None
+    }
+
+    fn udfs_names(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn udafs_names(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn udwfs_names(&self) -> Vec<String> {
+        Vec::new()
+    }
+}
+
+#[async_trait]
+impl TableProvider for LocalhostConnector {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
+
+    async fn scan(
+        &self,
+        _state: &SessionState,
+        _projection: Option<&Vec<usize>>,
+        _filters: &[Expr],
+        _limit: Option<usize>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(EmptyExec::new(Arc::clone(&self.schema))))
+    }
+
+    async fn insert_into(
+        &self,
+        _state: &SessionState,
+        input: Arc<dyn ExecutionPlan>,
+        _overwrite: bool,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(FileSinkExec::new(
+            input,
+            Arc::new(LocalhostDataSink::new()),
+            self.schema(),
+            None,
+        )) as _)
+    }
+}
+
+#[derive(Debug)]
+struct LocalhostDataSink {}
+
+impl LocalhostDataSink {
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
+#[async_trait]
+impl DataSink for LocalhostDataSink {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        None
+    }
+
+    async fn write_all(
+        &self,
+        mut _data: SendableRecordBatchStream,
+        _context: &Arc<TaskContext>,
+    ) -> datafusion::common::Result<u64> {
+        Ok(0)
+    }
+}
+
+impl DisplayAs for LocalhostDataSink {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> std::fmt::Result {
+        write!(f, "LocalhostDataSink")
     }
 }
