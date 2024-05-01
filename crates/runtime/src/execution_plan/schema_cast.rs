@@ -32,12 +32,11 @@ use std::sync::Arc;
 #[allow(clippy::module_name_repetitions)]
 pub struct SchemaCastScanExec {
     input: Arc<dyn ExecutionPlan>,
-    schema: SchemaRef,
     properties: PlanProperties,
 }
 
 impl SchemaCastScanExec {
-    pub fn new(input: Arc<dyn ExecutionPlan>, schema: SchemaRef) -> Self {
+    pub fn new(input: Arc<dyn ExecutionPlan>) -> Self {
         let eq_properties = input.equivalence_properties().clone();
         let execution_mode = input.execution_mode();
         let properties = PlanProperties::new(
@@ -45,11 +44,7 @@ impl SchemaCastScanExec {
             Partitioning::UnknownPartitioning(1),
             execution_mode,
         );
-        Self {
-            input,
-            schema,
-            properties,
-        }
+        Self { input, properties }
     }
 }
 
@@ -63,7 +58,6 @@ impl fmt::Debug for SchemaCastScanExec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SchemaCastScanExec")
             .field("input", &self.input)
-            .field("schema", &self.schema)
             .field("properties", &self.properties)
             .finish()
     }
@@ -79,7 +73,7 @@ impl ExecutionPlan for SchemaCastScanExec {
     }
 
     fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.schema)
+        self.input.schema()
     }
 
     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
@@ -91,10 +85,7 @@ impl ExecutionPlan for SchemaCastScanExec {
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         if children.len() == 1 {
-            Ok(Arc::new(Self::new(
-                Arc::clone(&children[0]),
-                Arc::clone(&self.schema),
-            )))
+            Ok(Arc::new(Self::new(Arc::clone(&children[0]))))
         } else {
             Err(DataFusionError::Execution(
                 "SchemaCastScanExec expects exactly one input".to_string(),

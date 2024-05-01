@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
+use std::{num::TryFromIntError, sync::Arc};
 
 use arrow::{
     array::{
@@ -35,8 +35,15 @@ pub enum Error {
     #[snafu(display("Unable to convert array: {}", source))]
     ParseTimestampFromString { source: chrono::ParseError },
 
-    #[snafu(display("Unable to convert array from {:?} to {:?}", from, to))]
-    ConvertArrowArray { from: DataType, to: DataType },
+    #[snafu(display("Unable to convert {} array from {:?} to {:?}", name, from, to))]
+    ConvertArrowArray {
+        from: DataType,
+        to: DataType,
+        name: String,
+    },
+
+    #[snafu(display("Unable to try from int: {}", source))]
+    ConvertInt { source: TryFromIntError },
 }
 
 /// Convert a given record batch into a new record batch with the given schema.
@@ -93,6 +100,22 @@ fn convert_column(
                 Arc::new(new_null_array(field.data_type(), column.len()))
             }
         }
+        (DataType::Int64, DataType::Int32) => {
+            if let Some(array) = column.as_any().downcast_ref::<Int64Array>() {
+                let converted: Vec<Option<i32>> = array
+                    .into_iter()
+                    .map(|f| -> Result<Option<i32>> {
+                        match f {
+                            Some(f) => Ok(Some(i32::try_from(f).context(ConvertIntSnafu)?)),
+                            None => Ok(None),
+                        }
+                    })
+                    .collect::<Result<_, _>>()?;
+                Arc::new(Int32Array::from(converted))
+            } else {
+                Arc::new(new_null_array(field.data_type(), column.len()))
+            }
+        }
         (DataType::Utf8, DataType::LargeUtf8) => {
             if let Some(array) = column.as_any().downcast_ref::<StringArray>() {
                 let converted: Vec<Option<&str>> = array.into_iter().collect();
@@ -107,6 +130,7 @@ fn convert_column(
         (_, _) => ConvertArrowArraySnafu {
             from: existing_field.data_type().clone(),
             to: field.data_type().clone(),
+            name: field.name(),
         }
         .fail()?,
     };
@@ -139,6 +163,7 @@ fn convert_timestamp_column(
                                     TimeUnit::Nanosecond => ConvertArrowArraySnafu {
                                         from: DataType::Timestamp(unit.clone(), None),
                                         to: data_type.clone(),
+                                        name: field.name(),
                                     }
                                     .fail()?,
                                 });
@@ -155,6 +180,7 @@ fn convert_timestamp_column(
                 TimeUnit::Nanosecond => ConvertArrowArraySnafu {
                     from: DataType::Timestamp(unit.clone(), None),
                     to: data_type,
+                    name: field.name(),
                 }
                 .fail()?,
             }
