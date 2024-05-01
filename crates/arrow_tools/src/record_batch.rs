@@ -52,7 +52,7 @@ pub enum Error {
 ///
 /// This function will return an error if the record batch cannot be converted.
 #[allow(clippy::needless_pass_by_value)]
-pub fn convert_to(record_batch: RecordBatch, schema: SchemaRef) -> Result<RecordBatch> {
+pub fn cast_to(record_batch: RecordBatch, schema: SchemaRef) -> Result<RecordBatch> {
     let existing_schema = record_batch.schema();
 
     if schema.contains(&existing_schema) {
@@ -230,7 +230,7 @@ mod test {
 
     #[test]
     fn test_string_to_timestamp_conversion() {
-        let result = convert_to(batch_input(), to_schema()).expect("converted");
+        let result = cast_to(batch_input(), to_schema()).expect("converted");
         assert_eq!(3, result.num_rows());
     }
 }

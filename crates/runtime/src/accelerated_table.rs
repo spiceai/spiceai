@@ -550,7 +550,7 @@ impl TableProvider for AcceleratedTable {
             )),
         };
 
-        Ok(Arc::new(SchemaCastScanExec::new(plan)))
+        Ok(Arc::new(SchemaCastScanExec::new(plan, self.schema())))
     }
 
     async fn insert_into(
