@@ -2428,6 +2428,7 @@ dependencies = [
  "snafu 0.8.2",
  "spicepod",
  "tokio",
+ "tokio-postgres",
  "tokio-rusqlite",
  "tracing",
  "tracing-subscriber",

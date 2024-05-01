@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::arrow::verify_schema;
 use crate::datafusion::DataFusion;
 use crate::dataupdate::DataUpdate;
 use crate::measure_scope_ms;
@@ -233,38 +234,6 @@ impl Service {
     }
 }
 
-fn verify_schema(
-    expected: &arrow::datatypes::Fields,
-    actual: &arrow::datatypes::Fields,
-) -> Result<()> {
-    if expected.len() != actual.len() {
-        return SchemaMismatchNumFieldsSnafu {
-            expected: expected.len(),
-            actual: actual.len(),
-        }
-        .fail();
-    }
-
-    for idx in 0..expected.len() {
-        let a = expected.get(idx).context(UnableToGetFieldDataTypeSnafu)?;
-        let b = actual.get(idx).context(UnableToGetFieldDataTypeSnafu)?;
-
-        let a_data_type = a.data_type();
-        let b_data_type = b.data_type();
-
-        if a_data_type != b_data_type {
-            return SchemaMismatchDataTypeSnafu {
-                name: a.name(),
-                expected: format!("{a_data_type}"),
-                actual: format!("{b_data_type}"),
-            }
-            .fail();
-        }
-    }
-
-    Ok(())
-}
-
 fn record_batches_to_flight_stream(
     record_batches: Vec<RecordBatch>,
 ) -> impl Stream<Item = Result<FlightData, Status>> {
@@ -318,19 +287,6 @@ pub enum Error {
 
     #[snafu(display("Unable to start Flight server: {source}"))]
     UnableToStartFlightServer { source: tonic::transport::Error },
-
-    #[snafu(display("Expected and actual number of fields in the query result don't match: expected {expected}, received {actual}"))]
-    SchemaMismatchNumFields { expected: usize, actual: usize },
-
-    #[snafu(display("Query returned an unexpected data type for column {name}: expected {expected}, received {actual}. Is the column data type supported by the data accelerator (https://docs.spiceai.org/reference/datatypes)?"))]
-    SchemaMismatchDataType {
-        name: String,
-        expected: String,
-        actual: String,
-    },
-
-    #[snafu(display("Failed to get field data type"))]
-    UnableToGetFieldDataType {},
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
