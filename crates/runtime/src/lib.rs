@@ -150,6 +150,14 @@ pub enum Error {
     UnableToReceiveAcceleratedTableStatus { source: RecvError },
 }
 
+impl From<Error> for errors::SpiceError {
+    fn from(error: Error) -> Self {
+        match error {
+            _ => errors::SpiceError::new(error, "User friendly Error".to_string()),
+        }
+    }
+}
+
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct Runtime {
@@ -198,7 +206,8 @@ impl Runtime {
         }
 
         if let Err(e) = secret_store.load_secrets().await {
-            tracing::warn!("Unable to load secrets: {}", e);
+            errors::trace(e);
+            // tracing::warn!("Unable to load secrets: {}", e);
         }
     }
 
@@ -222,21 +231,31 @@ impl Runtime {
                 Err(err) => {
                     status::update_dataset(&ds.name, status::ComponentStatus::Error);
                     metrics::counter!("datasets_load_error").increment(1);
-                    warn_spaced!(
-                        spaced_tracer,
-                        "Failed to get data connector from source for dataset {}, retrying: {err}",
-                        &ds.name
-                    );
+                    trace_spaced_error!(spaced_tracer, err, &ds.name);
+                    // warn_spaced!(
+                    //     spaced_tracer,
+                    //     "Failed to get data connector from source for dataset {}",
+                    //     &ds.name
+                    // );
                     sleep(Duration::from_secs(1)).await;
                     continue;
                 }
             };
 
-            if let Ok(()) = self.register_loaded_dataset(ds, connector, None).await {
-            } else {
-                sleep(Duration::from_secs(1)).await;
-                continue;
+            match self.register_loaded_dataset(ds, connector, None).await {
+                Ok(()) => {}
+                Err(err) => {
+                    trace_spaced_error!(spaced_tracer, err, &ds.name);
+                    sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
             }
+
+            // if let Ok(()) = self.register_loaded_dataset(ds, connector, None).await {
+            // } else {
+            //     sleep(Duration::from_secs(1)).await;
+            //     continue;
+            // }
 
             status::update_dataset(&ds.name, status::ComponentStatus::Ready);
             break;
@@ -283,11 +302,13 @@ impl Runtime {
             Err(err) => {
                 status::update_dataset(&ds.name, status::ComponentStatus::Error);
                 metrics::counter!("datasets_load_error").increment(1);
-                warn_spaced!(
-                    spaced_tracer,
-                    "Failed to get data connector from source for dataset {}: {err}",
-                    &ds.name
-                );
+                // errors::trace(err);
+                trace_spaced_error!(spaced_tracer, err, &ds.name);
+                // warn_spaced!(
+                //     spaced_tracer,
+                //     "Failed to get data connector from source for dataset {}",
+                //     &ds.name
+                // );
                 return UnableToLoadDatasetConnectorSnafu {
                     dataset: ds.name.clone(),
                 }
@@ -307,7 +328,6 @@ impl Runtime {
         let df = Arc::clone(&self.df);
         let ds = ds.clone();
         let source = ds.source();
-        let spaced_tracer = Arc::clone(&self.spaced_tracer);
         let shared_secrets_provider: Arc<RwLock<secrets::SecretsProvider>> =
             Arc::clone(&self.secrets_provider);
 
@@ -342,18 +362,19 @@ impl Runtime {
             Err(err) => {
                 status::update_dataset(&ds.name, status::ComponentStatus::Error);
                 metrics::counter!("datasets_load_error").increment(1);
-                if let Error::UnableToAttachDataConnector {
-                    source: datafusion::Error::RefreshSql { source },
-                    data_connector: _,
-                } = &err
-                {
-                    tracing::error!("{source}");
-                }
-                warn_spaced!(
-                    spaced_tracer,
-                    "Failed to initialize data connector for dataset {}: {err}",
-                    &ds.name
-                );
+                // if let Error::UnableToAttachDataConnector {
+                //     source: datafusion::Error::RefreshSql { source },
+                //     data_connector: _,
+                // } = &err
+                // {
+                //     tracing::error!("{source}");
+                // }
+                // trace_spaced_error!(spaced_tracer, err, &ds.name);
+                // warn_spaced!(
+                //     spaced_tracer,
+                //     "Failed to initialize data connector for dataset {}: {err}",
+                //     &ds.name
+                // );
 
                 Err(err)
             }
@@ -385,6 +406,7 @@ impl Runtime {
     }
 
     pub async fn update_dataset(&self, ds: &Dataset, all_datasets: &[Dataset]) {
+        let spaced_tracer = Arc::clone(&self.spaced_tracer);
         status::update_dataset(&ds.name, status::ComponentStatus::Refreshing);
         if let Ok(connector) = self.load_dataset_connector(ds, all_datasets).await {
             tracing::info!("Updating accelerated dataset {}...", &ds.name);
@@ -403,14 +425,27 @@ impl Runtime {
 
             self.remove_dataset(ds).await;
 
-            if let Ok(()) = self
+            match self
                 .register_loaded_dataset(ds, Arc::clone(&connector), None)
                 .await
             {
-                status::update_dataset(&ds.name, status::ComponentStatus::Ready);
-            } else {
-                status::update_dataset(&ds.name, status::ComponentStatus::Error);
+                Ok(()) => {
+                    status::update_dataset(&ds.name, status::ComponentStatus::Ready);
+                }
+                Err(err) => {
+                    status::update_dataset(&ds.name, status::ComponentStatus::Error);
+                    trace_spaced_error!(spaced_tracer, err, &ds.name);
+                }
             }
+
+            // if let Ok(()) = self
+            //     .register_loaded_dataset(ds, Arc::clone(&connector), None)
+            //     .await
+            // {
+            //     status::update_dataset(&ds.name, status::ComponentStatus::Ready);
+            // } else {
+            //     status::update_dataset(&ds.name, status::ComponentStatus::Error);
+            // }
         } else {
             status::update_dataset(&ds.name, status::ComponentStatus::Error);
         }

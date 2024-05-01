@@ -49,6 +49,18 @@ pub enum Error {
     UnableToQueryArrow { source: GenericError },
 }
 
+impl From<Error> for errors::SpiceError {
+    fn from(error: Error) -> Self {
+        match error {
+            Error::UnableToGetSchema { source: _ } => errors::SpiceError::new(
+                error,
+                "An error occurred while trying to get schema.".to_string(),
+            ),
+            _ => errors::SpiceError::new(error, "Failed to initialize data connector for dataset. Table <table_name_in_from> not found. Ensure the table name is correctly spelled in the spicepod.".to_string()),
+        }
+    }
+}
+
 pub trait SyncDbConnection<T, P>: DbConnection<T, P> {
     fn new(conn: T) -> Self
     where
