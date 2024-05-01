@@ -1,3 +1,3 @@
 # Arrow tools
 
-- Record batch conversion based on the provided schema
+- Cast RecordBatch from its schema to a given schema
