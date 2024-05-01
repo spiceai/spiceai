@@ -55,5 +55,22 @@ jobs:
             ${{ env.LATEST_GHCR_TAG }}
             ${{ env.LATEST_DOCKERHUB_TAG }}
 
+      - name: Build and push Docker images (ODBC)
+        id: docker_build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: ${{ startswith(github.ref, 'refs/tags/v') }}
+          build-args: |
+            REL_VERSION=${{ env.REL_VERSION }}
+            CARGO_FEATURES=odbc
+          tags: |
+            ghcr.io/spiceai/spiceai:${{ env.REL_VERSION }}-odbc
+            spiceai/spiceai:${{ env.REL_VERSION }}-odbc
+            ${{ env.LATEST_GHCR_TAG }}-odbc
+            ${{ env.LATEST_DOCKERHUB_TAG }}-odbc
+
       - name: Image digest
         run: echo ${{ steps.docker_build.outputs.digest }}
