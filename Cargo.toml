@@ -11,6 +11,7 @@ members = [
     "crates/ns_lookup",
     "tools/flightpublisher/",
     "tools/flightsubscriber/",
+    "crates/errors",
 ]
 default-members = ["bin/spiced"]
 

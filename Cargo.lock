@@ -2406,6 +2406,7 @@ dependencies = [
  "clickhouse-rs",
  "datafusion",
  "duckdb",
+ "errors",
  "futures",
  "lazy_static",
  "mysql_async",
@@ -2738,6 +2739,13 @@ name = "error-code"
 version = "3.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a0474425d51df81997e2f90a21591180b38eccf27292d755f3e30750225c175b"
+
+[[package]]
+name = "errors"
+version = "0.12.1-alpha"
+dependencies = [
+ "tracing",
+]
 
 [[package]]
 name = "event-listener"
@@ -5757,6 +5765,7 @@ dependencies = [
  "db_connection_pool",
  "dirs",
  "duckdb",
+ "errors",
  "flight_client",
  "futures",
  "indexmap 2.2.6",
@@ -6165,6 +6174,7 @@ dependencies = [
  "aws-sdk-sts",
  "base64 0.22.0",
  "dirs",
+ "errors",
  "keyring",
  "reqwest",
  "secrecy",

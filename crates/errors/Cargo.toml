@@ -1,0 +1,12 @@
+[package]
+name = "errors"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Spice Errors"
+
+[dependencies]
+tracing.workspace = true

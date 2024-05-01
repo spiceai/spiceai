@@ -46,6 +46,22 @@ pub enum Error {
     UnableToParseSecretValue {},
 }
 
+impl From<Error> for errors::SpiceError {
+    fn from(error: Error) -> Self {
+        match error {
+            Error::UnableToLoadSecrets { source: _ } => errors::SpiceError::new(
+                error,
+                "An error occurred while trying to load secrets.".to_string(),
+            )
+            .level(errors::Level::Warn),
+
+            _ => {
+                errors::SpiceError::new(error, "An error occurred in secrets provider".to_string())
+            }
+        }
+    }
+}
+
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub type AnyErrorResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
