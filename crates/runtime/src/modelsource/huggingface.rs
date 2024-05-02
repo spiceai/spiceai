@@ -123,7 +123,7 @@ impl ModelSource for Huggingface {
             tracing::info!("Downloading model: {}", download_url);
 
             if file.to_lowercase().ends_with(".onnx") {
-                onnx_file_name = file_name.clone();
+                onnx_file_name.clone_from(&file_name);
             }
 
             let client = reqwest::Client::new();
