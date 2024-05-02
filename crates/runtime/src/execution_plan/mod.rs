@@ -24,6 +24,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use std::sync::Arc;
 
 pub mod fallback_on_zero_results;
+pub mod schema_cast;
 pub mod slice;
 pub mod tee;
 
