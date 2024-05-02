@@ -59,3 +59,5 @@ uuid = "1.6.1"
 pem = "3.0.4"
 odbc-api = { version = "7.0.0" }
 arrow-odbc = { version = "9.0.0" }
+# Temporarily use git repo that has Arrow 51.0.0. This will be available in next release (0.8.0).
+snowflake-api = { git = "https://github.com/xmakro/snowflake-rs.git", commit="5616c31294d6e9deebd4b45200f1d57e9691aca1", folder = "snowflake-api" }
