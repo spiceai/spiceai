@@ -170,7 +170,7 @@ impl AcceleratorExternalTableBuilder {
 
         let mut params = HashMap::new();
         if let Some(p) = self.params.as_ref() {
-            params = p.clone();
+            params.clone_from(p);
         }
 
         let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&self.schema));
