@@ -38,8 +38,8 @@ pub struct DataUpdate {
     pub schema: SchemaRef,
     pub data: Vec<RecordBatch>,
     /// The type of update to perform.
-    /// If UpdateType::Append, the runtime will append the data to the existing dataset.
-    /// If UpdateType::Overwrite, the runtime will overwrite the existing data with the new data.
+    /// If `UpdateType::Append`, the runtime will append the data to the existing dataset.
+    /// If `UpdateType::Overwrite`, the runtime will overwrite the existing data with the new data.
     pub update_type: UpdateType,
 }
 
