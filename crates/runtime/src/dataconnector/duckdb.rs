@@ -47,6 +47,9 @@ pub enum Error {
 
     #[snafu(display("Missing required parameter: open"))]
     MissingDuckDBFile {},
+
+    #[snafu(display("Invalid access mode param value \"{access_mode}\". Valid values are: read_only, read_write, automatic"))]
+    InvalidAccessMode { access_mode: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -61,15 +64,28 @@ impl DataConnectorFactory for DuckDB {
         params: Arc<Option<HashMap<String, String>>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
+            let params = params.as_ref().as_ref();
+
             // data connector requires valid "open" parameter
             let db_path = params
-                .as_ref()
-                .as_ref()
-                .and_then(|p| p.get("open"))
+                .and_then(|p| p.get("open").cloned())
                 .ok_or(Error::MissingDuckDBFile {})?;
 
+            let access_mode = params
+                .and_then(|p| p.get("access_mode").cloned())
+                .unwrap_or("automatic".to_string());
+
+            let access_mode = match access_mode.as_str() {
+                "read_only" => &AccessMode::ReadOnly,
+                "read_write" => &AccessMode::ReadWrite,
+                "automatic" => &AccessMode::Automatic,
+                _ => {
+                    return Err(Error::InvalidAccessMode { access_mode }.into());
+                }
+            };
+
             let pool = Arc::new(
-                DuckDbConnectionPool::new_file(db_path, &AccessMode::ReadOnly)
+                DuckDbConnectionPool::new_file(&db_path, access_mode)
                     .context(UnableToCreateDuckDBConnectionPoolSnafu)?,
             );
 
