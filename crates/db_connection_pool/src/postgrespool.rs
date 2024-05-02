@@ -149,7 +149,7 @@ impl PostgresConnectionPool {
             _ => "require",
         };
 
-        // connection_string.push_str(format!("sslmode={mode} ").as_str());
+        connection_string.push_str(format!("sslmode={mode} ").as_str());
         let config = Config::from_str(connection_string.as_str()).context(ConnectionPoolSnafu)?;
 
         for host in config.get_hosts() {
