@@ -21,6 +21,7 @@ use datafusion::{
     execution::context::SessionContext,
     logical_expr::CreateExternalTable,
 };
+use duckdb::AccessMode;
 use snafu::prelude::*;
 use std::{any::Any, sync::Arc};
 
@@ -44,7 +45,7 @@ impl DuckDBAccelerator {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            duckdb_factory: DuckDBTableProviderFactory::new(),
+            duckdb_factory: DuckDBTableProviderFactory::new().access_mode(AccessMode::ReadWrite),
         }
     }
 }

@@ -19,6 +19,7 @@ use data_components::duckdb::DuckDBTableFactory;
 use data_components::Read;
 use datafusion::datasource::TableProvider;
 use db_connection_pool::duckdbpool::DuckDbConnectionPool;
+use duckdb::AccessMode;
 use secrets::Secret;
 use snafu::prelude::*;
 use spicepod::component::dataset::Dataset;
@@ -43,6 +44,9 @@ pub enum Error {
     UnableToGetReadWriteProvider {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[snafu(display("Missing required parameter: open"))]
+    MissingDuckDBFile {},
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -57,8 +61,15 @@ impl DataConnectorFactory for DuckDB {
         params: Arc<Option<HashMap<String, String>>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
+            // data connector requires valid "open" parameter
+            let db_path = params
+                .as_ref()
+                .as_ref()
+                .and_then(|p| p.get("open"))
+                .ok_or(Error::MissingDuckDBFile {})?;
+
             let pool = Arc::new(
-                DuckDbConnectionPool::new_with_file_mode(&params)
+                DuckDbConnectionPool::new_file(&db_path, &AccessMode::ReadOnly)
                     .context(UnableToCreateDuckDBConnectionPoolSnafu)?,
             );
 
