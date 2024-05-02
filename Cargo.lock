@@ -6772,7 +6772,8 @@ checksum = "1b6b67fb9a61334225b5b790716f609cd58395f895b3fe8b328786812a40bc3b"
 [[package]]
 name = "snowflake-api"
 version = "0.8.0"
-source = "git+https://github.com/xmakro/snowflake-rs.git#5616c31294d6e9deebd4b45200f1d57e9691aca1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1434bfb85dc18773aa4ff2f9824117f55304c4e2d1406aaea06cbcf29beb2047"
 dependencies = [
  "arrow",
  "async-trait",
