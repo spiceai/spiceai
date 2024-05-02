@@ -14,16 +14,19 @@ use sql_provider_datafusion::SqlTable;
 
 // Run this test requires local installation of postgres
 // See Requirements in https://github.com/boustrophedon/pgtemp
-#[tokio::test]
 #[ignore]
+#[tokio::test]
 async fn test_postgres_types() {
     let db = PgTempDB::async_new().await;
     let ctx = SessionContext::new();
-    println!("{}", db.connection_string());
-    let params = Arc::new(Some(HashMap::from([(
-        "pg_connection_string".to_string(),
-        db.connection_string(),
-    )])));
+    let params = Arc::new(Some(HashMap::from([
+        ("pg_host".to_string(), "localhost".into()),
+        ("pg_port".to_string(), format!("{}", db.db_port())),
+        ("pg_user".to_string(), db.db_user().into()),
+        ("pg_pass".to_string(), db.db_pass().into()),
+        ("pg_db".to_string(), db.db_name().into()),
+        ("pg_sslmode".to_string(), "disable".into()),
+    ])));
     let pool: Arc<dyn DbConnectionPool<_, _> + Send + Sync> = Arc::new(
         PostgresConnectionPool::new(params, None)
             .await
