@@ -82,7 +82,6 @@ pub fn map_data_type_to_array_builder(data_type: &DataType) -> Box<dyn ArrayBuil
             DataType::Boolean => Box::new(ListBuilder::new(BooleanBuilder::new())),
             _ => unimplemented!("Unsupported list value data type {:?}", data_type),
         },
-        DataType::FixedSizeBinary(size) => Box::new(FixedSizeBinaryBuilder::new(*size)),
         _ => unimplemented!("Unsupported data type {:?}", data_type),
     }
 }
