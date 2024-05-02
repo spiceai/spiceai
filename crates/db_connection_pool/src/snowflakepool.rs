@@ -17,7 +17,8 @@ limitations under the License.
 use async_trait::async_trait;
 use secrets::Secret;
 use snafu::prelude::*;
-use snowflake_api::SnowflakeApi;
+use snowflake_api::{SnowflakeApi, SnowflakeApiError};
+
 use std::{collections::HashMap, sync::Arc};
 
 use super::{DbConnectionPool, Result};
@@ -39,6 +40,14 @@ pub enum Error {
     UnableToConnect {
         source: snowflake_api::SnowflakeApiError,
     },
+
+    #[snafu(display("Snowflake authentication failed with error: {source}"))]
+    UnableToAuthenticate {
+        source: snowflake_api::SnowflakeApiError,
+    },
+
+    #[snafu(display("Snowflake authentication failed. Validate account and warehouse parameters using the SnowSQL tool."))]
+    UnableToAuthenticateGeneric {},
 }
 
 pub struct SnowflakeConnectionPool {
@@ -90,7 +99,27 @@ impl SnowflakeConnectionPool {
         .context(UnableToConnectSnafu)?;
 
         // auth happens on the first request; test auth and connection
-        api.exec("SELECT 1").await.context(UnableToConnectSnafu)?;
+        if let Err(err) = api.exec("SELECT 1").await {
+            match err {
+                snowflake_api::SnowflakeApiError::AuthError(auth_err) => {
+                    // for incorrect werehouse or account param the library fails
+                    // with response decoding message that confuses, so we return a generic error
+                    if auth_err
+                        .to_string()
+                        .contains("error decoding response body")
+                    {
+                        return Err(Box::new(Error::UnableToAuthenticateGeneric {}));
+                    };
+
+                    return Err(Box::new(Error::UnableToAuthenticate {
+                        source: SnowflakeApiError::AuthError(auth_err),
+                    }));
+                }
+                _ => {
+                    return Err(Box::new(Error::UnableToConnect { source: err }));
+                }
+            }
+        }
 
         Ok(Self { api: Arc::new(api) })
     }
