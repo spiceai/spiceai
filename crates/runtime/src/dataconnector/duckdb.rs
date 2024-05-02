@@ -69,7 +69,7 @@ impl DataConnectorFactory for DuckDB {
                 .ok_or(Error::MissingDuckDBFile {})?;
 
             let pool = Arc::new(
-                DuckDbConnectionPool::new_file(&db_path, &AccessMode::ReadOnly)
+                DuckDbConnectionPool::new_file(db_path, &AccessMode::ReadOnly)
                     .context(UnableToCreateDuckDBConnectionPoolSnafu)?,
             );
 

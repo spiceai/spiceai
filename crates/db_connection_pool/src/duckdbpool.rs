@@ -30,6 +30,9 @@ pub enum Error {
 
     #[snafu(display("ConnectionPoolError: {source}"))]
     ConnectionPoolError { source: r2d2::Error },
+
+    #[snafu(display("Unable to connect to DuckDB: {source}"))]
+    UnableToConnect { source: duckdb::Error },
 }
 
 pub struct DuckDbConnectionPool {
@@ -37,6 +40,21 @@ pub struct DuckDbConnectionPool {
 }
 
 impl DuckDbConnectionPool {
+    /// Create a new `DuckDbConnectionPool` from memory.
+    ///
+    /// # Arguments
+    ///
+    /// * `access_mode` - The access mode for the connection pool
+    ///
+    /// # Returns
+    ///
+    /// * A new `DuckDbConnectionPool`
+    ///
+    /// # Errors
+    ///
+    /// * `DuckDBSnafu` - If there is an error creating the connection pool
+    /// * `ConnectionPoolSnafu` - If there is an error creating the connection pool
+    /// * `UnableToConnectSnafu` - If there is an error connecting to the database
     pub fn new_memory(access_mode: &AccessMode) -> Result<Self> {
         let config = get_config(access_mode)?;
         let manager = DuckdbConnectionManager::memory_with_flags(config).context(DuckDBSnafu)?;
@@ -46,14 +64,27 @@ impl DuckDbConnectionPool {
         conn.register_table_function::<ArrowVTab>("arrow")
             .context(DuckDBSnafu)?;
 
-        // Test the connection
-        let _result = conn
-            .execute("SELECT 1", [])
-            .map_err(|_| ConnectionPoolSnafu);
+        test_connection(&conn)?;
 
         Ok(DuckDbConnectionPool { pool })
     }
 
+    /// Create a new `DuckDbConnectionPool` from a file.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - The path to the file
+    /// * `access_mode` - The access mode for the connection pool
+    ///
+    /// # Returns
+    ///
+    /// * A new `DuckDbConnectionPool`
+    ///
+    /// # Errors
+    ///
+    /// * `DuckDBSnafu` - If there is an error creating the connection pool
+    /// * `ConnectionPoolSnafu` - If there is an error creating the connection pool
+    /// * `UnableToConnectSnafu` - If there is an error connecting to the database
     pub fn new_file(path: &str, access_mode: &AccessMode) -> Result<Self> {
         let config = get_config(access_mode)?;
         let manager =
@@ -64,10 +95,7 @@ impl DuckDbConnectionPool {
         conn.register_table_function::<ArrowVTab>("arrow")
             .context(DuckDBSnafu)?;
 
-        // Test the connection
-        let _result = conn
-            .execute("SELECT 1", [])
-            .map_err(|_| ConnectionPoolSnafu);
+        test_connection(&conn)?;
 
         Ok(DuckDbConnectionPool { pool })
     }
@@ -87,6 +115,11 @@ impl DbConnectionPool<r2d2::PooledConnection<DuckdbConnectionManager>, &'static 
             pool.get().context(ConnectionPoolSnafu)?;
         Ok(Box::new(DuckDbConnection::new(conn)))
     }
+}
+
+fn test_connection(conn: &r2d2::PooledConnection<DuckdbConnectionManager>) -> Result<()> {
+    conn.execute("SELECT 1", []).context(UnableToConnectSnafu)?;
+    Ok(())
 }
 
 fn get_config(access_mode: &AccessMode) -> Result<duckdb::Config> {

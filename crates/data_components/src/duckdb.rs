@@ -107,6 +107,7 @@ impl DuckDBTableProviderFactory {
         }
     }
 
+    #[must_use]
     pub fn access_mode(mut self, access_mode: AccessMode) -> Self {
         self.access_mode = access_mode;
         self
