@@ -23,6 +23,7 @@ use arrow::array::ArrayRef;
 use arrow::array::BooleanBuilder;
 use arrow::array::Date32Builder;
 use arrow::array::Decimal128Builder;
+use arrow::array::FixedSizeBinaryBuilder;
 use arrow::array::Float32Builder;
 use arrow::array::Float64Builder;
 use arrow::array::Int16Builder;
@@ -68,6 +69,9 @@ pub enum Error {
         source: <u128 as convert::TryInto<i64>>::Error,
     },
 
+    #[snafu(display("Error building fixed size binary field: {source}"))]
+    FailedToBuildFixedSizeBinary { source: arrow::error::ArrowError },
+
     #[snafu(display("Failed to get a row value for {pg_type}: {source}"))]
     FailedToGetRowValue {
         pg_type: Type,
@@ -75,10 +79,10 @@ pub enum Error {
     },
 
     #[snafu(display("Failed to parse raw Postgres Bytes as BigDecimal: {:?}", bytes))]
-    FailedToParseBigDecmialFromPostgres { bytes: Vec<u8> },
+    FailedToParseBigDecimalFromPostgres { bytes: Vec<u8> },
 
     #[snafu(display("Cannot represent BigDecimal as i128: {big_decimal}"))]
-    FailedToConvertBigDecmialToI128 { big_decimal: BigDecimal },
+    FailedToConvertBigDecimalToI128 { big_decimal: BigDecimal },
 
     #[snafu(display("Failed to find field {column_name} in schema"))]
     FailedToFindFieldInSchema { column_name: String },
@@ -273,14 +277,14 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                     };
 
                     let Some(v_i128) = v.to_decimal_128() else {
-                        return FailedToConvertBigDecmialToI128Snafu {
+                        return FailedToConvertBigDecimalToI128Snafu {
                             big_decimal: v.inner,
                         }
                         .fail();
                     };
                     dec_builder.append_value(v_i128);
                 }
-                Type::TIMESTAMP => {
+                ref pg_type @ (Type::TIMESTAMP | Type::TIMESTAMPTZ) => {
                     let Some(builder) = builder else {
                         return NoBuilderForIndexSnafu { index: i }.fail();
                     };
@@ -293,11 +297,11 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                         }
                         .fail();
                     };
-                    let v = row.try_get::<usize, Option<SystemTime>>(i).context(
-                        FailedToGetRowValueSnafu {
-                            pg_type: Type::TIMESTAMP,
-                        },
-                    )?;
+                    let v = row
+                        .try_get::<usize, Option<SystemTime>>(i)
+                        .with_context(|_| FailedToGetRowValueSnafu {
+                            pg_type: pg_type.clone(),
+                        })?;
 
                     match v {
                         Some(v) => {
@@ -330,6 +334,32 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
 
                     match v {
                         Some(v) => builder.append_value(Date32Type::from_naive_date(v)),
+                        None => builder.append_null(),
+                    }
+                }
+                Type::UUID => {
+                    let Some(builder) = builder else {
+                        return NoBuilderForIndexSnafu { index: i }.fail();
+                    };
+                    let Some(builder) = builder
+                        .as_any_mut()
+                        .downcast_mut::<FixedSizeBinaryBuilder>()
+                    else {
+                        return FailedToDowncastBuilderSnafu {
+                            postgres_type: format!("{postgres_type}"),
+                        }
+                        .fail();
+                    };
+                    let v = row.try_get::<usize, Option<uuid::Uuid>>(i).context(
+                        FailedToGetRowValueSnafu {
+                            pg_type: Type::UUID,
+                        },
+                    )?;
+
+                    match v {
+                        Some(v) => builder
+                            .append_value(v)
+                            .context(FailedToBuildFixedSizeBinarySnafu)?,
                         None => builder.append_null(),
                     }
                 }
@@ -419,8 +449,11 @@ fn map_column_type_to_data_type(column_type: &Type) -> Option<DataType> {
         // Inspect the scale from the first row. Precision will always be 38 for Decimal128.
         Type::NUMERIC => None,
         // We get a SystemTime that we can always convert into milliseconds
-        Type::TIMESTAMP => Some(DataType::Timestamp(TimeUnit::Millisecond, None)),
+        Type::TIMESTAMP | Type::TIMESTAMPTZ => {
+            Some(DataType::Timestamp(TimeUnit::Millisecond, None))
+        }
         Type::DATE => Some(DataType::Date32),
+        Type::UUID => Some(DataType::FixedSizeBinary(16)),
         Type::INT2_ARRAY => Some(DataType::List(Arc::new(Field::new(
             "item",
             DataType::Int16,
@@ -527,14 +560,14 @@ impl<'a> FromSql<'a> for BigDecimalFromSql {
             0x4000 => Sign::Minus,
             0x0000 => Sign::Plus,
             _ => {
-                return Err(Box::new(Error::FailedToParseBigDecmialFromPostgres {
+                return Err(Box::new(Error::FailedToParseBigDecimalFromPostgres {
                     bytes: raw.to_vec(),
                 }))
             }
         };
 
         let Some(digits) = BigInt::from_radix_be(sign, u8_digits.as_slice(), 10) else {
-            return Err(Box::new(Error::FailedToParseBigDecmialFromPostgres {
+            return Err(Box::new(Error::FailedToParseBigDecimalFromPostgres {
                 bytes: raw.to_vec(),
             }));
         };
