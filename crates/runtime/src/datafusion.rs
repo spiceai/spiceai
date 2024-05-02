@@ -20,12 +20,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::accelerated_table::{AcceleratedTable, Refresh, Retention};
-use crate::arrow::verify_schema;
 use crate::dataaccelerator::{self, create_accelerator_table};
 use crate::dataconnector::DataConnector;
 use crate::dataupdate::{DataUpdate, DataUpdateExecutionPlan, UpdateType};
 use crate::get_dependent_table_names;
 use arrow::datatypes::Schema;
+use arrow_tools::schema::verify_schema;
 use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider};
 use datafusion::common::OwnedTableReference;
 use datafusion::config::CatalogOptions;
@@ -123,7 +123,7 @@ pub enum Error {
     NotAcceleratedTable { table_name: String },
 
     #[snafu(display("Schema mismatch: {source}"))]
-    SchemaMismatch { source: crate::arrow::Error },
+    SchemaMismatch { source: arrow_tools::schema::Error },
 }
 
 pub enum Table {
