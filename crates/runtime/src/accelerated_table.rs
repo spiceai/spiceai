@@ -32,6 +32,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::datafusion::filter_converter::TimestampFilterConvert;
 use crate::execution_plan::fallback_on_zero_results::FallbackOnZeroResultsScanExec;
+use crate::execution_plan::schema_cast::SchemaCastScanExec;
 use crate::execution_plan::slice::SliceExec;
 use crate::execution_plan::tee::TeeExec;
 use crate::execution_plan::TableScanParams;
@@ -539,15 +540,17 @@ impl TableProvider for AcceleratedTable {
             .scan(state, projection, filters, limit)
             .await?;
 
-        match self.zero_results_action {
-            ZeroResultsAction::ReturnEmpty => Ok(input),
-            ZeroResultsAction::UseSource => Ok(Arc::new(FallbackOnZeroResultsScanExec::new(
+        let plan: Arc<dyn ExecutionPlan> = match self.zero_results_action {
+            ZeroResultsAction::ReturnEmpty => input,
+            ZeroResultsAction::UseSource => Arc::new(FallbackOnZeroResultsScanExec::new(
                 self.dataset_name.clone(),
                 input,
                 Arc::clone(&self.federated),
                 TableScanParams::new(state, projection, filters, limit),
-            ))),
-        }
+            )),
+        };
+
+        Ok(Arc::new(SchemaCastScanExec::new(plan, self.schema())))
     }
 
     async fn insert_into(
