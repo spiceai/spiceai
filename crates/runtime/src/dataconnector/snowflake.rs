@@ -34,15 +34,12 @@ use std::{collections::HashMap, future::Future};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to create flight client: {source}"))]
-    UnableToCreateFlightClient { source: flight_client::Error },
-
     #[snafu(display("{source}"))]
     UnableToGetReadProvider {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Unable to create Snowflake connection pool: {source}"))]
+    #[snafu(display("{source}"))]
     UnableToCreateSnowflakeConnectionPool { source: db_connection_pool::Error },
 }
 

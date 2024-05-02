@@ -36,11 +36,11 @@ pub enum Error {
     #[snafu(display("Not implemented"))]
     NotImplemented,
 
-    #[snafu(display("Unable to retrieve schema"))]
-    UnableToRetrieveSchema,
+    #[snafu(display("Unable to retrieve schema: {reason}"))]
+    UnableToRetrieveSchema { reason: String },
 
-    #[snafu(display("Unexpected query response, expected Arrow, got JSON"))]
-    UnexpectedResponse,
+    #[snafu(display("Unexpected query response, expected Arrow, got JSON: {json}"))]
+    UnexpectedResponse { json: String },
 
     #[snafu(display("Error executing query: {source}"))]
     SnowflakeQueryError {
@@ -86,7 +86,14 @@ impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a (dyn Sync)> for SnowflakeConne
                 let schema = record_batches[0].schema();
                 return Ok(Arc::clone(&schema));
             }
-            _ => UnableToRetrieveSchemaSnafu.fail()?,
+            snowflake_api::QueryResult::Empty => UnableToRetrieveSchemaSnafu {
+                reason: "query to get table schema returned no result".to_string(),
+            }
+            .fail()?,
+            snowflake_api::QueryResult::Json(json) => UnexpectedResponseSnafu {
+                json: json.to_string(),
+            }
+            .fail()?,
         }
     }
 
@@ -101,6 +108,18 @@ impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a (dyn Sync)> for SnowflakeConne
 
         match res {
             snowflake_api::QueryResult::Arrow(record_batches) => {
+                tracing::trace!(
+                    "Snowflake data connector: received {} record batches",
+                    record_batches.len()
+                );
+
+                if record_batches.is_empty() {
+                    return Ok(Box::pin(RecordBatchStreamAdapter::new(
+                        Arc::new(Schema::empty()),
+                        stream::empty(),
+                    )));
+                }
+
                 let schema = record_batches[0].schema();
                 return Ok(Box::pin(MemoryStream::try_new(
                     record_batches,
@@ -116,7 +135,10 @@ impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a (dyn Sync)> for SnowflakeConne
             }
             snowflake_api::QueryResult::Json(json) => {
                 tracing::debug!("Unexpected response from Snowflake query: {json}");
-                UnexpectedResponseSnafu.fail()?
+                UnexpectedResponseSnafu {
+                    json: json.to_string(),
+                }
+                .fail()?
             }
         }
     }
