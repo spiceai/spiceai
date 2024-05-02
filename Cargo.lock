@@ -501,6 +501,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "arrow_tools"
+version = "0.12.1-alpha"
+dependencies = [
+ "arrow",
+ "snafu 0.8.2",
+]
+
+[[package]]
 name = "async-broadcast"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5742,6 +5750,7 @@ dependencies = [
  "arrow-ipc",
  "arrow-json",
  "arrow_sql_gen",
+ "arrow_tools",
  "async-stream",
  "async-trait",
  "axum 0.7.5",
