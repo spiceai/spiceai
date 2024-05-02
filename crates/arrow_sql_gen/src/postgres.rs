@@ -79,10 +79,10 @@ pub enum Error {
     },
 
     #[snafu(display("Failed to parse raw Postgres Bytes as BigDecimal: {:?}", bytes))]
-    FailedToParseBigDecmialFromPostgres { bytes: Vec<u8> },
+    FailedToParseBigDecimalFromPostgres { bytes: Vec<u8> },
 
     #[snafu(display("Cannot represent BigDecimal as i128: {big_decimal}"))]
-    FailedToConvertBigDecmialToI128 { big_decimal: BigDecimal },
+    FailedToConvertBigDecimalToI128 { big_decimal: BigDecimal },
 
     #[snafu(display("Failed to find field {column_name} in schema"))]
     FailedToFindFieldInSchema { column_name: String },
@@ -277,7 +277,7 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                     };
 
                     let Some(v_i128) = v.to_decimal_128() else {
-                        return FailedToConvertBigDecmialToI128Snafu {
+                        return FailedToConvertBigDecimalToI128Snafu {
                             big_decimal: v.inner,
                         }
                         .fail();
@@ -560,14 +560,14 @@ impl<'a> FromSql<'a> for BigDecimalFromSql {
             0x4000 => Sign::Minus,
             0x0000 => Sign::Plus,
             _ => {
-                return Err(Box::new(Error::FailedToParseBigDecmialFromPostgres {
+                return Err(Box::new(Error::FailedToParseBigDecimalFromPostgres {
                     bytes: raw.to_vec(),
                 }))
             }
         };
 
         let Some(digits) = BigInt::from_radix_be(sign, u8_digits.as_slice(), 10) else {
-            return Err(Box::new(Error::FailedToParseBigDecmialFromPostgres {
+            return Err(Box::new(Error::FailedToParseBigDecimalFromPostgres {
                 bytes: raw.to_vec(),
             }));
         };
