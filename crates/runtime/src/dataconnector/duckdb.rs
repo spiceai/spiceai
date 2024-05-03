@@ -71,21 +71,9 @@ impl DataConnectorFactory for DuckDB {
                 .and_then(|p| p.get("open").cloned())
                 .ok_or(Error::MissingDuckDBFile {})?;
 
-            let access_mode = params
-                .and_then(|p| p.get("access_mode").cloned())
-                .unwrap_or("automatic".to_string());
-
-            let access_mode = match access_mode.as_str() {
-                "read_only" => &AccessMode::ReadOnly,
-                "read_write" => &AccessMode::ReadWrite,
-                "automatic" => &AccessMode::Automatic,
-                _ => {
-                    return Err(Error::InvalidAccessMode { access_mode }.into());
-                }
-            };
-
+            // TODO: wire to dataset.mode once readwrite implemented for duckdb
             let pool = Arc::new(
-                DuckDbConnectionPool::new_file(&db_path, access_mode)
+                DuckDbConnectionPool::new_file(&db_path, &AccessMode::ReadOnly)
                     .context(UnableToCreateDuckDBConnectionPoolSnafu)?,
             );
 
