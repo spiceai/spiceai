@@ -290,7 +290,7 @@ impl DuckDB {
             .collect::<Vec<_>>();
         let arrow_params_ref: &[&dyn ToSql] = &arrow_params_vec;
         let sql = format!(
-            r#"CREATE TABLE "{name}" AS SELECT * FROM arrow(?, ?)"#,
+            r#"CREATE TABLE IF NOT EXISTS "{name}" AS SELECT * FROM arrow(?, ?)"#,
             name = self.table_name
         );
         tracing::trace!("{sql}");
