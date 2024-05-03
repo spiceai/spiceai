@@ -15,7 +15,7 @@ limitations under the License.
 */
 use arrow::{
     array::{array, Array, RecordBatch},
-    datatypes::{DataType, SchemaRef},
+    datatypes::{DataType, SchemaRef, TimeUnit},
 };
 
 use bigdecimal_0_3_0::BigDecimal;
@@ -219,29 +219,54 @@ impl InsertBuilder {
                             );
                         }
                     }
-                    DataType::Timestamp(_, _) => {
+                    DataType::Timestamp(TimeUnit::Second, _) => {
+                        let array = column
+                            .as_any()
+                            .downcast_ref::<array::TimestampSecondArray>();
+                        if let Some(valid_array) = array {
+                            insert_timestamp_into_row_values(
+                                OffsetDateTime::from_unix_timestamp(valid_array.value(row)),
+                                &mut row_values,
+                            )?;
+                        }
+                    }
+                    DataType::Timestamp(TimeUnit::Millisecond, _) => {
+                        let array = column
+                            .as_any()
+                            .downcast_ref::<array::TimestampMillisecondArray>();
+                        if let Some(valid_array) = array {
+                            insert_timestamp_into_row_values(
+                                OffsetDateTime::from_unix_timestamp_nanos(
+                                    i128::from(valid_array.value(row)) * 1_000_000,
+                                ),
+                                &mut row_values,
+                            )?;
+                        }
+                    }
+                    DataType::Timestamp(TimeUnit::Microsecond, _) => {
                         let array = column
                             .as_any()
                             .downcast_ref::<array::TimestampMicrosecondArray>();
                         if let Some(valid_array) = array {
-                            match OffsetDateTime::from_unix_timestamp(
-                                valid_array.value(row) / 1_000_000,
-                            ) {
-                                Ok(offset_time) => {
-                                    row_values.push(
-                                        PrimitiveDateTime::new(
-                                            offset_time.date(),
-                                            offset_time.time(),
-                                        )
-                                        .into(),
-                                    );
-                                }
-                                Err(e) => {
-                                    return Result::Err(Error::FailedToCreateInsertStatement {
-                                        source: Box::new(e),
-                                    })
-                                }
-                            };
+                            insert_timestamp_into_row_values(
+                                OffsetDateTime::from_unix_timestamp_nanos(
+                                    i128::from(valid_array.value(row)) * 1_000,
+                                ),
+                                &mut row_values,
+                            )?;
+                        }
+                    }
+                    DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+                        let array = column
+                            .as_any()
+                            .downcast_ref::<array::TimestampNanosecondArray>();
+                        if let Some(valid_array) = array {
+                            insert_timestamp_into_row_values(
+                                OffsetDateTime::from_unix_timestamp_nanos(i128::from(
+                                    valid_array.value(row),
+                                )),
+                                &mut row_values,
+                            )?;
                         }
                     }
                     DataType::List(list_type) => {
@@ -404,6 +429,21 @@ impl InsertBuilder {
             self.construct_insert_stmt(&mut insert_stmt, record_batch)?;
         }
         Ok(insert_stmt.to_string(query_builder))
+    }
+}
+
+fn insert_timestamp_into_row_values(
+    timestamp: Result<OffsetDateTime, time::error::ComponentRange>,
+    row_values: &mut Vec<SimpleExpr>,
+) -> Result<()> {
+    match timestamp {
+        Ok(offset_time) => {
+            row_values.push(PrimitiveDateTime::new(offset_time.date(), offset_time.time()).into());
+            Ok(())
+        }
+        Err(e) => Err(Error::FailedToCreateInsertStatement {
+            source: Box::new(e),
+        }),
     }
 }
 
