@@ -80,8 +80,8 @@ impl SnowflakeConnectionPool {
             .context(MissingRequiredSecretSnafu { name: "password" })?;
         let account = get_param(params, secret, "account")
             .context(MissingRequiredSecretSnafu { name: "account" })?;
-        let warehouse = get_param(params, secret, "warehouse");
-        let role = get_param(params, secret, "rolename");
+        let warehouse = get_param(params, secret, "snowflake_warehouse");
+        let role = get_param(params, secret, "snowflake_role");
 
         // account identifier can be in <orgname.account_name> format but API requires it as <orgname-account_name>
         let account = account.replace('.', "-");
