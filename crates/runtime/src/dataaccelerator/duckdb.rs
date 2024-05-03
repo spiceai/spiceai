@@ -45,7 +45,10 @@ impl DuckDBAccelerator {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            duckdb_factory: DuckDBTableProviderFactory::new().access_mode(AccessMode::ReadWrite),
+            // DuckDB accelerator uses params.duckdb_file for file connection
+            duckdb_factory: DuckDBTableProviderFactory::new()
+                .db_path_param("duckdb_file")
+                .access_mode(AccessMode::ReadWrite),
         }
     }
 }

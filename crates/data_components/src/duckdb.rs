@@ -97,6 +97,7 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct DuckDBTableProviderFactory {
     access_mode: AccessMode,
+    db_path_param: String,
 }
 
 impl DuckDBTableProviderFactory {
@@ -104,12 +105,19 @@ impl DuckDBTableProviderFactory {
     pub fn new() -> Self {
         Self {
             access_mode: AccessMode::ReadOnly,
+            db_path_param: "open".to_string(),
         }
     }
 
     #[must_use]
     pub fn access_mode(mut self, access_mode: AccessMode) -> Self {
         self.access_mode = access_mode;
+        self
+    }
+
+    #[must_use]
+    pub fn db_path_param(mut self, db_path_param: &str) -> Self {
+        self.db_path_param = db_path_param.to_string();
         self
     }
 }
@@ -141,7 +149,7 @@ impl TableProviderFactory for DuckDBTableProviderFactory {
                 // open duckdb at given path or create a new one
                 let db_path = cmd
                     .options
-                    .get("open")
+                    .get(self.db_path_param.as_str())
                     .cloned()
                     .unwrap_or(format!("{name}.db"));
 
