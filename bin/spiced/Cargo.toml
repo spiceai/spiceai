@@ -21,7 +21,7 @@ tracing-subscriber.workspace = true
 metrics-exporter-prometheus = "0.13.0"
 
 [features]
-default = ["duckdb", "postgres", "sqlite", "mysql", "flightsql", "databricks", "dremio", "clickhouse", "spark"]
+default = ["duckdb", "postgres", "sqlite", "mysql", "flightsql", "databricks", "dremio", "clickhouse", "spark", "snowflake"]
 duckdb = ["runtime/duckdb", "spicepod/duckdb", "app/duckdb"]
 postgres = ["runtime/postgres", "spicepod/postgres", "app/postgres"]
 sqlite = ["runtime/sqlite", "spicepod/sqlite", "app/sqlite"]
@@ -36,3 +36,4 @@ databricks = ["runtime/databricks"]
 dremio = ["runtime/dremio"]
 odbc = ["runtime/odbc"]
 spark = ["runtime/spark"]
+snowflake = ["runtime/snowflake"]
