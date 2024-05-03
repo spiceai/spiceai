@@ -53,6 +53,7 @@ pub(crate) mod query {
         response::{IntoResponse, Response},
         Extension,
     };
+    use datafusion::execution::context::SQLOptions;
     use std::sync::Arc;
     use tokio::sync::RwLock;
 
@@ -70,7 +71,17 @@ pub(crate) mod query {
             }
         };
 
-        let data_frame = match df.read().await.ctx.sql(&query).await {
+        let restricted_sql_options = SQLOptions::new()
+            .with_allow_ddl(false)
+            .with_allow_dml(false)
+            .with_allow_statements(false);
+        let data_frame = match df
+            .read()
+            .await
+            .ctx
+            .sql_with_options(&query, restricted_sql_options)
+            .await
+        {
             Ok(data_frame) => data_frame,
             Err(e) => {
                 tracing::debug!("Error running query: {e}");
