@@ -31,6 +31,8 @@ pub mod mysqlconn;
 pub mod odbcconn;
 #[cfg(feature = "postgres")]
 pub mod postgresconn;
+#[cfg(feature = "snowflake")]
+pub mod snowflakeconn;
 #[cfg(feature = "sqlite")]
 pub mod sqliteconn;
 
