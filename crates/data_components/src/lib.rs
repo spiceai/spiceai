@@ -46,6 +46,9 @@ pub mod spark_connect;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 
+#[cfg(feature = "snowflake")]
+pub mod snowflake;
+
 pub mod delete;
 pub mod util;
 

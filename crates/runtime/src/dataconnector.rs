@@ -57,6 +57,9 @@ pub mod s3;
 pub mod spark;
 pub mod spiceai;
 
+#[cfg(feature = "snowflake")]
+pub mod snowflake;
+
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Unable to scan table provider: {source}"))]
@@ -163,6 +166,8 @@ pub async fn register_all() {
     register_connector_factory("odbc", odbc::ODBC::create).await;
     #[cfg(feature = "spark")]
     register_connector_factory("spark", spark::Spark::create).await;
+    #[cfg(feature = "snowflake")]
+    register_connector_factory("snowflake", snowflake::Snowflake::create).await;
 }
 
 pub trait DataConnectorFactory {

@@ -36,6 +36,7 @@ lazy_static = "1.4.0"
 clickhouse-rs = { workspace = true, optional = true }
 tokio-postgres = { workspace = true , optional = true}
 async-stream = { workspace = true, optional = true }
+snowflake-api = { workspace = true, optional = true }
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
@@ -57,4 +58,5 @@ sqlite = ["dep:rusqlite", "dep:tokio-rusqlite", "arrow_sql_gen/sqlite", "spicepo
 mysql = ["dep:mysql_async", "arrow_sql_gen/mysql", "spicepod/mysql"]
 clickhouse = ["dep:clickhouse-rs", "arrow_sql_gen/clickhouse", "dep:async-stream"]
 odbc = ["dep:odbc-api", "dep:arrow-odbc", "dep:tokio"]
+snowflake = ["dep:snowflake-api"]
 
