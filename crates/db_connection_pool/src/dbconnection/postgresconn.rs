@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use std::any::Any;
+use std::error::Error;
 
 use arrow::datatypes::SchemaRef;
 use arrow_sql_gen::postgres::rows_to_arrow;
@@ -31,7 +32,7 @@ use super::DbConnection;
 use super::Result;
 
 #[derive(Debug, Snafu)]
-pub enum Error {
+pub enum PostgresError {
     #[snafu(display("{source}"))]
     QueryError {
         source: bb8_postgres::tokio_postgres::Error,
@@ -40,6 +41,17 @@ pub enum Error {
     #[snafu(display("Failed to convert query result to Arrow: {source}"))]
     ConversionError {
         source: arrow_sql_gen::postgres::Error,
+    },
+
+    #[snafu(display("Table {table_name} not found. Ensure the table name is correctly spelled."))]
+    UndefinedTableError {
+        source: Box<tokio_postgres::error::DbError>,
+        table_name: String,
+    },
+
+    #[snafu(display("{source}"))]
+    InternalError {
+        source: tokio_postgres::error::Error,
     },
 }
 
@@ -87,7 +99,7 @@ impl<'a>
     }
 
     async fn get_schema(&self, table_reference: &TableReference) -> Result<SchemaRef> {
-        let rows = self
+        match self
             .conn
             .query(
                 &format!(
@@ -97,10 +109,30 @@ impl<'a>
                 &[],
             )
             .await
-            .context(QuerySnafu)?;
-        let rec = rows_to_arrow(rows.as_slice()).context(ConversionSnafu)?;
-        let schema = rec.schema();
-        Ok(schema)
+        {
+            Ok(rows) => {
+                let rec = rows_to_arrow(rows.as_slice()).context(ConversionSnafu)?;
+                Ok(rec.schema())
+            }
+            Err(err) => {
+                let Some(error_source) = err.source() else {
+                    return Err(Box::new(PostgresError::InternalError { source: err }));
+                };
+
+                if let Some(pg_error) =
+                    error_source.downcast_ref::<tokio_postgres::error::DbError>()
+                {
+                    if pg_error.code() == &tokio_postgres::error::SqlState::UNDEFINED_TABLE {
+                        return Err(Box::new(PostgresError::UndefinedTableError {
+                            source: Box::new(pg_error.clone()),
+                            table_name: table_reference.to_string(),
+                        }));
+                    }
+                }
+
+                return Err(Box::new(PostgresError::InternalError { source: err }));
+            }
+        }
     }
 
     async fn query_arrow(
