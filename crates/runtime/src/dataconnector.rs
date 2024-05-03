@@ -21,6 +21,7 @@ use datafusion::dataframe::DataFrame;
 use datafusion::datasource::{DefaultTableSource, TableProvider};
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::{Expr, LogicalPlanBuilder};
+use db_connection_pool::postgrespool;
 use lazy_static::lazy_static;
 use object_store::ObjectStore;
 use snafu::prelude::*;
@@ -91,6 +92,9 @@ pub enum Error {
     UnableToFilterDataFrame {
         source: datafusion::error::DataFusionError,
     },
+
+    #[snafu(display("{message}"))]
+    UnableToCreateDataConnector { message: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -138,10 +142,32 @@ pub async fn create_new_connector(
 
     let connector_factory = guard.get(name);
 
-    match connector_factory {
-        Some(factory) => Some(factory(secret, params).await),
-        None => None,
+    if let Some(create_future) = connector_factory {
+        match create_future(secret, params).await {
+            Ok(connector) => return Some(Ok(connector)),
+            Err(err) => {
+                if let Some(err_source) = err.source() {
+                    #[cfg(feature = "postgres")]
+                    if let Some(postgrespool::Error::InvalidHostOrPortError {
+                        source: _,
+                        host,
+                        port,
+                    }) = err_source.downcast_ref::<postgrespool::Error>()
+                    {
+                        return Some(Err(Box::new(Error::UnableToCreateDataConnector {
+                                message: format!(
+                                    "Cannot connect to PostgreSQL data connector on {host}:{port}. Ensure that the host and port are correclty configured in the spicepod, and that the host is reachable"
+                                ),
+                            })));
+                    }
+                }
+
+                return Some(Err(err));
+            }
+        }
     }
+
+    None
 }
 
 pub async fn register_all() {
