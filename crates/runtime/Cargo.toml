@@ -70,6 +70,7 @@ odbc-api = { version = "7.0.0", optional = true }
 chrono = { version = "0.4.38" }
 clickhouse-rs = { workspace = true, optional = true }
 dashmap = "5.5.3"
+snowflake-api = { workspace = true, optional = true }
 
 [features]
 default = ["keyring-secret-store", "aws-secrets-manager"]
@@ -107,3 +108,4 @@ databricks = ["data_components/databricks"]
 spark = ["data_components/spark_connect"]
 dremio = []
 odbc = ["db_connection_pool/odbc", "data_components/odbc", "dep:odbc-api"]
+snowflake = ["dep:snowflake-api", "db_connection_pool/snowflake", "data_components/snowflake"]
