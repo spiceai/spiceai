@@ -26,6 +26,7 @@ use arrow_ipc::writer::IpcWriteOptions;
 use arrow_tools::schema::verify_schema;
 use bytes::Bytes;
 use datafusion::error::DataFusionError;
+use datafusion::execution::context::SQLOptions;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::sql::sqlparser::parser::ParserError;
 use futures::stream::{self, BoxStream, StreamExt};
@@ -178,11 +179,15 @@ impl Service {
         datafusion: Arc<RwLock<DataFusion>>,
         sql: String,
     ) -> Result<BoxStream<'static, Result<FlightData, Status>>, Status> {
+        let restricted_sql_options = SQLOptions::new()
+            .with_allow_ddl(false)
+            .with_allow_dml(false)
+            .with_allow_statements(false);
         let df = datafusion
             .read()
             .await
             .ctx
-            .sql(&sql)
+            .sql_with_options(&sql, restricted_sql_options)
             .await
             .map_err(handle_datafusion_error)?;
         let schema = df.schema().clone().into();
