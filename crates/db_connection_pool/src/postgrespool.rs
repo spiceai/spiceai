@@ -239,6 +239,10 @@ async fn verify_postgres_config(config: &Config) -> Result<()> {
             if let Host::Tcp(host) = host {
                 verify_ns_lookup_and_tcp_connect(host, *port)
                     .await
+                    .map_err(|err| {
+                        tracing::debug!("Failed to connect to host: {}", err);
+                        err
+                    })
                     .context(InvalidHostOrPortSnafu { host, port: *port })?;
             }
         }
