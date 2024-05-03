@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::arrow::verify_schema;
 use crate::datafusion::DataFusion;
 use crate::dataupdate::DataUpdate;
 use crate::measure_scope_ms;
@@ -24,6 +23,7 @@ use arrow::ipc::writer::{DictionaryTracker, IpcDataGenerator};
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::{Action, ActionType, Criteria, IpcMessage, PollInfo, SchemaResult};
 use arrow_ipc::writer::IpcWriteOptions;
+use arrow_tools::schema::verify_schema;
 use bytes::Bytes;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;

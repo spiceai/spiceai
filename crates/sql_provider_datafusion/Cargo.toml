@@ -25,6 +25,7 @@ db_connection_pool = { path = "../db_connection_pool" }
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 duckdb = { workspace = true, features = ["bundled", "r2d2", "vtab", "vtab-arrow"] }
 db_connection_pool = { path = "../db_connection_pool", features = ["duckdb"] }
+pgtemp = "0.3.0"
 
 [features]
 postgres = ["db_connection_pool/postgres"]

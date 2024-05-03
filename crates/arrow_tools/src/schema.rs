@@ -1,5 +1,3 @@
-// TODO: Move this to the arrow_tools crate when https://github.com/spiceai/spiceai/pull/1261 is merged
-
 use snafu::prelude::*;
 
 #[derive(Debug, Snafu)]
@@ -20,6 +18,13 @@ pub enum Error {
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// Validates the fields between two Arrow schemas match, with a specific error about which field is mismatched.
+///
+/// # Errors
+///
+/// This function will return an error if the fields of the expected schema don't
+/// match the fields of the actual schema.
+#[allow(clippy::module_name_repetitions)]
 pub fn verify_schema(
     expected: &arrow::datatypes::Fields,
     actual: &arrow::datatypes::Fields,
