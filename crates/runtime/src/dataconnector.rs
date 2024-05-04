@@ -156,7 +156,7 @@ pub async fn create_new_connector(
                     {
                         return Some(Err(Box::new(Error::UnableToCreateDataConnector {
                                 message: format!(
-                                    "Cannot connect to PostgreSQL data connector on {host}:{port}. Ensure that the host and port are correclty configured in the spicepod, and that the host is reachable."
+                                    "Cannot connect to PostgreSQL data connector on {host}:{port}. Ensure that the host and port are correctly configured in the spicepod, and that the host is reachable."
                                 ),
                             })));
                     }
