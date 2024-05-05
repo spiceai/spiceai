@@ -119,7 +119,6 @@ impl PostgresConnectionPool {
                     match pg_sslmode.to_lowercase().as_str() {
                         "disable" | "require" | "prefer" | "verify-ca" | "verify-full" => {
                             ssl_mode = pg_sslmode.as_str();
-                            connection_string.push_str(format!("sslmode={ssl_mode} ").as_str());
                         }
                         _ => {
                             InvalidParameterSnafu {
