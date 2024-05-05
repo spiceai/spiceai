@@ -333,8 +333,8 @@ mod tests {
     use datafusion::execution::context::SessionContext;
     use datafusion::sql::TableReference;
     use db_connection_pool::dbconnection::duckdbconn::DuckDbConnection;
-    use db_connection_pool::{duckdbpool::DuckDbConnectionPool, DbConnectionPool, Mode};
-    use duckdb::{DuckdbConnectionManager, ToSql};
+    use db_connection_pool::{duckdbpool::DuckDbConnectionPool, DbConnectionPool};
+    use duckdb::{AccessMode, DuckdbConnectionManager, ToSql};
     use tracing::{level_filters::LevelFilter, subscriber::DefaultGuard, Dispatch};
 
     use crate::SqlTable;
@@ -362,11 +362,7 @@ mod tests {
             dyn DbConnectionPool<r2d2::PooledConnection<DuckdbConnectionManager>, &dyn ToSql>
                 + Send
                 + Sync,
-        > = Arc::new(DuckDbConnectionPool::new(
-            "test",
-            &Mode::Memory,
-            &Arc::new(Option::None),
-        )?);
+        > = Arc::new(DuckDbConnectionPool::new_memory(&AccessMode::ReadWrite)?);
         let conn = pool.connect().await?;
         let db_conn = conn
             .as_any()
@@ -392,11 +388,7 @@ mod tests {
             dyn DbConnectionPool<r2d2::PooledConnection<DuckdbConnectionManager>, &dyn ToSql>
                 + Send
                 + Sync,
-        > = Arc::new(DuckDbConnectionPool::new(
-            "test",
-            &Mode::Memory,
-            &Arc::new(Option::None),
-        )?);
+        > = Arc::new(DuckDbConnectionPool::new_memory(&AccessMode::ReadWrite)?);
         let conn = pool.connect().await?;
         let db_conn = conn
             .as_any()
