@@ -220,6 +220,7 @@ impl DeletionSink for DuckDBDeletionSink {
 mod tests {
     use std::{collections::HashMap, sync::Arc};
 
+    use crate::{delete::get_deletion_provider, duckdb::DuckDBTableProviderFactory};
     use arrow::{
         array::{Int64Array, RecordBatch, StringArray, TimestampSecondArray, UInt64Array},
         datatypes::{DataType, Schema},
@@ -232,8 +233,7 @@ mod tests {
         physical_plan::{collect, test::exec::MockExec},
         scalar::ScalarValue,
     };
-
-    use crate::{delete::get_deletion_provider, duckdb::DuckDBTableProviderFactory};
+    use duckdb::AccessMode;
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
@@ -268,6 +268,7 @@ mod tests {
         };
         let ctx = SessionContext::new();
         let table = DuckDBTableProviderFactory::default()
+            .access_mode(AccessMode::ReadWrite)
             .create(&ctx.state(), &external_table)
             .await
             .expect("table should be created");
