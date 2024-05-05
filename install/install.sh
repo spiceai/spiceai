@@ -92,14 +92,36 @@ checkJqInstalled() {
     fi
 }
 
+function gh_curl() {
+    if [ -z "$GITHUB_TOKEN" ]
+    then
+        curl \
+            $@
+    else
+        curl -H "Authorization: token $GITHUB_TOKEN" \
+            $@
+    fi
+}
+
+function gh_wget() {
+    if [ -n "$GITHUB_TOKEN" ]
+    then
+        wget --header="Authorization: token $GITHUB_TOKEN" \
+            $@
+    else
+        wget \
+            $@
+    fi
+}
+
 getLatestRelease() {
     local spiceReleaseUrl="https://api.github.com/repos/${GITHUB_ORG}/${GITHUB_REPO}/releases"
     local latest_release=""
 
     if [ "$SPICE_HTTP_REQUEST_CLI" == "curl" ]; then
-        latest_release=$(curl -s $spiceReleaseUrl | grep \"tag_name\" | grep -v rc | awk 'NR==1{print $2}' |  sed -n 's/\"\(.*\)\",/\1/p')
+        latest_release=$(gh_curl -s $spiceReleaseUrl | grep \"tag_name\" | grep -v rc | awk 'NR==1{print $2}' |  sed -n 's/\"\(.*\)\",/\1/p')
     else
-        latest_release=$(wget -q --header="Accept: application/json" -O - $spiceReleaseUrl | grep \"tag_name\" | grep -v rc | awk 'NR==1{print $2}' |  sed -n 's/\"\(.*\)\",/\1/p')
+        latest_release=$(gh_wget -q --header="Accept: application/json" -O - $spiceReleaseUrl | grep \"tag_name\" | grep -v rc | awk 'NR==1{print $2}' |  sed -n 's/\"\(.*\)\",/\1/p')
     fi
 
     ret_val=$latest_release
@@ -118,25 +140,25 @@ downloadFile() {
 
     echo "Downloading $DOWNLOAD_URL ..."
 
-    function gh_curl() {
-      curl -H "Accept: application/vnd.github.v3.raw" \
+    function gh_curl_vnd() {
+        gh_curl -H "Accept: application/vnd.github.v3.raw" \
           $@
     }
 
     parser=". | map(select(.tag_name == \"$LATEST_RELEASE_TAG\"))[0].assets | map(select(.name == \"$SPICE_CLI_ARTIFACT\"))[0].id"
 
-    asset_id=`gh_curl -s https://api.github.com/repos/$GITHUB_ORG/$GITHUB_REPO/releases | jq "$parser"`
+    asset_id=`gh_curl_vnd -s https://api.github.com/repos/$GITHUB_ORG/$GITHUB_REPO/releases | jq "$parser"`
     if [ "$asset_id" = "null" ]; then
       echo "ERROR: version not found $VERSION"
       exit 1
     fi;
 
     if [ "$SPICE_HTTP_REQUEST_CLI" == "curl" ]; then
-        curl -H "Accept:application/octet-stream" -SsL \
+        gh_curl -H "Accept:application/octet-stream" -SsL \
             https://api.github.com/repos/$GITHUB_ORG/$GITHUB_REPO/releases/assets/$asset_id \
             -o "$ARTIFACT_TMP_FILE"
     else
-        wget -q --auth-no-challenge --header='Accept:application/octet-stream' \
+        gh_wget -q --auth-no-challenge --header='Accept:application/octet-stream' \
             https://api.github.com/repos/$GITHUB_ORG/$GITHUB_REPO/releases/assets/$asset_id \
             -O "$ARTIFACT_TMP_FILE"
     fi
