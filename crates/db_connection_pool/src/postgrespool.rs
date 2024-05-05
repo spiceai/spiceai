@@ -68,6 +68,11 @@ pub enum Error {
 
     #[snafu(display("Postgres connection error: {source}"))]
     PostgresConnectionError { source: tokio_postgres::Error },
+
+    #[snafu(display(
+        "Authentication failed. Ensure that the username and password are correctly configured."
+    ))]
+    InvalidUsernameOrPassword { source: tokio_postgres::Error },
 }
 
 pub struct PostgresConnectionPool {
@@ -227,11 +232,18 @@ async fn test_postgres_connection(
     connection_string: &str,
     connector: MakeTlsConnector,
 ) -> Result<()> {
-    let (_, _) = tokio_postgres::connect(connection_string, connector)
-        .await
-        .context(PostgresConnectionSnafu)?;
+    match tokio_postgres::connect(connection_string, connector).await {
+        Ok(_) => Ok(()),
+        Err(err) => {
+            if let Some(code) = err.code() {
+                if *code == tokio_postgres::error::SqlState::INVALID_PASSWORD {
+                    return Err(Box::new(Error::InvalidUsernameOrPassword { source: err }));
+                }
+            }
 
-    Ok(())
+            return Err(Box::new(Error::PostgresConnectionError { source: err }));
+        }
+    }
 }
 
 async fn verify_postgres_config(config: &Config) -> Result<()> {
