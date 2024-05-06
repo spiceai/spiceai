@@ -232,7 +232,7 @@ async fn test_postgres_connection(
     Ok(())
 }
 
-async fn verify_posstgres_config(config: &Config) -> Result<()> {
+async fn verify_postgres_config(config: &Config) -> Result<()> {
     for host in config.get_hosts() {
         for port in config.get_ports() {
             if let Host::Tcp(host) = host {
