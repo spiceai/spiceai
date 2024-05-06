@@ -113,8 +113,11 @@ macro_rules! append_value {
             }
             .fail()?
         };
-        let value: $type = $row.get($index).context(FailedToExtractRowValueSnafu)?;
-        builder.append_value(value);
+        let value: Option<$type> = $row.get($index).context(FailedToExtractRowValueSnafu)?;
+        match value {
+            Some(value) => builder.append_value(value),
+            None => builder.append_null(),
+        }
     }};
 }
 
