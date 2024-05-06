@@ -112,16 +112,14 @@ impl TableProviderFactory for SqliteTableFactory {
         let mode = options.remove("mode").unwrap_or_default();
         let mode: Mode = mode.as_str().into();
 
-        let params = Arc::new(Some(options));
-
         let db_path = cmd
             .options
             .get(self.db_path_param.as_str())
             .cloned()
-            .unwrap_or(format!("{name}.db"));
+            .unwrap_or(format!("{name}_sqlite.db"));
 
         let pool: Arc<SqliteConnectionPool> = Arc::new(
-            SqliteConnectionPool::new(&db_path, mode, params)
+            SqliteConnectionPool::new(&db_path, mode)
                 .await
                 .context(DbConnectionPoolSnafu)
                 .map_err(to_datafusion_error)?,
