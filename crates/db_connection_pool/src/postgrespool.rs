@@ -201,7 +201,7 @@ impl PostgresConnectionPool {
 }
 
 fn parse_connection_string(pg_connection_string: &str) -> (String, String, Option<String>) {
-    let mut connection_string = "host=localhost user=postgres dbname=postgres".to_string();
+    let mut connection_string = String::new();
     let mut ssl_mode = "verify-full".to_string();
     let mut ssl_rootcert_path: Option<String> = None;
 
