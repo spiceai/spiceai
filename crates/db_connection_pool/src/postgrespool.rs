@@ -50,7 +50,7 @@ pub enum Error {
     #[snafu(display("Invalid parameter: {parameter_name}"))]
     InvalidParameterError { parameter_name: String },
 
-    #[snafu(display("Cannot connect to PostgreSQL on {host}:{port}."))]
+    #[snafu(display("Cannot connect to PostgreSQL on {host}:{port}. Ensure that the host and port are correctly configured, and that the host is reachable."))]
     InvalidHostOrPortError {
         source: ns_lookup::Error,
         host: String,
