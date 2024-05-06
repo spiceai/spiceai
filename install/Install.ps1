@@ -12,7 +12,13 @@ New-Item -Path $spiceCliInstallDir -ItemType Directory -Force > $null
 
 function Get-LatestRelease {
     $url = "https://api.github.com/repos/$spiceOrgName/$spiceRepoName/releases/latest"
-    $releaseInfo = Invoke-RestMethod -Uri $url
+
+    $headers = @{}
+    if ($env:GITHUB_TOKEN) {
+        $headers["Authorization"] = "token $env:GITHUB_TOKEN"
+    }
+
+    $releaseInfo = Invoke-RestMethod -Uri $url -Headers $headers
     return $releaseInfo.tag_name
 }
 
@@ -45,8 +51,13 @@ function Download-And-Install-Spice {
     $tempPath = [System.IO.Path]::GetTempPath()
     $tempFile = Join-Path $tempPath $artifactName
 
+    $headers = @{}
+    if ($env:GITHUB_TOKEN) {
+        $headers["Authorization"] = "token $env:GITHUB_TOKEN"
+    }
+
     Write-Host "Downloading Spice CLI from $downloadUrl..."
-    Invoke-WebRequest -Uri $downloadUrl -OutFile $tempFile
+    Invoke-WebRequest -Uri $downloadUrl -OutFile $tempFile -Headers $headers
     tar -xf $tempFile -C $tempPath
 
     Move-Item -Path (Join-Path $tempPath $spiceCliFilename) -Destination $spiceCliFullPath -Force

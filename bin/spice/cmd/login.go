@@ -39,6 +39,7 @@ const (
 	token            = "token"
 	accessKeyFlag    = "access-key"
 	accessSecretFlag = "access-secret"
+	sparkRemoteFlag  = "spark_remote"
 	awsRegion        = "aws-region"
 	awsAccessKeyId   = "aws-access-key-id"
 	awsSecret        = "aws-secret-access-key"
@@ -190,6 +191,38 @@ spice login postgres engine --password <password>
 		passwordFlag: fmt.Sprintf("No password provided, use --%s or -p to provide a password", passwordFlag),
 	}, map[string]string{
 		passwordFlag: api.AUTH_PARAM_PG_PASSWORD,
+	}),
+}
+
+var snowflakeCmd = &cobra.Command{
+	Use:   "snowflake",
+	Short: "Login to a Snowflake warehouse",
+	Example: `
+spice login snowflake --username <username> --password <password>
+
+# See more at: https://docs.spiceai.org/
+`,
+	Run: CreateLoginRunFunc(api.AUTH_TYPE_SNOWFLAKE, map[string]string{
+		usernameFlag: fmt.Sprintf("No username provided, use --%s or -u to provide a username", usernameFlag),
+		passwordFlag: fmt.Sprintf("No password provided, use --%s or -p to provide a password", passwordFlag),
+	}, map[string]string{
+		usernameFlag: api.AUTH_PARAM_USERNAME,
+		passwordFlag: api.AUTH_PARAM_PASSWORD,
+	}),
+}
+
+var sparkCmd = &cobra.Command{
+	Use:   "spark",
+	Short: "Login to a Spark Connect remote",
+	Example: `
+spice login spark --spark_remote <remote>
+
+# See more at: https://docs.spiceai.org/
+`,
+	Run: CreateLoginRunFunc(api.AUTH_TYPE_SPARK, map[string]string{
+		sparkRemoteFlag: "No spark_remote provided, use --spark_remote to provide",
+	}, map[string]string{
+		sparkRemoteFlag: api.AUTH_PARAM_SPARK_REMOTE,
 	}),
 }
 
@@ -351,6 +384,15 @@ func init() {
 	postgresEngineCmd.Flags().BoolP("help", "h", false, "Print this help message")
 	postgresEngineCmd.Flags().StringP(passwordFlag, "p", "", "Password")
 	postgresCmd.AddCommand(postgresEngineCmd)
+
+	snowflakeCmd.Flags().BoolP("help", "h", false, "Print this help message")
+	snowflakeCmd.Flags().StringP(usernameFlag, "u", "", "Username")
+	snowflakeCmd.Flags().StringP(passwordFlag, "p", "", "Password")
+	loginCmd.AddCommand(snowflakeCmd)
+
+	sparkCmd.Flags().BoolP("help", "h", false, "Print this help message")
+	sparkCmd.Flags().String(sparkRemoteFlag, "", "Spark Remote")
+	loginCmd.AddCommand(sparkCmd)
 
 	loginCmd.Flags().BoolP("help", "h", false, "Print this help message")
 	loginCmd.Flags().StringP(apiKeyFlag, "k", "", "API key")

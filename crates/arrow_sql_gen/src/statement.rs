@@ -15,7 +15,7 @@ limitations under the License.
 */
 use arrow::{
     array::{array, Array, RecordBatch},
-    datatypes::{DataType, SchemaRef},
+    datatypes::{DataType, SchemaRef, TimeUnit},
 };
 
 use bigdecimal_0_3_0::BigDecimal;
@@ -25,7 +25,7 @@ use time::{OffsetDateTime, PrimitiveDateTime};
 
 use sea_query::{
     Alias, ColumnDef, ColumnType, GenericBuilder, Index, InsertStatement, IntoIden,
-    IntoIndexColumn, MysqlQueryBuilder, PostgresQueryBuilder, Query, SimpleExpr,
+    IntoIndexColumn, Keyword, MysqlQueryBuilder, PostgresQueryBuilder, Query, SimpleExpr,
     SqliteQueryBuilder, Table,
 };
 
@@ -113,6 +113,10 @@ macro_rules! push_value {
     ($row_values:expr, $column:expr, $row:expr, $array_type:ident) => {{
         let array = $column.as_any().downcast_ref::<array::$array_type>();
         if let Some(valid_array) = array {
+            if valid_array.is_null($row) {
+                $row_values.push(Keyword::Null.into());
+                continue;
+            }
             $row_values.push(valid_array.value($row).into());
         }
     }};
@@ -162,6 +166,7 @@ impl InsertBuilder {
             let mut row_values: Vec<SimpleExpr> = vec![];
             for col in 0..record_batch.num_columns() {
                 let column = record_batch.column(col);
+
                 match column.data_type() {
                     DataType::Int8 => push_value!(row_values, column, row, Int8Array),
                     DataType::Int16 => push_value!(row_values, column, row, Int16Array),
@@ -179,6 +184,10 @@ impl InsertBuilder {
                     DataType::Decimal128(_, scale) => {
                         let array = column.as_any().downcast_ref::<array::Decimal128Array>();
                         if let Some(valid_array) = array {
+                            if valid_array.is_null(row) {
+                                row_values.push(Keyword::Null.into());
+                                continue;
+                            }
                             row_values.push(
                                 BigDecimal::new(valid_array.value(row).into(), i64::from(*scale))
                                     .into(),
@@ -188,6 +197,10 @@ impl InsertBuilder {
                     DataType::Date32 => {
                         let array = column.as_any().downcast_ref::<array::Date32Array>();
                         if let Some(valid_array) = array {
+                            if valid_array.is_null(row) {
+                                row_values.push(Keyword::Null.into());
+                                continue;
+                            }
                             row_values.push(
                                 match OffsetDateTime::from_unix_timestamp(
                                     i64::from(valid_array.value(row)) * 86_400,
@@ -205,6 +218,10 @@ impl InsertBuilder {
                     DataType::Date64 => {
                         let array = column.as_any().downcast_ref::<array::Date64Array>();
                         if let Some(valid_array) = array {
+                            if valid_array.is_null(row) {
+                                row_values.push(Keyword::Null.into());
+                                continue;
+                            }
                             row_values.push(
                                 match OffsetDateTime::from_unix_timestamp(
                                     valid_array.value(row) * 86_400,
@@ -219,34 +236,83 @@ impl InsertBuilder {
                             );
                         }
                     }
-                    DataType::Timestamp(_, _) => {
+                    DataType::Timestamp(TimeUnit::Second, _) => {
+                        let array = column
+                            .as_any()
+                            .downcast_ref::<array::TimestampSecondArray>();
+
+                        if let Some(valid_array) = array {
+                            if valid_array.is_null(row) {
+                                row_values.push(Keyword::Null.into());
+                                continue;
+                            }
+                            insert_timestamp_into_row_values(
+                                OffsetDateTime::from_unix_timestamp(valid_array.value(row)),
+                                &mut row_values,
+                            )?;
+                        }
+                    }
+                    DataType::Timestamp(TimeUnit::Millisecond, _) => {
+                        let array = column
+                            .as_any()
+                            .downcast_ref::<array::TimestampMillisecondArray>();
+
+                        if let Some(valid_array) = array {
+                            if valid_array.is_null(row) {
+                                row_values.push(Keyword::Null.into());
+                                continue;
+                            }
+                            insert_timestamp_into_row_values(
+                                OffsetDateTime::from_unix_timestamp_nanos(
+                                    i128::from(valid_array.value(row)) * 1_000_000,
+                                ),
+                                &mut row_values,
+                            )?;
+                        }
+                    }
+                    DataType::Timestamp(TimeUnit::Microsecond, _) => {
                         let array = column
                             .as_any()
                             .downcast_ref::<array::TimestampMicrosecondArray>();
+
                         if let Some(valid_array) = array {
-                            match OffsetDateTime::from_unix_timestamp(
-                                valid_array.value(row) / 1_000_000,
-                            ) {
-                                Ok(offset_time) => {
-                                    row_values.push(
-                                        PrimitiveDateTime::new(
-                                            offset_time.date(),
-                                            offset_time.time(),
-                                        )
-                                        .into(),
-                                    );
-                                }
-                                Err(e) => {
-                                    return Result::Err(Error::FailedToCreateInsertStatement {
-                                        source: Box::new(e),
-                                    })
-                                }
-                            };
+                            if valid_array.is_null(row) {
+                                row_values.push(Keyword::Null.into());
+                                continue;
+                            }
+                            insert_timestamp_into_row_values(
+                                OffsetDateTime::from_unix_timestamp_nanos(
+                                    i128::from(valid_array.value(row)) * 1_000,
+                                ),
+                                &mut row_values,
+                            )?;
+                        }
+                    }
+                    DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+                        let array = column
+                            .as_any()
+                            .downcast_ref::<array::TimestampNanosecondArray>();
+
+                        if let Some(valid_array) = array {
+                            if valid_array.is_null(row) {
+                                row_values.push(Keyword::Null.into());
+                                continue;
+                            }
+                            insert_timestamp_into_row_values(
+                                OffsetDateTime::from_unix_timestamp_nanos(i128::from(
+                                    valid_array.value(row),
+                                )),
+                                &mut row_values,
+                            )?;
                         }
                     }
                     DataType::List(list_type) => {
                         let array = column.as_any().downcast_ref::<array::ListArray>();
                         if let Some(valid_array) = array {
+                            if valid_array.is_null(row) {
+                                row_values.push(Keyword::Null.into());
+                                continue;
+                            }
                             let list_array = valid_array.value(row);
                             match list_type.data_type() {
                                 DataType::Int8 => push_list_values!(
@@ -404,6 +470,21 @@ impl InsertBuilder {
             self.construct_insert_stmt(&mut insert_stmt, record_batch)?;
         }
         Ok(insert_stmt.to_string(query_builder))
+    }
+}
+
+fn insert_timestamp_into_row_values(
+    timestamp: Result<OffsetDateTime, time::error::ComponentRange>,
+    row_values: &mut Vec<SimpleExpr>,
+) -> Result<()> {
+    match timestamp {
+        Ok(offset_time) => {
+            row_values.push(PrimitiveDateTime::new(offset_time.date(), offset_time.time()).into());
+            Ok(())
+        }
+        Err(e) => Err(Error::FailedToCreateInsertStatement {
+            source: Box::new(e),
+        }),
     }
 }
 

@@ -185,7 +185,13 @@ impl DataSink for PostgresDataSink {
 
         while let Some(batch) = data.next().await {
             let batch = batch?;
-            num_rows += batch.num_rows() as u64;
+            let batch_num_rows = batch.num_rows();
+
+            if batch_num_rows == 0 {
+                continue;
+            };
+
+            num_rows += batch_num_rows as u64;
 
             self.postgres
                 .insert_batch(&tx, batch)
