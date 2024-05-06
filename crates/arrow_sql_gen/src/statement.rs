@@ -25,7 +25,7 @@ use time::{OffsetDateTime, PrimitiveDateTime};
 
 use sea_query::{
     Alias, ColumnDef, ColumnType, GenericBuilder, Index, InsertStatement, IntoIden,
-    IntoIndexColumn, MysqlQueryBuilder, PostgresQueryBuilder, Query, SimpleExpr,
+    IntoIndexColumn, Keyword, MysqlQueryBuilder, PostgresQueryBuilder, Query, SimpleExpr,
     SqliteQueryBuilder, Table,
 };
 
@@ -113,6 +113,10 @@ macro_rules! push_value {
     ($row_values:expr, $column:expr, $row:expr, $array_type:ident) => {{
         let array = $column.as_any().downcast_ref::<array::$array_type>();
         if let Some(valid_array) = array {
+            if valid_array.is_null($row) {
+                $row_values.push(Keyword::Null.into());
+                continue;
+            }
             $row_values.push(valid_array.value($row).into());
         }
     }};
@@ -162,6 +166,7 @@ impl InsertBuilder {
             let mut row_values: Vec<SimpleExpr> = vec![];
             for col in 0..record_batch.num_columns() {
                 let column = record_batch.column(col);
+
                 match column.data_type() {
                     DataType::Int8 => push_value!(row_values, column, row, Int8Array),
                     DataType::Int16 => push_value!(row_values, column, row, Int16Array),
@@ -179,6 +184,10 @@ impl InsertBuilder {
                     DataType::Decimal128(_, scale) => {
                         let array = column.as_any().downcast_ref::<array::Decimal128Array>();
                         if let Some(valid_array) = array {
+                            if valid_array.is_null(row) {
+                                row_values.push(Keyword::Null.into());
+                                continue;
+                            }
                             row_values.push(
                                 BigDecimal::new(valid_array.value(row).into(), i64::from(*scale))
                                     .into(),
@@ -188,6 +197,10 @@ impl InsertBuilder {
                     DataType::Date32 => {
                         let array = column.as_any().downcast_ref::<array::Date32Array>();
                         if let Some(valid_array) = array {
+                            if valid_array.is_null(row) {
+                                row_values.push(Keyword::Null.into());
+                                continue;
+                            }
                             row_values.push(
                                 match OffsetDateTime::from_unix_timestamp(
                                     i64::from(valid_array.value(row)) * 86_400,
@@ -205,6 +218,10 @@ impl InsertBuilder {
                     DataType::Date64 => {
                         let array = column.as_any().downcast_ref::<array::Date64Array>();
                         if let Some(valid_array) = array {
+                            if valid_array.is_null(row) {
+                                row_values.push(Keyword::Null.into());
+                                continue;
+                            }
                             row_values.push(
                                 match OffsetDateTime::from_unix_timestamp(
                                     valid_array.value(row) * 86_400,
@@ -223,7 +240,12 @@ impl InsertBuilder {
                         let array = column
                             .as_any()
                             .downcast_ref::<array::TimestampSecondArray>();
+
                         if let Some(valid_array) = array {
+                            if valid_array.is_null(row) {
+                                row_values.push(Keyword::Null.into());
+                                continue;
+                            }
                             insert_timestamp_into_row_values(
                                 OffsetDateTime::from_unix_timestamp(valid_array.value(row)),
                                 &mut row_values,
@@ -234,7 +256,12 @@ impl InsertBuilder {
                         let array = column
                             .as_any()
                             .downcast_ref::<array::TimestampMillisecondArray>();
+
                         if let Some(valid_array) = array {
+                            if valid_array.is_null(row) {
+                                row_values.push(Keyword::Null.into());
+                                continue;
+                            }
                             insert_timestamp_into_row_values(
                                 OffsetDateTime::from_unix_timestamp_nanos(
                                     i128::from(valid_array.value(row)) * 1_000_000,
@@ -247,7 +274,12 @@ impl InsertBuilder {
                         let array = column
                             .as_any()
                             .downcast_ref::<array::TimestampMicrosecondArray>();
+
                         if let Some(valid_array) = array {
+                            if valid_array.is_null(row) {
+                                row_values.push(Keyword::Null.into());
+                                continue;
+                            }
                             insert_timestamp_into_row_values(
                                 OffsetDateTime::from_unix_timestamp_nanos(
                                     i128::from(valid_array.value(row)) * 1_000,
@@ -260,7 +292,12 @@ impl InsertBuilder {
                         let array = column
                             .as_any()
                             .downcast_ref::<array::TimestampNanosecondArray>();
+
                         if let Some(valid_array) = array {
+                            if valid_array.is_null(row) {
+                                row_values.push(Keyword::Null.into());
+                                continue;
+                            }
                             insert_timestamp_into_row_values(
                                 OffsetDateTime::from_unix_timestamp_nanos(i128::from(
                                     valid_array.value(row),
@@ -272,6 +309,10 @@ impl InsertBuilder {
                     DataType::List(list_type) => {
                         let array = column.as_any().downcast_ref::<array::ListArray>();
                         if let Some(valid_array) = array {
+                            if valid_array.is_null(row) {
+                                row_values.push(Keyword::Null.into());
+                                continue;
+                            }
                             let list_array = valid_array.value(row);
                             match list_type.data_type() {
                                 DataType::Int8 => push_list_values!(
