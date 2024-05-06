@@ -18,8 +18,7 @@ use async_trait::async_trait;
 use secrets::Secret;
 use snafu::prelude::*;
 use snowflake_api::{SnowflakeApi, SnowflakeApiError};
-
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, fs, sync::Arc};
 
 use super::{DbConnectionPool, Result};
 
@@ -45,6 +44,18 @@ pub enum Error {
 
     #[snafu(display("Snowflake authentication failed. Validate account and warehouse parameters using the SnowSQL tool."))]
     UnableToAuthenticateGeneric {},
+
+    #[snafu(display("Error reading private key file {file_path}: {source}."))]
+    ErrorReadingPrivateKeyFile {
+        source: std::io::Error,
+        file_path: String,
+    },
+
+    #[snafu(display("Parameter {param_key} has invalid value: {param_value}"))]
+    InvalidParameterValue {
+        param_key: String,
+        param_value: String,
+    },
 }
 
 pub struct SnowflakeConnectionPool {
@@ -74,30 +85,8 @@ impl SnowflakeConnectionPool {
         params: &Arc<Option<HashMap<String, String>>>,
         secret: &Option<Secret>,
     ) -> Result<Self> {
-        let username = get_param(params, secret, "username")
-            .context(MissingRequiredSecretSnafu { name: "username" })?;
-        let password = get_param(params, secret, "password")
-            .context(MissingRequiredSecretSnafu { name: "password" })?;
-        let account = get_param(params, secret, "account")
-            .context(MissingRequiredSecretSnafu { name: "account" })?;
-        let warehouse = get_param(params, secret, "snowflake_warehouse");
-        let role = get_param(params, secret, "snowflake_role");
+        let api = init_snowflake_api(params, secret)?;
 
-        // account identifier can be in <orgname.account_name> format but API requires it as <orgname-account_name>
-        let account = account.replace('.', "-");
-
-        let api = SnowflakeApi::with_password_auth(
-            &account,
-            warehouse.as_deref(),
-            None,
-            None,
-            &username,
-            role.as_deref(),
-            &password,
-        )
-        .context(UnableToConnectSnafu)?;
-
-        // auth happens on the first request; test auth and connection
         if let Err(err) = api.exec("SELECT 1").await {
             match err {
                 snowflake_api::SnowflakeApiError::AuthError(auth_err) => {
@@ -122,6 +111,74 @@ impl SnowflakeConnectionPool {
 
         Ok(Self { api: Arc::new(api) })
     }
+}
+
+fn init_snowflake_api(
+    params: &Arc<Option<HashMap<String, String>>>,
+    secret: &Option<Secret>,
+) -> Result<SnowflakeApi> {
+    let username = get_param(params, secret, "username")
+        .context(MissingRequiredSecretSnafu { name: "username" })?;
+    let account = get_param(params, secret, "account")
+        .context(MissingRequiredSecretSnafu { name: "account" })?;
+    // account identifier can be in <orgname.account_name> format but API requires it as <orgname-account_name>
+    let account = account.replace('.', "-");
+
+    let warehouse = get_param(params, secret, "snowflake_warehouse");
+    let role = get_param(params, secret, "snowflake_role");
+    let auth_type = get_param(params, secret, "snowflake_auth_type")
+        .unwrap_or_else(|| "auth_snowflake".to_string())
+        .to_lowercase();
+
+    if auth_type == "auth_snowflake" {
+        // default username/password auth
+        let password = get_param(params, secret, "password")
+            .context(MissingRequiredSecretSnafu { name: "password" })?;
+        let api = SnowflakeApi::with_password_auth(
+            &account,
+            warehouse.as_deref(),
+            None,
+            None,
+            &username,
+            role.as_deref(),
+            &password,
+        )
+        .context(UnableToConnectSnafu)?;
+
+        return Ok(api);
+    }
+
+    if auth_type == "auth_keypair" {
+        let private_key_path = get_param(params, secret, "snowflake_private_key_path").context(
+            MissingRequiredSecretSnafu {
+                name: "snowflake_private_key_path",
+            },
+        )?;
+
+        let private_key_pem: String =
+            fs::read_to_string(&private_key_path).context(ErrorReadingPrivateKeyFileSnafu {
+                file_path: private_key_path,
+            })?;
+
+        let api = SnowflakeApi::with_certificate_auth(
+            &account,
+            warehouse.as_deref(),
+            None,
+            None,
+            &username,
+            role.as_deref(),
+            &private_key_pem,
+        )
+        .context(UnableToConnectSnafu)?;
+
+        return Ok(api);
+    }
+
+    InvalidParameterValueSnafu {
+        param_key: "snowflake_auth_type",
+        param_value: auth_type,
+    }
+    .fail()?
 }
 
 #[async_trait]
