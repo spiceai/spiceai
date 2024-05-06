@@ -50,11 +50,15 @@ jobs:
 
     - name: install Spice (https://install.spiceai.org)
       if : matrix.target_os != 'windows'
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         curl https://install.spiceai.org | /bin/bash
     
     - name: install Spice (Windows)
       if : matrix.target_os == 'windows'
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         curl -L "https://install.spiceai.org/Install.ps1" -o Install.ps1 && PowerShell -ExecutionPolicy Bypass -File ./Install.ps1
 
@@ -114,12 +118,14 @@ jobs:
 
     - name: check Spice cli and runtime version
       if: matrix.target_os != 'windows'
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         version=$(spice version 2>&1)
         cli_version=$(echo "$version" | grep 'CLI version:' | cut -d':' -f2 | xargs)
         runtime_version=$(echo "$version" | grep 'Runtime version:' | cut -d':' -f2 | xargs)
 
-        release_version=$(curl -s "https://api.github.com/repos/spiceai/spiceai/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+        release_version=$(curl -s "https://api.github.com/repos/spiceai/spiceai/releases/latest" -H "Authorization: token $GITHUB_TOKEN" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
         
         echo "Release Version: $release_version"
         echo "CLI Version: $cli_version"
@@ -137,6 +143,8 @@ jobs:
       
     - name: check Spice cli and runtime version (Windows)
       if: matrix.target_os == 'windows'
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         $version = spice version 2>&1
         Write-Host "Raw version string: $version"
@@ -149,7 +157,10 @@ jobs:
         $runtimeVersion = ($runtimeVersion -split "\s+")[-1].Trim()
         Write-Host "Runtime Version: $runtimeVersion"
 
-        $response = Invoke-WebRequest -Uri "https://api.github.com/repos/spiceai/spiceai/releases/latest" -UseBasicParsing
+        $headers = @{}
+        $headers["Authorization"] = "token $env:GITHUB_TOKEN"
+
+        $response = Invoke-WebRequest -Uri "https://api.github.com/repos/spiceai/spiceai/releases/latest" -UseBasicParsing -Headers $headers
         $releaseVersion = ($response.Content | ConvertFrom-Json).tag_name
         Write-Host "Release Version: $releaseVersion"
 
