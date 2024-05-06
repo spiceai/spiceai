@@ -60,4 +60,4 @@ uuid = "1.6.1"
 pem = "3.0.4"
 odbc-api = { version = "7.0.0" }
 arrow-odbc = { version = "9.0.0" }
-snowflake-api = { git="https://github.com/sgrebnov/snowflake-rs.git", folder="snowflake-api", branch="0.8.0-async-exec" }
+snowflake-api = { git="https://github.com/spiceai/snowflake-rs.git", folder="snowflake-api", rev="6a2088c89b3e79f6885f5e12de9eea2530c44562" }
