@@ -160,7 +160,7 @@ impl PostgresConnectionPool {
 
         connection_string.push_str(format!("sslmode={mode} ").as_str());
         let config = Config::from_str(connection_string.as_str()).context(ConnectionPoolSnafu)?;
-        verify_posstgres_config(&config).await?;
+        verify_postgres_config(&config).await?;
 
         let mut certs: Option<Vec<Certificate>> = None;
 
