@@ -77,7 +77,7 @@ Currently supported data connectors for upstream datasets. More coming soon.
 | `odbc`       | ODBC                                                                                           | Alpha        |  ODBC                                                                                              | `full`           |
 | `spark`      | Spark                                                                                          | Alpha        | [Spark Connect](https://spark.apache.org/docs/latest/spark-connect-overview.html)                  | `full`           |
 | `flightsql`  | Flight SQL                                                                                     | Alpha        | Arrow Flight SQL                                                                                   | `full`           |
-| `snowflake`  | Snowflake                                                                                      | Alpha        | Arrow data via REST                                                                                | `full`           |
+| `snowflake`  | Snowflake                                                                                      | Alpha        | Arrow                                                                                | `full`           |
 | `bigquery`   | BigQuery                                                                                       | Coming soon! | Arrow Flight SQL                                                                                   | `full`           |
 
 ### Supported Data Stores/Accelerators
