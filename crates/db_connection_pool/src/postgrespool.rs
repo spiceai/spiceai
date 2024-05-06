@@ -79,6 +79,7 @@ impl PostgresConnectionPool {
     /// # Errors
     ///
     /// Returns an error if there is a problem creating the connection pool.
+    #[allow(clippy::too_many_lines)]
     pub async fn new(
         params: Arc<Option<HashMap<String, String>>>,
         secret: Option<Secret>,
@@ -101,13 +102,13 @@ impl PostgresConnectionPool {
                 let str_params: Vec<&str> = str.split_whitespace().collect();
                 for param in str_params {
                     let param = param.split('=').collect::<Vec<&str>>();
-                    if param.len() == 2 {
-                        match param[0] {
+                    if let (Some(&name), Some(&value)) = (param.first(), param.get(1)) {
+                        match name {
                             "sslmode" => {
-                                ssl_mode = param[1].to_string();
+                                ssl_mode = value.to_string();
                             }
                             "sslrootcert" => {
-                                let sslrootcert = param[1];
+                                let sslrootcert = value;
                                 ensure!(
                                     std::path::Path::new(sslrootcert).exists(),
                                     InvalidRootCertPathSnafu { path: sslrootcert }
@@ -116,8 +117,7 @@ impl PostgresConnectionPool {
                                 ssl_rootcert_path = Some(PathBuf::from(sslrootcert));
                             }
                             _ => {
-                                connection_string
-                                    .push_str(format!("{} ", param.join("=")).as_str());
+                                connection_string.push_str(format!("{name}={value} ").as_str());
                             }
                         }
                     }
