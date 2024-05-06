@@ -104,12 +104,12 @@ function gh_curl() {
 }
 
 function gh_wget() {
-    if [ -n "$GITHUB_TOKEN" ]
+    if [ -z "$GITHUB_TOKEN" ]
     then
-        wget --header="Authorization: token $GITHUB_TOKEN" \
+        wget \
             $@
     else
-        wget \
+        wget --header="Authorization: token $GITHUB_TOKEN" \
             $@
     fi
 }
