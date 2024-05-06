@@ -35,7 +35,14 @@
       "request": "attach",
       "name": "[Rust] Attack to spiced",
       "program": "~/.spice/bin/spiced",
-      "pid": "" // pid of the process use `pgrep spiced`
+      "pid": "${input:pid}"
+    }
+  ],
+  "inputs": [
+    {
+      "id": "pid",
+      "type": "promptString",
+      "description": "pid of the process (Get this `pgrep spiced`)"
     }
   ]
 }
