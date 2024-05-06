@@ -34,6 +34,7 @@ import (
 
 const (
 	apiKeyFlag       = "key"
+	accountFlag      = "account"
 	usernameFlag     = "username"
 	passwordFlag     = "password"
 	token            = "token"
@@ -198,14 +199,16 @@ var snowflakeCmd = &cobra.Command{
 	Use:   "snowflake",
 	Short: "Login to a Snowflake warehouse",
 	Example: `
-spice login snowflake --username <username> --password <password>
+spice login snowflake --account <account-identifier> --username <username> --password <password>
 
 # See more at: https://docs.spiceai.org/
 `,
 	Run: CreateLoginRunFunc(api.AUTH_TYPE_SNOWFLAKE, map[string]string{
+		accountFlag:  fmt.Sprintf("No account identifier provided, use --%s or -a to provide an account identifier", accountFlag),
 		usernameFlag: fmt.Sprintf("No username provided, use --%s or -u to provide a username", usernameFlag),
 		passwordFlag: fmt.Sprintf("No password provided, use --%s or -p to provide a password", passwordFlag),
 	}, map[string]string{
+		accountFlag:  api.AUTH_PARAM_ACCOUNT,
 		usernameFlag: api.AUTH_PARAM_USERNAME,
 		passwordFlag: api.AUTH_PARAM_PASSWORD,
 	}),
@@ -386,6 +389,7 @@ func init() {
 	postgresCmd.AddCommand(postgresEngineCmd)
 
 	snowflakeCmd.Flags().BoolP("help", "h", false, "Print this help message")
+	snowflakeCmd.Flags().StringP(accountFlag, "a", "", "Account identifier")
 	snowflakeCmd.Flags().StringP(usernameFlag, "u", "", "Username")
 	snowflakeCmd.Flags().StringP(passwordFlag, "p", "", "Password")
 	loginCmd.AddCommand(snowflakeCmd)

@@ -30,9 +30,6 @@ use crate::{
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Missing required parameter: {name}"))]
-    MissingRequiredParameter { name: String },
-
     #[snafu(display("Missing required secret: {name}"))]
     MissingRequiredSecret { name: String },
 
@@ -81,19 +78,21 @@ impl SnowflakeConnectionPool {
             .context(MissingRequiredSecretSnafu { name: "username" })?;
         let password = get_param(params, secret, "password")
             .context(MissingRequiredSecretSnafu { name: "password" })?;
-
         let account = get_param(params, secret, "account")
-            .context(MissingRequiredParameterSnafu { name: "account" })?;
-        let warehouse = get_param(params, secret, "warehouse")
-            .context(MissingRequiredParameterSnafu { name: "warehouse" })?;
+            .context(MissingRequiredSecretSnafu { name: "account" })?;
+        let warehouse = get_param(params, secret, "snowflake_warehouse");
+        let role = get_param(params, secret, "snowflake_role");
+
+        // account identifier can be in <orgname.account_name> format but API requires it as <orgname-account_name>
+        let account = account.replace('.', "-");
 
         let api = SnowflakeApi::with_password_auth(
             &account,
-            Some(&warehouse),
+            warehouse.as_deref(),
             None,
             None,
             &username,
-            None,
+            role.as_deref(),
             &password,
         )
         .context(UnableToConnectSnafu)?;
