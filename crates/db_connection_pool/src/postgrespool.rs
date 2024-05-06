@@ -50,11 +50,12 @@ pub enum Error {
     #[snafu(display("Invalid parameter: {parameter_name}"))]
     InvalidParameterError { parameter_name: String },
 
-    #[snafu(display("Invalid port: {port}"))]
-    InvalidPortError { port: String },
-
-    #[snafu(display("Invalid host and port combination: {source}"))]
-    InvalidHostOrPortError { source: ns_lookup::Error },
+    #[snafu(display("Cannot connect to PostgreSQL on {host}:{port}. Ensure that the host and port are correctly configured, and that the host is reachable."))]
+    InvalidHostOrPortError {
+        source: ns_lookup::Error,
+        host: String,
+        port: u16,
+    },
 
     #[snafu(display("Invalid root cert path: {path}"))]
     InvalidRootCertPathError { path: String },
@@ -67,6 +68,11 @@ pub enum Error {
 
     #[snafu(display("Postgres connection error: {source}"))]
     PostgresConnectionError { source: tokio_postgres::Error },
+
+    #[snafu(display(
+        "Authentication failed. Ensure that the username and password are correctly configured."
+    ))]
+    InvalidUsernameOrPassword { source: tokio_postgres::Error },
 }
 
 pub struct PostgresConnectionPool {
@@ -195,7 +201,7 @@ impl PostgresConnectionPool {
 }
 
 fn parse_connection_string(pg_connection_string: &str) -> (String, String, Option<String>) {
-    let mut connection_string = "host=localhost user=postgres dbname=postgres".to_string();
+    let mut connection_string = String::new();
     let mut ssl_mode = "verify-full".to_string();
     let mut ssl_rootcert_path: Option<String> = None;
 
@@ -225,11 +231,18 @@ async fn test_postgres_connection(
     connection_string: &str,
     connector: MakeTlsConnector,
 ) -> Result<()> {
-    let (_, _) = tokio_postgres::connect(connection_string, connector)
-        .await
-        .context(PostgresConnectionSnafu)?;
+    match tokio_postgres::connect(connection_string, connector).await {
+        Ok(_) => Ok(()),
+        Err(err) => {
+            if let Some(code) = err.code() {
+                if *code == tokio_postgres::error::SqlState::INVALID_PASSWORD {
+                    return Err(Box::new(Error::InvalidUsernameOrPassword { source: err }));
+                }
+            }
 
-    Ok(())
+            Err(Box::new(Error::PostgresConnectionError { source: err }))
+        }
+    }
 }
 
 async fn verify_postgres_config(config: &Config) -> Result<()> {
@@ -238,7 +251,7 @@ async fn verify_postgres_config(config: &Config) -> Result<()> {
             if let Host::Tcp(host) = host {
                 verify_ns_lookup_and_tcp_connect(host, *port)
                     .await
-                    .context(InvalidHostOrPortSnafu)?;
+                    .context(InvalidHostOrPortSnafu { host, port: *port })?;
             }
         }
     }
