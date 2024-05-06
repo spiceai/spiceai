@@ -323,7 +323,7 @@ impl Runtime {
         .await
         {
             Ok(()) => {
-                tracing::info!("Loaded dataset {}", &ds.name);
+                tracing::info!("Registered dataset {}", &ds.name);
                 let engine = ds.acceleration.map_or_else(
                     || "None".to_string(),
                     |acc| {
