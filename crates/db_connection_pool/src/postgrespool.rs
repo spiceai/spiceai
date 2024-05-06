@@ -85,7 +85,6 @@ impl PostgresConnectionPool {
     /// # Errors
     ///
     /// Returns an error if there is a problem creating the connection pool.
-    #[allow(clippy::too_many_lines)]
     pub async fn new(
         params: Arc<Option<HashMap<String, String>>>,
         secret: Option<Secret>,
@@ -241,7 +240,7 @@ async fn test_postgres_connection(
                 }
             }
 
-            return Err(Box::new(Error::PostgresConnectionError { source: err }));
+            Err(Box::new(Error::PostgresConnectionError { source: err }))
         }
     }
 }
