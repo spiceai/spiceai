@@ -144,7 +144,9 @@ impl DataSink for SqliteDataSink {
                 }
 
                 for batch in data_batches {
-                    sqlite.insert_batch(&transaction, batch)?;
+                    if batch.num_rows() > 0 {
+                        sqlite.insert_batch(&transaction, batch)?;
+                    }
                 }
 
                 transaction.commit()?;
