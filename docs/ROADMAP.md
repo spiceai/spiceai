@@ -11,18 +11,20 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 ## [v0.13-alpha (May 2024)](https://github.com/spiceai/spiceai/milestone/21)
 
 - Snowflake data connector (alpha)
-- Improved query push-down
+- Query push-down improvements
 
 ## [v0.14-alpha (May 2024)](https://github.com/spiceai/spiceai/milestone/22)
 
 - MotherDuck data connector (alpha)
 - SFTP/FTP data connector (alpha)
+- Generic Object-Store connector (alpha)
 - S3 data connector Iceberg support
 
 ## v0.15-alpha (June 2024)
 
 - Catalog Providers
 - AWS Glue catalog provider (alpha)
+- Dataset management improvements
 
 ## Features being considered for beta (Jun 2024)
 
