@@ -129,7 +129,9 @@ impl TableProviderFactory for SqliteTableFactory {
 
         let table_exists = sqlite.table_exists(sqlite_conn).await;
         let sqlite_in_conn = Arc::clone(&sqlite);
-        if !table_exists {
+        if table_exists {
+            std::mem::drop(sqlite_in_conn);
+        } else {
             sqlite_conn
                 .conn
                 .call(move |conn| {
