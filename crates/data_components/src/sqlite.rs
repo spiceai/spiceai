@@ -78,12 +78,16 @@ pub enum Error {
 type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[allow(clippy::module_name_repetitions)]
-pub struct SqliteTableFactory {}
+pub struct SqliteTableFactory {
+    db_path_param: String,
+}
 
 impl SqliteTableFactory {
     #[must_use]
     pub fn new() -> Self {
-        Self {}
+        Self {
+            db_path_param: "sqlite_file".to_string(),
+        }
     }
 }
 
@@ -110,8 +114,14 @@ impl TableProviderFactory for SqliteTableFactory {
 
         let params = Arc::new(Some(options));
 
+        let db_path = cmd
+            .options
+            .get(self.db_path_param.as_str())
+            .cloned()
+            .unwrap_or(format!("{name}.db"));
+
         let pool: Arc<SqliteConnectionPool> = Arc::new(
-            SqliteConnectionPool::new(&name, mode, params)
+            SqliteConnectionPool::new(&db_path, mode, params)
                 .await
                 .context(DbConnectionPoolSnafu)
                 .map_err(to_datafusion_error)?,
