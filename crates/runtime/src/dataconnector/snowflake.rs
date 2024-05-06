@@ -14,78 +14,64 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use super::DataConnector;
+use super::DataConnectorFactory;
 use async_trait::async_trait;
-use data_components::duckdb::DuckDBTableFactory;
+use data_components::snowflake::SnowflakeTableFactory;
 use data_components::Read;
+
 use datafusion::datasource::TableProvider;
-use db_connection_pool::duckdbpool::DuckDbConnectionPool;
-use duckdb::AccessMode;
+use db_connection_pool::snowflakepool::SnowflakeConnectionPool;
+use db_connection_pool::DbConnectionPool;
 use secrets::Secret;
 use snafu::prelude::*;
+use snowflake_api::SnowflakeApi;
 use spicepod::component::dataset::Dataset;
 use std::any::Any;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::{collections::HashMap, future::Future};
 
-use super::{DataConnector, DataConnectorFactory};
-
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to create DuckDB connection pool: {source}"))]
-    UnableToCreateDuckDBConnectionPool { source: db_connection_pool::Error },
-
     #[snafu(display("{source}"))]
     UnableToGetReadProvider {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     #[snafu(display("{source}"))]
-    UnableToGetReadWriteProvider {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    #[snafu(display("Missing required parameter: open"))]
-    MissingDuckDBFile {},
-
-    #[snafu(display("Invalid access mode param value \"{access_mode}\". Valid values are: read_only, read_write, automatic"))]
-    InvalidAccessMode { access_mode: String },
+    UnableToCreateSnowflakeConnectionPool { source: db_connection_pool::Error },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-pub struct DuckDB {
-    duckdb_factory: DuckDBTableFactory,
+pub struct Snowflake {
+    table_factory: SnowflakeTableFactory,
 }
 
-impl DataConnectorFactory for DuckDB {
+impl DataConnectorFactory for Snowflake {
     fn create(
-        _secret: Option<Secret>,
+        secret: Option<Secret>,
         params: Arc<Option<HashMap<String, String>>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let params = params.as_ref().as_ref();
-
-            // data connector requires valid "open" parameter
-            let db_path = params
-                .and_then(|p| p.get("open").cloned())
-                .ok_or(Error::MissingDuckDBFile {})?;
-
-            // TODO: wire to dataset.mode once readwrite implemented for duckdb
-            let pool = Arc::new(
-                DuckDbConnectionPool::new_file(&db_path, &AccessMode::ReadOnly)
-                    .context(UnableToCreateDuckDBConnectionPoolSnafu)?,
+            let pool: Arc<
+                dyn DbConnectionPool<Arc<SnowflakeApi>, &'static (dyn Sync)> + Send + Sync,
+            > = Arc::new(
+                SnowflakeConnectionPool::new(&params, &secret)
+                    .await
+                    .context(UnableToCreateSnowflakeConnectionPoolSnafu)?,
             );
 
-            let duckdb_factory = DuckDBTableFactory::new(pool);
+            let table_factory = SnowflakeTableFactory::new(pool);
 
-            Ok(Arc::new(Self { duckdb_factory }) as Arc<dyn DataConnector>)
+            Ok(Arc::new(Self { table_factory }) as Arc<dyn DataConnector>)
         })
     }
 }
 
 #[async_trait]
-impl DataConnector for DuckDB {
+impl DataConnector for Snowflake {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -95,7 +81,7 @@ impl DataConnector for DuckDB {
         dataset: &Dataset,
     ) -> super::AnyErrorResult<Arc<dyn TableProvider>> {
         Ok(
-            Read::table_provider(&self.duckdb_factory, dataset.path().into())
+            Read::table_provider(&self.table_factory, dataset.path().into())
                 .await
                 .context(UnableToGetReadProviderSnafu)?,
         )

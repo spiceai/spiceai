@@ -89,16 +89,21 @@ pub async fn verify_ns_lookup_and_tcp_connect(host: &str, port: u16) -> Result<(
                 }
             }
 
+            tracing::debug!("Failed to connect to {host}:{port}, connection timed out");
+
             UnableToConnectSnafu {
                 host: host.to_string(),
                 port,
             }
             .fail()
         }
-        Err(_) => UnableToConnectSnafu {
-            host: host.to_string(),
-            port,
+        Err(err) => {
+            tracing::debug!("Failed to resolve host: {err}");
+            UnableToConnectSnafu {
+                host: host.to_string(),
+                port,
+            }
+            .fail()
         }
-        .fail(),
     }
 }

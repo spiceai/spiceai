@@ -68,6 +68,7 @@ pub fn map_data_type_to_array_builder(data_type: &DataType) -> Box<dyn ArrayBuil
             }
         },
         DataType::Date32 => Box::new(Date32Builder::new()),
+        DataType::FixedSizeBinary(s) => Box::new(FixedSizeBinaryBuilder::new(*s)),
         // We can't recursively call map_data_type_to_array_builder here because downcasting will not work if the
         // values_builder is boxed.
         DataType::List(values_field) => match values_field.data_type() {
@@ -81,7 +82,6 @@ pub fn map_data_type_to_array_builder(data_type: &DataType) -> Box<dyn ArrayBuil
             DataType::Boolean => Box::new(ListBuilder::new(BooleanBuilder::new())),
             _ => unimplemented!("Unsupported list value data type {:?}", data_type),
         },
-        DataType::FixedSizeBinary(size) => Box::new(FixedSizeBinaryBuilder::new(*size)),
         _ => unimplemented!("Unsupported data type {:?}", data_type),
     }
 }

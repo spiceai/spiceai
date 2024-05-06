@@ -15,3 +15,4 @@ limitations under the License.
 */
 
 pub mod record_batch;
+pub mod schema;

@@ -30,7 +30,8 @@ use db_connection_pool::{
     DbConnectionPool, Mode,
 };
 use duckdb::{
-    vtab::arrow::arrow_recordbatch_to_query_params, DuckdbConnectionManager, ToSql, Transaction,
+    vtab::arrow::arrow_recordbatch_to_query_params, AccessMode, DuckdbConnectionManager, ToSql,
+    Transaction,
 };
 use snafu::prelude::*;
 use sql_provider_datafusion::SqlTable;
@@ -94,12 +95,30 @@ pub enum Error {
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
-pub struct DuckDBTableProviderFactory {}
+pub struct DuckDBTableProviderFactory {
+    access_mode: AccessMode,
+    db_path_param: String,
+}
 
 impl DuckDBTableProviderFactory {
     #[must_use]
     pub fn new() -> Self {
-        Self {}
+        Self {
+            access_mode: AccessMode::ReadOnly,
+            db_path_param: "open".to_string(),
+        }
+    }
+
+    #[must_use]
+    pub fn access_mode(mut self, access_mode: AccessMode) -> Self {
+        self.access_mode = access_mode;
+        self
+    }
+
+    #[must_use]
+    pub fn db_path_param(mut self, db_path_param: &str) -> Self {
+        self.db_path_param = db_path_param.to_string();
+        self
     }
 }
 
@@ -125,13 +144,23 @@ impl TableProviderFactory for DuckDBTableProviderFactory {
         let mode = options.remove("mode").unwrap_or_default();
         let mode: Mode = mode.as_str().into();
 
-        let params = Arc::new(Some(options));
+        let pool: Arc<DuckDbConnectionPool> = Arc::new(match &mode {
+            Mode::File => {
+                // open duckdb at given path or create a new one
+                let db_path = cmd
+                    .options
+                    .get(self.db_path_param.as_str())
+                    .cloned()
+                    .unwrap_or(format!("{name}.db"));
 
-        let pool: Arc<DuckDbConnectionPool> = Arc::new(
-            DuckDbConnectionPool::new(&name, &mode, &params)
+                DuckDbConnectionPool::new_file(&db_path, &self.access_mode)
+                    .context(DbConnectionPoolSnafu)
+                    .map_err(to_datafusion_error)?
+            }
+            Mode::Memory => DuckDbConnectionPool::new_memory(&self.access_mode)
                 .context(DbConnectionPoolSnafu)
                 .map_err(to_datafusion_error)?,
-        );
+        });
 
         let schema: SchemaRef = Arc::new(cmd.schema.as_ref().into());
         let duckdb = DuckDB::new(name.clone(), Arc::clone(&schema), Arc::clone(&pool));
@@ -290,7 +319,7 @@ impl DuckDB {
             .collect::<Vec<_>>();
         let arrow_params_ref: &[&dyn ToSql] = &arrow_params_vec;
         let sql = format!(
-            r#"CREATE TABLE "{name}" AS SELECT * FROM arrow(?, ?)"#,
+            r#"CREATE TABLE IF NOT EXISTS "{name}" AS SELECT * FROM arrow(?, ?)"#,
             name = self.table_name
         );
         tracing::trace!("{sql}");
