@@ -50,11 +50,12 @@ pub enum Error {
     #[snafu(display("Invalid parameter: {parameter_name}"))]
     InvalidParameterError { parameter_name: String },
 
-    #[snafu(display("Invalid port: {port}"))]
-    InvalidPortError { port: String },
-
-    #[snafu(display("Invalid host and port combination: {source}"))]
-    InvalidHostOrPortError { source: ns_lookup::Error },
+    #[snafu(display("Cannot connect to PostgreSQL on {host}:{port}. Ensure that the host and port are correctly configured, and that the host is reachable."))]
+    InvalidHostOrPortError {
+        source: ns_lookup::Error,
+        host: String,
+        port: u16,
+    },
 
     #[snafu(display("Invalid root cert path: {path}"))]
     InvalidRootCertPathError { path: String },
@@ -67,6 +68,11 @@ pub enum Error {
 
     #[snafu(display("Postgres connection error: {source}"))]
     PostgresConnectionError { source: tokio_postgres::Error },
+
+    #[snafu(display(
+        "Authentication failed. Ensure that the username and password are correctly configured."
+    ))]
+    InvalidUsernameOrPassword { source: tokio_postgres::Error },
 }
 
 pub struct PostgresConnectionPool {
@@ -84,7 +90,7 @@ impl PostgresConnectionPool {
         secret: Option<Secret>,
     ) -> Result<Self> {
         let mut connection_string = "host=localhost user=postgres dbname=postgres".to_string();
-        let mut ssl_mode = "verify-full";
+        let mut ssl_mode = "verify-full".to_string();
         let mut ssl_rootcert_path: Option<PathBuf> = None;
 
         if let Some(params) = params.as_ref() {
@@ -96,7 +102,17 @@ impl PostgresConnectionPool {
                 "pg_connection_string_key",
                 "pg_connection_string",
             ) {
-                connection_string.push_str(pg_connection_string.as_str());
+                let (str, mode, cert_path) = parse_connection_string(pg_connection_string.as_str());
+                connection_string = str;
+                ssl_mode = mode;
+                if let Some(cert_path) = cert_path {
+                    let sslrootcert = cert_path.as_str();
+                    ensure!(
+                        std::path::Path::new(sslrootcert).exists(),
+                        InvalidRootCertPathSnafu { path: cert_path }
+                    );
+                    ssl_rootcert_path = Some(PathBuf::from(sslrootcert));
+                }
             } else {
                 if let Some(pg_host) = params.get("pg_host") {
                     connection_string.push_str(format!("host={pg_host} ").as_str());
@@ -118,8 +134,7 @@ impl PostgresConnectionPool {
                 if let Some(pg_sslmode) = params.get("pg_sslmode") {
                     match pg_sslmode.to_lowercase().as_str() {
                         "disable" | "require" | "prefer" | "verify-ca" | "verify-full" => {
-                            ssl_mode = pg_sslmode.as_str();
-                            connection_string.push_str(format!("sslmode={ssl_mode} ").as_str());
+                            ssl_mode = pg_sslmode.to_string();
                         }
                         _ => {
                             InvalidParameterSnafu {
@@ -142,7 +157,7 @@ impl PostgresConnectionPool {
             }
         }
 
-        let mode = match ssl_mode {
+        let mode = match ssl_mode.as_str() {
             "disable" => "disable",
             "prefer" => "prefer",
             // tokio_postgres supports only disable, require and prefer
@@ -151,16 +166,7 @@ impl PostgresConnectionPool {
 
         connection_string.push_str(format!("sslmode={mode} ").as_str());
         let config = Config::from_str(connection_string.as_str()).context(ConnectionPoolSnafu)?;
-
-        for host in config.get_hosts() {
-            for port in config.get_ports() {
-                if let Host::Tcp(host) = host {
-                    verify_ns_lookup_and_tcp_connect(host, *port)
-                        .await
-                        .context(InvalidHostOrPortSnafu)?;
-                }
-            }
-        }
+        verify_postgres_config(&config).await?;
 
         let mut certs: Option<Vec<Certificate>> = None;
 
@@ -169,13 +175,9 @@ impl PostgresConnectionPool {
             certs = Some(parse_certs(&buf)?);
         }
 
-        let tls_connector = get_tls_connector(ssl_mode, certs)?;
+        let tls_connector = get_tls_connector(ssl_mode.as_str(), certs)?;
         let connector = MakeTlsConnector::new(tls_connector);
-
-        // Test the connection using tokio-postgres before initialize bb8 connection pool
-        let (_, _) = tokio_postgres::connect(connection_string.as_str(), connector.clone())
-            .await
-            .context(PostgresConnectionSnafu)?;
+        test_postgres_connection(connection_string.as_str(), connector.clone()).await?;
 
         let manager = PostgresConnectionManager::new(config, connector);
         let error_sink = PostgresErrorSink::new();
@@ -196,6 +198,65 @@ impl PostgresConnectionPool {
             pool: Arc::new(pool.clone()),
         })
     }
+}
+
+fn parse_connection_string(pg_connection_string: &str) -> (String, String, Option<String>) {
+    let mut connection_string = String::new();
+    let mut ssl_mode = "verify-full".to_string();
+    let mut ssl_rootcert_path: Option<String> = None;
+
+    let str = pg_connection_string;
+    let str_params: Vec<&str> = str.split_whitespace().collect();
+    for param in str_params {
+        let param = param.split('=').collect::<Vec<&str>>();
+        if let (Some(&name), Some(&value)) = (param.first(), param.get(1)) {
+            match name {
+                "sslmode" => {
+                    ssl_mode = value.to_string();
+                }
+                "sslrootcert" => {
+                    ssl_rootcert_path = Some(value.to_string());
+                }
+                _ => {
+                    connection_string.push_str(format!("{name}={value} ").as_str());
+                }
+            }
+        }
+    }
+
+    (connection_string, ssl_mode, ssl_rootcert_path)
+}
+
+async fn test_postgres_connection(
+    connection_string: &str,
+    connector: MakeTlsConnector,
+) -> Result<()> {
+    match tokio_postgres::connect(connection_string, connector).await {
+        Ok(_) => Ok(()),
+        Err(err) => {
+            if let Some(code) = err.code() {
+                if *code == tokio_postgres::error::SqlState::INVALID_PASSWORD {
+                    return Err(Box::new(Error::InvalidUsernameOrPassword { source: err }));
+                }
+            }
+
+            Err(Box::new(Error::PostgresConnectionError { source: err }))
+        }
+    }
+}
+
+async fn verify_postgres_config(config: &Config) -> Result<()> {
+    for host in config.get_hosts() {
+        for port in config.get_ports() {
+            if let Host::Tcp(host) = host {
+                verify_ns_lookup_and_tcp_connect(host, *port)
+                    .await
+                    .context(InvalidHostOrPortSnafu { host, port: *port })?;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn get_tls_connector(
