@@ -39,6 +39,7 @@ const (
 	token            = "token"
 	accessKeyFlag    = "access-key"
 	accessSecretFlag = "access-secret"
+	sparkRemoteFlag  = "spark_remote"
 	awsRegion        = "aws-region"
 	awsAccessKeyId   = "aws-access-key-id"
 	awsSecret        = "aws-secret-access-key"
@@ -210,6 +211,21 @@ spice login snowflake --username <username> --password <password>
 	}),
 }
 
+var sparkCmd = &cobra.Command{
+	Use:   "spark",
+	Short: "Login to a Spark Connect remote",
+	Example: `
+spice login spark --spark_remote <remote>
+
+# See more at: https://docs.spiceai.org/
+`,
+	Run: CreateLoginRunFunc(api.AUTH_TYPE_SPARK, map[string]string{
+		sparkRemoteFlag: "No spark_remote provided, use --spark_remote to provide",
+	}, map[string]string{
+		sparkRemoteFlag: api.AUTH_PARAM_SPARK_REMOTE,
+	}),
+}
+
 func CreateLoginRunFunc(authName string, requiredFlags map[string]string, flagToTomlKeys map[string]string) func(cmd *cobra.Command, args []string) {
 	return func(cmd *cobra.Command, args []string) {
 
@@ -373,6 +389,10 @@ func init() {
 	snowflakeCmd.Flags().StringP(usernameFlag, "u", "", "Username")
 	snowflakeCmd.Flags().StringP(passwordFlag, "p", "", "Password")
 	loginCmd.AddCommand(snowflakeCmd)
+
+	sparkCmd.Flags().BoolP("help", "h", false, "Print this help message")
+	sparkCmd.Flags().String(sparkRemoteFlag, "", "Spark Remote")
+	loginCmd.AddCommand(sparkCmd)
 
 	loginCmd.Flags().BoolP("help", "h", false, "Print this help message")
 	loginCmd.Flags().StringP(apiKeyFlag, "k", "", "API key")
