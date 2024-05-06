@@ -84,7 +84,7 @@ impl PostgresConnectionPool {
         secret: Option<Secret>,
     ) -> Result<Self> {
         let mut connection_string = "host=localhost user=postgres dbname=postgres".to_string();
-        let mut ssl_mode = "verify-full";
+        let mut ssl_mode = "verify-full".to_string();
         let mut ssl_rootcert_path: Option<PathBuf> = None;
 
         if let Some(params) = params.as_ref() {
@@ -96,7 +96,32 @@ impl PostgresConnectionPool {
                 "pg_connection_string_key",
                 "pg_connection_string",
             ) {
-                connection_string.push_str(pg_connection_string.as_str());
+                // parse and extract ssl_mode and ssl_rootcert_path from connection string
+                let str = pg_connection_string.clone();
+                let str_params: Vec<&str> = str.split_whitespace().collect();
+                for param in str_params {
+                    let param = param.split('=').collect::<Vec<&str>>();
+                    if param.len() == 2 {
+                        match param[0] {
+                            "sslmode" => {
+                                ssl_mode = param[1].to_string();
+                            }
+                            "sslrootcert" => {
+                                let sslrootcert = param[1];
+                                ensure!(
+                                    std::path::Path::new(sslrootcert).exists(),
+                                    InvalidRootCertPathSnafu { path: sslrootcert }
+                                );
+
+                                ssl_rootcert_path = Some(PathBuf::from(sslrootcert));
+                            }
+                            _ => {
+                                connection_string
+                                    .push_str(format!("{} ", param.join("=")).as_str());
+                            }
+                        }
+                    }
+                }
             } else {
                 if let Some(pg_host) = params.get("pg_host") {
                     connection_string.push_str(format!("host={pg_host} ").as_str());
@@ -118,7 +143,7 @@ impl PostgresConnectionPool {
                 if let Some(pg_sslmode) = params.get("pg_sslmode") {
                     match pg_sslmode.to_lowercase().as_str() {
                         "disable" | "require" | "prefer" | "verify-ca" | "verify-full" => {
-                            ssl_mode = pg_sslmode.as_str();
+                            ssl_mode = pg_sslmode.to_string();
                         }
                         _ => {
                             InvalidParameterSnafu {
@@ -141,7 +166,7 @@ impl PostgresConnectionPool {
             }
         }
 
-        let mode = match ssl_mode {
+        let mode = match ssl_mode.as_str() {
             "disable" => "disable",
             "prefer" => "prefer",
             // tokio_postgres supports only disable, require and prefer
@@ -168,7 +193,7 @@ impl PostgresConnectionPool {
             certs = Some(parse_certs(&buf)?);
         }
 
-        let tls_connector = get_tls_connector(ssl_mode, certs)?;
+        let tls_connector = get_tls_connector(ssl_mode.as_str(), certs)?;
         let connector = MakeTlsConnector::new(tls_connector);
 
         // Test the connection using tokio-postgres before initialize bb8 connection pool
