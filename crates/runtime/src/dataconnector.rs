@@ -95,7 +95,7 @@ pub enum Error {
 
 #[derive(Debug, Snafu)]
 pub enum DataConnectorError {
-    #[snafu(display("Cannot connect to {dataconnector} data connector. {source}"))]
+    #[snafu(display("Cannot connect to {dataconnector}. {source}"))]
     UnableToConnectInternal {
         dataconnector: String,
         source: Box<dyn std::error::Error + Send + Sync>,
