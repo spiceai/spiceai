@@ -274,7 +274,7 @@ jobs:
           python ./.github/scripts/github_release.py upload \
             --owner $OWNER_NAME --repo $REPO_NAME \
             --tag "v${{ env.REL_VERSION }}" \
-            --release-name "Spice.ai v${{ env.REL_VERSION }}" \
+            --release-name "v${{ env.REL_VERSION }}" \
             --body "${RELEASE_BODY}" \
             --prerelease "$PRE_RELEASE" \
             ${RELEASE_ARTIFACT[*]}
