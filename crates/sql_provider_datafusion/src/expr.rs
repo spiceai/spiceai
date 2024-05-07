@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use arrow::temporal_conversions::SECONDS_IN_DAY;
 use datafusion::{logical_expr::Expr, scalar::ScalarValue};
 
 #[derive(Debug, snafu::Snafu)]
@@ -91,6 +92,19 @@ pub fn to_sql_with_engine(expr: &Expr, engine: Option<Engine>) -> Result<String>
             }
         }
         Expr::Literal(value) => match value {
+            ScalarValue::Date32(Some(value)) => match engine {
+                Some(Engine::SQLite) => Ok(format!(
+                    "datetime({}, 'unixepoch')",
+                    value * SECONDS_IN_DAY as i32
+                )),
+                _ => Ok(format!("TO_TIMESTAMP({})", value * SECONDS_IN_DAY as i32)),
+            },
+            ScalarValue::Date64(Some(value)) => match engine {
+                Some(Engine::SQLite) => {
+                    Ok(format!("datetime({}, 'unixepoch')", value * SECONDS_IN_DAY))
+                }
+                _ => Ok(format!("TO_TIMESTAMP({})", value * SECONDS_IN_DAY)),
+            },
             ScalarValue::Null => Ok(value.to_string()),
             ScalarValue::Int16(Some(value)) => Ok(value.to_string()),
             ScalarValue::Int32(Some(value)) => Ok(value.to_string()),
@@ -113,6 +127,7 @@ pub fn to_sql_with_engine(expr: &Expr, engine: Option<Engine>) -> Result<String>
                 _ => Ok(format!("TO_TIMESTAMP({})", value / 1_000_000_000)),
             },
             ScalarValue::TimestampMicrosecond(Some(value), None | Some(_)) => match engine {
+                Some(Engine::SQLite) => Ok(format!("datetime({}, 'unixepoch')", value / 1_000_000)),
                 _ => Ok(format!("TO_TIMESTAMP({})", value / 1_000_000)),
             },
             ScalarValue::TimestampMillisecond(Some(value), None | Some(_)) => match engine {
