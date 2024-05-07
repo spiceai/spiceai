@@ -283,11 +283,7 @@ impl Runtime {
             Err(err) => {
                 status::update_dataset(&ds.name, status::ComponentStatus::Error);
                 metrics::counter!("datasets_load_error").increment(1);
-                warn_spaced!(
-                    spaced_tracer,
-                    "Failed to get data connector from source for dataset {}: {err}",
-                    &ds.name
-                );
+                warn_spaced!(spaced_tracer, "{}{err}", "");
                 return UnableToLoadDatasetConnectorSnafu {
                     dataset: ds.name.clone(),
                 }

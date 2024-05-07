@@ -93,8 +93,33 @@ pub enum Error {
     },
 }
 
+#[derive(Debug, Snafu)]
+pub enum DataConnectorError {
+    #[snafu(display("{source}"))]
+    UnableToConnectInvalidConfiguration {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("{source}"))]
+    UnableToConnectSourceNotFound {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("{source}"))]
+    UnableToConnectInvalidAuth {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("Cannot connect to {dataconnector} data connector. {source}"))]
+    UnableToConnectInternal {
+        dataconnector: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+}
+
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub type AnyErrorResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+pub type DataConnectorResult<T> = std::result::Result<T, DataConnectorError>;
 
 type NewDataConnectorResult = AnyErrorResult<Arc<dyn DataConnector>>;
 

@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use data_components::postgres::PostgresTableFactory;
 use data_components::Read;
 use datafusion::datasource::TableProvider;
-use db_connection_pool::postgrespool::PostgresConnectionPool;
+use db_connection_pool::postgrespool::{self, PostgresConnectionPool};
 use secrets::Secret;
 use snafu::prelude::*;
 use spicepod::component::dataset::Dataset;
@@ -27,7 +27,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::{collections::HashMap, future::Future};
 
-use super::{DataConnector, DataConnectorFactory};
+use super::{DataConnector, DataConnectorError, DataConnectorFactory};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -43,9 +43,13 @@ pub enum Error {
     UnableToGetReadWriteProvider {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
-}
 
-pub type Result<T, E = Error> = std::result::Result<T, E>;
+    #[snafu(display("Cannot connect to PostgreSQL data connector. Authentication failed. Ensure that the username and password are correctly configured in the spicepod."))]
+    UnableToConnectInvalidAuth {},
+
+    #[snafu(display("Cannot connect to PostgreSQL data connector on {host}:{port}. Ensure that the host and port are correclty configured in the spicepod, and that the host is reachable."))]
+    UnableToConnectInvalidHostOrPort { host: String, port: u16 },
+}
 
 pub struct Postgres {
     postgres_factory: PostgresTableFactory,
@@ -57,15 +61,35 @@ impl DataConnectorFactory for Postgres {
         params: Arc<Option<HashMap<String, String>>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let pool = Arc::new(
-                PostgresConnectionPool::new(params, secret)
-                    .await
-                    .context(UnableToCreatePostgresConnectionPoolSnafu)?,
-            );
+            match PostgresConnectionPool::new(params, secret).await {
+                Ok(pool) => {
+                    let postgres_factory = PostgresTableFactory::new(Arc::new(pool));
+                    Ok(Arc::new(Self { postgres_factory }) as Arc<dyn DataConnector>)
+                }
+                Err(e) => match e {
+                    postgrespool::Error::InvalidUsernameOrPassword { .. } => {
+                        Err(DataConnectorError::UnableToConnectInvalidAuth {
+                            source: Box::new(Error::UnableToConnectInvalidAuth {}),
+                        }
+                        .into())
+                    }
 
-            let postgres_factory = PostgresTableFactory::new(pool);
+                    postgrespool::Error::InvalidHostOrPortError {
+                        host,
+                        port,
+                        source: _,
+                    } => Err(DataConnectorError::UnableToConnectInvalidConfiguration {
+                        source: Box::new(Error::UnableToConnectInvalidHostOrPort { host, port }),
+                    }
+                    .into()),
 
-            Ok(Arc::new(Self { postgres_factory }) as Arc<dyn DataConnector>)
+                    _ => Err(DataConnectorError::UnableToConnectInternal {
+                        dataconnector: "postgres".to_string(),
+                        source: Box::new(e),
+                    }
+                    .into()),
+                },
+            }
         })
     }
 }
