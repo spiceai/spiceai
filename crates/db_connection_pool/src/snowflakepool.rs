@@ -127,10 +127,10 @@ fn init_snowflake_api(
     let warehouse = get_param(params, secret, "snowflake_warehouse");
     let role = get_param(params, secret, "snowflake_role");
     let auth_type = get_param(params, secret, "snowflake_auth_type")
-        .unwrap_or_else(|| "auth_snowflake".to_string())
+        .unwrap_or_else(|| "snowflake".to_string())
         .to_lowercase();
 
-    if auth_type == "auth_snowflake" {
+    if auth_type == "snowflake" {
         // default username/password auth
         let password = get_param(params, secret, "password")
             .context(MissingRequiredSecretSnafu { name: "password" })?;
@@ -148,7 +148,7 @@ fn init_snowflake_api(
         return Ok(api);
     }
 
-    if auth_type == "auth_keypair" {
+    if auth_type == "keypair" {
         let private_key_path = get_param(params, secret, "snowflake_private_key_path").context(
             MissingRequiredSecretSnafu {
                 name: "snowflake_private_key_path",
