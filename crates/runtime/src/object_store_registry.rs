@@ -63,12 +63,14 @@ impl ObjectStoreRegistry for SpiceObjectStoreRegistry {
     }
 }
 
+// This method uses `expect` inside as this won't fail in normal case. See RuntimeEnv::default()
+// Rather than let all callers handle this, use expect to simplify the return signature.
 pub(crate) fn default_runtime_env() -> Arc<RuntimeEnv> {
     Arc::new(
         RuntimeEnv::new(
             RuntimeConfig::default()
                 .with_object_store_registry(Arc::new(SpiceObjectStoreRegistry::default())),
         )
-        .unwrap(),
+        .expect("Runtime env should always be created successfully with SpiceObjectStoreRegistry"),
     )
 }
