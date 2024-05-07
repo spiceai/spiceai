@@ -33,18 +33,20 @@ import (
 )
 
 const (
-	apiKeyFlag       = "key"
-	accountFlag      = "account"
-	usernameFlag     = "username"
-	passwordFlag     = "password"
-	token            = "token"
-	accessKeyFlag    = "access-key"
-	accessSecretFlag = "access-secret"
-	sparkRemoteFlag  = "spark_remote"
-	awsRegion        = "aws-region"
-	awsAccessKeyId   = "aws-access-key-id"
-	awsSecret        = "aws-secret-access-key"
-	charset          = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	apiKeyFlag         = "key"
+	accountFlag        = "account"
+	usernameFlag       = "username"
+	passwordFlag       = "password"
+	privateKeyPathFlag = "private-key-path"
+	passphraseFlag     = "passphrase"
+	token              = "token"
+	accessKeyFlag      = "access-key"
+	accessSecretFlag   = "access-secret"
+	sparkRemoteFlag    = "spark_remote"
+	awsRegion          = "aws-region"
+	awsAccessKeyId     = "aws-access-key-id"
+	awsSecret          = "aws-secret-access-key"
+	charset            = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 )
 
 var loginCmd = &cobra.Command{
@@ -145,7 +147,7 @@ spice login dremio --username <username> --password <password>
 	}, map[string]string{
 		usernameFlag: api.AUTH_PARAM_USERNAME,
 		passwordFlag: api.AUTH_PARAM_PASSWORD,
-	}),
+	}, []string{}),
 }
 
 var s3Cmd = &cobra.Command{
@@ -162,7 +164,7 @@ spice login s3 --access-key <key> --access-secret <secret>
 	}, map[string]string{
 		accessKeyFlag:    api.AUTH_PARAM_KEY,
 		accessSecretFlag: api.AUTH_PARAM_SECRET,
-	}),
+	}, []string{}),
 }
 
 var postgresCmd = &cobra.Command{
@@ -177,7 +179,7 @@ spice login postgres --password <password>
 		passwordFlag: fmt.Sprintf("No password provided, use --%s or -p to provide a password", passwordFlag),
 	}, map[string]string{
 		passwordFlag: api.AUTH_PARAM_PG_PASSWORD,
-	}),
+	}, []string{}),
 }
 
 var postgresEngineCmd = &cobra.Command{
@@ -192,7 +194,7 @@ spice login postgres engine --password <password>
 		passwordFlag: fmt.Sprintf("No password provided, use --%s or -p to provide a password", passwordFlag),
 	}, map[string]string{
 		passwordFlag: api.AUTH_PARAM_PG_PASSWORD,
-	}),
+	}, []string{}),
 }
 
 var snowflakeCmd = &cobra.Command{
@@ -200,18 +202,42 @@ var snowflakeCmd = &cobra.Command{
 	Short: "Login to a Snowflake warehouse",
 	Example: `
 spice login snowflake --account <account-identifier> --username <username> --password <password>
+spice login snowflake --account <account-identifier> --username <username> --private-key-path <private-key-path> --passphrase <passphrase>
 
 # See more at: https://docs.spiceai.org/
 `,
-	Run: CreateLoginRunFunc(api.AUTH_TYPE_SNOWFLAKE, map[string]string{
-		accountFlag:  fmt.Sprintf("No account identifier provided, use --%s or -a to provide an account identifier", accountFlag),
-		usernameFlag: fmt.Sprintf("No username provided, use --%s or -u to provide a username", usernameFlag),
-		passwordFlag: fmt.Sprintf("No password provided, use --%s or -p to provide a password", passwordFlag),
-	}, map[string]string{
-		accountFlag:  api.AUTH_PARAM_ACCOUNT,
-		usernameFlag: api.AUTH_PARAM_USERNAME,
-		passwordFlag: api.AUTH_PARAM_PASSWORD,
-	}),
+	Run: func(cmd *cobra.Command, args []string) {
+
+		if privateKeyPath, err := cmd.Flags().GetString(privateKeyPathFlag); err == nil && privateKeyPath != "" {
+
+			CreateLoginRunFunc(api.AUTH_TYPE_SNOWFLAKE, map[string]string{
+				accountFlag:        fmt.Sprintf("No account identifier provided, use --%s or -a to provide an account identifier", accountFlag),
+				usernameFlag:       fmt.Sprintf("No username provided, use --%s or -u to provide a username", usernameFlag),
+				privateKeyPathFlag: fmt.Sprintf("No private key path provided, use --%s or -k to provide a private key path", privateKeyPathFlag),
+			}, map[string]string{
+				accountFlag:        api.AUTH_PARAM_ACCOUNT,
+				usernameFlag:       api.AUTH_PARAM_USERNAME,
+				privateKeyPathFlag: api.AUTH_PARAM_SNOWFLAKE_PRIVATE_KEY_PATH,
+				passphraseFlag:     api.AUTH_PARAM_SNOWFLAKE_PRIVATE_KEY_PASSPHRASE,
+			}, []string{
+				passphraseFlag,
+			})(cmd, args)
+
+			return
+		}
+
+		// default username/password login
+		CreateLoginRunFunc(api.AUTH_TYPE_SNOWFLAKE, map[string]string{
+			accountFlag:  fmt.Sprintf("No account identifier provided, use --%s or -a to provide an account identifier", accountFlag),
+			usernameFlag: fmt.Sprintf("No username provided, use --%s or -u to provide a username", usernameFlag),
+			passwordFlag: fmt.Sprintf("No password provided, use --%s or -p to provide a password", passwordFlag),
+		}, map[string]string{
+			accountFlag:  api.AUTH_PARAM_ACCOUNT,
+			usernameFlag: api.AUTH_PARAM_USERNAME,
+			passwordFlag: api.AUTH_PARAM_PASSWORD,
+		}, []string{})(cmd, args)
+
+	},
 }
 
 var sparkCmd = &cobra.Command{
@@ -226,10 +252,10 @@ spice login spark --spark_remote <remote>
 		sparkRemoteFlag: "No spark_remote provided, use --spark_remote to provide",
 	}, map[string]string{
 		sparkRemoteFlag: api.AUTH_PARAM_SPARK_REMOTE,
-	}),
+	}, []string{}),
 }
 
-func CreateLoginRunFunc(authName string, requiredFlags map[string]string, flagToTomlKeys map[string]string) func(cmd *cobra.Command, args []string) {
+func CreateLoginRunFunc(authName string, requiredFlags map[string]string, flagToTomlKeys map[string]string, optionalFlags []string) func(cmd *cobra.Command, args []string) {
 	return func(cmd *cobra.Command, args []string) {
 
 		authParams := make(map[string]string)
@@ -244,6 +270,17 @@ func CreateLoginRunFunc(authName string, requiredFlags map[string]string, flagTo
 				os.Exit(1)
 			}
 			authParams[flag] = value
+		}
+
+		for _, flag := range optionalFlags {
+			value, err := cmd.Flags().GetString(flag)
+			if err != nil {
+				cmd.Println(err.Error())
+				os.Exit(1)
+			}
+			if value != "" {
+				authParams[flag] = value
+			}
 		}
 
 		// Convert keys from user flags to those to write to authConfig. Default to flag key.
@@ -392,6 +429,8 @@ func init() {
 	snowflakeCmd.Flags().StringP(accountFlag, "a", "", "Account identifier")
 	snowflakeCmd.Flags().StringP(usernameFlag, "u", "", "Username")
 	snowflakeCmd.Flags().StringP(passwordFlag, "p", "", "Password")
+	snowflakeCmd.Flags().StringP(privateKeyPathFlag, "k", "", "Private key path")
+	snowflakeCmd.Flags().StringP(passphraseFlag, "s", "", "Passphrase")
 	loginCmd.AddCommand(snowflakeCmd)
 
 	sparkCmd.Flags().BoolP("help", "h", false, "Print this help message")
