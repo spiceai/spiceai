@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use data_components::postgres::PostgresTableFactory;
 use data_components::Read;
 use datafusion::datasource::TableProvider;
-use db_connection_pool::postgrespool::PostgresConnectionPool;
+use db_connection_pool::postgrespool::{self, PostgresConnectionPool};
 use secrets::Secret;
 use snafu::prelude::*;
 use spicepod::component::dataset::Dataset;
@@ -27,7 +27,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::{collections::HashMap, future::Future};
 
-use super::{DataConnector, DataConnectorFactory};
+use super::{DataConnector, DataConnectorError, DataConnectorFactory};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -45,8 +45,6 @@ pub enum Error {
     },
 }
 
-pub type Result<T, E = Error> = std::result::Result<T, E>;
-
 pub struct Postgres {
     postgres_factory: PostgresTableFactory,
 }
@@ -57,15 +55,37 @@ impl DataConnectorFactory for Postgres {
         params: Arc<Option<HashMap<String, String>>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let pool = Arc::new(
-                PostgresConnectionPool::new(params, secret)
-                    .await
-                    .context(UnableToCreatePostgresConnectionPoolSnafu)?,
-            );
+            match PostgresConnectionPool::new(params, secret).await {
+                Ok(pool) => {
+                    let postgres_factory = PostgresTableFactory::new(Arc::new(pool));
+                    Ok(Arc::new(Self { postgres_factory }) as Arc<dyn DataConnector>)
+                }
+                Err(e) => match e {
+                    postgrespool::Error::InvalidUsernameOrPassword { .. } => Err(
+                        DataConnectorError::UnableToConnectInvalidUsernameOrPassword {
+                            dataconnector: "postgres".to_string(),
+                        }
+                        .into(),
+                    ),
 
-            let postgres_factory = PostgresTableFactory::new(pool);
+                    postgrespool::Error::InvalidHostOrPortError {
+                        host,
+                        port,
+                        source: _,
+                    } => Err(DataConnectorError::UnableToConnectInvalidHostOrPort {
+                        dataconnector: "postgres".to_string(),
+                        host,
+                        port,
+                    }
+                    .into()),
 
-            Ok(Arc::new(Self { postgres_factory }) as Arc<dyn DataConnector>)
+                    _ => Err(DataConnectorError::UnableToConnectInternal {
+                        dataconnector: "postgres".to_string(),
+                        source: Box::new(e),
+                    }
+                    .into()),
+                },
+            }
         })
     }
 }
