@@ -24,6 +24,7 @@ use crate::dataaccelerator::{self, create_accelerator_table};
 use crate::dataconnector::DataConnector;
 use crate::dataupdate::{DataUpdate, DataUpdateExecutionPlan, UpdateType};
 use crate::get_dependent_table_names;
+use crate::object_store_registry::default_runtime_env;
 use arrow::datatypes::Schema;
 use arrow_tools::schema::verify_schema;
 use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider};
@@ -156,7 +157,8 @@ impl DataFusion {
             .with_create_default_catalog_and_schema(false);
         df_config.options_mut().sql_parser.dialect = "PostgreSQL".to_string();
 
-        let ctx = SessionContext::new_with_config(df_config);
+        let runtime = default_runtime_env();
+        let ctx = SessionContext::new_with_config_rt(df_config, runtime);
 
         let catalog = MemoryCatalogProvider::new();
         let schema = SpiceSchemaProvider::new();

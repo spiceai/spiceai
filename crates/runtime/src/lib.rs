@@ -46,6 +46,7 @@ pub mod config;
 pub mod dataaccelerator;
 pub mod dataconnector;
 pub mod datafusion;
+pub mod object_store_registry;
 pub mod dataupdate;
 pub mod execution_plan;
 mod flight;

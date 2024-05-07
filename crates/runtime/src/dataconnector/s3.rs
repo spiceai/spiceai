@@ -14,10 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::object_store_registry::default_runtime_env;
+
 use super::{AnyErrorResult, DataConnector, DataConnectorFactory};
 use async_trait::async_trait;
+use datafusion::datasource::file_format::parquet::ParquetFormat;
+use datafusion::datasource::listing::{
+    ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
+};
 use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
+use datafusion::execution::config::SessionConfig;
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::options::ParquetReadOptions;
 use object_store::aws::AmazonS3Builder;
@@ -147,20 +154,24 @@ impl DataConnector for S3 {
         &self,
         dataset: &Dataset,
     ) -> super::AnyErrorResult<Arc<dyn TableProvider>> {
-        let ctx = SessionContext::new();
+        let runtime = default_runtime_env();
+        let ctx = SessionContext::new_with_config_rt(SessionConfig::new(), runtime);
 
-        let (url, s3) = self
+        let (url, _) = self
             .get_object_store(dataset)
             .ok_or_else(|| ObjectStoreNotImplementedSnafu.build())?
             .context(UnableToGetReadProviderSnafu)?;
 
-        let _ = ctx.runtime_env().register_object_store(&url, s3);
+        let table_path = ListingTableUrl::parse(url)?;
+        let options =
+            ListingOptions::new(Arc::new(ParquetFormat::default())).with_file_extension(".parquet");
 
-        let df = ctx
-            .read_parquet(&dataset.from, ParquetReadOptions::default())
-            .await
-            .context(UnableToBuildLogicalPlanSnafu)?;
+        let resolved_schema = options.infer_schema(&ctx.state(), &table_path).await?;
+        let config = ListingTableConfig::new(table_path)
+            .with_listing_options(options)
+            .with_schema(resolved_schema);
+        let table = ListingTable::try_new(config)?;
 
-        Ok(df.into_view())
+        Ok(Arc::new(table))
     }
 }
