@@ -19,13 +19,11 @@ use datafusion::{
     logical_expr::Expr,
 };
 use futures::{stream::BoxStream, StreamExt};
-use object_store::ObjectStore;
 use snafu::prelude::*;
 use spicepod::component::dataset::acceleration::{RefreshMode, ZeroResultsAction};
 use spicepod::component::dataset::TimeFormat;
 use tokio::task::JoinHandle;
 use tokio::time::interval;
-use url::Url;
 
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::{mpsc, oneshot};

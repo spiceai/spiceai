@@ -26,7 +26,6 @@ use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
 use datafusion::execution::config::SessionConfig;
 use datafusion::execution::context::SessionContext;
-use datafusion::execution::options::ParquetReadOptions;
 use object_store::aws::AmazonS3Builder;
 use object_store::ObjectStore;
 use secrets::Secret;
