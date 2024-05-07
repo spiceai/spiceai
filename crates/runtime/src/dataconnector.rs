@@ -101,7 +101,7 @@ pub enum DataConnectorError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Cannot connect to {dataconnector} data connector on {host}:{port}. Ensure that the host and port are correclty configured in the spicepod, and that the host is reachable."))]
+    #[snafu(display("Cannot connect to {dataconnector} on {host}:{port}. Ensure that the host and port are correclty configured in the spicepod, and that the host is reachable."))]
     UnableToConnectInvalidHostOrPort {
         dataconnector: String,
         host: String,
