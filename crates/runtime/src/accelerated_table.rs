@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use data_components::delete::get_deletion_provider;
 use datafusion::common::OwnedTableReference;
 use datafusion::error::Result as DataFusionResult;
+use datafusion::execution::config::SessionConfig;
 use datafusion::execution::context::SessionState;
 use datafusion::logical_expr::{Operator, TableProviderFilterPushDown};
 use datafusion::physical_plan::union::UnionExec;
@@ -36,6 +37,7 @@ use crate::execution_plan::schema_cast::SchemaCastScanExec;
 use crate::execution_plan::slice::SliceExec;
 use crate::execution_plan::tee::TeeExec;
 use crate::execution_plan::TableScanParams;
+use crate::object_store_registry::default_runtime_env;
 use crate::{
     dataconnector::{self, get_data},
     dataupdate::{DataUpdate, DataUpdateExecutionPlan, UpdateType},
@@ -107,7 +109,6 @@ pub struct Builder {
     accelerator: Arc<dyn TableProvider>,
     refresh: Refresh,
     retention: Option<Retention>,
-    object_store: Option<(Url, Arc<dyn ObjectStore + 'static>)>,
     zero_results_action: ZeroResultsAction,
 }
 
@@ -124,21 +125,12 @@ impl Builder {
             accelerator,
             refresh,
             retention: None,
-            object_store: None,
             zero_results_action: ZeroResultsAction::default(),
         }
     }
 
     pub fn retention(&mut self, retention: Option<Retention>) -> &mut Self {
         self.retention = retention;
-        self
-    }
-
-    pub fn object_store(
-        &mut self,
-        object_store: Option<(Url, Arc<dyn ObjectStore + 'static>)>,
-    ) -> &mut Self {
-        self.object_store = object_store;
         self
     }
 
@@ -173,7 +165,6 @@ impl Builder {
             self.refresh,
             acceleration_refresh_mode,
             Arc::clone(&self.accelerator),
-            self.object_store,
             ready_sender,
         ));
 
@@ -344,7 +335,6 @@ impl AcceleratedTable {
         refresh: Refresh,
         acceleration_refresh_mode: AccelerationRefreshMode,
         accelerator: Arc<dyn TableProvider>,
-        object_store: Option<(Url, Arc<dyn ObjectStore + 'static>)>,
         ready_sender: oneshot::Sender<()>,
     ) {
         let mut stream = Self::stream_updates(
@@ -352,7 +342,6 @@ impl AcceleratedTable {
             federated,
             refresh,
             acceleration_refresh_mode,
-            object_store,
         );
 
         let ctx = SessionContext::new();
@@ -401,13 +390,9 @@ impl AcceleratedTable {
         federated: Arc<dyn TableProvider>,
         refresh: Refresh,
         acceleration_refresh_mode: AccelerationRefreshMode,
-        object_store: Option<(Url, Arc<dyn ObjectStore + 'static>)>,
     ) -> BoxStream<'a, Result<DataUpdate>> {
-        let mut ctx = SessionContext::new();
-        if let Some((ref url, ref object_store)) = object_store {
-            ctx.runtime_env()
-                .register_object_store(url, Arc::clone(object_store));
-        }
+        let runtime = default_runtime_env();
+        let mut ctx = SessionContext::new_with_config_rt(SessionConfig::new(), runtime);
         if let Err(e) = ctx.register_table(
             OwnedTableReference::bare(dataset_name.clone()),
             Arc::clone(&federated),

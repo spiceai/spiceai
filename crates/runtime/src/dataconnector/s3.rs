@@ -100,16 +100,12 @@ impl DataConnectorFactory for S3 {
     }
 }
 
-#[async_trait]
-impl DataConnector for S3 {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
+impl S3 {
+    // TODO: more work here -> still WIP
     fn get_object_store(
         &self,
         dataset: &Dataset,
-    ) -> Option<AnyErrorResult<(Url, Arc<dyn ObjectStore + 'static>)>> {
+    ) -> AnyErrorResult<(Url, Arc<dyn ObjectStore + 'static>)> {
         let result: AnyErrorResult<(Url, Arc<dyn ObjectStore + 'static>)> = (|| {
             let url = dataset.from.clone();
             let parts = url.clone().replace("s3://", "");
@@ -147,7 +143,14 @@ impl DataConnector for S3 {
             Ok((s3_url, Arc::new(s3) as Arc<dyn ObjectStore>))
         })();
 
-        Some(result)
+        result
+    }
+}
+
+#[async_trait]
+impl DataConnector for S3 {
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 
     async fn read_provider(
@@ -159,7 +162,6 @@ impl DataConnector for S3 {
 
         let (url, _) = self
             .get_object_store(dataset)
-            .ok_or_else(|| ObjectStoreNotImplementedSnafu.build())?
             .context(UnableToGetReadProviderSnafu)?;
 
         let table_path = ListingTableUrl::parse(url)?;

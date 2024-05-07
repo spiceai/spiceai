@@ -197,13 +197,6 @@ pub trait DataConnector: Send + Sync {
     ) -> Option<AnyErrorResult<Arc<dyn TableProvider>>> {
         None
     }
-
-    fn get_object_store(
-        &self,
-        _dataset: &Dataset,
-    ) -> Option<AnyErrorResult<(Url, Arc<dyn ObjectStore + 'static>)>> {
-        None
-    }
 }
 
 // Gets data from a table provider and returns it as a vector of RecordBatches.
