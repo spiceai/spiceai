@@ -108,7 +108,7 @@ pub enum DataConnectorError {
         port: u16,
     },
 
-    #[snafu(display("Cannot connect to {dataconnector} data connector. Authentication failed. Ensure that the username and password are correctly configured in the spicepod."))]
+    #[snafu(display("Cannot connect to {dataconnector}. Authentication failed. Ensure that the username and password are correctly configured in the spicepod."))]
     UnableToConnectInvalidUsernameOrPassword { dataconnector: String },
 }
 
