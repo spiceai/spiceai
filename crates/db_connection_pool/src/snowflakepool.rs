@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
+use pkcs8::{LineEnding, SecretDocument};
 use secrets::Secret;
 use snafu::prelude::*;
 use snowflake_api::{SnowflakeApi, SnowflakeApiError};
@@ -56,6 +57,15 @@ pub enum Error {
         param_key: String,
         param_value: String,
     },
+
+    #[snafu(display("Unable to parse private key file: {source}"))]
+    UnableToParsePrivateKey { source: pkcs8::der::Error },
+
+    #[snafu(display("Unable to decrypt private key file: {source}. Is the passphrase correct?"))]
+    UnableToDecryptPrivateKey { source: pkcs8::Error },
+
+    #[snafu(display("Failed to save decrypted private key content as PEM: {source}"))]
+    FailedToCreatePem { source: pkcs8::der::Error },
 }
 
 pub struct SnowflakeConnectionPool {
@@ -155,10 +165,22 @@ fn init_snowflake_api(
             },
         )?;
 
-        let private_key_pem: String =
+        let mut private_key_pem: String =
             fs::read_to_string(&private_key_path).context(ErrorReadingPrivateKeyFileSnafu {
                 file_path: private_key_path,
             })?;
+
+        let (label, data) =
+            SecretDocument::from_pem(&private_key_pem).context(UnableToParsePrivateKeySnafu)?;
+
+        if label.to_uppercase() == "ENCRYPTED PRIVATE KEY" {
+            let passphrase = get_param(params, secret, "snowflake_private_key_passphrase")
+                .context(MissingRequiredSecretSnafu {
+                    name: "snowflake_private_key_passphrase",
+                })?;
+
+            private_key_pem = decode_pkcs8_encrypted_data(&data, &passphrase)?;
+        }
 
         let api = SnowflakeApi::with_certificate_auth(
             &account,
@@ -192,4 +214,18 @@ impl DbConnectionPool<Arc<SnowflakeApi>, &'static (dyn Sync)> for SnowflakeConne
 
         Ok(Box::new(conn))
     }
+}
+
+fn decode_pkcs8_encrypted_data(data: &SecretDocument, password: &str) -> Result<String> {
+    let encrypted_key_info = data
+        .decode_msg::<pkcs8::EncryptedPrivateKeyInfo>()
+        .context(UnableToParsePrivateKeySnafu)?;
+    let decrypted_key_info = encrypted_key_info
+        .decrypt(password)
+        .context(UnableToDecryptPrivateKeySnafu)?;
+    let decrypted_pem = decrypted_key_info
+        .to_pem("PRIVATE KEY", LineEnding::CRLF)
+        .context(FailedToCreatePemSnafu)?;
+
+    Ok(decrypted_pem.to_string())
 }
