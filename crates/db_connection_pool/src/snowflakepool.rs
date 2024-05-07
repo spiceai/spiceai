@@ -95,7 +95,34 @@ impl SnowflakeConnectionPool {
         params: &Arc<Option<HashMap<String, String>>>,
         secret: &Option<Secret>,
     ) -> Result<Self> {
-        let api = init_snowflake_api(params, secret)?;
+        let username = get_param(params, secret, "username")
+            .context(MissingRequiredSecretSnafu { name: "username" })?;
+
+        let account = get_param(params, secret, "account")
+            .context(MissingRequiredSecretSnafu { name: "account" })?;
+        // account identifier can be in <orgname.account_name> format but API requires it as <orgname-account_name>
+        let account = account.replace('.', "-");
+
+        let warehouse = get_param(params, secret, "snowflake_warehouse");
+        let role = get_param(params, secret, "snowflake_role");
+
+        let auth_type = get_param(params, secret, "snowflake_auth_type")
+            .unwrap_or_else(|| "snowflake".to_string())
+            .to_lowercase();
+
+        let api = match auth_type.as_str() {
+            "snowflake" => init_snowflake_api_with_password_auth(
+                &account, &username, &warehouse, &role, params, secret,
+            )?,
+            "keypair" => init_snowflake_api_with_keypair_auth(
+                &account, &username, &warehouse, &role, params, secret,
+            )?,
+            _ => InvalidParameterValueSnafu {
+                param_key: "snowflake_auth_type",
+                param_value: auth_type,
+            }
+            .fail()?,
+        };
 
         if let Err(err) = api.exec("SELECT 1").await {
             match err {
@@ -123,84 +150,74 @@ impl SnowflakeConnectionPool {
     }
 }
 
-fn init_snowflake_api(
+fn init_snowflake_api_with_password_auth(
+    account: &str,
+    username: &str,
+    warehouse: &Option<String>,
+    role: &Option<String>,
     params: &Arc<Option<HashMap<String, String>>>,
     secret: &Option<Secret>,
 ) -> Result<SnowflakeApi> {
-    let username = get_param(params, secret, "username")
-        .context(MissingRequiredSecretSnafu { name: "username" })?;
-    let account = get_param(params, secret, "account")
-        .context(MissingRequiredSecretSnafu { name: "account" })?;
-    // account identifier can be in <orgname.account_name> format but API requires it as <orgname-account_name>
-    let account = account.replace('.', "-");
+    let password = get_param(params, secret, "password")
+        .context(MissingRequiredSecretSnafu { name: "password" })?;
+    let api = SnowflakeApi::with_password_auth(
+        account,
+        warehouse.as_deref(),
+        None,
+        None,
+        username,
+        role.as_deref(),
+        &password,
+    )
+    .context(UnableToConnectSnafu)?;
 
-    let warehouse = get_param(params, secret, "snowflake_warehouse");
-    let role = get_param(params, secret, "snowflake_role");
-    let auth_type = get_param(params, secret, "snowflake_auth_type")
-        .unwrap_or_else(|| "snowflake".to_string())
-        .to_lowercase();
+    Ok(api)
+}
 
-    if auth_type == "snowflake" {
-        // default username/password auth
-        let password = get_param(params, secret, "password")
-            .context(MissingRequiredSecretSnafu { name: "password" })?;
-        let api = SnowflakeApi::with_password_auth(
-            &account,
-            warehouse.as_deref(),
-            None,
-            None,
-            &username,
-            role.as_deref(),
-            &password,
-        )
-        .context(UnableToConnectSnafu)?;
+fn init_snowflake_api_with_keypair_auth(
+    account: &str,
+    username: &str,
+    warehouse: &Option<String>,
+    role: &Option<String>,
+    params: &Arc<Option<HashMap<String, String>>>,
+    secret: &Option<Secret>,
+) -> Result<SnowflakeApi> {
+    let private_key_path = get_param(params, secret, "snowflake_private_key_path").context(
+        MissingRequiredSecretSnafu {
+            name: "snowflake_private_key_path",
+        },
+    )?;
 
-        return Ok(api);
-    }
+    let mut private_key_pem: String =
+        fs::read_to_string(&private_key_path).context(ErrorReadingPrivateKeyFileSnafu {
+            file_path: private_key_path,
+        })?;
 
-    if auth_type == "keypair" {
-        let private_key_path = get_param(params, secret, "snowflake_private_key_path").context(
+    let (label, data) =
+        SecretDocument::from_pem(&private_key_pem).context(UnableToParsePrivateKeySnafu)?;
+
+    if label.to_uppercase() == "ENCRYPTED PRIVATE KEY" {
+        let passphrase = get_param(params, secret, "snowflake_private_key_passphrase").context(
             MissingRequiredSecretSnafu {
-                name: "snowflake_private_key_path",
+                name: "snowflake_private_key_passphrase",
             },
         )?;
 
-        let mut private_key_pem: String =
-            fs::read_to_string(&private_key_path).context(ErrorReadingPrivateKeyFileSnafu {
-                file_path: private_key_path,
-            })?;
-
-        let (label, data) =
-            SecretDocument::from_pem(&private_key_pem).context(UnableToParsePrivateKeySnafu)?;
-
-        if label.to_uppercase() == "ENCRYPTED PRIVATE KEY" {
-            let passphrase = get_param(params, secret, "snowflake_private_key_passphrase")
-                .context(MissingRequiredSecretSnafu {
-                    name: "snowflake_private_key_passphrase",
-                })?;
-
-            private_key_pem = decode_pkcs8_encrypted_data(&data, &passphrase)?;
-        }
-
-        let api = SnowflakeApi::with_certificate_auth(
-            &account,
-            warehouse.as_deref(),
-            None,
-            None,
-            &username,
-            role.as_deref(),
-            &private_key_pem,
-        )
-        .context(UnableToConnectSnafu)?;
-
-        return Ok(api);
+        private_key_pem = decode_pkcs8_encrypted_data(&data, &passphrase)?;
     }
 
-    InvalidParameterValueSnafu {
-        param_key: "snowflake_auth_type",
-        param_value: auth_type,
-    }
-    .fail()?
+    let api = SnowflakeApi::with_certificate_auth(
+        account,
+        warehouse.as_deref(),
+        None,
+        None,
+        username,
+        role.as_deref(),
+        &private_key_pem,
+    )
+    .context(UnableToConnectSnafu)?;
+
+    Ok(api)
 }
 
 #[async_trait]
