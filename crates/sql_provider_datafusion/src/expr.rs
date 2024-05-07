@@ -112,6 +112,9 @@ pub fn to_sql_with_engine(expr: &Expr, engine: Option<Engine>) -> Result<String>
                 }
                 _ => Ok(format!("TO_TIMESTAMP({})", value / 1_000_000_000)),
             },
+            ScalarValue::TimestampMicrosecond(Some(value), None | Some(_)) => match engine {
+                _ => Ok(format!("TO_TIMESTAMP({})", value / 1_000_000)),
+            },
             ScalarValue::TimestampMillisecond(Some(value), None | Some(_)) => match engine {
                 Some(Engine::SQLite) => Ok(format!("datetime({}, 'unixepoch')", value / 1000)),
                 _ => Ok(format!("TO_TIMESTAMP({})", value / 1000)),
