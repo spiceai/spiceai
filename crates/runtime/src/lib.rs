@@ -84,10 +84,9 @@ pub enum Error {
     #[snafu(display("Failed to start pods watcher: {source}"))]
     UnableToInitializePodsWatcher { source: NotifyError },
 
-    #[snafu(display("Unable to initialize data connector {data_connector}: {source}"))]
+    #[snafu(display("{source}"))]
     UnableToInitializeDataConnector {
         source: Box<dyn std::error::Error + Send + Sync>,
-        data_connector: String,
     },
 
     #[snafu(display("Unknown data connector: {data_connector}"))]
@@ -223,11 +222,7 @@ impl Runtime {
                 Err(err) => {
                     status::update_dataset(&ds.name, status::ComponentStatus::Error);
                     metrics::counter!("datasets_load_error").increment(1);
-                    warn_spaced!(
-                        spaced_tracer,
-                        "Failed to get data connector from source for dataset {}, retrying: {err}",
-                        &ds.name
-                    );
+                    warn_spaced!(spaced_tracer, "{}{err}", "");
                     sleep(Duration::from_secs(1)).await;
                     continue;
                 }
@@ -284,11 +279,7 @@ impl Runtime {
             Err(err) => {
                 status::update_dataset(&ds.name, status::ComponentStatus::Error);
                 metrics::counter!("datasets_load_error").increment(1);
-                warn_spaced!(
-                    spaced_tracer,
-                    "Failed to get data connector from source for dataset {}: {err}",
-                    &ds.name
-                );
+                warn_spaced!(spaced_tracer, "{}{err}", "");
                 return UnableToLoadDatasetConnectorSnafu {
                     dataset: ds.name.clone(),
                 }
@@ -350,11 +341,7 @@ impl Runtime {
                 {
                     tracing::error!("{source}");
                 }
-                warn_spaced!(
-                    spaced_tracer,
-                    "Failed to initialize data connector for dataset {}: {err}",
-                    &ds.name
-                );
+                warn_spaced!(spaced_tracer, "{}{err}", "");
 
                 Err(err)
             }
@@ -461,9 +448,7 @@ impl Runtime {
         )?;
 
         match dataconnector::create_new_connector(source, secret, params).await {
-            Some(dc) => dc.context(UnableToInitializeDataConnectorSnafu {
-                data_connector: source,
-            }),
+            Some(dc) => dc.context(UnableToInitializeDataConnectorSnafu {}),
             None => UnknownDataConnectorSnafu {
                 data_connector: source,
             }

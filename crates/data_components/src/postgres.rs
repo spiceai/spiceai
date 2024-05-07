@@ -34,7 +34,7 @@ use datafusion::{
 };
 use db_connection_pool::{
     dbconnection::{postgresconn::PostgresConnection, DbConnection},
-    postgrespool::PostgresConnectionPool,
+    postgrespool::{self, PostgresConnectionPool},
     DbConnectionPool,
 };
 use postgres_native_tls::MakeTlsConnector;
@@ -66,7 +66,7 @@ pub enum Error {
     },
 
     #[snafu(display("Unable to create Postgres connection pool: {source}"))]
-    UnableToCreatePostgresConnectionPool { source: db_connection_pool::Error },
+    UnableToCreatePostgresConnectionPool { source: postgrespool::Error },
 
     #[snafu(display("Unable to downcast DbConnection to PostgresConnection"))]
     UnableToDowncastDbConnection {},
