@@ -13,9 +13,6 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-
-use std::{collections::HashMap, sync::Arc};
-
 use async_trait::async_trait;
 use snafu::{prelude::*, ResultExt};
 use tokio_rusqlite::{Connection, ToSql};
@@ -49,22 +46,12 @@ impl SqliteConnectionPool {
     ///
     /// Returns an error if there is a problem creating the connection pool.
     #[allow(clippy::needless_pass_by_value)]
-    pub async fn new(
-        name: &str,
-        mode: Mode,
-        params: Arc<Option<HashMap<String, String>>>,
-    ) -> Result<Self> {
-        let file_name = params
-            .as_ref()
-            .as_ref()
-            .and_then(|params| params.get("sqlite_file").cloned())
-            .unwrap_or(format!("{name}_sqlite.db"));
-
+    pub async fn new(path: &str, mode: Mode) -> Result<Self> {
         let conn = match mode {
             Mode::Memory => Connection::open_in_memory()
                 .await
                 .context(ConnectionPoolSnafu)?,
-            Mode::File => Connection::open(file_name)
+            Mode::File => Connection::open(path.to_string())
                 .await
                 .context(ConnectionPoolSnafu)?,
         };
