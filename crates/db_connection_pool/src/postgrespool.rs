@@ -29,7 +29,7 @@ use secrets::Secret;
 use snafu::{prelude::*, ResultExt};
 use tokio_postgres;
 
-use super::{DbConnectionPool, Result};
+use super::DbConnectionPool;
 use crate::{
     dbconnection::{postgresconn::PostgresConnection, AsyncDbConnection, DbConnection},
     get_secret_or_param,
@@ -66,6 +66,9 @@ pub enum Error {
     #[snafu(display("Failed to load cert : {source}"))]
     FailedToLoadCertError { source: native_tls::Error },
 
+    #[snafu(display("Failed to build tls connector : {source}"))]
+    FailedToBuildTlsConnectorError { source: native_tls::Error },
+
     #[snafu(display("Postgres connection error: {source}"))]
     PostgresConnectionError { source: tokio_postgres::Error },
 
@@ -74,6 +77,8 @@ pub enum Error {
     ))]
     InvalidUsernameOrPassword { source: tokio_postgres::Error },
 }
+
+pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct PostgresConnectionPool {
     pool: Arc<bb8::Pool<PostgresConnectionManager<MakeTlsConnector>>>,
@@ -236,11 +241,11 @@ async fn test_postgres_connection(
         Err(err) => {
             if let Some(code) = err.code() {
                 if *code == tokio_postgres::error::SqlState::INVALID_PASSWORD {
-                    return Err(Box::new(Error::InvalidUsernameOrPassword { source: err }));
+                    return Err(Error::InvalidUsernameOrPassword { source: err });
                 }
             }
 
-            Err(Box::new(Error::PostgresConnectionError { source: err }))
+            Err(Error::PostgresConnectionError { source: err })
         }
     }
 }
@@ -259,14 +264,11 @@ async fn verify_postgres_config(config: &Config) -> Result<()> {
     Ok(())
 }
 
-fn get_tls_connector(
-    ssl_mode: &str,
-    rootcerts: Option<Vec<Certificate>>,
-) -> native_tls::Result<TlsConnector> {
+fn get_tls_connector(ssl_mode: &str, rootcerts: Option<Vec<Certificate>>) -> Result<TlsConnector> {
     let mut builder = TlsConnector::builder();
 
     if ssl_mode == "disable" {
-        return builder.build();
+        return builder.build().context(FailedToBuildTlsConnectorSnafu);
     }
 
     if let Some(certs) = rootcerts {
@@ -279,10 +281,11 @@ fn get_tls_connector(
         .danger_accept_invalid_hostnames(ssl_mode != "verify-full")
         .danger_accept_invalid_certs(ssl_mode != "verify-full" && ssl_mode != "verify-ca")
         .build()
+        .context(FailedToBuildTlsConnectorSnafu)
 }
 
 fn parse_certs(buf: &[u8]) -> Result<Vec<Certificate>> {
-    Ok(Certificate::from_der(buf)
+    Certificate::from_der(buf)
         .map(|x| vec![x])
         .or_else(|_| {
             pem::parse_many(buf)
@@ -292,7 +295,7 @@ fn parse_certs(buf: &[u8]) -> Result<Vec<Certificate>> {
                 .map(|s| Certificate::from_pem(s.as_bytes()))
                 .collect()
         })
-        .context(FailedToLoadCertSnafu)?)
+        .context(FailedToLoadCertSnafu)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -327,7 +330,7 @@ impl
 {
     async fn connect(
         &self,
-    ) -> Result<
+    ) -> super::Result<
         Box<
             dyn DbConnection<
                 bb8::PooledConnection<'static, PostgresConnectionManager<MakeTlsConnector>>,

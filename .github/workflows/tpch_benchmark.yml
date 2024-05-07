@@ -177,7 +177,7 @@ jobs:
       - name: Install PostgreSQL
         uses: ./.github/actions/install-postgres
         with:
-          os: ${{ matrix.target.target_os }}
+          os: ${{ matrix.target_os }}
           pg-db: tpch
 
       - name: Generate TPC-H Benchmark data
