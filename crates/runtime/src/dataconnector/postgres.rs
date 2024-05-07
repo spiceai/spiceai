@@ -43,12 +43,6 @@ pub enum Error {
     UnableToGetReadWriteProvider {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
-
-    #[snafu(display("Cannot connect to PostgreSQL data connector. Authentication failed. Ensure that the username and password are correctly configured in the spicepod."))]
-    UnableToConnectInvalidAuth {},
-
-    #[snafu(display("Cannot connect to PostgreSQL data connector on {host}:{port}. Ensure that the host and port are correclty configured in the spicepod, and that the host is reachable."))]
-    UnableToConnectInvalidHostOrPort { host: String, port: u16 },
 }
 
 pub struct Postgres {
@@ -67,19 +61,21 @@ impl DataConnectorFactory for Postgres {
                     Ok(Arc::new(Self { postgres_factory }) as Arc<dyn DataConnector>)
                 }
                 Err(e) => match e {
-                    postgrespool::Error::InvalidUsernameOrPassword { .. } => {
-                        Err(DataConnectorError::UnableToConnectInvalidAuth {
-                            source: Box::new(Error::UnableToConnectInvalidAuth {}),
+                    postgrespool::Error::InvalidUsernameOrPassword { .. } => Err(
+                        DataConnectorError::UnableToConnectInvalidUsernameOrPassword {
+                            dataconnector: "postgres".to_string(),
                         }
-                        .into())
-                    }
+                        .into(),
+                    ),
 
                     postgrespool::Error::InvalidHostOrPortError {
                         host,
                         port,
                         source: _,
-                    } => Err(DataConnectorError::UnableToConnectInvalidConfiguration {
-                        source: Box::new(Error::UnableToConnectInvalidHostOrPort { host, port }),
+                    } => Err(DataConnectorError::UnableToConnectInvalidHostOrPort {
+                        dataconnector: "postgres".to_string(),
+                        host,
+                        port,
                     }
                     .into()),
 

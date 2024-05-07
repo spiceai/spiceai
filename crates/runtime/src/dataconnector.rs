@@ -95,26 +95,21 @@ pub enum Error {
 
 #[derive(Debug, Snafu)]
 pub enum DataConnectorError {
-    #[snafu(display("{source}"))]
-    UnableToConnectInvalidConfiguration {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    #[snafu(display("{source}"))]
-    UnableToConnectSourceNotFound {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    #[snafu(display("{source}"))]
-    UnableToConnectInvalidAuth {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
     #[snafu(display("Cannot connect to {dataconnector} data connector. {source}"))]
     UnableToConnectInternal {
         dataconnector: String,
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[snafu(display("Cannot connect to {dataconnector} data connector on {host}:{port}. Ensure that the host and port are correclty configured in the spicepod, and that the host is reachable."))]
+    UnableToConnectInvalidHostOrPort {
+        dataconnector: String,
+        host: String,
+        port: u16,
+    },
+
+    #[snafu(display("Cannot connect to {dataconnector} data connector. Authentication failed. Ensure that the username and password are correctly configured in the spicepod."))]
+    UnableToConnectInvalidUsernameOrPassword { dataconnector: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
