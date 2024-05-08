@@ -55,7 +55,9 @@ impl SpiceObjectStoreRegistry {
         }
 
         Err(DataFusionError::Execution(format!(
-            "No object store available for: {url}"
+            "No object store available for: {:?}/{}",
+            url.host_str(),
+            url.path(),
         )))
     }
 }
