@@ -557,10 +557,9 @@ pub(crate) mod models {
         Extension,
     };
     use csv::Writer;
+    use models::model::Model;
     use serde::{Deserialize, Serialize};
     use tokio::sync::RwLock;
-
-    use crate::model::Model;
 
     use super::Format;
 
@@ -625,9 +624,8 @@ pub(crate) mod models {
 }
 
 pub(crate) mod inference {
-    use crate::datafusion::DataFusion;
-    use crate::model::version as model_version;
-    use crate::model::Model;
+    use crate::{datafusion::DataFusion, model::run};
+    
     use app::App;
     use arrow::array::Float32Array;
     use axum::{
@@ -636,6 +634,7 @@ pub(crate) mod inference {
         response::{IntoResponse, Response},
         Extension, Json,
     };
+    use models::{model::Model, modelsource};
     use serde::{Deserialize, Serialize};
     use std::time::Instant;
     use std::{collections::HashMap, sync::Arc};
@@ -781,13 +780,13 @@ pub(crate) mod inference {
                 status: PredictStatus::BadRequest,
                 error_message: Some(format!("Model {model_name} not found")),
                 model_name,
-                model_version: Some(model_version(&model.from)),
+                model_version: Some(modelsource::version(&model.from)),
                 prediction: None,
                 duration_ms: start_time.elapsed().as_millis(),
             };
         };
 
-        match runnable.run(Arc::clone(&df)).await {
+        match run(runnable, Arc::clone(&df)).await {
             Ok(inference_result) => {
                 if let Some(column_data) = inference_result.column_by_name("y") {
                     if let Some(array) = column_data.as_any().downcast_ref::<Float32Array>() {
@@ -796,7 +795,7 @@ pub(crate) mod inference {
                             status: PredictStatus::Success,
                             error_message: None,
                             model_name,
-                            model_version: Some(model_version(&model.from)),
+                            model_version: Some(modelsource::version(&model.from)),
                             prediction: Some(result),
                             duration_ms: start_time.elapsed().as_millis(),
                         };
@@ -811,7 +810,7 @@ pub(crate) mod inference {
                             "Unable to cast inference result to Float32Array".to_string(),
                         ),
                         model_name,
-                        model_version: Some(model_version(&model.from)),
+                        model_version: Some(modelsource::version(&model.from)),
                         prediction: None,
                         duration_ms: start_time.elapsed().as_millis(),
                     };
@@ -825,7 +824,7 @@ pub(crate) mod inference {
                         "Unable to find column 'y' in inference result".to_string(),
                     ),
                     model_name,
-                    model_version: Some(model_version(&model.from)),
+                    model_version: Some(modelsource::version(&model.from)),
                     prediction: None,
                     duration_ms: start_time.elapsed().as_millis(),
                 }
@@ -836,7 +835,7 @@ pub(crate) mod inference {
                     status: PredictStatus::InternalError,
                     error_message: Some(e.to_string()),
                     model_name,
-                    model_version: Some(model_version(&model.from)),
+                    model_version: Some(modelsource::version(&model.from)),
                     prediction: None,
                     duration_ms: start_time.elapsed().as_millis(),
                 }

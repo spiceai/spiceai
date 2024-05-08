@@ -1,11 +1,12 @@
 OPT_LEVEL = --release
+SPICED_FEATURES := --features $(SPICED_NON_DEFAULT_FEATURES)
 
 ifdef REL_VERSION
-	SPICED_FEATURES := --features release
+	SPICED_FEATURES := --features release $(SPICED_NON_DEFAULT_FEATURES)
 endif
 
 ifdef DEV
-	SPICED_FEATURES := --features dev
+	SPICED_FEATURES := --features dev $(SPICED_NON_DEFAULT_FEATURES)
 	OPT_LEVEL = --profile dev
 endif
 

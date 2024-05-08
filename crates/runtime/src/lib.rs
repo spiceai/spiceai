@@ -28,7 +28,7 @@ use ::datafusion::sql::sqlparser::{self, ast};
 use accelerated_table::AcceleratedTable;
 use app::App;
 use config::Config;
-use model::Model;
+use models::{model::Model, modelsource::source as model_source};
 pub use notify::Error as NotifyError;
 use secrets::{spicepod_secret_store_type, Secret};
 use snafu::prelude::*;
@@ -51,9 +51,6 @@ pub mod execution_plan;
 mod flight;
 mod http;
 pub mod model;
-pub mod modelformat;
-pub mod modelruntime;
-pub mod modelsource;
 mod opentelemetry;
 pub mod podswatcher;
 pub mod status;
@@ -578,17 +575,17 @@ impl Runtime {
 
     // Caller must set `status::update_model(...` before calling `load_model`. This function will set error/ready statues appropriately.`
     pub async fn load_model(&self, m: &SpicepodModel) {
-        measure_scope_ms!("load_model", "model" => m.name, "source" => model::source(&m.from));
+        measure_scope_ms!("load_model", "model" => m.name, "source" => model_source(&m.from));
         tracing::info!("Loading model [{}] from {}...", m.name, m.from);
         let mut model_map = self.models.write().await;
 
         let model = m.clone();
-        let source = model::source(&model.from);
-
+        let source = model_source(model.from.as_str());
+        
         let shared_secrets_provider = Arc::clone(&self.secrets_provider);
         let secrets_provider = shared_secrets_provider.read().await;
 
-        let secret = match secrets_provider.get_secret(source.as_str()).await {
+        let secret = match secrets_provider.get_secret(source.to_string().as_str()).await {
             Ok(s) => s,
             Err(e) => {
                 metrics::counter!("models_load_error").increment(1);
@@ -606,7 +603,7 @@ impl Runtime {
             Ok(in_m) => {
                 model_map.insert(m.name.clone(), in_m);
                 tracing::info!("Model [{}] deployed, ready for inferencing", m.name);
-                metrics::gauge!("models_count", "model" => m.name.clone(), "source" => model::source(&m.from)).increment(1.0);
+                metrics::gauge!("models_count", "model" => m.name.clone(), "source" => model_source(&m.from).to_string()).increment(1.0);
                 status::update_model(&model.name, status::ComponentStatus::Ready);
             }
             Err(e) => {
@@ -632,7 +629,7 @@ impl Runtime {
         }
         model_map.remove(&m.name);
         tracing::info!("Model [{}] has been unloaded", m.name);
-        metrics::gauge!("models_count", "model" => m.name.clone(), "source" => model::source(&m.from)).decrement(1.0);
+        metrics::gauge!("models_count", "model" => m.name.clone(), "source" => model_source(&m.from).to_string()).decrement(1.0);
     }
 
     pub async fn update_model(&self, m: &SpicepodModel) {

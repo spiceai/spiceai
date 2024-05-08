@@ -17,13 +17,15 @@ limitations under the License.
 use std::{collections::HashMap, fmt::Debug, net::SocketAddr, sync::Arc};
 
 use app::App;
+use models::model::Model;
 use snafu::prelude::*;
 use tokio::{
     net::{TcpListener, ToSocketAddrs},
     sync::RwLock,
 };
 
-use crate::{config, datafusion::DataFusion, model::Model};
+use crate::{config, datafusion::DataFusion};
+
 
 mod routes;
 mod v1;
