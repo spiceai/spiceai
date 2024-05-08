@@ -157,8 +157,7 @@ impl DataFusion {
             .with_create_default_catalog_and_schema(false);
         df_config.options_mut().sql_parser.dialect = "PostgreSQL".to_string();
 
-        let runtime = default_runtime_env();
-        let ctx = SessionContext::new_with_config_rt(df_config, runtime);
+        let ctx = SessionContext::new_with_config_rt(df_config, default_runtime_env());
 
         let catalog = MemoryCatalogProvider::new();
         let schema = SpiceSchemaProvider::new();

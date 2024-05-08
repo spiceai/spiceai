@@ -389,8 +389,8 @@ impl AcceleratedTable {
         refresh: Refresh,
         acceleration_refresh_mode: AccelerationRefreshMode,
     ) -> BoxStream<'a, Result<DataUpdate>> {
-        let runtime = default_runtime_env();
-        let mut ctx = SessionContext::new_with_config_rt(SessionConfig::new(), runtime);
+        let mut ctx =
+            SessionContext::new_with_config_rt(SessionConfig::new(), default_runtime_env());
         if let Err(e) = ctx.register_table(
             OwnedTableReference::bare(dataset_name.clone()),
             Arc::clone(&federated),

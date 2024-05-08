@@ -144,8 +144,7 @@ impl DataConnector for S3 {
     }
 
     async fn read_provider(&self, dataset: &Dataset) -> AnyErrorResult<Arc<dyn TableProvider>> {
-        let runtime = default_runtime_env();
-        let ctx = SessionContext::new_with_config_rt(SessionConfig::new(), runtime);
+        let ctx = SessionContext::new_with_config_rt(SessionConfig::new(), default_runtime_env());
 
         let url = self
             .get_object_store_url(dataset)
