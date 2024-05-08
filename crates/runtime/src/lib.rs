@@ -548,7 +548,7 @@ impl Runtime {
                 name: accelerator_engine,
             })?;
 
-        return Runtime::register_table(
+        Runtime::register_table(
             df,
             ds,
             datafusion::Table::Accelerated {
@@ -558,7 +558,7 @@ impl Runtime {
             },
             source,
         )
-        .await;
+        .await
     }
 
     async fn register_table(
