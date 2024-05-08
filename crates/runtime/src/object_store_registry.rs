@@ -22,8 +22,7 @@ impl SpiceObjectStoreRegistry {
         SpiceObjectStoreRegistry::default()
     }
 
-    #[allow(clippy::unused_self)]
-    fn get_feature_store(&self, url: &Url) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
+    fn get_feature_store(url: &Url) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
         {
             if url.as_str().starts_with("s3://") {
                 if let Some(bucket_name) = url.host_str() {
@@ -73,7 +72,7 @@ impl ObjectStoreRegistry for SpiceObjectStoreRegistry {
 
     fn get_store(&self, url: &Url) -> datafusion::error::Result<Arc<dyn ObjectStore>> {
         self.inner.get_store(url).or_else(|_| {
-            let store = self.get_feature_store(url)?;
+            let store = Self::get_feature_store(url)?;
             self.inner.register_store(url, Arc::clone(&store));
 
             Ok(store)

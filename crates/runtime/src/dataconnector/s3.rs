@@ -100,23 +100,23 @@ impl DataConnectorFactory for S3 {
 impl S3 {
     fn get_object_store_url(&self, dataset: &Dataset) -> AnyErrorResult<Url> {
         let mut fragments = vec![];
-        let mut query = form_urlencoded::Serializer::new(String::new());
+        let mut fragment_builder = form_urlencoded::Serializer::new(String::new());
 
         if let Some(region) = self.params.get("region") {
-            query.append_pair("region", region);
+            fragment_builder.append_pair("region", region);
         }
         if let Some(endpoint) = self.params.get("endpoint") {
-            query.append_pair("endpoint", endpoint);
+            fragment_builder.append_pair("endpoint", endpoint);
         }
         if let Some(secret) = &self.secret {
             if let Some(key) = secret.get("key") {
-                query.append_pair("key", key);
+                fragment_builder.append_pair("key", key);
             };
             if let Some(secret) = secret.get("secret") {
-                query.append_pair("secret", secret);
+                fragment_builder.append_pair("secret", secret);
             };
         }
-        fragments.push(query.finish());
+        fragments.push(fragment_builder.finish());
 
         let mut s3_url =
             Url::parse(&dataset.from).context(UnableToParseURLSnafu { url: &dataset.from })?;
