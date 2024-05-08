@@ -74,5 +74,5 @@ jobs:
 
       - name: Image digest
         run: |
-          echo ${{ steps.docker_build.outputs.digest }}
-          echo ${{ steps.docker_build_odbc.outputs.digest }}
+          echo ${{ steps.docker_build_slim.outputs.digest }}
+          echo ${{ steps.docker_build_full.outputs.digest }}
