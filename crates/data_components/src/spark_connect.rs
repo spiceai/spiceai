@@ -25,6 +25,7 @@ use datafusion::{
 };
 use futures::Stream;
 use spark_connect_rs::{
+    functions::col,
     spark::{data_type, DataType},
     DataFrame, SparkSession, SparkSessionBuilder,
 };
@@ -334,21 +335,22 @@ impl ExecutionPlan for SparkConnectExecutionPlan {
         _partition: usize,
         _context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-        let columns = self
+        let filtered_columns = self
             .projected_schema
             .fields()
             .iter()
-            .map(|f| format!("\"{}\"", f.name()))
+            .map(|f| col(f.name()))
             .collect::<Vec<_>>();
         tracing::trace!("projected_schema {:#?}", self.projected_schema);
-        tracing::trace!("sql columns {:#?}", columns);
+        tracing::trace!("sql columns {:#?}", filtered_columns);
         tracing::trace!("filters {:#?}", self.filters);
         let df = self
             .filters
             .iter()
             .fold(self.dataframe.clone(), |df, filter| {
                 df.filter(filter.as_str())
-            });
+            })
+            .select(filtered_columns);
         let df = match self.limit {
             Some(limit) => df.limit(limit),
             None => df,
