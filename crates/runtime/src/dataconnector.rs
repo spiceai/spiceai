@@ -22,7 +22,6 @@ use datafusion::datasource::{DefaultTableSource, TableProvider};
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::{Expr, LogicalPlanBuilder};
 use lazy_static::lazy_static;
-use object_store::ObjectStore;
 use snafu::prelude::*;
 use spicepod::component::dataset::Dataset;
 use std::any::Any;
@@ -30,7 +29,6 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use url::Url;
 
 use secrets::Secret;
 use std::future::Future;
@@ -215,13 +213,6 @@ pub trait DataConnector: Send + Sync {
         &self,
         _dataset: &Dataset,
     ) -> Option<AnyErrorResult<Arc<dyn TableProvider>>> {
-        None
-    }
-
-    fn get_object_store(
-        &self,
-        _dataset: &Dataset,
-    ) -> Option<AnyErrorResult<(Url, Arc<dyn ObjectStore + 'static>)>> {
         None
     }
 }
