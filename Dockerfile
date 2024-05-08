@@ -28,9 +28,17 @@ RUN \
 
 FROM debian:bookworm-slim
 
+ARG CARGO_FEATURES
+
 RUN apt update \
-    && apt install --yes ca-certificates libssl3 unixodbc --no-install-recommends \
+    && apt install --yes ca-certificates libssl3 --no-install-recommends \
     && rm -rf /var/lib/{apt,dpkg,cache,log}
+
+RUN if echo "$CARGO_FEATURES" | grep -q "odbc"; then \
+    apt update \
+    && apt install --yes unixodbc --no-install-recommends \
+    && rm -rf /var/lib/{apt,dpkg,cache,log}; \
+fi
 
 COPY --from=build /root/spiced /usr/local/bin/spiced
 
