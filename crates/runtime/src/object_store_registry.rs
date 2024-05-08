@@ -8,7 +8,7 @@ use datafusion::{
     },
 };
 use object_store::{aws::AmazonS3Builder, ObjectStore};
-use url::Url;
+use url::{form_urlencoded::parse, Url};
 
 #[allow(clippy::module_name_repetitions)]
 #[derive(Debug, Default)]
@@ -31,7 +31,10 @@ impl SpiceObjectStoreRegistry {
                         .with_bucket_name(bucket_name)
                         .with_allow_http(true);
 
-                    let params: HashMap<_, _> = url.query_pairs().into_owned().collect();
+                    let params: HashMap<String, String> =
+                        parse(url.fragment().unwrap_or_default().as_bytes())
+                            .into_owned()
+                            .collect();
 
                     if let Some(region) = params.get("region") {
                         s3_builder = s3_builder.with_region(region);

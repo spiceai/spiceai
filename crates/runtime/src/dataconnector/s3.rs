@@ -33,7 +33,7 @@ use std::any::Any;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::{collections::HashMap, future::Future};
-use url::Url;
+use url::{form_urlencoded, Url};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -100,33 +100,38 @@ impl DataConnectorFactory for S3 {
 impl S3 {
     fn get_object_store_url(&self, dataset: &Dataset) -> AnyErrorResult<Url> {
         let url = dataset.from.clone();
-        let mut params: HashMap<String, String> = HashMap::new();
+        let mut fragments = vec![];
+
+        let mut query = form_urlencoded::Serializer::new(String::new());
 
         if let Some(region) = self.params.get("region") {
-            let _ = params.insert("region".into(), region.into());
+            query.append_pair("region", region);
         }
         if let Some(endpoint) = self.params.get("endpoint") {
-            let _ = params.insert("endpoint".into(), endpoint.into());
+            query.append_pair("endpoint", endpoint);
         }
         if let Some(secret) = &self.secret {
             if let Some(key) = secret.get("key") {
-                let _ = params.insert("key".into(), key.into());
+                query.append_pair("key", key);
             };
             if let Some(secret) = secret.get("secret") {
-                let _ = params.insert("secret".into(), secret.into());
+                query.append_pair("secret", secret);
             };
         }
+        fragments.push(query.finish());
 
-        let mut s3_url = Url::parse_with_params(&url, params.clone())
-            .context(UnableToParseURLSnafu { url: url.clone() })?;
+        let mut s3_url = Url::parse(&url).context(UnableToParseURLSnafu { url: url.clone() })?;
 
         // infer_schema has a bug using is_collection which is determined by if url contains suffix of /
         // using a fragment with / suffix to trick df to think this is still a collection
         // will need to raise an issue with DF to use url without query and fragment to decide if
         // is_collection
+        // PR: https://github.com/apache/datafusion/pull/10419/files
         if url.ends_with('/') {
-            s3_url.set_fragment(Some("dfiscollectionbugworkaround=hack/"));
+            fragments.push("dfiscollectionbugworkaround=hack/".into());
         }
+
+        s3_url.set_fragment(Some(&fragments.join("&")));
 
         Ok(s3_url)
     }
