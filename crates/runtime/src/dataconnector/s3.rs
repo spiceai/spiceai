@@ -99,9 +99,7 @@ impl DataConnectorFactory for S3 {
 
 impl S3 {
     fn get_object_store_url(&self, dataset: &Dataset) -> AnyErrorResult<Url> {
-        let url = dataset.from.clone();
         let mut fragments = vec![];
-
         let mut query = form_urlencoded::Serializer::new(String::new());
 
         if let Some(region) = self.params.get("region") {
@@ -120,14 +118,15 @@ impl S3 {
         }
         fragments.push(query.finish());
 
-        let mut s3_url = Url::parse(&url).context(UnableToParseURLSnafu { url: url.clone() })?;
+        let mut s3_url =
+            Url::parse(&dataset.from).context(UnableToParseURLSnafu { url: &dataset.from })?;
 
         // infer_schema has a bug using is_collection which is determined by if url contains suffix of /
         // using a fragment with / suffix to trick df to think this is still a collection
         // will need to raise an issue with DF to use url without query and fragment to decide if
         // is_collection
         // PR: https://github.com/apache/datafusion/pull/10419/files
-        if url.ends_with('/') {
+        if dataset.from.clone().ends_with('/') {
             fragments.push("dfiscollectionbugworkaround=hack/".into());
         }
 
