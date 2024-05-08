@@ -581,11 +581,14 @@ impl Runtime {
 
         let model = m.clone();
         let source = model_source(model.from.as_str());
-        
+
         let shared_secrets_provider = Arc::clone(&self.secrets_provider);
         let secrets_provider = shared_secrets_provider.read().await;
 
-        let secret = match secrets_provider.get_secret(source.to_string().as_str()).await {
+        let secret = match secrets_provider
+            .get_secret(source.to_string().as_str())
+            .await
+        {
             Ok(s) => s,
             Err(e) => {
                 metrics::counter!("models_load_error").increment(1);

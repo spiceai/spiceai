@@ -26,7 +26,6 @@ use tokio::{
 
 use crate::{config, datafusion::DataFusion};
 
-
 mod routes;
 mod v1;
 

@@ -15,8 +15,8 @@ limitations under the License.
 */
 
 use crate::{config, datafusion::DataFusion};
-use models::model::Model;
 use app::App;
+use models::model::Model;
 use std::net::SocketAddr;
 use std::{collections::HashMap, sync::Arc};
 
@@ -53,8 +53,9 @@ pub(crate) fn routes(
         .layer(Extension(with_metrics))
         .layer(Extension(config));
 
-    if cfg!(feature="models") {
-        router = router.route("/v1/models", get(v1::models::get))
+    if cfg!(feature = "models") {
+        router = router
+            .route("/v1/models", get(v1::models::get))
             .route("/v1/models/:name/predict", get(v1::inference::get))
             .route("/v1/predict", post(v1::inference::post))
             .layer(Extension(models));

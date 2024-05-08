@@ -625,7 +625,7 @@ pub(crate) mod models {
 
 pub(crate) mod inference {
     use crate::{datafusion::DataFusion, model::run};
-    
+
     use app::App;
     use arrow::array::Float32Array;
     use axum::{

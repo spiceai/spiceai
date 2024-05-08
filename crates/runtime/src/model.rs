@@ -14,15 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use models::model::Model;
 use arrow::record_batch::RecordBatch;
+use models::model::Model;
 use std::result::Result;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::DataFusion;
 
-pub async fn run(m: &Model, df: Arc<RwLock<DataFusion>>) -> Result<RecordBatch, models::model::Error> {
+pub async fn run(
+    m: &Model,
+    df: Arc<RwLock<DataFusion>>,
+) -> Result<RecordBatch, models::model::Error> {
     match df
         .read()
         .await
@@ -32,19 +35,17 @@ pub async fn run(m: &Model, df: Arc<RwLock<DataFusion>>) -> Result<RecordBatch, 
                 "select * from datafusion.public.{} order by ts asc",
                 m.model.datasets[0]
             )),
-        ).await {
-            Ok(data) => {
-                match data.collect().await {
-                    Ok(d) => {
-                        m.run(d).await
-                    },
-                    Err(e) => {
-                        return Err(models::model::Error::UnableToRunModel { source: Box::new(e) });
-                    }
-                }
-            },
-            Err(e) => {
-                Err(models::model::Error::UnableToRunModel { source: Box::new(e) })
-            }
-        }
+        )
+        .await
+    {
+        Ok(data) => match data.collect().await {
+            Ok(d) => m.run(d),
+            Err(e) => Err(models::model::Error::UnableToRunModel {
+                source: Box::new(e),
+            }),
+        },
+        Err(e) => Err(models::model::Error::UnableToRunModel {
+            source: Box::new(e),
+        }),
+    }
 }
