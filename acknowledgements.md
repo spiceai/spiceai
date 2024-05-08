@@ -82,6 +82,9 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - axum 0.7.5, MIT 
   <br/>https://github.com/tokio-rs/axum
 
+- base64 0.13.1, Apache-2.0 OR MIT 
+  <br/>https://github.com/marshallpierce/rust-base64
+
 - base64 0.21.7, Apache-2.0 OR MIT 
   <br/>https://github.com/marshallpierce/rust-base64
 
@@ -187,8 +190,14 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - parquet 51.0.0, Apache-2.0 
   <br/>https://github.com/apache/arrow-rs
 
+- pem 1.1.1, MIT 
+  <br/>https://github.com/jcreekmore/pem-rs.git
+
 - pem 3.0.4, MIT 
   <br/>https://github.com/jcreekmore/pem-rs.git
+
+- pgtemp 0.3.0, MIT 
+  <br/>https://github.com/boustrophedon/pgtemp
 
 - pin-project 1.1.5, Apache-2.0 OR MIT 
   <br/>https://github.com/taiki-e/pin-project
@@ -209,6 +218,9 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
   <br/>https://github.com/rust-lang/regex
 
 - reqwest 0.11.27, Apache-2.0 OR MIT 
+  <br/>https://github.com/seanmonstar/reqwest
+
+- reqwest 0.12.4, Apache-2.0 OR MIT 
   <br/>https://github.com/seanmonstar/reqwest
 
 - rusqlite 0.31.0, MIT 
@@ -249,6 +261,9 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 
 - snafu 0.8.2, Apache-2.0 OR MIT 
   <br/>https://github.com/shepmaster/snafu
+
+- snowflake-api 0.8.0, Apache-2.0 
+  <br/>https://github.com/mycelial/snowflake-rs
 
 - spark-connect-rs 0.0.1-beta.3, Apache-2.0 
   <br/>https://github.com/sjrusso8/spark-connect-rs
