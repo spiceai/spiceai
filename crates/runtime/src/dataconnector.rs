@@ -108,6 +108,18 @@ pub enum DataConnectorError {
 
     #[snafu(display("Cannot connect to {dataconnector}. Authentication failed. Ensure that the username and password are correctly configured in the spicepod."))]
     UnableToConnectInvalidUsernameOrPassword { dataconnector: String },
+
+    #[snafu(display("Unable to get read provider for {dataconnector}: {source}"))]
+    UnableToGetReadProvider {
+        dataconnector: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("Unable to get read write provider for {dataconnector}: {source}"))]
+    UnableToGetReadWriteProvider {
+        dataconnector: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

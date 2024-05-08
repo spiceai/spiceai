@@ -50,16 +50,6 @@ pub enum Error {
     UnableToConstructSparkConnect {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
-
-    #[snafu(display("{source}"))]
-    UnableToGetReadProvider {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    #[snafu(display("{source}"))]
-    UnableToGetReadWriteProvider {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -119,7 +109,9 @@ impl DataConnector for Spark {
             .read_provider
             .table_provider(table_reference)
             .await
-            .context(UnableToGetReadProviderSnafu)?)
+            .context(super::UnableToGetReadProviderSnafu {
+                dataconnector: "spark",
+            })?)
     }
 
     async fn read_write_provider(
@@ -131,7 +123,9 @@ impl DataConnector for Spark {
             .read_write_provider
             .table_provider(table_reference)
             .await
-            .context(UnableToGetReadWriteProviderSnafu)
+            .context(super::UnableToGetReadWriteProviderSnafu {
+                dataconnector: "spark",
+            })
             .boxed();
         match read_write_result {
             Ok(provider) => Some(Ok(provider)),

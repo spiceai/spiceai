@@ -35,11 +35,6 @@ use super::{DataConnector, DataConnectorFactory};
 pub enum Error {
     #[snafu(display("Unable to create Clickhouse connection pool: {source}"))]
     UnableToCreateClickhouseConnectionPool { source: db_connection_pool::Error },
-
-    #[snafu(display("{source}"))]
-    UnableToGetReadProvider {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -81,7 +76,9 @@ impl DataConnector for Clickhouse {
         Ok(
             Read::table_provider(&self.clickhouse_factory, dataset.path().into())
                 .await
-                .context(UnableToGetReadProviderSnafu)?,
+                .context(super::UnableToGetReadProviderSnafu {
+                    dataconnector: "clickhouse",
+                })?,
         )
     }
 }

@@ -34,11 +34,6 @@ use super::{DataConnector, DataConnectorFactory};
 pub enum Error {
     #[snafu(display("Unable to create ODBC connection pool: {source}"))]
     UnableToCreateODBCConnectionPool { source: db_connection_pool::Error },
-
-    #[snafu(display("{source}"))]
-    UnableToGetReadProvider {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -86,7 +81,9 @@ where
         Ok(
             Read::table_provider(&self.odbc_factory, dataset.path().into())
                 .await
-                .context(UnableToGetReadProviderSnafu)?,
+                .context(super::UnableToGetReadProviderSnafu {
+                    dataconnector: "odbc",
+                })?,
         )
     }
 }

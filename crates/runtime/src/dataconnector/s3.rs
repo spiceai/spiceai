@@ -50,16 +50,6 @@ pub enum Error {
     },
 
     #[snafu(display("{source}"))]
-    UnableToGetReadProvider {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    #[snafu(display("{source}"))]
-    UnableToGetReadWriteProvider {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    #[snafu(display("{source}"))]
     UnableToBuildObjectStore {
         source: object_store::Error,
     },
@@ -145,9 +135,11 @@ impl DataConnector for S3 {
     async fn read_provider(&self, dataset: &Dataset) -> AnyErrorResult<Arc<dyn TableProvider>> {
         let ctx = SessionContext::new_with_config_rt(SessionConfig::new(), default_runtime_env());
 
-        let url = self
-            .get_object_store_url(dataset)
-            .context(UnableToGetReadProviderSnafu)?;
+        let url =
+            self.get_object_store_url(dataset)
+                .context(super::UnableToGetReadProviderSnafu {
+                    dataconnector: "s3",
+                })?;
 
         let table_path = ListingTableUrl::parse(url)?;
         let options =

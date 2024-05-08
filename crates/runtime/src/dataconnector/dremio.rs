@@ -47,16 +47,6 @@ pub enum Error {
 
     #[snafu(display("Unable to create flight client: {source}"))]
     UnableToCreateFlightClient { source: flight_client::Error },
-
-    #[snafu(display("{source}"))]
-    UnableToGetReadProvider {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    #[snafu(display("{source}"))]
-    UnableToGetReadWriteProvider {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -111,7 +101,9 @@ impl DataConnector for Dremio {
         Ok(
             Read::table_provider(&self.flight_factory, dataset.path().into())
                 .await
-                .context(UnableToGetReadProviderSnafu)?,
+                .context(super::UnableToGetReadProviderSnafu {
+                    dataconnector: "dremio",
+                })?,
         )
     }
 
@@ -122,7 +114,9 @@ impl DataConnector for Dremio {
         let read_write_result =
             ReadWrite::table_provider(&self.flight_factory, dataset.path().into())
                 .await
-                .context(UnableToGetReadWriteProviderSnafu)
+                .context(super::UnableToGetReadWriteProviderSnafu {
+                    dataconnector: "dremio",
+                })
                 .boxed();
         match read_write_result {
             Ok(provider) => Some(Ok(provider)),

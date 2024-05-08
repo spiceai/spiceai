@@ -35,11 +35,6 @@ use std::{collections::HashMap, future::Future};
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("{source}"))]
-    UnableToGetReadProvider {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    #[snafu(display("{source}"))]
     UnableToCreateSnowflakeConnectionPool { source: db_connection_pool::Error },
 }
 
@@ -83,7 +78,9 @@ impl DataConnector for Snowflake {
         Ok(
             Read::table_provider(&self.table_factory, dataset.path().into())
                 .await
-                .context(UnableToGetReadProviderSnafu)?,
+                .context(super::UnableToGetReadProviderSnafu {
+                    dataconnector: "snowflake",
+                })?,
         )
     }
 }

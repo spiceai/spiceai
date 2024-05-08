@@ -35,16 +35,6 @@ pub enum Error {
     #[snafu(display("Unable to create DuckDB connection pool: {source}"))]
     UnableToCreateDuckDBConnectionPool { source: db_connection_pool::Error },
 
-    #[snafu(display("{source}"))]
-    UnableToGetReadProvider {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    #[snafu(display("{source}"))]
-    UnableToGetReadWriteProvider {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
     #[snafu(display("Missing required parameter: open"))]
     MissingDuckDBFile {},
 
@@ -97,7 +87,9 @@ impl DataConnector for DuckDB {
         Ok(
             Read::table_provider(&self.duckdb_factory, dataset.path().into())
                 .await
-                .context(UnableToGetReadProviderSnafu)?,
+                .context(super::UnableToGetReadProviderSnafu {
+                    dataconnector: "duckdb",
+                })?,
         )
     }
 }
