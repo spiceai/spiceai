@@ -105,7 +105,7 @@ impl DataConnector for SpiceAI {
     async fn read_provider(
         &self,
         dataset: &Dataset,
-    ) -> super::AnyErrorResult<Arc<dyn TableProvider>> {
+    ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         Ok(Read::table_provider(
             &self.flight_factory,
             SpiceAI::spice_dataset_path(dataset).into(),
@@ -119,7 +119,7 @@ impl DataConnector for SpiceAI {
     async fn read_write_provider(
         &self,
         dataset: &Dataset,
-    ) -> Option<super::AnyErrorResult<Arc<dyn TableProvider>>> {
+    ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
         let read_write_result = ReadWrite::table_provider(
             &self.flight_factory,
             SpiceAI::spice_dataset_path(dataset).into(),
@@ -127,12 +127,9 @@ impl DataConnector for SpiceAI {
         .await
         .context(super::UnableToGetReadWriteProviderSnafu {
             dataconnector: "spiceai",
-        })
-        .boxed();
-        match read_write_result {
-            Ok(provider) => Some(Ok(provider)),
-            Err(e) => Some(Err(e)),
-        }
+        });
+
+        Some(read_write_result)
     }
 }
 

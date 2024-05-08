@@ -212,12 +212,13 @@ pub trait DataConnectorFactory {
 pub trait DataConnector: Send + Sync {
     fn as_any(&self) -> &dyn Any;
 
-    async fn read_provider(&self, dataset: &Dataset) -> AnyErrorResult<Arc<dyn TableProvider>>;
+    async fn read_provider(&self, dataset: &Dataset)
+        -> DataConnectorResult<Arc<dyn TableProvider>>;
 
     async fn read_write_provider(
         &self,
         _dataset: &Dataset,
-    ) -> Option<AnyErrorResult<Arc<dyn TableProvider>>> {
+    ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         None
     }
 

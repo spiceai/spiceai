@@ -83,7 +83,7 @@ impl DataConnector for DuckDB {
     async fn read_provider(
         &self,
         dataset: &Dataset,
-    ) -> super::AnyErrorResult<Arc<dyn TableProvider>> {
+    ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         Ok(
             Read::table_provider(&self.duckdb_factory, dataset.path().into())
                 .await

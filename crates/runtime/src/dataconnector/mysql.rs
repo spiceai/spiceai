@@ -75,7 +75,7 @@ impl DataConnector for MySQL {
     async fn read_provider(
         &self,
         dataset: &Dataset,
-    ) -> super::AnyErrorResult<Arc<dyn TableProvider>> {
+    ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         Ok(
             Read::table_provider(&self.mysql_factory, dataset.path().into())
                 .await

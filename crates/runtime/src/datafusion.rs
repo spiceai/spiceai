@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use crate::accelerated_table::{AcceleratedTable, Refresh, Retention};
 use crate::dataaccelerator::{self, create_accelerator_table};
-use crate::dataconnector::DataConnector;
+use crate::dataconnector::{DataConnector, DataConnectorError};
 use crate::dataupdate::{DataUpdate, DataUpdateExecutionPlan, UpdateType};
 use crate::get_dependent_table_names;
 use crate::object_store_registry::default_runtime_env;
@@ -78,9 +78,7 @@ pub enum Error {
     UnableToGetTable { source: DataFusionError },
 
     #[snafu(display("Unable to resolve table provider: {source}"))]
-    UnableToResolveTableProvider {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
+    UnableToResolveTableProvider { source: DataConnectorError },
 
     #[snafu(display("Table {table_name} was marked as read_write, but the underlying provider only supports reads."))]
     WriteProviderNotImplemented { table_name: String },

@@ -145,7 +145,7 @@ impl DataConnector for Databricks {
     async fn read_provider(
         &self,
         dataset: &Dataset,
-    ) -> super::AnyErrorResult<Arc<dyn TableProvider>> {
+    ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         let table_reference = OwnedTableReference::from(dataset.path());
         Ok(self
             .read_provider
@@ -159,7 +159,7 @@ impl DataConnector for Databricks {
     async fn read_write_provider(
         &self,
         dataset: &Dataset,
-    ) -> Option<super::AnyErrorResult<Arc<dyn TableProvider>>> {
+    ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
         let table_reference = OwnedTableReference::from(dataset.path());
         let read_write_result = self
             .read_write_provider
@@ -167,11 +167,8 @@ impl DataConnector for Databricks {
             .await
             .context(super::UnableToGetReadWriteProviderSnafu {
                 dataconnector: "databricks",
-            })
-            .boxed();
-        match read_write_result {
-            Ok(provider) => Some(Ok(provider)),
-            Err(e) => Some(Err(e)),
-        }
+            });
+
+        Some(read_write_result)
     }
 }

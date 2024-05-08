@@ -132,7 +132,10 @@ impl DataConnector for S3 {
         self
     }
 
-    async fn read_provider(&self, dataset: &Dataset) -> AnyErrorResult<Arc<dyn TableProvider>> {
+    async fn read_provider(
+        &self,
+        dataset: &Dataset,
+    ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         let ctx = SessionContext::new_with_config_rt(SessionConfig::new(), default_runtime_env());
 
         let url =
@@ -141,16 +144,41 @@ impl DataConnector for S3 {
                     dataconnector: "s3",
                 })?;
 
-        let table_path = ListingTableUrl::parse(url)?;
+        let table_path = match ListingTableUrl::parse(url) {
+            Ok(table_path) => table_path,
+            Err(e) => {
+                return Err(super::DataConnectorError::UnableToGetReadProvider {
+                    dataconnector: "s3".to_string(),
+                    source: Box::new(e),
+                });
+            }
+        };
+
         let options =
             ListingOptions::new(Arc::new(ParquetFormat::default())).with_file_extension(".parquet");
 
-        let resolved_schema = options.infer_schema(&ctx.state(), &table_path).await?;
+        let resolved_schema = match options.infer_schema(&ctx.state(), &table_path).await {
+            Ok(schema) => schema,
+            Err(e) => {
+                return Err(super::DataConnectorError::UnableToGetReadProvider {
+                    dataconnector: "s3".to_string(),
+                    source: Box::new(e),
+                });
+            }
+        };
 
         let config = ListingTableConfig::new(table_path)
             .with_listing_options(options)
             .with_schema(resolved_schema);
-        let table = ListingTable::try_new(config)?;
+        let table = match ListingTable::try_new(config) {
+            Ok(table) => table,
+            Err(e) => {
+                return Err(super::DataConnectorError::UnableToGetReadProvider {
+                    dataconnector: "s3".to_string(),
+                    source: Box::new(e),
+                });
+            }
+        };
 
         Ok(Arc::new(table))
     }
