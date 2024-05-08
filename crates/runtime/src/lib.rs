@@ -54,6 +54,7 @@ pub mod model;
 pub mod modelformat;
 pub mod modelruntime;
 pub mod modelsource;
+pub mod object_store_registry;
 mod opentelemetry;
 pub mod podswatcher;
 pub mod status;
