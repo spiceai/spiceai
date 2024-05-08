@@ -26,8 +26,6 @@ use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
 use datafusion::execution::config::SessionConfig;
 use datafusion::execution::context::SessionContext;
-use object_store::aws::AmazonS3Builder;
-use object_store::ObjectStore;
 use secrets::Secret;
 use snafu::prelude::*;
 use spicepod::component::dataset::Dataset;
@@ -100,49 +98,37 @@ impl DataConnectorFactory for S3 {
 }
 
 impl S3 {
-    // TODO: more work here -> still WIP
-    fn get_object_store(
-        &self,
-        dataset: &Dataset,
-    ) -> AnyErrorResult<(Url, Arc<dyn ObjectStore + 'static>)> {
-        let result: AnyErrorResult<(Url, Arc<dyn ObjectStore + 'static>)> = (|| {
-            let url = dataset.from.clone();
-            let parts = url.clone().replace("s3://", "");
+    fn get_object_store_url(&self, dataset: &Dataset) -> AnyErrorResult<Url> {
+        let url = dataset.from.clone();
+        let mut params: HashMap<String, String> = HashMap::new();
 
-            let bucket = parts
-                .split('/')
-                .next()
-                .ok_or_else(|| MissingForwardSlashSnafu { url: url.clone() }.build())?;
-
-            let mut s3_builder = AmazonS3Builder::new()
-                .with_bucket_name(bucket)
-                .with_allow_http(true);
-
-            if let Some(region) = self.params.get("region") {
-                s3_builder = s3_builder.with_region(region);
-            }
-            if let Some(endpoint) = self.params.get("endpoint") {
-                s3_builder = s3_builder.with_endpoint(endpoint);
-            }
-            if let Some(secret) = &self.secret {
-                if let Some(key) = secret.get("key") {
-                    s3_builder = s3_builder.with_access_key_id(key);
-                };
-                if let Some(secret) = secret.get("secret") {
-                    s3_builder = s3_builder.with_secret_access_key(secret);
-                };
-            } else {
-                s3_builder = s3_builder.with_skip_signature(true);
+        if let Some(region) = self.params.get("region") {
+            let _ = params.insert("region".into(), region.into());
+        }
+        if let Some(endpoint) = self.params.get("endpoint") {
+            let _ = params.insert("endpoint".into(), endpoint.into());
+        }
+        if let Some(secret) = &self.secret {
+            if let Some(key) = secret.get("key") {
+                let _ = params.insert("key".into(), key.into());
             };
+            if let Some(secret) = secret.get("secret") {
+                let _ = params.insert("secret".into(), secret.into());
+            };
+        }
 
-            let s3 = s3_builder.build().context(UnableToBuildObjectStoreSnafu)?;
+        let mut s3_url = Url::parse_with_params(&url, params.clone())
+            .context(UnableToParseURLSnafu { url: url.clone() })?;
 
-            let s3_url = Url::parse(&url).context(UnableToParseURLSnafu { url: url.clone() })?;
+        // infer_schema has a bug using is_collection which is determined by if url contains suffix of /
+        // using a fragment with / suffix to trick df to think this is still a collection
+        // will need to raise an issue with DF to use url without query and fragment to decide if
+        // is_collection
+        if url.ends_with('/') {
+            s3_url.set_fragment(Some("dfiscollectionbugworkaround=hack/"));
+        }
 
-            Ok((s3_url, Arc::new(s3) as Arc<dyn ObjectStore>))
-        })();
-
-        result
+        Ok(s3_url)
     }
 }
 
@@ -152,15 +138,12 @@ impl DataConnector for S3 {
         self
     }
 
-    async fn read_provider(
-        &self,
-        dataset: &Dataset,
-    ) -> super::AnyErrorResult<Arc<dyn TableProvider>> {
+    async fn read_provider(&self, dataset: &Dataset) -> AnyErrorResult<Arc<dyn TableProvider>> {
         let runtime = default_runtime_env();
         let ctx = SessionContext::new_with_config_rt(SessionConfig::new(), runtime);
 
-        let (url, _) = self
-            .get_object_store(dataset)
+        let url = self
+            .get_object_store_url(dataset)
             .context(UnableToGetReadProviderSnafu)?;
 
         let table_path = ListingTableUrl::parse(url)?;
@@ -168,6 +151,7 @@ impl DataConnector for S3 {
             ListingOptions::new(Arc::new(ParquetFormat::default())).with_file_extension(".parquet");
 
         let resolved_schema = options.infer_schema(&ctx.state(), &table_path).await?;
+
         let config = ListingTableConfig::new(table_path)
             .with_listing_options(options)
             .with_schema(resolved_schema);

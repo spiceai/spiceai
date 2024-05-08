@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use datafusion::{
     error::DataFusionError,
@@ -27,13 +27,26 @@ impl SpiceObjectStoreRegistry {
         {
             if url.as_str().starts_with("s3://") {
                 if let Some(bucket_name) = url.host_str() {
-                    let store = Arc::new(
-                        AmazonS3Builder::from_env()
-                            .with_bucket_name(bucket_name)
-                            .with_skip_signature(true)
-                            .build()?,
-                    );
-                    return Ok(store);
+                    let mut s3_builder = AmazonS3Builder::from_env()
+                        .with_bucket_name(bucket_name)
+                        .with_allow_http(true);
+
+                    let params: HashMap<_, _> = url.query_pairs().into_owned().collect();
+
+                    if let Some(region) = params.get("region") {
+                        s3_builder = s3_builder.with_region(region);
+                    }
+                    if let Some(endpoint) = params.get("endpoint") {
+                        s3_builder = s3_builder.with_endpoint(endpoint);
+                    }
+                    if let (Some(key), Some(secret)) = (params.get("key"), params.get("secret")) {
+                        s3_builder = s3_builder.with_access_key_id(key);
+                        s3_builder = s3_builder.with_secret_access_key(secret);
+                    } else {
+                        s3_builder = s3_builder.with_skip_signature(true);
+                    };
+
+                    return Ok(Arc::new(s3_builder.build()?));
                 }
             }
         }
