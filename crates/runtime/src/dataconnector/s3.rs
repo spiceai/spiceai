@@ -148,8 +148,9 @@ impl DataConnector for S3 {
         let table_path =
             ListingTableUrl::parse(url)
                 .boxed()
-                .context(super::UnableToGetReadProviderSnafu {
+                .context(super::InvalidConfigurationSnafu {
                     dataconnector: "s3".to_string(),
+                    message: "Unable to parse URL",
                 })?;
 
         let options =
