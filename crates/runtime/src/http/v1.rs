@@ -303,7 +303,7 @@ pub(crate) mod datasets {
     use tokio::sync::RwLock;
     use tract_core::tract_data::itertools::Itertools;
 
-    use crate::{datafusion::DataFusion, status::ComponentStatus};
+    use crate::{datafusion::{refresh_sql, DataFusion}, status::ComponentStatus};
 
     use super::{convert_entry_to_csv, dataset_status, Format};
 
@@ -402,8 +402,13 @@ pub(crate) mod datasets {
 
     #[derive(Debug, Serialize, Deserialize)]
     #[serde(rename_all = "lowercase")]
-    pub(crate) struct DatasetRefreshResponse {
+    pub(crate) struct MessageResponse {
         pub message: String,
+    }
+
+    #[derive(Deserialize)]
+    pub struct AccelerationRequest {
+        pub refresh_sql: String,
     }
 
     pub(crate) async fn refresh(
@@ -423,7 +428,7 @@ pub(crate) mod datasets {
         else {
             return (
                 status::StatusCode::NOT_FOUND,
-                Json(DatasetRefreshResponse {
+                Json(MessageResponse {
                     message: format!("Dataset {dataset_name} not found"),
                 }),
             )
@@ -435,7 +440,7 @@ pub(crate) mod datasets {
         if !acceleration_enabled {
             return (
                 status::StatusCode::BAD_REQUEST,
-                Json(DatasetRefreshResponse {
+                Json(MessageResponse {
                     message: format!("Dataset {dataset_name} does not have acceleration enabled"),
                 }),
             )
@@ -447,15 +452,78 @@ pub(crate) mod datasets {
         match df_read.refresh_table(&dataset.name).await {
             Ok(()) => (
                 status::StatusCode::CREATED,
-                Json(DatasetRefreshResponse {
+                Json(MessageResponse {
                     message: format!("Dataset refresh triggered for {dataset_name}."),
                 }),
             )
                 .into_response(),
             Err(err) => (
                 status::StatusCode::INTERNAL_SERVER_ERROR,
-                Json(DatasetRefreshResponse {
+                Json(MessageResponse {
                     message: format!("Failed to trigger refresh for {dataset_name}: {err}."),
+                }),
+            )
+                .into_response(),
+        }
+    }
+
+    pub(crate) async fn acceleration(
+        Extension(app): Extension<Arc<RwLock<Option<App>>>>,
+        Extension(df): Extension<Arc<RwLock<DataFusion>>>,
+        Path(dataset_name): Path<String>,
+        Json(payload): Json<AccelerationRequest>,
+    ) -> Response {
+        
+        
+        let app_lock = app.read().await;
+        let Some(readable_app) = &*app_lock else {
+            return (status::StatusCode::INTERNAL_SERVER_ERROR).into_response();
+        };
+
+        let Some(dataset) = readable_app
+            .datasets
+            .iter()
+            .find(|d| d.name.to_lowercase() == dataset_name.to_lowercase())
+        else {
+            return (
+                status::StatusCode::NOT_FOUND,
+                Json(MessageResponse {
+                    message: format!("Dataset {dataset_name} not found"),
+                }),
+            )
+                .into_response();
+        };
+
+        let acceleration_enabled = dataset.acceleration.as_ref().is_some_and(|f| f.enabled);
+
+        if !acceleration_enabled {
+            return (
+                status::StatusCode::BAD_REQUEST,
+                Json(MessageResponse {
+                    message: format!("Dataset {dataset_name} does not have acceleration enabled"),
+                }),
+            )
+                .into_response();
+        };
+
+        if let Err(e) = refresh_sql::validate_refresh_sql(dataset_name.as_str(), &payload.refresh_sql) {
+            return (
+                status::StatusCode::BAD_REQUEST,
+                Json(MessageResponse {
+                    message: format!("Invalid refresh_sql parameter value. {e}"),
+                }),
+            )
+                .into_response();
+        }
+
+        let df_read = df.read().await;
+
+        match df_read.update_refresh_sql(&dataset.name, &payload.refresh_sql).await {
+            Ok(()) => (status::StatusCode::OK).into_response(),
+            Err(e) => (
+                status::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(MessageResponse {
+                    message: format!("Request faield. {e}"),
                 }),
             )
                 .into_response(),

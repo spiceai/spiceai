@@ -417,6 +417,10 @@ impl DataFusion {
 
         Ok(())
     }
+    
+    pub async fn update_refresh_sql(&self, _dataset_name: &str, _refresh_sql: &str) -> Result<()> {
+       Ok(())
+    }
 
     /// Federated tables are attached directly as tables visible in the public `DataFusion` context.
     async fn register_federated_table(
