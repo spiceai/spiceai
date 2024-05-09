@@ -21,9 +21,10 @@ use std::time::Duration;
 
 use crate::accelerated_table::{AcceleratedTable, Refresh, Retention};
 use crate::dataaccelerator::{self, create_accelerator_table};
-use crate::dataconnector::DataConnector;
+use crate::dataconnector::{DataConnector, DataConnectorError};
 use crate::dataupdate::{DataUpdate, DataUpdateExecutionPlan, UpdateType};
 use crate::get_dependent_table_names;
+use crate::object_store_registry::default_runtime_env;
 use arrow::datatypes::Schema;
 use arrow_tools::schema::verify_schema;
 use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider};
@@ -77,9 +78,7 @@ pub enum Error {
     UnableToGetTable { source: DataFusionError },
 
     #[snafu(display("Unable to resolve table provider: {source}"))]
-    UnableToResolveTableProvider {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
+    UnableToResolveTableProvider { source: DataConnectorError },
 
     #[snafu(display("Table {table_name} was marked as read_write, but the underlying provider only supports reads."))]
     WriteProviderNotImplemented { table_name: String },
@@ -156,7 +155,7 @@ impl DataFusion {
             .with_create_default_catalog_and_schema(false);
         df_config.options_mut().sql_parser.dialect = "PostgreSQL".to_string();
 
-        let ctx = SessionContext::new_with_config(df_config);
+        let ctx = SessionContext::new_with_config_rt(df_config, default_runtime_env());
 
         let catalog = MemoryCatalogProvider::new();
         let schema = SpiceSchemaProvider::new();
@@ -298,11 +297,6 @@ impl DataFusion {
         acceleration_secret: Option<Secret>,
     ) -> Result<(AcceleratedTable, oneshot::Receiver<()>)> {
         tracing::debug!("Creating accelerated table {dataset:?}");
-        let obj_store = source
-            .get_object_store(dataset)
-            .transpose()
-            .context(InvalidObjectStoreSnafu)?;
-
         let source_table_provider = match dataset.mode() {
             Mode::Read => source
                 .read_provider(dataset)
@@ -357,7 +351,6 @@ impl DataFusion {
                 dataset.refresh_data_window(),
             ),
         );
-        accelerated_table_builder.object_store(obj_store);
         accelerated_table_builder.retention(Retention::new(
             dataset.time_column.clone(),
             dataset.time_format.clone(),
@@ -418,15 +411,6 @@ impl DataFusion {
         source: Arc<dyn DataConnector>,
     ) -> Result<()> {
         tracing::debug!("Registering federated table {dataset:?}");
-        if let Some(obj_store_result) = source.get_object_store(dataset) {
-            let (key, store) = obj_store_result.context(InvalidObjectStoreSnafu)?;
-
-            tracing::debug!("Registered object_store for {key}");
-            self.ctx
-                .runtime_env()
-                .register_object_store(&key, Arc::clone(&store));
-        }
-
         let table_exists = self.ctx.table_exist(&dataset.name).unwrap_or(false);
         if table_exists {
             return TableAlreadyExistsSnafu.fail();

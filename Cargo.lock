@@ -6900,9 +6900,10 @@ checksum = "1b6b67fb9a61334225b5b790716f609cd58395f895b3fe8b328786812a40bc3b"
 [[package]]
 name = "snowflake-api"
 version = "0.8.0"
-source = "git+https://github.com/spiceai/snowflake-rs.git?rev=6a2088c89b3e79f6885f5e12de9eea2530c44562#6a2088c89b3e79f6885f5e12de9eea2530c44562"
+source = "git+https://github.com/spiceai/snowflake-rs.git?rev=5dab964abef23314e7a3f27ae89b83352e315206#5dab964abef23314e7a3f27ae89b83352e315206"
 dependencies = [
  "arrow",
+ "async-stream",
  "async-trait",
  "base64 0.22.0",
  "bytes",

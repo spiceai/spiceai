@@ -51,6 +51,7 @@ pub mod execution_plan;
 mod flight;
 mod http;
 pub mod model;
+pub mod object_store_registry;
 mod opentelemetry;
 pub mod podswatcher;
 pub mod status;
@@ -519,14 +520,13 @@ impl Runtime {
                 FederatedReadWriteTableWithoutReplicationSnafu.fail()?;
             }
 
-            df.write()
-                .await
-                .register_table(ds, datafusion::Table::Federated(data_connector))
-                .await
-                .context(UnableToAttachDataConnectorSnafu {
-                    data_connector: source,
-                })?;
-            return Ok(());
+            return Runtime::register_table(
+                df,
+                ds,
+                datafusion::Table::Federated(data_connector),
+                source,
+            )
+            .await;
         }
 
         // ACCELERATED TABLE
@@ -545,20 +545,30 @@ impl Runtime {
                 name: accelerator_engine,
             })?;
 
-        df.write()
-            .await
-            .register_table(
-                ds,
-                datafusion::Table::Accelerated {
-                    source: data_connector,
-                    acceleration_secret,
-                    accelerated_table,
-                },
-            )
-            .await
-            .context(UnableToAttachDataConnectorSnafu {
+        Runtime::register_table(
+            df,
+            ds,
+            datafusion::Table::Accelerated {
+                source: data_connector,
+                acceleration_secret,
+                accelerated_table,
+            },
+            source,
+        )
+        .await
+    }
+
+    async fn register_table(
+        df: Arc<RwLock<DataFusion>>,
+        ds: &Dataset,
+        table: datafusion::Table,
+        source: &str,
+    ) -> Result<()> {
+        df.write().await.register_table(ds, table).await.context(
+            UnableToAttachDataConnectorSnafu {
                 data_connector: source,
-            })?;
+            },
+        )?;
 
         Ok(())
     }

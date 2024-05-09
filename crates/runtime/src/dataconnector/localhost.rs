@@ -124,14 +124,14 @@ impl DataConnector for LocalhostConnector {
     async fn read_provider(
         &self,
         _dataset: &Dataset,
-    ) -> super::AnyErrorResult<Arc<dyn TableProvider>> {
+    ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         Ok(Arc::new(self.clone()))
     }
 
     async fn read_write_provider(
         &self,
         _dataset: &Dataset,
-    ) -> Option<super::AnyErrorResult<Arc<dyn TableProvider>>> {
+    ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
         Some(Ok(Arc::new(self.clone())))
     }
 }

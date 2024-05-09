@@ -38,7 +38,7 @@ lint:
 	go vet ./...
 	golangci-lint run
 	cargo fmt --all -- --check
-	cargo clippy --all-targets --workspace -- \
+	cargo clippy --all-targets --all-features --workspace -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
