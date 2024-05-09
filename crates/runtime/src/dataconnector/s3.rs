@@ -187,7 +187,13 @@ impl DataConnector for S3 {
         &self,
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        let ctx = SessionContext::new_with_config_rt(SessionConfig::new(), default_runtime_env());
+        let ctx = SessionContext::new_with_config_rt(
+            SessionConfig::new().set_bool(
+                "datafusion.execution.listing_table_ignore_subdirectory",
+                false,
+            ),
+            default_runtime_env(),
+        );
 
         let url = self
             .get_object_store_url(dataset)

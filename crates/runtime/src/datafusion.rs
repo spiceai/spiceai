@@ -152,7 +152,11 @@ impl DataFusion {
 
         let mut df_config = SessionConfig::new()
             .with_information_schema(true)
-            .with_create_default_catalog_and_schema(false);
+            .with_create_default_catalog_and_schema(false)
+            .set_bool(
+                "datafusion.execution.listing_table_ignore_subdirectory",
+                false,
+            );
         df_config.options_mut().sql_parser.dialect = "PostgreSQL".to_string();
 
         let ctx = SessionContext::new_with_config_rt(df_config, default_runtime_env());
