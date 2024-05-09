@@ -105,7 +105,7 @@ jobs:
             { engine: arrow, mode: memory },
             { engine: duckdb, mode: memory },
             { engine: sqlite, mode: memory },
-            # { engine: postgres},
+            { engine: postgres},
           ]
         target:
           - name: "Linux x64"
@@ -137,6 +137,20 @@ jobs:
         uses: ./.github/actions/install-spice
         with:
           build-path: ./build
+
+      - name: Configure Spice secrets
+        if: matrix.acceleration.engine == 'postgres'
+        run: |
+          echo "[postgres_engine]" >> $HOME/.spice/auth
+          echo "  [postgres_engine.params]" >> $HOME/.spice/auth
+          echo "    pg_connection_string = 'host=localhost port=5432 dbname=testdb user=postgres password=postgres sslmode=disable'" >> $HOME/.spice/auth
+  
+      - name: Install PostgreSQL
+        uses: ./.github/actions/install-postgres
+        if: matrix.acceleration.engine == 'postgres'
+        with:
+          os: ${{ matrix.target.target_os }}
+          pg-db: testdb
 
       - name: Test boolean
         id: test-boolean
