@@ -234,20 +234,17 @@ impl DataConnector for FTP {
     async fn read_provider(
         &self,
         dataset: &Dataset,
-    ) -> super::AnyErrorResult<Arc<dyn TableProvider>> {
+    ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         let ctx = SessionContext::new();
 
-        let (url, ftp) = self
-            .get_object_store(dataset)
-            .ok_or_else(|| ObjectStoreNotImplementedSnafu.build())?
-            .context(UnableToGetReadProviderSnafu)?;
+        let (url, ftp) = self.get_object_store(dataset).unwrap().unwrap();
 
         let _ = ctx.runtime_env().register_object_store(&url, ftp);
 
         let df = ctx
             .read_parquet(&dataset.from, ParquetReadOptions::default())
             .await
-            .context(UnableToBuildLogicalPlanSnafu)?;
+            .unwrap();
 
         Ok(df.into_view())
     }
