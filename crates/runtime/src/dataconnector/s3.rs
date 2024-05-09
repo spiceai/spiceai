@@ -50,16 +50,6 @@ pub enum Error {
     },
 
     #[snafu(display("{source}"))]
-    UnableToGetReadProvider {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    #[snafu(display("{source}"))]
-    UnableToGetReadWriteProvider {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    #[snafu(display("{source}"))]
     UnableToBuildObjectStore {
         source: object_store::Error,
     },
@@ -142,23 +132,56 @@ impl DataConnector for S3 {
         self
     }
 
-    async fn read_provider(&self, dataset: &Dataset) -> AnyErrorResult<Arc<dyn TableProvider>> {
-        let ctx = SessionContext::new_with_config_rt(SessionConfig::new(), default_runtime_env());
+    async fn read_provider(
+        &self,
+        dataset: &Dataset,
+    ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
+        let ctx = SessionContext::new_with_config_rt(
+            SessionConfig::new().set_bool(
+                "datafusion.execution.listing_table_ignore_subdirectory",
+                false,
+            ),
+            default_runtime_env(),
+        );
 
         let url = self
             .get_object_store_url(dataset)
-            .context(UnableToGetReadProviderSnafu)?;
+            .context(super::InvalidConfigurationSnafu {
+                dataconnector: "s3",
+                message: "Unable to parse URL",
+            })?;
 
-        let table_path = ListingTableUrl::parse(url)?;
+        let table_path =
+            ListingTableUrl::parse(url)
+                .boxed()
+                .context(super::InvalidConfigurationSnafu {
+                    dataconnector: "s3".to_string(),
+                    message: "Unable to parse URL",
+                })?;
+
         let options =
             ListingOptions::new(Arc::new(ParquetFormat::default())).with_file_extension(".parquet");
 
-        let resolved_schema = options.infer_schema(&ctx.state(), &table_path).await?;
+        let resolved_schema = options
+            .infer_schema(&ctx.state(), &table_path)
+            .await
+            .boxed()
+            .context(super::InvalidConfigurationSnafu {
+                dataconnector: "s3".to_string(),
+                message: "Unable to infer files schema",
+            })?;
 
         let config = ListingTableConfig::new(table_path)
             .with_listing_options(options)
             .with_schema(resolved_schema);
-        let table = ListingTable::try_new(config)?;
+
+        let table =
+            ListingTable::try_new(config)
+                .boxed()
+                .context(super::InvalidConfigurationSnafu {
+                    dataconnector: "s3".to_string(),
+                    message: "Unable to list files in S3 bucket",
+                })?;
 
         Ok(Arc::new(table))
     }
