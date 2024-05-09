@@ -120,6 +120,13 @@ pub enum DataConnectorError {
         dataconnector: String,
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[snafu(display("Invalid configuration for {dataconnector}: {message}"))]
+    InvalidConfiguration {
+        dataconnector: String,
+        message: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
