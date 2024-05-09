@@ -39,8 +39,8 @@ jobs:
           echo "LATEST_GHCR_TAG=ghcr.io/spiceai/spiceai:latest" >> $GITHUB_ENV
           echo "LATEST_DOCKERHUB_TAG=spiceai/spiceai:latest" >> $GITHUB_ENV
 
-      - name: Build and push Docker images
-        id: docker_build
+      - name: Build and push Docker images (slim)
+        id: docker_build_slim
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -50,10 +50,29 @@ jobs:
           build-args: |
             REL_VERSION=${{ env.REL_VERSION }}
           tags: |
+            ghcr.io/spiceai/spiceai:${{ env.REL_VERSION }}-slim
+            spiceai/spiceai:${{ env.REL_VERSION }}-slim
+            ${{ env.LATEST_GHCR_TAG }}-slim
+            ${{ env.LATEST_DOCKERHUB_TAG }}-slim
+
+      - name: Build and push Docker images (full)
+        id: docker_build_full
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: ${{ startswith(github.ref, 'refs/tags/v') }}
+          build-args: |
+            REL_VERSION=${{ env.REL_VERSION }}
+            CARGO_FEATURES=odbc
+          tags: |
             ghcr.io/spiceai/spiceai:${{ env.REL_VERSION }}
             spiceai/spiceai:${{ env.REL_VERSION }}
             ${{ env.LATEST_GHCR_TAG }}
             ${{ env.LATEST_DOCKERHUB_TAG }}
 
       - name: Image digest
-        run: echo ${{ steps.docker_build.outputs.digest }}
+        run: |
+          echo ${{ steps.docker_build_slim.outputs.digest }}
+          echo ${{ steps.docker_build_full.outputs.digest }}

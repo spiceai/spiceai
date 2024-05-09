@@ -56,16 +56,6 @@ pub enum Error {
     UnableToConstructDatabricksSpark {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
-
-    #[snafu(display("{source}"))]
-    UnableToGetReadProvider {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    #[snafu(display("{source}"))]
-    UnableToGetReadWriteProvider {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -155,29 +145,30 @@ impl DataConnector for Databricks {
     async fn read_provider(
         &self,
         dataset: &Dataset,
-    ) -> super::AnyErrorResult<Arc<dyn TableProvider>> {
+    ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         let table_reference = OwnedTableReference::from(dataset.path());
         Ok(self
             .read_provider
             .table_provider(table_reference)
             .await
-            .context(UnableToGetReadProviderSnafu)?)
+            .context(super::UnableToGetReadProviderSnafu {
+                dataconnector: "databricks",
+            })?)
     }
 
     async fn read_write_provider(
         &self,
         dataset: &Dataset,
-    ) -> Option<super::AnyErrorResult<Arc<dyn TableProvider>>> {
+    ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
         let table_reference = OwnedTableReference::from(dataset.path());
         let read_write_result = self
             .read_write_provider
             .table_provider(table_reference)
             .await
-            .context(UnableToGetReadWriteProviderSnafu)
-            .boxed();
-        match read_write_result {
-            Ok(provider) => Some(Ok(provider)),
-            Err(e) => Some(Err(e)),
-        }
+            .context(super::UnableToGetReadWriteProviderSnafu {
+                dataconnector: "databricks",
+            });
+
+        Some(read_write_result)
     }
 }

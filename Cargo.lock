@@ -2384,6 +2384,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "datafusion-federation"
+version = "0.1.3"
+source = "git+https://github.com/phillipleblanc/datafusion-federation.git?branch=df-37.1#a25a523e0e4e6def29c1675fee944f07c70d869b"
+dependencies = [
+ "async-trait",
+ "datafusion",
+]
+
+[[package]]
 name = "datafusion-functions"
 version = "37.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4602,6 +4611,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c9be0862c1b3f26a88803c4a49de6889c10e608b3ee9344e6ef5b45fb37ad3d1"
 
 [[package]]
+name = "model_components"
+version = "0.13.0-alpha"
+dependencies = [
+ "arrow",
+ "async-trait",
+ "dirs",
+ "ndarray",
+ "regex",
+ "reqwest 0.11.27",
+ "secrets",
+ "serde",
+ "serde_json",
+ "snafu 0.8.2",
+ "spicepod",
+ "tracing",
+ "tract-core",
+ "tract-onnx",
+]
+
+[[package]]
 name = "multimap"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6380,6 +6409,7 @@ dependencies = [
  "dashmap",
  "data_components",
  "datafusion",
+ "datafusion-federation",
  "db_connection_pool",
  "dirs",
  "duckdb",
@@ -6389,6 +6419,7 @@ dependencies = [
  "itertools 0.12.1",
  "lazy_static",
  "metrics",
+ "model_components",
  "mysql_async",
  "ndarray",
  "notify",
