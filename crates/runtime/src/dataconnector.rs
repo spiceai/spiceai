@@ -173,7 +173,7 @@ pub async fn register_all() {
     #[cfg(feature = "flightsql")]
     register_connector_factory("flightsql", flightsql::FlightSQL::create).await;
     register_connector_factory("s3", s3::S3::create).await;
-    #[cfg(feature = "sftp")]
+    #[cfg(feature = "ftp")]
     register_connector_factory("ftp", ftp::FTP::create).await;
     register_connector_factory("spiceai", spiceai::SpiceAI::create).await;
     #[cfg(feature = "mysql")]
