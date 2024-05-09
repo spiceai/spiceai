@@ -10,9 +10,10 @@ members = [
     "crates/sql_provider_datafusion",
     "crates/flightrepl",
     "crates/llms",
+    "crates/model_components",
     "crates/ns_lookup",
     "tools/flightpublisher/",
-    "tools/flightsubscriber/", "crates/llms",
+    "tools/flightsubscriber/",
 ]
 default-members = ["bin/spiced"]
 

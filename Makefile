@@ -78,6 +78,10 @@ install: build
 	install -m 755 target/release/spice ~/.spice/bin/spice
 	install -m 755 target/release/spiced ~/.spice/bin/spiced
 
+.PHONY: install-with-models
+install-with-models:
+	make install SPICED_NON_DEFAULT_FEATURES="models"
+
 .PHONY: install-cli
 install-cli: build-cli
 	mkdir -p ~/.spice/bin

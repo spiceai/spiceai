@@ -38,6 +38,7 @@ tract-onnx = "0.21.0"
 ndarray = "0.15.3"
 duckdb = { workspace = true, features = ["bundled", "r2d2", "vtab", "vtab-arrow"], optional = true }
 sql_provider_datafusion = { path = "../sql_provider_datafusion", optional = true }
+model_components = { path = "../model_components"}
 r2d2 = { workspace = true, optional = true }
 opentelemetry-proto = { version = "0.4.0", features = ["gen-tonic-messages", "gen-tonic", "metrics"] }
 indexmap = "2.2.2"
@@ -109,3 +110,4 @@ spark = ["data_components/spark_connect"]
 dremio = []
 odbc = ["db_connection_pool/odbc", "data_components/odbc", "dep:odbc-api"]
 snowflake = ["dep:snowflake-api", "db_connection_pool/snowflake", "data_components/snowflake"]
+models = ["model_components/full"]

@@ -13,11 +13,32 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+#![allow(clippy::missing_errors_doc)]
 
 use arrow::record_batch::RecordBatch;
 use std::result::Result;
 
+use crate::modelformat::{from_path as format_from_path, ModelFormat};
+
+#[cfg(feature = "full")]
 pub mod tract;
+
+pub fn supported_runtime_for_path(path: &str) -> Result<Box<dyn ModelRuntime>, String> {
+    match format_from_path(path) {
+        Some(format) => {
+            #[cfg(feature = "full")]
+            if tract::Tract::supports_format(format.clone()) {
+                return Ok(Box::new(tract::Tract {
+                    path: path.to_string(),
+                }));
+            }
+            Err(format!("Unsupported model format for path: {format}"))
+        }
+        None => Err(format!(
+            "Model format for path={path} could not be inferred"
+        )),
+    }
+}
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
@@ -37,4 +58,8 @@ pub trait ModelRuntime {
     // Load the model into the runtime and return a runnable
     // TODO: add format parameter when more formats are supported
     fn load(&self) -> Result<Box<dyn Runnable>, Error>;
+
+    fn supports_format(format: ModelFormat) -> bool
+    where
+        Self: Sized;
 }
