@@ -30,7 +30,9 @@ use secrets::Secret;
 use snafu::prelude::*;
 use spicepod::component::dataset::Dataset;
 use std::any::Any;
+use std::clone::Clone;
 use std::pin::Pin;
+use std::string::String;
 use std::sync::Arc;
 use std::{collections::HashMap, future::Future};
 use url::{form_urlencoded, Url};
@@ -132,49 +134,37 @@ impl S3 {
 
     fn get_file_format_and_extension(&self) -> AnyErrorResult<(Arc<dyn FileFormat>, String)> {
         let params = &self.params;
-        match params.get("file_format") {
-            Some(file_format) => {
-                match file_format.as_str() {
-                    "csv" => Ok((
-                        Arc::new(
-                            CsvFormat::default()
-                                .with_has_header(
-                                    params
-                                        .get("has_header")
-                                        .map_or_else(|| true, |f| f.as_str() == "true"),
-                                )
-                                .with_delimiter(params.get("delimiter").map_or_else(
-                                    || b',',
-                                    |f| *f.as_bytes().first().unwrap_or(&b','),
-                                )),
-                        ),
-                        params
-                            .get("file_extension")
-                            .map_or_else(|| ".csv", |f| f.as_str())
-                            .into(),
-                    )),
-                    "parquet" => Ok((
-                        Arc::new(ParquetFormat::default()),
-                        params
-                            .get("file_extension")
-                            .map_or_else(|| ".parquet", |f| f.as_str())
-                            .into(),
-                    )),
-                    format => Err(Error::UnsupportedFileFormat {
-                        format: format.to_string(),
-                    }
-                    .into()),
-                }
-            }
-            _ => Ok((
+        match params.get("file_format").map(String::as_str) {
+            Some("csv") => Ok((
+                get_csv_format(params),
+                params
+                    .get("file_extension")
+                    .map_or(".csv".to_string(), Clone::clone),
+            )),
+            None | Some("parquet") => Ok((
                 Arc::new(ParquetFormat::default()),
                 params
                     .get("file_extension")
-                    .map_or_else(|| ".parquet", |f| f.as_str())
-                    .into(),
+                    .map_or(".parquet".to_string(), Clone::clone),
             )),
+            Some(format) => Err(Error::UnsupportedFileFormat {
+                format: format.to_string(),
+            }
+            .into()),
         }
     }
+}
+
+fn get_csv_format(params: &HashMap<String, String>) -> Arc<CsvFormat> {
+    Arc::new(
+        CsvFormat::default()
+            .with_has_header(params.get("has_header").map_or(true, |f| f == "true"))
+            .with_delimiter(
+                params
+                    .get("delimiter")
+                    .map_or(b',', |f| *f.as_bytes().first().unwrap_or(&b',')),
+            ),
+    )
 }
 
 #[async_trait]
