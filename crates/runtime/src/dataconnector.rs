@@ -110,6 +110,25 @@ pub enum DataConnectorError {
 
     #[snafu(display("Cannot connect to {dataconnector}. Authentication failed. Ensure that the username and password are correctly configured in the spicepod."))]
     UnableToConnectInvalidUsernameOrPassword { dataconnector: String },
+
+    #[snafu(display("Unable to get read provider for {dataconnector}: {source}"))]
+    UnableToGetReadProvider {
+        dataconnector: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("Unable to get read write provider for {dataconnector}: {source}"))]
+    UnableToGetReadWriteProvider {
+        dataconnector: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("Invalid configuration for {dataconnector}. {message}"))]
+    InvalidConfiguration {
+        dataconnector: String,
+        message: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -204,12 +223,13 @@ pub trait DataConnectorFactory {
 pub trait DataConnector: Send + Sync {
     fn as_any(&self) -> &dyn Any;
 
-    async fn read_provider(&self, dataset: &Dataset) -> AnyErrorResult<Arc<dyn TableProvider>>;
+    async fn read_provider(&self, dataset: &Dataset)
+        -> DataConnectorResult<Arc<dyn TableProvider>>;
 
     async fn read_write_provider(
         &self,
         _dataset: &Dataset,
-    ) -> Option<AnyErrorResult<Arc<dyn TableProvider>>> {
+    ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         None
     }
 

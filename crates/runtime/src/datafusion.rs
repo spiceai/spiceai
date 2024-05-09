@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use crate::accelerated_table::{AcceleratedTable, Refresh, Retention};
 use crate::dataaccelerator::{self, create_accelerator_table};
-use crate::dataconnector::DataConnector;
+use crate::dataconnector::{DataConnector, DataConnectorError};
 use crate::dataupdate::{DataUpdate, DataUpdateExecutionPlan, UpdateType};
 use crate::get_dependent_table_names;
 use crate::object_store_registry::default_runtime_env;
@@ -32,7 +32,7 @@ use datafusion::common::OwnedTableReference;
 use datafusion::config::CatalogOptions;
 use datafusion::datasource::ViewTable;
 use datafusion::error::DataFusionError;
-use datafusion::execution::context::{SessionConfig, SessionContext};
+use datafusion::execution::context::{SessionConfig, SessionContext, SessionState};
 use datafusion::physical_plan::collect;
 use datafusion::sql::parser::DFParser;
 use datafusion::sql::sqlparser;
@@ -78,9 +78,7 @@ pub enum Error {
     UnableToGetTable { source: DataFusionError },
 
     #[snafu(display("Unable to resolve table provider: {source}"))]
-    UnableToResolveTableProvider {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
+    UnableToResolveTableProvider { source: DataConnectorError },
 
     #[snafu(display("Table {table_name} was marked as read_write, but the underlying provider only supports reads."))]
     WriteProviderNotImplemented { table_name: String },
@@ -154,10 +152,24 @@ impl DataFusion {
 
         let mut df_config = SessionConfig::new()
             .with_information_schema(true)
-            .with_create_default_catalog_and_schema(false);
+            .with_create_default_catalog_and_schema(false)
+            .set_bool(
+                "datafusion.execution.listing_table_ignore_subdirectory",
+                false,
+            );
         df_config.options_mut().sql_parser.dialect = "PostgreSQL".to_string();
 
-        let ctx = SessionContext::new_with_config_rt(df_config, default_runtime_env());
+        let state = SessionState::new_with_config_rt(df_config, default_runtime_env());
+
+        #[cfg(feature = "federation-experimental")]
+        let state = {
+            use datafusion_federation::{FederatedQueryPlanner, FederationAnalyzerRule};
+            state
+                .add_analyzer_rule(Arc::new(FederationAnalyzerRule::new()))
+                .with_query_planner(Arc::new(FederatedQueryPlanner::new()))
+        };
+
+        let ctx = SessionContext::new_with_state(state);
 
         let catalog = MemoryCatalogProvider::new();
         let schema = SpiceSchemaProvider::new();

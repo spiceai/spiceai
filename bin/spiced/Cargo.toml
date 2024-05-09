@@ -13,7 +13,7 @@ snafu.workspace = true
 clap = { workspace = true, features = ["derive"] }
 spicepod = { path = "../../crates/spicepod" }
 app = { path = "../../crates/app" }
-runtime = { path = "../../crates/runtime" }
+runtime = { path = "../../crates/runtime"}
 flightrepl = { path = "../../crates/flightrepl" }
 tokio.workspace = true
 tracing.workspace = true
@@ -52,3 +52,5 @@ dremio = ["runtime/dremio"]
 odbc = ["runtime/odbc"]
 spark = ["runtime/spark"]
 snowflake = ["runtime/snowflake"]
+models = ["runtime/models"] 
+federation-experimental = ["runtime/federation-experimental"]

@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use super::{ModelRuntime, Runnable};
+use crate::modelruntime::ModelFormat;
 use arrow::array::ArrayRef;
 use arrow::array::Float32Array;
 use arrow::array::Float64Array;
@@ -26,6 +27,7 @@ use snafu::prelude::*;
 use snafu::ResultExt;
 use std::sync::Arc;
 
+use crate::modelformat::onnx;
 use tract_core::tract_data::itertools::Itertools;
 use tract_onnx::prelude::*;
 
@@ -75,6 +77,10 @@ impl ModelRuntime for Tract {
     fn load(&self) -> std::result::Result<Box<dyn Runnable>, super::Error> {
         let model = load_tract_model(self.path.as_str()).context(TractSnafu)?;
         Ok(Box::new(Model { model }))
+    }
+
+    fn supports_format(format: ModelFormat) -> bool {
+        format == ModelFormat::Onnx(onnx::Onnx {})
     }
 }
 
