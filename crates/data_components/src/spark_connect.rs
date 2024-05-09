@@ -83,7 +83,7 @@ async fn get_table_provider(
     let dataframe = spark_session.table(table_reference.table())?;
     let schema = dataframe.clone().schema().await?;
     let arrow_schema = datatype_as_arrow_schema(schema)?;
-    Ok(Arc::new(SparkConnectTablePovider {
+    Ok(Arc::new(SparkConnectTableProvider {
         dataframe,
         schema: arrow_schema,
     }))
@@ -127,8 +127,8 @@ fn arrow_field_datatype_from_spark_connect_field_datatype(
                 Some(data_type) => {
                     let arrow_inner_type =
                         arrow_field_datatype_from_spark_connect_field_datatype(Some(*data_type))?;
-                    // Very smelly
-                    let field = Field::new("", arrow_inner_type, false);
+                    // The default name for the field is element
+                    let field = Field::new("element", arrow_inner_type, boxed_array.contains_null);
                     Ok(datatypes::DataType::List(Arc::new(field)))
                 }
                 None => Err(DataFusionError::Execution(format!(
@@ -195,13 +195,13 @@ fn datatype_as_arrow_schema(data_type: DataType) -> Result<SchemaRef, DataFusion
     )))
 }
 
-struct SparkConnectTablePovider {
+struct SparkConnectTableProvider {
     dataframe: DataFrame,
     schema: SchemaRef,
 }
 
 #[async_trait]
-impl TableProvider for SparkConnectTablePovider {
+impl TableProvider for SparkConnectTableProvider {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
