@@ -408,7 +408,7 @@ pub(crate) mod datasets {
 
     #[derive(Deserialize)]
     pub struct AccelerationRequest {
-        pub refresh_sql: String,
+        pub refresh_sql: Option<String>,
     }
 
     pub(crate) async fn refresh(
@@ -494,19 +494,12 @@ pub(crate) mod datasets {
                 .into_response();
         };
 
-        let acceleration_enabled = dataset.acceleration.as_ref().is_some_and(|f| f.enabled);
-
-        if !acceleration_enabled {
-            return (
-                status::StatusCode::BAD_REQUEST,
-                Json(MessageResponse {
-                    message: format!("Dataset {dataset_name} does not have acceleration enabled"),
-                }),
-            )
-                .into_response();
+        let Some(refresh_sql) = payload.refresh_sql else  {
+            return (status::StatusCode::OK).into_response();
         };
 
-        if let Err(e) = refresh_sql::validate_refresh_sql(dataset_name.as_str(), &payload.refresh_sql) {
+        // TODO: move validation to data fusion logic
+        if let Err(e) = refresh_sql::validate_refresh_sql(dataset_name.as_str(), &refresh_sql) {
             return (
                 status::StatusCode::BAD_REQUEST,
                 Json(MessageResponse {
@@ -518,12 +511,13 @@ pub(crate) mod datasets {
 
         let df_read = df.read().await;
 
-        match df_read.update_refresh_sql(&dataset.name, &payload.refresh_sql).await {
+        // TODO this should be extended to support the whole acceleration configuration, not just refresh_sql
+        match df_read.update_refresh_sql(&dataset.name, &refresh_sql).await {
             Ok(()) => (status::StatusCode::OK).into_response(),
             Err(e) => (
                 status::StatusCode::INTERNAL_SERVER_ERROR,
                 Json(MessageResponse {
-                    message: format!("Request faield. {e}"),
+                    message: format!("Request failed. {e}"),
                 }),
             )
                 .into_response(),
