@@ -142,12 +142,13 @@ pub fn ensure_model_path(name: &str) -> Result<String> {
 }
 
 impl From<ModelSourceType> for Option<Box<dyn ModelSource>> {
+    #[allow(unused_variables)]
     fn from(source: ModelSourceType) -> Self {
         #[cfg(feature = "full")]
         if source == ModelSourceType::Local {
             return Some(Box::new(local::Local {}));
-        } 
-        
+        }
+
         #[cfg(feature = "full")]
         if source == ModelSourceType::SpiceAI {
             return Some(Box::new(spiceai::SpiceAI {}));
@@ -157,7 +158,7 @@ impl From<ModelSourceType> for Option<Box<dyn ModelSource>> {
         if source == ModelSourceType::Huggingface {
             return Some(Box::new(huggingface::Huggingface {}));
         }
-        return None
+        None
     }
 }
 

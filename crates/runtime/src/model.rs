@@ -15,17 +15,14 @@ limitations under the License.
 */
 
 use arrow::record_batch::RecordBatch;
-use model_components::model::{Model, Error as ModelError};
+use model_components::model::{Error as ModelError, Model};
 use std::result::Result;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::DataFusion;
 
-pub async fn run(
-    m: &Model,
-    df: Arc<RwLock<DataFusion>>,
-) -> Result<RecordBatch, ModelError> {
+pub async fn run(m: &Model, df: Arc<RwLock<DataFusion>>) -> Result<RecordBatch, ModelError> {
     match df
         .read()
         .await

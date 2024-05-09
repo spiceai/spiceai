@@ -27,9 +27,9 @@ use snafu::prelude::*;
 use snafu::ResultExt;
 use std::sync::Arc;
 
+use crate::modelformat::onnx;
 use tract_core::tract_data::itertools::Itertools;
 use tract_onnx::prelude::*;
-use crate::modelformat::onnx;
 
 pub struct Tract {
     pub path: String,
@@ -80,7 +80,7 @@ impl ModelRuntime for Tract {
     }
 
     fn supports_format(format: ModelFormat) -> bool {
-        return format == ModelFormat::Onnx(onnx::Onnx{});
+        return format == ModelFormat::Onnx(onnx::Onnx {});
     }
 }
 

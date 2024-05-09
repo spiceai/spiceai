@@ -49,10 +49,14 @@ impl PartialEq for ModelFormat {
     }
 }
 
-/// Determines the most appropriate ModelFormat given a local file path.
+/// Determines the most appropriate `ModelFormat` given a local file path.
+#[must_use]
 pub fn from_path(path: &str) -> Option<ModelFormat> {
-    if path.ends_with(".onnx") {
+    if std::path::Path::new(path)
+        .extension()
+        .map_or(false, |ext| ext.eq_ignore_ascii_case("onnx"))
+    {
         return Some(ModelFormat::Onnx(onnx::Onnx {}));
     }
-    return None
+    None
 }

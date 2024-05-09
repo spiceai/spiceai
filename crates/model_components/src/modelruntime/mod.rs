@@ -23,18 +23,20 @@ use crate::modelformat::{from_path as format_from_path, ModelFormat};
 #[cfg(feature = "full")]
 pub mod tract;
 
-
 pub fn supported_runtime_for_path(path: &str) -> Result<Box<dyn ModelRuntime>, String> {
     match format_from_path(path) {
         Some(format) => {
-
             #[cfg(feature = "full")]
             if tract::Tract::supports_format(format.clone()) {
-                return Ok(Box::new(tract::Tract {path: path.to_string()}));
+                return Ok(Box::new(tract::Tract {
+                    path: path.to_string(),
+                }));
             }
-            return Err(format!("Unsupported model format for path: {}", format));
+            Err(format!("Unsupported model format for path: {format}"))
         }
-        None => Err(format!("Model format for path={} could not be inferred", path)),
+        None => Err(format!(
+            "Model format for path={path} could not be inferred"
+        )),
     }
 }
 
@@ -57,5 +59,7 @@ pub trait ModelRuntime {
     // TODO: add format parameter when more formats are supported
     fn load(&self) -> Result<Box<dyn Runnable>, Error>;
 
-    fn supports_format(format: ModelFormat) -> bool where Self: Sized;
+    fn supports_format(format: ModelFormat) -> bool
+    where
+        Self: Sized;
 }

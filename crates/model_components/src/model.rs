@@ -17,7 +17,9 @@ limitations under the License.
 #![allow(clippy::missing_errors_doc)]
 
 use crate::{
-    modelformat::from_path as format_from_path, modelruntime::{supported_runtime_for_path, Error as ModelRuntimeError, Runnable}, modelsource::{path, Error as ModelSourceError, ModelSource, ModelSourceType}
+    modelformat::from_path as format_from_path,
+    modelruntime::{supported_runtime_for_path, Error as ModelRuntimeError, Runnable},
+    modelsource::{path, Error as ModelSourceError, ModelSource, ModelSourceType},
 };
 use arrow::record_batch::RecordBatch;
 use secrets::Secret;
@@ -53,11 +55,13 @@ impl Model {
         model: spicepod::component::model::Model,
         secret: Option<Secret>,
     ) -> Result<Self> {
-
         let Ok(source) = model.from.parse::<ModelSourceType>() else {
-            return Err(Error::UnknownModelSource { source: ModelSourceError::UnknownModelSource {model_source: model.from } })
+            return Err(Error::UnknownModelSource {
+                source: ModelSourceError::UnknownModelSource {
+                    model_source: model.from,
+                },
+            });
         };
-        
 
         let Some(secret) = secret else {
             tracing::warn!(
@@ -82,32 +86,32 @@ impl Model {
                 .context(UnableToLoadModelSnafu)?;
 
             match format_from_path(path.as_str()) {
-                Some(format) => {
-                    match supported_runtime_for_path(path.as_str()) {
-                        Ok(runtime) => {
-                            let runnable = runtime.load().context(UnableToInitModelSnafu {})?;
-                            Ok(Self {
-                                runnable,
-                                model: model.clone(),
-                            })
-                        }
-                        Err(_) => {
-                            return Err(Error::UnableToLoadModel {
-                                source: ModelSourceError::UnsupportedModelFormat { model_format: format },
-                            });
-                        }
+                Some(format) => match supported_runtime_for_path(path.as_str()) {
+                    Ok(runtime) => {
+                        let runnable = runtime.load().context(UnableToInitModelSnafu {})?;
+                        Ok(Self {
+                            runnable,
+                            model: model.clone(),
+                        })
                     }
-                },
-                None => {
-                    return Err(Error::UnknownModelSource {
-                        source: ModelSourceError::UnknownModelSource {
-                            model_source: model.from,
+                    Err(_) => Err(Error::UnableToLoadModel {
+                        source: ModelSourceError::UnsupportedModelFormat {
+                            model_format: format,
                         },
-                    });     
-                }
+                    }),
+                },
+                None => Err(Error::UnknownModelSource {
+                    source: ModelSourceError::UnknownModelSource {
+                        model_source: model.from,
+                    },
+                }),
             }
         } else {
-            return Err(Error::UnknownModelSource { source: ModelSourceError::UnknownModelSource { model_source: source.to_string() } })
+            Err(Error::UnknownModelSource {
+                source: ModelSourceError::UnknownModelSource {
+                    model_source: source.to_string(),
+                },
+            })
         }
     }
 
