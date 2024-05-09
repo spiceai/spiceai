@@ -82,6 +82,10 @@ install: build
 install-with-models:
 	make install SPICED_NON_DEFAULT_FEATURES="models"
 
+.PHONY: install-with-federation
+install-with-federation:
+	make install SPICED_NON_DEFAULT_FEATURES="federation-experimental"
+
 .PHONY: install-cli
 install-cli: build-cli
 	mkdir -p ~/.spice/bin

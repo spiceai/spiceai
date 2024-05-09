@@ -32,7 +32,7 @@ use datafusion::common::OwnedTableReference;
 use datafusion::config::CatalogOptions;
 use datafusion::datasource::ViewTable;
 use datafusion::error::DataFusionError;
-use datafusion::execution::context::{SessionConfig, SessionContext};
+use datafusion::execution::context::{SessionConfig, SessionContext, SessionState};
 use datafusion::physical_plan::collect;
 use datafusion::sql::parser::DFParser;
 use datafusion::sql::sqlparser;
@@ -159,7 +159,17 @@ impl DataFusion {
             );
         df_config.options_mut().sql_parser.dialect = "PostgreSQL".to_string();
 
-        let ctx = SessionContext::new_with_config_rt(df_config, default_runtime_env());
+        let state = SessionState::new_with_config_rt(df_config, default_runtime_env());
+
+        #[cfg(feature = "federation-experimental")]
+        let state = {
+            use datafusion_federation::{FederatedQueryPlanner, FederationAnalyzerRule};
+            state
+                .add_analyzer_rule(Arc::new(FederationAnalyzerRule::new()))
+                .with_query_planner(Arc::new(FederatedQueryPlanner::new()))
+        };
+
+        let ctx = SessionContext::new_with_state(state);
 
         let catalog = MemoryCatalogProvider::new();
         let schema = SpiceSchemaProvider::new();
