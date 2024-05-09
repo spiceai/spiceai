@@ -93,7 +93,7 @@ jobs:
             spiced
 
   test_acceleration:
-    name: 'Arrow types using ${{ matrix.acceleration.engine }} on ${{ matrix.target.name }}'
+    name: '${{ matrix.acceleration.engine }} acceleration on ${{ matrix.target.name }}'
     runs-on: ${{ matrix.target.runner }}
     needs:
       - build
@@ -469,7 +469,7 @@ jobs:
           
           declare -a types=("boolean" "int8" "int16" "int32" "int64" "float32" "float64" "date32" "date64" "timestamp_ms" "time64_us" "string" "binary" "decimal128" "decimal256" "list_int" "list_string" "duration_ms")
 
-          echo "| Arrow Type | Match | Non-accelerated | Accelerated |" >> $GITHUB_STEP_SUMMARY
+          echo "| Type | Match | Non-accelerated | Accelerated |" >> $GITHUB_STEP_SUMMARY
           echo "| --- | --- | --- | --- |" >> $GITHUB_STEP_SUMMARY
 
           for type in "${types[@]}"
