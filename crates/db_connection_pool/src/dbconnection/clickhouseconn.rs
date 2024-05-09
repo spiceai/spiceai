@@ -90,7 +90,10 @@ impl<'a> AsyncDbConnection<ClientHandle, &'a (dyn Sync)> for ClickhouseConnectio
         unreachable!()
     }
 
-    async fn get_schema(&self, table_reference: &TableReference) -> Result<SchemaRef> {
+    async fn get_schema(
+        &self,
+        table_reference: &TableReference,
+    ) -> Result<SchemaRef, super::Error> {
         let mut conn = self.conn.lock().await;
         let conn = &mut *conn;
         let block = conn
@@ -100,8 +103,13 @@ impl<'a> AsyncDbConnection<ClientHandle, &'a (dyn Sync)> for ClickhouseConnectio
             ))
             .fetch_all()
             .await
-            .context(QuerySnafu)?;
-        let rec = block_to_arrow(&block).context(ConversionSnafu)?;
+            .boxed()
+            .context(super::UnableToGetSchemaSnafu)?;
+
+        let rec = block_to_arrow(&block)
+            .boxed()
+            .context(super::UnableToGetSchemaSnafu)?;
+
         Ok(rec.schema())
     }
 

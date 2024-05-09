@@ -109,14 +109,25 @@ where
     }
 
     #[must_use]
-    async fn get_schema(&self, table_reference: &TableReference) -> Result<SchemaRef> {
+    async fn get_schema(
+        &self,
+        table_reference: &TableReference,
+    ) -> Result<SchemaRef, super::Error> {
         let cxn = self.conn.lock().await;
 
-        let mut prepared = cxn.prepare(&format!(
-            "SELECT * FROM {} LIMIT 1",
-            table_reference.to_quoted_string()
-        ))?;
-        let schema = Arc::new(arrow_schema_from(&mut prepared)?);
+        let mut prepared = cxn
+            .prepare(&format!(
+                "SELECT * FROM {} LIMIT 1",
+                table_reference.to_quoted_string()
+            ))
+            .boxed()
+            .context(super::UnableToGetSchemaSnafu)?;
+
+        let schema = Arc::new(
+            arrow_schema_from(&mut prepared)
+                .boxed()
+                .context(super::UnableToGetSchemaSnafu)?,
+        );
 
         Ok(schema)
     }
