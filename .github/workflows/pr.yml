@@ -12,7 +12,7 @@ on:
 jobs:
   lint:
     name: Run Go & Rust Linters
-    runs-on: rust
+    runs-on: ubuntu-latest
     env:
       GOVER: 1.22.0
 
@@ -79,5 +79,7 @@ jobs:
           file: Dockerfile
           platforms: linux/amd64
           push: false
+          build-args: |
+            CARGO_FEATURES=odbc
           tags: |
             ghcr.io/spiceai/spiceai-rust:ci
