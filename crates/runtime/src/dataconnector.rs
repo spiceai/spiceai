@@ -43,6 +43,8 @@ pub mod dremio;
 pub mod duckdb;
 #[cfg(feature = "flightsql")]
 pub mod flightsql;
+#[cfg(feature = "ftp")]
+pub mod ftp;
 pub mod localhost;
 #[cfg(feature = "mysql")]
 pub mod mysql;
@@ -171,6 +173,8 @@ pub async fn register_all() {
     #[cfg(feature = "flightsql")]
     register_connector_factory("flightsql", flightsql::FlightSQL::create).await;
     register_connector_factory("s3", s3::S3::create).await;
+    #[cfg(feature = "sftp")]
+    register_connector_factory("ftp", ftp::FTP::create).await;
     register_connector_factory("spiceai", spiceai::SpiceAI::create).await;
     #[cfg(feature = "mysql")]
     register_connector_factory("mysql", mysql::MySQL::create).await;
