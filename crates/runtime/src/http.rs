@@ -17,7 +17,7 @@ limitations under the License.
 use std::{collections::HashMap, fmt::Debug, net::SocketAddr, sync::Arc};
 
 use app::App;
-use models::model::Model;
+use model_components::model::Model;
 use snafu::prelude::*;
 use tokio::{
     net::{TcpListener, ToSocketAddrs},

@@ -4461,7 +4461,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c9be0862c1b3f26a88803c4a49de6889c10e608b3ee9344e6ef5b45fb37ad3d1"
 
 [[package]]
-name = "models"
+name = "model_components"
 version = "0.13.0-alpha"
 dependencies = [
  "arrow",
@@ -6182,7 +6182,7 @@ dependencies = [
  "itertools 0.12.1",
  "lazy_static",
  "metrics",
- "models",
+ "model_components",
  "mysql_async",
  "ndarray",
  "notify",

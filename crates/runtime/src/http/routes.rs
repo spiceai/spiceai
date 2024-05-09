@@ -16,7 +16,7 @@ limitations under the License.
 
 use crate::{config, datafusion::DataFusion};
 use app::App;
-use models::model::Model;
+use model_components::model::Model;
 use std::net::SocketAddr;
 use std::{collections::HashMap, sync::Arc};
 

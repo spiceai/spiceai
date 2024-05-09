@@ -17,8 +17,7 @@ limitations under the License.
 #![allow(clippy::missing_errors_doc)]
 
 use crate::{
-    modelruntime::{self, ModelRuntime, Runnable},
-    modelsource::{path, source, Error as ModelSourceError, ModelSource},
+    modelformat::from_path as format_from_path, modelruntime::{supported_runtime_for_path, Error as ModelRuntimeError, Runnable}, modelsource::{path, Error as ModelSourceError, ModelSource, ModelSourceType}
 };
 use arrow::record_batch::RecordBatch;
 use secrets::Secret;
@@ -40,10 +39,10 @@ pub enum Error {
     UnableToLoadModel { source: ModelSourceError },
 
     #[snafu(display("Unable to init model: {source}"))]
-    UnableToInitModel { source: modelruntime::Error },
+    UnableToInitModel { source: ModelRuntimeError },
 
     #[snafu(display("Unable to run model: {source}"))]
-    UnableToRunModel { source: modelruntime::Error },
+    UnableToRunModel { source: ModelRuntimeError },
 
     #[snafu(display("Unable to load required secrets"))]
     UnableToLoadRequiredSecrets {},
@@ -54,7 +53,11 @@ impl Model {
         model: spicepod::component::model::Model,
         secret: Option<Secret>,
     ) -> Result<Self> {
-        let source = source(&model.from);
+
+        let Ok(source) = model.from.parse::<ModelSourceType>() else {
+            return Err(Error::UnknownModelSource { source: ModelSourceError::UnknownModelSource {model_source: model.from } })
+        };
+        
 
         let Some(secret) = secret else {
             tracing::warn!(
@@ -71,21 +74,41 @@ impl Model {
         params.insert("from".to_string(), path(&model.from));
         params.insert("files".to_string(), model.files.join(",").to_string());
 
-        let tract = modelruntime::tract::Tract {
-            path: Into::<Box<dyn ModelSource>>::into(source)
+        let model_source: Option<Box<dyn ModelSource>> = source.into();
+        if let Some(model_source) = model_source {
+            let path = model_source
                 .pull(secret, Arc::new(Option::from(params)))
                 .await
-                .context(UnableToLoadModelSnafu)?
-                .clone()
-                .to_string(),
-        }
-        .load()
-        .context(UnableToInitModelSnafu {})?;
+                .context(UnableToLoadModelSnafu)?;
 
-        Ok(Self {
-            runnable: tract,
-            model: model.clone(),
-        })
+            match format_from_path(path.as_str()) {
+                Some(format) => {
+                    match supported_runtime_for_path(path.as_str()) {
+                        Ok(runtime) => {
+                            let runnable = runtime.load().context(UnableToInitModelSnafu {})?;
+                            Ok(Self {
+                                runnable,
+                                model: model.clone(),
+                            })
+                        }
+                        Err(_) => {
+                            return Err(Error::UnableToLoadModel {
+                                source: ModelSourceError::UnsupportedModelFormat { model_format: format },
+                            });
+                        }
+                    }
+                },
+                None => {
+                    return Err(Error::UnknownModelSource {
+                        source: ModelSourceError::UnknownModelSource {
+                            model_source: model.from,
+                        },
+                    });     
+                }
+            }
+        } else {
+            return Err(Error::UnknownModelSource { source: ModelSourceError::UnknownModelSource { model_source: source.to_string() } })
+        }
     }
 
     pub fn run(&self, data: Vec<RecordBatch>) -> Result<RecordBatch> {

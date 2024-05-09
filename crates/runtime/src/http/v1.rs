@@ -557,7 +557,7 @@ pub(crate) mod models {
         Extension,
     };
     use csv::Writer;
-    use models::model::Model;
+    use model_components::model::Model;
     use serde::{Deserialize, Serialize};
     use tokio::sync::RwLock;
 
@@ -634,7 +634,7 @@ pub(crate) mod inference {
         response::{IntoResponse, Response},
         Extension, Json,
     };
-    use models::{model::Model, modelsource};
+    use model_components::{model::Model, modelsource};
     use serde::{Deserialize, Serialize};
     use std::time::Instant;
     use std::{collections::HashMap, sync::Arc};

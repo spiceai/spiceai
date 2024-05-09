@@ -28,7 +28,7 @@ use ::datafusion::sql::sqlparser::{self, ast};
 use accelerated_table::AcceleratedTable;
 use app::App;
 use config::Config;
-use models::{model::Model, modelsource::source as model_source};
+use model_components::{model::Model, modelsource::source as model_source};
 pub use notify::Error as NotifyError;
 use secrets::{spicepod_secret_store_type, Secret};
 use snafu::prelude::*;

@@ -24,8 +24,13 @@ use std::fmt;
 use std::str::FromStr;
 use std::sync::Arc;
 
+use crate::modelformat::ModelFormat;
+
+#[cfg(feature = "full")]
 pub mod huggingface;
+#[cfg(feature = "full")]
 pub mod local;
+#[cfg(feature = "full")]
 pub mod spiceai;
 
 #[derive(Debug, Snafu)]
@@ -54,6 +59,9 @@ pub enum Error {
 
     #[snafu(display("Unknown data source: {model_source}"))]
     UnknownModelSource { model_source: String },
+
+    #[snafu(display("No runtime supported for model format: {model_format}"))]
+    UnsupportedModelFormat { model_format: ModelFormat },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -133,13 +141,23 @@ pub fn ensure_model_path(name: &str) -> Result<String> {
     Ok(model_path.to_string())
 }
 
-impl From<ModelSourceType> for Box<dyn ModelSource> {
+impl From<ModelSourceType> for Option<Box<dyn ModelSource>> {
     fn from(source: ModelSourceType) -> Self {
-        match source {
-            ModelSourceType::Local => Box::new(local::Local {}),
-            ModelSourceType::SpiceAI => Box::new(spiceai::SpiceAI {}),
-            ModelSourceType::Huggingface => Box::new(huggingface::Huggingface {}),
+        #[cfg(feature = "full")]
+        if source == ModelSourceType::Local {
+            return Some(Box::new(local::Local {}));
+        } 
+        
+        #[cfg(feature = "full")]
+        if source == ModelSourceType::SpiceAI {
+            return Some(Box::new(spiceai::SpiceAI {}));
         }
+
+        #[cfg(feature = "full")]
+        if source == ModelSourceType::Huggingface {
+            return Some(Box::new(huggingface::Huggingface {}));
+        }
+        return None
     }
 }
 
