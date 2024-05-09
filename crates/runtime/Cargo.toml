@@ -72,6 +72,7 @@ chrono = { version = "0.4.38" }
 clickhouse-rs = { workspace = true, optional = true }
 dashmap = "5.5.3"
 snowflake-api = { workspace = true, optional = true }
+datafusion-federation = { workspace = true, optional = true }
 
 [features]
 default = ["keyring-secret-store", "aws-secrets-manager"]
@@ -111,3 +112,4 @@ dremio = []
 odbc = ["db_connection_pool/odbc", "data_components/odbc", "dep:odbc-api"]
 snowflake = ["dep:snowflake-api", "db_connection_pool/snowflake", "data_components/snowflake"]
 models = ["model_components/full"]
+federation-experimental = ["dep:datafusion-federation"]
