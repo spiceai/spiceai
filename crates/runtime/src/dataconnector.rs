@@ -121,7 +121,7 @@ pub enum DataConnectorError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Invalid configuration for {dataconnector}: {message}"))]
+    #[snafu(display("Invalid configuration for {dataconnector}. {message}"))]
     InvalidConfiguration {
         dataconnector: String,
         message: String,
