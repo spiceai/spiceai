@@ -80,7 +80,7 @@ impl ModelRuntime for Tract {
     }
 
     fn supports_format(format: ModelFormat) -> bool {
-        return format == ModelFormat::Onnx(onnx::Onnx {});
+        format == ModelFormat::Onnx(onnx::Onnx {})
     }
 }
 
