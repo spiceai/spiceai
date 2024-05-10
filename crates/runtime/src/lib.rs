@@ -445,7 +445,7 @@ impl Runtime {
         )?;
 
         match dataconnector::create_new_connector(source, secret, params).await {
-            Some(dc) => dc.context(UnableToInitializeDataConnectorSnafu {}),
+            Some(dc) => dc.context(UnableToInitializeDataConnectorSnafu),
             None => UnknownDataConnectorSnafu {
                 data_connector: source,
             }
