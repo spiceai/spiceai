@@ -127,6 +127,14 @@ pub enum DataConnectorError {
         message: String,
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[snafu(display(
+        "Failed to get data connector from source for dataset {dataconnector}. Table {table_name} not found. Ensure the table name is correctly spelled in the spicepod."
+    ))]
+    InvalidTableName {
+        dataconnector: String,
+        table_name: String,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

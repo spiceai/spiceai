@@ -90,12 +90,27 @@ impl DataConnector for Postgres {
         &self,
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        Ok(
-            Read::table_provider(&self.postgres_factory, dataset.path().into())
-                .await
-                .context(super::UnableToGetReadProviderSnafu {
-                    dataconnector: "postgres",
-                })?,
-        )
+        match Read::table_provider(&self.postgres_factory, dataset.path().into()).await {
+            Ok(provider) => Ok(provider),
+            Err(e) => {
+                if let Some(err_source) = e.source() {
+                    if let Some(db_connection_pool::dbconnection::Error::UndefinedTable {
+                        table_name,
+                        source: _,
+                    }) = err_source.downcast_ref::<db_connection_pool::dbconnection::Error>()
+                    {
+                        return Err(DataConnectorError::InvalidTableName {
+                            dataconnector: "postgres".to_string(),
+                            table_name: table_name.clone(),
+                        });
+                    }
+                }
+
+                return Err(DataConnectorError::UnableToGetReadProvider {
+                    dataconnector: "postgres".to_string(),
+                    source: e,
+                });
+            }
+        }
     }
 }
