@@ -43,12 +43,6 @@ pub enum PostgresError {
         source: arrow_sql_gen::postgres::Error,
     },
 
-    #[snafu(display("Table {table_name} not found. Ensure the table name is correctly spelled."))]
-    UndefinedTableError {
-        source: Box<tokio_postgres::error::DbError>,
-        table_name: String,
-    },
-
     #[snafu(display("{source}"))]
     InternalError {
         source: tokio_postgres::error::Error,
