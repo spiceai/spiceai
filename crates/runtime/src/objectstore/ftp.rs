@@ -13,7 +13,6 @@ use object_store::{
 };
 use suppaftp::FtpStream;
 use tokio::io::AsyncWrite;
-use tonic::IntoRequest;
 
 #[derive(Debug)]
 pub struct FTPObjectStore {

@@ -8,11 +8,12 @@ use datafusion::{
     },
 };
 use object_store::{aws::AmazonS3Builder, ObjectStore};
-use suppaftp::FtpStream;
 use url::{form_urlencoded::parse, Url};
 
 #[cfg(feature = "ftp")]
 use crate::objectstore::ftp::FTPObjectStore;
+#[cfg(feature = "ftp")]
+use suppaftp::FtpStream;
 
 #[allow(clippy::module_name_repetitions)]
 #[derive(Debug, Default)]
