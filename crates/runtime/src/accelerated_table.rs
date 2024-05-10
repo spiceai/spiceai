@@ -230,8 +230,8 @@ impl AcceleratedTable {
     pub async fn update_refresh_sql(&self, refresh_sql: Option<String>) -> Result<()> {
         let dataset_name = &self.dataset_name;
 
-        if refresh_sql.is_some() {
-            tracing::info!("[refresh] Updating refresh SQL for {dataset_name}");
+        if let Some(sql_str) = refresh_sql {
+            tracing::info!("[refresh] Updating refresh SQL for {dataset_name} to {sql_str}");
         } else {
             tracing::info!("[refresh] Removing refresh SQL for {dataset_name}");
         }
