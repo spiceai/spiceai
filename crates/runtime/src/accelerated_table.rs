@@ -68,12 +68,6 @@ pub struct AcceleratedTable {
     zero_results_action: ZeroResultsAction,
 }
 
-pub(crate) enum AccelerationRefreshMode {
-    Full(Receiver<()>),
-    BatchAppend(Receiver<()>),
-    Append,
-}
-
 fn validate_refresh_data_window(refresh: &refresh::Refresh, dataset: &str, schema: &SchemaRef) {
     if refresh.period.is_some() {
         if let Some(time_column) = &refresh.time_column {
@@ -131,8 +125,8 @@ impl Builder {
         let mut scheduled_refreshes_handle: Option<JoinHandle<()>> = None;
         let (ready_sender, is_ready) = oneshot::channel::<()>();
 
-        let acceleration_refresh_mode: AccelerationRefreshMode = match self.refresh.mode {
-            RefreshMode::Append => AccelerationRefreshMode::Append,
+        let acceleration_refresh_mode: refresh::AccelerationRefreshMode = match self.refresh.mode {
+            RefreshMode::Append => refresh::AccelerationRefreshMode::Append,
             ref mode @ (RefreshMode::Full | RefreshMode::BatchAppend) => {
                 let (trigger, receiver) = mpsc::channel::<()>(1);
                 refresh_trigger = Some(trigger.clone());
@@ -142,22 +136,25 @@ impl Builder {
                 )
                 .await;
                 match mode {
-                    RefreshMode::Full => AccelerationRefreshMode::Full(receiver),
-                    RefreshMode::Append => AccelerationRefreshMode::BatchAppend(receiver),
+                    RefreshMode::Full => refresh::AccelerationRefreshMode::Full(receiver),
+                    RefreshMode::Append => refresh::AccelerationRefreshMode::BatchAppend(receiver),
                     RefreshMode::BatchAppend => panic!("cannot be matched here"),
                 }
             }
         };
 
         validate_refresh_data_window(&self.refresh, &self.dataset_name, &self.federated.schema());
-        let refresh_handle = tokio::spawn(refresh::start(
+        let refresher = refresh::Refresher::new(
             self.dataset_name.clone(),
             Arc::clone(&self.federated),
             self.refresh,
-            acceleration_refresh_mode,
             Arc::clone(&self.accelerator),
-            ready_sender,
-        ));
+        );
+        let refresh_handle = tokio::spawn(async move {
+            refresher
+                .start(acceleration_refresh_mode, ready_sender)
+                .await;
+        });
 
         let mut handlers = vec![];
         handlers.push(refresh_handle);

@@ -60,257 +60,272 @@ impl Refresh {
     }
 }
 
-pub(crate) async fn start(
+pub(crate) enum AccelerationRefreshMode {
+    Full(Receiver<()>),
+    BatchAppend(Receiver<()>),
+    Append,
+}
+
+pub(crate) struct Refresher {
     dataset_name: String,
     federated: Arc<dyn TableProvider>,
     refresh: Refresh,
-    acceleration_refresh_mode: super::AccelerationRefreshMode,
     accelerator: Arc<dyn TableProvider>,
-    ready_sender: oneshot::Sender<()>,
-) {
-    let mut stream = stream_updates(
-        dataset_name.clone(),
-        Arc::clone(&accelerator),
-        federated,
-        refresh,
-        acceleration_refresh_mode,
-    );
-
-    let ctx = SessionContext::new();
-
-    let mut ready_sender = Some(ready_sender);
-
-    loop {
-        let future_result = stream.next().await;
-
-        match future_result {
-            Some(data_update) => {
-                let Ok(data_update) = data_update else {
-                    continue;
-                };
-                let state = ctx.state();
-
-                let overwrite = data_update.update_type == UpdateType::Overwrite;
-                match accelerator
-                    .insert_into(
-                        &state,
-                        Arc::new(DataUpdateExecutionPlan::new(data_update)),
-                        overwrite,
-                    )
-                    .await
-                {
-                    Ok(plan) => {
-                        if let Err(e) = collect(plan, ctx.task_ctx()).await {
-                            tracing::error!("Error adding data for {dataset_name}: {e}");
-                        } else if let Some(sender) = ready_sender.take() {
-                            sender.send(()).ok();
-                        };
-                    }
-                    Err(e) => {
-                        tracing::error!("Error adding data for {dataset_name}: {e}");
-                    }
-                }
-            }
-            None => break,
-        };
-    }
 }
 
-#[allow(clippy::needless_pass_by_value)]
-fn stream_updates<'a>(
-    dataset_name: String,
-    accelerator: Arc<dyn TableProvider>,
-    federated: Arc<dyn TableProvider>,
-    refresh: Refresh,
-    acceleration_refresh_mode: super::AccelerationRefreshMode,
-) -> BoxStream<'a, super::Result<DataUpdate>> {
-    let ctx = get_refresh_df_context(&dataset_name, &federated, &accelerator);
-
-    match acceleration_refresh_mode {
-        super::AccelerationRefreshMode::Append => {
-            Box::pin(get_append_stream(dataset_name, federated, ctx))
-        }
-        super::AccelerationRefreshMode::Full(receiver)
-        | super::AccelerationRefreshMode::BatchAppend(receiver) => Box::pin(
-            get_full_or_batch_append_update_stream(federated, refresh, receiver, dataset_name, ctx),
-        ),
-    }
-}
-
-fn get_full_or_batch_append_update_stream(
-    federated: Arc<dyn TableProvider>,
-    refresh: Refresh,
-    receiver: Receiver<()>,
-    dataset_name: String,
-    mut ctx: SessionContext,
-) -> impl Stream<Item = super::Result<DataUpdate>> {
-    let schema = federated.schema();
-    let column = refresh.time_column.as_deref().unwrap_or_default();
-    let field = schema.column_with_name(column).map(|(_, f)| f).cloned();
-    let mut refresh_stream = ReceiverStream::new(receiver);
-    let filter_converter = TimestampFilterConvert::create(
-        field,
-        refresh.time_column.clone(),
-        refresh.time_format.clone(),
-    );
-    stream! {
-        while refresh_stream.next().await.is_some() {
-            let timer = TimeMeasurement::new(
-                "load_dataset_duration_ms",
-                vec![("dataset", dataset_name.clone())],
-            );
-            yield get_full_or_batch_append_update(
-                dataset_name.clone(),
-                refresh.clone(),
-                filter_converter.clone(),
-                &mut ctx,
-                Arc::clone(&federated),
-            )
-            .await;
-            drop(timer);
+impl Refresher {
+    pub(crate) fn new(
+        dataset_name: String,
+        federated: Arc<dyn TableProvider>,
+        refresh: Refresh,
+        accelerator: Arc<dyn TableProvider>,
+    ) -> Self {
+        Self {
+            dataset_name,
+            federated,
+            refresh,
+            accelerator,
         }
     }
-}
 
-async fn get_full_or_batch_append_update(
-    dataset_name: String,
-    refresh: Refresh,
-    filter_converter: Option<TimestampFilterConvert>,
-    ctx: &mut SessionContext,
-    federated: Arc<dyn TableProvider>,
-) -> super::Result<DataUpdate> {
-    tracing::info!("[refresh] Loading data for dataset {dataset_name}");
-    status::update_dataset(dataset_name.as_str(), status::ComponentStatus::Refreshing);
-    let refresh = refresh.clone();
-    let filters =
-        if let (Some(period), Some(converter)) = (refresh.period, filter_converter.as_ref()) {
-            let start = SystemTime::now() - period;
+    pub(crate) async fn start(
+        &self,
+        acceleration_refresh_mode: AccelerationRefreshMode,
+        ready_sender: oneshot::Sender<()>,
+    ) {
+        let dataset_name = self.dataset_name.clone();
+        let mut stream = self.stream_updates(acceleration_refresh_mode);
 
-            let timestamp = get_timestamp(start);
-            vec![converter.convert(timestamp, Operator::Gt)]
-        } else {
-            vec![]
-        };
+        let ctx = SessionContext::new();
 
-    let update_type = match refresh.mode {
-        RefreshMode::Full => UpdateType::Overwrite,
-        _ => UpdateType::Append,
-    };
+        let mut ready_sender = Some(ready_sender);
 
-    match get_data_update(
-        ctx,
-        dataset_name.clone(),
-        federated,
-        refresh.sql,
-        filters,
-        update_type,
-    )
-    .await
-    {
-        Ok(data) => Ok(data),
-        Err(e) => {
-            tracing::error!("[refresh] Failed to load data for dataset {dataset_name}: {e}");
-            Err(e)
-        }
-    }
-}
-
-async fn get_data_update(
-    ctx: &mut SessionContext,
-    dataset_name: String,
-    federated: Arc<dyn TableProvider>,
-    sql: Option<String>,
-    filters: Vec<Expr>,
-    update_type: UpdateType,
-) -> super::Result<DataUpdate> {
-    match get_data(
-        ctx,
-        OwnedTableReference::bare(dataset_name.clone()),
-        Arc::clone(&federated),
-        sql,
-        filters,
-    )
-    .await
-    .map(|data| DataUpdate {
-        schema: data.0,
-        data: data.1,
-        update_type,
-    }) {
-        Ok(data) => Ok(data),
-        Err(e) => Err(super::Error::UnableToGetDataFromConnector { source: e }),
-    }
-}
-
-fn get_append_stream(
-    dataset_name: String,
-    federated: Arc<dyn TableProvider>,
-    ctx: SessionContext,
-) -> impl Stream<Item = super::Result<DataUpdate>> {
-    stream! {
-        let plan = federated
-            .scan(&ctx.state(), None, &[], None)
-            .await
-            .context(super::UnableToScanTableProviderSnafu {})?;
-
-        if plan.output_partitioning().partition_count() > 1 {
-            tracing::error!(
-                "Append mode is not supported for datasets with multiple partitions: {dataset_name}"
-            );
-            return;
-        }
-
-        let schema = federated.schema();
-
-        let mut stream = plan
-            .execute(0, ctx.task_ctx())
-            .context(super::UnableToScanTableProviderSnafu {})?;
         loop {
-            match stream.next().await {
-                Some(Ok(batch)) => {
-                    yield Ok(DataUpdate {
-                        schema: Arc::clone(&schema),
-                        data: vec![batch],
-                        update_type: UpdateType::Append,
-                    });
-                }
-                Some(Err(e)) => {
-                    tracing::error!("Error reading data for dataset {dataset_name}: {e}");
-                    yield Err(super::Error::UnableToScanTableProvider { source: e });
+            let future_result = stream.next().await;
+
+            match future_result {
+                Some(data_update) => {
+                    let Ok(data_update) = data_update else {
+                        continue;
+                    };
+                    let state = ctx.state();
+
+                    let overwrite = data_update.update_type == UpdateType::Overwrite;
+                    match self
+                        .accelerator
+                        .insert_into(
+                            &state,
+                            Arc::new(DataUpdateExecutionPlan::new(data_update)),
+                            overwrite,
+                        )
+                        .await
+                    {
+                        Ok(plan) => {
+                            if let Err(e) = collect(plan, ctx.task_ctx()).await {
+                                tracing::error!("Error adding data for {dataset_name}: {e}");
+                            } else if let Some(sender) = ready_sender.take() {
+                                sender.send(()).ok();
+                            };
+                        }
+                        Err(e) => {
+                            tracing::error!("Error adding data for {dataset_name}: {e}");
+                        }
+                    }
                 }
                 None => break,
+            };
+        }
+    }
+
+    fn stream_updates(
+        &self,
+        acceleration_refresh_mode: AccelerationRefreshMode,
+    ) -> BoxStream<'_, super::Result<DataUpdate>> {
+        match acceleration_refresh_mode {
+            AccelerationRefreshMode::Append => Box::pin(self.get_append_stream()),
+            AccelerationRefreshMode::Full(receiver) => {
+                Box::pin(self.get_full_update_stream(receiver))
+            }
+            AccelerationRefreshMode::BatchAppend(receiver) => {
+                Box::pin(self.get_batch_append_update_stream(receiver))
             }
         }
     }
-}
 
-fn get_refresh_df_context(
-    dataset_name: &String,
-    federated: &Arc<dyn TableProvider>,
-    accelerator: &Arc<dyn TableProvider>,
-) -> SessionContext {
-    let ctx = SessionContext::new_with_config_rt(
-        SessionConfig::new().set_bool(
-            "datafusion.execution.listing_table_ignore_subdirectory",
-            false,
-        ),
-        default_runtime_env(),
-    );
-    if let Err(e) = ctx.register_table(
-        OwnedTableReference::bare(dataset_name.clone()),
-        Arc::clone(federated),
-    ) {
-        tracing::error!("Unable to register federated table: {e}");
+    fn get_append_stream(&self) -> impl Stream<Item = super::Result<DataUpdate>> {
+        let ctx = self.get_refresh_df_context();
+        let federated = Arc::clone(&self.federated);
+        let dataset_name = self.dataset_name.clone();
+
+        stream! {
+            let plan = federated
+                .scan(&ctx.state(), None, &[], None)
+                .await
+                .context(super::UnableToScanTableProviderSnafu {})?;
+
+            if plan.output_partitioning().partition_count() > 1 {
+                tracing::error!(
+                    "Append mode is not supported for datasets with multiple partitions: {dataset_name}"
+                );
+                return;
+            }
+
+            let schema = federated.schema();
+
+            let mut stream = plan
+                .execute(0, ctx.task_ctx())
+                .context(super::UnableToScanTableProviderSnafu {})?;
+            loop {
+                match stream.next().await {
+                    Some(Ok(batch)) => {
+                        yield Ok(DataUpdate {
+                            schema: Arc::clone(&schema),
+                            data: vec![batch],
+                            update_type: UpdateType::Append,
+                        });
+                    }
+                    Some(Err(e)) => {
+                        tracing::error!("Error reading data for dataset {dataset_name}: {e}");
+                        yield Err(super::Error::UnableToScanTableProvider { source: e });
+                    }
+                    None => break,
+                }
+            }
+        }
     }
 
-    let acc_dataset_name = format!("accelerated_{dataset_name}");
+    fn get_full_update_stream(
+        &self,
+        receiver: Receiver<()>,
+    ) -> impl Stream<Item = super::Result<DataUpdate>> + '_ {
+        let dataset_name = self.dataset_name.clone();
 
-    if let Err(e) = ctx.register_table(
-        OwnedTableReference::bare(acc_dataset_name),
-        Arc::clone(accelerator),
-    ) {
-        tracing::error!("Unable to register accelerator table: {e}");
+        let mut refresh_stream = ReceiverStream::new(receiver);
+        stream! {
+            while refresh_stream.next().await.is_some() {
+                let timer = TimeMeasurement::new(
+                    "load_dataset_duration_ms",
+                    vec![("dataset", dataset_name.clone())],
+                );
+                yield self.get_full_or_batch_append_update(None).await;
+                drop(timer);
+            }
+        }
     }
-    ctx
+
+    fn get_batch_append_update_stream(
+        &self,
+        receiver: Receiver<()>,
+    ) -> impl Stream<Item = super::Result<DataUpdate>> + '_ {
+        let dataset_name = self.dataset_name.clone();
+
+        let mut refresh_stream = ReceiverStream::new(receiver);
+        stream! {
+            while refresh_stream.next().await.is_some() {
+                let timer = TimeMeasurement::new(
+                    "batch_append_dataset_duration_ms",
+                    vec![("dataset", dataset_name.clone())],
+                );
+                yield self.get_full_or_batch_append_update(None).await;
+                drop(timer);
+            }
+        }
+    }
+
+    async fn get_full_or_batch_append_update(
+        &self,
+        overwrite_timestamp_in_nano: Option<u128>,
+    ) -> super::Result<DataUpdate> {
+        let dataset_name = self.dataset_name.clone();
+        let refresh = self.refresh.clone();
+        let filter_converter = self.get_filter_converter();
+
+        tracing::info!("[refresh] Loading data for dataset {dataset_name}");
+        status::update_dataset(dataset_name.as_str(), status::ComponentStatus::Refreshing);
+        let refresh = refresh.clone();
+        let filters =
+            if let (Some(period), Some(converter)) = (refresh.period, filter_converter.as_ref()) {
+                let timestamp = overwrite_timestamp_in_nano
+                    .unwrap_or(get_timestamp(SystemTime::now() - period));
+
+                vec![converter.convert(timestamp, Operator::Gt)]
+            } else {
+                vec![]
+            };
+
+        match self.get_data_update(filters).await {
+            Ok(data) => Ok(data),
+            Err(e) => {
+                tracing::error!("[refresh] Failed to load data for dataset {dataset_name}: {e}");
+                Err(e)
+            }
+        }
+    }
+
+    async fn get_data_update(&self, filters: Vec<Expr>) -> super::Result<DataUpdate> {
+        let update_type = match self.refresh.clone().mode {
+            RefreshMode::Full => UpdateType::Overwrite,
+            _ => UpdateType::Append,
+        };
+        let mut ctx = self.get_refresh_df_context();
+        let federated = Arc::clone(&self.federated);
+        let dataset_name = self.dataset_name.clone();
+        match get_data(
+            &mut ctx,
+            OwnedTableReference::bare(dataset_name.clone()),
+            Arc::clone(&federated),
+            self.refresh.sql.clone(),
+            filters,
+        )
+        .await
+        .map(|data| DataUpdate {
+            schema: data.0,
+            data: data.1,
+            update_type,
+        }) {
+            Ok(data) => Ok(data),
+            Err(e) => Err(super::Error::UnableToGetDataFromConnector { source: e }),
+        }
+    }
+
+    fn get_refresh_df_context(&self) -> SessionContext {
+        let ctx = SessionContext::new_with_config_rt(
+            SessionConfig::new().set_bool(
+                "datafusion.execution.listing_table_ignore_subdirectory",
+                false,
+            ),
+            default_runtime_env(),
+        );
+        let dataset_name = self.dataset_name.clone();
+        if let Err(e) = ctx.register_table(
+            OwnedTableReference::bare(dataset_name.clone()),
+            Arc::clone(&self.federated),
+        ) {
+            tracing::error!("Unable to register federated table: {e}");
+        }
+
+        let acc_dataset_name = format!("accelerated_{dataset_name}");
+
+        if let Err(e) = ctx.register_table(
+            OwnedTableReference::bare(acc_dataset_name),
+            Arc::clone(&self.accelerator),
+        ) {
+            tracing::error!("Unable to register accelerator table: {e}");
+        }
+        ctx
+    }
+
+    fn get_filter_converter(&self) -> Option<TimestampFilterConvert> {
+        let schema = self.federated.schema();
+        let column = self.refresh.time_column.as_deref().unwrap_or_default();
+        let field = schema.column_with_name(column).map(|(_, f)| f).cloned();
+
+        TimestampFilterConvert::create(
+            field,
+            self.refresh.time_column.clone(),
+            self.refresh.time_format.clone(),
+        )
+    }
 }
 
 pub(crate) fn get_timestamp(time: SystemTime) -> u128 {
