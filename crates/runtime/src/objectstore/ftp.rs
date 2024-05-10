@@ -67,6 +67,7 @@ impl ObjectStore for FTPObjectStore {
             version: None,
         };
         let stream = client.retr_as_stream(location_string.clone()).unwrap();
+        // TODO: slow performance properly pipe to stream
         let stream = stream
             .bytes()
             .map(|x| {
