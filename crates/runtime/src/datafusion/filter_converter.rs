@@ -26,7 +26,7 @@ pub(crate) struct TimestampFilterConvert {
 #[allow(clippy::needless_pass_by_value)]
 impl TimestampFilterConvert {
     pub(crate) fn create(
-        field: Option<&arrow::datatypes::Field>,
+        field: Option<arrow::datatypes::Field>,
         time_column: Option<String>,
         mut time_format: Option<TimeFormat>,
     ) -> Option<Self> {
@@ -112,19 +112,19 @@ mod test {
     #[test]
     fn test_timestamp_filter_convert() {
         test(
-            &Field::new("timestamp", DataType::Int64, false),
+            Field::new("timestamp", DataType::Int64, false),
             TimeFormat::UnixMillis,
             1_620_000_000_000_000_000,
             "timestamp > UInt64(1620000000000)",
         );
         test(
-            &Field::new("timestamp", DataType::Int64, false),
+            Field::new("timestamp", DataType::Int64, false),
             TimeFormat::UnixSeconds,
             1_620_000_000_000_000_000,
             "timestamp > UInt64(1620000000)",
         );
         test(
-            &Field::new(
+            Field::new(
                 "timestamp",
                 DataType::Timestamp(TimeUnit::Second, None),
                 false,
@@ -134,7 +134,7 @@ mod test {
             "timestamp > TimestampMillisecond(1620000000000, None)",
         );
         test(
-            &Field::new(
+            Field::new(
                 "timestamp",
                 DataType::Utf8,
                 false,
@@ -145,7 +145,7 @@ mod test {
         );
     }
 
-    fn test(field: &Field, time_format: TimeFormat, timestamp: u128, expected: &str) {
+    fn test(field: Field, time_format: TimeFormat, timestamp: u128, expected: &str) {
         let time_column = "timestamp".to_string();
         let timestamp_filter_convert =
             TimestampFilterConvert::create(Some(field), Some(time_column), Some(time_format));
