@@ -21,7 +21,6 @@ use spicepod::component::dataset::TimeFormat;
 use tokio::task::JoinHandle;
 use tokio::time::interval;
 
-use tokio::sync::mpsc::Receiver;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::dataconnector;

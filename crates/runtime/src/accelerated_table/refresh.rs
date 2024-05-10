@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use arrow::array::TimestampNanosecondArray;
 use async_stream::stream;
 use datafusion::common::OwnedTableReference;
 use datafusion::execution::config::SessionConfig;
@@ -226,10 +227,112 @@ impl Refresher {
                     "batch_append_dataset_duration_ms",
                     vec![("dataset", dataset_name.clone())],
                 );
-                yield self.get_full_or_batch_append_update(None).await;
+                yield self.get_full_or_batch_append_update(self.get_latest_timestamp().await).await;
                 drop(timer);
             }
         }
+    }
+
+    #[allow(clippy::cast_sign_loss)]
+    async fn get_latest_timestamp(&self) -> Option<u128> {
+        let ctx = self.get_refresh_df_context();
+
+        let result = match self.refresh.time_column.clone() {
+            Some(column) => match ctx
+                .sql(
+                    format!(
+                        "SELECT {column} FROM accelerated_{} order by column desc limit 1",
+                        self.dataset_name.clone()
+                    )
+                    .as_str(),
+                )
+                .await
+            {
+                Ok(df) => {
+                    let result = df.collect().await;
+                    match result {
+                        Ok(result) => {
+                            let schema = result.first()?.schema();
+                            let field = schema.field(0);
+                            let column = result.first()?.column(0);
+
+                            match field.data_type() {
+                                arrow::datatypes::DataType::Int8
+                                | arrow::datatypes::DataType::Int16
+                                | arrow::datatypes::DataType::Int32
+                                | arrow::datatypes::DataType::Int64
+                                | arrow::datatypes::DataType::UInt8
+                                | arrow::datatypes::DataType::UInt16
+                                | arrow::datatypes::DataType::UInt32
+                                | arrow::datatypes::DataType::UInt64 => {
+                                    match self.refresh.time_format.clone() {
+                                        Some(TimeFormat::UnixSeconds) => Some(
+                                            arrow::compute::cast(
+                                                &arrow::compute::cast(
+                                                    column,
+                                                    &arrow::datatypes::DataType::Timestamp(
+                                                        arrow::datatypes::TimeUnit::Second,
+                                                        None,
+                                                    ),
+                                                )
+                                                .ok()?,
+                                                &arrow::datatypes::DataType::Timestamp(
+                                                    arrow::datatypes::TimeUnit::Nanosecond,
+                                                    None,
+                                                ),
+                                            )
+                                            .ok()?
+                                            .as_any()
+                                            .downcast_ref::<TimestampNanosecondArray>()?
+                                            .value(0),
+                                        ),
+                                        Some(TimeFormat::UnixMillis) => Some(
+                                            arrow::compute::cast(
+                                                &arrow::compute::cast(
+                                                    column,
+                                                    &arrow::datatypes::DataType::Timestamp(
+                                                        arrow::datatypes::TimeUnit::Millisecond,
+                                                        None,
+                                                    ),
+                                                )
+                                                .ok()?,
+                                                &arrow::datatypes::DataType::Timestamp(
+                                                    arrow::datatypes::TimeUnit::Nanosecond,
+                                                    None,
+                                                ),
+                                            )
+                                            .ok()?
+                                            .as_any()
+                                            .downcast_ref::<TimestampNanosecondArray>()?
+                                            .value(0),
+                                        ),
+                                        _ => todo!(),
+                                    }
+                                }
+                                _ => Some(
+                                    arrow::compute::cast(
+                                        column,
+                                        &arrow::datatypes::DataType::Timestamp(
+                                            arrow::datatypes::TimeUnit::Nanosecond,
+                                            None,
+                                        ),
+                                    )
+                                    .ok()?
+                                    .as_any()
+                                    .downcast_ref::<TimestampNanosecondArray>()?
+                                    .value(0),
+                                ),
+                            }
+                        }
+                        Err(_) => None,
+                    }
+                }
+                Err(_) => None,
+            },
+            None => None,
+        };
+
+        result.map(|n| n as u128)
     }
 
     async fn get_full_or_batch_append_update(
