@@ -433,6 +433,32 @@ impl DataFusion {
         Ok(())
     }
 
+    pub async fn update_refresh_sql(
+        &self,
+        dataset_name: &str,
+        refresh_sql: Option<String>,
+    ) -> Result<()> {
+        if let Some(sql) = &refresh_sql {
+            refresh_sql::validate_refresh_sql(dataset_name, sql).context(RefreshSqlSnafu)?;
+        }
+
+        let table = self
+            .ctx
+            .table_provider(OwnedTableReference::bare(dataset_name.to_string()))
+            .await
+            .context(UnableToGetTableSnafu)?;
+
+        if let Some(accelerated_table) = table.as_any().downcast_ref::<AcceleratedTable>() {
+            accelerated_table
+                .update_refresh_sql(refresh_sql)
+                .await
+                .context(UnableToTriggerRefreshSnafu {
+                    table_name: dataset_name.to_string(),
+                })?;
+        }
+        Ok(())
+    }
+
     /// Federated tables are attached directly as tables visible in the public `DataFusion` context.
     async fn register_federated_table(
         &self,
