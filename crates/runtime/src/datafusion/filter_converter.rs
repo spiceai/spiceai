@@ -100,3 +100,56 @@ impl TimestampFilterConvert {
         }
     }
 }
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, TimeUnit};
+
+    #[test]
+    fn test_timestamp_filter_convert() {
+        test(
+            &Field::new("timestamp", DataType::Int64, false),
+            TimeFormat::UnixMillis,
+            1_620_000_000,
+            "timestamp > UInt64(1620000000000)",
+        );
+        test(
+            &Field::new("timestamp", DataType::Int64, false),
+            TimeFormat::UnixSeconds,
+            1_620_000_000,
+            "timestamp > UInt64(1620000000)",
+        );
+        test(
+            &Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Second, None),
+                false,
+            ),
+            TimeFormat::UnixSeconds,
+            1_620_000_000,
+            "timestamp > TimestampMillisecond(1620000000000, None)",
+        );
+        test(
+            &Field::new(
+                "timestamp",
+                DataType::Utf8,
+                false,
+            ),
+            TimeFormat::UnixSeconds,
+            1_620_000_000,
+            "CAST(timestamp AS Timestamp(Millisecond, None)) > TimestampMillisecond(1620000000000, None)",
+        );
+    }
+
+    fn test(field: &Field, time_format: TimeFormat, timestamp: u64, expected: &str) {
+        let time_column = "timestamp".to_string();
+        let timestamp_filter_convert =
+            TimestampFilterConvert::create(Some(field), Some(time_column), Some(time_format));
+        assert!(timestamp_filter_convert.is_some());
+        let timestamp_filter_convert =
+            timestamp_filter_convert.expect("the convert can be created");
+        let expr = timestamp_filter_convert.convert(timestamp, Operator::Gt);
+        assert_eq!(expr.to_string(), expected);
+    }
+}
