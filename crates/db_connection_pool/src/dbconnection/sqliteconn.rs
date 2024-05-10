@@ -68,7 +68,10 @@ impl AsyncDbConnection<Connection, &'static (dyn ToSql + Sync)> for SqliteConnec
         SqliteConnection { conn }
     }
 
-    async fn get_schema(&self, table_reference: &TableReference) -> Result<SchemaRef> {
+    async fn get_schema(
+        &self,
+        table_reference: &TableReference,
+    ) -> Result<SchemaRef, super::Error> {
         let table_reference = table_reference.to_quoted_string();
         let schema = self
             .conn
@@ -83,7 +86,9 @@ impl AsyncDbConnection<Connection, &'static (dyn ToSql + Sync)> for SqliteConnec
                 Ok(schema)
             })
             .await
-            .context(ConnectionSnafu)?;
+            .boxed()
+            .context(super::UnableToGetSchemaSnafu)?;
+
         Ok(schema)
     }
 
