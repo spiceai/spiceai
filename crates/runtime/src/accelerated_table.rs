@@ -231,7 +231,7 @@ impl AcceleratedTable {
         let dataset_name = &self.dataset_name;
 
         if refresh_sql.is_some() {
-            tracing::info!("[refresh] Updating refresh SQL for {dataset_name}");
+            tracing::info!("[refresh] Updating refresh SQL for {dataset_name} to {sql_str}");
         } else {
             tracing::info!("[refresh] Removing refresh SQL for {dataset_name}");
         }
