@@ -2301,7 +2301,7 @@ dependencies = [
 [[package]]
 name = "datafusion-federation"
 version = "0.1.3"
-source = "git+https://github.com/phillipleblanc/datafusion-federation.git?branch=phillip/240509-allow-non-federated-scans#9122c92f69358bacb47f82159fb1de7e733e928f"
+source = "git+https://github.com/phillipleblanc/datafusion-federation.git?branch=spiceai#c6c95420772e7360a41fccec1e4caf43c3f40f70"
 dependencies = [
  "async-trait",
  "datafusion",

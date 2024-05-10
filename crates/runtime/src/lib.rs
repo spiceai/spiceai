@@ -300,6 +300,17 @@ impl Runtime {
         let shared_secrets_provider: Arc<RwLock<secrets::SecretsProvider>> =
             Arc::clone(&self.secrets_provider);
 
+        // test dataset connectivity by attempting to get a read provider
+        if let Err(err) = data_connector.read_provider(&ds).await {
+            status::update_dataset(&ds.name, status::ComponentStatus::Error);
+            metrics::counter!("datasets_load_error").increment(1);
+            warn_spaced!(spaced_tracer, "{}{err}", "");
+            return UnableToLoadDatasetConnectorSnafu {
+                dataset: ds.name.clone(),
+            }
+            .fail();
+        }
+
         let data_connector = Arc::clone(&data_connector);
         match Runtime::register_dataset(
             &ds,
