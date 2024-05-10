@@ -129,10 +129,11 @@ pub enum DataConnectorError {
     },
 
     #[snafu(display(
-        "Failed to get data connector from source for dataset {dataconnector}. Table {table_name} not found. Ensure the table name is correctly spelled in the spicepod."
+        "Failed to get {dataconnector} data connector for dataset {dataset_name}. Table {table_name} not found. Ensure the table name is correctly spelled in the spicepod."
     ))]
     InvalidTableName {
         dataconnector: String,
+        dataset_name: String,
         table_name: String,
     },
 }

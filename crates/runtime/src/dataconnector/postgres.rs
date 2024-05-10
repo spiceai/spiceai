@@ -101,6 +101,7 @@ impl DataConnector for Postgres {
                     {
                         return Err(DataConnectorError::InvalidTableName {
                             dataconnector: "postgres".to_string(),
+                            dataset_name: dataset.name.to_string(),
                             table_name: table_name.clone(),
                         });
                     }
