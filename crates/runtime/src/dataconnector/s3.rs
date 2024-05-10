@@ -14,23 +14,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::object_store_registry::default_runtime_env;
-
+use super::macros::impl_listing_data_connector;
 use super::{AnyErrorResult, DataConnector, DataConnectorFactory};
-use async_trait::async_trait;
+
 use datafusion::datasource::file_format::file_compression_type::FileCompressionType;
 use datafusion::datasource::file_format::{csv::CsvFormat, parquet::ParquetFormat, FileFormat};
-use datafusion::datasource::listing::{
-    ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
-};
-use datafusion::datasource::TableProvider;
+
 use datafusion::error::DataFusionError;
-use datafusion::execution::config::SessionConfig;
-use datafusion::execution::context::SessionContext;
 use secrets::Secret;
 use snafu::prelude::*;
 use spicepod::component::dataset::Dataset;
-use std::any::Any;
 use std::clone::Clone;
 use std::pin::Pin;
 use std::str::FromStr;
@@ -179,68 +172,4 @@ fn get_csv_format(params: &HashMap<String, String>) -> AnyErrorResult<Arc<CsvFor
     ))
 }
 
-#[async_trait]
-impl DataConnector for S3 {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    async fn read_provider(
-        &self,
-        dataset: &Dataset,
-    ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        let ctx = SessionContext::new_with_config_rt(
-            SessionConfig::new().set_bool(
-                "datafusion.execution.listing_table_ignore_subdirectory",
-                false,
-            ),
-            default_runtime_env(),
-        );
-
-        let url = self
-            .get_object_store_url(dataset)
-            .context(super::InvalidConfigurationSnafu {
-                dataconnector: "s3",
-                message: "Unable to parse URL",
-            })?;
-
-        let table_path =
-            ListingTableUrl::parse(url)
-                .boxed()
-                .context(super::InvalidConfigurationSnafu {
-                    dataconnector: "s3".to_string(),
-                    message: "Unable to parse URL",
-                })?;
-
-        let (file_format, extension) =
-            self.get_file_format_and_extension()
-                .context(super::InvalidConfigurationSnafu {
-                    dataconnector: "s3".to_string(),
-                    message: "Unable to resolve file_format and file_extension",
-                })?;
-        let options = ListingOptions::new(file_format).with_file_extension(&extension);
-
-        let resolved_schema = options
-            .infer_schema(&ctx.state(), &table_path)
-            .await
-            .boxed()
-            .context(super::InvalidConfigurationSnafu {
-                dataconnector: "s3".to_string(),
-                message: "Unable to infer files schema",
-            })?;
-
-        let config = ListingTableConfig::new(table_path)
-            .with_listing_options(options)
-            .with_schema(resolved_schema);
-
-        let table =
-            ListingTable::try_new(config)
-                .boxed()
-                .context(super::InvalidConfigurationSnafu {
-                    dataconnector: "s3".to_string(),
-                    message: "Unable to list files in S3 bucket",
-                })?;
-
-        Ok(Arc::new(table))
-    }
-}
+impl_listing_data_connector!(S3);

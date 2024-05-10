@@ -11,7 +11,7 @@ use object_store::{aws::AmazonS3Builder, ObjectStore};
 use suppaftp::FtpStream;
 use url::{form_urlencoded::parse, Url};
 
-use crate::dataconnector::ftp::FTPObjectStore;
+use crate::objectstore::ftp::FTPObjectStore;
 
 #[allow(clippy::module_name_repetitions)]
 #[derive(Debug, Default)]
@@ -54,9 +54,11 @@ impl SpiceObjectStoreRegistry {
                     return Ok(Arc::new(s3_builder.build()?));
                 }
             }
+            #[cfg(feature = "ftp")]
             if url.as_str().starts_with("ftp://") {
                 let mut ftp_stream = FtpStream::connect("eu-central-1.sftpcloud.io:21").unwrap();
                 let _ = ftp_stream.login("username", "password");
+                let _ = ftp_stream.cwd("taxi_trips");
                 let ftp_object_store = FTPObjectStore::new(ftp_stream);
 
                 return Ok(Arc::new(ftp_object_store) as Arc<dyn ObjectStore>);

@@ -14,34 +14,20 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use super::macros::impl_listing_data_connector;
 use super::{AnyErrorResult, DataConnector, DataConnectorFactory};
-use arrow::array::timezone::TzOffset;
-use arrow_ipc::Date;
-use async_trait::async_trait;
-use bytes::Bytes;
-use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
-use datafusion::datasource::TableProvider;
+use datafusion::datasource::file_format::csv::CsvFormat;
+use datafusion::datasource::file_format::file_compression_type::FileCompressionType;
+use datafusion::datasource::file_format::parquet::ParquetFormat;
+use datafusion::datasource::file_format::FileFormat;
 use datafusion::error::DataFusionError;
-use datafusion::execution::context::SessionContext;
-use datafusion::execution::options::ParquetReadOptions;
-use futures::stream::BoxStream;
-use futures::StreamExt;
-use object_store::path::Path;
-use object_store::{
-    GetOptions, GetResult, GetResultPayload, ListResult, MultipartId, ObjectMeta, ObjectStore,
-    PutOptions, PutResult,
-};
 use secrets::Secret;
 use snafu::prelude::*;
 use spicepod::component::dataset::Dataset;
-use std::any::Any;
-use std::io::Read;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::str::FromStr;
+use std::sync::Arc;
 use std::{collections::HashMap, future::Future};
-use suppaftp::FtpStream;
-use tokio::io::AsyncWrite;
-use tonic::IntoRequest;
 use url::Url;
 
 #[derive(Debug, Snafu)]
@@ -73,6 +59,17 @@ pub enum Error {
     UnableToBuildLogicalPlan {
         source: DataFusionError,
     },
+
+    #[snafu(display("Unsupported file format {format} in S3 Connector"))]
+    UnsupportedFileFormat {
+        format: String,
+    },
+
+    #[snafu(display("Unsupported compression type for CSV"))]
+    UnsupportedCompressionType {
+        source: DataFusionError,
+        compression_type: String,
+    },
 }
 
 pub struct FTP {
@@ -95,157 +92,48 @@ impl DataConnectorFactory for FTP {
     }
 }
 
-#[derive(Debug)]
-pub struct FTPObjectStore {
-    client: Arc<Mutex<FtpStream>>,
-}
-
-impl std::fmt::Display for FTPObjectStore {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "FTS")
+impl FTP {
+    fn get_object_store_url(&self, dataset: &Dataset) -> AnyErrorResult<Url> {
+        Ok(Url::parse(&dataset.from).unwrap())
     }
-}
 
-impl FTPObjectStore {
-    pub fn new(client: FtpStream) -> Self {
-        Self {
-            client: Arc::new(Mutex::new(client)),
+    fn get_file_format_and_extension(&self) -> AnyErrorResult<(Arc<dyn FileFormat>, String)> {
+        let params = &self.params;
+        let extension = params.get("file_extension").cloned();
+
+        match params.get("file_format").map(String::as_str) {
+            Some("csv") => Ok((
+                get_csv_format(params)?,
+                extension.unwrap_or(".csv".to_string()),
+            )),
+            None | Some("parquet") => Ok((
+                Arc::new(ParquetFormat::default()),
+                extension.unwrap_or(".parquet".to_string()),
+            )),
+            Some(format) => Err(Error::UnsupportedFileFormat {
+                format: format.to_string(),
+            }
+            .into()),
         }
     }
 }
 
-#[async_trait]
-impl ObjectStore for FTPObjectStore {
-    async fn put_opts(&self, _: &Path, _: Bytes, _: PutOptions) -> object_store::Result<PutResult> {
-        unimplemented!()
-    }
+fn get_csv_format(params: &HashMap<String, String>) -> AnyErrorResult<Arc<CsvFormat>> {
+    let compression_type = params.get("compression_type").map_or("", |f| f);
+    let has_header = params.get("has_header").map_or(true, |f| f == "true");
+    let delimiter = params
+        .get("delimiter")
+        .map_or(b',', |f| *f.as_bytes().first().unwrap_or(&b','));
 
-    async fn put_multipart(
-        &self,
-        _: &Path,
-    ) -> object_store::Result<(MultipartId, Box<dyn AsyncWrite + Unpin + Send>)> {
-        unimplemented!()
-    }
-
-    async fn abort_multipart(&self, _: &Path, _: &MultipartId) -> object_store::Result<()> {
-        unimplemented!()
-    }
-
-    async fn get_opts(
-        &self,
-        location: &Path,
-        options: GetOptions,
-    ) -> object_store::Result<GetResult> {
-        let mut client = self.client.lock().unwrap();
-        let client = &mut *client;
-        let location_string: Arc<str> = location.to_string().into();
-        let object_meta = ObjectMeta {
-            location: location.clone(),
-            size: client.size(location_string.clone()).unwrap(),
-            last_modified: client.mdtm(location_string.clone()).unwrap().and_utc(),
-            e_tag: None,
-            version: None,
-        };
-        let stream = client.retr_as_stream(location_string.clone()).unwrap();
-
-        unimplemented!()
-    }
-
-    async fn delete(&self, _: &Path) -> object_store::Result<()> {
-        unimplemented!()
-    }
-
-    fn delete_stream<'a>(
-        &'a self,
-        _: BoxStream<'a, object_store::Result<Path>>,
-    ) -> BoxStream<'a, object_store::Result<Path>> {
-        unimplemented!()
-    }
-
-    fn list(&self, _: Option<&Path>) -> BoxStream<'_, object_store::Result<ObjectMeta>> {
-        let mut client = self.client.lock().unwrap();
-        let client = &mut *client;
-        client.cwd("taxi_trips").unwrap();
-        let list = client.nlst(None).unwrap();
-
-        let list = list
-            .iter()
-            .map(|x| {
-                let path = Path::from(x.clone());
-
-                Ok(ObjectMeta {
-                    location: path,
-                    size: client.size(x.clone()).unwrap(),
-                    last_modified: client.mdtm(x.clone()).unwrap().and_utc(),
-                    e_tag: None,
-                    version: None,
-                })
-            })
-            .collect::<Vec<_>>();
-        futures::stream::iter(list.into_iter()).boxed()
-    }
-
-    fn list_with_offset(
-        &self,
-        _: Option<&Path>,
-        _: &Path,
-    ) -> BoxStream<'_, object_store::Result<ObjectMeta>> {
-        unimplemented!()
-    }
-
-    async fn list_with_delimiter(&self, _: Option<&Path>) -> object_store::Result<ListResult> {
-        unimplemented!()
-    }
-
-    async fn copy(&self, _: &Path, _: &Path) -> object_store::Result<()> {
-        unimplemented!()
-    }
-
-    async fn copy_if_not_exists(&self, _: &Path, _: &Path) -> object_store::Result<()> {
-        unimplemented!()
-    }
+    Ok(Arc::new(
+        CsvFormat::default()
+            .with_has_header(has_header)
+            .with_file_compression_type(
+                FileCompressionType::from_str(compression_type)
+                    .context(UnsupportedCompressionTypeSnafu { compression_type })?,
+            )
+            .with_delimiter(delimiter),
+    ))
 }
 
-impl FTP {
-    fn get_object_store(
-        &self,
-        dataset: &Dataset,
-    ) -> Option<AnyErrorResult<(Url, Arc<dyn ObjectStore + 'static>)>> {
-        let result: AnyErrorResult<(Url, Arc<dyn ObjectStore + 'static>)> = (|| {
-            let url = dataset.from.clone();
-            let mut ftp_stream = FtpStream::connect("eu-central-1.sftpcloud.io:21").unwrap();
-            let _ = ftp_stream.login("username", "password");
-            let ftp_object_store = FTPObjectStore::new(ftp_stream);
-
-            let ftp_url = Url::parse(&url).context(UnableToParseURLSnafu { url: url.clone() })?;
-            Ok((ftp_url, Arc::new(ftp_object_store) as Arc<dyn ObjectStore>))
-        })();
-
-        Some(result)
-    }
-}
-
-#[async_trait]
-impl DataConnector for FTP {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    async fn read_provider(
-        &self,
-        dataset: &Dataset,
-    ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        let ctx = SessionContext::new();
-
-        let (url, ftp) = self.get_object_store(dataset).unwrap().unwrap();
-
-        let _ = ctx.runtime_env().register_object_store(&url, ftp);
-
-        let df = ctx
-            .read_parquet(&dataset.from, ParquetReadOptions::default())
-            .await
-            .unwrap();
-
-        Ok(df.into_view())
-    }
-}
+impl_listing_data_connector!(FTP);
