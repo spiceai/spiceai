@@ -492,14 +492,14 @@ pub(crate) mod datasets {
                 .into_response();
         };
 
-        let Some(refresh_sql) = payload.refresh_sql else {
+        if payload.refresh_sql.is_none() {
             return (status::StatusCode::OK).into_response();
-        };
+        }
 
         let df_read = df.read().await;
 
         match df_read
-            .update_refresh_sql(&dataset.name, Some(refresh_sql))
+            .update_refresh_sql(&dataset.name, payload.refresh_sql)
             .await
         {
             Ok(()) => (status::StatusCode::OK).into_response(),

@@ -46,7 +46,10 @@ pub(crate) fn routes(
         .route("/v1/sql", post(v1::query::post))
         .route("/v1/status", get(v1::status::get))
         .route("/v1/datasets", get(v1::datasets::get))
-        .route("/v1/datasets/:name/refresh", post(v1::datasets::refresh))
+        .route(
+            "/v1/datasets/:name/acceleration/refresh",
+            post(v1::datasets::refresh),
+        )
         .route(
             "/v1/datasets/:name/acceleration",
             patch(v1::datasets::acceleration),
