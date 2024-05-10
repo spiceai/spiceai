@@ -29,7 +29,6 @@ use arrow::datatypes::Schema;
 use arrow_tools::schema::verify_schema;
 use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider};
 use datafusion::common::OwnedTableReference;
-use datafusion::config::CatalogOptions;
 use datafusion::datasource::ViewTable;
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::{SessionConfig, SessionContext, SessionState};
@@ -49,6 +48,10 @@ pub mod refresh_sql;
 pub mod schema;
 
 use self::schema::SpiceSchemaProvider;
+
+const SPICE_DEFAULT_CATALOG: &str = "spice";
+const SPICE_RUNTIME_SCHEMA: &str = "runtime";
+const SPICE_DEFAULT_SCHEMA: &str = "public";
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -88,6 +91,9 @@ pub enum Error {
 
     #[snafu(display("Unable to register table in DataFusion: {source}"))]
     UnableToRegisterTableToDataFusion { source: DataFusionError },
+
+    #[snafu(display("Unable to register system table in DataFusion: {source}"))]
+    UnableToRegisterSystemTableToDataFusion { source: DataFusionError },
 
     #[snafu(display("Expected acceleration settings for {name}, found None"))]
     ExpectedAccelerationSettings { name: String },
@@ -148,8 +154,6 @@ impl DataFusion {
     /// Panics if the default schema cannot be registered.
     #[must_use]
     pub fn new() -> Self {
-        let catalog_options = CatalogOptions::default();
-
         let mut df_config = SessionConfig::new()
             .with_information_schema(true)
             .with_create_default_catalog_and_schema(false)
@@ -158,6 +162,8 @@ impl DataFusion {
                 false,
             );
         df_config.options_mut().sql_parser.dialect = "PostgreSQL".to_string();
+        df_config.options_mut().catalog.default_catalog = SPICE_DEFAULT_CATALOG.to_string();
+        df_config.options_mut().catalog.default_schema = SPICE_DEFAULT_SCHEMA.to_string();
 
         let state = SessionState::new_with_config_rt(df_config, default_runtime_env());
 
@@ -172,15 +178,24 @@ impl DataFusion {
         let ctx = SessionContext::new_with_state(state);
 
         let catalog = MemoryCatalogProvider::new();
-        let schema = SpiceSchemaProvider::new();
+        let default_schema = SpiceSchemaProvider::new();
+        let runtime_schema = SpiceSchemaProvider::new();
 
-        match catalog.register_schema(&catalog_options.default_schema, Arc::new(schema)) {
+        match catalog.register_schema(SPICE_DEFAULT_SCHEMA, Arc::new(default_schema)) {
             Ok(_) => {}
             Err(e) => {
                 panic!("Unable to register default schema: {e}");
             }
         }
-        ctx.register_catalog(&catalog_options.default_catalog, Arc::new(catalog));
+
+        match catalog.register_schema(SPICE_RUNTIME_SCHEMA, Arc::new(runtime_schema)) {
+            Ok(_) => {}
+            Err(e) => {
+                panic!("Unable to register spice runtime schema: {e}");
+            }
+        }
+
+        ctx.register_catalog(SPICE_DEFAULT_CATALOG, Arc::new(catalog));
 
         DataFusion {
             ctx: Arc::new(ctx),
@@ -415,6 +430,32 @@ impl DataFusion {
             .fail()?;
         }
 
+        Ok(())
+    }
+
+    pub async fn update_refresh_sql(
+        &self,
+        dataset_name: &str,
+        refresh_sql: Option<String>,
+    ) -> Result<()> {
+        if let Some(sql) = &refresh_sql {
+            refresh_sql::validate_refresh_sql(dataset_name, sql).context(RefreshSqlSnafu)?;
+        }
+
+        let table = self
+            .ctx
+            .table_provider(OwnedTableReference::bare(dataset_name.to_string()))
+            .await
+            .context(UnableToGetTableSnafu)?;
+
+        if let Some(accelerated_table) = table.as_any().downcast_ref::<AcceleratedTable>() {
+            accelerated_table
+                .update_refresh_sql(refresh_sql)
+                .await
+                .context(UnableToTriggerRefreshSnafu {
+                    table_name: dataset_name.to_string(),
+                })?;
+        }
         Ok(())
     }
 

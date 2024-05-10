@@ -16,6 +16,7 @@ limitations under the License.
 
 use crate::{config, datafusion::DataFusion};
 use app::App;
+use axum::routing::patch;
 use model_components::model::Model;
 use std::net::SocketAddr;
 use std::{collections::HashMap, sync::Arc};
@@ -45,7 +46,14 @@ pub(crate) fn routes(
         .route("/v1/sql", post(v1::query::post))
         .route("/v1/status", get(v1::status::get))
         .route("/v1/datasets", get(v1::datasets::get))
-        .route("/v1/datasets/:name/refresh", post(v1::datasets::refresh))
+        .route(
+            "/v1/datasets/:name/acceleration/refresh",
+            post(v1::datasets::refresh),
+        )
+        .route(
+            "/v1/datasets/:name/acceleration",
+            patch(v1::datasets::acceleration),
+        )
         .route("/v1/spicepods", get(v1::spicepods::get))
         .route_layer(middleware::from_fn(track_metrics))
         .layer(Extension(app))
