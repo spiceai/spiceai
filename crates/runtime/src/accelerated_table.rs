@@ -68,7 +68,7 @@ pub struct AcceleratedTable {
     zero_results_action: ZeroResultsAction,
 }
 
-enum AccelerationRefreshMode {
+pub(crate) enum AccelerationRefreshMode {
     Full(Receiver<()>),
     BatchAppend(Receiver<()>),
     Append,

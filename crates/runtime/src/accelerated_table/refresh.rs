@@ -121,7 +121,7 @@ fn stream_updates<'a>(
     dataset_name: String,
     accelerator: Arc<dyn TableProvider>,
     federated: Arc<dyn TableProvider>,
-    refresh: super::Refresh,
+    refresh: Refresh,
     acceleration_refresh_mode: super::AccelerationRefreshMode,
 ) -> BoxStream<'a, super::Result<DataUpdate>> {
     let ctx = get_refresh_df_context(&dataset_name, &federated, &accelerator);
@@ -139,7 +139,7 @@ fn stream_updates<'a>(
 
 fn get_full_or_batch_append_update_stream(
     federated: Arc<dyn TableProvider>,
-    refresh: super::Refresh,
+    refresh: Refresh,
     receiver: Receiver<()>,
     dataset_name: String,
     mut ctx: SessionContext,
@@ -174,7 +174,7 @@ fn get_full_or_batch_append_update_stream(
 
 async fn get_full_or_batch_append_update(
     dataset_name: String,
-    refresh: super::Refresh,
+    refresh: Refresh,
     filter_converter: Option<TimestampFilterConvert>,
     ctx: &mut SessionContext,
     federated: Arc<dyn TableProvider>,
@@ -315,6 +315,6 @@ fn get_refresh_df_context(
 
 pub(crate) fn get_timestamp(time: SystemTime) -> u128 {
     time.duration_since(UNIX_EPOCH)
-        .expect("Clock should not go backwards more than EPOCH")
+        .unwrap_or_default()
         .as_nanos()
 }
