@@ -77,28 +77,30 @@ impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a (dyn Sync)> for SnowflakeConne
         SnowflakeConnection { api }
     }
 
-    async fn get_schema(&self, table_reference: &TableReference) -> Result<SchemaRef> {
+    async fn get_schema(
+        &self,
+        table_reference: &TableReference,
+    ) -> Result<SchemaRef, super::Error> {
         let table = table_reference.to_quoted_string();
 
         let res = self
             .api
             .exec(format!("SELECT * FROM {table} limit 1").as_str())
             .await
-            .context(SnowflakeQuerySnafu)?;
+            .boxed()
+            .context(super::UnableToGetSchemaSnafu)?;
 
         match res {
             snowflake_api::QueryResult::Arrow(record_batches) => {
                 let schema = record_batches[0].schema();
                 return Ok(Arc::clone(&schema));
             }
-            snowflake_api::QueryResult::Empty => UnableToRetrieveSchemaSnafu {
-                reason: "query to get table schema returned no result".to_string(),
-            }
-            .fail()?,
-            snowflake_api::QueryResult::Json(json) => UnexpectedResponseSnafu {
-                json: json.to_string(),
-            }
-            .fail()?,
+            snowflake_api::QueryResult::Empty => Err(super::Error::UnableToGetSchema {
+                source: "Empty response".to_string().into(),
+            }),
+            snowflake_api::QueryResult::Json(_json) => Err(super::Error::UnableToGetSchema {
+                source: "Unexpected response".to_string().into(),
+            }),
         }
     }
 
