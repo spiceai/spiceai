@@ -346,6 +346,7 @@ pub mod acceleration {
         #[default]
         Full,
         Append,
+        BatchAppend,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]

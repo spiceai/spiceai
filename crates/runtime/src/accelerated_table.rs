@@ -82,6 +82,7 @@ pub struct AcceleratedTable {
 
 enum AccelerationRefreshMode {
     Full(Receiver<()>),
+    BatchAppend(Receiver<()>),
     Append,
 }
 
@@ -144,7 +145,7 @@ impl Builder {
 
         let acceleration_refresh_mode: AccelerationRefreshMode = match self.refresh.mode {
             RefreshMode::Append => AccelerationRefreshMode::Append,
-            RefreshMode::Full => {
+            ref mode @ (RefreshMode::Full | RefreshMode::BatchAppend) => {
                 let (trigger, receiver) = mpsc::channel::<()>(1);
                 refresh_trigger = Some(trigger.clone());
                 scheduled_refreshes_handle = AcceleratedTable::schedule_regular_refreshes(
@@ -152,7 +153,11 @@ impl Builder {
                     trigger,
                 )
                 .await;
-                AccelerationRefreshMode::Full(receiver)
+                match mode {
+                    RefreshMode::Full => AccelerationRefreshMode::Full(receiver),
+                    RefreshMode::Append => AccelerationRefreshMode::BatchAppend(receiver),
+                    RefreshMode::BatchAppend => panic!("cannot be matched here"),
+                }
             }
         };
 
@@ -337,6 +342,7 @@ impl AcceleratedTable {
     ) {
         let mut stream = Self::stream_updates(
             dataset_name.clone(),
+            Arc::clone(&accelerator),
             federated,
             refresh,
             acceleration_refresh_mode,
@@ -385,6 +391,7 @@ impl AcceleratedTable {
     #[allow(clippy::needless_pass_by_value)]
     fn stream_updates<'a>(
         dataset_name: String,
+        accelerator: Arc<dyn TableProvider>,
         federated: Arc<dyn TableProvider>,
         refresh: Refresh,
         acceleration_refresh_mode: AccelerationRefreshMode,
@@ -401,6 +408,15 @@ impl AcceleratedTable {
             Arc::clone(&federated),
         ) {
             tracing::error!("Unable to register federated table: {e}");
+        }
+
+        let acc_dataset_name = format!("accelerated_{dataset_name}");
+
+        if let Err(e) = ctx.register_table(
+            OwnedTableReference::bare(acc_dataset_name),
+            Arc::clone(&accelerator),
+        ) {
+            tracing::error!("Unable to register accelerator table: {e}");
         }
 
         Box::pin(stream! {
@@ -433,7 +449,7 @@ impl AcceleratedTable {
                         }
                     }
                 }
-                AccelerationRefreshMode::Full(receiver) => {
+                AccelerationRefreshMode::Full(receiver) | AccelerationRefreshMode::BatchAppend(receiver) => {
                     let schema = federated.schema();
                     let column = refresh.time_column.as_deref().unwrap_or_default();
                     let field = schema.column_with_name(column).map(|(_, f)| f);
@@ -458,7 +474,8 @@ impl AcceleratedTable {
                             _ => vec![],
                         };
 
-                        let data = match get_data(&mut ctx, OwnedTableReference::bare(dataset_name.clone()), Arc::clone(&federated), refresh.sql.clone(), filters).await {
+                        let get_data_tmp = get_data(&mut ctx, OwnedTableReference::bare(dataset_name.clone()), Arc::clone(&federated), refresh.sql.clone(), filters).await;
+                        let data = match  get_data_tmp {
                             Ok(data) => data,
                             Err(e) => {
                                 tracing::error!("[refresh] Failed to load data for dataset {dataset_name}: {e}");
@@ -469,7 +486,10 @@ impl AcceleratedTable {
                         yield Ok(DataUpdate {
                             schema: data.0,
                             data: data.1,
-                            update_type: UpdateType::Overwrite,
+                            update_type: match refresh.mode {
+                                RefreshMode::Full => UpdateType::Overwrite,
+                                _ => UpdateType::Append,
+                            }
                         });
 
                         drop(timer);
@@ -480,11 +500,11 @@ impl AcceleratedTable {
     }
 }
 
-fn get_timestamp(time: SystemTime) -> Result<u64> {
+fn get_timestamp(time: SystemTime) -> Result<u128> {
     let timestamp = time
         .duration_since(UNIX_EPOCH)
         .context(UnableToGetUnixTimestampSnafu)?;
-    Ok(timestamp.as_secs())
+    Ok(timestamp.as_nanos())
 }
 
 impl Drop for AcceleratedTable {
