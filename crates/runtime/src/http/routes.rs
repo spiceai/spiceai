@@ -47,7 +47,10 @@ pub(crate) fn routes(
         .route("/v1/status", get(v1::status::get))
         .route("/v1/datasets", get(v1::datasets::get))
         .route("/v1/datasets/:name/refresh", post(v1::datasets::refresh))
-        .route("/v1/datasets/:name/acceleration", patch(v1::datasets::acceleration))
+        .route(
+            "/v1/datasets/:name/acceleration",
+            patch(v1::datasets::acceleration),
+        )
         .route("/v1/spicepods", get(v1::spicepods::get))
         .route_layer(middleware::from_fn(track_metrics))
         .layer(Extension(app))

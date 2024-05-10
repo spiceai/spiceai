@@ -26,7 +26,7 @@ use tokio::task::JoinHandle;
 use tokio::time::interval;
 
 use tokio::sync::mpsc::Receiver;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::datafusion::filter_converter::TimestampFilterConvert;
@@ -78,6 +78,7 @@ pub struct AcceleratedTable {
     refresh_trigger: Option<mpsc::Sender<()>>,
     handlers: Vec<JoinHandle<()>>,
     zero_results_action: ZeroResultsAction,
+    refresh: Arc<RwLock<Refresh>>,
 }
 
 enum AccelerationRefreshMode {
@@ -157,10 +158,13 @@ impl Builder {
         };
 
         validate_refresh_data_window(&self.refresh, &self.dataset_name, &self.federated.schema());
+
+        let refresh = Arc::new(RwLock::new(self.refresh));
+
         let refresh_handle = tokio::spawn(AcceleratedTable::start_refresh(
             self.dataset_name.clone(),
             Arc::clone(&self.federated),
-            self.refresh,
+            Arc::clone(&refresh),
             acceleration_refresh_mode,
             Arc::clone(&self.accelerator),
             ready_sender,
@@ -190,6 +194,7 @@ impl Builder {
                 refresh_trigger,
                 handlers,
                 zero_results_action: self.zero_results_action,
+                refresh,
             },
             is_ready,
         )
@@ -219,6 +224,19 @@ impl AcceleratedTable {
             }
         }
 
+        Ok(())
+    }
+
+    pub async fn update_refresh_sql(&self, refresh_sql: Option<String>) -> Result<()> {
+        let dataset_name = &self.dataset_name;
+
+        if refresh_sql.is_some() {
+            tracing::info!("[refresh] Updating refresh SQL for {dataset_name}");
+        } else {
+            tracing::info!("[refresh] Removing refresh SQL for {dataset_name}");
+        }
+        let mut refresh = self.refresh.write().await;
+        refresh.sql = refresh_sql;
         Ok(())
     }
 
@@ -330,7 +348,7 @@ impl AcceleratedTable {
     async fn start_refresh(
         dataset_name: String,
         federated: Arc<dyn TableProvider>,
-        refresh: Refresh,
+        refresh: Arc<RwLock<Refresh>>,
         acceleration_refresh_mode: AccelerationRefreshMode,
         accelerator: Arc<dyn TableProvider>,
         ready_sender: oneshot::Sender<()>,
@@ -386,7 +404,7 @@ impl AcceleratedTable {
     fn stream_updates<'a>(
         dataset_name: String,
         federated: Arc<dyn TableProvider>,
-        refresh: Refresh,
+        refresh: Arc<RwLock<Refresh>>,
         acceleration_refresh_mode: AccelerationRefreshMode,
     ) -> BoxStream<'a, Result<DataUpdate>> {
         let mut ctx = SessionContext::new_with_config_rt(
@@ -434,18 +452,29 @@ impl AcceleratedTable {
                     }
                 }
                 AccelerationRefreshMode::Full(receiver) => {
+
+                    let refresh_lock = refresh.read().await;
+                    let refresh_settings = refresh_lock.clone();
+                    drop(refresh_lock);
+
                     let schema = federated.schema();
-                    let column = refresh.time_column.as_deref().unwrap_or_default();
+                    let column = refresh_settings.time_column.as_deref().unwrap_or_default();
                     let field = schema.column_with_name(column).map(|(_, f)| f);
-                    let filter_converter = TimestampFilterConvert::create(field, refresh.time_column, refresh.time_format);
+                    let filter_converter = TimestampFilterConvert::create(field, refresh_settings.time_column, refresh_settings.time_format);
 
                     let mut refresh_stream = ReceiverStream::new(receiver);
 
                     while refresh_stream.next().await.is_some() {
                         tracing::info!("[refresh] Loading data for dataset {dataset_name}");
                         status::update_dataset(&dataset_name, status::ComponentStatus::Refreshing);
+
+                        let refresh_lock = refresh.read().await;
+                        let refresh_settings = refresh_lock.clone();
+                        drop(refresh_lock);
+
+
                         let timer = TimeMeasurement::new("load_dataset_duration_ms", vec![("dataset", dataset_name.clone())]);
-                        let filters = match (refresh.period, filter_converter.as_ref()){
+                        let filters = match (refresh_settings.period, filter_converter.as_ref()){
                             (Some(period), Some(converter)) => {
                                 let start = SystemTime::now() - period;
 
@@ -458,7 +487,7 @@ impl AcceleratedTable {
                             _ => vec![],
                         };
 
-                        let data = match get_data(&mut ctx, OwnedTableReference::bare(dataset_name.clone()), Arc::clone(&federated), refresh.sql.clone(), filters).await {
+                        let data = match get_data(&mut ctx, OwnedTableReference::bare(dataset_name.clone()), Arc::clone(&federated), refresh_settings.sql.clone(), filters).await {
                             Ok(data) => data,
                             Err(e) => {
                                 tracing::error!("[refresh] Failed to load data for dataset {dataset_name}: {e}");

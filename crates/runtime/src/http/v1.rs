@@ -303,7 +303,7 @@ pub(crate) mod datasets {
     use tokio::sync::RwLock;
     use tract_core::tract_data::itertools::Itertools;
 
-    use crate::{datafusion::{refresh_sql, DataFusion}, status::ComponentStatus};
+    use crate::{datafusion::DataFusion, status::ComponentStatus};
 
     use super::{convert_entry_to_csv, dataset_status, Format};
 
@@ -473,8 +473,6 @@ pub(crate) mod datasets {
         Path(dataset_name): Path<String>,
         Json(payload): Json<AccelerationRequest>,
     ) -> Response {
-        
-        
         let app_lock = app.read().await;
         let Some(readable_app) = &*app_lock else {
             return (status::StatusCode::INTERNAL_SERVER_ERROR).into_response();
@@ -494,25 +492,16 @@ pub(crate) mod datasets {
                 .into_response();
         };
 
-        let Some(refresh_sql) = payload.refresh_sql else  {
+        let Some(refresh_sql) = payload.refresh_sql else {
             return (status::StatusCode::OK).into_response();
         };
 
-        // TODO: move validation to data fusion logic
-        if let Err(e) = refresh_sql::validate_refresh_sql(dataset_name.as_str(), &refresh_sql) {
-            return (
-                status::StatusCode::BAD_REQUEST,
-                Json(MessageResponse {
-                    message: format!("Invalid refresh_sql parameter value. {e}"),
-                }),
-            )
-                .into_response();
-        }
-
         let df_read = df.read().await;
 
-        // TODO this should be extended to support the whole acceleration configuration, not just refresh_sql
-        match df_read.update_refresh_sql(&dataset.name, &refresh_sql).await {
+        match df_read
+            .update_refresh_sql(&dataset.name, Some(refresh_sql))
+            .await
+        {
             Ok(()) => (status::StatusCode::OK).into_response(),
             Err(e) => (
                 status::StatusCode::INTERNAL_SERVER_ERROR,
