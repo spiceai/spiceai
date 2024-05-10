@@ -1,53 +1,69 @@
-use std::time::{SystemTime, UNIX_EPOCH};
-use std::{any::Any, sync::Arc, time::Duration};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use arrow::array::UInt64Array;
-use arrow::datatypes::SchemaRef;
 use async_stream::stream;
-use async_trait::async_trait;
-use data_components::delete::get_deletion_provider;
 use datafusion::common::OwnedTableReference;
-use datafusion::error::Result as DataFusionResult;
 use datafusion::execution::config::SessionConfig;
-use datafusion::execution::context::SessionState;
-use datafusion::logical_expr::{Operator, TableProviderFilterPushDown};
-use datafusion::physical_plan::union::UnionExec;
-use datafusion::physical_plan::{collect, ExecutionPlan, ExecutionPlanProperties};
+use datafusion::logical_expr::Operator;
+use datafusion::physical_plan::{collect, ExecutionPlanProperties};
 use datafusion::{
-    datasource::{TableProvider, TableType},
-    execution::context::SessionContext,
-    logical_expr::Expr,
+    datasource::TableProvider, execution::context::SessionContext, logical_expr::Expr,
 };
 use futures::Stream;
 use futures::{stream::BoxStream, StreamExt};
 use snafu::prelude::*;
-use spicepod::component::dataset::acceleration::{RefreshMode, ZeroResultsAction};
-use spicepod::component::dataset::TimeFormat;
-use tokio::task::JoinHandle;
-use tokio::time::interval;
+use spicepod::component::dataset::acceleration::RefreshMode;
 
+use spicepod::component::dataset::TimeFormat;
 use tokio::sync::mpsc::Receiver;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::datafusion::filter_converter::TimestampFilterConvert;
-use crate::execution_plan::fallback_on_zero_results::FallbackOnZeroResultsScanExec;
-use crate::execution_plan::schema_cast::SchemaCastScanExec;
-use crate::execution_plan::slice::SliceExec;
-use crate::execution_plan::tee::TeeExec;
-use crate::execution_plan::TableScanParams;
 use crate::object_store_registry::default_runtime_env;
 use crate::{
-    dataconnector::{self, get_data},
+    dataconnector::get_data,
     dataupdate::{DataUpdate, DataUpdateExecutionPlan, UpdateType},
     status,
     timing::TimeMeasurement,
 };
 
+#[derive(Clone, Debug)]
+pub struct Refresh {
+    pub(crate) time_column: Option<String>,
+    pub(crate) time_format: Option<TimeFormat>,
+    pub(crate) check_interval: Option<Duration>,
+    pub(crate) sql: Option<String>,
+    pub(crate) mode: RefreshMode,
+    pub(crate) period: Option<Duration>,
+}
+
+impl Refresh {
+    #[allow(clippy::needless_pass_by_value)]
+    #[must_use]
+    pub(crate) fn new(
+        time_column: Option<String>,
+        time_format: Option<TimeFormat>,
+        check_interval: Option<Duration>,
+        sql: Option<String>,
+        mode: RefreshMode,
+        period: Option<Duration>,
+    ) -> Self {
+        Self {
+            time_column,
+            time_format,
+            check_interval,
+            sql,
+            mode,
+            period,
+        }
+    }
+}
+
 pub(crate) async fn start(
     dataset_name: String,
     federated: Arc<dyn TableProvider>,
-    refresh: super::Refresh,
+    refresh: Refresh,
     acceleration_refresh_mode: super::AccelerationRefreshMode,
     accelerator: Arc<dyn TableProvider>,
     ready_sender: oneshot::Sender<()>,
@@ -297,7 +313,7 @@ fn get_refresh_df_context(
     ctx
 }
 
-fn get_timestamp(time: SystemTime) -> u128 {
+pub(crate) fn get_timestamp(time: SystemTime) -> u128 {
     time.duration_since(UNIX_EPOCH)
         .expect("Clock should not go backwards more than EPOCH")
         .as_nanos()

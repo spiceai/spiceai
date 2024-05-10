@@ -32,7 +32,7 @@ use crate::execution_plan::slice::SliceExec;
 use crate::execution_plan::tee::TeeExec;
 use crate::execution_plan::TableScanParams;
 
-mod refresh;
+pub mod refresh;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -74,7 +74,7 @@ enum AccelerationRefreshMode {
     Append,
 }
 
-fn validate_refresh_data_window(refresh: &Refresh, dataset: &str, schema: &SchemaRef) {
+fn validate_refresh_data_window(refresh: &refresh::Refresh, dataset: &str, schema: &SchemaRef) {
     if refresh.period.is_some() {
         if let Some(time_column) = &refresh.time_column {
             if schema.column_with_name(time_column).is_none() {
@@ -94,7 +94,7 @@ pub struct Builder {
     dataset_name: String,
     federated: Arc<dyn TableProvider>,
     accelerator: Arc<dyn TableProvider>,
-    refresh: Refresh,
+    refresh: refresh::Refresh,
     retention: Option<Retention>,
     zero_results_action: ZeroResultsAction,
 }
@@ -104,7 +104,7 @@ impl Builder {
         dataset_name: String,
         federated: Arc<dyn TableProvider>,
         accelerator: Arc<dyn TableProvider>,
-        refresh: Refresh,
+        refresh: refresh::Refresh,
     ) -> Self {
         Self {
             dataset_name,
@@ -194,7 +194,7 @@ impl AcceleratedTable {
         dataset_name: String,
         federated: Arc<dyn TableProvider>,
         accelerator: Arc<dyn TableProvider>,
-        refresh: Refresh,
+        refresh: refresh::Refresh,
     ) -> Builder {
         Builder::new(dataset_name, federated, accelerator, refresh)
     }
@@ -273,7 +273,7 @@ impl AcceleratedTable {
 
                 let start = SystemTime::now() - retention_period;
 
-                let timestamp = get_timestamp(start);
+                let timestamp = refresh::get_timestamp(start);
                 let expr = timestamp_filter_converter.convert(timestamp, Operator::Lt);
                 tracing::info!(
                     "[retention] Evicting data for {dataset_name} where {time_column} < {}...",
@@ -438,38 +438,6 @@ impl Retention {
             })
         } else {
             None
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct Refresh {
-    pub(crate) time_column: Option<String>,
-    pub(crate) time_format: Option<TimeFormat>,
-    pub(crate) check_interval: Option<Duration>,
-    pub(crate) sql: Option<String>,
-    pub(crate) mode: RefreshMode,
-    pub(crate) period: Option<Duration>,
-}
-
-impl Refresh {
-    #[allow(clippy::needless_pass_by_value)]
-    #[must_use]
-    pub(crate) fn new(
-        time_column: Option<String>,
-        time_format: Option<TimeFormat>,
-        check_interval: Option<Duration>,
-        sql: Option<String>,
-        mode: RefreshMode,
-        period: Option<Duration>,
-    ) -> Self {
-        Self {
-            time_column,
-            time_format,
-            check_interval,
-            sql,
-            mode,
-            period,
         }
     }
 }
