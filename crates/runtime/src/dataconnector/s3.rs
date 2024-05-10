@@ -14,7 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::macros::impl_listing_data_connector;
+use crate::object_store_registry::macros::impl_listing_data_connector;
+
 use super::{AnyErrorResult, DataConnector, DataConnectorFactory};
 
 use datafusion::datasource::file_format::file_compression_type::FileCompressionType;
