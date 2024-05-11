@@ -7,7 +7,7 @@ use object_store::{
     path::Path, GetOptions, GetResult, GetResultPayload, ListResult, MultipartId, ObjectMeta,
     ObjectStore, PutOptions, PutResult,
 };
-use suppaftp::FtpStream;
+use suppaftp::{AsyncFtpStream, FtpStream};
 use tokio::io::AsyncWrite;
 
 #[derive(Debug)]
@@ -33,6 +33,34 @@ impl FTPObjectStore {
             port,
         }
     }
+
+    fn get_client(&self) -> FtpStream {
+        let mut client = FtpStream::connect(format!("{}:{}", self.host, self.port)).unwrap();
+        let _ = client.login(&self.user, &self.password);
+        client
+    }
+
+    async fn get_async_client(&self) -> AsyncFtpStream {
+        let mut client = AsyncFtpStream::connect(format!("{}:{}", self.host, self.port))
+            .await
+            .unwrap();
+        let _ = client.login(&self.user, &self.password).await;
+        client
+    }
+
+    fn get_object_meta(&self, location: &String) -> Result<ObjectMeta, object_store::Error> {
+        let mut client = self.get_client();
+
+        let path = Path::from(location.clone());
+
+        Ok(ObjectMeta {
+            location: path,
+            size: client.size(location.clone()).unwrap(),
+            last_modified: client.mdtm(location.clone()).unwrap().and_utc(),
+            e_tag: None,
+            version: None,
+        })
+    }
 }
 
 #[async_trait]
@@ -53,17 +81,10 @@ impl ObjectStore for FTPObjectStore {
     }
 
     async fn get_opts(&self, location: &Path, _: GetOptions) -> object_store::Result<GetResult> {
-        let mut client = FtpStream::connect(format!("{}:{}", self.host, self.port)).unwrap();
-        let _ = client.login(&self.user, &self.password);
+        let mut client = self.get_client();
 
-        let location_string: Arc<str> = location.to_string().into();
-        let object_meta = ObjectMeta {
-            location: location.clone(),
-            size: client.size(Arc::clone(&location_string)).unwrap(),
-            last_modified: client.mdtm(Arc::clone(&location_string)).unwrap().and_utc(),
-            e_tag: None,
-            version: None,
-        };
+        let location_string = location.to_string();
+        let object_meta = self.get_object_meta(&location_string).unwrap();
         let stream = client.retr_as_stream(location_string.clone()).unwrap();
         // TODO: slow performance properly pipe to stream
         let stream = stream
@@ -73,12 +94,14 @@ impl ObjectStore for FTPObjectStore {
                     .map_err(|_| object_store::Error::NotImplemented)
             })
             .collect::<Vec<_>>();
-        let len = stream.len();
 
         Ok(GetResult {
-            meta: object_meta,
+            meta: object_meta.clone(),
             payload: GetResultPayload::Stream(futures::stream::iter(stream).boxed()),
-            range: Range { start: 0, end: len },
+            range: Range {
+                start: 0,
+                end: object_meta.size,
+            },
         })
     }
 
@@ -94,25 +117,14 @@ impl ObjectStore for FTPObjectStore {
     }
 
     fn list(&self, location: Option<&Path>) -> BoxStream<'_, object_store::Result<ObjectMeta>> {
-        let mut client = FtpStream::connect(format!("{}:{}", self.host, self.port)).unwrap();
-        let _ = client.login(&self.user, &self.password);
+        let mut client = self.get_client();
 
         let path = location.map(ToString::to_string);
         let list = client.nlst(path.as_deref()).unwrap();
 
         let list = list
             .iter()
-            .map(|x| {
-                let path = Path::from(x.clone());
-
-                Ok(ObjectMeta {
-                    location: path,
-                    size: client.size(x.clone()).unwrap(),
-                    last_modified: client.mdtm(x.clone()).unwrap().and_utc(),
-                    e_tag: None,
-                    version: None,
-                })
-            })
+            .map(|x| self.get_object_meta(x))
             .collect::<Vec<_>>();
         futures::stream::iter(list).boxed()
     }
