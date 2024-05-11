@@ -58,12 +58,22 @@ impl SpiceObjectStoreRegistry {
             }
             #[cfg(feature = "ftp")]
             if url.as_str().starts_with("ftp://") {
-                let mut ftp_stream = FtpStream::connect("eu-central-1.sftpcloud.io:21").unwrap();
-                let _ = ftp_stream.login("username", "password");
-                let _ = ftp_stream.cwd("taxi_trips");
-                let ftp_object_store = FTPObjectStore::new(ftp_stream);
+                if let Some(host) = url.host() {
+                    let params: HashMap<String, String> =
+                        parse(url.fragment().unwrap_or_default().as_bytes())
+                            .into_owned()
+                            .collect();
 
-                return Ok(Arc::new(ftp_object_store) as Arc<dyn ObjectStore>);
+                    // TODO: properly handle missing params
+                    let port = params.get("port").unwrap();
+                    let user = params.get("user").unwrap();
+                    let password = params.get("password").unwrap();
+
+                    let mut ftp_stream = FtpStream::connect(format!("{}:{}", host, port)).unwrap();
+                    let _ = ftp_stream.login(user, password);
+                    let ftp_object_store = FTPObjectStore::new(ftp_stream);
+                    return Ok(Arc::new(ftp_object_store) as Arc<dyn ObjectStore>);
+                }
             }
         }
 

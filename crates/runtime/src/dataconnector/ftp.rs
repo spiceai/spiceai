@@ -15,21 +15,21 @@ limitations under the License.
 */
 
 use crate::object_store_registry::macros::impl_listing_data_connector;
-
-use super::{AnyErrorResult, DataConnector, DataConnectorFactory};
 use datafusion::datasource::file_format::csv::CsvFormat;
 use datafusion::datasource::file_format::file_compression_type::FileCompressionType;
 use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::file_format::FileFormat;
 use datafusion::error::DataFusionError;
-use secrets::Secret;
+use secrets::{AnyErrorResult, Secret};
 use snafu::prelude::*;
 use spicepod::component::dataset::Dataset;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::{collections::HashMap, future::Future};
-use url::Url;
+use url::{form_urlencoded, Url};
+
+use super::{DataConnector, DataConnectorFactory};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -95,7 +95,32 @@ impl DataConnectorFactory for FTP {
 
 impl FTP {
     fn get_object_store_url(&self, dataset: &Dataset) -> AnyErrorResult<Url> {
-        Ok(Url::parse(&dataset.from).unwrap())
+        let mut fragments = vec![];
+        let mut fragment_builder = form_urlencoded::Serializer::new(String::new());
+
+        if let Some(ftp_port) = self.params.get("ftp_port") {
+            fragment_builder.append_pair("port", ftp_port);
+        }
+        if let Some(ftp_user) = self.params.get("ftp_user") {
+            fragment_builder.append_pair("user", ftp_user);
+        }
+        if let Some(ftp_password) =
+            get_secret_or_param(Some(&self.params), &self.secret, "ftp_pass_key", "ftp_pass")
+        {
+            fragment_builder.append_pair("password", &ftp_password);
+        }
+        fragments.push(fragment_builder.finish());
+
+        let mut ftp_url =
+            Url::parse(&dataset.from).context(UnableToParseURLSnafu { url: &dataset.from })?;
+
+        if dataset.from.clone().ends_with('/') {
+            fragments.push("dfiscollectionbugworkaround=hack/".into());
+        }
+
+        ftp_url.set_fragment(Some(&fragments.join("&")));
+
+        Ok(ftp_url)
     }
 
     fn get_file_format_and_extension(&self) -> AnyErrorResult<(Arc<dyn FileFormat>, String)> {
@@ -135,6 +160,30 @@ fn get_csv_format(params: &HashMap<String, String>) -> AnyErrorResult<Arc<CsvFor
             )
             .with_delimiter(delimiter),
     ))
+}
+
+pub(crate) fn get_secret_or_param(
+    params: Option<&HashMap<String, String>>,
+    secret: &Option<Secret>,
+    secret_param_key: &str,
+    param_key: &str,
+) -> Option<String> {
+    let secret_param_val = match params.and_then(|p| p.get(secret_param_key)) {
+        Some(val) => val,
+        None => param_key,
+    };
+
+    if let Some(secrets) = secret {
+        if let Some(secret_val) = secrets.get(secret_param_val) {
+            return Some(secret_val.to_string());
+        };
+    };
+
+    if let Some(param_val) = params.and_then(|p| p.get(param_key)) {
+        return Some(param_val.to_string());
+    };
+
+    None
 }
 
 impl_listing_data_connector!(FTP);

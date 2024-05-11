@@ -50,11 +50,7 @@ impl ObjectStore for FTPObjectStore {
         unimplemented!()
     }
 
-    async fn get_opts(
-        &self,
-        location: &Path,
-        options: GetOptions,
-    ) -> object_store::Result<GetResult> {
+    async fn get_opts(&self, location: &Path, _: GetOptions) -> object_store::Result<GetResult> {
         let mut client = self.client.lock().unwrap();
         let client = &mut *client;
         let location_string: Arc<str> = location.to_string().into();
@@ -94,10 +90,11 @@ impl ObjectStore for FTPObjectStore {
         unimplemented!()
     }
 
-    fn list(&self, _: Option<&Path>) -> BoxStream<'_, object_store::Result<ObjectMeta>> {
+    fn list(&self, location: Option<&Path>) -> BoxStream<'_, object_store::Result<ObjectMeta>> {
         let mut client = self.client.lock().unwrap();
         let client = &mut *client;
-        let list = client.nlst(None).unwrap();
+        let path = location.map(|val| val.to_string());
+        let list = client.nlst(path.as_deref()).unwrap();
 
         let list = list
             .iter()
