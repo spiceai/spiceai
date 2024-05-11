@@ -69,7 +69,7 @@ impl SpiceObjectStoreRegistry {
                     let user = params.get("user").unwrap();
                     let password = params.get("password").unwrap();
 
-                    let mut ftp_stream = FtpStream::connect(format!("{}:{}", host, port)).unwrap();
+                    let mut ftp_stream = FtpStream::connect(format!("{host}:{port}")).unwrap();
                     let _ = ftp_stream.login(user, password);
                     let ftp_object_store = FTPObjectStore::new(ftp_stream);
                     return Ok(Arc::new(ftp_object_store) as Arc<dyn ObjectStore>);

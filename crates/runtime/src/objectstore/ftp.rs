@@ -56,8 +56,8 @@ impl ObjectStore for FTPObjectStore {
         let location_string: Arc<str> = location.to_string().into();
         let object_meta = ObjectMeta {
             location: location.clone(),
-            size: client.size(location_string.clone()).unwrap(),
-            last_modified: client.mdtm(location_string.clone()).unwrap().and_utc(),
+            size: client.size(Arc::clone(&location_string)).unwrap(),
+            last_modified: client.mdtm(Arc::clone(&location_string)).unwrap().and_utc(),
             e_tag: None,
             version: None,
         };
@@ -93,7 +93,7 @@ impl ObjectStore for FTPObjectStore {
     fn list(&self, location: Option<&Path>) -> BoxStream<'_, object_store::Result<ObjectMeta>> {
         let mut client = self.client.lock().unwrap();
         let client = &mut *client;
-        let path = location.map(|val| val.to_string());
+        let path = location.map(ToString::to_string);
         let list = client.nlst(path.as_deref()).unwrap();
 
         let list = list
@@ -110,7 +110,7 @@ impl ObjectStore for FTPObjectStore {
                 })
             })
             .collect::<Vec<_>>();
-        futures::stream::iter(list.into_iter()).boxed()
+        futures::stream::iter(list).boxed()
     }
 
     fn list_with_offset(
