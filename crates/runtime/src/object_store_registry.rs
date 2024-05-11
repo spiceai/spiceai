@@ -13,8 +13,6 @@ use url::{form_urlencoded::parse, Url};
 #[cfg(feature = "ftp")]
 use crate::objectstore::ftp::FTPObjectStore;
 #[cfg(feature = "ftp")]
-use suppaftp::FtpStream;
-
 #[allow(clippy::module_name_repetitions)]
 #[derive(Debug, Default)]
 pub struct SpiceObjectStoreRegistry {
@@ -69,9 +67,12 @@ impl SpiceObjectStoreRegistry {
                     let user = params.get("user").unwrap();
                     let password = params.get("password").unwrap();
 
-                    let mut ftp_stream = FtpStream::connect(format!("{host}:{port}")).unwrap();
-                    let _ = ftp_stream.login(user, password);
-                    let ftp_object_store = FTPObjectStore::new(ftp_stream);
+                    let ftp_object_store = FTPObjectStore::new(
+                        user.clone(),
+                        password.clone(),
+                        host.to_string(),
+                        port.clone(),
+                    );
                     return Ok(Arc::new(ftp_object_store) as Arc<dyn ObjectStore>);
                 }
             }

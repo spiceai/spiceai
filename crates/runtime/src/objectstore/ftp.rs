@@ -1,8 +1,4 @@
-use std::{
-    io::Read,
-    ops::Range,
-    sync::{Arc, Mutex},
-};
+use std::{io::Read, ops::Range, sync::Arc};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -16,7 +12,10 @@ use tokio::io::AsyncWrite;
 
 #[derive(Debug)]
 pub struct FTPObjectStore {
-    client: Arc<Mutex<FtpStream>>,
+    user: String,
+    password: String,
+    host: String,
+    port: String,
 }
 
 impl std::fmt::Display for FTPObjectStore {
@@ -26,9 +25,12 @@ impl std::fmt::Display for FTPObjectStore {
 }
 
 impl FTPObjectStore {
-    pub fn new(client: FtpStream) -> Self {
+    pub fn new(user: String, password: String, host: String, port: String) -> Self {
         Self {
-            client: Arc::new(Mutex::new(client)),
+            user,
+            password,
+            host,
+            port,
         }
     }
 }
@@ -51,8 +53,9 @@ impl ObjectStore for FTPObjectStore {
     }
 
     async fn get_opts(&self, location: &Path, _: GetOptions) -> object_store::Result<GetResult> {
-        let mut client = self.client.lock().unwrap();
-        let client = &mut *client;
+        let mut client = FtpStream::connect(format!("{}:{}", self.host, self.port)).unwrap();
+        let _ = client.login(&self.user, &self.password);
+
         let location_string: Arc<str> = location.to_string().into();
         let object_meta = ObjectMeta {
             location: location.clone(),
@@ -91,8 +94,9 @@ impl ObjectStore for FTPObjectStore {
     }
 
     fn list(&self, location: Option<&Path>) -> BoxStream<'_, object_store::Result<ObjectMeta>> {
-        let mut client = self.client.lock().unwrap();
-        let client = &mut *client;
+        let mut client = FtpStream::connect(format!("{}:{}", self.host, self.port)).unwrap();
+        let _ = client.login(&self.user, &self.password);
+
         let path = location.map(ToString::to_string);
         let list = client.nlst(path.as_deref()).unwrap();
 
