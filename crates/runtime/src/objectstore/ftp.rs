@@ -1,8 +1,12 @@
-use std::{io::Read, ops::Range, sync::Arc};
+use std::ops::Range;
 
+use async_stream::stream;
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::{stream::BoxStream, StreamExt};
+use futures::stream::BoxStream;
+use futures::stream::StreamExt;
+use futures::AsyncReadExt;
+use object_store::GetRange;
 use object_store::{
     path::Path, GetOptions, GetResult, GetResultPayload, ListResult, MultipartId, ObjectMeta,
     ObjectStore, PutOptions, PutResult,
@@ -63,6 +67,36 @@ impl FTPObjectStore {
     }
 }
 
+fn pipe_stream<T>(
+    stream: T,
+    read_size: usize,
+) -> BoxStream<'static, std::result::Result<Bytes, object_store::Error>>
+where
+    T: AsyncReadExt + Unpin + Send + 'static,
+{
+    let stream = stream! {
+        let mut stream = stream;
+        let mut buf = vec![0; 4096];
+        let mut total = 0;
+        loop {
+            if total > read_size {
+                break;
+            }
+            let mut n = stream.read(&mut buf).await.map_err(|_| object_store::Error::NotImplemented
+                {})?;
+            total += n;
+            if n == 0 {
+                break;
+            }
+            if total > read_size {
+                n = total - read_size;
+            }
+            yield Ok(Bytes::copy_from_slice(&buf[..n]));
+        }
+    };
+    Box::pin(stream)
+}
+
 #[async_trait]
 impl ObjectStore for FTPObjectStore {
     async fn put_opts(&self, _: &Path, _: Bytes, _: PutOptions) -> object_store::Result<PutResult> {
@@ -80,27 +114,40 @@ impl ObjectStore for FTPObjectStore {
         unimplemented!()
     }
 
-    async fn get_opts(&self, location: &Path, _: GetOptions) -> object_store::Result<GetResult> {
-        let mut client = self.get_client();
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> object_store::Result<GetResult> {
+        let mut client = self.get_async_client().await;
 
         let location_string = location.to_string();
         let object_meta = self.get_object_meta(&location_string).unwrap();
-        let stream = client.retr_as_stream(location_string.clone()).unwrap();
-        // TODO: slow performance properly pipe to stream
-        let stream = stream
-            .bytes()
-            .map(|x| {
-                x.map(|x| Bytes::from(vec![x]))
-                    .map_err(|_| object_store::Error::NotImplemented)
-            })
-            .collect::<Vec<_>>();
+        let mut start = 0;
+        let mut end = object_meta.size;
+
+        let mut data_to_read = object_meta.size;
+
+        match options.range {
+            Some(GetRange::Bounded(range)) => {
+                let _ = client.resume_transfer(range.start).await;
+                data_to_read = range.end - range.start;
+                end = range.end;
+                start = range.start;
+            }
+            _ => {}
+        }
+        let stream = client
+            .retr_as_stream(location_string.clone())
+            .await
+            .unwrap();
 
         Ok(GetResult {
             meta: object_meta.clone(),
-            payload: GetResultPayload::Stream(futures::stream::iter(stream).boxed()),
+            payload: GetResultPayload::Stream(pipe_stream(stream, data_to_read)),
             range: Range {
-                start: 0,
-                end: object_meta.size,
+                start: start,
+                end: end,
             },
         })
     }
