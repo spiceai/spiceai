@@ -299,7 +299,10 @@ pub(crate) mod datasets {
         Extension, Json,
     };
     use serde::{Deserialize, Serialize};
-    use spicepod::component::dataset::Dataset;
+    use spicepod::{
+        component::dataset::{acceleration::Acceleration, Dataset},
+        writer::SpicepodUpdater,
+    };
     use tokio::sync::RwLock;
     use tract_core::tract_data::itertools::Itertools;
 
@@ -473,12 +476,13 @@ pub(crate) mod datasets {
         Path(dataset_name): Path<String>,
         Json(payload): Json<AccelerationRequest>,
     ) -> Response {
-        let app_lock = app.read().await;
-        let Some(readable_app) = &*app_lock else {
+        let mut app_lock = app.write().await;
+
+        let Some(writable_app) = app_lock.as_mut() else {
             return (status::StatusCode::INTERNAL_SERVER_ERROR).into_response();
         };
 
-        let Some(dataset) = readable_app
+        let Some(dataset) = writable_app
             .datasets
             .iter()
             .find(|d| d.name.to_lowercase() == dataset_name.to_lowercase())
@@ -496,21 +500,63 @@ pub(crate) mod datasets {
             return (status::StatusCode::OK).into_response();
         }
 
+        let mut patched_acceleration = if let Some(acceleration) = dataset.acceleration.clone() {
+            acceleration
+        } else {
+            Acceleration {
+                enabled: false,
+                ..Default::default()
+            }
+        };
+
+        patched_acceleration.refresh_sql = payload.refresh_sql;
+
         let df_read = df.read().await;
 
-        match df_read
-            .update_refresh_sql(&dataset.name, payload.refresh_sql)
+        if let Err(e) = df_read
+            .update_dataset_acceleration(dataset, &patched_acceleration)
             .await
         {
-            Ok(()) => (status::StatusCode::OK).into_response(),
-            Err(e) => (
+            return (
                 status::StatusCode::INTERNAL_SERVER_ERROR,
                 Json(MessageResponse {
                     message: format!("Request failed. {e}"),
                 }),
             )
-                .into_response(),
+                .into_response();
         }
+
+        if let Err(e) = save_acceleration_params(writable_app, &dataset_name, &patched_acceleration)
+        {
+            return (
+                status::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(MessageResponse {
+                    message: format!("Request failed. {e}"),
+                }),
+            )
+                .into_response();
+        }
+
+        (status::StatusCode::OK).into_response()
+    }
+
+    fn save_acceleration_params(
+        app: &mut App,
+        dataset_name: &str,
+        acceleration: &Acceleration,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // update dataset definition in runtime, otherwise pods watcher will detect the dataset change and reload it
+        app.datasets.iter_mut().for_each(|d| {
+            if d.name.to_lowercase() == dataset_name.to_lowercase() {
+                d.acceleration = Some(acceleration.clone());
+            }
+        });
+
+        SpicepodUpdater::from_main_spicepod()?
+            .patch_acceleration(dataset_name, acceleration)?
+            .save()?;
+
+        Ok(())
     }
 }
 

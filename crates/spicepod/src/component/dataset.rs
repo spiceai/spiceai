@@ -390,13 +390,13 @@ pub mod acceleration {
         #[serde(default = "default_true")]
         pub enabled: bool,
 
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "is_default_mode")]
         pub mode: Mode,
 
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub engine: Option<String>,
 
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "is_default_refresh_mode")]
         pub refresh_mode: RefreshMode,
 
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -423,7 +423,7 @@ pub mod acceleration {
         #[serde(default, skip_serializing_if = "is_false")]
         pub retention_check_enabled: bool,
 
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "is_default_zero_results_action")]
         pub on_zero_results: ZeroResultsAction,
     }
 
@@ -448,6 +448,38 @@ pub mod acceleration {
                 .as_ref()
                 .map_or_else(|| "arrow", String::as_str)
                 .into()
+        }
+    }
+
+    fn is_default_zero_results_action(action: &ZeroResultsAction) -> bool {
+        *action == ZeroResultsAction::default()
+    }
+
+    fn is_default_mode(mode: &Mode) -> bool {
+        *mode == Mode::default()
+    }
+
+    fn is_default_refresh_mode(refresh_mode: &RefreshMode) -> bool {
+        *refresh_mode == RefreshMode::default()
+    }
+
+    impl Default for Acceleration {
+        fn default() -> Self {
+            Acceleration {
+                enabled: default_true(),
+                mode: Mode::default(),
+                engine: None,
+                refresh_mode: RefreshMode::default(),
+                refresh_check_interval: None,
+                refresh_sql: None,
+                refresh_data_window: None,
+                params: None,
+                engine_secret: None,
+                retention_period: None,
+                retention_check_interval: None,
+                retention_check_enabled: false,
+                on_zero_results: ZeroResultsAction::default(),
+            }
         }
     }
 }

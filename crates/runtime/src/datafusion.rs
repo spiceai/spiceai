@@ -38,6 +38,7 @@ use datafusion::sql::sqlparser;
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use secrets::Secret;
 use snafu::prelude::*;
+use spicepod::component::dataset::acceleration::Acceleration;
 use spicepod::component::dataset::{Dataset, Mode};
 use tokio::spawn;
 use tokio::sync::oneshot;
@@ -433,13 +434,24 @@ impl DataFusion {
         Ok(())
     }
 
-    pub async fn update_refresh_sql(
+    pub async fn update_dataset_acceleration(
         &self,
-        dataset_name: &str,
-        refresh_sql: Option<String>,
+        dataset: &Dataset,
+        acceleration_params: &Acceleration,
     ) -> Result<()> {
-        if let Some(sql) = &refresh_sql {
-            refresh_sql::validate_refresh_sql(dataset_name, sql).context(RefreshSqlSnafu)?;
+        if dataset
+            .acceleration
+            .as_ref()
+            .is_some_and(|accel| accel == acceleration_params)
+        {
+            return Ok(());
+        }
+
+        let dataset_name = &dataset.name;
+
+        // currently refresh_sql is only supported
+        if let Some(sql_str) = &acceleration_params.refresh_sql {
+            refresh_sql::validate_refresh_sql(dataset_name, sql_str).context(RefreshSqlSnafu)?;
         }
 
         let table = self
@@ -450,7 +462,7 @@ impl DataFusion {
 
         if let Some(accelerated_table) = table.as_any().downcast_ref::<AcceleratedTable>() {
             accelerated_table
-                .update_refresh_sql(refresh_sql)
+                .update_refresh_sql(acceleration_params.refresh_sql.clone())
                 .await
                 .context(UnableToTriggerRefreshSnafu {
                     table_name: dataset_name.to_string(),
