@@ -89,7 +89,7 @@ where
                 break;
             }
             if total > read_size {
-                n = total - read_size;
+                n -= total - read_size;
             }
             yield Ok(Bytes::copy_from_slice(&buf[..n]));
         }
