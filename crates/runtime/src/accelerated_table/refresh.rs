@@ -235,8 +235,6 @@ impl Refresher {
                 );
                 match self.get_latest_timestamp().await {
                     Ok(timestamp) => {
-                        // TODO - in further enhancement, this needs to handle the data dedup
-                        // between the source and accelerator
                         yield self.get_full_or_incremental_append_update(timestamp).await;
                     }
                     Err(e) => {
@@ -336,10 +334,10 @@ impl Refresher {
         let mut filters = vec![];
         if let Some(converter) = filter_converter.as_ref() {
             if let Some(timestamp) = overwrite_timestamp_in_nano {
-                filters.push(converter.convert(timestamp, Operator::GtEq));
+                filters.push(converter.convert(timestamp, Operator::Gt));
             } else if let Some(period) = refresh.period {
                 filters.push(
-                    converter.convert(get_timestamp(SystemTime::now() - period), Operator::GtEq),
+                    converter.convert(get_timestamp(SystemTime::now() - period), Operator::Gt),
                 );
             }
         };
