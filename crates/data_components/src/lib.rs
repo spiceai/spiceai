@@ -18,7 +18,7 @@ limitations under the License.
 use std::{error::Error, sync::Arc};
 
 use async_trait::async_trait;
-use datafusion::{common::OwnedTableReference, datasource::TableProvider};
+use datafusion::{datasource::TableProvider, sql::TableReference};
 
 pub mod arrow;
 #[cfg(feature = "databricks")]
@@ -56,7 +56,7 @@ pub mod util;
 pub trait Read: Send + Sync {
     async fn table_provider(
         &self,
-        table_reference: OwnedTableReference,
+        table_reference: TableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn Error + Send + Sync>>;
 }
 
@@ -64,7 +64,7 @@ pub trait Read: Send + Sync {
 pub trait ReadWrite: Send + Sync {
     async fn table_provider(
         &self,
-        table_reference: OwnedTableReference,
+        table_reference: TableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn Error + Send + Sync>>;
 }
 
@@ -73,6 +73,6 @@ pub trait ReadWrite: Send + Sync {
 pub trait Stream: Send + Sync {
     async fn table_provider(
         &self,
-        table_reference: OwnedTableReference,
+        table_reference: TableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn Error + Send + Sync>>;
 }

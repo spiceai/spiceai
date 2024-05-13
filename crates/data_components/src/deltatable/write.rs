@@ -23,7 +23,7 @@ use datafusion::{
     execution::{context::SessionState, SendableRecordBatchStream, TaskContext},
     logical_expr::Expr,
     physical_plan::{
-        insert::{DataSink, FileSinkExec},
+        insert::{DataSink, DataSinkExec},
         metrics::MetricsSet,
         DisplayAs, DisplayFormatType, ExecutionPlan,
     },
@@ -100,7 +100,7 @@ impl TableProvider for DeltaTableWriter {
         input: Arc<dyn ExecutionPlan>,
         overwrite: bool,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(FileSinkExec::new(
+        Ok(Arc::new(DataSinkExec::new(
             input,
             Arc::new(DeltaTableDataSink::new(self.delta_table.clone(), overwrite)),
             self.schema(),

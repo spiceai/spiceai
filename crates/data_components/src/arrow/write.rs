@@ -33,7 +33,7 @@ use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::{SessionContext, SessionState};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::{is_not_true, Expr, LogicalPlanBuilder};
-use datafusion::physical_plan::insert::{DataSink, FileSinkExec};
+use datafusion::physical_plan::insert::{DataSink, DataSinkExec};
 use datafusion::physical_plan::memory::MemoryExec;
 use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan};
@@ -175,7 +175,7 @@ impl TableProvider for MemTable {
         }
 
         let sink = Arc::new(MemSink::new(self.batches.clone(), overwrite));
-        Ok(Arc::new(FileSinkExec::new(
+        Ok(Arc::new(DataSinkExec::new(
             input,
             sink,
             Arc::clone(&self.schema),
