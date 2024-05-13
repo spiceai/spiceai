@@ -124,10 +124,10 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - dashmap 5.5.3, MIT 
   <br/>https://github.com/xacrimon/dashmap
 
-- datafusion 37.1.0, Apache-2.0 
-  <br/>https://github.com/apache/arrow-datafusion
+- datafusion 38.0.0, Apache-2.0 
+  <br/>https://github.com/apache/datafusion
 
-- deltalake 0.17.1, Apache-2.0 
+- deltalake 0.17.3, Apache-2.0 
   <br/>https://github.com/delta-io/delta.rs
 
 - dirs 5.0.1, Apache-2.0 OR MIT 
@@ -201,6 +201,9 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 
 - pin-project 1.1.5, Apache-2.0 OR MIT 
   <br/>https://github.com/taiki-e/pin-project
+
+- pkcs8 0.10.2, Apache-2.0 OR MIT 
+  <br/>https://github.com/RustCrypto/formats/tree/master/pkcs8
 
 - postgres-native-tls 0.5.0, Apache-2.0 OR MIT 
   <br/>https://github.com/sfackler/rust-postgres
