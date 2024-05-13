@@ -21,6 +21,7 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::{collections::HashMap, sync::Arc};
 
+#[cfg(feature = "spice-metrics")]
 use ::datafusion::error::DataFusionError;
 use ::datafusion::sql::parser::{self, DFParser};
 use ::datafusion::sql::sqlparser::ast::{SetExpr, TableFactor};
@@ -29,6 +30,7 @@ use ::datafusion::sql::sqlparser::{self, ast};
 use accelerated_table::AcceleratedTable;
 use app::App;
 use config::Config;
+#[cfg(feature = "spice-metrics")]
 use metrics::SetRecorderError;
 use model_components::{model::Model, modelsource::source as model_source};
 pub use notify::Error as NotifyError;
