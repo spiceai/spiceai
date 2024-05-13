@@ -18,8 +18,8 @@ use async_trait::async_trait;
 
 use data_components::spark_connect::SparkConnect;
 use data_components::{Read, ReadWrite};
-use datafusion::common::OwnedTableReference;
 use datafusion::datasource::TableProvider;
+use datafusion::sql::TableReference;
 use secrets::Secret;
 use snafu::prelude::*;
 use spicepod::component::dataset::Dataset;
@@ -104,7 +104,7 @@ impl DataConnector for Spark {
         &self,
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        let table_reference = OwnedTableReference::from(dataset.path());
+        let table_reference = TableReference::from(dataset.path());
         Ok(self
             .read_provider
             .table_provider(table_reference)
@@ -118,7 +118,7 @@ impl DataConnector for Spark {
         &self,
         dataset: &Dataset,
     ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
-        let table_reference = OwnedTableReference::from(dataset.path());
+        let table_reference = TableReference::from(dataset.path());
         let read_write_result = self
             .read_write_provider
             .table_provider(table_reference)

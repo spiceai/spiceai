@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
-use datafusion::{common::OwnedTableReference, datasource::TableProvider};
+use datafusion::{datasource::TableProvider, sql::TableReference};
 use std::{error::Error, sync::Arc};
 use uuid::Uuid;
 
@@ -46,7 +46,7 @@ impl DatabricksSparkConnect {
 impl ReadWrite for DatabricksSparkConnect {
     async fn table_provider(
         &self,
-        table_reference: OwnedTableReference,
+        table_reference: TableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn Error + Send + Sync>> {
         Ok(ReadWrite::table_provider(&self.spark_connect, table_reference).await?)
     }
@@ -56,7 +56,7 @@ impl ReadWrite for DatabricksSparkConnect {
 impl Read for DatabricksSparkConnect {
     async fn table_provider(
         &self,
-        table_reference: OwnedTableReference,
+        table_reference: TableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn Error + Send + Sync>> {
         Ok(Read::table_provider(&self.spark_connect, table_reference).await?)
     }

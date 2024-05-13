@@ -3,7 +3,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arrow::array::TimestampNanosecondArray;
 use async_stream::stream;
-use datafusion::common::OwnedTableReference;
+use datafusion::common::TableReference;
 use datafusion::execution::config::SessionConfig;
 use datafusion::logical_expr::Operator;
 use datafusion::physical_plan::{collect, ExecutionPlanProperties};
@@ -364,7 +364,7 @@ impl Refresher {
         let dataset_name = self.dataset_name.clone();
         match get_data(
             &mut ctx,
-            OwnedTableReference::bare(dataset_name.clone()),
+            TableReference::bare(dataset_name.clone()),
             Arc::clone(&federated),
             refresh.sql.clone(),
             filters,
@@ -390,7 +390,7 @@ impl Refresher {
         );
         let dataset_name = self.dataset_name.clone();
         if let Err(e) = ctx.register_table(
-            OwnedTableReference::bare(dataset_name.clone()),
+            TableReference::bare(dataset_name.clone()),
             Arc::clone(&self.federated),
         ) {
             tracing::error!("Unable to register federated table: {e}");
@@ -399,7 +399,7 @@ impl Refresher {
         let acc_dataset_name = format!("accelerated_{dataset_name}");
 
         if let Err(e) = ctx.register_table(
-            OwnedTableReference::bare(acc_dataset_name),
+            TableReference::bare(acc_dataset_name),
             Arc::clone(&self.accelerator),
         ) {
             tracing::error!("Unable to register accelerator table: {e}");

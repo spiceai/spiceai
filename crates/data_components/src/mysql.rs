@@ -16,7 +16,7 @@ limitations under the License.
 
 #![allow(clippy::module_name_repetitions)]
 use async_trait::async_trait;
-use datafusion::{common::OwnedTableReference, datasource::TableProvider};
+use datafusion::{datasource::TableProvider, sql::TableReference};
 use db_connection_pool::DbConnectionPool;
 use mysql_async::prelude::ToValue;
 use snafu::prelude::*;
@@ -57,7 +57,7 @@ impl MySQLTableFactory {
 impl Read for MySQLTableFactory {
     async fn table_provider(
         &self,
-        table_reference: OwnedTableReference,
+        table_reference: TableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         let pool = Arc::clone(&self.pool);
         let table_provider = SqlTable::new(&pool, table_reference, None)
