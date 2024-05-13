@@ -37,6 +37,7 @@ use datafusion::physical_plan::collect;
 use datafusion::sql::parser::DFParser;
 use datafusion::sql::sqlparser;
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
+use itertools::Itertools;
 use secrets::Secret;
 use snafu::prelude::*;
 use spicepod::component::dataset::{Dataset, Mode};
@@ -76,6 +77,9 @@ pub enum Error {
 
     #[snafu(display("Unable to get table: {source}"))]
     UnableToGetTable { source: DataFusionError },
+
+    #[snafu(display("Unable to list tables: {source}"))]
+    UnableToGetTables { source: DataFusionError },
 
     #[snafu(display("Unable to resolve table provider: {source}"))]
     UnableToResolveTableProvider { source: DataConnectorError },
@@ -529,6 +533,16 @@ impl DataFusion {
         });
 
         Ok(())
+    }
+
+    pub async fn get_public_table_names(&self) -> Result<Vec<String>> {
+        let rb = self.ctx.sql("select table_name from information_schema.tables where table_schema = 'public'").await.context(UnableToGetTablesSnafu)?.collect().await.context(UnableToGetTablesSnafu)?;
+        Ok(rb.iter().flat_map(
+            |rb| rb.column_by_name("table_name").map(
+                |ar| ar.as_any().downcast_ref::<String>().unwrap_or(&"".to_string()).to_string()
+            )
+        ).filter(|s| !s.is_empty())
+        .collect_vec())
     }
 }
 

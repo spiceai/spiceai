@@ -11,28 +11,33 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use candle_examples::token_output_stream::TokenOutputStream;
-use candle_transformers::{
-    generation::LogitsProcessor,
-    models::quantized_llama::ModelWeights,
-};
-
+use async_trait::async_trait;
 use snafu::Snafu;
-use tokenizers::Tokenizer;
 
-use candle_core::{quantized::gguf_file, Tensor};
+#[cfg(feature = "candle")]
+pub mod candle; 
 
+#[cfg(feature = "mistralrs")]
+pub mod mistral;
+
+pub enum LlmRuntime {
+    Mistral,
+    Candle,
+}
 
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Failed to run the NSQL model"))]
     FailedToRunModel { e: Box<dyn std::error::Error> },
 
-    #[snafu(display("Local model not found"))]
-    LocalModelNotFound {},
+    #[snafu(display("Local model, expected at {expected_path}, not found"))]
+    LocalModelNotFound {expected_path: String},
+
+    #[snafu(display("Local tokenizer, expected at {expected_path}, not found"))]
+    LocalTokenizerNotFound {expected_path: String},
 
     #[snafu(display("Failed to load model from file {e}"))]
-    FailedToLoadModel { e: candle_core::Error },
+    FailedToLoadModel { e: Box<dyn std::error::Error> },
 
     #[snafu(display("Failed to load model tokenizer"))]
     FailedToLoadTokenizer { e: Box<dyn std::error::Error> },
@@ -43,14 +48,35 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-
-#[derive(Debug, Clone)]
-pub struct NsqlConfig {
-    pub tokenizer: Option<String>,
-    pub model_weights: String,
+#[async_trait]
+pub trait Nql: Sync + Send {
+    async fn run(&mut self, prompt: String) -> Result<Option<String>>;
 }
 
-pub trait Nsql {
-    fn try_new(cfg: NsqlConfig) -> Result<Self>;
-    fn run(&self, prompt: String) -> Result<Option<String>>;
+
+/// Loads `https://huggingface.co/motherduckdb/DuckDB-NSQL-7B-v0.1-GGUF` local spice llms cache (i.e. ~/.spice/llms/),
+/// based on the configured features, and the preference order: [`mistralrs`, `candle`].
+pub fn try_duckdb_from_spice_local(runtime: LlmRuntime) -> Result<Box<dyn Nql>> {
+    let spice_dir = dirs::home_dir()
+        .map(|x| x.join(".spice/llms"))
+        .ok_or(Error::LocalModelNotFound{expected_path: "~/.spice/llms".to_string() })?;
+    
+    let model_weights = spice_dir.join("DuckDB-NSQL-7B-v0.1-q8_0.gguf");
+    let tokenizer = spice_dir.join("llama2.tokenizer.json");
+
+    if !model_weights.exists(){
+        return Err(Error::LocalModelNotFound{expected_path: model_weights.to_string_lossy().to_string()}.into());
+    }
+
+    if !tokenizer.exists() {
+        return Err(Error::LocalTokenizerNotFound { expected_path: tokenizer.to_string_lossy().to_string() }.into());
+    }
+
+    match runtime {
+        #[cfg(feature="candle")]
+        LlmRuntime::Candle => candle::CandleLlama::try_new(tokenizer.to_string_lossy().to_string(), model_weights.to_string_lossy().to_string()).map(|x| Box::new(x) as Box<dyn Nql>),
+        #[cfg(feature="mistralrs")]
+        LlmRuntime::Mistral => mistralLlamamistral::MistralLlama::try_new(tokenizer.to_string_lossy().to_string(), model_weights.to_string_lossy().to_string()).map(|x| Box::new(x) as Box<dyn Nql>),
+        _ => Err(Error::FailedToRunModel { e: "No NQL model feature enabled".into() })
+    }
 }

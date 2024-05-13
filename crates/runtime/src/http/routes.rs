@@ -16,8 +16,10 @@ limitations under the License.
 
 use crate::{config, datafusion::DataFusion};
 use app::App;
+use llms::nql::LlmRuntime;
 use model_components::model::Model;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::{collections::HashMap, sync::Arc};
 
 use axum::{
@@ -61,6 +63,16 @@ pub(crate) fn routes(
             .layer(Extension(models));
     }
 
+    if cfg!(feature = "nsql") {
+        match llms::nql::try_duckdb_from_spice_local(LlmRuntime::Mistral) {
+            Ok(duck_nql) => {
+                router = router
+                    .route("/v1/nsql", post(v1::nsql::post))
+                    .layer(Extension(Pin::new(Arc::new(RwLock::new(duck_nql)))))
+            }, 
+            Err(e) => tracing::error!("Failed to load DuckDB NQL model: {e:#?}")
+        }        
+    }
     router
 }
 

@@ -82,6 +82,10 @@ install: build
 install-with-models:
 	make install SPICED_NON_DEFAULT_FEATURES="models"
 
+.PHONY: install-with-nsql
+install-with-nsql:
+	make install SPICED_NON_DEFAULT_FEATURES="nsql"
+
 .PHONY: install-cli
 install-cli: build-cli
 	mkdir -p ~/.spice/bin
