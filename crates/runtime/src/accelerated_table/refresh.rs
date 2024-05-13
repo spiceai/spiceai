@@ -18,6 +18,7 @@ use spicepod::component::dataset::acceleration::RefreshMode;
 use spicepod::component::dataset::TimeFormat;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::oneshot;
+use tokio::sync::RwLock;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::datafusion::filter_converter::TimestampFilterConvert;
@@ -70,7 +71,7 @@ pub(crate) enum AccelerationRefreshMode {
 pub(crate) struct Refresher {
     dataset_name: String,
     federated: Arc<dyn TableProvider>,
-    refresh: Refresh,
+    refresh: Arc<RwLock<Refresh>>,
     accelerator: Arc<dyn TableProvider>,
 }
 
@@ -78,7 +79,7 @@ impl Refresher {
     pub(crate) fn new(
         dataset_name: String,
         federated: Arc<dyn TableProvider>,
-        refresh: Refresh,
+        refresh: Arc<RwLock<Refresh>>,
         accelerator: Arc<dyn TableProvider>,
     ) -> Self {
         Self {
@@ -236,8 +237,10 @@ impl Refresher {
     #[allow(clippy::cast_sign_loss)]
     async fn get_latest_timestamp(&self) -> Option<u128> {
         let ctx = self.get_refresh_df_context();
+        // No need to drop it as the lock will be gone once it is out of scope
+        let refresh = self.refresh.read().await;
 
-        let result = match self.refresh.time_column.clone() {
+        let result = match refresh.time_column.clone() {
             Some(column) => match ctx
                 .sql(
                     format!(
@@ -265,7 +268,7 @@ impl Refresher {
                                 | arrow::datatypes::DataType::UInt16
                                 | arrow::datatypes::DataType::UInt32
                                 | arrow::datatypes::DataType::UInt64 => {
-                                    match self.refresh.time_format.clone() {
+                                    match refresh.time_format.clone() {
                                         Some(TimeFormat::UnixSeconds) => Some(
                                             arrow::compute::cast(
                                                 &arrow::compute::cast(
@@ -340,8 +343,8 @@ impl Refresher {
         overwrite_timestamp_in_nano: Option<u128>,
     ) -> super::Result<DataUpdate> {
         let dataset_name = self.dataset_name.clone();
-        let refresh = self.refresh.clone();
-        let filter_converter = self.get_filter_converter();
+        let refresh = self.refresh.read().await;
+        let filter_converter = self.get_filter_converter(&refresh);
 
         tracing::info!("[refresh] Loading data for dataset {dataset_name}");
         status::update_dataset(dataset_name.as_str(), status::ComponentStatus::Refreshing);
@@ -366,7 +369,8 @@ impl Refresher {
     }
 
     async fn get_data_update(&self, filters: Vec<Expr>) -> super::Result<DataUpdate> {
-        let update_type = match self.refresh.clone().mode {
+        let refresh = self.refresh.read().await;
+        let update_type = match refresh.mode {
             RefreshMode::Full => UpdateType::Overwrite,
             _ => UpdateType::Append,
         };
@@ -377,7 +381,7 @@ impl Refresher {
             &mut ctx,
             OwnedTableReference::bare(dataset_name.clone()),
             Arc::clone(&federated),
-            self.refresh.sql.clone(),
+            refresh.sql.clone(),
             filters,
         )
         .await
@@ -418,15 +422,15 @@ impl Refresher {
         ctx
     }
 
-    fn get_filter_converter(&self) -> Option<TimestampFilterConvert> {
+    fn get_filter_converter(&self, refresh: &Refresh) -> Option<TimestampFilterConvert> {
         let schema = self.federated.schema();
-        let column = self.refresh.time_column.as_deref().unwrap_or_default();
+        let column = refresh.time_column.as_deref().unwrap_or_default();
         let field = schema.column_with_name(column).map(|(_, f)| f).cloned();
 
         TimestampFilterConvert::create(
             field,
-            self.refresh.time_column.clone(),
-            self.refresh.time_format.clone(),
+            refresh.time_column.clone(),
+            refresh.time_format.clone(),
         )
     }
 }
