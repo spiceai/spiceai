@@ -26,11 +26,11 @@ use bb8_postgres::{
     PostgresConnectionManager,
 };
 use datafusion::{
-    sql::TableReference,
     datasource::{provider::TableProviderFactory, TableProvider},
     error::{DataFusionError, Result as DataFusionResult},
     execution::context::SessionState,
     logical_expr::CreateExternalTable,
+    sql::TableReference,
 };
 use db_connection_pool::{
     dbconnection::{postgresconn::PostgresConnection, DbConnection},

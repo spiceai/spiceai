@@ -16,7 +16,7 @@ limitations under the License.
 
 #![allow(clippy::module_name_repetitions)]
 use async_trait::async_trait;
-use datafusion::{sql::TableReference, datasource::TableProvider};
+use datafusion::{datasource::TableProvider, sql::TableReference};
 use db_connection_pool::dbconnection::odbcconn::ODBCDbConnectionPool;
 use snafu::prelude::*;
 use sql_provider_datafusion::{

@@ -18,11 +18,11 @@ use arrow::{array::RecordBatch, datatypes::SchemaRef};
 use arrow_sql_gen::statement::{CreateTableBuilder, InsertBuilder};
 use async_trait::async_trait;
 use datafusion::{
-    sql::TableReference,
     datasource::{provider::TableProviderFactory, TableProvider},
     error::{DataFusionError, Result as DataFusionResult},
     execution::context::SessionState,
     logical_expr::CreateExternalTable,
+    sql::TableReference,
 };
 use db_connection_pool::{
     dbconnection::{sqliteconn::SqliteConnection, DbConnection},

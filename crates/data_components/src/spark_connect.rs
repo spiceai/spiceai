@@ -15,12 +15,12 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionMode};
 use datafusion::physical_plan::{Partitioning, PlanProperties};
 use datafusion::{
-    sql::TableReference,
     datasource::{TableProvider, TableType},
     error::Result,
     execution::context::SessionState,
     logical_expr::Expr,
     physical_plan::ExecutionPlan,
+    sql::TableReference,
 };
 use futures::Stream;
 use spark_connect_rs::{functions::col, DataFrame, SparkSession, SparkSessionBuilder};
