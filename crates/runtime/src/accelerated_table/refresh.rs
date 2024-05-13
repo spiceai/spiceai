@@ -273,16 +273,12 @@ impl Refresher {
             .collect()
             .await
             .context(super::FailedToQueryLatestTimestampSnafu)?;
-        let result = result.first();
 
-        let Some(result) = result else {
+        let Some(result) = result.first() else {
             return Ok(None);
         };
-        let schema = &result.schema();
-        let field = schema.field(0);
-        let column = result.column(0);
 
-        let array = column
+        let array = result.column(0)
             .as_any()
             .downcast_ref::<TimestampNanosecondArray>()
             .context(super::FailedToFindLatestTimestampSnafu {
@@ -295,6 +291,14 @@ impl Refresher {
 
         let mut value = array.value(0) as u128;
 
+        let schema = &self.accelerator.schema();
+        let Ok(accelerated_field) = schema.field_with_name(&column) else {
+            return Err(super::Error::FailedToFindLatestTimestamp {
+                reason: "Failed to get latest timestamp due to time column not specified"
+                    .to_string(),
+            });
+        };
+
         if let arrow::datatypes::DataType::Int8
         | arrow::datatypes::DataType::Int16
         | arrow::datatypes::DataType::Int32
@@ -302,10 +306,16 @@ impl Refresher {
         | arrow::datatypes::DataType::UInt8
         | arrow::datatypes::DataType::UInt16
         | arrow::datatypes::DataType::UInt32
-        | arrow::datatypes::DataType::UInt64 = field.data_type()
+        | arrow::datatypes::DataType::UInt64 = accelerated_field.data_type()
         {
-            if let Some(TimeFormat::UnixMillis) = refresh.time_format.clone() {
-                value /= 1000;
+            match refresh.time_format.clone() {
+                Some(TimeFormat::UnixMillis) => {
+                    value *= 1_000_000;
+                }
+                Some(TimeFormat::UnixSeconds) => {
+                    value *= 1_000_000_000;
+                }
+                _ => (),
             }
         };
 
@@ -333,6 +343,8 @@ impl Refresher {
                 );
             }
         };
+
+        dbg!(&filters);
 
         match self.get_data_update(filters).await {
             Ok(data) => Ok(data),
