@@ -135,7 +135,7 @@ impl Builder {
 
         let acceleration_refresh_mode: refresh::AccelerationRefreshMode = match self.refresh.mode {
             RefreshMode::Append => {
-                if self.refresh.time_column.is_some() {
+                if self.refresh.time_column.is_none() {
                     refresh::AccelerationRefreshMode::Append(None)
                 } else {
                     let (trigger, receiver) = mpsc::channel::<()>(1);
@@ -162,7 +162,6 @@ impl Builder {
 
         validate_refresh_data_window(&self.refresh, &self.dataset_name, &self.federated.schema());
         let refresh_params = Arc::new(RwLock::new(self.refresh));
-        println!("{refresh_params:?}");
         let refresher = refresh::Refresher::new(
             self.dataset_name.clone(),
             Arc::clone(&self.federated),
