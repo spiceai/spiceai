@@ -15,7 +15,7 @@ use datafusion::{
     execution::context::SessionContext,
     logical_expr::Expr,
 };
-use snafu::{prelude::*, NoneError};
+use snafu::prelude::*;
 use spicepod::component::dataset::acceleration::{RefreshMode, ZeroResultsAction};
 use spicepod::component::dataset::TimeFormat;
 use tokio::task::JoinHandle;
@@ -56,9 +56,8 @@ pub enum Error {
         source: datafusion::error::DataFusionError,
     },
 
-    #[snafu(display("Failed to find latest timestamp in accelerated table"))]
-    FailedToFindLatestTimestamp {
-    },
+    #[snafu(display("{reason}"))]
+    FailedToFindLatestTimestamp { reason: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -135,8 +134,21 @@ impl Builder {
         let (ready_sender, is_ready) = oneshot::channel::<()>();
 
         let acceleration_refresh_mode: refresh::AccelerationRefreshMode = match self.refresh.mode {
-            RefreshMode::Append => refresh::AccelerationRefreshMode::Append,
-            ref mode @ (RefreshMode::Full | RefreshMode::BatchAppend) => {
+            RefreshMode::Append => {
+                if self.refresh.time_column.is_some() {
+                    refresh::AccelerationRefreshMode::Append(None)
+                } else {
+                    let (trigger, receiver) = mpsc::channel::<()>(1);
+                    refresh_trigger = Some(trigger.clone());
+                    scheduled_refreshes_handle = AcceleratedTable::schedule_regular_refreshes(
+                        self.refresh.check_interval,
+                        trigger,
+                    )
+                    .await;
+                    refresh::AccelerationRefreshMode::Append(Some(receiver))
+                }
+            }
+            RefreshMode::Full => {
                 let (trigger, receiver) = mpsc::channel::<()>(1);
                 refresh_trigger = Some(trigger.clone());
                 scheduled_refreshes_handle = AcceleratedTable::schedule_regular_refreshes(
@@ -144,11 +156,7 @@ impl Builder {
                     trigger,
                 )
                 .await;
-                match mode {
-                    RefreshMode::Full => refresh::AccelerationRefreshMode::Full(receiver),
-                    RefreshMode::Append => refresh::AccelerationRefreshMode::BatchAppend(receiver),
-                    RefreshMode::BatchAppend => panic!("cannot be matched here"),
-                }
+                refresh::AccelerationRefreshMode::Full(receiver)
             }
         };
 

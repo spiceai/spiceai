@@ -64,8 +64,7 @@ impl Refresh {
 
 pub(crate) enum AccelerationRefreshMode {
     Full(Receiver<()>),
-    BatchAppend(Receiver<()>),
-    Append,
+    Append(Option<Receiver<()>>),
 }
 
 pub(crate) struct Refresher {
@@ -96,7 +95,7 @@ impl Refresher {
         ready_sender: oneshot::Sender<()>,
     ) {
         let dataset_name = self.dataset_name.clone();
-        let mut stream = self.stream_updates(acceleration_refresh_mode);
+        let mut stream = self.stream_updates(acceleration_refresh_mode).await;
 
         let ctx = SessionContext::new();
 
@@ -140,17 +139,22 @@ impl Refresher {
         }
     }
 
-    fn stream_updates(
+    async fn stream_updates(
         &self,
         acceleration_refresh_mode: AccelerationRefreshMode,
     ) -> BoxStream<'_, super::Result<DataUpdate>> {
+        let time_column = self.refresh.read().await.time_column.clone();
+
         match acceleration_refresh_mode {
-            AccelerationRefreshMode::Append => Box::pin(self.get_append_stream()),
+            AccelerationRefreshMode::Append(receiver) => {
+                if let (Some(receiver), Some(_)) = (receiver, time_column) {
+                    Box::pin(self.get_incremental_append_update_stream(receiver))
+                } else {
+                    Box::pin(self.get_append_stream())
+                }
+            }
             AccelerationRefreshMode::Full(receiver) => {
                 Box::pin(self.get_full_update_stream(receiver))
-            }
-            AccelerationRefreshMode::BatchAppend(receiver) => {
-                Box::pin(self.get_batch_append_update_stream(receiver))
             }
         }
     }
@@ -216,7 +220,7 @@ impl Refresher {
         }
     }
 
-    fn get_batch_append_update_stream(
+    fn get_incremental_append_update_stream(
         &self,
         receiver: Receiver<()>,
     ) -> impl Stream<Item = super::Result<DataUpdate>> + '_ {
@@ -226,15 +230,17 @@ impl Refresher {
         stream! {
             while refresh_stream.next().await.is_some() {
                 let timer = TimeMeasurement::new(
-                    "batch_append_dataset_duration_ms",
+                    "append_dataset_duration_ms",
                     vec![("dataset", dataset_name.clone())],
                 );
                 match self.get_latest_timestamp().await {
                     Ok(timestamp) => {
+                        // TODO - in further enhancement, this needs to handle the data dedup
+                        // between the source and accelerator
                         yield self.get_full_or_batch_append_update(timestamp).await;
                     }
                     Err(e) => {
-                        tracing::error!("No timestamp is detected: {e}");
+                        tracing::error!("No latest timestamp is found: {e}");
                     }
                 }
                 drop(timer);
@@ -247,10 +253,13 @@ impl Refresher {
         let ctx = self.get_refresh_df_context();
         let refresh = self.refresh.read().await;
 
-        let column = refresh
-            .time_column
-            .clone()
-            .context(super::FailedToFindLatestTimestampSnafu)?;
+        let column =
+            refresh
+                .time_column
+                .clone()
+                .context(super::FailedToFindLatestTimestampSnafu {
+                    reason: "Failed to get latest timestamp due to time column not specified",
+                })?;
         let df = ctx
             .sql(
                 format!(
@@ -276,7 +285,9 @@ impl Refresher {
         let array = column
             .as_any()
             .downcast_ref::<TimestampNanosecondArray>()
-            .context(super::FailedToFindLatestTimestampSnafu)?;
+            .context(super::FailedToFindLatestTimestampSnafu {
+                reason: "Failed to get latest timestamp during incremental appending process due to time column is unable to cast to timestamp",
+            })?;
 
         if array.is_empty() {
             return Ok(None);
@@ -315,10 +326,10 @@ impl Refresher {
         let mut filters = vec![];
         if let Some(converter) = filter_converter.as_ref() {
             if let Some(timestamp) = overwrite_timestamp_in_nano {
-                filters.push(converter.convert(timestamp, Operator::Gt));
+                filters.push(converter.convert(timestamp, Operator::GtEq));
             } else if let Some(period) = refresh.period {
                 filters.push(
-                    converter.convert(get_timestamp(SystemTime::now() - period), Operator::Gt),
+                    converter.convert(get_timestamp(SystemTime::now() - period), Operator::GtEq),
                 );
             }
         };
@@ -337,7 +348,7 @@ impl Refresher {
         let refresh = self.refresh.read().await;
         let update_type = match refresh.mode {
             RefreshMode::Full => UpdateType::Overwrite,
-            _ => UpdateType::Append,
+            RefreshMode::Append => UpdateType::Append,
         };
         let mut ctx = self.get_refresh_df_context();
         let federated = Arc::clone(&self.federated);
@@ -554,7 +565,7 @@ mod tests {
                 None,
                 None,
                 None,
-                RefreshMode::BatchAppend,
+                RefreshMode::Append,
                 None,
             );
 
@@ -567,7 +578,7 @@ mod tests {
 
             let (trigger, receiver) = mpsc::channel::<()>(1);
             let (ready_sender, is_ready) = oneshot::channel::<()>();
-            let acceleration_refresh_mode = AccelerationRefreshMode::BatchAppend(receiver);
+            let acceleration_refresh_mode = AccelerationRefreshMode::Append(Some(receiver));
             let refresh_handle = tokio::spawn(async move {
                 refresher
                     .start(acceleration_refresh_mode, ready_sender)
@@ -645,17 +656,19 @@ mod tests {
             "should apply new data onto existing data",
         )
         .await;
-        // test(
-        //     vec!["2012-12-01T11:11:15Z", "2012-12-01T11:11:15Z"],
-        //     vec![
-        //         "1970-01-01",
-        //         "2012-12-01T11:11:11Z",
-        //         "2012-12-01T11:11:12Z",
-        //         "2012-12-01T11:11:15Z",
-        //     ],
-        //     5,
-        //     "should override existing data",
-        // )
-        // .await;
+
+        // Known limitation, doesn't dedup
+        test(
+            vec!["2012-12-01T11:11:15Z", "2012-12-01T11:11:15Z"],
+            vec![
+                "1970-01-01",
+                "2012-12-01T11:11:11Z",
+                "2012-12-01T11:11:12Z",
+                "2012-12-01T11:11:15Z",
+            ],
+            6,
+            "should override existing data",
+        )
+        .await;
     }
 }
