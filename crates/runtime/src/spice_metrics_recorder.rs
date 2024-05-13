@@ -121,6 +121,8 @@ impl SpiceMetricsRecorder {
     }
 }
 
+pub type PartitionData = Arc<RwLock<Vec<RecordBatch>>>;
+
 pub struct MetricsTable {
     pub schema: SchemaRef,
     pub batches: RwLock<Vec<PartitionData>>,
