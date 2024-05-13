@@ -110,9 +110,20 @@ impl Refresher {
                         continue;
                     };
 
+                    if data_update.data.is_empty() {
+                        continue;
+                    };
+
+                    if let Some(data) = data_update.data.first() {
+                        if data.num_rows() == 0 {
+                            continue;
+                        }
+                    };
+
                     let state = ctx.state();
 
                     let overwrite = data_update.update_type == UpdateType::Overwrite;
+
                     match self
                         .accelerator
                         .insert_into(
