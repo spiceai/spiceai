@@ -673,7 +673,7 @@ mod tests {
                 "2012-12-01T11:11:12Z",
                 "2012-12-01T11:11:15Z",
             ],
-            6,
+            4,
             "should override existing data",
         )
         .await;
