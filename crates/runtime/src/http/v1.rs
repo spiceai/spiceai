@@ -936,7 +936,7 @@ pub(crate) mod inference {
 }
 
 
-// #[cfg(feature = "nsql")]
+#[cfg(feature = "nsql")]
 pub(crate) mod nsql {
     use arrow::datatypes::Schema;
     use axum::{
