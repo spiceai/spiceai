@@ -111,11 +111,17 @@ impl Refresher {
                     };
 
                     if data_update.data.is_empty() {
+                        if let Some(sender) = ready_sender.take() {
+                            sender.send(()).ok();
+                        };
                         continue;
                     };
 
                     if let Some(data) = data_update.data.first() {
-                        if data.num_rows() == 0 {
+                        if data.columns().is_empty() {
+                            if let Some(sender) = ready_sender.take() {
+                                sender.send(()).ok();
+                            };
                             continue;
                         }
                     };
