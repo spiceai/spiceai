@@ -2540,6 +2540,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "datafusion-federation"
+version = "0.1.3"
+source = "git+https://github.com/phillipleblanc/datafusion-federation.git?branch=df-37.1#a25a523e0e4e6def29c1675fee944f07c70d869b"
+dependencies = [
+ "async-trait",
+ "datafusion",
+]
+
+[[package]]
 name = "datafusion-functions"
 version = "37.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7111,6 +7120,7 @@ dependencies = [
  "dashmap",
  "data_components",
  "datafusion",
+ "datafusion-federation",
  "db_connection_pool",
  "dirs",
  "duckdb",
