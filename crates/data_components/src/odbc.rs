@@ -16,7 +16,7 @@ limitations under the License.
 
 #![allow(clippy::module_name_repetitions)]
 use async_trait::async_trait;
-use datafusion::{common::OwnedTableReference, datasource::TableProvider};
+use datafusion::{sql::TableReference, datasource::TableProvider};
 use db_connection_pool::dbconnection::odbcconn::ODBCDbConnectionPool;
 use snafu::prelude::*;
 use sql_provider_datafusion::{
@@ -71,7 +71,7 @@ where
 {
     async fn table_provider(
         &self,
-        table_reference: OwnedTableReference,
+        table_reference: TableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         let pool = Arc::clone(&self.pool);
         let dyn_pool: Arc<ODBCDbConnectionPool<'a>> = pool;

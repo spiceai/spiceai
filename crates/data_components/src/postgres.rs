@@ -26,7 +26,7 @@ use bb8_postgres::{
     PostgresConnectionManager,
 };
 use datafusion::{
-    common::OwnedTableReference,
+    sql::TableReference,
     datasource::{provider::TableProviderFactory, TableProvider},
     error::{DataFusionError, Result as DataFusionResult},
     execution::context::SessionState,
@@ -135,7 +135,7 @@ impl PostgresTableFactory {
 impl Read for PostgresTableFactory {
     async fn table_provider(
         &self,
-        table_reference: OwnedTableReference,
+        table_reference: TableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         let pool = Arc::clone(&self.pool);
         let dyn_pool: Arc<DynPostgresConnectionPool> = pool;
@@ -151,7 +151,7 @@ impl Read for PostgresTableFactory {
 impl ReadWrite for PostgresTableFactory {
     async fn table_provider(
         &self,
-        table_reference: OwnedTableReference,
+        table_reference: TableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         let read_provider = Read::table_provider(self, table_reference.clone()).await?;
 
@@ -229,7 +229,7 @@ impl TableProviderFactory for PostgresTableProviderFactory {
         let read_provider = Arc::new(SqlTable::new_with_schema(
             &dyn_pool,
             Arc::clone(&schema),
-            OwnedTableReference::bare(name.clone()),
+            TableReference::bare(name.clone()),
         ));
 
         let delete_adapter =

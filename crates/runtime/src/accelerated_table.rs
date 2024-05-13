@@ -415,7 +415,7 @@ impl AcceleratedTable {
             default_runtime_env(),
         );
         if let Err(e) = ctx.register_table(
-            OwnedTableReference::bare(dataset_name.clone()),
+            TableReference::bare(dataset_name.clone()),
             Arc::clone(&federated),
         ) {
             tracing::error!("Unable to register federated table: {e}");
@@ -488,7 +488,7 @@ impl AcceleratedTable {
                         let refresh_sql = refresh_settings.sql.clone();
                         drop(refresh_params_lock);
 
-                        let data = match get_data(&mut ctx, OwnedTableReference::bare(dataset_name.clone()), Arc::clone(&federated), refresh_sql, filters).await {
+                        let data = match get_data(&mut ctx, TableReference::bare(dataset_name.clone()), Arc::clone(&federated), refresh_sql, filters).await {
                             Ok(data) => data,
                             Err(e) => {
                                 tracing::error!("[refresh] Failed to load data for dataset {dataset_name}: {e}");

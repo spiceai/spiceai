@@ -249,7 +249,7 @@ pub trait DataConnector: Send + Sync {
 // Gets data from a table provider and returns it as a vector of RecordBatches.
 pub async fn get_data(
     ctx: &mut SessionContext,
-    table_name: OwnedTableReference,
+    table_name: TableReference,
     table_provider: Arc<dyn TableProvider>,
     sql: Option<String>,
     filters: Vec<Expr>,

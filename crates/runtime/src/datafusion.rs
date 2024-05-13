@@ -570,7 +570,7 @@ impl DataFusion {
                 }
             };
             if let Err(e) = ctx.register_table(
-                OwnedTableReference::bare(table_name.clone()),
+                TableReference::bare(table_name.clone()),
                 Arc::new(view_table),
             ) {
                 tracing::error!("Failed to create view: {e}");

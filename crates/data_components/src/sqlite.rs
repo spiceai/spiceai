@@ -18,7 +18,7 @@ use arrow::{array::RecordBatch, datatypes::SchemaRef};
 use arrow_sql_gen::statement::{CreateTableBuilder, InsertBuilder};
 use async_trait::async_trait;
 use datafusion::{
-    common::OwnedTableReference,
+    sql::TableReference,
     datasource::{provider::TableProviderFactory, TableProvider},
     error::{DataFusionError, Result as DataFusionResult},
     execution::context::SessionState,
@@ -156,7 +156,7 @@ impl TableProviderFactory for SqliteTableFactory {
         let read_provider = Arc::new(SqlTable::new_with_schema(
             &dyn_pool,
             Arc::clone(&schema),
-            OwnedTableReference::bare(name.clone()),
+            TableReference::bare(name.clone()),
         ));
 
         let sqlite = Arc::into_inner(sqlite)

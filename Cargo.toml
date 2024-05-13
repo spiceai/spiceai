@@ -38,7 +38,7 @@ tokio = { version = "1.35.1", features = ["rt-multi-thread", "signal"] }
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 metrics = "0.22.0"
-datafusion = "37.1.0"
+datafusion = "38.0.0"
 arrow = "51.0.0"
 arrow-flight = "51.0.0"
 duckdb = "0.10.2"

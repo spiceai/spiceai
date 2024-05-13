@@ -132,7 +132,7 @@ pub trait DbConnection<T, P>: Send {
 /// Returns an error if the schema cannot be retrieved.
 pub async fn get_schema<T, P>(
     conn: Box<dyn DbConnection<T, P>>,
-    table_reference: &datafusion::sql::TableReference<'_>,
+    table_reference: &datafusion::sql::TableReference,
 ) -> Result<Arc<arrow::datatypes::Schema>, Error> {
     let schema = if let Some(conn) = conn.as_sync() {
         conn.get_schema(table_reference)?
