@@ -67,17 +67,21 @@ impl FTPObjectStore {
     }
 }
 
-fn pipe_stream<T>(
-    stream: T,
+fn pipe_stream(
+    mut client: AsyncFtpStream,
+    location: String,
+    start: usize,
     read_size: usize,
-) -> BoxStream<'static, std::result::Result<Bytes, object_store::Error>>
-where
-    T: AsyncReadExt + Unpin + Send + 'static,
-{
+) -> BoxStream<'static, std::result::Result<Bytes, object_store::Error>> {
     let stream = stream! {
-        let mut stream = stream;
-        let mut buf = vec![0; 4096];
         let mut total = 0;
+        let mut buf = vec![0; 4096];
+
+        client.resume_transfer(start + total).await.unwrap();
+        let mut stream = client
+            .retr_as_stream(location.clone())
+            .await
+            .unwrap();
         loop {
             if total > read_size {
                 break;
@@ -119,7 +123,7 @@ impl ObjectStore for FTPObjectStore {
         location: &Path,
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
-        let mut client = self.get_async_client().await;
+        let client = self.get_async_client().await;
 
         let location_string = location.to_string();
         let object_meta = self.get_object_meta(&location_string).unwrap();
@@ -130,21 +134,21 @@ impl ObjectStore for FTPObjectStore {
 
         match options.range {
             Some(GetRange::Bounded(range)) => {
-                let _ = client.resume_transfer(range.start).await;
                 data_to_read = range.end - range.start;
                 end = range.end;
                 start = range.start;
             }
             _ => {}
         }
-        let stream = client
-            .retr_as_stream(location_string.clone())
-            .await
-            .unwrap();
 
         Ok(GetResult {
             meta: object_meta.clone(),
-            payload: GetResultPayload::Stream(pipe_stream(stream, data_to_read)),
+            payload: GetResultPayload::Stream(pipe_stream(
+                client,
+                location_string,
+                start,
+                data_to_read,
+            )),
             range: Range {
                 start: start,
                 end: end,
