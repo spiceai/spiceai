@@ -454,67 +454,100 @@ mod tests {
 
     #[tokio::test]
     async fn test_refresh_full() {
-        let schema = Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
-            "time_in_string",
-            DataType::Utf8,
-            false,
-        )]));
-        let arr = StringArray::from(vec![
-            "1970-01-01",
-            "2012-12-01T11:11:11Z",
-            "2012-12-01T11:11:12Z",
-        ]);
+        async fn test(source_data: Vec<&str>, existing_data: Vec<&str>, expected_size: usize) {
+            let schema = Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
+                "time_in_string",
+                DataType::Utf8,
+                false,
+            )]));
+            let arr = StringArray::from(source_data);
 
-        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(arr)])
-            .expect("data should be created");
+            let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(arr)])
+                .expect("data should be created");
 
-        let federated = Arc::new(
-            MemTable::try_new(Arc::clone(&schema), vec![vec![batch]])
-                .expect("mem table should be created"),
-        );
-        let accelerator =
-            Arc::new(MemTable::try_new(schema, vec![vec![]]).expect("mem table should be created"))
-                as Arc<dyn TableProvider>;
+            let federated = Arc::new(
+                MemTable::try_new(Arc::clone(&schema), vec![vec![batch]])
+                    .expect("mem table should be created"),
+            );
 
-        let refresh = Refresh::new(None, None, None, None, RefreshMode::Full, None);
+            let arr = StringArray::from(existing_data);
 
-        let refresher = Refresher::new(
-            "test".to_string(),
-            federated,
-            Arc::new(RwLock::new(refresh)),
-            Arc::clone(&accelerator),
-        );
+            let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(arr)])
+                .expect("data should be created");
 
-        let (trigger, receiver) = mpsc::channel::<()>(1);
-        let (ready_sender, is_ready) = oneshot::channel::<()>();
-        let acceleration_refresh_mode = AccelerationRefreshMode::Full(receiver);
-        let refresh_handle = tokio::spawn(async move {
-            refresher
-                .start(acceleration_refresh_mode, ready_sender)
-                .await;
-        });
+            let accelerator = Arc::new(
+                MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created"),
+            ) as Arc<dyn TableProvider>;
 
-        trigger
-            .send(())
-            .await
-            .expect("trigger sent correctly to refresh");
+            let refresh = Refresh::new(None, None, None, None, RefreshMode::Full, None);
 
-        is_ready.await.expect("data is received");
+            let refresher = Refresher::new(
+                "test".to_string(),
+                federated,
+                Arc::new(RwLock::new(refresh)),
+                Arc::clone(&accelerator),
+            );
 
-        let ctx = SessionContext::new();
-        let state = ctx.state();
+            let (trigger, receiver) = mpsc::channel::<()>(1);
+            let (ready_sender, is_ready) = oneshot::channel::<()>();
+            let acceleration_refresh_mode = AccelerationRefreshMode::Full(receiver);
+            let refresh_handle = tokio::spawn(async move {
+                refresher
+                    .start(acceleration_refresh_mode, ready_sender)
+                    .await;
+            });
 
-        let plan = accelerator
-            .scan(&state, None, &[], None)
-            .await
-            .expect("Scan plan can be constructed");
+            trigger
+                .send(())
+                .await
+                .expect("trigger sent correctly to refresh");
 
-        let result = collect(plan, ctx.task_ctx())
-            .await
-            .expect("Query successful");
+            is_ready.await.expect("data is received");
 
-        assert_eq!(3, result.first().expect("result").num_rows());
+            let ctx = SessionContext::new();
+            let state = ctx.state();
 
-        drop(refresh_handle);
+            let plan = accelerator
+                .scan(&state, None, &[], None)
+                .await
+                .expect("Scan plan can be constructed");
+
+            let result = collect(plan, ctx.task_ctx())
+                .await
+                .expect("Query successful");
+
+            assert_eq!(expected_size, result.first().expect("result").num_rows());
+
+            drop(refresh_handle);
+        }
+
+        test(
+            vec!["1970-01-01", "2012-12-01T11:11:11Z", "2012-12-01T11:11:12Z"],
+            vec![],
+            3,
+        )
+        .await;
+        test(
+            vec!["1970-01-01", "2012-12-01T11:11:11Z", "2012-12-01T11:11:12Z"],
+            vec![
+                "1970-01-01",
+                "2012-12-01T11:11:11Z",
+                "2012-12-01T11:11:12Z",
+                "2012-12-01T11:11:15Z",
+            ],
+            3,
+        )
+        .await;
+        test(
+            vec![],
+            vec![
+                "1970-01-01",
+                "2012-12-01T11:11:11Z",
+                "2012-12-01T11:11:12Z",
+                "2012-12-01T11:11:15Z",
+            ],
+            0,
+        )
+        .await;
     }
 }
