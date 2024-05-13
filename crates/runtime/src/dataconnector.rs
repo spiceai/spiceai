@@ -16,11 +16,11 @@ limitations under the License.
 
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
-use datafusion::common::OwnedTableReference;
 use datafusion::dataframe::DataFrame;
 use datafusion::datasource::{DefaultTableSource, TableProvider};
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::{Expr, LogicalPlanBuilder};
+use datafusion::sql::TableReference;
 use lazy_static::lazy_static;
 use snafu::prelude::*;
 use spicepod::component::dataset::Dataset;
@@ -249,7 +249,7 @@ pub trait DataConnector: Send + Sync {
 // Gets data from a table provider and returns it as a vector of RecordBatches.
 pub async fn get_data(
     ctx: &mut SessionContext,
-    table_name: OwnedTableReference,
+    table_name: TableReference,
     table_provider: Arc<dyn TableProvider>,
     sql: Option<String>,
     filters: Vec<Expr>,
