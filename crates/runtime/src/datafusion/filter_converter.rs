@@ -14,7 +14,7 @@ enum ExprTimeFormat {
 
 #[derive(Debug, Clone)]
 struct ExprUnixTimestamp {
-    scale: u64,
+    scale: u128,
 }
 
 #[derive(Clone, Debug)]
@@ -26,7 +26,7 @@ pub(crate) struct TimestampFilterConvert {
 #[allow(clippy::needless_pass_by_value)]
 impl TimestampFilterConvert {
     pub(crate) fn create(
-        field: Option<&arrow::datatypes::Field>,
+        field: Option<arrow::datatypes::Field>,
         time_column: Option<String>,
         mut time_format: Option<TimeFormat>,
     ) -> Option<Self> {
@@ -45,10 +45,10 @@ impl TimestampFilterConvert {
             | DataType::Float16
             | DataType::Float32
             | DataType::Float64 => {
-                let mut scale = 1;
+                let mut scale = 1_000_000_000;
                 if let Some(time_format) = time_format.take() {
                     if time_format == TimeFormat::UnixMillis {
-                        scale = 1000;
+                        scale = 1_000_000;
                     }
                 }
                 ExprTimeFormat::UnixTimestamp(ExprUnixTimestamp { scale })
@@ -72,7 +72,8 @@ impl TimestampFilterConvert {
     }
 
     #[allow(clippy::cast_possible_wrap)]
-    pub(crate) fn convert(&self, timestamp: u64, op: Operator) -> Expr {
+    #[allow(clippy::cast_possible_truncation)]
+    pub(crate) fn convert(&self, timestamp_in_nanos: u128, op: Operator) -> Expr {
         let time_column: &str = self.time_column.as_ref();
         match &self.time_format {
             ExprTimeFormat::ISO8601 => binary_expr(
@@ -82,21 +83,76 @@ impl TimestampFilterConvert {
                 ),
                 op,
                 Expr::Literal(ScalarValue::TimestampMillisecond(
-                    Some((timestamp * 1000) as i64),
+                    Some((timestamp_in_nanos / 1_000_000) as i64),
                     None,
                 )),
             ),
-            ExprTimeFormat::UnixTimestamp(format) => {
-                binary_expr(col(time_column), op, lit(timestamp * format.scale))
-            }
+            ExprTimeFormat::UnixTimestamp(format) => binary_expr(
+                col(time_column),
+                op,
+                lit((timestamp_in_nanos / format.scale) as u64),
+            ),
             ExprTimeFormat::Timestamp => binary_expr(
                 col(time_column),
                 op,
                 Expr::Literal(ScalarValue::TimestampMillisecond(
-                    Some((timestamp * 1000) as i64),
+                    Some((timestamp_in_nanos / 1_000_000) as i64),
                     None,
                 )),
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, TimeUnit};
+
+    #[test]
+    fn test_timestamp_filter_convert() {
+        test(
+            Field::new("timestamp", DataType::Int64, false),
+            TimeFormat::UnixMillis,
+            1_620_000_000_000_000_000,
+            "timestamp > UInt64(1620000000000)",
+        );
+        test(
+            Field::new("timestamp", DataType::Int64, false),
+            TimeFormat::UnixSeconds,
+            1_620_000_000_000_000_000,
+            "timestamp > UInt64(1620000000)",
+        );
+        test(
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Second, None),
+                false,
+            ),
+            TimeFormat::UnixSeconds,
+            1_620_000_000_000_000_000,
+            "timestamp > TimestampMillisecond(1620000000000, None)",
+        );
+        test(
+            Field::new(
+                "timestamp",
+                DataType::Utf8,
+                false,
+            ),
+            TimeFormat::UnixSeconds,
+            1_620_000_000_000_000_000,
+            "CAST(timestamp AS Timestamp(Millisecond, None)) > TimestampMillisecond(1620000000000, None)",
+        );
+    }
+
+    fn test(field: Field, time_format: TimeFormat, timestamp: u128, expected: &str) {
+        let time_column = "timestamp".to_string();
+        let timestamp_filter_convert =
+            TimestampFilterConvert::create(Some(field), Some(time_column), Some(time_format));
+        assert!(timestamp_filter_convert.is_some());
+        let timestamp_filter_convert =
+            timestamp_filter_convert.expect("the convert can be created");
+        let expr = timestamp_filter_convert.convert(timestamp, Operator::Gt);
+        assert_eq!(expr.to_string(), expected);
     }
 }
