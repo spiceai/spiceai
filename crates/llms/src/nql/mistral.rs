@@ -69,7 +69,7 @@ impl Nql for MistralLlama{
 
         self.pipeline.get_sender().blocking_send(r).map_err(|e| NqlError::FailedToRunModel { e: e.into() })?;
 
-        match self.rx.blocking_recv().unwrap() {
+        match self.rx.recv().await.unwrap() {
             MistralRsponse::CompletionDone(cr) => {
                 Ok(Some(cr.choices[0].text.clone()))
             },
@@ -82,11 +82,11 @@ impl Nql for MistralLlama{
 }
 
 mod test {
-    use crate::nql::try_duckdb_from_spice_local;
+    use crate::nql::{try_duckdb_from_spice_local, LlmRuntime};
 
     #[test]
     fn test_candle_llama_local() {
-        let mut llama = try_duckdb_from_spice_local().unwrap();
+        let mut llama = try_duckdb_from_spice_local(LlmRuntime::Mistral).unwrap();
         let res = llama.run("SELECT * FROM users WHERE id = 1".to_string());
     }
 }

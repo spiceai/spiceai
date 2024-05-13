@@ -68,10 +68,10 @@ pub(crate) fn routes(
             Ok(duck_nql) => {
                 router = router
                     .route("/v1/nsql", post(v1::nsql::post))
-                    .layer(Extension(Pin::new(Arc::new(RwLock::new(duck_nql)))))
-            }, 
-            Err(e) => tracing::error!("Failed to load DuckDB NQL model: {e:#?}")
-        }        
+                    .layer(Extension(Arc::new(RwLock::new(duck_nql))))
+            }
+            Err(e) => tracing::error!("Failed to load DuckDB NQL model: {e:#?}"),
+        }
     }
     router
 }

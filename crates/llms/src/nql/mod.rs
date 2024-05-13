@@ -28,7 +28,7 @@ pub enum LlmRuntime {
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Failed to run the NSQL model"))]
-    FailedToRunModel { e: Box<dyn std::error::Error> },
+    FailedToRunModel { e: Box<dyn std::error::Error + Send + Sync> },
 
     #[snafu(display("Local model, expected at {expected_path}, not found"))]
     LocalModelNotFound {expected_path: String},
@@ -37,13 +37,13 @@ pub enum Error {
     LocalTokenizerNotFound {expected_path: String},
 
     #[snafu(display("Failed to load model from file {e}"))]
-    FailedToLoadModel { e: Box<dyn std::error::Error> },
+    FailedToLoadModel { e: Box<dyn std::error::Error + Send + Sync> },
 
     #[snafu(display("Failed to load model tokenizer"))]
-    FailedToLoadTokenizer { e: Box<dyn std::error::Error> },
+    FailedToLoadTokenizer { e: Box<dyn std::error::Error + Send + Sync> },
 
     #[snafu(display("Failed to tokenize"))]
-    FailedToTokenize { e: Box<dyn std::error::Error> },
+    FailedToTokenize { e: Box<dyn std::error::Error + Send + Sync> },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -76,7 +76,7 @@ pub fn try_duckdb_from_spice_local(runtime: LlmRuntime) -> Result<Box<dyn Nql>> 
         #[cfg(feature="candle")]
         LlmRuntime::Candle => candle::CandleLlama::try_new(tokenizer.to_string_lossy().to_string(), model_weights.to_string_lossy().to_string()).map(|x| Box::new(x) as Box<dyn Nql>),
         #[cfg(feature="mistralrs")]
-        LlmRuntime::Mistral => mistralLlamamistral::MistralLlama::try_new(tokenizer.to_string_lossy().to_string(), model_weights.to_string_lossy().to_string()).map(|x| Box::new(x) as Box<dyn Nql>),
+        LlmRuntime::Mistral => mistral::MistralLlama::try_new(tokenizer.to_string_lossy().to_string(), model_weights.to_string_lossy().to_string()).map(|x| Box::new(x) as Box<dyn Nql>),
         _ => Err(Error::FailedToRunModel { e: "No NQL model feature enabled".into() })
     }
 }

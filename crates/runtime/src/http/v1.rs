@@ -913,10 +913,9 @@ pub(crate) mod nsql {
         return "".to_string();
     }
 
-    // #[debug_handler]
     pub(crate) async fn post(
         Extension(df): Extension<Arc<RwLock<DataFusion>>>,
-        Extension(nsql_model):  Extension<Arc<RwLock<Pin<Box<dyn Nql>>>>>,
+        Extension(nsql_model): Extension<Arc<RwLock<Box<dyn Nql>>>>,
         Json(payload): Json<NsqlRequest>,
     ) -> Response {
 
