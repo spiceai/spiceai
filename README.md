@@ -193,11 +193,11 @@ Enter `show tables;` to display the available tables for query:
 
 ```
 sql> show tables
-+------------+
-| table_name |
-+------------+
-| taxi_trips |
-+------------+
++------------+------------+
+| table_name | table_type |
++------------+------------+
+| taxi_trips | BASE TABLE |
++------------+------------+
 
 Time: 0.007505084 seconds. 1 rows.
 ```
