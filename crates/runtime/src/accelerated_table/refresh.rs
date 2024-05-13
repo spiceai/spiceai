@@ -214,7 +214,7 @@ impl Refresher {
                     "load_dataset_duration_ms",
                     vec![("dataset", dataset_name.clone())],
                 );
-                yield self.get_full_or_batch_append_update(None).await;
+                yield self.get_full_or_incremental_append_update(None).await;
                 drop(timer);
             }
         }
@@ -237,7 +237,7 @@ impl Refresher {
                     Ok(timestamp) => {
                         // TODO - in further enhancement, this needs to handle the data dedup
                         // between the source and accelerator
-                        yield self.get_full_or_batch_append_update(timestamp).await;
+                        yield self.get_full_or_incremental_append_update(timestamp).await;
                     }
                     Err(e) => {
                         tracing::error!("No latest timestamp is found: {e}");
@@ -322,7 +322,7 @@ impl Refresher {
         Ok(Some(value))
     }
 
-    async fn get_full_or_batch_append_update(
+    async fn get_full_or_incremental_append_update(
         &self,
         overwrite_timestamp_in_nano: Option<u128>,
     ) -> super::Result<DataUpdate> {
