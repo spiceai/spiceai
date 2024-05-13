@@ -19,6 +19,7 @@ limitations under the License.
 use async_trait::async_trait;
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::{ExecutionMode, Partitioning, PlanProperties};
+use datafusion::sql::TableReference;
 use db_connection_pool::dbconnection::{get_schema, query_arrow};
 use db_connection_pool::DbConnectionPool;
 use expr::Engine;
@@ -28,7 +29,6 @@ use std::{any::Any, fmt, sync::Arc};
 
 use datafusion::{
     arrow::datatypes::SchemaRef,
-    common::OwnedTableReference,
     datasource::TableProvider,
     error::{DataFusionError, Result as DataFusionResult},
     execution::{context::SessionState, TaskContext},
@@ -60,14 +60,14 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 pub struct SqlTable<T: 'static, P: 'static> {
     pool: Arc<dyn DbConnectionPool<T, P> + Send + Sync>,
     schema: SchemaRef,
-    table_reference: OwnedTableReference,
+    table_reference: TableReference,
     engine: Option<Engine>,
 }
 
 impl<T, P> SqlTable<T, P> {
     pub async fn new(
         pool: &Arc<dyn DbConnectionPool<T, P> + Send + Sync>,
-        table_reference: impl Into<OwnedTableReference>,
+        table_reference: impl Into<TableReference>,
         engine: Option<expr::Engine>,
     ) -> Result<Self> {
         let table_reference = table_reference.into();
@@ -91,7 +91,7 @@ impl<T, P> SqlTable<T, P> {
     pub fn new_with_schema(
         pool: &Arc<dyn DbConnectionPool<T, P> + Send + Sync>,
         schema: impl Into<SchemaRef>,
-        table_reference: impl Into<OwnedTableReference>,
+        table_reference: impl Into<TableReference>,
     ) -> Self {
         Self {
             pool: Arc::clone(pool),
@@ -163,7 +163,7 @@ impl<T, P> TableProvider for SqlTable<T, P> {
 #[derive(Clone)]
 struct SqlExec<T, P> {
     projected_schema: SchemaRef,
-    table_reference: OwnedTableReference,
+    table_reference: TableReference,
     pool: Arc<dyn DbConnectionPool<T, P> + Send + Sync>,
     filters: Vec<Expr>,
     limit: Option<usize>,
@@ -192,7 +192,7 @@ impl<T, P> SqlExec<T, P> {
     fn new(
         projections: Option<&Vec<usize>>,
         schema: &SchemaRef,
-        table_reference: &OwnedTableReference,
+        table_reference: &TableReference,
         pool: Arc<dyn DbConnectionPool<T, P> + Send + Sync>,
         filters: &[Expr],
         limit: Option<usize>,
