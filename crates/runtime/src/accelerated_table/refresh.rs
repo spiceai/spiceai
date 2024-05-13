@@ -344,8 +344,6 @@ impl Refresher {
             }
         };
 
-        dbg!(&filters);
-
         match self.get_data_update(filters).await {
             Ok(data) => Ok(data),
             Err(e) => {
