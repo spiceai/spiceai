@@ -110,6 +110,7 @@ impl Refresher {
                     let Ok(data_update) = data_update else {
                         continue;
                     };
+
                     let state = ctx.state();
 
                     let overwrite = data_update.update_type == UpdateType::Overwrite;
@@ -228,114 +229,76 @@ impl Refresher {
                     "batch_append_dataset_duration_ms",
                     vec![("dataset", dataset_name.clone())],
                 );
-                yield self.get_full_or_batch_append_update(self.get_latest_timestamp().await).await;
+                match self.get_latest_timestamp().await {
+                    Ok(timestamp) => {
+                        yield self.get_full_or_batch_append_update(timestamp).await;
+                    }
+                    Err(e) => {
+                        tracing::error!("No timestamp is detected: {e}");
+                    }
+                }
                 drop(timer);
             }
         }
     }
 
     #[allow(clippy::cast_sign_loss)]
-    async fn get_latest_timestamp(&self) -> Option<u128> {
+    async fn get_latest_timestamp(&self) -> super::Result<Option<u128>> {
         let ctx = self.get_refresh_df_context();
-        // No need to drop it as the lock will be gone once it is out of scope
         let refresh = self.refresh.read().await;
 
-        let result = match refresh.time_column.clone() {
-            Some(column) => match ctx
-                .sql(
-                    format!(
-                        "SELECT {column} FROM accelerated_{} order by column desc limit 1",
-                        self.dataset_name.clone()
-                    )
-                    .as_str(),
+        let column = refresh
+            .time_column
+            .clone()
+            .context(super::FailedToFindLatestTimestampSnafu)?;
+        let df = ctx
+            .sql(
+                format!(
+                    "SELECT CAST({column} AS timestamp) AS a FROM accelerated_{} ORDER BY a DESC LIMIT 1",
+                    self.dataset_name.clone()
                 )
-                .await
-            {
-                Ok(df) => {
-                    let result = df.collect().await;
-                    match result {
-                        Ok(result) => {
-                            let schema = result.first()?.schema();
-                            let field = schema.field(0);
-                            let column = result.first()?.column(0);
+                .as_str(),
+            )
+            .await.context(super::FailedToQueryLatestTimestampSnafu)?;
+        let result = &df
+            .collect()
+            .await
+            .context(super::FailedToQueryLatestTimestampSnafu)?;
+        let result = result.first();
 
-                            match field.data_type() {
-                                arrow::datatypes::DataType::Int8
-                                | arrow::datatypes::DataType::Int16
-                                | arrow::datatypes::DataType::Int32
-                                | arrow::datatypes::DataType::Int64
-                                | arrow::datatypes::DataType::UInt8
-                                | arrow::datatypes::DataType::UInt16
-                                | arrow::datatypes::DataType::UInt32
-                                | arrow::datatypes::DataType::UInt64 => {
-                                    match refresh.time_format.clone() {
-                                        Some(TimeFormat::UnixSeconds) => Some(
-                                            arrow::compute::cast(
-                                                &arrow::compute::cast(
-                                                    column,
-                                                    &arrow::datatypes::DataType::Timestamp(
-                                                        arrow::datatypes::TimeUnit::Second,
-                                                        None,
-                                                    ),
-                                                )
-                                                .ok()?,
-                                                &arrow::datatypes::DataType::Timestamp(
-                                                    arrow::datatypes::TimeUnit::Nanosecond,
-                                                    None,
-                                                ),
-                                            )
-                                            .ok()?
-                                            .as_any()
-                                            .downcast_ref::<TimestampNanosecondArray>()?
-                                            .value(0),
-                                        ),
-                                        Some(TimeFormat::UnixMillis) => Some(
-                                            arrow::compute::cast(
-                                                &arrow::compute::cast(
-                                                    column,
-                                                    &arrow::datatypes::DataType::Timestamp(
-                                                        arrow::datatypes::TimeUnit::Millisecond,
-                                                        None,
-                                                    ),
-                                                )
-                                                .ok()?,
-                                                &arrow::datatypes::DataType::Timestamp(
-                                                    arrow::datatypes::TimeUnit::Nanosecond,
-                                                    None,
-                                                ),
-                                            )
-                                            .ok()?
-                                            .as_any()
-                                            .downcast_ref::<TimestampNanosecondArray>()?
-                                            .value(0),
-                                        ),
-                                        _ => todo!(),
-                                    }
-                                }
-                                _ => Some(
-                                    arrow::compute::cast(
-                                        column,
-                                        &arrow::datatypes::DataType::Timestamp(
-                                            arrow::datatypes::TimeUnit::Nanosecond,
-                                            None,
-                                        ),
-                                    )
-                                    .ok()?
-                                    .as_any()
-                                    .downcast_ref::<TimestampNanosecondArray>()?
-                                    .value(0),
-                                ),
-                            }
-                        }
-                        Err(_) => None,
-                    }
-                }
-                Err(_) => None,
-            },
-            None => None,
+        let Some(result) = result else {
+            return Ok(None);
+        };
+        let schema = &result.schema();
+        let field = schema.field(0);
+        let column = result.column(0);
+
+        let array = column
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .context(super::FailedToFindLatestTimestampSnafu)?;
+
+        if array.is_empty() {
+            return Ok(None);
+        }
+
+        let mut value = array.value(0) as u128;
+
+        if let arrow::datatypes::DataType::Int8
+        | arrow::datatypes::DataType::Int16
+        | arrow::datatypes::DataType::Int32
+        | arrow::datatypes::DataType::Int64
+        | arrow::datatypes::DataType::UInt8
+        | arrow::datatypes::DataType::UInt16
+        | arrow::datatypes::DataType::UInt32
+        | arrow::datatypes::DataType::UInt64 = field.data_type()
+        {
+            if let Some(TimeFormat::UnixMillis) = refresh.time_format.clone() {
+                value /= 1000;
+            }
         };
 
-        result.map(|n| n as u128)
+        Ok(Some(value))
     }
 
     async fn get_full_or_batch_append_update(
@@ -349,15 +312,17 @@ impl Refresher {
         tracing::info!("[refresh] Loading data for dataset {dataset_name}");
         status::update_dataset(dataset_name.as_str(), status::ComponentStatus::Refreshing);
         let refresh = refresh.clone();
-        let filters =
-            if let (Some(period), Some(converter)) = (refresh.period, filter_converter.as_ref()) {
-                let timestamp = overwrite_timestamp_in_nano
-                    .unwrap_or(get_timestamp(SystemTime::now() - period));
-
-                vec![converter.convert(timestamp, Operator::Gt)]
-            } else {
-                vec![]
-            };
+        let mut filters = vec![];
+        if let Some(converter) = filter_converter.as_ref() {
+            if let Some(timestamp) = overwrite_timestamp_in_nano {
+                filters.push(converter.convert(timestamp, Operator::Gt));
+            } else if let Some(period) = refresh.period {
+                filters.push(
+                    converter.convert(get_timestamp(SystemTime::now() - period), Operator::Gt),
+                );
+            }
+        };
+        dbg!(&filters);
 
         match self.get_data_update(filters).await {
             Ok(data) => Ok(data),
@@ -549,5 +514,148 @@ mod tests {
             0,
         )
         .await;
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn test_refresh_append_batch() {
+        async fn test(
+            source_data: Vec<&str>,
+            existing_data: Vec<&str>,
+            expected_size: usize,
+            message: &str,
+        ) {
+            let schema = Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
+                "time_in_string",
+                DataType::Utf8,
+                false,
+            )]));
+            let arr = StringArray::from(source_data);
+
+            let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(arr)])
+                .expect("data should be created");
+
+            let federated = Arc::new(
+                MemTable::try_new(Arc::clone(&schema), vec![vec![batch]])
+                    .expect("mem table should be created"),
+            );
+
+            let arr = StringArray::from(existing_data);
+
+            let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(arr)])
+                .expect("data should be created");
+
+            let accelerator = Arc::new(
+                MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created"),
+            ) as Arc<dyn TableProvider>;
+
+            let refresh = Refresh::new(
+                Some("time_in_string".to_string()),
+                None,
+                None,
+                None,
+                RefreshMode::BatchAppend,
+                None,
+            );
+
+            let refresher = Refresher::new(
+                "test".to_string(),
+                federated,
+                Arc::new(RwLock::new(refresh)),
+                Arc::clone(&accelerator),
+            );
+
+            let (trigger, receiver) = mpsc::channel::<()>(1);
+            let (ready_sender, is_ready) = oneshot::channel::<()>();
+            let acceleration_refresh_mode = AccelerationRefreshMode::BatchAppend(receiver);
+            let refresh_handle = tokio::spawn(async move {
+                refresher
+                    .start(acceleration_refresh_mode, ready_sender)
+                    .await;
+            });
+
+            trigger
+                .send(())
+                .await
+                .expect("trigger sent correctly to refresh");
+
+            is_ready.await.expect("data is received");
+
+            let ctx = SessionContext::new();
+            let state = ctx.state();
+
+            let plan = accelerator
+                .scan(&state, None, &[], None)
+                .await
+                .expect("Scan plan can be constructed");
+
+            let result = collect(plan, ctx.task_ctx())
+                .await
+                .expect("Query successful");
+
+            assert_eq!(
+                expected_size,
+                result.into_iter().map(|f| f.num_rows()).sum::<usize>(),
+                "{message}"
+            );
+
+            drop(refresh_handle);
+        }
+
+        test(
+            vec!["1970-01-01", "2012-12-01T11:11:11Z", "2012-12-01T11:11:12Z"],
+            vec![],
+            3,
+            "should insert all data into empty accelerator",
+        )
+        .await;
+        test(
+            vec!["1970-01-01", "2012-12-01T11:11:11Z", "2012-12-01T11:11:12Z"],
+            vec![
+                "1970-01-01",
+                "2012-12-01T11:11:11Z",
+                "2012-12-01T11:11:12Z",
+                "2012-12-01T11:11:15Z",
+            ],
+            4,
+            "should not insert any stale data and keep original size",
+        )
+        .await;
+        test(
+            vec![],
+            vec![
+                "1970-01-01",
+                "2012-12-01T11:11:11Z",
+                "2012-12-01T11:11:12Z",
+                "2012-12-01T11:11:15Z",
+            ],
+            4,
+            "should keep original data of accelerator when no new data is found",
+        )
+        .await;
+        test(
+            vec!["2012-12-01T11:11:16Z", "2012-12-01T11:11:17Z"],
+            vec![
+                "1970-01-01",
+                "2012-12-01T11:11:11Z",
+                "2012-12-01T11:11:12Z",
+                "2012-12-01T11:11:15Z",
+            ],
+            6,
+            "should apply new data onto existing data",
+        )
+        .await;
+        // test(
+        //     vec!["2012-12-01T11:11:15Z", "2012-12-01T11:11:15Z"],
+        //     vec![
+        //         "1970-01-01",
+        //         "2012-12-01T11:11:11Z",
+        //         "2012-12-01T11:11:12Z",
+        //         "2012-12-01T11:11:15Z",
+        //     ],
+        //     5,
+        //     "should override existing data",
+        // )
+        // .await;
     }
 }

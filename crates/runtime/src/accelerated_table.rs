@@ -15,7 +15,7 @@ use datafusion::{
     execution::context::SessionContext,
     logical_expr::Expr,
 };
-use snafu::prelude::*;
+use snafu::{prelude::*, NoneError};
 use spicepod::component::dataset::acceleration::{RefreshMode, ZeroResultsAction};
 use spicepod::component::dataset::TimeFormat;
 use tokio::task::JoinHandle;
@@ -50,6 +50,15 @@ pub enum Error {
 
     #[snafu(display("Manual refresh is not supported for `append` mode"))]
     ManualRefreshIsNotSupported {},
+
+    #[snafu(display("Failed to find latest timestamp in accelerated table"))]
+    FailedToQueryLatestTimestamp {
+        source: datafusion::error::DataFusionError,
+    },
+
+    #[snafu(display("Failed to find latest timestamp in accelerated table"))]
+    FailedToFindLatestTimestamp {
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
