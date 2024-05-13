@@ -163,7 +163,7 @@ impl FlightSQLTable {
                         .unwrap_or_default();
 
                     // Only check fields in `table_reference` matches.
-                    if table_reference.resolved_eq(&OwnedTableReference::full(
+                    if table_reference.resolved_eq(&TableReference::full(
                         catalog_name,
                         db_schema_name,
                         table_name,

@@ -6,13 +6,13 @@ use arrow::datatypes::SchemaRef;
 use async_stream::stream;
 use async_trait::async_trait;
 use data_components::delete::get_deletion_provider;
-use datafusion::common::OwnedTableReference;
 use datafusion::error::Result as DataFusionResult;
 use datafusion::execution::config::SessionConfig;
 use datafusion::execution::context::SessionState;
 use datafusion::logical_expr::{Operator, TableProviderFilterPushDown};
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{collect, ExecutionPlan, ExecutionPlanProperties};
+use datafusion::sql::TableReference;
 use datafusion::{
     datasource::{TableProvider, TableType},
     execution::context::SessionContext,
