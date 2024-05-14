@@ -65,6 +65,5 @@ pem = "3.0.4"
 odbc-api = { version = "7.0.0" }
 arrow-odbc = { version = "9.0.0" }
 snowflake-api = { git = "https://github.com/spiceai/snowflake-rs.git", folder = "snowflake-api", rev = "5dab964abef23314e7a3f27ae89b83352e315206" }
-openssh-sftp-client = "0.14.3"
 suppaftp = { version = "5.3.1", features = ["async"] }
 datafusion-federation = { git = "https://github.com/phillipleblanc/datafusion-federation.git", branch = "spiceai" }
