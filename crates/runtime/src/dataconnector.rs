@@ -157,7 +157,7 @@ pub enum DataConnectorError {
     UnsupportedFileFormat { format: String },
 
     #[snafu(display("Unsupported compression type for CSV"))]
-    UnsupportedCompressionType {
+    UnsupportedCsvCompressionType {
         source: DataFusionError,
         compression_type: String,
     },
@@ -345,7 +345,7 @@ pub trait ListingTableConnector: DataConnector {
                 .with_has_header(has_header)
                 .with_file_compression_type(
                     FileCompressionType::from_str(compression_type)
-                        .context(UnsupportedCompressionTypeSnafu { compression_type })?,
+                        .context(UnsupportedCsvCompressionTypeSnafu { compression_type })?,
                 )
                 .with_delimiter(delimiter),
         ))
