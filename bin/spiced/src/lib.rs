@@ -80,6 +80,13 @@ pub struct Args {
 
     #[clap(flatten)]
     pub repl_config: ReplConfig,
+
+    /// Enable Spice Cloud connection.
+    #[arg(
+        long,
+        help_heading = "Enable metrics replication to Spice Cloud. Requires Spice Cloud API key stored in secrets."
+    )]
+    pub spice_cloud_metrics: bool,
 }
 
 pub async fn run(args: Args) -> Result<()> {
@@ -96,6 +103,10 @@ pub async fn run(args: Args) -> Result<()> {
         };
 
     let mut rt: Runtime = Runtime::new(args.runtime, app, df, pods_watcher).await;
+
+    if args.spice_cloud_metrics {
+        rt.start_metrics(args.metrics).await;
+    }
 
     rt.load_secrets().await;
 

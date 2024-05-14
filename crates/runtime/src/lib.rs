@@ -678,27 +678,28 @@ impl Runtime {
         self.load_model(m).await;
     }
 
-    pub async fn start_metrics(&mut self, metrics_socket: SocketAddr) -> Result<()> {
-        let recorder = SpiceMetricsRecorder::new(metrics_socket);
+    pub async fn start_metrics(&mut self, with_metrics: Option<SocketAddr>) {
+        if let Some(metrics_socket) = with_metrics {
+            let recorder = SpiceMetricsRecorder::new(metrics_socket);
 
-        self.df
-            .write()
-            .await
-            .register_runtime_table("metrics".to_string(), recorder.table())
-            .context(UnableToRegisterMetricsTableSnafu)?;
+            if let Err(err) = self
+                .df
+                .write()
+                .await
+                .register_runtime_table("metrics".to_string(), recorder.table())
+                .context(UnableToRegisterMetricsTableSnafu)
+            {
+                tracing::warn!("Unable to register runtime metrics table: {}", err);
+                return;
+            }
 
-        recorder.start();
+            recorder.start();
 
-        tracing::info!("Runtime metrics available at `spice.runtime.metrics`");
-
-        Ok(())
+            tracing::info!("Runtime metrics available at `spice.runtime.metrics`");
+        }
     }
 
     pub async fn start_servers(&mut self, with_metrics: Option<SocketAddr>) -> Result<()> {
-        if let Some(metrics_socket) = with_metrics {
-            self.start_metrics(metrics_socket).await?;
-        }
-
         let http_server_future = http::start(
             self.config.http_bind_address,
             Arc::clone(&self.app),
