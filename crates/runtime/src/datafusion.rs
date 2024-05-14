@@ -19,7 +19,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::accelerated_table::{AcceleratedTable, Refresh, Retention};
+use crate::accelerated_table::{refresh::Refresh, AcceleratedTable, Retention};
 use crate::dataaccelerator::{self, create_accelerator_table};
 use crate::dataconnector::{DataConnector, DataConnectorError};
 use crate::dataupdate::{DataUpdate, DataUpdateExecutionPlan, UpdateType};

@@ -18,12 +18,6 @@ T: Time-Bound
 
 A clear and concise description of what the enhancement is and the target goal-state.
 
-Milestones:
-
-- M1 <>
-- M2 <>
-- ...
-
 ## Why/Purpose
 
 Clear and concise answer to why this should be done now.
@@ -33,10 +27,6 @@ Clear and concise answer to why this should be done now.
 A target date for done-done completion of the entire enhancement.
 
 **Issue/Spec written and reviewed:** <Target Date>
-
-**M1:** <Target Date>
-**M2:** <Target Date>
-...
 **Done-Done:** <Target Date>
 
 ## Done-Done

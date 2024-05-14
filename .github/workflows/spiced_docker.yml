@@ -49,6 +49,7 @@ jobs:
           push: ${{ startswith(github.ref, 'refs/tags/v') }}
           build-args: |
             REL_VERSION=${{ env.REL_VERSION }}
+            CARGO_FEATURES=release
           tags: |
             ghcr.io/spiceai/spiceai:${{ env.REL_VERSION }}-slim
             spiceai/spiceai:${{ env.REL_VERSION }}-slim
@@ -65,7 +66,7 @@ jobs:
           push: ${{ startswith(github.ref, 'refs/tags/v') }}
           build-args: |
             REL_VERSION=${{ env.REL_VERSION }}
-            CARGO_FEATURES=odbc
+            CARGO_FEATURES=release,odbc
           tags: |
             ghcr.io/spiceai/spiceai:${{ env.REL_VERSION }}
             spiceai/spiceai:${{ env.REL_VERSION }}
