@@ -52,6 +52,7 @@ mod flight;
 mod http;
 pub mod model;
 pub mod object_store_registry;
+pub mod objectstore;
 mod opentelemetry;
 pub mod podswatcher;
 pub mod status;
