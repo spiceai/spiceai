@@ -1,3 +1,19 @@
+/*
+Copyright 2024 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 use std::ops::Range;
 
 use async_stream::stream;
@@ -29,6 +45,7 @@ impl std::fmt::Display for FTPObjectStore {
 }
 
 impl FTPObjectStore {
+    #[must_use]
     pub fn new(user: String, password: String, host: String, port: String) -> Self {
         Self {
             user,
@@ -52,15 +69,15 @@ impl FTPObjectStore {
         client
     }
 
-    fn get_object_meta(&self, location: &String) -> Result<ObjectMeta, object_store::Error> {
+    fn get_object_meta(&self, location: &str) -> Result<ObjectMeta, object_store::Error> {
         let mut client = self.get_client();
 
-        let path = Path::from(location.clone());
+        let path = Path::from(location);
 
         Ok(ObjectMeta {
             location: path,
-            size: client.size(location.clone()).unwrap(),
-            last_modified: client.mdtm(location.clone()).unwrap().and_utc(),
+            size: client.size(location).unwrap(),
+            last_modified: client.mdtm(location).unwrap().and_utc(),
             e_tag: None,
             version: None,
         })
@@ -127,18 +144,15 @@ impl ObjectStore for FTPObjectStore {
 
         let location_string = location.to_string();
         let object_meta = self.get_object_meta(&location_string).unwrap();
+
         let mut start = 0;
         let mut end = object_meta.size;
-
         let mut data_to_read = object_meta.size;
 
-        match options.range {
-            Some(GetRange::Bounded(range)) => {
-                data_to_read = range.end - range.start;
-                end = range.end;
-                start = range.start;
-            }
-            _ => {}
+        if let Some(GetRange::Bounded(range)) = options.range {
+            data_to_read = range.end - range.start;
+            start = range.start;
+            end = range.end;
         }
 
         Ok(GetResult {
@@ -149,10 +163,7 @@ impl ObjectStore for FTPObjectStore {
                 start,
                 data_to_read,
             )),
-            range: Range {
-                start: start,
-                end: end,
-            },
+            range: Range { start, end },
         })
     }
 
