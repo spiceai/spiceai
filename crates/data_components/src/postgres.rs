@@ -139,7 +139,7 @@ impl Read for PostgresTableFactory {
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         let pool = Arc::clone(&self.pool);
         let dyn_pool: Arc<DynPostgresConnectionPool> = pool;
-        let table_provider = SqlTable::new(&dyn_pool, table_reference, None)
+        let table_provider = SqlTable::new("postgres", &dyn_pool, table_reference, None)
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
@@ -227,6 +227,7 @@ impl TableProviderFactory for PostgresTableProviderFactory {
         let dyn_pool: Arc<DynPostgresConnectionPool> = pool;
 
         let read_provider = Arc::new(SqlTable::new_with_schema(
+            "postgres",
             &dyn_pool,
             Arc::clone(&schema),
             TableReference::bare(name.clone()),

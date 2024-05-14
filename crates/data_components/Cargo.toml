@@ -60,4 +60,4 @@ spark_connect = ["dep:spark-connect-rs"]
 databricks = ["dep:deltalake", "spark_connect"]
 odbc = ["dep:odbc-api", "dep:arrow-odbc"]
 snowflake = ["dep:snowflake-api"]
-
+federation-experimental = ["sql_provider_datafusion/federation-experimental"]
