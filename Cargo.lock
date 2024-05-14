@@ -1860,7 +1860,7 @@ checksum = "98cc8fbded0c607b7ba9dd60cd98df59af97e84d24e49c8557331cfc26d301ce"
 [[package]]
 name = "clickhouse-rs"
 version = "1.1.0-alpha.1"
-source = "git+https://github.com/spiceai/clickhouse-rs.git?tag=0.2.0#36a87884321fbf296876ab0b63d611f19f5f0e02"
+source = "git+https://github.com/spiceai/clickhouse-rs.git?tag=0.2.1#81a652c7c3dc4aff9097c30ece821393f089e3b5"
 dependencies = [
  "byteorder",
  "cfg-if",
@@ -1890,7 +1890,7 @@ dependencies = [
 [[package]]
 name = "clickhouse-rs-cityhash-sys"
 version = "0.1.2"
-source = "git+https://github.com/spiceai/clickhouse-rs.git?tag=0.2.0#36a87884321fbf296876ab0b63d611f19f5f0e02"
+source = "git+https://github.com/spiceai/clickhouse-rs.git?tag=0.2.1#81a652c7c3dc4aff9097c30ece821393f089e3b5"
 dependencies = [
  "cc",
 ]

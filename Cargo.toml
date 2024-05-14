@@ -56,7 +56,7 @@ tokio-postgres = { version = "0.7.10", features = [
     "with-chrono-0_4",
     "with-uuid-1",
 ] }
-clickhouse-rs = { git = "https://github.com/spiceai/clickhouse-rs.git", tag = "0.2.0", features = [
+clickhouse-rs = { git = "https://github.com/spiceai/clickhouse-rs.git", tag = "0.2.1", features = [
     "tokio_io",
     "tls",
 ] }
