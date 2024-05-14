@@ -76,7 +76,8 @@ Currently supported data connectors for upstream datasets. More coming soon.
 | `clickhouse` | Clickhouse                                                                                     | Alpha        |                                                                                                    | `full`           |
 | `odbc`       | ODBC                                                                                           | Alpha        |  ODBC                                                                                              | `full`           |
 | `spark`      | Spark                                                                                          | Alpha        | [Spark Connect](https://spark.apache.org/docs/latest/spark-connect-overview.html)                  | `full`           |
-| `snowflake`  | Snowflake                                                                                      | Coming soon! | Arrow Flight SQL                                                                                   | `full`           |
+| `flightsql`  | Apache Arrow Flight SQL                                                                                     | Alpha        | Arrow Flight SQL                                                                                   | `full`           |
+| `snowflake`  | Snowflake                                                                                      | Alpha        | Arrow                                                                                | `full`           |
 | `bigquery`   | BigQuery                                                                                       | Coming soon! | Arrow Flight SQL                                                                                   | `full`           |
 
 ### Supported Data Stores/Accelerators
@@ -192,11 +193,11 @@ Enter `show tables;` to display the available tables for query:
 
 ```
 sql> show tables
-+------------+
-| table_name |
-+------------+
-| taxi_trips |
-+------------+
++------------+------------+
+| table_name | table_type |
++------------+------------+
+| taxi_trips | BASE TABLE |
++------------+------------+
 
 Time: 0.007505084 seconds. 1 rows.
 ```

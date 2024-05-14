@@ -402,8 +402,13 @@ pub(crate) mod datasets {
 
     #[derive(Debug, Serialize, Deserialize)]
     #[serde(rename_all = "lowercase")]
-    pub(crate) struct DatasetRefreshResponse {
+    pub(crate) struct MessageResponse {
         pub message: String,
+    }
+
+    #[derive(Deserialize)]
+    pub struct AccelerationRequest {
+        pub refresh_sql: Option<String>,
     }
 
     pub(crate) async fn refresh(
@@ -423,7 +428,7 @@ pub(crate) mod datasets {
         else {
             return (
                 status::StatusCode::NOT_FOUND,
-                Json(DatasetRefreshResponse {
+                Json(MessageResponse {
                     message: format!("Dataset {dataset_name} not found"),
                 }),
             )
@@ -435,7 +440,7 @@ pub(crate) mod datasets {
         if !acceleration_enabled {
             return (
                 status::StatusCode::BAD_REQUEST,
-                Json(DatasetRefreshResponse {
+                Json(MessageResponse {
                     message: format!("Dataset {dataset_name} does not have acceleration enabled"),
                 }),
             )
@@ -447,15 +452,61 @@ pub(crate) mod datasets {
         match df_read.refresh_table(&dataset.name).await {
             Ok(()) => (
                 status::StatusCode::CREATED,
-                Json(DatasetRefreshResponse {
+                Json(MessageResponse {
                     message: format!("Dataset refresh triggered for {dataset_name}."),
                 }),
             )
                 .into_response(),
             Err(err) => (
                 status::StatusCode::INTERNAL_SERVER_ERROR,
-                Json(DatasetRefreshResponse {
+                Json(MessageResponse {
                     message: format!("Failed to trigger refresh for {dataset_name}: {err}."),
+                }),
+            )
+                .into_response(),
+        }
+    }
+
+    pub(crate) async fn acceleration(
+        Extension(app): Extension<Arc<RwLock<Option<App>>>>,
+        Extension(df): Extension<Arc<RwLock<DataFusion>>>,
+        Path(dataset_name): Path<String>,
+        Json(payload): Json<AccelerationRequest>,
+    ) -> Response {
+        let app_lock = app.read().await;
+        let Some(readable_app) = &*app_lock else {
+            return (status::StatusCode::INTERNAL_SERVER_ERROR).into_response();
+        };
+
+        let Some(dataset) = readable_app
+            .datasets
+            .iter()
+            .find(|d| d.name.to_lowercase() == dataset_name.to_lowercase())
+        else {
+            return (
+                status::StatusCode::NOT_FOUND,
+                Json(MessageResponse {
+                    message: format!("Dataset {dataset_name} not found"),
+                }),
+            )
+                .into_response();
+        };
+
+        if payload.refresh_sql.is_none() {
+            return (status::StatusCode::OK).into_response();
+        }
+
+        let df_read = df.read().await;
+
+        match df_read
+            .update_refresh_sql(&dataset.name, payload.refresh_sql)
+            .await
+        {
+            Ok(()) => (status::StatusCode::OK).into_response(),
+            Err(e) => (
+                status::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(MessageResponse {
+                    message: format!("Request failed. {e}"),
                 }),
             )
                 .into_response(),
@@ -557,10 +608,9 @@ pub(crate) mod models {
         Extension,
     };
     use csv::Writer;
+    use model_components::model::Model;
     use serde::{Deserialize, Serialize};
     use tokio::sync::RwLock;
-
-    use crate::model::Model;
 
     use super::Format;
 
@@ -625,9 +675,8 @@ pub(crate) mod models {
 }
 
 pub(crate) mod inference {
-    use crate::datafusion::DataFusion;
-    use crate::model::version as model_version;
-    use crate::model::Model;
+    use crate::{datafusion::DataFusion, model::run};
+
     use app::App;
     use arrow::array::Float32Array;
     use axum::{
@@ -636,6 +685,7 @@ pub(crate) mod inference {
         response::{IntoResponse, Response},
         Extension, Json,
     };
+    use model_components::{model::Model, modelsource};
     use serde::{Deserialize, Serialize};
     use std::time::Instant;
     use std::{collections::HashMap, sync::Arc};
@@ -781,13 +831,13 @@ pub(crate) mod inference {
                 status: PredictStatus::BadRequest,
                 error_message: Some(format!("Model {model_name} not found")),
                 model_name,
-                model_version: Some(model_version(&model.from)),
+                model_version: Some(modelsource::version(&model.from)),
                 prediction: None,
                 duration_ms: start_time.elapsed().as_millis(),
             };
         };
 
-        match runnable.run(Arc::clone(&df)).await {
+        match run(runnable, Arc::clone(&df)).await {
             Ok(inference_result) => {
                 if let Some(column_data) = inference_result.column_by_name("y") {
                     if let Some(array) = column_data.as_any().downcast_ref::<Float32Array>() {
@@ -796,7 +846,7 @@ pub(crate) mod inference {
                             status: PredictStatus::Success,
                             error_message: None,
                             model_name,
-                            model_version: Some(model_version(&model.from)),
+                            model_version: Some(modelsource::version(&model.from)),
                             prediction: Some(result),
                             duration_ms: start_time.elapsed().as_millis(),
                         };
@@ -811,7 +861,7 @@ pub(crate) mod inference {
                             "Unable to cast inference result to Float32Array".to_string(),
                         ),
                         model_name,
-                        model_version: Some(model_version(&model.from)),
+                        model_version: Some(modelsource::version(&model.from)),
                         prediction: None,
                         duration_ms: start_time.elapsed().as_millis(),
                     };
@@ -825,7 +875,7 @@ pub(crate) mod inference {
                         "Unable to find column 'y' in inference result".to_string(),
                     ),
                     model_name,
-                    model_version: Some(model_version(&model.from)),
+                    model_version: Some(modelsource::version(&model.from)),
                     prediction: None,
                     duration_ms: start_time.elapsed().as_millis(),
                 }
@@ -836,7 +886,7 @@ pub(crate) mod inference {
                     status: PredictStatus::InternalError,
                     error_message: Some(e.to_string()),
                     model_name,
-                    model_version: Some(model_version(&model.from)),
+                    model_version: Some(modelsource::version(&model.from)),
                     prediction: None,
                     duration_ms: start_time.elapsed().as_millis(),
                 }

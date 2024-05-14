@@ -19,23 +19,22 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::accelerated_table::{AcceleratedTable, Refresh, Retention};
+use crate::accelerated_table::{refresh::Refresh, AcceleratedTable, Retention};
 use crate::dataaccelerator::{self, create_accelerator_table};
-use crate::dataconnector::DataConnector;
+use crate::dataconnector::{DataConnector, DataConnectorError};
 use crate::dataupdate::{DataUpdate, DataUpdateExecutionPlan, UpdateType};
 use crate::get_dependent_table_names;
+use crate::object_store_registry::default_runtime_env;
 use arrow::datatypes::Schema;
 use arrow_tools::schema::verify_schema;
 use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider};
-use datafusion::common::OwnedTableReference;
-use datafusion::config::CatalogOptions;
 use datafusion::datasource::ViewTable;
 use datafusion::error::DataFusionError;
-use datafusion::execution::context::{SessionConfig, SessionContext};
+use datafusion::execution::context::{SessionConfig, SessionContext, SessionState};
 use datafusion::physical_plan::collect;
 use datafusion::sql::parser::DFParser;
-use datafusion::sql::sqlparser;
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
+use datafusion::sql::{sqlparser, TableReference};
 use secrets::Secret;
 use snafu::prelude::*;
 use spicepod::component::dataset::{Dataset, Mode};
@@ -48,6 +47,10 @@ pub mod refresh_sql;
 pub mod schema;
 
 use self::schema::SpiceSchemaProvider;
+
+const SPICE_DEFAULT_CATALOG: &str = "spice";
+const SPICE_RUNTIME_SCHEMA: &str = "runtime";
+const SPICE_DEFAULT_SCHEMA: &str = "public";
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -77,9 +80,7 @@ pub enum Error {
     UnableToGetTable { source: DataFusionError },
 
     #[snafu(display("Unable to resolve table provider: {source}"))]
-    UnableToResolveTableProvider {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
+    UnableToResolveTableProvider { source: DataConnectorError },
 
     #[snafu(display("Table {table_name} was marked as read_write, but the underlying provider only supports reads."))]
     WriteProviderNotImplemented { table_name: String },
@@ -89,6 +90,9 @@ pub enum Error {
 
     #[snafu(display("Unable to register table in DataFusion: {source}"))]
     UnableToRegisterTableToDataFusion { source: DataFusionError },
+
+    #[snafu(display("Unable to register system table in DataFusion: {source}"))]
+    UnableToRegisterSystemTableToDataFusion { source: DataFusionError },
 
     #[snafu(display("Expected acceleration settings for {name}, found None"))]
     ExpectedAccelerationSettings { name: String },
@@ -149,25 +153,48 @@ impl DataFusion {
     /// Panics if the default schema cannot be registered.
     #[must_use]
     pub fn new() -> Self {
-        let catalog_options = CatalogOptions::default();
-
         let mut df_config = SessionConfig::new()
             .with_information_schema(true)
-            .with_create_default_catalog_and_schema(false);
+            .with_create_default_catalog_and_schema(false)
+            .set_bool(
+                "datafusion.execution.listing_table_ignore_subdirectory",
+                false,
+            );
         df_config.options_mut().sql_parser.dialect = "PostgreSQL".to_string();
+        df_config.options_mut().catalog.default_catalog = SPICE_DEFAULT_CATALOG.to_string();
+        df_config.options_mut().catalog.default_schema = SPICE_DEFAULT_SCHEMA.to_string();
 
-        let ctx = SessionContext::new_with_config(df_config);
+        let state = SessionState::new_with_config_rt(df_config, default_runtime_env());
+
+        #[cfg(feature = "federation-experimental")]
+        let state = {
+            use datafusion_federation::{FederatedQueryPlanner, FederationAnalyzerRule};
+            state
+                .add_analyzer_rule(Arc::new(FederationAnalyzerRule::new()))
+                .with_query_planner(Arc::new(FederatedQueryPlanner::new()))
+        };
+
+        let ctx = SessionContext::new_with_state(state);
 
         let catalog = MemoryCatalogProvider::new();
-        let schema = SpiceSchemaProvider::new();
+        let default_schema = SpiceSchemaProvider::new();
+        let runtime_schema = SpiceSchemaProvider::new();
 
-        match catalog.register_schema(&catalog_options.default_schema, Arc::new(schema)) {
+        match catalog.register_schema(SPICE_DEFAULT_SCHEMA, Arc::new(default_schema)) {
             Ok(_) => {}
             Err(e) => {
                 panic!("Unable to register default schema: {e}");
             }
         }
-        ctx.register_catalog(&catalog_options.default_catalog, Arc::new(catalog));
+
+        match catalog.register_schema(SPICE_RUNTIME_SCHEMA, Arc::new(runtime_schema)) {
+            Ok(_) => {}
+            Err(e) => {
+                panic!("Unable to register spice runtime schema: {e}");
+            }
+        }
+
+        ctx.register_catalog(SPICE_DEFAULT_CATALOG, Arc::new(catalog));
 
         DataFusion {
             ctx: Arc::new(ctx),
@@ -227,7 +254,7 @@ impl DataFusion {
 
         let table_provider = self
             .ctx
-            .table_provider(OwnedTableReference::bare(table_name.to_string()))
+            .table_provider(TableReference::bare(table_name.to_string()))
             .await
             .context(UnableToGetTableSnafu)?;
 
@@ -298,11 +325,6 @@ impl DataFusion {
         acceleration_secret: Option<Secret>,
     ) -> Result<(AcceleratedTable, oneshot::Receiver<()>)> {
         tracing::debug!("Creating accelerated table {dataset:?}");
-        let obj_store = source
-            .get_object_store(dataset)
-            .transpose()
-            .context(InvalidObjectStoreSnafu)?;
-
         let source_table_provider = match dataset.mode() {
             Mode::Read => source
                 .read_provider(dataset)
@@ -357,7 +379,6 @@ impl DataFusion {
                 dataset.refresh_data_window(),
             ),
         );
-        accelerated_table_builder.object_store(obj_store);
         accelerated_table_builder.retention(Retention::new(
             dataset.time_column.clone(),
             dataset.time_format.clone(),
@@ -390,7 +411,7 @@ impl DataFusion {
     pub async fn refresh_table(&self, dataset_name: &str) -> Result<()> {
         let table = self
             .ctx
-            .table_provider(OwnedTableReference::bare(dataset_name.to_string()))
+            .table_provider(TableReference::bare(dataset_name.to_string()))
             .await
             .context(UnableToGetTableSnafu)?;
 
@@ -411,6 +432,32 @@ impl DataFusion {
         Ok(())
     }
 
+    pub async fn update_refresh_sql(
+        &self,
+        dataset_name: &str,
+        refresh_sql: Option<String>,
+    ) -> Result<()> {
+        if let Some(sql) = &refresh_sql {
+            refresh_sql::validate_refresh_sql(dataset_name, sql).context(RefreshSqlSnafu)?;
+        }
+
+        let table = self
+            .ctx
+            .table_provider(TableReference::bare(dataset_name.to_string()))
+            .await
+            .context(UnableToGetTableSnafu)?;
+
+        if let Some(accelerated_table) = table.as_any().downcast_ref::<AcceleratedTable>() {
+            accelerated_table
+                .update_refresh_sql(refresh_sql)
+                .await
+                .context(UnableToTriggerRefreshSnafu {
+                    table_name: dataset_name.to_string(),
+                })?;
+        }
+        Ok(())
+    }
+
     /// Federated tables are attached directly as tables visible in the public `DataFusion` context.
     async fn register_federated_table(
         &self,
@@ -418,15 +465,6 @@ impl DataFusion {
         source: Arc<dyn DataConnector>,
     ) -> Result<()> {
         tracing::debug!("Registering federated table {dataset:?}");
-        if let Some(obj_store_result) = source.get_object_store(dataset) {
-            let (key, store) = obj_store_result.context(InvalidObjectStoreSnafu)?;
-
-            tracing::debug!("Registered object_store for {key}");
-            self.ctx
-                .runtime_env()
-                .register_object_store(&key, Arc::clone(&store));
-        }
-
         let table_exists = self.ctx.table_exist(&dataset.name).unwrap_or(false);
         if table_exists {
             return TableAlreadyExistsSnafu.fail();
@@ -531,7 +569,7 @@ impl DataFusion {
                 }
             };
             if let Err(e) = ctx.register_table(
-                OwnedTableReference::bare(table_name.clone()),
+                TableReference::bare(table_name.clone()),
                 Arc::new(view_table),
             ) {
                 tracing::error!("Failed to create view: {e}");

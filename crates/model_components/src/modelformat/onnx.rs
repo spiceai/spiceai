@@ -14,11 +14,5 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-pub mod onnx;
-
-/// A `ModelFormat` specifies the supported format of a model artifacts.
-///
-/// Currently, only `onnx` is supported.
-pub enum ModelFormat {
-    Onnx(onnx::Onnx),
-}
+#[derive(Debug, Clone)]
+pub struct Onnx {}

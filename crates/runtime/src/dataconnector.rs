@@ -16,24 +16,36 @@ limitations under the License.
 
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
-use datafusion::common::OwnedTableReference;
 use datafusion::dataframe::DataFrame;
+use datafusion::datasource::file_format::csv::CsvFormat;
+use datafusion::datasource::file_format::file_compression_type::FileCompressionType;
+use datafusion::datasource::file_format::parquet::ParquetFormat;
+use datafusion::datasource::file_format::FileFormat;
+use datafusion::datasource::listing::{
+    ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
+};
 use datafusion::datasource::{DefaultTableSource, TableProvider};
+use datafusion::error::DataFusionError;
+use datafusion::execution::config::SessionConfig;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::{Expr, LogicalPlanBuilder};
+use datafusion::sql::TableReference;
 use lazy_static::lazy_static;
-use object_store::ObjectStore;
 use snafu::prelude::*;
 use spicepod::component::dataset::Dataset;
 use std::any::Any;
 use std::collections::HashMap;
+use std::fmt::Display;
 use std::pin::Pin;
+use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use url::Url;
 
 use secrets::Secret;
 use std::future::Future;
+
+use crate::object_store_registry::default_runtime_env;
 
 #[cfg(feature = "clickhouse")]
 pub mod clickhouse;
@@ -45,6 +57,8 @@ pub mod dremio;
 pub mod duckdb;
 #[cfg(feature = "flightsql")]
 pub mod flightsql;
+#[cfg(feature = "ftp")]
+pub mod ftp;
 pub mod localhost;
 #[cfg(feature = "mysql")]
 pub mod mysql;
@@ -93,8 +107,65 @@ pub enum Error {
     },
 }
 
+#[derive(Debug, Snafu)]
+pub enum DataConnectorError {
+    #[snafu(display("Cannot connect to {dataconnector}. {source}"))]
+    UnableToConnectInternal {
+        dataconnector: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("Cannot connect to {dataconnector} on {host}:{port}. Ensure that the host and port are correclty configured in the spicepod, and that the host is reachable."))]
+    UnableToConnectInvalidHostOrPort {
+        dataconnector: String,
+        host: String,
+        port: u16,
+    },
+
+    #[snafu(display("Cannot connect to {dataconnector}. Authentication failed. Ensure that the username and password are correctly configured in the spicepod."))]
+    UnableToConnectInvalidUsernameOrPassword { dataconnector: String },
+
+    #[snafu(display("Unable to get read provider for {dataconnector}: {source}"))]
+    UnableToGetReadProvider {
+        dataconnector: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("Unable to get read write provider for {dataconnector}: {source}"))]
+    UnableToGetReadWriteProvider {
+        dataconnector: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("Invalid configuration for {dataconnector}. {message}"))]
+    InvalidConfiguration {
+        dataconnector: String,
+        message: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display(
+        "Failed to get {dataconnector} data connector for dataset {dataset_name}. Table {table_name} not found. Ensure the table name is correctly spelled in the spicepod."
+    ))]
+    InvalidTableName {
+        dataconnector: String,
+        dataset_name: String,
+        table_name: String,
+    },
+
+    #[snafu(display("Unsupported file format: {format}"))]
+    UnsupportedFileFormat { format: String },
+
+    #[snafu(display("Unsupported compression type for CSV"))]
+    UnsupportedCsvCompressionType {
+        source: DataFusionError,
+        compression_type: String,
+    },
+}
+
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub type AnyErrorResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+pub type DataConnectorResult<T> = std::result::Result<T, DataConnectorError>;
 
 type NewDataConnectorResult = AnyErrorResult<Arc<dyn DataConnector>>;
 
@@ -153,6 +224,8 @@ pub async fn register_all() {
     #[cfg(feature = "flightsql")]
     register_connector_factory("flightsql", flightsql::FlightSQL::create).await;
     register_connector_factory("s3", s3::S3::create).await;
+    #[cfg(feature = "ftp")]
+    register_connector_factory("ftp", ftp::FTP::create).await;
     register_connector_factory("spiceai", spiceai::SpiceAI::create).await;
     #[cfg(feature = "mysql")]
     register_connector_factory("mysql", mysql::MySQL::create).await;
@@ -182,12 +255,13 @@ pub trait DataConnectorFactory {
 pub trait DataConnector: Send + Sync {
     fn as_any(&self) -> &dyn Any;
 
-    async fn read_provider(&self, dataset: &Dataset) -> AnyErrorResult<Arc<dyn TableProvider>>;
+    async fn read_provider(&self, dataset: &Dataset)
+        -> DataConnectorResult<Arc<dyn TableProvider>>;
 
     async fn read_write_provider(
         &self,
         _dataset: &Dataset,
-    ) -> Option<AnyErrorResult<Arc<dyn TableProvider>>> {
+    ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         None
     }
 
@@ -197,19 +271,12 @@ pub trait DataConnector: Send + Sync {
     ) -> Option<AnyErrorResult<Arc<dyn TableProvider>>> {
         None
     }
-
-    fn get_object_store(
-        &self,
-        _dataset: &Dataset,
-    ) -> Option<AnyErrorResult<(Url, Arc<dyn ObjectStore + 'static>)>> {
-        None
-    }
 }
 
 // Gets data from a table provider and returns it as a vector of RecordBatches.
 pub async fn get_data(
     ctx: &mut SessionContext,
-    table_name: OwnedTableReference,
+    table_name: TableReference,
     table_provider: Arc<dyn TableProvider>,
     sql: Option<String>,
     filters: Vec<Expr>,
@@ -237,4 +304,118 @@ pub async fn get_data(
     let batches = df.collect().await.context(UnableToScanTableProviderSnafu)?;
 
     Ok((table_provider.schema(), batches))
+}
+
+pub trait ListingTableConnector: DataConnector {
+    fn as_any(&self) -> &dyn Any;
+
+    fn get_object_store_url(&self, dataset: &Dataset) -> AnyErrorResult<Url>;
+
+    fn get_params(&self) -> &HashMap<String, String>;
+
+    fn get_file_format_and_extension(&self) -> DataConnectorResult<(Arc<dyn FileFormat>, String)> {
+        let params = self.get_params();
+        let extension = params.get("file_extension").cloned();
+
+        match params.get("file_format").map(String::as_str) {
+            Some("csv") => Ok((
+                self.get_csv_format(params)?,
+                extension.unwrap_or(".csv".to_string()),
+            )),
+            None | Some("parquet") => Ok((
+                Arc::new(ParquetFormat::default()),
+                extension.unwrap_or(".parquet".to_string()),
+            )),
+            Some(format) => Err(DataConnectorError::UnsupportedFileFormat {
+                format: format.to_string(),
+            }),
+        }
+    }
+
+    fn get_csv_format(
+        &self,
+        params: &HashMap<String, String>,
+    ) -> DataConnectorResult<Arc<CsvFormat>> {
+        let compression_type = params.get("compression_type").map_or("", |f| f);
+        let has_header = params.get("has_header").map_or(true, |f| f == "true");
+        let delimiter = params
+            .get("delimiter")
+            .map_or(b',', |f| *f.as_bytes().first().unwrap_or(&b','));
+
+        Ok(Arc::new(
+            CsvFormat::default()
+                .with_has_header(has_header)
+                .with_file_compression_type(
+                    FileCompressionType::from_str(compression_type)
+                        .context(UnsupportedCsvCompressionTypeSnafu { compression_type })?,
+                )
+                .with_delimiter(delimiter),
+        ))
+    }
+}
+
+#[async_trait]
+impl<T: ListingTableConnector + Display> DataConnector for T {
+    fn as_any(&self) -> &dyn Any {
+        ListingTableConnector::as_any(self)
+    }
+
+    async fn read_provider(
+        &self,
+        dataset: &Dataset,
+    ) -> DataConnectorResult<Arc<dyn TableProvider>> {
+        let ctx = SessionContext::new_with_config_rt(
+            SessionConfig::new().set_bool(
+                "datafusion.execution.listing_table_ignore_subdirectory",
+                false,
+            ),
+            default_runtime_env(),
+        );
+
+        let url = self
+            .get_object_store_url(dataset)
+            .context(InvalidConfigurationSnafu {
+                dataconnector: format!("{__self}"),
+                message: "Unable to parse URL",
+            })?;
+
+        let table_path =
+            ListingTableUrl::parse(url)
+                .boxed()
+                .context(InvalidConfigurationSnafu {
+                    dataconnector: format!("{__self}"),
+                    message: "Unable to parse URL",
+                })?;
+
+        let (file_format, extension) = self
+            .get_file_format_and_extension()
+            .map_err(Into::into)
+            .context(InvalidConfigurationSnafu {
+                dataconnector: format!("{__self}"),
+                message: "Unable to resolve file_format and file_extension",
+            })?;
+        let options = ListingOptions::new(file_format).with_file_extension(&extension);
+
+        let resolved_schema = options
+            .infer_schema(&ctx.state(), &table_path)
+            .await
+            .boxed()
+            .context(InvalidConfigurationSnafu {
+                dataconnector: format!("{__self}"),
+                message: "Unable to infer files schema",
+            })?;
+
+        let config = ListingTableConfig::new(table_path)
+            .with_listing_options(options)
+            .with_schema(resolved_schema);
+
+        let table = ListingTable::try_new(config)
+            .boxed()
+            .context(InvalidConfigurationSnafu {
+                dataconnector: format!("{__self}"),
+                message: "Unable to list files in data provider",
+            })?;
+
+        Ok(Arc::new(table))
+    }
 }

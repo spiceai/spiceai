@@ -49,6 +49,12 @@ pub enum Error {
 
     #[snafu(display("Unable to query arrow: {source}"))]
     UnableToQueryArrow { source: GenericError },
+
+    #[snafu(display("Table {table_name} not found. Ensure the table name is correctly spelled."))]
+    UndefinedTable {
+        table_name: String,
+        source: GenericError,
+    },
 }
 
 pub trait SyncDbConnection<T, P>: DbConnection<T, P> {
@@ -65,7 +71,7 @@ pub trait SyncDbConnection<T, P>: DbConnection<T, P> {
     /// # Errors
     ///
     /// Returns an error if the schema cannot be retrieved.
-    fn get_schema(&self, table_reference: &TableReference) -> Result<SchemaRef>;
+    fn get_schema(&self, table_reference: &TableReference) -> Result<SchemaRef, Error>;
 
     /// Query the database with the given SQL statement and parameters, returning a `Result` of `SendableRecordBatchStream`.
     ///
@@ -97,7 +103,7 @@ pub trait AsyncDbConnection<T, P>: DbConnection<T, P> + Sync {
     fn new(conn: T) -> Self
     where
         Self: Sized;
-    async fn get_schema(&self, table_reference: &TableReference) -> Result<SchemaRef>;
+    async fn get_schema(&self, table_reference: &TableReference) -> Result<SchemaRef, Error>;
     async fn query_arrow(&self, sql: &str, params: &[P]) -> Result<SendableRecordBatchStream>;
     async fn execute(&self, sql: &str, params: &[P]) -> Result<u64>;
 }
@@ -126,15 +132,12 @@ pub trait DbConnection<T, P>: Send {
 /// Returns an error if the schema cannot be retrieved.
 pub async fn get_schema<T, P>(
     conn: Box<dyn DbConnection<T, P>>,
-    table_reference: &datafusion::sql::TableReference<'_>,
+    table_reference: &datafusion::sql::TableReference,
 ) -> Result<Arc<arrow::datatypes::Schema>, Error> {
     let schema = if let Some(conn) = conn.as_sync() {
-        conn.get_schema(table_reference)
-            .context(UnableToGetSchemaSnafu)?
+        conn.get_schema(table_reference)?
     } else if let Some(conn) = conn.as_async() {
-        conn.get_schema(table_reference)
-            .await
-            .context(UnableToGetSchemaSnafu)?
+        conn.get_schema(table_reference).await?
     } else {
         return Err(Error::UnableToDowncastConnection {});
     };

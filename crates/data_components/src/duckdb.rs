@@ -18,11 +18,11 @@ use crate::{delete::DeletionTableProviderAdapter, Read, ReadWrite};
 use arrow::{array::RecordBatch, datatypes::SchemaRef};
 use async_trait::async_trait;
 use datafusion::{
-    common::OwnedTableReference,
     datasource::{provider::TableProviderFactory, TableProvider},
     error::{DataFusionError, Result as DataFusionResult},
     execution::context::SessionState,
     logical_expr::CreateExternalTable,
+    sql::TableReference,
 };
 use db_connection_pool::{
     dbconnection::{duckdbconn::DuckDbConnection, DbConnection},
@@ -185,7 +185,7 @@ impl TableProviderFactory for DuckDBTableProviderFactory {
         let read_provider = Arc::new(SqlTable::new_with_schema(
             &dyn_pool,
             Arc::clone(&schema),
-            OwnedTableReference::bare(name.clone()),
+            TableReference::bare(name.clone()),
         ));
 
         let read_write_provider = DuckDBTableWriter::create(read_provider, duckdb);
@@ -347,7 +347,7 @@ impl DuckDBTableFactory {
 impl Read for DuckDBTableFactory {
     async fn table_provider(
         &self,
-        table_reference: OwnedTableReference,
+        table_reference: TableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         let pool = Arc::clone(&self.pool);
         let dyn_pool: Arc<DynDuckDbConnectionPool> = pool;
@@ -363,7 +363,7 @@ impl Read for DuckDBTableFactory {
 impl ReadWrite for DuckDBTableFactory {
     async fn table_provider(
         &self,
-        table_reference: OwnedTableReference,
+        table_reference: TableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         let read_provider = Read::table_provider(self, table_reference.clone()).await?;
 

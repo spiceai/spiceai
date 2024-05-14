@@ -15,24 +15,18 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
-use secrets::Secret;
+use pkcs8::{LineEnding, SecretDocument};
+use secrets::{get_secret_or_param, Secret};
 use snafu::prelude::*;
 use snowflake_api::{SnowflakeApi, SnowflakeApiError};
-
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, fs, sync::Arc};
 
 use super::{DbConnectionPool, Result};
 
-use crate::{
-    dbconnection::{snowflakeconn::SnowflakeConnection, DbConnection},
-    get_secret_or_param,
-};
+use crate::dbconnection::{snowflakeconn::SnowflakeConnection, DbConnection};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Missing required parameter: {name}"))]
-    MissingRequiredParameter { name: String },
-
     #[snafu(display("Missing required secret: {name}"))]
     MissingRequiredSecret { name: String },
 
@@ -48,6 +42,27 @@ pub enum Error {
 
     #[snafu(display("Snowflake authentication failed. Validate account and warehouse parameters using the SnowSQL tool."))]
     UnableToAuthenticateGeneric {},
+
+    #[snafu(display("Error reading private key file {file_path}: {source}."))]
+    ErrorReadingPrivateKeyFile {
+        source: std::io::Error,
+        file_path: String,
+    },
+
+    #[snafu(display("Parameter {param_key} has invalid value: {param_value}"))]
+    InvalidParameterValue {
+        param_key: String,
+        param_value: String,
+    },
+
+    #[snafu(display("Unable to parse private key file: {source}"))]
+    UnableToParsePrivateKey { source: pkcs8::der::Error },
+
+    #[snafu(display("Unable to decrypt private key file: {source}. Is the passphrase correct?"))]
+    UnableToDecryptPrivateKey { source: pkcs8::Error },
+
+    #[snafu(display("Failed to save decrypted private key content as PEM: {source}"))]
+    FailedToCreatePem { source: pkcs8::der::Error },
 }
 
 pub struct SnowflakeConnectionPool {
@@ -79,26 +94,33 @@ impl SnowflakeConnectionPool {
     ) -> Result<Self> {
         let username = get_param(params, secret, "username")
             .context(MissingRequiredSecretSnafu { name: "username" })?;
-        let password = get_param(params, secret, "password")
-            .context(MissingRequiredSecretSnafu { name: "password" })?;
 
         let account = get_param(params, secret, "account")
-            .context(MissingRequiredParameterSnafu { name: "account" })?;
-        let warehouse = get_param(params, secret, "warehouse")
-            .context(MissingRequiredParameterSnafu { name: "warehouse" })?;
+            .context(MissingRequiredSecretSnafu { name: "account" })?;
+        // account identifier can be in <orgname.account_name> format but API requires it as <orgname-account_name>
+        let account = account.replace('.', "-");
 
-        let api = SnowflakeApi::with_password_auth(
-            &account,
-            Some(&warehouse),
-            None,
-            None,
-            &username,
-            None,
-            &password,
-        )
-        .context(UnableToConnectSnafu)?;
+        let warehouse = get_param(params, secret, "snowflake_warehouse");
+        let role = get_param(params, secret, "snowflake_role");
 
-        // auth happens on the first request; test auth and connection
+        let auth_type = get_param(params, secret, "snowflake_auth_type")
+            .unwrap_or_else(|| "snowflake".to_string())
+            .to_lowercase();
+
+        let api = match auth_type.as_str() {
+            "snowflake" => init_snowflake_api_with_password_auth(
+                &account, &username, &warehouse, &role, params, secret,
+            )?,
+            "keypair" => init_snowflake_api_with_keypair_auth(
+                &account, &username, &warehouse, &role, params, secret,
+            )?,
+            _ => InvalidParameterValueSnafu {
+                param_key: "snowflake_auth_type",
+                param_value: auth_type,
+            }
+            .fail()?,
+        };
+
         if let Err(err) = api.exec("SELECT 1").await {
             match err {
                 snowflake_api::SnowflakeApiError::AuthError(auth_err) => {
@@ -125,6 +147,76 @@ impl SnowflakeConnectionPool {
     }
 }
 
+fn init_snowflake_api_with_password_auth(
+    account: &str,
+    username: &str,
+    warehouse: &Option<String>,
+    role: &Option<String>,
+    params: &Arc<Option<HashMap<String, String>>>,
+    secret: &Option<Secret>,
+) -> Result<SnowflakeApi> {
+    let password = get_param(params, secret, "password")
+        .context(MissingRequiredSecretSnafu { name: "password" })?;
+    let api = SnowflakeApi::with_password_auth(
+        account,
+        warehouse.as_deref(),
+        None,
+        None,
+        username,
+        role.as_deref(),
+        &password,
+    )
+    .context(UnableToConnectSnafu)?;
+
+    Ok(api)
+}
+
+fn init_snowflake_api_with_keypair_auth(
+    account: &str,
+    username: &str,
+    warehouse: &Option<String>,
+    role: &Option<String>,
+    params: &Arc<Option<HashMap<String, String>>>,
+    secret: &Option<Secret>,
+) -> Result<SnowflakeApi> {
+    let private_key_path = get_param(params, secret, "snowflake_private_key_path").context(
+        MissingRequiredSecretSnafu {
+            name: "snowflake_private_key_path",
+        },
+    )?;
+
+    let mut private_key_pem: String =
+        fs::read_to_string(&private_key_path).context(ErrorReadingPrivateKeyFileSnafu {
+            file_path: private_key_path,
+        })?;
+
+    let (label, data) =
+        SecretDocument::from_pem(&private_key_pem).context(UnableToParsePrivateKeySnafu)?;
+
+    if label.to_uppercase() == "ENCRYPTED PRIVATE KEY" {
+        let passphrase = get_param(params, secret, "snowflake_private_key_passphrase").context(
+            MissingRequiredSecretSnafu {
+                name: "snowflake_private_key_passphrase",
+            },
+        )?;
+
+        private_key_pem = decode_pkcs8_encrypted_data(&data, &passphrase)?;
+    }
+
+    let api = SnowflakeApi::with_certificate_auth(
+        account,
+        warehouse.as_deref(),
+        None,
+        None,
+        username,
+        role.as_deref(),
+        &private_key_pem,
+    )
+    .context(UnableToConnectSnafu)?;
+
+    Ok(api)
+}
+
 #[async_trait]
 impl DbConnectionPool<Arc<SnowflakeApi>, &'static (dyn Sync)> for SnowflakeConnectionPool {
     async fn connect(
@@ -136,4 +228,18 @@ impl DbConnectionPool<Arc<SnowflakeApi>, &'static (dyn Sync)> for SnowflakeConne
 
         Ok(Box::new(conn))
     }
+}
+
+fn decode_pkcs8_encrypted_data(data: &SecretDocument, password: &str) -> Result<String> {
+    let encrypted_key_info = data
+        .decode_msg::<pkcs8::EncryptedPrivateKeyInfo>()
+        .context(UnableToParsePrivateKeySnafu)?;
+    let decrypted_key_info = encrypted_key_info
+        .decrypt(password)
+        .context(UnableToDecryptPrivateKeySnafu)?;
+    let decrypted_pem = decrypted_key_info
+        .to_pem("PRIVATE KEY", LineEnding::CRLF)
+        .context(FailedToCreatePemSnafu)?;
+
+    Ok(decrypted_pem.to_string())
 }

@@ -14,4 +14,5 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-pub struct Onnx {}
+#[cfg(feature = "ftp")]
+pub mod ftp;

@@ -9,6 +9,7 @@ members = [
     "crates/arrow_tools",
     "crates/sql_provider_datafusion",
     "crates/flightrepl",
+    "crates/model_components",
     "crates/ns_lookup",
     "tools/flightpublisher/",
     "tools/flightsubscriber/",
@@ -20,7 +21,7 @@ default-members = ["bin/spiced"]
 resolver = "2"
 
 [workspace.package]
-version = "0.12.1-alpha"
+version = "0.13.0-alpha"
 edition = "2021"
 rust-version = "1.75"
 license = "Apache-2.0"
@@ -37,7 +38,7 @@ tokio = { version = "1.35.1", features = ["rt-multi-thread", "signal"] }
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 metrics = "0.22.0"
-datafusion = "37.1.0"
+datafusion = "38.0.0"
 arrow = "51.0.0"
 arrow-flight = "51.0.0"
 duckdb = "0.10.2"
@@ -61,6 +62,9 @@ clickhouse-rs = { git = "https://github.com/spiceai/clickhouse-rs.git", tag = "0
 ] }
 uuid = "1.6.1"
 pem = "3.0.4"
+fundu = "2.0.0"
 odbc-api = { version = "7.0.0" }
 arrow-odbc = { version = "9.0.0" }
-snowflake-api = { version = "0.8.0" }
+snowflake-api = { git = "https://github.com/spiceai/snowflake-rs.git", folder = "snowflake-api", rev = "5dab964abef23314e7a3f27ae89b83352e315206" }
+suppaftp = { version = "5.3.1", features = ["async"] }
+datafusion-federation = { git = "https://github.com/phillipleblanc/datafusion-federation.git", branch = "spiceai" }

@@ -18,11 +18,11 @@ use arrow::{array::RecordBatch, datatypes::SchemaRef};
 use arrow_sql_gen::statement::{CreateTableBuilder, InsertBuilder};
 use async_trait::async_trait;
 use datafusion::{
-    common::OwnedTableReference,
     datasource::{provider::TableProviderFactory, TableProvider},
     error::{DataFusionError, Result as DataFusionResult},
     execution::context::SessionState,
     logical_expr::CreateExternalTable,
+    sql::TableReference,
 };
 use db_connection_pool::{
     dbconnection::{sqliteconn::SqliteConnection, DbConnection},
@@ -78,12 +78,16 @@ pub enum Error {
 type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[allow(clippy::module_name_repetitions)]
-pub struct SqliteTableFactory {}
+pub struct SqliteTableFactory {
+    db_path_param: String,
+}
 
 impl SqliteTableFactory {
     #[must_use]
     pub fn new() -> Self {
-        Self {}
+        Self {
+            db_path_param: "sqlite_file".to_string(),
+        }
     }
 }
 
@@ -108,10 +112,14 @@ impl TableProviderFactory for SqliteTableFactory {
         let mode = options.remove("mode").unwrap_or_default();
         let mode: Mode = mode.as_str().into();
 
-        let params = Arc::new(Some(options));
+        let db_path = cmd
+            .options
+            .get(self.db_path_param.as_str())
+            .cloned()
+            .unwrap_or(format!("{name}_sqlite.db"));
 
         let pool: Arc<SqliteConnectionPool> = Arc::new(
-            SqliteConnectionPool::new(&name, mode, params)
+            SqliteConnectionPool::new(&db_path, mode)
                 .await
                 .context(DbConnectionPoolSnafu)
                 .map_err(to_datafusion_error)?,
@@ -128,8 +136,8 @@ impl TableProviderFactory for SqliteTableFactory {
         let sqlite_conn = Sqlite::sqlite_conn(&mut db_conn).map_err(to_datafusion_error)?;
 
         let table_exists = sqlite.table_exists(sqlite_conn).await;
-        let sqlite_in_conn = Arc::clone(&sqlite);
         if !table_exists {
+            let sqlite_in_conn = Arc::clone(&sqlite);
             sqlite_conn
                 .conn
                 .call(move |conn| {
@@ -148,7 +156,7 @@ impl TableProviderFactory for SqliteTableFactory {
         let read_provider = Arc::new(SqlTable::new_with_schema(
             &dyn_pool,
             Arc::clone(&schema),
-            OwnedTableReference::bare(name.clone()),
+            TableReference::bare(name.clone()),
         ));
 
         let sqlite = Arc::into_inner(sqlite)

@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use data_components::postgres::PostgresTableFactory;
 use data_components::Read;
 use datafusion::datasource::TableProvider;
-use db_connection_pool::postgrespool::PostgresConnectionPool;
+use db_connection_pool::postgrespool::{self, PostgresConnectionPool};
 use secrets::Secret;
 use snafu::prelude::*;
 use spicepod::component::dataset::Dataset;
@@ -27,25 +27,13 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::{collections::HashMap, future::Future};
 
-use super::{DataConnector, DataConnectorFactory};
+use super::{DataConnector, DataConnectorError, DataConnectorFactory};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Unable to create Postgres connection pool: {source}"))]
     UnableToCreatePostgresConnectionPool { source: db_connection_pool::Error },
-
-    #[snafu(display("{source}"))]
-    UnableToGetReadProvider {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    #[snafu(display("{source}"))]
-    UnableToGetReadWriteProvider {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
 }
-
-pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct Postgres {
     postgres_factory: PostgresTableFactory,
@@ -57,15 +45,37 @@ impl DataConnectorFactory for Postgres {
         params: Arc<Option<HashMap<String, String>>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let pool = Arc::new(
-                PostgresConnectionPool::new(params, secret)
-                    .await
-                    .context(UnableToCreatePostgresConnectionPoolSnafu)?,
-            );
+            match PostgresConnectionPool::new(params, secret).await {
+                Ok(pool) => {
+                    let postgres_factory = PostgresTableFactory::new(Arc::new(pool));
+                    Ok(Arc::new(Self { postgres_factory }) as Arc<dyn DataConnector>)
+                }
+                Err(e) => match e {
+                    postgrespool::Error::InvalidUsernameOrPassword { .. } => Err(
+                        DataConnectorError::UnableToConnectInvalidUsernameOrPassword {
+                            dataconnector: "postgres".to_string(),
+                        }
+                        .into(),
+                    ),
 
-            let postgres_factory = PostgresTableFactory::new(pool);
+                    postgrespool::Error::InvalidHostOrPortError {
+                        host,
+                        port,
+                        source: _,
+                    } => Err(DataConnectorError::UnableToConnectInvalidHostOrPort {
+                        dataconnector: "postgres".to_string(),
+                        host,
+                        port,
+                    }
+                    .into()),
 
-            Ok(Arc::new(Self { postgres_factory }) as Arc<dyn DataConnector>)
+                    _ => Err(DataConnectorError::UnableToConnectInternal {
+                        dataconnector: "postgres".to_string(),
+                        source: Box::new(e),
+                    }
+                    .into()),
+                },
+            }
         })
     }
 }
@@ -79,11 +89,29 @@ impl DataConnector for Postgres {
     async fn read_provider(
         &self,
         dataset: &Dataset,
-    ) -> super::AnyErrorResult<Arc<dyn TableProvider>> {
-        Ok(
-            Read::table_provider(&self.postgres_factory, dataset.path().into())
-                .await
-                .context(UnableToGetReadProviderSnafu)?,
-        )
+    ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
+        match Read::table_provider(&self.postgres_factory, dataset.path().into()).await {
+            Ok(provider) => Ok(provider),
+            Err(e) => {
+                if let Some(err_source) = e.source() {
+                    if let Some(db_connection_pool::dbconnection::Error::UndefinedTable {
+                        table_name,
+                        source: _,
+                    }) = err_source.downcast_ref::<db_connection_pool::dbconnection::Error>()
+                    {
+                        return Err(DataConnectorError::InvalidTableName {
+                            dataconnector: "postgres".to_string(),
+                            dataset_name: dataset.name.to_string(),
+                            table_name: table_name.clone(),
+                        });
+                    }
+                }
+
+                return Err(DataConnectorError::UnableToGetReadProvider {
+                    dataconnector: "postgres".to_string(),
+                    source: e,
+                });
+            }
+        }
     }
 }

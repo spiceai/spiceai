@@ -64,7 +64,10 @@ impl<'a> AsyncDbConnection<Conn, &'a (dyn ToValue + Sync)> for MySQLConnection {
         }
     }
 
-    async fn get_schema(&self, table_reference: &TableReference) -> Result<SchemaRef> {
+    async fn get_schema(
+        &self,
+        table_reference: &TableReference,
+    ) -> Result<SchemaRef, super::Error> {
         let mut conn = self.conn.lock().await;
         let conn = &mut *conn;
         let rows: Vec<Row> = conn
@@ -76,8 +79,13 @@ impl<'a> AsyncDbConnection<Conn, &'a (dyn ToValue + Sync)> for MySQLConnection {
                 Params::Empty,
             )
             .await
-            .context(QuerySnafu)?;
-        let rec = rows_to_arrow(&rows).context(ConversionSnafu)?;
+            .boxed()
+            .context(super::UnableToGetSchemaSnafu)?;
+
+        let rec = rows_to_arrow(&rows)
+            .boxed()
+            .context(super::UnableToGetSchemaSnafu)?;
+
         Ok(rec.schema())
     }
 

@@ -43,12 +43,6 @@ pub enum PostgresError {
         source: arrow_sql_gen::postgres::Error,
     },
 
-    #[snafu(display("Table {table_name} not found. Ensure the table name is correctly spelled."))]
-    UndefinedTableError {
-        source: Box<tokio_postgres::error::DbError>,
-        table_name: String,
-    },
-
     #[snafu(display("{source}"))]
     InternalError {
         source: tokio_postgres::error::Error,
@@ -98,7 +92,10 @@ impl<'a>
         PostgresConnection { conn }
     }
 
-    async fn get_schema(&self, table_reference: &TableReference) -> Result<SchemaRef> {
+    async fn get_schema(
+        &self,
+        table_reference: &TableReference,
+    ) -> Result<SchemaRef, super::Error> {
         match self
             .conn
             .query(
@@ -111,26 +108,29 @@ impl<'a>
             .await
         {
             Ok(rows) => {
-                let rec = rows_to_arrow(rows.as_slice()).context(ConversionSnafu)?;
+                let rec = rows_to_arrow(rows.as_slice())
+                    .boxed()
+                    .context(super::UnableToGetSchemaSnafu)?;
+
                 Ok(rec.schema())
             }
             Err(err) => {
-                let Some(error_source) = err.source() else {
-                    return Err(Box::new(PostgresError::InternalError { source: err }));
-                };
-
-                if let Some(pg_error) =
-                    error_source.downcast_ref::<tokio_postgres::error::DbError>()
-                {
-                    if pg_error.code() == &tokio_postgres::error::SqlState::UNDEFINED_TABLE {
-                        return Err(Box::new(PostgresError::UndefinedTableError {
-                            source: Box::new(pg_error.clone()),
-                            table_name: table_reference.to_string(),
-                        }));
+                if let Some(error_source) = err.source() {
+                    if let Some(pg_error) =
+                        error_source.downcast_ref::<tokio_postgres::error::DbError>()
+                    {
+                        if pg_error.code() == &tokio_postgres::error::SqlState::UNDEFINED_TABLE {
+                            return Err(super::Error::UndefinedTable {
+                                source: Box::new(pg_error.clone()),
+                                table_name: table_reference.to_string(),
+                            });
+                        }
                     }
                 }
 
-                return Err(Box::new(PostgresError::InternalError { source: err }));
+                return Err(super::Error::UnableToGetSchema {
+                    source: Box::new(err),
+                });
             }
         }
     }

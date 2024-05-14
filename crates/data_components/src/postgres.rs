@@ -26,15 +26,15 @@ use bb8_postgres::{
     PostgresConnectionManager,
 };
 use datafusion::{
-    common::OwnedTableReference,
     datasource::{provider::TableProviderFactory, TableProvider},
     error::{DataFusionError, Result as DataFusionResult},
     execution::context::SessionState,
     logical_expr::CreateExternalTable,
+    sql::TableReference,
 };
 use db_connection_pool::{
     dbconnection::{postgresconn::PostgresConnection, DbConnection},
-    postgrespool::PostgresConnectionPool,
+    postgrespool::{self, PostgresConnectionPool},
     DbConnectionPool,
 };
 use postgres_native_tls::MakeTlsConnector;
@@ -66,7 +66,7 @@ pub enum Error {
     },
 
     #[snafu(display("Unable to create Postgres connection pool: {source}"))]
-    UnableToCreatePostgresConnectionPool { source: db_connection_pool::Error },
+    UnableToCreatePostgresConnectionPool { source: postgrespool::Error },
 
     #[snafu(display("Unable to downcast DbConnection to PostgresConnection"))]
     UnableToDowncastDbConnection {},
@@ -135,7 +135,7 @@ impl PostgresTableFactory {
 impl Read for PostgresTableFactory {
     async fn table_provider(
         &self,
-        table_reference: OwnedTableReference,
+        table_reference: TableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         let pool = Arc::clone(&self.pool);
         let dyn_pool: Arc<DynPostgresConnectionPool> = pool;
@@ -151,7 +151,7 @@ impl Read for PostgresTableFactory {
 impl ReadWrite for PostgresTableFactory {
     async fn table_provider(
         &self,
-        table_reference: OwnedTableReference,
+        table_reference: TableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         let read_provider = Read::table_provider(self, table_reference.clone()).await?;
 
@@ -229,7 +229,7 @@ impl TableProviderFactory for PostgresTableProviderFactory {
         let read_provider = Arc::new(SqlTable::new_with_schema(
             &dyn_pool,
             Arc::clone(&schema),
-            OwnedTableReference::bare(name.clone()),
+            TableReference::bare(name.clone()),
         ));
 
         let delete_adapter =

@@ -14,22 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{AnyErrorResult, DataConnector, DataConnectorFactory};
-use async_trait::async_trait;
-use datafusion::datasource::TableProvider;
-use datafusion::error::DataFusionError;
-use datafusion::execution::context::SessionContext;
-use datafusion::execution::options::ParquetReadOptions;
-use object_store::aws::AmazonS3Builder;
-use object_store::ObjectStore;
+use super::{AnyErrorResult, DataConnector, DataConnectorFactory, ListingTableConnector};
+
 use secrets::Secret;
 use snafu::prelude::*;
 use spicepod::component::dataset::Dataset;
 use std::any::Any;
+use std::clone::Clone;
 use std::pin::Pin;
+use std::string::String;
 use std::sync::Arc;
 use std::{collections::HashMap, future::Future};
-use url::Url;
+use url::{form_urlencoded, Url};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -43,33 +39,6 @@ pub enum Error {
     UnableToParseURL {
         url: String,
         source: url::ParseError,
-    },
-
-    #[snafu(display("{source}"))]
-    UnableToGetReadProvider {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    #[snafu(display("{source}"))]
-    UnableToGetReadWriteProvider {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    #[snafu(display("{source}"))]
-    UnableToBuildObjectStore {
-        source: object_store::Error,
-    },
-
-    #[snafu(display("The S3 URL is missing a forward slash: {url}"))]
-    MissingForwardSlash {
-        url: String,
-    },
-
-    ObjectStoreNotImplemented,
-
-    #[snafu(display("{source}"))]
-    UnableToBuildLogicalPlan {
-        source: DataFusionError,
     },
 }
 
@@ -93,74 +62,58 @@ impl DataConnectorFactory for S3 {
     }
 }
 
-#[async_trait]
-impl DataConnector for S3 {
+impl std::fmt::Display for S3 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "S3")
+    }
+}
+
+impl ListingTableConnector for S3 {
     fn as_any(&self) -> &dyn Any {
         self
     }
 
-    fn get_object_store(
-        &self,
-        dataset: &Dataset,
-    ) -> Option<AnyErrorResult<(Url, Arc<dyn ObjectStore + 'static>)>> {
-        let result: AnyErrorResult<(Url, Arc<dyn ObjectStore + 'static>)> = (|| {
-            let url = dataset.from.clone();
-            let parts = url.clone().replace("s3://", "");
-
-            let bucket = parts
-                .split('/')
-                .next()
-                .ok_or_else(|| MissingForwardSlashSnafu { url: url.clone() }.build())?;
-
-            let mut s3_builder = AmazonS3Builder::new()
-                .with_bucket_name(bucket)
-                .with_allow_http(true);
-
-            if let Some(region) = self.params.get("region") {
-                s3_builder = s3_builder.with_region(region);
-            }
-            if let Some(endpoint) = self.params.get("endpoint") {
-                s3_builder = s3_builder.with_endpoint(endpoint);
-            }
-            if let Some(secret) = &self.secret {
-                if let Some(key) = secret.get("key") {
-                    s3_builder = s3_builder.with_access_key_id(key);
-                };
-                if let Some(secret) = secret.get("secret") {
-                    s3_builder = s3_builder.with_secret_access_key(secret);
-                };
-            } else {
-                s3_builder = s3_builder.with_skip_signature(true);
-            };
-
-            let s3 = s3_builder.build().context(UnableToBuildObjectStoreSnafu)?;
-
-            let s3_url = Url::parse(&url).context(UnableToParseURLSnafu { url: url.clone() })?;
-
-            Ok((s3_url, Arc::new(s3) as Arc<dyn ObjectStore>))
-        })();
-
-        Some(result)
+    fn get_params(&self) -> &HashMap<String, String> {
+        &self.params
     }
 
-    async fn read_provider(
-        &self,
-        dataset: &Dataset,
-    ) -> super::AnyErrorResult<Arc<dyn TableProvider>> {
-        let ctx = SessionContext::new();
+    fn get_object_store_url(&self, dataset: &Dataset) -> AnyErrorResult<Url> {
+        let mut fragments = vec![];
+        let mut fragment_builder = form_urlencoded::Serializer::new(String::new());
 
-        let (url, s3) = self
-            .get_object_store(dataset)
-            .ok_or_else(|| ObjectStoreNotImplementedSnafu.build())?
-            .context(UnableToGetReadProviderSnafu)?;
+        if let Some(region) = self.params.get("region") {
+            fragment_builder.append_pair("region", region);
+        }
+        if let Some(endpoint) = self.params.get("endpoint") {
+            fragment_builder.append_pair("endpoint", endpoint);
+        }
+        if let Some(secret) = &self.secret {
+            if let Some(key) = secret.get("key") {
+                fragment_builder.append_pair("key", key);
+            };
+            if let Some(secret) = secret.get("secret") {
+                fragment_builder.append_pair("secret", secret);
+            };
+        }
+        if let Some(timeout) = self.params.get("timeout") {
+            fragment_builder.append_pair("timeout", timeout);
+        }
+        fragments.push(fragment_builder.finish());
 
-        let _ = ctx.runtime_env().register_object_store(&url, s3);
+        let mut s3_url =
+            Url::parse(&dataset.from).context(UnableToParseURLSnafu { url: &dataset.from })?;
 
-        let df = ctx
-            .read_parquet(&dataset.from, ParquetReadOptions::default())
-            .await
-            .context(UnableToBuildLogicalPlanSnafu)?;
+        // infer_schema has a bug using is_collection which is determined by if url contains suffix of /
+        // using a fragment with / suffix to trick df to think this is still a collection
+        // will need to raise an issue with DF to use url without query and fragment to decide if
+        // is_collection
+        // PR: https://github.com/apache/datafusion/pull/10419/files
+        if dataset.from.ends_with('/') {
+            fragments.push("dfiscollectionbugworkaround=hack/".into());
+        }
 
-        Ok(df.into_view())
+        s3_url.set_fragment(Some(&fragments.join("&")));
+
+        Ok(s3_url)
     }
 }

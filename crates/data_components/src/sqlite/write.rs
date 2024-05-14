@@ -24,7 +24,7 @@ use datafusion::{
     execution::{context::SessionState, SendableRecordBatchStream, TaskContext},
     logical_expr::Expr,
     physical_plan::{
-        insert::{DataSink, FileSinkExec},
+        insert::{DataSink, DataSinkExec},
         metrics::MetricsSet,
         DisplayAs, DisplayFormatType, ExecutionPlan,
     },
@@ -83,7 +83,7 @@ impl TableProvider for SqliteTableWriter {
         input: Arc<dyn ExecutionPlan>,
         overwrite: bool,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(FileSinkExec::new(
+        Ok(Arc::new(DataSinkExec::new(
             input,
             Arc::new(SqliteDataSink::new(Arc::clone(&self.sqlite), overwrite)),
             self.schema(),
@@ -241,7 +241,7 @@ mod tests {
         datatypes::{DataType, Schema},
     };
     use datafusion::{
-        common::{parsers::CompressionTypeVariant, Constraints, OwnedTableReference, ToDFSchema},
+        common::{parsers::CompressionTypeVariant, Constraints, TableReference, ToDFSchema},
         datasource::provider::TableProviderFactory,
         execution::context::SessionContext,
         logical_expr::{cast, col, lit, CreateExternalTable},
@@ -261,7 +261,7 @@ mod tests {
         let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema)).expect("df schema");
         let external_table = CreateExternalTable {
             schema: df_schema,
-            name: OwnedTableReference::bare("test_table"),
+            name: TableReference::bare("test_table"),
             location: String::new(),
             file_type: String::new(),
             has_header: false,
