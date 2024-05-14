@@ -79,9 +79,8 @@ impl FTPObjectStore {
                     let children = client.nlst(Some(&item)).await.unwrap_or(vec![]);
                     if children.is_empty() {
                         continue;
-                    } else if children[0] != item {
-                        queue.push(Some(item));
-                    } else {
+                    }
+                    if children[0] == item {
                         let meta = ObjectMeta {
                             location: Path::from(item.clone()),
                             size: client.size(&item).await.map_err(|e| {
@@ -94,6 +93,8 @@ impl FTPObjectStore {
                             version: None,
                         };
                         yield Ok(meta);
+                    } else {
+                        queue.push(Some(item));
                     }
                 }
             }
