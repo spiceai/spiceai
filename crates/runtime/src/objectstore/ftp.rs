@@ -155,8 +155,20 @@ impl ObjectStore for FTPObjectStore {
         let location_string = location.to_string();
         let object_meta = ObjectMeta {
             location: location.clone(),
-            size: client.size(&location_string).await.unwrap(),
-            last_modified: client.mdtm(&location_string).await.unwrap().and_utc(),
+            size: client.size(&location_string).await.map_err(|e| {
+                object_store::Error::NotFound {
+                    path: location_string.clone(),
+                    source: e.into(),
+                }
+            })?,
+            last_modified: client
+                .mdtm(&location_string)
+                .await
+                .map_err(|e| object_store::Error::NotFound {
+                    path: location_string.clone(),
+                    source: e.into(),
+                })?
+                .and_utc(),
             e_tag: None,
             version: None,
         };
@@ -195,7 +207,7 @@ impl ObjectStore for FTPObjectStore {
     }
 
     fn list(&self, location: Option<&Path>) -> BoxStream<'_, object_store::Result<ObjectMeta>> {
-        self.walk_path(location.map(|v| v.to_owned()))
+        self.walk_path(location.map(std::borrow::ToOwned::to_owned))
     }
 
     fn list_with_offset(
