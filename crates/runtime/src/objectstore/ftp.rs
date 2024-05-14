@@ -77,7 +77,9 @@ impl FTPObjectStore {
                     .map_err(|e| object_store::Error::NotFound { path: path.unwrap_or("/".to_string()), source: e.into() })?;
                 for item in list {
                     let children = client.nlst(Some(&item)).await.unwrap_or(vec![]);
-                    if !children.is_empty() && children[0] != item {
+                    if children.is_empty() {
+                        continue;
+                    } else if children[0] != item {
                         queue.push(Some(item));
                     } else {
                         let meta = ObjectMeta {
