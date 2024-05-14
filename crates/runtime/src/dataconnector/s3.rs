@@ -19,6 +19,7 @@ use super::{AnyErrorResult, DataConnector, DataConnectorFactory, ListingTableCon
 use secrets::Secret;
 use snafu::prelude::*;
 use spicepod::component::dataset::Dataset;
+use std::any::Any;
 use std::clone::Clone;
 use std::pin::Pin;
 use std::string::String;
@@ -62,6 +63,10 @@ impl DataConnectorFactory for S3 {
 }
 
 impl ListingTableConnector for S3 {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn get_params(&self) -> &HashMap<String, String> {
         &self.params
     }

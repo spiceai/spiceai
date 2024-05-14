@@ -306,6 +306,8 @@ pub async fn get_data(
 }
 
 pub trait ListingTableConnector: DataConnector {
+    fn as_any(&self) -> &dyn Any;
+
     fn get_object_store_url(&self, dataset: &Dataset) -> AnyErrorResult<Url>;
 
     fn get_params(&self) -> &HashMap<String, String>;
@@ -350,9 +352,9 @@ pub trait ListingTableConnector: DataConnector {
 }
 
 #[async_trait]
-impl<T: ListingTableConnector + 'static> DataConnector for T {
+impl<T: ListingTableConnector> DataConnector for T {
     fn as_any(&self) -> &dyn Any {
-        self
+        ListingTableConnector::as_any(self)
     }
 
     async fn read_provider(

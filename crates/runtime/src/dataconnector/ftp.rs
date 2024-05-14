@@ -17,6 +17,7 @@ limitations under the License.
 use secrets::{AnyErrorResult, Secret};
 use snafu::prelude::*;
 use spicepod::component::dataset::Dataset;
+use std::any::Any;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::{collections::HashMap, future::Future};
@@ -54,6 +55,10 @@ impl DataConnectorFactory for FTP {
 }
 
 impl ListingTableConnector for FTP {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn get_params(&self) -> &HashMap<String, String> {
         &self.params
     }
