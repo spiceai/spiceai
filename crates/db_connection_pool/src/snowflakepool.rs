@@ -16,17 +16,14 @@ limitations under the License.
 
 use async_trait::async_trait;
 use pkcs8::{LineEnding, SecretDocument};
-use secrets::Secret;
+use secrets::{get_secret_or_param, Secret};
 use snafu::prelude::*;
 use snowflake_api::{SnowflakeApi, SnowflakeApiError};
 use std::{collections::HashMap, fs, sync::Arc};
 
 use super::{DbConnectionPool, Result};
 
-use crate::{
-    dbconnection::{snowflakeconn::SnowflakeConnection, DbConnection},
-    get_secret_or_param,
-};
+use crate::dbconnection::{snowflakeconn::SnowflakeConnection, DbConnection};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
