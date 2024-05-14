@@ -17,16 +17,16 @@ limitations under the License.
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
-    common::OwnedTableReference,
     datasource::{TableProvider, TableType},
     error::DataFusionError,
     execution::{context::SessionState, SendableRecordBatchStream, TaskContext},
     logical_expr::Expr,
     physical_plan::{
-        insert::{DataSink, FileSinkExec},
+        insert::{DataSink, DataSinkExec},
         metrics::MetricsSet,
         DisplayAs, DisplayFormatType, ExecutionPlan,
     },
+    sql::TableReference,
 };
 use flight_client::FlightClient;
 use futures::StreamExt;
@@ -41,14 +41,14 @@ pub enum Error {
 
 pub struct FlightTableWriter {
     read_provider: Arc<dyn TableProvider>,
-    table_reference: OwnedTableReference,
+    table_reference: TableReference,
     flight_client: FlightClient,
 }
 
 impl FlightTableWriter {
     pub fn create(
         read_provider: Arc<dyn TableProvider>,
-        table_reference: OwnedTableReference,
+        table_reference: TableReference,
         flight_client: FlightClient,
     ) -> Arc<dyn TableProvider> {
         Arc::new(Self {
@@ -91,7 +91,7 @@ impl TableProvider for FlightTableWriter {
         input: Arc<dyn ExecutionPlan>,
         overwrite: bool,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(FileSinkExec::new(
+        Ok(Arc::new(DataSinkExec::new(
             input,
             Arc::new(FlightDataSink::new(
                 self.flight_client.clone(),
@@ -107,7 +107,7 @@ impl TableProvider for FlightTableWriter {
 #[derive(Clone)]
 struct FlightDataSink {
     flight_client: FlightClient,
-    table_reference: OwnedTableReference,
+    table_reference: TableReference,
     _overwrite: bool,
 }
 
@@ -138,18 +138,6 @@ impl DataSink for FlightDataSink {
                 .await
                 .context(UnableToPublishDataSnafu)
                 .map_err(to_external_error)?;
-            // TODOREARCH
-            // if let Err(e) = flight_client
-            //     .publish(&format!("{}", self.table_reference), vec![batch])
-            //     .await
-            // {
-            //     // if let flight_client::Error::PermissionDenied {} = e {
-            //     //     tracing::error!("Permission denied when publishing data to Spice AI at '{dataset_path}' - does the API Key ('{api_key}') match the app that owns the dataset?");
-            //     // } else {
-            //     //     tracing::error!("Error publishing data to Spice AI at '{dataset_path}': {e}");
-            //     //     Err(e).context(UnableToPublishDataSnafu)?;
-            //     // }
-            // };
         }
 
         Ok(num_rows)
@@ -157,11 +145,7 @@ impl DataSink for FlightDataSink {
 }
 
 impl FlightDataSink {
-    fn new(
-        flight_client: FlightClient,
-        table_reference: OwnedTableReference,
-        overwrite: bool,
-    ) -> Self {
+    fn new(flight_client: FlightClient, table_reference: TableReference, overwrite: bool) -> Self {
         Self {
             flight_client,
             table_reference,
