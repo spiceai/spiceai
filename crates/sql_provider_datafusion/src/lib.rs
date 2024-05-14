@@ -41,6 +41,9 @@ use datafusion::{
 
 pub mod expr;
 
+#[cfg(feature = "federation-experimental")]
+pub mod federation;
+
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Unable to get a DB connection from the pool: {source}"))]

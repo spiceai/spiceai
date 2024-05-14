@@ -356,7 +356,16 @@ impl Read for DuckDBTableFactory {
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
-        Ok(Arc::new(table_provider))
+        let table_provider = Arc::new(table_provider);
+
+        #[cfg(feature = "federation-experimental")]
+        let table_provider = Arc::new(
+            table_provider
+                .create_federated_table_provider()
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?,
+        );
+
+        Ok(table_provider)
     }
 }
 
