@@ -16,10 +16,9 @@ limitations under the License.
 
 use crate::dbconnection::odbcconn::ODBCConnection;
 use crate::dbconnection::odbcconn::{ODBCDbConnection, ODBCParameter};
-use crate::get_secret_or_param;
 use async_trait::async_trait;
 use odbc_api::{sys::AttrConnectionPooling, Connection, ConnectionOptions, Environment};
-use secrets::Secret;
+use secrets::{get_secret_or_param, Secret};
 use snafu::prelude::*;
 use std::{collections::HashMap, sync::Arc};
 

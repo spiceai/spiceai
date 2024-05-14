@@ -21,13 +21,10 @@ use mysql_async::{
     prelude::{Queryable, ToValue},
     Params, Row, SslOpts,
 };
-use secrets::Secret;
+use secrets::{get_secret_or_param, Secret};
 use snafu::{ResultExt, Snafu};
 
-use crate::{
-    dbconnection::{mysqlconn::MySQLConnection, AsyncDbConnection, DbConnection},
-    get_secret_or_param,
-};
+use crate::dbconnection::{mysqlconn::MySQLConnection, AsyncDbConnection, DbConnection};
 
 use super::{DbConnectionPool, Result};
 

@@ -23,13 +23,10 @@ use std::{
 
 use async_trait::async_trait;
 use clickhouse_rs::{ClientHandle, Options, Pool};
-use secrets::Secret;
+use secrets::{get_secret_or_param, Secret};
 use snafu::{ResultExt, Snafu};
 
-use crate::{
-    dbconnection::{clickhouseconn::ClickhouseConnection, DbConnection},
-    get_secret_or_param,
-};
+use crate::dbconnection::{clickhouseconn::ClickhouseConnection, DbConnection};
 
 use super::{DbConnectionPool, Result};
 
