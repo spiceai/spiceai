@@ -19,7 +19,6 @@ use arrow_flight::decode::DecodedPayload;
 use async_stream::stream;
 use async_trait::async_trait;
 use datafusion::{
-    common::OwnedTableReference,
     datasource::{TableProvider, TableType},
     error::{DataFusionError, Result as DataFusionResult},
     execution::{context::SessionState, SendableRecordBatchStream, TaskContext},
@@ -29,6 +28,7 @@ use datafusion::{
         stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionMode,
         ExecutionPlan, Partitioning, PlanProperties,
     },
+    sql::TableReference,
 };
 use flight_client::FlightClient;
 use futures::{Stream, StreamExt};
@@ -58,14 +58,14 @@ pub enum Error {
 type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct FlightTableStreamer {
-    table_reference: OwnedTableReference,
+    table_reference: TableReference,
     flight_client: FlightClient,
     schema: SchemaRef,
 }
 
 impl FlightTableStreamer {
     pub async fn create(
-        table_reference: OwnedTableReference,
+        table_reference: TableReference,
         flight_client: FlightClient,
     ) -> Result<Arc<dyn TableProvider>> {
         let schema = Self::get_schema(table_reference.clone(), flight_client.clone()).await?;
@@ -78,7 +78,7 @@ impl FlightTableStreamer {
     }
 
     async fn get_schema(
-        table_reference: OwnedTableReference,
+        table_reference: TableReference,
         mut flight_client: FlightClient,
     ) -> Result<SchemaRef> {
         let mut decoder = flight_client
@@ -135,18 +135,14 @@ impl TableProvider for FlightTableStreamer {
 
 #[derive(Clone)]
 struct FlightStreamExec {
-    table_reference: OwnedTableReference,
+    table_reference: TableReference,
     client: FlightClient,
     schema: SchemaRef,
     properties: PlanProperties,
 }
 
 impl FlightStreamExec {
-    fn new(
-        schema: &SchemaRef,
-        table_reference: &OwnedTableReference,
-        client: FlightClient,
-    ) -> Self {
+    fn new(schema: &SchemaRef, table_reference: &TableReference, client: FlightClient) -> Self {
         Self {
             table_reference: table_reference.clone(),
             client,

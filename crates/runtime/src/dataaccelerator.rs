@@ -17,7 +17,7 @@ limitations under the License.
 use ::arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
-    common::{parsers::CompressionTypeVariant, Constraints, OwnedTableReference, ToDFSchema},
+    common::{parsers::CompressionTypeVariant, Constraints, TableReference, ToDFSchema},
     datasource::TableProvider,
     logical_expr::CreateExternalTable,
 };
@@ -191,7 +191,7 @@ impl AcceleratorExternalTableBuilder {
                 }
                 .build()
             })?,
-            name: OwnedTableReference::bare(self.table_name.clone()),
+            name: TableReference::bare(self.table_name.clone()),
             location: String::new(),
             file_type: String::new(),
             has_header: false,

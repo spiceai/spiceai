@@ -1,47 +1,37 @@
-use std::time::{SystemTime, SystemTimeError, UNIX_EPOCH};
+use std::time::SystemTime;
 use std::{any::Any, sync::Arc, time::Duration};
 
 use arrow::array::UInt64Array;
 use arrow::datatypes::SchemaRef;
-use async_stream::stream;
 use async_trait::async_trait;
 use data_components::delete::get_deletion_provider;
-use datafusion::common::OwnedTableReference;
 use datafusion::error::Result as DataFusionResult;
-use datafusion::execution::config::SessionConfig;
 use datafusion::execution::context::SessionState;
 use datafusion::logical_expr::{Operator, TableProviderFilterPushDown};
 use datafusion::physical_plan::union::UnionExec;
-use datafusion::physical_plan::{collect, ExecutionPlan, ExecutionPlanProperties};
+use datafusion::physical_plan::{collect, ExecutionPlan};
 use datafusion::{
     datasource::{TableProvider, TableType},
     execution::context::SessionContext,
     logical_expr::Expr,
 };
-use futures::{stream::BoxStream, StreamExt};
 use snafu::prelude::*;
 use spicepod::component::dataset::acceleration::{RefreshMode, ZeroResultsAction};
 use spicepod::component::dataset::TimeFormat;
 use tokio::task::JoinHandle;
 use tokio::time::interval;
 
-use tokio::sync::mpsc::Receiver;
 use tokio::sync::{mpsc, oneshot, RwLock};
-use tokio_stream::wrappers::ReceiverStream;
 
+use crate::dataconnector;
 use crate::datafusion::filter_converter::TimestampFilterConvert;
 use crate::execution_plan::fallback_on_zero_results::FallbackOnZeroResultsScanExec;
 use crate::execution_plan::schema_cast::SchemaCastScanExec;
 use crate::execution_plan::slice::SliceExec;
 use crate::execution_plan::tee::TeeExec;
 use crate::execution_plan::TableScanParams;
-use crate::object_store_registry::default_runtime_env;
-use crate::{
-    dataconnector::{self, get_data},
-    dataupdate::{DataUpdate, DataUpdateExecutionPlan, UpdateType},
-    status,
-    timing::TimeMeasurement,
-};
+
+pub mod refresh;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -61,8 +51,13 @@ pub enum Error {
     #[snafu(display("Manual refresh is not supported for `append` mode"))]
     ManualRefreshIsNotSupported {},
 
-    #[snafu(display("Unable to get unix timestamp: {source}"))]
-    UnableToGetUnixTimestamp { source: SystemTimeError },
+    #[snafu(display("Failed to find latest timestamp in accelerated table"))]
+    FailedToQueryLatestTimestamp {
+        source: datafusion::error::DataFusionError,
+    },
+
+    #[snafu(display("{reason}"))]
+    FailedToFindLatestTimestamp { reason: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -78,15 +73,10 @@ pub struct AcceleratedTable {
     refresh_trigger: Option<mpsc::Sender<()>>,
     handlers: Vec<JoinHandle<()>>,
     zero_results_action: ZeroResultsAction,
-    refresh_params: Arc<RwLock<Refresh>>,
+    refresh_params: Arc<RwLock<refresh::Refresh>>,
 }
 
-enum AccelerationRefreshMode {
-    Full(Receiver<()>),
-    Append,
-}
-
-fn validate_refresh_data_window(refresh: &Refresh, dataset: &str, schema: &SchemaRef) {
+fn validate_refresh_data_window(refresh: &refresh::Refresh, dataset: &str, schema: &SchemaRef) {
     if refresh.period.is_some() {
         if let Some(time_column) = &refresh.time_column {
             if schema.column_with_name(time_column).is_none() {
@@ -106,7 +96,7 @@ pub struct Builder {
     dataset_name: String,
     federated: Arc<dyn TableProvider>,
     accelerator: Arc<dyn TableProvider>,
-    refresh: Refresh,
+    refresh: refresh::Refresh,
     retention: Option<Retention>,
     zero_results_action: ZeroResultsAction,
 }
@@ -116,7 +106,7 @@ impl Builder {
         dataset_name: String,
         federated: Arc<dyn TableProvider>,
         accelerator: Arc<dyn TableProvider>,
-        refresh: Refresh,
+        refresh: refresh::Refresh,
     ) -> Self {
         Self {
             dataset_name,
@@ -143,8 +133,21 @@ impl Builder {
         let mut scheduled_refreshes_handle: Option<JoinHandle<()>> = None;
         let (ready_sender, is_ready) = oneshot::channel::<()>();
 
-        let acceleration_refresh_mode: AccelerationRefreshMode = match self.refresh.mode {
-            RefreshMode::Append => AccelerationRefreshMode::Append,
+        let acceleration_refresh_mode: refresh::AccelerationRefreshMode = match self.refresh.mode {
+            RefreshMode::Append => {
+                if self.refresh.time_column.is_none() {
+                    refresh::AccelerationRefreshMode::Append(None)
+                } else {
+                    let (trigger, receiver) = mpsc::channel::<()>(1);
+                    refresh_trigger = Some(trigger.clone());
+                    scheduled_refreshes_handle = AcceleratedTable::schedule_regular_refreshes(
+                        self.refresh.check_interval,
+                        trigger,
+                    )
+                    .await;
+                    refresh::AccelerationRefreshMode::Append(Some(receiver))
+                }
+            }
             RefreshMode::Full => {
                 let (trigger, receiver) = mpsc::channel::<()>(1);
                 refresh_trigger = Some(trigger.clone());
@@ -153,22 +156,23 @@ impl Builder {
                     trigger,
                 )
                 .await;
-                AccelerationRefreshMode::Full(receiver)
+                refresh::AccelerationRefreshMode::Full(receiver)
             }
         };
 
         validate_refresh_data_window(&self.refresh, &self.dataset_name, &self.federated.schema());
-
         let refresh_params = Arc::new(RwLock::new(self.refresh));
-
-        let refresh_handle = tokio::spawn(AcceleratedTable::start_refresh(
+        let refresher = refresh::Refresher::new(
             self.dataset_name.clone(),
             Arc::clone(&self.federated),
             Arc::clone(&refresh_params),
-            acceleration_refresh_mode,
             Arc::clone(&self.accelerator),
-            ready_sender,
-        ));
+        );
+        let refresh_handle = tokio::spawn(async move {
+            refresher
+                .start(acceleration_refresh_mode, ready_sender)
+                .await;
+        });
 
         let mut handlers = vec![];
         handlers.push(refresh_handle);
@@ -206,7 +210,7 @@ impl AcceleratedTable {
         dataset_name: String,
         federated: Arc<dyn TableProvider>,
         accelerator: Arc<dyn TableProvider>,
-        refresh: Refresh,
+        refresh: refresh::Refresh,
     ) -> Builder {
         Builder::new(dataset_name, federated, accelerator, refresh)
     }
@@ -266,6 +270,7 @@ impl AcceleratedTable {
     }
 
     #[allow(clippy::cast_possible_wrap)]
+    #[allow(clippy::cast_possible_truncation)]
     async fn start_retention_check(
         dataset_name: String,
         accelerator: Arc<dyn TableProvider>,
@@ -280,9 +285,11 @@ impl AcceleratedTable {
 
         let mut interval_timer = tokio::time::interval(retention.check_interval);
 
-        let Some(timestamp_filter_converter) =
-            TimestampFilterConvert::create(field, Some(time_column.clone()), retention.time_format)
-        else {
+        let Some(timestamp_filter_converter) = TimestampFilterConvert::create(
+            field.cloned(),
+            Some(time_column.clone()),
+            retention.time_format,
+        ) else {
             tracing::error!("[retention] Failed to get the expression time format for {time_column}, check schema and time format");
             return;
         };
@@ -295,14 +302,13 @@ impl AcceleratedTable {
 
                 let start = SystemTime::now() - retention_period;
 
-                let Ok(timestamp) = get_timestamp(start) else {
-                    tracing::error!("[retention] Failed to get timestamp");
-                    continue;
-                };
+                let timestamp = refresh::get_timestamp(start);
                 let expr = timestamp_filter_converter.convert(timestamp, Operator::Lt);
                 tracing::info!(
                     "[retention] Evicting data for {dataset_name} where {time_column} < {}...",
-                    if let Some(value) = chrono::DateTime::from_timestamp(timestamp as i64, 0) {
+                    if let Some(value) =
+                        chrono::DateTime::from_timestamp((timestamp / 1_000_000_000) as i64, 0)
+                    {
                         value.to_rfc3339()
                     } else {
                         tracing::warn!("[retention] Unable to convert timestamp");
@@ -344,177 +350,6 @@ impl AcceleratedTable {
             }
         }
     }
-
-    async fn start_refresh(
-        dataset_name: String,
-        federated: Arc<dyn TableProvider>,
-        refresh_params: Arc<RwLock<Refresh>>,
-        acceleration_refresh_mode: AccelerationRefreshMode,
-        accelerator: Arc<dyn TableProvider>,
-        ready_sender: oneshot::Sender<()>,
-    ) {
-        let mut stream = Self::stream_updates(
-            dataset_name.clone(),
-            federated,
-            refresh_params,
-            acceleration_refresh_mode,
-        );
-
-        let ctx = SessionContext::new();
-
-        let mut ready_sender = Some(ready_sender);
-
-        loop {
-            let future_result = stream.next().await;
-
-            match future_result {
-                Some(data_update) => {
-                    let Ok(data_update) = data_update else {
-                        continue;
-                    };
-                    let state = ctx.state();
-
-                    let overwrite = data_update.update_type == UpdateType::Overwrite;
-                    match accelerator
-                        .insert_into(
-                            &state,
-                            Arc::new(DataUpdateExecutionPlan::new(data_update)),
-                            overwrite,
-                        )
-                        .await
-                    {
-                        Ok(plan) => {
-                            if let Err(e) = collect(plan, ctx.task_ctx()).await {
-                                tracing::error!("Error adding data for {dataset_name}: {e}");
-                            } else if let Some(sender) = ready_sender.take() {
-                                sender.send(()).ok();
-                            };
-                        }
-                        Err(e) => {
-                            tracing::error!("Error adding data for {dataset_name}: {e}");
-                        }
-                    }
-                }
-                None => break,
-            };
-        }
-    }
-
-    #[allow(clippy::needless_pass_by_value)]
-    fn stream_updates<'a>(
-        dataset_name: String,
-        federated: Arc<dyn TableProvider>,
-        refresh_params: Arc<RwLock<Refresh>>,
-        acceleration_refresh_mode: AccelerationRefreshMode,
-    ) -> BoxStream<'a, Result<DataUpdate>> {
-        let mut ctx = SessionContext::new_with_config_rt(
-            SessionConfig::new().set_bool(
-                "datafusion.execution.listing_table_ignore_subdirectory",
-                false,
-            ),
-            default_runtime_env(),
-        );
-        if let Err(e) = ctx.register_table(
-            OwnedTableReference::bare(dataset_name.clone()),
-            Arc::clone(&federated),
-        ) {
-            tracing::error!("Unable to register federated table: {e}");
-        }
-
-        Box::pin(stream! {
-            match acceleration_refresh_mode {
-                AccelerationRefreshMode::Append => {
-                    let plan = federated.scan(&ctx.state(), None, &[], None).await.context(UnableToScanTableProviderSnafu {})?;
-
-                    if plan.output_partitioning().partition_count() > 1 {
-                        tracing::error!("Append mode is not supported for datasets with multiple partitions: {dataset_name}");
-                        return;
-                    }
-
-                    let schema = federated.schema();
-
-                    let mut stream = plan.execute(0, ctx.task_ctx()).context(UnableToScanTableProviderSnafu {})?;
-                    loop {
-                        match stream.next().await {
-                            Some(Ok(batch)) => {
-                                yield Ok(DataUpdate {
-                                    schema: Arc::clone(&schema),
-                                    data: vec![batch],
-                                    update_type: UpdateType::Append,
-                                });
-                            }
-                            Some(Err(e)) => {
-                                tracing::error!("Error reading data for dataset {dataset_name}: {e}");
-                                yield Err(Error::UnableToScanTableProvider { source: e });
-                            }
-                            None => break,
-                        }
-                    }
-                }
-                AccelerationRefreshMode::Full(receiver) => {
-
-                    let refresh_params_lock = refresh_params.read().await;
-                    let refresh_settings = &*refresh_params_lock;
-
-                    let schema = federated.schema();
-                    let column = refresh_settings.time_column.as_deref().unwrap_or_default();
-                    let field = schema.column_with_name(column).map(|(_, f)| f);
-                    let filter_converter = TimestampFilterConvert::create(field, refresh_settings.time_column.clone(), refresh_settings.time_format.clone());
-                    drop(refresh_params_lock);
-
-                    let mut refresh_stream = ReceiverStream::new(receiver);
-
-                    while refresh_stream.next().await.is_some() {
-                        tracing::info!("[refresh] Loading data for dataset {dataset_name}");
-                        status::update_dataset(&dataset_name, status::ComponentStatus::Refreshing);
-
-                        let refresh_params_lock = refresh_params.read().await;
-                        let refresh_settings = &*refresh_params_lock;
-
-                        let timer = TimeMeasurement::new("load_dataset_duration_ms", vec![("dataset", dataset_name.clone())]);
-                        let filters = match (refresh_settings.period, filter_converter.as_ref()){
-                            (Some(period), Some(converter)) => {
-                                let start = SystemTime::now() - period;
-
-                                let Ok(timestamp) = get_timestamp(start) else {
-                                    tracing::error!("[refresh] Failed to calculate timestamp of refresh period start");
-                                    continue;
-                                };
-                                vec![converter.convert(timestamp, Operator::Gt)]
-                            },
-                            _ => vec![],
-                        };
-
-                        let refresh_sql = refresh_settings.sql.clone();
-                        drop(refresh_params_lock);
-
-                        let data = match get_data(&mut ctx, OwnedTableReference::bare(dataset_name.clone()), Arc::clone(&federated), refresh_sql, filters).await {
-                            Ok(data) => data,
-                            Err(e) => {
-                                tracing::error!("[refresh] Failed to load data for dataset {dataset_name}: {e}");
-                                yield Err(Error::UnableToGetDataFromConnector { source: e });
-                                continue;
-                            }
-                        };
-                        yield Ok(DataUpdate {
-                            schema: data.0,
-                            data: data.1,
-                            update_type: UpdateType::Overwrite,
-                        });
-
-                        drop(timer);
-                    }
-                }
-            }
-        })
-    }
-}
-
-fn get_timestamp(time: SystemTime) -> Result<u64> {
-    let timestamp = time
-        .duration_since(UNIX_EPOCH)
-        .context(UnableToGetUnixTimestampSnafu)?;
-    Ok(timestamp.as_secs())
 }
 
 impl Drop for AcceleratedTable {
@@ -632,38 +467,6 @@ impl Retention {
             })
         } else {
             None
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct Refresh {
-    pub(crate) time_column: Option<String>,
-    pub(crate) time_format: Option<TimeFormat>,
-    pub(crate) check_interval: Option<Duration>,
-    pub(crate) sql: Option<String>,
-    pub(crate) mode: RefreshMode,
-    pub(crate) period: Option<Duration>,
-}
-
-impl Refresh {
-    #[allow(clippy::needless_pass_by_value)]
-    #[must_use]
-    pub(crate) fn new(
-        time_column: Option<String>,
-        time_format: Option<TimeFormat>,
-        check_interval: Option<Duration>,
-        sql: Option<String>,
-        mode: RefreshMode,
-        period: Option<Duration>,
-    ) -> Self {
-        Self {
-            time_column,
-            time_format,
-            check_interval,
-            sql,
-            mode,
-            period,
         }
     }
 }

@@ -27,7 +27,7 @@ use datafusion::{
     logical_expr::{AggregateUDF, Expr, ScalarUDF, TableSource, WindowUDF},
     physical_plan::{
         empty::EmptyExec,
-        insert::{DataSink, FileSinkExec},
+        insert::{DataSink, DataSinkExec},
         metrics::MetricsSet,
         DisplayAs, DisplayFormatType, ExecutionPlan,
     },
@@ -218,7 +218,7 @@ impl TableProvider for LocalhostConnector {
         input: Arc<dyn ExecutionPlan>,
         _overwrite: bool,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(FileSinkExec::new(
+        Ok(Arc::new(DataSinkExec::new(
             input,
             Arc::new(LocalhostDataSink::new()),
             self.schema(),

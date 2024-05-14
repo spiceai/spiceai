@@ -15,12 +15,12 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionMode};
 use datafusion::physical_plan::{Partitioning, PlanProperties};
 use datafusion::{
-    common::OwnedTableReference,
     datasource::{TableProvider, TableType},
     error::Result,
     execution::context::SessionState,
     logical_expr::Expr,
     physical_plan::ExecutionPlan,
+    sql::TableReference,
 };
 use futures::Stream;
 use spark_connect_rs::{functions::col, DataFrame, SparkSession, SparkSessionBuilder};
@@ -45,7 +45,7 @@ impl SparkConnect {
 impl ReadWrite for SparkConnect {
     async fn table_provider(
         &self,
-        table_reference: OwnedTableReference,
+        table_reference: TableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn Error + Send + Sync>> {
         let provider = get_table_provider(Arc::clone(&self.session), table_reference).await?;
         Ok(provider)
@@ -56,7 +56,7 @@ impl ReadWrite for SparkConnect {
 impl Read for SparkConnect {
     async fn table_provider(
         &self,
-        table_reference: OwnedTableReference,
+        table_reference: TableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn Error + Send + Sync>> {
         let provider = get_table_provider(Arc::clone(&self.session), table_reference).await?;
         Ok(provider)
@@ -65,7 +65,7 @@ impl Read for SparkConnect {
 
 async fn get_table_provider(
     spark_session: Arc<SparkSession>,
-    table_reference: OwnedTableReference,
+    table_reference: TableReference,
 ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn Error + Send + Sync>> {
     if let Some(catalog_name) = table_reference.catalog() {
         let spark_session = Arc::clone(&spark_session);

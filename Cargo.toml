@@ -39,7 +39,7 @@ tokio = { version = "1.35.1", features = ["rt-multi-thread", "signal"] }
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 metrics = "0.22.0"
-datafusion = "37.1.0"
+datafusion = "38.0.0"
 arrow = "51.0.0"
 arrow-flight = "51.0.0"
 duckdb = "0.10.2"
@@ -62,5 +62,5 @@ uuid = "1.6.1"
 pem = "3.0.4"
 odbc-api = { version = "7.0.0" }
 arrow-odbc = { version = "9.0.0" }
-snowflake-api = { git="https://github.com/spiceai/snowflake-rs.git", folder="snowflake-api", rev="5dab964abef23314e7a3f27ae89b83352e315206" }
-datafusion-federation = { git = "https://github.com/phillipleblanc/datafusion-federation.git", branch = "df-37.1" }
+snowflake-api = { git = "https://github.com/spiceai/snowflake-rs.git", folder = "snowflake-api", rev = "5dab964abef23314e7a3f27ae89b83352e315206" }
+datafusion-federation = { git = "https://github.com/phillipleblanc/datafusion-federation.git", branch = "spiceai" }

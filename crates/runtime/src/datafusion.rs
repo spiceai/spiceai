@@ -19,7 +19,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::accelerated_table::{AcceleratedTable, Refresh, Retention};
+use crate::accelerated_table::{refresh::Refresh, AcceleratedTable, Retention};
 use crate::dataaccelerator::{self, create_accelerator_table};
 use crate::dataconnector::{DataConnector, DataConnectorError};
 use crate::dataupdate::{DataUpdate, DataUpdateExecutionPlan, UpdateType};
@@ -28,15 +28,14 @@ use crate::object_store_registry::default_runtime_env;
 use arrow::datatypes::Schema;
 use arrow_tools::schema::verify_schema;
 use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider};
-use datafusion::common::OwnedTableReference;
 use datafusion::datasource::ViewTable;
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::{SessionConfig, SessionContext, SessionState};
 use datafusion::physical_plan::collect;
 use datafusion::sql::parser::DFParser;
-use datafusion::sql::sqlparser;
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use itertools::Itertools;
+use datafusion::sql::{sqlparser, TableReference};
 use secrets::Secret;
 use snafu::prelude::*;
 use spicepod::component::dataset::{Dataset, Mode};
@@ -259,7 +258,7 @@ impl DataFusion {
 
         let table_provider = self
             .ctx
-            .table_provider(OwnedTableReference::bare(table_name.to_string()))
+            .table_provider(TableReference::bare(table_name.to_string()))
             .await
             .context(UnableToGetTableSnafu)?;
 
@@ -416,7 +415,7 @@ impl DataFusion {
     pub async fn refresh_table(&self, dataset_name: &str) -> Result<()> {
         let table = self
             .ctx
-            .table_provider(OwnedTableReference::bare(dataset_name.to_string()))
+            .table_provider(TableReference::bare(dataset_name.to_string()))
             .await
             .context(UnableToGetTableSnafu)?;
 
@@ -448,7 +447,7 @@ impl DataFusion {
 
         let table = self
             .ctx
-            .table_provider(OwnedTableReference::bare(dataset_name.to_string()))
+            .table_provider(TableReference::bare(dataset_name.to_string()))
             .await
             .context(UnableToGetTableSnafu)?;
 
@@ -574,7 +573,7 @@ impl DataFusion {
                 }
             };
             if let Err(e) = ctx.register_table(
-                OwnedTableReference::bare(table_name.clone()),
+                TableReference::bare(table_name.clone()),
                 Arc::new(view_table),
             ) {
                 tracing::error!("Failed to create view: {e}");

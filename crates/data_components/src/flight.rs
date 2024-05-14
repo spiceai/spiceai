@@ -21,7 +21,7 @@ use arrow_flight::error::FlightError;
 use async_stream::stream;
 use async_trait::async_trait;
 use datafusion::{
-    common::{project_schema, OwnedTableReference},
+    common::{project_schema, TableReference},
     datasource::{TableProvider, TableType},
     error::{DataFusionError, Result as DataFusionResult},
     execution::{context::SessionState, SendableRecordBatchStream, TaskContext},
@@ -31,7 +31,6 @@ use datafusion::{
         stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionMode,
         ExecutionPlan, Partitioning, PlanProperties,
     },
-    sql::TableReference,
 };
 use flight_client::FlightClient;
 use futures::{Stream, StreamExt};
@@ -77,7 +76,7 @@ impl FlightFactory {
 impl Read for FlightFactory {
     async fn table_provider(
         &self,
-        table_reference: OwnedTableReference,
+        table_reference: TableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         FlightTable::create(self.client.clone(), table_reference)
             .await
@@ -90,7 +89,7 @@ impl Read for FlightFactory {
 impl ReadWrite for FlightFactory {
     async fn table_provider(
         &self,
-        table_reference: OwnedTableReference,
+        table_reference: TableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         let read_provider = Read::table_provider(self, table_reference.clone()).await?;
 
@@ -105,14 +104,14 @@ impl ReadWrite for FlightFactory {
 pub struct FlightTable {
     client: FlightClient,
     schema: SchemaRef,
-    table_reference: OwnedTableReference,
+    table_reference: TableReference,
 }
 
 #[allow(clippy::needless_pass_by_value)]
 impl FlightTable {
     pub async fn create(
         client: FlightClient,
-        table_reference: impl Into<OwnedTableReference>,
+        table_reference: impl Into<TableReference>,
     ) -> Result<Self> {
         let table_reference = table_reference.into();
         let schema = Self::get_schema(client.clone(), &table_reference).await?;
@@ -124,13 +123,13 @@ impl FlightTable {
     }
 
     #[allow(clippy::needless_pass_by_value)]
-    async fn get_schema<'a>(
+    async fn get_schema(
         client: FlightClient,
-        table_reference: impl Into<TableReference<'a>>,
+        table_reference: &TableReference,
     ) -> Result<SchemaRef> {
         let mut stream = client
             .clone()
-            .query(format!("SELECT * FROM {} limit 1", table_reference.into()).as_str())
+            .query(format!("SELECT * FROM {table_reference} limit 1").as_str())
             .await
             .context(FlightSnafu)?;
 
@@ -206,7 +205,7 @@ impl TableProvider for FlightTable {
 #[derive(Clone)]
 struct FlightExec {
     projected_schema: SchemaRef,
-    table_reference: OwnedTableReference,
+    table_reference: TableReference,
     client: FlightClient,
     filters: Vec<Expr>,
     limit: Option<usize>,
@@ -217,7 +216,7 @@ impl FlightExec {
     fn new(
         projections: Option<&Vec<usize>>,
         schema: &SchemaRef,
-        table_reference: &OwnedTableReference,
+        table_reference: &TableReference,
         client: FlightClient,
         filters: &[Expr],
         limit: Option<usize>,
