@@ -62,6 +62,12 @@ impl DataConnectorFactory for S3 {
     }
 }
 
+impl std::fmt::Display for S3 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "S3")
+    }
+}
+
 impl ListingTableConnector for S3 {
     fn as_any(&self) -> &dyn Any {
         self

@@ -20,14 +20,13 @@ use async_stream::stream;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::BoxStream;
-use futures::stream::StreamExt;
 use futures::AsyncReadExt;
 use object_store::GetRange;
 use object_store::{
     path::Path, GetOptions, GetResult, GetResultPayload, ListResult, MultipartId, ObjectMeta,
     ObjectStore, PutOptions, PutResult,
 };
-use suppaftp::{AsyncFtpStream, FtpStream};
+use suppaftp::AsyncFtpStream;
 use tokio::io::AsyncWrite;
 
 #[derive(Debug)]
@@ -55,32 +54,43 @@ impl FTPObjectStore {
         }
     }
 
-    fn get_client(&self) -> FtpStream {
-        let mut client = FtpStream::connect(format!("{}:{}", self.host, self.port)).unwrap();
-        let _ = client.login(&self.user, &self.password);
-        client
-    }
-
     async fn get_async_client(&self) -> AsyncFtpStream {
         let mut client = AsyncFtpStream::connect(format!("{}:{}", self.host, self.port))
             .await
             .unwrap();
         let _ = client.login(&self.user, &self.password).await;
+
         client
     }
 
-    fn get_object_meta(&self, location: &str) -> Result<ObjectMeta, object_store::Error> {
-        let mut client = self.get_client();
+    fn walk_path(&self, location: Option<Path>) -> BoxStream<'_, object_store::Result<ObjectMeta>> {
+        let stream = stream! {
+            let mut client = self.get_async_client().await;
+            let path = location.map(|v| v.to_string());
+            let mut queue = vec![path];
+            while let Some(path) = queue.pop() {
+                let list = client.nlst(path.as_deref())
+                    .await
+                    .map_err(|e| object_store::Error::NotFound { path: path.unwrap_or("/".to_string()), source: e.into() })?;
+                for item in list {
+                    let children = client.nlst(Some(&item)).await.unwrap_or(vec![]);
+                    if children.len() > 0 && children[0] != item {
+                        queue.push(Some(item));
+                    } else {
+                        let meta = ObjectMeta {
+                            location: Path::from(item.clone()),
+                            size: client.size(&item).await.map_err(|e| object_store::Error::NotFound { path: item.clone(), source: e.into() })?,
+                            last_modified: client.mdtm(&item).await.map_err(|e| object_store::Error::NotFound { path: item.clone(), source: e.into() })?.and_utc(),
+                            e_tag: None,
+                            version: None,
+                        };
+                        yield Ok(meta);
+                    }
+                }
+            }
+        };
 
-        let path = Path::from(location);
-
-        Ok(ObjectMeta {
-            location: path,
-            size: client.size(location).unwrap(),
-            last_modified: client.mdtm(location).unwrap().and_utc(),
-            e_tag: None,
-            version: None,
-        })
+        Box::pin(stream)
     }
 }
 
@@ -94,7 +104,7 @@ fn pipe_stream(
         let mut total = 0;
         let mut buf = vec![0; 4096];
 
-        client.resume_transfer(start + total).await.unwrap();
+        client.resume_transfer(start).await.unwrap();
         let mut stream = client
             .retr_as_stream(location.clone())
             .await
@@ -140,10 +150,16 @@ impl ObjectStore for FTPObjectStore {
         location: &Path,
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
-        let client = self.get_async_client().await;
+        let mut client = self.get_async_client().await;
 
         let location_string = location.to_string();
-        let object_meta = self.get_object_meta(&location_string).unwrap();
+        let object_meta = ObjectMeta {
+            location: location.clone(),
+            size: client.size(&location_string).await.unwrap(),
+            last_modified: client.mdtm(&location_string).await.unwrap().and_utc(),
+            e_tag: None,
+            version: None,
+        };
 
         let mut start = 0;
         let mut end = object_meta.size;
@@ -179,16 +195,7 @@ impl ObjectStore for FTPObjectStore {
     }
 
     fn list(&self, location: Option<&Path>) -> BoxStream<'_, object_store::Result<ObjectMeta>> {
-        let mut client = self.get_client();
-
-        let path = location.map(ToString::to_string);
-        let list = client.nlst(path.as_deref()).unwrap();
-
-        let list = list
-            .iter()
-            .map(|x| self.get_object_meta(x))
-            .collect::<Vec<_>>();
-        futures::stream::iter(list).boxed()
+        self.walk_path(location.map(|v| v.to_owned()))
     }
 
     fn list_with_offset(

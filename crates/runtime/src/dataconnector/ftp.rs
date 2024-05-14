@@ -39,6 +39,12 @@ pub struct FTP {
     params: HashMap<String, String>,
 }
 
+impl std::fmt::Display for FTP {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "FTP")
+    }
+}
+
 impl DataConnectorFactory for FTP {
     fn create(
         secret: Option<Secret>,
