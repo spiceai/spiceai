@@ -21,6 +21,7 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::{collections::HashMap, sync::Arc};
 
+use ::datafusion::error::DataFusionError;
 use ::datafusion::sql::parser::{self, DFParser};
 use ::datafusion::sql::sqlparser::ast::{SetExpr, TableFactor};
 use ::datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
@@ -28,6 +29,7 @@ use ::datafusion::sql::sqlparser::{self, ast};
 use accelerated_table::AcceleratedTable;
 use app::App;
 use config::Config;
+use metrics::SetRecorderError;
 use model_components::{model::Model, modelsource::source as model_source};
 pub use notify::Error as NotifyError;
 use secrets::{spicepod_secret_store_type, Secret};
@@ -40,6 +42,7 @@ use tokio::sync::oneshot::error::RecvError;
 use tokio::time::sleep;
 use tokio::{signal, sync::RwLock};
 
+use crate::spice_metrics::MetricsRecorder;
 use crate::{dataconnector::DataConnector, datafusion::DataFusion};
 mod accelerated_table;
 pub mod config;
@@ -55,6 +58,7 @@ pub mod object_store_registry;
 pub mod objectstore;
 mod opentelemetry;
 pub mod podswatcher;
+mod spice_metrics;
 pub mod status;
 pub mod timing;
 pub(crate) mod tracers;
@@ -146,6 +150,17 @@ pub enum Error {
 
     #[snafu(display("Unable to receive accelerated table status: {source}"))]
     UnableToReceiveAcceleratedTableStatus { source: RecvError },
+
+    #[snafu(display("Unable to install metrics recorder: {source}"))]
+    UnableToInstallMetricsServer {
+        source: SetRecorderError<MetricsRecorder>,
+    },
+
+    #[snafu(display("Unable to create metrics table: {source}"))]
+    UnableToCreateMetricsTable { source: DataFusionError },
+
+    #[snafu(display("Unable to register metrics table: {source}"))]
+    UnableToRegisterMetricsTable { source: datafusion::Error },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -661,6 +676,27 @@ impl Runtime {
         status::update_model(&m.name, status::ComponentStatus::Refreshing);
         self.remove_model(m).await;
         self.load_model(m).await;
+    }
+
+    pub async fn start_metrics(&mut self, with_metrics: Option<SocketAddr>) {
+        if let Some(metrics_socket) = with_metrics {
+            let recorder = MetricsRecorder::new(metrics_socket);
+
+            if let Err(err) = self
+                .df
+                .write()
+                .await
+                .register_runtime_table("metrics".to_string(), recorder.table())
+                .context(UnableToRegisterMetricsTableSnafu)
+            {
+                tracing::warn!("Unable to register runtime metrics table: {}", err);
+                return;
+            }
+
+            recorder.start();
+
+            tracing::info!("Runtime metrics available at `spice.runtime.metrics`");
+        }
     }
 
     pub async fn start_servers(&mut self, with_metrics: Option<SocketAddr>) -> Result<()> {

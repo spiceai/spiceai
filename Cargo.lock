@@ -1860,7 +1860,7 @@ checksum = "98cc8fbded0c607b7ba9dd60cd98df59af97e84d24e49c8557331cfc26d301ce"
 [[package]]
 name = "clickhouse-rs"
 version = "1.1.0-alpha.1"
-source = "git+https://github.com/spiceai/clickhouse-rs.git?branch=async-await-plus-hello-unwrap#6c63dff9c77b528b5fc499efafb4d00ce61d2032"
+source = "git+https://github.com/spiceai/clickhouse-rs.git?tag=0.2.1#81a652c7c3dc4aff9097c30ece821393f089e3b5"
 dependencies = [
  "byteorder",
  "cfg-if",
@@ -1890,7 +1890,7 @@ dependencies = [
 [[package]]
 name = "clickhouse-rs-cityhash-sys"
 version = "0.1.2"
-source = "git+https://github.com/spiceai/clickhouse-rs.git?branch=async-await-plus-hello-unwrap#6c63dff9c77b528b5fc499efafb4d00ce61d2032"
+source = "git+https://github.com/spiceai/clickhouse-rs.git?tag=0.2.1#81a652c7c3dc4aff9097c30ece821393f089e3b5"
 dependencies = [
  "cc",
 ]
@@ -5742,6 +5742,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "prometheus-parse"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "811031bea65e5a401fb2e1f37d802cca6601e204ac463809a3189352d13b78a5"
+dependencies = [
+ "chrono",
+ "itertools 0.12.1",
+ "once_cell",
+ "regex",
+]
+
+[[package]]
 name = "prost"
 version = "0.11.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5946,9 +5958,9 @@ dependencies = [
 
 [[package]]
 name = "raw-cpuid"
-version = "11.0.1"
+version = "11.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d86a7c4638d42c44551f4791a20e687dbb4c3de1f33c43dd71e355cd429def1"
+checksum = "e29830cbb1290e404f24c73af91c5d8d631ce7e128691e9477556b540cd01ecd"
 dependencies = [
  "bitflags 2.5.0",
 ]
@@ -6327,11 +6339,13 @@ dependencies = [
  "dirs",
  "duckdb",
  "flight_client",
+ "fundu",
  "futures",
  "indexmap 2.2.6",
  "itertools 0.12.1",
  "lazy_static",
  "metrics",
+ "metrics-exporter-prometheus",
  "model_components",
  "mysql_async",
  "ndarray",
@@ -6343,6 +6357,7 @@ dependencies = [
  "opentelemetry-proto",
  "pin-project",
  "postgres-native-tls",
+ "prometheus-parse",
  "prost 0.12.4",
  "r2d2",
  "regex",

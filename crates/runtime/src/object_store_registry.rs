@@ -7,7 +7,7 @@ use datafusion::{
         runtime_env::{RuntimeConfig, RuntimeEnv},
     },
 };
-use object_store::{aws::AmazonS3Builder, ObjectStore};
+use object_store::{aws::AmazonS3Builder, ClientOptions, ObjectStore};
 use url::{form_urlencoded::parse, Url};
 
 #[cfg(feature = "ftp")]
@@ -31,6 +31,7 @@ impl SpiceObjectStoreRegistry {
                     let mut s3_builder = AmazonS3Builder::from_env()
                         .with_bucket_name(bucket_name)
                         .with_allow_http(true);
+                    let mut client_options = ClientOptions::default();
 
                     let params: HashMap<String, String> =
                         parse(url.fragment().unwrap_or_default().as_bytes())
@@ -43,12 +44,22 @@ impl SpiceObjectStoreRegistry {
                     if let Some(endpoint) = params.get("endpoint") {
                         s3_builder = s3_builder.with_endpoint(endpoint);
                     }
+                    if let Some(timeout) = params.get("timeout") {
+                        client_options = client_options.with_timeout(
+                            fundu::parse_duration(timeout).map_err(|_| {
+                                DataFusionError::Configuration(format!(
+                                    "Unable to parse timeout: {timeout}",
+                                ))
+                            })?,
+                        );
+                    }
                     if let (Some(key), Some(secret)) = (params.get("key"), params.get("secret")) {
                         s3_builder = s3_builder.with_access_key_id(key);
                         s3_builder = s3_builder.with_secret_access_key(secret);
                     } else {
                         s3_builder = s3_builder.with_skip_signature(true);
                     };
+                    s3_builder = s3_builder.with_client_options(client_options);
 
                     return Ok(Arc::new(s3_builder.build()?));
                 }
@@ -65,14 +76,14 @@ impl SpiceObjectStoreRegistry {
                         .get("port")
                         .map_or("21".to_string(), ToOwned::to_owned);
                     let user = params.get("user").map(ToOwned::to_owned).ok_or_else(|| {
-                        DataFusionError::Execution("No user provided for FTP".to_string())
+                        DataFusionError::Configuration("No user provided for FTP".to_string())
                     })?;
                     let password =
                         params
                             .get("password")
                             .map(ToOwned::to_owned)
                             .ok_or_else(|| {
-                                DataFusionError::Execution(
+                                DataFusionError::Configuration(
                                     "No password provided for FTP".to_string(),
                                 )
                             })?;
