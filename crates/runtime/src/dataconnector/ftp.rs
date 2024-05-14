@@ -89,7 +89,7 @@ impl ListingTableConnector for FTP {
         let mut ftp_url =
             Url::parse(&dataset.from).context(UnableToParseURLSnafu { url: &dataset.from })?;
 
-        if dataset.from.clone().ends_with('/') {
+        if dataset.from.ends_with('/') {
             fragments.push("dfiscollectionbugworkaround=hack/".into());
         }
 

@@ -105,7 +105,7 @@ impl ListingTableConnector for S3 {
         // will need to raise an issue with DF to use url without query and fragment to decide if
         // is_collection
         // PR: https://github.com/apache/datafusion/pull/10419/files
-        if dataset.from.clone().ends_with('/') {
+        if dataset.from.ends_with('/') {
             fragments.push("dfiscollectionbugworkaround=hack/".into());
         }
 
