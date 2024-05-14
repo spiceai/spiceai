@@ -313,7 +313,7 @@ pub trait ListingTableConnector: DataConnector {
 
     fn get_params(&self) -> &HashMap<String, String>;
 
-    fn get_file_format_and_extension(&self) -> AnyErrorResult<(Arc<dyn FileFormat>, String)> {
+    fn get_file_format_and_extension(&self) -> DataConnectorResult<(Arc<dyn FileFormat>, String)> {
         let params = self.get_params();
         let extension = params.get("file_extension").cloned();
 
@@ -328,12 +328,14 @@ pub trait ListingTableConnector: DataConnector {
             )),
             Some(format) => Err(DataConnectorError::UnsupportedFileFormat {
                 format: format.to_string(),
-            }
-            .into()),
+            }),
         }
     }
 
-    fn get_csv_format(&self, params: &HashMap<String, String>) -> AnyErrorResult<Arc<CsvFormat>> {
+    fn get_csv_format(
+        &self,
+        params: &HashMap<String, String>,
+    ) -> DataConnectorResult<Arc<CsvFormat>> {
         let compression_type = params.get("compression_type").map_or("", |f| f);
         let has_header = params.get("has_header").map_or(true, |f| f == "true");
         let delimiter = params
@@ -385,12 +387,13 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
                     message: "Unable to parse URL",
                 })?;
 
-        let (file_format, extension) =
-            self.get_file_format_and_extension()
-                .context(InvalidConfigurationSnafu {
-                    dataconnector: format!("{__self}"),
-                    message: "Unable to resolve file_format and file_extension",
-                })?;
+        let (file_format, extension) = self
+            .get_file_format_and_extension()
+            .map_err(Into::into)
+            .context(InvalidConfigurationSnafu {
+                dataconnector: format!("{__self}"),
+                message: "Unable to resolve file_format and file_extension",
+            })?;
         let options = ListingOptions::new(file_format).with_file_extension(&extension);
 
         let resolved_schema = options
