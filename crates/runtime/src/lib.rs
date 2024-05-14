@@ -42,7 +42,7 @@ use tokio::sync::oneshot::error::RecvError;
 use tokio::time::sleep;
 use tokio::{signal, sync::RwLock};
 
-use crate::spice_metrics_recorder::SpiceMetricsRecorder;
+use crate::spice_metrics::MetricsRecorder;
 use crate::{dataconnector::DataConnector, datafusion::DataFusion};
 mod accelerated_table;
 pub mod config;
@@ -58,7 +58,7 @@ pub mod object_store_registry;
 pub mod objectstore;
 mod opentelemetry;
 pub mod podswatcher;
-mod spice_metrics_recorder;
+mod spice_metrics;
 pub mod status;
 pub mod timing;
 pub(crate) mod tracers;
@@ -153,7 +153,7 @@ pub enum Error {
 
     #[snafu(display("Unable to install metrics recorder: {source}"))]
     UnableToInstallMetricsServer {
-        source: SetRecorderError<SpiceMetricsRecorder>,
+        source: SetRecorderError<MetricsRecorder>,
     },
 
     #[snafu(display("Unable to create metrics table: {source}"))]
@@ -680,7 +680,7 @@ impl Runtime {
 
     pub async fn start_metrics(&mut self, with_metrics: Option<SocketAddr>) {
         if let Some(metrics_socket) = with_metrics {
-            let recorder = SpiceMetricsRecorder::new(metrics_socket);
+            let recorder = MetricsRecorder::new(metrics_socket);
 
             if let Err(err) = self
                 .df
