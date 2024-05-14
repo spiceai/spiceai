@@ -61,7 +61,13 @@ impl FTPObjectStore {
                 store: "FTP",
                 source: e.into(),
             })?;
-        let _ = client.login(&self.user, &self.password).await;
+        client
+            .login(&self.user, &self.password)
+            .await
+            .map_err(|e| object_store::Error::Generic {
+                store: "FTP",
+                source: e.into(),
+            })?;
 
         Ok(client)
     }
