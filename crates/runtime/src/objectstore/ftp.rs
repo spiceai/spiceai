@@ -39,7 +39,7 @@ pub struct FTPObjectStore {
 
 impl std::fmt::Display for FTPObjectStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "FTS")
+        write!(f, "FTP")
     }
 }
 
@@ -54,18 +54,21 @@ impl FTPObjectStore {
         }
     }
 
-    async fn get_async_client(&self) -> AsyncFtpStream {
+    async fn get_async_client(&self) -> object_store::Result<AsyncFtpStream> {
         let mut client = AsyncFtpStream::connect(format!("{}:{}", self.host, self.port))
             .await
-            .unwrap();
+            .map_err(|e| object_store::Error::Generic {
+                store: "FTP",
+                source: e.into(),
+            })?;
         let _ = client.login(&self.user, &self.password).await;
 
-        client
+        Ok(client)
     }
 
     fn walk_path(&self, location: Option<Path>) -> BoxStream<'_, object_store::Result<ObjectMeta>> {
         let stream = stream! {
-            let mut client = self.get_async_client().await;
+            let mut client = self.get_async_client().await?;
             let path = location.map(|v| v.to_string());
             let mut queue = vec![path];
             while let Some(path) = queue.pop() {
@@ -74,13 +77,17 @@ impl FTPObjectStore {
                     .map_err(|e| object_store::Error::NotFound { path: path.unwrap_or("/".to_string()), source: e.into() })?;
                 for item in list {
                     let children = client.nlst(Some(&item)).await.unwrap_or(vec![]);
-                    if children.len() > 0 && children[0] != item {
+                    if !children.is_empty() && children[0] != item {
                         queue.push(Some(item));
                     } else {
                         let meta = ObjectMeta {
                             location: Path::from(item.clone()),
-                            size: client.size(&item).await.map_err(|e| object_store::Error::NotFound { path: item.clone(), source: e.into() })?,
-                            last_modified: client.mdtm(&item).await.map_err(|e| object_store::Error::NotFound { path: item.clone(), source: e.into() })?.and_utc(),
+                            size: client.size(&item).await.map_err(|e| {
+                                object_store::Error::NotFound { path: item.clone(), source: e.into() }
+                            })?,
+                            last_modified: client.mdtm(&item).await.map_err(|e| {
+                                object_store::Error::NotFound { path: item.clone(), source: e.into() }
+                            })?.and_utc(),
                             e_tag: None,
                             version: None,
                         };
@@ -104,17 +111,21 @@ fn pipe_stream(
         let mut total = 0;
         let mut buf = vec![0; 4096];
 
-        client.resume_transfer(start).await.unwrap();
+        client.resume_transfer(start).await.map_err(|e| {
+            object_store::Error::Generic { store: "FTP", source: e.into() }
+        })?;
         let mut stream = client
             .retr_as_stream(location.clone())
             .await
-            .unwrap();
+            .map_err(|e| object_store::Error::Generic { store: "FTP", source: e.into() })?;
         loop {
             if total > read_size {
                 break;
             }
-            let mut n = stream.read(&mut buf).await.map_err(|_| object_store::Error::NotImplemented
-                {})?;
+            let mut n = stream.read(&mut buf).await.map_err(|e| {
+                object_store::Error::Generic { store: "FTP", source: e.into() }
+            })?;
+
             total += n;
             if n == 0 {
                 break;
@@ -150,7 +161,7 @@ impl ObjectStore for FTPObjectStore {
         location: &Path,
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
-        let mut client = self.get_async_client().await;
+        let mut client = self.get_async_client().await?;
 
         let location_string = location.to_string();
         let object_meta = ObjectMeta {
@@ -207,7 +218,7 @@ impl ObjectStore for FTPObjectStore {
     }
 
     fn list(&self, location: Option<&Path>) -> BoxStream<'_, object_store::Result<ObjectMeta>> {
-        self.walk_path(location.map(std::borrow::ToOwned::to_owned))
+        self.walk_path(location.map(ToOwned::to_owned))
     }
 
     fn list_with_offset(

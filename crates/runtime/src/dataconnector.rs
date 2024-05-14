@@ -373,7 +373,7 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
         let url = self
             .get_object_store_url(dataset)
             .context(InvalidConfigurationSnafu {
-                dataconnector: format!("{}", self),
+                dataconnector: format!("{__self}"),
                 message: "Unable to parse URL",
             })?;
 
@@ -381,14 +381,14 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
             ListingTableUrl::parse(url)
                 .boxed()
                 .context(InvalidConfigurationSnafu {
-                    dataconnector: format!("{}", self),
+                    dataconnector: format!("{__self}"),
                     message: "Unable to parse URL",
                 })?;
 
         let (file_format, extension) =
             self.get_file_format_and_extension()
                 .context(InvalidConfigurationSnafu {
-                    dataconnector: format!("{}", self),
+                    dataconnector: format!("{__self}"),
                     message: "Unable to resolve file_format and file_extension",
                 })?;
         let options = ListingOptions::new(file_format).with_file_extension(&extension);
@@ -398,7 +398,7 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
             .await
             .boxed()
             .context(InvalidConfigurationSnafu {
-                dataconnector: format!("{}", self),
+                dataconnector: format!("{__self}"),
                 message: "Unable to infer files schema",
             })?;
 
@@ -409,7 +409,7 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
         let table = ListingTable::try_new(config)
             .boxed()
             .context(InvalidConfigurationSnafu {
-                dataconnector: format!("{}", self),
+                dataconnector: format!("{__self}"),
                 message: "Unable to list files in data provider",
             })?;
 

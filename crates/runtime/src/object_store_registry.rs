@@ -61,17 +61,24 @@ impl SpiceObjectStoreRegistry {
                             .into_owned()
                             .collect();
 
-                    // TODO: properly handle missing params
-                    let port = params.get("port").unwrap();
-                    let user = params.get("user").unwrap();
-                    let password = params.get("password").unwrap();
+                    let port = params
+                        .get("port")
+                        .map_or("21".to_string(), ToOwned::to_owned);
+                    let user = params.get("user").map(ToOwned::to_owned).ok_or_else(|| {
+                        DataFusionError::Execution("No user provided for FTP".to_string())
+                    })?;
+                    let password =
+                        params
+                            .get("password")
+                            .map(ToOwned::to_owned)
+                            .ok_or_else(|| {
+                                DataFusionError::Execution(
+                                    "No password provided for FTP".to_string(),
+                                )
+                            })?;
 
-                    let ftp_object_store = FTPObjectStore::new(
-                        user.clone(),
-                        password.clone(),
-                        host.to_string(),
-                        port.clone(),
-                    );
+                    let ftp_object_store =
+                        FTPObjectStore::new(user, password, host.to_string(), port);
                     return Ok(Arc::new(ftp_object_store) as Arc<dyn ObjectStore>);
                 }
             }
