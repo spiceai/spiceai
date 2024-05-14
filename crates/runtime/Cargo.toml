@@ -87,7 +87,7 @@ suppaftp = { workspace = true, optional = true }
 datafusion-federation = { workspace = true, optional = true }
 fundu = { workspace = true }
 metrics-exporter-prometheus = "0.13.0"
-prometheus-parse = { version = "0.2.5", optional = true }
+prometheus-parse = "0.2.5"
 
 [features]
 default = ["keyring-secret-store", "aws-secrets-manager"]
@@ -139,4 +139,3 @@ ftp = ["dep:suppaftp"]
 snowflake = ["dep:snowflake-api", "db_connection_pool/snowflake", "data_components/snowflake"]
 models = ["model_components/full"]
 federation-experimental = ["dep:datafusion-federation"]
-spice-metrics = ["dep:prometheus-parse"]

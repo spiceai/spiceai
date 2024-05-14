@@ -21,7 +21,6 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::{collections::HashMap, sync::Arc};
 
-#[cfg(feature = "spice-metrics")]
 use ::datafusion::error::DataFusionError;
 use ::datafusion::sql::parser::{self, DFParser};
 use ::datafusion::sql::sqlparser::ast::{SetExpr, TableFactor};
@@ -30,7 +29,6 @@ use ::datafusion::sql::sqlparser::{self, ast};
 use accelerated_table::AcceleratedTable;
 use app::App;
 use config::Config;
-#[cfg(feature = "spice-metrics")]
 use metrics::SetRecorderError;
 use model_components::{model::Model, modelsource::source as model_source};
 pub use notify::Error as NotifyError;
@@ -44,7 +42,6 @@ use tokio::sync::oneshot::error::RecvError;
 use tokio::time::sleep;
 use tokio::{signal, sync::RwLock};
 
-#[cfg(feature = "spice-metrics")]
 use crate::spice_metrics_recorder::SpiceMetricsRecorder;
 use crate::{dataconnector::DataConnector, datafusion::DataFusion};
 mod accelerated_table;
@@ -61,7 +58,6 @@ pub mod object_store_registry;
 pub mod objectstore;
 mod opentelemetry;
 pub mod podswatcher;
-#[cfg(feature = "spice-metrics")]
 mod spice_metrics_recorder;
 pub mod status;
 pub mod timing;
@@ -155,17 +151,14 @@ pub enum Error {
     #[snafu(display("Unable to receive accelerated table status: {source}"))]
     UnableToReceiveAcceleratedTableStatus { source: RecvError },
 
-    #[cfg(feature = "spice-metrics")]
     #[snafu(display("Unable to install metrics recorder: {source}"))]
     UnableToInstallMetricsServer {
         source: SetRecorderError<SpiceMetricsRecorder>,
     },
 
-    #[cfg(feature = "spice-metrics")]
     #[snafu(display("Unable to create metrics table: {source}"))]
     UnableToCreateMetricsTable { source: DataFusionError },
 
-    #[cfg(feature = "spice-metrics")]
     #[snafu(display("Unable to register metrics table: {source}"))]
     UnableToRegisterMetricsTable { source: datafusion::Error },
 }
@@ -685,7 +678,6 @@ impl Runtime {
         self.load_model(m).await;
     }
 
-    #[cfg(feature = "spice-metrics")]
     pub async fn start_metrics(&mut self, metrics_socket: SocketAddr) -> Result<()> {
         let recorder = SpiceMetricsRecorder::new(metrics_socket);
 
@@ -703,7 +695,6 @@ impl Runtime {
     }
 
     pub async fn start_servers(&mut self, with_metrics: Option<SocketAddr>) -> Result<()> {
-        #[cfg(feature = "spice-metrics")]
         if let Some(metrics_socket) = with_metrics {
             self.start_metrics(metrics_socket).await?;
         }
