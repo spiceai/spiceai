@@ -82,7 +82,9 @@ impl FTPObjectStore {
                     .await
                     .map_err(|e| object_store::Error::NotFound { path: path.unwrap_or("/".to_string()), source: e.into() })?;
                 for item in list {
-                    let children = client.nlst(Some(&item)).await.unwrap_or(vec![]);
+                    let children = client.nlst(Some(&item)).await.map_err(|e| {
+                        object_store::Error::NotFound { path: item.clone(), source: e.into() }
+                    })?;
                     if children.is_empty() {
                         continue;
                     }
