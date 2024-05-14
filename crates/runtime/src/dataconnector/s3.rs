@@ -95,6 +95,9 @@ impl ListingTableConnector for S3 {
                 fragment_builder.append_pair("secret", secret);
             };
         }
+        if let Some(timeout) = self.params.get("timeout") {
+            fragment_builder.append_pair("timeout", timeout);
+        }
         fragments.push(fragment_builder.finish());
 
         let mut s3_url =

@@ -62,6 +62,7 @@ clickhouse-rs = { git = "https://github.com/spiceai/clickhouse-rs.git", branch =
 ] }
 uuid = "1.6.1"
 pem = "3.0.4"
+fundu = "2.0.0"
 odbc-api = { version = "7.0.0" }
 arrow-odbc = { version = "9.0.0" }
 snowflake-api = { git = "https://github.com/spiceai/snowflake-rs.git", folder = "snowflake-api", rev = "5dab964abef23314e7a3f27ae89b83352e315206" }
