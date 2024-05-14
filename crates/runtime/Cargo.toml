@@ -86,6 +86,8 @@ snowflake-api = { workspace = true, optional = true }
 suppaftp = { workspace = true, optional = true }
 datafusion-federation = { workspace = true, optional = true }
 fundu = { workspace = true }
+metrics-exporter-prometheus = "0.13.0"
+prometheus-parse = "0.2.5"
 
 [features]
 default = ["keyring-secret-store", "aws-secrets-manager"]
