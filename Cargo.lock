@@ -2303,7 +2303,7 @@ dependencies = [
 [[package]]
 name = "datafusion-federation"
 version = "0.1.3"
-source = "git+https://github.com/phillipleblanc/datafusion-federation.git?branch=spiceai#5d9b98f08618930e06072002bd7bc4a1365d02ac"
+source = "git+https://github.com/phillipleblanc/datafusion-federation.git?rev=04f8c40277cb8e8b9efda243cbf2f9cd1664f34f#04f8c40277cb8e8b9efda243cbf2f9cd1664f34f"
 dependencies = [
  "async-trait",
  "datafusion",
