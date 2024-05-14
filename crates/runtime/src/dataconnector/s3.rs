@@ -14,20 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::object_store_registry::macros::impl_listing_data_connector;
+use super::{AnyErrorResult, DataConnector, DataConnectorFactory, ListingTableConnector};
 
-use super::{AnyErrorResult, DataConnector, DataConnectorFactory};
-
-use datafusion::datasource::file_format::file_compression_type::FileCompressionType;
-use datafusion::datasource::file_format::{csv::CsvFormat, parquet::ParquetFormat, FileFormat};
-
-use datafusion::error::DataFusionError;
 use secrets::Secret;
 use snafu::prelude::*;
 use spicepod::component::dataset::Dataset;
 use std::clone::Clone;
 use std::pin::Pin;
-use std::str::FromStr;
 use std::string::String;
 use std::sync::Arc;
 use std::{collections::HashMap, future::Future};
@@ -45,34 +38,6 @@ pub enum Error {
     UnableToParseURL {
         url: String,
         source: url::ParseError,
-    },
-
-    #[snafu(display("{source}"))]
-    UnableToBuildObjectStore {
-        source: object_store::Error,
-    },
-
-    #[snafu(display("The S3 URL is missing a forward slash: {url}"))]
-    MissingForwardSlash {
-        url: String,
-    },
-
-    ObjectStoreNotImplemented,
-
-    #[snafu(display("{source}"))]
-    UnableToBuildLogicalPlan {
-        source: DataFusionError,
-    },
-
-    #[snafu(display("Unsupported file format {format} in S3 Connector"))]
-    UnsupportedFileFormat {
-        format: String,
-    },
-
-    #[snafu(display("Unsupported compression type for CSV"))]
-    UnsupportedCompressionType {
-        source: DataFusionError,
-        compression_type: String,
     },
 }
 
@@ -96,7 +61,11 @@ impl DataConnectorFactory for S3 {
     }
 }
 
-impl S3 {
+impl ListingTableConnector for S3 {
+    fn get_params(&self) -> &HashMap<String, String> {
+        &self.params
+    }
+
     fn get_object_store_url(&self, dataset: &Dataset) -> AnyErrorResult<Url> {
         let mut fragments = vec![];
         let mut fragment_builder = form_urlencoded::Serializer::new(String::new());
@@ -133,44 +102,4 @@ impl S3 {
 
         Ok(s3_url)
     }
-
-    fn get_file_format_and_extension(&self) -> AnyErrorResult<(Arc<dyn FileFormat>, String)> {
-        let params = &self.params;
-        let extension = params.get("file_extension").cloned();
-
-        match params.get("file_format").map(String::as_str) {
-            Some("csv") => Ok((
-                get_csv_format(params)?,
-                extension.unwrap_or(".csv".to_string()),
-            )),
-            None | Some("parquet") => Ok((
-                Arc::new(ParquetFormat::default()),
-                extension.unwrap_or(".parquet".to_string()),
-            )),
-            Some(format) => Err(Error::UnsupportedFileFormat {
-                format: format.to_string(),
-            }
-            .into()),
-        }
-    }
 }
-
-fn get_csv_format(params: &HashMap<String, String>) -> AnyErrorResult<Arc<CsvFormat>> {
-    let compression_type = params.get("compression_type").map_or("", |f| f);
-    let has_header = params.get("has_header").map_or(true, |f| f == "true");
-    let delimiter = params
-        .get("delimiter")
-        .map_or(b',', |f| *f.as_bytes().first().unwrap_or(&b','));
-
-    Ok(Arc::new(
-        CsvFormat::default()
-            .with_has_header(has_header)
-            .with_file_compression_type(
-                FileCompressionType::from_str(compression_type)
-                    .context(UnsupportedCompressionTypeSnafu { compression_type })?,
-            )
-            .with_delimiter(delimiter),
-    ))
-}
-
-impl_listing_data_connector!(S3);

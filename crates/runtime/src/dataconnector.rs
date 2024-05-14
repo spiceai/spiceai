@@ -18,7 +18,16 @@ use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::common::OwnedTableReference;
 use datafusion::dataframe::DataFrame;
+use datafusion::datasource::file_format::csv::CsvFormat;
+use datafusion::datasource::file_format::file_compression_type::FileCompressionType;
+use datafusion::datasource::file_format::parquet::ParquetFormat;
+use datafusion::datasource::file_format::FileFormat;
+use datafusion::datasource::listing::{
+    ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
+};
 use datafusion::datasource::{DefaultTableSource, TableProvider};
+use datafusion::error::DataFusionError;
+use datafusion::execution::config::SessionConfig;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::{Expr, LogicalPlanBuilder};
 use lazy_static::lazy_static;
@@ -27,11 +36,15 @@ use spicepod::component::dataset::Dataset;
 use std::any::Any;
 use std::collections::HashMap;
 use std::pin::Pin;
+use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use url::Url;
 
 use secrets::Secret;
 use std::future::Future;
+
+use crate::object_store_registry::default_runtime_env;
 
 #[cfg(feature = "clickhouse")]
 pub mod clickhouse;
@@ -137,6 +150,15 @@ pub enum DataConnectorError {
         dataconnector: String,
         dataset_name: String,
         table_name: String,
+    },
+
+    #[snafu(display("Unsupported file format: {format}"))]
+    UnsupportedFileFormat { format: String },
+
+    #[snafu(display("Unsupported compression type for CSV"))]
+    UnsupportedCompressionType {
+        source: DataFusionError,
+        compression_type: String,
     },
 }
 
@@ -281,4 +303,113 @@ pub async fn get_data(
     let batches = df.collect().await.context(UnableToScanTableProviderSnafu)?;
 
     Ok((table_provider.schema(), batches))
+}
+
+pub trait ListingTableConnector: DataConnector {
+    fn get_object_store_url(&self, dataset: &Dataset) -> AnyErrorResult<Url>;
+
+    fn get_params(&self) -> &HashMap<String, String>;
+
+    fn get_file_format_and_extension(&self) -> AnyErrorResult<(Arc<dyn FileFormat>, String)> {
+        let params = self.get_params();
+        let extension = params.get("file_extension").cloned();
+
+        match params.get("file_format").map(String::as_str) {
+            Some("csv") => Ok((
+                self.get_csv_format(params)?,
+                extension.unwrap_or(".csv".to_string()),
+            )),
+            None | Some("parquet") => Ok((
+                Arc::new(ParquetFormat::default()),
+                extension.unwrap_or(".parquet".to_string()),
+            )),
+            Some(format) => Err(DataConnectorError::UnsupportedFileFormat {
+                format: format.to_string(),
+            }
+            .into()),
+        }
+    }
+
+    fn get_csv_format(&self, params: &HashMap<String, String>) -> AnyErrorResult<Arc<CsvFormat>> {
+        let compression_type = params.get("compression_type").map_or("", |f| f);
+        let has_header = params.get("has_header").map_or(true, |f| f == "true");
+        let delimiter = params
+            .get("delimiter")
+            .map_or(b',', |f| *f.as_bytes().first().unwrap_or(&b','));
+
+        Ok(Arc::new(
+            CsvFormat::default()
+                .with_has_header(has_header)
+                .with_file_compression_type(
+                    FileCompressionType::from_str(compression_type)
+                        .context(UnsupportedCompressionTypeSnafu { compression_type })?,
+                )
+                .with_delimiter(delimiter),
+        ))
+    }
+}
+
+#[async_trait]
+impl<T: ListingTableConnector + 'static> DataConnector for T {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    async fn read_provider(
+        &self,
+        dataset: &Dataset,
+    ) -> DataConnectorResult<Arc<dyn TableProvider>> {
+        let ctx = SessionContext::new_with_config_rt(
+            SessionConfig::new().set_bool(
+                "datafusion.execution.listing_table_ignore_subdirectory",
+                false,
+            ),
+            default_runtime_env(),
+        );
+
+        let url = self
+            .get_object_store_url(dataset)
+            .context(InvalidConfigurationSnafu {
+                dataconnector: stringify!($connector),
+                message: "Unable to parse URL",
+            })?;
+
+        let table_path =
+            ListingTableUrl::parse(url)
+                .boxed()
+                .context(InvalidConfigurationSnafu {
+                    dataconnector: stringify!($connector).to_string(),
+                    message: "Unable to parse URL",
+                })?;
+
+        let (file_format, extension) =
+            self.get_file_format_and_extension()
+                .context(InvalidConfigurationSnafu {
+                    dataconnector: stringify!($connector).to_string(),
+                    message: "Unable to resolve file_format and file_extension",
+                })?;
+        let options = ListingOptions::new(file_format).with_file_extension(&extension);
+
+        let resolved_schema = options
+            .infer_schema(&ctx.state(), &table_path)
+            .await
+            .boxed()
+            .context(InvalidConfigurationSnafu {
+                dataconnector: stringify!($connector).to_string(),
+                message: "Unable to infer files schema",
+            })?;
+
+        let config = ListingTableConfig::new(table_path)
+            .with_listing_options(options)
+            .with_schema(resolved_schema);
+
+        let table = ListingTable::try_new(config)
+            .boxed()
+            .context(InvalidConfigurationSnafu {
+                dataconnector: stringify!($connector).to_string(),
+                message: "Unable to list files in data provider",
+            })?;
+
+        Ok(Arc::new(table))
+    }
 }
