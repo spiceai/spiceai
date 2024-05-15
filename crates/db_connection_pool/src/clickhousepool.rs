@@ -49,6 +49,13 @@ pub enum Error {
         source: clickhouse_rs::errors::Error,
     },
 
+    #[snafu(display(
+        "Authentication failed. Ensure that the username and password are correctly configured."
+    ))]
+    InvalidUsernameOrPasswordError {
+        source: clickhouse_rs::errors::Error,
+    },
+
     #[snafu(display("Cannot connect to ClickHouse on {host}:{port}. Ensure that the host and port are correctly configured, and that the host is reachable."))]
     InvalidHostOrPortError {
         source: Box<dyn std::error::Error + Sync + Send>,
@@ -200,7 +207,30 @@ impl DbConnectionPool<ClientHandle, &'static (dyn Sync)> for ClickhouseConnectio
         &self,
     ) -> super::Result<Box<dyn DbConnection<ClientHandle, &'static (dyn Sync)>>> {
         let pool = Arc::clone(&self.pool);
-        let conn = pool.get_handle().await.context(ConnectionPoolRunSnafu)?;
+        let conn = match pool.get_handle().await {
+            Ok(conn) => Ok(conn),
+            Err(e) => match e {
+                clickhouse_rs::errors::Error::Driver(_)
+                | clickhouse_rs::errors::Error::Io(_)
+                | clickhouse_rs::errors::Error::Connection(_)
+                | clickhouse_rs::errors::Error::Other(_)
+                | clickhouse_rs::errors::Error::Url(_)
+                | clickhouse_rs::errors::Error::FromSql(_) => {
+                    Err(Error::ConnectionPoolRunError { source: e })
+                }
+                clickhouse_rs::errors::Error::Server(server_error) => {
+                    if server_error.code == 516 {
+                        Err(Error::InvalidUsernameOrPasswordError {
+                            source: server_error.into(),
+                        })
+                    } else {
+                        Err(Error::ConnectionPoolRunError {
+                            source: server_error.into(),
+                        })
+                    }
+                }
+            },
+        }?;
         Ok(Box::new(ClickhouseConnection::new(
             conn,
             Arc::clone(&self.pool),

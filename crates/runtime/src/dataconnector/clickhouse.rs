@@ -54,6 +54,12 @@ impl DataConnectorFactory for Clickhouse {
                 }
 
                 Err(e) => match e {
+                    clickhousepool::Error::InvalidUsernameOrPasswordError { .. } => Err(
+                        DataConnectorError::UnableToConnectInvalidUsernameOrPassword {
+                            dataconnector: "clickhouse".to_string(),
+                        }
+                        .into(),
+                    ),
                     clickhousepool::Error::InvalidHostOrPortError {
                         host,
                         port,
