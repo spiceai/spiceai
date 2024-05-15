@@ -154,6 +154,7 @@ impl TableProviderFactory for SqliteTableFactory {
         let dyn_pool: Arc<DynSqliteConnectionPool> = pool;
 
         let read_provider = Arc::new(SqlTable::new_with_schema(
+            "sqlite",
             &dyn_pool,
             Arc::clone(&schema),
             TableReference::bare(name.clone()),

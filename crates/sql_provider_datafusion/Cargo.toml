@@ -20,6 +20,8 @@ tokio.workspace = true
 tracing.workspace = true
 futures.workspace = true
 db_connection_pool = { path = "../db_connection_pool" }
+datafusion-federation = { workspace = true, optional = true }
+datafusion-federation-sql = { workspace = true, optional = true }
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
@@ -31,3 +33,4 @@ pgtemp = "0.3.0"
 postgres = ["db_connection_pool/postgres"]
 sqlite = ["db_connection_pool/sqlite"]
 mysql = ["db_connection_pool/mysql"]
+federation-experimental = ["datafusion-federation", "datafusion-federation-sql"]

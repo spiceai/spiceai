@@ -14,27 +14,19 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{AnyErrorResult, DataConnector, DataConnectorFactory, ListingTableConnector};
-
-use secrets::Secret;
+use secrets::{get_secret_or_param, AnyErrorResult, Secret};
 use snafu::prelude::*;
 use spicepod::component::dataset::Dataset;
 use std::any::Any;
-use std::clone::Clone;
 use std::pin::Pin;
-use std::string::String;
 use std::sync::Arc;
 use std::{collections::HashMap, future::Future};
 use url::{form_urlencoded, Url};
 
+use super::{DataConnector, DataConnectorFactory, ListingTableConnector};
+
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("No AWS access secret provided for credentials"))]
-    NoAccessSecret,
-
-    #[snafu(display("No AWS access key provided for credentials"))]
-    NoAccessKey,
-
     #[snafu(display("Unable to parse URL {url}: {source}"))]
     UnableToParseURL {
         url: String,
@@ -42,33 +34,33 @@ pub enum Error {
     },
 }
 
-pub struct S3 {
+pub struct FTP {
     secret: Option<Secret>,
     params: HashMap<String, String>,
 }
 
-impl DataConnectorFactory for S3 {
+impl std::fmt::Display for FTP {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "FTP")
+    }
+}
+
+impl DataConnectorFactory for FTP {
     fn create(
         secret: Option<Secret>,
         params: Arc<Option<HashMap<String, String>>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let s3 = Self {
+            let ftp = Self {
                 secret,
                 params: params.as_ref().clone().map_or_else(HashMap::new, |x| x),
             };
-            Ok(Arc::new(s3) as Arc<dyn DataConnector>)
+            Ok(Arc::new(ftp) as Arc<dyn DataConnector>)
         })
     }
 }
 
-impl std::fmt::Display for S3 {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "S3")
-    }
-}
-
-impl ListingTableConnector for S3 {
+impl ListingTableConnector for FTP {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -81,39 +73,28 @@ impl ListingTableConnector for S3 {
         let mut fragments = vec![];
         let mut fragment_builder = form_urlencoded::Serializer::new(String::new());
 
-        if let Some(region) = self.params.get("region") {
-            fragment_builder.append_pair("region", region);
+        if let Some(ftp_port) = self.params.get("ftp_port") {
+            fragment_builder.append_pair("port", ftp_port);
         }
-        if let Some(endpoint) = self.params.get("endpoint") {
-            fragment_builder.append_pair("endpoint", endpoint);
+        if let Some(ftp_user) = self.params.get("ftp_user") {
+            fragment_builder.append_pair("user", ftp_user);
         }
-        if let Some(secret) = &self.secret {
-            if let Some(key) = secret.get("key") {
-                fragment_builder.append_pair("key", key);
-            };
-            if let Some(secret) = secret.get("secret") {
-                fragment_builder.append_pair("secret", secret);
-            };
-        }
-        if let Some(timeout) = self.params.get("timeout") {
-            fragment_builder.append_pair("timeout", timeout);
+        if let Some(ftp_password) =
+            get_secret_or_param(Some(&self.params), &self.secret, "ftp_pass_key", "ftp_pass")
+        {
+            fragment_builder.append_pair("password", &ftp_password);
         }
         fragments.push(fragment_builder.finish());
 
-        let mut s3_url =
+        let mut ftp_url =
             Url::parse(&dataset.from).context(UnableToParseURLSnafu { url: &dataset.from })?;
 
-        // infer_schema has a bug using is_collection which is determined by if url contains suffix of /
-        // using a fragment with / suffix to trick df to think this is still a collection
-        // will need to raise an issue with DF to use url without query and fragment to decide if
-        // is_collection
-        // PR: https://github.com/apache/datafusion/pull/10419/files
         if dataset.from.ends_with('/') {
             fragments.push("dfiscollectionbugworkaround=hack/".into());
         }
 
-        s3_url.set_fragment(Some(&fragments.join("&")));
+        ftp_url.set_fragment(Some(&fragments.join("&")));
 
-        Ok(s3_url)
+        Ok(ftp_url)
     }
 }

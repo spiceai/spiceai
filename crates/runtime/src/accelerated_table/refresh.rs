@@ -361,7 +361,7 @@ impl Refresher {
         let refresh = self.refresh.read().await;
         let filter_converter = self.get_filter_converter(&refresh);
 
-        tracing::info!("[refresh] Loading data for dataset {dataset_name}");
+        tracing::info!("Loading data for dataset {dataset_name}");
         status::update_dataset(dataset_name.as_str(), status::ComponentStatus::Refreshing);
         let refresh = refresh.clone();
         let mut filters = vec![];
