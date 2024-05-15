@@ -29,8 +29,6 @@ mistralrs-core = {git = "https://github.com/Jeadie/mistral.rs", rev="f9b85c92767
 candle-core-rs = { package="candle-core", git = "https://github.com/EricLBuehler/candle.git", version = "0.5.0", optional=true}
 tokio = { workspace = true, optional=true }
 
-
-
 [features]
 default = ["candle", "mistralrs"]
 candle = ["dep:candle-core", "dep:candle-examples", "dep:candle-transformers", "dep:tokenizers"]
