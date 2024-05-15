@@ -29,7 +29,7 @@ pub enum LlmRuntime {
 pub enum Error {
     #[snafu(display("Failed to run the NSQL model"))]
     FailedToRunModel {
-        e: Box<dyn std::error::Error + Send + Sync>,
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     #[snafu(display("Local model, expected at {expected_path}, not found"))]
@@ -38,19 +38,19 @@ pub enum Error {
     #[snafu(display("Local tokenizer, expected at {expected_path}, not found"))]
     LocalTokenizerNotFound { expected_path: String },
 
-    #[snafu(display("Failed to load model from file {e}"))]
+    #[snafu(display("Failed to load model from file"))]
     FailedToLoadModel {
-        e: Box<dyn std::error::Error + Send + Sync>,
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     #[snafu(display("Failed to load model tokenizer"))]
     FailedToLoadTokenizer {
-        e: Box<dyn std::error::Error + Send + Sync>,
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     #[snafu(display("Failed to tokenize"))]
     FailedToTokenize {
-        e: Box<dyn std::error::Error + Send + Sync>,
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
 }
 
@@ -89,11 +89,8 @@ pub fn try_duckdb_from_spice_local(runtime: &LlmRuntime) -> Result<Box<dyn Nql>>
 
     match runtime {
         #[cfg(feature = "candle")]
-        LlmRuntime::Candle => candle::CandleLlama::try_new(
-            tokenizer.to_string_lossy().to_string(),
-            model_weights.to_string_lossy().to_string(),
-        )
-        .map(|x| Box::new(x) as Box<dyn Nql>),
+        LlmRuntime::Candle => candle::CandleLlama::try_new(&tokenizer, &model_weights)
+            .map(|x| Box::new(x) as Box<dyn Nql>),
         #[cfg(feature = "mistralrs")]
         LlmRuntime::Mistral => {
             let template_file = spice_dir.join("template.json");
@@ -102,15 +99,11 @@ pub fn try_duckdb_from_spice_local(runtime: &LlmRuntime) -> Result<Box<dyn Nql>>
                     expected_path: template_file.to_string_lossy().to_string(),
                 });
             }
-            mistral::MistralLlama::try_new(
-                tokenizer.to_string_lossy().to_string(),
-                model_weights.to_string_lossy().to_string(),
-                template_file.to_string_lossy().as_ref(),
-            )
-            .map(|x| Box::new(x) as Box<dyn Nql>)
+            mistral::MistralLlama::try_new(&tokenizer, &model_weights, &template_file)
+                .map(|x| Box::new(x) as Box<dyn Nql>)
         }
         _ => Err(Error::FailedToRunModel {
-            e: "No NQL model feature enabled".into(),
+            source: "No NQL model feature enabled".into(),
         }),
     }
 }

@@ -972,7 +972,7 @@ pub(crate) mod nsql {
     ) -> Response {
         let readable_df = df.read().await;
 
-        let tables = match readable_df.get_public_table_names().await {
+        let tables = match readable_df.get_public_table_names() {
             Ok(t) => t,
             Err(e) => {
                 tracing::trace!("Error getting tables: {e}");

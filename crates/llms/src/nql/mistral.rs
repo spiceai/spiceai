@@ -22,8 +22,9 @@ use mistralrs::{
     Response as MistralRsponse, SamplingParams, SchedulerMethod,
 };
 use mistralrs_core::{ModelPaths, SimpleModelPaths};
+use snafu::ResultExt;
 
-use std::{path::PathBuf, str::FromStr, sync::Arc};
+use std::{path::Path, sync::Arc};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 
 pub struct MistralLlama {
@@ -34,27 +35,16 @@ pub struct MistralLlama {
 
 impl MistralLlama {
     pub fn try_new(
-        tokenizer: String,
-        model_weights: String,
-        template_filename: &str,
+        tokenizer: &Path,
+        model_weights: &Path,
+        template_filename: &Path,
     ) -> Result<Self> {
         let paths: Box<dyn ModelPaths> = Box::new(SimpleModelPaths::new(
-            PathBuf::from_str(&tokenizer).map_err(|_| super::Error::LocalTokenizerNotFound {
-                expected_path: tokenizer.clone(),
-            })?,
-            PathBuf::from_str(&tokenizer).map_err(|_| super::Error::LocalTokenizerNotFound {
-                expected_path: tokenizer.clone(),
-            })?,
-            PathBuf::from_str(template_filename).map_err(|_| {
-                super::Error::LocalTokenizerNotFound {
-                    expected_path: tokenizer.clone(),
-                }
-            })?,
-            vec![PathBuf::from_str(&model_weights).map_err(|_| {
-                super::Error::LocalModelNotFound {
-                    expected_path: model_weights.clone(),
-                }
-            })?],
+            tokenizer.into(),
+            // Not needed for LLama2 / DuckDB NQL, but needed in `EricLBuehler/mistral.rs`.
+            tokenizer.into(),
+            template_filename.into(),
+            vec![model_weights.into()],
             None,
             None,
             None,
@@ -66,10 +56,10 @@ impl MistralLlama {
         let pipeline = GGUFLoaderBuilder::new(
             GGUFSpecificConfig::default(),
             None,
-            Some(tokenizer),
+            Some(tokenizer.to_string_lossy().to_string()),
             Some("motherduckdb/DuckDB-NSQL-7B-v0.1-GGUF".to_string()),
             "quantized_model_id".to_string(),
-            model_weights,
+            model_weights.to_string_lossy().to_string(),
         )
         .build()
         .load_model_from_path(
@@ -80,14 +70,14 @@ impl MistralLlama {
             DeviceMapMetadata::dummy(),
             None,
         )
-        .map_err(|e| NqlError::FailedToLoadModel { e: e.into() })?;
+        .map_err(|e| NqlError::FailedToLoadModel { source: e.into() })?;
 
         let (tx, rx) = channel(10_000);
         Ok(Self {
             pipeline: MistralRsBuilder::new(
                 pipeline,
                 SchedulerMethod::Fixed(5.try_into().map_err(|_| NqlError::FailedToLoadModel {
-                    e: "couldn't create schedule method".into(),
+                    source: "couldn't create schedule method".into(),
                 })?),
             )
             .build(),
@@ -123,20 +113,23 @@ impl Nql for MistralLlama {
             .get_sender()
             .send(r)
             .await
-            .map_err(|e| NqlError::FailedToRunModel { e: e.into() })?;
+            .boxed()
+            .context(super::FailedToRunModelSnafu)?;
 
         match self.rx.recv().await {
             Some(response) => match response {
                 MistralRsponse::CompletionDone(cr) => Ok(Some(cr.choices[0].text.clone())),
                 MistralRsponse::CompletionModelError(err_msg, _cr) => {
-                    Err(NqlError::FailedToRunModel { e: err_msg.into() })
+                    Err(NqlError::FailedToRunModel {
+                        source: err_msg.into(),
+                    })
                 }
                 _ => Err(NqlError::FailedToRunModel {
-                    e: "Unexpected error occurred".into(),
+                    source: "Unexpected error occurred".into(),
                 }),
             },
             None => Err(NqlError::FailedToRunModel {
-                e: "Mistral pipeline unexpectedly closed".into(),
+                source: "Mistral pipeline unexpectedly closed".into(),
             }),
         }
     }

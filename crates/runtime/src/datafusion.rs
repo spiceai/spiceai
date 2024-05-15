@@ -25,7 +25,6 @@ use crate::dataconnector::{DataConnector, DataConnectorError};
 use crate::dataupdate::{DataUpdate, DataUpdateExecutionPlan, UpdateType};
 use crate::get_dependent_table_names;
 use crate::object_store_registry::default_runtime_env;
-use arrow::array::StringArray;
 use arrow::datatypes::Schema;
 use arrow_tools::schema::verify_schema;
 use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider};
@@ -36,7 +35,6 @@ use datafusion::physical_plan::collect;
 use datafusion::sql::parser::DFParser;
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::{sqlparser, TableReference};
-use itertools::Itertools;
 use secrets::Secret;
 use snafu::prelude::*;
 use spicepod::component::dataset::{Dataset, Mode};
@@ -133,6 +131,12 @@ pub enum Error {
 
     #[snafu(display("Schema mismatch: {source}"))]
     SchemaMismatch { source: arrow_tools::schema::Error },
+
+    #[snafu(display("The catalog {catalog} is not registered."))]
+    CatalogMissing { catalog: String },
+
+    #[snafu(display("The schema {schema} is not registered."))]
+    SchemaMissing { schema: String },
 }
 
 pub enum Table {
@@ -586,32 +590,18 @@ impl DataFusion {
         Ok(())
     }
 
-    /// Returns all tables that are in the public schema.
-    #[allow(clippy::redundant_closure_for_method_calls)]
-    #[allow(clippy::flat_map_option)]
-    pub async fn get_public_table_names(&self) -> Result<Vec<String>> {
-        let rb = self
+    pub fn get_public_table_names(&self) -> Result<Vec<String>> {
+        Ok(self
             .ctx
-            .sql("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'")
-            .await
-            .context(UnableToGetTablesSnafu)?
-            .collect()
-            .await
-            .context(UnableToGetTablesSnafu)?;
-
-        Ok(rb
-            .iter()
-            .flat_map(|rb| {
-                rb.column(0)
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .map(|ar| {
-                        ar.iter()
-                            .filter_map(|x: Option<&str>| x.map(|x| x.to_string()))
-                    })
-            })
-            .flatten()
-            .collect_vec())
+            .catalog(SPICE_DEFAULT_CATALOG)
+            .context(CatalogMissingSnafu {
+                catalog: SPICE_DEFAULT_CATALOG.to_string(),
+            })?
+            .schema(SPICE_DEFAULT_SCHEMA)
+            .context(SchemaMissingSnafu {
+                schema: SPICE_DEFAULT_SCHEMA.to_string(),
+            })?
+            .table_names())
     }
 }
 

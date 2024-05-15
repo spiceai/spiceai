@@ -12,16 +12,18 @@ limitations under the License.
 */
 #![allow(clippy::needless_pass_by_value)]
 #![allow(clippy::module_name_repetitions)]
+use std::path::Path;
+
 use async_trait::async_trait;
 use candle_examples::token_output_stream::TokenOutputStream;
 use candle_transformers::{generation::LogitsProcessor, models::quantized_llama::ModelWeights};
 
+use snafu::ResultExt;
 use tokenizers::Tokenizer;
 
-use super::{Error as NqlError, Nql, Result};
+use super::{Error as NqlError, FailedToLoadModelSnafu, FailedToLoadTokenizerSnafu, Nql, Result};
 use candle_core::{quantized::gguf_file, Tensor};
 
-#[derive()]
 struct InferenceHyperparams {
     pub to_sample: usize,
     pub max_seq_len: usize,
@@ -58,24 +60,21 @@ pub struct CandleLlama {
 impl Nql for CandleLlama {
     async fn run(&mut self, prompt: String) -> Result<Option<String>> {
         // tknzr.clone() is bad
-        let stream = TokenOutputStream::new(self.tknzr.clone());
-        match Self::perform_inference(prompt, stream, &mut self.mdl.clone()) {
-            Ok(opt_output) => Ok(opt_output),
-            Err(e) => Err(NqlError::FailedToRunModel { e }),
-        }
+        Self::perform_inference(
+            prompt,
+            TokenOutputStream::new(self.tknzr.clone()),
+            &mut self.mdl.clone(),
+        )
+        .context(FailedToLoadModelSnafu)
     }
 }
 
 impl CandleLlama {
-    pub fn try_new(tokenizer: String, model_weights: String) -> Result<Self> {
-        let tknzr = {
-            Tokenizer::from_file(tokenizer).map_err(|e| NqlError::FailedToLoadTokenizer { e })?
-        };
-
-        // let content = fs::read_to_string(tokenizer).unwrap();
-        // let t = serde_json::from_str::<Tokenizer>(&content).unwrap();
-        let mdl = Self::load_gguf_model_weights(model_weights)?;
-        Ok(Self { tknzr, mdl })
+    pub fn try_new(tokenizer: &Path, model_weights: &Path) -> Result<Self> {
+        Ok(Self {
+            tknzr: Tokenizer::from_file(tokenizer).context(FailedToLoadTokenizerSnafu)?,
+            mdl: Self::load_gguf_model_weights(model_weights.to_string_lossy().to_string())?,
+        })
     }
 
     pub fn perform_inference(
@@ -124,7 +123,7 @@ impl CandleLlama {
             Some(token) => *token,
             None => {
                 return Err(NqlError::FailedToTokenize {
-                    e: "Failed to get eos_token".into(),
+                    source: "Failed to get eos_token".into(),
                 }
                 .into());
             }
@@ -148,9 +147,7 @@ impl CandleLlama {
             };
             next_token = logits_processor.sample(&logits)?;
             all_tokens.push(next_token);
-            if let Some(t) = tos.next_token(next_token)? {
-                print!("{t}");
-            }
+            tos.next_token(next_token)?;
             if next_token == eos_token {
                 break;
             };
@@ -164,11 +161,13 @@ impl CandleLlama {
                 expected_path: model_weights_path.clone(),
             }
         })?;
-        let model_content = gguf_file::Content::read(&mut file) //Content::read(&mut file, &candle_core::Device::Cpu)
-            .map_err(|e| e.with_path(model_weights_path))
-            .map_err(|e| NqlError::FailedToLoadModel { e: Box::new(e) })?;
+
+        let model_content = gguf_file::Content::read(&mut file)
+            .boxed()
+            .context(FailedToLoadModelSnafu)?;
 
         ModelWeights::from_gguf(model_content, &mut file, &candle_core::Device::Cpu)
-            .map_err(|e| NqlError::FailedToLoadModel { e: Box::new(e) })
+            .boxed()
+            .context(FailedToLoadModelSnafu)
     }
 }
