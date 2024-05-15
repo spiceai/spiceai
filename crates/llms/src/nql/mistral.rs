@@ -21,7 +21,7 @@ use mistralrs::{
     MistralRsBuilder, NormalRequest, Request as MistralRsquest, RequestMessage,
     Response as MistralRsponse, SamplingParams, SchedulerMethod,
 };
-use mistralrs_core::{ModelPaths, LocalModelPaths};
+use mistralrs_core::{LocalModelPaths, ModelPaths};
 use snafu::ResultExt;
 
 use std::{path::Path, sync::Arc};
