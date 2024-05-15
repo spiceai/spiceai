@@ -84,7 +84,7 @@ pub struct Args {
     /// Enable Spice Cloud connection.
     #[arg(
         long,
-        help_heading = "Enable metrics replication to Spice Cloud. Requires Spice Cloud API key stored in secrets."
+        help_heading = "Enable connection to Spice.ai Cloud. Requires the API key to be stored in secrets."
     )]
     pub spice_cloud_connect: bool,
 }

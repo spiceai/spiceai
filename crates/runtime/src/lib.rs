@@ -695,7 +695,7 @@ impl Runtime {
 
             recorder.start();
 
-            tracing::info!("Runtime metrics available at `spice.runtime.metrics`");
+            tracing::info!("Runtime metrics available in spice.runtime.metrics");
         }
     }
 
