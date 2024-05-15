@@ -25,6 +25,7 @@ use crate::dataconnector::{DataConnector, DataConnectorError};
 use crate::dataupdate::{DataUpdate, DataUpdateExecutionPlan, UpdateType};
 use crate::get_dependent_table_names;
 use crate::object_store_registry::default_runtime_env;
+use arrow::array::StringArray;
 use arrow::datatypes::Schema;
 use arrow_tools::schema::verify_schema;
 use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider};
@@ -34,8 +35,8 @@ use datafusion::execution::context::{SessionConfig, SessionContext, SessionState
 use datafusion::physical_plan::collect;
 use datafusion::sql::parser::DFParser;
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
-use itertools::Itertools;
 use datafusion::sql::{sqlparser, TableReference};
+use itertools::Itertools;
 use secrets::Secret;
 use snafu::prelude::*;
 use spicepod::component::dataset::{Dataset, Mode};
@@ -585,14 +586,23 @@ impl DataFusion {
         Ok(())
     }
 
+    /// Returns all tables that are in the public schema.
+    #[allow(clippy::redundant_closure_for_method_calls)]
+    #[allow(clippy::flat_map_option)]
     pub async fn get_public_table_names(&self) -> Result<Vec<String>> {
-        let rb = self.ctx.sql("select table_name from information_schema.tables where table_schema = 'public'").await.context(UnableToGetTablesSnafu)?.collect().await.context(UnableToGetTablesSnafu)?;
+        let rb = self.ctx.sql(
+            "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'"
+        ).await
+            .context(UnableToGetTablesSnafu)?
+            .collect().await
+            .context(UnableToGetTablesSnafu)?;
+
         Ok(rb.iter().flat_map(
-            |rb| rb.column_by_name("table_name").map(
-                |ar| ar.as_any().downcast_ref::<String>().unwrap_or(&"".to_string()).to_string()
+            |rb| rb.column(0).as_any().downcast_ref::<StringArray>()
+            .map(
+                |ar| ar.iter().filter_map(|x: Option<&str>| x.map(|x| x.to_string())
             )
-        ).filter(|s| !s.is_empty())
-        .collect_vec())
+        )).flatten().collect_vec())
     }
 }
 

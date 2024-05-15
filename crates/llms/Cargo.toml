@@ -24,14 +24,14 @@ candle-transformers = {version= "0.5.0", optional = true}
 tokenizers = {version= "0.19.1", optional = true}
 
 ## `mistralrs` feature packages
-mistralrs = {git = "https://github.com/EricLBuehler/mistral.rs", branch="master", optional=true}
-mistralrs-core = {git = "https://github.com/EricLBuehler/mistral.rs", branch="master", optional=true, package="mistralrs-core" }
+mistralrs = {git = "https://github.com/Jeadie/mistral.rs", rev="f9b85c92767e8c644ee921606ddb14433014077c", optional=true} # branch="master"
+mistralrs-core = {git = "https://github.com/Jeadie/mistral.rs", rev="f9b85c92767e8c644ee921606ddb14433014077c", optional=true, package="mistralrs-core" } # branch="master"
 candle-core-rs = { package="candle-core", git = "https://github.com/EricLBuehler/candle.git", version = "0.5.0", optional=true}
 tokio = { workspace = true, optional=true }
 
 
 
 [features]
-default = ["mistralrs"]
+default = ["candle", "mistralrs"]
 candle = ["dep:candle-core", "dep:candle-examples", "dep:candle-transformers", "dep:tokenizers"]
 mistralrs = ["dep:mistralrs", "dep:candle-core-rs", "dep:mistralrs-core", "dep:tokio"]

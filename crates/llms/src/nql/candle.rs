@@ -10,20 +10,16 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-
-use std::fs;
-
+#![allow(clippy::needless_pass_by_value)]
+#![allow(clippy::module_name_repetitions)]
 use async_trait::async_trait;
 use candle_examples::token_output_stream::TokenOutputStream;
-use candle_transformers::{
-    generation::LogitsProcessor,
-    models::quantized_llama::ModelWeights,
-};
+use candle_transformers::{generation::LogitsProcessor, models::quantized_llama::ModelWeights};
 
 use tokenizers::Tokenizer;
 
+use super::{Error as NqlError, Nql, Result};
 use candle_core::{quantized::gguf_file, Tensor};
-use super::{Nql, Result, Error as NqlError};
 
 #[derive()]
 struct InferenceHyperparams {
@@ -45,7 +41,7 @@ impl Default for InferenceHyperparams {
             repeat_last_n: 64,
             repeat_penalty: 1.1,
             device: candle_core::Device::Cpu,
-            seed: 299792458,
+            seed: 299_792_458,
             temperature: 0.8,
             split_prompt: true,
         }
@@ -55,7 +51,7 @@ impl Default for InferenceHyperparams {
 #[derive(Clone)]
 pub struct CandleLlama {
     tknzr: Tokenizer,
-    mdl: ModelWeights
+    mdl: ModelWeights,
 }
 
 #[async_trait]
@@ -71,10 +67,9 @@ impl Nql for CandleLlama {
 }
 
 impl CandleLlama {
-    pub fn try_new(tokenizer: String, model_weights: String) -> Result<Self>  {
+    pub fn try_new(tokenizer: String, model_weights: String) -> Result<Self> {
         let tknzr = {
-            Tokenizer::from_file(tokenizer)
-                .map_err(|e| NqlError::FailedToLoadTokenizer { e })?
+            Tokenizer::from_file(tokenizer).map_err(|e| NqlError::FailedToLoadTokenizer { e })?
         };
 
         // let content = fs::read_to_string(tokenizer).unwrap();
@@ -87,7 +82,7 @@ impl CandleLlama {
         prompt_str: String,
         mut tos: TokenOutputStream,
         model: &mut ModelWeights,
-    ) -> std::result::Result<Option<String>, Box<dyn std::error::Error>> {
+    ) -> std::result::Result<Option<String>, Box<dyn std::error::Error + Sync + Send>> {
         let hyper = InferenceHyperparams::default();
 
         let prompt_tokens = match tos.tokenizer().encode(prompt_str, true) {
@@ -99,22 +94,16 @@ impl CandleLlama {
                 } else {
                     token_ids
                 }
-            },
+            }
             Err(err) => {
                 return Err(err);
             }
         };
 
-
         let mut all_tokens = vec![];
         let mut logits_processor = LogitsProcessor::new(hyper.seed, Some(hyper.temperature), None);
 
-        let mut next_token = if !hyper.split_prompt {
-            let input = Tensor::new(prompt_tokens.as_slice(), &hyper.device)?.unsqueeze(0)?;
-            let logits = model.forward(&input, 0)?;
-            let logits = logits.squeeze(0)?;
-            logits_processor.sample(&logits)?
-        } else {
+        let mut next_token = if hyper.split_prompt {
             let mut next_token = 0;
             for (pos, token) in prompt_tokens.iter().enumerate() {
                 let input = Tensor::new(&[*token], &hyper.device)?.unsqueeze(0)?;
@@ -123,14 +112,21 @@ impl CandleLlama {
                 next_token = logits_processor.sample(&logits)?;
             }
             next_token
+        } else {
+            let input = Tensor::new(prompt_tokens.as_slice(), &hyper.device)?.unsqueeze(0)?;
+            let logits = model.forward(&input, 0)?;
+            let logits = logits.squeeze(0)?;
+            logits_processor.sample(&logits)?
         };
         all_tokens.push(next_token);
-
 
         let eos_token = match tos.tokenizer().get_vocab(true).get("</s>") {
             Some(token) => *token,
             None => {
-                return Err(NqlError::FailedToTokenize { e: "Failed to get eos_token".into() }.into());
+                return Err(NqlError::FailedToTokenize {
+                    e: "Failed to get eos_token".into(),
+                }
+                .into());
             }
         };
 
@@ -139,7 +135,7 @@ impl CandleLlama {
             let logits = {
                 let logits = model.forward(&input, prompt_tokens.len() + index)?;
                 let logits = logits.squeeze(0)?;
-                if hyper.repeat_penalty == 1. {
+                if hyper.repeat_penalty == 0.0 {
                     logits
                 } else {
                     let start_at = all_tokens.len().saturating_sub(hyper.repeat_last_n);
@@ -159,38 +155,20 @@ impl CandleLlama {
                 break;
             };
         }
-        tos.decode_rest().map_err(|e| e.into())
+        tos.decode_rest().map_err(std::convert::Into::into)
     }
 
     fn load_gguf_model_weights(model_weights_path: String) -> Result<ModelWeights> {
-        let mut file =
-            std::fs::File::open(model_weights_path.clone()).map_err(|_| NqlError::LocalModelNotFound {expected_path: model_weights_path.clone()})?;
+        let mut file = std::fs::File::open(model_weights_path.clone()).map_err(|_| {
+            NqlError::LocalModelNotFound {
+                expected_path: model_weights_path.clone(),
+            }
+        })?;
         let model_content = gguf_file::Content::read(&mut file) //Content::read(&mut file, &candle_core::Device::Cpu)
             .map_err(|e| e.with_path(model_weights_path))
             .map_err(|e| NqlError::FailedToLoadModel { e: Box::new(e) })?;
-    
-        Ok(
-            ModelWeights::from_gguf(model_content, &mut file, &candle_core::Device::Cpu)
-                .map_err(|e| NqlError::FailedToLoadModel { e: Box::new(e) })?,
-        )
-    }
-}
 
-mod test {
-    use std::fs;
-
-    use tokenizers::{Token, Tokenizer};
-
-    use crate::nql::Nql;
-
-    use super::CandleLlama;
-
-    #[test]
-    fn test_candle_llama_local() {
-        let content = fs::read_to_string("/Users/jeadie/.spice/llms/llama2.tokenizer.json").unwrap();
-        let t = serde_json::from_str::<Tokenizer>(&content).unwrap();
-
-        let prompt = "SELECT * FROM users WHERE id = 1;".to_string();
-        // let result = candle.run(prompt)
+        ModelWeights::from_gguf(model_content, &mut file, &candle_core::Device::Cpu)
+            .map_err(|e| NqlError::FailedToLoadModel { e: Box::new(e) })
     }
 }

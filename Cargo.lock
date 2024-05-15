@@ -2287,6 +2287,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ctrlc"
+version = "3.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "672465ae37dc1bc6380a6547a8883d5dd397b0f1faaad4f265726cc7042a5345"
+dependencies = [
+ "nix 0.28.0",
+ "windows-sys 0.52.0",
+]
+
+[[package]]
 name = "cursor-icon"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5151,19 +5161,20 @@ checksum = "c9be0862c1b3f26a88803c4a49de6889c10e608b3ee9344e6ef5b45fb37ad3d1"
 
 [[package]]
 name = "mistralrs"
-version = "0.1.5"
-source = "git+https://github.com/EricLBuehler/mistral.rs?branch=master#6b0dc84dd52c77296cc568fb6d2d217aed2b7014"
+version = "0.1.6"
+source = "git+https://github.com/Jeadie/mistral.rs?rev=f9b85c92767e8c644ee921606ddb14433014077c#f9b85c92767e8c644ee921606ddb14433014077c"
 dependencies = [
  "anyhow",
  "candle-core 0.5.0 (git+https://github.com/EricLBuehler/candle.git)",
  "mistralrs-core",
+ "serde_json",
  "tokio",
 ]
 
 [[package]]
 name = "mistralrs-core"
-version = "0.1.5"
-source = "git+https://github.com/EricLBuehler/mistral.rs?branch=master#6b0dc84dd52c77296cc568fb6d2d217aed2b7014"
+version = "0.1.6"
+source = "git+https://github.com/Jeadie/mistral.rs?rev=f9b85c92767e8c644ee921606ddb14433014077c#f9b85c92767e8c644ee921606ddb14433014077c"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5174,6 +5185,7 @@ dependencies = [
  "cfgrammar",
  "chrono",
  "clap",
+ "ctrlc",
  "dirs",
  "either",
  "futures",
@@ -5208,8 +5220,8 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-lora"
-version = "0.1.5"
-source = "git+https://github.com/EricLBuehler/mistral.rs?branch=master#6b0dc84dd52c77296cc568fb6d2d217aed2b7014"
+version = "0.1.6"
+source = "git+https://github.com/Jeadie/mistral.rs?rev=f9b85c92767e8c644ee921606ddb14433014077c#f9b85c92767e8c644ee921606ddb14433014077c"
 dependencies = [
  "candle-core 0.5.0 (git+https://github.com/EricLBuehler/candle.git)",
  "candle-nn 0.5.0 (git+https://github.com/EricLBuehler/candle.git)",
@@ -5447,6 +5459,18 @@ checksum = "2eb04e9c688eff1c89d72b407f168cf79bb9e867a9d3323ed6c01519eb9cc053"
 dependencies = [
  "bitflags 2.5.0",
  "cfg-if",
+ "libc",
+]
+
+[[package]]
+name = "nix"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab2156c4fce2f8df6c499cc1c763e4394b7482525bf2a9701c9d79d215f519e4"
+dependencies = [
+ "bitflags 2.5.0",
+ "cfg-if",
+ "cfg_aliases",
  "libc",
 ]
 
