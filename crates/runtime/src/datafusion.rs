@@ -590,19 +590,28 @@ impl DataFusion {
     #[allow(clippy::redundant_closure_for_method_calls)]
     #[allow(clippy::flat_map_option)]
     pub async fn get_public_table_names(&self) -> Result<Vec<String>> {
-        let rb = self.ctx.sql(
-            "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'"
-        ).await
+        let rb = self
+            .ctx
+            .sql("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'")
+            .await
             .context(UnableToGetTablesSnafu)?
-            .collect().await
+            .collect()
+            .await
             .context(UnableToGetTablesSnafu)?;
 
-        Ok(rb.iter().flat_map(
-            |rb| rb.column(0).as_any().downcast_ref::<StringArray>()
-            .map(
-                |ar| ar.iter().filter_map(|x: Option<&str>| x.map(|x| x.to_string())
-            )
-        )).flatten().collect_vec())
+        Ok(rb
+            .iter()
+            .flat_map(|rb| {
+                rb.column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .map(|ar| {
+                        ar.iter()
+                            .filter_map(|x: Option<&str>| x.map(|x| x.to_string()))
+                    })
+            })
+            .flatten()
+            .collect_vec())
     }
 }
 
