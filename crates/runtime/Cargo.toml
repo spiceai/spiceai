@@ -74,6 +74,9 @@ dashmap = "5.5.3"
 snowflake-api = { workspace = true, optional = true }
 datafusion-federation = { workspace = true, optional = true }
 
+[dev-dependencies]
+metrics-util = "0.16.3"
+
 [features]
 default = ["keyring-secret-store", "aws-secrets-manager"]
 dev = []
@@ -113,3 +116,4 @@ odbc = ["db_connection_pool/odbc", "data_components/odbc", "dep:odbc-api"]
 snowflake = ["dep:snowflake-api", "db_connection_pool/snowflake", "data_components/snowflake"]
 models = ["model_components/full"]
 federation-experimental = ["dep:datafusion-federation"]
+

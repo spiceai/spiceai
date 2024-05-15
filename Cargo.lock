@@ -4452,12 +4452,16 @@ version = "0.16.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8b07a5eb561b8cbc16be2d216faf7757f9baf3bfb94dbb0fae3df8387a5bb47f"
 dependencies = [
+ "aho-corasick",
  "crossbeam-epoch",
  "crossbeam-utils",
  "hashbrown 0.14.3",
+ "indexmap 2.2.6",
  "metrics",
  "num_cpus",
+ "ordered-float 4.2.0",
  "quanta",
+ "radix_trie",
  "sketches-ddsketch",
 ]
 
@@ -6223,6 +6227,7 @@ dependencies = [
  "itertools 0.12.1",
  "lazy_static",
  "metrics",
+ "metrics-util",
  "model_components",
  "mysql_async",
  "ndarray",
