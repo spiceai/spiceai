@@ -64,9 +64,7 @@ pub(crate) fn routes(
             .route("/v1/models/:name/predict", get(v1::inference::get))
             .route("/v1/predict", post(v1::inference::post))
             .layer(Extension(models));
-    }
 
-    if cfg!(feature = "nsql") {
         match llms::nql::try_duckdb_from_spice_local(&LlmRuntime::Mistral) {
             Ok(duck_nql) => {
                 router = router
