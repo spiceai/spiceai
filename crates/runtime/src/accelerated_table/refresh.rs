@@ -111,37 +111,25 @@ impl Refresher {
                     };
 
                     if data_update.data.is_empty() {
-                        if let Some(sender) = ready_sender.take() {
-                            sender.send(()).ok();
-                        };
-                        status::update_dataset(
-                            dataset_name.as_str(),
-                            status::ComponentStatus::Ready,
-                        );
+                        self.notify_refresh_done(&mut ready_sender, status::ComponentStatus::Ready);
                         continue;
                     };
 
                     if let Some(data) = data_update.data.first() {
                         if data.columns().is_empty() {
-                            if let Some(sender) = ready_sender.take() {
-                                sender.send(()).ok();
-                            };
-                            status::update_dataset(
-                                dataset_name.as_str(),
+                            self.notify_refresh_done(
+                                &mut ready_sender,
                                 status::ComponentStatus::Ready,
                             );
                             continue;
                         }
                     };
 
-                    let state = ctx.state();
-
                     let overwrite = data_update.update_type == UpdateType::Overwrite;
-
                     match self
                         .accelerator
                         .insert_into(
-                            &state,
+                            &ctx.state(),
                             Arc::new(DataUpdateExecutionPlan::new(data_update)),
                             overwrite,
                         )
@@ -150,19 +138,16 @@ impl Refresher {
                         Ok(plan) => {
                             if let Err(e) = collect(plan, ctx.task_ctx()).await {
                                 tracing::error!("Error adding data for {dataset_name}: {e}");
-                            } else if let Some(sender) = ready_sender.take() {
-                                sender.send(()).ok();
+                                self.mark_dataset_status(status::ComponentStatus::Error);
+                            } else {
+                                self.notify_refresh_done(
+                                    &mut ready_sender,
+                                    status::ComponentStatus::Ready,
+                                );
                             };
-                            status::update_dataset(
-                                dataset_name.as_str(),
-                                status::ComponentStatus::Ready,
-                            );
                         }
                         Err(e) => {
-                            status::update_dataset(
-                                dataset_name.as_str(),
-                                status::ComponentStatus::Error,
-                            );
+                            self.mark_dataset_status(status::ComponentStatus::Error);
                             tracing::error!("Error adding data for {dataset_name}: {e}");
                         }
                     }
@@ -448,6 +433,21 @@ impl Refresher {
             refresh.time_column.clone(),
             refresh.time_format.clone(),
         )
+    }
+
+    fn notify_refresh_done(
+        &self,
+        ready_sender: &mut Option<oneshot::Sender<()>>,
+        status: status::ComponentStatus,
+    ) {
+        if let Some(sender) = ready_sender.take() {
+            sender.send(()).ok();
+        };
+        self.mark_dataset_status(status);
+    }
+
+    fn mark_dataset_status(&self, status: status::ComponentStatus) {
+        status::update_dataset(self.dataset_name.as_str(), status);
     }
 }
 
