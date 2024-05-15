@@ -15,12 +15,10 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
-use clickhouse_rs::ClientHandle;
 use data_components::clickhouse::ClickhouseTableFactory;
 use data_components::Read;
 use datafusion::datasource::TableProvider;
-use db_connection_pool::clickhousepool::ClickhouseConnectionPool;
-use db_connection_pool::DbConnectionPool;
+use db_connection_pool::clickhousepool::{self, ClickhouseConnectionPool};
 use secrets::Secret;
 use snafu::prelude::*;
 use spicepod::component::dataset::Dataset;
@@ -29,7 +27,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::{collections::HashMap, future::Future};
 
-use super::{DataConnector, DataConnectorFactory};
+use super::{DataConnector, DataConnectorError, DataConnectorFactory};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -49,16 +47,30 @@ impl DataConnectorFactory for Clickhouse {
         params: Arc<Option<HashMap<String, String>>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let pool: Arc<dyn DbConnectionPool<ClientHandle, &'static (dyn Sync)> + Send + Sync> =
-                Arc::new(
-                    ClickhouseConnectionPool::new(params, secret)
-                        .await
-                        .context(UnableToCreateClickhouseConnectionPoolSnafu)?,
-                );
+            match ClickhouseConnectionPool::new(params, secret).await {
+                Ok(pool) => {
+                    let clickhouse_factory = ClickhouseTableFactory::new(Arc::new(pool));
+                    Ok(Arc::new(Self { clickhouse_factory }) as Arc<dyn DataConnector>)
+                }
 
-            let clickhouse_factory = ClickhouseTableFactory::new(pool);
-
-            Ok(Arc::new(Self { clickhouse_factory }) as Arc<dyn DataConnector>)
+                Err(e) => match e {
+                    clickhousepool::Error::InvalidHostOrPortError {
+                        host,
+                        port,
+                        source: _,
+                    } => Err(DataConnectorError::UnableToConnectInvalidHostOrPort {
+                        dataconnector: "clickhouse".to_string(),
+                        host,
+                        port,
+                    }
+                    .into()),
+                    _ => Err(DataConnectorError::UnableToConnectInternal {
+                        dataconnector: "clickhouse".to_string(),
+                        source: Box::new(e),
+                    }
+                    .into()),
+                },
+            }
         })
     }
 }
