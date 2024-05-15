@@ -17,14 +17,12 @@ limitations under the License.
 #![allow(clippy::missing_errors_doc)]
 
 use async_trait::async_trait;
-use datafusion::physical_expr::EquivalenceProperties;
-use datafusion::physical_plan::{ExecutionMode, Partitioning, PlanProperties};
-use datafusion::sql::TableReference;
 use db_connection_pool::dbconnection::{get_schema, query_arrow};
 use db_connection_pool::DbConnectionPool;
 use expr::Engine;
 use futures::TryStreamExt;
 use snafu::prelude::*;
+use std::fmt::Display;
 use std::{any::Any, fmt, sync::Arc};
 
 use datafusion::{
@@ -33,13 +31,18 @@ use datafusion::{
     error::{DataFusionError, Result as DataFusionResult},
     execution::{context::SessionState, TaskContext},
     logical_expr::{Expr, TableProviderFilterPushDown, TableType},
+    physical_expr::EquivalenceProperties,
     physical_plan::{
-        stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionPlan,
-        SendableRecordBatchStream,
+        stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionMode,
+        ExecutionPlan, Partitioning, PlanProperties, SendableRecordBatchStream,
     },
+    sql::TableReference,
 };
 
 pub mod expr;
+
+#[cfg(feature = "federation-experimental")]
+pub mod federation;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -58,6 +61,7 @@ pub enum Error {
 type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct SqlTable<T: 'static, P: 'static> {
+    name: &'static str,
     pool: Arc<dyn DbConnectionPool<T, P> + Send + Sync>,
     schema: SchemaRef,
     table_reference: TableReference,
@@ -66,6 +70,7 @@ pub struct SqlTable<T: 'static, P: 'static> {
 
 impl<T, P> SqlTable<T, P> {
     pub async fn new(
+        name: &'static str,
         pool: &Arc<dyn DbConnectionPool<T, P> + Send + Sync>,
         table_reference: impl Into<TableReference>,
         engine: Option<expr::Engine>,
@@ -81,6 +86,7 @@ impl<T, P> SqlTable<T, P> {
             .context(UnableToGetSchemaSnafu)?;
 
         Ok(Self {
+            name,
             pool: Arc::clone(pool),
             schema,
             table_reference,
@@ -89,11 +95,13 @@ impl<T, P> SqlTable<T, P> {
     }
 
     pub fn new_with_schema(
+        name: &'static str,
         pool: &Arc<dyn DbConnectionPool<T, P> + Send + Sync>,
         schema: impl Into<SchemaRef>,
         table_reference: impl Into<TableReference>,
     ) -> Self {
         Self {
+            name,
             pool: Arc::clone(pool),
             schema: schema.into(),
             table_reference: table_reference.into(),
@@ -157,6 +165,12 @@ impl<T, P> TableProvider for SqlTable<T, P> {
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         return self.create_physical_plan(projection, &self.schema(), filters, limit);
+    }
+}
+
+impl<T, P> Display for SqlTable<T, P> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "SqlTable {}", self.name)
     }
 }
 
@@ -371,7 +385,7 @@ mod tests {
         db_conn.conn.execute_batch(
             "CREATE TABLE test (a INTEGER, b VARCHAR); INSERT INTO test VALUES (3, 'bar');",
         )?;
-        let duckdb_table = SqlTable::new(&pool, "test", None).await?;
+        let duckdb_table = SqlTable::new("duckdb", &pool, "test", None).await?;
         ctx.register_table("test_datafusion", Arc::new(duckdb_table))?;
         let sql = "SELECT * FROM test_datafusion limit 1";
         let df = ctx.sql(sql).await?;
@@ -397,7 +411,7 @@ mod tests {
         db_conn.conn.execute_batch(
             "CREATE TABLE test (a INTEGER, b VARCHAR); INSERT INTO test VALUES (3, 'bar');",
         )?;
-        let duckdb_table = SqlTable::new(&pool, "test", None).await?;
+        let duckdb_table = SqlTable::new("duckdb", &pool, "test", None).await?;
         ctx.register_table("test_datafusion", Arc::new(duckdb_table))?;
         let sql = "SELECT * FROM test_datafusion where a > 1 and b = 'bar' limit 1";
         let df = ctx.sql(sql).await?;

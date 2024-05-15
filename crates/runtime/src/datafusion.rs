@@ -27,6 +27,7 @@ use crate::get_dependent_table_names;
 use crate::object_store_registry::default_runtime_env;
 use arrow::datatypes::Schema;
 use arrow_tools::schema::verify_schema;
+use datafusion::catalog::schema::SchemaProvider;
 use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider};
 use datafusion::datasource::ViewTable;
 use datafusion::error::DataFusionError;
@@ -94,8 +95,11 @@ pub enum Error {
     #[snafu(display("Unable to register table in DataFusion: {source}"))]
     UnableToRegisterTableToDataFusion { source: DataFusionError },
 
-    #[snafu(display("Unable to register system table in DataFusion: {source}"))]
-    UnableToRegisterSystemTableToDataFusion { source: DataFusionError },
+    #[snafu(display("Unable to register {schema} table in DataFusion: {source}"))]
+    UnableToRegisterTableToDataFusionSchema {
+        schema: String,
+        source: DataFusionError,
+    },
 
     #[snafu(display("Expected acceleration settings for {name}, found None"))]
     ExpectedAccelerationSettings { name: String },
@@ -209,6 +213,29 @@ impl DataFusion {
             ctx: Arc::new(ctx),
             data_writers: HashSet::new(),
         }
+    }
+
+    #[must_use]
+    fn runtime_schema(&self) -> Option<Arc<dyn SchemaProvider>> {
+        if let Some(catalog) = self.ctx.catalog(SPICE_DEFAULT_CATALOG) {
+            return catalog.schema(SPICE_RUNTIME_SCHEMA);
+        }
+
+        None
+    }
+
+    pub fn register_runtime_table(
+        &mut self,
+        name: String,
+        table: Arc<dyn datafusion::datasource::TableProvider>,
+    ) -> Result<()> {
+        if let Some(system_schema) = self.runtime_schema() {
+            system_schema
+                .register_table(name, table)
+                .context(UnableToRegisterTableToDataFusionSchemaSnafu { schema: "runtime" })?;
+        }
+
+        Ok(())
     }
 
     pub async fn register_table(

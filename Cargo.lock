@@ -543,6 +543,17 @@ dependencies = [
 
 [[package]]
 name = "async-channel"
+version = "1.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "81953c529336010edd6d8e358f886d9581267795c61b19475b71314bffa46d35"
+dependencies = [
+ "concurrent-queue",
+ "event-listener 2.5.3",
+ "futures-core",
+]
+
+[[package]]
+name = "async-channel"
 version = "2.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "136d4d23bcc79e27423727b36823d86233aad06dfea531837b038394d11e9928"
@@ -595,6 +606,21 @@ dependencies = [
  "autocfg",
  "blocking",
  "futures-lite 1.13.0",
+]
+
+[[package]]
+name = "async-global-executor"
+version = "2.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05b1b633a2115cd122d73b955eadd9916c18c8f510ec9cd1686404c60ad1c29c"
+dependencies = [
+ "async-channel 2.2.1",
+ "async-executor",
+ "async-io 2.3.2",
+ "async-lock 3.3.0",
+ "blocking",
+ "futures-lite 2.3.0",
+ "once_cell",
 ]
 
 [[package]]
@@ -700,6 +726,32 @@ dependencies = [
  "signal-hook-registry",
  "slab",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "async-std"
+version = "1.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "62565bb4402e926b29953c785397c6dc0391b7b446e45008b0049eb43cec6f5d"
+dependencies = [
+ "async-channel 1.9.0",
+ "async-global-executor",
+ "async-io 1.13.0",
+ "async-lock 2.8.0",
+ "crossbeam-utils",
+ "futures-channel",
+ "futures-core",
+ "futures-io",
+ "futures-lite 1.13.0",
+ "gloo-timers",
+ "kv-log-macro",
+ "log",
+ "memchr",
+ "once_cell",
+ "pin-project-lite",
+ "pin-utils",
+ "slab",
+ "wasm-bindgen-futures",
 ]
 
 [[package]]
@@ -1502,7 +1554,7 @@ version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6a37913e8dc4ddcc604f0c6d3bf2887c995153af3611de9e23c352b44c1b9118"
 dependencies = [
- "async-channel",
+ "async-channel 2.2.1",
  "async-lock 3.3.0",
  "async-task",
  "fastrand 2.0.2",
@@ -1976,7 +2028,7 @@ checksum = "98cc8fbded0c607b7ba9dd60cd98df59af97e84d24e49c8557331cfc26d301ce"
 [[package]]
 name = "clickhouse-rs"
 version = "1.1.0-alpha.1"
-source = "git+https://github.com/spiceai/clickhouse-rs.git?branch=async-await-plus-hello-unwrap#6c63dff9c77b528b5fc499efafb4d00ce61d2032"
+source = "git+https://github.com/spiceai/clickhouse-rs.git?tag=0.2.1#81a652c7c3dc4aff9097c30ece821393f089e3b5"
 dependencies = [
  "byteorder",
  "cfg-if",
@@ -2006,7 +2058,7 @@ dependencies = [
 [[package]]
 name = "clickhouse-rs-cityhash-sys"
 version = "0.1.2"
-source = "git+https://github.com/spiceai/clickhouse-rs.git?branch=async-await-plus-hello-unwrap#6c63dff9c77b528b5fc499efafb4d00ce61d2032"
+source = "git+https://github.com/spiceai/clickhouse-rs.git?tag=0.2.1#81a652c7c3dc4aff9097c30ece821393f089e3b5"
 dependencies = [
  "cc",
 ]
@@ -2554,10 +2606,22 @@ dependencies = [
 [[package]]
 name = "datafusion-federation"
 version = "0.1.3"
-source = "git+https://github.com/phillipleblanc/datafusion-federation.git?branch=spiceai#5d9b98f08618930e06072002bd7bc4a1365d02ac"
+source = "git+https://github.com/phillipleblanc/datafusion-federation.git?branch=spiceai#0fadae1037056bd37fdc90297fa6df2fdd8dbb94"
 dependencies = [
  "async-trait",
  "datafusion",
+]
+
+[[package]]
+name = "datafusion-federation-sql"
+version = "0.1.3"
+source = "git+https://github.com/phillipleblanc/datafusion-federation.git?branch=spiceai#0fadae1037056bd37fdc90297fa6df2fdd8dbb94"
+dependencies = [
+ "async-trait",
+ "datafusion",
+ "datafusion-federation",
+ "futures",
+ "tokio",
 ]
 
 [[package]]
@@ -3919,6 +3983,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2fabcfbdc87f4758337ca535fb41a6d701b65693ce38287d856d1674551ec9b"
 
 [[package]]
+name = "gloo-timers"
+version = "0.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b995a66bb87bebce9a0f4a95aed01daca4872c050bfcb21653361c03bc35e5c"
+dependencies = [
+ "futures-channel",
+ "futures-core",
+ "js-sys",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "h2"
 version = "0.3.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4617,6 +4693,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "kv-log-macro"
+version = "1.0.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0de8b303297635ad57c9f5059fd9cee7a47f8e8daa09df0fcd07dd39fb22977f"
+dependencies = [
+ "log",
+]
+
+[[package]]
+name = "lazy-regex"
+version = "3.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d12be4595afdf58bd19e4a9f4e24187da2a66700786ff660a418e9059937a4c"
+dependencies = [
+ "lazy-regex-proc_macros",
+ "once_cell",
+ "regex",
+]
+
+[[package]]
+name = "lazy-regex-proc_macros"
+version = "3.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "44bcd58e6c97a7fcbaffcdc95728b393b8d98933bfadad49ed4097845b57ef0b"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "regex",
+ "syn 2.0.60",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4896,6 +5004,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "90ed8c1e510134f979dbc4f070f87d4313098b704861a105fe34231c70a3901c"
 dependencies = [
  "serde",
+ "value-bag",
 ]
 
 [[package]]
@@ -6448,6 +6557,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "prometheus-parse"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "811031bea65e5a401fb2e1f37d802cca6601e204ac463809a3189352d13b78a5"
+dependencies = [
+ "chrono",
+ "itertools 0.12.1",
+ "once_cell",
+ "regex",
+]
+
+[[package]]
 name = "prost"
 version = "0.11.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6762,9 +6883,9 @@ dependencies = [
 
 [[package]]
 name = "raw-cpuid"
-version = "11.0.1"
+version = "11.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d86a7c4638d42c44551f4791a20e687dbb4c3de1f33c43dd71e355cd429def1"
+checksum = "e29830cbb1290e404f24c73af91c5d8d631ce7e128691e9477556b540cd01ecd"
 dependencies = [
  "bitflags 2.5.0",
 ]
@@ -7180,12 +7301,14 @@ dependencies = [
  "dirs",
  "duckdb",
  "flight_client",
+ "fundu",
  "futures",
  "indexmap 2.2.6",
  "itertools 0.12.1",
  "lazy_static",
  "llms",
  "metrics",
+ "metrics-exporter-prometheus",
  "model_components",
  "mysql_async",
  "ndarray",
@@ -7197,6 +7320,7 @@ dependencies = [
  "opentelemetry-proto",
  "pin-project",
  "postgres-native-tls",
+ "prometheus-parse",
  "prost 0.12.4",
  "r2d2",
  "regex",
@@ -7209,6 +7333,7 @@ dependencies = [
  "snowflake-api",
  "spicepod",
  "sql_provider_datafusion",
+ "suppaftp",
  "tokio",
  "tokio-rusqlite",
  "tokio-stream",
@@ -8110,6 +8235,8 @@ dependencies = [
  "arrow",
  "async-trait",
  "datafusion",
+ "datafusion-federation",
+ "datafusion-federation-sql",
  "db_connection_pool",
  "duckdb",
  "futures",
@@ -8262,6 +8389,21 @@ name = "subtle"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "81cdd64d312baedb58e21336b31bc043b77e01cc99033ce76ef539f78e965ebc"
+
+[[package]]
+name = "suppaftp"
+version = "5.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d9290ef2d57a47ebc32442cbc74ce039e5483e59b6e099a3361346d894b89196"
+dependencies = [
+ "async-std",
+ "async-trait",
+ "chrono",
+ "lazy-regex",
+ "log",
+ "pin-project",
+ "thiserror",
+]
 
 [[package]]
 name = "syn"
@@ -9321,6 +9463,12 @@ name = "valuable"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "830b7e5d4d90034032940e4ace0d9a9a057e7a45cd94e6c007832e39edb82f6d"
+
+[[package]]
+name = "value-bag"
+version = "1.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a84c137d37ab0142f0f2ddfe332651fdbf252e7b7dbb4e67b6c1f1b2e925101"
 
 [[package]]
 name = "vcpkg"

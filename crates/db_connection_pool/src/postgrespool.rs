@@ -25,15 +25,12 @@ use bb8_postgres::{
 use native_tls::{Certificate, TlsConnector};
 use ns_lookup::verify_ns_lookup_and_tcp_connect;
 use postgres_native_tls::MakeTlsConnector;
-use secrets::Secret;
+use secrets::{get_secret_or_param, Secret};
 use snafu::{prelude::*, ResultExt};
 use tokio_postgres;
 
 use super::DbConnectionPool;
-use crate::{
-    dbconnection::{postgresconn::PostgresConnection, AsyncDbConnection, DbConnection},
-    get_secret_or_param,
-};
+use crate::dbconnection::{postgresconn::PostgresConnection, AsyncDbConnection, DbConnection};
 
 #[derive(Debug, Snafu)]
 pub enum Error {

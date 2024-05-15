@@ -183,6 +183,7 @@ impl TableProviderFactory for DuckDBTableProviderFactory {
         let dyn_pool: Arc<DynDuckDbConnectionPool> = pool;
 
         let read_provider = Arc::new(SqlTable::new_with_schema(
+            "duckdb",
             &dyn_pool,
             Arc::clone(&schema),
             TableReference::bare(name.clone()),
@@ -351,11 +352,20 @@ impl Read for DuckDBTableFactory {
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         let pool = Arc::clone(&self.pool);
         let dyn_pool: Arc<DynDuckDbConnectionPool> = pool;
-        let table_provider = SqlTable::new(&dyn_pool, table_reference, None)
+        let table_provider = SqlTable::new("duckdb", &dyn_pool, table_reference, None)
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
-        Ok(Arc::new(table_provider))
+        let table_provider = Arc::new(table_provider);
+
+        #[cfg(feature = "federation-experimental")]
+        let table_provider = Arc::new(
+            table_provider
+                .create_federated_table_provider()
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?,
+        );
+
+        Ok(table_provider)
     }
 }
 
