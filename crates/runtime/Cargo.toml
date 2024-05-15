@@ -60,7 +60,7 @@ async-trait.workspace = true
 itertools = "0.12"
 object_store = { version = "0.9.1", features = ["aws"] }
 url = "2.5.0"
-arrow_sql_gen = { path = "../arrow_sql_gen", optional = true }
+arrow_sql_gen = { path = "../arrow_sql_gen" }
 arrow_tools = { path = "../arrow_tools" }
 bb8 = { workspace = true, optional = true }
 bb8-postgres = { workspace = true, optional = true }

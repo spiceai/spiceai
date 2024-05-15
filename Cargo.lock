@@ -6760,7 +6760,7 @@ dependencies = [
  "crossbeam-utils",
  "libc",
  "once_cell",
- "raw-cpuid 11.0.1",
+ "raw-cpuid 11.0.2",
  "wasi",
  "web-sys",
  "winapi",
