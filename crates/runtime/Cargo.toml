@@ -90,6 +90,9 @@ fundu = { workspace = true }
 metrics-exporter-prometheus = "0.13.0"
 prometheus-parse = "0.2.5"
 
+[dev-dependencies]
+metrics-util = "0.16.3"
+
 [features]
 default = ["keyring-secret-store", "aws-secrets-manager"]
 dev = []
