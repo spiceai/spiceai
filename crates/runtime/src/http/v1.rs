@@ -935,7 +935,6 @@ pub(crate) mod inference {
     }
 }
 
-#[cfg(feature = "models")]
 pub(crate) mod nsql {
     use arrow_sql_gen::statement::CreateTableBuilder;
     use axum::{
