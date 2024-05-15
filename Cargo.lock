@@ -2339,16 +2339,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ctrlc"
-version = "3.4.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "672465ae37dc1bc6380a6547a8883d5dd397b0f1faaad4f265726cc7042a5345"
-dependencies = [
- "nix 0.28.0",
- "windows-sys 0.52.0",
-]
-
-[[package]]
 name = "cursor-icon"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3359,16 +3349,6 @@ checksum = "332f51cb23d20b0de8458b86580878211da09bcd4503cb579c225b3d124cabb3"
 dependencies = [
  "event-listener 5.3.0",
  "pin-project-lite",
-]
-
-[[package]]
-name = "eyre"
-version = "0.6.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7cd915d99f24784cdc19fd37ef22b97e3ff0ae756c7e492e9fbfe897d61e2aec"
-dependencies = [
- "indenter",
- "once_cell",
 ]
 
 [[package]]
@@ -4418,12 +4398,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "indenter"
-version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce23b50ad8242c51a442f3ff322d56b02f08852c77e4c0b4d3fd684abc89c683"
-
-[[package]]
 name = "indexmap"
 version = "1.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4457,12 +4431,6 @@ dependencies = [
  "rayon",
  "unicode-width",
 ]
-
-[[package]]
-name = "indoc"
-version = "2.0.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b248f5224d1d606005e02c97f5aa4e88eeb230488bcc03bc9ca4d7991399f2b5"
 
 [[package]]
 name = "inherent"
@@ -5270,8 +5238,8 @@ checksum = "c9be0862c1b3f26a88803c4a49de6889c10e608b3ee9344e6ef5b45fb37ad3d1"
 
 [[package]]
 name = "mistralrs"
-version = "0.1.6"
-source = "git+https://github.com/Jeadie/mistral.rs?rev=f9b85c92767e8c644ee921606ddb14433014077c#f9b85c92767e8c644ee921606ddb14433014077c"
+version = "0.1.7"
+source = "git+https://github.com/Jeadie/mistral.rs#3a79bc82e0e7ba59f320908316d128e63b689179"
 dependencies = [
  "anyhow",
  "candle-core 0.5.0 (git+https://github.com/EricLBuehler/candle.git)",
@@ -5282,8 +5250,8 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-core"
-version = "0.1.6"
-source = "git+https://github.com/Jeadie/mistral.rs?rev=f9b85c92767e8c644ee921606ddb14433014077c#f9b85c92767e8c644ee921606ddb14433014077c"
+version = "0.1.7"
+source = "git+https://github.com/Jeadie/mistral.rs#3a79bc82e0e7ba59f320908316d128e63b689179"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5294,7 +5262,6 @@ dependencies = [
  "cfgrammar",
  "chrono",
  "clap",
- "ctrlc",
  "dirs",
  "either",
  "futures",
@@ -5307,7 +5274,6 @@ dependencies = [
  "minijinja",
  "mistralrs-lora",
  "once_cell",
- "pyo3",
  "radix_trie",
  "rand",
  "rand_isaac",
@@ -5329,8 +5295,8 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-lora"
-version = "0.1.6"
-source = "git+https://github.com/Jeadie/mistral.rs?rev=f9b85c92767e8c644ee921606ddb14433014077c#f9b85c92767e8c644ee921606ddb14433014077c"
+version = "0.1.7"
+source = "git+https://github.com/Jeadie/mistral.rs#3a79bc82e0e7ba59f320908316d128e63b689179"
 dependencies = [
  "candle-core 0.5.0 (git+https://github.com/EricLBuehler/candle.git)",
  "candle-nn 0.5.0 (git+https://github.com/EricLBuehler/candle.git)",
@@ -5568,18 +5534,6 @@ checksum = "2eb04e9c688eff1c89d72b407f168cf79bb9e867a9d3323ed6c01519eb9cc053"
 dependencies = [
  "bitflags 2.5.0",
  "cfg-if",
- "libc",
-]
-
-[[package]]
-name = "nix"
-version = "0.28.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab2156c4fce2f8df6c499cc1c763e4394b7482525bf2a9701c9d79d215f519e4"
-dependencies = [
- "bitflags 2.5.0",
- "cfg-if",
- "cfg_aliases",
  "libc",
 ]
 
@@ -6674,81 +6628,6 @@ dependencies = [
  "libm",
  "num-complex",
  "reborrow",
-]
-
-[[package]]
-name = "pyo3"
-version = "0.21.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a5e00b96a521718e08e03b1a622f01c8a8deb50719335de3f60b3b3950f069d8"
-dependencies = [
- "anyhow",
- "cfg-if",
- "chrono",
- "chrono-tz",
- "either",
- "eyre",
- "hashbrown 0.12.3",
- "indexmap 1.9.3",
- "indoc",
- "libc",
- "memoffset 0.9.1",
- "num-bigint",
- "num-complex",
- "parking_lot 0.11.2",
- "portable-atomic",
- "pyo3-build-config",
- "pyo3-ffi",
- "pyo3-macros",
- "rust_decimal",
- "serde",
- "smallvec",
- "unindent",
-]
-
-[[package]]
-name = "pyo3-build-config"
-version = "0.21.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7883df5835fafdad87c0d888b266c8ec0f4c9ca48a5bed6bbb592e8dedee1b50"
-dependencies = [
- "once_cell",
- "target-lexicon",
-]
-
-[[package]]
-name = "pyo3-ffi"
-version = "0.21.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "01be5843dc60b916ab4dad1dca6d20b9b4e6ddc8e15f50c47fe6d85f1fb97403"
-dependencies = [
- "libc",
- "pyo3-build-config",
-]
-
-[[package]]
-name = "pyo3-macros"
-version = "0.21.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77b34069fc0682e11b31dbd10321cbf94808394c56fd996796ce45217dfac53c"
-dependencies = [
- "proc-macro2",
- "pyo3-macros-backend",
- "quote",
- "syn 2.0.60",
-]
-
-[[package]]
-name = "pyo3-macros-backend"
-version = "0.21.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08260721f32db5e1a5beae69a55553f56b99bd0e1c3e6e0a5e8851a9d0f5a85c"
-dependencies = [
- "heck 0.4.1",
- "proc-macro2",
- "pyo3-build-config",
- "quote",
- "syn 2.0.60",
 ]
 
 [[package]]
@@ -8515,12 +8394,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "target-lexicon"
-version = "0.12.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e1fc403891a21bcfb7c37834ba66a547a8f402146eba7265b5a6d88059c9ff2f"
-
-[[package]]
 name = "tempfile"
 version = "3.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9380,12 +9253,6 @@ name = "unicode_categories"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39ec24b3121d976906ece63c9daad25b85969647682eee313cb5779fdd69e14e"
-
-[[package]]
-name = "unindent"
-version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c7de7d73e1754487cb58364ee906a499937a0dfabd86bcb980fa99ec8c8fa2ce"
 
 [[package]]
 name = "unsafe-libyaml"

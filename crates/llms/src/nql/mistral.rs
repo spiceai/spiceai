@@ -21,7 +21,7 @@ use mistralrs::{
     MistralRsBuilder, NormalRequest, Request as MistralRsquest, RequestMessage,
     Response as MistralRsponse, SamplingParams, SchedulerMethod,
 };
-use mistralrs_core::{ModelPaths, SimpleModelPaths};
+use mistralrs_core::{ModelPaths, LocalModelPaths};
 use snafu::ResultExt;
 
 use std::{path::Path, sync::Arc};
@@ -39,7 +39,7 @@ impl MistralLlama {
         model_weights: &Path,
         template_filename: &Path,
     ) -> Result<Self> {
-        let paths: Box<dyn ModelPaths> = Box::new(SimpleModelPaths::new(
+        let paths: Box<dyn ModelPaths> = Box::new(LocalModelPaths::new(
             tokenizer.into(),
             // Not needed for LLama2 / DuckDB NQL, but needed in `EricLBuehler/mistral.rs`.
             tokenizer.into(),
