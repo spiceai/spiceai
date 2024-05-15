@@ -65,7 +65,7 @@ impl DataConnectorFactory for Postgres {
                     } => Err(DataConnectorError::UnableToConnectInvalidHostOrPort {
                         dataconnector: "postgres".to_string(),
                         host,
-                        port,
+                        port: format!("{port}"),
                     }
                     .into()),
 
