@@ -577,7 +577,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_refresh_status_change_to_ready_when_there_are_data_updates() {
+    async fn test_refresh_status_change_to_ready() {
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
 
@@ -598,14 +598,6 @@ mod tests {
             value,
             &DebugValue::Gauge((status::ComponentStatus::Ready as i32).into())
         );
-    }
-
-    #[tokio::test]
-    async fn test_refresh_status_change_to_ready_when_there_are_no_updates() {
-        let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
-
-        metrics::set_global_recorder(recorder).expect("recorder is set globally");
 
         status::update_dataset("test", status::ComponentStatus::Refreshing);
 
