@@ -238,7 +238,7 @@ impl ObjectStore for SFTPObjectStore {
             }
         };
 
-        Box::pin(Box::pin(stream))
+        Box::pin(stream)
     }
 
     fn list_with_offset(
