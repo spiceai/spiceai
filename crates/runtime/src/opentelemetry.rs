@@ -30,6 +30,7 @@ use arrow::datatypes::DataType;
 use arrow::datatypes::Field;
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
+use datafusion::sql::TableReference;
 use indexmap::IndexMap;
 use opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_server::MetricsService;
 use opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_server::MetricsServiceServer;
@@ -136,7 +137,7 @@ impl MetricsService for Service {
                             Ok(record_batch) => {
                                 let df = self.data_fusion.read().await;
 
-                                if !df.is_writable(metric.name.as_str()) {
+                                if !df.is_writable(&TableReference::bare(metric.name.to_string())) {
                                     warn_once!(
                                         self.once_tracer,
                                         "No writable dataset defined for metric {}, skipping",
@@ -154,8 +155,12 @@ impl MetricsService for Service {
                                 };
 
                                 let mut write_failed = false;
-                                if let Err(e) =
-                                    df.write_data(metric.name.as_str(), data_update).await
+                                if let Err(e) = df
+                                    .write_data(
+                                        TableReference::bare(metric.name.as_str()),
+                                        data_update,
+                                    )
+                                    .await
                                 {
                                     write_failed = true;
                                     tracing::debug!("Failed to add OpenTelemetry data: {e}");

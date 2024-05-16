@@ -18,6 +18,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use arrow_flight::{flight_service_server::FlightService, FlightData, PutResult};
 use arrow_ipc::convert::try_schema_from_flatbuffer_bytes;
+use datafusion::sql::TableReference;
 use futures::stream;
 use tokio::sync::{broadcast::Sender, RwLock};
 use tonic::{Request, Response, Status, Streaming};
@@ -65,7 +66,7 @@ pub(crate) async fn handle(
 
     let df = flight_svc.datafusion.read().await;
 
-    if !df.is_writable(&path) {
+    if !df.is_writable(&TableReference::bare(path.to_string())) {
         return Err(Status::invalid_argument(format!(
             "Path doesn't exist or is not writable: {path}",
         )));
@@ -126,7 +127,10 @@ pub(crate) async fn handle(
                     };
 
                     let df_guard = df.read().await;
-                    if let Err(e) = df_guard.write_data(&path, data_update).await {
+                    if let Err(e) = df_guard
+                        .write_data(TableReference::bare(path), data_update)
+                        .await
+                    {
                         return Some((
                             Err(Status::internal(format!("Error writing data: {e}"))),
                             flight,
