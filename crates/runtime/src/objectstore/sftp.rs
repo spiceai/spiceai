@@ -220,8 +220,7 @@ impl ObjectStore for SFTPObjectStore {
     fn list(&self, location: Option<&Path>) -> BoxStream<'_, object_store::Result<ObjectMeta>> {
         let location = location
             .map(ToOwned::to_owned)
-            .map(|x| x.to_string())
-            .unwrap_or("/".to_string());
+            .map_or("/".to_string(), |x| x.to_string());
         let stream = stream! {
             let client = self.get_client()?;
 
@@ -243,10 +242,14 @@ impl ObjectStore for SFTPObjectStore {
                         store: "SFTP",
                         source: "Failed to convert path".into(),
                     })?),
-                    size: entry.1.size.ok_or_else(|| object_store::Error::Generic {
+                    size: usize::try_from(entry.1.size.ok_or_else(|| object_store::Error::Generic {
                         store: "SFTP",
                         source: "No size found for file".into(),
-                    })? as usize,
+                    })?).map_err(|e| object_store::Error::Generic {
+                        store: "SFTP",
+                        source: e.into(),
+                    })?,
+                    #[allow(clippy::cast_possible_wrap)]
                     last_modified: DateTime::from_timestamp(entry.1.mtime.ok_or_else(|| object_store::Error::Generic {
                             store: "SFTP",
                             source: "No modification time found for file".into(),
