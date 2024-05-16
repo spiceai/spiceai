@@ -323,7 +323,7 @@ impl DataFusion {
                     .context(UnableToGetTableSnafu)?
                     .ok_or_else(|| {
                         TableMissingSnafu {
-                            schema: "runtime".to_string(),
+                            schema: schema_name.to_string(),
                             table: table_name.to_string(),
                         }
                         .build()
