@@ -40,6 +40,8 @@ use std::{any::Any, fmt, sync::Arc};
 
 use self::write::FlightTableWriter;
 
+#[cfg(feature = "federation-experimental")]
+pub mod federation;
 pub mod stream;
 pub mod write;
 
@@ -62,13 +64,14 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Clone)]
 pub struct FlightFactory {
+    name: &'static str,
     client: FlightClient,
 }
 
 impl FlightFactory {
     #[must_use]
-    pub fn new(client: FlightClient) -> Self {
-        Self { client }
+    pub fn new(name: &'static str, client: FlightClient) -> Self {
+        Self { name, client }
     }
 }
 
@@ -78,10 +81,17 @@ impl Read for FlightFactory {
         &self,
         table_reference: TableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
-        FlightTable::create(self.client.clone(), table_reference)
-            .await
-            .map(|f| Arc::new(f) as Arc<dyn TableProvider + 'static>)
-            .boxed()
+        let table_provider =
+            Arc::new(FlightTable::create(self.name, self.client.clone(), table_reference).await?);
+
+        #[cfg(feature = "federation-experimental")]
+        let table_provider = Arc::new(
+            table_provider
+                .create_federated_table_provider()
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?,
+        );
+
+        Ok(table_provider)
     }
 }
 
@@ -102,6 +112,8 @@ impl ReadWrite for FlightFactory {
 }
 
 pub struct FlightTable {
+    name: &'static str,
+    join_push_down_context: String,
     client: FlightClient,
     schema: SchemaRef,
     table_reference: TableReference,
@@ -110,15 +122,18 @@ pub struct FlightTable {
 #[allow(clippy::needless_pass_by_value)]
 impl FlightTable {
     pub async fn create(
+        name: &'static str,
         client: FlightClient,
         table_reference: impl Into<TableReference>,
     ) -> Result<Self> {
         let table_reference = table_reference.into();
         let schema = Self::get_schema(client.clone(), &table_reference).await?;
         Ok(Self {
+            name,
             client: client.clone(),
             schema,
             table_reference,
+            join_push_down_context: format!("url={},username={}", client.url(), client.username()),
         })
     }
 

@@ -22,7 +22,7 @@ use secrets::{get_secret_or_param, Secret};
 use snafu::prelude::*;
 use std::{collections::HashMap, sync::Arc};
 
-use super::{DbConnectionPool, Result};
+use super::{DbConnectionPool, JoinPushDown, Result};
 use lazy_static::lazy_static;
 
 lazy_static! {
@@ -105,5 +105,12 @@ where
         };
 
         Ok(Box::new(odbc_cxn))
+    }
+
+    fn join_push_down(&self) -> JoinPushDown {
+        // It would be technically feasible to return JoinPushDown::AllowedFor(connection_string) here,
+        // but we don't have a general way to strip out sensitive information from the connection string.
+        // We could solve this by asking the user to explicly provide a join context in the parameters.
+        JoinPushDown::Disallow
     }
 }

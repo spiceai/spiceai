@@ -21,7 +21,10 @@ use duckdb::{vtab::arrow::ArrowVTab, AccessMode, DuckdbConnectionManager, ToSql}
 use snafu::{prelude::*, ResultExt};
 
 use super::{DbConnectionPool, Result};
-use crate::dbconnection::{duckdbconn::DuckDbConnection, DbConnection, SyncDbConnection};
+use crate::{
+    dbconnection::{duckdbconn::DuckDbConnection, DbConnection, SyncDbConnection},
+    JoinPushDown,
+};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -37,6 +40,7 @@ pub enum Error {
 
 pub struct DuckDbConnectionPool {
     pool: Arc<r2d2::Pool<DuckdbConnectionManager>>,
+    join_push_down: JoinPushDown,
 }
 
 impl DuckDbConnectionPool {
@@ -66,7 +70,11 @@ impl DuckDbConnectionPool {
 
         test_connection(&conn)?;
 
-        Ok(DuckDbConnectionPool { pool })
+        Ok(DuckDbConnectionPool {
+            pool,
+            // There can't be any other tables that share the same context for an in-memory DuckDB.
+            join_push_down: JoinPushDown::Disallow,
+        })
     }
 
     /// Create a new `DuckDbConnectionPool` from a file.
@@ -97,7 +105,11 @@ impl DuckDbConnectionPool {
 
         test_connection(&conn)?;
 
-        Ok(DuckDbConnectionPool { pool })
+        Ok(DuckDbConnectionPool {
+            pool,
+            // Allow join-push down for any other instances that connect to the same underlying file.
+            join_push_down: JoinPushDown::AllowedFor(path.to_string()),
+        })
     }
 }
 
@@ -114,6 +126,10 @@ impl DbConnectionPool<r2d2::PooledConnection<DuckdbConnectionManager>, &'static 
         let conn: r2d2::PooledConnection<DuckdbConnectionManager> =
             pool.get().context(ConnectionPoolSnafu)?;
         Ok(Box::new(DuckDbConnection::new(conn)))
+    }
+
+    fn join_push_down(&self) -> JoinPushDown {
+        self.join_push_down.clone()
     }
 }
 
