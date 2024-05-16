@@ -20,7 +20,7 @@ use tokio_rusqlite::{Connection, ToSql};
 use super::{DbConnectionPool, Result};
 use crate::{
     dbconnection::{sqliteconn::SqliteConnection, AsyncDbConnection, DbConnection},
-    Mode,
+    JoinPushDown, Mode,
 };
 
 #[derive(Debug, Snafu)]
@@ -34,6 +34,7 @@ pub enum Error {
 
 pub struct SqliteConnectionPool {
     conn: Connection,
+    join_push_down: JoinPushDown,
 }
 
 impl SqliteConnectionPool {
@@ -47,16 +48,25 @@ impl SqliteConnectionPool {
     /// Returns an error if there is a problem creating the connection pool.
     #[allow(clippy::needless_pass_by_value)]
     pub async fn new(path: &str, mode: Mode) -> Result<Self> {
-        let conn = match mode {
-            Mode::Memory => Connection::open_in_memory()
-                .await
-                .context(ConnectionPoolSnafu)?,
-            Mode::File => Connection::open(path.to_string())
-                .await
-                .context(ConnectionPoolSnafu)?,
+        let (conn, join_push_down) = match mode {
+            Mode::Memory => (
+                Connection::open_in_memory()
+                    .await
+                    .context(ConnectionPoolSnafu)?,
+                JoinPushDown::Disallow,
+            ),
+            Mode::File => (
+                Connection::open(path.to_string())
+                    .await
+                    .context(ConnectionPoolSnafu)?,
+                JoinPushDown::AllowedFor(path.to_string()),
+            ),
         };
 
-        Ok(SqliteConnectionPool { conn })
+        Ok(SqliteConnectionPool {
+            conn,
+            join_push_down,
+        })
     }
 }
 
@@ -66,5 +76,9 @@ impl DbConnectionPool<Connection, &'static (dyn ToSql + Sync)> for SqliteConnect
         &self,
     ) -> Result<Box<dyn DbConnection<Connection, &'static (dyn ToSql + Sync)>>> {
         Ok(Box::new(SqliteConnection::new(self.conn.clone())))
+    }
+
+    fn join_push_down(&self) -> JoinPushDown {
+        self.join_push_down.clone()
     }
 }

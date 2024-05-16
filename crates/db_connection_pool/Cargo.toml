@@ -38,6 +38,7 @@ tokio-postgres = { workspace = true , optional = true}
 async-stream = { workspace = true, optional = true }
 snowflake-api = { workspace = true, optional = true }
 pkcs8 = { version = "0.10.2",  features = ["encryption", "pem", "3des"], optional = true }
+url = "2.5.0"
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }

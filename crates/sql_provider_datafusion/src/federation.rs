@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use datafusion_federation::{FederatedTableProviderAdaptor, FederatedTableSource};
 use datafusion_federation_sql::{SQLExecutor, SQLFederationProvider, SQLTableSource};
-use db_connection_pool::dbconnection::get_schema;
+use db_connection_pool::{dbconnection::get_schema, JoinPushDown};
 use futures::TryStreamExt;
 use snafu::prelude::*;
 use std::sync::Arc;
@@ -49,7 +49,12 @@ impl<T, P> SQLExecutor for SqlTable<T, P> {
     }
 
     fn compute_context(&self) -> Option<String> {
-        None
+        match self.pool.join_push_down() {
+            JoinPushDown::AllowedFor(context) => Some(context),
+            // Don't return None here - it will cause incorrect federation with other providers of the same name that also have a compute_context of None.
+            // Instead return a random string that will never match any other provider's context.
+            JoinPushDown::Disallow => Some(format!("{}", self.unique_id())),
+        }
     }
 
     fn dialect(&self) -> Arc<dyn Dialect> {

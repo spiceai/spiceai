@@ -38,9 +38,22 @@ pub mod snowflakepool;
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// Controls whether join pushdown is allowed, and under what conditions
+#[derive(Clone, Debug)]
+pub enum JoinPushDown {
+    /// This connection pool should not allow join push down. (i.e. we don't know under what conditions it is safe to send a join query to the database)
+    Disallow,
+    /// Allows join push down for other tables that share the same context.
+    ///
+    /// The context can be part of the connection string that uniquely identifies the server.
+    AllowedFor(String),
+}
+
 #[async_trait]
 pub trait DbConnectionPool<T, P: 'static> {
     async fn connect(&self) -> Result<Box<dyn DbConnection<T, P>>>;
+
+    fn join_push_down(&self) -> JoinPushDown;
 }
 
 #[derive(Default)]
