@@ -239,13 +239,16 @@ fn parse_connection_string(pg_connection_string: &str) -> (String, String, Optio
 fn get_join_context(config: &Config) -> JoinPushDown {
     let mut join_push_context_str = String::new();
     for host in config.get_hosts() {
-        join_push_context_str.push_str(&format!("{host:?}"));
+        join_push_context_str.push_str(&format!("host={host:?},"));
     }
     if !config.get_ports().is_empty() {
-        join_push_context_str.push_str(&format!(":{port}", port = config.get_ports()[0]));
+        join_push_context_str.push_str(&format!("port={port},", port = config.get_ports()[0]));
     }
     if let Some(dbname) = config.get_dbname() {
-        join_push_context_str.push_str(&format!("/{dbname}"));
+        join_push_context_str.push_str(&format!("db={dbname},"));
+    }
+    if let Some(user) = config.get_user() {
+        join_push_context_str.push_str(&format!("user={user},"));
     }
 
     JoinPushDown::AllowedFor(join_push_context_str)

@@ -147,9 +147,12 @@ impl SnowflakeConnectionPool {
             }
         }
 
-        let mut join_push_context_str = format!("account={account}");
+        let mut join_push_context_str = format!("username={username},account={account}");
         if let Some(warehouse) = warehouse {
-            join_push_context_str.push_str(&format!(",warehouse={}", warehouse));
+            join_push_context_str.push_str(&format!(",warehouse={warehouse}"));
+        }
+        if let Some(role) = role {
+            join_push_context_str.push_str(&format!(",role={role}"));
         }
 
         Ok(Self {

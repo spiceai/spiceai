@@ -127,10 +127,7 @@ impl MySQLConnectionPool {
 
         let opts = mysql_async::Opts::from(connection_string);
 
-        let mut join_context = format!("{}:{}", opts.ip_or_hostname(), opts.tcp_port());
-        if let Some(db_name) = opts.db_name() {
-            join_context.push_str(&format!("/{}", db_name));
-        }
+        let join_push_down = get_join_context(&opts);
 
         let pool = mysql_async::Pool::new(opts);
 
@@ -143,9 +140,21 @@ impl MySQLConnectionPool {
 
         Ok(Self {
             pool: Arc::new(pool),
-            join_push_down: JoinPushDown::AllowedFor(join_context),
+            join_push_down,
         })
     }
+}
+
+fn get_join_context(opts: &mysql_async::Opts) -> JoinPushDown {
+    let mut join_context = format!("host={},port={}", opts.ip_or_hostname(), opts.tcp_port());
+    if let Some(db_name) = opts.db_name() {
+        join_context.push_str(&format!(",db={}", db_name));
+    }
+    if let Some(user) = opts.user() {
+        join_context.push_str(&format!(",user={}", user));
+    }
+
+    JoinPushDown::AllowedFor(join_context)
 }
 
 fn get_ssl_opts(ssl_mode: &str, rootcert_path: Option<PathBuf>) -> Option<SslOpts> {
