@@ -21,6 +21,7 @@ use arrow::{array::ArrayRef, datatypes::Schema};
 use snafu::prelude::*;
 use tokio::sync::RwLock;
 
+use crate::accelerated_table::Retention;
 use crate::datafusion::DataFusion;
 use crate::datafusion::Error as DataFusionError;
 use crate::dataupdate::DataUpdate;
@@ -100,6 +101,7 @@ impl InternalTable {
         schema: Arc<Schema>,
         acceleration: Acceleration,
         refresh: Refresh,
+        retention: Option<Retention>,
     ) -> Result<Self, Error> {
         let mut dataset = Dataset::new("internal".to_string(), name.to_string());
         dataset.mode = Mode::ReadWrite;
@@ -118,14 +120,16 @@ impl InternalTable {
                 .await
                 .context(UnableToCreateAcceleratedTableProviderSnafu)?;
 
-        let (accelerated_table, _) = AcceleratedTable::builder(
+        let mut builder = AcceleratedTable::builder(
             name.to_string(),
             source_table_provider,
             accelerated_table_provider,
             refresh,
-        )
-        .build()
-        .await;
+        );
+
+        builder.retention(retention);
+
+        let (accelerated_table, _) = builder.build().await;
 
         Ok(Self {
             name: name.to_string(),

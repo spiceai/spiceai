@@ -22,10 +22,12 @@ use arrow::array::{Float64Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use snafu::prelude::*;
 use spicepod::component::dataset::acceleration::Acceleration;
+use spicepod::component::dataset::TimeFormat;
 use tokio::spawn;
 use tokio::sync::RwLock;
 
 use crate::accelerated_table::refresh::Refresh;
+use crate::accelerated_table::Retention;
 use crate::datafusion::DataFusion;
 use crate::internal_table::{self, InternalTable};
 
@@ -60,11 +62,20 @@ impl MetricsRecorder {
 
 impl MetricsRecorder {
     pub async fn new(socket_addr: SocketAddr) -> Result<Self, Error> {
+        let retention = Retention::new(
+            Some("timestamp".to_string()),
+            Some(TimeFormat::UnixSeconds),
+            Some(Duration::from_secs(1800)), // delete metrics older then 30 minutes
+            Some(Duration::from_secs(300)),  // run retention every 5 minutes
+            true,
+        );
+
         let internal_table = InternalTable::new(
             "metrics",
             get_metrics_schema(),
             Acceleration::default(),
             Refresh::default(),
+            retention,
         )
         .await
         .context(UnableToCreateMetricsTableSnafu)?;
