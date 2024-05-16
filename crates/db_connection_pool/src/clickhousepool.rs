@@ -122,7 +122,7 @@ impl ClickhouseConnectionPool {
 const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Returns a Clickhouse `Options` based on user-provided parameters.
-/// Also returns the sanitized connection string for use as a federation compute_context.
+/// Also returns the sanitized connection string for use as a federation `compute_context`.
 async fn get_config_from_params(
     params: &HashMap<String, String>,
     secret: &'_ Option<Secret>,
@@ -181,7 +181,7 @@ async fn get_config_from_params(
         Url::parse(&connection_string).context(UnableToParseConnectionStringSnafu)?;
     sanitized_connection_string
         .set_password(None)
-        .map_err(|_| Error::UnableToSanitizeConnectionString)?;
+        .map_err(|()| Error::UnableToSanitizeConnectionString)?;
 
     let mut options =
         Options::from_str(&connection_string).context(InvalidConnectionStringSnafu)?;

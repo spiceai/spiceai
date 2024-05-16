@@ -148,10 +148,10 @@ impl MySQLConnectionPool {
 fn get_join_context(opts: &mysql_async::Opts) -> JoinPushDown {
     let mut join_context = format!("host={},port={}", opts.ip_or_hostname(), opts.tcp_port());
     if let Some(db_name) = opts.db_name() {
-        join_context.push_str(&format!(",db={}", db_name));
+        join_context.push_str(&format!(",db={db_name}"));
     }
     if let Some(user) = opts.user() {
-        join_context.push_str(&format!(",user={}", user));
+        join_context.push_str(&format!(",user={user}"));
     }
 
     JoinPushDown::AllowedFor(join_context)
