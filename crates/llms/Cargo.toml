@@ -15,7 +15,10 @@ snafu.workspace = true
 
 dirs = "5.0.1"
 serde_json = "1.0.117"
+async-openai = "0.21.0"
 async-trait.workspace = true
+tracing.workspace = true
+serde = { workspace = true, features = ["derive"] }
 
 ## `candle` feature packages
 candle-core = {version= "0.5.0", optional = true}

@@ -17,7 +17,7 @@ limitations under the License.
 use crate::{config, datafusion::DataFusion};
 use app::App;
 use axum::routing::patch;
-use llms::nql::LlmRuntime;
+use llms::nql::NSQLRuntime;
 use model_components::model::Model;
 use std::net::SocketAddr;
 use std::{collections::HashMap, sync::Arc};
@@ -65,7 +65,7 @@ pub(crate) fn routes(
             .route("/v1/predict", post(v1::inference::post))
             .layer(Extension(models));
 
-        match llms::nql::try_duckdb_from_spice_local(&LlmRuntime::Mistral) {
+        match llms::nql::try_duckdb_from_spice_local(&NSQLRuntime::Mistral) {
             Ok(duck_nql) => {
                 router = router
                     .route("/v1/nsql", post(v1::nsql::post))
