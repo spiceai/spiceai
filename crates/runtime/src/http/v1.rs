@@ -1002,7 +1002,7 @@ pub(crate) mod nsql {
 
         // Construct prompt
         let nsql_query = format!(
-            "```SQL {table_create_schemas} \n-- Using valid postgres SQL, without comments, answer the following questions for the tables provided above.\n -- {user_query}",
+            "```SQL\n{table_create_schemas}\n-- Using valid postgres SQL, without comments, answer the following questions for the tables provided above.\n-- {user_query}",
             user_query=payload.query,
             table_create_schemas=table_create_stms.join("\n")
         );
