@@ -116,7 +116,7 @@ pub async fn run(args: Args) -> Result<()> {
             .await
             .context(UnableToStartServersSnafu)
         {
-            tracing::warn!("{}", err);
+            tracing::warn!("{err}");
         }
     }
 
