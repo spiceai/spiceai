@@ -144,7 +144,7 @@ impl ObjectStore for SFTPObjectStore {
                     .mtime
                     .ok_or_else(|| object_store::Error::Generic {
                         store: "SFTP",
-                        source: "No modifcation time found for file".into(),
+                        source: "No modification time found for file".into(),
                     })? as i64,
                 0,
             )
@@ -205,6 +205,7 @@ impl ObjectStore for SFTPObjectStore {
                 if total > data_to_read {
                     n -= total - data_to_read;
                 }
+
                 let _ = sender.send(Ok(Bytes::copy_from_slice(&buf[..n]))).await;
             }
         });
@@ -242,26 +243,51 @@ impl ObjectStore for SFTPObjectStore {
     }
 
     fn list(&self, location: Option<&Path>) -> BoxStream<'_, object_store::Result<ObjectMeta>> {
-        let client = self.get_client().unwrap();
-        let list = client
-            .sftp()
-            .unwrap()
-            .readdir(std::path::Path::new(location.unwrap().as_ref()))
-            .unwrap();
+        let location = location
+            .map(ToOwned::to_owned)
+            .map(|x| x.to_string())
+            .unwrap_or("/".to_string());
+        let stream = stream! {
+            let client = self.get_client()?;
 
-        let res = list
-            .iter()
-            .map(|entry| ObjectMeta {
-                location: Path::from(entry.0.to_str().unwrap()),
-                size: entry.1.size.unwrap() as usize,
-                last_modified: DateTime::from_timestamp_millis(entry.1.mtime.unwrap() as i64)
-                    .unwrap(),
-                e_tag: None,
-                version: None,
-            })
-            .collect::<Vec<_>>();
+            let list = client
+                .sftp()
+                .map_err(|e| object_store::Error::Generic {
+                    store: "SFTP",
+                    source: e.into(),
+                })?
+                .readdir(std::path::Path::new(&location))
+                .map_err(|e| object_store::Error::Generic {
+                    store: "SFTP",
+                    source: e.into(),
+                })?;
 
-        Box::pin(futures::stream::iter(res.into_iter().map(Ok)))
+            for entry in list {
+                yield Ok(ObjectMeta {
+                    location: Path::from(entry.0.to_str().ok_or_else(|| object_store::Error::Generic {
+                        store: "SFTP",
+                        source: "Failed to convert path".into(),
+                    })?),
+                    size: entry.1.size.ok_or_else(|| object_store::Error::Generic {
+                        store: "SFTP",
+                        source: "No size found for file".into(),
+                    })? as usize,
+                    last_modified: DateTime::from_timestamp(entry.1.mtime.ok_or_else(|| object_store::Error::Generic {
+                            store: "SFTP",
+                            source: "No modification time found for file".into(),
+                        })? as i64, 0)
+                        .ok_or_else(|| object_store::Error::Generic {
+                            store: "SFTP",
+                            source: "Failed to construct DataTime".into(),
+                        })?,
+                    e_tag: None,
+                    version: None,
+                })
+            }
+
+        };
+
+        Box::pin(Box::pin(stream))
     }
 
     fn list_with_offset(
