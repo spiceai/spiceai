@@ -696,7 +696,7 @@ impl Runtime {
                 .register_runtime_table(metrics_table.name(), metrics_table.accelerated_table())
                 .context(UnableToRegisterMetricsTableSnafu)?;
 
-            recorder.start(Arc::clone(&self.df));
+            recorder.start(&Arc::clone(&self.df));
         }
 
         Ok(())

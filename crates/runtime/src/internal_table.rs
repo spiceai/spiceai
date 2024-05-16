@@ -16,9 +16,14 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use arrow::datatypes::Schema;
+use arrow::record_batch::RecordBatch;
+use arrow::{array::ArrayRef, datatypes::Schema};
 use snafu::prelude::*;
+use tokio::sync::RwLock;
 
+use crate::datafusion::DataFusion;
+use crate::datafusion::Error as DataFusionError;
+use crate::dataupdate::DataUpdate;
 use crate::{
     accelerated_table::{refresh::Refresh, AcceleratedTable},
     dataaccelerator::{self, create_accelerator_table},
@@ -39,10 +44,20 @@ pub enum Error {
 
     #[snafu(display("Unable to create accelerated table provider: {source}"))]
     UnableToCreateAcceleratedTableProvider { source: dataaccelerator::Error },
+
+    #[snafu(display("Error creating record batch: {source}",))]
+    UnableToCreateRecordBatch { source: arrow::error::ArrowError },
+
+    #[snafu(display("Error writing to {name} table: {source}"))]
+    UnableToWriteToTable {
+        name: String,
+        source: DataFusionError,
+    },
 }
 
 pub struct InternalTable {
     name: String,
+    schema: Arc<Schema>,
     accelerated_table: Arc<AcceleratedTable>,
 }
 
@@ -55,6 +70,29 @@ impl InternalTable {
     #[must_use]
     pub fn accelerated_table(&self) -> Arc<AcceleratedTable> {
         Arc::clone(&self.accelerated_table)
+    }
+
+    pub async fn insert(
+        &self,
+        data_fusion: &Arc<RwLock<DataFusion>>,
+        data: Vec<ArrayRef>,
+    ) -> Result<(), Error> {
+        let data_update = DataUpdate {
+            schema: Arc::clone(&self.schema),
+            data: vec![RecordBatch::try_new(Arc::clone(&self.schema), data)
+                .context(UnableToCreateRecordBatchSnafu)?],
+            update_type: crate::dataupdate::UpdateType::Append,
+        };
+
+        let df = data_fusion.write().await;
+        df.write_runtime_data(self.name(), data_update)
+            .await
+            .context(UnableToWriteToTableSnafu {
+                name: self.name().to_string(),
+            })?;
+        drop(df);
+
+        Ok(())
     }
 
     pub async fn new(
@@ -76,7 +114,7 @@ impl InternalTable {
             .context(UnableToCreateSourceTableProviderSnafu)?;
 
         let accelerated_table_provider =
-            create_accelerator_table(name, schema, &acceleration, None)
+            create_accelerator_table(name, Arc::clone(&schema), &acceleration, None)
                 .await
                 .context(UnableToCreateAcceleratedTableProviderSnafu)?;
 
@@ -91,6 +129,7 @@ impl InternalTable {
 
         Ok(Self {
             name: name.to_string(),
+            schema,
             accelerated_table: Arc::new(accelerated_table),
         })
     }
