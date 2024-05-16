@@ -12,6 +12,8 @@ use url::{form_urlencoded::parse, Url};
 
 #[cfg(feature = "ftp")]
 use crate::objectstore::ftp::FTPObjectStore;
+#[cfg(feature = "ftp")]
+use crate::objectstore::sftp::SFTPObjectStore;
 #[allow(clippy::module_name_repetitions)]
 #[derive(Debug, Default)]
 pub struct SpiceObjectStoreRegistry {
@@ -91,6 +93,35 @@ impl SpiceObjectStoreRegistry {
                     let ftp_object_store =
                         FTPObjectStore::new(user, password, host.to_string(), port);
                     return Ok(Arc::new(ftp_object_store) as Arc<dyn ObjectStore>);
+                }
+            }
+            #[cfg(feature = "ftp")]
+            if url.as_str().starts_with("sftp://") {
+                if let Some(host) = url.host() {
+                    let params: HashMap<String, String> =
+                        parse(url.fragment().unwrap_or_default().as_bytes())
+                            .into_owned()
+                            .collect();
+
+                    let port = params
+                        .get("port")
+                        .map_or("22".to_string(), ToOwned::to_owned);
+                    let user = params.get("user").map(ToOwned::to_owned).ok_or_else(|| {
+                        DataFusionError::Configuration("No user provided for SFTP".to_string())
+                    })?;
+                    let password =
+                        params
+                            .get("password")
+                            .map(ToOwned::to_owned)
+                            .ok_or_else(|| {
+                                DataFusionError::Configuration(
+                                    "No password provided for SFTP".to_string(),
+                                )
+                            })?;
+
+                    let sftp_object_store =
+                        SFTPObjectStore::new(user, password, host.to_string(), port);
+                    return Ok(Arc::new(sftp_object_store) as Arc<dyn ObjectStore>);
                 }
             }
         }

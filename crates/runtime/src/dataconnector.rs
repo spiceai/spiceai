@@ -67,6 +67,8 @@ pub mod odbc;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 pub mod s3;
+#[cfg(feature = "ftp")]
+pub mod sftp;
 #[cfg(feature = "spark")]
 pub mod spark;
 pub mod spiceai;
@@ -226,6 +228,8 @@ pub async fn register_all() {
     register_connector_factory("s3", s3::S3::create).await;
     #[cfg(feature = "ftp")]
     register_connector_factory("ftp", ftp::FTP::create).await;
+    #[cfg(feature = "ftp")]
+    register_connector_factory("sftp", sftp::SFTP::create).await;
     register_connector_factory("spiceai", spiceai::SpiceAI::create).await;
     #[cfg(feature = "mysql")]
     register_connector_factory("mysql", mysql::MySQL::create).await;
