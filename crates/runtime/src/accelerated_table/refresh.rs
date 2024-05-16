@@ -257,7 +257,6 @@ impl Refresher {
                         yield self.get_full_or_incremental_append_update(timestamp).await;
                     }
                     Err(e) => {
-                        dbg!(&e);
                         tracing::error!("No latest timestamp is found: {e}");
                     }
                 }
