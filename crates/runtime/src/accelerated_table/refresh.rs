@@ -341,7 +341,7 @@ impl Refresher {
         )
         .alias("a");
         ctx.read_table(Arc::clone(&self.accelerator))?
-            .select(vec![expr.clone()])?
+            .select(vec![expr])?
             .sort(vec![col("a").sort(false, false)])?
             .limit(0, Some(1))
     }
