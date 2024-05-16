@@ -29,7 +29,7 @@ use arrow::datatypes::Schema;
 use arrow_tools::schema::verify_schema;
 use datafusion::catalog::schema::SchemaProvider;
 use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider};
-use datafusion::datasource::ViewTable;
+use datafusion::datasource::{TableProvider, ViewTable};
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::{SessionConfig, SessionContext, SessionState};
 use datafusion::physical_plan::collect;
@@ -141,6 +141,20 @@ pub enum Error {
 
     #[snafu(display("The schema {schema} is not registered."))]
     SchemaMissing { schema: String },
+
+    #[snafu(display("Unable to get {schema} schema: {source}"))]
+    UnableToGetSchema {
+        schema: String,
+        source: DataFusionError,
+    },
+
+    #[snafu(display("Table {schema}.{table} not registered"))]
+    TableMissing { schema: String, table: String },
+
+    #[snafu(display("Unable to get object store configuration: {source}"))]
+    UnableToGetSchemaTable {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 pub enum Table {
@@ -224,6 +238,15 @@ impl DataFusion {
         None
     }
 
+    #[must_use]
+    fn schema(&self, schema_name: &str) -> Option<Arc<dyn SchemaProvider>> {
+        if let Some(catalog) = self.ctx.catalog(SPICE_DEFAULT_CATALOG) {
+            return catalog.schema(schema_name);
+        }
+
+        None
+    }
+
     pub fn register_runtime_table(
         &mut self,
         name: String,
@@ -276,16 +299,40 @@ impl DataFusion {
     }
 
     #[must_use]
-    pub fn is_writable(&self, table_name: &str) -> bool {
+    pub fn is_writable(&self, table_reference: &TableReference) -> bool {
+        let mut table_name = table_reference.table().to_string();
+
+        if let Some(schema_name) = table_reference.schema() {
+            table_name = format!("{schema_name}.{table_name}");
+        }
+
         self.data_writers.iter().any(|s| s.as_str() == table_name)
     }
 
-    pub async fn write_data(&self, table_name: &str, data_update: DataUpdate) -> Result<()> {
-        if !self.is_writable(table_name) {
-            TableNotWritableSnafu {
-                table_name: table_name.to_string(),
+    async fn get_table_provider(
+        &self,
+        table_reference: &TableReference,
+    ) -> Result<Arc<dyn TableProvider>> {
+        let table_name = table_reference.table();
+
+        if let Some(schema_name) = table_reference.schema() {
+            if let Some(schema) = self.schema(schema_name) {
+                let table_provider = schema
+                    .table(table_name)
+                    .await
+                    .context(UnableToGetTableSnafu)?
+                    .ok_or_else(|| {
+                        TableMissingSnafu {
+                            schema: schema_name.to_string(),
+                            table: table_name.to_string(),
+                        }
+                        .build()
+                    })
+                    .boxed()
+                    .context(UnableToGetSchemaTableSnafu)?;
+
+                return Ok(table_provider);
             }
-            .fail()?;
         }
 
         let table_provider = self
@@ -293,6 +340,23 @@ impl DataFusion {
             .table_provider(TableReference::bare(table_name.to_string()))
             .await
             .context(UnableToGetTableSnafu)?;
+
+        Ok(table_provider)
+    }
+
+    pub async fn write_data(
+        &self,
+        table_reference: TableReference,
+        data_update: DataUpdate,
+    ) -> Result<()> {
+        if !self.is_writable(&table_reference) {
+            TableNotWritableSnafu {
+                table_name: table_reference.to_string(),
+            }
+            .fail()?;
+        }
+
+        let table_provider = self.get_table_provider(&table_reference).await?;
 
         verify_schema(
             table_provider.schema().fields(),
@@ -309,12 +373,12 @@ impl DataFusion {
             )
             .await
             .context(UnableToPlanTableInsertSnafu {
-                table_name: table_name.to_string(),
+                table_name: table_reference.to_string(),
             })?;
 
         let _ = collect(insert_plan, self.ctx.task_ctx()).await.context(
             UnableToExecuteTableInsertSnafu {
-                table_name: table_name.to_string(),
+                table_name: table_reference.to_string(),
             },
         )?;
 
@@ -347,7 +411,7 @@ impl DataFusion {
             .fail();
         }
 
-        if self.is_writable(dataset_name) {
+        if self.is_writable(&TableReference::bare(dataset_name)) {
             self.data_writers.remove(dataset_name);
         }
 

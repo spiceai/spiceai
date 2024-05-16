@@ -48,6 +48,8 @@ arrow-odbc = { workspace = true, optional = true }
 clickhouse-rs = { workspace = true, optional = true }
 snowflake-api ={ workspace = true, optional = true }
 uuid.workspace = true
+datafusion-federation = { workspace = true, optional = true }
+datafusion-federation-sql = { workspace = true, optional = true }
 
 [features]
 duckdb = ["dep:duckdb", "dep:r2d2"]
@@ -60,4 +62,4 @@ spark_connect = ["dep:spark-connect-rs"]
 databricks = ["dep:deltalake", "spark_connect"]
 odbc = ["dep:odbc-api", "dep:arrow-odbc"]
 snowflake = ["dep:snowflake-api"]
-federation-experimental = ["sql_provider_datafusion/federation-experimental"]
+federation-experimental = ["sql_provider_datafusion/federation-experimental", "dep:datafusion-federation", "dep:datafusion-federation-sql"]
