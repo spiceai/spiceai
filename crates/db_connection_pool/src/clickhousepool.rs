@@ -75,7 +75,7 @@ pub enum Error {
 
 pub struct ClickhouseConnectionPool {
     pool: Arc<Pool>,
-    join_push_down_context: String,
+    join_push_down: JoinPushDown,
 }
 
 impl ClickhouseConnectionPool {
@@ -99,7 +99,7 @@ impl ClickhouseConnectionPool {
 
         Ok(Self {
             pool: Arc::new(pool),
-            join_push_down_context: compute_context,
+            join_push_down: JoinPushDown::AllowedFor(compute_context),
         })
     }
 }
@@ -108,61 +108,51 @@ const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Returns a Clickhouse `Options` based on user-provided parameters.
 /// Also returns the sanitized connection string for use as a federation compute_context.
-fn get_config_from_params<'a>(
-    params: &'a HashMap<String, String>,
+fn get_config_from_params(
+    params: &HashMap<String, String>,
     secret: &'_ Option<Secret>,
 ) -> Result<(Options, String)> {
-    let mut connection_string: Option<String> = None;
-    if let Some(clickhouse_connection_string) = get_secret_or_param(
-        Some(params),
-        secret,
-        "clickhouse_connection_string_key",
-        "clickhouse_connection_string",
-    ) {
-        connection_string = Some(clickhouse_connection_string);
-    } else {
-        let user =
-            params
-                .get("clickhouse_user")
-                .ok_or(Error::MissingRequiredParameterForConnection {
-                    parameter_name: "clickhouse_user".to_string(),
-                })?;
-        let password = get_secret_or_param(
+    let connection_string =
+        if let Some(clickhouse_connection_string) = get_secret_or_param(
             Some(params),
             secret,
-            "clickhouse_pass_key",
-            "clickhouse_pass",
-        )
-        .ok_or(Error::MissingRequiredParameterForConnection {
-            parameter_name: "clickhouse_pass".to_string(),
-        })?;
-        let host =
-            params
-                .get("clickhouse_host")
-                .ok_or(Error::MissingRequiredParameterForConnection {
+            "clickhouse_connection_string_key",
+            "clickhouse_connection_string",
+        ) {
+            clickhouse_connection_string
+        } else {
+            let user = params.get("clickhouse_user").ok_or(
+                Error::MissingRequiredParameterForConnection {
+                    parameter_name: "clickhouse_user".to_string(),
+                },
+            )?;
+            let password = get_secret_or_param(
+                Some(params),
+                secret,
+                "clickhouse_pass_key",
+                "clickhouse_pass",
+            )
+            .ok_or(Error::MissingRequiredParameterForConnection {
+                parameter_name: "clickhouse_pass".to_string(),
+            })?;
+            let host = params.get("clickhouse_host").ok_or(
+                Error::MissingRequiredParameterForConnection {
                     parameter_name: "clickhouse_tcp_host".to_string(),
-                })?;
-        let port = params.get("clickhouse_tcp_port").ok_or(
-            Error::MissingRequiredParameterForConnection {
-                parameter_name: "clickhouse_port".to_string(),
-            },
-        )?;
-        let db =
-            params
-                .get("clickhouse_db")
-                .ok_or(Error::MissingRequiredParameterForConnection {
+                },
+            )?;
+            let port = params.get("clickhouse_tcp_port").ok_or(
+                Error::MissingRequiredParameterForConnection {
+                    parameter_name: "clickhouse_port".to_string(),
+                },
+            )?;
+            let db = params.get("clickhouse_db").ok_or(
+                Error::MissingRequiredParameterForConnection {
                     parameter_name: "clickhouse_db".to_string(),
-                })?;
+                },
+            )?;
 
-        connection_string = Some(format!("tcp://{user}:{password}@{host}:{port}/{db}",));
-    }
-
-    let Some(connection_string) = connection_string else {
-        return MissingRequiredParameterForConnectionSnafu {
-            parameter_name: "clickhouse_connection_string".to_string(),
-        }
-        .fail()?;
-    };
+            format!("tcp://{user}:{password}@{host}:{port}/{db}",)
+        };
 
     let mut sanitized_connection_string =
         Url::parse(&connection_string).context(UnableToParseConnectionStringSnafu)?;
@@ -208,6 +198,6 @@ impl DbConnectionPool<ClientHandle, &'static (dyn Sync)> for ClickhouseConnectio
     }
 
     fn join_push_down(&self) -> JoinPushDown {
-        JoinPushDown::AllowedFor(self.join_push_down_context.clone())
+        self.join_push_down.clone()
     }
 }

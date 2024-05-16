@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use datafusion_federation::{FederatedTableProviderAdaptor, FederatedTableSource};
 use datafusion_federation_sql::{SQLExecutor, SQLFederationProvider, SQLTableSource};
-use db_connection_pool::dbconnection::get_schema;
+use db_connection_pool::{dbconnection::get_schema, JoinPushDown};
 use futures::TryStreamExt;
 use snafu::prelude::*;
 use std::sync::Arc;
@@ -10,7 +10,6 @@ use crate::{get_stream, to_execution_error, SqlTable, UnableToGetSchemaSnafu};
 use datafusion::{
     arrow::datatypes::SchemaRef,
     error::{DataFusionError, Result as DataFusionResult},
-    functions::string::uuid,
     physical_plan::{stream::RecordBatchStreamAdapter, SendableRecordBatchStream},
     sql::{
         sqlparser::dialect::{Dialect, GenericDialect},

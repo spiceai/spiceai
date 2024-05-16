@@ -24,7 +24,10 @@ use mysql_async::{
 use secrets::{get_secret_or_param, Secret};
 use snafu::{ResultExt, Snafu};
 
-use crate::dbconnection::{mysqlconn::MySQLConnection, AsyncDbConnection, DbConnection};
+use crate::{
+    dbconnection::{mysqlconn::MySQLConnection, AsyncDbConnection, DbConnection},
+    JoinPushDown,
+};
 
 use super::{DbConnectionPool, Result};
 
@@ -45,6 +48,7 @@ pub enum Error {
 
 pub struct MySQLConnectionPool {
     pool: Arc<mysql_async::Pool>,
+    join_push_down: JoinPushDown,
 }
 
 impl MySQLConnectionPool {
@@ -123,6 +127,11 @@ impl MySQLConnectionPool {
 
         let opts = mysql_async::Opts::from(connection_string);
 
+        let mut join_context = format!("{}:{}", opts.ip_or_hostname(), opts.tcp_port());
+        if let Some(db_name) = opts.db_name() {
+            join_context.push_str(&format!("/{}", db_name));
+        }
+
         let pool = mysql_async::Pool::new(opts);
 
         // Test the connection
@@ -134,6 +143,7 @@ impl MySQLConnectionPool {
 
         Ok(Self {
             pool: Arc::new(pool),
+            join_push_down: JoinPushDown::AllowedFor(join_context),
         })
     }
 }
@@ -169,5 +179,9 @@ impl DbConnectionPool<mysql_async::Conn, &'static (dyn ToValue + Sync)> for MySQ
         let pool = Arc::clone(&self.pool);
         let conn = pool.get_conn().await.context(ConnectionPoolRunSnafu)?;
         Ok(Box::new(MySQLConnection::new(conn)))
+    }
+
+    fn join_push_down(&self) -> JoinPushDown {
+        self.join_push_down.clone()
     }
 }

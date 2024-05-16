@@ -30,7 +30,10 @@ use snafu::{prelude::*, ResultExt};
 use tokio_postgres;
 
 use super::DbConnectionPool;
-use crate::dbconnection::{postgresconn::PostgresConnection, AsyncDbConnection, DbConnection};
+use crate::{
+    dbconnection::{postgresconn::PostgresConnection, AsyncDbConnection, DbConnection},
+    JoinPushDown,
+};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -79,6 +82,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct PostgresConnectionPool {
     pool: Arc<bb8::Pool<PostgresConnectionManager<MakeTlsConnector>>>,
+    join_push_down: JoinPushDown,
 }
 
 impl PostgresConnectionPool {
@@ -181,6 +185,8 @@ impl PostgresConnectionPool {
         let connector = MakeTlsConnector::new(tls_connector);
         test_postgres_connection(connection_string.as_str(), connector.clone()).await?;
 
+        let join_push_down = get_join_context(&config);
+
         let manager = PostgresConnectionManager::new(config, connector);
         let error_sink = PostgresErrorSink::new();
 
@@ -198,6 +204,7 @@ impl PostgresConnectionPool {
 
         Ok(PostgresConnectionPool {
             pool: Arc::new(pool.clone()),
+            join_push_down,
         })
     }
 }
@@ -227,6 +234,21 @@ fn parse_connection_string(pg_connection_string: &str) -> (String, String, Optio
     }
 
     (connection_string, ssl_mode, ssl_rootcert_path)
+}
+
+fn get_join_context(config: &Config) -> JoinPushDown {
+    let mut join_push_context_str = String::new();
+    for host in config.get_hosts() {
+        join_push_context_str.push_str(&format!("{host:?}"));
+    }
+    if !config.get_ports().is_empty() {
+        join_push_context_str.push_str(&format!(":{port}", port = config.get_ports()[0]));
+    }
+    if let Some(dbname) = config.get_dbname() {
+        join_push_context_str.push_str(&format!("/{dbname}"));
+    }
+
+    JoinPushDown::AllowedFor(join_push_context_str)
 }
 
 async fn test_postgres_connection(
@@ -338,5 +360,9 @@ impl
         let pool = Arc::clone(&self.pool);
         let conn = pool.get_owned().await.context(ConnectionPoolRunSnafu)?;
         Ok(Box::new(PostgresConnection::new(conn)))
+    }
+
+    fn join_push_down(&self) -> JoinPushDown {
+        self.join_push_down.clone()
     }
 }
