@@ -126,6 +126,11 @@ impl<T, P> SqlTable<T, P> {
             self.engine,
         )?))
     }
+
+    // Return the current memory location of the object as a unique identifier
+    fn unique_id(&self) -> usize {
+        self as *const _ as usize
+    }
 }
 
 #[async_trait]

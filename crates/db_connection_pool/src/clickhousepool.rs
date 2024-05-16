@@ -25,8 +25,12 @@ use async_trait::async_trait;
 use clickhouse_rs::{ClientHandle, Options, Pool};
 use secrets::{get_secret_or_param, Secret};
 use snafu::{ResultExt, Snafu};
+use url::Url;
 
-use crate::dbconnection::{clickhouseconn::ClickhouseConnection, DbConnection};
+use crate::{
+    dbconnection::{clickhouseconn::ClickhouseConnection, DbConnection},
+    JoinPushDown,
+};
 
 use super::{DbConnectionPool, Result};
 
@@ -41,6 +45,12 @@ pub enum Error {
     InvalidConnectionStringError {
         source: clickhouse_rs::errors::Error,
     },
+
+    #[snafu(display("Unable to parse the connection string as a URL: {source}"))]
+    UnableToParseConnectionString { source: url::ParseError },
+
+    #[snafu(display("Unable to sanitize the connection string"))]
+    UnableToSanitizeConnectionString,
 
     #[snafu(display("ConnectionPoolRunError: {source}"))]
     ConnectionPoolRunError {
@@ -65,6 +75,7 @@ pub enum Error {
 
 pub struct ClickhouseConnectionPool {
     pool: Arc<Pool>,
+    join_push_down_context: String,
 }
 
 impl ClickhouseConnectionPool {
@@ -82,36 +93,33 @@ impl ClickhouseConnectionPool {
             Some(params) => params,
             None => ParametersEmptySnafu {}.fail()?,
         };
-        let options = get_config_from_params(params, &secret)?;
+        let (options, compute_context) = get_config_from_params(params, &secret)?;
 
         let pool = Pool::new(options);
 
         Ok(Self {
             pool: Arc::new(pool),
+            join_push_down_context: compute_context,
         })
     }
 }
 
 const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 
-fn get_config_from_params(
-    params: &HashMap<String, String>,
-    secret: &Option<Secret>,
-) -> Result<Options> {
-    let options: Option<Options>;
+/// Returns a Clickhouse `Options` based on user-provided parameters.
+/// Also returns the sanitized connection string for use as a federation compute_context.
+fn get_config_from_params<'a>(
+    params: &'a HashMap<String, String>,
+    secret: &'_ Option<Secret>,
+) -> Result<(Options, String)> {
+    let mut connection_string: Option<String> = None;
     if let Some(clickhouse_connection_string) = get_secret_or_param(
         Some(params),
         secret,
         "clickhouse_connection_string_key",
         "clickhouse_connection_string",
     ) {
-        let mut new_options = Options::from_str(&clickhouse_connection_string)
-            .context(InvalidConnectionStringSnafu)?;
-        if !clickhouse_connection_string.contains("connection_timeout") {
-            // Default timeout of 500ms is not enough in some cases.
-            new_options = new_options.connection_timeout(DEFAULT_CONNECTION_TIMEOUT);
-        }
-        options = Some(new_options);
+        connection_string = Some(clickhouse_connection_string);
     } else {
         let user =
             params
@@ -146,17 +154,28 @@ fn get_config_from_params(
                     parameter_name: "clickhouse_db".to_string(),
                 })?;
 
-        let connection_string = format!("tcp://{user}:{password}@{host}:{port}/{db}",);
-        // Default timeout of 500ms is not enough
-        let new_options = Options::from_str(&connection_string)
-            .context(InvalidConnectionStringSnafu)?
-            .connection_timeout(DEFAULT_CONNECTION_TIMEOUT);
-        options = Some(new_options);
+        connection_string = Some(format!("tcp://{user}:{password}@{host}:{port}/{db}",));
     }
 
-    let mut options = options.ok_or(Error::MissingRequiredParameterForConnection {
-        parameter_name: "clickhouse_connection_string".to_string(),
-    })?;
+    let Some(connection_string) = connection_string else {
+        return MissingRequiredParameterForConnectionSnafu {
+            parameter_name: "clickhouse_connection_string".to_string(),
+        }
+        .fail()?;
+    };
+
+    let mut sanitized_connection_string =
+        Url::parse(&connection_string).context(UnableToParseConnectionStringSnafu)?;
+    sanitized_connection_string
+        .set_password(None)
+        .map_err(|_| Error::UnableToSanitizeConnectionString)?;
+
+    let mut options =
+        Options::from_str(&connection_string).context(InvalidConnectionStringSnafu)?;
+    if !connection_string.contains("connection_timeout") {
+        // Default timeout of 500ms is not enough in some cases.
+        options = options.connection_timeout(DEFAULT_CONNECTION_TIMEOUT);
+    }
 
     if let Some(connection_timeout) = params.get("clickhouse_connection_timeout") {
         let connection_timeout = connection_timeout
@@ -174,7 +193,7 @@ fn get_config_from_params(
         })?;
     options = options.secure(secure.unwrap_or(true));
 
-    Ok(options)
+    Ok((options, sanitized_connection_string.to_string()))
 }
 
 #[async_trait]
@@ -186,5 +205,9 @@ impl DbConnectionPool<ClientHandle, &'static (dyn Sync)> for ClickhouseConnectio
             conn,
             Arc::clone(&self.pool),
         )))
+    }
+
+    fn join_push_down(&self) -> JoinPushDown {
+        JoinPushDown::AllowedFor(self.join_push_down_context.clone())
     }
 }
