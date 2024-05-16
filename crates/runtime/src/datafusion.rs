@@ -311,7 +311,7 @@ impl DataFusion {
 
     async fn get_table_provider(
         &self,
-        table_reference: TableReference,
+        table_reference: &TableReference,
     ) -> Result<Arc<dyn TableProvider>> {
         let table_name = table_reference.table();
 
@@ -356,7 +356,7 @@ impl DataFusion {
             .fail()?;
         }
 
-        let table_provider = self.get_table_provider(table_reference.clone()).await?;
+        let table_provider = self.get_table_provider(&table_reference).await?;
 
         verify_schema(
             table_provider.schema().fields(),
