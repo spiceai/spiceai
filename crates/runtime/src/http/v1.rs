@@ -942,24 +942,32 @@ pub(crate) mod nsql {
         response::{IntoResponse, Response},
         Extension, Json,
     };
-    use llms::nql::Nql;
+    use llms::nql::{create_nsql, NSQLRuntime, Nql};
     use serde::{Deserialize, Serialize};
-    use std::{ops::DerefMut, sync::Arc};
+    use std::sync::Arc;
     use tokio::sync::RwLock;
 
     use crate::{datafusion::DataFusion, http::v1::dataframe_to_response};
 
-    fn remove_prefix_dashes(input: &str) -> String {
-        match input.strip_prefix("--") {
+    fn clean_model_based_sql(input: &str) -> String {
+        let no_dashes = match input.strip_prefix("--") {
             Some(rest) => rest.to_string(),
             None => input.to_string(),
-        }
+        };
+        no_dashes.trim().to_string()
     }
 
     #[derive(Debug, Serialize, Deserialize)]
     #[serde(rename_all = "lowercase")]
     pub struct Request {
         pub query: String,
+
+        #[serde(rename = "use", default = "default_runtime")]
+        pub runtime: NSQLRuntime,
+    }
+
+    fn default_runtime() -> NSQLRuntime {
+        NSQLRuntime::Mistral
     }
 
     pub(crate) async fn post(
@@ -969,6 +977,7 @@ pub(crate) mod nsql {
     ) -> Response {
         let readable_df = df.read().await;
 
+        // Get all public table CREATE TABLE statements to add to prompt.
         let tables = match readable_df.get_public_table_names() {
             Ok(t) => t,
             Err(e) => {
@@ -991,22 +1000,33 @@ pub(crate) mod nsql {
             }
         }
 
+        // Construct prompt
         let nsql_query = format!(
-            "{table_create_schemas} -- Using valid postgres SQL, without comments, answer the following questions for the tables provided above. -- {user_query}",
+            "```SQL\n{table_create_schemas}\n-- Using valid postgres SQL, without comments, answer the following questions for the tables provided above.\n-- {user_query}",
             user_query=payload.query,
             table_create_schemas=table_create_stms.join("\n")
         );
-        tracing::debug!("Running prompt: {nsql_query}");
+        tracing::trace!("Running prompt: {nsql_query}");
 
-        let mut model = nsql_model.write().await;
-        match model.deref_mut().run(nsql_query).await {
+        // Run prompt through model. Only OpenAI is loaded at runtime.
+        let result = if payload.runtime == NSQLRuntime::Openai {
+            match create_nsql(&NSQLRuntime::Openai) {
+                Ok(mut openai_nsql) => openai_nsql.run(nsql_query).await,
+                Err(e) => {
+                    tracing::error!("Failed to load OpenAI NQL model: {e:#?}");
+                    return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+                }
+            }
+        } else {
+            nsql_model.write().await.run(nsql_query).await
+        };
+
+        // Run the SQL from the NSQL model through datafusion.
+        match result {
             Ok(Some(model_sql_query)) => {
-                tracing::debug!("Running query: {model_sql_query}");
-                match readable_df
-                    .ctx
-                    .sql(&remove_prefix_dashes(&model_sql_query))
-                    .await
-                {
+                let cleaned_query = clean_model_based_sql(&model_sql_query);
+                tracing::trace!("Running query:\n{cleaned_query}");
+                match readable_df.ctx.sql(&cleaned_query).await {
                     Ok(result) => dataframe_to_response(result).await,
                     Err(e) => {
                         tracing::trace!("Error running query: {e}");
