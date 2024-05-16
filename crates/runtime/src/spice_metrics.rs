@@ -88,7 +88,7 @@ impl MetricsRecorder {
 
     async fn tick(
         socket_addr: &SocketAddr,
-        data_fusion: &Arc<RwLock<DataFusion>>,
+        datafusion: &Arc<RwLock<DataFusion>>,
         table: &Arc<InternalTable>,
     ) -> Result<(), Error> {
         let body = reqwest::get(format!("http://{socket_addr}/metrics"))
