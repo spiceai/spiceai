@@ -158,7 +158,7 @@ impl ObjectStore for SFTPObjectStore {
 
         let mut start = 0;
         let mut end = object_meta.size;
-        let mut data_to_read = object_meta.size;
+        let mut data_to_read = end;
 
         if let Some(GetRange::Bounded(range)) = options.range {
             data_to_read = range.end - range.start;
@@ -166,7 +166,7 @@ impl ObjectStore for SFTPObjectStore {
             end = range.end;
         }
 
-        let (sender, mut receiver) = mpsc::channel(32);
+        let (sender, mut receiver) = mpsc::channel(100);
         tokio::spawn(async move {
             let res = file.seek(SeekFrom::Start(start as u64)).map_err(|e| {
                 object_store::Error::Generic {
@@ -179,7 +179,7 @@ impl ObjectStore for SFTPObjectStore {
             }
 
             let mut total = 0;
-            let mut buf = vec![0; 4096];
+            let mut buf = vec![0; 100000];
             loop {
                 if total > data_to_read {
                     break;
@@ -212,15 +212,7 @@ impl ObjectStore for SFTPObjectStore {
 
         let stream = stream! {
             while let Some(data) = receiver.recv().await {
-                match data {
-                    Ok(data) => {
-                        yield Ok(data);
-                    }
-                    Err(e) => {
-                        yield Err(e);
-                        break;
-                    }
-                }
+               yield data;
             }
         };
 
