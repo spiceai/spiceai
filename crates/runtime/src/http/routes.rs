@@ -17,6 +17,7 @@ limitations under the License.
 use crate::{config, datafusion::DataFusion};
 use app::App;
 use axum::routing::patch;
+use llms::nql::LlmRuntime;
 use model_components::model::Model;
 use std::net::SocketAddr;
 use std::{collections::HashMap, sync::Arc};
@@ -55,11 +56,7 @@ pub(crate) fn routes(
             patch(v1::datasets::acceleration),
         )
         .route("/v1/spicepods", get(v1::spicepods::get))
-        .route_layer(middleware::from_fn(track_metrics))
-        .layer(Extension(app))
-        .layer(Extension(df))
-        .layer(Extension(with_metrics))
-        .layer(Extension(config));
+        .route_layer(middleware::from_fn(track_metrics));
 
     if cfg!(feature = "models") {
         router = router
@@ -67,8 +64,22 @@ pub(crate) fn routes(
             .route("/v1/models/:name/predict", get(v1::inference::get))
             .route("/v1/predict", post(v1::inference::post))
             .layer(Extension(models));
+
+        match llms::nql::try_duckdb_from_spice_local(&LlmRuntime::Mistral) {
+            Ok(duck_nql) => {
+                router = router
+                    .route("/v1/nsql", post(v1::nsql::post))
+                    .layer(Extension(Arc::new(RwLock::new(duck_nql))));
+            }
+            Err(e) => tracing::error!("Failed to load DuckDB NQL model: {e:#?}"),
+        }
     }
 
+    router = router
+        .layer(Extension(app))
+        .layer(Extension(df))
+        .layer(Extension(with_metrics))
+        .layer(Extension(config));
     router
 }
 

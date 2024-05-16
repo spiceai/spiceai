@@ -23,6 +23,7 @@ use std::{
 
 use async_trait::async_trait;
 use clickhouse_rs::{ClientHandle, Options, Pool};
+use ns_lookup::verify_ns_lookup_and_tcp_connect;
 use secrets::{get_secret_or_param, Secret};
 use snafu::{ResultExt, Snafu};
 use url::Url;
@@ -32,7 +33,8 @@ use crate::{
     JoinPushDown,
 };
 
-use super::{DbConnectionPool, Result};
+use super::DbConnectionPool;
+pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -55,6 +57,20 @@ pub enum Error {
     #[snafu(display("ConnectionPoolRunError: {source}"))]
     ConnectionPoolRunError {
         source: clickhouse_rs::errors::Error,
+    },
+
+    #[snafu(display(
+        "Authentication failed. Ensure that the username and password are correctly configured."
+    ))]
+    InvalidUsernameOrPasswordError {
+        source: clickhouse_rs::errors::Error,
+    },
+
+    #[snafu(display("Cannot connect to ClickHouse on {host}:{port}. Ensure that the host and port are correctly configured, and that the host is reachable."))]
+    InvalidHostOrPortError {
+        source: Box<dyn std::error::Error + Sync + Send>,
+        host: String,
+        port: String,
     },
 
     #[snafu(display("No parameters specified"))]
@@ -84,7 +100,6 @@ impl ClickhouseConnectionPool {
     /// # Errors
     ///
     /// Returns an error if there is a problem creating the connection pool.
-    #[allow(clippy::unused_async)]
     pub async fn new(
         params: Arc<Option<HashMap<String, String>>>,
         secret: Option<Secret>,
@@ -93,7 +108,7 @@ impl ClickhouseConnectionPool {
             Some(params) => params,
             None => ParametersEmptySnafu {}.fail()?,
         };
-        let (options, compute_context) = get_config_from_params(params, &secret)?;
+        let (options, compute_context) = get_config_from_params(params, &secret).await?;
 
         let pool = Pool::new(options);
 
@@ -108,7 +123,7 @@ const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Returns a Clickhouse `Options` based on user-provided parameters.
 /// Also returns the sanitized connection string for use as a federation compute_context.
-fn get_config_from_params(
+async fn get_config_from_params(
     params: &HashMap<String, String>,
     secret: &'_ Option<Secret>,
 ) -> Result<(Options, String)> {
@@ -145,6 +160,14 @@ fn get_config_from_params(
                     parameter_name: "clickhouse_port".to_string(),
                 },
             )?;
+
+            let port_in_usize = u16::from_str(port)
+                .map_err(std::convert::Into::into)
+                .context(InvalidHostOrPortSnafu { host, port })?;
+            verify_ns_lookup_and_tcp_connect(host, port_in_usize)
+                .await
+                .map_err(std::convert::Into::into)
+                .context(InvalidHostOrPortSnafu { host, port })?;
             let db = params.get("clickhouse_db").ok_or(
                 Error::MissingRequiredParameterForConnection {
                     parameter_name: "clickhouse_db".to_string(),
@@ -188,9 +211,34 @@ fn get_config_from_params(
 
 #[async_trait]
 impl DbConnectionPool<ClientHandle, &'static (dyn Sync)> for ClickhouseConnectionPool {
-    async fn connect(&self) -> Result<Box<dyn DbConnection<ClientHandle, &'static (dyn Sync)>>> {
+    async fn connect(
+        &self,
+    ) -> super::Result<Box<dyn DbConnection<ClientHandle, &'static (dyn Sync)>>> {
         let pool = Arc::clone(&self.pool);
-        let conn = pool.get_handle().await.context(ConnectionPoolRunSnafu)?;
+        let conn = match pool.get_handle().await {
+            Ok(conn) => Ok(conn),
+            Err(e) => match e {
+                clickhouse_rs::errors::Error::Driver(_)
+                | clickhouse_rs::errors::Error::Io(_)
+                | clickhouse_rs::errors::Error::Connection(_)
+                | clickhouse_rs::errors::Error::Other(_)
+                | clickhouse_rs::errors::Error::Url(_)
+                | clickhouse_rs::errors::Error::FromSql(_) => {
+                    Err(Error::ConnectionPoolRunError { source: e })
+                }
+                clickhouse_rs::errors::Error::Server(server_error) => {
+                    if server_error.code == 516 {
+                        Err(Error::InvalidUsernameOrPasswordError {
+                            source: server_error.into(),
+                        })
+                    } else {
+                        Err(Error::ConnectionPoolRunError {
+                            source: server_error.into(),
+                        })
+                    }
+                }
+            },
+        }?;
         Ok(Box::new(ClickhouseConnection::new(
             conn,
             Arc::clone(&self.pool),

@@ -111,29 +111,25 @@ impl Refresher {
                     };
 
                     if data_update.data.is_empty() {
-                        if let Some(sender) = ready_sender.take() {
-                            sender.send(()).ok();
-                        };
+                        self.notify_refresh_done(&mut ready_sender, status::ComponentStatus::Ready);
                         continue;
                     };
 
                     if let Some(data) = data_update.data.first() {
                         if data.columns().is_empty() {
-                            if let Some(sender) = ready_sender.take() {
-                                sender.send(()).ok();
-                            };
+                            self.notify_refresh_done(
+                                &mut ready_sender,
+                                status::ComponentStatus::Ready,
+                            );
                             continue;
                         }
                     };
 
-                    let state = ctx.state();
-
                     let overwrite = data_update.update_type == UpdateType::Overwrite;
-
                     match self
                         .accelerator
                         .insert_into(
-                            &state,
+                            &ctx.state(),
                             Arc::new(DataUpdateExecutionPlan::new(data_update)),
                             overwrite,
                         )
@@ -142,11 +138,16 @@ impl Refresher {
                         Ok(plan) => {
                             if let Err(e) = collect(plan, ctx.task_ctx()).await {
                                 tracing::error!("Error adding data for {dataset_name}: {e}");
-                            } else if let Some(sender) = ready_sender.take() {
-                                sender.send(()).ok();
+                                self.mark_dataset_status(status::ComponentStatus::Error);
+                            } else {
+                                self.notify_refresh_done(
+                                    &mut ready_sender,
+                                    status::ComponentStatus::Ready,
+                                );
                             };
                         }
                         Err(e) => {
+                            self.mark_dataset_status(status::ComponentStatus::Error);
                             tracing::error!("Error adding data for {dataset_name}: {e}");
                         }
                     }
@@ -433,6 +434,21 @@ impl Refresher {
             refresh.time_format.clone(),
         )
     }
+
+    fn notify_refresh_done(
+        &self,
+        ready_sender: &mut Option<oneshot::Sender<()>>,
+        status: status::ComponentStatus,
+    ) {
+        if let Some(sender) = ready_sender.take() {
+            sender.send(()).ok();
+        };
+        self.mark_dataset_status(status);
+    }
+
+    fn mark_dataset_status(&self, status: status::ComponentStatus) {
+        status::update_dataset(self.dataset_name.as_str(), status);
+    }
 }
 
 pub(crate) fn get_timestamp(time: SystemTime) -> u128 {
@@ -448,86 +464,95 @@ mod tests {
         datatypes::{DataType, Schema},
     };
     use data_components::arrow::write::MemTable;
-    use tokio::sync::mpsc;
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    use tokio::{sync::mpsc, time::timeout};
 
     use super::*;
 
+    async fn setup_and_test(
+        source_data: Vec<&str>,
+        existing_data: Vec<&str>,
+        expected_size: usize,
+    ) {
+        let schema = Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
+            "time_in_string",
+            DataType::Utf8,
+            false,
+        )]));
+        let arr = StringArray::from(source_data);
+
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(arr)])
+            .expect("data should be created");
+
+        let federated = Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![batch]])
+                .expect("mem table should be created"),
+        );
+
+        let arr = StringArray::from(existing_data);
+
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(arr)])
+            .expect("data should be created");
+
+        let accelerator = Arc::new(
+            MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+
+        let refresh = Refresh::new(None, None, None, None, RefreshMode::Full, None);
+
+        let refresher = Refresher::new(
+            "test".to_string(),
+            federated,
+            Arc::new(RwLock::new(refresh)),
+            Arc::clone(&accelerator),
+        );
+
+        let (trigger, receiver) = mpsc::channel::<()>(1);
+        let (ready_sender, is_ready) = oneshot::channel::<()>();
+        let acceleration_refresh_mode = AccelerationRefreshMode::Full(receiver);
+        let refresh_handle = tokio::spawn(async move {
+            refresher
+                .start(acceleration_refresh_mode, ready_sender)
+                .await;
+        });
+
+        trigger
+            .send(())
+            .await
+            .expect("trigger sent correctly to refresh");
+
+        timeout(Duration::from_secs(2), async move {
+            is_ready.await.expect("data is received");
+        })
+        .await
+        .expect("finish before the timeout");
+
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+
+        let plan = accelerator
+            .scan(&state, None, &[], None)
+            .await
+            .expect("Scan plan can be constructed");
+
+        let result = collect(plan, ctx.task_ctx())
+            .await
+            .expect("Query successful");
+
+        assert_eq!(expected_size, result.first().expect("result").num_rows());
+
+        drop(refresh_handle);
+    }
+
     #[tokio::test]
     async fn test_refresh_full() {
-        async fn test(source_data: Vec<&str>, existing_data: Vec<&str>, expected_size: usize) {
-            let schema = Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
-                "time_in_string",
-                DataType::Utf8,
-                false,
-            )]));
-            let arr = StringArray::from(source_data);
-
-            let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(arr)])
-                .expect("data should be created");
-
-            let federated = Arc::new(
-                MemTable::try_new(Arc::clone(&schema), vec![vec![batch]])
-                    .expect("mem table should be created"),
-            );
-
-            let arr = StringArray::from(existing_data);
-
-            let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(arr)])
-                .expect("data should be created");
-
-            let accelerator = Arc::new(
-                MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created"),
-            ) as Arc<dyn TableProvider>;
-
-            let refresh = Refresh::new(None, None, None, None, RefreshMode::Full, None);
-
-            let refresher = Refresher::new(
-                "test".to_string(),
-                federated,
-                Arc::new(RwLock::new(refresh)),
-                Arc::clone(&accelerator),
-            );
-
-            let (trigger, receiver) = mpsc::channel::<()>(1);
-            let (ready_sender, is_ready) = oneshot::channel::<()>();
-            let acceleration_refresh_mode = AccelerationRefreshMode::Full(receiver);
-            let refresh_handle = tokio::spawn(async move {
-                refresher
-                    .start(acceleration_refresh_mode, ready_sender)
-                    .await;
-            });
-
-            trigger
-                .send(())
-                .await
-                .expect("trigger sent correctly to refresh");
-
-            is_ready.await.expect("data is received");
-
-            let ctx = SessionContext::new();
-            let state = ctx.state();
-
-            let plan = accelerator
-                .scan(&state, None, &[], None)
-                .await
-                .expect("Scan plan can be constructed");
-
-            let result = collect(plan, ctx.task_ctx())
-                .await
-                .expect("Query successful");
-
-            assert_eq!(expected_size, result.first().expect("result").num_rows());
-
-            drop(refresh_handle);
-        }
-
-        test(
+        setup_and_test(
             vec!["1970-01-01", "2012-12-01T11:11:11Z", "2012-12-01T11:11:12Z"],
             vec![],
             3,
         )
         .await;
-        test(
+        setup_and_test(
             vec!["1970-01-01", "2012-12-01T11:11:11Z", "2012-12-01T11:11:12Z"],
             vec![
                 "1970-01-01",
@@ -538,7 +563,7 @@ mod tests {
             3,
         )
         .await;
-        test(
+        setup_and_test(
             vec![],
             vec![
                 "1970-01-01",
@@ -549,6 +574,41 @@ mod tests {
             0,
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn test_refresh_status_change_to_ready() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        metrics::set_global_recorder(recorder).expect("recorder is set globally");
+
+        status::update_dataset("test", status::ComponentStatus::Refreshing);
+
+        setup_and_test(
+            vec!["1970-01-01", "2012-12-01T11:11:11Z", "2012-12-01T11:11:12Z"],
+            vec![],
+            3,
+        )
+        .await;
+
+        let hashmap = snapshotter.snapshot().into_vec();
+        let (_, _, _, value) = hashmap.first().expect("at least one metric exists");
+        assert_eq!(
+            value,
+            &DebugValue::Gauge((status::ComponentStatus::Ready as i32).into())
+        );
+
+        status::update_dataset("test", status::ComponentStatus::Refreshing);
+
+        setup_and_test(vec![], vec![], 0).await;
+
+        let hashmap = snapshotter.snapshot().into_vec();
+        let (_, _, _, value) = hashmap.first().expect("at least one metric exists");
+        assert_eq!(
+            value,
+            &DebugValue::Gauge((status::ComponentStatus::Ready as i32).into())
+        );
     }
 
     #[allow(clippy::too_many_lines)]
@@ -608,13 +668,16 @@ mod tests {
                     .start(acceleration_refresh_mode, ready_sender)
                     .await;
             });
-
             trigger
                 .send(())
                 .await
                 .expect("trigger sent correctly to refresh");
 
-            is_ready.await.expect("data is received");
+            timeout(Duration::from_secs(2), async move {
+                is_ready.await.expect("data is received");
+            })
+            .await
+            .expect("finish before the timeout");
 
             let ctx = SessionContext::new();
             let state = ctx.state();
