@@ -80,6 +80,9 @@ pub enum Error {
     #[snafu(display("Unable to get table: {source}"))]
     UnableToGetTable { source: DataFusionError },
 
+    #[snafu(display("Unable to list tables: {source}"))]
+    UnableToGetTables { source: DataFusionError },
+
     #[snafu(display("Unable to resolve table provider: {source}"))]
     UnableToResolveTableProvider { source: DataConnectorError },
 
@@ -132,6 +135,12 @@ pub enum Error {
 
     #[snafu(display("Schema mismatch: {source}"))]
     SchemaMismatch { source: arrow_tools::schema::Error },
+
+    #[snafu(display("The catalog {catalog} is not registered."))]
+    CatalogMissing { catalog: String },
+
+    #[snafu(display("The schema {schema} is not registered."))]
+    SchemaMissing { schema: String },
 }
 
 pub enum Table {
@@ -606,6 +615,20 @@ impl DataFusion {
         });
 
         Ok(())
+    }
+
+    pub fn get_public_table_names(&self) -> Result<Vec<String>> {
+        Ok(self
+            .ctx
+            .catalog(SPICE_DEFAULT_CATALOG)
+            .context(CatalogMissingSnafu {
+                catalog: SPICE_DEFAULT_CATALOG.to_string(),
+            })?
+            .schema(SPICE_DEFAULT_SCHEMA)
+            .context(SchemaMissingSnafu {
+                schema: SPICE_DEFAULT_SCHEMA.to_string(),
+            })?
+            .table_names())
     }
 }
 

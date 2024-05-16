@@ -14,7 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use arrow::array::RecordBatch;
+use axum::{
+    http::StatusCode,
+    response::{IntoResponse, Response},
+};
 use csv::Writer;
+use datafusion::dataframe::DataFrame;
 use serde::{Deserialize, Serialize};
 use spicepod::component::dataset::Dataset;
 
@@ -43,6 +49,40 @@ fn dataset_status(df: &DataFusion, ds: &Dataset) -> ComponentStatus {
     } else {
         ComponentStatus::Error
     }
+}
+
+// Prepare a dataframe for Response (as JSON).
+async fn dataframe_to_response(data_frame: DataFrame) -> Response {
+    let results = match data_frame.collect().await {
+        Ok(results) => results,
+        Err(e) => {
+            tracing::debug!("Error collecting results: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
+    };
+
+    let buf = Vec::new();
+    let mut writer = arrow_json::ArrayWriter::new(buf);
+
+    if let Err(e) = writer.write_batches(results.iter().collect::<Vec<&RecordBatch>>().as_slice()) {
+        tracing::debug!("Error converting results to JSON: {e}");
+        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+    }
+    if let Err(e) = writer.finish() {
+        tracing::debug!("Error finishing JSON conversion: {e}");
+        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+    }
+
+    let buf = writer.into_inner();
+    let res = match String::from_utf8(buf) {
+        Ok(res) => res,
+        Err(e) => {
+            tracing::debug!("Error converting JSON buffer to string: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
+    };
+
+    (StatusCode::OK, res).into_response()
 }
 
 pub(crate) mod query {
@@ -890,6 +930,101 @@ pub(crate) mod inference {
                     prediction: None,
                     duration_ms: start_time.elapsed().as_millis(),
                 }
+            }
+        }
+    }
+}
+
+pub(crate) mod nsql {
+    use arrow_sql_gen::statement::CreateTableBuilder;
+    use axum::{
+        http::StatusCode,
+        response::{IntoResponse, Response},
+        Extension, Json,
+    };
+    use llms::nql::Nql;
+    use serde::{Deserialize, Serialize};
+    use std::{ops::DerefMut, sync::Arc};
+    use tokio::sync::RwLock;
+
+    use crate::{datafusion::DataFusion, http::v1::dataframe_to_response};
+
+    fn remove_prefix_dashes(input: &str) -> String {
+        match input.strip_prefix("--") {
+            Some(rest) => rest.to_string(),
+            None => input.to_string(),
+        }
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    pub struct Request {
+        pub query: String,
+    }
+
+    pub(crate) async fn post(
+        Extension(df): Extension<Arc<RwLock<DataFusion>>>,
+        Extension(nsql_model): Extension<Arc<RwLock<Box<dyn Nql>>>>,
+        Json(payload): Json<Request>,
+    ) -> Response {
+        let readable_df = df.read().await;
+
+        let tables = match readable_df.get_public_table_names() {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::trace!("Error getting tables: {e}");
+                return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+            }
+        };
+
+        let mut table_create_stms: Vec<String> = Vec::with_capacity(tables.len());
+        for t in &tables {
+            match readable_df.get_arrow_schema(t).await {
+                Ok(schm) => {
+                    let c = CreateTableBuilder::new(Arc::new(schm), format!("public.{t}").as_str());
+                    table_create_stms.push(c.build_postgres());
+                }
+                Err(e) => {
+                    tracing::trace!("Error getting table={t} schema: {e}");
+                    return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+                }
+            }
+        }
+
+        let nsql_query = format!(
+            "{table_create_schemas} -- Using valid postgres SQL, without comments, answer the following questions for the tables provided above. -- {user_query}",
+            user_query=payload.query,
+            table_create_schemas=table_create_stms.join("\n")
+        );
+        tracing::debug!("Running prompt: {nsql_query}");
+
+        let mut model = nsql_model.write().await;
+        match model.deref_mut().run(nsql_query).await {
+            Ok(Some(model_sql_query)) => {
+                tracing::debug!("Running query: {model_sql_query}");
+                match readable_df
+                    .ctx
+                    .sql(&remove_prefix_dashes(&model_sql_query))
+                    .await
+                {
+                    Ok(result) => dataframe_to_response(result).await,
+                    Err(e) => {
+                        tracing::trace!("Error running query: {e}");
+                        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+                    }
+                }
+            }
+            Ok(None) => {
+                tracing::trace!("No query produced from NSQL model");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "No query produced from NSQL model".to_string(),
+                )
+                    .into_response()
+            }
+            Err(e) => {
+                tracing::trace!("Error running NSQL model: {e}");
+                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
             }
         }
     }

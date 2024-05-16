@@ -43,7 +43,8 @@ duckdb = { workspace = true, features = [
     "vtab-arrow",
 ], optional = true }
 sql_provider_datafusion = { path = "../sql_provider_datafusion", optional = true }
-model_components = { path = "../model_components" }
+model_components = { path = "../model_components"}
+llms = { path = "../llms" }
 r2d2 = { workspace = true, optional = true }
 opentelemetry-proto = { version = "0.4.0", features = [
     "gen-tonic-messages",
@@ -59,7 +60,7 @@ async-trait.workspace = true
 itertools = "0.12"
 object_store = { version = "0.9.1", features = ["aws"] }
 url = "2.5.0"
-arrow_sql_gen = { path = "../arrow_sql_gen", optional = true }
+arrow_sql_gen = { path = "../arrow_sql_gen" }
 arrow_tools = { path = "../arrow_tools" }
 bb8 = { workspace = true, optional = true }
 bb8-postgres = { workspace = true, optional = true }
@@ -140,5 +141,5 @@ dremio = []
 odbc = ["db_connection_pool/odbc", "data_components/odbc", "dep:odbc-api"]
 ftp = ["dep:suppaftp"]
 snowflake = ["dep:snowflake-api", "db_connection_pool/snowflake", "data_components/snowflake"]
-models = ["model_components/full"]
+models = ["model_components/full", "llms/mistralrs"]
 federation-experimental = ["dep:datafusion-federation", "data_components/federation-experimental"]
