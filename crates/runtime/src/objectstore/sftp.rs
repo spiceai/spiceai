@@ -30,7 +30,7 @@ use object_store::{
     ObjectMeta, ObjectStore, PutOptions, PutResult,
 };
 use ssh2::Session;
-use tokio::{io::AsyncWrite, sync::mpsc};
+use tokio::io::AsyncWrite;
 
 #[derive(Debug)]
 pub struct SFTPObjectStore {
@@ -166,37 +166,26 @@ impl ObjectStore for SFTPObjectStore {
             end = range.end;
         }
 
-        let (sender, mut receiver) = mpsc::channel(100);
-        tokio::spawn(async move {
-            let res = file.seek(SeekFrom::Start(start as u64)).map_err(|e| {
+        let stream = stream! {
+            file.seek(SeekFrom::Start(start as u64)).map_err(|e| {
                 object_store::Error::Generic {
                     store: "SFTP",
                     source: e.into(),
                 }
-            });
-            if let Err(e) = res {
-                let _ = sender.send(Err(e)).await;
-            }
+            })?;
 
             let mut total = 0;
-            let mut buf = vec![0; 100000];
+            let mut buf = vec![0; 4096];
             loop {
                 if total > data_to_read {
                     break;
                 }
-                let n = file
+                let mut n = file
                     .read(&mut buf)
                     .map_err(|e| object_store::Error::Generic {
                         store: "SFTP",
                         source: e.into(),
-                    });
-                let mut n = match n {
-                    Ok(n) => n,
-                    Err(e) => {
-                        let _ = sender.send(Err(e)).await;
-                        break;
-                    }
-                };
+                    })?;
 
                 total += n;
                 if n == 0 {
@@ -206,13 +195,7 @@ impl ObjectStore for SFTPObjectStore {
                     n -= total - data_to_read;
                 }
 
-                let _ = sender.send(Ok(Bytes::copy_from_slice(&buf[..n]))).await;
-            }
-        });
-
-        let stream = stream! {
-            while let Some(data) = receiver.recv().await {
-               yield data;
+                yield Ok(Bytes::copy_from_slice(&buf[..n]))
             }
         };
 
