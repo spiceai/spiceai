@@ -154,7 +154,7 @@ pub fn get_metrics_schema() -> Arc<Schema> {
         //     false,
         // ),
         Field::new("timestamp", DataType::Int64, false),
-        Field::new("metric", DataType::Utf8, false),
+        Field::new("name", DataType::Utf8, false),
         Field::new("value", DataType::Float64, false),
         Field::new("labels", DataType::Utf8, false),
     ];
