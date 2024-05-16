@@ -21,6 +21,7 @@ use std::time::Duration;
 use arrow::array::{Float64Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
 use snafu::prelude::*;
 use spicepod::component::dataset::acceleration::Acceleration;
@@ -33,7 +34,7 @@ use crate::accelerated_table::Retention;
 use crate::datafusion::DataFusion;
 use crate::datafusion::Error as DataFusionError;
 use crate::dataupdate::DataUpdate;
-use crate::internal_table::{self, InternalTable};
+use crate::internal_table::{create_internal_accelerated_table, Error as InternalTableError};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -50,16 +51,16 @@ pub enum Error {
     UnableToWriteToMetricsTable { source: DataFusionError },
 
     #[snafu(display("Error creating metrics table: {source}"))]
-    UnableToCreateMetricsTable { source: internal_table::Error },
+    UnableToCreateMetricsTable { source: InternalTableError },
 }
 
 pub struct MetricsRecorder {
     socket_addr: Arc<SocketAddr>,
-    metrics_table: Arc<InternalTable>,
+    metrics_table: Arc<dyn TableProvider>,
 }
 
 impl MetricsRecorder {
-    pub fn metrics_table(&self) -> Arc<InternalTable> {
+    pub fn metrics_table(&self) -> Arc<dyn TableProvider> {
         Arc::clone(&self.metrics_table)
     }
 }
@@ -74,7 +75,7 @@ impl MetricsRecorder {
             true,
         );
 
-        let internal_table = InternalTable::new(
+        let metrics_table = create_internal_accelerated_table(
             "metrics",
             get_metrics_schema(),
             Acceleration::default(),
@@ -86,7 +87,7 @@ impl MetricsRecorder {
 
         Ok(Self {
             socket_addr: Arc::new(socket_addr),
-            metrics_table: Arc::new(internal_table),
+            metrics_table,
         })
     }
 

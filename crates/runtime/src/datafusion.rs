@@ -252,8 +252,8 @@ impl DataFusion {
         name: &str,
         table: Arc<dyn datafusion::datasource::TableProvider>,
     ) -> Result<()> {
-        if let Some(system_schema) = self.runtime_schema() {
-            system_schema
+        if let Some(runtime_schema) = self.runtime_schema() {
+            runtime_schema
                 .register_table(name.to_string(), table)
                 .context(UnableToRegisterTableToDataFusionSchemaSnafu { schema: "runtime" })?;
 

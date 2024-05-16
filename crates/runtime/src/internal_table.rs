@@ -17,6 +17,7 @@ limitations under the License.
 use std::sync::Arc;
 
 use arrow::datatypes::Schema;
+use datafusion::datasource::TableProvider;
 use snafu::prelude::*;
 
 use crate::accelerated_table::Retention;
@@ -30,9 +31,6 @@ use spicepod::component::dataset::{acceleration::Acceleration, Dataset, Mode};
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Unable to create data connector"))]
-    NoDataConnector {},
-
-    #[snafu(display("Unable to create data connector"))]
     NoReadWriteProvider {},
 
     #[snafu(display("Unable to create accelerated table provider"))]
@@ -42,60 +40,49 @@ pub enum Error {
     UnableToCreateAcceleratedTableProvider { source: dataaccelerator::Error },
 }
 
-pub struct InternalTable {
-    name: String,
-    accelerated_table: Arc<AcceleratedTable>,
+async fn get_local_table_provider(
+    name: &str,
+    schema: &Arc<Schema>,
+) -> Result<Arc<dyn TableProvider>, Error> {
+    let mut dataset = Dataset::new("internal".to_string(), name.to_string());
+    dataset.mode = Mode::ReadWrite;
+
+    let data_connector =
+        Arc::new(LocalhostConnector::new(Arc::clone(schema))) as Arc<dyn DataConnector>;
+
+    let source_table_provider = data_connector
+        .read_write_provider(&dataset)
+        .await
+        .ok_or_else(|| NoReadWriteProviderSnafu {}.build())?
+        .context(UnableToCreateSourceTableProviderSnafu)?;
+
+    Ok(source_table_provider)
 }
 
-impl InternalTable {
-    #[must_use]
-    pub fn name(&self) -> &str {
-        &self.name
-    }
+pub async fn create_internal_accelerated_table(
+    name: &str,
+    schema: Arc<Schema>,
+    acceleration: Acceleration,
+    refresh: Refresh,
+    retention: Option<Retention>,
+) -> Result<Arc<AcceleratedTable>, Error> {
+    let source_table_provider = get_local_table_provider(name, &schema).await?;
 
-    #[must_use]
-    pub fn accelerated_table(&self) -> Arc<AcceleratedTable> {
-        Arc::clone(&self.accelerated_table)
-    }
-
-    pub async fn new(
-        name: &str,
-        schema: Arc<Schema>,
-        acceleration: Acceleration,
-        refresh: Refresh,
-        retention: Option<Retention>,
-    ) -> Result<Self, Error> {
-        let mut dataset = Dataset::new("internal".to_string(), name.to_string());
-        dataset.mode = Mode::ReadWrite;
-
-        let data_connector =
-            Arc::new(LocalhostConnector::new(Arc::clone(&schema))) as Arc<dyn DataConnector>;
-
-        let source_table_provider = data_connector
-            .read_write_provider(&dataset)
+    let accelerated_table_provider =
+        create_accelerator_table(name, Arc::clone(&schema), &acceleration, None)
             .await
-            .ok_or_else(|| NoReadWriteProviderSnafu {}.build())?
-            .context(UnableToCreateSourceTableProviderSnafu)?;
+            .context(UnableToCreateAcceleratedTableProviderSnafu)?;
 
-        let accelerated_table_provider =
-            create_accelerator_table(name, Arc::clone(&schema), &acceleration, None)
-                .await
-                .context(UnableToCreateAcceleratedTableProviderSnafu)?;
+    let mut builder = AcceleratedTable::builder(
+        name.to_string(),
+        source_table_provider,
+        accelerated_table_provider,
+        refresh,
+    );
 
-        let mut builder = AcceleratedTable::builder(
-            name.to_string(),
-            source_table_provider,
-            accelerated_table_provider,
-            refresh,
-        );
+    builder.retention(retention);
 
-        builder.retention(retention);
+    let (accelerated_table, _) = builder.build().await;
 
-        let (accelerated_table, _) = builder.build().await;
-
-        Ok(Self {
-            name: name.to_string(),
-            accelerated_table: Arc::new(accelerated_table),
-        })
-    }
+    Ok(Arc::new(accelerated_table))
 }

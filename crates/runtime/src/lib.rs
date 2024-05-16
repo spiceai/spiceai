@@ -688,12 +688,10 @@ impl Runtime {
                 .await
                 .context(UnableToStartLocalMetricsSnafu)?;
 
-            let metrics_table = recorder.metrics_table();
-
             self.df
                 .write()
                 .await
-                .register_runtime_table(metrics_table.name(), metrics_table.accelerated_table())
+                .register_runtime_table("metrics", recorder.metrics_table())
                 .context(UnableToRegisterMetricsTableSnafu)?;
 
             recorder.start(&Arc::clone(&self.df));
