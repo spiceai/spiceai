@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use arrow_flight::{flight_service_server::FlightService, FlightData, SchemaAsIpc};
 use arrow_ipc::writer::{self, DictionaryTracker, IpcDataGenerator};
+use datafusion::sql::TableReference;
 use futures::{stream, StreamExt};
 use tokio::sync::broadcast;
 use tonic::{Request, Response, Status, Streaming};
@@ -63,7 +64,12 @@ pub(crate) async fn handle(
 
     let data_path = flight_descriptor.path.join(".");
 
-    if !flight_svc.datafusion.read().await.is_writable(&data_path) {
+    if !flight_svc
+        .datafusion
+        .read()
+        .await
+        .is_writable(&TableReference::bare(data_path.to_string()))
+    {
         return Err(Status::invalid_argument(format!(
             r#"Unknown dataset: "{data_path}""#,
         )));
