@@ -139,11 +139,20 @@ impl Read for PostgresTableFactory {
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         let pool = Arc::clone(&self.pool);
         let dyn_pool: Arc<DynPostgresConnectionPool> = pool;
-        let table_provider = SqlTable::new("postgres", &dyn_pool, table_reference, None)
-            .await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        let table_provider = Arc::new(
+            SqlTable::new("postgres", &dyn_pool, table_reference, None)
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?,
+        );
 
-        Ok(Arc::new(table_provider))
+        #[cfg(feature = "federation-experimental")]
+        let table_provider = Arc::new(
+            table_provider
+                .create_federated_table_provider()
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?,
+        );
+
+        Ok(table_provider)
     }
 }
 
