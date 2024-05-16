@@ -1,11 +1,9 @@
-use crate::nql::FailedToRunModelSnafu;
-
 /*
 Copyright 2024 The Spice.ai OSS Authors
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
-     https://www.apache.org/licenses/LICENSE-2.0
+https://www.apache.org/licenses/LICENSE-2.0
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -13,6 +11,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use super::{FailedToLoadModelSnafu, Nql, Result};
+use crate::nql::FailedToRunModelSnafu;
 
 use async_openai::{config::OpenAIConfig, types::CreateCompletionRequestArgs, Client};
 use async_trait::async_trait;
@@ -63,7 +62,6 @@ impl Nql for Openai {
 
         if let Some(usage) = response.usage {
             if usage.completion_tokens >= u32::from(MAX_COMPLETION_TOKENS) {
-                // Convert u16 to u32
                 tracing::warn!(
                     "Completion response may have been cut off after {} tokens",
                     MAX_COMPLETION_TOKENS
