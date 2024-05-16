@@ -2447,6 +2447,8 @@ dependencies = [
  "bb8-postgres",
  "clickhouse-rs",
  "datafusion",
+ "datafusion-federation",
+ "datafusion-federation-sql",
  "db_connection_pool",
  "deltalake",
  "duckdb",

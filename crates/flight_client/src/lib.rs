@@ -79,6 +79,7 @@ pub struct FlightClient {
     flight_client: FlightServiceClient<Channel>,
     username: String,
     password: String,
+    url: String,
 }
 
 impl FlightClient {
@@ -104,6 +105,7 @@ impl FlightClient {
             token: None,
             username: username.to_string(),
             password: password.to_string(),
+            url: url.to_string(),
         })
     }
 
@@ -302,5 +304,13 @@ impl FlightClient {
             self.token = Some(auth["Bearer ".len()..].to_string());
         }
         Ok(())
+    }
+
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    pub fn username(&self) -> &str {
+        &self.username
     }
 }
