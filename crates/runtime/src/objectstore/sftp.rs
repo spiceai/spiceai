@@ -29,7 +29,6 @@ use object_store::{
     path::Path, GetOptions, GetRange, GetResult, GetResultPayload, ListResult, MultipartId,
     ObjectMeta, ObjectStore, PutOptions, PutResult,
 };
-use snafu::Snafu;
 use ssh2::Session;
 use tokio::io::AsyncWrite;
 
@@ -196,39 +195,47 @@ impl ObjectStore for SFTPObjectStore {
         let location = location
             .map(ToOwned::to_owned)
             .map_or("/".to_string(), |x| x.to_string());
+
         let stream = stream! {
             let client = self.get_client()?;
 
-            let list = client
-                .sftp()
-                .map_err(handle_error)?
-                .readdir(std::path::Path::new(&location))
-                .map_err(handle_error)?;
+            let mut queue = vec![location];
 
-            for entry in list {
-                yield Ok(ObjectMeta {
-                    location: Path::from(entry.0.to_str().ok_or_else(|| object_store::Error::Generic {
-                        store: "SFTP",
-                        source: "Failed to convert path".into(),
-                    })?),
-                    size: usize::try_from(entry.1.size.ok_or_else(|| object_store::Error::Generic {
-                        store: "SFTP",
-                        source: "No size found for file".into(),
-                    })?).map_err(handle_error)?,
-                    #[allow(clippy::cast_possible_wrap)]
-                    last_modified: DateTime::from_timestamp(entry.1.mtime.ok_or_else(|| object_store::Error::Generic {
+            while let Some(item) = queue.pop() {
+                let list = client
+                    .sftp()
+                    .map_err(handle_error)?
+                    .readdir(std::path::Path::new(&item))
+                    .map_err(handle_error)?;
+
+                for entry in list {
+                    if entry.1.is_dir() {
+                        queue.push(entry.0.to_string_lossy().to_string());
+                        continue;
+                    }
+                    yield Ok(ObjectMeta {
+                        location: Path::from(entry.0.to_str().ok_or_else(|| object_store::Error::Generic {
                             store: "SFTP",
-                            source: "No modification time found for file".into(),
-                        })? as i64, 0)
-                        .ok_or_else(|| object_store::Error::Generic {
+                            source: "Failed to convert path".into(),
+                        })?),
+                        size: usize::try_from(entry.1.size.ok_or_else(|| object_store::Error::Generic {
                             store: "SFTP",
-                            source: "Failed to construct DataTime".into(),
-                        })?,
-                    e_tag: None,
-                    version: None,
-                })
+                            source: "No size found for file".into(),
+                        })?).map_err(handle_error)?,
+                        #[allow(clippy::cast_possible_wrap)]
+                        last_modified: DateTime::from_timestamp(entry.1.mtime.ok_or_else(|| object_store::Error::Generic {
+                                store: "SFTP",
+                                source: "No modification time found for file".into(),
+                            })? as i64, 0)
+                            .ok_or_else(|| object_store::Error::Generic {
+                                store: "SFTP",
+                                source: "Failed to construct DataTime".into(),
+                            })?,
+                        e_tag: None,
+                        version: None,
+                    })
+                }
             }
-
         };
 
         Box::pin(Box::pin(stream))
