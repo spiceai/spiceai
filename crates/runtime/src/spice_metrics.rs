@@ -20,6 +20,8 @@ use std::time::Duration;
 
 use arrow::array::{Float64Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use datafusion::sql::TableReference;
 use snafu::prelude::*;
 use spicepod::component::dataset::acceleration::Acceleration;
 use spicepod::component::dataset::TimeFormat;
@@ -29,6 +31,8 @@ use tokio::sync::RwLock;
 use crate::accelerated_table::refresh::Refresh;
 use crate::accelerated_table::Retention;
 use crate::datafusion::DataFusion;
+use crate::datafusion::Error as DataFusionError;
+use crate::dataupdate::DataUpdate;
 use crate::internal_table::{self, InternalTable};
 
 #[derive(Debug, Snafu)]
@@ -43,7 +47,7 @@ pub enum Error {
     UnableToParsePrometheusMetrics { source: std::io::Error },
 
     #[snafu(display("Error writing to metrics table: {source}"))]
-    UnableToWriteToMetricsTable { source: internal_table::Error },
+    UnableToWriteToMetricsTable { source: DataFusionError },
 
     #[snafu(display("Error creating metrics table: {source}"))]
     UnableToCreateMetricsTable { source: internal_table::Error },
@@ -89,7 +93,6 @@ impl MetricsRecorder {
     async fn tick(
         socket_addr: &SocketAddr,
         datafusion: &Arc<RwLock<DataFusion>>,
-        table: &Arc<InternalTable>,
     ) -> Result<(), Error> {
         let body = reqwest::get(format!("http://{socket_addr}/metrics"))
             .await
@@ -124,9 +127,11 @@ impl MetricsRecorder {
             labels.push(sample.labels.to_string());
         }
 
-        table
-            .insert(
-                datafusion,
+        let schema = get_metrics_schema();
+        let data_update = DataUpdate {
+            schema: Arc::clone(&schema),
+            data: vec![RecordBatch::try_new(
+                Arc::clone(&schema),
                 vec![
                     Arc::new(Int64Array::from(timestamps)),
                     Arc::new(StringArray::from(metrics)),
@@ -134,20 +139,27 @@ impl MetricsRecorder {
                     Arc::new(StringArray::from(labels)),
                 ],
             )
+            .context(UnableToCreateRecordBatchSnafu)?],
+            update_type: crate::dataupdate::UpdateType::Append,
+        };
+
+        let df = datafusion.write().await;
+        df.write_data(TableReference::partial("runtime", "metrics"), data_update)
             .await
             .context(UnableToWriteToMetricsTableSnafu)?;
+
+        drop(df);
 
         Ok(())
     }
 
     pub fn start(&self, datafusion: &Arc<RwLock<DataFusion>>) {
         let addr = Arc::clone(&self.socket_addr);
-        let table = Arc::clone(&self.metrics_table);
         let df = Arc::clone(datafusion);
 
         spawn(async move {
             loop {
-                if let Err(err) = MetricsRecorder::tick(&addr, &df, &table).await {
+                if let Err(err) = MetricsRecorder::tick(&addr, &df).await {
                     tracing::error!("{err}");
                 }
                 tokio::time::sleep(Duration::from_secs(30)).await;
