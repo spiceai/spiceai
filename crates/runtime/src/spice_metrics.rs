@@ -126,7 +126,7 @@ impl MetricsRecorder {
 
         table
             .insert(
-                data_fusion,
+                datafusion,
                 vec![
                     Arc::new(Int64Array::from(timestamps)),
                     Arc::new(StringArray::from(metrics)),
@@ -140,10 +140,10 @@ impl MetricsRecorder {
         Ok(())
     }
 
-    pub fn start(&self, data_fusion: &Arc<RwLock<DataFusion>>) {
+    pub fn start(&self, datafusion: &Arc<RwLock<DataFusion>>) {
         let addr = Arc::clone(&self.socket_addr);
         let table = Arc::clone(&self.metrics_table);
-        let df = Arc::clone(data_fusion);
+        let df = Arc::clone(datafusion);
 
         spawn(async move {
             loop {
