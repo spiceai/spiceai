@@ -78,6 +78,13 @@ pub struct LocalhostConnector {
     schema: SchemaRef,
 }
 
+impl LocalhostConnector {
+    #[must_use]
+    pub fn new(schema: SchemaRef) -> Self {
+        Self { schema }
+    }
+}
+
 impl DataConnectorFactory for LocalhostConnector {
     fn create(
         _secret: Option<Secret>,

@@ -64,7 +64,7 @@ pub struct Dataset {
     pub name: String,
 
     #[serde(default)]
-    mode: Mode,
+    pub mode: Mode,
 
     /// Inline SQL that describes a view.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -448,6 +448,26 @@ pub mod acceleration {
                 .as_ref()
                 .map_or_else(|| "arrow", String::as_str)
                 .into()
+        }
+    }
+
+    impl Default for Acceleration {
+        fn default() -> Self {
+            Self {
+                enabled: true,
+                mode: Mode::Memory,
+                engine: None,
+                refresh_mode: RefreshMode::Full,
+                refresh_check_interval: None,
+                refresh_sql: None,
+                refresh_data_window: None,
+                params: None,
+                engine_secret: None,
+                retention_period: None,
+                retention_check_interval: None,
+                retention_check_enabled: false,
+                on_zero_results: ZeroResultsAction::ReturnEmpty,
+            }
         }
     }
 }

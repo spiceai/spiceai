@@ -101,6 +101,23 @@ pub enum Error {
         source: DataFusionError,
     },
 
+    #[snafu(display("Unable to get {schema} schema: {source}"))]
+    UnableToGetSchema {
+        schema: String,
+        source: DataFusionError,
+    },
+
+    #[snafu(display("Schema {schema} not registered in default calaog"))]
+    SchemaNotFound { schema: String },
+
+    #[snafu(display("Table {table} not registered in {schema} schema"))]
+    TableNotFound { schema: String, table: String },
+
+    #[snafu(display("Unable to get object store configuration: {source}"))]
+    UnableToGetSchemaTable {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
     #[snafu(display("Expected acceleration settings for {name}, found None"))]
     ExpectedAccelerationSettings { name: String },
 
@@ -249,13 +266,15 @@ impl DataFusion {
 
     pub fn register_runtime_table(
         &mut self,
-        name: String,
+        name: &str,
         table: Arc<dyn datafusion::datasource::TableProvider>,
     ) -> Result<()> {
         if let Some(system_schema) = self.runtime_schema() {
             system_schema
-                .register_table(name, table)
+                .register_table(name.to_string(), table)
                 .context(UnableToRegisterTableToDataFusionSchemaSnafu { schema: "runtime" })?;
+
+            self.data_writers.insert(format!("runtime.{name}"));
         }
 
         Ok(())

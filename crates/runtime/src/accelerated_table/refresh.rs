@@ -63,6 +63,19 @@ impl Refresh {
     }
 }
 
+impl Default for Refresh {
+    fn default() -> Self {
+        Self {
+            time_column: None,
+            time_format: None,
+            check_interval: None,
+            sql: None,
+            mode: RefreshMode::Full,
+            period: None,
+        }
+    }
+}
+
 pub(crate) enum AccelerationRefreshMode {
     Full(Receiver<()>),
     Append(Option<Receiver<()>>),
