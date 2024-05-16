@@ -5243,7 +5243,7 @@ checksum = "c9be0862c1b3f26a88803c4a49de6889c10e608b3ee9344e6ef5b45fb37ad3d1"
 [[package]]
 name = "mistralrs"
 version = "0.1.7"
-source = "git+https://github.com/Jeadie/mistral.rs#3a79bc82e0e7ba59f320908316d128e63b689179"
+source = "git+https://github.com/Jeadie/mistral.rs?rev=04e4abf19935d0f7882f0ca71450ba150dc85caa#04e4abf19935d0f7882f0ca71450ba150dc85caa"
 dependencies = [
  "anyhow",
  "candle-core 0.5.0 (git+https://github.com/EricLBuehler/candle.git)",
@@ -5255,7 +5255,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-core"
 version = "0.1.7"
-source = "git+https://github.com/Jeadie/mistral.rs#3a79bc82e0e7ba59f320908316d128e63b689179"
+source = "git+https://github.com/Jeadie/mistral.rs?rev=04e4abf19935d0f7882f0ca71450ba150dc85caa#04e4abf19935d0f7882f0ca71450ba150dc85caa"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5300,7 +5300,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-lora"
 version = "0.1.7"
-source = "git+https://github.com/Jeadie/mistral.rs#3a79bc82e0e7ba59f320908316d128e63b689179"
+source = "git+https://github.com/Jeadie/mistral.rs?rev=04e4abf19935d0f7882f0ca71450ba150dc85caa#04e4abf19935d0f7882f0ca71450ba150dc85caa"
 dependencies = [
  "candle-core 0.5.0 (git+https://github.com/EricLBuehler/candle.git)",
  "candle-nn 0.5.0 (git+https://github.com/EricLBuehler/candle.git)",

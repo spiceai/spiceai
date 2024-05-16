@@ -960,8 +960,6 @@ pub(crate) mod nsql {
     #[serde(rename_all = "lowercase")]
     pub struct Request {
         pub query: String,
-        // If present, only include these tables in the NSQL query
-        // pub included_tables: Option<Vec<String>>,
     }
 
     pub(crate) async fn post(

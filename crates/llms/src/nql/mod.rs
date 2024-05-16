@@ -27,7 +27,7 @@ pub enum LlmRuntime {
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to run the NSQL model"))]
+    #[snafu(display("Failed to run the NSQL model: {source}"))]
     FailedToRunModel {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
@@ -38,17 +38,17 @@ pub enum Error {
     #[snafu(display("Local tokenizer, expected at {expected_path}, not found"))]
     LocalTokenizerNotFound { expected_path: String },
 
-    #[snafu(display("Failed to load model from file"))]
+    #[snafu(display("Failed to load model from file: {source}"))]
     FailedToLoadModel {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Failed to load model tokenizer"))]
+    #[snafu(display("Failed to load model tokenizer: {source}"))]
     FailedToLoadTokenizer {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Failed to tokenize"))]
+    #[snafu(display("Failed to tokenize: {source}"))]
     FailedToTokenize {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
