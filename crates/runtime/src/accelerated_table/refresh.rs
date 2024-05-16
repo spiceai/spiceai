@@ -2,14 +2,15 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arrow::array::TimestampNanosecondArray;
+use arrow::datatypes::DataType;
 use async_stream::stream;
 use datafusion::common::TableReference;
+use datafusion::error::DataFusionError;
 use datafusion::execution::config::SessionConfig;
-use datafusion::logical_expr::Operator;
+use datafusion::logical_expr::{cast, col, Expr, Operator};
 use datafusion::physical_plan::{collect, ExecutionPlanProperties};
-use datafusion::{
-    datasource::TableProvider, execution::context::SessionContext, logical_expr::Expr,
-};
+use datafusion::prelude::DataFrame;
+use datafusion::{datasource::TableProvider, execution::context::SessionContext};
 use futures::Stream;
 use futures::{stream::BoxStream, StreamExt};
 use snafu::prelude::*;
@@ -256,6 +257,7 @@ impl Refresher {
                         yield self.get_full_or_incremental_append_update(timestamp).await;
                     }
                     Err(e) => {
+                        dbg!(&e);
                         tracing::error!("No latest timestamp is found: {e}");
                     }
                 }
@@ -276,15 +278,9 @@ impl Refresher {
                 .context(super::FailedToFindLatestTimestampSnafu {
                     reason: "Failed to get latest timestamp due to time column not specified",
                 })?;
-        let df = ctx
-            .sql(
-                format!(
-                    "SELECT CAST({column} AS timestamp) AS a FROM accelerated_{} ORDER BY a DESC LIMIT 1",
-                    self.dataset_name.clone()
-                )
-                .as_str(),
-            )
-            .await.context(super::FailedToQueryLatestTimestampSnafu)?;
+        let df = self
+            .get_df(ctx, &column)
+            .context(super::UnableToScanTableProviderSnafu)?;
         let result = &df
             .collect()
             .await
@@ -336,6 +332,19 @@ impl Refresher {
         };
 
         Ok(Some(value))
+    }
+
+    #[allow(clippy::needless_pass_by_value)]
+    fn get_df(&self, ctx: SessionContext, column: &str) -> Result<DataFrame, DataFusionError> {
+        let expr = cast(
+            col(column),
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+        )
+        .alias("a");
+        ctx.read_table(Arc::clone(&self.accelerator))?
+            .select(vec![expr.clone()])?
+            .sort(vec![col("a").sort(false, false)])?
+            .limit(0, Some(1))
     }
 
     async fn get_full_or_incremental_append_update(
@@ -460,7 +469,7 @@ pub(crate) fn get_timestamp(time: SystemTime) -> u128 {
 #[cfg(test)]
 mod tests {
     use arrow::{
-        array::{RecordBatch, StringArray},
+        array::{RecordBatch, StringArray, UInt64Array},
         datatypes::{DataType, Schema},
     };
     use data_components::arrow::write::MemTable;
@@ -613,7 +622,7 @@ mod tests {
 
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
-    async fn test_refresh_append_batch() {
+    async fn test_refresh_append_batch_for_iso8601() {
         async fn test(
             source_data: Vec<&str>,
             existing_data: Vec<&str>,
@@ -754,7 +763,135 @@ mod tests {
                 "2012-12-01T11:11:15Z",
             ],
             4,
-            "should override existing data",
+            "should not apply same timestamp data",
+        )
+        .await;
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn test_refresh_append_batch_for_timestamp() {
+        async fn test(
+            source_data: Vec<u64>,
+            existing_data: Vec<u64>,
+            expected_size: usize,
+            message: &str,
+        ) {
+            let schema = Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
+                "time",
+                DataType::UInt64,
+                false,
+            )]));
+            let arr = UInt64Array::from(source_data);
+
+            let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(arr)])
+                .expect("data should be created");
+
+            let federated = Arc::new(
+                MemTable::try_new(Arc::clone(&schema), vec![vec![batch]])
+                    .expect("mem table should be created"),
+            );
+
+            let arr = UInt64Array::from(existing_data);
+
+            let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(arr)])
+                .expect("data should be created");
+
+            let accelerator = Arc::new(
+                MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created"),
+            ) as Arc<dyn TableProvider>;
+
+            let refresh = Refresh::new(
+                Some("time".to_string()),
+                Some(TimeFormat::UnixSeconds),
+                None,
+                None,
+                RefreshMode::Append,
+                None,
+            );
+
+            let refresher = Refresher::new(
+                "test".to_string(),
+                federated,
+                Arc::new(RwLock::new(refresh)),
+                Arc::clone(&accelerator),
+            );
+
+            let (trigger, receiver) = mpsc::channel::<()>(1);
+            let (ready_sender, is_ready) = oneshot::channel::<()>();
+            let acceleration_refresh_mode = AccelerationRefreshMode::Append(Some(receiver));
+            let refresh_handle = tokio::spawn(async move {
+                refresher
+                    .start(acceleration_refresh_mode, ready_sender)
+                    .await;
+            });
+            trigger
+                .send(())
+                .await
+                .expect("trigger sent correctly to refresh");
+
+            timeout(Duration::from_secs(2), async move {
+                is_ready.await.expect("data is received");
+            })
+            .await
+            .expect("finish before the timeout");
+
+            let ctx = SessionContext::new();
+            let state = ctx.state();
+
+            let plan = accelerator
+                .scan(&state, None, &[], None)
+                .await
+                .expect("Scan plan can be constructed");
+
+            let result = collect(plan, ctx.task_ctx())
+                .await
+                .expect("Query successful");
+
+            assert_eq!(
+                expected_size,
+                result.into_iter().map(|f| f.num_rows()).sum::<usize>(),
+                "{message}"
+            );
+
+            drop(refresh_handle);
+        }
+
+        test(
+            vec![1, 2, 3],
+            vec![],
+            3,
+            "should insert all data into empty accelerator",
+        )
+        .await;
+        test(
+            vec![1, 2, 3],
+            vec![2, 3, 4, 5],
+            4,
+            "should not insert any stale data and keep original size",
+        )
+        .await;
+        test(
+            vec![],
+            vec![1, 2, 3, 4],
+            4,
+            "should keep original data of accelerator when no new data is found",
+        )
+        .await;
+        test(
+            vec![5, 6],
+            vec![1, 2, 3, 4],
+            6,
+            "should apply new data onto existing data",
+        )
+        .await;
+
+        // Known limitation, doesn't dedup
+        test(
+            vec![4, 4],
+            vec![1, 2, 3, 4],
+            4,
+            "should not apply same timestamp data",
         )
         .await;
     }
