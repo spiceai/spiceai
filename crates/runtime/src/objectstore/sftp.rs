@@ -20,6 +20,7 @@ use std::{
     ops::Range,
 };
 
+use async_stream::stream;
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::DateTime;
@@ -29,7 +30,7 @@ use object_store::{
     ObjectMeta, ObjectStore, PutOptions, PutResult,
 };
 use ssh2::Session;
-use tokio::io::AsyncWrite;
+use tokio::{io::AsyncWrite, sync::mpsc};
 
 #[derive(Debug)]
 pub struct SFTPObjectStore {
@@ -57,13 +58,29 @@ impl SFTPObjectStore {
     }
 
     fn get_client(&self) -> object_store::Result<Session> {
-        let stream = TcpStream::connect(format!("{}:{}", self.host, self.port)).unwrap();
-        let mut session = Session::new().unwrap();
+        let stream = TcpStream::connect(format!("{}:{}", self.host, self.port)).map_err(|e| {
+            object_store::Error::Generic {
+                store: "SFTP",
+                source: e.into(),
+            }
+        })?;
+        let mut session = Session::new().map_err(|e| object_store::Error::Generic {
+            store: "SFTP",
+            source: e.into(),
+        })?;
         session.set_tcp_stream(stream);
-        session.handshake().unwrap();
+        session
+            .handshake()
+            .map_err(|e| object_store::Error::Generic {
+                store: "SFTP",
+                source: e.into(),
+            })?;
         session
             .userauth_password(&self.user, &self.password)
-            .unwrap();
+            .map_err(|e| object_store::Error::Generic {
+                store: "SFTP",
+                source: e.into(),
+            })?;
 
         Ok(session)
     }
@@ -91,20 +108,50 @@ impl ObjectStore for SFTPObjectStore {
         location: &Path,
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
-        let client = self.get_client().unwrap();
+        let client = self.get_client()?;
         let mut file = client
             .sftp()
-            .unwrap()
+            .map_err(|e| object_store::Error::Generic {
+                store: "SFTP",
+                source: e.into(),
+            })?
             .open(std::path::Path::new(location.as_ref()))
-            .unwrap();
+            .map_err(|e| object_store::Error::Generic {
+                store: "SFTP",
+                source: e.into(),
+            })?;
 
         let object_meta = ObjectMeta {
             location: location.clone(),
-            size: file.stat().unwrap().size.unwrap() as usize,
-            last_modified: DateTime::from_timestamp_millis(
-                file.stat().unwrap().mtime.unwrap() as i64
+            size: file
+                .stat()
+                .map_err(|e| object_store::Error::Generic {
+                    store: "SFTP",
+                    source: e.into(),
+                })?
+                .size
+                .ok_or_else(|| object_store::Error::Generic {
+                    store: "SFTP",
+                    source: "No size found for file".into(),
+                })? as usize,
+
+            last_modified: DateTime::from_timestamp(
+                file.stat()
+                    .map_err(|e| object_store::Error::Generic {
+                        store: "SFTP",
+                        source: e.into(),
+                    })?
+                    .mtime
+                    .ok_or_else(|| object_store::Error::Generic {
+                        store: "SFTP",
+                        source: "No modifcation time found for file".into(),
+                    })? as i64,
+                0,
             )
-            .unwrap(),
+            .ok_or_else(|| object_store::Error::Generic {
+                store: "SFTP",
+                source: "Failed to construct DataTime".into(),
+            })?,
             e_tag: None,
             version: None,
         };
@@ -119,30 +166,65 @@ impl ObjectStore for SFTPObjectStore {
             end = range.end;
         }
 
-        let mut res = vec![];
-        file.seek(SeekFrom::Start(start as u64)).unwrap();
-        let mut total = 0;
-        let mut buf = vec![0; 4096];
-        loop {
-            if total > data_to_read {
-                break;
+        let (sender, mut receiver) = mpsc::channel(32);
+        tokio::spawn(async move {
+            let res = file.seek(SeekFrom::Start(start as u64)).map_err(|e| {
+                object_store::Error::Generic {
+                    store: "SFTP",
+                    source: e.into(),
+                }
+            });
+            if let Err(e) = res {
+                let _ = sender.send(Err(e)).await;
             }
-            let mut n = file.read(&mut buf).unwrap();
 
-            total += n;
-            if n == 0 {
-                break;
+            let mut total = 0;
+            let mut buf = vec![0; 4096];
+            loop {
+                if total > data_to_read {
+                    break;
+                }
+                let n = file
+                    .read(&mut buf)
+                    .map_err(|e| object_store::Error::Generic {
+                        store: "SFTP",
+                        source: e.into(),
+                    });
+                let mut n = match n {
+                    Ok(n) => n,
+                    Err(e) => {
+                        let _ = sender.send(Err(e)).await;
+                        break;
+                    }
+                };
+
+                total += n;
+                if n == 0 {
+                    break;
+                }
+                if total > data_to_read {
+                    n -= total - data_to_read;
+                }
+                let _ = sender.send(Ok(Bytes::copy_from_slice(&buf[..n]))).await;
             }
-            if total > data_to_read {
-                n -= total - data_to_read;
+        });
+
+        let stream = stream! {
+            while let Some(data) = receiver.recv().await {
+                match data {
+                    Ok(data) => {
+                        yield Ok(data);
+                    }
+                    Err(e) => {
+                        yield Err(e);
+                        break;
+                    }
+                }
             }
-            res.push(Bytes::copy_from_slice(&buf[..n]))
-        }
+        };
 
         Ok(GetResult {
-            payload: GetResultPayload::Stream(Box::pin(futures::stream::iter(
-                res.into_iter().map(Ok),
-            ))),
+            payload: GetResultPayload::Stream(Box::pin(stream)),
             meta: object_meta,
             range: Range { start, end },
         })
