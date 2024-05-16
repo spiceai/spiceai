@@ -30,6 +30,7 @@ use crate::{
     dataaccelerator::{self, create_accelerator_table},
     dataconnector::{localhost::LocalhostConnector, DataConnector, DataConnectorError},
 };
+use datafusion::sql::TableReference;
 use spicepod::component::dataset::{acceleration::Acceleration, Dataset, Mode};
 
 #[derive(Debug, Snafu)]
@@ -86,11 +87,14 @@ impl InternalTable {
         };
 
         let df = data_fusion.write().await;
-        df.write_runtime_data(self.name(), data_update)
-            .await
-            .context(UnableToWriteToTableSnafu {
-                name: self.name().to_string(),
-            })?;
+        df.write_data(
+            TableReference::partial("runtime", self.name.to_string()),
+            data_update,
+        )
+        .await
+        .context(UnableToWriteToTableSnafu {
+            name: self.name().to_string(),
+        })?;
         drop(df);
 
         Ok(())

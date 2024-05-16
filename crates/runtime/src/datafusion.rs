@@ -101,23 +101,6 @@ pub enum Error {
         source: DataFusionError,
     },
 
-    #[snafu(display("Unable to get {schema} schema: {source}"))]
-    UnableToGetSchema {
-        schema: String,
-        source: DataFusionError,
-    },
-
-    #[snafu(display("Schema {schema} not registered in default calaog"))]
-    SchemaNotFound { schema: String },
-
-    #[snafu(display("Table {table} not registered in {schema} schema"))]
-    TableNotFound { schema: String, table: String },
-
-    #[snafu(display("Unable to get object store configuration: {source}"))]
-    UnableToGetSchemaTable {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
     #[snafu(display("Expected acceleration settings for {name}, found None"))]
     ExpectedAccelerationSettings { name: String },
 
