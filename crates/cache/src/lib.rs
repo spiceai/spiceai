@@ -17,6 +17,7 @@ limitations under the License.
 use arrow::array::RecordBatch;
 use async_trait::async_trait;
 use byte_unit::Byte;
+use fundu::ParseError;
 use lru_cache::LruCache;
 use snafu::{ResultExt, Snafu};
 use spicepod::component::runtime::ResultsCache;
@@ -30,11 +31,14 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Failed to parse cache max size: {}", source))]
+    #[snafu(display("Failed to parse cache_max_size value: {}", source))]
     FailedToParseCacheMaxSize { source: byte_unit::ParseError },
 
     #[snafu(display("Value is too large: {}", source))]
     TooLargeValue { source: std::num::TryFromIntError },
+
+    #[snafu(display("Failed to parse item_expire value: {}", source))]
+    FailedToParseItemExpire { source: ParseError },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -54,14 +58,24 @@ impl QueryResultCacheProvider {
     /// # Errors
     ///
     /// Will return `Err` if method fails to parse cache params or to create the cache
-    pub fn new(_config: &ResultsCache) -> Result<Self> {
-        let cache_max_size: usize = Byte::parse_str("128mb", true)
-            .context(FailedToParseCacheMaxSizeSnafu)?
-            .try_into()
-            .context(TooLargeValueSnafu)?;
+    pub fn new(config: &ResultsCache) -> Result<Self> {
+        let cache_max_size: usize = match &config.cache_max_size {
+            Some(cache_max_size) => Byte::parse_str(cache_max_size, true)
+                .context(FailedToParseCacheMaxSizeSnafu)?
+                .try_into()
+                .context(TooLargeValueSnafu)?,
+            None => 128 * 1024 * 1024, // 128MB
+        };
+
+        let ttl = match &config.item_expire {
+            Some(item_expire) => {
+                fundu::parse_duration(item_expire).context(FailedToParseItemExpireSnafu)?
+            }
+            None => fundu::parse_duration("1s").context(FailedToParseItemExpireSnafu)?,
+        };
 
         let cache_provider = QueryResultCacheProvider {
-            cache: Box::new(LruCache::new(cache_max_size)),
+            cache: Box::new(LruCache::new(cache_max_size, ttl)),
         };
 
         Ok(cache_provider)

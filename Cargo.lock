@@ -1761,6 +1761,7 @@ dependencies = [
  "arrow",
  "async-trait",
  "byte-unit",
+ "fundu",
  "snafu 0.8.2",
  "spicepod",
  "tracing",

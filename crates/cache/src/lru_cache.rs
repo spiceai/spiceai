@@ -17,11 +17,12 @@ use crate::AnyErrorResult;
 use crate::QueryResultCache;
 use arrow::array::RecordBatch;
 use async_trait::async_trait;
+use std::time::Duration;
 
 pub struct LruCache {}
 
 impl LruCache {
-    pub fn new(_cache_max_size: usize) -> Self {
+    pub fn new(_cache_max_size: usize, _ttl: Duration) -> Self {
         LruCache {}
     }
 }
