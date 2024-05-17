@@ -17,20 +17,15 @@ limitations under the License.
 use arrow::datatypes::{DataType, SchemaRef};
 use async_trait::async_trait;
 
-use std::{any::Any, collections::HashMap, fmt, pin::Pin, sync::Arc};
+use std::{any::Any, collections::HashMap, pin::Pin, sync::Arc};
 
 use datafusion::{
     config::ConfigOptions,
     datasource::{TableProvider, TableType},
     error::{DataFusionError, Result as DataFusionResult},
-    execution::{context::SessionState, SendableRecordBatchStream, TaskContext},
+    execution::context::SessionState,
     logical_expr::{AggregateUDF, Expr, ScalarUDF, TableSource, WindowUDF},
-    physical_plan::{
-        empty::EmptyExec,
-        insert::{DataSink, DataSinkExec},
-        metrics::MetricsSet,
-        DisplayAs, DisplayFormatType, ExecutionPlan,
-    },
+    physical_plan::{empty::EmptyExec, ExecutionPlan},
     sql::{
         planner::{ContextProvider, SqlToRel},
         sqlparser::{self, ast::Statement, dialect::PostgreSqlDialect, parser::Parser},
@@ -76,6 +71,13 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Debug, Clone)]
 pub struct LocalhostConnector {
     schema: SchemaRef,
+}
+
+impl LocalhostConnector {
+    #[must_use]
+    pub fn new(schema: SchemaRef) -> Self {
+        Self { schema }
+    }
 }
 
 impl DataConnectorFactory for LocalhostConnector {
@@ -215,48 +217,9 @@ impl TableProvider for LocalhostConnector {
     async fn insert_into(
         &self,
         _state: &SessionState,
-        input: Arc<dyn ExecutionPlan>,
+        _input: Arc<dyn ExecutionPlan>,
         _overwrite: bool,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(DataSinkExec::new(
-            input,
-            Arc::new(LocalhostDataSink::new()),
-            self.schema(),
-            None,
-        )) as _)
-    }
-}
-
-#[derive(Debug)]
-struct LocalhostDataSink {}
-
-impl LocalhostDataSink {
-    pub fn new() -> Self {
-        Self {}
-    }
-}
-
-#[async_trait]
-impl DataSink for LocalhostDataSink {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn metrics(&self) -> Option<MetricsSet> {
-        None
-    }
-
-    async fn write_all(
-        &self,
-        mut _data: SendableRecordBatchStream,
-        _context: &Arc<TaskContext>,
-    ) -> datafusion::common::Result<u64> {
-        Ok(0)
-    }
-}
-
-impl DisplayAs for LocalhostDataSink {
-    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> std::fmt::Result {
-        write!(f, "LocalhostDataSink")
+        Ok(Arc::new(EmptyExec::new(Arc::clone(&self.schema))))
     }
 }
