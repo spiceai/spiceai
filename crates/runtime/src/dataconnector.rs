@@ -127,6 +127,9 @@ pub enum DataConnectorError {
     #[snafu(display("Cannot connect to {dataconnector}. Authentication failed. Ensure that the username and password are correctly configured in the spicepod."))]
     UnableToConnectInvalidUsernameOrPassword { dataconnector: String },
 
+    #[snafu(display("Cannot connect to {dataconnector}. Ensure that the corresponding secure option is configured to match the data connector's TLS security requirements."))]
+    UnableToConnectTlsError { dataconnector: String },
+
     #[snafu(display("Unable to get read provider for {dataconnector}: {source}"))]
     UnableToGetReadProvider {
         dataconnector: String,
@@ -340,20 +343,32 @@ pub trait ListingTableConnector: DataConnector {
         &self,
         params: &HashMap<String, String>,
     ) -> DataConnectorResult<Arc<CsvFormat>> {
-        let compression_type = params.get("compression_type").map_or("", |f| f);
         let has_header = params.get("has_header").map_or(true, |f| f == "true");
+        let quote = params
+            .get("quote")
+            .map_or(b'"', |f| *f.as_bytes().first().unwrap_or(&b'"'));
+        let escape = params
+            .get("escape")
+            .and_then(|f| f.as_bytes().first().copied());
+        let schema_infer_max_rec = params
+            .get("schema_infer_max_records")
+            .map_or_else(|| 1000, |f| usize::from_str(f).map_or(1000, |f| f));
         let delimiter = params
             .get("delimiter")
             .map_or(b',', |f| *f.as_bytes().first().unwrap_or(&b','));
+        let compression_type = params.get("compression_type").map_or("", |f| f);
 
         Ok(Arc::new(
             CsvFormat::default()
                 .with_has_header(has_header)
+                .with_quote(quote)
+                .with_escape(escape)
+                .with_schema_infer_max_rec(schema_infer_max_rec)
+                .with_delimiter(delimiter)
                 .with_file_compression_type(
                     FileCompressionType::from_str(compression_type)
                         .context(UnsupportedCsvCompressionTypeSnafu { compression_type })?,
-                )
-                .with_delimiter(delimiter),
+                ),
         ))
     }
 }
