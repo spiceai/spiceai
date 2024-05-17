@@ -53,6 +53,7 @@ pub mod dataupdate;
 pub mod execution_plan;
 mod flight;
 mod http;
+pub mod internal_table;
 pub mod model;
 pub mod object_store_registry;
 pub mod objectstore;
@@ -155,6 +156,9 @@ pub enum Error {
     UnableToInstallMetricsServer {
         source: SetRecorderError<MetricsRecorder>,
     },
+
+    #[snafu(display("Unable to start local metrics: {source}"))]
+    UnableToStartLocalMetrics { source: spice_metrics::Error },
 
     #[snafu(display("Unable to create metrics table: {source}"))]
     UnableToCreateMetricsTable { source: DataFusionError },
@@ -678,25 +682,22 @@ impl Runtime {
         self.load_model(m).await;
     }
 
-    pub async fn start_metrics(&mut self, with_metrics: Option<SocketAddr>) {
+    pub async fn start_metrics(&mut self, with_metrics: Option<SocketAddr>) -> Result<()> {
         if let Some(metrics_socket) = with_metrics {
-            let recorder = MetricsRecorder::new(metrics_socket);
+            let recorder = MetricsRecorder::new(metrics_socket)
+                .await
+                .context(UnableToStartLocalMetricsSnafu)?;
 
-            if let Err(err) = self
-                .df
+            self.df
                 .write()
                 .await
-                .register_runtime_table("metrics".to_string(), recorder.table())
-                .context(UnableToRegisterMetricsTableSnafu)
-            {
-                tracing::warn!("Unable to register runtime metrics table: {}", err);
-                return;
-            }
+                .register_runtime_table("metrics", recorder.metrics_table())
+                .context(UnableToRegisterMetricsTableSnafu)?;
 
-            recorder.start();
-
-            tracing::info!("Runtime metrics available in spice.runtime.metrics");
+            recorder.start(&Arc::clone(&self.df));
         }
+
+        Ok(())
     }
 
     pub async fn start_servers(&mut self, with_metrics: Option<SocketAddr>) -> Result<()> {

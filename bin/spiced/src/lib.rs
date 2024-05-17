@@ -104,15 +104,21 @@ pub async fn run(args: Args) -> Result<()> {
 
     let mut rt: Runtime = Runtime::new(args.runtime, app, df, pods_watcher).await;
 
-    if args.spice_cloud_connect {
-        rt.start_metrics(args.metrics).await;
-    }
-
     rt.load_secrets().await;
 
     rt.load_datasets().await;
 
     rt.load_models().await;
+
+    if args.spice_cloud_connect {
+        if let Err(err) = rt
+            .start_metrics(args.metrics)
+            .await
+            .context(UnableToStartServersSnafu)
+        {
+            tracing::warn!("{err}");
+        }
+    }
 
     rt.start_servers(args.metrics)
         .await

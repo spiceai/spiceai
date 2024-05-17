@@ -249,13 +249,15 @@ impl DataFusion {
 
     pub fn register_runtime_table(
         &mut self,
-        name: String,
+        name: &str,
         table: Arc<dyn datafusion::datasource::TableProvider>,
     ) -> Result<()> {
-        if let Some(system_schema) = self.runtime_schema() {
-            system_schema
-                .register_table(name, table)
+        if let Some(runtime_schema) = self.runtime_schema() {
+            runtime_schema
+                .register_table(name.to_string(), table)
                 .context(UnableToRegisterTableToDataFusionSchemaSnafu { schema: "runtime" })?;
+
+            self.data_writers.insert(format!("runtime.{name}"));
         }
 
         Ok(())
