@@ -28,6 +28,7 @@ use ::datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use ::datafusion::sql::sqlparser::{self, ast};
 use accelerated_table::AcceleratedTable;
 use app::App;
+use cache::QueryResultCacheProvider;
 use config::Config;
 use metrics::SetRecorderError;
 use model_components::{model::Model, modelsource::source as model_source};
@@ -165,6 +166,9 @@ pub enum Error {
 
     #[snafu(display("Unable to register metrics table: {source}"))]
     UnableToRegisterMetricsTable { source: datafusion::Error },
+
+    #[snafu(display("Unable to create cache for query results: {source}"))]
+    UnableToCreateResultsCache { source: cache::Error },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -176,6 +180,7 @@ pub struct Runtime {
     pub models: Arc<RwLock<HashMap<String, Model>>>,
     pub pods_watcher: podswatcher::PodsWatcher,
     pub secrets_provider: Arc<RwLock<secrets::SecretsProvider>>,
+    pub results_cache: Arc<RwLock<Option<cache::QueryResultCacheProvider>>>,
 
     spaced_tracer: Arc<tracers::SpacedTracer>,
 }
@@ -187,6 +192,7 @@ impl Runtime {
         app: Arc<RwLock<Option<app::App>>>,
         df: Arc<RwLock<DataFusion>>,
         pods_watcher: podswatcher::PodsWatcher,
+        results_cache: Arc<RwLock<Option<QueryResultCacheProvider>>>,
     ) -> Self {
         dataconnector::register_all().await;
         dataaccelerator::register_all().await;
@@ -198,6 +204,7 @@ impl Runtime {
             pods_watcher,
             secrets_provider: Arc::new(RwLock::new(secrets::SecretsProvider::new())),
             spaced_tracer: Arc::new(tracers::SpacedTracer::new(Duration::from_secs(15))),
+            results_cache,
         }
     }
 
@@ -794,6 +801,23 @@ impl Runtime {
         }
 
         Ok(())
+    }
+
+    pub fn create_results_cache(
+        app: &Option<app::App>,
+    ) -> Result<Option<QueryResultCacheProvider>> {
+        let cache_config = app
+            .as_ref()
+            .and_then(|app| app.runtime.results_cache.as_ref());
+
+        match cache_config {
+            Some(config) => {
+                let cache_provider = QueryResultCacheProvider::new(config)
+                    .context(UnableToCreateResultsCacheSnafu)?;
+                Ok(Some(cache_provider))
+            }
+            None => Ok(None),
+        }
     }
 }
 

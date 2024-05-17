@@ -1,0 +1,20 @@
+[package]
+name = "cache"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Spice cache"
+
+[dependencies]
+snafu.workspace = true
+spicepod = { path = "../spicepod" }
+tracing.workspace = true
+async-trait.workspace = true
+arrow.workspace = true
+byte-unit="5.1.4"
+
+[features]
+default = []

@@ -93,16 +93,31 @@ pub async fn run(args: Args) -> Result<()> {
     let current_dir = env::current_dir().unwrap_or(PathBuf::from("."));
     let df = Arc::new(RwLock::new(runtime::datafusion::DataFusion::new()));
     let pods_watcher = PodsWatcher::new(current_dir.clone());
-    let app: Arc<RwLock<Option<App>>> =
+    let app: Option<App> =
         match App::new(current_dir.clone()).context(UnableToConstructSpiceAppSnafu) {
-            Ok(app) => Arc::new(RwLock::new(Some(app))),
+            Ok(app) => Some(app),
             Err(e) => {
                 tracing::warn!("{}", e);
-                Arc::new(RwLock::new(None))
+                None
             }
         };
 
-    let mut rt: Runtime = Runtime::new(args.runtime, app, df, pods_watcher).await;
+    let cache = match Runtime::create_results_cache(&app) {
+        Ok(cache) => cache,
+        Err(e) => {
+            tracing::warn!("{}", e);
+            None
+        }
+    };
+
+    let mut rt: Runtime = Runtime::new(
+        args.runtime,
+        Arc::new(RwLock::new(app)),
+        df,
+        pods_watcher,
+        Arc::new(RwLock::new(cache)),
+    )
+    .await;
 
     rt.load_secrets().await;
 
