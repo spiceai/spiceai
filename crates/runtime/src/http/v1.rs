@@ -954,7 +954,10 @@ pub(crate) mod nsql {
             Some(rest) => rest.to_string(),
             None => input.to_string(),
         };
-        no_dashes.trim().to_string()
+
+        // Only take the first query, if there are multiple.
+        let one_query = no_dashes.split(';').next().unwrap_or(&no_dashes);
+        one_query.trim().to_string()
     }
 
     #[derive(Debug, Serialize, Deserialize)]
