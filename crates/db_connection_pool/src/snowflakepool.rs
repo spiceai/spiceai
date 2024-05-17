@@ -23,7 +23,10 @@ use std::{collections::HashMap, fs, sync::Arc};
 
 use super::{DbConnectionPool, Result};
 
-use crate::dbconnection::{snowflakeconn::SnowflakeConnection, DbConnection};
+use crate::{
+    dbconnection::{snowflakeconn::SnowflakeConnection, DbConnection},
+    JoinPushDown,
+};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -67,6 +70,7 @@ pub enum Error {
 
 pub struct SnowflakeConnectionPool {
     pub api: Arc<SnowflakeApi>,
+    join_push_down: JoinPushDown,
 }
 
 fn get_param(
@@ -143,7 +147,18 @@ impl SnowflakeConnectionPool {
             }
         }
 
-        Ok(Self { api: Arc::new(api) })
+        let mut join_push_context_str = format!("username={username},account={account}");
+        if let Some(warehouse) = warehouse {
+            join_push_context_str.push_str(&format!(",warehouse={warehouse}"));
+        }
+        if let Some(role) = role {
+            join_push_context_str.push_str(&format!(",role={role}"));
+        }
+
+        Ok(Self {
+            api: Arc::new(api),
+            join_push_down: JoinPushDown::AllowedFor(join_push_context_str),
+        })
     }
 }
 
@@ -227,6 +242,10 @@ impl DbConnectionPool<Arc<SnowflakeApi>, &'static (dyn Sync)> for SnowflakeConne
         let conn = SnowflakeConnection { api };
 
         Ok(Box::new(conn))
+    }
+
+    fn join_push_down(&self) -> JoinPushDown {
+        self.join_push_down.clone()
     }
 }
 

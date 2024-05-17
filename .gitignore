@@ -46,3 +46,5 @@ venv
 /test/tpch/tmp/
 /test/tpch/tpch-kit
 /test/tpch/tpch_queries.sql
+
+.vscode/settings.json

@@ -2481,6 +2481,8 @@ dependencies = [
  "bb8-postgres",
  "clickhouse-rs",
  "datafusion",
+ "datafusion-federation",
+ "datafusion-federation-sql",
  "db_connection_pool",
  "deltalake",
  "duckdb",
@@ -2630,7 +2632,7 @@ dependencies = [
 [[package]]
 name = "datafusion-federation"
 version = "0.1.3"
-source = "git+https://github.com/phillipleblanc/datafusion-federation.git?branch=spiceai#0fadae1037056bd37fdc90297fa6df2fdd8dbb94"
+source = "git+https://github.com/phillipleblanc/datafusion-federation.git?rev=8ba03bd75ccf3a7d6fdf5d30bd92160278f5c16a#8ba03bd75ccf3a7d6fdf5d30bd92160278f5c16a"
 dependencies = [
  "async-trait",
  "datafusion",
@@ -2639,7 +2641,7 @@ dependencies = [
 [[package]]
 name = "datafusion-federation-sql"
 version = "0.1.3"
-source = "git+https://github.com/phillipleblanc/datafusion-federation.git?branch=spiceai#0fadae1037056bd37fdc90297fa6df2fdd8dbb94"
+source = "git+https://github.com/phillipleblanc/datafusion-federation.git?rev=8ba03bd75ccf3a7d6fdf5d30bd92160278f5c16a#8ba03bd75ccf3a7d6fdf5d30bd92160278f5c16a"
 dependencies = [
  "async-trait",
  "datafusion",
@@ -2871,6 +2873,7 @@ dependencies = [
  "tokio-rusqlite",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]
@@ -4893,12 +4896,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "libssh2-sys"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2dc8a030b787e2119a731f1951d6a773e2280c660f8ec4b0f5e1505a386e71ee"
+dependencies = [
+ "cc",
+ "libc",
+ "libz-sys",
+ "openssl-sys",
+ "pkg-config",
+ "vcpkg",
+]
+
+[[package]]
 name = "libz-sys"
 version = "1.1.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e143b5e666b2695d28f6bca6497720813f699c9602dd7f5cac91008b8ada7f9"
 dependencies = [
  "cc",
+ "libc",
  "pkg-config",
  "vcpkg",
 ]
@@ -7300,6 +7318,7 @@ dependencies = [
  "snowflake-api",
  "spicepod",
  "sql_provider_datafusion",
+ "ssh2",
  "suppaftp",
  "tokio",
  "tokio-rusqlite",
@@ -8244,6 +8263,18 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.60",
+]
+
+[[package]]
+name = "ssh2"
+version = "0.9.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e7fe461910559f6d5604c3731d00d2aafc4a83d1665922e280f42f9a168d5455"
+dependencies = [
+ "bitflags 1.3.2",
+ "libc",
+ "libssh2-sys",
+ "parking_lot 0.11.2",
 ]
 
 [[package]]

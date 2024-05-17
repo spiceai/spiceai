@@ -40,10 +40,19 @@ impl Read for SnowflakeTableFactory {
         table_reference: TableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         let pool = Arc::clone(&self.pool);
-        let table_provider = SqlTable::new("snowflake", &pool, table_reference, None)
-            .await
-            .context(UnableToConstructSQLTableSnafu)?;
+        let table_provider = Arc::new(
+            SqlTable::new("snowflake", &pool, table_reference, None)
+                .await
+                .context(UnableToConstructSQLTableSnafu)?,
+        );
 
-        Ok(Arc::new(table_provider))
+        #[cfg(feature = "federation-experimental")]
+        let table_provider = Arc::new(
+            table_provider
+                .create_federated_table_provider()
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?,
+        );
+
+        Ok(table_provider)
     }
 }
