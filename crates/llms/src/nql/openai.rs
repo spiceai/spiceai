@@ -51,11 +51,11 @@ impl Openai {
 
     /// Convert the Json object returned when using a `{ "type": "json_object" } ` response format.
     /// Expected format is `"content": "{\"arbitrary_key\": \"arbitrary_value\"}"`
-    pub fn convert_json_object_to_sql(raw_json: String) -> Result<Option<String>> {
-        let result: Value = serde_json::from_str(&raw_json)
+    pub fn convert_json_object_to_sql(raw_json: &str) -> Result<Option<String>> {
+        let result: Value = serde_json::from_str(raw_json)
             .boxed()
             .context(FailedToRunModelSnafu)?;
-        Ok(result["sql"].as_str().map(|s| s.to_string()))
+        Ok(result["sql"].as_str().map(std::string::ToString::to_string))
     }
 }
 
@@ -107,10 +107,9 @@ impl Nql for Openai {
         match response
             .choices
             .iter()
-            .filter_map(|c| c.message.content.clone())
-            .next()
+            .find_map(|c| c.message.content.clone())
         {
-            Some(json_resp) => Self::convert_json_object_to_sql(json_resp),
+            Some(json_resp) => Self::convert_json_object_to_sql(&json_resp),
             None => Ok(None),
         }
     }

@@ -956,7 +956,7 @@ pub(crate) mod nsql {
         };
 
         // Only take the first query, if there are multiple.
-        let one_query = no_dashes.splitn(1, ";").next().unwrap_or(&no_dashes);
+        let one_query = no_dashes.split(';').next().unwrap_or(&no_dashes);
 
         one_query.trim().to_string()
     }
