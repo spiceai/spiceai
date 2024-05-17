@@ -48,6 +48,11 @@ pub enum Error {
         source: clickhouse_rs::errors::Error,
     },
 
+    #[snafu(display("ConnectionTlsError: {source}"))]
+    ConnectionTlsError {
+        source: clickhouse_rs::errors::ConnectionError,
+    },
+
     #[snafu(display("Unable to parse the connection string as a URL: {source}"))]
     UnableToParseConnectionString { source: url::ParseError },
 
@@ -220,11 +225,28 @@ impl DbConnectionPool<ClientHandle, &'static (dyn Sync)> for ClickhouseConnectio
             Err(e) => match e {
                 clickhouse_rs::errors::Error::Driver(_)
                 | clickhouse_rs::errors::Error::Io(_)
-                | clickhouse_rs::errors::Error::Connection(_)
                 | clickhouse_rs::errors::Error::Other(_)
                 | clickhouse_rs::errors::Error::Url(_)
                 | clickhouse_rs::errors::Error::FromSql(_) => {
                     Err(Error::ConnectionPoolRunError { source: e })
+                }
+                clickhouse_rs::errors::Error::Connection(connection_error) => {
+                    match connection_error {
+                        // This will be covered by host configuration error
+                        clickhouse_rs::ConnectionError::TlsHostNotProvided
+                        | clickhouse_rs::ConnectionError::IoError(_)
+                        | clickhouse_rs::ConnectionError::Broken
+                        | clickhouse_rs::ConnectionError::NoPacketReceived => {
+                            Err(Error::ConnectionPoolRunError {
+                                source: connection_error.into(),
+                            })
+                        }
+                        clickhouse_rs::ConnectionError::TlsError(_) => {
+                            Err(Error::ConnectionTlsError {
+                                source: connection_error,
+                            })
+                        }
+                    }
                 }
                 clickhouse_rs::errors::Error::Server(server_error) => {
                     if server_error.code == 516 {
