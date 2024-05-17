@@ -127,6 +127,9 @@ pub enum DataConnectorError {
     #[snafu(display("Cannot connect to {dataconnector}. Authentication failed. Ensure that the username and password are correctly configured in the spicepod."))]
     UnableToConnectInvalidUsernameOrPassword { dataconnector: String },
 
+    #[snafu(display("Cannot connect to {dataconnector}. Ensure that the corresponding secure option is configured to match the data connector's TLS security requirements."))]
+    UnableToConnectTlsError { dataconnector: String },
+
     #[snafu(display("Unable to get read provider for {dataconnector}: {source}"))]
     UnableToGetReadProvider {
         dataconnector: String,
