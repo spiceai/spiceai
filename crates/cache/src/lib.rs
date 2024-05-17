@@ -32,6 +32,9 @@ pub enum Error {
 
     #[snafu(display("Failed to parse cache max size: {}", source))]
     FailedToParseCacheMaxSize { source: byte_unit::ParseError },
+
+    #[snafu(display("Value is too large: {}", source))]
+    TooLargeValue { source: std::num::TryFromIntError },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -52,9 +55,10 @@ impl QueryResultCacheProvider {
     ///
     /// Will return `Err` if method fails to parse cache params or to create the cache
     pub fn new(_config: &ResultsCache) -> Result<Self> {
-        let cache_max_size = Byte::parse_str("128mb", true)
+        let cache_max_size: usize = Byte::parse_str("128mb", true)
             .context(FailedToParseCacheMaxSizeSnafu)?
-            .as_u64();
+            .try_into()
+            .context(TooLargeValueSnafu)?;
 
         let cache_provider = QueryResultCacheProvider {
             cache: Box::new(LruCache::new(cache_max_size)),

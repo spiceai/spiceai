@@ -21,7 +21,7 @@ use async_trait::async_trait;
 pub struct LruCache {}
 
 impl LruCache {
-    pub fn new(_cache_max_size: u64) -> Self {
+    pub fn new(_cache_max_size: usize) -> Self {
         LruCache {}
     }
 }
