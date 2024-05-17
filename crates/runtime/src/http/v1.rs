@@ -954,7 +954,11 @@ pub(crate) mod nsql {
             Some(rest) => rest.to_string(),
             None => input.to_string(),
         };
-        no_dashes.trim().to_string()
+
+        // Only take the first query, if there are multiple.
+        let one_query = no_dashes.splitn(1, ";").next().unwrap_or(&no_dashes);
+
+        one_query.trim().to_string()
     }
 
     #[derive(Debug, Serialize, Deserialize)]
@@ -1013,7 +1017,7 @@ pub(crate) mod nsql {
             match create_nsql(&NSQLRuntime::Openai) {
                 Ok(mut openai_nsql) => openai_nsql.run(nsql_query).await,
                 Err(e) => {
-                    tracing::error!("Failed to load OpenAI NQL model: {e:#?}");
+                    tracing::trace!("Failed to load OpenAI NQL model: {e:#?}");
                     return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
                 }
             }
