@@ -23,15 +23,20 @@ use arrow_flight::{
     decode::FlightRecordBatchStream, error::FlightError,
     flight_service_client::FlightServiceClient, FlightDescriptor,
 };
+
 use clap::Parser;
+use datafusion::arrow::array::RecordBatch;
 use datafusion::dataframe::DataFrame;
 use datafusion::datasource::{provider_as_source, MemTable};
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::{LogicalPlanBuilder, UNNAMED_TABLE};
 use futures::{StreamExt, TryStreamExt};
+use llms::nql::NSQLRuntime;
 use prost::Message;
+use reqwest::Client;
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
+use serde_json::json;
 use tonic::transport::Channel;
 use tonic::{Code, IntoRequest, Status};
 
@@ -45,6 +50,35 @@ pub struct ReplConfig {
         help_heading = "SQL REPL"
     )]
     pub repl_flight_endpoint: String,
+
+    #[arg(
+        long,
+        value_name = "HTTP_ENDPOINT",
+        default_value = "http://localhost:3000",
+        help_heading = "SQL REPL"
+    )]
+    pub http_endpoint: String,
+}
+
+const NQL_LINE_PREFIX: &str = "nql ";
+
+async fn send_nsql_request(
+    client: &Client,
+    base_url: String,
+    query: String,
+    runtime: NSQLRuntime,
+) -> Result<String, reqwest::Error> {
+    client
+        .post(format!("{base_url}/v1/nsql"))
+        .header("Content-Type", "application/json")
+        .json(&json!({
+            "query": query,
+            "use": runtime,
+        }))
+        .send()
+        .await?
+        .text()
+        .await
 }
 
 #[allow(clippy::too_many_lines)]
@@ -56,7 +90,7 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
         .await?;
 
     // The encoder/decoder size is limited to 500MB.
-    let mut client = FlightServiceClient::new(channel)
+    let client = FlightServiceClient::new(channel)
         .max_decoding_message_size(500 * 1024 * 1024)
         .max_encoding_message_size(500 * 1024 * 1024);
 
@@ -112,109 +146,171 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
             "show tables" | "show tables;" => {
                 "select table_name, table_type from information_schema.tables where table_schema = 'public'"
             }
+            line if line.to_lowercase().starts_with(NQL_LINE_PREFIX) => {
+                let _ = rl.add_history_entry(line);
+                get_and_display_nql_records(
+                    repl_config.http_endpoint.clone(),
+                     line.strip_prefix(NQL_LINE_PREFIX).unwrap_or(line).to_string()
+                ).await.map_err(|e| format!("Error occured on NQL request: {e}"))?;
+                continue;
+            }
             _ => line,
         };
 
         let _ = rl.add_history_entry(line);
 
-        let sql_command = CommandStatementQuery {
-            query: line.to_string(),
-            transaction_id: None,
-        };
-        let sql_command_bytes = sql_command.as_any().encode_to_vec();
-
-        let request = FlightDescriptor::new_cmd(sql_command_bytes);
-
         let start_time = Instant::now();
-        let mut flight_info = match client.get_flight_info(request).await {
-            Ok(flight_info) => flight_info.into_inner(),
-            Err(e) => {
-                display_grpc_error(&e);
-                last_error = Some(e);
+        match get_records(client.clone(), line).await {
+            Ok((_, 0)) => {
+                println!("No results.");
+            }
+            Ok((records, total_rows)) => {
+                display_records(records, start_time, total_rows).await?;
+            }
+            Err(FlightError::Tonic(status)) => {
+                display_grpc_error(&status);
+                last_error = Some(status);
                 continue;
             }
-        };
-        let Some(endpoint) = flight_info.endpoint.pop() else {
-            let internal_err = Status::internal("No endpoint");
-            display_grpc_error(&internal_err);
-            last_error = Some(internal_err);
-            continue;
-        };
-        let Some(ticket) = endpoint.ticket else {
-            let internal_err = Status::internal("No ticket");
-            display_grpc_error(&internal_err);
-            last_error = Some(internal_err);
-            continue;
-        };
-        let request = ticket.into_request();
-
-        let stream = match client.do_get(request).await {
-            Ok(stream) => stream.into_inner(),
             Err(e) => {
-                display_grpc_error(&e);
-                last_error = Some(e);
-                continue;
-            }
-        };
-        let mut stream =
-            FlightRecordBatchStream::new_from_flight_data(stream.map_err(FlightError::Tonic));
-        let mut records = vec![];
-        let mut total_rows = 0;
-        while let Some(data) = stream.next().await {
-            match data {
-                Ok(data) => {
-                    total_rows += data.num_rows();
-                    records.push(data);
-                }
-                Err(e) => {
-                    match e {
-                        FlightError::Tonic(e) => {
-                            display_grpc_error(&e);
-                            last_error = Some(e);
-                        }
-                        _ => println!("Error receiving data: {e}"),
-                    };
-                    break;
-                }
+                println!(
+                    "Unexpected Flight Error {}",
+                    Colour::Red.paint(e.to_string())
+                );
             }
         }
-
-        if records.is_empty() {
-            println!("No results.");
-            continue;
-        }
-        let schema = records[0].schema();
-
-        let ctx = SessionContext::new();
-        let provider = MemTable::try_new(schema, vec![records])?;
-        let df = DataFrame::new(
-            ctx.state(),
-            LogicalPlanBuilder::scan(UNNAMED_TABLE, provider_as_source(Arc::new(provider)), None)?
-                .limit(0, Some(500))?
-                .build()?,
-        );
-
-        let num_rows = df.clone().count().await?;
-
-        if let Err(e) = df.show().await {
-            println!("Error displaying results: {e}");
-        };
-        let elapsed = start_time.elapsed();
-        if num_rows == total_rows {
-            println!(
-                "\nTime: {} seconds. {num_rows} rows.",
-                elapsed.as_secs_f64()
-            );
-        } else {
-            println!(
-                "\nTime: {} seconds. {num_rows}/{total_rows} rows displayed.",
-                elapsed.as_secs_f64()
-            );
-        }
-        last_error = None;
     }
 
     Ok(())
+}
+
+/// Send a SQL query to the Flight service and return the resulting record batches.
+///
+/// # Errors
+///
+/// Returns an error if the Flight service returns an error.
+async fn get_records(
+    mut client: FlightServiceClient<Channel>,
+    line: &str,
+) -> Result<(Vec<RecordBatch>, usize), FlightError> {
+    let sql_command = CommandStatementQuery {
+        query: line.to_string(),
+        transaction_id: None,
+    };
+    let sql_command_bytes = sql_command.as_any().encode_to_vec();
+
+    let request = FlightDescriptor::new_cmd(sql_command_bytes);
+
+    let mut flight_info = client.get_flight_info(request).await?.into_inner();
+    let Some(endpoint) = flight_info.endpoint.pop() else {
+        return Err(FlightError::Tonic(Status::internal("No endpoint")));
+    };
+    let Some(ticket) = endpoint.ticket else {
+        return Err(FlightError::Tonic(Status::internal("No ticket")));
+    };
+    let request = ticket.into_request();
+
+    let stream = client.do_get(request).await?.into_inner();
+
+    let mut stream =
+        FlightRecordBatchStream::new_from_flight_data(stream.map_err(FlightError::Tonic));
+    let mut records = vec![];
+    let mut total_rows = 0_usize;
+    while let Some(data) = stream.next().await {
+        match data {
+            Ok(data) => {
+                total_rows += data.num_rows();
+                records.push(data);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    Ok((records, total_rows))
+}
+
+/// Display a set of record batches to the user. This function will display the first 500 rows.
+///
+/// # Errors
+///
+/// Returns an error if the record batches cannot be loaded into Datafusion.
+async fn display_records(
+    records: Vec<RecordBatch>,
+    start_time: Instant,
+    total_rows: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = records[0].schema();
+
+    let ctx = SessionContext::new();
+    let provider = MemTable::try_new(schema, vec![records])?;
+    let df = DataFrame::new(
+        ctx.state(),
+        LogicalPlanBuilder::scan(UNNAMED_TABLE, provider_as_source(Arc::new(provider)), None)?
+            .limit(0, Some(500))?
+            .build()?,
+    );
+
+    let num_rows = df.clone().count().await?;
+
+    if let Err(e) = df.show().await {
+        println!("Error displaying results: {e}");
+    };
+    let elapsed = start_time.elapsed();
+    if num_rows == total_rows {
+        println!(
+            "\nTime: {} seconds. {num_rows} rows.",
+            elapsed.as_secs_f64()
+        );
+    } else {
+        println!(
+            "\nTime: {} seconds. {num_rows}/{total_rows} rows displayed.",
+            elapsed.as_secs_f64()
+        );
+    }
+    Ok(())
+}
+
+
+/// Use the `POST v1/nsql` HTTP endpoint to send an NSQL query and display the resulting records.
+async fn get_and_display_nql_records(
+    endpoint: String,
+    query: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let start_time = Instant::now();
+
+    let resp = send_nsql_request(&Client::new(), endpoint, query, NSQLRuntime::Openai).await?;
+
+    let jsonl_resp = json_array_to_jsonl(&resp)?;
+
+    let (schema, _) = arrow_json::reader::infer_json_schema(jsonl_resp.as_bytes(), None)?;
+
+    let records: Vec<RecordBatch> = arrow_json::ReaderBuilder::new(Arc::new(schema))
+        .build(jsonl_resp.as_bytes())?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let total_rows = records
+        .iter()
+        .map(RecordBatch::num_rows)
+        .reduce(|x, y| x + y)
+        .unwrap_or(0) as usize;
+
+    display_records(records, start_time, total_rows).await?;
+
+    Ok(())
+}
+
+/// Convert a JSON array string to a JSONL string. 
+fn json_array_to_jsonl(json_array_str: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let json_array: Vec<serde_json::Value> = serde_json::from_str(json_array_str)?;
+
+    let jsonl_strings: Vec<String> = json_array
+        .into_iter()
+        .map(|item| serde_json::to_string(&item))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let jsonl_str = jsonl_strings.join("\n");
+
+    Ok(jsonl_str)
 }
 
 fn display_grpc_error(err: &Status) {
