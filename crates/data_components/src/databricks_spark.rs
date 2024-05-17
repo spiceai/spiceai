@@ -36,7 +36,7 @@ impl DatabricksSparkConnect {
     ) -> Result<Self, Box<dyn Error + Send + Sync>> {
         let user = user.unwrap_or("spice.ai".to_string());
         let session_id = Uuid::new_v4();
-        let connection = format!("sc://{endpoint}:443/;use_ssl={databricks_use_ssl};ser_id={user};session_id={session_id};token={token};x-databricks-cluster-id={cluster_id}");
+        let connection = format!("sc://{endpoint}:443/;use_ssl={databricks_use_ssl};user_id={user};session_id={session_id};token={token};x-databricks-cluster-id={cluster_id}");
         Ok(Self {
             spark_connect: SparkConnect::from_connection(connection.as_str()).await?,
         })
