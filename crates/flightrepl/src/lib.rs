@@ -270,7 +270,6 @@ async fn display_records(
     Ok(())
 }
 
-
 /// Use the `POST v1/nsql` HTTP endpoint to send an NSQL query and display the resulting records.
 async fn get_and_display_nql_records(
     endpoint: String,
@@ -299,7 +298,7 @@ async fn get_and_display_nql_records(
     Ok(())
 }
 
-/// Convert a JSON array string to a JSONL string. 
+/// Convert a JSON array string to a JSONL string.
 fn json_array_to_jsonl(json_array_str: &str) -> Result<String, Box<dyn std::error::Error>> {
     let json_array: Vec<serde_json::Value> = serde_json::from_str(json_array_str)?;
 
