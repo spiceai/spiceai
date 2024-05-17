@@ -142,10 +142,9 @@ pub enum DataConnectorError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Invalid configuration for {dataconnector}. {message}"))]
-    InvalidConfiguration {
+    #[snafu(display("{dataconnector}: {source}."))]
+    ListingTableInternal {
         dataconnector: String,
-        message: String,
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
@@ -393,25 +392,22 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
 
         let url = self
             .get_object_store_url(dataset)
-            .context(InvalidConfigurationSnafu {
+            .context(ListingTableInternalSnafu {
                 dataconnector: format!("{__self}"),
-                message: "Unable to parse URL",
             })?;
 
         let table_path =
             ListingTableUrl::parse(url)
                 .boxed()
-                .context(InvalidConfigurationSnafu {
+                .context(ListingTableInternalSnafu {
                     dataconnector: format!("{__self}"),
-                    message: "Unable to parse URL",
                 })?;
 
         let (file_format, extension) = self
             .get_file_format_and_extension()
             .map_err(Into::into)
-            .context(InvalidConfigurationSnafu {
+            .context(ListingTableInternalSnafu {
                 dataconnector: format!("{__self}"),
-                message: "Unable to resolve file_format and file_extension",
             })?;
         let options = ListingOptions::new(file_format).with_file_extension(&extension);
 
@@ -419,9 +415,8 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
             .infer_schema(&ctx.state(), &table_path)
             .await
             .boxed()
-            .context(InvalidConfigurationSnafu {
+            .context(ListingTableInternalSnafu {
                 dataconnector: format!("{__self}"),
-                message: "Unable to infer files schema",
             })?;
 
         let config = ListingTableConfig::new(table_path)
@@ -430,9 +425,8 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
 
         let table = ListingTable::try_new(config)
             .boxed()
-            .context(InvalidConfigurationSnafu {
+            .context(ListingTableInternalSnafu {
                 dataconnector: format!("{__self}"),
-                message: "Unable to list files in data provider",
             })?;
 
         Ok(Arc::new(table))
