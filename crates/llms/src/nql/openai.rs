@@ -10,15 +10,24 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use super::{FailedToLoadModelSnafu, Nql, Result};
+use super::{FailedToLoadModelSnafu, FailedToLoadTokenizerSnafu, Nql, Result};
 use crate::nql::FailedToRunModelSnafu;
 
-use async_openai::{config::OpenAIConfig, types::CreateCompletionRequestArgs, Client};
+use async_openai::{
+    config::OpenAIConfig,
+    types::{
+        ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
+        ChatCompletionResponseFormat, ChatCompletionResponseFormatType,
+        CreateChatCompletionRequestArgs,
+    },
+    Client,
+};
 use async_trait::async_trait;
+use serde_json::Value;
 use snafu::ResultExt;
 
 const MAX_COMPLETION_TOKENS: u16 = 1024_u16; // Avoid accidentally using infinite tokens. Should think about this more.
-const GPT3_5_TURBO_INSTRUCT: &str = "gpt-3.5-turbo-instruct";
+const GPT3_5_TURBO_INSTRUCT: &str = "gpt-3.5-turbo";
 
 pub struct Openai {
     client: Client<OpenAIConfig>,
@@ -39,14 +48,40 @@ impl Openai {
             model,
         }
     }
+
+    /// Convert the Json object returned when using a `{ "type": "json_object" } ` response format.
+    /// Expected format is `"content": "{\"arbitrary_key\": \"arbitrary_value\"}"`
+    pub fn convert_json_object_to_sql(raw_json: &str) -> Result<Option<String>> {
+        let result: Value = serde_json::from_str(raw_json)
+            .boxed()
+            .context(FailedToRunModelSnafu)?;
+        Ok(result["sql"].as_str().map(std::string::ToString::to_string))
+    }
 }
 
 #[async_trait]
 impl Nql for Openai {
     async fn run(&mut self, prompt: String) -> Result<Option<String>> {
-        let request = CreateCompletionRequestArgs::default()
+        let messages: Vec<ChatCompletionRequestMessage> = vec![
+            ChatCompletionRequestSystemMessageArgs::default()
+                .content("Return JSON, with the requested SQL under 'sql'.")
+                .build()
+                .boxed()
+                .context(FailedToLoadTokenizerSnafu)?
+                .into(),
+            ChatCompletionRequestSystemMessageArgs::default()
+                .content(prompt)
+                .build()
+                .boxed()
+                .context(FailedToLoadTokenizerSnafu)?
+                .into(),
+        ];
+        let request = CreateChatCompletionRequestArgs::default()
             .model(self.model.clone())
-            .prompt(prompt.as_str())
+            .response_format(ChatCompletionResponseFormat {
+                r#type: ChatCompletionResponseFormatType::JsonObject,
+            })
+            .messages(messages)
             .max_tokens(MAX_COMPLETION_TOKENS)
             .build()
             .boxed()
@@ -54,7 +89,7 @@ impl Nql for Openai {
 
         let response = self
             .client
-            .completions()
+            .chat()
             .create(request)
             .await
             .boxed()
@@ -69,6 +104,13 @@ impl Nql for Openai {
             }
         }
 
-        Ok(response.choices.first().map(|c| c.text.clone()))
+        match response
+            .choices
+            .iter()
+            .find_map(|c| c.message.content.clone())
+        {
+            Some(json_resp) => Self::convert_json_object_to_sql(&json_resp),
+            None => Ok(None),
+        }
     }
 }
