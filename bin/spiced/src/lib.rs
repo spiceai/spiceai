@@ -102,22 +102,17 @@ pub async fn run(args: Args) -> Result<()> {
             }
         };
 
-    let cache = match Runtime::create_results_cache(&app) {
-        Ok(cache) => cache,
-        Err(e) => {
-            tracing::warn!("{}", e);
-            None
+    match Runtime::create_results_cache(&app) {
+        Ok(cache) => {
+            df.write().await.set_cache_provider(cache);
         }
-    };
+        Err(e) => {
+            tracing::warn!("Failed to initialize query results cache: {e}");
+        }
+    }
 
-    let mut rt: Runtime = Runtime::new(
-        args.runtime,
-        Arc::new(RwLock::new(app)),
-        df,
-        pods_watcher,
-        Arc::new(RwLock::new(cache)),
-    )
-    .await;
+    let mut rt: Runtime =
+        Runtime::new(args.runtime, Arc::new(RwLock::new(app)), df, pods_watcher).await;
 
     rt.load_secrets().await;
 

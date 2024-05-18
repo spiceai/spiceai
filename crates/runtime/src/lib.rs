@@ -180,7 +180,6 @@ pub struct Runtime {
     pub models: Arc<RwLock<HashMap<String, Model>>>,
     pub pods_watcher: podswatcher::PodsWatcher,
     pub secrets_provider: Arc<RwLock<secrets::SecretsProvider>>,
-    pub results_cache: Arc<RwLock<Option<cache::QueryResultCacheProvider>>>,
 
     spaced_tracer: Arc<tracers::SpacedTracer>,
 }
@@ -192,7 +191,6 @@ impl Runtime {
         app: Arc<RwLock<Option<app::App>>>,
         df: Arc<RwLock<DataFusion>>,
         pods_watcher: podswatcher::PodsWatcher,
-        results_cache: Arc<RwLock<Option<QueryResultCacheProvider>>>,
     ) -> Self {
         dataconnector::register_all().await;
         dataaccelerator::register_all().await;
@@ -204,7 +202,6 @@ impl Runtime {
             pods_watcher,
             secrets_provider: Arc::new(RwLock::new(secrets::SecretsProvider::new())),
             spaced_tracer: Arc::new(tracers::SpacedTracer::new(Duration::from_secs(15))),
-            results_cache,
         }
     }
 
@@ -814,6 +811,9 @@ impl Runtime {
             Some(config) => {
                 let cache_provider = QueryResultCacheProvider::new(config)
                     .context(UnableToCreateResultsCacheSnafu)?;
+
+                tracing::info!("Initialized query results cache: {cache_provider}");
+
                 Ok(Some(cache_provider))
             }
             None => Ok(None),
