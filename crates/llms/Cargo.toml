@@ -29,7 +29,7 @@ tokenizers = {version= "0.19.1", optional = true}
 ## `mistralrs` feature packages
 mistralrs = {git = "https://github.com/Jeadie/mistral.rs", optional=true, rev="04e4abf19935d0f7882f0ca71450ba150dc85caa"}
 mistralrs-core = {git = "https://github.com/Jeadie/mistral.rs", optional=true, rev="04e4abf19935d0f7882f0ca71450ba150dc85caa", package="mistralrs-core" }
-candle-core-rs = { package="candle-core", git = "https://github.com/EricLBuehler/candle.git", version = "0.5.0", optional=true}
+candle-core-rs = { package="candle-core", git = "https://github.com/EricLBuehler/candle.git", rev = "5892fac1ebb77bfb1ad4e02b0c3fb8312693db1e", optional=true}
 tokio = { workspace = true, optional=true }
 
 [features]
