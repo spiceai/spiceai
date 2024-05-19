@@ -37,7 +37,7 @@ pub enum Error {
     #[snafu(display("Failed to parse cache_max_size value: {source}"))]
     FailedToParseCacheMaxSize { source: byte_unit::ParseError },
 
-    #[snafu(display("Failed to parse item_expire value: {}", source))]
+    #[snafu(display("Failed to parse item_expire value: {source}"))]
     FailedToParseItemExpire { source: ParseError },
 }
 
