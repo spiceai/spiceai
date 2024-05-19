@@ -3563,11 +3563,15 @@ version = "0.13.0-alpha"
 dependencies = [
  "ansi_term",
  "arrow-flight",
+ "arrow-json",
  "clap",
  "datafusion",
  "futures",
+ "llms",
  "prost 0.12.4",
+ "reqwest 0.11.27",
  "rustyline",
+ "serde_json",
  "tonic 0.11.0",
  "tracing",
 ]
@@ -5324,8 +5328,8 @@ checksum = "c9be0862c1b3f26a88803c4a49de6889c10e608b3ee9344e6ef5b45fb37ad3d1"
 
 [[package]]
 name = "mistralrs"
-version = "0.1.7"
-source = "git+https://github.com/Jeadie/mistral.rs?rev=04e4abf19935d0f7882f0ca71450ba150dc85caa#04e4abf19935d0f7882f0ca71450ba150dc85caa"
+version = "0.1.8"
+source = "git+https://github.com/EricLBuehler/mistral.rs#ca9bf7d1a8a67bd69a3eed89841a106d2e518c45"
 dependencies = [
  "anyhow",
  "candle-core 0.5.0 (git+https://github.com/EricLBuehler/candle.git)",
@@ -5336,8 +5340,8 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-core"
-version = "0.1.7"
-source = "git+https://github.com/Jeadie/mistral.rs?rev=04e4abf19935d0f7882f0ca71450ba150dc85caa#04e4abf19935d0f7882f0ca71450ba150dc85caa"
+version = "0.1.8"
+source = "git+https://github.com/EricLBuehler/mistral.rs#ca9bf7d1a8a67bd69a3eed89841a106d2e518c45"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5358,7 +5362,6 @@ dependencies = [
  "indicatif",
  "lrtable",
  "minijinja",
- "mistralrs-lora",
  "once_cell",
  "radix_trie",
  "rand",
@@ -5377,18 +5380,6 @@ dependencies = [
  "tqdm",
  "tracing",
  "vob",
-]
-
-[[package]]
-name = "mistralrs-lora"
-version = "0.1.7"
-source = "git+https://github.com/Jeadie/mistral.rs?rev=04e4abf19935d0f7882f0ca71450ba150dc85caa#04e4abf19935d0f7882f0ca71450ba150dc85caa"
-dependencies = [
- "candle-core 0.5.0 (git+https://github.com/EricLBuehler/candle.git)",
- "candle-nn 0.5.0 (git+https://github.com/EricLBuehler/candle.git)",
- "either",
- "serde",
- "serde_json",
 ]
 
 [[package]]
