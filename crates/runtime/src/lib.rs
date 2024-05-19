@@ -809,10 +809,14 @@ impl Runtime {
 
         match cache_config {
             Some(config) => {
+                if !config.enabled {
+                    return Ok(None);
+                }
+
                 let cache_provider = QueryResultCacheProvider::new(config)
                     .context(UnableToCreateResultsCacheSnafu)?;
 
-                tracing::info!("Initialized query results cache: {cache_provider}");
+                tracing::info!("Initialized query results cache; {cache_provider}");
 
                 Ok(Some(cache_provider))
             }
