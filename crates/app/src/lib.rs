@@ -67,6 +67,7 @@ impl AppBuilder {
         }
     }
 
+    #[must_use]
     pub fn with_spicepod(mut self, spicepod: Spicepod) -> AppBuilder {
         self.secrets = spicepod.secrets.clone();
         self.datasets.extend(spicepod.datasets.clone());
@@ -75,21 +76,25 @@ impl AppBuilder {
         self
     }
 
+    #[must_use]
     pub fn with_secret(mut self, secret: Secrets) -> AppBuilder {
         self.secrets = secret;
         self
     }
 
+    #[must_use]
     pub fn with_dataset(mut self, dataset: Dataset) -> AppBuilder {
         self.datasets.push(dataset);
         self
     }
 
+    #[must_use]
     pub fn with_model(mut self, model: Model) -> AppBuilder {
         self.models.push(model);
         self
     }
 
+    #[must_use]
     pub fn build(self) -> App {
         App {
             name: self.name,
