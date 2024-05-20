@@ -611,8 +611,8 @@ mod tests {
                 match value {
                     DebugValue::Gauge(i) => {
                         let value = i.into_inner();
-                        let desired = desired as i32 as f64;
-                        if value.is_eq(desired) {
+
+                        if value.is_eq(f64::from(desired as i32)) {
                             return true;
                         }
                     }
