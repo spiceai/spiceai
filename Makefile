@@ -27,11 +27,15 @@ ci:
 
 .PHONY: test
 test:
-	@cargo test --all
+	@cargo test --all --lib
 
-.PHONY: test
+.PHONY: nextest
 nextest:
 	@cargo nextest run --all
+
+.PHONY: test-integration
+test-integration:
+	@cargo test -p runtime --test integration --features federation-experimental -- --nocapture
 
 .PHONY: lint
 lint:
