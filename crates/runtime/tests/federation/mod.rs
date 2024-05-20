@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use app::AppBuilder;
+use arrow::array::Int64Array;
 use datafusion::assert_batches_eq;
 use runtime::{datafusion::DataFusion, Runtime};
 use spicepod::component::{
@@ -16,14 +17,12 @@ fn make_spiceai_dataset(path: &str, name: &str) -> Dataset {
 #[tokio::test]
 async fn basic_federation_push_down() -> Result<(), String> {
     let eth_blocks_ds = make_spiceai_dataset("eth.recent_blocks", "blocks");
-    let eth_tx_ds = make_spiceai_dataset("eth.recent_transactions", "tx");
 
     let app = AppBuilder::new("basic_federation_push_down")
         .with_secret(Secrets {
             store: SpiceSecretStore::File,
         })
         .with_dataset(eth_blocks_ds)
-        .with_dataset(eth_tx_ds)
         .build();
 
     let df = Arc::new(RwLock::new(DataFusion::new()));
@@ -37,7 +36,7 @@ async fn basic_federation_push_down() -> Result<(), String> {
 
     let results = df
         .ctx
-        .sql("EXPLAIN SELECT MAX(number) as max_num FROM blocks UNION ALL SELECT MAX(block_number) as max_num FROM tx")
+        .sql("EXPLAIN SELECT MAX(number) as max_num FROM blocks")
         .await
         .expect("EXPLAIN query to plan")
         .collect()
@@ -47,15 +46,40 @@ async fn basic_federation_push_down() -> Result<(), String> {
     #[rustfmt::skip]
     let expected = 
     [
-        "+---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
-        "| plan_type     | plan                                                                                                                                                                                                                                                                                                                                                                                                                             |",
-        "+---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
-        "| logical_plan  | TableScan: blocks projection=[number, hash, parent_hash, nonce, sha3_uncles, logs_bloom, transactions_root, state_root, receipts_root, miner, difficulty, total_difficulty, size, extra_data, gas_limit, gas_used, timestamp, transaction_count, base_fee_per_gas, withdrawals_root, withdrawal_count, parent_beacon_block_root, blob_gas_used, excess_blob_gas]                                                                 |",
-        "| physical_plan | FlightExec sql=SELECT \"number\", \"hash\", \"parent_hash\", \"nonce\", \"sha3_uncles\", \"logs_bloom\", \"transactions_root\", \"state_root\", \"receipts_root\", \"miner\", \"difficulty\", \"total_difficulty\", \"size\", \"extra_data\", \"gas_limit\", \"gas_used\", \"timestamp\", \"transaction_count\", \"base_fee_per_gas\", \"withdrawals_root\", \"withdrawal_count\", \"parent_beacon_block_root\", \"blob_gas_used\", \"excess_blob_gas\" FROM eth.recent_blocks   |",
-        "|               |                                                                                                                                                                                                                                                                                                                                                                                                                                  |",
-        "+---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+        "+---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+        "| plan_type     | plan                                                                                                                                                                            |",
+        "+---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+        "| logical_plan  | Federated                                                                                                                                                                       |",
+        "|               |  Projection: MAX(blocks.number) AS max_num                                                                                                                                      |",
+        "|               |   Aggregate: groupBy=[[]], aggr=[[MAX(blocks.number)]]                                                                                                                          |",
+        "|               |     SubqueryAlias: blocks                                                                                                                                                       |",
+        "|               |       TableScan: eth.recent_blocks                                                                                                                                              |",
+        "| physical_plan | VirtualExecutionPlan name=spiceai compute_context=url=https://flight.spiceai.io,username= sql=SELECT MAX(\"blocks\".\"number\") AS \"max_num\" FROM \"eth\".\"recent_blocks\" AS \"blocks\" |",
+        "|               |                                                                                                                                                                                 |",
+        "+---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
     ];
     assert_batches_eq!(expected, &results);
+
+    let batches = df
+        .ctx
+        .sql("SELECT MAX(number) as max_num FROM blocks")
+        .await
+        .expect("query to plan")
+        .collect()
+        .await
+        .expect("to collect results");
+
+    for batch in batches {
+        assert_eq!(batch.num_columns(), 1);
+        assert_eq!(batch.num_rows(), 1);
+        let max_num_arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64Array");
+        assert_eq!(max_num_arr.len(), 1);
+        assert_ne!(max_num_arr.value(0), 0);
+    }
 
     Ok(())
 }
