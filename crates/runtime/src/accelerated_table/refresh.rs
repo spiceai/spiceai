@@ -601,7 +601,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_refresh_status_change_to_ready() {
-        fn wait_until_ready_status(snapshotter: &Snapshotter, desired: status::ComponentStatus) -> bool {
+        fn wait_until_ready_status(
+            snapshotter: &Snapshotter,
+            desired: status::ComponentStatus,
+        ) -> bool {
             for _i in 1..20 {
                 let hashmap = snapshotter.snapshot().into_vec();
                 let (_, _, _, value) = hashmap.first().expect("at least one metric exists");
@@ -636,13 +639,19 @@ mod tests {
         )
         .await;
 
-        assert!(wait_until_ready_status(&snapshotter, status::ComponentStatus::Ready));
+        assert!(wait_until_ready_status(
+            &snapshotter,
+            status::ComponentStatus::Ready
+        ));
 
         status::update_dataset("test", status::ComponentStatus::Refreshing);
 
         setup_and_test(vec![], vec![], 0).await;
 
-        assert!(wait_until_ready_status(&snapshotter, status::ComponentStatus::Ready));
+        assert!(wait_until_ready_status(
+            &snapshotter,
+            status::ComponentStatus::Ready
+        ));
     }
 
     #[allow(clippy::too_many_lines)]
