@@ -33,6 +33,7 @@ default = [
   "spark",
   "snowflake",
   "ftp",
+  "federation-experimental",
 ]
 duckdb = ["runtime/duckdb", "spicepod/duckdb", "app/duckdb"]
 postgres = ["runtime/postgres", "spicepod/postgres", "app/postgres"]
