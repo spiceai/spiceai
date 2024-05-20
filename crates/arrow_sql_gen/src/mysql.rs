@@ -18,15 +18,15 @@ use std::{convert, sync::Arc};
 
 use arrow::{
     array::{
-        ArrayBuilder, ArrayRef, Date32Builder, Decimal128Builder, Float32Builder, Float64Builder,
-        Int16Builder, Int32Builder, Int64Builder, Int8Builder, NullBuilder, RecordBatch,
-        RecordBatchOptions, StringBuilder, TimestampMillisecondBuilder, UInt64Builder,
+        ArrayBuilder, ArrayRef, Date32Builder, Date64Builder, Decimal128Builder, Float32Builder,
+        Float64Builder, Int16Builder, Int32Builder, Int64Builder, Int8Builder, NullBuilder,
+        RecordBatch, RecordBatchOptions, StringBuilder, TimestampMillisecondBuilder, UInt64Builder,
     },
-    datatypes::{DataType, Date32Type, Field, Schema, TimeUnit},
+    datatypes::{DataType, Date32Type, Date64Type, Field, Schema, TimeUnit},
 };
 use bigdecimal::BigDecimal;
 use bigdecimal::ToPrimitive;
-use chrono::{NaiveDate, Timelike};
+use chrono::{NaiveDate, NaiveDateTime, Timelike};
 use mysql_async::{consts::ColumnType, FromValueError, Row, Value};
 use snafu::{ResultExt, Snafu};
 
@@ -129,6 +129,7 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
         }
     }
 
+    dbg!(rows);
     for row in rows {
         for (i, mysql_type) in mysql_types.iter().enumerate() {
             let Some(builder) = arrow_columns_builders.get_mut(i) else {
@@ -195,6 +196,26 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                         ColumnType::MYSQL_TYPE_SHORT,
                         Int16Builder,
                         i16,
+                        row,
+                        i
+                    );
+                }
+                ColumnType::MYSQL_TYPE_YEAR => {
+                    handle_primitive_type!(
+                        builder,
+                        ColumnType::MYSQL_TYPE_YEAR,
+                        Int16Builder,
+                        i16,
+                        row,
+                        i
+                    );
+                }
+                ColumnType::MYSQL_TYPE_INT24 => {
+                    handle_primitive_type!(
+                        builder,
+                        ColumnType::MYSQL_TYPE_INT24,
+                        Int32Builder,
+                        i32,
                         row,
                         i
                     );
@@ -340,7 +361,8 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                         None => builder.append_null(),
                     }
                 }
-                ColumnType::MYSQL_TYPE_TIMESTAMP => {
+                column_type @ (ColumnType::MYSQL_TYPE_TIMESTAMP
+                | ColumnType::MYSQL_TYPE_DATETIME) => {
                     let Some(builder) = builder else {
                         return NoBuilderForIndexSnafu { index: i }.fail();
                     };
@@ -355,7 +377,7 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                     };
                     let v = handle_null_error(row.get_opt::<Value, usize>(i).transpose()).context(
                         FailedToGetRowValueSnafu {
-                            mysql_type: ColumnType::MYSQL_TYPE_TIMESTAMP,
+                            mysql_type: column_type,
                         },
                     )?;
 
@@ -426,19 +448,40 @@ fn map_column_to_data_type(column_type: ColumnType) -> Option<DataType> {
         ColumnType::MYSQL_TYPE_NULL => Some(DataType::Null),
         ColumnType::MYSQL_TYPE_BIT => Some(DataType::UInt64),
         ColumnType::MYSQL_TYPE_TINY => Some(DataType::Int8),
-        ColumnType::MYSQL_TYPE_SHORT => Some(DataType::Int16),
-        ColumnType::MYSQL_TYPE_LONG => Some(DataType::Int32),
+        ColumnType::MYSQL_TYPE_YEAR | ColumnType::MYSQL_TYPE_SHORT => Some(DataType::Int16),
+        ColumnType::MYSQL_TYPE_INT24 | ColumnType::MYSQL_TYPE_LONG => Some(DataType::Int32),
         ColumnType::MYSQL_TYPE_LONGLONG => Some(DataType::Int64),
         ColumnType::MYSQL_TYPE_FLOAT => Some(DataType::Float32),
         ColumnType::MYSQL_TYPE_DOUBLE => Some(DataType::Float64),
         ColumnType::MYSQL_TYPE_DECIMAL | ColumnType::MYSQL_TYPE_NEWDECIMAL => None,
-        ColumnType::MYSQL_TYPE_TIMESTAMP => Some(DataType::Timestamp(TimeUnit::Millisecond, None)),
+        ColumnType::MYSQL_TYPE_TIMESTAMP | ColumnType::MYSQL_TYPE_DATETIME | ColumnType::MYSQL_TYPE_DATETIME2  => {
+            Some(DataType::Timestamp(TimeUnit::Millisecond, None))
+        }
         ColumnType::MYSQL_TYPE_DATE => Some(DataType::Date32),
+        ColumnType::MYSQL_TYPE_TIME | ColumnType::MYSQL_TYPE_TIME2 => {
+            Some(DataType::Time64(TimeUnit::Microsecond))
+        }
         ColumnType::MYSQL_TYPE_VARCHAR
         | ColumnType::MYSQL_TYPE_STRING
         | ColumnType::MYSQL_TYPE_VAR_STRING
         | ColumnType::MYSQL_TYPE_BLOB => Some(DataType::Utf8),
-        _ => unimplemented!("Unsupported column type {:?}", column_type),
+        ColumnType::MYSQL_TYPE_JSON | ColumnType::MYSQL_TYPE_ENUM => Some(DataType::LargeUtf8),
+        ColumnType::MYSQL_TYPE_TINY_BLOB
+        | ColumnType::MYSQL_TYPE_MEDIUM_BLOB
+        | ColumnType::MYSQL_TYPE_LONG_BLOB => Some(DataType::LargeBinary),
+
+        // replication only
+        ColumnType::MYSQL_TYPE_TYPED_ARRAY
+        // internal
+        | ColumnType::MYSQL_TYPE_NEWDATE
+        // Unsupported yet
+        | ColumnType::MYSQL_TYPE_UNKNOWN
+        | ColumnType::MYSQL_TYPE_TIMESTAMP2
+        | ColumnType::MYSQL_TYPE_GEOMETRY
+        | ColumnType::MYSQL_TYPE_SET => {
+
+            unimplemented!("Unsupported column type {:?}", column_type)
+        }
     }
 }
 
