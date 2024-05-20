@@ -682,9 +682,24 @@ impl Runtime {
         self.load_model(m).await;
     }
 
-    pub async fn start_metrics(&mut self, with_metrics: Option<SocketAddr>) -> Result<()> {
+    pub async fn start_metrics(
+        &mut self,
+        with_metrics: Option<SocketAddr>,
+        cloud_dataset_path: Option<String>,
+    ) -> Result<()> {
         if let Some(metrics_socket) = with_metrics {
-            let recorder = MetricsRecorder::new(metrics_socket)
+            let secret = match self
+                .secrets_provider
+                .read()
+                .await
+                .get_secret("spiceai")
+                .await
+            {
+                Ok(s) => s,
+                Err(_) => None,
+            };
+
+            let recorder = MetricsRecorder::new(metrics_socket, secret, cloud_dataset_path)
                 .await
                 .context(UnableToStartLocalMetricsSnafu)?;
 
