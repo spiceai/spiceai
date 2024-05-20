@@ -33,4 +33,3 @@ pgtemp = "0.3.0"
 postgres = ["db_connection_pool/postgres"]
 sqlite = ["db_connection_pool/sqlite"]
 mysql = ["db_connection_pool/mysql"]
-federation-experimental = ["datafusion-federation", "datafusion-federation-sql"]

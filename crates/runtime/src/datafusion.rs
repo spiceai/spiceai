@@ -193,7 +193,6 @@ impl DataFusion {
 
         let state = SessionState::new_with_config_rt(df_config, default_runtime_env());
 
-        #[cfg(feature = "federation-experimental")]
         let state = {
             use datafusion_federation::{FederatedQueryPlanner, FederationAnalyzerRule};
             state

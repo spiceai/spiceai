@@ -35,7 +35,7 @@ nextest:
 
 .PHONY: test-integration
 test-integration:
-	@cargo test -p runtime --test integration --features federation-experimental -- --nocapture
+	@cargo test -p runtime --test integration -- --nocapture
 
 .PHONY: lint
 lint:
@@ -85,10 +85,6 @@ install: build
 .PHONY: install-with-models
 install-with-models:
 	make install SPICED_NON_DEFAULT_FEATURES="models"
-
-.PHONY: install-with-federation
-install-with-federation:
-	make install SPICED_NON_DEFAULT_FEATURES="federation-experimental"
 
 .PHONY: install-cli
 install-cli: build-cli

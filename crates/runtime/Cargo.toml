@@ -148,7 +148,3 @@ snowflake = [
     "data_components/snowflake",
 ]
 models = ["model_components/full", "llms/mistralrs"]
-federation-experimental = [
-    "dep:datafusion-federation",
-    "data_components/federation-experimental",
-]

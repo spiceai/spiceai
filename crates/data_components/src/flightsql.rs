@@ -49,7 +49,6 @@ use tonic::transport::{channel, Channel};
 
 use crate::Read;
 
-#[cfg(feature = "federation-experimental")]
 pub mod federation;
 
 #[derive(Debug, Snafu)]
@@ -107,7 +106,6 @@ impl Read for FlightSQLFactory {
             .await?,
         );
 
-        #[cfg(feature = "federation-experimental")]
         let table_provider = Arc::new(
             table_provider
                 .create_federated_table_provider()

@@ -33,7 +33,6 @@ default = [
   "spark",
   "snowflake",
   "ftp",
-  "federation-experimental",
 ]
 duckdb = ["runtime/duckdb", "spicepod/duckdb", "app/duckdb"]
 postgres = ["runtime/postgres", "spicepod/postgres", "app/postgres"]
@@ -52,4 +51,3 @@ odbc = ["runtime/odbc"]
 spark = ["runtime/spark"]
 snowflake = ["runtime/snowflake"]
 models = ["runtime/models"]
-federation-experimental = ["runtime/federation-experimental"]
