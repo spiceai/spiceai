@@ -70,6 +70,12 @@ impl DataConnectorFactory for Clickhouse {
                         port,
                     }
                     .into()),
+                    clickhousepool::Error::ConnectionTlsError { source: _ } => {
+                        Err(DataConnectorError::UnableToConnectTlsError {
+                            dataconnector: "clickhouse".to_string(),
+                        }
+                        .into())
+                    }
                     _ => Err(DataConnectorError::UnableToConnectInternal {
                         dataconnector: "clickhouse".to_string(),
                         source: Box::new(e),

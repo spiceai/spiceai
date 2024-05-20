@@ -37,6 +37,12 @@ Before you file an issue, make sure you've checked the following:
 
 This section describes the guidelines for contributing code / docs to Spice.ai.
 
+### Follow principles and guidelines
+
+- [Principles](/docs/PRINCIPLES.md)
+- [Style Guide](/docs/dev/style_guide.md)
+- [Error Handling](/docs/dev/error_handling.md)
+
 ### Pull Requests
 
 All contributions come through pull requests. To submit a proposed change, we recommend following this workflow:

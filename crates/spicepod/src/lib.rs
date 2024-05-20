@@ -23,6 +23,7 @@ use std::{fmt::Debug, path::PathBuf};
 
 use component::dataset::Dataset;
 use component::model::Model;
+use component::runtime::Runtime;
 use component::secrets::Secrets;
 use spec::{SpicepodDefinition, SpicepodVersion};
 
@@ -58,6 +59,8 @@ pub struct Spicepod {
     pub models: Vec<Model>,
 
     pub dependencies: Vec<String>,
+
+    pub runtime: Runtime,
 }
 
 impl Spicepod {
@@ -137,5 +140,6 @@ fn from_definition(
         datasets,
         models,
         dependencies: spicepod_definition.dependencies,
+        runtime: spicepod_definition.runtime,
     }
 }

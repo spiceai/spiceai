@@ -62,7 +62,6 @@ impl Read for ClickhouseTableFactory {
                 .context(UnableToConstructSQLTableSnafu)?,
         );
 
-        #[cfg(feature = "federation-experimental")]
         let table_provider = Arc::new(
             table_provider
                 .create_federated_table_provider()

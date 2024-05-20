@@ -25,17 +25,20 @@ use crate::dataconnector::{DataConnector, DataConnectorError};
 use crate::dataupdate::{DataUpdate, DataUpdateExecutionPlan, UpdateType};
 use crate::get_dependent_table_names;
 use crate::object_store_registry::default_runtime_env;
+use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
 use arrow_tools::schema::verify_schema;
+use cache::QueryResultCacheProvider;
 use datafusion::catalog::schema::SchemaProvider;
 use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider};
 use datafusion::datasource::{TableProvider, ViewTable};
 use datafusion::error::DataFusionError;
-use datafusion::execution::context::{SessionConfig, SessionContext, SessionState};
+use datafusion::execution::context::{SQLOptions, SessionConfig, SessionContext, SessionState};
 use datafusion::physical_plan::collect;
 use datafusion::sql::parser::DFParser;
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::{sqlparser, TableReference};
+use datafusion_federation::{FederatedQueryPlanner, FederationAnalyzerRule};
 use secrets::Secret;
 use snafu::prelude::*;
 use spicepod::component::dataset::{Dataset, Mode};
@@ -155,6 +158,15 @@ pub enum Error {
     UnableToGetSchemaTable {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[snafu(display("Failed to access query results cache: {source}"))]
+    FailedToAccessCache { source: cache::Error },
+
+    #[snafu(display("Failed to execute query: {source}"))]
+    UnableToExecuteQuery { source: DataFusionError },
+
+    #[snafu(display("Unable to collect results after query execution: {source}"))]
+    UnableToCollectResults { source: DataFusionError },
 }
 
 pub enum Table {
@@ -170,6 +182,7 @@ pub enum Table {
 pub struct DataFusion {
     pub ctx: Arc<SessionContext>,
     data_writers: HashSet<String>,
+    cache_provider: Option<QueryResultCacheProvider>,
 }
 
 impl DataFusion {
@@ -191,15 +204,9 @@ impl DataFusion {
         df_config.options_mut().catalog.default_catalog = SPICE_DEFAULT_CATALOG.to_string();
         df_config.options_mut().catalog.default_schema = SPICE_DEFAULT_SCHEMA.to_string();
 
-        let state = SessionState::new_with_config_rt(df_config, default_runtime_env());
-
-        #[cfg(feature = "federation-experimental")]
-        let state = {
-            use datafusion_federation::{FederatedQueryPlanner, FederationAnalyzerRule};
-            state
-                .add_analyzer_rule(Arc::new(FederationAnalyzerRule::new()))
-                .with_query_planner(Arc::new(FederatedQueryPlanner::new()))
-        };
+        let state = SessionState::new_with_config_rt(df_config, default_runtime_env())
+            .add_analyzer_rule(Arc::new(FederationAnalyzerRule::new()))
+            .with_query_planner(Arc::new(FederatedQueryPlanner::new()));
 
         let ctx = SessionContext::new_with_state(state);
 
@@ -226,6 +233,7 @@ impl DataFusion {
         DataFusion {
             ctx: Arc::new(ctx),
             data_writers: HashSet::new(),
+            cache_provider: None,
         }
     }
 
@@ -247,15 +255,69 @@ impl DataFusion {
         None
     }
 
+    pub fn set_cache_provider(&mut self, cache_provider: Option<QueryResultCacheProvider>) {
+        self.cache_provider = cache_provider;
+    }
+
+    pub async fn query_with_cache(&self, sql: &str) -> Result<Arc<Vec<RecordBatch>>> {
+        let session = self.ctx.state();
+        let plan = session
+            .create_logical_plan(sql)
+            .await
+            .context(UnableToExecuteQuerySnafu)?;
+
+        if let Some(cache_provider) = &self.cache_provider {
+            if let Some(cached_result) = cache_provider
+                .get(&plan)
+                .await
+                .context(FailedToAccessCacheSnafu)?
+            {
+                return Ok(cached_result);
+            }
+        }
+
+        let restricted_sql_options = SQLOptions::new()
+            .with_allow_ddl(false)
+            .with_allow_dml(false)
+            .with_allow_statements(false);
+
+        restricted_sql_options
+            .verify_plan(&plan)
+            .context(UnableToExecuteQuerySnafu)?;
+
+        let plan_copy = plan.clone();
+
+        let df = self
+            .ctx
+            .execute_logical_plan(plan)
+            .await
+            .context(UnableToExecuteQuerySnafu)?;
+
+        let records = df.collect().await.context(UnableToCollectResultsSnafu)?;
+
+        let shared_records = Arc::new(records);
+
+        if let Some(cache_provider) = &self.cache_provider {
+            cache_provider
+                .put(&plan_copy, Arc::clone(&shared_records))
+                .await
+                .context(FailedToAccessCacheSnafu)?;
+        }
+
+        Ok(shared_records)
+    }
+
     pub fn register_runtime_table(
         &mut self,
-        name: String,
+        name: &str,
         table: Arc<dyn datafusion::datasource::TableProvider>,
     ) -> Result<()> {
-        if let Some(system_schema) = self.runtime_schema() {
-            system_schema
-                .register_table(name, table)
+        if let Some(runtime_schema) = self.runtime_schema() {
+            runtime_schema
+                .register_table(name.to_string(), table)
                 .context(UnableToRegisterTableToDataFusionSchemaSnafu { schema: "runtime" })?;
+
+            self.data_writers.insert(format!("runtime.{name}"));
         }
 
         Ok(())

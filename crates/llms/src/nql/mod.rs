@@ -12,6 +12,7 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use snafu::Snafu;
 
 #[cfg(feature = "candle")]
@@ -20,9 +21,14 @@ pub mod candle;
 #[cfg(feature = "mistralrs")]
 pub mod mistral;
 
-pub enum LlmRuntime {
-    Mistral,
+pub mod openai;
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+pub enum NSQLRuntime {
     Candle,
+    Mistral,
+    Openai,
 }
 
 #[derive(Debug, Snafu)]
@@ -61,10 +67,18 @@ pub trait Nql: Sync + Send {
     async fn run(&mut self, prompt: String) -> Result<Option<String>>;
 }
 
+/// Loads an NSQL model based on the chosen runtime.
+pub fn create_nsql(runtime: &NSQLRuntime) -> Result<Box<dyn Nql>> {
+    match runtime {
+        NSQLRuntime::Openai => Ok(Box::<openai::Openai>::default() as Box<dyn Nql>),
+        _ => try_duckdb_from_spice_local(runtime),
+    }
+}
+
 /// Loads `https://huggingface.co/motherduckdb/DuckDB-NSQL-7B-v0.1-GGUF` local spice llms cache (i.e. ~/.spice/llms/),
 /// based on the configured features, and the preference order: [`mistralrs`, `candle`].
 #[allow(unreachable_patterns)]
-pub fn try_duckdb_from_spice_local(runtime: &LlmRuntime) -> Result<Box<dyn Nql>> {
+pub fn try_duckdb_from_spice_local(runtime: &NSQLRuntime) -> Result<Box<dyn Nql>> {
     let spice_dir =
         dirs::home_dir()
             .map(|x| x.join(".spice/llms"))
@@ -89,10 +103,10 @@ pub fn try_duckdb_from_spice_local(runtime: &LlmRuntime) -> Result<Box<dyn Nql>>
 
     match runtime {
         #[cfg(feature = "candle")]
-        LlmRuntime::Candle => candle::CandleLlama::try_new(&tokenizer, &model_weights)
+        NSQLRuntime::Candle => candle::CandleLlama::try_new(&tokenizer, &model_weights)
             .map(|x| Box::new(x) as Box<dyn Nql>),
         #[cfg(feature = "mistralrs")]
-        LlmRuntime::Mistral => {
+        NSQLRuntime::Mistral => {
             let template_file = spice_dir.join("template.json");
             if !template_file.exists() {
                 return Err(Error::LocalTokenizerNotFound {

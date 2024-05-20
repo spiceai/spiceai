@@ -69,7 +69,7 @@ impl DataConnectorFactory for FlightSQL {
                     )
                     .await;
             };
-            let flightsql_factory = FlightSQLFactory::new(client);
+            let flightsql_factory = FlightSQLFactory::new(client, endpoint);
             Ok(Arc::new(Self { flightsql_factory }) as Arc<dyn DataConnector>)
         })
     }

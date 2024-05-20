@@ -584,6 +584,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-convert"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6d416feee97712e43152cd42874de162b8f9b77295b1c85e5d92725cc8310bae"
+dependencies = [
+ "async-trait",
+]
+
+[[package]]
 name = "async-executor"
 version = "1.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -680,6 +689,31 @@ dependencies = [
  "event-listener 4.0.3",
  "event-listener-strategy 0.4.0",
  "pin-project-lite",
+]
+
+[[package]]
+name = "async-openai"
+version = "0.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "007f03f7e27271451af57ced242d6adfa04204d1275a91ec0952bf441fd8d102"
+dependencies = [
+ "async-convert",
+ "backoff",
+ "base64 0.22.0",
+ "bytes",
+ "derive_builder 0.20.0",
+ "futures",
+ "rand",
+ "reqwest 0.12.4",
+ "reqwest-eventsource",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]
@@ -1595,6 +1629,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "79296716171880943b8470b5f8d03aa55eb2e645a4874bdbb28adb49162e012c"
 
 [[package]]
+name = "byte-unit"
+version = "5.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33ac19bdf0b2665407c39d82dbc937e951e7e2001609f0fb32edd0af45a2d63e"
+dependencies = [
+ "rust_decimal",
+ "serde",
+ "utf8-width",
+]
+
+[[package]]
 name = "bytecheck"
 version = "0.6.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1677,6 +1722,21 @@ dependencies = [
  "cc",
  "libc",
  "pkg-config",
+]
+
+[[package]]
+name = "cache"
+version = "0.13.0-alpha"
+dependencies = [
+ "arrow",
+ "async-trait",
+ "byte-unit",
+ "datafusion",
+ "fundu",
+ "moka",
+ "snafu 0.8.2",
+ "spicepod",
+ "tracing",
 ]
 
 [[package]]
@@ -2568,7 +2628,7 @@ dependencies = [
 [[package]]
 name = "datafusion-federation"
 version = "0.1.3"
-source = "git+https://github.com/phillipleblanc/datafusion-federation.git?rev=8ba03bd75ccf3a7d6fdf5d30bd92160278f5c16a#8ba03bd75ccf3a7d6fdf5d30bd92160278f5c16a"
+source = "git+https://github.com/spiceai/datafusion-federation.git?rev=8fcda49d7e561a70e1efe439ac9c57c8b9ad30a2#8fcda49d7e561a70e1efe439ac9c57c8b9ad30a2"
 dependencies = [
  "async-trait",
  "datafusion",
@@ -2577,13 +2637,14 @@ dependencies = [
 [[package]]
 name = "datafusion-federation-sql"
 version = "0.1.3"
-source = "git+https://github.com/phillipleblanc/datafusion-federation.git?rev=8ba03bd75ccf3a7d6fdf5d30bd92160278f5c16a#8ba03bd75ccf3a7d6fdf5d30bd92160278f5c16a"
+source = "git+https://github.com/spiceai/datafusion-federation.git?rev=8fcda49d7e561a70e1efe439ac9c57c8b9ad30a2#8fcda49d7e561a70e1efe439ac9c57c8b9ad30a2"
 dependencies = [
  "async-trait",
  "datafusion",
  "datafusion-federation",
  "futures",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -3319,6 +3380,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "eventsource-stream"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "74fef4569247a5f429d9156b9d0a2599914385dd189c539334c625d8099d90ab"
+dependencies = [
+ "futures-core",
+ "nom",
+ "pin-project-lite",
+]
+
+[[package]]
 name = "fallible-iterator"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3482,11 +3554,15 @@ version = "0.13.0-alpha"
 dependencies = [
  "ansi_term",
  "arrow-flight",
+ "arrow-json",
  "clap",
  "datafusion",
  "futures",
+ "llms",
  "prost 0.12.4",
+ "reqwest 0.11.27",
  "rustyline",
+ "serde_json",
  "tonic 0.11.0",
  "tracing",
 ]
@@ -3741,6 +3817,12 @@ name = "futures-task"
 version = "0.3.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "38d84fa142264698cdce1a9f9172cf383a0c82de1bddcf3092901442c4097004"
+
+[[package]]
+name = "futures-timer"
+version = "3.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f288b0a4f20f9a56b5d1da57e2227c661b7b16168e2f72365f57b63326e29b24"
 
 [[package]]
 name = "futures-util"
@@ -4917,6 +4999,7 @@ dependencies = [
 name = "llms"
 version = "0.13.0-alpha"
 dependencies = [
+ "async-openai",
  "async-trait",
  "candle-core 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "candle-core 0.5.0 (git+https://github.com/EricLBuehler/candle.git)",
@@ -4925,10 +5008,12 @@ dependencies = [
  "dirs",
  "mistralrs",
  "mistralrs-core",
+ "serde",
  "serde_json",
  "snafu 0.8.2",
  "tokenizers 0.19.1",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -5174,6 +5259,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
 
 [[package]]
+name = "mime_guess"
+version = "2.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4192263c238a5f0d0c6bfd21f336a313a4ce1c450542449ca191bb657b4642ef"
+dependencies = [
+ "mime",
+ "unicase",
+]
+
+[[package]]
 name = "minijinja"
 version = "1.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5212,8 +5307,8 @@ dependencies = [
 
 [[package]]
 name = "mistralrs"
-version = "0.1.7"
-source = "git+https://github.com/Jeadie/mistral.rs?rev=04e4abf19935d0f7882f0ca71450ba150dc85caa#04e4abf19935d0f7882f0ca71450ba150dc85caa"
+version = "0.1.9"
+source = "git+https://github.com/spiceai/mistral.rs#ac5dd0f7f7a4ff1626c1e1be5069bbd6b49fe750"
 dependencies = [
  "anyhow",
  "candle-core 0.5.0 (git+https://github.com/EricLBuehler/candle.git)",
@@ -5224,8 +5319,8 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-core"
-version = "0.1.7"
-source = "git+https://github.com/Jeadie/mistral.rs?rev=04e4abf19935d0f7882f0ca71450ba150dc85caa#04e4abf19935d0f7882f0ca71450ba150dc85caa"
+version = "0.1.9"
+source = "git+https://github.com/spiceai/mistral.rs#ac5dd0f7f7a4ff1626c1e1be5069bbd6b49fe750"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5246,7 +5341,6 @@ dependencies = [
  "indicatif",
  "lrtable",
  "minijinja",
- "mistralrs-lora",
  "once_cell",
  "radix_trie",
  "rand",
@@ -5268,18 +5362,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mistralrs-lora"
-version = "0.1.7"
-source = "git+https://github.com/Jeadie/mistral.rs?rev=04e4abf19935d0f7882f0ca71450ba150dc85caa#04e4abf19935d0f7882f0ca71450ba150dc85caa"
-dependencies = [
- "candle-core 0.5.0 (git+https://github.com/EricLBuehler/candle.git)",
- "candle-nn 0.5.0 (git+https://github.com/EricLBuehler/candle.git)",
- "either",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "model_components"
 version = "0.13.0-alpha"
 dependencies = [
@@ -5297,6 +5379,30 @@ dependencies = [
  "tracing",
  "tract-core",
  "tract-onnx",
+]
+
+[[package]]
+name = "moka"
+version = "0.12.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9e0d88686dc561d743b40de8269b26eaf0dc58781bde087b0984646602021d08"
+dependencies = [
+ "async-lock 3.3.0",
+ "async-trait",
+ "crossbeam-channel",
+ "crossbeam-epoch",
+ "crossbeam-utils",
+ "event-listener 5.3.0",
+ "futures-util",
+ "once_cell",
+ "parking_lot 0.12.1",
+ "quanta",
+ "rustc_version",
+ "smallvec",
+ "tagptr",
+ "thiserror",
+ "triomphe",
+ "uuid",
 ]
 
 [[package]]
@@ -6956,10 +7062,12 @@ dependencies = [
  "js-sys",
  "log",
  "mime",
+ "mime_guess",
  "once_cell",
  "percent-encoding",
  "pin-project-lite",
  "rustls 0.22.4",
+ "rustls-native-certs 0.7.0",
  "rustls-pemfile 2.1.2",
  "rustls-pki-types",
  "serde",
@@ -6973,9 +7081,26 @@ dependencies = [
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wasm-streams",
  "web-sys",
  "webpki-roots",
  "winreg 0.52.0",
+]
+
+[[package]]
+name = "reqwest-eventsource"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "632c55746dbb44275691640e7b40c907c16a2dc1a5842aa98aaec90da6ec6bde"
+dependencies = [
+ "eventsource-stream",
+ "futures-core",
+ "futures-timer",
+ "mime",
+ "nom",
+ "pin-project-lite",
+ "reqwest 0.12.4",
+ "thiserror",
 ]
 
 [[package]]
@@ -7142,6 +7267,7 @@ dependencies = [
  "bb8",
  "bb8-postgres",
  "bytes",
+ "cache",
  "chrono",
  "clap",
  "clickhouse-rs",
@@ -7196,6 +7322,7 @@ dependencies = [
  "tonic 0.9.2",
  "tonic-health",
  "tracing",
+ "tracing-subscriber",
  "tract-core",
  "tract-onnx",
  "url",
@@ -7552,6 +7679,7 @@ version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9bd1c54ea06cfd2f6b63219704de0b9b4f72dcc2b8fdef820be6cd799780e91e"
 dependencies = [
+ "serde",
  "zeroize",
 ]
 
@@ -8356,6 +8484,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "tagptr"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b2093cf4c8eb1e67749a6762251bc9cd836b6fc171623bd0a9d324d37af2417"
+
+[[package]]
 name = "tap"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9083,6 +9217,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "triomphe"
+version = "0.1.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "859eb650cfee7434994602c3a68b25d77ad9e68c8a6cd491616ef86661382eb3"
+
+[[package]]
 name = "trust-dns-proto"
 version = "0.23.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9173,6 +9313,15 @@ name = "unchecked-index"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eeba86d422ce181a719445e51872fa30f1f7413b62becb52e95ec91aa262d85c"
+
+[[package]]
+name = "unicase"
+version = "2.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f7d2d4dafb69621809a81864c9c1b864479e1235c0dd4e199924b9742439ed89"
+dependencies = [
+ "version_check",
+]
 
 [[package]]
 name = "unicode-bidi"
@@ -9276,6 +9425,12 @@ name = "urlencoding"
 version = "2.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "daf8dba3b7eb870caf1ddeed7bc9d2a049f3cfdfae7cb521b087cc33ae4c49da"
+
+[[package]]
+name = "utf8-width"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "86bd8d4e895da8537e5315b8254664e6b769c4ff3db18321b297a1e7004392e3"
 
 [[package]]
 name = "utf8parse"

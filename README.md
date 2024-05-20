@@ -16,7 +16,7 @@ Spice makes it easy to build data-driven and data-intensive applications by stre
 The Spice runtime is written in Rust and leverages industry leading technologies like Apache DataFusion, Apache Arrow, Apache Arrow Flight, and DuckDB.
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://github.com/spiceai/spiceai/assets/80174/96b5fcef-a550-4ce8-a74a-83931275e83e">  
+  <source media="(prefers-color-scheme: dark)" srcset="https://github.com/spiceai/spiceai/assets/80174/96b5fcef-a550-4ce8-a74a-83931275e83e">
   <img width="900" alt="Spice.ai" src="https://github.com/spiceai/spiceai/assets/80174/f71f227d-d7cd-418c-85b9-5c663a728491" />
 </picture>
 
@@ -69,7 +69,7 @@ Currently supported data connectors for upstream datasets. More coming soon.
 | `databricks` | [Databricks](https://github.com/spiceai/quickstarts/tree/trunk/databricks#spice-on-databricks) | Alpha        | [Spark Connect](https://spark.apache.org/docs/latest/spark-connect-overview.html)<br>S3/Delta Lake | `full`           |
 | `postgres`   | PostgreSQL                                                                                     | Alpha        |                                                                                                    | `full`           |
 | `spiceai`    | [Spice.ai](https://github.com/spiceai/quickstarts/tree/trunk/spiceai#readme)                   | Alpha        | Arrow Flight                                                                                       | `append`, `full` |
-| `s3`         | [S3](https://github.com/spiceai/quickstarts/tree/trunk/s3#readme)                              | Alpha        | Parquet                                                                                            | `full`           |
+| `s3`         | [S3](https://github.com/spiceai/quickstarts/tree/trunk/s3#readme)                              | Alpha        | Parquet, CSV                                                                                           | `full`           |
 | `dremio`     | [Dremio](https://github.com/spiceai/quickstarts/tree/trunk/dremio#readme)                      | Alpha        | Arrow Flight                                                                                       | `full`           |
 | `mysql`      | MySQL                                                                                          | Alpha        |                                                                                                    | `full`           |
 | `duckdb`     | DuckDB                                                                                         | Alpha        |                                                                                                    | `full`           |
@@ -79,6 +79,7 @@ Currently supported data connectors for upstream datasets. More coming soon.
 | `flightsql`  | Apache Arrow Flight SQL                                                                                     | Alpha        | Arrow Flight SQL                                                                                   | `full`           |
 | `snowflake`  | Snowflake                                                                                      | Alpha        | Arrow                                                                                | `full`           |
 | `bigquery`   | BigQuery                                                                                       | Coming soon! | Arrow Flight SQL                                                                                   | `full`           |
+| `ftp`, `sftp` | FTP/SFTP | Alpha | Parquet, CSV | `full` |
 
 ### Supported Data Stores/Accelerators
 
