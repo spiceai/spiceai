@@ -93,6 +93,7 @@ prometheus-parse = "0.2.5"
 
 [dev-dependencies]
 metrics-util = "0.16.3"
+tracing-subscriber.workspace = true
 
 [features]
 default = ["keyring-secret-store", "aws-secrets-manager"]
