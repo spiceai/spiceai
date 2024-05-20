@@ -28,6 +28,8 @@ fn make_spiceai_dataset(path: &str, name: &str) -> Dataset {
     Dataset::new(format!("spiceai:{path}"), name.to_string())
 }
 
+type ValidateFn = dyn FnOnce(Vec<RecordBatch>);
+
 async fn run_query_and_check_results<F>(
     rt: &mut Runtime,
     query: &str,
@@ -69,7 +71,9 @@ where
 }
 
 #[tokio::test]
-async fn basic_federation_push_down() -> Result<(), String> {
+#[allow(clippy::too_many_lines)]
+async fn federation_push_down() -> Result<(), String> {
+    type QueryTests<'a> = Vec<(&'a str, Vec<&'a str>, Option<Box<ValidateFn>>)>;
     init_tracing(None);
     let app = AppBuilder::new("basic_federation_push_down")
         .with_secret_store(SpiceSecretStore::File)
@@ -99,7 +103,7 @@ async fn basic_federation_push_down() -> Result<(), String> {
         }
     };
 
-    let queries = vec![
+    let queries: QueryTests = vec![
         (
             "SELECT MAX(number) as max_num FROM blocks",
             vec![
@@ -115,7 +119,7 @@ async fn basic_federation_push_down() -> Result<(), String> {
                 "|               |                                                                                                                                                                                 |",
                 "+---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
             ],
-            Some(has_one_int_val),
+            Some(Box::new(has_one_int_val)),
         ),
         (
             "SELECT number FROM blocks WHERE number = (SELECT MAX(number) FROM blocks)",
@@ -137,7 +141,44 @@ async fn basic_federation_push_down() -> Result<(), String> {
                 "|               |                                                                                                                                                                                                                                                                  |",
                 "+---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
             ],
-            Some(has_one_int_val),
+            Some(Box::new(has_one_int_val)),
+        ),
+        (
+            "SELECT number, hash FROM full_blocks WHERE number BETWEEN 1000 AND 2000 ORDER BY number DESC LIMIT 10",
+            vec![
+                "+---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+                "| plan_type     | plan                                                                                                                                                                                                                                                                                                  |",
+                "+---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+                "| logical_plan  | Federated                                                                                                                                                                                                                                                                                             |",
+                "|               |  Limit: skip=0, fetch=10                                                                                                                                                                                                                                                                              |",
+                "|               |   Sort: full_blocks.number DESC NULLS FIRST                                                                                                                                                                                                                                                           |",
+                "|               |     Projection: full_blocks.number, full_blocks.hash                                                                                                                                                                                                                                                  |",
+                "|               |       Filter: full_blocks.number BETWEEN Int64(1000) AND Int64(2000)                                                                                                                                                                                                                                  |",
+                "|               |         SubqueryAlias: full_blocks                                                                                                                                                                                                                                                                    |",
+                "|               |           TableScan: eth.blocks                                                                                                                                                                                                                                                                       |",
+                "| physical_plan | VirtualExecutionPlan name=spiceai compute_context=url=https://flight.spiceai.io,username= sql=SELECT \"full_blocks\".\"number\", \"full_blocks\".\"hash\" FROM \"eth\".\"blocks\" AS \"full_blocks\" WHERE (\"full_blocks\".\"number\" BETWEEN 1000 AND 2000) ORDER BY \"full_blocks\".\"number\" DESC NULLS FIRST LIMIT 10 |",
+                "|               |                                                                                                                                                                                                                                                                                                       |",
+                "+---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+            ],
+            Some(Box::new(|plan_results| {
+                let expected_results = [
+                    "+--------+--------------------------------------------------------------------+",
+                    "| number | hash                                                               |",
+                    "+--------+--------------------------------------------------------------------+",
+                    "| 2000   | 0x73b20034e531f385a59401bbda9a225be12b2fd42d7c21e4c3d11b3d7be34244 |",
+                    "| 1999   | 0x1af2b6c4d0eb975784441b0fdae7c99d603b1afcf03b18b0be2e8fd1190ae52c |",
+                    "| 1998   | 0x317063b3e2d39995ef86384feaa4502f8413286fea86587d31ec35778d2da7cd |",
+                    "| 1997   | 0xb83cf3e25014973d6073de708a499b25e9fb447e60057332783e3ee2a43567cf |",
+                    "| 1996   | 0x9be7b34b99c125b392f2f9f71c221d167dec2e1a22a79d9e507bc832ce098337 |",
+                    "| 1995   | 0xdfd07b4875096ad5fa2ebe330b7d18c57e85bfe7d65fd5b545191bc0950a132e |",
+                    "| 1994   | 0x6fd9761d6e15cc4bc41b7c28880c46e28e468eb07553ba5510e87bac3002b259 |",
+                    "| 1993   | 0x1074de28cd4fbf430ce2c161d8ce4b27d234ec81b4e742ccc9808681a0502de4 |",
+                    "| 1992   | 0xd6bd3d330458bdb644d6d58c7544b98d1632cb71787f4ac904d6c730367e5af8 |",
+                    "| 1991   | 0x17b6a9ff7ffdcd02cccb96d2e5ea9c5e73ae0c1de85f19a335a1660421b2c3b7 |",
+                    "+--------+--------------------------------------------------------------------+",
+                ];
+                assert_batches_eq!(expected_results, &plan_results);
+            })),
         ),
     ];
 
