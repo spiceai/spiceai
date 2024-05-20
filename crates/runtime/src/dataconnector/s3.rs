@@ -104,7 +104,7 @@ impl ListingTableConnector for S3 {
             Url::parse(&dataset.from)
                 .boxed()
                 .context(super::InvalidConfigurationSnafu {
-                    dataconnector: "ftp".to_string(),
+                    dataconnector: format!("{self}"),
                     message: format!("{} is not a valid URL", dataset.from),
                 })?;
 
