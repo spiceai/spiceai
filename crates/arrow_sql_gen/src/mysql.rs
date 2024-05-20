@@ -438,26 +438,7 @@ fn map_column_to_data_type(column_type: ColumnType) -> Option<DataType> {
         | ColumnType::MYSQL_TYPE_STRING
         | ColumnType::MYSQL_TYPE_VAR_STRING
         | ColumnType::MYSQL_TYPE_BLOB => Some(DataType::Utf8),
-        ColumnType::MYSQL_TYPE_INT24 => todo!(),
-        ColumnType::MYSQL_TYPE_TIME => todo!(),
-        ColumnType::MYSQL_TYPE_DATETIME => todo!(),
-        ColumnType::MYSQL_TYPE_YEAR => todo!(),
-        ColumnType::MYSQL_TYPE_TIMESTAMP2 => todo!(),
-        ColumnType::MYSQL_TYPE_DATETIME2 => todo!(),
-        ColumnType::MYSQL_TYPE_TIME2 => todo!(),
-        ColumnType::MYSQL_TYPE_UNKNOWN => todo!(),
-        ColumnType::MYSQL_TYPE_JSON => todo!(),
-        ColumnType::MYSQL_TYPE_ENUM => todo!(),
-        ColumnType::MYSQL_TYPE_SET => todo!(),
-        ColumnType::MYSQL_TYPE_TINY_BLOB => todo!(),
-        ColumnType::MYSQL_TYPE_MEDIUM_BLOB => todo!(),
-        ColumnType::MYSQL_TYPE_LONG_BLOB => todo!(),
-        ColumnType::MYSQL_TYPE_GEOMETRY => todo!(),
-
-        // replication only
-        ColumnType::MYSQL_TYPE_TYPED_ARRAY |
-        // internal
-        ColumnType::MYSQL_TYPE_NEWDATE => unimplemented!("Unsupported column type {:?}", column_type),
+        _ => unimplemented!("Unsupported column type {:?}", column_type),
     }
 }
 
