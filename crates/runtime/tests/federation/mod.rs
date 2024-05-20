@@ -72,7 +72,7 @@ where
 
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
-async fn federation_push_down() -> Result<(), String> {
+async fn single_source_federation_push_down() -> Result<(), String> {
     type QueryTests<'a> = Vec<(&'a str, Vec<&'a str>, Option<Box<ValidateFn>>)>;
     init_tracing(None);
     let app = AppBuilder::new("basic_federation_push_down")
@@ -216,6 +216,51 @@ async fn federation_push_down() -> Result<(), String> {
                     "+--------------+-------------------+",
                 ];
                 assert_batches_eq!(expected_results, &plan_results);
+            })),
+        ),
+        (
+            "SELECT SUM(tx.receipt_gas_used) AS total_gas_used, blocks.number FROM blocks JOIN tx ON blocks.number = tx.block_number GROUP BY blocks.number ORDER BY blocks.number DESC LIMIT 10",
+            vec![
+                "+---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+                "| plan_type     | plan                                                                                                                                                                                                                                                                                                                                                                                  |",
+                "+---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+                "| logical_plan  | Federated                                                                                                                                                                                                                                                                                                                                                                             |",
+                "|               |  Limit: skip=0, fetch=10                                                                                                                                                                                                                                                                                                                                                              |",
+                "|               |   Sort: blocks.number DESC NULLS FIRST                                                                                                                                                                                                                                                                                                                                                |",
+                "|               |     Projection: SUM(tx.receipt_gas_used) AS total_gas_used, blocks.number                                                                                                                                                                                                                                                                                                             |",
+                "|               |       Aggregate: groupBy=[[blocks.number]], aggr=[[SUM(tx.receipt_gas_used)]]                                                                                                                                                                                                                                                                                                         |",
+                "|               |         Inner Join:  Filter: blocks.number = tx.block_number                                                                                                                                                                                                                                                                                                                          |",
+                "|               |           SubqueryAlias: blocks                                                                                                                                                                                                                                                                                                                                                       |",
+                "|               |             TableScan: eth.recent_blocks                                                                                                                                                                                                                                                                                                                                              |",
+                "|               |           SubqueryAlias: tx                                                                                                                                                                                                                                                                                                                                                           |",
+                "|               |             TableScan: eth.recent_transactions                                                                                                                                                                                                                                                                                                                                        |",
+                "| physical_plan | VirtualExecutionPlan name=spiceai compute_context=url=https://flight.spiceai.io,username= sql=SELECT SUM(\"tx\".\"receipt_gas_used\") AS \"total_gas_used\", \"blocks\".\"number\" FROM \"eth\".\"recent_blocks\" AS \"blocks\" JOIN \"eth\".\"recent_transactions\" AS \"tx\" ON (\"blocks\".\"number\" = \"tx\".\"block_number\") GROUP BY \"blocks\".\"number\" ORDER BY \"blocks\".\"number\" DESC NULLS FIRST LIMIT 10 |",
+                "|               |                                                                                                                                                                                                                                                                                                                                                                                       |",
+                "+---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+            ],
+            Some(Box::new(|result_batches| {
+                // Results change over time, but it looks like:
+                // let expected_results = [
+                //     "+----------------+----------+",
+                //     "| total_gas_used | number   |",
+                //     "+----------------+----------+",
+                //     "| 14965044       | 19912051 |",
+                //     "| 19412656       | 19912049 |",
+                //     "| 12304986       | 19912047 |",
+                //     "| 19661381       | 19912046 |",
+                //     "| 10828931       | 19912045 |",
+                //     "| 21121895       | 19912044 |",
+                //     "| 29982938       | 19912043 |",
+                //     "| 10630719       | 19912042 |",
+                //     "| 29988818       | 19912041 |",
+                //     "| 9310052        | 19912040 |",
+                //     "+----------------+----------+",
+                // ];
+                
+                for batch in result_batches {
+                    assert_eq!(batch.num_columns(), 2);
+                    assert_eq!(batch.num_rows(), 10);
+                }
             })),
         ),
     ];
