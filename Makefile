@@ -27,7 +27,7 @@ ci:
 
 .PHONY: test
 test:
-	@cargo test --all
+	@cargo test --all --lib
 
 .PHONY: nextest
 nextest:
