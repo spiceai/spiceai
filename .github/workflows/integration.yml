@@ -3,9 +3,6 @@ name: integration tests
 
 on:
   pull_request:
-    branches:
-      - trunk
-      - release-*
 
   workflow_dispatch:
 
