@@ -40,11 +40,12 @@ impl LruCache {
                 match val.try_into() {
                     Ok(val) => val,
                     Err(e) => {
+                        // This should never happen, as the size of record batches should be less than u32::MAX
                         tracing::warn!(
                             "Lru cache: Failed to convert query result size to u32: {}",
                             e
                         );
-                        // this should never happen, don't cache record
+                        // Return the maximum value if we can't convert, so that we don't cache this record.
                         u32::MAX
                     }
                 }
