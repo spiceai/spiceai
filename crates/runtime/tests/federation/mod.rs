@@ -21,7 +21,7 @@ fn init_tracing(default_level: Option<&str>) {
         .with_env_filter(filter)
         .with_ansi(true)
         .finish();
-    tracing::subscriber::set_global_default(subscriber).expect("tracing subscriber set");
+    let _ = tracing::subscriber::set_global_default(subscriber);
 }
 
 fn make_spiceai_dataset(path: &str, name: &str) -> Dataset {
@@ -49,7 +49,7 @@ where
         .map_err(|e| format!("query `{query}` to plan: {e}"))?
         .collect()
         .await
-        .expect("to collect results");
+        .map_err(|e| format!("query `{query}` to results: {e}"))?;
 
     assert_batches_eq!(expected_plan, &plan_results);
 
@@ -62,7 +62,7 @@ where
             .map_err(|e| format!("query `{query}` to plan: {e}"))?
             .collect()
             .await
-            .expect("to collect results");
+            .map_err(|e| format!("query `{query}` to results: {e}"))?;
 
         validate_result(result_batches);
     }
