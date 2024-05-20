@@ -180,6 +180,44 @@ async fn federation_push_down() -> Result<(), String> {
                 assert_batches_eq!(expected_results, &plan_results);
             })),
         ),
+        (
+            "SELECT AVG(gas_used) AS avg_gas_used, transaction_count FROM full_blocks WHERE number BETWEEN 100000 AND 200000 GROUP BY transaction_count ORDER BY transaction_count DESC LIMIT 10",
+            vec![
+                "+---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+                "| plan_type     | plan                                                                                                                                                                                                                                                                                                                                                                                                                  |",
+                "+---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+                "| logical_plan  | Federated                                                                                                                                                                                                                                                                                                                                                                                                             |",
+                "|               |  Limit: skip=0, fetch=10                                                                                                                                                                                                                                                                                                                                                                                              |",
+                "|               |   Sort: full_blocks.transaction_count DESC NULLS FIRST                                                                                                                                                                                                                                                                                                                                                                |",
+                "|               |     Projection: AVG(full_blocks.gas_used) AS avg_gas_used, full_blocks.transaction_count                                                                                                                                                                                                                                                                                                                              |",
+                "|               |       Aggregate: groupBy=[[full_blocks.transaction_count]], aggr=[[AVG(CAST(full_blocks.gas_used AS Float64))]]                                                                                                                                                                                                                                                                                                       |",
+                "|               |         Filter: full_blocks.number BETWEEN Int64(100000) AND Int64(200000)                                                                                                                                                                                                                                                                                                                                            |",
+                "|               |           SubqueryAlias: full_blocks                                                                                                                                                                                                                                                                                                                                                                                  |",
+                "|               |             TableScan: eth.blocks                                                                                                                                                                                                                                                                                                                                                                                     |",
+                "| physical_plan | VirtualExecutionPlan name=spiceai compute_context=url=https://flight.spiceai.io,username= sql=SELECT AVG(CAST(\"full_blocks\".\"gas_used\" AS DOUBLE)) AS \"avg_gas_used\", \"full_blocks\".\"transaction_count\" FROM \"eth\".\"blocks\" AS \"full_blocks\" WHERE (\"full_blocks\".\"number\" BETWEEN 100000 AND 200000) GROUP BY \"full_blocks\".\"transaction_count\" ORDER BY \"full_blocks\".\"transaction_count\" DESC NULLS FIRST LIMIT 10 |",
+                "|               |                                                                                                                                                                                                                                                                                                                                                                                                                       |",
+                "+---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+            ],
+            Some(Box::new(|plan_results| {
+                let expected_results = [
+                    "+--------------+-------------------+",
+                    "| avg_gas_used | transaction_count |",
+                    "+--------------+-------------------+",
+                    "| 3129000.0    | 149               |",
+                    "| 3108000.0    | 148               |",
+                    "| 3117600.0    | 147               |",
+                    "| 3100500.0    | 146               |",
+                    "| 3045000.0    | 145               |",
+                    "| 3034227.0    | 143               |",
+                    "| 2982000.0    | 142               |",
+                    "| 2898000.0    | 138               |",
+                    "| 3047268.0    | 137               |",
+                    "| 2835000.0    | 135               |",
+                    "+--------------+-------------------+",
+                ];
+                assert_batches_eq!(expected_results, &plan_results);
+            })),
+        ),
     ];
 
     for (query, expected_plan, validate_result) in queries {
