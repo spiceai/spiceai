@@ -41,6 +41,9 @@ pub enum Error {
     #[snafu(display("Missing required token. {message}"))]
     MissingDatabricksToken { message: String },
 
+    #[snafu(display("databricks_use_ssl value {value} is invalid, please use true or false"))]
+    InvalidUsessl { value: String },
+
     #[snafu(display("Endpoint {endpoint} is invalid: {source}"))]
     InvalidEndpoint {
         endpoint: String,
@@ -93,6 +96,21 @@ impl Databricks {
                 return MissingEndpointSnafu.fail();
             };
             let user = ref_params.and_then(|p| p.get("user").map(std::borrow::ToOwned::to_owned));
+            let mut databricks_use_ssl = true;
+            if let Some(databricks_use_ssl_value) =
+                ref_params.and_then(|p| p.get("databricks_use_ssl"))
+            {
+                databricks_use_ssl = match databricks_use_ssl_value.as_str() {
+                    "true" => true,
+                    "false" => false,
+                    _ => {
+                        return InvalidUsesslSnafu {
+                            value: databricks_use_ssl_value,
+                        }
+                        .fail()
+                    }
+                };
+            }
             let Some(cluster_id) = ref_params.and_then(|p| p.get("databricks-cluster-id")) else {
                 return MissingDatabricksClusterIdSnafu.fail();
             };
@@ -113,6 +131,7 @@ impl Databricks {
                 user,
                 cluster_id.to_string(),
                 token.to_string(),
+                databricks_use_ssl,
             )
             .await
             .context(UnableToConstructDatabricksSparkSnafu)?;
