@@ -166,19 +166,15 @@ pub enum Error {
 
     #[snafu(display("Unable to register metrics table: {source}"))]
     UnableToRegisterMetricsTable { source: datafusion::Error },
-
-    #[snafu(display("Unable to create cache for query results: {source}"))]
-    UnableToCreateResultsCache { source: cache::Error },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct Runtime {
     pub app: Arc<RwLock<Option<App>>>,
-    pub config: config::Config,
     pub df: Arc<RwLock<DataFusion>>,
     pub models: Arc<RwLock<HashMap<String, Model>>>,
-    pub pods_watcher: podswatcher::PodsWatcher,
+    pub pods_watcher: Option<podswatcher::PodsWatcher>,
     pub secrets_provider: Arc<RwLock<secrets::SecretsProvider>>,
 
     spaced_tracer: Arc<tracers::SpacedTracer>,
@@ -186,23 +182,22 @@ pub struct Runtime {
 
 impl Runtime {
     #[must_use]
-    pub async fn new(
-        config: Config,
-        app: Arc<RwLock<Option<app::App>>>,
-        df: Arc<RwLock<DataFusion>>,
-        pods_watcher: podswatcher::PodsWatcher,
-    ) -> Self {
+    pub async fn new(app: Option<app::App>, df: Arc<RwLock<DataFusion>>) -> Self {
         dataconnector::register_all().await;
         dataaccelerator::register_all().await;
+
         Runtime {
-            app,
-            config,
+            app: Arc::new(RwLock::new(app)),
             df,
             models: Arc::new(RwLock::new(HashMap::new())),
-            pods_watcher,
+            pods_watcher: None,
             secrets_provider: Arc::new(RwLock::new(secrets::SecretsProvider::new())),
             spaced_tracer: Arc::new(tracers::SpacedTracer::new(Duration::from_secs(15))),
         }
+    }
+
+    pub fn with_pods_watcher(&mut self, pods_watcher: podswatcher::PodsWatcher) {
+        self.pods_watcher = Some(pods_watcher);
     }
 
     pub async fn load_secrets(&self) {
@@ -719,22 +714,23 @@ impl Runtime {
         Ok(())
     }
 
-    pub async fn start_servers(&mut self, with_metrics: Option<SocketAddr>) -> Result<()> {
+    pub async fn start_servers(
+        &mut self,
+        config: Config,
+        with_metrics: Option<SocketAddr>,
+    ) -> Result<()> {
         let http_server_future = http::start(
-            self.config.http_bind_address,
+            config.http_bind_address,
             Arc::clone(&self.app),
             Arc::clone(&self.df),
             Arc::clone(&self.models),
-            self.config.clone().into(),
+            config.clone().into(),
             with_metrics,
         );
 
-        let flight_server_future =
-            flight::start(self.config.flight_bind_address, Arc::clone(&self.df));
-        let open_telemetry_server_future = opentelemetry::start(
-            self.config.open_telemetry_bind_address,
-            Arc::clone(&self.df),
-        );
+        let flight_server_future = flight::start(config.flight_bind_address, Arc::clone(&self.df));
+        let open_telemetry_server_future =
+            opentelemetry::start(config.open_telemetry_bind_address, Arc::clone(&self.df));
         let pods_watcher_future = self.start_pods_watcher();
 
         tokio::select! {
@@ -750,7 +746,10 @@ impl Runtime {
     }
 
     pub async fn start_pods_watcher(&mut self) -> notify::Result<()> {
-        let mut rx = self.pods_watcher.watch()?;
+        let Some(mut pods_watcher) = self.pods_watcher.take() else {
+            return Ok(());
+        };
+        let mut rx = pods_watcher.watch()?;
 
         while let Some(new_app) = rx.recv().await {
             let mut app_lock = self.app.write().await;
@@ -815,28 +814,34 @@ impl Runtime {
         Ok(())
     }
 
-    pub fn create_results_cache(
-        app: &Option<app::App>,
-    ) -> Result<Option<QueryResultCacheProvider>> {
-        let cache_config = app
+    pub async fn init_results_cache(&self) {
+        let app_lock = self.app.read().await;
+        let cache_config = app_lock
             .as_ref()
             .and_then(|app| app.runtime.results_cache.as_ref());
 
-        match cache_config {
-            Some(config) => {
-                if !config.enabled {
-                    return Ok(None);
-                }
+        let Some(cache_config) = cache_config else {
+            return;
+        };
 
-                let cache_provider = QueryResultCacheProvider::new(config)
-                    .context(UnableToCreateResultsCacheSnafu)?;
-
-                tracing::info!("Initialized query results cache; {cache_provider}");
-
-                Ok(Some(cache_provider))
-            }
-            None => Ok(None),
+        if !cache_config.enabled {
+            return;
         }
+
+        let cache_provider = match QueryResultCacheProvider::new(cache_config) {
+            Ok(cache_provider) => cache_provider,
+            Err(e) => {
+                tracing::warn!("Failed to initialize query results cache: {e}");
+                return;
+            }
+        };
+
+        tracing::info!("Initialized query results cache; {cache_provider}");
+
+        self.df
+            .write()
+            .await
+            .set_cache_provider(Some(cache_provider));
     }
 }
 

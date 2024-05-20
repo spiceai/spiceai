@@ -21,7 +21,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use app::App;
+use app::{App, AppBuilder};
 use clap::Parser;
 use flightrepl::ReplConfig;
 use runtime::config::Config as RuntimeConfig;
@@ -99,32 +99,27 @@ pub async fn run(args: Args) -> Result<()> {
     let current_dir = env::current_dir().unwrap_or(PathBuf::from("."));
     let df = Arc::new(RwLock::new(runtime::datafusion::DataFusion::new()));
     let pods_watcher = PodsWatcher::new(current_dir.clone());
-    let app: Option<App> =
-        match App::new(current_dir.clone()).context(UnableToConstructSpiceAppSnafu) {
-            Ok(app) => Some(app),
-            Err(e) => {
-                tracing::warn!("{}", e);
-                None
-            }
-        };
-
-    match Runtime::create_results_cache(&app) {
-        Ok(cache) => {
-            df.write().await.set_cache_provider(cache);
-        }
+    let app: Option<App> = match AppBuilder::build_from_filesystem_path(current_dir.clone())
+        .context(UnableToConstructSpiceAppSnafu)
+    {
+        Ok(app) => Some(app),
         Err(e) => {
-            tracing::warn!("Failed to initialize query results cache: {e}");
+            tracing::warn!("{}", e);
+            None
         }
-    }
+    };
 
-    let mut rt: Runtime =
-        Runtime::new(args.runtime, Arc::new(RwLock::new(app)), df, pods_watcher).await;
+    let mut rt: Runtime = Runtime::new(app, df).await;
+
+    rt.with_pods_watcher(pods_watcher);
 
     rt.load_secrets().await;
 
     rt.load_datasets().await;
 
     rt.load_models().await;
+
+    rt.init_results_cache().await;
 
     if args.spice_cloud_connect {
         if let Err(err) = rt
@@ -136,7 +131,7 @@ pub async fn run(args: Args) -> Result<()> {
         }
     }
 
-    rt.start_servers(args.metrics)
+    rt.start_servers(args.runtime, args.metrics)
         .await
         .context(UnableToStartServersSnafu)?;
 

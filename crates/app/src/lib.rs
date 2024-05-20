@@ -20,7 +20,12 @@ use std::path::PathBuf;
 
 use snafu::prelude::*;
 use spicepod::{
-    component::{dataset::Dataset, model::Model, runtime::Runtime, secrets::Secrets},
+    component::{
+        dataset::Dataset,
+        model::Model,
+        runtime::Runtime,
+        secrets::{Secrets, SpiceSecretStore},
+    },
     Spicepod,
 };
 
@@ -50,9 +55,67 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-impl App {
-    // This will load an app's spicepod.yaml file and all of its components and dependencies.
-    pub fn new(path: impl Into<PathBuf>) -> Result<Self> {
+pub struct AppBuilder {
+    name: String,
+    secrets: Secrets,
+    datasets: Vec<Dataset>,
+    models: Vec<Model>,
+    spicepods: Vec<Spicepod>,
+    runtime: Runtime,
+}
+
+impl AppBuilder {
+    pub fn new(name: impl Into<String>) -> AppBuilder {
+        AppBuilder {
+            name: name.into(),
+            secrets: Secrets::default(),
+            datasets: vec![],
+            models: vec![],
+            spicepods: vec![],
+            runtime: Runtime::default(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_spicepod(mut self, spicepod: Spicepod) -> AppBuilder {
+        self.secrets = spicepod.secrets.clone();
+        self.datasets.extend(spicepod.datasets.clone());
+        self.models.extend(spicepod.models.clone());
+        self.spicepods.push(spicepod);
+        self
+    }
+
+    #[must_use]
+    pub fn with_secret_store(mut self, secret: SpiceSecretStore) -> AppBuilder {
+        self.secrets = Secrets { store: secret };
+        self
+    }
+
+    #[must_use]
+    pub fn with_dataset(mut self, dataset: Dataset) -> AppBuilder {
+        self.datasets.push(dataset);
+        self
+    }
+
+    #[must_use]
+    pub fn with_model(mut self, model: Model) -> AppBuilder {
+        self.models.push(model);
+        self
+    }
+
+    #[must_use]
+    pub fn build(self) -> App {
+        App {
+            name: self.name,
+            secrets: self.secrets,
+            datasets: self.datasets,
+            models: self.models,
+            spicepods: self.spicepods,
+            runtime: self.runtime,
+        }
+    }
+
+    pub fn build_from_filesystem_path(path: impl Into<PathBuf>) -> Result<App> {
         let path = path.into();
         let spicepod_root =
             Spicepod::load(&path).context(UnableToLoadSpicepodSnafu { path: path.clone() })?;
