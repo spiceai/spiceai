@@ -71,6 +71,7 @@ prost = { version = "0.12.1", default-features = false, features = [
 once_cell = "1.19.0"
 secrets = { path = "../secrets" }
 db_connection_pool = { path = "../db_connection_pool" }
+cache = { path = "../cache" }
 rusqlite = { workspace = true, optional = true }
 tokio-rusqlite = { workspace = true, optional = true }
 pin-project = "1.0"

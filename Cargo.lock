@@ -1659,6 +1659,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "79296716171880943b8470b5f8d03aa55eb2e645a4874bdbb28adb49162e012c"
 
 [[package]]
+name = "byte-unit"
+version = "5.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33ac19bdf0b2665407c39d82dbc937e951e7e2001609f0fb32edd0af45a2d63e"
+dependencies = [
+ "rust_decimal",
+ "serde",
+ "utf8-width",
+]
+
+[[package]]
 name = "bytecheck"
 version = "0.6.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1741,6 +1752,21 @@ dependencies = [
  "cc",
  "libc",
  "pkg-config",
+]
+
+[[package]]
+name = "cache"
+version = "0.13.0-alpha"
+dependencies = [
+ "arrow",
+ "async-trait",
+ "byte-unit",
+ "datafusion",
+ "fundu",
+ "moka",
+ "snafu 0.8.2",
+ "spicepod",
+ "tracing",
 ]
 
 [[package]]
@@ -5404,6 +5430,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "moka"
+version = "0.12.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9e0d88686dc561d743b40de8269b26eaf0dc58781bde087b0984646602021d08"
+dependencies = [
+ "async-lock 3.3.0",
+ "async-trait",
+ "crossbeam-channel",
+ "crossbeam-epoch",
+ "crossbeam-utils",
+ "event-listener 5.3.0",
+ "futures-util",
+ "once_cell",
+ "parking_lot 0.12.1",
+ "quanta",
+ "rustc_version",
+ "smallvec",
+ "tagptr",
+ "thiserror",
+ "triomphe",
+ "uuid",
+]
+
+[[package]]
 name = "monostate"
 version = "0.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7265,6 +7315,7 @@ dependencies = [
  "bb8",
  "bb8-postgres",
  "bytes",
+ "cache",
  "chrono",
  "clap",
  "clickhouse-rs",
@@ -8490,6 +8541,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "tagptr"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b2093cf4c8eb1e67749a6762251bc9cd836b6fc171623bd0a9d324d37af2417"
+
+[[package]]
 name = "tap"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9228,6 +9285,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "triomphe"
+version = "0.1.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "859eb650cfee7434994602c3a68b25d77ad9e68c8a6cd491616ef86661382eb3"
+
+[[package]]
 name = "trust-dns-proto"
 version = "0.23.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9430,6 +9493,12 @@ name = "urlencoding"
 version = "2.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "daf8dba3b7eb870caf1ddeed7bc9d2a049f3cfdfae7cb521b087cc33ae4c49da"
+
+[[package]]
+name = "utf8-width"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "86bd8d4e895da8537e5315b8254664e6b769c4ff3db18321b297a1e7004392e3"
 
 [[package]]
 name = "utf8parse"
