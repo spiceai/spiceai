@@ -69,5 +69,5 @@ arrow-odbc = { version = "9.0.0" }
 snowflake-api = { git = "https://github.com/spiceai/snowflake-rs.git", folder = "snowflake-api", rev = "5dab964abef23314e7a3f27ae89b83352e315206" }
 suppaftp = { version = "5.3.1", features = ["async"] }
 ssh2 = { version = "0.9.4" }
-datafusion-federation = { git = "https://github.com/phillipleblanc/datafusion-federation.git", rev = "3b0b667655b7777a4ba3e6889df3c80050596dc9" }
-datafusion-federation-sql = { git = "https://github.com/phillipleblanc/datafusion-federation.git", folder = "sources/sql", rev = "3b0b667655b7777a4ba3e6889df3c80050596dc9" }
+datafusion-federation = { git = "https://github.com/phillipleblanc/datafusion-federation.git", rev = "939fbc95e9952d02fac8d62e025697090ae1f676" }
+datafusion-federation-sql = { git = "https://github.com/phillipleblanc/datafusion-federation.git", folder = "sources/sql", rev = "939fbc95e9952d02fac8d62e025697090ae1f676" }

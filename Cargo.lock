@@ -2632,7 +2632,7 @@ dependencies = [
 [[package]]
 name = "datafusion-federation"
 version = "0.1.3"
-source = "git+https://github.com/phillipleblanc/datafusion-federation.git?rev=3b0b667655b7777a4ba3e6889df3c80050596dc9#3b0b667655b7777a4ba3e6889df3c80050596dc9"
+source = "git+https://github.com/phillipleblanc/datafusion-federation.git?rev=939fbc95e9952d02fac8d62e025697090ae1f676#939fbc95e9952d02fac8d62e025697090ae1f676"
 dependencies = [
  "async-trait",
  "datafusion",
@@ -2641,13 +2641,14 @@ dependencies = [
 [[package]]
 name = "datafusion-federation-sql"
 version = "0.1.3"
-source = "git+https://github.com/phillipleblanc/datafusion-federation.git?rev=3b0b667655b7777a4ba3e6889df3c80050596dc9#3b0b667655b7777a4ba3e6889df3c80050596dc9"
+source = "git+https://github.com/phillipleblanc/datafusion-federation.git?rev=939fbc95e9952d02fac8d62e025697090ae1f676#939fbc95e9952d02fac8d62e025697090ae1f676"
 dependencies = [
  "async-trait",
  "datafusion",
  "datafusion-federation",
  "futures",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
