@@ -78,7 +78,6 @@ Currently supported data connectors for upstream datasets. More coming soon.
 | `spark`      | Spark                                                                                          | Alpha        | [Spark Connect](https://spark.apache.org/docs/latest/spark-connect-overview.html)                  | `full`           |
 | `flightsql`  | Apache Arrow Flight SQL                                                                                     | Alpha        | Arrow Flight SQL                                                                                   | `full`           |
 | `snowflake`  | Snowflake                                                                                      | Alpha        | Arrow                                                                                | `full`           |
-| `bigquery`   | BigQuery                                                                                       | Coming soon! | Arrow Flight SQL                                                                                   | `full`           |
 | `ftp`, `sftp` | FTP/SFTP | Alpha | Parquet, CSV | `full` |
 
 ### Supported Data Stores/Accelerators
