@@ -20,7 +20,11 @@ use std::path::PathBuf;
 
 use snafu::prelude::*;
 use spicepod::{
-    component::{dataset::Dataset, model::Model, secrets::Secrets},
+    component::{
+        dataset::Dataset,
+        model::Model,
+        secrets::{Secrets, SpiceSecretStore},
+    },
     Spicepod,
 };
 
@@ -77,8 +81,8 @@ impl AppBuilder {
     }
 
     #[must_use]
-    pub fn with_secret(mut self, secret: Secrets) -> AppBuilder {
-        self.secrets = secret;
+    pub fn with_secret_store(mut self, secret: SpiceSecretStore) -> AppBuilder {
+        self.secrets = Secrets { store: secret };
         self
     }
 
