@@ -5328,8 +5328,8 @@ checksum = "c9be0862c1b3f26a88803c4a49de6889c10e608b3ee9344e6ef5b45fb37ad3d1"
 
 [[package]]
 name = "mistralrs"
-version = "0.1.8"
-source = "git+https://github.com/EricLBuehler/mistral.rs#ca9bf7d1a8a67bd69a3eed89841a106d2e518c45"
+version = "0.1.9"
+source = "git+https://github.com/spiceai/mistral.rs#ac5dd0f7f7a4ff1626c1e1be5069bbd6b49fe750"
 dependencies = [
  "anyhow",
  "candle-core 0.5.0 (git+https://github.com/EricLBuehler/candle.git)",
@@ -5340,8 +5340,8 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-core"
-version = "0.1.8"
-source = "git+https://github.com/EricLBuehler/mistral.rs#ca9bf7d1a8a67bd69a3eed89841a106d2e518c45"
+version = "0.1.9"
+source = "git+https://github.com/spiceai/mistral.rs#ac5dd0f7f7a4ff1626c1e1be5069bbd6b49fe750"
 dependencies = [
  "anyhow",
  "async-trait",
