@@ -816,11 +816,11 @@ impl Runtime {
 
     pub async fn init_results_cache(&self) {
         let app_lock = self.app.read().await;
-        let cache_config = app_lock
-            .as_ref()
-            .and_then(|app| app.runtime.results_cache.as_ref());
 
-        let Some(cache_config) = cache_config else {
+        let Some(cache_config) = app_lock
+            .as_ref()
+            .and_then(|app| app.runtime.results_cache.as_ref())
+        else {
             return;
         };
 

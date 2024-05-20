@@ -1,4 +1,3 @@
-use crate::key_for_logical_plan;
 /*
 Copyright 2024 The Spice.ai OSS Authors
 
@@ -14,6 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+use crate::key_for_logical_plan;
 use crate::QueryResultCache;
 use crate::Result;
 use arrow::array::RecordBatch;
