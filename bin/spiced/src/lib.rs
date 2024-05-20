@@ -87,6 +87,12 @@ pub struct Args {
         help_heading = "Enable connection to Spice.ai Cloud. Requires the API key to be stored in secrets."
     )]
     pub spice_cloud_connect: bool,
+
+    #[arg(
+        long,
+        help_heading = "The dataset path for syncing metrics to Spice.ai."
+    )]
+    pub spice_cloud_metrics_dataset: Option<String>,
 }
 
 pub async fn run(args: Args) -> Result<()> {
@@ -122,7 +128,7 @@ pub async fn run(args: Args) -> Result<()> {
 
     if args.spice_cloud_connect {
         if let Err(err) = rt
-            .start_metrics(args.metrics)
+            .start_metrics(args.metrics, args.spice_cloud_metrics_dataset)
             .await
             .context(UnableToStartServersSnafu)
         {
