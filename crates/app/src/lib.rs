@@ -23,6 +23,7 @@ use spicepod::{
     component::{
         dataset::Dataset,
         model::Model,
+        runtime::Runtime,
         secrets::{Secrets, SpiceSecretStore},
     },
     Spicepod,
@@ -39,6 +40,8 @@ pub struct App {
     pub models: Vec<Model>,
 
     pub spicepods: Vec<Spicepod>,
+
+    pub runtime: Runtime,
 }
 
 #[derive(Debug, Snafu)]
@@ -58,6 +61,7 @@ pub struct AppBuilder {
     datasets: Vec<Dataset>,
     models: Vec<Model>,
     spicepods: Vec<Spicepod>,
+    runtime: Runtime,
 }
 
 impl AppBuilder {
@@ -68,6 +72,7 @@ impl AppBuilder {
             datasets: vec![],
             models: vec![],
             spicepods: vec![],
+            runtime: Runtime::default(),
         }
     }
 
@@ -106,6 +111,7 @@ impl AppBuilder {
             datasets: self.datasets,
             models: self.models,
             spicepods: self.spicepods,
+            runtime: self.runtime,
         }
     }
 
@@ -114,6 +120,7 @@ impl AppBuilder {
         let spicepod_root =
             Spicepod::load(&path).context(UnableToLoadSpicepodSnafu { path: path.clone() })?;
         let secrets = spicepod_root.secrets.clone();
+        let runtime = spicepod_root.runtime.clone();
         let mut datasets: Vec<Dataset> = vec![];
         let mut models: Vec<Model> = vec![];
         for dataset in &spicepod_root.datasets {
@@ -150,6 +157,7 @@ impl AppBuilder {
             datasets,
             models,
             spicepods,
+            runtime,
         })
     }
 }

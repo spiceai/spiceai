@@ -28,6 +28,7 @@ use ::datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use ::datafusion::sql::sqlparser::{self, ast};
 use accelerated_table::AcceleratedTable;
 use app::App;
+use cache::QueryResultCacheProvider;
 use config::Config;
 use metrics::SetRecorderError;
 use model_components::{model::Model, modelsource::source as model_source};
@@ -184,6 +185,7 @@ impl Runtime {
     pub async fn new(app: Option<app::App>, df: Arc<RwLock<DataFusion>>) -> Self {
         dataconnector::register_all().await;
         dataaccelerator::register_all().await;
+
         Runtime {
             app: Arc::new(RwLock::new(app)),
             df,
@@ -810,6 +812,36 @@ impl Runtime {
         }
 
         Ok(())
+    }
+
+    pub async fn init_results_cache(&self) {
+        let app_lock = self.app.read().await;
+
+        let Some(cache_config) = app_lock
+            .as_ref()
+            .and_then(|app| app.runtime.results_cache.as_ref())
+        else {
+            return;
+        };
+
+        if !cache_config.enabled {
+            return;
+        }
+
+        let cache_provider = match QueryResultCacheProvider::new(cache_config) {
+            Ok(cache_provider) => cache_provider,
+            Err(e) => {
+                tracing::warn!("Failed to initialize query results cache: {e}");
+                return;
+            }
+        };
+
+        tracing::info!("Initialized query results cache; {cache_provider}");
+
+        self.df
+            .write()
+            .await
+            .set_cache_provider(Some(cache_provider));
     }
 }
 
