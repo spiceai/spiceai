@@ -17,7 +17,7 @@ limitations under the License.
 use crate::{config, datafusion::DataFusion};
 use app::App;
 use axum::routing::patch;
-use llms::nql::NSQLRuntime;
+use llms::nql::Nql;
 use model_components::model::Model;
 use std::net::SocketAddr;
 use std::{collections::HashMap, sync::Arc};
@@ -39,6 +39,7 @@ pub(crate) fn routes(
     app: Arc<RwLock<Option<App>>>,
     df: Arc<RwLock<DataFusion>>,
     models: Arc<RwLock<HashMap<String, Model>>>,
+    llms: Arc<RwLock<HashMap<String, Box<dyn Nql>>>>,
     config: Arc<config::Config>,
     with_metrics: Option<SocketAddr>,
 ) -> Router {
@@ -63,16 +64,9 @@ pub(crate) fn routes(
             .route("/v1/models", get(v1::models::get))
             .route("/v1/models/:name/predict", get(v1::inference::get))
             .route("/v1/predict", post(v1::inference::post))
+            .route("/v1/nsql", post(v1::nsql::post))
+            .layer(Extension(llms))
             .layer(Extension(models));
-
-        match llms::nql::try_duckdb_from_spice_local(&NSQLRuntime::Mistral) {
-            Ok(duck_nql) => {
-                router = router
-                    .route("/v1/nsql", post(v1::nsql::post))
-                    .layer(Extension(Arc::new(RwLock::new(duck_nql))));
-            }
-            Err(e) => tracing::error!("Failed to load DuckDB NQL model: {e:#?}"),
-        }
     }
 
     router = router

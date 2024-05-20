@@ -20,7 +20,7 @@ use std::path::PathBuf;
 
 use snafu::prelude::*;
 use spicepod::{
-    component::{dataset::Dataset, model::Model, secrets::Secrets},
+    component::{dataset::Dataset, llms::Llm, model::Model, secrets::Secrets},
     Spicepod,
 };
 
@@ -33,6 +33,8 @@ pub struct App {
     pub datasets: Vec<Dataset>,
 
     pub models: Vec<Model>,
+
+    pub llms: Vec<Llm>,
 
     pub spicepods: Vec<Spicepod>,
 }
@@ -53,6 +55,7 @@ pub struct AppBuilder {
     secrets: Secrets,
     datasets: Vec<Dataset>,
     models: Vec<Model>,
+    pub llms: Vec<Llm>,
     spicepods: Vec<Spicepod>,
 }
 
@@ -63,6 +66,7 @@ impl AppBuilder {
             secrets: Secrets::default(),
             datasets: vec![],
             models: vec![],
+            llms: vec![],
             spicepods: vec![],
         }
     }
@@ -72,6 +76,7 @@ impl AppBuilder {
         self.secrets = spicepod.secrets.clone();
         self.datasets.extend(spicepod.datasets.clone());
         self.models.extend(spicepod.models.clone());
+        self.llms.extend(spicepod.llms.clone());
         self.spicepods.push(spicepod);
         self
     }
@@ -95,12 +100,19 @@ impl AppBuilder {
     }
 
     #[must_use]
+    pub fn with_llm(mut self, llm: Llm) -> AppBuilder {
+        self.llms.push(llm);
+        self
+    }
+
+    #[must_use]
     pub fn build(self) -> App {
         App {
             name: self.name,
             secrets: self.secrets,
             datasets: self.datasets,
             models: self.models,
+            llms: self.llms,
             spicepods: self.spicepods,
         }
     }
@@ -112,12 +124,17 @@ impl AppBuilder {
         let secrets = spicepod_root.secrets.clone();
         let mut datasets: Vec<Dataset> = vec![];
         let mut models: Vec<Model> = vec![];
+        let mut llms: Vec<Llm> = vec![];
         for dataset in &spicepod_root.datasets {
             datasets.push(dataset.clone());
         }
 
         for model in &spicepod_root.models {
             models.push(model.clone());
+        }
+
+        for llm in &spicepod_root.llms {
+            llms.push(llm.clone());
         }
 
         let root_spicepod_name = spicepod_root.name.clone();
@@ -135,6 +152,9 @@ impl AppBuilder {
             for model in &dependent_spicepod.models {
                 models.push(model.clone());
             }
+            for llm in &dependent_spicepod.llms {
+                llms.push(llm.clone());
+            }
             spicepods.push(dependent_spicepod);
         }
 
@@ -145,6 +165,7 @@ impl AppBuilder {
             secrets,
             datasets,
             models,
+            llms,
             spicepods,
         })
     }
