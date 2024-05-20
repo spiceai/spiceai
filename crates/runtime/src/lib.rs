@@ -171,10 +171,9 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct Runtime {
     pub app: Arc<RwLock<Option<App>>>,
-    pub config: config::Config,
     pub df: Arc<RwLock<DataFusion>>,
     pub models: Arc<RwLock<HashMap<String, Model>>>,
-    pub pods_watcher: podswatcher::PodsWatcher,
+    pub pods_watcher: Option<podswatcher::PodsWatcher>,
     pub secrets_provider: Arc<RwLock<secrets::SecretsProvider>>,
 
     spaced_tracer: Arc<tracers::SpacedTracer>,
@@ -182,23 +181,21 @@ pub struct Runtime {
 
 impl Runtime {
     #[must_use]
-    pub async fn new(
-        config: Config,
-        app: Arc<RwLock<Option<app::App>>>,
-        df: Arc<RwLock<DataFusion>>,
-        pods_watcher: podswatcher::PodsWatcher,
-    ) -> Self {
+    pub async fn new(app: Option<app::App>, df: Arc<RwLock<DataFusion>>) -> Self {
         dataconnector::register_all().await;
         dataaccelerator::register_all().await;
         Runtime {
-            app,
-            config,
+            app: Arc::new(RwLock::new(app)),
             df,
             models: Arc::new(RwLock::new(HashMap::new())),
-            pods_watcher,
+            pods_watcher: None,
             secrets_provider: Arc::new(RwLock::new(secrets::SecretsProvider::new())),
             spaced_tracer: Arc::new(tracers::SpacedTracer::new(Duration::from_secs(15))),
         }
+    }
+
+    pub fn with_pods_watcher(&mut self, pods_watcher: podswatcher::PodsWatcher) {
+        self.pods_watcher = Some(pods_watcher);
     }
 
     pub async fn load_secrets(&self) {
@@ -682,9 +679,24 @@ impl Runtime {
         self.load_model(m).await;
     }
 
-    pub async fn start_metrics(&mut self, with_metrics: Option<SocketAddr>) -> Result<()> {
+    pub async fn start_metrics(
+        &mut self,
+        with_metrics: Option<SocketAddr>,
+        cloud_dataset_path: Option<String>,
+    ) -> Result<()> {
         if let Some(metrics_socket) = with_metrics {
-            let recorder = MetricsRecorder::new(metrics_socket)
+            let secret = match self
+                .secrets_provider
+                .read()
+                .await
+                .get_secret("spiceai")
+                .await
+            {
+                Ok(s) => s,
+                Err(_) => None,
+            };
+
+            let recorder = MetricsRecorder::new(metrics_socket, secret, cloud_dataset_path)
                 .await
                 .context(UnableToStartLocalMetricsSnafu)?;
 
@@ -700,22 +712,23 @@ impl Runtime {
         Ok(())
     }
 
-    pub async fn start_servers(&mut self, with_metrics: Option<SocketAddr>) -> Result<()> {
+    pub async fn start_servers(
+        &mut self,
+        config: Config,
+        with_metrics: Option<SocketAddr>,
+    ) -> Result<()> {
         let http_server_future = http::start(
-            self.config.http_bind_address,
+            config.http_bind_address,
             Arc::clone(&self.app),
             Arc::clone(&self.df),
             Arc::clone(&self.models),
-            self.config.clone().into(),
+            config.clone().into(),
             with_metrics,
         );
 
-        let flight_server_future =
-            flight::start(self.config.flight_bind_address, Arc::clone(&self.df));
-        let open_telemetry_server_future = opentelemetry::start(
-            self.config.open_telemetry_bind_address,
-            Arc::clone(&self.df),
-        );
+        let flight_server_future = flight::start(config.flight_bind_address, Arc::clone(&self.df));
+        let open_telemetry_server_future =
+            opentelemetry::start(config.open_telemetry_bind_address, Arc::clone(&self.df));
         let pods_watcher_future = self.start_pods_watcher();
 
         tokio::select! {
@@ -731,7 +744,10 @@ impl Runtime {
     }
 
     pub async fn start_pods_watcher(&mut self) -> notify::Result<()> {
-        let mut rx = self.pods_watcher.watch()?;
+        let Some(mut pods_watcher) = self.pods_watcher.take() else {
+            return Ok(());
+        };
+        let mut rx = pods_watcher.watch()?;
 
         while let Some(new_app) = rx.recv().await {
             let mut app_lock = self.app.write().await;
