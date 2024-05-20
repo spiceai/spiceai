@@ -16,9 +16,6 @@ limitations under the License.
 
 use std::fmt::Display;
 use std::fmt::Formatter;
-use std::hash::DefaultHasher;
-use std::hash::Hash;
-use std::hash::Hasher;
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
@@ -107,11 +104,4 @@ impl Display for QueryResultCacheProvider {
             self.ttl
         )
     }
-}
-
-#[must_use]
-pub fn key_for_logical_plan(plan: &LogicalPlan) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    plan.hash(&mut hasher);
-    hasher.finish()
 }

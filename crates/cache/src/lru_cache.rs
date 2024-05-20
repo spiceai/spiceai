@@ -13,13 +13,15 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use crate::key_for_logical_plan;
 use crate::QueryResultCache;
 use crate::Result;
 use arrow::array::RecordBatch;
 use async_trait::async_trait;
 use datafusion::logical_expr::LogicalPlan;
 use moka::future::Cache;
+use std::hash::DefaultHasher;
+use std::hash::Hash;
+use std::hash::Hasher;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -30,7 +32,7 @@ pub struct LruCache {
 impl LruCache {
     pub fn new(cache_max_size: u64, ttl: Duration) -> Self {
         let cache: Cache<u64, Arc<Vec<RecordBatch>>> = Cache::builder()
-            .time_to_live(std::time::Duration::from_secs(ttl.as_secs()))
+            .time_to_live(ttl)
             .weigher(|_key, value: &Arc<Vec<RecordBatch>>| -> u32 {
                 let val: usize = value
                     .iter()
@@ -72,4 +74,10 @@ impl QueryResultCache for LruCache {
         self.cache.insert(key, result).await;
         Ok(())
     }
+}
+
+pub fn key_for_logical_plan(plan: &LogicalPlan) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    plan.hash(&mut hasher);
+    hasher.finish()
 }
