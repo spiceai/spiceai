@@ -358,7 +358,6 @@ impl Read for DuckDBTableFactory {
 
         let table_provider = Arc::new(table_provider);
 
-        #[cfg(feature = "federation-experimental")]
         let table_provider = Arc::new(
             table_provider
                 .create_federated_table_provider()

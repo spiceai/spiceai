@@ -21,7 +21,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use app::App;
+use app::{App, AppBuilder};
 use clap::Parser;
 use flightrepl::ReplConfig;
 use runtime::config::Config as RuntimeConfig;
@@ -87,26 +87,31 @@ pub struct Args {
         help_heading = "Enable connection to Spice.ai Cloud. Requires the API key to be stored in secrets."
     )]
     pub spice_cloud_connect: bool,
+
+    #[arg(
+        long,
+        help_heading = "The dataset path for syncing metrics to Spice.ai."
+    )]
+    pub spice_cloud_metrics_dataset: Option<String>,
 }
 
 pub async fn run(args: Args) -> Result<()> {
     let current_dir = env::current_dir().unwrap_or(PathBuf::from("."));
     let df = Arc::new(RwLock::new(runtime::datafusion::DataFusion::new()));
     let pods_watcher = PodsWatcher::new(current_dir.clone());
-    let app: Arc<RwLock<Option<App>>> =
-        match App::new(current_dir.clone()).context(UnableToConstructSpiceAppSnafu) {
-            Ok(app) => Arc::new(RwLock::new(Some(app))),
-            Err(e) => {
-                tracing::warn!("{}", e);
-                Arc::new(RwLock::new(None))
-            }
-        };
+    let app: Option<App> = match AppBuilder::build_from_filesystem_path(current_dir.clone())
+        .context(UnableToConstructSpiceAppSnafu)
+    {
+        Ok(app) => Some(app),
+        Err(e) => {
+            tracing::warn!("{}", e);
+            None
+        }
+    };
 
-    let mut rt: Runtime = Runtime::new(args.runtime, app, df, pods_watcher).await;
+    let mut rt: Runtime = Runtime::new(app, df).await;
 
-    if args.spice_cloud_connect {
-        rt.start_metrics(args.metrics).await;
-    }
+    rt.with_pods_watcher(pods_watcher);
 
     rt.load_secrets().await;
 
@@ -114,7 +119,19 @@ pub async fn run(args: Args) -> Result<()> {
 
     rt.load_models().await;
 
-    rt.start_servers(args.metrics)
+    rt.init_results_cache().await;
+
+    if args.spice_cloud_connect {
+        if let Err(err) = rt
+            .start_metrics(args.metrics, args.spice_cloud_metrics_dataset)
+            .await
+            .context(UnableToStartServersSnafu)
+        {
+            tracing::warn!("{err}");
+        }
+    }
+
+    rt.start_servers(args.runtime, args.metrics)
         .await
         .context(UnableToStartServersSnafu)?;
 

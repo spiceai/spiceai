@@ -22,7 +22,7 @@ use spicepod::component::ComponentOrReference;
 use std::path::PathBuf;
 use tokio::sync::mpsc::{channel, Receiver};
 
-use app::App;
+use app::{App, AppBuilder};
 
 pub struct PodsWatcher {
     root_path: PathBuf,
@@ -66,7 +66,7 @@ impl PodsWatcher {
                             }
                         }
 
-                        match App::new(root_path.clone()) {
+                        match AppBuilder::build_from_filesystem_path(root_path.clone()) {
                             Ok(app) => {
                                 if let Err(e) = tx.blocking_send(app) {
                                     tracing::error!("Pods content watcher is unable to notify detected state change: {}", e);
