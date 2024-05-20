@@ -256,7 +256,7 @@ async fn single_source_federation_push_down() -> Result<(), String> {
                 //     "| 9310052        | 19912040 |",
                 //     "+----------------+----------+",
                 // ];
-                
+
                 for batch in result_batches {
                     assert_eq!(batch.num_columns(), 2);
                     assert_eq!(batch.num_rows(), 10);
