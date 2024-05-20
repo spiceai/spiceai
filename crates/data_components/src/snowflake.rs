@@ -46,7 +46,6 @@ impl Read for SnowflakeTableFactory {
                 .context(UnableToConstructSQLTableSnafu)?,
         );
 
-        #[cfg(feature = "federation-experimental")]
         let table_provider = Arc::new(
             table_provider
                 .create_federated_table_provider()
