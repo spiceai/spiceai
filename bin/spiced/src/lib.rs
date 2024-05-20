@@ -21,7 +21,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use app::App;
+use app::{App, AppBuilder};
 use clap::Parser;
 use flightrepl::ReplConfig;
 use runtime::config::Config as RuntimeConfig;
@@ -99,14 +99,15 @@ pub async fn run(args: Args) -> Result<()> {
     let current_dir = env::current_dir().unwrap_or(PathBuf::from("."));
     let df = Arc::new(RwLock::new(runtime::datafusion::DataFusion::new()));
     let pods_watcher = PodsWatcher::new(current_dir.clone());
-    let app: Option<App> =
-        match App::new(current_dir.clone()).context(UnableToConstructSpiceAppSnafu) {
-            Ok(app) => Some(app),
-            Err(e) => {
-                tracing::warn!("{}", e);
-                None
-            }
-        };
+    let app: Option<App> = match AppBuilder::build_from_filesystem_path(current_dir.clone())
+        .context(UnableToConstructSpiceAppSnafu)
+    {
+        Ok(app) => Some(app),
+        Err(e) => {
+            tracing::warn!("{}", e);
+            None
+        }
+    };
 
     let mut rt: Runtime = Runtime::new(app, df).await;
 
