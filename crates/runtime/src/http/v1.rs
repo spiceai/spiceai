@@ -137,7 +137,7 @@ pub(crate) mod query {
                 }
             }
             Err(e) => {
-                tracing::debug!("Error running query: {e}");
+                tracing::debug!("Error executing query: {e}");
                 return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
             }
         };
