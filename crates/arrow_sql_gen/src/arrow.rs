@@ -18,9 +18,9 @@ use arrow::{
         ArrayBuilder, BinaryBuilder, BooleanBuilder, Date32Builder, Date64Builder,
         Decimal128Builder, FixedSizeBinaryBuilder, Float32Builder, Float64Builder, Int16Builder,
         Int32Builder, Int64Builder, Int8Builder, LargeBinaryBuilder, LargeStringBuilder,
-        ListBuilder, StringBuilder, Time64NanosecondBuilder, TimestampMicrosecondBuilder,
-        TimestampMillisecondBuilder, TimestampNanosecondBuilder, TimestampSecondBuilder,
-        UInt16Builder, UInt32Builder, UInt64Builder, UInt8Builder,
+        ListBuilder, NullBuilder, StringBuilder, Time64NanosecondBuilder,
+        TimestampMicrosecondBuilder, TimestampMillisecondBuilder, TimestampNanosecondBuilder,
+        TimestampSecondBuilder, UInt16Builder, UInt32Builder, UInt64Builder, UInt8Builder,
     },
     datatypes::{DataType, TimeUnit},
 };
@@ -88,6 +88,7 @@ pub fn map_data_type_to_array_builder(data_type: &DataType) -> Box<dyn ArrayBuil
             DataType::Boolean => Box::new(ListBuilder::new(BooleanBuilder::new())),
             _ => unimplemented!("Unsupported list value data type {:?}", data_type),
         },
+        DataType::Null => Box::new(NullBuilder::new()),
         _ => unimplemented!("Unsupported data type {:?}", data_type),
     }
 }

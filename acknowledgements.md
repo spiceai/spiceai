@@ -61,6 +61,9 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - arrow-json 51.0.0, Apache-2.0 
   <br/>https://github.com/apache/arrow-rs
 
+- async-openai 0.21.0, MIT 
+  <br/>https://github.com/64bit/async-openai
+
 - async-stream 0.3.5, MIT 
   <br/>https://github.com/tokio-rs/async-stream
 
@@ -103,8 +106,26 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - bigdecimal 0.4.3, Apache-2.0 OR MIT 
   <br/>https://github.com/akubera/bigdecimal-rs
 
+- byte-unit 5.1.4, MIT 
+  <br/>https://github.com/magiclen/byte-unit
+
 - bytes 1.6.0, MIT 
   <br/>https://github.com/tokio-rs/bytes
+
+- candle-core 0.5.0, Apache-2.0 OR MIT 
+  <br/>https://github.com/huggingface/candle
+
+- candle-core 0.5.0, Apache-2.0 OR MIT 
+  <br/>https://github.com/huggingface/candle
+
+- candle-examples 0.5.0, Apache-2.0 OR MIT 
+  <br/>https://github.com/huggingface/candle
+
+- candle-transformers 0.5.0, Apache-2.0 OR MIT 
+  <br/>https://github.com/huggingface/candle
+
+- candle-transformers 0.5.0, Apache-2.0 OR MIT 
+  <br/>https://github.com/huggingface/candle
 
 - chrono 0.4.38, Apache-2.0 OR MIT 
   <br/>https://github.com/chronotope/chrono
@@ -126,6 +147,12 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 
 - datafusion 38.0.0, Apache-2.0 
   <br/>https://github.com/apache/datafusion
+
+- datafusion-federation 0.1.3, Apache-2.0 
+  <br/>
+
+- datafusion-federation-sql 0.1.3, Apache-2.0 
+  <br/>
 
 - deltalake 0.17.3, Apache-2.0 
   <br/>https://github.com/delta-io/delta.rs
@@ -151,6 +178,9 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - itertools 0.10.5, Apache-2.0 OR MIT 
   <br/>https://github.com/rust-itertools/itertools
 
+- itertools 0.11.0, Apache-2.0 OR MIT 
+  <br/>https://github.com/rust-itertools/itertools
+
 - itertools 0.12.1, Apache-2.0 OR MIT 
   <br/>https://github.com/rust-itertools/itertools
 
@@ -165,6 +195,18 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 
 - metrics-exporter-prometheus 0.13.1, MIT 
   <br/>https://github.com/metrics-rs/metrics
+
+- metrics-util 0.16.3, MIT 
+  <br/>https://github.com/metrics-rs/metrics
+
+- mistralrs 0.1.9, MIT 
+  <br/>https://github.com/EricLBuehler/mistral.rs
+
+- mistralrs-core 0.1.9, MIT 
+  <br/>https://github.com/EricLBuehler/mistral.rs
+
+- moka 0.12.7, Apache-2.0 OR MIT 
+  <br/>https://github.com/moka-rs/moka
 
 - mysql_async 0.34.1, Apache-2.0 OR MIT 
   <br/>https://github.com/blackbeam/mysql_async
@@ -207,6 +249,9 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 
 - postgres-native-tls 0.5.0, Apache-2.0 OR MIT 
   <br/>https://github.com/sfackler/rust-postgres
+
+- prometheus-parse 0.2.5, Apache-2.0 
+  <br/>https://github.com/ccakes/prometheus-parse-rs
 
 - prost 0.11.9, Apache-2.0 
   <br/>https://github.com/tokio-rs/prost
@@ -253,7 +298,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - serde 1.0.198, Apache-2.0 OR MIT 
   <br/>https://github.com/serde-rs/serde
 
-- serde_json 1.0.116, Apache-2.0 OR MIT 
+- serde_json 1.0.117, Apache-2.0 OR MIT 
   <br/>https://github.com/serde-rs/json
 
 - serde_yaml 0.9.34+deprecated, Apache-2.0 OR MIT 
@@ -271,8 +316,20 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - spark-connect-rs 0.0.1-beta.3, Apache-2.0 
   <br/>https://github.com/sjrusso8/spark-connect-rs
 
+- ssh2 0.9.4, Apache-2.0 OR MIT 
+  <br/>https://github.com/alexcrichton/ssh2-rs
+
+- suppaftp 5.3.1, Apache-2.0 
+  <br/>https://github.com/veeso/suppaftp
+
 - time 0.3.36, Apache-2.0 OR MIT 
   <br/>https://github.com/time-rs/time
+
+- tokenizers 0.15.2, Apache-2.0 
+  <br/>https://github.com/huggingface/tokenizers
+
+- tokenizers 0.19.1, Apache-2.0 
+  <br/>https://github.com/huggingface/tokenizers
 
 - tokio 1.37.0, MIT 
   <br/>https://github.com/tokio-rs/tokio

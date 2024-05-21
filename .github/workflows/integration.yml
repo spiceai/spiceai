@@ -1,0 +1,31 @@
+---
+name: integration tests
+
+on:
+  pull_request:
+    branches:
+      - trunk
+      - release-*
+
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Integration Tests
+    runs-on: ubuntu-latest-16-cores
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          os: 'linux'
+
+      - name: Set up Spice.ai API Key
+        run: |
+          mkdir -p ~/.spice
+          echo "[spiceai]" > ~/.spice/auth
+          echo "  [spiceai.params]" >> ~/.spice/auth
+          echo '    key = "${{ secrets.SPICE_SECRET_SPICEAI_KEY }}"' >> ~/.spice/auth
+
+      - run: make test-integration

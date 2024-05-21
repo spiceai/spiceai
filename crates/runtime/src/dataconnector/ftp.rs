@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use secrets::{get_secret_or_param, AnyErrorResult, Secret};
+use secrets::{get_secret_or_param, Secret};
 use snafu::prelude::*;
 use spicepod::component::dataset::Dataset;
 use std::any::Any;
@@ -23,16 +23,7 @@ use std::sync::Arc;
 use std::{collections::HashMap, future::Future};
 use url::{form_urlencoded, Url};
 
-use super::{DataConnector, DataConnectorFactory, ListingTableConnector};
-
-#[derive(Debug, Snafu)]
-pub enum Error {
-    #[snafu(display("Unable to parse URL {url}: {source}"))]
-    UnableToParseURL {
-        url: String,
-        source: url::ParseError,
-    },
-}
+use super::{DataConnector, DataConnectorFactory, DataConnectorResult, ListingTableConnector};
 
 pub struct FTP {
     secret: Option<Secret>,
@@ -69,7 +60,7 @@ impl ListingTableConnector for FTP {
         &self.params
     }
 
-    fn get_object_store_url(&self, dataset: &Dataset) -> AnyErrorResult<Url> {
+    fn get_object_store_url(&self, dataset: &Dataset) -> DataConnectorResult<Url> {
         let mut fragments = vec![];
         let mut fragment_builder = form_urlencoded::Serializer::new(String::new());
 
@@ -87,7 +78,12 @@ impl ListingTableConnector for FTP {
         fragments.push(fragment_builder.finish());
 
         let mut ftp_url =
-            Url::parse(&dataset.from).context(UnableToParseURLSnafu { url: &dataset.from })?;
+            Url::parse(&dataset.from)
+                .boxed()
+                .context(super::InvalidConfigurationSnafu {
+                    dataconnector: format!("{self}"),
+                    message: format!("{} is not a valid URL", dataset.from),
+                })?;
 
         if dataset.from.ends_with('/') {
             fragments.push("dfiscollectionbugworkaround=hack/".into());
