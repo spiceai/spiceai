@@ -127,7 +127,7 @@ pub(crate) mod query {
                 match record_batch_stream.try_collect::<Vec<RecordBatch>>().await {
                     Ok(batches) => batches,
                     Err(e) => {
-                        tracing::debug!("Error running query: {e}");
+                        tracing::debug!("Error executing query: {e}");
                         return (
                             StatusCode::BAD_REQUEST,
                             format!("Batch processing error: {e}"),
