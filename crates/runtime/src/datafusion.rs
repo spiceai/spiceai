@@ -25,26 +25,21 @@ use crate::dataconnector::{DataConnector, DataConnectorError};
 use crate::dataupdate::{DataUpdate, DataUpdateExecutionPlan, UpdateType};
 use crate::get_dependent_table_names;
 use crate::object_store_registry::default_runtime_env;
-use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
 use arrow_tools::schema::verify_schema;
-use async_stream::stream;
-use cache::{CachedQueryResult, QueryResultCacheProvider};
+use cache::{to_cached_record_batch_stream, QueryResultCacheProvider};
 use datafusion::catalog::schema::SchemaProvider;
 use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider};
 use datafusion::datasource::{TableProvider, ViewTable};
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::{SQLOptions, SessionConfig, SessionContext, SessionState};
 use datafusion::execution::SendableRecordBatchStream;
-use datafusion::logical_expr::LogicalPlan;
 use datafusion::physical_plan::collect;
 use datafusion::physical_plan::memory::MemoryStream;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::sql::parser::DFParser;
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::{sqlparser, TableReference};
 use datafusion_federation::{FederatedQueryPlanner, FederationAnalyzerRule};
-use futures::StreamExt;
 use secrets::Secret;
 use snafu::prelude::*;
 use spicepod::component::dataset::{Dataset, Mode};
@@ -322,7 +317,7 @@ impl DataFusion {
         verify_schema(df_schema.fields(), res_schema.fields()).context(SchemaMismatchSnafu)?;
 
         if let Some(cache_provider) = &self.cache_provider {
-            return Ok(Self::to_cached_result_stream(
+            return Ok(to_cached_record_batch_stream(
                 cache_provider.clone(),
                 res_stream,
                 plan_copy,
@@ -330,48 +325,6 @@ impl DataFusion {
         }
 
         Ok(res_stream)
-    }
-
-    fn to_cached_result_stream(
-        cache_provider_copy: QueryResultCacheProvider,
-        mut stream: SendableRecordBatchStream,
-        plan: LogicalPlan,
-    ) -> SendableRecordBatchStream {
-        let schema = stream.schema();
-        let schema_copy = Arc::clone(&schema);
-
-        let cached_result_stream = stream! {
-            let mut records: Vec<RecordBatch> = Vec::new();
-            let mut records_size: usize = 0;
-            let cache_max_size: usize = cache_provider_copy.cache_max_size().try_into().unwrap_or(usize::MAX);
-
-            while let Some(batch_result) = stream.next().await {
-                if records_size < cache_max_size {
-                    if let Ok(batch) = &batch_result {
-                        records.push(batch.clone());
-                        records_size += batch.get_array_memory_size();
-                    }
-                }
-
-                yield batch_result;
-            }
-
-            if records_size < cache_max_size {
-                let cached_result = CachedQueryResult {
-                    records: Arc::new(records),
-                    schema: schema_copy
-                };
-
-                if let Err(e) = cache_provider_copy.put(&plan, cached_result).await {
-                    tracing::error!("Failed to cache query results: {e}");
-                }
-            }
-        };
-
-        Box::pin(RecordBatchStreamAdapter::new(
-            schema,
-            Box::pin(cached_result_stream),
-        ))
     }
 
     pub fn register_runtime_table(

@@ -29,6 +29,10 @@ use snafu::{ResultExt, Snafu};
 use spicepod::component::runtime::ResultsCache;
 
 mod lru_cache;
+mod utils;
+
+pub use utils::to_cached_record_batch_stream;
+
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Failed to parse cache_max_size value: {source}"))]
