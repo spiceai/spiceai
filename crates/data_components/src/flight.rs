@@ -40,7 +40,6 @@ use std::{any::Any, fmt, sync::Arc};
 
 use self::write::FlightTableWriter;
 
-#[cfg(feature = "federation-experimental")]
 pub mod federation;
 pub mod stream;
 pub mod write;
@@ -84,7 +83,6 @@ impl Read for FlightFactory {
         let table_provider =
             Arc::new(FlightTable::create(self.name, self.client.clone(), table_reference).await?);
 
-        #[cfg(feature = "federation-experimental")]
         let table_provider = Arc::new(
             table_provider
                 .create_federated_table_provider()

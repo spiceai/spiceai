@@ -20,7 +20,13 @@ use std::path::PathBuf;
 
 use snafu::prelude::*;
 use spicepod::{
-    component::{dataset::Dataset, llms::Llm, model::Model, secrets::Secrets},
+    component::{
+        dataset::Dataset,
+        llms::Llm,
+        model::Model,
+        runtime::Runtime,
+        secrets::{Secrets, SpiceSecretStore},
+    },
     Spicepod,
 };
 
@@ -37,6 +43,8 @@ pub struct App {
     pub llms: Vec<Llm>,
 
     pub spicepods: Vec<Spicepod>,
+
+    pub runtime: Runtime,
 }
 
 #[derive(Debug, Snafu)]
@@ -57,6 +65,7 @@ pub struct AppBuilder {
     models: Vec<Model>,
     pub llms: Vec<Llm>,
     spicepods: Vec<Spicepod>,
+    runtime: Runtime,
 }
 
 impl AppBuilder {
@@ -68,6 +77,7 @@ impl AppBuilder {
             models: vec![],
             llms: vec![],
             spicepods: vec![],
+            runtime: Runtime::default(),
         }
     }
 
@@ -82,8 +92,8 @@ impl AppBuilder {
     }
 
     #[must_use]
-    pub fn with_secret(mut self, secret: Secrets) -> AppBuilder {
-        self.secrets = secret;
+    pub fn with_secret_store(mut self, secret: SpiceSecretStore) -> AppBuilder {
+        self.secrets = Secrets { store: secret };
         self
     }
 
@@ -114,6 +124,7 @@ impl AppBuilder {
             models: self.models,
             llms: self.llms,
             spicepods: self.spicepods,
+            runtime: self.runtime,
         }
     }
 
@@ -122,6 +133,7 @@ impl AppBuilder {
         let spicepod_root =
             Spicepod::load(&path).context(UnableToLoadSpicepodSnafu { path: path.clone() })?;
         let secrets = spicepod_root.secrets.clone();
+        let runtime = spicepod_root.runtime.clone();
         let mut datasets: Vec<Dataset> = vec![];
         let mut models: Vec<Model> = vec![];
         let mut llms: Vec<Llm> = vec![];
@@ -167,6 +179,7 @@ impl AppBuilder {
             models,
             llms,
             spicepods,
+            runtime,
         })
     }
 }

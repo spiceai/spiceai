@@ -71,6 +71,7 @@ prost = { version = "0.12.1", default-features = false, features = [
 once_cell = "1.19.0"
 secrets = { path = "../secrets" }
 db_connection_pool = { path = "../db_connection_pool" }
+cache = { path = "../cache" }
 rusqlite = { workspace = true, optional = true }
 tokio-rusqlite = { workspace = true, optional = true }
 pin-project = "1.0"
@@ -86,13 +87,14 @@ dashmap = "5.5.3"
 snowflake-api = { workspace = true, optional = true }
 suppaftp = { workspace = true, optional = true }
 ssh2 = { workspace = true, optional = true }
-datafusion-federation = { workspace = true, optional = true }
+datafusion-federation = { workspace = true }
 fundu = { workspace = true }
 metrics-exporter-prometheus = "0.13.0"
 prometheus-parse = "0.2.5"
 
 [dev-dependencies]
 metrics-util = "0.16.3"
+tracing-subscriber.workspace = true
 
 [features]
 default = ["keyring-secret-store", "aws-secrets-manager"]
@@ -147,7 +149,3 @@ snowflake = [
     "data_components/snowflake",
 ]
 models = ["model_components/full", "llms/mistralrs"]
-federation-experimental = [
-    "dep:datafusion-federation",
-    "data_components/federation-experimental",
-]

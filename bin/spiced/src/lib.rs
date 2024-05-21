@@ -122,6 +122,8 @@ pub async fn run(args: Args) -> Result<()> {
         rt.load_llms().await;
     }
 
+    rt.init_results_cache().await;
+
     if args.spice_cloud_connect {
         if let Err(err) = rt
             .start_metrics(args.metrics, args.spice_cloud_metrics_dataset)

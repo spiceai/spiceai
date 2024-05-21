@@ -25,6 +25,7 @@ pub mod dataset;
 pub mod llms;
 pub mod model;
 pub mod params;
+pub mod runtime;
 pub mod secrets;
 
 pub trait WithDependsOn<T> {

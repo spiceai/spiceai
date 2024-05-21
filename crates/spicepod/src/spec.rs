@@ -19,6 +19,7 @@ use serde_yaml::{self, Value};
 use std::fmt::{self, Display, Formatter};
 use std::{collections::HashMap, fmt::Debug};
 
+use crate::component::runtime::Runtime;
 use crate::component::secrets::Secrets;
 use crate::component::{dataset::Dataset, llms::Llm, model::Model, ComponentOrReference};
 
@@ -41,6 +42,10 @@ pub struct SpicepodDefinition {
     pub version: SpicepodVersion,
 
     pub kind: SpicepodKind,
+
+    /// Optional runtime configuration
+    #[serde(default)]
+    pub runtime: Runtime,
 
     /// Optional spicepod secrets configuration
     /// Default value is `store: file`

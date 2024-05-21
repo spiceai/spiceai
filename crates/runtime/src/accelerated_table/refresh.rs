@@ -480,12 +480,14 @@ pub(crate) fn get_timestamp(time: SystemTime) -> u128 {
 
 #[cfg(test)]
 mod tests {
+    use std::thread::sleep;
+
     use arrow::{
-        array::{RecordBatch, StringArray, UInt64Array},
+        array::{ArrowNativeTypeOp, RecordBatch, StringArray, UInt64Array},
         datatypes::{DataType, Schema},
     };
     use data_components::arrow::write::MemTable;
-    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
     use tokio::{sync::mpsc, time::timeout};
 
     use super::*;
@@ -599,6 +601,30 @@ mod tests {
 
     #[tokio::test]
     async fn test_refresh_status_change_to_ready() {
+        fn wait_until_ready_status(
+            snapshotter: &Snapshotter,
+            desired: status::ComponentStatus,
+        ) -> bool {
+            for _i in 1..20 {
+                let hashmap = snapshotter.snapshot().into_vec();
+                let (_, _, _, value) = hashmap.first().expect("at least one metric exists");
+                match value {
+                    DebugValue::Gauge(i) => {
+                        let value = i.into_inner();
+
+                        if value.is_eq(f64::from(desired as i32)) {
+                            return true;
+                        }
+                    }
+                    _ => panic!("not testing this"),
+                }
+
+                sleep(Duration::from_micros(100));
+            }
+
+            false
+        }
+
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
 
@@ -613,23 +639,19 @@ mod tests {
         )
         .await;
 
-        let hashmap = snapshotter.snapshot().into_vec();
-        let (_, _, _, value) = hashmap.first().expect("at least one metric exists");
-        assert_eq!(
-            value,
-            &DebugValue::Gauge((status::ComponentStatus::Ready as i32).into())
-        );
+        assert!(wait_until_ready_status(
+            &snapshotter,
+            status::ComponentStatus::Ready
+        ));
 
         status::update_dataset("test", status::ComponentStatus::Refreshing);
 
         setup_and_test(vec![], vec![], 0).await;
 
-        let hashmap = snapshotter.snapshot().into_vec();
-        let (_, _, _, value) = hashmap.first().expect("at least one metric exists");
-        assert_eq!(
-            value,
-            &DebugValue::Gauge((status::ComponentStatus::Ready as i32).into())
-        );
+        assert!(wait_until_ready_status(
+            &snapshotter,
+            status::ComponentStatus::Ready
+        ));
     }
 
     #[allow(clippy::too_many_lines)]

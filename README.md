@@ -78,7 +78,6 @@ Currently supported data connectors for upstream datasets. More coming soon.
 | `spark`      | Spark                                                                                          | Alpha        | [Spark Connect](https://spark.apache.org/docs/latest/spark-connect-overview.html)                  | `full`           |
 | `flightsql`  | Apache Arrow Flight SQL                                                                                     | Alpha        | Arrow Flight SQL                                                                                   | `full`           |
 | `snowflake`  | Snowflake                                                                                      | Alpha        | Arrow                                                                                | `full`           |
-| `bigquery`   | BigQuery                                                                                       | Coming soon! | Arrow Flight SQL                                                                                   | `full`           |
 | `ftp`, `sftp` | FTP/SFTP | Alpha | Parquet, CSV | `full` |
 
 ### Supported Data Stores/Accelerators
@@ -145,9 +144,10 @@ Example output will be shown as follows:
 ```bash
 Spice.ai runtime starting...
 Using latest 'local' runtime version.
-2024-02-21T06:11:56.381793Z  INFO runtime::http: Spice Runtime HTTP listening on 127.0.0.1:3000
-2024-02-21T06:11:56.381853Z  INFO runtime::flight: Spice Runtime Flight listening on 127.0.0.1:50051
-2024-02-21T06:11:56.382038Z  INFO runtime::opentelemetry: Spice Runtime OpenTelemetry listening on 127.0.0.1:50052
+2024-05-20T22:37:26.787577Z  INFO spiced: Metrics listening on 127.0.0.1:9000
+2024-05-20T22:37:26.788298Z  INFO runtime::http: Spice Runtime HTTP listening on 127.0.0.1:3000
+2024-05-20T22:37:26.788329Z  INFO runtime::flight: Spice Runtime Flight listening on 127.0.0.1:50051
+2024-05-20T22:37:26.788402Z  INFO runtime::opentelemetry: Spice Runtime OpenTelemetry listening on 127.0.0.1:50052
 ```
 
 The runtime is now started and ready for queries.
@@ -171,8 +171,8 @@ dependencies:
 The `spiceai/quickstart` Spicepod will add a `taxi_trips` data table to the runtime which is now available to query by SQL.
 
 ```bash
-2024-02-22T05:53:48.222952Z  INFO runtime: Loaded dataset taxi_trips
-2024-02-22T05:53:48.223101Z  INFO runtime::dataconnector: Refreshing data for taxi_trips
+2024-02-22T05:53:48.222952Z  INFO runtime: Registered dataset taxi_trips
+2024-02-22T05:53:48.223101Z  INFO runtime::dataconnector::refresh: Loading data for dataset taxi_trips
 ```
 
 **Step 5.** Start the Spice SQL REPL:
@@ -305,7 +305,7 @@ dataset name: (spice_app) eth_recent_blocks
 Enter the description of the dataset:
 
 ```
-description: eth recent logs
+description: eth recent blocks
 ```
 
 Enter the location of the dataset:
@@ -323,7 +323,8 @@ Locally accelerate (y/n)? y
 You should see the following output from your runtime terminal:
 
 ```bash
-2024-02-21T22:49:10.038461Z  INFO runtime: Loaded dataset eth_recent_blocks
+2024-05-20T22:50:17.997446Z  INFO runtime: Registered dataset eth_recent_blocks
+2024-05-20T22:50:17.998125Z  INFO runtime::accelerated_table::refresh: Loading data for dataset eth_recent_blocks
 ```
 
 **Step 4.** In a new terminal window, use the Spice SQL REPL to query the dataset
