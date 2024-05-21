@@ -130,7 +130,7 @@ pub(crate) mod query {
                         tracing::debug!("Error executing query: {e}");
                         return (
                             StatusCode::BAD_REQUEST,
-                            format!("Batch processing error: {e}"),
+                            format!("Error processing batch: {e}"),
                         )
                             .into_response();
                     }
