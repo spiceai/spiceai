@@ -77,7 +77,7 @@ pub trait Nql: Sync + Send {
 /// Loads an NSQL model based on the chosen runtime.
 pub fn create_nsql(
     runtime: &NSQLRuntime,
-    extra_params: HashMap<String, String>,
+    extra_params: LlmParams,
 ) -> Result<Box<dyn Nql>> {
     match runtime {
         NSQLRuntime::Openai => {

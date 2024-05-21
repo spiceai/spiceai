@@ -52,14 +52,14 @@ pub async fn run(m: &Model, df: Arc<RwLock<DataFusion>>) -> Result<RecordBatch, 
 
 /// Attempt to derive a runnable NQL model from a given component from the Spicepod definition.
 pub fn try_to_nql(component: &spicepod::component::llms::Llm) -> Result<Box<dyn Nql>, LlmError> {
-    match component.get_prefix() {
+    match component.get_prefix() { 
         Some(prefix) => match prefix {
             // LlmPrefix::HuggingFace => Ok(Box::new(HuggingFace::new(component))),
             // LlmPrefix::SpiceAi => Ok(Box::new(SpiceAi::new(component))),
             // LlmPrefix::File => Ok(Box::new(File::new(component))),
             LlmPrefix::OpenAi => llms::nql::create_nsql(
                 &llms::nql::NSQLRuntime::Openai,
-                component.params.clone().unwrap_or_default(),
+                component.params.clone(),
             ),
             _ => Err(LlmError::UnknownModelSource {
                 source: format!(
