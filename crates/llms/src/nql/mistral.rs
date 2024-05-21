@@ -17,11 +17,11 @@ use super::{Error as NqlError, Nql, Result};
 
 use async_trait::async_trait;
 use mistralrs::{
-    Constraint, DeviceMapMetadata, GGUFLoaderBuilder, GGUFSpecificConfig, MistralRs,
-    MistralRsBuilder, NormalRequest, Request as MistralRsquest, RequestMessage,
-    Response as MistralRsponse, SamplingParams, SchedulerMethod,
+    Constraint, DeviceMapMetadata, GGUFLoaderBuilder, GGUFSpecificConfig, Loader, MistralRs,
+    MistralRsBuilder, NormalLoaderBuilder, NormalRequest, Request as MistralRsquest,
+    RequestMessage, Response as MistralRsponse, SamplingParams, SchedulerMethod,
 };
-use mistralrs_core::{LocalModelPaths, ModelPaths};
+use mistralrs_core::{LoaderBuilder, LocalModelPaths, ModelPaths, ModelSelected};
 use snafu::ResultExt;
 
 use std::{path::Path, sync::Arc};
@@ -84,6 +84,19 @@ impl MistralLlama {
             tx,
             rx,
         })
+    }
+
+    pub fn from_hf(model_id: String) -> Result<Self> {
+        let builder = NormalLoaderBuilder::new(
+            mistralrs::NormalSpecificConfig {
+                use_flash_attn: false,
+                repeat_last_n: 64,
+            },
+            None,
+            None,
+            Some(model_id),
+        );
+        let loader: Box<dyn Loader> = builder.build(Norm);
     }
 
     fn to_request(&self, prompt: String) -> MistralRsquest {

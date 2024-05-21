@@ -11,6 +11,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use snafu::Snafu;
@@ -73,9 +75,18 @@ pub trait Nql: Sync + Send {
 }
 
 /// Loads an NSQL model based on the chosen runtime.
-pub fn create_nsql(runtime: &NSQLRuntime) -> Result<Box<dyn Nql>> {
+pub fn create_nsql(
+    runtime: &NSQLRuntime,
+    extra_params: HashMap<String, String>,
+) -> Result<Box<dyn Nql>> {
     match runtime {
-        NSQLRuntime::Openai => Ok(Box::<openai::Openai>::default() as Box<dyn Nql>),
+        NSQLRuntime::Openai => {
+            let model = extra_params
+                .get("model")
+                .unwrap_or(&openai::GPT3_5_TURBO_INSTRUCT.to_string())
+                .clone();
+            Ok(Box::new(openai::Openai::using_model(model)) as Box<dyn Nql>)
+        }
         _ => try_duckdb_from_spice_local(runtime),
     }
 }

@@ -17,6 +17,8 @@ limitations under the License.
 use arrow::record_batch::RecordBatch;
 use llms::nql::{Error as LlmError, Nql};
 use model_components::model::{Error as ModelError, Model};
+use spicepod::component::llms::LlmPrefix;
+use std::collections::HashMap;
 use std::result::Result;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -51,18 +53,22 @@ pub async fn run(m: &Model, df: Arc<RwLock<DataFusion>>) -> Result<RecordBatch, 
 /// Attempt to derive a runnable NQL model from a given component from the Spicepod definition.
 pub fn try_to_nql(component: &spicepod::component::llms::Llm) -> Result<Box<dyn Nql>, LlmError> {
     match component.get_prefix() {
-        Some(_prefix) => Err(LlmError::UnknownModelSource {
-            // match prefix {
-            //     // LlmPrefix::HuggingFace => Ok(Box::new(HuggingFace::new(component))),
-            //     // LlmPrefix::SpiceAi => Ok(Box::new(SpiceAi::new(component))),
-            //     // LlmPrefix::File => Ok(Box::new(File::new(component))),
-            //     // LlmPrefix::OpenAi => Ok(Box::new(OpenAi::new(component))),
-            source: format!(
-                "Unknown model source for spicepod component from: {}",
-                component.from.clone()
-            )
-            .into(),
-        }),
+        Some(prefix) => match prefix {
+            // LlmPrefix::HuggingFace => Ok(Box::new(HuggingFace::new(component))),
+            // LlmPrefix::SpiceAi => Ok(Box::new(SpiceAi::new(component))),
+            // LlmPrefix::File => Ok(Box::new(File::new(component))),
+            LlmPrefix::OpenAi => llms::nql::create_nsql(
+                &llms::nql::NSQLRuntime::Openai,
+                component.params.clone().unwrap_or_default(),
+            ),
+            _ => Err(LlmError::UnknownModelSource {
+                source: format!(
+                    "Unknown model source for spicepod component from: {}",
+                    component.from.clone()
+                )
+                .into(),
+            }),
+        },
         None => Err(LlmError::UnknownModelSource {
             source: format!(
                 "Unknown model source for spicepod component from: {}",

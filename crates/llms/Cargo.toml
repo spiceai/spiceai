@@ -33,6 +33,6 @@ candle-core-rs = { package="candle-core", git = "https://github.com/EricLBuehler
 tokio = { workspace = true, optional=true }
 
 [features]
-default = []
+default = ["mistralrs"]
 candle = ["dep:candle-core", "dep:candle-examples", "dep:candle-transformers", "dep:tokenizers"]
 mistralrs = ["dep:mistralrs", "dep:candle-core-rs", "dep:mistralrs-core", "dep:tokio"]

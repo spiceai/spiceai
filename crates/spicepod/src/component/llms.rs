@@ -14,7 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::fmt::{self, Display, Formatter};
+use std::{
+    collections::HashMap,
+    fmt::{self, Display, Formatter},
+    hash::Hash,
+};
 
 use super::WithDependsOn;
 use serde::{Deserialize, Serialize};
@@ -27,6 +31,9 @@ pub struct Llm {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(rename = "dependsOn", default)]
     pub depends_on: Vec<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<HashMap<String, String>>,
 }
 
 impl WithDependsOn<Llm> for Llm {
@@ -35,6 +42,7 @@ impl WithDependsOn<Llm> for Llm {
             from: self.from.clone(),
             name: self.name.clone(),
             depends_on: depends_on.to_vec(),
+            params: self.params.clone(),
         }
     }
 }

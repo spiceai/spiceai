@@ -46,7 +46,7 @@ pub(crate) async fn start<A>(
     app: Arc<RwLock<Option<App>>>,
     df: Arc<RwLock<DataFusion>>,
     models: Arc<RwLock<HashMap<String, Model>>>,
-    llms: Arc<RwLock<HashMap<String, Box<dyn Nql>>>>,
+    llms: Arc<RwLock<HashMap<String, RwLock<Box<dyn Nql>>>>>,
     config: Arc<config::Config>,
     with_metrics: Option<SocketAddr>,
 ) -> Result<()>

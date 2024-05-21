@@ -949,7 +949,7 @@ pub(crate) mod nsql {
     };
     use llms::nql::{create_nsql, NSQLRuntime, Nql};
     use serde::{Deserialize, Serialize};
-    use std::sync::Arc;
+    use std::{collections::HashMap, sync::Arc};
     use tokio::sync::RwLock;
 
     use crate::{datafusion::DataFusion, http::v1::dataframe_to_response};
@@ -970,17 +970,17 @@ pub(crate) mod nsql {
     pub struct Request {
         pub query: String,
 
-        #[serde(rename = "use", default = "default_runtime")]
-        pub runtime: NSQLRuntime,
+        #[serde(rename = "use", default = "default_model")]
+        pub model: String,
     }
 
-    fn default_runtime() -> NSQLRuntime {
-        NSQLRuntime::Mistral
+    fn default_model() -> String {
+        "nql".to_string()
     }
 
     pub(crate) async fn post(
         Extension(df): Extension<Arc<RwLock<DataFusion>>>,
-        Extension(nsql_model): Extension<Arc<RwLock<Box<dyn Nql>>>>,
+        Extension(nsql_models): Extension<Arc<RwLock<HashMap<String, RwLock<Box<dyn Nql>>>>>>,
         Json(payload): Json<Request>,
     ) -> Response {
         let readable_df = df.read().await;
@@ -1016,17 +1016,15 @@ pub(crate) mod nsql {
         );
         tracing::trace!("Running prompt: {nsql_query}");
 
-        // Run prompt through model. Only OpenAI is loaded at runtime.
-        let result = if payload.runtime == NSQLRuntime::Openai {
-            match create_nsql(&NSQLRuntime::Openai) {
-                Ok(mut openai_nsql) => openai_nsql.run(nsql_query).await,
-                Err(e) => {
-                    tracing::error!("Failed to load OpenAI NQL model: {e:#?}");
-                    return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-                }
+        let result = match nsql_models.read().await.get(&payload.model) {
+            Some(nql_model) => nql_model.write().await.run(nsql_query).await,
+            None => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Model {} not found", payload.model),
+                )
+                    .into_response()
             }
-        } else {
-            nsql_model.write().await.run(nsql_query).await
         };
 
         // Run the SQL from the NSQL model through datafusion.
