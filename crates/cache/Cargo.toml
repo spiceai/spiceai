@@ -13,8 +13,10 @@ snafu.workspace = true
 spicepod = { path = "../spicepod" }
 tracing.workspace = true
 async-trait.workspace = true
+async-stream.workspace = true
 arrow.workspace = true
 datafusion.workspace = true
+futures.workspace = true
 byte-unit="5.1.4"
 fundu = { workspace = true }
 moka = {version = "0.12.7", features = ["future"]}
