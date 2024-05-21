@@ -57,7 +57,7 @@ pub trait QueryResultCache {
 }
 #[derive(Clone)]
 pub struct QueryResultCacheProvider {
-    cache: Arc<Box<dyn QueryResultCache + Send + Sync>>,
+    cache: Arc<dyn QueryResultCache + Send + Sync>,
     cache_max_size: u64,
     ttl: std::time::Duration,
 }
