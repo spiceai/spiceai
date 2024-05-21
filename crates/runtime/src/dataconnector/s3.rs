@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{AnyErrorResult, DataConnector, DataConnectorFactory, ListingTableConnector};
+use super::{DataConnector, DataConnectorFactory, DataConnectorResult, ListingTableConnector};
 
 use secrets::Secret;
 use snafu::prelude::*;
@@ -77,7 +77,7 @@ impl ListingTableConnector for S3 {
         &self.params
     }
 
-    fn get_object_store_url(&self, dataset: &Dataset) -> AnyErrorResult<Url> {
+    fn get_object_store_url(&self, dataset: &Dataset) -> DataConnectorResult<Url> {
         let mut fragments = vec![];
         let mut fragment_builder = form_urlencoded::Serializer::new(String::new());
 
@@ -101,7 +101,12 @@ impl ListingTableConnector for S3 {
         fragments.push(fragment_builder.finish());
 
         let mut s3_url =
-            Url::parse(&dataset.from).context(UnableToParseURLSnafu { url: &dataset.from })?;
+            Url::parse(&dataset.from)
+                .boxed()
+                .context(super::InvalidConfigurationSnafu {
+                    dataconnector: format!("{self}"),
+                    message: format!("{} is not a valid URL", dataset.from),
+                })?;
 
         // infer_schema has a bug using is_collection which is determined by if url contains suffix of /
         // using a fragment with / suffix to trick df to think this is still a collection
