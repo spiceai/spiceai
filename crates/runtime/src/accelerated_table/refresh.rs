@@ -125,19 +125,24 @@ impl Refresher {
                         continue;
                     };
 
-                    if data_update.data.is_empty() {
+                    if data_update.data.is_empty()
+                        || data_update
+                            .data
+                            .first()
+                            .map_or(false, |x| x.columns().is_empty())
+                    {
+                        if let Some(start_time) = start_time {
+                            if let Ok(elapse) = SystemTime::now()
+                                .duration_since(start_time)
+                                .map(|x| x.as_secs())
+                            {
+                                tracing::info!(
+                                    "Loaded 0 rows for dataset {dataset_name} in {elapse} seconds."
+                                );
+                            }
+                        }
                         self.notify_refresh_done(&mut ready_sender, status::ComponentStatus::Ready);
                         continue;
-                    };
-
-                    if let Some(data) = data_update.data.first() {
-                        if data.columns().is_empty() {
-                            self.notify_refresh_done(
-                                &mut ready_sender,
-                                status::ComponentStatus::Ready,
-                            );
-                            continue;
-                        }
                     };
 
                     let overwrite = data_update.update_type == UpdateType::Overwrite;
