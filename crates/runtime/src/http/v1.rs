@@ -93,6 +93,8 @@ pub(crate) mod query {
         response::{IntoResponse, Response},
         Extension,
     };
+    use datafusion::execution::context::SQLOptions;
+    use futures::TryStreamExt;
     use std::sync::Arc;
     use tokio::sync::RwLock;
 
@@ -110,8 +112,30 @@ pub(crate) mod query {
             }
         };
 
-        let results = match df.read().await.query_with_cache(&query).await {
-            Ok(results) => results,
+        let restricted_sql_options = SQLOptions::new()
+            .with_allow_ddl(false)
+            .with_allow_dml(false)
+            .with_allow_statements(false);
+
+        let results: Vec<RecordBatch> = match df
+            .read()
+            .await
+            .query_with_cache(&query, Some(restricted_sql_options))
+            .await
+        {
+            Ok(record_batch_stream) => {
+                match record_batch_stream.try_collect::<Vec<RecordBatch>>().await {
+                    Ok(batches) => batches,
+                    Err(e) => {
+                        tracing::debug!("Error running query: {e}");
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            format!("Batch processing error: {e}"),
+                        )
+                            .into_response();
+                    }
+                }
+            }
             Err(e) => {
                 tracing::debug!("Error running query: {e}");
                 return (StatusCode::BAD_REQUEST, e.to_string()).into_response();

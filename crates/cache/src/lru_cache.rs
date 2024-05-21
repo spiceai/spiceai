@@ -1,3 +1,4 @@
+use crate::CachedQueryResult;
 /*
 Copyright 2024 The Spice.ai OSS Authors
 
@@ -15,26 +16,25 @@ limitations under the License.
 */
 use crate::QueryResultCache;
 use crate::Result;
-use arrow::array::RecordBatch;
 use async_trait::async_trait;
 use datafusion::logical_expr::LogicalPlan;
 use moka::future::Cache;
 use std::hash::DefaultHasher;
 use std::hash::Hash;
 use std::hash::Hasher;
-use std::sync::Arc;
 use std::time::Duration;
 
 pub struct LruCache {
-    cache: Cache<u64, Arc<Vec<RecordBatch>>>,
+    cache: Cache<u64, CachedQueryResult>,
 }
 
 impl LruCache {
     pub fn new(cache_max_size: u64, ttl: Duration) -> Self {
-        let cache: Cache<u64, Arc<Vec<RecordBatch>>> = Cache::builder()
+        let cache: Cache<u64, CachedQueryResult> = Cache::builder()
             .time_to_live(ttl)
-            .weigher(|_key, value: &Arc<Vec<RecordBatch>>| -> u32 {
+            .weigher(|_key, value: &CachedQueryResult| -> u32 {
                 let val: usize = value
+                    .records
                     .iter()
                     .map(arrow::array::RecordBatch::get_array_memory_size)
                     .sum();
@@ -61,7 +61,7 @@ impl LruCache {
 
 #[async_trait]
 impl QueryResultCache for LruCache {
-    async fn get(&self, plan: &LogicalPlan) -> Result<Option<Arc<Vec<RecordBatch>>>> {
+    async fn get(&self, plan: &LogicalPlan) -> Result<Option<CachedQueryResult>> {
         let key = key_for_logical_plan(plan);
         match self.cache.get(&key).await {
             Some(value) => Ok(Some(value)),
@@ -69,7 +69,7 @@ impl QueryResultCache for LruCache {
         }
     }
 
-    async fn put(&self, plan: &LogicalPlan, result: Arc<Vec<RecordBatch>>) -> Result<()> {
+    async fn put(&self, plan: &LogicalPlan, result: CachedQueryResult) -> Result<()> {
         let key = key_for_logical_plan(plan);
         self.cache.insert(key, result).await;
         Ok(())
