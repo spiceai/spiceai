@@ -186,7 +186,7 @@ pub enum Table {
 pub struct DataFusion {
     pub ctx: Arc<SessionContext>,
     data_writers: HashSet<String>,
-    cache_provider: Option<QueryResultCacheProvider>,
+    cache_provider: Option<Arc<QueryResultCacheProvider>>,
 }
 
 impl DataFusion {
@@ -259,7 +259,7 @@ impl DataFusion {
         None
     }
 
-    pub fn set_cache_provider(&mut self, cache_provider: Option<QueryResultCacheProvider>) {
+    pub fn set_cache_provider(&mut self, cache_provider: Option<Arc<QueryResultCacheProvider>>) {
         self.cache_provider = cache_provider;
     }
 
@@ -275,11 +275,15 @@ impl DataFusion {
             .context(UnableToExecuteQuerySnafu)?;
 
         if let Some(cache_provider) = &self.cache_provider {
+            metrics::counter!("results_cache_request_count").increment(1);
+
             if let Some(cached_result) = cache_provider
                 .get(&plan)
                 .await
                 .context(FailedToAccessCacheSnafu)?
             {
+                metrics::counter!("results_cache_hit_count").increment(1);
+
                 return Ok(Box::pin(
                     MemoryStream::try_new(
                         cached_result.records.to_vec(),
@@ -318,7 +322,7 @@ impl DataFusion {
 
         if let Some(cache_provider) = &self.cache_provider {
             return Ok(to_cached_record_batch_stream(
-                cache_provider.clone(),
+                Arc::clone(cache_provider),
                 res_stream,
                 plan_copy,
             ));

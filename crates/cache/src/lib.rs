@@ -54,6 +54,8 @@ pub struct CachedQueryResult {
 pub trait QueryResultCache {
     async fn get(&self, plan: &LogicalPlan) -> Result<Option<CachedQueryResult>>;
     async fn put(&self, plan: &LogicalPlan, result: CachedQueryResult) -> Result<()>;
+    fn size(&self) -> u64;
+    fn item_count(&self) -> u64;
 }
 #[derive(Clone)]
 pub struct QueryResultCacheProvider {
@@ -107,6 +109,16 @@ impl QueryResultCacheProvider {
     #[must_use]
     pub fn cache_max_size(&self) -> u64 {
         self.cache_max_size
+    }
+
+    #[must_use]
+    pub fn cache_size(&self) -> u64 {
+        self.cache.size()
+    }
+
+    #[must_use]
+    pub fn item_count(&self) -> u64 {
+        self.cache.item_count()
     }
 }
 

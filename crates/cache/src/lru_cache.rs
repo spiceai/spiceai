@@ -74,6 +74,14 @@ impl QueryResultCache for LruCache {
         self.cache.insert(key, result).await;
         Ok(())
     }
+
+    fn size(&self) -> u64 {
+        self.cache.weighted_size()
+    }
+
+    fn item_count(&self) -> u64 {
+        self.cache.entry_count()
+    }
 }
 
 pub fn key_for_logical_plan(plan: &LogicalPlan) -> u64 {
