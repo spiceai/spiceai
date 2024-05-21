@@ -331,16 +331,21 @@ pub trait ListingTableConnector: DataConnector {
                 self.get_csv_format(params)?,
                 extension.unwrap_or(".csv".to_string()),
             )),
-            None | Some("parquet") => Ok((
+            Some("parquet") => Ok((
                 Arc::new(ParquetFormat::default()),
                 extension.unwrap_or(".parquet".to_string()),
             )),
             Some(format) => Err(DataConnectorError::InvalidConfiguration {
                 dataconnector: format!("{self}"),
                 message: format!(
-                    "Invalid file_format: {format}. Supported formats are: csv, parquet"
+                    "Invalid file_format: {format}. Supported formats are: csv, parquet."
                 ),
                 source: "Invalid file format".into(),
+            }),
+            None => Err(DataConnectorError::InvalidConfiguration {
+                dataconnector: format!("{self}"),
+                message: "Missing required file_format parameter.".to_string(),
+                source: "Missing file format".into(),
             }),
         }
     }
