@@ -549,6 +549,71 @@ jobs:
           killall spice
           cat spice.log
 
+  test_quickstart_duckdb:
+    name: 'Test DuckDB quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
+    runs-on: ${{ matrix.target.runner }}
+    needs:
+      - build
+      - setup-matrix
+
+    strategy:
+      matrix:
+        target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install DuckDB
+        if: matrix.target.target_os == 'linux'
+        uses: opt-nc/setup-duckdb-action@v1.0.7
+        with:
+          version: v0.10.2
+
+      - name: Generate TPCH database
+        run: |
+          duckdb -s "INSTALL tpch;LOAD tpch;CALL dbgen(sf = 1);" ./tpch.db
+
+      - name: Install Spice
+        uses: ./.github/actions/install-spice
+        with:
+          build-path: ./build
+
+      - name: Init Spice app
+        run: |
+          spice init duckdb-app
+
+      - name: Spice dataset configure
+        working-directory: duckdb-app
+        run: |
+          echo -e "tpch_customer\nTPC-H customer table\nduckdb:customer\ny" | spice dataset configure
+          echo -e "params:\n  open: ./tpch.db\n" >> spicepod.yaml
+          cat spicepod.yaml
+
+      - name: Start Spice runtime
+        working-directory: duckdb-app
+        run: |
+          spice run &> spice.log &
+          # time to initialize added dataset
+          sleep 5
+
+      - name: Wait for Spice runtime healthy
+        working-directory: duckdb-app
+        timeout-minutes: 1
+        run: |
+          while [[ "$(curl -s http://localhost:3000/health)" != "ok" ]]; do sleep 1; done
+
+      - name: Verify dataset
+        uses: ./.github/actions/verify-dataset
+        with:
+          name: tpch_customer
+
+      - name: Stop spice and check logs
+        working-directory: duckdb-app
+        if: always()
+        run: |
+          killall spice
+          cat spice.log
+
   test_local_acceleration:
     name: 'Test acceleration on ${{ matrix.target.name }} using ${{ matrix.acceleration.engine }}'
     runs-on: ${{ matrix.target.runner }}
@@ -571,7 +636,7 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Install PostgreSQL
         uses: ./.github/actions/install-postgres
         with:
