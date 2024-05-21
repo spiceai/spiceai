@@ -8,12 +8,6 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 
 - See [Bugs](https://github.com/spiceai/spiceai/labels/bug). Feel free to file a new Issue if you see a bug and let us know on Discord.
 
-## [v0.13-alpha (May 2024)](https://github.com/spiceai/spiceai/milestone/21)
-
-- Federated Query push-down improvements
-- Query result LRU caching
-- SFTP/FTP data connector (alpha)
-
 ## [v0.14-alpha (May 2024)](https://github.com/spiceai/spiceai/milestone/22)
 
 - Accelerated table indexes
