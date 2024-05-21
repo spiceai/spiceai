@@ -25,7 +25,6 @@ use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
 use datafusion::datasource::{DefaultTableSource, TableProvider};
-use datafusion::error::DataFusionError;
 use datafusion::execution::config::SessionConfig;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::{Expr, LogicalPlanBuilder};
@@ -158,13 +157,13 @@ pub enum DataConnectorError {
         table_name: String,
     },
 
-    #[snafu(display("Unsupported file format: {format}"))]
-    UnsupportedFileFormat { format: String },
-
-    #[snafu(display("Unsupported compression type for CSV"))]
-    UnsupportedCsvCompressionType {
-        source: DataFusionError,
-        compression_type: String,
+    #[snafu(display(
+        "An internal error occurred in the {dataconnector} Data Connector. Report a bug on GitHub (github.com/spiceai/spiceai) and reference the code: {code}"
+    ))]
+    Internal {
+        dataconnector: String,
+        code: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
 }
 
@@ -316,11 +315,14 @@ pub async fn get_data(
 pub trait ListingTableConnector: DataConnector {
     fn as_any(&self) -> &dyn Any;
 
-    fn get_object_store_url(&self, dataset: &Dataset) -> AnyErrorResult<Url>;
+    fn get_object_store_url(&self, dataset: &Dataset) -> DataConnectorResult<Url>;
 
     fn get_params(&self) -> &HashMap<String, String>;
 
-    fn get_file_format_and_extension(&self) -> DataConnectorResult<(Arc<dyn FileFormat>, String)> {
+    fn get_file_format_and_extension(&self) -> DataConnectorResult<(Arc<dyn FileFormat>, String)>
+    where
+        Self: Display,
+    {
         let params = self.get_params();
         let extension = params.get("file_extension").cloned();
 
@@ -333,8 +335,12 @@ pub trait ListingTableConnector: DataConnector {
                 Arc::new(ParquetFormat::default()),
                 extension.unwrap_or(".parquet".to_string()),
             )),
-            Some(format) => Err(DataConnectorError::UnsupportedFileFormat {
-                format: format.to_string(),
+            Some(format) => Err(DataConnectorError::InvalidConfiguration {
+                dataconnector: format!("{self}"),
+                message: format!(
+                    "Invalid file_format: {format}. Supported formats are: csv, parquet"
+                ),
+                source: "Invalid file format".into(),
             }),
         }
     }
@@ -342,7 +348,10 @@ pub trait ListingTableConnector: DataConnector {
     fn get_csv_format(
         &self,
         params: &HashMap<String, String>,
-    ) -> DataConnectorResult<Arc<CsvFormat>> {
+    ) -> DataConnectorResult<Arc<CsvFormat>>
+    where
+        Self: Display,
+    {
         let has_header = params.get("has_header").map_or(true, |f| f == "true");
         let quote = params
             .get("quote")
@@ -367,7 +376,11 @@ pub trait ListingTableConnector: DataConnector {
                 .with_delimiter(delimiter)
                 .with_file_compression_type(
                     FileCompressionType::from_str(compression_type)
-                        .context(UnsupportedCsvCompressionTypeSnafu { compression_type })?,
+                        .boxed()
+                        .context(InvalidConfigurationSnafu {
+                            dataconnector: format!("{self}"),
+                            message: format!("Invalid CSV compression_type: {compression_type}, supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED"),
+                        })?,
                 ),
         ))
     }
@@ -391,48 +404,35 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
             default_runtime_env(),
         );
 
-        let url = self
-            .get_object_store_url(dataset)
-            .context(InvalidConfigurationSnafu {
-                dataconnector: format!("{__self}"),
-                message: "Unable to parse URL",
-            })?;
+        let url = self.get_object_store_url(dataset)?;
 
-        let table_path =
-            ListingTableUrl::parse(url)
-                .boxed()
-                .context(InvalidConfigurationSnafu {
-                    dataconnector: format!("{__self}"),
-                    message: "Unable to parse URL",
-                })?;
+        // This shouldn't error because we've already validated the URL in `get_object_store_url`.
+        let table_path = ListingTableUrl::parse(url).boxed().context(InternalSnafu {
+            dataconnector: format!("{self}"),
+            code: "LTC-RP-LTUP".to_string(), // ListingTableConnector-ReadProvider-ListingTableUrlParse
+        })?;
 
-        let (file_format, extension) = self
-            .get_file_format_and_extension()
-            .map_err(Into::into)
-            .context(InvalidConfigurationSnafu {
-                dataconnector: format!("{__self}"),
-                message: "Unable to resolve file_format and file_extension",
-            })?;
+        let (file_format, extension) = self.get_file_format_and_extension()?;
         let options = ListingOptions::new(file_format).with_file_extension(&extension);
 
         let resolved_schema = options
             .infer_schema(&ctx.state(), &table_path)
             .await
             .boxed()
-            .context(InvalidConfigurationSnafu {
-                dataconnector: format!("{__self}"),
-                message: "Unable to infer files schema",
+            .context(UnableToConnectInternalSnafu {
+                dataconnector: format!("{self}"),
             })?;
 
         let config = ListingTableConfig::new(table_path)
             .with_listing_options(options)
             .with_schema(resolved_schema);
 
+        // This shouldn't error because we're passing the schema and options correctly.
         let table = ListingTable::try_new(config)
             .boxed()
-            .context(InvalidConfigurationSnafu {
-                dataconnector: format!("{__self}"),
-                message: "Unable to list files in data provider",
+            .context(InternalSnafu {
+                dataconnector: format!("{self}"),
+                code: "LTC-RP-LTTN".to_string(), // ListingTableConnector-ReadProvider-ListingTableTryNew
             })?;
 
         Ok(Arc::new(table))
