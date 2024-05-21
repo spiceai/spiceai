@@ -36,3 +36,6 @@ tokio = { workspace = true, optional=true }
 default = []
 candle = ["dep:candle-core", "dep:candle-examples", "dep:candle-transformers", "dep:tokenizers"]
 mistralrs = ["dep:mistralrs", "dep:candle-core-rs", "dep:mistralrs-core", "dep:tokio"]
+
+[patch.crates-io]
+candle-core={ package="candle-core", git = "https://github.com/EricLBuehler/candle.git", version = "0.5.0" , optional=true}
