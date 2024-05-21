@@ -18,6 +18,7 @@ use std::any::Any;
 use std::error::Error;
 
 use arrow::datatypes::SchemaRef;
+use arrow_sql_gen::postgres::columns_to_schema;
 use arrow_sql_gen::postgres::rows_to_arrow;
 use bb8_postgres::tokio_postgres::types::ToSql;
 use bb8_postgres::PostgresConnectionManager;
@@ -98,21 +99,16 @@ impl<'a>
     ) -> Result<SchemaRef, super::Error> {
         match self
             .conn
-            .query(
-                &format!(
-                    "SELECT * FROM {} LIMIT 1",
-                    table_reference.to_quoted_string()
-                ),
-                &[],
-            )
+            .prepare(&format!(
+                "SELECT * FROM {} LIMIT 1",
+                table_reference.to_quoted_string()
+            ))
             .await
         {
-            Ok(rows) => {
-                let rec = rows_to_arrow(rows.as_slice())
+            Ok(statement) => {
+                return Ok(columns_to_schema(statement.columns())
                     .boxed()
-                    .context(super::UnableToGetSchemaSnafu)?;
-
-                Ok(rec.schema())
+                    .context(super::UnableToGetSchemaSnafu)?)
             }
             Err(err) => {
                 if let Some(error_source) = err.source() {
