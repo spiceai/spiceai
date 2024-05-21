@@ -1,3 +1,4 @@
+use std::cmp;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -120,7 +121,7 @@ impl Refresher {
 
             match future_result {
                 Some(result) => {
-                    let Ok((_, data_update)) = result else {
+                    let Ok((start_time, data_update)) = result else {
                         continue;
                     };
 
@@ -144,7 +145,7 @@ impl Refresher {
                         .accelerator
                         .insert_into(
                             &ctx.state(),
-                            Arc::new(DataUpdateExecutionPlan::new(data_update)),
+                            Arc::new(DataUpdateExecutionPlan::new(data_update.clone())),
                             overwrite,
                         )
                         .await
@@ -154,6 +155,30 @@ impl Refresher {
                                 tracing::error!("Error adding data for {dataset_name}: {e}");
                                 self.mark_dataset_status(status::ComponentStatus::Error);
                             } else {
+                                if let Some(start_time) = start_time {
+                                    let num_rows = data_update
+                                        .clone()
+                                        .data
+                                        .into_iter()
+                                        .map(|x| x.num_rows())
+                                        .sum::<usize>();
+
+                                    let memory_size = human_readable_bytes(
+                                        data_update
+                                            .data
+                                            .into_iter()
+                                            .map(|x| x.get_array_memory_size())
+                                            .sum::<usize>(),
+                                    );
+
+                                    if let Ok(elapse) = SystemTime::now()
+                                        .duration_since(start_time)
+                                        .map(|x| x.as_secs())
+                                    {
+                                        tracing::info!("Loaded {num_rows} rows ({memory_size}) for dataset {dataset_name} in {elapse} seconds.");
+                                    }
+                                }
+
                                 self.notify_refresh_done(
                                     &mut ready_sender,
                                     status::ComponentStatus::Ready,
@@ -248,8 +273,9 @@ impl Refresher {
                     "load_dataset_duration_ms",
                     vec![("dataset", dataset_name.clone())],
                 );
+                let start = SystemTime::now();
                 match self.get_full_or_incremental_append_update(None).await {
-                    Ok(data) => yield Ok((None, data)),
+                    Ok(data) => yield Ok((Some(start), data)),
                     Err(e) => yield Err(e),
                 };
                 drop(timer);
@@ -272,8 +298,9 @@ impl Refresher {
                 );
                 match self.get_latest_timestamp().await {
                     Ok(timestamp) => {
+                        let start = SystemTime::now();
                         match self.get_full_or_incremental_append_update(timestamp).await {
-                            Ok(data) => yield Ok((None, data)),
+                            Ok(data) => yield Ok((Some(start), data)),
                             Err(e) => yield Err(e),
                         }
 
@@ -485,6 +512,25 @@ pub(crate) fn get_timestamp(time: SystemTime) -> u128 {
     time.duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos()
+}
+
+#[allow(clippy::cast_precision_loss)]
+#[allow(clippy::cast_sign_loss)]
+#[allow(clippy::cast_possible_truncation)]
+#[allow(clippy::cast_possible_wrap)]
+pub(crate) fn human_readable_bytes(num: usize) -> String {
+    let units = ["B", "kiB", "MiB", "GiB"];
+    if num < 1 {
+        return format!("{num} B ");
+    }
+    let delimiter = 1024_f64;
+    let num = num as f64;
+    let exponent = cmp::min(
+        (num.ln() / delimiter.ln()).floor() as usize,
+        units.len() - 1,
+    );
+    let unit = units[exponent];
+    format!("{:.2} {unit}", num / delimiter.powi(exponent as i32))
 }
 
 #[cfg(test)]
