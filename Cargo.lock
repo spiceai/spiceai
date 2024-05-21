@@ -1729,10 +1729,12 @@ name = "cache"
 version = "0.13.0-alpha"
 dependencies = [
  "arrow",
+ "async-stream",
  "async-trait",
  "byte-unit",
  "datafusion",
  "fundu",
+ "futures",
  "moka",
  "snafu 0.8.2",
  "spicepod",
