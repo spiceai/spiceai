@@ -106,9 +106,9 @@ impl<'a>
             .await
         {
             Ok(statement) => {
-                return Ok(columns_to_schema(statement.columns())
+                return columns_to_schema(statement.columns())
                     .boxed()
-                    .context(super::UnableToGetSchemaSnafu)?)
+                    .context(super::UnableToGetSchemaSnafu)
             }
             Err(err) => {
                 if let Some(error_source) = err.source() {
