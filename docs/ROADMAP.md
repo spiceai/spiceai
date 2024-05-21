@@ -10,32 +10,41 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 
 ## [v0.14-alpha (May 2024)](https://github.com/spiceai/spiceai/milestone/22)
 
+- Query result caching
+- Query history
 - Accelerated table indexes
 - MotherDuck data connector (alpha)
 - Generic Object-Store connector (alpha)
 - S3 data connector Iceberg support
 
-## v0.15-alpha (June 2024)
+## [v0.15-alpha (June 2024)](https://github.com/spiceai/spiceai/milestone/28)
 
 - NSQL API
 - Catalog Providers
-- AWS Glue catalog provider (alpha)
+  - Unity Catalog catalog provider (alpha)
 - Dataset management improvements
 
-## Features being considered for beta (Jun 2024)
+## v0.16-beta (June 2024)
 
 - CDC replication refresh mode
+- Bugfixes and performance improvements
+
+## v1.0-stable (Sep 2024)
+
+- Bugfixes and performance improvements
+
+## v1.1 (Oct 2024)
+
+- AWS Glue catalog provider (alpha)
+
+## Features being considered
+
+- Intelligent (AI-powered) accelerators
+- Kafka data connector
 - GraphQL API
 - GraphQL data connector
 - BigQuery data connector
 - Key/Value API
   - RocksDB data accelerator
   - DynamoDB data connector
-
-## Features being considered for v1.0-stable (Sep 2024)
-
 - CLI publish Spicepods to [spicerack.org](https://spicerack.org)
-
-## Beyond v1.0
-
-Based on community feedback!
