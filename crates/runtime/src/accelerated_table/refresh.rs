@@ -1,4 +1,3 @@
-use std::cmp;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -132,12 +131,9 @@ impl Refresher {
                             .map_or(false, |x| x.columns().is_empty())
                     {
                         if let Some(start_time) = start_time {
-                            if let Ok(elapse) = SystemTime::now()
-                                .duration_since(start_time)
-                                .map(|x| x.as_secs())
-                            {
+                            if let Ok(elapse) = util::humantime_elapsed(start_time) {
                                 tracing::info!(
-                                    "Loaded 0 rows for dataset {dataset_name} in {elapse} seconds."
+                                    "Loaded 0 rows for dataset {dataset_name} in {elapse}."
                                 );
                             }
                         }
@@ -168,7 +164,7 @@ impl Refresher {
                                         .map(|x| x.num_rows())
                                         .sum::<usize>();
 
-                                    let memory_size = human_readable_bytes(
+                                    let memory_size = util::human_readable_bytes(
                                         data_update
                                             .data
                                             .into_iter()
@@ -176,11 +172,8 @@ impl Refresher {
                                             .sum::<usize>(),
                                     );
 
-                                    if let Ok(elapse) = SystemTime::now()
-                                        .duration_since(start_time)
-                                        .map(|x| x.as_secs())
-                                    {
-                                        tracing::info!("Loaded {num_rows} rows ({memory_size}) for dataset {dataset_name} in {elapse} seconds.");
+                                    if let Ok(elapse) = util::humantime_elapsed(start_time) {
+                                        tracing::info!("Loaded {num_rows} rows ({memory_size}) for dataset {dataset_name} in {elapse}.");
                                     }
                                 }
 
@@ -517,25 +510,6 @@ pub(crate) fn get_timestamp(time: SystemTime) -> u128 {
     time.duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos()
-}
-
-#[allow(clippy::cast_precision_loss)]
-#[allow(clippy::cast_sign_loss)]
-#[allow(clippy::cast_possible_truncation)]
-#[allow(clippy::cast_possible_wrap)]
-pub(crate) fn human_readable_bytes(num: usize) -> String {
-    let units = ["B", "kiB", "MiB", "GiB"];
-    if num < 1 {
-        return format!("{num} B ");
-    }
-    let delimiter = 1024_f64;
-    let num = num as f64;
-    let exponent = cmp::min(
-        (num.ln() / delimiter.ln()).floor() as usize,
-        units.len() - 1,
-    );
-    let unit = units[exponent];
-    format!("{:.2} {unit}", num / delimiter.powi(exponent as i32))
 }
 
 #[cfg(test)]
