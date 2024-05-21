@@ -18,15 +18,16 @@ use std::{convert, sync::Arc};
 
 use arrow::{
     array::{
-        ArrayBuilder, ArrayRef, Date32Builder, Date64Builder, Decimal128Builder, Float32Builder,
-        Float64Builder, Int16Builder, Int32Builder, Int64Builder, Int8Builder, NullBuilder,
-        RecordBatch, RecordBatchOptions, StringBuilder, TimestampMillisecondBuilder, UInt64Builder,
+        ArrayBuilder, ArrayRef, Date32Builder, Decimal128Builder, Float32Builder, Float64Builder,
+        Int16Builder, Int32Builder, Int64Builder, Int8Builder, LargeStringBuilder, NullBuilder,
+        RecordBatch, RecordBatchOptions, Time64NanosecondBuilder, TimestampMillisecondBuilder,
+        UInt64Builder,
     },
-    datatypes::{DataType, Date32Type, Date64Type, Field, Schema, TimeUnit},
+    datatypes::{DataType, Date32Type, Field, Schema, TimeUnit},
 };
 use bigdecimal::BigDecimal;
 use bigdecimal::ToPrimitive;
-use chrono::{NaiveDate, NaiveDateTime, Timelike};
+use chrono::{NaiveDate, NaiveTime, Timelike};
 use mysql_async::{consts::ColumnType, FromValueError, Row, Value};
 use snafu::{ResultExt, Snafu};
 
@@ -60,10 +61,10 @@ pub enum Error {
     },
 
     #[snafu(display("Failed to parse raw Postgres Bytes as BigDecimal: {:?}", bytes))]
-    FailedToParseBigDecmialFromPostgres { bytes: Vec<u8> },
+    FailedToParseBigDecimalFromPostgres { bytes: Vec<u8> },
 
     #[snafu(display("Cannot represent BigDecimal as i128: {big_decimal}"))]
-    FailedToConvertBigDecmialToI128 { big_decimal: BigDecimal },
+    FailedToConvertBigDecimalToI128 { big_decimal: BigDecimal },
 
     #[snafu(display("Failed to find field {column_name} in schema"))]
     FailedToFindFieldInSchema { column_name: String },
@@ -129,7 +130,6 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
         }
     }
 
-    dbg!(rows);
     for row in rows {
         for (i, mysql_type) in mysql_types.iter().enumerate() {
             let Some(builder) = arrow_columns_builders.get_mut(i) else {
@@ -190,45 +190,11 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                         i
                     );
                 }
-                ColumnType::MYSQL_TYPE_SHORT => {
-                    handle_primitive_type!(
-                        builder,
-                        ColumnType::MYSQL_TYPE_SHORT,
-                        Int16Builder,
-                        i16,
-                        row,
-                        i
-                    );
+                column_type @ (ColumnType::MYSQL_TYPE_SHORT | ColumnType::MYSQL_TYPE_YEAR) => {
+                    handle_primitive_type!(builder, column_type, Int16Builder, i16, row, i);
                 }
-                ColumnType::MYSQL_TYPE_YEAR => {
-                    handle_primitive_type!(
-                        builder,
-                        ColumnType::MYSQL_TYPE_YEAR,
-                        Int16Builder,
-                        i16,
-                        row,
-                        i
-                    );
-                }
-                ColumnType::MYSQL_TYPE_INT24 => {
-                    handle_primitive_type!(
-                        builder,
-                        ColumnType::MYSQL_TYPE_INT24,
-                        Int32Builder,
-                        i32,
-                        row,
-                        i
-                    );
-                }
-                ColumnType::MYSQL_TYPE_LONG => {
-                    handle_primitive_type!(
-                        builder,
-                        ColumnType::MYSQL_TYPE_LONG,
-                        Int32Builder,
-                        i32,
-                        row,
-                        i
-                    );
+                column_type @ (ColumnType::MYSQL_TYPE_INT24 | ColumnType::MYSQL_TYPE_LONG) => {
+                    handle_primitive_type!(builder, column_type, Int32Builder, i32, row, i);
                 }
                 ColumnType::MYSQL_TYPE_LONGLONG => {
                     handle_primitive_type!(
@@ -305,35 +271,23 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                     }
 
                     let Some(val) = to_decimal_128(&val, scale) else {
-                        return FailedToConvertBigDecmialToI128Snafu { big_decimal: val }.fail();
+                        return FailedToConvertBigDecimalToI128Snafu { big_decimal: val }.fail();
                     };
                     dec_builder.append_value(val);
                 }
-                ColumnType::MYSQL_TYPE_VARCHAR => {
+                column_type @ (ColumnType::MYSQL_TYPE_VARCHAR
+                | ColumnType::MYSQL_TYPE_STRING
+                | ColumnType::MYSQL_TYPE_VAR_STRING
+                | ColumnType::MYSQL_TYPE_JSON
+                | ColumnType::MYSQL_TYPE_TINY_BLOB
+                | ColumnType::MYSQL_TYPE_BLOB
+                | ColumnType::MYSQL_TYPE_MEDIUM_BLOB
+                | ColumnType::MYSQL_TYPE_LONG_BLOB
+                | ColumnType::MYSQL_TYPE_ENUM) => {
                     handle_primitive_type!(
                         builder,
-                        ColumnType::MYSQL_TYPE_VARCHAR,
-                        StringBuilder,
-                        String,
-                        row,
-                        i
-                    );
-                }
-                ColumnType::MYSQL_TYPE_VAR_STRING => {
-                    handle_primitive_type!(
-                        builder,
-                        ColumnType::MYSQL_TYPE_VAR_STRING,
-                        StringBuilder,
-                        String,
-                        row,
-                        i
-                    );
-                }
-                ColumnType::MYSQL_TYPE_BLOB => {
-                    handle_primitive_type!(
-                        builder,
-                        ColumnType::MYSQL_TYPE_BLOB,
-                        StringBuilder,
+                        column_type,
+                        LargeStringBuilder,
                         String,
                         row,
                         i
@@ -357,6 +311,34 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                     match v {
                         Some(v) => {
                             builder.append_value(Date32Type::from_naive_date(v));
+                        }
+                        None => builder.append_null(),
+                    }
+                }
+                ColumnType::MYSQL_TYPE_TIME => {
+                    let Some(builder) = builder else {
+                        return NoBuilderForIndexSnafu { index: i }.fail();
+                    };
+                    let Some(builder) = builder
+                        .as_any_mut()
+                        .downcast_mut::<Time64NanosecondBuilder>()
+                    else {
+                        return FailedToDowncastBuilderSnafu {
+                            mysql_type: format!("{mysql_type:?}"),
+                        }
+                        .fail();
+                    };
+                    let v = handle_null_error(row.get_opt::<NaiveTime, usize>(i).transpose())
+                        .context(FailedToGetRowValueSnafu {
+                            mysql_type: ColumnType::MYSQL_TYPE_TIME,
+                        })?;
+
+                    match v {
+                        Some(value) => {
+                            builder.append_value(
+                                i64::from(value.num_seconds_from_midnight()) * 1_000_000_000
+                                    + i64::from(value.nanosecond()),
+                            );
                         }
                         None => builder.append_null(),
                     }
@@ -402,7 +384,7 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                                     timestamp.timestamp() * 1000
                                 }
                                 Value::Time(is_neg, days, hours, minutes, seconds, micros) => {
-                                    let naivetime = chrono::NaiveTime::from_hms_micro_opt(
+                                    let naive_time = chrono::NaiveTime::from_hms_micro_opt(
                                         u32::from(hours),
                                         u32::from(minutes),
                                         u32::from(seconds),
@@ -410,7 +392,7 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                                     )
                                     .unwrap_or_default();
 
-                                    let time: i64 = naivetime.num_seconds_from_midnight().into();
+                                    let time: i64 = naive_time.num_seconds_from_midnight().into();
 
                                     let timestamp = i64::from(days) * 24 * 60 * 60 + time;
 
@@ -458,17 +440,19 @@ fn map_column_to_data_type(column_type: ColumnType) -> Option<DataType> {
             Some(DataType::Timestamp(TimeUnit::Millisecond, None))
         }
         ColumnType::MYSQL_TYPE_DATE => Some(DataType::Date32),
-        ColumnType::MYSQL_TYPE_TIME | ColumnType::MYSQL_TYPE_TIME2 => {
-            Some(DataType::Time64(TimeUnit::Microsecond))
+        ColumnType::MYSQL_TYPE_TIME => {
+            Some(DataType::Time64(TimeUnit::Nanosecond))
         }
         ColumnType::MYSQL_TYPE_VARCHAR
         | ColumnType::MYSQL_TYPE_STRING
         | ColumnType::MYSQL_TYPE_VAR_STRING
-        | ColumnType::MYSQL_TYPE_BLOB => Some(DataType::Utf8),
-        ColumnType::MYSQL_TYPE_JSON | ColumnType::MYSQL_TYPE_ENUM => Some(DataType::LargeUtf8),
-        ColumnType::MYSQL_TYPE_TINY_BLOB
+        | ColumnType::MYSQL_TYPE_JSON
+        | ColumnType::MYSQL_TYPE_ENUM
+        | ColumnType::MYSQL_TYPE_SET
+        | ColumnType::MYSQL_TYPE_TINY_BLOB
+        | ColumnType::MYSQL_TYPE_BLOB
         | ColumnType::MYSQL_TYPE_MEDIUM_BLOB
-        | ColumnType::MYSQL_TYPE_LONG_BLOB => Some(DataType::LargeBinary),
+        | ColumnType::MYSQL_TYPE_LONG_BLOB => Some(DataType::LargeUtf8),
 
         // replication only
         ColumnType::MYSQL_TYPE_TYPED_ARRAY
@@ -477,9 +461,8 @@ fn map_column_to_data_type(column_type: ColumnType) -> Option<DataType> {
         // Unsupported yet
         | ColumnType::MYSQL_TYPE_UNKNOWN
         | ColumnType::MYSQL_TYPE_TIMESTAMP2
-        | ColumnType::MYSQL_TYPE_GEOMETRY
-        | ColumnType::MYSQL_TYPE_SET => {
-
+        | ColumnType::MYSQL_TYPE_TIME2
+        | ColumnType::MYSQL_TYPE_GEOMETRY => {
             unimplemented!("Unsupported column type {:?}", column_type)
         }
     }

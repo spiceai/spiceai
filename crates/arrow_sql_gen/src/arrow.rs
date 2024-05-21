@@ -17,9 +17,10 @@ use arrow::{
     array::{
         ArrayBuilder, BinaryBuilder, BooleanBuilder, Date32Builder, Date64Builder,
         Decimal128Builder, FixedSizeBinaryBuilder, Float32Builder, Float64Builder, Int16Builder,
-        Int32Builder, Int64Builder, Int8Builder, ListBuilder, StringBuilder,
-        TimestampMicrosecondBuilder, TimestampMillisecondBuilder, TimestampNanosecondBuilder,
-        TimestampSecondBuilder, UInt16Builder, UInt32Builder, UInt64Builder, UInt8Builder,
+        Int32Builder, Int64Builder, Int8Builder, LargeBinaryBuilder, LargeStringBuilder,
+        ListBuilder, StringBuilder, Time64NanosecondBuilder, TimestampMicrosecondBuilder,
+        TimestampMillisecondBuilder, TimestampNanosecondBuilder, TimestampSecondBuilder,
+        UInt16Builder, UInt32Builder, UInt64Builder, UInt8Builder,
     },
     datatypes::{DataType, TimeUnit},
 };
@@ -46,8 +47,10 @@ pub fn map_data_type_to_array_builder(data_type: &DataType) -> Box<dyn ArrayBuil
         DataType::Float32 => Box::new(Float32Builder::new()),
         DataType::Float64 => Box::new(Float64Builder::new()),
         DataType::Utf8 => Box::new(StringBuilder::new()),
+        DataType::LargeUtf8 => Box::new(LargeStringBuilder::new()),
         DataType::Boolean => Box::new(BooleanBuilder::new()),
         DataType::Binary => Box::new(BinaryBuilder::new()),
+        DataType::LargeBinary => Box::new(LargeBinaryBuilder::new()),
         DataType::Decimal128(precision, scale) => Box::new(
             Decimal128Builder::new()
                 .with_precision_and_scale(*precision, *scale)
@@ -69,6 +72,8 @@ pub fn map_data_type_to_array_builder(data_type: &DataType) -> Box<dyn ArrayBuil
         },
         DataType::Date32 => Box::new(Date32Builder::new()),
         DataType::Date64 => Box::new(Date64Builder::new()),
+        // For time format, always use nanosecond
+        DataType::Time64(TimeUnit::Nanosecond) => Box::new(Time64NanosecondBuilder::new()),
         DataType::FixedSizeBinary(s) => Box::new(FixedSizeBinaryBuilder::new(*s)),
         // We can't recursively call map_data_type_to_array_builder here because downcasting will not work if the
         // values_builder is boxed.
