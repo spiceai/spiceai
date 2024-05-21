@@ -82,7 +82,7 @@ impl QueryResultCacheProvider {
         };
 
         let cache_provider = QueryResultCacheProvider {
-            cache: Arc::new(Box::new(LruCache::new(cache_max_size, ttl))),
+            cache: Arc::new(LruCache::new(cache_max_size, ttl)),
             cache_max_size,
             ttl,
         };
