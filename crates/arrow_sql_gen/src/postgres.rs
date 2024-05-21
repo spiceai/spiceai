@@ -46,8 +46,7 @@ use bigdecimal::ToPrimitive;
 use snafu::prelude::*;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio_postgres::types::FromSql;
-use tokio_postgres::Column;
-use tokio_postgres::{types::Type, Row};
+use tokio_postgres::{types::Type, Column, Row};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
