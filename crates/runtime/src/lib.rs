@@ -850,12 +850,12 @@ impl Runtime {
         let _handle = tokio::spawn(async move {
             loop {
                 #[allow(clippy::cast_precision_loss)]
-                metrics::gauge!("results_cache_max_size").set(cache_copy.cache_max_size() as f64);
+                metrics::gauge!("results_cache_max_size").set(cache_copy.max_size() as f64);
                 #[allow(clippy::cast_precision_loss)]
-                metrics::gauge!("results_cache_size").set(cache_copy.cache_size() as f64);
+                metrics::gauge!("results_cache_size").set(cache_copy.size() as f64);
                 #[allow(clippy::cast_precision_loss)]
                 metrics::gauge!("results_cache_item_count").set(cache_copy.item_count() as f64);
-                sleep(Duration::from_secs(30)).await;
+                sleep(Duration::from_secs(10)).await;
             }
         });
     }
