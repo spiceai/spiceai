@@ -14,5 +14,21 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use arrow::array::RecordBatch;
+use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
 // Run all tests in the `federation` module
 mod federation;
+
+async fn get_tpch_lineitem() -> Result<Vec<RecordBatch>, anyhow::Error> {
+    let lineitem_parquet_bytes =
+        reqwest::get("https://public-data.spiceai.org/tpch_lineitem.parquet")
+            .await?
+            .bytes()
+            .await?;
+
+    let parquet_reader =
+        ParquetRecordBatchReaderBuilder::try_new(lineitem_parquet_bytes)?.build()?;
+
+    Ok(parquet_reader.collect::<Result<Vec<_>, arrow::error::ArrowError>>()?)
+}
