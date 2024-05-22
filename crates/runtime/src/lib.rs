@@ -47,6 +47,7 @@ use tokio::{signal, sync::RwLock};
 
 use crate::spice_metrics::MetricsRecorder;
 use crate::{dataconnector::DataConnector, datafusion::DataFusion};
+use extensions::{Extension, Runtime as ExtensionRuntime};
 mod accelerated_table;
 pub mod config;
 pub mod dataaccelerator;
@@ -875,6 +876,13 @@ impl Runtime {
             .write()
             .await
             .set_cache_provider(Some(Arc::new(cache_provider)));
+    }
+}
+
+impl ExtensionRuntime for Runtime {
+    fn register_extension(&mut self, extension: Box<&mut dyn Extension>) {
+        let boxed: Box<&mut dyn ExtensionRuntime> = Box::new(self);
+        extension.initialize(boxed);
     }
 }
 

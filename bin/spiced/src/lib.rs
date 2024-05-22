@@ -26,6 +26,7 @@ use clap::Parser;
 use flightrepl::ReplConfig;
 use runtime::config::Config as RuntimeConfig;
 
+use extensions::{Extension, Runtime as ExtensionRuntime};
 use runtime::podswatcher::PodsWatcher;
 use runtime::Runtime;
 use snafu::prelude::*;
@@ -111,6 +112,20 @@ pub async fn run(args: Args) -> Result<()> {
 
     let mut rt: Runtime = Runtime::new(app, df).await;
 
+    let mut extensions: Vec<Box<&mut dyn Extension>> = vec![];
+
+    // Built in spiceai extension
+    let mut spice_extension = spiceai_extension::SpiceExtension {};
+    let boxed: Box<&mut dyn Extension> = Box::new(&mut spice_extension);
+    extensions.push(boxed);
+
+    // TODO load other extensions from spicepod.yaml
+
+    for extension in extensions {
+        let rt: Box<&mut dyn ExtensionRuntime> = Box::new(&mut rt);
+        extension.initialize(rt);
+    }
+
     rt.with_pods_watcher(pods_watcher);
 
     rt.load_secrets().await;
@@ -123,6 +138,10 @@ pub async fn run(args: Args) -> Result<()> {
     }
 
     rt.init_results_cache().await;
+
+    // TODO: iterate over all loaded extensions
+    let boxed: Box<&mut dyn ExtensionRuntime> = Box::new(&mut rt);
+    spice_extension.on_start(boxed);
 
     if args.spice_cloud_connect {
         if let Err(err) = rt

@@ -92,6 +92,7 @@ datafusion-federation = { workspace = true }
 fundu = { workspace = true }
 metrics-exporter-prometheus = "0.13.0"
 prometheus-parse = "0.2.5"
+extensions = { path = "../extensions" }
 
 [dev-dependencies]
 bollard = "0.16.1"

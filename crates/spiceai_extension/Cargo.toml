@@ -1,0 +1,13 @@
+[package]
+name = "spiceai_extension"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+exclude.workspace = true
+
+[dependencies]
+extensions = { path = "../extensions" }
+tracing.workspace = true
