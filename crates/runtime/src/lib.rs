@@ -176,15 +176,24 @@ pub struct Runtime {
     pub models: Arc<RwLock<HashMap<String, Model>>>,
     pub pods_watcher: Option<podswatcher::PodsWatcher>,
     pub secrets_provider: Arc<RwLock<secrets::SecretsProvider>>,
+    pub extensions: Vec<Extension>,
 
     spaced_tracer: Arc<tracers::SpacedTracer>,
 }
 
 impl Runtime {
     #[must_use]
-    pub async fn new(app: Option<app::App>, df: Arc<RwLock<DataFusion>>) -> Self {
+    pub async fn new(
+        app: Option<app::App>,
+        df: Arc<RwLock<DataFusion>>,
+        extensions: Vec<dyn Extension>,
+    ) -> Self {
         dataconnector::register_all().await;
         dataaccelerator::register_all().await;
+
+        for extension in extensions {
+            extention.initialize();
+        }
 
         Runtime {
             app: Arc::new(RwLock::new(app)),
