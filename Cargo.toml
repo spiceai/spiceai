@@ -12,6 +12,7 @@ members = [
     "crates/llms",
     "crates/model_components",
     "crates/ns_lookup",
+    "crates/util",
     "tools/flightpublisher/",
     "tools/flightsubscriber/",
 ]
