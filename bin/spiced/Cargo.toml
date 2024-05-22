@@ -16,7 +16,6 @@ app = { path = "../../crates/app" }
 runtime = { path = "../../crates/runtime" }
 flightrepl = { path = "../../crates/flightrepl" }
 extensions = { path = "../../crates/extensions" }
-spiceai_extension = { path = "../../crates/spiceai_extension" }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

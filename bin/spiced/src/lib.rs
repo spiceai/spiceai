@@ -115,7 +115,7 @@ pub async fn run(args: Args) -> Result<()> {
     let mut extensions: Vec<Box<&mut dyn Extension>> = vec![];
 
     // Built in spiceai extension
-    let mut spice_extension = spiceai_extension::SpiceExtension {};
+    let mut spice_extension = extensions::spiceai_extension::SpiceExtension {};
     let boxed: Box<&mut dyn Extension> = Box::new(&mut spice_extension);
     extensions.push(boxed);
 

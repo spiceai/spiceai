@@ -1,3 +1,5 @@
+pub mod spiceai_extension;
+
 pub trait Extension {
     fn name(&self) -> &'static str;
     fn initialize(&mut self, runtime: Box<&mut dyn Runtime>);

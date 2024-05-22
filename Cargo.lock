@@ -3426,6 +3426,9 @@ dependencies = [
 [[package]]
 name = "extensions"
 version = "0.13.1-alpha"
+dependencies = [
+ "tracing",
+]
 
 [[package]]
 name = "fallible-iterator"
@@ -8231,14 +8234,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "spiceai_extension"
-version = "0.13.1-alpha"
-dependencies = [
- "extensions",
- "tracing",
-]
-
-[[package]]
 name = "spiced"
 version = "0.13.1-alpha"
 dependencies = [
@@ -8249,7 +8244,6 @@ dependencies = [
  "metrics-exporter-prometheus",
  "runtime",
  "snafu 0.8.2",
- "spiceai_extension",
  "spicepod",
  "tokio",
  "tracing",

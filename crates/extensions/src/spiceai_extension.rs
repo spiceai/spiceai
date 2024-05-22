@@ -1,4 +1,4 @@
-use extensions::{Extension, Runtime};
+use crate::{Extension, Runtime};
 
 pub struct SpiceExtension {}
 
@@ -8,7 +8,7 @@ impl Extension for SpiceExtension {
     }
 
     fn initialize(&mut self, _runtime: Box<&mut dyn Runtime>) {
-        tracing::info!("Initializing SpiceaiExtension");
+        tracing::info!("Initializing Spiceai Extension");
     }
 
     fn on_start(&mut self, _runtime: Box<&mut dyn Runtime>) {
