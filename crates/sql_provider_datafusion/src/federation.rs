@@ -21,7 +21,7 @@ impl<T, P> SqlTable<T, P> {
     fn create_federated_table_source(
         self: Arc<Self>,
     ) -> DataFusionResult<Arc<dyn FederatedTableSource>> {
-        let table_name = self.table_reference.table().to_string();
+        let table_name = self.table_reference.to_quoted_string();
         let schema = Arc::clone(&self.schema);
         let fed_provider = Arc::new(SQLFederationProvider::new(self));
         Ok(Arc::new(SQLTableSource::new_with_schema(
@@ -80,7 +80,7 @@ impl<T, P> SQLExecutor for SqlTable<T, P> {
 
     async fn get_table_schema(&self, table_name: &str) -> DataFusionResult<SchemaRef> {
         let conn = self.pool.connect().await.map_err(to_execution_error)?;
-        get_schema(conn, &TableReference::bare(table_name))
+        get_schema(conn, &TableReference::from(table_name))
             .await
             .context(UnableToGetSchemaSnafu)
             .map_err(to_execution_error)

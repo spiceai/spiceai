@@ -119,24 +119,26 @@ impl Refresher {
             let future_result = stream.next().await;
 
             match future_result {
-                Some(data_update) => {
-                    let Ok(data_update) = data_update else {
+                Some(result) => {
+                    let Ok((start_time, data_update)) = result else {
                         continue;
                     };
 
-                    if data_update.data.is_empty() {
+                    if data_update.data.is_empty()
+                        || data_update
+                            .data
+                            .first()
+                            .map_or(false, |x| x.columns().is_empty())
+                    {
+                        if let Some(start_time) = start_time {
+                            if let Ok(elapse) = util::humantime_elapsed(start_time) {
+                                tracing::info!(
+                                    "Loaded 0 rows for dataset {dataset_name} in {elapse}."
+                                );
+                            }
+                        }
                         self.notify_refresh_done(&mut ready_sender, status::ComponentStatus::Ready);
                         continue;
-                    };
-
-                    if let Some(data) = data_update.data.first() {
-                        if data.columns().is_empty() {
-                            self.notify_refresh_done(
-                                &mut ready_sender,
-                                status::ComponentStatus::Ready,
-                            );
-                            continue;
-                        }
                     };
 
                     let overwrite = data_update.update_type == UpdateType::Overwrite;
@@ -144,7 +146,7 @@ impl Refresher {
                         .accelerator
                         .insert_into(
                             &ctx.state(),
-                            Arc::new(DataUpdateExecutionPlan::new(data_update)),
+                            Arc::new(DataUpdateExecutionPlan::new(data_update.clone())),
                             overwrite,
                         )
                         .await
@@ -154,6 +156,27 @@ impl Refresher {
                                 tracing::error!("Error adding data for {dataset_name}: {e}");
                                 self.mark_dataset_status(status::ComponentStatus::Error);
                             } else {
+                                if let Some(start_time) = start_time {
+                                    let num_rows = data_update
+                                        .clone()
+                                        .data
+                                        .into_iter()
+                                        .map(|x| x.num_rows())
+                                        .sum::<usize>();
+
+                                    let memory_size = util::human_readable_bytes(
+                                        data_update
+                                            .data
+                                            .into_iter()
+                                            .map(|x| x.get_array_memory_size())
+                                            .sum::<usize>(),
+                                    );
+
+                                    if let Ok(elapse) = util::humantime_elapsed(start_time) {
+                                        tracing::info!("Loaded {num_rows} rows ({memory_size}) for dataset {dataset_name} in {elapse}.");
+                                    }
+                                }
+
                                 self.notify_refresh_done(
                                     &mut ready_sender,
                                     status::ComponentStatus::Ready,
@@ -174,7 +197,7 @@ impl Refresher {
     async fn stream_updates(
         &self,
         acceleration_refresh_mode: AccelerationRefreshMode,
-    ) -> BoxStream<'_, super::Result<DataUpdate>> {
+    ) -> BoxStream<'_, super::Result<(Option<SystemTime>, DataUpdate)>> {
         let time_column = self.refresh.read().await.time_column.clone();
 
         match acceleration_refresh_mode {
@@ -191,7 +214,9 @@ impl Refresher {
         }
     }
 
-    fn get_append_stream(&self) -> impl Stream<Item = super::Result<DataUpdate>> {
+    fn get_append_stream(
+        &self,
+    ) -> impl Stream<Item = super::Result<(Option<SystemTime>, DataUpdate)>> {
         let ctx = self.get_refresh_df_context();
         let federated = Arc::clone(&self.federated);
         let dataset_name = self.dataset_name.clone();
@@ -217,11 +242,11 @@ impl Refresher {
             loop {
                 match stream.next().await {
                     Some(Ok(batch)) => {
-                        yield Ok(DataUpdate {
+                        yield Ok((None, DataUpdate {
                             schema: Arc::clone(&schema),
                             data: vec![batch],
                             update_type: UpdateType::Append,
-                        });
+                        }));
                     }
                     Some(Err(e)) => {
                         tracing::error!("Error reading data for dataset {dataset_name}: {e}");
@@ -236,7 +261,7 @@ impl Refresher {
     fn get_full_update_stream(
         &self,
         receiver: Receiver<()>,
-    ) -> impl Stream<Item = super::Result<DataUpdate>> + '_ {
+    ) -> impl Stream<Item = super::Result<(Option<SystemTime>, DataUpdate)>> + '_ {
         let dataset_name = self.dataset_name.clone();
 
         let mut refresh_stream = ReceiverStream::new(receiver);
@@ -246,7 +271,11 @@ impl Refresher {
                     "load_dataset_duration_ms",
                     vec![("dataset", dataset_name.clone())],
                 );
-                yield self.get_full_or_incremental_append_update(None).await;
+                let start = SystemTime::now();
+                match self.get_full_or_incremental_append_update(None).await {
+                    Ok(data) => yield Ok((Some(start), data)),
+                    Err(e) => yield Err(e),
+                };
                 drop(timer);
             }
         }
@@ -255,7 +284,7 @@ impl Refresher {
     fn get_incremental_append_update_stream(
         &self,
         receiver: Receiver<()>,
-    ) -> impl Stream<Item = super::Result<DataUpdate>> + '_ {
+    ) -> impl Stream<Item = super::Result<(Option<SystemTime>, DataUpdate)>> + '_ {
         let dataset_name = self.dataset_name.clone();
 
         let mut refresh_stream = ReceiverStream::new(receiver);
@@ -267,7 +296,12 @@ impl Refresher {
                 );
                 match self.get_latest_timestamp().await {
                     Ok(timestamp) => {
-                        yield self.get_full_or_incremental_append_update(timestamp).await;
+                        let start = SystemTime::now();
+                        match self.get_full_or_incremental_append_update(timestamp).await {
+                            Ok(data) => yield Ok((Some(start), data)),
+                            Err(e) => yield Err(e),
+                        }
+
                     }
                     Err(e) => {
                         tracing::error!("No latest timestamp is found: {e}");
@@ -384,7 +418,7 @@ impl Refresher {
         match self.get_data_update(filters).await {
             Ok(data) => Ok(data),
             Err(e) => {
-                tracing::error!("[refresh] Failed to load data for dataset {dataset_name}: {e}");
+                tracing::error!("Failed to load data for dataset {dataset_name}: {e}");
                 Err(e)
             }
         }
