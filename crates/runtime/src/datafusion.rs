@@ -189,6 +189,24 @@ pub struct DataFusion {
     cache_provider: Option<QueryResultCacheProvider>,
 }
 
+pub struct QueryResult {
+    pub data: SendableRecordBatchStream,
+    pub cache_status: ResultCacheStatus,
+}
+
+pub enum ResultCacheStatus {
+    Cached,
+    NotCached,
+    CacheDisabled,
+}
+
+impl QueryResult {
+    #[must_use]
+    pub fn new(data: SendableRecordBatchStream, cache_status: ResultCacheStatus) -> Self {
+        QueryResult { data, cache_status }
+    }
+}
+
 impl DataFusion {
     /// Create a new `DataFusion` instance.
     ///
@@ -267,7 +285,7 @@ impl DataFusion {
         &self,
         sql: &str,
         restricted_sql_options: Option<SQLOptions>,
-    ) -> Result<SendableRecordBatchStream> {
+    ) -> Result<QueryResult> {
         let session = self.ctx.state();
         let plan = session
             .create_logical_plan(sql)
@@ -280,13 +298,18 @@ impl DataFusion {
                 .await
                 .context(FailedToAccessCacheSnafu)?
             {
-                return Ok(Box::pin(
+                let record_batch_stream = Box::pin(
                     MemoryStream::try_new(
                         cached_result.records.to_vec(),
                         cached_result.schema,
                         None,
                     )
                     .context(UnableToCreateMemoryStreamSnafu)?,
+                );
+
+                return Ok(QueryResult::new(
+                    record_batch_stream,
+                    ResultCacheStatus::Cached,
                 ));
             }
         }
@@ -317,14 +340,19 @@ impl DataFusion {
         verify_schema(df_schema.fields(), res_schema.fields()).context(SchemaMismatchSnafu)?;
 
         if let Some(cache_provider) = &self.cache_provider {
-            return Ok(to_cached_record_batch_stream(
-                cache_provider.clone(),
-                res_stream,
-                plan_copy,
+            let record_batch_stream =
+                to_cached_record_batch_stream(cache_provider.clone(), res_stream, plan_copy);
+
+            return Ok(QueryResult::new(
+                record_batch_stream,
+                ResultCacheStatus::NotCached,
             ));
         }
 
-        Ok(res_stream)
+        Ok(QueryResult::new(
+            res_stream,
+            ResultCacheStatus::CacheDisabled,
+        ))
     }
 
     pub fn register_runtime_table(

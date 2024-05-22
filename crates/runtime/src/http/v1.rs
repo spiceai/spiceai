@@ -89,7 +89,7 @@ pub(crate) mod query {
     use arrow::record_batch::RecordBatch;
     use axum::{
         body::Bytes,
-        http::StatusCode,
+        http::{HeaderMap, StatusCode},
         response::{IntoResponse, Response},
         Extension,
     };
@@ -98,7 +98,7 @@ pub(crate) mod query {
     use std::sync::Arc;
     use tokio::sync::RwLock;
 
-    use crate::datafusion::DataFusion;
+    use crate::datafusion::{DataFusion, ResultCacheStatus};
 
     pub(crate) async fn post(
         Extension(df): Extension<Arc<RwLock<DataFusion>>>,
@@ -117,25 +117,23 @@ pub(crate) mod query {
             .with_allow_dml(false)
             .with_allow_statements(false);
 
-        let results: Vec<RecordBatch> = match df
+        let (data, cache_status) = match df
             .read()
             .await
             .query_with_cache(&query, Some(restricted_sql_options))
             .await
         {
-            Ok(record_batch_stream) => {
-                match record_batch_stream.try_collect::<Vec<RecordBatch>>().await {
-                    Ok(batches) => batches,
-                    Err(e) => {
-                        tracing::debug!("Error executing query: {e}");
-                        return (
-                            StatusCode::BAD_REQUEST,
-                            format!("Error processing batch: {e}"),
-                        )
-                            .into_response();
-                    }
+            Ok(query_result) => match query_result.data.try_collect::<Vec<RecordBatch>>().await {
+                Ok(batches) => (batches, query_result.cache_status),
+                Err(e) => {
+                    tracing::debug!("Error executing query: {e}");
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        format!("Error processing batch: {e}"),
+                    )
+                        .into_response();
                 }
-            }
+            },
             Err(e) => {
                 tracing::debug!("Error executing query: {e}");
                 return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
@@ -145,8 +143,7 @@ pub(crate) mod query {
         let buf = Vec::new();
         let mut writer = arrow_json::ArrayWriter::new(buf);
 
-        if let Err(e) =
-            writer.write_batches(results.iter().collect::<Vec<&RecordBatch>>().as_slice())
+        if let Err(e) = writer.write_batches(data.iter().collect::<Vec<&RecordBatch>>().as_slice())
         {
             tracing::debug!("Error converting results to JSON: {e}");
             return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
@@ -165,7 +162,23 @@ pub(crate) mod query {
             }
         };
 
-        (StatusCode::OK, res).into_response()
+        let mut headers = HeaderMap::new();
+
+        match cache_status {
+            ResultCacheStatus::Cached => {
+                if let Ok(value) = "HIT".parse() {
+                    headers.insert("X-Cache", value);
+                }
+            }
+            ResultCacheStatus::NotCached => {
+                if let Ok(value) = "MISS".parse() {
+                    headers.insert("X-Cache", value);
+                }
+            }
+            ResultCacheStatus::CacheDisabled => {}
+        };
+
+        (StatusCode::OK, headers, res).into_response()
     }
 }
 
