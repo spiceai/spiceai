@@ -93,12 +93,13 @@ pub(crate) mod query {
         response::{IntoResponse, Response},
         Extension,
     };
+    use cache::ResultCacheStatus;
     use datafusion::execution::context::SQLOptions;
     use futures::TryStreamExt;
     use std::sync::Arc;
     use tokio::sync::RwLock;
 
-    use crate::datafusion::{DataFusion, ResultCacheStatus};
+    use crate::datafusion::DataFusion;
 
     pub(crate) async fn post(
         Extension(df): Extension<Arc<RwLock<DataFusion>>>,

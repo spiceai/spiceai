@@ -27,7 +27,9 @@ use crate::get_dependent_table_names;
 use crate::object_store_registry::default_runtime_env;
 use arrow::datatypes::Schema;
 use arrow_tools::schema::verify_schema;
-use cache::{to_cached_record_batch_stream, QueryResultCacheProvider};
+use cache::{
+    to_cached_record_batch_stream, QueryResult, QueryResultCacheProvider, ResultCacheStatus,
+};
 use datafusion::catalog::schema::SchemaProvider;
 use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider};
 use datafusion::datasource::{TableProvider, ViewTable};
@@ -187,24 +189,6 @@ pub struct DataFusion {
     pub ctx: Arc<SessionContext>,
     data_writers: HashSet<String>,
     cache_provider: Option<QueryResultCacheProvider>,
-}
-
-pub struct QueryResult {
-    pub data: SendableRecordBatchStream,
-    pub cache_status: ResultCacheStatus,
-}
-
-pub enum ResultCacheStatus {
-    Cached,
-    NotCached,
-    CacheDisabled,
-}
-
-impl QueryResult {
-    #[must_use]
-    pub fn new(data: SendableRecordBatchStream, cache_status: ResultCacheStatus) -> Self {
-        QueryResult { data, cache_status }
-    }
 }
 
 impl DataFusion {
