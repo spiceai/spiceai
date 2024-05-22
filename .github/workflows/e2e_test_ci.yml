@@ -573,6 +573,12 @@ jobs:
         run: |
           duckdb -s "INSTALL tpch;LOAD tpch;CALL dbgen(sf = 1);" ./tpch.db
 
+      - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+        uses: actions/download-artifact@v4
+        with:
+          name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+          path: ./build
+
       - name: Install Spice
         uses: ./.github/actions/install-spice
         with:
@@ -586,8 +592,9 @@ jobs:
         working-directory: duckdb-app
         run: |
           echo -e "tpch_customer\nTPC-H customer table\nduckdb:customer\ny" | spice dataset configure
-          echo -e "params:\n  open: ./tpch.db\n" >> spicepod.yaml
+          echo -e "params:\n  open: ../tpch.db\n" >> datasets/tpch_customer/dataset.yaml
           cat spicepod.yaml
+          cat datasets/tpch_customer/dataset.yaml
 
       - name: Start Spice runtime
         working-directory: duckdb-app
