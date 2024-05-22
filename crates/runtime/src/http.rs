@@ -17,7 +17,6 @@ limitations under the License.
 use std::{collections::HashMap, fmt::Debug, net::SocketAddr, sync::Arc};
 
 use app::App;
-use llms::nql::Nql;
 use model_components::model::Model;
 use snafu::prelude::*;
 use tokio::{
@@ -25,7 +24,7 @@ use tokio::{
     sync::RwLock,
 };
 
-use crate::{config, datafusion::DataFusion};
+use crate::{config, datafusion::DataFusion, LLMModelStore};
 
 mod routes;
 mod v1;
@@ -46,7 +45,7 @@ pub(crate) async fn start<A>(
     app: Arc<RwLock<Option<App>>>,
     df: Arc<RwLock<DataFusion>>,
     models: Arc<RwLock<HashMap<String, Model>>>,
-    llms: Arc<RwLock<HashMap<String, RwLock<Box<dyn Nql>>>>>,
+    llms: Arc<RwLock<LLMModelStore>>,
     config: Arc<config::Config>,
     with_metrics: Option<SocketAddr>,
 ) -> Result<()>

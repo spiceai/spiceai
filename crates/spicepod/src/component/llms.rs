@@ -14,23 +14,26 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::fmt::{self, Display, Formatter};
+use std::{
+    collections::HashMap,
+    fmt::{self, Display},
+};
 
 use super::WithDependsOn;
-use serde::{Deserialize, Deserializer, Serialize, de::Error as serde_error};
-use serde_yaml;
+use serde::{Deserialize, Serialize};
+use serde_json;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Llm {
     pub from: String,
     pub name: String,
 
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub params: Option<HashMap<String, String>>,
+
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(rename = "dependsOn", default)]
     pub depends_on: Vec<String>,
-
-    // #[serde(deserialize_with = "deserialize_params")]
-    pub params: LlmParams,
 }
 
 impl WithDependsOn<Llm> for Llm {
@@ -49,6 +52,17 @@ impl Llm {
     pub fn get_prefix(&self) -> Option<LlmPrefix> {
         LlmPrefix::try_from(self.from.as_str()).ok()
     }
+
+    #[must_use]
+    pub fn get_model_id(&self) -> Option<String> {
+        match self.get_prefix() {
+            Some(p) => self
+                .from
+                .strip_prefix(&p.to_string())
+                .map(ToString::to_string),
+            None => None,
+        }
+    }
 }
 
 pub enum LlmPrefix {
@@ -62,13 +76,13 @@ impl TryFrom<&str> for LlmPrefix {
     type Error = &'static str;
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
-        if value.starts_with("huggingface:huggingface.co/") {
+        if value.starts_with("huggingface:huggingface.co") {
             Ok(LlmPrefix::HuggingFace)
-        } else if value.starts_with("spice.ai/") {
+        } else if value.starts_with("spice.ai") {
             Ok(LlmPrefix::SpiceAi)
-        } else if value.starts_with("file:/") {
+        } else if value.starts_with("file:") {
             Ok(LlmPrefix::File)
-        } else if value.starts_with("openai/") {
+        } else if value.starts_with("openai") {
             Ok(LlmPrefix::OpenAi)
         } else {
             Err("Unknown prefix")
@@ -77,11 +91,11 @@ impl TryFrom<&str> for LlmPrefix {
 }
 
 impl Display for LlmPrefix {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            LlmPrefix::HuggingFace => write!(f, "huggingface"),
+            LlmPrefix::HuggingFace => write!(f, "huggingface:huggingface.co"),
             LlmPrefix::SpiceAi => write!(f, "spice.ai"),
-            LlmPrefix::File => write!(f, "file"),
+            LlmPrefix::File => write!(f, "file:"),
             LlmPrefix::OpenAi => write!(f, "openai"),
         }
     }
@@ -89,58 +103,68 @@ impl Display for LlmPrefix {
 
 #[derive(Debug, Serialize, PartialEq, Clone)]
 #[serde(untagged)]
-enum LlmParams {
-    HuggingfaceParams{
+pub enum LlmParams {
+    HuggingfaceParams {
+        model_type: Option<Architecture>,
         weights: Option<String>,
         tokenizer: Option<String>,
         chat_template: Option<String>,
     },
 
-    SpiceAiParams{
+    SpiceAiParams {
         chat_template: Option<String>,
     },
 
-    LocalModelParams{
-        weights: Option<String>,
-        tokenizer: Option<String>,
-        chat_template: Option<String>,
+    LocalModelParams {
+        weights: String,
+        tokenizer: String,
+        chat_template: String,
     },
-    OpenAiParams{
+    OpenAiParams {
         model: Option<String>,
     },
-    None
+    None,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum Architecture {
+    #[serde(rename = "mistral")]
+    Mistral,
+    #[serde(rename = "gemma")]
+    Gemma,
+    #[serde(rename = "mixtral")]
+    Mixtral,
+    #[serde(rename = "llama")]
+    Llama,
+    #[serde(rename = "phi2")]
+    Phi2,
+    #[serde(rename = "phi3")]
+    Phi3,
+    #[serde(rename = "qwen2")]
+    Qwen2,
+}
+impl TryFrom<&str> for Architecture {
+    type Error = &'static str;
 
-impl<'de> Deserialize<'de> for LlmParams {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-    let helper: serde_yaml::Value = Deserialize::deserialize(deserializer)?;
-    
-    let params = helper.get("params").cloned().unwrap_or(serde_yaml::Value::Null);
-    
-    let from = helper.get("from").and_then(serde_yaml::Value::as_str);
-    
-    let p: Result<LlmParams, _> = serde_yaml::from_value(params).map_err(serde_error::custom);
-    return p;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "mistral" => Ok(Architecture::Mistral),
+            "gemma" => Ok(Architecture::Gemma),
+            "mixtral" => Ok(Architecture::Mixtral),
+            "llama" => Ok(Architecture::Llama),
+            "phi2" => Ok(Architecture::Phi2),
+            "phi3" => Ok(Architecture::Phi3),
+            "qwen2" => Ok(Architecture::Qwen2),
+            _ => Err("Unknown architecture"),
+        }
+    }
+}
 
-    // match from.map(|f| LlmPrefix::try_from(f)) {
-    //     Some(Ok(LlmPrefix::HuggingFace)) => {
-    //         Ok(LlmParams::HuggingfaceParams(params))
-    //     }
-    //     Some(Ok(LlmPrefix::SpiceAi)) => {
-    //         Ok(LlmParams::SpiceAiParams(params))
-    //     }
-    //     Some(Ok(LlmPrefix::File)) => {
-    //         Ok(LlmParams::LocalModelParams(params))
-    //     }
-    //     Some(Ok(LlmPrefix::OpenAi)) => {
-    //         Ok(LlmParams::OpenAiParams(params))
-    //     }
-    //     None => Err(serde_error::custom(format!("Unknown `from` value: {}", from.unwrap_or("no `from` parameter found")))),
-    //     Some(Err(e)) => Err(serde_error::custom(e)),
-    // }
+impl fmt::Display for Architecture {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let s = serde_json::to_string(self)
+            .unwrap_or_else(|_| "unknown".to_string())
+            .replace('"', ""); // Remove the quotes added by JSON serialization
+        write!(f, "{s}")
     }
 }

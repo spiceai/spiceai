@@ -48,6 +48,8 @@ impl Openai {
             model,
         }
     }
+
+    #[must_use]
     pub fn using_model(model: String) -> Self {
         Self::new(OpenAIConfig::default(), model)
     }

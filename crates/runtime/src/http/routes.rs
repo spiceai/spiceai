@@ -14,10 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::LLMModelStore;
 use crate::{config, datafusion::DataFusion};
 use app::App;
 use axum::routing::patch;
-use llms::nql::Nql;
 use model_components::model::Model;
 use std::net::SocketAddr;
 use std::{collections::HashMap, sync::Arc};
@@ -39,7 +39,7 @@ pub(crate) fn routes(
     app: Arc<RwLock<Option<App>>>,
     df: Arc<RwLock<DataFusion>>,
     models: Arc<RwLock<HashMap<String, Model>>>,
-    llms: Arc<RwLock<HashMap<String, RwLock<Box<dyn Nql>>>>>,
+    llms: Arc<RwLock<LLMModelStore>>,
     config: Arc<config::Config>,
     with_metrics: Option<SocketAddr>,
 ) -> Router {

@@ -947,12 +947,11 @@ pub(crate) mod nsql {
         response::{IntoResponse, Response},
         Extension, Json,
     };
-    use llms::nql::{create_nsql, NSQLRuntime, Nql};
     use serde::{Deserialize, Serialize};
-    use std::{collections::HashMap, sync::Arc};
+    use std::sync::Arc;
     use tokio::sync::RwLock;
 
-    use crate::{datafusion::DataFusion, http::v1::dataframe_to_response};
+    use crate::{datafusion::DataFusion, http::v1::dataframe_to_response, LLMModelStore};
 
     fn clean_model_based_sql(input: &str) -> String {
         let no_dashes = match input.strip_prefix("--") {
@@ -980,7 +979,7 @@ pub(crate) mod nsql {
 
     pub(crate) async fn post(
         Extension(df): Extension<Arc<RwLock<DataFusion>>>,
-        Extension(nsql_models): Extension<Arc<RwLock<HashMap<String, RwLock<Box<dyn Nql>>>>>>,
+        Extension(nsql_models): Extension<Arc<RwLock<LLMModelStore>>>,
         Json(payload): Json<Request>,
     ) -> Response {
         let readable_df = df.read().await;

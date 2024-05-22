@@ -172,11 +172,13 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+pub type LLMModelStore = HashMap<String, RwLock<Box<dyn Nql>>>;
+
 pub struct Runtime {
     pub app: Arc<RwLock<Option<App>>>,
     pub df: Arc<RwLock<DataFusion>>,
     pub models: Arc<RwLock<HashMap<String, Model>>>,
-    pub llms: Arc<RwLock<HashMap<String, RwLock<Box<dyn Nql>>>>>,
+    pub llms: Arc<RwLock<LLMModelStore>>,
     pub pods_watcher: Option<podswatcher::PodsWatcher>,
     pub secrets_provider: Arc<RwLock<secrets::SecretsProvider>>,
 

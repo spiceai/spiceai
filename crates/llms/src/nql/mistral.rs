@@ -17,14 +17,15 @@ use super::{Error as NqlError, Nql, Result};
 
 use async_trait::async_trait;
 use mistralrs::{
-    Constraint, DeviceMapMetadata, GGUFLoaderBuilder, GGUFSpecificConfig, MistralRs,
-    MistralRsBuilder, NormalRequest, Request as MistralRsquest,
-    RequestMessage, Response as MistralRsponse, SamplingParams, SchedulerMethod,
+    Constraint, DeviceMapMetadata, GGMLLoaderBuilder, GGMLSpecificConfig, GGUFLoaderBuilder,
+    GGUFSpecificConfig, MistralRs, MistralRsBuilder, NormalLoaderBuilder, NormalRequest,
+    Request as MistralRsquest, RequestMessage, Response as MistralRsponse, SamplingParams,
+    SchedulerMethod, TokenSource,
 };
-use mistralrs_core::{LocalModelPaths, ModelPaths};
+use mistralrs_core::{LocalModelPaths, ModelPaths, Pipeline};
 use snafu::ResultExt;
 
-use std::{path::Path, sync::Arc};
+use std::{path::Path, str::FromStr, sync::Arc};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 
 pub struct MistralLlama {
@@ -34,7 +35,17 @@ pub struct MistralLlama {
 }
 
 impl MistralLlama {
-    pub fn try_new(
+    pub fn from(tokenizer: &Path, model_weights: &Path, template_filename: &Path) -> Result<Self> {
+        match model_weights.extension().unwrap_or_default().to_str() {
+            Some("ggml") => Self::from_ggml(tokenizer, model_weights, template_filename),
+            Some("gguf") => Self::from_gguf(tokenizer, model_weights, template_filename),
+            _ => Err(NqlError::FailedToLoadModel {
+                source: "Unknown model type {}".into(),
+            }),
+        }
+    }
+
+    pub fn from_gguf(
         tokenizer: &Path,
         model_weights: &Path,
         template_filename: &Path,
@@ -57,8 +68,8 @@ impl MistralLlama {
             GGUFSpecificConfig::default(),
             None,
             Some(tokenizer.to_string_lossy().to_string()),
-            Some("motherduckdb/DuckDB-NSQL-7B-v0.1-GGUF".to_string()),
-            "quantized_model_id".to_string(),
+            Some("None".to_string()),
+            String::new(),
             model_weights.to_string_lossy().to_string(),
         )
         .build()
@@ -72,10 +83,95 @@ impl MistralLlama {
         )
         .map_err(|e| NqlError::FailedToLoadModel { source: e.into() })?;
 
+        Self::from_pipeline(pipeline)
+    }
+
+    pub fn from_ggml(
+        tokenizer: &Path,
+        model_weights: &Path,
+        template_filename: &Path,
+    ) -> Result<Self> {
+        let paths: Box<dyn ModelPaths> = Box::new(LocalModelPaths::new(
+            tokenizer.into(),
+            // Not needed for LLama2 / DuckDB NQL, but needed in `EricLBuehler/mistral.rs`.
+            tokenizer.into(),
+            template_filename.into(),
+            vec![model_weights.into()],
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ));
+        let pipeline = GGMLLoaderBuilder::new(
+            GGMLSpecificConfig::default(),
+            None,
+            Some(tokenizer.to_string_lossy().to_string()),
+            None,
+            String::new(),
+            model_weights.to_string_lossy().to_string(),
+        )
+        .build()
+        .load_model_from_path(
+            &paths,
+            None,
+            &candle_core_rs::Device::Cpu,
+            false,
+            DeviceMapMetadata::dummy(),
+            None,
+        )
+        .map_err(|e| NqlError::FailedToLoadModel { source: e.into() })?;
+
+        Self::from_pipeline(pipeline)
+    }
+
+    pub fn from_hf(model_id: &str, arch: &str) -> Result<Self> {
+        let model_parts = model_id.split(':').collect::<Vec<&str>>();
+        if model_parts.len() != 2 {
+            return Err(NqlError::FailedToLoadModel {
+                source: format!("Invalid model id {model_id}").into(),
+            });
+        }
+
+        let builder = NormalLoaderBuilder::new(
+            mistralrs::NormalSpecificConfig {
+                use_flash_attn: false,
+                repeat_last_n: 64,
+            },
+            None,
+            None,
+            Some(model_parts[0].to_string()),
+        );
+
+        let Ok(loader_type) = mistralrs::NormalLoaderType::from_str(arch) else {
+            return Err(NqlError::FailedToLoadModel {
+                source: format!("Unknown model type {arch}").into(),
+            });
+        };
+
+        let pipeline = builder
+            .build(loader_type)
+            .load_model_from_hf(
+                model_parts.get(1).map(std::string::ToString::to_string),
+                TokenSource::CacheToken,
+                None,
+                &candle_core_rs::Device::Cpu,
+                false,
+                DeviceMapMetadata::dummy(),
+                None,
+            )
+            .map_err(|e| NqlError::FailedToLoadModel { source: e.into() })?;
+
+        Self::from_pipeline(pipeline)
+    }
+
+    fn from_pipeline(p: Arc<tokio::sync::Mutex<dyn Pipeline + Sync + Send>>) -> Result<Self> {
         let (tx, rx) = channel(10_000);
         Ok(Self {
             pipeline: MistralRsBuilder::new(
-                pipeline,
+                p,
                 SchedulerMethod::Fixed(5.try_into().map_err(|_| NqlError::FailedToLoadModel {
                     source: "couldn't create schedule method".into(),
                 })?),
@@ -85,19 +181,6 @@ impl MistralLlama {
             rx,
         })
     }
-
-    // pub fn from_hf(model_id: String) -> Result<Self> {
-    //     let builder = NormalLoaderBuilder::new(
-    //         mistralrs::NormalSpecificConfig {
-    //             use_flash_attn: false,
-    //             repeat_last_n: 64,
-    //         },
-    //         None,
-    //         None,
-    //         Some(model_id),
-    //     );
-    //     let loader: Box<dyn Loader> = builder.build(Norm);
-    // }
 
     fn to_request(&self, prompt: String) -> MistralRsquest {
         MistralRsquest::Normal(NormalRequest {

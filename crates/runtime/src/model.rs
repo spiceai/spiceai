@@ -17,7 +17,7 @@ limitations under the License.
 use arrow::record_batch::RecordBatch;
 use llms::nql::{Error as LlmError, Nql};
 use model_components::model::{Error as ModelError, Model};
-use spicepod::component::llms::LlmPrefix;
+use spicepod::component::llms::{Architecture, LlmParams, LlmPrefix};
 use std::collections::HashMap;
 use std::result::Result;
 use std::sync::Arc;
@@ -52,29 +52,109 @@ pub async fn run(m: &Model, df: Arc<RwLock<DataFusion>>) -> Result<RecordBatch, 
 
 /// Attempt to derive a runnable NQL model from a given component from the Spicepod definition.
 pub fn try_to_nql(component: &spicepod::component::llms::Llm) -> Result<Box<dyn Nql>, LlmError> {
-    match component.get_prefix() { 
-        Some(prefix) => match prefix {
-            // LlmPrefix::HuggingFace => Ok(Box::new(HuggingFace::new(component))),
-            // LlmPrefix::SpiceAi => Ok(Box::new(SpiceAi::new(component))),
-            // LlmPrefix::File => Ok(Box::new(File::new(component))),
-            LlmPrefix::OpenAi => llms::nql::create_nsql(
-                &llms::nql::NSQLRuntime::Openai,
-                component.params.clone(),
-            ),
-            _ => Err(LlmError::UnknownModelSource {
-                source: format!(
-                    "Unknown model source for spicepod component from: {}",
-                    component.from.clone()
-                )
-                .into(),
-            }),
-        },
-        None => Err(LlmError::UnknownModelSource {
+    let prefix = component.get_prefix().ok_or(LlmError::UnknownModelSource {
+        source: format!(
+            "Unknown model source for spicepod component from: {}",
+            component.from.clone()
+        )
+        .into(),
+    })?;
+
+    match convert_hashmap_to_llmparams(&prefix, &(component.params).clone().unwrap_or_default()) {
+        Ok(LlmParams::OpenAiParams { model }) => Ok(llms::nql::create_openai(model)),
+        Ok(LlmParams::LocalModelParams {
+            weights,
+            tokenizer,
+            chat_template,
+        }) => llms::nql::create_local_model(&weights, &tokenizer, &chat_template),
+        Ok(LlmParams::HuggingfaceParams {
+            model_type,
+            weights,
+            tokenizer,
+            chat_template,
+        }) => {
+            match component.get_model_id() {
+                Some(id) => {
+                    llms::nql::create_hf_model(
+                        &id,
+                        model_type.map(|x| x.to_string()),
+                        &weights,
+                        &tokenizer,
+                        &chat_template, // TODO handle inline chat templates
+                    )
+                }
+                None => Err(LlmError::FailedToLoadModel {
+                    source: format!("Failed to load model from: {}", component.from).into(),
+                }),
+            }
+        }
+        Err(e) => Err(e),
+        _ => Err(LlmError::UnknownModelSource {
             source: format!(
                 "Unknown model source for spicepod component from: {}",
                 component.from.clone()
             )
             .into(),
+        }),
+    }
+}
+
+fn convert_hashmap_to_llmparams(
+    from: &LlmPrefix,
+    params: &HashMap<String, String>,
+) -> Result<LlmParams, LlmError> {
+    match from {
+        LlmPrefix::HuggingFace => {
+            let model_type = params.get("model_type").cloned();
+            let arch = match model_type {
+                Some(arch) => {
+                    let a = Architecture::try_from(arch.as_str()).map_err(|_| {
+                        LlmError::UnknownModelSource {
+                            source: format!("Unknown model architecture {arch} for spicepod llm")
+                                .into(),
+                        }
+                    })?;
+                    Some(a)
+                }
+                None => None,
+            };
+            Ok(LlmParams::HuggingfaceParams {
+                model_type: arch,
+                weights: params.get("weights").cloned(),
+                tokenizer: params.get("tokenizer").cloned(),
+                chat_template: params.get("chat_template").cloned(),
+            })
+        }
+        LlmPrefix::File => {
+            let weights = params
+                .get("weights")
+                .ok_or(LlmError::FailedToLoadModel {
+                    source: "No 'weights' parameter provided".into(),
+                })?
+                .clone();
+            let tokenizer = params
+                .get("tokenizer")
+                .ok_or(LlmError::FailedToLoadTokenizer {
+                    source: "No 'tokenizer' parameter provided".into(),
+                })?
+                .clone();
+            let chat_template = params
+                .get("chat_template")
+                .ok_or(LlmError::FailedToLoadTokenizer {
+                    source: "No 'chat_template' parameter provided".into(),
+                })?
+                .clone();
+            Ok(LlmParams::LocalModelParams {
+                weights,
+                tokenizer,
+                chat_template,
+            })
+        }
+        LlmPrefix::SpiceAi => Ok(LlmParams::SpiceAiParams {
+            chat_template: params.get("chat_template").cloned(),
+        }),
+        LlmPrefix::OpenAi => Ok(LlmParams::OpenAiParams {
+            model: params.get("model").cloned(),
         }),
     }
 }
