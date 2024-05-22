@@ -42,6 +42,8 @@ pub struct App {
     pub spicepods: Vec<Spicepod>,
 
     pub runtime: Runtime,
+
+    pub extensions: Vec<dyn Extension>,
 }
 
 #[derive(Debug, Snafu)]
