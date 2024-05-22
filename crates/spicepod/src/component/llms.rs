@@ -21,7 +21,6 @@ use std::{
 
 use super::WithDependsOn;
 use serde::{Deserialize, Serialize};
-use serde_json;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Llm {
@@ -162,9 +161,14 @@ impl TryFrom<&str> for Architecture {
 
 impl fmt::Display for Architecture {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let s = serde_json::to_string(self)
-            .unwrap_or_else(|_| "unknown".to_string())
-            .replace('"', ""); // Remove the quotes added by JSON serialization
-        write!(f, "{s}")
+        match self {
+            Architecture::Mistral => write!(f, "mistral"),
+            Architecture::Gemma => write!(f, "gemma"),
+            Architecture::Mixtral => write!(f, "mixtral"),
+            Architecture::Llama => write!(f, "llama"),
+            Architecture::Phi2 => write!(f, "phi2"),
+            Architecture::Phi3 => write!(f, "phi3"),
+            Architecture::Qwen2 => write!(f, "qwen2"),
+        }
     }
 }

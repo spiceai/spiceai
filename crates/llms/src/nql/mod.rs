@@ -98,6 +98,7 @@ pub fn create_hf_model(
     mistral::MistralLlama::from_hf(
         model_id,
         &model_type.unwrap_or_default(),
+        // TODO: Support HF models with non-standard paths.
         // model_weights,
         // tokenizer,
         // template_filename,

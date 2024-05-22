@@ -60,7 +60,7 @@ pub fn try_to_nql(component: &spicepod::component::llms::Llm) -> Result<Box<dyn 
         .into(),
     })?;
 
-    match convert_hashmap_to_llmparams(&prefix, &(component.params).clone().unwrap_or_default()) {
+    match construct_llm_params(&prefix, &(component.params).clone().unwrap_or_default()) {
         Ok(LlmParams::OpenAiParams { model }) => Ok(llms::nql::create_openai(model)),
         Ok(LlmParams::LocalModelParams {
             weights,
@@ -99,7 +99,8 @@ pub fn try_to_nql(component: &spicepod::component::llms::Llm) -> Result<Box<dyn 
     }
 }
 
-fn convert_hashmap_to_llmparams(
+/// Construct the parameters needed to create an LLM based on its source (i.e. prefix).
+fn construct_llm_params(
     from: &LlmPrefix,
     params: &HashMap<String, String>,
 ) -> Result<LlmParams, LlmError> {

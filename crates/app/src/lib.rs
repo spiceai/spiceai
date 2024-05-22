@@ -63,7 +63,7 @@ pub struct AppBuilder {
     secrets: Secrets,
     datasets: Vec<Dataset>,
     models: Vec<Model>,
-    pub llms: Vec<Llm>,
+    llms: Vec<Llm>,
     spicepods: Vec<Spicepod>,
     runtime: Runtime,
 }
