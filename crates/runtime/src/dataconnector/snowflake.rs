@@ -23,6 +23,7 @@ use data_components::Read;
 use datafusion::datasource::TableProvider;
 use db_connection_pool::snowflakepool::SnowflakeConnectionPool;
 use db_connection_pool::DbConnectionPool;
+use itertools::Itertools;
 use secrets::Secret;
 use snafu::prelude::*;
 use snowflake_api::SnowflakeApi;
@@ -75,12 +76,22 @@ impl DataConnector for Snowflake {
         &self,
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        Ok(
-            Read::table_provider(&self.table_factory, dataset.path().into())
-                .await
-                .context(super::UnableToGetReadProviderSnafu {
-                    dataconnector: "snowflake",
-                })?,
-        )
+        let path = dataset
+            .path()
+            .split('.')
+            .map(|x| {
+                if x.starts_with('"') && x.ends_with('"') {
+                    return x.into();
+                }
+
+                format!("\"{x}\"")
+            })
+            .join(".");
+
+        Ok(Read::table_provider(&self.table_factory, path.into())
+            .await
+            .context(super::UnableToGetReadProviderSnafu {
+                dataconnector: "snowflake",
+            })?)
     }
 }
