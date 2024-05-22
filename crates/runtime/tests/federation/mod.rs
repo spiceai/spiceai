@@ -22,26 +22,11 @@ use datafusion::assert_batches_eq;
 use runtime::{datafusion::DataFusion, Runtime};
 use spicepod::component::{dataset::Dataset, secrets::SpiceSecretStore};
 use tokio::sync::RwLock;
-use tracing_subscriber::EnvFilter;
+
+use crate::init_tracing;
 
 #[cfg(feature = "mysql")]
 mod mysql;
-
-fn init_tracing(default_level: Option<&str>) {
-    let filter = match (default_level, std::env::var("SPICED_LOG").ok()) {
-        (_, Some(log)) => EnvFilter::new(log),
-        (Some(level), None) => EnvFilter::new(level),
-        _ => EnvFilter::new(
-            "runtime=TRACE,datafusion-federation=TRACE,datafusion-federation-sql=TRACE",
-        ),
-    };
-
-    let subscriber = tracing_subscriber::FmtSubscriber::builder()
-        .with_env_filter(filter)
-        .with_ansi(true)
-        .finish();
-    let _ = tracing::subscriber::set_global_default(subscriber);
-}
 
 fn make_spiceai_dataset(path: &str, name: &str) -> Dataset {
     Dataset::new(format!("spiceai:{path}"), name.to_string())

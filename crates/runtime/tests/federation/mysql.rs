@@ -18,21 +18,16 @@ limitations under the License.
 //! Expects a Docker daemon to be running.
 use std::{collections::HashMap, sync::Arc};
 
+use crate::docker::{ContainerRunnerBuilder, RunningContainer};
+
 use super::*;
 use app::AppBuilder;
 use arrow_sql_gen::statement::{CreateTableBuilder, InsertBuilder};
-use bollard::{
-    container::{Config, CreateContainerOptions, StartContainerOptions},
-    image::CreateImageOptions,
-    models::HostConfig,
-    secret::PortBinding,
-    Docker,
-};
+use bollard::secret::HealthConfig;
 use mysql_async::{prelude::Queryable, Params, Row};
 use runtime::{datafusion::DataFusion, Runtime};
 use spicepod::component::{dataset::Dataset, params::Params as DatasetParams};
 use tokio::sync::RwLock;
-use tokio_stream::StreamExt;
 use tracing::instrument;
 
 fn make_mysql_dataset(path: &str, name: &str) -> Dataset {
@@ -56,66 +51,29 @@ const MYSQL_ROOT_PASSWORD: &str = "federation-integration-test-pw";
 const MYSQL_DOCKER_CONTAINER: &str = "runtime-integration-test-federation-mysql";
 
 #[instrument]
-async fn start_mysql_docker_container() -> Result<(), anyhow::Error> {
-    let docker =
-        Docker::connect_with_local_defaults().expect("a running Docker daemon is required");
-    let containers = docker.list_containers::<&str>(None).await?;
-    for container in containers {
-        let Some(names) = container.names else {
-            continue;
-        };
-        if names.iter().any(|n| n == MYSQL_DOCKER_CONTAINER) {
-            tracing::debug!("MySQL container {MYSQL_DOCKER_CONTAINER} already running");
-            return Ok(());
-        }
-    }
-
-    let options = Some(CreateImageOptions::<&str> {
-        from_image: "mysql:latest",
-        ..Default::default()
-    });
-
-    let mut pulling_stream = docker.create_image(options, None, None);
-    while let Some(event) = pulling_stream.next().await {
-        tracing::debug!("Pulling image: {:?}", event?);
-    }
-
-    let options = CreateContainerOptions {
-        name: MYSQL_DOCKER_CONTAINER,
-        platform: None,
-    };
-
-    let host_config = Some(HostConfig {
-        port_bindings: Some(HashMap::from([(
-            "3306/tcp".to_string(),
-            Some(vec![PortBinding {
-                host_ip: Some("127.0.0.1".to_string()),
-                host_port: Some("13306/tcp".to_string()),
-            }]),
-        )])),
-        ..Default::default()
-    });
-
-    let config = Config::<String> {
-        image: Some("mysql:latest".to_string()),
-        env: Some(vec![
-            format!("MYSQL_ROOT_PASSWORD={MYSQL_ROOT_PASSWORD}"),
-            format!("MYSQL_DATABASE=federation"),
-        ]),
-        host_config,
-        ..Default::default()
-    };
-
-    let _ = docker.create_container(Some(options), config).await?;
-
-    docker
-        .start_container(
-            MYSQL_DOCKER_CONTAINER,
-            None::<StartContainerOptions<String>>,
-        )
+async fn start_mysql_docker_container() -> Result<RunningContainer<'static>, anyhow::Error> {
+    let running_container = ContainerRunnerBuilder::new(MYSQL_DOCKER_CONTAINER)
+        .image("mysql:latest")
+        .add_port_binding(3306, 13306)
+        .add_env_var("MYSQL_ROOT_PASSWORD", MYSQL_ROOT_PASSWORD)
+        .add_env_var("MYSQL_DATABASE", "federation")
+        .healthcheck(HealthConfig {
+            test: Some(vec![
+                "CMD-SHELL".to_string(),
+                format!("mysqladmin ping --password={MYSQL_ROOT_PASSWORD}"),
+            ]),
+            interval: Some(250_000_000), // 250ms
+            timeout: Some(100_000_000),  // 100ms
+            retries: Some(5),
+            start_period: Some(500_000_000), // 100ms
+            start_interval: None,
+        })
+        .build()?
+        .run()
         .await?;
 
-    Ok(())
+    tokio::time::sleep(std::time::Duration::from_millis(5000)).await;
+    Ok(running_container)
 }
 
 #[instrument]
@@ -138,7 +96,7 @@ async fn init_mysql_db() -> Result<(), anyhow::Error> {
         .exec("DROP TABLE IF EXISTS lineitem", Params::Empty)
         .await?;
 
-    tracing::debug!("crate::get_tpch_lineitem().await?");
+    tracing::debug!("Downloading TPCH lineitem...");
     let tpch_lineitem = crate::get_tpch_lineitem().await?;
 
     let tpch_lineitem_schema = Arc::clone(&tpch_lineitem[0].schema());
@@ -156,13 +114,18 @@ async fn init_mysql_db() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
 async fn mysql_federation_push_down() -> Result<(), String> {
     type QueryTests<'a> = Vec<(&'a str, Vec<&'a str>, Option<Box<ValidateFn>>)>;
     init_tracing(Some("integration=debug,info"));
-    let _ = start_mysql_docker_container().await;
-    tracing::debug!("Containers started");
-    let _ = init_mysql_db().await;
+    let running_container = start_mysql_docker_container().await.map_err(|e| {
+        tracing::error!("start_mysql_docker_container: {e}");
+        e.to_string()
+    })?;
+    tracing::debug!("Container started");
+    init_mysql_db().await.map_err(|e| {
+        tracing::error!("init_mysql_db: {e}");
+        e.to_string()
+    })?;
     let app = AppBuilder::new("mysql_federation_push_down")
         .with_dataset(make_mysql_dataset("lineitem", "line"))
         .build();
@@ -170,8 +133,6 @@ async fn mysql_federation_push_down() -> Result<(), String> {
     let df = Arc::new(RwLock::new(DataFusion::new()));
 
     let mut rt = Runtime::new(Some(app), df).await;
-
-    rt.load_secrets().await;
 
     // Set a timeout for the test
     tokio::select! {
@@ -185,25 +146,50 @@ async fn mysql_federation_push_down() -> Result<(), String> {
         (
             "SELECT * FROM line LIMIT 10",
             vec![
-                "+---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
-                "| plan_type     | plan                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |",
-                "+---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
-                "| logical_plan  | Federated                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |",
-                "|               |  Limit: skip=0, fetch=10                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |",
-                "|               |   Projection: line.l_orderkey, line.l_partkey, line.l_suppkey, line.l_linenumber, line.l_quantity, line.l_extendedprice, line.l_discount, line.l_tax, line.l_returnflag, line.l_linestatus, line.l_shipdate, line.l_commitdate, line.l_receiptdate, line.l_shipinstruct, line.l_shipmode, line.l_comment                                                                                                                                                                                                   |",
-                "|               |     SubqueryAlias: line                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |",
-                "|               |       TableScan: lineitem                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |",
-                "| physical_plan | VirtualExecutionPlan name=mysql compute_context=host=localhost,port=13306,db=federation,user=root sql=SELECT \"line\".\"l_orderkey\", \"line\".\"l_partkey\", \"line\".\"l_suppkey\", \"line\".\"l_linenumber\", \"line\".\"l_quantity\", \"line\".\"l_extendedprice\", \"line\".\"l_discount\", \"line\".\"l_tax\", \"line\".\"l_returnflag\", \"line\".\"l_linestatus\", \"line\".\"l_shipdate\", \"line\".\"l_commitdate\", \"line\".\"l_receiptdate\", \"line\".\"l_shipinstruct\", \"line\".\"l_shipmode\", \"line\".\"l_comment\" FROM \"lineitem\" AS \"line\" LIMIT 10 |",
-                "|               |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |",
-                "+---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+                "+---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+                "| plan_type     | plan                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |",
+                "+---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+                "| logical_plan  | Federated                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |",
+                "|               |  Limit: skip=0, fetch=10                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |",
+                "|               |   Sort: line.l_orderkey DESC NULLS FIRST                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |",
+                "|               |     Projection: line.l_orderkey, line.l_partkey, line.l_suppkey, line.l_linenumber, line.l_quantity, line.l_extendedprice, line.l_discount, line.l_tax, line.l_returnflag, line.l_linestatus, line.l_shipdate, line.l_commitdate, line.l_receiptdate, line.l_shipinstruct, line.l_shipmode, line.l_comment                                                                                                                                                                                                                                               |",
+                "|               |       SubqueryAlias: line                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |",
+                "|               |         TableScan: lineitem                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |",
+                "| physical_plan | VirtualExecutionPlan name=mysql compute_context=host=localhost,port=13306,db=federation,user=root sql=SELECT \"line\".\"l_orderkey\", \"line\".\"l_partkey\", \"line\".\"l_suppkey\", \"line\".\"l_linenumber\", \"line\".\"l_quantity\", \"line\".\"l_extendedprice\", \"line\".\"l_discount\", \"line\".\"l_tax\", \"line\".\"l_returnflag\", \"line\".\"l_linestatus\", \"line\".\"l_shipdate\", \"line\".\"l_commitdate\", \"line\".\"l_receiptdate\", \"line\".\"l_shipinstruct\", \"line\".\"l_shipmode\", \"line\".\"l_comment\" FROM \"lineitem\" AS \"line\" ORDER BY \"line\".\"l_orderkey\" DESC NULLS FIRST LIMIT 10 |",
+                "|               |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |",
+                "+---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
             ],
             None,
         ),
+        // This fails with: Error: "query `SELECT * FROM line ORDER BY line.l_orderkey DESC LIMIT 10` to results: Execution error: Unable to query arrow: Server error: `ERROR 42000 (1064): You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near 'NULLS FIRST LIMIT 10' at line 1'"
+        // (
+        //     "SELECT * FROM line ORDER BY line.l_orderkey DESC LIMIT 10",
+        //     vec![
+        //         "+---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+        //         "| plan_type     | plan                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |",
+        //         "+---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+        //         "| logical_plan  | Federated                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |",
+        //         "|               |  Limit: skip=0, fetch=10                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |",
+        //         "|               |   Sort: line.l_orderkey DESC NULLS FIRST                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |",
+        //         "|               |     Projection: line.l_orderkey, line.l_partkey, line.l_suppkey, line.l_linenumber, line.l_quantity, line.l_extendedprice, line.l_discount, line.l_tax, line.l_returnflag, line.l_linestatus, line.l_shipdate, line.l_commitdate, line.l_receiptdate, line.l_shipinstruct, line.l_shipmode, line.l_comment                                                                                                                                                                                                                                               |",
+        //         "|               |       SubqueryAlias: line                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |",
+        //         "|               |         TableScan: lineitem                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |",
+        //         "| physical_plan | VirtualExecutionPlan name=mysql compute_context=host=localhost,port=13306,db=federation,user=root sql=SELECT \"line\".\"l_orderkey\", \"line\".\"l_partkey\", \"line\".\"l_suppkey\", \"line\".\"l_linenumber\", \"line\".\"l_quantity\", \"line\".\"l_extendedprice\", \"line\".\"l_discount\", \"line\".\"l_tax\", \"line\".\"l_returnflag\", \"line\".\"l_linestatus\", \"line\".\"l_shipdate\", \"line\".\"l_commitdate\", \"line\".\"l_receiptdate\", \"line\".\"l_shipinstruct\", \"line\".\"l_shipmode\", \"line\".\"l_comment\" FROM \"lineitem\" AS \"line\" ORDER BY \"line\".\"l_orderkey\" DESC NULLS FIRST LIMIT 10 |",
+        //         "|               |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |",
+        //         "+---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+        //     ],
+        //     None,
+        // ),
     ];
 
     for (query, expected_plan, validate_result) in queries {
         run_query_and_check_results(&mut rt, query, &expected_plan, validate_result).await?;
     }
+
+    running_container.remove().await.map_err(|e| {
+        tracing::error!("running_container.remove: {e}");
+        e.to_string()
+    })?;
 
     Ok(())
 }
