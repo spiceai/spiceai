@@ -73,7 +73,7 @@ impl QueryResultCacheProvider {
             Some(cache_max_size) => Byte::parse_str(cache_max_size, true)
                 .context(FailedToParseCacheMaxSizeSnafu)?
                 .as_u64(),
-            None => 128 * 1024 * 1024, // 128MB
+            None => 128 * 1024 * 1024, // 128 MiB
         };
 
         let ttl = match &config.item_expire {
@@ -144,7 +144,7 @@ impl Display for QueryResultCacheProvider {
         write!(
             f,
             "max size: {:.2}, item expire duration: {:?}",
-            Byte::from_u64(self.cache_max_size).get_adjusted_unit(byte_unit::Unit::MB),
+            Byte::from_u64(self.cache_max_size).get_adjusted_unit(byte_unit::Unit::MiB),
             self.ttl
         )
     }
