@@ -16,6 +16,7 @@ limitations under the License.
 use super::{Error as NqlError, Nql, Result};
 
 use async_trait::async_trait;
+use candle_core_rs::{Device, MetalDevice};
 use mistralrs::{
     Constraint, DeviceMapMetadata, GGMLLoaderBuilder, GGMLSpecificConfig, GGUFLoaderBuilder,
     GGUFSpecificConfig, MistralRs, MistralRsBuilder, NormalLoaderBuilder, NormalRequest,
@@ -64,19 +65,24 @@ impl MistralLlama {
             None,
             None,
         ));
+        let model_id = model_weights.file_name().map(|x| x.to_string_lossy().to_string()).unwrap_or(model_weights.to_string_lossy().to_string());
+
+        let device = Device::new_metal(0).unwrap_or(candle_core_rs::Device::Cpu);
+        print!("device: {:?}", device);
+
         let pipeline = GGUFLoaderBuilder::new(
             GGUFSpecificConfig::default(),
             None,
             Some(tokenizer.to_string_lossy().to_string()),
-            Some("None".to_string()),
+            Some(model_id.clone()),
+            model_id,
             String::new(),
-            model_weights.to_string_lossy().to_string(),
         )
         .build()
         .load_model_from_path(
             &paths,
             None,
-            &candle_core_rs::Device::Cpu,
+            &device,
             false,
             DeviceMapMetadata::dummy(),
             None,
@@ -214,7 +220,10 @@ impl Nql for MistralLlama {
 
         match self.rx.recv().await {
             Some(response) => match response {
-                MistralRsponse::CompletionDone(cr) => Ok(Some(cr.choices[0].text.clone())),
+                MistralRsponse::CompletionDone(cr) => {
+                    println!("total: {}, avg_tok_per_sec: {}, avg_prompt_tok_per_sec: {}, avg_compl_tok_per_sec: {}", cr.usage.total_time_sec, cr.usage.avg_tok_per_sec, cr.usage.avg_prompt_tok_per_sec, cr.usage.avg_compl_tok_per_sec);
+                    Ok(Some(cr.choices[0].text.clone()))
+                },
                 MistralRsponse::CompletionModelError(err_msg, _cr) => {
                     Err(NqlError::FailedToRunModel {
                         source: err_msg.into(),
