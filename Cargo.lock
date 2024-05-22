@@ -3424,13 +3424,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "extensions"
-version = "0.13.1-alpha"
-dependencies = [
- "tracing",
-]
-
-[[package]]
 name = "fallible-iterator"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7352,7 +7345,6 @@ dependencies = [
  "db_connection_pool",
  "dirs",
  "duckdb",
- "extensions",
  "flight_client",
  "fundu",
  "futures",
@@ -8239,7 +8231,6 @@ version = "0.13.1-alpha"
 dependencies = [
  "app",
  "clap",
- "extensions",
  "flightrepl",
  "metrics-exporter-prometheus",
  "runtime",

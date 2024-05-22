@@ -26,7 +26,7 @@ use clap::Parser;
 use flightrepl::ReplConfig;
 use runtime::config::Config as RuntimeConfig;
 
-use extensions::{Extension, Runtime as ExtensionRuntime};
+use runtime::extensions::{Extension, Runtime as ExtensionRuntime};
 use runtime::podswatcher::PodsWatcher;
 use runtime::Runtime;
 use snafu::prelude::*;
@@ -115,7 +115,7 @@ pub async fn run(args: Args) -> Result<()> {
     let mut extensions: Vec<Box<&mut dyn Extension>> = vec![];
 
     // Built in spiceai extension
-    let mut spice_extension = extensions::spiceai_extension::SpiceExtension {};
+    let mut spice_extension = runtime::extensions::spiceai_extension::SpiceExtension {};
     let boxed: Box<&mut dyn Extension> = Box::new(&mut spice_extension);
     extensions.push(boxed);
 

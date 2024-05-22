@@ -1,4 +1,4 @@
-use crate::{Extension, Runtime};
+use super::{Extension, Runtime};
 
 pub struct SpiceExtension {}
 
