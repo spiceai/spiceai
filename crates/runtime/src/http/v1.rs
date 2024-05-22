@@ -93,7 +93,6 @@ pub(crate) mod query {
         response::{IntoResponse, Response},
         Extension,
     };
-    use cache::RetrievalResult;
     use datafusion::execution::context::SQLOptions;
     use futures::TryStreamExt;
     use std::sync::Arc;
@@ -118,14 +117,14 @@ pub(crate) mod query {
             .with_allow_dml(false)
             .with_allow_statements(false);
 
-        let (data, cache_status) = match df
+        let (data, is_data_from_cache) = match df
             .read()
             .await
             .query_with_cache(&query, Some(restricted_sql_options))
             .await
         {
             Ok(query_result) => match query_result.data.try_collect::<Vec<RecordBatch>>().await {
-                Ok(batches) => (batches, query_result.cache_retrieval_result),
+                Ok(batches) => (batches, query_result.from_cache),
                 Err(e) => {
                     tracing::debug!("Error executing query: {e}");
                     return (
@@ -165,13 +164,13 @@ pub(crate) mod query {
 
         let mut headers = HeaderMap::new();
 
-        match cache_status {
-            Some(RetrievalResult::Hit) => {
+        match is_data_from_cache {
+            Some(true) => {
                 if let Ok(value) = "HIT".parse() {
                     headers.insert("X-Cache", value);
                 }
             }
-            Some(RetrievalResult::Miss) => {
+            Some(false) => {
                 if let Ok(value) = "MISS".parse() {
                     headers.insert("X-Cache", value);
                 }

@@ -27,9 +27,7 @@ use crate::get_dependent_table_names;
 use crate::object_store_registry::default_runtime_env;
 use arrow::datatypes::Schema;
 use arrow_tools::schema::verify_schema;
-use cache::{
-    to_cached_record_batch_stream, QueryResult, QueryResultCacheProvider, RetrievalResult,
-};
+use cache::{to_cached_record_batch_stream, QueryResult, QueryResultCacheProvider};
 use datafusion::catalog::schema::SchemaProvider;
 use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider};
 use datafusion::datasource::{TableProvider, ViewTable};
@@ -291,10 +289,7 @@ impl DataFusion {
                     .context(UnableToCreateMemoryStreamSnafu)?,
                 );
 
-                return Ok(QueryResult::new(
-                    record_batch_stream,
-                    Some(RetrievalResult::Hit),
-                ));
+                return Ok(QueryResult::new(record_batch_stream, Some(true)));
             }
         }
 
@@ -327,10 +322,7 @@ impl DataFusion {
             let record_batch_stream =
                 to_cached_record_batch_stream(cache_provider.clone(), res_stream, plan_copy);
 
-            return Ok(QueryResult::new(
-                record_batch_stream,
-                Some(RetrievalResult::Miss),
-            ));
+            return Ok(QueryResult::new(record_batch_stream, Some(false)));
         }
 
         Ok(QueryResult::new(res_stream, None))

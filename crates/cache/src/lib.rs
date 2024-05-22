@@ -45,26 +45,15 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-pub enum RetrievalResult {
-    Hit,
-    Miss,
-}
-
 pub struct QueryResult {
     pub data: SendableRecordBatchStream,
-    pub cache_retrieval_result: Option<RetrievalResult>,
+    pub from_cache: Option<bool>,
 }
 
 impl QueryResult {
     #[must_use]
-    pub fn new(
-        data: SendableRecordBatchStream,
-        cache_retrieval_result: Option<RetrievalResult>,
-    ) -> Self {
-        QueryResult {
-            data,
-            cache_retrieval_result,
-        }
+    pub fn new(data: SendableRecordBatchStream, from_cache: Option<bool>) -> Self {
+        QueryResult { data, from_cache }
     }
 }
 
