@@ -30,13 +30,22 @@ use bollard::{
 };
 use mysql_async::{prelude::Queryable, Params, Row};
 use runtime::{datafusion::DataFusion, Runtime};
-use spicepod::component::dataset::Dataset;
+use spicepod::component::{dataset::Dataset, params::Params as DatasetParams};
 use tokio::sync::RwLock;
 use tokio_stream::StreamExt;
 use tracing::instrument;
 
 fn make_mysql_dataset(path: &str, name: &str) -> Dataset {
-    Dataset::new(format!("mysql:{path}"), name.to_string())
+    let mut dataset = Dataset::new(format!("mysql:{path}"), name.to_string());
+    let params = HashMap::from([
+        (
+            "mysql_connection_string".to_string(),
+            "mysql://root:federation-integration-test-pw@localhost:13306/federation".to_string(),
+        ),
+        ("mysql_sslmode".to_string(), "disabled".to_string()),
+    ]);
+    dataset.params = Some(DatasetParams::from_string_map(params));
+    dataset
 }
 
 const MYSQL_ROOT_PASSWORD: &str = "federation-integration-test-pw";
@@ -52,6 +61,7 @@ async fn start_mysql_docker_container() -> Result<(), anyhow::Error> {
             continue;
         };
         if names.iter().any(|n| n == MYSQL_DOCKER_CONTAINER) {
+            tracing::debug!("MySQL container {MYSQL_DOCKER_CONTAINER} already running");
             return Ok(());
         }
     }
@@ -63,7 +73,7 @@ async fn start_mysql_docker_container() -> Result<(), anyhow::Error> {
 
     let mut pulling_stream = docker.create_image(options, None, None);
     while let Some(event) = pulling_stream.next().await {
-        tracing::info!("Pulling image: {:?}", event?);
+        tracing::debug!("Pulling image: {:?}", event?);
     }
 
     let options = CreateContainerOptions {
@@ -142,20 +152,15 @@ async fn init_mysql_db() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
-async fn list_containers() -> Result<(), anyhow::Error> {
-    init_tracing(Some("integration=debug"));
-    let _ = start_mysql_docker_container().await;
-    tracing::debug!("Containers started");
-    init_mysql_db().await
-}
-
-#[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn mysql_federation_push_down() -> Result<(), String> {
     type QueryTests<'a> = Vec<(&'a str, Vec<&'a str>, Option<Box<ValidateFn>>)>;
-    init_tracing(None);
+    init_tracing(Some("integration=debug,info"));
+    let _ = start_mysql_docker_container().await;
+    tracing::debug!("Containers started");
+    let _ = init_mysql_db().await;
     let app = AppBuilder::new("mysql_federation_push_down")
-        .with_dataset(make_mysql_dataset("foobar", "test"))
+        .with_dataset(make_mysql_dataset("lineitem", "line"))
         .build();
 
     let df = Arc::new(RwLock::new(DataFusion::new()));
@@ -174,7 +179,7 @@ async fn mysql_federation_push_down() -> Result<(), String> {
 
     let queries: QueryTests = vec![
         (
-            "SELECT MAX(number) as max_num FROM test",
+            "SELECT * FROM line LIMIT 10",
             vec![
                 "+---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
                 "| plan_type     | plan                                                                                                                                                                            |",
