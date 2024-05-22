@@ -25,16 +25,17 @@ use crate::dataconnector::{DataConnector, DataConnectorError};
 use crate::dataupdate::{DataUpdate, DataUpdateExecutionPlan, UpdateType};
 use crate::get_dependent_table_names;
 use crate::object_store_registry::default_runtime_env;
-use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
 use arrow_tools::schema::verify_schema;
-use cache::QueryResultCacheProvider;
+use cache::{to_cached_record_batch_stream, QueryResultCacheProvider};
 use datafusion::catalog::schema::SchemaProvider;
 use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider};
 use datafusion::datasource::{TableProvider, ViewTable};
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::{SQLOptions, SessionConfig, SessionContext, SessionState};
+use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::collect;
+use datafusion::physical_plan::memory::MemoryStream;
 use datafusion::sql::parser::DFParser;
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::{sqlparser, TableReference};
@@ -167,6 +168,9 @@ pub enum Error {
 
     #[snafu(display("Unable to collect results after query execution: {source}"))]
     UnableToCollectResults { source: DataFusionError },
+
+    #[snafu(display("Unable to convert cached result to a record batch stream: {source}"))]
+    UnableToCreateMemoryStream { source: DataFusionError },
 }
 
 pub enum Table {
@@ -259,7 +263,11 @@ impl DataFusion {
         self.cache_provider = cache_provider;
     }
 
-    pub async fn query_with_cache(&self, sql: &str) -> Result<Arc<Vec<RecordBatch>>> {
+    pub async fn query_with_cache(
+        &self,
+        sql: &str,
+        restricted_sql_options: Option<SQLOptions>,
+    ) -> Result<SendableRecordBatchStream> {
         let session = self.ctx.state();
         let plan = session
             .create_logical_plan(sql)
@@ -272,18 +280,22 @@ impl DataFusion {
                 .await
                 .context(FailedToAccessCacheSnafu)?
             {
-                return Ok(cached_result);
+                return Ok(Box::pin(
+                    MemoryStream::try_new(
+                        cached_result.records.to_vec(),
+                        cached_result.schema,
+                        None,
+                    )
+                    .context(UnableToCreateMemoryStreamSnafu)?,
+                ));
             }
         }
 
-        let restricted_sql_options = SQLOptions::new()
-            .with_allow_ddl(false)
-            .with_allow_dml(false)
-            .with_allow_statements(false);
-
-        restricted_sql_options
-            .verify_plan(&plan)
-            .context(UnableToExecuteQuerySnafu)?;
+        if let Some(restricted_sql_options) = restricted_sql_options {
+            restricted_sql_options
+                .verify_plan(&plan)
+                .context(UnableToExecuteQuerySnafu)?;
+        }
 
         let plan_copy = plan.clone();
 
@@ -293,18 +305,26 @@ impl DataFusion {
             .await
             .context(UnableToExecuteQuerySnafu)?;
 
-        let records = df.collect().await.context(UnableToCollectResultsSnafu)?;
+        let df_schema: Arc<Schema> = df.schema().clone().into();
 
-        let shared_records = Arc::new(records);
+        let res_stream: SendableRecordBatchStream = df
+            .execute_stream()
+            .await
+            .context(UnableToCollectResultsSnafu)?;
+
+        let res_schema = res_stream.schema();
+
+        verify_schema(df_schema.fields(), res_schema.fields()).context(SchemaMismatchSnafu)?;
 
         if let Some(cache_provider) = &self.cache_provider {
-            cache_provider
-                .put(&plan_copy, Arc::clone(&shared_records))
-                .await
-                .context(FailedToAccessCacheSnafu)?;
+            return Ok(to_cached_record_batch_stream(
+                cache_provider.clone(),
+                res_stream,
+                plan_copy,
+            ));
         }
 
-        Ok(shared_records)
+        Ok(res_stream)
     }
 
     pub fn register_runtime_table(
