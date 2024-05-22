@@ -337,9 +337,7 @@ pub trait ListingTableConnector: DataConnector {
             )),
             Some(format) => Err(DataConnectorError::InvalidConfiguration {
                 dataconnector: format!("{self}"),
-                message: format!(
-                    "Unsupported file format '{format}'. Use csv or parquet."
-                ),
+                message: format!("Unsupported file format '{format}'. Use csv or parquet."),
                 source: "Invalid file format".into(),
             }),
             None => Err(DataConnectorError::InvalidConfiguration {
