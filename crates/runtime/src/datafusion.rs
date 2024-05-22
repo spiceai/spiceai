@@ -28,7 +28,7 @@ use crate::object_store_registry::default_runtime_env;
 use arrow::datatypes::Schema;
 use arrow_tools::schema::verify_schema;
 use cache::{
-    to_cached_record_batch_stream, QueryResult, QueryResultCacheProvider, ResultCacheStatus,
+    to_cached_record_batch_stream, QueryResult, QueryResultCacheProvider, RetrievalResult,
 };
 use datafusion::catalog::schema::SchemaProvider;
 use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider};
@@ -293,7 +293,7 @@ impl DataFusion {
 
                 return Ok(QueryResult::new(
                     record_batch_stream,
-                    ResultCacheStatus::Cached,
+                    Some(RetrievalResult::Hit),
                 ));
             }
         }
@@ -329,14 +329,11 @@ impl DataFusion {
 
             return Ok(QueryResult::new(
                 record_batch_stream,
-                ResultCacheStatus::NotCached,
+                Some(RetrievalResult::Miss),
             ));
         }
 
-        Ok(QueryResult::new(
-            res_stream,
-            ResultCacheStatus::CacheDisabled,
-        ))
+        Ok(QueryResult::new(res_stream, None))
     }
 
     pub fn register_runtime_table(
