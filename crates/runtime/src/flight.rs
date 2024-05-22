@@ -23,11 +23,9 @@ use arrow::ipc::writer::{DictionaryTracker, IpcDataGenerator};
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::{Action, ActionType, Criteria, IpcMessage, PollInfo, SchemaResult};
 use arrow_ipc::writer::IpcWriteOptions;
-use arrow_tools::schema::verify_schema;
 use bytes::Bytes;
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::SQLOptions;
-use datafusion::execution::SendableRecordBatchStream;
 use datafusion::sql::sqlparser::parser::ParserError;
 use futures::stream::{self, BoxStream, StreamExt};
 use futures::{Stream, TryStreamExt};
@@ -183,34 +181,28 @@ impl Service {
             .with_allow_ddl(false)
             .with_allow_dml(false)
             .with_allow_statements(false);
-        let df = datafusion
+
+        let batches_stream = datafusion
             .read()
             .await
-            .ctx
-            .sql_with_options(&sql, restricted_sql_options)
+            .query_with_cache(&sql, Some(restricted_sql_options))
             .await
-            .map_err(handle_datafusion_error)?;
-        let schema = df.schema().clone().into();
+            .map_err(to_tonic_err)?;
+
+        let schema = batches_stream.schema();
         let options = datafusion::arrow::ipc::writer::IpcWriteOptions::default();
         let schema_as_ipc = SchemaAsIpc::new(&schema, &options);
         let schema_flight_data = FlightData::from(schema_as_ipc);
 
-        let batches_stream: SendableRecordBatchStream =
-            df.execute_stream().await.map_err(to_tonic_err)?;
-
         let batches_stream = batches_stream
             .then(move |batch_result| {
                 let options_clone = options.clone();
-                let schema_clone = schema.clone();
                 async move {
                     let encoder = IpcDataGenerator::default();
                     let mut tracker = DictionaryTracker::new(false);
 
                     match batch_result {
                         Ok(batch) => {
-                            verify_schema(schema_clone.fields(), batch.schema().fields())
-                                .map_err(to_tonic_err)?;
-
                             let (flight_dictionaries, flight_batch) = encoder
                                 .encoded_batch(&batch, &mut tracker, &options_clone)
                                 .map_err(|e| Status::internal(e.to_string()))?;

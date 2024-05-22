@@ -19,6 +19,7 @@ use std::fmt::Formatter;
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
+use arrow::datatypes::Schema;
 use async_trait::async_trait;
 use byte_unit::Byte;
 use datafusion::logical_expr::LogicalPlan;
@@ -28,6 +29,9 @@ use snafu::{ResultExt, Snafu};
 use spicepod::component::runtime::ResultsCache;
 
 mod lru_cache;
+mod utils;
+
+pub use utils::to_cached_record_batch_stream;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -40,14 +44,20 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-#[async_trait]
-pub trait QueryResultCache {
-    async fn get(&self, plan: &LogicalPlan) -> Result<Option<Arc<Vec<RecordBatch>>>>;
-    async fn put(&self, plan: &LogicalPlan, result: Arc<Vec<RecordBatch>>) -> Result<()>;
+#[derive(Clone)]
+pub struct CachedQueryResult {
+    pub records: Arc<Vec<RecordBatch>>,
+    pub schema: Arc<Schema>,
 }
 
+#[async_trait]
+pub trait QueryResultCache {
+    async fn get(&self, plan: &LogicalPlan) -> Result<Option<CachedQueryResult>>;
+    async fn put(&self, plan: &LogicalPlan, result: CachedQueryResult) -> Result<()>;
+}
+#[derive(Clone)]
 pub struct QueryResultCacheProvider {
-    cache: Box<dyn QueryResultCache + Send + Sync>,
+    cache: Arc<dyn QueryResultCache + Send + Sync>,
     cache_max_size: u64,
     ttl: std::time::Duration,
 }
@@ -72,7 +82,7 @@ impl QueryResultCacheProvider {
         };
 
         let cache_provider = QueryResultCacheProvider {
-            cache: Box::new(LruCache::new(cache_max_size, ttl)),
+            cache: Arc::new(LruCache::new(cache_max_size, ttl)),
             cache_max_size,
             ttl,
         };
@@ -83,15 +93,20 @@ impl QueryResultCacheProvider {
     /// # Errors
     ///
     /// Will return `Err` if method fails to access the cache
-    pub async fn get(&self, plan: &LogicalPlan) -> Result<Option<Arc<Vec<RecordBatch>>>> {
+    pub async fn get(&self, plan: &LogicalPlan) -> Result<Option<CachedQueryResult>> {
         self.cache.get(plan).await
     }
 
     /// # Errors
     ///
     /// Will return `Err` if method fails to access the cache
-    pub async fn put(&self, plan: &LogicalPlan, result: Arc<Vec<RecordBatch>>) -> Result<()> {
+    pub async fn put(&self, plan: &LogicalPlan, result: CachedQueryResult) -> Result<()> {
         self.cache.put(plan, result).await
+    }
+
+    #[must_use]
+    pub fn cache_max_size(&self) -> u64 {
+        self.cache_max_size
     }
 }
 
