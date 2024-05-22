@@ -12,6 +12,7 @@ description = "The spiced runtime"
 snafu.workspace = true
 spicepod = { path = "../spicepod" }
 app = { path = "../app" }
+util = { path = "../util" }
 axum = { version = "0.7.4", features = ["macros"] }
 tokio.workspace = true
 tracing.workspace = true
