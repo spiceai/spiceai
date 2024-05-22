@@ -838,26 +838,10 @@ impl Runtime {
 
         tracing::info!("Initialized query results cache; {cache_provider}");
 
-        let shared_cache_provider = Arc::new(cache_provider);
-        let cache_copy = Arc::clone(&shared_cache_provider);
-
         self.df
             .write()
             .await
-            .set_cache_provider(Some(shared_cache_provider));
-
-        // cache metrics reporting
-        let _handle = tokio::spawn(async move {
-            loop {
-                #[allow(clippy::cast_precision_loss)]
-                metrics::gauge!("results_cache_max_size").set(cache_copy.max_size() as f64);
-                #[allow(clippy::cast_precision_loss)]
-                metrics::gauge!("results_cache_size").set(cache_copy.size() as f64);
-                #[allow(clippy::cast_precision_loss)]
-                metrics::gauge!("results_cache_item_count").set(cache_copy.item_count() as f64);
-                sleep(Duration::from_secs(10)).await;
-            }
-        });
+            .set_cache_provider(Some(cache_provider));
     }
 }
 

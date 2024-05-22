@@ -96,14 +96,31 @@ impl QueryResultCacheProvider {
     ///
     /// Will return `Err` if method fails to access the cache
     pub async fn get(&self, plan: &LogicalPlan) -> Result<Option<CachedQueryResult>> {
-        self.cache.get(plan).await
+        metrics::counter!("results_cache_request_count").increment(1);
+        match self.cache.get(plan).await {
+            Ok(Some(cached_result)) => {
+                metrics::counter!("results_cache_hit_count").increment(1);
+                Ok(Some(cached_result))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     /// # Errors
     ///
     /// Will return `Err` if method fails to access the cache
     pub async fn put(&self, plan: &LogicalPlan, result: CachedQueryResult) -> Result<()> {
-        self.cache.put(plan, result).await
+        let res = self.cache.put(plan, result).await;
+
+        #[allow(clippy::cast_precision_loss)]
+        metrics::gauge!("results_cache_max_size").set(self.max_size() as f64);
+        #[allow(clippy::cast_precision_loss)]
+        metrics::gauge!("results_cache_size").set(self.size() as f64);
+        #[allow(clippy::cast_precision_loss)]
+        metrics::gauge!("results_cache_item_count").set(self.item_count() as f64);
+
+        res
     }
 
     #[must_use]

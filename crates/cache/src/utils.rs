@@ -30,7 +30,7 @@ use futures::StreamExt;
 
 #[must_use]
 pub fn to_cached_record_batch_stream(
-    cache_provider: Arc<QueryResultCacheProvider>,
+    cache_provider: QueryResultCacheProvider,
     mut stream: SendableRecordBatchStream,
     plan: LogicalPlan,
 ) -> SendableRecordBatchStream {

@@ -53,6 +53,7 @@ impl LruCache {
                 }
             })
             .max_capacity(cache_max_size)
+            .eviction_policy(moka::policy::EvictionPolicy::lru())
             .build();
 
         LruCache { cache }
