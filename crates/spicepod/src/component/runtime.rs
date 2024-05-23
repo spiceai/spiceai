@@ -27,7 +27,8 @@ pub struct ResultsCache {
     #[serde(default = "default_true")]
     pub enabled: bool,
     pub cache_max_size: Option<String>,
-    pub item_expire: Option<String>,
+    pub item_ttl: Option<String>,
+    pub eviction_policy: Option<String>,
 }
 
 const fn default_true() -> bool {
@@ -39,7 +40,8 @@ impl Default for ResultsCache {
         Self {
             enabled: true,
             cache_max_size: None,
-            item_expire: None,
+            item_ttl: None,
+            eviction_policy: None,
         }
     }
 }

@@ -840,7 +840,7 @@ impl Runtime {
         self.df
             .write()
             .await
-            .set_cache_provider(Some(cache_provider));
+            .set_cache_provider(Some(Arc::new(cache_provider)));
     }
 }
 

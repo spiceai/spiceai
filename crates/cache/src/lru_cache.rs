@@ -53,6 +53,7 @@ impl LruCache {
                 }
             })
             .max_capacity(cache_max_size)
+            .eviction_policy(moka::policy::EvictionPolicy::lru())
             .build();
 
         LruCache { cache }
@@ -73,6 +74,14 @@ impl QueryResultCache for LruCache {
         let key = key_for_logical_plan(plan);
         self.cache.insert(key, result).await;
         Ok(())
+    }
+
+    fn size_bytes(&self) -> u64 {
+        self.cache.weighted_size()
+    }
+
+    fn item_count(&self) -> u64 {
+        self.cache.entry_count()
     }
 }
 
