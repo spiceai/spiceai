@@ -25,6 +25,7 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
 use async_trait::async_trait;
 use byte_unit::Byte;
+use datafusion::execution::SendableRecordBatchStream;
 use datafusion::logical_expr::LogicalPlan;
 use fundu::ParseError;
 use lru_cache::LruCache;
@@ -47,6 +48,18 @@ pub enum Error {
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+pub struct QueryResult {
+    pub data: SendableRecordBatchStream,
+    pub from_cache: Option<bool>,
+}
+
+impl QueryResult {
+    #[must_use]
+    pub fn new(data: SendableRecordBatchStream, from_cache: Option<bool>) -> Self {
+        QueryResult { data, from_cache }
+    }
+}
 
 #[derive(Clone)]
 pub struct CachedQueryResult {
