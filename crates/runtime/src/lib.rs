@@ -881,6 +881,10 @@ impl Runtime {
 }
 
 impl ExtensionRuntime for Runtime {
+    fn datafusion(&self) -> Arc<RwLock<DataFusion>> {
+        Arc::clone(&self.df)
+    }
+
     fn register_extension(&mut self, extension: Box<&mut dyn Extension>) {
         let boxed: Box<&mut dyn ExtensionRuntime> = Box::new(self);
         extension.initialize(boxed);
