@@ -27,7 +27,7 @@ use crate::get_dependent_table_names;
 use crate::object_store_registry::default_runtime_env;
 use arrow::datatypes::Schema;
 use arrow_tools::schema::verify_schema;
-use cache::{to_cached_record_batch_stream, QueryResultCacheProvider};
+use cache::{to_cached_record_batch_stream, QueryResult, QueryResultCacheProvider};
 use datafusion::catalog::schema::SchemaProvider;
 use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider};
 use datafusion::datasource::{TableProvider, ViewTable};
@@ -267,7 +267,7 @@ impl DataFusion {
         &self,
         sql: &str,
         restricted_sql_options: Option<SQLOptions>,
-    ) -> Result<SendableRecordBatchStream> {
+    ) -> Result<QueryResult> {
         let session = self.ctx.state();
         let plan = session
             .create_logical_plan(sql)
@@ -280,14 +280,16 @@ impl DataFusion {
                 .await
                 .context(FailedToAccessCacheSnafu)?
             {
-                return Ok(Box::pin(
+                let record_batch_stream = Box::pin(
                     MemoryStream::try_new(
                         cached_result.records.to_vec(),
                         cached_result.schema,
                         None,
                     )
                     .context(UnableToCreateMemoryStreamSnafu)?,
-                ));
+                );
+
+                return Ok(QueryResult::new(record_batch_stream, Some(true)));
             }
         }
 
@@ -317,14 +319,13 @@ impl DataFusion {
         verify_schema(df_schema.fields(), res_schema.fields()).context(SchemaMismatchSnafu)?;
 
         if let Some(cache_provider) = &self.cache_provider {
-            return Ok(to_cached_record_batch_stream(
-                cache_provider.clone(),
-                res_stream,
-                plan_copy,
-            ));
+            let record_batch_stream =
+                to_cached_record_batch_stream(cache_provider.clone(), res_stream, plan_copy);
+
+            return Ok(QueryResult::new(record_batch_stream, Some(false)));
         }
 
-        Ok(res_stream)
+        Ok(QueryResult::new(res_stream, None))
     }
 
     pub fn register_runtime_table(
