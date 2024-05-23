@@ -36,7 +36,7 @@ pub struct SparkConnect {
 
 impl SparkConnect {
     pub async fn from_connection(connection: &str) -> Result<Self, Box<dyn Error + Send + Sync>> {
-        let session = Arc::new(SparkSessionBuilder::remote(connection).build().await?);
+        let session = Arc::new(SparkSessionBuilder::remote(connection)?.build().await?);
         Ok(Self { session })
     }
 }
