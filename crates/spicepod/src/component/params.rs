@@ -52,6 +52,15 @@ impl Params {
             .map(|(k, v)| (k.clone(), v.as_string()))
             .collect()
     }
+
+    #[must_use]
+    pub fn from_string_map(data: HashMap<String, String>) -> Self {
+        let mut params = HashMap::new();
+        for (k, v) in data {
+            params.insert(k, ParamValue::String(v));
+        }
+        Params { data: params }
+    }
 }
 
 impl Serialize for Params {
