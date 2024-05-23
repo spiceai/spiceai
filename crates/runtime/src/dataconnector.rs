@@ -521,23 +521,25 @@ mod tests {
     #[test]
     fn test_get_file_format_and_extension_require_file_format() {
         let (connector, dataset) = setup_connector("test:test/".to_string(), HashMap::new());
-        let result = connector.get_file_format_and_extension(&dataset);
-        assert!(result.is_err());
-        assert_eq!(
-            result.unwrap_err().to_string(),
-            "Invalid configuration for TestConnector. Missing required file_format parameter."
-        );
+
+        match connector.get_file_format_and_extension(&dataset) {
+            Ok(_) => panic!("Unexpected success"),
+            Err(e) => assert_eq!(
+                e.to_string(),
+                "Invalid configuration for TestConnector. Missing required file_format parameter."
+            ),
+        }
     }
 
     #[test]
     fn test_get_file_format_and_extension_detect_csv_extension() {
         let (connector, dataset) = setup_connector("test:test.csv".to_string(), HashMap::new());
-        match connector.get_file_format_and_extension(&dataset) {
-            Ok((file_format, extension)) => {
-                assert_eq!(file_format.file_type(), FileType::CSV);
-                assert_eq!(extension, ".csv");
-            }
-            Err(_) => assert!(false, "Unexpected error"),
+
+        if let Ok((file_format, extension)) = connector.get_file_format_and_extension(&dataset) {
+            assert_eq!(file_format.file_type(), FileType::CSV);
+            assert_eq!(extension, ".csv");
+        } else {
+            panic!("Unexpected error");
         }
     }
 
@@ -545,12 +547,11 @@ mod tests {
     fn test_get_file_format_and_extension_detect_parquet_extension() {
         let (connector, dataset) = setup_connector("test:test.parquet".to_string(), HashMap::new());
 
-        match connector.get_file_format_and_extension(&dataset) {
-            Ok((file_format, extension)) => {
-                assert_eq!(file_format.file_type(), FileType::PARQUET);
-                assert_eq!(extension, ".parquet");
-            }
-            Err(_) => assert!(false, "Unexpected error"),
+        if let Ok((file_format, extension)) = connector.get_file_format_and_extension(&dataset) {
+            assert_eq!(file_format.file_type(), FileType::PARQUET);
+            assert_eq!(extension, ".parquet");
+        } else {
+            panic!("Unexpected error");
         }
     }
 
@@ -560,12 +561,11 @@ mod tests {
         params.insert("file_format".to_string(), "csv".to_string());
         let (connector, dataset) = setup_connector("test:test.parquet".to_string(), params);
 
-        match connector.get_file_format_and_extension(&dataset) {
-            Ok((file_format, extension)) => {
-                assert_eq!(file_format.file_type(), FileType::CSV);
-                assert_eq!(extension, ".csv");
-            }
-            Err(_) => assert!(false, "Unexpected error"),
+        if let Ok((file_format, extension)) = connector.get_file_format_and_extension(&dataset) {
+            assert_eq!(file_format.file_type(), FileType::CSV);
+            assert_eq!(extension, ".csv");
+        } else {
+            panic!("Unexpected error");
         }
     }
 
@@ -575,12 +575,11 @@ mod tests {
         params.insert("file_format".to_string(), "parquet".to_string());
         let (connector, dataset) = setup_connector("test:test.csv".to_string(), params);
 
-        match connector.get_file_format_and_extension(&dataset) {
-            Ok((file_format, extension)) => {
-                assert_eq!(file_format.file_type(), FileType::PARQUET);
-                assert_eq!(extension, ".parquet");
-            }
-            Err(_) => assert!(false, "Unexpected error"),
+        if let Ok((file_format, extension)) = connector.get_file_format_and_extension(&dataset) {
+            assert_eq!(file_format.file_type(), FileType::PARQUET);
+            assert_eq!(extension, ".parquet");
+        } else {
+            panic!("Unexpected error");
         }
     }
 }
