@@ -20,6 +20,10 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+///
+/// Extension trait
+///
+/// This trait is used to define the interface for extensions to the Spice runtime.
 #[async_trait]
 pub trait Extension: Send + Sync {
     fn name(&self) -> &'static str;
@@ -32,6 +36,10 @@ pub trait Extension: Send + Sync {
     async fn on_start(&mut self, runtime: Box<&mut dyn Runtime>) -> Result<()>;
 }
 
+///
+/// Runtime trait
+///
+/// This trait is used to define the extensible interface for the Spice runtime.
 #[async_trait]
 pub trait Runtime: Send + Sync {
     fn datafusion(&self) -> Arc<RwLock<DataFusion>>;
