@@ -14,5 +14,39 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use arrow::array::RecordBatch;
+use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use tracing_subscriber::EnvFilter;
+
+mod docker;
 // Run all tests in the `federation` module
 mod federation;
+
+fn init_tracing(default_level: Option<&str>) {
+    let filter = match (default_level, std::env::var("SPICED_LOG").ok()) {
+        (_, Some(log)) => EnvFilter::new(log),
+        (Some(level), None) => EnvFilter::new(level),
+        _ => EnvFilter::new(
+            "runtime=TRACE,datafusion-federation=TRACE,datafusion-federation-sql=TRACE",
+        ),
+    };
+
+    let subscriber = tracing_subscriber::FmtSubscriber::builder()
+        .with_env_filter(filter)
+        .with_ansi(true)
+        .finish();
+    let _ = tracing::subscriber::set_global_default(subscriber);
+}
+
+async fn get_tpch_lineitem() -> Result<Vec<RecordBatch>, anyhow::Error> {
+    let lineitem_parquet_bytes =
+        reqwest::get("https://public-data.spiceai.org/tpch_lineitem.parquet")
+            .await?
+            .bytes()
+            .await?;
+
+    let parquet_reader =
+        ParquetRecordBatchReaderBuilder::try_new(lineitem_parquet_bytes)?.build()?;
+
+    Ok(parquet_reader.collect::<Result<Vec<_>, arrow::error::ArrowError>>()?)
+}
