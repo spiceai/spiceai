@@ -1842,6 +1842,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "candle-core"
+version = "0.5.1"
+source = "git+https://github.com/EricLBuehler/candle.git?rev=38f8d9e01f8684d4fa4ee171bdde3f1a89f41c54#38f8d9e01f8684d4fa4ee171bdde3f1a89f41c54"
+dependencies = [
+ "byteorder",
+ "gemm",
+ "half",
+ "memmap2",
+ "num-traits",
+ "num_cpus",
+ "rand",
+ "rand_distr",
+ "rayon",
+ "safetensors",
+ "thiserror",
+ "yoke",
+ "zip",
+]
+
+[[package]]
 name = "candle-examples"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5067,7 +5087,7 @@ dependencies = [
  "async-openai",
  "async-trait",
  "candle-core 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "candle-core 0.5.0 (git+https://github.com/EricLBuehler/candle.git)",
+ "candle-core 0.5.1",
  "candle-examples",
  "candle-transformers 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "dirs",
@@ -5373,7 +5393,7 @@ dependencies = [
 [[package]]
 name = "mistralrs"
 version = "0.1.9"
-source = "git+https://github.com/spiceai/mistral.rs#ac5dd0f7f7a4ff1626c1e1be5069bbd6b49fe750"
+source = "git+https://github.com/spiceai/mistral.rs?rev=ac5dd0f7f7a4ff1626c1e1be5069bbd6b49fe750#ac5dd0f7f7a4ff1626c1e1be5069bbd6b49fe750"
 dependencies = [
  "anyhow",
  "candle-core 0.5.0 (git+https://github.com/EricLBuehler/candle.git)",
@@ -5385,7 +5405,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-core"
 version = "0.1.9"
-source = "git+https://github.com/spiceai/mistral.rs#ac5dd0f7f7a4ff1626c1e1be5069bbd6b49fe750"
+source = "git+https://github.com/spiceai/mistral.rs?rev=ac5dd0f7f7a4ff1626c1e1be5069bbd6b49fe750#ac5dd0f7f7a4ff1626c1e1be5069bbd6b49fe750"
 dependencies = [
  "anyhow",
  "async-trait",
