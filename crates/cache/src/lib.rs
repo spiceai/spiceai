@@ -39,8 +39,8 @@ pub enum Error {
     #[snafu(display("Failed to parse cache_max_size value: {source}"))]
     FailedToParseCacheMaxSize { source: byte_unit::ParseError },
 
-    #[snafu(display("Failed to parse item_expire value: {source}"))]
-    FailedToParseItemExpire { source: ParseError },
+    #[snafu(display("Failed to parse item_ttl value: {source}"))]
+    FailedToParseItemTtl { source: ParseError },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -87,11 +87,9 @@ impl QueryResultCacheProvider {
             None => 128 * 1024 * 1024, // 128 MiB
         };
 
-        let ttl = match &config.item_expire {
-            Some(item_expire) => {
-                fundu::parse_duration(item_expire).context(FailedToParseItemExpireSnafu)?
-            }
-            None => fundu::parse_duration("1s").context(FailedToParseItemExpireSnafu)?,
+        let ttl = match &config.item_ttl {
+            Some(item_ttl) => fundu::parse_duration(item_ttl).context(FailedToParseItemTtlSnafu)?,
+            None => fundu::parse_duration("1s").context(FailedToParseItemTtlSnafu)?,
         };
 
         let cache_provider = QueryResultCacheProvider {
