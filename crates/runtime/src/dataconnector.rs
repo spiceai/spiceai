@@ -558,12 +558,27 @@ mod tests {
     fn test_get_file_format_and_extension_csv_from_params() {
         let mut params = HashMap::new();
         params.insert("file_format".to_string(), "csv".to_string());
-        let (connector, dataset) = setup_connector("test:test/".to_string(), params);
+        let (connector, dataset) = setup_connector("test:test.parquet".to_string(), params);
 
         match connector.get_file_format_and_extension(&dataset) {
             Ok((file_format, extension)) => {
                 assert_eq!(file_format.file_type(), FileType::CSV);
                 assert_eq!(extension, ".csv");
+            }
+            Err(_) => assert!(false, "Unexpected error"),
+        }
+    }
+
+    #[test]
+    fn test_get_file_format_and_extension_parquet_from_params() {
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "parquet".to_string());
+        let (connector, dataset) = setup_connector("test:test.csv".to_string(), params);
+
+        match connector.get_file_format_and_extension(&dataset) {
+            Ok((file_format, extension)) => {
+                assert_eq!(file_format.file_type(), FileType::PARQUET);
+                assert_eq!(extension, ".parquet");
             }
             Err(_) => assert!(false, "Unexpected error"),
         }
