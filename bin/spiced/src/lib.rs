@@ -125,7 +125,9 @@ pub async fn run(args: Args) -> Result<()> {
 
     for extension in extensions {
         let rt: Box<&mut dyn ExtensionRuntime> = Box::new(&mut rt);
-        extension.initialize(rt);
+        if let Err(err) = extension.initialize(rt).await {
+            tracing::warn!("Failed to initialize extension: {err}");
+        }
     }
 
     rt.with_pods_watcher(pods_watcher);
@@ -143,7 +145,9 @@ pub async fn run(args: Args) -> Result<()> {
 
     // TODO: iterate over all loaded extensions
     let boxed: Box<&mut dyn ExtensionRuntime> = Box::new(&mut rt);
-    spice_extension.on_start(boxed);
+    if let Err(err) = spice_extension.on_start(boxed).await {
+        tracing::warn!("Failed to start spice extension: {err}");
+    }
 
     if args.spice_cloud_connect {
         if let Err(err) = rt

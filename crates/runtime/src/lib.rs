@@ -28,6 +28,7 @@ use ::datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use ::datafusion::sql::sqlparser::{self, ast};
 use accelerated_table::AcceleratedTable;
 use app::App;
+use async_trait::async_trait;
 use cache::QueryResultCacheProvider;
 use config::Config;
 use llms::nql::Nql;
@@ -880,14 +881,25 @@ impl Runtime {
     }
 }
 
+#[async_trait]
 impl ExtensionRuntime for Runtime {
     fn datafusion(&self) -> Arc<RwLock<DataFusion>> {
         Arc::clone(&self.df)
     }
 
-    fn register_extension(&mut self, extension: Box<&mut dyn Extension>) {
+    fn secrets_provider(&self) -> Arc<RwLock<secrets::SecretsProvider>> {
+        Arc::clone(&self.secrets_provider)
+    }
+
+    async fn register_extension(
+        &mut self,
+        extension: Box<&mut dyn Extension>,
+    ) -> extensions::Result<()> {
         let boxed: Box<&mut dyn ExtensionRuntime> = Box::new(self);
-        extension.initialize(boxed);
+
+        extension.initialize(boxed).await?;
+
+        Ok(())
     }
 }
 
