@@ -16,7 +16,10 @@ limitations under the License.
 
 use std::fmt::Display;
 use std::fmt::Formatter;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
@@ -25,6 +28,7 @@ use byte_unit::Byte;
 use datafusion::logical_expr::LogicalPlan;
 use fundu::ParseError;
 use lru_cache::LruCache;
+use metrics::atomics::AtomicU64;
 use snafu::{ResultExt, Snafu};
 use spicepod::component::runtime::ResultsCache;
 
@@ -57,11 +61,12 @@ pub trait QueryResultCache {
     fn size(&self) -> u64;
     fn item_count(&self) -> u64;
 }
-#[derive(Clone)]
+
 pub struct QueryResultCacheProvider {
     cache: Arc<dyn QueryResultCache + Send + Sync>,
     cache_max_size: u64,
     ttl: std::time::Duration,
+    metrics_reported_last_time: AtomicU64,
 }
 
 impl QueryResultCacheProvider {
@@ -80,13 +85,14 @@ impl QueryResultCacheProvider {
             Some(item_expire) => {
                 fundu::parse_duration(item_expire).context(FailedToParseItemExpireSnafu)?
             }
-            None => fundu::parse_duration("1s").context(FailedToParseItemExpireSnafu)?,
+            None => std::time::Duration::from_secs(1),
         };
 
         let cache_provider = QueryResultCacheProvider {
             cache: Arc::new(LruCache::new(cache_max_size, ttl)),
             cache_max_size,
             ttl,
+            metrics_reported_last_time: AtomicU64::new(0),
         };
 
         Ok(cache_provider)
@@ -112,15 +118,23 @@ impl QueryResultCacheProvider {
     /// Will return `Err` if method fails to access the cache
     pub async fn put(&self, plan: &LogicalPlan, result: CachedQueryResult) -> Result<()> {
         let res = self.cache.put(plan, result).await;
-
-        #[allow(clippy::cast_precision_loss)]
-        metrics::gauge!("results_cache_max_size").set(self.max_size() as f64);
-        #[allow(clippy::cast_precision_loss)]
-        metrics::gauge!("results_cache_size").set(self.size() as f64);
-        #[allow(clippy::cast_precision_loss)]
-        metrics::gauge!("results_cache_item_count").set(self.item_count() as f64);
-
+        self.report_size_metrics();
         res
+    }
+
+    fn report_size_metrics(&self) {
+        let now_seconds = current_time_secs();
+
+        if now_seconds - self.metrics_reported_last_time.load(Ordering::Relaxed) >= 5 {
+            self.metrics_reported_last_time
+                .store(now_seconds, Ordering::Relaxed);
+            #[allow(clippy::cast_precision_loss)]
+            metrics::gauge!("results_cache_max_size").set(self.max_size() as f64);
+            #[allow(clippy::cast_precision_loss)]
+            metrics::gauge!("results_cache_size").set(self.size() as f64);
+            #[allow(clippy::cast_precision_loss)]
+            metrics::gauge!("results_cache_item_count").set(self.item_count() as f64);
+        }
     }
 
     #[must_use]
@@ -148,4 +162,11 @@ impl Display for QueryResultCacheProvider {
             self.ttl
         )
     }
+}
+
+fn current_time_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
