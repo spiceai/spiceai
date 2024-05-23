@@ -327,16 +327,6 @@ pub trait ListingTableConnector: DataConnector {
         Self: Display,
     {
         let params = self.get_params();
-
-        // try to get file format from dataset path
-        let dataset_path = dataset.path().to_lowercase();
-        if dataset_path.ends_with(".csv") {
-            return Ok((self.get_csv_format(params)?, ".csv".to_string()));
-        }
-        if dataset_path.ends_with(".parquet") {
-            return Ok((Arc::new(ParquetFormat::default()), ".parquet".to_string()));
-        }
-
         let extension = params.get("file_extension").cloned();
 
         match params.get("file_format").map(String::as_str) {
@@ -353,11 +343,28 @@ pub trait ListingTableConnector: DataConnector {
                 message: format!("Unsupported file format '{format}'. Use csv or parquet."),
                 source: "Invalid file format".into(),
             }),
-            None => Err(DataConnectorError::InvalidConfiguration {
-                dataconnector: format!("{self}"),
-                message: "Missing required file_format parameter.".to_string(),
-                source: "Missing file format".into(),
-            }),
+            None => {
+                if let Some(ext) = std::path::Path::new(dataset.path().as_str()).extension() {
+                    if ext.eq_ignore_ascii_case("csv") {
+                        return Ok((
+                            self.get_csv_format(params)?,
+                            extension.unwrap_or(".csv".to_string()),
+                        ));
+                    }
+                    if ext.eq_ignore_ascii_case("parquet") {
+                        return Ok((
+                            Arc::new(ParquetFormat::default()),
+                            extension.unwrap_or(".parquet".to_string()),
+                        ));
+                    }
+                }
+
+                Err(DataConnectorError::InvalidConfiguration {
+                    dataconnector: format!("{self}"),
+                    message: "Missing required file_format parameter.".to_string(),
+                    source: "Missing file format".into(),
+                })
+            }
         }
     }
 
@@ -452,5 +459,113 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
             })?;
 
         Ok(Arc::new(table))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use datafusion::common::FileType;
+
+    use super::*;
+
+    struct TestConnector {
+        params: HashMap<String, String>,
+    }
+
+    impl std::fmt::Display for TestConnector {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "TestConnector")
+        }
+    }
+
+    impl DataConnectorFactory for TestConnector {
+        fn create(
+            _secret: Option<Secret>,
+            params: Arc<Option<HashMap<String, String>>>,
+        ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+            Box::pin(async move {
+                let connector = Self {
+                    params: params.as_ref().clone().map_or_else(HashMap::new, |x| x),
+                };
+                Ok(Arc::new(connector) as Arc<dyn DataConnector>)
+            })
+        }
+    }
+
+    impl ListingTableConnector for TestConnector {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn get_params(&self) -> &HashMap<String, String> {
+            &self.params
+        }
+
+        fn get_object_store_url(&self, _dataset: &Dataset) -> DataConnectorResult<Url> {
+            Url::parse("test")
+                .boxed()
+                .context(super::InvalidConfigurationSnafu {
+                    dataconnector: format!("{self}"),
+                    message: "Invalid URL".to_string(),
+                })
+        }
+    }
+
+    fn setup_connector(path: String, params: HashMap<String, String>) -> (TestConnector, Dataset) {
+        let connector = TestConnector { params };
+        let dataset = Dataset::new(path, "test".to_string());
+
+        (connector, dataset)
+    }
+
+    #[test]
+    fn test_get_file_format_and_extension_require_file_format() {
+        let (connector, dataset) = setup_connector("test:test/".to_string(), HashMap::new());
+        let result = connector.get_file_format_and_extension(&dataset);
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "Invalid configuration for TestConnector. Missing required file_format parameter."
+        );
+    }
+
+    #[test]
+    fn test_get_file_format_and_extension_detect_csv_extension() {
+        let (connector, dataset) = setup_connector("test:test.csv".to_string(), HashMap::new());
+        match connector.get_file_format_and_extension(&dataset) {
+            Ok((file_format, extension)) => {
+                assert_eq!(file_format.file_type(), FileType::CSV);
+                assert_eq!(extension, ".csv");
+            }
+            Err(_) => assert!(false, "Unexpected error"),
+        }
+    }
+
+    #[test]
+    fn test_get_file_format_and_extension_detect_parquet_extension() {
+        let (connector, dataset) = setup_connector("test:test.parquet".to_string(), HashMap::new());
+
+        match connector.get_file_format_and_extension(&dataset) {
+            Ok((file_format, extension)) => {
+                assert_eq!(file_format.file_type(), FileType::PARQUET);
+                assert_eq!(extension, ".parquet");
+            }
+            Err(_) => assert!(false, "Unexpected error"),
+        }
+    }
+
+    #[test]
+    fn test_get_file_format_and_extension_csv_from_params() {
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "csv".to_string());
+        let (connector, dataset) = setup_connector("test:test/".to_string(), params);
+
+        match connector.get_file_format_and_extension(&dataset) {
+            Ok((file_format, extension)) => {
+                assert_eq!(file_format.file_type(), FileType::CSV);
+                assert_eq!(extension, ".csv");
+            }
+            Err(_) => assert!(false, "Unexpected error"),
+        }
     }
 }
