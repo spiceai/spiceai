@@ -95,17 +95,27 @@ pub fn create_hf_model(
         });
     };
 
-    mistral::MistralLlama::from_hf(
-        model_id,
-        &model_type.unwrap_or_default(),
-        // TODO: Support HF models with non-standard paths.
-        // model_weights,
-        // tokenizer,
-        // template_filename,
-    )
-    .map(|x| Box::new(x) as Box<dyn Nql>)
+    #[cfg(feature = "mistralrs")]
+    {
+        mistral::MistralLlama::from_hf(
+            model_id,
+            &model_type.unwrap_or_default(),
+            // TODO: Support HF models with non-standard paths.
+            // model_weights,
+            // tokenizer,
+            // template_filename,
+        )
+        .map(|x| Box::new(x) as Box<dyn Nql>)
+    }
+    #[cfg(not(feature = "mistralrs"))]
+    {
+        Err(Error::FailedToRunModel {
+            source: "No NQL model feature enabled".into(),
+        })
+    }
 }
 
+#[allow(unused_variables)]
 pub fn create_local_model(
     model_weights: &str,
     tokenizer: &str,
