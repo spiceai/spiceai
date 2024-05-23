@@ -58,7 +58,7 @@ pub struct CachedQueryResult {
 pub trait QueryResultCache {
     async fn get(&self, plan: &LogicalPlan) -> Result<Option<CachedQueryResult>>;
     async fn put(&self, plan: &LogicalPlan, result: CachedQueryResult) -> Result<()>;
-    fn size(&self) -> u64;
+    fn size_bytes(&self) -> u64;
     fn item_count(&self) -> u64;
 }
 
@@ -92,6 +92,9 @@ impl QueryResultCacheProvider {
             ttl,
             metrics_reported_last_time: AtomicU64::new(0),
         };
+
+        #[allow(clippy::cast_precision_loss)]
+        metrics::gauge!("results_cache_max_size").set(cache_max_size as f64);
 
         Ok(cache_provider)
     }
@@ -127,8 +130,6 @@ impl QueryResultCacheProvider {
             self.metrics_reported_last_time
                 .store(now_seconds, Ordering::Relaxed);
             #[allow(clippy::cast_precision_loss)]
-            metrics::gauge!("results_cache_max_size").set(self.max_size() as f64);
-            #[allow(clippy::cast_precision_loss)]
             metrics::gauge!("results_cache_size").set(self.size() as f64);
             #[allow(clippy::cast_precision_loss)]
             metrics::gauge!("results_cache_item_count").set(self.item_count() as f64);
@@ -142,7 +143,7 @@ impl QueryResultCacheProvider {
 
     #[must_use]
     pub fn size(&self) -> u64 {
-        self.cache.size()
+        self.cache.size_bytes()
     }
 
     #[must_use]

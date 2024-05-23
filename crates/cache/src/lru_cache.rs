@@ -76,7 +76,7 @@ impl QueryResultCache for LruCache {
         Ok(())
     }
 
-    fn size(&self) -> u64 {
+    fn size_bytes(&self) -> u64 {
         self.cache.weighted_size()
     }
 
