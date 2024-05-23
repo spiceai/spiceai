@@ -28,7 +28,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::{collections::HashMap, future::Future};
 
-use super::{DataConnector, DataConnectorFactory};
+use super::{DataConnector, DataConnectorError, DataConnectorFactory};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -88,8 +88,24 @@ impl DataConnectorFactory for Spark {
         params: Arc<Option<HashMap<String, String>>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let spark_connector = Spark::new(Arc::new(secret), params).await?;
-            Ok(Arc::new(spark_connector) as Arc<dyn DataConnector>)
+            match Spark::new(Arc::new(secret), params).await {
+                Ok(spark_connector) => Ok(Arc::new(spark_connector) as Arc<dyn DataConnector>),
+                Err(e) => match e {
+                    Error::UnableToConstructSparkConnect { source } => {
+                        Err(DataConnectorError::UnableToConnectInternal {
+                            dataconnector: "spark".to_string(),
+                            source,
+                        }
+                        .into())
+                    }
+                    _ => Err(DataConnectorError::InvalidConfiguration {
+                        dataconnector: "spark".to_string(),
+                        message: e.to_string(),
+                        source: e.into(),
+                    }
+                    .into()),
+                },
+            }
         })
     }
 }
