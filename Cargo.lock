@@ -1823,26 +1823,6 @@ dependencies = [
 
 [[package]]
 name = "candle-core"
-version = "0.5.0"
-source = "git+https://github.com/EricLBuehler/candle.git#997a57c4d871c9ae1e6b955599dea81963b6c961"
-dependencies = [
- "byteorder",
- "gemm",
- "half",
- "memmap2",
- "num-traits",
- "num_cpus",
- "rand",
- "rand_distr",
- "rayon",
- "safetensors",
- "thiserror",
- "yoke",
- "zip",
-]
-
-[[package]]
-name = "candle-core"
 version = "0.5.1"
 source = "git+https://github.com/spiceai/candle.git?rev=38f8d9e01f8684d4fa4ee171bdde3f1a89f41c54#38f8d9e01f8684d4fa4ee171bdde3f1a89f41c54"
 dependencies = [
@@ -1868,9 +1848,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a507379a0e4ff9958e49af5550a7eb4e19e901ea176c18aaa532214102224095"
 dependencies = [
  "anyhow",
- "candle-core 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "candle-nn 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "candle-transformers 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "candle-core 0.5.0",
+ "candle-nn 0.5.0",
+ "candle-transformers 0.5.0",
  "csv",
  "hf-hub",
  "image",
@@ -1888,21 +1868,7 @@ version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8d439382fc4a8c4e080e29b39c94f8d7d5101e22096aba415a47c7e77b0229cd"
 dependencies = [
- "candle-core 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "half",
- "num-traits",
- "rayon",
- "safetensors",
- "serde",
- "thiserror",
-]
-
-[[package]]
-name = "candle-nn"
-version = "0.5.0"
-source = "git+https://github.com/EricLBuehler/candle.git#997a57c4d871c9ae1e6b955599dea81963b6c961"
-dependencies = [
- "candle-core 0.5.0 (git+https://github.com/EricLBuehler/candle.git)",
+ "candle-core 0.5.0",
  "half",
  "num-traits",
  "rayon",
@@ -1932,8 +1898,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c32601526f2b28bd9141a63c81b4bf4fd8b3d9b087604fe6dec1e8326b7bf2d4"
 dependencies = [
  "byteorder",
- "candle-core 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "candle-nn 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "candle-core 0.5.0",
+ "candle-nn 0.5.0",
  "fancy-regex",
  "num-traits",
  "rand",
@@ -1946,12 +1912,12 @@ dependencies = [
 
 [[package]]
 name = "candle-transformers"
-version = "0.5.0"
-source = "git+https://github.com/EricLBuehler/candle.git#997a57c4d871c9ae1e6b955599dea81963b6c961"
+version = "0.5.1"
+source = "git+https://github.com/spiceai/candle.git?rev=38f8d9e01f8684d4fa4ee171bdde3f1a89f41c54#38f8d9e01f8684d4fa4ee171bdde3f1a89f41c54"
 dependencies = [
  "byteorder",
- "candle-core 0.5.0 (git+https://github.com/EricLBuehler/candle.git)",
- "candle-nn 0.5.0 (git+https://github.com/EricLBuehler/candle.git)",
+ "candle-core 0.5.1",
+ "candle-nn 0.5.1",
  "fancy-regex",
  "num-traits",
  "rand",
@@ -5100,10 +5066,10 @@ version = "0.13.1-alpha"
 dependencies = [
  "async-openai",
  "async-trait",
- "candle-core 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "candle-core 0.5.0",
  "candle-core 0.5.1",
  "candle-examples",
- "candle-transformers 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "candle-transformers 0.5.0",
  "dirs",
  "mistralrs",
  "mistralrs-core",
@@ -5407,7 +5373,7 @@ dependencies = [
 [[package]]
 name = "mistralrs"
 version = "0.1.10"
-source = "git+https://github.com/spiceai/mistral.rs?rev=3703d6ab6beb0420ebb51dec8ed6947276f7e561#3703d6ab6beb0420ebb51dec8ed6947276f7e561"
+source = "git+https://github.com/spiceai/mistral.rs?rev=243bbd5c765a22a11b0270c83664c9060a30caf8#243bbd5c765a22a11b0270c83664c9060a30caf8"
 dependencies = [
  "anyhow",
  "candle-core 0.5.1",
@@ -5419,14 +5385,14 @@ dependencies = [
 [[package]]
 name = "mistralrs-core"
 version = "0.1.10"
-source = "git+https://github.com/spiceai/mistral.rs?rev=3703d6ab6beb0420ebb51dec8ed6947276f7e561#3703d6ab6beb0420ebb51dec8ed6947276f7e561"
+source = "git+https://github.com/spiceai/mistral.rs?rev=243bbd5c765a22a11b0270c83664c9060a30caf8#243bbd5c765a22a11b0270c83664c9060a30caf8"
 dependencies = [
  "anyhow",
  "async-trait",
  "bytemuck",
  "candle-core 0.5.1",
  "candle-nn 0.5.1",
- "candle-transformers 0.5.0 (git+https://github.com/EricLBuehler/candle.git)",
+ "candle-transformers 0.5.1",
  "cfgrammar",
  "chrono",
  "clap",
