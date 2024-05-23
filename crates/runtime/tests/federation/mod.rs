@@ -1,3 +1,19 @@
+/*
+Copyright 2024 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 use std::sync::Arc;
 
 use app::AppBuilder;
@@ -6,23 +22,11 @@ use datafusion::assert_batches_eq;
 use runtime::{datafusion::DataFusion, Runtime};
 use spicepod::component::{dataset::Dataset, secrets::SpiceSecretStore};
 use tokio::sync::RwLock;
-use tracing_subscriber::EnvFilter;
 
-fn init_tracing(default_level: Option<&str>) {
-    let filter = match (default_level, std::env::var("SPICED_LOG").ok()) {
-        (_, Some(log)) => EnvFilter::new(log),
-        (Some(level), None) => EnvFilter::new(level),
-        _ => EnvFilter::new(
-            "runtime=TRACE,datafusion-federation=TRACE,datafusion-federation-sql=TRACE",
-        ),
-    };
+use crate::init_tracing;
 
-    let subscriber = tracing_subscriber::FmtSubscriber::builder()
-        .with_env_filter(filter)
-        .with_ansi(true)
-        .finish();
-    let _ = tracing::subscriber::set_global_default(subscriber);
-}
+#[cfg(feature = "mysql")]
+mod mysql;
 
 fn make_spiceai_dataset(path: &str, name: &str) -> Dataset {
     Dataset::new(format!("spiceai:{path}"), name.to_string())

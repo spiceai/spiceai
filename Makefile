@@ -35,7 +35,7 @@ nextest:
 
 .PHONY: test-integration
 test-integration:
-	@cargo test -p runtime --test integration -- --nocapture
+	@cargo test -p runtime --test integration --features mysql -- --nocapture
 
 .PHONY: lint
 lint:
