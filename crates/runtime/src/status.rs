@@ -50,3 +50,8 @@ pub fn update_model(model_name: &str, status: ComponentStatus) {
     let model_name = model_name.to_string();
     gauge!("model/status", "model" => model_name).set(f64::from(status as u32));
 }
+
+pub fn update_llm(model_name: &str, status: ComponentStatus) {
+    let model_name = model_name.to_string();
+    gauge!("llm/status", "model" => model_name).set(f64::from(status as u32));
+}
