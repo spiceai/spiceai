@@ -18,7 +18,8 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct Runtime {
-    pub results_cache: Option<ResultsCache>,
+    #[serde(default)]
+    pub results_cache: ResultsCache,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -31,4 +32,14 @@ pub struct ResultsCache {
 
 const fn default_true() -> bool {
     true
+}
+
+impl Default for ResultsCache {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            cache_max_size: None,
+            item_expire: None,
+        }
+    }
 }
