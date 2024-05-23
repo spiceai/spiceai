@@ -186,7 +186,7 @@ pub enum Table {
 pub struct DataFusion {
     pub ctx: Arc<SessionContext>,
     data_writers: HashSet<String>,
-    cache_provider: Option<QueryResultCacheProvider>,
+    cache_provider: Option<Arc<QueryResultCacheProvider>>,
 }
 
 impl DataFusion {
@@ -259,7 +259,7 @@ impl DataFusion {
         None
     }
 
-    pub fn set_cache_provider(&mut self, cache_provider: Option<QueryResultCacheProvider>) {
+    pub fn set_cache_provider(&mut self, cache_provider: Option<Arc<QueryResultCacheProvider>>) {
         self.cache_provider = cache_provider;
     }
 
@@ -320,7 +320,7 @@ impl DataFusion {
 
         if let Some(cache_provider) = &self.cache_provider {
             let record_batch_stream =
-                to_cached_record_batch_stream(cache_provider.clone(), res_stream, plan_copy);
+                to_cached_record_batch_stream(Arc::clone(cache_provider), res_stream, plan_copy);
 
             return Ok(QueryResult::new(record_batch_stream, Some(false)));
         }

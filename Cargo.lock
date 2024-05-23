@@ -1779,6 +1779,7 @@ dependencies = [
  "datafusion",
  "fundu",
  "futures",
+ "metrics",
  "moka",
  "snafu 0.8.2",
  "spicepod",
