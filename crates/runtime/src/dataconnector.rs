@@ -319,11 +319,24 @@ pub trait ListingTableConnector: DataConnector {
 
     fn get_params(&self) -> &HashMap<String, String>;
 
-    fn get_file_format_and_extension(&self) -> DataConnectorResult<(Arc<dyn FileFormat>, String)>
+    fn get_file_format_and_extension(
+        &self,
+        dataset: &Dataset,
+    ) -> DataConnectorResult<(Arc<dyn FileFormat>, String)>
     where
         Self: Display,
     {
         let params = self.get_params();
+
+        // try to get file format from dataset path
+        let dataset_path = dataset.path().to_lowercase();
+        if dataset_path.ends_with(".csv") {
+            return Ok((self.get_csv_format(params)?, ".csv".to_string()));
+        }
+        if dataset_path.ends_with(".parquet") {
+            return Ok((Arc::new(ParquetFormat::default()), ".parquet".to_string()));
+        }
+
         let extension = params.get("file_extension").cloned();
 
         match params.get("file_format").map(String::as_str) {
@@ -415,7 +428,7 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
             code: "LTC-RP-LTUP".to_string(), // ListingTableConnector-ReadProvider-ListingTableUrlParse
         })?;
 
-        let (file_format, extension) = self.get_file_format_and_extension()?;
+        let (file_format, extension) = self.get_file_format_and_extension(dataset)?;
         let options = ListingOptions::new(file_format).with_file_extension(&extension);
 
         let resolved_schema = options
