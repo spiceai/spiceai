@@ -86,7 +86,14 @@ impl MistralLlama {
             String::new(),
         )
         .build()
-        .load_model_from_path(&paths, None, device, false, DeviceMapMetadata::dummy(), None)
+        .load_model_from_path(
+            &paths,
+            None,
+            device,
+            false,
+            DeviceMapMetadata::dummy(),
+            None,
+        )
         .map_err(|e| NqlError::FailedToLoadModel { source: e.into() })
     }
 
@@ -105,7 +112,14 @@ impl MistralLlama {
             model_id.to_string(),
         )
         .build()
-        .load_model_from_path(&paths, None, device, false, DeviceMapMetadata::dummy(), None)
+        .load_model_from_path(
+            &paths,
+            None,
+            device,
+            false,
+            DeviceMapMetadata::dummy(),
+            None,
+        )
         .map_err(|e| NqlError::FailedToLoadModel { source: e.into() })
     }
 
@@ -117,8 +131,12 @@ impl MistralLlama {
         let paths = Self::create_paths(tokenizer, model_weights, template_filename);
         let model_id = model_weights
             .file_name()
-            .and_then(|x| x.to_str()).map_or_else(|| model_weights.to_string_lossy().to_string(), std::string::ToString::to_string);
-        
+            .and_then(|x| x.to_str())
+            .map_or_else(
+                || model_weights.to_string_lossy().to_string(),
+                std::string::ToString::to_string,
+            );
+
         let device = Self::get_device();
 
         let pipeline = Self::load_gguf_pipeline(paths, &device, tokenizer, &model_id)?;
@@ -146,11 +164,6 @@ impl MistralLlama {
 
     pub fn from_hf(model_id: &str, arch: &str) -> Result<Self> {
         let model_parts: Vec<&str> = model_id.split(':').collect();
-        if model_parts.len() != 2 {
-            return Err(NqlError::FailedToLoadModel {
-                source: format!("Invalid model id: {model_id}").into(),
-            });
-        }
 
         let loader_type = mistralrs::NormalLoaderType::from_str(arch).map_err(|_| {
             NqlError::FailedToLoadModel {
@@ -171,7 +184,7 @@ impl MistralLlama {
         let pipeline = builder
             .build(loader_type)
             .load_model_from_hf(
-                Some(model_parts[1].to_string()),
+                model_parts.get(1).map(|&x| x.to_string()),
                 TokenSource::CacheToken,
                 None,
                 &Device::Cpu,

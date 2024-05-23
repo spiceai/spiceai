@@ -60,8 +60,10 @@ pub fn try_to_nql(component: &spicepod::component::llms::Llm) -> Result<Box<dyn 
         .into(),
     })?;
 
+    let model_id = component.get_model_id();
+
     match construct_llm_params(&prefix, &(component.params).clone().unwrap_or_default()) {
-        Ok(LlmParams::OpenAiParams { model }) => Ok(llms::nql::create_openai(model)),
+        Ok(LlmParams::OpenAiParams {}) => Ok(llms::nql::create_openai(model_id)),
         Ok(LlmParams::LocalModelParams {
             weights,
             tokenizer,
@@ -155,7 +157,7 @@ fn construct_llm_params(
             chat_template: params.get("chat_template").cloned(),
         }),
         LlmPrefix::OpenAi => Ok(LlmParams::OpenAiParams {
-            model: params.get("model").cloned(),
+            // model: params.get("model").cloned(),
         }),
     }
 }

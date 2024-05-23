@@ -57,7 +57,7 @@ impl Llm {
         match self.get_prefix() {
             Some(p) => self
                 .from
-                .strip_prefix(&p.to_string())
+                .strip_prefix(&format!("{p}/"))
                 .map(ToString::to_string),
             None => None,
         }
@@ -120,7 +120,7 @@ pub enum LlmParams {
         chat_template: String,
     },
     OpenAiParams {
-        model: Option<String>,
+        // model: Option<String>,
     },
     None,
 }
