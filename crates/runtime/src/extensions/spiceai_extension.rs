@@ -12,6 +12,12 @@ pub struct SpiceExtension {
     datafusion: Arc<RwLock<DataFusion>>,
 }
 
+impl SpiceExtension {
+    pub fn new(datafusion: Arc<RwLock<DataFusion>>) -> Self {
+        SpiceExtension { datafusion }
+    }
+}
+
 impl Extension for SpiceExtension {
     fn name(&self) -> &'static str {
         "spiceai"
@@ -39,7 +45,7 @@ pub struct SpiceMetricsConnector {}
 
 #[async_trait]
 impl MetricsConnector for SpiceMetricsConnector {
-    async fn write_metrics(&self, record_batch: RecordBatch) -> Result<(), Whatever> {
+    async fn write_metrics(&self, _record_batch: RecordBatch) -> Result<(), Whatever> {
         // - write metrics to Spiceai
         Ok(())
     }

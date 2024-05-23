@@ -26,6 +26,7 @@ use clap::Parser;
 use flightrepl::ReplConfig;
 use runtime::config::Config as RuntimeConfig;
 
+use runtime::extensions::spiceai_extension::SpiceExtension;
 use runtime::extensions::{Extension, Runtime as ExtensionRuntime};
 use runtime::podswatcher::PodsWatcher;
 use runtime::Runtime;
@@ -110,14 +111,13 @@ pub async fn run(args: Args) -> Result<()> {
         }
     };
 
-    let mut rt: Runtime = Runtime::new(app, df).await;
+    let mut rt: Runtime = Runtime::new(app, df.clone()).await;
 
     let mut extensions: Vec<Box<&mut dyn Extension>> = vec![];
 
     // Built in spiceai extension
-    let mut spice_extension = runtime::extensions::spiceai_extension::SpiceExtension {
-        datafusion: Arc::clone(df),
-    };
+    let mut spice_extension = SpiceExtension::new(df);
+
     let boxed: Box<&mut dyn Extension> = Box::new(&mut spice_extension);
     extensions.push(boxed);
 
