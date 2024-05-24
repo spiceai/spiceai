@@ -994,7 +994,7 @@ pub(crate) mod nsql {
     use std::{sync::Arc, time::SystemTime};
     use tokio::sync::RwLock;
 
-    use crate::{datafusion::DataFusion, http::v1::dataframe_to_response, LLMModelStore};
+    use crate::{datafusion::DataFusion, http::v1::dataframe_to_response, LLMModelStore, query_history::QueryHistory};
 
     fn clean_model_based_sql(input: &str) -> String {
         let no_dashes = match input.strip_prefix("--") {
