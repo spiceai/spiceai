@@ -550,6 +550,8 @@ jobs:
           cat spice.log
 
   test_quickstart_duckdb:
+    env:
+      duckdb_version: v0.10.2
     name: 'Test DuckDB quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
     runs-on: ${{ matrix.target.runner }}
     needs:
@@ -565,14 +567,21 @@ jobs:
 
       - name: Install DuckDB
         if: matrix.target.target_os == 'linux'
-        uses: opt-nc/setup-duckdb-action@v1.0.7
-        with:
-          version: v0.10.2
+        run: |
+          wget https://github.com/duckdb/duckdb/releases/download/${{ env.duckdb_version }}/duckdb_cli-linux-amd64.zip
+          unzip duckdb_cli-linux-amd64.zip
+          chmod +x ./duckdb
+
+      - name: Install DuckDB
+        if: matrix.target.target_os == 'darwin'
+        run: |
+          wget https://github.com/duckdb/duckdb/releases/download/${{ env.duckdb_version }}/duckdb_cli-osx-universal.zip
+          unzip duckdb_cli-osx-universal.zip
+          chmod +x ./duckdb
 
       - name: Generate TPCH database
-        if: matrix.target.target_os == 'linux'
         run: |
-          duckdb -s "INSTALL tpch;LOAD tpch;CALL dbgen(sf = 1);" ./tpch.db
+          ./duckdb -s "INSTALL tpch;LOAD tpch;CALL dbgen(sf = 1);" ./tpch.db
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         if: matrix.target.target_os == 'linux'
@@ -582,18 +591,15 @@ jobs:
           path: ./build
 
       - name: Install Spice
-        if: matrix.target.target_os == 'linux'
         uses: ./.github/actions/install-spice
         with:
           build-path: ./build
 
       - name: Init Spice app
-        if: matrix.target.target_os == 'linux'
         run: |
           spice init duckdb-app
 
       - name: Spice dataset configure
-        if: matrix.target.target_os == 'linux'
         working-directory: duckdb-app
         run: |
           echo -e "tpch_customer\nTPC-H customer table\nduckdb:customer\ny" | spice dataset configure
@@ -602,7 +608,6 @@ jobs:
           cat datasets/tpch_customer/dataset.yaml
 
       - name: Start Spice runtime
-        if: matrix.target.target_os == 'linux'
         working-directory: duckdb-app
         run: |
           spice run &> spice.log &
@@ -610,21 +615,19 @@ jobs:
           sleep 5
 
       - name: Wait for Spice runtime healthy
-        if: matrix.target.target_os == 'linux'
         working-directory: duckdb-app
         timeout-minutes: 1
         run: |
           while [[ "$(curl -s http://localhost:3000/health)" != "ok" ]]; do sleep 1; done
 
       - name: Verify dataset
-        if: matrix.target.target_os == 'linux'
         uses: ./.github/actions/verify-dataset
         with:
           name: tpch_customer
 
       - name: Stop spice and check logs
-        if: matrix.target.target_os == 'linux'
         working-directory: duckdb-app
+        if: always()
         run: |
           killall spice
           cat spice.log
