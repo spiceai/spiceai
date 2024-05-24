@@ -28,7 +28,7 @@ use crate::get_dependent_table_names;
 use crate::object_store_registry::default_runtime_env;
 use arrow::datatypes::Schema;
 use arrow_tools::schema::verify_schema;
-use cache::{to_cached_record_batch_stream, QueryResult, QueryResultCacheProvider};
+use cache::{to_cached_record_batch_stream, QueryResult, QueryResultsCacheProvider};
 use datafusion::catalog::schema::SchemaProvider;
 use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider};
 use datafusion::datasource::{TableProvider, ViewTable};
@@ -186,7 +186,7 @@ pub enum Table {
 pub struct DataFusion {
     pub ctx: Arc<SessionContext>,
     data_writers: HashSet<TableReference>,
-    cache_provider: Option<Arc<QueryResultCacheProvider>>,
+    cache_provider: Option<Arc<QueryResultsCacheProvider>>,
 }
 
 impl DataFusion {
@@ -259,7 +259,7 @@ impl DataFusion {
         None
     }
 
-    pub fn set_cache_provider(&mut self, cache_provider: Option<Arc<QueryResultCacheProvider>>) {
+    pub fn set_cache_provider(&mut self, cache_provider: Option<Arc<QueryResultsCacheProvider>>) {
         self.cache_provider = cache_provider;
     }
 
