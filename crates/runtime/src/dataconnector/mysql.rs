@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::component::dataset::Dataset;
 use async_trait::async_trait;
 use data_components::mysql::MySQLTableFactory;
 use data_components::Read;
@@ -23,7 +24,6 @@ use db_connection_pool::DbConnectionPool;
 use mysql_async::prelude::ToValue;
 use secrets::Secret;
 use snafu::prelude::*;
-use spicepod::component::dataset::Dataset;
 use std::any::Any;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -46,7 +46,7 @@ pub struct MySQL {
 impl DataConnectorFactory for MySQL {
     fn create(
         secret: Option<Secret>,
-        params: Arc<Option<HashMap<String, String>>>,
+        params: Arc<HashMap<String, String>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let pool: Arc<

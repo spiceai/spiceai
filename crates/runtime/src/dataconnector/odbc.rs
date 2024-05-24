@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::component::dataset::Dataset;
 use async_trait::async_trait;
 use data_components::odbc::ODBCTableFactory;
 use data_components::Read;
@@ -22,7 +23,6 @@ use db_connection_pool::dbconnection::odbcconn::ODBCDbConnectionPool;
 use db_connection_pool::odbcpool::ODBCPool;
 use secrets::Secret;
 use snafu::prelude::*;
-use spicepod::component::dataset::Dataset;
 use std::any::Any;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -51,11 +51,11 @@ where
 {
     fn create(
         secret: Option<Secret>,
-        params: Arc<Option<HashMap<String, String>>>,
+        params: Arc<HashMap<String, String>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let pool: Arc<ODBCDbConnectionPool<'a>> = Arc::new(
-                ODBCPool::new(&params, &secret).context(UnableToCreateODBCConnectionPoolSnafu)?,
+                ODBCPool::new(params, &secret).context(UnableToCreateODBCConnectionPoolSnafu)?,
             );
 
             let odbc_factory = ODBCTableFactory::new(pool);

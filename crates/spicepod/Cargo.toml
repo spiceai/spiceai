@@ -13,9 +13,3 @@ serde_yaml.workspace = true
 snafu.workspace = true
 tracing.workspace = true
 fundu.workspace = true
-
-[features]
-duckdb = []
-postgres = []
-sqlite = []
-mysql = []

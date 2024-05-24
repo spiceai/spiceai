@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::component::dataset::Dataset;
 use async_trait::async_trait;
 use data_components::duckdb::DuckDBTableFactory;
 use data_components::Read;
@@ -22,7 +23,6 @@ use db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use duckdb::AccessMode;
 use secrets::Secret;
 use snafu::prelude::*;
-use spicepod::component::dataset::Dataset;
 use std::any::Any;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -48,19 +48,19 @@ pub struct DuckDB {
 impl DataConnectorFactory for DuckDB {
     fn create(
         _secret: Option<Secret>,
-        params: Arc<Option<HashMap<String, String>>>,
+        params: Arc<HashMap<String, String>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let params = params.as_ref().as_ref();
-
             // data connector requires valid "open" parameter
-            let db_path: String = params.and_then(|p| p.get("open").cloned()).ok_or(
-                DataConnectorError::InvalidConfiguration {
-                    dataconnector: "duckdb".to_string(),
-                    message: "Missing required open parameter.".to_string(),
-                    source: "Missing open".into(),
-                },
-            )?;
+            let db_path: String =
+                params
+                    .get("open")
+                    .cloned()
+                    .ok_or(DataConnectorError::InvalidConfiguration {
+                        dataconnector: "duckdb".to_string(),
+                        message: "Missing required open parameter.".to_string(),
+                        source: "Missing open".into(),
+                    })?;
 
             // TODO: wire to dataset.mode once readwrite implemented for duckdb
             let pool = Arc::new(

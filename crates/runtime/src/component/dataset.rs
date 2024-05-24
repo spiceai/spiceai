@@ -14,12 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{fs, time::Duration};
-
-use serde::{Deserialize, Serialize};
-
-use super::{params::Params, WithDependsOn};
 use snafu::prelude::*;
+use spicepod::component::{dataset as spicepod_dataset, params::Params};
+use std::{collections::HashMap, fs, time::Duration};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -28,33 +25,42 @@ pub enum Error {
         file: String,
         source: std::io::Error,
     },
-    // #[snafu(display(
-    //     "Dataset names should not include a catalog. Unexpected '{}' in '{}'. Remove '{}' from the dataset name and try again.",
-    //     catalog,
-    //     name,
-    //     catalog,
-    // ))]
-    // DatasetNameIncludesCatalog { catalog: Arc<str>, name: Arc<str> },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum Mode {
     #[default]
     Read,
     ReadWrite,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-#[serde(rename_all = "snake_case")]
+impl From<spicepod_dataset::Mode> for Mode {
+    fn from(mode: spicepod_dataset::Mode) -> Self {
+        match mode {
+            spicepod_dataset::Mode::Read => Mode::Read,
+            spicepod_dataset::Mode::ReadWrite => Mode::ReadWrite,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum TimeFormat {
     #[default]
     UnixSeconds,
     UnixMillis,
-    #[serde(rename = "ISO8601")]
     ISO8601,
+}
+
+impl From<spicepod_dataset::TimeFormat> for TimeFormat {
+    fn from(time_format: spicepod_dataset::TimeFormat) -> Self {
+        match time_format {
+            spicepod_dataset::TimeFormat::UnixSeconds => TimeFormat::UnixSeconds,
+            spicepod_dataset::TimeFormat::UnixMillis => TimeFormat::UnixMillis,
+            spicepod_dataset::TimeFormat::ISO8601 => TimeFormat::ISO8601,
+        }
+    }
 }
 
 impl std::fmt::Display for TimeFormat {
@@ -63,68 +69,64 @@ impl std::fmt::Display for TimeFormat {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Dataset {
-    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub from: String,
-
     pub name: String,
-
-    #[serde(default)]
     pub mode: Mode,
-
     /// Inline SQL that describes a view.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sql: Option<String>,
-
+    sql: Option<String>,
     /// Reference to a SQL file that describes a view.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sql_ref: Option<String>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub params: Option<Params>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sql_ref: Option<String>,
+    pub params: HashMap<String, String>,
     pub replication: Option<replication::Replication>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub time_column: Option<String>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub time_format: Option<TimeFormat>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acceleration: Option<acceleration::Acceleration>,
+}
 
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    #[serde(rename = "dependsOn", default)]
-    pub depends_on: Vec<String>,
+impl TryFrom<spicepod_dataset::Dataset> for Dataset {
+    type Error = crate::Error;
+
+    fn try_from(dataset: spicepod_dataset::Dataset) -> Result<Self, Self::Error> {
+        let acceleration = dataset
+            .acceleration
+            .map(acceleration::Acceleration::try_from)
+            .transpose()?;
+
+        Ok(Dataset {
+            from: dataset.from,
+            name: dataset.name,
+            mode: Mode::from(dataset.mode),
+            sql: dataset.sql,
+            sql_ref: dataset.sql_ref,
+            params: dataset
+                .params
+                .as_ref()
+                .map(Params::as_string_map)
+                .unwrap_or_default(),
+            replication: dataset.replication.map(replication::Replication::from),
+            time_column: dataset.time_column,
+            time_format: dataset.time_format.map(TimeFormat::from),
+            acceleration,
+        })
+    }
 }
 
 impl Dataset {
     #[must_use]
     pub fn new(from: String, name: String) -> Self {
-        // let name = name.into();
-        // let name = match TableReference::parse_str(&name) {
-        //     table_ref @ (TableReference::Bare { .. } | TableReference::Partial { .. }) => table_ref,
-        //     TableReference::Full { catalog, .. } => DatasetNameIncludesCatalogSnafu {
-        //         catalog,
-        //         name: Arc::clone(&name),
-        //     }
-        //     .fail()?,
-        // };
         Dataset {
             from,
             name,
             mode: Mode::default(),
             sql: None,
             sql_ref: None,
-            params: None,
+            params: HashMap::default(),
             replication: None,
             time_column: None,
             time_format: None,
             acceleration: None,
-            depends_on: Vec::default(),
         }
     }
 
@@ -133,7 +135,7 @@ impl Dataset {
     /// # Examples
     ///
     /// ```
-    /// use spicepod::component::dataset::Dataset;
+    /// use runtime::component::dataset::Dataset;
     ///
     /// let dataset = Dataset::new("foo:bar".to_string(), "bar".to_string());
     ///
@@ -141,7 +143,7 @@ impl Dataset {
     /// ```
     ///
     /// ```
-    /// use spicepod::component::dataset::Dataset;
+    /// use runtime::component::dataset::Dataset;
     ///
     /// let dataset = Dataset::new("foo".to_string(), "bar".to_string());
     ///
@@ -165,7 +167,7 @@ impl Dataset {
     /// # Examples
     ///
     /// ```
-    /// use spicepod::component::dataset::Dataset;
+    /// use crate::component::dataset::Dataset;
     ///
     /// let dataset = Dataset::new("foo:bar".to_string(), "bar".to_string());
     ///
@@ -173,7 +175,7 @@ impl Dataset {
     /// ```
     ///
     /// ```
-    /// use spicepod::component::dataset::Dataset;
+    /// use crate::component::dataset::Dataset;
     ///
     /// let dataset = Dataset::new("foo".to_string(), "bar".to_string());
     ///
@@ -301,7 +303,7 @@ impl Dataset {
 
     #[must_use]
     pub fn mode(&self) -> Mode {
-        self.mode.clone()
+        self.mode
     }
 
     #[must_use]
@@ -323,44 +325,40 @@ impl Dataset {
     }
 }
 
-impl WithDependsOn<Dataset> for Dataset {
-    fn depends_on(&self, depends_on: &[String]) -> Dataset {
-        Dataset {
-            from: self.from.clone(),
-            name: self.name.clone(),
-            mode: self.mode.clone(),
-            sql: self.sql.clone(),
-            sql_ref: self.sql_ref.clone(),
-            params: self.params.clone(),
-            replication: self.replication.clone(),
-            time_column: self.time_column.clone(),
-            time_format: self.time_format.clone(),
-            acceleration: self.acceleration.clone(),
-            depends_on: depends_on.to_vec(),
-        }
-    }
-}
-
 pub mod acceleration {
-    use serde::{Deserialize, Serialize};
-    use std::{fmt::Display, sync::Arc};
+    use spicepod::component::{dataset::acceleration as spicepod_acceleration, params::Params};
+    use std::{collections::HashMap, fmt::Display};
 
-    use crate::component::params::Params;
-
-    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-    #[serde(rename_all = "lowercase")]
+    #[derive(Debug, Clone, PartialEq, Default)]
     pub enum RefreshMode {
         #[default]
         Full,
         Append,
     }
 
-    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-    #[serde(rename_all = "lowercase")]
+    impl From<spicepod_acceleration::RefreshMode> for RefreshMode {
+        fn from(refresh_mode: spicepod_acceleration::RefreshMode) -> Self {
+            match refresh_mode {
+                spicepod_acceleration::RefreshMode::Full => RefreshMode::Full,
+                spicepod_acceleration::RefreshMode::Append => RefreshMode::Append,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Default)]
     pub enum Mode {
         #[default]
         Memory,
         File,
+    }
+
+    impl From<spicepod_acceleration::Mode> for Mode {
+        fn from(mode: spicepod_acceleration::Mode) -> Self {
+            match mode {
+                spicepod_acceleration::Mode::Memory => Mode::Memory,
+                spicepod_acceleration::Mode::File => Mode::File,
+            }
+        }
     }
 
     impl Display for Mode {
@@ -373,14 +371,24 @@ pub mod acceleration {
     }
 
     /// Behavior when a query on an accelerated table returns zero results.
-    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-    #[serde(rename_all = "snake_case")]
+    #[derive(Debug, Clone, PartialEq, Default)]
     pub enum ZeroResultsAction {
         /// Return an empty result set. This is the default.
         #[default]
         ReturnEmpty,
         /// Fallback to querying the source table.
         UseSource,
+    }
+
+    impl From<spicepod_acceleration::ZeroResultsAction> for ZeroResultsAction {
+        fn from(zero_results_action: spicepod_acceleration::ZeroResultsAction) -> Self {
+            match zero_results_action {
+                spicepod_acceleration::ZeroResultsAction::ReturnEmpty => {
+                    ZeroResultsAction::ReturnEmpty
+                }
+                spicepod_acceleration::ZeroResultsAction::UseSource => ZeroResultsAction::UseSource,
+            }
+        }
     }
 
     impl Display for ZeroResultsAction {
@@ -392,69 +400,107 @@ pub mod acceleration {
         }
     }
 
-    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
+    pub enum Engine {
+        #[default]
+        Arrow,
+        DuckDB,
+        Sqlite,
+        PostgreSQL,
+    }
+
+    impl Display for Engine {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Engine::Arrow => write!(f, "arrow"),
+                Engine::DuckDB => write!(f, "duckdb"),
+                Engine::Sqlite => write!(f, "sqlite"),
+                Engine::PostgreSQL => write!(f, "postgres"),
+            }
+        }
+    }
+
+    impl TryFrom<&str> for Engine {
+        type Error = crate::Error;
+
+        fn try_from(engine: &str) -> Result<Self, Self::Error> {
+            match engine.to_lowercase().as_str() {
+                "arrow" => Ok(Engine::Arrow),
+                "duckdb" => Ok(Engine::DuckDB),
+                "sqlite" => Ok(Engine::Sqlite),
+                "postgres" | "postgresql" => Ok(Engine::PostgreSQL),
+                _ => crate::AcceleratorEngineNotAvailableSnafu {
+                    name: engine.to_string(),
+                }
+                .fail(),
+            }
+        }
+    }
+
+    impl TryFrom<String> for Engine {
+        type Error = crate::Error;
+
+        fn try_from(engine: String) -> Result<Self, Self::Error> {
+            Engine::try_from(engine.as_str())
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
     pub struct Acceleration {
-        #[serde(default = "default_true")]
         pub enabled: bool,
 
-        #[serde(default)]
         pub mode: Mode,
 
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub engine: Option<String>,
+        pub engine: Engine,
 
-        #[serde(default)]
         pub refresh_mode: RefreshMode,
 
-        #[serde(default, skip_serializing_if = "Option::is_none")]
         pub refresh_check_interval: Option<String>,
 
-        #[serde(default, skip_serializing_if = "Option::is_none")]
         pub refresh_sql: Option<String>,
 
-        #[serde(default, skip_serializing_if = "Option::is_none")]
         pub refresh_data_window: Option<String>,
 
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub params: Option<Params>,
+        pub params: HashMap<String, String>,
 
-        #[serde(default, skip_serializing_if = "Option::is_none")]
         pub engine_secret: Option<String>,
 
-        #[serde(default, skip_serializing_if = "Option::is_none")]
         pub retention_period: Option<String>,
 
-        #[serde(default, skip_serializing_if = "Option::is_none")]
         pub retention_check_interval: Option<String>,
 
-        #[serde(default, skip_serializing_if = "is_false")]
         pub retention_check_enabled: bool,
 
-        #[serde(default)]
         pub on_zero_results: ZeroResultsAction,
     }
 
-    #[allow(clippy::trivially_copy_pass_by_ref)]
-    fn is_false(b: &bool) -> bool {
-        !b
-    }
+    impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
+        type Error = crate::Error;
 
-    const fn default_true() -> bool {
-        true
-    }
-
-    impl Acceleration {
-        #[must_use]
-        pub fn mode(&self) -> Mode {
-            self.mode.clone()
-        }
-
-        #[must_use]
-        pub fn engine(&self) -> Arc<str> {
-            self.engine
-                .as_ref()
-                .map_or_else(|| "arrow", String::as_str)
-                .into()
+        fn try_from(
+            acceleration: spicepod_acceleration::Acceleration,
+        ) -> Result<Self, Self::Error> {
+            Ok(Acceleration {
+                enabled: acceleration.enabled,
+                mode: Mode::from(acceleration.mode),
+                engine: Engine::try_from(
+                    acceleration.engine.unwrap_or_else(|| "arrow".to_string()),
+                )?,
+                refresh_mode: RefreshMode::from(acceleration.refresh_mode),
+                refresh_check_interval: acceleration.refresh_check_interval,
+                refresh_sql: acceleration.refresh_sql,
+                refresh_data_window: acceleration.refresh_data_window,
+                params: acceleration
+                    .params
+                    .as_ref()
+                    .map(Params::as_string_map)
+                    .unwrap_or_default(),
+                engine_secret: acceleration.engine_secret,
+                retention_period: acceleration.retention_period,
+                retention_check_interval: acceleration.retention_check_interval,
+                retention_check_enabled: acceleration.retention_check_enabled,
+                on_zero_results: ZeroResultsAction::from(acceleration.on_zero_results),
+            })
         }
     }
 
@@ -463,12 +509,12 @@ pub mod acceleration {
             Self {
                 enabled: true,
                 mode: Mode::Memory,
-                engine: None,
+                engine: Engine::default(),
                 refresh_mode: RefreshMode::Full,
                 refresh_check_interval: None,
                 refresh_sql: None,
                 refresh_data_window: None,
-                params: None,
+                params: HashMap::default(),
                 engine_secret: None,
                 retention_period: None,
                 retention_check_interval: None,
@@ -480,11 +526,18 @@ pub mod acceleration {
 }
 
 pub mod replication {
-    use serde::{Deserialize, Serialize};
+    use spicepod::component::dataset::replication as spicepod_replication;
 
-    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    #[derive(Debug, Clone, PartialEq, Default)]
     pub struct Replication {
-        #[serde(default)]
         pub enabled: bool,
+    }
+
+    impl From<spicepod_replication::Replication> for Replication {
+        fn from(replication: spicepod_replication::Replication) -> Self {
+            Replication {
+                enabled: replication.enabled,
+            }
+        }
     }
 }

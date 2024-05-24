@@ -58,66 +58,61 @@ impl MySQLConnectionPool {
     ///
     /// Returns an error if there is a problem creating the connection pool.
     #[allow(clippy::unused_async)]
-    pub async fn new(
-        params: Arc<Option<HashMap<String, String>>>,
-        secret: Option<Secret>,
-    ) -> Result<Self> {
+    pub async fn new(params: Arc<HashMap<String, String>>, secret: Option<Secret>) -> Result<Self> {
         let mut connection_string = mysql_async::OptsBuilder::default();
         let mut ssl_mode = "required";
         let mut ssl_rootcert_path: Option<PathBuf> = None;
 
-        if let Some(params) = params.as_ref() {
-            if let Some(mysql_connection_string) = get_secret_or_param(
-                Some(params),
-                &secret,
-                "mysql_connection_string_key",
-                "mysql_connection_string",
-            ) {
-                connection_string = mysql_async::OptsBuilder::from_opts(
-                    mysql_async::Opts::from_url(mysql_connection_string.as_str())?,
-                );
-            } else {
-                if let Some(mysql_host) = params.get("mysql_host") {
-                    connection_string = connection_string.ip_or_hostname(mysql_host.as_str());
-                }
-                if let Some(mysql_user) = params.get("mysql_user") {
-                    connection_string = connection_string.user(Some(mysql_user));
-                }
-                if let Some(mysql_db) = params.get("mysql_db") {
-                    connection_string = connection_string.db_name(Some(mysql_db));
-                }
-                if let Some(mysql_pass) =
-                    get_secret_or_param(Some(params), &secret, "mysql_pass_key", "mysql_pass")
-                {
-                    connection_string = connection_string.pass(Some(mysql_pass));
-                }
-                if let Some(mysql_tcp_port) = params.get("mysql_tcp_port") {
-                    connection_string =
-                        connection_string.tcp_port(mysql_tcp_port.parse::<u16>().unwrap_or(3306));
-                }
-                if let Some(mysql_sslmode) = params.get("mysql_sslmode") {
-                    match mysql_sslmode.to_lowercase().as_str() {
-                        "disabled" | "required" | "preferred" => {
-                            ssl_mode = mysql_sslmode.as_str();
-                        }
-                        _ => {
-                            InvalidParameterSnafu {
-                                parameter_name: "mysql_sslmode".to_string(),
-                            }
-                            .fail()?;
-                        }
+        if let Some(mysql_connection_string) = get_secret_or_param(
+            &params,
+            &secret,
+            "mysql_connection_string_key",
+            "mysql_connection_string",
+        ) {
+            connection_string = mysql_async::OptsBuilder::from_opts(mysql_async::Opts::from_url(
+                mysql_connection_string.as_str(),
+            )?);
+        } else {
+            if let Some(mysql_host) = params.get("mysql_host") {
+                connection_string = connection_string.ip_or_hostname(mysql_host.as_str());
+            }
+            if let Some(mysql_user) = params.get("mysql_user") {
+                connection_string = connection_string.user(Some(mysql_user));
+            }
+            if let Some(mysql_db) = params.get("mysql_db") {
+                connection_string = connection_string.db_name(Some(mysql_db));
+            }
+            if let Some(mysql_pass) =
+                get_secret_or_param(&params, &secret, "mysql_pass_key", "mysql_pass")
+            {
+                connection_string = connection_string.pass(Some(mysql_pass));
+            }
+            if let Some(mysql_tcp_port) = params.get("mysql_tcp_port") {
+                connection_string =
+                    connection_string.tcp_port(mysql_tcp_port.parse::<u16>().unwrap_or(3306));
+            }
+            if let Some(mysql_sslmode) = params.get("mysql_sslmode") {
+                match mysql_sslmode.to_lowercase().as_str() {
+                    "disabled" | "required" | "preferred" => {
+                        ssl_mode = mysql_sslmode.as_str();
                     }
-                }
-                if let Some(mysql_sslrootcert) = params.get("mysql_sslrootcert") {
-                    if !std::path::Path::new(mysql_sslrootcert).exists() {
-                        InvalidRootCertPathSnafu {
-                            path: mysql_sslrootcert,
+                    _ => {
+                        InvalidParameterSnafu {
+                            parameter_name: "mysql_sslmode".to_string(),
                         }
                         .fail()?;
                     }
-
-                    ssl_rootcert_path = Some(PathBuf::from(mysql_sslrootcert));
                 }
+            }
+            if let Some(mysql_sslrootcert) = params.get("mysql_sslrootcert") {
+                if !std::path::Path::new(mysql_sslrootcert).exists() {
+                    InvalidRootCertPathSnafu {
+                        path: mysql_sslrootcert,
+                    }
+                    .fail()?;
+                }
+
+                ssl_rootcert_path = Some(PathBuf::from(mysql_sslrootcert));
             }
         }
 

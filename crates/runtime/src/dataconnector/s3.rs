@@ -16,9 +16,9 @@ limitations under the License.
 
 use super::{DataConnector, DataConnectorFactory, DataConnectorResult, ListingTableConnector};
 
+use crate::component::dataset::Dataset;
 use secrets::Secret;
 use snafu::prelude::*;
-use spicepod::component::dataset::Dataset;
 use std::any::Any;
 use std::clone::Clone;
 use std::pin::Pin;
@@ -44,19 +44,16 @@ pub enum Error {
 
 pub struct S3 {
     secret: Option<Secret>,
-    params: HashMap<String, String>,
+    params: Arc<HashMap<String, String>>,
 }
 
 impl DataConnectorFactory for S3 {
     fn create(
         secret: Option<Secret>,
-        params: Arc<Option<HashMap<String, String>>>,
+        params: Arc<HashMap<String, String>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let s3 = Self {
-                secret,
-                params: params.as_ref().clone().map_or_else(HashMap::new, |x| x),
-            };
+            let s3 = Self { secret, params };
             Ok(Arc::new(s3) as Arc<dyn DataConnector>)
         })
     }

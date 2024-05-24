@@ -2897,7 +2897,6 @@ dependencies = [
  "secrets",
  "snafu 0.8.2",
  "snowflake-api",
- "spicepod",
  "tokio",
  "tokio-postgres",
  "tokio-rusqlite",
