@@ -14,6 +14,7 @@ clap = { workspace = true, features = ["derive"] }
 spicepod = { path = "../../crates/spicepod" }
 app = { path = "../../crates/app" }
 runtime = { path = "../../crates/runtime" }
+extensions = { path = "../../crates/extensions" }
 flightrepl = { path = "../../crates/flightrepl" }
 tokio.workspace = true
 tracing.workspace = true

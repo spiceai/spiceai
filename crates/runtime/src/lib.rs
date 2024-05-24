@@ -28,7 +28,6 @@ use ::datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use ::datafusion::sql::sqlparser::{self, ast};
 use accelerated_table::AcceleratedTable;
 use app::App;
-use async_trait::async_trait;
 use cache::QueryResultCacheProvider;
 use config::Config;
 use llms::nql::Nql;
@@ -46,7 +45,7 @@ use tokio::sync::oneshot::error::RecvError;
 use tokio::time::sleep;
 use tokio::{signal, sync::RwLock};
 
-use crate::extensions::{Extension, Runtime as ExtensionRuntime};
+use crate::extensions::{Extension, ExtensionFactory};
 use crate::spice_metrics::MetricsRecorder;
 use crate::{dataconnector::DataConnector, datafusion::DataFusion};
 mod accelerated_table;
@@ -185,16 +184,21 @@ pub struct Runtime {
     pub pods_watcher: Option<podswatcher::PodsWatcher>,
     pub secrets_provider: Arc<RwLock<secrets::SecretsProvider>>,
 
+    extensions: Arc<Vec<RwLock<Box<dyn Extension>>>>,
     spaced_tracer: Arc<tracers::SpacedTracer>,
 }
 
 impl Runtime {
     #[must_use]
-    pub async fn new(app: Option<app::App>, df: Arc<RwLock<DataFusion>>) -> Self {
+    pub async fn new(
+        app: Option<app::App>,
+        df: Arc<RwLock<DataFusion>>,
+        extension_factories: Arc<Vec<Box<dyn ExtensionFactory>>>,
+    ) -> Self {
         dataconnector::register_all().await;
         dataaccelerator::register_all().await;
 
-        Runtime {
+        let mut rt = Runtime {
             app: Arc::new(RwLock::new(app)),
             df,
             models: Arc::new(RwLock::new(HashMap::new())),
@@ -202,6 +206,49 @@ impl Runtime {
             pods_watcher: None,
             secrets_provider: Arc::new(RwLock::new(secrets::SecretsProvider::new())),
             spaced_tracer: Arc::new(tracers::SpacedTracer::new(Duration::from_secs(15))),
+            extensions: Arc::new(vec![]),
+        };
+
+        let mut extensions: Vec<RwLock<Box<dyn Extension>>> = vec![];
+        for factory in extension_factories.iter() {
+            let extension = factory.create();
+            let extension_name = extension.name();
+            let extension_lock = RwLock::new(extension);
+            if let Err(err) = rt.initialize_extension(&extension_lock).await {
+                tracing::warn!("Failed to initialize extension {extension_name}: {err}");
+            } else {
+                extensions.push(extension_lock);
+            };
+        }
+
+        rt.extensions = Arc::new(extensions);
+
+        rt
+    }
+
+    async fn initialize_extension(
+        &mut self,
+        extension: &RwLock<Box<dyn Extension>>,
+    ) -> extensions::Result<()> {
+        let mut extension = extension.write().await;
+        extension.initialize(&mut *self).await?;
+        Ok(())
+    }
+
+    async fn start_extension(
+        &self,
+        extension: &RwLock<Box<dyn Extension>>,
+    ) -> extensions::Result<()> {
+        let mut extension = extension.write().await;
+        extension.on_start(self).await?;
+        Ok(())
+    }
+
+    pub async fn start_extensions(&mut self) {
+        for extension in self.extensions.iter() {
+            if let Err(err) = self.start_extension(extension).await {
+                tracing::warn!("Failed to start extension: {err}");
+            }
         }
     }
 
@@ -878,28 +925,6 @@ impl Runtime {
             .write()
             .await
             .set_cache_provider(Some(Arc::new(cache_provider)));
-    }
-}
-
-#[async_trait]
-impl ExtensionRuntime for Runtime {
-    fn datafusion(&self) -> Arc<RwLock<DataFusion>> {
-        Arc::clone(&self.df)
-    }
-
-    fn secrets_provider(&self) -> Arc<RwLock<secrets::SecretsProvider>> {
-        Arc::clone(&self.secrets_provider)
-    }
-
-    async fn register_extension(
-        &mut self,
-        extension: Box<&mut dyn Extension>,
-    ) -> extensions::Result<()> {
-        let boxed: Box<&mut dyn ExtensionRuntime> = Box::new(self);
-
-        extension.initialize(boxed).await?;
-
-        Ok(())
     }
 }
 

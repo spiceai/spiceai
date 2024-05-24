@@ -26,10 +26,9 @@ use clap::Parser;
 use flightrepl::ReplConfig;
 use runtime::config::Config as RuntimeConfig;
 
-use runtime::extensions::spiceai_extension::SpiceExtension;
-use runtime::extensions::{Extension, Runtime as ExtensionRuntime};
+use extensions::spiceai_extension::SpiceExtensionFactory;
 use runtime::podswatcher::PodsWatcher;
-use runtime::Runtime;
+use runtime::{extensions::ExtensionFactory, Runtime};
 use snafu::prelude::*;
 use tokio::sync::RwLock;
 
@@ -111,24 +110,12 @@ pub async fn run(args: Args) -> Result<()> {
         }
     };
 
-    let mut rt: Runtime = Runtime::new(app, df.clone()).await;
+    let mut extension_factories: Vec<Box<dyn ExtensionFactory>> = vec![];
+    let spice_extension_factory = SpiceExtensionFactory {};
+    extension_factories.push(Box::new(spice_extension_factory));
+    // TODO: load extensions from spicepod
 
-    let mut extensions: Vec<Box<&mut dyn Extension>> = vec![];
-
-    // Built in spiceai extension
-    let mut spice_extension = SpiceExtension::new(df);
-
-    let boxed: Box<&mut dyn Extension> = Box::new(&mut spice_extension);
-    extensions.push(boxed);
-
-    // TODO load other extensions from spicepod.yaml
-
-    for extension in extensions {
-        let rt: Box<&mut dyn ExtensionRuntime> = Box::new(&mut rt);
-        if let Err(err) = extension.initialize(rt).await {
-            tracing::warn!("Failed to initialize extension: {err}");
-        }
-    }
+    let mut rt: Runtime = Runtime::new(app, df.clone(), Arc::new(extension_factories)).await;
 
     rt.with_pods_watcher(pods_watcher);
 
@@ -143,12 +130,6 @@ pub async fn run(args: Args) -> Result<()> {
 
     rt.init_results_cache().await;
 
-    // TODO: iterate over all loaded extensions
-    let boxed: Box<&mut dyn ExtensionRuntime> = Box::new(&mut rt);
-    if let Err(err) = spice_extension.on_start(boxed).await {
-        tracing::warn!("Failed to start spice extension: {err}");
-    }
-
     if args.spice_cloud_connect {
         if let Err(err) = rt
             .start_metrics(args.metrics, args.spice_cloud_metrics_dataset)
@@ -158,6 +139,8 @@ pub async fn run(args: Args) -> Result<()> {
             tracing::warn!("{err}");
         }
     }
+
+    rt.start_extensions().await;
 
     rt.start_servers(args.runtime, args.metrics)
         .await

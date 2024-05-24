@@ -1,13 +1,16 @@
 use std::sync::Arc;
 
-use arrow::array::RecordBatch;
+// use arrow::array::RecordBatch;
 use async_trait::async_trait;
-use secrets::Secret;
 use snafu::prelude::*;
 use tokio::sync::RwLock;
 
-use super::{Extension, MetricsConnector, Runtime};
-use crate::datafusion::DataFusion;
+use runtime::{
+    datafusion::DataFusion,
+    extensions::{Extension, ExtensionFactory, Result},
+    Runtime,
+};
+use secrets::Secret;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -37,21 +40,20 @@ impl Extension for SpiceExtension {
         "spiceai"
     }
 
-    async fn initialize(&mut self, _runtime: Box<&mut dyn Runtime>) -> super::Result<()> {
+    async fn initialize(&mut self, _runtime: &mut Runtime) -> Result<()> {
         tracing::info!("Initializing Spiceai Extension");
 
         Ok(())
     }
 
-    async fn on_start(&mut self, runtime: Box<&mut dyn Runtime>) -> super::Result<()> {
+    async fn on_start(&mut self, runtime: &Runtime) -> Result<()> {
         tracing::info!("Starting Spiceai Extension");
 
-        let secrets_provider = runtime.secrets_provider();
-        let secrets = secrets_provider.read().await;
+        let secrets = runtime.secrets_provider.read().await;
         let secret = secrets
             .get_secret("spiceai")
             .await
-            .context(super::UnableToInitializeExtensionSnafu)?;
+            .map_err(|e| runtime::extensions::Error::UnableToInitializeExtension { source: e })?;
 
         self.secret = secret;
 
@@ -62,12 +64,22 @@ impl Extension for SpiceExtension {
     }
 }
 
-pub struct SpiceMetricsConnector {}
+pub struct SpiceExtensionFactory;
 
-#[async_trait]
-impl MetricsConnector for SpiceMetricsConnector {
-    async fn write_metrics(&self, _record_batch: RecordBatch) -> super::Result<()> {
-        // - write metrics to Spiceai
-        Ok(())
+impl ExtensionFactory for SpiceExtensionFactory {
+    fn create(&self) -> Box<dyn Extension> {
+        Box::new(SpiceExtension::new(Arc::new(
+            RwLock::new(DataFusion::new()),
+        )))
     }
 }
+
+// pub struct SpiceMetricsConnector {}
+
+// #[async_trait]
+// impl MetricsConnector for SpiceMetricsConnector {
+//     async fn write_metrics(&self, _record_batch: RecordBatch) -> super::Result<()> {
+//         // - write metrics to Spiceai
+//         Ok(())
+//     }
+// }
