@@ -26,10 +26,10 @@ use clap::Parser;
 use flightrepl::ReplConfig;
 use runtime::config::Config as RuntimeConfig;
 
-use extensions::spiceai_extension::SpiceExtensionFactory;
 use runtime::podswatcher::PodsWatcher;
 use runtime::{extensions::ExtensionFactory, Runtime};
 use snafu::prelude::*;
+use spiceai_extension::SpiceExtensionFactory;
 use tokio::sync::RwLock;
 
 #[derive(Debug, Snafu)]
