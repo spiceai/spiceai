@@ -111,7 +111,7 @@ impl Extension for SpiceExtension {
             .boxed()
             .map_err(|e| runtime::extensions::Error::UnableToStartExtension { source: e })?;
 
-        tracing::info!("Enabled sync to spice.ai for runtime.metrics");
+        tracing::info!("Enabled sync to Spice.ai for runtime.metrics");
 
         Ok(())
     }
