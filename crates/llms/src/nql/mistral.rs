@@ -157,9 +157,19 @@ impl MistralLlama {
 
         Self::from_pipeline(pipeline)
     }
-
     fn get_device() -> Device {
-        Device::cuda_if_available(0).unwrap_or(Device::new_metal(0).unwrap_or(Device::Cpu))
+        let default_device = {
+            #[cfg(feature = "metal")]
+            {
+                Device::new_metal(0).unwrap_or(Device::Cpu)
+            }
+            #[cfg(not(feature = "metal"))]
+            {
+                Device::Cpu
+            }
+        };
+
+        Device::cuda_if_available(0).unwrap_or(default_device)
     }
 
     pub fn from_hf(model_id: &str, arch: &str) -> Result<Self> {
