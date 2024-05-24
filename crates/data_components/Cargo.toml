@@ -32,7 +32,7 @@ deltalake = { git = "https://github.com/spiceai/delta-rs.git", rev = "b5022aea8c
 serde.workspace = true
 reqwest = { version = "0.11.24", features = ["json"] }
 db_connection_pool = { path = "../db_connection_pool" }
-duckdb = { workspace = true, features = ["bundled", "r2d2", "vtab", "vtab-arrow"], optional = true }
+duckdb = { workspace = true, features = ["bundled", "r2d2", "vtab", "vtab-arrow", "appender-arrow"], optional = true }
 tonic = { workspace = true, optional = true }
 bb8 = { workspace = true, optional = true }
 bb8-postgres = { workspace = true, optional = true }
