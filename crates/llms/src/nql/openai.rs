@@ -27,7 +27,7 @@ use serde_json::Value;
 use snafu::ResultExt;
 
 const MAX_COMPLETION_TOKENS: u16 = 1024_u16; // Avoid accidentally using infinite tokens. Should think about this more.
-const GPT3_5_TURBO_INSTRUCT: &str = "gpt-3.5-turbo";
+pub(crate) const GPT3_5_TURBO_INSTRUCT: &str = "gpt-3.5-turbo";
 
 pub struct Openai {
     client: Client<OpenAIConfig>,
@@ -47,6 +47,11 @@ impl Openai {
             client: Client::with_config(client_config),
             model,
         }
+    }
+
+    #[must_use]
+    pub fn using_model(model: String) -> Self {
+        Self::new(OpenAIConfig::default(), model)
     }
 
     /// Convert the Json object returned when using a `{ "type": "json_object" } ` response format.
