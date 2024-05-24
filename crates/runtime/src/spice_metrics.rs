@@ -30,8 +30,8 @@ use crate::accelerated_table::refresh::Refresh;
 use crate::accelerated_table::Retention;
 use crate::component::dataset::acceleration::Acceleration;
 use crate::component::dataset::TimeFormat;
-use crate::datafusion::DataFusion;
 use crate::datafusion::Error as DataFusionError;
+use crate::datafusion::{DataFusion, SPICE_RUNTIME_SCHEMA};
 use crate::dataupdate::DataUpdate;
 use crate::internal_table::{create_internal_accelerated_table, Error as InternalTableError};
 
@@ -79,9 +79,8 @@ impl MetricsRecorder {
             true,
         );
 
-
         let table = create_internal_accelerated_table(
-            metrics_table_reference,
+            metrics_table_reference.clone(),
             get_metrics_schema(),
             Acceleration::default(),
             Refresh::default(),
@@ -197,5 +196,5 @@ pub fn get_metrics_schema() -> Arc<Schema> {
 
 #[must_use]
 pub fn get_metrics_table_reference() -> TableReference {
-    TableReference::partial("runtime", "metrics")
+    TableReference::partial(SPICE_RUNTIME_SCHEMA, "metrics")
 }

@@ -53,9 +53,9 @@ pub mod schema;
 
 use self::schema::SpiceSchemaProvider;
 
-const SPICE_DEFAULT_CATALOG: &str = "spice";
-const SPICE_RUNTIME_SCHEMA: &str = "runtime";
-const SPICE_DEFAULT_SCHEMA: &str = "public";
+pub const SPICE_DEFAULT_CATALOG: &str = "spice";
+pub const SPICE_RUNTIME_SCHEMA: &str = "runtime";
+pub const SPICE_DEFAULT_SCHEMA: &str = "public";
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 

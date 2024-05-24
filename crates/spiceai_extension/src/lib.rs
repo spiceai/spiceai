@@ -1,7 +1,7 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use datafusion::datasource::TableProvider;
+use datafusion::{datasource::TableProvider, sql::TableReference};
 use snafu::prelude::*;
 
 use runtime::{
@@ -130,7 +130,10 @@ async fn get_spiceai_table_provider(
     cloud_dataset_path: &str,
     secret: Option<Secret>,
 ) -> Result<Arc<dyn TableProvider>, Error> {
-    let mut dataset = Dataset::new(cloud_dataset_path.to_string(), name.to_string());
+    let mut dataset = Dataset::try_new(cloud_dataset_path.to_string(), name)
+        .boxed()
+        .context(UnableToCreateDataConnectorSnafu)?;
+
     dataset.mode = Mode::ReadWrite;
     dataset.replication = Some(Replication { enabled: true });
 
@@ -163,13 +166,17 @@ pub async fn create_synced_internal_accelerated_table(
 ) -> Result<Arc<AcceleratedTable>, Error> {
     let source_table_provider = get_spiceai_table_provider(name, from, secret).await?;
 
-    let accelerated_table_provider =
-        create_accelerator_table(name, source_table_provider.schema(), &acceleration, None)
-            .await
-            .context(UnableToCreateAcceleratedTableProviderSnafu)?;
+    let accelerated_table_provider = create_accelerator_table(
+        TableReference::bare(name),
+        source_table_provider.schema(),
+        &acceleration,
+        None,
+    )
+    .await
+    .context(UnableToCreateAcceleratedTableProviderSnafu)?;
 
     let mut builder = AcceleratedTable::builder(
-        name.to_string(),
+        TableReference::bare(name),
         source_table_provider,
         accelerated_table_provider,
         refresh,
