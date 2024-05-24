@@ -7,9 +7,9 @@ use snafu::prelude::*;
 use runtime::{
     accelerated_table::{refresh::Refresh, AcceleratedTable, Retention},
     dataaccelerator::{self, create_accelerator_table},
-    dataconnector::create_new_connector,
-    dataconnector::DataConnectorError,
+    dataconnector::{create_new_connector, DataConnectorError},
     extensions::{Extension, ExtensionFactory, Result},
+    spice_metrics::get_metrics_table_reference,
     Runtime,
 };
 use secrets::Secret;
@@ -89,8 +89,10 @@ impl Extension for SpiceExtension {
             Some(Duration::from_secs(1800)), // sync only last 30 minutes from cloud
         );
 
+        let metrics_table_reference = get_metrics_table_reference();
+
         let table = create_synced_internal_accelerated_table(
-            "metrics",
+            metrics_table_reference.table(),
             "spice.ai/ewgenius/demo/runtime_metrics_test",
             secret,
             Acceleration::default(),
@@ -105,7 +107,7 @@ impl Extension for SpiceExtension {
             .datafusion()
             .write()
             .await
-            .register_runtime_table("metrics", table)
+            .register_runtime_table(metrics_table_reference.table(), table)
             .boxed()
             .map_err(|e| runtime::extensions::Error::UnableToStartExtension { source: e })?;
 
@@ -119,7 +121,7 @@ pub struct SpiceExtensionFactory;
 
 impl ExtensionFactory for SpiceExtensionFactory {
     fn create(&self) -> Box<dyn Extension> {
-        Box::new(SpiceExtension {})
+        Box::new(SpiceExtension)
     }
 }
 

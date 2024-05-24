@@ -333,11 +333,17 @@ impl DataFusion {
 
         if let Some(schema_name) = table_reference.schema() {
             if let Some(schema) = self.schema(schema_name) {
-                return schema.table(table_name).await.ok().is_some();
+                match schema.table(table_name).await {
+                    Ok(table) => return table.is_some(),
+                    Err(_) => return false,
+                }
             }
         }
 
-        self.ctx.table(table_name).await.ok().is_some()
+        match self.ctx.table(table_name).await {
+            Ok(_) => return true,
+            Err(_) => return false,
+        }
     }
 
     pub fn register_runtime_table(

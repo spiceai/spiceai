@@ -26,7 +26,6 @@ use ::datafusion::sql::parser::{self, DFParser};
 use ::datafusion::sql::sqlparser::ast::{SetExpr, TableFactor};
 use ::datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use ::datafusion::sql::sqlparser::{self, ast};
-use ::datafusion::sql::TableReference;
 use accelerated_table::AcceleratedTable;
 use app::App;
 use cache::QueryResultCacheProvider;
@@ -38,6 +37,7 @@ use model_components::{model::Model, modelsource::source as model_source};
 pub use notify::Error as NotifyError;
 use secrets::{spicepod_secret_store_type, Secret};
 use snafu::prelude::*;
+use spice_metrics::get_metrics_table_reference;
 use spicepod::component::dataset::Dataset;
 use spicepod::component::dataset::Mode;
 use spicepod::component::model::Model as SpicepodModel;
@@ -65,7 +65,7 @@ pub mod object_store_registry;
 pub mod objectstore;
 mod opentelemetry;
 pub mod podswatcher;
-mod spice_metrics;
+pub mod spice_metrics;
 pub mod status;
 pub mod timing;
 pub(crate) mod tracers;
@@ -779,7 +779,7 @@ impl Runtime {
                 .df
                 .read()
                 .await
-                .has_table(&TableReference::partial("runtime", "metrics"))
+                .has_table(&get_metrics_table_reference())
                 .await;
 
             if !has_metrics_table {

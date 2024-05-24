@@ -98,9 +98,11 @@ pub async fn run(args: Args) -> Result<()> {
     };
 
     let mut extension_factories: Vec<Box<dyn ExtensionFactory>> = vec![];
-    let spice_extension_factory = SpiceExtensionFactory {};
-    extension_factories.push(Box::new(spice_extension_factory));
-    // TODO: load extensions from spicepod
+
+    if cfg!(feature = "spiceai-extension") {
+        let spice_extension_factory = SpiceExtensionFactory {};
+        extension_factories.push(Box::new(spice_extension_factory));
+    }
 
     let mut rt: Runtime = Runtime::new(app, Arc::clone(&df), Arc::new(extension_factories)).await;
 

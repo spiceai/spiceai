@@ -68,6 +68,8 @@ impl MetricsRecorder {
     }
 
     pub async fn register_metrics_table(datafusion: &Arc<RwLock<DataFusion>>) -> Result<(), Error> {
+        let metrics_table_reference = get_metrics_table_reference();
+
         let retention = Retention::new(
             Some("timestamp".to_string()),
             Some(TimeFormat::UnixSeconds),
@@ -77,7 +79,7 @@ impl MetricsRecorder {
         );
 
         let table = create_internal_accelerated_table(
-            "metrics",
+            metrics_table_reference.table(),
             get_metrics_schema(),
             Acceleration::default(),
             Refresh::default(),
@@ -89,13 +91,11 @@ impl MetricsRecorder {
         datafusion
             .write()
             .await
-            .register_runtime_table("metrics", table)
+            .register_runtime_table(metrics_table_reference.table(), table)
             .context(UnableToRegisterToMetricsTableSnafu)?;
 
         Ok(())
     }
-
-    // pub async fn
 
     async fn tick(
         socket_addr: &SocketAddr,
@@ -151,7 +151,7 @@ impl MetricsRecorder {
         };
 
         let df = datafusion.write().await;
-        df.write_data(TableReference::partial("runtime", "metrics"), data_update)
+        df.write_data(get_metrics_table_reference(), data_update)
             .await
             .context(UnableToWriteToMetricsTableSnafu)?;
 
@@ -190,4 +190,8 @@ pub fn get_metrics_schema() -> Arc<Schema> {
     ];
 
     Arc::new(Schema::new(fields))
+}
+
+pub fn get_metrics_table_reference() -> TableReference {
+    TableReference::partial("runtime", "metrics")
 }
