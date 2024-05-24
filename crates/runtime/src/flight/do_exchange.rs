@@ -62,14 +62,9 @@ pub(crate) async fn handle(
         ));
     };
 
-    let data_path = flight_descriptor.path.join(".");
+    let data_path = TableReference::parse_str(&flight_descriptor.path.join("."));
 
-    if !flight_svc
-        .datafusion
-        .read()
-        .await
-        .is_writable(&TableReference::bare(data_path.to_string()))
-    {
+    if !flight_svc.datafusion.read().await.is_writable(&data_path) {
         return Err(Status::invalid_argument(format!(
             r#"Unknown dataset: "{data_path}""#,
         )));
@@ -137,7 +132,7 @@ pub(crate) async fn handle(
             .read()
             .await
             .ctx
-            .sql(&format!(r#"SELECT * FROM "{data_path}""#))
+            .sql(&format!(r#"SELECT * FROM {data_path}"#))
             .await
         else {
             return;

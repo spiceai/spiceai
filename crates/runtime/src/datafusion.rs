@@ -353,6 +353,8 @@ impl DataFusion {
     ) -> Result<()> {
         let dataset = dataset.borrow();
 
+        schema::ensure_schema_exists(&self.ctx, SPICE_DEFAULT_CATALOG, &dataset.name)?;
+
         match table {
             Table::Accelerated {
                 source,
