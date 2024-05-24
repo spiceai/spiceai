@@ -56,7 +56,7 @@ impl Default for SpiceExtension {
 #[async_trait]
 impl Extension for SpiceExtension {
     fn name(&self) -> &'static str {
-        "spiceai"
+        "spice_cloud"
     }
 
     async fn initialize(&mut self, _runtime: &mut Runtime) -> Result<()> {
@@ -64,7 +64,7 @@ impl Extension for SpiceExtension {
             return Ok(());
         }
 
-        tracing::info!("Initializing Spice.ai Extension");
+        tracing::info!("Initializing Spice.ai Cloud Extension");
 
         Ok(())
     }
@@ -76,7 +76,7 @@ impl Extension for SpiceExtension {
 
         if let Some(spiceai_metrics_dataset_path) = self.manifest.params.get("metrics_dataset_path")
         {
-            tracing::info!("Starting Spice.ai Extension");
+            tracing::info!("Starting Spice.ai Cloud Extension");
 
             let secrets = runtime.secrets_provider.read().await;
             let secret = secrets

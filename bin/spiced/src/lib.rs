@@ -29,7 +29,7 @@ use runtime::config::Config as RuntimeConfig;
 use runtime::podswatcher::PodsWatcher;
 use runtime::{extensions::ExtensionFactory, Runtime};
 use snafu::prelude::*;
-use spiceai_extension::SpiceExtensionFactory;
+use spice_cloud::SpiceExtensionFactory;
 use tokio::sync::RwLock;
 
 #[derive(Debug, Snafu)]
@@ -99,9 +99,9 @@ pub async fn run(args: Args) -> Result<()> {
 
     let mut extension_factories: Vec<Box<dyn ExtensionFactory>> = vec![];
 
-    if cfg!(feature = "spiceai-extension") {
+    if cfg!(feature = "spice-cloud") {
         if let Some(app) = &app {
-            if let Some(manifest) = app.extensions.get("spiceai") {
+            if let Some(manifest) = app.extensions.get("spice_cloud") {
                 let spice_extension_factory = SpiceExtensionFactory::new(manifest.clone());
                 extension_factories.push(Box::new(spice_extension_factory));
             }

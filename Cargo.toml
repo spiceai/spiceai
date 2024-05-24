@@ -13,7 +13,7 @@ members = [
     "crates/model_components",
     "crates/ns_lookup",
     "crates/util",
-    "crates/spiceai_extension",
+    "crates/spice_cloud",
     "tools/flightpublisher/",
     "tools/flightsubscriber/",
 ]

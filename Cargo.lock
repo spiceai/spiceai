@@ -8225,7 +8225,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "spiceai-extension"
+name = "spice-cloud"
 version = "0.13.1-alpha"
 dependencies = [
  "async-trait",
@@ -8248,7 +8248,7 @@ dependencies = [
  "metrics-exporter-prometheus",
  "runtime",
  "snafu 0.8.2",
- "spiceai-extension",
+ "spice-cloud",
  "spicepod",
  "tokio",
  "tracing",
