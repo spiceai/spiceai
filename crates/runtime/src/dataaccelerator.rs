@@ -112,7 +112,7 @@ pub trait DataAccelerator: Send + Sync {
 }
 
 pub struct AcceleratorExternalTableBuilder {
-    table_name: String,
+    table_name: TableReference,
     schema: SchemaRef,
     engine: Engine,
     mode: Mode,
@@ -122,7 +122,7 @@ pub struct AcceleratorExternalTableBuilder {
 
 impl AcceleratorExternalTableBuilder {
     #[must_use]
-    pub fn new(table_name: String, schema: SchemaRef, engine: Engine) -> Self {
+    pub fn new(table_name: TableReference, schema: SchemaRef, engine: Engine) -> Self {
         Self {
             table_name,
             schema,
@@ -191,7 +191,7 @@ impl AcceleratorExternalTableBuilder {
                 }
                 .build()
             })?,
-            name: TableReference::bare(self.table_name.clone()),
+            name: self.table_name.clone(),
             location: String::new(),
             file_type: String::new(),
             has_header: false,
@@ -212,13 +212,11 @@ impl AcceleratorExternalTableBuilder {
 }
 
 pub async fn create_accelerator_table(
-    table_name: &str,
+    table_name: TableReference,
     schema: SchemaRef,
     acceleration_settings: &acceleration::Acceleration,
     acceleration_secret: Option<Secret>,
 ) -> Result<Arc<dyn TableProvider>> {
-    let table_name = table_name.to_string();
-
     let engine = acceleration_settings.engine;
 
     let accelerator_guard = DATA_ACCELERATOR_ENGINES.lock().await;

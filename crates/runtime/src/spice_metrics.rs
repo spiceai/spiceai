@@ -79,8 +79,9 @@ impl MetricsRecorder {
             true,
         );
 
+
         let table = create_internal_accelerated_table(
-            metrics_table_reference.table(),
+            metrics_table_reference,
             get_metrics_schema(),
             Acceleration::default(),
             Refresh::default(),
