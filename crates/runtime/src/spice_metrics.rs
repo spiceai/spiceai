@@ -18,6 +18,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::component::dataset::acceleration::{Acceleration, RefreshMode};
+use crate::component::dataset::TimeFormat;
 use arrow::array::{Float64Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;

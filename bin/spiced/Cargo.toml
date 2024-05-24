@@ -35,10 +35,10 @@ default = [
   "snowflake",
   "ftp",
 ]
-duckdb = ["runtime/duckdb", "spicepod/duckdb", "app/duckdb"]
-postgres = ["runtime/postgres", "spicepod/postgres", "app/postgres"]
-sqlite = ["runtime/sqlite", "spicepod/sqlite", "app/sqlite"]
-mysql = ["runtime/mysql", "spicepod/mysql", "app/mysql"]
+duckdb = ["runtime/duckdb"]
+postgres = ["runtime/postgres"]
+sqlite = ["runtime/sqlite"]
+mysql = ["runtime/mysql"]
 ftp = ["runtime/ftp"]
 clickhouse = ["runtime/clickhouse"]
 release = []

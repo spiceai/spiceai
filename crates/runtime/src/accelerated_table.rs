@@ -17,6 +17,8 @@ limitations under the License.
 use std::time::SystemTime;
 use std::{any::Any, sync::Arc, time::Duration};
 
+use crate::component::dataset::acceleration::{RefreshMode, ZeroResultsAction};
+use crate::component::dataset::TimeFormat;
 use arrow::array::UInt64Array;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
@@ -32,8 +34,6 @@ use datafusion::{
     logical_expr::Expr,
 };
 use snafu::prelude::*;
-use spicepod::component::dataset::acceleration::{RefreshMode, ZeroResultsAction};
-use spicepod::component::dataset::TimeFormat;
 use tokio::task::JoinHandle;
 use tokio::time::interval;
 

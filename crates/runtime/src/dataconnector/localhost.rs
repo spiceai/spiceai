@@ -19,6 +19,7 @@ use async_trait::async_trait;
 
 use std::{any::Any, collections::HashMap, pin::Pin, sync::Arc};
 
+use crate::component::dataset::Dataset;
 use datafusion::{
     config::ConfigOptions,
     datasource::{TableProvider, TableType},
@@ -35,7 +36,6 @@ use datafusion::{
 use futures::Future;
 use secrets::Secret;
 use snafu::prelude::*;
-use spicepod::component::dataset::Dataset;
 
 use super::{DataConnector, DataConnectorFactory};
 
@@ -83,13 +83,9 @@ impl LocalhostConnector {
 impl DataConnectorFactory for LocalhostConnector {
     fn create(
         _secret: Option<Secret>,
-        params: Arc<Option<HashMap<String, String>>>,
+        params: Arc<HashMap<String, String>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let Some(params) = params.as_ref() else {
-                return Err(Error::MissingSchemaParameter.into());
-            };
-
             let schema = params.get("schema").ok_or(Error::MissingSchemaParameter)?;
 
             let statements = Parser::parse_sql(&PostgreSqlDialect {}, schema).context(

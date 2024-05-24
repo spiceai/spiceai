@@ -78,9 +78,6 @@ pub enum Error {
         port: String,
     },
 
-    #[snafu(display("No parameters specified"))]
-    ParametersEmptyError {},
-
     #[snafu(display("Missing required parameter: {parameter_name}"))]
     MissingRequiredParameterForConnection { parameter_name: String },
 
@@ -105,15 +102,8 @@ impl ClickhouseConnectionPool {
     /// # Errors
     ///
     /// Returns an error if there is a problem creating the connection pool.
-    pub async fn new(
-        params: Arc<Option<HashMap<String, String>>>,
-        secret: Option<Secret>,
-    ) -> Result<Self> {
-        let params = match params.as_ref() {
-            Some(params) => params,
-            None => ParametersEmptySnafu {}.fail()?,
-        };
-        let (options, compute_context) = get_config_from_params(params, &secret).await?;
+    pub async fn new(params: Arc<HashMap<String, String>>, secret: Option<Secret>) -> Result<Self> {
+        let (options, compute_context) = get_config_from_params(&params, &secret).await?;
 
         let pool = Pool::new(options);
 
@@ -134,7 +124,7 @@ async fn get_config_from_params(
 ) -> Result<(Options, String)> {
     let connection_string =
         if let Some(clickhouse_connection_string) = get_secret_or_param(
-            Some(params),
+            params,
             secret,
             "clickhouse_connection_string_key",
             "clickhouse_connection_string",
@@ -146,15 +136,11 @@ async fn get_config_from_params(
                     parameter_name: "clickhouse_user".to_string(),
                 },
             )?;
-            let password = get_secret_or_param(
-                Some(params),
-                secret,
-                "clickhouse_pass_key",
-                "clickhouse_pass",
-            )
-            .ok_or(Error::MissingRequiredParameterForConnection {
-                parameter_name: "clickhouse_pass".to_string(),
-            })?;
+            let password =
+                get_secret_or_param(params, secret, "clickhouse_pass_key", "clickhouse_pass")
+                    .ok_or(Error::MissingRequiredParameterForConnection {
+                        parameter_name: "clickhouse_pass".to_string(),
+                    })?;
             let host = params.get("clickhouse_host").ok_or(
                 Error::MissingRequiredParameterForConnection {
                     parameter_name: "clickhouse_tcp_host".to_string(),

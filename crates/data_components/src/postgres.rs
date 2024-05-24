@@ -196,7 +196,7 @@ impl TableProviderFactory for PostgresTableProviderFactory {
         let options = cmd.options.clone();
         let schema: Schema = cmd.schema.as_ref().into();
 
-        let params = Arc::new(Some(options));
+        let params = Arc::new(options);
 
         let pool = Arc::new(
             PostgresConnectionPool::new(params, None)

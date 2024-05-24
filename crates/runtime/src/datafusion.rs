@@ -20,6 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::accelerated_table::{refresh::Refresh, AcceleratedTable, Retention};
+use crate::component::dataset::{Dataset, Mode};
 use crate::dataaccelerator::{self, create_accelerator_table};
 use crate::dataconnector::{DataConnector, DataConnectorError};
 use crate::dataupdate::{DataUpdate, DataUpdateExecutionPlan, UpdateType};
@@ -42,7 +43,6 @@ use datafusion::sql::{sqlparser, TableReference};
 use datafusion_federation::{FederatedQueryPlanner, FederationAnalyzerRule};
 use secrets::Secret;
 use snafu::prelude::*;
-use spicepod::component::dataset::{Dataset, Mode};
 use tokio::spawn;
 use tokio::sync::oneshot;
 use tokio::time::{sleep, Instant};
@@ -573,16 +573,16 @@ impl DataFusion {
             accelerated_table_provider,
             Refresh::new(
                 dataset.time_column.clone(),
-                dataset.time_format.clone(),
+                dataset.time_format,
                 dataset.refresh_check_interval(),
                 refresh_sql.clone(),
-                acceleration_settings.refresh_mode.clone(),
+                acceleration_settings.refresh_mode,
                 dataset.refresh_data_window(),
             ),
         );
         accelerated_table_builder.retention(Retention::new(
             dataset.time_column.clone(),
-            dataset.time_format.clone(),
+            dataset.time_format,
             dataset.retention_period(),
             dataset.retention_check_interval(),
             acceleration_settings.retention_check_enabled,

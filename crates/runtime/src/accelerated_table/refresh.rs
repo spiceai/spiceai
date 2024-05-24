@@ -1,6 +1,16 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::component::dataset::acceleration::RefreshMode;
+use crate::component::dataset::TimeFormat;
+use crate::datafusion::filter_converter::TimestampFilterConvert;
+use crate::object_store_registry::default_runtime_env;
+use crate::{
+    dataconnector::get_data,
+    dataupdate::{DataUpdate, DataUpdateExecutionPlan, UpdateType},
+    status,
+    timing::TimeMeasurement,
+};
 use arrow::array::TimestampNanosecondArray;
 use arrow::datatypes::DataType;
 use async_stream::stream;
@@ -14,22 +24,10 @@ use datafusion::{datasource::TableProvider, execution::context::SessionContext};
 use futures::Stream;
 use futures::{stream::BoxStream, StreamExt};
 use snafu::prelude::*;
-use spicepod::component::dataset::acceleration::RefreshMode;
-
-use spicepod::component::dataset::TimeFormat;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::oneshot;
 use tokio::sync::RwLock;
 use tokio_stream::wrappers::ReceiverStream;
-
-use crate::datafusion::filter_converter::TimestampFilterConvert;
-use crate::object_store_registry::default_runtime_env;
-use crate::{
-    dataconnector::get_data,
-    dataupdate::{DataUpdate, DataUpdateExecutionPlan, UpdateType},
-    status,
-    timing::TimeMeasurement,
-};
 
 #[derive(Clone, Debug)]
 pub struct Refresh {
@@ -366,7 +364,7 @@ impl Refresher {
         | arrow::datatypes::DataType::UInt32
         | arrow::datatypes::DataType::UInt64 = accelerated_field.data_type()
         {
-            match refresh.time_format.clone() {
+            match refresh.time_format {
                 Some(TimeFormat::UnixMillis) => {
                     value *= 1_000_000;
                 }
@@ -483,11 +481,7 @@ impl Refresher {
         let column = refresh.time_column.as_deref().unwrap_or_default();
         let field = schema.column_with_name(column).map(|(_, f)| f).cloned();
 
-        TimestampFilterConvert::create(
-            field,
-            refresh.time_column.clone(),
-            refresh.time_format.clone(),
-        )
+        TimestampFilterConvert::create(field, refresh.time_column.clone(), refresh.time_format)
     }
 
     fn notify_refresh_done(
