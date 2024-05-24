@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::collections::HashSet;
 use std::fmt::Display;
 use std::fmt::Formatter;
 use std::sync::atomic::Ordering;
@@ -45,6 +46,12 @@ pub enum Error {
 
     #[snafu(display("Failed to parse item_ttl value: {source}"))]
     FailedToParseItemTtl { source: ParseError },
+
+    #[snafu(display("Cache invalidation for dataset {table_name} failed with error: {source}"))]
+    FailedToInvalidateCache {
+        source: moka::PredicateError,
+        table_name: String,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -65,12 +72,14 @@ impl QueryResult {
 pub struct CachedQueryResult {
     pub records: Arc<Vec<RecordBatch>>,
     pub schema: Arc<Schema>,
+    pub input_tables: Arc<HashSet<String>>,
 }
 
 #[async_trait]
 pub trait QueryResultCache {
     async fn get(&self, plan: &LogicalPlan) -> Result<Option<CachedQueryResult>>;
     async fn put(&self, plan: &LogicalPlan, result: CachedQueryResult) -> Result<()>;
+    async fn invalidate_for_table(&self, table_name: &str) -> Result<()>;
     fn size_bytes(&self) -> u64;
     fn item_count(&self) -> u64;
 }
@@ -147,6 +156,13 @@ impl QueryResultsCacheProvider {
             #[allow(clippy::cast_precision_loss)]
             metrics::gauge!("results_cache_item_count").set(self.item_count() as f64);
         }
+    }
+
+    /// # Errors
+    ///
+    /// Will return `Err` if method fails to invalidate cache for the table provided
+    pub async fn invalidate_for_table(&self, table_name: &str) -> Result<()> {
+        self.cache.invalidate_for_table(table_name).await
     }
 
     #[must_use]

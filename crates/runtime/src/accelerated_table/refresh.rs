@@ -15,6 +15,7 @@ use crate::{
 use arrow::array::TimestampNanosecondArray;
 use arrow::datatypes::DataType;
 use async_stream::stream;
+use cache::QueryResultsCacheProvider;
 use datafusion::common::TableReference;
 use datafusion::error::DataFusionError;
 use datafusion::execution::config::SessionConfig;
@@ -85,6 +86,7 @@ pub(crate) struct Refresher {
     federated: Arc<dyn TableProvider>,
     refresh: Arc<RwLock<Refresh>>,
     accelerator: Arc<dyn TableProvider>,
+    cache_provider: Option<Arc<QueryResultsCacheProvider>>,
 }
 
 impl Refresher {
@@ -99,7 +101,16 @@ impl Refresher {
             federated,
             refresh,
             accelerator,
+            cache_provider: None,
         }
+    }
+
+    pub fn cache_provider(
+        &mut self,
+        cache_provider: Option<Arc<QueryResultsCacheProvider>>,
+    ) -> &mut Self {
+        self.cache_provider = cache_provider;
+        self
     }
 
     pub(crate) async fn start(
@@ -173,6 +184,15 @@ impl Refresher {
 
                                     if let Ok(elapse) = util::humantime_elapsed(start_time) {
                                         tracing::info!("Loaded {num_rows} rows ({memory_size}) for dataset {dataset_name} in {elapse}.");
+                                    }
+
+                                    if let Some(cache_provider) = &self.cache_provider {
+                                        if let Err(e) = cache_provider
+                                            .invalidate_for_table(&dataset_name.to_string())
+                                            .await
+                                        {
+                                            tracing::error!("Failed to invalidate cached results for dataset {}: {e}", &dataset_name.to_string());
+                                        }
                                     }
                                 }
 
