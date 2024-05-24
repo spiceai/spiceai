@@ -34,7 +34,9 @@ use app::App;
 use cache::QueryResultCacheProvider;
 use component::dataset::{self, Dataset};
 use config::Config;
+use llms::nql::Nql;
 use metrics::SetRecorderError;
+use model::try_to_nql;
 use model_components::{model::Model, modelsource::source as model_source};
 pub use notify::Error as NotifyError;
 use secrets::{spicepod_secret_store_type, Secret};
@@ -178,10 +180,13 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+pub type LLMModelStore = HashMap<String, RwLock<Box<dyn Nql>>>;
+
 pub struct Runtime {
     pub app: Arc<RwLock<Option<App>>>,
     pub df: Arc<RwLock<DataFusion>>,
     pub models: Arc<RwLock<HashMap<String, Model>>>,
+    pub llms: Arc<RwLock<LLMModelStore>>,
     pub pods_watcher: Option<podswatcher::PodsWatcher>,
     pub secrets_provider: Arc<RwLock<secrets::SecretsProvider>>,
 
@@ -198,6 +203,7 @@ impl Runtime {
             app: Arc::new(RwLock::new(app)),
             df,
             models: Arc::new(RwLock::new(HashMap::new())),
+            llms: Arc::new(RwLock::new(HashMap::new())),
             pods_watcher: None,
             secrets_provider: Arc::new(RwLock::new(secrets::SecretsProvider::new())),
             spaced_tracer: Arc::new(tracers::SpacedTracer::new(Duration::from_secs(15))),
@@ -634,6 +640,33 @@ impl Runtime {
         Ok(())
     }
 
+    pub async fn load_llms(&self) {
+        let app_lock = self.app.read().await;
+        if let Some(app) = app_lock.as_ref() {
+            for in_llm in &app.llms {
+                status::update_llm(&in_llm.name, status::ComponentStatus::Initializing);
+                match try_to_nql(in_llm) {
+                    Ok(l) => {
+                        let mut llm_map = self.llms.write().await;
+                        llm_map.insert(in_llm.name.clone(), l.into());
+                        tracing::info!("Llm [{}] deployed, ready for inferencing", in_llm.name);
+                        metrics::gauge!("llms_count", "llm" => in_llm.name.clone(), "source" => in_llm.get_prefix().map(|x| x.to_string()).unwrap_or_default()).increment(1.0);
+                        status::update_llm(&in_llm.name, status::ComponentStatus::Ready);
+                    }
+                    Err(e) => {
+                        metrics::counter!("llms_load_error").increment(1);
+                        status::update_llm(&in_llm.name, status::ComponentStatus::Error);
+                        tracing::warn!(
+                            "Unable to load LLM from spicepod {}, error: {}",
+                            in_llm.name,
+                            e,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     pub async fn load_models(&self) {
         let app_lock = self.app.read().await;
         if let Some(app) = app_lock.as_ref() {
@@ -648,7 +681,6 @@ impl Runtime {
     pub async fn load_model(&self, m: &SpicepodModel) {
         measure_scope_ms!("load_model", "model" => m.name, "source" => model_source(&m.from));
         tracing::info!("Loading model [{}] from {}...", m.name, m.from);
-        let mut model_map = self.models.write().await;
 
         let model = m.clone();
         let source = model_source(model.from.as_str());
@@ -675,6 +707,7 @@ impl Runtime {
 
         match Model::load(m.clone(), secret).await {
             Ok(in_m) => {
+                let mut model_map = self.models.write().await;
                 model_map.insert(m.name.clone(), in_m);
                 tracing::info!("Model [{}] deployed, ready for inferencing", m.name);
                 metrics::gauge!("models_count", "model" => m.name.clone(), "source" => model_source(&m.from).to_string()).increment(1.0);
@@ -755,6 +788,7 @@ impl Runtime {
             Arc::clone(&self.app),
             Arc::clone(&self.df),
             Arc::clone(&self.models),
+            Arc::clone(&self.llms),
             config.clone().into(),
             with_metrics,
         );
