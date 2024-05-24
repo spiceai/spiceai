@@ -80,7 +80,8 @@ impl MetricsRecorder {
         );
 
         let table = create_internal_accelerated_table(
-            metrics_table_reference.clone(),
+            // we don't support register with custom schema yet
+            TableReference::bare(metrics_table_reference.table()),
             get_metrics_schema(),
             Acceleration::default(),
             Refresh::default(),
