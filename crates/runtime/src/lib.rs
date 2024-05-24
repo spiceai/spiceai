@@ -32,7 +32,7 @@ use ::datafusion::sql::sqlparser::{self, ast};
 use ::datafusion::sql::TableReference;
 use accelerated_table::AcceleratedTable;
 use app::App;
-use cache::QueryResultCacheProvider;
+use cache::QueryResultsCacheProvider;
 use component::dataset::{self, Dataset};
 use config::Config;
 use llms::nql::Nql;
@@ -908,15 +908,15 @@ impl Runtime {
             return;
         }
 
-        let cache_provider = match QueryResultCacheProvider::new(cache_config) {
+        let cache_provider = match QueryResultsCacheProvider::new(cache_config) {
             Ok(cache_provider) => cache_provider,
             Err(e) => {
-                tracing::warn!("Failed to initialize query results cache: {e}");
+                tracing::warn!("Failed to initialize results cache: {e}");
                 return;
             }
         };
 
-        tracing::info!("Initialized query results cache; {cache_provider}");
+        tracing::info!("Initialized results cache; {cache_provider}");
 
         self.df
             .write()
