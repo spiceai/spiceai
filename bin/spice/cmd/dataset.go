@@ -116,6 +116,31 @@ spice dataset configure
 			params["endpoint"] = endpoint
 		}
 
+		if datasetPrefix == spec.DATA_SOURCE_S3 || datasetPrefix == spec.DATA_SOURCE_FTP || datasetPrefix == spec.DATA_SOURCE_SFTP {
+			// check if `from` ends with .csv or .parquet
+			from_path := strings.ToLower(from)
+			if !strings.HasSuffix(from_path, ".csv") && !strings.HasSuffix(from_path, ".parquet") {
+				cmd.Print("file_format (parquet/csv) (parquet) ")
+				file_format, err := reader.ReadString('\n')
+				if err != nil {
+					cmd.Println(err.Error())
+					os.Exit(1)
+				}
+				file_format = strings.TrimSuffix(file_format, "\n")
+
+				if file_format == "" {
+					file_format = "parquet"
+				}
+
+				if file_format != "parquet" && file_format != "csv" {
+					cmd.Println(aurora.BrightRed("file_format must be either parquet or csv"))
+					os.Exit(1)
+				}
+
+				params["file_format"] = file_format
+			}
+		}
+
 		cmd.Print("locally accelerate (y/n)? (y) ")
 		locallyAccelerateStr, err := reader.ReadString('\n')
 		if err != nil {
@@ -134,9 +159,9 @@ spice dataset configure
 
 		if accelerateDataset {
 			dataset.Acceleration = &spec.AccelerationSpec{
-				Enabled:                   accelerateDataset,
+				Enabled:              accelerateDataset,
 				RefreshCheckInterval: time.Second * 10,
-				RefreshMode:               spec.REFRESH_MODE_FULL,
+				RefreshMode:          spec.REFRESH_MODE_FULL,
 			}
 		}
 

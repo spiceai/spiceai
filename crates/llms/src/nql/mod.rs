@@ -11,6 +11,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
+use std::path::Path;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use snafu::Snafu;
@@ -58,6 +60,11 @@ pub enum Error {
     FailedToTokenize {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[snafu(display("Unsupported source of model: {source}"))]
+    UnknownModelSource {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -67,57 +74,77 @@ pub trait Nql: Sync + Send {
     async fn run(&mut self, prompt: String) -> Result<Option<String>>;
 }
 
-/// Loads an NSQL model based on the chosen runtime.
-pub fn create_nsql(runtime: &NSQLRuntime) -> Result<Box<dyn Nql>> {
-    match runtime {
-        NSQLRuntime::Openai => Ok(Box::<openai::Openai>::default() as Box<dyn Nql>),
-        _ => try_duckdb_from_spice_local(runtime),
+#[must_use]
+pub fn create_openai(model: Option<String>) -> Box<dyn Nql> {
+    match model {
+        Some(model) => Box::new(openai::Openai::using_model(model)),
+        None => Box::<openai::Openai>::default(),
     }
 }
 
-/// Loads `https://huggingface.co/motherduckdb/DuckDB-NSQL-7B-v0.1-GGUF` local spice llms cache (i.e. ~/.spice/llms/),
-/// based on the configured features, and the preference order: [`mistralrs`, `candle`].
-#[allow(unreachable_patterns)]
-pub fn try_duckdb_from_spice_local(runtime: &NSQLRuntime) -> Result<Box<dyn Nql>> {
-    let spice_dir =
-        dirs::home_dir()
-            .map(|x| x.join(".spice/llms"))
-            .ok_or(Error::LocalModelNotFound {
-                expected_path: "~/.spice/llms".to_string(),
-            })?;
-
-    let model_weights = spice_dir.join("DuckDB-NSQL-7B-v0.1-q8_0.gguf");
-    let tokenizer = spice_dir.join("llama2.tokenizer_2.json");
-
-    if !model_weights.exists() {
-        return Err(Error::LocalModelNotFound {
-            expected_path: model_weights.to_string_lossy().to_string(),
+pub fn create_hf_model(
+    model_id: &str,
+    model_type: Option<String>,
+    model_weights: &Option<String>,
+    _tokenizer: &Option<String>,
+    _template_filename: &Option<String>,
+) -> Result<Box<dyn Nql>> {
+    if model_type.is_none() && model_weights.is_none() {
+        return Err(Error::FailedToLoadModel {
+            source: format!("For {model_id} either model type or model weights is required").into(),
         });
-    }
+    };
 
-    if !tokenizer.exists() {
-        return Err(Error::LocalTokenizerNotFound {
-            expected_path: tokenizer.to_string_lossy().to_string(),
-        });
+    #[cfg(feature = "mistralrs")]
+    {
+        mistral::MistralLlama::from_hf(
+            model_id,
+            &model_type.unwrap_or_default(),
+            // TODO: Support HF models with non-standard paths.
+            // model_weights,
+            // tokenizer,
+            // template_filename,
+        )
+        .map(|x| Box::new(x) as Box<dyn Nql>)
     }
-
-    match runtime {
-        #[cfg(feature = "candle")]
-        NSQLRuntime::Candle => candle::CandleLlama::try_new(&tokenizer, &model_weights)
-            .map(|x| Box::new(x) as Box<dyn Nql>),
-        #[cfg(feature = "mistralrs")]
-        NSQLRuntime::Mistral => {
-            let template_file = spice_dir.join("template.json");
-            if !template_file.exists() {
-                return Err(Error::LocalTokenizerNotFound {
-                    expected_path: template_file.to_string_lossy().to_string(),
-                });
-            }
-            mistral::MistralLlama::try_new(&tokenizer, &model_weights, &template_file)
-                .map(|x| Box::new(x) as Box<dyn Nql>)
-        }
-        _ => Err(Error::FailedToRunModel {
+    #[cfg(not(feature = "mistralrs"))]
+    {
+        Err(Error::FailedToRunModel {
             source: "No NQL model feature enabled".into(),
-        }),
+        })
+    }
+}
+
+#[allow(unused_variables)]
+pub fn create_local_model(
+    model_weights: &str,
+    tokenizer: &str,
+    template_filename: &str,
+) -> Result<Box<dyn Nql>> {
+    let w = Path::new(&model_weights);
+    let t = Path::new(&tokenizer);
+    let tf = Path::new(&template_filename);
+
+    if !w.exists() {
+        return Err(Error::LocalModelNotFound {
+            expected_path: w.to_string_lossy().to_string(),
+        });
+    }
+
+    if !t.exists() {
+        return Err(Error::LocalTokenizerNotFound {
+            expected_path: t.to_string_lossy().to_string(),
+        });
+    }
+
+    #[cfg(feature = "mistralrs")]
+    {
+        mistral::MistralLlama::from(t, w, tf).map(|x| Box::new(x) as Box<dyn Nql>)
+    }
+    #[cfg(not(feature = "mistralrs"))]
+    {
+        Err(Error::FailedToRunModel {
+            source: "No NQL model feature enabled".into(),
+        })
     }
 }
