@@ -30,7 +30,7 @@ use futures::StreamExt;
 
 #[must_use]
 pub fn to_cached_record_batch_stream(
-    cache_provider: QueryResultCacheProvider,
+    cache_provider: Arc<QueryResultCacheProvider>,
     mut stream: SendableRecordBatchStream,
     plan: LogicalPlan,
 ) -> SendableRecordBatchStream {
@@ -40,7 +40,7 @@ pub fn to_cached_record_batch_stream(
     let cached_result_stream = stream! {
         let mut records: Vec<RecordBatch> = Vec::new();
         let mut records_size: usize = 0;
-        let cache_max_size: usize = cache_provider.cache_max_size().try_into().unwrap_or(usize::MAX);
+        let cache_max_size: usize = cache_provider.max_size().try_into().unwrap_or(usize::MAX);
 
         while let Some(batch_result) = stream.next().await {
             if records_size < cache_max_size {

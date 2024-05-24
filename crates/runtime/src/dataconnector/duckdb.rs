@@ -28,7 +28,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::{collections::HashMap, future::Future};
 
-use super::{DataConnector, DataConnectorFactory};
+use super::{DataConnector, DataConnectorError, DataConnectorFactory};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -36,10 +36,7 @@ pub enum Error {
     UnableToCreateDuckDBConnectionPool { source: db_connection_pool::Error },
 
     #[snafu(display("Missing required parameter: open"))]
-    MissingDuckDBFile {},
-
-    #[snafu(display("Invalid access mode param value \"{access_mode}\". Valid values are: read_only, read_write, automatic"))]
-    InvalidAccessMode { access_mode: String },
+    MissingDuckDBFile,
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -57,14 +54,22 @@ impl DataConnectorFactory for DuckDB {
             let params = params.as_ref().as_ref();
 
             // data connector requires valid "open" parameter
-            let db_path = params
-                .and_then(|p| p.get("open").cloned())
-                .ok_or(Error::MissingDuckDBFile {})?;
+            let db_path: String = params.and_then(|p| p.get("open").cloned()).ok_or(
+                DataConnectorError::InvalidConfiguration {
+                    dataconnector: "duckdb".to_string(),
+                    message: "Missing required open parameter.".to_string(),
+                    source: "Missing open".into(),
+                },
+            )?;
 
             // TODO: wire to dataset.mode once readwrite implemented for duckdb
             let pool = Arc::new(
-                DuckDbConnectionPool::new_file(&db_path, &AccessMode::ReadOnly)
-                    .context(UnableToCreateDuckDBConnectionPoolSnafu)?,
+                DuckDbConnectionPool::new_file(&db_path, &AccessMode::ReadOnly).map_err(|e| {
+                    DataConnectorError::UnableToConnectInternal {
+                        dataconnector: "duckdb".to_string(),
+                        source: e,
+                    }
+                })?,
             );
 
             let duckdb_factory = DuckDBTableFactory::new(pool);
