@@ -584,7 +584,6 @@ jobs:
           ./duckdb -s "INSTALL tpch;LOAD tpch;CALL dbgen(sf = 1);" ./tpch.db
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        if: matrix.target.target_os == 'linux'
         uses: actions/download-artifact@v4
         with:
           name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
