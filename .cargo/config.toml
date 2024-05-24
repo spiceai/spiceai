@@ -1,0 +1,5 @@
+[build]
+rustflags = ["-C", "link-dead-code"]
+
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-dead-code"]

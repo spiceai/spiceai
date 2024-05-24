@@ -109,6 +109,7 @@ duckdb = [
     "spicepod/duckdb",
     "data_components/duckdb",
 ]
+motherduck = []
 postgres = [
     "dep:bb8",
     "dep:bb8-postgres",

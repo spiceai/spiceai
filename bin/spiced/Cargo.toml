@@ -23,6 +23,7 @@ metrics-exporter-prometheus = "0.13.0"
 [features]
 default = [
   "duckdb",
+  "motherduck",
   "postgres",
   "sqlite",
   "mysql",
@@ -35,6 +36,7 @@ default = [
   "ftp",
 ]
 duckdb = ["runtime/duckdb", "spicepod/duckdb", "app/duckdb"]
+motherduck = ["runtime/motherduck", "runtime/duckdb", "spicepod/duckdb", "app/duckdb"]
 postgres = ["runtime/postgres", "spicepod/postgres", "app/postgres"]
 sqlite = ["runtime/sqlite", "spicepod/sqlite", "app/sqlite"]
 mysql = ["runtime/mysql", "spicepod/mysql", "app/mysql"]
