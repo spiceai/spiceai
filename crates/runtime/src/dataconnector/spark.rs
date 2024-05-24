@@ -93,6 +93,17 @@ impl DataConnectorFactory for Spark {
             match Spark::new(Arc::new(secret), params).await {
                 Ok(spark_connector) => Ok(Arc::new(spark_connector) as Arc<dyn DataConnector>),
                 Err(e) => match e {
+                    Error::DuplicatedSparkRemote
+                    | Error::MissingSparkRemote
+                    | Error::InvalidEndpoint {
+                        endpoint: _,
+                        source: _,
+                    } => Err(DataConnectorError::InvalidConfiguration {
+                        dataconnector: "spark".to_string(),
+                        message: e.to_string(),
+                        source: e.into(),
+                    }
+                    .into()),
                     Error::UnableToConstructSparkConnect { source } => {
                         Err(DataConnectorError::UnableToConnectInternal {
                             dataconnector: "spark".to_string(),
@@ -100,12 +111,6 @@ impl DataConnectorFactory for Spark {
                         }
                         .into())
                     }
-                    _ => Err(DataConnectorError::InvalidConfiguration {
-                        dataconnector: "spark".to_string(),
-                        message: e.to_string(),
-                        source: e.into(),
-                    }
-                    .into()),
                 },
             }
         })
