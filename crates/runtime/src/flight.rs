@@ -17,7 +17,6 @@ limitations under the License.
 use crate::datafusion::DataFusion;
 use crate::dataupdate::DataUpdate;
 use crate::measure_scope_ms;
-use crate::query_history::QueryHistoryBuilder;
 use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
 use arrow::ipc::writer::{DictionaryTracker, IpcDataGenerator};
@@ -178,11 +177,6 @@ impl Service {
         datafusion: Arc<RwLock<DataFusion>>,
         sql: String,
     ) -> Result<BoxStream<'static, Result<FlightData, Status>>, Status> {
-
-        let mut h = QueryHistoryBuilder::default()
-            .start_time(std::time::SystemTime::now())
-            .sql(sql.clone());
-
         let restricted_sql_options = SQLOptions::new()
             .with_allow_ddl(false)
             .with_allow_dml(false)
@@ -196,7 +190,6 @@ impl Service {
             .map_err(to_tonic_err)?;
 
         let schema = batches_stream.data.schema();
-        h.schema(schema);
 
         let options = datafusion::arrow::ipc::writer::IpcWriteOptions::default();
         let schema_as_ipc = SchemaAsIpc::new(&schema, &options);
@@ -228,11 +221,7 @@ impl Service {
             .map(|result| {
                 // Convert Result<Vec<FlightData>, Status> into Stream of Result<FlightData, Status>
                 match result {
-                    Ok(flights) => {
-                        let resp = stream::iter(flights.into_iter().map(Ok)).left_stream();
-                        h.end_time(std::time::SystemTime::now());
-                        resp
-                    },
+                    Ok(flights) => stream::iter(flights.into_iter().map(Ok)).left_stream(),
                     Err(e) => stream::once(async { Err(e) }).right_stream(),
                 }
             })

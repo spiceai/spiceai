@@ -54,7 +54,6 @@ pub mod dataconnector;
 pub mod datafusion;
 pub mod dataupdate;
 pub mod execution_plan;
-pub mod query_history;
 mod flight;
 mod http;
 pub mod internal_table;
@@ -63,6 +62,7 @@ pub mod object_store_registry;
 pub mod objectstore;
 mod opentelemetry;
 pub mod podswatcher;
+pub mod query_history;
 mod spice_metrics;
 pub mod status;
 pub mod timing;
@@ -163,6 +163,9 @@ pub enum Error {
 
     #[snafu(display("Unable to start local metrics: {source}"))]
     UnableToStartLocalMetrics { source: spice_metrics::Error },
+
+    #[snafu(display("Unable to track query history: {source}"))]
+    UnableToStartQueryHistory { source: query_history::Error },
 
     #[snafu(display("Unable to create metrics table: {source}"))]
     UnableToCreateMetricsTable { source: DataFusionError },
@@ -732,7 +735,7 @@ impl Runtime {
                 Err(_) => None,
             };
 
-            let recorder = MetricsRecorder::new(metrics_socket, secret, cloud_dataset_path)
+            let recorder = MetricsRecorder::new(metrics_socket, secret.clone(), cloud_dataset_path)
                 .await
                 .context(UnableToStartLocalMetricsSnafu)?;
 

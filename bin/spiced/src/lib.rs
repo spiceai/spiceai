@@ -27,7 +27,7 @@ use flightrepl::ReplConfig;
 use runtime::config::Config as RuntimeConfig;
 
 use runtime::podswatcher::PodsWatcher;
-use runtime::Runtime;
+use runtime::{query_history, Runtime};
 use snafu::prelude::*;
 use tokio::sync::RwLock;
 
@@ -123,6 +123,19 @@ pub async fn run(args: Args) -> Result<()> {
     }
 
     rt.init_results_cache().await;
+
+    match query_history::instantiate_query_history_table(&rt.secrets_provider, None).await {
+        Ok(table) => {
+            rt.df
+                .write()
+                .await
+                .register_runtime_table(query_history::DEFAULT_QUERY_HISTORY_TABLE, table)
+                .context(UnableToCreateBackendSnafu)?;
+        }
+        Err(err) => {
+            tracing::warn!("{err}");
+        }
+    };
 
     if args.spice_cloud_connect {
         if let Err(err) = rt
