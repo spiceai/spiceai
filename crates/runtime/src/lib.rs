@@ -237,15 +237,17 @@ impl Runtime {
     }
 
     /// Returns a list of valid datasets from the given App, skipping any that fail to parse and logging an error for them.
-    fn get_valid_datasets(app: &App) -> Vec<Dataset> {
+    fn get_valid_datasets(app: &App, log_failures: bool) -> Vec<Dataset> {
         Self::datasets_iter(app)
             .zip(&app.datasets)
             .filter_map(|(ds, spicepod_ds)| match ds {
                 Ok(ds) => Some(ds),
                 Err(e) => {
-                    status::update_dataset(&spicepod_ds.name, status::ComponentStatus::Error);
-                    metrics::counter!("datasets_load_error").increment(1);
-                    tracing::error!(dataset = &spicepod_ds.name, "{e}");
+                    if log_failures {
+                        status::update_dataset(&spicepod_ds.name, status::ComponentStatus::Error);
+                        metrics::counter!("datasets_load_error").increment(1);
+                        tracing::error!(dataset = &spicepod_ds.name, "{e}");
+                    }
                     None
                 }
             })
@@ -258,7 +260,7 @@ impl Runtime {
             return;
         };
 
-        let valid_datasets = Self::get_valid_datasets(app);
+        let valid_datasets = Self::get_valid_datasets(app, true);
         for ds in &valid_datasets {
             status::update_dataset(&ds.name, status::ComponentStatus::Initializing);
             self.load_dataset(ds, &valid_datasets).await;
@@ -827,7 +829,7 @@ impl Runtime {
                 tracing::debug!("Previous pods information: {:?}", current_app);
 
                 // check for new and updated datasets
-                let valid_datasets = Self::get_valid_datasets(&new_app);
+                let valid_datasets = Self::get_valid_datasets(&new_app, true);
                 for ds in &valid_datasets {
                     if let Some(current_ds) =
                         current_app.datasets.iter().find(|d| d.name == ds.name)
