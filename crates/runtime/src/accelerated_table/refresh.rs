@@ -1,6 +1,17 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::component::dataset::acceleration::RefreshMode;
+use crate::component::dataset::TimeFormat;
+use crate::datafusion::filter_converter::TimestampFilterConvert;
+use crate::datafusion::schema;
+use crate::object_store_registry::default_runtime_env;
+use crate::{
+    dataconnector::get_data,
+    dataupdate::{DataUpdate, DataUpdateExecutionPlan, UpdateType},
+    status,
+    timing::TimeMeasurement,
+};
 use arrow::array::TimestampNanosecondArray;
 use arrow::datatypes::DataType;
 use async_stream::stream;
@@ -14,22 +25,10 @@ use datafusion::{datasource::TableProvider, execution::context::SessionContext};
 use futures::Stream;
 use futures::{stream::BoxStream, StreamExt};
 use snafu::prelude::*;
-use spicepod::component::dataset::acceleration::RefreshMode;
-
-use spicepod::component::dataset::TimeFormat;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::oneshot;
 use tokio::sync::RwLock;
 use tokio_stream::wrappers::ReceiverStream;
-
-use crate::datafusion::filter_converter::TimestampFilterConvert;
-use crate::object_store_registry::default_runtime_env;
-use crate::{
-    dataconnector::get_data,
-    dataupdate::{DataUpdate, DataUpdateExecutionPlan, UpdateType},
-    status,
-    timing::TimeMeasurement,
-};
 
 #[derive(Clone, Debug)]
 pub struct Refresh {
@@ -82,7 +81,7 @@ pub(crate) enum AccelerationRefreshMode {
 }
 
 pub(crate) struct Refresher {
-    dataset_name: String,
+    dataset_name: TableReference,
     federated: Arc<dyn TableProvider>,
     refresh: Arc<RwLock<Refresh>>,
     accelerator: Arc<dyn TableProvider>,
@@ -90,7 +89,7 @@ pub(crate) struct Refresher {
 
 impl Refresher {
     pub(crate) fn new(
-        dataset_name: String,
+        dataset_name: TableReference,
         federated: Arc<dyn TableProvider>,
         refresh: Arc<RwLock<Refresh>>,
         accelerator: Arc<dyn TableProvider>,
@@ -269,7 +268,7 @@ impl Refresher {
             while refresh_stream.next().await.is_some() {
                 let timer = TimeMeasurement::new(
                     "load_dataset_duration_ms",
-                    vec![("dataset", dataset_name.clone())],
+                    vec![("dataset", dataset_name.to_string())],
                 );
                 let start = SystemTime::now();
                 match self.get_full_or_incremental_append_update(None).await {
@@ -292,7 +291,7 @@ impl Refresher {
             while refresh_stream.next().await.is_some() {
                 let timer = TimeMeasurement::new(
                     "append_dataset_duration_ms",
-                    vec![("dataset", dataset_name.clone())],
+                    vec![("dataset", dataset_name.to_string())],
                 );
                 match self.get_latest_timestamp().await {
                     Ok(timestamp) => {
@@ -366,7 +365,7 @@ impl Refresher {
         | arrow::datatypes::DataType::UInt32
         | arrow::datatypes::DataType::UInt64 = accelerated_field.data_type()
         {
-            match refresh.time_format.clone() {
+            match refresh.time_format {
                 Some(TimeFormat::UnixMillis) => {
                     value *= 1_000_000;
                 }
@@ -402,7 +401,7 @@ impl Refresher {
         let filter_converter = self.get_filter_converter(&refresh);
 
         tracing::info!("Loading data for dataset {dataset_name}");
-        status::update_dataset(dataset_name.as_str(), status::ComponentStatus::Refreshing);
+        status::update_dataset(&dataset_name, status::ComponentStatus::Refreshing);
         let refresh = refresh.clone();
         let mut filters = vec![];
         if let Some(converter) = filter_converter.as_ref() {
@@ -435,7 +434,7 @@ impl Refresher {
         let dataset_name = self.dataset_name.clone();
         match get_data(
             &mut ctx,
-            TableReference::bare(dataset_name.clone()),
+            dataset_name.clone(),
             Arc::clone(&federated),
             refresh.sql.clone(),
             filters,
@@ -459,18 +458,33 @@ impl Refresher {
             ),
             default_runtime_env(),
         );
-        let dataset_name = self.dataset_name.clone();
-        if let Err(e) = ctx.register_table(
-            TableReference::bare(dataset_name.clone()),
-            Arc::clone(&self.federated),
-        ) {
+
+        let ctx_state = ctx.state();
+        let default_catalog = &ctx_state.config_options().catalog.default_catalog;
+        match schema::ensure_schema_exists(&ctx, default_catalog, &self.dataset_name) {
+            Ok(()) => (),
+            Err(_) => {
+                unreachable!("The default catalog should always exist");
+            }
+        };
+
+        if let Err(e) = ctx.register_table(self.dataset_name.clone(), Arc::clone(&self.federated)) {
             tracing::error!("Unable to register federated table: {e}");
         }
 
-        let acc_dataset_name = format!("accelerated_{dataset_name}");
+        let mut acc_dataset_name = String::with_capacity(
+            self.dataset_name.table().len() + self.dataset_name.schema().map_or(0, str::len),
+        );
+
+        if let Some(schema) = self.dataset_name.schema() {
+            acc_dataset_name.push_str(schema);
+        }
+
+        acc_dataset_name.push_str("accelerated_");
+        acc_dataset_name.push_str(self.dataset_name.table());
 
         if let Err(e) = ctx.register_table(
-            TableReference::bare(acc_dataset_name),
+            TableReference::parse_str(&acc_dataset_name),
             Arc::clone(&self.accelerator),
         ) {
             tracing::error!("Unable to register accelerator table: {e}");
@@ -483,11 +497,7 @@ impl Refresher {
         let column = refresh.time_column.as_deref().unwrap_or_default();
         let field = schema.column_with_name(column).map(|(_, f)| f).cloned();
 
-        TimestampFilterConvert::create(
-            field,
-            refresh.time_column.clone(),
-            refresh.time_format.clone(),
-        )
+        TimestampFilterConvert::create(field, refresh.time_column.clone(), refresh.time_format)
     }
 
     fn notify_refresh_done(
@@ -502,7 +512,7 @@ impl Refresher {
     }
 
     fn mark_dataset_status(&self, status: status::ComponentStatus) {
-        status::update_dataset(self.dataset_name.as_str(), status);
+        status::update_dataset(&self.dataset_name, status);
     }
 }
 
@@ -558,7 +568,7 @@ mod tests {
         let refresh = Refresh::new(None, None, None, None, RefreshMode::Full, None);
 
         let refresher = Refresher::new(
-            "test".to_string(),
+            TableReference::bare("test"),
             federated,
             Arc::new(RwLock::new(refresh)),
             Arc::clone(&accelerator),
@@ -664,7 +674,10 @@ mod tests {
 
         metrics::set_global_recorder(recorder).expect("recorder is set globally");
 
-        status::update_dataset("test", status::ComponentStatus::Refreshing);
+        status::update_dataset(
+            &TableReference::bare("test"),
+            status::ComponentStatus::Refreshing,
+        );
 
         setup_and_test(
             vec!["1970-01-01", "2012-12-01T11:11:11Z", "2012-12-01T11:11:12Z"],
@@ -678,7 +691,10 @@ mod tests {
             status::ComponentStatus::Ready
         ));
 
-        status::update_dataset("test", status::ComponentStatus::Refreshing);
+        status::update_dataset(
+            &TableReference::bare("test"),
+            status::ComponentStatus::Refreshing,
+        );
 
         setup_and_test(vec![], vec![], 0).await;
 
@@ -731,7 +747,7 @@ mod tests {
             );
 
             let refresher = Refresher::new(
-                "test".to_string(),
+                TableReference::bare("test"),
                 federated,
                 Arc::new(RwLock::new(refresh)),
                 Arc::clone(&accelerator),
@@ -879,7 +895,7 @@ mod tests {
             );
 
             let refresher = Refresher::new(
-                "test".to_string(),
+                TableReference::bare("test"),
                 federated,
                 Arc::new(RwLock::new(refresh)),
                 Arc::clone(&accelerator),

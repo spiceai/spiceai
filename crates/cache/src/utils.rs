@@ -22,7 +22,7 @@ use datafusion::{
     physical_plan::stream::RecordBatchStreamAdapter,
 };
 
-use crate::{CachedQueryResult, QueryResultCacheProvider};
+use crate::{CachedQueryResult, QueryResultsCacheProvider};
 
 use async_stream::stream;
 
@@ -30,7 +30,7 @@ use futures::StreamExt;
 
 #[must_use]
 pub fn to_cached_record_batch_stream(
-    cache_provider: Arc<QueryResultCacheProvider>,
+    cache_provider: Arc<QueryResultsCacheProvider>,
     mut stream: SendableRecordBatchStream,
     plan: LogicalPlan,
 ) -> SendableRecordBatchStream {

@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::component::dataset::Dataset;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::dataframe::DataFrame;
@@ -31,7 +32,6 @@ use datafusion::logical_expr::{Expr, LogicalPlanBuilder};
 use datafusion::sql::TableReference;
 use lazy_static::lazy_static;
 use snafu::prelude::*;
-use spicepod::component::dataset::Dataset;
 use std::any::Any;
 use std::collections::HashMap;
 use std::fmt::Display;
@@ -175,7 +175,7 @@ type NewDataConnectorResult = AnyErrorResult<Arc<dyn DataConnector>>;
 
 type NewDataConnectorFn = dyn Fn(
         Option<Secret>,
-        Arc<Option<HashMap<String, String>>>,
+        Arc<HashMap<String, String>>,
     ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>>
     + Send;
 
@@ -188,7 +188,7 @@ pub async fn register_connector_factory(
     name: &str,
     connector_factory: impl Fn(
             Option<Secret>,
-            Arc<Option<HashMap<String, String>>>,
+            Arc<HashMap<String, String>>,
         ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>>
         + Send
         + 'static,
@@ -207,7 +207,7 @@ pub async fn register_connector_factory(
 pub async fn create_new_connector(
     name: &str,
     secret: Option<Secret>,
-    params: Arc<Option<HashMap<String, String>>>,
+    params: Arc<HashMap<String, String>>,
 ) -> Option<AnyErrorResult<Arc<dyn DataConnector>>> {
     let guard = DATA_CONNECTOR_FACTORY_REGISTRY.lock().await;
 
@@ -252,7 +252,7 @@ pub async fn register_all() {
 pub trait DataConnectorFactory {
     fn create(
         secret: Option<Secret>,
-        params: Arc<Option<HashMap<String, String>>>,
+        params: Arc<HashMap<String, String>>,
     ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>>;
 }
 
@@ -469,7 +469,7 @@ mod tests {
     use super::*;
 
     struct TestConnector {
-        params: HashMap<String, String>,
+        params: Arc<HashMap<String, String>>,
     }
 
     impl std::fmt::Display for TestConnector {
@@ -481,12 +481,10 @@ mod tests {
     impl DataConnectorFactory for TestConnector {
         fn create(
             _secret: Option<Secret>,
-            params: Arc<Option<HashMap<String, String>>>,
+            params: Arc<HashMap<String, String>>,
         ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
             Box::pin(async move {
-                let connector = Self {
-                    params: params.as_ref().clone().map_or_else(HashMap::new, |x| x),
-                };
+                let connector = Self { params };
                 Ok(Arc::new(connector) as Arc<dyn DataConnector>)
             })
         }
@@ -512,8 +510,10 @@ mod tests {
     }
 
     fn setup_connector(path: String, params: HashMap<String, String>) -> (TestConnector, Dataset) {
-        let connector = TestConnector { params };
-        let dataset = Dataset::new(path, "test".to_string());
+        let connector = TestConnector {
+            params: params.into(),
+        };
+        let dataset = Dataset::try_new(path, "test").expect("a valid dataset");
 
         (connector, dataset)
     }

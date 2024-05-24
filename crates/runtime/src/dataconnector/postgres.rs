@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::component::dataset::Dataset;
 use async_trait::async_trait;
 use data_components::postgres::PostgresTableFactory;
 use data_components::Read;
@@ -21,7 +22,6 @@ use datafusion::datasource::TableProvider;
 use db_connection_pool::postgrespool::{self, PostgresConnectionPool};
 use secrets::Secret;
 use snafu::prelude::*;
-use spicepod::component::dataset::Dataset;
 use std::any::Any;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -42,7 +42,7 @@ pub struct Postgres {
 impl DataConnectorFactory for Postgres {
     fn create(
         secret: Option<Secret>,
-        params: Arc<Option<HashMap<String, String>>>,
+        params: Arc<HashMap<String, String>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             match PostgresConnectionPool::new(params, secret).await {

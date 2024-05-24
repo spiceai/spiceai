@@ -14,9 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::component::dataset::Dataset;
 use secrets::{get_secret_or_param, Secret};
 use snafu::prelude::*;
-use spicepod::component::dataset::Dataset;
 use std::any::Any;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -36,7 +36,7 @@ pub enum Error {
 
 pub struct SFTP {
     secret: Option<Secret>,
-    params: HashMap<String, String>,
+    params: Arc<HashMap<String, String>>,
 }
 
 impl std::fmt::Display for SFTP {
@@ -48,13 +48,10 @@ impl std::fmt::Display for SFTP {
 impl DataConnectorFactory for SFTP {
     fn create(
         secret: Option<Secret>,
-        params: Arc<Option<HashMap<String, String>>>,
+        params: Arc<HashMap<String, String>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let sftp = Self {
-                secret,
-                params: params.as_ref().clone().map_or_else(HashMap::new, |x| x),
-            };
+            let sftp = Self { secret, params };
             Ok(Arc::new(sftp) as Arc<dyn DataConnector>)
         })
     }
@@ -79,12 +76,9 @@ impl ListingTableConnector for SFTP {
         if let Some(sftp_user) = self.params.get("sftp_user") {
             fragment_builder.append_pair("user", sftp_user);
         }
-        if let Some(sftp_password) = get_secret_or_param(
-            Some(&self.params),
-            &self.secret,
-            "sftp_pass_key",
-            "sftp_pass",
-        ) {
+        if let Some(sftp_password) =
+            get_secret_or_param(&self.params, &self.secret, "sftp_pass_key", "sftp_pass")
+        {
             fragment_builder.append_pair("password", &sftp_password);
         }
         fragments.push(fragment_builder.finish());

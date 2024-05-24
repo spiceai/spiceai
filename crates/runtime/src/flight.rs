@@ -27,6 +27,7 @@ use bytes::Bytes;
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::SQLOptions;
 use datafusion::sql::sqlparser::parser::ParserError;
+use datafusion::sql::TableReference;
 use futures::stream::{self, BoxStream, StreamExt};
 use futures::{Stream, TryStreamExt};
 use snafu::prelude::*;
@@ -53,7 +54,7 @@ use arrow_flight::{
 
 pub struct Service {
     datafusion: Arc<RwLock<DataFusion>>,
-    channel_map: Arc<RwLock<HashMap<String, Arc<Sender<DataUpdate>>>>>,
+    channel_map: Arc<RwLock<HashMap<TableReference, Arc<Sender<DataUpdate>>>>>,
 }
 
 #[tonic::async_trait]

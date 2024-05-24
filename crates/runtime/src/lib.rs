@@ -19,16 +19,21 @@ limitations under the License.
 use std::borrow::Borrow;
 use std::collections::HashSet;
 use std::net::SocketAddr;
+use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
 
+use crate::spice_metrics::MetricsRecorder;
+use crate::{dataconnector::DataConnector, datafusion::DataFusion};
 use ::datafusion::error::DataFusionError;
 use ::datafusion::sql::parser::{self, DFParser};
 use ::datafusion::sql::sqlparser::ast::{SetExpr, TableFactor};
 use ::datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use ::datafusion::sql::sqlparser::{self, ast};
+use ::datafusion::sql::TableReference;
 use accelerated_table::AcceleratedTable;
 use app::App;
-use cache::QueryResultCacheProvider;
+use cache::QueryResultsCacheProvider;
+use component::dataset::{self, Dataset};
 use config::Config;
 use llms::nql::Nql;
 use metrics::SetRecorderError;
@@ -37,17 +42,13 @@ use model_components::{model::Model, modelsource::source as model_source};
 pub use notify::Error as NotifyError;
 use secrets::{spicepod_secret_store_type, Secret};
 use snafu::prelude::*;
-use spicepod::component::dataset::Dataset;
-use spicepod::component::dataset::Mode;
 use spicepod::component::model::Model as SpicepodModel;
-use std::time::Duration;
 use tokio::sync::oneshot::error::RecvError;
 use tokio::time::sleep;
 use tokio::{signal, sync::RwLock};
 
-use crate::spice_metrics::MetricsRecorder;
-use crate::{dataconnector::DataConnector, datafusion::DataFusion};
 mod accelerated_table;
+pub mod component;
 pub mod config;
 pub mod dataaccelerator;
 pub mod dataconnector;
@@ -110,7 +111,7 @@ pub enum Error {
 
     #[snafu(display("Unable to create view: {source}"))]
     InvalidSQLView {
-        source: spicepod::component::dataset::Error,
+        source: crate::component::dataset::Error,
     },
 
     #[snafu(display("Unable to attach data connector {data_connector}: {source}"))]
@@ -141,15 +142,23 @@ pub enum Error {
     #[snafu(display("Expected acceleration settings for {name}, found None"))]
     ExpectedAccelerationSettings { name: String },
 
-    #[snafu(display("The accelerator engine {name} is not available"))]
-    AcceleratorEngineNotAvailable { name: Arc<str> },
+    #[snafu(display("The accelerator engine {name} is not available. Valid engines are arrow, duckdb, sqlite, and postgres."))]
+    AcceleratorEngineNotAvailable { name: String },
+
+    #[snafu(display(
+        "Dataset names should not include a catalog. Unexpected '{}' in '{}'. Remove '{}' from the dataset name and try again.",
+        catalog,
+        name,
+        catalog,
+    ))]
+    DatasetNameIncludesCatalog { catalog: Arc<str>, name: Arc<str> },
 
     #[snafu(display("Unable to load dataset connector: {dataset}"))]
-    UnableToLoadDatasetConnector { dataset: String },
+    UnableToLoadDatasetConnector { dataset: TableReference },
 
     #[snafu(display("Unable to create accelerated table: {dataset}, {source}"))]
     UnableToCreateAcceleratedTable {
-        dataset: String,
+        dataset: TableReference,
         source: datafusion::Error,
     },
 
@@ -228,13 +237,41 @@ impl Runtime {
         }
     }
 
+    fn datasets_iter(app: &App) -> impl Iterator<Item = Result<Dataset>> + '_ {
+        app.datasets.iter().cloned().map(Dataset::try_from)
+    }
+
+    /// Returns a list of valid datasets from the given App, skipping any that fail to parse and logging an error for them.
+    fn get_valid_datasets(app: &App, log_failures: bool) -> Vec<Dataset> {
+        Self::datasets_iter(app)
+            .zip(&app.datasets)
+            .filter_map(|(ds, spicepod_ds)| match ds {
+                Ok(ds) => Some(ds),
+                Err(e) => {
+                    if log_failures {
+                        status::update_dataset(
+                            &TableReference::parse_str(&spicepod_ds.name),
+                            status::ComponentStatus::Error,
+                        );
+                        metrics::counter!("datasets_load_error").increment(1);
+                        tracing::error!(dataset = &spicepod_ds.name, "{e}");
+                    }
+                    None
+                }
+            })
+            .collect()
+    }
+
     pub async fn load_datasets(&self) {
         let app_lock = self.app.read().await;
-        if let Some(app) = app_lock.as_ref() {
-            for ds in &app.datasets {
-                status::update_dataset(&ds.name, status::ComponentStatus::Initializing);
-                self.load_dataset(ds, &app.datasets).await;
-            }
+        let Some(app) = app_lock.as_ref() else {
+            return;
+        };
+
+        let valid_datasets = Self::get_valid_datasets(app, true);
+        for ds in &valid_datasets {
+            status::update_dataset(&ds.name, status::ComponentStatus::Initializing);
+            self.load_dataset(ds, &valid_datasets).await;
         }
     }
 
@@ -279,7 +316,7 @@ impl Runtime {
         let existing_tables = all_datasets
             .iter()
             .map(|d| d.name.clone())
-            .collect::<Vec<String>>();
+            .collect::<Vec<TableReference>>();
 
         let secrets_provider = shared_secrets_provider.read().await;
 
@@ -293,7 +330,7 @@ impl Runtime {
         }
 
         let source = ds.source();
-        let params = Arc::new(ds.params.clone().map(|params| params.as_string_map()));
+        let params = Arc::new(ds.params.clone());
         let data_connector: Arc<dyn DataConnector> = match Runtime::get_dataconnector_from_source(
             &source,
             &secrets_provider,
@@ -357,7 +394,7 @@ impl Runtime {
                     || "None".to_string(),
                     |acc| {
                         if acc.enabled {
-                            acc.engine().to_string()
+                            acc.engine.to_string()
                         } else {
                             "None".to_string()
                         }
@@ -388,7 +425,7 @@ impl Runtime {
     pub async fn remove_dataset(&self, ds: &Dataset) {
         let mut df = self.df.write().await;
 
-        if df.table_exists(&ds.name) {
+        if df.table_exists(ds.name.clone()) {
             if let Err(e) = df.remove_table(&ds.name) {
                 tracing::warn!("Unable to unload dataset {}: {}", &ds.name, e);
                 return;
@@ -400,7 +437,7 @@ impl Runtime {
             || "None".to_string(),
             |acc| {
                 if acc.enabled {
-                    acc.engine().to_string()
+                    acc.engine.to_string()
                 } else {
                     "None".to_string()
                 }
@@ -476,7 +513,7 @@ impl Runtime {
     async fn get_dataconnector_from_source(
         source: &str,
         secrets_provider: &secrets::SecretsProvider,
-        params: Arc<Option<HashMap<String, String>>>,
+        params: Arc<HashMap<String, String>>,
     ) -> Result<Arc<dyn DataConnector>> {
         let secret = secrets_provider.get_secret(source).await.context(
             UnableToGetSecretForDataConnectorSnafu {
@@ -507,11 +544,11 @@ impl Runtime {
                     name: ds.name.to_string(),
                 })?;
 
-        if ds.mode() == Mode::ReadWrite && !replicate {
+        if ds.mode() == dataset::Mode::ReadWrite && !replicate {
             AcceleratedReadWriteTableWithoutReplicationSnafu.fail()?;
         }
 
-        let accelerator_engine = acceleration_settings.engine();
+        let accelerator_engine = acceleration_settings.engine;
         let secret_key = acceleration_settings
             .engine_secret
             .clone()
@@ -555,7 +592,7 @@ impl Runtime {
 
         // FEDERATED TABLE
         if !ds.is_accelerated() {
-            if ds.mode() == Mode::ReadWrite && !replicate {
+            if ds.mode() == dataset::Mode::ReadWrite && !replicate {
                 // A federated dataset was configured as ReadWrite, but the replication setting wasn't set - error out.
                 FederatedReadWriteTableWithoutReplicationSnafu.fail()?;
             }
@@ -576,13 +613,13 @@ impl Runtime {
                 .ok_or_else(|| Error::ExpectedAccelerationSettings {
                     name: ds.name.to_string(),
                 })?;
-        let accelerator_engine = acceleration_settings.engine();
+        let accelerator_engine = acceleration_settings.engine;
         let acceleration_secret = Runtime::get_acceleration_secret(ds, secrets_provider).await?;
 
-        dataaccelerator::get_accelerator_engine(&accelerator_engine)
+        dataaccelerator::get_accelerator_engine(accelerator_engine)
             .await
             .context(AcceleratorEngineNotAvailableSnafu {
-                name: accelerator_engine,
+                name: accelerator_engine.to_string(),
             })?;
 
         Runtime::register_table(
@@ -800,16 +837,19 @@ impl Runtime {
                 tracing::debug!("Previous pods information: {:?}", current_app);
 
                 // check for new and updated datasets
-                for ds in &new_app.datasets {
-                    if let Some(current_ds) =
-                        current_app.datasets.iter().find(|d| d.name == ds.name)
+                let valid_datasets = Self::get_valid_datasets(&new_app, true);
+                for ds in &valid_datasets {
+                    if let Some(current_ds) = current_app
+                        .datasets
+                        .iter()
+                        .find(|d| TableReference::parse_str(&d.name) == ds.name)
                     {
-                        if current_ds != ds {
-                            self.update_dataset(ds, &new_app.datasets).await;
+                        if TableReference::parse_str(&current_ds.name) != ds.name {
+                            self.update_dataset(ds, &valid_datasets).await;
                         }
                     } else {
                         status::update_dataset(&ds.name, status::ComponentStatus::Initializing);
-                        self.load_dataset(ds, &new_app.datasets).await;
+                        self.load_dataset(ds, &valid_datasets).await;
                     }
                 }
 
@@ -838,8 +878,15 @@ impl Runtime {
                 // Remove datasets that are no longer in the app
                 for ds in &current_app.datasets {
                     if !new_app.datasets.iter().any(|d| d.name == ds.name) {
+                        let ds = match Dataset::try_from(ds.clone()) {
+                            Ok(ds) => ds,
+                            Err(e) => {
+                                tracing::error!("Could not remove dataset {}: {e}", ds.name);
+                                continue;
+                            }
+                        };
                         status::update_dataset(&ds.name, status::ComponentStatus::Disabled);
-                        self.remove_dataset(ds).await;
+                        self.remove_dataset(&ds).await;
                     }
                 }
 
@@ -865,15 +912,15 @@ impl Runtime {
             return;
         }
 
-        let cache_provider = match QueryResultCacheProvider::new(cache_config) {
+        let cache_provider = match QueryResultsCacheProvider::new(cache_config) {
             Ok(cache_provider) => cache_provider,
             Err(e) => {
-                tracing::warn!("Failed to initialize query results cache: {e}");
+                tracing::warn!("Failed to initialize results cache: {e}");
                 return;
             }
         };
 
-        tracing::info!("Initialized query results cache; {cache_provider}");
+        tracing::info!("Initialized results cache; {cache_provider}");
 
         self.df
             .write()
@@ -882,7 +929,7 @@ impl Runtime {
     }
 }
 
-fn verify_dependent_tables(ds: &Dataset, existing_tables: &[String]) -> bool {
+fn verify_dependent_tables(ds: &Dataset, existing_tables: &[TableReference]) -> bool {
     if !ds.is_view() {
         return true;
     }
@@ -913,7 +960,7 @@ fn verify_dependent_tables(ds: &Dataset, existing_tables: &[String]) -> bool {
     true
 }
 
-fn get_view_dependent_tables(dataset: impl Borrow<Dataset>) -> Result<Vec<String>> {
+fn get_view_dependent_tables(dataset: impl Borrow<Dataset>) -> Result<Vec<TableReference>> {
     let ds = dataset.borrow();
 
     let Some(sql) = ds.view_sql() else {
@@ -939,7 +986,7 @@ fn get_view_dependent_tables(dataset: impl Borrow<Dataset>) -> Result<Vec<String
     Ok(get_dependent_table_names(&statements[0]))
 }
 
-fn get_dependent_table_names(statement: &parser::Statement) -> Vec<String> {
+fn get_dependent_table_names(statement: &parser::Statement) -> Vec<TableReference> {
     let mut table_names = Vec::new();
     let mut cte_names = HashSet::new();
 
@@ -948,7 +995,7 @@ fn get_dependent_table_names(statement: &parser::Statement) -> Vec<String> {
             // Collect names of CTEs
             if let Some(with) = statement.with {
                 for table in with.cte_tables {
-                    cte_names.insert(table.alias.name.to_string());
+                    cte_names.insert(TableReference::bare(table.alias.name.to_string()));
                     let cte_table_names = get_dependent_table_names(&parser::Statement::Statement(
                         Box::new(ast::Statement::Query(table.query)),
                     ));
@@ -975,7 +1022,7 @@ fn get_dependent_table_names(statement: &parser::Statement) -> Vec<String> {
                                 version: _,
                                 partitions: _,
                             } => {
-                                table_names.push(name.to_string());
+                                table_names.push(name.to_string().into());
                             }
                             TableFactor::Derived {
                                 lateral: _,

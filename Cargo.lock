@@ -2670,7 +2670,7 @@ dependencies = [
 [[package]]
 name = "datafusion-federation"
 version = "0.1.3"
-source = "git+https://github.com/spiceai/datafusion-federation.git?rev=74dd1cdc3a20b989f1b272f5f6b7a1f8f0be5a46#74dd1cdc3a20b989f1b272f5f6b7a1f8f0be5a46"
+source = "git+https://github.com/spiceai/datafusion-federation.git?rev=b221f4ec87ad57dc7e026fa9e5f5935bfe6b3961#b221f4ec87ad57dc7e026fa9e5f5935bfe6b3961"
 dependencies = [
  "async-trait",
  "datafusion",
@@ -2679,7 +2679,7 @@ dependencies = [
 [[package]]
 name = "datafusion-federation-sql"
 version = "0.1.3"
-source = "git+https://github.com/spiceai/datafusion-federation.git?rev=74dd1cdc3a20b989f1b272f5f6b7a1f8f0be5a46#74dd1cdc3a20b989f1b272f5f6b7a1f8f0be5a46"
+source = "git+https://github.com/spiceai/datafusion-federation.git?rev=b221f4ec87ad57dc7e026fa9e5f5935bfe6b3961#b221f4ec87ad57dc7e026fa9e5f5935bfe6b3961"
 dependencies = [
  "async-trait",
  "datafusion",
@@ -2897,7 +2897,6 @@ dependencies = [
  "secrets",
  "snafu 0.8.2",
  "snowflake-api",
- "spicepod",
  "tokio",
  "tokio-postgres",
  "tokio-rusqlite",
@@ -8245,7 +8244,6 @@ dependencies = [
 name = "spicepod"
 version = "0.13.1-alpha"
 dependencies = [
- "fundu",
  "serde",
  "serde_json",
  "serde_yaml",

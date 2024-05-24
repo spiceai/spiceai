@@ -16,7 +16,6 @@ limitations under the License.
 
 use crate::dbconnection::DbConnection;
 use async_trait::async_trait;
-use spicepod::component::dataset::acceleration;
 
 #[cfg(feature = "clickhouse")]
 pub mod clickhousepool;
@@ -69,15 +68,6 @@ impl From<&str> for Mode {
             "file" => Mode::File,
             "memory" => Mode::Memory,
             _ => Mode::default(),
-        }
-    }
-}
-
-impl From<acceleration::Mode> for Mode {
-    fn from(m: acceleration::Mode) -> Self {
-        match m {
-            acceleration::Mode::File => Mode::File,
-            acceleration::Mode::Memory => Mode::Memory,
         }
     }
 }
