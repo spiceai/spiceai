@@ -64,7 +64,7 @@ impl Extension for SpiceExtension {
     }
 
     async fn on_start(&mut self, runtime: &Runtime) -> Result<()> {
-        tracing::info!("Starting Spiceai Extension");
+        tracing::info!("Starting Spice.ai Extension");
 
         let secrets = runtime.secrets_provider.read().await;
         let secret = secrets
