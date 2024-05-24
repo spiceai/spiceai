@@ -54,6 +54,7 @@ pub mod dataconnector;
 pub mod datafusion;
 pub mod dataupdate;
 pub mod execution_plan;
+pub mod query_history;
 mod flight;
 mod http;
 pub mod internal_table;
