@@ -2897,7 +2897,6 @@ dependencies = [
  "secrets",
  "snafu 0.8.2",
  "snowflake-api",
- "spicepod",
  "tokio",
  "tokio-postgres",
  "tokio-rusqlite",
@@ -8245,8 +8244,8 @@ dependencies = [
 name = "spicepod"
 version = "0.13.1-alpha"
 dependencies = [
- "fundu",
  "serde",
+ "serde_json",
  "serde_yaml",
  "snafu 0.8.2",
  "tracing",

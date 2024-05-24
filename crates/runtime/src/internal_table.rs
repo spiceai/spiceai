@@ -14,22 +14,23 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::component::dataset::replication::Replication;
 use arrow::datatypes::Schema;
 use datafusion::datasource::TableProvider;
 use secrets::Secret;
 use snafu::prelude::*;
-use spicepod::component::dataset::replication::Replication;
 
 use crate::accelerated_table::Retention;
+use crate::component::dataset::{acceleration::Acceleration, Dataset, Mode};
 use crate::dataconnector::create_new_connector;
 use crate::{
     accelerated_table::{refresh::Refresh, AcceleratedTable},
     dataaccelerator::{self, create_accelerator_table},
     dataconnector::{localhost::LocalhostConnector, DataConnector, DataConnectorError},
 };
-use spicepod::component::dataset::{acceleration::Acceleration, Dataset, Mode};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -104,7 +105,7 @@ async fn get_spiceai_table_provider(
     dataset.mode = Mode::ReadWrite;
     dataset.replication = Some(Replication { enabled: true });
 
-    let data_connector = create_new_connector("spiceai", secret, Arc::new(None))
+    let data_connector = create_new_connector("spiceai", secret, Arc::new(HashMap::new()))
         .await
         .ok_or_else(|| NoReadWriteProviderSnafu {}.build())?
         .context(UnableToCreateDataConnectorSnafu)?;

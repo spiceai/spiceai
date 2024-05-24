@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::component::dataset::acceleration::{self, Engine, Mode};
 use ::arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
@@ -25,7 +26,6 @@ use lazy_static::lazy_static;
 use secrets::ExposeSecret;
 use secrets::Secret;
 use snafu::prelude::*;
-use spicepod::component::dataset::acceleration::{self, Mode};
 use std::{any::Any, collections::HashMap, sync::Arc};
 use tokio::sync::Mutex;
 
@@ -65,30 +65,33 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 lazy_static! {
-    static ref DATA_ACCELERATOR_ENGINES: Mutex<HashMap<Arc<str>, Arc<dyn DataAccelerator>>> =
+    static ref DATA_ACCELERATOR_ENGINES: Mutex<HashMap<Engine, Arc<dyn DataAccelerator>>> =
         Mutex::new(HashMap::new());
 }
 
-pub async fn register_accelerator_engine(name: &str, accelerator_engine: Arc<dyn DataAccelerator>) {
+pub async fn register_accelerator_engine(
+    name: Engine,
+    accelerator_engine: Arc<dyn DataAccelerator>,
+) {
     let mut registry = DATA_ACCELERATOR_ENGINES.lock().await;
 
-    registry.insert(name.into(), accelerator_engine);
+    registry.insert(name, accelerator_engine);
 }
 
 pub async fn register_all() {
-    register_accelerator_engine("arrow", Arc::new(ArrowAccelerator::new())).await;
+    register_accelerator_engine(Engine::Arrow, Arc::new(ArrowAccelerator::new())).await;
     #[cfg(feature = "duckdb")]
-    register_accelerator_engine("duckdb", Arc::new(DuckDBAccelerator::new())).await;
+    register_accelerator_engine(Engine::DuckDB, Arc::new(DuckDBAccelerator::new())).await;
     #[cfg(feature = "postgres")]
-    register_accelerator_engine("postgres", Arc::new(PostgresAccelerator::new())).await;
+    register_accelerator_engine(Engine::PostgreSQL, Arc::new(PostgresAccelerator::new())).await;
     #[cfg(feature = "sqlite")]
-    register_accelerator_engine("sqlite", Arc::new(SqliteAccelerator::new())).await;
+    register_accelerator_engine(Engine::Sqlite, Arc::new(SqliteAccelerator::new())).await;
 }
 
-pub async fn get_accelerator_engine(engine_name: &str) -> Option<Arc<dyn DataAccelerator>> {
+pub async fn get_accelerator_engine(engine: Engine) -> Option<Arc<dyn DataAccelerator>> {
     let guard = DATA_ACCELERATOR_ENGINES.lock().await;
 
-    let engine = guard.get(engine_name);
+    let engine = guard.get(&engine);
 
     match engine {
         Some(engine_ref) => Some(Arc::clone(engine_ref)),
@@ -111,21 +114,21 @@ pub trait DataAccelerator: Send + Sync {
 pub struct AcceleratorExternalTableBuilder {
     table_name: String,
     schema: SchemaRef,
-    engine: Arc<str>,
+    engine: Engine,
     mode: Mode,
-    params: Arc<Option<HashMap<String, String>>>,
+    params: Option<HashMap<String, String>>,
     secret: Option<Secret>,
 }
 
 impl AcceleratorExternalTableBuilder {
     #[must_use]
-    pub fn new(table_name: String, schema: SchemaRef, engine: impl Into<Arc<str>>) -> Self {
+    pub fn new(table_name: String, schema: SchemaRef, engine: Engine) -> Self {
         Self {
             table_name,
             schema,
-            engine: engine.into(),
+            engine,
             mode: Mode::Memory,
-            params: Arc::new(None),
+            params: None,
             secret: None,
         }
     }
@@ -137,8 +140,8 @@ impl AcceleratorExternalTableBuilder {
     }
 
     #[must_use]
-    pub fn params(mut self, params: Arc<Option<HashMap<String, String>>>) -> Self {
-        self.params = params;
+    pub fn params(mut self, params: HashMap<String, String>) -> Self {
+        self.params = Some(params);
         self
     }
 
@@ -159,8 +162,8 @@ impl AcceleratorExternalTableBuilder {
     }
 
     fn validate(&self) -> Result<(), Error> {
-        match self.engine.as_ref() {
-            "arrow" => self.validate_arrow(),
+        match self.engine {
+            Engine::Arrow => self.validate_arrow(),
             _ => Ok(()),
         }
     }
@@ -168,10 +171,7 @@ impl AcceleratorExternalTableBuilder {
     pub fn build(self) -> Result<CreateExternalTable> {
         self.validate()?;
 
-        let mut params = HashMap::new();
-        if let Some(p) = self.params.as_ref() {
-            params.clone_from(p);
-        }
+        let mut params = self.params.unwrap_or_default();
 
         let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&self.schema));
 
@@ -217,16 +217,9 @@ pub async fn create_accelerator_table(
     acceleration_settings: &acceleration::Acceleration,
     acceleration_secret: Option<Secret>,
 ) -> Result<Arc<dyn TableProvider>> {
-    let params = Arc::new(
-        acceleration_settings
-            .params
-            .clone()
-            .map(|params| params.as_string_map()),
-    );
-
     let table_name = table_name.to_string();
 
-    let engine = acceleration_settings.engine();
+    let engine = acceleration_settings.engine;
 
     let accelerator_guard = DATA_ACCELERATOR_ENGINES.lock().await;
     let accelerator =
@@ -237,8 +230,8 @@ pub async fn create_accelerator_table(
             })?;
 
     let external_table = AcceleratorExternalTableBuilder::new(table_name, schema, engine)
-        .mode(acceleration_settings.mode())
-        .params(params)
+        .mode(acceleration_settings.mode)
+        .params(acceleration_settings.params.clone())
         .secret(acceleration_secret)
         .build()?;
 
