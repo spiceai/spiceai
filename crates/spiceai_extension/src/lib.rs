@@ -58,7 +58,7 @@ impl Extension for SpiceExtension {
     }
 
     async fn initialize(&mut self, _runtime: &mut Runtime) -> Result<()> {
-        tracing::info!("Initializing Spiceai Extension");
+        tracing::info!("Initializing Spice.ai Extension");
 
         Ok(())
     }
