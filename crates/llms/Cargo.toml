@@ -36,4 +36,4 @@ tokio = { workspace = true, optional=true }
 default = []
 candle = ["dep:candle-core", "dep:candle-examples", "dep:candle-transformers", "dep:tokenizers"]
 mistralrs = ["dep:mistralrs", "dep:candle-core-rs", "dep:mistralrs-core", "dep:tokio"]
-metal = ["mistralrs/metal", "mistralrs-core/metal", "candle-core-rs/metal"]
+metal = ["mistralrs-core/metal"]
