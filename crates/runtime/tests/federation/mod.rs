@@ -267,6 +267,54 @@ async fn single_source_federation_push_down() -> Result<(), String> {
                 }
             })),
         ),
+        (
+            "SELECT number FROM blocks 
+             UNION ALL
+             SELECT tx.block_number as number FROM tx
+             ORDER BY number DESC LIMIT 10",
+            vec![
+                "+---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+                "| plan_type     | plan                                                                                                                                                                                                                                                                                                         |",
+                "+---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+                "| logical_plan  | Federated                                                                                                                                                                                                                                                                                                    |",
+                "|               |  Limit: skip=0, fetch=10                                                                                                                                                                                                                                                                                     |",
+                "|               |   Sort: blocks.number DESC NULLS FIRST                                                                                                                                                                                                                                                                       |",
+                "|               |     Union                                                                                                                                                                                                                                                                                                    |",
+                "|               |       Projection: blocks.number                                                                                                                                                                                                                                                                              |",
+                "|               |         SubqueryAlias: blocks                                                                                                                                                                                                                                                                                |",
+                "|               |           TableScan: eth.recent_blocks                                                                                                                                                                                                                                                                       |",
+                "|               |       Projection: tx.block_number AS number                                                                                                                                                                                                                                                                  |",
+                "|               |         SubqueryAlias: tx                                                                                                                                                                                                                                                                                    |",
+                "|               |           TableScan: eth.recent_transactions                                                                                                                                                                                                                                                                 |",
+                "| physical_plan | VirtualExecutionPlan name=spiceai compute_context=url=https://flight.spiceai.io,username= sql=SELECT \"blocks\".\"number\" FROM \"eth\".\"recent_blocks\" AS \"blocks\" UNION ALL SELECT \"tx\".\"block_number\" AS \"number\" FROM \"eth\".\"recent_transactions\" AS \"tx\" ORDER BY \"blocks\".\"number\" DESC NULLS FIRST LIMIT 10 |",
+                "|               |                                                                                                                                                                                                                                                                                                              |",
+                "+---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+            ],
+            Some(Box::new(|result_batches| {
+                // Results change over time, but it looks like:
+                // let expected_results = [
+                //     "+----------------+----------+",
+                //     "| total_gas_used | number   |",
+                //     "+----------------+----------+",
+                //     "| 14965044       | 19912051 |",
+                //     "| 19412656       | 19912049 |",
+                //     "| 12304986       | 19912047 |",
+                //     "| 19661381       | 19912046 |",
+                //     "| 10828931       | 19912045 |",
+                //     "| 21121895       | 19912044 |",
+                //     "| 29982938       | 19912043 |",
+                //     "| 10630719       | 19912042 |",
+                //     "| 29988818       | 19912041 |",
+                //     "| 9310052        | 19912040 |",
+                //     "+----------------+----------+",
+                // ];
+
+                for batch in result_batches {
+                    assert_eq!(batch.num_columns(), 2);
+                    assert_eq!(batch.num_rows(), 10);
+                }
+            })),
+        ),
     ];
 
     for (query, expected_plan, validate_result) in queries {
