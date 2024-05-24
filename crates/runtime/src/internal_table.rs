@@ -20,6 +20,7 @@ use std::sync::Arc;
 use crate::component::dataset::replication::Replication;
 use arrow::datatypes::Schema;
 use datafusion::datasource::TableProvider;
+use datafusion::sql::TableReference;
 use secrets::Secret;
 use snafu::prelude::*;
 
@@ -47,13 +48,26 @@ pub enum Error {
 
     #[snafu(display("Unable to create accelerated table provider: {source}"))]
     UnableToCreateAcceleratedTableProvider { source: dataaccelerator::Error },
+
+    #[snafu(display(
+        "An internal error occurred. Report a bug on GitHub (github.com/spiceai/spiceai) and reference the code: {code}"
+    ))]
+    Internal {
+        code: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 async fn get_local_table_provider(
-    name: &str,
+    name: TableReference,
     schema: &Arc<Schema>,
 ) -> Result<Arc<dyn TableProvider>, Error> {
-    let mut dataset = Dataset::new("localhost://internal".to_string(), name.to_string());
+    // This shouldn't error because we control the name passed in, and it shouldn't contain a catalog.
+    let mut dataset = Dataset::try_new("localhost://internal".to_string(), &name.to_string())
+        .boxed()
+        .context(InternalSnafu {
+            code: "IT-GLTP-DTN".to_string(), // InternalTable - GetLocalTableProvider - DatasetTryNew
+        })?;
     dataset.mode = Mode::ReadWrite;
 
     let data_connector =
@@ -69,21 +83,21 @@ async fn get_local_table_provider(
 }
 
 pub async fn create_internal_accelerated_table(
-    name: &str,
+    name: TableReference,
     schema: Arc<Schema>,
     acceleration: Acceleration,
     refresh: Refresh,
     retention: Option<Retention>,
 ) -> Result<Arc<AcceleratedTable>, Error> {
-    let source_table_provider = get_local_table_provider(name, &schema).await?;
+    let source_table_provider = get_local_table_provider(name.clone(), &schema).await?;
 
     let accelerated_table_provider =
-        create_accelerator_table(name, Arc::clone(&schema), &acceleration, None)
+        create_accelerator_table(name.clone(), Arc::clone(&schema), &acceleration, None)
             .await
             .context(UnableToCreateAcceleratedTableProviderSnafu)?;
 
     let mut builder = AcceleratedTable::builder(
-        name.to_string(),
+        name.clone(),
         source_table_provider,
         accelerated_table_provider,
         refresh,
@@ -97,11 +111,16 @@ pub async fn create_internal_accelerated_table(
 }
 
 async fn get_spiceai_table_provider(
-    name: &str,
+    name: TableReference,
     cloud_dataset_path: &str,
     secret: Option<Secret>,
 ) -> Result<Arc<dyn TableProvider>, Error> {
-    let mut dataset = Dataset::new(cloud_dataset_path.to_string(), name.to_string());
+    // This shouldn't error because we control the name passed in, and it shouldn't contain a catalog.
+    let mut dataset = Dataset::try_new(cloud_dataset_path.to_string(), &name.to_string())
+        .boxed()
+        .context(InternalSnafu {
+            code: "IT-GSTP-DTN".to_string(), // InternalTable - GetSpiceaiTableProvider - DatasetTryNew
+        })?;
     dataset.mode = Mode::ReadWrite;
     dataset.replication = Some(Replication { enabled: true });
 
@@ -120,22 +139,26 @@ async fn get_spiceai_table_provider(
 }
 
 pub async fn create_synced_internal_accelerated_table(
-    name: &str,
+    name: TableReference,
     from: &str,
     secret: Option<Secret>,
     acceleration: Acceleration,
     refresh: Refresh,
     retention: Option<Retention>,
 ) -> Result<Arc<AcceleratedTable>, Error> {
-    let source_table_provider = get_spiceai_table_provider(name, from, secret).await?;
+    let source_table_provider = get_spiceai_table_provider(name.clone(), from, secret).await?;
 
-    let accelerated_table_provider =
-        create_accelerator_table(name, source_table_provider.schema(), &acceleration, None)
-            .await
-            .context(UnableToCreateAcceleratedTableProviderSnafu)?;
+    let accelerated_table_provider = create_accelerator_table(
+        name.clone(),
+        source_table_provider.schema(),
+        &acceleration,
+        None,
+    )
+    .await
+    .context(UnableToCreateAcceleratedTableProviderSnafu)?;
 
     let mut builder = AcceleratedTable::builder(
-        name.to_string(),
+        name.clone(),
         source_table_provider,
         accelerated_table_provider,
         refresh,

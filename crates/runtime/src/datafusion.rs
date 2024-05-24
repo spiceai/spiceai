@@ -185,7 +185,7 @@ pub enum Table {
 
 pub struct DataFusion {
     pub ctx: Arc<SessionContext>,
-    data_writers: HashSet<String>,
+    data_writers: HashSet<TableReference>,
     cache_provider: Option<Arc<QueryResultCacheProvider>>,
 }
 
@@ -330,15 +330,17 @@ impl DataFusion {
 
     pub fn register_runtime_table(
         &mut self,
-        name: &str,
+        table_name: &str,
         table: Arc<dyn datafusion::datasource::TableProvider>,
     ) -> Result<()> {
         if let Some(runtime_schema) = self.runtime_schema() {
             runtime_schema
-                .register_table(name.to_string(), table)
+                .register_table(table_name.to_string(), table)
                 .context(UnableToRegisterTableToDataFusionSchemaSnafu { schema: "runtime" })?;
 
-            self.data_writers.insert(format!("runtime.{name}"));
+            let table_reference = TableReference::partial(SPICE_RUNTIME_SCHEMA, table_name);
+
+            self.data_writers.insert(table_reference);
         }
 
         Ok(())
@@ -362,7 +364,7 @@ impl DataFusion {
                         "Registering dataset {dataset:?} with preloaded accelerated table"
                     );
                     self.ctx
-                        .register_table(&dataset.name, Arc::new(accelerated_table))
+                        .register_table(dataset.name.clone(), Arc::new(accelerated_table))
                         .context(UnableToRegisterTableToDataFusionSnafu)?;
 
                     return Ok(());
@@ -371,7 +373,7 @@ impl DataFusion {
                     .await?;
             }
             Table::Federated(source) => self.register_federated_table(dataset, source).await?,
-            Table::View(sql) => self.register_view(&dataset.name, sql)?,
+            Table::View(sql) => self.register_view(dataset.name.clone(), sql)?,
         }
 
         if matches!(dataset.mode(), Mode::ReadWrite) {
@@ -383,13 +385,7 @@ impl DataFusion {
 
     #[must_use]
     pub fn is_writable(&self, table_reference: &TableReference) -> bool {
-        let mut table_name = table_reference.table().to_string();
-
-        if let Some(schema_name) = table_reference.schema() {
-            table_name = format!("{schema_name}.{table_name}");
-        }
-
-        self.data_writers.iter().any(|s| s.as_str() == table_name)
+        self.data_writers.iter().any(|s| s == table_reference)
     }
 
     async fn get_table_provider(
@@ -478,23 +474,23 @@ impl DataFusion {
     }
 
     #[must_use]
-    pub fn table_exists(&self, dataset_name: &str) -> bool {
+    pub fn table_exists(&self, dataset_name: TableReference) -> bool {
         self.ctx.table_exist(dataset_name).unwrap_or(false)
     }
 
-    pub fn remove_table(&mut self, dataset_name: &str) -> Result<()> {
-        if !self.ctx.table_exist(dataset_name).unwrap_or(false) {
+    pub fn remove_table(&mut self, dataset_name: &TableReference) -> Result<()> {
+        if !self.ctx.table_exist(dataset_name.clone()).unwrap_or(false) {
             return Ok(());
         }
 
-        if let Err(e) = self.ctx.deregister_table(dataset_name) {
+        if let Err(e) = self.ctx.deregister_table(dataset_name.clone()) {
             return UnableToDeleteTableSnafu {
                 reason: e.to_string(),
             }
             .fail();
         }
 
-        if self.is_writable(&TableReference::bare(dataset_name)) {
+        if self.is_writable(dataset_name) {
             self.data_writers.remove(dataset_name);
         }
 
@@ -535,7 +531,7 @@ impl DataFusion {
                 })?;
 
         let accelerated_table_provider = create_accelerator_table(
-            &dataset.name,
+            dataset.name.clone(),
             source_schema,
             &acceleration_settings,
             acceleration_secret,
@@ -545,12 +541,12 @@ impl DataFusion {
 
         let refresh_sql = dataset.refresh_sql();
         if let Some(refresh_sql) = &refresh_sql {
-            refresh_sql::validate_refresh_sql(&dataset.name, refresh_sql.as_str())
+            refresh_sql::validate_refresh_sql(dataset.name.clone(), refresh_sql.as_str())
                 .context(RefreshSqlSnafu)?;
         }
 
         let mut accelerated_table_builder = AcceleratedTable::builder(
-            dataset.name.to_string(),
+            dataset.name.clone(),
             source_table_provider,
             accelerated_table_provider,
             Refresh::new(
@@ -585,7 +581,7 @@ impl DataFusion {
             .await?;
 
         self.ctx
-            .register_table(&dataset.name, Arc::new(accelerated_table))
+            .register_table(dataset.name.clone(), Arc::new(accelerated_table))
             .context(UnableToRegisterTableToDataFusionSnafu)?;
 
         Ok(())
@@ -617,16 +613,17 @@ impl DataFusion {
 
     pub async fn update_refresh_sql(
         &self,
-        dataset_name: &str,
+        dataset_name: TableReference,
         refresh_sql: Option<String>,
     ) -> Result<()> {
         if let Some(sql) = &refresh_sql {
-            refresh_sql::validate_refresh_sql(dataset_name, sql).context(RefreshSqlSnafu)?;
+            refresh_sql::validate_refresh_sql(dataset_name.clone(), sql)
+                .context(RefreshSqlSnafu)?;
         }
 
         let table = self
             .ctx
-            .table_provider(TableReference::bare(dataset_name.to_string()))
+            .table_provider(dataset_name.clone())
             .await
             .context(UnableToGetTableSnafu)?;
 
@@ -648,7 +645,7 @@ impl DataFusion {
         source: Arc<dyn DataConnector>,
     ) -> Result<()> {
         tracing::debug!("Registering federated table {dataset:?}");
-        let table_exists = self.ctx.table_exist(&dataset.name).unwrap_or(false);
+        let table_exists = self.ctx.table_exist(dataset.name.clone()).unwrap_or(false);
         if table_exists {
             return TableAlreadyExistsSnafu.fail();
         }
@@ -671,14 +668,14 @@ impl DataFusion {
         };
 
         self.ctx
-            .register_table(&dataset.name, source_table_provider)
+            .register_table(dataset.name.clone(), source_table_provider)
             .context(UnableToRegisterTableToDataFusionSnafu)?;
 
         Ok(())
     }
 
-    fn register_view(&self, table_name: &str, view: String) -> Result<()> {
-        let table_exists = self.ctx.table_exist(table_name).unwrap_or(false);
+    fn register_view(&self, table: TableReference, view: String) -> Result<()> {
+        let table_exists = self.ctx.table_exist(table.clone()).unwrap_or(false);
         if table_exists {
             return TableAlreadyExistsSnafu.fail();
         }
@@ -697,14 +694,13 @@ impl DataFusion {
         }
 
         let ctx = Arc::clone(&self.ctx);
-        let table_name = table_name.to_string();
         spawn(async move {
             // Tables are currently lazily created (i.e. not created until first data is received) so that we know the table schema.
             // This means that we can't create a view on top of a table until the first data is received for all dependent tables and therefore
             // the tables are created. To handle this, wait until all tables are created.
 
             let deadline = Instant::now() + Duration::from_secs(60);
-            let mut unresolved_dependent_table: Option<String> = None;
+            let mut unresolved_dependent_table: Option<TableReference> = None;
             let dependent_table_names = get_dependent_table_names(&statements[0]);
             for dependent_table_name in dependent_table_names {
                 let mut attempts = 0;
@@ -714,14 +710,17 @@ impl DataFusion {
                 }
 
                 loop {
-                    if !ctx.table_exist(&dependent_table_name).unwrap_or(false) {
+                    if !ctx
+                        .table_exist(dependent_table_name.clone())
+                        .unwrap_or(false)
+                    {
                         if Instant::now() >= deadline {
                             unresolved_dependent_table = Some(dependent_table_name.clone());
                             break;
                         }
 
                         if attempts % 10 == 0 {
-                            tracing::warn!("Dependent table {dependent_table_name} for view {table_name} does not exist, retrying...");
+                            tracing::warn!("Dependent table {dependent_table_name} for view {table} does not exist, retrying...");
                         }
                         attempts += 1;
                         sleep(Duration::from_secs(1)).await;
@@ -732,7 +731,7 @@ impl DataFusion {
             }
 
             if let Some(missing_table) = unresolved_dependent_table {
-                tracing::error!("Failed to create view {table_name}. Dependent table {missing_table} does not exist.");
+                tracing::error!("Failed to create view {table}. Dependent table {missing_table} does not exist.");
                 return;
             }
 
@@ -751,14 +750,11 @@ impl DataFusion {
                     return;
                 }
             };
-            if let Err(e) = ctx.register_table(
-                TableReference::bare(table_name.clone()),
-                Arc::new(view_table),
-            ) {
+            if let Err(e) = ctx.register_table(table.clone(), Arc::new(view_table)) {
                 tracing::error!("Failed to create view: {e}");
             };
 
-            tracing::info!("Created view {table_name}");
+            tracing::info!("Created view {table}");
         });
 
         Ok(())

@@ -95,7 +95,7 @@ impl MetricsRecorder {
                 };
 
                 create_synced_internal_accelerated_table(
-                    "metrics",
+                    TableReference::bare("metrics"),
                     path.as_str(),
                     secret,
                     Acceleration::default(),
@@ -106,7 +106,7 @@ impl MetricsRecorder {
                 .context(UnableToCreateMetricsTableSnafu)?
             }
             None => create_internal_accelerated_table(
-                "metrics",
+                TableReference::bare("metrics"),
                 get_metrics_schema(),
                 Acceleration::default(),
                 Refresh::default(),

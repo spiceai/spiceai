@@ -44,7 +44,7 @@ fn convert_entry_to_csv<T: Serialize>(entries: &[T]) -> Result<String, Box<dyn s
 }
 
 fn dataset_status(df: &DataFusion, ds: &Dataset) -> ComponentStatus {
-    if df.table_exists(ds.name.as_str()) {
+    if df.table_exists(ds.name.clone()) {
         ComponentStatus::Ready
     } else {
         ComponentStatus::Error
@@ -357,6 +357,7 @@ pub(crate) mod datasets {
         response::{IntoResponse, Response},
         Extension, Json,
     };
+    use datafusion::sql::TableReference;
     use serde::{Deserialize, Serialize};
     use tokio::sync::RwLock;
     use tract_core::tract_data::itertools::Itertools;
@@ -428,7 +429,7 @@ pub(crate) mod datasets {
             .iter()
             .map(|d| DatasetResponseItem {
                 from: d.from.clone(),
-                name: d.name.clone(),
+                name: d.name.to_quoted_string(),
                 replication_enabled: d.replication.as_ref().is_some_and(|f| f.enabled),
                 acceleration_enabled: d.acceleration.as_ref().is_some_and(|f| f.enabled),
                 status: if params.status {
@@ -550,7 +551,10 @@ pub(crate) mod datasets {
         let df_read = df.read().await;
 
         match df_read
-            .update_refresh_sql(&dataset.name, payload.refresh_sql)
+            .update_refresh_sql(
+                TableReference::parse_str(&dataset.name),
+                payload.refresh_sql,
+            )
             .await
         {
             Ok(()) => (status::StatusCode::OK).into_response(),
