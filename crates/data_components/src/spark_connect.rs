@@ -23,7 +23,9 @@ use datafusion::{
     sql::TableReference,
 };
 use futures::Stream;
-use spark_connect_rs::{functions::col, DataFrame, SparkSession, SparkSessionBuilder};
+use spark_connect_rs::{
+    client::ChannelBuilder, functions::col, DataFrame, SparkSession, SparkSessionBuilder,
+};
 use sql_provider_datafusion::expr::{self, Engine};
 
 use std::error::Error;
@@ -35,6 +37,13 @@ pub struct SparkConnect {
 }
 
 impl SparkConnect {
+    pub fn validate_connection_string(
+        connection: &str,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        ChannelBuilder::parse_connection_string(connection)?;
+        Ok(())
+    }
+
     pub async fn from_connection(connection: &str) -> Result<Self, Box<dyn Error + Send + Sync>> {
         let session = Arc::new(SparkSessionBuilder::remote(connection)?.build().await?);
         Ok(Self { session })

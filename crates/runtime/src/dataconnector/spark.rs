@@ -28,7 +28,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::{collections::HashMap, future::Future};
 
-use super::{DataConnector, DataConnectorFactory};
+use super::{DataConnector, DataConnectorError, DataConnectorFactory};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -43,7 +43,7 @@ pub enum Error {
     #[snafu(display("Endpoint {endpoint} is invalid: {source}"))]
     InvalidEndpoint {
         endpoint: String,
-        source: ns_lookup::Error,
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     #[snafu(display("{source}"))]
@@ -72,6 +72,8 @@ impl Spark {
             (Some(conn), _) => Ok(conn.as_str()),
             _ => MissingSparkRemoteSnafu.fail(),
         }?;
+        SparkConnect::validate_connection_string(conn)
+            .context(InvalidEndpointSnafu { endpoint: conn })?;
         let spark = SparkConnect::from_connection(conn)
             .await
             .context(UnableToConstructSparkConnectSnafu)?;
@@ -88,8 +90,29 @@ impl DataConnectorFactory for Spark {
         params: Arc<HashMap<String, String>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let spark_connector = Spark::new(Arc::new(secret), params).await?;
-            Ok(Arc::new(spark_connector) as Arc<dyn DataConnector>)
+            match Spark::new(Arc::new(secret), params).await {
+                Ok(spark_connector) => Ok(Arc::new(spark_connector) as Arc<dyn DataConnector>),
+                Err(e) => match e {
+                    Error::DuplicatedSparkRemote
+                    | Error::MissingSparkRemote
+                    | Error::InvalidEndpoint {
+                        endpoint: _,
+                        source: _,
+                    } => Err(DataConnectorError::InvalidConfiguration {
+                        dataconnector: "spark".to_string(),
+                        message: e.to_string(),
+                        source: e.into(),
+                    }
+                    .into()),
+                    Error::UnableToConstructSparkConnect { source } => {
+                        Err(DataConnectorError::UnableToConnectInternal {
+                            dataconnector: "spark".to_string(),
+                            source,
+                        }
+                        .into())
+                    }
+                },
+            }
         })
     }
 }
