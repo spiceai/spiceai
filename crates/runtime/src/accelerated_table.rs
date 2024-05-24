@@ -17,6 +17,8 @@ limitations under the License.
 use std::time::SystemTime;
 use std::{any::Any, sync::Arc, time::Duration};
 
+use crate::component::dataset::acceleration::{RefreshMode, ZeroResultsAction};
+use crate::component::dataset::TimeFormat;
 use arrow::array::UInt64Array;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
@@ -27,14 +29,13 @@ use datafusion::execution::context::SessionState;
 use datafusion::logical_expr::{Operator, TableProviderFilterPushDown};
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{collect, ExecutionPlan};
+use datafusion::sql::TableReference;
 use datafusion::{
     datasource::{TableProvider, TableType},
     execution::context::SessionContext,
     logical_expr::Expr,
 };
 use snafu::prelude::*;
-use spicepod::component::dataset::acceleration::{RefreshMode, ZeroResultsAction};
-use spicepod::component::dataset::TimeFormat;
 use tokio::task::JoinHandle;
 use tokio::time::interval;
 
@@ -84,7 +85,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 // The accelerator must support inserts.
 // AcceleratedTable::new returns an instance of the table and a oneshot receiver that will be triggered when the table is ready, right after the initial data refresh finishes.
 pub struct AcceleratedTable {
-    dataset_name: String,
+    dataset_name: TableReference,
     accelerator: Arc<dyn TableProvider>,
     federated: Arc<dyn TableProvider>,
     refresh_trigger: Option<mpsc::Sender<()>>,
@@ -93,7 +94,11 @@ pub struct AcceleratedTable {
     refresh_params: Arc<RwLock<refresh::Refresh>>,
 }
 
-fn validate_refresh_data_window(refresh: &refresh::Refresh, dataset: &str, schema: &SchemaRef) {
+fn validate_refresh_data_window(
+    refresh: &refresh::Refresh,
+    dataset: &TableReference,
+    schema: &SchemaRef,
+) {
     if refresh.period.is_some() {
         if let Some(time_column) = &refresh.time_column {
             if schema.column_with_name(time_column).is_none() {
@@ -110,7 +115,7 @@ fn validate_refresh_data_window(refresh: &refresh::Refresh, dataset: &str, schem
 }
 
 pub struct Builder {
-    dataset_name: String,
+    dataset_name: TableReference,
     federated: Arc<dyn TableProvider>,
     accelerator: Arc<dyn TableProvider>,
     refresh: refresh::Refresh,
@@ -121,7 +126,7 @@ pub struct Builder {
 
 impl Builder {
     pub fn new(
-        dataset_name: String,
+        dataset_name: TableReference,
         federated: Arc<dyn TableProvider>,
         accelerator: Arc<dyn TableProvider>,
         refresh: refresh::Refresh,
@@ -235,7 +240,7 @@ impl Builder {
 
 impl AcceleratedTable {
     pub fn builder(
-        dataset_name: String,
+        dataset_name: TableReference,
         federated: Arc<dyn TableProvider>,
         accelerator: Arc<dyn TableProvider>,
         refresh: refresh::Refresh,
@@ -300,7 +305,7 @@ impl AcceleratedTable {
     #[allow(clippy::cast_possible_wrap)]
     #[allow(clippy::cast_possible_truncation)]
     async fn start_retention_check(
-        dataset_name: String,
+        dataset_name: TableReference,
         accelerator: Arc<dyn TableProvider>,
         retention: Retention,
         cache_provider: Option<Arc<QueryResultCacheProvider>>,

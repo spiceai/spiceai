@@ -54,7 +54,7 @@ pub enum Error {
 
 pub struct ODBCPool {
     pool: &'static Environment,
-    params: Option<HashMap<String, String>>,
+    params: Arc<HashMap<String, String>>,
     connection_string: String,
 }
 
@@ -64,19 +64,16 @@ impl ODBCPool {
     /// # Errors
     ///
     /// Returns an error if there is a problem creating the connection pool.
-    pub fn new(
-        params: &Arc<Option<HashMap<String, String>>>,
-        secret: &Option<Secret>,
-    ) -> Result<Self> {
+    pub fn new(params: Arc<HashMap<String, String>>, secret: &Option<Secret>) -> Result<Self> {
         let connection_string = get_secret_or_param(
-            params.as_ref().as_ref(),
+            &params,
             secret,
             "odbc_connection_string_key",
             "odbc_connection_string",
         )
         .context(MissingConnectionStringSnafu)?;
         Ok(Self {
-            params: params.as_ref().clone(),
+            params,
             connection_string,
             pool: &ENV,
         })
@@ -101,7 +98,7 @@ where
 
         let odbc_cxn = ODBCConnection {
             conn: Arc::new(cxn.into()),
-            params: self.params.clone(),
+            params: Arc::clone(&self.params),
         };
 
         Ok(Box::new(odbc_cxn))

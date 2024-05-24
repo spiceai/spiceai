@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::component::dataset::Dataset;
 use arrow::array::RecordBatch;
 use axum::{
     http::StatusCode,
@@ -22,7 +23,6 @@ use axum::{
 use csv::Writer;
 use datafusion::dataframe::DataFrame;
 use serde::{Deserialize, Serialize};
-use spicepod::component::dataset::Dataset;
 
 use crate::{datafusion::DataFusion, status::ComponentStatus};
 
@@ -44,7 +44,7 @@ fn convert_entry_to_csv<T: Serialize>(entries: &[T]) -> Result<String, Box<dyn s
 }
 
 fn dataset_status(df: &DataFusion, ds: &Dataset) -> ComponentStatus {
-    if df.table_exists(ds.name.as_str()) {
+    if df.table_exists(ds.name.clone()) {
         ComponentStatus::Ready
     } else {
         ComponentStatus::Error
@@ -348,6 +348,7 @@ pub(crate) mod status {
 pub(crate) mod datasets {
     use std::sync::Arc;
 
+    use crate::{component::dataset::Dataset, Runtime};
     use app::App;
     use axum::{
         extract::Path,
@@ -356,8 +357,8 @@ pub(crate) mod datasets {
         response::{IntoResponse, Response},
         Extension, Json,
     };
+    use datafusion::sql::TableReference;
     use serde::{Deserialize, Serialize};
-    use spicepod::component::dataset::Dataset;
     use tokio::sync::RwLock;
     use tract_core::tract_data::itertools::Itertools;
 
@@ -389,7 +390,6 @@ pub(crate) mod datasets {
         pub name: String,
         pub replication_enabled: bool,
         pub acceleration_enabled: bool,
-        pub depends_on: Option<String>,
 
         #[serde(skip_serializing_if = "Option::is_none")]
         pub status: Option<ComponentStatus>,
@@ -410,14 +410,13 @@ pub(crate) mod datasets {
                 .into_response();
         };
 
+        let valid_datasets = Runtime::get_valid_datasets(readable_app, false);
         let mut datasets: Vec<Dataset> = match filter.source {
-            Some(source) => readable_app
-                .datasets
-                .iter()
+            Some(source) => valid_datasets
+                .into_iter()
                 .filter(|d| d.source() == source)
-                .cloned()
                 .collect(),
-            None => readable_app.datasets.clone(),
+            None => valid_datasets,
         };
 
         if filter.remove_views {
@@ -430,14 +429,9 @@ pub(crate) mod datasets {
             .iter()
             .map(|d| DatasetResponseItem {
                 from: d.from.clone(),
-                name: d.name.clone(),
+                name: d.name.to_quoted_string(),
                 replication_enabled: d.replication.as_ref().is_some_and(|f| f.enabled),
                 acceleration_enabled: d.acceleration.as_ref().is_some_and(|f| f.enabled),
-                depends_on: if d.depends_on.is_empty() {
-                    None
-                } else {
-                    Some(d.depends_on.join(", "))
-                },
                 status: if params.status {
                     Some(dataset_status(&df_read, d))
                 } else {
@@ -557,7 +551,10 @@ pub(crate) mod datasets {
         let df_read = df.read().await;
 
         match df_read
-            .update_refresh_sql(&dataset.name, payload.refresh_sql)
+            .update_refresh_sql(
+                TableReference::parse_str(&dataset.name),
+                payload.refresh_sql,
+            )
             .await
         {
             Ok(()) => (status::StatusCode::OK).into_response(),
