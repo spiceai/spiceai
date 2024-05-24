@@ -22,7 +22,7 @@ use crate::component::dataset::TimeFormat;
 use arrow::array::UInt64Array;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
-use cache::QueryResultCacheProvider;
+use cache::QueryResultsCacheProvider;
 use data_components::delete::get_deletion_provider;
 use datafusion::error::Result as DataFusionResult;
 use datafusion::execution::context::SessionState;
@@ -121,7 +121,7 @@ pub struct Builder {
     refresh: refresh::Refresh,
     retention: Option<Retention>,
     zero_results_action: ZeroResultsAction,
-    cache_provider: Option<Arc<QueryResultCacheProvider>>,
+    cache_provider: Option<Arc<QueryResultsCacheProvider>>,
 }
 
 impl Builder {
@@ -154,7 +154,7 @@ impl Builder {
 
     pub fn cache_provider(
         &mut self,
-        cache_provider: Option<Arc<QueryResultCacheProvider>>,
+        cache_provider: Option<Arc<QueryResultsCacheProvider>>,
     ) -> &mut Self {
         self.cache_provider = cache_provider;
         self
@@ -308,7 +308,7 @@ impl AcceleratedTable {
         dataset_name: TableReference,
         accelerator: Arc<dyn TableProvider>,
         retention: Retention,
-        cache_provider: Option<Arc<QueryResultCacheProvider>>,
+        cache_provider: Option<Arc<QueryResultsCacheProvider>>,
     ) {
         let time_column = retention.time_column;
         let retention_period = retention.period;
@@ -375,10 +375,11 @@ impl AcceleratedTable {
 
                                 if num_records > 0 {
                                     if let Some(cache_provider) = &cache_provider {
-                                        if let Err(e) =
-                                            cache_provider.invalidate_for_table(&dataset_name).await
+                                        if let Err(e) = cache_provider
+                                            .invalidate_for_table(&dataset_name.to_string())
+                                            .await
                                         {
-                                            tracing::error!("Failed to invalidate cached results for dataset {dataset_name}: {e}");
+                                            tracing::error!("Failed to invalidate cached results for dataset {}: {e}", &dataset_name.to_string());
                                         }
                                     }
                                 }
