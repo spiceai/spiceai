@@ -2,6 +2,9 @@ use async_trait::async_trait;
 use snafu::prelude::*;
 
 use crate::Runtime;
+use spicepod::component::extension::Extension as ExtensionComponent;
+
+pub type ExtensionManifest = ExtensionComponent;
 
 #[derive(Debug, Snafu)]
 pub enum Error {

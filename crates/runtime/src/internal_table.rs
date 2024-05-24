@@ -60,7 +60,6 @@ async fn get_local_table_provider(
     schema: &Arc<Schema>,
 ) -> Result<Arc<dyn TableProvider>, Error> {
     // This shouldn't error because we control the name passed in, and it shouldn't contain a catalog.
-    println!("Creating dataset {}", &name.to_string());
     let mut dataset = Dataset::try_new("localhost://internal".to_string(), &name.to_string())
         .boxed()
         .context(InternalSnafu {

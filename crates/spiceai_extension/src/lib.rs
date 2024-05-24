@@ -13,7 +13,7 @@ use runtime::{
     },
     dataaccelerator::{self, create_accelerator_table},
     dataconnector::{create_new_connector, DataConnectorError},
-    extensions::{Extension, ExtensionFactory, Result},
+    extensions::{Extension, ExtensionFactory, ExtensionManifest, Result},
     spice_metrics::get_metrics_table_reference,
     Runtime,
 };
@@ -36,18 +36,20 @@ pub enum Error {
     UnableToCreateAcceleratedTableProvider { source: dataaccelerator::Error },
 }
 
-pub struct SpiceExtension;
+pub struct SpiceExtension {
+    manifest: ExtensionManifest,
+}
 
 impl SpiceExtension {
     #[must_use]
-    pub fn new() -> Self {
-        SpiceExtension {}
+    pub fn new(manifest: ExtensionManifest) -> Self {
+        SpiceExtension { manifest }
     }
 }
 
 impl Default for SpiceExtension {
     fn default() -> Self {
-        SpiceExtension::new()
+        SpiceExtension::new(ExtensionManifest::default())
     }
 }
 
@@ -58,70 +60,100 @@ impl Extension for SpiceExtension {
     }
 
     async fn initialize(&mut self, _runtime: &mut Runtime) -> Result<()> {
+        if !self.manifest.enabled {
+            return Ok(());
+        }
+
         tracing::info!("Initializing Spice.ai Extension");
 
         Ok(())
     }
 
     async fn on_start(&mut self, runtime: &Runtime) -> Result<()> {
-        tracing::info!("Starting Spice.ai Extension");
+        if !self.manifest.enabled {
+            return Ok(());
+        }
 
-        let secrets = runtime.secrets_provider.read().await;
-        let secret = secrets
-            .get_secret("spiceai")
+        if let Some(spiceai_metrics_dataset_path) = self.manifest.params.get("metrics_dataset_path")
+        {
+            tracing::info!("Starting Spice.ai Extension");
+
+            let secrets = runtime.secrets_provider.read().await;
+            let secret = secrets
+                .get_secret("spiceai")
+                .await
+                .map_err(|e| runtime::extensions::Error::UnableToStartExtension { source: e })?;
+
+            let retention = Retention::new(
+                Some("timestamp".to_string()),
+                Some(TimeFormat::UnixSeconds),
+                Some(Duration::from_secs(1800)), // delete metrics older then 30 minutes
+                Some(Duration::from_secs(300)),  // run retention every 5 minutes
+                true,
+            );
+
+            let refresh = Refresh::new(
+                Some("timestamp".to_string()),
+                Some(TimeFormat::UnixSeconds),
+                Some(Duration::from_secs(10)),
+                None,
+                RefreshMode::Full,
+                Some(Duration::from_secs(1800)), // sync only last 30 minutes from cloud
+            );
+
+            let metrics_table_reference = get_metrics_table_reference();
+
+            let table = create_synced_internal_accelerated_table(
+                metrics_table_reference.table(),
+                spiceai_metrics_dataset_path,
+                secret,
+                Acceleration::default(),
+                refresh,
+                retention,
+            )
             .await
-            .map_err(|e| runtime::extensions::Error::UnableToStartExtension { source: e })?;
-
-        let retention = Retention::new(
-            Some("timestamp".to_string()),
-            Some(TimeFormat::UnixSeconds),
-            Some(Duration::from_secs(1800)), // delete metrics older then 30 minutes
-            Some(Duration::from_secs(300)),  // run retention every 5 minutes
-            true,
-        );
-
-        let refresh = Refresh::new(
-            Some("timestamp".to_string()),
-            Some(TimeFormat::UnixSeconds),
-            Some(Duration::from_secs(10)),
-            None,
-            RefreshMode::Full,
-            Some(Duration::from_secs(1800)), // sync only last 30 minutes from cloud
-        );
-
-        let metrics_table_reference = get_metrics_table_reference();
-
-        let table = create_synced_internal_accelerated_table(
-            metrics_table_reference.table(),
-            "spice.ai/ewgenius/demo/runtime_metrics_test",
-            secret,
-            Acceleration::default(),
-            refresh,
-            retention,
-        )
-        .await
-        .boxed()
-        .map_err(|e| runtime::extensions::Error::UnableToStartExtension { source: e })?;
-
-        runtime
-            .datafusion()
-            .write()
-            .await
-            .register_runtime_table(metrics_table_reference.table(), table)
             .boxed()
             .map_err(|e| runtime::extensions::Error::UnableToStartExtension { source: e })?;
 
-        tracing::info!("Enabled sync to Spice.ai for runtime.metrics");
+            runtime
+                .datafusion()
+                .write()
+                .await
+                .register_runtime_table(metrics_table_reference.table(), table)
+                .boxed()
+                .map_err(|e| runtime::extensions::Error::UnableToStartExtension { source: e })?;
+
+            tracing::info!(
+                "Enabled metrics sync from runtime.metrics to {spiceai_metrics_dataset_path}"
+            );
+        }
 
         Ok(())
     }
 }
 
-pub struct SpiceExtensionFactory;
+pub struct SpiceExtensionFactory {
+    manifest: Option<ExtensionManifest>,
+}
+
+impl SpiceExtensionFactory {
+    #[must_use]
+    pub fn new(manifest: Option<&ExtensionManifest>) -> Self {
+        SpiceExtensionFactory {
+            manifest: manifest.cloned(),
+        }
+    }
+}
 
 impl ExtensionFactory for SpiceExtensionFactory {
     fn create(&self) -> Box<dyn Extension> {
-        Box::new(SpiceExtension)
+        let manifest = self
+            .manifest
+            .as_ref()
+            .unwrap_or(&ExtensionManifest::default())
+            .clone();
+
+        Box::new(SpiceExtension { manifest })
     }
 }
 

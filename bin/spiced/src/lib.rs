@@ -26,6 +26,7 @@ use clap::Parser;
 use flightrepl::ReplConfig;
 use runtime::config::Config as RuntimeConfig;
 
+use runtime::extensions::ExtensionManifest;
 use runtime::podswatcher::PodsWatcher;
 use runtime::{extensions::ExtensionFactory, Runtime};
 use snafu::prelude::*;
@@ -100,7 +101,11 @@ pub async fn run(args: Args) -> Result<()> {
     let mut extension_factories: Vec<Box<dyn ExtensionFactory>> = vec![];
 
     if cfg!(feature = "spiceai-extension") {
-        let spice_extension_factory = SpiceExtensionFactory {};
+        let mut manifest: Option<&ExtensionManifest> = None;
+        if let Some(app) = &app {
+            manifest = app.extensions.get("spiceai");
+        }
+        let spice_extension_factory = SpiceExtensionFactory::new(manifest);
         extension_factories.push(Box::new(spice_extension_factory));
     }
 
