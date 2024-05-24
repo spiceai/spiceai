@@ -457,15 +457,23 @@ impl Refresher {
             ),
             default_runtime_env(),
         );
-        let dataset_name = self.dataset_name.clone();
-        if let Err(e) = ctx.register_table(dataset_name.clone(), Arc::clone(&self.federated)) {
+        if let Err(e) = ctx.register_table(self.dataset_name.clone(), Arc::clone(&self.federated)) {
             tracing::error!("Unable to register federated table: {e}");
         }
 
-        let acc_dataset_name = format!("accelerated_{dataset_name}");
+        let mut acc_dataset_name = String::with_capacity(
+            self.dataset_name.table().len() + self.dataset_name.schema().map_or(0, str::len),
+        );
+
+        if let Some(schema) = self.dataset_name.schema() {
+            acc_dataset_name.push_str(schema);
+        }
+
+        acc_dataset_name.push_str("accelerated_");
+        acc_dataset_name.push_str(self.dataset_name.table());
 
         if let Err(e) = ctx.register_table(
-            TableReference::bare(acc_dataset_name),
+            TableReference::parse_str(&acc_dataset_name),
             Arc::clone(&self.accelerator),
         ) {
             tracing::error!("Unable to register accelerator table: {e}");
