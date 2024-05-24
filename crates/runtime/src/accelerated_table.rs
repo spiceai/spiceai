@@ -20,6 +20,7 @@ use std::{any::Any, sync::Arc, time::Duration};
 use arrow::array::UInt64Array;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
+use cache::QueryResultCacheProvider;
 use data_components::delete::get_deletion_provider;
 use datafusion::error::Result as DataFusionResult;
 use datafusion::execution::context::SessionState;
@@ -115,6 +116,7 @@ pub struct Builder {
     refresh: refresh::Refresh,
     retention: Option<Retention>,
     zero_results_action: ZeroResultsAction,
+    cache_provider: Option<Arc<QueryResultCacheProvider>>,
 }
 
 impl Builder {
@@ -131,6 +133,7 @@ impl Builder {
             refresh,
             retention: None,
             zero_results_action: ZeroResultsAction::default(),
+            cache_provider: None,
         }
     }
 
@@ -144,6 +147,13 @@ impl Builder {
         self
     }
 
+    pub fn cache_provider(
+        &mut self,
+        cache_provider: Option<Arc<QueryResultCacheProvider>>,
+    ) -> &mut Self {
+        self.cache_provider = cache_provider;
+        self
+    }
     pub async fn build(self) -> (AcceleratedTable, oneshot::Receiver<()>) {
         let mut refresh_trigger = None;
         let mut scheduled_refreshes_handle: Option<JoinHandle<()>> = None;
@@ -183,6 +193,7 @@ impl Builder {
             Arc::clone(&self.federated),
             Arc::clone(&refresh_params),
             Arc::clone(&self.accelerator),
+            self.cache_provider.clone(),
         );
         let refresh_handle = tokio::spawn(async move {
             refresher
@@ -202,10 +213,10 @@ impl Builder {
                 self.dataset_name.clone(),
                 Arc::clone(&self.accelerator),
                 retention,
+                self.cache_provider.clone(),
             ));
             handlers.push(retention_check_handle);
         }
-
         (
             AcceleratedTable {
                 dataset_name: self.dataset_name,
@@ -291,6 +302,7 @@ impl AcceleratedTable {
         dataset_name: String,
         accelerator: Arc<dyn TableProvider>,
         retention: Retention,
+        cache_provider: Option<Arc<QueryResultCacheProvider>>,
     ) {
         let time_column = retention.time_column;
         let retention_period = retention.period;
@@ -344,7 +356,7 @@ impl AcceleratedTable {
                                 tracing::error!("[retention] Error running retention check: {e}");
                             }
                             Ok(deleted) => {
-                                let result = deleted.first().map_or(0, |f| {
+                                let num_records = deleted.first().map_or(0, |f| {
                                     f.column(0)
                                         .as_any()
                                         .downcast_ref::<UInt64Array>()
@@ -352,8 +364,18 @@ impl AcceleratedTable {
                                 });
 
                                 tracing::info!(
-                                    "[retention] Evicted {result} records for {dataset_name}",
+                                    "[retention] Evicted {num_records} records for {dataset_name}",
                                 );
+
+                                if num_records > 0 {
+                                    if let Some(cache_provider) = &cache_provider {
+                                        if let Err(e) =
+                                            cache_provider.invalidate_for_table(&dataset_name).await
+                                        {
+                                            tracing::error!("Failed to invalidate cached results for dataset {dataset_name}: {e}");
+                                        }
+                                    }
+                                }
                             }
                         };
                     }

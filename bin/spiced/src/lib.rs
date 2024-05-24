@@ -115,11 +115,11 @@ pub async fn run(args: Args) -> Result<()> {
 
     rt.load_secrets().await;
 
+    rt.init_results_cache().await;
+
     rt.load_datasets().await;
 
     rt.load_models().await;
-
-    rt.init_results_cache().await;
 
     if args.spice_cloud_connect {
         if let Err(err) = rt
