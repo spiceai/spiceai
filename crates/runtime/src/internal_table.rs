@@ -14,15 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::component::dataset::replication::Replication;
 use arrow::datatypes::Schema;
 use datafusion::datasource::TableProvider;
 use snafu::prelude::*;
 
 use crate::accelerated_table::Retention;
+use crate::component::dataset::acceleration::Acceleration;
+use crate::component::dataset::{Dataset, Mode};
 use crate::{
     accelerated_table::{refresh::Refresh, AcceleratedTable},
     dataaccelerator::{self, create_accelerator_table},

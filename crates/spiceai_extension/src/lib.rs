@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
@@ -6,6 +6,11 @@ use snafu::prelude::*;
 
 use runtime::{
     accelerated_table::{refresh::Refresh, AcceleratedTable, Retention},
+    component::dataset::{
+        acceleration::{Acceleration, RefreshMode},
+        replication::Replication,
+        Dataset, Mode, TimeFormat,
+    },
     dataaccelerator::{self, create_accelerator_table},
     dataconnector::{create_new_connector, DataConnectorError},
     extensions::{Extension, ExtensionFactory, Result},
@@ -13,11 +18,6 @@ use runtime::{
     Runtime,
 };
 use secrets::Secret;
-use spicepod::component::dataset::{
-    acceleration::{Acceleration, RefreshMode},
-    replication::Replication,
-    Dataset, Mode, TimeFormat,
-};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -134,7 +134,7 @@ async fn get_spiceai_table_provider(
     dataset.mode = Mode::ReadWrite;
     dataset.replication = Some(Replication { enabled: true });
 
-    let data_connector = create_new_connector("spiceai", secret, Arc::new(None))
+    let data_connector = create_new_connector("spiceai", secret, Arc::new(HashMap::new()))
         .await
         .ok_or_else(|| NoReadWriteProviderSnafu {}.build())?
         .context(UnableToCreateDataConnectorSnafu)?;

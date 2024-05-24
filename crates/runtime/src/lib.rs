@@ -42,16 +42,12 @@ pub use notify::Error as NotifyError;
 use secrets::{spicepod_secret_store_type, Secret};
 use snafu::prelude::*;
 use spice_metrics::get_metrics_table_reference;
-use spicepod::component::dataset::Dataset;
-use spicepod::component::dataset::Mode;
 use spicepod::component::model::Model as SpicepodModel;
 use tokio::sync::oneshot::error::RecvError;
 use tokio::time::sleep;
 use tokio::{signal, sync::RwLock};
 
 use crate::extensions::{Extension, ExtensionFactory};
-use crate::spice_metrics::MetricsRecorder;
-use crate::{dataconnector::DataConnector, datafusion::DataFusion};
 pub mod accelerated_table;
 pub mod component;
 pub mod config;

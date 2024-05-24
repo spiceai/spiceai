@@ -18,20 +18,18 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::component::dataset::acceleration::{Acceleration, RefreshMode};
-use crate::component::dataset::TimeFormat;
 use arrow::array::{Float64Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use datafusion::sql::TableReference;
 use snafu::prelude::*;
-use spicepod::component::dataset::acceleration::Acceleration;
-use spicepod::component::dataset::TimeFormat;
 use tokio::spawn;
 use tokio::sync::RwLock;
 
 use crate::accelerated_table::refresh::Refresh;
 use crate::accelerated_table::Retention;
+use crate::component::dataset::acceleration::Acceleration;
+use crate::component::dataset::TimeFormat;
 use crate::datafusion::DataFusion;
 use crate::datafusion::Error as DataFusionError;
 use crate::dataupdate::DataUpdate;
