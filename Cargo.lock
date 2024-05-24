@@ -1500,12 +1500,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "block"
-version = "0.1.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d8c1fef690941d3e7788d328517591fecc684c084084702d6ff1641e993699a"
-
-[[package]]
 name = "block-buffer"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1785,6 +1779,7 @@ dependencies = [
  "datafusion",
  "fundu",
  "futures",
+ "metrics",
  "moka",
  "snafu 0.8.2",
  "spicepod",
@@ -1828,15 +1823,13 @@ dependencies = [
 
 [[package]]
 name = "candle-core"
-version = "0.5.0"
-source = "git+https://github.com/EricLBuehler/candle.git#997a57c4d871c9ae1e6b955599dea81963b6c961"
+version = "0.5.1"
+source = "git+https://github.com/spiceai/candle.git?rev=38f8d9e01f8684d4fa4ee171bdde3f1a89f41c54#38f8d9e01f8684d4fa4ee171bdde3f1a89f41c54"
 dependencies = [
  "byteorder",
- "candle-metal-kernels",
  "gemm",
  "half",
  "memmap2",
- "metal",
  "num-traits",
  "num_cpus",
  "rand",
@@ -1855,9 +1848,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a507379a0e4ff9958e49af5550a7eb4e19e901ea176c18aaa532214102224095"
 dependencies = [
  "anyhow",
- "candle-core 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "candle-nn 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "candle-transformers 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "candle-core 0.5.0",
+ "candle-nn 0.5.0",
+ "candle-transformers 0.5.0",
  "csv",
  "hf-hub",
  "image",
@@ -1870,23 +1863,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "candle-metal-kernels"
-version = "0.5.0"
-source = "git+https://github.com/EricLBuehler/candle.git#997a57c4d871c9ae1e6b955599dea81963b6c961"
-dependencies = [
- "metal",
- "once_cell",
- "thiserror",
- "tracing",
-]
-
-[[package]]
 name = "candle-nn"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8d439382fc4a8c4e080e29b39c94f8d7d5101e22096aba415a47c7e77b0229cd"
 dependencies = [
- "candle-core 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "candle-core 0.5.0",
  "half",
  "num-traits",
  "rayon",
@@ -1897,13 +1879,11 @@ dependencies = [
 
 [[package]]
 name = "candle-nn"
-version = "0.5.0"
-source = "git+https://github.com/EricLBuehler/candle.git#997a57c4d871c9ae1e6b955599dea81963b6c961"
+version = "0.5.1"
+source = "git+https://github.com/spiceai/candle.git?rev=38f8d9e01f8684d4fa4ee171bdde3f1a89f41c54#38f8d9e01f8684d4fa4ee171bdde3f1a89f41c54"
 dependencies = [
- "candle-core 0.5.0 (git+https://github.com/EricLBuehler/candle.git)",
- "candle-metal-kernels",
+ "candle-core 0.5.1",
  "half",
- "metal",
  "num-traits",
  "rayon",
  "safetensors",
@@ -1918,8 +1898,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c32601526f2b28bd9141a63c81b4bf4fd8b3d9b087604fe6dec1e8326b7bf2d4"
 dependencies = [
  "byteorder",
- "candle-core 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "candle-nn 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "candle-core 0.5.0",
+ "candle-nn 0.5.0",
  "fancy-regex",
  "num-traits",
  "rand",
@@ -1932,12 +1912,12 @@ dependencies = [
 
 [[package]]
 name = "candle-transformers"
-version = "0.5.0"
-source = "git+https://github.com/EricLBuehler/candle.git#997a57c4d871c9ae1e6b955599dea81963b6c961"
+version = "0.5.1"
+source = "git+https://github.com/spiceai/candle.git?rev=38f8d9e01f8684d4fa4ee171bdde3f1a89f41c54#38f8d9e01f8684d4fa4ee171bdde3f1a89f41c54"
 dependencies = [
  "byteorder",
- "candle-core 0.5.0 (git+https://github.com/EricLBuehler/candle.git)",
- "candle-nn 0.5.0 (git+https://github.com/EricLBuehler/candle.git)",
+ "candle-core 0.5.1",
+ "candle-nn 0.5.1",
  "fancy-regex",
  "num-traits",
  "rand",
@@ -3247,8 +3227,7 @@ checksum = "75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2"
 [[package]]
 name = "duckdb"
 version = "0.10.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "424ede399a5d1084e65c0888fda71e407e5809400c92ff2cf510bfd1697b9c76"
+source = "git+https://github.com/spiceai/duckdb-rs.git?rev=86b6b44f4ae401706be0cbcaa5d7d12d41443e5e#86b6b44f4ae401706be0cbcaa5d7d12d41443e5e"
 dependencies = [
  "arrow",
  "cast",
@@ -4908,8 +4887,7 @@ checksum = "9c198f91728a82281a64e1f4f9eeb25d82cb32a5de251c6bd1b5154d63a8e7bd"
 [[package]]
 name = "libduckdb-sys"
 version = "0.10.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "51b3f02cecc430f61561bde538d42af4be2d9d5a8b058f74883e460bc1055461"
+source = "git+https://github.com/spiceai/duckdb-rs.git?rev=86b6b44f4ae401706be0cbcaa5d7d12d41443e5e#86b6b44f4ae401706be0cbcaa5d7d12d41443e5e"
 dependencies = [
  "autocfg",
  "cc",
@@ -5086,10 +5064,10 @@ version = "0.13.1-alpha"
 dependencies = [
  "async-openai",
  "async-trait",
- "candle-core 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "candle-core 0.5.0 (git+https://github.com/EricLBuehler/candle.git)",
+ "candle-core 0.5.0",
+ "candle-core 0.5.1",
  "candle-examples",
- "candle-transformers 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "candle-transformers 0.5.0",
  "dirs",
  "mistralrs",
  "mistralrs-core",
@@ -5209,15 +5187,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b8dd856d451cc0da70e2ef2ce95a18e39a93b7558bedf10201ad28503f918568"
 
 [[package]]
-name = "malloc_buf"
-version = "0.0.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "62bb907fe88d54d8d9ce32a3cceab4218ed2f6b7d35617cafe9adf84e43919cb"
-dependencies = [
- "libc",
-]
-
-[[package]]
 name = "maplit"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5296,21 +5265,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
 dependencies = [
  "autocfg",
-]
-
-[[package]]
-name = "metal"
-version = "0.27.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c43f73953f8cbe511f021b58f18c3ce1c3d1ae13fe953293e13345bf83217f25"
-dependencies = [
- "bitflags 2.5.0",
- "block",
- "core-graphics-types",
- "foreign-types 0.5.0",
- "log",
- "objc",
- "paste",
 ]
 
 [[package]]
@@ -5416,11 +5370,11 @@ dependencies = [
 
 [[package]]
 name = "mistralrs"
-version = "0.1.9"
-source = "git+https://github.com/spiceai/mistral.rs#ac5dd0f7f7a4ff1626c1e1be5069bbd6b49fe750"
+version = "0.1.10"
+source = "git+https://github.com/spiceai/mistral.rs?rev=243bbd5c765a22a11b0270c83664c9060a30caf8#243bbd5c765a22a11b0270c83664c9060a30caf8"
 dependencies = [
  "anyhow",
- "candle-core 0.5.0 (git+https://github.com/EricLBuehler/candle.git)",
+ "candle-core 0.5.1",
  "mistralrs-core",
  "serde_json",
  "tokio",
@@ -5428,15 +5382,15 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-core"
-version = "0.1.9"
-source = "git+https://github.com/spiceai/mistral.rs#ac5dd0f7f7a4ff1626c1e1be5069bbd6b49fe750"
+version = "0.1.10"
+source = "git+https://github.com/spiceai/mistral.rs?rev=243bbd5c765a22a11b0270c83664c9060a30caf8#243bbd5c765a22a11b0270c83664c9060a30caf8"
 dependencies = [
  "anyhow",
  "async-trait",
  "bytemuck",
- "candle-core 0.5.0 (git+https://github.com/EricLBuehler/candle.git)",
- "candle-nn 0.5.0 (git+https://github.com/EricLBuehler/candle.git)",
- "candle-transformers 0.5.0 (git+https://github.com/EricLBuehler/candle.git)",
+ "candle-core 0.5.1",
+ "candle-nn 0.5.1",
+ "candle-transformers 0.5.1",
  "cfgrammar",
  "chrono",
  "clap",
@@ -5460,6 +5414,7 @@ dependencies = [
  "rustc-hash",
  "serde",
  "serde_json",
+ "strum 0.26.2",
  "thiserror",
  "tokenizers 0.15.2",
  "tokio",
@@ -5913,16 +5868,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "830b246a0e5f20af87141b25c173cd1b609bd7779a4617d6ec582abaf90870f3"
 
 [[package]]
-name = "objc"
-version = "0.2.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "915b1b472bc21c53464d6c8461c9d3af805ba1ef837e1cac254428f4a77177b1"
-dependencies = [
- "malloc_buf",
- "objc_exception",
-]
-
-[[package]]
 name = "objc-sys"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5943,15 +5888,6 @@ name = "objc2-encode"
 version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d079845b37af429bfe5dfa76e6d087d788031045b25cfc6fd898486fd9847666"
-
-[[package]]
-name = "objc_exception"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ad970fb455818ad6cba4c122ad012fae53ae8b4795f86378bce65e4f6bab2ca4"
-dependencies = [
- "cc",
-]
 
 [[package]]
 name = "object"
