@@ -119,7 +119,10 @@ pub async fn run(args: Args) -> Result<()> {
 
     rt.load_datasets().await;
 
-    rt.load_models().await;
+    if cfg!(feature = "models") {
+        rt.load_models().await;
+        rt.load_llms().await;
+    }
 
     if args.spice_cloud_connect {
         if let Err(err) = rt
