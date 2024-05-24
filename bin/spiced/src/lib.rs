@@ -81,19 +81,6 @@ pub struct Args {
 
     #[clap(flatten)]
     pub repl_config: ReplConfig,
-
-    /// Enable Spice Cloud connection.
-    #[arg(
-        long,
-        help_heading = "Enable connection to Spice.ai Cloud. Requires the API key to be stored in secrets."
-    )]
-    pub spice_cloud_connect: bool,
-
-    #[arg(
-        long,
-        help_heading = "The dataset path for syncing metrics to Spice.ai."
-    )]
-    pub spice_cloud_metrics_dataset: Option<String>,
 }
 
 pub async fn run(args: Args) -> Result<()> {
@@ -115,7 +102,7 @@ pub async fn run(args: Args) -> Result<()> {
     extension_factories.push(Box::new(spice_extension_factory));
     // TODO: load extensions from spicepod
 
-    let mut rt: Runtime = Runtime::new(app, df.clone(), Arc::new(extension_factories)).await;
+    let mut rt: Runtime = Runtime::new(app, Arc::clone(&df), Arc::new(extension_factories)).await;
 
     rt.with_pods_watcher(pods_watcher);
 
@@ -130,17 +117,15 @@ pub async fn run(args: Args) -> Result<()> {
 
     rt.init_results_cache().await;
 
-    if args.spice_cloud_connect {
-        if let Err(err) = rt
-            .start_metrics(args.metrics, args.spice_cloud_metrics_dataset)
-            .await
-            .context(UnableToStartServersSnafu)
-        {
-            tracing::warn!("{err}");
-        }
-    }
-
     rt.start_extensions().await;
+
+    if let Err(err) = rt
+        .start_metrics(args.metrics)
+        .await
+        .context(UnableToStartServersSnafu)
+    {
+        tracing::warn!("{err}");
+    }
 
     rt.start_servers(args.runtime, args.metrics)
         .await

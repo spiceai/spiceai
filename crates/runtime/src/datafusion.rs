@@ -328,6 +328,18 @@ impl DataFusion {
         Ok(QueryResult::new(res_stream, None))
     }
 
+    pub async fn has_table(&self, table_reference: &TableReference) -> bool {
+        let table_name = table_reference.table();
+
+        if let Some(schema_name) = table_reference.schema() {
+            if let Some(schema) = self.schema(schema_name) {
+                return schema.table(table_name).await.ok().is_some();
+            }
+        }
+
+        self.ctx.table(table_name).await.ok().is_some()
+    }
+
     pub fn register_runtime_table(
         &mut self,
         name: &str,

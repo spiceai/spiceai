@@ -5,8 +5,13 @@ use crate::Runtime;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to load secret: {source}"))]
+    #[snafu(display("Unable to initialize extension: {source}"))]
     UnableToInitializeExtension {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("Unable to start extension: {source}"))]
+    UnableToStartExtension {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 }
@@ -29,11 +34,6 @@ pub trait Extension: Send + Sync {
     async fn on_start(&mut self, runtime: &Runtime) -> Result<()>;
 }
 
-// #[async_trait]
-// pub trait MetricsConnector: Send + Sync {
-//     async fn write_metrics(&self, record_batch: RecordBatch) -> Result<()>;
-// }
-
-pub trait ExtensionFactory {
+pub trait ExtensionFactory: Send + Sync {
     fn create(&self) -> Box<dyn Extension>;
 }

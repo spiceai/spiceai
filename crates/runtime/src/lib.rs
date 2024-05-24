@@ -26,6 +26,7 @@ use ::datafusion::sql::parser::{self, DFParser};
 use ::datafusion::sql::sqlparser::ast::{SetExpr, TableFactor};
 use ::datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use ::datafusion::sql::sqlparser::{self, ast};
+use ::datafusion::sql::TableReference;
 use accelerated_table::AcceleratedTable;
 use app::App;
 use cache::QueryResultCacheProvider;
@@ -48,7 +49,7 @@ use tokio::{signal, sync::RwLock};
 use crate::extensions::{Extension, ExtensionFactory};
 use crate::spice_metrics::MetricsRecorder;
 use crate::{dataconnector::DataConnector, datafusion::DataFusion};
-mod accelerated_table;
+pub mod accelerated_table;
 pub mod config;
 pub mod dataaccelerator;
 pub mod dataconnector;
@@ -224,6 +225,11 @@ impl Runtime {
         rt.extensions = Arc::new(extensions);
 
         rt
+    }
+
+    #[must_use]
+    pub fn datafusion(&self) -> Arc<RwLock<DataFusion>> {
+        Arc::clone(&self.df)
     }
 
     async fn initialize_extension(
@@ -764,32 +770,24 @@ impl Runtime {
         self.load_model(m).await;
     }
 
-    pub async fn start_metrics(
-        &mut self,
-        with_metrics: Option<SocketAddr>,
-        cloud_dataset_path: Option<String>,
-    ) -> Result<()> {
+    pub async fn start_metrics(&mut self, with_metrics: Option<SocketAddr>) -> Result<()> {
         if let Some(metrics_socket) = with_metrics {
-            let secret = match self
-                .secrets_provider
+            let recorder = MetricsRecorder::new(metrics_socket);
+
+            // check if runtime.metrics already registered, otherwise create local table
+            let has_metrics_table = self
+                .df
                 .read()
                 .await
-                .get_secret("spiceai")
-                .await
-            {
-                Ok(s) => s,
-                Err(_) => None,
-            };
+                .has_table(&TableReference::partial("runtime", "metrics"))
+                .await;
 
-            let recorder = MetricsRecorder::new(metrics_socket, secret, cloud_dataset_path)
-                .await
-                .context(UnableToStartLocalMetricsSnafu)?;
-
-            self.df
-                .write()
-                .await
-                .register_runtime_table("metrics", recorder.metrics_table())
-                .context(UnableToRegisterMetricsTableSnafu)?;
+            if !has_metrics_table {
+                tracing::info!("Registering local metrics table");
+                MetricsRecorder::register_metrics_table(&self.df)
+                    .await
+                    .context(UnableToStartLocalMetricsSnafu)?;
+            }
 
             recorder.start(&Arc::clone(&self.df));
         }

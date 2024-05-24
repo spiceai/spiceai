@@ -44,7 +44,7 @@ pub struct Refresh {
 impl Refresh {
     #[allow(clippy::needless_pass_by_value)]
     #[must_use]
-    pub(crate) fn new(
+    pub fn new(
         time_column: Option<String>,
         time_format: Option<TimeFormat>,
         check_interval: Option<Duration>,

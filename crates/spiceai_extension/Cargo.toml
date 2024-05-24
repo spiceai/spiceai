@@ -13,5 +13,7 @@ tracing.workspace = true
 tokio.workspace = true
 snafu.workspace = true
 async-trait.workspace = true
+datafusion.workspace = true
 runtime = { path = "../runtime" }
 secrets = { path = "../secrets" }
+spicepod = { path = "../spicepod" }
