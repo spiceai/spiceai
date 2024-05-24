@@ -1,9 +1,9 @@
+use crate::component::dataset::TimeFormat;
 use arrow::datatypes::DataType;
 use datafusion::{
     logical_expr::{binary_expr, cast, col, lit, Expr, Operator},
     scalar::ScalarValue,
 };
-use spicepod::component::dataset::TimeFormat;
 
 #[derive(Debug, Clone)]
 enum ExprTimeFormat {

@@ -16,13 +16,13 @@ limitations under the License.
 
 use async_trait::async_trait;
 
+use crate::component::dataset::Dataset;
 use data_components::spark_connect::SparkConnect;
 use data_components::{Read, ReadWrite};
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
 use secrets::Secret;
 use snafu::prelude::*;
-use spicepod::component::dataset::Dataset;
 use std::any::Any;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -62,10 +62,10 @@ pub struct Spark {
 impl Spark {
     async fn new(
         secret: Arc<Option<Secret>>,
-        params: Arc<Option<HashMap<String, String>>>,
+        params: Arc<HashMap<String, String>>,
     ) -> Result<Self> {
-        let plain_text_connection = params.as_ref().as_ref().and_then(|x| x.get("spark_remote"));
-        let secret_connection = secret.as_ref().as_ref().and_then(|x| x.get("spark_remote"));
+        let plain_text_connection = params.get("spark_remote");
+        let secret_connection = secret.as_ref().as_ref().and_then(|s| s.get("spark_remote"));
         let conn = match (plain_text_connection, secret_connection) {
             (Some(_), Some(_)) => DuplicatedSparkRemoteSnafu.fail(),
             (_, Some(conn)) => Ok(conn),
@@ -87,7 +87,7 @@ impl Spark {
 impl DataConnectorFactory for Spark {
     fn create(
         secret: Option<Secret>,
-        params: Arc<Option<HashMap<String, String>>>,
+        params: Arc<HashMap<String, String>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             match Spark::new(Arc::new(secret), params).await {

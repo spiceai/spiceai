@@ -14,9 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::component::dataset::Dataset;
 use secrets::{get_secret_or_param, Secret};
 use snafu::prelude::*;
-use spicepod::component::dataset::Dataset;
 use std::any::Any;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -27,7 +27,7 @@ use super::{DataConnector, DataConnectorFactory, DataConnectorResult, ListingTab
 
 pub struct FTP {
     secret: Option<Secret>,
-    params: HashMap<String, String>,
+    params: Arc<HashMap<String, String>>,
 }
 
 impl std::fmt::Display for FTP {
@@ -39,13 +39,10 @@ impl std::fmt::Display for FTP {
 impl DataConnectorFactory for FTP {
     fn create(
         secret: Option<Secret>,
-        params: Arc<Option<HashMap<String, String>>>,
+        params: Arc<HashMap<String, String>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let ftp = Self {
-                secret,
-                params: params.as_ref().clone().map_or_else(HashMap::new, |x| x),
-            };
+            let ftp = Self { secret, params };
             Ok(Arc::new(ftp) as Arc<dyn DataConnector>)
         })
     }
@@ -71,7 +68,7 @@ impl ListingTableConnector for FTP {
             fragment_builder.append_pair("user", ftp_user);
         }
         if let Some(ftp_password) =
-            get_secret_or_param(Some(&self.params), &self.secret, "ftp_pass_key", "ftp_pass")
+            get_secret_or_param(&self.params, &self.secret, "ftp_pass_key", "ftp_pass")
         {
             fragment_builder.append_pair("password", &ftp_password);
         }

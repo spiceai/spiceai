@@ -12,9 +12,3 @@ description = "All loaded components from the root Spicepod and its dependencies
 snafu.workspace = true
 spicepod = { path = "../spicepod" }
 tracing.workspace = true
-
-[features]
-duckdb = ["spicepod/duckdb"]
-postgres = ["spicepod/postgres"]
-sqlite = ["spicepod/sqlite"]
-mysql = ["spicepod/mysql"]

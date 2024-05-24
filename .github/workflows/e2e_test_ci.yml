@@ -550,6 +550,8 @@ jobs:
           cat spice.log
 
   test_quickstart_duckdb:
+    env:
+      duckdb_version: v0.10.2
     name: 'Test DuckDB quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
     runs-on: ${{ matrix.target.runner }}
     needs:
@@ -565,13 +567,21 @@ jobs:
 
       - name: Install DuckDB
         if: matrix.target.target_os == 'linux'
-        uses: opt-nc/setup-duckdb-action@v1.0.7
-        with:
-          version: v0.10.2
+        run: |
+          wget https://github.com/duckdb/duckdb/releases/download/${{ env.duckdb_version }}/duckdb_cli-linux-amd64.zip
+          unzip duckdb_cli-linux-amd64.zip
+          chmod +x ./duckdb
+
+      - name: Install DuckDB
+        if: matrix.target.target_os == 'darwin'
+        run: |
+          wget https://github.com/duckdb/duckdb/releases/download/${{ env.duckdb_version }}/duckdb_cli-osx-universal.zip
+          unzip duckdb_cli-osx-universal.zip
+          chmod +x ./duckdb
 
       - name: Generate TPCH database
         run: |
-          duckdb -s "INSTALL tpch;LOAD tpch;CALL dbgen(sf = 1);" ./tpch.db
+          ./duckdb -s "INSTALL tpch;LOAD tpch;CALL dbgen(sf = 1);" ./tpch.db
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         uses: actions/download-artifact@v4
@@ -615,8 +625,8 @@ jobs:
           name: tpch_customer
 
       - name: Stop spice and check logs
-        working-directory: duckdb-app
         if: always()
+        working-directory: duckdb-app
         run: |
           killall spice
           cat spice.log

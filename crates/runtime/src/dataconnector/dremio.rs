@@ -16,6 +16,7 @@ limitations under the License.
 
 use super::DataConnector;
 use super::DataConnectorFactory;
+use crate::component::dataset::Dataset;
 use async_trait::async_trait;
 use data_components::flight::FlightFactory;
 use data_components::Read;
@@ -25,7 +26,6 @@ use flight_client::FlightClient;
 use ns_lookup::verify_endpoint_connection;
 use secrets::Secret;
 use snafu::prelude::*;
-use spicepod::component::dataset::Dataset;
 use std::any::Any;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -58,16 +58,15 @@ pub struct Dremio {
 impl DataConnectorFactory for Dremio {
     fn create(
         secret: Option<Secret>,
-        params: Arc<Option<HashMap<String, String>>>,
+        params: Arc<HashMap<String, String>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let secret = secret.context(MissingSecretsSnafu)?;
 
             let endpoint: String = params
-                .as_ref() // &Option<HashMap<String, String>>
-                .as_ref() // Option<&HashMap<String, String>>
-                .and_then(|params| params.get("endpoint").cloned())
-                .context(MissingEndpointParameterSnafu)?;
+                .get("endpoint")
+                .context(MissingEndpointParameterSnafu)?
+                .clone();
 
             verify_endpoint_connection(&endpoint)
                 .await
