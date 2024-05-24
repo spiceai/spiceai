@@ -25,6 +25,9 @@ const (
 	DATA_SOURCE_SPICEAI    = "spice.ai"
 	DATA_SOURCE_DREMIO     = "dremio"
 	DATA_SOURCE_DATABRICKS = "databricks"
+	DATA_SOURCE_S3         = "s3"
+	DATA_SOURCE_FTP        = "ftp"
+	DATA_SOURCE_SFTP       = "sftp"
 )
 
 type DatasetSpec struct {
