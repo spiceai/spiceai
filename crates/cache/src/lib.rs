@@ -75,14 +75,14 @@ pub trait QueryResultCache {
     fn item_count(&self) -> u64;
 }
 
-pub struct QueryResultCacheProvider {
+pub struct QueryResultsCacheProvider {
     cache: Arc<dyn QueryResultCache + Send + Sync>,
     cache_max_size: u64,
     ttl: std::time::Duration,
     metrics_reported_last_time: AtomicU64,
 }
 
-impl QueryResultCacheProvider {
+impl QueryResultsCacheProvider {
     /// # Errors
     ///
     /// Will return `Err` if method fails to parse cache params or to create the cache
@@ -99,7 +99,7 @@ impl QueryResultCacheProvider {
             None => std::time::Duration::from_secs(1),
         };
 
-        let cache_provider = QueryResultCacheProvider {
+        let cache_provider = QueryResultsCacheProvider {
             cache: Arc::new(LruCache::new(cache_max_size, ttl)),
             cache_max_size,
             ttl,
@@ -165,11 +165,11 @@ impl QueryResultCacheProvider {
     }
 }
 
-impl Display for QueryResultCacheProvider {
+impl Display for QueryResultsCacheProvider {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "max size: {:.2}, item expire duration: {:?}",
+            "max size: {:.2}, item ttl: {:?}",
             Byte::from_u64(self.cache_max_size).get_adjusted_unit(byte_unit::Unit::MiB),
             self.ttl
         )
