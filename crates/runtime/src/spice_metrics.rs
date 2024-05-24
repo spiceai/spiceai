@@ -61,6 +61,7 @@ pub struct MetricsRecorder {
 }
 
 impl MetricsRecorder {
+    #[must_use]
     pub fn new(socket_addr: SocketAddr) -> Self {
         Self {
             socket_addr: Arc::new(socket_addr),
@@ -175,6 +176,7 @@ impl MetricsRecorder {
     }
 }
 
+#[must_use]
 pub fn get_metrics_schema() -> Arc<Schema> {
     let fields = vec![
         // TODO: Use timestamp
@@ -192,6 +194,7 @@ pub fn get_metrics_schema() -> Arc<Schema> {
     Arc::new(Schema::new(fields))
 }
 
+#[must_use]
 pub fn get_metrics_table_reference() -> TableReference {
     TableReference::partial("runtime", "metrics")
 }
