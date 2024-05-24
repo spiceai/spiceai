@@ -43,7 +43,7 @@ pub enum Error {
     #[snafu(display("Endpoint {endpoint} is invalid: {source}"))]
     InvalidEndpoint {
         endpoint: String,
-        source: ns_lookup::Error,
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     #[snafu(display("{source}"))]
@@ -72,6 +72,8 @@ impl Spark {
             (Some(conn), _) => Ok(conn.as_str()),
             _ => MissingSparkRemoteSnafu.fail(),
         }?;
+        SparkConnect::validate_connection_string(conn)
+            .context(InvalidEndpointSnafu { endpoint: conn })?;
         let spark = SparkConnect::from_connection(conn)
             .await
             .context(UnableToConstructSparkConnectSnafu)?;
