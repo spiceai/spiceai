@@ -21,7 +21,7 @@ use secrets::Secret;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to create data connector"))]
+    #[snafu(display("Unable to get read-write table provider"))]
     NoReadWriteProvider {},
 
     #[snafu(display("Unable to create data connector"))]
