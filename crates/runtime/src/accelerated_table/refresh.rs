@@ -96,15 +96,22 @@ impl Refresher {
         federated: Arc<dyn TableProvider>,
         refresh: Arc<RwLock<Refresh>>,
         accelerator: Arc<dyn TableProvider>,
-        cache_provider: Option<Arc<QueryResultCacheProvider>>,
     ) -> Self {
         Self {
             dataset_name,
             federated,
             refresh,
             accelerator,
-            cache_provider,
+            cache_provider: None,
         }
+    }
+
+    pub fn cache_provider(
+        &mut self,
+        cache_provider: Option<Arc<QueryResultCacheProvider>>,
+    ) -> &mut Self {
+        self.cache_provider = cache_provider;
+        self
     }
 
     pub(crate) async fn start(
@@ -574,7 +581,6 @@ mod tests {
             federated,
             Arc::new(RwLock::new(refresh)),
             Arc::clone(&accelerator),
-            None,
         );
 
         let (trigger, receiver) = mpsc::channel::<()>(1);
@@ -748,7 +754,6 @@ mod tests {
                 federated,
                 Arc::new(RwLock::new(refresh)),
                 Arc::clone(&accelerator),
-                None,
             );
 
             let (trigger, receiver) = mpsc::channel::<()>(1);
@@ -897,7 +902,6 @@ mod tests {
                 federated,
                 Arc::new(RwLock::new(refresh)),
                 Arc::clone(&accelerator),
-                None,
             );
 
             let (trigger, receiver) = mpsc::channel::<()>(1);

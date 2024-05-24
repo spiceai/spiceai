@@ -188,13 +188,14 @@ impl Builder {
 
         validate_refresh_data_window(&self.refresh, &self.dataset_name, &self.federated.schema());
         let refresh_params = Arc::new(RwLock::new(self.refresh));
-        let refresher = refresh::Refresher::new(
+        let mut refresher = refresh::Refresher::new(
             self.dataset_name.clone(),
             Arc::clone(&self.federated),
             Arc::clone(&refresh_params),
             Arc::clone(&self.accelerator),
-            self.cache_provider.clone(),
         );
+        refresher.cache_provider(self.cache_provider.clone());
+
         let refresh_handle = tokio::spawn(async move {
             refresher
                 .start(acceleration_refresh_mode, ready_sender)
