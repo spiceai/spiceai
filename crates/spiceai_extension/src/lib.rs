@@ -133,27 +133,21 @@ impl Extension for SpiceExtension {
 }
 
 pub struct SpiceExtensionFactory {
-    manifest: Option<ExtensionManifest>,
+    manifest: ExtensionManifest,
 }
 
 impl SpiceExtensionFactory {
     #[must_use]
-    pub fn new(manifest: Option<&ExtensionManifest>) -> Self {
-        SpiceExtensionFactory {
-            manifest: manifest.cloned(),
-        }
+    pub fn new(manifest: ExtensionManifest) -> Self {
+        SpiceExtensionFactory { manifest }
     }
 }
 
 impl ExtensionFactory for SpiceExtensionFactory {
     fn create(&self) -> Box<dyn Extension> {
-        let manifest = self
-            .manifest
-            .as_ref()
-            .unwrap_or(&ExtensionManifest::default())
-            .clone();
-
-        Box::new(SpiceExtension { manifest })
+        Box::new(SpiceExtension {
+            manifest: self.manifest.clone(),
+        })
     }
 }
 

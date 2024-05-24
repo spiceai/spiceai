@@ -34,6 +34,7 @@ default = [
   "spark",
   "snowflake",
   "ftp",
+  "spiceai-extension"
 ]
 duckdb = ["runtime/duckdb"]
 postgres = ["runtime/postgres"]
