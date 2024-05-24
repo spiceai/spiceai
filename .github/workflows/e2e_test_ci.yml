@@ -625,7 +625,6 @@ jobs:
       - name: Stop spice and check logs
         if: matrix.target.target_os == 'linux'
         working-directory: duckdb-app
-        if: always()
         run: |
           killall spice
           cat spice.log
