@@ -144,7 +144,7 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
                 continue;
             }
             "show tables" | "show tables;" => {
-                "select table_name, table_type from information_schema.tables where table_schema = 'public'"
+                "select table_catalog, table_schema, table_name, table_type from information_schema.tables where table_schema != 'information_schema'"
             }
             line if line.to_lowercase().starts_with(NQL_LINE_PREFIX) => {
                 let _ = rl.add_history_entry(line);
