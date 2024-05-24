@@ -513,7 +513,7 @@ mod tests {
         let connector = TestConnector {
             params: params.into(),
         };
-        let dataset = Dataset::new(path, "test".to_string());
+        let dataset = Dataset::try_new(path, "test".to_string()).expect("a valid dataset");
 
         (connector, dataset)
     }

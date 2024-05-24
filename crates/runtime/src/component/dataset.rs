@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use datafusion::sql::TableReference;
 use snafu::prelude::*;
 use spicepod::component::{dataset as spicepod_dataset, params::Params};
 use std::{collections::HashMap, fs, time::Duration};
@@ -72,7 +73,7 @@ impl std::fmt::Display for TimeFormat {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Dataset {
     pub from: String,
-    pub name: String,
+    pub name: TableReference,
     pub mode: Mode,
     /// Inline SQL that describes a view.
     sql: Option<String>,
@@ -94,9 +95,11 @@ impl TryFrom<spicepod_dataset::Dataset> for Dataset {
             .map(acceleration::Acceleration::try_from)
             .transpose()?;
 
+        let table_reference = Dataset::parse_table_reference(&dataset.name)?;
+
         Ok(Dataset {
             from: dataset.from,
-            name: dataset.name,
+            name: table_reference,
             mode: Mode::from(dataset.mode),
             sql: dataset.sql,
             sql_ref: dataset.sql_ref,
@@ -115,10 +118,10 @@ impl TryFrom<spicepod_dataset::Dataset> for Dataset {
 
 impl Dataset {
     #[must_use]
-    pub fn new(from: String, name: String) -> Self {
-        Dataset {
+    pub fn try_new(from: String, name: String) -> Result<Self, crate::Error> {
+        Ok(Dataset {
             from,
-            name,
+            name: Self::parse_table_reference(&name)?,
             mode: Mode::default(),
             sql: None,
             sql_ref: None,
@@ -127,6 +130,19 @@ impl Dataset {
             time_column: None,
             time_format: None,
             acceleration: None,
+        })
+    }
+
+    fn parse_table_reference(name: &str) -> Result<TableReference, crate::Error> {
+        match TableReference::parse_str(name) {
+            table_ref @ (TableReference::Bare { .. } | TableReference::Partial { .. }) => {
+                Ok(table_ref)
+            }
+            TableReference::Full { catalog, .. } => crate::DatasetNameIncludesCatalogSnafu {
+                catalog,
+                name: name.to_string(),
+            }
+            .fail(),
         }
     }
 

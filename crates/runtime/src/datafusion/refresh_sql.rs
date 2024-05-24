@@ -15,9 +15,9 @@ limitations under the License.
 */
 
 use datafusion::sql::parser::{DFParser, Statement};
-use datafusion::sql::sqlparser;
 use datafusion::sql::sqlparser::ast::SetExpr;
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
+use datafusion::sql::{sqlparser, TableReference};
 use snafu::prelude::*;
 use sqlparser::ast::Statement as SQLStatement;
 
@@ -36,14 +36,14 @@ pub enum Error {
     ExpectedSingleSqlStatement { num_statements: usize },
 
     #[snafu(display("Expected a SQL query starting with SELECT * FROM {expected_table}"))]
-    InvalidSqlStatement { expected_table: String },
+    InvalidSqlStatement { expected_table: TableReference },
 
     #[snafu(display("Missing expected SQL statement - this is a bug in Spice.ai"))]
     MissingStatement,
 }
 
 #[allow(clippy::module_name_repetitions)]
-pub fn validate_refresh_sql(expected_table: &str, refresh_sql: &str) -> Result<()> {
+pub fn validate_refresh_sql(expected_table: TableReference, refresh_sql: &str) -> Result<()> {
     let mut statements = DFParser::parse_sql_with_dialect(refresh_sql, &PostgreSqlDialect {})
         .context(UnableToParseSqlSnafu)?;
     if statements.len() != 1 {
@@ -88,7 +88,8 @@ pub fn validate_refresh_sql(expected_table: &str, refresh_sql: &str) -> Result<(
                                 InvalidSqlStatementSnafu { expected_table }
                             );
                             ensure!(
-                                name.0[0].value.as_str() == expected_table,
+                                TableReference::parse_str(name.0[0].value.as_str())
+                                    == expected_table,
                                 InvalidSqlStatementSnafu { expected_table }
                             );
                         }

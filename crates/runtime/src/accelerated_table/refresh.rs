@@ -80,7 +80,7 @@ pub(crate) enum AccelerationRefreshMode {
 }
 
 pub(crate) struct Refresher {
-    dataset_name: String,
+    dataset_name: TableReference,
     federated: Arc<dyn TableProvider>,
     refresh: Arc<RwLock<Refresh>>,
     accelerator: Arc<dyn TableProvider>,
@@ -88,7 +88,7 @@ pub(crate) struct Refresher {
 
 impl Refresher {
     pub(crate) fn new(
-        dataset_name: String,
+        dataset_name: TableReference,
         federated: Arc<dyn TableProvider>,
         refresh: Arc<RwLock<Refresh>>,
         accelerator: Arc<dyn TableProvider>,
@@ -267,7 +267,7 @@ impl Refresher {
             while refresh_stream.next().await.is_some() {
                 let timer = TimeMeasurement::new(
                     "load_dataset_duration_ms",
-                    vec![("dataset", dataset_name.clone())],
+                    vec![("dataset", dataset_name.to_string())],
                 );
                 let start = SystemTime::now();
                 match self.get_full_or_incremental_append_update(None).await {
@@ -290,7 +290,7 @@ impl Refresher {
             while refresh_stream.next().await.is_some() {
                 let timer = TimeMeasurement::new(
                     "append_dataset_duration_ms",
-                    vec![("dataset", dataset_name.clone())],
+                    vec![("dataset", dataset_name.to_string())],
                 );
                 match self.get_latest_timestamp().await {
                     Ok(timestamp) => {
@@ -400,7 +400,7 @@ impl Refresher {
         let filter_converter = self.get_filter_converter(&refresh);
 
         tracing::info!("Loading data for dataset {dataset_name}");
-        status::update_dataset(dataset_name.as_str(), status::ComponentStatus::Refreshing);
+        status::update_dataset(dataset_name.clone(), status::ComponentStatus::Refreshing);
         let refresh = refresh.clone();
         let mut filters = vec![];
         if let Some(converter) = filter_converter.as_ref() {
@@ -433,7 +433,7 @@ impl Refresher {
         let dataset_name = self.dataset_name.clone();
         match get_data(
             &mut ctx,
-            TableReference::bare(dataset_name.clone()),
+            dataset_name.clone(),
             Arc::clone(&federated),
             refresh.sql.clone(),
             filters,
@@ -458,10 +458,7 @@ impl Refresher {
             default_runtime_env(),
         );
         let dataset_name = self.dataset_name.clone();
-        if let Err(e) = ctx.register_table(
-            TableReference::bare(dataset_name.clone()),
-            Arc::clone(&self.federated),
-        ) {
+        if let Err(e) = ctx.register_table(dataset_name.clone(), Arc::clone(&self.federated)) {
             tracing::error!("Unable to register federated table: {e}");
         }
 
@@ -496,7 +493,7 @@ impl Refresher {
     }
 
     fn mark_dataset_status(&self, status: status::ComponentStatus) {
-        status::update_dataset(self.dataset_name.as_str(), status);
+        status::update_dataset(self.dataset_name.clone(), status);
     }
 }
 
@@ -552,7 +549,7 @@ mod tests {
         let refresh = Refresh::new(None, None, None, None, RefreshMode::Full, None);
 
         let refresher = Refresher::new(
-            "test".to_string(),
+            TableReference::bare("test"),
             federated,
             Arc::new(RwLock::new(refresh)),
             Arc::clone(&accelerator),
@@ -658,7 +655,10 @@ mod tests {
 
         metrics::set_global_recorder(recorder).expect("recorder is set globally");
 
-        status::update_dataset("test", status::ComponentStatus::Refreshing);
+        status::update_dataset(
+            TableReference::bare("test"),
+            status::ComponentStatus::Refreshing,
+        );
 
         setup_and_test(
             vec!["1970-01-01", "2012-12-01T11:11:11Z", "2012-12-01T11:11:12Z"],
@@ -672,7 +672,10 @@ mod tests {
             status::ComponentStatus::Ready
         ));
 
-        status::update_dataset("test", status::ComponentStatus::Refreshing);
+        status::update_dataset(
+            TableReference::bare("test"),
+            status::ComponentStatus::Refreshing,
+        );
 
         setup_and_test(vec![], vec![], 0).await;
 
@@ -725,7 +728,7 @@ mod tests {
             );
 
             let refresher = Refresher::new(
-                "test".to_string(),
+                TableReference::bare("test"),
                 federated,
                 Arc::new(RwLock::new(refresh)),
                 Arc::clone(&accelerator),
@@ -873,7 +876,7 @@ mod tests {
             );
 
             let refresher = Refresher::new(
-                "test".to_string(),
+                TableReference::bare("test"),
                 federated,
                 Arc::new(RwLock::new(refresh)),
                 Arc::clone(&accelerator),
