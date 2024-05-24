@@ -117,11 +117,10 @@ impl TryFrom<spicepod_dataset::Dataset> for Dataset {
 }
 
 impl Dataset {
-    #[must_use]
-    pub fn try_new(from: String, name: String) -> Result<Self, crate::Error> {
+    pub fn try_new(from: String, name: &str) -> Result<Self, crate::Error> {
         Ok(Dataset {
             from,
-            name: Self::parse_table_reference(&name)?,
+            name: Self::parse_table_reference(name)?,
             mode: Mode::default(),
             sql: None,
             sql_ref: None,

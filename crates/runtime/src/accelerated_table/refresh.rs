@@ -400,7 +400,7 @@ impl Refresher {
         let filter_converter = self.get_filter_converter(&refresh);
 
         tracing::info!("Loading data for dataset {dataset_name}");
-        status::update_dataset(dataset_name.clone(), status::ComponentStatus::Refreshing);
+        status::update_dataset(&dataset_name, status::ComponentStatus::Refreshing);
         let refresh = refresh.clone();
         let mut filters = vec![];
         if let Some(converter) = filter_converter.as_ref() {
@@ -493,7 +493,7 @@ impl Refresher {
     }
 
     fn mark_dataset_status(&self, status: status::ComponentStatus) {
-        status::update_dataset(self.dataset_name.clone(), status);
+        status::update_dataset(&self.dataset_name, status);
     }
 }
 
@@ -656,7 +656,7 @@ mod tests {
         metrics::set_global_recorder(recorder).expect("recorder is set globally");
 
         status::update_dataset(
-            TableReference::bare("test"),
+            &TableReference::bare("test"),
             status::ComponentStatus::Refreshing,
         );
 
@@ -673,7 +673,7 @@ mod tests {
         ));
 
         status::update_dataset(
-            TableReference::bare("test"),
+            &TableReference::bare("test"),
             status::ComponentStatus::Refreshing,
         );
 

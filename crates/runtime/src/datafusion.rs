@@ -478,7 +478,7 @@ impl DataFusion {
         self.ctx.table_exist(dataset_name).unwrap_or(false)
     }
 
-    pub fn remove_table(&mut self, dataset_name: TableReference) -> Result<()> {
+    pub fn remove_table(&mut self, dataset_name: &TableReference) -> Result<()> {
         if !self.ctx.table_exist(dataset_name.clone()).unwrap_or(false) {
             return Ok(());
         }
@@ -490,8 +490,8 @@ impl DataFusion {
             .fail();
         }
 
-        if self.is_writable(&dataset_name) {
-            self.data_writers.remove(&dataset_name);
+        if self.is_writable(dataset_name) {
+            self.data_writers.remove(dataset_name);
         }
 
         Ok(())

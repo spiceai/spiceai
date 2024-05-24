@@ -246,7 +246,7 @@ impl Runtime {
                 Err(e) => {
                     if log_failures {
                         status::update_dataset(
-                            TableReference::parse_str(&spicepod_ds.name),
+                            &TableReference::parse_str(&spicepod_ds.name),
                             status::ComponentStatus::Error,
                         );
                         metrics::counter!("datasets_load_error").increment(1);
@@ -266,7 +266,7 @@ impl Runtime {
 
         let valid_datasets = Self::get_valid_datasets(app, true);
         for ds in &valid_datasets {
-            status::update_dataset(ds.name.clone(), status::ComponentStatus::Initializing);
+            status::update_dataset(&ds.name, status::ComponentStatus::Initializing);
             self.load_dataset(ds, &valid_datasets).await;
         }
     }
@@ -279,7 +279,7 @@ impl Runtime {
             let connector = match self.load_dataset_connector(ds, all_datasets).await {
                 Ok(connector) => connector,
                 Err(err) => {
-                    status::update_dataset(ds.name.clone(), status::ComponentStatus::Error);
+                    status::update_dataset(&ds.name, status::ComponentStatus::Error);
                     metrics::counter!("datasets_load_error").increment(1);
                     warn_spaced!(spaced_tracer, "{}{err}", "");
                     sleep(Duration::from_secs(1)).await;
@@ -293,7 +293,7 @@ impl Runtime {
                 continue;
             }
 
-            status::update_dataset(ds.name.clone(), status::ComponentStatus::Ready);
+            status::update_dataset(&ds.name, status::ComponentStatus::Ready);
             break;
         }
     }
@@ -317,7 +317,7 @@ impl Runtime {
         let secrets_provider = shared_secrets_provider.read().await;
 
         if !verify_dependent_tables(&ds, &existing_tables) {
-            status::update_dataset(ds.name.clone(), status::ComponentStatus::Error);
+            status::update_dataset(&ds.name, status::ComponentStatus::Error);
             metrics::counter!("datasets_load_error").increment(1);
             return UnableToLoadDatasetConnectorSnafu {
                 dataset: ds.name.clone(),
@@ -336,7 +336,7 @@ impl Runtime {
         {
             Ok(data_connector) => data_connector,
             Err(err) => {
-                status::update_dataset(ds.name.clone(), status::ComponentStatus::Error);
+                status::update_dataset(&ds.name, status::ComponentStatus::Error);
                 metrics::counter!("datasets_load_error").increment(1);
                 warn_spaced!(spaced_tracer, "{}{err}", "");
                 return UnableToLoadDatasetConnectorSnafu {
@@ -364,7 +364,7 @@ impl Runtime {
 
         // test dataset connectivity by attempting to get a read provider
         if let Err(err) = data_connector.read_provider(&ds).await {
-            status::update_dataset(ds.name.clone(), status::ComponentStatus::Error);
+            status::update_dataset(&ds.name, status::ComponentStatus::Error);
             metrics::counter!("datasets_load_error").increment(1);
             warn_spaced!(spaced_tracer, "{}{err}", "");
             return UnableToLoadDatasetConnectorSnafu {
@@ -397,12 +397,12 @@ impl Runtime {
                     },
                 );
                 metrics::gauge!("datasets_count", "engine" => engine).increment(1.0);
-                status::update_dataset(ds.name.clone(), status::ComponentStatus::Ready);
+                status::update_dataset(&ds.name, status::ComponentStatus::Ready);
 
                 Ok(())
             }
             Err(err) => {
-                status::update_dataset(ds.name.clone(), status::ComponentStatus::Error);
+                status::update_dataset(&ds.name, status::ComponentStatus::Error);
                 metrics::counter!("datasets_load_error").increment(1);
                 if let Error::UnableToAttachDataConnector {
                     source: datafusion::Error::RefreshSql { source },
@@ -422,7 +422,7 @@ impl Runtime {
         let mut df = self.df.write().await;
 
         if df.table_exists(ds.name.clone()) {
-            if let Err(e) = df.remove_table(ds.name.clone()) {
+            if let Err(e) = df.remove_table(&ds.name) {
                 tracing::warn!("Unable to unload dataset {}: {}", &ds.name, e);
                 return;
             }
@@ -443,7 +443,7 @@ impl Runtime {
     }
 
     pub async fn update_dataset(&self, ds: &Dataset, all_datasets: &[Dataset]) {
-        status::update_dataset(ds.name.clone(), status::ComponentStatus::Refreshing);
+        status::update_dataset(&ds.name, status::ComponentStatus::Refreshing);
         if let Ok(connector) = self.load_dataset_connector(ds, all_datasets).await {
             tracing::info!("Updating accelerated dataset {}...", &ds.name);
 
@@ -453,7 +453,7 @@ impl Runtime {
                     .reload_accelerated_dataset(ds, Arc::clone(&connector))
                     .await
                 {
-                    status::update_dataset(ds.name.clone(), status::ComponentStatus::Ready);
+                    status::update_dataset(&ds.name, status::ComponentStatus::Ready);
                     return;
                 }
                 tracing::debug!("Failed to create accelerated table for dataset {}, falling back to full dataset reload", ds.name);
@@ -465,12 +465,12 @@ impl Runtime {
                 .register_loaded_dataset(ds, Arc::clone(&connector), None)
                 .await
             {
-                status::update_dataset(ds.name.clone(), status::ComponentStatus::Ready);
+                status::update_dataset(&ds.name, status::ComponentStatus::Ready);
             } else {
-                status::update_dataset(ds.name.clone(), status::ComponentStatus::Error);
+                status::update_dataset(&ds.name, status::ComponentStatus::Error);
             }
         } else {
-            status::update_dataset(ds.name.clone(), status::ComponentStatus::Error);
+            status::update_dataset(&ds.name, status::ComponentStatus::Error);
         }
     }
 
@@ -844,10 +844,7 @@ impl Runtime {
                             self.update_dataset(ds, &valid_datasets).await;
                         }
                     } else {
-                        status::update_dataset(
-                            ds.name.clone(),
-                            status::ComponentStatus::Initializing,
-                        );
+                        status::update_dataset(&ds.name, status::ComponentStatus::Initializing);
                         self.load_dataset(ds, &valid_datasets).await;
                     }
                 }
@@ -884,7 +881,7 @@ impl Runtime {
                                 continue;
                             }
                         };
-                        status::update_dataset(ds.name.clone(), status::ComponentStatus::Disabled);
+                        status::update_dataset(&ds.name, status::ComponentStatus::Disabled);
                         self.remove_dataset(&ds).await;
                     }
                 }

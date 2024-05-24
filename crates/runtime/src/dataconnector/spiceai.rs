@@ -205,8 +205,7 @@ mod tests {
         ];
 
         for (input, expected) in tests {
-            let dataset =
-                Dataset::try_new(input.clone(), "bar".to_string()).expect("a valid dataset");
+            let dataset = Dataset::try_new(input.clone(), "bar").expect("a valid dataset");
             assert_eq!(SpiceAI::spice_dataset_path(dataset), expected, "{input}");
         }
     }

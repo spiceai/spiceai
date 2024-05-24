@@ -357,6 +357,7 @@ pub(crate) mod datasets {
         response::{IntoResponse, Response},
         Extension, Json,
     };
+    use datafusion::sql::TableReference;
     use serde::{Deserialize, Serialize};
     use tokio::sync::RwLock;
     use tract_core::tract_data::itertools::Itertools;
@@ -550,7 +551,10 @@ pub(crate) mod datasets {
         let df_read = df.read().await;
 
         match df_read
-            .update_refresh_sql(&dataset.name, payload.refresh_sql)
+            .update_refresh_sql(
+                TableReference::parse_str(&dataset.name),
+                payload.refresh_sql,
+            )
             .await
         {
             Ok(()) => (status::StatusCode::OK).into_response(),
