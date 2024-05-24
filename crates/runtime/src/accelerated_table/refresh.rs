@@ -4,6 +4,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::TimeFormat;
 use crate::datafusion::filter_converter::TimestampFilterConvert;
+use crate::datafusion::schema;
 use crate::object_store_registry::default_runtime_env;
 use crate::{
     dataconnector::get_data,
@@ -457,6 +458,16 @@ impl Refresher {
             ),
             default_runtime_env(),
         );
+
+        let ctx_state = ctx.state();
+        let default_catalog = &ctx_state.config_options().catalog.default_catalog;
+        match schema::ensure_schema_exists(&ctx, default_catalog, &self.dataset_name) {
+            Ok(()) => (),
+            Err(_) => {
+                unreachable!("The default catalog should always exist");
+            }
+        };
+
         if let Err(e) = ctx.register_table(self.dataset_name.clone(), Arc::clone(&self.federated)) {
             tracing::error!("Unable to register federated table: {e}");
         }
