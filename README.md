@@ -7,13 +7,13 @@
 
 ## What is Spice?
 
-**Spice** is a small, portable runtime that provides developers with a unified SQL query interface to locally materialize, accelerate, and query datasets sourced from any database, data warehouse, or data lake.
+**Spice** is a portable runtime providing developers with a unified SQL interface to materialize, accelerate, and query data sourced from any database, data warehouse, or data lake.
 
 📣 Read the [Spice.ai OSS announcement blog post](https://blog.spiceai.org/posts/2024/03/28/adding-spice-the-next-generation-of-spice.ai-oss/).
 
-Spice makes it easy to build data-driven and data-intensive applications by streamlining the use of data and machine learning (ML) in software.
+Spice connects, fuses, and delivers data to applications and AI, acting as an application-specific, tier-optimized Database CDN.
 
-The Spice runtime is written in Rust and leverages industry leading technologies like Apache DataFusion, Apache Arrow, Apache Arrow Flight, and DuckDB.
+The Spice runtime is written in Rust and is built-with industry leading technologies like [Apache DataFusion](https://datafusion.apache.org), Apache Arrow, Apache Arrow Flight, SQlite, and DuckDB.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://github.com/spiceai/spiceai/assets/80174/96b5fcef-a550-4ce8-a74a-83931275e83e">
@@ -22,11 +22,11 @@ The Spice runtime is written in Rust and leverages industry leading technologies
 
 ## Why Spice?
 
-Spice makes querying data by SQL across one or more data sources simple and fast. Easily co-locate a managed working set of data with your application or ML, locally accelerated in-memory with Arrow, with SQLite/DuckDB, or with an attached database like PostgreSQL for high-performance, low-latency queries. Accelerated engines run in your infrastructure giving you flexibility and control over price and performance.
+Spice makes querying data by SQL across one or more data sources simple and fast. Easily co-locate a managed working set of data with your application or ML, accelerated with in-memory Arrow, with SQLite/DuckDB, or with attached PostgreSQL for high-performance, low-latency queries. Accelerated engines run tier-native in your infrastructure giving you flexibility and control over cost and performance.
 
 ### How is Spice different?
 
-1. Local Acceleration with **both OLAP (Arrow/DuckDB) and OLTP (SQLite/PostgreSQL)** databases at dataset granularity compared to other OLAP only or OLTP only systems.
+1. Tier-optimized Acceleration with **both OLAP (Arrow/DuckDB) and OLTP (SQLite/PostgreSQL)** databases at dataset granularity compared to other OLAP only or OLTP only systems.
 
 2. **Separation of materialization and storage/compute** compared with monolith data systems and data lakes. Keep compute colocated with source data while bringing a materialized working set next to your application, dashboard, or data/ML pipeline.
 
