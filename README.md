@@ -30,7 +30,7 @@ Spice makes querying data by SQL across one or more data sources simple and fast
 
 2. **Separation of materialization and storage/compute** compared with monolith data systems and data lakes. Keep compute colocated with source data while bringing a materialized working set next to your application, dashboard, or data/ML pipeline.
 
-3. **Edge to cloud native**. Chainable and designed to be deployed standalone, as a container sidecar, as a microservice, in a cluster across laptops, the Edge, On-Prem, to a POP, and to all public clouds.
+3. **Edge to cloud native**. Designed to be deployed standalone, as a container sidecar, as a microservice, in a cluster across laptops, the Edge, On-Prem, to a POP, and to all public clouds. Spice instances can also be chained, and deployed distributed across tiers of infrastructure.
 
 ### Before Spice
 
