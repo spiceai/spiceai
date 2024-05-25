@@ -368,6 +368,8 @@ impl DataFusion {
     ) -> Result<()> {
         let dataset = dataset.borrow();
 
+        schema::ensure_schema_exists(&self.ctx, SPICE_DEFAULT_CATALOG, &dataset.name)?;
+
         match table {
             Table::Accelerated {
                 source,
@@ -580,7 +582,10 @@ impl DataFusion {
             dataset.retention_check_interval(),
             acceleration_settings.retention_check_enabled,
         ));
+
         accelerated_table_builder.zero_results_action(acceleration_settings.on_zero_results);
+
+        accelerated_table_builder.cache_provider(self.cache_provider.clone());
 
         Ok(accelerated_table_builder.build().await)
     }
