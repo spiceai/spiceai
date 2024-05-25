@@ -60,7 +60,7 @@ Spice makes querying data by SQL across one or more data sources simple and fast
 
 - **Is Spice a cache?** No, however you can think of Spice data materialization like an _active_ cache or data prefetcher. A cache would fetch data on a cache-miss while Spice prefetches and materializes filtered data on an interval or as new data becomes available. In addition to materialization Spice supports [results caching](https://docs.spiceai.org/features/caching).
 
-- **Is Spice a CDN for databases?** Yes, you can think of Spice like a CDN for different data sources. Using CDN concepts, Spice enables you to ship (load) a working set of your database (or data lake, or data warehouse) where it's most frequently accessed, like from a data application or with AI-inference.
+- **Is Spice a CDN for databases?** Yes, you can think of Spice like a CDN for different data sources. Using CDN concepts, Spice enables you to ship (load) a working set of your database (or data lake, or data warehouse) where it's most frequently accessed, like from a data application or for AI-inference.
 
 ### Watch a 30-sec BI dashboard acceleration demo
 
@@ -90,12 +90,12 @@ Currently supported data connectors for upstream datasets. More coming soon.
 
 Currently supported data stores for local materialization/acceleration. More coming soon.
 
-| Name       | Description                                                                                                   | Status | Engine Modes     | Refresh Modes    |
-| ---------- | ------------------------------------------------------------------------------------------------------------- | ------ | ---------------- | ---------------- |
-| `arrow`    | In-Memory Arrow Records                                                                                       | Alpha  | `memory`         | `append`, `full` |
-| `duckdb`   | Embedded [DuckDB](https://docs.spiceai.org/data-accelerators/duckdb)                                          | Alpha  | `memory`, `file` | `append`, `full` |
-| `sqlite`   | Embedded [SQLite](https://docs.spiceai.org/data-accelerators/sqlite)                                          | Alpha  | `memory`, `file` | `append`, `full` |
-| `postgres` | Attached [PostgreSQL](https://github.com/spiceai/quickstarts/tree/trunk/postgres#postgresql-data-accelerator) | Alpha  |                  | `append`, `full` |
+| Name       | Description                                                                                                   | Status | Engine Modes     |
+| ---------- | ------------------------------------------------------------------------------------------------------------- | ------ | ---------------- |
+| `arrow`    | In-Memory Arrow Records                                                                                       | Alpha  | `memory`         |
+| `duckdb`   | Embedded [DuckDB](https://docs.spiceai.org/data-accelerators/duckdb)                                          | Alpha  | `memory`, `file` |
+| `sqlite`   | Embedded [SQLite](https://docs.spiceai.org/data-accelerators/sqlite)                                          | Alpha  | `memory`, `file` |
+| `postgres` | Attached [PostgreSQL](https://github.com/spiceai/quickstarts/tree/trunk/postgres#postgresql-data-accelerator) | Alpha  | `file`           |
 
 ### Intelligent Applications
 
