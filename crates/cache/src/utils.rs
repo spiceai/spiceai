@@ -116,6 +116,17 @@ mod tests {
     }
 
     #[test]
+    fn test_collect_table_names_system_query() {
+        let sql = "describe customer";
+        let logical_plan = parse_sql_to_logical_plan(sql);
+
+        let table_names = get_logical_plan_input_tables(&logical_plan);
+
+        let expected: HashSet<String> = vec![].into_iter().collect();
+        assert_eq!(table_names, expected);
+    }
+
+    #[test]
     fn test_collect_table_names_simple_select() {
         let sql = "SELECT * FROM customer";
         let logical_plan = parse_sql_to_logical_plan(sql);
