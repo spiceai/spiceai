@@ -22,7 +22,10 @@ use datafusion::{
     catalog::schema::SchemaProvider,
     datasource::TableProvider,
     error::{DataFusionError, Result},
+    execution::context::SessionContext,
+    sql::TableReference,
 };
+use snafu::prelude::*;
 
 // Copy of default MemorySchemaProvider that allows `register_table` to atomically overwrite any existing tables
 // https://github.com/apache/datafusion/blob/deebda78a34251b2bddf0c5f66edfaa112c4559b/datafusion/core/src/catalog/schema.rs#L84
@@ -76,5 +79,32 @@ impl SchemaProvider for SpiceSchemaProvider {
 
     fn table_exist(&self, name: &str) -> bool {
         self.tables.contains_key(name)
+    }
+}
+
+pub(crate) fn ensure_schema_exists(
+    ctx: &SessionContext,
+    catalog: &str,
+    table_reference: &TableReference,
+) -> Result<(), super::Error> {
+    let catalog_provider = ctx
+        .catalog(catalog)
+        .context(super::CatalogMissingSnafu { catalog })?;
+
+    // This TableReference doesn't have a schema component, nothing to do.
+    let Some(schema_name) = table_reference.schema() else {
+        return Ok(());
+    };
+
+    // If the schema exists, nothing to do.
+    if catalog_provider.schema(schema_name).is_some() {
+        return Ok(());
+    };
+
+    // Create the schema
+    let schema_provider = Arc::new(SpiceSchemaProvider::new());
+    match catalog_provider.register_schema(schema_name, schema_provider) {
+        Ok(_) => Ok(()),
+        Err(_) => unreachable!("register_schema will never fail"),
     }
 }

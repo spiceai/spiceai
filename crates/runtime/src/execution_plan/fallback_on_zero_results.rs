@@ -25,6 +25,7 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, Partitioning,
     PlanProperties,
 };
+use datafusion::sql::TableReference;
 use futures::{stream, StreamExt};
 use std::any::Any;
 use std::fmt;
@@ -38,7 +39,7 @@ use super::TableScanParams;
 /// The input and fallback `ExecutionPlan` must have the same schema, execution modes and equivalence properties.
 #[allow(clippy::module_name_repetitions)]
 pub struct FallbackOnZeroResultsScanExec {
-    table_name: String,
+    table_name: TableReference,
     /// The input execution plan.
     input: Arc<dyn ExecutionPlan>,
     /// A closure to get the fallback execution plan if needed.
@@ -50,7 +51,7 @@ pub struct FallbackOnZeroResultsScanExec {
 impl FallbackOnZeroResultsScanExec {
     /// Create a new `FallbackOnZeroResultsScanExec`.
     pub fn new(
-        table_name: String,
+        table_name: TableReference,
         mut input: Arc<dyn ExecutionPlan>,
         fallback_table_provider: Arc<dyn TableProvider>,
         fallback_scan_params: TableScanParams,
@@ -188,7 +189,7 @@ impl ExecutionPlan for FallbackOnZeroResultsScanExec {
             } else {
                 tracing::trace!("FallbackOnZeroResultsScanExec input_stream.next() returned None");
                 tracing::info!("{fallback_msg}");
-                metrics::counter!("accelerated_zero_results_federated_fallback", "dataset_name" => table_name).increment(1);
+                metrics::counter!("accelerated_zero_results_federated_fallback", "dataset_name" => table_name.to_string()).increment(1);
                 let fallback_plan = match fallback_provider
                     .scan(
                         &scan_params.state,
@@ -282,7 +283,7 @@ mod tests {
             let ctx = SessionContext::new();
 
             let exec = FallbackOnZeroResultsScanExec::new(
-                "test".to_string(),
+                TableReference::bare("test"),
                 empty_memory_exec(),
                 memory_table_provider(),
                 TableScanParams {
@@ -369,7 +370,7 @@ mod tests {
             };
 
             let exec = FallbackOnZeroResultsScanExec::new(
-                "test".to_string(),
+                TableReference::bare("test"),
                 input_plan,
                 fallback_provider,
                 fallback_scan_params,

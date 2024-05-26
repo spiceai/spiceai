@@ -31,8 +31,8 @@ use crate::{
 use super::Service;
 
 async fn get_sender_channel(
-    channel_map: Arc<RwLock<HashMap<String, Arc<Sender<DataUpdate>>>>>,
-    path: &str,
+    channel_map: Arc<RwLock<HashMap<TableReference, Arc<Sender<DataUpdate>>>>>,
+    path: &TableReference,
 ) -> Option<Arc<Sender<DataUpdate>>> {
     let channel_map_read = channel_map.read().await;
     if channel_map_read.contains_key(path) {
@@ -60,13 +60,13 @@ pub(crate) async fn handle(
         return Err(Status::invalid_argument("No path provided"));
     };
 
-    let path = fd.path.join(".");
+    let path = TableReference::parse_str(&fd.path.join("."));
 
-    duration_metric.with_labels(vec![("path", path.clone())]);
+    duration_metric.with_labels(vec![("path", path.to_string())]);
 
     let df = flight_svc.datafusion.read().await;
 
-    if !df.is_writable(&TableReference::bare(path.to_string())) {
+    if !df.is_writable(&path) {
         return Err(Status::invalid_argument(format!(
             "Path doesn't exist or is not writable: {path}",
         )));
@@ -127,10 +127,7 @@ pub(crate) async fn handle(
                     };
 
                     let df_guard = df.read().await;
-                    if let Err(e) = df_guard
-                        .write_data(TableReference::bare(path), data_update)
-                        .await
-                    {
+                    if let Err(e) = df_guard.write_data(path.clone(), data_update).await {
                         return Some((
                             Err(Status::internal(format!("Error writing data: {e}"))),
                             flight,

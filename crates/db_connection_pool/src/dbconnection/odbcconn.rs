@@ -76,7 +76,7 @@ pub enum Error {
 
 pub struct ODBCConnection<'a> {
     pub conn: Arc<Mutex<Connection<'a>>>,
-    pub params: Option<HashMap<String, String>>,
+    pub params: Arc<HashMap<String, String>>,
 }
 
 impl<'a> DbConnection<Connection<'a>, ODBCParameter> for ODBCConnection<'a>
@@ -104,7 +104,7 @@ where
     fn new(conn: Connection<'a>) -> Self {
         ODBCConnection {
             conn: Arc::new(conn.into()),
-            params: None,
+            params: Arc::new(HashMap::new()),
         }
     }
 
@@ -178,15 +178,15 @@ where
 fn build_odbc_reader<C: Cursor>(
     cursor: C,
     schema: &Arc<Schema>,
-    params: &Option<HashMap<String, String>>,
+    params: &HashMap<String, String>,
 ) -> Result<OdbcReader<C>> {
     let mut builder = OdbcReaderBuilder::new();
     builder.with_schema(Arc::clone(schema));
 
     let bind_as_usize = |k: &str, f: &mut dyn FnMut(usize)| {
         params
-            .as_ref()
-            .and_then(|p| p.get(k).cloned())
+            .get(k)
+            .cloned()
             .and_then(|s| s.parse::<usize>().ok())
             .into_iter()
             .for_each(f);
@@ -206,8 +206,7 @@ fn build_odbc_reader<C: Cursor>(
     });
 
     params
-        .as_ref()
-        .and_then(|p| p.get("enable_db2_length_quirk"))
+        .get("enable_db2_length_quirk")
         .and_then(|q| q.parse::<bool>().ok())
         .into_iter()
         .for_each(|b| {
@@ -256,7 +255,7 @@ mod tests {
         use odbc_api::Cursor;
 
         // It is possible to connect to the SQLite driver without an underlying file
-        let pool = ODBCPool::new(&Arc::new(None), &None).expect("Must create ODBC pool");
+        let pool = ODBCPool::new(Arc::new(HashMap::new()), &None).expect("Must create ODBC pool");
         let env = pool.odbc_environment();
         let driver_cxn = env
             .driver_connect(

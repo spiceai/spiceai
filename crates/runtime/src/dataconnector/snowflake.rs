@@ -20,13 +20,14 @@ use async_trait::async_trait;
 use data_components::snowflake::SnowflakeTableFactory;
 use data_components::Read;
 
+use crate::component::dataset::Dataset;
 use datafusion::datasource::TableProvider;
 use db_connection_pool::snowflakepool::SnowflakeConnectionPool;
 use db_connection_pool::DbConnectionPool;
+use itertools::Itertools;
 use secrets::Secret;
 use snafu::prelude::*;
 use snowflake_api::SnowflakeApi;
-use spicepod::component::dataset::Dataset;
 use std::any::Any;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -47,7 +48,7 @@ pub struct Snowflake {
 impl DataConnectorFactory for Snowflake {
     fn create(
         secret: Option<Secret>,
-        params: Arc<Option<HashMap<String, String>>>,
+        params: Arc<HashMap<String, String>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let pool: Arc<
@@ -75,12 +76,22 @@ impl DataConnector for Snowflake {
         &self,
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        Ok(
-            Read::table_provider(&self.table_factory, dataset.path().into())
-                .await
-                .context(super::UnableToGetReadProviderSnafu {
-                    dataconnector: "snowflake",
-                })?,
-        )
+        let path = dataset
+            .path()
+            .split('.')
+            .map(|x| {
+                if x.starts_with('"') && x.ends_with('"') {
+                    return x.into();
+                }
+
+                format!("\"{x}\"")
+            })
+            .join(".");
+
+        Ok(Read::table_provider(&self.table_factory, path.into())
+            .await
+            .context(super::UnableToGetReadProviderSnafu {
+                dataconnector: "snowflake",
+            })?)
     }
 }

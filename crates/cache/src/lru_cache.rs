@@ -14,11 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use crate::CachedQueryResult;
+use crate::FailedToInvalidateCacheSnafu;
 use crate::QueryResultCache;
 use crate::Result;
 use async_trait::async_trait;
 use datafusion::logical_expr::LogicalPlan;
 use moka::future::Cache;
+use snafu::ResultExt;
 use std::hash::DefaultHasher;
 use std::hash::Hash;
 use std::hash::Hasher;
@@ -53,6 +55,8 @@ impl LruCache {
                 }
             })
             .max_capacity(cache_max_size)
+            .eviction_policy(moka::policy::EvictionPolicy::lru())
+            .support_invalidation_closures()
             .build();
 
         LruCache { cache }
@@ -73,6 +77,23 @@ impl QueryResultCache for LruCache {
         let key = key_for_logical_plan(plan);
         self.cache.insert(key, result).await;
         Ok(())
+    }
+
+    async fn invalidate_for_table(&self, table_name: &str) -> Result<()> {
+        let name = table_name.to_string().to_lowercase();
+        self.cache
+            .invalidate_entries_if(move |_key, value| value.input_tables.contains(&name))
+            .context(FailedToInvalidateCacheSnafu { table_name })?;
+
+        Ok(())
+    }
+
+    fn size_bytes(&self) -> u64 {
+        self.cache.weighted_size()
+    }
+
+    fn item_count(&self) -> u64 {
+        self.cache.entry_count()
     }
 }
 

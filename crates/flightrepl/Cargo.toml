@@ -19,6 +19,6 @@ rustyline = "13.0.0"
 prost = { version = "0.12.1", default-features = false, features = ["prost-derive"] }
 ansi_term = "0.12.1"
 reqwest = { version = "0.11.24", features = ["json"] }
-serde_json = "1.0.1"
+serde_json.workspace = true
 arrow-json = "51.0.0"
 llms = { path = "../llms" }

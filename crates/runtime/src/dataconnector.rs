@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::component::dataset::Dataset;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::dataframe::DataFrame;
@@ -31,7 +32,6 @@ use datafusion::logical_expr::{Expr, LogicalPlanBuilder};
 use datafusion::sql::TableReference;
 use lazy_static::lazy_static;
 use snafu::prelude::*;
-use spicepod::component::dataset::Dataset;
 use std::any::Any;
 use std::collections::HashMap;
 use std::fmt::Display;
@@ -175,7 +175,7 @@ type NewDataConnectorResult = AnyErrorResult<Arc<dyn DataConnector>>;
 
 type NewDataConnectorFn = dyn Fn(
         Option<Secret>,
-        Arc<Option<HashMap<String, String>>>,
+        Arc<HashMap<String, String>>,
     ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>>
     + Send;
 
@@ -188,7 +188,7 @@ pub async fn register_connector_factory(
     name: &str,
     connector_factory: impl Fn(
             Option<Secret>,
-            Arc<Option<HashMap<String, String>>>,
+            Arc<HashMap<String, String>>,
         ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>>
         + Send
         + 'static,
@@ -207,7 +207,7 @@ pub async fn register_connector_factory(
 pub async fn create_new_connector(
     name: &str,
     secret: Option<Secret>,
-    params: Arc<Option<HashMap<String, String>>>,
+    params: Arc<HashMap<String, String>>,
 ) -> Option<AnyErrorResult<Arc<dyn DataConnector>>> {
     let guard = DATA_CONNECTOR_FACTORY_REGISTRY.lock().await;
 
@@ -252,7 +252,7 @@ pub async fn register_all() {
 pub trait DataConnectorFactory {
     fn create(
         secret: Option<Secret>,
-        params: Arc<Option<HashMap<String, String>>>,
+        params: Arc<HashMap<String, String>>,
     ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>>;
 }
 
@@ -319,7 +319,10 @@ pub trait ListingTableConnector: DataConnector {
 
     fn get_params(&self) -> &HashMap<String, String>;
 
-    fn get_file_format_and_extension(&self) -> DataConnectorResult<(Arc<dyn FileFormat>, String)>
+    fn get_file_format_and_extension(
+        &self,
+        dataset: &Dataset,
+    ) -> DataConnectorResult<(Arc<dyn FileFormat>, String)>
     where
         Self: Display,
     {
@@ -331,17 +334,37 @@ pub trait ListingTableConnector: DataConnector {
                 self.get_csv_format(params)?,
                 extension.unwrap_or(".csv".to_string()),
             )),
-            None | Some("parquet") => Ok((
+            Some("parquet") => Ok((
                 Arc::new(ParquetFormat::default()),
                 extension.unwrap_or(".parquet".to_string()),
             )),
             Some(format) => Err(DataConnectorError::InvalidConfiguration {
                 dataconnector: format!("{self}"),
-                message: format!(
-                    "Invalid file_format: {format}. Supported formats are: csv, parquet"
-                ),
+                message: format!("Unsupported file format '{format}'. Use csv or parquet."),
                 source: "Invalid file format".into(),
             }),
+            None => {
+                if let Some(ext) = std::path::Path::new(dataset.path().as_str()).extension() {
+                    if ext.eq_ignore_ascii_case("csv") {
+                        return Ok((
+                            self.get_csv_format(params)?,
+                            extension.unwrap_or(".csv".to_string()),
+                        ));
+                    }
+                    if ext.eq_ignore_ascii_case("parquet") {
+                        return Ok((
+                            Arc::new(ParquetFormat::default()),
+                            extension.unwrap_or(".parquet".to_string()),
+                        ));
+                    }
+                }
+
+                Err(DataConnectorError::InvalidConfiguration {
+                    dataconnector: format!("{self}"),
+                    message: "Missing required file_format parameter.".to_string(),
+                    source: "Missing file format".into(),
+                })
+            }
         }
     }
 
@@ -412,7 +435,7 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
             code: "LTC-RP-LTUP".to_string(), // ListingTableConnector-ReadProvider-ListingTableUrlParse
         })?;
 
-        let (file_format, extension) = self.get_file_format_and_extension()?;
+        let (file_format, extension) = self.get_file_format_and_extension(dataset)?;
         let options = ListingOptions::new(file_format).with_file_extension(&extension);
 
         let resolved_schema = options
@@ -436,5 +459,127 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
             })?;
 
         Ok(Arc::new(table))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use datafusion::common::FileType;
+
+    use super::*;
+
+    struct TestConnector {
+        params: Arc<HashMap<String, String>>,
+    }
+
+    impl std::fmt::Display for TestConnector {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "TestConnector")
+        }
+    }
+
+    impl DataConnectorFactory for TestConnector {
+        fn create(
+            _secret: Option<Secret>,
+            params: Arc<HashMap<String, String>>,
+        ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+            Box::pin(async move {
+                let connector = Self { params };
+                Ok(Arc::new(connector) as Arc<dyn DataConnector>)
+            })
+        }
+    }
+
+    impl ListingTableConnector for TestConnector {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn get_params(&self) -> &HashMap<String, String> {
+            &self.params
+        }
+
+        fn get_object_store_url(&self, _dataset: &Dataset) -> DataConnectorResult<Url> {
+            Url::parse("test")
+                .boxed()
+                .context(super::InvalidConfigurationSnafu {
+                    dataconnector: format!("{self}"),
+                    message: "Invalid URL".to_string(),
+                })
+        }
+    }
+
+    fn setup_connector(path: String, params: HashMap<String, String>) -> (TestConnector, Dataset) {
+        let connector = TestConnector {
+            params: params.into(),
+        };
+        let dataset = Dataset::try_new(path, "test").expect("a valid dataset");
+
+        (connector, dataset)
+    }
+
+    #[test]
+    fn test_get_file_format_and_extension_require_file_format() {
+        let (connector, dataset) = setup_connector("test:test/".to_string(), HashMap::new());
+
+        match connector.get_file_format_and_extension(&dataset) {
+            Ok(_) => panic!("Unexpected success"),
+            Err(e) => assert_eq!(
+                e.to_string(),
+                "Invalid configuration for TestConnector. Missing required file_format parameter."
+            ),
+        }
+    }
+
+    #[test]
+    fn test_get_file_format_and_extension_detect_csv_extension() {
+        let (connector, dataset) = setup_connector("test:test.csv".to_string(), HashMap::new());
+
+        if let Ok((file_format, extension)) = connector.get_file_format_and_extension(&dataset) {
+            assert_eq!(file_format.file_type(), FileType::CSV);
+            assert_eq!(extension, ".csv");
+        } else {
+            panic!("Unexpected error");
+        }
+    }
+
+    #[test]
+    fn test_get_file_format_and_extension_detect_parquet_extension() {
+        let (connector, dataset) = setup_connector("test:test.parquet".to_string(), HashMap::new());
+
+        if let Ok((file_format, extension)) = connector.get_file_format_and_extension(&dataset) {
+            assert_eq!(file_format.file_type(), FileType::PARQUET);
+            assert_eq!(extension, ".parquet");
+        } else {
+            panic!("Unexpected error");
+        }
+    }
+
+    #[test]
+    fn test_get_file_format_and_extension_csv_from_params() {
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "csv".to_string());
+        let (connector, dataset) = setup_connector("test:test.parquet".to_string(), params);
+
+        if let Ok((file_format, extension)) = connector.get_file_format_and_extension(&dataset) {
+            assert_eq!(file_format.file_type(), FileType::CSV);
+            assert_eq!(extension, ".csv");
+        } else {
+            panic!("Unexpected error");
+        }
+    }
+
+    #[test]
+    fn test_get_file_format_and_extension_parquet_from_params() {
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "parquet".to_string());
+        let (connector, dataset) = setup_connector("test:test.csv".to_string(), params);
+
+        if let Ok((file_format, extension)) = connector.get_file_format_and_extension(&dataset) {
+            assert_eq!(file_format.file_type(), FileType::PARQUET);
+            assert_eq!(extension, ".parquet");
+        } else {
+            panic!("Unexpected error");
+        }
     }
 }

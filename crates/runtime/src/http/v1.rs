@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::component::dataset::Dataset;
 use arrow::array::RecordBatch;
 use axum::{
     http::StatusCode,
@@ -22,7 +23,6 @@ use axum::{
 use csv::Writer;
 use datafusion::dataframe::DataFrame;
 use serde::{Deserialize, Serialize};
-use spicepod::component::dataset::Dataset;
 
 use crate::{datafusion::DataFusion, status::ComponentStatus};
 
@@ -44,7 +44,7 @@ fn convert_entry_to_csv<T: Serialize>(entries: &[T]) -> Result<String, Box<dyn s
 }
 
 fn dataset_status(df: &DataFusion, ds: &Dataset) -> ComponentStatus {
-    if df.table_exists(ds.name.as_str()) {
+    if df.table_exists(ds.name.clone()) {
         ComponentStatus::Ready
     } else {
         ComponentStatus::Error
@@ -89,7 +89,7 @@ pub(crate) mod query {
     use arrow::record_batch::RecordBatch;
     use axum::{
         body::Bytes,
-        http::StatusCode,
+        http::{HeaderMap, StatusCode},
         response::{IntoResponse, Response},
         Extension,
     };
@@ -117,25 +117,23 @@ pub(crate) mod query {
             .with_allow_dml(false)
             .with_allow_statements(false);
 
-        let results: Vec<RecordBatch> = match df
+        let (data, is_data_from_cache) = match df
             .read()
             .await
             .query_with_cache(&query, Some(restricted_sql_options))
             .await
         {
-            Ok(record_batch_stream) => {
-                match record_batch_stream.try_collect::<Vec<RecordBatch>>().await {
-                    Ok(batches) => batches,
-                    Err(e) => {
-                        tracing::debug!("Error executing query: {e}");
-                        return (
-                            StatusCode::BAD_REQUEST,
-                            format!("Error processing batch: {e}"),
-                        )
-                            .into_response();
-                    }
+            Ok(query_result) => match query_result.data.try_collect::<Vec<RecordBatch>>().await {
+                Ok(batches) => (batches, query_result.from_cache),
+                Err(e) => {
+                    tracing::debug!("Error executing query: {e}");
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        format!("Error processing batch: {e}"),
+                    )
+                        .into_response();
                 }
-            }
+            },
             Err(e) => {
                 tracing::debug!("Error executing query: {e}");
                 return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
@@ -145,8 +143,7 @@ pub(crate) mod query {
         let buf = Vec::new();
         let mut writer = arrow_json::ArrayWriter::new(buf);
 
-        if let Err(e) =
-            writer.write_batches(results.iter().collect::<Vec<&RecordBatch>>().as_slice())
+        if let Err(e) = writer.write_batches(data.iter().collect::<Vec<&RecordBatch>>().as_slice())
         {
             tracing::debug!("Error converting results to JSON: {e}");
             return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
@@ -165,7 +162,23 @@ pub(crate) mod query {
             }
         };
 
-        (StatusCode::OK, res).into_response()
+        let mut headers = HeaderMap::new();
+
+        match is_data_from_cache {
+            Some(true) => {
+                if let Ok(value) = "Hit from spiceai".parse() {
+                    headers.insert("X-Cache", value);
+                }
+            }
+            Some(false) => {
+                if let Ok(value) = "Miss from spiceai".parse() {
+                    headers.insert("X-Cache", value);
+                }
+            }
+            None => {}
+        };
+
+        (StatusCode::OK, headers, res).into_response()
     }
 }
 
@@ -335,6 +348,7 @@ pub(crate) mod status {
 pub(crate) mod datasets {
     use std::sync::Arc;
 
+    use crate::{component::dataset::Dataset, Runtime};
     use app::App;
     use axum::{
         extract::Path,
@@ -343,8 +357,8 @@ pub(crate) mod datasets {
         response::{IntoResponse, Response},
         Extension, Json,
     };
+    use datafusion::sql::TableReference;
     use serde::{Deserialize, Serialize};
-    use spicepod::component::dataset::Dataset;
     use tokio::sync::RwLock;
     use tract_core::tract_data::itertools::Itertools;
 
@@ -376,7 +390,6 @@ pub(crate) mod datasets {
         pub name: String,
         pub replication_enabled: bool,
         pub acceleration_enabled: bool,
-        pub depends_on: Option<String>,
 
         #[serde(skip_serializing_if = "Option::is_none")]
         pub status: Option<ComponentStatus>,
@@ -397,14 +410,13 @@ pub(crate) mod datasets {
                 .into_response();
         };
 
+        let valid_datasets = Runtime::get_valid_datasets(readable_app, false);
         let mut datasets: Vec<Dataset> = match filter.source {
-            Some(source) => readable_app
-                .datasets
-                .iter()
+            Some(source) => valid_datasets
+                .into_iter()
                 .filter(|d| d.source() == source)
-                .cloned()
                 .collect(),
-            None => readable_app.datasets.clone(),
+            None => valid_datasets,
         };
 
         if filter.remove_views {
@@ -417,14 +429,9 @@ pub(crate) mod datasets {
             .iter()
             .map(|d| DatasetResponseItem {
                 from: d.from.clone(),
-                name: d.name.clone(),
+                name: d.name.to_quoted_string(),
                 replication_enabled: d.replication.as_ref().is_some_and(|f| f.enabled),
                 acceleration_enabled: d.acceleration.as_ref().is_some_and(|f| f.enabled),
-                depends_on: if d.depends_on.is_empty() {
-                    None
-                } else {
-                    Some(d.depends_on.join(", "))
-                },
                 status: if params.status {
                     Some(dataset_status(&df_read, d))
                 } else {
@@ -544,7 +551,10 @@ pub(crate) mod datasets {
         let df_read = df.read().await;
 
         match df_read
-            .update_refresh_sql(&dataset.name, payload.refresh_sql)
+            .update_refresh_sql(
+                TableReference::parse_str(&dataset.name),
+                payload.refresh_sql,
+            )
             .await
         {
             Ok(()) => (status::StatusCode::OK).into_response(),
@@ -947,12 +957,11 @@ pub(crate) mod nsql {
         response::{IntoResponse, Response},
         Extension, Json,
     };
-    use llms::nql::{create_nsql, NSQLRuntime, Nql};
     use serde::{Deserialize, Serialize};
     use std::sync::Arc;
     use tokio::sync::RwLock;
 
-    use crate::{datafusion::DataFusion, http::v1::dataframe_to_response};
+    use crate::{datafusion::DataFusion, http::v1::dataframe_to_response, LLMModelStore};
 
     fn clean_model_based_sql(input: &str) -> String {
         let no_dashes = match input.strip_prefix("--") {
@@ -970,17 +979,17 @@ pub(crate) mod nsql {
     pub struct Request {
         pub query: String,
 
-        #[serde(rename = "use", default = "default_runtime")]
-        pub runtime: NSQLRuntime,
+        #[serde(rename = "use", default = "default_model")]
+        pub model: String,
     }
 
-    fn default_runtime() -> NSQLRuntime {
-        NSQLRuntime::Mistral
+    fn default_model() -> String {
+        "nql".to_string()
     }
 
     pub(crate) async fn post(
         Extension(df): Extension<Arc<RwLock<DataFusion>>>,
-        Extension(nsql_model): Extension<Arc<RwLock<Box<dyn Nql>>>>,
+        Extension(nsql_models): Extension<Arc<RwLock<LLMModelStore>>>,
         Json(payload): Json<Request>,
     ) -> Response {
         let readable_df = df.read().await;
@@ -1016,17 +1025,15 @@ pub(crate) mod nsql {
         );
         tracing::trace!("Running prompt: {nsql_query}");
 
-        // Run prompt through model. Only OpenAI is loaded at runtime.
-        let result = if payload.runtime == NSQLRuntime::Openai {
-            match create_nsql(&NSQLRuntime::Openai) {
-                Ok(mut openai_nsql) => openai_nsql.run(nsql_query).await,
-                Err(e) => {
-                    tracing::error!("Failed to load OpenAI NQL model: {e:#?}");
-                    return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-                }
+        let result = match nsql_models.read().await.get(&payload.model) {
+            Some(nql_model) => nql_model.write().await.run(nsql_query).await,
+            None => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Model {} not found", payload.model),
+                )
+                    .into_response()
             }
-        } else {
-            nsql_model.write().await.run(nsql_query).await
         };
 
         // Run the SQL from the NSQL model through datafusion.

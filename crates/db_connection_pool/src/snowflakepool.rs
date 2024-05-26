@@ -74,16 +74,11 @@ pub struct SnowflakeConnectionPool {
 }
 
 fn get_param(
-    params: &Arc<Option<HashMap<String, String>>>,
+    params: &HashMap<String, String>,
     secret: &Option<Secret>,
     param_name: &str,
 ) -> Option<String> {
-    return get_secret_or_param(
-        params.as_ref().as_ref(),
-        secret,
-        &format!("{param_name}_key"),
-        param_name,
-    );
+    get_secret_or_param(params, secret, &format!("{param_name}_key"), param_name)
 }
 
 impl SnowflakeConnectionPool {
@@ -92,10 +87,7 @@ impl SnowflakeConnectionPool {
     /// # Errors
     ///
     /// Returns an error if there is a problem creating the connection pool.
-    pub async fn new(
-        params: &Arc<Option<HashMap<String, String>>>,
-        secret: &Option<Secret>,
-    ) -> Result<Self> {
+    pub async fn new(params: &HashMap<String, String>, secret: &Option<Secret>) -> Result<Self> {
         let username = get_param(params, secret, "username")
             .context(MissingRequiredSecretSnafu { name: "username" })?;
 
@@ -167,7 +159,7 @@ fn init_snowflake_api_with_password_auth(
     username: &str,
     warehouse: &Option<String>,
     role: &Option<String>,
-    params: &Arc<Option<HashMap<String, String>>>,
+    params: &HashMap<String, String>,
     secret: &Option<Secret>,
 ) -> Result<SnowflakeApi> {
     let password = get_param(params, secret, "password")
@@ -191,7 +183,7 @@ fn init_snowflake_api_with_keypair_auth(
     username: &str,
     warehouse: &Option<String>,
     role: &Option<String>,
-    params: &Arc<Option<HashMap<String, String>>>,
+    params: &HashMap<String, String>,
     secret: &Option<Secret>,
 ) -> Result<SnowflakeApi> {
     let private_key_path = get_param(params, secret, "snowflake_private_key_path").context(

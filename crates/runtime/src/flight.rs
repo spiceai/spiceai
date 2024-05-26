@@ -27,6 +27,7 @@ use bytes::Bytes;
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::SQLOptions;
 use datafusion::sql::sqlparser::parser::ParserError;
+use datafusion::sql::TableReference;
 use futures::stream::{self, BoxStream, StreamExt};
 use futures::{Stream, TryStreamExt};
 use snafu::prelude::*;
@@ -53,7 +54,7 @@ use arrow_flight::{
 
 pub struct Service {
     datafusion: Arc<RwLock<DataFusion>>,
-    channel_map: Arc<RwLock<HashMap<String, Arc<Sender<DataUpdate>>>>>,
+    channel_map: Arc<RwLock<HashMap<TableReference, Arc<Sender<DataUpdate>>>>>,
 }
 
 #[tonic::async_trait]
@@ -189,12 +190,13 @@ impl Service {
             .await
             .map_err(to_tonic_err)?;
 
-        let schema = batches_stream.schema();
+        let schema = batches_stream.data.schema();
         let options = datafusion::arrow::ipc::writer::IpcWriteOptions::default();
         let schema_as_ipc = SchemaAsIpc::new(&schema, &options);
         let schema_flight_data = FlightData::from(schema_as_ipc);
 
         let batches_stream = batches_stream
+            .data
             .then(move |batch_result| {
                 let options_clone = options.clone();
                 async move {
