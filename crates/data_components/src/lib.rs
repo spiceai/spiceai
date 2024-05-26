@@ -51,6 +51,7 @@ pub mod snowflake;
 
 pub mod delete;
 pub mod util;
+pub mod metadata;
 
 #[async_trait]
 pub trait Read: Send + Sync {
