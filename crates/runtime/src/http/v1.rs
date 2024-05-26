@@ -196,12 +196,12 @@ pub(crate) mod query {
 
         match is_data_from_cache {
             Some(true) => {
-                if let Ok(value) = "HIT".parse() {
+                if let Ok(value) = "Hit from spiceai".parse() {
                     headers.insert("X-Cache", value);
                 }
             }
             Some(false) => {
-                if let Ok(value) = "MISS".parse() {
+                if let Ok(value) = "Miss from spiceai".parse() {
                     headers.insert("X-Cache", value);
                 }
             }
