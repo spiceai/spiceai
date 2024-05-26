@@ -783,14 +783,6 @@ jobs:
           with:
             build-path: ./build
 
-        # - name: install Spice (https://install.spiceai.org)
-        #   if : matrix.target_os != 'windows'
-        #   env:
-        #     GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        #   run: |
-        #     curl https://install.spiceai.org | /bin/bash
-        #     echo "$HOME/.spice/bin" >> $GITHUB_PATH
-
         - name: Init spice app
           run: |
             spice init test_app
