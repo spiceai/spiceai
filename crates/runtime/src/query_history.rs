@@ -19,16 +19,14 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use crate::component::dataset::acceleration::{Acceleration, RefreshMode};
+use crate::component::dataset::TimeFormat;
 use arrow::{
     array::{BooleanArray, RecordBatch, StringArray, TimestampNanosecondArray, UInt64Array},
     datatypes::{DataType, Field, Schema, TimeUnit},
 };
 use datafusion::sql::TableReference;
 use snafu::{ResultExt, Snafu};
-use spicepod::component::dataset::{
-    acceleration::{Acceleration, RefreshMode},
-    TimeFormat,
-};
 use tokio::sync::RwLock;
 
 use crate::{
@@ -49,7 +47,7 @@ pub async fn instantiate_query_history_table(
 
     let retention = Retention::new(
         time_column.clone(),
-        time_format.clone(),
+        time_format,
         Some(Duration::from_secs(3 * 24 * 60 * 60)), // 3 days
         Some(Duration::from_secs(300)),
         true,
@@ -74,7 +72,7 @@ pub async fn instantiate_query_history_table(
             };
 
             create_synced_internal_accelerated_table(
-                DEFAULT_QUERY_HISTORY_TABLE,
+                DEFAULT_QUERY_HISTORY_TABLE.into(),
                 path.as_str(),
                 secret,
                 Acceleration::default(),
@@ -86,7 +84,7 @@ pub async fn instantiate_query_history_table(
             .context(UnableToRegisterTableSnafu)
         }
         None => create_internal_accelerated_table(
-            DEFAULT_QUERY_HISTORY_TABLE,
+            DEFAULT_QUERY_HISTORY_TABLE.into(),
             Arc::new(table_schema()),
             Acceleration::default(),
             Refresh::default(),
