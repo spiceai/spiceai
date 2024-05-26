@@ -772,7 +772,7 @@ impl Runtime {
                 Err(_) => None,
             };
 
-            let recorder = MetricsRecorder::new(metrics_socket, secret.clone(), cloud_dataset_path)
+            let recorder = MetricsRecorder::new(metrics_socket, secret, cloud_dataset_path)
                 .await
                 .context(UnableToStartLocalMetricsSnafu)?;
 

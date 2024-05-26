@@ -51,7 +51,7 @@ fn dataset_status(df: &DataFusion, ds: &Dataset) -> ComponentStatus {
     }
 }
 
-// Prepare a dataframe for Response (as JSON).
+// Prepare a dataframe for Response (as JSON). Also returns the number of rows in the dataframe.
 async fn dataframe_to_response(data_frame: DataFrame) -> (Response, u64) {
     let results = match data_frame.collect().await {
         Ok(results) => results,

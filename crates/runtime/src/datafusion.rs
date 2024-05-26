@@ -233,6 +233,7 @@ impl DataFusion {
         }
 
         ctx.register_catalog(SPICE_DEFAULT_CATALOG, Arc::new(catalog));
+
         DataFusion {
             ctx: Arc::new(ctx),
             data_writers: HashSet::new(),

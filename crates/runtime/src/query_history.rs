@@ -142,6 +142,10 @@ pub enum Error {
     },
 }
 
+/// Checks if a required field is missing in a [`QueryHistory`] struct. Returns a [`MissingColumnInRow`] if field is None.
+/// Example:
+///   - `check_required_field!(None, "sql")`
+///   - `check_required_field!(Some("SELECT * FROM table"), "sql")`
 macro_rules! check_required_field {
     ($field:expr, $field_name:expr) => {
         if $field.is_none() {
@@ -293,6 +297,9 @@ impl QueryHistory {
     }
 }
 
+/// When a [`QueryHistory`] instance is dropped, it writes the query history to the internal query
+/// history table (via [`Datafusion`]). On failure (either write, or if the [`QueryHistory`] is
+/// invalid, no error is returned, but it's logged)
 impl Drop for QueryHistory {
     fn drop(&mut self) {
         if let Err(err) = self.validate() {

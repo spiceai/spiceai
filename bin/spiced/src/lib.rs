@@ -135,7 +135,7 @@ pub async fn run(args: Args) -> Result<()> {
                 .context(UnableToCreateBackendSnafu)?;
         }
         Err(err) => {
-            tracing::warn!("{err}");
+            tracing::warn!("Creating internal query history table: {err}");
         }
     };
 
