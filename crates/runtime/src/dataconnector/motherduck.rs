@@ -22,11 +22,12 @@ use db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use duckdb::AccessMode;
 use secrets::{get_secret_or_param, Secret};
 use snafu::prelude::*;
-use spicepod::component::dataset::Dataset;
 use std::any::Any;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::{collections::HashMap, future::Future};
+
+use crate::component::dataset::Dataset;
 
 use super::{DataConnector, DataConnectorError, DataConnectorFactory};
 
@@ -42,7 +43,7 @@ pub struct MotherDuck {
 impl DataConnectorFactory for MotherDuck {
     fn create(
         secret: Option<Secret>,
-        params: Arc<Option<HashMap<String, String>>>,
+        params: Arc<HashMap<String, String>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let motherduck_token = get_param(&params, &secret, "motherduck_token").ok_or(
@@ -92,12 +93,12 @@ impl DataConnector for MotherDuck {
 }
 
 fn get_param(
-    params: &Arc<Option<HashMap<String, String>>>,
+    params: &Arc<HashMap<String, String>>,
     secret: &Option<Secret>,
     param_name: &str,
 ) -> Option<String> {
     return get_secret_or_param(
-        params.as_ref().as_ref(),
+        params.as_ref(),
         secret,
         &format!("{param_name}_key"),
         param_name,
