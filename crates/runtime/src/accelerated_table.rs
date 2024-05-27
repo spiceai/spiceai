@@ -93,6 +93,7 @@ pub struct AcceleratedTable {
     handlers: Vec<JoinHandle<()>>,
     zero_results_action: ZeroResultsAction,
     refresh_params: Arc<RwLock<refresh::Refresh>>,
+    refresher: Arc<refresh::Refresher>,
 }
 
 fn validate_refresh_data_window(
@@ -201,9 +202,11 @@ impl Builder {
             Arc::clone(&self.accelerator),
         );
         refresher.cache_provider(self.cache_provider.clone());
+        let refresher = Arc::new(refresher);
 
+        let refresher_tokio = Arc::clone(&refresher);
         let refresh_handle = tokio::spawn(async move {
-            refresher
+            refresher_tokio
                 .start(acceleration_refresh_mode, ready_sender)
                 .await;
         });
@@ -233,6 +236,7 @@ impl Builder {
                 handlers,
                 zero_results_action: self.zero_results_action,
                 refresh_params,
+                refresher,
             },
             is_ready,
         )
@@ -247,6 +251,11 @@ impl AcceleratedTable {
         refresh: refresh::Refresh,
     ) -> Builder {
         Builder::new(dataset_name, federated, accelerator, refresh)
+    }
+
+    #[must_use]
+    pub fn refresher(&self) -> Arc<refresh::Refresher> {
+        Arc::clone(&self.refresher)
     }
 
     pub async fn trigger_refresh(&self) -> Result<()> {
