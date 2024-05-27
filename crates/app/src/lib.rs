@@ -16,12 +16,13 @@ limitations under the License.
 
 #![allow(clippy::missing_errors_doc)]
 
-use std::path::PathBuf;
+use std::{collections::HashMap, path::PathBuf};
 
 use snafu::prelude::*;
 use spicepod::{
     component::{
         dataset::Dataset,
+        extension::Extension,
         llms::Llm,
         model::Model,
         runtime::Runtime,
@@ -35,6 +36,8 @@ pub struct App {
     pub name: String,
 
     pub secrets: Secrets,
+
+    pub extensions: HashMap<String, Extension>,
 
     pub datasets: Vec<Dataset>,
 
@@ -61,6 +64,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub struct AppBuilder {
     name: String,
     secrets: Secrets,
+    extensions: HashMap<String, Extension>,
     datasets: Vec<Dataset>,
     models: Vec<Model>,
     llms: Vec<Llm>,
@@ -73,6 +77,7 @@ impl AppBuilder {
         AppBuilder {
             name: name.into(),
             secrets: Secrets::default(),
+            extensions: HashMap::new(),
             datasets: vec![],
             models: vec![],
             llms: vec![],
@@ -84,10 +89,17 @@ impl AppBuilder {
     #[must_use]
     pub fn with_spicepod(mut self, spicepod: Spicepod) -> AppBuilder {
         self.secrets = spicepod.secrets.clone();
+        self.extensions.extend(spicepod.extensions.clone());
         self.datasets.extend(spicepod.datasets.clone());
         self.models.extend(spicepod.models.clone());
         self.llms.extend(spicepod.llms.clone());
         self.spicepods.push(spicepod);
+        self
+    }
+
+    #[must_use]
+    pub fn with_extension(mut self, name: String, extension: Extension) -> AppBuilder {
+        self.extensions.insert(name, extension);
         self
     }
 
@@ -120,6 +132,7 @@ impl AppBuilder {
         App {
             name: self.name,
             secrets: self.secrets,
+            extensions: self.extensions,
             datasets: self.datasets,
             models: self.models,
             llms: self.llms,
@@ -134,9 +147,11 @@ impl AppBuilder {
             Spicepod::load(&path).context(UnableToLoadSpicepodSnafu { path: path.clone() })?;
         let secrets = spicepod_root.secrets.clone();
         let runtime = spicepod_root.runtime.clone();
+        let extensions = spicepod_root.extensions.clone();
         let mut datasets: Vec<Dataset> = vec![];
         let mut models: Vec<Model> = vec![];
         let mut llms: Vec<Llm> = vec![];
+
         for dataset in &spicepod_root.datasets {
             datasets.push(dataset.clone());
         }
@@ -175,6 +190,7 @@ impl AppBuilder {
         Ok(App {
             name: root_spicepod_name,
             secrets,
+            extensions,
             datasets,
             models,
             llms,

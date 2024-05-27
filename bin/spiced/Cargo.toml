@@ -14,6 +14,7 @@ clap = { workspace = true, features = ["derive"] }
 spicepod = { path = "../../crates/spicepod" }
 app = { path = "../../crates/app" }
 runtime = { path = "../../crates/runtime" }
+spice-cloud = { path = "../../crates/spice_cloud" }
 flightrepl = { path = "../../crates/flightrepl" }
 tokio.workspace = true
 tracing.workspace = true
@@ -51,3 +52,4 @@ odbc = ["runtime/odbc"]
 spark = ["runtime/spark"]
 snowflake = ["runtime/snowflake"]
 models = ["runtime/models"]
+spice-cloud = []
