@@ -70,12 +70,12 @@ impl SpiceExtension {
             == "true"
     }
 
-    fn spice_http_url() -> String {
-        // if cfg!(feature = "dev") {
-        "https://dev-data.spiceai.io".to_string()
-        // } else {
-        // "https://data.spiceai.io".to_string()
-        // }
+    fn spice_http_url(&self) -> String {
+        self.manifest
+            .params
+            .get("api_url")
+            .unwrap_or(&"https://data.spiceai.io".to_string())
+            .to_string()
     }
 
     async fn get_spice_secret(&self, runtime: &Runtime) -> Result<Secret, Error> {
@@ -101,7 +101,7 @@ impl SpiceExtension {
         let response = client
             .post(format!(
                 "{}/v1/control_plane/connect",
-                SpiceExtension::spice_http_url()
+                self.spice_http_url()
             ))
             .json(&json!({}))
             .header("Content-Type", "application/json")
