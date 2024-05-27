@@ -119,7 +119,7 @@ impl Extension for SpiceExtension {
                 .datafusion()
                 .write()
                 .await
-                .register_runtime_table(metrics_table_reference.table(), table)
+                .register_runtime_table(metrics_table_reference, table)
                 .boxed()
                 .map_err(|e| runtime::extension::Error::UnableToStartExtension { source: e })?;
 
