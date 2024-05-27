@@ -123,6 +123,10 @@ pub async fn run(args: Args) -> Result<()> {
         rt.load_llms().await;
     }
 
+    if let Err(err) = rt.init_query_history().await {
+        tracing::warn!("Creating internal query history table: {err}");
+    };
+
     rt.start_extensions().await;
 
     if let Err(err) = rt

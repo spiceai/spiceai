@@ -2671,7 +2671,7 @@ dependencies = [
 [[package]]
 name = "datafusion-federation"
 version = "0.1.3"
-source = "git+https://github.com/spiceai/datafusion-federation.git?rev=b221f4ec87ad57dc7e026fa9e5f5935bfe6b3961#b221f4ec87ad57dc7e026fa9e5f5935bfe6b3961"
+source = "git+https://github.com/spiceai/datafusion-federation.git?rev=532ecd01bdf4ce77787a56c5b354bb6332eae8c4#532ecd01bdf4ce77787a56c5b354bb6332eae8c4"
 dependencies = [
  "async-trait",
  "datafusion",
@@ -2680,7 +2680,7 @@ dependencies = [
 [[package]]
 name = "datafusion-federation-sql"
 version = "0.1.3"
-source = "git+https://github.com/spiceai/datafusion-federation.git?rev=b221f4ec87ad57dc7e026fa9e5f5935bfe6b3961#b221f4ec87ad57dc7e026fa9e5f5935bfe6b3961"
+source = "git+https://github.com/spiceai/datafusion-federation.git?rev=532ecd01bdf4ce77787a56c5b354bb6332eae8c4#532ecd01bdf4ce77787a56c5b354bb6332eae8c4"
 dependencies = [
  "async-trait",
  "datafusion",
@@ -8188,7 +8188,7 @@ dependencies = [
 [[package]]
 name = "spark-connect-core"
 version = "0.0.1-beta.4"
-source = "git+https://github.com/spiceai/spark-connect-rs.git?rev=29b0634cdcb336fdceaf289aacf35927fb4a8877#29b0634cdcb336fdceaf289aacf35927fb4a8877"
+source = "git+https://github.com/spiceai/spark-connect-rs.git?rev=b594f2e626c2a9356a087aa5b28cd861d9ac377f#b594f2e626c2a9356a087aa5b28cd861d9ac377f"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -8208,7 +8208,7 @@ dependencies = [
 [[package]]
 name = "spark-connect-rs"
 version = "0.0.1-beta.4"
-source = "git+https://github.com/spiceai/spark-connect-rs.git?rev=29b0634cdcb336fdceaf289aacf35927fb4a8877#29b0634cdcb336fdceaf289aacf35927fb4a8877"
+source = "git+https://github.com/spiceai/spark-connect-rs.git?rev=b594f2e626c2a9356a087aa5b28cd861d9ac377f#b594f2e626c2a9356a087aa5b28cd861d9ac377f"
 dependencies = [
  "spark-connect-core",
 ]
