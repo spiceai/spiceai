@@ -28,7 +28,10 @@ use crate::get_dependent_table_names;
 use crate::object_store_registry::default_runtime_env;
 use arrow::datatypes::Schema;
 use arrow_tools::schema::verify_schema;
-use cache::{to_cached_record_batch_stream, QueryResult, QueryResultsCacheProvider};
+use cache::{
+    get_logical_plan_input_tables, to_cached_record_batch_stream, QueryResult,
+    QueryResultsCacheProvider,
+};
 use datafusion::catalog::schema::SchemaProvider;
 use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider};
 use datafusion::datasource::{TableProvider, ViewTable};
@@ -274,22 +277,28 @@ impl DataFusion {
             .await
             .context(UnableToExecuteQuerySnafu)?;
 
-        if let Some(cache_provider) = &self.cache_provider {
-            if let Some(cached_result) = cache_provider
-                .get(&plan)
-                .await
-                .context(FailedToAccessCacheSnafu)?
-            {
-                let record_batch_stream = Box::pin(
-                    MemoryStream::try_new(
-                        cached_result.records.to_vec(),
-                        cached_result.schema,
-                        None,
-                    )
-                    .context(UnableToCreateMemoryStreamSnafu)?,
-                );
+        let query_input_tables = get_logical_plan_input_tables(&plan);
+        let cache_enabled_for_query = !(query_input_tables.is_empty()
+            || query_input_tables.contains("information_schema.tables"));
 
-                return Ok(QueryResult::new(record_batch_stream, Some(true)));
+        if cache_enabled_for_query {
+            if let Some(cache_provider) = &self.cache_provider {
+                if let Some(cached_result) = cache_provider
+                    .get(&plan)
+                    .await
+                    .context(FailedToAccessCacheSnafu)?
+                {
+                    let record_batch_stream = Box::pin(
+                        MemoryStream::try_new(
+                            cached_result.records.to_vec(),
+                            cached_result.schema,
+                            None,
+                        )
+                        .context(UnableToCreateMemoryStreamSnafu)?,
+                    );
+
+                    return Ok(QueryResult::new(record_batch_stream, Some(true)));
+                }
             }
         }
 
@@ -318,11 +327,17 @@ impl DataFusion {
 
         verify_schema(df_schema.fields(), res_schema.fields()).context(SchemaMismatchSnafu)?;
 
-        if let Some(cache_provider) = &self.cache_provider {
-            let record_batch_stream =
-                to_cached_record_batch_stream(Arc::clone(cache_provider), res_stream, plan_copy);
+        if cache_enabled_for_query {
+            if let Some(cache_provider) = &self.cache_provider {
+                let record_batch_stream = to_cached_record_batch_stream(
+                    Arc::clone(cache_provider),
+                    res_stream,
+                    plan_copy,
+                    query_input_tables,
+                );
 
-            return Ok(QueryResult::new(record_batch_stream, Some(false)));
+                return Ok(QueryResult::new(record_batch_stream, Some(false)));
+            }
         }
 
         Ok(QueryResult::new(res_stream, None))
