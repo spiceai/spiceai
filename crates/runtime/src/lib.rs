@@ -42,12 +42,14 @@ use model_components::{model::Model, modelsource::source as model_source};
 pub use notify::Error as NotifyError;
 use secrets::{spicepod_secret_store_type, Secret};
 use snafu::prelude::*;
+use spice_metrics::get_metrics_table_reference;
 use spicepod::component::model::Model as SpicepodModel;
 use tokio::sync::oneshot::error::RecvError;
 use tokio::time::sleep;
 use tokio::{signal, sync::RwLock};
 
-mod accelerated_table;
+use crate::extension::{Extension, ExtensionFactory};
+pub mod accelerated_table;
 pub mod component;
 pub mod config;
 pub mod dataaccelerator;
@@ -55,6 +57,7 @@ pub mod dataconnector;
 pub mod datafusion;
 pub mod dataupdate;
 pub mod execution_plan;
+pub mod extension;
 mod flight;
 mod http;
 pub mod internal_table;
@@ -195,16 +198,21 @@ pub struct Runtime {
     pub pods_watcher: Option<podswatcher::PodsWatcher>,
     pub secrets_provider: Arc<RwLock<secrets::SecretsProvider>>,
 
+    extensions: Vec<Box<dyn Extension>>,
     spaced_tracer: Arc<tracers::SpacedTracer>,
 }
 
 impl Runtime {
     #[must_use]
-    pub async fn new(app: Option<app::App>, df: Arc<RwLock<DataFusion>>) -> Self {
+    pub async fn new(
+        app: Option<app::App>,
+        df: Arc<RwLock<DataFusion>>,
+        extension_factories: Arc<Vec<Box<dyn ExtensionFactory>>>,
+    ) -> Self {
         dataconnector::register_all().await;
         dataaccelerator::register_all().await;
 
-        Runtime {
+        let mut rt = Runtime {
             app: Arc::new(RwLock::new(app)),
             df,
             models: Arc::new(RwLock::new(HashMap::new())),
@@ -212,7 +220,39 @@ impl Runtime {
             pods_watcher: None,
             secrets_provider: Arc::new(RwLock::new(secrets::SecretsProvider::new())),
             spaced_tracer: Arc::new(tracers::SpacedTracer::new(Duration::from_secs(15))),
+            extensions: vec![],
+        };
+
+        let mut extensions: Vec<Box<dyn Extension>> = vec![];
+        for factory in extension_factories.iter() {
+            let mut extension = factory.create();
+            let extension_name = extension.name();
+            if let Err(err) = extension.initialize(&mut rt).await {
+                tracing::warn!("Failed to initialize extension {extension_name}: {err}");
+            } else {
+                extensions.push(extension);
+            };
         }
+
+        rt.extensions = extensions;
+
+        rt
+    }
+
+    #[must_use]
+    pub fn datafusion(&self) -> Arc<RwLock<DataFusion>> {
+        Arc::clone(&self.df)
+    }
+
+    pub async fn start_extensions(&mut self) {
+        let mut extensions: Vec<Box<dyn Extension>> = std::mem::take(&mut self.extensions);
+        for extension in &mut extensions {
+            if let Err(err) = extension.on_start(self).await {
+                tracing::warn!("Failed to start extension: {err}");
+            }
+        }
+
+        self.extensions = extensions;
     }
 
     pub fn with_pods_watcher(&mut self, pods_watcher: podswatcher::PodsWatcher) {
@@ -755,32 +795,24 @@ impl Runtime {
         self.load_model(m).await;
     }
 
-    pub async fn start_metrics(
-        &mut self,
-        with_metrics: Option<SocketAddr>,
-        cloud_dataset_path: Option<String>,
-    ) -> Result<()> {
+    pub async fn start_metrics(&mut self, with_metrics: Option<SocketAddr>) -> Result<()> {
         if let Some(metrics_socket) = with_metrics {
-            let secret = match self
-                .secrets_provider
+            let recorder = MetricsRecorder::new(metrics_socket);
+
+            // check if runtime.metrics already registered, otherwise create local table
+            let has_metrics_table = self
+                .df
                 .read()
                 .await
-                .get_secret("spiceai")
-                .await
-            {
-                Ok(s) => s,
-                Err(_) => None,
-            };
+                .has_table(&get_metrics_table_reference())
+                .await;
 
-            let recorder = MetricsRecorder::new(metrics_socket, secret, cloud_dataset_path)
-                .await
-                .context(UnableToStartLocalMetricsSnafu)?;
-
-            self.df
-                .write()
-                .await
-                .register_runtime_table("metrics", recorder.metrics_table())
-                .context(UnableToRegisterMetricsTableSnafu)?;
+            if !has_metrics_table {
+                tracing::info!("Registering local metrics table");
+                MetricsRecorder::register_metrics_table(&self.df)
+                    .await
+                    .context(UnableToStartLocalMetricsSnafu)?;
+            }
 
             recorder.start(&Arc::clone(&self.df));
         }
