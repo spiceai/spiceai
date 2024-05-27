@@ -174,7 +174,7 @@ pub enum Error {
     UnableToStartLocalMetrics { source: spice_metrics::Error },
 
     #[snafu(display("Unable to track query history: {source}"))]
-    UnableToStartQueryHistory { source: query_history::Error },
+    UnableToTrackQueryHistory { source: query_history::Error },
 
     #[snafu(display("Unable to create metrics table: {source}"))]
     UnableToCreateMetricsTable { source: DataFusionError },
@@ -926,6 +926,29 @@ impl Runtime {
             .write()
             .await
             .set_cache_provider(Some(Arc::new(cache_provider)));
+    }
+
+    pub async fn init_query_history(&self) -> Result<()> {
+        let spiceai_secret = match self
+            .secrets_provider
+            .read()
+            .await
+            .get_secret("spiceai")
+            .await
+        {
+            Ok(s) => s,
+            Err(_) => None,
+        };
+
+        match query_history::instantiate_query_history_table(spiceai_secret, None).await {
+            Ok(table) => self
+                .df
+                .write()
+                .await
+                .register_runtime_table(query_history::DEFAULT_QUERY_HISTORY_TABLE, table)
+                .context(UnableToCreateBackendSnafu),
+            Err(err) => Err(Error::UnableToTrackQueryHistory { source: err }),
+        }
     }
 }
 

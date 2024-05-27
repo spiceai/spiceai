@@ -26,6 +26,7 @@ use arrow::{
     datatypes::{DataType, Field, Schema, TimeUnit},
 };
 use datafusion::sql::TableReference;
+use secrets::Secret;
 use snafu::{ResultExt, Snafu};
 use tokio::sync::RwLock;
 
@@ -39,7 +40,7 @@ use crate::{
 pub const DEFAULT_QUERY_HISTORY_TABLE: &str = "query_history";
 
 pub async fn instantiate_query_history_table(
-    secrets_provider: &Arc<RwLock<secrets::SecretsProvider>>,
+    spiceai_secret: Option<Secret>,
     cloud_dataset_path: Option<String>,
 ) -> Result<Arc<AcceleratedTable>, Error> {
     let time_column = Some("start_time".to_string());
@@ -55,13 +56,6 @@ pub async fn instantiate_query_history_table(
 
     match cloud_dataset_path {
         Some(path) => {
-            let secret = secrets_provider
-                .read()
-                .await
-                .get_secret("spiceai")
-                .await
-                .context(UnableToRegisterTableSnafu)?;
-
             let refresh = Refresh {
                 mode: RefreshMode::Append,
                 time_column,
@@ -74,7 +68,7 @@ pub async fn instantiate_query_history_table(
             create_synced_internal_accelerated_table(
                 DEFAULT_QUERY_HISTORY_TABLE.into(),
                 path.as_str(),
-                secret,
+                spiceai_secret,
                 Acceleration::default(),
                 refresh,
                 retention,
@@ -97,7 +91,7 @@ pub async fn instantiate_query_history_table(
 }
 
 #[must_use]
-pub fn table_schema() -> Schema {
+fn table_schema() -> Schema {
     Schema::new(vec![
         Field::new("query_id", DataType::Utf8, false),
         Field::new("schema", DataType::Utf8, false),
@@ -136,22 +130,17 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Error validating query_history row. {source} is required"))]
-    MissingColumnInRow {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
+    #[snafu(display(
+        "Error validating query_history row. Columns {columns} are required but missing"
+    ))]
+    MissingColumnsInRow { columns: String },
 }
 
-/// Checks if a required field is missing in a [`QueryHistory`] struct. Returns a [`MissingColumnInRow`] if field is None.
-/// Example:
-///   - `check_required_field!(None, "sql")`
-///   - `check_required_field!(Some("SELECT * FROM table"), "sql")`
+/// Checks if a required field is missing in a [`QueryHistory`] struct. Adds field name to missing fields vector if field is None.
 macro_rules! check_required_field {
-    ($field:expr, $field_name:expr) => {
+    ($field:expr, $field_name:expr, $missing_fields:expr) => {
         if $field.is_none() {
-            return Err(Error::MissingColumnInRow {
-                source: $field_name.into(),
-            });
+            $missing_fields.push($field_name.into());
         }
     };
 }
@@ -285,15 +274,23 @@ impl QueryHistory {
     }
 
     pub fn validate(&self) -> Result<(), Error> {
-        check_required_field!(self.schema, "schema");
-        check_required_field!(self.sql, "sql");
-        check_required_field!(self.start_time, "start_time");
-        // check_required_field!(self.execution_time, "execution_time");
-        check_required_field!(self.rows_produced, "rows_produced");
-        check_required_field!(self.results_cache_hit, "results_cache_hit");
-        check_required_field!(self.df, "df");
+        let mut missing_fields: Vec<&str> = Vec::new();
 
-        Ok(())
+        check_required_field!(self.schema, "schema", missing_fields);
+        check_required_field!(self.sql, "sql", missing_fields);
+        check_required_field!(self.start_time, "start_time", missing_fields);
+        // check_required_field!(self.execution_time, "execution_time", missing_fields);
+        check_required_field!(self.rows_produced, "rows_produced", missing_fields);
+        check_required_field!(self.results_cache_hit, "results_cache_hit", missing_fields);
+        check_required_field!(self.df, "df", missing_fields);
+
+        if missing_fields.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::MissingColumnsInRow {
+                columns: missing_fields.join(", "),
+            })
+        }
     }
 }
 

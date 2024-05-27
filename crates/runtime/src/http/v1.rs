@@ -1025,7 +1025,7 @@ pub(crate) mod nsql {
         Extension(nsql_models): Extension<Arc<RwLock<LLMModelStore>>>,
         Json(payload): Json<Request>,
     ) -> Response {
-        let mut q_trace = QueryHistory::default().results_cache_hit(false); // TODO use query cache
+        let mut q_trace = QueryHistory::default().results_cache_hit(false);
         q_trace = q_trace.df(Arc::<tokio::sync::RwLock<DataFusion>>::clone(&df));
         let readable_df = df.read().await;
 
@@ -1082,13 +1082,12 @@ pub(crate) mod nsql {
 
                 q_trace = q_trace.start_time(SystemTime::now());
                 let result = readable_df.ctx.sql(&cleaned_query).await;
-                q_trace = q_trace.end_time(SystemTime::now());
 
                 match result {
                     Ok(result) => {
                         q_trace = q_trace.schema(Arc::new(result.schema().clone().into()));
                         let (resp, num_rows) = dataframe_to_response(result).await;
-                        let _ = q_trace.rows_produced(num_rows);
+                        let _ = q_trace.rows_produced(num_rows).end_time(SystemTime::now());
                         resp
                     }
                     Err(e) => {
