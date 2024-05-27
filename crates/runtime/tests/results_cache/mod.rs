@@ -27,9 +27,9 @@ use tokio::sync::RwLock;
 
 use crate::init_tracing;
 
-fn create_test_dataset(name: &str) -> Dataset {
+fn make_s3_tpch_dataset(name: &str) -> Dataset {
     let mut test_dataset = Dataset::new(
-        "s3://spiceai-demo-datasets/tpch/customer/".to_string(),
+        format!("s3://spiceai-demo-datasets/tpch/{name}/").to_string(),
         name.to_string(),
     );
     test_dataset.params = Some(Params::from_string_map(
@@ -43,7 +43,7 @@ fn create_test_dataset(name: &str) -> Dataset {
 
 #[tokio::test]
 async fn results_cache_system_queries() -> Result<(), String> {
-    init_tracing(None);
+    let _tracing = init_tracing(None);
 
     let results_cache = ResultsCache {
         item_ttl: Some("60s".to_string()),
@@ -53,7 +53,7 @@ async fn results_cache_system_queries() -> Result<(), String> {
     let app = AppBuilder::new("cache_test")
         .with_results_cache(results_cache)
         .with_secret_store(SpiceSecretStore::File)
-        .with_dataset(create_test_dataset("customer"))
+        .with_dataset(make_s3_tpch_dataset("customer"))
         .build();
 
     let df = Arc::new(RwLock::new(DataFusion::new()));

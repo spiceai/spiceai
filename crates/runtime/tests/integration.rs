@@ -15,16 +15,20 @@ limitations under the License.
 */
 
 use arrow::array::RecordBatch;
-use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use datafusion::{
+    assert_batches_eq, parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder,
+};
+use runtime::Runtime;
+use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::EnvFilter;
 
 mod docker;
 // Run all tests in the `federation` module
 mod federation;
-
+mod refresh_sql;
 mod results_cache;
 
-fn init_tracing(default_level: Option<&str>) {
+fn init_tracing(default_level: Option<&str>) -> DefaultGuard {
     let filter = match (default_level, std::env::var("SPICED_LOG").ok()) {
         (_, Some(log)) => EnvFilter::new(log),
         (Some(level), None) => EnvFilter::new(level),
@@ -37,7 +41,7 @@ fn init_tracing(default_level: Option<&str>) {
         .with_env_filter(filter)
         .with_ansi(true)
         .finish();
-    let _ = tracing::subscriber::set_global_default(subscriber);
+    tracing::subscriber::set_default(subscriber)
 }
 
 async fn get_tpch_lineitem() -> Result<Vec<RecordBatch>, anyhow::Error> {
@@ -51,4 +55,46 @@ async fn get_tpch_lineitem() -> Result<Vec<RecordBatch>, anyhow::Error> {
         ParquetRecordBatchReaderBuilder::try_new(lineitem_parquet_bytes)?.build()?;
 
     Ok(parquet_reader.collect::<Result<Vec<_>, arrow::error::ArrowError>>()?)
+}
+
+type ValidateFn = dyn FnOnce(Vec<RecordBatch>);
+
+async fn run_query_and_check_results<F>(
+    rt: &mut Runtime,
+    query: &str,
+    expected_plan: &[&str],
+    validate_result: Option<F>,
+) -> Result<(), String>
+where
+    F: FnOnce(Vec<RecordBatch>),
+{
+    let df = &mut *rt.df.write().await;
+
+    // Check the plan
+    let plan_results = df
+        .ctx
+        .sql(&format!("EXPLAIN {query}"))
+        .await
+        .map_err(|e| format!("query `{query}` to plan: {e}"))?
+        .collect()
+        .await
+        .map_err(|e| format!("query `{query}` to results: {e}"))?;
+
+    assert_batches_eq!(expected_plan, &plan_results);
+
+    // Check the result
+    if let Some(validate_result) = validate_result {
+        let result_batches = df
+            .ctx
+            .sql(query)
+            .await
+            .map_err(|e| format!("query `{query}` to plan: {e}"))?
+            .collect()
+            .await
+            .map_err(|e| format!("query `{query}` to results: {e}"))?;
+
+        validate_result(result_batches);
+    }
+
+    Ok(())
 }
