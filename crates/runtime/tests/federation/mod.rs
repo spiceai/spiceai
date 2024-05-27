@@ -88,7 +88,7 @@ async fn single_source_federation_push_down() -> Result<(), String> {
 
     let df = Arc::new(RwLock::new(DataFusion::new()));
 
-    let mut rt = Runtime::new(Some(app), df).await;
+    let mut rt = Runtime::new(Some(app), df, Arc::new(vec![])).await;
 
     rt.load_secrets().await;
     rt.load_datasets().await;

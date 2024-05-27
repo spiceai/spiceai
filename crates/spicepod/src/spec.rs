@@ -21,7 +21,9 @@ use std::{collections::HashMap, fmt::Debug};
 
 use crate::component::runtime::Runtime;
 use crate::component::secrets::Secrets;
-use crate::component::{dataset::Dataset, llms::Llm, model::Model, ComponentOrReference};
+use crate::component::{
+    dataset::Dataset, extension::Extension, llms::Llm, model::Model, ComponentOrReference,
+};
 
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -46,6 +48,11 @@ pub struct SpicepodDefinition {
     /// Optional runtime configuration
     #[serde(default)]
     pub runtime: Runtime,
+
+    /// Optional extensions configuration
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    #[serde(default)]
+    pub extensions: HashMap<String, Extension>,
 
     /// Optional spicepod secrets configuration
     /// Default value is `store: file`
