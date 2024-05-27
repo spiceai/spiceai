@@ -360,17 +360,15 @@ impl DataFusion {
 
     pub fn register_runtime_table(
         &mut self,
-        table_name: &str,
+        table_name: TableReference,
         table: Arc<dyn datafusion::datasource::TableProvider>,
     ) -> Result<()> {
         if let Some(runtime_schema) = self.runtime_schema() {
             runtime_schema
-                .register_table(table_name.to_string(), table)
+                .register_table(table_name.table().to_string(), table)
                 .context(UnableToRegisterTableToDataFusionSchemaSnafu { schema: "runtime" })?;
 
-            let table_reference = TableReference::partial(SPICE_RUNTIME_SCHEMA, table_name);
-
-            self.data_writers.insert(table_reference);
+            self.data_writers.insert(table_name);
         }
 
         Ok(())
