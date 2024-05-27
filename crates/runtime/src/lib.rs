@@ -961,18 +961,7 @@ impl Runtime {
     }
 
     pub async fn init_query_history(&self) -> Result<()> {
-        let spiceai_secret = match self
-            .secrets_provider
-            .read()
-            .await
-            .get_secret("spiceai")
-            .await
-        {
-            Ok(s) => s,
-            Err(_) => None,
-        };
-
-        match query_history::instantiate_query_history_table(spiceai_secret, None).await {
+        match query_history::instantiate_query_history_table().await {
             Ok(table) => self
                 .df
                 .write()

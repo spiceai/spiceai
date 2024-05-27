@@ -126,9 +126,8 @@ pub(crate) mod query {
             }
         };
 
-        let mut q_trace = QueryHistory::default()
+        let mut q_trace = QueryHistory::new(Arc::<tokio::sync::RwLock<DataFusion>>::clone(&df))
             .sql(query.clone())
-            .df(Arc::<tokio::sync::RwLock<DataFusion>>::clone(&df))
             .start_time(SystemTime::now());
 
         let restricted_sql_options = SQLOptions::new()
@@ -156,6 +155,7 @@ pub(crate) mod query {
                 }
                 Err(e) => {
                     tracing::debug!("Error executing query: {e}");
+                    let _ = q_trace.write().await;
                     return (
                         StatusCode::BAD_REQUEST,
                         format!("Error processing batch: {e}"),
@@ -165,10 +165,11 @@ pub(crate) mod query {
             },
             Err(e) => {
                 tracing::debug!("Error executing query: {e}");
+                let _ = q_trace.write().await;
                 return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
             }
         };
-        let _ = q_trace.results_cache_hit(is_data_from_cache.unwrap_or(false));
+        q_trace = q_trace.results_cache_hit(is_data_from_cache.unwrap_or(false));
 
         let buf = Vec::new();
         let mut writer = arrow_json::ArrayWriter::new(buf);
@@ -176,10 +177,12 @@ pub(crate) mod query {
         if let Err(e) = writer.write_batches(data.iter().collect::<Vec<&RecordBatch>>().as_slice())
         {
             tracing::debug!("Error converting results to JSON: {e}");
+            let _ = q_trace.write().await;
             return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
         }
         if let Err(e) = writer.finish() {
             tracing::debug!("Error finishing JSON conversion: {e}");
+            let _ = q_trace.write().await;
             return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
         }
 
@@ -188,6 +191,7 @@ pub(crate) mod query {
             Ok(res) => res,
             Err(e) => {
                 tracing::debug!("Error converting JSON buffer to string: {e}");
+                let _ = q_trace.write().await;
                 return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
             }
         };
@@ -207,7 +211,7 @@ pub(crate) mod query {
             }
             None => {}
         };
-
+        let _ = q_trace.write().await;
         (StatusCode::OK, headers, res).into_response()
     }
 }
@@ -1025,8 +1029,8 @@ pub(crate) mod nsql {
         Extension(nsql_models): Extension<Arc<RwLock<LLMModelStore>>>,
         Json(payload): Json<Request>,
     ) -> Response {
-        let mut q_trace = QueryHistory::default().results_cache_hit(false);
-        q_trace = q_trace.df(Arc::<tokio::sync::RwLock<DataFusion>>::clone(&df));
+        let mut q_trace = QueryHistory::new(Arc::<tokio::sync::RwLock<DataFusion>>::clone(&df))
+            .results_cache_hit(false);
         let readable_df = df.read().await;
 
         // Get all public table CREATE TABLE statements to add to prompt.
@@ -1074,20 +1078,21 @@ pub(crate) mod nsql {
         };
 
         // Run the SQL from the NSQL model through datafusion.
-        match result {
+        let resp = match result {
             Ok(Some(model_sql_query)) => {
                 let cleaned_query = clean_model_based_sql(&model_sql_query);
-                q_trace = q_trace.sql(cleaned_query.clone());
                 tracing::trace!("Running query:\n{cleaned_query}");
 
-                q_trace = q_trace.start_time(SystemTime::now());
+                q_trace = q_trace
+                    .start_time(SystemTime::now())
+                    .sql(cleaned_query.clone());
                 let result = readable_df.ctx.sql(&cleaned_query).await;
 
                 match result {
                     Ok(result) => {
                         q_trace = q_trace.schema(Arc::new(result.schema().clone().into()));
                         let (resp, num_rows) = dataframe_to_response(result).await;
-                        let _ = q_trace.rows_produced(num_rows).end_time(SystemTime::now());
+                        q_trace = q_trace.rows_produced(num_rows).end_time(SystemTime::now());
                         resp
                     }
                     Err(e) => {
@@ -1108,6 +1113,8 @@ pub(crate) mod nsql {
                 tracing::trace!("Error running NSQL model: {e}");
                 (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
             }
-        }
+        };
+        let _ = q_trace.write().await;
+        resp
     }
 }

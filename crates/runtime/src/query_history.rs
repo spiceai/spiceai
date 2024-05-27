@@ -19,14 +19,13 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use crate::component::dataset::acceleration::{Acceleration, RefreshMode};
+use crate::component::dataset::acceleration::Acceleration;
 use crate::component::dataset::TimeFormat;
 use arrow::{
     array::{BooleanArray, RecordBatch, StringArray, TimestampNanosecondArray, UInt64Array},
     datatypes::{DataType, Field, Schema, TimeUnit},
 };
 use datafusion::sql::TableReference;
-use secrets::Secret;
 use snafu::{ResultExt, Snafu};
 use tokio::sync::RwLock;
 
@@ -34,15 +33,12 @@ use crate::{
     accelerated_table::{refresh::Refresh, AcceleratedTable, Retention},
     datafusion::DataFusion,
     dataupdate::DataUpdate,
-    internal_table::{create_internal_accelerated_table, create_synced_internal_accelerated_table},
+    internal_table::create_internal_accelerated_table,
 };
 
 pub const DEFAULT_QUERY_HISTORY_TABLE: &str = "query_history";
 
-pub async fn instantiate_query_history_table(
-    spiceai_secret: Option<Secret>,
-    cloud_dataset_path: Option<String>,
-) -> Result<Arc<AcceleratedTable>, Error> {
+pub async fn instantiate_query_history_table() -> Result<Arc<AcceleratedTable>, Error> {
     let time_column = Some("start_time".to_string());
     let time_format = Some(TimeFormat::UnixSeconds);
 
@@ -53,41 +49,16 @@ pub async fn instantiate_query_history_table(
         Some(Duration::from_secs(300)),
         true,
     );
-
-    match cloud_dataset_path {
-        Some(path) => {
-            let refresh = Refresh {
-                mode: RefreshMode::Append,
-                time_column,
-                time_format,
-                check_interval: Some(Duration::from_secs(10)),
-                period: Some(Duration::from_secs(1800)), // sync only last 30 minutes from cloud
-                ..Default::default()
-            };
-
-            create_synced_internal_accelerated_table(
-                DEFAULT_QUERY_HISTORY_TABLE.into(),
-                path.as_str(),
-                spiceai_secret,
-                Acceleration::default(),
-                refresh,
-                retention,
-            )
-            .await
-            .boxed()
-            .context(UnableToRegisterTableSnafu)
-        }
-        None => create_internal_accelerated_table(
-            DEFAULT_QUERY_HISTORY_TABLE.into(),
-            Arc::new(table_schema()),
-            Acceleration::default(),
-            Refresh::default(),
-            retention,
-        )
-        .await
-        .boxed()
-        .context(UnableToRegisterTableSnafu),
-    }
+    create_internal_accelerated_table(
+        DEFAULT_QUERY_HISTORY_TABLE.into(),
+        Arc::new(table_schema()),
+        Acceleration::default(),
+        Refresh::default(),
+        retention,
+    )
+    .await
+    .boxed()
+    .context(UnableToRegisterTableSnafu)
 }
 
 #[must_use]
@@ -145,7 +116,6 @@ macro_rules! check_required_field {
     };
 }
 
-#[derive(Default)]
 pub struct QueryHistory {
     query_id: Option<String>,
     schema: Option<Arc<Schema>>,
@@ -158,11 +128,27 @@ pub struct QueryHistory {
     results_cache_hit: Option<bool>,
 
     // The datafusion instance and the internal table to route data to.
-    df: Option<Arc<RwLock<DataFusion>>>,
+    df: Arc<RwLock<DataFusion>>,
     to_table: Option<String>,
 }
 
 impl QueryHistory {
+    pub fn new(df: Arc<RwLock<DataFusion>>) -> Self {
+        Self {
+            query_id: None,
+            schema: None,
+            sql: None,
+            nsql_query: None,
+            start_time: None,
+            end_time: None,
+            execution_time: None,
+            rows_produced: None,
+            results_cache_hit: None,
+            df,
+            to_table: None,
+        }
+    }
+
     #[must_use]
     pub fn query_id(mut self, query_id: String) -> Self {
         self.query_id = Some(query_id);
@@ -214,12 +200,6 @@ impl QueryHistory {
     #[must_use]
     pub fn results_cache_hit(mut self, results_cache_hit: bool) -> Self {
         self.results_cache_hit = Some(results_cache_hit);
-        self
-    }
-
-    #[must_use]
-    pub fn df(mut self, df: Arc<RwLock<DataFusion>>) -> Self {
-        self.df = Some(df);
         self
     }
 
@@ -282,7 +262,6 @@ impl QueryHistory {
         // check_required_field!(self.execution_time, "execution_time", missing_fields);
         check_required_field!(self.rows_produced, "rows_produced", missing_fields);
         check_required_field!(self.results_cache_hit, "results_cache_hit", missing_fields);
-        check_required_field!(self.df, "df", missing_fields);
 
         if missing_fields.is_empty() {
             Ok(())
@@ -292,17 +271,10 @@ impl QueryHistory {
             })
         }
     }
-}
 
-/// When a [`QueryHistory`] instance is dropped, it writes the query history to the internal query
-/// history table (via [`Datafusion`]). On failure (either write, or if the [`QueryHistory`] is
-/// invalid, no error is returned, but it's logged)
-impl Drop for QueryHistory {
-    fn drop(&mut self) {
-        if let Err(err) = self.validate() {
-            tracing::error!("Error validating QueryHistory: {err}");
-            return;
-        }
+    pub async fn write(&mut self) -> Result<(), Error> {
+        self.validate()?;
+
         if self.end_time.is_none() {
             self.end_time = Some(SystemTime::now());
         }
@@ -312,41 +284,30 @@ impl Drop for QueryHistory {
         if self.query_id.is_none() {
             self.query_id = Some(uuid::Uuid::new_v4().to_string());
         }
-        let data = match self.into_record_batch() {
-            Ok(data) => data,
-            Err(err) => {
-                tracing::error!("Cannot create record batch for query history: {err}");
-                return;
-            }
-        };
         let table = self
             .to_table
             .clone()
             .unwrap_or(DEFAULT_QUERY_HISTORY_TABLE.to_string());
 
-        match self.df.clone() {
-            Some(df) => {
-                tokio::spawn(async move {
-                    let data_update = DataUpdate {
-                        schema: Arc::new(table_schema()),
-                        data: vec![data],
-                        update_type: crate::dataupdate::UpdateType::Append,
-                    };
-                    if let Err(e) = df
-                        .write()
-                        .await
-                        .write_data(TableReference::partial("runtime", table), data_update)
-                        .await
-                        .boxed()
-                        .context(UnableToWriteToTableSnafu)
-                    {
-                        tracing::error!("Error writing to query_history table: {}", e);
-                    }
-                });
-            }
-            None => {
-                tracing::error!("DataFusion instance is missing");
-            }
-        }
+        let data = self
+            .into_record_batch()
+            .boxed()
+            .context(UnableToWriteToTableSnafu)?;
+
+        let data_update = DataUpdate {
+            schema: Arc::new(table_schema()),
+            data: vec![data],
+            update_type: crate::dataupdate::UpdateType::Append,
+        };
+
+        self.df
+            .write()
+            .await
+            .write_data(TableReference::partial("runtime", table), data_update)
+            .await
+            .boxed()
+            .context(UnableToWriteToTableSnafu)?;
+
+        Ok(())
     }
 }
