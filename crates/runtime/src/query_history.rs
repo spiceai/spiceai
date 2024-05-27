@@ -19,8 +19,8 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use crate::component::dataset::acceleration::Acceleration;
 use crate::component::dataset::TimeFormat;
+use crate::{component::dataset::acceleration::Acceleration, datafusion::SPICE_RUNTIME_SCHEMA};
 use arrow::{
     array::{BooleanArray, RecordBatch, StringArray, TimestampNanosecondArray, UInt64Array},
     datatypes::{DataType, Field, Schema, TimeUnit},
@@ -49,8 +49,10 @@ pub async fn instantiate_query_history_table() -> Result<Arc<AcceleratedTable>, 
         Some(Duration::from_secs(300)),
         true,
     );
+    let query_history_table_reference =
+        TableReference::partial(SPICE_RUNTIME_SCHEMA, DEFAULT_QUERY_HISTORY_TABLE);
     create_internal_accelerated_table(
-        DEFAULT_QUERY_HISTORY_TABLE.into(),
+        query_history_table_reference,
         Arc::new(table_schema()),
         Acceleration::default(),
         Refresh::default(),

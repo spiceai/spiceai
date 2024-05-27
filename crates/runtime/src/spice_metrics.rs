@@ -80,8 +80,7 @@ impl MetricsRecorder {
         );
 
         let table = create_internal_accelerated_table(
-            // we don't support register with custom schema yet
-            TableReference::bare(metrics_table_reference.table()),
+            metrics_table_reference.clone(),
             get_metrics_schema(),
             Acceleration::default(),
             Refresh::default(),
@@ -93,7 +92,7 @@ impl MetricsRecorder {
         datafusion
             .write()
             .await
-            .register_runtime_table(metrics_table_reference.table(), table)
+            .register_runtime_table(metrics_table_reference, table)
             .context(UnableToRegisterToMetricsTableSnafu)?;
 
         Ok(())
