@@ -8225,6 +8225,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "spice-cloud"
+version = "0.13.1-alpha"
+dependencies = [
+ "async-trait",
+ "datafusion",
+ "runtime",
+ "secrets",
+ "snafu 0.8.2",
+ "spicepod",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "spiced"
 version = "0.13.1-alpha"
 dependencies = [
@@ -8234,6 +8248,7 @@ dependencies = [
  "metrics-exporter-prometheus",
  "runtime",
  "snafu 0.8.2",
+ "spice-cloud",
  "spicepod",
  "tokio",
  "tracing",
