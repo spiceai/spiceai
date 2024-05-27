@@ -63,7 +63,14 @@ pub fn try_to_nql(component: &spicepod::component::llms::Llm) -> Result<Box<dyn 
     let model_id = component.get_model_id();
 
     match construct_llm_params(&prefix, &(component.params).clone().unwrap_or_default()) {
-        Ok(LlmParams::OpenAiParams {}) => Ok(llms::nql::create_openai(model_id)),
+        Ok(LlmParams::OpenAiParams {
+            api_base,
+            api_key,
+            org_id,
+            project_id,
+        }) => Ok(llms::nql::create_openai(
+            model_id, api_base, api_key, org_id, project_id,
+        )),
         Ok(LlmParams::LocalModelParams {
             weights,
             tokenizer,
@@ -123,28 +130,28 @@ fn construct_llm_params(
             };
             Ok(LlmParams::HuggingfaceParams {
                 model_type: arch,
-                weights: params.get("weights").cloned(),
-                tokenizer: params.get("tokenizer").cloned(),
-                chat_template: params.get("chat_template").cloned(),
+                weights: params.get("weights_path").cloned(),
+                tokenizer: params.get("tokenizer_path").cloned(),
+                chat_template: params.get("system_prompt").cloned(),
             })
         }
         LlmPrefix::File => {
             let weights = params
-                .get("weights")
+                .get("weights_path")
                 .ok_or(LlmError::FailedToLoadModel {
-                    source: "No 'weights' parameter provided".into(),
+                    source: "No 'weights_path' parameter provided".into(),
                 })?
                 .clone();
             let tokenizer = params
-                .get("tokenizer")
+                .get("tokenizer_path")
                 .ok_or(LlmError::FailedToLoadTokenizer {
-                    source: "No 'tokenizer' parameter provided".into(),
+                    source: "No 'tokenizer_path' parameter provided".into(),
                 })?
                 .clone();
             let chat_template = params
-                .get("chat_template")
+                .get("system_prompt")
                 .ok_or(LlmError::FailedToLoadTokenizer {
-                    source: "No 'chat_template' parameter provided".into(),
+                    source: "No 'system_prompt' parameter provided".into(),
                 })?
                 .clone();
             Ok(LlmParams::LocalModelParams {
@@ -154,10 +161,14 @@ fn construct_llm_params(
             })
         }
         LlmPrefix::SpiceAi => Ok(LlmParams::SpiceAiParams {
-            chat_template: params.get("chat_template").cloned(),
+            chat_template: params.get("system_prompt").cloned(),
         }),
+
         LlmPrefix::OpenAi => Ok(LlmParams::OpenAiParams {
-            // model: params.get("model").cloned(),
+            api_base: params.get("endpoint").cloned(),
+            api_key: params.get("openai_api_key").cloned(),
+            org_id: params.get("openai_org_id").cloned(),
+            project_id: params.get("openai_project_id").cloned(),
         }),
     }
 }

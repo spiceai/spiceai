@@ -120,7 +120,10 @@ pub enum LlmParams {
         chat_template: String,
     },
     OpenAiParams {
-        // model: Option<String>,
+        api_base: Option<String>,
+        api_key: Option<String>,
+        org_id: Option<String>,
+        project_id: Option<String>,
     },
     None,
 }

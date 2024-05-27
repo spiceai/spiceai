@@ -13,9 +13,12 @@ limitations under the License.
 #![allow(clippy::missing_errors_doc)]
 use std::path::Path;
 
+use async_openai::config::OpenAIConfig;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use snafu::Snafu;
+
+use self::openai::GPT3_5_TURBO_INSTRUCT;
 
 #[cfg(feature = "candle")]
 pub mod candle;
@@ -75,11 +78,27 @@ pub trait Nql: Sync + Send {
 }
 
 #[must_use]
-pub fn create_openai(model: Option<String>) -> Box<dyn Nql> {
-    match model {
-        Some(model) => Box::new(openai::Openai::using_model(model)),
-        None => Box::<openai::Openai>::default(),
+pub fn create_openai(
+    model: Option<String>,
+    api_base: Option<String>,
+    api_key: Option<String>,
+    org_id: Option<String>,
+    project_id: Option<String>,
+) -> Box<dyn Nql> {
+    let mut cfg = OpenAIConfig::new()
+        .with_api_base(api_base.unwrap_or_default())
+        .with_org_id(org_id.unwrap_or_default())
+        .with_project_id(project_id.unwrap_or_default());
+
+    // If an API key is provided, use it. Otherwise use default from env variables.
+    if let Some(api_key) = api_key {
+        cfg = cfg.with_api_key(api_key);
     }
+
+    Box::new(openai::Openai::new(
+        cfg,
+        model.unwrap_or(GPT3_5_TURBO_INSTRUCT.to_string()),
+    ))
 }
 
 pub fn create_hf_model(
