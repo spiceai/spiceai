@@ -26,6 +26,7 @@ mod docker;
 // Run all tests in the `federation` module
 mod federation;
 mod refresh_sql;
+mod results_cache;
 
 fn init_tracing(default_level: Option<&str>) -> DefaultGuard {
     let filter = match (default_level, std::env::var("SPICED_LOG").ok()) {
