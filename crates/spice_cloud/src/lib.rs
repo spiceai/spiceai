@@ -34,6 +34,14 @@ pub enum Error {
 
     #[snafu(display("Unable to create accelerated table provider: {source}"))]
     UnableToCreateAcceleratedTableProvider { source: dataaccelerator::Error },
+
+    #[snafu(display("Unable to get Spice Cloud secret: {source}"))]
+    UnableToGetSpiceSecret {
+        source: Box<dyn std::error::Error + Sync + Send>,
+    },
+
+    #[snafu(display("Spice Cloud secret not found"))]
+    SpiceSecretNotFound {},
 }
 
 pub struct SpiceExtension {
@@ -44,6 +52,72 @@ impl SpiceExtension {
     #[must_use]
     pub fn new(manifest: ExtensionManifest) -> Self {
         SpiceExtension { manifest }
+    }
+
+    fn control_plane_enabled(&self) -> bool {
+        self.manifest
+            .params
+            .get("control_plane_enabled")
+            .unwrap_or(&"false".to_string())
+            == "true"
+    }
+
+    async fn get_spice_secret(&self, runtime: &Runtime) -> Result<Secret, Error> {
+        let secrets = runtime.secrets_provider.read().await;
+        let secret = secrets
+            .get_secret("spiceai")
+            .await
+            .context(UnableToGetSpiceSecretSnafu)?;
+
+        secret.ok_or(Error::SpiceSecretNotFound {})
+    }
+
+    async fn register_runtime_metrics_table(
+        &mut self,
+        runtime: &Runtime,
+        from: String,
+        secret: Secret,
+    ) -> Result<()> {
+        let retention = Retention::new(
+            Some("timestamp".to_string()),
+            Some(TimeFormat::UnixSeconds),
+            Some(Duration::from_secs(1800)), // delete metrics older then 30 minutes
+            Some(Duration::from_secs(300)),  // run retention every 5 minutes
+            true,
+        );
+
+        let refresh = Refresh::new(
+            Some("timestamp".to_string()),
+            Some(TimeFormat::UnixSeconds),
+            Some(Duration::from_secs(10)),
+            None,
+            RefreshMode::Full,
+            Some(Duration::from_secs(1800)), // sync only last 30 minutes from cloud
+        );
+
+        let metrics_table_reference = get_metrics_table_reference();
+
+        let table = create_synced_internal_accelerated_table(
+            metrics_table_reference.table(),
+            from.as_str(),
+            Some(secret),
+            Acceleration::default(),
+            refresh,
+            retention,
+        )
+        .await
+        .boxed()
+        .map_err(|e| runtime::extension::Error::UnableToStartExtension { source: e })?;
+
+        runtime
+            .datafusion()
+            .write()
+            .await
+            .register_runtime_table(metrics_table_reference.table(), table)
+            .boxed()
+            .map_err(|e| runtime::extension::Error::UnableToStartExtension { source: e })?;
+
+        Ok(())
     }
 }
 
@@ -74,58 +148,24 @@ impl Extension for SpiceExtension {
             return Ok(());
         }
 
-        if let Some(spiceai_metrics_dataset_path) = self.manifest.params.get("metrics_dataset_path")
-        {
-            tracing::info!("Starting Spice.ai Cloud Extension");
+        tracing::info!("Starting Spice.ai Cloud Extension");
 
-            let secrets = runtime.secrets_provider.read().await;
-            let secret = secrets
-                .get_secret("spiceai")
-                .await
-                .map_err(|e| runtime::extension::Error::UnableToStartExtension { source: e })?;
-
-            let retention = Retention::new(
-                Some("timestamp".to_string()),
-                Some(TimeFormat::UnixSeconds),
-                Some(Duration::from_secs(1800)), // delete metrics older then 30 minutes
-                Some(Duration::from_secs(300)),  // run retention every 5 minutes
-                true,
-            );
-
-            let refresh = Refresh::new(
-                Some("timestamp".to_string()),
-                Some(TimeFormat::UnixSeconds),
-                Some(Duration::from_secs(10)),
-                None,
-                RefreshMode::Full,
-                Some(Duration::from_secs(1800)), // sync only last 30 minutes from cloud
-            );
-
-            let metrics_table_reference = get_metrics_table_reference();
-
-            let table = create_synced_internal_accelerated_table(
-                metrics_table_reference.table(),
-                spiceai_metrics_dataset_path,
-                secret,
-                Acceleration::default(),
-                refresh,
-                retention,
-            )
+        let secret = self
+            .get_spice_secret(runtime)
             .await
             .boxed()
             .map_err(|e| runtime::extension::Error::UnableToStartExtension { source: e })?;
 
-            runtime
-                .datafusion()
-                .write()
-                .await
-                .register_runtime_table(metrics_table_reference, table)
-                .boxed()
-                .map_err(|e| runtime::extension::Error::UnableToStartExtension { source: e })?;
-
-            tracing::info!(
-                "Enabled metrics sync from runtime.metrics to {spiceai_metrics_dataset_path}"
-            );
+        if self.control_plane_enabled() {
+            // TODO: get dataset path from cloud
+            if let Some(spiceai_metrics_dataset_path) =
+                self.manifest.params.get("metrics_dataset_path")
+            {
+                let from = spiceai_metrics_dataset_path.to_string();
+                self.register_runtime_metrics_table(runtime, from.clone(), secret)
+                    .await?;
+                tracing::info!("Enabled metrics sync from runtime.metrics to {from}",);
+            }
         }
 
         Ok(())
