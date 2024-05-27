@@ -45,7 +45,7 @@ pub async fn instantiate_query_history_table() -> Result<Arc<AcceleratedTable>, 
     let retention = Retention::new(
         time_column.clone(),
         time_format,
-        Some(Duration::from_secs(3 * 24 * 60 * 60)), // 3 days
+        Some(Duration::from_secs(24 * 60 * 60)), // 1 day
         Some(Duration::from_secs(300)),
         true,
     );
@@ -67,7 +67,7 @@ fn table_schema() -> Schema {
         Field::new("query_id", DataType::Utf8, false),
         Field::new("schema", DataType::Utf8, false),
         Field::new("sql", DataType::Utf8, false),
-        Field::new("nsql_query", DataType::Utf8, true),
+        Field::new("nsql", DataType::Utf8, true),
         Field::new(
             "start_time",
             DataType::Timestamp(TimeUnit::Nanosecond, None),
@@ -120,7 +120,7 @@ pub struct QueryHistory {
     query_id: Option<String>,
     schema: Option<Arc<Schema>>,
     sql: Option<String>,
-    nsql_query: Option<String>,
+    nsql: Option<String>,
     start_time: Option<SystemTime>,
     end_time: Option<SystemTime>,
     execution_time: Option<u64>,
@@ -138,7 +138,7 @@ impl QueryHistory {
             query_id: None,
             schema: None,
             sql: None,
-            nsql_query: None,
+            nsql: None,
             start_time: None,
             end_time: None,
             execution_time: None,
@@ -168,8 +168,8 @@ impl QueryHistory {
     }
 
     #[must_use]
-    pub fn nsql_query(mut self, nsql_query: String) -> Self {
-        self.nsql_query = Some(nsql_query);
+    pub fn nsql(mut self, nsql: String) -> Self {
+        self.nsql = Some(nsql);
         self
     }
 
@@ -241,7 +241,7 @@ impl QueryHistory {
                     .as_ref()
                     .map(ToString::to_string)])),
                 Arc::new(StringArray::from(vec![self.sql.clone()])),
-                Arc::new(StringArray::from(vec![self.nsql_query.clone()])),
+                Arc::new(StringArray::from(vec![self.nsql.clone()])),
                 Arc::new(TimestampNanosecondArray::from(vec![start_time])),
                 Arc::new(TimestampNanosecondArray::from(vec![end_time])),
                 Arc::new(UInt64Array::from(vec![self.execution_time])),

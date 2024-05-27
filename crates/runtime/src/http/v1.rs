@@ -155,7 +155,9 @@ pub(crate) mod query {
                 }
                 Err(e) => {
                     tracing::debug!("Error executing query: {e}");
-                    let _ = q_trace.write().await;
+                    if let Err(e) = q_trace.write().await {
+                        tracing::trace!("Error writing query history: {e}");
+                    }
                     return (
                         StatusCode::BAD_REQUEST,
                         format!("Error processing batch: {e}"),
@@ -165,7 +167,9 @@ pub(crate) mod query {
             },
             Err(e) => {
                 tracing::debug!("Error executing query: {e}");
-                let _ = q_trace.write().await;
+                if let Err(e) = q_trace.write().await {
+                    tracing::trace!("Error writing query history: {e}");
+                }
                 return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
             }
         };
@@ -177,12 +181,16 @@ pub(crate) mod query {
         if let Err(e) = writer.write_batches(data.iter().collect::<Vec<&RecordBatch>>().as_slice())
         {
             tracing::debug!("Error converting results to JSON: {e}");
-            let _ = q_trace.write().await;
+            if let Err(e) = q_trace.write().await {
+                tracing::trace!("Error writing query history: {e}");
+            }
             return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
         }
         if let Err(e) = writer.finish() {
             tracing::debug!("Error finishing JSON conversion: {e}");
-            let _ = q_trace.write().await;
+            if let Err(e) = q_trace.write().await {
+                tracing::trace!("Error writing query history: {e}");
+            }
             return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
         }
 
@@ -191,7 +199,9 @@ pub(crate) mod query {
             Ok(res) => res,
             Err(e) => {
                 tracing::debug!("Error converting JSON buffer to string: {e}");
-                let _ = q_trace.write().await;
+                if let Err(e) = q_trace.write().await {
+                    tracing::trace!("Error writing query history: {e}");
+                }
                 return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
             }
         };
@@ -211,7 +221,9 @@ pub(crate) mod query {
             }
             None => {}
         };
-        let _ = q_trace.write().await;
+        if let Err(e) = q_trace.write().await {
+            tracing::trace!("Error writing query history: {e}");
+        }
         (StatusCode::OK, headers, res).into_response()
     }
 }
@@ -1063,7 +1075,7 @@ pub(crate) mod nsql {
             table_create_schemas=table_create_stms.join("\n")
         );
 
-        q_trace = q_trace.nsql_query(nsql_query.clone());
+        q_trace = q_trace.nsql(nsql_query.clone());
         tracing::trace!("Running prompt: {nsql_query}");
 
         let result = match nsql_models.read().await.get(&payload.model) {
@@ -1114,7 +1126,9 @@ pub(crate) mod nsql {
                 (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
             }
         };
-        let _ = q_trace.write().await;
+        if let Err(e) = q_trace.write().await {
+            tracing::trace!("Error writing query history: {e}");
+        }
         resp
     }
 }
