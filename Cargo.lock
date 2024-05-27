@@ -8188,7 +8188,7 @@ dependencies = [
 [[package]]
 name = "spark-connect-core"
 version = "0.0.1-beta.4"
-source = "git+https://github.com/spiceai/spark-connect-rs.git?rev=29b0634cdcb336fdceaf289aacf35927fb4a8877#29b0634cdcb336fdceaf289aacf35927fb4a8877"
+source = "git+https://github.com/spiceai/spark-connect-rs.git?rev=b594f2e626c2a9356a087aa5b28cd861d9ac377f#b594f2e626c2a9356a087aa5b28cd861d9ac377f"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -8208,7 +8208,7 @@ dependencies = [
 [[package]]
 name = "spark-connect-rs"
 version = "0.0.1-beta.4"
-source = "git+https://github.com/spiceai/spark-connect-rs.git?rev=29b0634cdcb336fdceaf289aacf35927fb4a8877#29b0634cdcb336fdceaf289aacf35927fb4a8877"
+source = "git+https://github.com/spiceai/spark-connect-rs.git?rev=b594f2e626c2a9356a087aa5b28cd861d9ac377f#b594f2e626c2a9356a087aa5b28cd861d9ac377f"
 dependencies = [
  "spark-connect-core",
 ]
