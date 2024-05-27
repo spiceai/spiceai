@@ -116,7 +116,7 @@ async fn init_mysql_db() -> Result<(), anyhow::Error> {
 #[tokio::test]
 async fn mysql_federation_push_down() -> Result<(), String> {
     type QueryTests<'a> = Vec<(&'a str, Vec<&'a str>, Option<Box<ValidateFn>>)>;
-    init_tracing(Some("integration=debug,info"));
+    let _tracing = init_tracing(Some("integration=debug,info"));
     let running_container = start_mysql_docker_container().await.map_err(|e| {
         tracing::error!("start_mysql_docker_container: {e}");
         e.to_string()
