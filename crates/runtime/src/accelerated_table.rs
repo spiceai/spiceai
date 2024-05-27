@@ -19,6 +19,7 @@ use std::{any::Any, sync::Arc, time::Duration};
 
 use crate::component::dataset::acceleration::{RefreshMode, ZeroResultsAction};
 use crate::component::dataset::TimeFormat;
+use crate::datafusion::SPICE_RUNTIME_SCHEMA;
 use arrow::array::UInt64Array;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
@@ -267,10 +268,12 @@ impl AcceleratedTable {
     pub async fn update_refresh_sql(&self, refresh_sql: Option<String>) -> Result<()> {
         let dataset_name = &self.dataset_name;
 
-        if let Some(sql_str) = &refresh_sql {
-            tracing::info!("[refresh] Updating refresh SQL for {dataset_name} to {sql_str}");
-        } else {
-            tracing::info!("[refresh] Removing refresh SQL for {dataset_name}");
+        if self.dataset_name.schema() != Some(SPICE_RUNTIME_SCHEMA) {
+            if let Some(sql_str) = &refresh_sql {
+                tracing::info!("[refresh] Updating refresh SQL for {dataset_name} to {sql_str}");
+            } else {
+                tracing::info!("[refresh] Removing refresh SQL for {dataset_name}");
+            }
         }
         let mut refresh = self.refresh_params.write().await;
         refresh.sql = refresh_sql;
@@ -338,17 +341,26 @@ impl AcceleratedTable {
 
                 let timestamp = refresh::get_timestamp(start);
                 let expr = timestamp_filter_converter.convert(timestamp, Operator::Lt);
-                tracing::info!(
-                    "[retention] Evicting data for {dataset_name} where {time_column} < {}...",
-                    if let Some(value) =
-                        chrono::DateTime::from_timestamp((timestamp / 1_000_000_000) as i64, 0)
-                    {
-                        value.to_rfc3339()
-                    } else {
-                        tracing::warn!("[retention] Unable to convert timestamp");
-                        continue;
-                    }
-                );
+
+                let timestamp = if let Some(value) =
+                    chrono::DateTime::from_timestamp((timestamp / 1_000_000_000) as i64, 0)
+                {
+                    value.to_rfc3339()
+                } else {
+                    tracing::warn!("[retention] Unable to convert timestamp");
+                    continue;
+                };
+                if dataset_name.schema() == Some(SPICE_RUNTIME_SCHEMA) {
+                    tracing::debug!(
+                        "[retention] Evicting data for {dataset_name} where {time_column} < {}...",
+                        timestamp
+                    );
+                } else {
+                    tracing::info!(
+                        "[retention] Evicting data for {dataset_name} where {time_column} < {}...",
+                        timestamp
+                    );
+                }
 
                 tracing::debug!("[retention] Expr {expr:?}");
 
@@ -369,9 +381,11 @@ impl AcceleratedTable {
                                         .map_or(0, |v| v.values().first().map_or(0, |f| *f))
                                 });
 
-                                tracing::info!(
-                                    "[retention] Evicted {num_records} records for {dataset_name}",
-                                );
+                                if dataset_name.schema() == Some(SPICE_RUNTIME_SCHEMA) {
+                                    tracing::debug!("[retention] Evicted {num_records} records for {dataset_name}");
+                                } else {
+                                    tracing::info!("[retention] Evicted {num_records} records for {dataset_name}");
+                                }
 
                                 if num_records > 0 {
                                     if let Some(cache_provider) = &cache_provider {
