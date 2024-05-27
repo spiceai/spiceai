@@ -2,6 +2,8 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use datafusion::{datasource::TableProvider, sql::TableReference};
+use serde::Deserialize;
+use serde_json::json;
 use snafu::prelude::*;
 
 use runtime::{
@@ -42,6 +44,12 @@ pub enum Error {
 
     #[snafu(display("Spice Cloud secret not found"))]
     SpiceSecretNotFound {},
+
+    #[snafu(display("Spice Cloud api_key not provided"))]
+    SpiceApiKeyNotFound {},
+
+    #[snafu(display("Unable to connect to Spiec Cloud: {source}"))]
+    UnableToConnectToSpiceCloud { source: reqwest::Error },
 }
 
 pub struct SpiceExtension {
@@ -62,6 +70,14 @@ impl SpiceExtension {
             == "true"
     }
 
+    fn spice_http_url() -> String {
+        // if cfg!(feature = "dev") {
+        "https://dev-data.spiceai.io".to_string()
+        // } else {
+        // "https://data.spiceai.io".to_string()
+        // }
+    }
+
     async fn get_spice_secret(&self, runtime: &Runtime) -> Result<Secret, Error> {
         let secrets = runtime.secrets_provider.read().await;
         let secret = secrets
@@ -70,6 +86,36 @@ impl SpiceExtension {
             .context(UnableToGetSpiceSecretSnafu)?;
 
         secret.ok_or(Error::SpiceSecretNotFound {})
+    }
+
+    async fn get_spice_api_key(&self, runtime: &Runtime) -> Result<String, Error> {
+        let secret = self.get_spice_secret(runtime).await?;
+        let api_key = secret.get("key").ok_or(Error::SpiceApiKeyNotFound {})?;
+
+        Ok(api_key.to_string())
+    }
+
+    async fn connect(&self, runtime: &Runtime) -> Result<SpiceCloudConnectResponse, Error> {
+        let api_key = self.get_spice_api_key(runtime).await?;
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!(
+                "{}/v1/control_plane/connect",
+                SpiceExtension::spice_http_url()
+            ))
+            .json(&json!({}))
+            .header("Content-Type", "application/json")
+            .header("X-API-Key", api_key)
+            .send()
+            .await
+            .context(UnableToConnectToSpiceCloudSnafu)?;
+
+        let response: SpiceCloudConnectResponse = response
+            .json()
+            .await
+            .context(UnableToConnectToSpiceCloudSnafu)?;
+
+        Ok(response)
     }
 
     async fn register_runtime_metrics_table(
@@ -157,15 +203,21 @@ impl Extension for SpiceExtension {
             .map_err(|e| runtime::extension::Error::UnableToStartExtension { source: e })?;
 
         if self.control_plane_enabled() {
-            // TODO: get dataset path from cloud
-            if let Some(spiceai_metrics_dataset_path) =
-                self.manifest.params.get("metrics_dataset_path")
-            {
-                let from = spiceai_metrics_dataset_path.to_string();
-                self.register_runtime_metrics_table(runtime, from.clone(), secret)
-                    .await?;
-                tracing::info!("Enabled metrics sync from runtime.metrics to {from}",);
-            }
+            let connection = self
+                .connect(runtime)
+                .await
+                .boxed()
+                .map_err(|e| runtime::extension::Error::UnableToStartExtension { source: e })?;
+
+            let spiceai_metrics_dataset_path = format!(
+                "spice.ai/{}/{}/{}",
+                connection.org_name, connection.app_name, connection.metrics_dataset_name
+            );
+
+            let from = spiceai_metrics_dataset_path.to_string();
+            self.register_runtime_metrics_table(runtime, from.clone(), secret)
+                .await?;
+            tracing::info!("Enabled metrics sync from runtime.metrics to {from}",);
         }
 
         Ok(())
@@ -253,4 +305,12 @@ pub async fn create_synced_internal_accelerated_table(
     let (accelerated_table, _) = builder.build().await;
 
     Ok(Arc::new(accelerated_table))
+}
+
+#[derive(Deserialize, Debug)]
+#[allow(clippy::struct_field_names)]
+struct SpiceCloudConnectResponse {
+    org_name: String,
+    app_name: String,
+    metrics_dataset_name: String,
 }
