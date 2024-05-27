@@ -26,6 +26,7 @@ use object_store::{
     path::Path, GetOptions, GetResult, GetResultPayload, ListResult, MultipartId, ObjectMeta,
     ObjectStore, PutOptions, PutResult,
 };
+use suppaftp::types::FileType;
 use suppaftp::AsyncFtpStream;
 use tokio::io::AsyncWrite;
 
@@ -122,6 +123,13 @@ fn pipe_stream(
         let mut total = 0;
         let mut buf = vec![0; 4096];
 
+        client
+            .transfer_type(FileType::Binary)
+            .await
+            .map_err(|e| object_store::Error::Generic {
+                store: "FTP",
+                source: e.into(),
+            })?;
         client.resume_transfer(start).await.map_err(|e| {
             object_store::Error::Generic { store: "FTP", source: e.into() }
         })?;

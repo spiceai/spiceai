@@ -491,7 +491,8 @@ pub struct Retention {
 }
 
 impl Retention {
-    pub(crate) fn new(
+    #[must_use]
+    pub fn new(
         time_column: Option<String>,
         time_format: Option<TimeFormat>,
         retention_period: Option<Duration>,
