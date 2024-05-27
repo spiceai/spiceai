@@ -106,7 +106,6 @@ duckdb = [
     "dep:duckdb",
     "r2d2",
     "db_connection_pool/duckdb",
-    "spicepod/duckdb",
     "data_components/duckdb",
 ]
 motherduck = []

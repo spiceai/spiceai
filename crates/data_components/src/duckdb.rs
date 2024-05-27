@@ -251,21 +251,13 @@ impl DuckDB {
     }
 
     fn insert_batch(&self, transaction: &Transaction<'_>, batch: &RecordBatch) -> Result<()> {
-        let sql = format!(
-            r#"INSERT INTO "{name}" SELECT * FROM arrow(?, ?)"#,
-            name = self.table_name
-        );
-        tracing::trace!("{sql}");
+        let mut appender = transaction
+            .appender(&self.table_name)
+            .context(UnableToInsertToDuckDBTableSnafu)?;
 
-        for sliced in Self::split_batch(batch) {
-            let arrow_params = arrow_recordbatch_to_query_params(sliced);
-            let arrow_params_vec: Vec<&dyn ToSql> = arrow_params
-                .iter()
-                .map(|p| p as &dyn ToSql)
-                .collect::<Vec<_>>();
-            let arrow_params_ref: &[&dyn ToSql] = &arrow_params_vec;
-            transaction
-                .execute(&sql, arrow_params_ref)
+        for batch in Self::split_batch(batch) {
+            appender
+                .append_record_batch(batch.clone())
                 .context(UnableToInsertToDuckDBTableSnafu)?;
         }
 
