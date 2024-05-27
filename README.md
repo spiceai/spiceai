@@ -200,11 +200,13 @@ Enter `show tables;` to display the available tables for query:
 
 ```
 sql> show tables
-+------------+------------+
-| table_name | table_type |
-+------------+------------+
-| taxi_trips | BASE TABLE |
-+------------+------------+
++---------------+--------------+---------------+------------+
+| table_catalog | table_schema | table_name    | table_type |
++---------------+--------------+---------------+------------+
+| spice         | public       | taxi_trips    | BASE TABLE |
+| spice         | runtime      | metrics       | BASE TABLE |
+| spice         | runtime      | query_history | BASE TABLE |
++---------------+--------------+---------------+------------+
 
 Time: 0.007505084 seconds. 1 rows.
 ```
