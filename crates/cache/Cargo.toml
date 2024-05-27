@@ -15,6 +15,7 @@ tracing.workspace = true
 async-trait.workspace = true
 async-stream.workspace = true
 arrow.workspace = true
+tokio.workspace = true
 datafusion.workspace = true
 futures.workspace = true
 metrics.workspace = true
