@@ -194,7 +194,7 @@ pub struct Runtime {
     pub pods_watcher: Option<podswatcher::PodsWatcher>,
     pub secrets_provider: Arc<RwLock<secrets::SecretsProvider>>,
 
-    extensions: Arc<Vec<RwLock<Box<dyn Extension>>>>,
+    extensions: Vec<Box<dyn Extension>>,
     spaced_tracer: Arc<tracers::SpacedTracer>,
 }
 
@@ -216,22 +216,21 @@ impl Runtime {
             pods_watcher: None,
             secrets_provider: Arc::new(RwLock::new(secrets::SecretsProvider::new())),
             spaced_tracer: Arc::new(tracers::SpacedTracer::new(Duration::from_secs(15))),
-            extensions: Arc::new(vec![]),
+            extensions: vec![],
         };
 
-        let mut extensions: Vec<RwLock<Box<dyn Extension>>> = vec![];
+        let mut extensions: Vec<Box<dyn Extension>> = vec![];
         for factory in extension_factories.iter() {
-            let extension = factory.create();
+            let mut extension = factory.create();
             let extension_name = extension.name();
-            let extension_lock = RwLock::new(extension);
-            if let Err(err) = rt.initialize_extension(&extension_lock).await {
+            if let Err(err) = rt.initialize_extension(&mut *extension).await {
                 tracing::warn!("Failed to initialize extension {extension_name}: {err}");
             } else {
-                extensions.push(extension_lock);
+                extensions.push(extension);
             };
         }
 
-        rt.extensions = Arc::new(extensions);
+        rt.extensions = extensions;
 
         rt
     }
@@ -243,28 +242,21 @@ impl Runtime {
 
     async fn initialize_extension(
         &mut self,
-        extension: &RwLock<Box<dyn Extension>>,
+        extension: &mut dyn Extension,
     ) -> extensions::Result<()> {
-        let mut extension = extension.write().await;
-        extension.initialize(&mut *self).await?;
-        Ok(())
-    }
-
-    async fn start_extension(
-        &self,
-        extension: &RwLock<Box<dyn Extension>>,
-    ) -> extensions::Result<()> {
-        let mut extension = extension.write().await;
-        extension.on_start(self).await?;
+        extension.initialize(self).await?;
         Ok(())
     }
 
     pub async fn start_extensions(&mut self) {
-        for extension in self.extensions.iter() {
-            if let Err(err) = self.start_extension(extension).await {
+        let mut extensions: Vec<Box<dyn Extension>> = self.extensions.drain(..).collect();
+        for extension in &mut extensions {
+            if let Err(err) = extension.on_start(self).await {
                 tracing::warn!("Failed to start extension: {err}");
             }
         }
+
+        self.extensions = extensions;
     }
 
     pub fn with_pods_watcher(&mut self, pods_watcher: podswatcher::PodsWatcher) {
