@@ -14,57 +14,144 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{any::Any, fmt,  sync::Arc};
+use std::{any::Any, fmt, sync::Arc};
 
-use arrow::{array::RecordBatch, datatypes::{DataType, Field, Schema, SchemaRef}};
+use arrow::{
+    array::{ArrayRef, RecordBatch, StringArray, TimestampMillisecondArray, UInt64Array},
+    datatypes::{DataType, Field, Schema, SchemaRef},
+    error::ArrowError,
+};
 use async_stream::stream;
 use async_trait::async_trait;
 use datafusion::{
-    common::{project_schema, Constraint, Constraints}, datasource::{TableProvider, TableType}, error::{DataFusionError, Result as DataFusionResult}, execution::{context::SessionState, SendableRecordBatchStream, TaskContext}, logical_expr::{Expr, TableProviderFilterPushDown}, physical_expr::EquivalenceProperties, physical_plan::{
-        stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionMode, ExecutionPlan, Partitioning, PlanProperties
-    }
+    common::{project_schema, Constraint, Constraints},
+    datasource::{TableProvider, TableType},
+    error::{DataFusionError, Result as DataFusionResult},
+    execution::{context::SessionState, SendableRecordBatchStream, TaskContext},
+    logical_expr::{Expr, TableProviderFilterPushDown},
+    physical_expr::EquivalenceProperties,
+    physical_plan::{
+        stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionMode,
+        ExecutionPlan, Partitioning, PlanProperties,
+    },
 };
 
-use futures::StreamExt;
-use object_store::{ObjectStore, path::Path};
-
 use futures::Stream;
-
+use futures::StreamExt;
+use object_store::{path::Path, ObjectMeta, ObjectStore};
+use regex::Regex;
+use snafu::ResultExt;
 
 pub struct ObjectStoreMetadataTable {
     store: Arc<dyn ObjectStore>,
+
+    // Directory-like prefix to filter objects in the store.
+    prefix: Option<String>,
+
+    // Filename filter to apply to post-[`Scan`].
+    // [`object_store.list(`] does not support filtering by filename, or filename regex.
+    filename_regex: Option<Regex>,
 }
 
 impl ObjectStoreMetadataTable {
-    pub fn new(store: Arc<dyn ObjectStore>) -> Arc<Self> {
-        Arc::new(Self { store })
+    pub fn try_new(
+        store: Arc<dyn ObjectStore>,
+        prefix: Option<String>,
+        filename_regex: Option<String>,
+    ) -> Result<Arc<Self>, Box<dyn std::error::Error + Send + Sync>> {
+        let filename_regex = filename_regex.map(|regex| {
+            Regex::new(&regex).boxed()
+        }).transpose()?;
+
+        Ok(Arc::new(Self {
+            store,
+            prefix,
+            filename_regex,
+        }))
     }
-    
+
     pub fn constraints(&self) -> Constraints {
         Constraints::new_unverified(vec![
-            Constraint::PrimaryKey(vec![0]) // "location"
+            Constraint::PrimaryKey(vec![0]), // "location"
         ])
+    }
+
+    /// Schema of [`ObjectStoreMetadataTable`] defined in relation to [`object_store::ObjectMeta`].
+    /// Must match the order and types of the fields in [`to_record_batch`].
+    fn table_schema() -> Schema {
+        Schema::new(vec![
+            Field::new("location", DataType::Utf8, false),
+            Field::new(
+                "last_modified",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+                false,
+            ),
+            Field::new("size", DataType::UInt64, false),
+            Field::new("e_tag", DataType::Utf8, true),
+            Field::new("version", DataType::Utf8, true),
+        ])
+    }
+
+    /// Convert a list of [`ObjectMeta`] to a [`RecordBatch`]. Schema is defined in [`Self::table_schema`].
+    fn to_record_batch(meta_list: &[ObjectMeta]) -> Result<RecordBatch, ArrowError> {
+        let schema = Self::table_schema();
+
+        let location_array = StringArray::from(
+            meta_list
+                .iter()
+                .map(|meta| meta.location.to_string())
+                .collect::<Vec<_>>(),
+        );
+        let last_modified_array = TimestampMillisecondArray::from(
+            meta_list
+                .iter()
+                .map(|meta| meta.last_modified.timestamp_millis())
+                .collect::<Vec<_>>(),
+        );
+        let size_array = UInt64Array::from(
+            meta_list
+                .iter()
+                .map(|meta| meta.size as u64)
+                .collect::<Vec<_>>(),
+        );
+        let e_tag_array = StringArray::from(
+            meta_list
+                .iter()
+                .map(|meta| meta.e_tag.clone())
+                .collect::<Vec<_>>(),
+        );
+        let version_array = StringArray::from(
+            meta_list
+                .iter()
+                .map(|meta| meta.version.clone())
+                .collect::<Vec<_>>(),
+        );
+
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(location_array) as ArrayRef,
+                Arc::new(last_modified_array) as ArrayRef,
+                Arc::new(size_array) as ArrayRef,
+                Arc::new(e_tag_array) as ArrayRef,
+                Arc::new(version_array) as ArrayRef,
+            ],
+        )?;
+
+        Ok(batch)
     }
 }
 
-
 #[async_trait]
 impl TableProvider for ObjectStoreMetadataTable {
-
     fn as_any(&self) -> &dyn Any {
         self
     }
 
-
-    /// Schema of [`ObjectStoreMetadataTable`] defined in relation to [`object_store::ObjectMeta`]. 
+    /// Schema of [`ObjectStoreMetadataTable`] defined in relation to [`object_store::ObjectMeta`].
+    /// Must match the order and types of the fields in [`to_record_batch`].
     fn schema(&self) -> SchemaRef {
-        Arc::new(Schema::new(vec![
-            Field::new("location", DataType::Utf8, false),
-            Field::new("last_modified", DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None), false),
-            Field::new("size", DataType::UInt64, false),
-            Field::new("e_tag", DataType::Utf8, true),
-            Field::new("version", DataType::Utf8, true),
-        ]))
+        Arc::new(Self::table_schema())
     }
 
     fn constraints(&self) -> Option<&Constraints> {
@@ -80,7 +167,6 @@ impl TableProvider for ObjectStoreMetadataTable {
         TableType::Base
     }
 
-
     async fn scan(
         &self,
         _state: &SessionState,
@@ -93,10 +179,12 @@ impl TableProvider for ObjectStoreMetadataTable {
             projected_schema,
             filters,
             limit,
-            self.store.clone()
+            Arc::clone(&self.store),
+            self.prefix.clone(),
+            self.filename_regex.clone(),
         )))
     }
-    
+
     fn supports_filters_pushdown(
         &self,
         filters: &[&Expr],
@@ -110,10 +198,30 @@ impl TableProvider for ObjectStoreMetadataTable {
 
 pub struct ObjectStoreMetadataExec {
     projected_schema: SchemaRef,
-    filters: Vec<Expr>,
+    _filters: Vec<Expr>,
     limit: Option<usize>,
-    store: Arc<dyn ObjectStore>,
     properties: PlanProperties,
+
+    store: Arc<dyn ObjectStore>,
+    prefix: Option<String>,
+    filename_regex: Option<Regex>,
+}
+
+impl std::fmt::Debug for ObjectStoreMetadataExec {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{} prefix={:?}", self.name(), self.prefix.clone())
+    }
+}
+
+impl DisplayAs for ObjectStoreMetadataExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "{} prefix={}",
+            self.name(),
+            self.prefix.clone().unwrap_or_default()
+        )
+    }
 }
 
 impl ExecutionPlan for ObjectStoreMetadataExec {
@@ -151,7 +259,12 @@ impl ExecutionPlan for ObjectStoreMetadataExec {
     ) -> DataFusionResult<SendableRecordBatchStream> {
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema(),
-            to_sendable_stream(self.store.clone(), Some("prefix".to_string())),
+            to_sendable_stream(
+                Arc::clone(&self.store),
+                self.limit,
+                self.prefix.clone(),
+                self.filename_regex.clone(),
+            ), // TODO get prefix from filters
         )))
     }
 }
@@ -162,10 +275,11 @@ impl ObjectStoreMetadataExec {
         filters: &[Expr],
         limit: Option<usize>,
         store: Arc<dyn ObjectStore>,
+        prefix: Option<String>,
+        filename_regex: Option<Regex>,
     ) -> Self {
-
         Self {
-            projected_schema: projected_schema.clone(),
+            projected_schema: Arc::clone(&projected_schema),
             filters: filters.to_vec(),
             limit,
             properties: PlanProperties::new(
@@ -173,44 +287,58 @@ impl ObjectStoreMetadataExec {
                 Partitioning::UnknownPartitioning(1),
                 ExecutionMode::Bounded,
             ),
-            store
+            store,
+            prefix,
+            filename_regex,
         }
     }
-    
-
-    /// Querying a prefix, p of the object store, is equivalent to the filter: `TODO`.
-    fn prefix(&self) -> Option<String> {
-        
-        // TODO: Implement the filter for the prefix.
-        self.filters.iter()
-            .filter(|&_f| false).next()
-            .map(|f| f.to_string())
-    }
-
 }
 
-pub fn to_sendable_stream(store: Arc<dyn ObjectStore>, prefix: Option<String>) -> impl Stream<Item = DataFusionResult<RecordBatch>> + 'static  {
+pub fn to_sendable_stream(
+    store: Arc<dyn ObjectStore>,
+    limit: Option<usize>,
+    prefix: Option<String>,
+    filename_regex: Option<Regex>,
+) -> impl Stream<Item = DataFusionResult<RecordBatch>> + 'static {
     stream! {
-        let mut object_stream = store.list(prefix.map(|p| Path::from(p)).as_ref());
+        let mut object_stream = store.list(prefix.clone().map(Path::from).as_ref());
+        let mut count = 0;
+
         while let Some(item) = object_stream.next().await {
             match item {
                 Ok(object_meta) => {
-                    let x = object_meta.location;
-                }
+
+                    if !filename_in_scan(&object_meta.location, filename_regex.clone()) {
+                    continue;
+                    }
+                    match ObjectStoreMetadataTable::to_record_batch(&[object_meta]) {
+                        Ok(batch) => {yield Ok(batch); count += 1;},
+                        Err(e) => yield Err(DataFusionError::Execution(format!("{e}"))),
+                    }
+                },
                 Err(e) => yield Err(DataFusionError::Execution(format!("{e}"))),
+            }
+
+            // Early exit on LIMIT clause
+            if let Some(limit) = limit {
+                if count >= limit {
+                    break;
+                }
             }
         }
     }
 }
 
-impl std::fmt::Debug for ObjectStoreMetadataExec {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "{} prefix={}", self.name(), self.prefix().unwrap_or_default())
+fn filename_in_scan(location: &Path, filename_regex: Option<Regex>) -> bool {
+    if let Some(regex) = filename_regex {
+        if let Some(filename) = location.filename() {
+            if !regex.is_match(filename) {
+                return false;
+            }
+        } else {
+            return false; // Could not get the filename as a valid UTF-8 string
+        }
     }
-}
 
-impl DisplayAs for ObjectStoreMetadataExec {
-    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> std::fmt::Result {
-        write!(f, "{} prefix={}", self.name(), self.prefix().unwrap_or_default())
-    }
+    true
 }

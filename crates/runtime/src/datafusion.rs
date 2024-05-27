@@ -56,6 +56,7 @@ use self::schema::SpiceSchemaProvider;
 const SPICE_DEFAULT_CATALOG: &str = "spice";
 const SPICE_RUNTIME_SCHEMA: &str = "runtime";
 const SPICE_DEFAULT_SCHEMA: &str = "public";
+const SPICE_METADATA_SCHEMA: &str = "metadata";
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -217,6 +218,7 @@ impl DataFusion {
         let catalog = MemoryCatalogProvider::new();
         let default_schema = SpiceSchemaProvider::new();
         let runtime_schema = SpiceSchemaProvider::new();
+        let metadata_schema = SpiceSchemaProvider::new();
 
         match catalog.register_schema(SPICE_DEFAULT_SCHEMA, Arc::new(default_schema)) {
             Ok(_) => {}
@@ -226,6 +228,13 @@ impl DataFusion {
         }
 
         match catalog.register_schema(SPICE_RUNTIME_SCHEMA, Arc::new(runtime_schema)) {
+            Ok(_) => {}
+            Err(e) => {
+                panic!("Unable to register spice runtime schema: {e}");
+            }
+        }
+
+        match catalog.register_schema(SPICE_METADATA_SCHEMA, Arc::new(metadata_schema)) {
             Ok(_) => {}
             Err(e) => {
                 panic!("Unable to register spice runtime schema: {e}");
@@ -582,12 +591,15 @@ impl DataFusion {
         acceleration_secret: Option<Secret>,
     ) -> Result<()> {
         let (accelerated_table, _) = self
-            .create_accelerated_table(dataset, source, acceleration_secret)
+            .create_accelerated_table(dataset, Arc::clone(&source), acceleration_secret)
             .await?;
 
         self.ctx
             .register_table(dataset.name.clone(), Arc::new(accelerated_table))
             .context(UnableToRegisterTableToDataFusionSnafu)?;
+
+        self.register_metadata_table(&dataset, Arc::clone(&source))
+            .await?;
 
         Ok(())
     }
@@ -672,10 +684,35 @@ impl DataFusion {
                 .context(UnableToResolveTableProviderSnafu)?,
         };
 
+        self.register_metadata_table(&dataset, Arc::clone(&source))
+            .await?;
+
         self.ctx
             .register_table(dataset.name.clone(), source_table_provider)
             .context(UnableToRegisterTableToDataFusionSnafu)?;
 
+        Ok(())
+    }
+
+    /// Register a metadata table to the DataFusion context if supported by the underlying data connector.
+    /// For a dataset `name`, the metadata table will be under `metadata.$name`
+    async fn register_metadata_table(
+        &self,
+        dataset: &Dataset,
+        source: Arc<dyn DataConnector>,
+    ) -> Result<()> {
+        let tbl_ref = TableReference::partial(SPICE_METADATA_SCHEMA, dataset.name.clone());
+        match source.metadata_provider(dataset).await {
+            Some(Ok(table)) => {
+                self.ctx
+                    .register_table(tbl_ref, table)
+                    .context(UnableToRegisterTableToDataFusionSnafu)?;
+            }
+            Some(Err(e)) => {
+                Err(e).context(InvalidObjectStoreSnafu)?;
+            }
+            None => {}
+        }
         Ok(())
     }
 

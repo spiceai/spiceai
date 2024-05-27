@@ -17,6 +17,7 @@ limitations under the License.
 use crate::component::dataset::Dataset;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
+use data_components::metadata::object::ObjectStoreMetadataTable;
 use datafusion::dataframe::DataFrame;
 use datafusion::datasource::file_format::csv::CsvFormat;
 use datafusion::datasource::file_format::file_compression_type::FileCompressionType;
@@ -30,11 +31,13 @@ use datafusion::execution::config::SessionConfig;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::{Expr, LogicalPlanBuilder};
 use datafusion::sql::TableReference;
+use futures::StreamExt;
 use lazy_static::lazy_static;
 use snafu::prelude::*;
 use std::any::Any;
 use std::collections::HashMap;
 use std::fmt::Display;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -277,6 +280,13 @@ pub trait DataConnector: Send + Sync {
     ) -> Option<AnyErrorResult<Arc<dyn TableProvider>>> {
         None
     }
+
+    async fn metadata_provider(
+        &self,
+        _dataset: &Dataset,
+    ) -> Option<AnyErrorResult<Arc<dyn TableProvider>>> {
+        None
+    }
 }
 
 // Gets data from a table provider and returns it as a vector of RecordBatches.
@@ -318,6 +328,60 @@ pub trait ListingTableConnector: DataConnector {
     fn get_object_store_url(&self, dataset: &Dataset) -> DataConnectorResult<Url>;
 
     fn get_params(&self) -> &HashMap<String, String>;
+
+    fn get_session_context() -> SessionContext {
+        SessionContext::new_with_config_rt(
+            SessionConfig::new().set_bool(
+                "datafusion.execution.listing_table_ignore_subdirectory",
+                false,
+            ),
+            default_runtime_env(),
+        )
+    }
+
+    fn construct_metadata_provider(
+        &self,
+        dataset: &Dataset,
+    ) -> DataConnectorResult<Arc<dyn TableProvider>>
+    where
+        Self: Display,
+    {
+        let ctx = Self::get_session_context();
+        let store_url = self.get_object_store_url(dataset)?;
+        
+        // TODO: For some reason, this `store` is not working. It's not setting `bucket_endpoint`.
+        // Need this, store-specific, prefix parsing
+        let (_store, prefix) = object_store::parse_url(&store_url.clone()).unwrap();
+        let (_, extension) = self.get_file_format_and_extension()?;
+
+        let (prefix_str, filename_regex) = if let Some(_ext) = prefix.extension() {
+            // Prefix is not collection, but a single file
+            let filename = prefix.filename().unwrap_or_default();
+            (prefix.to_string().strip_suffix(filename).unwrap_or_default().to_string(), filename.to_string())
+        } else {
+            (prefix.to_string(), format!(r"^.*\{extension}$"))
+        };
+
+        let listing_store_url = ListingTableUrl::parse(store_url.clone()).boxed().context(
+            UnableToConnectInternalSnafu {
+                dataconnector: "ListingTableConnector",
+            },
+        )?;
+        let object_store = ctx
+            .runtime_env()
+            .object_store(&listing_store_url)
+            .boxed()
+            .context(UnableToConnectInternalSnafu {
+                dataconnector: "ListingTableConnector",
+            })?;
+
+        let table = ObjectStoreMetadataTable::try_new(object_store, Some(prefix_str), Some(filename_regex))
+            .context(InternalSnafu {
+                dataconnector: "ListingTableConnector",
+                code: "LTC-MP-OSMT".to_string(), // ListingTableConnector-MetadataProvider-ObjectStoreMetadataTableTryNew
+            })?;
+        Ok(table as Arc<dyn TableProvider>)
+    }
 
     fn get_file_format_and_extension(
         &self,
@@ -415,18 +479,30 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
         ListingTableConnector::as_any(self)
     }
 
+    async fn metadata_provider(
+        &self,
+        dataset: &Dataset,
+    ) -> Option<AnyErrorResult<Arc<dyn TableProvider>>> {
+        if let Some(true) = self
+            .get_params()
+            .get("metadata")
+            .map(|s| s.to_lowercase() == "true")
+        {
+            // Only create a TableProvider for metadata if the user-provided parameters specify `metadata=true`.
+            Some(
+                self.construct_metadata_provider(dataset)
+                    .map_err(|e| e.into()),
+            )
+        } else {
+            None
+        }
+    }
+
     async fn read_provider(
         &self,
         dataset: &Dataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
-        let ctx = SessionContext::new_with_config_rt(
-            SessionConfig::new().set_bool(
-                "datafusion.execution.listing_table_ignore_subdirectory",
-                false,
-            ),
-            default_runtime_env(),
-        );
-
+        let ctx = Self::get_session_context();
         let url = self.get_object_store_url(dataset)?;
 
         // This shouldn't error because we've already validated the URL in `get_object_store_url`.
