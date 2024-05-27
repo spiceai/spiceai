@@ -142,12 +142,12 @@ impl Refresher {
                     {
                         if let Some(start_time) = start_time {
                             if let Ok(elapse) = util::humantime_elapsed(start_time) {
-                                if dataset_name.schema() != Some(SPICE_RUNTIME_SCHEMA) {
-                                    tracing::info!(
+                                if dataset_name.schema() == Some(SPICE_RUNTIME_SCHEMA) {
+                                    tracing::debug!(
                                         "Loaded 0 rows for dataset {dataset_name} in {elapse}."
                                     );
                                 } else {
-                                    tracing::debug!(
+                                    tracing::info!(
                                         "Loaded 0 rows for dataset {dataset_name} in {elapse}."
                                     );
                                 }
@@ -189,10 +189,10 @@ impl Refresher {
                                     );
 
                                     if let Ok(elapse) = util::humantime_elapsed(start_time) {
-                                        if dataset_name.schema() != Some(SPICE_RUNTIME_SCHEMA) {
-                                            tracing::info!("Loaded {num_rows} rows ({memory_size}) for dataset {dataset_name} in {elapse}.");
-                                        } else {
+                                        if dataset_name.schema() == Some(SPICE_RUNTIME_SCHEMA) {
                                             tracing::debug!("Loaded {num_rows} rows ({memory_size}) for dataset {dataset_name} in {elapse}.");
+                                        } else {
+                                            tracing::info!("Loaded {num_rows} rows ({memory_size}) for dataset {dataset_name} in {elapse}.");
                                         }
                                     }
 
@@ -430,10 +430,10 @@ impl Refresher {
         let refresh = self.refresh.read().await;
         let filter_converter = self.get_filter_converter(&refresh);
 
-        if dataset_name.schema() != Some(SPICE_RUNTIME_SCHEMA) {
-            tracing::info!("Loading data for dataset {dataset_name}");
-        } else {
+        if dataset_name.schema() == Some(SPICE_RUNTIME_SCHEMA) {
             tracing::debug!("Loading data for dataset {dataset_name}");
+        } else {
+            tracing::info!("Loading data for dataset {dataset_name}");
         }
         status::update_dataset(&dataset_name, status::ComponentStatus::Refreshing);
         let refresh = refresh.clone();

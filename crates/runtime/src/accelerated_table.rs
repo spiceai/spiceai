@@ -350,13 +350,13 @@ impl AcceleratedTable {
                     tracing::warn!("[retention] Unable to convert timestamp");
                     continue;
                 };
-                if dataset_name.schema() != Some(SPICE_RUNTIME_SCHEMA) {
-                    tracing::info!(
+                if dataset_name.schema() == Some(SPICE_RUNTIME_SCHEMA) {
+                    tracing::debug!(
                         "[retention] Evicting data for {dataset_name} where {time_column} < {}...",
                         timestamp
                     );
                 } else {
-                    tracing::debug!(
+                    tracing::info!(
                         "[retention] Evicting data for {dataset_name} where {time_column} < {}...",
                         timestamp
                     );
@@ -381,10 +381,10 @@ impl AcceleratedTable {
                                         .map_or(0, |v| v.values().first().map_or(0, |f| *f))
                                 });
 
-                                if dataset_name.schema() != Some(SPICE_RUNTIME_SCHEMA) {
-                                    tracing::info!("[retention] Evicted {num_records} records for {dataset_name}");
-                                } else {
+                                if dataset_name.schema() == Some(SPICE_RUNTIME_SCHEMA) {
                                     tracing::debug!("[retention] Evicted {num_records} records for {dataset_name}");
+                                } else {
+                                    tracing::info!("[retention] Evicted {num_records} records for {dataset_name}");
                                 }
 
                                 if num_records > 0 {
