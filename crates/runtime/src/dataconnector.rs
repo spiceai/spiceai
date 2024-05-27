@@ -59,7 +59,7 @@ pub mod flightsql;
 #[cfg(feature = "ftp")]
 pub mod ftp;
 pub mod localhost;
-#[cfg(feature = "motherduck")]
+#[cfg(feature = "duckdb")]
 pub mod motherduck;
 #[cfg(feature = "mysql")]
 pub mod mysql;
@@ -241,7 +241,7 @@ pub async fn register_all() {
     register_connector_factory("postgres", postgres::Postgres::create).await;
     #[cfg(feature = "duckdb")]
     register_connector_factory("duckdb", duckdb::DuckDB::create).await;
-    #[cfg(feature = "motherduck")]
+    #[cfg(feature = "duckdb")]
     register_connector_factory("motherduck", motherduck::MotherDuck::create).await;
     #[cfg(feature = "clickhouse")]
     register_connector_factory("clickhouse", clickhouse::Clickhouse::create).await;

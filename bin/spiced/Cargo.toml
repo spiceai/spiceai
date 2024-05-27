@@ -24,7 +24,6 @@ metrics-exporter-prometheus = "0.13.0"
 [features]
 default = [
   "duckdb",
-  "motherduck",
   "postgres",
   "sqlite",
   "mysql",
@@ -37,7 +36,6 @@ default = [
   "ftp",
 ]
 duckdb = ["runtime/duckdb"]
-motherduck = ["runtime/motherduck", "runtime/duckdb"]
 postgres = ["runtime/postgres"]
 sqlite = ["runtime/sqlite"]
 mysql = ["runtime/mysql"]
