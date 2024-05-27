@@ -53,10 +53,10 @@ pub mod schema;
 
 use self::schema::SpiceSchemaProvider;
 
-const SPICE_DEFAULT_CATALOG: &str = "spice";
-const SPICE_RUNTIME_SCHEMA: &str = "runtime";
-const SPICE_DEFAULT_SCHEMA: &str = "public";
-const SPICE_METADATA_SCHEMA: &str = "metadata";
+pub const SPICE_DEFAULT_CATALOG: &str = "spice";
+pub const SPICE_RUNTIME_SCHEMA: &str = "runtime";
+pub const SPICE_DEFAULT_SCHEMA: &str = "public";
+pub const SPICE_METADATA_SCHEMA: &str = "metadata";
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -335,6 +335,21 @@ impl DataFusion {
         }
 
         Ok(QueryResult::new(res_stream, None))
+    }
+
+    pub async fn has_table(&self, table_reference: &TableReference) -> bool {
+        let table_name = table_reference.table();
+
+        if let Some(schema_name) = table_reference.schema() {
+            if let Some(schema) = self.schema(schema_name) {
+                return match schema.table(table_name).await {
+                    Ok(table) => table.is_some(),
+                    Err(_) => false,
+                };
+            }
+        }
+
+        self.ctx.table(table_name).await.is_ok()
     }
 
     pub fn register_runtime_table(

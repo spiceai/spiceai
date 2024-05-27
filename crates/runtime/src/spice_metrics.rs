@@ -18,27 +18,22 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::component::dataset::acceleration::{Acceleration, RefreshMode};
-use crate::component::dataset::TimeFormat;
 use arrow::array::{Float64Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
-use secrets::Secret;
 use snafu::prelude::*;
 use tokio::spawn;
 use tokio::sync::RwLock;
 
 use crate::accelerated_table::refresh::Refresh;
 use crate::accelerated_table::Retention;
-use crate::datafusion::DataFusion;
+use crate::component::dataset::acceleration::Acceleration;
+use crate::component::dataset::TimeFormat;
 use crate::datafusion::Error as DataFusionError;
+use crate::datafusion::{DataFusion, SPICE_RUNTIME_SCHEMA};
 use crate::dataupdate::DataUpdate;
-use crate::internal_table::{
-    create_internal_accelerated_table, create_synced_internal_accelerated_table,
-    Error as InternalTableError,
-};
+use crate::internal_table::{create_internal_accelerated_table, Error as InternalTableError};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -56,25 +51,26 @@ pub enum Error {
 
     #[snafu(display("Error creating metrics table: {source}"))]
     UnableToCreateMetricsTable { source: InternalTableError },
+
+    #[snafu(display("Error registering metrics table: {source}"))]
+    UnableToRegisterToMetricsTable { source: DataFusionError },
 }
 
 pub struct MetricsRecorder {
     socket_addr: Arc<SocketAddr>,
-    metrics_table: Arc<dyn TableProvider>,
 }
 
 impl MetricsRecorder {
-    pub fn metrics_table(&self) -> Arc<dyn TableProvider> {
-        Arc::clone(&self.metrics_table)
+    #[must_use]
+    pub fn new(socket_addr: SocketAddr) -> Self {
+        Self {
+            socket_addr: Arc::new(socket_addr),
+        }
     }
-}
 
-impl MetricsRecorder {
-    pub async fn new(
-        socket_addr: SocketAddr,
-        secret: Option<Secret>,
-        cloud_dataset_path: Option<String>,
-    ) -> Result<Self, Error> {
+    pub async fn register_metrics_table(datafusion: &Arc<RwLock<DataFusion>>) -> Result<(), Error> {
+        let metrics_table_reference = get_metrics_table_reference();
+
         let retention = Retention::new(
             Some("timestamp".to_string()),
             Some(TimeFormat::UnixSeconds),
@@ -83,43 +79,24 @@ impl MetricsRecorder {
             true,
         );
 
-        let metrics_table = match cloud_dataset_path {
-            Some(path) => {
-                let refresh = Refresh {
-                    mode: RefreshMode::Append,
-                    time_column: Some("timestamp".to_string()),
-                    time_format: Some(TimeFormat::UnixSeconds),
-                    check_interval: Some(Duration::from_secs(10)),
-                    period: Some(Duration::from_secs(1800)), // sync only last 30 minutes from cloud
-                    ..Default::default()
-                };
+        let table = create_internal_accelerated_table(
+            // we don't support register with custom schema yet
+            TableReference::bare(metrics_table_reference.table()),
+            get_metrics_schema(),
+            Acceleration::default(),
+            Refresh::default(),
+            retention,
+        )
+        .await
+        .context(UnableToCreateMetricsTableSnafu)?;
 
-                create_synced_internal_accelerated_table(
-                    TableReference::bare("metrics"),
-                    path.as_str(),
-                    secret,
-                    Acceleration::default(),
-                    refresh,
-                    retention,
-                )
-                .await
-                .context(UnableToCreateMetricsTableSnafu)?
-            }
-            None => create_internal_accelerated_table(
-                TableReference::bare("metrics"),
-                get_metrics_schema(),
-                Acceleration::default(),
-                Refresh::default(),
-                retention,
-            )
+        datafusion
+            .write()
             .await
-            .context(UnableToCreateMetricsTableSnafu)?,
-        };
+            .register_runtime_table(metrics_table_reference.table(), table)
+            .context(UnableToRegisterToMetricsTableSnafu)?;
 
-        Ok(Self {
-            socket_addr: Arc::new(socket_addr),
-            metrics_table,
-        })
+        Ok(())
     }
 
     async fn tick(
@@ -176,7 +153,7 @@ impl MetricsRecorder {
         };
 
         let df = datafusion.write().await;
-        df.write_data(TableReference::partial("runtime", "metrics"), data_update)
+        df.write_data(get_metrics_table_reference(), data_update)
             .await
             .context(UnableToWriteToMetricsTableSnafu)?;
 
@@ -200,6 +177,7 @@ impl MetricsRecorder {
     }
 }
 
+#[must_use]
 pub fn get_metrics_schema() -> Arc<Schema> {
     let fields = vec![
         // TODO: Use timestamp
@@ -215,4 +193,9 @@ pub fn get_metrics_schema() -> Arc<Schema> {
     ];
 
     Arc::new(Schema::new(fields))
+}
+
+#[must_use]
+pub fn get_metrics_table_reference() -> TableReference {
+    TableReference::partial(SPICE_RUNTIME_SCHEMA, "metrics")
 }

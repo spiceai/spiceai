@@ -14,19 +14,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::component::dataset::replication::Replication;
 use arrow::datatypes::Schema;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
-use secrets::Secret;
 use snafu::prelude::*;
 
 use crate::accelerated_table::Retention;
-use crate::component::dataset::{acceleration::Acceleration, Dataset, Mode};
-use crate::dataconnector::create_new_connector;
+use crate::component::dataset::acceleration::Acceleration;
+use crate::component::dataset::{Dataset, Mode};
 use crate::{
     accelerated_table::{refresh::Refresh, AcceleratedTable},
     dataaccelerator::{self, create_accelerator_table},
@@ -95,67 +92,6 @@ pub async fn create_internal_accelerated_table(
         create_accelerator_table(name.clone(), Arc::clone(&schema), &acceleration, None)
             .await
             .context(UnableToCreateAcceleratedTableProviderSnafu)?;
-
-    let mut builder = AcceleratedTable::builder(
-        name.clone(),
-        source_table_provider,
-        accelerated_table_provider,
-        refresh,
-    );
-
-    builder.retention(retention);
-
-    let (accelerated_table, _) = builder.build().await;
-
-    Ok(Arc::new(accelerated_table))
-}
-
-async fn get_spiceai_table_provider(
-    name: TableReference,
-    cloud_dataset_path: &str,
-    secret: Option<Secret>,
-) -> Result<Arc<dyn TableProvider>, Error> {
-    // This shouldn't error because we control the name passed in, and it shouldn't contain a catalog.
-    let mut dataset = Dataset::try_new(cloud_dataset_path.to_string(), &name.to_string())
-        .boxed()
-        .context(InternalSnafu {
-            code: "IT-GSTP-DTN".to_string(), // InternalTable - GetSpiceaiTableProvider - DatasetTryNew
-        })?;
-    dataset.mode = Mode::ReadWrite;
-    dataset.replication = Some(Replication { enabled: true });
-
-    let data_connector = create_new_connector("spiceai", secret, Arc::new(HashMap::new()))
-        .await
-        .ok_or_else(|| NoReadWriteProviderSnafu {}.build())?
-        .context(UnableToCreateDataConnectorSnafu)?;
-
-    let source_table_provider = data_connector
-        .read_write_provider(&dataset)
-        .await
-        .ok_or_else(|| NoReadWriteProviderSnafu {}.build())?
-        .context(UnableToCreateSourceTableProviderSnafu)?;
-
-    Ok(source_table_provider)
-}
-
-pub async fn create_synced_internal_accelerated_table(
-    name: TableReference,
-    from: &str,
-    secret: Option<Secret>,
-    acceleration: Acceleration,
-    refresh: Refresh,
-    retention: Option<Retention>,
-) -> Result<Arc<AcceleratedTable>, Error> {
-    let source_table_provider = get_spiceai_table_provider(name.clone(), from, secret).await?;
-
-    let accelerated_table_provider = create_accelerator_table(
-        name.clone(),
-        source_table_provider.schema(),
-        &acceleration,
-        None,
-    )
-    .await
-    .context(UnableToCreateAcceleratedTableProviderSnafu)?;
 
     let mut builder = AcceleratedTable::builder(
         name.clone(),
