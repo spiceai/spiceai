@@ -249,7 +249,7 @@ impl Runtime {
     }
 
     pub async fn start_extensions(&mut self) {
-        let mut extensions: Vec<Box<dyn Extension>> = self.extensions.drain(..).collect();
+        let mut extensions: Vec<Box<dyn Extension>> = std::mem::take(&mut self.extensions);
         for extension in &mut extensions {
             if let Err(err) = extension.on_start(self).await {
                 tracing::warn!("Failed to start extension: {err}");
