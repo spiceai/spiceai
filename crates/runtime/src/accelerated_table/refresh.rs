@@ -4,7 +4,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::TimeFormat;
 use crate::datafusion::filter_converter::TimestampFilterConvert;
-use crate::datafusion::schema;
+use crate::datafusion::{schema, SPICE_RUNTIME_SCHEMA};
 use crate::object_store_registry::default_runtime_env;
 use crate::{
     dataconnector::get_data,
@@ -142,9 +142,15 @@ impl Refresher {
                     {
                         if let Some(start_time) = start_time {
                             if let Ok(elapse) = util::humantime_elapsed(start_time) {
-                                tracing::info!(
-                                    "Loaded 0 rows for dataset {dataset_name} in {elapse}."
-                                );
+                                if dataset_name.schema() != Some(SPICE_RUNTIME_SCHEMA) {
+                                    tracing::info!(
+                                        "Loaded 0 rows for dataset {dataset_name} in {elapse}."
+                                    );
+                                } else {
+                                    tracing::debug!(
+                                        "Loaded 0 rows for dataset {dataset_name} in {elapse}."
+                                    );
+                                }
                             }
                         }
                         self.notify_refresh_done(&mut ready_sender, status::ComponentStatus::Ready);
@@ -183,7 +189,11 @@ impl Refresher {
                                     );
 
                                     if let Ok(elapse) = util::humantime_elapsed(start_time) {
-                                        tracing::info!("Loaded {num_rows} rows ({memory_size}) for dataset {dataset_name} in {elapse}.");
+                                        if dataset_name.schema() != Some(SPICE_RUNTIME_SCHEMA) {
+                                            tracing::info!("Loaded {num_rows} rows ({memory_size}) for dataset {dataset_name} in {elapse}.");
+                                        } else {
+                                            tracing::debug!("Loaded {num_rows} rows ({memory_size}) for dataset {dataset_name} in {elapse}.");
+                                        }
                                     }
 
                                     if let Some(cache_provider) = &self.cache_provider {
@@ -420,7 +430,11 @@ impl Refresher {
         let refresh = self.refresh.read().await;
         let filter_converter = self.get_filter_converter(&refresh);
 
-        tracing::info!("Loading data for dataset {dataset_name}");
+        if dataset_name.schema() != Some(SPICE_RUNTIME_SCHEMA) {
+            tracing::info!("Loading data for dataset {dataset_name}");
+        } else {
+            tracing::debug!("Loading data for dataset {dataset_name}");
+        }
         status::update_dataset(&dataset_name, status::ComponentStatus::Refreshing);
         let refresh = refresh.clone();
         let mut filters = vec![];
