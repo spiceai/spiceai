@@ -48,7 +48,7 @@ pub enum Error {
     #[snafu(display("Spice Cloud api_key not provided"))]
     SpiceApiKeyNotFound {},
 
-    #[snafu(display("Unable to connect to Spiec Cloud: {source}"))]
+    #[snafu(display("Unable to connect to Spice Cloud: {source}"))]
     UnableToConnectToSpiceCloud { source: reqwest::Error },
 }
 
