@@ -35,6 +35,7 @@ use app::App;
 use cache::QueryResultsCacheProvider;
 use component::dataset::{self, Dataset};
 use config::Config;
+use datafusion::SPICE_RUNTIME_SCHEMA;
 use llms::nql::Nql;
 use metrics::SetRecorderError;
 use model::try_to_nql;
@@ -808,7 +809,7 @@ impl Runtime {
                 .await;
 
             if !has_metrics_table {
-                tracing::info!("Registering local metrics table");
+                tracing::debug!("Registering local metrics table");
                 MetricsRecorder::register_metrics_table(&self.df)
                     .await
                     .context(UnableToStartLocalMetricsSnafu)?;
@@ -961,12 +962,16 @@ impl Runtime {
     }
 
     pub async fn init_query_history(&self) -> Result<()> {
+        let query_history_table_reference = TableReference::partial(
+            SPICE_RUNTIME_SCHEMA,
+            query_history::DEFAULT_QUERY_HISTORY_TABLE,
+        );
         match query_history::instantiate_query_history_table().await {
             Ok(table) => self
                 .df
                 .write()
                 .await
-                .register_runtime_table(query_history::DEFAULT_QUERY_HISTORY_TABLE, table)
+                .register_runtime_table(query_history_table_reference, table)
                 .context(UnableToCreateBackendSnafu),
             Err(err) => Err(Error::UnableToTrackQueryHistory { source: err }),
         }
