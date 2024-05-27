@@ -49,6 +49,9 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - ansi_term 0.12.1, MIT 
   <br/>https://github.com/ogham/rust-ansi-term
 
+- anyhow 1.0.86, Apache-2.0 OR MIT 
+  <br/>https://github.com/dtolnay/anyhow
+
 - arrow 51.0.0, Apache-2.0 
   <br/>https://github.com/apache/arrow-rs
 
@@ -106,26 +109,14 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - bigdecimal 0.4.3, Apache-2.0 OR MIT 
   <br/>https://github.com/akubera/bigdecimal-rs
 
+- bollard 0.16.1, Apache-2.0 
+  <br/>https://github.com/fussybeaver/bollard
+
 - byte-unit 5.1.4, MIT 
   <br/>https://github.com/magiclen/byte-unit
 
 - bytes 1.6.0, MIT 
   <br/>https://github.com/tokio-rs/bytes
-
-- candle-core 0.5.0, Apache-2.0 OR MIT 
-  <br/>https://github.com/huggingface/candle
-
-- candle-core 0.5.0, Apache-2.0 OR MIT 
-  <br/>https://github.com/huggingface/candle
-
-- candle-examples 0.5.0, Apache-2.0 OR MIT 
-  <br/>https://github.com/huggingface/candle
-
-- candle-transformers 0.5.0, Apache-2.0 OR MIT 
-  <br/>https://github.com/huggingface/candle
-
-- candle-transformers 0.5.0, Apache-2.0 OR MIT 
-  <br/>https://github.com/huggingface/candle
 
 - chrono 0.4.38, Apache-2.0 OR MIT 
   <br/>https://github.com/chronotope/chrono
@@ -169,6 +160,9 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - futures 0.3.30, Apache-2.0 OR MIT 
   <br/>https://github.com/rust-lang/futures-rs
 
+- humantime 2.1.0, Apache-2.0 OR MIT 
+  <br/>https://github.com/tailhook/humantime
+
 - indexmap 1.9.3, Apache-2.0 OR MIT 
   <br/>https://github.com/bluss/indexmap
 
@@ -176,9 +170,6 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
   <br/>https://github.com/indexmap-rs/indexmap
 
 - itertools 0.10.5, Apache-2.0 OR MIT 
-  <br/>https://github.com/rust-itertools/itertools
-
-- itertools 0.11.0, Apache-2.0 OR MIT 
   <br/>https://github.com/rust-itertools/itertools
 
 - itertools 0.12.1, Apache-2.0 OR MIT 
@@ -198,12 +189,6 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 
 - metrics-util 0.16.3, MIT 
   <br/>https://github.com/metrics-rs/metrics
-
-- mistralrs 0.1.9, MIT 
-  <br/>https://github.com/EricLBuehler/mistral.rs
-
-- mistralrs-core 0.1.9, MIT 
-  <br/>https://github.com/EricLBuehler/mistral.rs
 
 - moka 0.12.7, Apache-2.0 OR MIT 
   <br/>https://github.com/moka-rs/moka
@@ -313,7 +298,7 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 - snowflake-api 0.8.0, Apache-2.0 
   <br/>https://github.com/mycelial/snowflake-rs
 
-- spark-connect-rs 0.0.1-beta.3, Apache-2.0 
+- spark-connect-rs 0.0.1-beta.4, Apache-2.0 
   <br/>https://github.com/sjrusso8/spark-connect-rs
 
 - ssh2 0.9.4, Apache-2.0 OR MIT 
@@ -324,12 +309,6 @@ gopkg.in/yaml.v3, https://github.com/go-yaml/yaml/blob/v3.0.1/LICENSE, MIT
 
 - time 0.3.36, Apache-2.0 OR MIT 
   <br/>https://github.com/time-rs/time
-
-- tokenizers 0.15.2, Apache-2.0 
-  <br/>https://github.com/huggingface/tokenizers
-
-- tokenizers 0.19.1, Apache-2.0 
-  <br/>https://github.com/huggingface/tokenizers
 
 - tokio 1.37.0, MIT 
   <br/>https://github.com/tokio-rs/tokio
