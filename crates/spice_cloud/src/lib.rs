@@ -67,6 +67,7 @@ impl SpiceExtension {
             .params
             .get("control_plane_enabled")
             .unwrap_or(&"false".to_string())
+            .to_lowercase()
             == "true"
     }
 
