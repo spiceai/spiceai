@@ -81,7 +81,7 @@ pub(crate) enum AccelerationRefreshMode {
     Append(Option<Receiver<()>>),
 }
 
-pub(crate) struct Refresher {
+pub struct Refresher {
     dataset_name: TableReference,
     federated: Arc<dyn TableProvider>,
     refresh: Arc<RwLock<Refresh>>,
@@ -422,7 +422,7 @@ impl Refresher {
             .limit(0, Some(1))
     }
 
-    async fn get_full_or_incremental_append_update(
+    pub async fn get_full_or_incremental_append_update(
         &self,
         overwrite_timestamp_in_nano: Option<u128>,
     ) -> super::Result<DataUpdate> {
