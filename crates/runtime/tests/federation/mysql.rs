@@ -132,7 +132,7 @@ async fn mysql_federation_push_down() -> Result<(), String> {
 
     let df = Arc::new(RwLock::new(DataFusion::new()));
 
-    let mut rt = Runtime::new(Some(app), df).await;
+    let mut rt = Runtime::new(Some(app), df, Arc::new(vec![])).await;
 
     // Set a timeout for the test
     tokio::select! {

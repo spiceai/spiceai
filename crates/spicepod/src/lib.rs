@@ -19,13 +19,14 @@ limitations under the License.
 
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
+use std::collections::HashMap;
 use std::{fmt::Debug, path::PathBuf};
 
-use component::dataset::Dataset;
 use component::llms::Llm;
 use component::model::Model;
 use component::runtime::Runtime;
 use component::secrets::Secrets;
+use component::{dataset::Dataset, extension::Extension};
 
 use spec::{SpicepodDefinition, SpicepodVersion};
 
@@ -53,6 +54,8 @@ pub struct Spicepod {
     pub version: SpicepodVersion,
 
     pub name: String,
+
+    pub extensions: HashMap<String, Extension>,
 
     pub secrets: Secrets,
 
@@ -146,6 +149,7 @@ fn from_definition(
     Spicepod {
         name: spicepod_definition.name,
         version: spicepod_definition.version,
+        extensions: spicepod_definition.extensions,
         secrets: spicepod_definition.secrets,
         datasets,
         models,
