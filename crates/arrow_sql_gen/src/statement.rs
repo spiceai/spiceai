@@ -236,6 +236,18 @@ impl InsertBuilder {
                             );
                         }
                     }
+                    DataType::Time64(TimeUnit::Nanosecond) => {
+                        let array = column
+                            .as_any()
+                            .downcast_ref::<array::Time64NanosecondArray>();
+                        if let Some(valid_array) = array {
+                            if valid_array.is_null(row) {
+                                row_values.push(Keyword::Null.into());
+                                continue;
+                            }
+                            row_values.push(valid_array.value(row).into());
+                        }
+                    }
                     DataType::Timestamp(TimeUnit::Second, _) => {
                         let array = column
                             .as_any()
@@ -506,6 +518,7 @@ fn map_data_type_to_column_type(data_type: &DataType) -> ColumnType {
         DataType::Decimal128(p, s) => ColumnType::Decimal(Some((u32::from(*p), *s as u32))),
         DataType::Timestamp(_unit, _time_zone) => ColumnType::Timestamp,
         DataType::Date32 | DataType::Date64 => ColumnType::Date,
+        DataType::Time64(_unit) | DataType::Time32(_unit) => ColumnType::Time,
         DataType::List(list_type) => {
             ColumnType::Array(map_data_type_to_column_type(list_type.data_type()).into())
         }
