@@ -51,26 +51,37 @@ fn dataset_status(df: &DataFusion, ds: &Dataset) -> ComponentStatus {
     }
 }
 
-// Prepare a dataframe for Response (as JSON).
-async fn dataframe_to_response(data_frame: DataFrame) -> Response {
+// Prepare a dataframe for Response (as JSON). Also returns the number of rows in the dataframe.
+async fn dataframe_to_response(data_frame: DataFrame) -> (Response, u64) {
     let results = match data_frame.collect().await {
         Ok(results) => results,
         Err(e) => {
             tracing::debug!("Error collecting results: {e}");
-            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+            return (
+                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+                0,
+            );
         }
     };
+
+    let num_rows = results.iter().map(|r| r.num_rows() as u64).sum::<u64>();
 
     let buf = Vec::new();
     let mut writer = arrow_json::ArrayWriter::new(buf);
 
     if let Err(e) = writer.write_batches(results.iter().collect::<Vec<&RecordBatch>>().as_slice()) {
         tracing::debug!("Error converting results to JSON: {e}");
-        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        return (
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+            0,
+        );
     }
     if let Err(e) = writer.finish() {
         tracing::debug!("Error finishing JSON conversion: {e}");
-        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        return (
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+            0,
+        );
     }
 
     let buf = writer.into_inner();
@@ -78,15 +89,18 @@ async fn dataframe_to_response(data_frame: DataFrame) -> Response {
         Ok(res) => res,
         Err(e) => {
             tracing::debug!("Error converting JSON buffer to string: {e}");
-            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+            return (
+                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+                0,
+            );
         }
     };
 
-    (StatusCode::OK, res).into_response()
+    ((StatusCode::OK, res).into_response(), num_rows)
 }
 
 pub(crate) mod query {
-    use arrow::record_batch::RecordBatch;
+    use arrow::{datatypes::Schema, record_batch::RecordBatch};
     use axum::{
         body::Bytes,
         http::{HeaderMap, StatusCode},
@@ -95,10 +109,10 @@ pub(crate) mod query {
     };
     use datafusion::execution::context::SQLOptions;
     use futures::TryStreamExt;
-    use std::sync::Arc;
+    use std::{sync::Arc, time::SystemTime};
     use tokio::sync::RwLock;
 
-    use crate::datafusion::DataFusion;
+    use crate::{datafusion::DataFusion, query_history::QueryHistory};
 
     pub(crate) async fn post(
         Extension(df): Extension<Arc<RwLock<DataFusion>>>,
@@ -112,6 +126,10 @@ pub(crate) mod query {
             }
         };
 
+        let mut q_trace = QueryHistory::new(Arc::<tokio::sync::RwLock<DataFusion>>::clone(&df))
+            .sql(query.clone())
+            .start_time(SystemTime::now());
+
         let restricted_sql_options = SQLOptions::new()
             .with_allow_ddl(false)
             .with_allow_dml(false)
@@ -124,9 +142,22 @@ pub(crate) mod query {
             .await
         {
             Ok(query_result) => match query_result.data.try_collect::<Vec<RecordBatch>>().await {
-                Ok(batches) => (batches, query_result.from_cache),
+                Ok(batches) => {
+                    q_trace = q_trace
+                        .rows_produced(batches.iter().map(|r| r.num_rows() as u64).sum::<u64>())
+                        .schema(
+                            batches
+                                .first()
+                                .map_or(Arc::new(Schema::empty()), RecordBatch::schema),
+                        );
+
+                    (batches, query_result.from_cache)
+                }
                 Err(e) => {
                     tracing::debug!("Error executing query: {e}");
+                    if let Err(e) = q_trace.write().await {
+                        tracing::trace!("Error writing query history: {e}");
+                    }
                     return (
                         StatusCode::BAD_REQUEST,
                         format!("Error processing batch: {e}"),
@@ -136,9 +167,13 @@ pub(crate) mod query {
             },
             Err(e) => {
                 tracing::debug!("Error executing query: {e}");
+                if let Err(e) = q_trace.write().await {
+                    tracing::trace!("Error writing query history: {e}");
+                }
                 return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
             }
         };
+        q_trace = q_trace.results_cache_hit(is_data_from_cache.unwrap_or(false));
 
         let buf = Vec::new();
         let mut writer = arrow_json::ArrayWriter::new(buf);
@@ -146,10 +181,16 @@ pub(crate) mod query {
         if let Err(e) = writer.write_batches(data.iter().collect::<Vec<&RecordBatch>>().as_slice())
         {
             tracing::debug!("Error converting results to JSON: {e}");
+            if let Err(e) = q_trace.write().await {
+                tracing::trace!("Error writing query history: {e}");
+            }
             return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
         }
         if let Err(e) = writer.finish() {
             tracing::debug!("Error finishing JSON conversion: {e}");
+            if let Err(e) = q_trace.write().await {
+                tracing::trace!("Error writing query history: {e}");
+            }
             return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
         }
 
@@ -158,6 +199,9 @@ pub(crate) mod query {
             Ok(res) => res,
             Err(e) => {
                 tracing::debug!("Error converting JSON buffer to string: {e}");
+                if let Err(e) = q_trace.write().await {
+                    tracing::trace!("Error writing query history: {e}");
+                }
                 return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
             }
         };
@@ -177,7 +221,9 @@ pub(crate) mod query {
             }
             None => {}
         };
-
+        if let Err(e) = q_trace.write().await {
+            tracing::trace!("Error writing query history: {e}");
+        }
         (StatusCode::OK, headers, res).into_response()
     }
 }
@@ -958,10 +1004,13 @@ pub(crate) mod nsql {
         Extension, Json,
     };
     use serde::{Deserialize, Serialize};
-    use std::sync::Arc;
+    use std::{sync::Arc, time::SystemTime};
     use tokio::sync::RwLock;
 
-    use crate::{datafusion::DataFusion, http::v1::dataframe_to_response, LLMModelStore};
+    use crate::{
+        datafusion::DataFusion, http::v1::dataframe_to_response, query_history::QueryHistory,
+        LLMModelStore,
+    };
 
     fn clean_model_based_sql(input: &str) -> String {
         let no_dashes = match input.strip_prefix("--") {
@@ -992,6 +1041,8 @@ pub(crate) mod nsql {
         Extension(nsql_models): Extension<Arc<RwLock<LLMModelStore>>>,
         Json(payload): Json<Request>,
     ) -> Response {
+        let mut q_trace = QueryHistory::new(Arc::<tokio::sync::RwLock<DataFusion>>::clone(&df))
+            .results_cache_hit(false);
         let readable_df = df.read().await;
 
         // Get all public table CREATE TABLE statements to add to prompt.
@@ -1023,6 +1074,8 @@ pub(crate) mod nsql {
             user_query=payload.query,
             table_create_schemas=table_create_stms.join("\n")
         );
+
+        q_trace = q_trace.nsql(nsql_query.clone());
         tracing::trace!("Running prompt: {nsql_query}");
 
         let result = match nsql_models.read().await.get(&payload.model) {
@@ -1037,12 +1090,23 @@ pub(crate) mod nsql {
         };
 
         // Run the SQL from the NSQL model through datafusion.
-        match result {
+        let resp = match result {
             Ok(Some(model_sql_query)) => {
                 let cleaned_query = clean_model_based_sql(&model_sql_query);
                 tracing::trace!("Running query:\n{cleaned_query}");
-                match readable_df.ctx.sql(&cleaned_query).await {
-                    Ok(result) => dataframe_to_response(result).await,
+
+                q_trace = q_trace
+                    .start_time(SystemTime::now())
+                    .sql(cleaned_query.clone());
+                let result = readable_df.ctx.sql(&cleaned_query).await;
+
+                match result {
+                    Ok(result) => {
+                        q_trace = q_trace.schema(Arc::new(result.schema().clone().into()));
+                        let (resp, num_rows) = dataframe_to_response(result).await;
+                        q_trace = q_trace.rows_produced(num_rows).end_time(SystemTime::now());
+                        resp
+                    }
                     Err(e) => {
                         tracing::trace!("Error running query: {e}");
                         (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
@@ -1061,6 +1125,10 @@ pub(crate) mod nsql {
                 tracing::trace!("Error running NSQL model: {e}");
                 (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
             }
+        };
+        if let Err(e) = q_trace.write().await {
+            tracing::trace!("Error writing query history: {e}");
         }
+        resp
     }
 }

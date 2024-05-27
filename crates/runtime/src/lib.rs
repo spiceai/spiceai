@@ -66,6 +66,7 @@ pub mod object_store_registry;
 pub mod objectstore;
 mod opentelemetry;
 pub mod podswatcher;
+pub mod query_history;
 pub mod spice_metrics;
 pub mod status;
 pub mod timing;
@@ -174,6 +175,9 @@ pub enum Error {
 
     #[snafu(display("Unable to start local metrics: {source}"))]
     UnableToStartLocalMetrics { source: spice_metrics::Error },
+
+    #[snafu(display("Unable to track query history: {source}"))]
+    UnableToTrackQueryHistory { source: query_history::Error },
 
     #[snafu(display("Unable to create metrics table: {source}"))]
     UnableToCreateMetricsTable { source: DataFusionError },
@@ -954,6 +958,18 @@ impl Runtime {
             .write()
             .await
             .set_cache_provider(Some(Arc::new(cache_provider)));
+    }
+
+    pub async fn init_query_history(&self) -> Result<()> {
+        match query_history::instantiate_query_history_table().await {
+            Ok(table) => self
+                .df
+                .write()
+                .await
+                .register_runtime_table(query_history::DEFAULT_QUERY_HISTORY_TABLE, table)
+                .context(UnableToCreateBackendSnafu),
+            Err(err) => Err(Error::UnableToTrackQueryHistory { source: err }),
+        }
     }
 }
 
