@@ -223,7 +223,7 @@ impl Runtime {
         for factory in extension_factories.iter() {
             let mut extension = factory.create();
             let extension_name = extension.name();
-            if let Err(err) = rt.initialize_extension(&mut *extension).await {
+            if let Err(err) = extension.initialize(&mut rt).await {
                 tracing::warn!("Failed to initialize extension {extension_name}: {err}");
             } else {
                 extensions.push(extension);
@@ -238,14 +238,6 @@ impl Runtime {
     #[must_use]
     pub fn datafusion(&self) -> Arc<RwLock<DataFusion>> {
         Arc::clone(&self.df)
-    }
-
-    async fn initialize_extension(
-        &mut self,
-        extension: &mut dyn Extension,
-    ) -> extensions::Result<()> {
-        extension.initialize(self).await?;
-        Ok(())
     }
 
     pub async fn start_extensions(&mut self) {
