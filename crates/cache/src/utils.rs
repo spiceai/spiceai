@@ -29,10 +29,12 @@ use async_stream::stream;
 use futures::StreamExt;
 
 #[must_use]
+#[allow(clippy::implicit_hasher)]
 pub fn to_cached_record_batch_stream(
     cache_provider: Arc<QueryResultsCacheProvider>,
     mut stream: SendableRecordBatchStream,
     plan: LogicalPlan,
+    input_tables: HashSet<String>,
 ) -> SendableRecordBatchStream {
     let schema = stream.schema();
     let schema_copy = Arc::clone(&schema);
@@ -57,7 +59,7 @@ pub fn to_cached_record_batch_stream(
             let cached_result = CachedQueryResult {
                 records: Arc::new(records),
                 schema: schema_copy,
-                input_tables: Arc::new(get_logical_plan_input_tables(&plan)),
+                input_tables: Arc::new(input_tables),
             };
 
             if let Err(e) = cache_provider.put(&plan, cached_result).await {
