@@ -13,7 +13,7 @@ use runtime::{
     },
     dataaccelerator::{self, create_accelerator_table},
     dataconnector::{create_new_connector, DataConnectorError},
-    extensions::{Extension, ExtensionFactory, ExtensionManifest, Result},
+    extension::{Extension, ExtensionFactory, ExtensionManifest, Result},
     spice_metrics::get_metrics_table_reference,
     Runtime,
 };
@@ -82,7 +82,7 @@ impl Extension for SpiceExtension {
             let secret = secrets
                 .get_secret("spiceai")
                 .await
-                .map_err(|e| runtime::extensions::Error::UnableToStartExtension { source: e })?;
+                .map_err(|e| runtime::extension::Error::UnableToStartExtension { source: e })?;
 
             let retention = Retention::new(
                 Some("timestamp".to_string()),
@@ -113,7 +113,7 @@ impl Extension for SpiceExtension {
             )
             .await
             .boxed()
-            .map_err(|e| runtime::extensions::Error::UnableToStartExtension { source: e })?;
+            .map_err(|e| runtime::extension::Error::UnableToStartExtension { source: e })?;
 
             runtime
                 .datafusion()
@@ -121,7 +121,7 @@ impl Extension for SpiceExtension {
                 .await
                 .register_runtime_table(metrics_table_reference.table(), table)
                 .boxed()
-                .map_err(|e| runtime::extensions::Error::UnableToStartExtension { source: e })?;
+                .map_err(|e| runtime::extension::Error::UnableToStartExtension { source: e })?;
 
             tracing::info!(
                 "Enabled metrics sync from runtime.metrics to {spiceai_metrics_dataset_path}"

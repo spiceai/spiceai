@@ -27,7 +27,7 @@ use flightrepl::ReplConfig;
 use runtime::config::Config as RuntimeConfig;
 
 use runtime::podswatcher::PodsWatcher;
-use runtime::{extensions::ExtensionFactory, Runtime};
+use runtime::{extension::ExtensionFactory, Runtime};
 use snafu::prelude::*;
 use spice_cloud::SpiceExtensionFactory;
 use tokio::sync::RwLock;

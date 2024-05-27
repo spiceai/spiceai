@@ -48,7 +48,7 @@ use tokio::sync::oneshot::error::RecvError;
 use tokio::time::sleep;
 use tokio::{signal, sync::RwLock};
 
-use crate::extensions::{Extension, ExtensionFactory};
+use crate::extension::{Extension, ExtensionFactory};
 pub mod accelerated_table;
 pub mod component;
 pub mod config;
@@ -57,7 +57,7 @@ pub mod dataconnector;
 pub mod datafusion;
 pub mod dataupdate;
 pub mod execution_plan;
-pub mod extensions;
+pub mod extension;
 mod flight;
 mod http;
 pub mod internal_table;
