@@ -46,13 +46,13 @@ impl DataConnectorFactory for MotherDuck {
         params: Arc<HashMap<String, String>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let motherduck_token = get_param(&params, &secret, "motherduck_token").ok_or(
-                DataConnectorError::InvalidConfiguration {
+            let motherduck_token =
+                get_secret_or_param(&params, &secret, "motherduck_token", "motherduck_token_key")
+                    .ok_or(DataConnectorError::InvalidConfiguration {
                     dataconnector: "motherduck".to_string(),
                     message: "Missing required parameter motherduck_token.".to_string(),
                     source: "Missing motherduck_token".into(),
-                },
-            )?;
+                })?;
 
             let conn_params = format!("md:?motherduck_token={motherduck_token}&saas_mode=true");
 
@@ -90,17 +90,4 @@ impl DataConnector for MotherDuck {
                 })?,
         )
     }
-}
-
-fn get_param(
-    params: &Arc<HashMap<String, String>>,
-    secret: &Option<Secret>,
-    param_name: &str,
-) -> Option<String> {
-    return get_secret_or_param(
-        params.as_ref(),
-        secret,
-        &format!("{param_name}_key"),
-        param_name,
-    );
 }
