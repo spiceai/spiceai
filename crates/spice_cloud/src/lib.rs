@@ -145,7 +145,7 @@ impl SpiceExtension {
         let metrics_table_reference = get_metrics_table_reference();
 
         let table = create_synced_internal_accelerated_table(
-            metrics_table_reference.table(),
+            metrics_table_reference.clone(),
             from.as_str(),
             Some(secret),
             Acceleration::default(),
@@ -160,7 +160,7 @@ impl SpiceExtension {
             .datafusion()
             .write()
             .await
-            .register_runtime_table(metrics_table_reference.table(), table)
+            .register_runtime_table(metrics_table_reference, table)
             .boxed()
             .map_err(|e| runtime::extension::Error::UnableToStartExtension { source: e })?;
 
@@ -276,17 +276,18 @@ async fn get_spiceai_table_provider(
 ///
 /// This function will return an error if the accelerated table provider cannot be created
 pub async fn create_synced_internal_accelerated_table(
-    name: &str,
+    table_reference: TableReference,
     from: &str,
     secret: Option<Secret>,
     acceleration: Acceleration,
     refresh: Refresh,
     retention: Option<Retention>,
 ) -> Result<Arc<AcceleratedTable>, Error> {
-    let source_table_provider = get_spiceai_table_provider(name, from, secret).await?;
+    let source_table_provider =
+        get_spiceai_table_provider(table_reference.table(), from, secret).await?;
 
     let accelerated_table_provider = create_accelerator_table(
-        TableReference::bare(name),
+        table_reference.clone(),
         source_table_provider.schema(),
         &acceleration,
         None,
@@ -295,7 +296,7 @@ pub async fn create_synced_internal_accelerated_table(
     .context(UnableToCreateAcceleratedTableProviderSnafu)?;
 
     let mut builder = AcceleratedTable::builder(
-        TableReference::bare(name),
+        table_reference.clone(),
         source_table_provider,
         accelerated_table_provider,
         refresh,
