@@ -105,19 +105,18 @@ impl Display for LlmPrefix {
 pub enum LlmParams {
     HuggingfaceParams {
         model_type: Option<Architecture>,
-        weights: Option<String>,
-        tokenizer: Option<String>,
-        chat_template: Option<String>,
+        weights_path: Option<String>,
+        tokenizer_path: Option<String>,
+        tokenizer_config_path: Option<String>,
     },
 
     SpiceAiParams {
-        chat_template: Option<String>,
     },
 
     LocalModelParams {
-        weights: String,
-        tokenizer: String,
-        chat_template: String,
+        weights_path: String,
+        tokenizer_path: String,
+        tokenizer_config_path: String,
     },
     OpenAiParams {
         api_base: Option<String>,

@@ -72,24 +72,24 @@ pub fn try_to_nql(component: &spicepod::component::llms::Llm) -> Result<Box<dyn 
             model_id, api_base, api_key, org_id, project_id,
         )),
         Ok(LlmParams::LocalModelParams {
-            weights,
-            tokenizer,
-            chat_template,
-        }) => llms::nql::create_local_model(&weights, &tokenizer, &chat_template),
+            weights_path,
+            tokenizer_path,
+            tokenizer_config_path,
+        }) => llms::nql::create_local_model(&weights_path, &tokenizer_path, &tokenizer_config_path),
         Ok(LlmParams::HuggingfaceParams {
             model_type,
-            weights,
-            tokenizer,
-            chat_template,
+            weights_path,
+            tokenizer_path,
+            tokenizer_config_path,
         }) => {
             match component.get_model_id() {
                 Some(id) => {
                     llms::nql::create_hf_model(
                         &id,
                         model_type.map(|x| x.to_string()),
-                        &weights,
-                        &tokenizer,
-                        &chat_template, // TODO handle inline chat templates
+                        &weights_path,
+                        &tokenizer_path,
+                        &tokenizer_config_path, // TODO handle inline chat templates
                     )
                 }
                 None => Err(LlmError::FailedToLoadModel {
@@ -130,38 +130,38 @@ fn construct_llm_params(
             };
             Ok(LlmParams::HuggingfaceParams {
                 model_type: arch,
-                weights: params.get("weights_path").cloned(),
-                tokenizer: params.get("tokenizer_path").cloned(),
-                chat_template: params.get("system_prompt").cloned(),
+                weights_path: params.get("weights_path").cloned(),
+                tokenizer_path: params.get("tokenizer_path").cloned(),
+                tokenizer_config_path: params.get("tokenizer_config_path").cloned(),
             })
         }
         LlmPrefix::File => {
-            let weights = params
+            let weights_path = params
                 .get("weights_path")
                 .ok_or(LlmError::FailedToLoadModel {
                     source: "No 'weights_path' parameter provided".into(),
                 })?
                 .clone();
-            let tokenizer = params
+            let tokenizer_path = params
                 .get("tokenizer_path")
                 .ok_or(LlmError::FailedToLoadTokenizer {
                     source: "No 'tokenizer_path' parameter provided".into(),
                 })?
                 .clone();
-            let chat_template = params
-                .get("system_prompt")
+            let tokenizer_config_path = params
+                .get("tokenizer_config_path")
                 .ok_or(LlmError::FailedToLoadTokenizer {
-                    source: "No 'system_prompt' parameter provided".into(),
+                    source: "No 'tokenizer_config_path' parameter provided".into(),
                 })?
                 .clone();
             Ok(LlmParams::LocalModelParams {
-                weights,
-                tokenizer,
-                chat_template,
+                weights_path,
+                tokenizer_path,
+                tokenizer_config_path,
             })
         }
+
         LlmPrefix::SpiceAi => Ok(LlmParams::SpiceAiParams {
-            chat_template: params.get("system_prompt").cloned(),
         }),
 
         LlmPrefix::OpenAi => Ok(LlmParams::OpenAiParams {

@@ -106,7 +106,7 @@ pub fn create_hf_model(
     model_type: Option<String>,
     model_weights: &Option<String>,
     _tokenizer: &Option<String>,
-    _template_filename: &Option<String>,
+    _tokenizer_config: &Option<String>,
 ) -> Result<Box<dyn Nql>> {
     if model_type.is_none() && model_weights.is_none() {
         return Err(Error::FailedToLoadModel {
@@ -122,7 +122,7 @@ pub fn create_hf_model(
             // TODO: Support HF models with non-standard paths.
             // model_weights,
             // tokenizer,
-            // template_filename,
+            // tokenizer_config,
         )
         .map(|x| Box::new(x) as Box<dyn Nql>)
     }
@@ -138,11 +138,11 @@ pub fn create_hf_model(
 pub fn create_local_model(
     model_weights: &str,
     tokenizer: &str,
-    template_filename: &str,
+    tokenizer_config: &str,
 ) -> Result<Box<dyn Nql>> {
     let w = Path::new(&model_weights);
     let t = Path::new(&tokenizer);
-    let tf = Path::new(&template_filename);
+    let tc = Path::new(&tokenizer_config);
 
     if !w.exists() {
         return Err(Error::LocalModelNotFound {
@@ -158,7 +158,7 @@ pub fn create_local_model(
 
     #[cfg(feature = "mistralrs")]
     {
-        mistral::MistralLlama::from(t, w, tf).map(|x| Box::new(x) as Box<dyn Nql>)
+        mistral::MistralLlama::from(t, w, tc).map(|x| Box::new(x) as Box<dyn Nql>)
     }
     #[cfg(not(feature = "mistralrs"))]
     {
