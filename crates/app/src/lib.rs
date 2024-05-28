@@ -25,7 +25,7 @@ use spicepod::{
         extension::Extension,
         llms::Llm,
         model::Model,
-        runtime::Runtime,
+        runtime::{ResultsCache, Runtime},
         secrets::{Secrets, SpiceSecretStore},
     },
     Spicepod,
@@ -124,6 +124,12 @@ impl AppBuilder {
     #[must_use]
     pub fn with_llm(mut self, llm: Llm) -> AppBuilder {
         self.llms.push(llm);
+        self
+    }
+
+    #[must_use]
+    pub fn with_results_cache(mut self, results_cache: ResultsCache) -> AppBuilder {
+        self.runtime.results_cache = results_cache;
         self
     }
 

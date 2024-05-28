@@ -28,7 +28,10 @@ use crate::get_dependent_table_names;
 use crate::object_store_registry::default_runtime_env;
 use arrow::datatypes::Schema;
 use arrow_tools::schema::verify_schema;
-use cache::{to_cached_record_batch_stream, QueryResult, QueryResultsCacheProvider};
+use cache::{
+    get_logical_plan_input_tables, to_cached_record_batch_stream, QueryResult,
+    QueryResultsCacheProvider,
+};
 use datafusion::catalog::schema::SchemaProvider;
 use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider};
 use datafusion::datasource::{TableProvider, ViewTable};
@@ -283,22 +286,28 @@ impl DataFusion {
             .await
             .context(UnableToExecuteQuerySnafu)?;
 
-        if let Some(cache_provider) = &self.cache_provider {
-            if let Some(cached_result) = cache_provider
-                .get(&plan)
-                .await
-                .context(FailedToAccessCacheSnafu)?
-            {
-                let record_batch_stream = Box::pin(
-                    MemoryStream::try_new(
-                        cached_result.records.to_vec(),
-                        cached_result.schema,
-                        None,
-                    )
-                    .context(UnableToCreateMemoryStreamSnafu)?,
-                );
+        let query_input_tables = get_logical_plan_input_tables(&plan);
+        let cache_enabled_for_query = !(query_input_tables.is_empty()
+            || query_input_tables.contains("information_schema.tables"));
 
-                return Ok(QueryResult::new(record_batch_stream, Some(true)));
+        if cache_enabled_for_query {
+            if let Some(cache_provider) = &self.cache_provider {
+                if let Some(cached_result) = cache_provider
+                    .get(&plan)
+                    .await
+                    .context(FailedToAccessCacheSnafu)?
+                {
+                    let record_batch_stream = Box::pin(
+                        MemoryStream::try_new(
+                            cached_result.records.to_vec(),
+                            cached_result.schema,
+                            None,
+                        )
+                        .context(UnableToCreateMemoryStreamSnafu)?,
+                    );
+
+                    return Ok(QueryResult::new(record_batch_stream, Some(true)));
+                }
             }
         }
 
@@ -327,11 +336,17 @@ impl DataFusion {
 
         verify_schema(df_schema.fields(), res_schema.fields()).context(SchemaMismatchSnafu)?;
 
-        if let Some(cache_provider) = &self.cache_provider {
-            let record_batch_stream =
-                to_cached_record_batch_stream(Arc::clone(cache_provider), res_stream, plan_copy);
+        if cache_enabled_for_query {
+            if let Some(cache_provider) = &self.cache_provider {
+                let record_batch_stream = to_cached_record_batch_stream(
+                    Arc::clone(cache_provider),
+                    res_stream,
+                    plan_copy,
+                    query_input_tables,
+                );
 
-            return Ok(QueryResult::new(record_batch_stream, Some(false)));
+                return Ok(QueryResult::new(record_batch_stream, Some(false)));
+            }
         }
 
         Ok(QueryResult::new(res_stream, None))
@@ -354,17 +369,15 @@ impl DataFusion {
 
     pub fn register_runtime_table(
         &mut self,
-        table_name: &str,
+        table_name: TableReference,
         table: Arc<dyn datafusion::datasource::TableProvider>,
     ) -> Result<()> {
         if let Some(runtime_schema) = self.runtime_schema() {
             runtime_schema
-                .register_table(table_name.to_string(), table)
+                .register_table(table_name.table().to_string(), table)
                 .context(UnableToRegisterTableToDataFusionSchemaSnafu { schema: "runtime" })?;
 
-            let table_reference = TableReference::partial(SPICE_RUNTIME_SCHEMA, table_name);
-
-            self.data_writers.insert(table_reference);
+            self.data_writers.insert(table_name);
         }
 
         Ok(())

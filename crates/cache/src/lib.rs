@@ -37,6 +37,7 @@ use spicepod::component::runtime::ResultsCache;
 mod lru_cache;
 mod utils;
 
+pub use utils::get_logical_plan_input_tables;
 pub use utils::to_cached_record_batch_stream;
 
 #[derive(Debug, Snafu)]

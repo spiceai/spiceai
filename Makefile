@@ -70,7 +70,7 @@ dep-licenses:
 .PHONY: display-deps
 display-deps:
 	@cargo install cargo-license --quiet
-	@cargo license -d  --tsv --direct-deps-only | grep -v "github.com/spiceai"
+	@cargo license -d  --tsv --direct-deps-only --all-features | grep -v "github.com/spiceai"
 
 
 ################################################################################
