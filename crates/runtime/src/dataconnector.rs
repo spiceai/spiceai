@@ -58,6 +58,7 @@ pub mod duckdb;
 pub mod flightsql;
 #[cfg(feature = "ftp")]
 pub mod ftp;
+pub mod graphql;
 pub mod localhost;
 #[cfg(feature = "mysql")]
 pub mod mysql;
@@ -241,6 +242,7 @@ pub async fn register_all() {
     register_connector_factory("duckdb", duckdb::DuckDB::create).await;
     #[cfg(feature = "clickhouse")]
     register_connector_factory("clickhouse", clickhouse::Clickhouse::create).await;
+    register_connector_factory("graphql", graphql::GraphQL::create).await;
     #[cfg(feature = "odbc")]
     register_connector_factory("odbc", odbc::ODBC::create).await;
     #[cfg(feature = "spark")]
