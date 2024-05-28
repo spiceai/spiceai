@@ -10,8 +10,7 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 
 ## [v0.14-alpha (May 2024)](https://github.com/spiceai/spiceai/milestone/22)
 
-- Query result caching
-- Query history
+- Query history (Arrow Flight)
 - Accelerated table indexes
 - MotherDuck data connector (alpha)
 - Generic Object-Store connector (alpha)
@@ -19,14 +18,13 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 
 ## [v0.15-alpha (June 2024)](https://github.com/spiceai/spiceai/milestone/28)
 
-- NSQL API
-- Catalog Providers
-  - Unity Catalog catalog provider (alpha)
-- Dataset management improvements
+- CDC replication refresh mode
 
 ## v0.16-beta (June 2024)
 
-- CDC replication refresh mode
+- Catalog Providers
+  - Unity Catalog catalog provider (alpha)
+- Dataset management improvements
 - Bugfixes and performance improvements
 
 ## v1.0-stable (Sep 2024)
