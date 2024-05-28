@@ -51,26 +51,28 @@ impl DataConnectorFactory for DuckDB {
         params: Arc<HashMap<String, String>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            // data connector requires valid "open" parameter
-            let db_path: String =
-                params
-                    .get("open")
-                    .cloned()
-                    .ok_or(DataConnectorError::InvalidConfiguration {
-                        dataconnector: "duckdb".to_string(),
-                        message: "Missing required open parameter.".to_string(),
-                        source: "Missing open".into(),
-                    })?;
-
             // TODO: wire to dataset.mode once readwrite implemented for duckdb
-            let pool = Arc::new(
-                DuckDbConnectionPool::new_file(&db_path, &AccessMode::ReadOnly).map_err(|e| {
-                    DataConnectorError::UnableToConnectInternal {
-                        dataconnector: "duckdb".to_string(),
-                        source: e,
-                    }
-                })?,
-            );
+            let pool = match params.get("open") {
+                Some(open) => {
+                    let db_path = open.clone();
+                    Arc::new(
+                        DuckDbConnectionPool::new_file(&db_path, &AccessMode::ReadWrite).map_err(
+                            |e| DataConnectorError::UnableToConnectInternal {
+                                dataconnector: "duckdb".to_string(),
+                                source: e,
+                            },
+                        )?,
+                    )
+                }
+                None => Arc::new(
+                    DuckDbConnectionPool::new_memory(&AccessMode::ReadWrite).map_err(|e| {
+                        DataConnectorError::UnableToConnectInternal {
+                            dataconnector: "duckdb".to_string(),
+                            source: e,
+                        }
+                    })?,
+                ),
+            };
 
             let duckdb_factory = DuckDBTableFactory::new(pool);
 
