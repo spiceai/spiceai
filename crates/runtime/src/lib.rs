@@ -232,7 +232,6 @@ impl Runtime {
                 tracing::warn!("Failed to initialize extension {extension_name}: {err}");
             } else {
                 extensions.push(extension);
-                tracing::info!("Loaded extension {extension_name}");
             };
         }
 

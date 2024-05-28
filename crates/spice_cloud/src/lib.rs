@@ -65,7 +65,7 @@ impl SpiceExtension {
     fn spice_http_url(&self) -> String {
         self.manifest
             .params
-            .get("api_url")
+            .get("endpoint")
             .unwrap_or(&"https://data.spiceai.io".to_string())
             .to_string()
     }
@@ -176,8 +176,6 @@ impl Extension for SpiceExtension {
             return Ok(());
         }
 
-        tracing::info!("Initializing Spice.ai Cloud Extension");
-
         Ok(())
     }
 
@@ -185,8 +183,6 @@ impl Extension for SpiceExtension {
         if !self.manifest.enabled {
             return Ok(());
         }
-
-        tracing::info!("Starting Spice.ai Cloud Extension");
 
         let secret = self
             .get_spice_secret(runtime)
