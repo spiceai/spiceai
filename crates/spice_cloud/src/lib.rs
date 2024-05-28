@@ -62,15 +62,6 @@ impl SpiceExtension {
         SpiceExtension { manifest }
     }
 
-    fn control_plane_enabled(&self) -> bool {
-        self.manifest
-            .params
-            .get("control_plane_enabled")
-            .unwrap_or(&"false".to_string())
-            .to_lowercase()
-            == "true"
-    }
-
     fn spice_http_url(&self) -> String {
         self.manifest
             .params
@@ -203,23 +194,21 @@ impl Extension for SpiceExtension {
             .boxed()
             .map_err(|e| runtime::extension::Error::UnableToStartExtension { source: e })?;
 
-        if self.control_plane_enabled() {
-            let connection = self
-                .connect(runtime)
-                .await
-                .boxed()
-                .map_err(|e| runtime::extension::Error::UnableToStartExtension { source: e })?;
+        let connection = self
+            .connect(runtime)
+            .await
+            .boxed()
+            .map_err(|e| runtime::extension::Error::UnableToStartExtension { source: e })?;
 
-            let spiceai_metrics_dataset_path = format!(
-                "spice.ai/{}/{}/{}",
-                connection.org_name, connection.app_name, connection.metrics_dataset_name
-            );
+        let spiceai_metrics_dataset_path = format!(
+            "spice.ai/{}/{}/{}",
+            connection.org_name, connection.app_name, connection.metrics_dataset_name
+        );
 
-            let from = spiceai_metrics_dataset_path.to_string();
-            self.register_runtime_metrics_table(runtime, from.clone(), secret)
-                .await?;
-            tracing::info!("Enabled metrics sync from runtime.metrics to {from}",);
-        }
+        let from = spiceai_metrics_dataset_path.to_string();
+        self.register_runtime_metrics_table(runtime, from.clone(), secret)
+            .await?;
+        tracing::info!("Enabled metrics sync from runtime.metrics to {from}",);
 
         Ok(())
     }
