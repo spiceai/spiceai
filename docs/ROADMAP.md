@@ -15,7 +15,6 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 - MotherDuck data connector (alpha)
 - Generic Object-Store connector (alpha)
 - S3 data connector Iceberg support
-- NSQL API
 
 ## [v0.15-alpha (June 2024)](https://github.com/spiceai/spiceai/milestone/28)
 
