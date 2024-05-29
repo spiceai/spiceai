@@ -14,17 +14,22 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::component::dataset::Dataset;
+use std::sync::Arc;
+
+use crate::{component::dataset::Dataset, query_context::QueryContext};
 use arrow::array::RecordBatch;
 use axum::{
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
 use csv::Writer;
-use datafusion::dataframe::DataFrame;
+use datafusion::execution::context::SQLOptions;
 use serde::{Deserialize, Serialize};
+use tokio::sync::RwLock;
 
 use crate::{datafusion::DataFusion, status::ComponentStatus};
+
+use futures::TryStreamExt;
 
 #[derive(Default, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -51,37 +56,51 @@ fn dataset_status(df: &DataFusion, ds: &Dataset) -> ComponentStatus {
     }
 }
 
-// Prepare a dataframe for Response (as JSON). Also returns the number of rows in the dataframe.
-async fn dataframe_to_response(data_frame: DataFrame) -> (Response, u64) {
-    let results = match data_frame.collect().await {
-        Ok(results) => results,
+// Runs query and converts query results to HTTP response (as JSON).
+pub async fn sql_to_http_response(
+    df: Arc<RwLock<DataFusion>>,
+    sql: &str,
+    restricted_sql_options: Option<SQLOptions>,
+    nql: Option<&str>,
+) -> Response {
+    let mut ctx = QueryContext::new(Arc::clone(&df)).sql(sql.to_string());
+
+    if let Some(nsql) = nql {
+        ctx = ctx.nsql(nsql.to_string());
+    }
+
+    let (data, is_data_from_cache) = match df
+        .read()
+        .await
+        .query_with_cache(sql, restricted_sql_options, ctx)
+        .await
+    {
+        Ok(query_result) => match query_result.data.try_collect::<Vec<RecordBatch>>().await {
+            Ok(batches) => (batches, query_result.from_cache),
+            Err(e) => {
+                tracing::debug!("Error executing query: {e}");
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("Error processing batch: {e}"),
+                )
+                    .into_response();
+            }
+        },
         Err(e) => {
-            tracing::debug!("Error collecting results: {e}");
-            return (
-                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-                0,
-            );
+            tracing::debug!("Error executing query: {e}");
+            return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
         }
     };
-
-    let num_rows = results.iter().map(|r| r.num_rows() as u64).sum::<u64>();
-
     let buf = Vec::new();
     let mut writer = arrow_json::ArrayWriter::new(buf);
 
-    if let Err(e) = writer.write_batches(results.iter().collect::<Vec<&RecordBatch>>().as_slice()) {
+    if let Err(e) = writer.write_batches(data.iter().collect::<Vec<&RecordBatch>>().as_slice()) {
         tracing::debug!("Error converting results to JSON: {e}");
-        return (
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-            0,
-        );
+        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
     if let Err(e) = writer.finish() {
         tracing::debug!("Error finishing JSON conversion: {e}");
-        return (
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-            0,
-        );
+        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
 
     let buf = writer.into_inner();
@@ -89,30 +108,43 @@ async fn dataframe_to_response(data_frame: DataFrame) -> (Response, u64) {
         Ok(res) => res,
         Err(e) => {
             tracing::debug!("Error converting JSON buffer to string: {e}");
-            return (
-                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-                0,
-            );
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
         }
     };
 
-    ((StatusCode::OK, res).into_response(), num_rows)
+    let mut headers = HeaderMap::new();
+
+    match is_data_from_cache {
+        Some(true) => {
+            if let Ok(value) = "Hit from spiceai".parse() {
+                headers.insert("X-Cache", value);
+            }
+        }
+        Some(false) => {
+            if let Ok(value) = "Miss from spiceai".parse() {
+                headers.insert("X-Cache", value);
+            }
+        }
+        None => {}
+    };
+    (StatusCode::OK, headers, res).into_response()
 }
 
 pub(crate) mod query {
-    use arrow::{datatypes::Schema, record_batch::RecordBatch};
+    use std::sync::Arc;
+
     use axum::{
         body::Bytes,
-        http::{HeaderMap, StatusCode},
+        http::StatusCode,
         response::{IntoResponse, Response},
         Extension,
     };
     use datafusion::execution::context::SQLOptions;
-    use futures::TryStreamExt;
-    use std::{sync::Arc, time::SystemTime};
     use tokio::sync::RwLock;
 
-    use crate::{datafusion::DataFusion, query_history::QueryHistory};
+    use crate::datafusion::DataFusion;
+
+    use super::sql_to_http_response;
 
     pub(crate) async fn post(
         Extension(df): Extension<Arc<RwLock<DataFusion>>>,
@@ -126,105 +158,12 @@ pub(crate) mod query {
             }
         };
 
-        let mut q_trace = QueryHistory::new(Arc::<tokio::sync::RwLock<DataFusion>>::clone(&df))
-            .sql(query.clone())
-            .start_time(SystemTime::now());
-
         let restricted_sql_options = SQLOptions::new()
             .with_allow_ddl(false)
             .with_allow_dml(false)
             .with_allow_statements(false);
 
-        let (data, is_data_from_cache) = match df
-            .read()
-            .await
-            .query_with_cache(&query, Some(restricted_sql_options))
-            .await
-        {
-            Ok(query_result) => match query_result.data.try_collect::<Vec<RecordBatch>>().await {
-                Ok(batches) => {
-                    q_trace = q_trace
-                        .rows_produced(batches.iter().map(|r| r.num_rows() as u64).sum::<u64>())
-                        .schema(
-                            batches
-                                .first()
-                                .map_or(Arc::new(Schema::empty()), RecordBatch::schema),
-                        );
-
-                    (batches, query_result.from_cache)
-                }
-                Err(e) => {
-                    tracing::debug!("Error executing query: {e}");
-                    if let Err(e) = q_trace.write().await {
-                        tracing::trace!("Error writing query history: {e}");
-                    }
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        format!("Error processing batch: {e}"),
-                    )
-                        .into_response();
-                }
-            },
-            Err(e) => {
-                tracing::debug!("Error executing query: {e}");
-                if let Err(e) = q_trace.write().await {
-                    tracing::trace!("Error writing query history: {e}");
-                }
-                return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
-            }
-        };
-        q_trace = q_trace.results_cache_hit(is_data_from_cache.unwrap_or(false));
-
-        let buf = Vec::new();
-        let mut writer = arrow_json::ArrayWriter::new(buf);
-
-        if let Err(e) = writer.write_batches(data.iter().collect::<Vec<&RecordBatch>>().as_slice())
-        {
-            tracing::debug!("Error converting results to JSON: {e}");
-            if let Err(e) = q_trace.write().await {
-                tracing::trace!("Error writing query history: {e}");
-            }
-            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-        }
-        if let Err(e) = writer.finish() {
-            tracing::debug!("Error finishing JSON conversion: {e}");
-            if let Err(e) = q_trace.write().await {
-                tracing::trace!("Error writing query history: {e}");
-            }
-            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-        }
-
-        let buf = writer.into_inner();
-        let res = match String::from_utf8(buf) {
-            Ok(res) => res,
-            Err(e) => {
-                tracing::debug!("Error converting JSON buffer to string: {e}");
-                if let Err(e) = q_trace.write().await {
-                    tracing::trace!("Error writing query history: {e}");
-                }
-                return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-            }
-        };
-
-        let mut headers = HeaderMap::new();
-
-        match is_data_from_cache {
-            Some(true) => {
-                if let Ok(value) = "Hit from spiceai".parse() {
-                    headers.insert("X-Cache", value);
-                }
-            }
-            Some(false) => {
-                if let Ok(value) = "Miss from spiceai".parse() {
-                    headers.insert("X-Cache", value);
-                }
-            }
-            None => {}
-        };
-        if let Err(e) = q_trace.write().await {
-            tracing::trace!("Error writing query history: {e}");
-        }
-        (StatusCode::OK, headers, res).into_response()
+        sql_to_http_response(df, &query, Some(restricted_sql_options), None).await
     }
 }
 
@@ -1003,14 +942,12 @@ pub(crate) mod nsql {
         response::{IntoResponse, Response},
         Extension, Json,
     };
+    use datafusion::execution::context::SQLOptions;
     use serde::{Deserialize, Serialize};
-    use std::{sync::Arc, time::SystemTime};
+    use std::sync::Arc;
     use tokio::sync::RwLock;
 
-    use crate::{
-        datafusion::DataFusion, http::v1::dataframe_to_response, query_history::QueryHistory,
-        LLMModelStore,
-    };
+    use crate::{datafusion::DataFusion, http::v1::sql_to_http_response, LLMModelStore};
 
     fn clean_model_based_sql(input: &str) -> String {
         let no_dashes = match input.strip_prefix("--") {
@@ -1041,8 +978,8 @@ pub(crate) mod nsql {
         Extension(nsql_models): Extension<Arc<RwLock<LLMModelStore>>>,
         Json(payload): Json<Request>,
     ) -> Response {
-        let mut q_trace = QueryHistory::new(Arc::<tokio::sync::RwLock<DataFusion>>::clone(&df))
-            .results_cache_hit(false);
+        let df_copy = Arc::clone(&df);
+
         let readable_df = df.read().await;
 
         // Get all public table CREATE TABLE statements to add to prompt.
@@ -1075,7 +1012,8 @@ pub(crate) mod nsql {
             table_create_schemas=table_create_stms.join("\n")
         );
 
-        q_trace = q_trace.nsql(nsql_query.clone());
+        let nsql_query_copy = nsql_query.clone();
+
         tracing::trace!("Running prompt: {nsql_query}");
 
         let result = match nsql_models.read().await.get(&payload.model) {
@@ -1089,29 +1027,24 @@ pub(crate) mod nsql {
             }
         };
 
+        let restricted_sql_options = SQLOptions::new()
+            .with_allow_ddl(false)
+            .with_allow_dml(false)
+            .with_allow_statements(false);
+
         // Run the SQL from the NSQL model through datafusion.
-        let resp = match result {
+        match result {
             Ok(Some(model_sql_query)) => {
                 let cleaned_query = clean_model_based_sql(&model_sql_query);
                 tracing::trace!("Running query:\n{cleaned_query}");
 
-                q_trace = q_trace
-                    .start_time(SystemTime::now())
-                    .sql(cleaned_query.clone());
-                let result = readable_df.ctx.sql(&cleaned_query).await;
-
-                match result {
-                    Ok(result) => {
-                        q_trace = q_trace.schema(Arc::new(result.schema().clone().into()));
-                        let (resp, num_rows) = dataframe_to_response(result).await;
-                        q_trace = q_trace.rows_produced(num_rows).end_time(SystemTime::now());
-                        resp
-                    }
-                    Err(e) => {
-                        tracing::trace!("Error running query: {e}");
-                        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
-                    }
-                }
+                sql_to_http_response(
+                    df_copy,
+                    &cleaned_query,
+                    Some(restricted_sql_options),
+                    Some(&nsql_query_copy),
+                )
+                .await
             }
             Ok(None) => {
                 tracing::trace!("No query produced from NSQL model");
@@ -1125,10 +1058,6 @@ pub(crate) mod nsql {
                 tracing::trace!("Error running NSQL model: {e}");
                 (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
             }
-        };
-        if let Err(e) = q_trace.write().await {
-            tracing::trace!("Error writing query history: {e}");
         }
-        resp
     }
 }

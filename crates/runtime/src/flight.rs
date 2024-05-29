@@ -17,6 +17,7 @@ limitations under the License.
 use crate::datafusion::DataFusion;
 use crate::dataupdate::DataUpdate;
 use crate::measure_scope_ms;
+use crate::query_context::QueryContext;
 use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
 use arrow::ipc::writer::{DictionaryTracker, IpcDataGenerator};
@@ -175,7 +176,7 @@ impl Service {
     }
 
     async fn sql_to_flight_stream(
-        datafusion: Arc<RwLock<DataFusion>>,
+        df: Arc<RwLock<DataFusion>>,
         sql: String,
     ) -> Result<BoxStream<'static, Result<FlightData, Status>>, Status> {
         let restricted_sql_options = SQLOptions::new()
@@ -183,10 +184,12 @@ impl Service {
             .with_allow_dml(false)
             .with_allow_statements(false);
 
-        let batches_stream = datafusion
+        let ctx = QueryContext::new(Arc::clone(&df)).sql(sql.clone());
+
+        let batches_stream = df
             .read()
             .await
-            .query_with_cache(&sql, Some(restricted_sql_options))
+            .query_with_cache(&sql, Some(restricted_sql_options), ctx)
             .await
             .map_err(to_tonic_err)?;
 

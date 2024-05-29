@@ -26,6 +26,8 @@ use crate::dataconnector::{DataConnector, DataConnectorError};
 use crate::dataupdate::{DataUpdate, DataUpdateExecutionPlan, UpdateType};
 use crate::get_dependent_table_names;
 use crate::object_store_registry::default_runtime_env;
+use crate::query_context::{attach_query_context_to_stream, QueryContext};
+
 use arrow::datatypes::Schema;
 use arrow_tools::schema::verify_schema;
 use cache::{
@@ -270,6 +272,7 @@ impl DataFusion {
         &self,
         sql: &str,
         restricted_sql_options: Option<SQLOptions>,
+        ctx: QueryContext,
     ) -> Result<QueryResult> {
         let session = self.ctx.state();
         let plan = session
@@ -297,7 +300,13 @@ impl DataFusion {
                         .context(UnableToCreateMemoryStreamSnafu)?,
                     );
 
-                    return Ok(QueryResult::new(record_batch_stream, Some(true)));
+                    return Ok(QueryResult::new(
+                        attach_query_context_to_stream(
+                            ctx.results_cache_hit(true),
+                            record_batch_stream,
+                        ),
+                        Some(true),
+                    ));
                 }
             }
         }
@@ -336,11 +345,20 @@ impl DataFusion {
                     query_input_tables,
                 );
 
-                return Ok(QueryResult::new(record_batch_stream, Some(false)));
+                return Ok(QueryResult::new(
+                    attach_query_context_to_stream(
+                        ctx.results_cache_hit(false),
+                        record_batch_stream,
+                    ),
+                    Some(false),
+                ));
             }
         }
 
-        Ok(QueryResult::new(res_stream, None))
+        Ok(QueryResult::new(
+            attach_query_context_to_stream(ctx, res_stream),
+            None,
+        ))
     }
 
     pub async fn has_table(&self, table_reference: &TableReference) -> bool {

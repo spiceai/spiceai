@@ -67,6 +67,7 @@ pub mod object_store_registry;
 pub mod objectstore;
 mod opentelemetry;
 pub mod podswatcher;
+pub mod query_context;
 pub mod query_history;
 pub mod spice_metrics;
 pub mod status;
