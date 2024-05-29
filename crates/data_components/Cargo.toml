@@ -50,6 +50,8 @@ snowflake-api ={ workspace = true, optional = true }
 uuid.workspace = true
 datafusion-federation = { workspace = true }
 datafusion-federation-sql = { workspace = true }
+object_store = { workspace = true }
+regex = "1.10.4"
 
 [features]
 duckdb = ["dep:duckdb", "dep:r2d2"]
