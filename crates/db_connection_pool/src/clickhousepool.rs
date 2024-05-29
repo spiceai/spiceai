@@ -138,9 +138,7 @@ async fn get_config_from_params(
             )?;
             let password =
                 get_secret_or_param(params, secret, "clickhouse_pass_key", "clickhouse_pass")
-                    .ok_or(Error::MissingRequiredParameterForConnection {
-                        parameter_name: "clickhouse_pass".to_string(),
-                    })?;
+                    .unwrap_or_default();
             let host = params.get("clickhouse_host").ok_or(
                 Error::MissingRequiredParameterForConnection {
                     parameter_name: "clickhouse_tcp_host".to_string(),

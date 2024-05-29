@@ -18,9 +18,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use arrow::array::{Float64Array, Int64Array, StringArray};
+use arrow::array::{Float64Array, StringArray, TimestampNanosecondArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use chrono::Utc;
 use datafusion::sql::TableReference;
 use snafu::prelude::*;
 use tokio::spawn;
@@ -123,7 +124,12 @@ impl MetricsRecorder {
                 prometheus_parse::Value::Summary(v) => v.into_iter().map(|v| v.count).sum(),
             };
 
-            timestamps.push(sample.timestamp.timestamp());
+            let timestamp = sample.timestamp.with_timezone(&Utc);
+            if let Some(timestamp_nano) = timestamp.timestamp_nanos_opt() {
+                timestamps.push(timestamp_nano);
+            } else {
+                timestamps.push(timestamp.timestamp_micros() * 1000);
+            }
             metrics.push(sample.metric);
             values.push(value);
             labels.push(sample.labels.to_string());
@@ -135,7 +141,9 @@ impl MetricsRecorder {
             data: vec![RecordBatch::try_new(
                 Arc::clone(&schema),
                 vec![
-                    Arc::new(Int64Array::from(timestamps)),
+                    Arc::new(
+                        TimestampNanosecondArray::from(timestamps).with_timezone(Arc::from("UTC")),
+                    ),
                     Arc::new(StringArray::from(metrics)),
                     Arc::new(Float64Array::from(values)),
                     Arc::new(StringArray::from(labels)),
@@ -171,13 +179,14 @@ impl MetricsRecorder {
 #[must_use]
 pub fn get_metrics_schema() -> Arc<Schema> {
     let fields = vec![
-        // TODO: Use timestamp
-        // Field::new(
-        //     "timestamp",
-        //     DataType::Timestamp(TimeUnit::Second, None),
-        //     false,
-        // ),
-        Field::new("timestamp", DataType::Int64, false),
+        Field::new(
+            "timestamp",
+            DataType::Timestamp(
+                arrow::datatypes::TimeUnit::Nanosecond,
+                Some(Arc::from("UTC")),
+            ),
+            false,
+        ),
         Field::new("name", DataType::Utf8, false),
         Field::new("value", DataType::Float64, false),
         Field::new("labels", DataType::Utf8, false),
