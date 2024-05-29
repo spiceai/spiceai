@@ -17,7 +17,7 @@ limitations under the License.
 use crate::component::dataset::Dataset;
 use async_trait::async_trait;
 use data_components::duckdb::DuckDBTableFactory;
-use data_components::Read;
+use data_components::{Read, ReadWrite};
 use datafusion::datasource::TableProvider;
 use db_connection_pool::duckdbpool::DuckDbConnectionPool;
 use duckdb::AccessMode;
@@ -51,6 +51,22 @@ impl DataConnectorFactory for DuckDB {
         params: Arc<HashMap<String, String>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
+            let mut from_duckdb_function = false;
+            if let Some(from_duckdb_function_str) = params.get("from_duckdb_function") {
+                match from_duckdb_function_str.to_lowercase().as_str() {
+                    "true" => from_duckdb_function = true,
+                    "false" => from_duckdb_function = false,
+                    invalid_value => {
+                        return Err(DataConnectorError::InvalidConfiguration {
+                            dataconnector: "duckdb".to_string(),
+                            message: format!("Invalid value for parameter from_duckdb_function {invalid_value}, use either true or false"),
+                            source: "".into(),
+                        }
+                        .into());
+                    }
+                }
+            }
+
             // TODO: wire to dataset.mode once readwrite implemented for duckdb
             let pool = match params.get("open") {
                 Some(open) => {
@@ -74,7 +90,7 @@ impl DataConnectorFactory for DuckDB {
                 ),
             };
 
-            let duckdb_factory = DuckDBTableFactory::new(pool);
+            let duckdb_factory = DuckDBTableFactory::new(pool, from_duckdb_function);
 
             Ok(Arc::new(Self { duckdb_factory }) as Arc<dyn DataConnector>)
         })
@@ -98,5 +114,19 @@ impl DataConnector for DuckDB {
                     dataconnector: "duckdb",
                 })?,
         )
+    }
+
+    async fn read_write_provider(
+        &self,
+        dataset: &Dataset,
+    ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
+        let read_write_result =
+            ReadWrite::table_provider(&self.duckdb_factory, dataset.path().into())
+                .await
+                .context(super::UnableToGetReadWriteProviderSnafu {
+                    dataconnector: "duckdb",
+                });
+
+        Some(read_write_result)
     }
 }

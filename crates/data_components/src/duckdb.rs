@@ -323,16 +323,41 @@ impl DuckDB {
 
         Ok(())
     }
+
+    pub fn create_view(
+        &self,
+        duckdb_conn: &mut DuckDbConnection,
+        table_reference: &TableReference,
+    ) -> Result<()> {
+        let create_view_stmt = format!(
+            r#"CREATE VIEW IF NOT EXISTS {} AS SELECT * FROM {}"#,
+            table_reference.to_quoted_string(),
+            self.table_name,
+        );
+
+        let tx = duckdb_conn
+            .conn
+            .transaction()
+            .context(UnableToBeginTransactionSnafu)?;
+
+        tx.execute(&create_view_stmt, [])
+            .context(UnableToCreateDuckDBTableSnafu)?;
+
+        tx.commit().context(UnableToCommitDuckDBTransactionSnafu)?;
+
+        Ok(())
+    }
 }
 
 pub struct DuckDBTableFactory {
     pool: Arc<DuckDbConnectionPool>,
+    create_view: bool,
 }
 
 impl DuckDBTableFactory {
     #[must_use]
-    pub fn new(pool: Arc<DuckDbConnectionPool>) -> Self {
-        Self { pool }
+    pub fn new(pool: Arc<DuckDbConnectionPool>, create_view: bool) -> Self {
+        Self { pool, create_view }
     }
 }
 
@@ -374,6 +399,12 @@ impl ReadWrite for DuckDBTableFactory {
             Arc::clone(&read_provider).schema(),
             Arc::clone(&self.pool),
         );
+
+        if self.create_view {
+            let mut db_conn = self.pool.connect().await?;
+            let duckdb_conn = DuckDB::duckdb_conn(&mut db_conn)?;
+            DuckDB::create_view(&duckdb, duckdb_conn, &table_reference)?;
+        }
 
         Ok(DuckDBTableWriter::create(read_provider, duckdb))
     }

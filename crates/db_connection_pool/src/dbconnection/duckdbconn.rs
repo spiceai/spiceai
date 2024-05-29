@@ -66,14 +66,24 @@ impl SyncDbConnection<r2d2::PooledConnection<DuckdbConnectionManager>, &dyn ToSq
     }
 
     fn get_schema(&self, table_reference: &TableReference) -> Result<SchemaRef, super::Error> {
-        let mut stmt = self
+        let mut stmt = match self
             .conn
             .prepare(&format!(
                 "SELECT * FROM {} LIMIT 0",
                 table_reference.to_quoted_string()
             ))
             .boxed()
-            .context(super::UnableToGetSchemaSnafu)?;
+        {
+            Ok(stmt) => stmt,
+            Err(e) => match self
+                .conn
+                .prepare(&format!("SELECT * FROM {table_reference} LIMIT 0"))
+                .boxed()
+            {
+                Ok(stmt) => stmt,
+                Err(_) => return Err(super::Error::UnableToGetSchema { source: e }),
+            },
+        };
 
         let result: duckdb::Arrow<'_> = stmt
             .query_arrow([])
