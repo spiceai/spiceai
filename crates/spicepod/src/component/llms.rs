@@ -110,8 +110,7 @@ pub enum LlmParams {
         tokenizer_config_path: Option<String>,
     },
 
-    SpiceAiParams {
-    },
+    SpiceAiParams {},
 
     LocalModelParams {
         weights_path: String,

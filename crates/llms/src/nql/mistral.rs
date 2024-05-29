@@ -223,7 +223,6 @@ impl MistralLlama {
     }
 
     fn to_request(&self, prompt: String) -> MistralRsquest {
-        // MistralRsquest::max_tokens
         MistralRsquest::Normal(NormalRequest {
             messages: RequestMessage::Completion {
                 text: prompt,

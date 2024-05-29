@@ -190,19 +190,6 @@ impl Extension for SpiceExtension {
             .boxed()
             .map_err(|e| runtime::extension::Error::UnableToStartExtension { source: e })?;
 
-        runtime
-                .datafusion()
-                .write()
-                .await
-                .register_runtime_table(metrics_table_reference, table)
-                .boxed()
-                .map_err(|e| runtime::extension::Error::UnableToStartExtension { source: e })?;
-
-            tracing::info!(
-                "Enabled metrics sync from runtime.metrics to {spiceai_metrics_dataset_path}"
-            );
-        }
-
         let connection = self
             .connect(runtime)
             .await

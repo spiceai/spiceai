@@ -161,8 +161,7 @@ fn construct_llm_params(
             })
         }
 
-        LlmPrefix::SpiceAi => Ok(LlmParams::SpiceAiParams {
-        }),
+        LlmPrefix::SpiceAi => Ok(LlmParams::SpiceAiParams {}),
 
         LlmPrefix::OpenAi => Ok(LlmParams::OpenAiParams {
             api_base: params.get("endpoint").cloned(),
