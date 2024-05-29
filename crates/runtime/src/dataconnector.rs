@@ -350,11 +350,11 @@ pub trait ListingTableConnector: DataConnector {
 
         // TODO: For some reason, this `store` is not working. It's not setting `bucket_endpoint`.
         // Need this, store-specific, prefix parsing
-        let (_store, prefix) = object_store::parse_url(&store_url.clone()).boxed().context(
-            UnableToConnectInternalSnafu {
+        let (_store, prefix) = object_store::parse_url(&store_url.clone())
+            .boxed()
+            .context(UnableToConnectInternalSnafu {
                 dataconnector: "ListingTableConnector",
-            },
-        )?;
+            })?;
         let (_, extension) = self.get_file_format_and_extension(dataset)?;
 
         let (prefix_str, filename_regex) = if let Some(_ext) = prefix.extension() {
@@ -494,19 +494,10 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
         &self,
         dataset: &Dataset,
     ) -> Option<AnyErrorResult<Arc<dyn TableProvider>>> {
-        if let Some(true) = self
-            .get_params()
-            .get("metadata")
-            .map(|s| s.to_lowercase() == "true")
-        {
-            // Only create a TableProvider for metadata if the user-provided parameters specify `metadata=true`.
-            Some(
-                self.construct_metadata_provider(dataset)
-                    .map_err(Into::into),
-            )
-        } else {
-            None
-        }
+        Some(
+            self.construct_metadata_provider(dataset)
+                .map_err(Into::into),
+        )
     }
 
     async fn read_provider(

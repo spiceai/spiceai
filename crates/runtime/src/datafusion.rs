@@ -729,6 +729,11 @@ impl DataFusion {
         dataset: &Dataset,
         source: Arc<dyn DataConnector>,
     ) -> Result<()> {
+        // If the dataset does not have metadata, don't create metadata
+        if !dataset.has_metadata_table {
+            return Ok(());
+        }
+
         let tbl_ref = TableReference::partial(SPICE_METADATA_SCHEMA, dataset.name.to_string());
         match source.metadata_provider(dataset).await {
             Some(Ok(table)) => {
