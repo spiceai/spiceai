@@ -409,13 +409,12 @@ impl DataFusion {
                         "Registering dataset {dataset:?} with preloaded accelerated table"
                     );
 
-                    return self.register_table_in_context(
-                        dataset,
-                        Arc::new(accelerated_table),
-                        false,
-                    );
-                }
+                    self.ctx
+                        .register_table(dataset.name.clone(), Arc::new(accelerated_table))
+                        .context(UnableToRegisterTableToDataFusionSnafu)?;
 
+                    return Ok(());
+                }
                 self.register_accelerated_table(dataset, source, acceleration_secret)
                     .await?;
             }
@@ -430,25 +429,6 @@ impl DataFusion {
                 .insert(dataset.name.clone());
         }
 
-        Ok(())
-    }
-
-    fn register_table_in_context(
-        &self,
-        dataset: &Dataset,
-        provider: Arc<dyn TableProvider>,
-        check_existing: bool,
-    ) -> Result<(), Error> {
-        if check_existing {
-            let table_exists = self.ctx.table_exist(dataset.name.clone()).unwrap_or(false);
-            if table_exists {
-                return TableAlreadyExistsSnafu.fail();
-            }
-        }
-
-        self.ctx
-            .register_table(dataset.name.clone(), provider)
-            .context(UnableToRegisterTableToDataFusionSnafu)?;
         Ok(())
     }
 
@@ -720,6 +700,7 @@ impl DataFusion {
         Ok(())
     }
 
+    /// Federated tables are attached directly as tables visible in the public `DataFusion` context.
     async fn register_federated_table(
         &self,
         dataset: &Dataset,
