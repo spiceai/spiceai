@@ -27,7 +27,6 @@ use arrow::{
 };
 use datafusion::sql::TableReference;
 use snafu::{ResultExt, Snafu};
-use tokio::sync::RwLock;
 
 use crate::{
     accelerated_table::{refresh::Refresh, AcceleratedTable, Retention},
@@ -130,12 +129,12 @@ pub struct QueryHistory {
     results_cache_hit: Option<bool>,
 
     // The datafusion instance and the internal table to route data to.
-    df: Arc<RwLock<DataFusion>>,
+    df: Arc<DataFusion>,
     to_table: Option<String>,
 }
 
 impl QueryHistory {
-    pub fn new(df: Arc<RwLock<DataFusion>>) -> Self {
+    pub fn new(df: Arc<DataFusion>) -> Self {
         Self {
             query_id: None,
             schema: None,
@@ -303,8 +302,6 @@ impl QueryHistory {
         };
 
         self.df
-            .write()
-            .await
             .write_data(TableReference::partial("runtime", table), data_update)
             .await
             .boxed()

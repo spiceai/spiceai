@@ -48,10 +48,10 @@ pub(crate) async fn handle(
             .await
         }
         Command::CommandGetCatalogs(command) => {
-            flightsql::get_catalogs::do_get(flight_svc, command).await
+            flightsql::get_catalogs::do_get(flight_svc, command)
         }
         Command::CommandGetDbSchemas(command) => {
-            flightsql::get_schemas::do_get(flight_svc, command).await
+            flightsql::get_schemas::do_get(flight_svc, command)
         }
         Command::CommandGetTables(command) => {
             flightsql::get_tables::do_get(flight_svc, command).await

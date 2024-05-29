@@ -110,14 +110,10 @@ pub(crate) mod query {
     use datafusion::execution::context::SQLOptions;
     use futures::TryStreamExt;
     use std::{sync::Arc, time::SystemTime};
-    use tokio::sync::RwLock;
 
     use crate::{datafusion::DataFusion, query_history::QueryHistory};
 
-    pub(crate) async fn post(
-        Extension(df): Extension<Arc<RwLock<DataFusion>>>,
-        body: Bytes,
-    ) -> Response {
+    pub(crate) async fn post(Extension(df): Extension<Arc<DataFusion>>, body: Bytes) -> Response {
         let query = match String::from_utf8(body.to_vec()) {
             Ok(query) => query,
             Err(e) => {
@@ -126,7 +122,7 @@ pub(crate) mod query {
             }
         };
 
-        let mut q_trace = QueryHistory::new(Arc::<tokio::sync::RwLock<DataFusion>>::clone(&df))
+        let mut q_trace = QueryHistory::new(Arc::clone(&df))
             .sql(query.clone())
             .start_time(SystemTime::now());
 
@@ -136,8 +132,6 @@ pub(crate) mod query {
             .with_allow_statements(false);
 
         let (data, is_data_from_cache) = match df
-            .read()
-            .await
             .query_with_cache(&query, Some(restricted_sql_options))
             .await
         {
@@ -443,7 +437,7 @@ pub(crate) mod datasets {
 
     pub(crate) async fn get(
         Extension(app): Extension<Arc<RwLock<Option<App>>>>,
-        Extension(df): Extension<Arc<RwLock<DataFusion>>>,
+        Extension(df): Extension<Arc<DataFusion>>,
         Query(filter): Query<DatasetFilter>,
         Query(params): Query<DatasetQueryParams>,
     ) -> Response {
@@ -469,8 +463,6 @@ pub(crate) mod datasets {
             datasets.retain(|d| !d.is_view());
         }
 
-        let df_read = df.read().await;
-
         let resp = datasets
             .iter()
             .map(|d| DatasetResponseItem {
@@ -479,7 +471,7 @@ pub(crate) mod datasets {
                 replication_enabled: d.replication.as_ref().is_some_and(|f| f.enabled),
                 acceleration_enabled: d.acceleration.as_ref().is_some_and(|f| f.enabled),
                 status: if params.status {
-                    Some(dataset_status(&df_read, d))
+                    Some(dataset_status(&df, d))
                 } else {
                     None
                 },
@@ -511,7 +503,7 @@ pub(crate) mod datasets {
 
     pub(crate) async fn refresh(
         Extension(app): Extension<Arc<RwLock<Option<App>>>>,
-        Extension(df): Extension<Arc<RwLock<DataFusion>>>,
+        Extension(df): Extension<Arc<DataFusion>>,
         Path(dataset_name): Path<String>,
     ) -> Response {
         let app_lock = app.read().await;
@@ -545,9 +537,7 @@ pub(crate) mod datasets {
                 .into_response();
         };
 
-        let df_read = df.read().await;
-
-        match df_read.refresh_table(&dataset.name).await {
+        match df.refresh_table(&dataset.name).await {
             Ok(()) => (
                 status::StatusCode::CREATED,
                 Json(MessageResponse {
@@ -567,7 +557,7 @@ pub(crate) mod datasets {
 
     pub(crate) async fn acceleration(
         Extension(app): Extension<Arc<RwLock<Option<App>>>>,
-        Extension(df): Extension<Arc<RwLock<DataFusion>>>,
+        Extension(df): Extension<Arc<DataFusion>>,
         Path(dataset_name): Path<String>,
         Json(payload): Json<AccelerationRequest>,
     ) -> Response {
@@ -594,9 +584,7 @@ pub(crate) mod datasets {
             return (status::StatusCode::OK).into_response();
         }
 
-        let df_read = df.read().await;
-
-        match df_read
+        match df
             .update_refresh_sql(
                 TableReference::parse_str(&dataset.name),
                 payload.refresh_sql,
@@ -837,7 +825,7 @@ pub(crate) mod inference {
 
     pub(crate) async fn get(
         Extension(app): Extension<Arc<RwLock<Option<App>>>>,
-        Extension(df): Extension<Arc<RwLock<DataFusion>>>,
+        Extension(df): Extension<Arc<DataFusion>>,
         Path(model_name): Path<String>,
         Extension(models): Extension<Arc<RwLock<HashMap<String, Model>>>>,
     ) -> Response {
@@ -860,7 +848,7 @@ pub(crate) mod inference {
 
     pub(crate) async fn post(
         Extension(app): Extension<Arc<RwLock<Option<App>>>>,
-        Extension(df): Extension<Arc<RwLock<DataFusion>>>,
+        Extension(df): Extension<Arc<DataFusion>>,
         Extension(models): Extension<Arc<RwLock<HashMap<String, Model>>>>,
         Json(payload): Json<BatchPredictRequest>,
     ) -> Response {
@@ -894,7 +882,7 @@ pub(crate) mod inference {
 
     async fn run_inference(
         app: Arc<RwLock<Option<App>>>,
-        df: Arc<RwLock<DataFusion>>,
+        df: Arc<DataFusion>,
         models: Arc<RwLock<HashMap<String, Model>>>,
         model_name: String,
     ) -> PredictResponse {
@@ -1037,16 +1025,14 @@ pub(crate) mod nsql {
     }
 
     pub(crate) async fn post(
-        Extension(df): Extension<Arc<RwLock<DataFusion>>>,
+        Extension(df): Extension<Arc<DataFusion>>,
         Extension(nsql_models): Extension<Arc<RwLock<LLMModelStore>>>,
         Json(payload): Json<Request>,
     ) -> Response {
-        let mut q_trace = QueryHistory::new(Arc::<tokio::sync::RwLock<DataFusion>>::clone(&df))
-            .results_cache_hit(false);
-        let readable_df = df.read().await;
+        let mut q_trace = QueryHistory::new(Arc::clone(&df)).results_cache_hit(false);
 
         // Get all public table CREATE TABLE statements to add to prompt.
-        let tables = match readable_df.get_public_table_names() {
+        let tables = match df.get_public_table_names() {
             Ok(t) => t,
             Err(e) => {
                 tracing::error!("Error getting tables: {e}");
@@ -1056,7 +1042,7 @@ pub(crate) mod nsql {
 
         let mut table_create_stms: Vec<String> = Vec::with_capacity(tables.len());
         for t in &tables {
-            match readable_df.get_arrow_schema(t).await {
+            match df.get_arrow_schema(t).await {
                 Ok(schm) => {
                     let c = CreateTableBuilder::new(Arc::new(schm), format!("public.{t}").as_str());
                     table_create_stms.push(c.build_postgres());
@@ -1098,7 +1084,7 @@ pub(crate) mod nsql {
                 q_trace = q_trace
                     .start_time(SystemTime::now())
                     .sql(cleaned_query.clone());
-                let result = readable_df.ctx.sql(&cleaned_query).await;
+                let result = df.ctx.sql(&cleaned_query).await;
 
                 match result {
                     Ok(result) => {

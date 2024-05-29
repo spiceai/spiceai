@@ -25,9 +25,8 @@ use app::AppBuilder;
 use arrow_sql_gen::statement::{CreateTableBuilder, InsertBuilder};
 use bollard::secret::HealthConfig;
 use mysql_async::{prelude::Queryable, Params, Row};
-use runtime::{datafusion::DataFusion, Runtime};
+use runtime::Runtime;
 use spicepod::component::{dataset::Dataset, params::Params as DatasetParams};
-use tokio::sync::RwLock;
 use tracing::instrument;
 
 fn make_mysql_dataset(path: &str, name: &str) -> Dataset {
@@ -130,9 +129,7 @@ async fn mysql_federation_push_down() -> Result<(), String> {
         .with_dataset(make_mysql_dataset("lineitem", "line"))
         .build();
 
-    let df = Arc::new(RwLock::new(DataFusion::new()));
-
-    let mut rt = Runtime::new(Some(app), df, Arc::new(vec![])).await;
+    let mut rt = Runtime::new(Some(app), Arc::new(vec![])).await;
 
     // Set a timeout for the test
     tokio::select! {

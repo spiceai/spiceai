@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::borrow::Borrow;
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use crate::accelerated_table::{refresh::Refresh, AcceleratedTable, Retention};
@@ -178,6 +178,9 @@ pub enum Error {
 
     #[snafu(display("Unable to convert cached result to a record batch stream: {source}"))]
     UnableToCreateMemoryStream { source: DataFusionError },
+
+    #[snafu(display("Unable to get the lock of data writers"))]
+    UnableToLockDataWriters {},
 }
 
 pub enum Table {
@@ -192,18 +195,23 @@ pub enum Table {
 
 pub struct DataFusion {
     pub ctx: Arc<SessionContext>,
-    data_writers: HashSet<TableReference>,
+    data_writers: RwLock<HashSet<TableReference>>,
     cache_provider: Option<Arc<QueryResultsCacheProvider>>,
 }
 
 impl DataFusion {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::new_with_cache_provider(None)
+    }
+
     /// Create a new `DataFusion` instance.
     ///
     /// # Panics
     ///
     /// Panics if the default schema cannot be registered.
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new_with_cache_provider(cache_provider: Option<Arc<QueryResultsCacheProvider>>) -> Self {
         let mut df_config = SessionConfig::new()
             .with_information_schema(true)
             .with_create_default_catalog_and_schema(false)
@@ -251,8 +259,8 @@ impl DataFusion {
 
         DataFusion {
             ctx: Arc::new(ctx),
-            data_writers: HashSet::new(),
-            cache_provider: None,
+            data_writers: RwLock::new(HashSet::new()),
+            cache_provider,
         }
     }
 
@@ -272,10 +280,6 @@ impl DataFusion {
         }
 
         None
-    }
-
-    pub fn set_cache_provider(&mut self, cache_provider: Option<Arc<QueryResultsCacheProvider>>) {
-        self.cache_provider = cache_provider;
     }
 
     pub async fn query_with_cache(
@@ -378,7 +382,7 @@ impl DataFusion {
     }
 
     pub fn register_runtime_table(
-        &mut self,
+        &self,
         table_name: TableReference,
         table: Arc<dyn datafusion::datasource::TableProvider>,
     ) -> Result<()> {
@@ -387,17 +391,16 @@ impl DataFusion {
                 .register_table(table_name.table().to_string(), table)
                 .context(UnableToRegisterTableToDataFusionSchemaSnafu { schema: "runtime" })?;
 
-            self.data_writers.insert(table_name);
+            self.data_writers
+                .write()
+                .map_err(|_| Error::UnableToLockDataWriters {})?
+                .insert(table_name);
         }
 
         Ok(())
     }
 
-    pub async fn register_table(
-        &mut self,
-        dataset: impl Borrow<Dataset>,
-        table: Table,
-    ) -> Result<()> {
+    pub async fn register_table(&self, dataset: impl Borrow<Dataset>, table: Table) -> Result<()> {
         let dataset = dataset.borrow();
 
         schema::ensure_schema_exists(&self.ctx, SPICE_DEFAULT_CATALOG, &dataset.name)?;
@@ -412,6 +415,7 @@ impl DataFusion {
                     tracing::debug!(
                         "Registering dataset {dataset:?} with preloaded accelerated table"
                     );
+
                     self.ctx
                         .register_table(dataset.name.clone(), Arc::new(accelerated_table))
                         .context(UnableToRegisterTableToDataFusionSnafu)?;
@@ -426,7 +430,10 @@ impl DataFusion {
         }
 
         if matches!(dataset.mode(), Mode::ReadWrite) {
-            self.data_writers.insert(dataset.name.clone());
+            self.data_writers
+                .write()
+                .map_err(|_| Error::UnableToLockDataWriters {})?
+                .insert(dataset.name.clone());
         }
 
         Ok(())
@@ -434,7 +441,11 @@ impl DataFusion {
 
     #[must_use]
     pub fn is_writable(&self, table_reference: &TableReference) -> bool {
-        self.data_writers.iter().any(|s| s == table_reference)
+        if let Ok(writers) = self.data_writers.read() {
+            writers.iter().any(|s| s == table_reference)
+        } else {
+            false
+        }
     }
 
     async fn get_table_provider(
@@ -527,7 +538,7 @@ impl DataFusion {
         self.ctx.table_exist(dataset_name).unwrap_or(false)
     }
 
-    pub fn remove_table(&mut self, dataset_name: &TableReference) -> Result<()> {
+    pub fn remove_table(&self, dataset_name: &TableReference) -> Result<()> {
         if !self.ctx.table_exist(dataset_name.clone()).unwrap_or(false) {
             return Ok(());
         }
@@ -540,7 +551,10 @@ impl DataFusion {
         }
 
         if self.is_writable(dataset_name) {
-            self.data_writers.remove(dataset_name);
+            self.data_writers
+                .write()
+                .map_err(|_| Error::UnableToLockDataWriters {})?
+                .remove(dataset_name);
         }
 
         Ok(())
@@ -623,7 +637,7 @@ impl DataFusion {
     }
 
     async fn register_accelerated_table(
-        &mut self,
+        &self,
         dataset: &Dataset,
         source: Arc<dyn DataConnector>,
         acceleration_secret: Option<Secret>,

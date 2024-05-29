@@ -46,7 +46,7 @@ pub(crate) fn get_flight_info(
     Response::new(info)
 }
 
-pub(crate) async fn do_get(
+pub(crate) fn do_get(
     flight_svc: &Service,
     query: sql::CommandGetDbSchemas,
 ) -> Result<Response<<Service as FlightService>::DoGetStream>, Status> {
@@ -55,20 +55,14 @@ pub(crate) async fn do_get(
     tracing::trace!("do_get: {query:?}");
     let filtered_catalogs = match catalog {
         Some(catalog) => vec![catalog.to_string()],
-        None => flight_svc.datafusion.read().await.ctx.catalog_names(),
+        None => flight_svc.datafusion.ctx.catalog_names(),
     };
     let mut builder = query.into_builder();
 
     for catalog in filtered_catalogs {
-        let catalog_provider = flight_svc
-            .datafusion
-            .read()
-            .await
-            .ctx
-            .catalog(&catalog)
-            .ok_or_else(|| {
-                Status::internal(format!("unable to get catalog provider for {catalog}"))
-            })?;
+        let catalog_provider = flight_svc.datafusion.ctx.catalog(&catalog).ok_or_else(|| {
+            Status::internal(format!("unable to get catalog provider for {catalog}"))
+        })?;
         for schema in catalog_provider.schema_names() {
             builder.append(&catalog, schema);
         }
