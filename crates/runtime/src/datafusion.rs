@@ -393,16 +393,29 @@ impl DataFusion {
                     tracing::debug!(
                         "Registering dataset {dataset:?} with preloaded accelerated table"
                     );
-                    self.ctx
-                        .register_table(dataset.name.clone(), Arc::new(accelerated_table))
-                        .context(UnableToRegisterTableToDataFusionSnafu)?;
 
-                    return Ok(());
+                    return self.register_table_in_context(
+                        dataset,
+                        Arc::new(accelerated_table),
+                        false,
+                    );
                 }
-                self.register_accelerated_table(dataset, source, acceleration_secret)
+
+                let (accelerated_table, _) = self
+                    .create_accelerated_table(dataset, source, acceleration_secret)
                     .await?;
+
+                self.register_table_in_context(dataset, Arc::new(accelerated_table), true)?;
             }
-            Table::Federated(source) => self.register_federated_table(dataset, source).await?,
+            Table::Federated(source) => {
+                tracing::debug!("Registering federated table {dataset:?}");
+
+                self.register_table_in_context(
+                    dataset,
+                    create_federated_table(dataset, source).await?,
+                    true,
+                )?;
+            }
             Table::View(sql) => self.register_view(dataset.name.clone(), sql)?,
         }
 
@@ -410,6 +423,25 @@ impl DataFusion {
             self.data_writers.insert(dataset.name.clone());
         }
 
+        Ok(())
+    }
+
+    fn register_table_in_context(
+        &mut self,
+        dataset: &Dataset,
+        provider: Arc<dyn TableProvider>,
+        check_existing: bool,
+    ) -> Result<(), Error> {
+        if check_existing {
+            let table_exists = self.ctx.table_exist(dataset.name.clone()).unwrap_or(false);
+            if table_exists {
+                return TableAlreadyExistsSnafu.fail();
+            }
+        }
+
+        self.ctx
+            .register_table(dataset.name.clone(), provider)
+            .context(UnableToRegisterTableToDataFusionSnafu)?;
         Ok(())
     }
 
@@ -603,23 +635,6 @@ impl DataFusion {
         Ok(accelerated_table_builder.build().await)
     }
 
-    async fn register_accelerated_table(
-        &mut self,
-        dataset: &Dataset,
-        source: Arc<dyn DataConnector>,
-        acceleration_secret: Option<Secret>,
-    ) -> Result<()> {
-        let (accelerated_table, _) = self
-            .create_accelerated_table(dataset, source, acceleration_secret)
-            .await?;
-
-        self.ctx
-            .register_table(dataset.name.clone(), Arc::new(accelerated_table))
-            .context(UnableToRegisterTableToDataFusionSnafu)?;
-
-        Ok(())
-    }
-
     pub async fn refresh_table(&self, dataset_name: &str) -> Result<()> {
         let table = self
             .ctx
@@ -668,42 +683,6 @@ impl DataFusion {
                     table_name: dataset_name.to_string(),
                 })?;
         }
-        Ok(())
-    }
-
-    /// Federated tables are attached directly as tables visible in the public `DataFusion` context.
-    async fn register_federated_table(
-        &self,
-        dataset: &Dataset,
-        source: Arc<dyn DataConnector>,
-    ) -> Result<()> {
-        tracing::debug!("Registering federated table {dataset:?}");
-        let table_exists = self.ctx.table_exist(dataset.name.clone()).unwrap_or(false);
-        if table_exists {
-            return TableAlreadyExistsSnafu.fail();
-        }
-
-        let source_table_provider = match dataset.mode() {
-            Mode::Read => source
-                .read_provider(dataset)
-                .await
-                .context(UnableToResolveTableProviderSnafu)?,
-            Mode::ReadWrite => source
-                .read_write_provider(dataset)
-                .await
-                .ok_or_else(|| {
-                    WriteProviderNotImplementedSnafu {
-                        table_name: dataset.name.to_string(),
-                    }
-                    .build()
-                })?
-                .context(UnableToResolveTableProviderSnafu)?,
-        };
-
-        self.ctx
-            .register_table(dataset.name.clone(), source_table_provider)
-            .context(UnableToRegisterTableToDataFusionSnafu)?;
-
         Ok(())
     }
 
@@ -806,6 +785,29 @@ impl DataFusion {
             })?
             .table_names())
     }
+}
+
+async fn create_federated_table(
+    dataset: &Dataset,
+    source: Arc<dyn DataConnector>,
+) -> Result<Arc<dyn TableProvider>> {
+    let source_table_provider = match dataset.mode() {
+        Mode::Read => source
+            .read_provider(dataset)
+            .await
+            .context(UnableToResolveTableProviderSnafu)?,
+        Mode::ReadWrite => source
+            .read_write_provider(dataset)
+            .await
+            .ok_or_else(|| {
+                WriteProviderNotImplementedSnafu {
+                    table_name: dataset.name.to_string(),
+                }
+                .build()
+            })?
+            .context(UnableToResolveTableProviderSnafu)?,
+    };
+    Ok(source_table_provider)
 }
 
 impl Default for DataFusion {

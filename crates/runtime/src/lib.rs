@@ -36,6 +36,7 @@ use cache::QueryResultsCacheProvider;
 use component::dataset::{self, Dataset};
 use config::Config;
 use datafusion::SPICE_RUNTIME_SCHEMA;
+use futures::StreamExt;
 use llms::nql::Nql;
 use metrics::SetRecorderError;
 use model::try_to_nql;
@@ -310,10 +311,15 @@ impl Runtime {
         };
 
         let valid_datasets = Self::get_valid_datasets(app, true);
+        let mut futures = vec![];
         for ds in &valid_datasets {
             status::update_dataset(&ds.name, status::ComponentStatus::Initializing);
-            self.load_dataset(ds, &valid_datasets).await;
+            futures.push(self.load_dataset(ds, &valid_datasets));
         }
+
+        // hardcoded a size for now, can expose it for configurable;
+        let stream = futures::stream::iter(futures).buffer_unordered(10);
+        let _ = stream.collect::<Vec<_>>().await;
     }
 
     // Caller must set `status::update_dataset(...` before calling `load_dataset`. This function will set error/ready statuses appropriately.`
@@ -321,6 +327,7 @@ impl Runtime {
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
 
         loop {
+            tracing::info!("testing here");
             let connector = match self.load_dataset_connector(ds, all_datasets).await {
                 Ok(connector) => connector,
                 Err(err) => {
