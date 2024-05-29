@@ -86,13 +86,15 @@ pub fn create_openai(
     project_id: Option<String>,
 ) -> Box<dyn Nql> {
     let mut cfg = OpenAIConfig::new()
-        .with_api_base(api_base.unwrap_or_default())
         .with_org_id(org_id.unwrap_or_default())
         .with_project_id(project_id.unwrap_or_default());
 
     // If an API key is provided, use it. Otherwise use default from env variables.
     if let Some(api_key) = api_key {
         cfg = cfg.with_api_key(api_key);
+    }
+    if let Some(api_base) = api_base {
+        cfg = cfg.with_api_base(api_base);
     }
 
     Box::new(openai::Openai::new(
@@ -137,12 +139,12 @@ pub fn create_hf_model(
 #[allow(unused_variables)]
 pub fn create_local_model(
     model_weights: &str,
-    tokenizer: &str,
+    tokenizer: Option<&str>,
     tokenizer_config: &str,
 ) -> Result<Box<dyn Nql>> {
     let w = Path::new(&model_weights);
-    let t = Path::new(&tokenizer);
-    let tc = Path::new(&tokenizer_config);
+    let t = tokenizer.map(Path::new);
+    let tc = Path::new(tokenizer_config);
 
     if !w.exists() {
         return Err(Error::LocalModelNotFound {
@@ -150,9 +152,17 @@ pub fn create_local_model(
         });
     }
 
-    if !t.exists() {
+    if let Some(tokenizer_path) = t {
+        if !tokenizer_path.exists() {
+            return Err(Error::LocalTokenizerNotFound {
+                expected_path: tokenizer_path.to_string_lossy().to_string(),
+            });
+        }
+    }
+
+    if !tc.exists() {
         return Err(Error::LocalTokenizerNotFound {
-            expected_path: t.to_string_lossy().to_string(),
+            expected_path: tc.to_string_lossy().to_string(),
         });
     }
 

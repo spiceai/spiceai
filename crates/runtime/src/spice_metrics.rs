@@ -21,6 +21,7 @@ use std::time::Duration;
 use arrow::array::{Float64Array, StringArray, TimestampNanosecondArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use arrow_tools::record_batch::{self, try_cast_to};
 use chrono::Utc;
 use datafusion::sql::TableReference;
 use snafu::prelude::*;
@@ -40,6 +41,9 @@ pub enum Error {
     #[snafu(display("Error creating record batch: {source}",))]
     UnableToCreateRecordBatch { source: arrow::error::ArrowError },
 
+    #[snafu(display("Error casting record batch: {source}",))]
+    UnableToCastRecordBatch { source: record_batch::Error },
+
     #[snafu(display("Error queriing prometheus metrics: {source}"))]
     FailedToQueryPrometheusMetrics { source: reqwest::Error },
 
@@ -58,6 +62,7 @@ pub enum Error {
 
 pub struct MetricsRecorder {
     socket_addr: Arc<SocketAddr>,
+    remote_schema: Arc<Option<Arc<Schema>>>,
 }
 
 impl MetricsRecorder {
@@ -65,10 +70,15 @@ impl MetricsRecorder {
     pub fn new(socket_addr: SocketAddr) -> Self {
         Self {
             socket_addr: Arc::new(socket_addr),
+            remote_schema: Arc::new(None),
         }
     }
 
-    pub async fn register_metrics_table(datafusion: Arc<DataFusion>) -> Result<(), Error> {
+    pub fn set_remote_schema(&mut self, schema: Arc<Option<Arc<Schema>>>) {
+        self.remote_schema = schema;
+    }
+
+    pub async fn register_metrics_table(datafusion: &Arc<DataFusion>) -> Result<(), Error> {
         let metrics_table_reference = get_metrics_table_reference();
 
         let retention = Retention::new(
@@ -96,7 +106,11 @@ impl MetricsRecorder {
         Ok(())
     }
 
-    async fn tick(socket_addr: &SocketAddr, datafusion: &Arc<DataFusion>) -> Result<(), Error> {
+    async fn tick(
+        socket_addr: &SocketAddr,
+        datafusion: &Arc<DataFusion>,
+        remote_schema: &Arc<Option<Arc<Schema>>>,
+    ) -> Result<(), Error> {
         let body = reqwest::get(format!("http://{socket_addr}/metrics"))
             .await
             .context(FailedToQueryPrometheusMetricsSnafu)?
@@ -135,21 +149,30 @@ impl MetricsRecorder {
             labels.push(sample.labels.to_string());
         }
 
-        let schema = get_metrics_schema();
+        let mut schema = get_metrics_schema();
+        let mut record_batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(
+                    TimestampNanosecondArray::from(timestamps).with_timezone(Arc::from("UTC")),
+                ),
+                Arc::new(StringArray::from(metrics)),
+                Arc::new(Float64Array::from(values)),
+                Arc::new(StringArray::from(labels)),
+            ],
+        )
+        .context(UnableToCreateRecordBatchSnafu)?;
+
+        // If a remote schema is provided, cast the record batch to it
+        if let Some(remote_schema) = remote_schema.as_ref() {
+            schema = Arc::clone(remote_schema);
+            record_batch = try_cast_to(record_batch.clone(), Arc::clone(remote_schema))
+                .context(UnableToCastRecordBatchSnafu)?;
+        }
+
         let data_update = DataUpdate {
             schema: Arc::clone(&schema),
-            data: vec![RecordBatch::try_new(
-                Arc::clone(&schema),
-                vec![
-                    Arc::new(
-                        TimestampNanosecondArray::from(timestamps).with_timezone(Arc::from("UTC")),
-                    ),
-                    Arc::new(StringArray::from(metrics)),
-                    Arc::new(Float64Array::from(values)),
-                    Arc::new(StringArray::from(labels)),
-                ],
-            )
-            .context(UnableToCreateRecordBatchSnafu)?],
+            data: vec![record_batch],
             update_type: crate::dataupdate::UpdateType::Append,
         };
 
@@ -164,10 +187,11 @@ impl MetricsRecorder {
     pub fn start(&self, datafusion: &Arc<DataFusion>) {
         let addr = Arc::clone(&self.socket_addr);
         let df = Arc::clone(datafusion);
+        let schema = Arc::clone(&self.remote_schema);
 
         spawn(async move {
             loop {
-                if let Err(err) = MetricsRecorder::tick(&addr, &df).await {
+                if let Err(err) = MetricsRecorder::tick(&addr, &df, &schema).await {
                     tracing::error!("{err}");
                 }
                 tokio::time::sleep(Duration::from_secs(30)).await;

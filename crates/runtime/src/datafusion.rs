@@ -374,6 +374,13 @@ impl DataFusion {
         self.ctx.table(table_name).await.is_ok()
     }
 
+    pub async fn get_table(
+        &self,
+        table_reference: TableReference,
+    ) -> Option<Arc<dyn TableProvider>> {
+        self.ctx.table_provider(table_reference).await.ok()
+    }
+
     pub fn register_runtime_table(
         &self,
         table_name: TableReference,

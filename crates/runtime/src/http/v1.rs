@@ -1035,7 +1035,7 @@ pub(crate) mod nsql {
         let tables = match df.get_public_table_names() {
             Ok(t) => t,
             Err(e) => {
-                tracing::trace!("Error getting tables: {e}");
+                tracing::error!("Error getting tables: {e}");
                 return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
             }
         };
@@ -1048,7 +1048,7 @@ pub(crate) mod nsql {
                     table_create_stms.push(c.build_postgres());
                 }
                 Err(e) => {
-                    tracing::trace!("Error getting table={t} schema: {e}");
+                    tracing::error!("Error getting table={t} schema: {e}");
                     return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
                 }
             }
@@ -1094,7 +1094,7 @@ pub(crate) mod nsql {
                         resp
                     }
                     Err(e) => {
-                        tracing::trace!("Error running query: {e}");
+                        tracing::error!("Error running query: {e}");
                         (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
                     }
                 }
@@ -1108,7 +1108,7 @@ pub(crate) mod nsql {
                     .into_response()
             }
             Err(e) => {
-                tracing::trace!("Error running NSQL model: {e}");
+                tracing::error!("Error running NSQL model: {e}");
                 (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
             }
         };

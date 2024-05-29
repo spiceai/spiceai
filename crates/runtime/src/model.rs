@@ -59,7 +59,11 @@ pub fn try_to_nql(component: &spicepod::component::llms::Llm) -> Result<Box<dyn 
 
     let model_id = component.get_model_id();
 
-    match construct_llm_params(&prefix, &(component.params).clone().unwrap_or_default()) {
+    match construct_llm_params(
+        &prefix,
+        &model_id,
+        &(component.params).clone().unwrap_or_default(),
+    ) {
         Ok(LlmParams::OpenAiParams {
             api_base,
             api_key,
@@ -72,7 +76,11 @@ pub fn try_to_nql(component: &spicepod::component::llms::Llm) -> Result<Box<dyn 
             weights_path,
             tokenizer_path,
             tokenizer_config_path,
-        }) => llms::nql::create_local_model(&weights_path, &tokenizer_path, &tokenizer_config_path),
+        }) => llms::nql::create_local_model(
+            &weights_path,
+            tokenizer_path.as_deref(),
+            tokenizer_config_path.as_ref(),
+        ),
         Ok(LlmParams::HuggingfaceParams {
             model_type,
             weights_path,
@@ -106,8 +114,10 @@ pub fn try_to_nql(component: &spicepod::component::llms::Llm) -> Result<Box<dyn 
 }
 
 /// Construct the parameters needed to create an LLM based on its source (i.e. prefix).
+/// If a `model_id` is provided (in the `from: `), it is provided.
 fn construct_llm_params(
     from: &LlmPrefix,
+    model_id: &Option<String>,
     params: &HashMap<String, String>,
 ) -> Result<LlmParams, LlmError> {
     match from {
@@ -125,26 +135,23 @@ fn construct_llm_params(
                 }
                 None => None,
             };
+
             Ok(LlmParams::HuggingfaceParams {
                 model_type: arch,
-                weights_path: params.get("weights_path").cloned(),
+                weights_path: model_id.clone().or(params.get("weights_path").cloned()),
                 tokenizer_path: params.get("tokenizer_path").cloned(),
                 tokenizer_config_path: params.get("tokenizer_config_path").cloned(),
             })
         }
         LlmPrefix::File => {
-            let weights_path = params
-                .get("weights_path")
+            let weights_path = model_id
+                .clone()
+                .or(params.get("weights_path").cloned())
                 .ok_or(LlmError::FailedToLoadModel {
                     source: "No 'weights_path' parameter provided".into(),
                 })?
                 .clone();
-            let tokenizer_path = params
-                .get("tokenizer_path")
-                .ok_or(LlmError::FailedToLoadTokenizer {
-                    source: "No 'tokenizer_path' parameter provided".into(),
-                })?
-                .clone();
+            let tokenizer_path = params.get("tokenizer_path").cloned();
             let tokenizer_config_path = params
                 .get("tokenizer_config_path")
                 .ok_or(LlmError::FailedToLoadTokenizer {
