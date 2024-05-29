@@ -353,7 +353,7 @@ pub trait ListingTableConnector: DataConnector {
         let (_store, prefix) = object_store::parse_url(&store_url.clone())
             .boxed()
             .context(UnableToConnectInternalSnafu {
-                dataconnector: "ListingTableConnector",
+                dataconnector: format!("{self}"),
             })?;
         let (_, extension) = self.get_file_format_and_extension(dataset)?;
 
@@ -374,7 +374,7 @@ pub trait ListingTableConnector: DataConnector {
 
         let listing_store_url = ListingTableUrl::parse(store_url.clone()).boxed().context(
             UnableToConnectInternalSnafu {
-                dataconnector: "ListingTableConnector",
+                dataconnector: format!("{self}"),
             },
         )?;
         let object_store = ctx
@@ -382,13 +382,13 @@ pub trait ListingTableConnector: DataConnector {
             .object_store(&listing_store_url)
             .boxed()
             .context(UnableToConnectInternalSnafu {
-                dataconnector: "ListingTableConnector",
+                dataconnector: format!("{self}"),
             })?;
 
         let table =
             ObjectStoreMetadataTable::try_new(object_store, Some(prefix_str), Some(filename_regex))
                 .context(InternalSnafu {
-                    dataconnector: "ListingTableConnector",
+                    dataconnector: format!("{self}"),
                     code: "LTC-MP-OSMT".to_string(), // ListingTableConnector-MetadataProvider-ObjectStoreMetadataTableTryNew
                 })?;
         Ok(table as Arc<dyn TableProvider>)
