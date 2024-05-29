@@ -80,6 +80,7 @@ pub struct Dataset {
     /// Reference to a SQL file that describes a view.
     sql_ref: Option<String>,
     pub params: HashMap<String, String>,
+    pub has_metadata_table: bool,
     pub replication: Option<replication::Replication>,
     pub time_column: Option<String>,
     pub time_format: Option<TimeFormat>,
@@ -108,6 +109,9 @@ impl TryFrom<spicepod_dataset::Dataset> for Dataset {
                 .as_ref()
                 .map(Params::as_string_map)
                 .unwrap_or_default(),
+            has_metadata_table: dataset
+                .has_metadata_table
+                .unwrap_or(Dataset::have_metadata_table_by_default()),
             replication: dataset.replication.map(replication::Replication::from),
             time_column: dataset.time_column,
             time_format: dataset.time_format.map(TimeFormat::from),
@@ -125,11 +129,18 @@ impl Dataset {
             sql: None,
             sql_ref: None,
             params: HashMap::default(),
+            has_metadata_table: Self::have_metadata_table_by_default(),
             replication: None,
             time_column: None,
             time_format: None,
             acceleration: None,
         })
+    }
+
+    #[must_use]
+    /// Returns whether the dataset should enable metadata by default.
+    fn have_metadata_table_by_default() -> bool {
+        false
     }
 
     fn parse_table_reference(name: &str) -> Result<TableReference, crate::Error> {
