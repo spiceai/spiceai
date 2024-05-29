@@ -48,7 +48,7 @@ spice init my_app
 			dirName := path.Base(wd)
 
 			cmd.Printf("name: (%s)? ", dirName)
-			fmt.Scanf("%s", &spicepodName)
+			_, _ = fmt.Scanf("%s", &spicepodName)
 			if strings.TrimSpace(spicepodName) == "" {
 				spicepodName = dirName
 			}
@@ -61,7 +61,7 @@ spice init my_app
 		if _, err := os.Stat(spicepodPath); !os.IsNotExist(err) {
 			cmd.Print("spicepod.yaml already exists. Replace (y/n)? ")
 			var confirm string
-			fmt.Scanf("%s", &confirm)
+			_, _ = fmt.Scanf("%s", &confirm)
 			if strings.ToLower(strings.TrimSpace(confirm)) != "y" {
 				return
 			}
