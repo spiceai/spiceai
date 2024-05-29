@@ -174,6 +174,9 @@ pub enum Error {
 
     #[snafu(display("Unable to convert cached result to a record batch stream: {source}"))]
     UnableToCreateMemoryStream { source: DataFusionError },
+
+    #[snafu(display("Unable to get the lock"))]
+    UnableToLock {},
 }
 
 pub enum Table {
@@ -193,13 +196,18 @@ pub struct DataFusion {
 }
 
 impl DataFusion {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::new_with_cache_provider(None)
+    }
+
     /// Create a new `DataFusion` instance.
     ///
     /// # Panics
     ///
     /// Panics if the default schema cannot be registered.
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new_with_cache_provider(cache_provider: Option<Arc<QueryResultsCacheProvider>>) -> Self {
         let mut df_config = SessionConfig::new()
             .with_information_schema(true)
             .with_create_default_catalog_and_schema(false)
@@ -240,7 +248,7 @@ impl DataFusion {
         DataFusion {
             ctx: Arc::new(ctx),
             data_writers: RwLock::new(HashSet::new()),
-            cache_provider: None,
+            cache_provider,
         }
     }
 
@@ -260,12 +268,6 @@ impl DataFusion {
         }
 
         None
-    }
-
-    pub fn set_cache_provider(&self, cache_provider: Option<Arc<QueryResultsCacheProvider>>) {
-        // self.cache_provider = cache_provider;
-        let _ = cache_provider;
-        todo!()
     }
 
     pub async fn query_with_cache(
@@ -370,7 +372,10 @@ impl DataFusion {
                 .register_table(table_name.table().to_string(), table)
                 .context(UnableToRegisterTableToDataFusionSchemaSnafu { schema: "runtime" })?;
 
-            self.data_writers.write().unwrap().insert(table_name);
+            self.data_writers
+                .write()
+                .map_err(|_| Error::UnableToLock {})?
+                .insert(table_name);
         }
 
         Ok(())
@@ -420,7 +425,7 @@ impl DataFusion {
         if matches!(dataset.mode(), Mode::ReadWrite) {
             self.data_writers
                 .write()
-                .unwrap()
+                .map_err(|_| Error::UnableToLock {})?
                 .insert(dataset.name.clone());
         }
 
@@ -448,11 +453,11 @@ impl DataFusion {
 
     #[must_use]
     pub fn is_writable(&self, table_reference: &TableReference) -> bool {
-        self.data_writers
-            .read()
-            .unwrap()
-            .iter()
-            .any(|s| s == table_reference)
+        if let Ok(writers) = self.data_writers.read() {
+            writers.iter().any(|s| s == table_reference)
+        } else {
+            false
+        }
     }
 
     async fn get_table_provider(
@@ -558,7 +563,10 @@ impl DataFusion {
         }
 
         if self.is_writable(dataset_name) {
-            self.data_writers.write().unwrap().remove(dataset_name);
+            self.data_writers
+                .write()
+                .map_err(|_| Error::UnableToLock {})?
+                .remove(dataset_name);
         }
 
         Ok(())

@@ -122,7 +122,7 @@ pub(crate) mod query {
             }
         };
 
-        let mut q_trace = QueryHistory::new(df.clone())
+        let mut q_trace = QueryHistory::new(Arc::clone(&df))
             .sql(query.clone())
             .start_time(SystemTime::now());
 
@@ -1035,10 +1035,10 @@ pub(crate) mod nsql {
         Extension(nsql_models): Extension<Arc<RwLock<LLMModelStore>>>,
         Json(payload): Json<Request>,
     ) -> Response {
-        let mut q_trace = QueryHistory::new(df.clone()).results_cache_hit(false);
+        let mut q_trace = QueryHistory::new(Arc::clone(&df)).results_cache_hit(false);
 
         // Get all public table CREATE TABLE statements to add to prompt.
-        let tables = match df.clone().get_public_table_names() {
+        let tables = match df.get_public_table_names() {
             Ok(t) => t,
             Err(e) => {
                 tracing::trace!("Error getting tables: {e}");

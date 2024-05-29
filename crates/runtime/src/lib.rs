@@ -213,9 +213,11 @@ impl Runtime {
         dataconnector::register_all().await;
         dataaccelerator::register_all().await;
 
+        let cache_provider = Self::init_results_cache(&app);
+
         let mut rt = Runtime {
             app: Arc::new(RwLock::new(app)),
-            df: Arc::new(DataFusion::new()),
+            df: Arc::new(DataFusion::new_with_cache_provider(cache_provider)),
             models: Arc::new(RwLock::new(HashMap::new())),
             llms: Arc::new(RwLock::new(HashMap::new())),
             pods_watcher: None,
@@ -927,30 +929,26 @@ impl Runtime {
         Ok(())
     }
 
-    pub async fn init_results_cache(&self) {
-        let app_lock = self.app.read().await;
-
-        let Some(app) = app_lock.as_ref() else {
-            return;
-        };
+    fn init_results_cache(app: &Option<App>) -> Option<Arc<QueryResultsCacheProvider>> {
+        let app = app.as_ref()?;
 
         let cache_config = &app.runtime.results_cache;
 
         if !cache_config.enabled {
-            return;
+            return None;
         }
 
         let cache_provider = match QueryResultsCacheProvider::new(cache_config) {
-            Ok(cache_provider) => cache_provider,
+            Ok(cache_provider) => Arc::new(cache_provider),
             Err(e) => {
                 tracing::warn!("Failed to initialize results cache: {e}");
-                return;
+                return None;
             }
         };
 
         tracing::info!("Initialized results cache; {cache_provider}");
 
-        self.df.set_cache_provider(Some(Arc::new(cache_provider)));
+        Some(cache_provider)
     }
 
     pub async fn init_query_history(&self) -> Result<()> {

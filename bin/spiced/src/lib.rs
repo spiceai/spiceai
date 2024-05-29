@@ -112,8 +112,6 @@ pub async fn run(args: Args) -> Result<()> {
 
     rt.load_secrets().await;
 
-    rt.init_results_cache().await;
-
     rt.load_datasets().await;
 
     if cfg!(feature = "models") {
