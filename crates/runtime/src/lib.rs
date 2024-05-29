@@ -36,6 +36,7 @@ use cache::QueryResultsCacheProvider;
 use component::dataset::{self, Dataset};
 use config::Config;
 use datafusion::SPICE_RUNTIME_SCHEMA;
+use futures::future::join_all;
 use futures::StreamExt;
 use llms::nql::Nql;
 use metrics::SetRecorderError;
@@ -318,9 +319,17 @@ impl Runtime {
             futures.push(self.load_dataset(ds, &valid_datasets));
         }
 
-        // hardcoded a size for now, can expose it for configurable;
-        let stream = futures::stream::iter(futures).buffer_unordered(10);
-        let _ = stream.collect::<Vec<_>>().await;
+        let app = self.app.read().await;
+
+        if let Some(app) = app.as_ref() {
+            if let Some(parallel_num) = app.runtime.num_of_parallel_loading_at_start_up {
+                let stream = futures::stream::iter(futures).buffer_unordered(parallel_num);
+                let _ = stream.collect::<Vec<_>>().await;
+                return;
+            }
+        }
+
+        let _ = join_all(futures).await;
     }
 
     // Caller must set `status::update_dataset(...` before calling `load_dataset`. This function will set error/ready statuses appropriately.`

@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 pub struct Runtime {
     #[serde(default)]
     pub results_cache: ResultsCache,
+    pub num_of_parallel_loading_at_start_up: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
