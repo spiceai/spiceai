@@ -17,12 +17,11 @@ limitations under the License.
 use std::sync::Arc;
 
 use app::AppBuilder;
-use runtime::{accelerated_table::AcceleratedTable, datafusion::DataFusion, Runtime};
+use runtime::{accelerated_table::AcceleratedTable, Runtime};
 use spicepod::component::{
     dataset::{acceleration::Acceleration, Dataset},
     secrets::SpiceSecretStore,
 };
-use tokio::sync::RwLock;
 
 use crate::init_tracing;
 
@@ -49,9 +48,7 @@ async fn refresh_sql_pushdown() -> Result<(), String> {
         ))
         .build();
 
-    let df = Arc::new(RwLock::new(DataFusion::new()));
-
-    let rt = Runtime::new(Some(app), df, Arc::new(vec![])).await;
+    let rt = Runtime::new(Some(app), Arc::new(vec![])).await;
 
     rt.load_secrets().await;
     rt.load_datasets().await;

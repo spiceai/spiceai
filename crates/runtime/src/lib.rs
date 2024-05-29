@@ -208,7 +208,6 @@ impl Runtime {
     #[must_use]
     pub async fn new(
         app: Option<app::App>,
-        df: Arc<RwLock<DataFusion>>,
         extension_factories: Arc<Vec<Box<dyn ExtensionFactory>>>,
     ) -> Self {
         dataconnector::register_all().await;
@@ -216,7 +215,7 @@ impl Runtime {
 
         let mut rt = Runtime {
             app: Arc::new(RwLock::new(app)),
-            df,
+            df: Arc::new(RwLock::new(DataFusion::new())),
             models: Arc::new(RwLock::new(HashMap::new())),
             llms: Arc::new(RwLock::new(HashMap::new())),
             pods_watcher: None,

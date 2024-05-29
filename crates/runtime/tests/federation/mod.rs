@@ -19,9 +19,8 @@ use std::sync::Arc;
 use app::AppBuilder;
 use arrow::array::{Int64Array, RecordBatch};
 use datafusion::assert_batches_eq;
-use runtime::{datafusion::DataFusion, Runtime};
+use runtime::Runtime;
 use spicepod::component::{dataset::Dataset, secrets::SpiceSecretStore};
-use tokio::sync::RwLock;
 
 use crate::{init_tracing, run_query_and_check_results, ValidateFn};
 
@@ -45,9 +44,7 @@ async fn single_source_federation_push_down() -> Result<(), String> {
         .with_dataset(make_spiceai_dataset("eth.recent_logs", "eth.logs"))
         .build();
 
-    let df = Arc::new(RwLock::new(DataFusion::new()));
-
-    let mut rt = Runtime::new(Some(app), df, Arc::new(vec![])).await;
+    let mut rt = Runtime::new(Some(app), Arc::new(vec![])).await;
 
     rt.load_secrets().await;
     rt.load_datasets().await;
@@ -266,9 +263,7 @@ async fn refresh_sql() -> Result<(), String> {
         .with_dataset(make_spiceai_dataset("eth.recent_logs", "eth.logs"))
         .build();
 
-    let df = Arc::new(RwLock::new(DataFusion::new()));
-
-    let mut rt = Runtime::new(Some(app), df, Arc::new(vec![])).await;
+    let mut rt = Runtime::new(Some(app), Arc::new(vec![])).await;
 
     rt.load_secrets().await;
     rt.load_datasets().await;
