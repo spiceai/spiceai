@@ -328,7 +328,6 @@ impl Runtime {
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
 
         loop {
-            tracing::info!("testing here");
             let connector = match self.load_dataset_connector(ds, all_datasets).await {
                 Ok(connector) => connector,
                 Err(err) => {
