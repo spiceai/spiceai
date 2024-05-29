@@ -8231,8 +8231,11 @@ version = "0.14.0-alpha"
 dependencies = [
  "async-trait",
  "datafusion",
+ "reqwest 0.11.27",
  "runtime",
  "secrets",
+ "serde",
+ "serde_json",
  "snafu 0.8.2",
  "spicepod",
  "tokio",

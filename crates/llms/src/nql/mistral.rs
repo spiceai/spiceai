@@ -36,14 +36,14 @@ pub struct MistralLlama {
 }
 
 impl MistralLlama {
-    pub fn from(tokenizer: &Path, model_weights: &Path, template_filename: &Path) -> Result<Self> {
+    pub fn from(tokenizer: &Path, model_weights: &Path, tokenizer_config: &Path) -> Result<Self> {
         let extension = model_weights
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or_default();
         match extension {
-            "ggml" => Self::from_ggml(tokenizer, model_weights, template_filename),
-            "gguf" => Self::from_gguf(tokenizer, model_weights, template_filename),
+            "ggml" => Self::from_ggml(tokenizer, model_weights, tokenizer_config),
+            "gguf" => Self::from_gguf(tokenizer, model_weights, tokenizer_config),
             _ => Err(NqlError::FailedToLoadModel {
                 source: format!("Unknown model type: {extension}").into(),
             }),
@@ -53,13 +53,13 @@ impl MistralLlama {
     fn create_paths(
         tokenizer: &Path,
         model_weights: &Path,
-        template_filename: &Path,
+        tokenizer_config: &Path,
     ) -> Box<dyn ModelPaths> {
         Box::new(LocalModelPaths::new(
             tokenizer.into(),
             // Not needed for LLama2 / DuckDB NQL, but needed in `EricLBuehler/mistral.rs`.
             tokenizer.into(),
-            template_filename.into(),
+            tokenizer_config.into(),
             vec![model_weights.into()],
             None,
             None,
@@ -126,9 +126,9 @@ impl MistralLlama {
     pub fn from_gguf(
         tokenizer: &Path,
         model_weights: &Path,
-        template_filename: &Path,
+        tokenizer_config: &Path,
     ) -> Result<Self> {
-        let paths = Self::create_paths(tokenizer, model_weights, template_filename);
+        let paths = Self::create_paths(tokenizer, model_weights, tokenizer_config);
         let model_id = model_weights
             .file_name()
             .and_then(|x| x.to_str())
@@ -147,9 +147,9 @@ impl MistralLlama {
     pub fn from_ggml(
         tokenizer: &Path,
         model_weights: &Path,
-        template_filename: &Path,
+        tokenizer_config: &Path,
     ) -> Result<Self> {
-        let paths = Self::create_paths(tokenizer, model_weights, template_filename);
+        let paths = Self::create_paths(tokenizer, model_weights, tokenizer_config);
         let model_id = model_weights.to_string_lossy().to_string();
         let device = Self::get_device();
 
@@ -251,7 +251,6 @@ impl Nql for MistralLlama {
             .await
             .boxed()
             .context(FailedToRunModelSnafu)?;
-
         match self.rx.recv().await {
             Some(response) => match response {
                 MistralRsponse::CompletionDone(cr) => {
