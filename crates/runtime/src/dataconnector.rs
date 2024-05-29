@@ -282,7 +282,7 @@ pub trait DataConnector: Send + Sync {
     async fn metadata_provider(
         &self,
         _dataset: &Dataset,
-    ) -> Option<AnyErrorResult<Arc<dyn TableProvider>>> {
+    ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         None
     }
 }
@@ -493,7 +493,11 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
     async fn metadata_provider(
         &self,
         dataset: &Dataset,
-    ) -> Option<AnyErrorResult<Arc<dyn TableProvider>>> {
+    ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
+        if !dataset.has_metadata_table {
+            return None;
+        }
+
         Some(
             self.construct_metadata_provider(dataset)
                 .map_err(Into::into),

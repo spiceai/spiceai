@@ -97,6 +97,9 @@ pub enum Error {
     #[snafu(display("Table {table_name} was marked as read_write, but the underlying provider only supports reads."))]
     WriteProviderNotImplemented { table_name: String },
 
+    #[snafu(display("Table {table_name} is expected to provide metadata, but the underlying provider does not support this."))]
+    MetadataProviderNotImplemented { table_name: String },
+
     #[snafu(display("Unable to register table: {source}"))]
     UnableToRegisterTable { source: crate::dataconnector::Error },
 
@@ -729,23 +732,23 @@ impl DataFusion {
         dataset: &Dataset,
         source: Arc<dyn DataConnector>,
     ) -> Result<()> {
-        // If the dataset does not have metadata, don't create metadata
-        if !dataset.has_metadata_table {
-            return Ok(());
-        }
+        let table = source
+            .metadata_provider(dataset)
+            .await
+            .ok_or_else(|| {
+                MetadataProviderNotImplementedSnafu {
+                    table_name: dataset.name.to_string(),
+                }
+                .build()
+            })?
+            .context(UnableToResolveTableProviderSnafu)?;
 
-        let tbl_ref = TableReference::partial(SPICE_METADATA_SCHEMA, dataset.name.to_string());
-        match source.metadata_provider(dataset).await {
-            Some(Ok(table)) => {
-                self.ctx
-                    .register_table(tbl_ref, table)
-                    .context(UnableToRegisterTableToDataFusionSnafu)?;
-            }
-            Some(Err(e)) => {
-                Err(e).context(InvalidObjectStoreSnafu)?;
-            }
-            None => {}
-        }
+        self.ctx
+            .register_table(
+                TableReference::partial(SPICE_METADATA_SCHEMA, dataset.name.to_string()),
+                table,
+            )
+            .context(UnableToRegisterTableToDataFusionSnafu)?;
         Ok(())
     }
 
