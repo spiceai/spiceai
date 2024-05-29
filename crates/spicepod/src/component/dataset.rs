@@ -63,6 +63,9 @@ pub struct Dataset {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<Params>,
 
+    #[serde(rename = "metadata", default, skip_serializing_if = "Option::is_none")]
+    pub has_metadata_table: Option<bool>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replication: Option<replication::Replication>,
 
@@ -90,6 +93,7 @@ impl Dataset {
             sql: None,
             sql_ref: None,
             params: None,
+            has_metadata_table: None,
             replication: None,
             time_column: None,
             time_format: None,
@@ -108,6 +112,7 @@ impl WithDependsOn<Dataset> for Dataset {
             sql: self.sql.clone(),
             sql_ref: self.sql_ref.clone(),
             params: self.params.clone(),
+            has_metadata_table: self.has_metadata_table,
             replication: self.replication.clone(),
             time_column: self.time_column.clone(),
             time_format: self.time_format.clone(),

@@ -799,17 +799,14 @@ impl Runtime {
 
     pub async fn start_metrics(&mut self, with_metrics: Option<SocketAddr>) -> Result<()> {
         if let Some(metrics_socket) = with_metrics {
-            let recorder = MetricsRecorder::new(metrics_socket);
+            let mut recorder = MetricsRecorder::new(metrics_socket);
 
-            // check if runtime.metrics already registered, otherwise create local table
-            let has_metrics_table = self
-                .df
-                .read()
-                .await
-                .has_table(&get_metrics_table_reference())
-                .await;
+            let table_reference = get_metrics_table_reference();
+            let metrics_table = self.df.read().await.get_table(table_reference).await;
 
-            if !has_metrics_table {
+            if let Some(metrics_table) = metrics_table {
+                recorder.set_remote_schema(Arc::new(Some(metrics_table.schema())));
+            } else {
                 tracing::debug!("Registering local metrics table");
                 MetricsRecorder::register_metrics_table(&self.df)
                     .await

@@ -24,7 +24,7 @@ tracing.workspace = true
 flight_client = { path = "../flight_client" }
 sql_provider_datafusion = { path = "../sql_provider_datafusion" }
 secrets = { path = "../secrets" }
-deltalake = { git = "https://github.com/spiceai/delta-rs.git", rev = "b5022aea8cd159c5ffb31068ce09674dd88c9681", features = [
+deltalake = { git = "https://github.com/spiceai/delta-rs.git", rev = "52e78f1f324904476a7ba3e71cc747e1ea6fdfe1", features = [
     "datafusion-ext",
     "s3",
     "azure",
@@ -50,6 +50,8 @@ snowflake-api ={ workspace = true, optional = true }
 uuid.workspace = true
 datafusion-federation = { workspace = true }
 datafusion-federation-sql = { workspace = true }
+object_store = { workspace = true }
+regex = "1.10.4"
 
 [features]
 duckdb = ["dep:duckdb", "dep:r2d2"]
