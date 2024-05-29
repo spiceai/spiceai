@@ -13,6 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+#![allow(clippy::module_name_repetitions)]
 
 use std::{any::Any, fmt, sync::Arc};
 
@@ -59,9 +60,9 @@ impl ObjectStoreMetadataTable {
         prefix: Option<String>,
         filename_regex: Option<String>,
     ) -> Result<Arc<Self>, Box<dyn std::error::Error + Send + Sync>> {
-        let filename_regex = filename_regex.map(|regex| {
-            Regex::new(&regex).boxed()
-        }).transpose()?;
+        let filename_regex = filename_regex
+            .map(|regex| Regex::new(&regex).boxed())
+            .transpose()?;
 
         Ok(Arc::new(Self {
             store,
@@ -70,6 +71,7 @@ impl ObjectStoreMetadataTable {
         }))
     }
 
+    #[must_use]
     pub fn constraints(&self) -> Constraints {
         Constraints::new_unverified(vec![
             Constraint::PrimaryKey(vec![0]), // "location"
@@ -280,7 +282,7 @@ impl ObjectStoreMetadataExec {
     ) -> Self {
         Self {
             projected_schema: Arc::clone(&projected_schema),
-            filters: filters.to_vec(),
+            _filters: filters.to_vec(),
             limit,
             properties: PlanProperties::new(
                 EquivalenceProperties::new(projected_schema),

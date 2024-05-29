@@ -50,8 +50,8 @@ pub mod sqlite;
 pub mod snowflake;
 
 pub mod delete;
-pub mod util;
 pub mod metadata;
+pub mod util;
 
 #[async_trait]
 pub trait Read: Send + Sync {

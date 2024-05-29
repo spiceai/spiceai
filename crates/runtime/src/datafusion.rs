@@ -626,7 +626,7 @@ impl DataFusion {
             .register_table(dataset.name.clone(), Arc::new(accelerated_table))
             .context(UnableToRegisterTableToDataFusionSnafu)?;
 
-        self.register_metadata_table(&dataset, Arc::clone(&source))
+        self.register_metadata_table(dataset, Arc::clone(&source))
             .await?;
 
         Ok(())
@@ -712,7 +712,7 @@ impl DataFusion {
                 .context(UnableToResolveTableProviderSnafu)?,
         };
 
-        self.register_metadata_table(&dataset, Arc::clone(&source))
+        self.register_metadata_table(dataset, Arc::clone(&source))
             .await?;
 
         self.ctx
@@ -722,14 +722,14 @@ impl DataFusion {
         Ok(())
     }
 
-    /// Register a metadata table to the DataFusion context if supported by the underlying data connector.
+    /// Register a metadata table to the `DataFusion` context if supported by the underlying data connector.
     /// For a dataset `name`, the metadata table will be under `metadata.$name`
     async fn register_metadata_table(
         &self,
         dataset: &Dataset,
         source: Arc<dyn DataConnector>,
     ) -> Result<()> {
-        let tbl_ref = TableReference::partial(SPICE_METADATA_SCHEMA, dataset.name.clone());
+        let tbl_ref = TableReference::partial(SPICE_METADATA_SCHEMA, dataset.name.to_string());
         match source.metadata_provider(dataset).await {
             Some(Ok(table)) => {
                 self.ctx
