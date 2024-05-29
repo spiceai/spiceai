@@ -114,7 +114,7 @@ pub enum LlmParams {
 
     LocalModelParams {
         weights_path: String,
-        tokenizer_path: String,
+        tokenizer_path: Option<String>,
         tokenizer_config_path: String,
     },
     OpenAiParams {
