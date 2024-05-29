@@ -110,14 +110,10 @@ pub(crate) mod query {
     use datafusion::execution::context::SQLOptions;
     use futures::TryStreamExt;
     use std::{sync::Arc, time::SystemTime};
-    use tokio::sync::RwLock;
 
     use crate::{datafusion::DataFusion, query_history::QueryHistory};
 
-    pub(crate) async fn post(
-        Extension(df): Extension<Arc<RwLock<DataFusion>>>,
-        body: Bytes,
-    ) -> Response {
+    pub(crate) async fn post(Extension(df): Extension<Arc<DataFusion>>, body: Bytes) -> Response {
         let query = match String::from_utf8(body.to_vec()) {
             Ok(query) => query,
             Err(e) => {
@@ -126,7 +122,7 @@ pub(crate) mod query {
             }
         };
 
-        let mut q_trace = QueryHistory::new(Arc::<tokio::sync::RwLock<DataFusion>>::clone(&df))
+        let mut q_trace = QueryHistory::new(df.clone())
             .sql(query.clone())
             .start_time(SystemTime::now());
 
@@ -136,8 +132,6 @@ pub(crate) mod query {
             .with_allow_statements(false);
 
         let (data, is_data_from_cache) = match df
-            .read()
-            .await
             .query_with_cache(&query, Some(restricted_sql_options))
             .await
         {
@@ -1037,16 +1031,14 @@ pub(crate) mod nsql {
     }
 
     pub(crate) async fn post(
-        Extension(df): Extension<Arc<RwLock<DataFusion>>>,
+        Extension(df): Extension<Arc<DataFusion>>,
         Extension(nsql_models): Extension<Arc<RwLock<LLMModelStore>>>,
         Json(payload): Json<Request>,
     ) -> Response {
-        let mut q_trace = QueryHistory::new(Arc::<tokio::sync::RwLock<DataFusion>>::clone(&df))
-            .results_cache_hit(false);
-        let readable_df = df.read().await;
+        let mut q_trace = QueryHistory::new(df.clone()).results_cache_hit(false);
 
         // Get all public table CREATE TABLE statements to add to prompt.
-        let tables = match readable_df.get_public_table_names() {
+        let tables = match df.clone().get_public_table_names() {
             Ok(t) => t,
             Err(e) => {
                 tracing::trace!("Error getting tables: {e}");
@@ -1056,7 +1048,7 @@ pub(crate) mod nsql {
 
         let mut table_create_stms: Vec<String> = Vec::with_capacity(tables.len());
         for t in &tables {
-            match readable_df.get_arrow_schema(t).await {
+            match df.get_arrow_schema(t).await {
                 Ok(schm) => {
                     let c = CreateTableBuilder::new(Arc::new(schm), format!("public.{t}").as_str());
                     table_create_stms.push(c.build_postgres());
@@ -1098,7 +1090,7 @@ pub(crate) mod nsql {
                 q_trace = q_trace
                     .start_time(SystemTime::now())
                     .sql(cleaned_query.clone());
-                let result = readable_df.ctx.sql(&cleaned_query).await;
+                let result = df.ctx.sql(&cleaned_query).await;
 
                 match result {
                     Ok(result) => {

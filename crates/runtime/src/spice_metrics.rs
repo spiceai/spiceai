@@ -24,7 +24,6 @@ use arrow::record_batch::RecordBatch;
 use datafusion::sql::TableReference;
 use snafu::prelude::*;
 use tokio::spawn;
-use tokio::sync::RwLock;
 
 use crate::accelerated_table::refresh::Refresh;
 use crate::accelerated_table::Retention;
@@ -68,7 +67,7 @@ impl MetricsRecorder {
         }
     }
 
-    pub async fn register_metrics_table(datafusion: &Arc<RwLock<DataFusion>>) -> Result<(), Error> {
+    pub async fn register_metrics_table(datafusion: Arc<DataFusion>) -> Result<(), Error> {
         let metrics_table_reference = get_metrics_table_reference();
 
         let retention = Retention::new(
@@ -90,18 +89,13 @@ impl MetricsRecorder {
         .context(UnableToCreateMetricsTableSnafu)?;
 
         datafusion
-            .write()
-            .await
             .register_runtime_table(metrics_table_reference, table)
             .context(UnableToRegisterToMetricsTableSnafu)?;
 
         Ok(())
     }
 
-    async fn tick(
-        socket_addr: &SocketAddr,
-        datafusion: &Arc<RwLock<DataFusion>>,
-    ) -> Result<(), Error> {
+    async fn tick(socket_addr: &SocketAddr, datafusion: &Arc<DataFusion>) -> Result<(), Error> {
         let body = reqwest::get(format!("http://{socket_addr}/metrics"))
             .await
             .context(FailedToQueryPrometheusMetricsSnafu)?
@@ -151,17 +145,15 @@ impl MetricsRecorder {
             update_type: crate::dataupdate::UpdateType::Append,
         };
 
-        let df = datafusion.write().await;
-        df.write_data(get_metrics_table_reference(), data_update)
+        datafusion
+            .write_data(get_metrics_table_reference(), data_update)
             .await
             .context(UnableToWriteToMetricsTableSnafu)?;
-
-        drop(df);
 
         Ok(())
     }
 
-    pub fn start(&self, datafusion: &Arc<RwLock<DataFusion>>) {
+    pub fn start(&self, datafusion: &Arc<DataFusion>) {
         let addr = Arc::clone(&self.socket_addr);
         let df = Arc::clone(datafusion);
 

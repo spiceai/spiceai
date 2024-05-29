@@ -64,14 +64,11 @@ pub(crate) async fn handle(
 
     duration_metric.with_labels(vec![("path", path.to_string())]);
 
-    let df = flight_svc.datafusion.read().await;
-
-    if !df.is_writable(&path) {
+    if !flight_svc.datafusion.is_writable(&path) {
         return Err(Status::invalid_argument(format!(
             "Path doesn't exist or is not writable: {path}",
         )));
     };
-    drop(df);
 
     let schema = try_schema_from_flatbuffer_bytes(&message.data_header)
         .map_err(|e| Status::internal(format!("Failed to get schema from data header: {e}")))?;
@@ -126,8 +123,7 @@ pub(crate) async fn handle(
                         let _ = channel.send(data_update.clone());
                     };
 
-                    let df_guard = df.read().await;
-                    if let Err(e) = df_guard.write_data(path.clone(), data_update).await {
+                    if let Err(e) = df.write_data(path.clone(), data_update).await {
                         return Some((
                             Err(Status::internal(format!("Error writing data: {e}"))),
                             flight,

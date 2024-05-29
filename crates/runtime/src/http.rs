@@ -43,7 +43,7 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 pub(crate) async fn start<A>(
     bind_address: A,
     app: Arc<RwLock<Option<App>>>,
-    df: Arc<RwLock<DataFusion>>,
+    df: Arc<DataFusion>,
     models: Arc<RwLock<HashMap<String, Model>>>,
     llms: Arc<RwLock<LLMModelStore>>,
     config: Arc<config::Config>,

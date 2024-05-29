@@ -37,7 +37,7 @@ use super::v1;
 
 pub(crate) fn routes(
     app: Arc<RwLock<Option<App>>>,
-    df: Arc<RwLock<DataFusion>>,
+    df: Arc<DataFusion>,
     models: Arc<RwLock<HashMap<String, Model>>>,
     llms: Arc<RwLock<LLMModelStore>>,
     config: Arc<config::Config>,

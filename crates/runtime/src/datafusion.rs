@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::borrow::Borrow;
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use crate::accelerated_table::{refresh::Refresh, AcceleratedTable, Retention};
@@ -188,7 +188,7 @@ pub enum Table {
 
 pub struct DataFusion {
     pub ctx: Arc<SessionContext>,
-    data_writers: HashSet<TableReference>,
+    data_writers: RwLock<HashSet<TableReference>>,
     cache_provider: Option<Arc<QueryResultsCacheProvider>>,
 }
 
@@ -239,7 +239,7 @@ impl DataFusion {
 
         DataFusion {
             ctx: Arc::new(ctx),
-            data_writers: HashSet::new(),
+            data_writers: RwLock::new(HashSet::new()),
             cache_provider: None,
         }
     }
@@ -262,8 +262,10 @@ impl DataFusion {
         None
     }
 
-    pub fn set_cache_provider(&mut self, cache_provider: Option<Arc<QueryResultsCacheProvider>>) {
-        self.cache_provider = cache_provider;
+    pub fn set_cache_provider(&self, cache_provider: Option<Arc<QueryResultsCacheProvider>>) {
+        // self.cache_provider = cache_provider;
+        let _ = cache_provider;
+        todo!()
     }
 
     pub async fn query_with_cache(
@@ -359,7 +361,7 @@ impl DataFusion {
     }
 
     pub fn register_runtime_table(
-        &mut self,
+        &self,
         table_name: TableReference,
         table: Arc<dyn datafusion::datasource::TableProvider>,
     ) -> Result<()> {
@@ -368,17 +370,13 @@ impl DataFusion {
                 .register_table(table_name.table().to_string(), table)
                 .context(UnableToRegisterTableToDataFusionSchemaSnafu { schema: "runtime" })?;
 
-            self.data_writers.insert(table_name);
+            self.data_writers.write().unwrap().insert(table_name);
         }
 
         Ok(())
     }
 
-    pub async fn register_table(
-        &mut self,
-        dataset: impl Borrow<Dataset>,
-        table: Table,
-    ) -> Result<()> {
+    pub async fn register_table(&self, dataset: impl Borrow<Dataset>, table: Table) -> Result<()> {
         let dataset = dataset.borrow();
 
         schema::ensure_schema_exists(&self.ctx, SPICE_DEFAULT_CATALOG, &dataset.name)?;
@@ -420,14 +418,17 @@ impl DataFusion {
         }
 
         if matches!(dataset.mode(), Mode::ReadWrite) {
-            self.data_writers.insert(dataset.name.clone());
+            self.data_writers
+                .write()
+                .unwrap()
+                .insert(dataset.name.clone());
         }
 
         Ok(())
     }
 
     fn register_table_in_context(
-        &mut self,
+        &self,
         dataset: &Dataset,
         provider: Arc<dyn TableProvider>,
         check_existing: bool,
@@ -447,7 +448,11 @@ impl DataFusion {
 
     #[must_use]
     pub fn is_writable(&self, table_reference: &TableReference) -> bool {
-        self.data_writers.iter().any(|s| s == table_reference)
+        self.data_writers
+            .read()
+            .unwrap()
+            .iter()
+            .any(|s| s == table_reference)
     }
 
     async fn get_table_provider(
@@ -540,7 +545,7 @@ impl DataFusion {
         self.ctx.table_exist(dataset_name).unwrap_or(false)
     }
 
-    pub fn remove_table(&mut self, dataset_name: &TableReference) -> Result<()> {
+    pub fn remove_table(&self, dataset_name: &TableReference) -> Result<()> {
         if !self.ctx.table_exist(dataset_name.clone()).unwrap_or(false) {
             return Ok(());
         }
@@ -553,7 +558,7 @@ impl DataFusion {
         }
 
         if self.is_writable(dataset_name) {
-            self.data_writers.remove(dataset_name);
+            self.data_writers.write().unwrap().remove(dataset_name);
         }
 
         Ok(())

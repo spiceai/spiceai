@@ -53,7 +53,7 @@ use arrow_flight::{
 };
 
 pub struct Service {
-    datafusion: Arc<RwLock<DataFusion>>,
+    datafusion: Arc<DataFusion>,
     channel_map: Arc<RwLock<HashMap<TableReference, Arc<Sender<DataUpdate>>>>>,
 }
 
@@ -151,13 +151,8 @@ impl FlightService for Service {
 }
 
 impl Service {
-    async fn get_arrow_schema(
-        datafusion: Arc<RwLock<DataFusion>>,
-        sql: String,
-    ) -> Result<Schema, Status> {
+    async fn get_arrow_schema(datafusion: Arc<DataFusion>, sql: String) -> Result<Schema, Status> {
         let df = datafusion
-            .read()
-            .await
             .ctx
             .sql(&sql)
             .await
@@ -175,7 +170,7 @@ impl Service {
     }
 
     async fn sql_to_flight_stream(
-        datafusion: Arc<RwLock<DataFusion>>,
+        datafusion: Arc<DataFusion>,
         sql: String,
     ) -> Result<BoxStream<'static, Result<FlightData, Status>>, Status> {
         let restricted_sql_options = SQLOptions::new()
@@ -184,8 +179,6 @@ impl Service {
             .with_allow_statements(false);
 
         let batches_stream = datafusion
-            .read()
-            .await
             .query_with_cache(&sql, Some(restricted_sql_options))
             .await
             .map_err(to_tonic_err)?;
@@ -290,7 +283,7 @@ pub enum Error {
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
-pub async fn start(bind_address: std::net::SocketAddr, df: Arc<RwLock<DataFusion>>) -> Result<()> {
+pub async fn start(bind_address: std::net::SocketAddr, df: Arc<DataFusion>) -> Result<()> {
     let service = Service {
         datafusion: Arc::clone(&df),
         channel_map: Arc::new(RwLock::new(HashMap::new())),

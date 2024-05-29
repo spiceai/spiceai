@@ -55,8 +55,6 @@ async fn refresh_sql_pushdown() -> Result<(), String> {
 
     let traces_table = rt
         .datafusion()
-        .write()
-        .await
         .ctx
         .table_provider("traces")
         .await

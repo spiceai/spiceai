@@ -194,7 +194,7 @@ pub type LLMModelStore = HashMap<String, RwLock<Box<dyn Nql>>>;
 
 pub struct Runtime {
     pub app: Arc<RwLock<Option<App>>>,
-    pub df: Arc<RwLock<DataFusion>>,
+    pub df: Arc<DataFusion>,
     pub models: Arc<RwLock<HashMap<String, Model>>>,
     pub llms: Arc<RwLock<LLMModelStore>>,
     pub pods_watcher: Option<podswatcher::PodsWatcher>,
@@ -215,7 +215,7 @@ impl Runtime {
 
         let mut rt = Runtime {
             app: Arc::new(RwLock::new(app)),
-            df: Arc::new(RwLock::new(DataFusion::new())),
+            df: Arc::new(DataFusion::new()),
             models: Arc::new(RwLock::new(HashMap::new())),
             llms: Arc::new(RwLock::new(HashMap::new())),
             pods_watcher: None,
@@ -241,7 +241,7 @@ impl Runtime {
     }
 
     #[must_use]
-    pub fn datafusion(&self) -> Arc<RwLock<DataFusion>> {
+    pub fn datafusion(&self) -> Arc<DataFusion> {
         Arc::clone(&self.df)
     }
 
@@ -469,11 +469,9 @@ impl Runtime {
         }
     }
 
-    pub async fn remove_dataset(&self, ds: &Dataset) {
-        let mut df = self.df.write().await;
-
-        if df.table_exists(ds.name.clone()) {
-            if let Err(e) = df.remove_table(&ds.name) {
+    pub fn remove_dataset(&self, ds: &Dataset) {
+        if self.df.table_exists(ds.name.clone()) {
+            if let Err(e) = self.df.remove_table(&ds.name) {
                 tracing::warn!("Unable to unload dataset {}: {}", &ds.name, e);
                 return;
             }
@@ -510,7 +508,7 @@ impl Runtime {
                 tracing::debug!("Failed to create accelerated table for dataset {}, falling back to full dataset reload", ds.name);
             }
 
-            self.remove_dataset(ds).await;
+            self.remove_dataset(ds);
 
             if let Ok(()) = self
                 .register_loaded_dataset(ds, Arc::clone(&connector), None)
@@ -536,8 +534,6 @@ impl Runtime {
         // create new accelerated table for updated data connector
         let (accelerated_table, is_ready) = self
             .df
-            .read()
-            .await
             .create_accelerated_table(ds, Arc::clone(&connector), acceleration_secret)
             .await
             .context(UnableToCreateAcceleratedTableSnafu {
@@ -617,7 +613,7 @@ impl Runtime {
     async fn register_dataset(
         ds: impl Borrow<Dataset>,
         data_connector: Arc<dyn DataConnector>,
-        df: Arc<RwLock<DataFusion>>,
+        df: Arc<DataFusion>,
         source: &str,
         secrets_provider: Arc<RwLock<secrets::SecretsProvider>>,
         accelerated_table: Option<AcceleratedTable>,
@@ -627,9 +623,7 @@ impl Runtime {
         // VIEW
         if let Some(view_sql) = ds.view_sql() {
             let view_sql = view_sql.context(InvalidSQLViewSnafu)?;
-            df.write()
-                .await
-                .register_table(ds, datafusion::Table::View(view_sql))
+            df.register_table(ds, datafusion::Table::View(view_sql))
                 .await
                 .context(UnableToAttachViewSnafu)?;
             return Ok(());
@@ -683,16 +677,16 @@ impl Runtime {
     }
 
     async fn register_table(
-        df: Arc<RwLock<DataFusion>>,
+        df: Arc<DataFusion>,
         ds: &Dataset,
         table: datafusion::Table,
         source: &str,
     ) -> Result<()> {
-        df.write().await.register_table(ds, table).await.context(
-            UnableToAttachDataConnectorSnafu {
+        df.register_table(ds, table)
+            .await
+            .context(UnableToAttachDataConnectorSnafu {
                 data_connector: source,
-            },
-        )?;
+            })?;
 
         Ok(())
     }
@@ -807,21 +801,16 @@ impl Runtime {
             let recorder = MetricsRecorder::new(metrics_socket);
 
             // check if runtime.metrics already registered, otherwise create local table
-            let has_metrics_table = self
-                .df
-                .read()
-                .await
-                .has_table(&get_metrics_table_reference())
-                .await;
+            let has_metrics_table = self.df.has_table(&get_metrics_table_reference()).await;
 
             if !has_metrics_table {
                 tracing::debug!("Registering local metrics table");
-                MetricsRecorder::register_metrics_table(&self.df)
+                MetricsRecorder::register_metrics_table(Arc::clone(&self.df))
                     .await
                     .context(UnableToStartLocalMetricsSnafu)?;
             }
 
-            recorder.start(&Arc::clone(&self.df));
+            recorder.start(&self.df);
         }
 
         Ok(())
@@ -925,7 +914,7 @@ impl Runtime {
                             }
                         };
                         status::update_dataset(&ds.name, status::ComponentStatus::Disabled);
-                        self.remove_dataset(&ds).await;
+                        self.remove_dataset(&ds);
                     }
                 }
 
@@ -961,10 +950,7 @@ impl Runtime {
 
         tracing::info!("Initialized results cache; {cache_provider}");
 
-        self.df
-            .write()
-            .await
-            .set_cache_provider(Some(Arc::new(cache_provider)));
+        self.df.set_cache_provider(Some(Arc::new(cache_provider)));
     }
 
     pub async fn init_query_history(&self) -> Result<()> {
@@ -975,8 +961,6 @@ impl Runtime {
         match query_history::instantiate_query_history_table().await {
             Ok(table) => self
                 .df
-                .write()
-                .await
                 .register_runtime_table(query_history_table_reference, table)
                 .context(UnableToCreateBackendSnafu),
             Err(err) => Err(Error::UnableToTrackQueryHistory { source: err }),
