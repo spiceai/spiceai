@@ -187,6 +187,7 @@ impl Refresher {
                                             .map(|x| x.get_array_memory_size())
                                             .sum::<usize>(),
                                     );
+                                    let num_rows = util::pretty_print_number(num_rows);
 
                                     if let Ok(elapse) = util::humantime_elapsed(start_time) {
                                         if dataset_name.schema() == Some(SPICE_RUNTIME_SCHEMA) {

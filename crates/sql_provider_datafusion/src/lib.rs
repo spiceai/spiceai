@@ -17,6 +17,7 @@ limitations under the License.
 #![allow(clippy::missing_errors_doc)]
 
 use async_trait::async_trait;
+use datafusion::sql::unparser::dialect::Dialect;
 use db_connection_pool::dbconnection::{get_schema, query_arrow};
 use db_connection_pool::DbConnectionPool;
 use expr::Engine;
@@ -64,6 +65,7 @@ pub struct SqlTable<T: 'static, P: 'static> {
     schema: SchemaRef,
     table_reference: TableReference,
     engine: Option<Engine>,
+    dialect: Option<Arc<dyn Dialect + Send + Sync>>,
 }
 
 impl<T, P> SqlTable<T, P> {
@@ -89,6 +91,7 @@ impl<T, P> SqlTable<T, P> {
             schema,
             table_reference,
             engine,
+            dialect: None,
         })
     }
 
@@ -104,6 +107,15 @@ impl<T, P> SqlTable<T, P> {
             schema: schema.into(),
             table_reference: table_reference.into(),
             engine: None,
+            dialect: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_dialect(self, dialect: Arc<dyn Dialect + Send + Sync>) -> Self {
+        Self {
+            dialect: Some(dialect),
+            ..self
         }
     }
 

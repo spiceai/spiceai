@@ -59,6 +59,7 @@ use self::schema::SpiceSchemaProvider;
 pub const SPICE_DEFAULT_CATALOG: &str = "spice";
 pub const SPICE_RUNTIME_SCHEMA: &str = "runtime";
 pub const SPICE_DEFAULT_SCHEMA: &str = "public";
+pub const SPICE_METADATA_SCHEMA: &str = "metadata";
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -95,6 +96,9 @@ pub enum Error {
 
     #[snafu(display("Table {table_name} was marked as read_write, but the underlying provider only supports reads."))]
     WriteProviderNotImplemented { table_name: String },
+
+    #[snafu(display("Table {table_name} is expected to provide metadata, but the underlying provider does not support this."))]
+    MetadataProviderNotImplemented { table_name: String },
 
     #[snafu(display("Unable to register table: {source}"))]
     UnableToRegisterTable { source: crate::dataconnector::Error },
@@ -220,6 +224,7 @@ impl DataFusion {
         let catalog = MemoryCatalogProvider::new();
         let default_schema = SpiceSchemaProvider::new();
         let runtime_schema = SpiceSchemaProvider::new();
+        let metadata_schema = SpiceSchemaProvider::new();
 
         match catalog.register_schema(SPICE_DEFAULT_SCHEMA, Arc::new(default_schema)) {
             Ok(_) => {}
@@ -229,6 +234,13 @@ impl DataFusion {
         }
 
         match catalog.register_schema(SPICE_RUNTIME_SCHEMA, Arc::new(runtime_schema)) {
+            Ok(_) => {}
+            Err(e) => {
+                panic!("Unable to register spice runtime schema: {e}");
+            }
+        }
+
+        match catalog.register_schema(SPICE_METADATA_SCHEMA, Arc::new(metadata_schema)) {
             Ok(_) => {}
             Err(e) => {
                 panic!("Unable to register spice runtime schema: {e}");
@@ -356,6 +368,13 @@ impl DataFusion {
         }
 
         self.ctx.table(table_name).await.is_ok()
+    }
+
+    pub async fn get_table(
+        &self,
+        table_reference: TableReference,
+    ) -> Option<Arc<dyn TableProvider>> {
+        self.ctx.table_provider(table_reference).await.ok()
     }
 
     pub fn register_runtime_table(
@@ -610,12 +629,15 @@ impl DataFusion {
         acceleration_secret: Option<Secret>,
     ) -> Result<()> {
         let (accelerated_table, _) = self
-            .create_accelerated_table(dataset, source, acceleration_secret)
+            .create_accelerated_table(dataset, Arc::clone(&source), acceleration_secret)
             .await?;
 
         self.ctx
             .register_table(dataset.name.clone(), Arc::new(accelerated_table))
             .context(UnableToRegisterTableToDataFusionSnafu)?;
+
+        self.register_metadata_table(dataset, Arc::clone(&source))
+            .await?;
 
         Ok(())
     }
@@ -700,10 +722,36 @@ impl DataFusion {
                 .context(UnableToResolveTableProviderSnafu)?,
         };
 
+        self.register_metadata_table(dataset, Arc::clone(&source))
+            .await?;
+
         self.ctx
             .register_table(dataset.name.clone(), source_table_provider)
             .context(UnableToRegisterTableToDataFusionSnafu)?;
 
+        Ok(())
+    }
+
+    /// Register a metadata table to the `DataFusion` context if supported by the underlying data connector.
+    /// For a dataset `name`, the metadata table will be under `metadata.$name`
+    async fn register_metadata_table(
+        &self,
+        dataset: &Dataset,
+        source: Arc<dyn DataConnector>,
+    ) -> Result<()> {
+        if let Some(table) = source
+            .metadata_provider(dataset)
+            .await
+            .transpose()
+            .context(UnableToResolveTableProviderSnafu)?
+        {
+            self.ctx
+                .register_table(
+                    TableReference::partial(SPICE_METADATA_SCHEMA, dataset.name.to_string()),
+                    table,
+                )
+                .context(UnableToRegisterTableToDataFusionSnafu)?;
+        };
         Ok(())
     }
 

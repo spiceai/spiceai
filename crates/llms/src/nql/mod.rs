@@ -13,9 +13,12 @@ limitations under the License.
 #![allow(clippy::missing_errors_doc)]
 use std::path::Path;
 
+use async_openai::config::OpenAIConfig;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use snafu::Snafu;
+
+use self::openai::GPT3_5_TURBO_INSTRUCT;
 
 #[cfg(feature = "candle")]
 pub mod candle;
@@ -75,11 +78,29 @@ pub trait Nql: Sync + Send {
 }
 
 #[must_use]
-pub fn create_openai(model: Option<String>) -> Box<dyn Nql> {
-    match model {
-        Some(model) => Box::new(openai::Openai::using_model(model)),
-        None => Box::<openai::Openai>::default(),
+pub fn create_openai(
+    model: Option<String>,
+    api_base: Option<String>,
+    api_key: Option<String>,
+    org_id: Option<String>,
+    project_id: Option<String>,
+) -> Box<dyn Nql> {
+    let mut cfg = OpenAIConfig::new()
+        .with_org_id(org_id.unwrap_or_default())
+        .with_project_id(project_id.unwrap_or_default());
+
+    // If an API key is provided, use it. Otherwise use default from env variables.
+    if let Some(api_key) = api_key {
+        cfg = cfg.with_api_key(api_key);
     }
+    if let Some(api_base) = api_base {
+        cfg = cfg.with_api_base(api_base);
+    }
+
+    Box::new(openai::Openai::new(
+        cfg,
+        model.unwrap_or(GPT3_5_TURBO_INSTRUCT.to_string()),
+    ))
 }
 
 pub fn create_hf_model(
@@ -87,7 +108,7 @@ pub fn create_hf_model(
     model_type: Option<String>,
     model_weights: &Option<String>,
     _tokenizer: &Option<String>,
-    _template_filename: &Option<String>,
+    _tokenizer_config: &Option<String>,
 ) -> Result<Box<dyn Nql>> {
     if model_type.is_none() && model_weights.is_none() {
         return Err(Error::FailedToLoadModel {
@@ -103,7 +124,7 @@ pub fn create_hf_model(
             // TODO: Support HF models with non-standard paths.
             // model_weights,
             // tokenizer,
-            // template_filename,
+            // tokenizer_config,
         )
         .map(|x| Box::new(x) as Box<dyn Nql>)
     }
@@ -118,12 +139,12 @@ pub fn create_hf_model(
 #[allow(unused_variables)]
 pub fn create_local_model(
     model_weights: &str,
-    tokenizer: &str,
-    template_filename: &str,
+    tokenizer: Option<&str>,
+    tokenizer_config: &str,
 ) -> Result<Box<dyn Nql>> {
     let w = Path::new(&model_weights);
-    let t = Path::new(&tokenizer);
-    let tf = Path::new(&template_filename);
+    let t = tokenizer.map(Path::new);
+    let tc = Path::new(tokenizer_config);
 
     if !w.exists() {
         return Err(Error::LocalModelNotFound {
@@ -131,15 +152,23 @@ pub fn create_local_model(
         });
     }
 
-    if !t.exists() {
+    if let Some(tokenizer_path) = t {
+        if !tokenizer_path.exists() {
+            return Err(Error::LocalTokenizerNotFound {
+                expected_path: tokenizer_path.to_string_lossy().to_string(),
+            });
+        }
+    }
+
+    if !tc.exists() {
         return Err(Error::LocalTokenizerNotFound {
-            expected_path: t.to_string_lossy().to_string(),
+            expected_path: tc.to_string_lossy().to_string(),
         });
     }
 
     #[cfg(feature = "mistralrs")]
     {
-        mistral::MistralLlama::from(t, w, tf).map(|x| Box::new(x) as Box<dyn Nql>)
+        mistral::MistralLlama::from(t, w, tc).map(|x| Box::new(x) as Box<dyn Nql>)
     }
     #[cfg(not(feature = "mistralrs"))]
     {

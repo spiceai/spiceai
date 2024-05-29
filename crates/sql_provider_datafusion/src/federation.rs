@@ -12,7 +12,7 @@ use datafusion::{
     error::{DataFusionError, Result as DataFusionResult},
     physical_plan::{stream::RecordBatchStreamAdapter, SendableRecordBatchStream},
     sql::{
-        sqlparser::dialect::{Dialect, GenericDialect},
+        unparser::dialect::{DefaultDialect, Dialect},
         TableReference,
     },
 };
@@ -58,7 +58,10 @@ impl<T, P> SQLExecutor for SqlTable<T, P> {
     }
 
     fn dialect(&self) -> Arc<dyn Dialect> {
-        Arc::new(GenericDialect {})
+        let Some(ref dialect) = self.dialect else {
+            return Arc::new(DefaultDialect {});
+        };
+        Arc::clone(dialect) as Arc<_>
     }
 
     fn execute(

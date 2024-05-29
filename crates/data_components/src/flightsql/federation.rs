@@ -8,7 +8,7 @@ use datafusion::{
     error::{DataFusionError, Result as DataFusionResult},
     physical_plan::{stream::RecordBatchStreamAdapter, SendableRecordBatchStream},
     sql::{
-        sqlparser::dialect::{Dialect, GenericDialect},
+        unparser::dialect::{DefaultDialect, Dialect},
         TableReference,
     },
 };
@@ -56,7 +56,7 @@ impl SQLExecutor for FlightSQLTable {
     }
 
     fn dialect(&self) -> Arc<dyn Dialect> {
-        Arc::new(GenericDialect {})
+        Arc::new(DefaultDialect {})
     }
 
     fn execute(
