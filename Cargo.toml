@@ -74,3 +74,4 @@ suppaftp = { version = "5.3.1", features = ["async"] }
 ssh2 = { version = "0.9.4" }
 datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "f5d20bb92b87cb5902c924aebe739d865cf31151" }
 datafusion-federation-sql = { git = "https://github.com/spiceai/datafusion-federation.git", folder = "sources/sql", rev = "f5d20bb92b87cb5902c924aebe739d865cf31151" }
+object_store = { version = "0.9.1" }
