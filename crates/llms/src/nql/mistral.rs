@@ -17,12 +17,11 @@ limitations under the License.
 
 use super::{Error as NqlError, FailedToRunModelSnafu, Nql, Result};
 use async_trait::async_trait;
-use candle_core_rs::Device;
 use mistralrs::{
-    Constraint, DeviceMapMetadata, GGMLLoaderBuilder, GGMLSpecificConfig, GGUFLoaderBuilder,
-    GGUFSpecificConfig, MistralRs, MistralRsBuilder, NormalLoaderBuilder, NormalRequest,
-    Request as MistralRsquest, RequestMessage, Response as MistralRsponse, SamplingParams,
-    SchedulerMethod, TokenSource,
+    Constraint, Device, DeviceMapMetadata, GGMLLoaderBuilder, GGMLSpecificConfig,
+    GGUFLoaderBuilder, GGUFSpecificConfig, MistralRs, MistralRsBuilder, NormalLoaderBuilder,
+    NormalRequest, Request as MistralRsquest, RequestMessage, Response as MistralRsponse,
+    SamplingParams, SchedulerMethod, TokenSource,
 };
 use mistralrs_core::{LocalModelPaths, ModelPaths, Pipeline};
 use snafu::ResultExt;
@@ -36,13 +35,22 @@ pub struct MistralLlama {
 }
 
 impl MistralLlama {
-    pub fn from(tokenizer: &Path, model_weights: &Path, tokenizer_config: &Path) -> Result<Self> {
+    pub fn from(
+        tokenizer: Option<&Path>,
+        model_weights: &Path,
+        tokenizer_config: &Path,
+    ) -> Result<Self> {
         let extension = model_weights
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or_default();
         match extension {
-            "ggml" => Self::from_ggml(tokenizer, model_weights, tokenizer_config),
+            "ggml" => match tokenizer {
+                Some(tokenizer) => Self::from_ggml(tokenizer, model_weights, tokenizer_config),
+                None => Err(NqlError::FailedToLoadModel {
+                    source: "Tokenizer path is required for GGML model".into(),
+                }),
+            },
             "gguf" => Self::from_gguf(tokenizer, model_weights, tokenizer_config),
             _ => Err(NqlError::FailedToLoadModel {
                 source: format!("Unknown model type: {extension}").into(),
@@ -51,14 +59,14 @@ impl MistralLlama {
     }
 
     fn create_paths(
-        tokenizer: &Path,
         model_weights: &Path,
+        tokenizer: Option<&Path>,
         tokenizer_config: &Path,
     ) -> Box<dyn ModelPaths> {
         Box::new(LocalModelPaths::new(
-            tokenizer.into(),
+            tokenizer.map(Into::into).unwrap_or_default(),
             // Not needed for LLama2 / DuckDB NQL, but needed in `EricLBuehler/mistral.rs`.
-            tokenizer.into(),
+            tokenizer.map(Into::into).unwrap_or_default(),
             tokenizer_config.into(),
             vec![model_weights.into()],
             None,
@@ -74,16 +82,15 @@ impl MistralLlama {
     fn load_gguf_pipeline(
         paths: Box<dyn ModelPaths>,
         device: &Device,
-        tokenizer: &Path,
+        tokenizer: Option<&Path>,
         model_id: &str,
     ) -> Result<Arc<tokio::sync::Mutex<dyn Pipeline + Sync + Send>>> {
         GGUFLoaderBuilder::new(
             GGUFSpecificConfig::default(),
             None,
-            Some(tokenizer.to_string_lossy().to_string()),
-            Some(model_id.to_string()),
+            tokenizer.map(|t| t.to_string_lossy().to_string()),
             model_id.to_string(),
-            String::new(),
+            model_id.to_string(),
         )
         .build()
         .load_model_from_path(
@@ -124,11 +131,11 @@ impl MistralLlama {
     }
 
     pub fn from_gguf(
-        tokenizer: &Path,
+        tokenizer: Option<&Path>,
         model_weights: &Path,
         tokenizer_config: &Path,
     ) -> Result<Self> {
-        let paths = Self::create_paths(tokenizer, model_weights, tokenizer_config);
+        let paths = Self::create_paths(model_weights, tokenizer, tokenizer_config);
         let model_id = model_weights
             .file_name()
             .and_then(|x| x.to_str())
@@ -149,7 +156,7 @@ impl MistralLlama {
         model_weights: &Path,
         tokenizer_config: &Path,
     ) -> Result<Self> {
-        let paths = Self::create_paths(tokenizer, model_weights, tokenizer_config);
+        let paths = Self::create_paths(model_weights, Some(tokenizer), tokenizer_config);
         let model_id = model_weights.to_string_lossy().to_string();
         let device = Self::get_device();
 
