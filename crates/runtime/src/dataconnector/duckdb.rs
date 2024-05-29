@@ -67,27 +67,43 @@ impl DataConnectorFactory for DuckDB {
                 }
             }
 
-            // TODO: wire to dataset.mode once readwrite implemented for duckdb
+            let access_mode = params
+                .get("access_mode")
+                .cloned()
+                .unwrap_or("automatic".to_string());
+
+            let access_mode = match access_mode.as_str() {
+                "read_only" => &AccessMode::ReadOnly,
+                "read_write" => &AccessMode::ReadWrite,
+                "automatic" => &AccessMode::Automatic,
+                invalid_value => {
+                    return Err(DataConnectorError::InvalidConfiguration {
+                        dataconnector: "duckdb".to_string(),
+                        message: format!("Invalid value for parameter access_mode {invalid_value}, use read_only, read_writ or automatic"),
+                        source: "".into(),
+                    }
+                    .into());
+                }
+            };
+
             let pool = match params.get("open") {
                 Some(open) => {
                     let db_path = open.clone();
                     Arc::new(
-                        DuckDbConnectionPool::new_file(&db_path, &AccessMode::ReadWrite).map_err(
-                            |e| DataConnectorError::UnableToConnectInternal {
+                        DuckDbConnectionPool::new_file(&db_path, access_mode).map_err(|e| {
+                            DataConnectorError::UnableToConnectInternal {
                                 dataconnector: "duckdb".to_string(),
                                 source: e,
-                            },
-                        )?,
+                            }
+                        })?,
                     )
                 }
-                None => Arc::new(
-                    DuckDbConnectionPool::new_memory(&AccessMode::ReadWrite).map_err(|e| {
-                        DataConnectorError::UnableToConnectInternal {
-                            dataconnector: "duckdb".to_string(),
-                            source: e,
-                        }
-                    })?,
-                ),
+                None => Arc::new(DuckDbConnectionPool::new_memory(access_mode).map_err(|e| {
+                    DataConnectorError::UnableToConnectInternal {
+                        dataconnector: "duckdb".to_string(),
+                        source: e,
+                    }
+                })?),
             };
 
             let duckdb_factory = DuckDBTableFactory::new(pool, from_duckdb_function);
