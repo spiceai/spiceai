@@ -44,7 +44,7 @@ pub enum Error {
     #[snafu(display("Error casting record batch: {source}",))]
     UnableToCastRecordBatch { source: record_batch::Error },
 
-    #[snafu(display("Error queriing prometheus metrics: {source}"))]
+    #[snafu(display("Error querying prometheus metrics: {source}"))]
     FailedToQueryPrometheusMetrics { source: reqwest::Error },
 
     #[snafu(display("Error parsing prometheus metrics: {source}"))]
