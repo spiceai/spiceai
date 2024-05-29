@@ -437,7 +437,7 @@ pub(crate) mod datasets {
 
     pub(crate) async fn get(
         Extension(app): Extension<Arc<RwLock<Option<App>>>>,
-        Extension(df): Extension<Arc<RwLock<DataFusion>>>,
+        Extension(df): Extension<Arc<DataFusion>>,
         Query(filter): Query<DatasetFilter>,
         Query(params): Query<DatasetQueryParams>,
     ) -> Response {
@@ -463,8 +463,6 @@ pub(crate) mod datasets {
             datasets.retain(|d| !d.is_view());
         }
 
-        let df_read = df.read().await;
-
         let resp = datasets
             .iter()
             .map(|d| DatasetResponseItem {
@@ -473,7 +471,7 @@ pub(crate) mod datasets {
                 replication_enabled: d.replication.as_ref().is_some_and(|f| f.enabled),
                 acceleration_enabled: d.acceleration.as_ref().is_some_and(|f| f.enabled),
                 status: if params.status {
-                    Some(dataset_status(&df_read, d))
+                    Some(dataset_status(&df, d))
                 } else {
                     None
                 },
@@ -505,7 +503,7 @@ pub(crate) mod datasets {
 
     pub(crate) async fn refresh(
         Extension(app): Extension<Arc<RwLock<Option<App>>>>,
-        Extension(df): Extension<Arc<RwLock<DataFusion>>>,
+        Extension(df): Extension<Arc<DataFusion>>,
         Path(dataset_name): Path<String>,
     ) -> Response {
         let app_lock = app.read().await;
@@ -539,9 +537,7 @@ pub(crate) mod datasets {
                 .into_response();
         };
 
-        let df_read = df.read().await;
-
-        match df_read.refresh_table(&dataset.name).await {
+        match df.refresh_table(&dataset.name).await {
             Ok(()) => (
                 status::StatusCode::CREATED,
                 Json(MessageResponse {
@@ -561,7 +557,7 @@ pub(crate) mod datasets {
 
     pub(crate) async fn acceleration(
         Extension(app): Extension<Arc<RwLock<Option<App>>>>,
-        Extension(df): Extension<Arc<RwLock<DataFusion>>>,
+        Extension(df): Extension<Arc<DataFusion>>,
         Path(dataset_name): Path<String>,
         Json(payload): Json<AccelerationRequest>,
     ) -> Response {
@@ -588,9 +584,7 @@ pub(crate) mod datasets {
             return (status::StatusCode::OK).into_response();
         }
 
-        let df_read = df.read().await;
-
-        match df_read
+        match df
             .update_refresh_sql(
                 TableReference::parse_str(&dataset.name),
                 payload.refresh_sql,
@@ -831,7 +825,7 @@ pub(crate) mod inference {
 
     pub(crate) async fn get(
         Extension(app): Extension<Arc<RwLock<Option<App>>>>,
-        Extension(df): Extension<Arc<RwLock<DataFusion>>>,
+        Extension(df): Extension<Arc<DataFusion>>,
         Path(model_name): Path<String>,
         Extension(models): Extension<Arc<RwLock<HashMap<String, Model>>>>,
     ) -> Response {
@@ -854,7 +848,7 @@ pub(crate) mod inference {
 
     pub(crate) async fn post(
         Extension(app): Extension<Arc<RwLock<Option<App>>>>,
-        Extension(df): Extension<Arc<RwLock<DataFusion>>>,
+        Extension(df): Extension<Arc<DataFusion>>,
         Extension(models): Extension<Arc<RwLock<HashMap<String, Model>>>>,
         Json(payload): Json<BatchPredictRequest>,
     ) -> Response {
@@ -888,7 +882,7 @@ pub(crate) mod inference {
 
     async fn run_inference(
         app: Arc<RwLock<Option<App>>>,
-        df: Arc<RwLock<DataFusion>>,
+        df: Arc<DataFusion>,
         models: Arc<RwLock<HashMap<String, Model>>>,
         model_name: String,
     ) -> PredictResponse {
