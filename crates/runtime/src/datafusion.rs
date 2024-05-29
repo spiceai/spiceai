@@ -732,23 +732,19 @@ impl DataFusion {
         dataset: &Dataset,
         source: Arc<dyn DataConnector>,
     ) -> Result<()> {
-        let table = source
+        if let Some(table) = source
             .metadata_provider(dataset)
             .await
-            .ok_or_else(|| {
-                MetadataProviderNotImplementedSnafu {
-                    table_name: dataset.name.to_string(),
-                }
-                .build()
-            })?
-            .context(UnableToResolveTableProviderSnafu)?;
-
-        self.ctx
-            .register_table(
-                TableReference::partial(SPICE_METADATA_SCHEMA, dataset.name.to_string()),
-                table,
-            )
-            .context(UnableToRegisterTableToDataFusionSnafu)?;
+            .transpose()
+            .context(UnableToResolveTableProviderSnafu)?
+        {
+            self.ctx
+                .register_table(
+                    TableReference::partial(SPICE_METADATA_SCHEMA, dataset.name.to_string()),
+                    table,
+                )
+                .context(UnableToRegisterTableToDataFusionSnafu)?;
+        };
         Ok(())
     }
 
