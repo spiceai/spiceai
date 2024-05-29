@@ -23,7 +23,7 @@ use runtime::{datafusion::DataFusion, Runtime};
 use spicepod::component::{dataset::Dataset, secrets::SpiceSecretStore};
 use tokio::sync::RwLock;
 
-use crate::init_tracing;
+use crate::{init_tracing, run_query_and_check_results, ValidateFn};
 
 #[cfg(feature = "mysql")]
 mod mysql;
@@ -32,63 +32,22 @@ fn make_spiceai_dataset(path: &str, name: &str) -> Dataset {
     Dataset::new(format!("spiceai:{path}"), name.to_string())
 }
 
-type ValidateFn = dyn FnOnce(Vec<RecordBatch>);
-
-async fn run_query_and_check_results<F>(
-    rt: &mut Runtime,
-    query: &str,
-    expected_plan: &[&str],
-    validate_result: Option<F>,
-) -> Result<(), String>
-where
-    F: FnOnce(Vec<RecordBatch>),
-{
-    let df = &mut *rt.df.write().await;
-
-    // Check the plan
-    let plan_results = df
-        .ctx
-        .sql(&format!("EXPLAIN {query}"))
-        .await
-        .map_err(|e| format!("query `{query}` to plan: {e}"))?
-        .collect()
-        .await
-        .map_err(|e| format!("query `{query}` to results: {e}"))?;
-
-    assert_batches_eq!(expected_plan, &plan_results);
-
-    // Check the result
-    if let Some(validate_result) = validate_result {
-        let result_batches = df
-            .ctx
-            .sql(query)
-            .await
-            .map_err(|e| format!("query `{query}` to plan: {e}"))?
-            .collect()
-            .await
-            .map_err(|e| format!("query `{query}` to results: {e}"))?;
-
-        validate_result(result_batches);
-    }
-
-    Ok(())
-}
-
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn single_source_federation_push_down() -> Result<(), String> {
     type QueryTests<'a> = Vec<(&'a str, Vec<&'a str>, Option<Box<ValidateFn>>)>;
-    init_tracing(None);
+    let _tracing = init_tracing(None);
     let app = AppBuilder::new("basic_federation_push_down")
         .with_secret_store(SpiceSecretStore::File)
         .with_dataset(make_spiceai_dataset("eth.recent_blocks", "blocks"))
         .with_dataset(make_spiceai_dataset("eth.blocks", "full_blocks"))
         .with_dataset(make_spiceai_dataset("eth.recent_transactions", "tx"))
+        .with_dataset(make_spiceai_dataset("eth.recent_logs", "eth.logs"))
         .build();
 
     let df = Arc::new(RwLock::new(DataFusion::new()));
 
-    let mut rt = Runtime::new(Some(app), df).await;
+    let mut rt = Runtime::new(Some(app), df, Arc::new(vec![])).await;
 
     rt.load_secrets().await;
     rt.load_datasets().await;
@@ -111,58 +70,54 @@ async fn single_source_federation_push_down() -> Result<(), String> {
         (
             "SELECT MAX(number) as max_num FROM blocks",
             vec![
-                "+---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
-                "| plan_type     | plan                                                                                                                                                                            |",
-                "+---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
-                "| logical_plan  | Federated                                                                                                                                                                       |",
-                "|               |  Projection: MAX(blocks.number) AS max_num                                                                                                                                      |",
-                "|               |   Aggregate: groupBy=[[]], aggr=[[MAX(blocks.number)]]                                                                                                                          |",
-                "|               |     SubqueryAlias: blocks                                                                                                                                                       |",
-                "|               |       TableScan: eth.recent_blocks                                                                                                                                              |",
-                "| physical_plan | VirtualExecutionPlan name=spiceai compute_context=url=https://flight.spiceai.io,username= sql=SELECT MAX(\"blocks\".\"number\") AS \"max_num\" FROM \"eth\".\"recent_blocks\" AS \"blocks\" |",
-                "|               |                                                                                                                                                                                 |",
-                "+---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+                "+---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+                "| plan_type     | plan                                                                                                                                                                             |",
+                "+---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+                "| logical_plan  | Federated                                                                                                                                                                        |",
+                "|               |  Projection: MAX(eth.recent_blocks.number) AS max_num                                                                                                                            |",
+                "|               |   Aggregate: groupBy=[[]], aggr=[[MAX(eth.recent_blocks.number)]]                                                                                                                |",
+                "|               |     TableScan: eth.recent_blocks                                                                                                                                                 |",
+                "| physical_plan | VirtualExecutionPlan name=spiceai compute_context=url=https://flight.spiceai.io,username= sql=SELECT MAX(\"eth\".\"recent_blocks\".\"number\") AS \"max_num\" FROM \"eth\".\"recent_blocks\" |",
+                "|               |                                                                                                                                                                                  |",
+                "+---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
             ],
             Some(Box::new(has_one_int_val)),
         ),
         (
             "SELECT number FROM blocks WHERE number = (SELECT MAX(number) FROM blocks)",
             vec![
-                "+---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
-                "| plan_type     | plan                                                                                                                                                                                                                                                             |",
-                "+---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
-                "| logical_plan  | Federated                                                                                                                                                                                                                                                        |",
-                "|               |  Projection: blocks.number                                                                                                                                                                                                                                       |",
-                "|               |   Filter: blocks.number = (<subquery>)                                                                                                                                                                                                                           |",
-                "|               |     Subquery:                                                                                                                                                                                                                                                    |",
-                "|               |       Projection: MAX(blocks.number)                                                                                                                                                                                                                             |",
-                "|               |         Aggregate: groupBy=[[]], aggr=[[MAX(blocks.number)]]                                                                                                                                                                                                     |",
-                "|               |           SubqueryAlias: blocks                                                                                                                                                                                                                                  |",
-                "|               |             TableScan: eth.recent_blocks                                                                                                                                                                                                                         |",
-                "|               |     SubqueryAlias: blocks                                                                                                                                                                                                                                        |",
-                "|               |       TableScan: eth.recent_blocks                                                                                                                                                                                                                               |",
-                "| physical_plan | VirtualExecutionPlan name=spiceai compute_context=url=https://flight.spiceai.io,username= sql=SELECT \"blocks\".\"number\" FROM \"eth\".\"recent_blocks\" AS \"blocks\" WHERE (\"blocks\".\"number\" = (SELECT MAX(\"blocks\".\"number\") FROM \"eth\".\"recent_blocks\" AS \"blocks\")) |",
-                "|               |                                                                                                                                                                                                                                                                  |",
-                "+---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+                "+---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+                "| plan_type     | plan                                                                                                                                                                                                                                                                            |",
+                "+---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+                "| logical_plan  | Federated                                                                                                                                                                                                                                                                       |",
+                "|               |  Projection: eth.recent_blocks.number                                                                                                                                                                                                                                           |",
+                "|               |   Filter: eth.recent_blocks.number = (<subquery>)                                                                                                                                                                                                                               |",
+                "|               |     Subquery:                                                                                                                                                                                                                                                                   |",
+                "|               |       Projection: MAX(eth.recent_blocks.number)                                                                                                                                                                                                                                 |",
+                "|               |         Aggregate: groupBy=[[]], aggr=[[MAX(eth.recent_blocks.number)]]                                                                                                                                                                                                         |",
+                "|               |           TableScan: eth.recent_blocks                                                                                                                                                                                                                                          |",
+                "|               |     TableScan: eth.recent_blocks                                                                                                                                                                                                                                                |",
+                "| physical_plan | VirtualExecutionPlan name=spiceai compute_context=url=https://flight.spiceai.io,username= sql=SELECT \"eth\".\"recent_blocks\".\"number\" FROM \"eth\".\"recent_blocks\" WHERE (\"eth\".\"recent_blocks\".\"number\" = (SELECT MAX(\"eth\".\"recent_blocks\".\"number\") FROM \"eth\".\"recent_blocks\")) |",
+                "|               |                                                                                                                                                                                                                                                                                 |",
+                "+---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
             ],
             Some(Box::new(has_one_int_val)),
         ),
         (
             "SELECT number, hash FROM full_blocks WHERE number BETWEEN 1000 AND 2000 ORDER BY number DESC LIMIT 10",
             vec![
-                "+---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
-                "| plan_type     | plan                                                                                                                                                                                                                                                                                                  |",
-                "+---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
-                "| logical_plan  | Federated                                                                                                                                                                                                                                                                                             |",
-                "|               |  Limit: skip=0, fetch=10                                                                                                                                                                                                                                                                              |",
-                "|               |   Sort: full_blocks.number DESC NULLS FIRST                                                                                                                                                                                                                                                           |",
-                "|               |     Projection: full_blocks.number, full_blocks.hash                                                                                                                                                                                                                                                  |",
-                "|               |       Filter: full_blocks.number BETWEEN Int64(1000) AND Int64(2000)                                                                                                                                                                                                                                  |",
-                "|               |         SubqueryAlias: full_blocks                                                                                                                                                                                                                                                                    |",
-                "|               |           TableScan: eth.blocks                                                                                                                                                                                                                                                                       |",
-                "| physical_plan | VirtualExecutionPlan name=spiceai compute_context=url=https://flight.spiceai.io,username= sql=SELECT \"full_blocks\".\"number\", \"full_blocks\".\"hash\" FROM \"eth\".\"blocks\" AS \"full_blocks\" WHERE (\"full_blocks\".\"number\" BETWEEN 1000 AND 2000) ORDER BY \"full_blocks\".\"number\" DESC NULLS FIRST LIMIT 10 |",
-                "|               |                                                                                                                                                                                                                                                                                                       |",
-                "+---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+                "+---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+                "| plan_type     | plan                                                                                                                                                                                                                                                                                     |",
+                "+---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+                "| logical_plan  | Federated                                                                                                                                                                                                                                                                                |",
+                "|               |  Limit: skip=0, fetch=10                                                                                                                                                                                                                                                                 |",
+                "|               |   Sort: eth.blocks.number DESC NULLS FIRST                                                                                                                                                                                                                                               |",
+                "|               |     Projection: eth.blocks.number, eth.blocks.hash                                                                                                                                                                                                                                       |",
+                "|               |       Filter: eth.blocks.number BETWEEN Int64(1000) AND Int64(2000)                                                                                                                                                                                                                      |",
+                "|               |         TableScan: eth.blocks                                                                                                                                                                                                                                                            |",
+                "| physical_plan | VirtualExecutionPlan name=spiceai compute_context=url=https://flight.spiceai.io,username= sql=SELECT \"eth\".\"blocks\".\"number\", \"eth\".\"blocks\".\"hash\" FROM \"eth\".\"blocks\" WHERE (\"eth\".\"blocks\".\"number\" BETWEEN 1000 AND 2000) ORDER BY \"eth\".\"blocks\".\"number\" DESC NULLS FIRST LIMIT 10 |",
+                "|               |                                                                                                                                                                                                                                                                                          |",
+                "+---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
             ],
             Some(Box::new(|plan_results| {
                 let expected_results = [
@@ -187,20 +142,19 @@ async fn single_source_federation_push_down() -> Result<(), String> {
         (
             "SELECT AVG(gas_used) AS avg_gas_used, transaction_count FROM full_blocks WHERE number BETWEEN 100000 AND 200000 GROUP BY transaction_count ORDER BY transaction_count DESC LIMIT 10",
             vec![
-                "+---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
-                "| plan_type     | plan                                                                                                                                                                                                                                                                                                                                                                                                                  |",
-                "+---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
-                "| logical_plan  | Federated                                                                                                                                                                                                                                                                                                                                                                                                             |",
-                "|               |  Limit: skip=0, fetch=10                                                                                                                                                                                                                                                                                                                                                                                              |",
-                "|               |   Sort: full_blocks.transaction_count DESC NULLS FIRST                                                                                                                                                                                                                                                                                                                                                                |",
-                "|               |     Projection: AVG(full_blocks.gas_used) AS avg_gas_used, full_blocks.transaction_count                                                                                                                                                                                                                                                                                                                              |",
-                "|               |       Aggregate: groupBy=[[full_blocks.transaction_count]], aggr=[[AVG(CAST(full_blocks.gas_used AS Float64))]]                                                                                                                                                                                                                                                                                                       |",
-                "|               |         Filter: full_blocks.number BETWEEN Int64(100000) AND Int64(200000)                                                                                                                                                                                                                                                                                                                                            |",
-                "|               |           SubqueryAlias: full_blocks                                                                                                                                                                                                                                                                                                                                                                                  |",
-                "|               |             TableScan: eth.blocks                                                                                                                                                                                                                                                                                                                                                                                     |",
-                "| physical_plan | VirtualExecutionPlan name=spiceai compute_context=url=https://flight.spiceai.io,username= sql=SELECT AVG(CAST(\"full_blocks\".\"gas_used\" AS DOUBLE)) AS \"avg_gas_used\", \"full_blocks\".\"transaction_count\" FROM \"eth\".\"blocks\" AS \"full_blocks\" WHERE (\"full_blocks\".\"number\" BETWEEN 100000 AND 200000) GROUP BY \"full_blocks\".\"transaction_count\" ORDER BY \"full_blocks\".\"transaction_count\" DESC NULLS FIRST LIMIT 10 |",
-                "|               |                                                                                                                                                                                                                                                                                                                                                                                                                       |",
-                "+---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+                "+---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+                "| plan_type     | plan                                                                                                                                                                                                                                                                                                                                                                                                      |",
+                "+---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+                "| logical_plan  | Federated                                                                                                                                                                                                                                                                                                                                                                                                 |",
+                "|               |  Limit: skip=0, fetch=10                                                                                                                                                                                                                                                                                                                                                                                  |",
+                "|               |   Sort: eth.blocks.transaction_count DESC NULLS FIRST                                                                                                                                                                                                                                                                                                                                                     |",
+                "|               |     Projection: AVG(eth.blocks.gas_used) AS avg_gas_used, eth.blocks.transaction_count                                                                                                                                                                                                                                                                                                                    |",
+                "|               |       Aggregate: groupBy=[[eth.blocks.transaction_count]], aggr=[[AVG(CAST(eth.blocks.gas_used AS Float64))]]                                                                                                                                                                                                                                                                                             |",
+                "|               |         Filter: eth.blocks.number BETWEEN Int64(100000) AND Int64(200000)                                                                                                                                                                                                                                                                                                                                 |",
+                "|               |           TableScan: eth.blocks                                                                                                                                                                                                                                                                                                                                                                           |",
+                "| physical_plan | VirtualExecutionPlan name=spiceai compute_context=url=https://flight.spiceai.io,username= sql=SELECT AVG(CAST(\"eth\".\"blocks\".\"gas_used\" AS DOUBLE)) AS \"avg_gas_used\", \"eth\".\"blocks\".\"transaction_count\" FROM \"eth\".\"blocks\" WHERE (\"eth\".\"blocks\".\"number\" BETWEEN 100000 AND 200000) GROUP BY \"eth\".\"blocks\".\"transaction_count\" ORDER BY \"eth\".\"blocks\".\"transaction_count\" DESC NULLS FIRST LIMIT 10 |",
+                "|               |                                                                                                                                                                                                                                                                                                                                                                                                           |",
+                "+---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
             ],
             Some(Box::new(|plan_results| {
                 let expected_results = [
@@ -225,22 +179,20 @@ async fn single_source_federation_push_down() -> Result<(), String> {
         (
             "SELECT SUM(tx.receipt_gas_used) AS total_gas_used, blocks.number FROM blocks JOIN tx ON blocks.number = tx.block_number GROUP BY blocks.number ORDER BY blocks.number DESC LIMIT 10",
             vec![
-                "+---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
-                "| plan_type     | plan                                                                                                                                                                                                                                                                                                                                                                                  |",
-                "+---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
-                "| logical_plan  | Federated                                                                                                                                                                                                                                                                                                                                                                             |",
-                "|               |  Limit: skip=0, fetch=10                                                                                                                                                                                                                                                                                                                                                              |",
-                "|               |   Sort: blocks.number DESC NULLS FIRST                                                                                                                                                                                                                                                                                                                                                |",
-                "|               |     Projection: SUM(tx.receipt_gas_used) AS total_gas_used, blocks.number                                                                                                                                                                                                                                                                                                             |",
-                "|               |       Aggregate: groupBy=[[blocks.number]], aggr=[[SUM(tx.receipt_gas_used)]]                                                                                                                                                                                                                                                                                                         |",
-                "|               |         Inner Join:  Filter: blocks.number = tx.block_number                                                                                                                                                                                                                                                                                                                          |",
-                "|               |           SubqueryAlias: blocks                                                                                                                                                                                                                                                                                                                                                       |",
-                "|               |             TableScan: eth.recent_blocks                                                                                                                                                                                                                                                                                                                                              |",
-                "|               |           SubqueryAlias: tx                                                                                                                                                                                                                                                                                                                                                           |",
-                "|               |             TableScan: eth.recent_transactions                                                                                                                                                                                                                                                                                                                                        |",
-                "| physical_plan | VirtualExecutionPlan name=spiceai compute_context=url=https://flight.spiceai.io,username= sql=SELECT SUM(\"tx\".\"receipt_gas_used\") AS \"total_gas_used\", \"blocks\".\"number\" FROM \"eth\".\"recent_blocks\" AS \"blocks\" JOIN \"eth\".\"recent_transactions\" AS \"tx\" ON (\"blocks\".\"number\" = \"tx\".\"block_number\") GROUP BY \"blocks\".\"number\" ORDER BY \"blocks\".\"number\" DESC NULLS FIRST LIMIT 10 |",
-                "|               |                                                                                                                                                                                                                                                                                                                                                                                       |",
-                "+---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+                "+---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+                "| plan_type     | plan                                                                                                                                                                                                                                                                                                                                                                                                                                                                |",
+                "+---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+                "| logical_plan  | Federated                                                                                                                                                                                                                                                                                                                                                                                                                                                           |",
+                "|               |  Limit: skip=0, fetch=10                                                                                                                                                                                                                                                                                                                                                                                                                                            |",
+                "|               |   Sort: eth.recent_blocks.number DESC NULLS FIRST                                                                                                                                                                                                                                                                                                                                                                                                                   |",
+                "|               |     Projection: SUM(eth.recent_transactions.receipt_gas_used) AS total_gas_used, eth.recent_blocks.number                                                                                                                                                                                                                                                                                                                                                           |",
+                "|               |       Aggregate: groupBy=[[eth.recent_blocks.number]], aggr=[[SUM(eth.recent_transactions.receipt_gas_used)]]                                                                                                                                                                                                                                                                                                                                                       |",
+                "|               |         Inner Join:  Filter: eth.recent_blocks.number = eth.recent_transactions.block_number                                                                                                                                                                                                                                                                                                                                                                        |",
+                "|               |           TableScan: eth.recent_blocks                                                                                                                                                                                                                                                                                                                                                                                                                              |",
+                "|               |           TableScan: eth.recent_transactions                                                                                                                                                                                                                                                                                                                                                                                                                        |",
+                "| physical_plan | VirtualExecutionPlan name=spiceai compute_context=url=https://flight.spiceai.io,username= sql=SELECT SUM(\"eth\".\"recent_transactions\".\"receipt_gas_used\") AS \"total_gas_used\", \"eth\".\"recent_blocks\".\"number\" FROM \"eth\".\"recent_blocks\" JOIN \"eth\".\"recent_transactions\" ON (\"eth\".\"recent_blocks\".\"number\" = \"eth\".\"recent_transactions\".\"block_number\") GROUP BY \"eth\".\"recent_blocks\".\"number\" ORDER BY \"eth\".\"recent_blocks\".\"number\" DESC NULLS FIRST LIMIT 10 |",
+                "|               |                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |",
+                "+---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
             ],
             Some(Box::new(|result_batches| {
                 // Results change over time, but it looks like:
@@ -264,6 +216,31 @@ async fn single_source_federation_push_down() -> Result<(), String> {
                 for batch in result_batches {
                     assert_eq!(batch.num_columns(), 2);
                     assert_eq!(batch.num_rows(), 10);
+                }
+            })),
+        ),
+        (
+            "SELECT *
+            FROM eth.logs
+            ORDER BY block_number DESC 
+            LIMIT 10",
+            vec![
+                "+---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+                "| plan_type     | plan                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |",
+                "+---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+                "| logical_plan  | Federated                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |",
+                "|               |  Limit: skip=0, fetch=10                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |",
+                "|               |   Sort: eth.recent_logs.block_number DESC NULLS FIRST                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |",
+                "|               |     Projection: eth.recent_logs.log_index, eth.recent_logs.transaction_hash, eth.recent_logs.transaction_index, eth.recent_logs.address, eth.recent_logs.data, eth.recent_logs.topics, eth.recent_logs.block_timestamp, eth.recent_logs.block_hash, eth.recent_logs.block_number                                                                                                                                                                                                                                           |",
+                "|               |       TableScan: eth.recent_logs                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |",
+                "| physical_plan | VirtualExecutionPlan name=spiceai compute_context=url=https://flight.spiceai.io,username= sql=SELECT \"eth\".\"recent_logs\".\"log_index\", \"eth\".\"recent_logs\".\"transaction_hash\", \"eth\".\"recent_logs\".\"transaction_index\", \"eth\".\"recent_logs\".\"address\", \"eth\".\"recent_logs\".\"data\", \"eth\".\"recent_logs\".\"topics\", \"eth\".\"recent_logs\".\"block_timestamp\", \"eth\".\"recent_logs\".\"block_hash\", \"eth\".\"recent_logs\".\"block_number\" FROM \"eth\".\"recent_logs\" ORDER BY \"eth\".\"recent_logs\".\"block_number\" DESC NULLS FIRST LIMIT 10 |",
+                "|               |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |",
+                "+---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+            ],
+            Some(Box::new(|result_batches| {
+                for batch in result_batches {
+                    assert_eq!(batch.num_columns(), 9, "num_cols: {}", batch.num_columns());
+                    assert_eq!(batch.num_rows(), 10, "num_rows: {}", batch.num_rows());
                 }
             })),
         ),
@@ -290,31 +267,8 @@ async fn single_source_federation_push_down() -> Result<(), String> {
                 "|               |                                                                                                                                                                                                                                                                                                              |",
                 "+---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
             ],
-            Some(Box::new(|result_batches| {
-                // Results change over time, but it looks like:
-                // let expected_results = [
-                //     "+----------------+----------+",
-                //     "| total_gas_used | number   |",
-                //     "+----------------+----------+",
-                //     "| 14965044       | 19912051 |",
-                //     "| 19412656       | 19912049 |",
-                //     "| 12304986       | 19912047 |",
-                //     "| 19661381       | 19912046 |",
-                //     "| 10828931       | 19912045 |",
-                //     "| 21121895       | 19912044 |",
-                //     "| 29982938       | 19912043 |",
-                //     "| 10630719       | 19912042 |",
-                //     "| 29988818       | 19912041 |",
-                //     "| 9310052        | 19912040 |",
-                //     "+----------------+----------+",
-                // ];
-
-                for batch in result_batches {
-                    assert_eq!(batch.num_columns(), 2);
-                    assert_eq!(batch.num_rows(), 10);
-                }
-            })),
-        ),
+            None,
+        )
     ];
 
     for (query, expected_plan, validate_result) in queries {

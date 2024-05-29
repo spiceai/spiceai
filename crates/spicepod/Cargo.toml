@@ -10,12 +10,6 @@ repository.workspace = true
 [dependencies]
 serde = { workspace = true, features = ["derive"] }
 serde_yaml.workspace = true
+serde_json.workspace = true
 snafu.workspace = true
 tracing.workspace = true
-fundu.workspace = true
-
-[features]
-duckdb = []
-postgres = []
-sqlite = []
-mysql = []

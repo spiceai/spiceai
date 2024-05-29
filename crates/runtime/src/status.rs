@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::fmt::Display;
 
+use datafusion::sql::TableReference;
 use metrics::gauge;
 use serde::{Deserialize, Serialize};
 
@@ -41,12 +42,17 @@ impl Display for ComponentStatus {
     }
 }
 
-pub fn update_dataset(ds_name: &str, status: ComponentStatus) {
-    let ds_name = ds_name.to_string();
+pub fn update_dataset(dataset: &TableReference, status: ComponentStatus) {
+    let ds_name = dataset.to_string();
     gauge!("dataset/status", "dataset" => ds_name).set(f64::from(status as u32));
 }
 
 pub fn update_model(model_name: &str, status: ComponentStatus) {
     let model_name = model_name.to_string();
     gauge!("model/status", "model" => model_name).set(f64::from(status as u32));
+}
+
+pub fn update_llm(model_name: &str, status: ComponentStatus) {
+    let model_name = model_name.to_string();
+    gauge!("llm/status", "model" => model_name).set(f64::from(status as u32));
 }

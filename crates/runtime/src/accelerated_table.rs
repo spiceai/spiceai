@@ -17,23 +17,26 @@ limitations under the License.
 use std::time::SystemTime;
 use std::{any::Any, sync::Arc, time::Duration};
 
+use crate::component::dataset::acceleration::{RefreshMode, ZeroResultsAction};
+use crate::component::dataset::TimeFormat;
+use crate::datafusion::SPICE_RUNTIME_SCHEMA;
 use arrow::array::UInt64Array;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
+use cache::QueryResultsCacheProvider;
 use data_components::delete::get_deletion_provider;
 use datafusion::error::Result as DataFusionResult;
 use datafusion::execution::context::SessionState;
 use datafusion::logical_expr::{Operator, TableProviderFilterPushDown};
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{collect, ExecutionPlan};
+use datafusion::sql::TableReference;
 use datafusion::{
     datasource::{TableProvider, TableType},
     execution::context::SessionContext,
     logical_expr::Expr,
 };
 use snafu::prelude::*;
-use spicepod::component::dataset::acceleration::{RefreshMode, ZeroResultsAction};
-use spicepod::component::dataset::TimeFormat;
 use tokio::task::JoinHandle;
 use tokio::time::interval;
 
@@ -83,16 +86,21 @@ pub type Result<T> = std::result::Result<T, Error>;
 // The accelerator must support inserts.
 // AcceleratedTable::new returns an instance of the table and a oneshot receiver that will be triggered when the table is ready, right after the initial data refresh finishes.
 pub struct AcceleratedTable {
-    dataset_name: String,
+    dataset_name: TableReference,
     accelerator: Arc<dyn TableProvider>,
     federated: Arc<dyn TableProvider>,
     refresh_trigger: Option<mpsc::Sender<()>>,
     handlers: Vec<JoinHandle<()>>,
     zero_results_action: ZeroResultsAction,
     refresh_params: Arc<RwLock<refresh::Refresh>>,
+    refresher: Arc<refresh::Refresher>,
 }
 
-fn validate_refresh_data_window(refresh: &refresh::Refresh, dataset: &str, schema: &SchemaRef) {
+fn validate_refresh_data_window(
+    refresh: &refresh::Refresh,
+    dataset: &TableReference,
+    schema: &SchemaRef,
+) {
     if refresh.period.is_some() {
         if let Some(time_column) = &refresh.time_column {
             if schema.column_with_name(time_column).is_none() {
@@ -109,17 +117,18 @@ fn validate_refresh_data_window(refresh: &refresh::Refresh, dataset: &str, schem
 }
 
 pub struct Builder {
-    dataset_name: String,
+    dataset_name: TableReference,
     federated: Arc<dyn TableProvider>,
     accelerator: Arc<dyn TableProvider>,
     refresh: refresh::Refresh,
     retention: Option<Retention>,
     zero_results_action: ZeroResultsAction,
+    cache_provider: Option<Arc<QueryResultsCacheProvider>>,
 }
 
 impl Builder {
     pub fn new(
-        dataset_name: String,
+        dataset_name: TableReference,
         federated: Arc<dyn TableProvider>,
         accelerator: Arc<dyn TableProvider>,
         refresh: refresh::Refresh,
@@ -131,6 +140,7 @@ impl Builder {
             refresh,
             retention: None,
             zero_results_action: ZeroResultsAction::default(),
+            cache_provider: None,
         }
     }
 
@@ -144,6 +154,13 @@ impl Builder {
         self
     }
 
+    pub fn cache_provider(
+        &mut self,
+        cache_provider: Option<Arc<QueryResultsCacheProvider>>,
+    ) -> &mut Self {
+        self.cache_provider = cache_provider;
+        self
+    }
     pub async fn build(self) -> (AcceleratedTable, oneshot::Receiver<()>) {
         let mut refresh_trigger = None;
         let mut scheduled_refreshes_handle: Option<JoinHandle<()>> = None;
@@ -178,14 +195,18 @@ impl Builder {
 
         validate_refresh_data_window(&self.refresh, &self.dataset_name, &self.federated.schema());
         let refresh_params = Arc::new(RwLock::new(self.refresh));
-        let refresher = refresh::Refresher::new(
+        let mut refresher = refresh::Refresher::new(
             self.dataset_name.clone(),
             Arc::clone(&self.federated),
             Arc::clone(&refresh_params),
             Arc::clone(&self.accelerator),
         );
+        refresher.cache_provider(self.cache_provider.clone());
+        let refresher = Arc::new(refresher);
+
+        let refresher_tokio = Arc::clone(&refresher);
         let refresh_handle = tokio::spawn(async move {
-            refresher
+            refresher_tokio
                 .start(acceleration_refresh_mode, ready_sender)
                 .await;
         });
@@ -202,10 +223,10 @@ impl Builder {
                 self.dataset_name.clone(),
                 Arc::clone(&self.accelerator),
                 retention,
+                self.cache_provider.clone(),
             ));
             handlers.push(retention_check_handle);
         }
-
         (
             AcceleratedTable {
                 dataset_name: self.dataset_name,
@@ -215,6 +236,7 @@ impl Builder {
                 handlers,
                 zero_results_action: self.zero_results_action,
                 refresh_params,
+                refresher,
             },
             is_ready,
         )
@@ -223,12 +245,17 @@ impl Builder {
 
 impl AcceleratedTable {
     pub fn builder(
-        dataset_name: String,
+        dataset_name: TableReference,
         federated: Arc<dyn TableProvider>,
         accelerator: Arc<dyn TableProvider>,
         refresh: refresh::Refresh,
     ) -> Builder {
         Builder::new(dataset_name, federated, accelerator, refresh)
+    }
+
+    #[must_use]
+    pub fn refresher(&self) -> Arc<refresh::Refresher> {
+        Arc::clone(&self.refresher)
     }
 
     pub async fn trigger_refresh(&self) -> Result<()> {
@@ -250,10 +277,12 @@ impl AcceleratedTable {
     pub async fn update_refresh_sql(&self, refresh_sql: Option<String>) -> Result<()> {
         let dataset_name = &self.dataset_name;
 
-        if let Some(sql_str) = &refresh_sql {
-            tracing::info!("[refresh] Updating refresh SQL for {dataset_name} to {sql_str}");
-        } else {
-            tracing::info!("[refresh] Removing refresh SQL for {dataset_name}");
+        if self.dataset_name.schema() != Some(SPICE_RUNTIME_SCHEMA) {
+            if let Some(sql_str) = &refresh_sql {
+                tracing::info!("[refresh] Updating refresh SQL for {dataset_name} to {sql_str}");
+            } else {
+                tracing::info!("[refresh] Removing refresh SQL for {dataset_name}");
+            }
         }
         let mut refresh = self.refresh_params.write().await;
         refresh.sql = refresh_sql;
@@ -288,9 +317,10 @@ impl AcceleratedTable {
     #[allow(clippy::cast_possible_wrap)]
     #[allow(clippy::cast_possible_truncation)]
     async fn start_retention_check(
-        dataset_name: String,
+        dataset_name: TableReference,
         accelerator: Arc<dyn TableProvider>,
         retention: Retention,
+        cache_provider: Option<Arc<QueryResultsCacheProvider>>,
     ) {
         let time_column = retention.time_column;
         let retention_period = retention.period;
@@ -320,17 +350,26 @@ impl AcceleratedTable {
 
                 let timestamp = refresh::get_timestamp(start);
                 let expr = timestamp_filter_converter.convert(timestamp, Operator::Lt);
-                tracing::info!(
-                    "[retention] Evicting data for {dataset_name} where {time_column} < {}...",
-                    if let Some(value) =
-                        chrono::DateTime::from_timestamp((timestamp / 1_000_000_000) as i64, 0)
-                    {
-                        value.to_rfc3339()
-                    } else {
-                        tracing::warn!("[retention] Unable to convert timestamp");
-                        continue;
-                    }
-                );
+
+                let timestamp = if let Some(value) =
+                    chrono::DateTime::from_timestamp((timestamp / 1_000_000_000) as i64, 0)
+                {
+                    value.to_rfc3339()
+                } else {
+                    tracing::warn!("[retention] Unable to convert timestamp");
+                    continue;
+                };
+                if dataset_name.schema() == Some(SPICE_RUNTIME_SCHEMA) {
+                    tracing::debug!(
+                        "[retention] Evicting data for {dataset_name} where {time_column} < {}...",
+                        timestamp
+                    );
+                } else {
+                    tracing::info!(
+                        "[retention] Evicting data for {dataset_name} where {time_column} < {}...",
+                        timestamp
+                    );
+                }
 
                 tracing::debug!("[retention] Expr {expr:?}");
 
@@ -344,16 +383,29 @@ impl AcceleratedTable {
                                 tracing::error!("[retention] Error running retention check: {e}");
                             }
                             Ok(deleted) => {
-                                let result = deleted.first().map_or(0, |f| {
+                                let num_records = deleted.first().map_or(0, |f| {
                                     f.column(0)
                                         .as_any()
                                         .downcast_ref::<UInt64Array>()
                                         .map_or(0, |v| v.values().first().map_or(0, |f| *f))
                                 });
 
-                                tracing::info!(
-                                    "[retention] Evicted {result} records for {dataset_name}",
-                                );
+                                if dataset_name.schema() == Some(SPICE_RUNTIME_SCHEMA) {
+                                    tracing::debug!("[retention] Evicted {num_records} records for {dataset_name}");
+                                } else {
+                                    tracing::info!("[retention] Evicted {num_records} records for {dataset_name}");
+                                }
+
+                                if num_records > 0 {
+                                    if let Some(cache_provider) = &cache_provider {
+                                        if let Err(e) = cache_provider
+                                            .invalidate_for_table(&dataset_name.to_string())
+                                            .await
+                                        {
+                                            tracing::error!("Failed to invalidate cached results for dataset {}: {e}", &dataset_name.to_string());
+                                        }
+                                    }
+                                }
                             }
                         };
                     }
@@ -462,7 +514,8 @@ pub struct Retention {
 }
 
 impl Retention {
-    pub(crate) fn new(
+    #[must_use]
+    pub fn new(
         time_column: Option<String>,
         time_format: Option<TimeFormat>,
         retention_period: Option<Duration>,

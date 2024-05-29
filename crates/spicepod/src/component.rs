@@ -22,6 +22,8 @@ use snafu::prelude::*;
 
 use crate::reader;
 pub mod dataset;
+pub mod extension;
+pub mod llms;
 pub mod model;
 pub mod params;
 pub mod runtime;

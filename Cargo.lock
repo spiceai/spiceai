@@ -211,7 +211,7 @@ checksum = "d301b3b94cb4b2f23d7917810addbbaff90738e0ca2be692bd027e70d7e0330c"
 
 [[package]]
 name = "app"
-version = "0.13.1-alpha"
+version = "0.14.0-alpha"
 dependencies = [
  "snafu 0.8.2",
  "spicepod",
@@ -504,7 +504,7 @@ dependencies = [
 
 [[package]]
 name = "arrow_sql_gen"
-version = "0.13.1-alpha"
+version = "0.14.0-alpha"
 dependencies = [
  "arrow",
  "bigdecimal 0.3.1",
@@ -525,7 +525,7 @@ dependencies = [
 
 [[package]]
 name = "arrow_tools"
-version = "0.13.1-alpha"
+version = "0.14.0-alpha"
 dependencies = [
  "arrow",
  "snafu 0.8.2",
@@ -1770,7 +1770,7 @@ dependencies = [
 
 [[package]]
 name = "cache"
-version = "0.13.1-alpha"
+version = "0.14.0-alpha"
 dependencies = [
  "arrow",
  "async-stream",
@@ -1783,6 +1783,7 @@ dependencies = [
  "moka",
  "snafu 0.8.2",
  "spicepod",
+ "tokio",
  "tracing",
 ]
 
@@ -2512,7 +2513,7 @@ checksum = "7e962a19be5cfc3f3bf6dd8f61eb50107f356ad6270fbb3ed41476571db78be5"
 
 [[package]]
 name = "data_components"
-version = "0.13.1-alpha"
+version = "0.14.0-alpha"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -2670,7 +2671,7 @@ dependencies = [
 [[package]]
 name = "datafusion-federation"
 version = "0.1.3"
-source = "git+https://github.com/spiceai/datafusion-federation.git?rev=74dd1cdc3a20b989f1b272f5f6b7a1f8f0be5a46#74dd1cdc3a20b989f1b272f5f6b7a1f8f0be5a46"
+source = "git+https://github.com/spiceai/datafusion-federation.git?rev=532ecd01bdf4ce77787a56c5b354bb6332eae8c4#532ecd01bdf4ce77787a56c5b354bb6332eae8c4"
 dependencies = [
  "async-trait",
  "datafusion",
@@ -2679,7 +2680,7 @@ dependencies = [
 [[package]]
 name = "datafusion-federation-sql"
 version = "0.1.3"
-source = "git+https://github.com/spiceai/datafusion-federation.git?rev=74dd1cdc3a20b989f1b272f5f6b7a1f8f0be5a46#74dd1cdc3a20b989f1b272f5f6b7a1f8f0be5a46"
+source = "git+https://github.com/spiceai/datafusion-federation.git?rev=532ecd01bdf4ce77787a56c5b354bb6332eae8c4#532ecd01bdf4ce77787a56c5b354bb6332eae8c4"
 dependencies = [
  "async-trait",
  "datafusion",
@@ -2871,7 +2872,7 @@ dependencies = [
 
 [[package]]
 name = "db_connection_pool"
-version = "0.13.1-alpha"
+version = "0.14.0-alpha"
 dependencies = [
  "arrow",
  "arrow-odbc",
@@ -2897,7 +2898,6 @@ dependencies = [
  "secrets",
  "snafu 0.8.2",
  "snowflake-api",
- "spicepod",
  "tokio",
  "tokio-postgres",
  "tokio-rusqlite",
@@ -3227,8 +3227,7 @@ checksum = "75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2"
 [[package]]
 name = "duckdb"
 version = "0.10.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "424ede399a5d1084e65c0888fda71e407e5809400c92ff2cf510bfd1697b9c76"
+source = "git+https://github.com/spiceai/duckdb-rs.git?rev=86b6b44f4ae401706be0cbcaa5d7d12d41443e5e#86b6b44f4ae401706be0cbcaa5d7d12d41443e5e"
 dependencies = [
  "arrow",
  "cast",
@@ -3555,7 +3554,7 @@ dependencies = [
 
 [[package]]
 name = "flight_client"
-version = "0.13.1-alpha"
+version = "0.14.0-alpha"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -3571,7 +3570,7 @@ dependencies = [
 
 [[package]]
 name = "flightpublisher"
-version = "0.13.1-alpha"
+version = "0.14.0-alpha"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -3584,7 +3583,7 @@ dependencies = [
 
 [[package]]
 name = "flightrepl"
-version = "0.13.1-alpha"
+version = "0.14.0-alpha"
 dependencies = [
  "ansi_term",
  "arrow-flight",
@@ -3603,7 +3602,7 @@ dependencies = [
 
 [[package]]
 name = "flightsubscriber"
-version = "0.13.1-alpha"
+version = "0.14.0-alpha"
 dependencies = [
  "arrow-flight",
  "clap",
@@ -4888,8 +4887,7 @@ checksum = "9c198f91728a82281a64e1f4f9eeb25d82cb32a5de251c6bd1b5154d63a8e7bd"
 [[package]]
 name = "libduckdb-sys"
 version = "0.10.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "51b3f02cecc430f61561bde538d42af4be2d9d5a8b058f74883e460bc1055461"
+source = "git+https://github.com/spiceai/duckdb-rs.git?rev=86b6b44f4ae401706be0cbcaa5d7d12d41443e5e#86b6b44f4ae401706be0cbcaa5d7d12d41443e5e"
 dependencies = [
  "autocfg",
  "cc",
@@ -5062,7 +5060,7 @@ dependencies = [
 
 [[package]]
 name = "llms"
-version = "0.13.1-alpha"
+version = "0.14.0-alpha"
 dependencies = [
  "async-openai",
  "async-trait",
@@ -5429,7 +5427,7 @@ dependencies = [
 
 [[package]]
 name = "model_components"
-version = "0.13.1-alpha"
+version = "0.14.0-alpha"
 dependencies = [
  "arrow",
  "async-trait",
@@ -5714,7 +5712,7 @@ dependencies = [
 
 [[package]]
 name = "ns_lookup"
-version = "0.13.1-alpha"
+version = "0.14.0-alpha"
 dependencies = [
  "snafu 0.8.2",
  "tracing",
@@ -7318,7 +7316,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "0.13.1-alpha"
+version = "0.14.0-alpha"
 dependencies = [
  "anyhow",
  "app",
@@ -7773,7 +7771,7 @@ dependencies = [
 
 [[package]]
 name = "secrets"
-version = "0.13.1-alpha"
+version = "0.14.0-alpha"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -8190,7 +8188,7 @@ dependencies = [
 [[package]]
 name = "spark-connect-core"
 version = "0.0.1-beta.4"
-source = "git+https://github.com/spiceai/spark-connect-rs.git?rev=29b0634cdcb336fdceaf289aacf35927fb4a8877#29b0634cdcb336fdceaf289aacf35927fb4a8877"
+source = "git+https://github.com/spiceai/spark-connect-rs.git?rev=b594f2e626c2a9356a087aa5b28cd861d9ac377f#b594f2e626c2a9356a087aa5b28cd861d9ac377f"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -8210,7 +8208,7 @@ dependencies = [
 [[package]]
 name = "spark-connect-rs"
 version = "0.0.1-beta.4"
-source = "git+https://github.com/spiceai/spark-connect-rs.git?rev=29b0634cdcb336fdceaf289aacf35927fb4a8877#29b0634cdcb336fdceaf289aacf35927fb4a8877"
+source = "git+https://github.com/spiceai/spark-connect-rs.git?rev=b594f2e626c2a9356a087aa5b28cd861d9ac377f#b594f2e626c2a9356a087aa5b28cd861d9ac377f"
 dependencies = [
  "spark-connect-core",
 ]
@@ -8228,8 +8226,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "spice-cloud"
+version = "0.14.0-alpha"
+dependencies = [
+ "async-trait",
+ "datafusion",
+ "reqwest 0.11.27",
+ "runtime",
+ "secrets",
+ "serde",
+ "serde_json",
+ "snafu 0.8.2",
+ "spicepod",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "spiced"
-version = "0.13.1-alpha"
+version = "0.14.0-alpha"
 dependencies = [
  "app",
  "clap",
@@ -8237,6 +8252,7 @@ dependencies = [
  "metrics-exporter-prometheus",
  "runtime",
  "snafu 0.8.2",
+ "spice-cloud",
  "spicepod",
  "tokio",
  "tracing",
@@ -8245,10 +8261,10 @@ dependencies = [
 
 [[package]]
 name = "spicepod"
-version = "0.13.1-alpha"
+version = "0.14.0-alpha"
 dependencies = [
- "fundu",
  "serde",
+ "serde_json",
  "serde_yaml",
  "snafu 0.8.2",
  "tracing",
@@ -8290,7 +8306,7 @@ dependencies = [
 
 [[package]]
 name = "sql_provider_datafusion"
-version = "0.13.1-alpha"
+version = "0.14.0-alpha"
 dependencies = [
  "arrow",
  "async-trait",
@@ -9526,7 +9542,7 @@ checksum = "711b9620af191e0cdc7468a8d14e709c3dcdb115b36f838e601583af800a370a"
 
 [[package]]
 name = "util"
-version = "0.13.1-alpha"
+version = "0.14.0-alpha"
 dependencies = [
  "humantime",
 ]

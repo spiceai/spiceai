@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::{collections::HashMap, mem, sync::Arc};
 
+use crate::component::dataset::Dataset;
 use arrow::array::RecordBatch;
 use arrow_sql_gen::statement::{CreateTableBuilder, InsertBuilder};
 use datafusion::{execution::context::SessionContext, sql::TableReference};
@@ -29,7 +30,6 @@ use mysql_async::{
 };
 use secrets::Secret;
 use snafu::{prelude::*, ResultExt};
-use spicepod::component::dataset::Dataset;
 use sql_provider_datafusion::SqlTable;
 use tract_core::downcast_rs::Downcast;
 

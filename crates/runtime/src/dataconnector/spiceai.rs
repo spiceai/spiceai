@@ -16,6 +16,7 @@ limitations under the License.
 
 use super::DataConnector;
 use super::DataConnectorFactory;
+use crate::component::dataset::Dataset;
 use async_trait::async_trait;
 use data_components::flight::FlightFactory;
 use data_components::{Read, ReadWrite};
@@ -24,7 +25,6 @@ use flight_client::FlightClient;
 use ns_lookup::verify_endpoint_connection;
 use secrets::Secret;
 use snafu::prelude::*;
-use spicepod::component::dataset::Dataset;
 use std::any::Any;
 use std::borrow::Borrow;
 use std::pin::Pin;
@@ -62,7 +62,7 @@ pub struct SpiceAI {
 impl DataConnectorFactory for SpiceAI {
     fn create(
         secret: Option<Secret>,
-        params: Arc<Option<HashMap<String, String>>>,
+        params: Arc<HashMap<String, String>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         let default_flight_url = if cfg!(feature = "dev") {
             "https://dev-flight.spiceai.io".to_string()
@@ -73,9 +73,8 @@ impl DataConnectorFactory for SpiceAI {
             let secret = secret.context(MissingRequiredSecretsSnafu)?;
 
             let url: String = params
-                .as_ref() // &Option<HashMap<String, String>>
-                .as_ref() // Option<&HashMap<String, String>>
-                .and_then(|params| params.get("endpoint").cloned())
+                .get("endpoint")
+                .cloned()
                 .unwrap_or(default_flight_url);
             tracing::trace!("Connecting to SpiceAI with flight url: {url}");
 
@@ -206,7 +205,7 @@ mod tests {
         ];
 
         for (input, expected) in tests {
-            let dataset = Dataset::new(input.clone(), "bar".to_string());
+            let dataset = Dataset::try_new(input.clone(), "bar").expect("a valid dataset");
             assert_eq!(SpiceAI::spice_dataset_path(dataset), expected, "{input}");
         }
     }

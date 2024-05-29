@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::collections::HashSet;
 use std::fmt::Display;
 use std::fmt::Formatter;
 use std::sync::atomic::Ordering;
@@ -36,6 +37,7 @@ use spicepod::component::runtime::ResultsCache;
 mod lru_cache;
 mod utils;
 
+pub use utils::get_logical_plan_input_tables;
 pub use utils::to_cached_record_batch_stream;
 
 #[derive(Debug, Snafu)]
@@ -45,6 +47,12 @@ pub enum Error {
 
     #[snafu(display("Failed to parse item_ttl value: {source}"))]
     FailedToParseItemTtl { source: ParseError },
+
+    #[snafu(display("Cache invalidation for dataset {table_name} failed with error: {source}"))]
+    FailedToInvalidateCache {
+        source: moka::PredicateError,
+        table_name: String,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -65,24 +73,26 @@ impl QueryResult {
 pub struct CachedQueryResult {
     pub records: Arc<Vec<RecordBatch>>,
     pub schema: Arc<Schema>,
+    pub input_tables: Arc<HashSet<String>>,
 }
 
 #[async_trait]
 pub trait QueryResultCache {
     async fn get(&self, plan: &LogicalPlan) -> Result<Option<CachedQueryResult>>;
     async fn put(&self, plan: &LogicalPlan, result: CachedQueryResult) -> Result<()>;
+    async fn invalidate_for_table(&self, table_name: &str) -> Result<()>;
     fn size_bytes(&self) -> u64;
     fn item_count(&self) -> u64;
 }
 
-pub struct QueryResultCacheProvider {
+pub struct QueryResultsCacheProvider {
     cache: Arc<dyn QueryResultCache + Send + Sync>,
     cache_max_size: u64,
     ttl: std::time::Duration,
     metrics_reported_last_time: AtomicU64,
 }
 
-impl QueryResultCacheProvider {
+impl QueryResultsCacheProvider {
     /// # Errors
     ///
     /// Will return `Err` if method fails to parse cache params or to create the cache
@@ -99,7 +109,7 @@ impl QueryResultCacheProvider {
             None => std::time::Duration::from_secs(1),
         };
 
-        let cache_provider = QueryResultCacheProvider {
+        let cache_provider = QueryResultsCacheProvider {
             cache: Arc::new(LruCache::new(cache_max_size, ttl)),
             cache_max_size,
             ttl,
@@ -149,6 +159,13 @@ impl QueryResultCacheProvider {
         }
     }
 
+    /// # Errors
+    ///
+    /// Will return `Err` if method fails to invalidate cache for the table provided
+    pub async fn invalidate_for_table(&self, table_name: &str) -> Result<()> {
+        self.cache.invalidate_for_table(table_name).await
+    }
+
     #[must_use]
     pub fn max_size(&self) -> u64 {
         self.cache_max_size
@@ -165,11 +182,11 @@ impl QueryResultCacheProvider {
     }
 }
 
-impl Display for QueryResultCacheProvider {
+impl Display for QueryResultsCacheProvider {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "max size: {:.2}, item expire duration: {:?}",
+            "max size: {:.2}, item ttl: {:?}",
             Byte::from_u64(self.cache_max_size).get_adjusted_unit(byte_unit::Unit::MiB),
             self.ttl
         )

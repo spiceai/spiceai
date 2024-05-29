@@ -19,12 +19,15 @@ limitations under the License.
 
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
+use std::collections::HashMap;
 use std::{fmt::Debug, path::PathBuf};
 
-use component::dataset::Dataset;
+use component::llms::Llm;
 use component::model::Model;
 use component::runtime::Runtime;
 use component::secrets::Secrets;
+use component::{dataset::Dataset, extension::Extension};
+
 use spec::{SpicepodDefinition, SpicepodVersion};
 
 pub mod component;
@@ -52,6 +55,8 @@ pub struct Spicepod {
 
     pub name: String,
 
+    pub extensions: HashMap<String, Extension>,
+
     pub secrets: Secrets,
 
     pub datasets: Vec<Dataset>,
@@ -59,6 +64,8 @@ pub struct Spicepod {
     pub models: Vec<Model>,
 
     pub dependencies: Vec<String>,
+
+    pub llms: Vec<Llm>,
 
     pub runtime: Runtime,
 }
@@ -98,10 +105,15 @@ impl Spicepod {
         )
         .context(UnableToResolveSpicepodComponentsSnafu { path: path.clone() })?;
 
+        let resolved_llms =
+            component::resolve_component_references(fs, &path, &spicepod_definition.llms, "llms")
+                .context(UnableToResolveSpicepodComponentsSnafu { path: path.clone() })?;
+
         Ok(from_definition(
             spicepod_definition,
             resolved_datasets,
             resolved_models,
+            resolved_llms,
         ))
     }
 
@@ -132,13 +144,16 @@ fn from_definition(
     spicepod_definition: SpicepodDefinition,
     datasets: Vec<Dataset>,
     models: Vec<Model>,
+    llms: Vec<Llm>,
 ) -> Spicepod {
     Spicepod {
         name: spicepod_definition.name,
         version: spicepod_definition.version,
+        extensions: spicepod_definition.extensions,
         secrets: spicepod_definition.secrets,
         datasets,
         models,
+        llms,
         dependencies: spicepod_definition.dependencies,
         runtime: spicepod_definition.runtime,
     }

@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::component::dataset::Dataset;
 use arrow::array::RecordBatch;
 use axum::{
     http::StatusCode,
@@ -22,7 +23,6 @@ use axum::{
 use csv::Writer;
 use datafusion::dataframe::DataFrame;
 use serde::{Deserialize, Serialize};
-use spicepod::component::dataset::Dataset;
 
 use crate::{datafusion::DataFusion, status::ComponentStatus};
 
@@ -44,33 +44,44 @@ fn convert_entry_to_csv<T: Serialize>(entries: &[T]) -> Result<String, Box<dyn s
 }
 
 fn dataset_status(df: &DataFusion, ds: &Dataset) -> ComponentStatus {
-    if df.table_exists(ds.name.as_str()) {
+    if df.table_exists(ds.name.clone()) {
         ComponentStatus::Ready
     } else {
         ComponentStatus::Error
     }
 }
 
-// Prepare a dataframe for Response (as JSON).
-async fn dataframe_to_response(data_frame: DataFrame) -> Response {
+// Prepare a dataframe for Response (as JSON). Also returns the number of rows in the dataframe.
+async fn dataframe_to_response(data_frame: DataFrame) -> (Response, u64) {
     let results = match data_frame.collect().await {
         Ok(results) => results,
         Err(e) => {
             tracing::debug!("Error collecting results: {e}");
-            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+            return (
+                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+                0,
+            );
         }
     };
+
+    let num_rows = results.iter().map(|r| r.num_rows() as u64).sum::<u64>();
 
     let buf = Vec::new();
     let mut writer = arrow_json::ArrayWriter::new(buf);
 
     if let Err(e) = writer.write_batches(results.iter().collect::<Vec<&RecordBatch>>().as_slice()) {
         tracing::debug!("Error converting results to JSON: {e}");
-        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        return (
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+            0,
+        );
     }
     if let Err(e) = writer.finish() {
         tracing::debug!("Error finishing JSON conversion: {e}");
-        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        return (
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+            0,
+        );
     }
 
     let buf = writer.into_inner();
@@ -78,15 +89,18 @@ async fn dataframe_to_response(data_frame: DataFrame) -> Response {
         Ok(res) => res,
         Err(e) => {
             tracing::debug!("Error converting JSON buffer to string: {e}");
-            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+            return (
+                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+                0,
+            );
         }
     };
 
-    (StatusCode::OK, res).into_response()
+    ((StatusCode::OK, res).into_response(), num_rows)
 }
 
 pub(crate) mod query {
-    use arrow::record_batch::RecordBatch;
+    use arrow::{datatypes::Schema, record_batch::RecordBatch};
     use axum::{
         body::Bytes,
         http::{HeaderMap, StatusCode},
@@ -95,10 +109,10 @@ pub(crate) mod query {
     };
     use datafusion::execution::context::SQLOptions;
     use futures::TryStreamExt;
-    use std::sync::Arc;
+    use std::{sync::Arc, time::SystemTime};
     use tokio::sync::RwLock;
 
-    use crate::datafusion::DataFusion;
+    use crate::{datafusion::DataFusion, query_history::QueryHistory};
 
     pub(crate) async fn post(
         Extension(df): Extension<Arc<RwLock<DataFusion>>>,
@@ -112,6 +126,10 @@ pub(crate) mod query {
             }
         };
 
+        let mut q_trace = QueryHistory::new(Arc::<tokio::sync::RwLock<DataFusion>>::clone(&df))
+            .sql(query.clone())
+            .start_time(SystemTime::now());
+
         let restricted_sql_options = SQLOptions::new()
             .with_allow_ddl(false)
             .with_allow_dml(false)
@@ -124,9 +142,22 @@ pub(crate) mod query {
             .await
         {
             Ok(query_result) => match query_result.data.try_collect::<Vec<RecordBatch>>().await {
-                Ok(batches) => (batches, query_result.from_cache),
+                Ok(batches) => {
+                    q_trace = q_trace
+                        .rows_produced(batches.iter().map(|r| r.num_rows() as u64).sum::<u64>())
+                        .schema(
+                            batches
+                                .first()
+                                .map_or(Arc::new(Schema::empty()), RecordBatch::schema),
+                        );
+
+                    (batches, query_result.from_cache)
+                }
                 Err(e) => {
                     tracing::debug!("Error executing query: {e}");
+                    if let Err(e) = q_trace.write().await {
+                        tracing::trace!("Error writing query history: {e}");
+                    }
                     return (
                         StatusCode::BAD_REQUEST,
                         format!("Error processing batch: {e}"),
@@ -136,9 +167,13 @@ pub(crate) mod query {
             },
             Err(e) => {
                 tracing::debug!("Error executing query: {e}");
+                if let Err(e) = q_trace.write().await {
+                    tracing::trace!("Error writing query history: {e}");
+                }
                 return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
             }
         };
+        q_trace = q_trace.results_cache_hit(is_data_from_cache.unwrap_or(false));
 
         let buf = Vec::new();
         let mut writer = arrow_json::ArrayWriter::new(buf);
@@ -146,10 +181,16 @@ pub(crate) mod query {
         if let Err(e) = writer.write_batches(data.iter().collect::<Vec<&RecordBatch>>().as_slice())
         {
             tracing::debug!("Error converting results to JSON: {e}");
+            if let Err(e) = q_trace.write().await {
+                tracing::trace!("Error writing query history: {e}");
+            }
             return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
         }
         if let Err(e) = writer.finish() {
             tracing::debug!("Error finishing JSON conversion: {e}");
+            if let Err(e) = q_trace.write().await {
+                tracing::trace!("Error writing query history: {e}");
+            }
             return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
         }
 
@@ -158,6 +199,9 @@ pub(crate) mod query {
             Ok(res) => res,
             Err(e) => {
                 tracing::debug!("Error converting JSON buffer to string: {e}");
+                if let Err(e) = q_trace.write().await {
+                    tracing::trace!("Error writing query history: {e}");
+                }
                 return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
             }
         };
@@ -166,18 +210,20 @@ pub(crate) mod query {
 
         match is_data_from_cache {
             Some(true) => {
-                if let Ok(value) = "HIT".parse() {
+                if let Ok(value) = "Hit from spiceai".parse() {
                     headers.insert("X-Cache", value);
                 }
             }
             Some(false) => {
-                if let Ok(value) = "MISS".parse() {
+                if let Ok(value) = "Miss from spiceai".parse() {
                     headers.insert("X-Cache", value);
                 }
             }
             None => {}
         };
-
+        if let Err(e) = q_trace.write().await {
+            tracing::trace!("Error writing query history: {e}");
+        }
         (StatusCode::OK, headers, res).into_response()
     }
 }
@@ -348,6 +394,7 @@ pub(crate) mod status {
 pub(crate) mod datasets {
     use std::sync::Arc;
 
+    use crate::{component::dataset::Dataset, Runtime};
     use app::App;
     use axum::{
         extract::Path,
@@ -356,8 +403,8 @@ pub(crate) mod datasets {
         response::{IntoResponse, Response},
         Extension, Json,
     };
+    use datafusion::sql::TableReference;
     use serde::{Deserialize, Serialize};
-    use spicepod::component::dataset::Dataset;
     use tokio::sync::RwLock;
     use tract_core::tract_data::itertools::Itertools;
 
@@ -389,7 +436,6 @@ pub(crate) mod datasets {
         pub name: String,
         pub replication_enabled: bool,
         pub acceleration_enabled: bool,
-        pub depends_on: Option<String>,
 
         #[serde(skip_serializing_if = "Option::is_none")]
         pub status: Option<ComponentStatus>,
@@ -410,14 +456,13 @@ pub(crate) mod datasets {
                 .into_response();
         };
 
+        let valid_datasets = Runtime::get_valid_datasets(readable_app, false);
         let mut datasets: Vec<Dataset> = match filter.source {
-            Some(source) => readable_app
-                .datasets
-                .iter()
+            Some(source) => valid_datasets
+                .into_iter()
                 .filter(|d| d.source() == source)
-                .cloned()
                 .collect(),
-            None => readable_app.datasets.clone(),
+            None => valid_datasets,
         };
 
         if filter.remove_views {
@@ -430,14 +475,9 @@ pub(crate) mod datasets {
             .iter()
             .map(|d| DatasetResponseItem {
                 from: d.from.clone(),
-                name: d.name.clone(),
+                name: d.name.to_quoted_string(),
                 replication_enabled: d.replication.as_ref().is_some_and(|f| f.enabled),
                 acceleration_enabled: d.acceleration.as_ref().is_some_and(|f| f.enabled),
-                depends_on: if d.depends_on.is_empty() {
-                    None
-                } else {
-                    Some(d.depends_on.join(", "))
-                },
                 status: if params.status {
                     Some(dataset_status(&df_read, d))
                 } else {
@@ -557,7 +597,10 @@ pub(crate) mod datasets {
         let df_read = df.read().await;
 
         match df_read
-            .update_refresh_sql(&dataset.name, payload.refresh_sql)
+            .update_refresh_sql(
+                TableReference::parse_str(&dataset.name),
+                payload.refresh_sql,
+            )
             .await
         {
             Ok(()) => (status::StatusCode::OK).into_response(),
@@ -960,12 +1003,14 @@ pub(crate) mod nsql {
         response::{IntoResponse, Response},
         Extension, Json,
     };
-    use llms::nql::{create_nsql, NSQLRuntime, Nql};
     use serde::{Deserialize, Serialize};
-    use std::sync::Arc;
+    use std::{sync::Arc, time::SystemTime};
     use tokio::sync::RwLock;
 
-    use crate::{datafusion::DataFusion, http::v1::dataframe_to_response};
+    use crate::{
+        datafusion::DataFusion, http::v1::dataframe_to_response, query_history::QueryHistory,
+        LLMModelStore,
+    };
 
     fn clean_model_based_sql(input: &str) -> String {
         let no_dashes = match input.strip_prefix("--") {
@@ -983,19 +1028,21 @@ pub(crate) mod nsql {
     pub struct Request {
         pub query: String,
 
-        #[serde(rename = "use", default = "default_runtime")]
-        pub runtime: NSQLRuntime,
+        #[serde(rename = "use", default = "default_model")]
+        pub model: String,
     }
 
-    fn default_runtime() -> NSQLRuntime {
-        NSQLRuntime::Mistral
+    fn default_model() -> String {
+        "nql".to_string()
     }
 
     pub(crate) async fn post(
         Extension(df): Extension<Arc<RwLock<DataFusion>>>,
-        Extension(nsql_model): Extension<Arc<RwLock<Box<dyn Nql>>>>,
+        Extension(nsql_models): Extension<Arc<RwLock<LLMModelStore>>>,
         Json(payload): Json<Request>,
     ) -> Response {
+        let mut q_trace = QueryHistory::new(Arc::<tokio::sync::RwLock<DataFusion>>::clone(&df))
+            .results_cache_hit(false);
         let readable_df = df.read().await;
 
         // Get all public table CREATE TABLE statements to add to prompt.
@@ -1027,28 +1074,39 @@ pub(crate) mod nsql {
             user_query=payload.query,
             table_create_schemas=table_create_stms.join("\n")
         );
+
+        q_trace = q_trace.nsql(nsql_query.clone());
         tracing::trace!("Running prompt: {nsql_query}");
 
-        // Run prompt through model. Only OpenAI is loaded at runtime.
-        let result = if payload.runtime == NSQLRuntime::Openai {
-            match create_nsql(&NSQLRuntime::Openai) {
-                Ok(mut openai_nsql) => openai_nsql.run(nsql_query).await,
-                Err(e) => {
-                    tracing::error!("Failed to load OpenAI NQL model: {e:#?}");
-                    return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-                }
+        let result = match nsql_models.read().await.get(&payload.model) {
+            Some(nql_model) => nql_model.write().await.run(nsql_query).await,
+            None => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Model {} not found", payload.model),
+                )
+                    .into_response()
             }
-        } else {
-            nsql_model.write().await.run(nsql_query).await
         };
 
         // Run the SQL from the NSQL model through datafusion.
-        match result {
+        let resp = match result {
             Ok(Some(model_sql_query)) => {
                 let cleaned_query = clean_model_based_sql(&model_sql_query);
                 tracing::trace!("Running query:\n{cleaned_query}");
-                match readable_df.ctx.sql(&cleaned_query).await {
-                    Ok(result) => dataframe_to_response(result).await,
+
+                q_trace = q_trace
+                    .start_time(SystemTime::now())
+                    .sql(cleaned_query.clone());
+                let result = readable_df.ctx.sql(&cleaned_query).await;
+
+                match result {
+                    Ok(result) => {
+                        q_trace = q_trace.schema(Arc::new(result.schema().clone().into()));
+                        let (resp, num_rows) = dataframe_to_response(result).await;
+                        q_trace = q_trace.rows_produced(num_rows).end_time(SystemTime::now());
+                        resp
+                    }
                     Err(e) => {
                         tracing::trace!("Error running query: {e}");
                         (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
@@ -1067,6 +1125,10 @@ pub(crate) mod nsql {
                 tracing::trace!("Error running NSQL model: {e}");
                 (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
             }
+        };
+        if let Err(e) = q_trace.write().await {
+            tracing::trace!("Error writing query history: {e}");
         }
+        resp
     }
 }
