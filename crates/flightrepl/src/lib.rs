@@ -219,12 +219,10 @@ async fn get_records(
     while let Some(data) = stream.next().await {
         match data {
             Ok(data) => {
-                println!("OK");
                 total_rows += data.num_rows();
                 records.push(data);
             }
             Err(e) => {
-                println!("Not OK");
                 return Err(e);
             }
         }
@@ -244,7 +242,6 @@ async fn display_records(
     total_rows: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let schema = records[0].schema();
-    println!("Schema: {schema}");
 
     let ctx = SessionContext::new();
     let provider = MemTable::try_new(schema, vec![records])?;
@@ -256,7 +253,6 @@ async fn display_records(
     );
 
     let num_rows = df.clone().count().await?;
-    println!("num_rows: {num_rows}");
 
     if let Err(e) = df.show().await {
         println!("Error displaying results: {e}");

@@ -72,36 +72,6 @@ arrow-odbc = { version = "9.0.0" }
 snowflake-api = { git = "https://github.com/spiceai/snowflake-rs.git", folder = "snowflake-api", rev = "5dab964abef23314e7a3f27ae89b83352e315206" }
 suppaftp = { version = "5.3.1", features = ["async"] }
 ssh2 = { version = "0.9.4" }
-datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "9dc7404eb251b3949247f3cc8c2ba89feea5dee7" }
-datafusion-federation-sql = { git = "https://github.com/spiceai/datafusion-federation.git", folder = "sources/sql", rev = "9dc7404eb251b3949247f3cc8c2ba89feea5dee7" }
+datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "bf5fac66ca196ca52221df1ac90f38879d9b6ea8" }
+datafusion-federation-sql = { git = "https://github.com/spiceai/datafusion-federation.git", folder = "sources/sql", rev = "bf5fac66ca196ca52221df1ac90f38879d9b6ea8" }
 object_store = { version = "0.9.1" }
-
-[patch.crates-io]
-arrow-flight = { path = "/Users/phillip/code/apache/arrow-rs/arrow-flight" }
-arrow = { path = "/Users/phillip/code/apache/arrow-rs/arrow" }
-arrow-array = { path = "/Users/phillip/code/apache/arrow-rs/arrow-array" }
-arrow-buffer = { path = "/Users/phillip/code/apache/arrow-rs/arrow-buffer" }
-arrow-ipc = { path = "/Users/phillip/code/apache/arrow-rs/arrow-ipc" }
-arrow-ord = { path = "/Users/phillip/code/apache/arrow-rs/arrow-ord" }
-arrow-schema = { path = "/Users/phillip/code/apache/arrow-rs/arrow-schema" }
-arrow-string = { path = "/Users/phillip/code/apache/arrow-rs/arrow-string" }
-arrow-data = { path = "/Users/phillip/code/apache/arrow-rs/arrow-data" }
-
-[patch."https://github.com/spiceai/datafusion.git"]
-datafusion = { path = "/Users/phillip/code/apache/datafusion/datafusion/core" }
-datafusion-substrait = { path = "/Users/phillip/code/apache/datafusion/datafusion/substrait" }
-datafusion-proto = { path = "/Users/phillip/code/apache/datafusion/datafusion/proto" }
-datafusion-expr = { path = "/Users/phillip/code/apache/datafusion/datafusion/expr" }
-datafusion-execution = { path = "/Users/phillip/code/apache/datafusion/datafusion/execution" }
-datafusion-sql = { path = "/Users/phillip/code/apache/datafusion/datafusion/sql" }
-datafusion-physical-plan = { path = "/Users/phillip/code/apache/datafusion/datafusion/physical-plan" }
-datafusion-common = { path = "/Users/phillip/code/apache/datafusion/datafusion/common" }
-datafusion-common-runtime = { path = "/Users/phillip/code/apache/datafusion/datafusion/common-runtime" }
-datafusion-physical-expr = { path = "/Users/phillip/code/apache/datafusion/datafusion/physical-expr" }
-datafusion-physical-expr-common = { path = "/Users/phillip/code/apache/datafusion/datafusion/physical-expr-common" }
-datafusion-functions = { path = "/Users/phillip/code/apache/datafusion/datafusion/functions" }
-datafusion-functions-array = { path = "/Users/phillip/code/apache/datafusion/datafusion/functions-array" }
-
-[patch."https://github.com/spiceai/datafusion-federation.git"]
-datafusion-federation = { path = "/Users/phillip/code/datafusion-contrib/datafusion-federation/datafusion-federation" }
-datafusion-federation-sql = { path = "/Users/phillip/code/datafusion-contrib/datafusion-federation/sources/sql" }
