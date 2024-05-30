@@ -18,7 +18,7 @@ use std::{sync::Arc, time::SystemTime};
 
 use arrow::datatypes::Schema;
 use arrow_tools::schema::verify_schema;
-use cache::{is_cache_allowed_for_query, to_cached_record_batch_stream, QueryResult};
+use cache::{cache_is_enabled_for_plan, to_cached_record_batch_stream, QueryResult};
 use datafusion::{
     error::DataFusionError,
     execution::{context::SQLOptions, SendableRecordBatchStream},
