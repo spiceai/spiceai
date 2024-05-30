@@ -106,7 +106,7 @@ pub fn cache_is_enabled_for_plan(plan: &LogicalPlan) -> bool {
     }
 
     for input in plan.inputs() {
-        if !is_cache_allowed_for_query(input) {
+        if ! cache_is_enabled_for_plan(input) {
             return false;
         }
     }
