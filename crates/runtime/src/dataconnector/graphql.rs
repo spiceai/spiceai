@@ -78,7 +78,7 @@ impl GraphQLClient {
             })?;
 
         let mut response: serde_json::Value = response.json().await.map_err(|_| {
-            datafusion::error::DataFusionError::Execution("Failed to execute query".to_string())
+            datafusion::error::DataFusionError::Execution("Failed to parse response".to_string())
         })?;
         for key in self.json_path.split('.') {
             response = response[key].clone();
@@ -99,7 +99,7 @@ impl GraphQLClient {
             infer_json_schema_from_iterator(unwraped.clone().into_iter().map(Result::Ok)).map_err(
                 |_| {
                     datafusion::error::DataFusionError::Execution(
-                        "Failed to infer schema.".to_string(),
+                        "Failed to infer schema".to_string(),
                     )
                 },
             )?,
@@ -108,7 +108,7 @@ impl GraphQLClient {
         let mut res = vec![];
         for v in unwraped {
             let buf = v.to_string();
-            let batch = ReaderBuilder::new(schema.clone())
+            let batch = ReaderBuilder::new(Arc::clone(&schema))
                 .with_batch_size(1024)
                 .build(Cursor::new(buf.as_bytes()))
                 .map_err(|_| {
@@ -130,7 +130,7 @@ impl GraphQLClient {
 }
 
 impl GraphQL {
-    async fn get_client(&self, dataset: &Dataset) -> super::DataConnectorResult<GraphQLClient> {
+    fn get_client(&self, dataset: &Dataset) -> super::DataConnectorResult<GraphQLClient> {
         let mut client_builder = reqwest::Client::builder();
         let token = get_secret_or_param(&self.params, &self.secret, "auth_token_key", "auth_token");
 
@@ -143,7 +143,7 @@ impl GraphQL {
                 message: "Query not found",
             })?
             .to_owned();
-        let endpoint = Url::parse(&dataset.path()).map_err(|e| e.into()).context(
+        let endpoint = Url::parse(&dataset.path()).map_err(Into::into).context(
             super::InvalidConfigurationSnafu {
                 dataconnector: "GraphQL",
                 message: "Invalid URL",
@@ -198,7 +198,7 @@ impl GraphQLTableProvider {
             client
                 .execute()
                 .await
-                .map_err(|e| e.into())
+                .map_err(Into::into)
                 .context(super::InternalSnafu {
                     dataconnector: "GraphQL",
                     code: "GTP-GC-e".to_string(), //GraphQLTableProvider-GraphQLClient-execute
@@ -215,7 +215,7 @@ impl TableProvider for GraphQLTableProvider {
     }
 
     fn schema(&self) -> Arc<Schema> {
-        self.schema.clone()
+        Arc::clone(&self.schema)
     }
 
     fn table_type(&self) -> TableType {
@@ -246,7 +246,7 @@ impl DataConnector for GraphQL {
         &self,
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        let client = self.get_client(&dataset).await?;
+        let client = self.get_client(dataset)?;
 
         Ok(Arc::new(GraphQLTableProvider::new(client).await?))
     }
