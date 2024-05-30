@@ -26,20 +26,16 @@ use crate::dataconnector::{DataConnector, DataConnectorError};
 use crate::dataupdate::{DataUpdate, DataUpdateExecutionPlan, UpdateType};
 use crate::get_dependent_table_names;
 use crate::object_store_registry::default_runtime_env;
+
 use arrow::datatypes::Schema;
 use arrow_tools::schema::verify_schema;
-use cache::{
-    get_logical_plan_input_tables, to_cached_record_batch_stream, QueryResult,
-    QueryResultsCacheProvider,
-};
+use cache::QueryResultsCacheProvider;
 use datafusion::catalog::schema::SchemaProvider;
 use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider};
 use datafusion::datasource::{TableProvider, ViewTable};
 use datafusion::error::DataFusionError;
-use datafusion::execution::context::{SQLOptions, SessionConfig, SessionContext, SessionState};
-use datafusion::execution::SendableRecordBatchStream;
+use datafusion::execution::context::{SessionConfig, SessionContext, SessionState};
 use datafusion::physical_plan::collect;
-use datafusion::physical_plan::memory::MemoryStream;
 use datafusion::sql::parser::DFParser;
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::{sqlparser, TableReference};
@@ -49,6 +45,8 @@ use snafu::prelude::*;
 use tokio::spawn;
 use tokio::sync::oneshot;
 use tokio::time::{sleep, Instant};
+
+pub mod query;
 
 pub mod filter_converter;
 pub mod refresh_sql;
@@ -167,18 +165,6 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Failed to access query results cache: {source}"))]
-    FailedToAccessCache { source: cache::Error },
-
-    #[snafu(display("Failed to execute query: {source}"))]
-    UnableToExecuteQuery { source: DataFusionError },
-
-    #[snafu(display("Unable to collect results after query execution: {source}"))]
-    UnableToCollectResults { source: DataFusionError },
-
-    #[snafu(display("Unable to convert cached result to a record batch stream: {source}"))]
-    UnableToCreateMemoryStream { source: DataFusionError },
-
     #[snafu(display("Unable to get the lock of data writers"))]
     UnableToLockDataWriters {},
 }
@@ -196,7 +182,7 @@ pub enum Table {
 pub struct DataFusion {
     pub ctx: Arc<SessionContext>,
     data_writers: RwLock<HashSet<TableReference>>,
-    cache_provider: Option<Arc<QueryResultsCacheProvider>>,
+    pub cache_provider: Option<Arc<QueryResultsCacheProvider>>,
 }
 
 impl DataFusion {
@@ -280,83 +266,6 @@ impl DataFusion {
         }
 
         None
-    }
-
-    pub async fn query_with_cache(
-        &self,
-        sql: &str,
-        restricted_sql_options: Option<SQLOptions>,
-    ) -> Result<QueryResult> {
-        let session = self.ctx.state();
-        let plan = session
-            .create_logical_plan(sql)
-            .await
-            .context(UnableToExecuteQuerySnafu)?;
-
-        let query_input_tables = get_logical_plan_input_tables(&plan);
-        let cache_enabled_for_query = !(query_input_tables.is_empty()
-            || query_input_tables.contains("information_schema.tables"));
-
-        if cache_enabled_for_query {
-            if let Some(cache_provider) = &self.cache_provider {
-                if let Some(cached_result) = cache_provider
-                    .get(&plan)
-                    .await
-                    .context(FailedToAccessCacheSnafu)?
-                {
-                    let record_batch_stream = Box::pin(
-                        MemoryStream::try_new(
-                            cached_result.records.to_vec(),
-                            cached_result.schema,
-                            None,
-                        )
-                        .context(UnableToCreateMemoryStreamSnafu)?,
-                    );
-
-                    return Ok(QueryResult::new(record_batch_stream, Some(true)));
-                }
-            }
-        }
-
-        if let Some(restricted_sql_options) = restricted_sql_options {
-            restricted_sql_options
-                .verify_plan(&plan)
-                .context(UnableToExecuteQuerySnafu)?;
-        }
-
-        let plan_copy = plan.clone();
-
-        let df = self
-            .ctx
-            .execute_logical_plan(plan)
-            .await
-            .context(UnableToExecuteQuerySnafu)?;
-
-        let df_schema: Arc<Schema> = df.schema().clone().into();
-
-        let res_stream: SendableRecordBatchStream = df
-            .execute_stream()
-            .await
-            .context(UnableToCollectResultsSnafu)?;
-
-        let res_schema = res_stream.schema();
-
-        verify_schema(df_schema.fields(), res_schema.fields()).context(SchemaMismatchSnafu)?;
-
-        if cache_enabled_for_query {
-            if let Some(cache_provider) = &self.cache_provider {
-                let record_batch_stream = to_cached_record_batch_stream(
-                    Arc::clone(cache_provider),
-                    res_stream,
-                    plan_copy,
-                    query_input_tables,
-                );
-
-                return Ok(QueryResult::new(record_batch_stream, Some(false)));
-            }
-        }
-
-        Ok(QueryResult::new(res_stream, None))
     }
 
     pub async fn has_table(&self, table_reference: &TableReference) -> bool {
