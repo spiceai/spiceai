@@ -76,39 +76,41 @@ pub fn to_cached_record_batch_stream(
 #[must_use]
 pub fn get_logical_plan_input_tables(plan: &LogicalPlan) -> HashSet<String> {
     let mut table_names: HashSet<String> = HashSet::new();
-    collect_table_names(plan, &mut table_names);
+    let mut plan_stack = vec![plan];
+
+    while let Some(current_plan) = plan_stack.pop() {
+        if let LogicalPlan::TableScan(source, ..) = current_plan {
+            table_names.insert(source.table_name.to_string().to_lowercase());
+        }
+
+        plan_stack.extend(current_plan.inputs());
+    }
+
     table_names
 }
 
-fn collect_table_names(plan: &LogicalPlan, table_names: &mut HashSet<String>) {
-    if let LogicalPlan::TableScan(source, ..) = plan {
-        table_names.insert(source.table_name.to_string().to_lowercase());
-    }
-
-    plan.inputs().iter().for_each(|input| {
-        collect_table_names(input, table_names);
-    });
-}
-
 #[must_use]
-pub fn is_cache_allowed_for_query(plan: &LogicalPlan) -> bool {
-    match plan {
-        LogicalPlan::TableScan(source, ..) => {
-            let table_name = source.table_name.to_string();
-            return !(table_name.starts_with("information_schema.")
-                || table_name.starts_with("runtime."));
-        }
-        LogicalPlan::Explain { .. }
-        | LogicalPlan::Analyze { .. }
-        | LogicalPlan::DescribeTable { .. }
-        | LogicalPlan::Statement(..) => return false,
-        _ => {}
-    }
+pub fn cache_is_enabled_for_plan(plan: &LogicalPlan) -> bool {
+    let mut plan_stack = vec![plan];
 
-    for input in plan.inputs() {
-        if !is_cache_allowed_for_query(input) {
-            return false;
+    while let Some(current_plan) = plan_stack.pop() {
+        match current_plan {
+            LogicalPlan::TableScan(source, ..) => {
+                let table_name = source.table_name.to_string();
+                if table_name.starts_with("information_schema.")
+                    || table_name.starts_with("runtime.")
+                {
+                    return false;
+                }
+            }
+            LogicalPlan::Explain { .. }
+            | LogicalPlan::Analyze { .. }
+            | LogicalPlan::DescribeTable { .. }
+            | LogicalPlan::Statement(..) => return false,
+            _ => {}
         }
+
+        plan_stack.extend(current_plan.inputs());
     }
 
     true
@@ -256,9 +258,34 @@ mod tests {
         assert_eq!(table_names, expected);
     }
 
+    #[tokio::test]
+    async fn test_cache_is_enabled_for_system_query_describe() {
+        let sql = "describe customer";
+        let logical_plan = parse_sql_to_logical_plan(sql).await;
+
+        assert!(!cache_is_enabled_for_plan(&logical_plan));
+    }
+
+    #[tokio::test]
+    async fn test_cache_is_enabled_for_show_tables() {
+        let sql = "show tables";
+        let logical_plan = parse_sql_to_logical_plan(sql).await;
+
+        assert!(!cache_is_enabled_for_plan(&logical_plan));
+    }
+
+    #[tokio::test]
+    async fn test_cache_is_enabled_for_simple_select() {
+        let sql = "SELECT * FROM customer";
+        let logical_plan = parse_sql_to_logical_plan(sql).await;
+
+        assert!(cache_is_enabled_for_plan(&logical_plan));
+    }
+
     fn create_session_context() -> SessionContext {
         let config = SessionConfig::new().with_information_schema(true);
         let ctx = SessionContext::new_with_config(config);
+
         register_tables(&ctx);
 
         ctx
