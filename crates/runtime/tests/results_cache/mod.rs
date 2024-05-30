@@ -19,7 +19,7 @@ use std::sync::Arc;
 use app::AppBuilder;
 use arrow::array::RecordBatch;
 use futures::TryStreamExt;
-use runtime::{query_context::QueryContext, Runtime};
+use runtime::{datafusion::query::QueryBuilder, Runtime};
 use spicepod::component::{
     dataset::Dataset, params::Params, runtime::ResultsCache, secrets::SpiceSecretStore,
 };
@@ -79,11 +79,10 @@ async fn execute_query_and_check_cache_status(
     query: &str,
     expected_cache_status: Option<bool>,
 ) -> Result<Vec<RecordBatch>, String> {
-    let ctx = QueryContext::new(Arc::clone(&rt.df)).sql(query.to_string());
+    let query = QueryBuilder::new(query.to_string(), Arc::clone(&rt.df)).build();
 
-    let query_result = rt
-        .df
-        .query_with_cache(query, None, ctx)
+    let query_result = query
+        .run()
         .await
         .map_err(|e| format!("Failed to execute query: {e}"))?;
 

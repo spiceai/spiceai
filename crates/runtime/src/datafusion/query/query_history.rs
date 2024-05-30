@@ -20,10 +20,7 @@ use std::{
 };
 
 use crate::component::dataset::TimeFormat;
-use crate::{
-    component::dataset::acceleration::Acceleration, datafusion::SPICE_RUNTIME_SCHEMA,
-    query_context::QueryContext,
-};
+use crate::{component::dataset::acceleration::Acceleration, datafusion::SPICE_RUNTIME_SCHEMA};
 use arrow::{
     array::{BooleanArray, RecordBatch, StringArray, TimestampNanosecondArray, UInt64Array},
     datatypes::{DataType, Field, Schema, TimeUnit},
@@ -37,6 +34,8 @@ use crate::{
     dataupdate::DataUpdate,
     internal_table::create_internal_accelerated_table,
 };
+
+use super::Query;
 
 pub const DEFAULT_QUERY_HISTORY_TABLE: &str = "query_history";
 
@@ -116,32 +115,6 @@ pub enum Error {
     },
 }
 
-#[allow(clippy::module_name_repetitions)]
-pub async fn write(ctx: &QueryContext) -> Result<(), Error> {
-    validate(ctx)?;
-
-    let data = query_context_into_record_batch(ctx)
-        .boxed()
-        .context(UnableToWriteToTableSnafu)?;
-
-    let data_update = DataUpdate {
-        schema: Arc::new(table_schema()),
-        data: vec![data],
-        update_type: crate::dataupdate::UpdateType::Append,
-    };
-
-    ctx.df
-        .write_data(
-            TableReference::partial(SPICE_RUNTIME_SCHEMA, DEFAULT_QUERY_HISTORY_TABLE),
-            data_update,
-        )
-        .await
-        .boxed()
-        .context(UnableToWriteToTableSnafu)?;
-
-    Ok(())
-}
-
 /// Checks if a required field is missing in a [`QueryHistory`] struct. Adds field name to missing fields vector if field is None.
 macro_rules! check_required_field {
     ($field:expr, $field_name:expr, $missing_fields:expr) => {
@@ -151,59 +124,86 @@ macro_rules! check_required_field {
     };
 }
 
-fn query_context_into_record_batch(ctx: &QueryContext) -> Result<RecordBatch, Error> {
-    let end_time = ctx
-        .end_time
-        .and_then(|s| {
-            s.duration_since(SystemTime::UNIX_EPOCH)
-                .map(|x| i64::try_from(x.as_nanos()))
-                .ok()
-        })
-        .transpose()
-        .boxed()
-        .context(UnableToCreateRowSnafu)?;
+impl Query {
+    pub async fn write(&self) -> Result<(), Error> {
+        self.validate()?;
 
-    let start_time = ctx
-        .start_time
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|duration| i64::try_from(duration.as_nanos()).ok())
-        .boxed()
-        .context(UnableToCreateRowSnafu)?;
+        let data = self
+            .query_context_into_record_batch()
+            .boxed()
+            .context(UnableToWriteToTableSnafu)?;
 
-    RecordBatch::try_new(
-        Arc::new(table_schema()),
-        vec![
-            Arc::new(StringArray::from(vec![ctx.query_id.to_string()])),
-            Arc::new(StringArray::from(vec![ctx
-                .schema
-                .as_ref()
-                .map(ToString::to_string)])),
-            Arc::new(StringArray::from(vec![ctx.sql.clone()])),
-            Arc::new(StringArray::from(vec![ctx.nsql.clone()])),
-            Arc::new(TimestampNanosecondArray::from(vec![start_time])),
-            Arc::new(TimestampNanosecondArray::from(vec![end_time])),
-            Arc::new(UInt64Array::from(vec![ctx.execution_time])),
-            Arc::new(UInt64Array::from(vec![ctx.rows_produced])),
-            Arc::new(BooleanArray::from(vec![ctx.results_cache_hit])),
-        ],
-    )
-    .boxed()
-    .context(UnableToCreateRowSnafu)
-}
+        let data_update = DataUpdate {
+            schema: Arc::new(table_schema()),
+            data: vec![data],
+            update_type: crate::dataupdate::UpdateType::Append,
+        };
 
-fn validate(ctx: &QueryContext) -> Result<(), Error> {
-    let mut missing_fields: Vec<&str> = Vec::new();
+        self.df
+            .write_data(
+                TableReference::partial(SPICE_RUNTIME_SCHEMA, DEFAULT_QUERY_HISTORY_TABLE),
+                data_update,
+            )
+            .await
+            .boxed()
+            .context(UnableToWriteToTableSnafu)?;
 
-    check_required_field!(ctx.schema, "schema", missing_fields);
-    check_required_field!(ctx.sql, "sql", missing_fields);
-    check_required_field!(ctx.end_time, "end_time", missing_fields);
-    check_required_field!(ctx.rows_produced, "rows_produced", missing_fields);
-
-    if missing_fields.is_empty() {
         Ok(())
-    } else {
-        Err(Error::MissingColumnsInRow {
-            columns: missing_fields.join(", "),
-        })
+    }
+
+    fn query_context_into_record_batch(&self) -> Result<RecordBatch, Error> {
+        let end_time = self
+            .end_time
+            .and_then(|s| {
+                s.duration_since(SystemTime::UNIX_EPOCH)
+                    .map(|x| i64::try_from(x.as_nanos()))
+                    .ok()
+            })
+            .transpose()
+            .boxed()
+            .context(UnableToCreateRowSnafu)?;
+
+        let start_time = self
+            .start_time
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|duration| i64::try_from(duration.as_nanos()).ok())
+            .boxed()
+            .context(UnableToCreateRowSnafu)?;
+
+        RecordBatch::try_new(
+            Arc::new(table_schema()),
+            vec![
+                Arc::new(StringArray::from(vec![self.query_id.to_string()])),
+                Arc::new(StringArray::from(vec![self
+                    .schema
+                    .as_ref()
+                    .map(ToString::to_string)])),
+                Arc::new(StringArray::from(vec![self.sql.clone()])),
+                Arc::new(StringArray::from(vec![self.nsql.clone()])),
+                Arc::new(TimestampNanosecondArray::from(vec![start_time])),
+                Arc::new(TimestampNanosecondArray::from(vec![end_time])),
+                Arc::new(UInt64Array::from(vec![self.execution_time])),
+                Arc::new(UInt64Array::from(vec![self.rows_produced])),
+                Arc::new(BooleanArray::from(vec![self.results_cache_hit])),
+            ],
+        )
+        .boxed()
+        .context(UnableToCreateRowSnafu)
+    }
+
+    fn validate(&self) -> Result<(), Error> {
+        let mut missing_fields: Vec<&str> = Vec::new();
+
+        check_required_field!(self.schema, "schema", missing_fields);
+        check_required_field!(self.end_time, "end_time", missing_fields);
+        check_required_field!(self.rows_produced, "rows_produced", missing_fields);
+
+        if missing_fields.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::MissingColumnsInRow {
+                columns: missing_fields.join(", "),
+            })
+        }
     }
 }

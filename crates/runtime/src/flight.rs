@@ -14,10 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::datafusion::query::QueryBuilder;
 use crate::datafusion::DataFusion;
 use crate::dataupdate::DataUpdate;
 use crate::measure_scope_ms;
-use crate::query_context::QueryContext;
 use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
 use arrow::ipc::writer::{DictionaryTracker, IpcDataGenerator};
@@ -179,12 +179,11 @@ impl Service {
             .with_allow_dml(false)
             .with_allow_statements(false);
 
-        let ctx = QueryContext::new(Arc::clone(&datafusion)).sql(sql.clone());
+        let query = QueryBuilder::new(sql, Arc::clone(&datafusion))
+            .restricted_sql_options(Some(restricted_sql_options))
+            .build();
 
-        let batches_stream = datafusion
-            .query_with_cache(&sql, Some(restricted_sql_options), ctx)
-            .await
-            .map_err(to_tonic_err)?;
+        let batches_stream = query.run().await.map_err(to_tonic_err)?;
 
         let schema = batches_stream.data.schema();
         let options = datafusion::arrow::ipc::writer::IpcWriteOptions::default();

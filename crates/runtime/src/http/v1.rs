@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use crate::{component::dataset::Dataset, query_context::QueryContext};
+use crate::{component::dataset::Dataset, datafusion::query::QueryBuilder};
 use arrow::array::RecordBatch;
 use axum::{
     http::{HeaderMap, StatusCode},
@@ -60,32 +60,30 @@ pub async fn sql_to_http_response(
     df: Arc<DataFusion>,
     sql: &str,
     restricted_sql_options: Option<SQLOptions>,
-    nql: Option<&str>,
+    nsql: Option<String>,
 ) -> Response {
-    let mut ctx = QueryContext::new(Arc::clone(&df)).sql(sql.to_string());
+    let query = QueryBuilder::new(sql.to_string(), Arc::clone(&df))
+        .restricted_sql_options(restricted_sql_options)
+        .nsql(nsql)
+        .build();
 
-    if let Some(nsql) = nql {
-        ctx = ctx.nsql(nsql.to_string());
-    }
-
-    let (data, is_data_from_cache) =
-        match df.query_with_cache(sql, restricted_sql_options, ctx).await {
-            Ok(query_result) => match query_result.data.try_collect::<Vec<RecordBatch>>().await {
-                Ok(batches) => (batches, query_result.from_cache),
-                Err(e) => {
-                    tracing::debug!("Error executing query: {e}");
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        format!("Error processing batch: {e}"),
-                    )
-                        .into_response();
-                }
-            },
+    let (data, is_data_from_cache) = match query.run().await {
+        Ok(query_result) => match query_result.data.try_collect::<Vec<RecordBatch>>().await {
+            Ok(batches) => (batches, query_result.from_cache),
             Err(e) => {
                 tracing::debug!("Error executing query: {e}");
-                return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("Error processing batch: {e}"),
+                )
+                    .into_response();
             }
-        };
+        },
+        Err(e) => {
+            tracing::debug!("Error executing query: {e}");
+            return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+        }
+    };
     let buf = Vec::new();
     let mut writer = arrow_json::ArrayWriter::new(buf);
 
@@ -963,8 +961,6 @@ pub(crate) mod nsql {
         Extension(nsql_models): Extension<Arc<RwLock<LLMModelStore>>>,
         Json(payload): Json<Request>,
     ) -> Response {
-        let df_copy = Arc::clone(&df);
-
         // Get all public table CREATE TABLE statements to add to prompt.
         let tables = match df.get_public_table_names() {
             Ok(t) => t,
@@ -1022,10 +1018,10 @@ pub(crate) mod nsql {
                 tracing::trace!("Running query:\n{cleaned_query}");
 
                 sql_to_http_response(
-                    df_copy,
+                    Arc::clone(&df),
                     &cleaned_query,
                     Some(restricted_sql_options),
-                    Some(&nsql_query_copy),
+                    Some(nsql_query_copy),
                 )
                 .await
             }
