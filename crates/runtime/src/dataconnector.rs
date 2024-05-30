@@ -159,6 +159,12 @@ pub enum DataConnectorError {
         table_name: String,
     },
 
+    #[snafu(display("Unable to handle request for {dataconnector}: {source}"))]
+    UnableToHandleRequest {
+        dataconnector: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
     #[snafu(display(
         "An internal error occurred in the {dataconnector} Data Connector. Report a bug on GitHub (github.com/spiceai/spiceai) and reference the code: {code}"
     ))]

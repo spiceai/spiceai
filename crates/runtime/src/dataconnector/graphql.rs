@@ -77,6 +77,17 @@ impl GraphQLClient {
                 datafusion::error::DataFusionError::Execution("Failed to execute query".to_string())
             })?;
 
+        if !response.status().is_success() {
+            return Err(datafusion::error::DataFusionError::Execution(format!(
+                "Request error:\n{}",
+                response
+                    .json::<serde_json::Value>()
+                    .await
+                    .map(|v| serde_json::to_string_pretty(&v).unwrap_or_default())
+                    .unwrap_or_default()
+            )));
+        }
+
         let mut response: serde_json::Value = response.json().await.map_err(|_| {
             datafusion::error::DataFusionError::Execution("Failed to parse response".to_string())
         })?;
@@ -194,15 +205,11 @@ struct GraphQLTableProvider {
 
 impl GraphQLTableProvider {
     pub async fn new(client: GraphQLClient) -> super::DataConnectorResult<Self> {
-        let (_, schema) =
-            client
-                .execute()
-                .await
-                .map_err(Into::into)
-                .context(super::InternalSnafu {
-                    dataconnector: "GraphQL",
-                    code: "GTP-GC-e".to_string(), //GraphQLTableProvider-GraphQLClient-execute
-                })?;
+        let (_, schema) = client.execute().await.map_err(Into::into).context(
+            super::UnableToHandleRequestSnafu {
+                dataconnector: "GraphQL",
+            },
+        )?;
 
         Ok(Self { client, schema })
     }
