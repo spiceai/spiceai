@@ -316,7 +316,7 @@ impl Runtime {
         let mut futures = vec![];
         for ds in &valid_datasets {
             status::update_dataset(&ds.name, status::ComponentStatus::Initializing);
-            futures.push(self.load_dataset_at_startup(ds, &valid_datasets));
+            futures.push(self.load_dataset(ds, &valid_datasets));
         }
 
         let app = self.app.read().await;
@@ -330,12 +330,6 @@ impl Runtime {
         }
 
         let _ = join_all(futures).await;
-    }
-
-    pub async fn load_dataset_at_startup(&self, ds: &Dataset, all_datasets: &[Dataset]) {
-        status::update_dataset_startup_status(&ds.name, status::ComponentStatus::Initializing);
-        self.load_dataset(ds, all_datasets).await;
-        status::update_dataset_startup_status(&ds.name, status::ComponentStatus::Ready);
     }
 
     // Caller must set `status::update_dataset(...` before calling `load_dataset`. This function will set error/ready statuses appropriately.`
