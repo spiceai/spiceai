@@ -39,9 +39,10 @@ use datafusion::query::query_history;
 use datafusion::SPICE_RUNTIME_SCHEMA;
 use futures::future::join_all;
 use futures::StreamExt;
+use llms::embeddings::Embed;
 use llms::nql::Nql;
 use metrics::SetRecorderError;
-use model::try_to_nql;
+use model::{try_to_embedding, try_to_nql};
 use model_components::{model::Model, modelsource::source as model_source};
 pub use notify::Error as NotifyError;
 use secrets::{spicepod_secret_store_type, Secret};
@@ -192,12 +193,14 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub type LLMModelStore = HashMap<String, RwLock<Box<dyn Nql>>>;
+pub type EmbeddingModelStore = HashMap<String, RwLock<Box<dyn Embed>>>;
 
 pub struct Runtime {
     pub app: Arc<RwLock<Option<App>>>,
     pub df: Arc<DataFusion>,
     pub models: Arc<RwLock<HashMap<String, Model>>>,
     pub llms: Arc<RwLock<LLMModelStore>>,
+    pub embeds: Arc<RwLock<EmbeddingModelStore>>,
     pub pods_watcher: Option<podswatcher::PodsWatcher>,
     pub secrets_provider: Arc<RwLock<secrets::SecretsProvider>>,
 
@@ -221,6 +224,7 @@ impl Runtime {
             df: Arc::new(DataFusion::new_with_cache_provider(cache_provider)),
             models: Arc::new(RwLock::new(HashMap::new())),
             llms: Arc::new(RwLock::new(HashMap::new())),
+            embeds: Arc::new(RwLock::new(HashMap::new())),
             pods_watcher: None,
             secrets_provider: Arc::new(RwLock::new(secrets::SecretsProvider::new())),
             spaced_tracer: Arc::new(tracers::SpacedTracer::new(Duration::from_secs(15))),
@@ -728,6 +732,37 @@ impl Runtime {
         }
     }
 
+    pub async fn load_embeddings(&self) {
+        let app_lock = self.app.read().await;
+        if let Some(app) = app_lock.as_ref() {
+            for in_embed in &app.llms {
+                if !in_embed.can_embed {
+                    continue;
+                }
+
+                status::update_embedding(&in_embed.name, status::ComponentStatus::Initializing);
+                match try_to_embedding(in_embed) {
+                    Ok(e) => {
+                        let mut embeds_map = self.embeds.write().await;
+                        embeds_map.insert(in_embed.name.clone(), e.into());
+                        tracing::info!("Embedding [{}] ready to embed", in_embed.name);
+                        metrics::gauge!("embeddings_count", "embeddings" => in_embed.name.clone(), "source" => in_embed.get_prefix().map(|x| x.to_string()).unwrap_or_default()).increment(1.0);
+                        status::update_embedding(&in_embed.name, status::ComponentStatus::Ready);
+                    }
+                    Err(e) => {
+                        metrics::counter!("embeddings_load_error").increment(1);
+                        status::update_embedding(&in_embed.name, status::ComponentStatus::Error);
+                        tracing::warn!(
+                            "Unable to load embedding from spicepod {}, error: {}",
+                            in_embed.name,
+                            e,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     pub async fn load_models(&self) {
         let app_lock = self.app.read().await;
         if let Some(app) = app_lock.as_ref() {
@@ -839,6 +874,7 @@ impl Runtime {
             Arc::clone(&self.df),
             Arc::clone(&self.models),
             Arc::clone(&self.llms),
+            Arc::clone(&self.embeds),
             config.clone().into(),
             with_metrics,
         );

@@ -27,6 +27,9 @@ pub struct Llm {
     pub from: String,
     pub name: String,
 
+    #[serde(default)]
+    pub can_embed: bool,
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub params: Option<HashMap<String, String>>,
 
@@ -40,6 +43,7 @@ impl WithDependsOn<Llm> for Llm {
         Llm {
             from: self.from.clone(),
             name: self.name.clone(),
+            can_embed: self.can_embed,
             depends_on: depends_on.to_vec(),
             params: self.params.clone(),
         }
