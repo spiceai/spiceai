@@ -1128,7 +1128,7 @@ pub(crate) mod embed {
     };
     use datafusion::execution::context::SQLOptions;
     use futures::TryStreamExt;
-    
+
     use serde::{Deserialize, Serialize};
     use std::sync::Arc;
     use tokio::sync::RwLock;
@@ -1233,13 +1233,11 @@ pub(crate) mod embed {
                     Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
                 }
             }
-            None => {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Model {model} not found"),
-                )
-                    .into_response()
-            }
+            None => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Model {model} not found"),
+            )
+                .into_response(),
         }
     }
 }
