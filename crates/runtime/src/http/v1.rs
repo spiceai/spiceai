@@ -1055,7 +1055,10 @@ pub(crate) mod embed {
     use std::sync::Arc;
     use tokio::sync::RwLock;
 
-    use crate::{datafusion::DataFusion, EmbeddingModelStore};
+    use crate::{
+        datafusion::{query::QueryBuilder, DataFusion},
+        EmbeddingModelStore,
+    };
 
     #[derive(Debug, Serialize, Deserialize)]
     #[serde(rename_all = "lowercase")]
@@ -1096,9 +1099,14 @@ pub(crate) mod embed {
             .with_allow_dml(false)
             .with_allow_statements(false);
 
+        let query = QueryBuilder::new(sql, Arc::clone(&df))
+            .restricted_sql_options(Some(opt))
+            .build();
+
         // Attempt to convert first column to String
         let result: Result<Vec<Result<Vec<String>, _>>, _> =
-            df.query_with_cache(&sql, Some(opt))
+            query
+                .run()
                 .await
                 .map(|r| r.data)?
                 .map_ok(
