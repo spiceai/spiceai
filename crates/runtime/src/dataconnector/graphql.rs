@@ -23,7 +23,7 @@ use datafusion::execution::context::SessionState;
 use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::ExecutionPlan;
 use itertools::Itertools;
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
+use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::header::{CONTENT_TYPE, USER_AGENT};
 use secrets::{get_secret_or_param, Secret};
 use serde_json::Value;
@@ -57,25 +57,37 @@ impl DataConnectorFactory for GraphQL {
     }
 }
 
+enum Auth {
+    Basic(String, Option<String>),
+    Bearer(String),
+}
+
 struct GraphQLClient {
     client: reqwest::Client,
     endpoint: Url,
     query: String,
     json_path: String,
+    auth: Option<Auth>,
 }
 
 impl GraphQLClient {
     async fn execute(&self) -> datafusion::error::Result<(Vec<Vec<RecordBatch>>, SchemaRef)> {
         let body = format!(r#"{{"query": "{}"}}"#, self.query.lines().join(" "));
-        let response = self
-            .client
-            .post(self.endpoint.clone())
-            .body(body)
-            .send()
-            .await
-            .map_err(|_| {
-                datafusion::error::DataFusionError::Execution("Failed to execute query".to_string())
-            })?;
+        let mut request = self.client.post(self.endpoint.clone()).body(body);
+
+        match &self.auth {
+            Some(Auth::Basic(user, pass)) => {
+                request = request.basic_auth(user, pass.clone());
+            }
+            Some(Auth::Bearer(token)) => {
+                request = request.bearer_auth(token);
+            }
+            _ => {}
+        }
+
+        let response = request.send().await.map_err(|_| {
+            datafusion::error::DataFusionError::Execution("Failed to execute query".to_string())
+        })?;
 
         if !response.status().is_success() {
             return Err(datafusion::error::DataFusionError::Execution(format!(
@@ -144,6 +156,8 @@ impl GraphQL {
     fn get_client(&self, dataset: &Dataset) -> super::DataConnectorResult<GraphQLClient> {
         let mut client_builder = reqwest::Client::builder();
         let token = get_secret_or_param(&self.params, &self.secret, "auth_token_key", "auth_token");
+        let user = get_secret_or_param(&self.params, &self.secret, "auth_user_key", "auth_user");
+        let pass = get_secret_or_param(&self.params, &self.secret, "auth_pass_key", "auth_pass");
 
         let query = self
             .params
@@ -168,17 +182,13 @@ impl GraphQL {
         let mut headers = HeaderMap::new();
         headers.append(USER_AGENT, HeaderValue::from_static("spice"));
         headers.append(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+
+        let mut auth = None;
         if let Some(token) = token {
-            headers.append(
-                AUTHORIZATION,
-                HeaderValue::from_str(&format!("bearer {token}")).map_err(|e| {
-                    super::DataConnectorError::InvalidConfiguration {
-                        dataconnector: "GraphQL".to_string(),
-                        message: "Failed to set token".to_string(),
-                        source: e.into(),
-                    }
-                })?,
-            );
+            auth = Some(Auth::Bearer(token));
+        }
+        if let Some(user) = user {
+            auth = Some(Auth::Basic(user, pass));
         }
 
         client_builder = client_builder.default_headers(headers);
@@ -194,6 +204,7 @@ impl GraphQL {
             query,
             endpoint,
             json_path,
+            auth,
         })
     }
 }
