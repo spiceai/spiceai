@@ -15,7 +15,9 @@ limitations under the License.
 */
 
 use arrow::record_batch::RecordBatch;
+use llms::embeddings::Embed;
 use llms::nql::{Error as LlmError, Nql};
+use llms::openai::{DEFAULT_EMBEDDING_MODEL, DEFAULT_LLM_MODEL};
 use model_components::model::{Error as ModelError, Model};
 use spicepod::component::llms::{Architecture, LlmParams, LlmPrefix};
 use std::collections::HashMap;
@@ -47,6 +49,44 @@ pub async fn run(m: &Model, df: Arc<DataFusion>) -> Result<RecordBatch, ModelErr
     }
 }
 
+pub fn try_to_embedding(
+    component: &spicepod::component::llms::Llm,
+) -> Result<Box<dyn Embed>, LlmError> {
+    let prefix = component.get_prefix().ok_or(LlmError::UnknownModelSource {
+        source: format!(
+            "Unknown model source for spicepod component from: {}",
+            component.from.clone()
+        )
+        .into(),
+    })?;
+
+    let model_id = component.get_model_id();
+
+    match construct_llm_params(
+        &prefix,
+        &model_id,
+        &(component.params).clone().unwrap_or_default(),
+    ) {
+        Ok(LlmParams::OpenAiParams {
+            api_base,
+            api_key,
+            org_id,
+            project_id,
+        }) => Ok(Box::new(llms::openai::Openai::new(
+            DEFAULT_EMBEDDING_MODEL.to_string(),
+            api_base,
+            api_key,
+            org_id,
+            project_id,
+        ))),
+        Ok(_) => Err(LlmError::UnsupportedTaskForModel {
+            from: component.from.clone(),
+            task: "embedding".into(),
+        }),
+        Err(e) => Err(e),
+    }
+}
+
 /// Attempt to derive a runnable NQL model from a given component from the Spicepod definition.
 pub fn try_to_nql(component: &spicepod::component::llms::Llm) -> Result<Box<dyn Nql>, LlmError> {
     let prefix = component.get_prefix().ok_or(LlmError::UnknownModelSource {
@@ -69,9 +109,13 @@ pub fn try_to_nql(component: &spicepod::component::llms::Llm) -> Result<Box<dyn 
             api_key,
             org_id,
             project_id,
-        }) => Ok(llms::nql::create_openai(
-            model_id, api_base, api_key, org_id, project_id,
-        )),
+        }) => Ok(Box::new(llms::openai::Openai::new(
+            model_id.unwrap_or(DEFAULT_LLM_MODEL.to_string()),
+            api_base,
+            api_key,
+            org_id,
+            project_id,
+        ))),
         Ok(LlmParams::LocalModelParams {
             weights_path,
             tokenizer_path,

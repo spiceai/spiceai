@@ -13,20 +13,15 @@ limitations under the License.
 #![allow(clippy::missing_errors_doc)]
 use std::path::Path;
 
-use async_openai::config::OpenAIConfig;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use snafu::Snafu;
-
-use self::openai::GPT3_5_TURBO_INSTRUCT;
 
 #[cfg(feature = "candle")]
 pub mod candle;
 
 #[cfg(feature = "mistralrs")]
 pub mod mistral;
-
-pub mod openai;
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Copy)]
 #[serde(rename_all = "lowercase")]
@@ -49,7 +44,7 @@ pub enum Error {
     #[snafu(display("Local tokenizer, expected at {expected_path}, not found"))]
     LocalTokenizerNotFound { expected_path: String },
 
-    #[snafu(display("Failed to load model from file: {source}"))]
+    #[snafu(display("Failed to load model: {source}"))]
     FailedToLoadModel {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
@@ -68,6 +63,9 @@ pub enum Error {
     UnknownModelSource {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[snafu(display("No model from {from} currently supports {task}"))]
+    UnsupportedTaskForModel { from: String, task: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -75,32 +73,6 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[async_trait]
 pub trait Nql: Sync + Send {
     async fn run(&mut self, prompt: String) -> Result<Option<String>>;
-}
-
-#[must_use]
-pub fn create_openai(
-    model: Option<String>,
-    api_base: Option<String>,
-    api_key: Option<String>,
-    org_id: Option<String>,
-    project_id: Option<String>,
-) -> Box<dyn Nql> {
-    let mut cfg = OpenAIConfig::new()
-        .with_org_id(org_id.unwrap_or_default())
-        .with_project_id(project_id.unwrap_or_default());
-
-    // If an API key is provided, use it. Otherwise use default from env variables.
-    if let Some(api_key) = api_key {
-        cfg = cfg.with_api_key(api_key);
-    }
-    if let Some(api_base) = api_base {
-        cfg = cfg.with_api_base(api_base);
-    }
-
-    Box::new(openai::Openai::new(
-        cfg,
-        model.unwrap_or(GPT3_5_TURBO_INSTRUCT.to_string()),
-    ))
 }
 
 pub fn create_hf_model(
