@@ -285,7 +285,6 @@ mod tests {
     fn create_session_context() -> SessionContext {
         let config = SessionConfig::new().with_information_schema(true);
         let ctx = SessionContext::new_with_config(config);
-
         register_tables(&ctx);
 
         ctx
