@@ -112,8 +112,6 @@ pub async fn run(args: Args) -> Result<()> {
 
     rt.load_secrets().await;
 
-    rt.load_datasets().await;
-
     if cfg!(feature = "models") {
         rt.load_models().await;
         rt.load_llms().await;
@@ -133,9 +131,12 @@ pub async fn run(args: Args) -> Result<()> {
         tracing::warn!("{err}");
     }
 
-    rt.start_servers(args.runtime, args.metrics)
-        .await
-        .context(UnableToStartServersSnafu)?;
+    let result = futures::join!(
+        async {
+            rt.load_datasets().await;
+        },
+        rt.start_servers(args.runtime, args.metrics)
+    );
 
-    Ok(())
+    result.1.context(UnableToStartServersSnafu)
 }

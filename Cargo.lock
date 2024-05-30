@@ -8242,6 +8242,7 @@ dependencies = [
  "app",
  "clap",
  "flightrepl",
+ "futures",
  "metrics-exporter-prometheus",
  "runtime",
  "snafu 0.8.2",

@@ -198,7 +198,7 @@ pub struct Runtime {
     pub df: Arc<DataFusion>,
     pub models: Arc<RwLock<HashMap<String, Model>>>,
     pub llms: Arc<RwLock<LLMModelStore>>,
-    pub pods_watcher: Option<podswatcher::PodsWatcher>,
+    pub pods_watcher: RwLock<Option<podswatcher::PodsWatcher>>,
     pub secrets_provider: Arc<RwLock<secrets::SecretsProvider>>,
 
     extensions: Vec<Box<dyn Extension>>,
@@ -221,7 +221,7 @@ impl Runtime {
             df: Arc::new(DataFusion::new_with_cache_provider(cache_provider)),
             models: Arc::new(RwLock::new(HashMap::new())),
             llms: Arc::new(RwLock::new(HashMap::new())),
-            pods_watcher: None,
+            pods_watcher: RwLock::new(None),
             secrets_provider: Arc::new(RwLock::new(secrets::SecretsProvider::new())),
             spaced_tracer: Arc::new(tracers::SpacedTracer::new(Duration::from_secs(15))),
             extensions: vec![],
@@ -260,7 +260,7 @@ impl Runtime {
     }
 
     pub fn with_pods_watcher(&mut self, pods_watcher: podswatcher::PodsWatcher) {
-        self.pods_watcher = Some(pods_watcher);
+        self.pods_watcher = RwLock::new(Some(pods_watcher));
     }
 
     pub async fn load_secrets(&self) {
@@ -316,7 +316,7 @@ impl Runtime {
         let mut futures = vec![];
         for ds in &valid_datasets {
             status::update_dataset(&ds.name, status::ComponentStatus::Initializing);
-            futures.push(self.load_dataset(ds, &valid_datasets));
+            futures.push(self.load_dataset_at_startup(ds, &valid_datasets));
         }
 
         let app = self.app.read().await;
@@ -330,6 +330,12 @@ impl Runtime {
         }
 
         let _ = join_all(futures).await;
+    }
+
+    pub async fn load_dataset_at_startup(&self, ds: &Dataset, all_datasets: &[Dataset]) {
+        status::update_dataset_startup_status(&ds.name, status::ComponentStatus::Initializing);
+        self.load_dataset(ds, all_datasets).await;
+        status::update_dataset_startup_status(&ds.name, status::ComponentStatus::Ready);
     }
 
     // Caller must set `status::update_dataset(...` before calling `load_dataset`. This function will set error/ready statuses appropriately.`
@@ -829,7 +835,7 @@ impl Runtime {
     }
 
     pub async fn start_servers(
-        &mut self,
+        &self,
         config: Config,
         with_metrics: Option<SocketAddr>,
     ) -> Result<()> {
@@ -860,8 +866,9 @@ impl Runtime {
         }
     }
 
-    pub async fn start_pods_watcher(&mut self) -> notify::Result<()> {
-        let Some(mut pods_watcher) = self.pods_watcher.take() else {
+    pub async fn start_pods_watcher(&self) -> notify::Result<()> {
+        let mut pods_watcher = self.pods_watcher.write().await;
+        let Some(mut pods_watcher) = pods_watcher.take() else {
             return Ok(());
         };
         let mut rx = pods_watcher.watch()?;
