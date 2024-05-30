@@ -42,12 +42,6 @@ impl Display for ComponentStatus {
     }
 }
 
-#[allow(clippy::module_name_repetitions)]
-pub fn update_dataset_startup_status(dataset: &TableReference, status: ComponentStatus) {
-    let ds_name = dataset.to_string();
-    gauge!("dataset/start_up_status", "dataset" => ds_name).set(f64::from(status as u32));
-}
-
 pub fn update_dataset(dataset: &TableReference, status: ComponentStatus) {
     let ds_name = dataset.to_string();
     gauge!("dataset/status", "dataset" => ds_name).set(f64::from(status as u32));
