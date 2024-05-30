@@ -132,9 +132,7 @@ pub async fn run(args: Args) -> Result<()> {
     }
 
     let result = futures::join!(
-        async {
-            rt.load_datasets().await;
-        },
+        rt.load_datasets(),
         rt.start_servers(args.runtime, args.metrics)
     );
 
