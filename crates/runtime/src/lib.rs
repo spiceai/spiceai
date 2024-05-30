@@ -196,6 +196,7 @@ pub type LLMModelStore = HashMap<String, RwLock<Box<dyn Nql>>>;
 pub type EmbeddingModelStore = HashMap<String, RwLock<Box<dyn Embed>>>;
 
 pub struct Runtime {
+    pub instance_name: String,
     pub app: Arc<RwLock<Option<App>>>,
     pub df: Arc<DataFusion>,
     pub models: Arc<RwLock<HashMap<String, Model>>>,
@@ -211,6 +212,7 @@ pub struct Runtime {
 impl Runtime {
     #[must_use]
     pub async fn new(
+        instance_name: String,
         app: Option<app::App>,
         extension_factories: Arc<Vec<Box<dyn ExtensionFactory>>>,
     ) -> Self {
@@ -220,6 +222,7 @@ impl Runtime {
         let cache_provider = Self::init_results_cache(&app);
 
         let mut rt = Runtime {
+            instance_name,
             app: Arc::new(RwLock::new(app)),
             df: Arc::new(DataFusion::new_with_cache_provider(cache_provider)),
             models: Arc::new(RwLock::new(HashMap::new())),
@@ -853,7 +856,7 @@ impl Runtime {
                     .context(UnableToStartLocalMetricsSnafu)?;
             }
 
-            recorder.start(&self.df);
+            recorder.start(self.instance_name.clone(), &self.df);
         }
 
         Ok(())

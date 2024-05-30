@@ -46,7 +46,7 @@ async fn single_source_federation_push_down() -> Result<(), String> {
         .with_dataset(make_spiceai_dataset("eth.recent_logs", "eth.logs"))
         .build();
 
-    let rt = Runtime::new(Some(app), Arc::new(vec![])).await;
+    let rt = Runtime::new("spice".to_string(), Some(app), Arc::new(vec![])).await;
 
     rt.load_secrets().await;
     rt.load_datasets().await;
@@ -233,7 +233,7 @@ async fn single_source_federation_push_down() -> Result<(), String> {
         (
             "SELECT *
             FROM eth.logs
-            ORDER BY block_number DESC 
+            ORDER BY block_number DESC
             LIMIT 10",
             vec![
                 "+---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
@@ -258,7 +258,7 @@ async fn single_source_federation_push_down() -> Result<(), String> {
             })),
         ),
         (
-            "SELECT number FROM blocks 
+            "SELECT number FROM blocks
              UNION ALL
              SELECT tx.block_number as number FROM tx
              ORDER BY number DESC LIMIT 10",

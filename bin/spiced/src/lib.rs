@@ -25,6 +25,7 @@ use app::{App, AppBuilder};
 use clap::Parser;
 use flightrepl::ReplConfig;
 use runtime::config::Config as RuntimeConfig;
+use uuid::Uuid;
 
 use runtime::podswatcher::PodsWatcher;
 use runtime::{extension::ExtensionFactory, Runtime};
@@ -97,6 +98,15 @@ pub async fn run(args: Args) -> Result<()> {
 
     let mut extension_factories: Vec<Box<dyn ExtensionFactory>> = vec![];
 
+    let hash = Uuid::new_v4().to_string()[..8].to_string();
+    let name = match &app {
+        Some(app) => app.name.clone(),
+        None => "spice".to_string(),
+    };
+    let instance_name = format!("{name}-{hash}");
+
+    println!("{instance_name}");
+
     if cfg!(feature = "spice-cloud") {
         if let Some(app) = &app {
             if let Some(manifest) = app.extensions.get("spice_cloud") {
@@ -106,7 +116,7 @@ pub async fn run(args: Args) -> Result<()> {
         }
     }
 
-    let mut rt: Runtime = Runtime::new(app, Arc::new(extension_factories)).await;
+    let mut rt: Runtime = Runtime::new(instance_name, app, Arc::new(extension_factories)).await;
 
     rt.with_pods_watcher(pods_watcher);
 

@@ -48,7 +48,7 @@ async fn refresh_sql_pushdown() -> Result<(), String> {
         ))
         .build();
 
-    let rt = Runtime::new(Some(app), Arc::new(vec![])).await;
+    let rt = Runtime::new("spice".to_string(), Some(app), Arc::new(vec![])).await;
 
     rt.load_secrets().await;
     rt.load_datasets().await;

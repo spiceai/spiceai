@@ -55,7 +55,7 @@ async fn results_cache_system_queries() -> Result<(), String> {
         .with_dataset(make_s3_tpch_dataset("customer"))
         .build();
 
-    let rt = Runtime::new(Some(app), Arc::new(vec![])).await;
+    let rt = Runtime::new("spice".to_string(), Some(app), Arc::new(vec![])).await;
 
     rt.load_secrets().await;
     rt.load_datasets().await;

@@ -16,6 +16,7 @@ app = { path = "../../crates/app" }
 runtime = { path = "../../crates/runtime" }
 spice-cloud = { path = "../../crates/spice_cloud" }
 flightrepl = { path = "../../crates/flightrepl" }
+uuid.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

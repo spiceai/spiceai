@@ -18,8 +18,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use arrow::array::{Float64Array, StringArray, TimestampNanosecondArray};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::array::{ArrayRef, Float64Array, StringArray, StructArray, TimestampNanosecondArray};
+use arrow::datatypes::{DataType, Field, Fields, Schema};
 use arrow::record_batch::RecordBatch;
 use arrow_tools::record_batch::{self, try_cast_to};
 use chrono::Utc;
@@ -108,6 +108,7 @@ impl MetricsRecorder {
 
     async fn tick(
         socket_addr: &SocketAddr,
+        instance_name: String,
         datafusion: &Arc<DataFusion>,
         remote_schema: &Arc<Option<Arc<Schema>>>,
     ) -> Result<(), Error> {
@@ -125,9 +126,13 @@ impl MetricsRecorder {
         let sample_size = scrape.samples.len();
 
         let mut timestamps: Vec<i64> = Vec::with_capacity(sample_size);
-        let mut metrics: Vec<String> = Vec::with_capacity(sample_size);
+        let mut instances: Vec<String> = Vec::with_capacity(sample_size);
+        let mut names: Vec<String> = Vec::with_capacity(sample_size);
         let mut values: Vec<f64> = Vec::with_capacity(sample_size);
         let mut labels: Vec<String> = Vec::with_capacity(sample_size);
+        // tags:
+        let mut datasets: Vec<Option<String>> = Vec::with_capacity(sample_size);
+        let mut engines: Vec<Option<String>> = Vec::with_capacity(sample_size);
 
         for sample in scrape.samples {
             let value: f64 = match sample.value {
@@ -144,10 +149,29 @@ impl MetricsRecorder {
             } else {
                 timestamps.push(timestamp.timestamp_micros() * 1000);
             }
-            metrics.push(sample.metric);
+            instances.push(instance_name.clone());
+            names.push(sample.metric);
             values.push(value);
             labels.push(sample.labels.to_string());
+
+            datasets.push(match sample.labels.get("dataset") {
+                Some("") | None => None,
+                Some(v) => Some(v.to_string()),
+            });
+            engines.push(match sample.labels.get("engine") {
+                Some("") | None => None,
+                Some(v) => Some(v.to_string()),
+            });
         }
+
+        let datasets_array: ArrayRef = Arc::new(StringArray::from(datasets));
+        let engines_array: ArrayRef = Arc::new(StringArray::from(engines));
+
+        let tags: ArrayRef = Arc::new(StructArray::new(
+            get_tags_fields(),
+            vec![datasets_array, engines_array],
+            None,
+        ));
 
         let mut schema = get_metrics_schema();
         let mut record_batch = RecordBatch::try_new(
@@ -156,9 +180,11 @@ impl MetricsRecorder {
                 Arc::new(
                     TimestampNanosecondArray::from(timestamps).with_timezone(Arc::from("UTC")),
                 ),
-                Arc::new(StringArray::from(metrics)),
+                Arc::new(StringArray::from(instances)),
+                Arc::new(StringArray::from(names)),
                 Arc::new(Float64Array::from(values)),
                 Arc::new(StringArray::from(labels)),
+                tags,
             ],
         )
         .context(UnableToCreateRecordBatchSnafu)?;
@@ -184,20 +210,29 @@ impl MetricsRecorder {
         Ok(())
     }
 
-    pub fn start(&self, datafusion: &Arc<DataFusion>) {
+    pub fn start(&self, instance_name: String, datafusion: &Arc<DataFusion>) {
         let addr = Arc::clone(&self.socket_addr);
         let df = Arc::clone(datafusion);
         let schema = Arc::clone(&self.remote_schema);
 
         spawn(async move {
             loop {
-                if let Err(err) = MetricsRecorder::tick(&addr, &df, &schema).await {
+                if let Err(err) =
+                    MetricsRecorder::tick(&addr, instance_name.clone(), &df, &schema).await
+                {
                     tracing::error!("{err}");
                 }
                 tokio::time::sleep(Duration::from_secs(30)).await;
             }
         });
     }
+}
+
+fn get_tags_fields() -> Fields {
+    Fields::from(vec![
+        Field::new("dataset", DataType::Utf8, true),
+        Field::new("engine", DataType::Utf8, true),
+    ])
 }
 
 #[must_use]
@@ -211,9 +246,11 @@ pub fn get_metrics_schema() -> Arc<Schema> {
             ),
             false,
         ),
+        Field::new("instance", DataType::Utf8, false),
         Field::new("name", DataType::Utf8, false),
         Field::new("value", DataType::Float64, false),
         Field::new("labels", DataType::Utf8, false),
+        Field::new("tags", DataType::Struct(get_tags_fields()), false),
     ];
 
     Arc::new(Schema::new(fields))

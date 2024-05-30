@@ -129,7 +129,7 @@ async fn mysql_federation_push_down() -> Result<(), String> {
         .with_dataset(make_mysql_dataset("lineitem", "line"))
         .build();
 
-    let rt = Runtime::new(Some(app), Arc::new(vec![])).await;
+    let rt = Runtime::new("spice".to_string(), Some(app), Arc::new(vec![])).await;
 
     // Set a timeout for the test
     tokio::select! {
