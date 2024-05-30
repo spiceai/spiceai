@@ -91,7 +91,7 @@ fn collect_table_names(plan: &LogicalPlan, table_names: &mut HashSet<String>) {
 }
 
 #[must_use]
-pub fn is_cache_allowed_for_query(plan: &LogicalPlan) -> bool {
+pub fn cache_is_enabled_for_plan(plan: &LogicalPlan) -> bool {
     match plan {
         LogicalPlan::TableScan(source, ..) => {
             let table_name = source.table_name.to_string();
