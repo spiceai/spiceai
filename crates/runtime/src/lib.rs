@@ -73,6 +73,9 @@ pub mod status;
 pub mod timing;
 pub(crate) mod tracers;
 
+pub mod pg_server;
+
+
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Unable to start HTTP server: {source}"))]
@@ -185,6 +188,10 @@ pub enum Error {
 
     #[snafu(display("Unable to register metrics table: {source}"))]
     UnableToRegisterMetricsTable { source: datafusion::Error },
+
+    //#[cfg(feature = "pg-server")]
+    #[snafu(display("Unable to start postgres compatible access layer: {source}"))]
+    UnableToStartPGServer { source: pg_server::Error },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -836,13 +843,25 @@ impl Runtime {
         let flight_server_future = flight::start(config.flight_bind_address, Arc::clone(&self.df));
         let open_telemetry_server_future =
             opentelemetry::start(config.open_telemetry_bind_address, Arc::clone(&self.df));
+        
+        let pg_server_future = pg_server::start(config.pg_bind_address, Arc::clone(&self.df));
+        
+        
         let pods_watcher_future = self.start_pods_watcher();
+
+        // let df_session = Arc::clone(&self.df.read().await.ctx);
+
+
+        // #[cfg(feature = "pg-server")]
+
+
 
         tokio::select! {
             http_res = http_server_future => http_res.context(UnableToStartHttpServerSnafu),
             flight_res = flight_server_future => flight_res.context(UnableToStartFlightServerSnafu),
             open_telemetry_res = open_telemetry_server_future => open_telemetry_res.context(UnableToStartOpenTelemetryServerSnafu),
             pods_watcher_res = pods_watcher_future => pods_watcher_res.context(UnableToInitializePodsWatcherSnafu),
+            pg_server_res = pg_server_future => pg_server_res.context(UnableToStartPGServerSnafu),
             () = shutdown_signal() => {
                 tracing::info!("Goodbye!");
                 Ok(())

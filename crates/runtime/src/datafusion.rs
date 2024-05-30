@@ -214,6 +214,7 @@ impl DataFusion {
         df_config.options_mut().sql_parser.dialect = "PostgreSQL".to_string();
         df_config.options_mut().catalog.default_catalog = SPICE_DEFAULT_CATALOG.to_string();
         df_config.options_mut().catalog.default_schema = SPICE_DEFAULT_SCHEMA.to_string();
+       
 
         let state = SessionState::new_with_config_rt(df_config, default_runtime_env())
             .add_analyzer_rule(Arc::new(FederationAnalyzerRule::new()))

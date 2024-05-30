@@ -34,7 +34,8 @@ default = [
   "spark",
   "snowflake",
   "ftp",
-  "spice-cloud"
+  "spice-cloud",
+  "pg-server",
 ]
 duckdb = ["runtime/duckdb"]
 postgres = ["runtime/postgres"]
@@ -54,3 +55,4 @@ spark = ["runtime/spark"]
 snowflake = ["runtime/snowflake"]
 models = ["runtime/models"]
 spice-cloud = []
+pg-server = ["runtime/pg-server"]

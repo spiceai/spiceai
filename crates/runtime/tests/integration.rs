@@ -28,6 +28,8 @@ mod federation;
 mod refresh_sql;
 mod results_cache;
 
+mod pg_server;
+
 fn init_tracing(default_level: Option<&str>) -> DefaultGuard {
     let filter = match (default_level, std::env::var("SPICED_LOG").ok()) {
         (_, Some(log)) => EnvFilter::new(log),

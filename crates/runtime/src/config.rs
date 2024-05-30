@@ -44,4 +44,14 @@ pub struct Config {
         action
     )]
     pub open_telemetry_bind_address: SocketAddr,
+
+    /// Configure runtime PostgreSQL address.
+    //#[cfg(feature = "pg-server")]
+    #[arg(
+        long = "pg_port",
+        value_name = "PG_SERVER_BIND_ADDRESS",
+        default_value = "127.0.0.1:5444",
+        action
+    )]
+    pub pg_bind_address: SocketAddr,
 }

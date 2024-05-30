@@ -92,6 +92,8 @@ datafusion-federation = { workspace = true }
 fundu = { workspace = true }
 metrics-exporter-prometheus = "0.13.0"
 prometheus-parse = "0.2.5"
+# pg_server = { path = "../pg_server", optional = true }
+pgwire = "0.22"
 
 [dev-dependencies]
 bollard = "0.16.1"
@@ -100,7 +102,7 @@ anyhow = "1.0.86"
 tracing-subscriber.workspace = true
 
 [features]
-default = ["keyring-secret-store", "aws-secrets-manager"]
+default = ["keyring-secret-store", "aws-secrets-manager", "pg-server", "postgres"]
 dev = []
 duckdb = [
     "dep:duckdb",
@@ -151,3 +153,4 @@ snowflake = [
     "data_components/snowflake",
 ]
 models = ["model_components/full", "llms/mistralrs"]
+pg-server = []
