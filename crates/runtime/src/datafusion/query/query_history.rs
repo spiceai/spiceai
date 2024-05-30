@@ -125,7 +125,7 @@ macro_rules! check_required_field {
 }
 
 impl Query {
-    pub async fn write(&self) -> Result<(), Error> {
+    pub async fn write_query_history(&self) -> Result<(), Error> {
         self.validate()?;
 
         let data = self

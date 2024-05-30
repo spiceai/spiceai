@@ -161,7 +161,7 @@ impl Query {
     }
 
     #[must_use]
-    pub fn finish(mut self) -> Self {
+    fn finish(mut self) -> Self {
         if self.end_time.is_none() {
             self.end_time = Some(SystemTime::now());
         }
@@ -183,38 +183,20 @@ impl Query {
     }
 
     #[must_use]
-    pub fn schema(mut self, schema: Arc<Schema>) -> Self {
+    fn schema(mut self, schema: Arc<Schema>) -> Self {
         self.schema = Some(schema);
         self
     }
 
     #[must_use]
-    pub fn end_time(mut self, end_time: SystemTime) -> Self {
-        self.end_time = Some(end_time);
-        self
-    }
-
-    #[must_use]
-    pub fn execution_time(mut self, execution_time: u64) -> Self {
-        self.execution_time = Some(execution_time);
-        self
-    }
-
-    #[must_use]
-    pub fn rows_produced(mut self, rows_produced: u64) -> Self {
+    fn rows_produced(mut self, rows_produced: u64) -> Self {
         self.rows_produced = Some(rows_produced);
-        self
-    }
-
-    #[must_use]
-    pub fn results_cache_hit(mut self, results_cache_hit: bool) -> Self {
-        self.results_cache_hit = Some(results_cache_hit);
         self
     }
 }
 
 #[must_use]
-pub fn attach_query_context_to_stream(
+fn attach_query_context_to_stream(
     ctx: Query,
     mut stream: SendableRecordBatchStream,
 ) -> SendableRecordBatchStream {
@@ -231,13 +213,11 @@ pub fn attach_query_context_to_stream(
             yield batch_result;
         }
 
-
-
         if let Err(e) = ctx
             .schema(schema_copy)
             .rows_produced(num_records)
             .finish()
-            .write().await {
+            .write_query_history().await {
                 tracing::error!("Error writing query history: {e}");
             }
     };
