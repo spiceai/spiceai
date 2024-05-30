@@ -14,8 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::LLMModelStore;
 use crate::{config, datafusion::DataFusion};
+use crate::{EmbeddingModelStore, LLMModelStore};
 use app::App;
 use axum::routing::patch;
 use model_components::model::Model;
@@ -40,6 +40,7 @@ pub(crate) fn routes(
     df: Arc<DataFusion>,
     models: Arc<RwLock<HashMap<String, Model>>>,
     llms: Arc<RwLock<LLMModelStore>>,
+    embeddings: Arc<RwLock<EmbeddingModelStore>>,
     config: Arc<config::Config>,
     with_metrics: Option<SocketAddr>,
 ) -> Router {
@@ -65,8 +66,10 @@ pub(crate) fn routes(
             .route("/v1/models/:name/predict", get(v1::inference::get))
             .route("/v1/predict", post(v1::inference::post))
             .route("/v1/nsql", post(v1::nsql::post))
+            .route("/v1/embed", post(v1::embed::post))
             .layer(Extension(llms))
-            .layer(Extension(models));
+            .layer(Extension(models))
+            .layer(Extension(embeddings));
     }
 
     router = router

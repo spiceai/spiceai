@@ -24,7 +24,7 @@ use tokio::{
     sync::RwLock,
 };
 
-use crate::{config, datafusion::DataFusion, LLMModelStore};
+use crate::{config, datafusion::DataFusion, EmbeddingModelStore, LLMModelStore};
 
 mod routes;
 mod v1;
@@ -46,13 +46,14 @@ pub(crate) async fn start<A>(
     df: Arc<DataFusion>,
     models: Arc<RwLock<HashMap<String, Model>>>,
     llms: Arc<RwLock<LLMModelStore>>,
+    embeddings: Arc<RwLock<EmbeddingModelStore>>,
     config: Arc<config::Config>,
     with_metrics: Option<SocketAddr>,
 ) -> Result<()>
 where
     A: ToSocketAddrs + Debug,
 {
-    let routes = routes::routes(app, df, models, llms, config, with_metrics);
+    let routes = routes::routes(app, df, models, llms, embeddings, config, with_metrics);
 
     let listener = TcpListener::bind(&bind_address)
         .await
