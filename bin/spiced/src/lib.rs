@@ -117,6 +117,7 @@ pub async fn run(args: Args) -> Result<()> {
     if cfg!(feature = "models") {
         rt.load_models().await;
         rt.load_llms().await;
+        rt.load_embeddings().await;
     }
 
     if let Err(err) = rt.init_query_history().await {
