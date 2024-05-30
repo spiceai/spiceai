@@ -26,14 +26,16 @@ use arrow::{
     datatypes::{DataType, Field, Schema, TimeUnit},
 };
 use datafusion::sql::TableReference;
+
 use snafu::{ResultExt, Snafu};
 
 use crate::{
     accelerated_table::{refresh::Refresh, AcceleratedTable, Retention},
-    datafusion::DataFusion,
     dataupdate::DataUpdate,
     internal_table::create_internal_accelerated_table,
 };
+
+use super::Query;
 
 pub const DEFAULT_QUERY_HISTORY_TABLE: &str = "query_history";
 
@@ -106,6 +108,11 @@ pub enum Error {
         "Error validating query_history row. Columns {columns} are required but missing"
     ))]
     MissingColumnsInRow { columns: String },
+
+    #[snafu(display("Unable to get table provider for query_history table: {source}"))]
+    UnableToGetTableProvider {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 /// Checks if a required field is missing in a [`QueryHistory`] struct. Adds field name to missing fields vector if field is None.
@@ -117,100 +124,34 @@ macro_rules! check_required_field {
     };
 }
 
-pub struct QueryHistory {
-    query_id: Option<String>,
-    schema: Option<Arc<Schema>>,
-    sql: Option<String>,
-    nsql: Option<String>,
-    start_time: Option<SystemTime>,
-    end_time: Option<SystemTime>,
-    execution_time: Option<u64>,
-    rows_produced: Option<u64>,
-    results_cache_hit: Option<bool>,
+impl Query {
+    pub async fn write_query_history(&self) -> Result<(), Error> {
+        self.validate()?;
 
-    // The datafusion instance and the internal table to route data to.
-    df: Arc<DataFusion>,
-    to_table: Option<String>,
-}
+        let data = self
+            .to_record_batch()
+            .boxed()
+            .context(UnableToWriteToTableSnafu)?;
 
-impl QueryHistory {
-    pub fn new(df: Arc<DataFusion>) -> Self {
-        Self {
-            query_id: None,
-            schema: None,
-            sql: None,
-            nsql: None,
-            start_time: None,
-            end_time: None,
-            execution_time: None,
-            rows_produced: None,
-            results_cache_hit: None,
-            df,
-            to_table: None,
-        }
+        let data_update = DataUpdate {
+            schema: Arc::new(table_schema()),
+            data: vec![data],
+            update_type: crate::dataupdate::UpdateType::Append,
+        };
+
+        self.df
+            .write_data(
+                TableReference::partial(SPICE_RUNTIME_SCHEMA, DEFAULT_QUERY_HISTORY_TABLE),
+                data_update,
+            )
+            .await
+            .boxed()
+            .context(UnableToWriteToTableSnafu)?;
+
+        Ok(())
     }
 
-    #[must_use]
-    pub fn query_id(mut self, query_id: String) -> Self {
-        self.query_id = Some(query_id);
-        self
-    }
-
-    #[must_use]
-    pub fn schema(mut self, schema: Arc<Schema>) -> Self {
-        self.schema = Some(schema);
-        self
-    }
-
-    #[must_use]
-    pub fn sql(mut self, sql: String) -> Self {
-        self.sql = Some(sql);
-        self
-    }
-
-    #[must_use]
-    pub fn nsql(mut self, nsql: String) -> Self {
-        self.nsql = Some(nsql);
-        self
-    }
-
-    #[must_use]
-    pub fn start_time(mut self, start_time: SystemTime) -> Self {
-        self.start_time = Some(start_time);
-        self
-    }
-
-    #[must_use]
-    pub fn end_time(mut self, end_time: SystemTime) -> Self {
-        self.end_time = Some(end_time);
-        self
-    }
-
-    #[must_use]
-    pub fn execution_time(mut self, execution_time: u64) -> Self {
-        self.execution_time = Some(execution_time);
-        self
-    }
-
-    #[must_use]
-    pub fn rows_produced(mut self, rows_produced: u64) -> Self {
-        self.rows_produced = Some(rows_produced);
-        self
-    }
-
-    #[must_use]
-    pub fn results_cache_hit(mut self, results_cache_hit: bool) -> Self {
-        self.results_cache_hit = Some(results_cache_hit);
-        self
-    }
-
-    #[must_use]
-    pub fn to_table(mut self, to_table: String) -> Self {
-        self.to_table = Some(to_table);
-        self
-    }
-
-    pub fn into_record_batch(&self) -> Result<RecordBatch, Error> {
+    fn to_record_batch(&self) -> Result<RecordBatch, Error> {
         let end_time = self
             .end_time
             .and_then(|s| {
@@ -224,19 +165,15 @@ impl QueryHistory {
 
         let start_time = self
             .start_time
-            .and_then(|s| {
-                s.duration_since(SystemTime::UNIX_EPOCH)
-                    .map(|x| Some(i64::try_from(x.as_nanos())))
-                    .unwrap_or(None)
-            })
-            .transpose()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|duration| i64::try_from(duration.as_nanos()).ok())
             .boxed()
             .context(UnableToCreateRowSnafu)?;
 
         RecordBatch::try_new(
             Arc::new(table_schema()),
             vec![
-                Arc::new(StringArray::from(vec![self.query_id.clone()])),
+                Arc::new(StringArray::from(vec![self.query_id.to_string()])),
                 Arc::new(StringArray::from(vec![self
                     .schema
                     .as_ref()
@@ -254,15 +191,12 @@ impl QueryHistory {
         .context(UnableToCreateRowSnafu)
     }
 
-    pub fn validate(&self) -> Result<(), Error> {
+    fn validate(&self) -> Result<(), Error> {
         let mut missing_fields: Vec<&str> = Vec::new();
 
         check_required_field!(self.schema, "schema", missing_fields);
-        check_required_field!(self.sql, "sql", missing_fields);
-        check_required_field!(self.start_time, "start_time", missing_fields);
-        // check_required_field!(self.execution_time, "execution_time", missing_fields);
+        check_required_field!(self.end_time, "end_time", missing_fields);
         check_required_field!(self.rows_produced, "rows_produced", missing_fields);
-        check_required_field!(self.results_cache_hit, "results_cache_hit", missing_fields);
 
         if missing_fields.is_empty() {
             Ok(())
@@ -271,42 +205,5 @@ impl QueryHistory {
                 columns: missing_fields.join(", "),
             })
         }
-    }
-
-    pub async fn write(&mut self) -> Result<(), Error> {
-        self.validate()?;
-
-        if self.end_time.is_none() {
-            self.end_time = Some(SystemTime::now());
-        }
-        if self.to_table.is_none() {
-            self.to_table = Some(DEFAULT_QUERY_HISTORY_TABLE.to_string());
-        }
-        if self.query_id.is_none() {
-            self.query_id = Some(uuid::Uuid::new_v4().to_string());
-        }
-        let table = self
-            .to_table
-            .clone()
-            .unwrap_or(DEFAULT_QUERY_HISTORY_TABLE.to_string());
-
-        let data = self
-            .into_record_batch()
-            .boxed()
-            .context(UnableToWriteToTableSnafu)?;
-
-        let data_update = DataUpdate {
-            schema: Arc::new(table_schema()),
-            data: vec![data],
-            update_type: crate::dataupdate::UpdateType::Append,
-        };
-
-        self.df
-            .write_data(TableReference::partial("runtime", table), data_update)
-            .await
-            .boxed()
-            .context(UnableToWriteToTableSnafu)?;
-
-        Ok(())
     }
 }
