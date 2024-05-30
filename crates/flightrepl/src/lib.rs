@@ -222,9 +222,7 @@ async fn get_records(
                 total_rows += data.num_rows();
                 records.push(data);
             }
-            Err(e) => {
-                return Err(e);
-            }
+            Err(e) => return Err(e),
         }
     }
 
