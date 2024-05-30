@@ -38,6 +38,7 @@ mod lru_cache;
 mod utils;
 
 pub use utils::get_logical_plan_input_tables;
+pub use utils::is_cache_allowed_for_query;
 pub use utils::to_cached_record_batch_stream;
 
 #[derive(Debug, Snafu)]

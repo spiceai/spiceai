@@ -18,7 +18,7 @@ use std::{sync::Arc, time::SystemTime};
 
 use arrow::datatypes::Schema;
 use arrow_tools::schema::verify_schema;
-use cache::{get_logical_plan_input_tables, to_cached_record_batch_stream, QueryResult};
+use cache::{is_cache_allowed_for_query, to_cached_record_batch_stream, QueryResult};
 use datafusion::{
     error::DataFusionError,
     execution::{context::SQLOptions, SendableRecordBatchStream},
@@ -78,34 +78,28 @@ impl Query {
             .await
             .context(UnableToExecuteQuerySnafu)?;
 
-        let query_input_tables = get_logical_plan_input_tables(&plan);
-        let cache_enabled_for_query = !(query_input_tables.is_empty()
-            || query_input_tables.contains("information_schema.tables"));
+        if let Some(cache_provider) = &self.df.cache_provider {
+            if let Some(cached_result) = cache_provider
+                .get(&plan)
+                .await
+                .context(FailedToAccessCacheSnafu)?
+            {
+                let record_batch_stream = Box::pin(
+                    MemoryStream::try_new(
+                        cached_result.records.to_vec(),
+                        cached_result.schema,
+                        None,
+                    )
+                    .context(UnableToCreateMemoryStreamSnafu)?,
+                );
 
-        if cache_enabled_for_query {
-            if let Some(cache_provider) = &self.df.cache_provider {
-                if let Some(cached_result) = cache_provider
-                    .get(&plan)
-                    .await
-                    .context(FailedToAccessCacheSnafu)?
-                {
-                    let record_batch_stream = Box::pin(
-                        MemoryStream::try_new(
-                            cached_result.records.to_vec(),
-                            cached_result.schema,
-                            None,
-                        )
-                        .context(UnableToCreateMemoryStreamSnafu)?,
-                    );
-
-                    return Ok(QueryResult::new(
-                        attach_query_context_to_stream(
-                            self, // self.results_cache_hit(true),
-                            record_batch_stream,
-                        ),
-                        Some(true),
-                    ));
-                }
+                return Ok(QueryResult::new(
+                    attach_query_context_to_stream(
+                        self, // self.results_cache_hit(true),
+                        record_batch_stream,
+                    ),
+                    Some(true),
+                ));
             }
         }
 
@@ -135,13 +129,12 @@ impl Query {
 
         verify_schema(df_schema.fields(), res_schema.fields()).context(SchemaMismatchSnafu)?;
 
-        if cache_enabled_for_query {
+        if is_cache_allowed_for_query(&plan_copy) {
             if let Some(cache_provider) = &self.df.cache_provider {
                 let record_batch_stream = to_cached_record_batch_stream(
                     Arc::clone(cache_provider),
                     res_stream,
                     plan_copy,
-                    query_input_tables,
                 );
 
                 return Ok(QueryResult::new(

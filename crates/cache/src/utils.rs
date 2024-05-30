@@ -34,7 +34,6 @@ pub fn to_cached_record_batch_stream(
     cache_provider: Arc<QueryResultsCacheProvider>,
     mut stream: SendableRecordBatchStream,
     plan: LogicalPlan,
-    input_tables: HashSet<String>,
 ) -> SendableRecordBatchStream {
     let schema = stream.schema();
     let schema_copy = Arc::clone(&schema);
@@ -59,7 +58,7 @@ pub fn to_cached_record_batch_stream(
             let cached_result = CachedQueryResult {
                 records: Arc::new(records),
                 schema: schema_copy,
-                input_tables: Arc::new(input_tables),
+                input_tables: Arc::new(get_logical_plan_input_tables(&plan)),
             };
 
             if let Err(e) = cache_provider.put(&plan, cached_result).await {
@@ -89,6 +88,30 @@ fn collect_table_names(plan: &LogicalPlan, table_names: &mut HashSet<String>) {
     plan.inputs().iter().for_each(|input| {
         collect_table_names(input, table_names);
     });
+}
+
+#[must_use]
+pub fn is_cache_allowed_for_query(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::TableScan(source, ..) => {
+            let table_name = source.table_name.to_string();
+            return !(table_name.starts_with("information_schema.")
+                || table_name.starts_with("runtime."));
+        }
+        LogicalPlan::Explain { .. }
+        | LogicalPlan::Analyze { .. }
+        | LogicalPlan::DescribeTable { .. }
+        | LogicalPlan::Statement(..) => return false,
+        _ => {}
+    }
+
+    for input in plan.inputs() {
+        if !is_cache_allowed_for_query(input) {
+            return false;
+        }
+    }
+
+    true
 }
 
 #[cfg(test)]
