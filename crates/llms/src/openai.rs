@@ -10,6 +10,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+#![allow(clippy::missing_errors_doc)]
 use crate::embeddings::{Embed, EmbeddingInput, Error as EmbedError, Result as EmbedResult};
 use crate::nql::{Error as NqlError, Nql, Result as NqlResult};
 

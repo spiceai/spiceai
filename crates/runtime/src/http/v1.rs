@@ -1120,15 +1120,15 @@ pub(crate) mod nsql {
 }
 
 pub(crate) mod embed {
-    use arrow::array::{RecordBatch, StringArray};
+    use arrow::array::StringArray;
     use axum::{
         http::StatusCode,
         response::{IntoResponse, Response},
         Extension, Json,
     };
     use datafusion::execution::context::SQLOptions;
-    use futures::{StreamExt, TryStreamExt};
-    use itertools::Itertools;
+    use futures::TryStreamExt;
+    
     use serde::{Deserialize, Serialize};
     use std::sync::Arc;
     use tokio::sync::RwLock;
@@ -1175,7 +1175,7 @@ pub(crate) mod embed {
             .with_allow_statements(false);
 
         // Attempt to convert first column to String
-        let stream =
+        let result: Result<Vec<Result<Vec<String>, _>>, _> =
             df.query_with_cache(&sql, Some(opt))
                 .await
                 .map(|r| r.data)?
@@ -1183,14 +1183,15 @@ pub(crate) mod embed {
                     |r| match r.column(0).as_any().downcast_ref::<StringArray>() {
                         Some(s) => Ok(s
                             .into_iter()
-                            .filter_map(|x| x)
+                            .flatten()
                             .map(ToString::to_string)
                             .collect::<Vec<String>>()),
                         None => Err("Expected first column of SQL query to return a String type"
                             .to_string()),
                     },
-                );
-        let result: Result<Vec<Result<Vec<String>, _>>, _> = stream.try_collect().await;
+                )
+                .try_collect()
+                .await;
 
         match result {
             Ok(result) => {
@@ -1233,9 +1234,9 @@ pub(crate) mod embed {
                 }
             }
             None => {
-                return (
+                (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Model {} not found", model),
+                    format!("Model {model} not found"),
                 )
                     .into_response()
             }

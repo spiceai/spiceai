@@ -13,12 +13,9 @@ limitations under the License.
 #![allow(clippy::missing_errors_doc)]
 use std::path::Path;
 
-use async_openai::config::OpenAIConfig;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use snafu::Snafu;
-
-use crate::openai::{Openai, DEFAULT_LLM_MODEL};
 
 #[cfg(feature = "candle")]
 pub mod candle;

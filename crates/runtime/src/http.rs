@@ -40,6 +40,7 @@ pub enum Error {
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn start<A>(
     bind_address: A,
     app: Arc<RwLock<Option<App>>>,
