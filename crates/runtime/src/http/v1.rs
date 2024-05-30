@@ -25,7 +25,6 @@ use axum::{
 use csv::Writer;
 use datafusion::execution::context::SQLOptions;
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
 
 use crate::{datafusion::DataFusion, status::ComponentStatus};
 
@@ -69,28 +68,24 @@ pub async fn sql_to_http_response(
         ctx = ctx.nsql(nsql.to_string());
     }
 
-    let (data, is_data_from_cache) = match df
-        .read()
-        .await
-        .query_with_cache(sql, restricted_sql_options, ctx)
-        .await
-    {
-        Ok(query_result) => match query_result.data.try_collect::<Vec<RecordBatch>>().await {
-            Ok(batches) => (batches, query_result.from_cache),
+    let (data, is_data_from_cache) =
+        match df.query_with_cache(sql, restricted_sql_options, ctx).await {
+            Ok(query_result) => match query_result.data.try_collect::<Vec<RecordBatch>>().await {
+                Ok(batches) => (batches, query_result.from_cache),
+                Err(e) => {
+                    tracing::debug!("Error executing query: {e}");
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        format!("Error processing batch: {e}"),
+                    )
+                        .into_response();
+                }
+            },
             Err(e) => {
                 tracing::debug!("Error executing query: {e}");
-                return (
-                    StatusCode::BAD_REQUEST,
-                    format!("Error processing batch: {e}"),
-                )
-                    .into_response();
+                return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
             }
-        },
-        Err(e) => {
-            tracing::debug!("Error executing query: {e}");
-            return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
-        }
-    };
+        };
     let buf = Vec::new();
     let mut writer = arrow_json::ArrayWriter::new(buf);
 
@@ -145,10 +140,7 @@ pub(crate) mod query {
 
     use super::sql_to_http_response;
 
-    pub(crate) async fn post(
-        Extension(df): Extension<Arc<DataFusion>>,
-        body: Bytes,
-    ) -> Response {
+    pub(crate) async fn post(Extension(df): Extension<Arc<DataFusion>>, body: Bytes) -> Response {
         let query = match String::from_utf8(body.to_vec()) {
             Ok(query) => query,
             Err(e) => {
@@ -974,7 +966,7 @@ pub(crate) mod nsql {
         let df_copy = Arc::clone(&df);
 
         // Get all public table CREATE TABLE statements to add to prompt.
-        let tables = match readable_df.get_public_table_names() {
+        let tables = match df.get_public_table_names() {
             Ok(t) => t,
             Err(e) => {
                 tracing::error!("Error getting tables: {e}");
@@ -984,7 +976,7 @@ pub(crate) mod nsql {
 
         let mut table_create_stms: Vec<String> = Vec::with_capacity(tables.len());
         for t in &tables {
-            match readable_df.get_arrow_schema(t).await {
+            match df.get_arrow_schema(t).await {
                 Ok(schm) => {
                     let c = CreateTableBuilder::new(Arc::new(schm), format!("public.{t}").as_str());
                     table_create_stms.push(c.build_postgres());

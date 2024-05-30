@@ -17,6 +17,7 @@ limitations under the License.
 use crate::datafusion::DataFusion;
 use crate::dataupdate::DataUpdate;
 use crate::measure_scope_ms;
+use crate::query_context::QueryContext;
 use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
 use arrow::ipc::writer::{DictionaryTracker, IpcDataGenerator};
@@ -178,10 +179,10 @@ impl Service {
             .with_allow_dml(false)
             .with_allow_statements(false);
 
-        let ctx = QueryContext::new(Arc::clone(&df)).sql(sql.clone());
+        let ctx = QueryContext::new(Arc::clone(&datafusion)).sql(sql.clone());
 
         let batches_stream = datafusion
-            .query_with_cache(&sql, Some(restricted_sql_options))
+            .query_with_cache(&sql, Some(restricted_sql_options), ctx)
             .await
             .map_err(to_tonic_err)?;
 
