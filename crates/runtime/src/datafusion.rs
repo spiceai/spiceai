@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::borrow::Borrow;
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use crate::accelerated_table::{refresh::Refresh, AcceleratedTable, Retention};
@@ -26,20 +26,16 @@ use crate::dataconnector::{DataConnector, DataConnectorError};
 use crate::dataupdate::{DataUpdate, DataUpdateExecutionPlan, UpdateType};
 use crate::get_dependent_table_names;
 use crate::object_store_registry::default_runtime_env;
+
 use arrow::datatypes::Schema;
 use arrow_tools::schema::verify_schema;
-use cache::{
-    get_logical_plan_input_tables, to_cached_record_batch_stream, QueryResult,
-    QueryResultsCacheProvider,
-};
+use cache::QueryResultsCacheProvider;
 use datafusion::catalog::schema::SchemaProvider;
 use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider};
 use datafusion::datasource::{TableProvider, ViewTable};
 use datafusion::error::DataFusionError;
-use datafusion::execution::context::{SQLOptions, SessionConfig, SessionContext, SessionState};
-use datafusion::execution::SendableRecordBatchStream;
+use datafusion::execution::context::{SessionConfig, SessionContext, SessionState};
 use datafusion::physical_plan::collect;
-use datafusion::physical_plan::memory::MemoryStream;
 use datafusion::sql::parser::DFParser;
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::{sqlparser, TableReference};
@@ -50,6 +46,8 @@ use tokio::spawn;
 use tokio::sync::oneshot;
 use tokio::time::{sleep, Instant};
 
+pub mod query;
+
 pub mod filter_converter;
 pub mod refresh_sql;
 pub mod schema;
@@ -59,6 +57,7 @@ use self::schema::SpiceSchemaProvider;
 pub const SPICE_DEFAULT_CATALOG: &str = "spice";
 pub const SPICE_RUNTIME_SCHEMA: &str = "runtime";
 pub const SPICE_DEFAULT_SCHEMA: &str = "public";
+pub const SPICE_METADATA_SCHEMA: &str = "metadata";
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -95,6 +94,9 @@ pub enum Error {
 
     #[snafu(display("Table {table_name} was marked as read_write, but the underlying provider only supports reads."))]
     WriteProviderNotImplemented { table_name: String },
+
+    #[snafu(display("Table {table_name} is expected to provide metadata, but the underlying provider does not support this."))]
+    MetadataProviderNotImplemented { table_name: String },
 
     #[snafu(display("Unable to register table: {source}"))]
     UnableToRegisterTable { source: crate::dataconnector::Error },
@@ -163,17 +165,8 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Failed to access query results cache: {source}"))]
-    FailedToAccessCache { source: cache::Error },
-
-    #[snafu(display("Failed to execute query: {source}"))]
-    UnableToExecuteQuery { source: DataFusionError },
-
-    #[snafu(display("Unable to collect results after query execution: {source}"))]
-    UnableToCollectResults { source: DataFusionError },
-
-    #[snafu(display("Unable to convert cached result to a record batch stream: {source}"))]
-    UnableToCreateMemoryStream { source: DataFusionError },
+    #[snafu(display("Unable to get the lock of data writers"))]
+    UnableToLockDataWriters {},
 }
 
 pub enum Table {
@@ -188,18 +181,23 @@ pub enum Table {
 
 pub struct DataFusion {
     pub ctx: Arc<SessionContext>,
-    data_writers: HashSet<TableReference>,
-    cache_provider: Option<Arc<QueryResultsCacheProvider>>,
+    data_writers: RwLock<HashSet<TableReference>>,
+    pub cache_provider: Option<Arc<QueryResultsCacheProvider>>,
 }
 
 impl DataFusion {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::new_with_cache_provider(None)
+    }
+
     /// Create a new `DataFusion` instance.
     ///
     /// # Panics
     ///
     /// Panics if the default schema cannot be registered.
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new_with_cache_provider(cache_provider: Option<Arc<QueryResultsCacheProvider>>) -> Self {
         let mut df_config = SessionConfig::new()
             .with_information_schema(true)
             .with_create_default_catalog_and_schema(false)
@@ -220,6 +218,7 @@ impl DataFusion {
         let catalog = MemoryCatalogProvider::new();
         let default_schema = SpiceSchemaProvider::new();
         let runtime_schema = SpiceSchemaProvider::new();
+        let metadata_schema = SpiceSchemaProvider::new();
 
         match catalog.register_schema(SPICE_DEFAULT_SCHEMA, Arc::new(default_schema)) {
             Ok(_) => {}
@@ -235,12 +234,19 @@ impl DataFusion {
             }
         }
 
+        match catalog.register_schema(SPICE_METADATA_SCHEMA, Arc::new(metadata_schema)) {
+            Ok(_) => {}
+            Err(e) => {
+                panic!("Unable to register spice runtime schema: {e}");
+            }
+        }
+
         ctx.register_catalog(SPICE_DEFAULT_CATALOG, Arc::new(catalog));
 
         DataFusion {
             ctx: Arc::new(ctx),
-            data_writers: HashSet::new(),
-            cache_provider: None,
+            data_writers: RwLock::new(HashSet::new()),
+            cache_provider,
         }
     }
 
@@ -262,87 +268,6 @@ impl DataFusion {
         None
     }
 
-    pub fn set_cache_provider(&mut self, cache_provider: Option<Arc<QueryResultsCacheProvider>>) {
-        self.cache_provider = cache_provider;
-    }
-
-    pub async fn query_with_cache(
-        &self,
-        sql: &str,
-        restricted_sql_options: Option<SQLOptions>,
-    ) -> Result<QueryResult> {
-        let session = self.ctx.state();
-        let plan = session
-            .create_logical_plan(sql)
-            .await
-            .context(UnableToExecuteQuerySnafu)?;
-
-        let query_input_tables = get_logical_plan_input_tables(&plan);
-        let cache_enabled_for_query = !(query_input_tables.is_empty()
-            || query_input_tables.contains("information_schema.tables"));
-
-        if cache_enabled_for_query {
-            if let Some(cache_provider) = &self.cache_provider {
-                if let Some(cached_result) = cache_provider
-                    .get(&plan)
-                    .await
-                    .context(FailedToAccessCacheSnafu)?
-                {
-                    let record_batch_stream = Box::pin(
-                        MemoryStream::try_new(
-                            cached_result.records.to_vec(),
-                            cached_result.schema,
-                            None,
-                        )
-                        .context(UnableToCreateMemoryStreamSnafu)?,
-                    );
-
-                    return Ok(QueryResult::new(record_batch_stream, Some(true)));
-                }
-            }
-        }
-
-        if let Some(restricted_sql_options) = restricted_sql_options {
-            restricted_sql_options
-                .verify_plan(&plan)
-                .context(UnableToExecuteQuerySnafu)?;
-        }
-
-        let plan_copy = plan.clone();
-
-        let df = self
-            .ctx
-            .execute_logical_plan(plan)
-            .await
-            .context(UnableToExecuteQuerySnafu)?;
-
-        let df_schema: Arc<Schema> = df.schema().clone().into();
-
-        let res_stream: SendableRecordBatchStream = df
-            .execute_stream()
-            .await
-            .context(UnableToCollectResultsSnafu)?;
-
-        let res_schema = res_stream.schema();
-
-        verify_schema(df_schema.fields(), res_schema.fields()).context(SchemaMismatchSnafu)?;
-
-        if cache_enabled_for_query {
-            if let Some(cache_provider) = &self.cache_provider {
-                let record_batch_stream = to_cached_record_batch_stream(
-                    Arc::clone(cache_provider),
-                    res_stream,
-                    plan_copy,
-                    query_input_tables,
-                );
-
-                return Ok(QueryResult::new(record_batch_stream, Some(false)));
-            }
-        }
-
-        Ok(QueryResult::new(res_stream, None))
-    }
-
     pub async fn has_table(&self, table_reference: &TableReference) -> bool {
         let table_name = table_reference.table();
 
@@ -358,8 +283,15 @@ impl DataFusion {
         self.ctx.table(table_name).await.is_ok()
     }
 
+    pub async fn get_table(
+        &self,
+        table_reference: TableReference,
+    ) -> Option<Arc<dyn TableProvider>> {
+        self.ctx.table_provider(table_reference).await.ok()
+    }
+
     pub fn register_runtime_table(
-        &mut self,
+        &self,
         table_name: TableReference,
         table: Arc<dyn datafusion::datasource::TableProvider>,
     ) -> Result<()> {
@@ -368,17 +300,16 @@ impl DataFusion {
                 .register_table(table_name.table().to_string(), table)
                 .context(UnableToRegisterTableToDataFusionSchemaSnafu { schema: "runtime" })?;
 
-            self.data_writers.insert(table_name);
+            self.data_writers
+                .write()
+                .map_err(|_| Error::UnableToLockDataWriters {})?
+                .insert(table_name);
         }
 
         Ok(())
     }
 
-    pub async fn register_table(
-        &mut self,
-        dataset: impl Borrow<Dataset>,
-        table: Table,
-    ) -> Result<()> {
+    pub async fn register_table(&self, dataset: impl Borrow<Dataset>, table: Table) -> Result<()> {
         let dataset = dataset.borrow();
 
         schema::ensure_schema_exists(&self.ctx, SPICE_DEFAULT_CATALOG, &dataset.name)?;
@@ -393,6 +324,7 @@ impl DataFusion {
                     tracing::debug!(
                         "Registering dataset {dataset:?} with preloaded accelerated table"
                     );
+
                     self.ctx
                         .register_table(dataset.name.clone(), Arc::new(accelerated_table))
                         .context(UnableToRegisterTableToDataFusionSnafu)?;
@@ -407,7 +339,10 @@ impl DataFusion {
         }
 
         if matches!(dataset.mode(), Mode::ReadWrite) {
-            self.data_writers.insert(dataset.name.clone());
+            self.data_writers
+                .write()
+                .map_err(|_| Error::UnableToLockDataWriters {})?
+                .insert(dataset.name.clone());
         }
 
         Ok(())
@@ -415,7 +350,11 @@ impl DataFusion {
 
     #[must_use]
     pub fn is_writable(&self, table_reference: &TableReference) -> bool {
-        self.data_writers.iter().any(|s| s == table_reference)
+        if let Ok(writers) = self.data_writers.read() {
+            writers.iter().any(|s| s == table_reference)
+        } else {
+            false
+        }
     }
 
     async fn get_table_provider(
@@ -508,7 +447,7 @@ impl DataFusion {
         self.ctx.table_exist(dataset_name).unwrap_or(false)
     }
 
-    pub fn remove_table(&mut self, dataset_name: &TableReference) -> Result<()> {
+    pub fn remove_table(&self, dataset_name: &TableReference) -> Result<()> {
         if !self.ctx.table_exist(dataset_name.clone()).unwrap_or(false) {
             return Ok(());
         }
@@ -521,7 +460,10 @@ impl DataFusion {
         }
 
         if self.is_writable(dataset_name) {
-            self.data_writers.remove(dataset_name);
+            self.data_writers
+                .write()
+                .map_err(|_| Error::UnableToLockDataWriters {})?
+                .remove(dataset_name);
         }
 
         Ok(())
@@ -604,18 +546,21 @@ impl DataFusion {
     }
 
     async fn register_accelerated_table(
-        &mut self,
+        &self,
         dataset: &Dataset,
         source: Arc<dyn DataConnector>,
         acceleration_secret: Option<Secret>,
     ) -> Result<()> {
         let (accelerated_table, _) = self
-            .create_accelerated_table(dataset, source, acceleration_secret)
+            .create_accelerated_table(dataset, Arc::clone(&source), acceleration_secret)
             .await?;
 
         self.ctx
             .register_table(dataset.name.clone(), Arc::new(accelerated_table))
             .context(UnableToRegisterTableToDataFusionSnafu)?;
+
+        self.register_metadata_table(dataset, Arc::clone(&source))
+            .await?;
 
         Ok(())
     }
@@ -700,10 +645,36 @@ impl DataFusion {
                 .context(UnableToResolveTableProviderSnafu)?,
         };
 
+        self.register_metadata_table(dataset, Arc::clone(&source))
+            .await?;
+
         self.ctx
             .register_table(dataset.name.clone(), source_table_provider)
             .context(UnableToRegisterTableToDataFusionSnafu)?;
 
+        Ok(())
+    }
+
+    /// Register a metadata table to the `DataFusion` context if supported by the underlying data connector.
+    /// For a dataset `name`, the metadata table will be under `metadata.$name`
+    async fn register_metadata_table(
+        &self,
+        dataset: &Dataset,
+        source: Arc<dyn DataConnector>,
+    ) -> Result<()> {
+        if let Some(table) = source
+            .metadata_provider(dataset)
+            .await
+            .transpose()
+            .context(UnableToResolveTableProviderSnafu)?
+        {
+            self.ctx
+                .register_table(
+                    TableReference::partial(SPICE_METADATA_SCHEMA, dataset.name.to_string()),
+                    table,
+                )
+                .context(UnableToRegisterTableToDataFusionSnafu)?;
+        };
         Ok(())
     }
 

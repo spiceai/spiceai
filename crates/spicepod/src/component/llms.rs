@@ -27,6 +27,9 @@ pub struct Llm {
     pub from: String,
     pub name: String,
 
+    #[serde(default)]
+    pub can_embed: bool,
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub params: Option<HashMap<String, String>>,
 
@@ -40,6 +43,7 @@ impl WithDependsOn<Llm> for Llm {
         Llm {
             from: self.from.clone(),
             name: self.name.clone(),
+            can_embed: self.can_embed,
             depends_on: depends_on.to_vec(),
             params: self.params.clone(),
         }
@@ -105,22 +109,23 @@ impl Display for LlmPrefix {
 pub enum LlmParams {
     HuggingfaceParams {
         model_type: Option<Architecture>,
-        weights: Option<String>,
-        tokenizer: Option<String>,
-        chat_template: Option<String>,
+        weights_path: Option<String>,
+        tokenizer_path: Option<String>,
+        tokenizer_config_path: Option<String>,
     },
 
-    SpiceAiParams {
-        chat_template: Option<String>,
-    },
+    SpiceAiParams {},
 
     LocalModelParams {
-        weights: String,
-        tokenizer: String,
-        chat_template: String,
+        weights_path: String,
+        tokenizer_path: Option<String>,
+        tokenizer_config_path: String,
     },
     OpenAiParams {
-        // model: Option<String>,
+        api_base: Option<String>,
+        api_key: Option<String>,
+        org_id: Option<String>,
+        project_id: Option<String>,
     },
     None,
 }

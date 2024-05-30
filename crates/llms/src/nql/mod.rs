@@ -23,8 +23,6 @@ pub mod candle;
 #[cfg(feature = "mistralrs")]
 pub mod mistral;
 
-pub mod openai;
-
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Copy)]
 #[serde(rename_all = "lowercase")]
 pub enum NSQLRuntime {
@@ -46,7 +44,7 @@ pub enum Error {
     #[snafu(display("Local tokenizer, expected at {expected_path}, not found"))]
     LocalTokenizerNotFound { expected_path: String },
 
-    #[snafu(display("Failed to load model from file: {source}"))]
+    #[snafu(display("Failed to load model: {source}"))]
     FailedToLoadModel {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
@@ -65,6 +63,9 @@ pub enum Error {
     UnknownModelSource {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[snafu(display("No model from {from} currently supports {task}"))]
+    UnsupportedTaskForModel { from: String, task: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -74,20 +75,12 @@ pub trait Nql: Sync + Send {
     async fn run(&mut self, prompt: String) -> Result<Option<String>>;
 }
 
-#[must_use]
-pub fn create_openai(model: Option<String>) -> Box<dyn Nql> {
-    match model {
-        Some(model) => Box::new(openai::Openai::using_model(model)),
-        None => Box::<openai::Openai>::default(),
-    }
-}
-
 pub fn create_hf_model(
     model_id: &str,
     model_type: Option<String>,
     model_weights: &Option<String>,
     _tokenizer: &Option<String>,
-    _template_filename: &Option<String>,
+    _tokenizer_config: &Option<String>,
 ) -> Result<Box<dyn Nql>> {
     if model_type.is_none() && model_weights.is_none() {
         return Err(Error::FailedToLoadModel {
@@ -103,7 +96,7 @@ pub fn create_hf_model(
             // TODO: Support HF models with non-standard paths.
             // model_weights,
             // tokenizer,
-            // template_filename,
+            // tokenizer_config,
         )
         .map(|x| Box::new(x) as Box<dyn Nql>)
     }
@@ -118,12 +111,12 @@ pub fn create_hf_model(
 #[allow(unused_variables)]
 pub fn create_local_model(
     model_weights: &str,
-    tokenizer: &str,
-    template_filename: &str,
+    tokenizer: Option<&str>,
+    tokenizer_config: &str,
 ) -> Result<Box<dyn Nql>> {
     let w = Path::new(&model_weights);
-    let t = Path::new(&tokenizer);
-    let tf = Path::new(&template_filename);
+    let t = tokenizer.map(Path::new);
+    let tc = Path::new(tokenizer_config);
 
     if !w.exists() {
         return Err(Error::LocalModelNotFound {
@@ -131,15 +124,23 @@ pub fn create_local_model(
         });
     }
 
-    if !t.exists() {
+    if let Some(tokenizer_path) = t {
+        if !tokenizer_path.exists() {
+            return Err(Error::LocalTokenizerNotFound {
+                expected_path: tokenizer_path.to_string_lossy().to_string(),
+            });
+        }
+    }
+
+    if !tc.exists() {
         return Err(Error::LocalTokenizerNotFound {
-            expected_path: t.to_string_lossy().to_string(),
+            expected_path: tc.to_string_lossy().to_string(),
         });
     }
 
     #[cfg(feature = "mistralrs")]
     {
-        mistral::MistralLlama::from(t, w, tf).map(|x| Box::new(x) as Box<dyn Nql>)
+        mistral::MistralLlama::from(t, w, tc).map(|x| Box::new(x) as Box<dyn Nql>)
     }
     #[cfg(not(feature = "mistralrs"))]
     {

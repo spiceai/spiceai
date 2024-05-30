@@ -50,15 +50,13 @@ pub(crate) async fn do_get(
     tracing::trace!("do_get_tables: {query:?}");
     let filtered_catalogs = match catalog {
         Some(catalog) => vec![catalog.to_string()],
-        None => flight_svc.datafusion.read().await.ctx.catalog_names(),
+        None => flight_svc.datafusion.ctx.catalog_names(),
     };
     let mut builder = query.into_builder();
 
     for catalog_name in filtered_catalogs {
         let catalog_provider = flight_svc
             .datafusion
-            .read()
-            .await
             .ctx
             .catalog(&catalog_name)
             .ok_or_else(|| {

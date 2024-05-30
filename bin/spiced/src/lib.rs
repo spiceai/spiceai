@@ -30,7 +30,6 @@ use runtime::podswatcher::PodsWatcher;
 use runtime::{extension::ExtensionFactory, Runtime};
 use snafu::prelude::*;
 use spice_cloud::SpiceExtensionFactory;
-use tokio::sync::RwLock;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -85,7 +84,6 @@ pub struct Args {
 
 pub async fn run(args: Args) -> Result<()> {
     let current_dir = env::current_dir().unwrap_or(PathBuf::from("."));
-    let df = Arc::new(RwLock::new(runtime::datafusion::DataFusion::new()));
     let pods_watcher = PodsWatcher::new(current_dir.clone());
     let app: Option<App> = match AppBuilder::build_from_filesystem_path(current_dir.clone())
         .context(UnableToConstructSpiceAppSnafu)
@@ -108,19 +106,18 @@ pub async fn run(args: Args) -> Result<()> {
         }
     }
 
-    let mut rt: Runtime = Runtime::new(app, Arc::clone(&df), Arc::new(extension_factories)).await;
+    let mut rt: Runtime = Runtime::new(app, Arc::new(extension_factories)).await;
 
     rt.with_pods_watcher(pods_watcher);
 
     rt.load_secrets().await;
-
-    rt.init_results_cache().await;
 
     rt.load_datasets().await;
 
     if cfg!(feature = "models") {
         rt.load_models().await;
         rt.load_llms().await;
+        rt.load_embeddings().await;
     }
 
     if let Err(err) = rt.init_query_history().await {
