@@ -17,7 +17,7 @@ limitations under the License.
 use crate::component::dataset::Dataset;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
-use data_components::metadata::object::ObjectStoreMetadataTable;
+use data_components::object::metadata::ObjectStoreMetadataTable;
 use datafusion::dataframe::DataFrame;
 use datafusion::datasource::file_format::csv::CsvFormat;
 use datafusion::datasource::file_format::file_compression_type::FileCompressionType;
@@ -508,7 +508,7 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
         &self,
         dataset: &Dataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
-        let ctx = Self::get_session_context();
+        let ctx: SessionContext = Self::get_session_context();
         let url = self.get_object_store_url(dataset)?;
 
         // This shouldn't error because we've already validated the URL in `get_object_store_url`.
