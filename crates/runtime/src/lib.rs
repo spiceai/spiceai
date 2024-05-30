@@ -36,6 +36,8 @@ use cache::QueryResultsCacheProvider;
 use component::dataset::{self, Dataset};
 use config::Config;
 use datafusion::SPICE_RUNTIME_SCHEMA;
+use futures::future::join_all;
+use futures::StreamExt;
 use llms::nql::Nql;
 use metrics::SetRecorderError;
 use model::try_to_nql;
@@ -194,7 +196,7 @@ pub type LLMModelStore = HashMap<String, RwLock<Box<dyn Nql>>>;
 
 pub struct Runtime {
     pub app: Arc<RwLock<Option<App>>>,
-    pub df: Arc<RwLock<DataFusion>>,
+    pub df: Arc<DataFusion>,
     pub models: Arc<RwLock<HashMap<String, Model>>>,
     pub llms: Arc<RwLock<LLMModelStore>>,
     pub pods_watcher: Option<podswatcher::PodsWatcher>,
@@ -208,15 +210,16 @@ impl Runtime {
     #[must_use]
     pub async fn new(
         app: Option<app::App>,
-        df: Arc<RwLock<DataFusion>>,
         extension_factories: Arc<Vec<Box<dyn ExtensionFactory>>>,
     ) -> Self {
         dataconnector::register_all().await;
         dataaccelerator::register_all().await;
 
+        let cache_provider = Self::init_results_cache(&app);
+
         let mut rt = Runtime {
             app: Arc::new(RwLock::new(app)),
-            df,
+            df: Arc::new(DataFusion::new_with_cache_provider(cache_provider)),
             models: Arc::new(RwLock::new(HashMap::new())),
             llms: Arc::new(RwLock::new(HashMap::new())),
             pods_watcher: None,
@@ -242,7 +245,7 @@ impl Runtime {
     }
 
     #[must_use]
-    pub fn datafusion(&self) -> Arc<RwLock<DataFusion>> {
+    pub fn datafusion(&self) -> Arc<DataFusion> {
         Arc::clone(&self.df)
     }
 
@@ -311,10 +314,23 @@ impl Runtime {
         };
 
         let valid_datasets = Self::get_valid_datasets(app, true);
+        let mut futures = vec![];
         for ds in &valid_datasets {
             status::update_dataset(&ds.name, status::ComponentStatus::Initializing);
-            self.load_dataset(ds, &valid_datasets).await;
+            futures.push(self.load_dataset(ds, &valid_datasets));
         }
+
+        let app = self.app.read().await;
+
+        if let Some(app) = app.as_ref() {
+            if let Some(parallel_num) = app.runtime.num_of_parallel_loading_at_start_up {
+                let stream = futures::stream::iter(futures).buffer_unordered(parallel_num);
+                let _ = stream.collect::<Vec<_>>().await;
+                return;
+            }
+        }
+
+        let _ = join_all(futures).await;
     }
 
     // Caller must set `status::update_dataset(...` before calling `load_dataset`. This function will set error/ready statuses appropriately.`
@@ -464,11 +480,9 @@ impl Runtime {
         }
     }
 
-    pub async fn remove_dataset(&self, ds: &Dataset) {
-        let mut df = self.df.write().await;
-
-        if df.table_exists(ds.name.clone()) {
-            if let Err(e) = df.remove_table(&ds.name) {
+    pub fn remove_dataset(&self, ds: &Dataset) {
+        if self.df.table_exists(ds.name.clone()) {
+            if let Err(e) = self.df.remove_table(&ds.name) {
                 tracing::warn!("Unable to unload dataset {}: {}", &ds.name, e);
                 return;
             }
@@ -505,7 +519,7 @@ impl Runtime {
                 tracing::debug!("Failed to create accelerated table for dataset {}, falling back to full dataset reload", ds.name);
             }
 
-            self.remove_dataset(ds).await;
+            self.remove_dataset(ds);
 
             if let Ok(()) = self
                 .register_loaded_dataset(ds, Arc::clone(&connector), None)
@@ -531,8 +545,6 @@ impl Runtime {
         // create new accelerated table for updated data connector
         let (accelerated_table, is_ready) = self
             .df
-            .read()
-            .await
             .create_accelerated_table(ds, Arc::clone(&connector), acceleration_secret)
             .await
             .context(UnableToCreateAcceleratedTableSnafu {
@@ -612,7 +624,7 @@ impl Runtime {
     async fn register_dataset(
         ds: impl Borrow<Dataset>,
         data_connector: Arc<dyn DataConnector>,
-        df: Arc<RwLock<DataFusion>>,
+        df: Arc<DataFusion>,
         source: &str,
         secrets_provider: Arc<RwLock<secrets::SecretsProvider>>,
         accelerated_table: Option<AcceleratedTable>,
@@ -622,9 +634,7 @@ impl Runtime {
         // VIEW
         if let Some(view_sql) = ds.view_sql() {
             let view_sql = view_sql.context(InvalidSQLViewSnafu)?;
-            df.write()
-                .await
-                .register_table(ds, datafusion::Table::View(view_sql))
+            df.register_table(ds, datafusion::Table::View(view_sql))
                 .await
                 .context(UnableToAttachViewSnafu)?;
             return Ok(());
@@ -678,16 +688,16 @@ impl Runtime {
     }
 
     async fn register_table(
-        df: Arc<RwLock<DataFusion>>,
+        df: Arc<DataFusion>,
         ds: &Dataset,
         table: datafusion::Table,
         source: &str,
     ) -> Result<()> {
-        df.write().await.register_table(ds, table).await.context(
-            UnableToAttachDataConnectorSnafu {
+        df.register_table(ds, table)
+            .await
+            .context(UnableToAttachDataConnectorSnafu {
                 data_connector: source,
-            },
-        )?;
+            })?;
 
         Ok(())
     }
@@ -802,18 +812,18 @@ impl Runtime {
             let mut recorder = MetricsRecorder::new(metrics_socket);
 
             let table_reference = get_metrics_table_reference();
-            let metrics_table = self.df.read().await.get_table(table_reference).await;
+            let metrics_table = self.df.get_table(table_reference).await;
 
             if let Some(metrics_table) = metrics_table {
                 recorder.set_remote_schema(Arc::new(Some(metrics_table.schema())));
             } else {
                 tracing::debug!("Registering local metrics table");
-                MetricsRecorder::register_metrics_table(&self.df)
+                MetricsRecorder::register_metrics_table(&Arc::clone(&self.df))
                     .await
                     .context(UnableToStartLocalMetricsSnafu)?;
             }
 
-            recorder.start(&Arc::clone(&self.df));
+            recorder.start(&self.df);
         }
 
         Ok(())
@@ -917,7 +927,7 @@ impl Runtime {
                             }
                         };
                         status::update_dataset(&ds.name, status::ComponentStatus::Disabled);
-                        self.remove_dataset(&ds).await;
+                        self.remove_dataset(&ds);
                     }
                 }
 
@@ -930,33 +940,26 @@ impl Runtime {
         Ok(())
     }
 
-    pub async fn init_results_cache(&self) {
-        let app_lock = self.app.read().await;
-
-        let Some(app) = app_lock.as_ref() else {
-            return;
-        };
+    fn init_results_cache(app: &Option<App>) -> Option<Arc<QueryResultsCacheProvider>> {
+        let app = app.as_ref()?;
 
         let cache_config = &app.runtime.results_cache;
 
         if !cache_config.enabled {
-            return;
+            return None;
         }
 
         let cache_provider = match QueryResultsCacheProvider::new(cache_config) {
-            Ok(cache_provider) => cache_provider,
+            Ok(cache_provider) => Arc::new(cache_provider),
             Err(e) => {
                 tracing::warn!("Failed to initialize results cache: {e}");
-                return;
+                return None;
             }
         };
 
         tracing::info!("Initialized results cache; {cache_provider}");
 
-        self.df
-            .write()
-            .await
-            .set_cache_provider(Some(Arc::new(cache_provider)));
+        Some(cache_provider)
     }
 
     pub async fn init_query_history(&self) -> Result<()> {
@@ -967,8 +970,6 @@ impl Runtime {
         match query_history::instantiate_query_history_table().await {
             Ok(table) => self
                 .df
-                .write()
-                .await
                 .register_runtime_table(query_history_table_reference, table)
                 .context(UnableToCreateBackendSnafu),
             Err(err) => Err(Error::UnableToTrackQueryHistory { source: err }),

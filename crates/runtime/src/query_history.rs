@@ -131,8 +131,6 @@ pub async fn write(ctx: &QueryContext) -> Result<(), Error> {
     };
 
     ctx.df
-        .read()
-        .await
         .write_data(
             TableReference::partial(SPICE_RUNTIME_SCHEMA, DEFAULT_QUERY_HISTORY_TABLE),
             data_update,

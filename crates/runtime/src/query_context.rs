@@ -20,7 +20,6 @@ use arrow::datatypes::Schema;
 use datafusion::{
     execution::SendableRecordBatchStream, physical_plan::stream::RecordBatchStreamAdapter,
 };
-use tokio::sync::RwLock;
 
 use crate::{datafusion::DataFusion, query_history};
 use async_stream::stream;
@@ -36,11 +35,11 @@ pub struct QueryContext {
     pub execution_time: Option<u64>,
     pub rows_produced: Option<u64>,
     pub results_cache_hit: Option<bool>,
-    pub df: Arc<RwLock<DataFusion>>,
+    pub df: Arc<DataFusion>,
 }
 
 impl QueryContext {
-    pub fn new(df: Arc<RwLock<DataFusion>>) -> Self {
+    pub fn new(df: Arc<DataFusion>) -> Self {
         Self {
             query_id: uuid::Uuid::new_v4(),
             schema: None,

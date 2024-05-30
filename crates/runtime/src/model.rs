@@ -21,14 +21,11 @@ use spicepod::component::llms::{Architecture, LlmParams, LlmPrefix};
 use std::collections::HashMap;
 use std::result::Result;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 
 use crate::DataFusion;
 
-pub async fn run(m: &Model, df: Arc<RwLock<DataFusion>>) -> Result<RecordBatch, ModelError> {
+pub async fn run(m: &Model, df: Arc<DataFusion>) -> Result<RecordBatch, ModelError> {
     match df
-        .read()
-        .await
         .ctx
         .sql(
             &(format!(
