@@ -27,6 +27,7 @@ use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use reqwest::header::{CONTENT_TYPE, USER_AGENT};
 use secrets::{get_secret_or_param, Secret};
 use serde_json::Value;
+use url::Url;
 
 use crate::component::dataset::Dataset;
 use datafusion::datasource::{MemTable, TableProvider, TableType};
@@ -38,11 +39,6 @@ use std::sync::Arc;
 use std::{collections::HashMap, future::Future};
 
 use super::{DataConnector, DataConnectorFactory};
-
-#[derive(Debug, Snafu)]
-pub enum Error {}
-
-pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct GraphQL {
     secret: Option<Secret>,
@@ -63,23 +59,27 @@ impl DataConnectorFactory for GraphQL {
 
 struct GraphQLClient {
     client: reqwest::Client,
-    endpoint: String,
+    endpoint: Url,
     query: String,
     json_path: String,
 }
 
 impl GraphQLClient {
-    async fn execute(&self) -> (Vec<Vec<RecordBatch>>, SchemaRef) {
+    async fn execute(&self) -> datafusion::error::Result<(Vec<Vec<RecordBatch>>, SchemaRef)> {
         let body = format!(r#"{{"query": "{}"}}"#, self.query.lines().join(" "));
         let response = self
             .client
-            .post(&self.endpoint)
+            .post(self.endpoint.clone())
             .body(body)
             .send()
             .await
-            .unwrap();
+            .map_err(|_| {
+                datafusion::error::DataFusionError::Execution("Failed to execute query".to_string())
+            })?;
 
-        let mut response: serde_json::Value = response.json().await.unwrap();
+        let mut response: serde_json::Value = response.json().await.map_err(|_| {
+            datafusion::error::DataFusionError::Execution("Failed to execute query".to_string())
+        })?;
         for key in self.json_path.split('.') {
             response = response[key].clone();
         }
@@ -87,11 +87,22 @@ impl GraphQLClient {
         let unwraped = match response {
             Value::Array(val) => val.clone(),
             obj @ Value::Object(_) => vec![obj.clone()],
-            _ => unimplemented!(),
+            Value::Null => Err(datafusion::error::DataFusionError::Execution(
+                "Value is null".to_string(),
+            ))?,
+            _ => Err(datafusion::error::DataFusionError::Execution(
+                "Value is not an array or object".to_string(),
+            ))?,
         };
 
         let schema = Arc::new(
-            infer_json_schema_from_iterator(unwraped.clone().into_iter().map(Result::Ok)).unwrap(),
+            infer_json_schema_from_iterator(unwraped.clone().into_iter().map(Result::Ok)).map_err(
+                |_| {
+                    datafusion::error::DataFusionError::Execution(
+                        "Failed to infer schema.".to_string(),
+                    )
+                },
+            )?,
         );
 
         let mut res = vec![];
@@ -100,41 +111,79 @@ impl GraphQLClient {
             let batch = ReaderBuilder::new(schema.clone())
                 .with_batch_size(1024)
                 .build(Cursor::new(buf.as_bytes()))
-                .unwrap()
+                .map_err(|_| {
+                    datafusion::error::DataFusionError::Execution(
+                        "Failed to read batch".to_string(),
+                    )
+                })?
                 .collect::<Result<Vec<_>, _>>()
-                .unwrap();
+                .map_err(|_| {
+                    datafusion::error::DataFusionError::Execution(
+                        "Failed to collect batch".to_string(),
+                    )
+                })?;
             res.push(batch);
         }
 
-        (res, schema)
+        Ok((res, schema))
     }
 }
 
 impl GraphQL {
-    async fn get_client(&self, dataset: &Dataset) -> GraphQLClient {
+    async fn get_client(&self, dataset: &Dataset) -> super::DataConnectorResult<GraphQLClient> {
         let mut client_builder = reqwest::Client::builder();
-        let token = get_secret_or_param(&self.params, &self.secret, "auth_token_key", "auth_token")
-            .unwrap();
-        let query = self.params.get("query").unwrap().clone();
-        let endpoint = dataset.path().clone();
-        let json_path = self.params.get("json_path").unwrap().clone();
+        let token = get_secret_or_param(&self.params, &self.secret, "auth_token_key", "auth_token");
+
+        let query = self
+            .params
+            .get("query")
+            .ok_or("Query not found in params".into())
+            .context(super::InvalidConfigurationSnafu {
+                dataconnector: "GraphQL",
+                message: "Query not found",
+            })?
+            .to_owned();
+        let endpoint = Url::parse(&dataset.path()).map_err(|e| e.into()).context(
+            super::InvalidConfigurationSnafu {
+                dataconnector: "GraphQL",
+                message: "Invalid URL",
+            },
+        )?;
+        let json_path = self
+            .params
+            .get("json_path")
+            .map_or("data".to_string(), ToOwned::to_owned);
 
         let mut headers = HeaderMap::new();
         headers.append(USER_AGENT, HeaderValue::from_static("spice"));
         headers.append(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        headers.append(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("bearer {token}")).unwrap(),
-        );
+        if let Some(token) = token {
+            headers.append(
+                AUTHORIZATION,
+                HeaderValue::from_str(&format!("bearer {token}")).map_err(|e| {
+                    super::DataConnectorError::InvalidConfiguration {
+                        dataconnector: "GraphQL".to_string(),
+                        message: "Failed to set token".to_string(),
+                        source: e.into(),
+                    }
+                })?,
+            );
+        }
 
         client_builder = client_builder.default_headers(headers);
 
-        GraphQLClient {
-            client: client_builder.build().unwrap(),
+        Ok(GraphQLClient {
+            client: client_builder.build().map_err(|e| {
+                super::DataConnectorError::InvalidConfiguration {
+                    dataconnector: "GraphQL".to_string(),
+                    message: "Failed to set token".to_string(),
+                    source: e.into(),
+                }
+            })?,
             query,
             endpoint,
             json_path,
-        }
+        })
     }
 }
 
@@ -144,8 +193,16 @@ struct GraphQLTableProvider {
 }
 
 impl GraphQLTableProvider {
-    pub async fn new(client: GraphQLClient) -> Result<Self> {
-        let (_, schema) = client.execute().await;
+    pub async fn new(client: GraphQLClient) -> super::DataConnectorResult<Self> {
+        let (_, schema) =
+            client
+                .execute()
+                .await
+                .map_err(|e| e.into())
+                .context(super::InternalSnafu {
+                    dataconnector: "GraphQL",
+                    code: "GTP-GC-e".to_string(), //GraphQLTableProvider-GraphQLClient-execute
+                })?;
 
         Ok(Self { client, schema })
     }
@@ -172,8 +229,8 @@ impl TableProvider for GraphQLTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        let (res, schema) = self.client.execute().await;
-        let table = MemTable::try_new(schema, res).unwrap();
+        let (res, schema) = self.client.execute().await?;
+        let table = MemTable::try_new(schema, res)?;
 
         table.scan(state, projection, filters, limit).await
     }
@@ -189,8 +246,8 @@ impl DataConnector for GraphQL {
         &self,
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        let client = self.get_client(&dataset).await;
+        let client = self.get_client(&dataset).await?;
 
-        Ok(Arc::new(GraphQLTableProvider::new(client).await.unwrap()))
+        Ok(Arc::new(GraphQLTableProvider::new(client).await?))
     }
 }
