@@ -579,15 +579,6 @@ dependencies = [
 
 [[package]]
 name = "arrow_tools"
-version = "0.13.1-alpha"
-source = "git+https://github.com/spiceai/spiceai.git?rev=v0.13.1-alpha#3007a0dab43d3b25badf5aca29659f92f00af1e9"
-dependencies = [
- "arrow",
- "snafu 0.8.2",
-]
-
-[[package]]
-name = "arrow_tools"
 version = "0.14.0-alpha"
 dependencies = [
  "arrow",
@@ -2697,7 +2688,6 @@ dependencies = [
 name = "datafusion-federation"
 version = "0.1.3"
 dependencies = [
- "arrow_tools 0.13.1-alpha",
  "async-stream",
  "async-trait",
  "datafusion",
@@ -7368,7 +7358,7 @@ dependencies = [
  "arrow-ipc",
  "arrow-json 51.0.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "arrow_sql_gen",
- "arrow_tools 0.14.0-alpha",
+ "arrow_tools",
  "async-stream",
  "async-trait",
  "axum 0.7.5",
