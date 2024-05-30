@@ -129,7 +129,7 @@ impl Query {
         self.validate()?;
 
         let data = self
-            .query_context_into_record_batch()
+            .into_record_batch()
             .boxed()
             .context(UnableToWriteToTableSnafu)?;
 
@@ -151,7 +151,7 @@ impl Query {
         Ok(())
     }
 
-    fn query_context_into_record_batch(&self) -> Result<RecordBatch, Error> {
+    fn into_record_batch(&self) -> Result<RecordBatch, Error> {
         let end_time = self
             .end_time
             .and_then(|s| {
