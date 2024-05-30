@@ -15,20 +15,19 @@ limitations under the License.
 */
 
 use arrow::record_batch::RecordBatch;
+use llms::embeddings::Embed;
 use llms::nql::{Error as LlmError, Nql};
+use llms::openai::{DEFAULT_EMBEDDING_MODEL, DEFAULT_LLM_MODEL};
 use model_components::model::{Error as ModelError, Model};
 use spicepod::component::llms::{Architecture, LlmParams, LlmPrefix};
 use std::collections::HashMap;
 use std::result::Result;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 
 use crate::DataFusion;
 
-pub async fn run(m: &Model, df: Arc<RwLock<DataFusion>>) -> Result<RecordBatch, ModelError> {
+pub async fn run(m: &Model, df: Arc<DataFusion>) -> Result<RecordBatch, ModelError> {
     match df
-        .read()
-        .await
         .ctx
         .sql(
             &(format!(
@@ -47,6 +46,44 @@ pub async fn run(m: &Model, df: Arc<RwLock<DataFusion>>) -> Result<RecordBatch, 
         Err(e) => Err(ModelError::UnableToRunModel {
             source: Box::new(e),
         }),
+    }
+}
+
+pub fn try_to_embedding(
+    component: &spicepod::component::llms::Llm,
+) -> Result<Box<dyn Embed>, LlmError> {
+    let prefix = component.get_prefix().ok_or(LlmError::UnknownModelSource {
+        source: format!(
+            "Unknown model source for spicepod component from: {}",
+            component.from.clone()
+        )
+        .into(),
+    })?;
+
+    let model_id = component.get_model_id();
+
+    match construct_llm_params(
+        &prefix,
+        &model_id,
+        &(component.params).clone().unwrap_or_default(),
+    ) {
+        Ok(LlmParams::OpenAiParams {
+            api_base,
+            api_key,
+            org_id,
+            project_id,
+        }) => Ok(Box::new(llms::openai::Openai::new(
+            DEFAULT_EMBEDDING_MODEL.to_string(),
+            api_base,
+            api_key,
+            org_id,
+            project_id,
+        ))),
+        Ok(_) => Err(LlmError::UnsupportedTaskForModel {
+            from: component.from.clone(),
+            task: "embedding".into(),
+        }),
+        Err(e) => Err(e),
     }
 }
 
@@ -72,9 +109,13 @@ pub fn try_to_nql(component: &spicepod::component::llms::Llm) -> Result<Box<dyn 
             api_key,
             org_id,
             project_id,
-        }) => Ok(llms::nql::create_openai(
-            model_id, api_base, api_key, org_id, project_id,
-        )),
+        }) => Ok(Box::new(llms::openai::Openai::new(
+            model_id.unwrap_or(DEFAULT_LLM_MODEL.to_string()),
+            api_base,
+            api_key,
+            org_id,
+            project_id,
+        ))),
         Ok(LlmParams::LocalModelParams {
             weights_path,
             tokenizer_path,

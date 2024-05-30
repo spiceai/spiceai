@@ -64,7 +64,7 @@ pub(crate) async fn handle(
 
     let data_path = TableReference::parse_str(&flight_descriptor.path.join("."));
 
-    if !flight_svc.datafusion.read().await.is_writable(&data_path) {
+    if !flight_svc.datafusion.is_writable(&data_path) {
         return Err(Status::invalid_argument(format!(
             r#"Unknown dataset: "{data_path}""#,
         )));
@@ -129,8 +129,6 @@ pub(crate) async fn handle(
     let datafusion = Arc::clone(&flight_svc.datafusion);
     tokio::spawn(async move {
         let Ok(df) = datafusion
-            .read()
-            .await
             .ctx
             .sql(&format!(r#"SELECT * FROM {data_path}"#))
             .await

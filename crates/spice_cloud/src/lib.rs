@@ -91,10 +91,7 @@ impl SpiceExtension {
         let api_key = self.get_spice_api_key(runtime).await?;
         let client = reqwest::Client::new();
         let response = client
-            .post(format!(
-                "{}/v1/control_plane/connect",
-                self.spice_http_url()
-            ))
+            .post(format!("{}/v1/connect", self.spice_http_url()))
             .json(&json!({}))
             .header("Content-Type", "application/json")
             .header("X-API-Key", api_key)
@@ -149,8 +146,6 @@ impl SpiceExtension {
 
         runtime
             .datafusion()
-            .write()
-            .await
             .register_runtime_table(metrics_table_reference, table)
             .boxed()
             .map_err(|e| runtime::extension::Error::UnableToStartExtension { source: e })?;

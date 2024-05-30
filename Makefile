@@ -37,10 +37,10 @@ nextest:
 test-integration:
 	@cargo test -p runtime --test integration --features mysql -- --nocapture
 
-.PHONY: lint
-lint:
-	go vet ./...
-	golangci-lint run
+.PHONY: lint lint-go lint-rust
+lint: lint-go lint-rust
+
+lint-rust:
 	cargo fmt --all -- --check
 	cargo clippy --all-targets --all-features --workspace -- \
 		-Dwarnings \
@@ -48,6 +48,11 @@ lint:
 		-Dclippy::unwrap_used \
 		-Dclippy::expect_used \
 		-Dclippy::clone_on_ref_ptr
+
+lint-go:
+	go vet ./...
+	golangci-lint run
+
 
 .PHONY: run
 run:

@@ -68,10 +68,9 @@ async fn run_query_and_check_results<F>(
 where
     F: FnOnce(Vec<RecordBatch>),
 {
-    let df = &mut *rt.df.write().await;
-
     // Check the plan
-    let plan_results = df
+    let plan_results = rt
+        .df
         .ctx
         .sql(&format!("EXPLAIN {query}"))
         .await
@@ -84,7 +83,8 @@ where
 
     // Check the result
     if let Some(validate_result) = validate_result {
-        let result_batches = df
+        let result_batches = rt
+            .df
             .ctx
             .sql(query)
             .await
