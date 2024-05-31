@@ -21,6 +21,7 @@ use arrow::{
     error::ArrowError,
 };
 use async_stream::stream;
+use async_trait::async_trait;
 use bytes::Bytes;
 use datafusion::{
     common::{project_schema, Constraints},
@@ -38,9 +39,9 @@ use futures::Stream;
 use futures::StreamExt;
 use object_store::{path::Path, GetResult, ObjectMeta, ObjectStore};
 use std::{any::Any, fmt, str::Utf8Error, sync::Arc};
-use tonic::async_trait;
 
-use super::ObjectStoreContext;
+use super::{parse_prefix_and_regex, ObjectStoreContext};
+use url::Url;
 
 pub struct ObjectStoreRawTable {
     ctx: ObjectStoreContext,
@@ -49,11 +50,12 @@ pub struct ObjectStoreRawTable {
 impl ObjectStoreRawTable {
     pub fn try_new(
         store: Arc<dyn ObjectStore>,
-        prefix: Option<String>,
-        filename_regex: Option<String>,
+        url: &Url,
+        extension: Option<String>,
     ) -> Result<Arc<Self>, Box<dyn std::error::Error + Send + Sync>> {
+        let (prefix_str, filename_regex_opt) = parse_prefix_and_regex(url, extension)?;
         Ok(Arc::new(Self {
-            ctx: ObjectStoreContext::try_new(store, prefix, filename_regex)?,
+            ctx: ObjectStoreContext::try_new(store, Some(prefix_str), filename_regex_opt)?,
         }))
     }
 
@@ -78,10 +80,8 @@ impl ObjectStoreRawTable {
                 .collect::<Vec<_>>(),
         );
 
-        let utf8_strings: Result<Vec<_>, Utf8Error> = raw
-            .iter()
-            .map(|bytes| std::str::from_utf8(bytes))
-            .collect();
+        let utf8_strings: Result<Vec<_>, Utf8Error> =
+            raw.iter().map(|bytes| std::str::from_utf8(bytes)).collect();
 
         let content_array = StringArray::from(
             utf8_strings?

@@ -22,6 +22,7 @@ pub mod raw;
 use object_store::{ObjectMeta, ObjectStore};
 use regex::Regex;
 use snafu::ResultExt;
+use url::Url;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ObjectStoreContext {
@@ -63,5 +64,29 @@ impl ObjectStoreContext {
             }
         }
         true
+    }
+}
+
+pub(crate) fn parse_prefix_and_regex(
+    url: &Url,
+    extension: Option<String>,
+) -> Result<(String, Option<String>), Box<dyn std::error::Error + Send + Sync>> {
+    let (_store, prefix) = object_store::parse_url(url)?;
+
+    if let Some(_ext) = prefix.extension() {
+        // Prefix is not collection, but a single file
+        let filename = prefix.filename().unwrap_or_default();
+        Ok((
+            prefix
+                .to_string()
+                .strip_suffix(filename)
+                .unwrap_or_default()
+                .to_string(),
+            Some(filename.to_string()),
+        ))
+    } else if let Some(ext) = extension {
+        Ok((prefix.to_string(), Some(format!(r"^.*\{ext}$"))))
+    } else {
+        Ok((prefix.to_string(), None))
     }
 }
