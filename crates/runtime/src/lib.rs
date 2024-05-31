@@ -50,8 +50,9 @@ use snafu::prelude::*;
 use spice_metrics::get_metrics_table_reference;
 use spicepod::component::model::Model as SpicepodModel;
 use tokio::sync::oneshot::error::RecvError;
+use tokio::sync::RwLock;
 use tokio::time::sleep;
-use tokio::{signal, sync::RwLock};
+pub use util::shutdown_signal;
 
 use crate::extension::{Extension, ExtensionFactory};
 pub mod accelerated_table;
@@ -1128,17 +1129,4 @@ fn get_dependent_table_names(statement: &parser::Statement) -> Vec<TableReferenc
         .into_iter()
         .filter(|name| !cte_names.contains(name))
         .collect()
-}
-
-pub async fn shutdown_signal() {
-    let ctrl_c = async {
-        let signal_result = signal::ctrl_c().await;
-        if let Err(err) = signal_result {
-            tracing::error!("Failed to listen to shutdown signal: {err}");
-        }
-    };
-
-    tokio::select! {
-        () = ctrl_c => {},
-    }
 }

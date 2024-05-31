@@ -9506,6 +9506,8 @@ name = "util"
 version = "0.14.0-alpha"
 dependencies = [
  "humantime",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
