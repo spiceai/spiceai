@@ -41,7 +41,7 @@ use futures::Stream;
 use futures::StreamExt;
 use object_store::{path::Path, ObjectMeta, ObjectStore};
 
-use super::{parse_prefix_and_regex, ObjectStoreContext};
+use super::ObjectStoreContext;
 use url::Url;
 
 pub struct ObjectStoreMetadataTable {
@@ -54,9 +54,8 @@ impl ObjectStoreMetadataTable {
         url: &Url,
         extension: Option<String>,
     ) -> Result<Arc<Self>, Box<dyn std::error::Error + Send + Sync>> {
-        let (prefix_str, filename_regex_opt) = parse_prefix_and_regex(url, extension)?;
         Ok(Arc::new(Self {
-            ctx: ObjectStoreContext::try_new(store, Some(prefix_str), filename_regex_opt)?,
+            ctx: ObjectStoreContext::try_new(store, url, extension)?,
         }))
     }
 

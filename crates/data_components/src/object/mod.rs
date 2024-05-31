@@ -39,16 +39,17 @@ pub(crate) struct ObjectStoreContext {
 impl ObjectStoreContext {
     pub fn try_new(
         store: Arc<dyn ObjectStore>,
-        prefix: Option<String>,
-        filename_regex: Option<String>,
+        url: &Url,
+        extension: Option<String>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let filename_regex = filename_regex
+        let (prefix, filename_regex_opt) = parse_prefix_and_regex(url, extension)?;
+        let filename_regex = filename_regex_opt
             .map(|regex| Regex::new(&regex).boxed())
             .transpose()?;
 
         Ok(Self {
             store,
-            prefix,
+            prefix: Some(prefix),
             filename_regex,
         })
     }
