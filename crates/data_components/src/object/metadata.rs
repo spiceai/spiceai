@@ -40,34 +40,22 @@ use datafusion::{
 use futures::Stream;
 use futures::StreamExt;
 use object_store::{path::Path, ObjectMeta, ObjectStore};
-use regex::Regex;
-use snafu::ResultExt;
+
+use super::ObjectStoreContext;
+use url::Url;
 
 pub struct ObjectStoreMetadataTable {
-    store: Arc<dyn ObjectStore>,
-
-    // Directory-like prefix to filter objects in the store.
-    prefix: Option<String>,
-
-    // Filename filter to apply to post-[`Scan`].
-    // [`object_store.list(`] does not support filtering by filename, or filename regex.
-    filename_regex: Option<Regex>,
+    ctx: ObjectStoreContext,
 }
 
 impl ObjectStoreMetadataTable {
     pub fn try_new(
         store: Arc<dyn ObjectStore>,
-        prefix: Option<String>,
-        filename_regex: Option<String>,
+        url: &Url,
+        extension: Option<String>,
     ) -> Result<Arc<Self>, Box<dyn std::error::Error + Send + Sync>> {
-        let filename_regex = filename_regex
-            .map(|regex| Regex::new(&regex).boxed())
-            .transpose()?;
-
         Ok(Arc::new(Self {
-            store,
-            prefix,
-            filename_regex,
+            ctx: ObjectStoreContext::try_new(store, url, extension)?,
         }))
     }
 
@@ -181,9 +169,7 @@ impl TableProvider for ObjectStoreMetadataTable {
             projected_schema,
             filters,
             limit,
-            Arc::clone(&self.store),
-            self.prefix.clone(),
-            self.filename_regex.clone(),
+            self.ctx.clone(),
         )))
     }
 
@@ -204,14 +190,12 @@ pub struct ObjectStoreMetadataExec {
     limit: Option<usize>,
     properties: PlanProperties,
 
-    store: Arc<dyn ObjectStore>,
-    prefix: Option<String>,
-    filename_regex: Option<Regex>,
+    ctx: ObjectStoreContext,
 }
 
 impl std::fmt::Debug for ObjectStoreMetadataExec {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "{} prefix={:?}", self.name(), self.prefix.clone())
+        write!(f, "{} prefix={:?}", self.name(), self.ctx.prefix.clone())
     }
 }
 
@@ -221,7 +205,7 @@ impl DisplayAs for ObjectStoreMetadataExec {
             f,
             "{} prefix={}",
             self.name(),
-            self.prefix.clone().unwrap_or_default()
+            self.ctx.prefix.clone().unwrap_or_default()
         )
     }
 }
@@ -261,24 +245,17 @@ impl ExecutionPlan for ObjectStoreMetadataExec {
     ) -> DataFusionResult<SendableRecordBatchStream> {
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema(),
-            to_sendable_stream(
-                Arc::clone(&self.store),
-                self.limit,
-                self.prefix.clone(),
-                self.filename_regex.clone(),
-            ), // TODO get prefix from filters
+            to_sendable_stream(self.ctx.clone(), self.limit), // TODO get prefix from filters
         )))
     }
 }
 
 impl ObjectStoreMetadataExec {
-    pub fn new(
+    pub(crate) fn new(
         projected_schema: SchemaRef,
         filters: &[Expr],
         limit: Option<usize>,
-        store: Arc<dyn ObjectStore>,
-        prefix: Option<String>,
-        filename_regex: Option<Regex>,
+        ctx: ObjectStoreContext,
     ) -> Self {
         Self {
             projected_schema: Arc::clone(&projected_schema),
@@ -289,28 +266,24 @@ impl ObjectStoreMetadataExec {
                 Partitioning::UnknownPartitioning(1),
                 ExecutionMode::Bounded,
             ),
-            store,
-            prefix,
-            filename_regex,
+            ctx,
         }
     }
 }
 
-pub fn to_sendable_stream(
-    store: Arc<dyn ObjectStore>,
+fn to_sendable_stream(
+    ctx: ObjectStoreContext,
     limit: Option<usize>,
-    prefix: Option<String>,
-    filename_regex: Option<Regex>,
 ) -> impl Stream<Item = DataFusionResult<RecordBatch>> + 'static {
     stream! {
-        let mut object_stream = store.list(prefix.clone().map(Path::from).as_ref());
+        let mut object_stream = ctx.store.list(ctx.prefix.clone().map(Path::from).as_ref());
         let mut count = 0;
 
         while let Some(item) = object_stream.next().await {
             match item {
                 Ok(object_meta) => {
 
-                    if !filename_in_scan(&object_meta.location, filename_regex.clone()) {
+                    if !ctx.filename_in_scan(&object_meta) {
                     continue;
                     }
                     match ObjectStoreMetadataTable::to_record_batch(&[object_meta]) {
@@ -329,18 +302,4 @@ pub fn to_sendable_stream(
             }
         }
     }
-}
-
-fn filename_in_scan(location: &Path, filename_regex: Option<Regex>) -> bool {
-    if let Some(regex) = filename_regex {
-        if let Some(filename) = location.filename() {
-            if !regex.is_match(filename) {
-                return false;
-            }
-        } else {
-            return false; // Could not get the filename as a valid UTF-8 string
-        }
-    }
-
-    true
 }
