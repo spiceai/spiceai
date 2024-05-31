@@ -415,6 +415,18 @@ impl InsertBuilder {
                                 ),
                             }
                         }
+                    },
+                    DataType::Binary => {
+                        let array = column.as_any().downcast_ref::<array::BinaryArray>();
+
+                        if let Some(valid_array) = array {
+                            if valid_array.is_null(row) {
+                                row_values.push(Keyword::Null.into());
+                                continue;
+                            }
+
+                            row_values.push(valid_array.value(row).into());
+                        }
                     }
                     unimplemented_type => {
                         return Result::Err(Error::UnimplementedDataTypeInInsertStatement {
