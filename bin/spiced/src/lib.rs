@@ -129,14 +129,13 @@ pub async fn run(args: Args) -> Result<()> {
         tokio::spawn(async move { cloned_rt.start_servers(args.runtime, args.metrics).await });
 
     rt.load_secrets().await;
-    let init_query_history = async {
-        if let Err(err) = rt.init_query_history().await {
-            tracing::warn!("Creating internal query history table: {err}");
-        };
-    };
 
     let mut futures: Vec<Pin<Box<dyn Future<Output = ()>>>> = vec![
-        Box::pin(init_query_history),
+        Box::pin(async {
+            if let Err(err) = rt.init_query_history().await {
+                tracing::warn!("Creating internal query history table: {err}");
+            };
+        }),
         Box::pin(rt.init_results_cache()),
         Box::pin(rt.start_extensions()),
         Box::pin(rt.load_datasets()),
@@ -152,7 +151,12 @@ pub async fn run(args: Args) -> Result<()> {
         futures.append(&mut v);
     }
 
-    let _ = join_all(futures).await;
+    tokio::select! {
+        _ = join_all(futures) => {},
+        () = runtime::shutdown_signal() => {
+            tracing::debug!("Cancelling runtime initializing!");
+        },
+    }
 
     match server_thread.await {
         Ok(ok) => ok.context(UnableToStartServersSnafu),

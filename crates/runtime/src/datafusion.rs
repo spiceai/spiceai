@@ -269,8 +269,9 @@ impl DataFusion {
     }
 
     pub fn set_cache_provider(&self, cache_provider: QueryResultsCacheProvider) {
-        let mut a = self.cache_provider.write().unwrap();
-        *a = Some(Arc::new(cache_provider));
+        if let Ok(mut a) = self.cache_provider.write() {
+            *a = Some(Arc::new(cache_provider));
+        };
     }
 
     pub async fn has_table(&self, table_reference: &TableReference) -> bool {

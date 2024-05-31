@@ -1130,7 +1130,7 @@ fn get_dependent_table_names(statement: &parser::Statement) -> Vec<TableReferenc
         .collect()
 }
 
-async fn shutdown_signal() {
+pub async fn shutdown_signal() {
     let ctrl_c = async {
         let signal_result = signal::ctrl_c().await;
         if let Err(err) = signal_result {
