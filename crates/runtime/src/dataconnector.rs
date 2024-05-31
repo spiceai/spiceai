@@ -17,7 +17,8 @@ limitations under the License.
 use crate::component::dataset::Dataset;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
-use data_components::metadata::object::ObjectStoreMetadataTable;
+use data_components::object::metadata::ObjectStoreMetadataTable;
+use data_components::object::text::ObjectStoreTextTable;
 use datafusion::dataframe::DataFrame;
 use datafusion::datasource::file_format::csv::CsvFormat;
 use datafusion::datasource::file_format::file_compression_type::FileCompressionType;
@@ -32,6 +33,7 @@ use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::{Expr, LogicalPlanBuilder};
 use datafusion::sql::TableReference;
 use lazy_static::lazy_static;
+use object_store::ObjectStore;
 use snafu::prelude::*;
 use std::any::Any;
 use std::collections::HashMap;
@@ -338,6 +340,25 @@ pub trait ListingTableConnector: DataConnector {
         )
     }
 
+    fn get_object_store(&self, dataset: &Dataset) -> DataConnectorResult<Arc<dyn ObjectStore>>
+    where
+        Self: Display,
+    {
+        let store_url = self.get_object_store_url(dataset)?;
+        let listing_store_url = ListingTableUrl::parse(store_url.clone()).boxed().context(
+            UnableToConnectInternalSnafu {
+                dataconnector: format!("{self}"),
+            },
+        )?;
+        Self::get_session_context()
+            .runtime_env()
+            .object_store(&listing_store_url)
+            .boxed()
+            .context(UnableToConnectInternalSnafu {
+                dataconnector: format!("{self}"),
+            })
+    }
+
     fn construct_metadata_provider(
         &self,
         dataset: &Dataset,
@@ -345,59 +366,33 @@ pub trait ListingTableConnector: DataConnector {
     where
         Self: Display,
     {
-        let ctx = Self::get_session_context();
-        let store_url = self.get_object_store_url(dataset)?;
-
-        // TODO: For some reason, this `store` is not working. It's not setting `bucket_endpoint`.
-        // Need this, store-specific, prefix parsing
-        let (_store, prefix) = object_store::parse_url(&store_url.clone())
-            .boxed()
-            .context(UnableToConnectInternalSnafu {
-                dataconnector: format!("{self}"),
-            })?;
+        let store_url: Url = self.get_object_store_url(dataset)?;
+        let store = self.get_object_store(dataset)?;
         let (_, extension) = self.get_file_format_and_extension(dataset)?;
 
-        let (prefix_str, filename_regex) = if let Some(_ext) = prefix.extension() {
-            // Prefix is not collection, but a single file
-            let filename = prefix.filename().unwrap_or_default();
-            (
-                prefix
-                    .to_string()
-                    .strip_suffix(filename)
-                    .unwrap_or_default()
-                    .to_string(),
-                filename.to_string(),
-            )
-        } else {
-            (prefix.to_string(), format!(r"^.*\{extension}$"))
-        };
-
-        let listing_store_url = ListingTableUrl::parse(store_url.clone()).boxed().context(
-            UnableToConnectInternalSnafu {
-                dataconnector: format!("{self}"),
-            },
-        )?;
-        let object_store = ctx
-            .runtime_env()
-            .object_store(&listing_store_url)
-            .boxed()
-            .context(UnableToConnectInternalSnafu {
-                dataconnector: format!("{self}"),
-            })?;
-
-        let table =
-            ObjectStoreMetadataTable::try_new(object_store, Some(prefix_str), Some(filename_regex))
-                .context(InternalSnafu {
-                    dataconnector: format!("{self}"),
-                    code: "LTC-MP-OSMT".to_string(), // ListingTableConnector-MetadataProvider-ObjectStoreMetadataTableTryNew
-                })?;
+        let table = ObjectStoreMetadataTable::try_new(store, &store_url, Some(extension.clone()))
+            .context(InvalidConfigurationSnafu {
+            dataconnector: format!("{self}"),
+            message: format!("Invalid extension ({extension}) for source ({store_url})"),
+        })?;
         Ok(table as Arc<dyn TableProvider>)
     }
 
+    /// Determines the file format and its corresponding extension for a given dataset.
+    ///
+    /// If not explicitly specified (via the [`Dataset`]'s `file_format` param key), it attempts
+    /// to infer the format from the dataset's file extension. It supports both tabular and
+    /// unstructured formats. It supports the following tabular formats:
+    ///  - parquet
+    ///  - csv
+    /// For tabular formats, file options can also be specified in the [`Dataset`]'s `param`s.
+    ///
+    /// For unstructured text formats, the [`Dataset`]'s `file_format` param key must be set. `Ok`
+    /// responses, are always of the format `Ok((None, String))`. The data must be UTF8 compatible.
     fn get_file_format_and_extension(
         &self,
         dataset: &Dataset,
-    ) -> DataConnectorResult<(Arc<dyn FileFormat>, String)>
+    ) -> DataConnectorResult<(Option<Arc<dyn FileFormat>>, String)>
     where
         Self: Display,
     {
@@ -406,29 +401,25 @@ pub trait ListingTableConnector: DataConnector {
 
         match params.get("file_format").map(String::as_str) {
             Some("csv") => Ok((
-                self.get_csv_format(params)?,
+                Some(self.get_csv_format(params)?),
                 extension.unwrap_or(".csv".to_string()),
             )),
             Some("parquet") => Ok((
-                Arc::new(ParquetFormat::default()),
+                Some(Arc::new(ParquetFormat::default())),
                 extension.unwrap_or(".parquet".to_string()),
             )),
-            Some(format) => Err(DataConnectorError::InvalidConfiguration {
-                dataconnector: format!("{self}"),
-                message: format!("Unsupported file format '{format}'. Use csv or parquet."),
-                source: "Invalid file format".into(),
-            }),
+            Some(format) => Ok((None, format!(".{format}"))),
             None => {
                 if let Some(ext) = std::path::Path::new(dataset.path().as_str()).extension() {
                     if ext.eq_ignore_ascii_case("csv") {
                         return Ok((
-                            self.get_csv_format(params)?,
+                            Some(self.get_csv_format(params)?),
                             extension.unwrap_or(".csv".to_string()),
                         ));
                     }
                     if ext.eq_ignore_ascii_case("parquet") {
                         return Ok((
-                            Arc::new(ParquetFormat::default()),
+                            Some(Arc::new(ParquetFormat::default())),
                             extension.unwrap_or(".parquet".to_string()),
                         ));
                     }
@@ -508,39 +499,57 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
         &self,
         dataset: &Dataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
-        let ctx = Self::get_session_context();
+        let ctx: SessionContext = Self::get_session_context();
         let url = self.get_object_store_url(dataset)?;
 
         // This shouldn't error because we've already validated the URL in `get_object_store_url`.
-        let table_path = ListingTableUrl::parse(url).boxed().context(InternalSnafu {
-            dataconnector: format!("{self}"),
-            code: "LTC-RP-LTUP".to_string(), // ListingTableConnector-ReadProvider-ListingTableUrlParse
-        })?;
-
-        let (file_format, extension) = self.get_file_format_and_extension(dataset)?;
-        let options = ListingOptions::new(file_format).with_file_extension(&extension);
-
-        let resolved_schema = options
-            .infer_schema(&ctx.state(), &table_path)
-            .await
-            .boxed()
-            .context(UnableToConnectInternalSnafu {
-                dataconnector: format!("{self}"),
-            })?;
-
-        let config = ListingTableConfig::new(table_path)
-            .with_listing_options(options)
-            .with_schema(resolved_schema);
-
-        // This shouldn't error because we're passing the schema and options correctly.
-        let table = ListingTable::try_new(config)
+        let table_path = ListingTableUrl::parse(url.clone())
             .boxed()
             .context(InternalSnafu {
                 dataconnector: format!("{self}"),
-                code: "LTC-RP-LTTN".to_string(), // ListingTableConnector-ReadProvider-ListingTableTryNew
+                code: "LTC-RP-LTUP".to_string(), // ListingTableConnector-ReadProvider-ListingTableUrlParse
             })?;
 
-        Ok(Arc::new(table))
+        let (file_format_opt, extension) = self.get_file_format_and_extension(dataset)?;
+        match file_format_opt {
+            None => {
+                // Assume its unstructured text data. Use a [`ObjectStoreTextTable`].
+                Ok(ObjectStoreTextTable::try_new(
+                    self.get_object_store(dataset)?,
+                    &url.clone(),
+                    Some(extension.clone()),
+                )
+                .context(InvalidConfigurationSnafu {
+                    dataconnector: format!("{self}"),
+                    message: format!("Invalid extension ({extension}) for source ({url})"),
+                })?)
+            }
+            Some(file_format) => {
+                let options = ListingOptions::new(file_format).with_file_extension(&extension);
+
+                let resolved_schema = options
+                    .infer_schema(&ctx.state(), &table_path)
+                    .await
+                    .boxed()
+                    .context(UnableToConnectInternalSnafu {
+                        dataconnector: format!("{self}"),
+                    })?;
+
+                let config = ListingTableConfig::new(table_path)
+                    .with_listing_options(options)
+                    .with_schema(resolved_schema);
+
+                // This shouldn't error because we're passing the schema and options correctly.
+                let table = ListingTable::try_new(config)
+                    .boxed()
+                    .context(InternalSnafu {
+                        dataconnector: format!("{self}"),
+                        code: "LTC-RP-LTTN".to_string(), // ListingTableConnector-ReadProvider-ListingTableTryNew
+                    })?;
+
+                Ok(Arc::new(table))
+            }
+        }
     }
 }
 
@@ -617,7 +626,9 @@ mod tests {
     fn test_get_file_format_and_extension_detect_csv_extension() {
         let (connector, dataset) = setup_connector("test:test.csv".to_string(), HashMap::new());
 
-        if let Ok((file_format, extension)) = connector.get_file_format_and_extension(&dataset) {
+        if let Ok((Some(file_format), extension)) =
+            connector.get_file_format_and_extension(&dataset)
+        {
             assert_eq!(file_format.file_type(), FileType::CSV);
             assert_eq!(extension, ".csv");
         } else {
@@ -629,7 +640,9 @@ mod tests {
     fn test_get_file_format_and_extension_detect_parquet_extension() {
         let (connector, dataset) = setup_connector("test:test.parquet".to_string(), HashMap::new());
 
-        if let Ok((file_format, extension)) = connector.get_file_format_and_extension(&dataset) {
+        if let Ok((Some(file_format), extension)) =
+            connector.get_file_format_and_extension(&dataset)
+        {
             assert_eq!(file_format.file_type(), FileType::PARQUET);
             assert_eq!(extension, ".parquet");
         } else {
@@ -643,7 +656,9 @@ mod tests {
         params.insert("file_format".to_string(), "csv".to_string());
         let (connector, dataset) = setup_connector("test:test.parquet".to_string(), params);
 
-        if let Ok((file_format, extension)) = connector.get_file_format_and_extension(&dataset) {
+        if let Ok((Some(file_format), extension)) =
+            connector.get_file_format_and_extension(&dataset)
+        {
             assert_eq!(file_format.file_type(), FileType::CSV);
             assert_eq!(extension, ".csv");
         } else {
@@ -657,7 +672,9 @@ mod tests {
         params.insert("file_format".to_string(), "parquet".to_string());
         let (connector, dataset) = setup_connector("test:test.csv".to_string(), params);
 
-        if let Ok((file_format, extension)) = connector.get_file_format_and_extension(&dataset) {
+        if let Ok((Some(file_format), extension)) =
+            connector.get_file_format_and_extension(&dataset)
+        {
             assert_eq!(file_format.file_type(), FileType::PARQUET);
             assert_eq!(extension, ".parquet");
         } else {
