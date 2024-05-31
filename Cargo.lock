@@ -2488,7 +2488,6 @@ dependencies = [
  "async-trait",
  "bb8",
  "bb8-postgres",
- "bytes",
  "clickhouse-rs",
  "datafusion",
  "datafusion-federation",
@@ -2517,7 +2516,6 @@ dependencies = [
  "tokio-rusqlite",
  "tonic 0.11.0",
  "tracing",
- "url",
  "uuid",
 ]
 
