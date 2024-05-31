@@ -16,7 +16,7 @@ limitations under the License.
 #![allow(clippy::module_name_repetitions)]
 
 use arrow::{
-    array::{ArrayRef, LargeBinaryArray, RecordBatch, StringArray},
+    array::{ArrayRef, RecordBatch, StringArray},
     datatypes::{DataType, Field, Schema, SchemaRef},
     error::ArrowError,
 };
@@ -61,7 +61,7 @@ impl ObjectStoreRawTable {
     fn table_schema() -> Schema {
         Schema::new(vec![
             Field::new("location", DataType::Utf8, false),
-            Field::new("content", DataType::LargeBinary, false),
+            Field::new("content", DataType::Utf8, false),
         ])
     }
 
@@ -79,9 +79,15 @@ impl ObjectStoreRawTable {
                 .collect::<Vec<_>>(),
         ));
 
-        let content_array: ArrayRef = Arc::new(LargeBinaryArray::from_vec(
-            raw.iter().map(|b| b.as_ref()).collect(),
-        ));
+        let utf8_strings: Result<Vec<_>, Utf8Error> =
+            raw.iter().map(|bytes| std::str::from_utf8(bytes)).collect();
+
+        let content_array = StringArray::from(
+            utf8_strings?
+                .into_iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+        );
 
         Ok(RecordBatch::try_new(Arc::new(schema), vec![location_array, content_array])?)
     }
