@@ -13,25 +13,25 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
 use std::sync::Arc;
 
 use arrow::{
-    array::{RecordBatch, StringArray},
+    array::RecordBatch,
     datatypes::{DataType, Field, Schema},
 };
 use arrow_flight::{
     flight_service_server::FlightService, sql, FlightDescriptor, FlightEndpoint, FlightInfo, Ticket,
 };
-use datafusion::datasource::TableType;
 use tonic::{Request, Response, Status};
 
 use crate::{
-    flight::{flightsql::get_tables, record_batches_to_flight_stream, to_tonic_err, Service},
+    flight::{record_batches_to_flight_stream, Service},
     timing::{TimeMeasurement, TimedStream},
 };
 
 pub(crate) fn get_flight_info(
-    query: &sql::CommandGetTableTypes,
+    query: &sql::CommandGetPrimaryKeys,
     request: Request<FlightDescriptor>,
 ) -> Response<FlightInfo> {
     let fd = request.into_inner();
@@ -46,22 +46,32 @@ pub(crate) fn get_flight_info(
     })
 }
 
+/// <https://arrow.apache.org/docs/format/FlightSql.html#rpc-methods>
+/// The returned Arrow schema is:
+///   `catalog_name`: utf8,
+///   `db_schema_name`: utf8,
+///   `table_name`: utf8 not null,
+///   `column_name`: utf8 not null,
+///   `key_name`: utf8,
+///   `key_sequence`: int32 not null
+#[allow(clippy::unnecessary_wraps)]
 pub(crate) fn do_get(
-    query: &sql::CommandGetTableTypes,
+    _flight_svc: &Service,
+    query: &sql::CommandGetPrimaryKeys,
 ) -> Result<Response<<Service as FlightService>::DoGetStream>, Status> {
-    let start = TimeMeasurement::new("flight_do_get_table_types_duration_ms", vec![]);
-    tracing::trace!("do_get_table_types: {query:?}");
+    let start = TimeMeasurement::new("flight_do_get_get_primary_keys_duration_ms", vec![]);
+    tracing::trace!("do_get_get_primary_keys: {query:?}");
 
-    let schema = Schema::new(vec![Field::new("table_type", DataType::Utf8, false)]);
-    let table_type = vec![
-        get_tables::table_type_name(TableType::Base),
-        get_tables::table_type_name(TableType::View),
-    ];
-    let record_batch = RecordBatch::try_new(
-        Arc::new(schema),
-        vec![Arc::new(StringArray::from(table_type))],
-    )
-    .map_err(to_tonic_err)?;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("catalog_name", DataType::Utf8, true),
+        Field::new("db_schema_name", DataType::Utf8, true),
+        Field::new("table_name", DataType::Utf8, true),
+        Field::new("column_name", DataType::Utf8, true),
+        Field::new("key_name", DataType::Utf8, true),
+        Field::new("key_sequence", DataType::Int32, true),
+    ]));
+
+    let record_batch = RecordBatch::new_empty(Arc::clone(&schema));
 
     Ok(Response::new(Box::pin(TimedStream::new(
         record_batches_to_flight_stream(vec![record_batch]),
