@@ -72,24 +72,18 @@ impl ObjectStoreRawTable {
 
         let schema = Self::table_schema();
 
-        let location_array = StringArray::from(
+        let location_array: ArrayRef = Arc::new(StringArray::from(
             meta_list
                 .iter()
                 .map(|meta| meta.location.to_string())
                 .collect::<Vec<_>>(),
-        );
+        ));
 
-        let content_array = LargeBinaryArray::from_vec(raw.iter().map(|b| b.as_ref()).collect());
+        let content_array: ArrayRef = Arc::new(LargeBinaryArray::from_vec(
+            raw.iter().map(|b| b.as_ref()).collect(),
+        ));
 
-        let batch = RecordBatch::try_new(
-            Arc::new(schema),
-            vec![
-                Arc::new(location_array) as ArrayRef,
-                Arc::new(content_array) as ArrayRef,
-            ],
-        )?;
-
-        Ok(batch)
+        Ok(RecordBatch::try_new(Arc::new(schema), vec![location_array, content_array])?)
     }
 }
 
