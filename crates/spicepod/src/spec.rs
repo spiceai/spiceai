@@ -19,6 +19,7 @@ use serde_yaml::{self, Value};
 use std::fmt::{self, Display, Formatter};
 use std::{collections::HashMap, fmt::Debug};
 
+use crate::component::embeddings::Embeddings;
 use crate::component::runtime::Runtime;
 use crate::component::secrets::Secrets;
 use crate::component::{
@@ -70,6 +71,10 @@ pub struct SpicepodDefinition {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(default)]
     pub models: Vec<ComponentOrReference<Model>>,
+
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
+    pub embeddings: Vec<ComponentOrReference<Embeddings>>,
 
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(default)]

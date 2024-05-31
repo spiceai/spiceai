@@ -22,6 +22,7 @@ use snafu::prelude::*;
 use std::collections::HashMap;
 use std::{fmt::Debug, path::PathBuf};
 
+use component::embeddings::Embeddings;
 use component::llms::Llm;
 use component::model::Model;
 use component::runtime::Runtime;
@@ -67,6 +68,8 @@ pub struct Spicepod {
 
     pub llms: Vec<Llm>,
 
+    pub embeddings: Vec<Embeddings>,
+
     pub runtime: Runtime,
 }
 
@@ -88,7 +91,6 @@ impl Spicepod {
 
         let spicepod_definition: SpicepodDefinition =
             serde_yaml::from_reader(spicepod_rdr).context(UnableToParseSpicepodSnafu)?;
-
         let resolved_datasets = component::resolve_component_references(
             fs,
             &path,
@@ -109,9 +111,18 @@ impl Spicepod {
             component::resolve_component_references(fs, &path, &spicepod_definition.llms, "llms")
                 .context(UnableToResolveSpicepodComponentsSnafu { path: path.clone() })?;
 
+        let resolved_embeddings = component::resolve_component_references(
+            fs,
+            &path,
+            &spicepod_definition.embeddings,
+            "embeddings",
+        )
+        .context(UnableToResolveSpicepodComponentsSnafu { path: path.clone() })?;
+
         Ok(from_definition(
             spicepod_definition,
             resolved_datasets,
+            resolved_embeddings,
             resolved_models,
             resolved_llms,
         ))
@@ -143,6 +154,7 @@ impl Spicepod {
 fn from_definition(
     spicepod_definition: SpicepodDefinition,
     datasets: Vec<Dataset>,
+    embeddings: Vec<Embeddings>,
     models: Vec<Model>,
     llms: Vec<Llm>,
 ) -> Spicepod {
@@ -154,6 +166,7 @@ fn from_definition(
         datasets,
         models,
         llms,
+        embeddings,
         dependencies: spicepod_definition.dependencies,
         runtime: spicepod_definition.runtime,
     }
