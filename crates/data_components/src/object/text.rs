@@ -89,10 +89,7 @@ impl ObjectStoreTextTable {
                 .collect::<Vec<_>>(),
         ));
 
-        RecordBatch::try_new(
-            Arc::new(schema),
-            vec![location_array, content_array],
-        )
+        RecordBatch::try_new(Arc::new(schema), vec![location_array, content_array])
     }
 }
 
