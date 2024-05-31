@@ -22,6 +22,7 @@ use snafu::prelude::*;
 use spicepod::{
     component::{
         dataset::Dataset,
+        embeddings::Embeddings,
         extension::Extension,
         llms::Llm,
         model::Model,
@@ -42,6 +43,8 @@ pub struct App {
     pub datasets: Vec<Dataset>,
 
     pub models: Vec<Model>,
+
+    pub embeddings: Vec<Embeddings>,
 
     pub llms: Vec<Llm>,
 
@@ -68,6 +71,7 @@ pub struct AppBuilder {
     datasets: Vec<Dataset>,
     models: Vec<Model>,
     llms: Vec<Llm>,
+    embeddings: Vec<Embeddings>,
     spicepods: Vec<Spicepod>,
     runtime: Runtime,
 }
@@ -81,6 +85,7 @@ impl AppBuilder {
             datasets: vec![],
             models: vec![],
             llms: vec![],
+            embeddings: vec![],
             spicepods: vec![],
             runtime: Runtime::default(),
         }
@@ -93,6 +98,7 @@ impl AppBuilder {
         self.datasets.extend(spicepod.datasets.clone());
         self.models.extend(spicepod.models.clone());
         self.llms.extend(spicepod.llms.clone());
+        self.embeddings.extend(spicepod.embeddings.clone());
         self.spicepods.push(spicepod);
         self
     }
@@ -128,6 +134,12 @@ impl AppBuilder {
     }
 
     #[must_use]
+    pub fn with_embedding(mut self, embedding: Embeddings) -> AppBuilder {
+        self.embeddings.push(embedding);
+        self
+    }
+
+    #[must_use]
     pub fn with_results_cache(mut self, results_cache: ResultsCache) -> AppBuilder {
         self.runtime.results_cache = results_cache;
         self
@@ -142,6 +154,7 @@ impl AppBuilder {
             datasets: self.datasets,
             models: self.models,
             llms: self.llms,
+            embeddings: self.embeddings,
             spicepods: self.spicepods,
             runtime: self.runtime,
         }
@@ -157,6 +170,7 @@ impl AppBuilder {
         let mut datasets: Vec<Dataset> = vec![];
         let mut models: Vec<Model> = vec![];
         let mut llms: Vec<Llm> = vec![];
+        let mut embeddings: Vec<Embeddings> = vec![];
 
         for dataset in &spicepod_root.datasets {
             datasets.push(dataset.clone());
@@ -168,6 +182,10 @@ impl AppBuilder {
 
         for llm in &spicepod_root.llms {
             llms.push(llm.clone());
+        }
+
+        for embedding in &spicepod_root.embeddings {
+            embeddings.push(embedding.clone());
         }
 
         let root_spicepod_name = spicepod_root.name.clone();
@@ -188,6 +206,9 @@ impl AppBuilder {
             for llm in &dependent_spicepod.llms {
                 llms.push(llm.clone());
             }
+            for embedding in &dependent_spicepod.embeddings {
+                embeddings.push(embedding.clone());
+            }
             spicepods.push(dependent_spicepod);
         }
 
@@ -199,6 +220,7 @@ impl AppBuilder {
             extensions,
             datasets,
             models,
+            embeddings,
             llms,
             spicepods,
             runtime,
