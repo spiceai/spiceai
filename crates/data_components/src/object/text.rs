@@ -82,14 +82,17 @@ impl ObjectStoreTextTable {
         let utf8_strings: Result<Vec<_>, Utf8Error> =
             raw.iter().map(|bytes| std::str::from_utf8(bytes)).collect();
 
-        let content_array = StringArray::from(
+        let content_array: ArrayRef = Arc::new(StringArray::from(
             utf8_strings?
                 .into_iter()
                 .map(ToString::to_string)
                 .collect::<Vec<_>>(),
-        );
+        ));
 
-        Ok(RecordBatch::try_new(Arc::new(schema), vec![location_array, content_array])?)
+        RecordBatch::try_new(
+            Arc::new(schema),
+            vec![location_array, content_array],
+        )
     }
 }
 
