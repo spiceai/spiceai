@@ -17,7 +17,7 @@ limitations under the License.
 use std::sync::Arc;
 
 pub mod metadata;
-pub mod raw;
+pub mod text;
 
 use object_store::{ObjectMeta, ObjectStore};
 use regex::Regex;

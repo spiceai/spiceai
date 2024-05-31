@@ -43,11 +43,11 @@ use std::{any::Any, fmt, str::Utf8Error, sync::Arc};
 use super::ObjectStoreContext;
 use url::Url;
 
-pub struct ObjectStoreRawTable {
+pub struct ObjectStoreTextTable {
     ctx: ObjectStoreContext,
 }
 
-impl ObjectStoreRawTable {
+impl ObjectStoreTextTable {
     pub fn try_new(
         store: Arc<dyn ObjectStore>,
         url: &Url,
@@ -94,7 +94,7 @@ impl ObjectStoreRawTable {
 }
 
 #[async_trait]
-impl TableProvider for ObjectStoreRawTable {
+impl TableProvider for ObjectStoreTextTable {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -244,7 +244,7 @@ pub(crate) fn to_sendable_stream(
                     let result: GetResult = ctx.store.get(&object_meta.location).await?;
                     let bytz = result.bytes().await?;
 
-                    match ObjectStoreRawTable::to_record_batch(&[object_meta], &[bytz]) {
+                    match ObjectStoreTextTable::to_record_batch(&[object_meta], &[bytz]) {
                         Ok(batch) => {yield Ok(batch); count += 1;},
                         Err(e) => yield Err(DataFusionError::Execution(format!("{e}"))),
                     }

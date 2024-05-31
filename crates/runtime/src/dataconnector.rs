@@ -18,7 +18,7 @@ use crate::component::dataset::Dataset;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use data_components::object::metadata::ObjectStoreMetadataTable;
-use data_components::object::raw::ObjectStoreRawTable;
+use data_components::object::text::ObjectStoreTextTable;
 use datafusion::dataframe::DataFrame;
 use datafusion::datasource::file_format::csv::CsvFormat;
 use datafusion::datasource::file_format::file_compression_type::FileCompressionType;
@@ -388,8 +388,8 @@ pub trait ListingTableConnector: DataConnector {
     ///  - csv
     /// For tabular formats, file options can also be specified in the [`Dataset`]'s `param`s.
     ///
-    /// For unstructured formats, the [`Dataset`]'s `file_format` param key must be set. `Ok`
-    /// responses, are always of the format `Ok((None, String))`
+    /// For unstructured text formats, the [`Dataset`]'s `file_format` param key must be set. `Ok`
+    /// responses, are always of the format `Ok((None, String))`. The data must be UTF8 compatible.
     fn get_file_format_and_extension(
         &self,
         dataset: &Dataset,
@@ -514,8 +514,8 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
         let (file_format_opt, extension) = self.get_file_format_and_extension(dataset)?;
         match file_format_opt {
             None => {
-                // Assume its unstructured data. Use a [`ObjectStoreRawTable`].
-                Ok(ObjectStoreRawTable::try_new(
+                // Assume its unstructured text data. Use a [`ObjectStoreTextTable`].
+                Ok(ObjectStoreTextTable::try_new(
                     self.get_object_store(dataset)?,
                     &url,
                     Some(extension),
