@@ -546,9 +546,7 @@ impl DataFusion {
 
         accelerated_table_builder.zero_results_action(acceleration_settings.on_zero_results);
 
-        if let Ok(cache) = self.cache_provider.read() {
-            accelerated_table_builder.cache_provider(cache.clone());
-        }
+        accelerated_table_builder.cache_provider(self.cache_provider());
 
         Ok(accelerated_table_builder.build().await)
     }
