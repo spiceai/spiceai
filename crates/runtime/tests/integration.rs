@@ -14,9 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::sync::Arc;
+
 use arrow::array::RecordBatch;
 use datafusion::{
-    assert_batches_eq, parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder,
+    assert_batches_eq, execution::context::SessionContext,
+    parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder,
 };
 use runtime::Runtime;
 use tracing::subscriber::DefaultGuard;
@@ -27,6 +30,30 @@ mod docker;
 mod federation;
 mod refresh_sql;
 mod results_cache;
+
+/// Modifies the runtime configuration of `DataFusion` to make test results reproducible across all machines.
+///
+/// 1) Sets the number of `target_partitions` to 3, by default its the number of CPU cores available.
+fn modify_runtime_datafusion_options(mut rt: Runtime) -> Runtime {
+    // Unwrap the Arc to get exclusive ownership of the DataFusion struct
+    let Ok(mut df) = Arc::try_unwrap(rt.df) else {
+        panic!("Expected to get exclusive ownership of the DataFusion struct");
+    };
+
+    // Set the target partitions to 3 to make RepartitionExec show consistent partitioning across machines with different CPU counts.
+    let mut new_state = df.ctx.state();
+    new_state
+        .config_mut()
+        .options_mut()
+        .execution
+        .target_partitions = 3;
+    let new_ctx = SessionContext::new_with_state(new_state);
+
+    // Replace the old context with the modified one
+    df.ctx = new_ctx.into();
+    rt.df = df.into();
+    rt
+}
 
 fn init_tracing(default_level: Option<&str>) -> DefaultGuard {
     let filter = match (default_level, std::env::var("SPICED_LOG").ok()) {
