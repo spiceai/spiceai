@@ -65,10 +65,10 @@ pub(crate) fn do_get(
     let schema = Arc::new(Schema::new(vec![
         Field::new("catalog_name", DataType::Utf8, true),
         Field::new("db_schema_name", DataType::Utf8, true),
-        Field::new("table_name", DataType::Utf8, true),
-        Field::new("column_name", DataType::Utf8, true),
+        Field::new("table_name", DataType::Utf8, false),
+        Field::new("column_name", DataType::Utf8, false),
         Field::new("key_name", DataType::Utf8, true),
-        Field::new("key_sequence", DataType::Int32, true),
+        Field::new("key_sequence", DataType::Int32, false),
     ]));
 
     let record_batch = RecordBatch::new_empty(Arc::clone(&schema));
