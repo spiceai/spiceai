@@ -15,9 +15,13 @@ limitations under the License.
 */
 #![allow(clippy::module_name_repetitions)]
 
+use arrow::{
+    array::{ArrayRef, RecordBatch, StringArray},
+    datatypes::{DataType, Field, Schema, SchemaRef},
+    error::ArrowError,
+};
+use async_stream::stream;
 use bytes::Bytes;
-use std::{any::Any, fmt, sync::Arc};
-use arrow::{array::{ArrayRef, RecordBatch, StringArray}, datatypes::{ByteArrayType, DataType, Field, Schema, SchemaRef}, error::ArrowError};
 use datafusion::{
     common::{project_schema, Constraints},
     datasource::{TableProvider, TableType},
@@ -30,16 +34,16 @@ use datafusion::{
         ExecutionPlan, Partitioning, PlanProperties,
     },
 };
-use async_stream::stream;
 use futures::Stream;
 use futures::StreamExt;
 use object_store::{path::Path, GetResult, ObjectMeta, ObjectStore};
+use std::{any::Any, fmt, str::Utf8Error, sync::Arc};
 use tonic::async_trait;
 
 use super::ObjectStoreContext;
 
 pub struct ObjectStoreRawTable {
-    ctx: ObjectStoreContext
+    ctx: ObjectStoreContext,
 }
 
 impl ObjectStoreRawTable {
@@ -49,7 +53,7 @@ impl ObjectStoreRawTable {
         filename_regex: Option<String>,
     ) -> Result<Arc<Self>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Arc::new(Self {
-            ctx: ObjectStoreContext::try_new(store, prefix, filename_regex)?
+            ctx: ObjectStoreContext::try_new(store, prefix, filename_regex)?,
         }))
     }
 
@@ -66,7 +70,7 @@ impl ObjectStoreRawTable {
         }
 
         let schema = Self::table_schema();
-        
+
         let location_array = StringArray::from(
             meta_list
                 .iter()
@@ -74,11 +78,17 @@ impl ObjectStoreRawTable {
                 .collect::<Vec<_>>(),
         );
 
-        let utf8_strings: Vec<String> = raw.iter()
-            .map(|bytes| std::str::from_utf8(bytes).to_string())
+        let utf8_strings: Result<Vec<_>, Utf8Error> = raw
+            .iter()
+            .map(|bytes| std::str::from_utf8(bytes))
             .collect();
 
-        let content_array = StringArray::from(utf8_strings);
+        let content_array = StringArray::from(
+            utf8_strings?
+                .into_iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+        );
 
         let batch = RecordBatch::try_new(
             Arc::new(schema),
@@ -198,10 +208,7 @@ impl ExecutionPlan for ObjectStoreRawExec {
     ) -> DataFusionResult<SendableRecordBatchStream> {
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema(),
-            to_sendable_stream(
-                self.ctx.clone(),
-                self.limit
-            ), // TODO get prefix from filters
+            to_sendable_stream(self.ctx.clone(), self.limit), // TODO get prefix from filters
         )))
     }
 }
@@ -211,7 +218,7 @@ impl ObjectStoreRawExec {
         projected_schema: SchemaRef,
         filters: &[Expr],
         limit: Option<usize>,
-        ctx: ObjectStoreContext
+        ctx: ObjectStoreContext,
     ) -> Self {
         Self {
             projected_schema: Arc::clone(&projected_schema),
@@ -227,13 +234,12 @@ impl ObjectStoreRawExec {
     }
 }
 
-
 pub(crate) fn to_sendable_stream(
     ctx: ObjectStoreContext,
     limit: Option<usize>,
 ) -> impl Stream<Item = DataFusionResult<RecordBatch>> + 'static {
     stream! {
-        let mut object_stream = ctx.store.list(ctx.prefix.clone().map(&mut Path::from).as_ref());
+        let mut object_stream = ctx.store.list(ctx.prefix.clone().map(Path::from).as_ref());
         let mut count = 0;
 
         while let Some(item) = object_stream.next().await {
@@ -247,7 +253,7 @@ pub(crate) fn to_sendable_stream(
                     let result: GetResult = ctx.store.get(&object_meta.location).await?;
                     let bytz = result.bytes().await?;
 
-                    match ObjectStoreRawTable::to_record_batch(&[object_meta], &bytz) {
+                    match ObjectStoreRawTable::to_record_batch(&[object_meta], &[bytz]) {
                         Ok(batch) => {yield Ok(batch); count += 1;},
                         Err(e) => yield Err(DataFusionError::Execution(format!("{e}"))),
                     }

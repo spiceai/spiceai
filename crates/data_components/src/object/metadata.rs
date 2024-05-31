@@ -54,7 +54,7 @@ impl ObjectStoreMetadataTable {
         filename_regex: Option<String>,
     ) -> Result<Arc<Self>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Arc::new(Self {
-            ctx: ObjectStoreContext::try_new(store, prefix, filename_regex)?
+            ctx: ObjectStoreContext::try_new(store, prefix, filename_regex)?,
         }))
     }
 
@@ -244,10 +244,7 @@ impl ExecutionPlan for ObjectStoreMetadataExec {
     ) -> DataFusionResult<SendableRecordBatchStream> {
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema(),
-            to_sendable_stream(
-                self.ctx.clone(),
-                self.limit
-            ), // TODO get prefix from filters
+            to_sendable_stream(self.ctx.clone(), self.limit), // TODO get prefix from filters
         )))
     }
 }
@@ -257,7 +254,7 @@ impl ObjectStoreMetadataExec {
         projected_schema: SchemaRef,
         filters: &[Expr],
         limit: Option<usize>,
-        ctx: ObjectStoreContext
+        ctx: ObjectStoreContext,
     ) -> Self {
         Self {
             projected_schema: Arc::clone(&projected_schema),
@@ -305,4 +302,3 @@ fn to_sendable_stream(
         }
     }
 }
-

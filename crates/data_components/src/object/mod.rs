@@ -35,7 +35,6 @@ pub(crate) struct ObjectStoreContext {
     filename_regex: Option<Regex>,
 }
 
-
 impl ObjectStoreContext {
     pub fn try_new(
         store: Arc<dyn ObjectStore>,
@@ -65,5 +64,4 @@ impl ObjectStoreContext {
         }
         true
     }
-    
 }
