@@ -119,7 +119,7 @@ impl TableProvider for ObjectStoreTextTable {
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let projected_schema = project_schema(&self.schema(), projection)?;
-        Ok(Arc::new(ObjectStoreRawExec::new(
+        Ok(Arc::new(ObjectStoreTextExec::new(
             projected_schema,
             filters,
             limit,
@@ -138,7 +138,7 @@ impl TableProvider for ObjectStoreTextTable {
     }
 }
 
-pub struct ObjectStoreRawExec {
+pub struct ObjectStoreTextExec {
     projected_schema: SchemaRef,
     _filters: Vec<Expr>,
     limit: Option<usize>,
@@ -147,13 +147,13 @@ pub struct ObjectStoreRawExec {
     ctx: ObjectStoreContext,
 }
 
-impl std::fmt::Debug for ObjectStoreRawExec {
+impl std::fmt::Debug for ObjectStoreTextExec {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "{} prefix={:?}", self.name(), self.ctx.prefix.clone())
     }
 }
 
-impl DisplayAs for ObjectStoreRawExec {
+impl DisplayAs for ObjectStoreTextExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
@@ -164,9 +164,9 @@ impl DisplayAs for ObjectStoreRawExec {
     }
 }
 
-impl ExecutionPlan for ObjectStoreRawExec {
+impl ExecutionPlan for ObjectStoreTextExec {
     fn name(&self) -> &'static str {
-        "ObjectStoreRawExec"
+        "ObjectStoreTextExec"
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -204,7 +204,7 @@ impl ExecutionPlan for ObjectStoreRawExec {
     }
 }
 
-impl ObjectStoreRawExec {
+impl ObjectStoreTextExec {
     pub(crate) fn new(
         projected_schema: SchemaRef,
         filters: &[Expr],
