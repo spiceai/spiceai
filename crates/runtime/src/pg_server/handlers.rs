@@ -20,11 +20,11 @@ use async_trait::async_trait;
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::{DFSchema, DFSchemaRef};
 use datafusion::error::DataFusionError;
-use datafusion::logical_expr::{LogicalPlan, LogicalPlanBuilder};
+use datafusion::logical_expr::{LogicalPlan, LogicalPlanBuilder, Statement};
 use datafusion::prelude::*;
 use pgwire::api::portal::Portal;
 use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
-use pgwire::api::results::{DescribePortalResponse, DescribeStatementResponse, Response};
+use pgwire::api::results::{DescribePortalResponse, DescribeStatementResponse, Response, Tag};
 use pgwire::api::stmt::QueryParser;
 use pgwire::api::stmt::StoredStatement;
 use pgwire::api::{ClientInfo, Type};
@@ -137,56 +137,7 @@ impl QueryParser for Parser {
             sql = "start transaction read only".to_string();
         }
 
-        // Check if the SQL query starts with any transaction-related keyword
-        if transaction_keywords.iter().any(|&kw| sql.trim_start().to_uppercase().starts_with(kw)) {
-            // println!("Ignoring transaction-related query: {sql}");
-            // https://github.com/apache/datafusion/blob/904f0db73cf2c0049822c7045e09824a7453a02d/datafusion/sql/tests/sql_integration.rs#L352
-            //sql = "start transaction read only".to_string();
 
-            // sql = "SET TIMEZONE TO 'UTC'".to_string();
-
-            // let empty_schema = DFSchema::empty();
-            // let empty_schema_ref = DFSchemaRef::new(empty_schema);
-
-            // let empty_df = self.df.read().await.ctx
-            // .read_empty().unwrap();
-
-            // let plan = empty_df.logical_plan();
-
-
-            // // let plan = self.df.read().await.ctx
-            // //     .state()
-            // //     .create_logical_plan("")
-            // //     .await
-            // //     .unwrap();
-        
-            // return Ok(plan.clone());
-
-            // self.df.read().await.ctx
-            //     .sql(&sql)
-            //     .await
-            //     .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
-            // return Err(PgWireError::ApiError(Box::new(std::io::Error::new(
-            //     std::io::ErrorKind::Unsupported,
-            //     "Transaction-related queries are ignored",
-            // )))); // or return an appropriate empty/default Statement
-
-            //let empty_plan = LogicalPlanBuilder::empty(false).build().map_err(|e| PgWireError::ApiError(Box::new(e)))?;
-    
-            
-            // let schema = DFSchema::empty();
-            // let empty_plan = LogicalPlan::Projection {
-            //     expr: vec![],
-            //     input: Arc::new(LogicalPlan::EmptyRelation {
-            //         produce_one_row: false,
-            //         schema,
-            //     }),
-            //     schema,
-            // };
-            
-            // return Ok(empty_plan);
-
-        }
 
 
 
@@ -259,7 +210,10 @@ impl ExtendedQueryHandler for DfSessionService {
     ) -> PgWireResult<DescribePortalResponse>
     where
         C: ClientInfo + Unpin + Send + Sync,
+
     {
+        println!("do_describe_portal");
+
         let plan = &target.statement.statement;
         let schema = plan.schema();
         let fields = datatypes::df_schema_to_pg_fields(schema.as_ref())?;
@@ -295,6 +249,17 @@ impl ExtendedQueryHandler for DfSessionService {
             .replace_params_with_values(&param_values)
             .map_err(to_pg_wire_error)?;
 
+            if let LogicalPlan::Statement(statement) = &plan {
+                if let Statement::TransactionStart(_) = statement {
+                    let tag: Tag = Tag::new("BEGIN");
+                    return Ok(Response::Execution(tag));
+                }
+            }
+
+
+    
+
+
         match self
             .df.read().await.ctx
             .execute_logical_plan(plan)
@@ -307,7 +272,20 @@ impl ExtendedQueryHandler for DfSessionService {
                         },
                         Err(e) => {
                             println!("Internal encoding error: {:?}", e);
-                            Ok(Response::EmptyQuery)
+
+                            // pub enum Response<'a> {
+                            //     EmptyQuery,
+                            //     Query(QueryResponse<'a>),
+                            //     Execution(Tag),
+                            //     Error(Box<ErrorInfo>),
+                            // }
+
+                            let tag: Tag = Tag::new("BEGIN");
+
+                            Ok(Response::Execution(tag))
+
+
+                            //Ok(Response::EmptyQuery)
                         }
                     }
                 },

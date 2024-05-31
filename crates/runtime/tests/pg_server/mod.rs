@@ -30,6 +30,7 @@ use tokio::{sync::RwLock};
 
 use crate::{init_tracing, pg_server};
 
+
 fn make_s3_tpch_dataset(name: &str) -> Dataset {
     let mut test_dataset = Dataset::new(
         format!("s3://spiceai-demo-datasets/tpch/{name}/").to_string(),
