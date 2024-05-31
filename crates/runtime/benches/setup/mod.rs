@@ -46,10 +46,14 @@ pub(crate) async fn write_benchmark_results(
 fn build_app() -> App {
     AppBuilder::new("runtime_benchmark_test")
         .with_secret_store(SpiceSecretStore::File)
-        .with_dataset(make_spiceai_dataset("eth.recent_blocks", "blocks"))
-        .with_dataset(make_spiceai_dataset("eth.blocks", "full_blocks"))
-        .with_dataset(make_spiceai_dataset("eth.recent_transactions", "tx"))
-        .with_dataset(make_spiceai_dataset("eth.recent_logs", "eth.logs"))
+        .with_dataset(make_spiceai_dataset("tpch.customer", "customer"))
+        .with_dataset(make_spiceai_dataset("tpch.lineitem", "lineitem"))
+        .with_dataset(make_spiceai_dataset("tpch.part", "part"))
+        .with_dataset(make_spiceai_dataset("tpch.partsupp", "partsupp"))
+        .with_dataset(make_spiceai_dataset("tpch.orders", "orders"))
+        .with_dataset(make_spiceai_dataset("tpch.nation", "nation"))
+        .with_dataset(make_spiceai_dataset("tpch.region", "region"))
+        .with_dataset(make_spiceai_dataset("tpch.supplier", "supplier"))
         .with_dataset(make_spiceai_rw_dataset(
             "phillipleblanc.spicetests.oss_benchmarks",
             "oss_benchmarks",
