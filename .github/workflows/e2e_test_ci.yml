@@ -272,6 +272,89 @@ jobs:
           killall spice
           cat spice.log
 
+  test_quickstart_graphql:
+      name: "Test GraphQL quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})"
+      runs-on: ${{ matrix.target.runner }}
+
+      if: github.event_name == 'workflow_dispatch' || github.event_name == 'push'
+      needs:
+        - build
+        - setup-matrix
+
+      strategy:
+        matrix:
+          target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
+
+      steps:
+        - uses: actions/checkout@v4
+
+        - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+          uses: actions/download-artifact@v4
+          with:
+            name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+            path: ./build
+
+        - name: Install spice
+          uses: ./.github/actions/install-spice
+          with:
+            build-path: ./build
+
+        - name: Init spice app
+          run: |
+            spice init test_app
+
+        - name: Spice dataset configure
+          working-directory: test_app
+          run: |
+            echo -e "test_graphql_table\nrepos\graphql:https://api.github.com/graphql\ny" | spice dataset configure
+            # configure mysql credentials
+            echo -e "params:\n  auth_token_key: token\n  json_path: data.viewer.repositories.nodes\n  query: |
+            {
+              viewer {
+                repositories(first: 100) {
+                  nodes {
+                    id
+                    name
+                    watchers (first: 10) {
+                      nodes {
+                        name
+                      }
+                    }
+                  }
+                }
+              }
+            }" >> ./datasets/test_graphql_table/dataset.yaml
+            # configure env secret store
+            echo -e "secrets:\n  store: env\n" >> spicepod.yaml
+            cat spicepod.yaml
+
+        - name: Start spice runtime
+          env:
+            SPICE_SECRET_GRAPHQL_TOKEN: ${{ secrets.SPICE_SECRET_GITHUB_TOKEN }}
+          working-directory: test_app
+          run: |
+            spice run &> spice.log &
+            # time to initialize added dataset
+            sleep 10
+
+        - name: Wait for Spice runtime healthy
+          working-directory: test_app
+          timeout-minutes: 1
+          run: |
+            while [[ "$(curl -s http://localhost:3000/health)" != "ok" ]]; do sleep 1; done
+
+        - name: Verify dataset
+          uses: ./.github/actions/verify-dataset
+          with:
+            name: test_graphql_table
+
+        - name: Stop spice and check logs
+          working-directory: test_app
+          if: always()
+          run: |
+            killall spice
+            cat spice.log
+
   test_quickstart_data_postgres:
     name: 'Test PostgreSQL quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})'
     runs-on: ${{ matrix.target.runner }}
@@ -856,7 +939,7 @@ jobs:
               echo "Failed to trigger dataset refresh."
               exit 1
             fi
-    
+
         - name: Run SQL query and check Miss cache header
           working-directory: test_app
           run: |
