@@ -19,6 +19,7 @@ use llms::embeddings::Embed;
 use llms::nql::{Error as LlmError, Nql};
 use llms::openai::{DEFAULT_EMBEDDING_MODEL, DEFAULT_LLM_MODEL};
 use model_components::model::{Error as ModelError, Model};
+use spicepod::component::embeddings::{EmbeddingParams, EmbeddingPrefix};
 use spicepod::component::llms::{Architecture, LlmParams, LlmPrefix};
 use std::collections::HashMap;
 use std::result::Result;
@@ -50,7 +51,7 @@ pub async fn run(m: &Model, df: Arc<DataFusion>) -> Result<RecordBatch, ModelErr
 }
 
 pub fn try_to_embedding(
-    component: &spicepod::component::llms::Llm,
+    component: &spicepod::component::embeddings::Embeddings,
 ) -> Result<Box<dyn Embed>, LlmError> {
     let prefix = component.get_prefix().ok_or(LlmError::UnknownModelSource {
         source: format!(
@@ -62,28 +63,23 @@ pub fn try_to_embedding(
 
     let model_id = component.get_model_id();
 
-    match construct_llm_params(
-        &prefix,
-        &model_id,
-        &(component.params).clone().unwrap_or_default(),
-    ) {
-        Ok(LlmParams::OpenAiParams {
+    match construct_embedding_params(&prefix, &(component.params).clone().unwrap_or_default()) {
+        EmbeddingParams::OpenAiParams {
             api_base,
             api_key,
             org_id,
             project_id,
-        }) => Ok(Box::new(llms::openai::Openai::new(
-            DEFAULT_EMBEDDING_MODEL.to_string(),
+        } => Ok(Box::new(llms::openai::Openai::new(
+            model_id.unwrap_or(DEFAULT_EMBEDDING_MODEL.to_string()),
             api_base,
             api_key,
             org_id,
             project_id,
         ))),
-        Ok(_) => Err(LlmError::UnsupportedTaskForModel {
+        EmbeddingParams::None => Err(LlmError::UnsupportedTaskForModel {
             from: component.from.clone(),
             task: "embedding".into(),
         }),
-        Err(e) => Err(e),
     }
 }
 
@@ -217,5 +213,21 @@ fn construct_llm_params(
             org_id: params.get("openai_org_id").cloned(),
             project_id: params.get("openai_project_id").cloned(),
         }),
+    }
+}
+
+/// Construct the parameters needed to create an [`Embeddings`] based on its source (i.e. prefix).
+/// If a `model_id` is provided (in the `from: `), it is provided.
+fn construct_embedding_params(
+    from: &EmbeddingPrefix,
+    params: &HashMap<String, String>,
+) -> EmbeddingParams {
+    match from {
+        EmbeddingPrefix::OpenAi => EmbeddingParams::OpenAiParams {
+            api_base: params.get("endpoint").cloned(),
+            api_key: params.get("openai_api_key").cloned(),
+            org_id: params.get("openai_org_id").cloned(),
+            project_id: params.get("openai_project_id").cloned(),
+        },
     }
 }
