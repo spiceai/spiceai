@@ -733,11 +733,7 @@ impl Runtime {
     pub async fn load_embeddings(&self) {
         let app_lock = self.app.read().await;
         if let Some(app) = app_lock.as_ref() {
-            for in_embed in &app.llms {
-                if !in_embed.can_embed {
-                    continue;
-                }
-
+            for in_embed in &app.embeddings {
                 status::update_embedding(&in_embed.name, status::ComponentStatus::Initializing);
                 match try_to_embedding(in_embed) {
                     Ok(e) => {
