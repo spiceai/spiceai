@@ -38,6 +38,7 @@ pub enum Engine {
     SQLite,
     DuckDB,
     ODBC,
+    Postgres
 }
 
 pub fn to_sql_with_engine(expr: &Expr, engine: Option<Engine>) -> Result<String> {
@@ -131,10 +132,7 @@ pub fn to_sql(expr: &Expr) -> Result<String> {
 fn handle_cast(cast: &Cast, engine: Option<Engine>, expr: &Expr) -> Result<String> {
     match cast.data_type {
         arrow::datatypes::DataType::Timestamp(_, Some(_) | None) => match engine {
-            None => Ok(format!(
-                "CAST({} AS TIMESTAMPTZ)",
-                to_sql_with_engine(&cast.expr, engine)?,
-            )),
+
             Some(Engine::ODBC) => Ok(format!(
                 "CAST({} AS TIMESTAMP)",
                 to_sql_with_engine(&cast.expr, engine)?,
@@ -151,8 +149,11 @@ fn handle_cast(cast: &Cast, engine: Option<Engine>, expr: &Expr) -> Result<Strin
             Some(Engine::Spark) => EngineNotSupportedForExpressionSnafu {
                 engine: "Spark".to_string(),
                 expr: format!("{expr}"),
-            }
-            .fail()?,
+            }.fail()?,
+            _ => Ok(format!(
+                "CAST({} AS TIMESTAMPTZ)",
+                to_sql_with_engine(&cast.expr, engine)?,
+            )),
         },
         _ => Err(Error::UnsupportedFilterExpr {
             expr: format!("{expr}"),
