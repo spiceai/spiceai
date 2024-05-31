@@ -24,9 +24,7 @@ use snafu::Snafu;
 use time::{OffsetDateTime, PrimitiveDateTime};
 
 use sea_query::{
-    Alias, ColumnDef, ColumnType, GenericBuilder, Index, InsertStatement, IntoIden,
-    IntoIndexColumn, Keyword, MysqlQueryBuilder, PostgresQueryBuilder, Query, SimpleExpr,
-    SqliteQueryBuilder, Table,
+    Alias, BlobSize, ColumnDef, ColumnType, GenericBuilder, Index, InsertStatement, IntoIden, IntoIndexColumn, Keyword, MysqlQueryBuilder, PostgresQueryBuilder, Query, SimpleExpr, SqliteQueryBuilder, Table
 };
 
 #[derive(Debug, Snafu)]
@@ -521,7 +519,8 @@ fn map_data_type_to_column_type(data_type: &DataType) -> ColumnType {
         DataType::Time64(_unit) | DataType::Time32(_unit) => ColumnType::Time,
         DataType::List(list_type) => {
             ColumnType::Array(map_data_type_to_column_type(list_type.data_type()).into())
-        }
+        },
+        DataType::Binary => ColumnType::Binary(BlobSize::Blob(None)),
 
         // Add more mappings here as needed
         _ => unimplemented!("Data type mapping not implemented for {:?}", data_type),
