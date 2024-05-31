@@ -72,7 +72,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// remote) and store it in the local directory. The local directory is returned for further
 /// processing by `ModelRuntime`.
 #[async_trait]
-pub trait ModelSource {
+pub trait ModelSource: Send + Sync {
     async fn pull(
         &self,
         secret: Secret,

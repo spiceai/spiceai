@@ -78,7 +78,7 @@ impl Query {
             .await
             .context(UnableToExecuteQuerySnafu)?;
 
-        if let Some(cache_provider) = &self.df.cache_provider {
+        if let Some(cache_provider) = &self.df.cache_provider() {
             if let Some(cached_result) = cache_provider
                 .get(&plan)
                 .await
@@ -130,7 +130,7 @@ impl Query {
         verify_schema(df_schema.fields(), res_schema.fields()).context(SchemaMismatchSnafu)?;
 
         if cache_is_enabled_for_plan(&plan_copy) {
-            if let Some(cache_provider) = &self.df.cache_provider {
+            if let Some(cache_provider) = &self.df.cache_provider() {
                 let record_batch_stream = to_cached_record_batch_stream(
                     Arc::clone(cache_provider),
                     res_stream,

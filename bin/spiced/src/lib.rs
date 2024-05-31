@@ -19,11 +19,14 @@ limitations under the License.
 use std::env;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use app::{App, AppBuilder};
 use clap::Parser;
 use flightrepl::ReplConfig;
+use futures::future::join_all;
+use futures::Future;
 use runtime::config::Config as RuntimeConfig;
 
 use runtime::podswatcher::PodsWatcher;
@@ -55,6 +58,9 @@ pub enum Error {
 
     #[snafu(display("Failed to start pods watcher: {source}"))]
     UnableToInitializePodsWatcher { source: runtime::NotifyError },
+
+    #[snafu(display("Generic Error: {reason}"))]
+    GenericError { reason: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -108,22 +114,8 @@ pub async fn run(args: Args) -> Result<()> {
 
     let mut rt: Runtime = Runtime::new(app, Arc::new(extension_factories)).await;
 
+    // mutable reference
     rt.with_pods_watcher(pods_watcher);
-
-    rt.load_secrets().await;
-
-    if cfg!(feature = "models") {
-        rt.load_models().await;
-        rt.load_llms().await;
-        rt.load_embeddings().await;
-    }
-
-    if let Err(err) = rt.init_query_history().await {
-        tracing::warn!("Creating internal query history table: {err}");
-    };
-
-    rt.start_extensions().await;
-
     if let Err(err) = rt
         .start_metrics(args.metrics)
         .await
@@ -132,10 +124,40 @@ pub async fn run(args: Args) -> Result<()> {
         tracing::warn!("{err}");
     }
 
-    let result = futures::join!(
-        rt.load_datasets(),
-        rt.start_servers(args.runtime, args.metrics)
-    );
+    let cloned_rt = rt.clone();
+    let server_thread =
+        tokio::spawn(async move { cloned_rt.start_servers(args.runtime, args.metrics).await });
 
-    result.1.context(UnableToStartServersSnafu)
+    rt.load_secrets().await;
+    let init_query_history = async {
+        if let Err(err) = rt.init_query_history().await {
+            tracing::warn!("Creating internal query history table: {err}");
+        };
+    };
+
+    let mut futures: Vec<Pin<Box<dyn Future<Output = ()>>>> = vec![
+        Box::pin(init_query_history),
+        Box::pin(rt.init_results_cache()),
+        Box::pin(rt.start_extensions()),
+        Box::pin(rt.load_datasets()),
+    ];
+
+    if cfg!(feature = "models") {
+        let mut v: Vec<Pin<Box<dyn Future<Output = ()>>>> = vec![
+            Box::pin(rt.load_models()),
+            Box::pin(rt.load_llms()),
+            Box::pin(rt.load_embeddings()),
+        ];
+
+        futures.append(&mut v);
+    }
+
+    let _ = join_all(futures).await;
+
+    match server_thread.await {
+        Ok(ok) => ok.context(UnableToStartServersSnafu),
+        Err(_) => Err(Error::GenericError {
+            reason: "Unable to start spiced".into(),
+        }),
+    }
 }

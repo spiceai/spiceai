@@ -182,7 +182,7 @@ pub enum Table {
 pub struct DataFusion {
     pub ctx: Arc<SessionContext>,
     data_writers: RwLock<HashSet<TableReference>>,
-    pub cache_provider: Option<Arc<QueryResultsCacheProvider>>,
+    pub cache_provider: RwLock<Option<Arc<QueryResultsCacheProvider>>>,
 }
 
 impl DataFusion {
@@ -246,7 +246,7 @@ impl DataFusion {
         DataFusion {
             ctx: Arc::new(ctx),
             data_writers: RwLock::new(HashSet::new()),
-            cache_provider,
+            cache_provider: RwLock::new(cache_provider),
         }
     }
 
@@ -266,6 +266,11 @@ impl DataFusion {
         }
 
         None
+    }
+
+    pub fn set_cache_provider(&self, cache_provider: QueryResultsCacheProvider) {
+        let mut a = self.cache_provider.write().unwrap();
+        *a = Some(Arc::new(cache_provider));
     }
 
     pub async fn has_table(&self, table_reference: &TableReference) -> bool {
@@ -540,9 +545,19 @@ impl DataFusion {
 
         accelerated_table_builder.zero_results_action(acceleration_settings.on_zero_results);
 
-        accelerated_table_builder.cache_provider(self.cache_provider.clone());
+        if let Ok(cache) = self.cache_provider.read() {
+            accelerated_table_builder.cache_provider(cache.clone());
+        }
 
         Ok(accelerated_table_builder.build().await)
+    }
+
+    pub fn cache_provider(&self) -> Option<Arc<QueryResultsCacheProvider>> {
+        let Ok(provider) = self.cache_provider.read() else {
+            return None;
+        };
+
+        provider.clone()
     }
 
     async fn register_accelerated_table(
