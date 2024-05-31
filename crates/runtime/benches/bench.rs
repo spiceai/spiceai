@@ -9,6 +9,7 @@
 // schema
 // run_id, started_at, finished_at, query_name, status, min_duration, max_duration, iterations, commit_sha
 
+use clap::Parser;
 use results::BenchmarkResultsBuilder;
 use runtime::Runtime;
 
@@ -19,13 +20,28 @@ mod setup;
 
 mod bench_spiceai;
 
+#[derive(Parser)]
+pub struct Args {
+    #[arg(long)]
+    pub upload_results_dataset: Option<String>,
+
+    // Needed to prevent Clap from erroring when this is set automatically by `cargo bench`.
+    #[arg(long)]
+    pub bench: bool,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), String> {
-    let (mut benchmark_results, mut rt) = setup::setup_benchmark().await;
+    let args = Args::parse();
+
+    let (mut benchmark_results, mut rt) = setup::setup_benchmark(&args).await;
 
     bench_spiceai::run(&mut rt, &mut benchmark_results).await?;
 
-    setup::write_benchmark_results(benchmark_results, &rt).await?;
+    if let Some(upload_results_dataset) = args.upload_results_dataset {
+        tracing::info!("Writing benchmark results to dataset {upload_results_dataset}...");
+        setup::write_benchmark_results(benchmark_results, &rt).await?;
+    }
 
     Ok(())
 }

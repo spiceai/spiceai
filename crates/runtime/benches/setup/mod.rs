@@ -11,10 +11,10 @@ use tracing_subscriber::EnvFilter;
 /// The number of times to run each query in the benchmark.
 const ITERATIONS: i32 = 5;
 
-pub(crate) async fn setup_benchmark() -> (BenchmarkResultsBuilder, Runtime) {
+pub(crate) async fn setup_benchmark(args: &super::Args) -> (BenchmarkResultsBuilder, Runtime) {
     init_tracing();
 
-    let app = build_app();
+    let app = build_app(args);
 
     let rt = Runtime::new(Some(app), Arc::new(vec![])).await;
 
@@ -43,8 +43,8 @@ pub(crate) async fn write_benchmark_results(
         .map_err(|e| e.to_string())
 }
 
-fn build_app() -> App {
-    AppBuilder::new("runtime_benchmark_test")
+fn build_app(args: &super::Args) -> App {
+    let mut app_builder = AppBuilder::new("runtime_benchmark_test")
         .with_secret_store(SpiceSecretStore::File)
         .with_dataset(make_spiceai_dataset("tpch.customer", "customer"))
         .with_dataset(make_spiceai_dataset("tpch.lineitem", "lineitem"))
@@ -53,12 +53,16 @@ fn build_app() -> App {
         .with_dataset(make_spiceai_dataset("tpch.orders", "orders"))
         .with_dataset(make_spiceai_dataset("tpch.nation", "nation"))
         .with_dataset(make_spiceai_dataset("tpch.region", "region"))
-        .with_dataset(make_spiceai_dataset("tpch.supplier", "supplier"))
-        .with_dataset(make_spiceai_rw_dataset(
-            "phillipleblanc.spicetests.oss_benchmarks",
+        .with_dataset(make_spiceai_dataset("tpch.supplier", "supplier"));
+
+    if let Some(upload_results_dataset) = &args.upload_results_dataset {
+        app_builder = app_builder.with_dataset(make_spiceai_rw_dataset(
+            upload_results_dataset,
             "oss_benchmarks",
-        ))
-        .build()
+        ));
+    }
+
+    app_builder.build()
 }
 
 fn init_tracing() {
