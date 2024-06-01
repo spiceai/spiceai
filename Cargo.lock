@@ -2488,6 +2488,7 @@ dependencies = [
  "async-trait",
  "bb8",
  "bb8-postgres",
+ "bytes",
  "clickhouse-rs",
  "datafusion",
  "datafusion-federation",
@@ -2516,6 +2517,7 @@ dependencies = [
  "tokio-rusqlite",
  "tonic 0.11.0",
  "tracing",
+ "url",
  "uuid",
 ]
 
@@ -8224,8 +8226,12 @@ dependencies = [
 name = "spice-cloud"
 version = "0.14.0-alpha"
 dependencies = [
+ "arrow",
  "async-trait",
+ "data_components",
  "datafusion",
+ "flight_client",
+ "futures",
  "reqwest 0.11.27",
  "runtime",
  "secrets",

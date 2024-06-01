@@ -228,7 +228,8 @@ impl MetricsRecorder {
     }
 }
 
-fn get_tags_fields() -> Fields {
+#[must_use]
+pub fn get_tags_fields() -> Fields {
     Fields::from(vec![
         Field::new("dataset", DataType::Utf8, true),
         Field::new("engine", DataType::Utf8, true),

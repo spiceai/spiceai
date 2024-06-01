@@ -1,7 +1,10 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
+use arrow::array::{ArrayRef, Float64Array, StringArray, StructArray, TimestampNanosecondArray};
 use async_trait::async_trait;
-use datafusion::{datasource::TableProvider, sql::TableReference};
+use datafusion::{arrow::array::RecordBatch, datasource::TableProvider, sql::TableReference};
+use flight_client::FlightClient;
+use futures::TryStreamExt;
 use serde::Deserialize;
 use serde_json::json;
 use snafu::prelude::*;
@@ -13,10 +16,12 @@ use runtime::{
         replication::Replication,
         Dataset, Mode, TimeFormat,
     },
-    dataaccelerator::{self, create_accelerator_table},
+    dataaccelerator,
     dataconnector::{create_new_connector, DataConnectorError},
+    datafusion::{query::QueryBuilder, DataFusion},
     extension::{Extension, ExtensionFactory, ExtensionManifest, Result},
-    spice_metrics::get_metrics_table_reference,
+    internal_table::{create_internal_accelerated_table, Error as InternalTableError},
+    spice_metrics::{get_metrics_schema, get_metrics_table_reference, get_tags_fields},
     Runtime,
 };
 use secrets::Secret;
@@ -50,6 +55,12 @@ pub enum Error {
 
     #[snafu(display("Unable to connect to Spice Cloud: {source}"))]
     UnableToConnectToSpiceCloud { source: reqwest::Error },
+
+    #[snafu(display("Error creating metrics table: {source}"))]
+    UnableToCreateMetricsTable { source: InternalTableError },
+
+    #[snafu(display("Unable to create flight client: {source}"))]
+    UnableToCreateFlightClient { source: flight_client::Error },
 }
 
 pub struct SpiceExtension {
@@ -67,6 +78,14 @@ impl SpiceExtension {
             .params
             .get("endpoint")
             .unwrap_or(&"https://data.spiceai.io".to_string())
+            .to_string()
+    }
+
+    fn spice_flight_url(&self) -> String {
+        self.manifest
+            .params
+            .get("flight_endpoint")
+            .unwrap_or(&"https://flight.spiceai.io".to_string())
             .to_string()
     }
 
@@ -152,6 +171,98 @@ impl SpiceExtension {
 
         Ok(())
     }
+
+    async fn start_sync(
+        flight_url: String,
+        api_key: String,
+        dataset_path: String,
+        datafusion: Arc<DataFusion>,
+    ) {
+        let mut flight_client =
+            match FlightClient::new(flight_url.as_str(), "", api_key.as_str()).await {
+                Ok(client) => client,
+                Err(err) => {
+                    tracing::error!("Unable to create flight client: {}", err);
+                    return;
+                }
+            };
+
+        let mut interval_timer = tokio::time::interval(Duration::from_secs(30));
+
+        loop {
+            interval_timer.tick().await;
+
+            let query = QueryBuilder::new(
+                "SELECT * FROM runtime.metrics".to_string(),
+                Arc::clone(&datafusion),
+            )
+            .build();
+
+            match query.run().await {
+                Ok(result) => match result.data.try_collect::<Vec<RecordBatch>>().await {
+                    Ok(record_batches) => {
+                        if let Err(err) = flight_client
+                            .publish(dataset_path.as_str(), record_batches)
+                            .await
+                        {
+                            tracing::error!("Failed to publish metrics to Spice Cloud: {}", err);
+                            continue;
+                        } else {
+                            tracing::info!("Metrics published to Spice Cloud");
+                        }
+                    }
+                    Err(err) => {
+                        tracing::error!("Error collecting record batches: {}", err);
+                    }
+                },
+                Err(err) => {
+                    tracing::error!("Error running query: {}", err);
+                }
+            }
+
+            // let schema = get_metrics_schema();
+            // let timestamps: Vec<i64> = vec![12345678];
+            // let instances: Vec<String> = vec![String::from("instance1")];
+            // let names: Vec<String> = vec![String::from("name1")];
+            // let values: Vec<f64> = vec![1.0];
+            // let labels: Vec<String> = vec![String::from("label1")];
+            // let datasets: Vec<Option<String>> = vec![Some(String::from("dataset1"))];
+            // let engines: Vec<Option<String>> = vec![Some(String::from("engine1"))];
+            // let datasets_array: ArrayRef = Arc::new(StringArray::from(datasets));
+            // let engines_array: ArrayRef = Arc::new(StringArray::from(engines));
+
+            // let Ok(record_batch) = RecordBatch::try_new(
+            //     Arc::clone(&schema),
+            //     vec![
+            //         Arc::new(
+            //             TimestampNanosecondArray::from(timestamps).with_timezone(Arc::from("UTC")),
+            //         ),
+            //         Arc::new(StringArray::from(instances)),
+            //         Arc::new(StringArray::from(names)),
+            //         Arc::new(Float64Array::from(values)),
+            //         Arc::new(StringArray::from(labels)),
+            //         Arc::new(StructArray::new(
+            //             get_tags_fields(),
+            //             vec![datasets_array, engines_array],
+            //             None,
+            //         )),
+            //     ],
+            // ) else {
+            //     tracing::error!("Failed to create record batch");
+            //     continue;
+            // };
+
+            // if let Err(err) = flight_client
+            //     .publish(dataset_path.as_str(), vec![record_batch])
+            //     .await
+            // {
+            //     tracing::error!("Failed to publish metrics to Spice Cloud: {}", err);
+            //     continue;
+            // }
+
+            // tracing::info!("Metrics published to Spice Cloud");
+        }
+    }
 }
 
 impl Default for SpiceExtension {
@@ -196,6 +307,30 @@ impl Extension for SpiceExtension {
             connection.org_name, connection.app_name, connection.metrics_dataset_name
         );
 
+        let api_key = secret.get("key").unwrap_or_default();
+        // let mut flight_client = FlightClient::new(self.spice_flight_url().as_str(), "", api_key)
+        //     .await
+        //     .boxed()
+        //     .map_err(|e| runtime::extension::Error::UnableToStartExtension { source: e })?;
+        //
+
+        let flight_url = self.spice_flight_url().to_string();
+        let api_key = api_key.to_string();
+        let dataset_path = format!(
+            "{}.{}.{}",
+            connection.org_name, connection.app_name, connection.metrics_dataset_name
+        )
+        .to_string();
+        let df = runtime.datafusion();
+        let clone = Arc::clone(&df);
+
+        tokio::spawn(SpiceExtension::start_sync(
+            flight_url,
+            api_key,
+            dataset_path,
+            clone,
+        ));
+
         let from = spiceai_metrics_dataset_path.to_string();
         self.register_runtime_metrics_table(runtime, from.clone(), secret)
             .await?;
@@ -218,9 +353,7 @@ impl SpiceExtensionFactory {
 
 impl ExtensionFactory for SpiceExtensionFactory {
     fn create(&self) -> Box<dyn Extension> {
-        Box::new(SpiceExtension {
-            manifest: self.manifest.clone(),
-        })
+        Box::new(SpiceExtension::new(self.manifest.clone()))
     }
 }
 
@@ -256,37 +389,59 @@ async fn get_spiceai_table_provider(
 ///
 /// This function will return an error if the accelerated table provider cannot be created
 pub async fn create_synced_internal_accelerated_table(
-    table_reference: TableReference,
-    from: &str,
-    secret: Option<Secret>,
-    acceleration: Acceleration,
-    refresh: Refresh,
-    retention: Option<Retention>,
+    _table_reference: TableReference,
+    _from: &str,
+    _secret: Option<Secret>,
+    _acceleration: Acceleration,
+    _refresh: Refresh,
+    _retention: Option<Retention>,
 ) -> Result<Arc<AcceleratedTable>, Error> {
-    let source_table_provider =
-        get_spiceai_table_provider(table_reference.table(), from, secret).await?;
+    let metrics_table_reference = get_metrics_table_reference();
 
-    let accelerated_table_provider = create_accelerator_table(
-        table_reference.clone(),
-        source_table_provider.schema(),
-        &acceleration,
-        None,
-    )
-    .await
-    .context(UnableToCreateAcceleratedTableProviderSnafu)?;
-
-    let mut builder = AcceleratedTable::builder(
-        table_reference.clone(),
-        source_table_provider,
-        accelerated_table_provider,
-        refresh,
+    let retention = Retention::new(
+        Some("timestamp".to_string()),
+        Some(TimeFormat::UnixSeconds),
+        Some(Duration::from_secs(1800)), // delete metrics older then 30 minutes
+        Some(Duration::from_secs(300)),  // run retention every 5 minutes
+        true,
     );
 
-    builder.retention(retention);
+    let table = create_internal_accelerated_table(
+        metrics_table_reference.clone(),
+        get_metrics_schema(),
+        Acceleration::default(),
+        Refresh::default(),
+        retention,
+    )
+    .await
+    .context(UnableToCreateMetricsTableSnafu)?;
 
-    let (accelerated_table, _) = builder.build().await;
+    Ok(table)
 
-    Ok(Arc::new(accelerated_table))
+    // let source_table_provider =
+    //     get_spiceai_table_provider(table_reference.table(), from, secret).await?;
+
+    // let accelerated_table_provider = create_accelerator_table(
+    //     table_reference.clone(),
+    //     source_table_provider.schema(),
+    //     &acceleration,
+    //     None,
+    // )
+    // .await
+    // .context(UnableToCreateAcceleratedTableProviderSnafu)?;
+
+    // let mut builder = AcceleratedTable::builder(
+    //     table_reference.clone(),
+    //     source_table_provider,
+    //     accelerated_table_provider,
+    //     refresh,
+    // );
+
+    // builder.retention(retention);
+
+    // let (accelerated_table, _) = builder.build().await;
+
+    // Ok(Arc::new(accelerated_table))
 }
 
 #[derive(Deserialize, Debug)]
