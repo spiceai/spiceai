@@ -37,6 +37,7 @@ use component::dataset::{self, Dataset};
 use config::Config;
 use datafusion::query::query_history;
 use datafusion::SPICE_RUNTIME_SCHEMA;
+use embeddings::connector::EmbeddingConnector;
 use futures::future::join_all;
 use futures::StreamExt;
 use llms::embeddings::Embed;
@@ -61,6 +62,7 @@ pub mod dataaccelerator;
 pub mod dataconnector;
 pub mod datafusion;
 pub mod dataupdate;
+pub mod embeddings;
 pub mod execution_plan;
 pub mod extension;
 mod flight;
@@ -411,7 +413,14 @@ impl Runtime {
             }
         };
 
-        Ok(data_connector)
+        Ok(
+            Arc::new(EmbeddingConnector::new(data_connector, self.embeds.clone()))
+                as Arc<dyn DataConnector>,
+        )
+        // if cfg!(feature="models") {
+        // } else {
+        //     Ok(data_connector)
+        // }
     }
 
     pub async fn register_loaded_dataset(

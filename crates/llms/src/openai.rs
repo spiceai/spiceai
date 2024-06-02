@@ -164,6 +164,15 @@ impl Embed for Openai {
 
         Ok(embedding)
     }
+
+    fn size(&self) -> usize {
+        match self.model.as_str() {
+            "text-embedding-3-large" => 3_072,
+            "text-embedding-3-small" => 1_536,
+            "text-embedding-ada-002" => 1_536,
+            _ => 0, // unreachable. If not a valid model, it won't create embeddings.
+        }
+    }
 }
 
 fn to_openai_embedding_input(input: EmbeddingInput) -> OpenAiEmbeddingInput {
