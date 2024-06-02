@@ -16,7 +16,7 @@ limitations under the License.
 #![allow(clippy::module_name_repetitions)]
 
 use arrow::{
-    array::{ArrayRef, FixedSizeListArray, RecordBatch, StringArray},
+    array::{ArrayRef, RecordBatch, StringArray},
     datatypes::{DataType, Field, Schema, SchemaRef},
     error::ArrowError,
 };

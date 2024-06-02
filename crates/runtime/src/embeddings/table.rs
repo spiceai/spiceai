@@ -13,6 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+#![allow(clippy::module_name_repetitions)]
 
 use std::collections::HashMap;
 use std::{any::Any, sync::Arc};
@@ -22,75 +23,66 @@ use async_trait::async_trait;
 use datafusion::common::{project_schema, Constraints, Statistics};
 use datafusion::error::Result as DataFusionResult;
 use datafusion::execution::context::SessionState;
-use datafusion::logical_expr::{LogicalPlan, TableProviderFilterPushDown};
+use datafusion::logical_expr::TableProviderFilterPushDown;
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::sql::TableReference;
 use datafusion::{
     datasource::{TableProvider, TableType},
     logical_expr::Expr,
 };
 use itertools::Itertools;
-use llms::embeddings::Embed;
 use snafu::prelude::*;
 
 use tokio::sync::RwLock;
 
 use crate::embeddings::execution_plan::EmbeddingTableExec;
+use crate::EmbeddingModelStore;
 
 #[derive(Debug, Snafu)]
 pub enum Error {}
 
 /// An [`EmbeddingTable`] is a [`TableProvider`] where some columns are augmented with associated embedding columns
 pub struct EmbeddingTable {
-    dataset_name: TableReference,
     base_table: Arc<dyn TableProvider>,
 
     // A mapping of columns names from [`base_table`] to the embedding's `name` to use.
     embedded_columns: HashMap<String, String>,
 
-    embedding_models: Arc<RwLock<HashMap<String, RwLock<Box<dyn Embed>>>>>,
+    embedding_models: Arc<RwLock<EmbeddingModelStore>>,
 
     // Precompute to avoid async lock waits from `embedding_models` data structure.
     // Mapping of column name to the expected size of its embedding.
-    embedding_sizes: HashMap<String, usize>,
-
-    num_base_cols: usize,
+    embedding_sizes: HashMap<String, i32>,
 }
 
 impl EmbeddingTable {
     pub async fn new(
-        dataset_name: TableReference,
         base_table: Arc<dyn TableProvider>,
         embedded_columns: HashMap<String, String>,
-        embedding_models: Arc<RwLock<HashMap<String, RwLock<Box<dyn Embed>>>>>,
+        embedding_models: Arc<RwLock<EmbeddingModelStore>>,
     ) -> Self {
         let sizes = Self::precompute_embedding_sizes(&embedded_columns, &embedding_models).await;
-        println!("Sizes: {:#?}", sizes);
-        let num_base_cols = base_table.schema().all_fields().len();
         Self {
-            dataset_name,
             base_table,
             embedded_columns,
             embedding_models,
             embedding_sizes: sizes,
-            num_base_cols,
         }
     }
 
     async fn precompute_embedding_sizes(
         embedded_columns: &HashMap<String, String>,
-        embedding_models: &Arc<RwLock<HashMap<String, RwLock<Box<dyn Embed>>>>>,
-    ) -> HashMap<String, usize> {
-        println!("Precomputing embedding sizes for {:#?}", embedded_columns);
+        embedding_models: &Arc<RwLock<EmbeddingModelStore>>,
+    ) -> HashMap<String, i32> {
+        println!("Precomputing embedding sizes for {embedded_columns:#?}");
 
-        let mut model_sizes: HashMap<String, usize> = HashMap::new();
-        for (col, model) in embedded_columns.iter() {
+        let mut model_sizes: HashMap<String, i32> = HashMap::new();
+        for (col, model) in embedded_columns {
             if let Some(model_lock) = embedding_models.read().await.get(model) {
                 let z = model_lock.read().await.size();
                 model_sizes.insert(col.clone(), z);
-                println!("Model {} has size {}", model, z);
+                println!("Model {model} has size {z}");
             } else {
-                println!("Model {} not found for column {}", model, col);
+                println!("Model {model} not found for column {col}");
             }
         }
         model_sizes
@@ -112,7 +104,7 @@ impl EmbeddingTable {
                         if c > base_cols {
                             None
                         } else {
-                            x.get(c - base_cols).cloned()
+                            x.get(c - base_cols).copied()
                         }
                     })
                     .cloned()
@@ -136,9 +128,9 @@ impl TableProvider for EmbeddingTable {
         self.base_table.table_type()
     }
 
-    fn get_table_definition(&self) -> Option<&str> {
-        self.base_table.get_table_definition()
-    }
+    // fn get_table_definition(&self) -> Option<&str> {
+    //     self.base_table.get_table_definition()
+    // }
 
     // fn get_logical_plan(&self) -> Option<&LogicalPlan> {
     //     let table_source = Arc::new(DefaultTableSource::new(Arc::clone(&table_provider)));
@@ -150,28 +142,26 @@ impl TableProvider for EmbeddingTable {
     //     self.base_table.get_logical_plan()
     // }
 
-    fn get_column_default(&self, _column: &str) -> Option<&Expr> {
-        self.base_table.get_column_default(_column)
+    fn get_column_default(&self, column: &str) -> Option<&Expr> {
+        self.base_table.get_column_default(column)
     }
 
     fn schema(&self) -> SchemaRef {
         let base_schema = self.base_table.schema();
         let mut base_fields: Vec<_> = (0..base_schema.fields.len())
-            .into_iter()
-            .map(|i| base_schema.fields.get(i).cloned())
-            .flatten()
+            .filter_map(|i| base_schema.fields.get(i).cloned())
             .collect();
 
         let mut embedding_fields: Vec<_> = self
             .embedded_columns
             .keys()
             .sorted() // Important to be kept alphabetical for fast lookup
-            .map(|k| match base_schema.column_with_name(k) {
+            .filter_map(|k| match base_schema.column_with_name(k) {
                 Some((_, field)) => {
                     let embedding_size = self
                         .embedding_sizes
                         .get(field.name())
-                        .map(|&x| x as i32)
+                        .copied()
                         .unwrap_or_default();
 
                     Some(Arc::new(
@@ -187,7 +177,6 @@ impl TableProvider for EmbeddingTable {
                 }
                 None => None,
             })
-            .flatten()
             .collect();
 
         base_fields.append(&mut embedding_fields);
@@ -216,7 +205,7 @@ impl TableProvider for EmbeddingTable {
                         .map(|p| {
                             p.iter()
                                 .filter(|&&idx| idx < num_base_cols)
-                                .cloned()
+                                .copied()
                                 .collect()
                         })
                         .as_ref(),
@@ -247,7 +236,7 @@ impl TableProvider for EmbeddingTable {
                     proj.iter()
                         .unique()
                         .filter(|&&c| c < num_base_cols) // Don't include embedding columns for `base_table`
-                        .cloned()
+                        .copied()
                         .collect_vec(),
                 )
             }
@@ -260,12 +249,12 @@ impl TableProvider for EmbeddingTable {
             .await?;
 
         Ok(Arc::new(EmbeddingTableExec::new(
-            projected_schema,
+            &projected_schema,
             filters,
             limit,
             base_plan,
             scan_embed_columns,
-            self.embedding_models.clone(),
+            Arc::clone(&self.embedding_models),
         )) as Arc<dyn ExecutionPlan>)
     }
 

@@ -13,12 +13,12 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-
+#![allow(clippy::module_name_repetitions)]
 use crate::component::dataset::Dataset;
 use crate::dataconnector::AnyErrorResult;
+use crate::EmbeddingModelStore;
 use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
-use llms::embeddings::Embed;
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -32,13 +32,13 @@ use super::table::EmbeddingTable;
 pub struct EmbeddingConnector {
     inner_connector: Arc<dyn DataConnector>,
 
-    embedding_models: Arc<RwLock<HashMap<String, RwLock<Box<dyn Embed>>>>>,
+    embedding_models: Arc<RwLock<EmbeddingModelStore>>,
 }
 
 impl EmbeddingConnector {
     pub fn new(
         inner_connector: Arc<dyn DataConnector>,
-        embedding_models: Arc<RwLock<HashMap<String, RwLock<Box<dyn Embed>>>>>,
+        embedding_models: Arc<RwLock<EmbeddingModelStore>>,
     ) -> Self {
         Self {
             inner_connector,
@@ -57,20 +57,20 @@ impl EmbeddingConnector {
             return Ok(inner_table_provider);
         }
 
-        println!("I, {}, have been wrapped", dataset.name);
-        let embed_columns: HashMap<String, String, _> = HashMap::from_iter(
-            dataset
-                .embeddings
-                .iter()
-                .map(|e| (e.column.clone(), e.model.clone())),
-        );
+        let embed_columns: HashMap<String, String, _> = dataset
+            .embeddings
+            .iter()
+            .map(|e| (e.column.clone(), e.model.clone()))
+            .collect::<HashMap<_, _>>();
+        // );
+
+        // map(|e| (e.column.clone(), e.model.clone())).collect::<HashMap<_, _>>();
 
         Ok(Arc::new(
             EmbeddingTable::new(
-                dataset.name.clone(),
                 inner_table_provider,
                 embed_columns,
-                self.embedding_models.clone(),
+                Arc::clone(&self.embedding_models),
             )
             .await,
         ) as Arc<dyn TableProvider>)
@@ -107,7 +107,7 @@ impl DataConnector for EmbeddingConnector {
         dataset: &Dataset,
     ) -> Option<AnyErrorResult<Arc<dyn TableProvider>>> {
         match self.inner_connector.read_write_provider(dataset).await {
-            Some(Ok(inner)) => Some(self.wrap(inner, dataset).await.map_err(|e| e.into())),
+            Some(Ok(inner)) => Some(self.wrap(inner, dataset).await.map_err(Into::into)),
             Some(Err(e)) => Some(Err(e.into())),
             None => None,
         }

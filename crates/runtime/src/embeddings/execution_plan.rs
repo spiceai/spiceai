@@ -14,9 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use arrow::array::{
-    ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, StringArray,
-};
+use arrow::array::{ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, SchemaRef};
 
 use arrow::error::ArrowError;
@@ -31,9 +29,11 @@ use itertools::Itertools;
 use std::collections::HashMap;
 use std::{any::Any, sync::Arc};
 
-use llms::embeddings::{Embed, EmbeddingInput};
+use llms::embeddings::EmbeddingInput;
 use std::fmt;
 use tokio::sync::RwLock;
+
+use crate::EmbeddingModelStore;
 
 pub struct EmbeddingTableExec {
     projected_schema: SchemaRef,
@@ -44,7 +44,7 @@ pub struct EmbeddingTableExec {
     base_plan: Arc<dyn ExecutionPlan>,
 
     embedded_columns: HashMap<String, String>,
-    embedding_models: Arc<RwLock<HashMap<String, RwLock<Box<dyn Embed>>>>>,
+    embedding_models: Arc<RwLock<EmbeddingModelStore>>,
 }
 
 impl std::fmt::Debug for EmbeddingTableExec {
@@ -74,7 +74,7 @@ impl ExecutionPlan for EmbeddingTableExec {
     }
 
     fn schema(&self) -> SchemaRef {
-        self.projected_schema.clone()
+        Arc::clone(&self.projected_schema)
     }
 
     fn properties(&self) -> &PlanProperties {
@@ -90,12 +90,12 @@ impl ExecutionPlan for EmbeddingTableExec {
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(Self::new(
-            self.projected_schema.clone(),
+            &Arc::clone(&self.projected_schema),
             &self.filters,
             self.limit,
-            self.base_plan.clone().with_new_children(children)?,
+            Arc::clone(&self.base_plan).with_new_children(children)?,
             self.embedded_columns.clone(),
-            self.embedding_models.clone(),
+            Arc::clone(&self.embedding_models),
         )) as Arc<dyn ExecutionPlan>)
     }
 
@@ -104,16 +104,14 @@ impl ExecutionPlan for EmbeddingTableExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-        println!("In execute");
         let s = self.base_plan.execute(partition, context)?;
-        println!("In execute, after base: {:#?}", self.schema());
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema(),
             to_sendable_stream(
                 s,
-                self.projected_schema.clone(),
+                Arc::clone(&self.projected_schema),
                 self.embedded_columns.clone(),
-                self.embedding_models.clone(),
+                Arc::clone(&self.embedding_models),
             ),
         )))
     }
@@ -122,15 +120,15 @@ impl ExecutionPlan for EmbeddingTableExec {
 /// All [`Self::embedded_columns`] must be in [`Self::projected_schema`].
 impl EmbeddingTableExec {
     pub(crate) fn new(
-        projected_schema: SchemaRef,
+        projected_schema: &SchemaRef,
         filters: &[Expr],
         limit: Option<usize>,
         base_plan: Arc<dyn ExecutionPlan>,
         embedded_columns: HashMap<String, String>,
-        embedding_models: Arc<RwLock<HashMap<String, RwLock<Box<dyn Embed>>>>>,
+        embedding_models: Arc<RwLock<EmbeddingModelStore>>,
     ) -> Self {
         Self {
-            projected_schema: Arc::clone(&projected_schema),
+            projected_schema: Arc::clone(projected_schema),
             filters: filters.to_vec(),
             limit,
             properties: base_plan.properties().clone(),
@@ -145,19 +143,19 @@ fn to_sendable_stream(
     mut base_stream: SendableRecordBatchStream,
     projected_schema: SchemaRef,
     embedded_columns: HashMap<String, String>,
-    embedding_models: Arc<RwLock<HashMap<String, RwLock<Box<dyn Embed>>>>>,
+    embedding_models: Arc<RwLock<EmbeddingModelStore>>,
 ) -> impl Stream<Item = DataFusionResult<RecordBatch>> + 'static {
     stream! {
         while let Some(batch_result) = base_stream.next().await {
             match batch_result {
                 Ok(batch) => {
-                    match get_embeddings(&batch, &embedded_columns, embedding_models.clone()).await {
+                    match get_embeddings(&batch, &embedded_columns, Arc::clone(&embedding_models)).await {
                         Ok(embeddings) => {
 
                             match construct_record_batch(
                                 &batch,
-                                projected_schema.clone(),
-                                embeddings,
+                                &Arc::clone(&projected_schema),
+                                &embeddings,
                             ) {
                                 Ok(embedded_batch) => yield Ok(embedded_batch),
                                 Err(e) => {
@@ -166,12 +164,12 @@ fn to_sendable_stream(
                             }
                         }
                         Err(e) => {
-                            println!("Error: {:#?}", e);
-                            // yield Err(e.into())
-                        }, // yield Err(DataFusionError::Internal(format!("{e}"))),
+                            yield Err(DataFusionError::Internal(e.to_string()));
+
+                        },
                     };
                 },
-                Err(e) => yield Err(e.into()),
+                Err(e) => yield Err(e),
             }
         }
     }
@@ -179,37 +177,38 @@ fn to_sendable_stream(
 
 fn construct_record_batch(
     batch: &RecordBatch,
-    projected_schema: SchemaRef,
-    embedding_cols: HashMap<String, ArrayRef>,
+    projected_schema: &SchemaRef,
+    embedding_cols: &HashMap<String, ArrayRef>,
 ) -> Result<RecordBatch, ArrowError> {
     let cols: Vec<ArrayRef> = projected_schema
         .all_fields()
         .iter()
-        .map(|&f| match embedding_cols.get(f.name()).map(|c| c.clone()) {
+        .filter_map(|&f| match embedding_cols.get(f.name()).cloned() {
             Some(embedded_col) => Some(embedded_col),
             None => batch.column_by_name(f.name()).cloned(),
         })
-        .flatten()
+        // .map(|&f| match embedding_cols.get(f.name()).cloned() {
+        //     Some(embedded_col) => Some(embedded_col),
+        //     None => batch.column_by_name(f.name()).cloned(),
+        // })
         .collect_vec();
-    RecordBatch::try_new(projected_schema.clone(), cols)
+    RecordBatch::try_new(Arc::clone(projected_schema), cols)
 }
 
 async fn get_embeddings(
     rb: &RecordBatch,
     embedded_columns: &HashMap<String, String>,
-    embedding_models: Arc<RwLock<HashMap<String, RwLock<Box<dyn Embed>>>>>,
+    embedding_models: Arc<RwLock<EmbeddingModelStore>>,
 ) -> Result<HashMap<String, ArrayRef>, Box<dyn std::error::Error + Send + Sync>> {
     let field = Arc::new(Field::new("item", DataType::Float32, false));
 
     let mut embed_arrays: HashMap<String, ArrayRef> =
         HashMap::with_capacity(embedded_columns.len());
-    for (col, model_name) in embedded_columns.iter() {
+    for (col, model_name) in embedded_columns {
         let read_guard = embedding_models.read().await;
-        println!("model_names: {:#?}", read_guard.keys().join(", "));
         let model_lock_opt = read_guard.get(model_name);
 
         let Some(model_lock) = model_lock_opt else {
-            println!("model local baddie: {:#?}", model_name);
             continue;
         };
 
@@ -217,34 +216,35 @@ async fn get_embeddings(
 
         let raw_data = match rb.column_by_name(col) {
             None => {
-                println!("column not found: {:#?}", col);
                 continue;
             }
             Some(data) => data,
         };
 
-        let column: Vec<String> = raw_data
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("Failed to downcast to StringArray")
+        let string_array = raw_data.as_any().downcast_ref::<StringArray>();
+
+        let Some(arr) = string_array else {
+            continue;
+        };
+
+        // .ok_or("Failed to downcast to StringArray".into())?
+        let column: Vec<String> = arr
             .iter()
-            .filter_map(|s| s.map(|ss| ss.to_string()))
+            .filter_map(|s| s.map(ToString::to_string))
             .collect();
 
         let embedded_data = model.embed(EmbeddingInput::StringBatch(column)).await?;
-        let vector_length = embedded_data.first().map(|f| f.len()).unwrap_or_default();
-        let processed = embedded_data.iter().flatten().map(|&x| x).collect_vec();
+        let vector_length = embedded_data.first().map(Vec::len).unwrap_or_default();
+        let processed = embedded_data.iter().flatten().copied().collect_vec();
 
-        let values = Float32Array::try_new(processed.into(), None).unwrap();
+        let values = Float32Array::try_new(processed.into(), None)?;
         let list_array = FixedSizeListArray::try_new(
-            field.clone(),
-            vector_length as i32,
+            Arc::clone(&field),
+            i32::try_from(vector_length)?,
             Arc::new(values),
             None,
-        )
-        .unwrap();
+        )?;
         embed_arrays.insert(format!("{col}_embedding"), Arc::new(list_array));
     }
-    println!("embed_arrays: {:#?}", embed_arrays.len());
     Ok(embed_arrays)
 }

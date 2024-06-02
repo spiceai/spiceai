@@ -413,10 +413,10 @@ impl Runtime {
             }
         };
 
-        Ok(
-            Arc::new(EmbeddingConnector::new(data_connector, self.embeds.clone()))
-                as Arc<dyn DataConnector>,
-        )
+        Ok(Arc::new(EmbeddingConnector::new(
+            data_connector,
+            Arc::clone(&self.embeds),
+        )) as Arc<dyn DataConnector>)
         // if cfg!(feature="models") {
         // } else {
         //     Ok(data_connector)
@@ -455,7 +455,6 @@ impl Runtime {
             &source,
             Arc::clone(&shared_secrets_provider),
             accelerated_table,
-            self.embeds.clone(),
         )
         .await
         {
@@ -641,7 +640,6 @@ impl Runtime {
         source: &str,
         secrets_provider: Arc<RwLock<secrets::SecretsProvider>>,
         accelerated_table: Option<AcceleratedTable>,
-        embed_models: Arc<RwLock<EmbeddingModelStore>>,
     ) -> Result<()> {
         let ds = ds.borrow();
 
@@ -667,7 +665,7 @@ impl Runtime {
                 df,
                 ds,
                 datafusion::Table::Federated(data_connector),
-                source
+                source,
             )
             .await;
         }
@@ -697,7 +695,7 @@ impl Runtime {
                 acceleration_secret,
                 accelerated_table,
             },
-            source
+            source,
         )
         .await
     }
@@ -706,7 +704,7 @@ impl Runtime {
         df: Arc<DataFusion>,
         ds: &Dataset,
         table: datafusion::Table,
-        source: &str
+        source: &str,
     ) -> Result<()> {
         df.register_table(ds, table)
             .await

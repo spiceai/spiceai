@@ -24,8 +24,7 @@ use crate::component::dataset::{Dataset, Mode};
 use crate::dataaccelerator::{self, create_accelerator_table};
 use crate::dataconnector::{DataConnector, DataConnectorError};
 use crate::dataupdate::{DataUpdate, DataUpdateExecutionPlan, UpdateType};
-use crate::embeddings::connector::EmbeddingConnector;
-use crate::{get_dependent_table_names, EmbeddingModelStore};
+use crate::get_dependent_table_names;
 use crate::object_store_registry::default_runtime_env;
 
 use arrow::datatypes::Schema;
@@ -332,7 +331,8 @@ impl DataFusion {
 
                     return Ok(());
                 }
-                self.register_accelerated_table(dataset, source, acceleration_secret).await?;
+                self.register_accelerated_table(dataset, source, acceleration_secret)
+                    .await?;
             }
             Table::Federated(source) => self.register_federated_table(dataset, source).await?,
             Table::View(sql) => self.register_view(dataset.name.clone(), sql)?,
@@ -495,7 +495,7 @@ impl DataFusion {
         };
 
         // Is it that this schema does not have the embeddings?
-        
+
         let source_schema = source_table_provider.schema();
         let acceleration_settings =
             dataset
@@ -513,7 +513,7 @@ impl DataFusion {
         )
         .await
         .context(UnableToCreateDataAcceleratorSnafu)?;
-        
+
         let refresh_sql = dataset.refresh_sql();
         if let Some(refresh_sql) = &refresh_sql {
             refresh_sql::validate_refresh_sql(dataset.name.clone(), refresh_sql.as_str())

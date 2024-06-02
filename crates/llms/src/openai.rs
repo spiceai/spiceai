@@ -165,12 +165,11 @@ impl Embed for Openai {
         Ok(embedding)
     }
 
-    fn size(&self) -> usize {
+    fn size(&self) -> i32 {
         println!("self.model, {}", self.model);
         match self.model.as_str() {
             "text-embedding-3-large" => 3_072,
-            "text-embedding-3-small" => 1_536,
-            "text-embedding-ada-002" => 1_536,
+            "text-embedding-3-small" | "text-embedding-ada-002" => 1_536,
             _ => 0, // unreachable. If not a valid model, it won't create embeddings.
         }
     }
