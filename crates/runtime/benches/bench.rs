@@ -23,7 +23,7 @@ use crate::results::Status;
 mod results;
 mod setup;
 
-mod bench_spiceai;
+mod bench_spicecloud;
 
 #[tokio::main]
 async fn main() -> Result<(), String> {
@@ -35,7 +35,7 @@ async fn main() -> Result<(), String> {
 
     let (mut benchmark_results, mut rt) = setup::setup_benchmark(&upload_results_dataset).await;
 
-    bench_spiceai::run(&mut rt, &mut benchmark_results).await?;
+    bench_spicecloud::run(&mut rt, &mut benchmark_results).await?;
 
     let data_update: DataUpdate = benchmark_results.into();
 
