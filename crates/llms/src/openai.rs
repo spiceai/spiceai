@@ -166,7 +166,6 @@ impl Embed for Openai {
     }
 
     fn size(&self) -> i32 {
-        println!("self.model, {}", self.model);
         match self.model.as_str() {
             "text-embedding-3-large" => 3_072,
             "text-embedding-3-small" | "text-embedding-ada-002" => 1_536,
