@@ -9,9 +9,14 @@
 // schema
 // run_id, started_at, finished_at, query_name, status, min_duration, max_duration, iterations, commit_sha
 
-use clap::Parser;
+use std::sync::Arc;
+
+use arrow::array::RecordBatch;
+use datafusion::datasource::provider_as_source;
+use datafusion::logical_expr::{LogicalPlanBuilder, UNNAMED_TABLE};
+use datafusion::{dataframe::DataFrame, datasource::MemTable, execution::context::SessionContext};
 use results::BenchmarkResultsBuilder;
-use runtime::Runtime;
+use runtime::{dataupdate::DataUpdate, Runtime};
 
 use crate::results::Status;
 
@@ -20,28 +25,28 @@ mod setup;
 
 mod bench_spiceai;
 
-#[derive(Parser)]
-pub struct Args {
-    #[arg(long)]
-    pub upload_results_dataset: Option<String>,
-
-    // Needed to prevent Clap from erroring when this is set automatically by `cargo bench`.
-    #[arg(long)]
-    pub bench: bool,
-}
-
 #[tokio::main]
 async fn main() -> Result<(), String> {
-    let args = Args::parse();
+    let mut upload_results_dataset: Option<String> = None;
+    if let Ok(env_var) = std::env::var("UPLOAD_RESULTS_DATASET") {
+        println!("UPLOAD_RESULTS_DATASET: {env_var}");
+        upload_results_dataset = Some(env_var);
+    }
 
-    let (mut benchmark_results, mut rt) = setup::setup_benchmark(&args).await;
+    let (mut benchmark_results, mut rt) = setup::setup_benchmark(&upload_results_dataset).await;
 
     bench_spiceai::run(&mut rt, &mut benchmark_results).await?;
 
-    if let Some(upload_results_dataset) = args.upload_results_dataset {
+    let data_update: DataUpdate = benchmark_results.into();
+
+    let display_records = data_update.data.clone();
+
+    if let Some(upload_results_dataset) = upload_results_dataset {
         tracing::info!("Writing benchmark results to dataset {upload_results_dataset}...");
-        setup::write_benchmark_results(benchmark_results, &rt).await?;
+        setup::write_benchmark_results(data_update, &rt).await?;
     }
+
+    display_benchmark_records(display_records).await?;
 
     Ok(())
 }
@@ -98,5 +103,25 @@ async fn run_query_and_record_result(
         max_iter_duration_ms,
     );
 
+    Ok(())
+}
+
+/// Display the benchmark results record batches to the console.
+async fn display_benchmark_records(records: Vec<RecordBatch>) -> Result<(), String> {
+    let schema = records[0].schema();
+
+    let ctx = SessionContext::new();
+    let provider = MemTable::try_new(schema, vec![records]).map_err(|e| e.to_string())?;
+    let df = DataFrame::new(
+        ctx.state(),
+        LogicalPlanBuilder::scan(UNNAMED_TABLE, provider_as_source(Arc::new(provider)), None)
+            .map_err(|e| e.to_string())?
+            .build()
+            .map_err(|e| e.to_string())?,
+    );
+
+    if let Err(e) = df.show().await {
+        println!("Error displaying results: {e}");
+    };
     Ok(())
 }

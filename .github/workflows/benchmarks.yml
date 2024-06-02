@@ -1,0 +1,28 @@
+---
+    name: benchmark tests
+    
+    on:
+      workflow_dispatch:
+    
+    jobs:
+      build:
+        name: Benchmark Tests
+        runs-on: ubuntu-latest-16-cores
+        steps:
+          - uses: actions/checkout@v4
+    
+          - name: Set up Rust
+            uses: ./.github/actions/setup-rust
+            with:
+              os: 'linux'
+    
+          - name: Set up Spice.ai API Key
+            run: |
+              mkdir -p ~/.spice
+              echo "[spiceai]" > ~/.spice/auth
+              echo "  [spiceai.params]" >> ~/.spice/auth
+              echo '    key = "${{ secrets.SPICE_SECRET_SPICEAI_BENCHMARK_KEY }}"' >> ~/.spice/auth
+    
+          - run: cargo bench -p runtime
+            env:
+                UPLOAD_RESULTS_DATASET: "spiceai.tests.oss_benchmarks"

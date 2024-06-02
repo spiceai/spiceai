@@ -1,6 +1,6 @@
 use crate::results::BenchmarkResultsBuilder;
 use app::{App, AppBuilder};
-use runtime::Runtime;
+use runtime::{dataupdate::DataUpdate, Runtime};
 use spicepod::component::{
     dataset::{replication::Replication, Dataset, Mode},
     secrets::SpiceSecretStore,
@@ -11,10 +11,12 @@ use tracing_subscriber::EnvFilter;
 /// The number of times to run each query in the benchmark.
 const ITERATIONS: i32 = 5;
 
-pub(crate) async fn setup_benchmark(args: &super::Args) -> (BenchmarkResultsBuilder, Runtime) {
+pub(crate) async fn setup_benchmark(
+    upload_results_dataset: &Option<String>,
+) -> (BenchmarkResultsBuilder, Runtime) {
     init_tracing();
 
-    let app = build_app(args);
+    let app = build_app(upload_results_dataset);
 
     let rt = Runtime::new(Some(app), Arc::new(vec![])).await;
 
@@ -34,16 +36,16 @@ pub(crate) async fn setup_benchmark(args: &super::Args) -> (BenchmarkResultsBuil
 }
 
 pub(crate) async fn write_benchmark_results(
-    benchmark_results: BenchmarkResultsBuilder,
+    benchmark_results: DataUpdate,
     rt: &Runtime,
 ) -> Result<(), String> {
     rt.datafusion()
-        .write_data("oss_benchmarks".into(), benchmark_results.into())
+        .write_data("oss_benchmarks".into(), benchmark_results)
         .await
         .map_err(|e| e.to_string())
 }
 
-fn build_app(args: &super::Args) -> App {
+fn build_app(upload_results_dataset: &Option<String>) -> App {
     let mut app_builder = AppBuilder::new("runtime_benchmark_test")
         .with_secret_store(SpiceSecretStore::File)
         .with_dataset(make_spiceai_dataset("tpch.customer", "customer"))
@@ -55,7 +57,7 @@ fn build_app(args: &super::Args) -> App {
         .with_dataset(make_spiceai_dataset("tpch.region", "region"))
         .with_dataset(make_spiceai_dataset("tpch.supplier", "supplier"));
 
-    if let Some(upload_results_dataset) = &args.upload_results_dataset {
+    if let Some(upload_results_dataset) = upload_results_dataset {
         app_builder = app_builder.with_dataset(make_spiceai_rw_dataset(
             upload_results_dataset,
             "oss_benchmarks",
@@ -69,7 +71,7 @@ fn init_tracing() {
     let filter = match std::env::var("SPICED_LOG").ok() {
         Some(level) => EnvFilter::new(level),
         _ => EnvFilter::new(
-            "runtime=TRACE,datafusion-federation=TRACE,datafusion-federation-sql=TRACE",
+            "runtime=TRACE,datafusion-federation=TRACE,datafusion-federation-sql=TRACE,bench=TRACE",
         ),
     };
 
