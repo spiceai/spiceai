@@ -455,6 +455,7 @@ impl Runtime {
             &source,
             Arc::clone(&shared_secrets_provider),
             accelerated_table,
+            self.embeds.clone(),
         )
         .await
         {
@@ -640,6 +641,7 @@ impl Runtime {
         source: &str,
         secrets_provider: Arc<RwLock<secrets::SecretsProvider>>,
         accelerated_table: Option<AcceleratedTable>,
+        embed_models: Arc<RwLock<EmbeddingModelStore>>,
     ) -> Result<()> {
         let ds = ds.borrow();
 
@@ -665,7 +667,7 @@ impl Runtime {
                 df,
                 ds,
                 datafusion::Table::Federated(data_connector),
-                source,
+                source
             )
             .await;
         }
@@ -686,6 +688,7 @@ impl Runtime {
                 name: accelerator_engine.to_string(),
             })?;
 
+        // let wrap_data_connector = Arc::new(EmbeddingConnector::new(data_connector.clone(), embed_models.clone())) as Arc<dyn DataConnector>;
         Runtime::register_table(
             df,
             ds,
@@ -694,7 +697,7 @@ impl Runtime {
                 acceleration_secret,
                 accelerated_table,
             },
-            source,
+            source
         )
         .await
     }
@@ -703,7 +706,7 @@ impl Runtime {
         df: Arc<DataFusion>,
         ds: &Dataset,
         table: datafusion::Table,
-        source: &str,
+        source: &str
     ) -> Result<()> {
         df.register_table(ds, table)
             .await

@@ -140,9 +140,16 @@ impl TableProvider for EmbeddingTable {
         self.base_table.get_table_definition()
     }
 
-    fn get_logical_plan(&self) -> Option<&LogicalPlan> {
-        self.base_table.get_logical_plan()
-    }
+    // fn get_logical_plan(&self) -> Option<&LogicalPlan> {
+    //     let table_source = Arc::new(DefaultTableSource::new(Arc::clone(&table_provider)));
+    //     let logical_plan = LogicalPlanBuilder::scan(table_name.clone(), table_source, None)
+    //         .context(UnableToConstructLogicalPlanBuilderSnafu {})?
+    //         .build()
+    //         .context(UnableToBuildLogicalPlanSnafu {})?;
+
+    //     self.base_table.get_logical_plan()
+    // }
+
     fn get_column_default(&self, _column: &str) -> Option<&Expr> {
         self.base_table.get_column_default(_column)
     }
@@ -195,10 +202,6 @@ impl TableProvider for EmbeddingTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        println!(
-            "You are indeed in an embeddingtable for {}. Embedding columns are {:#?}.",
-            self.dataset_name, self.embedded_columns
-        );
         let columns_to_embed = self.columns_to_embed(projection);
         let num_base_cols = self.base_table.schema().fields.len();
 
@@ -250,21 +253,12 @@ impl TableProvider for EmbeddingTable {
             }
         };
 
-        println!(
-            "What im putting into the base table: {:#?}",
-            projection_for_base_table
-        );
-
         let projected_schema = project_schema(&self.schema(), projection)?;
         let base_plan = self
             .base_table
             .scan(state, projection_for_base_table.as_ref(), filters, limit)
             .await?;
 
-        println!(
-            "in scan. models: {:#?}",
-            self.embedding_models.read().await.keys().join(", ")
-        );
         Ok(Arc::new(EmbeddingTableExec::new(
             projected_schema,
             filters,

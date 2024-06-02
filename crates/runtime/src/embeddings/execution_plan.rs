@@ -15,9 +15,9 @@ limitations under the License.
 */
 
 use arrow::array::{
-    ArrayData, ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, StringArray,
+    ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, StringArray,
 };
-use arrow::datatypes::{DataType, Field, Float32Type, SchemaRef};
+use arrow::datatypes::{DataType, Field, SchemaRef};
 
 use arrow::error::ArrowError;
 use async_stream::stream;
@@ -29,7 +29,6 @@ use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, Pla
 use futures::stream::{Stream, StreamExt};
 use itertools::Itertools;
 use std::collections::HashMap;
-use std::hash::Hash;
 use std::{any::Any, sync::Arc};
 
 use llms::embeddings::{Embed, EmbeddingInput};
