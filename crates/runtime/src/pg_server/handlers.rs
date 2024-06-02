@@ -120,29 +120,14 @@ impl QueryParser for Parser {
 
         println!("parse_sql: {sql}");
 
-        let mut sql = sql.to_string();
+        let mut sql = sql.to_string().replace("::regclass", "");
+        sql = sql.replace("::regproc", "");
 
-        let transaction_keywords = ["BEGIN", "COMMIT", "ROLLBACK"];
-
-        // if sql.trim().is_empty() {
-        //     //let empty_schema = DFSchema::empty();
-        //     let empty_df = self.df.read().await.ctx
-        //         .read_empty().expect("should create empty dataframe");
-
-        //     let plan = empty_df.logical_plan();
-        //     return Ok(plan.clone());
-        // }
+        sql = sql.replace("n.nspname = ANY(current_schemas(true))", "true");        
 
         if sql.trim_start().to_uppercase().starts_with("BEGIN") {
             sql = "start transaction read only".to_string();
         }
-
-
-
-
-
-        // let context = self.session_context.lock().await;
-        // let state = context.state();
 
         let state = self.df.read().await.ctx.state();
 
@@ -154,7 +139,7 @@ impl QueryParser for Parser {
             .optimize(&logical_plan)
             .map_err(to_pg_wire_error)?;
 
-        println!("parse_sql: {sql} -> {:?}", optimised);
+        // println!("parse_sql: {sql} -> {:?}", optimised);
         Ok(optimised)
     }
 }
@@ -198,7 +183,7 @@ impl ExtendedQueryHandler for DfSessionService {
             }
         }
 
-        println!("done: {:?}", fields);
+        //println!("done: {:?}", fields);
 
         Ok(DescribeStatementResponse::new(param_types, fields))
     }
