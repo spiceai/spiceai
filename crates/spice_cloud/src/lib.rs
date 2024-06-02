@@ -290,7 +290,7 @@ impl Extension for SpiceExtension {
             return Ok(());
         }
 
-        let secret = self
+        let secret = selfP
             .get_spice_secret(runtime)
             .await
             .boxed()
