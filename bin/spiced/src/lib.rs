@@ -112,13 +112,13 @@ pub async fn run(args: Args) -> Result<()> {
 
     rt.load_secrets().await;
 
-    rt.load_datasets().await;
-
     if cfg!(feature = "models") {
         rt.load_models().await;
         rt.load_llms().await;
         rt.load_embeddings().await;
     }
+
+    rt.load_datasets().await;
 
     if let Err(err) = rt.init_query_history().await {
         tracing::warn!("Creating internal query history table: {err}");

@@ -47,6 +47,7 @@ pub struct EmbeddingTable {
 
     // A mapping of columns names from [`base_table`] to the embedding's `name` to use.
     embedded_columns: HashMap<String, String>,
+
     embedding_models: Arc<RwLock<HashMap<String, RwLock<Box<dyn Embed>>>>>,
 
     // Precompute to avoid async lock waits from `embedding_models` data structure.
@@ -64,6 +65,7 @@ impl EmbeddingTable {
         embedding_models: Arc<RwLock<HashMap<String, RwLock<Box<dyn Embed>>>>>,
     ) -> Self {
         let sizes = Self::precompute_embedding_sizes(&embedded_columns, &embedding_models).await;
+        println!("Sizes: {:#?}", sizes);
         let num_base_cols = base_table.schema().all_fields().len();
         Self {
             dataset_name,
@@ -79,17 +81,19 @@ impl EmbeddingTable {
         embedded_columns: &HashMap<String, String>,
         embedding_models: &Arc<RwLock<HashMap<String, RwLock<Box<dyn Embed>>>>>,
     ) -> HashMap<String, usize> {
-        let mut model_sizes: HashMap<&String, usize> = HashMap::new();
-        for model in embedded_columns.values().unique() {
+        println!("Precomputing embedding sizes for {:#?}", embedded_columns);
+
+        let mut model_sizes: HashMap<String, usize> = HashMap::new();
+        for (col, model) in embedded_columns.iter() {
             if let Some(model_lock) = embedding_models.read().await.get(model) {
-                model_sizes.insert(model, model_lock.read().await.size());
+                let z = model_lock.read().await.size();
+                model_sizes.insert(col.clone(), z);
+                println!("Model {} has size {}", model, z);
+            } else {
+                println!("Model {} not found for column {}", model, col);
             }
         }
-
-        HashMap::from_iter(embedded_columns.iter().map(|(col, model)| {
-            let z = model_sizes.get(model).unwrap_or(&(0 as usize));
-            (col.clone(), *z)
-        }))
+        model_sizes
     }
 
     /// For a given projection of the entire [`Schema`], find which [`Self::embedded_columns`] need to be computed.
@@ -250,12 +254,17 @@ impl TableProvider for EmbeddingTable {
             "What im putting into the base table: {:#?}",
             projection_for_base_table
         );
+
         let projected_schema = project_schema(&self.schema(), projection)?;
         let base_plan = self
             .base_table
             .scan(state, projection_for_base_table.as_ref(), filters, limit)
             .await?;
 
+        println!(
+            "in scan. models: {:#?}",
+            self.embedding_models.read().await.keys().join(", ")
+        );
         Ok(Arc::new(EmbeddingTableExec::new(
             projected_schema,
             filters,

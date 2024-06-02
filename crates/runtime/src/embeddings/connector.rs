@@ -32,8 +32,6 @@ use super::table::EmbeddingTable;
 pub struct EmbeddingConnector {
     inner_connector: Arc<dyn DataConnector>,
 
-    // A mapping of columns names from [`base_table`] to the embedding's `name` to use.
-    // embedded_columns: HashMap<String, String>,
     embedding_models: Arc<RwLock<HashMap<String, RwLock<Box<dyn Embed>>>>>,
 }
 
