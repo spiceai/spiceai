@@ -35,14 +35,14 @@ pub struct QueryBuilder {
 }
 
 impl QueryBuilder {
-    pub fn new(sql: String, df: Arc<DataFusion>) -> Self {
+    pub fn new(sql: String, df: Arc<DataFusion>, protocol: Protocol) -> Self {
         Self {
             df,
             sql,
             query_id: Uuid::new_v4(),
             nsql: None,
             restricted_sql_options: None,
-            protocol: Protocol::Http,
+            protocol,
         }
     }
 

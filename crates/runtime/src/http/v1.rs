@@ -65,7 +65,7 @@ pub async fn sql_to_http_response(
     restricted_sql_options: Option<SQLOptions>,
     nsql: Option<String>,
 ) -> Response {
-    let query = QueryBuilder::new(sql.to_string(), Arc::clone(&df))
+    let query = QueryBuilder::new(sql.to_string(), Arc::clone(&df), Protocol::Http)
         .restricted_sql_options(restricted_sql_options)
         .nsql(nsql)
         .protocol(Protocol::Http)
@@ -1060,7 +1060,10 @@ pub(crate) mod embed {
     use tokio::sync::RwLock;
 
     use crate::{
-        datafusion::{query::QueryBuilder, DataFusion},
+        datafusion::{
+            query::{Protocol, QueryBuilder},
+            DataFusion,
+        },
         EmbeddingModelStore,
     };
 
@@ -1103,7 +1106,7 @@ pub(crate) mod embed {
             .with_allow_dml(false)
             .with_allow_statements(false);
 
-        let query = QueryBuilder::new(sql, Arc::clone(&df))
+        let query = QueryBuilder::new(sql, Arc::clone(&df), Protocol::Http)
             .restricted_sql_options(Some(opt))
             .build();
 

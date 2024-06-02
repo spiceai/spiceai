@@ -179,7 +179,7 @@ impl Service {
             .with_allow_dml(false)
             .with_allow_statements(false);
 
-        let query = QueryBuilder::new(sql, Arc::clone(&datafusion))
+        let query = QueryBuilder::new(sql, Arc::clone(&datafusion), Protocol::Flight)
             .restricted_sql_options(Some(restricted_sql_options))
             .protocol(Protocol::Flight)
             .build();

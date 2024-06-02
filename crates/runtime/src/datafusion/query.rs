@@ -216,7 +216,6 @@ impl Query {
             self.execution_time = Some(duration.as_secs_f32());
         }
 
-
         let mut tags = vec![];
         match self.results_cache_hit {
             Some(true) => {
