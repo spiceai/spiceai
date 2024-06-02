@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 pub(crate) mod get_catalogs;
+pub(crate) mod get_primary_keys;
 pub(crate) mod get_schemas;
 pub(crate) mod get_sql_info;
 pub(crate) mod get_table_types;
