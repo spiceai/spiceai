@@ -23,7 +23,10 @@ use std::sync::Arc;
 use std::{collections::HashMap, future::Future};
 use url::Url;
 
-use super::{DataConnector, DataConnectorFactory, DataConnectorResult, InvalidConfigurationSnafu, ListingTableConnector};
+use super::{
+    DataConnector, DataConnectorFactory, DataConnectorResult, InvalidConfigurationSnafu,
+    ListingTableConnector,
+};
 
 pub struct File {
     params: Arc<HashMap<String, String>>,
@@ -40,9 +43,7 @@ impl DataConnectorFactory for File {
         _secret: Option<Secret>,
         params: Arc<HashMap<String, String>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
-        Box::pin(async move {
-            Ok(Arc::new(Self { params }) as Arc<dyn DataConnector>)
-        })
+        Box::pin(async move { Ok(Arc::new(Self { params }) as Arc<dyn DataConnector>) })
     }
 }
 
@@ -56,9 +57,11 @@ impl ListingTableConnector for File {
     }
 
     fn get_object_store_url(&self, dataset: &Dataset) -> DataConnectorResult<Url> {
-        Url::parse(&dataset.from).boxed().context(InvalidConfigurationSnafu{
-            dataconnector: "File".to_string(),
-            message: "Invalid URL".to_string(),
-        })
+        Url::parse(&dataset.from)
+            .boxed()
+            .context(InvalidConfigurationSnafu {
+                dataconnector: "File".to_string(),
+                message: "Invalid URL".to_string(),
+            })
     }
 }

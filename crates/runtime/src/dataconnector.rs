@@ -57,6 +57,7 @@ pub mod databricks;
 pub mod dremio;
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
+pub mod file;
 #[cfg(feature = "flightsql")]
 pub mod flightsql;
 #[cfg(feature = "ftp")]
@@ -74,7 +75,6 @@ pub mod sftp;
 #[cfg(feature = "spark")]
 pub mod spark;
 pub mod spiceai;
-pub mod file;
 
 #[cfg(feature = "snowflake")]
 pub mod snowflake;
@@ -229,7 +229,7 @@ pub async fn register_all() {
     register_connector_factory("databricks", databricks::Databricks::create).await;
     #[cfg(feature = "dremio")]
     register_connector_factory("dremio", dremio::Dremio::create).await;
-    register_connector_factory("file",file::File::create).await;
+    register_connector_factory("file", file::File::create).await;
     #[cfg(feature = "flightsql")]
     register_connector_factory("flightsql", flightsql::FlightSQL::create).await;
     register_connector_factory("s3", s3::S3::create).await;
