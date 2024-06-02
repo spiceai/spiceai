@@ -7,7 +7,7 @@
     jobs:
       build:
         name: Benchmark Tests
-        runs-on: ubuntu-latest-16-cores
+        runs-on: ubuntu-latest
         steps:
           - uses: actions/checkout@v4
     
