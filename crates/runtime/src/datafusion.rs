@@ -469,7 +469,6 @@ impl DataFusion {
         Ok(())
     }
 
-    // TODO (jeadie)
     pub async fn create_accelerated_table(
         &self,
         dataset: &Dataset,
@@ -493,8 +492,6 @@ impl DataFusion {
                 })?
                 .context(UnableToResolveTableProviderSnafu)?,
         };
-
-        // Is it that this schema does not have the embeddings?
 
         let source_schema = source_table_provider.schema();
         let acceleration_settings =
@@ -520,7 +517,6 @@ impl DataFusion {
                 .context(RefreshSqlSnafu)?;
         }
 
-        // This is what needs the changed schema too
         let mut accelerated_table_builder = AcceleratedTable::builder(
             dataset.name.clone(),
             source_table_provider,

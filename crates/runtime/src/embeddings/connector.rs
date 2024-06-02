@@ -62,9 +62,6 @@ impl EmbeddingConnector {
             .iter()
             .map(|e| (e.column.clone(), e.model.clone()))
             .collect::<HashMap<_, _>>();
-        // );
-
-        // map(|e| (e.column.clone(), e.model.clone())).collect::<HashMap<_, _>>();
 
         Ok(Arc::new(
             EmbeddingTable::new(

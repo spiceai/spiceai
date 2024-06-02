@@ -73,8 +73,6 @@ impl EmbeddingTable {
         embedded_columns: &HashMap<String, String>,
         embedding_models: &Arc<RwLock<EmbeddingModelStore>>,
     ) -> HashMap<String, i32> {
-        println!("Precomputing embedding sizes for {embedded_columns:#?}");
-
         let mut model_sizes: HashMap<String, i32> = HashMap::new();
         for (col, model) in embedded_columns {
             if let Some(model_lock) = embedding_models.read().await.get(model) {

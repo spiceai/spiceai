@@ -187,10 +187,6 @@ fn construct_record_batch(
             Some(embedded_col) => Some(embedded_col),
             None => batch.column_by_name(f.name()).cloned(),
         })
-        // .map(|&f| match embedding_cols.get(f.name()).cloned() {
-        //     Some(embedded_col) => Some(embedded_col),
-        //     None => batch.column_by_name(f.name()).cloned(),
-        // })
         .collect_vec();
     RecordBatch::try_new(Arc::clone(projected_schema), cols)
 }
@@ -227,7 +223,6 @@ async fn get_embeddings(
             continue;
         };
 
-        // .ok_or("Failed to downcast to StringArray".into())?
         let column: Vec<String> = arr
             .iter()
             .filter_map(|s| s.map(ToString::to_string))

@@ -417,10 +417,6 @@ impl Runtime {
             data_connector,
             Arc::clone(&self.embeds),
         )) as Arc<dyn DataConnector>)
-        // if cfg!(feature="models") {
-        // } else {
-        //     Ok(data_connector)
-        // }
     }
 
     pub async fn register_loaded_dataset(
@@ -686,7 +682,6 @@ impl Runtime {
                 name: accelerator_engine.to_string(),
             })?;
 
-        // let wrap_data_connector = Arc::new(EmbeddingConnector::new(data_connector.clone(), embed_models.clone())) as Arc<dyn DataConnector>;
         Runtime::register_table(
             df,
             ds,
