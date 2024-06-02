@@ -14,14 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{sync::Arc, time::SystemTime};
+use std::{collections::HashSet, sync::Arc, time::SystemTime};
 
 use datafusion::execution::context::SQLOptions;
+use tokio::time::Instant;
 use uuid::Uuid;
 
 use crate::datafusion::DataFusion;
 
-use super::Query;
+use super::{Protocol, Query};
 
 #[allow(clippy::module_name_repetitions)]
 pub struct QueryBuilder {
@@ -30,6 +31,7 @@ pub struct QueryBuilder {
     query_id: Uuid,
     nsql: Option<String>,
     restricted_sql_options: Option<SQLOptions>,
+    protocol: Protocol,
 }
 
 impl QueryBuilder {
@@ -40,6 +42,7 @@ impl QueryBuilder {
             query_id: Uuid::new_v4(),
             nsql: None,
             restricted_sql_options: None,
+            protocol: Protocol::Http,
         }
     }
 
@@ -62,6 +65,12 @@ impl QueryBuilder {
     }
 
     #[must_use]
+    pub fn protocol(mut self, protocol: Protocol) -> Self {
+        self.protocol = protocol;
+        self
+    }
+
+    #[must_use]
     pub fn build(self) -> Query {
         Query {
             df: self.df,
@@ -72,9 +81,13 @@ impl QueryBuilder {
             start_time: SystemTime::now(),
             end_time: None,
             execution_time: None,
-            rows_produced: None,
+            rows_produced: 0,
             results_cache_hit: None,
             restricted_sql_options: self.restricted_sql_options,
+            error_message: None,
+            datasets: Arc::new(HashSet::default()),
+            timer: Instant::now(),
+            protocol: self.protocol,
         }
     }
 }

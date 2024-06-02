@@ -16,7 +16,10 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use crate::{component::dataset::Dataset, datafusion::query::QueryBuilder};
+use crate::{
+    component::dataset::Dataset,
+    datafusion::query::{Protocol, QueryBuilder},
+};
 use arrow::array::RecordBatch;
 use axum::{
     http::{HeaderMap, StatusCode},
@@ -65,6 +68,7 @@ pub async fn sql_to_http_response(
     let query = QueryBuilder::new(sql.to_string(), Arc::clone(&df))
         .restricted_sql_options(restricted_sql_options)
         .nsql(nsql)
+        .protocol(Protocol::Http)
         .build();
 
     let (data, is_data_from_cache) = match query.run().await {

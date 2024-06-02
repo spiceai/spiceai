@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::datafusion::query::QueryBuilder;
+use crate::datafusion::query::{Protocol, QueryBuilder};
 use crate::datafusion::DataFusion;
 use crate::dataupdate::DataUpdate;
 use crate::measure_scope_ms;
@@ -181,6 +181,7 @@ impl Service {
 
         let query = QueryBuilder::new(sql, Arc::clone(&datafusion))
             .restricted_sql_options(Some(restricted_sql_options))
+            .protocol(Protocol::Flight)
             .build();
 
         let batches_stream = query.run().await.map_err(to_tonic_err)?;
