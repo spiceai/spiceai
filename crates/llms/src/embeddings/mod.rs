@@ -38,4 +38,7 @@ pub enum EmbeddingInput {
 #[async_trait]
 pub trait Embed: Sync + Send {
     async fn embed(&mut self, input: EmbeddingInput) -> Result<Vec<Vec<f32>>>;
+
+    /// Returns the size of the embedding vector returned by the model.
+    fn size(&self) -> i32;
 }

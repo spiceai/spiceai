@@ -43,6 +43,7 @@ mod actions;
 mod do_exchange;
 mod do_get;
 mod do_put;
+mod flight_utils;
 mod flightsql;
 mod get_flight_info;
 mod handshake;
@@ -173,7 +174,7 @@ impl Service {
     async fn sql_to_flight_stream(
         datafusion: Arc<DataFusion>,
         sql: String,
-    ) -> Result<BoxStream<'static, Result<FlightData, Status>>, Status> {
+    ) -> Result<(BoxStream<'static, Result<FlightData, Status>>, Option<bool>), Status> {
         let restricted_sql_options = SQLOptions::new()
             .with_allow_ddl(false)
             .with_allow_dml(false)
@@ -184,14 +185,14 @@ impl Service {
             .protocol(Protocol::Flight)
             .build();
 
-        let batches_stream = query.run().await.map_err(to_tonic_err)?;
+        let query_result = query.run().await.map_err(to_tonic_err)?;
 
-        let schema = batches_stream.data.schema();
+        let schema = query_result.data.schema();
         let options = datafusion::arrow::ipc::writer::IpcWriteOptions::default();
         let schema_as_ipc = SchemaAsIpc::new(&schema, &options);
         let schema_flight_data = FlightData::from(schema_as_ipc);
 
-        let batches_stream = batches_stream
+        let batches_stream = query_result
             .data
             .then(move |batch_result| {
                 let options_clone = options.clone();
@@ -225,7 +226,7 @@ impl Service {
 
         let flights_stream = stream::once(async { Ok(schema_flight_data) }).chain(batches_stream);
 
-        Ok(flights_stream.boxed())
+        Ok((flights_stream.boxed(), query_result.from_cache))
     }
 }
 

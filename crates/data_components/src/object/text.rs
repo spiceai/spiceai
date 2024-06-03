@@ -245,7 +245,11 @@ pub(crate) fn to_sendable_stream(
                     let bytz = result.bytes().await?;
 
                     match ObjectStoreTextTable::to_record_batch(&[object_meta], &[bytz]) {
-                        Ok(batch) => {yield Ok(batch); count += 1;},
+                        Ok(batch) => {
+                            let n = batch.num_rows();
+                            yield Ok(batch);
+                            count += n;
+                        },
                         Err(e) => yield Err(DataFusionError::Execution(format!("{e}"))),
                     }
                 },
