@@ -31,7 +31,7 @@ use db_connection_pool::{
 };
 use rusqlite::{ToSql, Transaction};
 use snafu::prelude::*;
-use sql_provider_datafusion::SqlTable;
+use sql_provider_datafusion::{expr::Engine, SqlTable};
 use std::sync::Arc;
 use tokio_rusqlite::Connection;
 
@@ -158,6 +158,7 @@ impl TableProviderFactory for SqliteTableFactory {
             &dyn_pool,
             Arc::clone(&schema),
             TableReference::bare(name.clone()),
+            Some(Engine::SQLite),
         ));
 
         let sqlite = Arc::into_inner(sqlite)
