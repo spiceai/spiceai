@@ -57,7 +57,9 @@ impl ListingTableConnector for File {
     }
 
     fn get_object_store_url(&self, dataset: &Dataset) -> DataConnectorResult<Url> {
-        Url::parse(&dataset.from)
+        let clean_from = dataset.from.replace("file://", "file:/");
+
+        Url::parse(&clean_from)
             .boxed()
             .context(InvalidConfigurationSnafu {
                 dataconnector: "File".to_string(),

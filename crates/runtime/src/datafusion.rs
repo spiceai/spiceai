@@ -40,6 +40,7 @@ use datafusion::sql::parser::DFParser;
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::{sqlparser, TableReference};
 use datafusion_federation::{FederatedQueryPlanner, FederationAnalyzerRule};
+use query::{Protocol, QueryBuilder};
 use secrets::Secret;
 use snafu::prelude::*;
 use tokio::spawn;
@@ -182,7 +183,7 @@ pub enum Table {
 pub struct DataFusion {
     pub ctx: Arc<SessionContext>,
     data_writers: RwLock<HashSet<TableReference>>,
-    pub cache_provider: Option<Arc<QueryResultsCacheProvider>>,
+    pub cache_provider: RwLock<Option<Arc<QueryResultsCacheProvider>>>,
 }
 
 impl DataFusion {
@@ -246,7 +247,7 @@ impl DataFusion {
         DataFusion {
             ctx: Arc::new(ctx),
             data_writers: RwLock::new(HashSet::new()),
-            cache_provider,
+            cache_provider: RwLock::new(cache_provider),
         }
     }
 
@@ -266,6 +267,12 @@ impl DataFusion {
         }
 
         None
+    }
+
+    pub fn set_cache_provider(&self, cache_provider: QueryResultsCacheProvider) {
+        if let Ok(mut a) = self.cache_provider.write() {
+            *a = Some(Arc::new(cache_provider));
+        };
     }
 
     pub async fn has_table(&self, table_reference: &TableReference) -> bool {
@@ -540,9 +547,17 @@ impl DataFusion {
 
         accelerated_table_builder.zero_results_action(acceleration_settings.on_zero_results);
 
-        accelerated_table_builder.cache_provider(self.cache_provider.clone());
+        accelerated_table_builder.cache_provider(self.cache_provider());
 
         Ok(accelerated_table_builder.build().await)
+    }
+
+    pub fn cache_provider(&self) -> Option<Arc<QueryResultsCacheProvider>> {
+        let Ok(provider) = self.cache_provider.read() else {
+            return None;
+        };
+
+        provider.clone()
     }
 
     async fn register_accelerated_table(
@@ -776,6 +791,10 @@ impl DataFusion {
                 schema: SPICE_DEFAULT_SCHEMA.to_string(),
             })?
             .table_names())
+    }
+
+    pub fn query_builder(self: &Arc<Self>, sql: String, protocol: Protocol) -> QueryBuilder {
+        QueryBuilder::new(sql, Arc::clone(self), protocol)
     }
 }
 
