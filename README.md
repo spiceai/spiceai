@@ -86,6 +86,8 @@ Currently supported data connectors for upstream datasets. More coming soon.
 | `snowflake`   | Snowflake                                                                                      | Alpha  | Arrow                                                                                              | `full`           |
 | `ftp`, `sftp` | FTP/SFTP                                                                                       | Alpha  | Parquet, CSV                                                                                       | `full`           |
 | `graphql`     | GraphQL                                                                                        | Alpha  | GraphQL                                                                                            | `full`           |
+| `motherduck`  | [MotherDuck](https://motherduck.com/)                                                   | Alpha  |                                                                                                    | `full`           |
+
 
 ### Supported Data Stores/Accelerators
 
