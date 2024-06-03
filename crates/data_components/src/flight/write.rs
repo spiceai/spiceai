@@ -35,7 +35,7 @@ use std::{any::Any, fmt, sync::Arc};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Unable to publish data to Flight endpoint"))]
+    #[snafu(display("Unable to publish data to Flight endpoint: {source}"))]
     UnableToPublishData { source: flight_client::Error },
 }
 
