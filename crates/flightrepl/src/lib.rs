@@ -92,7 +92,7 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
         .await
         .map_err(|_err| {
             Box::<dyn Error>::from(format!(
-                "Unable to connect to Spice runtime on {spice_endpoint}. Is it running?"
+                "Unable to connect to spiced at {spice_endpoint}. Is it running?"
             ))
         })?;
 
