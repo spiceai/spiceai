@@ -47,7 +47,7 @@ impl DataConnectorFactory for MotherDuck {
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let motherduck_token =
-                get_secret_or_param(&params, &secret, "motherduck_token", "motherduck_token_key")
+                get_secret_or_param(&params, &secret, "motherduck_token_key", "motherduck_token")
                     .ok_or(DataConnectorError::InvalidConfiguration {
                     dataconnector: "motherduck".to_string(),
                     message: "Missing required parameter motherduck_token.".to_string(),
