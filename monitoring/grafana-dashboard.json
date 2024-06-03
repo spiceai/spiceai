@@ -528,7 +528,7 @@
             "uid": "prometheus"
           },
           "editorMode": "code",
-          "expr": "sum by (datasets, quantile) (query_duration_seconds{quantile=~\"${quantile}\",pod=~\"${pods}\",datasets!~\"runtime.*\"})",
+          "expr": "sum by (datasets, quantile) (query_duration_seconds{quantile=~\"${quantile}\",pod=~\"${pods}\",datasets!~\"runtime.*\"}) > 0",
           "instant": false,
           "legendFormat": "{{datasets}}(P{{quantile}})",
           "range": true,
