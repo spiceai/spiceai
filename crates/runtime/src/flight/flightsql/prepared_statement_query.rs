@@ -25,7 +25,7 @@ use prost::Message;
 use tonic::{Request, Response, Status};
 
 use crate::{
-    flight::{to_tonic_err, Service},
+    flight::{flight_utils::attach_cache_metadata, to_tonic_err, Service},
     timing::{TimeMeasurement, TimedStream},
 };
 
@@ -96,12 +96,14 @@ pub(crate) async fn do_get(
         Ok(sql) => {
             let start =
                 TimeMeasurement::new("flight_do_get_prepared_statement_query_duration_ms", vec![]);
-            let output =
+            let (output, from_cache) =
                 Box::pin(Service::sql_to_flight_stream(datafusion, sql.to_owned())).await?;
             let timed_output = TimedStream::new(output, move || start);
-            Ok(Response::new(
-                Box::pin(timed_output) as <Service as FlightService>::DoGetStream
-            ))
+
+            let mut response =
+                Response::new(Box::pin(timed_output) as <Service as FlightService>::DoGetStream);
+            attach_cache_metadata(&mut response, from_cache);
+            Ok(response)
         }
         Err(e) => Err(Status::invalid_argument(format!(
             "Invalid prepared statement handle: {e}"

@@ -62,6 +62,7 @@ pub mod file;
 pub mod flightsql;
 #[cfg(feature = "ftp")]
 pub mod ftp;
+pub mod graphql;
 pub mod localhost;
 #[cfg(feature = "duckdb")]
 pub mod motherduck;
@@ -163,6 +164,12 @@ pub enum DataConnectorError {
         table_name: String,
     },
 
+    #[snafu(display("Unable to handle request for {dataconnector}: {source}"))]
+    UnableToHandleRequest {
+        dataconnector: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
     #[snafu(display(
         "An internal error occurred in the {dataconnector} Data Connector. Report a bug on GitHub (github.com/spiceai/spiceai) and reference the code: {code}"
     ))]
@@ -250,6 +257,7 @@ pub async fn register_all() {
     register_connector_factory("motherduck", motherduck::MotherDuck::create).await;
     #[cfg(feature = "clickhouse")]
     register_connector_factory("clickhouse", clickhouse::Clickhouse::create).await;
+    register_connector_factory("graphql", graphql::GraphQL::create).await;
     #[cfg(feature = "odbc")]
     register_connector_factory("odbc", odbc::ODBC::create).await;
     #[cfg(feature = "spark")]
