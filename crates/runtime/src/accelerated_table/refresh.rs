@@ -153,7 +153,8 @@ impl Refresher {
                                 }
                             }
                         }
-                        self.notify_refresh_done(&mut ready_sender, status::ComponentStatus::Ready);
+                        self.notify_refresh_done(&mut ready_sender, status::ComponentStatus::Ready)
+                            .await;
                         continue;
                     };
 
@@ -170,7 +171,8 @@ impl Refresher {
                         Ok(plan) => {
                             if let Err(e) = collect(plan, ctx.task_ctx()).await {
                                 tracing::error!("Error adding data for {dataset_name}: {e}");
-                                self.mark_dataset_status(status::ComponentStatus::Error);
+                                self.mark_dataset_status(status::ComponentStatus::Error)
+                                    .await;
                             } else {
                                 if let Some(start_time) = start_time {
                                     let num_rows = data_update
@@ -210,11 +212,13 @@ impl Refresher {
                                 self.notify_refresh_done(
                                     &mut ready_sender,
                                     status::ComponentStatus::Ready,
-                                );
+                                )
+                                .await;
                             };
                         }
                         Err(e) => {
-                            self.mark_dataset_status(status::ComponentStatus::Error);
+                            self.mark_dataset_status(status::ComponentStatus::Error)
+                                .await;
                             tracing::error!("Error adding data for {dataset_name}: {e}");
                         }
                     }
@@ -535,7 +539,7 @@ impl Refresher {
         TimestampFilterConvert::create(field, refresh.time_column.clone(), refresh.time_format)
     }
 
-    fn notify_refresh_done(
+    async fn notify_refresh_done(
         &self,
         ready_sender: &mut Option<oneshot::Sender<()>>,
         status: status::ComponentStatus,
@@ -543,11 +547,30 @@ impl Refresher {
         if let Some(sender) = ready_sender.take() {
             sender.send(()).ok();
         };
-        self.mark_dataset_status(status);
+        self.mark_dataset_status(status).await;
     }
 
-    fn mark_dataset_status(&self, status: status::ComponentStatus) {
+    async fn mark_dataset_status(&self, status: status::ComponentStatus) {
         status::update_dataset(&self.dataset_name, status);
+
+        let mut labels = vec![("dataset", self.dataset_name.to_string())];
+        if let Some(sql) = &self.refresh.read().await.sql {
+            labels.push(("sql", sql.to_string()));
+        };
+
+        match status {
+            status::ComponentStatus::Ready => {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default();
+                metrics::gauge!("datasets_acceleration_last_refresh_time", &labels)
+                    .set(now.as_secs_f64());
+            }
+            status::ComponentStatus::Error => {
+                metrics::counter!("datasets_acceleration_refresh_errors", &labels).increment(1);
+            }
+            _ => (),
+        }
     }
 }
 
