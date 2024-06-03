@@ -305,23 +305,8 @@ jobs:
           working-directory: test_app
           run: |
             echo -e "test_graphql_table\nrepos\ngraphql:https://api.github.com/graphql\ny" | spice dataset configure
-            # configure mysql credentials
-            echo -e "params:\n  auth_token_key: token\n  json_path: data.viewer.repositories.nodes\n  query: |
-            {
-              viewer {
-                repositories(first: 100) {
-                  nodes {
-                    id
-                    name
-                    watchers (first: 10) {
-                      nodes {
-                        name
-                      }
-                    }
-                  }
-                }
-              }
-            }" >> ./datasets/test_graphql_table/dataset.yaml
+            # configure graphql credentials
+            echo -e "params:\n  auth_token_key: token\n  json_path: data.viewer.repositories.nodes\n  query: \"{ viewer { repositories(first: 100) { nodes { id name watchers (first: 10) { nodes { name } } } } } }\"" >> ./datasets/test_graphql_table/dataset.yaml
             # configure env secret store
             echo -e "secrets:\n  store: env\n" >> spicepod.yaml
             cat spicepod.yaml
