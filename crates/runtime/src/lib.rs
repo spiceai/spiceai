@@ -648,13 +648,13 @@ impl Runtime {
         let replicate = ds.replication.as_ref().map_or(false, |r| r.enabled);
 
         // Only wrap data connector when necessary.
-        let connector = if !ds.embeddings.is_empty() {
+        let connector = if ds.embeddings.is_empty() {
+            data_connector
+        } else {
             Arc::new(EmbeddingConnector::new(
                 data_connector,
                 Arc::clone(&embedding),
             )) as Arc<dyn DataConnector>
-        } else {
-            data_connector
         };
 
         // FEDERATED TABLE

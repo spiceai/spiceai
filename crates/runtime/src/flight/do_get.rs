@@ -24,7 +24,10 @@ use arrow_flight::{
 use prost::Message;
 use tonic::{Request, Response, Status};
 
-use crate::timing::{TimeMeasurement, TimedStream};
+use crate::{
+    flight::flight_utils::attach_cache_metadata,
+    timing::{TimeMeasurement, TimedStream},
+};
 
 use super::{flightsql, to_tonic_err, Service};
 
@@ -75,14 +78,17 @@ async fn do_get_simple(
     match std::str::from_utf8(&ticket.ticket) {
         Ok(sql) => {
             let start = TimeMeasurement::new("flight_do_get_simple_duration_ms", vec![]);
-            let output =
+            let (output, from_cache) =
                 Box::pin(Service::sql_to_flight_stream(datafusion, sql.to_owned())).await?;
 
             let timed_output = TimedStream::new(output, move || start);
 
-            Ok(Response::new(
-                Box::pin(timed_output) as <Service as FlightService>::DoGetStream
-            ))
+            let mut response =
+                Response::new(Box::pin(timed_output) as <Service as FlightService>::DoGetStream);
+
+            attach_cache_metadata(&mut response, from_cache);
+
+            Ok(response)
         }
         Err(e) => Err(Status::invalid_argument(format!("Invalid ticket: {e}"))),
     }

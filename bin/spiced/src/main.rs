@@ -59,7 +59,7 @@ fn main() {
 
     if args.repl {
         if let Err(e) = tokio_runtime.block_on(flightrepl::run(args.repl_config)) {
-            tracing::error!("Flight REPL error: {e}");
+            tracing::error!("SQL REPL Error: {e}");
         };
         return;
     }
