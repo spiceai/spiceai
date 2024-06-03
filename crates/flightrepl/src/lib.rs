@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use std::sync::Arc;
+use std::error::Error;
 use std::time::Instant;
 
 use ansi_term::Colour;
@@ -85,9 +86,16 @@ async fn send_nsql_request(
 #[allow(clippy::missing_errors_doc)]
 pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Error>> {
     // Set up the Flight client
+    let spice_endpoint = repl_config.http_endpoint.clone();
     let channel = Channel::from_shared(repl_config.repl_flight_endpoint)?
         .connect()
-        .await?;
+        .await
+        .map_err(|_err| {
+            Box::<dyn Error>::from(format!(
+                "Unable to connect to Spice runtime on {}. Is it running?",
+                spice_endpoint
+            ))
+        })?;
 
     // The encoder/decoder size is limited to 500MB.
     let client = FlightServiceClient::new(channel)
