@@ -66,6 +66,8 @@ pub enum Error {
     InvalidObjectAccess { message: String },
 }
 
+pub type Result<T, E = Error> = std::result::Result<T, E>;
+
 pub struct GraphQL {
     secret: Option<Secret>,
     params: Arc<HashMap<String, String>>,
@@ -97,7 +99,7 @@ struct GraphQLClient {
 }
 
 impl GraphQLClient {
-    async fn execute(&self) -> datafusion::error::Result<(Vec<Vec<RecordBatch>>, SchemaRef)> {
+    async fn execute(&self) -> Result<(Vec<Vec<RecordBatch>>, SchemaRef)> {
         let body = format!(r#"{{"query": "{}"}}"#, self.query.lines().join(" "));
         let mut request = self.client.post(self.endpoint.clone()).body(body);
 
@@ -111,11 +113,7 @@ impl GraphQLClient {
             _ => {}
         }
 
-        let response = request
-            .send()
-            .await
-            .context(UnableToHandleRequestSnafu)
-            .map_err(to_execution_error)?;
+        let response = request.send().await.context(UnableToHandleRequestSnafu)?;
 
         if !response.status().is_success() {
             return Err(Error::FailedToRequestData {
@@ -124,15 +122,11 @@ impl GraphQLClient {
                     .await
                     .map(|v| serde_json::to_string_pretty(&v).unwrap_or_default())
                     .unwrap_or_default(),
-            })
-            .map_err(to_execution_error);
+            });
         }
 
-        let mut response: serde_json::Value = response
-            .json()
-            .await
-            .context(UnableToParseResponseSnafu)
-            .map_err(to_execution_error)?;
+        let mut response: serde_json::Value =
+            response.json().await.context(UnableToParseResponseSnafu)?;
 
         for key in self.json_path.split('.') {
             response = response[key].clone();
@@ -147,14 +141,11 @@ impl GraphQLClient {
             _ => Err(Error::InvalidObjectAccess {
                 message: "Found primitive value".to_string(),
             }),
-        };
-
-        let unwrapped = unwrapped.map_err(to_execution_error)?;
+        }?;
 
         let schema = Arc::new(
-            infer_json_schema_from_iterator(unwrapped.clone().into_iter().map(Result::Ok))
-                .context(UnableToInferSchemaSnafu)
-                .map_err(to_execution_error)?,
+            infer_json_schema_from_iterator(unwrapped.iter().map(Result::Ok))
+                .context(UnableToInferSchemaSnafu)?,
         );
 
         let mut res = vec![];
@@ -163,11 +154,9 @@ impl GraphQLClient {
             let batch = ReaderBuilder::new(Arc::clone(&schema))
                 .with_batch_size(1024)
                 .build(Cursor::new(buf.as_bytes()))
-                .context(UnableToReadBatchSnafu)
-                .map_err(to_execution_error)?
+                .context(UnableToReadBatchSnafu)?
                 .collect::<Result<Vec<_>, _>>()
-                .context(UnableToCollectBatchSnafu)
-                .map_err(to_execution_error)?;
+                .context(UnableToCollectBatchSnafu)?;
             res.push(batch);
         }
 
@@ -275,7 +264,7 @@ impl TableProvider for GraphQLTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        let (res, schema) = self.client.execute().await?;
+        let (res, schema) = self.client.execute().await.map_err(to_execution_error)?;
         let table = MemTable::try_new(schema, res)?;
 
         table.scan(state, projection, filters, limit).await
