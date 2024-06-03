@@ -116,6 +116,7 @@ pub async fn run(args: Args) -> Result<()> {
 
     // mutable reference
     rt.with_pods_watcher(pods_watcher);
+
     if let Err(err) = rt
         .start_metrics(args.metrics)
         .await
@@ -130,6 +131,9 @@ pub async fn run(args: Args) -> Result<()> {
 
     rt.load_secrets().await;
 
+    #[cfg(feature = "models")]
+    rt.load_embeddings().await; // Must be loaded before datasets
+
     let mut futures: Vec<Pin<Box<dyn Future<Output = ()>>>> = vec![
         Box::pin(async {
             if let Err(err) = rt.init_query_history().await {
@@ -142,11 +146,8 @@ pub async fn run(args: Args) -> Result<()> {
     ];
 
     if cfg!(feature = "models") {
-        let mut v: Vec<Pin<Box<dyn Future<Output = ()>>>> = vec![
-            Box::pin(rt.load_models()),
-            Box::pin(rt.load_llms()),
-            Box::pin(rt.load_embeddings()),
-        ];
+        let mut v: Vec<Pin<Box<dyn Future<Output = ()>>>> =
+            vec![Box::pin(rt.load_models()), Box::pin(rt.load_llms())];
 
         futures.append(&mut v);
     }

@@ -16,7 +16,9 @@ limitations under the License.
 
 use datafusion::sql::TableReference;
 use snafu::prelude::*;
-use spicepod::component::{dataset as spicepod_dataset, params::Params};
+use spicepod::component::{
+    dataset as spicepod_dataset, embeddings::ColumnEmbeddingConfig, params::Params,
+};
 use std::{collections::HashMap, fs, time::Duration};
 
 #[derive(Debug, Snafu)]
@@ -85,6 +87,7 @@ pub struct Dataset {
     pub time_column: Option<String>,
     pub time_format: Option<TimeFormat>,
     pub acceleration: Option<acceleration::Acceleration>,
+    pub embeddings: Vec<ColumnEmbeddingConfig>,
 }
 
 impl TryFrom<spicepod_dataset::Dataset> for Dataset {
@@ -115,6 +118,7 @@ impl TryFrom<spicepod_dataset::Dataset> for Dataset {
             replication: dataset.replication.map(replication::Replication::from),
             time_column: dataset.time_column,
             time_format: dataset.time_format.map(TimeFormat::from),
+            embeddings: dataset.embeddings,
             acceleration,
         })
     }
@@ -134,6 +138,7 @@ impl Dataset {
             time_column: None,
             time_format: None,
             acceleration: None,
+            embeddings: Vec::default(),
         })
     }
 

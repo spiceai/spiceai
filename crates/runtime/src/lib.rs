@@ -37,6 +37,7 @@ use component::dataset::{self, Dataset};
 use config::Config;
 use datafusion::query::query_history;
 use datafusion::SPICE_RUNTIME_SCHEMA;
+use embeddings::connector::EmbeddingConnector;
 use futures::future::join_all;
 use futures::StreamExt;
 use llms::embeddings::Embed;
@@ -62,6 +63,7 @@ pub mod dataaccelerator;
 pub mod dataconnector;
 pub mod datafusion;
 pub mod dataupdate;
+pub mod embeddings;
 pub mod execution_plan;
 pub mod extension;
 mod flight;
@@ -410,6 +412,11 @@ impl Runtime {
         };
 
         Ok(data_connector)
+
+        // Ok(Arc::new(EmbeddingConnector::new(
+        //     data_connector,
+        //     Arc::clone(&self.embeds),
+        // )) as Arc<dyn DataConnector>)
     }
 
     pub async fn register_loaded_dataset(
@@ -444,6 +451,7 @@ impl Runtime {
             &source,
             Arc::clone(&shared_secrets_provider),
             accelerated_table,
+            Arc::clone(&self.embeds),
         )
         .await
         {
@@ -629,6 +637,7 @@ impl Runtime {
         source: &str,
         secrets_provider: Arc<RwLock<secrets::SecretsProvider>>,
         accelerated_table: Option<AcceleratedTable>,
+        embedding: Arc<RwLock<EmbeddingModelStore>>,
     ) -> Result<()> {
         let ds = ds.borrow();
 
@@ -643,6 +652,16 @@ impl Runtime {
 
         let replicate = ds.replication.as_ref().map_or(false, |r| r.enabled);
 
+        // Only wrap data connector when necessary.
+        let connector = if ds.embeddings.is_empty() {
+            Arc::new(EmbeddingConnector::new(
+                data_connector,
+                Arc::clone(&embedding),
+            )) as Arc<dyn DataConnector>
+        } else {
+            data_connector
+        };
+
         // FEDERATED TABLE
         if !ds.is_accelerated() {
             if ds.mode() == dataset::Mode::ReadWrite && !replicate {
@@ -653,7 +672,7 @@ impl Runtime {
             return Runtime::register_table(
                 df,
                 ds,
-                datafusion::Table::Federated(data_connector),
+                datafusion::Table::Federated(connector),
                 source,
             )
             .await;
@@ -679,7 +698,7 @@ impl Runtime {
             df,
             ds,
             datafusion::Table::Accelerated {
-                source: data_connector,
+                source: connector,
                 acceleration_secret,
                 accelerated_table,
             },
