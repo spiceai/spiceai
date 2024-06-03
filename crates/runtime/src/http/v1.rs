@@ -1171,3 +1171,155 @@ pub(crate) mod embed {
         }
     }
 }
+
+pub(crate) mod assist {
+    use axum::{
+        http::StatusCode,
+        response::{IntoResponse, Response},
+        Extension, Json,
+    };
+    use datafusion::sql::TableReference;
+
+    use itertools::Itertools;
+    use serde::{Deserialize, Serialize};
+    use std::{collections::HashMap, sync::Arc};
+    use tokio::sync::RwLock;
+
+    use crate::{datafusion::DataFusion, EmbeddingModelStore, LLMModelStore};
+
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    pub struct Request {
+        pub text: String,
+
+        /// The model to use for chat completion. The embedding model is determined via the data source (that has the associated embeddings).
+        #[serde(rename = "use", default = "default_model")]
+        pub model: String,
+
+        /// Which datasources in the [`DataFusion`] instance to retrieve data from.
+        #[serde(rename = "from", default)]
+        pub data_source: Vec<String>,
+    }
+
+    fn default_model() -> String {
+        "embed".to_string()
+    }
+
+    async fn create_input_embeddings(
+        input: String,
+        embeddings_to_run: Vec<String>,
+        embeddings: Arc<RwLock<EmbeddingModelStore>>,
+    ) -> Result<HashMap<String, Vec<f32>>, Box<dyn std::error::Error>> {
+        let mut embedded_inputs: HashMap<String, Vec<f32>> = HashMap::new();
+        for (name, model) in embeddings
+            .read()
+            .await
+            .iter()
+            .filter(|(model_name, _)| embeddings_to_run.contains(model_name))
+        {
+            match model
+                .write()
+                .await
+                .embed(llms::embeddings::EmbeddingInput::String(input.clone()))
+                .await
+            {
+                Ok(embedding) => match embedding.first() {
+                    Some(embedding) => {
+                        embedded_inputs.insert(name.clone(), embedding.clone());
+                    }
+                    None => {
+                        return Err(
+                            format!("No embeddings returned for input text from {name}").into()
+                        )
+                    }
+                },
+                Err(e) => return Err(Box::new(e)),
+            }
+        }
+        Ok(embedded_inputs)
+    }
+
+    fn combined_relevant_data_and_input(
+        relevant_data: HashMap<TableReference, Vec<String>>,
+        input: String,
+    ) -> String {
+        let data = relevant_data.values().map(|v| v.join("\n")).join("\n");
+        format!("{}\n{}", data, input)
+    }
+
+    /// Assist runs a question or statement through an LLM with additional context retrieved from data within the [`DataFusion`] instance.
+    /// Logic:
+    /// 1. If user did not provide which/what data source to use, figure this out (?).
+    /// 2. Get embedding provider for each data source.
+    /// 2. Create embedding(s) of question/statement
+    /// 3. Retrieve relevant data from the data source.
+    /// 4. Run [relevant data;  question/statement] through LLM.
+    /// 5. Return response.
+    pub(crate) async fn post(
+        Extension(df): Extension<Arc<DataFusion>>,
+        Extension(embeddings): Extension<Arc<RwLock<EmbeddingModelStore>>>,
+        Extension(llms): Extension<Arc<RwLock<LLMModelStore>>>,
+        Json(payload): Json<Request>,
+    ) -> Response {
+        // For now, force the user to specify which data.
+        if payload.data_source.is_empty() {
+            return (StatusCode::BAD_REQUEST, "No data sources provided").into_response();
+        }
+
+        // Determine which embedding models need to be run. If a table does not have an embedded column, return an error.
+        // TODO:
+        let mut embeddings_to_run = Vec::new();
+        for data_source in &payload.data_source {
+            match df.get_table(TableReference::from(data_source)).await {
+                None => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        format!("Data source {data_source} does not exist"),
+                    )
+                        .into_response()
+                }
+                Some(table) => {
+                    println!("I have a table: {:#?}", table.schema());
+                    // let x = table.as_any().downcast_ref::<EmbeddingTable>();
+                }
+            }
+        }
+
+        // `embedded_inputs` model_name -> embedding.
+        let embedded_inputs = match create_input_embeddings(
+            payload.text.clone(),
+            embeddings_to_run,
+            Arc::clone(&embeddings),
+        )
+        .await
+        {
+            Ok(embedded_inputs) => embedded_inputs,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        };
+
+        // TODO: vector search from data sources.
+        let mut relevant_data: HashMap<TableReference, Vec<String>> = HashMap::new();
+
+        let model_input = combined_relevant_data_and_input(relevant_data, payload.text.clone());
+
+        match llms.read().await.get(&payload.model) {
+            Some(llm_model) => {
+                // TODO: We need to either 1. Separate LLMs from NQL, or create a LLM trait separately.
+                match llm_model.write().await.run(model_input).await {
+                    Ok(Some(assist)) => (StatusCode::OK, Json(assist)).into_response(),
+                    Ok(None) => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("No response from LLM {}", payload.model),
+                    )
+                        .into_response(),
+                    Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+                }
+            }
+            None => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Model {} not found", payload.model),
+            )
+                .into_response(),
+        }
+    }
+}
