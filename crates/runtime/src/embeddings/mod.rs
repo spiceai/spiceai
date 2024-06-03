@@ -16,3 +16,4 @@ limitations under the License.
 pub mod connector;
 pub mod execution_plan;
 pub mod table;
+pub mod array_distance;
