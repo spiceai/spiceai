@@ -22,6 +22,7 @@ use async_stream::stream;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::Expr;
+use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::stream::{Stream, StreamExt};
@@ -131,11 +132,21 @@ impl EmbeddingTableExec {
             projected_schema: Arc::clone(projected_schema),
             filters: filters.to_vec(),
             limit,
-            properties: base_plan.properties().clone(),
+            properties: Self::compute_properties(&base_plan, projected_schema),
             base_plan,
             embedded_columns,
             embedding_models,
         }
+    }
+
+    fn compute_properties(
+        base_plan: &Arc<dyn ExecutionPlan>,
+        projected_schema: &SchemaRef,
+    ) -> PlanProperties {
+        let eq_properties = EquivalenceProperties::new(Arc::clone(projected_schema));
+        let partitioning = base_plan.properties().partitioning.clone();
+        let execution_mode = base_plan.properties().execution_mode();
+        PlanProperties::new(eq_properties, partitioning, execution_mode)
     }
 }
 
