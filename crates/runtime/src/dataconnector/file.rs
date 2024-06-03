@@ -68,31 +68,3 @@ impl ListingTableConnector for File {
             })
     }
 }
-
-impl File {
-    pub fn url_from_dataset(dataset: &Dataset) -> Result<Url, ()> {
-        let from  = dataset.from.to_string();
-        let local_path = path::Path::new(&from);
-        println!("local_path: {:?}", local_path);
-        Url::from_file_path(local_path)
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use crate::component::dataset::Dataset;
-    use url::Url;
-    
-    #[test]
-    pub fn test_file() {
-        println!("1: {:?}", super::File::url_from_dataset(&Dataset::try_new("/Users/jeadie/Github/jalaipeno/data_Q2_2023.parquet".to_string(), "test").unwrap()).unwrap());
-        println!("4: {:?}", super::File::url_from_dataset(&Dataset::try_new("Github/jalaipeno/data_Q2_2023.parquet".to_string(), "test").unwrap()).unwrap());
-        // println!("1: {:?}", super::File::url_from_dataset(&Dataset::try_new("".to_string(), "test").unwrap()).unwrap());
-        // println!("1: {:?}", super::File::url_from_dataset(&Dataset::try_new("".to_string(), "test").unwrap()).unwrap());
-        // println!("1: {:?}", super::File::url_from_dataset(&Dataset::try_new("".to_string(), "test").unwrap()).unwrap());
-
-    
-
-        assert!(false);
-    }
-}
