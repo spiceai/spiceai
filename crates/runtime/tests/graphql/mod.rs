@@ -24,20 +24,26 @@ use async_graphql::{EmptyMutation, EmptySubscription, SimpleObject};
 use async_graphql::{Object, Schema};
 use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
 use axum::{routing::post, Extension, Router};
+use runtime::Runtime;
 use spicepod::component::{dataset::Dataset, params::Params as DatasetParams};
 use tokio::net::TcpListener;
-use tracing::debug;
-use runtime::Runtime;
 
-use crate::init_tracing;
+use crate::{init_tracing, run_query_and_check_results, ValidateFn};
 
 type ServiceSchema = Schema<QueryRoot, EmptyMutation, EmptySubscription>;
+
+#[derive(SimpleObject)]
+struct Post {
+    id: String,
+    title: String,
+    content: String,
+}
 
 #[derive(SimpleObject)]
 struct User {
     id: String,
     name: String,
-    email: String,
+    posts: Vec<Post>,
 }
 
 struct QueryRoot;
@@ -45,7 +51,72 @@ struct QueryRoot;
 #[Object]
 impl QueryRoot {
     async fn users(&self) -> Vec<User> {
-        vec![User { id: "1".to_string(), name: "name".to_string(), email: "email".to_string()}]
+        vec![
+            User {
+                id: "1".to_string(),
+                name: "John Doe".to_string(),
+                posts: vec![
+                    Post {
+                        id: "1".to_string(),
+                        title: "Hello world".to_string(),
+                        content: "Hello world".to_string(),
+                    },
+                    Post {
+                        id: "2".to_string(),
+                        title: "First post".to_string(),
+                        content: "First post content".to_string(),
+                    },
+                ],
+            },
+            User {
+                id: "2".to_string(),
+                name: "Jane Doe".to_string(),
+                posts: vec![
+                    Post {
+                        id: "3".to_string(),
+                        title: "First post".to_string(),
+                        content: "First post content".to_string(),
+                    },
+                    Post {
+                        id: "4".to_string(),
+                        title: "Second post".to_string(),
+                        content: "Second post content".to_string(),
+                    },
+                ],
+            },
+            User {
+                id: "3".to_string(),
+                name: "Alice".to_string(),
+                posts: vec![
+                    Post {
+                        id: "5".to_string(),
+                        title: "First post".to_string(),
+                        content: "First post content".to_string(),
+                    },
+                    Post {
+                        id: "6".to_string(),
+                        title: "Second post".to_string(),
+                        content: "Second post content".to_string(),
+                    },
+                ],
+            },
+            User {
+                id: "4".to_string(),
+                name: "Bob".to_string(),
+                posts: vec![
+                    Post {
+                        id: "7".to_string(),
+                        title: "First post".to_string(),
+                        content: "First post content".to_string(),
+                    },
+                    Post {
+                        id: "8".to_string(),
+                        title: "Second post".to_string(),
+                        content: "Second post content".to_string(),
+                    },
+                ],
+            },
+        ]
     }
 }
 
@@ -55,19 +126,23 @@ async fn graphql_handler(schema: Extension<ServiceSchema>, req: GraphQLRequest) 
     response.into()
 }
 
-async fn start_server() -> (tokio::sync::oneshot::Sender<()>, SocketAddr) {
+async fn start_server() -> Result<(tokio::sync::oneshot::Sender<()>, SocketAddr), String> {
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let schema = Schema::build(QueryRoot, EmptyMutation, EmptySubscription).finish();
 
     let app = Router::new()
         .route("/graphql", post(graphql_handler))
         .layer(Extension(schema));
-    debug!("Starting server");
 
-    let tcp_listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
-    let addr = tcp_listener.local_addr().unwrap();
+    let tcp_listener = TcpListener::bind("0.0.0.0:0").await.map_err(|e| {
+        tracing::error!("Failed to bind to address: {e}");
+        e.to_string()
+    })?;
+    let addr = tcp_listener.local_addr().map_err(|e| {
+        tracing::error!("Failed to get local address: {e}");
+        e.to_string()
+    })?;
 
-    debug!("{}", addr);
     tokio::spawn(async move {
         axum::serve(tcp_listener, app)
             .with_graceful_shutdown(async {
@@ -77,14 +152,17 @@ async fn start_server() -> (tokio::sync::oneshot::Sender<()>, SocketAddr) {
             .unwrap();
     });
 
-    (tx, addr)
+    Ok((tx, addr))
 }
 
 fn make_graphql_dataset(path: &str, name: &str) -> Dataset {
     let mut dataset = Dataset::new(format!("graphql:{path}"), name.to_string());
     let params = HashMap::from([
         ("json_path".to_string(), "data.users".to_string()),
-        ("query".to_string(), "query { users { id } }".to_string()),
+        (
+            "query".to_string(),
+            "query { users { id name posts { id title content } } }".to_string(),
+        ),
     ]);
     dataset.params = Some(DatasetParams::from_string_map(params));
     dataset
@@ -92,14 +170,17 @@ fn make_graphql_dataset(path: &str, name: &str) -> Dataset {
 
 #[tokio::test]
 async fn test_graphql() -> Result<(), String> {
+    type QueryTests<'a> = Vec<(&'a str, Vec<&'a str>, Option<Box<ValidateFn>>)>;
     let _tracing = init_tracing(Some("integration=debug,info"));
-    let (tx, addr) = start_server().await;
+    let (tx, addr) = start_server().await?;
     tracing::debug!("Server started at {}", addr);
-    let app = AppBuilder::new("graphql_integration_test").with_dataset(make_graphql_dataset(
-        &format!("http://{}/graphql", addr.to_string()),
-        "test_graphql",
-    )).build();
-    let rt = Runtime::new(Some(app), Arc::new(vec!{})).await;
+    let app = AppBuilder::new("graphql_integration_test")
+        .with_dataset(make_graphql_dataset(
+            &format!("http://{}/graphql", addr.to_string()),
+            "test_graphql",
+        ))
+        .build();
+    let mut rt = Runtime::new(Some(app), Arc::new(vec![])).await;
 
     tokio::select! {
         () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
@@ -108,10 +189,55 @@ async fn test_graphql() -> Result<(), String> {
         () = rt.load_datasets() => {}
     }
 
-    let res = rt.df.ctx.sql("SELECT * FROM test_graphql").await.unwrap();
-    tracing::debug!("{:?}", res);
+    let queries: QueryTests = vec![
+        (
+            "SELECT * FROM test_graphql",
+            vec![
+                "+---------------+--------------------------------------------------------+",
+                "| plan_type     | plan                                                   |",
+                "+---------------+--------------------------------------------------------+",
+                "| logical_plan  | TableScan: test_graphql projection=[id, name, posts]   |",
+                "| physical_plan | MemoryExec: partitions=4, partition_sizes=[1, 1, 1, 1] |",
+                "|               |                                                        |",
+                "+---------------+--------------------------------------------------------+",
+            ],
+            Some(Box::new(|result_batches| {
+                for batch in result_batches {
+                    assert_eq!(batch.num_columns(), 3, "num_cols: {}", batch.num_columns());
+                    assert_eq!(batch.num_rows(), 1, "num_rows: {}", batch.num_rows());
+                }
+            })),
+        ),
+        (
+            "SELECT posts[1]['title'] from test_graphql",
+            vec![
+                "+---------------+--------------------------------------------------------------------------------------------------------------------------+",
+                "| plan_type     | plan                                                                                                                     |",
+                "+---------------+--------------------------------------------------------------------------------------------------------------------------+",
+                "| logical_plan  | Projection: get_field(array_element(test_graphql.posts, Int64(1)), Utf8(\"title\")) AS test_graphql.posts[Int64(1)][title] |",
+                "|               |   TableScan: test_graphql projection=[posts]                                                                             |",
+                "| physical_plan | ProjectionExec: expr=[get_field(array_element(posts@0, 1), title) as test_graphql.posts[Int64(1)][title]]                |",
+                "|               |   MemoryExec: partitions=4, partition_sizes=[1, 1, 1, 1]                                                                 |",
+                "|               |                                                                                                                          |",
+                "+---------------+--------------------------------------------------------------------------------------------------------------------------+"
+            ],
+            Some(Box::new(|result_batches| {
+                for batch in result_batches {
+                    assert_eq!(batch.num_columns(), 1, "num_cols: {}", batch.num_columns());
+                    assert_eq!(batch.num_rows(), 1, "num_rows: {}", batch.num_rows());
+                }
+            })),
+        ),
+    ];
 
-    tx.send(()).unwrap();
+    for (query, expected_plan, validate_result) in queries {
+        run_query_and_check_results(&mut rt, query, &expected_plan, validate_result).await?;
+    }
+
+    tx.send(()).map_err(|_| {
+        tracing::error!("Failed to send shutdown signal");
+        "Failed to send shutdown signal".to_string()
+    })?;
 
     Ok(())
 }
