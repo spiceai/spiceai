@@ -275,8 +275,6 @@ jobs:
   test_quickstart_graphql:
       name: "Test GraphQL quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }})"
       runs-on: ${{ matrix.target.runner }}
-
-      if: github.event_name == 'workflow_dispatch' || github.event_name == 'push'
       needs:
         - build
         - setup-matrix
