@@ -29,6 +29,8 @@ use spicepod::component::{
     params::Params as DatasetParams,
 };
 
+// This method is only used in tests
+#[allow(clippy::expect_used)]
 fn make_databricks_odbc(path: &str, name: &str, acceleration: bool, engine: &str) -> Dataset {
     let mut dataset = Dataset::new(format!("odbc:{path}"), name.to_string());
     let databricks_odbc_host =
