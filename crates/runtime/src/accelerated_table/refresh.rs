@@ -113,7 +113,6 @@ impl Refresher {
         self
     }
 
-    #[allow(clippy::too_many_lines)]
     pub(crate) async fn start(
         &self,
         acceleration_refresh_mode: AccelerationRefreshMode,
@@ -147,17 +146,7 @@ impl Refresher {
                             .map_or(false, |x| x.columns().is_empty())
                     {
                         if let Some(start_time) = start_time {
-                            if let Ok(elapse) = util::humantime_elapsed(start_time) {
-                                if dataset_name.schema() == Some(SPICE_RUNTIME_SCHEMA) {
-                                    tracing::debug!(
-                                        "Loaded 0 rows for dataset {dataset_name} in {elapse}."
-                                    );
-                                } else {
-                                    tracing::info!(
-                                        "Loaded 0 rows for dataset {dataset_name} in {elapse}."
-                                    );
-                                }
-                            }
+                            self.trace_dataset_loaded(start_time, 0, None);
                         }
                         self.notify_refresh_done(&mut ready_sender, status::ComponentStatus::Ready)
                             .await;
@@ -187,22 +176,17 @@ impl Refresher {
                                         .map(|x| x.num_rows())
                                         .sum::<usize>();
 
-                                    let memory_size = util::human_readable_bytes(
-                                        data_update
-                                            .data
-                                            .into_iter()
-                                            .map(|x| x.get_array_memory_size())
-                                            .sum::<usize>(),
-                                    );
-                                    let num_rows = util::pretty_print_number(num_rows);
+                                    let memory_size = data_update
+                                        .data
+                                        .into_iter()
+                                        .map(|x| x.get_array_memory_size())
+                                        .sum::<usize>();
 
-                                    if let Ok(elapse) = util::humantime_elapsed(start_time) {
-                                        if dataset_name.schema() == Some(SPICE_RUNTIME_SCHEMA) {
-                                            tracing::debug!("Loaded {num_rows} rows ({memory_size}) for dataset {dataset_name} in {elapse}.");
-                                        } else {
-                                            tracing::info!("Loaded {num_rows} rows ({memory_size}) for dataset {dataset_name} in {elapse}.");
-                                        }
-                                    }
+                                    self.trace_dataset_loaded(
+                                        start_time,
+                                        num_rows,
+                                        Some(memory_size),
+                                    );
 
                                     if let Some(cache_provider) = &self.cache_provider {
                                         if let Err(e) = cache_provider
@@ -229,6 +213,32 @@ impl Refresher {
                 }
                 None => break,
             };
+        }
+    }
+
+    fn trace_dataset_loaded(
+        &self,
+        start_time: SystemTime,
+        num_rows: usize,
+        memory_size: Option<usize>,
+    ) {
+        if let Ok(elapse) = util::humantime_elapsed(start_time) {
+            let dataset_name = &self.dataset_name;
+            let num_rows = util::pretty_print_number(num_rows);
+            let memory_size = match memory_size {
+                Some(memory_size) => format!(" ({})", util::human_readable_bytes(memory_size)),
+                None => String::new(),
+            };
+
+            if self.dataset_name.schema() == Some(SPICE_RUNTIME_SCHEMA) {
+                tracing::debug!(
+                    "Loaded {num_rows} rows{memory_size} for dataset {dataset_name} in {elapse}.",
+                );
+            } else {
+                tracing::info!(
+                    "Loaded {num_rows} rows{memory_size} for dataset {dataset_name} in {elapse}."
+                );
+            }
         }
     }
 
