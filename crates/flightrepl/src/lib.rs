@@ -161,11 +161,11 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
 
         let start_time = Instant::now();
         match get_records(client.clone(), line).await {
-            Ok((_, 0)) => {
-                println!("No results.");
+            Ok((_, 0, from_cache)) => {
+                println!("No results{}.", if from_cache { " (cached)" } else { "" });
             }
-            Ok((records, total_rows)) => {
-                display_records(records, start_time, total_rows).await?;
+            Ok((records, total_rows, from_cache)) => {
+                display_records(records, start_time, total_rows, from_cache).await?;
             }
             Err(FlightError::Tonic(status)) => {
                 display_grpc_error(&status);
@@ -192,7 +192,7 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
 async fn get_records(
     mut client: FlightServiceClient<Channel>,
     line: &str,
-) -> Result<(Vec<RecordBatch>, usize), FlightError> {
+) -> Result<(Vec<RecordBatch>, usize, bool), FlightError> {
     let sql_command = CommandStatementQuery {
         query: line.to_string(),
         transaction_id: None,
@@ -210,7 +210,14 @@ async fn get_records(
     };
     let request = ticket.into_request();
 
-    let stream = client.do_get(request).await?.into_inner();
+    let response = client.do_get(request).await?;
+    let from_cache = response
+        .metadata()
+        .get("x-cache")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|s| s.to_lowercase().starts_with("hit"));
+
+    let stream = response.into_inner();
 
     let mut stream =
         FlightRecordBatchStream::new_from_flight_data(stream.map_err(FlightError::Tonic));
@@ -226,7 +233,7 @@ async fn get_records(
         }
     }
 
-    Ok((records, total_rows))
+    Ok((records, total_rows, from_cache))
 }
 
 /// Display a set of record batches to the user. This function will display the first 500 rows.
@@ -238,6 +245,7 @@ async fn display_records(
     records: Vec<RecordBatch>,
     start_time: Instant,
     total_rows: usize,
+    from_cache: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let schema = records[0].schema();
 
@@ -258,13 +266,15 @@ async fn display_records(
     let elapsed = start_time.elapsed();
     if num_rows == total_rows {
         println!(
-            "\nTime: {} seconds. {num_rows} rows.",
-            elapsed.as_secs_f64()
+            "\nTime: {} seconds. {num_rows} rows{}.",
+            elapsed.as_secs_f64(),
+            if from_cache { " (cached)" } else { "" }
         );
     } else {
         println!(
-            "\nTime: {} seconds. {num_rows}/{total_rows} rows displayed.",
-            elapsed.as_secs_f64()
+            "\nTime: {} seconds. {num_rows}/{total_rows} rows displayed{}.",
+            elapsed.as_secs_f64(),
+            if from_cache { " (cached)" } else { "" }
         );
     }
     Ok(())
@@ -293,7 +303,7 @@ async fn get_and_display_nql_records(
         .reduce(|x, y| x + y)
         .unwrap_or(0) as usize;
 
-    display_records(records, start_time, total_rows).await?;
+    display_records(records, start_time, total_rows, false).await?;
 
     Ok(())
 }
