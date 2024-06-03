@@ -1192,7 +1192,10 @@ pub(crate) mod assist {
     use std::{collections::HashMap, sync::Arc};
     use tokio::sync::RwLock;
 
-    use crate::{datafusion::DataFusion, embeddings::table::EmbeddingTable, EmbeddingModelStore, LLMModelStore};
+    use crate::{
+        datafusion::DataFusion, embeddings::table::EmbeddingTable, EmbeddingModelStore,
+        LLMModelStore,
+    };
 
     #[derive(Debug, Serialize, Deserialize)]
     #[serde(rename_all = "lowercase")]
@@ -1254,6 +1257,57 @@ pub(crate) mod assist {
         format!("{}\n{}", data, input)
     }
 
+    /// For the data sources that assumedly exist in the [`DataFusion`] instance, find the embedding models used in each data source.
+    async fn find_relevant_embedding_models(
+        data_sources: Vec<TableReference>,
+        df: Arc<DataFusion>,
+    ) -> Result<HashMap<TableReference, Vec<String>>, Box<dyn std::error::Error>> {
+        let mut embeddings_to_run = HashMap::new();
+        for data_source in data_sources {
+            match df.get_table(data_source.clone()).await {
+                None => {
+                    return Err(
+                        format!("Data source {} does not exist", data_source.clone()).into(),
+                    )
+                }
+                Some(table) => match table.as_any().downcast_ref::<EmbeddingTable>() {
+                    Some(embedding_table) => {
+                        embeddings_to_run
+                            .insert(data_source, embedding_table.get_embedding_names_used());
+                    }
+                    None => {
+                        return Err(format!(
+                            "Data source {} does not have an embedded column",
+                            data_source.clone()
+                        )
+                        .into())
+                    }
+                },
+            }
+        }
+        return Ok(embeddings_to_run);
+    }
+
+    ///
+    async fn vector_search(
+        df: Arc<DataFusion>,
+        embedded_inputs: HashMap<TableReference, Vec<Vec<f32>>>,
+    ) -> Result<HashMap<TableReference, Vec<String>>, Box<dyn std::error::Error>> {
+        for (tbl, search_vectors) in embedded_inputs {
+            if search_vectors.len() != 1 {
+                return Err(format!("Only one embedding column per table currently supported. Table: {tbl} has {} embeddings", search_vectors.len()).into());
+            }
+            match search_vectors.first() {
+                None => return Err(format!("No embeddings found for table {tbl}").into()),
+                Some(embedding) => {
+                    println!("I have a vector for tbl: {tbl}");
+                }
+            };
+        }
+
+        Ok(HashMap::new())
+    }
+
     /// Assist runs a question or statement through an LLM with additional context retrieved from data within the [`DataFusion`] instance.
     /// Logic:
     /// 1. If user did not provide which/what data source to use, figure this out (?).
@@ -1274,40 +1328,24 @@ pub(crate) mod assist {
         }
 
         // Determine which embedding models need to be run. If a table does not have an embedded column, return an error.
-        // TODO:
-        let mut embeddings_to_run = Vec::new();
-        for data_source in &payload.data_source {
-            match df.get_table(TableReference::from(data_source)).await {
-                None => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        format!("Data source {data_source} does not exist"),
-                    )
-                        .into_response()
-                }
-                Some(table) => {
-                    println!("I have a table: {:#?}", table.schema());
-                    match table.as_any().downcast_ref::<EmbeddingTable>() {
-                        Some(embedding_table) => {
-                            embeddings_to_run.append(&mut embedding_table.get_embedding_names_used())
-                        }
-                        None => {
-                            return (
-                                StatusCode::BAD_REQUEST,
-                                format!("Data source {data_source} does not have an embedded column"),
-                            )
-                                .into_response()
-                        }
-                    
-                    }
-                }
-            }
-        }
+        let embeddings_to_run = match find_relevant_embedding_models(
+            payload
+                .data_source
+                .iter()
+                .map(|t| TableReference::from(t))
+                .collect(),
+            Arc::clone(&df),
+        )
+        .await
+        {
+            Ok(embeddings_to_run) => embeddings_to_run,
+            Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        };
 
-        // `embedded_inputs` model_name -> embedding.
+        // Create embedding(s) for question/statement. `embedded_inputs` model_name -> embedding.
         let embedded_inputs = match create_input_embeddings(
             payload.text.clone(),
-            embeddings_to_run,
+            embeddings_to_run.values().flatten().cloned().collect(),
             Arc::clone(&embeddings),
         )
         .await
@@ -1316,11 +1354,27 @@ pub(crate) mod assist {
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
         };
 
-        // TODO: vector search from data sources.
-        let mut relevant_data: HashMap<TableReference, Vec<String>> = HashMap::new();
+        let per_table_embeddings: HashMap<TableReference, _> = embeddings_to_run
+            .iter()
+            .map(|(t, model_names)| {
+                let z: Vec<_> = model_names
+                    .iter()
+                    .map(|m| embedded_inputs.get(m).unwrap().clone())
+                    .collect();
+                (t.clone(), z)
+            })
+            .collect();
 
+        // Vector search to get relevant data from data sources.
+        let relevant_data = match vector_search(Arc::clone(&df), per_table_embeddings).await {
+            Ok(relevant_data) => relevant_data,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        };
+
+        // Using returned data, create input for LLM.
         let model_input = combined_relevant_data_and_input(relevant_data, payload.text.clone());
 
+        // Run LLM with input.
         match llms.read().await.get(&payload.model) {
             Some(llm_model) => {
                 // TODO: We need to either 1. Separate LLMs from NQL, or create a LLM trait separately.
