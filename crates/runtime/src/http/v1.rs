@@ -1192,7 +1192,7 @@ pub(crate) mod assist {
     use std::{collections::HashMap, sync::Arc};
     use tokio::sync::RwLock;
 
-    use crate::{datafusion::DataFusion, EmbeddingModelStore, LLMModelStore};
+    use crate::{datafusion::DataFusion, embeddings::table::EmbeddingTable, EmbeddingModelStore, LLMModelStore};
 
     #[derive(Debug, Serialize, Deserialize)]
     #[serde(rename_all = "lowercase")]
@@ -1287,7 +1287,19 @@ pub(crate) mod assist {
                 }
                 Some(table) => {
                     println!("I have a table: {:#?}", table.schema());
-                    // let x = table.as_any().downcast_ref::<EmbeddingTable>();
+                    match table.as_any().downcast_ref::<EmbeddingTable>() {
+                        Some(embedding_table) => {
+                            embeddings_to_run.append(&mut embedding_table.get_embedding_names_used())
+                        }
+                        None => {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                format!("Data source {data_source} does not have an embedded column"),
+                            )
+                                .into_response()
+                        }
+                    
+                    }
                 }
             }
         }
