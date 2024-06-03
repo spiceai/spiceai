@@ -24,7 +24,9 @@ use snafu::Snafu;
 use time::{OffsetDateTime, PrimitiveDateTime};
 
 use sea_query::{
-    Alias, BlobSize, ColumnDef, ColumnType, GenericBuilder, Index, InsertStatement, IntoIden, IntoIndexColumn, Keyword, MysqlQueryBuilder, PostgresQueryBuilder, Query, SimpleExpr, SqliteQueryBuilder, Table
+    Alias, BlobSize, ColumnDef, ColumnType, GenericBuilder, Index, InsertStatement, IntoIden,
+    IntoIndexColumn, Keyword, MysqlQueryBuilder, PostgresQueryBuilder, Query, SimpleExpr,
+    SqliteQueryBuilder, Table,
 };
 
 #[derive(Debug, Snafu)]
@@ -415,7 +417,7 @@ impl InsertBuilder {
                                 ),
                             }
                         }
-                    },
+                    }
                     DataType::Binary => {
                         let array = column.as_any().downcast_ref::<array::BinaryArray>();
 
@@ -531,7 +533,7 @@ fn map_data_type_to_column_type(data_type: &DataType) -> ColumnType {
         DataType::Time64(_unit) | DataType::Time32(_unit) => ColumnType::Time,
         DataType::List(list_type) => {
             ColumnType::Array(map_data_type_to_column_type(list_type.data_type()).into())
-        },
+        }
         DataType::Binary => ColumnType::Binary(BlobSize::Blob(None)),
 
         // Add more mappings here as needed
