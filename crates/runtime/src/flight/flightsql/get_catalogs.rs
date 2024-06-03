@@ -46,7 +46,7 @@ pub(crate) fn get_flight_info(
     Response::new(info)
 }
 
-pub(crate) async fn do_get(
+pub(crate) fn do_get(
     flight_svc: &Service,
     query: sql::CommandGetCatalogs,
 ) -> Result<Response<<Service as FlightService>::DoGetStream>, Status> {
@@ -54,7 +54,7 @@ pub(crate) async fn do_get(
     tracing::trace!("do_get_catalogs: {query:?}");
     let mut builder = query.into_builder();
 
-    let catalog_names = flight_svc.datafusion.read().await.ctx.catalog_names();
+    let catalog_names = flight_svc.datafusion.ctx.catalog_names();
 
     for catalog in catalog_names {
         builder.append(catalog);

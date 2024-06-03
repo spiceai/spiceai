@@ -45,7 +45,7 @@ impl SparkConnect {
     }
 
     pub async fn from_connection(connection: &str) -> Result<Self, Box<dyn Error + Send + Sync>> {
-        let session = Arc::new(SparkSessionBuilder::remote(connection).build().await?);
+        let session = Arc::new(SparkSessionBuilder::remote(connection)?.build().await?);
         Ok(Self { session })
     }
 }
@@ -76,15 +76,7 @@ async fn get_table_provider(
     spark_session: Arc<SparkSession>,
     table_reference: TableReference,
 ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn Error + Send + Sync>> {
-    if let Some(catalog_name) = table_reference.catalog() {
-        let spark_session = Arc::clone(&spark_session);
-        spark_session.setCatalog(catalog_name).collect().await?;
-    }
-    if let Some(database) = table_reference.schema() {
-        let spark_session = Arc::clone(&spark_session);
-        spark_session.setDatabase(database).collect().await?;
-    }
-    let dataframe = spark_session.table(table_reference.table())?;
+    let dataframe = spark_session.table(table_reference.to_string().as_str())?;
     let arrow_schema = dataframe.clone().limit(0).collect().await?.schema();
     Ok(Arc::new(SparkConnectTableProvider {
         dataframe,

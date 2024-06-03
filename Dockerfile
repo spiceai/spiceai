@@ -46,4 +46,6 @@ COPY --from=build /root/spiced /usr/local/bin/spiced
 
 EXPOSE 3000 50051
 
+WORKDIR /app
+
 ENTRYPOINT ["/usr/local/bin/spiced"]

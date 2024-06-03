@@ -37,10 +37,14 @@ nextest:
 test-integration:
 	@cargo test -p runtime --test integration --features mysql -- --nocapture
 
-.PHONY: lint
-lint:
-	go vet ./...
-	golangci-lint run
+.PHONY: test-bench
+test-bench:
+	@cargo bench -p runtime
+
+.PHONY: lint lint-go lint-rust
+lint: lint-go lint-rust
+
+lint-rust:
 	cargo fmt --all -- --check
 	cargo clippy --all-targets --all-features --workspace -- \
 		-Dwarnings \
@@ -48,6 +52,11 @@ lint:
 		-Dclippy::unwrap_used \
 		-Dclippy::expect_used \
 		-Dclippy::clone_on_ref_ptr
+
+lint-go:
+	go vet ./...
+	golangci-lint run
+
 
 .PHONY: run
 run:
@@ -70,7 +79,7 @@ dep-licenses:
 .PHONY: display-deps
 display-deps:
 	@cargo install cargo-license --quiet
-	@cargo license -d  --tsv --direct-deps-only | grep -v "github.com/spiceai"
+	@cargo license -d  --tsv --direct-deps-only --all-features | grep -v "github.com/spiceai"
 
 
 ################################################################################

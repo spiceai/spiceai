@@ -1,10 +1,6 @@
 name: Sets up the Rust toolchain
 description: 'composite action'
 inputs:
-  rust-version:
-    description: 'Rust version to setup'
-    default: '1.76'
-    required: false
   os:
     description: 'Operating system to set up the toolchain for'
     default: 'linux' # 'linux', 'darwin', 'windows'

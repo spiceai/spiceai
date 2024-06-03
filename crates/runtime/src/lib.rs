@@ -35,9 +35,14 @@ use app::App;
 use cache::QueryResultsCacheProvider;
 use component::dataset::{self, Dataset};
 use config::Config;
+use datafusion::query::query_history;
+use datafusion::SPICE_RUNTIME_SCHEMA;
+use futures::future::join_all;
+use futures::StreamExt;
+use llms::embeddings::Embed;
 use llms::nql::Nql;
 use metrics::SetRecorderError;
-use model::try_to_nql;
+use model::{try_to_embedding, try_to_nql};
 use model_components::{model::Model, modelsource::source as model_source};
 pub use notify::Error as NotifyError;
 use secrets::{spicepod_secret_store_type, Secret};
@@ -45,8 +50,9 @@ use snafu::prelude::*;
 use spice_metrics::get_metrics_table_reference;
 use spicepod::component::model::Model as SpicepodModel;
 use tokio::sync::oneshot::error::RecvError;
+use tokio::sync::RwLock;
 use tokio::time::sleep;
-use tokio::{signal, sync::RwLock};
+pub use util::shutdown_signal;
 
 use crate::extension::{Extension, ExtensionFactory};
 pub mod accelerated_table;
@@ -175,6 +181,9 @@ pub enum Error {
     #[snafu(display("Unable to start local metrics: {source}"))]
     UnableToStartLocalMetrics { source: spice_metrics::Error },
 
+    #[snafu(display("Unable to track query history: {source}"))]
+    UnableToTrackQueryHistory { source: query_history::Error },
+
     #[snafu(display("Unable to create metrics table: {source}"))]
     UnableToCreateMetricsTable { source: DataFusionError },
 
@@ -185,16 +194,19 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub type LLMModelStore = HashMap<String, RwLock<Box<dyn Nql>>>;
+pub type EmbeddingModelStore = HashMap<String, RwLock<Box<dyn Embed>>>;
 
+#[derive(Clone)]
 pub struct Runtime {
     pub app: Arc<RwLock<Option<App>>>,
-    pub df: Arc<RwLock<DataFusion>>,
+    pub df: Arc<DataFusion>,
     pub models: Arc<RwLock<HashMap<String, Model>>>,
     pub llms: Arc<RwLock<LLMModelStore>>,
-    pub pods_watcher: Option<podswatcher::PodsWatcher>,
+    pub embeds: Arc<RwLock<EmbeddingModelStore>>,
+    pub pods_watcher: Arc<RwLock<Option<podswatcher::PodsWatcher>>>,
     pub secrets_provider: Arc<RwLock<secrets::SecretsProvider>>,
 
-    extensions: Vec<Box<dyn Extension>>,
+    extensions: Arc<RwLock<Vec<Box<dyn Extension>>>>,
     spaced_tracer: Arc<tracers::SpacedTracer>,
 }
 
@@ -202,7 +214,6 @@ impl Runtime {
     #[must_use]
     pub async fn new(
         app: Option<app::App>,
-        df: Arc<RwLock<DataFusion>>,
         extension_factories: Arc<Vec<Box<dyn ExtensionFactory>>>,
     ) -> Self {
         dataconnector::register_all().await;
@@ -210,13 +221,14 @@ impl Runtime {
 
         let mut rt = Runtime {
             app: Arc::new(RwLock::new(app)),
-            df,
+            df: Arc::new(DataFusion::new()),
             models: Arc::new(RwLock::new(HashMap::new())),
             llms: Arc::new(RwLock::new(HashMap::new())),
-            pods_watcher: None,
+            embeds: Arc::new(RwLock::new(HashMap::new())),
+            pods_watcher: Arc::new(RwLock::new(None)),
             secrets_provider: Arc::new(RwLock::new(secrets::SecretsProvider::new())),
             spaced_tracer: Arc::new(tracers::SpacedTracer::new(Duration::from_secs(15))),
-            extensions: vec![],
+            extensions: Arc::new(RwLock::new(vec![])),
         };
 
         let mut extensions: Vec<Box<dyn Extension>> = vec![];
@@ -230,29 +242,27 @@ impl Runtime {
             };
         }
 
-        rt.extensions = extensions;
+        rt.extensions = Arc::new(RwLock::new(extensions));
 
         rt
     }
 
     #[must_use]
-    pub fn datafusion(&self) -> Arc<RwLock<DataFusion>> {
+    pub fn datafusion(&self) -> Arc<DataFusion> {
         Arc::clone(&self.df)
     }
 
-    pub async fn start_extensions(&mut self) {
-        let mut extensions: Vec<Box<dyn Extension>> = std::mem::take(&mut self.extensions);
-        for extension in &mut extensions {
-            if let Err(err) = extension.on_start(self).await {
+    pub async fn start_extensions(&self) {
+        let mut extensions = self.extensions.write().await;
+        for i in 0..extensions.len() {
+            if let Err(err) = extensions[i].on_start(self).await {
                 tracing::warn!("Failed to start extension: {err}");
             }
         }
-
-        self.extensions = extensions;
     }
 
     pub fn with_pods_watcher(&mut self, pods_watcher: podswatcher::PodsWatcher) {
-        self.pods_watcher = Some(pods_watcher);
+        self.pods_watcher = Arc::new(RwLock::new(Some(pods_watcher)));
     }
 
     pub async fn load_secrets(&self) {
@@ -305,10 +315,23 @@ impl Runtime {
         };
 
         let valid_datasets = Self::get_valid_datasets(app, true);
+        let mut futures = vec![];
         for ds in &valid_datasets {
             status::update_dataset(&ds.name, status::ComponentStatus::Initializing);
-            self.load_dataset(ds, &valid_datasets).await;
+            futures.push(self.load_dataset(ds, &valid_datasets));
         }
+
+        let app = self.app.read().await;
+
+        if let Some(app) = app.as_ref() {
+            if let Some(parallel_num) = app.runtime.num_of_parallel_loading_at_start_up {
+                let stream = futures::stream::iter(futures).buffer_unordered(parallel_num);
+                let _ = stream.collect::<Vec<_>>().await;
+                return;
+            }
+        }
+
+        let _ = join_all(futures).await;
     }
 
     // Caller must set `status::update_dataset(...` before calling `load_dataset`. This function will set error/ready statuses appropriately.`
@@ -458,11 +481,9 @@ impl Runtime {
         }
     }
 
-    pub async fn remove_dataset(&self, ds: &Dataset) {
-        let mut df = self.df.write().await;
-
-        if df.table_exists(ds.name.clone()) {
-            if let Err(e) = df.remove_table(&ds.name) {
+    pub fn remove_dataset(&self, ds: &Dataset) {
+        if self.df.table_exists(ds.name.clone()) {
+            if let Err(e) = self.df.remove_table(&ds.name) {
                 tracing::warn!("Unable to unload dataset {}: {}", &ds.name, e);
                 return;
             }
@@ -499,7 +520,7 @@ impl Runtime {
                 tracing::debug!("Failed to create accelerated table for dataset {}, falling back to full dataset reload", ds.name);
             }
 
-            self.remove_dataset(ds).await;
+            self.remove_dataset(ds);
 
             if let Ok(()) = self
                 .register_loaded_dataset(ds, Arc::clone(&connector), None)
@@ -525,8 +546,6 @@ impl Runtime {
         // create new accelerated table for updated data connector
         let (accelerated_table, is_ready) = self
             .df
-            .read()
-            .await
             .create_accelerated_table(ds, Arc::clone(&connector), acceleration_secret)
             .await
             .context(UnableToCreateAcceleratedTableSnafu {
@@ -606,7 +625,7 @@ impl Runtime {
     async fn register_dataset(
         ds: impl Borrow<Dataset>,
         data_connector: Arc<dyn DataConnector>,
-        df: Arc<RwLock<DataFusion>>,
+        df: Arc<DataFusion>,
         source: &str,
         secrets_provider: Arc<RwLock<secrets::SecretsProvider>>,
         accelerated_table: Option<AcceleratedTable>,
@@ -616,9 +635,7 @@ impl Runtime {
         // VIEW
         if let Some(view_sql) = ds.view_sql() {
             let view_sql = view_sql.context(InvalidSQLViewSnafu)?;
-            df.write()
-                .await
-                .register_table(ds, datafusion::Table::View(view_sql))
+            df.register_table(ds, datafusion::Table::View(view_sql))
                 .await
                 .context(UnableToAttachViewSnafu)?;
             return Ok(());
@@ -672,16 +689,16 @@ impl Runtime {
     }
 
     async fn register_table(
-        df: Arc<RwLock<DataFusion>>,
+        df: Arc<DataFusion>,
         ds: &Dataset,
         table: datafusion::Table,
         source: &str,
     ) -> Result<()> {
-        df.write().await.register_table(ds, table).await.context(
-            UnableToAttachDataConnectorSnafu {
+        df.register_table(ds, table)
+            .await
+            .context(UnableToAttachDataConnectorSnafu {
                 data_connector: source,
-            },
-        )?;
+            })?;
 
         Ok(())
     }
@@ -705,6 +722,33 @@ impl Runtime {
                         tracing::warn!(
                             "Unable to load LLM from spicepod {}, error: {}",
                             in_llm.name,
+                            e,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    pub async fn load_embeddings(&self) {
+        let app_lock = self.app.read().await;
+        if let Some(app) = app_lock.as_ref() {
+            for in_embed in &app.embeddings {
+                status::update_embedding(&in_embed.name, status::ComponentStatus::Initializing);
+                match try_to_embedding(in_embed) {
+                    Ok(e) => {
+                        let mut embeds_map = self.embeds.write().await;
+                        embeds_map.insert(in_embed.name.clone(), e.into());
+                        tracing::info!("Embedding [{}] ready to embed", in_embed.name);
+                        metrics::gauge!("embeddings_count", "embeddings" => in_embed.name.clone(), "source" => in_embed.get_prefix().map(|x| x.to_string()).unwrap_or_default()).increment(1.0);
+                        status::update_embedding(&in_embed.name, status::ComponentStatus::Ready);
+                    }
+                    Err(e) => {
+                        metrics::counter!("embeddings_load_error").increment(1);
+                        status::update_embedding(&in_embed.name, status::ComponentStatus::Error);
+                        tracing::warn!(
+                            "Unable to load embedding from spicepod {}, error: {}",
+                            in_embed.name,
                             e,
                         );
                     }
@@ -793,31 +837,28 @@ impl Runtime {
 
     pub async fn start_metrics(&mut self, with_metrics: Option<SocketAddr>) -> Result<()> {
         if let Some(metrics_socket) = with_metrics {
-            let recorder = MetricsRecorder::new(metrics_socket);
+            let mut recorder = MetricsRecorder::new(metrics_socket);
 
-            // check if runtime.metrics already registered, otherwise create local table
-            let has_metrics_table = self
-                .df
-                .read()
-                .await
-                .has_table(&get_metrics_table_reference())
-                .await;
+            let table_reference = get_metrics_table_reference();
+            let metrics_table = self.df.get_table(table_reference).await;
 
-            if !has_metrics_table {
-                tracing::info!("Registering local metrics table");
-                MetricsRecorder::register_metrics_table(&self.df)
+            if let Some(metrics_table) = metrics_table {
+                recorder.set_remote_schema(Arc::new(Some(metrics_table.schema())));
+            } else {
+                tracing::debug!("Registering local metrics table");
+                MetricsRecorder::register_metrics_table(&Arc::clone(&self.df))
                     .await
                     .context(UnableToStartLocalMetricsSnafu)?;
             }
 
-            recorder.start(&Arc::clone(&self.df));
+            recorder.start(&self.df);
         }
 
         Ok(())
     }
 
     pub async fn start_servers(
-        &mut self,
+        &self,
         config: Config,
         with_metrics: Option<SocketAddr>,
     ) -> Result<()> {
@@ -827,6 +868,7 @@ impl Runtime {
             Arc::clone(&self.df),
             Arc::clone(&self.models),
             Arc::clone(&self.llms),
+            Arc::clone(&self.embeds),
             config.clone().into(),
             with_metrics,
         );
@@ -848,8 +890,9 @@ impl Runtime {
         }
     }
 
-    pub async fn start_pods_watcher(&mut self) -> notify::Result<()> {
-        let Some(mut pods_watcher) = self.pods_watcher.take() else {
+    pub async fn start_pods_watcher(&self) -> notify::Result<()> {
+        let mut pods_watcher = self.pods_watcher.write().await;
+        let Some(mut pods_watcher) = pods_watcher.take() else {
             return Ok(());
         };
         let mut rx = pods_watcher.watch()?;
@@ -914,7 +957,7 @@ impl Runtime {
                             }
                         };
                         status::update_dataset(&ds.name, status::ComponentStatus::Disabled);
-                        self.remove_dataset(&ds).await;
+                        self.remove_dataset(&ds);
                     }
                 }
 
@@ -928,11 +971,8 @@ impl Runtime {
     }
 
     pub async fn init_results_cache(&self) {
-        let app_lock = self.app.read().await;
-
-        let Some(app) = app_lock.as_ref() else {
-            return;
-        };
+        let app = self.app.read().await;
+        let Some(app) = app.as_ref() else { return };
 
         let cache_config = &app.runtime.results_cache;
 
@@ -940,20 +980,29 @@ impl Runtime {
             return;
         }
 
-        let cache_provider = match QueryResultsCacheProvider::new(cache_config) {
-            Ok(cache_provider) => cache_provider,
+        match QueryResultsCacheProvider::new(cache_config) {
+            Ok(cache_provider) => {
+                tracing::info!("Initialized results cache; {cache_provider}");
+                self.datafusion().set_cache_provider(cache_provider);
+            }
             Err(e) => {
                 tracing::warn!("Failed to initialize results cache: {e}");
-                return;
             }
         };
+    }
 
-        tracing::info!("Initialized results cache; {cache_provider}");
-
-        self.df
-            .write()
-            .await
-            .set_cache_provider(Some(Arc::new(cache_provider)));
+    pub async fn init_query_history(&self) -> Result<()> {
+        let query_history_table_reference = TableReference::partial(
+            SPICE_RUNTIME_SCHEMA,
+            query_history::DEFAULT_QUERY_HISTORY_TABLE,
+        );
+        match query_history::instantiate_query_history_table().await {
+            Ok(table) => self
+                .df
+                .register_runtime_table(query_history_table_reference, table)
+                .context(UnableToCreateBackendSnafu),
+            Err(err) => Err(Error::UnableToTrackQueryHistory { source: err }),
+        }
     }
 }
 
@@ -1076,17 +1125,4 @@ fn get_dependent_table_names(statement: &parser::Statement) -> Vec<TableReferenc
         .into_iter()
         .filter(|name| !cte_names.contains(name))
         .collect()
-}
-
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        let signal_result = signal::ctrl_c().await;
-        if let Err(err) = signal_result {
-            tracing::error!("Failed to listen to shutdown signal: {err}");
-        }
-    };
-
-    tokio::select! {
-        () = ctrl_c => {},
-    }
 }

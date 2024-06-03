@@ -16,7 +16,10 @@ limitations under the License.
 
 #![allow(clippy::module_name_repetitions)]
 use async_trait::async_trait;
-use datafusion::{datasource::TableProvider, sql::TableReference};
+use datafusion::{
+    datasource::TableProvider,
+    sql::{unparser::dialect::MySqlDialect, TableReference},
+};
 use db_connection_pool::DbConnectionPool;
 use mysql_async::prelude::ToValue;
 use snafu::prelude::*;
@@ -63,7 +66,8 @@ impl Read for MySQLTableFactory {
         let table_provider = Arc::new(
             SqlTable::new("mysql", &pool, table_reference, None)
                 .await
-                .context(UnableToConstructSQLTableSnafu)?,
+                .context(UnableToConstructSQLTableSnafu)?
+                .with_dialect(Arc::new(MySqlDialect {})),
         );
 
         let table_provider = Arc::new(

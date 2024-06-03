@@ -19,6 +19,8 @@ use std::{
     time::{Duration, SystemTime, SystemTimeError},
 };
 
+use tokio::signal;
+
 #[allow(clippy::cast_precision_loss)]
 #[allow(clippy::cast_sign_loss)]
 #[allow(clippy::cast_possible_truncation)]
@@ -37,6 +39,31 @@ pub fn human_readable_bytes(num: usize) -> String {
     );
     let unit = units[exponent];
     format!("{:.2} {unit}", num / delimiter.powi(exponent as i32))
+}
+
+#[must_use]
+pub fn pretty_print_number(num: usize) -> String {
+    num.to_string()
+        .as_bytes()
+        .rchunks(3)
+        .rev()
+        .map(std::str::from_utf8)
+        .collect::<Result<Vec<&str>, _>>()
+        .unwrap_or(vec![])
+        .join(",")
+}
+
+pub async fn shutdown_signal() {
+    let ctrl_c = async {
+        let signal_result = signal::ctrl_c().await;
+        if let Err(err) = signal_result {
+            tracing::error!("Failed to listen to shutdown signal: {err}");
+        }
+    };
+
+    tokio::select! {
+        () = ctrl_c => {},
+    }
 }
 
 /**
@@ -68,5 +95,12 @@ mod tests {
         assert_eq!(super::human_readable_bytes(1025), "1.00 kiB");
         assert_eq!(super::human_readable_bytes(1024 * 1024), "1.00 MiB");
         assert_eq!(super::human_readable_bytes(1024 * 1024 * 1024), "1.00 GiB");
+    }
+
+    #[test]
+    fn test_print_number() {
+        assert_eq!(super::pretty_print_number(123), "123");
+        assert_eq!(super::pretty_print_number(1023), "1,023");
+        assert_eq!(super::pretty_print_number(10_231_024), "10,231,024");
     }
 }

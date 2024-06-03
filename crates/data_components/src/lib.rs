@@ -50,6 +50,7 @@ pub mod sqlite;
 pub mod snowflake;
 
 pub mod delete;
+pub mod object;
 pub mod util;
 
 #[async_trait]

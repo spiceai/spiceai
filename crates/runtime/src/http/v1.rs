@@ -14,17 +14,24 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::component::dataset::Dataset;
+use std::sync::Arc;
+
+use crate::{
+    component::dataset::Dataset,
+    datafusion::query::{Protocol, QueryBuilder},
+};
 use arrow::array::RecordBatch;
 use axum::{
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
 use csv::Writer;
-use datafusion::dataframe::DataFrame;
+use datafusion::execution::context::SQLOptions;
 use serde::{Deserialize, Serialize};
 
 use crate::{datafusion::DataFusion, status::ComponentStatus};
+
+use futures::TryStreamExt;
 
 #[derive(Default, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -51,20 +58,40 @@ fn dataset_status(df: &DataFusion, ds: &Dataset) -> ComponentStatus {
     }
 }
 
-// Prepare a dataframe for Response (as JSON).
-async fn dataframe_to_response(data_frame: DataFrame) -> Response {
-    let results = match data_frame.collect().await {
-        Ok(results) => results,
+// Runs query and converts query results to HTTP response (as JSON).
+pub async fn sql_to_http_response(
+    df: Arc<DataFusion>,
+    sql: &str,
+    restricted_sql_options: Option<SQLOptions>,
+    nsql: Option<String>,
+) -> Response {
+    let query = QueryBuilder::new(sql.to_string(), Arc::clone(&df), Protocol::Http)
+        .restricted_sql_options(restricted_sql_options)
+        .nsql(nsql)
+        .protocol(Protocol::Http)
+        .build();
+
+    let (data, is_data_from_cache) = match query.run().await {
+        Ok(query_result) => match query_result.data.try_collect::<Vec<RecordBatch>>().await {
+            Ok(batches) => (batches, query_result.from_cache),
+            Err(e) => {
+                tracing::debug!("Error executing query: {e}");
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("Error processing batch: {e}"),
+                )
+                    .into_response();
+            }
+        },
         Err(e) => {
-            tracing::debug!("Error collecting results: {e}");
-            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+            tracing::debug!("Error executing query: {e}");
+            return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
         }
     };
-
     let buf = Vec::new();
     let mut writer = arrow_json::ArrayWriter::new(buf);
 
-    if let Err(e) = writer.write_batches(results.iter().collect::<Vec<&RecordBatch>>().as_slice()) {
+    if let Err(e) = writer.write_batches(data.iter().collect::<Vec<&RecordBatch>>().as_slice()) {
         tracing::debug!("Error converting results to JSON: {e}");
         return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
@@ -82,28 +109,40 @@ async fn dataframe_to_response(data_frame: DataFrame) -> Response {
         }
     };
 
-    (StatusCode::OK, res).into_response()
+    let mut headers = HeaderMap::new();
+
+    match is_data_from_cache {
+        Some(true) => {
+            if let Ok(value) = "Hit from spiceai".parse() {
+                headers.insert("X-Cache", value);
+            }
+        }
+        Some(false) => {
+            if let Ok(value) = "Miss from spiceai".parse() {
+                headers.insert("X-Cache", value);
+            }
+        }
+        None => {}
+    };
+    (StatusCode::OK, headers, res).into_response()
 }
 
 pub(crate) mod query {
-    use arrow::record_batch::RecordBatch;
+    use std::sync::Arc;
+
     use axum::{
         body::Bytes,
-        http::{HeaderMap, StatusCode},
+        http::StatusCode,
         response::{IntoResponse, Response},
         Extension,
     };
     use datafusion::execution::context::SQLOptions;
-    use futures::TryStreamExt;
-    use std::sync::Arc;
-    use tokio::sync::RwLock;
 
     use crate::datafusion::DataFusion;
 
-    pub(crate) async fn post(
-        Extension(df): Extension<Arc<RwLock<DataFusion>>>,
-        body: Bytes,
-    ) -> Response {
+    use super::sql_to_http_response;
+
+    pub(crate) async fn post(Extension(df): Extension<Arc<DataFusion>>, body: Bytes) -> Response {
         let query = match String::from_utf8(body.to_vec()) {
             Ok(query) => query,
             Err(e) => {
@@ -117,68 +156,7 @@ pub(crate) mod query {
             .with_allow_dml(false)
             .with_allow_statements(false);
 
-        let (data, is_data_from_cache) = match df
-            .read()
-            .await
-            .query_with_cache(&query, Some(restricted_sql_options))
-            .await
-        {
-            Ok(query_result) => match query_result.data.try_collect::<Vec<RecordBatch>>().await {
-                Ok(batches) => (batches, query_result.from_cache),
-                Err(e) => {
-                    tracing::debug!("Error executing query: {e}");
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        format!("Error processing batch: {e}"),
-                    )
-                        .into_response();
-                }
-            },
-            Err(e) => {
-                tracing::debug!("Error executing query: {e}");
-                return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
-            }
-        };
-
-        let buf = Vec::new();
-        let mut writer = arrow_json::ArrayWriter::new(buf);
-
-        if let Err(e) = writer.write_batches(data.iter().collect::<Vec<&RecordBatch>>().as_slice())
-        {
-            tracing::debug!("Error converting results to JSON: {e}");
-            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-        }
-        if let Err(e) = writer.finish() {
-            tracing::debug!("Error finishing JSON conversion: {e}");
-            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-        }
-
-        let buf = writer.into_inner();
-        let res = match String::from_utf8(buf) {
-            Ok(res) => res,
-            Err(e) => {
-                tracing::debug!("Error converting JSON buffer to string: {e}");
-                return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-            }
-        };
-
-        let mut headers = HeaderMap::new();
-
-        match is_data_from_cache {
-            Some(true) => {
-                if let Ok(value) = "Hit from spiceai".parse() {
-                    headers.insert("X-Cache", value);
-                }
-            }
-            Some(false) => {
-                if let Ok(value) = "Miss from spiceai".parse() {
-                    headers.insert("X-Cache", value);
-                }
-            }
-            None => {}
-        };
-
-        (StatusCode::OK, headers, res).into_response()
+        sql_to_http_response(df, &query, Some(restricted_sql_options), None).await
     }
 }
 
@@ -397,7 +375,7 @@ pub(crate) mod datasets {
 
     pub(crate) async fn get(
         Extension(app): Extension<Arc<RwLock<Option<App>>>>,
-        Extension(df): Extension<Arc<RwLock<DataFusion>>>,
+        Extension(df): Extension<Arc<DataFusion>>,
         Query(filter): Query<DatasetFilter>,
         Query(params): Query<DatasetQueryParams>,
     ) -> Response {
@@ -423,8 +401,6 @@ pub(crate) mod datasets {
             datasets.retain(|d| !d.is_view());
         }
 
-        let df_read = df.read().await;
-
         let resp = datasets
             .iter()
             .map(|d| DatasetResponseItem {
@@ -433,7 +409,7 @@ pub(crate) mod datasets {
                 replication_enabled: d.replication.as_ref().is_some_and(|f| f.enabled),
                 acceleration_enabled: d.acceleration.as_ref().is_some_and(|f| f.enabled),
                 status: if params.status {
-                    Some(dataset_status(&df_read, d))
+                    Some(dataset_status(&df, d))
                 } else {
                     None
                 },
@@ -465,7 +441,7 @@ pub(crate) mod datasets {
 
     pub(crate) async fn refresh(
         Extension(app): Extension<Arc<RwLock<Option<App>>>>,
-        Extension(df): Extension<Arc<RwLock<DataFusion>>>,
+        Extension(df): Extension<Arc<DataFusion>>,
         Path(dataset_name): Path<String>,
     ) -> Response {
         let app_lock = app.read().await;
@@ -499,9 +475,7 @@ pub(crate) mod datasets {
                 .into_response();
         };
 
-        let df_read = df.read().await;
-
-        match df_read.refresh_table(&dataset.name).await {
+        match df.refresh_table(&dataset.name).await {
             Ok(()) => (
                 status::StatusCode::CREATED,
                 Json(MessageResponse {
@@ -521,7 +495,7 @@ pub(crate) mod datasets {
 
     pub(crate) async fn acceleration(
         Extension(app): Extension<Arc<RwLock<Option<App>>>>,
-        Extension(df): Extension<Arc<RwLock<DataFusion>>>,
+        Extension(df): Extension<Arc<DataFusion>>,
         Path(dataset_name): Path<String>,
         Json(payload): Json<AccelerationRequest>,
     ) -> Response {
@@ -548,9 +522,7 @@ pub(crate) mod datasets {
             return (status::StatusCode::OK).into_response();
         }
 
-        let df_read = df.read().await;
-
-        match df_read
+        match df
             .update_refresh_sql(
                 TableReference::parse_str(&dataset.name),
                 payload.refresh_sql,
@@ -791,7 +763,7 @@ pub(crate) mod inference {
 
     pub(crate) async fn get(
         Extension(app): Extension<Arc<RwLock<Option<App>>>>,
-        Extension(df): Extension<Arc<RwLock<DataFusion>>>,
+        Extension(df): Extension<Arc<DataFusion>>,
         Path(model_name): Path<String>,
         Extension(models): Extension<Arc<RwLock<HashMap<String, Model>>>>,
     ) -> Response {
@@ -814,7 +786,7 @@ pub(crate) mod inference {
 
     pub(crate) async fn post(
         Extension(app): Extension<Arc<RwLock<Option<App>>>>,
-        Extension(df): Extension<Arc<RwLock<DataFusion>>>,
+        Extension(df): Extension<Arc<DataFusion>>,
         Extension(models): Extension<Arc<RwLock<HashMap<String, Model>>>>,
         Json(payload): Json<BatchPredictRequest>,
     ) -> Response {
@@ -848,7 +820,7 @@ pub(crate) mod inference {
 
     async fn run_inference(
         app: Arc<RwLock<Option<App>>>,
-        df: Arc<RwLock<DataFusion>>,
+        df: Arc<DataFusion>,
         models: Arc<RwLock<HashMap<String, Model>>>,
         model_name: String,
     ) -> PredictResponse {
@@ -957,11 +929,12 @@ pub(crate) mod nsql {
         response::{IntoResponse, Response},
         Extension, Json,
     };
+    use datafusion::execution::context::SQLOptions;
     use serde::{Deserialize, Serialize};
     use std::sync::Arc;
     use tokio::sync::RwLock;
 
-    use crate::{datafusion::DataFusion, http::v1::dataframe_to_response, LLMModelStore};
+    use crate::{datafusion::DataFusion, http::v1::sql_to_http_response, LLMModelStore};
 
     fn clean_model_based_sql(input: &str) -> String {
         let no_dashes = match input.strip_prefix("--") {
@@ -988,30 +961,28 @@ pub(crate) mod nsql {
     }
 
     pub(crate) async fn post(
-        Extension(df): Extension<Arc<RwLock<DataFusion>>>,
+        Extension(df): Extension<Arc<DataFusion>>,
         Extension(nsql_models): Extension<Arc<RwLock<LLMModelStore>>>,
         Json(payload): Json<Request>,
     ) -> Response {
-        let readable_df = df.read().await;
-
         // Get all public table CREATE TABLE statements to add to prompt.
-        let tables = match readable_df.get_public_table_names() {
+        let tables = match df.get_public_table_names() {
             Ok(t) => t,
             Err(e) => {
-                tracing::trace!("Error getting tables: {e}");
+                tracing::error!("Error getting tables: {e}");
                 return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
             }
         };
 
         let mut table_create_stms: Vec<String> = Vec::with_capacity(tables.len());
         for t in &tables {
-            match readable_df.get_arrow_schema(t).await {
+            match df.get_arrow_schema(t).await {
                 Ok(schm) => {
                     let c = CreateTableBuilder::new(Arc::new(schm), format!("public.{t}").as_str());
                     table_create_stms.push(c.build_postgres());
                 }
                 Err(e) => {
-                    tracing::trace!("Error getting table={t} schema: {e}");
+                    tracing::error!("Error getting table={t} schema: {e}");
                     return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
                 }
             }
@@ -1023,6 +994,9 @@ pub(crate) mod nsql {
             user_query=payload.query,
             table_create_schemas=table_create_stms.join("\n")
         );
+
+        let nsql_query_copy = nsql_query.clone();
+
         tracing::trace!("Running prompt: {nsql_query}");
 
         let result = match nsql_models.read().await.get(&payload.model) {
@@ -1036,18 +1010,24 @@ pub(crate) mod nsql {
             }
         };
 
+        let restricted_sql_options = SQLOptions::new()
+            .with_allow_ddl(false)
+            .with_allow_dml(false)
+            .with_allow_statements(false);
+
         // Run the SQL from the NSQL model through datafusion.
         match result {
             Ok(Some(model_sql_query)) => {
                 let cleaned_query = clean_model_based_sql(&model_sql_query);
                 tracing::trace!("Running query:\n{cleaned_query}");
-                match readable_df.ctx.sql(&cleaned_query).await {
-                    Ok(result) => dataframe_to_response(result).await,
-                    Err(e) => {
-                        tracing::trace!("Error running query: {e}");
-                        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
-                    }
-                }
+
+                sql_to_http_response(
+                    Arc::clone(&df),
+                    &cleaned_query,
+                    Some(restricted_sql_options),
+                    Some(nsql_query_copy),
+                )
+                .await
             }
             Ok(None) => {
                 tracing::trace!("No query produced from NSQL model");
@@ -1058,9 +1038,143 @@ pub(crate) mod nsql {
                     .into_response()
             }
             Err(e) => {
-                tracing::trace!("Error running NSQL model: {e}");
+                tracing::error!("Error running NSQL model: {e}");
                 (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
             }
+        }
+    }
+}
+
+pub(crate) mod embed {
+    use arrow::array::StringArray;
+    use axum::{
+        http::StatusCode,
+        response::{IntoResponse, Response},
+        Extension, Json,
+    };
+    use datafusion::execution::context::SQLOptions;
+    use futures::TryStreamExt;
+
+    use serde::{Deserialize, Serialize};
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    use crate::{
+        datafusion::{
+            query::{Protocol, QueryBuilder},
+            DataFusion,
+        },
+        EmbeddingModelStore,
+    };
+
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    pub struct TextRequest {
+        pub text: String,
+
+        #[serde(rename = "use", default = "default_model")]
+        pub model: String,
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    pub struct SqlRequest {
+        pub sql: String,
+
+        #[serde(rename = "use", default = "default_model")]
+        pub model: String,
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(untagged)]
+    pub enum Request {
+        Sql(SqlRequest),
+        Text(TextRequest),
+    }
+
+    fn default_model() -> String {
+        "embed".to_string()
+    }
+
+    // For [`SqlRequest`], create the text to embed by querying [`Datafusion`].
+    async fn to_text(
+        df: Arc<DataFusion>,
+        sql: String,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        let opt = SQLOptions::new()
+            .with_allow_ddl(false)
+            .with_allow_dml(false)
+            .with_allow_statements(false);
+
+        let query = QueryBuilder::new(sql, Arc::clone(&df), Protocol::Http)
+            .restricted_sql_options(Some(opt))
+            .build();
+
+        // Attempt to convert first column to String
+        let result: Result<Vec<Result<Vec<String>, _>>, _> =
+            query
+                .run()
+                .await
+                .map(|r| r.data)?
+                .map_ok(
+                    |r| match r.column(0).as_any().downcast_ref::<StringArray>() {
+                        Some(s) => Ok(s
+                            .into_iter()
+                            .flatten()
+                            .map(ToString::to_string)
+                            .collect::<Vec<String>>()),
+                        None => Err("Expected first column of SQL query to return a String type"
+                            .to_string()),
+                    },
+                )
+                .try_collect()
+                .await;
+
+        match result {
+            Ok(result) => {
+                let result = result
+                    .into_iter()
+                    .collect::<Result<Vec<Vec<String>>, _>>()?;
+                Ok(result.into_iter().flatten().collect())
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub(crate) async fn post(
+        Extension(df): Extension<Arc<DataFusion>>,
+        Extension(embeddings): Extension<Arc<RwLock<EmbeddingModelStore>>>,
+        Json(payload): Json<Request>,
+    ) -> Response {
+        let (text, model) = match payload {
+            Request::Text(TextRequest { text, model }) => (vec![text], model),
+            Request::Sql(SqlRequest { sql, model }) => {
+                let text = match to_text(Arc::clone(&df), sql).await {
+                    Ok(text) => text,
+                    Err(e) => {
+                        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+                    }
+                };
+                (text, model)
+            }
+        };
+
+        match embeddings.read().await.get(&model) {
+            Some(embedding_model) => {
+                let mut embedding_model = embedding_model.write().await;
+                match embedding_model
+                    .embed(llms::embeddings::EmbeddingInput::StringBatch(text))
+                    .await
+                {
+                    Ok(embedding) => (StatusCode::OK, Json(embedding)).into_response(),
+                    Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+                }
+            }
+            None => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Model {model} not found"),
+            )
+                .into_response(),
         }
     }
 }

@@ -10,3 +10,5 @@ exclude.workspace = true
 
 [dependencies]
 humantime = "2.1.0"
+tokio = { workspace = true }
+tracing = { workspace = true }

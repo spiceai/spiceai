@@ -2,6 +2,8 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use datafusion::{datasource::TableProvider, sql::TableReference};
+use serde::Deserialize;
+use serde_json::json;
 use snafu::prelude::*;
 
 use runtime::{
@@ -34,6 +36,20 @@ pub enum Error {
 
     #[snafu(display("Unable to create accelerated table provider: {source}"))]
     UnableToCreateAcceleratedTableProvider { source: dataaccelerator::Error },
+
+    #[snafu(display("Unable to get Spice Cloud secret: {source}"))]
+    UnableToGetSpiceSecret {
+        source: Box<dyn std::error::Error + Sync + Send>,
+    },
+
+    #[snafu(display("Spice Cloud secret not found"))]
+    SpiceSecretNotFound {},
+
+    #[snafu(display("Spice Cloud api_key not provided"))]
+    SpiceApiKeyNotFound {},
+
+    #[snafu(display("Unable to connect to Spice Cloud: {source}"))]
+    UnableToConnectToSpiceCloud { source: reqwest::Error },
 }
 
 pub struct SpiceExtension {
@@ -44,6 +60,97 @@ impl SpiceExtension {
     #[must_use]
     pub fn new(manifest: ExtensionManifest) -> Self {
         SpiceExtension { manifest }
+    }
+
+    fn spice_http_url(&self) -> String {
+        self.manifest
+            .params
+            .get("endpoint")
+            .unwrap_or(&"https://data.spiceai.io".to_string())
+            .to_string()
+    }
+
+    async fn get_spice_secret(&self, runtime: &Runtime) -> Result<Secret, Error> {
+        let secrets = runtime.secrets_provider.read().await;
+        let secret = secrets
+            .get_secret("spiceai")
+            .await
+            .context(UnableToGetSpiceSecretSnafu)?;
+
+        secret.ok_or(Error::SpiceSecretNotFound {})
+    }
+
+    async fn get_spice_api_key(&self, runtime: &Runtime) -> Result<String, Error> {
+        let secret = self.get_spice_secret(runtime).await?;
+        let api_key = secret.get("key").ok_or(Error::SpiceApiKeyNotFound {})?;
+
+        Ok(api_key.to_string())
+    }
+
+    async fn connect(&self, runtime: &Runtime) -> Result<SpiceCloudConnectResponse, Error> {
+        let api_key = self.get_spice_api_key(runtime).await?;
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("{}/v1/connect", self.spice_http_url()))
+            .json(&json!({}))
+            .header("Content-Type", "application/json")
+            .header("X-API-Key", api_key)
+            .send()
+            .await
+            .context(UnableToConnectToSpiceCloudSnafu)?;
+
+        let response: SpiceCloudConnectResponse = response
+            .json()
+            .await
+            .context(UnableToConnectToSpiceCloudSnafu)?;
+
+        Ok(response)
+    }
+
+    async fn register_runtime_metrics_table(
+        &mut self,
+        runtime: &Runtime,
+        from: String,
+        secret: Secret,
+    ) -> Result<()> {
+        let retention = Retention::new(
+            Some("timestamp".to_string()),
+            Some(TimeFormat::UnixSeconds),
+            Some(Duration::from_secs(1800)), // delete metrics older then 30 minutes
+            Some(Duration::from_secs(300)),  // run retention every 5 minutes
+            true,
+        );
+
+        let refresh = Refresh::new(
+            Some("timestamp".to_string()),
+            Some(TimeFormat::UnixSeconds),
+            Some(Duration::from_secs(10)),
+            None,
+            RefreshMode::Full,
+            Some(Duration::from_secs(1800)), // sync only last 30 minutes from cloud
+        );
+
+        let metrics_table_reference = get_metrics_table_reference();
+
+        let table = create_synced_internal_accelerated_table(
+            metrics_table_reference.clone(),
+            from.as_str(),
+            Some(secret),
+            Acceleration::default(),
+            refresh,
+            retention,
+        )
+        .await
+        .boxed()
+        .map_err(|e| runtime::extension::Error::UnableToStartExtension { source: e })?;
+
+        runtime
+            .datafusion()
+            .register_runtime_table(metrics_table_reference, table)
+            .boxed()
+            .map_err(|e| runtime::extension::Error::UnableToStartExtension { source: e })?;
+
+        Ok(())
     }
 }
 
@@ -64,8 +171,6 @@ impl Extension for SpiceExtension {
             return Ok(());
         }
 
-        tracing::info!("Initializing Spice.ai Cloud Extension");
-
         Ok(())
     }
 
@@ -74,59 +179,27 @@ impl Extension for SpiceExtension {
             return Ok(());
         }
 
-        if let Some(spiceai_metrics_dataset_path) = self.manifest.params.get("metrics_dataset_path")
-        {
-            tracing::info!("Starting Spice.ai Cloud Extension");
-
-            let secrets = runtime.secrets_provider.read().await;
-            let secret = secrets
-                .get_secret("spiceai")
-                .await
-                .map_err(|e| runtime::extension::Error::UnableToStartExtension { source: e })?;
-
-            let retention = Retention::new(
-                Some("timestamp".to_string()),
-                Some(TimeFormat::UnixSeconds),
-                Some(Duration::from_secs(1800)), // delete metrics older then 30 minutes
-                Some(Duration::from_secs(300)),  // run retention every 5 minutes
-                true,
-            );
-
-            let refresh = Refresh::new(
-                Some("timestamp".to_string()),
-                Some(TimeFormat::UnixSeconds),
-                Some(Duration::from_secs(10)),
-                None,
-                RefreshMode::Full,
-                Some(Duration::from_secs(1800)), // sync only last 30 minutes from cloud
-            );
-
-            let metrics_table_reference = get_metrics_table_reference();
-
-            let table = create_synced_internal_accelerated_table(
-                metrics_table_reference.table(),
-                spiceai_metrics_dataset_path,
-                secret,
-                Acceleration::default(),
-                refresh,
-                retention,
-            )
+        let secret = self
+            .get_spice_secret(runtime)
             .await
             .boxed()
             .map_err(|e| runtime::extension::Error::UnableToStartExtension { source: e })?;
 
-            runtime
-                .datafusion()
-                .write()
-                .await
-                .register_runtime_table(metrics_table_reference.table(), table)
-                .boxed()
-                .map_err(|e| runtime::extension::Error::UnableToStartExtension { source: e })?;
+        let connection = self
+            .connect(runtime)
+            .await
+            .boxed()
+            .map_err(|e| runtime::extension::Error::UnableToStartExtension { source: e })?;
 
-            tracing::info!(
-                "Enabled metrics sync from runtime.metrics to {spiceai_metrics_dataset_path}"
-            );
-        }
+        let spiceai_metrics_dataset_path = format!(
+            "spice.ai/{}/{}/{}",
+            connection.org_name, connection.app_name, connection.metrics_dataset_name
+        );
+
+        let from = spiceai_metrics_dataset_path.to_string();
+        self.register_runtime_metrics_table(runtime, from.clone(), secret)
+            .await?;
+        tracing::info!("Enabled metrics sync from runtime.metrics to {from}",);
 
         Ok(())
     }
@@ -183,17 +256,18 @@ async fn get_spiceai_table_provider(
 ///
 /// This function will return an error if the accelerated table provider cannot be created
 pub async fn create_synced_internal_accelerated_table(
-    name: &str,
+    table_reference: TableReference,
     from: &str,
     secret: Option<Secret>,
     acceleration: Acceleration,
     refresh: Refresh,
     retention: Option<Retention>,
 ) -> Result<Arc<AcceleratedTable>, Error> {
-    let source_table_provider = get_spiceai_table_provider(name, from, secret).await?;
+    let source_table_provider =
+        get_spiceai_table_provider(table_reference.table(), from, secret).await?;
 
     let accelerated_table_provider = create_accelerator_table(
-        TableReference::bare(name),
+        table_reference.clone(),
         source_table_provider.schema(),
         &acceleration,
         None,
@@ -202,7 +276,7 @@ pub async fn create_synced_internal_accelerated_table(
     .context(UnableToCreateAcceleratedTableProviderSnafu)?;
 
     let mut builder = AcceleratedTable::builder(
-        TableReference::bare(name),
+        table_reference.clone(),
         source_table_provider,
         accelerated_table_provider,
         refresh,
@@ -213,4 +287,12 @@ pub async fn create_synced_internal_accelerated_table(
     let (accelerated_table, _) = builder.build().await;
 
     Ok(Arc::new(accelerated_table))
+}
+
+#[derive(Deserialize, Debug)]
+#[allow(clippy::struct_field_names)]
+struct SpiceCloudConnectResponse {
+    org_name: String,
+    app_name: String,
+    metrics_dataset_name: String,
 }

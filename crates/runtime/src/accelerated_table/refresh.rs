@@ -4,7 +4,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::TimeFormat;
 use crate::datafusion::filter_converter::TimestampFilterConvert;
-use crate::datafusion::schema;
+use crate::datafusion::{schema, SPICE_RUNTIME_SCHEMA};
 use crate::object_store_registry::default_runtime_env;
 use crate::{
     dataconnector::get_data,
@@ -81,7 +81,7 @@ pub(crate) enum AccelerationRefreshMode {
     Append(Option<Receiver<()>>),
 }
 
-pub(crate) struct Refresher {
+pub struct Refresher {
     dataset_name: TableReference,
     federated: Arc<dyn TableProvider>,
     refresh: Arc<RwLock<Refresh>>,
@@ -142,9 +142,15 @@ impl Refresher {
                     {
                         if let Some(start_time) = start_time {
                             if let Ok(elapse) = util::humantime_elapsed(start_time) {
-                                tracing::info!(
-                                    "Loaded 0 rows for dataset {dataset_name} in {elapse}."
-                                );
+                                if dataset_name.schema() == Some(SPICE_RUNTIME_SCHEMA) {
+                                    tracing::debug!(
+                                        "Loaded 0 rows for dataset {dataset_name} in {elapse}."
+                                    );
+                                } else {
+                                    tracing::info!(
+                                        "Loaded 0 rows for dataset {dataset_name} in {elapse}."
+                                    );
+                                }
                             }
                         }
                         self.notify_refresh_done(&mut ready_sender, status::ComponentStatus::Ready);
@@ -181,9 +187,14 @@ impl Refresher {
                                             .map(|x| x.get_array_memory_size())
                                             .sum::<usize>(),
                                     );
+                                    let num_rows = util::pretty_print_number(num_rows);
 
                                     if let Ok(elapse) = util::humantime_elapsed(start_time) {
-                                        tracing::info!("Loaded {num_rows} rows ({memory_size}) for dataset {dataset_name} in {elapse}.");
+                                        if dataset_name.schema() == Some(SPICE_RUNTIME_SCHEMA) {
+                                            tracing::debug!("Loaded {num_rows} rows ({memory_size}) for dataset {dataset_name} in {elapse}.");
+                                        } else {
+                                            tracing::info!("Loaded {num_rows} rows ({memory_size}) for dataset {dataset_name} in {elapse}.");
+                                        }
                                     }
 
                                     if let Some(cache_provider) = &self.cache_provider {
@@ -412,7 +423,7 @@ impl Refresher {
             .limit(0, Some(1))
     }
 
-    async fn get_full_or_incremental_append_update(
+    pub async fn get_full_or_incremental_append_update(
         &self,
         overwrite_timestamp_in_nano: Option<u128>,
     ) -> super::Result<DataUpdate> {
@@ -420,7 +431,11 @@ impl Refresher {
         let refresh = self.refresh.read().await;
         let filter_converter = self.get_filter_converter(&refresh);
 
-        tracing::info!("Loading data for dataset {dataset_name}");
+        if dataset_name.schema() == Some(SPICE_RUNTIME_SCHEMA) {
+            tracing::debug!("Loading data for dataset {dataset_name}");
+        } else {
+            tracing::info!("Loading data for dataset {dataset_name}");
+        }
         status::update_dataset(&dataset_name, status::ComponentStatus::Refreshing);
         let refresh = refresh.clone();
         let mut filters = vec![];

@@ -19,18 +19,20 @@ limitations under the License.
 use std::env;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use app::{App, AppBuilder};
 use clap::Parser;
 use flightrepl::ReplConfig;
+use futures::future::join_all;
+use futures::Future;
 use runtime::config::Config as RuntimeConfig;
 
 use runtime::podswatcher::PodsWatcher;
 use runtime::{extension::ExtensionFactory, Runtime};
 use snafu::prelude::*;
 use spice_cloud::SpiceExtensionFactory;
-use tokio::sync::RwLock;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -56,6 +58,9 @@ pub enum Error {
 
     #[snafu(display("Failed to start pods watcher: {source}"))]
     UnableToInitializePodsWatcher { source: runtime::NotifyError },
+
+    #[snafu(display("Generic Error: {reason}"))]
+    GenericError { reason: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -85,7 +90,6 @@ pub struct Args {
 
 pub async fn run(args: Args) -> Result<()> {
     let current_dir = env::current_dir().unwrap_or(PathBuf::from("."));
-    let df = Arc::new(RwLock::new(runtime::datafusion::DataFusion::new()));
     let pods_watcher = PodsWatcher::new(current_dir.clone());
     let app: Option<App> = match AppBuilder::build_from_filesystem_path(current_dir.clone())
         .context(UnableToConstructSpiceAppSnafu)
@@ -108,23 +112,10 @@ pub async fn run(args: Args) -> Result<()> {
         }
     }
 
-    let mut rt: Runtime = Runtime::new(app, Arc::clone(&df), Arc::new(extension_factories)).await;
+    let mut rt: Runtime = Runtime::new(app, Arc::new(extension_factories)).await;
 
+    // mutable reference
     rt.with_pods_watcher(pods_watcher);
-
-    rt.load_secrets().await;
-
-    rt.init_results_cache().await;
-
-    rt.load_datasets().await;
-
-    if cfg!(feature = "models") {
-        rt.load_models().await;
-        rt.load_llms().await;
-    }
-
-    rt.start_extensions().await;
-
     if let Err(err) = rt
         .start_metrics(args.metrics)
         .await
@@ -133,9 +124,44 @@ pub async fn run(args: Args) -> Result<()> {
         tracing::warn!("{err}");
     }
 
-    rt.start_servers(args.runtime, args.metrics)
-        .await
-        .context(UnableToStartServersSnafu)?;
+    let cloned_rt = rt.clone();
+    let server_thread =
+        tokio::spawn(async move { cloned_rt.start_servers(args.runtime, args.metrics).await });
 
-    Ok(())
+    rt.load_secrets().await;
+
+    let mut futures: Vec<Pin<Box<dyn Future<Output = ()>>>> = vec![
+        Box::pin(async {
+            if let Err(err) = rt.init_query_history().await {
+                tracing::warn!("Creating internal query history table: {err}");
+            };
+        }),
+        Box::pin(rt.init_results_cache()),
+        Box::pin(rt.start_extensions()),
+        Box::pin(rt.load_datasets()),
+    ];
+
+    if cfg!(feature = "models") {
+        let mut v: Vec<Pin<Box<dyn Future<Output = ()>>>> = vec![
+            Box::pin(rt.load_models()),
+            Box::pin(rt.load_llms()),
+            Box::pin(rt.load_embeddings()),
+        ];
+
+        futures.append(&mut v);
+    }
+
+    tokio::select! {
+        _ = join_all(futures) => {},
+        () = runtime::shutdown_signal() => {
+            tracing::debug!("Cancelling runtime initializing!");
+        },
+    }
+
+    match server_thread.await {
+        Ok(ok) => ok.context(UnableToStartServersSnafu),
+        Err(_) => Err(Error::GenericError {
+            reason: "Unable to start spiced".into(),
+        }),
+    }
 }

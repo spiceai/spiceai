@@ -15,20 +15,20 @@ limitations under the License.
 */
 
 use arrow::record_batch::RecordBatch;
+use llms::embeddings::Embed;
 use llms::nql::{Error as LlmError, Nql};
+use llms::openai::{DEFAULT_EMBEDDING_MODEL, DEFAULT_LLM_MODEL};
 use model_components::model::{Error as ModelError, Model};
+use spicepod::component::embeddings::{EmbeddingParams, EmbeddingPrefix};
 use spicepod::component::llms::{Architecture, LlmParams, LlmPrefix};
 use std::collections::HashMap;
 use std::result::Result;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 
 use crate::DataFusion;
 
-pub async fn run(m: &Model, df: Arc<RwLock<DataFusion>>) -> Result<RecordBatch, ModelError> {
+pub async fn run(m: &Model, df: Arc<DataFusion>) -> Result<RecordBatch, ModelError> {
     match df
-        .read()
-        .await
         .ctx
         .sql(
             &(format!(
@@ -50,6 +50,39 @@ pub async fn run(m: &Model, df: Arc<RwLock<DataFusion>>) -> Result<RecordBatch, 
     }
 }
 
+pub fn try_to_embedding(
+    component: &spicepod::component::embeddings::Embeddings,
+) -> Result<Box<dyn Embed>, LlmError> {
+    let prefix = component.get_prefix().ok_or(LlmError::UnknownModelSource {
+        source: format!(
+            "Unknown model source for spicepod component from: {}",
+            component.from.clone()
+        )
+        .into(),
+    })?;
+
+    let model_id = component.get_model_id();
+
+    match construct_embedding_params(&prefix, &(component.params).clone().unwrap_or_default()) {
+        EmbeddingParams::OpenAiParams {
+            api_base,
+            api_key,
+            org_id,
+            project_id,
+        } => Ok(Box::new(llms::openai::Openai::new(
+            model_id.unwrap_or(DEFAULT_EMBEDDING_MODEL.to_string()),
+            api_base,
+            api_key,
+            org_id,
+            project_id,
+        ))),
+        EmbeddingParams::None => Err(LlmError::UnsupportedTaskForModel {
+            from: component.from.clone(),
+            task: "embedding".into(),
+        }),
+    }
+}
+
 /// Attempt to derive a runnable NQL model from a given component from the Spicepod definition.
 pub fn try_to_nql(component: &spicepod::component::llms::Llm) -> Result<Box<dyn Nql>, LlmError> {
     let prefix = component.get_prefix().ok_or(LlmError::UnknownModelSource {
@@ -62,27 +95,46 @@ pub fn try_to_nql(component: &spicepod::component::llms::Llm) -> Result<Box<dyn 
 
     let model_id = component.get_model_id();
 
-    match construct_llm_params(&prefix, &(component.params).clone().unwrap_or_default()) {
-        Ok(LlmParams::OpenAiParams {}) => Ok(llms::nql::create_openai(model_id)),
+    match construct_llm_params(
+        &prefix,
+        &model_id,
+        &(component.params).clone().unwrap_or_default(),
+    ) {
+        Ok(LlmParams::OpenAiParams {
+            api_base,
+            api_key,
+            org_id,
+            project_id,
+        }) => Ok(Box::new(llms::openai::Openai::new(
+            model_id.unwrap_or(DEFAULT_LLM_MODEL.to_string()),
+            api_base,
+            api_key,
+            org_id,
+            project_id,
+        ))),
         Ok(LlmParams::LocalModelParams {
-            weights,
-            tokenizer,
-            chat_template,
-        }) => llms::nql::create_local_model(&weights, &tokenizer, &chat_template),
+            weights_path,
+            tokenizer_path,
+            tokenizer_config_path,
+        }) => llms::nql::create_local_model(
+            &weights_path,
+            tokenizer_path.as_deref(),
+            tokenizer_config_path.as_ref(),
+        ),
         Ok(LlmParams::HuggingfaceParams {
             model_type,
-            weights,
-            tokenizer,
-            chat_template,
+            weights_path,
+            tokenizer_path,
+            tokenizer_config_path,
         }) => {
             match component.get_model_id() {
                 Some(id) => {
                     llms::nql::create_hf_model(
                         &id,
                         model_type.map(|x| x.to_string()),
-                        &weights,
-                        &tokenizer,
-                        &chat_template, // TODO handle inline chat templates
+                        &weights_path,
+                        &tokenizer_path,
+                        &tokenizer_config_path, // TODO handle inline chat templates
                     )
                 }
                 None => Err(LlmError::FailedToLoadModel {
@@ -102,8 +154,10 @@ pub fn try_to_nql(component: &spicepod::component::llms::Llm) -> Result<Box<dyn 
 }
 
 /// Construct the parameters needed to create an LLM based on its source (i.e. prefix).
+/// If a `model_id` is provided (in the `from: `), it is provided.
 fn construct_llm_params(
     from: &LlmPrefix,
+    model_id: &Option<String>,
     params: &HashMap<String, String>,
 ) -> Result<LlmParams, LlmError> {
     match from {
@@ -121,43 +175,59 @@ fn construct_llm_params(
                 }
                 None => None,
             };
+
             Ok(LlmParams::HuggingfaceParams {
                 model_type: arch,
-                weights: params.get("weights").cloned(),
-                tokenizer: params.get("tokenizer").cloned(),
-                chat_template: params.get("chat_template").cloned(),
+                weights_path: model_id.clone().or(params.get("weights_path").cloned()),
+                tokenizer_path: params.get("tokenizer_path").cloned(),
+                tokenizer_config_path: params.get("tokenizer_config_path").cloned(),
             })
         }
         LlmPrefix::File => {
-            let weights = params
-                .get("weights")
+            let weights_path = model_id
+                .clone()
+                .or(params.get("weights_path").cloned())
                 .ok_or(LlmError::FailedToLoadModel {
-                    source: "No 'weights' parameter provided".into(),
+                    source: "No 'weights_path' parameter provided".into(),
                 })?
                 .clone();
-            let tokenizer = params
-                .get("tokenizer")
+            let tokenizer_path = params.get("tokenizer_path").cloned();
+            let tokenizer_config_path = params
+                .get("tokenizer_config_path")
                 .ok_or(LlmError::FailedToLoadTokenizer {
-                    source: "No 'tokenizer' parameter provided".into(),
-                })?
-                .clone();
-            let chat_template = params
-                .get("chat_template")
-                .ok_or(LlmError::FailedToLoadTokenizer {
-                    source: "No 'chat_template' parameter provided".into(),
+                    source: "No 'tokenizer_config_path' parameter provided".into(),
                 })?
                 .clone();
             Ok(LlmParams::LocalModelParams {
-                weights,
-                tokenizer,
-                chat_template,
+                weights_path,
+                tokenizer_path,
+                tokenizer_config_path,
             })
         }
-        LlmPrefix::SpiceAi => Ok(LlmParams::SpiceAiParams {
-            chat_template: params.get("chat_template").cloned(),
-        }),
+
+        LlmPrefix::SpiceAi => Ok(LlmParams::SpiceAiParams {}),
+
         LlmPrefix::OpenAi => Ok(LlmParams::OpenAiParams {
-            // model: params.get("model").cloned(),
+            api_base: params.get("endpoint").cloned(),
+            api_key: params.get("openai_api_key").cloned(),
+            org_id: params.get("openai_org_id").cloned(),
+            project_id: params.get("openai_project_id").cloned(),
         }),
+    }
+}
+
+/// Construct the parameters needed to create an [`Embeddings`] based on its source (i.e. prefix).
+/// If a `model_id` is provided (in the `from: `), it is provided.
+fn construct_embedding_params(
+    from: &EmbeddingPrefix,
+    params: &HashMap<String, String>,
+) -> EmbeddingParams {
+    match from {
+        EmbeddingPrefix::OpenAi => EmbeddingParams::OpenAiParams {
+            api_base: params.get("endpoint").cloned(),
+            api_key: params.get("openai_api_key").cloned(),
+            org_id: params.get("openai_org_id").cloned(),
+            project_id: params.get("openai_project_id").cloned(),
+        },
     }
 }

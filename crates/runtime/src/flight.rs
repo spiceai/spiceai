@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::datafusion::query::{Protocol, QueryBuilder};
 use crate::datafusion::DataFusion;
 use crate::dataupdate::DataUpdate;
 use crate::measure_scope_ms;
@@ -53,7 +54,7 @@ use arrow_flight::{
 };
 
 pub struct Service {
-    datafusion: Arc<RwLock<DataFusion>>,
+    datafusion: Arc<DataFusion>,
     channel_map: Arc<RwLock<HashMap<TableReference, Arc<Sender<DataUpdate>>>>>,
 }
 
@@ -151,13 +152,8 @@ impl FlightService for Service {
 }
 
 impl Service {
-    async fn get_arrow_schema(
-        datafusion: Arc<RwLock<DataFusion>>,
-        sql: String,
-    ) -> Result<Schema, Status> {
+    async fn get_arrow_schema(datafusion: Arc<DataFusion>, sql: String) -> Result<Schema, Status> {
         let df = datafusion
-            .read()
-            .await
             .ctx
             .sql(&sql)
             .await
@@ -175,7 +171,7 @@ impl Service {
     }
 
     async fn sql_to_flight_stream(
-        datafusion: Arc<RwLock<DataFusion>>,
+        datafusion: Arc<DataFusion>,
         sql: String,
     ) -> Result<BoxStream<'static, Result<FlightData, Status>>, Status> {
         let restricted_sql_options = SQLOptions::new()
@@ -183,12 +179,12 @@ impl Service {
             .with_allow_dml(false)
             .with_allow_statements(false);
 
-        let batches_stream = datafusion
-            .read()
-            .await
-            .query_with_cache(&sql, Some(restricted_sql_options))
-            .await
-            .map_err(to_tonic_err)?;
+        let query = QueryBuilder::new(sql, Arc::clone(&datafusion), Protocol::Flight)
+            .restricted_sql_options(Some(restricted_sql_options))
+            .protocol(Protocol::Flight)
+            .build();
+
+        let batches_stream = query.run().await.map_err(to_tonic_err)?;
 
         let schema = batches_stream.data.schema();
         let options = datafusion::arrow::ipc::writer::IpcWriteOptions::default();
@@ -290,7 +286,7 @@ pub enum Error {
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
-pub async fn start(bind_address: std::net::SocketAddr, df: Arc<RwLock<DataFusion>>) -> Result<()> {
+pub async fn start(bind_address: std::net::SocketAddr, df: Arc<DataFusion>) -> Result<()> {
     let service = Service {
         datafusion: Arc::clone(&df),
         channel_map: Arc::new(RwLock::new(HashMap::new())),
