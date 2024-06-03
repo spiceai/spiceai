@@ -179,9 +179,9 @@ dependencies:
 The `spiceai/quickstart` Spicepod will add a `taxi_trips` data table to the runtime which is now available to query by SQL.
 
 ```bash
+2024-06-03T23:21:29.721705Z  INFO runtime: Registered dataset taxi_trips
 2024-06-03T23:21:29.722839Z  INFO runtime::accelerated_table::refresh: Loading data for dataset taxi_trips
 2024-06-03T23:21:50.813510Z  INFO runtime::accelerated_table::refresh: Loaded 2,964,624 rows (421.71 MiB) for dataset taxi_trips in 21s 90ms.
-2024-06-03T23:21:50.813597Z  INFO runtime::accelerated_table::refresh: Loading data for dataset taxi_trips
 ```
 
 **Step 5.** Start the Spice SQL REPL:
