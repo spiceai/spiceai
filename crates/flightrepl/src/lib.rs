@@ -14,8 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
 use std::error::Error;
+use std::sync::Arc;
 use std::time::Instant;
 
 use ansi_term::Colour;
@@ -92,8 +92,7 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
         .await
         .map_err(|_err| {
             Box::<dyn Error>::from(format!(
-                "Unable to connect to Spice runtime on {}. Is it running?",
-                spice_endpoint
+                "Unable to connect to Spice runtime on {spice_endpoint}. Is it running?"
             ))
         })?;
 
